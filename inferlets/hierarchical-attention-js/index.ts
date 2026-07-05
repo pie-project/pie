@@ -18,7 +18,7 @@
 // lexical overlap, and one shared mask is applied to every query token per pass.
 // Demonstrates the programmable attention-mask path; no speedup is claimed.
 
-import { Context, Model, Sampler, chat, runtime } from 'inferlet';
+import { Context, Sampler, chat, model } from 'inferlet';
 
 interface Input {
     prompt?: string;
@@ -143,9 +143,6 @@ function fmtRanges(ranges: Range[]): string {
 // =============================================================================
 
 export async function main(input: Input): Promise<string> {
-    const model = Model.load(runtime.models()[0]);
-    const tokenizer = model.tokenizer();
-
     const prompt =
         input.prompt ??
         'Explain how LLM serving systems use KV cache, batching, scheduling, and ' +
@@ -168,7 +165,6 @@ export async function main(input: Input): Promise<string> {
     promptTokens.push(
         ...Array.from(
             chat.system(
-                model,
                 'You are a concise assistant. Use the visible hierarchy: global ' +
                     'instructions, the chunk summaries, and the selected local chunk.',
             ),
@@ -180,7 +176,7 @@ export async function main(input: Input): Promise<string> {
         const body = `Chunk ${i} full text:\n${chunk}\n`;
 
         const headerStart = promptTokens.length;
-        promptTokens.push(...Array.from(chat.user(model, header)));
+        promptTokens.push(...Array.from(chat.user(header)));
         const headerEnd = promptTokens.length;
         summaryRanges.push({
             start: headerStart,
@@ -188,7 +184,7 @@ export async function main(input: Input): Promise<string> {
         });
 
         const bodyStart = promptTokens.length;
-        promptTokens.push(...Array.from(chat.user(model, body)));
+        promptTokens.push(...Array.from(chat.user(body)));
         const bodyEnd = promptTokens.length;
         fullRanges.push({ start: bodyStart, end: bodyEnd });
     });
@@ -196,13 +192,12 @@ export async function main(input: Input): Promise<string> {
     promptTokens.push(
         ...Array.from(
             chat.user(
-                model,
                 'Answer the original request using the selected local chunk(s) and the ' +
                     'global chunk summaries.',
             ),
         ),
     );
-    promptTokens.push(...Array.from(chat.cue(model)));
+    promptTokens.push(...Array.from(chat.cue()));
 
     console.log('--- hierarchical-attention-js ---');
     console.log(`chunks=${chunks.length}`);
@@ -210,10 +205,10 @@ export async function main(input: Input): Promise<string> {
     console.log(`summary_ranges=${fmtRanges(summaryRanges)}`);
     console.log(`full_ranges=${fmtRanges(fullRanges)}`);
 
-    const ctx = new Context(model);
+    const ctx = new Context();
     let pending = promptTokens;
     const generated: number[] = [];
-    const stopTokens = new Set<number>(Array.from(chat.stopTokens(model)));
+    const stopTokens = new Set<number>(Array.from(chat.stopTokens()));
     let loggedMask = false;
 
     for (let i = 0; i < maxTokens; ++i) {
@@ -252,5 +247,5 @@ export async function main(input: Input): Promise<string> {
     }
 
     console.log(`generated_tokens=${generated.length}`);
-    return tokenizer.decode(new Uint32Array(generated));
+    return model.decode(new Uint32Array(generated));
 }

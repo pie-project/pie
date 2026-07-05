@@ -37,7 +37,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
-use pie_schema::gateway::BlobRef;
+use pie_worker_rpc::BlobRef;
 
 /// A stored blob: its MIME `kind` and raw `bytes`. Returned by [`BlobStore::get`]
 /// so the serving handler can echo the original content type.

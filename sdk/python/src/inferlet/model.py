@@ -1,5 +1,15 @@
 """
-Model and Tokenizer — wrappers for ``pie:core/model``.
+Model — global accessors for ``pie:core/model``.
+
+The engine serves exactly one model, so these are module-level functions
+over that single bound model (no ``model`` / ``tokenizer`` resource
+handles)::
+
+    from inferlet import model
+
+    print(model.name())
+    tokens = model.encode("hello")
+    text = model.decode(tokens)
 """
 
 from __future__ import annotations
@@ -7,62 +17,41 @@ from __future__ import annotations
 from wit_world.imports import model as _model
 
 
-class Tokenizer:
-    """Wraps the WIT tokenizer resource."""
-
-    __slots__ = ("_handle",)
-
-    def __init__(self, handle: _model.Tokenizer) -> None:
-        self._handle = handle
-
-    def encode(self, text: str) -> list[int]:
-        """Encode text into token IDs."""
-        return list(self._handle.encode(text))
-
-    def decode(self, tokens: list[int]) -> str:
-        """Decode token IDs back to text."""
-        return self._handle.decode(tokens)
-
-    def vocabs(self) -> tuple[list[int], list[bytes]]:
-        """Returns (token_ids, token_bytes) for the full vocabulary."""
-        return self._handle.vocabs()
-
-    def split_regex(self) -> str:
-        """Returns the tokenizer's split regular expression."""
-        return self._handle.split_regex()
-
-    def special_tokens(self) -> tuple[list[int], list[bytes]]:
-        """Returns (token_ids, token_bytes) for special tokens."""
-        return self._handle.special_tokens()
+def name() -> str:
+    """Name of the bound model."""
+    return _model.name()
 
 
-class Model:
-    """Wraps the WIT model resource.
+def architecture() -> str:
+    """Model architecture identifier (e.g. ``"gemma4"``, ``"qwen3_6"``)."""
+    return _model.architecture()
 
-    Usage::
 
-        model = Model.load("llama-3.2-3b")
-        tokenizer = model.tokenizer()
-    """
+def default_system_speculation() -> bool:
+    """Whether greedy generation should use the system drafter by default."""
+    return _model.default_system_speculation()
 
-    __slots__ = ("_handle",)
 
-    def __init__(self, handle: _model.Model) -> None:
-        self._handle = handle
+def encode(text: str) -> list[int]:
+    """Encode text into token IDs."""
+    return list(_model.encode(text))
 
-    @staticmethod
-    def load(name: str) -> Model:
-        """Load a model by name. Raises on failure."""
-        return Model(_model.Model.load(name))
 
-    def tokenizer(self) -> Tokenizer:
-        """Get the tokenizer for this model."""
-        return Tokenizer(self._handle.tokenizer())
+def decode(tokens: list[int]) -> str:
+    """Decode token IDs back to text."""
+    return _model.decode(tokens)
 
-    def default_system_speculation(self) -> bool:
-        """Whether greedy generation should use the system drafter by default."""
-        return self._handle.default_system_speculation()
 
-    def __repr__(self) -> str:
-        return f"Model({id(self._handle):#x})"
+def vocabs() -> tuple[list[int], list[bytes]]:
+    """Returns ``(token_ids, token_bytes)`` for the full vocabulary."""
+    return _model.vocabs()
 
+
+def split_regex() -> str:
+    """Returns the tokenizer's split regular expression."""
+    return _model.split_regex()
+
+
+def special_tokens() -> tuple[list[int], list[bytes]]:
+    """Returns ``(token_ids, token_bytes)`` for special tokens."""
+    return _model.special_tokens()

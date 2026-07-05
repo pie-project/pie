@@ -1,0 +1,10 @@
+[package]
+name = "beam-designb-compact"
+version = "0.1.0"
+description = "Design B compaction device-proof: the exact beam-designb steady-state mask-out decode plus a single mid-run pipeline.copy_into that physically relocates the shared BOS KV cell (flat pool position 0) to a fresh flat position, with an in-graph mask remap (col src -> col dst) so every beam attends the moved cell at its new home. copy_into rides the same scheduler FIFO/stream as the forward fires (B3 invariant: the move happens-after the prior fires' KV writes, happens-before the later fires' descriptor reads), so no drain barrier is needed. If copy_into is a faithful all-layers post-RoPE cell move, the emitted tokens are IDENTICAL to beam-designb (same query, same stored K/V, different physical slot) — that identical-tokens equality is the correctness oracle."
+authors = ["In Gim <in.gim@icloud.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]

@@ -2,8 +2,7 @@
 
 // Numeric-parity harness: runs a one-shot forward pass on a binary file
 // of i32 token ids and dumps the last token's logits (bf16, [vocab]) to
-// `logits_out`. Invoked only by the standalone `pie_driver_cuda_run`
-// entry point — the production serve loop never touches it.
+// `logits_out`. Used only by standalone numeric-parity tooling.
 
 #include <string>
 

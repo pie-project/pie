@@ -2,7 +2,7 @@
 
 Rust crate for the `pie` CLI and standalone engine.
 
-`pie` hosts the runtime, embedded drivers (`portable`, `cuda_native`,
+`pie` hosts the runtime, embedded drivers (`cuda_native`, `metal`,
 `dummy`), and Python subprocess drivers (`dev`, `vllm`, `sglang`) behind the
 same config and WebSocket API.
 
@@ -16,7 +16,7 @@ Include the embedded CUDA driver:
 
 ```bash
 CUDACXX=/usr/local/cuda/bin/nvcc \
-  cargo build -p pie-worker --release --features driver-portable,driver-cuda
+  cargo build -p pie-worker --release --features driver-cuda
 ```
 
 The binary lands at `target/release/pie`.

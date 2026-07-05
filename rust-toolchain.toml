@@ -1,0 +1,21 @@
+# Pinned toolchain for the wasip3 epic (epic 2). See scripts/setup-wasip3.sh.
+#
+# Why nightly: the host engine is wasmtime 46 (needs Rust >= 1.94) and inferlet
+# guests target the Tier-3 `wasm32-wasip3` (WASI 0.3 / Component-Model-async),
+# which has NO prebuilt std -> it must be built from source with `-Zbuild-std`
+# (nightly-only; needs the `rust-src` component). Pinned to a specific dated
+# nightly for reproducibility — verified end to end: host `cargo build -p pie`
+# is green, and a trivial `async fn run` component builds + runs on the host.
+#
+# `wasm32-wasip2` is listed ONLY as a wasi-libc DONOR: `wasm32-wasip3` ships no
+# self-contained wasi-libc, so scripts/wasip3-link.sh injects `-L` from the
+# wasip2 self-contained libc (or `$WASI_SDK_PATH` when set). It is NOT a guest
+# build target — all inferlets target `wasm32-wasip3`.
+#
+# NOTE: the `schema-header-drift` CI job pins stable 1.91.1 via a job-local
+# RUSTUP_TOOLCHAIN override (cbindgen `parse.expand` output is toolchain-
+# specific); RUSTUP_TOOLCHAIN outranks this file so that job stays deterministic.
+[toolchain]
+channel = "nightly-2026-06-24"
+components = ["rust-src", "clippy", "rustfmt"]
+targets = ["wasm32-wasip2"]

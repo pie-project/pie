@@ -1,0 +1,10 @@
+[package]
+name = "prefix-cache-e2e"
+version = "0.1.0"
+description = "Prefix-cache e2e: two identical CANONICAL prefills; the second grafts the cached prefix and fires only the suffix"
+authors = ["In Gim <in.gim@icloud.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]

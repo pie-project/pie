@@ -98,9 +98,9 @@ impl StorageCompiler<'_> {
         }
         assign_persistent_offsets(&mut self.program)?;
         // `BulkExtentWrite` / `SlabScatter` address a single contiguous device
-        // arena. Backends without one (Portable: per-tensor ggml buffers) must
-        // keep plain per-buffer `ExtentWrite`s — they have no arena base to
-        // resolve an arena-relative destination against.
+        // arena. Backends without one must keep plain per-buffer
+        // `ExtentWrite`s — they have no arena base to resolve an
+        // arena-relative destination against.
         if self.program.target.backend.uses_persistent_arena() {
             coalesce_persistent_arena_writes(&mut self.program)?;
             hoist_bulk_extent_writes(&mut self.program)?;
@@ -1701,27 +1701,6 @@ fn compact_extent_for_copy(extent: &StridedExtent) -> bool {
 
 fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError> {
     for instr in &program.instrs {
-        // Instruction-kind support. The portable executor walks a per-tensor
-        // ggml-buffer model: it has no single persistent device arena
-        // (`BulkExtentWrite` / `SlabScatter` resolve against an arena base) and
-        // decodes quant inline via `Decode` TileMaps rather than attaching
-        // separate scale/zero-point metadata (`Attach`). Reject those here so a
-        // missing executor impl surfaces as a clear compile error instead of
-        // silently-unwritten weight buffers (zero tensors → gibberish output).
-        if program.target.backend == BackendKind::Portable {
-            let unsupported = match instr {
-                StorageInstr::Attach { .. } => Some("Attach"),
-                StorageInstr::BulkExtentWrite { .. } => Some("BulkExtentWrite"),
-                StorageInstr::SlabScatter { .. } => Some("SlabScatter"),
-                _ => None,
-            };
-            if let Some(name) = unsupported {
-                return Err(CompileError::InvalidInput(format!(
-                    "Portable target cannot execute {name} instructions (the portable \
-                     executor has no persistent arena or quant-metadata path)"
-                )));
-            }
-        }
         let StorageInstr::TileMap {
             kind, transform, ..
         } = instr
@@ -1750,11 +1729,6 @@ fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError>
                                         | RepackLayout::MarlinMxfp4Scale
                                 ))))
             }
-            BackendKind::Portable => match kind {
-                TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder => true,
-                TileMapKind::Decode => transform.from == Some(QuantScheme::Fp8E4M3),
-                TileMapKind::Encode | TileMapKind::Transcode | TileMapKind::Repack => false,
-            },
         };
         if !supported {
             return Err(CompileError::InvalidInput(format!(

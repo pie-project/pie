@@ -11,13 +11,16 @@ repository = "https://github.com/pie-project/pie"
 thiserror = "1.0"
 # `PeerConn` (the pairing payload: peer id + exported handle + opaque connect
 # creds) crosses the control channel, so it derives serde — like the floor's
-# control-plane vocab (`cluster`/`kv`).
+# control-plane vocab (`cluster`/`transfer`).
 serde = { version = "1.0", features = ["derive"] }
 
-# KV layout + handle vocabulary live in `pie-schema` (the dependency floor):
-# `pie_schema::kv::{KvLayout, KvDtype, KvLayoutKind, KvHandle, KvRegion,
-# MemoryDomain}` — pure-Rust types (pie-schema is Python-free, no features).
-pie-schema = { path = "../../protocol/schema", default-features = false }
+# KV layout + handle vocabulary live in `pie-driver-abi` (the dependency floor):
+# `pie_driver_abi::{KvLayout, KvDtype, KvLayoutKind, KvHandle, KvRegion,
+# MemoryDomain}` — pure-Rust types (pie-driver-abi is Python-free, no features).
+pie-driver-abi = { path = "../../interface/driver", default-features = false }
+# `WorkerId` now lives on the interface leaf (`pie-ids`); transport names a
+# transfer's src/dst by it. Plain serde, no internal deps.
+pie-ids = { path = "../../interface/ids" }
 
 [features]
 # Cross-node RDMA/TCP/NVMe path via NIXL. Off by default: the on-device build

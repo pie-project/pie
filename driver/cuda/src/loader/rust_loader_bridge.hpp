@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
 
 #include "loader/rust_quant_attachment.hpp"
 #include "loader/rust_loader_input.hpp"
@@ -610,6 +612,34 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
     return attachments;
 }
 
+// Read a runtime-compiled StorageProgram (weight-loader Variant A) from
+// `path` — the serialized `bincode` program the runtime wrote in-process and
+// handed off via `[model].storage_program_path` in the boot TOML. The **bulk
+// weight bytes never cross**: the program records only tensor locations; the
+// driver reads payloads from its own copy of the checkpoint during execution.
+inline RustStorageProgram read_storage_program_from_file(const std::string& path)
+{
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        throw std::runtime_error(
+            "engine: cannot open runtime storage-program file '" + path +
+            "' ([model].storage_program_path). Bulk weights never cross this "
+            "boundary — only the compiled StorageProgram IR is shipped.");
+    }
+    const std::streamsize size = in.tellg();
+    if (size < 0) {
+        throw std::runtime_error(
+            "engine: cannot size runtime storage-program file '" + path + "'");
+    }
+    in.seekg(0, std::ios::beg);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    if (size > 0 && !in.read(reinterpret_cast<char*>(bytes.data()), size)) {
+        throw std::runtime_error(
+            "engine: failed to read runtime storage-program file '" + path + "'");
+    }
+    return deserialize_rust_storage_program(bytes);
+}
+
 inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
     const HfConfig& hf,
     const SafetensorsCheckpointSource& loader,
@@ -618,7 +648,9 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
     int tp_size,
     std::uint64_t max_tile_bytes,
     std::uint32_t preferred_alignment,
-    const BackendTarget& backend_target)
+    const BackendTarget& backend_target,
+    const std::string& snapshot_dir,
+    const std::string& storage_program_path)
 {
     RustLoaderInputBuilder input;
     input.set_model(hf, runtime_quant);
@@ -634,7 +666,18 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
     RustLoaderSourceIndex source_index =
         add_checkpoint_metadata_to_rust_input(input, loader, hf);
     const std::string cache_key = rust_loader_compile_cache_key(input.view());
-    RustStorageProgram program = compile_rust_storage_program_cached(input.view());
+    (void)snapshot_dir;
+    // Locality switch (weight-loader Variant A): an embedded/in-process driver's
+    // runtime compiles the StorageProgram in-process and hands it off as a file
+    // named in `[model].storage_program_path`; we only deserialize + execute it
+    // here. Remote/out-of-process (and standalone) drivers leave the path empty
+    // and keep the C++ FFI compile below. Either way the source index, quant
+    // attachments, coverage counts, and cache key are computed identically from
+    // the checkpoint metadata + HF config.
+    RustStorageProgram program =
+        !storage_program_path.empty()
+            ? read_storage_program_from_file(storage_program_path)
+            : compile_rust_storage_program_cached(input.view());
     const auto view = program.view();
     const std::size_t runtime_tensor_count = view.tensors.len;
     std::vector<RustQuantAttachment> attachments =

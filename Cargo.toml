@@ -2,31 +2,62 @@
 #
 # Members are the crates that build for the host (Linux/macOS x86_64/aarch64).
 # Wasm-target crates (`inferlets/*`, `sdk/rust/*`) are intentionally excluded —
-# they have their own Cargo.lock files and target `wasm32-wasip2`, so mixing
+# they have their own Cargo.lock files and target `wasm32-wasip3`, so mixing
 # them into this workspace's resolver would pull wasm-only deps into the host
 # build graph.
 [workspace]
 resolver = "2"
 members = [
-    "runtime",
+    "runtime/engine",
+    # X0 tensor-waker substrate (leaf crate; loom-model-checked in isolation).
+    "runtime/waker",
+    # Keystone leaf: BPE tokenizer (encode/decode) loaded from HF tokenizer.json.
+    "runtime/tokenizer",
+    # Constrained-decoding grammar engine (EBNF/regex/json-schema/matcher/bitmask).
+    "runtime/grammar",
+    # Model metadata + instruct chat templates + multimodal host-decode.
+    "runtime/model",
+    # Shared process skeleton (paths, config sourcing, tracing/metrics, signals,
+    # CLI skeleton). Depends on no role lib.
+    "bootstrap",
+    # Role libraries (pure libs: run(Config) -> Handle; no bin, never dep each other).
     "controller",
     "gateway",
+    "worker",
     "driver/transport",
     "client/rust",
-    "worker",
-    "protocol/schema",
-    "protocol/schema-bindgen",
-    "protocol/schema-derive",
-    "protocol/control",
-    "protocol/dispatch",
-    "driver/ipc",
+    # Interface crates — boundary-named contracts (see designs/design-interface-restructure).
+    # ids: deduped id atoms (plain serde leaf). driver: direct local FFI ABI +
+    # cold capabilities + transfer vocabulary, with its cbindgen tool.
+    # controller/worker/client: control-plane, data-plane, public-edge.
+    "interface/ids",
+    "interface/driver",
+    "interface/driver/cbindgen",
+    "interface/controller",
+    "interface/worker",
+    "interface/client",
+    # PTIR — the Pie Tensor IR: the cross-language seam for programmable dataflow
+    # (stage-tagged trace container + validation + versioned wire format).
+    # `no_std` core; the wasm SDK depends on it with `default-features = false`.
+    "interface/ptir",
     "driver/dummy",
     "driver/weight-loader",
     "sdk/python-server",
+    # Thin binary shells composing bootstrap + role lib(s). `bin/pie` is the
+    # composition root (deps all three role libs; the standalone).
+    "bin/controller",
+    "bin/gateway",
+    "bin/worker",
+    "bin/pie",
 ]
 exclude = [
     "inferlets",
     "sdk/rust",
+    # Worktree checkouts under .claude/worktrees/ must never be captured by
+    # THIS manifest when cargo walks up from a worktree's excluded package
+    # (e.g. .claude/worktrees/<x>/inferlets/<name> — the worktree's own root
+    # excludes it, so the walk continues up to here).
+    ".claude",
 ]
 
 # Distribution profile for `pie-worker`. Use

@@ -4,12 +4,10 @@
 //! where each agent has a specific role (idea generator, plot developer,
 //! character creator, or dialogue writer) and passes work to the next agent.
 
-use inferlet::{
-    Context, model::Model, runtime,
-    messaging, SubscriptionExt,
-    Result,
-    sample::Sampler,
-};
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{self, LoweredSampler, SamplerSpec};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{carrier, chat, messaging, model, Result};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -87,21 +85,84 @@ fn get_agent_config(role: &str) -> Result<AgentConfig> {
     }
 }
 
+/// Read the sampled token off a finalized pass's single-`Token` output tensor.
+async fn read_token(pass: ForwardPass) -> Result<u32> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(if bytes.len() >= 4 {
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
+    } else {
+        0
+    })
+}
+
+/// Chat-EOS depth-1 pipelined decode over the keep-core carrier, returning the
+/// detokenized text. `prompt` is the full prompt tail (the first sampling pass).
+/// Speculate the next forward eagerly, roll an over-shot pass back with
+/// `carrier::discard_pass` on a stop. See `ptir-pipelined-eos-rollback-spec`.
+async fn decode_chat(
+    kv: &KvWorkingSet,
+    seq_len: &mut u32,
+    fresh: &mut bool,
+    s: &LoweredSampler,
+    prompt: &[u32],
+    max_tokens: usize,
+) -> Result<String> {
+    let stop = chat::stop_tokens();
+    let mut dec = chat::Decoder::new();
+    let mut text = String::new();
+    if max_tokens == 0 {
+        return Ok(text);
+    }
+    let prompt = if prompt.is_empty() { &[0u32][..] } else { prompt };
+    let mut producer = carrier::submit_pass(kv, seq_len, fresh, s, prompt, true)?;
+    let mut generated = 0usize;
+    loop {
+        let speculate = generated + 1 < max_tokens;
+        let consumer = if speculate {
+            Some(carrier::submit_pass(kv, seq_len, fresh, s, &[0u32], true)?)
+        } else {
+            None
+        };
+        let token = read_token(producer).await?;
+        generated += 1;
+        let mut done = stop.contains(&token);
+        if !done {
+            match dec.feed(&[token])? {
+                chat::Event::Delta(t) => text.push_str(&t),
+                chat::Event::Done(t) => {
+                    text = t;
+                    done = true;
+                }
+                _ => {}
+            }
+        }
+        if generated >= max_tokens {
+            done = true;
+        }
+        if done {
+            if let Some(c) = consumer {
+                carrier::discard_pass(c, seq_len).await;
+            }
+            break;
+        }
+        producer = consumer.expect("consumer speculated when not terminal");
+    }
+    Ok(text)
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let my_role = input.role;
     let group_id = input.group_id;
     let tokens_per_step = input.tokens_per_step;
 
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-    let tokenizer = model.tokenizer();
     let config = get_agent_config(&my_role)?;
 
     let (user_prompt, accumulated_story) = if let Some(prev_topic) = config.prev_topic {
         // Subscribe to the previous agent's topic and wait for a message
-        let subscription = messaging::subscribe(&format!("{}-{}", prev_topic, group_id));
-        let accumulated = subscription.get_async().await
+        let mut subscription = messaging::subscribe(&format!("{}-{}", prev_topic, group_id));
+        let accumulated = subscription.next().await
             .ok_or_else(|| "No message received from previous agent".to_string())?;
         let prompt = format!(
             "**Previous Story Elements:**\n---\n{}\n---\n\n**Your Specific Task:**\n{}",
@@ -112,25 +173,31 @@ async fn main(input: Input) -> Result<String> {
         (input.prompt, String::new())
     };
 
-    let mut ctx = Context::new(&model)?;
-    ctx.system(config.system_message);
-    ctx.user(&format!(
-        "{}\nPlease start with \"### {}\"",
-        user_prompt, config.section_header
-    ));
-    ctx.cue();
+    // Build the prompt on the raw WIT surface: a deferred system folds into the
+    // first user turn via `system_user` (mirrors `Context::user`), then cue —
+    // the whole prompt is the tail the first decode pass samples from.
+    let kv = KvWorkingSet::new();
+    let mut seq_len: u32 = 0;
+    let mut fresh = true;
 
-    let contribution = ctx
-        .generate(Sampler::Argmax)
-        .max_tokens(tokens_per_step)
-        .collect_text()
-        .await?;
+    let mut tail = chat::system_user(
+        config.system_message,
+        &format!(
+            "{}\nPlease start with \"### {}\"",
+            user_prompt, config.section_header
+        ),
+    );
+    tail.extend(chat::cue());
+
+    let s = sampler::sampler_program(SamplerSpec::Argmax, model::output_vocab_size())?;
+    let contribution =
+        decode_chat(&kv, &mut seq_len, &mut fresh, &s, &tail, tokens_per_step).await?;
 
     // Strip any EOS token text from the contribution
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens();
     let stop_text: Vec<String> = stop_tokens
         .iter()
-        .filter_map(|&t| tokenizer.decode(&[t]).ok())
+        .filter_map(|&t| inferlet::model::decode(&[t]).ok())
         .collect();
     let contribution: &str = stop_text
         .iter()

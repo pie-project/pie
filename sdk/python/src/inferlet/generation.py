@@ -38,7 +38,7 @@ from wit_world.imports import zo as _zo
 from wit_world.imports.inference import SlotOutput_Token
 
 from . import chat as _chat
-from ._async import await_future
+from . import model as _model
 from .forward import Output, ProbeHandle, SampleHandle, _probe_kind
 from .grammar import (
     AnyJson,
@@ -162,7 +162,7 @@ class Generator:
             if system_speculation is not None
             else speculator is None
             and _sampler_is_argmax(sampler)
-            and ctx._model.default_system_speculation()
+            and _model.default_system_speculation()
         )
         # Cache for next-iter system drafts (populated each step from
         # the WIT output's spec channel when system speculation is on).
@@ -170,7 +170,7 @@ class Generator:
 
     def _add_constraint(self, c: Schema | Constraint) -> None:
         if hasattr(c, "build_constraint"):
-            self._constraints.append(c.build_constraint(self._ctx._model))
+            self._constraints.append(c.build_constraint())
         elif hasattr(c, "step"):
             self._constraints.append(c)
         else:
@@ -254,8 +254,8 @@ class Generator:
             raise StopAsyncIteration
 
         # Drain context buffer (filled by `system / user / cue / ...`).
-        pending = self._ctx._pending_tokens
-        self._ctx._pending_tokens = []
+        pending = self._ctx._buffer
+        self._ctx._buffer = []
 
         # Pull drafts from the speculator.
         if self._use_system_spec:
@@ -303,7 +303,7 @@ class Generator:
                 break
         # Max-tokens enforcement.
         if self._max_tokens is not None:
-            remaining = self._max_tokens - self._tokens_generated
+            remaining = max(0, self._max_tokens - self._tokens_generated)
             if len(accepted) > remaining:
                 accepted = accepted[:remaining]
                 self._done = True
@@ -312,7 +312,7 @@ class Generator:
             return []
 
         # Stage for next forward pass via the buffer; advance counters.
-        self._ctx._pending_tokens.extend(accepted)
+        self._ctx._buffer.extend(accepted)
         self._constraint_pending.extend(accepted)
         self._tokens_generated += len(accepted)
         if self._speculator is not None:
@@ -336,7 +336,7 @@ class Generator:
         clean end-of-turn (the expected case); otherwise concatenates
         every ``Delta`` chunk. The two are equal when the host honors
         the chat-template contract (Done's text == sum of deltas)."""
-        decoder = _chat.Decoder(self._ctx._model)
+        decoder = _chat.Decoder()
         text_parts: list[str] = []
         async for step in self:
             res = await step.execute()
@@ -445,53 +445,62 @@ class GenStep:
         n_pending = len(self._pending)
         n_drafted = len(self._drafts)
 
-        # Truly nothing to do — no input, no auto-sampler, no extra probes.
-        if (
-            n_pending == 0
-            and n_drafted == 0
-            and self._user_cleared_sampler
-            and not self._extra_probes
-        ):
+        if n_pending == 0 and n_drafted == 0:
             gen._done = True
             return Output(
                 _inf.Output(slots=[], spec_tokens=[], spec_positions=[])
             )
 
-        # Reserve pages for pending + drafts.
-        n_total = n_pending + n_drafted
-        if n_total > 0:
-            total_after = ctx._working_tokens + n_total
-            pages_needed = (total_after + ctx._page_size - 1) // ctx._page_size
-            additional = max(0, pages_needed - ctx._working_pages)
-            if additional > 0:
-                ctx._handle.reserve_working_pages(additional)
-                ctx._working_pages = pages_needed
+        is_custom = gen._speculator is not None
+        do_sdk_verify = is_custom and n_drafted > 0 and n_pending > 0
+        n_write = n_pending + n_drafted if do_sdk_verify else n_pending
 
         # Build forward pass.
-        fwd = _inf.ForwardPass(ctx._model._handle)
-        fwd.context(ctx._handle)
+        fwd = _inf.ForwardPass()
+        if n_write > 0:
+            generation, indices, valid_lens, ctx_pages = ctx._prepare_write(n_write)
+            ctx._attach_kv(fwd, generation, indices, valid_lens, ctx_pages)
+        else:
+            ctx._attach_full_context(fwd)
+
         if gen._adapter is not None:
             fwd.adapter(gen._adapter._handle)
         if gen._zo_seed is not None:
             _zo.adapter_seed(fwd, gen._zo_seed)
 
-        if n_pending > 0:
-            positions = list(range(ctx._seq_len, ctx._seq_len + n_pending))
-            fwd.input_tokens(self._pending, positions)
-        if self._drafts:
-            fwd.input_speculative_tokens(self._drafts, self._draft_positions)
+        if do_sdk_verify:
+            all_tokens = list(self._pending)
+            all_tokens.extend(self._drafts)
+            all_positions = list(range(ctx._seq_len, ctx._seq_len + n_pending))
+            all_positions.extend(self._draft_positions)
+            fwd.input_tokens(all_tokens, all_positions)
+        else:
+            if n_pending > 0:
+                positions = list(range(ctx._seq_len, ctx._seq_len + n_pending))
+                fwd.input_tokens(self._pending, positions)
+            if self._drafts:
+                fwd.input_speculative_tokens(self._drafts, self._draft_positions)
+
         remaining = (
             None
             if gen._max_tokens is None
-            else gen._max_tokens - gen._tokens_generated
+            else max(0, gen._max_tokens - gen._tokens_generated)
         )
         if gen._use_system_spec and (remaining is None or remaining > 1):
             fwd.output_speculative_tokens(True)
+        if remaining is not None and remaining <= n_drafted + 1:
+            fwd.pass_speculation(False)
 
         # Sampler at last input position (or 0 if drafts only / no input).
-        sample_idx = max(0, n_pending - 1)
+        sample_idx = n_pending - 1 if n_pending > 0 else 0
         if not self._user_cleared_sampler:
-            fwd.sampler([sample_idx], gen._sampler._variant)
+            if do_sdk_verify:
+                fwd.sampler(
+                    list(range(sample_idx, sample_idx + n_drafted + 1)),
+                    gen._sampler._variant,
+                )
+            else:
+                fwd.sampler([sample_idx], gen._sampler._variant)
 
         # Per-generator step probes.
         for idx, probe in gen._step_probes:
@@ -503,12 +512,27 @@ class GenStep:
         if self._mask is not None:
             fwd.logit_mask(self._mask)
 
-        raw = await await_future(fwd.execute(), "GenStep.execute failed")
+        raw = await fwd.execute()
 
-        # Collect accepted tokens off slot 0 (and following Token slots
-        # in spec mode — verifier produces a sequence).
         if self._user_cleared_sampler:
             accepted: list[int] = []
+        elif do_sdk_verify:
+            n_picks = n_drafted + 1
+            picks = [
+                slot.value
+                for slot in raw.slots[:n_picks]
+                if isinstance(slot, SlotOutput_Token)
+            ]
+            if len(picks) != n_picks:
+                raise RuntimeError(
+                    "GenStep.execute verify: expected "
+                    f"{n_picks} Token slots, got {len(picks)}"
+                )
+            accepted = [picks[0]]
+            for k in range(n_drafted):
+                if picks[k] != self._drafts[k]:
+                    break
+                accepted.append(picks[k + 1])
         else:
             accepted = []
             for slot in raw.slots:
@@ -516,6 +540,8 @@ class GenStep:
                     accepted.append(slot.value)
                 else:
                     break
+        if not self._user_cleared_sampler and not accepted:
+            raise RuntimeError("GenStep.execute: auto-sampler returned no token")
 
         # Stash next-iter system drafts; let custom speculators see accepted.
         if gen._use_system_spec:
@@ -523,35 +549,20 @@ class GenStep:
         elif gen._speculator is not None:
             gen._speculator.accept(accepted)
 
-        # Truncate rejected drafts.
+        # Roll back rejected drafts in the custom speculator's own state.
+        n_verified_drafts = max(0, len(accepted) - 1) if n_drafted > 0 else 0
         if n_drafted > 0:
-            n_verified = max(0, len(accepted) - 1)
-            n_rejected = n_drafted - n_verified
+            n_rejected = n_drafted - n_verified_drafts
             if n_rejected > 0:
-                ctx._handle.truncate_working_page_tokens(n_rejected)
                 if gen._speculator is not None:
                     gen._speculator.rollback(n_rejected)
 
-        # Commit pages: pending always commit (real KV); verified drafts too.
-        n_verified_drafts = max(0, len(accepted) - 1) if n_drafted > 0 else 0
         n_kv = n_pending + n_verified_drafts
         if n_kv > 0:
-            new_working = ctx._working_tokens + n_kv
-            to_commit = new_working // ctx._page_size
-            if to_commit > 0:
-                ctx._handle.commit_working_pages(to_commit)
-            ctx._committed_pages += to_commit
-            ctx._working_pages -= to_commit
-            ctx._working_tokens = new_working % ctx._page_size
             ctx._seq_len += n_kv
-        elif n_drafted > 0 and not accepted:
-            # All drafts rejected with no anchor — re-sync from host.
-            ctx._committed_pages = ctx._handle.committed_page_count()
-            ctx._working_pages = ctx._handle.working_page_count()
-            ctx._working_tokens = ctx._handle.working_page_token_count()
-            ctx._seq_len = (
-                ctx._committed_pages * ctx._page_size + ctx._working_tokens
-            )
+            ctx._history.extend(self._pending)
+            if n_verified_drafts > 0:
+                ctx._history.extend(self._drafts[:n_verified_drafts])
 
         # Advance constraint state with accepted tokens.
         if gen._constraints:
@@ -565,13 +576,13 @@ class GenStep:
                 gen._done = True
                 break
         if gen._max_tokens is not None:
-            remaining = gen._max_tokens - gen._tokens_generated
+            remaining = max(0, gen._max_tokens - gen._tokens_generated)
             if len(tokens) > remaining:
                 tokens = tokens[:remaining]
                 gen._done = True
         gen._tokens_generated += len(tokens)
         if tokens:
-            ctx._pending_tokens.append(tokens[-1])
+            ctx._buffer.append(tokens[-1])
 
         auto_sampler = (
             None if self._user_cleared_sampler else SampleHandle(slot=0, arity=1)

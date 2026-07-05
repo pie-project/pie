@@ -5,6 +5,7 @@
 //! executable storage program view.
 
 pub mod abi;
+pub mod checkpoint_header;
 pub mod config;
 pub mod dump;
 pub mod error;
@@ -12,6 +13,8 @@ pub mod ffi;
 pub mod ffi_arena;
 pub mod ffi_types;
 pub mod frontend;
+pub mod gguf;
+pub mod inproc;
 pub mod ir;
 pub mod optimizer;
 pub mod reference;

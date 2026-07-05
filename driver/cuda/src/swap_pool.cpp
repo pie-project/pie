@@ -10,6 +10,10 @@
 
 namespace pie_cuda_driver {
 
+void SwapPool::synchronize() const {
+    if (stream_ != nullptr) CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
 SwapPool SwapPool::allocate(int num_layers,
                             int num_pages,
                             int page_size,
@@ -140,6 +144,14 @@ void SwapPool::copy_d2h(KvCache& cache,
                         std::span<const std::uint32_t> src_gpu,
                         std::span<const std::uint32_t> dst_host)
 {
+    copy_d2h_async(cache, src_gpu, dst_host);
+    synchronize();
+}
+
+void SwapPool::copy_d2h_async(KvCache& cache,
+                              std::span<const std::uint32_t> src_gpu,
+                              std::span<const std::uint32_t> dst_host)
+{
     check_pairs(src_gpu.size(), dst_host.size());
     for (int layer = 0; layer < num_layers_; ++layer) {
         auto dev_buffers = cache.page_buffers(layer);
@@ -153,12 +165,19 @@ void SwapPool::copy_d2h(KvCache& cache,
             }
         }
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
 void SwapPool::copy_h2d(KvCache& cache,
                         std::span<const std::uint32_t> src_host,
                         std::span<const std::uint32_t> dst_gpu)
+{
+    copy_h2d_async(cache, src_host, dst_gpu);
+    synchronize();
+}
+
+void SwapPool::copy_h2d_async(KvCache& cache,
+                              std::span<const std::uint32_t> src_host,
+                              std::span<const std::uint32_t> dst_gpu)
 {
     check_pairs(src_host.size(), dst_gpu.size());
     for (int layer = 0; layer < num_layers_; ++layer) {
@@ -173,12 +192,19 @@ void SwapPool::copy_h2d(KvCache& cache,
             }
         }
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
 void SwapPool::copy_d2d(KvCache& cache,
                         std::span<const std::uint32_t> src_gpu,
                         std::span<const std::uint32_t> dst_gpu)
+{
+    copy_d2d_async(cache, src_gpu, dst_gpu);
+    synchronize();
+}
+
+void SwapPool::copy_d2d_async(KvCache& cache,
+                              std::span<const std::uint32_t> src_gpu,
+                              std::span<const std::uint32_t> dst_gpu)
 {
     check_pairs(src_gpu.size(), dst_gpu.size());
     for (int layer = 0; layer < num_layers_; ++layer) {
@@ -192,11 +218,16 @@ void SwapPool::copy_d2d(KvCache& cache,
             }
         }
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
 void SwapPool::copy_h2h(std::span<const std::uint32_t> src_host,
                         std::span<const std::uint32_t> dst_host)
+{
+    copy_h2h_async(src_host, dst_host);
+}
+
+void SwapPool::copy_h2h_async(std::span<const std::uint32_t> src_host,
+                              std::span<const std::uint32_t> dst_host)
 {
     check_pairs(src_host.size(), dst_host.size());
     for (int layer = 0; layer < num_layers_; ++layer) {

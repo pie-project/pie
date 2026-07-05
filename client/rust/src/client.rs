@@ -1,5 +1,4 @@
 use crate::crypto::ParsedPrivateKey;
-use crate::mcp_bridge::BridgeRegistry;
 use crate::message::{CHUNK_SIZE_BYTES, ClientMessage, ServerMessage};
 use crate::utils::IdPool;
 use anyhow::{Context, Result, anyhow};
@@ -8,13 +7,18 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use rmp_serde::{decode, encode};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, http::HeaderValue, protocol::Message},
+};
 use uuid::Uuid;
 
 type CorrId = u32;
@@ -35,6 +39,23 @@ pub enum ProcessEvent {
     /// Process terminated with an error.
     Error(String),
 }
+
+#[derive(Debug)]
+enum ProcessEventRoute {
+    Buffered(BufferedProcessEvents),
+    Attached(mpsc::Sender<ProcessEvent>),
+}
+
+#[derive(Debug)]
+struct BufferedProcessEvents {
+    events: VecDeque<ProcessEvent>,
+    updated_at: Instant,
+    terminal: bool,
+}
+
+const MAX_BUFFERED_PROCESSES: usize = 1024;
+const MAX_BUFFERED_EVENTS_PER_PROCESS: usize = 1024;
+const BUFFERED_PROCESS_TTL: Duration = Duration::from_secs(60);
 
 /// Holds the state for a file being downloaded from the server.
 #[derive(Debug)]
@@ -57,12 +78,11 @@ struct ClientInner {
     corr_id_pool: IdPool<CorrId>,
     /// Single pending-request map: all request/reply commands use this.
     pending_requests: DashMap<CorrId, oneshot::Sender<(bool, String)>>,
-    /// Per-process event channels.
-    process_event_tx: DashMap<String, mpsc::Sender<ProcessEvent>>,
+    /// Per-process event routes. Events can precede the launch response, so
+    /// unmatched events remain buffered until `launch_process` attaches.
+    process_events: StdMutex<HashMap<String, ProcessEventRoute>>,
     /// In-flight file downloads (key: file_hash).
     pending_downloads: DashMap<String, Mutex<DownloadState>>,
-    /// Locally-spawned MCP servers, keyed by registered name.
-    mcp_bridge: BridgeRegistry,
 }
 
 /// Represents a running process on the server.
@@ -139,11 +159,50 @@ impl Process {
             Err(mpsc::error::TryRecvError::Disconnected) => Err(anyhow!("Event channel closed")),
         }
     }
+
+    /// Drain process events until the process returns, returning its `Return`
+    /// value (the inferlet's `Ok(String)`). `Stdout` / `Stderr` are forwarded
+    /// to the host process's stderr for live debugging; `Message` / `File`
+    /// events are ignored. Returns `Err` on a process `Error`, or if the event
+    /// channel closes before a return.
+    ///
+    /// Convenience for the common "launch and wait for the result" flow (e.g.
+    /// test harnesses that assert on a structured-JSON return value).
+    pub async fn wait_for_return(&mut self) -> Result<String> {
+        loop {
+            match self.recv().await? {
+                ProcessEvent::Return(value) => return Ok(value),
+                ProcessEvent::Error(e) => return Err(anyhow!("inferlet returned an error: {e}")),
+                ProcessEvent::Stdout(s) | ProcessEvent::Stderr(s) => eprint!("{s}"),
+                ProcessEvent::Message(_) | ProcessEvent::File(_) => {}
+            }
+        }
+    }
 }
 
 impl Client {
     pub async fn connect(ws_host: &str) -> Result<Client> {
-        let (ws_stream, _) = connect_async(ws_host).await?;
+        Self::connect_inner(connect_async(ws_host).await?.0)
+    }
+
+    /// Connect, injecting the `x-pie-identity` trust-edge header the gateway's
+    /// `/v1/ws` upgrade requires (a missing/empty header is rejected with 401
+    /// before the socket opens — see `gateway/src/ingress/identity.rs`).
+    /// Production deployments terminate identity at the edge proxy; in-process
+    /// / standalone harnesses must supply it on the client request directly.
+    pub async fn connect_with_identity(ws_host: &str, identity: &str) -> Result<Client> {
+        let mut request = ws_host.into_client_request()?;
+        request
+            .headers_mut()
+            .insert("x-pie-identity", HeaderValue::from_str(identity)?);
+        Self::connect_inner(connect_async(request).await?.0)
+    }
+
+    fn connect_inner(
+        ws_stream: tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Result<Client> {
         let (mut ws_write, mut ws_read) = ws_stream.split();
         let (ws_writer_tx, mut ws_writer_rx) = unbounded_channel();
 
@@ -151,9 +210,8 @@ impl Client {
             ws_writer_tx: ws_writer_tx.clone(),
             corr_id_pool: IdPool::new(CorrId::MAX),
             pending_requests: DashMap::new(),
-            process_event_tx: DashMap::new(),
+            process_events: StdMutex::new(HashMap::new()),
             pending_downloads: DashMap::new(),
-            mcp_bridge: BridgeRegistry::new(),
         });
 
         let writer_handle = task::spawn(async move {
@@ -207,10 +265,7 @@ impl Client {
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::AddProgram { corr_id, .. }
             | ClientMessage::LaunchProcess { corr_id, .. }
-            | ClientMessage::LaunchProcesses { corr_id, .. }
-            | ClientMessage::RunProcesses { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }
-            | ClientMessage::RegisterMcpServer { corr_id, .. }
             | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
@@ -245,8 +300,16 @@ impl Client {
             anyhow::bail!("Username '{}' rejected by engine: {}", username, result)
         }
 
-        // If the engine has disabled public key authentication, we can return early.
-        if result == "Authenticated (Engine disabled authentication)" {
+        // Early-return on a no-challenge success. The engine answers a
+        // challenge-less `AuthIdentify` in two cases the client treats as
+        // already-good: legacy key-auth disabled, or the trust-edge gateway
+        // path where the session is pre-authenticated from the verified
+        // `x-pie-identity` header (the worker session starts authenticated, so
+        // an `AuthIdentify` comes back as "Already authenticated"). Neither
+        // carries a base64 challenge, so there is nothing to sign.
+        if result == "Authenticated (Engine disabled authentication)"
+            || result == "Already authenticated"
+        {
             return Ok(());
         }
 
@@ -428,14 +491,12 @@ impl Client {
         inferlet: String,
         input: String,
         capture_outputs: bool,
-        token_budget: Option<usize>,
     ) -> Result<Process> {
         let msg = ClientMessage::LaunchProcess {
             corr_id: 0,
             inferlet,
             input,
             capture_outputs,
-            token_budget,
         };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
 
@@ -445,8 +506,7 @@ impl Client {
 
         // result is the UUID string
         let process_id = result;
-        let (tx, rx) = mpsc::channel(64);
-        self.inner.process_event_tx.insert(process_id.clone(), tx);
+        let rx = attach_process_events(&self.inner, &process_id);
 
         Ok(Process {
             id: process_id,
@@ -468,10 +528,7 @@ impl Client {
             anyhow::bail!("Attach process failed: {}", result);
         }
 
-        let (tx, rx) = mpsc::channel(64);
-        self.inner
-            .process_event_tx
-            .insert(process_id.to_string(), tx);
+        let rx = attach_process_events(&self.inner, process_id);
 
         Ok(Process {
             id: process_id.to_string(),
@@ -525,58 +582,6 @@ impl Client {
             anyhow::bail!("Terminate process failed: {}", result)
         }
     }
-
-    /// Registers an MCP server for this session.
-    /// All inferlets launched in this session can discover and connect to it.
-    ///
-    /// For `transport = "stdio"`, this spawns the server process locally and
-    /// performs the MCP `initialize` handshake before announcing the server
-    /// to the engine. Other transports are not yet implemented.
-    pub async fn register_mcp_server(
-        &self,
-        name: &str,
-        transport: &str,
-        command: Option<&str>,
-        args: Option<Vec<String>>,
-        url: Option<&str>,
-    ) -> Result<()> {
-        // Spawn locally first so engine-side registration only succeeds if
-        // the server actually came up.
-        match transport {
-            "stdio" => {
-                let cmd = command.context("register_mcp_server(stdio): `command` is required")?;
-                let args_vec = args.clone().unwrap_or_default();
-                self.inner
-                    .mcp_bridge
-                    .register_stdio(name, cmd, &args_vec)
-                    .await
-                    .with_context(|| {
-                        format!("Local registration of MCP server '{}' failed", name)
-                    })?;
-            }
-            other => {
-                anyhow::bail!(
-                    "register_mcp_server: transport '{}' is not yet supported (only 'stdio')",
-                    other
-                );
-            }
-        }
-
-        let msg = ClientMessage::RegisterMcpServer {
-            corr_id: 0,
-            name: name.to_string(),
-            transport: transport.to_string(),
-            command: command.map(|s| s.to_string()),
-            args,
-            url: url.map(|s| s.to_string()),
-        };
-        let (ok, result) = self.send_msg_and_wait(msg).await?;
-        if ok {
-            Ok(())
-        } else {
-            anyhow::bail!("Register MCP server failed: {}", result)
-        }
-    }
 }
 
 // =============================================================================
@@ -600,26 +605,18 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
             event,
             value,
         } => {
-            if let Some(sender) = inner.process_event_tx.get(&process_id) {
-                let process_event = match event.as_str() {
-                    "stdout" => ProcessEvent::Stdout(value),
-                    "stderr" => ProcessEvent::Stderr(value),
-                    "message" => ProcessEvent::Message(value),
-                    "return" => ProcessEvent::Return(value),
-                    "error" => ProcessEvent::Error(value),
-                    _ => {
-                        eprintln!("Unknown event type: {}", event);
-                        return;
-                    }
-                };
-                sender.send(process_event).await.ok();
-
-                // Clean up event channel on terminal events
-                if event == "return" || event == "error" {
-                    drop(sender);
-                    inner.process_event_tx.remove(&process_id);
+            let process_event = match event.as_str() {
+                "stdout" => ProcessEvent::Stdout(value),
+                "stderr" => ProcessEvent::Stderr(value),
+                "message" => ProcessEvent::Message(value),
+                "return" => ProcessEvent::Return(value),
+                "error" => ProcessEvent::Error(value),
+                _ => {
+                    eprintln!("Unknown event type: {}", event);
+                    return;
                 }
-            }
+            };
+            route_process_event(inner, process_id, process_event).await;
         }
         ServerMessage::File {
             process_id,
@@ -656,98 +653,205 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
                 if let Some((_, state_mutex)) = inner.pending_downloads.remove(&file_hash) {
                     let final_state = state_mutex.into_inner();
                     if hash_blob(&final_state.buffer) == file_hash {
-                        if let Some(sender) = inner.process_event_tx.get(&final_state.process_id) {
-                            sender
-                                .send(ProcessEvent::File(final_state.buffer))
-                                .await
-                                .ok();
-                        }
+                        route_process_event(
+                            inner,
+                            final_state.process_id,
+                            ProcessEvent::File(final_state.buffer),
+                        )
+                        .await;
                     }
                 }
             }
         }
-        ServerMessage::McpRequest {
-            corr_id,
-            process_id: _,
-            server_name,
-            method,
-            params,
-        } => {
-            let inner_for_task = Arc::clone(inner);
-            // Run the relay off the reader task so a slow MCP server can't
-            // block other server messages.
-            tokio::spawn(async move {
-                let (ok, result) =
-                    relay_mcp_request(&inner_for_task, server_name, method, params).await;
-                let response = ClientMessage::McpResponse {
-                    corr_id,
-                    ok,
-                    result,
-                };
-                if let Ok(encoded) = rmp_serde::encode::to_vec_named(&response) {
-                    inner_for_task
-                        .ws_writer_tx
-                        .send(Message::Binary(Bytes::from(encoded)))
-                        .ok();
-                }
-            });
-        }
     }
-}
-
-/// Forward a JSON-RPC method to the named local MCP server and return
-/// `(ok, payload)` for an `McpResponse`. On success, `payload` is the
-/// JSON-encoded `result` field of the JSON-RPC response. On failure,
-/// `payload` is a human-readable error string.
-async fn relay_mcp_request(
-    inner: &Arc<ClientInner>,
-    server_name: String,
-    method: String,
-    params: String,
-) -> (bool, String) {
-    let server = match inner.mcp_bridge.get(&server_name) {
-        Some(s) => s,
-        None => {
-            return (
-                false,
-                format!("MCP server '{}' is not registered locally", server_name),
-            );
-        }
-    };
-    // The runtime sends params as a JSON-encoded string. Parse it back so we
-    // can embed a real JSON value in the JSON-RPC envelope.
-    let params_value: serde_json::Value =
-        serde_json::from_str(&params).unwrap_or(serde_json::Value::Object(Default::default()));
-    match server.call(&method, params_value).await {
-        Ok(result_value) => match serde_json::to_string(&result_value) {
-            Ok(s) => (true, s),
-            Err(e) => (
-                false,
-                encode_error(-32603, &format!("Result serialize: {}", e), None),
-            ),
-        },
-        Err(e) => (false, encode_error(e.code, &e.message, e.data)),
-    }
-}
-
-/// Encode a JSON-RPC-style error as the JSON payload that the runtime side
-/// expects to parse on `ok=false`.
-fn encode_error(code: i64, message: &str, data: Option<serde_json::Value>) -> String {
-    let mut obj = serde_json::Map::new();
-    obj.insert("code".into(), serde_json::Value::Number(code.into()));
-    obj.insert(
-        "message".into(),
-        serde_json::Value::String(message.to_string()),
-    );
-    if let Some(d) = data {
-        obj.insert("data".into(), d);
-    }
-    serde_json::Value::Object(obj).to_string()
 }
 
 /// When the server terminates, clear all pending state.
 async fn handle_server_termination(inner: &Arc<ClientInner>) {
     inner.pending_requests.clear();
-    inner.process_event_tx.clear();
+    inner
+        .process_events
+        .lock()
+        .expect("process event routes mutex poisoned")
+        .clear();
     inner.pending_downloads.clear();
+}
+
+fn is_terminal_process_event(event: &ProcessEvent) -> bool {
+    matches!(event, ProcessEvent::Return(_) | ProcessEvent::Error(_))
+}
+
+fn purge_expired_process_events(routes: &mut HashMap<String, ProcessEventRoute>) {
+    let now = Instant::now();
+    routes.retain(|process_id, route| {
+        let keep = match route {
+            ProcessEventRoute::Buffered(buffered) => {
+                now.duration_since(buffered.updated_at) <= BUFFERED_PROCESS_TTL
+            }
+            ProcessEventRoute::Attached(_) => true,
+        };
+        if !keep {
+            eprintln!("Discarding expired events for unattached process {process_id}");
+        }
+        keep
+    });
+}
+
+fn attach_process_events(inner: &ClientInner, process_id: &str) -> mpsc::Receiver<ProcessEvent> {
+    let mut routes = inner
+        .process_events
+        .lock()
+        .expect("process event routes mutex poisoned");
+    purge_expired_process_events(&mut routes);
+    let buffered = match routes.remove(process_id) {
+        Some(ProcessEventRoute::Buffered(buffered)) => buffered.events,
+        Some(ProcessEventRoute::Attached(_)) | None => VecDeque::new(),
+    };
+    let terminal = buffered.iter().any(is_terminal_process_event);
+    let (tx, rx) = mpsc::channel(buffered.len().max(64));
+    for event in buffered {
+        tx.try_send(event)
+            .expect("new process event channel has capacity for buffered events");
+    }
+    if !terminal {
+        routes.insert(process_id.to_string(), ProcessEventRoute::Attached(tx));
+    }
+    rx
+}
+
+async fn route_process_event(inner: &ClientInner, process_id: String, event: ProcessEvent) {
+    let terminal = is_terminal_process_event(&event);
+    let mut event = Some(event);
+    let sender = {
+        let mut routes = inner
+            .process_events
+            .lock()
+            .expect("process event routes mutex poisoned");
+        purge_expired_process_events(&mut routes);
+        match routes.get_mut(&process_id) {
+            Some(ProcessEventRoute::Attached(sender)) => {
+                let sender = sender.clone();
+                if terminal {
+                    routes.remove(&process_id);
+                }
+                Some(sender)
+            }
+            Some(ProcessEventRoute::Buffered(buffered)) => {
+                if buffered.terminal {
+                    eprintln!("Discarding event received after terminal event for {process_id}");
+                } else if buffered.events.len() >= MAX_BUFFERED_EVENTS_PER_PROCESS {
+                    buffered.events.clear();
+                    buffered.events.push_back(ProcessEvent::Error(
+                        "process event buffer overflowed before attachment".to_string(),
+                    ));
+                    buffered.terminal = true;
+                } else {
+                    buffered
+                        .events
+                        .push_back(event.take().expect("process event present"));
+                    buffered.terminal = terminal;
+                }
+                buffered.updated_at = Instant::now();
+                None
+            }
+            None => {
+                let buffered_count = routes
+                    .values()
+                    .filter(|route| matches!(route, ProcessEventRoute::Buffered(_)))
+                    .count();
+                if buffered_count >= MAX_BUFFERED_PROCESSES
+                    && let Some(oldest) = routes
+                        .iter()
+                        .filter_map(|(id, route)| match route {
+                            ProcessEventRoute::Buffered(buffered) => {
+                                Some((id.clone(), buffered.updated_at))
+                            }
+                            ProcessEventRoute::Attached(_) => None,
+                        })
+                        .min_by_key(|(_, updated_at)| *updated_at)
+                        .map(|(id, _)| id)
+                {
+                    routes.remove(&oldest);
+                    eprintln!("Discarding oldest unattached process events for {oldest}");
+                }
+                routes.insert(
+                    process_id,
+                    ProcessEventRoute::Buffered(BufferedProcessEvents {
+                        events: VecDeque::from([event.take().expect("process event present")]),
+                        updated_at: Instant::now(),
+                        terminal,
+                    }),
+                );
+                None
+            }
+        }
+    };
+    if let Some(sender) = sender {
+        sender
+            .send(event.expect("attached process event present"))
+            .await
+            .ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_inner() -> Arc<ClientInner> {
+        let (ws_writer_tx, _) = unbounded_channel();
+        Arc::new(ClientInner {
+            ws_writer_tx,
+            corr_id_pool: IdPool::new(CorrId::MAX),
+            pending_requests: DashMap::new(),
+            process_events: StdMutex::new(HashMap::new()),
+            pending_downloads: DashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn buffers_terminal_event_until_process_receiver_attaches() {
+        let inner = test_inner();
+        route_process_event(
+            &inner,
+            "fast-process".to_string(),
+            ProcessEvent::Return("done".to_string()),
+        )
+        .await;
+
+        let mut rx = attach_process_events(&inner, "fast-process");
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProcessEvent::Return(value)) if value == "done"
+        ));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn preserves_events_buffered_before_process_receiver_attaches() {
+        let inner = test_inner();
+        route_process_event(
+            &inner,
+            "process".to_string(),
+            ProcessEvent::Stdout("first".to_string()),
+        )
+        .await;
+        let mut rx = attach_process_events(&inner, "process");
+        route_process_event(
+            &inner,
+            "process".to_string(),
+            ProcessEvent::Return("second".to_string()),
+        )
+        .await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProcessEvent::Stdout(value)) if value == "first"
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProcessEvent::Return(value)) if value == "second"
+        ));
+        assert!(rx.recv().await.is_none());
+    }
 }

@@ -14,12 +14,13 @@ use tarpc::serde_transport::{tcp, unix};
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
-use pie_control::{Control, ControlRequest, ControlResponse};
-use pie_schema::control::{
-    Ack, GatewayId, GatewayInfo, Neighbors, NodeId, RoutingTable, WorkerId, WorkerInfo,
-    WorkerStatus,
+use pie_controller_rpc::{
+    Ack, Control, ControlRequest, ControlResponse, GatewayInfo, Neighbors, RoutingTable,
+    WorkerInfo, WorkerStatus,
 };
+use pie_ids::{GatewayId, NodeId, WorkerId};
 
 use crate::Handle;
 
@@ -55,8 +56,14 @@ impl Control for ControlServer {
     }
 }
 
-/// Bind the control endpoint (tcp or unix) and spawn the accept loop.
-pub(crate) async fn serve(listen_addr: &str, handle: Handle) -> io::Result<JoinHandle<()>> {
+/// Bind the control endpoint (tcp or unix) and spawn the accept loop. The loop
+/// runs until `cancel` is triggered (by [`crate::ControllerHandle::shutdown`]) or
+/// the listener closes.
+pub(crate) async fn serve(
+    listen_addr: &str,
+    handle: Handle,
+    cancel: CancellationToken,
+) -> io::Result<JoinHandle<()>> {
     let server = ControlServer { handle };
     if let Some(path) = listen_addr
         .strip_prefix("unix://")
@@ -64,12 +71,22 @@ pub(crate) async fn serve(listen_addr: &str, handle: Handle) -> io::Result<JoinH
     {
         let incoming = unix::listen(path, Bincode::default).await?;
         tracing::info!(listen = %listen_addr, "controller serving Control (tarpc/uds)");
-        Ok(tokio::spawn(serve_loop(incoming, server)))
+        Ok(tokio::spawn(async move {
+            tokio::select! {
+                _ = serve_loop(incoming, server) => {}
+                _ = cancel.cancelled() => {}
+            }
+        }))
     } else {
         let tcp_addr = listen_addr.strip_prefix("tcp://").unwrap_or(listen_addr);
         let incoming = tcp::listen(tcp_addr, Bincode::default).await?;
         tracing::info!(listen = %listen_addr, "controller serving Control (tarpc/tcp)");
-        Ok(tokio::spawn(serve_loop(incoming, server)))
+        Ok(tokio::spawn(async move {
+            tokio::select! {
+                _ = serve_loop(incoming, server) => {}
+                _ = cancel.cancelled() => {}
+            }
+        }))
     }
 }
 

@@ -11,8 +11,8 @@
 // the Python inferlet `python-constrained-decoding`.
 
 import {
-    Model, Context, Sampler,
-    session, runtime,
+    Context, Sampler,
+    session,
 } from 'inferlet';
 
 interface Person {
@@ -43,8 +43,7 @@ export async function main(input: Input) {
         'Generate a profile for a fictional software engineer named Alice.';
     const maxTokens = input.max_tokens ?? 512;
 
-    const model = Model.load(runtime.models()[0]);
-    using ctx = new Context(model);
+    using ctx = new Context();
     ctx.system(
         'You are a helpful assistant that generates structured data. ' +
         'Output ONLY a raw JSON object — no markdown, no explanation.',

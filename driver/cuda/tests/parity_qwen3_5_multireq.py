@@ -110,7 +110,7 @@ async def run_test(args) -> int:
     from pie.server import Server
     from pie.config import (
         Config, ModelConfig, DriverConfig, AuthConfig, RuntimeConfig,
-        SchedulerConfig, ServerConfig, TelemetryConfig,
+        ServerConfig, TelemetryConfig,
     )
 
     script_dir = Path(__file__).parent.resolve()
@@ -128,28 +128,19 @@ async def run_test(args) -> int:
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(wasm_max_instances=4096),
-        models=[
-            ModelConfig(
-                name="default",
-                hf_repo=args.model,
-                scheduler=SchedulerConfig(
-                    # `greedy` packs as many ready requests as possible
-                    # into each fire — needed to actually exercise R>1
-                    # multi-request fires in the concurrent pass.
-                    batch_policy="greedy",
-                    default_token_limit=512,
-                ),
-                driver=DriverConfig(
-                    type="cuda_native",
-                    device=args.device.split(","),
-                    tensor_parallel_size=args.tp_size,
-                    options={
-                        "gpu_mem_utilization": args.gpu_mem_util,
-                        "memory_profile": args.memory_profile,
-                    },
-                ),
+        model=ModelConfig(
+            name="default",
+            hf_repo=args.model,
+            driver=DriverConfig(
+                type="cuda_native",
+                device=args.device.split(","),
+                tensor_parallel_size=args.tp_size,
+                options={
+                    "gpu_mem_utilization": args.gpu_mem_util,
+                    "memory_profile": args.memory_profile,
+                },
             ),
-        ],
+        ),
     )
 
     async with Server(cfg) as server:

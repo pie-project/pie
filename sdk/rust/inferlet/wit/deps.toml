@@ -1,3 +1,0 @@
-core = "../../../../runtime/wit/core/wit"
-zo = "../../../../runtime/wit/zo/wit"
-mcp = "../../../../runtime/wit/mcp/wit"

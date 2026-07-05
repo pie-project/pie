@@ -26,15 +26,15 @@ use anyhow::{Result, bail};
 use futures::StreamExt;
 use tokio::sync::watch;
 
-use pie_dispatch::{GatewayInboundClient, WorkerControl, connect_gateway_link, dispatch_codec};
+use pie_client_api::{ClientMessage, ServerMessage};
+use pie_controller_rpc::{
+    Ack, GatewayInfo, Health, Role, RoutableWorker, RoutingTable, WorkerStatus,
+};
 use pie_gateway::session::{Affinity, Identity, TurnInput};
 use pie_gateway::{Gateway, GatewayConfig, GatewayControl, bind};
-use pie_schema::control::{
-    Ack, GatewayId, GatewayInfo, Health, NodeId, RoutableWorker, Role, RoutingTable, WorkerId,
-    WorkerStatus,
-};
-use pie_schema::gateway::{Accepted, Control, Priority, ReqId, Request, TenantId, Tokens};
-use pie_schema::message::{ClientMessage, ServerMessage};
+use pie_ids::{GatewayId, NodeId, ReqId, TenantId, WorkerId};
+use pie_worker_rpc::{Accepted, Control, Priority, Request, Tokens};
+use pie_worker_rpc::{GatewayInboundClient, WorkerControl, connect_gateway_link, dispatch_codec};
 use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, Channel};
 

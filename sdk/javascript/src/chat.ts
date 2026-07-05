@@ -16,41 +16,39 @@
 
 import * as _chat from 'pie:instruct/chat';
 
-import type { Model } from './model.js';
-
 // =============================================================================
 // Template fillers
 // =============================================================================
 
 /** Token sequence for a system-role message. */
-export function system(model: Model, message: string): Uint32Array {
-  return _chat.system(model._handle, message);
+export function system(message: string): Uint32Array {
+  return _chat.system(message);
 }
 
 /** Token sequence for a user-role message. */
-export function user(model: Model, message: string): Uint32Array {
-  return _chat.user(model._handle, message);
+export function user(message: string): Uint32Array {
+  return _chat.user(message);
 }
 
 /** Token sequence for an assistant-role message (history replay). */
-export function assistant(model: Model, message: string): Uint32Array {
-  return _chat.assistant(model._handle, message);
+export function assistant(message: string): Uint32Array {
+  return _chat.assistant(message);
 }
 
 /** Token sequence for the generation cue (tells the model "your turn"). */
-export function cue(model: Model): Uint32Array {
-  return _chat.cue(model._handle);
+export function cue(): Uint32Array {
+  return _chat.cue();
 }
 
 /** Token sequence that seals the current turn (inserts a stop token). */
-export function seal(model: Model): Uint32Array {
-  return _chat.seal(model._handle);
+export function seal(): Uint32Array {
+  return _chat.seal();
 }
 
-/** Stop-token IDs for `model`'s chat template — pass to
+/** Stop-token IDs for the model's chat template — pass to
  *  `Generator.stop()` for explicit termination control. */
-export function stopTokens(model: Model): Uint32Array {
-  return _chat.stopTokens(model._handle);
+export function stopTokens(): Uint32Array {
+  return _chat.stopTokens();
 }
 
 // =============================================================================
@@ -125,8 +123,8 @@ export const Event = {
 export class Decoder {
   readonly #inner: _chat.Decoder;
 
-  constructor(model: Model) {
-    this.#inner = _chat.createDecoder(model._handle);
+  constructor() {
+    this.#inner = _chat.createDecoder();
   }
 
   /** Feed a token batch and get back the event that fired (one per call).

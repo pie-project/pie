@@ -1,0 +1,20 @@
+// The pipeline is an ordering domain, not the owner of any working set
+// (kv_refact.md). Every command on every pipeline enters the single
+// per-driver sequencer queue in program order and is linearized there; a
+// pipeline names the ordering domain a command belongs to. Device-visible
+// working-set mutations (`working-set.wit`) and forward submissions
+// (`forward.wit`) take `borrow<pipeline>`.
+interface pipeline {
+    /// A run-ahead ordering domain. Commands on the same pipeline execute in
+    /// deterministic submission order; different pipelines promise nothing
+    /// beyond the sequencer's linearization. Creating a working set on one
+    /// pipeline and firing it from another is safe by construction.
+    resource pipeline {
+        constructor();
+
+        /// Signal no further submissions (implied by drop): in-flight passes
+        /// run as far as their inputs allow; touched channels are unspecified
+        /// after close.
+        close: func();
+    }
+}

@@ -1,12 +1,16 @@
 #include "model/qwen3_5_forward.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -466,7 +470,16 @@ void linear_attn_layer_body(
     // Recurrent-only commit-advance: when non-null, request r folds only
     // commit_len[r] tokens (confirmed [input|accepted]) into the committed
     // state. Forces the FLA path (the only one threading commit_len).
-    const int* commit_len = nullptr)
+    const int* commit_len = nullptr,
+    // Ph7 RS working-set fold-from-buffer (per-request CSR of buffered-slab
+    // pool ids; host). rs_buffer_write: scatter in-proj [mixed_qkv|a|b] to the
+    // pool (rs-output, write_state forced false). rs_buffer_fold (with
+    // commit_len): replay loads activations FROM the pool slabs instead of the
+    // verify stash. See executor.hpp ForwardInputs.
+    const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
+    const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
+    bool rs_buffer_write = false,
+    bool rs_buffer_fold = false)
 {
     // TP-local dims for linear-attention. tp_size == 1 keeps everything
     // unsharded. The K/V head counts must divide tp_size (checked at
@@ -491,7 +504,7 @@ void linear_attn_layer_body(
     // state as usual. Activation replay is the sole spec path now: the FLA, conv
     // and warp-tiled all honor write_state uniformly — frozen verify persists
     // nothing, the commit-advance replay (verify_frozen reset to false) writes.
-    const bool write_state = !state_cache.verify_frozen();
+    const bool write_state = !state_cache.verify_frozen() && !rs_buffer_write;
 
     // ── In-projections (or activation-replay load) ────────────────
     // Activation-replay stash layout per linear layer (bf16, max_tokens stride):
@@ -508,11 +521,62 @@ void linear_attn_layer_body(
         static_cast<std::size_t>(state_cache.verify_stash_max_tokens());
     const std::size_t stash_a_off = stash_stride * conv_dim;
     const std::size_t stash_b_off = stash_a_off + stash_stride * V_h;
-    const bool replay_load = (commit_len != nullptr) && stash != nullptr;
+    const bool replay_load =
+        (commit_len != nullptr) && (stash != nullptr || rs_buffer_fold);
     const bool stash_write =
         state_cache.verify_frozen() && stash != nullptr && commit_len == nullptr;
     profile_forward_stage_ptr(profile, &ForwardProfile::linear_proj_ms, stream, [&] {
         if (replay_load) {
+            // Ph7 fold-from-buffer: gather page-major from the persistent
+            // buffered-activation pool into the replay buffers (vs the verify
+            // stash). Request r folds its first nr = qo[r+1]-qo[r] buffered
+            // tokens across its CSR slabs; slab j holds tokens [j*page,(j+1)*page).
+            if (rs_buffer_fold && rs_buffer_slot_ids_h != nullptr &&
+                rs_buffer_slot_indptr_h != nullptr) {
+                const int page = state_cache.rs_buffer_page_tokens();
+                const std::size_t slab_a =
+                    static_cast<std::size_t>(page) * conv_dim;
+                const std::size_t slab_b =
+                    slab_a + static_cast<std::size_t>(page) * V_h;
+                for (int r = 0; r < R; ++r) {
+                    const int qo0 = static_cast<int>(qo_indptr_h[r]);
+                    const int nr  = static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                    const std::uint32_t s0 = rs_buffer_slot_indptr_h[r];
+                    const std::uint32_t s1 = rs_buffer_slot_indptr_h[r + 1];
+                    for (std::uint32_t j = 0; s0 + j < s1; ++j) {
+                        const int tok0 = static_cast<int>(j) * page;
+                        const int cnt = std::min(page, nr - tok0);
+                        if (cnt <= 0) break;
+                        auto* slab = static_cast<std::uint16_t*>(
+                            state_cache.rs_buffer_slab(
+                                linear_idx,
+                                static_cast<int>(rs_buffer_slot_ids_h[s0 + j])));
+                        if (slab == nullptr) continue;
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.mixed_qkv.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * conv_dim,
+                            slab,
+                            static_cast<std::size_t>(cnt) * conv_dim *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.a.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * V_h,
+                            slab + slab_a,
+                            static_cast<std::size_t>(cnt) * V_h *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.b.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * V_h,
+                            slab + slab_b,
+                            static_cast<std::size_t>(cnt) * V_h *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+                return;
+            }
             CUDA_CHECK(cudaMemcpyAsync(la.mixed_qkv.data(), stash,
                 static_cast<std::size_t>(N) * conv_dim * sizeof(std::uint16_t),
                 cudaMemcpyDeviceToDevice, stream));
@@ -563,6 +627,47 @@ void linear_attn_layer_body(
             CUDA_CHECK(cudaMemcpyAsync(stash + stash_b_off, la.b.data(),
                 static_cast<std::size_t>(N) * V_h * sizeof(std::uint16_t),
                 cudaMemcpyDeviceToDevice, stream));
+        }
+        // Ph7 rs-output (W10): scatter the in-proj [mixed_qkv|a|b] page-major
+        // into the persistent buffered-activation pool. write_state was forced
+        // false, so the recurrent_state is NOT folded — these tokens are buffered
+        // for a later fold-buffered(n). Slab j holds tokens [j*page,(j+1)*page).
+        if (rs_buffer_write && rs_buffer_slot_ids_h != nullptr &&
+            rs_buffer_slot_indptr_h != nullptr) {
+            const int page = state_cache.rs_buffer_page_tokens();
+            const std::size_t slab_a = static_cast<std::size_t>(page) * conv_dim;
+            const std::size_t slab_b =
+                slab_a + static_cast<std::size_t>(page) * V_h;
+            for (int r = 0; r < R; ++r) {
+                const int qo0 = static_cast<int>(qo_indptr_h[r]);
+                const int nr  = static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                const std::uint32_t s0 = rs_buffer_slot_indptr_h[r];
+                const std::uint32_t s1 = rs_buffer_slot_indptr_h[r + 1];
+                for (std::uint32_t j = 0; s0 + j < s1; ++j) {
+                    const int tok0 = static_cast<int>(j) * page;
+                    const int cnt = std::min(page, nr - tok0);
+                    if (cnt <= 0) break;
+                    auto* slab = static_cast<std::uint16_t*>(
+                        state_cache.rs_buffer_slab(
+                            linear_idx,
+                            static_cast<int>(rs_buffer_slot_ids_h[s0 + j])));
+                    if (slab == nullptr) continue;
+                    CUDA_CHECK(cudaMemcpyAsync(slab,
+                        la.mixed_qkv.data() +
+                            static_cast<std::size_t>(qo0 + tok0) * conv_dim,
+                        static_cast<std::size_t>(cnt) * conv_dim *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(slab + slab_a,
+                        la.a.data() + static_cast<std::size_t>(qo0 + tok0) * V_h,
+                        static_cast<std::size_t>(cnt) * V_h * sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(slab + slab_b,
+                        la.b.data() + static_cast<std::size_t>(qo0 + tok0) * V_h,
+                        static_cast<std::size_t>(cnt) * V_h * sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                }
+            }
         }
     });
 
@@ -627,10 +732,109 @@ void linear_attn_layer_body(
         }
     });
 
+    // ── PIE_CONV_TRACE: alpha's conv-state hand-off probe ────────────
+    // Dumps the decisive routing values (write_state + commit_len) that the
+    // N=2 prefill vs the decode conv1d fire pass, plus conv_state(layer0,slot)
+    // after the prefill and after each of the first few decodes — to route the
+    // rs_cache GDN glitch (4 spurious tokens == conv_K=4 window shift-out)
+    // between alpha's rs wiring and the driver's N<K conv persist/pad.
+    if (std::getenv("PIE_CONV_TRACE") != nullptr && linear_idx == 0) {
+        static std::atomic<int> s_decode_fire{0};
+        const int fire = is_pure_decode
+            ? s_decode_fire.fetch_add(1)
+            : -1;  // -1 = prefill
+        // Guard: D2H/sync are ILLEGAL during CUDA-graph capture (would hang).
+        // Skip captured fires (run with PIE_CUDA_PREFILL_DECODE_NOGRAPHS=1 to
+        // force eager decode so every fire dumps).
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &cap);
+        if ((!is_pure_decode || fire < 6) && cap == cudaStreamCaptureStatusNone) {
+            const int slot = slot_for(0);
+            const long long elems =
+                static_cast<long long>(conv_K) * conv_dim;
+            std::vector<std::uint16_t> host(static_cast<std::size_t>(elems));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaMemcpy(
+                host.data(), state_cache.conv_state(layer_idx, slot),
+                static_cast<std::size_t>(elems) * sizeof(std::uint16_t),
+                cudaMemcpyDeviceToHost));
+            auto bf16 = [](std::uint16_t h) -> float {
+                std::uint32_t u = static_cast<std::uint32_t>(h) << 16;
+                float f; std::memcpy(&f, &u, sizeof(f)); return f;
+            };
+            double l1 = 0.0;
+            for (auto h : host) l1 += std::fabs(static_cast<double>(bf16(h)));
+            std::string cl = "null";
+            if (commit_len != nullptr) {
+                std::vector<int> hcl(static_cast<std::size_t>(R));
+                CUDA_CHECK(cudaMemcpy(hcl.data(), commit_len,
+                    static_cast<std::size_t>(R) * sizeof(int),
+                    cudaMemcpyDeviceToHost));
+                cl.clear();
+                for (int r = 0; r < R; ++r)
+                    cl += (r ? "," : "") + std::to_string(hcl[static_cast<std::size_t>(r)]);
+            }
+            std::cerr << "[conv-trace] " << (is_pure_decode ? "decode#" : "PREFILL")
+                      << (is_pure_decode ? std::to_string(fire) : std::string())
+                      << " N=" << N << " R=" << R
+                      << " layer=" << layer_idx
+                      << " slot=" << slot
+                      << " conv_K=" << conv_K << " conv_dim=" << conv_dim
+                      << " write_state=" << (write_state ? 1 : 0)
+                      << " rs_buffer_write=" << (rs_buffer_write ? 1 : 0)
+                      << " rs_buffer_fold=" << (rs_buffer_fold ? 1 : 0)
+                      << " commit_len=[" << cl << "]"
+                      << " conv_state.L1=" << l1;
+            // Per-K-position channel-0..2 sample: answers alpha's "left-pad
+            // [0,0,t0,t1] vs mis-aligned" — pos k lives at offset k*conv_dim
+            // (layout [conv_K, conv_dim], position-major).
+            std::cerr << " posK[c0,c1,c2]=";
+            for (int k = 0; k < conv_K; ++k) {
+                const long long base = static_cast<long long>(k) * conv_dim;
+                std::cerr << (k ? " " : "") << "p" << k << "[";
+                for (int c = 0; c < 3 && base + c < elems; ++c)
+                    std::cerr << (c ? "," : "")
+                              << bf16(host[static_cast<std::size_t>(base + c)]);
+                std::cerr << "]";
+            }
+            // Recurrent (gated-delta) state L1 — the OTHER GDN state half.
+            const long long rs_elems =
+                static_cast<long long>(V_h) * K_d * V_d;
+            void* rs_ptr = state_cache.recurrent_state_raw(layer_idx, slot);
+            double rl1 = 0.0;
+            if (state_cache.recurrent_state_bf16()) {
+                std::vector<std::uint16_t> rhost(static_cast<std::size_t>(rs_elems));
+                CUDA_CHECK(cudaMemcpy(rhost.data(), rs_ptr,
+                    static_cast<std::size_t>(rs_elems) * sizeof(std::uint16_t),
+                    cudaMemcpyDeviceToHost));
+                for (auto h : rhost) rl1 += std::fabs(static_cast<double>(bf16(h)));
+            } else {
+                std::vector<float> rhost(static_cast<std::size_t>(rs_elems));
+                CUDA_CHECK(cudaMemcpy(rhost.data(), rs_ptr,
+                    static_cast<std::size_t>(rs_elems) * sizeof(float),
+                    cudaMemcpyDeviceToHost));
+                for (float x : rhost) rl1 += std::fabs(static_cast<double>(x));
+            }
+            std::cerr << " recur_state.L1=" << rl1 << "\n";
+        }
+    }
+
     // ── Split mixed_qkv_post + prep recurrent inputs ─────────────
     // mixed_qkv_post[N, conv_dim] packs [q_raw | k_raw | v_raw]. The fused
     // prep kernel emits compact q/k heads, fp32 v, and per-head g/beta.
     auto* qkv_base = la.mixed_qkv_post.data();
+    // STOPGAP (rs_cache GDN value-correctness, charlie): the warp-tiled recurrent
+    // PREFILL kernel under-folds the multi-token recurrent STATE on the
+    // write_state=true path — 4090 A/B proved disabling it makes the N=2 prefill
+    // decode HF-exact (T0 GOLDEN). Route state-persisting multi-token prefills to
+    // the proven non-warp-tiled chunk_gated_delta path; KEEP warp-tiled for
+    // frozen-verify (write_state=false → persists nothing, so the fold bug cannot
+    // manifest) and all decode. Re-enable the warp-tiled state path via
+    // PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST=1 once the kernel's fold is fixed.
+    static const bool warp_tiled_state_persist_ok = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
     const bool use_warp_tiled_recurrent =
         !is_pure_decode &&
         slot_ids_d != nullptr &&
@@ -638,7 +842,9 @@ void linear_attn_layer_body(
         N <= qwen35_gdn_warp_tiled_max_tokens() &&
         K_d <= 256 &&
         // The commit-advance threads commit_len only through the FLA path.
-        commit_len == nullptr;
+        commit_len == nullptr &&
+        // STOPGAP: skip warp-tiled when it must PERSIST state (the buggy fold).
+        (!write_state || warp_tiled_state_persist_ok);
     const bool use_decode_gqa_recurrent =
         is_pure_decode &&
         slot_ids_d != nullptr &&
@@ -680,6 +886,42 @@ void linear_attn_layer_body(
         (V_h == K_h) ? la.q_pre.data() : la.q_norm.data();
     const float* k_recur_full =
         (V_h == K_h) ? la.k_pre.data() : la.k_norm.data();
+
+    // ── PIE_GDN_PREP_TRACE: bravo's FLA-fold probe ───────────────────
+    // Dumps the recurrence INPUTS per prefill token (g_log = gating log-decay,
+    // beta, ‖v‖, ‖k‖) — to pinpoint whether the multi-token fold under-accumulates
+    // because a per-token INPUT is wrong (bravo's g_log[t1] bet) vs the fold math.
+    // g_log/beta are [N,V_h] fp32; v_fp32 [N,V_h,V_d]; k_pre [N,K_h,K_d] fp32.
+    if (std::getenv("PIE_GDN_PREP_TRACE") != nullptr && linear_idx == 0 &&
+        !is_pure_decode) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<float> hg(static_cast<std::size_t>(N) * V_h);
+        std::vector<float> hb(static_cast<std::size_t>(N) * V_h);
+        std::vector<float> hv(static_cast<std::size_t>(N) * V_h * V_d);
+        std::vector<float> hk(static_cast<std::size_t>(N) * K_h * K_d);
+        CUDA_CHECK(cudaMemcpy(hg.data(), la.g_log.data(), hg.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hb.data(), la.beta.data(), hb.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hv.data(), la.v_fp32.data(), hv.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hk.data(), la.k_pre.data(), hk.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int t = 0; t < N; ++t) {
+            double gsum = 0, gmin = 1e30, gmax = -1e30, bsum = 0;
+            for (int h = 0; h < V_h; ++h) {
+                double g = hg[static_cast<std::size_t>(t) * V_h + h];
+                gsum += g; gmin = std::min(gmin, g); gmax = std::max(gmax, g);
+                bsum += hb[static_cast<std::size_t>(t) * V_h + h];
+            }
+            double vn = 0, kn = 0;
+            for (int i = 0; i < V_h * V_d; ++i) { double x = hv[static_cast<std::size_t>(t) * V_h * V_d + i]; vn += x * x; }
+            for (int i = 0; i < K_h * K_d; ++i) { double x = hk[static_cast<std::size_t>(t) * K_h * K_d + i]; kn += x * x; }
+            std::cerr << "[gdn-prep] layer=" << layer_idx << " N=" << N
+                      << " t=" << t
+                      << " g_log{mean=" << (gsum / V_h) << ",min=" << gmin << ",max=" << gmax << "}"
+                      << " beta{mean=" << (bsum / V_h) << "}"
+                      << " |v|=" << std::sqrt(vn)
+                      << " |k|=" << std::sqrt(kn)
+                      << " (g_log head0=" << hg[static_cast<std::size_t>(t) * V_h] << ")\n";
+        }
+    }
 
         // ── Recurrent update ───────────────────────────────────────────
         // Both decode and prefill: one batched launch over (R, V_h) blocks
@@ -1227,7 +1469,11 @@ void qwen3_5_forward_paged(
     const std::int32_t* slot_ids_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
-    const std::int32_t* commit_advance_gather)
+    const std::int32_t* commit_advance_gather,
+    const std::uint32_t* rs_buffer_slot_ids_h,
+    const std::uint32_t* rs_buffer_slot_indptr_h,
+    bool rs_buffer_write,
+    bool rs_buffer_fold)
 {
     const int H  = cfg.hidden_size;
     const int V  = cfg.vocab_size;
@@ -1306,7 +1552,9 @@ void qwen3_5_forward_paged(
                 Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
                 static_cast<int>(L), linear_idx, N, R, is_pure_decode,
                 slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
-                cublas, stream, &profile, /*commit_len=*/commit_advance_gather);
+                cublas, stream, &profile, /*commit_len=*/commit_advance_gather,
+                rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
+                /*rs_buffer_write=*/false, rs_buffer_fold);
             ++linear_idx;
             continue;
         }
@@ -1329,7 +1577,9 @@ void qwen3_5_forward_paged(
                     Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
                     static_cast<int>(L), li, N, R, is_pure_decode,
                     slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
-                    cublas, stream, &profile);
+                    cublas, stream, &profile, /*commit_len=*/nullptr,
+                    rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
+                    rs_buffer_write, /*rs_buffer_fold=*/false);
             });
         } else {
             ++profile.full_layers;

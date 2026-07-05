@@ -8,10 +8,8 @@ import blake3
 from enum import Enum
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from .crypto import ParsedPrivateKey
-from .mcp_bridge import BridgeRegistry, JsonRpcError
 
 
 class Event(Enum):
@@ -83,9 +81,6 @@ class PieClient:
         # Buffer for early events to prevent race conditions.
         self.orphan_events = {}
 
-        # Locally-spawned MCP servers, indexed by registered name.
-        self.mcp_bridge = BridgeRegistry()
-
     # Also keep old name for backward compat
     @property
     def inst_event_queues(self):
@@ -154,11 +149,6 @@ class PieClient:
         elif msg_type == "file":
             await self._handle_file_chunk(message)
 
-        elif msg_type == "mcp_request":
-            # Run the relay in the background so a slow MCP server can't
-            # block other server messages.
-            asyncio.create_task(self._handle_mcp_request(message))
-
     async def _handle_file_chunk(self, message: dict):
         """Processes a chunk of a file sent from the server."""
         file_hash = message.get("file_hash")
@@ -193,10 +183,6 @@ class PieClient:
 
     async def close(self):
         """Gracefully close the WebSocket connection and shut down background tasks."""
-        try:
-            await self.mcp_bridge.close_all()
-        except Exception:
-            pass
         if self.ws:
             try:
                 await self.ws.close()
@@ -485,14 +471,12 @@ class PieClient:
         inferlet: str,
         input: dict | list | None = None,
         capture_outputs: bool = True,
-        token_budget: int | None = None,
     ) -> Process:
         """Launch a process. Returns a Process object for interaction.
 
         :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
         :param input: A dict of input parameters, serialized to JSON.
         :param capture_outputs: If True, process outputs are streamed to the client.
-        :param token_budget: Optional token budget for this process (None = use model default).
         :return: A Process object for the launched inferlet.
         """
         msg = {
@@ -501,8 +485,6 @@ class PieClient:
             "input": json.dumps(input if input is not None else {}),
             "capture_outputs": capture_outputs,
         }
-        if token_budget is not None:
-            msg["token_budget"] = token_budget
         ok, result = await self._send_msg_and_wait(msg)
 
         if not ok:
@@ -517,59 +499,6 @@ class PieClient:
                 await queue.put(event_tuple)
 
         return Process(self, process_id)
-
-    async def launch_processes(
-        self,
-        inferlet: str,
-        inputs: list[dict | list | None],
-        capture_outputs: bool = True,
-        token_budgets: list[int | None] | None = None,
-    ) -> list[Process]:
-        """Launch several processes with one control-plane request."""
-        msg = {
-            "type": "launch_processes",
-            "inferlet": inferlet,
-            "inputs": [json.dumps(inp if inp is not None else {}) for inp in inputs],
-            "capture_outputs": capture_outputs,
-        }
-        if token_budgets is not None:
-            msg["token_budgets"] = token_budgets
-        ok, result = await self._send_msg_and_wait(msg)
-
-        if not ok:
-            raise Exception(f"Failed to launch processes: {result}")
-
-        process_ids = json.loads(result)
-        processes: list[Process] = []
-        for process_id in process_ids:
-            queue = asyncio.Queue()
-            self.process_event_queues[process_id] = queue
-            if process_id in self.orphan_events:
-                for event_tuple in self.orphan_events.pop(process_id):
-                    await queue.put(event_tuple)
-            processes.append(Process(self, process_id))
-        return processes
-
-    async def run_processes(
-        self,
-        inferlet: str,
-        inputs: list[dict | list | None],
-        token_budgets: list[int | None] | None = None,
-    ) -> list[str]:
-        """Run several processes and collect their return payloads in one response."""
-        msg = {
-            "type": "run_processes",
-            "inferlet": inferlet,
-            "inputs": [json.dumps(inp if inp is not None else {}) for inp in inputs],
-        }
-        if token_budgets is not None:
-            msg["token_budgets"] = token_budgets
-        ok, result = await self._send_msg_and_wait(msg)
-
-        if not ok:
-            raise Exception(f"Failed to run processes: {result}")
-
-        return json.loads(result)
 
     async def attach_process(self, process_id: str) -> Process:
         """Attach to an existing process.
@@ -627,102 +556,3 @@ class PieClient:
         ok, result = await self._send_msg_and_wait(msg)
         if not ok:
             raise Exception(f"Failed to terminate process: {result}")
-
-    # =========================================================================
-    # MCP
-    # =========================================================================
-
-    async def register_mcp_server(
-        self,
-        name: str,
-        transport: str,
-        command: str | None = None,
-        args: list[str] | None = None,
-        url: str | None = None,
-    ) -> None:
-        """Register an MCP server for this session.
-
-        For ``transport='stdio'``, this spawns the server process locally and
-        performs the MCP ``initialize`` handshake before announcing the
-        server to the engine. All inferlets launched in this session can
-        then discover and call into it.
-
-        :param name: Logical name inferlets use to refer to this server.
-        :param transport: ``'stdio'`` (the only supported transport for now).
-        :param command: Executable to run (required for stdio).
-        :param args: Arguments to ``command``.
-        :param url: Reserved for future HTTP/SSE transports.
-        """
-        if transport == "stdio":
-            if command is None:
-                raise ValueError("register_mcp_server(stdio): `command` is required")
-            try:
-                await self.mcp_bridge.register_stdio(name, command, list(args or []))
-            except Exception as e:
-                raise Exception(f"Local registration of MCP server '{name}' failed: {e}")
-        else:
-            raise Exception(
-                f"register_mcp_server: transport '{transport}' is not yet supported (only 'stdio')"
-            )
-
-        msg = {
-            "type": "register_mcp_server",
-            "name": name,
-            "transport": transport,
-            "command": command,
-            "args": args,
-            "url": url,
-        }
-        ok, result = await self._send_msg_and_wait(msg)
-        if not ok:
-            raise Exception(f"Register MCP server failed: {result}")
-
-    async def _handle_mcp_request(self, message: dict) -> None:
-        """Forward an inbound MCP relay request to the local bridge and reply."""
-        corr_id = message.get("corr_id")
-        server_name = message.get("server_name", "")
-        method = message.get("method", "")
-        params_str = message.get("params", "{}")
-
-        ok, result_str = await self._relay_mcp_request(server_name, method, params_str)
-        response = {
-            "type": "mcp_response",
-            "corr_id": corr_id,
-            "ok": ok,
-            "result": result_str,
-        }
-        try:
-            await self.ws.send(msgpack.packb(response, use_bin_type=True))
-        except Exception:
-            pass
-
-    async def _relay_mcp_request(
-        self, server_name: str, method: str, params_str: str
-    ) -> tuple[bool, str]:
-        server = self.mcp_bridge.get(server_name)
-        if server is None:
-            return False, _encode_mcp_error(
-                -32000, f"MCP server '{server_name}' is not registered locally", None
-            )
-        try:
-            params = json.loads(params_str)
-        except (json.JSONDecodeError, TypeError):
-            params = {}
-        try:
-            result = await server.call(method, params)
-        except JsonRpcError as e:
-            return False, _encode_mcp_error(e.code, e.message, e.data)
-        except Exception as e:
-            return False, _encode_mcp_error(-32000, str(e), None)
-        try:
-            return True, json.dumps(result)
-        except (TypeError, ValueError) as e:
-            return False, _encode_mcp_error(-32603, f"Result serialize: {e}", None)
-
-
-def _encode_mcp_error(code: int, message: str, data: Any) -> str:
-    """Encode a JSON-RPC error as the JSON payload the runtime expects on ok=False."""
-    obj: dict = {"code": int(code), "message": message}
-    if data is not None:
-        obj["data"] = data
-    return json.dumps(obj)

@@ -1,0 +1,4 @@
+[package]
+name = "isolatedtopp"
+version = "0.1.0"
+description = "Phase-1 #12 token gate: isolated single TopP fire on a fresh context"

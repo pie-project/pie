@@ -9,11 +9,90 @@
 //! prefill is submitted asynchronously while the graph is being built on
 //! CPU, joined via `futures::join!`.
 
-use inferlet::{Context, Result, sample::Sampler, model::Model, runtime};
+//! Low-level ① rewrite (chat-EOS, pipelined): the 2 chat decodes run on the raw
+//! run-ahead carrier (`sampler::sampler_program(Argmax)` + `carrier::submit_pass`
+//! / `discard_pass` depth-1 EOS rollback, `chat::` templating) — NO `Context`/
+//! `Generator`/`Sampler` facade. The GPU/CPU overlap (query system-prefill ∥
+//! graph build) is preserved raw: the system prefill fire is submitted in-flight,
+//! the CPU graph work runs while it computes, then it is drained (no `futures::join!`).
+
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{self, SamplerSpec};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{carrier, chat, model, prefill, Result};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
+
+async fn read_token(pass: ForwardPass) -> Result<u32> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(if bytes.len() >= 4 {
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
+    } else {
+        0
+    })
+}
+
+fn pass_carries(stop_empty: bool, max_tokens: usize, produced_token_index: usize) -> bool {
+    !(stop_empty && max_tokens == produced_token_index)
+}
+
+/// Run-ahead (pipelined) decode with depth-1 EOS rollback (chat-EOS pattern).
+/// Continues from the current `*seq_len` (so a prior prefill on `kv` is reused).
+async fn decode_pipelined(
+    kv: &KvWorkingSet,
+    seq_len: &mut u32,
+    fresh: &mut bool,
+    s: &sampler::LoweredSampler,
+    prompt: Vec<u32>,
+    max_tokens: usize,
+    stop: &[u32],
+) -> Result<Vec<u32>> {
+    let pending = if prompt.is_empty() { vec![0u32] } else { prompt };
+    let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
+    if max_tokens == 0 {
+        return Ok(out);
+    }
+    let prime_carry = pass_carries(stop.is_empty(), max_tokens, 1);
+    let mut producer = carrier::submit_pass(kv, seq_len, fresh, s, &pending, prime_carry)?;
+    let mut generated = 0usize;
+    loop {
+        let speculate = generated + 1 < max_tokens;
+        let consumer = if speculate {
+            let carry = pass_carries(stop.is_empty(), max_tokens, generated + 2);
+            Some(carrier::submit_pass(kv, seq_len, fresh, s, &[0u32], carry)?)
+        } else {
+            None
+        };
+        let token = read_token(producer).await?;
+        if stop.contains(&token) {
+            if let Some(c) = consumer {
+                carrier::discard_pass(c, seq_len).await;
+            }
+            break;
+        }
+        out.push(token);
+        generated += 1;
+        match consumer {
+            Some(c) => producer = c,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Detokenize generated tokens through the chat decoder (strip template markers).
+fn decode_text(tokens: &[u32]) -> Result<String> {
+    let mut dec = chat::Decoder::new();
+    let mut text = String::new();
+    match dec.feed(tokens)? {
+        chat::Event::Delta(s) | chat::Event::Done(s) => text.push_str(&s),
+        _ => {}
+    }
+    Ok(text)
+}
 
 #[derive(Deserialize)]
 struct Input {
@@ -146,111 +225,95 @@ fn retrieve_facts(
     facts
 }
 
+/// Build a graph from extracted triples + BFS-retrieve the query facts (pure CPU).
+fn build_and_query(extraction_output: &str, depth: usize) -> Vec<String> {
+    // --- Stage 2: Parse triples and build the knowledge graph ---
+    println!("\n--- Stage 2: Building knowledge graph ---");
+
+    let triples = parse_triples(extraction_output);
+    println!("Extracted {} triples:", triples.len());
+    for t in &triples {
+        println!("  {} | {} | {}", t.subject, t.relation, t.object);
+    }
+
+    let mut graph = DiGraph::<String, String>::new();
+    let mut node_map: HashMap<String, NodeIndex> = HashMap::new();
+
+    for triple in &triples {
+        let src = get_or_insert_node(&mut graph, &mut node_map, &triple.subject);
+        let dst = get_or_insert_node(&mut graph, &mut node_map, &triple.object);
+        graph.add_edge(src, dst, triple.relation.clone());
+    }
+
+    println!("Graph: {} nodes, {} edges", graph.node_count(), graph.edge_count());
+    println!("Entities: {}", node_map.keys().cloned().collect::<Vec<_>>().join(", "));
+
+    // --- Stage 3: Query the graph for relevant context ---
+    println!("\n--- Stage 3: Querying graph (depth={}) for: \"{}\" ---", depth, QUESTION);
+
+    let query_entities = ["European Union"];
+    let mut all_facts = retrieve_facts(&graph, &node_map, &query_entities, depth);
+    all_facts.sort();
+    all_facts.dedup();
+
+    println!("Retrieved {} relevant facts:", all_facts.len());
+    for fact in &all_facts {
+        println!("  - {}", fact);
+    }
+    all_facts
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let max_tokens = input.max_tokens;
     let depth = input.depth;
+    let vocab = model::output_vocab_size();
+    let s = sampler::sampler_program(SamplerSpec::Argmax, vocab)?; // greedy
+    let stop = chat::stop_tokens();
 
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
-
-    // --- Stage 1: Extract triples from the passage ---
+    // --- Stage 1: Extract triples (chat-EOS decode on the run-ahead carrier) ---
     println!("--- Stage 1: Extracting knowledge triples ---");
+    let mut ext_prompt = chat::system_user(
+        EXTRACTION_SYSTEM_PROMPT,
+        &format!("Extract all factual triples from this passage:\n\n{}", PASSAGE),
+    );
+    ext_prompt.extend(chat::cue());
 
-    let mut extraction_ctx = Context::new(&model)?;
-    extraction_ctx.system(EXTRACTION_SYSTEM_PROMPT);
-    extraction_ctx.user(&format!(
-        "Extract all factual triples from this passage:\n\n{}",
-        PASSAGE
-    ));
-    extraction_ctx.cue();
-
-    let extraction_output = extraction_ctx
-        .generate(Sampler::Argmax) // greedy
-        .max_tokens(max_tokens)
-        .collect_text()
-        .await?;
-
+    let ext_kv = KvWorkingSet::new();
+    let mut e_seq = 0u32;
+    let mut e_fresh = true;
+    let ext_tokens =
+        decode_pipelined(&ext_kv, &mut e_seq, &mut e_fresh, &s, ext_prompt, max_tokens, &stop).await?;
+    let extraction_output = decode_text(&ext_tokens)?;
     println!("Extraction output: {}", extraction_output);
 
-    // Stage 2 needs the query context with the system prompt prefilled.
-    // We kick off that prefill (GPU) concurrently with graph construction
-    // (CPU) below, via futures::join!.
-    let mut query_ctx = Context::new(&model)?;
-    query_ctx.system(QUERY_SYSTEM_PROMPT);
+    // --- Stage 2/3: build the graph + retrieve facts (CPU), OVERLAPPED with the
+    // query system-prompt prefill (GPU). Raw run-ahead overlap: submit the system
+    // prefill IN-FLIGHT, run the CPU graph work while it computes, then drain it. ---
+    let query_kv = KvWorkingSet::new();
+    let mut q_seq = 0u32;
+    let sys_tokens = chat::system(QUERY_SYSTEM_PROMPT);
+    // Prefill the query system prompt IN-FLIGHT via the non-sampling keep-core
+    // primitive (KV materialization, no sampler/await); the CPU graph build below
+    // overlaps the GPU prefill, and the decode's prime is stream-ordered after it
+    // (no explicit drain needed).
+    prefill::tokens(&query_kv, &mut q_seq, &sys_tokens)?;
+    let mut q_fresh = sys_tokens.is_empty(); // the prefill was the first fire (unless empty)
 
-    let graph_work = async {
-        // --- Stage 2: Parse triples and build the knowledge graph ---
-        println!("\n--- Stage 2: Building knowledge graph ---");
+    let all_facts = build_and_query(&extraction_output, depth); // CPU ∥ the in-flight prefill
 
-        let triples = parse_triples(&extraction_output);
-        println!("Extracted {} triples:", triples.len());
-        for t in &triples {
-            println!("  {} | {} | {}", t.subject, t.relation, t.object);
-        }
-
-        let mut graph = DiGraph::<String, String>::new();
-        let mut node_map: HashMap<String, NodeIndex> = HashMap::new();
-
-        for triple in &triples {
-            let src = get_or_insert_node(&mut graph, &mut node_map, &triple.subject);
-            let dst = get_or_insert_node(&mut graph, &mut node_map, &triple.object);
-            graph.add_edge(src, dst, triple.relation.clone());
-        }
-
-        println!(
-            "Graph: {} nodes, {} edges",
-            graph.node_count(),
-            graph.edge_count()
-        );
-        println!(
-            "Entities: {}",
-            node_map.keys().cloned().collect::<Vec<_>>().join(", ")
-        );
-
-        // --- Stage 3: Query the graph for relevant context ---
-        println!(
-            "\n--- Stage 3: Querying graph (depth={}) for: \"{}\" ---",
-            depth, QUESTION
-        );
-
-        let query_entities = ["European Union"];
-        let mut all_facts = retrieve_facts(&graph, &node_map, &query_entities, depth);
-        all_facts.sort();
-        all_facts.dedup();
-
-        println!("Retrieved {} relevant facts:", all_facts.len());
-        for fact in &all_facts {
-            println!("  - {}", fact);
-        }
-
-        all_facts
-    };
-
-    let (flush_res, all_facts) = futures::join!(query_ctx.flush(), graph_work);
-    flush_res?;
-
-    // --- Stage 4: Answer the question using graph context ---
+    // --- Stage 4: Answer using graph context (continues from the prefilled KV) ---
     println!("\n--- Stage 4: Generating answer ---");
-
-    query_ctx.user(&format!(
+    let mut q_prompt = chat::user(&format!(
         "Knowledge graph facts:\n{}\n\nQuestion: {}",
-        all_facts
-            .iter()
-            .map(|f| format!("- {}", f))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        all_facts.iter().map(|f| format!("- {}", f)).collect::<Vec<_>>().join("\n"),
         QUESTION
     ));
-    query_ctx.cue();
+    q_prompt.extend(chat::cue());
 
-    let answer = query_ctx
-        .generate(Sampler::Argmax)
-        .max_tokens(max_tokens)
-        .collect_text()
-        .await?;
-
+    let ans_tokens =
+        decode_pipelined(&query_kv, &mut q_seq, &mut q_fresh, &s, q_prompt, max_tokens, &stop).await?;
+    let answer = decode_text(&ans_tokens)?;
     println!("Answer: {}", answer);
 
     Ok(String::new())

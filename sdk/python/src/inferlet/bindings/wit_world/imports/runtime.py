@@ -8,7 +8,9 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 def version() -> str:
@@ -26,8 +28,10 @@ def username() -> str:
     Returns the username of the user who invoked the inferlet
     """
     raise NotImplementedError
-def models() -> List[str]:
+async def sleep(duration_ns: int) -> None:
     """
-    Get a list of all available model names
+    Suspends the calling inferlet for the given duration. A host-provided
+    async timer: under component-model-async there is no guest-side
+    pollable->future bridge for wasi:clocks, so timing lives host-side.
     """
     raise NotImplementedError

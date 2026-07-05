@@ -1,11 +1,12 @@
-//! Smoke test for the #[tool] macro + Context::equip flow.
+//! Smoke test for the #[tool] macro + keep-core equip flow.
 //!
 //! - declares two tools with different param shapes
-//! - registers them via `ctx.equip`
+//! - splices their schemas into a raw token buffer via `tools::equip_prefix`
+//!   (off the `Context` facade — the keep-core equip path)
 //! - exercises both `call(json)` and `call_typed(args)` invocation paths
 //! - prints what would be the agent-loop dispatch for a hand-crafted call
 
-use inferlet::{Context, Result, Tool, model::Model, runtime, tool};
+use inferlet::{Result, Tool, chat, serde_json, tool, tools};
 
 /// Search the web for current information.
 #[tool]
@@ -21,22 +22,35 @@ async fn add(a: i64, b: i64) -> Result<String> {
 
 #[inferlet::main]
 async fn main(_prompt: String) -> Result<String> {
-    let model = Model::load(runtime::models().first().ok_or("no models")?)?;
-    let mut ctx = Context::new(&model)?;
-
     // ── Trait metadata ──
-    let tools: &[&dyn Tool] = &[&web_search, &add];
-    for t in tools {
+    let tool_list: &[&dyn Tool] = &[&web_search, &add];
+    for t in tool_list {
         println!("name={} desc={} schema={}", t.name(), t.description(), t.schema());
     }
 
-    // ── equip splices the chat-template tool block into ctx.buffer ──
-    let buf_before = ctx.buffer().len();
-    ctx.system("Use tools when helpful.").equip(tools)?;
-    let buf_after = ctx.buffer().len();
+    // ── Keep-core equip: build the tool envelopes + splice the equip prefix into
+    //    a raw token buffer (mirrors the retired `Context::equip`, no facade). The
+    //    system block + equip prefix are the same tokens the facade produced. ──
+    let mut buffer: Vec<u32> = chat::system("Use tools when helpful.");
+    let buf_before = buffer.len();
+    let envelopes: Vec<String> = tool_list
+        .iter()
+        .map(|t| {
+            let parsed: serde_json::Value = serde_json::from_str(t.schema())
+                .map_err(|e| format!("tool `{}`: invalid schema: {e}", t.name()))?;
+            Ok(serde_json::json!({
+                "name": t.name(),
+                "description": t.description(),
+                "parameters": parsed,
+            })
+            .to_string())
+        })
+        .collect::<Result<_>>()?;
+    buffer.extend(tools::equip_prefix(&envelopes)?);
+    let buf_after = buffer.len();
     println!("equip prefix tokens: {}", buf_after - buf_before);
 
-    // ── Direct invocation paths ──
+    // ── Direct invocation paths (unchanged — #[tool] macro, keep-core) ──
     let typed = web_search::call_typed("rust async traits".into()).await?;
     println!("call_typed -> {typed}");
 

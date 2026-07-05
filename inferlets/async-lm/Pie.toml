@@ -7,7 +7,6 @@ repository = "https://github.com/pie-project/pie"
 
 [runtime]
 core = "^0.2.0"
-mcp = "^0.2.0"
 
 [parameters]
 prompt = {type = "string", description = "The user message to answer"}

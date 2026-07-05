@@ -1,0 +1,25 @@
+[package]
+name = "pie-ptir"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "PTIR — the Pie Tensor IR: the stage-tagged, channel-carrying trace container over a closed first-party op set, its validator, and the flat versioned wire format. The single cross-language seam shared by the host runtime (parse + validate) and the CUDA driver (decode + codegen)."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+keywords = ["pie", "tensor", "ir", "ptir"]
+
+[lib]
+name = "pie_ptir"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+# `std` (default) is host-side. The wasm SDK depends on this crate with
+# `default-features = false` to keep the IR core `no_std` (+ `alloc`).
+# `eval` adds the CPU reference interpreter (implies `std`); off by default so it
+# never touches the wasm SDK build graph.
+[features]
+default = ["std"]
+std = []
+eval = ["std"]
+
+[dependencies]

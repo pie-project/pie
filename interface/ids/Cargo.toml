@@ -1,0 +1,16 @@
+[package]
+name = "pie-ids"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Deduplicated identity atoms (worker/gateway/node/session/req/request/tenant) shared across the pie interface crates — the dependency leaf, plain serde, no internal deps."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_ids"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }

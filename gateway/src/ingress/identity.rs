@@ -10,7 +10,7 @@ use std::net::IpAddr;
 
 use anyhow::{Context, anyhow};
 use axum::http::HeaderMap;
-use pie_schema::gateway::TenantId;
+use pie_ids::TenantId;
 
 use crate::session::Identity;
 

@@ -9,7 +9,7 @@
 //!
 //! It is deliberately **coarse**: "should the cluster admit this turn at all?".
 //! The authoritative, per-worker decision is the worker's own final admission
-//! ([`Accepted::Reject`](pie_schema::gateway::Accepted) during dispatch), so a
+//! ([`Accepted::Reject`](pie_worker_rpc::Accepted) during dispatch), so a
 //! slightly stale [`RoutingTable`] here is safe. v1 reads only the controller's
 //! pushed coarse load (`RoutingTable.coarse_load`, already flowing via
 //! `watch_gateway`); real per-tenant token-budget accounting is a later
@@ -19,7 +19,7 @@
 //! so the cluster-table read is single-sourced off the one routing watch; the
 //! logic itself lives here as its own §7 step.
 
-use pie_schema::control::{Health, RoutingTable};
+use pie_controller_rpc::{Health, RoutingTable};
 
 /// Thresholds for the coarse cluster gate. Per-worker headroom is judged against
 /// these; the cluster is admitted as long as *some* healthy worker has headroom.
@@ -93,7 +93,8 @@ pub fn admit(table: &RoutingTable, cfg: &AdmissionConfig) -> AdmissionDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_schema::control::{Role, RoutableWorker, WorkerId, WorkerStatus};
+    use pie_controller_rpc::{Role, RoutableWorker, WorkerStatus};
+    use pie_ids::WorkerId;
 
     fn worker(id: u64, health: Health, kv: u8, inflight: u32) -> RoutableWorker {
         RoutableWorker {

@@ -1,4 +1,5 @@
 #include "executor/executor.hpp"
+#include "executor/graph_variant.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -12,7 +13,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -28,20 +28,22 @@
 #include "custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
+#include "kernels/argmax.hpp"
+#include "kernels/dtype_cast.hpp"
+#include "kernels/gather_rows.hpp"
+#include "kernels/kv_paged.hpp"
 #include "distributed.hpp"
 #include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
 #include "recurrent_state_cache.hpp"
-#include "response_subpass.hpp"
 #include "model/imodel.hpp"
 #include "model/qwen3.hpp"
 #include "model/qwen3_forward.hpp"
 #include "ops/gemm.hpp"
-#include "kernels/argmax.hpp"
+#include "ptir/batch_compose.hpp"
+
+#include "kernels/pack_dense_mask.hpp"
 #include "kernels/sample_temp.hpp"
-#include "sampler_type.hpp"
-#include "sampling_dispatch.hpp"
-#include "spec_expansion.hpp"
 
 namespace pie_cuda_driver {
 
@@ -116,58 +118,6 @@ void tp_graph_capture_barrier(const Executor& executor) {
     b->arrive_and_wait();
 }
 
-std::uint64_t splitmix64(std::uint64_t x) {
-    x += 0x9E3779B97F4A7C15ULL;
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-    return x ^ (x >> 31);
-}
-
-std::uint64_t initial_sampling_seed() {
-    std::uint64_t seed =
-        static_cast<std::uint64_t>(
-            std::chrono::high_resolution_clock::now().time_since_epoch().count());
-    seed ^= reinterpret_cast<std::uintptr_t>(&seed);
-    try {
-        std::random_device rd;
-        seed ^= static_cast<std::uint64_t>(rd()) << 32;
-        seed ^= static_cast<std::uint64_t>(rd());
-    } catch (...) {
-        // Some libstdc++/container combinations can throw when entropy is
-        // unavailable. The clock/address mix above is still enough to avoid
-        // a fixed sampler sequence across server starts.
-    }
-    return splitmix64(seed);
-}
-
-std::uint32_t fresh_sampling_seed() {
-    static std::atomic<std::uint64_t> counter{initial_sampling_seed()};
-    std::uint64_t x = splitmix64(counter.fetch_add(
-        0x9E3779B97F4A7C15ULL, std::memory_order_relaxed));
-    std::uint32_t seed = static_cast<std::uint32_t>(x ^ (x >> 32));
-    return seed == 0 ? 1u : seed;
-}
-
-struct SamplingScratch {
-    std::vector<float> h_per_temp;
-    std::vector<float> h_per_min_p;
-    std::vector<float> h_per_top_p;
-    std::vector<std::int32_t> h_per_top_k;
-    std::vector<std::uint32_t> h_per_seed;
-    std::vector<std::uint32_t> per_slot_type;
-    std::vector<float> per_slot_temp;
-    std::vector<float> per_slot_top_p;
-    std::vector<float> per_slot_min_p;
-    std::vector<std::int32_t> per_slot_top_k;
-    std::vector<std::uint32_t> per_slot_seed;
-    std::vector<std::int32_t> h_sample_idx;
-};
-
-SamplingScratch& sampling_scratch() {
-    thread_local SamplingScratch scratch;
-    return scratch;
-}
-
 int partitioned_argmax_parts() {
     static const int parts = [] {
         const char* v = std::getenv("PIE_ARGMAX_PARTS");
@@ -184,6 +134,10 @@ int greedy_argmax_parts(int vocab) {
     }
     return vocab >= 131072 ? 8 : 1;
 }
+
+// #24 graph-variant bitfield helper: `make_graph_variant()` + the named flag
+// constants + the boundary static_asserts now live in
+// "executor/graph_variant.hpp" (so they're unit-testable host-side).
 
 int mtp_argmax_parts(int vocab) {
     static const int forced = [] {
@@ -731,256 +685,6 @@ void run_mtp_draft_with_argmax(
         rows, draft_step, max_global_tokens);
 }
 
-void tp_broadcast_mtp_inputs(NcclComm& comm, PersistentInputs& pi,
-                             int num_tokens, int draft_step,
-                             cudaStream_t stream);
-int tensor_rows(const DeviceTensor& t);
-void tp_cpu_gate_notify(const std::string& key);
-
-void run_step_chained_system_drafter(
-    Executor& executor,
-    std::span<const SystemSpecDraftRequest> requests,
-    std::span<pie_driver::PerRequestOutput> per_req,
-    bool mtp_global_cache)
-{
-    const int max_drafts = executor.system_drafter.max_drafts;
-    if (max_drafts <= 0 || requests.empty() ||
-        !executor.system_drafter.draft_step) {
-        return;
-    }
-
-    auto& pi = executor.inputs;
-    auto& ws = executor.ws;
-    auto& cublas = executor.cublas;
-
-    std::vector<std::uint32_t> mtp_tokens;
-    std::vector<std::int32_t> mtp_rows;
-    std::vector<std::uint32_t> mtp_input_pos;
-    std::vector<std::uint32_t> mtp_output_pos;
-    std::vector<int> mtp_requests;
-    mtp_tokens.reserve(requests.size());
-    mtp_rows.reserve(requests.size());
-    mtp_input_pos.reserve(requests.size());
-    mtp_output_pos.reserve(requests.size());
-    mtp_requests.reserve(requests.size());
-
-    const int draft_position_offset =
-        executor.system_drafter.draft_position_offset;
-    const bool prefix_global =
-        executor.system_drafter.draft_global_cache_uses_prefix_position;
-    for (const auto& req : requests) {
-        if (req.request_index < 0 ||
-            req.request_index >= static_cast<int>(per_req.size()) ||
-            req.source_row < 0) {
-            continue;
-        }
-        const std::uint64_t input_pos64 =
-            static_cast<std::uint64_t>(req.source_position) +
-            static_cast<std::uint64_t>(std::max(0, draft_position_offset));
-        if (input_pos64 > std::numeric_limits<std::uint32_t>::max()) {
-            continue;
-        }
-        mtp_tokens.push_back(req.accepted_token);
-        mtp_rows.push_back(req.source_row);
-        mtp_input_pos.push_back(static_cast<std::uint32_t>(input_pos64));
-        mtp_output_pos.push_back(req.first_draft_position);
-        mtp_requests.push_back(req.request_index);
-    }
-
-    const int S = static_cast<int>(mtp_tokens.size());
-    if (S <= 0) return;
-    if (S > tensor_rows(ws.logits)) {
-        throw std::runtime_error(
-            "MTP draft rows exceed logits workspace capacity");
-    }
-    if (static_cast<std::size_t>(S) *
-            static_cast<std::size_t>(max_drafts) >
-        static_cast<std::size_t>(tensor_rows(ws.k))) {
-        throw std::runtime_error(
-            "MTP draft history exceeds workspace capacity");
-    }
-
-    std::vector<std::int32_t> mtp_request_ids(static_cast<std::size_t>(S));
-    std::vector<std::int32_t> chained_rows(static_cast<std::size_t>(S));
-    for (int i = 0; i < S; ++i) {
-        mtp_request_ids[static_cast<std::size_t>(i)] =
-            static_cast<std::int32_t>(mtp_requests[static_cast<std::size_t>(i)]);
-        chained_rows[static_cast<std::size_t>(i)] = i;
-    }
-
-    const std::size_t s_sz = static_cast<std::size_t>(S);
-    const std::size_t drafts_sz = static_cast<std::size_t>(max_drafts);
-    const bool gpu_chain_capacity =
-        s_sz * (drafts_sz + 1) <= pi.tokens.size() &&
-        s_sz * drafts_sz <= pi.positions.size() &&
-        s_sz * drafts_sz <= pi.sample_idx.size() &&
-        s_sz * drafts_sz <= pi.tokens.size();
-    const bool gpu_chain =
-        executor.tp_comm == nullptr && !mtp_trace_enabled() &&
-        gpu_chain_capacity;
-
-    if (gpu_chain) {
-        StepProfileTimer mtp_timer(
-            "mtp_draft_chain", cublas.stream(),
-            static_cast<int>(s_sz * drafts_sz), S);
-        std::vector<std::uint32_t> mtp_positions_flat(s_sz * drafts_sz);
-        std::vector<std::int32_t> mtp_rows_flat(s_sz * drafts_sz);
-        std::vector<int> mtp_max_global_tokens(drafts_sz, 0);
-        int mtp_max_observed_global_tokens = 0;
-        for (int draft = 0; draft < max_drafts; ++draft) {
-            int max_global_tokens = 0;
-            for (int i = 0; i < S; ++i) {
-                const std::uint32_t input_pos =
-                    mtp_input_pos[static_cast<std::size_t>(i)] +
-                    static_cast<std::uint32_t>(draft);
-                const std::size_t flat =
-                    static_cast<std::size_t>(draft) * s_sz +
-                    static_cast<std::size_t>(i);
-                mtp_positions_flat[flat] = input_pos;
-                mtp_rows_flat[flat] =
-                    draft == 0
-                        ? mtp_rows[static_cast<std::size_t>(i)]
-                        : chained_rows[static_cast<std::size_t>(i)];
-                if (mtp_global_cache) {
-                    const int global_tokens = std::max(
-                        0,
-                        static_cast<int>(input_pos) -
-                            (prefix_global ? draft : 0));
-                    max_global_tokens = std::max(
-                        max_global_tokens, global_tokens);
-                }
-            }
-            mtp_max_global_tokens[static_cast<std::size_t>(draft)] =
-                max_global_tokens;
-            mtp_max_observed_global_tokens = std::max(
-                mtp_max_observed_global_tokens, max_global_tokens);
-        }
-
-        pi.tokens.copy_from_host(std::span<const std::uint32_t>(mtp_tokens));
-        pi.positions.copy_from_host(
-            std::span<const std::uint32_t>(mtp_positions_flat));
-        pi.sample_idx.copy_from_host(
-            std::span<const std::int32_t>(mtp_rows_flat));
-        pi.mtp_request_ids.copy_from_host(
-            std::span<const std::int32_t>(mtp_request_ids));
-
-        if (!try_run_mtp_chain_graph_with_argmax(
-                executor, S, max_drafts, mtp_max_observed_global_tokens)) {
-            for (int draft = 0; draft < max_drafts; ++draft) {
-                const std::size_t offset =
-                    static_cast<std::size_t>(draft) * s_sz;
-                run_mtp_draft_with_argmax(
-                    executor,
-                    reinterpret_cast<const std::int32_t*>(
-                        pi.tokens.data() + offset),
-                    reinterpret_cast<const std::int32_t*>(
-                        pi.positions.data() + offset),
-                    pi.sample_idx.data() + offset,
-                    pi.mtp_request_ids.data(),
-                    S, draft,
-                    mtp_max_global_tokens[static_cast<std::size_t>(draft)]);
-                CUDA_CHECK(cudaMemcpyAsync(
-                    pi.tokens.data() + offset + s_sz, pi.sampled.data(),
-                    sizeof(std::uint32_t) * s_sz,
-                    cudaMemcpyDeviceToDevice, cublas.stream()));
-            }
-        }
-
-        std::vector<std::uint32_t> mtp_sampled_flat(s_sz * drafts_sz);
-        CUDA_CHECK(cudaMemcpyAsync(
-            mtp_sampled_flat.data(), pi.tokens.data() + s_sz,
-            sizeof(std::uint32_t) * s_sz * drafts_sz,
-            cudaMemcpyDeviceToHost, cublas.stream()));
-        mtp_timer.finish(cublas.stream());
-        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
-
-        for (int draft = 0; draft < max_drafts; ++draft) {
-            for (int i = 0; i < S; ++i) {
-                auto& out = per_req[static_cast<std::size_t>(
-                    mtp_requests[static_cast<std::size_t>(i)])];
-                const std::size_t flat =
-                    static_cast<std::size_t>(draft) * s_sz +
-                    static_cast<std::size_t>(i);
-                out.spec_tokens.push_back(mtp_sampled_flat[flat]);
-                out.spec_positions.push_back(
-                    mtp_output_pos[static_cast<std::size_t>(i)] +
-                    static_cast<std::uint32_t>(draft));
-            }
-        }
-        return;
-    }
-
-    std::vector<std::int32_t> mtp_sampled(static_cast<std::size_t>(S));
-    for (int draft = 0; draft < max_drafts; ++draft) {
-        int max_global_tokens = 0;
-        if (mtp_global_cache) {
-            for (auto pos : mtp_input_pos) {
-                const int global_tokens =
-                    std::max(0,
-                             static_cast<int>(pos) -
-                                 (prefix_global ? draft : 0));
-                max_global_tokens =
-                    std::max(max_global_tokens, global_tokens);
-            }
-        }
-        pi.tokens.copy_from_host(std::span<const std::uint32_t>(mtp_tokens));
-        pi.positions.copy_from_host(
-            std::span<const std::uint32_t>(mtp_input_pos));
-        pi.sample_idx.copy_from_host(std::span<const std::int32_t>(mtp_rows));
-        pi.mtp_request_ids.copy_from_host(
-            std::span<const std::int32_t>(mtp_request_ids));
-        if (executor.tp_comm != nullptr) {
-            tp_cpu_gate_notify(executor.tp_cpu_gate_key);
-            tp_broadcast_mtp_inputs(
-                *executor.tp_comm, pi, S, draft, /*stream=*/nullptr);
-        }
-        run_mtp_draft_with_argmax(executor, S, draft, max_global_tokens);
-        CUDA_CHECK(cudaMemcpyAsync(
-            mtp_sampled.data(), pi.sampled.data(),
-            sizeof(std::int32_t) * static_cast<std::size_t>(S),
-            cudaMemcpyDeviceToHost, cublas.stream()));
-        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
-        if (mtp_trace_take()) {
-            std::cerr << "[pie-mtp-trace] draft_step=" << draft
-                      << " rows=" << S << " in_tok=[";
-            for (int i = 0; i < S; ++i) {
-                if (i) std::cerr << ",";
-                std::cerr << mtp_tokens[static_cast<std::size_t>(i)];
-            }
-            std::cerr << "] in_pos=[";
-            for (int i = 0; i < S; ++i) {
-                if (i) std::cerr << ",";
-                std::cerr << mtp_input_pos[static_cast<std::size_t>(i)];
-            }
-            std::cerr << "] out_pos=[";
-            for (int i = 0; i < S; ++i) {
-                if (i) std::cerr << ",";
-                std::cerr << mtp_output_pos[static_cast<std::size_t>(i)];
-            }
-            std::cerr << "] out_tok=[";
-            for (int i = 0; i < S; ++i) {
-                if (i) std::cerr << ",";
-                std::cerr << mtp_sampled[static_cast<std::size_t>(i)];
-            }
-            std::cerr << "]\n";
-        }
-        for (int i = 0; i < S; ++i) {
-            auto& out = per_req[static_cast<std::size_t>(
-                mtp_requests[static_cast<std::size_t>(i)])];
-            const auto sampled =
-                static_cast<std::uint32_t>(
-                    mtp_sampled[static_cast<std::size_t>(i)]);
-            out.spec_tokens.push_back(sampled);
-            out.spec_positions.push_back(
-                mtp_output_pos[static_cast<std::size_t>(i)]);
-            mtp_tokens[static_cast<std::size_t>(i)] = sampled;
-            mtp_input_pos[static_cast<std::size_t>(i)] += 1u;
-            mtp_output_pos[static_cast<std::size_t>(i)] += 1;
-        }
-        mtp_rows = chained_rows;
-    }
-}
-
 std::vector<int> forward_graph_request_lattice(int max_requests) {
     std::vector<int> out;
     if (max_requests <= 0) return out;
@@ -1083,105 +787,9 @@ cudaGraphExec_t capture_forward_graph_exec(
     return exec;
 }
 
-float bf16_to_float(std::uint16_t v) {
-    std::uint32_t bits = static_cast<std::uint32_t>(v) << 16;
-    float out;
-    std::memcpy(&out, &bits, sizeof(out));
-    return out;
-}
-
 int tensor_rows(const DeviceTensor& t) {
     if (t.shape().empty()) return 0;
     return static_cast<int>(t.shape()[0]);
-}
-
-std::int32_t* sampled_pinned_buf(std::size_t want_elems) {
-    static std::int32_t* buf = nullptr;
-    static std::size_t buf_capacity = 0;
-    if (want_elems > buf_capacity) {
-        if (buf) cudaFreeHost(buf);
-        CUDA_CHECK(cudaMallocHost(&buf, want_elems * sizeof(std::int32_t)));
-        buf_capacity = want_elems;
-    }
-    return buf;
-}
-
-std::int32_t masked_argmax_bf16(
-    const std::uint16_t* row,
-    int vocab_size,
-    std::span<const std::uint32_t> mask_runs)
-{
-    bool allow = false;
-    std::uint64_t pos = 0;
-    float best_val = -std::numeric_limits<float>::infinity();
-    std::int32_t best_idx = -1;
-
-    for (std::size_t i = 0; i < mask_runs.size() && pos < static_cast<std::uint64_t>(vocab_size);
-         ++i) {
-        const std::uint64_t run_len = mask_runs[i];
-        const std::uint64_t end =
-            std::min<std::uint64_t>(pos + run_len, static_cast<std::uint64_t>(vocab_size));
-        if (allow) {
-            for (std::uint64_t j = pos; j < end; ++j) {
-                const auto idx = static_cast<std::int32_t>(j);
-                const float val = bf16_to_float(row[idx]);
-                if (val > best_val || (val == best_val && idx < best_idx)) {
-                    best_val = val;
-                    best_idx = idx;
-                }
-            }
-        }
-        pos = end;
-        allow = !allow;
-    }
-
-    return best_idx;
-}
-
-void apply_logit_mask_overrides(
-    model::Qwen3Workspace& ws,
-    std::vector<std::int32_t>& all_sampled,
-    std::span<const std::uint32_t> logit_masks,
-    std::span<const std::uint32_t> logit_mask_indptr,
-    std::span<const std::uint32_t> qo_indptr,
-    std::span<const std::uint32_t> sampling_indptr,
-    std::span<const std::uint32_t> sampling_indices,
-    std::span<const std::uint32_t> per_slot_type,
-    int R,
-    int N,
-    int vocab_size)
-{
-    if (logit_masks.empty()) return;
-    if (logit_mask_indptr.size() < static_cast<std::size_t>(R + 1)) return;
-    if (qo_indptr.size() < static_cast<std::size_t>(R + 1)) return;
-    if (sampling_indptr.size() < static_cast<std::size_t>(R + 1)) return;
-
-    const auto* logits_u16 = static_cast<const std::uint16_t*>(ws.logits.data());
-    std::vector<std::uint16_t> row_bf16(static_cast<std::size_t>(vocab_size));
-
-    for (int r = 0; r < R; ++r) {
-        const std::uint32_t mask_lo = logit_mask_indptr[r];
-        const std::uint32_t mask_hi = logit_mask_indptr[r + 1];
-        if (mask_hi <= mask_lo || mask_hi > logit_masks.size()) continue;
-
-        const auto runs = logit_masks.subspan(mask_lo, mask_hi - mask_lo);
-        const std::uint32_t qo_lo = qo_indptr[r];
-        for (std::uint32_t k = sampling_indptr[r]; k < sampling_indptr[r + 1]; ++k) {
-            if (k >= per_slot_type.size() || !is_token_sampler(per_slot_type[k])) continue;
-            const std::uint32_t row = qo_lo + sampling_indices[k];
-            if (row >= static_cast<std::uint32_t>(N)) continue;
-
-            CUDA_CHECK(cudaMemcpy(row_bf16.data(),
-                                  logits_u16 + static_cast<long long>(row) * vocab_size,
-                                  sizeof(std::uint16_t) * static_cast<std::size_t>(vocab_size),
-                                  cudaMemcpyDeviceToHost));
-            const std::int32_t masked = masked_argmax_bf16(
-                row_bf16.data(), vocab_size, runs);
-            if (masked >= 0) {
-                all_sampled[row] = masked;
-            }
-        }
-    }
 }
 
 std::shared_ptr<TpCpuGate> tp_cpu_gate_for(const std::string& key) {
@@ -1575,10 +1183,10 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         const std::uint32_t graph_layout =
             executor.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
-            (tp_greedy_argmax ? 1u : 0u) |
-            (single_gpu_graph_argmax ? 2u : 0u) |
-            (fwd_handles_argmax_precapture ? 4u : 0u) |
-            (graph_layout << 3);
+            make_graph_variant(tp_greedy_argmax, single_gpu_graph_argmax,
+                               fwd_handles_argmax_precapture,
+                               /*small_spec=*/false, /*rs_verify=*/false,
+                               graph_layout);
         const ForwardGraphKey key{R, N, graph_variant};
         if (executor.graph_cache->get(key) != nullptr) continue;
 
@@ -1623,54 +1231,6 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
     return captured;
 }
 
-struct GraphShapeDecision {
-    bool small_spec_graph_shape = false;
-    bool graph_shape_ok = false;
-    int graph_requests = 0;
-};
-
-// Sliced wire-views the sample-plan builder consumes. Bundled so the
-// builder's signature stays manageable (12+ spans otherwise).
-struct SamplePlanInputs {
-    std::span<const std::uint8_t>  outspec_view;
-    std::span<const std::uint32_t> sptr_view;
-    std::span<const std::uint32_t> sidx_view;
-    std::span<const std::uint32_t> rns_view;
-    std::span<const std::uint32_t> types_view;
-    std::span<const float>         temp_view;
-    std::span<const std::uint32_t> top_k_view;
-    std::span<const float>         top_p_view;
-    std::span<const float>         min_p_view;
-    std::span<const std::uint32_t> seed_view;
-    std::span<const std::uint32_t> logit_masks_view;
-    const std::uint32_t* h_qo = nullptr;
-    int N = 0;
-    int R = 0;
-    int num_sampling = 0;
-    bool is_pure_decode = false;
-    bool have_custom_mask = false;
-    bool has_spec_drafts = false;
-};
-
-// Per-fire decisions emitted by the sample-plan phase. The spans on
-// `sampling_plan` point into the thread-local `sample_scratch()`
-// vectors, which the builder fills as a side effect; caller must keep
-// `sample_scratch()` alive for the rest of the fire (i.e. don't recurse).
-struct SamplePlanResult {
-    bool has_msgpack_only_slots = false;
-    bool has_rich_sampler_slots = false;
-    bool need_msgpack = false;
-    bool any_topk_topp = false;
-    bool sample_rows_are_dense = false;
-    bool all_rows_greedy = false;
-    bool all_slots_token = false;
-    bool compact_logit_rows = false;
-    bool tp_greedy_argmax = false;
-    bool single_gpu_greedy_argmax = false;
-    int logit_rows_required = 0;
-    int prob_rows_required = 0;
-};
-
 // Inputs to the forward-dispatch phase. Built once at the call site
 // and passed by-ref so the dispatcher can pick between graph replay
 // and a direct `forward_fn.body` call without a 20-arg signature.
@@ -1682,6 +1242,10 @@ struct ForwardDispatchInputs {
     int num_sampling = 0;
     bool is_pure_decode = false;
     bool have_custom_mask = false;
+    // Explicit KV-write descriptor present (device-geometry WSlot/WOff, B2).
+    // When set, the forward routes the per-layer KV append through the explicit
+    // (physical page, offset) kernel from pi.w_page/pi.w_off.
+    bool has_write_desc = false;
     bool small_spec_graph_shape = false;
     bool graph_shape_ok = false;
     bool tp_greedy_argmax = false;
@@ -1696,6 +1260,13 @@ struct ForwardDispatchInputs {
     const std::uint32_t* h_kvlpl_forward = nullptr;
     const std::int32_t*  slot_ids_h_data = nullptr;
     const std::uint8_t*  is_fresh_h_data = nullptr;
+    // Ph7 RS rs-output (W10): when rs_buffer_write, the linear layers scatter
+    // their in-proj [mixed_qkv|a|b] page-major into the buffered-activation pool
+    // at these per-request CSR slabs (write_state forced false). FOLD passes use
+    // the separate fold-replay dispatch instead (not this path).
+    const std::uint32_t* rs_buffer_slot_ids_h = nullptr;
+    const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;
+    bool                 rs_buffer_write = false;
     // Multimodal (gemma4 vision): image side-channel, set from the view.
     const float*         image_pixels_h = nullptr;
     const std::uint32_t* image_pixel_byte_indptr_h = nullptr;
@@ -1718,286 +1289,6 @@ struct ForwardDispatchResult {
     std::uint32_t graph_layout = 0;
     bool graph_captures_single_gpu_argmax = false;
 };
-
-// Decide whether the active fire can replay a captured CUDA graph and,
-// if so, what bucket size to request. Two paths qualify: pure-decode
-// (qo_len==1 every request) and small-prefill speculative verification.
-// Caller passes the shape inputs already gathered at the top of the
-// fire; the planner-pad fields come from `executor`.
-GraphShapeDecision decide_graph_shape(
-    const Executor& executor,
-    int R, int N, int page_size,
-    bool is_pure_decode,
-    bool has_spec_drafts,
-    bool has_fresh_slot,
-    std::size_t kvpi_view_size,
-    std::size_t pi_kv_page_indices_size)
-{
-    const int small_spec_graph_tokens = qwen35_small_spec_graph_tokens();
-    const int small_spec_graph_requests = small_spec_graph_max_requests();
-    const int small_spec_graph_min_r =
-        small_spec_graph_min_requests(small_spec_graph_requests);
-
-    const bool pure_decode_graph_shape =
-        executor.graph_cache != nullptr && is_pure_decode &&
-        executor.forward_fn.graph_safe && !has_fresh_slot;
-    const bool small_spec_graph_shape =
-        executor.graph_cache != nullptr &&
-        executor.tp_comm == nullptr &&
-        !is_pure_decode &&
-        has_spec_drafts &&
-        executor.forward_fn.graph_safe &&
-        executor.forward_fn.supports_small_prefill_graph &&
-        small_spec_graph_tokens > 0 &&
-        R >= small_spec_graph_min_r &&
-        R <= small_spec_graph_requests &&
-        N <= small_spec_graph_tokens &&
-        executor.kv_cache.format().is_native_bf16() &&
-        !executor.kv_cache.hnd_layout() &&
-        !has_fresh_slot;
-
-    GraphShapeDecision out;
-    out.small_spec_graph_shape = small_spec_graph_shape;
-    out.graph_shape_ok = pure_decode_graph_shape || small_spec_graph_shape;
-    out.graph_requests = R;
-    if (pure_decode_graph_shape) {
-        const int bucket =
-            forward_graph_request_bucket(R, executor.max_forward_requests);
-        const int pad = bucket - R;
-        const bool exact_bucket = (bucket == R);
-        const bool can_pad =
-            bucket > R &&
-            executor.graph_pad_page >= 0 &&
-            (executor.rs_cache == nullptr ||
-             executor.graph_pad_slot >= 0) &&
-            bucket <= executor.max_workspace_tokens &&
-            pad <= page_size &&
-            kvpi_view_size + static_cast<std::size_t>(pad) <=
-                pi_kv_page_indices_size;
-        out.graph_shape_ok = bucket > 0 && (exact_bucket || can_pad);
-        if (out.graph_shape_ok) out.graph_requests = bucket;
-    }
-    return out;
-}
-
-// Hoisted sample-plan builder. Mirrors the historical "Sample-plan
-// construction" block — fills the thread-local `sample_scratch()` with
-// per-row/per-slot sampler params and emits the dispatch flags
-// (compact-logit / TP greedy / single-GPU greedy / etc.) so the
-// downstream forward + sampling launch can take the fast path when
-// the request mix permits.
-SamplePlanResult build_sample_plan(
-    const Executor& executor,
-    const SamplePlanInputs& in)
-{
-    SamplePlanResult out;
-    for (auto t : in.types_view) {
-        if (pie_cuda_driver::is_msgpack_only(t)) {
-            out.has_msgpack_only_slots = true;
-            out.has_rich_sampler_slots = true;
-            break;
-        }
-    }
-    out.need_msgpack = out.has_msgpack_only_slots;
-    if (!out.need_msgpack) {
-        for (auto f : in.outspec_view) {
-            if (f) { out.need_msgpack = true; break; }
-        }
-    }
-    if (in.has_spec_drafts) out.need_msgpack = true;
-
-    const std::uint32_t* h_sptr  = in.sptr_view.data();
-    const std::uint32_t* h_sidx  = in.sidx_view.data();
-    const std::uint32_t* h_rns   = in.rns_view.data();
-    const float*         h_temp  = in.temp_view.data();
-    const std::uint32_t* h_top_k = in.top_k_view.data();
-    const float*         h_top_p = in.top_p_view.data();
-    const float*         h_min_p = in.min_p_view.data();
-    const std::uint32_t* h_seed  = in.seed_view.data();
-
-    auto& sample_scratch = sampling_scratch();
-    auto& h_per_temp = sample_scratch.h_per_temp;
-    auto& h_per_min_p = sample_scratch.h_per_min_p;
-    auto& h_per_top_p = sample_scratch.h_per_top_p;
-    auto& h_per_top_k = sample_scratch.h_per_top_k;
-    auto& h_per_seed = sample_scratch.h_per_seed;
-    auto& per_slot_type = sample_scratch.per_slot_type;
-    auto& per_slot_temp = sample_scratch.per_slot_temp;
-    auto& per_slot_top_p = sample_scratch.per_slot_top_p;
-    auto& per_slot_min_p = sample_scratch.per_slot_min_p;
-    auto& per_slot_top_k = sample_scratch.per_slot_top_k;
-    auto& per_slot_seed = sample_scratch.per_slot_seed;
-    auto& h_sample_idx = sample_scratch.h_sample_idx;
-
-    const int R = in.R;
-    const int N = in.N;
-    const int num_sampling = in.num_sampling;
-
-    bool fast_dense_greedy_argmax =
-        executor.tp_comm == nullptr &&
-        !in.have_custom_mask &&
-        !out.need_msgpack &&
-        !in.has_spec_drafts &&
-        in.logit_masks_view.empty() &&
-        in.is_pure_decode &&
-        N == R &&
-        num_sampling == R &&
-        in.sptr_view.size() == static_cast<std::size_t>(R + 1) &&
-        in.sidx_view.size() == static_cast<std::size_t>(R) &&
-        in.rns_view.size() >= static_cast<std::size_t>(R) &&
-        in.types_view.size() >= static_cast<std::size_t>(R) &&
-        in.temp_view.size() >= static_cast<std::size_t>(R);
-    if (fast_dense_greedy_argmax) {
-        for (int r = 0; r < R; ++r) {
-            if (h_sptr[r] != static_cast<std::uint32_t>(r) ||
-                h_sptr[r + 1] != static_cast<std::uint32_t>(r + 1) ||
-                h_sidx[r] != 0u ||
-                h_rns[r] != 1u ||
-                !pie_cuda_driver::is_token_sampler(in.types_view[r]) ||
-                h_temp[r] > 0.f) {
-                fast_dense_greedy_argmax = false;
-                break;
-            }
-        }
-    }
-
-    out.sample_rows_are_dense = fast_dense_greedy_argmax;
-    out.all_rows_greedy = fast_dense_greedy_argmax;
-    out.all_slots_token = fast_dense_greedy_argmax;
-    if (!fast_dense_greedy_argmax) {
-        h_per_temp.assign(static_cast<std::size_t>(N), 0.f);
-        h_per_min_p.assign(static_cast<std::size_t>(N), 0.f);
-        h_per_top_p.assign(static_cast<std::size_t>(N), 1.f);
-        h_per_top_k.assign(static_cast<std::size_t>(N), 0);
-        h_per_seed.assign(static_cast<std::size_t>(N), 0u);
-
-        per_slot_type.assign(static_cast<std::size_t>(num_sampling), 1u);
-        per_slot_temp.assign(static_cast<std::size_t>(num_sampling), 0.f);
-        per_slot_top_p.assign(static_cast<std::size_t>(num_sampling), 1.f);
-        per_slot_min_p.assign(static_cast<std::size_t>(num_sampling), 0.f);
-        per_slot_top_k.assign(static_cast<std::size_t>(num_sampling), 0);
-        per_slot_seed.assign(static_cast<std::size_t>(num_sampling), 0u);
-
-        std::uint32_t sampler_off = 0;
-        for (int r = 0; r < R; ++r) {
-            const std::uint32_t ns =
-                (in.rns_view.size() > static_cast<std::size_t>(r)) ? h_rns[r] : 0u;
-            const std::uint32_t lo = h_sptr[r];
-            const std::uint32_t hi = h_sptr[r + 1];
-            const std::uint32_t qo_lo = in.h_qo[r];
-            for (std::uint32_t k = lo; k < hi; ++k) {
-                const std::uint32_t s_idx = sampler_off + (k - lo);
-                const std::uint32_t type =
-                    (s_idx < in.types_view.size()) ? in.types_view[s_idx] : 1u;
-                per_slot_type[k] = type;
-                const float T = (s_idx < in.temp_view.size()) ? h_temp[s_idx] : 1.f;
-                const float Tp = (s_idx < in.top_p_view.size()) ? h_top_p[s_idx] : 1.f;
-                const float Mp = (s_idx < in.min_p_view.size()) ? h_min_p[s_idx] : 0.f;
-                const std::int32_t Tk_raw = (s_idx < in.top_k_view.size())
-                    ? static_cast<std::int32_t>(h_top_k[s_idx]) : 0;
-                const std::int32_t Tk =
-                    (Tk_raw == 0) ? executor.loaded_model.hf_config().vocab_size : Tk_raw;
-                std::uint32_t s = (s_idx < in.seed_view.size()) ? h_seed[s_idx] : 0u;
-                per_slot_temp[k] = T;
-                per_slot_top_p[k] = Tp;
-                per_slot_min_p[k] = Mp;
-                per_slot_top_k[k] = Tk;
-                const bool is_token = pie_cuda_driver::is_token_sampler(type);
-                if (is_token) {
-                    if (T > 0.f && s == 0u) {
-                        s = fresh_sampling_seed();
-                    }
-                    per_slot_seed[k] = s;
-                    if ((Tk_raw > 0 || Tp < 1.f) && T > 0.f) out.any_topk_topp = true;
-                    const std::uint32_t row = qo_lo + h_sidx[k];
-                    if (row < static_cast<std::uint32_t>(N)) {
-                        h_per_temp[row]  = T;
-                        h_per_top_k[row] = Tk;
-                        h_per_top_p[row] = Tp;
-                        h_per_min_p[row] = Mp;
-                        h_per_seed[row]  = s;
-                    }
-                } else {
-                    per_slot_seed[k] = s;
-                }
-            }
-            sampler_off += ns;
-        }
-
-        h_sample_idx.assign(static_cast<std::size_t>(num_sampling), 0);
-        int k_g = 0;
-        for (int r = 0; r < R; ++r) {
-            const std::uint32_t qo_lo = in.h_qo[r];
-            for (std::uint32_t k = h_sptr[r]; k < h_sptr[r + 1]; ++k, ++k_g) {
-                h_sample_idx[k_g] =
-                    static_cast<std::int32_t>(qo_lo + h_sidx[k]);
-            }
-        }
-
-        out.sample_rows_are_dense = (num_sampling == N);
-        if (out.sample_rows_are_dense) {
-            for (int i = 0; i < N; ++i) {
-                if (h_sample_idx[i] != i) {
-                    out.sample_rows_are_dense = false;
-                    break;
-                }
-            }
-        }
-        out.all_rows_greedy = true;
-        for (int i = 0; i < N; ++i) {
-            if (h_per_temp[i] > 0.f) {
-                out.all_rows_greedy = false;
-                break;
-            }
-        }
-        out.all_slots_token = true;
-        for (auto type : per_slot_type) {
-            if (!pie_cuda_driver::is_token_sampler(type)) {
-                out.all_slots_token = false;
-                break;
-            }
-        }
-    }
-
-    out.compact_logit_rows =
-        executor.forward_fn.supports_compact_logits &&
-        !in.is_pure_decode &&
-        !in.have_custom_mask &&
-        !out.has_msgpack_only_slots &&
-        !in.has_spec_drafts &&
-        in.logit_masks_view.empty() &&
-        !out.any_topk_topp &&
-        out.all_slots_token &&
-        num_sampling > 0 &&
-        num_sampling < N;
-    out.tp_greedy_argmax =
-        executor.tp_comm != nullptr &&
-        executor.tp_comm->world_size() <= 8 &&
-        executor.forward_fn.supports_tp_greedy_argmax &&
-        !in.have_custom_mask &&
-        !out.need_msgpack &&
-        !in.has_spec_drafts &&
-        in.logit_masks_view.empty() &&
-        !out.any_topk_topp &&
-        out.all_slots_token &&
-        out.all_rows_greedy &&
-        in.is_pure_decode &&
-        out.sample_rows_are_dense;
-    out.single_gpu_greedy_argmax =
-        executor.tp_comm == nullptr &&
-        !in.have_custom_mask &&
-        in.logit_masks_view.empty() &&
-        !out.any_topk_topp &&
-        out.all_slots_token &&
-        out.all_rows_greedy &&
-        out.sample_rows_are_dense;
-    out.logit_rows_required =
-        num_sampling == 0 ? 0
-        : out.compact_logit_rows ? num_sampling
-        : N;
-    out.prob_rows_required = out.any_topk_topp ? N : 0;
-    return out;
-}
 
 // Run the per-fire forward body. Two paths: replay a captured CUDA
 // graph if the active shape qualifies, or invoke `forward_fn.body`
@@ -2025,16 +1316,13 @@ ForwardDispatchResult run_forward_dispatch(
         graph_single_gpu_argmax_enabled();
     const bool rs_verify_frozen =
         executor.rs_cache != nullptr && executor.rs_cache->verify_frozen();
-    const std::uint32_t graph_variant =
-        (in.tp_greedy_argmax ? 1u : 0u) |
-        (out.graph_captures_single_gpu_argmax ? 2u : 0u) |
-        (in.forward_handles_argmax ? 4u : 0u) |
-        (out.graph_layout << 3) |
-        (in.small_spec_graph_shape ? 0x200u : 0u) |
+    const std::uint32_t graph_variant = make_graph_variant(
+        in.tp_greedy_argmax, out.graph_captures_single_gpu_argmax,
+        in.forward_handles_argmax, in.small_spec_graph_shape,
         // Frozen verify skips the GDN state writeback, baked into the captured
         // kernel — must not share a graph with a normal-writeback forward of
         // the same shape.
-        (rs_verify_frozen ? 0x400u : 0u);
+        rs_verify_frozen, out.graph_layout);
 
     if (try_graphs) {
         const ForwardGraphKey key{in.forward_R, in.forward_N, graph_variant};
@@ -2082,9 +1370,15 @@ ForwardDispatchResult run_forward_dispatch(
         fwd_in.is_pure_decode      = in.is_pure_decode;
         fwd_in.custom_mask_d        = in.have_custom_mask ? pi.custom_mask.data()        : nullptr;
         fwd_in.custom_mask_indptr_d = in.have_custom_mask ? pi.custom_mask_indptr.data() : nullptr;
+        fwd_in.w_page_d             = in.has_write_desc ? pi.w_page.data() : nullptr;
+        fwd_in.w_off_d              = in.has_write_desc ? pi.w_off.data()  : nullptr;
+        fwd_in.has_write_desc       = in.has_write_desc;
         fwd_in.slot_ids_h          = in.use_slots ? in.slot_ids_h_data : nullptr;
         fwd_in.is_fresh_h          = in.use_slots ? in.is_fresh_h_data : nullptr;
         fwd_in.slot_ids_d          = in.use_slots ? pi.slot_ids.data() : nullptr;
+        fwd_in.rs_buffer_slot_ids_h    = in.rs_buffer_slot_ids_h;
+        fwd_in.rs_buffer_slot_indptr_h = in.rs_buffer_slot_indptr_h;
+        fwd_in.rs_buffer_write         = in.rs_buffer_write;
         fwd_in.logit_row_indices_d = in.compact_logit_rows ? pi.sample_idx.data() : nullptr;
         fwd_in.num_logit_rows      = in.compact_logit_rows ? in.num_sampling : 0;
         fwd_in.emit_logits         = in.num_sampling > 0;
@@ -2109,39 +1403,28 @@ ForwardDispatchResult run_forward_dispatch(
     return out;
 }
 
-namespace {
-using probe_clock = std::chrono::steady_clock;
-inline std::uint32_t us_between(probe_clock::time_point a,
-                                probe_clock::time_point b) {
-    return static_cast<std::uint32_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
-}
-inline void write_probes(pie_driver::PieForwardResponseView& out,
-                         probe_clock::time_point t0, probe_clock::time_point t1,
-                         probe_clock::time_point t2, probe_clock::time_point t3,
-                         probe_clock::time_point t4, probe_clock::time_point t5) {
-    const auto t6 = probe_clock::now();
-    out.probe_wire_parse_us    = us_between(t0, t1);
-    out.probe_plan_us          = us_between(t1, t2);
-    out.probe_h2d_us           = us_between(t2, t3);
-    out.probe_kernel_launch_us = us_between(t3, t4);
-    out.probe_sync_us          = us_between(t4, t5);
-    out.probe_response_build_us = us_between(t5, t6);
-}
-}  // namespace
-
 void handle_fire_batch(
     std::uint32_t req_id,
-    const pie_driver::PieForwardRequestView& view,
-    pie_driver::PieForwardResponseView& out_resp,
+    const pie_native::LaunchView& view,
     Executor& executor,
-    std::uint64_t handled)
+    const PieRuntimeCallbacks& runtime,
+    PieCompletion completion)
 {
     using clock = std::chrono::steady_clock;
     const auto t_entry = clock::now();
 
+    // Diagnostic trace for the direct launch path.
+    const bool ir_trace = std::getenv("PIE_SAMPLING_IR_TRACE") != nullptr;
+    if (ir_trace) {
+        std::cerr << "[ir-trace] fire entry req_id=" << req_id << "\n";
+        std::cerr.flush();
+    }
+    if (std::getenv("PIE_PTIR_TRACE")) {
+        std::fprintf(stderr, "[ptir-serve] entry req_id=%u: ptir_hashes=%zu tokens=%zu\n",
+                     req_id, view.ptir_program_hashes.size(), view.token_ids.size());
+    }
+
     // Local references for the most-touched Executor members.
-    auto& engine               = executor.loaded_model;
     auto& ws                   = executor.ws;
     auto& kv_cache             = executor.kv_cache;
     auto& attn_ws              = executor.attn_ws;
@@ -2149,13 +1432,13 @@ void handle_fire_batch(
     auto& pi                   = executor.inputs;  // persistent input slabs
     auto& forward_fn           = executor.forward_fn;
     const int max_workspace_tokens = executor.max_workspace_tokens;
-    const int graph_pad_page = executor.graph_pad_page;
 
     // Track whether the custom-mask path was populated this fire so the
     // forward kernel knows whether to consume `pi.custom_mask`. Sizes are
     // stashed alongside so the TP broadcast knows how many bytes to fan
     // out to followers.
     bool have_custom_mask = false;
+    bool has_write_desc = false;
     int mask_bytes = 0;
     int mask_indptr_count = 0;
 
@@ -2205,85 +1488,114 @@ void handle_fire_batch(
         const auto tok_view_orig   = view.token_ids.as<std::uint32_t>();
         const auto pos_view_orig   = view.position_ids.as<std::uint32_t>();
         const auto qo_view_orig    = view.qo_indptr.as<std::uint32_t>();
-        const auto kvpi_view = view.kv_page_indices.as<std::uint32_t>();
-        const auto kvpp_view = view.kv_page_indptr.as<std::uint32_t>();
+        const auto kvpi_view_wire = view.kv_page_indices.as<std::uint32_t>();
+        const auto kvpp_view_wire = view.kv_page_indptr.as<std::uint32_t>();
         const auto kvlpl_view_orig = view.kv_last_page_lens.as<std::uint32_t>();
 
         const auto sidx_view_orig  = view.sampling_indices.as<std::uint32_t>();
         const auto sptr_view_orig  = view.sampling_indptr.as<std::uint32_t>();
-        // Per-request stable context ids. Runtime-managed rs_cache slot
-        // ids below are indexed in this same request order.
-        const auto ctx_id_view     = view.context_ids.as<std::uint64_t>();
 
-        // Sampler params (per-sampler arrays). Read here (rather than
-        // further down) so the spec expansion below can append cloned
-        // entries for the verification block.
-        const auto temp_view_orig  = view.sampler_temperatures.as<float>();
-        const auto top_k_view_orig = view.sampler_top_k.as<std::uint32_t>();
-        const auto top_p_view_orig = view.sampler_top_p.as<float>();
-        const auto min_p_view_orig = view.sampler_min_p.as<float>();
-        const auto types_view_orig = view.sampler_types.as<std::uint32_t>();
-        const auto seed_view_orig  = view.sampler_seeds.as<std::uint32_t>();
-        const auto rns_view_orig   = view.request_num_samplers.as<std::uint32_t>();
-        const auto logit_masks_view = view.logit_masks.as<std::uint32_t>();
-        const auto logit_mask_indptr_view = view.logit_mask_indptr.as<std::uint32_t>();
+        // ── W1.1: pre-forward device-geometry descriptor resolution ──────
+        // EVERY device-geometry PTIR program in the batch (WSlot/WOff write
+        // descriptors + a channel-bound [B, P>1] Pages port — the runtime's
+        // `detect_device_geometry` mirror) ships EMPTY wire geometry; the
+        // driver reads its port channels at fire time and COMPOSES the
+        // resolved geometries with the wire programs' launch slices into one
+        // flat forward batch (batch_compose.hpp) — no program-specific
+        // assembly (owner constraint §3.1). A not-ready descriptor channel
+        // fails the fire (W1.6). Pure-wire batches resolve nothing
+        // (dg_resolved = false, empty *err) and use the wire geometry
+        // unchanged.
+        ptir::ResolvedPrograms rpg;
+        ptir::ComposedBatch composed;
+        // Per-PROGRAM offsets of each program's sampled rows within the
+        // gathered logits buffer (`n_prog + 1` entries) — what
+        // `PtirDispatch::run` slices each program's logits base from.
+        std::vector<std::uint32_t> prog_sample_offsets;
+        bool dg_resolved = false;
+        if (!view.ptir_program_hashes.empty()) {
+            if (!executor.ptir_dispatch)
+                executor.ptir_dispatch = std::make_unique<ptir::PtirDispatch>();
+            std::string dg_err;
+            dg_resolved = executor.ptir_dispatch->resolve_descriptors(
+                view,
+                static_cast<std::uint32_t>(kv_cache.page_size()),
+                static_cast<std::uint32_t>(kv_cache.num_pages()),
+                rpg,
+                &dg_err);
+            if (!dg_resolved && !dg_err.empty()) {
+                throw std::runtime_error(dg_err);
+            }
+            if (dg_resolved) {
+                // v1 mask scope: a dense device mask (AttnMask channel)
+                // composes only SOLO — the runtime scheduler batches such
+                // fires alone; fail loud if the contract is violated.
+                if (rpg.per_program.size() > 1) {
+                    for (std::size_t p = 0; p < rpg.per_program.size(); ++p) {
+                        if (rpg.is_device_geometry[p] &&
+                            rpg.per_program[p].has_mask) {
+                            throw std::runtime_error(
+                                "ptir: dense device mask in a multi-program "
+                                "batch (scheduler contract violated)");
+                        }
+                    }
+                }
+                std::string compose_err;
+                if (!ptir::compose_forward_batch(
+                        view, rpg,
+                        static_cast<std::uint32_t>(kv_cache.page_size()),
+                        composed, &compose_err)) {
+                    throw std::runtime_error(compose_err);
+                }
+                prog_sample_offsets = composed.prog_sample_offsets;
+            } else {
+                std::string offs_err;
+                if (!ptir::wire_program_sample_offsets(
+                        view, prog_sample_offsets, &offs_err)) {
+                    throw std::runtime_error(offs_err);
+                }
+            }
+        }
+        // Only the SOLO device-geometry fire may carry a dense device mask;
+        // its resolved geometry equals the composed batch.
+        const ptir::FireGeometry* solo_fg =
+            (dg_resolved && rpg.per_program.size() == 1 &&
+             rpg.is_device_geometry[0])
+                ? &rpg.per_program[0]
+                : nullptr;
 
-        // Spec-decoding fields. When non-empty for some request, splice
-        // drafts into the forward and append a verification block to
-        // the sampling layout (one extra sample per draft + one bonus).
-        // Mirrors pie_driver's `get_spec_expanded_*`.
-        const auto spec_tok_view  = view.spec_token_ids.as<std::uint32_t>();
-        const auto spec_pos_view  = view.spec_position_ids.as<std::uint32_t>();
-        const auto spec_iptr_view = view.spec_indptr.as<std::uint32_t>();
-        const bool has_spec_drafts = !spec_tok_view.empty();
+        // Composed geometry takes precedence over the borrowed launch
+        // slices. No request/speculation carrier is expanded in the driver.
+        const int R = static_cast<int>(
+            dg_resolved ? composed.qo_indptr.size() : qo_view_orig.size()) - 1;
 
-        const int R = static_cast<int>(qo_view_orig.size()) - 1;
-
-        // Spec-decoding batch expansion. When `has_spec_drafts` is false
-        // the result has empty vectors and `verify_slot_start[r] == -1`
-        // for every r; the active spans below fall through to the
-        // original wire views.
-        const SpecExpansion spec = expand_spec_batch(
-            SpecExpansionInputs{
-                tok_view_orig, pos_view_orig, qo_view_orig, kvlpl_view_orig,
-                sidx_view_orig, sptr_view_orig, rns_view_orig,
-                types_view_orig, top_k_view_orig, seed_view_orig,
-                temp_view_orig, top_p_view_orig, min_p_view_orig,
-                spec_tok_view, spec_pos_view, spec_iptr_view,
-                kv_cache.page_size(),
-            },
-            R);
-        const std::vector<int>& verify_slot_start = spec.verify_slot_start;
-        const std::vector<int>& verify_n_drafts   = spec.verify_n_drafts;
-
-        // Active views: spec-expanded if drafts present, else direct
-        // wire. The rest of the function uses these.
-        const std::span<const std::uint32_t> tok_view   = spec.has_drafts ? std::span<const std::uint32_t>(spec.tokens)               : tok_view_orig;
-        const std::span<const std::uint32_t> pos_view   = spec.has_drafts ? std::span<const std::uint32_t>(spec.positions)            : pos_view_orig;
-        const std::span<const std::uint32_t> qo_view    = spec.has_drafts ? std::span<const std::uint32_t>(spec.qo_indptr)            : qo_view_orig;
-        const std::span<const std::uint32_t> kvlpl_view = spec.has_drafts ? std::span<const std::uint32_t>(spec.kv_last_page_lens)    : kvlpl_view_orig;
-        const std::span<const std::uint32_t> sidx_view  = spec.has_drafts ? std::span<const std::uint32_t>(spec.sampling_indices)     : sidx_view_orig;
-        const std::span<const std::uint32_t> sptr_view  = spec.has_drafts ? std::span<const std::uint32_t>(spec.sampling_indptr)      : sptr_view_orig;
-        const std::span<const std::uint32_t> rns_view   = spec.has_drafts ? std::span<const std::uint32_t>(spec.request_num_samplers) : rns_view_orig;
-        const std::span<const std::uint32_t> types_view = spec.has_drafts ? std::span<const std::uint32_t>(spec.sampler_types)        : types_view_orig;
-        const std::span<const std::uint32_t> top_k_view = spec.has_drafts ? std::span<const std::uint32_t>(spec.sampler_top_k)        : top_k_view_orig;
-        const std::span<const std::uint32_t> seed_view  = spec.has_drafts ? std::span<const std::uint32_t>(spec.sampler_seeds)        : seed_view_orig;
-        const std::span<const float>         temp_view  = spec.has_drafts ? std::span<const float>        (spec.sampler_temperatures) : temp_view_orig;
-        const std::span<const float>         top_p_view = spec.has_drafts ? std::span<const float>        (spec.sampler_top_p)        : top_p_view_orig;
-        const std::span<const float>         min_p_view = spec.has_drafts ? std::span<const float>        (spec.sampler_min_p)        : min_p_view_orig;
+        const std::span<const std::uint32_t> tok_view   = dg_resolved ? std::span<const std::uint32_t>(composed.token_ids)         : tok_view_orig;
+        const std::span<const std::uint32_t> pos_view   = dg_resolved ? std::span<const std::uint32_t>(composed.position_ids)      : pos_view_orig;
+        const std::span<const std::uint32_t> qo_view    = dg_resolved ? std::span<const std::uint32_t>(composed.qo_indptr)         : qo_view_orig;
+        const std::span<const std::uint32_t> kvpi_view  = dg_resolved ? std::span<const std::uint32_t>(composed.kv_page_indices)   : kvpi_view_wire;
+        const std::span<const std::uint32_t> kvpp_view  = dg_resolved ? std::span<const std::uint32_t>(composed.kv_page_indptr)    : kvpp_view_wire;
+        const std::span<const std::uint32_t> kvlpl_view = dg_resolved ? std::span<const std::uint32_t>(composed.kv_last_page_lens) : kvlpl_view_orig;
+        const std::span<const std::uint32_t> sidx_view  = dg_resolved ? std::span<const std::uint32_t>(composed.sampling_indices)  : sidx_view_orig;
+        const std::span<const std::uint32_t> sptr_view  = dg_resolved ? std::span<const std::uint32_t>(composed.sampling_indptr)   : sptr_view_orig;
 
         const auto t_wire_parse_end = clock::now();
 
         const int N = static_cast<int>(tok_view.size());
         const int num_sampling = static_cast<int>(sidx_view.size());
         dbg_R = R; dbg_N = N;
+        if (ir_trace) {
+            std::cerr << "[ir-trace] fire shape req_id=" << req_id
+                      << " N=" << N << " R=" << R
+                      << " num_sampling=" << num_sampling << "\n";
+            std::cerr.flush();
+        }
 
         // Qwen3-VL: assemble the per-token [N,3] M-RoPE positions. Text rows
         // carry (p,p,p) from the 1-D `pos_view`; image-token rows are
         // overwritten with the staged 3-axis (t,h,w) positions for each image
         // (image i's rows start at batch row `img_anchor[i]`). Built only when
         // image mrope data is present (image prefills never carry spec drafts).
-        if (img_num_images > 0 && !img_mrope_pos.empty() && !spec.has_drafts) {
+        if (img_num_images > 0 && !img_mrope_pos.empty()) {
             mrope_positions_storage.resize(static_cast<std::size_t>(N) * 3);
             for (int t = 0; t < N; ++t) {
                 const std::uint32_t p =
@@ -2312,33 +1624,24 @@ void handle_fire_batch(
         }
 
         if (N == 0 || R <= 0) {
-            // Empty batch — emit a zero-request response view.
-            std::vector<pie_driver::PerRequestOutput> empty(std::max(R, 0));
-            executor.response_builder.build(empty, out_resp);
+            if (!executor.ptir_dispatch)
+                executor.ptir_dispatch = std::make_unique<ptir::PtirDispatch>();
+            executor.ptir_dispatch->run(
+                view, nullptr, 0, executor.cublas.stream(), &runtime, completion);
             return;
         }
         if (N > max_workspace_tokens) {
             std::cerr << "[pie-driver-cuda] batch tokens=" << N
                       << " exceeds workspace=" << max_workspace_tokens << "\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
+            throw std::runtime_error("forward batch exceeds workspace capacity");
         }
 
-        // Compute max KV length across requests for shmem sizing.
-        // Also detect "pure decode" (every request has qo_len == 1) so
-        // we can dispatch flashinfer's decode kernel on the hot path.
-        const int page_size = kv_cache.page_size();
-        int max_kv_len = 0;
+        // Detect pure decode so the model can choose its decode kernel.
         const std::uint32_t* h_kvpp  = kvpp_view.data();
         const std::uint32_t* h_kvlpl = kvlpl_view.data();
         const std::uint32_t* h_qo    = qo_view.data();
         bool is_pure_decode = (R > 0);
         for (int r = 0; r < R; ++r) {
-            const int num_pages_r = static_cast<int>(h_kvpp[r + 1] - h_kvpp[r]);
-            if (num_pages_r <= 0) continue;
-            const int kv_len_r = (num_pages_r - 1) * page_size +
-                                 static_cast<int>(h_kvlpl[r]);
-            if (kv_len_r > max_kv_len) max_kv_len = kv_len_r;
             if (h_qo[r + 1] - h_qo[r] != 1u) is_pure_decode = false;
         }
 
@@ -2350,22 +1653,25 @@ void handle_fire_batch(
             throw std::runtime_error(
                 "rs_cache forward missing runtime-assigned slot ids");
         }
-        const bool has_fresh_slot =
-            use_slots && std::any_of(
-                rs_flag_view.begin(), rs_flag_view.end(),
-                [](std::uint8_t v) { return (v & 1u) != 0; });
+        // Ph7 RS working-set buffered-activation channel. Single-role per pass
+        // (v1): a FOLD pass (FOLD-bit=2 set) gathers+replays from the buffered
+        // pool into recurrent_state (separate fold-replay dispatch below); an
+        // rs-output write pass (FOLD-bit clear + buffered slabs present)
+        // scatters in-proj [mixed_qkv|a|b] to the pool during the main forward.
+        const auto rs_buf_id_view = view.rs_buffer_slot_ids.as<std::uint32_t>();
+        const auto rs_buf_indptr_view = view.rs_buffer_slot_indptr.as<std::uint32_t>();
+        const bool rs_is_fold = use_slots && std::any_of(
+            rs_flag_view.begin(), rs_flag_view.end(),
+            [](std::uint8_t v) { return (v & 2u) != 0; });
+        const bool rs_is_write =
+            use_slots && !rs_is_fold && rs_buf_id_view.size() > 0;
 
-        const GraphShapeDecision graph_shape = decide_graph_shape(
-            executor, R, N, page_size,
-            is_pure_decode, has_spec_drafts, has_fresh_slot,
-            kvpi_view.size(), pi.kv_page_indices.size());
-        bool graph_shape_ok = graph_shape.graph_shape_ok;
-        const int graph_requests = graph_shape.graph_requests;
-        const bool small_spec_graph_shape = graph_shape.small_spec_graph_shape;
-
+        // Direct PTIR launches keep the forward geometry exact. The program runs
+        // after the model and therefore cannot use the legacy graph variants that
+        // fused sampling into the captured forward.
         ForwardInputViews forward_inputs = make_forward_input_views(
             tok_view, pos_view, qo_view, kvpi_view, kvpp_view, kvlpl_view,
-            R, graph_requests, graph_pad_page);
+            R, R, -1);
         const int forward_N = forward_inputs.total_tokens;
         const int forward_R = forward_inputs.num_requests;
         const std::uint32_t* h_qo_forward = forward_inputs.qo_indptr.data();
@@ -2386,37 +1692,155 @@ void handle_fire_batch(
         pi.kv_page_indptr.copy_from_host(forward_inputs.kv_page_indptr);
         pi.kv_last_page_lens.copy_from_host(forward_inputs.kv_last_page_lens);
 
-        // BRLE attention masks. For prefill batches that aren't pure
-        // causal, decode + upload a packed bitmap and route through the
-        // flashinfer kCustom path. For decode-only batches the kernel
-        // doesn't support custom masks; we proceed without one (a
-        // limitation we'd have to fix by routing decode through the
-        // prefill kernel for custom-mask inferlets).
+        // BRLE attention masks. For any batch that isn't pure causal, decode +
+        // upload a packed bitmap and route through the flashinfer kCustom path.
+        // NOTE: `is_pure_decode` is intentionally NOT gated here. A decode-shaped
+        // batch (qo_len==1/req) that carries a per-cell custom mask — e.g. the
+        // §6.2 beam fire, whose kvm expresses fork-freeze mid-page holes the
+        // decode/xqa kernels can't — must ALSO build the mask; the forward then
+        // routes it through the custom-mask prefill kernel (llama_like's
+        // `has_custom_mask` gate). This is the previously-noted "route decode
+        // through the prefill kernel for custom-mask inferlets" fix; a normal
+        // decode batch carries no mask (`fmask_view` empty) so it is unaffected.
+        // Wire BRLE masks are indexed by the WIRE request layout, so the
+        // causality check and decode run against the WIRE spans (identical to
+        // the selected spans on a pure-wire batch). A composed batch never
+        // carries a custom wire mask (the runtime scheduler keeps custom-mask
+        // wire fires and device-geometry fires apart — fail loud otherwise);
+        // pure-causal wire masks are simply dropped, as before.
         const auto fmask_view  = view.flattened_masks.as<std::uint32_t>();
         const auto mskptr_view = view.mask_indptr.as<std::uint32_t>();
-        if (!has_spec_drafts && !is_pure_decode && !fmask_view.empty()) {
-            const auto qo_span =
-                std::span<const std::uint32_t>(qo_view.data(), qo_view.size());
-            const auto kvpp_span =
-                std::span<const std::uint32_t>(kvpp_view.data(), kvpp_view.size());
-            const auto kvlpl_span =
-                std::span<const std::uint32_t>(kvlpl_view.data(), kvlpl_view.size());
+        if (!fmask_view.empty()) {
+            const auto qo_span = std::span<const std::uint32_t>(
+                qo_view_orig.data(), qo_view_orig.size());
+            const auto kvpp_span = std::span<const std::uint32_t>(
+                kvpp_view_wire.data(), kvpp_view_wire.size());
+            const auto kvlpl_span = std::span<const std::uint32_t>(
+                kvlpl_view_orig.data(), kvlpl_view_orig.size());
             if (!pie_cuda_driver::brle::is_pure_causal(
                     fmask_view, mskptr_view,
                     qo_span, kvpp_span, kvlpl_span,
                     kv_cache.page_size())) {
-                auto decoded = pie_cuda_driver::brle::decode(
-                    fmask_view, mskptr_view,
-                    qo_span, kvpp_span, kvlpl_span,
-                    kv_cache.page_size());
-                pi.custom_mask.copy_from_host(
-                    std::span<const std::uint8_t>(decoded.packed));
-                pi.custom_mask_indptr.copy_from_host(
-                    std::span<const std::int32_t>(decoded.mask_indptr));
-                mask_bytes = static_cast<int>(decoded.packed.size());
-                mask_indptr_count = static_cast<int>(decoded.mask_indptr.size());
-                have_custom_mask = true;
+                if (dg_resolved) {
+                    // A MULTI-program batch cannot honor wire BRLE masks
+                    // (they index the wire request layout; the scheduler
+                    // batches mask-carrying fires solo — fail loud if not).
+                    // On a SOLO device-geometry fire the wire rows are
+                    // engine-SYNTHESIZED causal (a guest's mask is the DENSE
+                    // channel mask, packed below) and simply drop — the
+                    // resolved geometry runs the standard causal path.
+                    if (view.has_user_mask &&
+                        view.ptir_program_hashes.size() > 1) {
+                        throw std::runtime_error(
+                            "ptir: custom wire masks cannot co-batch with "
+                            "device-geometry programs (scheduler contract "
+                            "violated)");
+                    }
+                } else {
+                    auto decoded = pie_cuda_driver::brle::decode(
+                        fmask_view, mskptr_view,
+                        qo_span, kvpp_span, kvlpl_span,
+                        kv_cache.page_size());
+                    pi.custom_mask.copy_from_host(
+                        std::span<const std::uint8_t>(decoded.packed));
+                    pi.custom_mask_indptr.copy_from_host(
+                        std::span<const std::int32_t>(decoded.mask_indptr));
+                    mask_bytes = static_cast<int>(decoded.packed.size());
+                    mask_indptr_count = static_cast<int>(decoded.mask_indptr.size());
+                    have_custom_mask = true;
+                }
             }
+        }
+
+        // ── W1.3: device-geometry AttnMask → FlashInfer packed custom mask ──
+        // A device-geometry fire may carry a DENSE [lanes, stride] per-cell mask
+        // on its AttnMask descriptor port (resolved into fg.mask). Pack it to
+        // FlashInfer's bit-packed custom mask (launch_pack_dense_mask) INTO
+        // pi.custom_mask, so the standard custom-mask forward path consumes it
+        // exactly like a BRLE-decoded wire mask. DORMANT unless a device-geometry
+        // program binds an AttnMask channel (fg.has_mask); the guest producer is
+        // W2.1. Correctness is validated once a real device-geometry fire exists.
+        if (solo_fg != nullptr && solo_fg->has_mask && !solo_fg->mask.empty()) {
+            const ptir::FireGeometry& fg = *solo_fg;
+            const int lanes = static_cast<int>(qo_view.size()) - 1;
+            // Total query rows = qo_indptr.back(). For a 1-query/lane decode this
+            // equals `lanes`; for a variable-length prefill a single lane carries
+            // N query rows, so the dense mask is [TOTAL_Q, STRIDE] (one row per
+            // QUERY token), STRIDE = mask.size()/TOTAL_Q.
+            const int total_q =
+                lanes > 0 ? static_cast<int>(qo_view[lanes]) : 0;
+            if (lanes > 0 && total_q > 0 &&
+                fg.mask.size() % static_cast<std::size_t>(total_q) == 0) {
+                const int stride =
+                    static_cast<int>(fg.mask.size() / static_cast<std::size_t>(total_q));
+                const std::uint32_t page =
+                    static_cast<std::uint32_t>(kv_cache.page_size());
+                // Per-lane physical KV span klen[l] from the resolved page geometry,
+                // and the packed byte-offset CSR (ceil(qo_len[l]·klen[l]/8) per lane).
+                std::vector<std::uint32_t> klen(static_cast<std::size_t>(lanes), 0);
+                std::vector<std::int32_t> mindptr(static_cast<std::size_t>(lanes) + 1, 0);
+                for (int l = 0; l < lanes; ++l) {
+                    const std::uint32_t np =
+                        (l + 1 < static_cast<int>(fg.kv_page_indptr.size()))
+                            ? fg.kv_page_indptr[l + 1] - fg.kv_page_indptr[l] : 0u;
+                    const std::uint32_t lpl =
+                        (l < static_cast<int>(fg.kv_last_page_lens.size()))
+                            ? fg.kv_last_page_lens[l] : 0u;
+                    klen[l] = np == 0 ? 0u : (np - 1) * page + lpl;
+                    const std::uint32_t qo_len =
+                        qo_view[l + 1] - qo_view[l];
+                    const std::uint64_t bits =
+                        static_cast<std::uint64_t>(qo_len) * klen[l];
+                    mindptr[l + 1] = mindptr[l] +
+                        static_cast<std::int32_t>((bits + 7u) / 8u);
+                }
+                const std::size_t packed_bytes =
+                    static_cast<std::size_t>(mindptr[lanes]);
+                if (packed_bytes > 0 &&
+                    packed_bytes <= pi.custom_mask.size() &&
+                    static_cast<std::size_t>(lanes) + 1 <= pi.custom_mask_indptr.size()) {
+                    auto kvm_dev = DeviceBuffer<std::uint8_t>::from_bytes(
+                        std::span<const std::uint8_t>(fg.mask));
+                    auto klen_dev = DeviceBuffer<std::uint32_t>::from_host(
+                        std::span<const std::uint32_t>(klen));
+                    auto qo_dev = DeviceBuffer<std::uint32_t>::from_host(
+                        std::span<const std::uint32_t>(qo_view.data(), qo_view.size()));
+                    pi.custom_mask_indptr.copy_from_host(
+                        std::span<const std::int32_t>(mindptr));
+                    CUDA_CHECK(cudaMemsetAsync(pi.custom_mask.data(), 0,
+                                               packed_bytes, cublas.stream()));
+                    kernels::launch_pack_dense_mask(
+                        kvm_dev.data(), klen_dev.data(), qo_dev.data(),
+                        pi.custom_mask_indptr.data(), pi.custom_mask.data(),
+                        lanes, stride, cublas.stream());
+                    have_custom_mask = true;
+                    mask_bytes = static_cast<int>(packed_bytes);
+                    mask_indptr_count = lanes + 1;
+                }
+            }
+        }
+
+        // Explicit KV-write descriptor upload (device-geometry WSlot/WOff, B2).
+        // Parallels the mask pack above: when any composed program bound
+        // WSlot/WOff ports, the composition carries per-TOKEN physical page
+        // ids + offsets for EVERY batch row (device-geometry rows from their
+        // translated descriptors; wire rows synthesized to their standard
+        // append target — `has_write_desc` routes the whole forward's
+        // per-layer KV append through launch_write_kv_explicit_bf16, so every
+        // row needs a target). Beam fork/freeze correctness: a frozen fork's
+        // cell is not overwritten (a sibling's mask hides it).
+        if (dg_resolved && composed.has_write_desc && !composed.w_page.empty()) {
+            if (composed.w_page.size() != composed.w_off.size() ||
+                composed.w_page.size() > pi.w_page.size()) {
+                throw std::runtime_error(
+                    "ptir: composed write descriptor exceeds persistent "
+                    "input capacity");
+            }
+            pi.w_page.copy_from_host(
+                std::span<const std::uint32_t>(composed.w_page));
+            pi.w_off.copy_from_host(
+                std::span<const std::uint32_t>(composed.w_off));
+            has_write_desc = true;
         }
 
         // Linear-attention rs_cache slots. Runtime owns slot assignment;
@@ -2424,7 +1848,7 @@ void handle_fire_batch(
         std::vector<std::int32_t> slot_ids_h;
         std::vector<std::uint8_t> is_fresh_h;
         if (use_slots) {
-            const int slot_count = graph_shape_ok ? forward_R : R;
+            const int slot_count = R;
             slot_ids_h.resize(slot_count);
             is_fresh_h.resize(slot_count);
             for (int r = 0; r < R; ++r) {
@@ -2442,113 +1866,41 @@ void handle_fire_batch(
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
         }
 
-        // Frozen-verify speculative path. The verify forward walks the GDN
-        // recurrent state in registers to produce correct draft outputs but
-        // persists NOTHING (every linear layer sees write_state=false), so each
-        // committed slot stays at its pre-verify value — the implicit
-        // speculative snapshot. After sampling, one batched repair forward over
-        // [input | accepted] advances each committed slot to exactly the
-        // confirmed prefix. No per-request snapshot buffer → no concurrency
-        // cap; the committed slot only ever reflects committed tokens. (KV is
-        // untouched by freezing — only the recurrent-state writeback is gated —
-        // so the verify writes KV normally and the repair's KV re-write is an
-        // idempotent no-op.)
-        // rs_frozen_verify gates the conv freeze + the repair/commit-advance.
-        // The FLA freeze is decoupled (in linear_attn_layer_body): the fla only
-        // freezes in commit-advance mode (verify_frozen AND stash enabled), so
-        // the default keeps fla-drift + repair (the validated 6899 path) while
-        // the commit-advance gets a truly frozen verify for lossless replay.
-        bool rs_frozen_verify = false;
         if (executor.rs_cache != nullptr) {
-            rs_frozen_verify = has_spec_drafts && use_slots &&
-                               executor.tp_comm == nullptr;
-            executor.rs_cache->set_verify_frozen(rs_frozen_verify);
+            executor.rs_cache->set_verify_frozen(false);
         }
 
-        // ── Sample-plan construction (hoisted) ──────────────────
-        // Sampling stays outside the CUDA graph because sampler/probe
-        // layouts can vary even when the decode shape is identical. The
-        // builder fills `sampling_scratch()` and emits dispatch flags
-        // so the forward + sampling launches downstream can pick the
-        // fast path when the request mix permits.
-        const SamplePlanResult sp = build_sample_plan(executor, SamplePlanInputs{
-            .outspec_view      = view.output_spec_flags.as<std::uint8_t>(),
-            .sptr_view         = sptr_view,
-            .sidx_view         = sidx_view,
-            .rns_view          = rns_view,
-            .types_view        = types_view,
-            .temp_view         = temp_view,
-            .top_k_view        = top_k_view,
-            .top_p_view        = top_p_view,
-            .min_p_view        = min_p_view,
-            .seed_view         = seed_view,
-            .logit_masks_view  = logit_masks_view,
-            .h_qo              = h_qo,
-            .N                 = N,
-            .R                 = R,
-            .num_sampling      = num_sampling,
-            .is_pure_decode    = is_pure_decode,
-            .have_custom_mask  = have_custom_mask,
-            .has_spec_drafts   = has_spec_drafts,
-        });
-        const bool has_rich_sampler_slots = sp.has_rich_sampler_slots;
-        const bool need_msgpack          = sp.need_msgpack;
-        const bool any_topk_topp         = sp.any_topk_topp;
-        const bool sample_rows_are_dense = sp.sample_rows_are_dense;
-        const bool all_rows_greedy       = sp.all_rows_greedy;
-        const bool all_slots_token       = sp.all_slots_token;
-        const bool compact_logit_rows    = sp.compact_logit_rows;
-        const bool tp_greedy_argmax      = sp.tp_greedy_argmax;
-        const bool single_gpu_greedy_argmax = sp.single_gpu_greedy_argmax;
-        const int  logit_rows_required   = sp.logit_rows_required;
-        const int  prob_rows_required    = sp.prob_rows_required;
-        auto& sample_scratch = sampling_scratch();
-        auto& h_per_temp   = sample_scratch.h_per_temp;
-        auto& h_per_min_p  = sample_scratch.h_per_min_p;
-        auto& h_per_top_p  = sample_scratch.h_per_top_p;
-        auto& h_per_top_k  = sample_scratch.h_per_top_k;
-        auto& h_per_seed   = sample_scratch.h_per_seed;
-        auto& h_sample_idx = sample_scratch.h_sample_idx;
-        auto& per_slot_type  = sample_scratch.per_slot_type;
-        auto& per_slot_temp  = sample_scratch.per_slot_temp;
-        auto& per_slot_top_k = sample_scratch.per_slot_top_k;
+        if (sptr_view.size() != static_cast<std::size_t>(R + 1) ||
+            sptr_view.back() != sidx_view.size()) {
+            throw std::runtime_error("sampling CSR does not match launched instances");
+        }
+        std::vector<std::int32_t> sample_rows;
+        sample_rows.reserve(sidx_view.size());
         const std::uint32_t* h_sptr = sptr_view.data();
         const std::uint32_t* h_sidx = sidx_view.data();
-        const auto outspec_view = view.output_spec_flags.as<std::uint8_t>();
-        if (logit_rows_required > tensor_rows(ws.logits)) {
-            std::cerr << "[pie-driver-cuda] fire_batch needs "
-                      << logit_rows_required
-                      << " logit rows, exceeding workspace capacity "
-                      << tensor_rows(ws.logits) << "\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
+        for (int r = 0; r < R; ++r) {
+            const std::uint32_t qo_begin = h_qo[r];
+            const std::uint32_t qo_len = h_qo[r + 1] - qo_begin;
+            for (std::uint32_t k = h_sptr[r]; k < h_sptr[r + 1]; ++k) {
+                if (h_sidx[k] >= qo_len) {
+                    throw std::runtime_error("sampling row exceeds request query span");
+                }
+                sample_rows.push_back(
+                    static_cast<std::int32_t>(qo_begin + h_sidx[k]));
+            }
         }
-        if (prob_rows_required > tensor_rows(ws.probs)) {
-            std::cerr << "[pie-driver-cuda] fire_batch needs "
-                      << prob_rows_required
-                      << " probability rows, exceeding workspace capacity "
-                      << tensor_rows(ws.probs) << "\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
+        if (sample_rows.size() > pi.sample_idx.size()) {
+            throw std::runtime_error("sampling rows exceed persistent input capacity");
         }
-
-        const SamplingPlan sample_plan{
-            any_topk_topp,
-            std::span<const float>(h_per_temp),
-            std::span<const float>(h_per_top_p),
-            std::span<const float>(h_per_min_p),
-            std::span<const std::int32_t>(h_per_top_k),
-            std::span<const std::uint32_t>(h_per_seed),
-            std::span<const std::int32_t>(h_sample_idx),
-        };
+        if (N > tensor_rows(ws.logits)) {
+            throw std::runtime_error("forward batch exceeds logits workspace");
+        }
+        if (!sample_rows.empty()) {
+            pi.sample_idx.copy_from_host(
+                std::span<const std::int32_t>(sample_rows));
+        }
 
         const auto t_plan_end = clock::now();
-
-        if (compact_logit_rows) {
-            CUDA_CHECK(cudaMemcpyAsync(pi.sample_idx.data(), h_sample_idx.data(),
-                                       sizeof(std::int32_t) * num_sampling,
-                                       cudaMemcpyHostToDevice, nullptr));
-        }
 
         // TP fan-out. Rank 0 broadcasts the per-fire payload (header +
         // refilled persistent_inputs) to every follower so they can run
@@ -2564,8 +1916,8 @@ void handle_fire_batch(
                                     forward_inputs.kv_page_indices.size()),
                                 mask_bytes, mask_indptr_count,
                                 /*has_slot_ids=*/use_slots,
-                                tp_greedy_argmax,
-                                /*logit_rows=*/compact_logit_rows ? num_sampling : 0,
+                                /*tp_greedy_argmax=*/false,
+                                /*logit_rows=*/0,
                                 /*stream=*/nullptr);
         }
 
@@ -2593,41 +1945,39 @@ void handle_fire_batch(
                 .is_pure_decode = is_pure_decode,
             });
 
-        // ── Upload sampling inputs (must precede sampling launch) ──
-        // Per-row sampler params land in `pi.sample_*`. Sampling runs after
-        // forward, but the upload is kept here so the response path can use
-        // the same prepared device buffers for captured and uncaptured
-        // forward bodies.
-        if (!tp_greedy_argmax && !single_gpu_greedy_argmax) {
-            upload_sampling_inputs(pi, sample_plan, N, /*stream=*/nullptr);
-        }
-        const bool logits_argmax_only =
-            forward_fn.supports_fused_lmhead_argmax &&
-            !has_rich_sampler_slots &&
-            logit_masks_view.empty() &&
-            !any_topk_topp &&
-            all_slots_token &&
-            all_rows_greedy;
-        forward_fn.invoke_set_logits_argmax_only(logits_argmax_only);
-        const bool forward_handles_argmax =
-            forward_fn.supports_fused_lmhead_argmax &&
-            logits_argmax_only &&
-            single_gpu_greedy_argmax;
-        forward_fn.invoke_set_fused_argmax_output(
-            forward_handles_argmax
-                ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
-                : nullptr);
-
+        forward_fn.invoke_set_logits_argmax_only(false);
+        forward_fn.invoke_set_fused_argmax_output(nullptr);
         const auto t_h2d_end = clock::now();
 
         // ── Forward pass ────────────────────────────────────────
-        // Either replay a captured CUDA graph or invoke `forward_fn.body`
-        // directly — see run_forward_dispatch for the variant/key logic.
-        // The verify timer wraps body + sampling on the same stream so
-        // its end-of-fire reading is the visible cost of the work the
-        // graph executes.
         StepProfileTimer verify_timer(
             "verify", cublas.stream(), forward_N, forward_R);
+        if (ir_trace) {
+            std::cerr << "[ir-trace] forward-begin req_id=" << req_id
+                      << " forward_N=" << forward_N
+                      << " forward_R=" << forward_R << "\n";
+            std::cerr.flush();
+        }
+        auto dump_rs = [&](const char* tag) {
+            if (!std::getenv("PIE_RS_TRACE") || executor.rs_cache == nullptr ||
+                !use_slots || R < 1) return;
+            const int slot = static_cast<int>(rs_slot_view[0]);
+            std::uint32_t rw[4] = {0, 0, 0, 0}, cw[4] = {0, 0, 0, 0};
+            cudaMemcpy(rw, executor.rs_cache->recurrent_state_raw(0, slot),
+                       sizeof(rw), cudaMemcpyDeviceToHost);
+            cudaMemcpy(cw, executor.rs_cache->conv_state(0, slot),
+                       sizeof(cw), cudaMemcpyDeviceToHost);
+            std::cerr << "[rs-trace] " << tag << " req_id=" << req_id
+                      << " slot=" << slot
+                      << " bf16=" << executor.rs_cache->recurrent_state_bf16()
+                      << " N=" << N << " rs_is_fold=" << rs_is_fold
+                      << " rs_is_write=" << rs_is_write << std::hex
+                      << " recur16B=" << rw[0] << "," << rw[1] << "," << rw[2] << "," << rw[3]
+                      << " conv16B=" << cw[0] << "," << cw[1] << "," << cw[2] << "," << cw[3]
+                      << std::dec << "\n";
+        };
+        dump_rs("PRE ");
+
         const ForwardDispatchResult fd = run_forward_dispatch(
             executor, ForwardDispatchInputs{
                 .R = R,
@@ -2637,12 +1987,13 @@ void handle_fire_batch(
                 .num_sampling = num_sampling,
                 .is_pure_decode = is_pure_decode,
                 .have_custom_mask = have_custom_mask,
-                .small_spec_graph_shape = small_spec_graph_shape,
-                .graph_shape_ok = graph_shape_ok,
-                .tp_greedy_argmax = tp_greedy_argmax,
-                .forward_handles_argmax = forward_handles_argmax,
-                .single_gpu_greedy_argmax = single_gpu_greedy_argmax,
-                .compact_logit_rows = compact_logit_rows,
+                .has_write_desc = has_write_desc,
+                .small_spec_graph_shape = false,
+                .graph_shape_ok = false,
+                .tp_greedy_argmax = false,
+                .forward_handles_argmax = false,
+                .single_gpu_greedy_argmax = false,
+                .compact_logit_rows = false,
                 .use_slots = use_slots,
                 .padded = forward_inputs.padded,
                 .h_qo_forward = h_qo_forward,
@@ -2651,6 +2002,9 @@ void handle_fire_batch(
                 .h_kvlpl_forward = h_kvlpl_forward,
                 .slot_ids_h_data = slot_ids_h.data(),
                 .is_fresh_h_data = is_fresh_h.data(),
+                .rs_buffer_slot_ids_h = rs_is_write ? rs_buf_id_view.data() : nullptr,
+                .rs_buffer_slot_indptr_h = rs_is_write ? rs_buf_indptr_view.data() : nullptr,
+                .rs_buffer_write = rs_is_write,
                 .image_pixels_h = img_pixels_h,
                 .image_pixel_byte_indptr_h = img_pix_byte_indptr.data(),
                 .image_patch_positions_h = img_patch_pos.data(),
@@ -2666,549 +2020,72 @@ void handle_fire_batch(
                 .audio_anchor_rows_h = aud_anchor.data(),
                 .num_clips = aud_num_clips,
             });
-        const bool graph_captures_single_gpu_argmax =
-            fd.graph_captures_single_gpu_argmax;
-        // Sampling is deliberately outside the CUDA graph. The forward
-        // graph key is only `R`; sampler/probe layouts vary independently
-        // (for example top-p token-only decode vs. argmax + rich probes).
-        // Running the current fire's sampling kernel after the graph launch
-        // keeps that R-only key valid.
-        // A fire that samples nothing (e.g. a multimodal image-token KV-fill
-        // pass) produces no logits and no sampled tokens — skip every argmax /
-        // sampling launch (they would read the unwritten, undersized
-        // `ws.logits` over all N rows and fault).
-        if (num_sampling == 0) {
-            // nothing to sample
-        } else if (tp_greedy_argmax) {
-            kernels::launch_select_global_argmax_pairs(
-                reinterpret_cast<const std::uint64_t*>(ws.greedy_pairs_all.data()),
-                reinterpret_cast<std::int32_t*>(pi.sampled.data()),
-                N, executor.tp_comm->world_size(), cublas.stream());
-        } else if (graph_captures_single_gpu_argmax) {
-            // The captured forward graph already wrote pi.sampled.
-        } else if (forward_handles_argmax) {
-            // The forward's fused lm_head-argmax wrote pi.sampled.
-        } else if (single_gpu_greedy_argmax) {
-            const int argmax_parts =
-                greedy_argmax_parts(engine.hf_config().vocab_size);
-            if (argmax_parts > 1 && !ws.greedy_pairs_all.empty()) {
-                kernels::launch_argmax_bf16_partitioned_pairs(
-                    ws.logits.data(),
-                    reinterpret_cast<std::uint64_t*>(ws.greedy_pairs_all.data()),
-                    N, engine.hf_config().vocab_size, argmax_parts,
-                    cublas.stream());
-                kernels::launch_select_global_argmax_pairs(
-                    reinterpret_cast<const std::uint64_t*>(ws.greedy_pairs_all.data()),
-                    reinterpret_cast<std::int32_t*>(pi.sampled.data()),
-                    N, argmax_parts, cublas.stream());
-            } else {
-                kernels::launch_argmax_bf16(
-                    ws.logits.data(),
-                    reinterpret_cast<std::int32_t*>(pi.sampled.data()),
-                    N, engine.hf_config().vocab_size, cublas.stream());
-            }
-        } else {
-            if (compact_logit_rows) {
-                kernels::launch_sample_temp_bf16_compact_scatter(
-                    ws.logits.data(),
-                    pi.sample_idx.data(),
-                    pi.sample_temp.data(),
-                    pi.sample_min_p.data(),
-                    pi.sample_seed.data(),
-                    reinterpret_cast<std::int32_t*>(pi.sampled.data()),
-                    num_sampling, engine.hf_config().vocab_size,
-                    cublas.stream());
-            } else {
-                launch_sampling_kernel(
-                    ws, pi.sampled.data(), pi, sample_plan,
-                    N, num_sampling, engine.hf_config().vocab_size,
-                    /*prng_offset=*/static_cast<std::uint64_t>(handled),
-                    /*stream=*/cublas.stream());
-            }
+        static_cast<void>(fd);
+        dump_rs("POST");
+        if (ir_trace) {
+            std::cerr << "[ir-trace] forward-returned req_id=" << req_id << "\n";
+            std::cerr.flush();
         }
-
-        // Sample plan was built above the prepare hook (hoisted so the
-        // sampling uploads are ready before the forward graph launch). The host
-        // variables (`need_msgpack`, `per_slot_*`, `any_topk_topp`,
-        // `h_per_*`, `h_sample_idx`) are still in scope here for the
-        // response builder.
-
-        // Only copy the first N entries — `pi.sampled` is sized for
-        // max_workspace_tokens, but only [0, N) are valid this fire.
-        // Async on the same stream the sampler ran on so it slots into
-        // the stream's FIFO; we sync immediately after because the
-        // response payload depends on these tokens. (Future work moves
-        // the sync past the host-side response-prep so the host
-        // and GPU can overlap.)
-        std::int32_t* sampled_host =
-            sampled_pinned_buf(static_cast<std::size_t>(N));
-        CUDA_CHECK(cudaMemcpyAsync(sampled_host, pi.sampled.data(),
-                                   sizeof(std::int32_t) * N,
-                                   cudaMemcpyDeviceToHost,
-                                   cublas.stream()));
-        const auto t_kernel_launch_end = clock::now();
         verify_timer.finish(cublas.stream());
-        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
-        const auto t_sync_end = clock::now();
+        const auto t_kernel_launch_end = clock::now();
+        static_cast<void>(t_entry);
+        static_cast<void>(t_wire_parse_end);
+        static_cast<void>(t_plan_end);
+        static_cast<void>(t_h2d_end);
+        static_cast<void>(t_kernel_launch_end);
 
-        // CUDA's fast token samplers do not yet consume BRLE logit masks.
-        // When constrained decoding supplies one, keep correctness by
-        // overriding token-sampler rows with a host-side masked argmax. This
-        // path is cold and only runs for constrained requests; normal decode
-        // and benchmark traffic keep the GPU sampler result.
-        const std::int32_t* all_sampled = sampled_host;
-        std::vector<std::int32_t> sampled_override;
-        if (!logit_masks_view.empty()) {
-            sampled_override.assign(sampled_host, sampled_host + N);
-            apply_logit_mask_overrides(
-                ws, sampled_override, logit_masks_view, logit_mask_indptr_view,
-                qo_view, sptr_view, sidx_view, std::span<const std::uint32_t>(per_slot_type),
-                R, N, engine.hf_config().vocab_size);
-            all_sampled = sampled_override.data();
+        if (view.ptir_program_hashes.empty()) {
+            throw std::runtime_error(
+                "legacy sampler launches are removed; direct PTIR launch required");
         }
-
-        bool single_token_per_request =
-            !need_msgpack &&
-            sample_rows_are_dense &&
-            num_sampling == R &&
-            N == R;
-        if (single_token_per_request) {
-            for (int r = 0; r < R; ++r) {
-                if (h_sptr[r + 1] - h_sptr[r] != 1u) {
-                    single_token_per_request = false;
-                    break;
-                }
+        if (!executor.ptir_dispatch)
+            executor.ptir_dispatch = std::make_unique<ptir::PtirDispatch>();
+        const std::uint32_t vocab = static_cast<std::uint32_t>(
+            executor.loaded_model.hf_config().vocab_size);
+        const std::size_t n_conv =
+            static_cast<std::size_t>(num_sampling) * vocab;
+        const void* ptir_logits = nullptr;
+        if (n_conv > 0) {
+            if (executor.ptir_logits_bf16.size() < n_conv) {
+                executor.ptir_logits_bf16 =
+                    DeviceBuffer<std::uint16_t>::alloc(n_conv);
             }
+            if (executor.ptir_logits_f32.size() < n_conv) {
+                executor.ptir_logits_f32 = DeviceBuffer<float>::alloc(n_conv);
+            }
+            kernels::launch_gather_bf16_rows(
+                static_cast<const std::uint16_t*>(executor.ws.logits.data()),
+                executor.inputs.sample_idx.data(),
+                executor.ptir_logits_bf16.data(),
+                num_sampling,
+                static_cast<int>(vocab),
+                executor.cublas.stream());
+            kernels::launch_cast_bf16_to_fp32(
+                executor.ptir_logits_bf16.data(),
+                executor.ptir_logits_f32.data(),
+                n_conv,
+                executor.cublas.stream());
+            ptir_logits = executor.ptir_logits_f32.data();
         }
-        if (single_token_per_request) {
-            executor.response_builder.build_token_only_dense(
-                std::span<const std::int32_t>(all_sampled,
-                                              static_cast<std::size_t>(R)),
-                out_resp);
-            write_probes(out_resp, t_entry, t_wire_parse_end,
-                         t_plan_end, t_h2d_end,
-                         t_kernel_launch_end, t_sync_end);
-            if (executor.verbose && (handled <= 4 || handled % 100 == 0)) {
-                std::cerr << "[pie-driver-cuda] req_id=" << req_id
-                          << " R=" << R << " N=" << N
-                          << " sampled=" << num_sampling
-                          << " max_kv=" << max_kv_len << "\n";
-            }
-            return;
-        }
-
-        // Flat-path arrays: token sampler is the only slot type allowed
-        // here (need_msgpack would have flipped otherwise), so counts
-        // align 1:1 with sampling slots.
-        std::vector<std::uint32_t> per_request_counts(R);
-        std::vector<std::uint32_t> sampled_tokens;
-        sampled_tokens.reserve(num_sampling);
-        for (int r = 0; r < R; ++r) {
-            const std::uint32_t lo = h_sptr[r];
-            const std::uint32_t hi = h_sptr[r + 1];
-            const std::uint32_t qo_lo = h_qo[r];
-            per_request_counts[r] = hi - lo;
-            for (std::uint32_t k = lo; k < hi; ++k) {
-                const std::uint32_t row = qo_lo + h_sidx[k];
-                sampled_tokens.push_back(
-                    static_cast<std::uint32_t>(all_sampled[row]));
-            }
-        }
-        // Single structured response. The fast path (need_msgpack ==
-        // false) populates only `tokens`; rich paths additionally fill
-        // dists/logits/logprobs/entropies via the per-sampler sub-passes.
-
-        if (need_msgpack) {
-            std::vector<pie_driver::PerRequestOutput> per_req(R);
-            std::vector<int> spec_accepted_drafts(
-                static_cast<std::size_t>(R), -1);
-            std::vector<std::int32_t> mtp_base_rows(
-                static_cast<std::size_t>(R), -1);
-            std::vector<std::uint32_t> mtp_draft_positions(
-                static_cast<std::size_t>(R), 0);
-            auto remember_mtp_source = [&](int r, std::uint32_t row) {
-                if (r < 0 || r >= R) return;
-                if (row >= static_cast<std::uint32_t>(N)) return;
-                const std::uint64_t source_pos = pos_view[row];
-                const std::uint64_t draft_pos = source_pos + 2ull;
-                if (draft_pos > std::numeric_limits<std::uint32_t>::max()) {
-                    return;
-                }
-                mtp_base_rows[static_cast<std::size_t>(r)] =
-                    static_cast<std::int32_t>(row);
-                mtp_draft_positions[static_cast<std::size_t>(r)] =
-                    static_cast<std::uint32_t>(draft_pos);
-            };
-            if (has_rich_sampler_slots) {
-                const ResponseSubpassContext sub_ctx{
-                    ws,
-                    R, num_sampling, engine.hf_config().vocab_size,
-                    std::span<const std::uint32_t>(per_slot_type),
-                    std::span<const float>(per_slot_temp),
-                    std::span<const std::int32_t>(per_slot_top_k),
-                    qo_view, sptr_view, sidx_view, rns_view,
-                };
-                gather_raw_logits(sub_ctx, per_req);
-                compute_entropy_slots(sub_ctx, per_req);
-                compute_logprob_slots(sub_ctx, view, per_req);
-                compute_dist_slots(sub_ctx, per_req);
-            }
-
-            // Per-request token list. For non-spec requests this is the
-            // token-typed slots' samples. For spec requests we walk the
-            // verification block (cloned token samplers at the bonus +
-            // each draft position) and produce the accepted prefix; the
-            // inferlet's own samples for that request are discarded.
-            for (int r = 0; r < R; ++r) {
-                const std::uint32_t qo_lo = h_qo[r];
-                auto& bucket = per_req[r].tokens;
-
-                if (has_spec_drafts && verify_slot_start[r] >= 0) {
-                    const int vs = verify_slot_start[r];
-                    const int n_d = verify_n_drafts[r];
-                    const int spec_lo = (r < static_cast<int>(spec_iptr_view.size()))
-                        ? static_cast<int>(spec_iptr_view[r]) : 0;
-                    std::vector<std::uint32_t> block(n_d + 1);
-                    for (int j = 0; j <= n_d; ++j) {
-                        const std::uint32_t row = qo_lo + h_sidx[vs + j];
-                        block[j] = static_cast<std::uint32_t>(all_sampled[row]);
-                    }
-                    int match = 0;
-                    for (int k = 0; k < n_d; ++k) {
-                        if (block[k] == spec_tok_view[spec_lo + k]) match++;
-                        else break;
-                    }
-                    if (mtp_trace_take()) {
-                        std::cerr << "[pie-mtp-trace] verify r=" << r
-                                  << " n_drafts=" << n_d
-                                  << " accepted=" << match
-                                  << " pos=[";
-                        for (int j = 0; j <= n_d; ++j) {
-                            if (j) std::cerr << ",";
-                            const std::uint32_t row = qo_lo + h_sidx[vs + j];
-                            std::cerr << pos_view[row];
-                        }
-                        std::cerr << "] draft=[";
-                        for (int j = 0; j < n_d; ++j) {
-                            if (j) std::cerr << ",";
-                            std::cerr << spec_tok_view[spec_lo + j];
-                        }
-                        std::cerr << "] verify=[";
-                        for (int j = 0; j <= n_d; ++j) {
-                            if (j) std::cerr << ",";
-                            std::cerr << block[j];
-                        }
-                        std::cerr << "]\n";
-                    }
-                    spec_accepted_drafts[static_cast<std::size_t>(r)] = match;
-                    bucket.assign(block.begin(), block.begin() + match + 1);
-                    if (!bucket.empty()) {
-                        const int j = static_cast<int>(bucket.size()) - 1;
-                        const std::uint32_t row = qo_lo + h_sidx[vs + j];
-                        remember_mtp_source(r, row);
-                    }
-                } else {
-                    const std::uint32_t lo = h_sptr[r];
-                    const std::uint32_t hi = h_sptr[r + 1];
-                    bucket.reserve(hi - lo);
-                    std::uint32_t last_token_row =
-                        std::numeric_limits<std::uint32_t>::max();
-                    for (std::uint32_t k = lo; k < hi; ++k) {
-                        const std::uint32_t type = per_slot_type[k];
-                        if (!pie_cuda_driver::is_token_sampler(type)) continue;
-                        const std::uint32_t row = qo_lo + h_sidx[k];
-                        bucket.push_back(static_cast<std::uint32_t>(all_sampled[row]));
-                        last_token_row = row;
-                    }
-                    if (!bucket.empty()) {
-                        remember_mtp_source(r, last_token_row);
-                    }
-                }
-            }
-            std::vector<SystemSpecDraftRequest> system_draft_requests;
-            if (executor.system_drafter) {
-                system_draft_requests.reserve(static_cast<std::size_t>(R));
-                for (int r = 0; r < R; ++r) {
-                    const bool wants_spec =
-                        r < static_cast<int>(outspec_view.size()) &&
-                        outspec_view[r] != 0;
-                    if (!wants_spec) continue;
-                    const auto& bucket =
-                        per_req[static_cast<std::size_t>(r)].tokens;
-                    if (bucket.empty()) continue;
-                    const std::int32_t row =
-                        mtp_base_rows[static_cast<std::size_t>(r)];
-                    if (row < 0) continue;
-                    const std::uint32_t draft_pos =
-                        mtp_draft_positions[static_cast<std::size_t>(r)];
-                    if (draft_pos < 2u) continue;
-                    const int last_match =
-                        spec_accepted_drafts[static_cast<std::size_t>(r)];
-                    const bool has_prior_drafts =
-                        has_spec_drafts &&
-                        r < static_cast<int>(verify_slot_start.size()) &&
-                        verify_slot_start[r] >= 0;
-                    const int last_num_drafts =
-                        has_prior_drafts ? verify_n_drafts[r] : 0;
-                    system_draft_requests.push_back(SystemSpecDraftRequest{
-                        .request_index = r,
-                        .source_row = row,
-                        .accepted_token = bucket.back(),
-                        .source_position = draft_pos - 2u,
-                        .first_draft_position = draft_pos,
-                        .last_match = last_match,
-                        .last_num_drafts = last_num_drafts,
-                    });
-                }
-            }
-
-            bool native_commit_cache = false;
-            if (!system_draft_requests.empty() &&
-                executor.system_drafter.commit_verified_prefix) {
-                std::vector<std::uint32_t> mtp_commit_tokens;
-                std::vector<std::uint32_t> mtp_commit_positions;
-                std::vector<std::uint32_t> mtp_commit_qo(
-                    static_cast<std::size_t>(R) + 1, 0);
-                std::vector<std::uint32_t> mtp_commit_lpl(
-                    static_cast<std::size_t>(R), 0);
-                std::vector<std::int32_t> mtp_commit_source_rows;
-                mtp_commit_tokens.reserve(static_cast<std::size_t>(N));
-                mtp_commit_positions.reserve(static_cast<std::size_t>(N));
-                mtp_commit_source_rows.reserve(static_cast<std::size_t>(N));
-
-                auto bump_last_page_len = [&](std::uint32_t lpl,
-                                              int extra_tokens) {
-                    if (extra_tokens <= 0) return lpl;
-                    const int bumped = static_cast<int>(lpl) + extra_tokens;
-                    return static_cast<std::uint32_t>(
-                        ((bumped - 1) % page_size) + 1);
-                };
-                for (int r = 0; r < R; ++r) {
-                    mtp_commit_qo[static_cast<std::size_t>(r)] =
-                        static_cast<std::uint32_t>(mtp_commit_tokens.size());
-                    mtp_commit_lpl[static_cast<std::size_t>(r)] =
-                        r < static_cast<int>(kvlpl_view_orig.size())
-                            ? kvlpl_view_orig[r]
-                            : (r < static_cast<int>(kvlpl_view.size())
-                                   ? kvlpl_view[r]
-                                   : 0u);
-                    const bool wants_spec =
-                        r < static_cast<int>(outspec_view.size()) &&
-                        outspec_view[r] != 0;
-                    if (!wants_spec) continue;
-
-                    const int orig_qo_lo =
-                        static_cast<int>(qo_view_orig[r]);
-                    const int orig_n_in =
-                        static_cast<int>(qo_view_orig[r + 1]) - orig_qo_lo;
-                    int accepted = 0;
-                    if (has_spec_drafts &&
-                        r < static_cast<int>(spec_accepted_drafts.size()) &&
-                        spec_accepted_drafts[static_cast<std::size_t>(r)] > 0) {
-                        accepted =
-                            spec_accepted_drafts[static_cast<std::size_t>(r)];
-                    }
-                    const int commit_len = orig_n_in + accepted;
-                    if (commit_len <= 0) continue;
-
-                    const int active_qo_lo = static_cast<int>(qo_view[r]);
-                    const int active_qo_hi = static_cast<int>(qo_view[r + 1]);
-                    const int bounded_commit_len =
-                        std::min(commit_len, active_qo_hi - active_qo_lo);
-                    for (int j = 0; j < bounded_commit_len; ++j) {
-                        const int row = active_qo_lo + j;
-                        mtp_commit_tokens.push_back(tok_view[row]);
-                        mtp_commit_positions.push_back(pos_view[row]);
-                        mtp_commit_source_rows.push_back(
-                            static_cast<std::int32_t>(row));
-                    }
-                    mtp_commit_lpl[static_cast<std::size_t>(r)] =
-                        bump_last_page_len(
-                            mtp_commit_lpl[static_cast<std::size_t>(r)],
-                            std::max(0, bounded_commit_len - orig_n_in));
-                }
-                mtp_commit_qo[static_cast<std::size_t>(R)] =
-                    static_cast<std::uint32_t>(mtp_commit_tokens.size());
-
-                native_commit_cache =
-                    executor.tp_comm == nullptr &&
-                    !mtp_commit_tokens.empty();
-                if (native_commit_cache) {
-                    pi.tokens.copy_from_host(
-                        std::span<const std::uint32_t>(mtp_commit_tokens));
-                    pi.positions.copy_from_host(
-                        std::span<const std::uint32_t>(mtp_commit_positions));
-                    pi.qo_indptr.copy_from_host(
-                        std::span<const std::uint32_t>(mtp_commit_qo));
-                    pi.kv_last_page_lens.copy_from_host(
-                        std::span<const std::uint32_t>(mtp_commit_lpl));
-                    pi.sample_idx.copy_from_host(
-                        std::span<const std::int32_t>(mtp_commit_source_rows));
-                    profile_mtp_process_call(
-                        "commit", cublas.stream(),
-                        static_cast<int>(mtp_commit_tokens.size()), R,
-                        [&] {
-                            executor.system_drafter.commit_verified_prefix(
-                                NativeSystemCommitInputs{
-                                    .target_ws = ws,
-                                    .kv_cache = kv_cache,
-                                    .cublas = cublas,
-                                    .token_ids =
-                                        reinterpret_cast<const std::int32_t*>(
-                                            pi.tokens.data()),
-                                    .positions =
-                                        reinterpret_cast<const std::int32_t*>(
-                                            pi.positions.data()),
-                                    .qo_indptr = pi.qo_indptr.data(),
-                                    .kv_page_indices =
-                                        pi.kv_page_indices.data(),
-                                    .kv_page_indptr =
-                                        pi.kv_page_indptr.data(),
-                                    .kv_last_page_lens =
-                                        pi.kv_last_page_lens.data(),
-                                    .slot_ids =
-                                        use_slots ? pi.slot_ids.data()
-                                                  : nullptr,
-                                    .source_row_indices = pi.sample_idx.data(),
-                                    .total_tokens =
-                                        static_cast<int>(
-                                            mtp_commit_tokens.size()),
-                                    .num_requests = R,
-                                });
-                        });
-                }
-            }
-
-            // The driver is pure mechanism: it auto-drafts exactly when the
-            // runtime requested it (system_draft_requests, derived from the
-            // runtime's output_spec_flags). The decision of WHETHER to speculate
-            // this step is the runtime's — see the runtime spec policy.
-            if (!system_draft_requests.empty() &&
-                executor.system_drafter.draft_next) {
-                StepProfileTimer system_spec_timer(
-                    "system_drafter", cublas.stream(),
-                    static_cast<int>(system_draft_requests.size()), R);
-                executor.system_drafter.draft_next(
-                    SystemSpecDraftInputs{
-                        .target_ws = ws,
-                        .kv_cache = kv_cache,
-                        .attn_ws = attn_ws,
-                        .cublas = cublas,
-                        .requests =
-                            std::span<const SystemSpecDraftRequest>(
-                                system_draft_requests.data(),
-                                system_draft_requests.size()),
-                        .kv_page_indices = kvpi_view,
-                        .kv_page_indptr = kvpp_view,
-                        .page_size = kv_cache.page_size(),
-                        .max_drafts = executor.system_drafter.max_drafts,
-                    },
-                    std::span<pie_driver::PerRequestOutput>(
-                        per_req.data(), per_req.size()));
-                system_spec_timer.finish(cublas.stream());
-            } else if (!system_draft_requests.empty() &&
-                       executor.system_drafter.draft_step) {
-                run_step_chained_system_drafter(
-                    executor,
-                    std::span<const SystemSpecDraftRequest>(
-                        system_draft_requests.data(),
-                        system_draft_requests.size()),
-                    std::span<pie_driver::PerRequestOutput>(
-                        per_req.data(), per_req.size()),
-                    native_commit_cache);
-            }
-            // Advance each committed rs_cache slot from its pre-verify value
-            // (the frozen verify left it untouched) to its confirmed prefix
-            // [input | accepted] via ACTIVATION REPLAY: replay only the linear-
-            // attn recurrence over the accepted tokens, fed from the verify's
-            // stashed in-proj activations (mixed_qkv + a,b) — no in_proj GEMM, no
-            // attention/MLP, no lm_head. Lossless by construction (the rejected
-            // drafts' state is never committed). The MTP-head commit above must
-            // precede this (invoke_body overwrites ws). The stash is always
-            // configured (entry.cpp), so this is the sole hybrid-SSM spec path.
-            if (rs_frozen_verify) {
-                executor.rs_cache->set_verify_frozen(false);
-
-                // Replay over the verify window with a per-request commit_len
-                // (n_in + accepted): linear_attn_layer_body loads the stashed
-                // in-proj activations and SKIPS in_proj, so conv+prep+fla fold
-                // only the confirmed prefix and write the committed state at that
-                // boundary. No in_proj GEMM means no GEMM-tiling sensitivity, so
-                // the replay is bit-consistent with the verify.
-                std::vector<std::int32_t> commit_len(static_cast<std::size_t>(R));
-                std::vector<std::int32_t> commit_slots(static_cast<std::size_t>(R));
-                for (int r = 0; r < R; ++r) {
-                    const int n_in = static_cast<int>(
-                        qo_view_orig[r + 1] - qo_view_orig[r]);
-                    const int accepted =
-                        (r < static_cast<int>(spec_accepted_drafts.size()) &&
-                         spec_accepted_drafts[static_cast<std::size_t>(r)] > 0)
-                            ? spec_accepted_drafts[static_cast<std::size_t>(r)]
-                            : 0;
-                    commit_len[static_cast<std::size_t>(r)] = n_in + accepted;
-                    commit_slots[static_cast<std::size_t>(r)] = slot_ids_h[r];
-                }
-
-                if (N > 0) {
-                    // Reuse pi.tokens (uint32, unused — no embed) for the int32
-                    // commit_len array; restore the full verify qo + slots.
-                    pi.tokens.copy_from_host(std::span<const std::uint32_t>(
-                        reinterpret_cast<const std::uint32_t*>(commit_len.data()),
-                        commit_len.size()));
-                    pi.qo_indptr.copy_from_host(std::span<const std::uint32_t>(
-                        qo_view.data(), qo_view.size()));
-                    pi.slot_ids.copy_from_host(
-                        std::span<const std::int32_t>(commit_slots));
-
-                    pie_cuda_driver::ForwardFn::ForwardInputs fwd_in;
-                    fwd_in.qo_indptr_d   = pi.qo_indptr.data();
-                    fwd_in.qo_indptr_h   = qo_view.data();
-                    fwd_in.total_tokens  = N;       // full verify window
-                    fwd_in.num_requests  = R;
-                    fwd_in.is_pure_decode = false;  // N > R (has drafts)
-                    fwd_in.slot_ids_h    = commit_slots.data();
-                    fwd_in.slot_ids_d    = pi.slot_ids.data();
-                    fwd_in.num_logit_rows = -1;
-                    fwd_in.commit_advance_gather_d =
-                        reinterpret_cast<const std::int32_t*>(pi.tokens.data());
-                    forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas,
-                                           fwd_in);
-                }
-            }
-            executor.response_builder.build(per_req, out_resp);
-            write_probes(out_resp, t_entry, t_wire_parse_end,
-                         t_plan_end, t_h2d_end,
-                         t_kernel_launch_end, t_sync_end);
-
-            if (executor.verbose && (handled <= 4 || handled % 100 == 0)) {
-                std::cerr << "[pie-driver-cuda] req_id=" << req_id
-                          << " R=" << R << " N=" << N
-                          << " sampled=" << num_sampling
-                          << " max_kv=" << max_kv_len << "\n";
-            }
-            return;
-        }
-
-        executor.response_builder.build_token_only(
-            std::span<const std::uint32_t>(per_request_counts),
-            std::span<const std::uint32_t>(sampled_tokens),
-            out_resp);
-        write_probes(out_resp, t_entry, t_wire_parse_end,
-                     t_plan_end, t_h2d_end,
-                     t_kernel_launch_end, t_sync_end);
-        if (executor.verbose && (handled <= 4 || handled % 100 == 0)) {
-            std::cerr << "[pie-driver-cuda] req_id=" << req_id
-                      << " R=" << R << " N=" << N
-                      << " sampled=" << num_sampling
-                      << " max_kv=" << max_kv_len << "\n";
-        }
+        // The post-forward dispatch slices each program's logits base from
+        // `sampling_indptr[p]` — hand it the PER-PROGRAM gathered-row offsets
+        // (`n_prog + 1` entries), not the per-request sampling CSR (the two
+        // coincided only while every batched program was exactly one wire
+        // request).
+        pie_native::LaunchView dispatch_view = view;
+        dispatch_view.sampling_indices = pie_native::slice_from_u32(
+            sidx_view.data(), sidx_view.size());
+        dispatch_view.sampling_indptr = pie_native::slice_from_u32(
+            prog_sample_offsets.data(), prog_sample_offsets.size());
+        executor.ptir_dispatch->run(
+            dispatch_view, ptir_logits, vocab, executor.cublas.stream(),
+            &runtime, completion);
         return;
 
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-cuda] fire_batch failed for req_id="
                   << req_id << ": " << e.what() << "\n";
-        out_resp = pie_driver::PieForwardResponseView{};
-        return;
+        throw;
     }
 }
 
@@ -3218,8 +2095,8 @@ void handle_fire_batch(
 //
 // Symmetric counterpart of `handle_fire_batch` for ranks > 0:
 //
-//   * No shmem decode — the inputs arrive via NCCL broadcast from rank 0.
-//   * No sampling — only rank 0 owns the response buffer + sampler RNG.
+//   * Inputs arrive via NCCL broadcast from rank 0.
+//   * No sampling — only rank 0 owns the direct PTIR publish path.
 //   * Graph capture/replay mirrors rank 0 for graph-safe pure decode so
 //     NCCL collectives inside the body enter capture or replay on every
 //     rank in the same order.
@@ -3395,9 +2272,8 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // 4. Run the same forward function as rank 0. The all-reduces
-        // inside synchronise both ranks; we don't sample or write a
-        // response — that's rank-0-only.
+        // 4. Run the same forward function as rank 0. Channel publication is
+        // rank-0-only after the collectives complete.
         executor.forward_fn.invoke_prepare(
             executor.attn_ws,
             ForwardFn::PrepareInputs{
@@ -3420,15 +2296,16 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         // rank 0 would record while rank 1 executes, deadlocking the
         // first capture). The same `(R)` shape key keeps the per-rank
         // graph caches in lockstep; the captured graph on rank 1 has no
-        // sampling / response work, just the forward kernels + NCCL.
+        // PTIR publication, just the forward kernels + NCCL.
         const bool try_graphs =
             executor.graph_cache != nullptr && is_pure_decode && !have_custom_mask
             && executor.forward_fn.graph_safe;
         const std::uint32_t graph_layout =
             executor.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
-            (tp_greedy_argmax ? 1u : 0u) |
-            (graph_layout << 3);
+            make_graph_variant(tp_greedy_argmax, /*single_gpu=*/false,
+                               /*fwd_handles=*/false, /*small_spec=*/false,
+                               /*rs_verify=*/false, graph_layout);
         if (try_graphs) {
             const ForwardGraphKey key{R, N, graph_variant};
             cudaGraphExec_t exec = executor.graph_cache->get(key);

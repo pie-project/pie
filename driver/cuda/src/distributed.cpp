@@ -192,4 +192,10 @@ void NcclComm::barrier(cudaStream_t stream) {
         comm_);
 }
 
+void NcclComm::abort() noexcept {
+    if (comm_ != nullptr) {
+        ncclCommAbort(comm_);
+    }
+}
+
 }  // namespace pie_cuda_driver

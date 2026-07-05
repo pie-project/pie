@@ -1,0 +1,4 @@
+[package]
+name = "tempgen"
+version = "0.1.0"
+description = "Test inferlet: temperature (Multinomial) sampling — exercises the BakedIR temp de-hardwiring path"

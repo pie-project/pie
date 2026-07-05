@@ -21,7 +21,24 @@ namespace pie_cuda_driver {
 
 namespace {
 
-// Whitelist of model_types we currently support TP for. The shard plan is
+// Device storage-target constants advertised to the runtime and used by the
+// driver-side storage compile. The device prefers 64 MiB staged H2D tiles and
+// 256-byte-aligned persistent weight buffers.
+constexpr std::uint64_t kStorageMaxTileBytes = 64ull * 1024ull * 1024ull;
+constexpr std::uint32_t kStoragePreferredAlignment = 256;
+
+// Map the driver's MXFP4 MoE lowering choice onto the wire policy tag the
+// runtime's DriverCapabilities exposes (`mxfp4_moe_policy`).
+inline const char* mxfp4_moe_policy_tag(Mxfp4MoeLowering lowering) noexcept {
+    switch (lowering) {
+        case Mxfp4MoeLowering::NativeGemm:  return "native_gemm";
+        case Mxfp4MoeLowering::Bf16Dequant: return "eager_bf16";
+        case Mxfp4MoeLowering::RoutedDequant:
+        default:                            return "routed_decode";
+    }
+}
+
+
 // llama-like and assumes the standard name layout — gemma/mixtral/MoE need
 // their own plan (per-expert weights, dual-norm, etc.).
 bool supports_tp(const std::string& mt) {
@@ -209,6 +226,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     backend_target.mxfp4_moe =
         select_mxfp4_moe_lowering(boot_cfg.model, backend_target);
     e.mxfp4_moe_lowering_ = backend_target.mxfp4_moe;
+    e.mxfp4_native_gemm_ = backend_target.mxfp4_native_gemm;
 
     log_stage("open safetensors begin");
     auto loader = SafetensorsCheckpointSource::open(snapshot);
@@ -316,9 +334,11 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     RustLoaderCompileResult rust_plan =
         compile_rust_loader_plan_from_metadata(
             e.hf_, loader, runtime_quant, tp_rank, tp_size,
-            64ull * 1024ull * 1024ull,
-            /*preferred_alignment=*/256,
-            backend_target);
+            kStorageMaxTileBytes,
+            kStoragePreferredAlignment,
+            backend_target,
+            boot_cfg.model.snapshot_dir,
+            boot_cfg.model.storage_program_path);
     log_stage("compile rust loader plan done");
     const auto rust_view = rust_plan.program.view();
     if (const char* dump_path =
@@ -572,6 +592,11 @@ LoadedModelCapabilities LoadedModel::capabilities() const {
     c.max_model_len = hf_.max_position_embeddings;
     c.activation_dtype = boot_.model.dtype;
     c.snapshot_dir = boot_.model.snapshot_dir;
+    c.storage_backend = "cuda";
+    c.max_tile_bytes = kStorageMaxTileBytes;
+    c.preferred_alignment = kStoragePreferredAlignment;
+    c.mxfp4_moe_policy = mxfp4_moe_policy_tag(mxfp4_moe_lowering_);
+    c.native_mxfp4_moe = mxfp4_native_gemm_;
     return c;
 }
 

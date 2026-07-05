@@ -74,7 +74,7 @@ class RuntimeConfig:
 
 
 # ---------------------------------------------------------------------------
-# [[model]] / [model.driver] / [model.scheduler]
+# [model] / [model.driver] / [model.scheduler]
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -85,18 +85,12 @@ class DriverConfig:
     tensor_parallel_size: Optional[int] = None
     activation_dtype: Optional[str] = None
     random_seed: Optional[int] = None
-    ipc_profile: Optional[str] = None
-    spin_budget_us: Optional[int] = None
     options: dict = field(default_factory=dict)
 
 
 @dataclass
 class SchedulerConfig:
-    batch_policy: Optional[str] = None
     request_timeout_secs: Optional[int] = None
-    default_token_limit: Optional[int] = None
-    default_endowment_pages: Optional[int] = None
-    admission_oversubscription_factor: Optional[float] = None
     restore_pause_at_utilization: Optional[float] = None
     speculation_depth: Optional[int] = None
 
@@ -119,7 +113,7 @@ class Config:
     auth: AuthConfig = field(default_factory=AuthConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    models: list[ModelConfig] = field(default_factory=list)
+    model: ModelConfig = field(default_factory=ModelConfig)
 
     def to_toml(self) -> str:
         """Serialize to the same TOML schema `pie serve --config` reads."""
@@ -128,19 +122,19 @@ class Config:
         _emit_table(buf, "auth", _block(self.auth))
         _emit_table(buf, "telemetry", _block(self.telemetry))
         _emit_table(buf, "runtime", _block(self.runtime))
-        for m in self.models:
-            buf.write("\n[[model]]\n")
-            _emit_kv(buf, "name", m.name)
-            _emit_kv(buf, "hf_repo", m.hf_repo)
-            _emit_table(buf, "model.driver", _driver_block(m.driver),
+        m = self.model
+        buf.write("\n[model]\n")
+        _emit_kv(buf, "name", m.name)
+        _emit_kv(buf, "hf_repo", m.hf_repo)
+        _emit_table(buf, "model.driver", _driver_block(m.driver),
+                    leading_newline=True)
+        if m.driver.options:
+            buf.write("\n[model.driver.options]\n")
+            for k, v in m.driver.options.items():
+                _emit_kv(buf, k, v)
+        if m.scheduler is not None:
+            _emit_table(buf, "model.scheduler", _block(m.scheduler),
                         leading_newline=True)
-            if m.driver.options:
-                buf.write("\n[model.driver.options]\n")
-                for k, v in m.driver.options.items():
-                    _emit_kv(buf, k, v)
-            if m.scheduler is not None:
-                _emit_table(buf, "model.scheduler", _block(m.scheduler),
-                            leading_newline=True)
         return buf.getvalue()
 
 
@@ -174,8 +168,6 @@ def _driver_block(d: DriverConfig) -> dict:
         "tensor_parallel_size",
         "activation_dtype",
         "random_seed",
-        "ipc_profile",
-        "spin_budget_us",
     ):
         v = getattr(d, name)
         if v is not None:

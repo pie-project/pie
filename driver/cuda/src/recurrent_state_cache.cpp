@@ -350,4 +350,38 @@ void* RecurrentStateCache::verify_hidden_stash_layer(int linear_idx)
         static_cast<std::size_t>(linear_idx) * per_layer;
 }
 
+void RecurrentStateCache::configure_rs_buffer_pool(
+    int page_tokens, int hidden_size, int num_slots)
+{
+    if (page_tokens <= 0 || hidden_size <= 0 || num_slots <= 0 ||
+        num_linear_layers_ <= 0) {
+        return;
+    }
+    rs_buffer_page_tokens_ = page_tokens;
+    rs_buffer_hidden_ = hidden_size;
+    rs_buffer_num_slots_ = num_slots;
+    const std::size_t per_slot =
+        static_cast<std::size_t>(page_tokens) * hidden_size;
+    const std::size_t per_layer =
+        per_slot * static_cast<std::size_t>(num_slots);
+    rs_buffer_pool_ = DeviceBuffer<std::uint16_t>::alloc(
+        per_layer * static_cast<std::size_t>(num_linear_layers_));
+}
+
+void* RecurrentStateCache::rs_buffer_slab(int linear_idx, int slot)
+{
+    if (!rs_buffer_pool_enabled() || rs_buffer_pool_.data() == nullptr ||
+        linear_idx < 0 || linear_idx >= num_linear_layers_ ||
+        slot < 0 || slot >= rs_buffer_num_slots_) {
+        return nullptr;
+    }
+    const std::size_t per_slot =
+        static_cast<std::size_t>(rs_buffer_page_tokens_) * rs_buffer_hidden_;
+    const std::size_t per_layer =
+        per_slot * static_cast<std::size_t>(rs_buffer_num_slots_);
+    return rs_buffer_pool_.data() +
+        static_cast<std::size_t>(linear_idx) * per_layer +
+        static_cast<std::size_t>(slot) * per_slot;
+}
+
 }  // namespace pie_cuda_driver

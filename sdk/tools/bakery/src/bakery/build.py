@@ -61,15 +61,6 @@ def read_package_name(project_dir: Path) -> str:
     return name
 
 
-def to_wit_ident(name: str) -> str:
-    """Convert a package name to a valid WIT identifier.
-
-    WIT identifiers use kebab-case (hyphens).
-    """
-    # Replace underscores with hyphens
-    return name.replace("_", "-")
-
-
 def to_python_ident(name: str) -> str:
     """Convert a package name to a valid Python identifier.
 
@@ -418,63 +409,6 @@ def copy_dir_recursive(src: Path, dst: Path) -> None:
             shutil.copy2(src_path, dst_path)
 
 
-def generate_dynamic_wit(
-    base_wit_path: Path,
-    temp_wit_dir: Path,
-    package_name: str,
-) -> None:
-    """Generate a temporary WIT directory with the dynamic export interface.
-
-    Copies the deps/ directory from sdk/rust/inferlet/wit/ and adds
-    a world.wit with the dynamic run interface. The imports are read
-    from the source world.wit to avoid hardcoding.
-
-    Args:
-        base_wit_path: Path to sdk/rust/inferlet/wit/.
-        temp_wit_dir: Path to the temporary WIT directory to create.
-        package_name: The package name for the export interface.
-    """
-    # Convert package name to WIT identifier (kebab-case)
-    wit_package_name = to_wit_ident(package_name)
-
-    # Create temp WIT directory
-    temp_wit_dir.mkdir(parents=True, exist_ok=True)
-
-    # Copy the deps/ directory as-is
-    deps_src = base_wit_path / "deps"
-    if deps_src.exists():
-        copy_dir_recursive(deps_src, temp_wit_dir / "deps")
-
-    # Read the imports from the source world.wit
-    source_world_wit = base_wit_path / "world.wit"
-    include_lines = []
-    if source_world_wit.exists():
-        for line in source_world_wit.read_text().splitlines():
-            stripped = line.strip()
-            if stripped.startswith("include "):
-                include_lines.append(f"    {stripped}")
-
-    includes_block = "\n".join(include_lines) if include_lines else ""
-
-    # Add the world.wit with the dynamic run interface
-    world_wit_content = f"""package pie:{wit_package_name};
-
-// Dynamic run interface for this inferlet
-interface run {{
-    run: func(input: string) -> result<string, string>;
-}}
-
-// Exec world with imports and dynamic export
-world exec {{
-{includes_block}
-
-    export run;
-}}
-"""
-
-    (temp_wit_dir / "world.wit").write_text(world_wit_content)
-
-
 def run_componentize_py(
     wrapper_py: Path,
     output_wasm: Path,
@@ -497,10 +431,9 @@ def run_componentize_py(
     # Get the module name from the wrapper file (without .py extension)
     module_name = wrapper_py.stem
 
-    # Create a temporary WIT directory with the dynamic export
-    temp_wit_dir = work_dir / "wit"
-    generate_dynamic_wit(wit_path, temp_wit_dir, package_name)
-
+    # Componentize against the stock `pie:inferlet` world (WIT-refactor Phase 2):
+    # the world now declares `export run`, so the per-package synthesized `exec`
+    # world is gone. Point componentize-py straight at the vendored WIT dir.
     # Canonicalize paths for componentize-py
     output_wasm_abs = (
         output_wasm if output_wasm.is_absolute() else Path.cwd() / output_wasm
@@ -509,9 +442,9 @@ def run_componentize_py(
     cmd = [
         resolve_command("componentize-py"),
         "-d",
-        str(temp_wit_dir),
+        str(wit_path),
         "-w",
-        "exec",
+        "inferlet",
         "componentize",
         "--no-snapshot",
         "--shared-modules",
@@ -859,7 +792,7 @@ def run_componentize_js(
         "--wit",
         str(wit_path),
         "--world-name",
-        "exec",
+        "inferlet",
     ]
 
     if debug:
@@ -1281,18 +1214,13 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
             status.update("[bold green]📦 Bundling final output...[/bold green]")
             run_esbuild(wrapper_js, final_bundle, inferlet_js_entry, debug)
 
-            # Step 6: Generate dynamic WIT directory with exec world
-            status.update(
-                "[bold green]🔧 Generating dynamic WIT...[/bold green]"
-            )
-            temp_wit_dir = temp_path / "wit"
-            generate_dynamic_wit(wit_path, temp_wit_dir, package_name)
-
-            # Step 7: Compile to WASM
+            # Step 6: Compile to WASM against the stock `pie:inferlet` world
+            # (WIT-refactor Phase 2 — the synthesized `exec` world is gone; the
+            # world declares `export run` directly).
             status.update(
                 "[bold green]🔧 Compiling to WebAssembly component...[/bold green]"
             )
-            run_componentize_js(final_bundle, output, temp_wit_dir, debug)
+            run_componentize_js(final_bundle, output, wit_path, debug)
 
     # Success
     wasm_size = output.stat().st_size if output.exists() else 0

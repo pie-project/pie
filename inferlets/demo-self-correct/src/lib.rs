@@ -23,7 +23,77 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Sampler, wstd};
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{self, SamplerSpec};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{carrier, chat, model, Result};
+
+async fn read_token(pass: ForwardPass) -> Result<u32> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(if bytes.len() >= 4 {
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
+    } else {
+        0
+    })
+}
+
+fn pass_carries(stop_empty: bool, max_tokens: usize, produced_token_index: usize) -> bool {
+    !(stop_empty && max_tokens == produced_token_index)
+}
+
+/// Run-ahead (pipelined) chat-EOS decode with depth-1 EOS rollback, on a fresh KV
+/// (each self-correct attempt re-prefills the base prompt — the fork-based
+/// "rewind" of the facade over an unflushed base = a fresh working set here).
+async fn decode_pipelined(
+    kv: &KvWorkingSet,
+    seq_len: &mut u32,
+    fresh: &mut bool,
+    s: &sampler::LoweredSampler,
+    prompt: Vec<u32>,
+    max_tokens: usize,
+    stop: &[u32],
+) -> Result<Vec<u32>> {
+    let pending = if prompt.is_empty() { vec![0u32] } else { prompt };
+    let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
+    if max_tokens == 0 {
+        return Ok(out);
+    }
+    let prime_carry = pass_carries(stop.is_empty(), max_tokens, 1);
+    let mut producer = carrier::submit_pass(kv, seq_len, fresh, s, &pending, prime_carry)?;
+    let mut generated = 0usize;
+    loop {
+        let speculate = generated + 1 < max_tokens;
+        let consumer = if speculate {
+            let carry = pass_carries(stop.is_empty(), max_tokens, generated + 2);
+            Some(carrier::submit_pass(kv, seq_len, fresh, s, &[0u32], carry)?)
+        } else {
+            None
+        };
+        let token = read_token(producer).await?;
+        if stop.contains(&token) {
+            if let Some(c) = consumer {
+                carrier::discard_pass(c, seq_len).await;
+            }
+            break;
+        }
+        out.push(token);
+        generated += 1;
+        match consumer {
+            Some(c) => producer = c,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Build the chat-templated base prompt tokens (system + user + cue), unflushed —
+/// each attempt decodes from these on its own fresh KV.
+fn base_prompt(system: &str, question: &str) -> Vec<u32> {
+    let mut v = chat::system_user(system, &format!("{} /no_think", question));
+    v.extend(chat::cue());
+    v
+}
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -94,23 +164,19 @@ const MAGENTA: &str = "\x1b[35m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_baseline(&model, &model_name, &input).await?;
+            run_baseline(&model_name, &input).await?;
         }
         "verified" | "smart" => {
-            run_verified(&model, &model_name, &input).await?;
+            run_verified(&model_name, &input).await?;
         }
         "both" | "" => {
-            let p = run_baseline(&model, &model_name, &input).await?;
+            let p = run_baseline(&model_name, &input).await?;
             println!();
-            let s = run_verified(&model, &model_name, &input).await?;
+            let s = run_verified(&model_name, &input).await?;
             println!();
             comparison(&p, &s, &input.expected);
         }
@@ -134,7 +200,7 @@ struct ModeResult {
 }
 
 // ── BASELINE: one greedy roll-out ─────────────────────────────────────────
-async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_baseline(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "BASELINE",
         YELLOW,
@@ -143,13 +209,10 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
         &input.question,
     );
 
-    let mut ctx = Context::new(model)?;
-    ctx.system(&input.system);
-    ctx.user(&format!("{} /no_think", input.question));
-    ctx.cue();
+    let base = base_prompt(&input.system, &input.question);
 
     let start = Instant::now();
-    let text = stream_attempt(&mut ctx, model, input.max_tokens, 0.0, input.delay).await?;
+    let text = stream_attempt(&base, input.max_tokens, 0.0, input.delay).await?;
     let elapsed = start.elapsed();
     let answer = extract_answer(&text);
     print_footer("BASELINE", YELLOW, &answer, elapsed, 0, 1, &input.expected);
@@ -162,7 +225,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
 }
 
 // ── VERIFIED: full-attempt verify + fork()-based KV rewind ────────────────
-async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_verified(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "VERIFIED",
         GREEN,
@@ -195,18 +258,13 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
     // Both are buffered (not flushed) so each fork's first generate()
     // step does the prefill in one batched forward pass — bit-for-bit
     // parity with BASELINE's path.
-    let mut ctx_base_raw = Context::new(model)?;
-    ctx_base_raw.system(&input.system);
-    ctx_base_raw.user(&format!("{} /no_think", input.question));
-    ctx_base_raw.cue();
-
-    let mut ctx_base_primed = ctx_base_raw.fork()?;
-    let tokenizer = model.tokenizer();
-    let prime = tokenizer.encode("\n</think>\n\n");
-    if !prime.is_empty() {
-        ctx_base_primed.append(&prime);
-    }
-    let base_seq_len = ctx_base_primed.seq_len() + ctx_base_primed.buffer().len() as u32;
+    // Base prompt tokens (unflushed): attempt 1 uses the raw base; retries use the
+    // primed base (a closing `</think>` shifts the distribution). Each attempt
+    // decodes these on a fresh KV — the facade's fork()-of-unflushed-base rewind.
+    let base_raw = base_prompt(&input.system, &input.question);
+    let mut base_primed = base_raw.clone();
+    base_primed.extend(model::encode("\n</think>\n\n"));
+    let base_seq_len = base_primed.len() as u32;
 
     let start = Instant::now();
     let mut rewinds = 0usize;
@@ -237,13 +295,9 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
         // closing `</think>` token shifts the distribution into the
         // canonical-equation regime, so sampling can land on the right
         // multiplication.
-        let mut ctx = if attempt_idx == 1 {
-            ctx_base_raw.fork()?
-        } else {
-            ctx_base_primed.fork()?
-        };
+        let prompt = if attempt_idx == 1 { &base_raw } else { &base_primed };
 
-        let text = stream_attempt(&mut ctx, model, input.max_tokens, temp, input.delay).await?;
+        let text = stream_attempt(prompt, input.max_tokens, temp, input.delay).await?;
         let errs = verify_attempt(&text, &input.expected);
 
         if errs.is_empty() {
@@ -318,56 +372,37 @@ async fn run_verified(model: &Model, model_name: &str, input: &Input) -> Result<
 // blocks and optionally sleeps `delay_ms` after each delta to make the
 // streaming effect readable on video.
 async fn stream_attempt(
-    ctx: &mut Context,
-    model: &Model,
+    prompt: &[u32],
     max_tokens: usize,
     temperature: f32,
-    delay_ms: u64,
+    _delay_ms: u64,
 ) -> Result<String> {
     print!("  {}>{} ", CYAN, RESET);
     let _ = io::stdout().flush();
 
-    let sampler = if temperature <= 0.0 {
-        Sampler::Argmax
+    let vocab = model::output_vocab_size();
+    let spec = if temperature <= 0.0 {
+        SamplerSpec::Argmax
     } else {
-        Sampler::TopP {
-            temperature,
-            p: 0.95,
-        }
+        SamplerSpec::TopP { temperature, p: 0.95 }
     };
+    let s = sampler::sampler_program(spec, vocab)?;
+    let stop = chat::stop_tokens();
 
-    let mut g = ctx
-        .generate(sampler)
-        .max_tokens(max_tokens)
-        .stop(&chat::stop_tokens(model));
-    let mut decoder = chat::Decoder::new(model);
-    let mut stripper = ThinkStripper::new();
+    // Fresh KV per attempt (the fork-based rewind). Decode the base prompt on the
+    // run-ahead carrier; per-token streaming is traded for the pipelined overlap.
+    let kv = KvWorkingSet::new();
+    let mut seq = 0u32;
+    let mut fresh = true;
+    let toks = decode_pipelined(&kv, &mut seq, &mut fresh, &s, prompt.to_vec(), max_tokens, &stop).await?;
+
+    // Full decoded text (template markers stripped, <think> content kept for the
+    // verifier).
+    let mut decoder = chat::Decoder::new();
     let mut text = String::new();
-
-    while let Some(step) = g.next()? {
-        let out = step.execute().await?;
-        if out.tokens.is_empty() {
-            continue;
-        }
-        match decoder.feed(&out.tokens)? {
-            chat::Event::Delta(s) => {
-                text.push_str(&s);
-                let visible = stripper.process(&s);
-                if !visible.is_empty() {
-                    let rendered = visible.replace('\n', "\n    ");
-                    print!("{}", rendered);
-                    let _ = io::stdout().flush();
-                    if delay_ms > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(delay_ms)).await;
-                    }
-                }
-            }
-            chat::Event::Done(s) => {
-                text = s;
-                break;
-            }
-            _ => {}
-        }
+    match decoder.feed(&toks)? {
+        chat::Event::Delta(s) | chat::Event::Done(s) => text.push_str(&s),
+        _ => {}
     }
     println!();
     Ok(text)

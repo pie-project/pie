@@ -138,7 +138,6 @@ impl RuntimeAbi {
         Ok(Self {
             name: match target.backend {
                 crate::types::BackendKind::Cuda => "pie-cuda".to_string(),
-                crate::types::BackendKind::Portable => "pie-portable".to_string(),
                 crate::types::BackendKind::Unknown => "pie".to_string(),
             },
             version: 1,
@@ -157,11 +156,7 @@ impl RuntimeAbi {
 
         const MIN_GROUP_TENSORS: usize = 16;
         const DEFAULT_MAX_BANK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-        let max_bank_bytes = std::env::var("PIE_WEIGHT_LOADER_MAX_BANK_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_MAX_BANK_BYTES);
+        let max_bank_bytes = DEFAULT_MAX_BANK_BYTES;
 
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct GroupKey {
@@ -518,8 +513,17 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
         ArchProfile { nemotron_packed_experts: true, ..GENERIC_ARCH },
     ),
     (
+        // GPT-OSS binds attention q/k/v separately (its CUDA builder reads
+        // `self_attn.q_proj.weight` / `k_proj` / `v_proj`, never a fused qkv), so
+        // opt out of the dense projection join like Qwen3-MoE — otherwise the
+        // join consumes q/k/v into `qkv_proj.fused.weight` and the bind path
+        // fails with `missing weight 'self_attn.q_proj.weight'`.
         &["gpt_oss", "gpt-oss", "gptoss"],
-        ArchProfile { gpt_oss_mxfp4_groups: true, ..GENERIC_ARCH },
+        ArchProfile {
+            gpt_oss_mxfp4_groups: true,
+            skip_dense_qkv_fusion: true,
+            ..GENERIC_ARCH
+        },
     ),
     (
         &["glm_moe_dsa"],
@@ -1884,10 +1888,7 @@ fn dense_fused_projection_budget_bytes() -> u64 {
     // selects which groups get a fused GEMM: all groups through 8B-class Qwen
     // models, and QKV-only above that where gate/up fusion has regressed.
     const DEFAULT_BUDGET: u64 = 10 * 1024 * 1024 * 1024;
-    std::env::var("PIE_CUDA_FUSED_PROJECTION_BUDGET_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_BUDGET)
+    DEFAULT_BUDGET
 }
 
 fn local_range(full: i64, target: &StorageTarget) -> Result<(i64, i64), CompileError> {

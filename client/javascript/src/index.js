@@ -10,8 +10,6 @@ import msgpack from 'msgpack-lite';
 import { blake3 } from '@noble/hashes/blake3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
-import { BridgeRegistry, JsonRpcError } from './mcp_bridge.js';
-
 /**
  * A simple asynchronous queue.
  */
@@ -123,9 +121,6 @@ export class PieClient {
         this.pendingDownloads = new Map();
         this.orphanEvents = new Map();
         this.connectionPromise = null;
-
-        // Locally-spawned MCP servers, indexed by registered name.
-        this.mcpBridge = new BridgeRegistry();
     }
 
     // Backward compatibility alias
@@ -223,10 +218,6 @@ export class PieClient {
             }
         } else if (msgType === 'file') {
             await this._handleFileChunk(message);
-        } else if (msgType === 'mcp_request') {
-            // Run the relay off the listener so a slow MCP server
-            // can't block other server messages.
-            this._handleMcpRequest(message).catch(() => {});
         }
     }
 
@@ -259,11 +250,9 @@ export class PieClient {
     }
 
     /**
-     * Gracefully closes the WebSocket connection and shuts down any
-     * locally-spawned MCP servers.
+     * Gracefully closes the WebSocket connection.
      */
     async close() {
-        try { await this.mcpBridge.closeAll(); } catch {}
         return new Promise((resolve) => {
             if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
                 this._rejectPendingRequests(new Error("WebSocket connection closed."));
@@ -473,20 +462,15 @@ export class PieClient {
      * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
      * @param {Object} [input={}] Input parameters object, serialized to JSON.
      * @param {boolean} [captureOutputs=true] Stream outputs to client.
-     * @param {Object} [options={}] Additional launch options.
-     * @param {number|null} [options.tokenBudget=null] Token budget for this process.
      * @returns {Promise<Process>}
      */
-    async launchProcess(inferlet, input = {}, captureOutputs = true, { tokenBudget = null } = {}) {
+    async launchProcess(inferlet, input = {}, captureOutputs = true) {
         const msg = {
             type: "launch_process",
             inferlet,
             input: JSON.stringify(input),
             capture_outputs: captureOutputs,
         };
-        if (tokenBudget != null) {
-            msg.token_budget = tokenBudget;
-        }
         const { ok, result } = await this._sendMsgAndWait(msg);
         if (!ok) {
             throw new Error(`Failed to launch process: ${result}`);
@@ -587,113 +571,4 @@ export class PieClient {
             throw new Error(`Ping failed: ${result}`);
         }
     }
-
-    // =========================================================================
-    // MCP
-    // =========================================================================
-
-    /**
-     * Registers an MCP server for this session.
-     *
-     * For `transport: 'stdio'`, this spawns the server process locally
-     * (Node.js only) and performs the MCP `initialize` handshake before
-     * announcing the server to the engine. All inferlets launched in
-     * this session can then discover and call into it.
-     *
-     * @param {string} name Logical name inferlets use to refer to this server.
-     * @param {Object} opts
-     * @param {string} opts.transport `'stdio'` (the only supported transport for now).
-     * @param {string} [opts.command] Executable to run (required for stdio).
-     * @param {string[]} [opts.args] Arguments to `command`.
-     * @param {string} [opts.url] Reserved for future HTTP/SSE transports.
-     */
-    async registerMcpServer(name, { transport, command, args, url } = {}) {
-        if (transport === 'stdio') {
-            if (!command) {
-                throw new Error("registerMcpServer(stdio): `command` is required");
-            }
-            try {
-                await this.mcpBridge.registerStdio(name, command, args || []);
-            } catch (e) {
-                throw new Error(`Local registration of MCP server '${name}' failed: ${e.message}`);
-            }
-        } else {
-            throw new Error(
-                `registerMcpServer: transport '${transport}' is not yet supported (only 'stdio')`,
-            );
-        }
-
-        const msg = {
-            type: 'register_mcp_server',
-            name,
-            transport,
-            command: command ?? null,
-            args: args ?? null,
-            url: url ?? null,
-        };
-        const { ok, result } = await this._sendMsgAndWait(msg);
-        if (!ok) {
-            throw new Error(`Register MCP server failed: ${result}`);
-        }
-    }
-
-    /**
-     * Forward an inbound MCP relay request to the local bridge and reply.
-     * @private
-     */
-    async _handleMcpRequest(message) {
-        const { corr_id, server_name = '', method = '', params = '{}' } = message;
-        const { ok, result } = await this._relayMcpRequest(server_name, method, params);
-        const response = {
-            type: 'mcp_response',
-            corr_id,
-            ok,
-            result,
-        };
-        try {
-            await this._sendMsg(response);
-        } catch {
-            // Connection gone — nothing to do.
-        }
-    }
-
-    /** @private */
-    async _relayMcpRequest(serverName, method, paramsStr) {
-        const server = this.mcpBridge.get(serverName);
-        if (!server) {
-            return {
-                ok: false,
-                result: _encodeMcpError(
-                    -32000,
-                    `MCP server '${serverName}' is not registered locally`,
-                ),
-            };
-        }
-        let params;
-        try {
-            params = JSON.parse(paramsStr);
-        } catch {
-            params = {};
-        }
-        try {
-            const result = await server.call(method, params);
-            return { ok: true, result: JSON.stringify(result ?? null) };
-        } catch (e) {
-            if (e instanceof JsonRpcError) {
-                return { ok: false, result: _encodeMcpError(e.code, e.message, e.data) };
-            }
-            return { ok: false, result: _encodeMcpError(-32000, String(e?.message ?? e)) };
-        }
-    }
-}
-
-/**
- * Encode a JSON-RPC error as the JSON payload the runtime expects on
- * `ok=false`.
- * @private
- */
-function _encodeMcpError(code, message, data = null) {
-    const obj = { code: code | 0, message };
-    if (data !== null && data !== undefined) obj.data = data;
-    return JSON.stringify(obj);
 }

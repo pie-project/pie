@@ -284,7 +284,7 @@ What you can run on Pie depends on three choices: the model architecture, the
 driver Pie routes inference through, and the precision and parallelism that
 driver supports for that architecture. This page is the at-a-glance matrix.
 For configuration and supported architectures of each driver, see
-[CUDA](/docs/reference/drivers/cuda) and [Portable](/docs/reference/drivers/portable).
+[CUDA](/docs/reference/drivers/cuda).
 
 ## Drivers
 
@@ -321,41 +321,6 @@ For configuration and supported architectures of each driver, see
       </div>
     </div>
   </div>
-
-  <div className="m-card first">
-
-    <h3 className="m-card-name">portable</h3>
-    <div className="m-card-desc">
-      Standalone C++ binary for local inference based on ggml.
-    </div>
-    <div className="m-spec">
-      <div className="m-spec-row">
-        <span className="m-spec-label">Hardware</span>
-        <div className="m-chips">
-          <span className="m-chip">CPU</span>
-          <span className="m-chip">Metal</span>
-          <span className="m-chip">Vulkan</span>
-        </div>
-      </div>
-      <div className="m-spec-row">
-        <span className="m-spec-label">Weights</span>
-        <div className="m-chips">
-          <span className="m-chip">bf16</span>
-          <span className="m-chip">int8</span>
-          <span className="m-chip">int4</span>
-        </div>
-      </div>
-      <div className="m-spec-row">
-        <span className="m-spec-label">Parallel</span>
-        <div className="m-chips">
-          <span className="m-chip off">TP</span>
-          <span className="m-chip">DP</span>
-          <span className="m-chip off">PP</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
 </div>
 
 ## Architecture support
@@ -373,7 +338,6 @@ For configuration and supported architectures of each driver, see
     <tr>
       <th>Architecture</th>
       <th className="c">cuda</th>
-      <th className="c">portable</th>
       <th className="c">vllm</th>
       <th className="c">sglang</th>
       <th className="c">trtllm</th>
@@ -382,14 +346,13 @@ For configuration and supported architectures of each driver, see
   </thead>
   <tbody>
 
-    <tr className="m-group"><td colSpan={7}>Qwen</td></tr>
+    <tr className="m-group"><td colSpan={6}>Qwen</td></tr>
 
     <tr>
       <td>
         <span className="m-arch-name">Qwen 2</span>
         <span className="m-arch-sub">qwen2</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -408,7 +371,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-name">Qwen 2.5</span>
         <span className="m-arch-sub">qwen2</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -431,7 +393,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">qwen3</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -452,7 +413,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">qwen3_moe</span>
       </td>
       <td className="c"><span className="m-pill partial">preview</span></td>
-      <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -469,7 +429,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">qwen3_5</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
-      <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -489,7 +448,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">qwen3_5_moe</span>
       </td>
       <td className="c"><span className="m-pill no">—</span></td>
-      <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -507,7 +465,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">qwen3_5</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
-      <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -523,7 +480,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">qwen3_5_moe</span>
       </td>
       <td className="c"><span className="m-pill no">—</span></td>
-      <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -540,7 +496,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">qwen3_vl</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
-      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -551,14 +506,13 @@ For configuration and supported architectures of each driver, see
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={7}>Llama</td></tr>
+    <tr className="m-group"><td colSpan={6}>Llama</td></tr>
 
     <tr>
       <td>
         <span className="m-arch-name">Llama 3</span>
         <span className="m-arch-sub">llama</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -575,7 +529,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-name">Llama 3.1</span>
         <span className="m-arch-sub">llama</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -594,7 +547,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">llama</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -606,14 +558,13 @@ For configuration and supported architectures of each driver, see
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={7}>Gemma</td></tr>
+    <tr className="m-group"><td colSpan={6}>Gemma</td></tr>
 
     <tr>
       <td>
         <span className="m-arch-name">Gemma 2</span>
         <span className="m-arch-sub">gemma2</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -631,7 +582,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-name">Gemma 3</span>
         <span className="m-arch-sub">gemma3, gemma3_text</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -652,7 +602,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">gemma3n, gemma3n_text</span>
       </td>
       <td className="c"><span className="m-pill no">—</span></td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -668,7 +617,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-name">Gemma 4</span>
         <span className="m-arch-sub">gemma4, gemma4_text</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -687,7 +635,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">gemma4 (with experts)</span>
       </td>
       <td className="c"><span className="m-pill no">—</span></td>
-      <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -698,7 +645,7 @@ For configuration and supported architectures of each driver, see
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={7}>GPT-OSS</td></tr>
+    <tr className="m-group"><td colSpan={6}>GPT-OSS</td></tr>
 
     <tr>
       <td>
@@ -706,7 +653,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">gpt_oss, gptoss</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
-      <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -718,7 +664,7 @@ For configuration and supported architectures of each driver, see
       </td>
     </tr>
 
-      <tr className="m-group"><td colSpan={7}>Mistral</td></tr>
+      <tr className="m-group"><td colSpan={6}>Mistral</td></tr>
 
     <tr>
       <td>
@@ -726,7 +672,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">mistral</span>
       </td>
       <td className="c"><span className="m-pill no">—</span></td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -741,7 +686,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-name">Ministral 3</span>
         <span className="m-arch-sub">mistral3</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -760,7 +704,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">mistral3</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -777,7 +720,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">mixtral</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
-      <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -789,14 +731,13 @@ For configuration and supported architectures of each driver, see
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={7}>Phi</td></tr>
+    <tr className="m-group"><td colSpan={6}>Phi</td></tr>
 
     <tr>
       <td>
         <span className="m-arch-name">Phi-3</span>
         <span className="m-arch-sub">phi3</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -814,7 +755,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">phi3small</span>
       </td>
       <td className="c"><span className="m-pill no">—</span></td>
-      <td className="c"><span className="m-pill partial">preview</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -829,7 +769,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-name">Phi-3.5 / Phi-4</span>
         <span className="m-arch-sub">phi3</span>
       </td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
@@ -849,7 +788,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">phimoe</span>
       </td>
       <td className="c"><span className="m-pill no">—</span></td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -860,7 +798,7 @@ For configuration and supported architectures of each driver, see
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={7}>OLMo</td></tr>
+    <tr className="m-group"><td colSpan={6}>OLMo</td></tr>
 
     <tr>
       <td>
@@ -868,7 +806,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">olmo2</span>
       </td>
       <td className="c"><span className="m-pill no">—</span></td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -887,7 +824,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">olmo3</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
-      <td className="c"><span className="m-pill yes">stable</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -900,7 +836,7 @@ For configuration and supported architectures of each driver, see
     </tr>
 
 
-    <tr className="m-group"><td colSpan={7}>GLM</td></tr>
+    <tr className="m-group"><td colSpan={6}>GLM</td></tr>
 
     <tr>
       <td>
@@ -908,7 +844,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">glm_moe_dsa</span>
       </td>
       <td className="c"><span className="m-pill partial">preview</span></td>
-      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -919,7 +854,7 @@ For configuration and supported architectures of each driver, see
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={7}>Nemotron</td></tr>
+    <tr className="m-group"><td colSpan={6}>Nemotron</td></tr>
 
     <tr>
       <td>
@@ -927,7 +862,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">nemotron_h</span>
       </td>
       <td className="c"><span className="m-pill yes">stable</span></td>
-      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -939,7 +873,7 @@ For configuration and supported architectures of each driver, see
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={7}>DeepSeek / Kimi</td></tr>
+    <tr className="m-group"><td colSpan={6}>DeepSeek / Kimi</td></tr>
 
     <tr>
       <td>
@@ -947,7 +881,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">deepseek_v3</span>
       </td>
       <td className="c"><span className="m-pill partial">preview</span></td>
-      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -966,7 +899,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">kimi_k2</span>
       </td>
       <td className="c"><span className="m-pill partial">preview</span></td>
-      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill up">upstream</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -978,7 +910,7 @@ For configuration and supported architectures of each driver, see
       </td>
     </tr>
 
-    <tr className="m-group"><td colSpan={7}>Sesame</td></tr>
+    <tr className="m-group"><td colSpan={6}>Sesame</td></tr>
 
     <tr>
       <td>
@@ -986,7 +918,6 @@ For configuration and supported architectures of each driver, see
         <span className="m-arch-sub">csm</span>
       </td>
       <td className="c"><span className="m-pill partial">preview</span></td>
-      <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
       <td className="c"><span className="m-pill no">—</span></td>
@@ -1004,4 +935,3 @@ For configuration and supported architectures of each driver, see
 </div>
 
 **Multimodal models.** `Qwen3-VL` (vision), `Gemma 4` (vision + audio), `Nemotron-3 Omni` (vision + audio), and `CSM` (audio output) accept or produce non-text modalities. See [Multimodal generation](/docs/guide/model/multimodal).
-

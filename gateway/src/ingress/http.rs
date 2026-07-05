@@ -20,8 +20,8 @@ use futures::Stream;
 use crate::GatewayState;
 use crate::ingress::identity;
 use crate::session::{Affinity, Identity, SessionHandle, TokenRx, TurnInput};
-use pie_schema::gateway::{Priority, Tokens};
-use pie_schema::message::ClientMessage;
+use pie_client_api::ClientMessage;
+use pie_worker_rpc::{Priority, Tokens};
 
 /// `POST /v1/generate` — one-shot generate. Body = a [`ClientMessage`] payload;
 /// response = an SSE token stream terminated by a `[DONE]` sentinel (clean) or an

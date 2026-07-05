@@ -1697,6 +1697,20 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
         bh_state[j] = __floats2bfloat162_rn(s0, s1);
     }
 
+    // COMMIT-LEN-GATED rounding (charlie, verified on the 4090): the SAME kernel
+    // serves two ops with DIFFERENT bit-exactness references:
+    //   * commit_len == nullptr (plain PREFILL, K=0 & K=2 initial): fold N fresh
+    //     tokens into a reset state. The HF reference (T0 GDN_GOLDEN) matches the
+    //     DOUBLE-round trajectory here — single-round diverges (T0 glitch, the
+    //     warp-tiled-bug signature). So plain prefill KEEPS double-round.
+    //   * commit_len != nullptr (COMMIT-ADVANCE replay [input|accepted]): must
+    //     bit-match the K=0 decode-step kernel (single bf16 round/token) so the
+    //     spec-verify is lossless → SINGLE-round (fixes T1 K=0==K=2). bravo's fix.
+    // Verified: gating → T0 HF-exact (golden) AND T1 K=0==K=2 both green; ungated
+    // single-round gave T1 green but T0 red (both glitch); double-round-only gave
+    // T0 green but T1 red. (:1625 is shared prefill+commit-advance.)
+    const bool single_round = (commit_len != nullptr);
+
     // Walk T tokens; state stays in registers.
     for (int t = 0; t < T; ++t) {
         const long long bh = (long long)(t0 + t) * V_h + h;
@@ -1713,7 +1727,9 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
         }
         __syncthreads();
 
-        // Phase 1: state *= g; accumulate kv_mem (fp32).
+        // Phase 1: accumulate kv_mem = Σ (state*g)·sk (fp32). single_round leaves
+        // bh_state untouched (Phase 2 recomputes state*g from the original);
+        // double_round re-packs the g-scaled state into bh_state (the extra round).
         float kv_mem = 0.f;
         #pragma unroll
         for (int j = 0; j < BK_MAX / 2; ++j) {
@@ -1722,15 +1738,18 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
             const int k1 = k0 + 1;
             float2 s = __bfloat1622float2(bh_state[j]);
             s.x *= g_h;
-            s.y *= g_h;
-            bh_state[j] = __floats2bfloat162_rn(s.x, s.y);
+            if (k1 < K_d) s.y *= g_h;
+            if (!single_round) bh_state[j] = __floats2bfloat162_rn(s.x, s.y);
             kv_mem += s.x * sk[k0];
             if (k1 < K_d) kv_mem += s.y * sk[k1];
         }
         const float v_t   = v[bh * V_d + v_idx];
         const float delta = (v_t - kv_mem) * beta_h;
 
-        // Phase 2: state += k*delta; accumulate out_v (fp32).
+        // Phase 2: state = state*g + k·δ, accumulate out_v (fp32). single_round
+        // recomputes state*g fresh from the ORIGINAL bh_state (one round total);
+        // double_round reloads the already-g-scaled-and-rounded bh_state from
+        // Phase 1 and adds k·δ (a second round) — matches HF for the plain prefill.
         float out_v = 0.f;
         #pragma unroll
         for (int j = 0; j < BK_MAX / 2; ++j) {
@@ -1738,11 +1757,18 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
             if (k0 >= K_d) break;
             const int k1 = k0 + 1;
             float2 s = __bfloat1622float2(bh_state[j]);
-            s.x += sk[k0] * delta;
-            if (k1 < K_d) s.y += sk[k1] * delta;
-            bh_state[j] = __floats2bfloat162_rn(s.x, s.y);
-            out_v += s.x * sq[k0];
-            if (k1 < K_d) out_v += s.y * sq[k1];
+            float sx, sy;
+            if (single_round) {
+                sx = s.x * g_h + sk[k0] * delta;
+                sy = (k1 < K_d) ? (s.y * g_h + sk[k1] * delta) : s.y;
+            } else {
+                // bh_state already holds round(state*g) from Phase 1.
+                sx = s.x + sk[k0] * delta;
+                sy = (k1 < K_d) ? (s.y + sk[k1] * delta) : s.y;
+            }
+            bh_state[j] = __floats2bfloat162_rn(sx, sy);
+            out_v += sx * sq[k0];
+            if (k1 < K_d) out_v += sy * sq[k1];
         }
         out[bh * V_d + v_idx] = out_v;
         __syncthreads();

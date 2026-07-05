@@ -45,6 +45,22 @@ bool decode_full_attention_variant_enabled() {
     return enabled;
 }
 
+// Bug#2 A/B: the fused decode QKV+qk-norm+rope+KV-write kernel
+// (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode
+// suspect (the standalone BatchDecode attention is proven per-request-correct,
+// so the corruption is upstream in KV/Q production). PIE_CUDA_DECODE_FUSED_POST=0
+// falls back to the non-fused split-qkv + separate rope + `write_kv_to_pages`
+// (the verified `resolve_dst` path). If the fleet goes 8/8 with it off, the
+// fused kernel is the bug. Default on.
+bool decode_fused_post_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_CUDA_DECODE_FUSED_POST");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
 inline void apply_rope(
     const LlamaLikeForwardCfg& fwd_cfg,
     const HfConfig& cfg,
@@ -261,6 +277,9 @@ void llama_like_forward_paged(
     bool tp_greedy_argmax,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
+    const std::uint32_t* w_page_d,
+    const std::uint32_t* w_off_d,
+    bool has_write_desc,
     const LlamaLikeVisionInputs* vision)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
@@ -324,10 +343,21 @@ void llama_like_forward_paged(
     // flashinfer's decode dispatch table; for those we run the prefill
     // kernel even for qo_len==1 batches. The runtime decision lives in
     // a single bool: anything past the plan_attention call uses it.
+    // Beam / custom-mask decode (SEAM-1, overview §6.2): a decode-shaped batch
+    // (qo_len==1/req) that carries a per-cell custom mask cannot use the decode
+    // or xqa kernels — they have no per-cell mask (fork-freeze needs a mid-page
+    // hole in a non-last page). Route it through the custom-mask prefill path
+    // (the `else if (custom_mask_d)` branch below). Disabling `use_decode_path`
+    // ALSO disables the fused decode qkv-postproc (below), so the per-beam KV
+    // write goes through `launch_write_kv_to_pages`, whose page-run derivation
+    // (abs_kv_pos = klen-1) lands each beam's new token on (last live page,
+    // last_page_len-1) = the correct freeze/heir write target.
+    const bool has_custom_mask = (custom_mask_d != nullptr);
     const bool use_xqa_decode_path =
-        is_pure_decode && plan_state.use_xqa_decode;
+        is_pure_decode && !has_custom_mask && plan_state.use_xqa_decode;
     const bool use_decode_path =
-        is_pure_decode && (!fwd_cfg.force_prefill_path || use_xqa_decode_path);
+        is_pure_decode && !has_custom_mask &&
+        (!fwd_cfg.force_prefill_path || use_xqa_decode_path);
     const bool use_prefill_decode_path =
         use_decode_path && !use_xqa_decode_path &&
         plan_state.use_prefill_decode_plan;
@@ -392,7 +422,9 @@ void llama_like_forward_paged(
                                    !ws.qkv_fused.empty();
         const bool fused_decode_qkv_post =
             use_fused_qkv &&
+            decode_fused_post_enabled() &&
             is_pure_decode &&
+            !has_custom_mask &&
             native_bf16_kv_cache &&
             !head_dim_padded &&
             !fwd_cfg.use_qkv_bias &&
@@ -541,6 +573,21 @@ void llama_like_forward_paged(
         auto kv_view = cache.layer_view(L);
         if (fused_decode_qkv_post) {
             // Already written by launch_qkv_decode_qk_norm_rope_write_kv_bf16.
+        } else if (has_write_desc) {
+            // B2: explicit-descriptor KV write. Each query TOKEN writes its new
+            // K/V into the program-supplied (physical page id `w_page_d[c]`,
+            // offset `w_off_d[c]`) target — the WSlot/WOff lowering — rather than
+            // re-deriving the position from the page table + last_page_len. Beam
+            // fork/freeze correctness: a frozen fork's cell is not overwritten (a
+            // sibling's mask hides it). The write count is the number of query
+            // TOKENS N: a decode-shaped fire has N==R (one new token per lane); a
+            // variable-length prompt PREFILL has one lane (R==1) but N>1 tokens,
+            // so N (not R) cells must be written from `attn_k`/`attn_v` [N,·] and
+            // the N-entry WSlot/WOff descriptor.
+            kernels::launch_write_kv_explicit_bf16(
+                kv_view,
+                const_cast<void*>(attn_k), const_cast<void*>(attn_v),
+                w_page_d, w_off_d, N, stream);
         } else {
             kernels::launch_write_kv_to_pages(
                 kv_view,
@@ -838,7 +885,17 @@ void llama_like_forward_paged(
                 lm_head_input = ws.norm_y.data();
             }
             lm_head_rows = num_logit_rows;
-        } else if (!have_final_norm) {
+        } else {
+            // Full [N,V] emit (the PTIR `intrinsics::logits()` path). ALWAYS
+            // recompute the final norm from `ws.y` here — do NOT fall through to
+            // the `have_final_norm ? final_norm_buf` default. `final_norm_buf`
+            // (the TP fused-AR's `ws.norm_y`) is only guaranteed live on the
+            // fused greedy-argmax path that consumes it immediately; on the
+            // full-logits emit it can be stale/overwritten, so a PTIR stage-runner
+            // reading these logits saw garbage (§6.2: 19148 vs 14582). `ws.y` is
+            // the full pre-norm hidden (the fused-AR updates it in place via
+            // `residual_inout`), so `rmsnorm(ws.y)` reproduces the correct
+            // final-normed activation the fused path uses.
             kernels::launch_rmsnorm_bf16(
                 ws.y.data(), w.final_norm->data(), ws.norm_y.data(),
                 N, H, eps, stream);

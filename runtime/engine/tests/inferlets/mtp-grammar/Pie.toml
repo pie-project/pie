@@ -1,0 +1,10 @@
+[package]
+name = "mtp-grammar"
+version = "0.1.0"
+description = "Overview §6.1 native-MTP + grammar in ONE forward: SDK-authored spec-verify over intrinsics::mtp_logits drafts under a grammar mask. The M3-G1 real §6.1 pass."
+authors = ["In Gim <in.gim@icloud.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]

@@ -11,11 +11,11 @@ Embed `pie serve` inside a Python script:
     cfg = Config(
         server=ServerConfig(port=0),     # 0 = auto-pick a free port
         auth=AuthConfig(enabled=False),
-        models=[ModelConfig(
+        model=ModelConfig(
             name="default",
             hf_repo="Qwen/Qwen3-0.6B",
             driver=DriverConfig(type="dev", device=["cuda:0"]),
-        )],
+        ),
     )
 
     async def main():

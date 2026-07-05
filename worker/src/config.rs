@@ -1,17 +1,18 @@
 //! Pie standalone server config — TOML schema mirror of `pie.config`.
 //!
 //! Same TOML the legacy Python server consumed. Embedded drivers
-//! ([`DriverKind::Portable`] / [`DriverKind::CudaNative`] / [`DriverKind::Dummy`])
+//! ([`DriverKind::CudaNative`] / [`DriverKind::Metal`] / [`DriverKind::Dummy`])
 //! are dispatched in [`crate::serve::start_engine`] via
 //! [`crate::serve::topology::resolve_flavor`].
 //!
 //! The Rust [`Config`] type below is the user-facing TOML schema; the
-//! conversion to `pie::bootstrap::Config` (the runtime's own config)
-//! happens in [`crate::bootstrap_translate`].
+//! conversion to `pie_engine::bootstrap::Config` (the runtime's own config)
+//! happens in [`crate::translate`].
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
+use pie_controller_rpc::Role;
 use serde::{Deserialize, Serialize};
 
 // -----------------------------------------------------------------------------
@@ -29,53 +30,73 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
-    /// `[[model]]` array — at least one entry required. The first entry
-    /// is the implicit default for inferlets that don't pin a model.
-    #[serde(default, rename = "model")]
-    pub models: Vec<ModelConfig>,
+    /// Distributed-cluster topology (controller + role + gateways). Absent, or
+    /// `controller` unset ⇒ single-node (gateway-free local inference).
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+    /// The single `[model]` table. Pie serves exactly one model.
+    pub model: ModelConfig,
 }
 
 impl Config {
-    pub fn from_toml_file(path: &std::path::Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path:?}: {e}"))?;
-        let cfg: Config =
-            toml::from_str(&text).map_err(|e| anyhow::anyhow!("parse {path:?}: {e}"))?;
+    /// Parse a TOML config string into a validated [`Config`]. **Pure**: no file
+    /// IO, no env, no clap — sourcing the string (file locate/read + env merge)
+    /// is the bootstrap/bin layer's job (Seam 2). The role lib owns only the
+    /// domain parse + validation.
+    pub fn parse(s: &str) -> Result<Self> {
+        let cfg: Config = toml::from_str(s).map_err(|e| {
+            if s.contains("[[model]]") {
+                anyhow::anyhow!(
+                    "parse config: {e}\n\
+                     hint: pie serves exactly one model — use a single `[model]` table, \
+                     not a `[[model]]` list."
+                )
+            } else {
+                anyhow::anyhow!("parse config: {e}")
+            }
+        })?;
         cfg.validate()?;
         Ok(cfg)
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.models.is_empty(),
-            "at least one [[model]] section is required"
-        );
-
-        let mut seen = std::collections::HashSet::new();
-        for m in &self.models {
-            ensure!(
-                seen.insert(m.name.clone()),
-                "duplicate [[model]] name {:?}",
-                m.name
-            );
-            m.validate()?;
-        }
-
-        // Disjoint device check — same constraint as pie/config.py.
-        let mut owner: std::collections::HashMap<String, String> = Default::default();
-        for m in &self.models {
-            for d in &m.driver.device {
-                if let Some(prev) = owner.insert(d.clone(), m.name.clone()) {
-                    bail!(
-                        "device {d:?} claimed by both model {prev:?} and {:?}",
-                        m.name
-                    );
-                }
-            }
-        }
-
+        self.model.validate()?;
         self.server.validate()?;
         self.runtime.validate()?;
+        self.cluster.validate()?;
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// [cluster]
+// -----------------------------------------------------------------------------
+
+/// Distributed-cluster topology. Absent, or `controller` unset ⇒ single-node
+/// (the worker terminates clients directly; no controller/gateway).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterConfig {
+    /// Controller endpoint (`tcp://host:port`, a bare `host:port`, or
+    /// `unix:/path`); set ⇒ this worker joins a distributed cluster.
+    #[serde(default)]
+    pub controller: Option<String>,
+    /// This worker's role (required when `controller` is set).
+    #[serde(default)]
+    pub role: Option<Role>,
+    /// Gateway endpoint(s) this worker dials INTO (M3 inversion; distributed).
+    #[serde(default)]
+    pub gateways: Vec<String>,
+}
+
+impl ClusterConfig {
+    fn validate(&self) -> Result<()> {
+        if self.controller.is_some() {
+            ensure!(
+                self.role.is_some(),
+                "[cluster] role is required when controller is set"
+            );
+        }
         Ok(())
     }
 }
@@ -251,8 +272,8 @@ impl RuntimeConfig {
 }
 
 fn default_worker_threads() -> usize {
-    // Cap at 64 — pie's scheduler + chain-ext pool produces ~20-30
-    // active tokio tasks at conc=256. Beyond ~64 workers the runtime's
+    // Cap at 64 — pie's scheduler produces enough concurrent host work
+    // at high request concurrency. Beyond ~64 workers the runtime's
     // scheduling overhead (queue management, wake propagation) starts
     // adding variance without adding parallelism. Measured on AMD EPYC
     // 7773X (256 threads visible): tok/s mean +0.5%, stdev cut to ~1/3
@@ -282,7 +303,7 @@ fn default_max_upload_mb() -> usize {
 }
 
 // -----------------------------------------------------------------------------
-// [[model]]
+// [model]
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -314,44 +335,17 @@ impl ModelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
-    #[serde(default = "default_batch_policy")]
-    pub batch_policy: String,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
-    #[serde(default)]
-    pub default_token_limit: Option<usize>,
-    #[serde(default = "default_endowment_pages")]
-    pub default_endowment_pages: usize,
-    #[serde(default = "default_oversubscription_factor")]
-    pub admission_oversubscription_factor: f64,
     #[serde(default = "default_restore_pause_at_utilization")]
     pub restore_pause_at_utilization: f64,
-    /// Per-context depth of pass-level speculative execution.
-    /// `0` disables speculation entirely (every submit goes
-    /// through the cold path). `1` is the piggyback path —
-    /// one staged pass pre-fired per real pass. Higher values
-    /// let chain firing overlap with the inferlet's WASM time
-    /// (see SPECULATIVE_EXECUTION_DESIGN.md phase B4b.3). The
-    /// eventual ceiling is page-boundary-limited. Valid range:
-    /// 0..=64. Default 1.
-    #[serde(default = "default_speculation_depth")]
-    pub speculation_depth: u32,
-}
-
-fn default_speculation_depth() -> u32 {
-    1
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            batch_policy: default_batch_policy(),
             request_timeout_secs: default_request_timeout_secs(),
-            default_token_limit: None,
-            default_endowment_pages: default_endowment_pages(),
-            admission_oversubscription_factor: default_oversubscription_factor(),
             restore_pause_at_utilization: default_restore_pause_at_utilization(),
-            speculation_depth: default_speculation_depth(),
         }
     }
 }
@@ -359,50 +353,19 @@ impl Default for SchedulerConfig {
 impl SchedulerConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
-            matches!(self.batch_policy.as_str(), "adaptive" | "eager" | "greedy"),
-            "scheduler.batch_policy must be one of 'adaptive' | 'eager' | 'greedy' (got {:?})",
-            self.batch_policy
-        );
-        ensure!(
             self.request_timeout_secs > 0,
             "scheduler.request_timeout_secs must be > 0"
-        );
-        if let Some(n) = self.default_token_limit {
-            ensure!(n > 0, "scheduler.default_token_limit must be > 0 if set");
-        }
-        ensure!(
-            self.default_endowment_pages > 0,
-            "scheduler.default_endowment_pages must be > 0"
-        );
-        ensure!(
-            self.admission_oversubscription_factor > 0.0
-                && self.admission_oversubscription_factor.is_finite(),
-            "scheduler.admission_oversubscription_factor must be finite > 0"
         );
         ensure!(
             self.restore_pause_at_utilization > 0.0 && self.restore_pause_at_utilization <= 1.0,
             "scheduler.restore_pause_at_utilization must be in (0.0, 1.0]"
         );
-        ensure!(
-            self.speculation_depth <= 64,
-            "scheduler.speculation_depth must be in 0..=64 (got {}); 0 disables speculation",
-            self.speculation_depth
-        );
         Ok(())
     }
 }
 
-fn default_batch_policy() -> String {
-    "adaptive".to_string()
-}
 fn default_request_timeout_secs() -> u64 {
     120
-}
-fn default_endowment_pages() -> usize {
-    64
-}
-fn default_oversubscription_factor() -> f64 {
-    4.0
 }
 fn default_restore_pause_at_utilization() -> f64 {
     0.85
@@ -417,8 +380,8 @@ fn default_restore_pause_at_utilization() -> f64 {
 #[allow(dead_code)] // forwarded to the embedded driver via TOML; not all
 // fields are read on the Rust side yet.
 pub struct DriverConfig {
-    /// Driver discriminator. Embedded drivers (`portable`,
-    /// `cuda_native`, `dummy`) run in-process.
+    /// Driver discriminator. Embedded drivers (`cuda_native`,
+    /// `metal`, `dummy`) run in-process.
     #[serde(rename = "type")]
     pub kind: DriverKind,
     /// Single string or list of strings — both accepted on input.
@@ -430,17 +393,6 @@ pub struct DriverConfig {
     pub activation_dtype: String,
     #[serde(default = "default_random_seed")]
     pub random_seed: u64,
-    /// IPC wait profile. When omitted, CUDA defaults to `latency`;
-    /// other drivers default to the hybrid `balanced` path.
-    /// `power` parks immediately whenever no work is ready.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipc_profile: Option<IpcProfile>,
-    /// Expert override for the profile's busy-spin window, in µs.
-    ///
-    /// Leave unset for the profile default. `0` parks immediately;
-    /// larger values trade CPU for lower wake latency.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spin_budget_us: Option<u64>,
     /// Driver-specific knobs. Embedded drivers parse this into typed
     /// option structs.
     #[serde(default)]
@@ -448,39 +400,12 @@ pub struct DriverConfig {
 }
 
 impl DriverConfig {
-    pub fn effective_ipc_profile(&self) -> IpcProfile {
-        self.ipc_profile.unwrap_or(match self.kind {
-            DriverKind::CudaNative => IpcProfile::Latency,
-            _ => IpcProfile::Balanced,
-        })
-    }
-
-    pub fn effective_spin_budget_us(&self) -> u64 {
-        self.spin_budget_us
-            .unwrap_or_else(|| self.effective_ipc_profile().default_spin_budget_us())
-    }
-
-    pub fn use_inproc_polling_channel(&self) -> bool {
-        self.effective_ipc_profile() == IpcProfile::Latency
-    }
-
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.device.is_empty(),
             "model.driver.device must be non-empty"
         );
         match self.kind {
-            DriverKind::Portable => {
-                let opts: PortableDriverOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [model.driver.options] for driver type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
-                validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
-            }
             DriverKind::CudaNative => {
                 let opts: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
                     .try_into()
@@ -491,6 +416,17 @@ impl DriverConfig {
                         )
                     })?;
                 opts.validate()?;
+                validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
+            }
+            DriverKind::Metal => {
+                let opts: MetalDriverOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [model.driver.options] for driver type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
                 validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
             DriverKind::Dummy => {
@@ -529,49 +465,26 @@ fn validate_kv_cache_dtype(value: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum IpcProfile {
-    /// Lowest wake latency. Uses the polling in-process channel for
-    /// embedded drivers and unbounded busy-spin for shmem drivers
-    /// unless `spin_budget_us` overrides it.
-    Latency,
-    /// Hybrid spin-then-park path. Good default for GPU-bound work.
-    #[default]
-    Balanced,
-    /// Park immediately after an empty poll. Minimizes idle CPU.
-    Power,
-}
-
-impl IpcProfile {
-    pub fn default_spin_budget_us(self) -> u64 {
-        match self {
-            Self::Latency => u64::MAX,
-            Self::Balanced => default_spin_budget_us(),
-            Self::Power => 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
-    /// Portable ggml driver — embedded as a static lib in `pie-worker`.
-    Portable,
     /// Native CUDA driver — embedded as a static lib in `pie-worker`
     /// (requires `--features driver-cuda`).
     CudaNative,
     /// Rust dummy driver — random tokens, no model load. Always
     /// embedded in `pie-worker`.
     Dummy,
+    /// Native MLX + Metal driver for Apple Silicon — embedded as a static
+    /// lib in `pie-worker` (requires `--features driver-metal`, macOS only).
+    Metal,
 }
 
 impl DriverKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            DriverKind::Portable => "portable",
             DriverKind::CudaNative => "cuda_native",
             DriverKind::Dummy => "dummy",
+            DriverKind::Metal => "metal",
         }
     }
 }
@@ -585,12 +498,6 @@ fn default_activation_dtype() -> String {
 fn default_random_seed() -> u64 {
     42
 }
-/// Default busy-spin budget (µs) before the driver-side channel falls
-/// back to parking. Matches `pie::driver::InProcChannel::new()`.
-fn default_spin_budget_us() -> u64 {
-    1_000
-}
-
 /// Accept either a single string or a list of strings, matching
 /// `pie/config.py::_parse_driver`'s `device` handling.
 fn deserialize_string_or_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
@@ -627,11 +534,13 @@ where
 // Driver-specific options (typed views over `DriverConfig::options`)
 // -----------------------------------------------------------------------------
 
-/// `[model.driver.options]` for `type = "portable"`.
-/// Mirrors `pie/src/pie_driver_portable/config.py::PortableDriverConfig`.
+/// `[model.driver.options]` for `type = "metal"` (Apple Silicon MLX/Metal
+/// driver) — page geometry, forward limits, and timeouts; the metal driver
+/// speaks the embedded in-process ABI. `device` is the `metal:N` selector
+/// filled from `model.driver.device`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct PortableDriverOptions {
+pub struct MetalDriverOptions {
     pub kv_page_size: u32,
     pub total_pages: u32,
     pub max_forward_tokens: u32,
@@ -644,12 +553,12 @@ pub struct PortableDriverOptions {
     pub verbose: bool,
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
-    /// Ignored in standalone (binary is statically linked); accepted
-    /// for config compatibility with the Python wrapper path.
+    /// Accepted for config compatibility; ignored (the metal driver is a
+    /// statically-linked lib, no separate executable to discover).
     pub binary_path: String,
 }
 
-impl Default for PortableDriverOptions {
+impl Default for MetalDriverOptions {
     fn default() -> Self {
         Self {
             kv_page_size: 32,
@@ -658,7 +567,7 @@ impl Default for PortableDriverOptions {
             max_forward_requests: 512,
             cpu_pages: 0,
             kv_cache_dtype: "auto".to_string(),
-            device: "auto".to_string(),
+            device: "metal:0".to_string(),
             verbose: false,
             ready_timeout_s: 120.0,
             shutdown_timeout_s: 5.0,
@@ -668,7 +577,7 @@ impl Default for PortableDriverOptions {
 }
 
 /// `[model.driver.options]` for `type = "dummy"`. The dummy driver
-/// fabricates everything the portable driver would otherwise read from
+/// fabricates everything a real driver would otherwise read from
 /// model weights — `vocab_size` and `arch_name` are required because no
 /// safe default exists. Page geometry and timeouts have generic defaults;
 /// the driver derives its synthetic KV page pool from these limits.
@@ -712,6 +621,11 @@ pub struct CudaNativeDriverOptions {
     pub kv_page_size: u32,
     pub kv_cache_dtype: String,
     pub swap_pool_size: u32,
+    /// Optional HARD cap on the runtime KV page count (0 = derive from
+    /// `gpu_mem_utilization`). >0 forces a tiny deterministic pool for
+    /// contention/preempt tests + CI, independent of the forward-layout floor.
+    /// Mirrors the metal driver's `total_pages`.
+    pub total_pages: u32,
     pub weight_dtype: String,
     /// CUDA device string, e.g. `"cuda:0"`. Populated by the caller
     /// from `model.driver.device`; set on the C++ side via
@@ -767,6 +681,7 @@ impl Default for CudaNativeDriverOptions {
             kv_page_size: 32,
             kv_cache_dtype: "auto".to_string(),
             swap_pool_size: 0,
+            total_pages: 0,
             weight_dtype: "bfloat16".to_string(),
             device: String::new(),
             verbose: false,
@@ -819,113 +734,34 @@ impl CudaNativeDriverOptions {
 mod tests {
     use super::*;
 
-    const MINIMAL_PORTABLE: &str = r#"
-[[model]]
+    const MINIMAL_METAL: &str = r#"
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.driver]
-type = "portable"
+type = "metal"
 device = ["cpu"]
 "#;
 
     #[test]
-    fn parses_minimal_portable_config() {
-        let cfg: Config = toml::from_str(MINIMAL_PORTABLE).unwrap();
+    fn parses_minimal_metal_config() {
+        let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.models.len(), 1);
-        assert_eq!(cfg.models[0].driver.kind, DriverKind::Portable);
-        assert_eq!(cfg.models[0].driver.device, vec!["cpu".to_string()]);
-        assert_eq!(
-            cfg.models[0].driver.effective_ipc_profile(),
-            IpcProfile::Balanced
-        );
-        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 1_000);
+        assert_eq!(cfg.model.driver.kind, DriverKind::Metal);
+        assert_eq!(cfg.model.driver.device, vec!["cpu".to_string()]);
         assert_eq!(cfg.server.port, 8080);
     }
 
     #[test]
-    fn cuda_tp_defaults_to_latency_ipc() {
-        let text = r#"
-[[model]]
-name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
-
-[model.driver]
-type = "cuda_native"
-device = ["cuda:0"]
-tensor_parallel_size = 2
-
-[model.driver.options]
-gpu_mem_utilization = 0.90
-memory_profile = "balanced"
-"#;
-        let cfg: Config = toml::from_str(text).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(
-            cfg.models[0].driver.effective_ipc_profile(),
-            IpcProfile::Latency
-        );
-        assert!(cfg.models[0].driver.use_inproc_polling_channel());
-    }
-
-    #[test]
-    fn cuda_single_rank_defaults_to_latency_ipc() {
-        let text = r#"
-[[model]]
-name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
-
-[model.driver]
-type = "cuda_native"
-device = ["cuda:0"]
-
-[model.driver.options]
-gpu_mem_utilization = 0.90
-memory_profile = "balanced"
-"#;
-        let cfg: Config = toml::from_str(text).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(
-            cfg.models[0].driver.effective_ipc_profile(),
-            IpcProfile::Latency
-        );
-        assert!(cfg.models[0].driver.use_inproc_polling_channel());
-    }
-
-    #[test]
-    fn cuda_latency_profile_defaults_to_latency_ipc() {
-        let text = r#"
-[[model]]
-name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
-
-[model.driver]
-type = "cuda_native"
-device = ["cuda:0"]
-
-[model.driver.options]
-gpu_mem_utilization = 0.90
-memory_profile = "latency"
-"#;
-        let cfg: Config = toml::from_str(text).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(
-            cfg.models[0].driver.effective_ipc_profile(),
-            IpcProfile::Latency
-        );
-        assert!(cfg.models[0].driver.use_inproc_polling_channel());
-    }
-
-    #[test]
-    fn rejects_legacy_portable_kv_page_knob() {
+    fn rejects_legacy_metal_kv_page_knob() {
         let stale = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.driver]
-type = "portable"
+type = "metal"
 device = ["cpu"]
 
 [model.driver.options]
@@ -939,7 +775,7 @@ max_num_kv_pages = 1024
     #[test]
     fn rejects_legacy_dummy_kv_page_knob() {
         let stale = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
@@ -960,10 +796,6 @@ max_num_kv_pages = 1024
     #[test]
     fn rejects_public_driver_capacity_knobs() {
         for (ty, key) in [
-            ("portable", "total_pages"),
-            ("portable", "cpu_pages"),
-            ("portable", "max_forward_tokens"),
-            ("portable", "max_forward_requests"),
             ("dummy", "max_forward_tokens"),
             ("dummy", "max_forward_requests"),
             ("dummy", "max_model_len"),
@@ -974,7 +806,7 @@ max_num_kv_pages = 1024
             }
             options.push_str(&format!("{key} = 1\n"));
             let text = format!(
-                "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
+                "[model]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
                  type = \"{ty}\"\ndevice = [\"cpu\"]\n[model.driver.options]\n{options}"
             );
             let cfg: Config = toml::from_str(&text).unwrap();
@@ -987,82 +819,44 @@ max_num_kv_pages = 1024
     }
 
     #[test]
-    fn parses_ipc_profiles_and_spin_override() {
-        let latency = r#"
-[[model]]
-name = "m"
-hf_repo = "x"
-[model.driver]
-type = "portable"
-device = "cpu"
-ipc_profile = "latency"
-"#;
-        let cfg: Config = toml::from_str(latency).unwrap();
-        assert_eq!(cfg.models[0].driver.ipc_profile, Some(IpcProfile::Latency));
-        assert!(cfg.models[0].driver.use_inproc_polling_channel());
-        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), u64::MAX);
-
-        let power = r#"
-[[model]]
-name = "m"
-hf_repo = "x"
-[model.driver]
-type = "portable"
-device = "cpu"
-ipc_profile = "power"
-"#;
-        let cfg: Config = toml::from_str(power).unwrap();
-        assert_eq!(cfg.models[0].driver.ipc_profile, Some(IpcProfile::Power));
-        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 0);
-
-        let override_spin = r#"
-[[model]]
-name = "m"
-hf_repo = "x"
-[model.driver]
-type = "portable"
-device = "cpu"
-ipc_profile = "latency"
-spin_budget_us = 25
-"#;
-        let cfg: Config = toml::from_str(override_spin).unwrap();
-        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 25);
-    }
-
-    #[test]
     fn device_string_or_list() {
         let one = r#"
-[[model]]
+[model]
 name = "m"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "metal"
 device = "cuda:0"
 "#;
         let cfg: Config = toml::from_str(one).unwrap();
-        assert_eq!(cfg.models[0].driver.device, vec!["cuda:0".to_string()]);
+        assert_eq!(cfg.model.driver.device, vec!["cuda:0".to_string()]);
     }
 
     #[test]
-    fn rejects_duplicate_devices() {
-        let dup = r#"
+    fn rejects_legacy_multi_model_list() {
+        // The old `[[model]]` array form is gone: pie serves exactly one
+        // model. Parsing must fail with a comprehensible hint rather than a
+        // raw serde type error.
+        let legacy = r#"
 [[model]]
 name = "a"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "metal"
 device = ["cuda:0"]
 
 [[model]]
 name = "b"
 hf_repo = "y"
 [model.driver]
-type = "portable"
-device = ["cuda:0"]
+type = "metal"
+device = ["cuda:1"]
 "#;
-        let cfg: Config = toml::from_str(dup).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("claimed by both"), "got: {err}");
+        let err = Config::parse(legacy).unwrap_err().to_string();
+        assert!(
+            err.contains("exactly one") && err.contains("[[model]]"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1070,11 +864,11 @@ device = ["cuda:0"]
         let bad = r#"
 nonsense = true
 
-[[model]]
+[model]
 name = "m"
 hf_repo = "x"
 [model.driver]
-type = "portable"
+type = "metal"
 device = ["cpu"]
 "#;
         assert!(toml::from_str::<Config>(bad).is_err());
@@ -1083,7 +877,7 @@ device = ["cpu"]
     #[test]
     fn parses_cuda_native_config() {
         let cuda = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
@@ -1101,9 +895,8 @@ mtp_num_drafts = 6
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.models[0].driver.kind, DriverKind::CudaNative);
-        let opts: CudaNativeDriverOptions =
-            cfg.models[0].driver.options.clone().try_into().unwrap();
+        assert_eq!(cfg.model.driver.kind, DriverKind::CudaNative);
+        let opts: CudaNativeDriverOptions = cfg.model.driver.options.clone().try_into().unwrap();
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
         assert_eq!(opts.runtime_quant, "fp8");
@@ -1118,7 +911,7 @@ mtp_num_drafts = 6
     #[test]
     fn cuda_native_options_default_when_omitted() {
         let cuda = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
@@ -1128,8 +921,7 @@ device = ["cuda:0"]
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
-        let opts: CudaNativeDriverOptions =
-            cfg.models[0].driver.options.clone().try_into().unwrap();
+        let opts: CudaNativeDriverOptions = cfg.model.driver.options.clone().try_into().unwrap();
         assert_eq!(opts.swap_pool_size, 0);
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Auto);
@@ -1143,7 +935,7 @@ device = ["cuda:0"]
     #[test]
     fn rejects_invalid_embedded_kv_cache_dtype() {
         let bad = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
@@ -1164,7 +956,7 @@ kv_cache_dtype = "turboquant"
     #[test]
     fn rejects_invalid_cuda_memory_profile() {
         let cuda = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
@@ -1184,7 +976,7 @@ memory_profile = "aggressive"
     #[test]
     fn rejects_unknown_cuda_option() {
         let cuda = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
@@ -1203,7 +995,7 @@ manual_capacity = 1
     #[test]
     fn rejects_invalid_cuda_mxfp4_policy() {
         let cuda = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "openai/gpt-oss-20b"
 
@@ -1222,7 +1014,7 @@ mxfp4_moe = "mystery"
     #[test]
     fn rejects_options_for_wrong_embedded_driver_type() {
         let stale = r#"
-[[model]]
+[model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 

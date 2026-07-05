@@ -15,8 +15,8 @@ on:
         description: "Release tag to update (assets uploaded with --clobber)"
         type: string
         default: "nightly"
-      portable:
-        description: "Build portable matrix (Linux x86_64/aarch64 Vulkan + macOS arm64 Metal + Windows x86_64 Vulkan/CUDA)"
+      desktop:
+        description: "Build the desktop GPU artifacts (macOS arm64 Metal + Windows x86_64 native CUDA)"
         type: boolean
         default: true
       cuda_manylinux:
@@ -41,7 +41,7 @@ jobs:
   # the rolling build out of GitHub's "Latest" release slot.
   # =========================================================================
   prepare-release:
-    if: inputs.portable || inputs.cuda_manylinux
+    if: inputs.desktop || inputs.cuda_manylinux
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -74,182 +74,59 @@ jobs:
           fi
 
   # =========================================================================
-  # Portable matrix — Linux/Windows Vulkan, macOS Metal, plus Windows
-  # portable CUDA. Runs on the larger org runners wherever they exist.
+  # Desktop GPU artifacts — macOS arm64 (Metal) + Windows x86_64 (native
+  # CUDA). The Linux CUDA artifacts come from the cuda-manylinux job below.
   # =========================================================================
-  portable:
-    if: inputs.portable
+  desktop:
+    if: inputs.desktop
     needs: prepare-release
-    name: portable / ${{ matrix.target.label }}
+    name: desktop / ${{ matrix.target.label }}
     strategy:
       fail-fast: false
       matrix:
         target:
-          # Linux portable artifacts ship the Vulkan ggml backend (works on
-          # NVIDIA/AMD/Intel GPUs). Built directly on the larger Ubuntu
-          # runners — NOT in a manylinux container — because ggml-vulkan
-          # hard-requires `glslc` (find_package(Vulkan COMPONENTS glslc)),
-          # which Rocky 8 / manylinux_2_28 doesn't package but Ubuntu 24.04+
-          # does. glibc floor is therefore the runner's Ubuntu (>= 2.39),
-          # acceptable for a GPU artifact.
-          - label: x86_64-linux-vulkan
-            runner: ubuntu-large-x64
-            container: ""
-            platform: linux
-            triple: x86_64-unknown-linux-gnu
-            archive: tar.gz
-            backend: vulkan
-            backend_env: "PIE_PORTABLE_VULKAN=1"
-          - label: aarch64-linux-vulkan
-            runner: ubuntu-large-arm64
-            container: ""
-            platform: linux
-            triple: aarch64-unknown-linux-gnu
-            archive: tar.gz
-            backend: vulkan
-            backend_env: "PIE_PORTABLE_VULKAN=1"
           - label: aarch64-macos-metal
             # macos-15 gets Xcode 16 with libc++ 17, which has
             # `std::atomic_ref` (C++20). macos-14's Xcode 15.4 ships
             # libc++ 15, which doesn't.
             runner: macos-15
-            container: ""
             platform: macos
             triple: aarch64-apple-darwin
             archive: tar.gz
             backend: metal
-            backend_env: "PIE_PORTABLE_METAL=1"
-          - label: x86_64-windows-vulkan
-            runner: windows-large-x64
-            container: ""
-            platform: windows
-            triple: x86_64-pc-windows-msvc
-            archive: zip
-            backend: vulkan
-            backend_env: "PIE_PORTABLE_VULKAN=1"
+            features: driver-metal,driver-dummy
           - label: x86_64-windows-cuda
             runner: windows-large-x64
-            container: ""
             platform: windows
             triple: x86_64-pc-windows-msvc
             archive: zip
             backend: cuda
-            backend_env: "PIE_PORTABLE_CUDA=1"
-            # ggml-cuda compiles many template instances slowly with nvcc.
-            # Build one real+PTX arch; the PTX keeps the artifact
+            features: driver-cuda,driver-dummy
+            # nvcc builds one real+PTX arch; the PTX keeps the artifact
             # forward-JIT-able on newer NVIDIA GPUs.
             cuda_arch: "75"
     runs-on: ${{ matrix.target.runner }}
-    container: ${{ matrix.target.container || '' }}
     env:
       ARTIFACT_NAME: pie-${{ matrix.target.label }}.${{ matrix.target.archive }}
     steps:
       - uses: actions/checkout@v6
 
-      # manylinux containers ship gcc + cmake + ninja but no rust.
-      # We dnf-install:
-      #   - `openssl-devel` + `pkg-config`: for `openssl-sys` (reqwest's
-      #     default features).
-      #   - `perl`: openssl-sys build script's vendored fallback.
-      #   - `gcc-toolset-14-gcc(-c++)`: needed for libstdc++ 14, which
-      #     ships <span> and other C++20 headers driver/portable's
-      #     source uses. The container's stock gcc-8 / libstdc++-8
-      #     is missing them.
-      #
-      # Then we pin CC/CXX explicitly to the toolset's binaries —
-      # without that, cmake-rs picks `/opt/clang/bin/cc` (also on
-      # PATH inside the manylinux image) and we lose the libstdc++ 14
-      # come link time.
-      - name: Install build deps + rustup (manylinux only)
-        if: startsWith(matrix.target.container, 'quay.io/pypa/manylinux')
-        shell: bash
-        run: |
-          set -euxo pipefail
-          dnf install -y --setopt=install_weak_deps=False \
-            openssl-devel pkg-config perl git \
-            gcc-toolset-14-gcc gcc-toolset-14-gcc-c++
-          # GitHub CLI — used by the upload step. The manylinux image
-          # doesn't ship `gh` and the upload step's --clobber flow has
-          # no clean curl equivalent. `gh` rpm depends on `git`,
-          # installed above.
-          dnf install -y 'dnf-command(config-manager)'
-          dnf config-manager --add-repo \
-            https://cli.github.com/packages/rpm/gh-cli.repo
-          dnf install -y gh --repo gh-cli
-          # Pin compiler explicitly. cmake-rs (via cc-rs) reads
-          # CC/CXX, so this forces CMake to use gcc-toolset-14 even
-          # though manylinux's `/opt/clang/bin` is also on PATH and
-          # would otherwise be picked. We need libstdc++ 14 for the
-          # C++20 headers (`<span>`) the portable driver source uses.
-          {
-            echo "CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc"
-            echo "CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++"
-            echo "AR=/opt/rh/gcc-toolset-14/root/usr/bin/ar"
-            echo "PATH=/opt/rh/gcc-toolset-14/root/usr/bin:${PATH}"
-            echo "MANPATH=/opt/rh/gcc-toolset-14/root/usr/share/man:"
-            echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib"
-            echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64/pkgconfig"
-          } >> "$GITHUB_ENV"
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-            sh -s -- -y --profile minimal --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install Rust (non-container runners)
-        if: matrix.target.container == ''
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target.triple }}
 
-      - name: Install Vulkan toolchain + build deps (linux only)
-        if: matrix.target.platform == 'linux' && matrix.target.backend == 'vulkan'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          # No manylinux container on this leg: ggml-vulkan hard-requires
-          # `glslc` (find_package(Vulkan COMPONENTS glslc REQUIRED)), which
-          # Rocky 8 / manylinux_2_28 doesn't package but Ubuntu 24.04+ does.
-          # Install the Vulkan headers/loader/compiler plus the C/C++ build
-          # toolchain that the cmake-rs driver build and openssl-sys need.
-          export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update
-          # spirv-headers provides <spirv/unified1/spirv.hpp> (namespace spv),
-          # which ggml-vulkan.cpp includes for SPIR-V reflection — not pulled
-          # in by libvulkan-dev/glslc alone.
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config \
-            glslc libvulkan-dev spirv-headers libssl-dev
-          glslc --version
+      - name: Install build deps (macOS Metal only)
+        if: matrix.target.platform == 'macos'
+        run: brew install cmake ninja libomp
 
-      - name: Install Vulkan SDK (windows only)
-        id: vulkan_sdk
-        if: matrix.target.platform == 'windows' && matrix.target.backend == 'vulkan'
-        # node24 action that installs the full SDK (headers + import libs).
-        # Replaces humbletim/install-vulkan-sdk (node20 + a transitive
-        # actions/cache@v4) which warns under the Node-20 deprecation.
-        uses: jakoch/install-vulkan-sdk-action@v1.5.5
-        with:
-          cache: true
-
-      - name: Verify Vulkan SDK (windows only)
-        if: matrix.target.platform == 'windows' && matrix.target.backend == 'vulkan'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          # cmake-rs / build.rs read the VULKAN_SDK env var. The jakoch action
-          # already exports it to the environment (its step *output* of the same
-          # name is empty), so just sanity-check the files ggml's vulkan backend
-          # needs against $VULKAN_SDK.
-          echo "VULKAN_SDK=$VULKAN_SDK"
-          test -f "$VULKAN_SDK/Include/vulkan/vulkan.h"
-          test -f "$VULKAN_SDK/Lib/vulkan-1.lib"
-
-      - name: Install CUDA toolkit (windows portable cuda only)
+      - name: Install CUDA toolkit (windows cuda only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '12.9.1'
 
-      - name: Verify CUDA toolkit (windows portable cuda only)
+      - name: Verify CUDA toolkit (windows cuda only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
         shell: bash
         run: |
@@ -286,19 +163,14 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          if [ -n "${{ matrix.target.backend_env }}" ]; then
-            export ${{ matrix.target.backend_env }}
-          fi
           if [[ "${{ matrix.target.backend }}" == "cuda" ]]; then
-            export PIE_PORTABLE_CUDA_ARCH='${{ matrix.target.cuda_arch }}'
+            export CMAKE_CUDA_ARCHITECTURES='${{ matrix.target.cuda_arch }}'
           fi
           if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
-            # ggml-vulkan nests a shader-generator CMake build under Cargo's
-            # OUT_DIR, and ggml-cuda produces many long object paths. Keep the
-            # target root short enough for the legacy 260-character path limit
-            # on Windows, and isolate backend flavors from each other.
+            # ggml-cuda produces many long object paths. Keep the target root
+            # short enough for the legacy 260-character path limit on Windows.
             export CARGO_TARGET_DIR="C:/t/pie-${{ matrix.target.backend }}"
-            # 32-core windows-large runner: parallelize the native ggml build
+            # 32-core windows-large runner: parallelize the native CUDA build
             # fully (was capped at 4 for the old small hosted runners).
             export CMAKE_BUILD_PARALLEL_LEVEL="$(nproc 2>/dev/null || echo 8)"
             if [[ "${{ matrix.target.backend }}" == "cuda" ]]; then
@@ -323,7 +195,7 @@ jobs:
           cargo build --profile release-min \
             --target ${{ matrix.target.triple }} \
             -p pie-worker \
-            --features driver-portable,driver-dummy
+            --features ${{ matrix.target.features }}
 
       - name: Package
         shell: bash
@@ -415,8 +287,6 @@ jobs:
     container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
     env:
       ARTIFACT_NAME: pie-${{ matrix.target.os_arch }}-linux-cuda${{ matrix.cuda.short }}-sm${{ matrix.target.cc }}.tar.gz
-      PIE_PORTABLE_CUDA: "1"
-      PIE_PORTABLE_CUDA_ARCH: ${{ matrix.target.cc }}
       CMAKE_CUDA_ARCHITECTURES: ${{ matrix.target.cc }}
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
       CARGO_INCREMENTAL: "0"
@@ -484,7 +354,7 @@ jobs:
           cargo build --profile release-min \
             --target ${{ matrix.target.triple }} \
             -p pie-worker \
-            --features driver-portable,driver-cuda,driver-dummy
+            --features driver-cuda,driver-dummy
 
       - name: Package
         shell: bash
@@ -507,8 +377,8 @@ jobs:
   # Refresh the release notes once after all builds finish.
   # =========================================================================
   refresh-notes:
-    if: always() && (inputs.portable || inputs.cuda_manylinux)
-    needs: [portable, cuda-manylinux]
+    if: always() && (inputs.desktop || inputs.cuda_manylinux)
+    needs: [desktop, cuda-manylinux]
     runs-on: ubuntu-latest
     permissions:
       contents: write

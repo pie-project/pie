@@ -99,19 +99,23 @@ int main() {
         const std::uint32_t slot0[] = {0};
         const std::uint32_t slot1[] = {1};
 
-        swap.copy_d2h(cache, gpu0, slot0);
+        swap.copy_d2h_async(cache, gpu0, slot0);
+        swap.synchronize();
 
         zero_page(cache, 1);
-        swap.copy_h2d(cache, slot0, gpu1);
+        swap.copy_h2d_async(cache, slot0, gpu1);
+        swap.synchronize();
         expect_page(cache, 1, expected_page0, "h2d");
 
         zero_page(cache, 2);
-        swap.copy_d2d(cache, gpu0, gpu2);
+        swap.copy_d2d_async(cache, gpu0, gpu2);
+        swap.synchronize();
         expect_page(cache, 2, expected_page0, "d2d");
 
         zero_page(cache, 3);
-        swap.copy_h2h(slot0, slot1);
-        swap.copy_h2d(cache, slot1, gpu3);
+        swap.copy_h2h_async(slot0, slot1);
+        swap.copy_h2d_async(cache, slot1, gpu3);
+        swap.synchronize();
         expect_page(cache, 3, expected_page0, "h2h+h2d");
 
         std::puts("swap_pool ok");

@@ -2,10 +2,9 @@
 //
 // Quickstart:
 //
-//     import { Context, Model, Sampler, runtime } from 'inferlet';
+//     import { Context, Sampler } from 'inferlet';
 //
-//     const model = Model.load(runtime.models()[0]);
-//     const ctx = new Context(model);
+//     const ctx = new Context();
 //
 //     ctx.system('You are helpful.').user('What is 2 + 2?');
 //     const text = await ctx
@@ -26,7 +25,7 @@
 //
 //     import { chat, reasoning, tools } from 'inferlet';
 //
-//     const chatDec = new chat.Decoder(model);
+//     const chatDec = new chat.Decoder();
 //     for await (const step of gen) {
 //       const out = await step.execute();
 //       const ev = chatDec.feed(out.tokens);
@@ -36,10 +35,10 @@
 //
 // Constraint specs (`jsonSchema`, `anyJson`, `regex`, `ebnf`) implement
 // the `Schema` interface — duck-typed, so your own grammar source class
-// plugs in by adding a `buildConstraint(model)` method.
+// plugs in by adding a `buildConstraint()` method.
 
 // ── Core ─────────────────────────────────────────────────────────────
-export { Model, Tokenizer } from './model.js';
+export * as model from './model.js';
 export { Adapter } from './adapter.js';
 export { Context } from './context.js';
 
@@ -85,12 +84,9 @@ export type { Speculator } from './spec.js';
 
 // ── Runtime / IO sub-modules ─────────────────────────────────────────
 export * as runtime from './runtime.js';
-export * as scheduling from './scheduling.js';
 export * as session from './session.js';
 export * as messaging from './messaging.js';
-export * as mcp from './mcp.js';
 export * as zo from './zo.js';
 
 // Convenience re-exports for the most commonly subscribed-to types.
 export { Subscription } from './messaging.js';
-export { McpSession } from './mcp.js';

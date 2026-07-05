@@ -14,7 +14,7 @@
 //   use_cache=false         -> never open a saved snapshot
 //   save_cache=false        -> never save new snapshots
 
-import { Context, Model, Sampler, runtime } from 'inferlet';
+import { Context, Sampler } from 'inferlet';
 
 // Bump when the snapshot layout / key meaning changes.
 const CACHE_SCHEMA = 'modular-cache-v1';
@@ -134,11 +134,11 @@ function topoSort(modules: ModuleInput[]): ModuleInput[] {
 // open() forks the snapshot (it stays immutable), so the context it returns is
 // ours to append to. It *throws* on a missing snapshot rather than returning
 // undefined, so a failed open just means a miss at that length.
-function openLongestPrefix(model: Model, modules: ModuleInput[]): [Context | undefined, number] {
+function openLongestPrefix(modules: ModuleInput[]): [Context | undefined, number] {
     for (let len = modules.length; len >= 1; --len) {
         let ctx: Context | undefined;
         try {
-            ctx = Context.open(model, prefixKey(modules.slice(0, len)));
+            ctx = Context.open(prefixKey(modules.slice(0, len)));
         } catch {
             ctx = undefined;
         }
@@ -148,8 +148,6 @@ function openLongestPrefix(model: Model, modules: ModuleInput[]): [Context | und
 }
 
 export async function main(input: Input): Promise<string> {
-    const model = Model.load(runtime.models()[0]);
-
     const prompt =
         input.prompt ?? 'Explain modular KV caching for LLM serving in simple terms.';
     const maxTokens = input.max_tokens ?? 256;
@@ -167,18 +165,18 @@ export async function main(input: Input): Promise<string> {
     let resumeIndex = 0;
 
     if (useCache) {
-        const [cached, len] = openLongestPrefix(model, modules);
+        const [cached, len] = openLongestPrefix(modules);
         if (cached) {
             console.log(`cache_hit_modules=${len}`);
             ctx = cached;
             resumeIndex = len;
         } else {
             console.log('cache_miss');
-            ctx = new Context(model);
+            ctx = new Context();
         }
     } else {
         console.log('cache_miss (use_cache=false)');
-        ctx = new Context(model);
+        ctx = new Context();
     }
 
     for (let i = resumeIndex; i < modules.length; ++i) {

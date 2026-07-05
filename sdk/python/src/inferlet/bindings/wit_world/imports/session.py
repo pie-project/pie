@@ -8,7 +8,9 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import pie_core_types
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 def send(message: str) -> None:
@@ -16,7 +18,7 @@ def send(message: str) -> None:
     Sends a message to the remote user client
     """
     raise NotImplementedError
-def receive() -> pie_core_types.FutureString:
+async def receive() -> Optional[str]:
     """
     Receives an incoming message from the remote user client
     """
@@ -26,7 +28,7 @@ def send_file(data: bytes) -> None:
     Sends a file to the remote user client
     """
     raise NotImplementedError
-def receive_file() -> pie_core_types.FutureBlob:
+async def receive_file() -> Optional[bytes]:
     """
     Receives an incoming file from the remote user client
     """

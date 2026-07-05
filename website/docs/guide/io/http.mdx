@@ -199,8 +199,6 @@ loop {
 }
 ```
 
-The [`http-server`](https://github.com/pie-project/pie/tree/main/inferlets/http-server) inferlet shows the inverse pattern: an inferlet that *serves* HTTP, including SSE streaming.
-
 ## Sandbox boundary
 
 HTTP requests leave the inferlet's sandbox and reach the network through the engine. The engine does not currently enforce per-host allowlists, but the policy may tighten in future releases. Treat outbound HTTP as a privileged operation when you are deciding what an untrusted inferlet should do.
@@ -217,5 +215,4 @@ Examples of services that work well from inside an inferlet:
 ## Next
 
 - [Filesystem](./filesystem): persistent local storage.
-- [MCP](./mcp): structured tool servers as an alternative to raw HTTP.
 - [Tutorial: build a parallel research agent](../tutorial/build): parallel HTTP fetches as a worked example.

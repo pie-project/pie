@@ -6,7 +6,6 @@ authors = ["Pie Team"]
 
 [runtime]
 core = "^0.2.0"
-mcp = "^0.2.0"
 
 [parameters]
 prompt = {type = "string", optional = true, description = "The product/topic to generate content for"}

@@ -18,7 +18,6 @@ constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 3;
 
 enum class PieLoaderBackendKind {
   Cuda = 0,
-  Portable = 1,
   Unknown = 255,
 };
 

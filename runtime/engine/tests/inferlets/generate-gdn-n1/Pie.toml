@@ -1,0 +1,4 @@
+[package]
+name = "generate-gdn-n1"
+version = "0.1.0"
+description = "rs_cache T0 E1 discriminator: generate-gdn with a SINGLE-token (N=1) prefill — isolates the multi-token-prefill-commit bug from the general prefill->decode CoW-slab boundary"

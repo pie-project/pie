@@ -1,7 +1,7 @@
 #pragma once
 
 // Tiny error-check macros for CUDA runtime calls. Turn cudaError_t into
-// std::runtime_error so we can surface failures cleanly through the shmem
+// std::runtime_error so the direct FFI entry point can surface failures
 // loop or shutdown path.
 
 #include <cuda_runtime.h>

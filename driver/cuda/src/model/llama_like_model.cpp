@@ -58,7 +58,8 @@ void LlamaLikeModel::body(Qwen3Workspace& ws,
         in.total_tokens, in.num_requests, in.is_pure_decode,
         in.logit_row_indices_d, in.num_logit_rows,
         in.tp_greedy_argmax,
-        in.custom_mask_d, in.custom_mask_indptr_d);
+        in.custom_mask_d, in.custom_mask_indptr_d,
+        in.w_page_d, in.w_off_d, in.has_write_desc);
 }
 
 std::uint32_t LlamaLikeModel::graph_layout() {

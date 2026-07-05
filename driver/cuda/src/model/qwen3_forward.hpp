@@ -18,6 +18,15 @@ namespace pie_cuda_driver::model {
 // only writes prefixes of these, so reusing across calls is safe as long as
 // you don't exceed `max_tokens`.
 struct Qwen3Workspace {
+    // Stage-2 MTP: extra rows reserved at the TAIL of `logits` (beyond the
+    // `max_output_rows` target rows) to hold the K native MTP draft-logit rows
+    // an `Intrinsic::MtpLogits` [K,vocab] binding reads. `mtp_draft_row_base` is
+    // the first reserved row; drafts live at [base, base+K) and never collide
+    // with the target rows [0, max_output_rows). Sized to the PIE_MTP_DRAFT_TOKENS
+    // clamp (0..32).
+    static constexpr int kMtpDraftRowReserve = 32;
+    int mtp_draft_row_base = 0;
+
     DeviceTensor y;          // [max_tokens, hidden]
     DeviceTensor norm_x;     // [max_tokens, hidden]
     DeviceTensor spec_hidden; // [max_tokens, hidden] saved verifier hidden rows

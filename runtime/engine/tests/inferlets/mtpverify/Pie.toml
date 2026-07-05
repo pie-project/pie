@@ -1,0 +1,4 @@
+[package]
+name = "mtpverify"
+version = "0.1.0"
+description = "Test inferlet: §6.1 composed spec-verify ⟂ per-position grammar-mask verify (MTP assembly)"

@@ -1,0 +1,4 @@
+[package]
+name = "specverify"
+version = "0.1.0"
+description = "Test inferlet: [k]-Token channel e2e verification"

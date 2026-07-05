@@ -9,6 +9,9 @@ import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import wasi_filesystem_types
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 def get_directories() -> List[Tuple[wasi_filesystem_types.Descriptor, str]]:

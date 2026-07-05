@@ -1,7 +1,0 @@
-package pie:instruct;
-
-world imports {
-    import chat;
-    import tool-use;
-    import reasoning;
-}
