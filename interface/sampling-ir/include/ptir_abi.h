@@ -6,6 +6,8 @@
 
 #define PTIR_MAGIC "PTIR"
 #define PTIR_VERSION 1
+#define PTIB_MAGIC "PTIB" // bound-trace typed sidecar (PTIR-CONTAINER.md section 7)
+#define PTIB_VERSION 1
 
 // ── op tags (X-macro: name, tag, value-operands, results; 0xFF = variadic) ──
 #define PTIR_OP_LIST(X) \

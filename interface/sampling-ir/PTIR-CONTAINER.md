@@ -208,7 +208,30 @@ double-put last-wins); epoch-ring bump at pass end; faults/deadline poison.
 In-place lowering classes (`full_ring` / `in_place` / `in_place_undo`) are
 computed at bind (`classify_channels`) — semantics-invisible, perf-only.
 
-## 7. Worked example
+## 7. Bound-trace sidecar (`PTIB` v1) — the typed lowering
+
+Backends do NOT re-implement shape/dtype inference (T8 needs bit-identical
+shapes; `ptir::infer` is the single authority). At registration the host calls
+`bind(container, profile)` and ships the driver `(container bytes, sidecar
+bytes)`; the sidecar is `ptir::sidecar::encode_bound(&BoundTrace)`:
+
+```
+magic "PTIB" | version:u16 = 1 | flags:u16 = 0
+container_hash:u64            (REJECT if != FNV-1a64 of the container bytes)
+n_channels:u32
+  class:u8                    (0 full_ring, 1 in_place, 2 in_place_undo)
+n_readiness:u32
+  chan:u32 | phase:u8 | dir:u8  (phase = stage tag, 0xFF descriptor;
+                                 dir 0 = needs-full, 1 = needs-empty)
+n_stages:u32                  (container order)
+  stage:u8 | n_values:u32
+    dtype:u8 | shape           (per SSA value id, in order; ACT materialized)
+```
+
+Seed-independent and trace-known throughout ⇒ cache by `container_hash`
+alongside compiled kernels (the §7.3 registration discipline).
+
+## 8. Worked example
 
 See `src/ptir/validate.rs::tests::section3()` — the overview §3
 greedy+grammar-mask pipeline (5 channels, 3 ports, 1 epilogue) — and the

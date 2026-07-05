@@ -39,6 +39,7 @@ pub mod expand;
 pub mod infer;
 pub mod op;
 pub mod registry;
+pub mod sidecar;
 pub mod validate;
 
 #[cfg(feature = "std")]

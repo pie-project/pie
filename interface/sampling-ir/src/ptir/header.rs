@@ -19,7 +19,11 @@ pub fn generate_c_header() -> String {
     s.push_str("// Container layout: interface/sampling-ir/PTIR-CONTAINER.md\n");
     s.push_str("#pragma once\n#include <stdint.h>\n\n");
 
-    s.push_str(&format!("#define PTIR_MAGIC \"PTIR\"\n#define PTIR_VERSION {PTIR_VERSION}\n\n"));
+    s.push_str(&format!("#define PTIR_MAGIC \"PTIR\"\n#define PTIR_VERSION {PTIR_VERSION}\n"));
+    s.push_str(&format!(
+        "#define PTIB_MAGIC \"PTIB\" // bound-trace typed sidecar (PTIR-CONTAINER.md section 7)\n#define PTIB_VERSION {}\n\n",
+        super::sidecar::PTIB_VERSION
+    ));
 
     s.push_str("// ── op tags (X-macro: name, tag, value-operands, results; 0xFF = variadic) ──\n");
     s.push_str("#define PTIR_OP_LIST(X) \\\n");
