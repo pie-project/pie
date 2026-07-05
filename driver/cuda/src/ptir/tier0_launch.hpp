@@ -118,10 +118,12 @@ inline bool launch_op(const LaunchOp& o) {
     using namespace detail;
     switch (o.code) {
         // ── map ──
-        case OpCode::Add: case OpCode::Sub: case OpCode::Mul: case OpCode::Div: case OpCode::Rem: {
+        case OpCode::Add: case OpCode::Sub: case OpCode::Mul: case OpCode::Div: case OpCode::Rem:
+        case OpCode::MaxElem: case OpCode::MinElem: {
             BinKind k = o.code == OpCode::Add ? BinKind::Add : o.code == OpCode::Sub ? BinKind::Sub
                       : o.code == OpCode::Mul ? BinKind::Mul : o.code == OpCode::Div ? BinKind::Div
-                      : BinKind::Rem;
+                      : o.code == OpCode::Rem ? BinKind::Rem
+                      : o.code == OpCode::MaxElem ? BinKind::MaxElem : BinKind::MinElem;
             switch (o.elem_dtype) {
                 case DType::F32: run_binary<float>(o, k); return true;
                 case DType::I32: run_binary<std::int32_t>(o, k); return true;
@@ -129,11 +131,14 @@ inline bool launch_op(const LaunchOp& o) {
                 default: return false;
             }
         }
-        case OpCode::Neg: case OpCode::Exp: case OpCode::Log: {
-            UnKind k = o.code == OpCode::Neg ? UnKind::Neg : o.code == OpCode::Exp ? UnKind::Exp : UnKind::Log;
+        case OpCode::Neg: case OpCode::Exp: case OpCode::Log:
+        case OpCode::Recip: case OpCode::Abs: case OpCode::Sign: {
+            UnKind k = o.code == OpCode::Neg ? UnKind::Neg : o.code == OpCode::Exp ? UnKind::Exp
+                     : o.code == OpCode::Log ? UnKind::Log : o.code == OpCode::Recip ? UnKind::Recip
+                     : o.code == OpCode::Abs ? UnKind::Abs : UnKind::Sign;
             switch (o.elem_dtype) {
                 case DType::F32: run_unary<float>(o, k); return true;
-                case DType::I32: if (k == UnKind::Neg) { run_unary<std::int32_t>(o, k); return true; } return false;
+                case DType::I32: if (k == UnKind::Neg || k == UnKind::Abs || k == UnKind::Sign) { run_unary<std::int32_t>(o, k); return true; } return false;
                 default: return false;
             }
         }
@@ -209,6 +214,14 @@ inline bool launch_op(const LaunchOp& o) {
                 case DType::Bool: run_gather<std::uint8_t>(o); return true;
             }
             return false;
+        case OpCode::GatherRow:
+            // rows = index count (m), len = per-row length.
+            switch (o.elem_dtype) {
+                case DType::F32: k_gather_row<float><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const float*)o.in[0], (const std::uint32_t*)o.in[1], (float*)o.out, o.rows, o.len); return true;
+                case DType::U32: k_gather_row<std::uint32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint32_t*)o.in[0], (const std::uint32_t*)o.in[1], (std::uint32_t*)o.out, o.rows, o.len); return true;
+                case DType::I32: k_gather_row<std::int32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::int32_t*)o.in[0], (const std::uint32_t*)o.in[1], (std::int32_t*)o.out, o.rows, o.len); return true;
+                default: return false;
+            }
         case OpCode::ScatterSet:
             switch (o.elem_dtype) {
                 case DType::F32: run_scatter<float>(o); return true;
@@ -216,9 +229,17 @@ inline bool launch_op(const LaunchOp& o) {
                 case DType::U32: run_scatter<std::uint32_t>(o); return true;
                 default: return false;
             }
+        case OpCode::ScatterAdd:
+            switch (o.elem_dtype) {
+                case DType::F32: k_scatter_add_serial<float><<<1, 1, 0, o.stream>>>((float*)o.out, (const std::uint32_t*)o.in[1], (const float*)o.in[2], o.n_scatter); return true;
+                case DType::I32: k_scatter_add_serial<std::int32_t><<<1, 1, 0, o.stream>>>((std::int32_t*)o.out, (const std::uint32_t*)o.in[1], (const std::int32_t*)o.in[2], o.n_scatter); return true;
+                case DType::U32: k_scatter_add_serial<std::uint32_t><<<1, 1, 0, o.stream>>>((std::uint32_t*)o.out, (const std::uint32_t*)o.in[1], (const std::uint32_t*)o.in[2], o.n_scatter); return true;
+                default: return false;
+            }
         // ── reduce / scan ──
-        case OpCode::ReduceSum: case OpCode::ReduceMax: {
-            RedKind k = o.code == OpCode::ReduceSum ? RedKind::Sum : RedKind::Max;
+        case OpCode::ReduceSum: case OpCode::ReduceMax: case OpCode::ReduceMin: {
+            RedKind k = o.code == OpCode::ReduceSum ? RedKind::Sum
+                      : o.code == OpCode::ReduceMax ? RedKind::Max : RedKind::Min;
             switch (o.elem_dtype) {
                 case DType::F32: run_reduce<float>(o, k); return true;
                 case DType::I32: run_reduce<std::int32_t>(o, k); return true;
@@ -238,7 +259,7 @@ inline bool launch_op(const LaunchOp& o) {
                 default: return false;
             }
         }
-        // ── normalize ──
+        // ── normalize (composite / fusion-only) ──
         case OpCode::Softmax: case OpCode::LogSoftmax: case OpCode::L2Norm: {
             NormKind k = o.code == OpCode::Softmax ? NormKind::Softmax
                        : o.code == OpCode::LogSoftmax ? NormKind::LogSoftmax : NormKind::L2Norm;
@@ -246,22 +267,41 @@ inline bool launch_op(const LaunchOp& o) {
             return true;
         }
         // ── sampling ──
-        case OpCode::MaskApply:
+        case OpCode::MaskApplyBool:
             k_mask_apply<<<gs(o.numel), kTier0Block, 0, o.stream>>>(
                 (const float*)o.in[0], (const std::uint8_t*)o.in[1], (float*)o.out, o.numel);
             return true;
-        case OpCode::Gumbel:
+        case OpCode::MaskApplyPacked:
+            // len = vocab; k carries mask words per row (ceil(len/32)).
+            k_mask_apply_packed<<<gs(o.numel), kTier0Block, 0, o.stream>>>(
+                (const float*)o.in[0], (const std::uint32_t*)o.in[1], (float*)o.out, o.rows, o.len, o.k);
+            return true;
+        case OpCode::GumbelNoise:
             k_gumbel<<<gs((std::uint64_t)o.rows * o.len), kTier0Block, 0, o.stream>>>(
                 (const std::uint32_t*)o.row_seeds, o.rng_stream, (float*)o.out, o.rows, o.len);
+            return true;
+        case OpCode::Rng:   // ambient seed; rng_stream carries stream, bcast_mode = gumbel flag
+            k_rng_ambient<<<gs((std::uint64_t)o.rows * o.len), kTier0Block, 0, o.stream>>>(
+                (const std::uint32_t*)o.row_seeds, o.rng_stream, (float*)o.out, o.rows, o.len, o.bcast_mode);
+            return true;
+        case OpCode::RngKeyed:   // state=[key,ctr] in in[0]; bcast_mode = gumbel flag
+            k_rng_keyed<<<gs(o.numel), kTier0Block, 0, o.stream>>>(
+                (const std::uint32_t*)o.in[0], (float*)o.out, o.numel, o.bcast_mode);
             return true;
         // ── order ──
         case OpCode::RankLe:
             k_rank_le<<<o.rows, kTier0Block, 0, o.stream>>>((const float*)o.in[0], (std::uint8_t*)o.out, o.rows, o.len, o.k);
             return true;
         case OpCode::PivotThreshold:
-            k_pivot_threshold_rankle<<<o.rows, kTier0Block, 0, o.stream>>>((const float*)o.in[0], (float*)o.out, o.rows, o.len, o.k);
+            // Container pivot_threshold(input, rank_le(k)) → bool selection mask.
+            k_rank_le<<<o.rows, kTier0Block, 0, o.stream>>>((const float*)o.in[0], (std::uint8_t*)o.out, o.rows, o.len, o.k);
             return true;
         // ── library kernels ──
+        case OpCode::SortDesc:
+            // full per-row sort = top_k with k = len (2 results, value-first).
+            k_topk_rows<<<o.rows, kTier0Block, o.len * sizeof(std::uint8_t), o.stream>>>(
+                (const float*)o.in[0], (float*)o.out, (std::uint32_t*)o.out2, o.rows, o.len, o.len);
+            return true;
         case OpCode::TopK:
             k_topk_rows<<<o.rows, kTier0Block, o.len * sizeof(std::uint8_t), o.stream>>>(
                 (const float*)o.in[0], (float*)o.out, (std::uint32_t*)o.out2, o.rows, o.len, o.k);
@@ -273,6 +313,8 @@ inline bool launch_op(const LaunchOp& o) {
                 k_matmul<<<grd, blk, 0, o.stream>>>((const float*)o.in[0], (const float*)o.in[1], (float*)o.out, o.rows, o.len, o.k);
             }
             return true;
+        default:
+            return false;   // structural ops (chan_*/const/intrinsic_val/kernel_call/sink_call) are not launched
     }
     return false;
 }

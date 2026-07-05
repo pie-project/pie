@@ -69,7 +69,7 @@ __device__ __forceinline__ float t0_gumbel_noise(unsigned long long seed_eff, in
 
 // ─────────────────────────── map / element-wise ──────────────────────────
 
-enum class BinKind : std::uint8_t { Add, Sub, Mul, Div, Rem };
+enum class BinKind : std::uint8_t { Add, Sub, Mul, Div, Rem, MaxElem, MinElem };
 
 template <class T>
 __device__ __forceinline__ T t0_bin(BinKind k, T a, T b) {
@@ -79,6 +79,8 @@ __device__ __forceinline__ T t0_bin(BinKind k, T a, T b) {
         case BinKind::Mul: return a * b;
         case BinKind::Div: return a / b;
         case BinKind::Rem: return a - (a / b) * b;   // integer-style remainder
+        case BinKind::MaxElem: return a > b ? a : b;
+        case BinKind::MinElem: return a < b ? a : b;
     }
     return a;
 }
@@ -90,6 +92,8 @@ __device__ __forceinline__ float t0_bin<float>(BinKind k, float a, float b) {
         case BinKind::Mul: return a * b;
         case BinKind::Div: return a / b;
         case BinKind::Rem: return fmodf(a, b);
+        case BinKind::MaxElem: return fmaxf(a, b);
+        case BinKind::MinElem: return fminf(a, b);
     }
     return a;
 }
@@ -103,7 +107,7 @@ __global__ void k_binary(const T* __restrict__ a, const T* __restrict__ b,
     }
 }
 
-enum class UnKind : std::uint8_t { Neg, Exp, Log };
+enum class UnKind : std::uint8_t { Neg, Exp, Log, Recip, Abs, Sign };
 
 template <class T>
 __global__ void k_unary(const T* __restrict__ a, T* __restrict__ out,
@@ -112,9 +116,12 @@ __global__ void k_unary(const T* __restrict__ a, T* __restrict__ out,
          i < n; i += (std::uint64_t)gridDim.x * blockDim.x) {
         T v = a[i];
         switch (kind) {
-            case UnKind::Neg: out[i] = -v; break;
-            case UnKind::Exp: out[i] = (T)expf((float)v); break;
-            case UnKind::Log: out[i] = (T)logf((float)v); break;
+            case UnKind::Neg:   out[i] = -v; break;
+            case UnKind::Exp:   out[i] = (T)expf((float)v); break;
+            case UnKind::Log:   out[i] = (T)logf((float)v); break;
+            case UnKind::Recip: out[i] = (T)(1.0f / (float)v); break;
+            case UnKind::Abs:   out[i] = (T)fabsf((float)v); break;
+            case UnKind::Sign:  out[i] = (T)(((float)v > 0.0f) - ((float)v < 0.0f)); break;
         }
     }
 }
@@ -197,6 +204,20 @@ __global__ void k_gather(const T* __restrict__ src, const std::uint32_t* __restr
     }
 }
 
+// gather_row (axis-0 row gather): src [n, row_len], idx [m] → out [m, row_len],
+// out[i, :] = src[idx[i], :]. Grid-stride over m*row_len.
+template <class T>
+__global__ void k_gather_row(const T* __restrict__ src, const std::uint32_t* __restrict__ idx,
+                             T* __restrict__ out, std::uint32_t m, std::uint32_t row_len) {
+    std::uint64_t n = (std::uint64_t)m * row_len;
+    for (std::uint64_t t = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
+         t < n; t += (std::uint64_t)gridDim.x * blockDim.x) {
+        std::uint32_t i = (std::uint32_t)(t / row_len);
+        std::uint32_t j = (std::uint32_t)(t % row_len);
+        out[t] = src[(std::uint64_t)idx[i] * row_len + j];
+    }
+}
+
 // scatter_set: out starts as a copy of base; out[idx[j]] = vals[j] for j in
 // index order, LAST WINS on duplicates (§6.2, load-bearing). Tier-0 correctness
 // path: a single ordered pass (scatter counts are small — K/B words per lane).
@@ -208,9 +229,17 @@ __global__ void k_scatter_set_serial(T* __restrict__ out, const std::uint32_t* _
     for (std::uint32_t j = 0; j < n_scatter; ++j) out[idx[j]] = vals[j];
 }
 
+// scatter_add: out starts as a copy of base; out[idx[j]] += vals[j] in index
+// order (accumulate). Serial single-pass (deterministic; scatter counts small).
+template <class T>
+__global__ void k_scatter_add_serial(T* __restrict__ out, const std::uint32_t* __restrict__ idx,
+                                     const T* __restrict__ vals, std::uint32_t n_scatter) {
+    for (std::uint32_t j = 0; j < n_scatter; ++j) out[idx[j]] = (T)(out[idx[j]] + vals[j]);
+}
+
 // ───────────────────────── reduce / scan (row-local) ─────────────────────
 
-enum class RedKind : std::uint8_t { Sum, Max };
+enum class RedKind : std::uint8_t { Sum, Max, Min };
 
 // One CTA per row; grid-stride load over the row, then a shared-memory tree
 // reduce. `len` may exceed the block width.
@@ -222,17 +251,22 @@ __global__ void k_reduce(const T* __restrict__ in, T* __restrict__ out,
     if (row >= rows) return;
     const T* r = in + (std::uint64_t)row * len;
 
-    T acc = (kind == RedKind::Sum) ? (T)0 : r[threadIdx.x < len ? threadIdx.x : 0];
+    T seed0 = r[threadIdx.x < len ? threadIdx.x : 0];
+    T acc = (kind == RedKind::Sum) ? (T)0 : seed0;
     for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
         T v = r[i];
-        acc = (kind == RedKind::Sum) ? (T)(acc + v) : (v > acc ? v : acc);
+        if (kind == RedKind::Sum) acc = (T)(acc + v);
+        else if (kind == RedKind::Max) acc = (v > acc ? v : acc);
+        else acc = (v < acc ? v : acc);
     }
     sh[threadIdx.x] = acc;
     __syncthreads();
     for (std::uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
             T a = sh[threadIdx.x], b = sh[threadIdx.x + s];
-            sh[threadIdx.x] = (kind == RedKind::Sum) ? (T)(a + b) : (b > a ? b : a);
+            if (kind == RedKind::Sum) sh[threadIdx.x] = (T)(a + b);
+            else if (kind == RedKind::Max) sh[threadIdx.x] = (b > a ? b : a);
+            else sh[threadIdx.x] = (b < a ? b : a);
         }
         __syncthreads();
     }
@@ -390,6 +424,51 @@ __global__ void k_gumbel(const std::uint32_t* __restrict__ row_seed, std::uint32
         int col = (int)(t % len);
         unsigned long long se = t0_seed_eff_stream(row_seed[row], stream);
         out[t] = t0_gumbel_noise(se, col);
+    }
+}
+
+// rng (0x70, ambient seed): per-row draw from S[r] + stream salt. `gumbel`=1 →
+// Gumbel noise, else uniform in (0,1). Bit-parity with sample_temp.cu.
+__global__ void k_rng_ambient(const std::uint32_t* __restrict__ row_seed, std::uint32_t stream,
+                              float* __restrict__ out, std::uint32_t rows, std::uint32_t len, int gumbel) {
+    std::uint64_t n = (std::uint64_t)rows * len;
+    for (std::uint64_t t = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
+         t < n; t += (std::uint64_t)gridDim.x * blockDim.x) {
+        std::uint32_t row = (std::uint32_t)(t / len);
+        int col = (int)(t % len);
+        unsigned long long se = t0_seed_eff_stream(row_seed[row], stream);
+        float u = t0_hash_uniform(se, col);
+        out[t] = gumbel ? -logf(-logf(u)) : u;
+    }
+}
+
+// rng_keyed (0x71, state = [key, ctr] U32): seed64 = splitmix64((key<<32)|ctr);
+// element j (flat row-major over the shape) draws u = hash_uniform(seed64, j).
+// `gumbel`=1 → -log(-log(u)). Pure function of (key, ctr, j) — replay-exact.
+__global__ void k_rng_keyed(const std::uint32_t* __restrict__ state, float* __restrict__ out,
+                            std::uint64_t numel, int gumbel) {
+    unsigned long long seed64 = t0_splitmix64(((unsigned long long)state[0] << 32) | (unsigned long long)state[1]);
+    for (std::uint64_t j = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
+         j < numel; j += (std::uint64_t)gridDim.x * blockDim.x) {
+        float u = t0_hash_uniform(seed64, (int)j);
+        out[j] = gumbel ? -logf(-logf(u)) : u;
+    }
+}
+
+// mask_apply_packed(logits, packed_mask): out[j] = bit_j(mask) ? logits[j] : -inf.
+// `mask` is a packed u32 bitset per row: bit j lives in word (j>>5), bit (j&31),
+// 1 = ALLOWED. `mask_words` = ceil(len/32) words per row. Grid-stride over rows*len.
+__global__ void k_mask_apply_packed(const float* __restrict__ logits, const std::uint32_t* __restrict__ mask,
+                                    float* __restrict__ out, std::uint32_t rows, std::uint32_t len,
+                                    std::uint32_t mask_words) {
+    std::uint64_t n = (std::uint64_t)rows * len;
+    for (std::uint64_t t = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
+         t < n; t += (std::uint64_t)gridDim.x * blockDim.x) {
+        std::uint32_t row = (std::uint32_t)(t / len);
+        std::uint32_t j = (std::uint32_t)(t % len);
+        std::uint32_t word = mask[(std::uint64_t)row * mask_words + (j >> 5)];
+        bool keep = (word >> (j & 31)) & 1u;
+        out[t] = keep ? logits[t] : t0_neg_inf();
     }
 }
 

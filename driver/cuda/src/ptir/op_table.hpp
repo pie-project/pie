@@ -1,105 +1,96 @@
 #pragma once
 
-// PTIR first-party op table — the CUDA driver's mirror of the closed core op
-// set (docs/ptir/overview.md appendix). This is the tier-0/1/2 backend's view
-// of the op set: opcode bytes + per-op metadata (family, arity, result kind).
+// PTIR op table — the CUDA driver's view of the closed first-party op set.
 //
-// SOURCE OF TRUTH: echo owns the canonical op-table (a shared Rust crate +
-// generated C++ header, thrust-3 P0.1). Until that lands, this header is the
-// PROVISIONAL mirror the CUDA tier-0 library builds against; the opcode bytes
-// are grouped by family with gaps so echo's frozen byte assignments slot in
-// mechanically. Every op here comes from the overview appendix, nothing else
-// (D5: the first-party core is closed and fusable).
+// SOURCE OF TRUTH: echo's generated `ptir_abi.h` (from pie-sampling-ir
+// `src/ptir/{op,registry}.rs`) — op tag bytes come from its `PTIR_OP_*`
+// constants, NOT hand-copied (echo P0.1 rule: "include the header, don't
+// hand-copy ids"). Container byte layout: `interface/sampling-ir/PTIR-CONTAINER.md`.
+// The header is currently vendored beside this file; once it lands on dev under
+// `interface/sampling-ir/include/`, swap the include to that path (byte-identical,
+// so it is a no-op sync).
 //
-// Deliberately header-only and dependency-free (no CUDA, no std beyond
-// <cstdint>/<string_view>) so it compiles into host tools, the reference
-// evaluator, NVRTC codegen, and .cu kernels alike.
+// This header adds the CUDA-side annotations echo's table does not carry:
+// per-op OpFamily / LaunchClass / ResultKind, which drive tier-0 launch-shape
+// selection and tier-1 fusion cut points. Composite ops (softmax, gumbel, …) are
+// NOT container ops — the container carries their core-op expansion (echo's
+// `expand.rs`); we keep them as tier-1 fused-kernel forms at private tags 0xE0+.
 
 #include <cstdint>
 #include <string_view>
 
+#include "ptir/ptir_abi.h"   // PTIR_OP_* tag constants, PtirDType/Stage/Port/… enums
+
 namespace pie_cuda_driver::ptir {
 
-// Element dtype. Wire tags frozen to match the Sampling-IR mirror
-// (sampling_ir/ir.hpp): F32=0, I32=1, U32=2, Bool=3. `bool` travels packed on
-// the wire (D1) but is materialized one-byte per element on device.
-enum class DType : std::uint8_t { F32 = 0, I32 = 1, U32 = 2, Bool = 3 };
+// Element dtype — values mirror PtirDType (F32=0,I32=1,U32=2,Bool=3, Act=4).
+// Act is a channel-decl-only late-bound activation dtype; program ops see F32.
+enum class DType : std::uint8_t {
+    F32 = PTIR_DT_F32, I32 = PTIR_DT_I32, U32 = PTIR_DT_U32, Bool = PTIR_DT_BOOL, Act = PTIR_DT_ACT,
+};
 
 inline constexpr std::uint32_t dtype_size(DType d) {
     switch (d) {
-        case DType::F32: return 4;
-        case DType::I32: return 4;
-        case DType::U32: return 4;
+        case DType::F32: case DType::I32: case DType::U32: return 4;
         case DType::Bool: return 1;
+        case DType::Act: return 4;   // materialized as F32 program-side
     }
     return 4;
 }
-
-inline constexpr bool dtype_is_float(DType d) { return d == DType::F32; }
+inline constexpr bool dtype_is_float(DType d) { return d == DType::F32 || d == DType::Act; }
 inline constexpr bool dtype_is_int(DType d) { return d == DType::I32 || d == DType::U32; }
 
-// The closed first-party core (overview appendix). Bytes are grouped by family
-// on 0x10 boundaries with intra-family gaps; echo's generated table may reassign
-// them, at which point this enum is regenerated from that single source.
+// Op codes. Container ops take their byte from echo's ptir_abi.h constants;
+// composite (fusion-only, not-in-container) ops occupy the private 0xE0+ band.
 enum class OpCode : std::uint8_t {
-    // map — element-wise, broadcasting by shape
-    Add  = 0x01, Sub = 0x02, Mul = 0x03, Div = 0x04, Rem = 0x05,
-    Neg  = 0x06, Exp = 0x07, Log = 0x08, Cast = 0x09,
+    // map / element-wise
+    Exp = PTIR_OP_EXP, Log = PTIR_OP_LOG, Neg = PTIR_OP_NEG, Recip = PTIR_OP_RECIP,
+    Abs = PTIR_OP_ABS, Sign = PTIR_OP_SIGN, Cast = PTIR_OP_CAST,
+    Add = PTIR_OP_ADD, Sub = PTIR_OP_SUB, Mul = PTIR_OP_MUL, Div = PTIR_OP_DIV,
+    MaxElem = PTIR_OP_MAX_ELEM, MinElem = PTIR_OP_MIN_ELEM,
+    // compare / logic (bool results)
+    Gt = PTIR_OP_GT, Ge = PTIR_OP_GE, Eq = PTIR_OP_EQ, Ne = PTIR_OP_NE, Lt = PTIR_OP_LT, Le = PTIR_OP_LE,
+    And = PTIR_OP_AND, Or = PTIR_OP_OR, Not = PTIR_OP_NOT,
+    Rem = PTIR_OP_REM,
+    // choice
+    Select = PTIR_OP_SELECT,
+    // reduce / scan (row-local)
+    ReduceSum = PTIR_OP_REDUCE_SUM, ReduceMax = PTIR_OP_REDUCE_MAX,
+    ReduceMin = PTIR_OP_REDUCE_MIN, ReduceArgmax = PTIR_OP_REDUCE_ARGMAX,
+    CumSum = PTIR_OP_CUMSUM, CumProd = PTIR_OP_CUMPROD,
+    // shape
+    Broadcast = PTIR_OP_BROADCAST, Reshape = PTIR_OP_RESHAPE, Transpose = PTIR_OP_TRANSPOSE,
+    // order (sort_desc/top_k = 2 results value-first; pivot_threshold = bool mask)
+    SortDesc = PTIR_OP_SORT_DESC, TopK = PTIR_OP_TOP_K, PivotThreshold = PTIR_OP_PIVOT_THRESHOLD,
+    // linear (library)
+    Matmul = PTIR_OP_MATMUL,
+    // index
+    Gather = PTIR_OP_GATHER, GatherRow = PTIR_OP_GATHER_ROW,
+    ScatterAdd = PTIR_OP_SCATTER_ADD, ScatterSet = PTIR_OP_SCATTER_SET,
+    Iota = PTIR_OP_IOTA,
+    // sampling primitives
+    MaskApplyPacked = PTIR_OP_MASK_APPLY_PACKED,
+    Rng = PTIR_OP_RNG, RngKeyed = PTIR_OP_RNG_KEYED,
+    // structural (container roots/effects; translated by the reader, not launched)
+    Const = PTIR_OP_CONST,
+    ChanTake = PTIR_OP_CHAN_TAKE, ChanRead = PTIR_OP_CHAN_READ, ChanPut = PTIR_OP_CHAN_PUT,
+    IntrinsicVal = PTIR_OP_INTRINSIC_VAL, KernelCall = PTIR_OP_KERNEL_CALL, SinkCall = PTIR_OP_SINK_CALL,
 
-    // compare / logic — bool results (packed on the wire, D1)
-    Eq = 0x10, Ne = 0x11, Lt = 0x12, Le = 0x13, Gt = 0x14, Ge = 0x15,
-    And = 0x16, Or = 0x17, Not = 0x18,
-
-    // choice — the data-dependent branch (§2)
-    Select = 0x20,
-
-    // shape — metadata only, no data movement (Broadcast/Transpose materialize
-    // in a buffer backend; Reshape is a pure alias)
-    Reshape = 0x28, Broadcast = 0x29, Transpose = 0x2A,
-
-    // index — scatter_set duplicates resolve in index order, last wins (§6.2)
-    Iota = 0x30, Gather = 0x31, ScatterSet = 0x32,
-
-    // reduce / scan — row-local over the last axis (§7.3)
-    ReduceSum = 0x40, ReduceMax = 0x41, ReduceArgmax = 0x42,
-    CumSum = 0x43, CumProd = 0x44,
-
-    // normalize — composed reduce + map; fuse in tier 1
-    Softmax = 0x50, LogSoftmax = 0x51, L2Norm = 0x52,
-
-    // order — rank_le(k) is the rank predicate pivot_threshold cuts at; top_k
-    // links as a library kernel (§7.3), never generated
-    TopK = 0x60, PivotThreshold = 0x61, RankLe = 0x62,
-
-    // linear — the core's one GEMM; a library kernel (§7.3)
-    Matmul = 0x70,
-
-    // sampling — composed over rng state + map (§3, §4); replay-deterministic
-    Gumbel = 0x78, MaskApply = 0x79,
+    // ── composite / fusion-only (NOT container ops; core-op expansions, §7.3) ──
+    Softmax = 0xE0, LogSoftmax = 0xE1, L2Norm = 0xE2,
+    GumbelNoise = 0xE3,     // gumbel = -log(-log(rng_uniform))
+    MaskApplyBool = 0xE4,   // unpacked bool mask variant of mask_apply
+    RankLe = 0xE5,          // the rank predicate pivot_threshold cuts at, as a bool op
 };
 
 enum class OpFamily : std::uint8_t {
-    Map, Compare, Choice, Shape, Index, Reduce, Normalize, Order, Linear, Sampling,
+    Map, Compare, Choice, Shape, Index, Reduce, Order, Linear, Sampling, Structural,
 };
 
-// Result-element kind an op yields regardless of input dtype:
-//   SameAsInput — preserves the first operand's dtype (map/select/reduce_sum…)
-//   Bool        — compare/logic always yield bool
-//   Index       — reduce_argmax / iota / rank predicates yield u32 indices
-//   Custom      — dtype is carried explicitly on the op (cast, gather, top_k…)
-enum class ResultKind : std::uint8_t { SameAsInput, Bool, Index, Custom };
+enum class ResultKind : std::uint8_t { SameAsInput, Bool, Index, Custom, None };
 
-// How the op maps threads to data — the tier-0 launcher reads this to pick a
-// launch shape, and tier-1 fusion reads it to decide the cut points.
-//   Elementwise — grid-stride over numel; a pure per-element map
-//   RowLocal    — one CTA per row; a reduction/scan/normalize over the last axis
-//   Gather      — grid-stride over the index/output length
-//   Scatter     — grid-stride over the source length; last-writer-wins
-//   Library     — a prebuilt library kernel (top_k, matmul); never generated
-//   Materialize — a shape op that copies with an index remap (broadcast/transpose)
-//   Alias       — a pure metadata op (reshape); no kernel launched
 enum class LaunchClass : std::uint8_t {
-    Elementwise, RowLocal, Gather, Scatter, Library, Materialize, Alias,
+    Elementwise, RowLocal, Gather, Scatter, Library, Materialize, Alias, Structural,
 };
 
 struct OpInfo {
@@ -107,70 +98,88 @@ struct OpInfo {
     OpFamily    family;
     LaunchClass launch;
     ResultKind  result;
-    std::uint8_t arity;      // number of value operands
-    std::string_view name;   // canonical spelling (matches the overview)
+    std::uint8_t arity;      // value-operand count (0xFE = variadic, 0xFF = unknown)
+    std::uint8_t results;    // SSA ids defined (0 for chan_put/sink_call, 2 for sort/top_k)
+    std::string_view name;
 };
 
-// Metadata lookup. constexpr so it folds at compile time in both host tools and
-// device-side codegen. Returns a sentinel (arity 0xFF) for an unknown byte.
 inline constexpr OpInfo op_info(OpCode c) {
-    using F = OpFamily;
-    using L = LaunchClass;
-    using R = ResultKind;
+    using F = OpFamily; using L = LaunchClass; using R = ResultKind;
     switch (c) {
-        case OpCode::Add:  return {c, F::Map, L::Elementwise, R::SameAsInput, 2, "add"};
-        case OpCode::Sub:  return {c, F::Map, L::Elementwise, R::SameAsInput, 2, "sub"};
-        case OpCode::Mul:  return {c, F::Map, L::Elementwise, R::SameAsInput, 2, "mul"};
-        case OpCode::Div:  return {c, F::Map, L::Elementwise, R::SameAsInput, 2, "div"};
-        case OpCode::Rem:  return {c, F::Map, L::Elementwise, R::SameAsInput, 2, "rem"};
-        case OpCode::Neg:  return {c, F::Map, L::Elementwise, R::SameAsInput, 1, "neg"};
-        case OpCode::Exp:  return {c, F::Map, L::Elementwise, R::SameAsInput, 1, "exp"};
-        case OpCode::Log:  return {c, F::Map, L::Elementwise, R::SameAsInput, 1, "log"};
-        case OpCode::Cast: return {c, F::Map, L::Elementwise, R::Custom,      1, "cast"};
+        case OpCode::Exp:   return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "exp"};
+        case OpCode::Log:   return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "log"};
+        case OpCode::Neg:   return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "neg"};
+        case OpCode::Recip: return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "recip"};
+        case OpCode::Abs:   return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "abs"};
+        case OpCode::Sign:  return {c, F::Map, L::Elementwise, R::SameAsInput, 1, 1, "sign"};
+        case OpCode::Cast:  return {c, F::Map, L::Elementwise, R::Custom,      1, 1, "cast"};
+        case OpCode::Add:   return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "add"};
+        case OpCode::Sub:   return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "sub"};
+        case OpCode::Mul:   return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "mul"};
+        case OpCode::Div:   return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "div"};
+        case OpCode::MaxElem: return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "max_elem"};
+        case OpCode::MinElem: return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "min_elem"};
 
-        case OpCode::Eq: return {c, F::Compare, L::Elementwise, R::Bool, 2, "eq"};
-        case OpCode::Ne: return {c, F::Compare, L::Elementwise, R::Bool, 2, "ne"};
-        case OpCode::Lt: return {c, F::Compare, L::Elementwise, R::Bool, 2, "lt"};
-        case OpCode::Le: return {c, F::Compare, L::Elementwise, R::Bool, 2, "le"};
-        case OpCode::Gt: return {c, F::Compare, L::Elementwise, R::Bool, 2, "gt"};
-        case OpCode::Ge: return {c, F::Compare, L::Elementwise, R::Bool, 2, "ge"};
-        case OpCode::And: return {c, F::Compare, L::Elementwise, R::Bool, 2, "and"};
-        case OpCode::Or:  return {c, F::Compare, L::Elementwise, R::Bool, 2, "or"};
-        case OpCode::Not: return {c, F::Compare, L::Elementwise, R::Bool, 1, "not"};
+        case OpCode::Gt: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "gt"};
+        case OpCode::Ge: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "ge"};
+        case OpCode::Eq: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "eq"};
+        case OpCode::Ne: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "ne"};
+        case OpCode::Lt: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "lt"};
+        case OpCode::Le: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "le"};
+        case OpCode::And: return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "and"};
+        case OpCode::Or:  return {c, F::Compare, L::Elementwise, R::Bool, 2, 1, "or"};
+        case OpCode::Not: return {c, F::Compare, L::Elementwise, R::Bool, 1, 1, "not"};
+        case OpCode::Rem: return {c, F::Map, L::Elementwise, R::SameAsInput, 2, 1, "rem"};
 
-        case OpCode::Select: return {c, F::Choice, L::Elementwise, R::SameAsInput, 3, "select"};
+        case OpCode::Select: return {c, F::Choice, L::Elementwise, R::SameAsInput, 3, 1, "select"};
 
-        case OpCode::Reshape:   return {c, F::Shape, L::Alias,       R::SameAsInput, 1, "reshape"};
-        case OpCode::Broadcast: return {c, F::Shape, L::Materialize, R::SameAsInput, 1, "broadcast"};
-        case OpCode::Transpose: return {c, F::Shape, L::Materialize, R::SameAsInput, 1, "transpose"};
+        case OpCode::ReduceSum:    return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, 1, "reduce_sum"};
+        case OpCode::ReduceMax:    return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, 1, "reduce_max"};
+        case OpCode::ReduceMin:    return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, 1, "reduce_min"};
+        case OpCode::ReduceArgmax: return {c, F::Reduce, L::RowLocal, R::Index,       1, 1, "reduce_argmax"};
+        case OpCode::CumSum:       return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, 1, "cumsum"};
+        case OpCode::CumProd:      return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, 1, "cumprod"};
 
-        case OpCode::Iota:       return {c, F::Index, L::Elementwise, R::Index,       0, "iota"};
-        case OpCode::Gather:     return {c, F::Index, L::Gather,      R::SameAsInput, 2, "gather"};
-        case OpCode::ScatterSet: return {c, F::Index, L::Scatter,     R::SameAsInput, 3, "scatter_set"};
+        case OpCode::Broadcast: return {c, F::Shape, L::Materialize, R::SameAsInput, 1, 1, "broadcast"};
+        case OpCode::Reshape:   return {c, F::Shape, L::Alias,       R::SameAsInput, 1, 1, "reshape"};
+        case OpCode::Transpose: return {c, F::Shape, L::Materialize, R::SameAsInput, 1, 1, "transpose"};
 
-        case OpCode::ReduceSum:    return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, "reduce_sum"};
-        case OpCode::ReduceMax:    return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, "reduce_max"};
-        case OpCode::ReduceArgmax: return {c, F::Reduce, L::RowLocal, R::Index,       1, "reduce_argmax"};
-        case OpCode::CumSum:       return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, "cumsum"};
-        case OpCode::CumProd:      return {c, F::Reduce, L::RowLocal, R::SameAsInput, 1, "cumprod"};
+        case OpCode::SortDesc:       return {c, F::Order, L::Library,  R::Custom, 1, 2, "sort_desc"};
+        case OpCode::TopK:           return {c, F::Order, L::Library,  R::Custom, 1, 2, "top_k"};
+        case OpCode::PivotThreshold: return {c, F::Order, L::RowLocal, R::Bool,   2, 1, "pivot_threshold"};
 
-        case OpCode::Softmax:    return {c, F::Normalize, L::RowLocal, R::SameAsInput, 1, "softmax"};
-        case OpCode::LogSoftmax: return {c, F::Normalize, L::RowLocal, R::SameAsInput, 1, "log_softmax"};
-        case OpCode::L2Norm:     return {c, F::Normalize, L::RowLocal, R::SameAsInput, 1, "l2norm"};
+        case OpCode::Matmul: return {c, F::Linear, L::Library, R::SameAsInput, 2, 1, "matmul"};
 
-        case OpCode::TopK:           return {c, F::Order, L::Library,     R::Custom,      1, "top_k"};
-        case OpCode::PivotThreshold: return {c, F::Order, L::RowLocal,    R::SameAsInput, 1, "pivot_threshold"};
-        case OpCode::RankLe:         return {c, F::Order, L::RowLocal,    R::Bool,        1, "rank_le"};
+        case OpCode::Gather:     return {c, F::Index, L::Gather,  R::SameAsInput, 2, 1, "gather"};
+        case OpCode::GatherRow:  return {c, F::Index, L::Gather,  R::SameAsInput, 2, 1, "gather_row"};
+        case OpCode::ScatterAdd: return {c, F::Index, L::Scatter, R::SameAsInput, 3, 1, "scatter_add"};
+        case OpCode::ScatterSet: return {c, F::Index, L::Scatter, R::SameAsInput, 3, 1, "scatter_set"};
+        case OpCode::Iota:       return {c, F::Index, L::Elementwise, R::Index,   0, 1, "iota"};
 
-        case OpCode::Matmul: return {c, F::Linear, L::Library, R::SameAsInput, 2, "matmul"};
+        case OpCode::MaskApplyPacked: return {c, F::Sampling, L::Elementwise, R::SameAsInput, 2, 1, "mask_apply_packed"};
+        case OpCode::Rng:      return {c, F::Sampling, L::Elementwise, R::SameAsInput, 0, 1, "rng"};
+        case OpCode::RngKeyed: return {c, F::Sampling, L::Elementwise, R::SameAsInput, 1, 1, "rng_keyed"};
 
-        case OpCode::Gumbel:    return {c, F::Sampling, L::Elementwise, R::SameAsInput, 1, "gumbel"};
-        case OpCode::MaskApply: return {c, F::Sampling, L::Elementwise, R::SameAsInput, 2, "mask_apply"};
+        case OpCode::Const:        return {c, F::Structural, L::Structural, R::Custom,      0, 1, "const"};
+        case OpCode::ChanTake:     return {c, F::Structural, L::Structural, R::Custom,      0, 1, "chan_take"};
+        case OpCode::ChanRead:     return {c, F::Structural, L::Structural, R::Custom,      0, 1, "chan_read"};
+        case OpCode::ChanPut:      return {c, F::Structural, L::Structural, R::None,        1, 0, "chan_put"};
+        case OpCode::IntrinsicVal: return {c, F::Structural, L::Structural, R::Custom,      0, 1, "intrinsic_val"};
+        case OpCode::KernelCall:   return {c, F::Structural, L::Structural, R::Custom,   0xFE, 1, "kernel_call"};
+        case OpCode::SinkCall:     return {c, F::Structural, L::Structural, R::None,     0xFE, 0, "sink_call"};
+
+        case OpCode::Softmax:       return {c, F::Sampling, L::RowLocal,    R::SameAsInput, 1, 1, "softmax"};
+        case OpCode::LogSoftmax:    return {c, F::Sampling, L::RowLocal,    R::SameAsInput, 1, 1, "log_softmax"};
+        case OpCode::L2Norm:        return {c, F::Sampling, L::RowLocal,    R::SameAsInput, 1, 1, "l2norm"};
+        case OpCode::GumbelNoise:   return {c, F::Sampling, L::Elementwise, R::SameAsInput, 1, 1, "gumbel"};
+        case OpCode::MaskApplyBool: return {c, F::Sampling, L::Elementwise, R::SameAsInput, 2, 1, "mask_apply"};
+        case OpCode::RankLe:        return {c, F::Order,    L::RowLocal,    R::Bool,        1, 1, "rank_le"};
     }
-    return {c, OpFamily::Map, LaunchClass::Alias, ResultKind::Custom, 0xFF, "?"};
+    return {c, OpFamily::Map, LaunchClass::Alias, ResultKind::Custom, 0xFF, 1, "?"};
 }
 
 inline constexpr bool op_is_known(OpCode c) { return op_info(c).arity != 0xFF; }
 inline constexpr std::string_view op_name(OpCode c) { return op_info(c).name; }
+inline constexpr std::uint32_t op_result_count(OpCode c) { return op_info(c).results; }
 
 }  // namespace pie_cuda_driver::ptir

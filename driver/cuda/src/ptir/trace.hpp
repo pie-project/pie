@@ -134,10 +134,10 @@ struct Op {
     std::uint32_t imm = 0;          // TopK k, Transpose axis pair, Iota len, …
 
     ValueId       result_id = 0;    // first SSA id this op defines
-    std::uint32_t result_count = 1; // top_k → 2 (value, index)
+    std::uint32_t result_count = 1; // top_k / sort_desc → 2 (value, index)
 };
 
-inline std::uint32_t op_result_count(OpCode c) { return c == OpCode::TopK ? 2u : 1u; }
+// op_result_count(OpCode) is provided by op_table.hpp (sort_desc/top_k → 2).
 
 // A channel effect: this stage `put`s `value` into `channel` at pass end
 // (predicated on the commit flag, §7.1). Ordered within the stage (register

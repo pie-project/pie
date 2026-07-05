@@ -64,6 +64,8 @@ std::vector<T> binary(BinKind k, const std::vector<T>& a, const std::vector<T>& 
                 if constexpr (std::is_floating_point_v<T>) o[i] = std::fmod(a[i], b[i]);
                 else o[i] = a[i] - (a[i] / b[i]) * b[i];
                 break;
+            case BinKind::MaxElem: o[i] = a[i] > b[i] ? a[i] : b[i]; break;
+            case BinKind::MinElem: o[i] = a[i] < b[i] ? a[i] : b[i]; break;
         }
     }
     return o;
@@ -73,9 +75,12 @@ std::vector<T> unary(UnKind k, const std::vector<T>& a) {
     std::vector<T> o(a.size());
     for (std::size_t i = 0; i < a.size(); ++i) {
         switch (k) {
-            case UnKind::Neg: o[i] = -a[i]; break;
-            case UnKind::Exp: o[i] = (T)std::exp((float)a[i]); break;
-            case UnKind::Log: o[i] = (T)std::log((float)a[i]); break;
+            case UnKind::Neg:   o[i] = -a[i]; break;
+            case UnKind::Exp:   o[i] = (T)std::exp((float)a[i]); break;
+            case UnKind::Log:   o[i] = (T)std::log((float)a[i]); break;
+            case UnKind::Recip: o[i] = (T)(1.0f / (float)a[i]); break;
+            case UnKind::Abs:   o[i] = (T)std::fabs((float)a[i]); break;
+            case UnKind::Sign:  o[i] = (T)(((float)a[i] > 0.0f) - ((float)a[i] < 0.0f)); break;
         }
     }
     return o;
@@ -138,10 +143,26 @@ std::vector<T> gather(const std::vector<T>& src, const std::vector<std::uint32_t
     return o;
 }
 template <class T>
+std::vector<T> gather_row(const std::vector<T>& src, const std::vector<std::uint32_t>& idx,
+                          std::uint32_t row_len) {
+    std::vector<T> o(idx.size() * row_len);
+    for (std::size_t i = 0; i < idx.size(); ++i)
+        for (std::uint32_t j = 0; j < row_len; ++j)
+            o[i * row_len + j] = src[(std::size_t)idx[i] * row_len + j];
+    return o;
+}
+template <class T>
 std::vector<T> scatter_set(const std::vector<T>& base, const std::vector<std::uint32_t>& idx,
                            const std::vector<T>& vals) {
     std::vector<T> o = base;
     for (std::size_t j = 0; j < idx.size(); ++j) o[idx[j]] = vals[j];  // last wins
+    return o;
+}
+template <class T>
+std::vector<T> scatter_add(const std::vector<T>& base, const std::vector<std::uint32_t>& idx,
+                           const std::vector<T>& vals) {
+    std::vector<T> o = base;
+    for (std::size_t j = 0; j < idx.size(); ++j) o[idx[j]] = (T)(o[idx[j]] + vals[j]);
     return o;
 }
 
@@ -152,8 +173,11 @@ std::vector<T> reduce(RedKind k, const std::vector<T>& in, std::uint32_t rows, s
     for (std::uint32_t r = 0; r < rows; ++r) {
         const T* row = in.data() + (std::size_t)r * len;
         T acc = (k == RedKind::Sum) ? (T)0 : row[0];
-        for (std::uint32_t i = 0; i < len; ++i) acc = (k == RedKind::Sum) ? (T)(acc + row[i])
-                                                                          : std::max(acc, row[i]);
+        for (std::uint32_t i = 0; i < len; ++i) {
+            if (k == RedKind::Sum) acc = (T)(acc + row[i]);
+            else if (k == RedKind::Max) acc = std::max(acc, row[i]);
+            else acc = std::min(acc, row[i]);
+        }
         o[r] = acc;
     }
     return o;
@@ -229,6 +253,65 @@ inline std::vector<float> gumbel(const std::vector<std::uint32_t>& row_seed, std
         for (std::uint32_t j = 0; j < len; ++j) o[(std::size_t)r * len + j] = h_gumbel_noise(se, (int)j);
     }
     return o;
+}
+// rng (0x70 ambient): per-row draw; gumbel=true → -log(-log(u)), else uniform.
+inline std::vector<float> rng_ambient(const std::vector<std::uint32_t>& row_seed, std::uint32_t stream,
+                                      std::uint32_t rows, std::uint32_t len, bool gumbel) {
+    std::vector<float> o((std::size_t)rows * len);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        std::uint64_t se = h_seed_eff_stream(row_seed[r], stream);
+        for (std::uint32_t j = 0; j < len; ++j) {
+            float u = h_hash_uniform(se, (int)j);
+            o[(std::size_t)r * len + j] = gumbel ? -std::log(-std::log(u)) : u;
+        }
+    }
+    return o;
+}
+// rng_keyed (0x71): seed64 = splitmix64((key<<32)|ctr); element j → hash_uniform.
+inline std::vector<float> rng_keyed(std::uint32_t key, std::uint32_t ctr, std::uint64_t numel, bool gumbel) {
+    std::uint64_t seed64 = h_splitmix64(((std::uint64_t)key << 32) | (std::uint64_t)ctr);
+    std::vector<float> o(numel);
+    for (std::uint64_t j = 0; j < numel; ++j) {
+        float u = h_hash_uniform(seed64, (int)j);
+        o[j] = gumbel ? -std::log(-std::log(u)) : u;
+    }
+    return o;
+}
+// mask_apply_packed: bit j (word j>>5, bit j&31), 1 = keep, else -inf. Per row.
+inline std::vector<float> mask_apply_packed(const std::vector<float>& logits,
+                                            const std::vector<std::uint32_t>& mask,
+                                            std::uint32_t rows, std::uint32_t len, std::uint32_t mask_words) {
+    std::vector<float> o(logits.size());
+    for (std::uint32_t r = 0; r < rows; ++r)
+        for (std::uint32_t j = 0; j < len; ++j) {
+            std::uint32_t word = mask[(std::size_t)r * mask_words + (j >> 5)];
+            bool keep = (word >> (j & 31)) & 1u;
+            o[(std::size_t)r * len + j] = keep ? logits[(std::size_t)r * len + j] : neg_inf();
+        }
+    return o;
+}
+// sort_desc row-local: descending, ties → lower original index; NaN below −inf.
+inline void sort_desc(const std::vector<float>& in, std::uint32_t rows, std::uint32_t len,
+                      std::vector<float>& out_val, std::vector<std::uint32_t>& out_idx) {
+    out_val.assign(in.size(), 0.f);
+    out_idx.assign(in.size(), 0u);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        const float* row = in.data() + (std::size_t)r * len;
+        std::vector<std::uint32_t> order(len);
+        for (std::uint32_t i = 0; i < len; ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
+            float va = row[a], vb = row[b];
+            bool na = std::isnan(va), nb = std::isnan(vb);
+            if (na != nb) return nb;          // NaN sorts last
+            if (na && nb) return a < b;
+            if (va != vb) return va > vb;      // descending
+            return a < b;                      // ties → lower index
+        });
+        for (std::uint32_t i = 0; i < len; ++i) {
+            out_val[(std::size_t)r * len + i] = row[order[i]];
+            out_idx[(std::size_t)r * len + i] = order[i];
+        }
+    }
 }
 
 // ────────────────────────────── order family ─────────────────────────────

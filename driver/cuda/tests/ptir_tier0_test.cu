@@ -316,6 +316,98 @@ void test_shape_linear() {
     CUDA_OK(cudaFree(dA)); CUDA_OK(cudaFree(dB)); CUDA_OK(cudaFree(dC));
 }
 
+void test_new_ops() {
+    std::printf("[new ops: max/min_elem, recip/abs/sign, reduce_min, gather_row, scatter_add, sort_desc, mask_apply_packed, rng_keyed]\n");
+    std::vector<float> a{1, 5, 3, 8, 2, 6, -7, 4};
+    std::vector<float> b{2, 2, 9, 3, 5, 4, -2, 3};
+    float *da = dev_from(a), *db = dev_from(b), *dout = dev_alloc<float>(a.size());
+    for (auto [k, nm] : {std::pair{BinKind::MaxElem, "max_elem"}, {BinKind::MinElem, "min_elem"}}) {
+        k_binary<float><<<GS(a.size()), kTier0Block>>>(da, db, dout, a.size(), k);
+        CUDA_OK(cudaDeviceSynchronize());
+        check(nm, to_host(dout, a.size()), host_eval::binary(k, a, b));
+    }
+    for (auto [k, nm] : {std::pair{UnKind::Recip, "recip"}, {UnKind::Abs, "abs"}, {UnKind::Sign, "sign"}}) {
+        k_unary<float><<<GS(a.size()), kTier0Block>>>(da, dout, a.size(), k);
+        CUDA_OK(cudaDeviceSynchronize());
+        check(nm, to_host(dout, a.size()), host_eval::unary(k, a));
+    }
+    // reduce_min over rows
+    std::uint32_t rows = 2, len = 4;
+    std::vector<float> m{3, 1, 4, 1, 9, 2, 6, 5};
+    float* dm = dev_from(m);
+    float* dr = dev_alloc<float>(rows);
+    k_reduce<float><<<rows, kTier0Block>>>(dm, dr, rows, len, RedKind::Min);
+    CUDA_OK(cudaDeviceSynchronize());
+    check("reduce_min", to_host(dr, rows), host_eval::reduce(RedKind::Min, m, rows, len));
+
+    // gather_row: src [4,3], idx [2] -> [2,3]
+    std::vector<float> src{0,1,2, 3,4,5, 6,7,8, 9,10,11};
+    std::vector<std::uint32_t> idx{3, 1};
+    float* dsrc = dev_from(src);
+    std::uint32_t* didx = dev_from(idx);
+    float* dgr = dev_alloc<float>(idx.size() * 3);
+    k_gather_row<float><<<GS(idx.size()*3), kTier0Block>>>(dsrc, didx, dgr, (std::uint32_t)idx.size(), 3);
+    CUDA_OK(cudaDeviceSynchronize());
+    check("gather_row", to_host(dgr, idx.size()*3), host_eval::gather_row(src, idx, 3));
+
+    // scatter_add with duplicate target
+    std::vector<float> base{0,0,0,0,0,0};
+    std::vector<std::uint32_t> sidx{1, 3, 1, 4};
+    std::vector<float> vals{5, 2, 3, 7};
+    float* dbase = dev_from(base);
+    std::uint32_t* dsidx = dev_from(sidx);
+    float* dvals = dev_from(vals);
+    CUDA_OK(cudaMemcpy(dbase, base.data(), base.size()*sizeof(float), cudaMemcpyHostToDevice));
+    k_scatter_add_serial<float><<<1,1>>>(dbase, dsidx, dvals, (std::uint32_t)sidx.size());
+    CUDA_OK(cudaDeviceSynchronize());
+    check("scatter_add", to_host(dbase, base.size()), host_eval::scatter_add(base, sidx, vals));
+
+    // sort_desc [2,5]
+    std::uint32_t sr = 2, sl = 5;
+    std::vector<float> sv{3, 1, 4, 1, 5, 9, 2, 6, 5, 3};
+    float* dsv = dev_from(sv);
+    float* dsval = dev_alloc<float>(sv.size());
+    std::uint32_t* dsidx2 = dev_alloc<std::uint32_t>(sv.size());
+    k_topk_rows<<<sr, kTier0Block, sl*sizeof(std::uint8_t)>>>(dsv, dsval, dsidx2, sr, sl, sl);
+    CUDA_OK(cudaDeviceSynchronize());
+    std::vector<float> ev; std::vector<std::uint32_t> ei;
+    host_eval::sort_desc(sv, sr, sl, ev, ei);
+    check("sort_desc.values", to_host(dsval, sv.size()), ev);
+    check("sort_desc.indices", to_host(dsidx2, sv.size()), ei);
+
+    // mask_apply_packed [2, 40] (2 mask words/row)
+    std::uint32_t pr = 2, pl = 40, pw = (pl + 31) / 32;
+    std::vector<float> plog(pr * pl);
+    for (std::uint32_t i = 0; i < plog.size(); ++i) plog[i] = 0.5f * i - 3.0f;
+    std::vector<std::uint32_t> pmask(pr * pw);
+    for (std::uint32_t i = 0; i < pmask.size(); ++i) pmask[i] = 0xA5A5A5A5u ^ (i * 2654435761u);
+    float* dplog = dev_from(plog);
+    std::uint32_t* dpmask = dev_from(pmask);
+    float* dpout = dev_alloc<float>(plog.size());
+    k_mask_apply_packed<<<GS(plog.size()), kTier0Block>>>(dplog, dpmask, dpout, pr, pl, pw);
+    CUDA_OK(cudaDeviceSynchronize());
+    check("mask_apply_packed", to_host(dpout, plog.size()), host_eval::mask_apply_packed(plog, pmask, pr, pl, pw));
+
+    // rng_keyed: state=[key,ctr], numel=32, uniform + gumbel
+    std::vector<std::uint32_t> state{0xDEADBEEFu, 7u};
+    std::uint32_t* dstate = dev_from(state);
+    std::uint32_t rn = 32;
+    float* drk = dev_alloc<float>(rn);
+    k_rng_keyed<<<GS(rn), kTier0Block>>>(dstate, drk, rn, 0);
+    CUDA_OK(cudaDeviceSynchronize());
+    check("rng_keyed.uniform", to_host(drk, rn), host_eval::rng_keyed(state[0], state[1], rn, false));
+    k_rng_keyed<<<GS(rn), kTier0Block>>>(dstate, drk, rn, 1);
+    CUDA_OK(cudaDeviceSynchronize());
+    check("rng_keyed.gumbel", to_host(drk, rn), host_eval::rng_keyed(state[0], state[1], rn, true));
+
+    CUDA_OK(cudaFree(da)); CUDA_OK(cudaFree(db)); CUDA_OK(cudaFree(dout)); CUDA_OK(cudaFree(dm));
+    CUDA_OK(cudaFree(dr)); CUDA_OK(cudaFree(dsrc)); CUDA_OK(cudaFree(didx)); CUDA_OK(cudaFree(dgr));
+    CUDA_OK(cudaFree(dbase)); CUDA_OK(cudaFree(dsidx)); CUDA_OK(cudaFree(dvals));
+    CUDA_OK(cudaFree(dsv)); CUDA_OK(cudaFree(dsval)); CUDA_OK(cudaFree(dsidx2));
+    CUDA_OK(cudaFree(dplog)); CUDA_OK(cudaFree(dpmask)); CUDA_OK(cudaFree(dpout));
+    CUDA_OK(cudaFree(dstate)); CUDA_OK(cudaFree(drk));
+}
+
 }  // namespace
 
 int main() {
@@ -331,6 +423,7 @@ int main() {
     std::printf("[reduce/scan/normalize]\n"); test_reduce_scan_normalize();
     std::printf("[sampling/order/library]\n"); test_sampling_order_library();
     std::printf("[shape/linear]\n");          test_shape_linear();
+    test_new_ops();
 
     std::printf("\n==== tier-0 parity: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
