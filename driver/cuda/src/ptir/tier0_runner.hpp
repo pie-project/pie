@@ -252,6 +252,29 @@ class Tier0Runner {
         }
         lo.elem_dtype = prim;
 
+        // Scalar-broadcast flags: an elementwise operand of numel 1 against a
+        // wider result broadcasts (index 0). Covers `mul(logits, scalar)` etc.
+        std::uint64_t out_n = rt.shape.numel() == 0 ? 1 : rt.shape.numel();
+        auto operand_numel = [&](std::size_t k) -> std::uint64_t {
+            if (k >= op.args.size()) return out_n;
+            const Value* v = trace_->value(op.args[k]);
+            if (!v) return out_n;
+            std::uint64_t n = v->type.shape.numel();
+            return n == 0 ? 1 : n;
+        };
+        if (op.args.size() >= 2) {
+            lo.a_scalar = (operand_numel(0) == 1 && out_n > 1) ? 1 : 0;
+            lo.b_scalar = (operand_numel(1) == 1 && out_n > 1) ? 1 : 0;
+        }
+        // select: broadcast the a/b operands (args[1], args[2]); cond is full.
+        // Its element dtype is a/b's (= result dtype), NOT cond's (bool).
+        if (op.code == OpCode::Select && op.args.size() == 3) {
+            const Value* va = trace_->value(op.args[1]);
+            if (va) lo.elem_dtype = va->type.dtype;
+            lo.a_scalar = (operand_numel(1) == 1 && out_n > 1) ? 1 : 0;
+            lo.b_scalar = (operand_numel(2) == 1 && out_n > 1) ? 1 : 0;
+        }
+
         // Family-specific fixups.
         switch (op.code) {
             case OpCode::Reshape:                       // alias: result ptr = operand ptr

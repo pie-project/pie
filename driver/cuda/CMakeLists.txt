@@ -1003,6 +1003,19 @@ add_executable(test_ptir_container
 target_include_directories(test_ptir_container PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# PTIR tier-1 JIT fusion gate (Thrust 3 / charlie, P5). Emits a fused epilogue
+# kernel (src/ptir/tier1_codegen.hpp), NVRTC-compiles + launches it, and asserts
+# tier-1 == tier-0 (the stage-runner) on the same trace — greedy + temp/Gumbel
+# sample fused into ONE kernel. Needs a GPU + NVRTC at runtime.
+add_executable(test_ptir_tier1
+  tests/ptir_tier1_test.cu)
+target_include_directories(test_ptir_tier1 PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_ptir_tier1 PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_ptir_tier1 PRIVATE
+  CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
@@ -1022,6 +1035,7 @@ add_test(NAME ptir_tier0 COMMAND test_ptir_tier0)
 add_test(NAME ptir_runner COMMAND test_ptir_runner)
 add_test(NAME ptir_container COMMAND test_ptir_container
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+add_test(NAME ptir_tier1 COMMAND test_ptir_tier1)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

@@ -100,10 +100,11 @@ __device__ __forceinline__ float t0_bin<float>(BinKind k, float a, float b) {
 
 template <class T>
 __global__ void k_binary(const T* __restrict__ a, const T* __restrict__ b,
-                         T* __restrict__ out, std::uint64_t n, BinKind kind) {
+                         T* __restrict__ out, std::uint64_t n, BinKind kind,
+                         int a_scalar = 0, int b_scalar = 0) {
     for (std::uint64_t i = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
          i < n; i += (std::uint64_t)gridDim.x * blockDim.x) {
-        out[i] = t0_bin<T>(kind, a[i], b[i]);
+        out[i] = t0_bin<T>(kind, a[a_scalar ? 0 : i], b[b_scalar ? 0 : i]);
     }
 }
 
@@ -130,10 +131,11 @@ enum class CmpKind : std::uint8_t { Eq, Ne, Lt, Le, Gt, Ge };
 
 template <class T>
 __global__ void k_compare(const T* __restrict__ a, const T* __restrict__ b,
-                          std::uint8_t* __restrict__ out, std::uint64_t n, CmpKind kind) {
+                          std::uint8_t* __restrict__ out, std::uint64_t n, CmpKind kind,
+                          int a_scalar = 0, int b_scalar = 0) {
     for (std::uint64_t i = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
          i < n; i += (std::uint64_t)gridDim.x * blockDim.x) {
-        T x = a[i], y = b[i];
+        T x = a[a_scalar ? 0 : i], y = b[b_scalar ? 0 : i];
         bool r = false;
         switch (kind) {
             case CmpKind::Eq: r = (x == y); break;
@@ -169,10 +171,11 @@ __global__ void k_not(const std::uint8_t* __restrict__ a, std::uint8_t* __restri
 // select(cond, a, b): cond != 0 → a else b (§2, the data-dependent branch).
 template <class T>
 __global__ void k_select(const std::uint8_t* __restrict__ cond, const T* __restrict__ a,
-                         const T* __restrict__ b, T* __restrict__ out, std::uint64_t n) {
+                         const T* __restrict__ b, T* __restrict__ out, std::uint64_t n,
+                         int a_scalar = 0, int b_scalar = 0) {
     for (std::uint64_t i = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
          i < n; i += (std::uint64_t)gridDim.x * blockDim.x) {
-        out[i] = cond[i] ? a[i] : b[i];
+        out[i] = cond[i] ? a[a_scalar ? 0 : i] : b[b_scalar ? 0 : i];
     }
 }
 

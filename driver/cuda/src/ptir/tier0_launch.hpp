@@ -39,6 +39,8 @@ struct LaunchOp {
     std::uint32_t rng_stream = 0;   // gumbel stream salt
     const void*   row_seeds = nullptr;  // gumbel per-row seed buffer
     std::uint32_t n_scatter = 0;    // scatter_set index count
+    int           a_scalar = 0;     // broadcast: operand 0 is a scalar (index 0)
+    int           b_scalar = 0;     // broadcast: operand 1 is a scalar (index 0)
 
     cudaStream_t stream = nullptr;
 };
@@ -51,7 +53,7 @@ constexpr int gs(std::uint64_t n, int b = kTier0Block) { return (int)((n + b - 1
 template <class T>
 inline void run_binary(const LaunchOp& o, BinKind k) {
     k_binary<T><<<gs(o.numel), kTier0Block, 0, o.stream>>>(
-        (const T*)o.in[0], (const T*)o.in[1], (T*)o.out, o.numel, k);
+        (const T*)o.in[0], (const T*)o.in[1], (T*)o.out, o.numel, k, o.a_scalar, o.b_scalar);
 }
 template <class T>
 inline void run_unary(const LaunchOp& o, UnKind k) {
@@ -60,12 +62,12 @@ inline void run_unary(const LaunchOp& o, UnKind k) {
 template <class T>
 inline void run_compare(const LaunchOp& o, CmpKind k) {
     k_compare<T><<<gs(o.numel), kTier0Block, 0, o.stream>>>(
-        (const T*)o.in[0], (const T*)o.in[1], (std::uint8_t*)o.out, o.numel, k);
+        (const T*)o.in[0], (const T*)o.in[1], (std::uint8_t*)o.out, o.numel, k, o.a_scalar, o.b_scalar);
 }
 template <class T>
 inline void run_select(const LaunchOp& o) {
     k_select<T><<<gs(o.numel), kTier0Block, 0, o.stream>>>(
-        (const std::uint8_t*)o.in[0], (const T*)o.in[1], (const T*)o.in[2], (T*)o.out, o.numel);
+        (const std::uint8_t*)o.in[0], (const T*)o.in[1], (const T*)o.in[2], (T*)o.out, o.numel, o.a_scalar, o.b_scalar);
 }
 template <class T>
 inline void run_gather(const LaunchOp& o) {
