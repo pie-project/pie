@@ -98,15 +98,34 @@ fn check(name: &str, report: Report) {
 }
 
 fn step_line(n: usize, inst: &mut Instance, b: &BoundTrace, inputs: &PassInputs) -> String {
+    // The `inputs` line makes each golden self-contained: a backend runner
+    // replays the pass from the file alone (no transcription from this code).
+    let fed = format!("inputs {n}: {inputs:?}");
     match inst.step(b, inputs, &mut NoKernels) {
         Ok(r) => format!(
-            "step {n}: committed={} missed={:?} sinks={}",
+            "{fed}\nstep {n}: committed={} missed={:?} sinks={}",
             r.committed,
             r.missed.map(|(c, p)| (c, p.tag())),
             r.sinks.len()
         ),
-        Err(e) => format!("step {n}: error {e:?}"),
+        Err(e) => format!("{fed}\nstep {n}: error {e:?}"),
     }
+}
+
+/// Emit the per-instance seed values (D2 data — NOT in the container/hash,
+/// but a conformance runner needs them to reproduce the steps).
+fn seed_lines(mut rep: Report, seeds: &[(u32, Value)]) -> Report {
+    for (c, v) in seeds {
+        rep = rep.line(&format!("seed chan={c} = {v:?}"));
+    }
+    rep
+}
+
+/// A host_put a runner must replay before the next step.
+fn put_line(inst: &mut Instance, b: &BoundTrace, chan: u32, v: Value) -> String {
+    let l = format!("host_put chan={chan} = {v:?}");
+    inst.host_put(b, chan, v).unwrap();
+    l
 }
 
 fn take_line(inst: &mut Instance, b: &BoundTrace, chan: u32) -> String {
@@ -157,7 +176,9 @@ fn golden_greedy_argmax() {
     profile.vocab = 8;
     let bound = bind(c.clone(), profile).unwrap();
     let mut rep = Report::new("greedy_argmax", &c).verdict(&Ok(bound.clone()));
-    let mut inst = Instance::new(&bound, &[(0, i32s(&[1]))]).unwrap();
+    let seeds = [(0u32, i32s(&[1]))];
+    rep = seed_lines(rep, &seeds);
+    let mut inst = Instance::new(&bound, &seeds).unwrap();
     let inputs = PassInputs { logits: Some(f32s(&[0., 1., 9., 2., 0., 0., 0., 3.])), ..Default::default() };
     rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 1));
@@ -173,15 +194,16 @@ fn golden_section3_masked_gumbel() {
     let bound = bind(c.clone(), ModelProfile::dummy()).unwrap();
     let mut rep = Report::new("section3_masked_gumbel", &c).verdict(&Ok(bound.clone()));
     let seeds = [(0u32, i32s(&[1])), (3u32, u32s(&[1])), (4u32, u32s(&[1234, 0]))];
+    rep = seed_lines(rep, &seeds);
     let mut inst = Instance::new(&bound, &seeds).unwrap();
     let inputs = PassInputs { logits: Some(flat_logits(7, 100.0)), ..Default::default() };
-    inst.host_put(&bound, 2, allow_all()).unwrap();
+    rep = rep.line(&put_line(&mut inst, &bound, 2, allow_all()));
     rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 1));
     // Late mask: dummy-run, no commit.
     rep = rep.line(&step_line(1, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 1));
-    inst.host_put(&bound, 2, allow_only(&[3])).unwrap();
+    rep = rep.line(&put_line(&mut inst, &bound, 2, allow_only(&[3])));
     rep = rep.line(&step_line(2, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 1));
     check("section3_masked_gumbel", rep);
@@ -216,6 +238,7 @@ fn golden_beam_epilogue() {
         (10, i32s(&[1, 2])),
         (11, f32s(&[0.0, 0.0])),
     ];
+    rep = seed_lines(rep, &seeds);
     let mut inst = Instance::new(&bound, &seeds).unwrap();
     let mut logits = vec![0.0f32; (BB * V) as usize];
     logits[3] = 8.0;
@@ -223,7 +246,7 @@ fn golden_beam_epilogue() {
     let inputs = PassInputs { logits: Some(Value::F32(logits)), ..Default::default() };
     // Step 0: no fresh grant → miss.
     rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
-    inst.host_put(&bound, 12, u32s(&[7, 8])).unwrap();
+    rep = rep.line(&put_line(&mut inst, &bound, 12, u32s(&[7, 8])));
     rep = rep.line(&step_line(1, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 13));
     rep = rep.line(&take_line(&mut inst, &bound, 14));
@@ -265,7 +288,9 @@ fn golden_counter_pingpong() {
     };
     let bound = bind(c.clone(), ModelProfile::dummy()).unwrap();
     let mut rep = Report::new("counter_pingpong", &c).verdict(&Ok(bound.clone()));
-    let mut inst = Instance::new(&bound, &[(0, u32s(&[10]))]).unwrap();
+    let seeds = [(0u32, u32s(&[10]))];
+    rep = seed_lines(rep, &seeds);
+    let mut inst = Instance::new(&bound, &seeds).unwrap();
     let inputs = PassInputs::default();
     rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
     rep = rep.line(&step_line(1, &mut inst, &bound, &inputs)); // out full: this
