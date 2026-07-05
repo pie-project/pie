@@ -130,7 +130,7 @@ fn launch_aggregation_pairs(
     aggregation_tokens: usize,
     question: String,
     model: &Model,
-) -> Result<Vec<impl std::future::Future<Output = Result<(String, Context)>> + 'static>> {
+) -> Result<Vec<impl std::future::Future<Output = Result<(String, Context, usize)>> + 'static>> {
     let mut tasks = Vec::new();
     let mut iter = items.into_iter();
 
@@ -149,12 +149,12 @@ fn launch_aggregation_pairs(
             ctx.user(&prompt);
             ctx.cue();
             tasks.push(async move {
-                let text = ctx
+                let (text, n_tokens) = ctx
                     .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
                     .max_tokens(aggregation_tokens)
-                    .collect_text()
+                    .collect_text_with_tokens()
                     .await?;
-                Ok((text, ctx))
+                Ok((text, ctx, n_tokens))
             });
         }
         // Odd item out: context dropped, KV pages freed.
@@ -170,7 +170,7 @@ async fn run_hierarchical_aggregation(
     proposal_tokens: Vec<usize>,
     aggregation_tokens: usize,
     model: &Model,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, usize)> {
     // --- Stage 1: Generate Initial Proposals (all concurrent) ---
     let propose_prompt = PROPOSAL_PROMPT_TEMPLATE.replace("{}", question);
     base_context.user(&propose_prompt);
@@ -178,6 +178,7 @@ async fn run_hierarchical_aggregation(
 
     const BATCH_SIZE: usize = 4;
     let mut proposals: Vec<(String, Context)> = Vec::new();
+    let mut total_tokens: usize = 0;
     for chunk in proposal_tokens.chunks(BATCH_SIZE) {
         let proposal_futures = chunk
             .iter()
@@ -185,43 +186,53 @@ async fn run_hierarchical_aggregation(
                 let mut ctx = base_context.fork()?;
                 Ok(async move {
                     ctx.cue();
-                    let proposal_text = ctx
+                    let (proposal_text, n_tokens) = ctx
                         .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
                         .max_tokens(max_tokens)
-                        .collect_text()
+                        .collect_text_with_tokens()
                         .await?;
-                    Ok::<_, String>((proposal_text, ctx))
+                    Ok::<_, String>((proposal_text, ctx, n_tokens))
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let batch: Vec<(String, Context)> = future::join_all(proposal_futures)
+        let batch: Vec<(String, Context, usize)> = future::join_all(proposal_futures)
             .await
             .into_iter()
             .collect::<Result<_>>()?;
-        proposals.extend(batch);
+        for (text, ctx, n_tokens) in batch {
+            total_tokens += n_tokens;
+            proposals.push((text, ctx));
+        }
     }
 
     // --- Stage 2: First-Level Aggregation (all pairs launched at once) ---
     // All N/2 aggregation flush() calls hit the scheduler simultaneously,
     // which can coalesce them into a single batched forward pass.
     let first_agg_futures = launch_aggregation_pairs(proposals, aggregation_tokens, question.to_string(), &model)?;
-    let first_aggregations: Vec<(String, Context)> = future::join_all(first_agg_futures)
+    let first_aggregations_raw: Vec<(String, Context, usize)> = future::join_all(first_agg_futures)
         .await
         .into_iter()
         .collect::<Result<_>>()?;
+    let mut first_aggregations: Vec<(String, Context)> = Vec::new();
+    for (text, ctx, n_tokens) in first_aggregations_raw {
+        total_tokens += n_tokens;
+        first_aggregations.push((text, ctx));
+    }
 
     // --- Stage 3: Second-Level Aggregation (all pairs launched at once) ---
     let second_agg_futures = launch_aggregation_pairs(first_aggregations, aggregation_tokens, question.to_string(), &model)?;
-    let final_results: Vec<String> = future::join_all(second_agg_futures)
+    let second_aggregations_raw: Vec<(String, Context, usize)> = future::join_all(second_agg_futures)
         .await
         .into_iter()
-        .collect::<Result<Vec<(String, Context)>>>()?
-        .into_iter()
-        .map(|(text, _ctx)| text)
-        .collect();
+        .collect::<Result<Vec<(String, Context, usize)>>>()?;
+    let mut final_results: Vec<String> = Vec::new();
+    for (text, _ctx, n_tokens) in second_aggregations_raw {
+        total_tokens += n_tokens;
+        final_results.push(text);
+    }
 
-    Ok(final_results)
+    Ok((final_results, total_tokens))
 }
 
 #[inferlet::main]
@@ -248,7 +259,7 @@ async fn main(input: Input) -> Result<String> {
     ctx_root.system(SYSTEM_PROMPT);
     ctx_root.flush().await?;
 
-    let final_solutions = run_hierarchical_aggregation(
+    let (final_solutions, total_tokens) = run_hierarchical_aggregation(
         &mut ctx_root,
         &question,
         proposal_tokens,
@@ -281,8 +292,10 @@ async fn main(input: Input) -> Result<String> {
     }
     println!("Vote counts: {:?}", vote_counts);
     println!("Majority answer: {:?}", winner);
+    println!("Total tokens generated: {}", total_tokens);
 
-    Ok(winner
+    let answer_str = winner
         .map(|w| format!("{}", w))
-        .unwrap_or_else(|| "NO_CONSENSUS".to_string()))
+        .unwrap_or_else(|| "NO_CONSENSUS".to_string());
+    Ok(format!("{{\"answer\": \"{}\", \"tokens\": {}}}", answer_str, total_tokens))
 }

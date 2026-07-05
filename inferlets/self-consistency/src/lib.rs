@@ -130,6 +130,7 @@ async fn main(input: Input) -> Result<String> {
 
     const BATCH_SIZE: usize = 4;
     let mut proposal_texts: Vec<String> = Vec::new();
+    let mut total_tokens: usize = 0;
     for chunk in proposal_tokens.chunks(BATCH_SIZE) {
         let proposal_futures = chunk
             .iter()
@@ -137,21 +138,24 @@ async fn main(input: Input) -> Result<String> {
                 let mut ctx = ctx_root.fork()?;
                 Ok(async move {
                     ctx.cue();
-                    let text = ctx
+                    let (text, n_tokens) = ctx
                         .generate(Sampler::TopP { temperature: 0.6, p: 0.95 })
                         .max_tokens(max_tokens)
-                        .collect_text()
+                        .collect_text_with_tokens()
                         .await?;
-                    Ok::<_, String>(text)
+                    Ok::<_, String>((text, n_tokens))
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let batch_texts: Vec<String> = future::join_all(proposal_futures)
+        let batch_results: Vec<(String, usize)> = future::join_all(proposal_futures)
             .await
             .into_iter()
             .collect::<Result<_>>()?;
-        proposal_texts.extend(batch_texts);
+        for (text, n_tokens) in batch_results {
+            total_tokens += n_tokens;
+            proposal_texts.push(text);
+        }
     }
 
     let extracted: Vec<Option<f64>> = proposal_texts
@@ -177,8 +181,10 @@ async fn main(input: Input) -> Result<String> {
     }
     println!("Vote counts: {:?}", vote_counts);
     println!("Majority answer: {:?}", winner);
+    println!("Total tokens generated: {}", total_tokens);
 
-    Ok(winner
+    let answer_str = winner
         .map(|w| format!("{}", w))
-        .unwrap_or_else(|| "NO_CONSENSUS".to_string()))
+        .unwrap_or_else(|| "NO_CONSENSUS".to_string());
+    Ok(format!("{{\"answer\": \"{}\", \"tokens\": {}}}", answer_str, total_tokens))
 }
