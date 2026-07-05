@@ -109,6 +109,32 @@ fn ready_timeout(options: &DriverOptions) -> Duration {
     Duration::from_secs_f64(ready_timeout_s.max(1.0))
 }
 
+fn embedded_driver_argv(
+    flavor: Flavor,
+    toml_path_str: &str,
+    disable_cuda_graphs: bool,
+) -> Vec<CString> {
+    let mut argv_owned: Vec<CString> = vec![
+        CString::new(flavor.argv0()).unwrap(),
+        CString::new("--config").unwrap(),
+        CString::new(toml_path_str).unwrap(),
+    ];
+    if disable_cuda_graphs {
+        argv_owned.push(CString::new("--no-cuda-graphs").unwrap());
+    }
+    argv_owned
+}
+
+#[cfg(feature = "driver-cuda")]
+fn cuda_graphs_disabled(options: &DriverOptions) -> bool {
+    matches!(options, DriverOptions::CudaNative(opts) if opts.disable_cuda_graphs)
+}
+
+#[cfg(not(feature = "driver-cuda"))]
+fn cuda_graphs_disabled(_options: &DriverOptions) -> bool {
+    false
+}
+
 #[derive(Clone)]
 pub(crate) struct TpLaunch {
     size: usize,
@@ -725,8 +751,8 @@ impl EmbeddedDriver {
         // (model.cpp branches on is_regular_file). CUDA + dummy still need
         // a directory — those drivers fail later with their own message
         // when handed a file, so we don't gate that here.
-        let is_gguf_file = snapshot_dir.is_file()
-            && snapshot_dir.extension().is_some_and(|e| e == "gguf");
+        let is_gguf_file =
+            snapshot_dir.is_file() && snapshot_dir.extension().is_some_and(|e| e == "gguf");
         if !snapshot_dir.is_dir() && !is_gguf_file {
             return Err(anyhow!(
                 "snapshot_dir {snapshot_dir:?} does not exist, or is not a directory or .gguf file"
@@ -837,6 +863,7 @@ impl EmbeddedDriver {
             .as_ref()
             .map(|tp| format!("pie-driver-{}-g{group_id}-r{}", flavor.as_str(), tp.rank))
             .unwrap_or_else(|| format!("pie-driver-{}-g{group_id}", flavor.as_str()));
+        let disable_cuda_graphs = cuda_graphs_disabled(options);
         let thread = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || -> i32 {
@@ -846,11 +873,7 @@ impl EmbeddedDriver {
                 // the in-process vtable (`install_channel(group_id, …)`
                 // above) so the C++ backends don't need it on argv;
                 // their CLI parsers reject any flag they don't define.
-                let argv_owned: Vec<CString> = vec![
-                    CString::new(flavor.argv0()).unwrap(),
-                    CString::new("--config").unwrap(),
-                    CString::new(toml_path_str).unwrap(),
-                ];
+                let argv_owned = embedded_driver_argv(flavor, &toml_path_str, disable_cuda_graphs);
                 let mut argv_ptrs: Vec<*mut c_char> = argv_owned
                     .iter()
                     .map(|s| s.as_ptr() as *mut c_char)
@@ -1022,6 +1045,60 @@ mod tests {
         assert!(val["dummy"].get("kv_page_size").is_none());
         assert!(val["dummy"].get("max_forward_tokens").is_none());
         assert!(val["dummy"].get("max_forward_requests").is_none());
+    }
+
+    #[test]
+    fn embedded_driver_argv_uses_config_path_without_cuda_graph_flag_by_default() {
+        let opts = DriverOptions::Dummy {
+            opts: DummyDriverOptions {
+                vocab_size: None,
+                arch_name: None,
+                ready_timeout_s: 5.0,
+            },
+            random_seed: 0,
+            activation_dtype: "bfloat16".to_string(),
+        };
+
+        let argv = embedded_driver_argv(
+            opts.flavor(),
+            "/tmp/driver.toml",
+            cuda_graphs_disabled(&opts),
+        )
+        .into_iter()
+        .map(|arg| arg.into_string().unwrap())
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            argv,
+            vec!["pie_driver_dummy", "--config", "/tmp/driver.toml"]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "driver-cuda")]
+    fn embedded_driver_argv_disables_cuda_graphs_when_requested() {
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.disable_cuda_graphs = true;
+        let options = DriverOptions::CudaNative(opts);
+
+        let argv = embedded_driver_argv(
+            options.flavor(),
+            "/tmp/driver.toml",
+            cuda_graphs_disabled(&options),
+        )
+        .into_iter()
+        .map(|arg| arg.into_string().unwrap())
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            argv,
+            vec![
+                "pie_driver_cuda",
+                "--config",
+                "/tmp/driver.toml",
+                "--no-cuda-graphs"
+            ]
+        );
     }
 
     #[test]
