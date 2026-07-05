@@ -129,7 +129,7 @@ operands are `u32` value ids. `0x80` (v4 `input`) is reserved-unused in PTIR.
 | 0x61 | `gather_row` | `src:u32, idx:u32` | 1 |
 | 0x62/0x63 | `scatter_add scatter_set` | `base:u32, idx:u32, vals:u32` | 1 |
 | 0x64 | `iota` | `len:u32` | 1 (U32 `[len]`) |
-| 0x65 | `mask_apply_packed` | `logits:u32, mask:u32` | 1 |
+| 0x65 | `mask_apply_packed` | `logits:u32, mask:u32` | 1 | (per-row: mask bit index = column `j mod n`) |
 | 0x70 | `rng` | `stream:u32, shape:Shape, kind:u8` | 1 |
 | 0x71 | `rng_keyed` | `state:u32, shape:Shape, kind:u8` | 1 |
 | 0x81 | `const` | `literal:5B` | 1 |
@@ -159,6 +159,11 @@ operands are `u32` value ids. `0x80` (v4 `input`) is reserved-unused in PTIR.
   (broadcast) → base's type. Out-of-range index skips; duplicates: `set` =
   index order, **last wins** (load-bearing, §6.2's `heir`); `add`
   accumulates. `scatter_add` requires numeric base.
+- `mask_apply_packed`: `logits [.., n]` F32, `mask [ceil(n/32)]` U32 — ONE
+  packed word-row, **broadcast across rows**; `out[.., c] = bit_c(mask) ?
+  logits[.., c] : -inf` with `bit_c = (mask[c>>5] >> (c&31)) & 1`, `c` the
+  last-axis column (`flat_index mod n`), NEVER the flat element index.
+  Per-row *distinct* masks are the composed bool form (`select`), not this op.
 - `chan_take`/`chan_read` yield the channel's declared `(shape, dtype)` with
   ACT materialized as F32; `chan_put` requires exactly that type.
 - `intrinsic_val`/`kernel_call` declare their (trace-known) result types;

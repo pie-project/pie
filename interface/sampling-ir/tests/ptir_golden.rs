@@ -448,3 +448,48 @@ fn golden_neg_body_type_error() {
     };
     neg_report("neg_body_type_error", c, ModelProfile::dummy());
 }
+
+#[test]
+fn golden_matrix_mask_apply_packed() {
+    // Per-row packed-mask semantics (pinned after the §6.1 matrix gap): ONE
+    // packed mask broadcasts across rows, bit index = column (j % n) — never
+    // the flat element index. Mask 0b00101000 allows columns 3 and 5 only.
+    let mut b = B::new();
+    let lg = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::Logits,
+        shape: Shape::matrix(2, 8),
+        dtype: DType::F32,
+    });
+    let m = b.p(Op::Const(Literal::U32(0b0010_1000)));
+    let m1 = b.p(Op::Reshape { value: m, shape: Shape::vector(1) });
+    let masked = b.p(Op::MaskApply { logits: lg, mask: m1 });
+    let t = b.p(Op::ReduceArgmax(masked)); // [2] i32, per row
+    b.p(Op::ChanPut { chan: 0, value: t });
+    let c = TraceContainer {
+        names: vec![],
+        channels: vec![ChannelDecl {
+            shape: Shape::vector(2),
+            dtype: ChanDType::Concrete(DType::I32),
+            capacity: 1,
+            host_role: HostRole::Reader,
+            seeded: false,
+        }],
+        ports: vec![],
+        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+    };
+    let mut profile = ModelProfile::dummy();
+    profile.vocab = 8;
+    let bound = bind(c.clone(), profile).unwrap();
+    let mut rep = Report::new("matrix_mask_apply_packed", &c).verdict(&Ok(bound.clone()));
+    let mut inst = Instance::new(&bound, &[]).unwrap();
+    // Row 0's raw argmax (col 2) is MASKED -> falls to col 5 (2.0 > col 3's
+    // 1.0). Row 1's raw argmax (col 7) is masked -> falls to col 3.
+    let logits = vec![
+        0., 0., 9., 1., 0., 2., 0., 0., // row 0 -> 5
+        0., 0., 0., 4., 0., 3., 0., 9., // row 1 -> 3
+    ];
+    let inputs = PassInputs { logits: Some(f32s(&logits)), ..Default::default() };
+    rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
+    rep = rep.line(&take_line(&mut inst, &bound, 0));
+    check("matrix_mask_apply_packed", rep);
+}

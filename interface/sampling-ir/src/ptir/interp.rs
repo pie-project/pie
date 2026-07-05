@@ -940,13 +940,20 @@ fn eval_op(
         }
         Op::Iota { len } => One(Value::U32((0..len).collect())),
         Op::MaskApply { logits, mask } => {
+            // Per-row over the LAST axis: the single packed mask (one word
+            // row, [ceil(n/32)] — the validator's shape rule) broadcasts
+            // across rows; the bit index is the COLUMN `j % n`, never the
+            // flat element index. Per-row *distinct* masks use the composed
+            // bool-mask form (select), not this packed op.
+            let n = ty_of(logits).shape.last_len().unwrap_or(1) as usize;
             let x = lanes_f32(v(logits));
             let Value::U32(words) = v(mask) else { return Err(fault("mask_apply mask".into())) };
             One(Value::F32(
                 x.iter()
                     .enumerate()
                     .map(|(j, &l)| {
-                        let bit = words.get(j >> 5).map_or(0, |&w| (w >> (j & 31)) & 1);
+                        let c = j % n;
+                        let bit = words.get(c >> 5).map_or(0, |&w| (w >> (c & 31)) & 1);
                         if bit == 1 { l } else { f32::NEG_INFINITY }
                     })
                     .collect(),
