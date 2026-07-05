@@ -119,6 +119,53 @@ void run_greedy(const std::string& dir) {
     cudaFree(d_logits);
 }
 
+// ── section3_masked_gumbel: overview §3 — greedy + grammar mask + gumbel, with
+//    the late-mask dummy-run + recover (P4 exit criterion). VOCAB=32. ──
+void run_section3(const std::string& dir) {
+    std::printf("[section3_masked_gumbel]\n");
+    Trace t; if (!build_trace(dir, "section3_masked_gumbel", t)) return;
+    const std::uint32_t V = 32;
+    Tier0Runner runner(t);
+    // seeds (echo ptir_golden.rs): chan0 tok=[1] i32, chan3 len=[1] u32, chan4 rng=[1234,0] u32
+    std::int32_t s0 = 1;  runner.arena().seed_cell(0, &s0, sizeof(s0));
+    std::uint32_t s3 = 1; runner.arena().seed_cell(3, &s3, sizeof(s3));
+    std::uint32_t s4[2] = {1234, 0}; runner.arena().seed_cell(4, s4, sizeof(s4));
+
+    // logits = flat_logits(7, 100.0): all 0 except index 7 = 100.
+    std::vector<float> logits(V, 0.f); logits[7] = 100.f;
+    float* d_logits = nullptr; cudaMalloc(&d_logits, V * sizeof(float));
+    cudaMemcpy(d_logits, logits.data(), V * sizeof(float), cudaMemcpyHostToDevice);
+    // rng seed buffer unused for rng_keyed (state rides chan4) but bind a dummy.
+    std::uint32_t rs = 0; std::uint32_t* d_rs = nullptr; cudaMalloc(&d_rs, sizeof(rs));
+    cudaMemcpy(d_rs, &rs, sizeof(rs), cudaMemcpyHostToDevice);
+    FireInputs in; in.logits = d_logits; in.vocab = V; in.row_seeds = d_rs;
+
+    auto feed_mask = [&](const std::vector<std::uint8_t>& m) {
+        runner.arena().host_feed(2, m.data(), m.size());   // Bool[32] unpacked
+    };
+    std::vector<std::uint8_t> allow_all(V, 1);
+    std::vector<std::uint8_t> allow_only3(V, 0); allow_only3[3] = 1;
+
+    // step 0: mask = allow_all → argmax(logits) = 7.
+    feed_mask(allow_all);
+    PassResult r0 = runner.run_pass(in);
+    std::int32_t v = -1; runner.arena().host_take(1, &v, sizeof(v));
+    expect(r0.ok && r0.committed && v == 7, "step 0: token == 7 (got " + std::to_string(v) + ", committed=" + (r0.committed?"T":"F") + ")");
+
+    // step 1: mask channel now empty (consumed) → late-mask MISS, dummy-run.
+    PassResult r1 = runner.run_pass(in);
+    expect(r1.ok && !r1.committed, "step 1: late-mask dummy-run (committed=false)");
+    expect(!runner.arena().committed_full(1), "step 1: out == WouldBlock");
+
+    // step 2: mask = allow_only([3]) → only token 3 finite → argmax = 3.
+    feed_mask(allow_only3);
+    PassResult r2 = runner.run_pass(in);
+    runner.arena().host_take(1, &v, sizeof(v));
+    expect(r2.ok && r2.committed && v == 3, "step 2: recover, token == 3 (got " + std::to_string(v) + ", committed=" + (r2.committed?"T":"F") + ")");
+
+    cudaFree(d_logits); cudaFree(d_rs);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -128,6 +175,7 @@ int main(int argc, char** argv) {
                 p.name, p.major, p.minor, dir.c_str());
     run_counter(dir);
     run_greedy(dir);
+    run_section3(dir);
     std::printf("\n==== golden step-exec: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
