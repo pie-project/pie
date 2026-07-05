@@ -173,6 +173,11 @@ struct Stage {
     std::vector<Op>         ops;
     std::vector<ChannelPut> puts;
     std::vector<Output>     outputs;
+    // Channels consumed by a chan_take / peeked by a chan_read in this stage —
+    // including takes whose result is unused (e.g. §6.2's klen/kvm drain). The
+    // container translator fills these; readiness needs them full.
+    std::vector<ChannelId>  takes;
+    std::vector<ChannelId>  reads;
 };
 
 // A channel declaration (§1): a bounded queue of `capacity + 1` cells (ring),

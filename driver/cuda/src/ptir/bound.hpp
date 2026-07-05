@@ -151,7 +151,10 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
                     Value v; v.id = gid(local); v.type = ty(local);
                     v.source = (op.tag == PTIR_OP_CHAN_TAKE) ? ValueSource::ChannelTake : ValueSource::ChannelRead;
                     v.channel = (ChannelId)op.chan;
-                    t.values.push_back(v); local += 1; break;
+                    t.values.push_back(v); local += 1;
+                    if (op.tag == PTIR_OP_CHAN_TAKE) stage.takes.push_back((ChannelId)op.chan);
+                    else stage.reads.push_back((ChannelId)op.chan);
+                    break;
                 }
                 case PTIR_OP_CONST: {
                     Value v; v.id = gid(local); v.type = ty(local); v.source = ValueSource::Const;

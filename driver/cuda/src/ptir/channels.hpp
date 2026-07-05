@@ -237,6 +237,18 @@ class ChannelArena {
         return f != 0;
     }
 
+    // Debug: print head/tail/full-word per channel.
+    void dump() {
+        std::vector<std::uint32_t> hh(num_), tt(num_);
+        std::vector<std::uint8_t> ff((std::size_t)num_ * kMaxRing);
+        cudaMemcpy(hh.data(), d_head_, num_ * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(tt.data(), d_tail_, num_ * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(ff.data(), d_full_, ff.size(), cudaMemcpyDeviceToHost);
+        for (std::uint32_t c = 0; c < num_; ++c)
+            std::printf("        ch%u head=%u tail=%u full[head]=%u cap1=%u\n", c, hh[c], tt[c],
+                        ff[(std::size_t)c * kMaxRing + hh[c]], host_cap1_.empty()?0:host_cap1_[c]);
+    }
+
   private:
     std::uint32_t seed_tail(ChannelId c) const { return host_cap1_.empty() ? 0 : (1 % host_cap1_[c]); }
 

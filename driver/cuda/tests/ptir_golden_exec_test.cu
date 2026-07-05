@@ -204,12 +204,10 @@ void run_beam(const std::string& dir) {
 
     // step 0: no fresh grant (chan12 empty) → miss.
     PassResult r0 = runner.run_pass(in);
-    if (!r0.ok) std::printf("        [debug] step0 error: %s\n", r0.error.c_str());
     expect(r0.ok && !r0.committed, "step 0: miss (no fresh grant)");
     // host grants fresh slots [7,8], then step 1 commits.
     std::vector<std::uint32_t> fresh{7,8}; runner.arena().host_feed(12, fresh.data(), fresh.size()*4);
     PassResult r1 = runner.run_pass(in);
-    if (!r1.ok) std::printf("        [debug] step1 error: %s\n", r1.error.c_str());
     expect(r1.ok && r1.committed, "step 1: committed");
 
     std::int32_t out[2]; runner.arena().host_take(13, out, sizeof(out));
@@ -235,10 +233,7 @@ int main(int argc, char** argv) {
     run_counter(dir);
     run_greedy(dir);
     run_section3(dir);
-    // beam_epilogue (§6.2): decode/translate + all primitives land, but the full
-    // 16-channel geometry step-exec is still under debug (multi-op interaction);
-    // run it explicitly with PTIR_BEAM=1. Kept out of the default gate until green.
-    if (getenv("PTIR_BEAM")) run_beam(dir);
+    run_beam(dir);
     std::printf("\n==== golden step-exec: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

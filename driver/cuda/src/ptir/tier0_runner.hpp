@@ -163,6 +163,10 @@ class Tier0Runner {
                 else if (v->source == ValueSource::ChannelRead) { is_full[v->channel] = 1; }
             }
         }
+        // Takes/reads whose result is unused (e.g. §6.2 klen/kvm drain) aren't in
+        // any op's args — the translator records them explicitly.
+        for (ChannelId c : st.takes) if (c < is_full.size()) { is_full[c] = 1; is_taken[c] = 1; }
+        for (ChannelId c : st.reads) if (c < is_full.size()) is_full[c] = 1;
         for (std::size_t c = 0; c < is_full.size(); ++c) {
             if (is_full[c]) need_full.push_back((std::uint32_t)c);
             if (is_taken[c]) taken.push_back((std::uint32_t)c);
@@ -370,8 +374,12 @@ class Tier0Runner {
             }
             case OpCode::Transpose:
                 lo.rows = prim_shape.rows(); lo.len = prim_shape.row_len(); lo.elem_dtype = prim; break;
-            case OpCode::TopK:
+            case OpCode::TopK: case OpCode::SortDesc:
+                // rows/len are the INPUT shape ([n] or [m,n]) — the axis top_k
+                // scans — NOT the [k] result. k = the immediate.
+                lo.rows = prim_shape.rows(); lo.len = prim_shape.row_len();
                 lo.k = op.predicate.payload ? op.predicate.payload : op.imm;
+                if (op.code == OpCode::SortDesc) lo.k = lo.len;
                 break;
             case OpCode::Matmul:  // rows=M, len=K, k=N encoded in imm (N)
                 lo.k = op.imm; break;
