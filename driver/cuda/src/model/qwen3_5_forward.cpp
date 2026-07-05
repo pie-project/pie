@@ -538,18 +538,22 @@ void linear_attn_layer_body(
         } else {
             // mixed_qkv [N, conv_dim] = norm_x @ in_proj_qkv.T
             ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_qkv,
+                ws.norm_x.data(),
+                make_weight_view(Lw.la_in_proj_qkv, Lw.la_in_proj_qkv_quant),
                 la.mixed_qkv.data(), N, conv_dim, H);
             // z [N, V_dim] = norm_x @ in_proj_z.T
             ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_z,
+                ws.norm_x.data(),
+                make_weight_view(Lw.la_in_proj_z, Lw.la_in_proj_z_quant),
                 la.z.data(), N, V_dim, H);
             // a [N, V_h] = norm_x @ in_proj_a.T   (b symmetric)
             ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_a,
+                ws.norm_x.data(),
+                make_weight_view(Lw.la_in_proj_a, Lw.la_in_proj_a_quant),
                 la.a.data(), N, V_h, H);
             ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_b,
+                ws.norm_x.data(),
+                make_weight_view(Lw.la_in_proj_b, Lw.la_in_proj_b_quant),
                 la.b.data(), N, V_h, H);
         }
         if (stash_write) {
@@ -954,11 +958,13 @@ void linear_attn_layer_body(
     profile_forward_stage_ptr(profile, &ForwardProfile::linear_out_ms, stream, [&] {
         if (T == 1) {
             ops::gemm_act_x_w(cublas.handle(),
-                la.core_out_bf16.data(), *Lw.la_out_proj,
+                la.core_out_bf16.data(),
+                make_weight_view(Lw.la_out_proj, Lw.la_out_proj_quant),
                 ws.y.data(), N, H, V_dim, /*beta=*/1.f);
         } else {
             ops::gemm_act_x_w(cublas.handle(),
-                la.core_out_bf16.data(), *Lw.la_out_proj,
+                la.core_out_bf16.data(),
+                make_weight_view(Lw.la_out_proj, Lw.la_out_proj_quant),
                 ws.norm_y.data(), N, H, V_dim, /*beta=*/0.f);
             tp->all_reduce_bf16(ws.norm_y.data(),
                 static_cast<std::size_t>(N) * H, ncclSum, stream);
