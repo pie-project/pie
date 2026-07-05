@@ -661,6 +661,45 @@ mod tests {
     }
 
     #[test]
+    fn matrix_select_mask_k4_is_per_row_over_full_k_rows() {
+        // NORMATIVE pin for the §6.1 select-mask shape (bravo's cuda_mtpverify
+        // OOB): dselect(allow[k,v], logits[k,v], broadcast(-inf -> [k,v])) then
+        // per-row argmax. EVERY operand materializes k FULL rows (k*v elems,
+        // row-major); select/broadcast/argmax are per-row over the last axis.
+        // Non-degenerate: each row's RAW argmax is masked out, so a backend
+        // that drops/undersizes rows >= 1 (or reads bf16 storage with f32
+        // indexing) CANNOT pass by accident.
+        let (k, v) = (4u32, 8u32);
+        let p = SamplingProgram {
+            inputs: vec![
+                InputDecl::new(Shape::matrix(k, v), DType::F32),  // 0: logits
+                InputDecl::new(Shape::matrix(k, v), DType::Bool), // 1: allow
+            ],
+            ops: vec![
+                Op::Input(0),                                   // 0
+                Op::Input(1),                                   // 1
+                Op::Const(Literal::F32(f32::NEG_INFINITY)),     // 2
+                Op::Broadcast { value: 2, shape: Shape::matrix(k, v) }, // 3
+                Op::Select { cond: 1, a: 0, b: 3 },             // 4
+                Op::ReduceArgmax(4),                            // 5: [k] i32
+            ],
+            outputs: vec![OutputDecl::new(5, OutputKind::Token)],
+        };
+        p.validate().expect("validates");
+        // logits[r]: raw max 9.0 at col r (MASKED); allowed col (r+2)%8 = 1.0.
+        let mut logits = vec![0.0f32; (k * v) as usize];
+        let mut allow = vec![false; (k * v) as usize];
+        for r in 0..k as usize {
+            logits[r * v as usize + r] = 9.0;
+            let a = (r + 2) % v as usize;
+            logits[r * v as usize + a] = 1.0;
+            allow[r * v as usize + a] = true;
+        }
+        let out = eval(&p, &bind(&[Value::F32(logits), Value::Bool(allow)])).unwrap();
+        assert_eq!(out, vec![Value::I32(vec![2, 3, 4, 5])]);
+    }
+
+    #[test]
     fn matrix_reduce_then_broadcast_per_row() {
         // Per-row max over [2,4] → [2], broadcast back to [2,4] (each row filled
         // with its own max). Exercises the rank≥2 reduce + matrix Broadcast arms.

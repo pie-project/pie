@@ -493,3 +493,71 @@ fn golden_matrix_mask_apply_packed() {
     rep = rep.line(&take_line(&mut inst, &bound, 0));
     check("matrix_mask_apply_packed", rep);
 }
+
+#[test]
+fn golden_matrix_select_mask() {
+    // The §6.1 per-POSITION select-mask shape at k=4 (the cuda_mtpverify OOB
+    // repro, pinned): dselect(allow[k,v], logits[k,v], broadcast(-inf ->
+    // [k,v])) -> per-row argmax. EVERY matrix operand materializes k FULL
+    // rows (k*v, row-major). Non-degenerate: each row's raw argmax is masked
+    // out, so undersized rows / bf16-vs-f32 indexing errors cannot pass.
+    // Cross-backend gate: charlie's CUDA JIT + mac-master's Metal both match
+    // these step lines bit-exact.
+    let (k, v) = (4u32, 8u32);
+    let mut b = B::new();
+    let lg = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::Logits,
+        shape: Shape::matrix(k, v),
+        dtype: DType::F32,
+    });
+    let allow = b.p(Op::ChanTake(0)); // bool [k,v] per-position grammar mask
+    let ninf = b.p(Op::Const(Literal::F32(f32::NEG_INFINITY)));
+    let nb = b.p(Op::Broadcast { value: ninf, shape: Shape::matrix(k, v) });
+    let masked = b.p(Op::Select { cond: allow, a: lg, b: nb });
+    let t = b.p(Op::ReduceArgmax(masked)); // [k] i32 per row
+    b.p(Op::ChanPut { chan: 1, value: t });
+    let c = TraceContainer {
+        names: vec![],
+        channels: vec![
+            ChannelDecl {
+                shape: Shape::matrix(k, v),
+                dtype: ChanDType::Concrete(DType::Bool),
+                capacity: 1,
+                host_role: HostRole::Writer,
+                seeded: false,
+            },
+            ChannelDecl {
+                shape: Shape::vector(k),
+                dtype: ChanDType::Concrete(DType::I32),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            },
+        ],
+        ports: vec![],
+        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+    };
+    let mut profile = ModelProfile::dummy();
+    profile.vocab = v;
+    let bound = bind(c.clone(), profile).unwrap();
+    let mut rep = Report::new("matrix_select_mask", &c).verdict(&Ok(bound.clone()));
+    let mut inst = Instance::new(&bound, &[]).unwrap();
+    // logits[r]: raw max 9.0 at col r (MASKED); allowed col (r+2)%v = 1.0.
+    let mut logits = vec![0.0f32; (k * v) as usize];
+    let mut allow_bits = vec![false; (k * v) as usize];
+    for r in 0..k as usize {
+        logits[r * v as usize + r] = 9.0;
+        let a = (r + 2) % v as usize;
+        logits[r * v as usize + a] = 1.0;
+        allow_bits[r * v as usize + a] = true;
+    }
+    let inputs = PassInputs { logits: Some(f32s(&logits)), ..Default::default() };
+    rep = rep.line(&{
+        let l = format!("host_put chan=0 = {:?}", Value::Bool(allow_bits.clone()));
+        inst.host_put(&bound, 0, Value::Bool(allow_bits)).unwrap();
+        l
+    });
+    rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
+    rep = rep.line(&take_line(&mut inst, &bound, 1)); // expect I32([2,3,4,5])
+    check("matrix_select_mask", rep);
+}
