@@ -2,7 +2,6 @@
 """Regression checks for dense Qwen3.5 linear-attention FP8 metadata wiring."""
 
 from pathlib import Path
-import re
 import unittest
 
 
