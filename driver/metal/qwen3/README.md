@@ -54,22 +54,22 @@ CPU f32 reference run (self-validation); the Metal forward itself is sub-second.
 
 ## Algorithm loops (composed from certified pieces)
 
-Beam search and constrained speculative decoding run **end-to-end on Metal** by
-pure composition over the certified forward + KV cache + sampling ops (`model.hpp`
-supplies a `KVCache`-parameterized `forward_block` so each beam / draft owns a
-growing cache).
+Greedy, **beam search**, **constrained speculative decoding**, and **MCTS** all run
+**end-to-end on Metal** by pure composition over the certified forward + KV cache +
+sampling ops (`model.hpp` supplies a `KVCache`-parameterized `forward_block` so each
+beam / draft / tree-node owns a growing cache). Tensor work on Metal; algorithm
+control (beam/tree bookkeeping) on host — no tensor op beyond the certified set.
 
-- **`qwen3_beam`** — forward per beam → `log_softmax` scores → K×K candidate top-k
-  → reorder beams by parent → grow per-beam KV → repeat. Observed (K=3): top beam
-  *"France is a city located in…"*, ranked by cumulative log-prob. **Metal runs
-  beam search.**
-- **`qwen3_specdecode`** — constrained speculative decoding: draft k tokens greedily,
-  then spec-VERIFY under a **grammar mask** (masked logits via the certified
-  `dselect` = `matrix_select_mask` op + `argmax`, both Metal) and accept the longest
-  matching prefix; a grammar-disallowed draft is rejected and the mask-corrected
-  token substituted. Observed (k=4, grammar forbids `13`="."): 9/12 drafts accepted;
-  where greedy drafted `13` the grammar rejected+corrected it to `11`=",". **Metal
-  runs constrained speculative decoding.**
+- **`qwen3_beam`** — forward per beam → `log_softmax` → K×K candidate top-k → reorder
+  by parent → grow per-beam KV. (K=3: top beam *"France is a city located in…"*.)
+- **`qwen3_specdecode`** — draft k greedily → spec-VERIFY under a **grammar mask**
+  (certified `dselect` + `argmax`) → accept longest prefix; disallowed draft
+  rejected + corrected. (k=4, forbid `13`="." → 9/12 accepted; `13`→`11`=",".)
+- **`qwen3_mcts`** — host search tree: PUCT selection → expansion (candidate tokens)
+  → **Metal forward** evaluation (value = model confidence = max `log_softmax`) →
+  backprop. (sims=12, branch=4: decodes *"France is a city located in"*, chosen
+  tokens = the most-visited children.) MCTS needs **no tensor op beyond the certified
+  set** — forward + reduce + argmax + host tree control.
 
 ## Autoregressive generation (`qwen3_generate`)
 

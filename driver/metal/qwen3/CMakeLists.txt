@@ -68,7 +68,9 @@ add_executable(qwen3_beam
   ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm qwen3_beam.mm)
 add_executable(qwen3_specdecode
   ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm qwen3_specdecode.mm)
-foreach(algo qwen3_beam qwen3_specdecode)
+add_executable(qwen3_mcts
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm qwen3_mcts.mm)
+foreach(algo qwen3_beam qwen3_specdecode qwen3_mcts)
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
   target_include_directories(${algo} PRIVATE
@@ -79,7 +81,7 @@ foreach(algo qwen3_beam qwen3_specdecode)
   target_link_libraries(${algo} PRIVATE
     ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
 endforeach()
-set_source_files_properties(qwen3_beam.mm qwen3_specdecode.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+set_source_files_properties(qwen3_beam.mm qwen3_specdecode.mm qwen3_mcts.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 enable_testing()
 add_test(NAME qwen3_test COMMAND qwen3_test)
