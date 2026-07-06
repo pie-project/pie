@@ -18,3 +18,7 @@ target_link_libraries(qwen35_mtp PRIVATE pie_driver_metal_lib)
 # Honest wall-clock benchmark: regular greedy vs MTP (K=1) spec-decode.
 add_executable(qwen35_mtp_bench qwen35_mtp_bench.cpp)
 target_link_libraries(qwen35_mtp_bench PRIVATE pie_driver_metal_lib)
+
+# High-concurrency throughput sweep: regular batched vs MTP spec-decode.
+add_executable(qwen35_tput_bench qwen35_tput_bench.cpp)
+target_link_libraries(qwen35_tput_bench PRIVATE pie_driver_metal_lib)
