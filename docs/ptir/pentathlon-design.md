@@ -1,20 +1,25 @@
 <!-- Capstone stress-test design (echo). Composes overview §6.1 + §6.2 + §6.4
      into one scheme; authoritative semantics remain overview.md. -->
 
-# Pentathlon — MCTS-guided, grammar-constrained, MTP-speculative beam
-# expansion under Quest attention
+# Pentathlon+1 — MCTS-guided, grammar-constrained, MTP-speculative,
+# contrastive beam expansion under Quest attention
 
 **Status:** Design + gap analysis (the stress-test deliverable). Implementation
 follows §6.2-e2e + real-MTP landing.
 **Composes:** Quest (overview §6.1) · MCTS (§6.4) · beam (§6.2) · constrained
-decoding (§6.1/§3) · MTP speculation (§6.1) — all five in one inferlet,
-designed for high-throughput fleets under the quorum scheduler (§7.2).
-**Verdict up front:** the composition needs **zero new core ops and zero new
-first-party intrinsics**. Every gap found is either host-clock *placement*
-(where the model deliberately puts it) or a perf probe — plus one genuinely
-new expressiveness finding (§5.1: regular-grammar masks can move in-graph with
-existing ops). That is the stress-test result: the op set closes over the
-hardest composition we can state.
+decoding (§6.1/§3) · MTP speculation (§6.1) · **contrastive decoding (§6.3
+design note)** — all six in one inferlet, designed for high-throughput fleets
+under the quorum scheduler (§7.2).
+**Verdict up front:** the six-way composition still needs **zero new core ops
+and zero new first-party intrinsics** — the op set closes. Contrastive is the
+first technique to expose gaps BENEATH the op set (§5 G6): the amateur's
+logits bind as an ordinary channel (option (a) — no second-model intrinsic,
+exactly where §6.3's design note parked it), but realizing the efficient form
+needs (i) **multi-model runtime execution** (spec'd as direction) and (ii) an
+**extern-channel binding in the PTIR container** (the registration surface
+cannot yet express §1's "pairs may span pipelines"). A host-fed interim works
+today. Everything else: host-clock placement or perf probes, plus the §5 G1
+in-graph-DFA finding.
 
 ---
 
@@ -38,6 +43,11 @@ by `value_head` — better than greedy/beam alone can, at fleet throughput.
 - **Quest**: every forward (expand + rollout) selects top-`budget` KV pages
   per layer via `envelope_dot` → `attn_page_mask` — long-context efficiency
   orthogonal to all of the above.
+- **Contrastive**: the pick rule scores
+  `cd = log_softmax(expert) − λ·log_softmax(amateur)` under the plausibility
+  constraint (keep token iff `log p_expert ≥ log α + max log p_expert`), then
+  the grammar mask, then top-k/argmax. The amateur's logits arrive **through a
+  channel** (§2.4) — never a new intrinsic.
 
 One MCTS iteration, batched R-wide (virtual loss = run-ahead, §6.4):
 
@@ -93,7 +103,54 @@ rather than a conditional put. Rollout geometry: the child aliases the node's
 pages (freeze discipline, §5.2/§6.2); its D·(≤K+1) appended tokens land in
 child-private tail slots the host frees exactly after backprop.
 
-### 2.3 Identities and batching
+### 2.3 Contrastive pick rule (drop-in for 2.1/2.2 epilogues)
+
+Pure appendix ops. `am` is the amateur-logits channel (§2.4); λ, log α are
+`Tensor::constant`s.
+
+```rust
+let lse = log_softmax(intrinsics::logits());              // [rows, V] expert
+let lsa = log_softmax(am.take());                         // [rows, V] amateur
+let cd  = sub(lse, mul(LAMBDA, lsa));                     // contrastive score
+let plaus = ge(lse, add(broadcast(reduce_max(lse), SH), LOG_ALPHA));
+let ok  = and(plaus, gmask);                              // ∧ grammar mask
+let scored = select(ok, cd, NEG_INF_B);
+// expand: top_k(scored, B)   ·   rollout: picked = reduce_argmax(scored)
+```
+
+In the rollout the contrastive rule REPLACES the pick over the masked target
+distribution; the match-verify tail (`eq→cumprod→select`, golden
+`mtp_verify_tail`) is unchanged — acceptance compares drafts against whatever
+`picked` is, so speculation stays lossless w.r.t. the contrastive-argmax
+choice. The amateur must score the same K+1 window rows, i.e. its pipeline
+runs the same speculative geometry (`am` is `[K+1, V]` in the rollout).
+
+### 2.4 Where the amateur's logits come from — the stress-test question
+
+Three bindings, in order of preference; NONE adds an op or intrinsic:
+
+- **(a-device) cross-pipeline channel (the target form).** A second pipeline
+  runs the amateur model; `am`'s producer endpoint is the amateur's epilogue
+  (`am.put(intrinsics::logits())`), consumer is the expert's — §1 explicitly
+  allows SPSC pairs to span pipelines ("SPSC constrains endpoints, not
+  clocks"; §6.3's design note names exactly this). Zero host round-trip.
+- **(a-host) host-fed channel (works TODAY, the interim).** The host runs the
+  amateur (second request / smaller model) and feeds `am` mask-style. Fully
+  expressible now; costs a `[rows, V]` f32 host edge per step (§5 G6 probe).
+  Bandwidth mitigation with existing ops: feed only the amateur's top-M
+  `(ids, logprobs)` (M trace-known) and reconstruct in-graph —
+  `scatter_set(broadcast(AM_FLOOR, [V]), am_ids.take(), am_lp.take())` —
+  M·8 B/row instead of V·4 B/row; the plausibility constraint makes the
+  floor exact for CD's argmax on the plausible set.
+- **(b) a second-model-logits intrinsic — REJECTED.** An in-program
+  `intrinsics::amateur_logits()` would weld two models into one trace: pass
+  identity is the tuple of ONE forward's stage traces (§5.3), capacity
+  pricing and the fire rule assume one trunk per pass, and D2 would be
+  violated (which-amateur becomes trace identity, not data). The channel form
+  keeps the amateur swappable per-instance. This is the precise answer: the
+  model binds a second model's logits as DATA, never as an intrinsic.
+
+### 2.5 Identities and batching
 
 Two epilogue traces ⇒ **two program-set identities** (C3) fleet-wide, both
 shared by every request (per-instance data: seeds, budgets, masks, geometry —
@@ -145,7 +202,9 @@ finding: **the composition is expressible without touching the SDK.**
 | beam × grammar | `top_k(log_softmax(mask_apply(..)))` — masked -inf never wins; pure appendix ops (golden `matrix_select_mask`) |
 | mcts × beam/spec | the tree is host process + host-owned geometry (§6.4); programs never see the search |
 | spec × mcts memory | K+1 provisional writes per rollout step + cursor advance are per-instance channel state; reject tails are overwritten, dead rollouts freed exactly |
-| the fleet | two identities, batch-by-program, quorum denominator excludes host-blocked pipelines (§7.2) |
+| the fleet | two identities (+1 amateur trace under (a-device)), batch-by-program, quorum denominator excludes host-blocked pipelines (§7.2) |
+| contrastive × spec | the pick rule is upstream of verify; match-verify is pick-agnostic (golden `mtp_verify_tail` unchanged) |
+| contrastive × grammar/beam | one `and` composes plausibility ∧ grammar before top-k — pure appendix ops |
 
 ### G1 — grammar-mask production is the host-clock hot spot (and a NEW finding)
 
@@ -197,21 +256,56 @@ in-flight passes retire, so peak page residency ≈ live tree + 2 iterations of
 rollout tails. **Probe:** pages-freed/iter vs grace-period depth; if headroom
 `alloc` stalls, the fix is sizing (bigger arena / smaller R), never a new op.
 
+### G6 — contrastive names the first gaps BENEATH the op set
+
+The op-set verdict survives six techniques: contrastive is `sub`/`mul`/
+`log_softmax`/`reduce_max`/`ge`/`and`/`select` + a channel. But the
+**efficient** binding (a-device, §2.4) needs two things the runtime/container
+do not yet have:
+
+1. **Multi-model runtime execution** — two models (expert + amateur) driven
+   by one inferlet, each its own pipeline. The overview records this as
+   direction (§6.3 note, §6.5's cross-pipeline weight feed); channel
+   SEMANTICS already cover it. Note a same-model amateur needs no multi-model
+   at all: a context-truncated or different-working-set amateur is just a
+   second instance of the SAME model — available as soon as cross-instance
+   channels are.
+2. **Extern-channel binding in the PTIR container (P0 gap — mine).** The
+   container declares channels per-trace with `host_role ∈ {none, writer,
+   reader}`; there is NO way to declare "this channel's other endpoint is
+   another instance." §1/T2 permit it; the registration surface can't express
+   it. Fix is append-only: a fourth host-role-like variant `extern(name)` (or
+   an imports/exports table) + instantiation-time pairing, validator checks
+   SPSC across the pair. I own this and will land it when multi-model
+   scheduling work starts — it is a container v1.1 addition, not an op change.
+
+Until then **(a-host) is the shipping form** — correct today, with the top-M
+scatter mitigation bounding the edge. Probes: amateur-edge bytes/step (full-V
+vs top-M), expert/amateur step-phase skew (two clocks, one SPSC channel —
+back-pressure is the coupling), dummy-run rate on the `am` edge vs the mask
+edge.
+
 ### G5 — everything else already existed
 
 `value_head` (model-gated), `mtp_logits [K,V]` (Stage 2, `ab8ec2f1`),
 `envelope_dot`/`attn_page_mask` (second-party, bind-time), per-position bool
-masks (ruling B, 1-byte), `top_k` (immediate k) — all present in the P0
-registry and golden-anchored. The five-way composition adds **no entry** to
-the op table, which was the point of D5's closed core: if this scheme fits,
-extension pressure is genuinely second-party.
+masks (ruling B, 1-byte), `top_k` (immediate k) — and contrastive's whole
+vector algebra (`sub`, scalar `mul`, `log_softmax`, `reduce_max`, `ge`,
+`and`, `select`, `scatter_set` for the top-M reconstruction) — all present in
+the P0 registry and golden-anchored. The six-way composition adds **no
+entry** to the op table, which was the point of D5's closed core: if this
+scheme fits, extension pressure is genuinely second-party (or, per G6,
+runtime/container plumbing — never the IR).
 
 ## 6. Implementation plan (post-§6.2/MTP landing)
 
-1. Mock-first: compose 2.1+2.2 in the tier-0 interpreter harness; golden
-   `pentathlon_iter` (one MCTS iteration, R=2, B=2, K=3, tiny DFA grammar) —
-   hand-checkable like `mtp_verify_tail`.
+1. Mock-first: compose 2.1+2.2+2.3 in the tier-0 interpreter harness; golden
+   `pentathlon_iter` (one MCTS iteration, R=2, B=2, K=3, tiny DFA grammar,
+   host-fed amateur — a-host) — hand-checkable like `mtp_verify_tail`; plus a
+   `contrastive_pick` unit golden (CD + plausibility ∧ grammar at k rows).
 2. In-graph DFA demonstrator (G1) — same golden, mask channel deleted.
-3. CUDA: no new kernels; run the two identities under the quorum scheduler;
-   measure the §3 probe set at R ∈ {8, 32, 128} on Qwen3-0.6B.
+3. CUDA: no new kernels; run the identities under the quorum scheduler;
+   measure the §3 probe set + the G6 amateur-edge probes at R ∈ {8, 32, 128}
+   on Qwen3-0.6B (amateur = context-truncated same-model, a-host form).
+   (a-device) lands with multi-model + the container extern-channel (G6).
 4. Metal mirrors via the goldens (mac-master's existing gate discipline).
