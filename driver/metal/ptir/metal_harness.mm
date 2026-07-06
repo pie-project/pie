@@ -101,7 +101,9 @@ bool MetalHarness::run(const std::string& fn_name, std::vector<Arg>& args,
             std::size_t n = args[i].bytes ? args[i].bytes : 1;
             bufs[i] = [impl_->device newBufferWithLength:n
                                                  options:MTLResourceStorageModeShared];
-            if (!args[i].is_output && args[i].data) {
+            // Upload initial contents for inputs and inout (in-place) args;
+            // zero-fill pure outputs.
+            if ((!args[i].is_output || args[i].is_inout) && args[i].data) {
                 std::memcpy([bufs[i] contents], args[i].data, args[i].bytes);
             } else {
                 std::memset([bufs[i] contents], 0, n);

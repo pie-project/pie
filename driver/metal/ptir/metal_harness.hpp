@@ -23,11 +23,13 @@ struct Arg {
     void* data = nullptr;  // host pointer (read for input, written for output)
     std::size_t bytes = 0;
     bool is_output = false;
+    bool is_inout = false;  // upload initial data AND copy back (in-place kernels)
 
     static Arg in(const void* p, std::size_t n) {
-        return Arg{const_cast<void*>(p), n, false};
+        return Arg{const_cast<void*>(p), n, false, false};
     }
-    static Arg out(void* p, std::size_t n) { return Arg{p, n, true}; }
+    static Arg out(void* p, std::size_t n) { return Arg{p, n, true, false}; }
+    static Arg inout(void* p, std::size_t n) { return Arg{p, n, true, true}; }
 };
 
 class MetalHarness {
