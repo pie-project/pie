@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <string>
@@ -139,7 +140,7 @@ class Instance {
     }
     void exec_stage(const P::Stage& s, std::uint32_t layer, const FireInputs& in, Overlay& ov,
                     StepReport& rep);
-    Val eval_op(const P::Op& op, const std::vector<Val>& args, StepReport& rep);
+    std::vector<Val> eval_op(const P::Op& op, const std::vector<Val>& args, StepReport& rep);
 
     const P::Trace* trace_;
     const P::bound::Bound* bound_;
@@ -172,8 +173,10 @@ inline void rows_len(const P::TensorType& t, int& rows, int& len) {
     if (rows == 0) rows = 1;
 }
 
-inline Val Instance::eval_op(const P::Op& op, const std::vector<Val>& args, StepReport& rep) {
+inline std::vector<Val> Instance::eval_op(const P::Op& op, const std::vector<Val>& args, StepReport& rep) {
     using OC = P::OpCode;
+    auto one = [](Val v) { return std::vector<Val>{std::move(v)}; };
+    auto argtype = [&](std::size_t k) { return trace_->value(op.args[k])->type; };
     auto binop_int = [&](auto f) {
         const auto& a = args[0].i;
         const auto& b = args[1].i;
@@ -192,57 +195,138 @@ inline Val Instance::eval_op(const P::Op& op, const std::vector<Val>& args, Step
             o[k] = f(a[a.size() == 1 ? 0 : k], b[b.size() == 1 ? 0 : k]);
         return Val::make_f32(std::move(o));
     };
+    auto cmp = [&](auto f) {
+        auto a = args[0].to_f32();
+        auto b = args[1].to_f32();
+        std::size_t n = a.size() > b.size() ? a.size() : b.size();
+        std::vector<std::int64_t> o(n);
+        for (std::size_t k = 0; k < n; ++k)
+            o[k] = f(a[a.size() == 1 ? 0 : k], b[b.size() == 1 ? 0 : k]) ? 1 : 0;
+        return Val::make_int(DType::Bool, std::move(o));
+    };
+    auto unary_f = [&](auto f) {
+        auto a = args[0].to_f32();
+        std::vector<float> o(a.size());
+        for (std::size_t k = 0; k < a.size(); ++k) o[k] = f(a[k]);
+        return Val::make_f32(std::move(o));
+    };
     switch (op.code) {
         case OC::Add:
-            return args[0].dt == DType::F32 ? binop_f([](float x, float y) { return x + y; })
-                                            : binop_int([](std::int64_t x, std::int64_t y) { return x + y; });
+            return one(args[0].dt == DType::F32 ? binop_f([](float x, float y) { return x + y; })
+                                                : binop_int([](std::int64_t x, std::int64_t y) { return x + y; }));
         case OC::Sub:
-            return args[0].dt == DType::F32 ? binop_f([](float x, float y) { return x - y; })
-                                            : binop_int([](std::int64_t x, std::int64_t y) { return x - y; });
+            return one(args[0].dt == DType::F32 ? binop_f([](float x, float y) { return x - y; })
+                                                : binop_int([](std::int64_t x, std::int64_t y) { return x - y; }));
         case OC::Mul:
-            return args[0].dt == DType::F32 ? binop_f([](float x, float y) { return x * y; })
-                                            : binop_int([](std::int64_t x, std::int64_t y) { return x * y; });
+            return one(args[0].dt == DType::F32 ? binop_f([](float x, float y) { return x * y; })
+                                                : binop_int([](std::int64_t x, std::int64_t y) { return x * y; }));
+        case OC::Div:
+            return one(args[0].dt == DType::F32 ? binop_f([](float x, float y) { return x / y; })
+                                                : binop_int([](std::int64_t x, std::int64_t y) { return y ? x / y : 0; }));
+        case OC::Rem:
+            return one(binop_int([](std::int64_t x, std::int64_t y) { return y ? x % y : 0; }));
+        case OC::MaxElem:
+            return one(binop_f([](float x, float y) { return x > y ? x : y; }));
+        case OC::MinElem:
+            return one(binop_f([](float x, float y) { return x < y ? x : y; }));
+        case OC::Gt: return one(cmp([](float x, float y) { return x > y; }));
+        case OC::Ge: return one(cmp([](float x, float y) { return x >= y; }));
+        case OC::Eq: return one(cmp([](float x, float y) { return x == y; }));
+        case OC::Ne: return one(cmp([](float x, float y) { return x != y; }));
+        case OC::Lt: return one(cmp([](float x, float y) { return x < y; }));
+        case OC::Le: return one(cmp([](float x, float y) { return x <= y; }));
+        case OC::And: {
+            std::size_t n = args[0].i.size() > args[1].i.size() ? args[0].i.size() : args[1].i.size();
+            std::vector<std::int64_t> o(n);
+            for (std::size_t k = 0; k < n; ++k)
+                o[k] = (args[0].i[args[0].i.size() == 1 ? 0 : k] && args[1].i[args[1].i.size() == 1 ? 0 : k]) ? 1 : 0;
+            return one(Val::make_int(DType::Bool, std::move(o)));
+        }
+        case OC::Or: {
+            std::size_t n = args[0].i.size() > args[1].i.size() ? args[0].i.size() : args[1].i.size();
+            std::vector<std::int64_t> o(n);
+            for (std::size_t k = 0; k < n; ++k)
+                o[k] = (args[0].i[args[0].i.size() == 1 ? 0 : k] || args[1].i[args[1].i.size() == 1 ? 0 : k]) ? 1 : 0;
+            return one(Val::make_int(DType::Bool, std::move(o)));
+        }
+        case OC::Not: {
+            std::vector<std::int64_t> o(args[0].i.size());
+            for (std::size_t k = 0; k < o.size(); ++k) o[k] = args[0].i[k] ? 0 : 1;
+            return one(Val::make_int(DType::Bool, std::move(o)));
+        }
+        case OC::Exp: return one(unary_f([](float x) { return std::exp(x); }));
+        case OC::Log: return one(unary_f([](float x) { return std::log(x); }));
+        case OC::Neg: return one(unary_f([](float x) { return -x; }));
+        case OC::Recip: return one(unary_f([](float x) { return 1.0f / x; }));
+        case OC::Abs: return one(unary_f([](float x) { return std::fabs(x); }));
         case OC::Reshape:
-        case OC::Transpose:  // (axis metadata handled by shape; row-major clone for now)
-            return args[0];
+        case OC::Transpose:
+            return one(args[0]);
+        case OC::Broadcast: {
+            // left-aligned row-major broadcast (eval.rs broadcast_to).
+            const auto& td = op.result_type.shape.dims;
+            const auto& sd = argtype(0).shape.dims;
+            int r = (int)td.size();
+            auto sdim = [&](int idx) { return idx < (int)sd.size() ? (std::int64_t)sd[idx] : 1; };
+            std::size_t n = 1;
+            for (auto d : td) n *= d;
+            if (n == 0) n = 1;
+            std::vector<std::uint64_t> sstride(r, 1);
+            for (int idx = r - 2; idx >= 0; --idx) sstride[idx] = sstride[idx + 1] * (std::uint64_t)sdim(idx + 1);
+            auto src_idx = [&](std::uint64_t lin) {
+                std::uint64_t rem = lin, si = 0;
+                for (int idx = 0; idx < r; ++idx) {
+                    std::uint64_t stride = 1;
+                    for (int q = idx + 1; q < r; ++q) stride *= (std::uint64_t)td[q];
+                    std::uint64_t coord = stride ? rem / stride : 0;
+                    if (stride) rem %= stride;
+                    if (sdim(idx) != 1) si += coord * sstride[idx];
+                }
+                return si;
+            };
+            if (args[0].dt == DType::F32) {
+                auto s = args[0].to_f32();
+                std::vector<float> o(n);
+                for (std::uint64_t k = 0; k < n; ++k) o[k] = s[src_idx(k)];
+                return one(Val::make_f32(std::move(o)));
+            }
+            std::vector<std::int64_t> o(n);
+            for (std::uint64_t k = 0; k < n; ++k) o[k] = args[0].i[src_idx(k)];
+            return one(Val::make_int(args[0].dt, std::move(o)));
+        }
         case OC::Select: {
-            // cond ? a : b, per-operand len-1 broadcast, dtype of a preserved.
-            const Val& c = args[0];
-            const Val& a = args[1];
-            const Val& b = args[2];
+            const Val& c = args[0]; const Val& a = args[1]; const Val& b = args[2];
             std::size_t n = c.numel();
             n = a.numel() > n ? a.numel() : n;
             n = b.numel() > n ? b.numel() : n;
             auto pick = [](std::size_t l, std::size_t k) { return l == 1 ? std::size_t(0) : k; };
-            auto cond = c.i;  // Bool as i64 0/1
+            const auto& cond = c.i;
             if (a.dt == DType::F32) {
                 auto av = a.to_f32(), bv = b.to_f32();
                 std::vector<float> o(n);
                 for (std::size_t k = 0; k < n; ++k)
                     o[k] = cond[pick(cond.size(), k)] ? av[pick(av.size(), k)] : bv[pick(bv.size(), k)];
-                return Val::make_f32(std::move(o));
+                return one(Val::make_f32(std::move(o)));
             }
             std::vector<std::int64_t> o(n);
             for (std::size_t k = 0; k < n; ++k)
                 o[k] = cond[pick(cond.size(), k)] ? a.i[pick(a.i.size(), k)] : b.i[pick(b.i.size(), k)];
-            return Val::make_int(a.dt, std::move(o));
+            return one(Val::make_int(a.dt, std::move(o)));
         }
         case OC::Iota: {
             std::vector<std::int64_t> o(op.imm);
             for (std::uint32_t k = 0; k < op.imm; ++k) o[k] = k;
-            return Val::make_int(DType::U32, std::move(o));
+            return one(Val::make_int(DType::U32, std::move(o)));
         }
         case OC::Cast: {
             DType to = op.result_type.dtype;
-            if (to == DType::F32) return Val::make_f32(args[0].to_f32());
-            auto f = args[0].to_f32();
+            if (to == DType::F32) return one(Val::make_f32(args[0].to_f32()));
             std::vector<std::int64_t> o(args[0].numel());
-            if (args[0].dt == DType::F32) for (std::size_t k = 0; k < o.size(); ++k) o[k] = (std::int64_t)f[k];
+            if (args[0].dt == DType::F32) { auto f = args[0].to_f32(); for (std::size_t k = 0; k < o.size(); ++k) o[k] = (std::int64_t)f[k]; }
             else o = args[0].i;
-            return Val::make_int(to, std::move(o));
+            return one(Val::make_int(to, std::move(o)));
         }
         case OC::RngKeyed: {
-            // state = [key, ctr]; seed64 = splitmix64((key<<32)|ctr); gumbel/uniform.
             const auto& st = args[0].i;
             std::uint64_t key = (std::uint64_t)st[0] & 0xFFFFFFFFull;
             std::uint64_t ctr = st.size() > 1 ? ((std::uint64_t)st[1] & 0xFFFFFFFFull) : 0;
@@ -256,19 +340,109 @@ inline Val Instance::eval_op(const P::Op& op, const std::vector<Val>& args, Step
                 float u = hash_uniform(seed64, j);
                 o[j] = gumbel ? -std::log(-std::log(u)) : u;
             }
-            return Val::make_f32(std::move(o));
+            return one(Val::make_f32(std::move(o)));
         }
         case OC::ReduceArgmax: {
-            int rows, len;
-            rows_len(trace_->value(op.args[0])->type, rows, len);
+            int rows, len; rows_len(argtype(0), rows, len);
             auto tokens = ops_->reduce_argmax(args[0].to_f32(), rows, len);
-            std::vector<std::int64_t> o(tokens.begin(), tokens.end());
-            return Val::make_int(DType::I32, std::move(o));
+            return one(Val::make_int(DType::I32, std::vector<std::int64_t>(tokens.begin(), tokens.end())));
+        }
+        case OC::ReduceSum:
+        case OC::ReduceMax:
+        case OC::ReduceMin: {
+            // Compute on Metal (reduce_*_rows kernels) for the sampling compute.
+            int rows, len; rows_len(argtype(0), rows, len);
+            const char* fn = op.code == OC::ReduceSum ? "reduce_sum_rows"
+                           : op.code == OC::ReduceMax ? "reduce_max_rows" : "reduce_min_rows";
+            return one(Val::make_f32(ops_->reduce_rows(fn, args[0].to_f32(), rows, len)));
+        }
+        case OC::TopK: {
+            int rows, len; rows_len(argtype(0), rows, len);
+            int k = (int)op.imm;
+            auto x = args[0].to_f32();
+            std::vector<float> vs; std::vector<std::int64_t> is;
+            for (int r = 0; r < rows; ++r) {
+                std::vector<int> ord(len);
+                for (int j = 0; j < len; ++j) ord[j] = j;
+                std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return x[r * len + a] > x[r * len + b]; });
+                for (int t = 0; t < k; ++t) { vs.push_back(x[r * len + ord[t]]); is.push_back(ord[t]); }
+            }
+            return {Val::make_f32(std::move(vs)), Val::make_int(DType::U32, std::move(is))};
+        }
+        case OC::Gather: {
+            const auto& ts = argtype(0).shape.dims;
+            std::size_t rest = 1;
+            for (std::size_t d = 1; d < ts.size(); ++d) rest *= ts[d];
+            if (rest == 0) rest = 1;
+            std::size_t n0 = ts.empty() ? args[0].numel() : ts[0];
+            const auto& ix = args[1].i;
+            if (args[0].dt == DType::F32) {
+                auto s = args[0].to_f32();
+                std::vector<float> o(ix.size() * rest, 0.0f);
+                for (std::size_t j = 0; j < ix.size(); ++j)
+                    if (ix[j] >= 0 && (std::size_t)ix[j] < n0)
+                        for (std::size_t r = 0; r < rest; ++r) o[j * rest + r] = s[ix[j] * rest + r];
+                return one(Val::make_f32(std::move(o)));
+            }
+            std::vector<std::int64_t> o(ix.size() * rest, 0);
+            for (std::size_t j = 0; j < ix.size(); ++j)
+                if (ix[j] >= 0 && (std::size_t)ix[j] < n0)
+                    for (std::size_t r = 0; r < rest; ++r) o[j * rest + r] = args[0].i[ix[j] * rest + r];
+            return one(Val::make_int(args[0].dt, std::move(o)));
+        }
+        case OC::ScatterSet:
+        case OC::ScatterAdd: {
+            const auto& tb = argtype(0).shape.dims;
+            std::size_t rest = 1;
+            for (std::size_t d = 1; d < tb.size(); ++d) rest *= tb[d];
+            if (rest == 0) rest = 1;
+            std::size_t n0 = tb.empty() ? args[0].numel() : tb[0];
+            const auto& ix = args[1].i;
+            bool is_add = op.code == OC::ScatterAdd;
+            bool scalar_val = args[2].numel() == 1 && ix.size() * rest != 1;
+            if (args[0].dt == DType::F32) {
+                auto out = args[0].to_f32();
+                auto vv = args[2].to_f32();
+                for (std::size_t kk = 0; kk < ix.size(); ++kk)
+                    if (ix[kk] >= 0 && (std::size_t)ix[kk] < n0)
+                        for (std::size_t r = 0; r < rest; ++r) {
+                            float src = scalar_val ? vv[0] : vv[kk * rest + r];
+                            float& dst = out[ix[kk] * rest + r];
+                            dst = is_add ? dst + src : src;
+                        }
+                return one(Val::make_f32(std::move(out)));
+            }
+            auto out = args[0].i;
+            const auto& vv = args[2].i;
+            for (std::size_t kk = 0; kk < ix.size(); ++kk)
+                if (ix[kk] >= 0 && (std::size_t)ix[kk] < n0)
+                    for (std::size_t r = 0; r < rest; ++r) {
+                        std::int64_t src = scalar_val ? vv[0] : vv[kk * rest + r];
+                        std::int64_t& dst = out[ix[kk] * rest + r];
+                        dst = is_add ? dst + src : src;
+                    }
+            return one(Val::make_int(args[0].dt, std::move(out)));
+        }
+        case OC::GatherRow: {
+            int m = 1, n = 1;
+            const auto& ts = argtype(0).shape.dims;
+            if (ts.size() >= 2) { m = (int)ts[0]; n = (int)ts[1]; }
+            const auto& ix = args[1].i;
+            if (args[0].dt == DType::F32) {
+                auto s = args[0].to_f32();
+                std::vector<float> o(m, 0.0f);
+                for (int r = 0; r < m; ++r) if (ix[r] >= 0 && ix[r] < n) o[r] = s[r * n + ix[r]];
+                return one(Val::make_f32(std::move(o)));
+            }
+            std::vector<std::int64_t> o(m, 0);
+            for (int r = 0; r < m; ++r) if (ix[r] >= 0 && ix[r] < n) o[r] = args[0].i[r * n + ix[r]];
+            return one(Val::make_int(args[0].dt, std::move(o)));
         }
         default:
             rep.ok = false;
-            rep.error = "tier0: unhandled op 0x" + std::to_string((int)op.code);
-            return Val::zeros(DType::F32, 1);
+            rep.error = "tier0: unhandled op 0x" + std::to_string((int)op.code) + " (" +
+                        std::string(P::op_info(op.code).name) + ")";
+            return one(Val::zeros(DType::F32, 1));
     }
 }
 
@@ -318,9 +492,10 @@ inline void Instance::exec_stage(const P::Stage& s, std::uint32_t layer, const F
         std::vector<Val> args;
         args.reserve(op.args.size());
         for (auto aid : op.args) args.push_back(leaf(aid));
-        Val r = eval_op(op, args, rep);
+        std::vector<Val> results = eval_op(op, args, rep);
         if (!rep.ok) return;
-        cache[op.result_id] = std::move(r);
+        for (std::uint32_t rr = 0; rr < results.size(); ++rr)
+            cache[op.result_id + rr] = std::move(results[rr]);
     }
     // Channel puts (pass-local overlay; applied at commit).
     for (const P::ChannelPut& p : s.puts) {
@@ -328,6 +503,10 @@ inline void Instance::exec_stage(const P::Stage& s, std::uint32_t layer, const F
         ov.pending[p.channel] = v;
         ov.put[p.channel] = 1;
     }
+    // Takes/reads whose result is unused (e.g. §6.2 klen/kvm drain) aren't in any
+    // op's args — the translator records them explicitly; a take still advances
+    // the ring at commit (interp.rs / charlie's collect_stage_channels).
+    for (P::ChannelId c : s.takes) ov.taken[c] = 1;
 }
 
 inline StepReport Instance::step(const FireInputs& in) {
