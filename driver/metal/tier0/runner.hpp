@@ -60,7 +60,9 @@ struct Val {
 // golden's `inputs N:` line.
 struct FireInputs {
     bool has_logits = false;
-    std::vector<float> logits;     // [rows*vocab] row-major
+    std::vector<float> logits;     // [rows*vocab] row-major (Intrinsic::Logits)
+    bool has_mtp_logits = false;
+    std::vector<float> mtp_logits; // [rows*vocab] row-major (Intrinsic::MtpLogits)
     int vocab = 0;
     std::map<std::uint32_t, Val> host_inputs;  // host_key -> value
 };
@@ -356,6 +358,26 @@ inline std::vector<Val> Instance::eval_op(const P::Op& op, const std::vector<Val
                            : op.code == OC::ReduceMax ? "reduce_max_rows" : "reduce_min_rows";
             return one(Val::make_f32(ops_->reduce_rows(fn, args[0].to_f32(), rows, len)));
         }
+        case OC::CumProd:
+        case OC::CumSum: {
+            // Row-local inclusive prefix scan (interp.rs Reduce/RowLocal). Used
+            // by spec_verify_greedy: cumprod over {0,1} = prefix-AND accepting
+            // the longest matching draft prefix. Host control-flow (like the
+            // eq/gt lanes); the heavy per-row work stays on Metal (argmax).
+            int rows, len; rows_len(argtype(0), rows, len);
+            auto in = args[0].to_f32();
+            const bool prod = op.code == OC::CumProd;
+            std::vector<float> o(in.size());
+            for (int r = 0; r < rows; ++r) {
+                float acc = prod ? 1.0f : 0.0f;
+                for (int j = 0; j < len; ++j) {
+                    float x = in[(std::size_t)r * len + j];
+                    acc = prod ? acc * x : acc + x;
+                    o[(std::size_t)r * len + j] = acc;
+                }
+            }
+            return one(Val::make_f32(std::move(o)));
+        }
         case OC::TopK: {
             int rows, len; rows_len(argtype(0), rows, len);
             int k = (int)op.imm;
@@ -465,7 +487,14 @@ inline void Instance::exec_stage(const P::Stage& s, std::uint32_t layer, const F
                 break;
             }
             case P::ValueSource::Intrinsic:
-                out = Val::make_f32(in.logits);
+                // De-hardwiring: the draft speculator binds Intrinsic::MtpLogits
+                // (the on-device MTP draft logits); a plain sampler binds
+                // Intrinsic::Logits. Same argmax bytecode — only the bound
+                // source differs (mtp_argmax vs argmax). Mirrors CUDA Stage 2.
+                out = Val::make_f32(
+                    v->intrinsic == P::Intrinsic::MtpLogits && in.has_mtp_logits
+                        ? in.mtp_logits
+                        : in.logits);
                 break;
             case P::ValueSource::HostInput: {
                 auto hi = in.host_inputs.find(v->host_key);

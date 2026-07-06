@@ -35,6 +35,29 @@ target_compile_definitions(tier0_test PRIVATE
 target_link_libraries(tier0_test PRIVATE
   ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
 
+# PTIR-native MTP spec-verify cert (real Qwen3.5 MTP drafts through the tier-0
+# Metal op kernels: de-hardwiring + the spec_verify_greedy sentinel accept-tail).
+add_executable(mtpverify_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm
+  mtpverify_test.mm)
+
+set_source_files_properties(
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm mtpverify_test.mm
+  PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+target_include_directories(mtpverify_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../cuda/src)
+
+target_compile_definitions(mtpverify_test PRIVATE
+  TIER0_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../ptir/kernels")
+
+target_link_libraries(mtpverify_test PRIVATE
+  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
+
 enable_testing()
 add_test(NAME tier0_test COMMAND tier0_test)
 set_tests_properties(tier0_test PROPERTIES PASS_REGULAR_EXPRESSION "TIER0_TEST_OK")
+add_test(NAME mtpverify_test COMMAND mtpverify_test)
+set_tests_properties(mtpverify_test PROPERTIES PASS_REGULAR_EXPRESSION "MTPVERIFY_OK")

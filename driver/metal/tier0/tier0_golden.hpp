@@ -6,6 +6,7 @@
 // host-put), replayed against the tier-0 Instance.
 
 #include <cstdint>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -67,6 +68,8 @@ struct Action {
     // SetInputs
     bool has_logits = false;
     std::vector<float> logits;
+    bool has_mtp_logits = false;
+    std::vector<float> mtp_logits;
     // Step
     bool exp_committed = false, exp_miss = false;
     std::uint32_t miss_chan = 0, miss_phase = 0;
@@ -104,11 +107,20 @@ inline bool load(const std::string& path, Golden& g) {
             g.seeds.push_back(std::move(s));
         } else if (t.rfind("inputs ", 0) == 0) {
             Action a; a.kind = Action::SetInputs;
-            if (t.find("logits: Some(F32(") != std::string::npos) {
+            // Note: "mtp_logits:" contains "logits:" — match the plain logits
+            // only when not preceded by an identifier char (i.e. not the mtp one).
+            std::size_t lp = t.find("logits: Some(F32(");
+            while (lp != std::string::npos && lp > 0 &&
+                   (std::isalnum((unsigned char)t[lp - 1]) || t[lp - 1] == '_'))
+                lp = t.find("logits: Some(F32(", lp + 1);
+            if (lp != std::string::npos) {
                 a.has_logits = true;
-                std::size_t p = t.find("logits: Some(F32(");
-                Val v = parse_typed(t.substr(p));
-                a.logits = v.f;
+                a.logits = parse_typed(t.substr(lp)).f;
+            }
+            std::size_t mp = t.find("mtp_logits: Some(F32(");
+            if (mp != std::string::npos) {
+                a.has_mtp_logits = true;
+                a.mtp_logits = parse_typed(t.substr(mp)).f;
             }
             g.actions.push_back(std::move(a));
         } else if (t.rfind("step ", 0) == 0) {

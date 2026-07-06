@@ -274,6 +274,7 @@ int main(int argc, char** argv) {
         accepted += ok; ++total;
         gen.push_back(cur);
         if (s < 8) std::printf("  step %d: mtp_draft=%d target=%d %s\n", s, draft, truth, ok ? "ACCEPT" : "reject");
+        if (std::getenv("MTP_BLOCK")) std::printf("BLOCK %d %d\n", draft, truth);
         // advance
         hidden = h1; cur = truth; ++p;
     }

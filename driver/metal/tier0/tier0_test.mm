@@ -77,6 +77,7 @@ void run_golden(const std::string& dir, const std::string& name, tier0::MetalOps
             case tier0::golden::Action::SetInputs:
                 cur = tier0::FireInputs{};
                 if (a.has_logits) { cur.has_logits = true; cur.logits = a.logits; }
+                if (a.has_mtp_logits) { cur.has_mtp_logits = true; cur.mtp_logits = a.mtp_logits; }
                 break;
             case tier0::golden::Action::Step: {
                 auto rep = inst.step(cur);
