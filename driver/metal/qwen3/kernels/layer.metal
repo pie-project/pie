@@ -160,3 +160,19 @@ kernel void embedding(
     const int tok = token_ids[n];
     out[gid] = embed[(ulong)tok * hidden + j];
 }
+
+// ── greedy argmax over a logits row [vocab] -> I32 token (on-device greedy) ────
+// One thread per row; sequential scan (strict >, first-max wins). grid = rows.
+kernel void argmax_row(
+    device const float* logits [[buffer(0)]],
+    device int*         out    [[buffer(1)]],
+    constant int&       vocab  [[buffer(2)]],
+    constant uint&      rows   [[buffer(3)]],
+    uint r [[thread_position_in_grid]]) {
+    if (r >= rows) return;
+    float best = -INFINITY;
+    int bi = 0;
+    device const float* row = logits + (ulong)r * vocab;
+    for (int j = 0; j < vocab; ++j) { float x = row[j]; if (x > best) { best = x; bi = j; } }
+    out[r] = bi;
+}

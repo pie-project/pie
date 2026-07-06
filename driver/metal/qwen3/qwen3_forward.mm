@@ -29,6 +29,7 @@
 #include "chain.hpp"
 #include "metal_harness.hpp"
 #include "reference.hpp"
+#include "weights.hpp"
 
 #ifndef QWEN3_KERNELS_DIR
 #define QWEN3_KERNELS_DIR "."
@@ -36,80 +37,9 @@
 
 using namespace ptir_metal;
 namespace A = qwen3::arch;
+using qwen3::SafeTensors;
 
 namespace {
-
-// ── minimal safetensors reader (BF16) ────────────────────────────────────────
-struct SafeTensors {
-    int fd = -1;
-    const std::uint8_t* base = nullptr;  // mmap
-    std::size_t file_size = 0;
-    std::string header;                  // JSON
-    std::size_t data_base = 0;           // byte offset of tensor data region
-
-    bool open(const std::string& path) {
-        fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) return false;
-        struct stat st{};
-        if (fstat(fd, &st) != 0) return false;
-        file_size = st.st_size;
-        base = static_cast<const std::uint8_t*>(mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
-        if (base == MAP_FAILED) { base = nullptr; return false; }
-        std::uint64_t hlen;
-        std::memcpy(&hlen, base, 8);
-        header.assign(reinterpret_cast<const char*>(base + 8), hlen);
-        data_base = 8 + hlen;
-        return true;
-    }
-    ~SafeTensors() {
-        if (base) munmap(const_cast<std::uint8_t*>(base), file_size);
-        if (fd >= 0) ::close(fd);
-    }
-
-    // Locate a tensor's data_offsets [start,end] by name (flat header lookup).
-    bool offsets(const std::string& name, std::size_t& start, std::size_t& end) const {
-        std::string key = "\"" + name + "\":";
-        std::size_t k = header.find(key);
-        if (k == std::string::npos) return false;
-        std::size_t o = header.find("\"data_offsets\":[", k);
-        if (o == std::string::npos) return false;
-        o += std::strlen("\"data_offsets\":[");
-        start = std::strtoull(header.c_str() + o, nullptr, 10);
-        std::size_t comma = header.find(',', o);
-        end = std::strtoull(header.c_str() + comma + 1, nullptr, 10);
-        return true;
-    }
-
-    // Load a BF16 tensor as f32 (bits = u16 << 16). Returns false if missing.
-    bool load_f32(const std::string& name, std::vector<float>& out) const {
-        std::size_t start, end;
-        if (!offsets(name, start, end)) { std::fprintf(stderr, "missing tensor: %s\n", name.c_str()); return false; }
-        std::size_t nbytes = end - start;
-        std::size_t n = nbytes / 2;  // BF16 = 2 bytes
-        out.resize(n);
-        const std::uint16_t* src = reinterpret_cast<const std::uint16_t*>(base + data_base + start);
-        for (std::size_t i = 0; i < n; ++i) {
-            std::uint32_t bits = static_cast<std::uint32_t>(src[i]) << 16;
-            std::memcpy(&out[i], &bits, 4);
-        }
-        return true;
-    }
-};
-
-bool load_layer(const SafeTensors& st, int l, qwen3::ref::LayerWeights& w) {
-    std::string p = "model.layers." + std::to_string(l) + ".";
-    return st.load_f32(p + "input_layernorm.weight", w.input_ln) &&
-           st.load_f32(p + "self_attn.q_proj.weight", w.wq) &&
-           st.load_f32(p + "self_attn.k_proj.weight", w.wk) &&
-           st.load_f32(p + "self_attn.v_proj.weight", w.wv) &&
-           st.load_f32(p + "self_attn.q_norm.weight", w.q_norm) &&
-           st.load_f32(p + "self_attn.k_norm.weight", w.k_norm) &&
-           st.load_f32(p + "self_attn.o_proj.weight", w.wo) &&
-           st.load_f32(p + "post_attention_layernorm.weight", w.post_ln) &&
-           st.load_f32(p + "mlp.gate_proj.weight", w.wgate) &&
-           st.load_f32(p + "mlp.up_proj.weight", w.wup) &&
-           st.load_f32(p + "mlp.down_proj.weight", w.wdown);
-}
 
 std::vector<int> topk_indices(const float* row, int vocab, int k) {
     std::vector<int> idx(vocab);
@@ -151,7 +81,7 @@ int main(int argc, char** argv) {
     if (!st.load_f32("lm_head.weight", lm_head)) lm_head = embed;  // tied fallback
     std::vector<qwen3::ref::LayerWeights> layers(A::N_LAYERS);
     for (int l = 0; l < A::N_LAYERS; ++l)
-        if (!load_layer(st, l, layers[l])) return 2;
+        if (!qwen3::load_layer(st, l, layers[l])) return 2;
     std::printf("weights loaded. running forward (N=%d tokens)...\n", D.N);
 
     // CPU f32 reference forward (self-validation oracle).

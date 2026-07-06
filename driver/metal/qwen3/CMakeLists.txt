@@ -48,6 +48,21 @@ target_compile_definitions(qwen3_forward PRIVATE
 target_link_libraries(qwen3_forward PRIVATE
   ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
 
+# Greedy autoregressive generation driver (needs model.safetensors):
+#   ./build/qwen3_generate <model.safetensors> kernels 20 qwen3_generate.txt
+add_executable(qwen3_generate
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm
+  qwen3_generate.mm)
+set_source_files_properties(
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm qwen3_generate.mm
+  PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_include_directories(qwen3_generate PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../ptir)
+target_compile_definitions(qwen3_generate PRIVATE
+  QWEN3_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
+target_link_libraries(qwen3_generate PRIVATE
+  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
+
 enable_testing()
 add_test(NAME qwen3_test COMMAND qwen3_test)
 set_tests_properties(qwen3_test PROPERTIES

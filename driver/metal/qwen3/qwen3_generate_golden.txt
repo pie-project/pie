@@ -1,0 +1,11 @@
+# Qwen3-0.6B Metal greedy autoregressive generation — CUDA cross-check golden
+model: Qwen/Qwen3-0.6B model.safetensors (BF16, HF [out,in])
+backend: Metal (Apple M1 Max), f32 compute + MPS GEMM, greedy argmax on-device
+prompt: 9707 3838 374 279 6722 315 9625 30
+n_gen: 20
+generated: 9625 374 264 3146 304 4505 13 576 6722 315 9625 374 12095 13 9625 374 264 3146 304 4505
+full_sequence: 9707 3838 374 279 6722 315 9625 30 9625 374 264 3146 304 4505 13 576 6722 315 9625 374 12095 13 9625 374 264 3146 304 4505
+decoded_gist: "France is a city in Europe. The capital of France is Paris. France is a city in Europe"
+note: greedy (argmax) — per-step divergence compounds, so matching the full generated
+      sequence on CUDA (same prompt+weights) = tight cross-backend parity. Reproduce
+      with: qwen3_generate <model.safetensors> kernels 20

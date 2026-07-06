@@ -52,6 +52,24 @@ Measured (real weights, N=8, Apple M1 Max): **Metal forward 665 ms (MPS) vs
 2209 ms (sequential) → 3.3×**. The ~7 s wall time in the driver is dominated by the
 CPU f32 reference run (self-validation); the Metal forward itself is sub-second.
 
+## Autoregressive generation (`qwen3_generate`)
+
+`qwen3_generate` runs **end-to-end greedy autoregressive decoding** on Metal: prompt
+→ full 28-layer Metal forward → **Metal argmax** → append the new token's K/V to a
+growing per-layer KV cache → repeat. This exercises the **multi-step KV-decode path**
+(KV growth across autoregressive steps) that a single forward doesn't, fully
+on-device.
+
+Observed (real weights, prompt `9707 3838 374 279 6722 315 9625 30`, 20 tokens):
+```
+generated: 9625 374 264 3146 304 4505 13 576 6722 315 9625 374 12095 13 ...
+           ≈ "France is a city in Europe. The capital of France is Paris. ..."
+```
+Coherent, grammatical, factually correct ("The capital of France is Paris"). The
+generated token-id sequence is exported (`qwen3_generate.txt`) for the definitive
+CUDA cross-check — matching greedy sequences (same prompt+weights) means tight
+cross-backend parity, since per-step divergence compounds.
+
 ## Real-weight forward (`qwen3_forward`)
 
 `qwen3_forward` loads the **actual** `Qwen/Qwen3-0.6B` `model.safetensors` (BF16, HF
