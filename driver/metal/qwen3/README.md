@@ -39,6 +39,19 @@ CPU reference (`max_abs ≈ 4e-6`). The 28-layer stack test uses reduced dims to
 the stacking mechanism (loop + cross-layer residual + per-layer KV + final norm +
 head) cheaply; per-primitive and single-layer parity are at real Qwen3-0.6B dims.
 
+## Perf: MPS GEMM
+
+The projections/LM-head GEMMs run through **`MPSMatrixMultiplication`**
+(`MetalHarness::mps_gemm`, `y = x·Wᵀ` via `transposeRight`) by default
+(`Chain::use_mps`), with the parity-first sequential kernel retained as a fallback
+(`QWEN3_GEMM=seq`). Numerics stay within tolerance — the full-forward
+`Metal-vs-CPU-ref max_abs` is unchanged at `4.1e-5` (the residual is attention/RoPE
+`exp`-dominated, below the GEMM-swap delta).
+
+Measured (real weights, N=8, Apple M1 Max): **Metal forward 665 ms (MPS) vs
+2209 ms (sequential) → 3.3×**. The ~7 s wall time in the driver is dominated by the
+CPU f32 reference run (self-validation); the Metal forward itself is sub-second.
+
 ## Real-weight forward (`qwen3_forward`)
 
 `qwen3_forward` loads the **actual** `Qwen/Qwen3-0.6B` `model.safetensors` (BF16, HF

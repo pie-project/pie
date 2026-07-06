@@ -22,10 +22,15 @@ using ptir_metal::MetalHarness;
 struct Chain {
     MetalHarness& h;
     bool ok = true;
+    bool use_mps = true;  // MPS GEMM by default (perf); false = sequential kernel
 
     std::vector<float> matmul(const std::vector<float>& x, const std::vector<float>& w,
                               int M, int N, int K) {
         std::vector<float> y((std::size_t)M * N, 0.0f);
+        if (use_mps) {
+            ok = ok && h.mps_gemm(x.data(), w.data(), y.data(), M, N, K);
+            return y;
+        }
         int m = M, n = N, k = K; std::uint32_t total = (std::uint32_t)(M * N);
         std::vector<Arg> a = {Arg::in(x.data(), x.size() * 4), Arg::in(w.data(), w.size() * 4),
                               Arg::out(y.data(), y.size() * 4), Arg::in(&m, 4), Arg::in(&n, 4),

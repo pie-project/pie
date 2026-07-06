@@ -13,7 +13,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -160,11 +162,17 @@ int main(int argc, char** argv) {
     if (!h.ok()) { std::fprintf(stderr, "no Metal device: %s\n", h.error().c_str()); return 2; }
     if (!h.load_library(kernels_dir + "/layer.metal")) { std::fprintf(stderr, "%s\n", h.error().c_str()); return 2; }
     qwen3::Chain ch{h};
+    ch.use_mps = !(std::getenv("QWEN3_GEMM") && std::string(std::getenv("QWEN3_GEMM")) == "seq");
+    std::printf("GEMM backend: %s\n", ch.use_mps ? "MPS (MPSMatrixMultiplication)" : "sequential kernel");
+    auto t0 = std::chrono::steady_clock::now();
     auto x = ch.embedding(embed, tokens, D.N, D.hidden);
     for (int l = 0; l < A::N_LAYERS; ++l) x = ch.layer(x, positions, layers[l], D);
     x = ch.rmsnorm(x, final_norm, D.N, D.hidden, D.rms_eps);
     auto metal_logits = ch.matmul(x, lm_head, D.N, A::VOCAB, D.hidden);
+    auto t1 = std::chrono::steady_clock::now();
     if (!ch.ok) { std::fprintf(stderr, "metal forward failed: %s\n", h.error().c_str()); return 2; }
+    double metal_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::printf("Metal forward: %.1f ms (28 layers + LM head, N=%d)\n", metal_ms, D.N);
 
     // Self-validation: Metal vs CPU ref.
     double max_abs = 0.0;

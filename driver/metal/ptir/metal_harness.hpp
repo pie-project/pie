@@ -55,6 +55,11 @@ public:
     bool run(const std::string& fn_name, std::vector<Arg>& args,
              std::uint32_t grid_threads);
 
+    // Optimized GEMM y[M,N] = x[M,K] · W[N,K]ᵀ via MPSMatrixMultiplication
+    // (W row-major [out,in] = [N,K]; transposeRight). f32; within-tol of the
+    // sequential kernel. Returns false + sets error() on failure.
+    bool mps_gemm(const float* x, const float* w, float* y, int M, int N, int K);
+
 private:
     struct Impl;
     Impl* impl_;

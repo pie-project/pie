@@ -14,6 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
 
 add_executable(kvattn_test
   ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm
@@ -31,7 +32,7 @@ target_compile_definitions(kvattn_test PRIVATE
   KVATTN_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
 
 target_link_libraries(kvattn_test PRIVATE
-  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
 
 enable_testing()
 add_test(NAME kvattn_test COMMAND kvattn_test)

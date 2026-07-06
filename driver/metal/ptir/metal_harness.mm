@@ -2,6 +2,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include <cstring>
 
@@ -135,6 +136,52 @@ bool MetalHarness::run(const std::string& fn_name, std::vector<Arg>& args,
                 std::memcpy(args[i].data, [bufs[i] contents], args[i].bytes);
             }
         }
+        return true;
+    }
+}
+
+bool MetalHarness::mps_gemm(const float* x, const float* w, float* y, int M, int N, int K) {
+    @autoreleasepool {
+        if (!impl_->device || !impl_->queue) { error_ = "no device"; return false; }
+        id<MTLBuffer> bx = [impl_->device newBufferWithBytes:x
+                                                      length:(NSUInteger)M * K * 4
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bw = [impl_->device newBufferWithBytes:w
+                                                      length:(NSUInteger)N * K * 4
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> by = [impl_->device newBufferWithLength:(NSUInteger)M * N * 4
+                                                      options:MTLResourceStorageModeShared];
+        MPSMatrixDescriptor* dx = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:K
+                                                                       rowBytes:(NSUInteger)K * 4
+                                                                       dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor* dw = [MPSMatrixDescriptor matrixDescriptorWithRows:N columns:K
+                                                                       rowBytes:(NSUInteger)K * 4
+                                                                       dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor* dy = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:N
+                                                                       rowBytes:(NSUInteger)N * 4
+                                                                       dataType:MPSDataTypeFloat32];
+        MPSMatrix* mx = [[MPSMatrix alloc] initWithBuffer:bx descriptor:dx];
+        MPSMatrix* mw = [[MPSMatrix alloc] initWithBuffer:bw descriptor:dw];
+        MPSMatrix* my = [[MPSMatrix alloc] initWithBuffer:by descriptor:dy];
+        // y = x · Wᵀ : transposeRight (W stored [N,K] used as [K,N]).
+        MPSMatrixMultiplication* mm =
+            [[MPSMatrixMultiplication alloc] initWithDevice:impl_->device
+                                              transposeLeft:NO
+                                             transposeRight:YES
+                                                 resultRows:M
+                                              resultColumns:N
+                                            interiorColumns:K
+                                                      alpha:1.0
+                                                       beta:0.0];
+        id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+        [mm encodeToCommandBuffer:cb leftMatrix:mx rightMatrix:mw resultMatrix:my];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            error_ = "mps_gemm command buffer failed";
+            return false;
+        }
+        std::memcpy(y, [by contents], (std::size_t)M * N * 4);
         return true;
     }
 }

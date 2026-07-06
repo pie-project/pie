@@ -22,6 +22,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
 
 add_executable(ptir_metal_test
   metal_harness.mm
@@ -35,7 +36,7 @@ target_compile_definitions(ptir_metal_test PRIVATE
   PTIR_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
 
 target_link_libraries(ptir_metal_test PRIVATE
-  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
 
 # Cross-backend golden cert: reuses charlie's CUDA-free PTIR decoder
 # (driver/cuda/src/ptir/container.hpp) to verify container identity, then runs
@@ -56,7 +57,7 @@ target_compile_definitions(ptir_golden_cert PRIVATE
   PTIR_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../interface/sampling-ir/tests/golden-ptir")
 
 target_link_libraries(ptir_golden_cert PRIVATE
-  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
 
 enable_testing()
 add_test(NAME ptir_metal_test COMMAND ptir_metal_test)
