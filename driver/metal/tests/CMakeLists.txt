@@ -14,3 +14,7 @@ target_link_libraries(kv_perlayer_test PRIVATE pie_driver_metal_lib)
 # Real MTP speculative decoding on Metal (Qwen3.5-0.8B GDN backbone + MTP head).
 add_executable(qwen35_mtp qwen35_mtp.cpp)
 target_link_libraries(qwen35_mtp PRIVATE pie_driver_metal_lib)
+
+# Honest wall-clock benchmark: regular greedy vs MTP (K=1) spec-decode.
+add_executable(qwen35_mtp_bench qwen35_mtp_bench.cpp)
+target_link_libraries(qwen35_mtp_bench PRIVATE pie_driver_metal_lib)
