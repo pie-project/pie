@@ -63,6 +63,24 @@ target_compile_definitions(qwen3_generate PRIVATE
 target_link_libraries(qwen3_generate PRIVATE
   ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
 
+# Algorithm loops (need model.safetensors): beam search + constrained spec-decode.
+add_executable(qwen3_beam
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm qwen3_beam.mm)
+add_executable(qwen3_specdecode
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm qwen3_specdecode.mm)
+foreach(algo qwen3_beam qwen3_specdecode)
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  target_include_directories(${algo} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../ptir)
+  target_compile_definitions(${algo} PRIVATE
+    QWEN3_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels"
+    PTIR_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../ptir/kernels")
+  target_link_libraries(${algo} PRIVATE
+    ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
+endforeach()
+set_source_files_properties(qwen3_beam.mm qwen3_specdecode.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
 enable_testing()
 add_test(NAME qwen3_test COMMAND qwen3_test)
 set_tests_properties(qwen3_test PROPERTIES

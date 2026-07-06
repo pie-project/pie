@@ -52,6 +52,25 @@ Measured (real weights, N=8, Apple M1 Max): **Metal forward 665 ms (MPS) vs
 2209 ms (sequential) → 3.3×**. The ~7 s wall time in the driver is dominated by the
 CPU f32 reference run (self-validation); the Metal forward itself is sub-second.
 
+## Algorithm loops (composed from certified pieces)
+
+Beam search and constrained speculative decoding run **end-to-end on Metal** by
+pure composition over the certified forward + KV cache + sampling ops (`model.hpp`
+supplies a `KVCache`-parameterized `forward_block` so each beam / draft owns a
+growing cache).
+
+- **`qwen3_beam`** — forward per beam → `log_softmax` scores → K×K candidate top-k
+  → reorder beams by parent → grow per-beam KV → repeat. Observed (K=3): top beam
+  *"France is a city located in…"*, ranked by cumulative log-prob. **Metal runs
+  beam search.**
+- **`qwen3_specdecode`** — constrained speculative decoding: draft k tokens greedily,
+  then spec-VERIFY under a **grammar mask** (masked logits via the certified
+  `dselect` = `matrix_select_mask` op + `argmax`, both Metal) and accept the longest
+  matching prefix; a grammar-disallowed draft is rejected and the mask-corrected
+  token substituted. Observed (k=4, grammar forbids `13`="."): 9/12 drafts accepted;
+  where greedy drafted `13` the grammar rejected+corrected it to `11`=",". **Metal
+  runs constrained speculative decoding.**
+
 ## Autoregressive generation (`qwen3_generate`)
 
 `qwen3_generate` runs **end-to-end greedy autoregressive decoding** on Metal: prompt
