@@ -50,6 +50,10 @@ pub struct CachedProgram {
     /// per slot: `Submit` → `sampling_input_*` (gathered now), `Late` → the
     /// device-alias `sampling_late_*` channel (#27 cut #2). Defaults all `Submit`.
     pub input_readiness: Vec<Readiness>,
+    /// Per-input-slot declared types, in `Op::Input(i)` order — the attach-time
+    /// intrinsic shape contract (`validate::intrinsic_decl_ok`: Stage-2
+    /// `[K, vocab]` MtpLogits / matrix Logits) is checked against these.
+    pub input_decls: Vec<pie_sampling_ir::InputDecl>,
 }
 
 /// Default bound: high-concurrency unique-sampler churn (`#11`) must not grow the
@@ -93,6 +97,7 @@ impl ProgramCache {
             output_elem_counts,
             num_inputs: program.inputs.len(),
             input_readiness: program.inputs.iter().map(|i| i.ready).collect(),
+            input_decls: program.inputs.clone(),
         });
         self.inner.put(hash, entry.clone());
         Ok(entry)

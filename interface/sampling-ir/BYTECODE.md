@@ -163,7 +163,18 @@ threshold. (#25: `k` is host-submit like top-p `p`, so top-k bytecode is k-invar
   lift a `[m]` to `[m,n]` with `Broadcast` first.
 - **Binding & late-bind (attach-time):** binding (logits / tensor key / submit-
   late readiness) is supplied at the forward-pass attach, per input slot — not in
-  the bytecode. For a slot bound to a *late* tensor, `input_first_use(program,
+  the bytecode. **A host binding MUST cover the input decl's full extent**: the
+  bound tensor's byte length equals `numel(decl.shape) × dtype_size(decl.dtype)`
+  (a `[k, n]` matrix decl means k FULL rows). The runtime/executor rejects a
+  short binding loudly at bind/fire time — it never launches; a silently short
+  matrix input (e.g. a 2-row grammar mask against a `[4, vocab]` decl) is
+  undefined on-device behavior (the §6.1 psir_k0 OOB incident, 2026-07-05).
+  **Bool host inputs are 1-byte** (u8; 0 = false, nonzero = true) on the wire
+  AND on device — `dtype_size(Bool) = 1` on both sides of the guard; kernels
+  read the byte and widen in-register (the bf16-logits precedent). F32 storage
+  for Bool is only ever a JIT-internal choice for its OWN intermediates, never
+  assumed for host-bound inputs. (Direction per D1 stays packed bits; the
+  1-byte native read is the compatible step.) For a slot bound to a *late* tensor, `input_first_use(program,
   index)` gives the first consuming op = the runtime's inject-before barrier
   (miss = skip).
 - **Output-kind ⟂ dtype:** `Token` ⇒ integer value; every other kind ⇒ F32; a

@@ -262,6 +262,17 @@ impl Graph {
     pub fn intrinsic_mtp_logits_dyn(&self) -> DynValue {
         self.input(ir::ValueType::vector(self.vocab(), ir::DType::F32), ir::Binding::MtpLogits)
     }
+    /// The speculator's draft logits as a **`[K, vocab]` matrix** (Stage 2
+    /// PTIR-native MTP, overview §6.1): the MTP head's K next-step draft
+    /// proposals, one row per draft position — `argmax` per row yields the
+    /// K fresh drafts. K is trace-known (a different K = a different traced
+    /// program). Binds [`ir::Binding::MtpLogits`]; the driver maps the K rows
+    /// onto the pass's draft rows of `ws.logits` at fire time. Shape contract:
+    /// `pie_sampling_ir::validate::intrinsic_decl_ok`.
+    pub fn intrinsic_mtp_logits_matrix_dyn(&self, k: u32) -> DynValue {
+        let ty = ir::ValueType::new(ir::Shape::matrix(k, self.vocab()), ir::DType::F32);
+        self.input(ty, ir::Binding::MtpLogits)
+    }
 
     pub fn constant_f32_dyn(&self, x: f32) -> DynValue {
         self.konst(ir::Literal::F32(x))

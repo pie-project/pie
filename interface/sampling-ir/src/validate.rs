@@ -181,6 +181,42 @@ pub fn program_from_parts_typed(
 }
 
 // ===========================================================================
+// Attach-time intrinsic decl contract
+// ===========================================================================
+
+/// The intrinsic-binding shape contract (attach-time; the binding itself is
+/// not in the bytecode). One definition, shared by the runtime attach and
+/// every backend's bind so they cannot drift:
+///
+/// - [`Binding::Logits`]: F32, `[vocab]` or `[rows, vocab]` (the spec-verify
+///   readout rows).
+/// - [`Binding::MtpLogits`]: F32, `[vocab]` (legacy K=1) or **`[K, vocab]`**
+///   (Stage 2 — the MTP head's K draft proposals; K = the decl's row count,
+///   trace-known).
+/// - [`Binding::Tensor`]: any decl (host data; the full-extent byte rule in
+///   BYTECODE.md §5 governs the payload).
+///
+/// `vocab`: pass the model's vocab to pin the last axis; `None` skips that
+/// check (shape-only validation where the model is not yet known).
+pub fn intrinsic_decl_ok(binding: &Binding, decl: &InputDecl, vocab: Option<u32>) -> bool {
+    match binding {
+        Binding::Tensor { .. } => true,
+        Binding::Logits | Binding::MtpLogits => {
+            if decl.dtype != DType::F32 {
+                return false;
+            }
+            let dims = decl.shape.dims();
+            let last_ok = |n: u32| vocab.is_none_or(|v| n == v);
+            match *dims {
+                [n] => last_ok(n),
+                [k, n] => k >= 1 && last_ok(n),
+                _ => false,
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Late-bind use-site analysis
 // ===========================================================================
 
@@ -531,6 +567,27 @@ mod tests {
     }
     fn islot(dims: &[u32], dtype: DType) -> InputDecl {
         InputDecl::new(Shape::new(dims).unwrap(), dtype)
+    }
+
+    #[test]
+    fn intrinsic_decl_contract_stage2() {
+        use crate::types::{Binding, Readiness};
+        let d = |dims: &[u32], dt: DType| InputDecl::new(Shape::new(dims).unwrap(), dt);
+        let v = 128u32;
+        // MtpLogits: [vocab] (legacy K=1) and [K, vocab] (Stage 2) accepted.
+        assert!(intrinsic_decl_ok(&Binding::MtpLogits, &d(&[v], DType::F32), Some(v)));
+        assert!(intrinsic_decl_ok(&Binding::MtpLogits, &d(&[3, v], DType::F32), Some(v)));
+        assert!(intrinsic_decl_ok(&Binding::Logits, &d(&[4, v], DType::F32), Some(v)));
+        // Wrong last axis / dtype / rank rejected.
+        assert!(!intrinsic_decl_ok(&Binding::MtpLogits, &d(&[3, v + 1], DType::F32), Some(v)));
+        assert!(!intrinsic_decl_ok(&Binding::MtpLogits, &d(&[3, v], DType::I32), Some(v)));
+        assert!(!intrinsic_decl_ok(&Binding::MtpLogits, &d(&[1, 3, v], DType::F32), Some(v)));
+        assert!(!intrinsic_decl_ok(&Binding::MtpLogits, &d(&[], DType::F32), Some(v)));
+        // vocab=None skips the last-axis pin (model-agnostic check).
+        assert!(intrinsic_decl_ok(&Binding::MtpLogits, &d(&[3, 999], DType::F32), None));
+        // Host tensors are unconstrained here (BYTECODE.md §5 governs payload).
+        let t = Binding::Tensor { key: 7, ready: Readiness::Submit };
+        assert!(intrinsic_decl_ok(&t, &d(&[2, 2], DType::Bool), Some(v)));
     }
 
     #[test]

@@ -101,13 +101,34 @@ fn step_line(n: usize, inst: &mut Instance, b: &BoundTrace, inputs: &PassInputs)
     // The `inputs` line makes each golden self-contained: a backend runner
     // replays the pass from the file alone (no transcription from this code).
     let fed = format!("inputs {n}: {inputs:?}");
-    match inst.step(b, inputs, &mut NoKernels) {
-        Ok(r) => format!(
-            "{fed}\nstep {n}: committed={} missed={:?} sinks={}",
-            r.committed,
-            r.missed.map(|(c, p)| (c, p.tag())),
-            r.sinks.len()
-        ),
+    step_line_k(n, inst, b, inputs, &mut NoKernels, fed)
+}
+
+/// step_line with an explicit kernel host (Quest's `envelope_dot` etc.).
+fn step_line_k(
+    n: usize,
+    inst: &mut Instance,
+    b: &BoundTrace,
+    inputs: &PassInputs,
+    host: &mut dyn pie_sampling_ir::ptir::interp::KernelHost,
+    fed: String,
+) -> String {
+    match inst.step(b, inputs, host) {
+        Ok(r) => {
+            let mut out = format!(
+                "{fed}\nstep {n}: committed={} missed={:?} sinks={}",
+                r.committed,
+                r.missed.map(|(c, p)| (c, p.tag())),
+                r.sinks.len()
+            );
+            for sk in &r.sinks {
+                out.push_str(&format!(
+                    "\nsink {}: stage={:?} layer={} args={:?}",
+                    sk.name, sk.stage, sk.layer, sk.args
+                ));
+            }
+            out
+        }
         Err(e) => format!("{fed}\nstep {n}: error {e:?}"),
     }
 }
@@ -560,4 +581,572 @@ fn golden_matrix_select_mask() {
     rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 1)); // expect I32([2,3,4,5])
     check("matrix_select_mask", rep);
+}
+
+#[test]
+fn golden_mtp_verify_tail() {
+    // The full MTP match-verify DAG at K=3, V=8 (overview §6.1 steps 1-6),
+    // hand-checkable — the cross-backend anchor for the accept-prefix logic
+    // (eq → cumprod → select with the -1 sentinel) on top of the
+    // matrix_select_mask shape. Non-degenerate: WITHOUT the mask row 2 would
+    // match the draft (raw argmax = 6 = d3) — the mask forbids 6 and forces
+    // picked[2]=2, so the run stops at n_acc=2. Hand check:
+    //   prev_drafts=[3,5,6]; picked=[3,5,2,4] -> hit=[T,T,F] -> n_acc=2
+    //   commit lanes 0..=2, lane 3 = -1  =>  out = I32([3, 5, 2, -1])
+    //   drafts = argmax(mtp_logits) = [1, 4, 0] (also the new prev_drafts)
+    let (k, v) = (3u32, 8u32); // K drafts; K+1 = 4 verify rows
+    let kp1 = k + 1;
+    let mut b = B::new();
+    let lg = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::Logits,
+        shape: Shape::matrix(kp1, v),
+        dtype: DType::F32,
+    });
+    let mtp = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::MtpLogits,
+        shape: Shape::matrix(k, v),
+        dtype: DType::F32,
+    });
+    let m = b.p(Op::ChanTake(1)); // allow [K+1, v] bool (host-fed)
+    let ninf = b.p(Op::Const(Literal::F32(f32::NEG_INFINITY)));
+    let nb = b.p(Op::Broadcast { value: ninf, shape: Shape::matrix(kp1, v) });
+    let masked = b.p(Op::Select { cond: m, a: lg, b: nb });
+    let picked = b.p(Op::ReduceArgmax(masked)); // [K+1] i32
+    let d = b.p(Op::ChanTake(0)); // prev_drafts [K] i32
+    let vl = b.p(Op::Iota { len: k }); // VERIFY_LANES = [0,1,2]
+    let head = b.p(Op::Gather { src: picked, idx: vl }); // picked[0..K]
+    let hit = b.p(Op::Eq(head, d)); // [K] bool
+    let one = b.p(Op::Const(Literal::F32(1.0)));
+    let zero = b.p(Op::Const(Literal::F32(0.0)));
+    let ones = b.p(Op::Broadcast { value: one, shape: Shape::vector(k) });
+    let zeros = b.p(Op::Broadcast { value: zero, shape: Shape::vector(k) });
+    let runf = b.p(Op::Select { cond: hit, a: ones, b: zeros }); // [K] {1,0}
+    let run = b.p(Op::CumProd(runf));
+    let naccf = b.p(Op::ReduceSum(run)); // scalar f32 = leading-hit count
+    let nacc = b.p(Op::Cast { value: naccf, dtype: DType::U32 });
+    let naccb = b.p(Op::Broadcast { value: nacc, shape: Shape::vector(kp1) });
+    let lanes = b.p(Op::Iota { len: kp1 });
+    let keep = b.p(Op::Ge(naccb, lanes)); // keep[i] = i <= n_acc
+    let neg1 = b.p(Op::Const(Literal::I32(-1)));
+    let commit = b.p(Op::Select { cond: keep, a: picked, b: neg1 }); // [K+1]
+    b.p(Op::ChanPut { chan: 2, value: commit });
+    let drf = b.p(Op::ReduceArgmax(mtp)); // [K] fresh drafts (greedy proposals)
+    b.p(Op::ChanPut { chan: 0, value: drf }); // prev_drafts ping-pong
+    b.p(Op::ChanPut { chan: 3, value: drf }); // publish for the host grammar walk
+    let c = TraceContainer {
+        names: vec![],
+        channels: vec![
+            ChannelDecl {
+                shape: Shape::vector(k),
+                dtype: ChanDType::Concrete(DType::I32),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
+            }, // 0 prev_drafts
+            ChannelDecl {
+                shape: Shape::matrix(kp1, v),
+                dtype: ChanDType::Concrete(DType::Bool),
+                capacity: 1,
+                host_role: HostRole::Writer,
+                seeded: false,
+            }, // 1 allow
+            ChannelDecl {
+                shape: Shape::vector(kp1),
+                dtype: ChanDType::Concrete(DType::I32),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            }, // 2 out (committed window, -1 sentinel)
+            ChannelDecl {
+                shape: Shape::vector(k),
+                dtype: ChanDType::Concrete(DType::I32),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            }, // 3 draft_out
+        ],
+        ports: vec![],
+        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+    };
+    let mut profile = ModelProfile::dummy();
+    profile.vocab = v; // has_mtp_logits = true in dummy()
+    let bound = bind(c.clone(), profile).unwrap();
+    let mut rep = Report::new("mtp_verify_tail", &c).verdict(&Ok(bound.clone()));
+    let seeds = [(0u32, i32s(&[3, 5, 6]))];
+    rep = seed_lines(rep, &seeds);
+    let mut inst = Instance::new(&bound, &seeds).unwrap();
+    // logits rows (raw argmax): r0->3 (=d1 hit), r1->5 (=d2 hit),
+    // r2->6 (WOULD match d3 — but the mask forbids 6, allows {2} -> picked 2,
+    // miss), r3->4 (bonus row; unused since n_acc=2 -> bonus is picked[2]).
+    let mut logits = vec![0.0f32; (kp1 * v) as usize];
+    logits[0 * 8 + 3] = 9.0;
+    logits[8 + 5] = 9.0;
+    logits[2 * 8 + 6] = 9.0; // masked out
+    logits[2 * 8 + 2] = 1.0; // the allowed survivor
+    logits[3 * 8 + 4] = 9.0;
+    // mask: rows 0,1,3 allow-all; row 2 allows only col 2.
+    let mut allow = vec![true; (kp1 * v) as usize];
+    for col in 0..v as usize {
+        allow[2 * 8 + col] = col == 2;
+    }
+    // mtp rows argmax -> [1, 4, 0]
+    let mut mtpv = vec![0.0f32; (k * v) as usize];
+    mtpv[1] = 7.0;
+    mtpv[8 + 4] = 7.0;
+    mtpv[2 * 8] = 7.0;
+    let inputs = PassInputs {
+        logits: Some(f32s(&logits)),
+        mtp_logits: Some(f32s(&mtpv)),
+        ..Default::default()
+    };
+    rep = rep.line(&put_line(&mut inst, &bound, 1, Value::Bool(allow)));
+    rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
+    rep = rep.line(&take_line(&mut inst, &bound, 2)); // I32([3, 5, 2, -1])
+    rep = rep.line(&take_line(&mut inst, &bound, 3)); // I32([1, 4, 0])
+    check("mtp_verify_tail", rep);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Capstone: Pentathlon+1 — one MCTS iteration composing all SIX techniques
+// (quest + mcts + beam + constrained + speculative + contrastive) through the
+// tier-0 oracle. docs/ptir/pentathlon-design.md §2; zero new ops.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PV: u32 = 8; // vocab
+const PB: u32 = 2; // beam width per expansion
+const PK: u32 = 3; // MTP draft width (K+1 = 4 verify rows)
+const PPAGES: u32 = 4; // P_MAX (quest page-mask width)
+
+/// Deterministic Quest kernel host: `envelope_dot(query)` -> [P_MAX] scores,
+/// varying per call so layer-0/layer-1 selections differ visibly.
+struct QuestKernels {
+    calls: u32,
+}
+impl pie_sampling_ir::ptir::interp::KernelHost for QuestKernels {
+    fn kernel(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        result: pie_sampling_ir::types::ValueType,
+    ) -> Result<Value, String> {
+        if name != "envelope_dot" {
+            return Err(format!("no such kernel: {name}"));
+        }
+        // score[p] = |q[0]| + p + calls  — deterministic, call-varying.
+        let q0 = match &args[0] {
+            Value::F32(q) => q[0].abs(),
+            _ => 0.0,
+        };
+        let n = result.shape.numel() as usize;
+        let c = self.calls as f32;
+        self.calls += 1;
+        Ok(Value::F32((0..n).map(|p| q0 + p as f32 + c).collect()))
+    }
+}
+
+fn pentathlon_profile() -> ModelProfile {
+    let mut p = ModelProfile::dummy(); // num_layers = 2, mtp+value gated ON
+    p.vocab = PV;
+    p.kernels.push(pie_sampling_ir::ptir::registry::KernelInfo {
+        name: "envelope_dot".into(),
+        sink_scope: None,
+        replayable: true,
+    });
+    p
+}
+
+/// The Quest tap (design §2.1): per layer, envelope scores -> top-`budget`
+/// page mask -> the attn_page_mask sink. `budget_ch` is a [1] u32 channel.
+fn quest_tap(budget_ch: u32) -> StageProgram {
+    let mut b = B::new();
+    let q = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::Query,
+        shape: Shape::vector(PPAGES),
+        dtype: DType::F32,
+    });
+    let scores = b.p(Op::KernelCall {
+        name: 0, // "envelope_dot"
+        args: vec![q],
+        shape: Shape::vector(PPAGES),
+        dtype: DType::F32,
+    });
+    let bud = b.p(Op::ChanRead(budget_ch)); // [1] u32 (peek — a knob)
+    let buds = b.p(Op::Reshape { value: bud, shape: Shape::SCALAR });
+    let pm = b.p(Op::PivotThreshold {
+        input: scores,
+        predicate: pie_sampling_ir::types::Predicate::RankLe(buds),
+    });
+    b.p(Op::SinkCall { name: 1, args: vec![pm] }); // "attn_page_mask"
+    StageProgram { stage: Stage::OnAttnProj, ops: b.ops }
+}
+
+/// Contrastive pick (design §2.3, ORDER PINNED BY THIS GOLDEN): grammar folds
+/// into the expert distribution BEFORE the plausibility max — i.e. the
+/// α-filter runs within the CONSTRAINED support. Computing plausibility
+/// against the unmasked max annihilates every legal token whenever the
+/// grammar masks the expert's peak (the composition-order bug this golden
+/// caught in the first cut). Returns the scored [rows, V] value id.
+fn contrastive_score(b: &mut B, lse_in: u32, am_take: u32, gmask: u32, rows: u32) -> u32 {
+    let sh = Shape::matrix(rows, PV);
+    let lse = expand::log_softmax(&mut b.ops, lse_in, sh);
+    let lsa = expand::log_softmax(&mut b.ops, am_take, sh);
+    let lam = b.p(Op::Const(Literal::F32(0.5))); // λ
+    let pen = b.p(Op::Mul(lsa, lam));
+    let cd = b.p(Op::Sub(lse, pen));
+    let ninf = b.p(Op::Const(Literal::F32(f32::NEG_INFINITY)));
+    let lse_g = b.p(Op::Select { cond: gmask, a: lse, b: ninf }); // grammar FIRST
+    let mx = b.p(Op::ReduceMax(lse_g)); // [rows] max over the LEGAL set
+    let mx1 = b.p(Op::Reshape { value: mx, shape: Shape::matrix(rows, 1) });
+    let mxb = b.p(Op::Broadcast { value: mx1, shape: sh });
+    let la = b.p(Op::Const(Literal::F32(-1.0))); // log α
+    let thr = b.p(Op::Add(mxb, la));
+    let plaus = b.p(Op::Ge(lse_g, thr)); // -inf rows auto-excluded (grammar ∧ α)
+    b.p(Op::Select { cond: plaus, a: cd, b: ninf })
+}
+use pie_sampling_ir::ptir::expand;
+
+/// design §2.1 + §2.3: quest tap + contrastive beam expansion + leaf value.
+/// Channels: 0 am [1,V] f32 W · 1 gmask [1,V] bool W · 2 budget [1] u32 seed
+/// · 3 prio [B] f32 R · 4 pids [B] u32 R · 5 val [1] f32 R.
+fn expand_trace() -> TraceContainer {
+    let mut b = B::new();
+    let lg = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::Logits,
+        shape: Shape::matrix(1, PV),
+        dtype: DType::F32,
+    });
+    let am = b.p(Op::ChanTake(0));
+    let gm = b.p(Op::ChanTake(1));
+    let scored = contrastive_score(&mut b, lg, am, gm, 1);
+    let pr = b.p(Op::TopK { input: scored, k: PB }); // pr, pr+1=ids  [1,B]
+    let prv = b.p(Op::Reshape { value: pr, shape: Shape::vector(PB) });
+    let idv = b.p(Op::Reshape { value: pr + 1, shape: Shape::vector(PB) });
+    b.p(Op::ChanPut { chan: 3, value: prv });
+    b.p(Op::ChanPut { chan: 4, value: idv });
+    let vh = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::ValueHead,
+        shape: Shape::vector(1),
+        dtype: DType::F32,
+    });
+    b.p(Op::ChanPut { chan: 5, value: vh });
+    let ch = |shape, dtype, host_role, seeded| ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 1,
+        host_role,
+        seeded,
+    };
+    TraceContainer {
+        names: vec!["envelope_dot".into(), "attn_page_mask".into()],
+        channels: vec![
+            ch(Shape::matrix(1, PV), DType::F32, HostRole::Writer, false), // 0 am
+            ch(Shape::matrix(1, PV), DType::Bool, HostRole::Writer, false), // 1 gmask
+            ch(Shape::vector(1), DType::U32, HostRole::None, true),        // 2 budget
+            ch(Shape::vector(PB), DType::F32, HostRole::Reader, false),    // 3 prio
+            ch(Shape::vector(PB), DType::U32, HostRole::Reader, false),    // 4 pids
+            ch(Shape::vector(1), DType::F32, HostRole::Reader, false),     // 5 val
+        ],
+        ports: vec![],
+        stages: vec![quest_tap(2), StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+    }
+}
+
+/// design §2.2 + §2.3: quest tap + contrastive pick over the [K+1] window +
+/// the mtp_verify accept tail + value tap.
+/// Channels: 0 prev_drafts [K] i32 seed · 1 gmask [K+1,V] bool W ·
+/// 2 am [K+1,V] f32 W · 3 out [K+1] i32 R · 4 draft_out [K] i32 R ·
+/// 5 val [K+1] f32 R · 6 budget [1] u32 seed.
+fn rollout_trace() -> TraceContainer {
+    let kp1 = PK + 1;
+    let mut b = B::new();
+    let lg = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::Logits,
+        shape: Shape::matrix(kp1, PV),
+        dtype: DType::F32,
+    });
+    let mtp = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::MtpLogits,
+        shape: Shape::matrix(PK, PV),
+        dtype: DType::F32,
+    });
+    let am = b.p(Op::ChanTake(2));
+    let gm = b.p(Op::ChanTake(1));
+    let scored = contrastive_score(&mut b, lg, am, gm, kp1);
+    let picked = b.p(Op::ReduceArgmax(scored)); // [K+1] i32 — contrastive pick
+    // verify tail (== golden_mtp_verify_tail)
+    let d = b.p(Op::ChanTake(0));
+    let vl = b.p(Op::Iota { len: PK });
+    let head = b.p(Op::Gather { src: picked, idx: vl });
+    let hit = b.p(Op::Eq(head, d));
+    let one = b.p(Op::Const(Literal::F32(1.0)));
+    let zero = b.p(Op::Const(Literal::F32(0.0)));
+    let ones = b.p(Op::Broadcast { value: one, shape: Shape::vector(PK) });
+    let zeros = b.p(Op::Broadcast { value: zero, shape: Shape::vector(PK) });
+    let runf = b.p(Op::Select { cond: hit, a: ones, b: zeros });
+    let run = b.p(Op::CumProd(runf));
+    let naccf = b.p(Op::ReduceSum(run));
+    let nacc = b.p(Op::Cast { value: naccf, dtype: DType::U32 });
+    let naccb = b.p(Op::Broadcast { value: nacc, shape: Shape::vector(kp1) });
+    let lanes = b.p(Op::Iota { len: kp1 });
+    let keep = b.p(Op::Ge(naccb, lanes));
+    let neg1 = b.p(Op::Const(Literal::I32(-1)));
+    let commit = b.p(Op::Select { cond: keep, a: picked, b: neg1 });
+    b.p(Op::ChanPut { chan: 3, value: commit });
+    let drf = b.p(Op::ReduceArgmax(mtp));
+    b.p(Op::ChanPut { chan: 0, value: drf });
+    b.p(Op::ChanPut { chan: 4, value: drf });
+    let vh = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::ValueHead,
+        shape: Shape::vector(kp1),
+        dtype: DType::F32,
+    });
+    b.p(Op::ChanPut { chan: 5, value: vh });
+    let ch = |shape, dtype, host_role, seeded| ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 1,
+        host_role,
+        seeded,
+    };
+    TraceContainer {
+        names: vec!["envelope_dot".into(), "attn_page_mask".into()],
+        channels: vec![
+            ch(Shape::vector(PK), DType::I32, HostRole::None, true), // 0 prev_drafts
+            ch(Shape::matrix(kp1, PV), DType::Bool, HostRole::Writer, false), // 1 gmask
+            ch(Shape::matrix(kp1, PV), DType::F32, HostRole::Writer, false), // 2 am
+            ch(Shape::vector(kp1), DType::I32, HostRole::Reader, false), // 3 out
+            ch(Shape::vector(PK), DType::I32, HostRole::Reader, false), // 4 draft_out
+            ch(Shape::vector(kp1), DType::F32, HostRole::Reader, false), // 5 val
+            ch(Shape::vector(1), DType::U32, HostRole::None, true),   // 6 budget
+        ],
+        ports: vec![],
+        stages: vec![quest_tap(6), StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+    }
+}
+
+#[test]
+fn golden_pentathlon_iter() {
+    // ONE MCTS iteration at R=2 (host process; the tree/PUCT is ordinary host
+    // code — here, the scripted select/expand/backprop below): two EXPAND
+    // passes (leaves A, B) then one ROLLOUT step per chosen child. All six
+    // techniques fire: quest (per-layer envelope_dot -> page-mask sink),
+    // beam (top_k B=2), grammar (per-position masks), speculative (MTP
+    // verify tail), contrastive (expert − λ·amateur + plausibility), MCTS
+    // (this script + value_head taps).
+    let profile = pentathlon_profile();
+    let exp_c = expand_trace();
+    let rol_c = rollout_trace();
+    let exp_b = bind(exp_c.clone(), profile.clone()).expect("expand binds");
+    let rol_b = bind(rol_c.clone(), profile).expect("rollout binds");
+
+    let mut rep = Report::new("pentathlon_expand", &exp_c).verdict(&Ok(exp_b.clone()));
+    rep.0.push_str(&Report::new("pentathlon_rollout", &rol_c).verdict(&Ok(rol_b.clone())).0);
+    let mut kh = QuestKernels { calls: 0 };
+
+    // ── phase 1: EXPAND leaves A and B ──────────────────────────────────
+    // Leaf A: expert peaks on {2, 5}; amateur ALSO loves 2 (contrastive
+    // demotes it) -> beam picks 5 first, 2 second. Leaf B: grammar only
+    // allows {1, 3}; expert peaks 6 (masked) -> beam = {3, 1}.
+    for (label, elogits, amlogits, allow, q, vh) in [
+        (
+            "A",
+            vec![0., 0., 6.0, 0., 0., 5.9, 0., 0.],
+            vec![0., 0., 9.0, 0., 0., 0., 0., 0.],
+            vec![true; PV as usize],
+            2.0f32,
+            0.25f32,
+        ),
+        (
+            "B",
+            vec![0., 5.0, 0., 5.5, 0., 0., 9.0, 0.],
+            vec![0.0; PV as usize],
+            {
+                let mut a = vec![false; PV as usize];
+                a[1] = true;
+                a[3] = true;
+                a
+            },
+            -1.0f32,
+            0.75f32,
+        ),
+    ] {
+        rep = rep.line(&format!("== expand leaf {label}"));
+        let seeds = [(2u32, u32s(&[2]))]; // quest budget = top-2 pages
+        rep = seed_lines(rep, &seeds);
+        let mut inst = Instance::new(&exp_b, &seeds).unwrap();
+        rep = rep.line(&put_line(&mut inst, &exp_b, 0, f32s(&amlogits)));
+        rep = rep.line(&put_line(&mut inst, &exp_b, 1, Value::Bool(allow)));
+        let inputs = PassInputs {
+            logits: Some(f32s(&elogits)),
+            value_head: Some(f32s(&[vh])),
+            query: vec![f32s(&[q, 0., 0., 0.]), f32s(&[q + 1.0, 0., 0., 0.])],
+            ..Default::default()
+        };
+        let fed = format!("inputs {label}: {inputs:?}");
+        rep = rep.line(&step_line_k(0, &mut inst, &exp_b, &inputs, &mut kh, fed));
+        rep = rep.line(&take_line(&mut inst, &exp_b, 3)); // prio
+        rep = rep.line(&take_line(&mut inst, &exp_b, 4)); // pids: A=[5,2] B=[3,1]
+        rep = rep.line(&take_line(&mut inst, &exp_b, 5)); // leaf value
+    }
+
+    // ── phase 2: ROLLOUT one MTP step per chosen child ──────────────────
+    // Child A5: drafts [5,2,7]; contrastive+grammar picks rows -> [5,2,4,..]
+    // row2's raw pick (7) is masked -> forced 4 -> miss at i=2 -> n_acc=2,
+    // out=[5,2,4,-1]. Child B3: drafts [1,1,1]; row0 picks 1 (hit), row1
+    // amateur demotes 1 -> picks 3 -> miss -> n_acc=1, out=[1,3,-1,-1].
+    for (label, drafts, elogits_rows, am_rows, allow_rows, mtp_rows, vh) in [
+        (
+            "A5",
+            [5i32, 2, 7],
+            [[(5usize, 9.0f32), (0, 0.0)], [(2, 9.0), (0, 0.0)], [(7, 9.0), (0, 0.0)], [(0, 9.0), (0, 0.0)]],
+            [(0usize, 0.0f32); 4],
+            // row2 forbids 7, allows 4; other rows allow-all
+            Some((2usize, 4usize)),
+            [(6usize, 8.0f32), (0, 8.0), (2, 8.0)],
+            [0.9f32, 0.8, 0.7, 0.6],
+        ),
+        (
+            "B3",
+            [1i32, 1, 1],
+            // row1: TWO plausible expert tokens (1 at 9.0, 3 at 8.5, inside
+            // the α-window); the amateur loves 1 -> cd reranks 3 above 1.
+            [[(1usize, 9.0f32), (0, 0.0)], [(1, 9.0), (3, 8.5)], [(1, 9.0), (0, 0.0)], [(1, 9.0), (0, 0.0)]],
+            [(0, 0.0), (1, 18.0), (0, 0.0), (0, 0.0)],
+            None,
+            [(5usize, 8.0f32), (5, 8.0), (5, 8.0)],
+            [0.1, 0.2, 0.3, 0.4],
+        ),
+    ] {
+        let kp1 = (PK + 1) as usize;
+        rep = rep.line(&format!("== rollout child {label}"));
+        let seeds = [(0u32, i32s(&drafts)), (6u32, u32s(&[2]))];
+        rep = seed_lines(rep, &seeds);
+        let mut inst = Instance::new(&rol_b, &seeds).unwrap();
+        let mut allow = vec![true; kp1 * PV as usize];
+        if let Some((row, only)) = allow_rows {
+            for c in 0..PV as usize {
+                allow[row * PV as usize + c] = c == only;
+            }
+        }
+        let mut am = vec![0.0f32; kp1 * PV as usize];
+        for (r, (c, x)) in am_rows.iter().enumerate() {
+            am[r * PV as usize + c] = *x;
+        }
+        // row3 of elogits_rows fills the bonus row too (index 3).
+        let mut el = vec![0.0f32; kp1 * PV as usize];
+        for (r, row) in elogits_rows.iter().enumerate() {
+            for (c, x) in row {
+                el[r * PV as usize + c] = *x;
+            }
+        }
+        let mut mtpl = vec![0.0f32; PK as usize * PV as usize];
+        for (r, (c, x)) in mtp_rows.iter().enumerate() {
+            mtpl[r * PV as usize + c] = *x;
+        }
+        rep = rep.line(&put_line(&mut inst, &rol_b, 1, Value::Bool(allow)));
+        rep = rep.line(&put_line(&mut inst, &rol_b, 2, f32s(&am)));
+        let inputs = PassInputs {
+            logits: Some(f32s(&el)),
+            mtp_logits: Some(f32s(&mtpl)),
+            value_head: Some(f32s(&vh)),
+            query: vec![f32s(&[1., 0., 0., 0.]), f32s(&[2., 0., 0., 0.])],
+            ..Default::default()
+        };
+        let fed = format!("inputs {label}: {inputs:?}");
+        rep = rep.line(&step_line_k(0, &mut inst, &rol_b, &inputs, &mut kh, fed));
+        rep = rep.line(&take_line(&mut inst, &rol_b, 3)); // out (committed + -1)
+        rep = rep.line(&take_line(&mut inst, &rol_b, 4)); // next drafts
+        rep = rep.line(&take_line(&mut inst, &rol_b, 5)); // values -> backprop
+    }
+    check("pentathlon_iter", rep);
+}
+
+#[test]
+fn golden_dfa_ingraph() {
+    // The G1 demonstrator (design §5): for a REGULAR grammar the mask walk
+    // moves IN-GRAPH with existing ops — allow/next tables live in seeded
+    // device-private channels (read-only), the DFA state is a [1] u32
+    // ping-pong channel, and the per-step mask row is `gather(allow, state)`.
+    // ZERO host-fed channels: the grammar edge (the §3 "one host-coupled
+    // edge") is deleted; the host only harvests `out`.
+    //
+    // DFA (S=3, V=8): state0 allows {1,2}; state1 allows {3}; state2 allows
+    // {0}. next: 0-[1|2]->1, 1-[3]->2, 2-[0]->2. Logits favor a FORBIDDEN
+    // token every step, so the walk visibly forces: expect out = 2, 3, 0 and
+    // the state path 0->1->2->2.
+    let (sn, v) = (3u32, 8u32);
+    let mut b = B::new();
+    let lg = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::Logits,
+        shape: Shape::matrix(1, v),
+        dtype: DType::F32,
+    });
+    let allow = b.p(Op::ChanRead(0)); // [S, V] bool (read-only table)
+    let next = b.p(Op::ChanRead(1)); // [S*V] u32 (flat next-state table)
+    let st = b.p(Op::ChanTake(2)); // [1] u32
+    let row = b.p(Op::Gather { src: allow, idx: st }); // [1, V] bool — THE MASK
+    let ninf = b.p(Op::Const(Literal::F32(f32::NEG_INFINITY)));
+    let masked = b.p(Op::Select { cond: row, a: lg, b: ninf });
+    let picked = b.p(Op::ReduceArgmax(masked)); // [1] i32
+    b.p(Op::ChanPut { chan: 3, value: picked });
+    // state' = next[state*V + picked]  — the in-graph walk
+    let vc = b.p(Op::Const(Literal::U32(v)));
+    let base = b.p(Op::Mul(st, vc));
+    let pu = b.p(Op::Cast { value: picked, dtype: DType::U32 });
+    let idx = b.p(Op::Add(base, pu));
+    let ns = b.p(Op::Gather { src: next, idx });
+    b.p(Op::ChanPut { chan: 2, value: ns });
+    let ch = |shape, dtype, host_role, seeded| ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 1,
+        host_role,
+        seeded,
+    };
+    let c = TraceContainer {
+        names: vec![],
+        channels: vec![
+            ch(Shape::matrix(sn, v), DType::Bool, HostRole::None, true), // 0 allow (needs drain-refill? read-only: read never consumes ✓)
+            ch(Shape::vector(sn * v), DType::U32, HostRole::None, true), // 1 next
+            ch(Shape::vector(1), DType::U32, HostRole::None, true),      // 2 state
+            ch(Shape::vector(1), DType::I32, HostRole::Reader, false),   // 3 out
+        ],
+        ports: vec![],
+        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+    };
+    let mut profile = ModelProfile::dummy();
+    profile.vocab = v;
+    let bound = bind(c.clone(), profile).unwrap();
+    let mut rep = Report::new("dfa_ingraph", &c).verdict(&Ok(bound.clone()));
+
+    // Tables as instance seeds (per-instance data; a trace-level large-const
+    // form is a container-v1.1 nicety — seeded read-only channels work today).
+    let mut allow_t = vec![false; (sn * v) as usize];
+    allow_t[1] = true; // s0: {1, 2}
+    allow_t[2] = true;
+    allow_t[(v + 3) as usize] = true; // s1: {3}
+    allow_t[(2 * v) as usize] = true; // s2: {0}
+    let mut next_t = vec![0u32; (sn * v) as usize];
+    next_t[1] = 1; // 0 -[1]-> 1
+    next_t[2] = 1; // 0 -[2]-> 1
+    next_t[(v + 3) as usize] = 2; // 1 -[3]-> 2
+    next_t[(2 * v) as usize] = 2; // 2 -[0]-> 2
+    let seeds = [
+        (0u32, Value::Bool(allow_t)),
+        (1u32, u32s(&next_t)),
+        (2u32, u32s(&[0])),
+    ];
+    rep = seed_lines(rep, &seeds);
+    let mut inst = Instance::new(&bound, &seeds).unwrap();
+    // Every step the raw logits favor a FORBIDDEN token; the in-graph mask
+    // must force the legal pick. (Step 0 also has legal 2 > legal 1.)
+    for (n, fav, second) in [(0usize, 5usize, 2usize), (1, 6, 3), (2, 7, 0)] {
+        let mut l = vec![0.0f32; v as usize];
+        l[fav] = 9.0;
+        l[second] = 1.0;
+        let inputs = PassInputs { logits: Some(f32s(&l)), ..Default::default() };
+        rep = rep.line(&step_line(n, &mut inst, &bound, &inputs));
+        rep = rep.line(&take_line(&mut inst, &bound, 3)); // 2, 3, 0
+    }
+    check("dfa_ingraph", rep);
 }
