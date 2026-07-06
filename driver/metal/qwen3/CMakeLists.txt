@@ -32,6 +32,21 @@ target_compile_definitions(qwen3_test PRIVATE
 target_link_libraries(qwen3_test PRIVATE
   ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
 
+# Real-weight forward driver (not auto-tested — needs Qwen3-0.6B model.safetensors):
+#   ./build/qwen3_forward <model.safetensors> kernels qwen3_golden.txt
+add_executable(qwen3_forward
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm
+  qwen3_forward.mm)
+set_source_files_properties(
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm qwen3_forward.mm
+  PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+target_include_directories(qwen3_forward PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../ptir)
+target_compile_definitions(qwen3_forward PRIVATE
+  QWEN3_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
+target_link_libraries(qwen3_forward PRIVATE
+  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+
 enable_testing()
 add_test(NAME qwen3_test COMMAND qwen3_test)
 set_tests_properties(qwen3_test PROPERTIES

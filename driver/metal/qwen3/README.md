@@ -39,10 +39,26 @@ CPU reference (`max_abs ≈ 4e-6`). The 28-layer stack test uses reduced dims to
 the stacking mechanism (loop + cross-layer residual + per-layer KV + final norm +
 head) cheaply; per-primitive and single-layer parity are at real Qwen3-0.6B dims.
 
+## Real-weight forward (`qwen3_forward`)
+
+`qwen3_forward` loads the **actual** `Qwen/Qwen3-0.6B` `model.safetensors` (BF16, HF
+`[out,in]` layout — exactly `matmul_xwt`'s W layout, no transpose; `bf16→f32` via
+`bits<<16`), runs a real token sequence through the full Metal forward (embedding →
+28× decoder_layer → final RMSNorm → LM head), self-validates the Metal logits vs the
+CPU f32 reference, prints the next-token argmax/top-k, and writes a compact golden
+(`qwen3_golden.txt`) for the CUDA cross-check.
+
+Observed on Apple M1 Max: full 28-layer forward on real weights (N=8 tokens) in ~7 s,
+**Metal-vs-CPU-ref `max_abs = 4.1e-5`** across all 1.2M logits — the real model runs
+on Metal, parity-clean through the full depth. `qwen3_golden.txt` records token ids +
+weight source/layout + argmax/top-20 + logit L2/sum/min/max so the CUDA reference
+(4090) can run the identical input+weights for the definitive cross-backend check.
+
 ## Build & run
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/qwen3_test        # -> QWEN3_TEST_OK
+./build/qwen3_forward /path/to/model.safetensors kernels qwen3_golden.txt
 ```

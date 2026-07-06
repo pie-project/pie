@@ -1,0 +1,14 @@
+# Qwen3-0.6B Metal forward golden — cross-check on CUDA (4090)
+model: Qwen/Qwen3-0.6B model.safetensors (BF16, HF [out,in] layout)
+backend: Metal (Apple Apple M1 Max), f32 compute, fast-math OFF
+dims: hidden=1024 head_dim=128 n_q=16 n_kv=8 I=3072 layers=28 rope_theta=1e+06 rms_eps=1e-06 vocab=151936
+tokens: 9707 3838 374 279 6722 315 9625 30
+positions: 0 1 2 3 4 5 6 7
+self_validation_max_abs_vs_cpuref: 4.1008e-05
+next_token_argmax: 9625
+last_token_top20_idx_logit: 9625:14.1152 576:14.016 362:13.7567 220:13.6884 1084:13.6251 3555:13.4945 481:13.4548 8325:13.4435 4710:13.1835 264:12.9343 2303:12.7492 320:12.2215 1597:12.154 18611:12.0921 2160:12.084 715:12.0667 81917:12.053 5209:12.0274 6771:11.9515 8670:11.6879
+last_token_logits_sum: -98363.8
+last_token_logits_l2: 1021.08
+last_token_logits_min: -12.6264
+last_token_logits_max: 14.1152
+note: full 151936-logit vector reproducible via qwen3_forward (deterministic)
