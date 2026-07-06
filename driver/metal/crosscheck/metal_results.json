@@ -1,0 +1,27 @@
+{
+  "_doc": "Metal-side reference for the Metal<->CUDA cross-check. Goldens are injected at runtime from the eval.rs oracle (Metal certified == oracle by tier0_test + pentathlon_test). decode + mtp are from the committed Metal benchmarks (driver/metal/tests). Absolute tok/s are hardware-specific (Apple M1 Max) — the cross-backend claim is the RELATIVE cost ordering + the MTP regime, not absolute numbers.",
+  "backend": "Metal (Apple M1 Max, MLX 0.31.2)",
+  "decode": {
+    "peak_tok_s": {"greedy": 590, "grammar": 587, "temperature": 567, "min_p": 562, "top_k": 525, "top_p": 505},
+    "overhead_vs_greedy": {"greedy": 1.00, "grammar": 1.00, "temperature": 0.96, "min_p": 0.95, "top_k": 0.89, "top_p": 0.86},
+    "cost_order_cheapest_to_costliest": ["greedy", "grammar", "temperature", "min_p", "top_k", "top_p"],
+    "costliest": "top_p",
+    "costliest_reason": "full 248K-vocab sort per row",
+    "per_token_identity": "covered by greedy_argmax + matrix_select_mask goldens (bit-exact)"
+  },
+  "mtp": {
+    "model": "Qwen3.5-0.8B",
+    "draft_depth_K": 1,
+    "acceptance": 0.50,
+    "speedup_single_stream": 0.70,
+    "speedup_saturation": 0.72,
+    "speedup_regime": "net-loss",
+    "speedup_verdict": "latency-opt for underutilized GPU; hurts throughput under saturation (2x-verify + head compete for saturated compute)",
+    "T_target_ms": 28.9,
+    "T_mtp_ms": 12.4,
+    "T_verify_ms": 49.3,
+    "T_lmhead_ms": 7.3,
+    "lmhead_pct_of_target": 25,
+    "note": "acceptance is hardware-independent (same model + greedy verify) -> should match CUDA within tol; absolute ms differ by HW but the net-loss regime should hold on both"
+  }
+}

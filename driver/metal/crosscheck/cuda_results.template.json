@@ -1,0 +1,35 @@
+{
+  "_doc": "CUDA-side results template for the Metal<->CUDA cross-check. charlie fills this from the CUDA pentathlon capstone + real-MTP Stage-1 + decode-path bench, then: `python3 crosscheck.py --cuda cuda_results.json`. Schema mirrors metal_results.json + the golden takes.",
+  "backend": "CUDA (RTX 4090)",
+
+  "goldens": {
+    "_doc": "Per golden, the ordered `take chan=N` values CUDA's tier-0 produces, encoded [chan, kind, [values]] with kind in {f32,int,bool}. Must be BIT-IDENTICAL to the eval.rs oracle (== certified Metal). Fill from charlie's CUDA tier0 runner output for each golden.",
+    "pentathlon_iter": [
+      [3, "f32", [3.7482576, -0.65174246]], [4, "int", [5, 2]], [5, "f32", [0.25]],
+      [3, "f32", [-2.5082405, -3.0082405]], [4, "int", [3, 1]], [5, "f32", [0.75]],
+      [3, "int", [5, 2, 4, -1]], [4, "int", [6, 0, 2]], [5, "f32", [0.9, 0.8, 0.7, 0.6]],
+      [3, "int", [1, 3, -1, -1]], [4, "int", [5, 5, 5]], [5, "f32", [0.1, 0.2, 0.3, 0.4]]
+    ],
+    "dfa_ingraph": [
+      [3, "int", [2]], [3, "int", [3]], [3, "int", [0]]
+    ],
+    "mtp_verify_tail": [
+      [2, "int", [3, 5, 2, -1]], [3, "int", [1, 4, 0]]
+    ],
+    "_note": "The values above are PRE-FILLED with the oracle so the harness structure is testable NOW; charlie REPLACES them with the actual CUDA tier-0 outputs (which should equal these). If CUDA differs, the diff flags it."
+  },
+
+  "decode": {
+    "_doc": "Relative cost ordering of the 6 decode paths under saturation (hardware-independent). Absolute tok/s differ (4090 vs M1) — compare the ORDERING + which path is costliest.",
+    "cost_order_cheapest_to_costliest": ["greedy", "grammar", "temperature", "min_p", "top_k", "top_p"],
+    "costliest": "top_p"
+  },
+
+  "mtp": {
+    "_doc": "CUDA Qwen3.5-0.8B K=1 MTP: acceptance (should match Metal within ~0.10, same model+greedy verify) + the speedup regime (net-loss expected on both; if CUDA's optimized append-attention verify changes the regime, that's a real finding to flag).",
+    "model": "Qwen3.5-0.8B",
+    "draft_depth_K": 1,
+    "acceptance": 0.50,
+    "speedup_regime": "net-loss"
+  }
+}
