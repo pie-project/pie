@@ -7,12 +7,16 @@
 //   pre_fc_norm(embed(t)) + pre_fc_norm(hidden) → concat[2H] → fc(2H→H)
 //   → 1 transformer layer (attn+output-gate + SwiGLU, gemma (1+w) norms)
 //   → mtp.norm → tied lm_head → draft token.
-// The MTP attention is single-token self-attention (no cache) ⇒ softmax over one
-// key = 1 ⇒ attn = V exactly (q_norm/k_norm/RoPE are no-ops), gated by
-// sigmoid(gate) from the 2×-wide q_proj.
+// The MTP layer's attention is a CAUSAL attention over the MTP's own K/V history
+// for every prior position (mirrors CUDA attention_mtp_paged_history) — NOT a
+// single self token: without the context attention the layer degrades to
+// ≈identity and the head just echoes the backbone's own next-token prediction.
+// q_proj is 2×-wide [query|gate]; attn output is gated by sigmoid(gate). Q/K get
+// gemma (1+w) per-head RMSNorm + partial NEOX RoPE.
 //
-// Usage: qwen35_mtp <hf_path> [prompt_len=8] [steps=24]
+// Usage: qwen35_mtp <hf_path> [steps=24] [prompt_ids_csv]
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +31,7 @@
 #include "model/model_graph.hpp"
 #include "ops/norm.hpp"
 #include "ops/activation.hpp"
+#include "ops/rope.hpp"
 
 namespace mx = mlx::core;
 using namespace pie_metal_driver;
@@ -56,6 +61,30 @@ model::ForwardBatch make_batch(const std::vector<int>& toks, const std::vector<i
     };
 }
 
+// Prefill batch that returns the hidden state at EVERY prompt position (so the
+// MTP head can build its full K/V history), not just the last row.
+model::ForwardBatch make_prefill_all(const std::vector<int>& toks, int page_size) {
+    const int n = (int)toks.size();
+    std::vector<int> pos(n), rows(n), write_idx(n);
+    for (int i = 0; i < n; ++i) { pos[i] = i; rows[i] = i; write_idx[i] = i; }
+    const int last_pos = n - 1;
+    const int n_pages = last_pos / page_size + 1;
+    std::vector<int> page_idx(n_pages);
+    for (int i = 0; i < n_pages; ++i) page_idx[i] = i;
+    const int last_page_len = last_pos % page_size + 1;
+    return model::ForwardBatch{
+        mx::array(toks.data(), {n}, mx::int32),
+        mx::array(pos.data(), {n}, mx::int32),
+        mx::array(rows.data(), {n}, mx::int32),
+        mx::array(page_idx.data(), {n_pages}, mx::int32),
+        mx::array({0, n_pages}, {2}, mx::int32),
+        mx::array({last_page_len}, {1}, mx::int32),
+        mx::array({0, n}, {2}, mx::int32),
+        mx::array(write_idx.data(), {n}, mx::int32),
+        n, 1, n, false,
+    };
+}
+
 mx::array f32(const mx::array& a) { return mx::astype(a, mx::float32); }
 // y = x @ W^T, W row-major [out, in].
 mx::array linW(const mx::array& x, const mx::array& W) {
@@ -64,33 +93,65 @@ mx::array linW(const mx::array& x, const mx::array& W) {
 
 struct Mtp {
     std::unordered_map<std::string, mx::array> t;
-    int H = 0, n_q = 0, n_kv = 0, d = 0;
-    float eps = 1e-6f;
+    int H = 0, n_q = 0, n_kv = 0, d = 0, rope_dims = 0;
+    float eps = 1e-6f, theta = 1e7f;
     const mx::array& g(const std::string& k) const { return t.at(k); }
 };
 
-// One MTP draft step: given the backbone hidden [1,H] + the just-sampled token,
-// draft the next-next token (argmax of mtp logits).
-int mtp_draft(const Mtp& m, const mx::array& hidden, int token, const mx::array& embed) {
+// Full MTP forward with CAUSAL attention over the accumulated K/V history
+// (mirrors CUDA attention_mtp_paged_history: the MTP layer attends over its own
+// projected K/V for every prior position). H_list[i]/T_list[i]/P_list[i] give the
+// backbone hidden [1,H], the token to embed, and the absolute position of MTP
+// entry i. Returns the draft token = argmax(mtp_logits) at the LAST (current)
+// position, i.e. the predicted next-next token.
+int mtp_draft(const Mtp& m,
+              const std::vector<mx::array>& H_list,
+              const std::vector<int>& T_list,
+              const std::vector<int>& P_list,
+              const mx::array& embed) {
     using namespace mx;
-    array emb = reshape(take(f32(embed), array({token}, {1}, int32), 0), {1, m.H});
+    const int n = (int)T_list.size();
+    const int H = m.H, nq = m.n_q, nkv = m.n_kv, d = m.d;
+    const float scale = 1.0f / std::sqrt((float)d);
+
+    array hid = concatenate(std::vector<array>(H_list.begin(), H_list.end()), 0);  // [n,H]
+    array emb = take(f32(embed), array(T_list.data(), {n}, int32), 0);             // [n,H]
     array nx = ops::rms_norm(emb, f32(m.g("mtp.pre_fc_norm_embedding.weight")), m.eps, true);
-    array ny = ops::rms_norm(f32(hidden), f32(m.g("mtp.pre_fc_norm_hidden.weight")), m.eps, true);
-    array cat = concatenate({nx, ny}, 1);                       // [1, 2H]
-    array y = linW(cat, m.g("mtp.fc.weight"));                  // [1, H]
+    array ny = ops::rms_norm(f32(hid), f32(m.g("mtp.pre_fc_norm_hidden.weight")), m.eps, true);
+    array cat = concatenate({nx, ny}, 1);                       // [n, 2H]
+    array y = linW(cat, m.g("mtp.fc.weight"));                  // [n, H]
 
     const std::string p = "mtp.layers.0.";
-    // ── attention (single-token self-attn ⇒ attn = V, gated) ──
+    // ── causal attention over the full MTP history ──
     array res = y;
     array h = ops::rms_norm(y, f32(m.g(p + "input_layernorm.weight")), m.eps, true);
-    array qg = linW(h, m.g(p + "self_attn.q_proj.weight"));     // [1, n_q*2*d]
-    qg = reshape(qg, {1, m.n_q, 2, m.d});
-    array gate = reshape(slice(qg, {0, 0, 1, 0}, {1, m.n_q, 2, m.d}), {1, m.n_q * m.d});
-    array V = reshape(linW(h, m.g(p + "self_attn.v_proj.weight")), {1, m.n_kv, m.d});
-    array Vrep = reshape(repeat(V, m.n_q / m.n_kv, 1), {1, m.n_q * m.d});  // GQA broadcast
-    array attn = multiply(Vrep, sigmoid(gate));                 // output gate
-    array ao = linW(attn, m.g(p + "self_attn.o_proj.weight"));  // [1, H]
-    y = add(res, ao);
+    array qg = reshape(linW(h, m.g(p + "self_attn.q_proj.weight")), {n, nq, 2, d});
+    array Q    = reshape(slice(qg, {0, 0, 0, 0}, {n, nq, 1, d}), {n, nq, d});
+    array gate = reshape(slice(qg, {0, 0, 1, 0}, {n, nq, 2, d}), {n, nq, d});
+    array K = reshape(linW(h, m.g(p + "self_attn.k_proj.weight")), {n, nkv, d});
+    array V = reshape(linW(h, m.g(p + "self_attn.v_proj.weight")), {n, nkv, d});
+    // gemma (1+w) per-head Q/K RMSNorm, then partial NEOX RoPE at absolute pos.
+    Q = ops::rms_norm(Q, f32(m.g(p + "self_attn.q_norm.weight")), m.eps, true);
+    K = ops::rms_norm(K, f32(m.g(p + "self_attn.k_norm.weight")), m.eps, true);
+    array positions = array(P_list.data(), {n}, int32);
+    ops::RopeParams rp; rp.theta = m.theta;
+    Q = ops::rope(Q, positions, m.rope_dims, rp);
+    K = ops::rope(K, positions, m.rope_dims, rp);
+    // GQA broadcast (repeat_interleave: kv head i → n_q/n_kv contiguous q heads).
+    array Kr = repeat(K, nq / nkv, 1);   // [n,nq,d]
+    array Vr = repeat(V, nq / nkv, 1);   // [n,nq,d]
+    array Qt = transpose(Q,  {1, 0, 2}); // [nq,n,d]
+    array Kt = transpose(Kr, {1, 0, 2});
+    array Vt = transpose(Vr, {1, 0, 2});
+    array scores = multiply(matmul(Qt, transpose(Kt, {0, 2, 1})), array(scale));  // [nq,n,n]
+    array ri = reshape(arange(n), {n, 1});
+    array ci = reshape(arange(n), {1, n});
+    array mask = reshape(where(greater(ci, ri), array(-1e30f), array(0.0f)), {1, n, n});
+    array w = softmax(add(scores, mask), std::vector<int>{-1}, /*precise=*/true);  // [nq,n,n]
+    array ao = transpose(matmul(w, Vt), {1, 0, 2});             // [n,nq,d]
+    array attn = multiply(reshape(ao, {n, nq * d}), sigmoid(reshape(gate, {n, nq * d})));
+    array o = linW(attn, m.g(p + "self_attn.o_proj.weight"));   // [n,H]
+    y = add(res, o);
     // ── SwiGLU MLP ──
     array res2 = y;
     array hn = ops::rms_norm(y, f32(m.g(p + "post_attention_layernorm.weight")), m.eps, true);
@@ -98,9 +159,10 @@ int mtp_draft(const Mtp& m, const mx::array& hidden, int token, const mx::array&
     array up = linW(hn, m.g(p + "mlp.up_proj.weight"));
     array ffn = linW(ops::swiglu(gp, up), m.g(p + "mlp.down_proj.weight"));
     y = add(res2, ffn);
-    // ── final norm + tied lm_head ──
+    // ── final norm + tied lm_head at the LAST position ──
     array fn = ops::rms_norm(y, f32(m.g("mtp.norm.weight")), m.eps, true);
-    array logits = linW(fn, embed);                             // tied lm_head
+    array last = reshape(slice(fn, {n - 1, 0}, {n, H}), {1, H});
+    array logits = linW(last, embed);                           // tied lm_head
     array am = argmax(logits, 1);
     eval(am);
     return am.item<int>();
@@ -152,27 +214,52 @@ int main(int argc, char** argv) {
     m.n_kv = 2;                                         // num_key_value_heads
     int vrows = m.t.at("mtp.layers.0.self_attn.v_proj.weight").shape(0);
     m.d = vrows / m.n_kv;                               // head_dim
+    m.theta = 1e7f;                                     // rope_parameters.rope_theta
+    // partial_rotary_factor 0.25 → rope_dims = 2*floor(0.5*0.25*head_dim).
+    m.rope_dims = std::max(2, 2 * (int)std::floor(0.5f * 0.25f * m.d));
     std::cerr << "[mtp] head geom: H=" << m.H << " n_q=" << m.n_q << " n_kv=" << m.n_kv
-              << " head_dim=" << m.d << ", MTP tensors=" << m.t.size() << "\n";
+              << " head_dim=" << m.d << " rope_dims=" << m.rope_dims
+              << ", MTP tensors=" << m.t.size() << "\n";
 
-    // Real prompt already in `toks` (or overridden via argv[3]). Prefill it.
-    std::vector<int> pos(plen);
-    for (int i = 0; i < plen; ++i) pos[i] = i;
-    auto b0 = make_batch(toks, pos, plen - 1, ps, /*pure_decode=*/false);
+    // Prefill returning the hidden at EVERY prompt position, so the MTP head can
+    // build its full K/V history (the attention over prior positions is what lets
+    // the head draft t+2 instead of echoing the backbone's own t+1 prediction).
+    auto b0 = make_prefill_all(toks, ps);
     attach(b0);
     mx::array logits = model.graph->forward(b0, *model.kv);
     mx::eval(logits);
     model.kv->eval();
-    mx::array hidden = model.graph->last_hidden();   // [1, H], pre-final-norm
-    mx::eval(hidden);
-    int cur = mx::argmax(logits, 1).item<int>();     // t_{p+1}
+    mx::array hidden_all = model.graph->last_hidden();   // [plen, H], pre-final-norm
+    mx::eval(hidden_all);
+    auto row = [&](const mx::array& a, int i) {
+        return mx::reshape(mx::slice(a, {i, 0}, {i + 1, a.shape(1)}), {1, a.shape(1)});
+    };
+
+    // MTP K/V history: entry i pairs backbone hidden_i with token t_{i+1} at
+    // absolute position i+1. Prompt entries i=0..plen-2 use the (teacher-forced)
+    // next prompt token; the last prompt hidden pairs with the first generated
+    // token and is appended inside the loop below.
+    std::vector<mx::array> H_list;
+    std::vector<int> T_list, P_list;
+    for (int i = 0; i + 1 < plen; ++i) {
+        H_list.push_back(row(hidden_all, i));
+        T_list.push_back(toks[i + 1]);
+        P_list.push_back(i + 1);
+    }
+    mx::array hidden = row(hidden_all, plen - 1);         // [1,H] at last prompt pos
+    // logits is [plen,V]; take the last row's argmax as t_{plen} (first gen token).
+    int cur = mx::argmax(row(logits, plen - 1), 1).item<int>();
     int p = plen - 1;
 
     int accepted = 0, total = 0;
     std::vector<int> gen;
     for (int s = 0; s < steps; ++s) {
-        // MTP drafts t_{p+2} from (hidden_p, cur=t_{p+1}).
-        int draft = mtp_draft(m, hidden, cur, embed);
+        // Append the current entry (hidden_p, cur=t_{p+1} at pos p+1), then draft
+        // t_{p+2} = argmax(mtp_logits) with attention over the full history.
+        H_list.push_back(hidden);
+        T_list.push_back(cur);
+        P_list.push_back(p + 1);
+        int draft = mtp_draft(m, H_list, T_list, P_list, embed);
         // Backbone verifies: forward cur at position p+1 → ground-truth t_{p+2}.
         auto b = make_batch({cur}, {p + 1}, 0, ps, /*pure_decode=*/true);
         attach(b);
@@ -186,6 +273,7 @@ int main(int argc, char** argv) {
         bool ok = (draft == truth);
         accepted += ok; ++total;
         gen.push_back(cur);
+        if (s < 8) std::printf("  step %d: mtp_draft=%d target=%d %s\n", s, draft, truth, ok ? "ACCEPT" : "reject");
         // advance
         hidden = h1; cur = truth; ++p;
     }
@@ -206,6 +294,7 @@ int main(int argc, char** argv) {
             std::fprintf(f, "model: Qwen/Qwen3.5-0.8B (main), model.safetensors total_size=1746882752 BF16\n");
             std::fprintf(f, "backend: Metal (Apple M1 Max, MLX 0.31.2 GDN backbone) + real mtp.* head, f32 head compute\n");
             std::fprintf(f, "draft_depth_K: 1 (mtp_num_hidden_layers=1)\n");
+            std::fprintf(f, "mtp_attn: causal attention over the MTP layer's own K/V history for all prior positions (mirrors CUDA attention_mtp_paged_history); q/k gemma(1+w) RMSNorm + partial NEOX RoPE (rope_dims=64, theta=1e7), output-gated\n");
             std::fprintf(f, "prompt_ids:");
             for (int t : toks) std::fprintf(f, " %d", t);
             std::fprintf(f, "\nsteps: %d\naccepted: %d\nacceptance_pct: %.1f\n", total, accepted, 100.0 * accepted / std::max(1, total));

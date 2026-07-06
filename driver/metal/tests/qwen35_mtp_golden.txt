@@ -2,9 +2,10 @@
 model: Qwen/Qwen3.5-0.8B (main), model.safetensors total_size=1746882752 BF16
 backend: Metal (Apple M1 Max, MLX 0.31.2 GDN backbone) + real mtp.* head, f32 head compute
 draft_depth_K: 1 (mtp_num_hidden_layers=1)
+mtp_attn: causal attention over the MTP layer's own K/V history for all prior positions (mirrors CUDA attention_mtp_paged_history); q/k gemma(1+w) RMSNorm + partial NEOX RoPE (rope_dims=64, theta=1e7), output-gated
 prompt_ids: 760 6511 314 9338 369 11751 13 561 6511 314 6124 369
 steps: 30
-accepted: 6
-acceptance_pct: 20.0
+accepted: 15
+acceptance_pct: 50.0
 generated_ids: 25358 13 561 6511 314 279 3516 4042 369 6312 11 414 707 13 561 6511 314 279 3516 14634 369 6924 13 561 6511 314 279 3516 4042 369
 note: greedy verify — deterministic. Match acceptance + generated_ids on CUDA Qwen3.5 MTP for cross-parity.

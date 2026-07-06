@@ -200,3 +200,4 @@ pie/rollout_logs/
 
 # CUDA build scratch (accidentally committed; do not track)
 .bigtmp/
+.mcp.json
