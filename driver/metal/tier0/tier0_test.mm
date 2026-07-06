@@ -130,6 +130,7 @@ int main(int argc, char** argv) {
     run_golden(gdir, "greedy_argmax", ops);
     run_golden(gdir, "section3_masked_gumbel", ops);
     run_golden(gdir, "beam_epilogue", ops);
+    run_golden(gdir, "dfa_ingraph", ops);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     if (g_fail == 0) { std::printf("TIER0_TEST_OK\n"); return 0; }
