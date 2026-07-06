@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <deque>
 #include <map>
 #include <string>
@@ -149,6 +150,19 @@ class Instance {
 
 // ── implementation ──────────────────────────────────────────────────────────
 
+// RNG (PTIR-CONTAINER.md §5; shared splitmix64/hash_uniform with sample_temp).
+inline std::uint64_t splitmix64(std::uint64_t x) {
+    x ^= x >> 27; x *= 0x3C79AC492BA7B653ull;
+    x ^= x >> 33; x *= 0x1C69B3F74AC4AE35ull;
+    x ^= x >> 27;
+    return x;
+}
+inline float hash_uniform(std::uint64_t seed_eff, std::uint32_t j) {
+    std::uint64_t x = seed_eff + 0x9E3779B97F4A7C15ull * ((std::uint64_t)j + 1);
+    std::uint32_t bits = (std::uint32_t)(splitmix64(x) >> 40);
+    return ((float)bits + 0.5f) * (1.0f / 16777216.0f);
+}
+
 inline void rows_len(const P::TensorType& t, int& rows, int& len) {
     const auto& d = t.shape.dims;
     if (d.empty()) { rows = 1; len = 1; return; }
@@ -191,6 +205,59 @@ inline Val Instance::eval_op(const P::Op& op, const std::vector<Val>& args, Step
         case OC::Reshape:
         case OC::Transpose:  // (axis metadata handled by shape; row-major clone for now)
             return args[0];
+        case OC::Select: {
+            // cond ? a : b, per-operand len-1 broadcast, dtype of a preserved.
+            const Val& c = args[0];
+            const Val& a = args[1];
+            const Val& b = args[2];
+            std::size_t n = c.numel();
+            n = a.numel() > n ? a.numel() : n;
+            n = b.numel() > n ? b.numel() : n;
+            auto pick = [](std::size_t l, std::size_t k) { return l == 1 ? std::size_t(0) : k; };
+            auto cond = c.i;  // Bool as i64 0/1
+            if (a.dt == DType::F32) {
+                auto av = a.to_f32(), bv = b.to_f32();
+                std::vector<float> o(n);
+                for (std::size_t k = 0; k < n; ++k)
+                    o[k] = cond[pick(cond.size(), k)] ? av[pick(av.size(), k)] : bv[pick(bv.size(), k)];
+                return Val::make_f32(std::move(o));
+            }
+            std::vector<std::int64_t> o(n);
+            for (std::size_t k = 0; k < n; ++k)
+                o[k] = cond[pick(cond.size(), k)] ? a.i[pick(a.i.size(), k)] : b.i[pick(b.i.size(), k)];
+            return Val::make_int(a.dt, std::move(o));
+        }
+        case OC::Iota: {
+            std::vector<std::int64_t> o(op.imm);
+            for (std::uint32_t k = 0; k < op.imm; ++k) o[k] = k;
+            return Val::make_int(DType::U32, std::move(o));
+        }
+        case OC::Cast: {
+            DType to = op.result_type.dtype;
+            if (to == DType::F32) return Val::make_f32(args[0].to_f32());
+            auto f = args[0].to_f32();
+            std::vector<std::int64_t> o(args[0].numel());
+            if (args[0].dt == DType::F32) for (std::size_t k = 0; k < o.size(); ++k) o[k] = (std::int64_t)f[k];
+            else o = args[0].i;
+            return Val::make_int(to, std::move(o));
+        }
+        case OC::RngKeyed: {
+            // state = [key, ctr]; seed64 = splitmix64((key<<32)|ctr); gumbel/uniform.
+            const auto& st = args[0].i;
+            std::uint64_t key = (std::uint64_t)st[0] & 0xFFFFFFFFull;
+            std::uint64_t ctr = st.size() > 1 ? ((std::uint64_t)st[1] & 0xFFFFFFFFull) : 0;
+            std::uint64_t seed64 = splitmix64((key << 32) | ctr);
+            std::size_t n = 1;
+            for (auto d : op.result_type.shape.dims) n *= d;
+            if (n == 0) n = 1;
+            bool gumbel = op.rng_kind == P::RngKind::Gumbel;
+            std::vector<float> o(n);
+            for (std::uint32_t j = 0; j < n; ++j) {
+                float u = hash_uniform(seed64, j);
+                o[j] = gumbel ? -std::log(-std::log(u)) : u;
+            }
+            return Val::make_f32(std::move(o));
+        }
         case OC::ReduceArgmax: {
             int rows, len;
             rows_len(trace_->value(op.args[0])->type, rows, len);
