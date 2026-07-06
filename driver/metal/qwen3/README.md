@@ -31,17 +31,13 @@ RMSNorm → gate/up → SwiGLU → down+residual`.
 | **`decoder_layer`** (full forward) | `qwen3_forward.cpp` | **max_abs ~7e-7** |
 | `embedding` (gather, tied) | token embed gather | **bit-exact** |
 | `lm_head` (logits = h·embedᵀ) | tied LM head matmul | ~1e-5 |
+| **`layer_stack`** (28× full forward) | embed→28×layer→norm→lm_head | max_abs ~4e-6 |
 
-The full **Qwen3-0.6B decoder-layer forward** is assembled and validated end-to-end:
-`RMSNorm → QKV → QK-norm → RoPE → attention → O+residual → RMSNorm → gate/up →
-SwiGLU → down+residual`, chained on Metal and matched to the CPU f32 reference at
-`max_abs ≈ 7e-7` (f32 epsilon). Plus the token→logits ends: embedding gather
-(bit-exact) and the tied LM head. Prefill = multi-token causal attention (each
-query row attends `[0, position_ids[row]]`), the same paged kernel as decode.
-
-Next: multi-layer stack (28 layers) toward a full Metal Qwen3-0.6B forward, and
-real-weight cross-check vs CUDA. Matmul is currently a parity-first sequential-k
-GEMM; an MPS/MPSGraph swap-in is the perf follow-on (numerics already pinned).
+The full **Qwen3-0.6B forward stack** is validated end-to-end: `embedding → 28×
+decoder_layer → final RMSNorm → tied LM head`, chained on Metal and matched to the
+CPU reference (`max_abs ≈ 4e-6`). The 28-layer stack test uses reduced dims to prove
+the stacking mechanism (loop + cross-layer residual + per-layer KV + final norm +
+head) cheaply; per-primitive and single-layer parity are at real Qwen3-0.6B dims.
 
 ## Build & run
 

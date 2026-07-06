@@ -201,6 +201,46 @@ struct Chain {
                                Arg::in(&n, 4)};
         ok = ok && h.run("add_inplace", ar, n);
     }
+    std::vector<float> embedding(const std::vector<float>& embed,
+                                 const std::vector<std::int32_t>& tokens, int N, int hidden) {
+        std::vector<float> out((std::size_t)N * hidden, 0.0f);
+        int hd = hidden; std::uint32_t total = (std::uint32_t)(N * hidden);
+        std::vector<Arg> a = {Arg::in(embed.data(), embed.size() * 4),
+                              Arg::in(tokens.data(), tokens.size() * 4),
+                              Arg::out(out.data(), out.size() * 4), Arg::in(&hd, 4), Arg::in(&total, 4)};
+        ok = ok && h.run("embedding", a, total);
+        return out;
+    }
+    // Full Metal decoder-layer forward (same op sequence as ref::decoder_layer).
+    std::vector<float> layer(const std::vector<float>& x, const std::vector<std::int32_t>& positions,
+                             const qwen3::ref::LayerWeights& w, const qwen3::ref::LayerDims& D) {
+        const int N = D.N, H = D.hidden, hd = D.head_dim, qd = D.q_dim(), kd = D.kv_dim(),
+                  I = D.intermediate;
+        auto nx = rmsnorm(x, w.input_ln, N, H, D.rms_eps);
+        auto q = matmul(nx, w.wq, N, qd, H);
+        auto k = matmul(nx, w.wk, N, kd, H);
+        auto v = matmul(nx, w.wv, N, kd, H);
+        q = rmsnorm(q, w.q_norm, N * D.n_q_heads, hd, D.rms_eps);
+        k = rmsnorm(k, w.k_norm, N * D.n_kv_heads, hd, D.rms_eps);
+        rope_ip(q, positions, N, D.n_q_heads, hd, D.rope_theta);
+        rope_ip(k, positions, N, D.n_kv_heads, hd, D.rope_theta);
+        qwen3::ref::AttnConfig c;
+        c.N = N; c.n_q_heads = D.n_q_heads; c.n_kv_heads = D.n_kv_heads; c.d = hd;
+        c.page_size = N; c.scale = D.attn_scale; c.position_ids = positions;
+        c.req_of_token.assign(N, 0); c.kv_page_indices = {0}; c.kv_page_indptr = {0, 1};
+        auto attn = attention(c, q, k, v);
+        auto o = matmul(attn, w.wo, N, H, qd);
+        std::vector<float> y = x;
+        add_ip(y, o);
+        auto ny = rmsnorm(y, w.post_ln, N, H, D.rms_eps);
+        auto gate = matmul(ny, w.wgate, N, I, H);
+        auto up = matmul(ny, w.wup, N, I, H);
+        auto g = swiglu(gate, up);
+        auto down = matmul(g, w.wdown, N, H, I);
+        std::vector<float> out = y;
+        add_ip(out, down);
+        return out;
+    }
 };
 
 void test_prefill_attention(MetalHarness& h) {
@@ -309,6 +349,63 @@ void test_embed_lmhead(MetalHarness& h) {
     check_tol("lm_head (logits = hidden @ embedᵀ, tied)", got_logits, want_logits, 1e-3);
 }
 
+// Build a LayerWeights for the given dims (deterministic per seed).
+qwen3::ref::LayerWeights make_layer(const qwen3::ref::LayerDims& D, std::uint32_t seed) {
+    auto scaled = [](std::size_t n, std::uint32_t s, float mul) {
+        Rng r(s);
+        std::vector<float> v(n);
+        for (auto& x : v) x = r.next() * mul;
+        return v;
+    };
+    const int H = D.hidden, qd = D.q_dim(), kd = D.kv_dim(), I = D.intermediate, hd = D.head_dim;
+    qwen3::ref::LayerWeights w;
+    w.input_ln = scaled(H, seed + 1, 1.0f);
+    w.wq = scaled((std::size_t)qd * H, seed + 2, 0.03f);
+    w.wk = scaled((std::size_t)kd * H, seed + 3, 0.03f);
+    w.wv = scaled((std::size_t)kd * H, seed + 4, 0.03f);
+    w.q_norm = scaled(hd, seed + 5, 1.0f);
+    w.k_norm = scaled(hd, seed + 6, 1.0f);
+    w.wo = scaled((std::size_t)H * qd, seed + 7, 0.03f);
+    w.post_ln = scaled(H, seed + 8, 1.0f);
+    w.wgate = scaled((std::size_t)I * H, seed + 9, 0.03f);
+    w.wup = scaled((std::size_t)I * H, seed + 10, 0.03f);
+    w.wdown = scaled((std::size_t)H * I, seed + 11, 0.03f);
+    return w;
+}
+
+// 28-layer stack (full forward): validates the stacking mechanism — embed →
+// 28× decoder_layer → final RMSNorm → tied LM head — vs the CPU reference.
+// Reduced dims (the per-primitive + single-layer parity is at real Qwen3 dims);
+// this proves the loop + cross-layer residual/KV + final norm + head.
+void test_layer_stack(MetalHarness& h) {
+    qwen3::ref::LayerDims D;
+    D.N = 4; D.hidden = 128; D.n_q_heads = 4; D.n_kv_heads = 2; D.head_dim = 32;
+    D.intermediate = 256; D.rms_eps = A::RMS_EPS; D.rope_theta = A::ROPE_THETA;
+    D.attn_scale = 1.0f / std::sqrt((float)D.head_dim);
+    const int n_layers = A::N_LAYERS;  // 28
+    const int vocab = 256;
+
+    Rng er(4242);
+    std::vector<float> embed((std::size_t)vocab * D.hidden);
+    for (auto& x : embed) x = er.next();
+    auto final_norm = std::vector<float>(D.hidden);
+    { Rng r(9999); for (auto& x : final_norm) x = r.next(); }
+    std::vector<qwen3::ref::LayerWeights> layers;
+    for (int l = 0; l < n_layers; ++l) layers.push_back(make_layer(D, 1000u + 100u * l));
+    std::vector<std::int32_t> tokens = {5, 100, 0, 63};
+    std::vector<std::int32_t> positions = {0, 1, 2, 3};
+
+    auto want = qwen3::ref::full_forward(tokens, positions, embed, layers, final_norm, embed, D, vocab);
+
+    Chain ch{h};
+    auto x = ch.embedding(embed, tokens, D.N, D.hidden);
+    for (int l = 0; l < n_layers; ++l) x = ch.layer(x, positions, layers[l], D);
+    x = ch.rmsnorm(x, final_norm, D.N, D.hidden, D.rms_eps);
+    auto logits = ch.matmul(x, embed, D.N, vocab, D.hidden);
+    if (!ch.ok) { std::printf("  FAIL layer_stack: %s\n", h.error().c_str()); ++g_fail; return; }
+    check_tol("layer_stack (28 layers, embed→layers→norm→lm_head)", logits, want, 5e-3);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -329,6 +426,7 @@ int main(int argc, char** argv) {
     test_prefill_attention(h);
     test_decoder_layer(h);
     test_embed_lmhead(h);
+    test_layer_stack(h);
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     if (g_fail == 0) { std::printf("QWEN3_TEST_OK\n"); return 0; }
     std::printf("QWEN3_TEST_FAIL\n");

@@ -198,4 +198,20 @@ inline std::vector<float> embedding(const std::vector<float>& embed,
     return out;
 }
 
+// Full forward: embed → 28× decoder_layer → final RMSNorm → tied LM head.
+// logits[N, vocab]. `layers` supplies one LayerWeights per layer; `lm_head`
+// is the LM-head weight [vocab, hidden] (== embed when tied).
+inline std::vector<float> full_forward(const std::vector<std::int32_t>& tokens,
+                                       const std::vector<std::int32_t>& positions,
+                                       const std::vector<float>& embed,
+                                       const std::vector<LayerWeights>& layers,
+                                       const std::vector<float>& final_norm,
+                                       const std::vector<float>& lm_head,
+                                       const LayerDims& D, int vocab) {
+    auto x = embedding(embed, tokens, D.hidden);   // [N, hidden]
+    for (const auto& lw : layers) x = decoder_layer(x, positions, lw, D);
+    x = rmsnorm(x, final_norm, D.N, D.hidden, D.rms_eps);
+    return matmul_xwt(x, lm_head, D.N, vocab, D.hidden);   // [N, vocab]
+}
+
 }  // namespace qwen3::ref
