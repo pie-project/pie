@@ -561,3 +561,126 @@ fn golden_matrix_select_mask() {
     rep = rep.line(&take_line(&mut inst, &bound, 1)); // expect I32([2,3,4,5])
     check("matrix_select_mask", rep);
 }
+
+#[test]
+fn golden_mtp_verify_tail() {
+    // The full MTP match-verify DAG at K=3, V=8 (overview §6.1 steps 1-6),
+    // hand-checkable — the cross-backend anchor for the accept-prefix logic
+    // (eq → cumprod → select with the -1 sentinel) on top of the
+    // matrix_select_mask shape. Non-degenerate: WITHOUT the mask row 2 would
+    // match the draft (raw argmax = 6 = d3) — the mask forbids 6 and forces
+    // picked[2]=2, so the run stops at n_acc=2. Hand check:
+    //   prev_drafts=[3,5,6]; picked=[3,5,2,4] -> hit=[T,T,F] -> n_acc=2
+    //   commit lanes 0..=2, lane 3 = -1  =>  out = I32([3, 5, 2, -1])
+    //   drafts = argmax(mtp_logits) = [1, 4, 0] (also the new prev_drafts)
+    let (k, v) = (3u32, 8u32); // K drafts; K+1 = 4 verify rows
+    let kp1 = k + 1;
+    let mut b = B::new();
+    let lg = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::Logits,
+        shape: Shape::matrix(kp1, v),
+        dtype: DType::F32,
+    });
+    let mtp = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::MtpLogits,
+        shape: Shape::matrix(k, v),
+        dtype: DType::F32,
+    });
+    let m = b.p(Op::ChanTake(1)); // allow [K+1, v] bool (host-fed)
+    let ninf = b.p(Op::Const(Literal::F32(f32::NEG_INFINITY)));
+    let nb = b.p(Op::Broadcast { value: ninf, shape: Shape::matrix(kp1, v) });
+    let masked = b.p(Op::Select { cond: m, a: lg, b: nb });
+    let picked = b.p(Op::ReduceArgmax(masked)); // [K+1] i32
+    let d = b.p(Op::ChanTake(0)); // prev_drafts [K] i32
+    let vl = b.p(Op::Iota { len: k }); // VERIFY_LANES = [0,1,2]
+    let head = b.p(Op::Gather { src: picked, idx: vl }); // picked[0..K]
+    let hit = b.p(Op::Eq(head, d)); // [K] bool
+    let one = b.p(Op::Const(Literal::F32(1.0)));
+    let zero = b.p(Op::Const(Literal::F32(0.0)));
+    let ones = b.p(Op::Broadcast { value: one, shape: Shape::vector(k) });
+    let zeros = b.p(Op::Broadcast { value: zero, shape: Shape::vector(k) });
+    let runf = b.p(Op::Select { cond: hit, a: ones, b: zeros }); // [K] {1,0}
+    let run = b.p(Op::CumProd(runf));
+    let naccf = b.p(Op::ReduceSum(run)); // scalar f32 = leading-hit count
+    let nacc = b.p(Op::Cast { value: naccf, dtype: DType::U32 });
+    let naccb = b.p(Op::Broadcast { value: nacc, shape: Shape::vector(kp1) });
+    let lanes = b.p(Op::Iota { len: kp1 });
+    let keep = b.p(Op::Ge(naccb, lanes)); // keep[i] = i <= n_acc
+    let neg1 = b.p(Op::Const(Literal::I32(-1)));
+    let commit = b.p(Op::Select { cond: keep, a: picked, b: neg1 }); // [K+1]
+    b.p(Op::ChanPut { chan: 2, value: commit });
+    let drf = b.p(Op::ReduceArgmax(mtp)); // [K] fresh drafts (greedy proposals)
+    b.p(Op::ChanPut { chan: 0, value: drf }); // prev_drafts ping-pong
+    b.p(Op::ChanPut { chan: 3, value: drf }); // publish for the host grammar walk
+    let c = TraceContainer {
+        names: vec![],
+        channels: vec![
+            ChannelDecl {
+                shape: Shape::vector(k),
+                dtype: ChanDType::Concrete(DType::I32),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
+            }, // 0 prev_drafts
+            ChannelDecl {
+                shape: Shape::matrix(kp1, v),
+                dtype: ChanDType::Concrete(DType::Bool),
+                capacity: 1,
+                host_role: HostRole::Writer,
+                seeded: false,
+            }, // 1 allow
+            ChannelDecl {
+                shape: Shape::vector(kp1),
+                dtype: ChanDType::Concrete(DType::I32),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            }, // 2 out (committed window, -1 sentinel)
+            ChannelDecl {
+                shape: Shape::vector(k),
+                dtype: ChanDType::Concrete(DType::I32),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            }, // 3 draft_out
+        ],
+        ports: vec![],
+        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+    };
+    let mut profile = ModelProfile::dummy();
+    profile.vocab = v; // has_mtp_logits = true in dummy()
+    let bound = bind(c.clone(), profile).unwrap();
+    let mut rep = Report::new("mtp_verify_tail", &c).verdict(&Ok(bound.clone()));
+    let seeds = [(0u32, i32s(&[3, 5, 6]))];
+    rep = seed_lines(rep, &seeds);
+    let mut inst = Instance::new(&bound, &seeds).unwrap();
+    // logits rows (raw argmax): r0->3 (=d1 hit), r1->5 (=d2 hit),
+    // r2->6 (WOULD match d3 — but the mask forbids 6, allows {2} -> picked 2,
+    // miss), r3->4 (bonus row; unused since n_acc=2 -> bonus is picked[2]).
+    let mut logits = vec![0.0f32; (kp1 * v) as usize];
+    logits[0 * 8 + 3] = 9.0;
+    logits[8 + 5] = 9.0;
+    logits[2 * 8 + 6] = 9.0; // masked out
+    logits[2 * 8 + 2] = 1.0; // the allowed survivor
+    logits[3 * 8 + 4] = 9.0;
+    // mask: rows 0,1,3 allow-all; row 2 allows only col 2.
+    let mut allow = vec![true; (kp1 * v) as usize];
+    for col in 0..v as usize {
+        allow[2 * 8 + col] = col == 2;
+    }
+    // mtp rows argmax -> [1, 4, 0]
+    let mut mtpv = vec![0.0f32; (k * v) as usize];
+    mtpv[1] = 7.0;
+    mtpv[8 + 4] = 7.0;
+    mtpv[2 * 8] = 7.0;
+    let inputs = PassInputs {
+        logits: Some(f32s(&logits)),
+        mtp_logits: Some(f32s(&mtpv)),
+        ..Default::default()
+    };
+    rep = rep.line(&put_line(&mut inst, &bound, 1, Value::Bool(allow)));
+    rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
+    rep = rep.line(&take_line(&mut inst, &bound, 2)); // I32([3, 5, 2, -1])
+    rep = rep.line(&take_line(&mut inst, &bound, 3)); // I32([1, 4, 0])
+    check("mtp_verify_tail", rep);
+}
