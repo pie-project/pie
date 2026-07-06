@@ -400,11 +400,20 @@ pub enum Binding {
     /// The LM-head logits intrinsic (positions resolved host-side).
     Logits,
     /// The speculator's **draft** logits intrinsic (de-hardwired speculation).
-    /// Source-selects the draft rows of `ws.logits` (M=1 ⇒ row 0) rather than a
-    /// separate buffer — host→driver as `IntrinsicKind::MtpLogits`, resolving to
-    /// a draft-row offset within `ws.logits`. A **distinct manifest variant**
+    /// Source-selects the draft rows of `ws.logits` rather than a separate
+    /// buffer — host→driver as `IntrinsicKind::MtpLogits`, resolving to
+    /// draft-row offsets within `ws.logits`. A **distinct manifest variant**
     /// (not a kind-byte on `Logits`) so a stale reader loud-rejects rather than
     /// misparses a layout change. Manifest-only, additive — not in the bytecode.
+    ///
+    /// **Shape contract (Stage 2, overview §6.1):** the bound slot's
+    /// [`InputDecl`] is F32, either `[vocab]` (legacy single-draft, K=1 ⇒ the
+    /// M=1 draft row) or **`[K, vocab]`** — the MTP head's K next-step draft
+    /// proposals, one row per draft position. `K` is trace-known (the decl's
+    /// row count); the driver maps the K rows to the pass's draft rows
+    /// (`ctx.mtp_draft_row .. +K`) at fire time. Checked by
+    /// [`crate::validate::intrinsic_decl_ok`] — the one definition the
+    /// runtime attach and every backend enforce.
     MtpLogits,
     /// A host-visible `tensor` resource, keyed, ready per [`Readiness`].
     Tensor {

@@ -826,7 +826,7 @@ impl InstanceState {
         inputs: Vec<pie::core::inference::InputBinding>,
     ) -> Result<AttachedProgram> {
         use pie::core::inference::InputBinding;
-        let (bytecode, output_kinds, output_elem_counts, num_inputs, input_readiness) = {
+        let (bytecode, output_kinds, output_elem_counts, num_inputs, input_readiness, input_decls) = {
             let p = self.ctx().table.get(program)?;
             (
                 p.cached.bytecode.clone(),
@@ -834,6 +834,7 @@ impl InstanceState {
                 p.cached.output_elem_counts.clone(),
                 p.cached.num_inputs,
                 p.cached.input_readiness.clone(),
+                p.cached.input_decls.clone(),
             )
         };
         if inputs.len() != num_inputs {
@@ -857,7 +858,16 @@ impl InstanceState {
                     }
                     saw_logits = true;
                     logits_positions = positions;
-                    bindings.push(pie_sampling_ir::Binding::Logits);
+                    let b = pie_sampling_ir::Binding::Logits;
+                    // Attach-time intrinsic shape contract (one shared def).
+                    if !pie_sampling_ir::validate::intrinsic_decl_ok(&b, &input_decls[i], None) {
+                        return Err(anyhow::anyhow!(
+                            "sampler: slot {i} bound to `logits` but declared {:?} {:?} — \
+                             intrinsic slots must be F32 [vocab] or [rows, vocab]",
+                            input_decls[i].dtype, input_decls[i].shape.dims()
+                        ));
+                    }
+                    bindings.push(b);
                 }
                 InputBinding::MtpLogits => {
                     // #21 mtp-logits (de-hardwired speculation): the speculator's
@@ -866,9 +876,20 @@ impl InstanceState {
                     // resolved driver-side by echo's `IntrinsicKind`. A distinct
                     // MANIFEST binding (`Binding::MtpLogits`, not a flag on
                     // `Logits`), carried to the driver via `SamplingBinding::
-                    // MtpLogits` (kind 2). Payload-less: the draft-row offset is
-                    // implicit (M=1), so no host-supplied positions.
-                    bindings.push(pie_sampling_ir::Binding::MtpLogits);
+                    // MtpLogits` (kind 2). Payload-less: the draft rows are
+                    // resolved driver-side; no host-supplied positions. Stage 2:
+                    // the decl may be `[K, vocab]` (K trace-known draft
+                    // proposals) or legacy `[vocab]` (K=1) — the shared contract
+                    // check (`intrinsic_decl_ok`, BYTECODE.md §5 family).
+                    let b = pie_sampling_ir::Binding::MtpLogits;
+                    if !pie_sampling_ir::validate::intrinsic_decl_ok(&b, &input_decls[i], None) {
+                        return Err(anyhow::anyhow!(
+                            "sampler: slot {i} bound to `mtp-logits` but declared {:?} {:?} — \
+                             must be F32 [vocab] (K=1) or [K, vocab]",
+                            input_decls[i].dtype, input_decls[i].shape.dims()
+                        ));
+                    }
+                    bindings.push(b);
                 }
                 InputBinding::Tensor(tensor) => {
                     // The slot index is the TensorKey wired to `Op::Input(i)`. The
