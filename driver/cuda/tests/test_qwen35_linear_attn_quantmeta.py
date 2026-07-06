@@ -32,8 +32,13 @@ class Qwen35LinearAttnQuantMetaTests(unittest.TestCase):
     ) -> None:
         binder = read_model_file("qwen3_5.cpp")
 
+        self.assertRegex(
+            binder,
+            r'const auto qkv_quant\s*=\s*engine\.quant_meta\(la \+ "in_proj_qkv.weight"\);',
+        )
+        self.assertIn("Lw.la_in_proj_qkv_quant = qkv_quant;", binder)
+
         for field, weight_name in (
-            ("la_in_proj_qkv_quant", "in_proj_qkv.weight"),
             ("la_in_proj_z_quant", "in_proj_z.weight"),
             ("la_in_proj_a_quant", "in_proj_a.weight"),
             ("la_in_proj_b_quant", "in_proj_b.weight"),
@@ -58,8 +63,12 @@ class Qwen35LinearAttnQuantMetaTests(unittest.TestCase):
     ) -> None:
         binder = read_model_file("qwen3_5.cpp")
 
-        self.assertIn("T > 1 && Lw.la_in_proj_qkv_quant.has_value()", binder)
+        self.assertIn("T > 1 && qkv_quant.has_value()", binder)
         self.assertIn("TP-sliced FP8 linear_attn.in_proj_qkv", binder)
+        self.assertLess(
+            binder.index("T > 1 && qkv_quant.has_value()"),
+            binder.index("slice_la_kkv_blocked(*full_qkv"),
+        )
 
     def test_qwen35_linear_attention_forward_passes_weight_views_to_gemm(
         self,

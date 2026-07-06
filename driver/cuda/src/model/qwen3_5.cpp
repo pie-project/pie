@@ -320,6 +320,12 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             const int rank = engine.distributed().tp_rank;
             const int K_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
             const int V_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+            const auto qkv_quant = engine.quant_meta(la + "in_proj_qkv.weight");
+            if (T > 1 && qkv_quant.has_value()) {
+                throw std::runtime_error(
+                    "qwen3_5: TP-sliced FP8 linear_attn.in_proj_qkv "
+                    "requires matching scale slicing");
+            }
             if (T > 1) {
                 w.owned_bf16_buffers.push_back(
                     slice_la_kkv_blocked(*full_qkv, K_dim, V_dim, rank, T));
@@ -342,15 +348,10 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             Lw.la_in_proj_z   = &must(engine, la + "in_proj_z.weight");
             Lw.la_in_proj_b   = &must(engine, la + "in_proj_b.weight");
             Lw.la_in_proj_a   = &must(engine, la + "in_proj_a.weight");
-            Lw.la_in_proj_qkv_quant = engine.quant_meta(la + "in_proj_qkv.weight");
+            Lw.la_in_proj_qkv_quant = qkv_quant;
             Lw.la_in_proj_z_quant   = engine.quant_meta(la + "in_proj_z.weight");
             Lw.la_in_proj_b_quant   = engine.quant_meta(la + "in_proj_b.weight");
             Lw.la_in_proj_a_quant   = engine.quant_meta(la + "in_proj_a.weight");
-            if (T > 1 && Lw.la_in_proj_qkv_quant.has_value()) {
-                throw std::runtime_error(
-                    "qwen3_5: TP-sliced FP8 linear_attn.in_proj_qkv "
-                    "requires matching scale slicing");
-            }
             const bool can_fuse_gdn_projection_weights =
                 fused_gdn_projection_weights_enabled() &&
                 !Lw.la_in_proj_qkv_quant.has_value() &&
