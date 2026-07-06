@@ -9,6 +9,7 @@
 // Pure C++17, no Metal dependency.
 
 #include <cstdint>
+#include <cmath>
 #include <vector>
 
 namespace kvattn::ref {
@@ -90,6 +91,63 @@ inline std::vector<std::uint16_t> gather_rows(const std::vector<std::uint16_t>& 
         for (int j = 0; j < vocab; ++j) dst[dbase + j] = src[s + j];
     }
     return dst;
+}
+
+// ── paged decode attention (f32 reference) ──────────────────────────────────
+// Single-query-per-row causal attention over a paged NHD KV cache
+// (k/v_pages = [num_pages, page_size, n_kv_heads, d], element =
+// (slot*n_kv_heads + kv_head)*d + i, slot = page*page_size + kp%page_size,
+// page = kv_page_indices[kv_page_indptr[r] + kp/page_size]) — the same layout as
+// write_kv (NHD) and raw_metal sdpa_paged. Row `row` attends kv positions
+// [0, position_ids[row]]. Online (flash) softmax, so the accumulation order
+// matches the Metal kernel; only exp rounding can differ.
+struct AttnConfig {
+    int N = 0;            // query rows
+    int n_q_heads = 0;
+    int n_kv_heads = 0;
+    int d = 0;            // head_dim
+    int page_size = 0;
+    float scale = 1.0f;
+    std::vector<std::int32_t> position_ids;   // [N] causal bound
+    std::vector<std::int32_t> req_of_token;   // [N] owning request
+    std::vector<std::uint32_t> kv_page_indices;
+    std::vector<std::uint32_t> kv_page_indptr;  // [R+1]
+    int gqa_factor() const { return n_q_heads / n_kv_heads; }
+};
+
+inline std::vector<float> paged_attention(const AttnConfig& c,
+                                          const std::vector<float>& queries,  // [N,n_q_heads,d]
+                                          const std::vector<float>& k_pages,
+                                          const std::vector<float>& v_pages) {
+    std::vector<float> out(static_cast<std::size_t>(c.N) * c.n_q_heads * c.d, 0.0f);
+    for (int row = 0; row < c.N; ++row) {
+        const int r = c.req_of_token[row];
+        const int q_pos = c.position_ids[row];
+        const int page_base = static_cast<int>(c.kv_page_indptr[r]);
+        for (int qh = 0; qh < c.n_q_heads; ++qh) {
+            const int kv_head = qh / c.gqa_factor();
+            const std::size_t qbase = (static_cast<std::size_t>(row) * c.n_q_heads + qh) * c.d;
+            float m = -3.0e38f, l = 0.0f;
+            std::vector<float> acc(c.d, 0.0f);
+            for (int kp = 0; kp <= q_pos; ++kp) {
+                const int page = static_cast<int>(c.kv_page_indices[page_base + kp / c.page_size]);
+                const std::size_t slot =
+                    static_cast<std::size_t>(page) * c.page_size + (kp % c.page_size);
+                const std::size_t kb = (slot * c.n_kv_heads + kv_head) * c.d;
+                float score = 0.0f;
+                for (int i = 0; i < c.d; ++i) score += queries[qbase + i] * k_pages[kb + i];
+                score *= c.scale;
+                const float nm = m > score ? m : score;
+                const float factor = std::exp(m - nm);
+                const float e = std::exp(score - nm);
+                l = l * factor + e;
+                for (int i = 0; i < c.d; ++i) acc[i] = acc[i] * factor + e * v_pages[kb + i];
+                m = nm;
+            }
+            for (int i = 0; i < c.d; ++i) out[qbase + i] = l == 0.0f ? 0.0f : acc[i] / l;
+        }
+    }
+    return out;
 }
 
 }  // namespace kvattn::ref

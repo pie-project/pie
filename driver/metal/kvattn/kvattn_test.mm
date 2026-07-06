@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,62 @@ void test_gather_rows(MetalHarness& h) {
     report("gather_rows", got, want);
 }
 
+void test_paged_attention(MetalHarness& h) {
+    ref::AttnConfig c;
+    c.N = 3; c.n_q_heads = 4; c.n_kv_heads = 2; c.d = 16; c.page_size = 4;
+    c.scale = 1.0f / std::sqrt((float)c.d);
+    // 2 requests; row->request and causal positions.
+    c.req_of_token = {0, 0, 1};       // rows 0,1 -> req0; row2 -> req1
+    c.position_ids = {2, 5, 3};       // causal bounds per row
+    c.kv_page_indptr = {0, 2, 4};     // req0: pages[0,2]; req1: pages[1,3]
+    c.kv_page_indices = {0, 2, 1, 3};
+    const int total_pages = 4;
+
+    auto fill = [](std::vector<float>& v, unsigned seed) {
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            v[i] = ((float)((seed >> 9) & 0xffff) / 32768.0f) - 1.0f;  // [-1,1)
+        }
+    };
+    std::vector<float> queries((std::size_t)c.N * c.n_q_heads * c.d);
+    std::vector<float> k_pages((std::size_t)total_pages * c.page_size * c.n_kv_heads * c.d);
+    std::vector<float> v_pages(k_pages.size());
+    fill(queries, 1); fill(k_pages, 2); fill(v_pages, 3);
+
+    auto want = ref::paged_attention(c, queries, k_pages, v_pages);
+    std::vector<float> got(want.size(), 0.0f);
+    int nqh = c.n_q_heads, nkv = c.n_kv_heads, d = c.d, ps = c.page_size, gqa = c.gqa_factor();
+    float scale = c.scale; std::uint32_t total = (std::uint32_t)(c.N * c.n_q_heads);
+    std::vector<Arg> args = {
+        Arg::in(queries.data(), queries.size() * 4),
+        Arg::in(k_pages.data(), k_pages.size() * 4),
+        Arg::in(v_pages.data(), v_pages.size() * 4),
+        Arg::out(got.data(), got.size() * 4),
+        Arg::in(c.position_ids.data(), c.position_ids.size() * 4),
+        Arg::in(c.req_of_token.data(), c.req_of_token.size() * 4),
+        Arg::in(c.kv_page_indices.data(), c.kv_page_indices.size() * 4),
+        Arg::in(c.kv_page_indptr.data(), c.kv_page_indptr.size() * 4),
+        Arg::in(&nqh, 4), Arg::in(&nkv, 4), Arg::in(&d, 4), Arg::in(&ps, 4),
+        Arg::in(&gqa, 4), Arg::in(&scale, 4), Arg::in(&total, 4),
+    };
+    if (!h.run("paged_attention_decode", args, total)) {
+        std::printf("  FAIL  paged_attention_decode: %s\n", h.error().c_str());
+        ++g_fail; return;
+    }
+    // exp is not bit-exact GPU-vs-host; assert a tight numeric tolerance.
+    double max_abs = 0.0, max_rel = 0.0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        double a = std::fabs((double)got[i] - (double)want[i]);
+        max_abs = a > max_abs ? a : max_abs;
+        double rel = a / (std::fabs((double)want[i]) + 1e-6);
+        max_rel = rel > max_rel ? rel : max_rel;
+    }
+    bool ok = max_abs <= 1e-5;
+    std::printf("  %s  paged_attention_decode (max_abs=%.3e max_rel=%.3e vs f32 ref, %zu elems)\n",
+                ok ? "PASS" : "FAIL", max_abs, max_rel, want.size());
+    ok ? ++g_pass : ++g_fail;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -124,6 +181,7 @@ int main(int argc, char** argv) {
     test_write_kv(h, /*hnd=*/false);
     test_write_kv(h, /*hnd=*/true);
     test_gather_rows(h);
+    test_paged_attention(h);
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     if (g_fail == 0) { std::printf("KVATTN_TEST_OK\n"); return 0; }
     std::printf("KVATTN_TEST_FAIL\n");

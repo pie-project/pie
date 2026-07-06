@@ -11,15 +11,19 @@ for the KV + attention geometry.
 |--------|-------------|-------|
 | `write_kv`     | `kv_paged.cu` `write_kv_kernel` (NHD + HND layouts) | **bit-exact** (u16 movement) |
 | `gather_rows`  | `gather_rows.cu` `gather_bf16_rows_kernel`          | **bit-exact** (u16 movement) |
+| `paged_attention_decode` | paged SDPA (raw_metal `sdpa_paged` / FlashInfer decode) | **~f32-epsilon** vs CPU ref (`max_abs ≈ 9e-8`) |
 
-K/V are carried as opaque 16-bit words (bf16 bits): write/gather are pure data
-movement, so the copy is bit-exact regardless of numeric interpretation. The
-paged index math (`find_request` → `abs_kv_pos` → `page/offset`, head-major vs
+K/V movement (`write_kv`/`gather_rows`) is carried as opaque 16-bit words (bf16
+bits): a copy/gather is bit-exact regardless of numeric interpretation. The paged
+index math (`find_request` → `abs_kv_pos` → `page/offset`, head-major vs
 non-head-major dst) mirrors `write_kv_kernel` exactly.
 
-Paged decode attention (SDPA over paged KV, the softmax/numeric kernel) is the
-next phase — validated within tolerance vs a CPU reference (exp is not bit-exact
-GPU-vs-host).
+`paged_attention_decode` is single-query causal attention over the paged NHD KV
+cache (same layout as `write_kv` + raw_metal `sdpa_paged`): one thread per
+`(row, q_head)`, online (flash) softmax over kv positions `[0, position_ids[row]]`,
+GQA grouping. Softmax `exp` is not bit-exact GPU-vs-host, so it is validated within
+a tight tolerance vs a CPU reference that uses the **same online-softmax order** —
+observed `max_abs ≈ 9e-8` (f32 epsilon), i.e. only exp rounding differs.
 
 ## Build & run
 
