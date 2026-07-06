@@ -85,3 +85,63 @@ kernel void swiglu(
     float silu = g / (1.0f + exp(-g));
     y[gid] = silu * up[gid];
 }
+
+// ── paged decode/prefill attention (same kernel; per-row causal bound) ────────
+// One thread per (query_row, q_head). Online flash-softmax over kv positions
+// [0, position_ids[row]] with NHD paged KV. Prefill = multi query rows per
+// request, each with its own q_pos. grid = N * n_q_heads. (Mirrors kvattn.)
+constant constexpr int MAX_D = 128;
+kernel void paged_attention(
+    device const float* queries          [[buffer(0)]],
+    device const float* k_pages          [[buffer(1)]],
+    device const float* v_pages          [[buffer(2)]],
+    device float*       out              [[buffer(3)]],
+    device const int*   position_ids     [[buffer(4)]],
+    device const int*   req_of_token     [[buffer(5)]],
+    device const uint*  kv_page_indices  [[buffer(6)]],
+    device const uint*  kv_page_indptr   [[buffer(7)]],
+    constant int&       n_q_heads        [[buffer(8)]],
+    constant int&       n_kv_heads       [[buffer(9)]],
+    constant int&       d                [[buffer(10)]],
+    constant int&       page_size        [[buffer(11)]],
+    constant int&       gqa_factor       [[buffer(12)]],
+    constant float&     scale            [[buffer(13)]],
+    constant uint&      total            [[buffer(14)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= total) return;
+    const int row = (int)(gid / (uint)n_q_heads);
+    const int qh = (int)(gid % (uint)n_q_heads);
+    const int kv_head = qh / gqa_factor;
+    const int r = req_of_token[row];
+    const int q_pos = position_ids[row];
+    const int page_base = (int)kv_page_indptr[r];
+    const ulong qbase = ((ulong)row * n_q_heads + qh) * d;
+    float m = -3.0e38f, l = 0.0f;
+    float acc[MAX_D];
+    for (int i = 0; i < d; ++i) acc[i] = 0.0f;
+    for (int kp = 0; kp <= q_pos; ++kp) {
+        const int page = (int)kv_page_indices[page_base + kp / page_size];
+        const ulong slot = (ulong)page * page_size + (kp % page_size);
+        const ulong kb = (slot * n_kv_heads + kv_head) * d;
+        float score = 0.0f;
+        for (int i = 0; i < d; ++i) score += queries[qbase + i] * k_pages[kb + i];
+        score *= scale;
+        const float nm = max(m, score);
+        const float factor = exp(m - nm);
+        const float e = exp(score - nm);
+        l = l * factor + e;
+        for (int i = 0; i < d; ++i) acc[i] = acc[i] * factor + e * v_pages[kb + i];
+        m = nm;
+    }
+    for (int i = 0; i < d; ++i) out[qbase + i] = (l == 0.0f) ? 0.0f : acc[i] / l;
+}
+
+// Add a residual: out = a + b, grid = n.
+kernel void add_inplace(
+    device float*       a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    constant uint&      n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    a[gid] = a[gid] + b[gid];
+}

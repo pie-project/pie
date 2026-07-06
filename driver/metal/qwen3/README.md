@@ -27,9 +27,18 @@ RMSNorm → gate/up → SwiGLU → down+residual`.
 | `rmsnorm` (per-head QK-norm) | `rmsnorm.cu` over head_dim | ~2e-7 |
 | `rope_qwen`             | `rope.cu` (Qwen half-rotation) | ~4e-6 |
 | `swiglu`                | `swiglu.cu`   | ~1e-7 |
+| `paged_attention` (prefill/decode) | paged SDPA (`sdpa_paged`/FlashInfer) | ~2e-7 |
+| **`decoder_layer`** (full forward) | `qwen3_forward.cpp` | **max_abs ~7e-7** |
 
-Prefill/multi-token attention + the full-layer assembly (embedding + LM head) land
-next, then the end-to-end decoder-layer parity.
+The full **Qwen3-0.6B decoder-layer forward** is assembled and validated end-to-end:
+`RMSNorm → QKV → QK-norm → RoPE → attention → O+residual → RMSNorm → gate/up →
+SwiGLU → down+residual`, chained on Metal and matched to the CPU f32 reference at
+`max_abs ≈ 7e-7` (f32 epsilon). Prefill = multi-token causal attention (each query
+row attends `[0, position_ids[row]]`), the same paged kernel as decode.
+
+Next: embedding + LM head (tied weights) to close the token→logits path, then a
+multi-layer stack. Matmul is currently a parity-first sequential-k GEMM; an MPS/
+MPSGraph swap-in is the perf follow-on (numerics already pinned).
 
 ## Build & run
 
