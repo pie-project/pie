@@ -63,8 +63,19 @@ struct FireInputs {
     std::vector<float> logits;     // [rows*vocab] row-major (Intrinsic::Logits)
     bool has_mtp_logits = false;
     std::vector<float> mtp_logits; // [rows*vocab] row-major (Intrinsic::MtpLogits)
+    std::vector<float> value_head;              // Intrinsic::ValueHead
+    std::vector<std::vector<float>> query;      // Intrinsic::Query, one per layer
     int vocab = 0;
     std::map<std::uint32_t, Val> host_inputs;  // host_key -> value
+};
+
+// A second-party kernel host (kernel_call, e.g. Quest's envelope_dot). The
+// executor supplies it; a null host means the program uses no kernels.
+struct KernelHost {
+    virtual ~KernelHost() = default;
+    // name = trace name-table entry; result_type gives the expected shape/dtype.
+    virtual Val call(const std::string& name, const std::vector<Val>& args,
+                     const P::TensorType& result_type) = 0;
 };
 
 // ── channel ring (interp.rs ChannelState) ───────────────────────────────────
@@ -82,6 +93,14 @@ struct StepReport {
     std::uint32_t miss_chan = 0, miss_phase = 0;
     bool ok = true;
     std::string error;
+    // Sink effects fired this pass (sink_call), in execution order.
+    struct Sink {
+        std::uint16_t name_idx = 0;
+        P::StageKind stage = P::StageKind::Epilogue;
+        std::uint32_t layer = 0;
+        std::vector<Val> args;
+    };
+    std::vector<Sink> sinks;
 };
 
 class Instance {
@@ -122,7 +141,11 @@ class Instance {
         return HostErr::Ok;
     }
 
-    StepReport step(const FireInputs& in);
+    StepReport step(const FireInputs& in, KernelHost* host = nullptr);
+
+    // Number of decoder layers the per-layer stages (OnAttnProj/OnAttn) iterate
+    // over (model profile property; 1 for the single-layer channel goldens).
+    void set_num_layers(std::uint32_t n) { num_layers_ = n; }
 
   private:
     struct Overlay {
@@ -140,15 +163,40 @@ class Instance {
         const auto& st = chans_[chan];
         return st.queue.empty() ? st.last : st.queue.front();
     }
+    // pivot_threshold(RankLe): per-row top-k bool mask. `kv` is the resolved k
+    // operand (int lanes; [1] or [rows]). Mirrors eval.rs sort_desc + take(k).
+    Val pivot_threshold(const P::Op& op, const Val& input, const Val& kv) const {
+        const auto& d = op.result_type.shape.dims;
+        int len = d.empty() ? 1 : (int)d.back();
+        int rows = 1;
+        for (std::size_t k = 0; k + 1 < d.size(); ++k) rows *= (int)d[k];
+        if (rows == 0) rows = 1;
+        auto x = input.to_f32();
+        auto kf = kv.to_f32();
+        std::vector<std::int64_t> keep((std::size_t)rows * len, 0);
+        for (int r = 0; r < rows; ++r) {
+            std::int64_t k = (std::int64_t)(kf.size() == (std::size_t)rows ? kf[r]
+                                            : (kf.empty() ? 0.0f : kf[0]));
+            k = std::max<std::int64_t>(0, std::min<std::int64_t>(k, len));
+            std::vector<int> order(len);
+            for (int j = 0; j < len; ++j) order[j] = j;
+            std::stable_sort(order.begin(), order.end(),
+                             [&](int a, int b) { return x[(std::size_t)r * len + a]
+                                                        > x[(std::size_t)r * len + b]; });
+            for (int t = 0; t < (int)k; ++t) keep[(std::size_t)r * len + order[t]] = 1;
+        }
+        return Val::make_int(DType::Bool, std::move(keep));
+    }
     void exec_stage(const P::Stage& s, std::uint32_t layer, const FireInputs& in, Overlay& ov,
                     StepReport& rep);
     std::vector<Val> eval_op(const P::Op& op, const std::vector<Val>& args, StepReport& rep);
-
     const P::Trace* trace_;
     const P::bound::Bound* bound_;
     MetalOps* ops_;
     std::vector<Chan> chans_;
     bool poisoned_ = false;
+    std::uint32_t num_layers_ = 1;
+    KernelHost* host_ = nullptr;
 };
 
 // ── implementation ──────────────────────────────────────────────────────────
@@ -491,10 +539,21 @@ inline void Instance::exec_stage(const P::Stage& s, std::uint32_t layer, const F
                 // (the on-device MTP draft logits); a plain sampler binds
                 // Intrinsic::Logits. Same argmax bytecode — only the bound
                 // source differs (mtp_argmax vs argmax). Mirrors CUDA Stage 2.
-                out = Val::make_f32(
-                    v->intrinsic == P::Intrinsic::MtpLogits && in.has_mtp_logits
-                        ? in.mtp_logits
-                        : in.logits);
+                switch (v->intrinsic) {
+                    case P::Intrinsic::MtpLogits:
+                        out = Val::make_f32(in.has_mtp_logits ? in.mtp_logits : in.logits);
+                        break;
+                    case P::Intrinsic::ValueHead:
+                        out = Val::make_f32(in.value_head);
+                        break;
+                    case P::Intrinsic::Query:
+                        out = Val::make_f32(layer < in.query.size() ? in.query[layer]
+                                                                    : std::vector<float>{});
+                        break;
+                    default:  // Logits / Hidden
+                        out = Val::make_f32(in.logits);
+                        break;
+                }
                 break;
             case P::ValueSource::HostInput: {
                 auto hi = in.host_inputs.find(v->host_key);
@@ -516,8 +575,35 @@ inline void Instance::exec_stage(const P::Stage& s, std::uint32_t layer, const F
         cache.emplace(id, out);
         return out;
     };
-    (void)layer;
     for (const P::Op& op : s.ops) {
+        // ── structural / host ops that need stage-context (host, layer, the
+        //    leaf resolver for the predicate operand) ──
+        if (op.code == P::OpCode::KernelCall) {
+            std::vector<Val> args;
+            for (auto aid : op.args) args.push_back(leaf(aid));
+            if (!host_) { rep.ok = false; rep.error = "kernel_call with no kernel host"; return; }
+            const std::string& nm = op.name_idx < trace_->names.size()
+                                        ? trace_->names[op.name_idx] : std::string();
+            cache[op.result_id] = host_->call(nm, args, op.result_type);
+            continue;
+        }
+        if (op.code == P::OpCode::SinkCall) {
+            StepReport::Sink sk;
+            sk.name_idx = op.name_idx;
+            sk.stage = s.kind;
+            sk.layer = layer;
+            for (auto aid : op.args) sk.args.push_back(leaf(aid));
+            rep.sinks.push_back(std::move(sk));
+            continue;
+        }
+        if (op.code == P::OpCode::PivotThreshold) {
+            // Per-row top-k bool mask (interp.rs pivot_threshold). The k/thr is a
+            // VALUE id in predicate.payload (resolved from the value table).
+            Val input = leaf(op.args[0]);
+            Val kv = leaf(op.predicate.payload);
+            cache[op.result_id] = pivot_threshold(op, input, kv);
+            continue;
+        }
         std::vector<Val> args;
         args.reserve(op.args.size());
         for (auto aid : op.args) args.push_back(leaf(aid));
@@ -538,8 +624,9 @@ inline void Instance::exec_stage(const P::Stage& s, std::uint32_t layer, const F
     for (P::ChannelId c : s.takes) ov.taken[c] = 1;
 }
 
-inline StepReport Instance::step(const FireInputs& in) {
+inline StepReport Instance::step(const FireInputs& in, KernelHost* host) {
     StepReport rep;
+    host_ = host;
     if (poisoned_) { rep.ok = false; rep.error = "poisoned"; return rep; }
 
     // 1. Readiness (interp.rs §7.1): first channel whose direction is unmet.
@@ -555,19 +642,23 @@ inline StepReport Instance::step(const FireInputs& in) {
     ov.taken.assign(chans_.size(), 0);
     ov.put.assign(chans_.size(), 0);
 
-    auto run_kind = [&](P::StageKind k) {
+    auto run_kind = [&](P::StageKind k, std::uint32_t layer) {
         for (const auto& s : trace_->stages)
-            if (s.kind == k) { exec_stage(s, 0, in, ov, rep); if (!rep.ok) return; }
+            if (s.kind == k) { exec_stage(s, layer, in, ov, rep); if (!rep.ok) return; }
     };
-    run_kind(P::StageKind::Prologue);
+    run_kind(P::StageKind::Prologue, 0);
     // Descriptor phase: ports peek (or take, for the token family) — advance the ring.
     for (const auto& p : trace_->ports) {
         if (p.is_const) continue;
         if (P::port_consumes(p.port)) { (void)resolve(ov, p.channel); ov.taken[p.channel] = 1; }
     }
-    run_kind(P::StageKind::OnAttnProj);
-    run_kind(P::StageKind::OnAttn);
-    run_kind(P::StageKind::Epilogue);
+    // Per-layer attention phases (OnAttnProj/OnAttn run once per decoder layer —
+    // the quest tap fires envelope_dot + attn_page_mask at layer 0 then 1).
+    for (std::uint32_t L = 0; L < num_layers_ && rep.ok; ++L) {
+        run_kind(P::StageKind::OnAttnProj, L);
+        run_kind(P::StageKind::OnAttn, L);
+    }
+    run_kind(P::StageKind::Epilogue, 0);
     if (!rep.ok) return rep;
 
     // 3. Pass-atomic commit: predicated per-channel index bump.

@@ -56,8 +56,32 @@ target_compile_definitions(mtpverify_test PRIVATE
 target_link_libraries(mtpverify_test PRIVATE
   ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
 
+# pentathlon_iter cross-backend cert (6-technique composition, 2 programs,
+# envelope_dot kernel host + sink assertions).
+add_executable(pentathlon_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm
+  pentathlon_test.mm)
+
+set_source_files_properties(
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir/metal_harness.mm pentathlon_test.mm
+  PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+target_include_directories(pentathlon_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ptir
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../cuda/src)
+
+target_compile_definitions(pentathlon_test PRIVATE
+  TIER0_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../interface/sampling-ir/tests/golden-ptir"
+  TIER0_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../ptir/kernels")
+
+target_link_libraries(pentathlon_test PRIVATE
+  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK} ${MPS_FRAMEWORK})
+
 enable_testing()
 add_test(NAME tier0_test COMMAND tier0_test)
 set_tests_properties(tier0_test PROPERTIES PASS_REGULAR_EXPRESSION "TIER0_TEST_OK")
 add_test(NAME mtpverify_test COMMAND mtpverify_test)
 set_tests_properties(mtpverify_test PROPERTIES PASS_REGULAR_EXPRESSION "MTPVERIFY_OK")
+add_test(NAME pentathlon_test COMMAND pentathlon_test)
+set_tests_properties(pentathlon_test PROPERTIES PASS_REGULAR_EXPRESSION "PENTATHLON_OK")

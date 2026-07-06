@@ -132,6 +132,7 @@ struct Op {
     Predicate  predicate;           // PivotThreshold / RankLe
     RngKind    rng_kind = RngKind::Gumbel;   // Gumbel
     std::uint32_t imm = 0;          // TopK k, Transpose axis pair, Iota len, …
+    std::uint16_t name_idx = 0;     // kernel_call / sink_call → index into Trace::names
 
     ValueId       result_id = 0;    // first SSA id this op defines
     std::uint32_t result_count = 1; // top_k / sort_desc → 2 (value, index)
@@ -159,10 +160,12 @@ struct Output {
     OutputKind kind = OutputKind::Token;
 };
 
-// The five attachment points (overview §5.3). Boundary stages run once per pass;
-// the anatomical taps (OnAttnProj/OnAttn) run once per layer.
+// The attachment points (overview §5.3). Boundary stages run once per pass;
+// the anatomical taps (OnAttnProj/OnAttn) run once per layer. Values MUST match
+// the wire encoding (registry.rs Stage): Prologue 0, OnAttnProj 1, OnAttn 2,
+// Epilogue 3 — no AttnMask stage (AttnMask is a Port, not a Stage).
 enum class StageKind : std::uint8_t {
-    Prologue = 0, OnAttnProj = 1, AttnMask = 2, OnAttn = 3, Epilogue = 4,
+    Prologue = 0, OnAttnProj = 1, OnAttn = 2, Epilogue = 3,
 };
 
 // One stage program: a straight-line SSA op DAG plus its channel effects and
@@ -215,6 +218,7 @@ struct Trace {
     std::vector<Channel>     channels;
     std::vector<PortBinding> ports;     // descriptor-port channel bindings
     std::vector<Stage>       stages;    // in attachment order
+    std::vector<std::string> names;     // kernel_call / sink_call name table
 
     const Value* value(ValueId id) const {
         for (const auto& v : values) if (v.id == id) return &v;

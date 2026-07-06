@@ -130,6 +130,7 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
     }
     for (const container::CPort& p : c.ports)
         t.ports.push_back({p.port, p.chan, p.is_const});
+    t.names = c.names;   // kernel_call / sink_call name table
 
     std::uint32_t global_base = 0;
     for (std::size_t si = 0; si < c.stages.size(); ++si) {
@@ -170,10 +171,31 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
                     stage.puts.push_back({(ChannelId)op.chan, gid(op.args[0])});
                     break;   // defines 0 ids
                 }
-                case PTIR_OP_SINK_CALL:
-                    break;   // no result; tier-0 without kernels ignores the sink effect
-                case PTIR_OP_KERNEL_CALL:
-                    return fail("kernel_call needs a second-party kernel (not tier-0 executable)");
+                case PTIR_OP_SINK_CALL: {
+                    // A named sink effect (results=0). Tier-0 executors that
+                    // provide sink hosts record name/args; the trace carries it.
+                    Op o; o.code = OpCode::SinkCall; o.result_count = 0;
+                    o.name_idx = op.name_idx;
+                    for (std::uint32_t a : op.args) o.args.push_back(gid(a));
+                    stage.ops.push_back(o);
+                    break;
+                }
+                case PTIR_OP_KERNEL_CALL: {
+                    // A named second-party kernel producing 1 value. The
+                    // executor supplies the kernel host (e.g. envelope_dot).
+                    Op o; o.code = OpCode::KernelCall; o.result_type = ty(local);
+                    o.result_id = gid(local); o.result_count = op.results;
+                    o.name_idx = op.name_idx;
+                    for (std::uint32_t a : op.args) o.args.push_back(gid(a));
+                    stage.ops.push_back(o);
+                    for (std::uint32_t rr = 0; rr < op.results; ++rr) {
+                        Value v; v.id = gid(local + rr); v.type = ty(local + rr);
+                        v.source = ValueSource::OpResult;
+                        t.values.push_back(v);
+                    }
+                    local += op.results;
+                    break;
+                }
                 default: {
                     // A compute op — its OpCode byte IS the tag (op_table mirrors ptir_abi).
                     if (!op_is_known(code)) return fail("unknown op tag in stage body");
@@ -184,7 +206,7 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
                     o.imm = op.imm;
                     o.rng_kind = op.kind ? RngKind::Gumbel : RngKind::Uniform;
                     o.predicate.tag = (PredTag)op.pred_tag;
-                    o.predicate.payload = op.pred_payload;
+                    o.predicate.payload = gid(op.pred_payload);   // value id (k/p/thr operand)
                     stage.ops.push_back(o);
                     // define result value(s)
                     for (std::uint32_t rr = 0; rr < op.results; ++rr) {
