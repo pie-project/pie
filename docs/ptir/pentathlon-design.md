@@ -112,11 +112,19 @@ Pure appendix ops. `am` is the amateur-logits channel (§2.4); λ, log α are
 let lse = log_softmax(intrinsics::logits());              // [rows, V] expert
 let lsa = log_softmax(am.take());                         // [rows, V] amateur
 let cd  = sub(lse, mul(LAMBDA, lsa));                     // contrastive score
-let plaus = ge(lse, add(broadcast(reduce_max(lse), SH), LOG_ALPHA));
-let ok  = and(plaus, gmask);                              // ∧ grammar mask
-let scored = select(ok, cd, NEG_INF_B);
+let lse_g = select(gmask, lse, NEG_INF);                  // grammar FIRST
+let plaus = ge(lse_g, add(broadcast(reduce_max(lse_g), SH), LOG_ALPHA));
+let scored = select(plaus, cd, NEG_INF);                  // α within legal set
 // expand: top_k(scored, B)   ·   rollout: picked = reduce_argmax(scored)
 ```
+
+**Composition-order pin (found BY the `pentathlon_iter` golden):** the
+plausibility max is taken over the **grammar-constrained** expert
+distribution, never the raw one — α against the unmasked max annihilates
+every legal token whenever the grammar masks the expert's peak (leaf B in the
+golden scored uniformly −inf in the first cut). Order: grammar → plausibility
+→ contrastive. The `-inf` fold makes the grammar∧plausibility conjunction one
+`select` + one `ge`.
 
 In the rollout the contrastive rule REPLACES the pick over the masked target
 distribution; the match-verify tail (`eq→cumprod→select`, golden
@@ -300,10 +308,18 @@ runtime/container plumbing — never the IR).
 ## 6. Implementation plan (post-§6.2/MTP landing)
 
 1. Mock-first: compose 2.1+2.2+2.3 in the tier-0 interpreter harness; golden
-   `pentathlon_iter` (one MCTS iteration, R=2, B=2, K=3, tiny DFA grammar,
-   host-fed amateur — a-host) — hand-checkable like `mtp_verify_tail`; plus a
-   `contrastive_pick` unit golden (CD + plausibility ∧ grammar at k rows).
-2. In-graph DFA demonstrator (G1) — same golden, mask channel deleted.
+   `pentathlon_iter` (one MCTS iteration, R=2, B=2, K=3, host-fed amateur —
+   a-host) — **DONE** (`tests/golden-ptir/pentathlon_iter.txt`): all six
+   techniques fire with designed, checkable decisions (contrastive demotion
+   in the beam, grammar-forced accept boundary, contrastive-broken draft
+   chain, per-layer quest sinks, value taps). It caught the §2.3 order pin.
+2. In-graph DFA demonstrator (G1) — **DONE**
+   (`tests/golden-ptir/dfa_ingraph.txt`): allow/next tables in seeded
+   read-only device channels, state a [1] ping-pong, mask row =
+   `gather(allow, state)`, walk = `gather(next, state·V + picked)`. The
+   readiness table shows ZERO host-writer channels — the grammar edge is
+   deleted; three steps force 2→3→0 against adversarial logits. (Trace-level
+   large constants remain a container-v1.1 nicety; seeded channels suffice.)
 3. CUDA: no new kernels; run the identities under the quorum scheduler;
    measure the §3 probe set + the G6 amateur-edge probes at R ∈ {8, 32, 128}
    on Qwen3-0.6B (amateur = context-truncated same-model, a-host form).
