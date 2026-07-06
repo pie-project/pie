@@ -283,6 +283,32 @@ void test_decoder_layer(MetalHarness& h) {
     check_tol("decoder_layer (full Qwen3-0.6B layer, N=5)", out, want, 5e-3);
 }
 
+void test_embed_lmhead(MetalHarness& h) {
+    // Embedding gather (tied weights: lm_head aliases embed) + LM head matmul.
+    const int N = 4, hidden = A::HIDDEN, vocab = 128;  // reduced vocab for the harness
+    auto embed = rand_vec((std::size_t)vocab * hidden, 201);
+    std::vector<std::int32_t> tokens = {5, 100, 0, 63};
+
+    // embedding
+    auto want_emb = qwen3::ref::embedding(embed, tokens, hidden);
+    std::vector<float> got_emb((std::size_t)N * hidden, 0.0f);
+    int hd = hidden; std::uint32_t total = (std::uint32_t)(N * hidden);
+    std::vector<Arg> ea = {Arg::in(embed.data(), embed.size() * 4),
+                           Arg::in(tokens.data(), tokens.size() * 4),
+                           Arg::out(got_emb.data(), got_emb.size() * 4),
+                           Arg::in(&hd, 4), Arg::in(&total, 4)};
+    if (!h.run("embedding", ea, total)) { std::printf("  FAIL embedding: %s\n", h.error().c_str()); ++g_fail; return; }
+    check_tol("embedding (gather, tied)", got_emb, want_emb, 0.0);  // exact gather
+
+    // LM head: logits = hidden_states @ embedᵀ (tied). Use a random hidden state.
+    auto hs = rand_vec((std::size_t)N * hidden, 202);
+    auto want_logits = qwen3::ref::matmul_xwt(hs, embed, N, vocab, hidden);
+    Chain ch{h};
+    auto got_logits = ch.matmul(hs, embed, N, vocab, hidden);
+    if (!ch.ok) { std::printf("  FAIL lm_head: %s\n", h.error().c_str()); ++g_fail; return; }
+    check_tol("lm_head (logits = hidden @ embedᵀ, tied)", got_logits, want_logits, 1e-3);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -302,6 +328,7 @@ int main(int argc, char** argv) {
     test_swiglu(h);
     test_prefill_attention(h);
     test_decoder_layer(h);
+    test_embed_lmhead(h);
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     if (g_fail == 0) { std::printf("QWEN3_TEST_OK\n"); return 0; }
     std::printf("QWEN3_TEST_FAIL\n");

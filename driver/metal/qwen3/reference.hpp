@@ -187,4 +187,15 @@ inline std::vector<float> decoder_layer(const std::vector<float>& x,
     return out;
 }
 
+// Token embedding gather: out[n,:] = embed[token_ids[n], :]. embed is [vocab,hidden].
+inline std::vector<float> embedding(const std::vector<float>& embed,
+                                    const std::vector<std::int32_t>& token_ids, int hidden) {
+    std::vector<float> out(token_ids.size() * hidden);
+    for (std::size_t n = 0; n < token_ids.size(); ++n) {
+        const std::size_t s = static_cast<std::size_t>(token_ids[n]) * hidden;
+        for (int j = 0; j < hidden; ++j) out[n * hidden + j] = embed[s + j];
+    }
+    return out;
+}
+
 }  // namespace qwen3::ref

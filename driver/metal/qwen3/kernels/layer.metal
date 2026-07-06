@@ -145,3 +145,18 @@ kernel void add_inplace(
     if (gid >= n) return;
     a[gid] = a[gid] + b[gid];
 }
+
+// ── embedding: x[n,:] = embed[token_ids[n], :]  (gather). grid = N*hidden. ────
+kernel void embedding(
+    device const float* embed      [[buffer(0)]],   // [vocab, hidden]
+    device const int*   token_ids  [[buffer(1)]],   // [N]
+    device float*       out        [[buffer(2)]],   // [N, hidden]
+    constant int&       hidden     [[buffer(3)]],
+    constant uint&      total      [[buffer(4)]],   // N * hidden
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= total) return;
+    const int n = (int)(gid / (uint)hidden);
+    const int j = (int)(gid % (uint)hidden);
+    const int tok = token_ids[n];
+    out[gid] = embed[(ulong)tok * hidden + j];
+}
