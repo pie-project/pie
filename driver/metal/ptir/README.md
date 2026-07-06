@@ -72,10 +72,31 @@ clang++ -std=c++17 -fobjc-arc -O2 -DPTIR_KERNELS_DIR="\"$PWD/kernels\"" \
   -framework Metal -framework Foundation -o ptir_metal_test && ./ptir_metal_test
 ```
 
-## Golden wiring (pending echo)
+## Golden certification (cross-backend oracle)
 
-The CPU reference is the **interim** oracle. Once echo's value/output golden
-vector files land (e.g. `matrix_mask_apply_packed`, matrix `dselect`,
-`broadcast_matrix(neg_inf,k,vocab)`), a golden reader will assert
-`CPU-reference == golden bytes`, closing the loop so Metal is certified against
-the exact same bytes CUDA consumes.
+`ptir_golden_cert` proves the Metal ops are bit-exact to echo's golden vectors —
+the SAME files gating CUDA (`interface/sampling-ir/tests/golden-ptir/*.txt`). It
+**reuses charlie's CUDA-free PTIR decoder** (`driver/cuda/src/ptir/container.hpp`)
+so the decode matches CUDA exactly, then for each golden:
+
+1. decodes the container hex and asserts `container_hash == the golden's identity
+   hash` (⇒ running the exact same program bytes as CUDA);
+2. asserts the decoded op-tag sequence matches the expected program;
+3. feeds the golden's OWN inputs — including the **1-byte host-Bool mask** — runs
+   the Metal ops, and matches the expected `take` bytes.
+
+Certified: **`matrix_select_mask`** — `select(host-Bool mask, logits[4,8], -inf)`
+→ per-row argmax → `I32([2,3,4,5])`, byte-exact. `beam_epilogue` is decoded +
+identity-verified (16 channels, 82 ops); its behavioral exec (top_k / log_softmax
+/ geometry gathers+scatters over a 16-channel multi-step runner) is the staged
+follow-on.
+
+### (B) host-Bool contract (BYTECODE.md §5)
+
+A **host-bound** `Bool` input is **1 byte** on the wire and device (`u8`, `0`=false,
+nonzero=true); shaders read the byte and widen in-register (`!= 0`). `Phys::F32`-for-
+Bool is JIT-internal only, never a host input. Metal matches CUDA's `k_select`
+(`const uint8_t* cond`, `cond[i] ? a : b`): `dselect_f32` takes `device const uchar*
+cond` and selects on `cond[ic] != 0`. The `matrix_select_mask` cert exercises this
+with the golden's real host-Bool bytes — the exact check that catches a Bool-dtype
+mismatch.

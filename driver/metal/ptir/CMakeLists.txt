@@ -37,7 +37,31 @@ target_compile_definitions(ptir_metal_test PRIVATE
 target_link_libraries(ptir_metal_test PRIVATE
   ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
 
+# Cross-backend golden cert: reuses charlie's CUDA-free PTIR decoder
+# (driver/cuda/src/ptir/container.hpp) to verify container identity, then runs
+# the Metal ops against echo's golden vectors.
+add_executable(ptir_golden_cert
+  metal_harness.mm
+  ptir_golden_cert.mm)
+
+set_source_files_properties(
+  metal_harness.mm ptir_golden_cert.mm
+  PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+target_include_directories(ptir_golden_cert PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../cuda/src")
+
+target_compile_definitions(ptir_golden_cert PRIVATE
+  PTIR_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels"
+  PTIR_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../interface/sampling-ir/tests/golden-ptir")
+
+target_link_libraries(ptir_golden_cert PRIVATE
+  ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+
 enable_testing()
 add_test(NAME ptir_metal_test COMMAND ptir_metal_test)
 set_tests_properties(ptir_metal_test PROPERTIES
   PASS_REGULAR_EXPRESSION "PTIR_METAL_TEST_OK")
+add_test(NAME ptir_golden_cert COMMAND ptir_golden_cert)
+set_tests_properties(ptir_golden_cert PROPERTIES
+  PASS_REGULAR_EXPRESSION "PTIR_GOLDEN_CERT_OK")
