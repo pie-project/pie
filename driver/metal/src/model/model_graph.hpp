@@ -93,6 +93,12 @@ public:
     virtual Tensor forward(const ForwardBatch& batch, KvCacheView& kv) = 0;
 
     virtual const ModelConfig& config() const = 0;
+
+    // The pre-final-norm backbone hidden state at the logit rows from the most
+    // recent forward() — the input an MTP/EAGLE draft head consumes. Empty by
+    // default; graphs that support MTP drafting override it. Not part of the
+    // decode fast-path.
+    virtual Tensor last_hidden() const { return Tensor({}); }
 };
 
 // Data-driven factory: switches on `cfg.arch` to construct the right concrete

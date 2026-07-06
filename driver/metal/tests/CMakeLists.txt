@@ -10,3 +10,7 @@ target_link_libraries(decode_bench PRIVATE pie_driver_metal_lib)
 
 add_executable(kv_perlayer_test kv_perlayer_test.cpp)
 target_link_libraries(kv_perlayer_test PRIVATE pie_driver_metal_lib)
+
+# Real MTP speculative decoding on Metal (Qwen3.5-0.8B GDN backbone + MTP head).
+add_executable(qwen35_mtp qwen35_mtp.cpp)
+target_link_libraries(qwen35_mtp PRIVATE pie_driver_metal_lib)

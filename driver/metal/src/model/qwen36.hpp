@@ -41,6 +41,7 @@ public:
 
     Tensor forward(const ForwardBatch& batch, KvCacheView& kv) override;
     const ModelConfig& config() const override { return cfg_; }
+    Tensor last_hidden() const override { return last_hidden_; }
 
 private:
     // Standard Qwen3 paged-attention block with the output gate + partial RoPE.
@@ -56,6 +57,9 @@ private:
     ModelConfig  cfg_;
     ModelWeights w_;
     ArchSpec     spec_;
+    // Pre-final-norm hidden at the logit rows from the most recent forward()
+    // (the MTP draft-head input). Populated in forward().
+    Tensor last_hidden_ = Tensor({});
 };
 
 }  // namespace pie_metal_driver::model

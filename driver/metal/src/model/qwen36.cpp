@@ -294,10 +294,14 @@ Tensor Qwen36Graph::forward(const ForwardBatch& batch, KvCacheView& kv) {
         maybe_dump_hidden(il + 1, hidden);  // HF output_hidden_states[il+1]
     }
 
+    Tensor pre_norm_hidden = hidden;  // MTP head input (before the final norm)
     hidden = ops::rms_norm(hidden, w_.final_norm, eps, /*plus_one=*/true);
     dump_kernel(-1, "final_norm", hidden);
     maybe_dump_hidden(-1, hidden);  // post-final-norm (pre-LM-head)
     Tensor sampled = ops::gather_rows(hidden, batch.logit_rows);
+
+    // MTP draft head consumes the PRE-final-norm hidden at the logit rows.
+    last_hidden_ = ops::gather_rows(pre_norm_hidden, batch.logit_rows);
 
     Tensor logits = w_.lm_head
         ? apply_linear(*w_.lm_head, sampled)   // [n_slots, vocab]
