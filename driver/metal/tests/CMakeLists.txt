@@ -22,3 +22,7 @@ target_link_libraries(qwen35_mtp_bench PRIVATE pie_driver_metal_lib)
 # High-concurrency throughput sweep: regular batched vs MTP spec-decode.
 add_executable(qwen35_tput_bench qwen35_tput_bench.cpp)
 target_link_libraries(qwen35_tput_bench PRIVATE pie_driver_metal_lib)
+
+# General decode-path throughput (greedy/temp/top-k/top-p/min-p/grammar) under concurrency.
+add_executable(qwen35_decode_tput qwen35_decode_tput.cpp)
+target_link_libraries(qwen35_decode_tput PRIVATE pie_driver_metal_lib)
