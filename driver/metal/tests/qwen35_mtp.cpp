@@ -195,6 +195,27 @@ int main(int argc, char** argv) {
                 accepted, total, 100.0 * accepted / std::max(1, total));
     std::printf("  generated tokens:");
     for (int t : gen) std::printf(" %d", t);
-    std::printf("\n%s\n", accepted > 0 ? "QWEN35_MTP_OK" : "QWEN35_MTP_FAIL");
+    std::printf("\n");
+
+    // Cross-check vector for the CUDA Qwen3.5 MTP run (4090): identical prompt +
+    // weights → compare acceptance + generated sequence.
+    if (const char* gp = std::getenv("MTP_GOLDEN")) {
+        std::FILE* f = std::fopen(gp, "w");
+        if (f) {
+            std::fprintf(f, "# Qwen3.5-0.8B MTP spec-decode cross-check (Metal) — run CUDA on same input\n");
+            std::fprintf(f, "model: Qwen/Qwen3.5-0.8B (main), model.safetensors total_size=1746882752 BF16\n");
+            std::fprintf(f, "backend: Metal (Apple M1 Max, MLX 0.31.2 GDN backbone) + real mtp.* head, f32 head compute\n");
+            std::fprintf(f, "draft_depth_K: 1 (mtp_num_hidden_layers=1)\n");
+            std::fprintf(f, "prompt_ids:");
+            for (int t : toks) std::fprintf(f, " %d", t);
+            std::fprintf(f, "\nsteps: %d\naccepted: %d\nacceptance_pct: %.1f\n", total, accepted, 100.0 * accepted / std::max(1, total));
+            std::fprintf(f, "generated_ids:");
+            for (int t : gen) std::fprintf(f, " %d", t);
+            std::fprintf(f, "\nnote: greedy verify — deterministic. Match acceptance + generated_ids on CUDA Qwen3.5 MTP for cross-parity.\n");
+            std::fclose(f);
+            std::printf("  cross-check golden written: %s\n", gp);
+        }
+    }
+    std::printf("%s\n", accepted > 0 ? "QWEN35_MTP_OK" : "QWEN35_MTP_FAIL");
     return accepted > 0 ? 0 : 1;
 }
