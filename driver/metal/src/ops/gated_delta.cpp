@@ -350,6 +350,71 @@ GdnResult gated_delta_net_prefill(const Tensor& mixed_qkv,
     return GdnResult{result, state_out};
 }
 
+GdnCheckpointResult gated_delta_net_prefill_checkpointed(
+    const Tensor& mixed_qkv,
+    const Tensor& z,
+    const Tensor& a,
+    const Tensor& b,
+    const Tensor& conv_w,
+    const std::optional<Tensor>& conv_b,
+    const Tensor& A_log,
+    const Tensor& dt_bias,
+    const Tensor& gate_norm_w,
+    const GdnState& state_in,
+    const GdnParams& p) {
+    // Identical scan to gated_delta_net_prefill, but retains every intermediate
+    // state (recurrent + conv) as a checkpoint and persists NOTHING (the caller
+    // commit-advances by selecting S[commit_len]). Same recurrent_step op order
+    // ⇒ checkpoint m is bit-identical to a clean prefill of the first m tokens.
+    const int T = mixed_qkv.shape(0);
+    const int Kc = p.conv_kernel;
+    const int conv_dim = conv_dim_of(p);
+    const int Vh = p.n_heads_v, Kd = p.head_k, Vd = p.head_v;
+
+    Tensor xseq = mx::astype(mixed_qkv, mx::float32);            // [T, conv_dim]
+    Tensor cstate = mx::reshape(mx::astype(state_in.conv_state, mx::float32),
+                                {Kc, conv_dim});
+    Tensor ctx = mx::slice(cstate, {1, 0}, {Kc, conv_dim});     // [Kc-1, conv_dim]
+    Tensor padded = mx::concatenate({ctx, xseq}, /*axis=*/0);
+    Tensor y = conv_causal_silu(padded, conv_w, conv_b, Kc);    // [T, conv_dim]
+    Tensor full = mx::concatenate({cstate, xseq}, /*axis=*/0);  // [Kc+T, conv_dim]
+
+    // conv checkpoints: C_m = the last Kc rows of (cstate ++ xseq[0:m]) = full[m:m+Kc].
+    std::vector<Tensor> conv_ck;
+    conv_ck.reserve(T + 1);
+    for (int m = 0; m <= T; ++m)
+        conv_ck.push_back(mx::reshape(mx::slice(full, {m, 0}, {m + Kc, conv_dim}),
+                                      {1, Kc, conv_dim}));
+
+    Prepped pr = prep_qkvg(y, a, b, A_log, dt_bias, p);
+
+    Tensor state = mx::reshape(mx::astype(state_in.recurrent_state, mx::float32),
+                               {1, Vh, Kd, Vd});
+    std::vector<Tensor> recur_ck;   // S_0 .. S_T
+    recur_ck.reserve(T + 1);
+    recur_ck.push_back(state);      // S_0 = pre-window (committed) state
+    std::vector<Tensor> outs;
+    outs.reserve(T);
+    for (int t = 0; t < T; ++t) {
+        Tensor qt = mx::reshape(mx::slice(pr.q, {t, 0, 0}, {t + 1, Vh, Kd}), {1, Vh, Kd});
+        Tensor kt = mx::reshape(mx::slice(pr.k, {t, 0, 0}, {t + 1, Vh, Kd}), {1, Vh, Kd});
+        Tensor vt = mx::reshape(mx::slice(pr.v, {t, 0, 0}, {t + 1, Vh, Vd}), {1, Vh, Vd});
+        Tensor gt = mx::reshape(mx::slice(pr.g, {t, 0}, {t + 1, Vh}), {1, Vh});
+        Tensor bt = mx::reshape(mx::slice(pr.beta, {t, 0}, {t + 1, Vh}), {1, Vh});
+        auto [ns, ot] = recurrent_step(state, qt, kt, vt, gt, bt);
+        state = ns;
+        recur_ck.push_back(state);  // S_{t+1}
+        outs.push_back(ot);
+    }
+    Tensor out = mx::concatenate(outs, /*axis=*/0);
+    Tensor result = rmsnorm_gated(out, z, gate_norm_w, p.norm_eps);
+
+    return GdnCheckpointResult{
+        result,
+        mx::concatenate(recur_ck, /*axis=*/0),  // [T+1, Vh, Kd, Vd]
+        mx::concatenate(conv_ck, /*axis=*/0)};  // [T+1, Kc, conv_dim]
+}
+
 Tensor gated_delta_net_varlen(const Tensor& mixed_qkv,
                               const Tensor& z,
                               const Tensor& a,

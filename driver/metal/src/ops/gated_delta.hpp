@@ -103,6 +103,36 @@ GdnResult gated_delta_net_prefill(const Tensor& mixed_qkv,
                                   const GdnState& state_in,
                                   const GdnParams& params);
 
+// ── Speculative-decode support: frozen-verify + commit-advance (GDN rewind) ──
+// The recurrent state is an irreversible fold, so spec-decode must NOT advance
+// the persisted state over uncommitted drafts. This variant scans the T-token
+// window like `gated_delta_net_prefill` but (a) persists NOTHING, and (b) emits
+// the per-token intermediate state CHECKPOINTS. The caller then commit-advances
+// by selecting the checkpoint at the accepted-prefix boundary (S[commit_len]) —
+// device gather-by-value (or a static slice when commit_len is host-known) — and
+// writes only THAT back. See wiki `ptir-metal-gdn-rewind-design`.
+//   recur_ckpts : [T+1, V_h, K_d, V_d] fp32 — S_0 (pre-window) .. S_T (full)
+//   conv_ckpts  : [T+1, conv_K, conv_dim]   — C_0 .. C_T (conv window per boundary)
+// Checkpoint m is bit-identical to the state a clean prefill of the first m
+// window tokens would produce (same recurrent_step op sequence) — lossless.
+struct GdnCheckpointResult {
+    Tensor output;       // [T, V_dim]   (correct draft-position outputs)
+    Tensor recur_ckpts;  // [T+1, V_h, K_d, V_d] fp32
+    Tensor conv_ckpts;   // [T+1, conv_K, conv_dim]
+};
+GdnCheckpointResult gated_delta_net_prefill_checkpointed(
+    const Tensor& mixed_qkv,
+    const Tensor& z,
+    const Tensor& a,
+    const Tensor& b,
+    const Tensor& conv_w,
+    const std::optional<Tensor>& conv_b,
+    const Tensor& A_log,
+    const Tensor& dt_bias,
+    const Tensor& gate_norm_w,
+    const GdnState& state_in,
+    const GdnParams& params);
+
 // Cache-bound variable-length entry for a ragged batch (mixed prefill/decode).
 // `qo_indptr` [R+1] gives each request's token span into the packed
 // `mixed_qkv`/`z`/`a`/`b` (token-major, requests contiguous); `slot_ids` [R]

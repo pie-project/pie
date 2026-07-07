@@ -44,3 +44,8 @@ target_link_libraries(qwen35_decode_tput PRIVATE pie_driver_metal_lib)
 # window mx::array carrier + back-to-back async_eval; committed==greedy gate.
 add_executable(mtp_device_resident mtp_device_resident.cpp)
 target_link_libraries(mtp_device_resident PRIVATE pie_driver_metal_lib)
+
+# GDN frozen-checkpointed scan — the core of the GDN spec-decode rewind:
+# checkpoint m == clean sub-forward of the first m tokens (lossless commit-advance).
+add_executable(gdn_checkpoint_test gdn_checkpoint_test.cpp)
+target_link_libraries(gdn_checkpoint_test PRIVATE pie_driver_metal_lib)
