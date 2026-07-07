@@ -72,8 +72,14 @@ Reject magic ≠ `"PSIR"` or `version != 4`.
 
 ### 2.2 InputDecl record
 
-`dtype:u8 | shape:Shape` — a **typed input slot** (no binding). Slot `i` is
-referenced by `op-kind input(i)` / [`Op::Input`]`(i)`.
+`dtype:u8 | shape:Shape` — a **typed input slot**. Slot `i` is referenced by
+`op-kind input(i)` / [`Op::Input`]`(i)`. **Bit 7 of the `dtype` byte is the
+readiness flag** (DType tags are `0..=3`, so the high bit is free): clear ⇒
+`Submit`, set (`tag | 0x80`) ⇒ `Late` (the value is injected per-fire before its
+first consuming op — e.g. a grammar mask computed post-logits). **Additive:** v4
+bytecode never set the bit, so it decodes as `Submit`; a Late-input program is a
+distinct recognized shape (it rides the bytecode `program_hash` hashes over). The
+*source* binding (logits vs a host tensor) is still attach-time.
 
 ### 2.3 Op record
 
@@ -118,8 +124,10 @@ two consecutive ids, value-first (`r` = sorted F32 `[n]`, `r+1` = indices U32
 | `0x62`/`0x63`| `ScatterAdd/Set` | `base:u32, idx:u32, vals:u32`   | 1 | `[base.len]`, dtype=base |
 | `0x70`| `Rng`          | `stream:u32, shape:Shape, kind:u8`    | 1 | `{shape, F32}` |
 
-`Predicate` (5 bytes): `tag:u8 | payload:u32` — RankLe `payload`=`k` immediate;
-CummassLe/ProbGe `payload`= a Scalar-F32 value id. "drop-last" = last axis removed.
+`Predicate` (5 bytes): `tag:u8 | payload:u32` — `payload` is a **value id** for all
+three: RankLe = a Scalar/`[rows]`-`U32` `k`; CummassLe/ProbGe = a Scalar/`[rows]`-F32
+threshold. (#25: `k` is host-submit like top-p `p`, so top-k bytecode is k-invariant.)
+"drop-last" = last axis removed.
 
 ---
 
@@ -129,8 +137,8 @@ CummassLe/ProbGe `payload`= a Scalar-F32 value id. "drop-last" = last axis remov
   `GatherRow` FILL-0 an out-of-range index.
 - **`CummassLe(p)`** = inclusive nucleus (keep token iff exclusive prefix mass
   `< p`); **`ProbGe`** inclusive `>=`; **`RankLe(k)`** ties → lower index. For a
-  matrix input the threshold operand may be a shared **scalar** *or* a per-row
-  **`[rows]`** vector (one threshold per row — batched top-p/min-p).
+  matrix input the `k`/threshold operand may be a shared **scalar** *or* a per-row
+  **`[rows]`** vector (one `k`/threshold per row — batched top-k/top-p/min-p).
 - **RNG (ambient seed + static stream):** no seed operand; the per-fire seed `S`
   is the runtime's per-row `sample_seed`, folded by codegen. `stream` decorrelates
   multiple `Rng` ops. `splitmix64(x): x^=x>>27; x*=0x3C79AC492BA7B653; x^=x>>33;
@@ -155,7 +163,18 @@ CummassLe/ProbGe `payload`= a Scalar-F32 value id. "drop-last" = last axis remov
   lift a `[m]` to `[m,n]` with `Broadcast` first.
 - **Binding & late-bind (attach-time):** binding (logits / tensor key / submit-
   late readiness) is supplied at the forward-pass attach, per input slot — not in
-  the bytecode. For a slot bound to a *late* tensor, `input_first_use(program,
+  the bytecode. **A host binding MUST cover the input decl's full extent**: the
+  bound tensor's byte length equals `numel(decl.shape) × dtype_size(decl.dtype)`
+  (a `[k, n]` matrix decl means k FULL rows). The runtime/executor rejects a
+  short binding loudly at bind/fire time — it never launches; a silently short
+  matrix input (e.g. a 2-row grammar mask against a `[4, vocab]` decl) is
+  undefined on-device behavior (the §6.1 psir_k0 OOB incident, 2026-07-05).
+  **Bool host inputs are 1-byte** (u8; 0 = false, nonzero = true) on the wire
+  AND on device — `dtype_size(Bool) = 1` on both sides of the guard; kernels
+  read the byte and widen in-register (the bf16-logits precedent). F32 storage
+  for Bool is only ever a JIT-internal choice for its OWN intermediates, never
+  assumed for host-bound inputs. (Direction per D1 stays packed bits; the
+  1-byte native read is the compatible step.) For a slot bound to a *late* tensor, `input_first_use(program,
   index)` gives the first consuming op = the runtime's inject-before barrier
   (miss = skip).
 - **Output-kind ⟂ dtype:** `Token` ⇒ integer value; every other kind ⇒ F32; a

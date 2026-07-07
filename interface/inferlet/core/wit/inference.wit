@@ -1,9 +1,8 @@
 interface inference {
     use types.{error};
-    use context.{context};
     use adapter.{adapter};
-    use model.{tokenizer};
     use media.{image, audio};
+    use working-set.{kv-working-set, rs-working-set};
     use tensor.{tensor, program};
 
     type brle = list<u32>;
@@ -11,53 +10,168 @@ interface inference {
     variant input-binding {
         /// Forward-pass output positions whose logits are bound to this input.
         /// Shape `[vocab]` for one position, or `[len(positions), vocab]` for
-        /// multiple. Multiple samplers may name overlapping positions; the
-        /// runtime may coalesce the underlying logit computation. A `logits`
-        /// binding's positions are the pass's sampling positions.
+        /// multiple. A `logits` binding's positions are the pass's sampling
+        /// positions.
         logits(list<u32>),
+        /// Bind this input to the model's multi-token-prediction (MTP) logits
+        /// for the pass's sampling positions.
+        mtp-logits,
+        /// Bind this input to the model's multi-token-prediction (MTP) draft
+        /// token ids for the pass's sampling positions. Device-resident `[k]`
+        /// i32 tokens — the drafts channel consumed by device-side spec-decode
+        /// verify (no host round-trip).
+        mtp-drafts,
         /// A device tensor bound to a program input slot (a per-fire value,
-        /// mask, etc.). MVP (sync interface): all tensor bindings are
-        /// **submit** — the host gathers the tensor's data at `execute()`,
-        /// after the inferlet's `from-data`/`write` (so the value must be
-        /// written before `execute()`). Late binding (a value produced by a
-        /// prior pass's `next-*` output, injected before its consuming region)
-        /// is the async-pipeline (WS8) concern and is not expressed here.
+        /// mask, etc.). Submit-bound tensors are gathered at `execute()`;
+        /// late-bound values are written via `tensor.write` before the
+        /// consuming region (the run-ahead late channel).
         tensor(tensor),
     }
 
+    // ── Forward-pass memory contract (explicit read/write descriptors) ──────
+    // A forward pass READS its declared context tokens and WRITES only its
+    // declared output range. No ambient context handle, no implicit append.
+    // The runtime CoWs every write target before driver submission.
+
     resource forward-pass {
         constructor();
-        context: func(context: borrow<context>);
-        input-tokens: func(tokens: list<u32>, positions: list<u32>);
-        input-image: func(image: borrow<image>, anchor: u32);
-        input-audio: func(audio: borrow<audio>, anchor: u32);
-        attention-mask: func(mask: list<brle>);
+
+        /// KV working-set contract (merged read-context + write). Reads the
+        /// half-open relative span `[inp-start, inp-start + inp-len)` of `set`,
+        /// of which the first `valid-tokens` participate in attention. Writes
+        /// the contiguous relative range
+        /// `[output-start, output-start + output-len)`; `offset` is the in-page
+        /// token offset of the first written row. The inferlet owns correctness
+        /// (no generation guard — vacuous under a contiguous range).
+        kv-working-set: func(
+            set: borrow<kv-working-set>,
+            inp-start: u32,
+            inp-len: u32,
+            valid-tokens: u32,
+            output-start: u32,
+            output-len: u32,
+            offset: u32,
+        );
+
+        /// RS (recurrent-state) working-set contract (merged read + write):
+        /// `len-tokens` buffered tokens starting at buffered token offset
+        /// `start-token` of `set`.
+        rs-working-set: func(
+            set: borrow<rs-working-set>,
+            start-token: u32,
+            len-tokens: u32,
+        );
+
+        /// Fold the first `tokens` buffered recurrent-state tokens of this
+        /// pass's RS working set into its folded state as part of this forward.
+        /// `tokens` must be a positive multiple of the model's fold granularity
+        /// and within the buffered suffix. No rollback across a fold.
+        rs-fold-buffered: func(tokens: u32);
+
+        input-tokens: func(
+            tokens: list<u32>,
+            positions: list<u32>,
+        );
+
+        /// Splice an encoded visual span (image or video clip) at sequence
+        /// position `anchor`.
+        input-image: func(
+            image: borrow<image>,
+            anchor: u32,
+        );
+
+        /// Splice an encoded audio clip at sequence position `anchor`.
+        input-audio: func(
+            audio: borrow<audio>,
+            anchor: u32,
+        );
+
+        /// enabled by default
+        output-speculative-tokens: func(flag: bool);
+
+        /// if not provided, fallback to causal mask
+        attention-mask: func(
+            mask: list<brle>,
+        );
+
         /// Attach one tensor program as the sampler. Binding `i` supplies the
-        /// program input at index `i`. Result tensors follow the program's
-        /// declared output order.
-        sampler: func(program: borrow<program>, inputs: list<input-binding>);
-        /// Attach multiple tensor programs as samplers. `inputs[i]` supplies the
-        /// positional bindings for `programs[i]`. Output order mirrors `programs`.
-        batch-sampler: func(programs: list<borrow<program>>, inputs: list<list<input-binding>>);
-        adapter: func(adapter: borrow<adapter>);
+        /// program input at index `i`. The program's output is returned by
+        /// `output()` / `outputs()` as a raw tensor.
+        sampler: func(
+            program: borrow<program>,
+            inputs: list<input-binding>,
+        );
 
-        /// -- pipelining primitives ---------------------
-        /// Feed an i32 token/id vector produced by a sampler into the next pass.
-        /// Uses the first tensor output of the first sampler; lanes with the
-        /// sentinel value `-1` are ignored.
-        next-input: func(positions: list<u32>);
+        /// Attach multiple tensor programs as samplers. `inputs[i]` supplies
+        /// the positional bindings for `programs[i]`; outputs mirror `programs`.
+        samplers: func(
+            programs: list<borrow<program>>,
+            inputs: list<list<input-binding>>,
+        );
+
+        adapter: func(
+            adapter: borrow<adapter>,
+        );
+
+        /// Run-ahead carrier (§2.1). Declares that the NEXT forward pass on
+        /// this context carries THIS pass's sampled token(s) into the given
+        /// `positions` — ROW SLOTS in the next pass's dense `pi.tokens` row
+        /// array (the decode rows the carrier overwrites pre-forward), NOT
+        /// sequence positions and NOT KV-slot indices. For single-sequence
+        /// decode this is `[0]` (row 0); for a batch of B sequences, `[0..B)`.
+        /// The guest names only these destination rows; everything else is
+        /// host-owned:
+        /// - the SOURCE row in this pass is HOST-computed (prefill → last row
+        ///   `n-1`, single-row decode → row 0, batched → per-sequence sampled
+        ///   rows), never threaded by the guest;
+        /// - the CONSUMER is IMPLICIT — the next pass submitted on this context,
+        ///   which supplies a placeholder `input-tokens([0], [pos])` at each
+        ///   destination row; the carrier overwrites `pi.tokens[row]` before
+        ///   that forward from this pass's retained sample;
+        /// - the carry is SCOPED to the PRODUCING context — a pass submitted on
+        ///   a different context drops a still-pending carry (a terminal
+        ///   producer with no consumer must not leak its retained token into
+        ///   another context's prefill);
+        /// - the dependency (the consumer firing a strictly-later batch) is a
+        ///   host accumulate keyed on the carrier link — no guest ordering signal.
+        next-inputs: func(positions: list<u32>);
+
+        /// Run-ahead carrier retain-SOURCE tag for the `next-inputs` window of
+        /// THIS pass (ratified drafts-channel carrier-kind). Selects which device
+        /// buffer the host retains into the carrier destinations:
+        ///   0 = `prev-sample` (default) — `pi.sampled` (the shipped single-token
+        ///       decode carry; byte-identical to today when unset);
+        ///   1 = `prev-drafts` — the MTP `[k+1]` `[seed, drafts]` per-link COPY
+        ///       buffer (`mtp_drafts` retain). Additive `u8` tag on the existing
+        ///       `pipeline-source-link`; no layout change. Emitted alongside the
+        ///       multi-slot `next-inputs` window (slots `0..=k`).
+        set-pipeline-source-kind: func(kind: u8);
+
+        /// Run-ahead carrier: the attention mask (BRLE per row) for the next
+        /// forward, supplied ahead of this pass's sampled token.
         next-attention-mask: func(mask: list<brle>);
-        next-adapter: func(adapter: borrow<adapter>);
 
-        /// Submit. Tensor inputs referenced by samplers must be ready before
-        /// their first consuming compiled region executes.
+        /// Run-ahead generate-start signal (#26). Marks this pass as the FIRST
+        /// forward of a fresh `generate()` on its context. Before this pass's
+        /// carrier inject, the host drops any carrier still PENDING on this
+        /// context from a prior generate — the stop-terminal residual the loop's
+        /// count-predictable max-boundary omit cannot foresee (a stop is known
+        /// only post-sample, after `next-inputs` was already emitted) — and frees
+        /// its retained device buffer. Fires at most once per generate; the host
+        /// derives the context from this pass's `kv-working-set`. Flag only — the
+        /// carrier destinations declared on this pass are unaffected.
+        fresh-generate: func();
+
+        /// Eager submit (synchronous): enqueue this pass's forward work. Await
+        /// the result via `output()` / `outputs()`.
         execute: func();
-        /// Single-sampler output tensors (waits for completion). Follows the
-        /// program's declared output order.
-        output: func() -> result<list<tensor>, error>;
-        /// Batch-sampler output tensors. Outer list follows `batch-sampler.programs`;
-        /// each inner list follows that program's declared output order.
-        outputs: func() -> result<list<list<tensor>>, error>;
+
+        /// The output tensor of a single-sampler pass. Awaits the fire; the
+        /// dtype/shape follow the program's declared output value.
+        output: async func() -> result<tensor, error>;
+
+        /// The output tensors of a multi-sampler pass, in `samplers` order.
+        outputs: async func() -> result<list<tensor>, error>;
     }
 
     /// Describes the structure that the LLM output must conform to.
@@ -85,16 +199,20 @@ interface inference {
     /// The host compiles the grammar on construction and may cache the
     /// compiled result internally.
     resource matcher {
-        /// Create a new matcher from a grammar and tokenizer.
-        constructor(grammar: borrow<grammar>, tokenizer: borrow<tokenizer>);
+        /// Create a new matcher from a grammar.
+        constructor(grammar: borrow<grammar>);
 
         /// Accept one or more decoded tokens, advancing the matcher state.
         /// Returns an error if any token violates the grammar.
         accept-tokens: func(token-ids: list<u32>) -> result<_, error>;
 
-        /// Fill the next-token bitmask.  The returned BRLE encodes which
-        /// token ids in the vocabulary are allowed at the current position.
-        next-token-logit-mask: func() -> brle;
+        /// The packed allowed-token bitmask at the current position: a
+        /// `[ceil(vocab/32)]` u32 array where bit `j` (word `j/32`, bit `j%32`)
+        /// is 1 iff token `j` is allowed, 0 if disallowed. Applied in-program
+        /// by the sampler's `mask-apply` op (the de-hardwired grammar mask
+        /// channel); multiple constraints compose by word-wise bitwise-AND
+        /// host-side. Replaces the removed BRLE `next-token-logit-mask`.
+        mask: func() -> list<u32>;
 
         /// Check whether the matcher has reached a terminal state.
         is-terminated: func() -> bool;

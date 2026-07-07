@@ -1,0 +1,4 @@
+[package]
+name = "tempgen-pipelined"
+version = "0.1.0"
+description = "Pipelined ① copy of tempgen: run-ahead temperature (Multinomial) decode via carrier::submit_pass_sampler"

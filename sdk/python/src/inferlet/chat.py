@@ -29,43 +29,41 @@ from wit_world.imports.chat import (
     Event_Interrupt as _RawInterrupt,
 )
 
-from .model import Model
-
 
 # =============================================================================
 # Template fillers
 # =============================================================================
 
 
-def system(model: Model, message: str) -> list[int]:
+def system(message: str) -> list[int]:
     """Token sequence for a system-role message."""
-    return list(_chat.system(model._handle, message))
+    return list(_chat.system(message))
 
 
-def user(model: Model, message: str) -> list[int]:
+def user(message: str) -> list[int]:
     """Token sequence for a user-role message."""
-    return list(_chat.user(model._handle, message))
+    return list(_chat.user(message))
 
 
-def assistant(model: Model, message: str) -> list[int]:
+def assistant(message: str) -> list[int]:
     """Token sequence for an assistant-role message (history replay)."""
-    return list(_chat.assistant(model._handle, message))
+    return list(_chat.assistant(message))
 
 
-def cue(model: Model) -> list[int]:
+def cue() -> list[int]:
     """Token sequence for the generation cue (tells the model "your turn")."""
-    return list(_chat.cue(model._handle))
+    return list(_chat.cue())
 
 
-def seal(model: Model) -> list[int]:
+def seal() -> list[int]:
     """Token sequence that seals the current turn (inserts a stop token)."""
-    return list(_chat.seal(model._handle))
+    return list(_chat.seal())
 
 
-def stop_tokens(model: Model) -> list[int]:
-    """Stop-token IDs for ``model``'s chat template — pass to
+def stop_tokens() -> list[int]:
+    """Stop-token IDs for the model's chat template — pass to
     :meth:`Generator.stop` for explicit termination control."""
-    return list(_chat.stop_tokens(model._handle))
+    return list(_chat.stop_tokens())
 
 
 # =============================================================================
@@ -148,8 +146,8 @@ class Decoder:
 
     __slots__ = ("_inner",)
 
-    def __init__(self, model: Model) -> None:
-        self._inner = _chat.create_decoder(model._handle)
+    def __init__(self) -> None:
+        self._inner = _chat.create_decoder()
 
     def feed(self, tokens: list[int]) -> AnyEvent:
         """Feed a token batch and get back the event that fired (one per

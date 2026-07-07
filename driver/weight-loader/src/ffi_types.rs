@@ -21,7 +21,6 @@ pub enum PieLoaderCheckpointFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PieLoaderBackendKind {
     Cuda = 0,
-    Portable = 1,
     Unknown = 255,
 }
 

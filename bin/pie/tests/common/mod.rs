@@ -70,6 +70,35 @@ pub fn resolve_qwen3_snapshot() -> Result<String> {
 /// downloads). `device` is an array (`["cuda:0"]`); auth off; gateway on an
 /// ephemeral loopback port.
 pub fn cuda_standalone_toml(hf_repo: &str) -> String {
+    cuda_standalone_toml_util(hf_repo, 0.85)
+}
+
+/// [`cuda_standalone_toml`] with a caller-set `gpu_mem_utilization` — the knob
+/// that sizes the KV pool. A LOW value shrinks the pool so a modest fleet
+/// over-fills it (the Task-B contention e2e, `cuda_contention`). Tune per box.
+pub fn cuda_standalone_toml_util(hf_repo: &str, gpu_mem_utilization: f64) -> String {
+    cuda_standalone_toml_capped(hf_repo, gpu_mem_utilization, 0)
+}
+
+/// Like [`cuda_standalone_toml_util`] but with an explicit KV-page cap
+/// (`[batching].total_pages`; 0 = derive from util). Forces a tiny deterministic
+/// KV pool for the contention/preempt e2e independent of the forward-layout floor.
+pub fn cuda_standalone_toml_capped(
+    hf_repo: &str,
+    gpu_mem_utilization: f64,
+    total_pages: u32,
+) -> String {
+    // cpu_pages (the runtime KV stash pool for v2 suspend/restore) is derived from
+    // the cuda driver's `swap_pool_size` (translate.rs:117). MANDATORY > 0 for v2
+    // (guru: with swap_pool_size=0 the runtime cpu_pages=0 → every suspend is
+    // all-cold → the fix makes suspends inert (freed_now=0 → decline), and pre-fix
+    // it silently dropped written KV → "slot 0 has no written page"). Default 512
+    // (host RAM is cheap; must hold the fleet's stashed overage). Override via
+    // PIE_KV_CPU_PAGES.
+    let swap_pool_size: u32 = std::env::var("PIE_KV_CPU_PAGES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
     format!(
         "[controller]\n\
          \n\
@@ -80,8 +109,110 @@ pub fn cuda_standalone_toml(hf_repo: &str) -> String {
          [worker.auth]\n\
          enabled = false\n\
          \n\
-         [[worker.model]]\n\
+         [worker.model]\n\
          name = \"qwen3\"\n\
+         hf_repo = \"{hf_repo}\"\n\
+         \n\
+         [worker.model.driver]\n\
+         type = \"cuda_native\"\n\
+         device = [\"cuda:0\"]\n\
+         \n\
+         [worker.model.driver.options]\n\
+         gpu_mem_utilization = {gpu_mem_utilization}\n\
+         total_pages = {total_pages}\n\
+         swap_pool_size = {swap_pool_size}\n"
+    )
+}
+
+/// Boot the embedded standalone (controller + gateway + worker) with the real
+/// CUDA driver + qwen-3-0.6b on the 4090. The client edge is at
+/// `handle.listen_addr` (`ws://{listen_addr}` for the `pie-client`).
+pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
+    let snapshot = resolve_qwen3_snapshot()?;
+    let (controller, gateway, worker) = derive_standalone(&cuda_standalone_toml(&snapshot))?;
+    run_standalone(controller, gateway, worker, Mode::Local).await
+}
+
+/// [`boot_4090`] with a SMALL KV pool (low `gpu_mem_utilization`) so a modest
+/// fleet over-fills it — the Task-B preempt/restore over-capacity e2e
+/// (`cuda_contention`). Contention is now forced by the explicit KV-page cap
+/// (`PIE_CONTENTION_TOTAL_PAGES`, charlie — `[batching].total_pages`, mirrors
+/// metal), NOT by util: util only needs to clear the ~0.3 forward-layout floor
+/// so the driver boots (util < ~0.3 → fatal "no viable forward/KV layout"). The
+/// cap then shrinks the KV pool to exactly N pages (`min(kv_pages, cap)`), so a
+/// modest fleet genuinely over-fills it deterministically (CI-friendly).
+pub const SMALL_POOL_GPU_MEM_UTIL: f64 = 0.3;
+pub async fn boot_4090_small_kv() -> Result<pie_bin::StandaloneHandle> {
+    let util = std::env::var("PIE_CONTENTION_UTIL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SMALL_POOL_GPU_MEM_UTIL);
+    // charlie: explicit KV-page cap (deterministic tiny pool, independent of the
+    // forward-layout budget floor). Default 8 forces genuine contention out-of-the
+    // -box; `PIE_CONTENTION_TOTAL_PAGES=0` restores the derive-from-util path.
+    let total_pages: u32 = std::env::var("PIE_CONTENTION_TOTAL_PAGES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    eprintln!("[contention] boot_4090_small_kv util={util} total_pages={total_pages}");
+    let snapshot = resolve_qwen3_snapshot()?;
+    let (controller, gateway, worker) =
+        derive_standalone(&cuda_standalone_toml_capped(&snapshot, util, total_pages))?;
+    run_standalone(controller, gateway, worker, Mode::Local).await
+}
+
+/// Default MTP model for the native-drafter de-risk (Qwen3.5-0.8B GDN backbone +
+/// a 1-layer MTP head). HF-cached, resolved to a local snapshot path (R3: never
+/// downloads). The MTP head auto-activates in the driver on MTP-weight presence
+/// (entry.cpp `wire_system_drafter`); `PIE_MTP_DRAFT_TOKENS` sets the draft
+/// count K (0 disables → the non-spec baseline).
+pub const QWEN35_0_8B_REPO: &str = "Qwen/Qwen3.5-0.8B";
+
+/// Resolve `Qwen/Qwen3.5-0.8B` to its local HF cache snapshot dir (mirrors
+/// [`resolve_qwen3_snapshot`]; the snapshot hash is machine-specific).
+pub fn resolve_qwen35_snapshot() -> Result<String> {
+    let hub = std::env::var("HF_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join(".cache/huggingface")
+        })
+        .join("hub/models--Qwen--Qwen3.5-0.8B/snapshots");
+    let snap = std::fs::read_dir(&hub)
+        .with_context(|| {
+            format!(
+                "qwen3.5-0.8b not in HF cache at {} — run `huggingface-cli download Qwen/Qwen3.5-0.8B`",
+                hub.display()
+            )
+        })?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.join("config.json").exists()
+                && (p.join("model.safetensors").exists()
+                    || p.join("model.safetensors.index.json").exists())
+        })
+        .with_context(|| format!("no complete qwen3.5-0.8b snapshot under {}", hub.display()))?;
+    Ok(snap.to_string_lossy().into_owned())
+}
+
+/// The cuda_native standalone TOML for an MTP model. Same shape as
+/// [`cuda_standalone_toml`] but `name = "default"` so the driver auto-detects
+/// the architecture (GDN + MTP head) from the snapshot's `config.json` rather
+/// than being pinned to the dense `qwen3` path.
+pub fn cuda_mtp_standalone_toml(hf_repo: &str) -> String {
+    format!(
+        "[controller]\n\
+         \n\
+         [gateway]\n\
+         listen = \"127.0.0.1:0\"\n\
+         \n\
+         [worker]\n\
+         [worker.auth]\n\
+         enabled = false\n\
+         \n\
+         [worker.model]\n\
+         name = \"default\"\n\
          hf_repo = \"{hf_repo}\"\n\
          \n\
          [worker.model.driver]\n\
@@ -93,12 +224,14 @@ pub fn cuda_standalone_toml(hf_repo: &str) -> String {
     )
 }
 
-/// Boot the embedded standalone (controller + gateway + worker) with the real
-/// CUDA driver + qwen-3-0.6b on the 4090. The client edge is at
-/// `handle.listen_addr` (`ws://{listen_addr}` for the `pie-client`).
-pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
-    let snapshot = resolve_qwen3_snapshot()?;
-    let (controller, gateway, worker) = derive_standalone(&cuda_standalone_toml(&snapshot))?;
+/// Boot the embedded standalone with the real CUDA driver + Qwen3.5-0.8B (the
+/// MTP model) on the 4090. K (native draft tokens) is controlled out-of-band by
+/// the `PIE_MTP_DRAFT_TOKENS` env (read once at driver init, entry.cpp:106): set
+/// it BEFORE calling this. Client edge at `handle.listen_addr`.
+pub async fn boot_4090_mtp() -> Result<pie_bin::StandaloneHandle> {
+    let snapshot = resolve_qwen35_snapshot()?;
+    let (controller, gateway, worker) =
+        derive_standalone(&cuda_mtp_standalone_toml(&snapshot))?;
     run_standalone(controller, gateway, worker, Mode::Local).await
 }
 
@@ -119,7 +252,7 @@ pub fn dummy_standalone_toml(hf_repo: &str) -> String {
          [worker.auth]\n\
          enabled = false\n\
          \n\
-         [[worker.model]]\n\
+         [worker.model]\n\
          name = \"qwen3\"\n\
          hf_repo = \"{hf_repo}\"\n\
          \n\
@@ -156,14 +289,14 @@ use anyhow::Context;
 use pie_client::client::Client;
 
 /// Build the capability inferlets to `wasm32-wasip2` and return
-/// `(wasm, manifest)` for `name` ∈ {"mirostat", "grammar"}. Paths resolve from
+/// `(wasm, manifest)` for `name` ∈ {"generate", "mirostat", "grammar"}. Paths resolve from
 /// the `bin/pie` crate dir to the runtime test-inferlets workspace. Builds both
 /// (one cargo invocation) so a multi-capability harness pays the build once.
 pub fn build_inferlet(name: &str) -> (PathBuf, PathBuf) {
     let workspace =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
     let ok = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2", "-p", "mirostat", "-p", "grammar"])
+        .args(["build", "--target", "wasm32-wasip2", "-p", "generate", "-p", "mirostat", "-p", "grammar"])
         .current_dir(&workspace)
         .status()
         .expect("spawn cargo build for capability inferlets")
@@ -207,7 +340,7 @@ pub async fn run_inferlet(
         .with_context(|| format!("add_program {program_name}"))?;
 
     let mut proc = client
-        .launch_process(program_name.to_string(), input.to_string(), true, None)
+        .launch_process(program_name.to_string(), input.to_string(), true)
         .await
         .with_context(|| format!("launch_process {program_name}"))?;
 

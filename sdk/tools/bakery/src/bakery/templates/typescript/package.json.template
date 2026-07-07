@@ -4,7 +4,7 @@
   "type": "module",
   "main": "index.ts",
   "dependencies": {
-    "@pie-project/inferlet": "^0.3.0"
+    "@pie-project/inferlet": "^0.4.0"
   },
   "devDependencies": {
     "acorn": "^8.14.0",

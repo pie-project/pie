@@ -65,7 +65,7 @@ gpu_mem_utilization = 0.90
 memory_profile = "auto"
 ```
 
-`[model.driver].type` is a discriminator. Embedded drivers (`portable`, `cuda_native`, `dummy`) run inside the `pie` process. Driver-specific knobs live in `[model.driver.options]`; see the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable)) for what each backend accepts.
+`[model.driver].type` is a discriminator. Embedded drivers (`cuda_native`, `metal`, `dummy`) run inside the `pie` process. Driver-specific knobs live in `[model.driver.options]`; see the per-driver pages ([CUDA](./drivers/cuda)) for what each backend accepts.
 
 To add a second model, append another `[[model]]` block with a unique `name` and a `device` list that does not overlap any other model's.
 
@@ -141,17 +141,17 @@ Driver discriminator + universal driver fields:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `type` | required | Driver name. One of `portable`, `cuda_native`, `dummy`. See the per-driver reference pages. |
+| `type` | required | Driver name. One of `cuda_native`, `metal`, `dummy`. See the per-driver reference pages. |
 | `device` | required | Device list for this model. A single string is accepted and normalized to a one-element list. The list across all `[[model]]` entries must be disjoint. |
 | `tensor_parallel_size` | `1` | TP world size. |
 | `activation_dtype` | `"bfloat16"` | Activation dtype for forward passes. |
 | `random_seed` | `42` | Seed used by samplers and dropout-free stochastic ops. |
-| `ipc_profile` | driver-dependent | IPC wait profile. Omitted CUDA uses `latency`; omitted non-CUDA uses `balanced`. `latency` uses the polling in-process channel for embedded CUDA/portable drivers and busy-spins on shmem; `balanced` spins for 1000 us then parks; `power` parks immediately. |
+| `ipc_profile` | driver-dependent | IPC wait profile. Omitted CUDA uses `latency`; omitted non-CUDA uses `balanced`. `latency` uses the polling in-process channel for embedded CUDA/metal drivers and busy-spins on shmem; `balanced` spins for 1000 us then parks; `power` parks immediately. |
 | `spin_budget_us` | unset | Expert override for the profile's busy-spin window in microseconds. Leave unset unless tuning latency/CPU tradeoffs directly. |
 
 ### `[model.driver.options]`
 
-Driver-specific knobs in the driver's own vocabulary. Embedded drivers are validated by `pie` before boot. See the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable)) for each driver's option set.
+Driver-specific knobs in the driver's own vocabulary. Embedded drivers are validated by `pie` before boot. See the per-driver pages ([CUDA](./drivers/cuda)) for each driver's option set.
 
 ## Editing the config
 
@@ -203,5 +203,5 @@ Run `pie config init` to regenerate the file in the new shape.
 ## Related
 
 - [CLI reference](./pie): every `pie` command and flag.
-- Per-driver options: [CUDA](./drivers/cuda), [Portable](./drivers/portable).
+- Per-driver options: [CUDA](./drivers/cuda).
 - Supported architectures are listed on each driver page (e.g. [CUDA `#supported-architectures`](./drivers/cuda#supported-architectures)).

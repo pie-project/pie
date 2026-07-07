@@ -37,6 +37,22 @@ extern "C" {
 
 typedef int32_t PieRecvResult;
 
+/* #11 prefetch-seam: the C++ NVRTC-warm trampoline the Rust InProcChannel calls
+ * (fire-and-forget) once per attached program before `submit`, off-TTFT, to warm
+ * the JIT PTX cache. `backend_ctx` is the driver's IR backend (the compile-cache
+ * owner). Bindings marshal as parallel `(kind, key)` arrays — the SAME shape the
+ * submit path conveys (the carrier ships only `(kind, key)`; the trampoline
+ * reconstructs `ready = SubmitBound` identically) — so the prefetch-warm program
+ * hash MATCHES the real submit-fire hash ⇒ compile-cache HIT ⇒ the TTFT win.
+ * kind: 0 = Logits, 1 = Tensor(host_key), 2 = MtpLogits. */
+typedef void (*PiePrefetchFn)(
+    void*           backend_ctx,
+    const uint8_t*  bytecode,
+    size_t          bytecode_len,
+    const uint8_t*  binds_kind,
+    const uint32_t* binds_key,
+    size_t          binds_len);
+
 typedef struct PieInProcVTable {
     PieRecvResult (*recv)(
         void* ctx,
@@ -49,6 +65,19 @@ typedef struct PieInProcVTable {
         const PieResponseFrameDesc* response);
 
     void* ctx;
+
+    /* #11 prefetch-seam (trailing, additive — recv/send_response/ctx keep their
+     * offsets, so this is a pure append). The Rust side installs its prefetch
+     * entry point here; the driver calls it ONCE at backend-ready —
+     * `register_prefetch(ctx, &trampoline, backend_ctx)` — handing over the C++
+     * trampoline plus the IR-backend context. Optional: a non-JIT driver (metal)
+     * simply never calls it ⇒ prefetch stays a no-op (fire-and-forget tolerates
+     * an unregistered trampoline). May be NULL on the Rust side for transports
+     * that don't support prefetch. */
+    void (*register_prefetch)(
+        void*         ctx,
+        PiePrefetchFn prefetch,
+        void*         backend_ctx);
 } PieInProcVTable;
 
 #ifdef __cplusplus

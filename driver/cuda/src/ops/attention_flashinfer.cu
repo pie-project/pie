@@ -4,6 +4,7 @@
 #include <type_traits>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -708,6 +709,35 @@ cudaError_t dispatch_decode_for_head_dim_v(
         if (cache.plan_info.enable_cuda_graph) {
             params.block_valid_mask =
                 offset_ptr<bool>(int_buf, cache.plan_info.block_valid_mask_offset);
+        }
+    }
+
+    // Bug#2 device R>1 diagnostic (PIE_DECODE_PARAM_DUMP): the concurrent-decode
+    // corruption is per-request KV mis-attribution inside BatchDecode. Everything
+    // in the plan/kernel is per-request-correct in code, so dump the RUNTIME
+    // per-request KV bound + plan work-distribution the kernel actually reads —
+    // the wrong field (kv_len, request_indices, o_indptr, padded_batch_size, or
+    // batch_size) is the fix site. Env-gated, D2H copies (heavy) — off by default.
+    if (std::getenv("PIE_DECODE_PARAM_DUMP") != nullptr) {
+        const int R = static_cast<int>(cache.num_requests);
+        std::vector<IdType> h_indptr(R + 1), h_lastlen(R), h_reqidx(R), h_oindptr(R + 1);
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(h_indptr.data(), kv_page_indptr_d, sizeof(IdType) * (R + 1), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_lastlen.data(), kv_last_page_lens_d, sizeof(IdType) * R, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_reqidx.data(), params.request_indices, sizeof(IdType) * R, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_oindptr.data(), params.o_indptr, sizeof(IdType) * (R + 1), cudaMemcpyDeviceToHost);
+        std::fprintf(stderr,
+            "[DECODE_PARAM] R=%d padded_batch=%u split_kv=%d paged_kv.batch_size=%u page_size=%d\n",
+            R, params.padded_batch_size, static_cast<int>(params.partition_kv),
+            static_cast<unsigned>(cache.num_requests), cache.page_size);
+        for (int r = 0; r < R; ++r) {
+            const int pages = static_cast<int>(h_indptr[r + 1]) - static_cast<int>(h_indptr[r]);
+            const int kv_len = (pages - 1) * cache.page_size + static_cast<int>(h_lastlen[r]);
+            std::fprintf(stderr,
+                "[DECODE_PARAM]  r=%d indptr=[%d,%d) pages=%d last_page_len=%d kv_len=%d req_idx=%d o_indptr=%d\n",
+                r, static_cast<int>(h_indptr[r]), static_cast<int>(h_indptr[r + 1]), pages,
+                static_cast<int>(h_lastlen[r]), kv_len, static_cast<int>(h_reqidx[r]),
+                static_cast<int>(h_oindptr[r]));
         }
     }
 

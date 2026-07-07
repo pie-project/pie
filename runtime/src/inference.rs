@@ -10,39 +10,22 @@
 //! by individual BatchScheduler instances (one per driver).
 
 mod adaptive_policy;
+pub mod forward_prepare;
 pub mod request;
 pub mod scheduler;
-pub mod speculator;
 pub mod structured;
 
 use tokio::sync::oneshot;
 
-use crate::context::pagestore::PhysicalPageId;
+use crate::arena::PhysicalPageId;
 use crate::driver::{DriverId, SchedulerLimits};
-use crate::service::{ServiceArray, ServiceHandler};
+use crate::service::{Service, ServiceHandler};
 use anyhow::Result;
-use dashmap::DashMap;
 use scheduler::BatchScheduler;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 
-pub use scheduler::{SchedulerStats, SYSTEM_SPEC_DRAFT_POS_BUCKETS};
-pub use speculator::{
-    BYPASS_HIT_COUNT, CHAIN_DROP_COUNT, CHAIN_SUBMIT_COUNT, StagedBatch, lookup_for_ctx, try_hit,
-};
-
-use speculator::StagedBatchMap;
-
-pub(crate) fn should_use_pass_speculation(driver_idx: usize) -> bool {
-    // The chain extender is already gated by scheduler.speculation_depth and
-    // request shape. If a staged entry exists, claim it even for a single
-    // resident context; otherwise the API path pays pin/actor overhead and
-    // the pre-fired chain only gets discovered later inside InferenceService.
-    let _ = driver_idx;
-    true
-}
-
+pub use scheduler::{BUBBLE_HIST_UPPER_US, SYSTEM_SPEC_DRAFT_POS_BUCKETS, SchedulerStats};
 /// Aggregated inference stats for a single model (across all drivers).
 ///
 /// Always-on counters live at the top; per-domain probe averages
@@ -68,16 +51,129 @@ pub struct InferenceStats {
     pub system_spec_draft_tokens_accepted: u64,
     pub system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
     pub system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+    /// Per-identity (C3) co-batch density: `(program_identity_hash, fires, rows)`,
+    /// merged across drivers, sorted by rows desc. Per-identity fire density =
+    /// `rows / fires` (the pentathlon per-identity-batch-density probe).
+    pub per_identity_batch: Vec<(u64, u64, u64)>,
+    /// Distinct-identity fire-records dropped because the bounded per-identity
+    /// table saturated. `> 0` ⇒ the fleet has more identities than the table caps;
+    /// `per_identity_batch` is then a bounded sample (fail-loud, never silent).
+    pub identities_dropped: u64,
+    /// Inter-batch bubble histogram (one count per fire), bucketed by
+    /// [`BUBBLE_HIST_UPPER_US`] — for the p50/p99 bubble gate (masterplan M1).
+    /// HOST PROXY (device-idle stamped at the Rust enqueue point → over-counts by
+    /// the host submit/handshake delay). See [`Self::bubble_p50`].
+    pub bubble_us_hist: [u64; BUBBLE_HIST_UPPER_US.len()],
+    /// Inter-batch bubble histogram fed by the CUDA driver's accurate
+    /// `probe_device_idle_us` device-idle stamp (no host over-count). Empty unless
+    /// the driver stamps it (profile-driver-cuda). [`Self::bubble_p50`] prefers
+    /// this when non-empty, else falls back to the host proxy above.
+    pub bubble_us_hist_driver: [u64; BUBBLE_HIST_UPPER_US.len()],
+}
+
+impl InferenceStats {
+    /// Inter-batch bubble p50 (µs) for the masterplan G3 gate — the DRIVER-STAMP
+    /// histogram (accurate `probe_device_idle_us`) when it has samples, else the
+    /// host-proxy histogram (which over-counts by the host submit delay). Returns
+    /// the p50 bucket's UPPER bound (so "≤ 100" ⇔ the p50 bucket is ≤ 100 µs).
+    pub fn bubble_p50(&self) -> u64 {
+        self.bubble_percentile(0.50)
+    }
+
+    /// Inter-batch bubble p99 (µs), driver-stamp preferred (see [`Self::bubble_p50`]).
+    pub fn bubble_p99(&self) -> u64 {
+        self.bubble_percentile(0.99)
+    }
+
+    /// `true` when the accurate driver-stamp histogram has samples (so
+    /// [`Self::bubble_p50`] reflects the device-idle stamp, not the host proxy).
+    /// `false` ⇒ no driver profiling; p50 came from the host proxy.
+    pub fn bubble_from_driver(&self) -> bool {
+        self.bubble_us_hist_driver.iter().sum::<u64>() > 0
+    }
+
+    /// p50 from the HOST-PROXY histogram only — the transition cross-check
+    /// (proxy vs driver as two independent producers of the same quantity).
+    pub fn bubble_p50_proxy(&self) -> u64 {
+        Self::hist_percentile(&self.bubble_us_hist, 0.50)
+    }
+
+    /// p50 from the DRIVER-STAMP histogram only — the transition cross-check.
+    pub fn bubble_p50_driver(&self) -> u64 {
+        Self::hist_percentile(&self.bubble_us_hist_driver, 0.50)
+    }
+
+    fn bubble_percentile(&self, q: f64) -> u64 {
+        if self.bubble_from_driver() {
+            Self::hist_percentile(&self.bubble_us_hist_driver, q)
+        } else {
+            Self::hist_percentile(&self.bubble_us_hist, q)
+        }
+    }
+
+    /// The upper bound of the bucket containing the `q`-quantile of `hist`
+    /// (0 if the histogram is empty).
+    fn hist_percentile(hist: &[u64; BUBBLE_HIST_UPPER_US.len()], q: f64) -> u64 {
+        let total: u64 = hist.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let target = (total as f64 * q).ceil() as u64;
+        let mut cum = 0u64;
+        for (i, &count) in hist.iter().enumerate() {
+            cum += count;
+            if cum >= target {
+                return BUBBLE_HIST_UPPER_US[i];
+            }
+        }
+        *BUBBLE_HIST_UPPER_US.last().unwrap()
+    }
 }
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct FireStats {
     pub avg_inter_fire_us: u64,
     pub avg_post_dispatch_to_fire_us: u64,
+    pub avg_recv_block_wait_us: u64,
+    pub avg_guest_roundtrip_us: u64,
+    pub avg_service_queue_us: u64,
     pub accumulate: AccumulateStats,
     pub pre_dispatch: PreDispatchStats,
     pub execute: ExecuteStats,
     pub post_dispatch: PostDispatchStats,
+    pub quorum: QuorumStats,
+}
+
+/// Quorum-rule probe averages/counters (overview §7.2; thrust-2 §3 F1–F6).
+/// Zero unless built with `profile-fire`. Populated by the quorum core
+/// (thrust-2 phase S5); scaffolding lands in S0. Mirrors
+/// `crate::probe::fire::QuorumProbes`.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct QuorumStats {
+    /// Mean device idle between a batch retiring and the next launching (F1).
+    pub avg_inter_batch_bubble_us: u64,
+    /// Mean last-ready → enqueue latency (F1 quorum completion).
+    pub avg_quorum_latency_us: u64,
+    /// Idle-escape (F2) fire count; divide by `total_batches` for escape rate.
+    pub escape_fires: u64,
+    /// Depth-2 submit-ahead (G3 bubble) fire count; divide by `total_batches`
+    /// for the submit-ahead rate (steady-state decode-fleet bubble-filler).
+    pub submit_ahead_fires: u64,
+    /// Mean cold-hold window per cold-hold fire (F3 occupancy).
+    pub avg_cold_hold_us: u64,
+    /// Count of fires through the cold-hold path (F3).
+    pub cold_hold_fires: u64,
+    /// Dummy-run / readiness-miss count (M3 gate: rate < 1%).
+    pub readiness_miss: u64,
+    /// Wait-for-all wave (M-AB): mean active_pipelines (wait-set size) sampled
+    /// at each WaitAll fire. ≈ fleet width ⇒ persistent wait-set (waves should
+    /// be dense); ≈1 ⇒ transient/singleton. 0 if no WaitAll fire.
+    pub avg_active_pipelines_at_fire: u64,
+    /// Wait-for-all wave: mean stragglers fired without (deadline holds). >0 ⇒
+    /// waves hold to the deadline then fire partial; ≈0 ⇒ all-ready fires.
+    pub avg_missing_at_fire: u64,
+    /// Count of WaitAll wave fires (denominator for the two averages above).
+    pub wave_fires: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -103,7 +199,6 @@ pub struct ExecuteStats {
 pub struct ResponseDispatchStats {
     pub avg_total_us: u64,
     pub direct_count: u64,
-    pub chain_count: u64,
     pub chunk_count: u64,
 }
 
@@ -132,21 +227,14 @@ pub struct PostDispatchStats {
 // Public API
 // =============================================================================
 
-static SERVICES: std::sync::LazyLock<ServiceArray<Message>> =
-    std::sync::LazyLock::new(ServiceArray::new);
+static SERVICE: Service<Message> = Service::new();
 
-/// Spawns a new inference service for a model.
-///
-/// `speculation_depth` is the per-context depth of pass-level
-/// speculative execution (`scheduler.speculation_depth` in toml).
-/// `0` disables pass-level speculation entirely.
+/// Spawns the inference service for the single model.
 pub async fn spawn(
     driver_indices: &[usize],
     page_size: u32,
     request_timeout_secs: u64,
-    batch_policy: String,
-    speculation_depth: u32,
-) -> usize {
+) {
     // Fetch driver info before entering the sync closure.
     let driver_ids: Vec<DriverId> = driver_indices.to_vec();
     let mut driver_batch_limits = Vec::with_capacity(driver_indices.len());
@@ -157,79 +245,69 @@ pub async fn spawn(
         driver_batch_limits.push(info.scheduler_limits());
     }
 
-    let model_idx = SERVICES.len();
-    SERVICES
+    SERVICE
         .spawn(move || {
             InferenceService::new(
-                model_idx,
                 driver_ids,
                 driver_batch_limits,
                 page_size,
                 request_timeout_secs,
-                batch_policy,
-                speculation_depth as usize,
             )
         })
         .expect("Failed to spawn inference service")
 }
 
-/// Submits a pre-resolved forward pass to the appropriate driver scheduler.
-///
-/// All context operations (ensure_resident, page resolution) must be done
-/// by the caller BEFORE calling this. The inference actor just dispatches
-/// to the batch scheduler — it never blocks on context operations.
-///
-/// `extra_pages` lists working pages the ctx has reserved beyond the
-/// active prefix in `physical_page_ids`. They are passed to the
-/// speculator's chain extender so it can extend the chain across the
-/// full reserved range without re-pinning. Pass an empty vec when
-/// speculation is disabled or the caller has no extra pages.
-pub async fn submit(
-    model_idx: usize,
-    request: pie_driver_abi::ForwardRequest,
-    driver_idx: usize,
-    physical_page_ids: Vec<PhysicalPageId>,
-    extra_pages: Vec<PhysicalPageId>,
-    last_page_len: u32,
-) -> Result<ForwardOutput> {
-    let rx = submit_async(
-        model_idx,
-        request,
-        driver_idx,
-        physical_page_ids,
-        extra_pages,
-        last_page_len,
-        None,
-        true,
-    )?;
-    rx.await
-        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?
-}
+
 
 pub fn submit_async(
-    model_idx: usize,
     request: pie_driver_abi::ForwardRequest,
     driver_idx: usize,
     physical_page_ids: Vec<PhysicalPageId>,
-    extra_pages: Vec<PhysicalPageId>,
     last_page_len: u32,
-    active_page_idx: Option<usize>,
-    allow_pass_speculation: bool,
+    program_identity_hashes: Vec<u64>,
+    pipeline_id: Option<crate::process::ProcessId>,
 ) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(
-        model_idx,
+    // R-decomposition (charlie): stamp the guest's resubmit instant in the
+    // scheduler epoch so `service_queue_us` (submit→recv) is comparable.
+    let submitted_at_us = crate::inference::scheduler::now_micros();
+    SERVICE.send(
         Message::Submit {
             request,
             driver_idx,
             physical_page_ids,
-            extra_pages,
             last_page_len,
-            active_page_idx,
-            allow_pass_speculation,
+            program_identity_hashes,
+            pipeline_id,
+            submitted_at_us,
             response: tx,
         },
     )?;
+    Ok(rx)
+}
+
+/// G2 prebuilt-passthrough submit — fires a COMPLETE, wire-final multi-lane
+/// `ForwardRequest` (a PTIR beam fire = B forward lanes, one program/epilogue)
+/// VERBATIM + SOLO, bypassing the scheduler's per-request re-fold. The whole
+/// rich `ForwardOutput::Response` is routed to the returned receiver;
+/// `physical_page_ids` is the union of all lanes' pages (KV-txn / ref tracking
+/// only). Used by `ptir_host.submit` for the beam fire.
+pub fn submit_prebuilt_async(
+    request: pie_driver_abi::ForwardRequest,
+    driver_idx: usize,
+    physical_page_ids: Vec<PhysicalPageId>,
+    last_page_len: u32,
+    program_identity_hashes: Vec<u64>,
+) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::SubmitPrebuilt {
+        request,
+        driver_idx,
+        physical_page_ids,
+        last_page_len,
+        program_identity_hashes,
+        response: tx,
+    })?;
     Ok(rx)
 }
 
@@ -264,19 +342,14 @@ impl From<pie_driver_abi::ForwardResponse> for ForwardOutput {
     }
 }
 
-/// Returns aggregated inference stats for a model (lock-free, non-blocking).
-pub async fn get_stats(model_idx: usize) -> InferenceStats {
+/// Returns aggregated inference stats for the model (lock-free, non-blocking).
+pub async fn get_stats() -> InferenceStats {
     let (tx, rx) = oneshot::channel();
-    let _ = SERVICES.send(model_idx, Message::GetStats { response: tx });
+    let _ = SERVICE.send(Message::GetStats { response: tx });
     rx.await.unwrap_or_default()
 }
 
-/// Drop any outstanding speculation chain for a ctx that's about to
-/// be destroyed. Fire-and-forget: the speculator just clears its
-/// per-device deque for this ctx; callers don't need confirmation.
-pub fn invalidate_speculation_for_ctx(model_idx: usize, ctx_id: crate::context::ContextId) {
-    let _ = SERVICES.send(model_idx, Message::InvalidateSpeculationForCtx { ctx_id });
-}
+
 
 // =============================================================================
 // Inference Service
@@ -287,21 +360,9 @@ pub fn invalidate_speculation_for_ctx(model_idx: usize, ctx_id: crate::context::
 /// Routes requests to the appropriate per-driver `BatchScheduler`
 /// based on physical page affinity from the context service.
 struct InferenceService {
-    model_idx: usize,
     num_drivers: usize,
     schedulers: Vec<BatchScheduler>,
     scheduler_stats: Vec<Arc<SchedulerStats>>,
-    /// Per-context depth of pass-level speculation. Each ctx can
-    /// have up to this many pre-fired stages in its deque. Sourced
-    /// from `scheduler.speculation_depth` in the toml. `0` disables
-    /// speculation: no staged entries are ever pushed and every
-    /// submit goes through the cold path.
-    speculation_depth: usize,
-    /// Per-device speculation state: a deque of pre-fired stages
-    /// per ctx_id. Inferlet `execute()` calls hit-check the front
-    /// of the deque; the chain extender pushes new entries as each
-    /// fire completes (bounded by `speculation_depth`).
-    staged_batch: Vec<StagedBatchMap>,
 }
 
 impl std::fmt::Debug for InferenceService {
@@ -312,13 +373,10 @@ impl std::fmt::Debug for InferenceService {
 
 impl InferenceService {
     fn new(
-        model_idx: usize,
         driver_ids: Vec<DriverId>,
         driver_batch_limits: Vec<SchedulerLimits>,
         page_size: u32,
         request_timeout_secs: u64,
-        batch_policy: String,
-        speculation_depth: usize,
     ) -> Self {
         let num_drivers = driver_ids.len();
         let schedulers: Vec<BatchScheduler> = driver_ids
@@ -332,25 +390,18 @@ impl InferenceService {
                     page_size,
                     limits,
                     request_timeout_secs,
-                    batch_policy.clone(),
                 )
             })
             .collect();
 
         let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
 
-        let staged_batch: Vec<StagedBatchMap> = (0..num_drivers)
-            .map(|_| Arc::new(DashMap::new()))
-            .collect();
-        speculator::register_model(model_idx, &staged_batch, speculation_depth);
+
 
         InferenceService {
-            model_idx,
             num_drivers,
             schedulers,
             scheduler_stats,
-            speculation_depth,
-            staged_batch,
         }
     }
 
@@ -361,6 +412,12 @@ impl InferenceService {
         let mut total_requests = 0u64;
         let mut max_forward_requests = 0u64;
         let mut hist = [0u64; 8];
+        let mut bubble_hist = [0u64; BUBBLE_HIST_UPPER_US.len()];
+        let mut bubble_hist_driver = [0u64; BUBBLE_HIST_UPPER_US.len()];
+        // Per-identity (C3) co-batch density, merged across drivers by hash.
+        let mut per_identity: std::collections::HashMap<u64, (u64, u64)> =
+            std::collections::HashMap::new();
+        let mut identities_dropped = 0u64;
         let mut last_latency = 0u64;
         let mut cumulative_latency = 0u64;
         // Per-driver sums of probe atomics. Walked in the same shape
@@ -368,6 +425,9 @@ impl InferenceService {
         // self-evident.
         let mut fire_inter = 0u64;
         let mut fire_post_dispatch_to_fire = 0u64;
+        let mut fire_recv_block_wait = 0u64;
+        let mut fire_guest_roundtrip = 0u64;
+        let mut fire_service_queue = 0u64;
         let mut fire_accumulate_accum_loop = 0u64;
         let mut fire_pre_dispatch_fire_prepare = 0u64;
         let mut fire_execute_total = 0u64;
@@ -375,7 +435,6 @@ impl InferenceService {
         let mut fire_execute_driver_fire = 0u64;
         let mut fire_execute_response_dispatch_total = 0u64;
         let mut fire_execute_response_dispatch_direct = 0u64;
-        let mut fire_execute_response_dispatch_chain = 0u64;
         let mut fire_execute_response_dispatch_chunk = 0u64;
         let mut dc_ipc_submit = 0u64;
         let mut dc_gpu_wait = 0u64;
@@ -388,6 +447,16 @@ impl InferenceService {
         let mut dc_response_build = 0u64;
         let mut fire_post_dispatch_context_tick = 0u64;
         let mut fire_post_dispatch_stats_update = 0u64;
+        let mut q_inter_batch_bubble = 0u64;
+        let mut q_quorum_latency = 0u64;
+        let mut q_escape_fires = 0u64;
+        let mut q_submit_ahead_fires = 0u64;
+        let mut q_cold_hold = 0u64;
+        let mut q_cold_hold_fires = 0u64;
+        let mut q_readiness_miss = 0u64;
+        let mut q_wave_active_sum = 0u64;
+        let mut q_wave_missing_sum = 0u64;
+        let mut q_wave_fires = 0u64;
         let mut system_spec_draft_tokens_proposed = 0u64;
         let mut system_spec_draft_tokens_accepted = 0u64;
         let mut system_spec_draft_tokens_proposed_per_pos =
@@ -409,6 +478,9 @@ impl InferenceService {
             let f = &s.fire;
             fire_inter += f.inter_fire_us.load(Relaxed);
             fire_post_dispatch_to_fire += f.post_dispatch_to_fire_us.load(Relaxed);
+            fire_recv_block_wait += f.recv_block_wait_us.load(Relaxed);
+            fire_guest_roundtrip += f.guest_roundtrip_us.load(Relaxed);
+            fire_service_queue += f.service_queue_us.load(Relaxed);
             fire_accumulate_accum_loop += f.accumulate.accum_loop_us.load(Relaxed);
             fire_pre_dispatch_fire_prepare += f.pre_dispatch.fire_prepare_us.load(Relaxed);
             fire_execute_total += f.execute.total_us.load(Relaxed);
@@ -416,7 +488,6 @@ impl InferenceService {
             fire_execute_driver_fire += f.execute.driver_fire_us.load(Relaxed);
             fire_execute_response_dispatch_total += f.execute.response_dispatch.total_us.load(Relaxed);
             fire_execute_response_dispatch_direct += f.execute.response_dispatch.direct_count.load(Relaxed);
-            fire_execute_response_dispatch_chain += f.execute.response_dispatch.chain_count.load(Relaxed);
             fire_execute_response_dispatch_chunk += f.execute.response_dispatch.chunk_count.load(Relaxed);
             let dc = &s.driver_cuda;
             dc_ipc_submit += dc.ipc_submit_us.load(Relaxed);
@@ -430,6 +501,16 @@ impl InferenceService {
             dc_response_build += dc.response_build_us.load(Relaxed);
             fire_post_dispatch_context_tick += f.post_dispatch.context_tick_us.load(Relaxed);
             fire_post_dispatch_stats_update += f.post_dispatch.stats_update_us.load(Relaxed);
+            q_inter_batch_bubble += f.quorum.inter_batch_bubble_us.load(Relaxed);
+            q_quorum_latency += f.quorum.quorum_latency_us.load(Relaxed);
+            q_escape_fires += f.quorum.escape_fires.load(Relaxed);
+            q_submit_ahead_fires += f.quorum.submit_ahead_fires.load(Relaxed);
+            q_cold_hold += f.quorum.cold_hold_us.load(Relaxed);
+            q_cold_hold_fires += f.quorum.cold_hold_fires.load(Relaxed);
+            q_readiness_miss += f.quorum.readiness_miss.load(Relaxed);
+            q_wave_active_sum += f.quorum.wave_active_sum.load(Relaxed);
+            q_wave_missing_sum += f.quorum.wave_missing_sum.load(Relaxed);
+            q_wave_fires += f.quorum.wave_fires.load(Relaxed);
             system_spec_draft_tokens_proposed += s.system_spec_draft_tokens_proposed.load(Relaxed);
             system_spec_draft_tokens_accepted += s.system_spec_draft_tokens_accepted.load(Relaxed);
             for (dst, src) in system_spec_draft_tokens_proposed_per_pos
@@ -444,8 +525,32 @@ impl InferenceService {
             {
                 *dst += src.load(Relaxed);
             }
+            // Merge this driver's bounded per-identity table by hash.
+            for (i, hslot) in s.per_identity_hash.iter().enumerate() {
+                let h = hslot.load(Relaxed);
+                if h != 0 {
+                    let e = per_identity.entry(h).or_insert((0u64, 0u64));
+                    e.0 += s.per_identity_fires[i].load(Relaxed);
+                    e.1 += s.per_identity_rows[i].load(Relaxed);
+                }
+            }
+            identities_dropped += s.identities_dropped.load(Relaxed);
+            for (dst, src) in bubble_hist.iter_mut().zip(s.bubble_us_hist.iter()) {
+                *dst += src.load(Relaxed);
+            }
+            for (dst, src) in bubble_hist_driver
+                .iter_mut()
+                .zip(s.bubble_us_hist_driver.iter())
+            {
+                *dst += src.load(Relaxed);
+            }
         }
 
+        let mut per_identity_batch: Vec<(u64, u64, u64)> = per_identity
+            .into_iter()
+            .map(|(h, (fires, rows))| (h, fires, rows))
+            .collect();
+        per_identity_batch.sort_by(|a, b| b.2.cmp(&a.2)); // rows desc
         let avg = |value: u64| {
             if total_batches > 0 {
                 value / total_batches
@@ -475,6 +580,9 @@ impl InferenceService {
             fire: FireStats {
                 avg_inter_fire_us: avg_pair(fire_inter),
                 avg_post_dispatch_to_fire_us: avg_pair(fire_post_dispatch_to_fire),
+                avg_recv_block_wait_us: avg_pair(fire_recv_block_wait),
+                avg_guest_roundtrip_us: avg_pair(fire_guest_roundtrip),
+                avg_service_queue_us: avg_pair(fire_service_queue),
                 accumulate: AccumulateStats {
                     avg_accum_loop_us: avg(fire_accumulate_accum_loop),
                 },
@@ -488,7 +596,6 @@ impl InferenceService {
                     response_dispatch: ResponseDispatchStats {
                         avg_total_us: avg(fire_execute_response_dispatch_total),
                         direct_count: fire_execute_response_dispatch_direct,
-                        chain_count: fire_execute_response_dispatch_chain,
                         chunk_count: fire_execute_response_dispatch_chunk,
                     },
                     driver_cuda: DriverCudaStats {
@@ -509,11 +616,39 @@ impl InferenceService {
                     avg_context_tick_us: avg(fire_post_dispatch_context_tick),
                     avg_stats_update_us: avg(fire_post_dispatch_stats_update),
                 },
+                quorum: QuorumStats {
+                    avg_inter_batch_bubble_us: avg(q_inter_batch_bubble),
+                    avg_quorum_latency_us: avg(q_quorum_latency),
+                    escape_fires: q_escape_fires,
+                    submit_ahead_fires: q_submit_ahead_fires,
+                    avg_cold_hold_us: if q_cold_hold_fires > 0 {
+                        q_cold_hold / q_cold_hold_fires
+                    } else {
+                        0
+                    },
+                    cold_hold_fires: q_cold_hold_fires,
+                    readiness_miss: q_readiness_miss,
+                    avg_active_pipelines_at_fire: if q_wave_fires > 0 {
+                        q_wave_active_sum / q_wave_fires
+                    } else {
+                        0
+                    },
+                    avg_missing_at_fire: if q_wave_fires > 0 {
+                        q_wave_missing_sum / q_wave_fires
+                    } else {
+                        0
+                    },
+                    wave_fires: q_wave_fires,
+                },
             },
             system_spec_draft_tokens_proposed,
             system_spec_draft_tokens_accepted,
             system_spec_draft_tokens_proposed_per_pos,
             system_spec_draft_tokens_accepted_per_pos,
+            per_identity_batch,
+            identities_dropped,
+            bubble_us_hist: bubble_hist,
+            bubble_us_hist_driver: bubble_hist_driver,
         }
     }
 }
@@ -531,22 +666,35 @@ enum Message {
         request: pie_driver_abi::ForwardRequest,
         driver_idx: usize,
         physical_page_ids: Vec<PhysicalPageId>,
-        /// Pages the ctx has reserved beyond the active prefix.
-        /// Passed to the chain extender so it can extend across the
-        /// full reserved range without re-allocating.
-        extra_pages: Vec<PhysicalPageId>,
         last_page_len: u32,
-        active_page_idx: Option<usize>,
-        allow_pass_speculation: bool,
+        /// #10: per-program `program_identity_hash`es (distinct-count key, computed
+        /// host-side at attach). Empty ⇒ plain decode. Runtime-side only — never
+        /// placed on the wire request; reaches the policy via `submit_with_identity`.
+        program_identity_hashes: Vec<u64>,
+        /// M-A1 (wait-for-all): the submitting pipeline's `ProcessId` (wave
+        /// membership key); `None` for solo fires. Threaded to the scheduler via
+        /// `submit_with_identity`.
+        pipeline_id: Option<crate::process::ProcessId>,
+        /// R-decomposition probe (charlie): `now_micros()` at submit (guest
+        /// resubmit instant, scheduler epoch). See `PendingRequest::submitted_at_us`.
+        submitted_at_us: u64,
+        response: oneshot::Sender<Result<ForwardOutput>>,
+    },
+    /// G2 prebuilt-passthrough: submit a COMPLETE, wire-final multi-lane
+    /// `ForwardRequest` (a PTIR beam fire) that fires VERBATIM + SOLO. Same
+    /// fields as `Submit`; the scheduler skips the per-request re-fold and routes
+    /// the whole rich response to the single `response`.
+    SubmitPrebuilt {
+        request: pie_driver_abi::ForwardRequest,
+        driver_idx: usize,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+        program_identity_hashes: Vec<u64>,
         response: oneshot::Sender<Result<ForwardOutput>>,
     },
     GetStats {
         response: oneshot::Sender<InferenceStats>,
     },
-    /// Drop the speculation chain for a ctx (called from
-    /// `api::context::destroy`). Empties the per-device chain
-    /// queue if present.
-    InvalidateSpeculationForCtx { ctx_id: crate::context::ContextId },
 }
 
 impl ServiceHandler for InferenceService {
@@ -558,96 +706,42 @@ impl ServiceHandler for InferenceService {
                 request,
                 driver_idx,
                 physical_page_ids,
-                extra_pages,
                 last_page_len,
-                active_page_idx,
-                allow_pass_speculation,
+                program_identity_hashes,
+                pipeline_id,
+                submitted_at_us,
                 response,
             } => {
                 let idx = driver_idx.min(self.num_drivers.saturating_sub(1));
-
-                // Per-request shape stores the ctx_id in
-                // `context_ids[0]`. Default to 0 if missing — only
-                // happens for malformed requests, in which case the
-                // speculator path is a no-op.
-                let ctx_id = request.context_ids.first().copied().unwrap_or(0);
-
-                // Staged self-staging path: check staged_batch for a
-                // hit, submit cold otherwise, and chain-extend up to
-                // `speculation_depth` pre-fired stages. Inferlet-side
-                // hits typically bypass this path via
-                // `inference::try_hit` before reaching the actor.
-                // Submits reaching this actor are therefore either
-                // cold or post-miss (the api layer's try_hit
-                // returned None).
-                let staged_entry = {
-                    let mut deque = self.staged_batch[idx].get_mut(&ctx_id);
-                    deque.as_deref_mut().and_then(|deque| {
-                        if let Some(front) = deque.front() {
-                            if speculator::entry_matches_request(front, &request) {
-                                let entry = deque.pop_front();
-                                if let Some(entry) = entry.as_ref() {
-                                    if !allow_pass_speculation {
-                                        entry.allow_extend.store(false, Relaxed);
-                                    }
-                                }
-                                return entry;
-                            }
-                        }
-                        // Fingerprint mismatch — drop the entire chain.
-                        // Deeper stages were built on a now-invalid assumption.
-                        deque.clear();
-                        None
-                    })
-                };
-
-                let scheduler_handle = self.schedulers[idx].handle();
-                let staged_batch_arc = self.staged_batch[idx].clone();
-                let speculation_depth = if allow_pass_speculation {
-                    self.speculation_depth
-                } else {
-                    0
-                };
-
-                if let Some(entry) = staged_entry {
-                    // HIT: forward the staged rx; the chain
-                    // extender that pushed this entry is still
-                    // alive and will keep extending. No re-spawn
-                    // here (it would duplicate the chain).
-                    tokio::spawn(async move {
-                        if let Ok(output) = entry.output_rx.await {
-                            let _ = response.send(output);
-                        }
-                    });
-                    return;
-                }
-
-                // No hit: cold submit + start a fresh chain. The pool's
-                // dispatch-side hook will route this fire's output to a
-                // pool worker; no per-context task is spawned here.
-                let cur_page_idx =
-                    active_page_idx.unwrap_or_else(|| physical_page_ids.len().saturating_sub(1));
-                let mut all_pages = physical_page_ids.clone();
-                all_pages.extend(extra_pages);
-                speculator::start_chain(
-                    response,
-                    scheduler_handle,
-                    staged_batch_arc,
-                    self.model_idx,
+                let _ = self.schedulers[idx].handle().submit_with_identity(
                     request,
+                    response,
                     physical_page_ids,
-                    all_pages,
-                    cur_page_idx,
                     last_page_len,
-                    speculation_depth,
-                    Arc::new(AtomicBool::new(allow_pass_speculation)),
+                    program_identity_hashes,
+                    pipeline_id,
+                    submitted_at_us,
+                );
+            }
+            Message::SubmitPrebuilt {
+                request,
+                driver_idx,
+                physical_page_ids,
+                last_page_len,
+                program_identity_hashes,
+                response,
+            } => {
+                let idx = driver_idx.min(self.num_drivers.saturating_sub(1));
+                let _ = self.schedulers[idx].handle().submit_prebuilt(
+                    request,
+                    response,
+                    physical_page_ids,
+                    last_page_len,
+                    program_identity_hashes,
                 );
             }
             Message::GetStats { response } => {
                 let _ = response.send(self.aggregate_stats());
-            }
-            Message::InvalidateSpeculationForCtx { ctx_id } => {
-                speculator::invalidate_ctx(self.model_idx, ctx_id);
             }
         }
     }

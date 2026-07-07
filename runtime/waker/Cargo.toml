@@ -1,0 +1,21 @@
+[package]
+name = "pie-waker"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "X0 tensor-waker substrate (Runtime–Driver Boundary B9–B12): the Rust-owned waker slot table + pie_wake FFI the direct-call transport parks on. A leaf crate (std + loom only) so the register/commit race is model-checked under `--cfg loom` without dragging the runtime's dependency graph into the loom build."
+license = "Apache-2.0"
+
+[lib]
+name = "pie_waker"
+path = "src/lib.rs"
+
+# Loom model checking: real dependency under `--cfg loom` only (the sync shim
+# swaps to loom types); invisible to normal builds.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+# tokio is only used by the non-loom async tests; gate it away from the loom
+# build (tokio itself does not compile under a global `--cfg loom`).
+[target.'cfg(not(loom))'.dev-dependencies]
+tokio = { version = "1", features = ["rt", "time", "macros"] }

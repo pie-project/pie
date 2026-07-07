@@ -4,8 +4,8 @@
 use pie_ipc::wire::{WireError, encode_request, encode_response, parse_request, parse_response};
 use pie_ipc::{
     AdapterBinding, AdapterOp, AdapterRequest, ArchivedRequestPayload, ArchivedResponsePayload,
-    CopyDir, CopyRequest, CopyResource, ForwardRequest, ForwardResponse, Frame, RequestPayload,
-    ResponseFrame, ResponsePayload, Sampler, StatusResponse,
+    CopyDir, CopyRequest, CopyResource, ForwardRequest, ForwardResponse, Frame, RS_FLAG_FOLD,
+    RS_FLAG_RESET, RequestPayload, ResponseFrame, ResponsePayload, Sampler, StatusResponse,
 };
 
 #[test]
@@ -26,6 +26,8 @@ fn frame_forward_round_trip() {
         token_ids: vec![10, 20, 30],
         position_ids: vec![0, 1, 2],
         qo_indptr: vec![0, 3],
+        // M2a length column (C1): per-lane physical KV span on the wire.
+        kv_len: vec![48, 80],
         masks: vec![pie_ipc::Brle {
             buffer: vec![0xAAAAu32, 0xBBBB],
             total_size: 0xAAAA + 0xBBBB,
@@ -84,6 +86,8 @@ fn frame_forward_round_trip() {
     };
     assert_eq!(arch_req.token_ids.as_slice(), &[10u32, 20, 30]);
     assert_eq!(arch_req.position_ids.as_slice(), &[0u32, 1, 2]);
+    // M2a length column survives the rkyv round-trip (C1 wire binding surface).
+    assert_eq!(arch_req.kv_len.as_slice(), &[48u32, 80]);
     assert!(arch_req.single_token_mode);
     assert!(arch_req.has_user_mask);
     // SoA sampler wire: TopK(kind 1) + Logprobs(kind 9), labels in the CSR.
@@ -106,6 +110,85 @@ fn frame_forward_round_trip() {
     assert_eq!(arch_req.audio_feature_indptr.as_slice(), &[0u32, 8]);
     assert_eq!(arch_req.audio_anchor_rows.as_slice(), &[3u32]);
     assert_eq!(arch_req.audio_indptr.as_slice(), &[0u32, 1]);
+}
+
+/// Locks the RS-fold wire ABI (Lane D / Seam 3): the recurrent-state fold
+/// fields — `rs_slot_ids`, `rs_slot_flags` (`RS_FLAG_RESET` | `RS_FLAG_FOLD`),
+/// and `rs_fold_lens` — survive the rkyv round-trip as aligned parallel arrays.
+/// The base `frame_forward_round_trip` leaves these at `..Default::default()`,
+/// so this is the only coverage of the fold descriptors over the real wire.
+#[test]
+fn frame_forward_rs_fold_round_trip() {
+    // Two linear-attention requests: req0 resets its slot AND folds 2 buffered
+    // tokens; req1 folds 4 tokens without reset.
+    let req = ForwardRequest {
+        token_ids: vec![5, 6, 7, 8, 9, 10],
+        position_ids: vec![0, 1, 0, 1, 2, 3],
+        qo_indptr: vec![0, 2, 6],
+        rs_slot_ids: vec![3, 9],
+        rs_slot_flags: vec![RS_FLAG_RESET | RS_FLAG_FOLD, RS_FLAG_FOLD],
+        rs_fold_lens: vec![2, 4],
+        ..Default::default()
+    };
+    let f = Frame {
+        driver_id: 7,
+        payload: RequestPayload::Forward(req),
+    };
+
+    let bytes = encode_request(&f).unwrap();
+    let archived = parse_request(&bytes).unwrap();
+    let ArchivedRequestPayload::Forward(arch) = &archived.payload else {
+        panic!("expected Forward variant");
+    };
+
+    assert_eq!(arch.rs_slot_ids.as_slice(), &[3u32, 9]);
+    assert_eq!(arch.rs_fold_lens.as_slice(), &[2u32, 4]);
+
+    let flags = arch.rs_slot_flags.as_slice();
+    assert_eq!(flags, &[RS_FLAG_RESET | RS_FLAG_FOLD, RS_FLAG_FOLD]);
+    // Bits decode to the intended per-request semantics.
+    assert!(flags[0] & RS_FLAG_RESET != 0 && flags[0] & RS_FLAG_FOLD != 0);
+    assert!(flags[1] & RS_FLAG_RESET == 0 && flags[1] & RS_FLAG_FOLD != 0);
+}
+
+/// Locks the programmable-sampling output fast-path wire ABI (#27 cut #1): the
+/// per-output eager-D2H destination fields — `sampling_output_dst_ptrs` (raw
+/// host pointers, u64), `sampling_output_dst_lens` (byte capacities), and
+/// `sampling_output_indptr` (per-program CSR) — survive the rkyv round-trip as
+/// aligned parallel arrays. The base `frame_forward_round_trip` leaves these at
+/// `..Default::default()`, so this is the only coverage of the dst descriptors
+/// over the real wire. Two programs: p0 has 2 outputs (Token + Scalar, 4 B
+/// each), p1 has 1 (Token).
+#[test]
+fn frame_forward_sampling_output_round_trip() {
+    let req = ForwardRequest {
+        token_ids: vec![1, 2],
+        position_ids: vec![0, 1],
+        qo_indptr: vec![0, 1, 2],
+        sampling_output_dst_ptrs: vec![0xDEAD_BEEF_0000_1000, 0xDEAD_BEEF_0000_2000, 0xCAFE_0000_0000_3000],
+        sampling_output_dst_lens: vec![4, 4, 4],
+        sampling_output_indptr: vec![0, 2, 3],
+        ..Default::default()
+    };
+    let f = Frame {
+        driver_id: 11,
+        payload: RequestPayload::Forward(req),
+    };
+
+    let bytes = encode_request(&f).unwrap();
+    let archived = parse_request(&bytes).unwrap();
+    let ArchivedRequestPayload::Forward(arch) = &archived.payload else {
+        panic!("expected Forward variant");
+    };
+
+    // u64 host pointers survive the wire intact (in-proc direct-FFI dst).
+    assert_eq!(
+        arch.sampling_output_dst_ptrs.as_slice(),
+        &[0xDEAD_BEEF_0000_1000u64, 0xDEAD_BEEF_0000_2000, 0xCAFE_0000_0000_3000]
+    );
+    assert_eq!(arch.sampling_output_dst_lens.as_slice(), &[4u32, 4, 4]);
+    // Per-program CSR: p0 = outputs [0,2), p1 = output [2,3).
+    assert_eq!(arch.sampling_output_indptr.as_slice(), &[0u32, 2, 3]);
 }
 
 #[test]
@@ -237,6 +320,13 @@ fn forward_response_round_trip() {
         spec_indptr: vec![0, 2, 3],
         spec_tokens: vec![11, 12, 21],
         spec_positions: vec![5, 6, 9],
+        // #32 per-(request,output) [k]-Token two-level CSR: 2 requests × 2 outputs
+        // each ([Token, [k]-Token]). req_indptr partitions output slots by request
+        // (r0→[0,2), r1→[2,4)); indptr partitions tokens per slot (single-Token o=0
+        // empty, [k]-Token o=1 = k=2 tokens).
+        program_tokens_req_indptr: vec![0, 2, 4],
+        program_tokens_indptr: vec![0, 0, 2, 2, 4],
+        program_tokens: vec![279, 280, 555, 556],
         ..Default::default()
     };
     let f = ResponseFrame {
@@ -255,6 +345,9 @@ fn forward_response_round_trip() {
     assert_eq!(fr.spec_indptr.as_slice(), &[0u32, 2, 3]);
     assert_eq!(fr.spec_tokens.as_slice(), &[11u32, 12, 21]);
     assert_eq!(fr.spec_positions.as_slice(), &[5u32, 6, 9]);
+    assert_eq!(fr.program_tokens_req_indptr.as_slice(), &[0u32, 2, 4]);
+    assert_eq!(fr.program_tokens_indptr.as_slice(), &[0u32, 0, 2, 2, 4]);
+    assert_eq!(fr.program_tokens.as_slice(), &[279u32, 280, 555, 556]);
 }
 
 #[test]
@@ -289,4 +382,39 @@ fn corrupt_buffer_rejected() {
     let buf = vec![0xFFu8; 64];
     let result = parse_request(&buf);
     assert!(matches!(result.err(), Some(WireError::Verify(_))));
+}
+
+/// Locks the #27 cut #2 device-alias late channel wire ABI: the per-late-key
+/// `sampling_late_device_ptrs` (device value pointers) + `sampling_late_device_flags`
+/// (R12 self-arm flags) survive the rkyv round-trip as aligned u64 arrays parallel
+/// to `sampling_late_keys`. The base `frame_forward_round_trip` leaves these empty,
+/// so this is the only wire coverage of the direct-H2D late carrier.
+#[test]
+fn frame_forward_sampling_late_device_round_trip() {
+    let req = ForwardRequest {
+        token_ids: vec![1, 2],
+        sampling_late_keys: vec![7, 9],
+        sampling_late_device_ptrs: vec![0xDEAD_0000_0000_A000, 0xDEAD_0000_0000_B000],
+        sampling_late_device_flags: vec![0xF1A6_0000_0000_0001, 0xF1A6_0000_0000_0002],
+        sampling_late_device_lens: vec![19000, 4096],
+        ..Default::default()
+    };
+    let f = Frame {
+        driver_id: 13,
+        payload: RequestPayload::Forward(req),
+    };
+    let bytes = encode_request(&f).unwrap();
+    let archived = parse_request(&bytes).unwrap();
+    let ArchivedRequestPayload::Forward(arch) = &archived.payload else {
+        panic!("expected Forward variant");
+    };
+    assert_eq!(
+        arch.sampling_late_device_ptrs.as_slice(),
+        &[0xDEAD_0000_0000_A000u64, 0xDEAD_0000_0000_B000]
+    );
+    assert_eq!(
+        arch.sampling_late_device_flags.as_slice(),
+        &[0xF1A6_0000_0000_0001u64, 0xF1A6_0000_0000_0002]
+    );
+    assert_eq!(arch.sampling_late_device_lens.as_slice(), &[19000u32, 4096]);
 }

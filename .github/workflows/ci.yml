@@ -50,14 +50,16 @@ jobs:
   # test set.
   #
   #   --exclude pie-server-py : links driver-cuda (needs nvcc) → cuda job only.
-  #   --exclude pie-worker (test step only): pie-worker is exercised by the four
-  #     dedicated jobs below via `--bin pie`. Its *library* tests carry two
-  #     PRE-EXISTING failures (identical to the former `server` crate on main,
-  #     never run because CI only tests `--bin pie`): `config::rejects_public_
-  #     driver_capacity_knobs` and `bootstrap_translate::translates_minimal_
-  #     config` (the latter is filesystem-coupled). They are tracked for a
-  #     follow-up; the build step below still compiles all of pie-worker's
-  #     targets for bitrot coverage.
+  #   --exclude pie-worker (workspace test step): pie-worker's `--bin pie` tests
+  #     need a driver feature (dummy/metal/cuda) and are exercised by the four
+  #     dedicated jobs below. Its *library* tests are pure-Rust (default
+  #     features = no cmake/cuda) and ARE run here explicitly via the
+  #     `cargo test -p pie-worker --lib` step so worker library test-rot is
+  #     caught in the full battery — those lib tests previously ran in NO job at
+  #     all. (The two former failures — the filesystem-coupled
+  #     `translate::translates_minimal_config` and
+  #     `config::rejects_public_driver_capacity_knobs` — are now fixed, so the
+  #     exclusion no longer applies to `--lib`.)
   workspace-verify:
     name: workspace verify (all crates + all targets)
     runs-on: ubuntu-latest
@@ -73,6 +75,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # rust-toolchain.toml pins the wasip3 nightly; this installs the Tier-3
+      # wasm32-wasip3 build prereqs (wasm32-wasip2 libc donor + linker wrapper)
+      # so the runtime integration tests can build their wasip3 inferlets.
+      - name: Set up wasm32-wasip3 toolchain
+        run: ./scripts/setup-wasip3.sh
+
       - name: Cache cargo + cmake build
         uses: actions/cache@v5
         with:
@@ -81,7 +89,7 @@ jobs:
             ~/.cargo/git
             ~/.cache/ccache
             target
-          key: ${{ runner.os }}-workspace-verify-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+          key: ${{ runner.os }}-workspace-verify-${{ hashFiles('**/Cargo.lock', 'driver/**/CMakeLists.txt') }}
           restore-keys: |
             ${{ runner.os }}-workspace-verify-
 
@@ -91,17 +99,27 @@ jobs:
         run: cargo build --workspace --all-targets --exclude pie-server-py
 
       # Run the workspace test set (benches are compiled above, not executed).
-      - name: cargo test (workspace)
-        run: cargo test --workspace --exclude pie-server-py --exclude pie-worker
+      # pie-worker's library tests are pure-Rust, so run them explicitly here to
+      # keep worker test-rot inside the full battery; its `--bin pie` tests need
+      # a driver feature and stay in the dedicated jobs below.
+      - name: cargo test (workspace + pie-worker lib)
+        run: |
+          cargo test --workspace --exclude pie-server-py --exclude pie-worker
+          cargo test -p pie-worker --lib
 
-  # Drift guard for the committed C++ schema header: regenerate it with
-  # pie-schema-bindgen (cbindgen over pie-schema's repr(C)/cabi surface) and
-  # fail if it differs from the committed copy. Complements the runtime
+  # Drift guard for the committed C++ driver ABI header: regenerate it with
+  # pie-driver-abi-cbindgen (cbindgen over pie-driver-abi's repr(C)/cabi surface)
+  # and fail if it differs from the committed copy. Complements the runtime
   # SCHEMA_HASH handshake. Toolchain is PINNED (not @stable) because cbindgen's
   # parse.expand output is toolchain-dependent — pinning keeps the diff stable.
   schema-header-drift:
     name: schema header drift (cbindgen regen)
     runs-on: ubuntu-latest
+    # Pinned to stable 1.91.1 for deterministic cbindgen parse.expand output.
+    # RUSTUP_TOOLCHAIN is forced here so the repo-wide nightly rust-toolchain.toml
+    # (wasip3 epic) does NOT override the dtolnay-installed 1.91.1 in this job.
+    env:
+      RUSTUP_TOOLCHAIN: "1.91.1"
     steps:
       - uses: actions/checkout@v6
 
@@ -119,58 +137,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-schema-bindgen-
 
-      - name: Regenerate committed schema header
+      - name: Regenerate committed driver ABI header
         # RUSTC_BOOTSTRAP=1 is set inside the generator; cbindgen is a dep of
-        # pie-schema-bindgen, so no separate install is needed.
-        run: cargo run -p pie-schema-bindgen
+        # pie-driver-abi-cbindgen, so no separate install is needed.
+        run: cargo run -p pie-driver-abi-cbindgen
 
-      - name: Fail if committed pie_schema.h is stale
+      - name: Fail if committed pie_driver_abi.h is stale
         run: |
-          if ! git diff --exit-code -- protocol/schema/include/pie_schema.h; then
-            echo "::error::protocol/schema/include/pie_schema.h is out of date."
-            echo "Regenerate with: cargo run -p pie-schema-bindgen   (then commit)"
+          if ! git diff --exit-code -- interface/driver/include/pie_driver_abi.h; then
+            echo "::error::interface/driver/include/pie_driver_abi.h is out of date."
+            echo "Regenerate with: cargo run -p pie-driver-abi-cbindgen   (then commit)"
             exit 1
           fi
-
-  pie-worker-portable:
-    name: pie-worker (driver-portable)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build ccache
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo + cmake build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cache/ccache
-            target
-          key: ${{ runner.os }}-pie-worker-portable-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
-
-      - name: cargo build (default = driver-portable)
-        run: cargo build -p pie-worker
-
-      - name: cargo test (pie-worker)
-        run: cargo test -p pie-worker --bin pie
-
-      - name: Verify single-binary linkage
-        run: |
-          file target/debug/pie
-          ldd target/debug/pie
-          # No ggml shared libs should be in the dep tree.
-          ldd target/debug/pie | grep -E "libggml|libllama" \
-            && { echo "FAIL: ggml shared lib leaked into binary"; exit 1; } \
-            || echo "OK: no ggml shared deps"
 
   # Dummy driver — pure Rust, builds on every OS we support. Cheapest
   # gate for "did the standalone wiring break end to end". Runs the
@@ -207,12 +185,12 @@ jobs:
           cargo test -p pie-worker --bin pie \
             --no-default-features --features driver-dummy
 
-  # macOS portable build with Metal backend. Verifies build.rs's
-  # macOS branch + libomp link path. Doesn't run tests against a
-  # real model — just exercises the cmake + link path so PRs that
-  # touch driver/portable or build.rs fail fast on macOS.
-  pie-worker-portable-metal:
-    name: pie-worker (driver-portable + metal)
+  # macOS Metal driver build. Verifies driver/metal's cmake + link
+  # path (libomp) so PRs that touch driver/metal or build.rs fail fast
+  # on macOS. Doesn't run against a real model — just exercises the
+  # cmake + link path.
+  pie-worker-metal:
+    name: pie-worker (driver-metal)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -233,17 +211,13 @@ jobs:
             ~/.cargo/git
             ~/Library/Caches/ccache
             target
-          key: ${{ runner.os }}-pie-worker-portable-metal-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
+          key: ${{ runner.os }}-pie-worker-metal-${{ hashFiles('**/Cargo.lock', 'driver/metal/CMakeLists.txt') }}
 
-      - name: cargo build (driver-portable + metal)
-        env:
-          PIE_PORTABLE_METAL: "1"
-        run: cargo build -p pie-worker
+      - name: cargo build (driver-metal)
+        run: cargo build -p pie-worker --no-default-features --features driver-metal
 
       - name: cargo test (pie-worker)
-        env:
-          PIE_PORTABLE_METAL: "1"
-        run: cargo test -p pie-worker --bin pie
+        run: cargo test -p pie-worker --bin pie --no-default-features --features driver-metal
 
   # Cuda build — runs only when an opt-in label or schedule fires
   # (no CUDA on the default GH-hosted runners). Add a self-hosted

@@ -19,11 +19,19 @@ path = "src/main.rs"
 
 [features]
 # bin/pie is the composition root that selects the driver backend; forward the
-# driver flavors to the embedded worker. Default = portable (matches bin/worker).
-default = ["driver-portable"]
-driver-portable = ["pie-worker/driver-portable"]
+# driver flavors to the embedded worker. Default = none (dummy fallback);
+# enable driver-cuda for real inference.
+default = []
 driver-cuda = ["pie-worker/driver-cuda"]
 driver-dummy = ["pie-worker/driver-dummy"]
+# Probe + PTIR thrust-2 passthroughs to the embedded worker (→ runtime).
+profile-fire = ["pie-worker/profile-fire"]
+profile-driver-cuda = ["pie-worker/profile-driver-cuda"]
+run-ahead = ["pie-worker/run-ahead"]
+# PTIR thrust-3 host surface (register-program / instantiate / pipeline). Enables
+# the runtime `ptir` feature (host WIT impl + submit dispatch). pie-bin depends on
+# `pie` directly, and cargo unifies the feature across the embedded worker's `pie`.
+ptir = ["pie/ptir"]
 
 [dependencies]
 # Shared process skeleton (CLI flags, paths, tracing, signals, /metrics, banner).
@@ -58,6 +66,14 @@ xz2 = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# The runtime lib (`pie`) — read `inference::get_stats()` in-process to observe
+# the scheduler's fire probes (the thrust-2 bubble/quorum gate) after a decode.
+pie = { path = "../../runtime" }
+# fd-level stderr capture for the gate-1 R=2 merge-witness assert (cuda_grammar_r2):
+# boot_4090 runs the engine in-process, so the scheduler/driver write their
+# `[pie-sched-trace] fire requests=N` / `[ir-trace] forward_R=N` merge witnesses
+# straight to THIS process's fd 2 — the harness dup2's it to a file to assert on.
+libc = "0.2"
 # Client edge for the 4090 capability harness (programmable_sampler_4090): the
 # in-process submit path (connect → add_program → launch → wait_for_return).
 pie-client = { path = "../../client/rust" }

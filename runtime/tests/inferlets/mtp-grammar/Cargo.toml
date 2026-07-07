@@ -1,0 +1,12 @@
+[package]
+name = "mtp-grammar"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet.workspace = true
+inferlet-macros.workspace = true
+ptir = { path = "../../../../sdk/rust/ptir" }

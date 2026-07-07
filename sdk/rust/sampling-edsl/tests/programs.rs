@@ -2,6 +2,7 @@
 //! spec-verify greedy/lossless) and the WS5 `Sampler` sugar, on PSIR v4.
 //! Each program builds, round-trips through the canonical encoder/decoder, and
 //! passes the canonical validator.
+#![allow(deprecated)] // exercises the deprecated WS5 sugar (`lower_sampler`) until removal.
 
 use sampling_edsl::ir::{self, Op};
 use sampling_edsl::program::{
@@ -50,17 +51,19 @@ fn mirostat_outputs_token_and_scalar() {
 
 // ── grammar ───────────────────────────────────────────────────────────────--
 #[test]
-fn grammar_greedy_additive_mask() {
+fn grammar_greedy_mask_apply() {
     let (b, keys) = grammar(VOCAB).expect("builds");
     roundtrip(&b);
     assert_eq!(b.outputs, vec![OutputKind::Token]);
     assert_eq!(b.host_inputs.len(), 1);
     let m = b.host_inputs[0];
     assert_eq!(m.key, keys.mask);
-    assert_eq!(m.dtype, ir::DType::F32);
-    assert_eq!(m.shape, ir::Shape::vector(VOCAB));
-    // argmax(Add(logits, mask)); greedy => no RNG.
-    assert!(has(&b, |o| matches!(o, Op::Add(_, _))));
+    // Packed allowed-token bitmask: [ceil(vocab/32)] u32, late-bound.
+    assert_eq!(m.dtype, ir::DType::U32);
+    assert_eq!(m.shape, ir::Shape::vector(VOCAB.div_ceil(32)));
+    assert_eq!(m.ready, ir::Readiness::Late);
+    // argmax(mask_apply(logits, mask)); greedy => no RNG.
+    assert!(has(&b, |o| matches!(o, Op::MaskApply { .. })));
     assert!(has(&b, |o| matches!(o, Op::ReduceArgmax(_))));
     assert!(!has(&b, |o| matches!(o, Op::Rng { .. })));
 }
@@ -171,7 +174,7 @@ fn sugar_min_p_is_logit_space() {
 fn sugar_top_k_top_p_has_both_predicates() {
     let b = build_sampler(SamplerSpec::TopKTopP { temperature: 0.9, k: 40, p: 0.95 }, VOCAB).unwrap();
     roundtrip(&b);
-    assert!(has(&b, |o| matches!(o, Op::PivotThreshold { predicate: ir::Predicate::RankLe(40), .. })));
+    assert!(has(&b, |o| matches!(o, Op::PivotThreshold { predicate: ir::Predicate::RankLe(_), .. })));
     assert!(has(&b, |o| matches!(o, Op::PivotThreshold { predicate: ir::Predicate::CummassLe(_), .. })));
 }
 

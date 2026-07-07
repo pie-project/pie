@@ -165,11 +165,15 @@ add_library(pie_driver_cuda_lib STATIC
   src/entry.cpp
   src/executor/persistent_inputs.cpp
   src/executor/executor.cpp
+  src/ptir/ptir_dispatch.cu
   src/service/inproc_service.cpp
   src/response_subpass.cpp
   src/sampling_dispatch.cpp
   src/sampling_ir/runtime.cpp
   src/sampling_ir/reader.cpp
+  src/sampling_ir/next_input.cpp
+  src/sampling_ir/tensor_io.cpp
+  src/sampling_ir/frame_carrier.cpp
   src/sampling_ir/codegen.cpp
   src/sampling_ir/jit.cpp
   src/sampling_ir/jit_backend.cpp
@@ -222,6 +226,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/kv_cache_format.cpp
   src/kv_cache.cpp
   src/ops/gemm.cpp
+  src/ops/beam_csrs.cpp
+  src/ops/beam_attention.cpp
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
   src/ops/attention_xqa.cu
@@ -238,6 +244,10 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/slab_scatter.cu
   src/kernels/argmax.cu
   src/kernels/kv_paged.cu
+  src/kernels/beam_mask_adapter.cu
+  src/kernels/gather_tokens.cu
+  src/kernels/envelope.cu
+  src/kernels/geometry.cu
   src/kernels/mla_paged.cu
   src/kernels/kimi_mla.cu
   src/kernels/dsv4_routing.cu
@@ -556,10 +566,123 @@ target_compile_options(test_causal_conv1d PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(test_causal_conv1d PRIVATE CUDA::cudart)
 
+# PTIR M3 — gather_tokens correctness + bandwidth (compact's kernel, W5). Compiles
+# the standalone kernel; verifies packed dst == deterministic host reference and
+# reports D2D bandwidth vs cudaMemcpy (>= 80% gate).
+add_executable(test_gather_tokens
+  tests/test_gather_tokens.cu
+  src/kernels/gather_tokens.cu)
+target_include_directories(test_gather_tokens PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_gather_tokens PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_gather_tokens PRIVATE CUDA::cudart)
+add_test(NAME gather_tokens COMMAND test_gather_tokens)
+
+# Beam [B,P] G2 SEAM 1 — kvm dense→packed-mask adapter, gated by the fork-freeze
+# golden geometry (echo: the goldens ARE the adapter's test vectors).
+add_executable(test_beam_mask_adapter
+  tests/beam_mask_adapter_test.cu
+  src/kernels/beam_mask_adapter.cu)
+target_include_directories(test_beam_mask_adapter PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_beam_mask_adapter PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_beam_mask_adapter PRIVATE CUDA::cudart)
+add_test(NAME beam_mask_adapter COMMAND test_beam_mask_adapter)
+
+# Beam [B,P] G2 SEAM 1+3 host glue — per-beam CSR construction vs the fork-freeze
+# golden + alpha's slot-0 padding guardrail (pure host, no CUDA).
+add_executable(test_beam_csrs
+  tests/beam_csrs_test.cpp
+  src/ops/beam_csrs.cpp)
+target_include_directories(test_beam_csrs PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME beam_csrs COMMAND test_beam_csrs)
+
+# PTIR M3.2 — Quest envelope kernels (envelope_recompute + envelope_dot).
+# Verifies the min/max maintenance vs a CPU reduction and the importance score
+# vs the CPU golden mirroring pie_sampling_ir::eval::envelope_dot_reference.
+add_executable(test_envelope_dot
+  tests/test_envelope_dot.cu
+  src/kernels/envelope.cu)
+target_include_directories(test_envelope_dot PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_envelope_dot PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_envelope_dot PRIVATE CUDA::cudart)
+add_test(NAME envelope_dot COMMAND test_envelope_dot)
+
+# PTIR M5 — geometry as data (C1 FINAL) kv_len + slot→block resolve handshake.
+# Verifies device-produced kv_len (launch_derive_kv_len) == the host reference
+# formula from request.rs, AND device slot→physical-BlockId resolution
+# (launch_resolve_slot_to_block) == host, bit-for-bit over randomized geometries.
+add_executable(test_kv_len_geometry
+  tests/test_kv_len_geometry.cu
+  src/kernels/geometry.cu)
+target_include_directories(test_kv_len_geometry PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_kv_len_geometry PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_kv_len_geometry PRIVATE CUDA::cudart)
+add_test(NAME kv_len_geometry COMMAND test_kv_len_geometry)
+
+
 # Wire-format unit tests. Pure C++ (no CUDA), short runtime; CTest runs
 # them under `cmake --build build --target test`.
 add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
 target_include_directories(test_brle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# PTIR M2b — fork-geometry masked-attention host gate: fork geometry → BRLE →
+# src/brle.cpp decode → reference oracle, asserting masking == prefix truncation
+# (overview §5.2/§6.4). Pure C++, no CUDA; the same (Q,K/V,BRLE) tuples the CUDA
+# parity test feeds the driver's flashinfer prefill-custom path.
+add_executable(test_masked_attention_geometry
+  tests/masked_attention_geometry_test.cpp src/brle.cpp)
+target_include_directories(test_masked_attention_geometry PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+add_test(NAME masked_attention_geometry
+  COMMAND test_masked_attention_geometry)
+
+# PTIR M2b — fork-geometry masked-attention GPU parity: the same (Q,K/V,BRLE)
+# tuples the host gate uses, run through the production flashinfer prefill-custom
+# (kCustom) path vs the reference oracle within fp32 tol. Links the driver lib
+# (the prebuilt attention/brle/workspace code) — no heavy kernel recompile.
+add_executable(masked_attention_parity tests/masked_attention_parity.cu)
+target_include_directories(masked_attention_parity PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_compile_options(masked_attention_parity PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(masked_attention_parity PRIVATE
+  pie_driver_cuda_lib CUDA::cudart)
+add_test(NAME masked_attention_parity COMMAND masked_attention_parity)
+
+add_executable(test_decode_batch_parity tests/test_decode_batch_parity.cu)
+target_include_directories(test_decode_batch_parity PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_compile_options(test_decode_batch_parity PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_decode_batch_parity PRIVATE
+  pie_driver_cuda_lib CUDA::cudart)
+add_test(NAME decode_batch_parity COMMAND test_decode_batch_parity)
+
+add_executable(test_decode_fused_write_parity tests/test_decode_fused_write_parity.cu)
+target_include_directories(test_decode_fused_write_parity PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_compile_options(test_decode_fused_write_parity PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_decode_fused_write_parity PRIVATE
+  pie_driver_cuda_lib CUDA::cudart)
+add_test(NAME decode_fused_write_parity COMMAND test_decode_fused_write_parity)
+
+add_executable(test_decode_cobatch_chain tests/test_decode_cobatch_chain.cu)
+target_include_directories(test_decode_cobatch_chain PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_compile_options(test_decode_cobatch_chain PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_decode_cobatch_chain PRIVATE
+  pie_driver_cuda_lib CUDA::cudart)
+add_test(NAME decode_cobatch_chain COMMAND test_decode_cobatch_chain)
 
 add_executable(test_driver_common
   tests/test_common.cpp
@@ -640,6 +763,25 @@ target_include_directories(test_sampling_ir_reader PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
+# #24 graph_variant bitfield collision — pure-host boundary unit test. Proves the
+# latent collision was real at graph_layout=64 (OLD encoding aliased small_spec)
+# and the new make_graph_variant keeps them distinct. No GPU, no CUDA.
+add_executable(test_graph_variant
+  tests/graph_variant_test.cpp)
+target_include_directories(test_graph_variant PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME graph_variant COMMAND test_graph_variant)
+
+# PTIR tier-2 graph-key extension (Thrust 3 / charlie, P6.1) — pure-host unit
+# test for the program-set hash (C3) added to ForwardGraphKey: backward-compat
+# (non-PTIR = 0), program-set distinctness, order-independent+dedup fold. No GPU.
+add_executable(test_ptir_graph_key
+  tests/ptir_graph_key_test.cpp)
+target_include_directories(test_ptir_graph_key PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_ptir_graph_key PRIVATE CUDA::cudart)
+add_test(NAME ptir_graph_key COMMAND test_ptir_graph_key)
+
 # Cross-request batching (#10 / delta) — CPU unit test for the grouping partition
 # (group fire rows by program handle = the canonical bytecode-hash). Pure host
 # logic, no GPU; group.hpp pulls runtime.hpp (cuda_runtime.h) so link cudart for
@@ -672,6 +814,34 @@ target_include_directories(test_next_input_device PRIVATE
 target_link_libraries(test_next_input_device PRIVATE CUDA::cudart)
 add_test(NAME sampling_ir_next_input_device COMMAND test_next_input_device)
 
+# #6 WS-L4 tensor-I/O fast-path (echo) — host<->driver direct-FFI: dedicated copy
+# stream + two dedicated slab arenas (inferlet-device + sampler-output-pinned), the
+# async H2D write with Model-A self-arming R12 flag, and the eager-D2H read-cache.
+# Standalone device de-risk before composing into the executor at foxtrot's WIT
+# freeze. Needs a GPU.
+add_executable(test_tensor_io_device
+  tests/test_tensor_io_device.cpp
+  src/sampling_ir/tensor_io.cpp)
+target_include_directories(test_tensor_io_device PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_tensor_io_device PRIVATE CUDA::cudart)
+add_test(NAME sampling_ir_tensor_io_device COMMAND test_tensor_io_device)
+
+# X2 — CUDA frames/mirrors carrier isolation test (bravo). Device de-risk of the
+# real-device dual of X1's mock control plane: register/bind allocates a device
+# frame + pinned mirror/words (distinct, non-null bases), the carrier D2H-mirrors a
+# written frame + publishes the pinned ring word, the copy-stream host callback
+# fires the completion (word passes target), and close reclaims the regions. Needs
+# a GPU; wired for the later validation batch (CUDA validation deferred per the
+# velocity-shift directive).
+add_executable(test_frame_carrier_device
+  tests/test_frame_carrier_device.cpp
+  src/sampling_ir/frame_carrier.cpp)
+target_include_directories(test_frame_carrier_device PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_frame_carrier_device PRIVATE CUDA::cudart)
+add_test(NAME sampling_ir_frame_carrier_device COMMAND test_frame_carrier_device)
+
 # Sampling-IR codegen (Lane L2 / charlie, W2): lowers golden PSIR programs to a
 # KernelDAG, NVRTC-compiles + launches each kernel via the driver API, and checks
 # the result against a CPU reference (incl. Gumbel-max sample_temp parity). Needs
@@ -699,6 +869,19 @@ target_include_directories(test_sampling_ir_jit PRIVATE
 target_link_libraries(test_sampling_ir_jit PRIVATE
   CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
+# #11 JIT compile-axis load-test (delta). Drives JitEngine directly (no codegen)
+# to quantify the compile-axis coefficients for echo's M-batch + alpha's #10
+# cost model: compile/finalize/fire µs/program, dedup (compiles_run==K), and the
+# PIE_JIT_POOL_THREADS pool-width knee. Same minimal deps as test_sampling_ir_jit.
+add_executable(jit_load_test
+  tests/jit_load_test.cpp
+  src/sampling_ir/jit.cpp)
+target_include_directories(jit_load_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(jit_load_test PRIVATE
+  CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
+add_test(NAME jit_load COMMAND jit_load_test)
+
 # Sampling-IR backend test — exercises the full facade: PSIR bytecode → decode
 # (charlie reader) → lower (charlie codegen) → NVRTC JIT (delta) → driver-API
 # launch, through echo's IProgramBackend. It needs charlie's codegen/reader and
@@ -720,6 +903,37 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
   target_link_libraries(test_sampling_ir_backend PRIVATE
     CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
   add_test(NAME sampling_ir_backend COMMAND test_sampling_ir_backend)
+
+  # #12 driver-side program->kind recognizer (delta). Host-only: hashes the
+  # driver's OWN baked standard_sampler_program(k,V) into a {hash->kind} table and
+  # matches an incoming program by program_hash. The round-trip (baked program ->
+  # recognize -> same kind) proves the enum->graph behavior-preserving property
+  # driver-internally; golf's #8 recognizer_golden.txt extends it cross-language
+  # at #12-phase-1. No CUDA: program_hash is header-inline, the programs are baked
+  # consts. (Guarded with the backend block since pie_standard_samplers.h needs
+  # codegen.hpp for the binding-manifest types.)
+  add_executable(test_sampling_ir_recognizer
+    tests/test_sampling_ir_recognizer.cpp
+    src/sampling_ir/reader.cpp)
+  target_include_directories(test_sampling_ir_recognizer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME sampling_ir_recognizer COMMAND test_sampling_ir_recognizer)
+
+  # #35-A regression guard (lane L2 / charlie): batched (M>1) lowering must REJECT
+  # matrix (per-row/cross-row) programs so the backend falls back to the M=1 matrix
+  # path. Folding a `[k, vocab]` matrix program into the per-batch-row batched
+  # kernel conflates the matrix (k-draft) axis with the batch axis and miscompiles
+  # cross-row ops (spec-verify's cumprod accept-scan). Pure host (lower_bytecode +
+  # the matrix/vector goldens); no CUDA.
+  add_executable(test_sampling_ir_batched_matrix_reject
+    tests/test_sampling_ir_batched_matrix_reject.cpp
+    src/sampling_ir/codegen.cpp
+    src/sampling_ir/reader.cpp)
+  target_include_directories(test_sampling_ir_batched_matrix_reject PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  add_test(NAME sampling_ir_batched_matrix_reject
+    COMMAND test_sampling_ir_batched_matrix_reject)
 
   # Driver-level parity gate (lane L4 / echo): the IR argmax program, run through
   # echo's IProgramBackend exactly as the executor invokes it, must match the
@@ -841,6 +1055,28 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
   target_link_libraries(bench_sampling_ir PRIVATE
     CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
+  # #10 M-batch occupancy/sync micro-bench (lane L4 / echo) — the land-vs-defer
+  # measurement: the LANDED sequential scatter (N × num_rows=1 launch + N syncs)
+  # vs the M-batch (1 × num_rows=N + 1 sync) on the real argmax-over-vocab kernel
+  # (OneBlockPerRow ⇒ single-row = grid=1 block). delta's #11 C3 (trivial-kernel
+  # launch) can't show the occupancy win; this does. Manual GPU perf run (not a
+  # ctest): cmake --build build --target bench_mbatch_occupancy
+  #          ./build/bin/bench_mbatch_occupancy
+  # IR-JIT path only (no hardwired/flashinfer comparison) ⇒ just the JIT sources.
+  add_executable(bench_mbatch_occupancy
+    tests/bench_mbatch_occupancy.cu
+    src/sampling_ir/jit.cpp
+    src/sampling_ir/jit_backend.cpp
+    src/sampling_ir/codegen.cpp
+    src/sampling_ir/reader.cpp)
+  target_include_directories(bench_mbatch_occupancy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  target_compile_options(bench_mbatch_occupancy PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+  target_link_libraries(bench_mbatch_occupancy PRIVATE
+    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
+
   # WS4 part-1 test (lane L4 / echo): drive charlie's greedy spec-verify program
   # through SamplingIrRuntime::try_run — matrix Intrinsic(Logits) verify block +
   # submit-bound draft vector + multi-element Vector<k+1> Token output — vs a CPU
@@ -876,6 +1112,70 @@ target_compile_options(test_sampling_ir_matrix PRIVATE
 target_link_libraries(test_sampling_ir_matrix PRIVATE
   CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
+# PTIR tier-0 op-kernel library parity (Thrust 3 / charlie, P4.2). Runs every
+# prebuilt row-parallel tier-0 kernel (src/ptir/tier0_kernels.cuh) on the GPU
+# and diffs against the host reference evaluator (src/ptir/host_eval.hpp) — the
+# self-check gate before echo's canonical golden vectors. Standalone (no driver
+# lib); needs a GPU at runtime.
+add_executable(test_ptir_tier0
+  tests/ptir_tier0_test.cu)
+target_include_directories(test_ptir_tier0 PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_ptir_tier0 PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_ptir_tier0 PRIVATE
+  CUDA::cudart)
+
+# PTIR tier-0 stage-runner (Thrust 3 / charlie, P4.2). Drives Tier0Runner over
+# hand-built traces: loop-carried channel ping-pong, readiness-miss dummy-run +
+# recovery, argmax epilogue (logits-intrinsic bind), capacity-1 back-pressure —
+# the overview §7.1 readiness/predicated-commit/epoch-ring-bump machinery.
+# Standalone (no driver lib); needs a GPU.
+add_executable(test_ptir_runner
+  tests/ptir_runner_test.cu)
+target_include_directories(test_ptir_runner PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_ptir_runner PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_ptir_runner PRIVATE
+  CUDA::cudart)
+
+# PTIR container reader conformance (Thrust 3 / charlie, P2/P4). Host-only: decodes
+# echo's golden `PTIR` v1 containers (tests/golden-ptir, vendored from
+# interface/sampling-ir/tests/golden-ptir) and checks container_hash (FNV-1a64) +
+# the derived readiness table against echo's oracle byte-for-byte. No GPU.
+add_executable(test_ptir_container
+  tests/ptir_container_test.cpp)
+target_include_directories(test_ptir_container PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# PTIR tier-1 JIT fusion gate (Thrust 3 / charlie, P5). Emits a fused epilogue
+# kernel (src/ptir/tier1_codegen.hpp), NVRTC-compiles + launches it, and asserts
+# tier-1 == tier-0 (the stage-runner) on the same trace — greedy + temp/Gumbel
+# sample fused into ONE kernel. Needs a GPU + NVRTC at runtime.
+add_executable(test_ptir_tier1
+  tests/ptir_tier1_test.cu)
+target_include_directories(test_ptir_tier1 PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_ptir_tier1 PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_ptir_tier1 PRIVATE
+  CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
+
+# PTIR cross-backend golden step-exec gate (Thrust 3 / charlie, P4). Decodes
+# echo's ACTUAL golden container bytes + PTIB typed sidecar (src/ptir/bound.hpp),
+# translates to an executable Trace, and runs it through the tier-0 stage-runner
+# with echo's canonical inputs/seeds — matching echo's step/take results
+# byte-for-byte (the golden-model conformance oracle). Needs a GPU.
+add_executable(test_ptir_golden_exec
+  tests/ptir_golden_exec_test.cu)
+target_include_directories(test_ptir_golden_exec PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_ptir_golden_exec PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_ptir_golden_exec PRIVATE
+  CUDA::cudart)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
@@ -891,6 +1191,13 @@ add_test(NAME sampling_ir_primitives COMMAND test_sampling_ir_primitives)
 add_test(NAME sampling_ir_reader COMMAND test_sampling_ir_reader)
 add_test(NAME sampling_ir_codegen COMMAND test_sampling_ir_codegen)
 add_test(NAME sampling_ir_matrix COMMAND test_sampling_ir_matrix)
+add_test(NAME ptir_tier0 COMMAND test_ptir_tier0)
+add_test(NAME ptir_runner COMMAND test_ptir_runner)
+add_test(NAME ptir_container COMMAND test_ptir_container
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+add_test(NAME ptir_tier1 COMMAND test_ptir_tier1)
+add_test(NAME ptir_golden_exec COMMAND test_ptir_golden_exec
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
@@ -911,5 +1218,5 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
 # -lculibos -lpthread -lrt -ldl`, runs at runtime, and yields `ldd`
 # output with zero non-system shared libs. M4 wires worker/standalone's
 # `--features driver-cuda` build.rs to consume `pie_driver_cuda_lib`
-# with those static link flags (mirror the portable side's `BUILD_SHARED_LIBS=OFF`
+# with those static link flags (mirror the metal side's `BUILD_SHARED_LIBS=OFF`
 # trick, plus explicit `-l:libcublas_static.a` group).

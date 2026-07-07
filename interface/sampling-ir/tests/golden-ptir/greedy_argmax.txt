@@ -1,0 +1,16 @@
+name: greedy_argmax
+hash: 0xff694395428759fe
+container: 5054495201000000000000000200000001000000010000000101010000000100000000010101010000000100000002000000000000000306000000a000000002010000000800000039000000000108000000330100000039020000000101000000920000000003000000920100000003000000
+verdict: OK
+sidecar: 5054494201000000fe598742954369ff0200000000000200000000000000ff00010000000301010000000304000000000201000000080000000001080000000100010101000000
+readiness: chan=0 phase=0xff dir=NeedsFull
+readiness: chan=1 phase=0x03 dir=NeedsEmpty
+class: chan=0 FullRing
+class: chan=1 FullRing
+seed chan=0 = I32([1])
+inputs 0: PassInputs { logits: Some(F32([0.0, 1.0, 9.0, 2.0, 0.0, 0.0, 0.0, 3.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+step 0: committed=true missed=None sinks=0
+take chan=1 = I32([2])
+inputs 1: PassInputs { logits: Some(F32([7.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+step 1: committed=true missed=None sinks=0
+take chan=1 = I32([0])

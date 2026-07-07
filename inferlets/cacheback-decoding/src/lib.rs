@@ -1,18 +1,16 @@
-//! Demonstrates CacheBack speculative decoding — a manual loop with a
-//! cached draft model.
+//! CacheBack speculative decoding on the raw low-level WIT (keep-core), off the
+//! `Context`/`Forward` facade.
 //!
-//! A separate "drafter" context generates candidate tokens; the main
-//! context verifies them in a single forward pass. Accepted tokens commit;
-//! rejected tokens are rolled back from both contexts via
-//! [`Context::truncate`]. Draft tokens are sent as regular `input` (not
-//! speculative) so working-token bookkeeping stays consistent.
+//! A separate lightweight "drafter" (its own `KvWorkingSet`) greedily proposes
+//! candidate tokens; the main sequence verifies them in ONE forward pass
+//! (`sampler::argmax_matrix_program` — argmax at every `[anchor, drafts]`
+//! position). Accepted tokens commit as working KV; the rejected suffix is rolled
+//! back from BOTH sequences via the inline raw `kv_truncate` (the retired
+//! `Context::truncate`: `seq_len -= n` + `kv.free` the trailing empty pages).
 
-use inferlet::{
-    Context, Result,
-    model::Model,
-    runtime,
-    sample::Sampler,
-};
+use inferlet::inference::ForwardPass;
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{chat, geometry, model, sampler, Result};
 use serde::Deserialize;
 use std::time::Instant;
 
@@ -30,143 +28,169 @@ fn default_prompt() -> String { "Explain quantum computing.".to_string() }
 fn default_max_tokens() -> usize { 256 }
 fn default_draft_length() -> usize { 4 }
 
-/// Simple greedy drafter on its own context.
+/// Raw n-token KV rollback (the keep-core equivalent of `Context::truncate`):
+/// drop the trailing `n` materialized tokens + free the pages that no longer
+/// hold a live token. `n` is clamped to `*seq_len`.
+fn kv_truncate(kv: &KvWorkingSet, seq_len: &mut u32, n: u32) {
+    let n = n.min(*seq_len);
+    if n == 0 {
+        return;
+    }
+    *seq_len -= n;
+    let page = kv.page_size();
+    let live_pages = seq_len.div_ceil(page);
+    let have = kv.size();
+    if have > live_pages {
+        let drop: Vec<u32> = (live_pages..have).collect();
+        let _ = kv.free(&drop);
+    }
+}
+
+/// Read a `[n]`-Token output tensor as `u32` ids.
+async fn read_tokens(pass: ForwardPass) -> Result<Vec<u32>> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("read: {e:?}"))?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32)
+        .collect())
+}
+
+/// A lightweight greedy drafter on its own `KvWorkingSet` — accumulates tokens
+/// across `draft` calls; `rollback` truncates the rejected suffix.
 struct GreedyDrafter {
-    ctx: Context,
+    kv: KvWorkingSet,
+    seq_len: u32,
+    fresh: bool,
 }
 
 impl GreedyDrafter {
-    fn new(model: &Model) -> Result<Self> {
-        Ok(Self { ctx: Context::new(model)? })
+    fn new() -> Self {
+        Self { kv: KvWorkingSet::new(), seq_len: 0, fresh: true }
     }
 
-    /// Generate `draft_length` greedy tokens starting from `seed`.
-    /// Returns whatever fraction completes before any forward pass fails.
-    async fn draft(&mut self, seed: u32, draft_length: usize) -> Vec<u32> {
+    /// Generate `draft_length` greedy tokens starting from `seed`. Returns
+    /// whatever completes before any fire fails.
+    async fn draft(
+        &mut self,
+        seed: u32,
+        draft_length: usize,
+        greedy: &sampler::LoweredSampler,
+    ) -> Result<Vec<u32>> {
+        let page = self.kv.page_size();
         let mut tokens = Vec::with_capacity(draft_length);
         let mut current = seed;
-
         for _ in 0..draft_length {
-            let mut pass = self.ctx.forward();
-            pass.input(&[current]);
-            let h = pass.sample(&[0], Sampler::Argmax);
-            let out = match pass.execute().await {
-                Ok(o) => o,
-                Err(_) => break,
-            };
-            match out.token(h) {
-                Some(t) => {
+            let pass = ForwardPass::new();
+            if self.fresh {
+                pass.fresh_generate();
+                self.fresh = false;
+            }
+            let geom =
+                geometry::ensure_pages(&self.kv, geometry::kv_write_geometry(self.seq_len, 1, page))?;
+            geometry::attach_kv_write(&pass, &self.kv, &geom);
+            pass.input_tokens(&[current], &[self.seq_len]);
+            pass.sampler(&greedy.program, greedy.bindings(self.seq_len)?);
+            pass.execute();
+            self.seq_len += 1;
+            match read_tokens(pass).await?.first() {
+                Some(&t) => {
                     current = t;
                     tokens.push(t);
                 }
                 None => break,
             }
         }
-        tokens
+        Ok(tokens)
     }
 
     fn rollback(&mut self, n: u32) {
-        self.ctx.truncate(n);
+        kv_truncate(&self.kv, &mut self.seq_len, n);
     }
 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let prompt = input.prompt;
     let max_tokens = input.max_tokens;
     let draft_length = input.draft_length;
 
     let start = Instant::now();
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-    let tokenizer = model.tokenizer();
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let stop_tokens = chat::stop_tokens();
+    let vocab = model::output_vocab_size();
 
-    let mut ctx = Context::new(&model)?;
+    let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
+    prompt.extend(chat::cue());
 
-    // Fill prompt and flush to populate the KV cache.
-    ctx.system("You are a helpful assistant.")
-        .user(&prompt)
-        .cue();
-    ctx.flush().await?;
+    let kv = KvWorkingSet::new();
+    let page = kv.page_size();
+    let mut seq_len: u32 = 0;
 
-    // Bootstrap: append the last cue token to drive a single forward pass
-    // and read its next-token prediction.
+    let greedy = sampler::sampler_program(sampler::SamplerSpec::Argmax, vocab)?;
+
+    // Bootstrap: materialize the prompt KV and read the first token = argmax of
+    // the last prompt position.
     let first_token = {
-        let cue = inferlet::chat::cue(&model);
-        let trigger = *cue.last().unwrap_or(&0);
-        let mut pass = ctx.forward();
-        pass.input(&[trigger]);
-        let h = pass.sample(&[0], Sampler::Argmax);
-        pass.execute().await?
-            .token(h)
-            .ok_or("Bootstrap produced no token")?
+        let n = prompt.len() as u32;
+        let pass = ForwardPass::new();
+        pass.fresh_generate();
+        let geom = geometry::ensure_pages(&kv, geometry::kv_write_geometry(seq_len, n, page))?;
+        geometry::attach_kv_write(&pass, &kv, &geom);
+        let positions: Vec<u32> = (seq_len..seq_len + n).collect();
+        pass.input_tokens(&prompt, &positions);
+        pass.sampler(&greedy.program, greedy.bindings(seq_len + n - 1)?);
+        pass.execute();
+        seq_len += n;
+        *read_tokens(pass).await?.first().ok_or("bootstrap produced no token")?
     };
 
-    let mut drafter = GreedyDrafter::new(&model)?;
-
+    let mut drafter = GreedyDrafter::new();
     let mut all_generated: Vec<u32> = vec![first_token];
     let mut anchor = first_token;
     let mut total_accepted = 1usize;
     let mut total_steps = 0usize;
 
     while total_accepted < max_tokens {
-        // Step 1: draft tokens off the secondary context.
-        let draft_tokens = drafter.draft(anchor, draft_length).await;
+        // Step 1: draft off the secondary sequence.
+        let draft_tokens = drafter.draft(anchor, draft_length, &greedy).await?;
         if draft_tokens.is_empty() {
             break;
         }
 
-        // Step 2: verification pass. Sample at every position so we can
-        // compare draft predictions vs. anchor-conditioned predictions.
+        // Step 2: verify [anchor] + drafts in one fire — argmax at every position.
         let mut verify_input = vec![anchor];
         verify_input.extend_from_slice(&draft_tokens);
-        let input_count = verify_input.len();
+        let n = verify_input.len() as u32;
+        let verify = sampler::argmax_matrix_program(vocab, n)?;
 
-        // Run the verify pass with the page commit DEFERRED: all
-        // `input_count` tokens (anchor + every draft) stay in *working*
-        // pages so the rejected suffix can be truncated below. Committing
-        // here (the `Forward` default) would lock unverified drafts into
-        // committed KV that `truncate` cannot reach, corrupting the cache.
-        let mut pass = ctx.forward();
-        pass.input(&verify_input);
-        pass.defer_commit();
-        let sample_indices: Vec<u32> = (0..input_count as u32).collect();
-        let h = pass.sample(&sample_indices, Sampler::Argmax);
-        let out = pass.execute().await?;
-        let verified = out.tokens_at(h);
-
+        let pass = ForwardPass::new();
+        let geom = geometry::ensure_pages(&kv, geometry::kv_write_geometry(seq_len, n, page))?;
+        geometry::attach_kv_write(&pass, &kv, &geom);
+        let positions: Vec<u32> = (seq_len..seq_len + n).collect();
+        pass.input_tokens(&verify_input, &positions);
+        pass.sampler(&verify.program, verify.bindings(&positions)?);
+        pass.execute();
+        let verified = read_tokens(pass).await?;
         if verified.is_empty() {
             break;
         }
 
-        // Step 3: count how many drafts the verifier accepts. The first
-        // verified token is always accepted (anchor's own next prediction);
-        // each subsequent draft accepted iff verified[i-1] == draft[i-1].
-        let mut accepted_count = 1;
+        // Step 3: accepted = anchor's own prediction + each matching draft.
+        let mut accepted_count = 1usize;
         for i in 1..verified.len().min(draft_tokens.len() + 1) {
-            let draft_idx = i - 1;
-            if draft_idx < draft_tokens.len() && verified[i - 1] == draft_tokens[draft_idx] {
+            if i - 1 < draft_tokens.len() && verified[i - 1] == draft_tokens[i - 1] {
                 accepted_count += 1;
             } else {
                 break;
             }
         }
-
         let newly_accepted: Vec<u32> = verified[..accepted_count.min(verified.len())].to_vec();
 
-        // Step 4: truncate the rejected tokens off the verifier context.
-        // The verify pass left all `input_count` tokens in *working* pages
-        // (commit was deferred), so dropping the last `n_rejected` removes
-        // exactly the rejected suffix and leaves the accepted prefix as
-        // working KV for the next step. Keeping the prefix uncommitted is
-        // what makes the output independent of `draft_length`.
-        let n_rejected = (input_count as u32) - (accepted_count as u32);
-        ctx.truncate(n_rejected);
+        // Step 4: roll back the rejected suffix from the main sequence — keep
+        // `accepted_count` of the `n` written tokens.
+        kv_truncate(&kv, &mut seq_len, n - accepted_count as u32);
 
-        // Roll back rejected drafts from the drafter too. The drafter
-        // wrote `draft_length` tokens; `accepted_count - 1` of them were
-        // accepted (the rest is the anchor's own first prediction).
+        // Roll back the drafter too: it wrote `draft_length`; `accepted_count-1`
+        // drafts were accepted.
         let drafter_rejected = draft_length as u32 - (accepted_count.saturating_sub(1) as u32);
         drafter.rollback(drafter_rejected);
 
@@ -188,13 +212,10 @@ async fn main(input: Input) -> Result<String> {
         total_steps += 1;
     }
 
-    let text = tokenizer.decode(&all_generated)?;
-    println!(
-        "--- CacheBack Decoding (draft_length={}, steps={}) ---",
-        draft_length, total_steps
-    );
+    let text = model::decode(&all_generated)?;
+    println!("--- CacheBack Decoding (draft_length={draft_length}, steps={total_steps}) ---");
     println!("Generated in {:?}", start.elapsed());
-    println!("Output:\n{}", text);
+    println!("Output:\n{text}");
 
     Ok(String::new())
 }

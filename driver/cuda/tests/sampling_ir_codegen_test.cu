@@ -947,6 +947,198 @@ void test_std_temp_minp_v4() {
     }
 }
 
+// Cut #2 — MaskApply (grammar-constrained sampling). Host-lower structural test
+// (GPU-independent: lowers + inspects the emitted DAG/source, no NVRTC/launch).
+// The token-correctness device verify (forced-out dominant token vs the CPU ref)
+// is echo's co-driven GPU slot with echo's pie_ir_mask_apply primitive merged.
+void test_grammar_maskapply_v4() {
+    std::printf("[codegen v4 MaskApply — foxtrot program::grammar host-lower (0x65 reader + fuse)]\n");
+    // slot[0]=Logits, slot[1]=mask host tensor, Readiness::Late (grammar masks
+    // attach per-fire after the recognizer step).
+    const ProgramManifest m = {{BindKind::Logits, 0, HostAvailability::SubmitBound},
+                               {BindKind::HostTensor, 0, HostAvailability::LateBound}};
+
+    auto check = [&](const unsigned char* bc, size_t n, const char* tag) {
+        // M=1 (single sequence — echo's device-verify shape).
+        LowerResult m1 = lower_bytecode_v4(bc, n, m, LowerOptions{});
+        expect(m1.ok, "grammar M=1 lowers (0x65 reader round-trip + manifest)");
+        if (!m1.ok) { std::fprintf(stderr, "  %s err: %s\n", tag, m1.error.c_str()); return; }
+        expect(m1.dag.kernels.size() == 1, "grammar M=1 = 1 fused kernel (cast+mask+argmax)");
+        // The mask must classify HostLate (Readiness::Late) so it routes to echo's
+        // late-bind path, never a stale-buffer silent pass.
+        bool mask_late = false;
+        for (const BufferDecl& b : m1.dag.buffers)
+            if (b.cls == BufferClass::HostLate) mask_late = true;
+        expect(mask_late, "grammar mask buffer classifies HostLate (Readiness::Late)");
+        // Emit calls echo's primitive with foxtrot's (a=logits, b=mask) operand order.
+        expect(m1.dag.kernels[0].source.find("pie_ir_mask_apply(") != std::string::npos,
+               "grammar M=1 emit calls pie_ir_mask_apply(mask, j, logit)");
+
+        // Batched (production): each sequence carries its own grammar mask, so the
+        // mask base is offset per-row (b? + r*len), col j stays the ABSOLUTE vocab
+        // column inside the packed primitive (mask[j>>5]). Fuses to one kernel.
+        LowerResult mb = lower_bytecode_v4(bc, n, m, LowerOptions{/*batched=*/true});
+        expect(mb.ok, "grammar batched lowers");
+        if (!mb.ok) { std::fprintf(stderr, "  %s batched err: %s\n", tag, mb.error.c_str()); return; }
+        expect(mb.dag.kernels.size() == 1, "grammar batched = 1 fused kernel");
+        const std::string& bs = mb.dag.kernels[0].source;
+        expect(bs.find("pie_ir_mask_apply(") != std::string::npos,
+               "grammar batched emit calls pie_ir_mask_apply");
+        expect(bs.find(" + r*") != std::string::npos,
+               "grammar batched offsets mask per-row (b + r*len), col j = absolute vocab");
+    };
+    check(GV_GRAMMAR32, sizeof(GV_GRAMMAR32), "V=32");
+    // Real-vocab shape: mask = [ceil(151936/32)] = [4748] u32 words, HostLate.
+    check(GV_GRAMMAR_151936, sizeof(GV_GRAMMAR_151936), "V=151936");
+
+    // Forward-compat with foxtrot's readiness lowering: once the EDSL
+    // Readiness::Late lowers into the bytecode (alpha's READY_LATE_BIT=0x80 on
+    // the mask InputDecl dtype byte), the reader must mask the bit off (dtype
+    // stays U32, never an UnknownTag reject) AND upgrade the binding to Late
+    // even if the manifest passed SubmitBound (readiness is a program property).
+    // Offset 26 = mask dtype byte (header 20 + logits InputDecl 6).
+    {
+        std::vector<unsigned char> late_bc(GV_GRAMMAR32, GV_GRAMMAR32 + sizeof(GV_GRAMMAR32));
+        expect((late_bc[26] & 0x7fu) == 0x02u, "GV_GRAMMAR32 mask dtype byte (offset 26) is U32");
+        late_bc[26] |= 0x80u;  // set READY_LATE_BIT
+        const ProgramManifest submit_m = {{BindKind::Logits, 0, HostAvailability::SubmitBound},
+                                          {BindKind::HostTensor, 0, HostAvailability::SubmitBound}};
+        LowerResult lr = lower_bytecode_v4(late_bc.data(), late_bc.size(), submit_m, LowerOptions{});
+        expect(lr.ok, "bit-7 Late mask decodes (dtype byte masked off, not rejected)");
+        if (lr.ok) {
+            bool mask_late = false;
+            for (const BufferDecl& b : lr.dag.buffers)
+                if (b.cls == BufferClass::HostLate) mask_late = true;
+            expect(mask_late, "bytecode Late bit upgrades binding to HostLate despite Submit manifest");
+        }
+    }
+}
+
+// Cut #2 mtp-logits: BufferDecl.intrinsic_kind (manifest-only). The SAME v4
+// argmax bytecode lowered with InputBind.intrinsic_kind = MtpLogits stamps the
+// IntrinsicLogits buffer MtpLogits, leaving the DAG otherwise identical to the
+// Logits lowering — foxtrot's manifest-only proof (identical bytecode, only the
+// binding differs). delta bridges the stamp to the runtime IntrinsicKind at the
+// jit_backend wire; echo's resolver routes MtpLogits to ws.logits[mtp_draft_row].
+void test_mtp_logits_intrinsic_kind_v4() {
+    std::printf("[codegen v4 mtp-logits — BufferDecl.intrinsic_kind manifest-only stamp]\n");
+    StandardSamplerProgram sp = standard_sampler_program(StandardSamplerKind::Argmax, 151936);
+    expect(sp.valid, "baked Argmax program present");
+    if (!sp.valid) return;
+
+    auto lower_with = [&](Intrinsic ik) -> LowerResult {
+        ProgramManifest m = {{BindKind::Logits, 0, HostAvailability::SubmitBound, ik}};
+        return lower_bytecode_v4(sp.bytecode, sp.len, m, LowerOptions{});
+    };
+    LowerResult lg = lower_with(Intrinsic::Logits);
+    LowerResult lm = lower_with(Intrinsic::MtpLogits);
+    expect(lg.ok && lm.ok, "argmax lowers under both Logits and MtpLogits manifests");
+    if (!lg.ok || !lm.ok) return;
+
+    auto intrinsic_kind_of = [](const LowerResult& lr) -> Intrinsic {
+        for (const BufferDecl& b : lr.dag.buffers)
+            if (b.cls == BufferClass::IntrinsicLogits) return b.intrinsic_kind;
+        return Intrinsic::Logits;
+    };
+    expect(intrinsic_kind_of(lg) == Intrinsic::Logits,
+           "Logits manifest -> IntrinsicLogits buffer intrinsic_kind=Logits");
+    expect(intrinsic_kind_of(lm) == Intrinsic::MtpLogits,
+           "MtpLogits manifest -> IntrinsicLogits buffer intrinsic_kind=MtpLogits");
+    // Manifest-only: structurally identical DAG (same buffer/kernel counts),
+    // only the intrinsic-kind tag differs — no extra op, no opcode/version bump.
+    expect(lg.dag.buffers.size() == lm.dag.buffers.size() &&
+           lg.dag.kernels.size() == lm.dag.kernels.size(),
+           "MtpLogits lowering is structurally identical (manifest-only)");
+}
+
+// Cut #2 passthrough output — grammar_with_logits [Token, Logits]. Output #1
+// (raw logits) aliases the IntrinsicLogits INPUT leaf, never an op result, so the
+// op-result loop drops it (n_out=1 vs declared 2) → readback corruption (delta's
+// MASK_OP_OK root cause). Codegen now materializes a BufferClass::Output + a tail
+// copy kernel reading the UNMASKED f32 cast (not the masked result). Host-lower
+// structural test (GPU-independent); echo marshals OutputClass::Logits back.
+void test_grammar_with_logits_passthrough_v4() {
+    std::printf("[codegen v4 passthrough output — grammar_with_logits [Token, Logits] n_out=2]\n");
+    const ProgramManifest m = {{BindKind::Logits, 0, HostAvailability::SubmitBound},
+                               {BindKind::HostTensor, 0, HostAvailability::LateBound}};
+    auto check = [&](bool batched, const char* tag) {
+        LowerResult lr = lower_bytecode_v4(GV_GRAMMAR_LOGITS32, sizeof(GV_GRAMMAR_LOGITS32),
+                                           m, LowerOptions{batched});
+        expect(lr.ok, "grammar_with_logits lowers");
+        if (!lr.ok) { std::fprintf(stderr, "  %s err: %s\n", tag, lr.error.c_str()); return; }
+        int n_out = 0;
+        const BufferDecl* logits_out = nullptr;
+        for (const BufferDecl& b : lr.dag.buffers) {
+            if (b.cls != BufferClass::Output) continue;
+            ++n_out;
+            if (b.output_index == 1) logits_out = &b;
+        }
+        // The fix: 2 outputs (token + raw-logits passthrough), not 1.
+        expect(n_out == 2, "two Output buffers (token + raw-logits passthrough)");
+        expect(logits_out != nullptr, "passthrough Output buffer at output index 1 exists");
+        if (logits_out) {
+            expect(logits_out->output_kind == OutputKind::Logits, "passthrough output kind = Logits");
+            expect(logits_out->elem_count == 32, "raw-logits output is [vocab] per row");
+        }
+        // A tail copy kernel writes the passthrough Output buffer as a RAW bf16
+        // copy of the logits input leaf (logits_raw) — not the masked mask_apply
+        // result, and no f32 convert (#28 no-f32-[vocab] rule; golf's CPU ref reads
+        // it via bf16_hi_to_f32). The output buffer must be a WRITABLE bf16 param
+        // (`unsigned short* b<id>`, not `const`), else NVRTC rejects the write.
+        // Inspect each kernel's BODY past the embedded prelude (which itself
+        // defines pie_ir_mask_apply/argmax).
+        bool has_passthrough_copy = false;
+        bool writable_bf16_param = false;
+        const std::string ob = logits_out ? ("b" + std::to_string(logits_out->id)) : "";
+        for (const KernelDesc& k : lr.dag.kernels) {
+            std::size_t gp = k.source.find("__global__");
+            std::string body = gp == std::string::npos ? k.source : k.source.substr(gp);
+            if (logits_out &&
+                body.find(ob + "[") != std::string::npos &&
+                body.find("pie_ir_mask_apply(") == std::string::npos &&
+                body.find("argmax") == std::string::npos &&
+                body.find("pie_ir_bf16_to_f32") == std::string::npos) {   // raw copy, no convert
+                has_passthrough_copy = true;
+                // writable (non-const) bf16 output param.
+                if (body.find("unsigned short* " + ob) != std::string::npos) writable_bf16_param = true;
+            }
+        }
+        expect(has_passthrough_copy, "a tail kernel raw-copies the bf16 logits into the Output buffer");
+        expect(writable_bf16_param, "raw-logits Output is a writable bf16 param (unsigned short*, vocab*2)");
+    };
+    check(false, "M=1");
+    check(true, "batched");
+}
+
+// Regression (2a): spec_verify_greedy(k=1) lowered BATCHED. The per-row
+// reduce/argmax result is one value per block (row r); the result-write must use
+// the row's single slot "r", NOT mwidx's elementwise "r*len+j" (whose per-element
+// j has no loop around a single-thread reduce write → unbound j → NVRTC compile
+// failure, the 2a RED). Host-lower structural test: assert the argmax write is
+// "[r] = _res" and NO "+j] = _res" survives, M=1 and batched.
+void test_spec_greedy_batched_reduce_write_v4() {
+    std::printf("[codegen v4 spec_verify_greedy(k=1) batched — per-row reduce write index]\n");
+    const ProgramManifest m = {{BindKind::Logits, 0, HostAvailability::SubmitBound},
+                               {BindKind::HostTensor, 0, HostAvailability::SubmitBound}};
+    auto check = [&](bool batched, const char* tag) {
+        LowerResult lr = lower_bytecode_v4(GV_SPECGREEDY_K1, sizeof(GV_SPECGREEDY_K1),
+                                           m, LowerOptions{batched});
+        expect(lr.ok, "spec_verify_greedy(k=1) lowers");
+        if (!lr.ok) { std::fprintf(stderr, "  %s err: %s\n", tag, lr.error.c_str()); return; }
+        // No single-thread reduce write may carry an unbound per-element j.
+        bool has_unbound_j = false, has_argmax = false;
+        for (const KernelDesc& k : lr.dag.kernels) {
+            const std::string& s = k.source;
+            if (s.find("_block_argmax_reduce") != std::string::npos) has_argmax = true;
+            if (s.find("+j] = _res") != std::string::npos) has_unbound_j = true;
+        }
+        expect(!has_unbound_j, "reduce/argmax write has NO unbound '+j] = _res' (writes row slot 'r')");
+        if (batched) expect(has_argmax, "batched path uses the fused per-row argmax reduce");
+    };
+    check(false, "M=1");
+    check(true, "batched");
+}
+
 }  // namespace
 
 int main() {
@@ -975,8 +1167,12 @@ int main() {
     test_batched_argmax();
     test_gathercols_codegen();
     test_spec_lossless();
+    test_spec_greedy_batched_reduce_write_v4();
     test_std_argmax_v4();
     test_std_temp_minp_v4();
+    test_grammar_maskapply_v4();
+    test_mtp_logits_intrinsic_kind_v4();
+    test_grammar_with_logits_passthrough_v4();
 
     CU_CHECK(cuDevicePrimaryCtxRelease(dev));
     std::printf("\n%d checks, %d failures\n", g_checks, g_fail);

@@ -1,6 +1,6 @@
 //! Embedded native driver: in-process supervisor for the C++ driver lib.
 //!
-//! Replaces the Python `pie_driver_portable.worker` for the standalone
+//! Replaces the Python `pie_driver.worker` for the standalone
 //! path. The driver is no longer a subprocess — it runs as a thread
 //! linked into our binary. We still preserve the shmem + control-socket
 //! protocol so the runtime side (`pie::driver::*`) doesn't know the
@@ -9,10 +9,9 @@
 //! This module exposes:
 //!   * [`DriverCapabilities`] — typed view over the caps JSON the C
 //!     entry hands back via the `ready_cb` callback.
-//!   * [`write_startup_toml`] / [`write_cuda_startup_toml`] /
+//!   * [`write_cuda_startup_toml`] / [`write_metal_startup_toml`] /
 //!     [`write_dummy_startup_toml`] — emit the per-launch TOML each
-//!     driver flavor reads on startup. Mirror
-//!     `pie_driver_*.worker._write_startup_toml`.
+//!     driver flavor reads on startup.
 //!   * [`EmbeddedDriver`] — owns the driver thread + its on-disk
 //!     launch state, and bridges the C `ready_cb` to a Rust channel.
 
@@ -25,9 +24,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::{
-    CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions, PortableDriverOptions,
-};
+use crate::config::{CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions};
+#[cfg(feature = "driver-metal")]
+use crate::config::MetalDriverOptions;
 use crate::driver_ffi::{self, Flavor};
 
 #[cfg(feature = "driver-cuda")]
@@ -74,10 +73,10 @@ fn nccl_unique_id_hex() -> Result<String> {
 /// re-deserializing TOML.
 #[derive(Clone)]
 pub enum DriverOptions {
-    #[cfg(feature = "driver-portable")]
-    Portable(PortableDriverOptions),
     #[cfg(feature = "driver-cuda")]
     CudaNative(CudaNativeDriverOptions),
+    #[cfg(feature = "driver-metal")]
+    Metal(MetalDriverOptions),
     Dummy {
         opts: DummyDriverOptions,
         random_seed: u64,
@@ -89,10 +88,10 @@ impl DriverOptions {
     /// Which compiled flavor this options bundle targets.
     pub fn flavor(&self) -> Flavor {
         match self {
-            #[cfg(feature = "driver-portable")]
-            DriverOptions::Portable(_) => Flavor::Portable,
             #[cfg(feature = "driver-cuda")]
             DriverOptions::CudaNative(_) => Flavor::Cuda,
+            #[cfg(feature = "driver-metal")]
+            DriverOptions::Metal(_) => Flavor::Metal,
             DriverOptions::Dummy { .. } => Flavor::Dummy,
         }
     }
@@ -100,10 +99,10 @@ impl DriverOptions {
 
 fn ready_timeout(options: &DriverOptions) -> Duration {
     let ready_timeout_s = match options {
-        #[cfg(feature = "driver-portable")]
-        DriverOptions::Portable(p) => p.ready_timeout_s,
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => opts.ready_timeout_s,
+        #[cfg(feature = "driver-metal")]
+        DriverOptions::Metal(opts) => opts.ready_timeout_s,
         DriverOptions::Dummy { opts, .. } => opts.ready_timeout_s,
     };
     Duration::from_secs_f64(ready_timeout_s.max(1.0))
@@ -136,7 +135,7 @@ unsafe fn release_inproc_ctx(kind: Option<InProcCtxKind>, ctx: *mut c_void) {
 struct PendingEmbeddedDriver {
     flavor: Flavor,
     /// `/pie_shmem_g{idx}` for shmem-based drivers (dummy + subprocess
-    /// Python); `None` for the inproc embedded drivers (cuda/portable)
+    /// Python); `None` for the inproc embedded drivers (cuda/metal)
     /// since they don't open a shmem region.
     shmem_name: Option<String>,
     thread: Option<JoinHandle<i32>>,
@@ -219,9 +218,9 @@ pub fn shmem_name(group_id: usize) -> String {
 }
 
 /// `[shmem]` TOML block. `req_buf` is fixed at 4 MiB across drivers;
-/// `resp_buf` varies — portable/dummy fit response payloads in 4 MiB,
-/// but the cuda driver must hold a full-vocab `Sampler::Dist` (≈2.6
-/// MiB on 150K-vocab models) plus per-request overhead and the
+/// `resp_buf` varies — the dummy driver fits response payloads in 4
+/// MiB, but the cuda driver must hold a full-vocab `Sampler::Dist`
+/// (≈2.6 MiB on 150K-vocab models) plus per-request overhead and the
 /// spec-mode multi-slot tail, so it uses 8 MiB. The runtime reads the
 /// buffer sizes from the shmem header at attach time, so each driver
 /// can pick its own size.
@@ -304,59 +303,6 @@ fn parse_caps_json(json: &str) -> Result<DriverCapabilities> {
     serde_json::from_value(value).map_err(|e| anyhow::anyhow!("driver caps schema mismatch: {e}"))
 }
 
-/// Write the portable driver's startup TOML, returning the path the
-/// driver should be invoked with. Mirrors the layout consumed by
-/// `driver/portable/src/config.hpp`.
-///
-/// The driver consumes:
-///   - `[model]` — local snapshot dir + GGML offload knobs.
-///   - `[runtime]` — logging / diagnostic flags.
-///
-/// Cold-path RPC (page copies, adapter loads) is no longer wired
-/// through this TOML — it now travels through direct `extern "C"`
-/// calls into the portable lib, keyed by the `--driver-id` the host
-/// passes on the command line.
-pub fn write_startup_toml(
-    out_path: &Path,
-    options: &PortableDriverOptions,
-    snapshot_dir: &Path,
-    _group_id: usize,
-) -> Result<()> {
-    let mut doc = toml::Table::new();
-
-    let mut model = toml::Table::new();
-    insert_str(&mut model, "hf_path", path_string(snapshot_dir));
-    insert_str(&mut model, "backend", &options.device);
-    insert_table(&mut doc, "model", model);
-
-    let mut batching = toml::Table::new();
-    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
-    insert_int(&mut batching, "total_pages", options.total_pages);
-    insert_int(
-        &mut batching,
-        "max_forward_tokens",
-        options.max_forward_tokens,
-    );
-    insert_int(
-        &mut batching,
-        "max_forward_requests",
-        options.max_forward_requests,
-    );
-    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
-    insert_str(
-        &mut batching,
-        "kv_cache_dtype",
-        options.kv_cache_dtype.clone(),
-    );
-    insert_table(&mut doc, "batching", batching);
-
-    let mut runtime = toml::Table::new();
-    insert_bool(&mut runtime, "verbose", options.verbose);
-    insert_table(&mut doc, "runtime", runtime);
-
-    write_toml_table(out_path, doc)
-}
-
 /// Read model facts out of `<snapshot>/config.json`.
 /// Used by [`write_dummy_startup_toml`] when the user didn't explicitly
 /// specify them in `[model.driver.options]`. Mirrors the legacy Python
@@ -398,7 +344,7 @@ fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
 }
 
 /// Write the dummy driver's startup TOML. Shape mirrors `driver/dummy/src/config.rs`:
-/// `[shmem]` (same as portable) + `[dummy]` (knobs the dummy fabricates in
+/// `[shmem]` + `[dummy]` (knobs the dummy fabricates in
 /// lieu of model introspection). The dummy ignores `[model]` / `[batching]`
 /// so we omit them.
 ///
@@ -452,6 +398,51 @@ pub fn write_dummy_startup_toml(
     insert_int(&mut dummy, "random_seed", random_seed as i64);
     insert_str(&mut dummy, "snapshot_dir", path_string(snapshot_dir));
     insert_table(&mut doc, "dummy", dummy);
+
+    write_toml_table(out_path, doc)
+}
+
+/// Emit the metal driver's startup TOML — same `[model]` + `[batching]` +
+/// `[runtime]` layout consumed by `driver/metal/src/config.hpp`. The metal
+/// launch state is identical apart from the `metal:N` backend selector.
+#[cfg(feature = "driver-metal")]
+pub fn write_metal_startup_toml(
+    out_path: &Path,
+    options: &MetalDriverOptions,
+    snapshot_dir: &Path,
+    _group_id: usize,
+) -> Result<()> {
+    let mut doc = toml::Table::new();
+
+    let mut model = toml::Table::new();
+    insert_str(&mut model, "hf_path", path_string(snapshot_dir));
+    insert_str(&mut model, "backend", &options.device);
+    insert_table(&mut doc, "model", model);
+
+    let mut batching = toml::Table::new();
+    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
+    insert_int(&mut batching, "total_pages", options.total_pages);
+    insert_int(
+        &mut batching,
+        "max_forward_tokens",
+        options.max_forward_tokens,
+    );
+    insert_int(
+        &mut batching,
+        "max_forward_requests",
+        options.max_forward_requests,
+    );
+    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
+    insert_str(
+        &mut batching,
+        "kv_cache_dtype",
+        options.kv_cache_dtype.clone(),
+    );
+    insert_table(&mut doc, "batching", batching);
+
+    let mut runtime = toml::Table::new();
+    insert_bool(&mut runtime, "verbose", options.verbose);
+    insert_table(&mut doc, "runtime", runtime);
 
     write_toml_table(out_path, doc)
 }
@@ -516,6 +507,7 @@ pub(crate) fn write_cuda_startup_toml(
     );
     insert_int(&mut batching, "kv_page_size", opts.kv_page_size);
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
+    insert_int(&mut batching, "total_pages", opts.total_pages);
     insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
     insert_table(&mut doc, "batching", batching);
 
@@ -601,12 +593,12 @@ pub struct EmbeddedDriver {
     pub caps: DriverCapabilities,
     /// Which compiled driver flavor backs this instance. `request_stop`
     /// dispatches via this so heterogeneous configs (e.g. one cuda +
-    /// one portable model) signal the right entry.
+    /// one metal model) signal the right entry.
     pub flavor: Flavor,
     /// Shared-memory region the driver owns (e.g. `/pie_shmem_g0`).
     /// Unix builds `shm_unlink` this on shutdown to clean up after a
     /// hard kill that bypassed the driver's own teardown. `None` when
-    /// the driver runs on the in-process channel (cuda / portable).
+    /// the driver runs on the in-process channel (cuda / metal).
     pub shmem_name: Option<String>,
     thread: Option<JoinHandle<i32>>,
     /// Raw pointer to the leaked `Box<CapsCtx>`. The C driver thread
@@ -706,7 +698,7 @@ impl EmbeddedDriver {
         let mut drivers = Vec::with_capacity(tp_size);
         for p in pending.into_iter() {
             // Every rank in this DP-group sees the same caps. Embedded
-            // drivers (cuda / portable) leave shmem_name = None — there
+            // drivers (cuda / metal) leave shmem_name = None — there
             // is no shmem region for either leader or followers.
             drivers.push(p.into_driver(leader_caps.clone()));
         }
@@ -721,7 +713,7 @@ impl EmbeddedDriver {
         use_inproc_polling_channel: bool,
         spin_budget_us: u64,
     ) -> Result<PendingEmbeddedDriver> {
-        // Portable allows either a safetensors dir or a single .gguf file
+        // Metal allows either a safetensors dir or a single .gguf file
         // (model.cpp branches on is_regular_file). CUDA + dummy still need
         // a directory — those drivers fail later with their own message
         // when handed a file, so we don't gate that here.
@@ -744,13 +736,13 @@ impl EmbeddedDriver {
         let toml_path = state_dir.join("driver.toml");
         let flavor = options.flavor();
         match options {
-            #[cfg(feature = "driver-portable")]
-            DriverOptions::Portable(p) => {
-                write_startup_toml(&toml_path, p, snapshot_dir, group_id)?;
-            }
             #[cfg(feature = "driver-cuda")]
             DriverOptions::CudaNative(opts) => {
                 write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, tp.as_ref())?;
+            }
+            #[cfg(feature = "driver-metal")]
+            DriverOptions::Metal(opts) => {
+                write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id)?;
             }
             DriverOptions::Dummy {
                 opts,
@@ -787,7 +779,7 @@ impl EmbeddedDriver {
             })?
             .to_owned();
 
-        // Both cuda_native and portable drive their C++ engines via the
+        // Both cuda_native and metal drive their C++ engines via the
         // in-process channel: the runtime owns the channel, the C++
         // driver thread consumes via FFI callbacks. TP followers
         // (cuda rank > 0) still receive a vtable but never use it — the
@@ -801,8 +793,8 @@ impl EmbeddedDriver {
         let uses_inproc = match flavor {
             #[cfg(feature = "driver-cuda")]
             Flavor::Cuda => true,
-            #[cfg(feature = "driver-portable")]
-            Flavor::Portable => true,
+            #[cfg(feature = "driver-metal")]
+            Flavor::Metal => true,
             _ => false,
         };
         if uses_inproc {
@@ -876,7 +868,7 @@ impl EmbeddedDriver {
             })?;
 
         // Only shmem-based flavors (dummy) own a runtime-visible region;
-        // embedded cuda/portable drivers leave the name as None.
+        // embedded cuda/metal drivers leave the name as None.
         let shmem_name = if matches!(flavor, Flavor::Dummy) {
             Some(shmem_name(group_id))
         } else {
@@ -1025,39 +1017,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_toml_round_trips() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("startup.toml");
-        let snap = tmp.path().join("snap");
-        let opts = PortableDriverOptions::default();
-
-        write_startup_toml(&out, &opts, &snap, 0).unwrap();
-
-        // Re-parse the emitted TOML to confirm the schema the driver
-        // expects matches what we wrote (driver-side parsing in
-        // driver/portable/src/config.hpp uses the same structure).
-        let text = std::fs::read_to_string(&out).unwrap();
-        let val: toml::Value = toml::from_str(&text).unwrap();
-        assert!(
-            val.get("shmem").is_none(),
-            "portable no longer emits [shmem]"
-        );
-        assert!(
-            val.get("aux_ipc").is_none(),
-            "portable no longer emits [aux_ipc]"
-        );
-        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
-        assert_eq!(val["batching"]["total_pages"].as_integer().unwrap(), 1024);
-        assert!(val["batching"].get("max_num_kv_pages").is_none());
-        assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
-        assert_eq!(
-            val["model"]["hf_path"].as_str().unwrap(),
-            snap.to_str().unwrap()
-        );
-        assert_eq!(val["model"]["backend"].as_str().unwrap(), "auto");
-    }
-
-    #[test]
     fn cuda_startup_toml_matches_driver_schema() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
@@ -1091,7 +1050,8 @@ mod tests {
             0.90
         );
         assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
-        assert_eq!(val["batching"].as_table().unwrap().len(), 5);
+        assert_eq!(val["batching"]["total_pages"].as_integer().unwrap(), 0);
+        assert_eq!(val["batching"].as_table().unwrap().len(), 6);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
     }

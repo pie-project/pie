@@ -166,9 +166,12 @@ impl DynValue {
     }
 
     // -- pivot-threshold masks (f32 input) -> bool, same shape --
-    pub fn pivot_rank_le(&self, k: u32) -> DynValue {
+    /// `RankLe(k)` keeps the top-`k` by logit; since #25 `k` is an integer
+    /// value-id (a `U32`/`I32` scalar input or per-row `[rows]` vector), not a
+    /// baked immediate.
+    pub fn pivot_rank_le(&self, k: &DynValue) -> DynValue {
         self.emit(
-            ir::Op::PivotThreshold { input: self.id, predicate: ir::Predicate::RankLe(k) },
+            ir::Op::PivotThreshold { input: self.id, predicate: ir::Predicate::RankLe(k.id) },
             ir::ValueType::new(self.ty.shape, ir::DType::Bool),
         )
     }
@@ -187,15 +190,39 @@ impl DynValue {
 
     // -- indexing --
     /// 1-D gather `out[j] = self[idx[j]]` (`self` is `[n]`, result `[k]`).
+    ///
+    /// Result dtype = the SOURCE dtype (matches the canonical validator,
+    /// `validate.rs`: `ValueType::vector(k, ts.dtype)`) — so a gather of the i32
+    /// `picked` intrinsic stays i32 and can be output as a `Token` (the Stage-2
+    /// seed extract). The old hardcoded-f32 label was a latent inconsistency that
+    /// never bit only because gather results were previously always compared or
+    /// reduced, never output directly.
     pub fn gather(&self, idx: &DynValue) -> DynValue {
+        // Result dtype = the SOURCE dtype (matches the validator + driver interp;
+        // a gather of the i32 `picked` stays i32 so it can be output as a Token).
+        // Re-applied from the mtp_specdecode fix (`6ee06bfc` on dev) — dedups at
+        // the echo→pipe-audit fold.
         let k = idx.ty.shape.last_len().unwrap_or(0);
-        self.emit(ir::Op::Gather { src: self.id, idx: idx.id }, self.f32(ir::Shape::vector(k)))
+        let ty = ir::ValueType::new(ir::Shape::vector(k), self.ty.dtype);
+        self.emit(ir::Op::Gather { src: self.id, idx: idx.id }, ty)
     }
     /// Per-row column pick `out[i] = self[i, idx[i]]` (`self` is `[m, n]`, `idx`
     /// `[m]` integer, result `[m]`). The lossless accept-ratio lookup.
     pub fn gather_row(&self, idx: &DynValue) -> DynValue {
         let m = self.ty.shape.dims().first().copied().unwrap_or(0);
         self.emit(ir::Op::GatherRow { src: self.id, idx: idx.id }, self.f32(ir::Shape::vector(m)))
+    }
+
+    /// Apply a packed allowed-token bitmask to `self` (logits `[n]`):
+    /// `out[j] = bit_j(mask) ? self[j] : −∞`, `bit_j = (mask[j>>5] >> (j&31)) &
+    /// 1` (bit 1 = allowed → pass-through, bit 0 = disallowed → `−∞`). `mask` is
+    /// a packed `[ceil(n/32)]` u32 vector (the matcher's allowed-token bits).
+    /// Result ≡ `self` (shape + dtype). The de-hardwired grammar mask op.
+    pub fn mask_apply(&self, mask: &DynValue) -> DynValue {
+        self.emit(
+            ir::Op::MaskApply { logits: self.id, mask: mask.id },
+            ir::ValueType::new(self.ty.shape, self.ty.dtype),
+        )
     }
 }
 
@@ -239,6 +266,37 @@ impl Graph {
     pub fn intrinsic_logits_matrix_dyn(&self, rows: u32) -> DynValue {
         let ty = ir::ValueType::new(ir::Shape::matrix(rows, self.vocab()), ir::DType::F32);
         self.input(ty, ir::Binding::Logits)
+    }
+    /// The speculator's **draft** logits as a `[vocab]` f32 vector (de-hardwired
+    /// speculation, M=1). Binds [`ir::Binding::MtpLogits`] → the driver
+    /// source-selects the draft row of `ws.logits` (not a separate buffer). The
+    /// program treats it like any logits vector; only the binding differs.
+    pub fn intrinsic_mtp_logits_dyn(&self) -> DynValue {
+        self.input(ir::ValueType::vector(self.vocab(), ir::DType::F32), ir::Binding::MtpLogits)
+    }
+    /// The speculator's draft logits as a **`[K, vocab]` matrix** (Stage 2
+    /// PTIR-native MTP, overview §6.1): the MTP head's K next-step draft
+    /// proposals, one row per draft position — `argmax` per row yields the
+    /// K fresh drafts. K is trace-known (a different K = a different traced
+    /// program). Binds [`ir::Binding::MtpLogits`]; the driver maps the K rows
+    /// onto the pass's draft rows of `ws.logits` at fire time. Shape contract:
+    /// `pie_sampling_ir::validate::intrinsic_decl_ok`.
+    pub fn intrinsic_mtp_logits_matrix_dyn(&self, k: u32) -> DynValue {
+        let ty = ir::ValueType::new(ir::Shape::matrix(k, self.vocab()), ir::DType::F32);
+        self.input(ty, ir::Binding::MtpLogits)
+    }
+
+    /// The window's **draft token ids** as a device-resident `[k]` i32 vector —
+    /// the CURRENT window's drafts (produced by the previous fire's MTP argmax,
+    /// composed into the retained `[k+1]` window's rows `1..=k`). Binds
+    /// [`ir::Binding::MtpDrafts`] → the driver source-selects the retained
+    /// `mtp_drafts` `[k]` buffer (bravo's per-link retain). The device-resident
+    /// analog of `spec_verify_greedy`'s host `draft` input: the verify compares
+    /// `target.argmax().eq(&this)` with ZERO host round-trip on the drafts. `k`
+    /// trace-known. Shape contract: `pie_sampling_ir::validate::intrinsic_decl_ok`
+    /// (I32 ∧ `[k≥1]`).
+    pub fn intrinsic_mtp_drafts_dyn(&self, k: u32) -> DynValue {
+        self.input(ir::ValueType::vector(k, ir::DType::I32), ir::Binding::MtpDrafts)
     }
 
     pub fn constant_f32_dyn(&self, x: f32) -> DynValue {

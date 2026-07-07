@@ -29,6 +29,24 @@
 //! are NOT contained in any `execute.*` probe — they measure gaps
 //! *between* fires, not work done during a fire. Don't sum them with
 //! children of `execute`.
+//!
+//! ## Quorum-rule probes (`quorum.*`)
+//!
+//! The quorum fire rule (overview §7.2, thrust-2 §3 F1–F6) needs a
+//! dedicated probe family the response-synchronous loop never had. These
+//! land as scaffolding in phase S0 and are populated by the quorum core
+//! in phase S5; until then they read zero. Each maps to a clause or a
+//! health signal of the rule:
+//!
+//! ```text
+//! FireProbes.quorum
+//! ├── inter_batch_bubble_us  device idle between one batch retiring and the next launching (F1 target: →0)
+//! ├── quorum_latency_us      last-pipeline-ready → dense-batch enqueue (F1 quorum completion)
+//! ├── escape_fires           count of F2 idle-escape fires (ready subset fired on device-idle+empty-queue)
+//! ├── cold_hold_us           time spent in the F3 cold-hold window (nothing in flight)
+//! ├── cold_hold_fires        count of fires that went through the F3 cold-hold path
+//! └── readiness_miss         count of dummy-runs: a pass launched structurally-ready whose late edge missed (M3 gate: rate < 1%)
+//! ```
 
 use std::sync::atomic::AtomicU64;
 
@@ -47,6 +65,31 @@ pub struct FireProbes {
     /// group.
     pub post_dispatch_to_fire_us: AtomicU64,
 
+    /// Steady-state scheduler idle-wait: time the run loop spent blocked in the
+    /// `while batch.is_empty()` `recv()` waiting for the NEXT batch's first
+    /// request (only recorded once warm — a fire has spawned — so the cold-start
+    /// wait for the first-ever request is excluded). This is the dominant chunk
+    /// of the round-trip R when the fleet is decode-bound: it measures
+    /// dispatch→inferlet-wake→sample→resubmit→SERVICE-hop→scheduler-recv, i.e.
+    /// everything OUTSIDE the scheduler's own build/decide (`accum_loop` +
+    /// `fire_prepare` + `batch_build`). A large value ⇒ R lives in the resubmit
+    /// round-trip (inferlet/SERVICE), not scheduler processing or the driver.
+    pub recv_block_wait_us: AtomicU64,
+
+    /// R-decomposition (charlie), part 1: `submit_at − last_dispatch_end` summed
+    /// over warm decode-fleet resubmits — the GUEST round-trip (fire-N dispatch →
+    /// guest wake + wasm next-input + request rebuild → `submit_async`). bravo's
+    /// device-side carrier targets this. Only `submitted_at_us != 0` (the
+    /// `submit_async` decode path) contributes; solo/prebuilt/chunked skip it.
+    pub guest_roundtrip_us: AtomicU64,
+
+    /// R-decomposition (charlie), part 2: `recv − submit_at` summed over the same
+    /// warm resubmits — the SERVICE actor queue hop (`submit_async` → SERVICE
+    /// mailbox tokio wakeup → scheduler `recv`). delta's SERVICE-bypass targets
+    /// this. Together with `guest_roundtrip_us` + the scheduler build/decide this
+    /// decomposes the round-trip R (pins bravo's carrier-vs-bypass fork).
+    pub service_queue_us: AtomicU64,
+
     /// Timestamp (micros from `sched_epoch`) of the most recent fire
     /// start. Used to compute `inter_fire_us` via `swap`. Cheap — kept
     /// always-on regardless of `profile-fire`.
@@ -61,6 +104,72 @@ pub struct FireProbes {
     pub pre_dispatch: PreDispatchProbes,
     pub execute: ExecuteProbes,
     pub post_dispatch: PostDispatchProbes,
+    pub quorum: QuorumProbes,
+}
+
+/// Probes for the quorum fire rule (overview §7.2; thrust-2 §3 F1–F6).
+///
+/// Scaffolding lands in S0; the quorum core (S5) writes these. Duration
+/// fields (`*_us`) accumulate micros via `probe_fire!` / `probe_fire_record!`;
+/// the `*_fires` / `*_miss` fields are counters incremented per event. All
+/// are `AtomicU64` and read via `load(Relaxed)`; readers derive rates by
+/// dividing against `total_batches` (see `crate::inference`).
+#[derive(Debug, Default)]
+pub struct QuorumProbes {
+    /// Device idle between one batch retiring and the next launching — the
+    /// inter-batch bubble the quorum rule drives to zero in steady state
+    /// (F1). Distinct from `inter_fire_us` (host-side gap between fire
+    /// *starts*): this is the *device*'s idle window, the bubble the M1/M3
+    /// gate bounds at p50 < 100 µs.
+    pub inter_batch_bubble_us: AtomicU64,
+
+    /// Quorum latency: from the moment the last counted pipeline becomes
+    /// structurally ready to the dense batch's enqueue (F1). Steady state
+    /// this completes mid-flight, so the value is the slack before the
+    /// in-flight batch retires.
+    pub quorum_latency_us: AtomicU64,
+
+    /// Count of idle-escape fires (F2): device went idle with the queue
+    /// empty and the ready subset fired immediately. Divide by
+    /// `total_batches` for the escape rate — dominant on agentic fleets,
+    /// near-zero on saturated decode fleets.
+    pub escape_fires: AtomicU64,
+
+    /// Count of depth-2 submit-ahead fires (G3 bubble): a batch was in flight
+    /// and below the cap with a partial cohort, so the ready subset fired
+    /// eagerly behind it rather than holding for quorum. Divide by
+    /// `total_batches` for the submit-ahead rate — the steady-state
+    /// decode-fleet bubble-filler. Zero when the cohort always completes
+    /// before the in-flight batch retires (pure quorum).
+    pub submit_ahead_fires: AtomicU64,
+
+    /// Time spent holding in the F3 cold-hold window (nothing in flight at
+    /// all): the sub-millisecond wait for arrivals before firing partial.
+    pub cold_hold_us: AtomicU64,
+
+    /// Count of fires that went through the cold-hold path (F3), the
+    /// denominator for cold-hold occupancy (`cold_hold_us / cold_hold_fires`).
+    pub cold_hold_fires: AtomicU64,
+
+    /// Dummy-run / readiness-miss count: a pass launched as structurally
+    /// ready (F5) whose genuinely-late host edge (grammar mask) had not
+    /// landed when its consuming stage reached the device cut point, so the
+    /// sample dummy-ran and the stage resubmits. The M3 gate holds this
+    /// rate < 1% on the steady-state decode fleet.
+    pub readiness_miss: AtomicU64,
+
+    /// Wait-for-all wave diagnostics (M-AB, delta). Sampled at each WaitAll
+    /// fire: `wave_active_sum` = Σ active_pipelines (the wait-set size),
+    /// `wave_missing_sum` = Σ stragglers fired without (deadline fires),
+    /// `wave_fires` = the denominator. `avg_active = wave_active_sum /
+    /// wave_fires` discriminates a PERSISTENT wait-set (converges to fleet
+    /// width ⇒ waves should be dense) from a TRANSIENT one (stuck ≈1 ⇒
+    /// singleton waves). `avg_missing` high ⇒ the wave holds to the deadline
+    /// then fires partial; ≈0 ⇒ it fires all-ready (dense or firing-early).
+    /// Zero on legacy/quorum (never a WaitAll fire).
+    pub wave_active_sum: AtomicU64,
+    pub wave_missing_sum: AtomicU64,
+    pub wave_fires: AtomicU64,
 }
 
 /// Probes that fire *during* the non-blocking accumulator pass — i.e.
@@ -116,7 +225,7 @@ pub struct ExecuteProbes {
 /// We deliberately don't time each completion-type arm separately —
 /// each `oneshot::Sender::send` and `pool.submit` call is ~50-100 ns,
 /// and probe overhead at that granularity would dwarf the work. The
-/// counts let us reason about workload shape (`chain_count / fire =
+/// counts let us reason about workload shape (`direct_count / fire =
 /// concurrency` at steady state) without per-call probe cost.
 #[derive(Debug, Default)]
 pub struct ResponseDispatchProbes {
@@ -125,10 +234,6 @@ pub struct ResponseDispatchProbes {
     /// Number of `Completion::Direct` arms taken per fire (sum across
     /// all fires; divide by `total_batches` for per-fire mean).
     pub direct_count: AtomicU64,
-    /// Number of `Completion::Chain` arms taken (chain-extender pool
-    /// submissions). At conc=256 with chain ext active, this equals
-    /// the batch size every fire.
-    pub chain_count: AtomicU64,
     /// Number of `Completion::Chunk` arms taken (chunked-retry
     /// continuations). Rare in the hot path.
     pub chunk_count: AtomicU64,
@@ -138,8 +243,8 @@ pub struct ResponseDispatchProbes {
 /// per-fire bookkeeping before looping back to accumulate.
 #[derive(Debug, Default)]
 pub struct PostDispatchProbes {
-    /// `crate::context::tick` — broadcasts batch context ids to the
-    /// market actor so per-context rent / dividends advance.
+    /// Inert probe slot — the post-dispatch hook it timed was removed under
+    /// FCFS; kept for stats-key stability.
     pub context_tick_us: AtomicU64,
     /// Cumulative-counter `fetch_add` block at the end of the fire
     /// (latency, batch_size_hist, system_spec_*).

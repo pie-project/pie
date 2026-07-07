@@ -85,6 +85,36 @@ int main() {
     CHECK(out[3] == 30);  // rows[2]=3 ← comp[2]
     CHECK(out[1] == -1);  // row 1 not in the group → untouched
 
+    // ── #10-ph2 param gather: f32 + u32 scalars [4] → compact [3] at rows {2,0,3}. ──
+    const std::vector<float>         pf = {1.5f, 0.7f, 2.0f, 0.1f};  // per-row temp-like
+    const std::vector<std::uint32_t> pu = {11u, 22u, 33u, 44u};     // per-row seed-like
+    float*         d_pf = nullptr; float*         d_pf_out = nullptr;
+    std::uint32_t* d_pu = nullptr; std::uint32_t* d_pu_out = nullptr;
+    RT(cudaMalloc(&d_pf, pf.size() * sizeof(float)));
+    RT(cudaMalloc(&d_pf_out, rows.size() * sizeof(float)));
+    RT(cudaMalloc(&d_pu, pu.size() * sizeof(std::uint32_t)));
+    RT(cudaMalloc(&d_pu_out, rows.size() * sizeof(std::uint32_t)));
+    RT(cudaMemcpy(d_pf, pf.data(), pf.size() * sizeof(float), cudaMemcpyHostToDevice));
+    RT(cudaMemcpy(d_pu, pu.data(), pu.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+
+    gather_f32(d_pf, std::span<const std::uint32_t>(rows.data(), rows.size()), d_pf_out, nullptr);
+    gather_u32(d_pu, std::span<const std::uint32_t>(rows.data(), rows.size()), d_pu_out, nullptr);
+    RT(cudaDeviceSynchronize());
+
+    std::vector<float>         of(rows.size());
+    std::vector<std::uint32_t> ou(rows.size());
+    RT(cudaMemcpy(of.data(), d_pf_out, of.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    RT(cudaMemcpy(ou.data(), d_pu_out, ou.size() * sizeof(std::uint32_t), cudaMemcpyDeviceToHost));
+    for (std::size_t g = 0; g < rows.size(); ++g) {
+        CHECK(of[g] == pf[rows[g]]);  // compact param g == source row rows[g]
+        CHECK(ou[g] == pu[rows[g]]);
+    }
+
+    RT(cudaFree(d_pf));
+    RT(cudaFree(d_pf_out));
+    RT(cudaFree(d_pu));
+    RT(cudaFree(d_pu_out));
+
     RT(cudaFree(d_src));
     RT(cudaFree(d_dst));
     RT(cudaFree(d_comp));

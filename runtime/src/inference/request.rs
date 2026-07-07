@@ -16,8 +16,7 @@
 use smallvec::{SmallVec, smallvec};
 
 use crate::adapter::AdapterId;
-use crate::context::ContextId;
-use crate::context::pagestore::PhysicalPageId;
+use crate::arena::PhysicalPageId;
 use crate::driver::DriverId;
 use pie_driver_abi::Brle;
 
@@ -30,7 +29,7 @@ use pie_driver_abi::Brle;
 /// `ForwardRequest` on its own should anyone want to send it that way.
 #[allow(clippy::too_many_arguments)]
 pub fn new_per_request(
-    context_id: ContextId,
+    context_id: u64,
     tokens: Vec<u32>,
     positions: Vec<u32>,
     masks: Vec<Brle>,
@@ -62,6 +61,7 @@ pub fn new_per_request(
         qo_indptr: vec![0, n_tokens],
         rs_slot_ids: Vec::new(),
         rs_slot_flags: Vec::new(),
+        rs_fold_lens: Vec::new(),
         masks,
         mask_indptr: vec![0, n_masks],
         logit_masks,
@@ -267,9 +267,14 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_drive
         kv_page_indices: Vec::with_capacity(page_cap),
         kv_page_indptr: indptr(indptr_cap),
         kv_last_page_lens: Vec::with_capacity(req_cap),
+        kv_len: Vec::with_capacity(req_cap),
+        kv_len_device: Vec::new(),
         qo_indptr: indptr(indptr_cap),
         rs_slot_ids: Vec::with_capacity(req_cap),
         rs_slot_flags: Vec::with_capacity(req_cap),
+        rs_fold_lens: Vec::with_capacity(req_cap),
+        rs_buffer_slot_ids: Vec::new(),
+        rs_buffer_slot_indptr: indptr(indptr_cap),
         masks: Vec::new(),
         mask_indptr: indptr(indptr_cap),
         logit_masks: Vec::new(),
@@ -328,12 +333,23 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_drive
         sampling_late_blob: Vec::new(),
         sampling_late_offsets: Vec::new(),
         sampling_late_lens: Vec::new(),
+        // #27 cut #2 device-alias late channel: parallel to sampling_late_keys
+        // (device value ptr + R12 flag per late key), grown by the batch-merge.
+        sampling_late_device_ptrs: Vec::new(),
+        sampling_late_device_flags: Vec::new(),
+        sampling_late_device_lens: Vec::new(),
         // Per-slot binding-map: per-program CSR with a leading 0 (grown by the
         // merge + per-request boundary); the (kind, key) payload stays empty for
         // the legacy/no-program path.
         sampling_binding_kind: Vec::new(),
         sampling_binding_key: Vec::new(),
         sampling_binding_indptr: indptr(indptr_cap),
+        // #27 cut #1 output fast-path dst table: payload arrays empty, the
+        // per-program CSR seeded with a leading 0 (grown by the batch-merge in
+        // `extend_sampling_programs_from`), exactly like `sampling_input_indptr`.
+        sampling_output_dst_ptrs: Vec::new(),
+        sampling_output_dst_lens: Vec::new(),
+        sampling_output_indptr: indptr(indptr_cap),
         // WS8 P2 device-resident next-input link: empty/0 for the host-inject
         // (P1) and no-pipelining paths; populated by the device-pipeline emission
         // at integration (per-row arrays + the producer source-link).
@@ -341,6 +357,9 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_drive
         next_input_producer_links: Vec::new(),
         next_input_src_rows: Vec::new(),
         next_input_dest_slots: Vec::new(),
+        // P3 recurrent-state fold fields (rs_fold_lens / rs_buffer_slot_*)
+        // default to empty — the de-hardwiring forward path does not use them.
+        ..Default::default()
     }
 }
 
@@ -472,6 +491,24 @@ pub fn append_request_with_options(
 
     // KV cache layout.
     emit_kv_pages(batch, physical_page_ids, trim.as_ref());
+    // Length column (M2a / C1): per-request physical KV span, derived from the
+    // EMITTED (post-trim) page count + this request's last-page length — so it
+    // matches exactly what the driver reconstructs from the two arrays below.
+    let page_start = *batch.kv_page_indptr.last().unwrap_or(&0);
+    let page_count = batch.kv_page_indices.len() as u32 - page_start;
+    let kv_len = if page_count == 0 {
+        0
+    } else {
+        (page_count - 1) * page_size + last_page_len
+    };
+    batch.kv_len.push(kv_len);
+    // Geometry-as-data (M5 / C1-FINAL): the device-resident kv_len source is ONE
+    // forward-level handle (`batch.kv_len_device[0]` = base of a packed `[R]` u32
+    // device buffer, `[r]` = request r's kv_len), NOT accumulated per-request —
+    // a per-request handle would fragment the bind. It is set post-assembly by
+    // the executor seam that wires a prior pass's producer output (empty ⇒
+    // all lanes host-fed via the scalar `kv_len` above). append() must not touch
+    // it, so a seam-set handle survives the merge unchanged.
     batch
         .kv_page_indptr
         .push(batch.kv_page_indices.len() as u32);
@@ -582,6 +619,59 @@ pub fn append_request_with_options(
         .sampling_program_indptr
         .push(batch.n_sampling_programs() as u32);
 
+    // PTIR-program carrier (thrust-3 P2c) — per-request fold, analogous to the
+    // sampling-program merge above. Concatenates this request's ptir containers
+    // (hash/instance/bytes/sidecar/seeds/host-puts, cumulative CSRs) into the
+    // batch so the driver's forward-serve sees `ptir_program_*` and the executor
+    // hook fires. Without it the merged batch drops the carrier (ptir_hashes=0).
+    batch.extend_ptir_programs_from(req);
+
+    // Run-ahead next-input carrier (WS8 P2) — per-request device-resident link
+    // fold. Each fed consumer input names a producer link id + the source row in
+    // that producer's retained `pi.sampled`, and a dest slot in THIS request's
+    // `pi.tokens`. On batch merge: producer link ids + source rows are GLOBAL (a
+    // prior fire's per-link buffer) → verbatim; dest slots index this fire's own
+    // token buffer → rebased by `row_base` (the batch token-offset). The
+    // `u32::MAX` dest sentinel (skip-lane) is preserved un-rebased.
+    for i in 0..req.n_next_input_links() {
+        let dest = req.next_input_dest_slots[i];
+        let rebased_dest = if dest == u32::MAX { u32::MAX } else { dest + row_base };
+        batch.push_next_input_link(
+            req.next_input_producer_links[i],
+            req.next_input_src_rows[i],
+            rebased_dest,
+        );
+    }
+    // All-consumers-drained free signals — global link ids, verbatim.
+    for &link in &req.next_input_free_links {
+        batch.push_next_input_free_link(link);
+    }
+    // Producer source-link — PER-REQUEST (thrust-2 Bug#2 fix). Each co-batched
+    // producer must retain its OWN sampled token under its OWN global link. Append
+    // one `pipeline_source_links` entry per request (0 = not a producer) so an R>1
+    // co-batched PRODUCER fire keeps EVERY request's link, not just the last.
+    //
+    // (Supersedes the earlier batch-level `set_pipeline_source_link` overwrite,
+    // which resolved Open Q2 as batch-level on the false premise that depth-1
+    // admits at most one producer per batch. It does not: multiple DISTINCT
+    // requests co-batch as producers under continuous batching, and the overwrite
+    // kept only the final request's link → the others' producers never retained →
+    // their consumers retain-missed → placeholder token 0, the concurrent-decode
+    // corruption charlie root-caused. The executor retains request `r`'s producer
+    // row `qo_indptr[r+1]-1` under `pipeline_source_links[r]`.) The scalar
+    // `pipeline_source_link` is still set (last non-zero) for R=1 back-compat.
+    batch.pipeline_source_links.push(req.pipeline_source_link);
+    if req.pipeline_source_link != 0 {
+        batch.set_pipeline_source_link(req.pipeline_source_link);
+    }
+    // Drafts-channel routing (§9): fold the per-request source-kind parallel to the
+    // link. `0 = PrevSample` (retain `pi.sampled`) / `1 = PrevDrafts` (retain the
+    // composed `[k+1]` window). Empty ⇒ all PrevSample (the pushed 0s are harmless).
+    batch.pipeline_source_kinds.push(req.pipeline_source_kind);
+    if req.pipeline_source_kind != 0 {
+        batch.set_pipeline_source_kind(req.pipeline_source_kind);
+    }
+
     // Inference hint: prefill kernel when ANY request needs `custom_mask`.
     if req.token_ids.len() > 1 || req.has_user_mask {
         batch.single_token_mode = false;
@@ -627,6 +717,12 @@ pub fn extract_per_request(
         && fr.logits_bytes.is_empty()
         && fr.logprobs_values.is_empty()
         && fr.entropies.is_empty()
+        && fr.program_tokens.is_empty()
+        // A PTIR stage-program response carries its committed Reader-channel cells
+        // in `ptir_output_*` with EMPTY tokens/probes — it must NOT take the
+        // token-only early return, which would drop the outputs before the
+        // `ptir_output_*` slice below (§6.2 `out.take: no cell available` root).
+        && fr.ptir_output_indptr.is_empty()
         && out.spec_tokens.is_empty();
     if token_payload_only {
         if tok_hi == tok_lo + 1 {
@@ -694,6 +790,51 @@ pub fn extract_per_request(
     out.entropies = fr.entropies[ent_lo..ent_hi].to_vec();
     out.entropies_indptr = vec![0, (ent_hi - ent_lo) as u32];
 
+    // Program tokens (#32 `[k]`-Token): two-level CSR like logprobs —
+    // `program_tokens_req_indptr` partitions the per-(request,output) slot ranges,
+    // `program_tokens_indptr` partitions the values. Slice to this request's slots,
+    // resetting both indptrs to request-local offsets.
+    if fr.program_tokens_req_indptr.len() >= 2 && fr.program_tokens_indptr.len() >= 2 {
+        let slot_lo = fr.program_tokens_req_indptr[r] as usize;
+        let slot_hi = fr.program_tokens_req_indptr[r + 1] as usize;
+        let val_lo = fr.program_tokens_indptr[slot_lo] as usize;
+        let val_hi = fr.program_tokens_indptr[slot_hi] as usize;
+        out.program_tokens_req_indptr = vec![0, (slot_hi - slot_lo) as u32];
+        out.program_tokens_indptr = (slot_lo..=slot_hi)
+            .map(|s| fr.program_tokens_indptr[s] - fr.program_tokens_indptr[slot_lo])
+            .collect();
+        out.program_tokens = fr.program_tokens[val_lo..val_hi].to_vec();
+    } else {
+        out.program_tokens_req_indptr = vec![0];
+        out.program_tokens_indptr = vec![0];
+    }
+
+    // PTIR outputs (§6.2 stage programs): a per-PROGRAM CSR — `ptir_output_indptr`
+    // partitions the committed READER-channel slots by program (program p ↔
+    // request p in the single-program-per-request fire). Slice this request's
+    // program slots + the matching blob range (blob offset = cumulative Σ lens;
+    // there is no byte_indptr, the blob is concatenated in slot order). Without
+    // this the driver-filled `ptir_output_*` is dropped by `..Default` and the
+    // guest's `out.take()` reads nothing.
+    if fr.ptir_output_indptr.len() >= 2 {
+        let (slot_lo, slot_hi) = indptr_range(&fr.ptir_output_indptr, r);
+        if slot_hi > slot_lo {
+            let byte_lo: usize =
+                fr.ptir_output_lens[..slot_lo].iter().map(|&n| n as usize).sum();
+            let byte_hi: usize = byte_lo
+                + fr.ptir_output_lens[slot_lo..slot_hi]
+                    .iter()
+                    .map(|&n| n as usize)
+                    .sum::<usize>();
+            out.ptir_output_channels = fr.ptir_output_channels[slot_lo..slot_hi].to_vec();
+            out.ptir_output_lens = fr.ptir_output_lens[slot_lo..slot_hi].to_vec();
+            out.ptir_output_blob = fr.ptir_output_blob[byte_lo..byte_hi].to_vec();
+            out.ptir_output_indptr = vec![0, (slot_hi - slot_lo) as u32];
+        } else {
+            out.ptir_output_indptr = vec![0, 0];
+        }
+    }
+
     out
 }
 
@@ -709,6 +850,58 @@ fn indptr_range(indptr: &[u32], r: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_per_request_slices_program_tokens_two_level_csr() {
+        // #32 two-level CSR (bravo's round-trip vectors): 2 requests, each n_out=2
+        // (output 0 single-Token/empty, output 1 a `[k]`-Token of 2).
+        // req_indptr=[0,2,4], indptr=[0,0,2,2,4], tokens=[279,280,555,556].
+        // extract_per_request slices request r to its slots, resetting both
+        // indptrs request-local so build_output_tensors walks seg=o within it.
+        let fr = pie_driver_abi::ForwardResponse {
+            num_requests: 2,
+            program_tokens_req_indptr: vec![0, 2, 4],
+            program_tokens_indptr: vec![0, 0, 2, 2, 4],
+            program_tokens: vec![279, 280, 555, 556],
+            ..Default::default()
+        };
+        // request 0: slots [0,2) → output 0 empty, output 1 = [279,280].
+        let r0 = extract_per_request(&fr, 0);
+        assert_eq!(r0.program_tokens, vec![279, 280]);
+        assert_eq!(r0.program_tokens_indptr, vec![0, 0, 2]);
+        // request 1: slots [2,4) → output 0 empty, output 1 = [555,556].
+        let r1 = extract_per_request(&fr, 1);
+        assert_eq!(r1.program_tokens, vec![555, 556]);
+        assert_eq!(r1.program_tokens_indptr, vec![0, 0, 2]);
+    }
+
+    #[test]
+    fn extract_per_request_preserves_ptir_output_over_token_fast_path() {
+        // §6.2 regression: a PTIR stage-program response carries its committed
+        // Reader-channel cells in `ptir_output_*` with EMPTY tokens/probes. The
+        // `token_payload_only` fast-path (all probe channels empty) must NOT take
+        // its early return for such a response, or the `ptir_output_*` slice is
+        // dropped and the guest's `out.take()` reads "no cell available".
+        let fr = pie_driver_abi::ForwardResponse {
+            num_requests: 1,
+            // greedy_argmax: 1 program, 1 committed Reader channel (chan 1) = i32 token.
+            ptir_output_channels: vec![1],
+            ptir_output_blob: 19148i32.to_le_bytes().to_vec(),
+            ptir_output_lens: vec![4],
+            ptir_output_indptr: vec![0, 1],
+            ..Default::default()
+        };
+        let r0 = extract_per_request(&fr, 0);
+        assert_eq!(r0.ptir_output_indptr, vec![0, 1]);
+        assert_eq!(r0.ptir_output_channels, vec![1]);
+        assert_eq!(r0.ptir_output_lens, vec![4]);
+        assert_eq!(r0.ptir_output_blob, 19148i32.to_le_bytes().to_vec());
+        // and `ptir_output_at(0)` reconstructs the (channel, bytes) tuple.
+        let outs = r0.ptir_output_at(0).unwrap();
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].channel, 1);
+        assert_eq!(outs[0].bytes, 19148i32.to_le_bytes().to_vec());
+    }
 
     // -- Page-trim integration tests -----------------------------------------
 
@@ -796,6 +989,68 @@ mod tests {
         assert_eq!(batch.image_indptr, vec![0, 1, 2]);
     }
 
+    #[test]
+    fn next_input_carrier_merges_with_dest_rebase() {
+        // Run-ahead next-input carrier fold: producer link ids + source rows are
+        // global (verbatim); dest slots index each fire's own token buffer (rebased
+        // by the batch token-offset); `u32::MAX` skip-lane preserved; free-links
+        // verbatim; producer source-link propagated.
+        let mut req0 = make_request(vec![10, 11], vec![0, 1], vec![]); // 2 tokens
+        req0.set_pipeline_source_link(7);
+        req0.push_next_input_link(5, 0, 1); // dest 1 -> row_base(0)+1 = 1
+        req0.push_next_input_free_link(5);
+
+        let mut req1 = make_request(vec![12], vec![2], vec![]); // 1 token
+        req1.set_pipeline_source_link(9);
+        req1.push_next_input_link(7, 3, 0); // dest 0 -> row_base(2)+0 = 2
+        req1.push_next_input_link(7, 4, u32::MAX); // skip-lane preserved
+        req1.push_next_input_free_link(7);
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16); // row_base 0
+        append_request(&mut batch, &req1, &[200], 1, 16); // row_base 2 (req0 had 2 tokens)
+
+        assert_eq!(batch.next_input_producer_links, vec![5, 7, 7]); // global, verbatim
+        assert_eq!(batch.next_input_src_rows, vec![0, 3, 4]); // global, verbatim
+        assert_eq!(batch.next_input_dest_slots, vec![1, 2, u32::MAX]); // rebased + sentinel
+        assert_eq!(batch.next_input_free_links, vec![5, 7]); // verbatim concat
+        // Bug#2 fix: EACH co-batched producer retains its own link (per-request),
+        // not just the last. The scalar stays set (last) for R=1 back-compat.
+        assert_eq!(batch.pipeline_source_links, vec![7, 9]); // per-request, both preserved
+        assert_eq!(batch.pipeline_source_link, 9); // scalar back-compat = last
+    }
+
+    #[test]
+    fn co_batched_producers_retain_per_request_links_not_just_last() {
+        // **Bug#2 repro/guard (thrust-2, bravo).** The R>1 concurrent-decode
+        // corruption: two DISTINCT requests co-batch as run-ahead PRODUCERS in one
+        // fire, each sampling a token its own consumer will inject next step. The
+        // producer link is assigned PER-REQUEST (`apply_next_input_carrier` bumps a
+        // fresh link per pass), so request A gets link 7, request B link 9. The
+        // merge MUST retain BOTH — a batch-level scalar keeps only the last (9), so
+        // request A's producer token is never retained → A's consumer retain-misses
+        // → the device injects placeholder token 0 (or a cross-request token) → wrong
+        // Q&K → garbage. This asserts the per-request `pipeline_source_links` fold so
+        // each co-batched producer's token is retained under its own link.
+        let mut prod_a = make_request(vec![100], vec![5], vec![]); // decode row, producer A
+        prod_a.set_pipeline_source_link(7);
+        let mut prod_b = make_request(vec![200], vec![9], vec![]); // decode row, producer B
+        prod_b.set_pipeline_source_link(9);
+        // A non-producer request in the same batch contributes a 0 (no retain).
+        let plain = make_request(vec![300], vec![3], vec![]);
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &prod_a, &[100], 1, 16);
+        append_request(&mut batch, &plain, &[200], 1, 16);
+        append_request(&mut batch, &prod_b, &[300], 1, 16);
+
+        // One entry per request, aligned with `qo_indptr`: both producers' links
+        // survive (0 for the non-producer). A batch-level scalar would have lost 7.
+        assert_eq!(batch.pipeline_source_links, vec![7, 0, 9]);
+        // And each is attributable to its request's producer row via qo_indptr.
+        assert_eq!(batch.qo_indptr, vec![0, 1, 2, 3]);
+    }
+
     /// Attach one audio clip to `req`, mirroring the `input_audio` host handler:
     /// append the row anchor + feature bytes, then push one feature-CSR slot.
     fn with_audio(
@@ -875,9 +1130,165 @@ mod tests {
         assert_eq!(batch.kv_page_indices, vec![100, 101, 102]);
         assert_eq!(batch.kv_page_indptr, vec![0, 3]);
         assert_eq!(batch.kv_last_page_lens, vec![16]);
+        // M2a length column: physical span = (3-1)*16 + 16 = 48 (= seq_len).
+        assert_eq!(batch.kv_len, vec![48]);
         // Mask buffer is the original BRLE (no rewrite).
         assert_eq!(batch.masks, vec![causal.clone()]);
         assert_eq!(batch.mask_indptr, vec![0, 1]);
+    }
+
+    /// A single-token decode request with a real per-request sampling row
+    /// (`sampling_indices = [0]`, request-relative — the driver rebases it to
+    /// `qo_lo + 0`). Mirrors what the API prepares for a decode step.
+    fn decode_request(token: u32, position: u32) -> pie_driver_abi::ForwardRequest {
+        new_per_request(
+            0,
+            vec![token],
+            vec![position],
+            vec![],
+            false,
+            None,
+            vec![0], // request-relative sampling row
+            vec![],
+            vec![],
+            vec![],
+            false,
+            None,
+            None,
+        )
+    }
+
+    /// **M5 (geometry-as-data / C1-FINAL): `kv_len_device` is a forward-level
+    /// handle that survives the merge.** The device-resident `kv_len` source is
+    /// ONE base pointer for the whole forward (base of a packed `[R]` u32 buffer,
+    /// `[r]` = request r's kv_len), set post-assembly by the executor seam — a
+    /// per-request handle would fragment the bind (C1 co-design). This proves the
+    /// merge does NOT clobber a seam-set handle and the host-fed scalar column is
+    /// unaffected; today the seam is unwired, so the handle stays `0` and the
+    /// legacy path is byte-identical.
+    #[test]
+    fn m5_kv_len_device_survives_merge() {
+        let req0 = decode_request(11, 47); // 3 pages, host kv_len 48
+        let req1 = decode_request(22, 31); // 2 pages, host kv_len 32
+        let req2 = decode_request(33, 15); // 1 page, host kv_len 16
+
+        let reqs = [
+            (req0, vec![100u32, 101, 102]),
+            (req1, vec![200u32, 201]),
+            (req2, vec![300u32]),
+        ];
+        let elide = reqs.iter().all(|(r, _)| {
+            r.single_token_mode
+                && !r.has_user_mask
+                && r.token_ids.len() <= 1
+                && r.spec_token_ids.is_empty()
+        });
+
+        let mut batch = new_batched_forward_request();
+        // The executor seam wires a prior pass's producer output as the forward's
+        // device kv_len source BEFORE the per-request merge folds the lanes in.
+        batch.kv_len_device = vec![0xDEAD_BEEF_0000_1000];
+        for (req, pages) in &reqs {
+            append_request_with_options(&mut batch, req, pages, 16, 16, elide);
+        }
+
+        // Host-fed scalar column is unchanged (back-compat), one entry per request.
+        assert_eq!(batch.kv_len, vec![48, 32, 16]);
+        // The forward-level device handle is a single 1-element Vec the merge leaves
+        // untouched (never fragmented/accumulated per request).
+        assert_eq!(batch.kv_len_device, vec![0xDEAD_BEEF_0000_1000]);
+    }
+
+    /// M5 back-compat: an unwired seam leaves `kv_len_device` EMPTY — the legacy
+    /// path is byte-identical modulo the appended (empty) handle, so the driver
+    /// keeps deriving each lane's length from the scalar `kv_len` column.
+    #[test]
+    fn m5_kv_len_device_absent_is_all_host_fed() {
+        let req = decode_request(11, 47);
+        let mut batch = new_batched_forward_request();
+        append_request_with_options(&mut batch, &req, &[100, 101, 102], 16, 16, true);
+        assert_eq!(batch.kv_len, vec![48]);
+        assert!(batch.kv_len_device.is_empty(), "unwired seam ⇒ host-fed (empty handle)");
+    }
+
+    /// **R>1 batch-merge page-attribution guard** (bravo, concurrent-decode hunt).
+    /// The concurrent-garbage signature is *all-zero KV reads under R>1* — a
+    /// request reads pages that were never written, i.e. its page-table entry is
+    /// wrong in the *merged* batch (a semantic rebasing bug that would still pass
+    /// the byte-round-trip S1 test). This dumps the merged per-request page tables
+    /// for a 3-request decode batch with **distinct multi-page contexts** and
+    /// asserts each request's KV span is correctly delimited AND pairwise
+    /// DISJOINT: no request can alias/read another's pages purely from the host
+    /// merge. Folds via the real `elide_decode_masks=true` decode path
+    /// `build_batch_request` uses.
+    #[test]
+    fn r_gt_1_decode_batch_attributes_pages_disjointly() {
+        // Three decodes with distinct physical pages + distinct context lengths:
+        //   req0: pos 47 → seq_len 48 → 3 pages [100,101,102]
+        //   req1: pos 31 → seq_len 32 → 2 pages [200,201]
+        //   req2: pos 15 → seq_len 16 → 1 page  [300]
+        let reqs = [
+            (decode_request(11, 47), vec![100u32, 101, 102]),
+            (decode_request(22, 31), vec![200u32, 201]),
+            (decode_request(33, 15), vec![300u32]),
+        ];
+
+        // Reproduce `build_batch_request`: pure single-token decode ⇒ elide masks.
+        let elide = reqs.iter().all(|(r, _)| {
+            r.single_token_mode
+                && !r.has_user_mask
+                && r.token_ids.len() <= 1
+                && r.spec_token_ids.is_empty()
+        });
+        assert!(elide, "a pure single-token decode batch must elide decode masks");
+
+        let mut batch = new_batched_forward_request();
+        for (req, pages) in &reqs {
+            append_request_with_options(&mut batch, req, pages, 16, 16, elide);
+        }
+
+        // Page columns: concatenated in request order, CSR delimiting each run.
+        assert_eq!(batch.kv_page_indices, vec![100, 101, 102, 200, 201, 300]);
+        assert_eq!(batch.kv_page_indptr, vec![0, 3, 5, 6]);
+        assert_eq!(batch.kv_last_page_lens, vec![16, 16, 16]);
+        // M2a length column, per request: (num_pages-1)*16 + last_page_len.
+        assert_eq!(batch.kv_len, vec![48, 32, 16]);
+        // Token rows: one per request, in order.
+        assert_eq!(batch.token_ids, vec![11, 22, 33]);
+        assert_eq!(batch.position_ids, vec![47, 31, 15]);
+        assert_eq!(batch.qo_indptr, vec![0, 1, 2, 3]);
+        // Sampling rows stay request-relative ([0] each); the driver rebases them
+        // per request via `qo_indptr[r] + sampling_indices[k]` — so NOT rebasing
+        // in the merge is correct. The CSR delimits one row per request.
+        assert_eq!(batch.sampling_indices, vec![0, 0, 0]);
+        assert_eq!(batch.sampling_indptr, vec![0, 1, 2, 3]);
+
+        // The anti-contamination invariant: reconstruct each request's page set
+        // from the CSR exactly as the driver does, and assert the sets are
+        // pairwise DISJOINT and their union is the whole array — so no request
+        // can read a page belonging to another (the all-zero/cross-read root, if
+        // the merge were the culprit, is structurally impossible here).
+        let n = batch.kv_page_indptr.len() - 1;
+        let spans: Vec<&[u32]> = (0..n)
+            .map(|r| {
+                let lo = batch.kv_page_indptr[r] as usize;
+                let hi = batch.kv_page_indptr[r + 1] as usize;
+                &batch.kv_page_indices[lo..hi]
+            })
+            .collect();
+        for i in 0..n {
+            // Reconstructed physical span matches the length column.
+            let pc = spans[i].len() as u32;
+            assert_eq!((pc - 1) * 16 + batch.kv_last_page_lens[i], batch.kv_len[i]);
+            for j in (i + 1)..n {
+                for &p in spans[i] {
+                    assert!(
+                        !spans[j].contains(&p),
+                        "request {i} and {j} alias physical page {p} in the merged batch"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -905,6 +1316,11 @@ mod tests {
         assert_eq!(batch.kv_page_indptr, vec![0, 5]);
         // last_page_len unchanged — last page is never dropped.
         assert_eq!(batch.kv_last_page_lens, vec![16]);
+        // M2a length column: the physical span tracks the EMITTED (trimmed)
+        // pages, not the logical seq_len — (5-1)*16 + 16 = 80, matching what the
+        // driver reconstructs from the two arrays above (frozen/dropped pages are
+        // out of the physical span; the mask carries any sub-page validity, W6).
+        assert_eq!(batch.kv_len, vec![80]);
 
         // Trimmed BRLE: original false run [4, 256) shrinks by 15*16 = 240
         // bits (15 dropped pages). Layout becomes:
@@ -1036,5 +1452,230 @@ mod tests {
         );
         // Per-request indptr: one request contributing 3 rows.
         assert_eq!(batch.mask_indptr, vec![0, 3]);
+    }
+
+    /// Faithful production-path durable guard for the "new carrier field silently
+    /// dropped by the batch-merge" class (2nd occurrence: #6 next-input, then #27
+    /// `sampling_output_*`). Exercises the REAL merge path —
+    /// `new_batched_forward_request` (init) + `append_request` (per-request fold)
+    /// — and asserts the #27 cut #1 `sampling_output_*` fast-path dst table
+    /// survives (the field the merge originally dropped → driver `view=0` →
+    /// zeros) ALONGSIDE `next_input_*` + `pipeline_source_link`. Catches a regress
+    /// in EITHER the init (missing leading-0 CSR) or the merge (missing concat).
+    #[test]
+    fn batch_merge_preserves_sampling_output_and_carriers() {
+        // req0: 1-token decode + 1 fast-path output + a producer source-link + a
+        // consumer next-input link.
+        let mut req0 = make_request(vec![1], vec![10], vec![]);
+        req0.sampling_output_dst_ptrs = vec![0x1000];
+        req0.sampling_output_dst_lens = vec![4];
+        req0.sampling_output_indptr = vec![0, 1];
+        req0.set_pipeline_source_link(7);
+        req0.push_next_input_link(3, 0, 0);
+
+        // req1: 1-token decode + 2 fast-path outputs.
+        let mut req1 = make_request(vec![2], vec![20], vec![]);
+        req1.sampling_output_dst_ptrs = vec![0x2000, 0x3000];
+        req1.sampling_output_dst_lens = vec![4, 8];
+        req1.sampling_output_indptr = vec![0, 2];
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16);
+        append_request(&mut batch, &req1, &[200], 1, 16);
+
+        // #27 cut #1: the fast-path dst table survives — concatenated payloads +
+        // the per-program CSR offset by the table base (p0's 1 output, p1's 2 at
+        // base 1). Before the fix this was empty → driver view=0 → all-zeros.
+        assert_eq!(
+            batch.sampling_output_dst_ptrs,
+            vec![0x1000u64, 0x2000, 0x3000]
+        );
+        assert_eq!(batch.sampling_output_dst_lens, vec![4u32, 4, 8]);
+        assert_eq!(batch.sampling_output_indptr, vec![0u32, 1, 3]);
+
+        // Other carriers survive the same merge (regression baseline).
+        assert_eq!(batch.pipeline_source_link, 7);
+        assert_eq!(batch.next_input_producer_links, vec![3]);
+        assert_eq!(batch.next_input_src_rows, vec![0]);
+        assert_eq!(batch.next_input_dest_slots, vec![0]);
+    }
+
+    /// S1 exit criterion: a `ForwardRequest` carrying the sampling-program
+    /// carrier (`sampling_program_*` / `sampling_input_*` / `sampling_late_*` /
+    /// `sampling_binding_*`) survives batching byte-for-byte modulo the
+    /// documented CSR offsets. Two requests each carry one program with
+    /// distinct bytecode, submit-bound inputs, late keys (one with a host
+    /// value, one device-alias with none), and a per-slot binding map. After
+    /// the real `append_request` fold, `sampling_program_at(p)` must reconstruct
+    /// each original submission exactly, and the offset CSRs must be correct.
+    #[test]
+    fn sampling_program_carrier_survives_batching_byte_for_byte() {
+        use pie_driver_abi::{SamplingBinding, SamplingInput, SamplingProgramSubmission};
+
+        let prog0 = SamplingProgramSubmission {
+            bytecode: vec![0xDE, 0xAD],
+            inputs: vec![
+                SamplingInput { key: 10, bytes: vec![1, 2, 3] },
+                SamplingInput { key: 11, bytes: vec![4, 5] },
+            ],
+            bindings: vec![SamplingBinding::Logits, SamplingBinding::Tensor { key: 11 }],
+            late_keys: vec![100, 200],
+            // key 100 has a staged host value; key 200 is a device-alias (no value).
+            late_inputs: vec![SamplingInput { key: 100, bytes: vec![9, 9, 9, 9] }],
+        };
+        let prog1 = SamplingProgramSubmission {
+            bytecode: vec![0xBE, 0xEF, 0x01],
+            inputs: vec![SamplingInput { key: 20, bytes: vec![7] }],
+            bindings: vec![SamplingBinding::Tensor { key: 20 }],
+            late_keys: vec![300],
+            late_inputs: vec![],
+        };
+
+        let mut req0 = make_request(vec![1], vec![10], vec![]);
+        req0.push_sampling_program(&prog0);
+        let mut req1 = make_request(vec![2], vec![20], vec![]);
+        req1.push_sampling_program(&prog1);
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16);
+        append_request(&mut batch, &req1, &[200], 1, 16);
+
+        // Byte-for-byte round-trip through the merged SoA + offset CSRs.
+        assert_eq!(batch.n_sampling_programs(), 2);
+        assert_eq!(batch.sampling_program_at(0), Some(prog0));
+        assert_eq!(batch.sampling_program_at(1), Some(prog1));
+
+        // Documented offsets: per-request boundary CSR, then the nested
+        // per-program CSRs with req1's ranges rebased onto req0's tail.
+        assert_eq!(batch.sampling_program_indptr, vec![0, 1, 2]);
+        assert_eq!(batch.sampling_program_bytes, vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01]);
+        assert_eq!(batch.sampling_program_bytes_indptr, vec![0, 2, 5]);
+        // Input blob concatenated; req1's offset rebased by req0's blob len (5).
+        assert_eq!(batch.sampling_input_blob, vec![1, 2, 3, 4, 5, 7]);
+        assert_eq!(batch.sampling_input_keys, vec![10, 11, 20]);
+        assert_eq!(batch.sampling_input_offsets, vec![0, 3, 5]);
+        assert_eq!(batch.sampling_input_lens, vec![3, 2, 1]);
+        assert_eq!(batch.sampling_input_indptr, vec![0, 2, 3]);
+        // Late channel: keys concatenated, value offsets rebased by the late
+        // blob len (4), the len-0 sentinel (device-alias) preserved.
+        assert_eq!(batch.sampling_late_keys, vec![100, 200, 300]);
+        assert_eq!(batch.sampling_late_blob, vec![9, 9, 9, 9]);
+        assert_eq!(batch.sampling_late_offsets, vec![0, 4, 4]);
+        assert_eq!(batch.sampling_late_lens, vec![4, 0, 0]);
+        assert_eq!(batch.sampling_late_indptr, vec![0, 2, 3]);
+        // Binding map: (kind, key) slots concatenated, CSR rebased.
+        assert_eq!(batch.sampling_binding_kind, vec![0, 1, 1]);
+        assert_eq!(batch.sampling_binding_key, vec![0, 11, 20]);
+        assert_eq!(batch.sampling_binding_indptr, vec![0, 2, 3]);
+    }
+
+    /// The intrinsic-kind ENCODING contract: `push_sampling_program` must emit
+    /// the manifest binding kind (`SamplingBinding::kind()`) into
+    /// `sampling_binding_kind` per slot — Logits→0, Tensor→1, **MtpLogits→2**,
+    /// **MtpDrafts→3**. This is the wire byte charlie's driver decode
+    /// (`manifest_to_slot_bindings`) reads to set `InputBind.intrinsic_kind`;
+    /// if the encoding collapsed the intrinsic kinds here, every intrinsic would
+    /// resolve as the sampled Logits row (the (b) A/B regression). Locks the
+    /// contract so a future binding shuffle can't silently drop the kind.
+    #[test]
+    fn sampling_binding_intrinsic_kind_encoded_per_slot() {
+        use pie_driver_abi::{SamplingBinding, SamplingProgramSubmission};
+
+        // One program binding all four kinds, in slot order.
+        let prog = SamplingProgramSubmission {
+            bytecode: vec![0x01],
+            inputs: vec![],
+            bindings: vec![
+                SamplingBinding::Logits,
+                SamplingBinding::MtpLogits,
+                SamplingBinding::MtpDrafts,
+                SamplingBinding::Tensor { key: 42 },
+            ],
+            late_keys: vec![],
+            late_inputs: vec![],
+        };
+
+        let mut req = make_request(vec![1], vec![10], vec![]);
+        req.push_sampling_program(&prog);
+
+        // Emitted wire kinds/keys, in slot order: the intrinsics are payload-less
+        // (key 0); the tensor carries its TensorKey.
+        assert_eq!(req.sampling_binding_kind, vec![0, 2, 3, 1]);
+        assert_eq!(req.sampling_binding_key, vec![0, 0, 0, 42]);
+        assert_eq!(req.sampling_binding_indptr, vec![0, 4]);
+
+        // Round-trips byte-for-byte through a merged batch (decode ≡ encode).
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req, &[], 1, 16);
+        assert_eq!(batch.sampling_program_at(0), Some(prog));
+        assert_eq!(batch.sampling_binding_kind, vec![0, 2, 3, 1]);
+    }
+
+    /// The #27 cut #2 device-alias late channel (`sampling_late_device_*`) is
+    /// value-parallel to `sampling_late_keys` (one device ptr + R12 flag + len
+    /// per late key), so the batch fold concatenates it verbatim — no CSR
+    /// offsetting. A miss here silently strands the device-resident late value.
+    #[test]
+    fn sampling_late_device_alias_channel_merges_verbatim() {
+        let mut req0 = make_request(vec![1], vec![10], vec![]);
+        req0.sampling_late_keys = vec![100, 200];
+        req0.sampling_late_indptr = vec![0, 2];
+        req0.sampling_late_device_ptrs = vec![0xAAAA, 0];
+        req0.sampling_late_device_flags = vec![1, 0];
+        req0.sampling_late_device_lens = vec![8, 0];
+
+        let mut req1 = make_request(vec![2], vec![20], vec![]);
+        req1.sampling_late_keys = vec![300];
+        req1.sampling_late_indptr = vec![0, 1];
+        req1.sampling_late_device_ptrs = vec![0xBBBB];
+        req1.sampling_late_device_flags = vec![1];
+        req1.sampling_late_device_lens = vec![4];
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16);
+        append_request(&mut batch, &req1, &[200], 1, 16);
+
+        assert_eq!(batch.sampling_late_keys, vec![100, 200, 300]);
+        // Parallel device arrays concatenated verbatim (no rebasing).
+        assert_eq!(batch.sampling_late_device_ptrs, vec![0xAAAA, 0, 0xBBBB]);
+        assert_eq!(batch.sampling_late_device_flags, vec![1, 0, 1]);
+        assert_eq!(batch.sampling_late_device_lens, vec![8, 0, 4]);
+    }
+
+    /// Legacy sampler SoA is unchanged by the program carrier: a batch of
+    /// plain-sampler requests (no programs) folds its sampler SoA + per-request
+    /// `sampler_indptr` exactly as before, and carries no program payload. This
+    /// guards the S1 "legacy sampler SoA unchanged" invariant.
+    #[test]
+    fn legacy_sampler_soa_unchanged_alongside_program_carrier() {
+        use pie_driver_abi::Sampler;
+
+        let mut req0 = make_request(vec![1], vec![10], vec![]);
+        req0.sampling_indices = vec![0];
+        req0.set_samplers(&[Sampler::Multinomial { temperature: 1.0, seed: 42 }]);
+        let mut req1 = make_request(vec![2], vec![20], vec![]);
+        req1.sampling_indices = vec![0];
+        req1.set_samplers(&[
+            Sampler::TopK { temperature: 0.7, k: 40 },
+            Sampler::MinP { temperature: 1.0, p: 0.05 },
+        ]);
+
+        let mut batch = new_batched_forward_request();
+        append_request(&mut batch, &req0, &[100], 1, 16);
+        append_request(&mut batch, &req1, &[200], 1, 16);
+
+        // Per-request sampler CSR: req0 contributes 1 slot, req1 contributes 2.
+        assert_eq!(batch.sampler_indptr, vec![0, 1, 3]);
+        assert_eq!(batch.n_samplers(), 3);
+        // Round-trip each merged sampler slot back to its origin.
+        assert_eq!(
+            batch.sampler_at(0),
+            Some(Sampler::Multinomial { temperature: 1.0, seed: 42 })
+        );
+        assert_eq!(batch.sampler_at(1), Some(Sampler::TopK { temperature: 0.7, k: 40 }));
+        assert_eq!(batch.sampler_at(2), Some(Sampler::MinP { temperature: 1.0, p: 0.05 }));
+        // No program carrier populated by the legacy path.
+        assert_eq!(batch.n_sampling_programs(), 0);
+        assert!(batch.sampling_program_bytes.is_empty());
     }
 }

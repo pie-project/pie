@@ -50,7 +50,12 @@ fn bind(b: &Built, logits: &[f32], tensors: &[(u32, EvalValue)]) -> Vec<EvalValu
     b.bindings
         .iter()
         .map(|binding| match binding {
-            pie_sampling_ir::Binding::Logits => EvalValue::F32(logits.to_vec()),
+            pie_sampling_ir::Binding::Logits | pie_sampling_ir::Binding::MtpLogits => {
+                EvalValue::F32(logits.to_vec())
+            }
+            pie_sampling_ir::Binding::MtpDrafts => {
+                panic!("mtp-drafts device intrinsic not supplied by this host-eval harness")
+            }
             pie_sampling_ir::Binding::Tensor { key, .. } => tensors
                 .iter()
                 .find(|(k, _)| k == key)
@@ -69,18 +74,25 @@ fn eval_sugar_argmax_exact() {
     assert_eq!(token_of(&out[0]), argmax(&logits));
 }
 
-// ── greedy grammar: exact argmax(logits + mask) ──────────────────────────────
+// ── greedy grammar: exact argmax over the packed allowed-token bitmask ────────
 #[test]
 fn eval_grammar_greedy_exact() {
     let (b, keys) = grammar(8).unwrap();
     let logits = logits8();
-    let mut mask = vec![0.0f32; 8];
-    mask[5] = f32::NEG_INFINITY; // ban the natural argmax (idx 5)
-    mask[1] = f32::NEG_INFINITY; // and idx 1 -> best allowed = idx 3 (2.0)
-    let tensors = [(keys.mask, EvalValue::F32(mask.clone()))];
+    // Packed `[ceil(8/32)]` = 1 u32 bitmask: bit j = 1 allowed / 0 disallowed.
+    // Ban idx 5 (the natural argmax) and idx 1 → best allowed = idx 3 (2.0).
+    let mut word: u32 = 0xFFFF_FFFF; // all allowed
+    word &= !(1u32 << 5);
+    word &= !(1u32 << 1);
+    let tensors = [(keys.mask, EvalValue::U32(vec![word]))];
     let out = eval(&prog(&b), &InputBindings::new(&bind(&b, &logits, &tensors), 7)).unwrap();
-    let biased: Vec<f32> = logits.iter().zip(&mask).map(|(l, m)| l + m).collect();
-    assert_eq!(token_of(&out[0]), argmax(&biased));
+    // mask-apply: disallowed → −∞; argmax over the allowed tokens.
+    let masked: Vec<f32> = logits
+        .iter()
+        .enumerate()
+        .map(|(j, &l)| if (word >> j) & 1 == 1 { l } else { f32::NEG_INFINITY })
+        .collect();
+    assert_eq!(token_of(&out[0]), argmax(&masked));
     assert_eq!(token_of(&out[0]), 3);
 }
 
@@ -111,6 +123,46 @@ fn eval_mirostat_small_mu_forces_argmax() {
     for s in [1u32, 7, 42, 1000] {
         let out = eval(&prog(&b), &InputBindings::new(&bind(&b, &logits, &tensors), s)).unwrap();
         assert_eq!(token_of(&out[0]), argmax(&logits), "seed {s}");
+    }
+}
+
+// ── mirostat min-kept-set floor (#19): the gate can't collapse below k_min ───-
+#[test]
+fn eval_mirostat_floor_guarantees_kept_set() {
+    use sampling_edsl::program::mirostat_floor;
+    let k_min = 3u32;
+    let (b, keys) = mirostat_floor(8, k_min).unwrap();
+    let logits = logits8();
+    // Top-k_min by logit — the floor's guaranteed kept set even when μ admits none.
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &c| logits[c].partial_cmp(&logits[a]).unwrap());
+    let floor_set: std::collections::HashSet<usize> =
+        idx[..k_min as usize].iter().cloned().collect();
+    // μ=0 collapses the surprise gate to empty; the floor must still keep top-k_min,
+    // so the sampled token is always one of them (vs plain mirostat → greedy argmax).
+    let tensors = [(keys.mu, EvalValue::F32(vec![0.0]))];
+    for s in [1u32, 7, 42, 1000, 65535] {
+        let out = eval(&prog(&b), &InputBindings::new(&bind(&b, &logits, &tensors), s)).unwrap();
+        let t = token_of(&out[0]) as usize;
+        assert!(
+            floor_set.contains(&t),
+            "seed {s}: token {t} not in floor top-{k_min} {floor_set:?}"
+        );
+    }
+}
+
+// ── #19 argmax-floor fallback (proven Ge/ReduceMax/Broadcast ops, no RankLe) ──-
+#[test]
+fn eval_mirostat_argmax_floor_keeps_argmax() {
+    use sampling_edsl::program::mirostat_argmax_floor;
+    let (b, keys) = mirostat_argmax_floor(8).unwrap();
+    let logits = logits8();
+    // μ=0 collapses the surprise gate; the argmax floor must still keep the argmax
+    // (→ never token-0), using only ops proven in charlie's NVRTC mirostat kernel.
+    let tensors = [(keys.mu, EvalValue::F32(vec![0.0]))];
+    for s in [1u32, 7, 42, 1000, 65535] {
+        let out = eval(&prog(&b), &InputBindings::new(&bind(&b, &logits, &tensors), s)).unwrap();
+        assert_eq!(token_of(&out[0]), argmax(&logits), "seed {s}: argmax floor keeps argmax");
     }
 }
 

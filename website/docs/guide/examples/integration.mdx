@@ -1,20 +1,18 @@
 ---
 title: I/O and integration
-description: HTTP, MCP, OpenAI Responses, concurrency
+description: HTTP, MCP, concurrency
 sidebar_position: 9
 ---
 
 # I/O and integration
 
-Inferlets that talk to the outside world: HTTP servers, HTTP clients, MCP servers, the OpenAI Responses protocol, and SDK concurrency tests.
+Inferlets that talk to the outside world: HTTP clients, MCP servers, and SDK concurrency tests.
 
-## HTTP and embedded servers
+## HTTP
 
 | Inferlet | What it shows |
 |---|---|
-| [`http-server`](https://github.com/pie-project/pie/tree/main/inferlets/http-server) | `wasi:http/incoming-handler` server with SSE streaming. |
 | [`image-fetch`](https://github.com/pie-project/pie/tree/main/inferlets/image-fetch) | `wstd::http::Client` to fetch and decode images. |
-| [`openresponses`](https://github.com/pie-project/pie/tree/main/inferlets/openresponses) | OpenResponses-compliant HTTP API. |
 
 ## MCP
 
@@ -34,6 +32,5 @@ Inferlets that talk to the outside world: HTTP servers, HTTP clients, MCP server
 ## Related guide
 
 - [HTTP](../io/http): outbound HTTP from inside an inferlet.
-- [MCP](../io/mcp): connecting to host-registered MCP servers.
 - [Filesystem](../io/filesystem): the sandboxed `/scratch` directory.
 - [Session](../io/session): the channel back to the launching client.

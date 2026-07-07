@@ -1,0 +1,15 @@
+[package]
+name = "ptir-greedy-e2e"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet.workspace = true
+inferlet-macros.workspace = true
+# Echo's canonical PTIR container types — the guest builds the greedy_argmax
+# trace and encodes the wire bytes `register-program` consumes. `eval` (the host
+# interpreter) stays off; only the container/op/encode surface is used guest-side.
+pie-sampling-ir = { path = "../../../../interface/sampling-ir", default-features = false, features = ["std"] }

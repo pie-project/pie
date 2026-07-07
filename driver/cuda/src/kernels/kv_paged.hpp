@@ -64,4 +64,20 @@ void launch_dequant_kv_cache_layer_to_bf16_active(
     int num_pages_in_batch,
     cudaStream_t stream);
 
+// Beam [B,P] freeze/heir KV write (SEAM 3): each beam b writes its ONE new-token
+// K/V into an EXPLICIT (physical page id `w_page[b]`, offset `w_off[b]`) target,
+// consuming the epilogue's WSlot/WOff (write-offset separated from KvLen) rather
+// than re-deriving the position from the page-table + last_page_len. Single-cell
+// per beam → shared-page-safe (a frozen sibling's kvm masks the heir's cell).
+// Requires a native-bf16 KV cache. `w_page` must already be PHYSICAL page ids
+// (resolve slot→physical before the call).
+void launch_write_kv_beam_bf16(
+    KvCacheLayerView layer,
+    const void* k_curr,                 // [B, h_kv, d]
+    const void* v_curr,
+    const std::uint32_t* w_page,        // [B] physical page id per beam
+    const std::uint32_t* w_off,         // [B] offset-in-page per beam
+    int B,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels

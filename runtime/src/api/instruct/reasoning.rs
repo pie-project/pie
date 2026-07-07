@@ -22,12 +22,8 @@ impl std::fmt::Debug for Decoder {
 }
 
 impl pie::instruct::reasoning::Host for InstanceState {
-    async fn create_decoder(
-        &mut self,
-        model: Resource<crate::api::model::Model>,
-    ) -> Result<Resource<Decoder>> {
-        let model = self.ctx().table.get(&model)?;
-        let inner = model.model.instruct().reasoning_decoder();
+    async fn create_decoder(&mut self) -> Result<Resource<Decoder>> {
+        let inner = crate::model::model().instruct().reasoning_decoder();
         let decoder = Decoder { inner };
         Ok(self.ctx().table.push(decoder)?)
     }

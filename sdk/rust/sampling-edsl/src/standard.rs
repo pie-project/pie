@@ -24,11 +24,11 @@
 //! (alpha, `6657f23b`): authoring is axis-neutral `Rng{stream:0}` and production's
 //! `batched=true` picks `col=j`. `stream:0 ⇒ seed_eff = S ^ 0xA5A5A5A5`.
 //!
-//! ## Param contract (manager/alpha/echo/golf-ratified, Task #4)
-//! - **Per-row HostSubmit (scalar inputs):** temperature, min_p, top_p `p`.
-//! - **Group-level immediate (program-identity / cache key):** top-k `k`
-//!   (`Predicate::RankLe(u32)` is a baked immediate — grouping buckets by
-//!   `(sampler_type, k)`).
+//! ## Param contract (#25 de-hardwired top-k)
+//! - **Per-row HostSubmit (scalar inputs):** temperature, min_p, top_p `p`, and
+//!   (since #25) top-k `k` (a `U32` scalar). `Predicate::RankLe` now references the
+//!   submit value-id rather than a baked immediate, so the bytecode is k-invariant
+//!   and the driver reads `k` from the binding exactly like temp / top-p / min-p.
 //! - **Ambient:** the RNG seed `S` — never a host input.
 //!
 //! Covers the full standard set: argmax, temperature, min-p, top-k, top-p,
@@ -40,6 +40,21 @@ use crate::dynamic::{
     dyn_temperature_scale,
 };
 use crate::ir::{DType, Readiness, TensorKey};
+use crate::kinds::CanonicalKind;
+use alloc::vec::Vec;
+
+impl From<StandardSampler> for CanonicalKind {
+    fn from(s: StandardSampler) -> Self {
+        match s {
+            StandardSampler::Argmax => CanonicalKind::Argmax,
+            StandardSampler::Temperature => CanonicalKind::Temperature,
+            StandardSampler::MinP => CanonicalKind::MinP,
+            StandardSampler::TopK => CanonicalKind::TopK,
+            StandardSampler::TopP => CanonicalKind::TopP,
+            StandardSampler::TopKTopP => CanonicalKind::TopKTopP,
+        }
+    }
+}
 
 /// The per-row HostSubmit parameter keys a standard-sampler program declares. A
 /// field is `Some(key)` iff the program consumes that param — bind row `r`'s
@@ -53,13 +68,17 @@ pub struct StdParamKeys {
     pub min_p: Option<TensorKey>,
     /// Top-p mass `p` (f32 scalar submit) — nucleus threshold.
     pub top_p: Option<TensorKey>,
+    /// Top-k cutoff `k` (u32 scalar submit, #25) — keep the top-`k` by logit. The
+    /// `RankLe` predicate references this submit value-id, so the program is
+    /// k-invariant; the driver reads `k` from the binding.
+    pub k: Option<TensorKey>,
 }
 
-/// The standard samplers authored as parametric per-sequence programs. The
-/// `k`-bearing forms bake `k` as a build-time immediate (`Predicate::RankLe`),
-/// keying the program cache by `(sampler_type, k)` so intra-group `k` never
-/// varies; the continuous params (temperature / top-p `p` / min_p) are scalar
-/// HostSubmit inputs.
+/// The standard samplers authored as parametric per-sequence programs. Every
+/// continuous param (temperature / top-p `p` / min_p) and — since #25 — the
+/// top-k cutoff `k` are scalar `HostSubmit` inputs, so each kind has a single
+/// k-invariant program (the `RankLe` predicate references the submit `k`
+/// value-id, never a baked immediate).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum StandardSampler {
     /// Greedy `argmax(logits)` — no params, no RNG.
@@ -68,20 +87,14 @@ pub enum StandardSampler {
     Temperature,
     /// Min-p truncation (logit space) + temperature, Gumbel-max.
     MinP,
-    /// Top-k: keep the top `k` by logit (`k` baked immediate, group key) +
+    /// Top-k: keep the top `k` by logit (`k` a `U32` submit input) +
     /// temperature, Gumbel-max.
-    TopK {
-        /// The (group-uniform) top-k cutoff — baked into `Predicate::RankLe`.
-        k: u32,
-    },
+    TopK,
     /// Top-p (nucleus): keep the smallest prob-mass-`p` set + temperature,
     /// Gumbel-max. `p` and temperature are scalar inputs.
     TopP,
-    /// Top-k ∩ top-p (`k` baked immediate; `p`/temperature scalar inputs).
-    TopKTopP {
-        /// The (group-uniform) top-k cutoff — baked into `Predicate::RankLe`.
-        k: u32,
-    },
+    /// Top-k ∩ top-p (`k` a `U32` submit input; `p`/temperature scalar inputs).
+    TopKTopP,
 }
 
 /// Build the parametric program for `kind` at runtime `vocab`. `outputs =
@@ -94,9 +107,9 @@ pub fn build_standard(
         StandardSampler::Argmax => Ok((argmax(vocab)?, StdParamKeys::default())),
         StandardSampler::Temperature => temperature(vocab),
         StandardSampler::MinP => min_p(vocab),
-        StandardSampler::TopK { k } => top_k(vocab, k),
+        StandardSampler::TopK => top_k(vocab),
         StandardSampler::TopP => top_p(vocab),
-        StandardSampler::TopKTopP { k } => top_k_top_p(vocab, k),
+        StandardSampler::TopKTopP => top_k_top_p(vocab),
     }
 }
 
@@ -104,6 +117,7 @@ pub fn build_standard(
 /// the (B) order lands it first to prove the batched bind + scatter).
 pub fn argmax(vocab: u32) -> Result<Built, BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::Argmax);
     let logits = g.intrinsic_logits_dyn(); // [vocab]
     let token = logits.argmax();
     g.output(&token, OutputKind::Token);
@@ -114,6 +128,7 @@ pub fn argmax(vocab: u32) -> Result<Built, BuildError> {
 /// scalar HostSubmit input (per-row at launch); seed is ambient batch axis.
 pub fn temperature(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::Temperature);
     let logits = g.intrinsic_logits_dyn();
     let temp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
 
@@ -134,6 +149,7 @@ pub fn temperature(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
 /// HostSubmit inputs; seed is ambient batch axis (`stream:0`).
 pub fn min_p(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::MinP);
     let logits = g.intrinsic_logits_dyn();
     let temp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
     let minp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
@@ -153,21 +169,27 @@ pub fn min_p(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
 }
 
 /// **Top-k** — keep the top `k` tokens by logit, then temperature-scaled
-/// Gumbel-max over the kept set. `k` is a **baked immediate** (the group key);
-/// temperature is a scalar HostSubmit input; seed is ambient (`stream:0`).
-pub fn top_k(vocab: u32, k: u32) -> Result<(Built, StdParamKeys), BuildError> {
+/// Gumbel-max over the kept set. Since #25 `k` is a **`U32` HostSubmit** input
+/// (declared last → submit ordinal after temperature); temperature is a scalar
+/// HostSubmit input; seed is ambient (`stream:0`). The `RankLe` predicate
+/// references the `k` value-id, so the program is k-invariant.
+pub fn top_k(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::TopK);
     let logits = g.intrinsic_logits_dyn();
     let temp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
+    // #25: k rides a U32 submit value-id (declared last), not a baked immediate.
+    let k = g.host_scalar_dyn(DType::U32, Readiness::Submit);
 
     let scaled = dyn_temperature_scale(&logits, &temp);
-    let keep = logits.pivot_rank_le(k); // k baked immediate
+    let keep = logits.pivot_rank_le(&k);
     let score = dyn_mask_to_score(&g, &keep, &scaled);
     let token = dyn_gumbel_argmax(&g, &score, 0, vocab);
     g.output(&token, OutputKind::Token);
 
     let keys = StdParamKeys {
         temperature: Some(temp.input_key().expect("temperature host input")),
+        k: Some(k.input_key().expect("k host input")),
         ..Default::default()
     };
     Ok((g.build()?, keys))
@@ -178,6 +200,7 @@ pub fn top_k(vocab: u32, k: u32) -> Result<(Built, StdParamKeys), BuildError> {
 /// and `p` are scalar HostSubmit inputs; seed is ambient (`stream:0`).
 pub fn top_p(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::TopP);
     let logits = g.intrinsic_logits_dyn();
     let temp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
     let pv = g.host_scalar_dyn(DType::F32, Readiness::Submit);
@@ -197,18 +220,23 @@ pub fn top_p(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
     Ok((g.build()?, keys))
 }
 
-/// **Top-k ∩ top-p** — keep tokens passing *both* the top-`k` (baked immediate)
-/// and the top-`p` (scalar input) cuts, then temperature-scaled Gumbel-max. `T`
-/// and `p` are scalar HostSubmit inputs; seed is ambient (`stream:0`).
-pub fn top_k_top_p(vocab: u32, k: u32) -> Result<(Built, StdParamKeys), BuildError> {
+/// **Top-k ∩ top-p** — keep tokens passing *both* the top-`k` and the top-`p`
+/// cuts, then temperature-scaled Gumbel-max. Since #25 `k` is a **`U32`
+/// HostSubmit** input (declared last → submit ordinal after temperature and
+/// top-p `p`); `T` and `p` are scalar HostSubmit inputs; seed is ambient
+/// (`stream:0`). The `RankLe` predicate references the `k` value-id.
+pub fn top_k_top_p(vocab: u32) -> Result<(Built, StdParamKeys), BuildError> {
     let g = Graph::new(vocab);
+    g.set_canonical_kind(CanonicalKind::TopKTopP);
     let logits = g.intrinsic_logits_dyn();
     let temp = g.host_scalar_dyn(DType::F32, Readiness::Submit);
     let pv = g.host_scalar_dyn(DType::F32, Readiness::Submit);
+    // #25: k rides a U32 submit value-id (declared last), not a baked immediate.
+    let k = g.host_scalar_dyn(DType::U32, Readiness::Submit);
 
     let scaled = dyn_temperature_scale(&logits, &temp);
     let probs = dyn_softmax(&scaled);
-    let keep_k = logits.pivot_rank_le(k); // k baked immediate
+    let keep_k = logits.pivot_rank_le(&k);
     let keep_p = probs.pivot_cummass_le(&pv);
     let f = g.constant_bool_dyn(false).broadcast_vec(vocab);
     let keep = dselect(&keep_k, &keep_p, &f); // keep_k AND keep_p
@@ -219,7 +247,68 @@ pub fn top_k_top_p(vocab: u32, k: u32) -> Result<(Built, StdParamKeys), BuildErr
     let keys = StdParamKeys {
         temperature: Some(temp.input_key().expect("temperature host input")),
         top_p: Some(pv.input_key().expect("top_p host input")),
+        k: Some(k.input_key().expect("k host input")),
         ..Default::default()
     };
     Ok((g.build()?, keys))
 }
+
+// ============================================================================
+// #12 reference set: canonical program -> kind (the hash-table source)
+// ============================================================================
+
+/// The canonical bytecode + [`CanonicalKind`] for one standard sampler — the
+/// `program → kind` reference the #12 classifier hash-matches against (alpha's
+/// table interns `program_hash(bytecode) → kind`). For a **k-bearing** kind the
+/// bytecode is k-specific (the baked `RankLe(k)` immediate); the **k-invariant**
+/// kinds (their continuous params are host-submit inputs, not baked) have a
+/// single canonical bytecode per `vocab`.
+pub fn standard_program(
+    kind: StandardSampler,
+    vocab: u32,
+) -> Result<(Vec<u8>, CanonicalKind), BuildError> {
+    let (built, _) = build_standard(kind, vocab)?;
+    Ok((built.lower().bytecode, kind.into()))
+}
+
+/// All standard programs for runtime `vocab` — each kind has a single canonical
+/// bytecode per `vocab`, so their hashes are stable reference entries for the #12
+/// `{hash → kind}` table. Since #25 this includes TopK / TopKTopP: their `k` is a
+/// submit value-id (not a baked immediate), so their bytecode is k-invariant too
+/// and they recognize by exact hash like the rest — there is no longer a separate
+/// canonicalized op-shape phase.
+pub fn standard_programs(vocab: u32) -> Result<Vec<(Vec<u8>, CanonicalKind)>, BuildError> {
+    [
+        StandardSampler::Argmax,
+        StandardSampler::Temperature,
+        StandardSampler::MinP,
+        StandardSampler::TopP,
+        StandardSampler::TopK,
+        StandardSampler::TopKTopP,
+    ]
+    .into_iter()
+    .map(|k| standard_program(k, vocab))
+    .collect()
+}
+
+/// The `{ program_hash → CanonicalKind }` reference entries for all standard
+/// kinds at `vocab` — the exact-hash #12 recognizer table.
+///
+/// Each hash is [`program_hash`](crate::ir::program_hash) (the single FNV-1a ==
+/// the driver `ProgramHandle`) of the canonical bytecode from [`standard_programs`].
+/// The driver self-recognizes an attached program by matching its hash against
+/// these — which equal the driver's *own* baked-program hashes by canonical
+/// encode — and routes to the kind. Since #25 TopK / TopKTopP are k-invariant
+/// (`k` is a submit value-id), so they too recognize by these exact hashes.
+pub fn standard_program_hashes(vocab: u32) -> Result<Vec<(u64, CanonicalKind)>, BuildError> {
+    Ok(standard_programs(vocab)?
+        .into_iter()
+        .map(|(bytecode, kind)| (crate::ir::program_hash(&bytecode), kind))
+        .collect())
+}
+
+// #25: TopK / TopKTopP are now k-invariant (k is a submit value-id), so the
+// former phase-2 canonical op-shape machinery (`standard_programs_canonical`,
+// `standard_program_hashes_canonical`) and the baked-`k` reader (`extract_top_k`)
+// are obsolete — all kinds recognize by exact hash via `standard_programs`, and
+// the driver reads `k` from the submit binding.

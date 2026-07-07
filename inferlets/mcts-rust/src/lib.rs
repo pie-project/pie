@@ -34,7 +34,10 @@
 //! `Context::fork()` optimization left as future work. This is a *correctness
 //! / demonstration* inferlet, not a tuned reasoning benchmark.
 
-use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{self, SamplerSpec};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{carrier, chat, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -291,6 +294,89 @@ fn first_number(text: &str) -> Option<f32> {
 // Each helper runs one isolated generation in a fresh Context. Splitting the
 // phases keeps the prompts small and the control flow readable; the trade-off
 // is recomputing the shared problem prefix every call (see README).
+//
+// Written directly on the low-level WIT surface (In Gim's SDK-minimize directive):
+// no `Context`/`Generator`/`Sampler` facade. Each phase builds its chat-templated
+// prompt from the kept `chat` bindings and runs the visible `decode_chat` loop
+// over the thin keep-core primitives (`carrier`, `prefill`, `sampler`).
+
+/// A raw-WIT decode context: its own KV working set + cursor + first-pass flag.
+/// Each MCTS phase uses a fresh one and discards it (no fork / no reuse here).
+struct Ctx {
+    kv: KvWorkingSet,
+    seq_len: u32,
+    fresh: bool,
+}
+
+impl Ctx {
+    fn new() -> Self {
+        Self { kv: KvWorkingSet::new(), seq_len: 0, fresh: true }
+    }
+}
+
+/// Read the sampled token off a finalized pass's single-`Token` output tensor.
+async fn read_token(pass: ForwardPass) -> Result<u32> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(if bytes.len() >= 4 {
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
+    } else {
+        0
+    })
+}
+
+/// Pipelined chat decode over `tail`, up to `max_tokens` tokens. These phases
+/// configure NO stop set, so termination is the chat template's end-of-turn
+/// (`chat::Event::Done`, detected by the streaming detok) or the token budget.
+/// Each step eagerly speculates the next forward (run-ahead overlap) and rolls
+/// the speculation back with `discard_pass` on the terminal step. Hand-written,
+/// visible loop over keep-core primitives.
+async fn decode_chat(c: &mut Ctx, spec: SamplerSpec, tail: &[u32], max_tokens: usize) -> Result<String> {
+    let vocab = inferlet::model::output_vocab_size();
+    let s = sampler::sampler_program(spec, vocab)?;
+    let mut dec = chat::Decoder::new();
+    let mut text = String::new();
+    if max_tokens == 0 {
+        return Ok(text);
+    }
+    let head = if tail.is_empty() { vec![0u32] } else { tail.to_vec() };
+
+    let mut producer = carrier::submit_pass(&c.kv, &mut c.seq_len, &mut c.fresh, &s, &head, true)?;
+    let mut generated = 0usize;
+    loop {
+        let speculate = generated + 1 < max_tokens;
+        let consumer = if speculate {
+            Some(carrier::submit_pass(&c.kv, &mut c.seq_len, &mut c.fresh, &s, &[0u32], true)?)
+        } else {
+            None
+        };
+
+        let token = read_token(producer).await?;
+        generated += 1;
+
+        let mut done = false;
+        match dec.feed(&[token])? {
+            chat::Event::Delta(x) => text.push_str(&x),
+            chat::Event::Done(x) => {
+                text = x;
+                done = true;
+            }
+            _ => {}
+        }
+        if generated >= max_tokens {
+            done = true;
+        }
+
+        if done {
+            if let Some(cc) = consumer {
+                carrier::discard_pass(cc, &mut c.seq_len).await;
+            }
+            break;
+        }
+        producer = consumer.expect("consumer speculated when not terminal");
+    }
+    Ok(text)
+}
 
 fn path_block(path: &[String]) -> String {
     if path.is_empty() {
@@ -308,98 +394,91 @@ fn path_block(path: &[String]) -> String {
 /// far. We sample `branch_factor` separate short completions (rather than
 /// parsing one numbered list) so each child is a clean, independent step.
 async fn expand_step(
-    model: &Model,
     problem: &str,
     path: &[String],
     rollout_tokens: usize,
 ) -> Result<String> {
-    let mut ctx = Context::new(model)?;
-    ctx.system(
+    let mut ctx = Ctx::new();
+    let mut tail = chat::system_user(
         "You extend a chain of reasoning. Given a problem and the steps so far, \
          propose ONE concise next reasoning step. Output only that step.",
+        &format!(
+            "Problem:\n{problem}\n\nReasoning so far:\n{}\n\nNext reasoning step:",
+            path_block(path)
+        ),
     );
-    ctx.user(&format!(
-        "Problem:\n{problem}\n\nReasoning so far:\n{}\n\nNext reasoning step:",
-        path_block(path)
-    ));
-    ctx.cue();
-    let text = ctx
-        .generate(Sampler::TopP { temperature: 0.8, p: 0.95 })
-        .max_tokens(rollout_tokens.min(64).max(16))
-        .collect_text()
-        .await?;
+    tail.extend(chat::cue());
+    let text = decode_chat(
+        &mut ctx,
+        SamplerSpec::TopP { temperature: 0.8, p: 0.95 },
+        &tail,
+        rollout_tokens.min(64).max(16),
+    )
+    .await?;
     Ok(text.trim().to_string())
 }
 
 /// **Simulation / rollout** — from the current path, produce a candidate final
 /// answer in one short generation.
 async fn rollout(
-    model: &Model,
     problem: &str,
     path: &[String],
     rollout_tokens: usize,
 ) -> Result<String> {
-    let mut ctx = Context::new(model)?;
-    ctx.system(
+    let mut ctx = Ctx::new();
+    let mut tail = chat::system_user(
         "You finish a partial chain of reasoning. Continue from the steps given \
          and produce a short, concrete candidate final answer.",
+        &format!(
+            "Problem:\n{problem}\n\nReasoning so far:\n{}\n\nCandidate final answer:",
+            path_block(path)
+        ),
     );
-    ctx.user(&format!(
-        "Problem:\n{problem}\n\nReasoning so far:\n{}\n\nCandidate final answer:",
-        path_block(path)
-    ));
-    ctx.cue();
-    let text = ctx
-        .generate(Sampler::TopP { temperature: 0.7, p: 0.95 })
-        .max_tokens(rollout_tokens)
-        .collect_text()
-        .await?;
+    tail.extend(chat::cue());
+    let text = decode_chat(
+        &mut ctx,
+        SamplerSpec::TopP { temperature: 0.7, p: 0.95 },
+        &tail,
+        rollout_tokens,
+    )
+    .await?;
     Ok(text.trim().to_string())
 }
 
 /// **Evaluation** — score a candidate answer 0–100. Returns the normalized
 /// value in `[0,1]` (with the `0.5` fallback baked into [`parse_score`]).
-async fn evaluate(model: &Model, problem: &str, candidate: &str) -> Result<f32> {
-    let mut ctx = Context::new(model)?;
-    ctx.system(
+async fn evaluate(problem: &str, candidate: &str) -> Result<f32> {
+    let mut ctx = Ctx::new();
+    let mut tail = chat::system_user(
         "You are a strict grader. Score the candidate answer from 0 to 100 for \
          correctness, completeness, and reasoning quality. Return ONLY the number.",
+        &format!(
+            "Problem:\n{problem}\n\nCandidate answer:\n{candidate}\n\nScore (0-100):"
+        ),
     );
-    ctx.user(&format!(
-        "Problem:\n{problem}\n\nCandidate answer:\n{candidate}\n\nScore (0-100):"
-    ));
-    ctx.cue();
-    let text = ctx
-        .generate(Sampler::Argmax)
-        .max_tokens(8)
-        .collect_text()
-        .await?;
+    tail.extend(chat::cue());
+    let text = decode_chat(&mut ctx, SamplerSpec::Argmax, &tail, 8).await?;
     Ok(parse_score(&text))
 }
 
 /// **Final synthesis** — write the answer the inferlet returns, conditioned on
 /// the best reasoning path MCTS found.
 async fn synthesize(
-    model: &Model,
     problem: &str,
     best_path: &[String],
     final_tokens: usize,
 ) -> Result<String> {
-    let mut ctx = Context::new(model)?;
-    ctx.system(
+    let mut ctx = Ctx::new();
+    let mut tail = chat::system_user(
         "You write the final answer to a problem, guided by a vetted chain of \
          reasoning. Be clear and correct.",
+        &format!(
+            "Problem:\n{problem}\n\nBest reasoning path:\n{}\n\nFinal answer:",
+            path_block(best_path)
+        ),
     );
-    ctx.user(&format!(
-        "Problem:\n{problem}\n\nBest reasoning path:\n{}\n\nFinal answer:",
-        path_block(best_path)
-    ));
-    ctx.cue();
-    let text = ctx
-        .generate(Sampler::Argmax)
-        .max_tokens(final_tokens)
-        .collect_text()
-        .await?;
+    tail.extend(chat::cue());
+    let text = decode_chat(&mut ctx, SamplerSpec::Argmax, &tail, final_tokens).await?;
     Ok(text.trim().to_string())
 }
 
@@ -409,8 +488,6 @@ async fn synthesize(
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model = Model::load(runtime::models().first().ok_or("No models available")?)?;
-
     // Clamp pathological inputs so the control flow always terminates sensibly.
     let max_iterations = input.max_iterations.max(1);
     let max_depth = input.max_depth.max(1);
@@ -438,7 +515,7 @@ async fn main(input: Input) -> Result<String> {
 
         let (sim_node, expanded_children) = if can_expand {
             let path = tree.path_actions(selected);
-            let action = expand_step(&model, &input.prompt, &path, input.rollout_tokens).await?;
+            let action = expand_step(&input.prompt, &path, input.rollout_tokens).await?;
             let child = tree.add_child(selected, action, max_depth);
             (child, tree.nodes[selected].children.len())
         } else {
@@ -449,10 +526,10 @@ async fn main(input: Input) -> Result<String> {
 
         // (c) Simulation / rollout from the node we will score.
         let sim_path = tree.path_actions(sim_node);
-        let candidate = rollout(&model, &input.prompt, &sim_path, input.rollout_tokens).await?;
+        let candidate = rollout(&input.prompt, &sim_path, input.rollout_tokens).await?;
 
         // (d) Evaluation.
-        let value = evaluate(&model, &input.prompt, &candidate).await?;
+        let value = evaluate(&input.prompt, &candidate).await?;
 
         // (e) Backpropagation.
         tree.backpropagate(sim_node, value);
@@ -474,12 +551,12 @@ async fn main(input: Input) -> Result<String> {
         // No expansion happened (e.g. max_iterations far below branch_factor):
         // fall back to the best rollout candidate we saw.
         if best_candidate.is_empty() {
-            rollout(&model, &input.prompt, &[], input.final_tokens).await?
+            rollout(&input.prompt, &[], input.final_tokens).await?
         } else {
             best_candidate.clone()
         }
     } else {
-        synthesize(&model, &input.prompt, &best_path, input.final_tokens).await?
+        synthesize(&input.prompt, &best_path, input.final_tokens).await?
     };
 
     if !input.show_trace {

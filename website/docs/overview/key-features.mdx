@@ -58,7 +58,7 @@ Patterns this supports:
 An inferlet runs inside a WASI sandbox with three I/O surfaces:
 
 - **Session.** `session::send` and `session::receive` exchange text and binary payloads with the client that launched the inferlet. The engine streams tokens back through this channel.
-- **WASI HTTP and filesystem.** Inferlets can issue HTTP requests and read files from a sandboxed view. The `wstd` crate exposes `http::Client`, useful for fetching tool outputs, images, or documents inline. See the `image-fetch` and `http-server` inferlets.
+- **WASI HTTP and filesystem.** Inferlets can issue HTTP requests and read files from a sandboxed view. The `wstd` crate exposes `http::Client`, useful for fetching tool outputs, images, or documents inline. See the `image-fetch` inferlet.
 - **Messaging.** `messaging::broadcast` and `messaging::subscribe` exchange messages between inferlets running in the same engine. Useful for coordinating swarms.
 
 These surfaces enable patterns that are awkward when application logic runs outside the engine:
@@ -67,7 +67,6 @@ These surfaces enable patterns that are awkward when application logic runs outs
 - **MCP.** A first-class MCP client. Connect to a registered MCP server, list tools, call them. See the `mcp-example` family.
 - **Virtual filesystem.** Inferlets can read from a sandboxed file tree exposed by the engine. Useful for episodic memory and checkpoint/resume.
 - **Embedded language runtimes.** Run JavaScript or Python from inside an inferlet (CodeACT-style). The model emits code; the inferlet executes it. See the `agent-codeact` inferlet.
-- **HTTP servers as inferlets.** An inferlet can implement `wasi:http/incoming-handler` and serve requests directly. See the `openresponses` inferlet, which exposes the OpenAI Responses API.
 
 I/O happens on the inferlet's own time, on a worker thread the engine manages. The model's forward passes do not stall waiting for HTTP.
 

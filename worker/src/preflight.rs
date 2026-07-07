@@ -6,13 +6,13 @@ use anyhow::{Result, anyhow};
 
 #[cfg(feature = "driver-cuda")]
 use crate::config::CudaNativeDriverOptions;
-#[cfg(feature = "driver-portable")]
-use crate::config::PortableDriverOptions;
 use crate::config::{self, DriverKind, DummyDriverOptions};
+#[cfg(feature = "driver-metal")]
+use crate::config::MetalDriverOptions;
 use crate::driver_ffi::Flavor;
 use crate::embedded_driver::DriverOptions;
 
-/// Top-level dispatcher: an inbound `[[model]]` either binds to an
+/// Top-level dispatcher: the inbound `[model]` either binds to an
 /// in-process [`Flavor`] (C++/Rust static lib).
 ///
 /// Returned by [`resolve_flavor`]; consumed by [`super::start_engine`]
@@ -42,12 +42,12 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
         .collect())
 }
 
-/// Resolve the `[[model]].driver.type` to a [`ResolvedFlavor`]. Errors
+/// Resolve the `[model].driver.type` to a [`ResolvedFlavor`]. Errors
 /// out with a clear, model-named message when the requested embedded
 /// flavor was not compiled into this binary.
 pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlavor> {
     match kind {
-        DriverKind::Portable | DriverKind::CudaNative | DriverKind::Dummy => {
+        DriverKind::CudaNative | DriverKind::Metal | DriverKind::Dummy => {
             Flavor::from_kind(kind)
                 .map(ResolvedFlavor::Embedded)
                 .map_err(|msg| anyhow!("model {model_name:?}: {msg}"))
@@ -64,16 +64,6 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlav
 /// it with the right device for each DP replica.
 pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result<DriverOptions> {
     match flavor {
-        #[cfg(feature = "driver-portable")]
-        Flavor::Portable => {
-            let p: PortableDriverOptions = m
-                .driver
-                .options
-                .clone()
-                .try_into()
-                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
-            Ok(DriverOptions::Portable(p))
-        }
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => {
             let mut c: CudaNativeDriverOptions = m
@@ -90,6 +80,16 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
             })?;
             c.device = device.clone();
             Ok(DriverOptions::CudaNative(c))
+        }
+        #[cfg(feature = "driver-metal")]
+        Flavor::Metal => {
+            let p: MetalDriverOptions = m
+                .driver
+                .options
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
+            Ok(DriverOptions::Metal(p))
         }
         Flavor::Dummy => {
             let d: DummyDriverOptions = m

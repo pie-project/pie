@@ -55,6 +55,11 @@ struct BatchingConfig {
     std::uint32_t swap_pool_size = 0;
     // KV cache storage format. "auto" preserves the historical bf16 cache.
     std::string kv_cache_dtype = "auto";
+    // Optional HARD cap on the runtime KV page count. 0 = derive from
+    // gpu_mem_utilization (default). >0 clamps `min(derived, total_pages)` so a
+    // tiny deterministic pool can be forced (contention/preempt tests + CI),
+    // independent of the forward-layout budget floor. Mirrors metal's total_pages.
+    std::int64_t total_pages = 0;
 };
 
 // Tensor-parallel group geometry. Default {1, 0, ""} = single-GPU; nothing
@@ -128,6 +133,7 @@ inline Config load_config(const std::filesystem::path& path) {
             "kv_page_size",
             "swap_pool_size",
             "kv_cache_dtype",
+            "total_pages",
         };
         for (const auto& [key, _] : *b) {
             const auto name = key.str();
@@ -167,6 +173,14 @@ inline Config load_config(const std::filesystem::path& path) {
         c.batching.swap_pool_size =
             static_cast<std::uint32_t>(swap_pool_size);
         c.batching.kv_cache_dtype   = (*b)["kv_cache_dtype"].value_or(c.batching.kv_cache_dtype);
+        const auto total_pages =
+            (*b)["total_pages"].value_or<int64_t>(
+                static_cast<std::int64_t>(c.batching.total_pages));
+        if (total_pages < 0) {
+            throw std::runtime_error(
+                "config: [batching].total_pages must be >= 0 (0 = derive from util)");
+        }
+        c.batching.total_pages = total_pages;
     }
     if (auto d = tbl["distributed"].as_table()) {
         c.distributed.tp_size = static_cast<int>(

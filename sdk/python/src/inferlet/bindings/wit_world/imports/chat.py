@@ -8,7 +8,9 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import model
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 @dataclass
@@ -33,7 +35,7 @@ class Decoder:
     
     def feed(self, tokens: List[int]) -> Event:
         """
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def reset(self) -> None:
@@ -50,31 +52,35 @@ class Decoder:
 
 
 
-def system(model: model.Model, message: str) -> List[int]:
+def system(message: str) -> List[int]:
     """
     Fill roles for history replay
     """
     raise NotImplementedError
-def user(model: model.Model, message: str) -> List[int]:
+def first_user(message: str) -> List[int]:
     raise NotImplementedError
-def assistant(model: model.Model, message: str) -> List[int]:
+def user(message: str) -> List[int]:
     raise NotImplementedError
-def cue(model: model.Model) -> List[int]:
+def system_user(system: str, user: str) -> List[int]:
+    raise NotImplementedError
+def assistant(message: str) -> List[int]:
+    raise NotImplementedError
+def cue() -> List[int]:
     """
     Cue the model to generate (fills generation header)
     """
     raise NotImplementedError
-def seal(model: model.Model) -> List[int]:
+def seal() -> List[int]:
     """
     Seal the current turn (insert stop token)
     """
     raise NotImplementedError
-def stop_tokens(model: model.Model) -> List[int]:
+def stop_tokens() -> List[int]:
     """
     Returns the stop token IDs for the model
     """
     raise NotImplementedError
-def create_decoder(model: model.Model) -> Decoder:
+def create_decoder() -> Decoder:
     """
     Create a decoder to classify generated tokens
     """

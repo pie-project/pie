@@ -6,12 +6,10 @@
 //! `Probe::Distribution` returns the host distribution per step, and the
 //! green-list bias + sampling are applied in user code.
 
-use inferlet::{
-    Context, Result,
-    model::Model,
-    runtime,
-    sample::Distribution,
-};
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{probe_program, LoweredProbe, ProbeKind};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{chat, geometry, model, Result};
 use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Instant;
@@ -121,45 +119,82 @@ fn weighted_sample(probs: &[f32], seed: u64) -> usize {
     probs.len() - 1
 }
 
+/// Raw keep-core decode context (no `Context` facade): one KV working set + a
+/// sequence cursor. The first sampling fire clears the run-ahead carrier
+/// (`fresh_generate`).
+struct Ctx {
+    kv: KvWorkingSet,
+    seq_len: u32,
+    fresh: bool,
+}
+impl Ctx {
+    fn new() -> Self {
+        Self { kv: KvWorkingSet::new(), seq_len: 0, fresh: true }
+    }
+    /// One measurement fire: geometry + input + probe sampler + execute.
+    fn probe_fire(&mut self, probe: &LoweredProbe, tokens: &[u32]) -> Result<ForwardPass> {
+        let n = tokens.len() as u32;
+        let pass = ForwardPass::new();
+        if self.fresh {
+            pass.fresh_generate();
+            self.fresh = false;
+        }
+        let geom = geometry::ensure_pages(
+            &self.kv,
+            geometry::kv_write_geometry(self.seq_len, n, self.kv.page_size()),
+        )?;
+        geometry::attach_kv_write(&pass, &self.kv, &geom);
+        let positions: Vec<u32> = (self.seq_len..self.seq_len + n).collect();
+        pass.input_tokens(tokens, &positions);
+        pass.sampler(&probe.program, probe.bindings(self.seq_len + n - 1)?);
+        pass.execute();
+        self.seq_len += n;
+        Ok(pass)
+    }
+}
+
+/// Read a dense `[vocab]` f32 distribution off the raw output tensor. `ids` are
+/// the implicit identity `0..vocab` (matching the facade `distribution()`).
+async fn read_distribution(pass: ForwardPass) -> Result<(Vec<u32>, Vec<f32>)> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    let probs: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let ids: Vec<u32> = (0..probs.len() as u32).collect();
+    Ok((ids, probs))
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let start = Instant::now();
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-    let tokenizer = model.tokenizer();
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let stop_tokens = chat::stop_tokens();
+    let vocab = model::output_vocab_size();
+    let probe = probe_program(ProbeKind::Distribution, vocab)
+        .map_err(|e| format!("probe(Distribution) build: {e}"))?;
 
-    let mut ctx = Context::new(&model)?;
+    let mut ctx = Ctx::new();
     let mut watermark = WatermarkState::new(0.5, 2.0);
     let mut generated_tokens = Vec::new();
 
-    // Build the prompt ourselves so the first Pass feeds it through the
-    // forward pass and lands the cue tokens in KV exactly once (auto-
-    // commit handles the rest). Subsequent iterations feed one chosen
-    // token at a time.
+    // Build the prompt ourselves so the first probe fire feeds it through the
+    // forward pass and lands the cue tokens in KV exactly once (auto-commit
+    // handles the rest). Subsequent iterations feed one chosen token at a time.
     let mut pending: Vec<u32> = Vec::new();
-    pending.extend(inferlet::chat::system(
-        &model,
+    pending.extend(chat::system(
         "You are a helpful, respectful and honest assistant.",
     ));
-    pending.extend(inferlet::chat::user(&model, &input.prompt));
-    pending.extend(inferlet::chat::cue(&model));
+    pending.extend(chat::user(&input.prompt));
+    pending.extend(chat::cue());
 
     for _ in 0..input.max_tokens {
-        let mut pass = ctx.forward();
-        pass.input(&pending);
-        let last_idx = (pending.len() - 1) as u32;
-        // `k = 0` returns the full vocabulary so the watermark can bias
-        // every token, not just the top-k.
-        let h = pass.probe(last_idx, Distribution { temperature: 0.0, k: 0 });
-        let out = pass.execute().await?;
+        // The full softmax distribution (over all vocab) so the watermark can
+        // bias every token, not just the top-k.
+        let pass = ctx.probe_fire(&probe, &pending)?;
+        let (ids, probs) = read_distribution(pass).await?;
 
-        let (ids, probs) = match out.distribution(h) {
-            Some(d) => d,
-            None => break,
-        };
-
-        let chosen = watermark.sample(ids, probs);
+        let chosen = watermark.sample(&ids, &probs);
         if stop_tokens.contains(&chosen) {
             break;
         }
@@ -168,7 +203,7 @@ async fn main(input: Input) -> Result<String> {
         pending = vec![chosen];
     }
 
-    let text = tokenizer.decode(&generated_tokens)?;
+    let text = model::decode(&generated_tokens)?;
     println!("Output: {:?} (total elapsed: {:?})", text, start.elapsed());
     if !generated_tokens.is_empty() {
         println!(

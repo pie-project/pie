@@ -35,7 +35,10 @@
 //! No speedup is claimed — masked KV pages still occupy memory; the mask only
 //! controls what the model *attends to*.
 
-use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{self, SamplerSpec};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{carrier, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -85,10 +88,21 @@ impl Range {
     }
 }
 
+/// Finalize a pass and read its sampled token (the low 4 bytes of the output
+/// tensor, LE). `None` on a short/empty tensor.
+async fn read_token(pass: ForwardPass) -> Result<Option<u32>> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(if bytes.len() >= 4 {
+        Some(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32)
+    } else {
+        None
+    })
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model = Model::load(runtime::models().first().ok_or("No models available")?)?;
-    let stop_tokens = inferlet::chat::stop_tokens(&model);
+    let stop_tokens = inferlet::chat::stop_tokens();
 
     // Minimum chunk size guards against degenerate 1-word chunks blowing up the
     // header/body bookkeeping.
@@ -104,7 +118,6 @@ async fn main(input: Input) -> Result<String> {
     let mut full_ranges: Vec<Range> = Vec::new();
 
     prompt_tokens.extend(inferlet::chat::system(
-        &model,
         "You are a concise assistant. Use the visible hierarchy: global \
          instructions, the chunk summaries, and the selected local chunk.",
     ));
@@ -116,24 +129,23 @@ async fn main(input: Input) -> Result<String> {
         // Header → keep only its first `summary_tokens_per_chunk` tokens as a
         // global summary range.
         let header_start = prompt_tokens.len() as u32;
-        prompt_tokens.extend(inferlet::chat::user(&model, &header));
+        prompt_tokens.extend(inferlet::chat::user(&header));
         let header_end = prompt_tokens.len() as u32;
         let summary_end = header_start + input.summary_tokens_per_chunk.min(header_end - header_start);
         summary_ranges.push(Range::new(header_start, summary_end));
 
         // Body → record the full range so a selected chunk can be kept whole.
         let body_start = prompt_tokens.len() as u32;
-        prompt_tokens.extend(inferlet::chat::user(&model, &body));
+        prompt_tokens.extend(inferlet::chat::user(&body));
         let body_end = prompt_tokens.len() as u32;
         full_ranges.push(Range::new(body_start, body_end));
     }
 
     prompt_tokens.extend(inferlet::chat::user(
-        &model,
         "Answer the original request using the selected local chunk(s) and the \
          global chunk summaries.",
     ));
-    prompt_tokens.extend(inferlet::chat::cue(&model));
+    prompt_tokens.extend(inferlet::chat::cue());
 
     println!("--- hierarchical-attention-rust ---");
     println!("chunks={}", chunks.len());
@@ -141,7 +153,14 @@ async fn main(input: Input) -> Result<String> {
     println!("summary_ranges={}", fmt_ranges(&summary_ranges));
     println!("full_ranges={}", fmt_ranges(&full_ranges));
 
-    let mut ctx = Context::new(&model)?;
+    // Raw keep-core decode (was owned by `Context`): a KV working set + cursor;
+    // each step attaches the per-token hierarchical mask in the `submit_pass_with`
+    // bind seam (after input_tokens, before the sampler/execute tail).
+    let vocab = inferlet::model::output_vocab_size();
+    let sampler = sampler::sampler_program(SamplerSpec::Argmax, vocab)?;
+    let kv = KvWorkingSet::new();
+    let mut seq_len: u32 = 0;
+    let mut fresh = true;
     let mut pending = prompt_tokens;
     let mut generated: Vec<u32> = Vec::new();
     let mut logged_mask = false;
@@ -151,8 +170,7 @@ async fn main(input: Input) -> Result<String> {
             break;
         }
 
-        let mut fwd = ctx.forward();
-        let total_seq_after = fwd.start_position() + pending.len() as u32;
+        let total_seq_after = seq_len + pending.len() as u32;
 
         // Assemble the keep-set for this step.
         let mut keep: Vec<Range> = Vec::new();
@@ -183,14 +201,22 @@ async fn main(input: Input) -> Result<String> {
             logged_mask = true;
         }
 
-        fwd.input(&pending);
         // One shared mask per query token in this pass (MVP simplification).
         let masks: Vec<Vec<u32>> = (0..pending.len()).map(|_| mask.clone()).collect();
-        fwd.attention_mask(&masks);
 
-        let h = fwd.sample(&[(pending.len() - 1) as u32], Sampler::Argmax);
-        let out = fwd.execute().await?;
-        let token = match out.token(h) {
+        let pass = carrier::submit_pass_with(
+            &kv,
+            &mut seq_len,
+            &mut fresh,
+            &sampler,
+            &pending,
+            false, // sequential masked decode — no run-ahead carrier
+            |pass| {
+                pass.attention_mask(&masks);
+            },
+        )?;
+
+        let token = match read_token(pass).await? {
             Some(t) => t,
             None => break,
         };
@@ -203,7 +229,7 @@ async fn main(input: Input) -> Result<String> {
     }
 
     println!("generated_tokens={}", generated.len());
-    Ok(model.tokenizer().decode(&generated)?)
+    Ok(inferlet::model::decode(&generated)?)
 }
 
 // =============================================================================

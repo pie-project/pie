@@ -15,6 +15,7 @@
 #include <cstring>
 #include <algorithm>
 #include <numeric>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -529,6 +530,15 @@ extern "C" __global__ void k_map(const float* a, const float* b, int n,
         s_out[j] = pie_ir_select(pie_ir_gt(a[j], b[j]), a[j], b[j]);
     }
 }
+extern "C" __global__ void k_mask_apply(const float* logits, const unsigned int* mask,
+                                        int n, float* masked_out, unsigned int* bit_out) {
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (int j = g; j < n; j += stride) {
+        masked_out[j] = pie_ir_mask_apply(mask, j, logits[j]);
+        bit_out[j]    = pie_ir_mask_bit(mask, j);
+    }
+}
 )TK";
 
 void test_topk_radix(CUmodule mod) {
@@ -571,6 +581,61 @@ void test_topk_radix(CUmodule mod) {
     }
 }
 
+// Cut #2 grammar `mask-apply` (OpKind 0x65). Non-degenerate by construction
+// (delta's verify-integrity bar): the unconstrained-argmax token is bit-0
+// (DISALLOWED) in the mask, so a passing run MUST exercise the `−∞` path —
+// an all-allowed (no-op) mask would fail assertion 3. n is NOT a multiple of
+// 32, exercising the tail word + don't-care pad bits.
+void test_mask_apply(CUmodule mod) {
+    std::printf("[mask-apply grammar constraint]\n");
+    const int n = 300;
+    const int words = (n + 31) / 32;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-5.f, 5.f);
+    std::vector<float> logits(n);
+    for (int i = 0; i < n; ++i) logits[i] = dist(rng);
+    const int T_MAX = 137;  // dominant unconstrained argmax (will be DISALLOWED)
+    const int T_2ND = 200;  // highest ALLOWED → the constrained argmax
+    logits[T_MAX] = 100.f;
+    logits[T_2ND] = 50.f;
+
+    // All-allowed (init all-1s, matches golf's compose) except a few bit-0s.
+    std::vector<unsigned int> mask(words, 0xFFFFFFFFu);
+    auto clear_bit = [&](int j) { mask[j >> 5] &= ~(1u << (j & 31)); };
+    clear_bit(T_MAX); clear_bit(5); clear_bit(290);
+
+    float* d_logits = dmalloc<float>(n);
+    unsigned int* d_mask = dmalloc<unsigned int>(words);
+    float* d_masked = dmalloc<float>(n);
+    unsigned int* d_bit = dmalloc<unsigned int>(n);
+    up(d_logits, logits); up(d_mask, mask);
+    CUfunction fn = get_fn(mod, "k_mask_apply");
+    void* args[] = {&d_logits, &d_mask, (void*)&n, &d_masked, &d_bit};
+    launch(fn, 1, 256, args);
+    std::vector<float> masked(n); down(masked, d_masked);
+    std::vector<unsigned int> bits(n); down(bits, d_bit);
+
+    const float NEG_INF = -std::numeric_limits<float>::infinity();
+    bool apply_ok = true, bit_ok = true;
+    for (int j = 0; j < n; ++j) {
+        const unsigned int ref = (mask[j >> 5] >> (j & 31)) & 1u;
+        if (bits[j] != ref) bit_ok = false;
+        if (ref) { if (masked[j] != logits[j]) apply_ok = false; }
+        else     { if (masked[j] != NEG_INF)   apply_ok = false; }
+    }
+    expect(bit_ok, "mask-bit: word-indexed bit matches packed mask");
+    expect(apply_ok, "mask-apply: allowed passthrough, disallowed -inf");
+
+    int unconstr = 0, constr = 0;
+    for (int j = 1; j < n; ++j) if (logits[j] > logits[unconstr]) unconstr = j;
+    for (int j = 1; j < n; ++j) if (masked[j] > masked[constr]) constr = j;
+    expect(unconstr == T_MAX, "unconstrained argmax = dominant (disallowed) token");
+    expect(masked[T_MAX] == NEG_INF, "the unconstrained-max is forced to -inf");
+    expect(constr == T_2ND && constr != unconstr,
+           "mask-apply changes argmax -> highest ALLOWED token (-inf actually bit)");
+    cudaFree(d_logits); cudaFree(d_mask); cudaFree(d_masked); cudaFree(d_bit);
+}
+
 }  // namespace
 
 int main() {
@@ -602,6 +667,7 @@ int main() {
     test_sort(mod);
     test_gather_scatter(mod);
     test_map(mod);
+    test_mask_apply(mod);
 
     CU_CHECK(cuModuleUnload(mod));
     CU_CHECK(cuDevicePrimaryCtxRelease(dev));

@@ -6,9 +6,6 @@
 /// Result type for inferlet operations (compatible with WIT bindings).
 pub type Result<T> = std::result::Result<T, String>;
 
-// Re-export wstd for the macro to use
-pub use wstd;
-
 // Re-export wit_bindgen so the macro-generated inline WIT can reference it
 pub use wit_bindgen;
 
@@ -20,42 +17,75 @@ pub use serde_json;
 // Re-export the attribute macros
 pub use inferlet_macros::{main, tool};
 
-// Generate WIT bindings directly in lib.rs
+// Generate WIT bindings directly in lib.rs. With no `async:` option, the
+// WIT's own `async func` annotations drive async generation: only
+// run/execute/receive/pull become `async fn` (component-model-async) and
+// `stream<T>` (messaging.subscribe) becomes a StreamReader; sync funcs
+// (model::encode, chat::*, …) stay sync. wit-bindgen generates the wasi:io
+// bindings itself (0.58-suffixed cabi_realloc) so it doesn't collide with
+// std's 0.57.1 copy.
 wit_bindgen::generate!({
     path: "wit",
     world: "inferlet",
     pub_export_macro: true,
-    with: {
-         "wasi:io/poll@0.2.4": ::wasi::io::poll,
-    },
     generate_all,
 });
 
 // Re-export types that don't need async wrappers directly
 pub use pie::core::types;
-pub use pie::mcp;
 pub use pie::zo;
 
 // =============================================================================
 // Context
 // =============================================================================
 
-mod context;
+mod constraint;
 
-pub use context::{
-    AnyJson, Constrain, Context, Ebnf, GrammarConstraint, JsonSchema, RawContext, Regex, Schema,
-};
+pub use constraint::{AnyJson, Constrain, Ebnf, GrammarConstraint, JsonSchema, Regex, Schema};
+
+/// The runtime working-set resources (KV page-slot array + recurrent state).
+/// Most inferlets use the [`Context`] facade; reach here for direct control.
+pub mod working_set {
+    pub use crate::pie::core::working_set::*;
+}
 
 // =============================================================================
 // Sampler / Probe + Forward primitive
 // =============================================================================
 
 pub mod audio;
+/// Run-ahead carrier mechanics (`submit_pass` / `discard_pass`) — the two
+/// correctness-critical primitives for pipelined decode on the raw WIT; the
+/// decode LOOP stays hand-written in the inferlet. See `ptir-sdk-minimization-audit`
+/// (keep-core) + `ptir-lowlevel-runahead-mechanics` (bravo, mechanics).
+pub mod carrier;
 pub mod emit;
-pub mod forward;
+/// KV page-geometry primitives (token→page math) as free functions over the
+/// raw WIT — the minimal-core geometry helper a low-level inferlet calls
+/// directly instead of re-inlining `first_write_page/total_pages/offset`.
+/// See `ptir-sdk-minimization-audit` §4.
+pub mod geometry;
 pub mod http;
+pub mod mask;
+/// Non-sampling prefill mechanics (text / image / audio KV materialization) —
+/// the keep-core twin of [`carrier`]; the raw-WIT form of `Context::flush` /
+/// `append_image` / `append_audio`. See `ptir-sdk-minimization-audit`.
+pub mod prefill;
 pub mod program;
-pub mod sample;
+
+/// Standard-sampler lowering (keep-core): turn a sampler spec into an
+/// attachable `tensor::Program` + its per-fire input bindings, so a low-level
+/// inferlet gets top-p/top-k/min-p/temperature sampling without hand-building
+/// the per-kind Sampling-IR. The sampler analog of `geometry`/`carrier`; the
+/// `Sampler` enum + `.generate()` facade are the sugar that gets deleted. See
+/// `ptir-sdk-minimization-audit`.
+pub mod sampler;
+
+/// Snapshot manifests (keep-core): the thin `SnapshotData` + serde +
+/// wasi:filesystem I/O (`save`/`open`/`snapshot`/`take`/`delete`). The token-log
+/// REPLAY factors out to the inferlet's carrier prefill; the `Context::save/open`
+/// facade is the sugar that gets deleted. See `ptir-snapshot-keepcore-spec`.
+pub mod snapshot;
 
 /// Sampling-IR EDSL — re-export of the `sampling-edsl` crate so inferlets can
 /// author programmable samplers (`Graph`, helpers like `softmax` / `top_p_mask`
@@ -84,13 +114,9 @@ pub mod tensor {
 // =============================================================================
 
 pub mod chat;
-pub mod generation;
 pub mod reasoning;
-pub mod spec;
 pub mod tools;
 
-pub use generation::{GenStep, Generator};
-pub use spec::Speculator;
 pub use tools::Tool;
 
 // =============================================================================
@@ -105,8 +131,15 @@ pub mod adapter {
 // Model
 // =============================================================================
 
+/// The engine serves exactly one model; these are global functions over
+/// that single bound model. There is no `Model`/`Tokenizer` handle to pass
+/// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
-    pub use crate::pie::core::model::{Model, Tokenizer};
+    pub use crate::pie::core::model::{
+        architecture, arena_block_size, decode, default_system_speculation, encode, is_linear,
+        name, output_vocab_size, rs_buffer_page_size, rs_fold_granularity, rs_state_size,
+        special_tokens, split_regex, vocabs,
+    };
 }
 
 // =============================================================================
@@ -117,10 +150,18 @@ pub mod runtime {
     pub use crate::pie::core::runtime::*;
 }
 
-pub mod scheduling {
-    pub use crate::pie::core::scheduling::*;
+/// Suspend the current inferlet for `duration` without blocking the host
+/// event loop. Backed by the engine's async timer (host-provided under
+/// component-model-async — wasi:clocks 0.2 pollables have no guest-side
+/// future bridge). Use for streaming pacing, retry backoff, etc.
+///
+/// ```ignore
+/// inferlet::sleep(std::time::Duration::from_millis(50)).await;
+/// ```
+pub async fn sleep(duration: std::time::Duration) {
+    let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+    crate::pie::core::runtime::sleep(nanos).await;
 }
-
 pub mod messaging {
     pub use crate::pie::core::messaging::*;
 }
@@ -148,132 +189,13 @@ pub mod media {
 /// [`GrammarConstraint`] instead.
 pub use crate::pie::core::inference::Matcher;
 
-// =============================================================================
-// Async Extension Traits
-// =============================================================================
-
-use wstd::io::AsyncPollable;
-
-/// Extension trait for async forward pass operations.
-pub trait ForwardPassExt {
-    /// Submit the pass, then await its sampler output tensors in the program's
-    /// declared output order. A no-sampler pass (prefill / flush) returns an
-    /// empty list once the forward completes.
-    fn execute_outputs(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Vec<crate::tensor::Tensor>>>;
-}
-
-impl ForwardPassExt for inference::ForwardPass {
-    async fn execute_outputs(&self) -> Result<Vec<crate::tensor::Tensor>> {
-        // `execute()` submits; `output()` is the completion barrier and yields
-        // the sampler result tensors (host-driven async). For a flush the
-        // result is empty — callers await it purely for the completion barrier.
-        self.execute();
-        self.output()
-            .map_err(|e| format!("forward output: {e:?}"))
-    }
-}
-
-/// Extension trait for async messaging subscription operations.
-pub trait SubscriptionExt {
-    /// Gets the next message from a subscription asynchronously.
-    fn get_async(&self) -> impl std::future::Future<Output = Option<String>>;
-}
-
-impl SubscriptionExt for messaging::Subscription {
-    async fn get_async(&self) -> Option<String> {
-        let pollable = self.pollable();
-        AsyncPollable::new(pollable).wait_for().await;
-        self.get()
-    }
-}
-
-/// Extension trait for FutureString (used by receive and spawn).
-pub trait FutureStringExt {
-    /// Waits for the result asynchronously.
-    fn wait_async(&self) -> impl std::future::Future<Output = Option<String>>;
-}
-
-impl FutureStringExt for types::FutureString {
-    async fn wait_async(&self) -> Option<String> {
-        let pollable = self.pollable();
-        AsyncPollable::new(pollable).wait_for().await;
-        self.get()
-    }
-}
-
-/// Extension trait for FutureBlob — mirror of [`FutureStringExt`] for
-/// binary payloads (e.g. files arriving via `session::receive_file`).
-pub trait FutureBlobExt {
-    /// Waits for the blob asynchronously. `None` when the producer
-    /// closes the channel before sending a payload.
-    fn wait_async(&self) -> impl std::future::Future<Output = Option<Vec<u8>>>;
-}
-
-impl FutureBlobExt for types::FutureBlob {
-    async fn wait_async(&self) -> Option<Vec<u8>> {
-        let pollable = self.pollable();
-        AsyncPollable::new(pollable).wait_for().await;
-        self.get()
-    }
-}
-
-// =============================================================================
-// Inferlet-to-inferlet launch
-// =============================================================================
-
-/// Handle to a launched child inferlet. See [`launch`].
-///
-/// Three modes:
-/// - **fire-and-forget**: drop the handle. The child runs to completion on its
-///   own; its return value is discarded.
-/// - **await the result**: `child.await` (via [`IntoFuture`]).
-/// - **timeout / cancel**: keep the handle, call `child.wait()` for a
-///   borrowing future, and call `child.cancel()` if the timeout fires.
-pub struct Child(pie::core::runtime::Child);
-
-impl Child {
-    /// Process id (UUID) of the child, useful for logs.
-    pub fn pid(&self) -> String {
-        self.0.pid()
-    }
-
-    /// Hard-kill the child if still running. Idempotent.
-    pub fn cancel(&self) {
-        self.0.cancel()
-    }
-
-    /// Wait for the child's result without consuming the handle. Use this
-    /// when you may need to call `cancel()` later (e.g. after a timeout).
-    pub async fn wait(&mut self) -> Result<String> {
-        let pollable = self.0.pollable();
-        wstd::io::AsyncPollable::new(pollable).wait_for().await;
-        self.0
-            .get()
-            .unwrap_or_else(|| Err("pollable signaled but get() returned None".to_string()))
-    }
-}
-
-impl std::future::IntoFuture for Child {
-    type Output = Result<String>;
-    // Box the future to keep the SDK on stable Rust without TAIT. The cost
-    // is one allocation per `child.await`, which is negligible next to the
-    // wasmtime store creation a launch already pays for.
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>>>>;
-
-    fn into_future(mut self) -> Self::IntoFuture {
-        Box::pin(async move { self.wait().await })
-    }
-}
-
-/// Launch a child inferlet identified by `name@version`. Returns a
-/// [`Child`] handle. See the handle docs for the three usage modes.
-pub fn launch(program: &str, input: &str) -> Result<Child> {
-    pie::core::runtime::launch(program, input)
-        .map(Child)
-        .map_err(|e| e.to_string())
-}
+// Under component-model-async, the WIT `async func`s are generated as native
+// `async fn`s directly on the bindings — `forward-pass.execute().await`,
+// `session::receive().await`, `messaging::pull().await` — and
+// `messaging::subscribe()` returns a `StreamReader<String>`. No SDK-side
+// pollable/future polling shim is needed (the old `ForwardPassExt`,
+// `SubscriptionExt`, `FutureStringExt`, `FutureBlobExt` and the `wstd`
+// executor have been removed); the host event loop drives all of it.
 
 // =============================================================================
 // Argument Parsing (re-exported from pico_args)
@@ -295,22 +217,12 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 pub mod prelude {
     pub use crate::adapter::Adapter;
     pub use crate::messaging;
-    pub use crate::model::Model;
+    pub use crate::model;
     pub use crate::runtime;
-    pub use crate::{Child, Context, Result, Schema, Tool, launch};
+    pub use crate::{Result, Schema, Tool};
     pub use crate::{main, tool};
 
-    pub use crate::forward::{Forward, Output};
-    pub use crate::generation::{GenStep, Generator};
     pub use crate::program::{LoweredProgramExt, ProgramHandle};
-    pub use crate::sample::Sampler;
-    pub use crate::spec::Speculator;
     pub use crate::tensor;
     pub use crate::{chat, reasoning, tools};
-
-    // Extension traits
-    pub use crate::ForwardPassExt;
-    pub use crate::FutureBlobExt;
-    pub use crate::FutureStringExt;
-    pub use crate::SubscriptionExt;
 }

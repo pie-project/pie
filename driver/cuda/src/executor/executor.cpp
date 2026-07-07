@@ -1,4 +1,5 @@
 #include "executor/executor.hpp"
+#include "executor/graph_variant.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -28,6 +29,7 @@
 #include "custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
+#include "kernels/dtype_cast.hpp"
 #include "distributed.hpp"
 #include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
@@ -44,6 +46,11 @@
 #include "sampling_ir/pie_standard_samplers.h"
 #include "sampling_ir/sampler_dispatch.hpp"
 #include "sampling_ir/group.hpp"
+#include "sampling_ir/next_input.hpp"
+#include "sampling_ir/tensor_io.hpp"
+#include "sampling_ir/frame_carrier.hpp"
+#include "sampling_ir/program_recognizer.hpp"
+#include "sampling_ir/param_extract.hpp"
 #include "spec_expansion.hpp"
 
 namespace pie_cuda_driver {
@@ -89,6 +96,16 @@ bool ForwardFn::invoke_fused_argmax_done() {
 }
 
 namespace {
+
+// X2 BRIDGE (a) — the carry ABI version guard. bravo's FINALIZED shape
+// (x2-x3-bridge @ e3caa4b3) is per-request SoA cols on the ForwardRequest
+// (carry_abi_version / carry_user_ptr / carry_word_index / carry_instance),
+// NOT a blob: the a2 fire-commit validates `carry_abi_version[0]` == this
+// (LOUD-REJECT on mismatch — guru's version-guard ABI rule) before trusting the
+// cols. The completion callback (`cuda_carry_done`) is registered ONCE via
+// `pie_frame_set_carry_done`, so the carry call passes `done=nullptr` (→ the
+// once-registered completion) — done is not threaded per-request.
+constexpr std::uint32_t kCarryDescriptorVersion = 1;
 
 struct TpCpuGate {
     std::mutex mu;
@@ -193,6 +210,10 @@ int greedy_argmax_parts(int vocab) {
     }
     return vocab >= 131072 ? 8 : 1;
 }
+
+// #24 graph-variant bitfield helper: `make_graph_variant()` + the named flag
+// constants + the boundary static_asserts now live in
+// "executor/graph_variant.hpp" (so they're unit-testable host-side).
 
 int mtp_argmax_parts(int vocab) {
     static const int forced = [] {
@@ -738,6 +759,148 @@ void run_mtp_draft_with_argmax(
         pi.sample_idx.data(),
         pi.mtp_request_ids.data(),
         rows, draft_step, max_global_tokens);
+}
+
+// ── Stage-2 MTP `mtp_logits` (charlie) ───────────────────────────────
+// Produce K native MTP draft-logit rows at `ws.logits[draft_base + j]` (bf16
+// [vocab] each) by chaining K MTP-head steps from the end of the verify window.
+// Returns true if K rows were written → caller sets `ctx.mtp_draft_row = draft_base`
+// so the `Intrinsic::MtpLogits [K,vocab]` binding resolves to them.
+//
+// Contract (bravo's wiki `ptir-stage2-driver-mtp-logits-contract`): row `draft_base+j`
+// = draft position j's next-token logits, the model's fresh K-token proposal for the
+// NEXT window. The chain seeds from the target's greedy pick at the window's last
+// logit row, then feeds each step's argmax forward.
+//
+// draft_step(sampled=nullptr) FORCES the logits-gemm path (qwen3_5_forward.cpp:1817)
+// → each step's [vocab] bf16 lands in ws.logits[0], which we argmax (next token) and
+// scatter to the reserved draft row. Row 0 is a live target logit row, so we
+// save/restore it around the chain.
+bool produce_mtp_draft_logits(
+    Executor& executor,
+    int K,
+    int base_hidden_row,   // ws.y row of the ANCHOR hidden = hidden(source_position)
+    int seed_logit_row,    // ws.logits row to argmax for the BONUS token = token(p+1)
+    int source_position,   // position whose hidden feeds the MTP head (= base_position)
+    int batch_req_index,   // BATCH-LOCAL request index [0,R) — indexes kv_page_indptr
+    int draft_base,        // first reserved ws.logits draft row
+    cudaStream_t stream)
+{
+    if (K <= 0 || !executor.system_drafter.draft_step) return false;
+    auto& ws = executor.ws;
+    auto& pi = executor.inputs;
+    const int V = executor.loaded_model.hf_config().vocab_size;
+    const bool mtp_trace = std::getenv("PIE_MTP_LOGITS_TRACE") != nullptr;
+    // The MTP-head chain invocation (KV/slot/position/max_global_tokens geometry)
+    // mirrors the native drafter (run_step_chained_system_drafter). Gate behind
+    // PIE_MTP_LOGITS_PRODUCE (default OFF returns false → caller leaves
+    // mtp_draft_row=-1, the safe aliasing stub) while it's being validated.
+    if (std::getenv("PIE_MTP_LOGITS_PRODUCE") == nullptr) {
+        if (mtp_trace)
+            std::cerr << "[mtp-logits] SKIP (PIE_MTP_LOGITS_PRODUCE unset) K=" << K
+                      << " seed_logit_row=" << seed_logit_row
+                      << " base_hidden_row=" << base_hidden_row
+                      << " source_position=" << source_position
+                      << " draft_base=" << draft_base << "\n";
+        return false;
+    }
+
+    auto* logits16 = static_cast<std::uint16_t*>(ws.logits.data());
+
+    // Save the target logit row 0 (bf16 [V]) — the chain clobbers it.
+    if (executor.mtp_row0_save.size() < static_cast<std::size_t>(V))
+        executor.mtp_row0_save = DeviceBuffer<std::uint16_t>(static_cast<std::size_t>(V));
+    CUDA_CHECK(cudaMemcpyAsync(
+        executor.mtp_row0_save.data(), logits16,
+        static_cast<std::size_t>(V) * sizeof(std::uint16_t),
+        cudaMemcpyDeviceToDevice, stream));
+
+    // Anchor token = the BONUS token = the target's greedy at the last verify row
+    // (bravo's Stage-2 contract: the drafts extend from committed.last() = bonus).
+    // token(p+1) = bonus; hidden(p) = ws.y[base_hidden_row] (position
+    // source_position); the MTP head predicts token(p+2) = the first draft.
+    kernels::launch_argmax_bf16(
+        logits16 + static_cast<std::size_t>(seed_logit_row) * V,
+        reinterpret_cast<std::int32_t*>(pi.sampled.data()), 1, V, stream);
+    std::int32_t next_tok = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&next_tok, pi.sampled.data(),
+        sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const std::int32_t req = static_cast<std::int32_t>(batch_req_index);
+    // Mirror run_step_chained_system_drafter's history-window geometry (the proven
+    // path). mtp_input_pos = source_position + draft_position_offset; draft j's
+    // input position = mtp_input_pos + j; and (when the model uses the global
+    // prefix cache) max_global_tokens = input_pos - j = mtp_input_pos — CONSTANT
+    // across drafts (the draft positions advance but attend the SAME committed
+    // prefix; each draft's own K/V is handled in-kernel by mtp_full_attn_no_cache).
+    // A growing max_global_tokens (the earlier naive base_position+1+j) reads OOB
+    // history pages → the illegal-memory-access crash.
+    const int off = executor.system_drafter.draft_position_offset;
+    const bool prefix_global =
+        executor.system_drafter.draft_global_cache_uses_prefix_position;
+    const bool mtp_global_cache = (executor.tp_comm == nullptr);
+    const int mtp_input_pos = source_position + std::max(0, off);
+    for (int j = 0; j < K; ++j) {
+        // draft_step reads token[0], position[0], base_hidden_row[0], request[0].
+        const std::int32_t tok = next_tok;
+        const int input_pos = mtp_input_pos + j;
+        const std::int32_t pos = static_cast<std::int32_t>(input_pos);
+        // Step 0 reads the last window hidden (ws.y[base_hidden_row]); chained steps
+        // read row 0 (draft_step copies ws.y=ws.norm_x each step into row 0).
+        const std::int32_t hrow = (j == 0) ? static_cast<std::int32_t>(base_hidden_row) : 0;
+        CUDA_CHECK(cudaMemcpyAsync(pi.tokens.data(), &tok, sizeof(tok),
+            cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(pi.positions.data(), &pos, sizeof(pos),
+            cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(pi.sample_idx.data(), &hrow, sizeof(hrow),
+            cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(pi.mtp_request_ids.data(), &req, sizeof(req),
+            cudaMemcpyHostToDevice, stream));
+
+        int max_global_tokens = 0;
+        if (mtp_global_cache) {
+            max_global_tokens =
+                std::max(0, input_pos - (prefix_global ? j : 0));
+        }
+        executor.system_drafter.draft_step(
+            ws, executor.kv_cache, executor.cublas,
+            reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
+            reinterpret_cast<const std::int32_t*>(pi.positions.data()),
+            pi.sample_idx.data(),
+            pi.mtp_request_ids.data(),
+            pi.kv_page_indices.data(),
+            pi.kv_page_indptr.data(),
+            pi.kv_last_page_lens.data(),
+            /*sampled_token_ids=*/nullptr,   // FORCE the logits-gemm path
+            /*rows=*/1, /*draft_step=*/j, max_global_tokens);
+
+        // This step's [vocab] bf16 draft logits are now in ws.logits[0]. Argmax for
+        // the next chained token, then scatter row 0 → the reserved draft row.
+        kernels::launch_argmax_bf16(
+            logits16, reinterpret_cast<std::int32_t*>(pi.sampled.data()), 1, V, stream);
+        CUDA_CHECK(cudaMemcpyAsync(&next_tok, pi.sampled.data(),
+            sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            logits16 + static_cast<std::size_t>(draft_base + j) * V, logits16,
+            static_cast<std::size_t>(V) * sizeof(std::uint16_t),
+            cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (mtp_trace) {
+            std::cerr << "[mtp-logits] draft j=" << j << " in_tok=" << tok
+                      << " pos=" << pos << " hrow=" << hrow
+                      << " → draft_row=" << (draft_base + j)
+                      << " argmax=" << next_tok << "\n";
+        }
+    }
+
+    // Restore the target logit row 0.
+    CUDA_CHECK(cudaMemcpyAsync(
+        logits16, executor.mtp_row0_save.data(),
+        static_cast<std::size_t>(V) * sizeof(std::uint16_t),
+        cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return true;
 }
 
 void tp_broadcast_mtp_inputs(NcclComm& comm, PersistentInputs& pi,
@@ -1584,10 +1747,10 @@ std::size_t capture_forward_graph_lattice(Executor& executor) {
         const std::uint32_t graph_layout =
             executor.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
-            (tp_greedy_argmax ? 1u : 0u) |
-            (single_gpu_graph_argmax ? 2u : 0u) |
-            (fwd_handles_argmax_precapture ? 4u : 0u) |
-            (graph_layout << 3);
+            make_graph_variant(tp_greedy_argmax, single_gpu_graph_argmax,
+                               fwd_handles_argmax_precapture,
+                               /*small_spec=*/false, /*rs_verify=*/false,
+                               graph_layout);
         const ForwardGraphKey key{R, N, graph_variant};
         if (executor.graph_cache->get(key) != nullptr) continue;
 
@@ -1660,6 +1823,20 @@ struct SamplePlanInputs {
     bool have_custom_mask = false;
     bool has_spec_drafts = false;
     bool has_custom_program = false;
+    // #12 phase-1: a standard sampler program recognized from the (migrated)
+    // program contract. When set, the program's dedicated-kernel params have been
+    // extracted into the fields below; the per-slot loop seeds `per_slot_*` from
+    // them (the program carries no legacy slot params) so the flag-set + dispatch
+    // route the fire to the SAME kernel a slot fire would (FlashInfer top-p /
+    // sample_temp min-p / greedy argmax / BakedIR temp) instead of falling through
+    // to CustomJIT. An unrecognized program keeps has_custom_program=true →
+    // CustomJIT. Seed stays ambient (`pi.sample_seed`; seed_view empty →
+    // fresh_sampling_seed, exactly as the pre-migration multisamp slot fire).
+    bool program_recognized = false;
+    float rec_temp = 1.0f;
+    float rec_top_p = 1.0f;
+    float rec_min_p = 0.0f;
+    std::int32_t rec_top_k = 0;
 };
 
 // Per-fire decisions emitted by the sample-plan phase. The spans on
@@ -1716,6 +1893,13 @@ struct ForwardDispatchInputs {
     const std::uint32_t* h_kvlpl_forward = nullptr;
     const std::int32_t*  slot_ids_h_data = nullptr;
     const std::uint8_t*  is_fresh_h_data = nullptr;
+    // Ph7 RS rs-output (W10): when rs_buffer_write, the linear layers scatter
+    // their in-proj [mixed_qkv|a|b] page-major into the buffered-activation pool
+    // at these per-request CSR slabs (write_state forced false). FOLD passes use
+    // the separate fold-replay dispatch instead (not this path).
+    const std::uint32_t* rs_buffer_slot_ids_h = nullptr;
+    const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;
+    bool                 rs_buffer_write = false;
     // Multimodal (gemma4 vision): image side-channel, set from the view.
     const float*         image_pixels_h = nullptr;
     const std::uint32_t* image_pixel_byte_indptr_h = nullptr;
@@ -1909,8 +2093,10 @@ SamplePlanResult build_sample_plan(
                 const std::uint32_t type =
                     (s_idx < in.types_view.size()) ? in.types_view[s_idx] : 1u;
                 per_slot_type[k] = type;
-                const float T = (s_idx < in.temp_view.size()) ? h_temp[s_idx] : 1.f;
-                float Tp = (s_idx < in.top_p_view.size()) ? h_top_p[s_idx] : 1.f;
+                const float T = in.program_recognized ? in.rec_temp
+                    : (s_idx < in.temp_view.size()) ? h_temp[s_idx] : 1.f;
+                float Tp = in.program_recognized ? in.rec_top_p
+                    : (s_idx < in.top_p_view.size()) ? h_top_p[s_idx] : 1.f;
                 // Defensive (#7 boundary): valid top_p ∈ (0,1]; "no top-p" = 1.0
                 // (the driver default — confirmed: a non-top-p fire reads pi.top_p
                 // = 1.0, so top_p<=0 never occurs in prod). A degenerate top_p<=0
@@ -1919,9 +2105,11 @@ SamplePlanResult build_sample_plan(
                 // holds on every input incl. hotel's boundary fires. Never fires
                 // on a real fire; the recognizer (infer_kind) is left unchanged.
                 if (Tp <= 0.f) Tp = 1.f;
-                const float Mp = (s_idx < in.min_p_view.size()) ? h_min_p[s_idx] : 0.f;
-                const std::int32_t Tk_raw = (s_idx < in.top_k_view.size())
-                    ? static_cast<std::int32_t>(h_top_k[s_idx]) : 0;
+                const float Mp = in.program_recognized ? in.rec_min_p
+                    : (s_idx < in.min_p_view.size()) ? h_min_p[s_idx] : 0.f;
+                const std::int32_t Tk_raw = in.program_recognized ? in.rec_top_k
+                    : (s_idx < in.top_k_view.size())
+                        ? static_cast<std::int32_t>(h_top_k[s_idx]) : 0;
                 const std::int32_t Tk =
                     (Tk_raw == 0) ? executor.loaded_model.hf_config().vocab_size : Tk_raw;
                 std::uint32_t s = (s_idx < in.seed_view.size()) ? h_seed[s_idx] : 0u;
@@ -2011,6 +2199,7 @@ SamplePlanResult build_sample_plan(
 
     out.compact_logit_rows =
         executor.forward_fn.supports_compact_logits &&
+        !in.has_custom_program &&  // a custom IR program reads the full [N,V] block
         !in.is_pure_decode &&
         !in.have_custom_mask &&
         !out.has_msgpack_only_slots &&
@@ -2128,16 +2317,13 @@ ForwardDispatchResult run_forward_dispatch(
         graph_single_gpu_argmax_enabled();
     const bool rs_verify_frozen =
         executor.rs_cache != nullptr && executor.rs_cache->verify_frozen();
-    const std::uint32_t graph_variant =
-        (in.tp_greedy_argmax ? 1u : 0u) |
-        (out.graph_captures_single_gpu_argmax ? 2u : 0u) |
-        (in.forward_handles_argmax ? 4u : 0u) |
-        (out.graph_layout << 3) |
-        (in.small_spec_graph_shape ? 0x200u : 0u) |
+    const std::uint32_t graph_variant = make_graph_variant(
+        in.tp_greedy_argmax, out.graph_captures_single_gpu_argmax,
+        in.forward_handles_argmax, in.small_spec_graph_shape,
         // Frozen verify skips the GDN state writeback, baked into the captured
         // kernel — must not share a graph with a normal-writeback forward of
         // the same shape.
-        (rs_verify_frozen ? 0x400u : 0u);
+        rs_verify_frozen, out.graph_layout);
 
     if (try_graphs) {
         const ForwardGraphKey key{in.forward_R, in.forward_N, graph_variant};
@@ -2188,6 +2374,9 @@ ForwardDispatchResult run_forward_dispatch(
         fwd_in.slot_ids_h          = in.use_slots ? in.slot_ids_h_data : nullptr;
         fwd_in.is_fresh_h          = in.use_slots ? in.is_fresh_h_data : nullptr;
         fwd_in.slot_ids_d          = in.use_slots ? pi.slot_ids.data() : nullptr;
+        fwd_in.rs_buffer_slot_ids_h    = in.rs_buffer_slot_ids_h;
+        fwd_in.rs_buffer_slot_indptr_h = in.rs_buffer_slot_indptr_h;
+        fwd_in.rs_buffer_write         = in.rs_buffer_write;
         fwd_in.logit_row_indices_d = in.compact_logit_rows ? pi.sample_idx.data() : nullptr;
         fwd_in.num_logit_rows      = in.compact_logit_rows ? in.num_sampling : 0;
         fwd_in.emit_logits         = in.num_sampling > 0;
@@ -2219,10 +2408,11 @@ inline std::uint32_t us_between(probe_clock::time_point a,
     return static_cast<std::uint32_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
 }
-inline void write_probes(pie_driver::PieForwardResponseView& out,
+inline void write_probes(pie_driver::PieForwardResponseView& out, Executor& executor,
                          probe_clock::time_point t0, probe_clock::time_point t1,
                          probe_clock::time_point t2, probe_clock::time_point t3,
-                         probe_clock::time_point t4, probe_clock::time_point t5) {
+                         probe_clock::time_point t4, probe_clock::time_point t5,
+                         bool skip_device_idle = false) {
     const auto t6 = probe_clock::now();
     out.probe_wire_parse_us    = us_between(t0, t1);
     out.probe_plan_us          = us_between(t1, t2);
@@ -2230,13 +2420,129 @@ inline void write_probes(pie_driver::PieForwardResponseView& out,
     out.probe_kernel_launch_us = us_between(t3, t4);
     out.probe_sync_us          = us_between(t4, t5);
     out.probe_response_build_us = us_between(t5, t6);
+    // Thrust-2 bubble-p50: DEVICE-idle gap = this fire's entry (t0) − the PREVIOUS
+    // fire's kernel-retire (its t5, post final sync). `0` on the first fire.
+    // Reconstruct the stored ns count into a probe_clock time_point for a
+    // period-safe µs diff, then stamp THIS fire's retire (t5) for the next fire.
+    // `skip_device_idle`: G3 PART-2 back-to-back fires have no real per-fire sync
+    // (t5 is not a true retire and fires overlap → the host stamp underflows), so
+    // they leave `probe_device_idle_us` to the CUDA-event measure (`g3_drain`).
+    if (skip_device_idle) {
+        out.probe_device_idle_us = 0u;
+        return;
+    }
+    if (executor.last_fire_retire_ns != 0) {
+        const probe_clock::time_point prev{
+            probe_clock::duration{static_cast<probe_clock::rep>(executor.last_fire_retire_ns)}};
+        out.probe_device_idle_us = us_between(prev, t0);
+    } else {
+        out.probe_device_idle_us = 0u;
+    }
+    executor.last_fire_retire_ns = static_cast<std::uint64_t>(t5.time_since_epoch().count());
 }
+
+// ── G3 PART-2 helpers ────────────────────────────────────────────────────────
+// Free retained-next-input entries (destroy the producer done-event + erase the
+// entry, releasing its DeviceBuffer). Factored out of the inline fire path so it
+// runs either inline (synchronous fires) or deferred (back-to-back, gated on the
+// fire's retire event via `g3_drain`).
+inline void g3_free_retained_links(Executor& executor,
+                                   const std::vector<std::uint32_t>& links) {
+    for (std::uint32_t link : links) {
+        auto it = executor.retained_next_input.find(link);
+        if (it != executor.retained_next_input.end()) {
+            if (it->second.done != nullptr)
+                CUDA_CHECK(cudaEventDestroy(it->second.done));
+            executor.retained_next_input.erase(it);
+        }
+    }
+}
+
+// Drafts-channel (`pipeline_source_kind == 1`) retain at the FRESH per-fire point.
+// The IR program's out_scratch (`last_output_ptrs`) is REUSED + overwritten by the
+// NEXT fire, and the merged IR dispatch marshals + RETURNS before the legacy
+// post-sample retain site (the per-req `pi.sampled` loop) — so that site reads a
+// STALE out_scratch for a drafts fire (its consumer then reads a prior fire's
+// leftover, or a zeroed buffer). Composing the window HERE — right after this fire's
+// program ran + synced — captures its OWN fresh output. The program emits
+// `[commit[k+1], drafts[k], seed]`; retain `[seed, drafts[k]]` as out[2]=seed→row0,
+// out[1]=drafts[k]→rows1..k. Per-link copy on the FIFO copy-stream ⇒ WAR-impossible.
+// No-op unless the 3 outputs are present (a non-drafts fire).
+inline void retain_drafts_window(Executor& executor,
+                                 std::uint32_t link,
+                                 std::span<void* const> out_ptrs,
+                                 const sampling_ir::ProgramInterface* iface,
+                                 cudaStream_t stream) {
+    if (link == 0 || out_ptrs.size() < 3 || iface == nullptr ||
+        iface->outputs.size() < 3)
+        return;
+    const std::size_t k = iface->outputs[1].elem_count;  // drafts [k]
+    const std::size_t k1 = k + 1;                         // [seed, drafts]
+    Executor::RetainedSampled& ret = executor.retained_next_input[link];
+    if (ret.copy.size() < k1)
+        ret.copy = DeviceBuffer<std::int32_t>::alloc(k1);
+    if (ret.done == nullptr) CUDA_CHECK(cudaEventCreate(&ret.done));
+    CUDA_CHECK(cudaMemcpyAsync(ret.copy.data(), out_ptrs[2], sizeof(std::int32_t),
+                               cudaMemcpyDeviceToDevice, stream));    // seed → row 0
+    CUDA_CHECK(cudaMemcpyAsync(ret.copy.data() + 1, out_ptrs[1],
+                               sizeof(std::int32_t) * k,
+                               cudaMemcpyDeviceToDevice, stream));    // drafts[k] → rows 1..k
+    CUDA_CHECK(cudaEventRecord(ret.done, stream));
+}
+
+// Look up request `member`'s pipeline-source link + kind from the wire view and, if
+// it is a drafts producer (kind == 1), retain its `[k+1]` window from the FRESH
+// program output. Called at each IR-dispatch marshal point (the merged paths return
+// before the legacy 4290 retain). Safe no-op for a non-drafts / unlinked request.
+inline void retain_drafts_window_for_member(Executor& executor,
+                                            const pie_driver::PieForwardRequestView& view,
+                                            std::uint32_t member,
+                                            cudaStream_t stream) {
+    const auto psl_v = view.pipeline_source_links.as<std::uint32_t>();
+    const auto psk_v = view.pipeline_source_kinds.as<std::uint8_t>();
+    const std::uint8_t sk =
+        (member < psk_v.size()) ? psk_v[member] : view.pipeline_source_kind;
+    if (sk != 1 || member >= psl_v.size() || psl_v[member] == 0) return;
+    retain_drafts_window(executor, psl_v[member],
+                         executor.sampling_ir_runtime.last_output_ptrs(),
+                         executor.sampling_ir_runtime.last_interface(), stream);
+}
+
+// Drain ready deferred measurements: for each pending item whose `idle_to`
+// first-kernel event has completed (⇒ `idle_from` retire event too — same
+// stream, later), compute the device-idle µs gap and (once per response) stamp
+// it on `out`, free the item's retained-next-input links (now hazard-free), and
+// destroy the event pair. Stops at the first not-ready item (later items are
+// newer on the stream). Best-effort attribution: the gap for fire k may land on
+// a later fire's response — fine for the p50 histogram.
+inline void g3_drain(Executor& executor, pie_driver::PieForwardResponseView* out) {
+    bool stamped = false;
+    while (!executor.g3_pending.empty()) {
+        auto& p = executor.g3_pending.front();
+        if (p.idle_to != nullptr && cudaEventQuery(p.idle_to) != cudaSuccess)
+            break;
+        if (out != nullptr && !stamped && p.idle_from != nullptr && p.idle_to != nullptr) {
+            float ms = 0.f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, p.idle_from, p.idle_to));
+            out->probe_device_idle_us =
+                static_cast<std::uint32_t>(ms * 1000.f + 0.5f);
+            stamped = true;
+        }
+        g3_free_retained_links(executor, p.free_links);
+        if (p.idle_from != nullptr) CUDA_CHECK(cudaEventDestroy(p.idle_from));
+        if (p.idle_to != nullptr) CUDA_CHECK(cudaEventDestroy(p.idle_to));
+        executor.g3_pending.pop_front();
+    }
+}
+}  // namespace  (split so ensure_sampling_ir_backend has external linkage)
 
 // Lazily construct the Sampling-IR JIT backend on the first program-carrying
 // fire — the JitEngine ctor resolves the device arch from the CUDA context,
 // which is current mid-fire. One-shot: a hard init failure (e.g. no NVRTC)
 // disables programmable sampling for the process and falls back to the legacy
-// sampler rather than retrying + re-logging every fire.
+// sampler rather than retrying + re-logging every fire. External linkage
+// (declared in executor.hpp): the #11 prefetch-seam registration in entry.cpp
+// force-creates it at backend-ready so a host-side prefetch has a live cache.
 sampling_ir::SamplingIrBackend* ensure_sampling_ir_backend(Executor& ex) {
     if (ex.sampling_ir_runtime.has_backend()) {
         return ex.sampling_ir_backend.get();
@@ -2258,6 +2564,118 @@ sampling_ir::SamplingIrBackend* ensure_sampling_ir_backend(Executor& ex) {
         return nullptr;
     }
 }
+
+namespace {
+// Marshal a fired sampling-IR program's declared outputs (read via the runtime's
+// `last_output_ptrs()`) into the per-request slots. This is the #32/#33/M-batch
+// unified marshal axis: it loops `r in 0..num_rows × o in 0..n_out`, reading
+// output `o`'s row `r` at `outs[o] + r*elem_count_o` and scattering it to
+// `per_req[group_member[r]]`. The three axes compose on this one read:
+//   • num_rows>1  → M-batch row-scatter (#34): one N-row fire, N requests;
+//   • n_out>1     → multi-output (#33): each program output → its own slot;
+//   • elem_count_o>1 (Token) → [k]-Token (#32, today still spec_tokens-routed).
+// `group_member[r]` is the batched row → per_req index map = `ProgramGroup.rows`
+// (partition_by_program); an individual fire passes num_rows=1 + a 1-element map
+// (the target request). Single-Token rows land dense in `pi.sampled[base+r]` (so
+// the N-row read works today); rich outputs (Scalar/Entropy/Logits/[k]) currently
+// use 1-row scratch — their N-row form needs the runtime's N-row scratch (a
+// follow-on), so today they're exercised only at num_rows==1.
+// Token→tokens (scalar) / spec_tokens (Vector<k> accept-prefix, sentinel -1 =
+// first reject); Scalar/Entropy→entropies; Logits→raw bf16 bytes.
+void marshal_ir_program_output(const sampling_ir::ProgramInterface* pif,
+                               std::span<void* const> outs,
+                               int num_rows,
+                               std::span<const std::uint32_t> group_member,
+                               std::vector<pie_driver::PerRequestOutput>& per_req) {
+    if (pif == nullptr) return;
+    // #34 fail-loud guard: rich outputs (Scalar/Entropy/Logits/[k]) read with a
+    // per-row stride that assumes an N-row [num_rows, elem_count] scratch, but the
+    // runtime scratch is 1-row today. Single-Token rows are dense-safe (pi.sampled
+    // [base+r]); any other output at num_rows>1 would OOB. No-op at num_rows==1
+    // (today's only path); makes a future #34 wiring fail LOUD, never silent-OOB.
+    if (num_rows > 1) {
+        bool all_single_token = true;
+        for (const auto& od : pif->outputs)
+            if (od.cls != sampling_ir::OutputClass::Token || od.elem_count > 1) {
+                all_single_token = false; break;
+            }
+        if (!all_single_token) {
+            std::fprintf(stderr, "[pie-driver-cuda] marshal num_rows=%d with a rich "
+                         "output needs the #34 N-row scratch (1-row today)\n", num_rows);
+            std::abort();  // fail-loud (assert compiles out under NDEBUG)
+        }
+    }
+    const int n = num_rows > 0 ? num_rows : 1;
+    for (int r = 0; r < n; ++r) {
+        if (static_cast<std::size_t>(r) >= group_member.size()) break;
+        const std::uint32_t req = group_member[r];
+        if (static_cast<std::size_t>(req) >= per_req.size()) continue;
+        pie_driver::PerRequestOutput& pr = per_req[req];
+        // #32: size this request's program_tokens to n_out so every declared
+        // output owns a CSR segment (empty for non-[k]) — keeps seg(r,o) =
+        // (Σ_{r'<r} n_out_{r'}) + o consistent with the runtime's output_types.
+        if (pr.program_tokens.size() < pif->outputs.size()) {
+            pr.program_tokens.resize(pif->outputs.size());
+        }
+        for (std::size_t i = 0; i < pif->outputs.size() && i < outs.size(); ++i) {
+            const sampling_ir::DeclaredOutput& o = pif->outputs[i];
+            if (outs[i] == nullptr) continue;
+            // Per-row stride within output i's [num_rows, elem_count] block.
+            const std::size_t stride = std::max<std::size_t>(o.elem_count, 1);
+            const std::size_t row_off = static_cast<std::size_t>(r) * stride;
+            switch (o.cls) {
+                case sampling_ir::OutputClass::Token: {
+                    const auto* base =
+                        static_cast<const std::int32_t*>(outs[i]) + row_off;
+                    if (o.elem_count <= 1) {
+                        std::int32_t t = 0;
+                        CUDA_CHECK(cudaMemcpy(&t, base, sizeof(t),
+                                              cudaMemcpyDeviceToHost));
+                        pr.tokens.push_back(static_cast<std::uint32_t>(t));
+                    } else {
+                        // #32 [k]-Token (elem_count>1) → the per-(request,output)
+                        // program_tokens CSR (output i's segment), OFF spec_tokens
+                        // (the system-drafter channel it was mis-routed to). The
+                        // -1 sentinel still truncates a spec-verify accept-prefix;
+                        // a plain [k] output has no -1 so all k tokens emit.
+                        std::vector<std::int32_t> v(o.elem_count);
+                        CUDA_CHECK(cudaMemcpy(v.data(), base,
+                                              sizeof(std::int32_t) * o.elem_count,
+                                              cudaMemcpyDeviceToHost));
+                        for (std::int32_t x : v) {
+                            if (x < 0) break;
+                            pr.program_tokens[i].push_back(
+                                static_cast<std::uint32_t>(x));
+                        }
+                    }
+                    break;
+                }
+                case sampling_ir::OutputClass::Scalar:
+                case sampling_ir::OutputClass::Entropy: {
+                    const auto* base =
+                        static_cast<const float*>(outs[i]) + row_off;
+                    float s = 0.f;
+                    CUDA_CHECK(cudaMemcpy(&s, base, sizeof(s),
+                                          cudaMemcpyDeviceToHost));
+                    pr.entropies.push_back(s);
+                    break;
+                }
+                case sampling_ir::OutputClass::Logits: {
+                    const std::size_t nbytes = o.elem_count * sizeof(std::uint16_t);
+                    const auto* base =
+                        static_cast<const std::uint16_t*>(outs[i]) + row_off;
+                    std::vector<std::uint8_t> bytes(nbytes);
+                    CUDA_CHECK(cudaMemcpy(bytes.data(), base, nbytes,
+                                          cudaMemcpyDeviceToHost));
+                    pr.logits.push_back(std::move(bytes));
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+}
 }  // namespace
 
 void handle_fire_batch(
@@ -2270,6 +2688,14 @@ void handle_fire_batch(
     using clock = std::chrono::steady_clock;
     const auto t_entry = clock::now();
 
+    // #27 cut #1 (a2): cleared each fire; set only if this fire takes the
+    // output→tensor fast-path (deferred forward-done). The in-proc service reads
+    // it after the handler to drive `out.deferred`.
+    executor.last_fire_deferred = false;
+    // D1: cleared each fire; the rich branch re-arms it if it defers a rich response.
+    executor.pending_rich_defer.active = false;
+    executor.pending_rich_defer.staged.clear();
+
     // Diagnostic trace (env-gated, zero-cost when unset): localizes where a
     // fire parks across the worker forward path. Pairs with the runtime-side
     // inproc submit/recv/slot-fill trace to map the a/b/c park location.
@@ -2277,6 +2703,11 @@ void handle_fire_batch(
     if (ir_trace) {
         std::cerr << "[ir-trace] fire entry req_id=" << req_id << "\n";
         std::cerr.flush();
+    }
+    if (std::getenv("PIE_PTIR_TRACE")) {
+        std::fprintf(stderr, "[ptir-serve] entry req_id=%u: ptir_hashes=%zu tokens=%zu "
+                     "sampling_prog=%zu\n", req_id, view.ptir_program_hashes.size(),
+                     view.token_ids.size(), view.sampling_program_bytes.size());
     }
 
     // Local references for the most-touched Executor members.
@@ -2505,6 +2936,20 @@ void handle_fire_batch(
                 rs_flag_view.begin(), rs_flag_view.end(),
                 [](std::uint8_t v) { return (v & 1u) != 0; });
 
+        // Ph7 RS working-set buffered-activation channel. Single-role per pass
+        // (v1): a FOLD pass (FOLD-bit=2 set) gathers+replays from the buffered
+        // pool into recurrent_state (separate fold-replay dispatch below); an
+        // rs-output write pass (FOLD-bit clear + buffered slabs present)
+        // scatters in-proj [mixed_qkv|a|b] to the pool during the main forward.
+        const auto rs_fold_view = view.rs_fold_lens.as<std::uint32_t>();
+        const auto rs_buf_id_view = view.rs_buffer_slot_ids.as<std::uint32_t>();
+        const auto rs_buf_indptr_view = view.rs_buffer_slot_indptr.as<std::uint32_t>();
+        const bool rs_is_fold = use_slots && std::any_of(
+            rs_flag_view.begin(), rs_flag_view.end(),
+            [](std::uint8_t v) { return (v & 2u) != 0; });
+        const bool rs_is_write =
+            use_slots && !rs_is_fold && rs_buf_id_view.size() > 0;
+
         const GraphShapeDecision graph_shape = decide_graph_shape(
             executor, R, N, page_size,
             is_pure_decode, has_spec_drafts, has_fresh_slot,
@@ -2536,15 +2981,19 @@ void handle_fire_batch(
         pi.kv_page_indptr.copy_from_host(forward_inputs.kv_page_indptr);
         pi.kv_last_page_lens.copy_from_host(forward_inputs.kv_last_page_lens);
 
-        // BRLE attention masks. For prefill batches that aren't pure
-        // causal, decode + upload a packed bitmap and route through the
-        // flashinfer kCustom path. For decode-only batches the kernel
-        // doesn't support custom masks; we proceed without one (a
-        // limitation we'd have to fix by routing decode through the
-        // prefill kernel for custom-mask inferlets).
+        // BRLE attention masks. For any batch that isn't pure causal, decode +
+        // upload a packed bitmap and route through the flashinfer kCustom path.
+        // NOTE: `is_pure_decode` is intentionally NOT gated here. A decode-shaped
+        // batch (qo_len==1/req) that carries a per-cell custom mask — e.g. the
+        // §6.2 beam fire, whose kvm expresses fork-freeze mid-page holes the
+        // decode/xqa kernels can't — must ALSO build the mask; the forward then
+        // routes it through the custom-mask prefill kernel (llama_like's
+        // `has_custom_mask` gate). This is the previously-noted "route decode
+        // through the prefill kernel for custom-mask inferlets" fix; a normal
+        // decode batch carries no mask (`fmask_view` empty) so it is unaffected.
         const auto fmask_view  = view.flattened_masks.as<std::uint32_t>();
         const auto mskptr_view = view.mask_indptr.as<std::uint32_t>();
-        if (!has_spec_drafts && !is_pure_decode && !fmask_view.empty()) {
+        if (!has_spec_drafts && !fmask_view.empty()) {
             const auto qo_span =
                 std::span<const std::uint32_t>(qo_view.data(), qo_view.size());
             const auto kvpp_span =
@@ -2592,6 +3041,17 @@ void handle_fire_batch(
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
         }
 
+        // RS_FLAG_FOLD (bit 1) + per-request rs_fold_lens (working-set fold(n)).
+        // v1: the runtime's `inference.fold` advances the folded-state boundary
+        // host-side and the mock driver no-ops the fold compute, so there is no
+        // real CUDA fold to run here yet — and the existing `commit_len` GDN
+        // primitive folds tokens *in-forward* (the spec commit-advance path),
+        // not from the working set's separately-buffered RS slabs.
+        // Ph7 (RS-real-driver): the real buffered-then-fold needs a new
+        // fold-from-buffer kernel that reads the `rs_buffer_slot_ids` SoA
+        // (append-only ForwardRequest field, parked with this kernel) for each
+        // request flagged RS_FLAG_FOLD and folds rs_fold_lens[r] buffered tokens
+        // into the folded slot `rs_slot_ids[r]`. Lower it here.
         // Frozen-verify speculative path. The verify forward walks the GDN
         // recurrent state in registers to produce correct draft outputs but
         // persists NOTHING (every linear layer sees write_state=false), so each
@@ -2613,6 +3073,96 @@ void handle_fire_batch(
             rs_frozen_verify = has_spec_drafts && use_slots &&
                                executor.tp_comm == nullptr;
             executor.rs_cache->set_verify_frozen(rs_frozen_verify);
+        }
+
+        // ── #12 phase-1: recognize a standard sampler program ───────────
+        // The contract migration (#15) moved the sampler slot→program: a fire
+        // now carries the sampler as a bytecode program (with the legacy slot
+        // params EMPTY). Hash the program against the driver's own baked
+        // standard programs (`pie_standard_samplers.h`); a match → extract its
+        // dedicated-kernel params and plan the fire as the equivalent slot fire,
+        // restoring the pre-migration dispatch (FlashInfer top-p / sample_temp
+        // min-p / greedy argmax / BakedIR temp). A miss → a genuine custom
+        // program → CustomJIT via `try_run`, unchanged. Without this, every
+        // standard program falls through to CustomJIT (SplitMix64-Gumbel) ≠ the
+        // FlashInfer the slot fire used → silent token divergence.
+        bool program_recognized = false;
+        sampling_ir::DedicatedParams rec_params;
+        const bool prog_attached =
+            view.sampling_program_bytes_indptr.size() >= 2 &&
+            !view.sampling_program_bytes.empty();
+        if (prog_attached && num_sampling > 0) {
+            const std::uint32_t vocab = static_cast<std::uint32_t>(
+                executor.loaded_model.hf_config().vocab_size);
+            // Built once per vocab (fixed per model); per-fire = O(table) hash compare.
+            static thread_local std::uint32_t recog_vocab = 0;
+            static thread_local std::vector<sampling_ir::StandardKindEntry> recog_table;
+            if (recog_table.empty() || recog_vocab != vocab) {
+                recog_table = sampling_ir::build_standard_kind_table(vocab);
+                recog_vocab = vocab;
+            }
+            const std::uint32_t blo = view.sampling_program_bytes_indptr.data()[0];
+            const std::uint32_t bhi = view.sampling_program_bytes_indptr.data()[1];
+            const std::uint8_t* const prog_bc = view.sampling_program_bytes.data() + blo;
+            const std::size_t prog_len = static_cast<std::size_t>(bhi - blo);
+            // #25: ALL six standard kinds are k-invariant (top-k `k` rides a host-
+            // submit value-id) → recognized by EXACT hash, no op-shape canonicalize.
+            auto kind_opt = sampling_ir::recognize_standard_kind(recog_table, prog_bc, prog_len);
+            if (ir_trace && !kind_opt) {
+                const std::uint64_t wh = sampling_ir::jit::fnv1a64(prog_bc, prog_len);
+                std::cerr << "[ir-trace] recognize MISS wire_len=" << prog_len
+                          << " wire_hash=" << std::hex << wh << std::dec
+                          << " exact=" << recog_table.size() << "\n";
+            }
+            if (kind_opt) {
+                // Program 0's host-submit inputs (the WS1a slice) carry T + the
+                // filter (top_p/min_p) + k (TopK/TopKTopP) by input ordinal; extract
+                // them. #25: k is the LAST submit ordinal (U32), read like top_p/min_p.
+                std::vector<sampling_ir::SubmitInput> rec_submit;
+                if (view.sampling_input_indptr.size() >= 2) {
+                    const std::uint32_t ilo = view.sampling_input_indptr.data()[0];
+                    const std::uint32_t ihi = view.sampling_input_indptr.data()[1];
+                    const std::uint8_t* blob = view.sampling_input_blob.data();
+                    for (std::uint32_t i = ilo; i < ihi; ++i) {
+                        sampling_ir::SubmitInput si;
+                        si.key = view.sampling_input_keys.data()[i];
+                        si.data = blob + view.sampling_input_offsets.data()[i];
+                        si.len_bytes = view.sampling_input_lens.data()[i];
+                        rec_submit.push_back(si);
+                    }
+                }
+                rec_params =
+                    sampling_ir::extract_dedicated_params(*kind_opt, rec_submit);
+                program_recognized = true;
+                if (ir_trace) {
+                    std::cerr << "[ir-trace] program recognized kind="
+                              << static_cast<int>(*kind_opt) << " T=" << rec_params.temp
+                              << " top_p=" << rec_params.top_p
+                              << " min_p=" << rec_params.min_p
+                              << " top_k=" << rec_params.top_k
+                              << " → dedicated dispatch\n";
+                }
+                // echo's free agreement guard (#7-step-1 analog, env-gated, prod
+                // default-off): the extracted params MUST re-classify (param
+                // recognizer + #7 normalizations) to the hash kind — a mis-extract
+                // (wrong key → wrong param) is caught here, pre-HW. Under
+                // PIE_RECOGNIZER_AUDIT we ALSO dump the extracted VALUES every
+                // recognized fire (not just on disagreement) — the #12 stage-2
+                // "param-dump" gate: HW-readable proof the route AND the values are
+                // right (e.g. top_p==0.9, T==0.8), catching a wrong-VALUE extract
+                // that the kind-only agreement check can't (0.5 and 0.9 both → TopP).
+                if (std::getenv("PIE_RECOGNIZER_AUDIT")) {
+                    const bool agree = sampling_ir::extracted_params_agree(
+                        *kind_opt, rec_params,
+                        executor.loaded_model.hf_config().vocab_size);
+                    std::cerr << "[extract-audit] " << (agree ? "OK" : "DISAGREE")
+                              << " hash_kind=" << static_cast<int>(*kind_opt)
+                              << " extracted(T=" << rec_params.temp
+                              << " top_p=" << rec_params.top_p
+                              << " min_p=" << rec_params.min_p
+                              << " top_k=" << rec_params.top_k << ")\n";
+                }
+            }
         }
 
         // ── Sample-plan construction (hoisted) ──────────────────
@@ -2640,9 +3190,14 @@ void handle_fire_batch(
             .is_pure_decode    = is_pure_decode,
             .have_custom_mask  = have_custom_mask,
             .has_spec_drafts   = has_spec_drafts,
-            .has_custom_program =
-                (view.sampling_program_bytes_indptr.size() >= 2 &&
-                 !view.sampling_program_bytes.empty()),
+            // A recognized standard program is planned as the equivalent slot
+            // fire (not a custom program), so the dedicated ladder runs.
+            .has_custom_program = prog_attached && !program_recognized,
+            .program_recognized = program_recognized,
+            .rec_temp           = rec_params.temp,
+            .rec_top_p          = rec_params.top_p,
+            .rec_min_p          = rec_params.min_p,
+            .rec_top_k          = rec_params.top_k,
         });
         const bool has_rich_sampler_slots = sp.has_rich_sampler_slots;
         const bool need_msgpack          = sp.need_msgpack;
@@ -2654,11 +3209,26 @@ void handle_fire_batch(
         const bool tp_greedy_argmax      = sp.tp_greedy_argmax;
         const bool single_gpu_greedy_argmax = sp.single_gpu_greedy_argmax;
         const bool dehardwire_baked_ir   = sp.dehardwire_baked_ir;
-        // De-hardwiring: force the non-graph forward path so it emits the full
-        // [N,V] logits (the captured graph would fuse/own the sampling); the IR
-        // program then samples over the emitted logits. `graph_shape_ok` is only
-        // consumed at the forward dispatch below, so overriding it here is safe.
-        if (dehardwire_baked_ir) {
+        // A custom IR sampling program (carrier path) owns the sampling and reads
+        // `ws.logits` via `try_run` — so, exactly like de-hardwiring, the forward
+        // must emit the full [N,V] logits. Otherwise a greedy custom fire takes the
+        // fused lm_head-argmax-only path (logits never materialized) and the IR
+        // argmax samples over unwritten logits → token 0. (Argmax routes to a
+        // DedicatedKernel, so this IR output path is unexercised until a real
+        // program-path argmax runs.)
+        // #12: a RECOGNIZED standard program is NOT custom — it runs the dedicated
+        // ladder (FlashInfer/sample_temp/argmax/BakedIR), so it follows the same
+        // logits-materialization rules as the equivalent slot fire (and lets the
+        // greedy-argmax fused path stay enabled when its kind is argmax).
+        const bool has_custom_program =
+            prog_attached && !program_recognized;
+        // De-hardwiring / custom-program: force the non-graph forward path so it
+        // emits the full [N,V] logits (the captured graph would fuse/own the
+        // sampling); the IR program then samples over the emitted logits.
+        // `graph_shape_ok` is only consumed at the forward dispatch below, so
+        // overriding it here is safe.
+        const bool ptir_attached = !view.ptir_program_hashes.empty();
+        if (dehardwire_baked_ir || has_custom_program || ptir_attached) {
             graph_shape_ok = false;
         }
         const int  logit_rows_required   = sp.logit_rows_required;
@@ -2771,7 +3341,9 @@ void handle_fire_batch(
             !any_topk_topp &&
             all_slots_token &&
             all_rows_greedy &&
-            !dehardwire_baked_ir;  // de-hardwire needs full logits, not argmax-only
+            !dehardwire_baked_ir &&  // de-hardwire needs full logits, not argmax-only
+            !has_custom_program &&   // a custom IR program samples over ws.logits → emit them
+            view.ptir_program_hashes.empty();  // a PTIR stage program reads ws.logits via the Logits intrinsic → must emit the full [N,V] logits, not the fused argmax-only
         forward_fn.invoke_set_logits_argmax_only(logits_argmax_only);
         const bool forward_handles_argmax =
             forward_fn.supports_fused_lmhead_argmax &&
@@ -2784,6 +3356,77 @@ void handle_fire_batch(
                 : nullptr);
 
         const auto t_h2d_end = clock::now();
+
+        // ── #6 WS8 P2: device-resident next-input inject ────────────────
+        // Source some of this fire's input tokens (`pi.tokens`) device-side from a
+        // PRIOR producer forward's retained `pi.sampled` (the next-input link), in
+        // place of a host-injected token — removing the host `output()`+copy between
+        // decode passes. Runs on the forward's stream so it strictly precedes the
+        // forward's `pi.tokens` read; event-gated on each producer's sample-done so
+        // the retained copy is ready cross-pass. The carrier groups entries by
+        // producer link id; one inject per distinct producer. A producer not in the
+        // retained map (e.g. its source pass hasn't run) is skipped.
+        if (!view.next_input_producer_links.empty()) {
+            const std::uint32_t* prod = view.next_input_producer_links.data();
+            const std::uint32_t* srcs = view.next_input_src_rows.data();
+            const std::uint32_t* dsts = view.next_input_dest_slots.data();
+            const std::size_t nlinks = view.next_input_producer_links.size();
+            std::size_t i = 0;
+            while (i < nlinks) {
+                const std::uint32_t link = prod[i];
+                std::vector<sampling_ir::NextInputLink> links;
+                for (; i < nlinks && prod[i] == link; ++i)
+                    links.push_back(sampling_ir::NextInputLink{srcs[i], dsts[i]});
+                auto it = executor.retained_next_input.find(link);
+                if (it != executor.retained_next_input.end()) {
+                    sampling_ir::inject_next_input_after(
+                        it->second.copy.data(), links, pi.tokens.data(),
+                        it->second.done, cublas.stream());
+                    // Plumbing-gate value-dump (charlie, PIE_DRAFTS_VERIFY): the
+                    // injected pi.tokens[dest_pos] must equal the retained window
+                    // (byte-identity through retain→inject) + src_rows==[0..=k].
+                    static const bool drafts_verify_inj =
+                        std::getenv("PIE_DRAFTS_VERIFY") != nullptr;
+                    if (drafts_verify_inj) {
+                        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+                        std::cerr << "[drafts-verify] INJECT link=" << link << " src_rows=[";
+                        for (std::size_t j = 0; j < links.size(); ++j)
+                            std::cerr << links[j].src_row << (j + 1 < links.size() ? "," : "");
+                        std::cerr << "] injected=[";
+                        for (std::size_t j = 0; j < links.size(); ++j) {
+                            std::int32_t v = 0;
+                            CUDA_CHECK(cudaMemcpy(&v, pi.tokens.data() + links[j].dest_pos,
+                                                  sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+                            std::cerr << v << (j + 1 < links.size() ? "," : "");
+                        }
+                        std::cerr << "]\n";
+                    }
+                    if (ir_trace)
+                        std::cerr << "[ir-trace] next-input INJECT link=" << link
+                                  << " rows=" << links.size() << " → pi.tokens\n";
+                } else {
+                    // #23 Part B(a) fence — retain-MISS = no retained source: the
+                    // producer pass is un-run or errored, so there is no buffer to
+                    // inject from. This is NOT a use-after-free: the deferred-free
+                    // (next_input_free_links, all-consumers-drained gate ~3690) frees
+                    // the retain-FOUND buffer strictly AFTER its counted inject drains,
+                    // so a freed buffer is never injected from; here there is simply no
+                    // buffer. The conditional read skips cleanly (no copy, no stream-
+                    // point — the consumer's forward graph is the stream-point and runs
+                    // regardless). The dst keeps its valid host placeholder (a stale,
+                    // hence DIVERGENT, token), but correctness is the #23 Part A host
+                    // cascade: this consumer's `consumed_producer_link` is unresolved
+                    // ⇒ fail-closed ⇒ effective_success=false ⇒ the divergent token is
+                    // rolled back, never committed. So: clean skip + cascade-abort, no
+                    // device flag, no race.
+                    if (ir_trace)
+                        std::cerr << "[ir-trace] next-input retain-miss link=" << link
+                                  << " rows=" << links.size()
+                                  << " → clean skip (producer un-run/errored; consumer "
+                                     "cascade-aborts via Part A fail-closed, no commit)\n";
+                }
+            }
+        }
 
         // ── Forward pass ────────────────────────────────────────
         // Either replay a captured CUDA graph or invoke `forward_fn.body`
@@ -2799,6 +3442,62 @@ void handle_fire_batch(
                       << " forward_R=" << forward_R << "\n";
             std::cerr.flush();
         }
+        // ── #27 cut #1 (b): WAR guard for single-buffer pi.sampled ───────
+        // The prior fast-path fire's eager-D2H (copy stream) READS pi.sampled;
+        // this fire's forward/sampler WRITES it (alloc-once, reused). Gate this
+        // fire's cublas-stream work behind the prior fire's eager-D2H read so the
+        // in-flight copy can't be clobbered. Placed before the forward dispatch
+        // (not only the dedicated sampler tail) so it also covers the
+        // fused-lm_head-argmax / captured-graph paths that write pi.sampled
+        // DURING the forward. nullptr ⇒ first fire / no prior fast-path read ⇒
+        // no wait. Near-zero cost: the prior one-token D2H has long completed by
+        // the time this fire's matmul is enqueued (it hides under H2D + compute).
+        if (executor.last_eager_d2h_done)
+            CUDA_CHECK(cudaStreamWaitEvent(cublas.stream(),
+                                           executor.last_eager_d2h_done, 0));
+
+        // ── G3 PART-2: mark this fire's first-kernel event (device-idle measure)
+        // ── + drain ready deferred measurements/frees. Only the (a2) single-Token
+        // fast-path goes back-to-back, so gate on the SAME eligibility the a2 block
+        // uses (below). The first-kernel event (recorded here, before the forward's
+        // first compute) pairs with the previous fire's retire event for the idle
+        // gap; the drain reclaims any pending pair whose first-kernel event
+        // completed. Held in `executor.g3_cur_first` (not a bare local) so an
+        // early-return handler path can't leak it — reclaimed here if stale.
+        const bool g3_a2 =
+            executor.g3_backtoback &&
+            !view.sampling_output_dst_ptrs.empty() &&
+            view.sampling_output_indptr.size() == static_cast<std::size_t>(R) + 1 &&
+            view.sampling_output_dst_ptrs.size() == static_cast<std::size_t>(R) &&
+            N >= 1;
+        if (g3_a2) {
+            g3_drain(executor, nullptr);
+            if (executor.g3_cur_first != nullptr)   // stale from an early-return fire
+                CUDA_CHECK(cudaEventDestroy(executor.g3_cur_first));
+            CUDA_CHECK(cudaEventCreateWithFlags(&executor.g3_cur_first, cudaEventDefault));
+            CUDA_CHECK(cudaEventRecord(executor.g3_cur_first, cublas.stream()));
+        }
+
+        auto dump_rs = [&](const char* tag) {
+            if (!std::getenv("PIE_RS_TRACE") || executor.rs_cache == nullptr ||
+                !use_slots || R < 1) return;
+            const int slot = static_cast<int>(rs_slot_view[0]);
+            std::uint32_t rw[4] = {0, 0, 0, 0}, cw[4] = {0, 0, 0, 0};
+            cudaMemcpy(rw, executor.rs_cache->recurrent_state_raw(0, slot),
+                       sizeof(rw), cudaMemcpyDeviceToHost);
+            cudaMemcpy(cw, executor.rs_cache->conv_state(0, slot),
+                       sizeof(cw), cudaMemcpyDeviceToHost);
+            std::cerr << "[rs-trace] " << tag << " req_id=" << req_id
+                      << " slot=" << slot
+                      << " bf16=" << executor.rs_cache->recurrent_state_bf16()
+                      << " N=" << N << " rs_is_fold=" << rs_is_fold
+                      << " rs_is_write=" << rs_is_write << std::hex
+                      << " recur16B=" << rw[0] << "," << rw[1] << "," << rw[2] << "," << rw[3]
+                      << " conv16B=" << cw[0] << "," << cw[1] << "," << cw[2] << "," << cw[3]
+                      << std::dec << "\n";
+        };
+        dump_rs("PRE ");
+
         const ForwardDispatchResult fd = run_forward_dispatch(
             executor, ForwardDispatchInputs{
                 .R = R,
@@ -2822,6 +3521,9 @@ void handle_fire_batch(
                 .h_kvlpl_forward = h_kvlpl_forward,
                 .slot_ids_h_data = slot_ids_h.data(),
                 .is_fresh_h_data = is_fresh_h.data(),
+                .rs_buffer_slot_ids_h = rs_is_write ? rs_buf_id_view.data() : nullptr,
+                .rs_buffer_slot_indptr_h = rs_is_write ? rs_buf_indptr_view.data() : nullptr,
+                .rs_buffer_write = rs_is_write,
                 .image_pixels_h = img_pixels_h,
                 .image_pixel_byte_indptr_h = img_pix_byte_indptr.data(),
                 .image_patch_positions_h = img_patch_pos.data(),
@@ -2839,6 +3541,7 @@ void handle_fire_batch(
             });
         const bool graph_captures_single_gpu_argmax =
             fd.graph_captures_single_gpu_argmax;
+        dump_rs("POST");
         if (ir_trace) {
             std::cerr << "[ir-trace] forward-returned req_id=" << req_id << "\n";
             std::cerr.flush();
@@ -2862,9 +3565,439 @@ void handle_fire_batch(
         // `pi.sampled[sample_row]`, so the existing D2H + response build below
         // marshal it like any other sampled token.
         sampling_ir::RunStatus ir_status = sampling_ir::RunStatus::NoProgram;
+
+        // ── #10 gate-1: merged multi-program custom path ─────────────────────
+        // A co-batched forward_R≥2 fire of DISTINCT custom programs (the
+        // cross-request masking case) carries one program per request: every
+        // sampling CSR (`sampling_program_bytes_indptr`, `sampling_input_indptr`,
+        // `sampling_late_indptr`, `sampling_binding_indptr`) is R+1 entries (the
+        // verified `extend_sampling_programs_from` N-merge). The single-program
+        // branch below reads only slice [0..1] (program 0) — for R≥2 that drops
+        // requests 1..R-1. Here we loop p∈[0,R): fire program p at its own sample
+        // row with its own [p..p+1] submit/late/manifest slices, then scatter that
+        // fire's output → per_req[p]. R=1 / num_programs≤1 skips this entirely and
+        // takes the byte-identical single-program path below. Engaged only for the
+        // clean all-custom fire (num_programs==R, every slice non-empty); a mixed
+        // or partial fire falls through to legacy (token-exact) — a later wave.
+        const std::uint32_t num_programs =
+            view.sampling_program_bytes_indptr.size() >= 1
+                ? static_cast<std::uint32_t>(
+                      view.sampling_program_bytes_indptr.size() - 1)
+                : 0u;
+        if (num_sampling > 0 && num_programs > 1 &&
+            num_programs == static_cast<std::uint32_t>(R) &&
+            !view.sampling_program_bytes.empty() && !program_recognized &&
+            ensure_sampling_ir_backend(executor) != nullptr) {
+            std::vector<pie_driver::PerRequestOutput> per_req(
+                static_cast<std::size_t>(R));
+            bool all_handled = true;
+            // #34 M-batch (env-gated, default OFF): group contiguous identical
+            // programs and fire them as ONE num_rows=N launch (fire-axis
+            // occupancy, 10-122x per the #10 bench). Env-off takes the
+            // byte-identical per-program loop below. Only the clean case
+            // M-batches — per-row variation is the device-alias mask(s), gathered
+            // into [N, byte_len] via the carrier byte-len (sampling_late_device_lens);
+            // any per-row submit/late-value host bytes, non-contiguous, or
+            // non-dense group fires individually. Composes onto the same N-row
+            // marshal (group_member = ProgramGroup.rows), zero marshal change.
+            const bool mbatch_enabled =
+                std::getenv("PIE_SAMPLING_IR_MBATCH") != nullptr;
+            bool mbatch_dispatched = false;
+            if (mbatch_enabled) {
+                auto* irb = ensure_sampling_ir_backend(executor);
+                struct ProgData {
+                    std::span<const std::uint8_t>          bytecode;
+                    std::vector<sampling_ir::SubmitInput>  submit_inputs;
+                    std::vector<sampling_ir::SubmitInput>  late_value_inputs;
+                    std::vector<sampling_ir::LateInput>    late_inputs;
+                    std::vector<std::uint32_t>             late_byte_lens;
+                    sampling_ir::ProgramManifest           manifest;
+                    int sample_row = 0;
+                    // Stage-2 MTP: the ws.logits row base of this program's K MTP
+                    // draft rows (an `IntrinsicKind::MtpLogits` [K,vocab] matrix
+                    // binding reads `[mtp_draft_row .. mtp_draft_row+K)`). -1 =
+                    // unset ⇒ the resolver falls back to `sample_row` (safe). The
+                    // MTP-head integration (Stage-1 real drafts / the argmax
+                    // stand-in) sets this from the draft layout once it writes the
+                    // K rows into ws.logits; until then it stays -1 (no-op).
+                    int mtp_draft_row = -1;
+                };
+                std::vector<ProgData> progs(num_programs);
+                std::vector<sampling_ir::ProgramHandle> handles(
+                    num_programs, sampling_ir::kInvalidProgram);
+                bool extract_ok = (irb != nullptr);
+                for (std::uint32_t p = 0; extract_ok && p < num_programs; ++p) {
+                    const std::uint32_t blo = view.sampling_program_bytes_indptr.data()[p];
+                    const std::uint32_t bhi = view.sampling_program_bytes_indptr.data()[p + 1];
+                    if (bhi <= blo) { extract_ok = false; break; }
+                    ProgData& pd = progs[p];
+                    pd.bytecode = {view.sampling_program_bytes.data() + blo,
+                                   static_cast<std::size_t>(bhi - blo)};
+                    pd.sample_row = static_cast<int>(h_qo[p] + h_sidx[h_sptr[p]]);
+                    if (view.sampling_input_indptr.size() > p + 1) {
+                        const std::uint32_t ilo = view.sampling_input_indptr.data()[p];
+                        const std::uint32_t ihi = view.sampling_input_indptr.data()[p + 1];
+                        const std::uint8_t* blob = view.sampling_input_blob.data();
+                        for (std::uint32_t i = ilo; i < ihi; ++i) {
+                            sampling_ir::SubmitInput si;
+                            si.key = view.sampling_input_keys.data()[i];
+                            si.data = blob + view.sampling_input_offsets.data()[i];
+                            si.len_bytes = view.sampling_input_lens.data()[i];
+                            pd.submit_inputs.push_back(si);
+                        }
+                    }
+                    if (view.sampling_late_indptr.size() > p + 1) {
+                        const std::uint32_t llo = view.sampling_late_indptr.data()[p];
+                        const std::uint32_t lhi = view.sampling_late_indptr.data()[p + 1];
+                        if (!view.sampling_late_blob.empty()) {
+                            const std::uint8_t* lblob = view.sampling_late_blob.data();
+                            for (std::uint32_t i = llo; i < lhi; ++i) {
+                                if (i >= view.sampling_late_lens.size()) break;
+                                if (view.sampling_late_lens.data()[i] == 0) continue;
+                                sampling_ir::SubmitInput li;
+                                li.key = view.sampling_late_keys.data()[i];
+                                li.data = lblob + view.sampling_late_offsets.data()[i];
+                                li.len_bytes = view.sampling_late_lens.data()[i];
+                                pd.late_value_inputs.push_back(li);
+                            }
+                        }
+                        if (!view.sampling_late_device_ptrs.empty()) {
+                            for (std::uint32_t i = llo; i < lhi; ++i) {
+                                if (i >= view.sampling_late_device_ptrs.size()) break;
+                                const std::uint64_t dptr = view.sampling_late_device_ptrs.data()[i];
+                                if (dptr == 0) continue;
+                                sampling_ir::LateInput li;
+                                li.key = view.sampling_late_keys.data()[i];
+                                li.device_ptr = reinterpret_cast<const void*>(
+                                    static_cast<std::uintptr_t>(dptr));
+                                li.elem_count = 0;
+                                pd.late_inputs.push_back(li);
+                                pd.late_byte_lens.push_back(
+                                    i < view.sampling_late_device_lens.size()
+                                        ? view.sampling_late_device_lens.data()[i] : 0u);
+                            }
+                        }
+                    }
+                    if (view.sampling_binding_indptr.size() > p + 1) {
+                        const std::uint32_t mlo = view.sampling_binding_indptr.data()[p];
+                        const std::uint32_t mhi = view.sampling_binding_indptr.data()[p + 1];
+                        pd.manifest.reserve(mhi - mlo);
+                        for (std::uint32_t i = mlo; i < mhi; ++i) {
+                            sampling_ir::InputBind b;
+                            const std::uint32_t bk = view.sampling_binding_kind.data()[i];
+                            if (bk == 1) {
+                                b.kind = sampling_ir::BindKind::HostTensor;
+                                b.host_key = view.sampling_binding_key.data()[i];
+                                b.ready = sampling_ir::HostAvailability::SubmitBound;
+                            } else {
+                                b.kind = sampling_ir::BindKind::Logits;
+                                if (bk == 2) b.intrinsic_kind = sampling_ir::Intrinsic::MtpLogits;
+                                else if (bk == 3) b.intrinsic_kind = sampling_ir::Intrinsic::MtpDrafts;
+                            }
+                            pd.manifest.push_back(b);
+                        }
+                    }
+                    handles[p] = irb->get_or_compile(pd.bytecode, pd.manifest);
+                    if (handles[p] == sampling_ir::kInvalidProgram) extract_ok = false;
+                }
+                if (extract_ok) {
+                    const auto groups = sampling_ir::partition_by_program(
+                        std::span<const sampling_ir::ProgramHandle>(handles));
+                    bool ok = true;
+                    bool late_miss = false;
+                    auto fire_one = [&](const ProgData& pd, std::uint32_t member) -> bool {
+                        sampling_ir::FireContext ctx;
+                        ctx.program_bytecode  = pd.bytecode;
+                        ctx.submit_inputs     = pd.submit_inputs;
+                        ctx.late_value_inputs = pd.late_value_inputs;
+                        ctx.late_inputs       = pd.late_inputs;
+                        ctx.manifest          = pd.manifest;
+                        ctx.logits            = ws.logits.data();
+                        ctx.pi                = &pi;
+                        ctx.vocab_size        = engine.hf_config().vocab_size;
+                        ctx.sample_row        = pd.sample_row;
+                        ctx.mtp_draft_row     = pd.mtp_draft_row;
+                        ctx.row_seeds         = pi.sample_seed.data() + pd.sample_row;
+                        ctx.prng_offset       = static_cast<std::uint64_t>(handled);
+                        ctx.stream            = cublas.stream();
+                        const sampling_ir::RunStatus st =
+                            executor.sampling_ir_runtime.try_run(ctx);
+                        if (st == sampling_ir::RunStatus::SkippedLateBindMiss) {
+                            late_miss = true; return false;
+                        }
+                        if (st != sampling_ir::RunStatus::Handled) return false;
+                        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+                        marshal_ir_program_output(
+                            executor.sampling_ir_runtime.last_interface(),
+                            executor.sampling_ir_runtime.last_output_ptrs(),
+                            1, std::span<const std::uint32_t>(&member, 1), per_req);
+                        // Drafts-channel retain at the FRESH point: this merged IR
+                        // path returns before the legacy 4290 retain, and out_scratch
+                        // is reused per fire — so retain `member`'s window HERE.
+                        retain_drafts_window_for_member(executor, view, member,
+                                                        cublas.stream());
+                        return true;
+                    };
+                    for (const auto& g : groups) {
+                        if (!ok) break;
+                        const std::uint32_t n = static_cast<std::uint32_t>(g.rows.size());
+                        const ProgData& head = progs[g.rows[0]];
+                        // Eligible: contiguous program indices, ≥2 rows, per-row
+                        // variation is ONLY device-alias masks, and the sample
+                        // rows are dense (head.sample_row + r) so num_rows=n strides.
+                        bool dense = sampling_ir::is_contiguous(g) && n >= 2 &&
+                                     head.submit_inputs.empty() &&
+                                     head.late_value_inputs.empty() &&
+                                     !head.late_inputs.empty();
+                        for (std::uint32_t r = 0; dense && r < n; ++r) {
+                            if (progs[g.rows[r]].sample_row !=
+                                head.sample_row + static_cast<int>(r))
+                                dense = false;
+                        }
+                        // #34: only single-[1]-Token-output programs M-batch today
+                        // — their N tokens land dense in pi.sampled[base+r], safe
+                        // with the 1-row scratch + the marshal guard. Rich outputs
+                        // (Scalar/Entropy/Logits/[k]) need the N-row scratch first →
+                        // fire individually (num_rows=1) until that lands.
+                        if (dense) {
+                            const auto& iface = irb->interface(handles[g.rows[0]]);
+                            for (const auto& od : iface.outputs)
+                                if (od.cls != sampling_ir::OutputClass::Token ||
+                                    od.elem_count > 1) { dense = false; break; }
+                        }
+                        bool mbatched = false;
+                        if (dense) {
+                            const std::size_t num_late = head.late_inputs.size();
+                            std::vector<void*> scratch(num_late, nullptr);
+                            std::vector<sampling_ir::LateInput> gathered(num_late);
+                            bool gather_ok = true;
+                            for (std::size_t j = 0; gather_ok && j < num_late; ++j) {
+                                const std::uint32_t blen = head.late_byte_lens[j];
+                                if (blen == 0) { gather_ok = false; break; }
+                                void* buf = nullptr;
+                                if (cudaMalloc(&buf, static_cast<std::size_t>(blen) * n)
+                                        != cudaSuccess) { gather_ok = false; break; }
+                                scratch[j] = buf;
+                                for (std::uint32_t r = 0; r < n; ++r) {
+                                    const ProgData& m = progs[g.rows[r]];
+                                    if (j >= m.late_inputs.size() ||
+                                        m.late_byte_lens[j] != blen) { gather_ok = false; break; }
+                                    CUDA_CHECK(cudaMemcpyAsync(
+                                        static_cast<std::uint8_t*>(buf) +
+                                            static_cast<std::size_t>(r) * blen,
+                                        m.late_inputs[j].device_ptr, blen,
+                                        cudaMemcpyDeviceToDevice, cublas.stream()));
+                                }
+                                gathered[j].key = head.late_inputs[j].key;
+                                gathered[j].device_ptr = buf;
+                                gathered[j].elem_count = 0;  // shape from InputDecl, strides/row
+                            }
+                            if (gather_ok) {
+                                sampling_ir::FireContext ctx;
+                                ctx.program_bytecode = head.bytecode;
+                                ctx.manifest         = head.manifest;
+                                ctx.late_inputs      = gathered;
+                                ctx.logits           = ws.logits.data();
+                                ctx.pi               = &pi;
+                                ctx.vocab_size       = engine.hf_config().vocab_size;
+                                ctx.sample_row       = head.sample_row;
+                                ctx.num_rows         = static_cast<int>(n);
+                                ctx.row_seeds        = pi.sample_seed.data() + head.sample_row;
+                                ctx.prng_offset      = static_cast<std::uint64_t>(handled);
+                                ctx.stream           = cublas.stream();
+                                const sampling_ir::RunStatus st =
+                                    executor.sampling_ir_runtime.try_run(ctx);
+                                if (st == sampling_ir::RunStatus::SkippedLateBindMiss) {
+                                    late_miss = true; ok = false;
+                                } else if (st != sampling_ir::RunStatus::Handled) {
+                                    ok = false;
+                                } else {
+                                    CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+                                    marshal_ir_program_output(
+                                        executor.sampling_ir_runtime.last_interface(),
+                                        executor.sampling_ir_runtime.last_output_ptrs(),
+                                        static_cast<int>(n),
+                                        std::span<const std::uint32_t>(g.rows.data(),
+                                                                       g.rows.size()),
+                                        per_req);
+                                    mbatched = true;
+                                    // #34 grouping witness (permanent diagnostic,
+                                    // under the ir-trace gate): proves the M-batch
+                                    // num_rows=N fire actually occupied — without it
+                                    // a silent fallback to per-row fire_one produces
+                                    // correct tokens but no occupancy (false green).
+                                    if (std::getenv("PIE_SAMPLING_IR_TRACE"))
+                                        std::cerr << "[ir-trace] mbatch group n=" << n
+                                                  << " sample_row=" << head.sample_row
+                                                  << "\n";
+                                }
+                            }
+                            for (void* b : scratch) if (b) cudaFree(b);
+                        }
+                        if (!ok) break;
+                        if (!mbatched) {
+                            for (std::uint32_t r = 0; r < n; ++r) {
+                                if (!fire_one(progs[g.rows[r]], g.rows[r])) { ok = false; break; }
+                            }
+                        }
+                    }
+                    if (late_miss) {
+                        std::cerr << "[pie-driver-cuda] sampling-ir late-bind miss "
+                                     "(mbatch), req_id=" << req_id << " — discarding fire\n";
+                        out_resp = pie_driver::PieForwardResponseView{};
+                        return;
+                    }
+                    all_handled = ok;
+                    mbatch_dispatched = true;  // M-batch owned the dispatch (no re-run)
+                }
+            }
+            if (!mbatch_dispatched)
+            for (std::uint32_t p = 0; p < num_programs && all_handled; ++p) {
+                const std::uint32_t blo =
+                    view.sampling_program_bytes_indptr.data()[p];
+                const std::uint32_t bhi =
+                    view.sampling_program_bytes_indptr.data()[p + 1];
+                if (bhi <= blo) { all_handled = false; break; }  // empty (mixed fire)
+                const int sample_row =
+                    static_cast<int>(h_qo[p] + h_sidx[h_sptr[p]]);
+
+                std::vector<sampling_ir::SubmitInput> submit_inputs;
+                if (view.sampling_input_indptr.size() > p + 1) {
+                    const std::uint32_t ilo = view.sampling_input_indptr.data()[p];
+                    const std::uint32_t ihi = view.sampling_input_indptr.data()[p + 1];
+                    const std::uint8_t* blob = view.sampling_input_blob.data();
+                    for (std::uint32_t i = ilo; i < ihi; ++i) {
+                        sampling_ir::SubmitInput si;
+                        si.key = view.sampling_input_keys.data()[i];
+                        si.data = blob + view.sampling_input_offsets.data()[i];
+                        si.len_bytes = view.sampling_input_lens.data()[i];
+                        submit_inputs.push_back(si);
+                    }
+                }
+
+                std::vector<sampling_ir::SubmitInput> late_value_inputs;
+                std::vector<sampling_ir::LateInput> late_inputs;
+                if (view.sampling_late_indptr.size() > p + 1) {
+                    const std::uint32_t llo = view.sampling_late_indptr.data()[p];
+                    const std::uint32_t lhi = view.sampling_late_indptr.data()[p + 1];
+                    if (!view.sampling_late_blob.empty()) {
+                        const std::uint8_t* lblob = view.sampling_late_blob.data();
+                        for (std::uint32_t i = llo; i < lhi; ++i) {
+                            if (i >= view.sampling_late_lens.size()) break;
+                            if (view.sampling_late_lens.data()[i] == 0) continue;
+                            sampling_ir::SubmitInput li;
+                            li.key = view.sampling_late_keys.data()[i];
+                            li.data = lblob + view.sampling_late_offsets.data()[i];
+                            li.len_bytes = view.sampling_late_lens.data()[i];
+                            late_value_inputs.push_back(li);
+                        }
+                    }
+                    if (!view.sampling_late_device_ptrs.empty()) {
+                        for (std::uint32_t i = llo; i < lhi; ++i) {
+                            if (i >= view.sampling_late_device_ptrs.size()) break;
+                            const std::uint64_t dptr =
+                                view.sampling_late_device_ptrs.data()[i];
+                            if (dptr == 0) continue;  // rides the staged path
+                            sampling_ir::LateInput li;
+                            li.key = view.sampling_late_keys.data()[i];
+                            li.device_ptr = reinterpret_cast<const void*>(
+                                static_cast<std::uintptr_t>(dptr));
+                            li.elem_count = 0;  // shape from the program InputDecl
+                            late_inputs.push_back(li);
+                        }
+                    }
+                }
+
+                sampling_ir::ProgramManifest manifest;
+                if (view.sampling_binding_indptr.size() > p + 1) {
+                    const std::uint32_t mlo = view.sampling_binding_indptr.data()[p];
+                    const std::uint32_t mhi = view.sampling_binding_indptr.data()[p + 1];
+                    manifest.reserve(mhi - mlo);
+                    for (std::uint32_t i = mlo; i < mhi; ++i) {
+                        sampling_ir::InputBind b;
+                        const std::uint32_t bk = view.sampling_binding_kind.data()[i];
+                        if (bk == 1 /* KIND_TENSOR */) {
+                            b.kind = sampling_ir::BindKind::HostTensor;
+                            b.host_key = view.sampling_binding_key.data()[i];
+                            b.ready = sampling_ir::HostAvailability::SubmitBound;
+                        } else {
+                            b.kind = sampling_ir::BindKind::Logits;
+                            if (bk == 2 /* KIND_MTP_LOGITS */)
+                                b.intrinsic_kind = sampling_ir::Intrinsic::MtpLogits;
+                        }
+                        manifest.push_back(b);
+                    }
+                }
+
+                sampling_ir::FireContext ctx;
+                ctx.program_bytecode = {
+                    view.sampling_program_bytes.data() + blo,
+                    static_cast<std::size_t>(bhi - blo)};
+                ctx.submit_inputs = submit_inputs;
+                ctx.late_value_inputs = late_value_inputs;
+                ctx.late_inputs = late_inputs;
+                ctx.manifest = std::move(manifest);
+                ctx.logits = ws.logits.data();
+                ctx.pi = &pi;
+                ctx.vocab_size = engine.hf_config().vocab_size;
+                ctx.sample_row = sample_row;
+                ctx.row_seeds = pi.sample_seed.data() + sample_row;
+                ctx.prng_offset = static_cast<std::uint64_t>(handled);
+                ctx.stream = cublas.stream();
+
+                const sampling_ir::RunStatus st =
+                    executor.sampling_ir_runtime.try_run(ctx);
+                if (st == sampling_ir::RunStatus::SkippedLateBindMiss) {
+                    // spec §7.4: late-bind miss → discard + retry, fail loud.
+                    std::cerr << "[pie-driver-cuda] sampling-ir late-bind miss "
+                                 "(merged p=" << p << "), req_id=" << req_id
+                              << " — discarding fire\n";
+                    out_resp = pie_driver::PieForwardResponseView{};
+                    return;
+                }
+                if (st != sampling_ir::RunStatus::Handled) {
+                    all_handled = false;
+                    break;
+                }
+                // Each fire reuses the runtime's out_scratch / last_output_ptrs;
+                // sync + marshal THIS program before the next fire overwrites it.
+                CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+                // Individual fire (num_rows=1): the one row maps to per_req[p].
+                // An M-batch fire of a contiguous identical group would instead
+                // pass num_rows=N + group_member=ProgramGroup.rows here.
+                const std::uint32_t member = p;
+                marshal_ir_program_output(
+                    executor.sampling_ir_runtime.last_interface(),
+                    executor.sampling_ir_runtime.last_output_ptrs(),
+                    /*num_rows=*/1, std::span<const std::uint32_t>(&member, 1),
+                    per_req);
+                // Drafts-channel retain at the FRESH point (fallback IR loop; same
+                // reasoning — out_scratch is reused, this path returns before 4290).
+                retain_drafts_window_for_member(executor, view, member,
+                                                cublas.stream());
+            }
+            if (all_handled) {
+                if (std::getenv("PIE_SAMPLING_IR_TRACE")) {
+                    std::cerr << "[ir-trace] de-hardwire merged multi-program "
+                                 "HANDLED programs=" << num_programs
+                              << " R=" << R << "\n";
+                }
+                // This path returns before the legacy-sampler timing markers; the
+                // per-fire cudaStreamSynchronize above already drained the work, so
+                // stamp kernel-launch/sync probes with the IR-completion time.
+                const auto t_ir_done = clock::now();
+                executor.response_builder.build(per_req, out_resp);
+                write_probes(out_resp, executor, t_entry, t_wire_parse_end, t_plan_end,
+                             t_h2d_end, t_ir_done, t_ir_done);
+                return;
+            }
+            // partial / mixed fire → fall through to single-program + legacy.
+        }
+
         if (num_sampling > 0 &&
             view.sampling_program_bytes_indptr.size() >= 2 &&
             !view.sampling_program_bytes.empty() &&
+            !program_recognized &&  // #12: recognized standard → dedicated ladder, not CustomJIT
             ensure_sampling_ir_backend(executor) != nullptr) {
             const std::uint32_t blo = view.sampling_program_bytes_indptr.data()[0];
             const std::uint32_t bhi = view.sampling_program_bytes_indptr.data()[1];
@@ -2913,18 +4046,185 @@ void handle_fire_batch(
                 }
             }
 
+            // Host-late DEVICE-ALIAS inputs for program 0 (#27 cut #2 (B) direct
+            // H2D): a Late tensor (the grammar mask) is written straight to a
+            // device buffer by the host (`pie_tensor_write_async` from the guest's
+            // WASM-memory slice — @ingim's inferlet→GPU memcpy) and carried here as
+            // a device ptr in `sampling_late_device_ptrs`, NOT bytes in
+            // `sampling_late_blob`. Register one LateInput per late key whose
+            // device ptr != 0 so the runtime's HostLate device-alias branch
+            // resolves it. The host pre-syncs the (sequential) H2D before submit,
+            // so the buffer is resident this fire ("already on device" contract);
+            // the carried `sampling_late_device_flags` R12 self-arm is for the
+            // true-async follow-up. A late key with neither a staged value nor a
+            // device ptr resolves to SkippedLateBindMiss (loud, never stale).
+            std::vector<sampling_ir::LateInput> late_inputs;
+            if (view.sampling_late_indptr.size() >= 2 &&
+                !view.sampling_late_device_ptrs.empty()) {
+                const std::uint32_t llo = view.sampling_late_indptr.data()[0];
+                const std::uint32_t lhi = view.sampling_late_indptr.data()[1];
+                for (std::uint32_t i = llo; i < lhi; ++i) {
+                    if (i >= view.sampling_late_device_ptrs.size()) break;
+                    const std::uint64_t dptr =
+                        view.sampling_late_device_ptrs.data()[i];
+                    if (dptr == 0) continue;  // this key rides the staged path
+                    sampling_ir::LateInput li;
+                    li.key = view.sampling_late_keys.data()[i];
+                    li.device_ptr = reinterpret_cast<const void*>(
+                        static_cast<std::uintptr_t>(dptr));
+                    li.elem_count = 0;  // shape taken from the program's InputDecl
+                    late_inputs.push_back(li);
+                }
+            }
+
             sampling_ir::FireContext ctx;
             ctx.program_bytecode = {
                 view.sampling_program_bytes.data() + blo,
                 static_cast<std::size_t>(bhi - blo)};
             ctx.submit_inputs = submit_inputs;
             ctx.late_value_inputs = late_value_inputs;
+            ctx.late_inputs = late_inputs;
+            // v4 binding manifest for program 0: the per-slot binding-map (Logits
+            // intrinsic vs keyed HostTensor) the binding-free v4 bytecode omits.
+            // Without it, get_or_compile routes to the v3 self-binding decoder,
+            // which rejects version 4 ("decode failed: version 4").
+            sampling_ir::ProgramManifest manifest;
+            bool has_mtp_logits = false;
+            bool has_mtp_drafts = false;
+            if (view.sampling_binding_indptr.size() >= 2) {
+                const std::uint32_t mlo = view.sampling_binding_indptr.data()[0];
+                const std::uint32_t mhi = view.sampling_binding_indptr.data()[1];
+                manifest.reserve(mhi - mlo);
+                for (std::uint32_t i = mlo; i < mhi; ++i) {
+                    sampling_ir::InputBind b;
+                    // Wire kind (bravo's carrier): 0=Logits, 1=Tensor, 2=MtpLogits.
+                    // MUST switch on the explicit kind — a `!= 0` test mis-routes
+                    // the new MtpLogits(2) into HostTensor (charlie's latent-bug
+                    // catch). MtpLogits is payload-less (binding_key=0); it stays
+                    // a Logits-class intrinsic, only stamping intrinsic_kind so the
+                    // codegen → delta's jit_backend wire → runtime resolver reads
+                    // the DRAFT row. `intrinsic_kind`/`Intrinsic::MtpLogits` come
+                    // from charlie's 970bfdcd (resolved in the consolidation fold).
+                    const std::uint32_t bk = view.sampling_binding_kind.data()[i];
+                    if (bk == 1 /* KIND_TENSOR */) {
+                        b.kind = sampling_ir::BindKind::HostTensor;
+                        b.host_key = view.sampling_binding_key.data()[i];
+                        b.ready = sampling_ir::HostAvailability::SubmitBound;
+                    } else {
+                        b.kind = sampling_ir::BindKind::Logits;
+                        if (bk == 2 /* KIND_MTP_LOGITS */) {
+                            b.intrinsic_kind = sampling_ir::Intrinsic::MtpLogits;
+                            has_mtp_logits = true;
+                        } else if (bk == 3 /* KIND_MTP_DRAFTS */) {
+                            // Device-resident spec-decode drafts (echo's I32 [k]
+                            // MtpDrafts intrinsic): a Logits-class intrinsic like
+                            // MtpLogits, but resolved to `ctx.mtp_drafts` (bravo's
+                            // retained buffer), NOT a ws.logits row. Payload-less.
+                            b.intrinsic_kind = sampling_ir::Intrinsic::MtpDrafts;
+                            has_mtp_drafts = true;
+                        }
+                    }
+                    manifest.push_back(b);
+                }
+            }
+            ctx.manifest = std::move(manifest);
             ctx.logits = ws.logits.data();
             ctx.pi = &pi;
             ctx.vocab_size = engine.hf_config().vocab_size;
             ctx.sample_row = sample_row;
+            // Ambient per-row RNG seed S (Model B) for custom RNG programs (e.g.
+            // mirostat's Op::Rng). The de-hardwiring/#10 path sets this at its group
+            // base; the custom-program path must too, else a sampling custom's
+            // RowSeed buffer is unbound at launch (jit_backend bind_external skips it
+            // when args.row_seeds==nullptr). sample_row indexes the [N] seed block
+            // (= the seed legacy sample_temp uses for this row). Non-RNG customs
+            // (e.g. grammar's masked-argmax) declare no RowSeed and ignore it.
+            ctx.row_seeds = pi.sample_seed.data() + sample_row;
             ctx.prng_offset = static_cast<std::uint64_t>(handled);
             ctx.stream = cublas.stream();
+            // Stage-2 MTP: if this program binds `Intrinsic::MtpLogits`, run the
+            // native MTP head to produce K contiguous draft-logit rows at the
+            // reserved ws.logits tail and point the intrinsic there. The K drafts
+            // are the model's fresh proposals from the END of the verify window
+            // (its last token = row N-1). K = the native drafter's draft count,
+            // clamped to the reserved tail. -1 (the stub default) if unset.
+            if (has_mtp_logits && executor.system_drafter.draft_step &&
+                N >= 1 && !pos_view.empty()) {
+                const int reserve = tensor_rows(ws.logits) - ws.mtp_draft_row_base;
+                int K = executor.system_drafter.max_drafts;
+                if (K > reserve) K = reserve;
+                if (K > 0 && N >= 1) {
+                    // ANCHOR = the BONUS position (bravo's Stage-2 contract): out[1]
+                    // feeds the NEXT window as [seed, drafts] where seed =
+                    // committed.last() = the BONUS token = the target's greedy at the
+                    // LAST verify row (the definitely-committed next token). So the
+                    // MTP drafts must extend FROM the bonus: token(p+1) = bonus token
+                    // = argmax(logits[last verify row = sample_row+K]); hidden(p) =
+                    // ws.y row N-1 (the last window row, position base_position);
+                    // first draft = base_position+2. (Anchoring at the last WINDOW
+                    // token — a possibly-rejected draft — conditions one position too
+                    // early → the 0-draft-accept baseline.)
+                    const int base_position =
+                        static_cast<int>(pos_view[static_cast<std::size_t>(N - 1)]);
+                    // #17-(b) anchor fix (charlie, guru-diagnosed): the seed anchor is
+                    // the fire's LAST written target-logits row. For a verify fire
+                    // (k+1 window @ sample_row=0) that's `sample_row + K` (the bonus).
+                    // For the fire-0 BOOTSTRAP (M=1 over the PROMPT, sample_row = the
+                    // prompt's last row) there is NO k+1 verify window, so `sample_row
+                    // + K` indexes K rows PAST the last written row → argmax over an
+                    // UNWRITTEN row → 0 → the zero-cascade charlie's A/B caught. Clamp
+                    // to `N-1` (the last written row) so the anchor derives from the
+                    // fire's ACTUAL window shape, not the constant K.
+                    const int seed_logit_row  = std::min(sample_row + K, N - 1);
+                    const int base_hidden_row = N - 1;
+                    const int source_position = base_position;
+                    // The MTP attention indexes kv_page_indptr[request_ids[·]], so
+                    // request_ids must be the BATCH-LOCAL request index [0,R) — NOT
+                    // the global req_id (65536), which OOBs the [R+1] page-indptr.
+                    // The single-program MVP path is request 0.
+                    const int batch_req_index = 0;
+                    if (std::getenv("PIE_MTP_SEED_TRACE") != nullptr) {
+                        std::cerr << "[mtp-seed] fire: sample_row=" << sample_row
+                                  << " K=" << K << " seed_logit_row=" << seed_logit_row
+                                  << " N=" << N << " last_written_row=" << (N - 1)
+                                  << " mtp_draft_row_base=" << ws.mtp_draft_row_base
+                                  << " (seed_logit_row " << (seed_logit_row > N - 1 ? ">PAST" : "<=OK")
+                                  << " last_written)\n";
+                    }
+                    if (produce_mtp_draft_logits(
+                            executor, K, base_hidden_row, seed_logit_row,
+                            source_position, batch_req_index, ws.mtp_draft_row_base,
+                            cublas.stream())) {
+                        ctx.mtp_draft_row = ws.mtp_draft_row_base;
+                    }
+                }
+            }
+            // Device-resident spec-decode drafts (echo/pipe-audit/charlie (b)):
+            // if this program binds `Intrinsic::MtpDrafts`, source-select bravo's
+            // retained `mtp_drafts` — rows 1..=k of the `[k+1]` `[seed, drafts]`
+            // window the PRIOR fire retained under this request's carrier link
+            // (row 0 = seed, skipped) — as the verify's `draft` operand. This is
+            // the SAME retained buffer the forward-input inject (~3308) reads, so
+            // the carrier link is `next_input_producer_links[0]` (single-program
+            // MVP = request 0). Same copy-stream (`cublas.stream()`) as the retain
+            // ⇒ ordered; the retain event is waited for cross-fire safety.
+            // SEAM (charlie ⇄ bravo ⇄ pipe-audit): validated jointly with the
+            // guest mtp_specdecode_device loop + the accepted-tok/s A/B.
+            if (has_mtp_drafts && !view.next_input_producer_links.empty()) {
+                const std::uint32_t link = view.next_input_producer_links.data()[0];
+                auto it = executor.retained_next_input.find(link);
+                if (it != executor.retained_next_input.end() &&
+                    it->second.copy.size() >= 2) {
+                    ctx.mtp_drafts = it->second.copy.data() + 1;  // skip seed@row0
+                    ctx.mtp_drafts_count = it->second.copy.size() - 1;  // [k]
+                    if (it->second.done)
+                        CUDA_CHECK(cudaStreamWaitEvent(
+                            cublas.stream(), it->second.done, 0));
+                    if (ir_trace)
+                        std::cerr << "[ir-trace] mtp-drafts source-select link="
+                                  << link << " k=" << ctx.mtp_drafts_count << "\n";
+                }
+            }
             ir_status = executor.sampling_ir_runtime.try_run(ctx);
         }
         // De-hardwiring branch (Task #4 / #10 cross-request batching): a fire whose
@@ -3116,6 +4416,114 @@ void handle_fire_batch(
             }
         }
 
+        // ── #6 WS8 P2: device-resident next-input retain ────────────────
+        // PER-REQUEST (thrust-2 Bug#2, bravo — UNTESTED CUDA, needs GPU verify):
+        // each producer REQUEST retains ITS OWN row-slice `[qo_indptr[r],
+        // qo_indptr[r+1])` of `pi.sampled` under ITS OWN link. The old scalar path
+        // retained all N rows under `view.pipeline_source_link` = the LAST request's
+        // id (the host merge overwrote it), so R>1 co-batched producers collapsed:
+        // earlier producers' tokens were never retained → their consumers
+        // retain-missed → placeholder token 0 (or the last link's row-0 token
+        // cross-injected, 9707) → wrong Q&K → garbage. Retaining each request's
+        // row-slice (indexed 0-based) preserves the inject/`src_row` contract: a
+        // consumer reads `retained[L_r][src_row]` where `src_row` is the row WITHIN
+        // request r (the builder's `n_rows-1`), now relative to that slice.
+        if (view.pipeline_source_links.as<std::uint32_t>().size() > 0 && N > 0) {
+            const auto psl_view = view.pipeline_source_links.as<std::uint32_t>();
+            const auto qo_psl_view = view.qo_indptr.as<std::uint32_t>();
+            for (std::size_t r = 0;
+                 r + 1 < qo_psl_view.size() && r < psl_view.size(); ++r) {
+                const std::uint32_t link = psl_view[r];
+                if (link == 0) continue;
+                const std::int64_t lo = static_cast<std::int64_t>(qo_psl_view[r]);
+                const std::int64_t hi = static_cast<std::int64_t>(qo_psl_view[r + 1]);
+                const std::int64_t rows = hi - lo;
+                if (rows <= 0 || hi > static_cast<std::int64_t>(N)) continue;
+                // Drafts-channel routing (§9): `pipeline_source_kind == 1` (PrevDrafts)
+                // → retain the PROGRAM-composed `[k+1]` `[seed, drafts]` window
+                // (out[2]=seed→row0, out[1]=drafts[k]→rows1..k) instead of
+                // `pi.sampled[lo:hi]`. PER-LINK COPY on the single FIFO copy-stream
+                // (`cublas.stream()`) ⇒ WAR-impossible by construction (§9 cond-2);
+                // the tag is pure routing. Defensive: fall through to `pi.sampled`
+                // if the program's 3 outputs aren't present (non-drafts fire).
+                const auto psk_view = view.pipeline_source_kinds.as<std::uint8_t>();
+                const std::uint8_t src_kind =
+                    (r < psk_view.size()) ? psk_view[r] : view.pipeline_source_kind;
+                if (src_kind == 1) {
+                    auto out_ptrs = executor.sampling_ir_runtime.last_output_ptrs();
+                    const auto* iface = executor.sampling_ir_runtime.last_interface();
+                    if (out_ptrs.size() >= 3 && iface != nullptr &&
+                        iface->outputs.size() >= 3) {
+                        const std::size_t k = iface->outputs[1].elem_count; // drafts [k]
+                        const std::size_t k1 = k + 1;                       // [seed, drafts]
+                        Executor::RetainedSampled& ret = executor.retained_next_input[link];
+                        if (ret.copy.size() < k1)
+                            ret.copy = DeviceBuffer<std::int32_t>::alloc(k1);
+                        if (ret.done == nullptr) CUDA_CHECK(cudaEventCreate(&ret.done));
+                        // seed (out[2], 1 elem) → row 0
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            ret.copy.data(), out_ptrs[2], sizeof(std::int32_t),
+                            cudaMemcpyDeviceToDevice, cublas.stream()));
+                        // drafts (out[1], k elems) → rows 1..k
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            ret.copy.data() + 1, out_ptrs[1],
+                            sizeof(std::int32_t) * k,
+                            cudaMemcpyDeviceToDevice, cublas.stream()));
+                        CUDA_CHECK(cudaEventRecord(ret.done, cublas.stream()));
+                        // Plumbing-gate value-dump (charlie, PIE_DRAFTS_VERIFY): the
+                        // retained [k+1] window = [seed, drafts]. Gated (D2H sync) — test only.
+                        static const bool drafts_verify =
+                            std::getenv("PIE_DRAFTS_VERIFY") != nullptr;
+                        if (drafts_verify) {
+                            CUDA_CHECK(cudaEventSynchronize(ret.done));
+                            std::vector<std::int32_t> host(k1);
+                            CUDA_CHECK(cudaMemcpy(host.data(), ret.copy.data(),
+                                                  sizeof(std::int32_t) * k1,
+                                                  cudaMemcpyDeviceToHost));
+                            std::cerr << "[drafts-verify] RETAIN link=" << link
+                                      << " window[k+1]=[";
+                            for (std::size_t j = 0; j < host.size(); ++j)
+                                std::cerr << host[j] << (j + 1 < host.size() ? "," : "");
+                            std::cerr << "]\n";
+                        }
+                        if (ir_trace)
+                            std::cerr << "[ir-trace] next-input RETAIN (drafts [k+1]) link="
+                                      << link << " req=" << r << " k=" << k << "\n";
+                        continue;
+                    }
+                    // else: 3 outputs unavailable ⇒ fall through to pi.sampled.
+                }
+                Executor::RetainedSampled& ret = executor.retained_next_input[link];
+                if (ret.copy.size() < static_cast<std::size_t>(rows))
+                    ret.copy = DeviceBuffer<std::int32_t>::alloc(static_cast<std::size_t>(rows));
+                if (ret.done == nullptr) CUDA_CHECK(cudaEventCreate(&ret.done));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    ret.copy.data(), pi.sampled.data() + lo,
+                    sizeof(std::int32_t) * static_cast<std::size_t>(rows),
+                    cudaMemcpyDeviceToDevice, cublas.stream()));
+                CUDA_CHECK(cudaEventRecord(ret.done, cublas.stream()));
+                if (ir_trace)
+                    std::cerr << "[ir-trace] next-input RETAIN (per-req) link=" << link
+                              << " req=" << r << " rows=" << rows << "\n";
+            }
+        } else if (view.pipeline_source_link != 0 && N > 0) {
+            // Back-compat scalar path (empty `pipeline_source_links`, e.g. a
+            // pre-fix caller): retain the whole `pi.sampled[N]` under one link.
+            Executor::RetainedSampled& r =
+                executor.retained_next_input[view.pipeline_source_link];
+            if (r.copy.size() < static_cast<std::size_t>(N))
+                r.copy = DeviceBuffer<std::int32_t>::alloc(static_cast<std::size_t>(N));
+            if (r.done == nullptr) CUDA_CHECK(cudaEventCreate(&r.done));
+            CUDA_CHECK(cudaMemcpyAsync(
+                r.copy.data(), pi.sampled.data(),
+                sizeof(std::int32_t) * static_cast<std::size_t>(N),
+                cudaMemcpyDeviceToDevice, cublas.stream()));
+            CUDA_CHECK(cudaEventRecord(r.done, cublas.stream()));
+            if (ir_trace)
+                std::cerr << "[ir-trace] next-input RETAIN (scalar back-compat) link="
+                          << view.pipeline_source_link << " rows=" << N << "\n";
+        }
+
         // Sample plan was built above the prepare hook (hoisted so the
         // sampling uploads are ready before the forward graph launch). The host
         // variables (`need_msgpack`, `per_slot_*`, `any_topk_topp`,
@@ -3137,8 +4545,223 @@ void handle_fire_batch(
                                    cublas.stream()));
         const auto t_kernel_launch_end = clock::now();
         verify_timer.finish(cublas.stream());
-        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+        // G3 PART-2: decide back-to-back for THIS fire. `g3_a2` (outer a2
+        // eligibility) recorded `g3_first`; here we also validate the per-request
+        // a2 conditions (the same checks the a2 block re-runs below as `all_ok`) so
+        // that skipping the sync ⟺ the a2 fast-return IS taken — never leaving a
+        // synchronous fall-through path un-synced.
+        bool g3_go = g3_a2 &&
+            view.sampling_output_dst_lens.size() >= static_cast<std::size_t>(R);
+        if (g3_go) {
+            for (int r = 0; r < R; ++r) {
+                const std::uint64_t dst = view.sampling_output_dst_ptrs.data()[r];
+                const std::uint32_t cap = view.sampling_output_dst_lens.data()[r];
+                const int row = static_cast<int>(h_qo[r + 1]) - 1;
+                if (dst == 0 || cap < sizeof(std::int32_t) || row < 0 || row >= N) {
+                    g3_go = false;
+                    break;
+                }
+            }
+        }
+        // On the back-to-back a2 fast-path DON'T block the launch thread on the
+        // compute sync — record this fire's retire event (pairs with the next
+        // fire's first-kernel event for the device-idle gap) + push the deferred
+        // measurement/free item, and let fire N+1's forward enqueue behind this one
+        // on cublas.stream (stream-ordered → bubble→0). The response is still sent
+        // off-thread by the a2 copy-stream host-func (below); the retained-next-
+        // input free is deferred (gated on g3_first) rather than run inline under
+        // the now-absent sync.
+        if (g3_go) {
+            cudaEvent_t g3_retire = nullptr;
+            CUDA_CHECK(cudaEventCreateWithFlags(&g3_retire, cudaEventDefault));
+            CUDA_CHECK(cudaEventRecord(g3_retire, cublas.stream()));
+            Executor::G3Pending gp;
+            gp.idle_from = executor.g3_prev_retire;
+            gp.idle_to = executor.g3_cur_first;   // move ownership into the pending pair
+            executor.g3_cur_first = nullptr;
+            const std::uint32_t* fl = view.next_input_free_links.data();
+            gp.free_links.assign(fl, fl + view.next_input_free_links.size());
+            executor.g3_pending.push_back(std::move(gp));
+            executor.g3_prev_retire = g3_retire;
+        } else {
+            // Not going back-to-back this fire (default, or the a2 inner check
+            // failed): sync as usual. If a first-kernel event was recorded (g3_a2)
+            // but we're not going, drop it — no pending pair references it.
+            if (executor.g3_cur_first != nullptr) {
+                CUDA_CHECK(cudaEventDestroy(executor.g3_cur_first));
+                executor.g3_cur_first = nullptr;
+            }
+            CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
+        }
         const auto t_sync_end = clock::now();
+
+        // ── #6 WS8 P2: free retained next-input sources signaled this pass ──
+        // The host appends a producer link id to `next_input_free_links` once its
+        // LAST consumer drained (whose inject read the retained copy above). The
+        // stream sync just completed → that inject finished → freeing the retained
+        // buffer + its event is hazard-free, and the global id is reclaimable.
+        // Driver is count-agnostic: it frees strictly on the host signal.
+        // G3 PART-2: skipped when back-to-back (g3_go) — there was no sync, so the
+        // free is deferred into the pending item above and processed by `g3_drain`
+        // once the fire's retire event completes (the consuming inject has drained).
+        if (!g3_go && !view.next_input_free_links.empty()) {
+            const std::uint32_t* freed = view.next_input_free_links.data();
+            const std::size_t nfree = view.next_input_free_links.size();
+            for (std::size_t k = 0; k < nfree; ++k) {
+                auto it = executor.retained_next_input.find(freed[k]);
+                if (it != executor.retained_next_input.end()) {
+                    if (it->second.done != nullptr)
+                        CUDA_CHECK(cudaEventDestroy(it->second.done));
+                    executor.retained_next_input.erase(it);  // DeviceBuffer dtor frees the copy
+                    if (ir_trace)
+                        std::cerr << "[ir-trace] next-input FREE link=" << freed[k]
+                                  << " (host all-consumers-drained signal)\n";
+                }
+            }
+        }
+
+        // ── #27 cut #1 (a2): output→tensor fast-path ─────────────────────
+        // If the host bound per-output pinned dsts (`sampling_output_dst_ptrs`),
+        // eager-D2H each program's output VALUE into its dst on the tensor-I/O
+        // copy stream and DEFER the forward-done to a copy-stream host-func — it
+        // fires once the pinned buffer is filled (the (a2) seam; the host's
+        // output() reads the pinned bytes, not the ForwardResponse channels).
+        // MVP slice: one Token per program (the greedy `cuda_runahead` path) →
+        // device_src = pi.sampled[p]. Multi-output / rich programs fall through to
+        // the legacy marshal below (a follow-on wires last_output_ptrs()).
+        if (!view.sampling_output_dst_ptrs.empty() &&
+            view.sampling_output_indptr.size() == static_cast<std::size_t>(R) + 1 &&
+            view.sampling_output_dst_ptrs.size() == static_cast<std::size_t>(R) && N >= 1) {
+            // (a2) eager-D2H the sampled Token of EVERY co-batched request into its
+            // own pinned dst. Extends the single-request MVP to R>1: request r's
+            // token is pi.sampled at its last sampled input row (h_qo[r+1]-1). The
+            // runtime enables the per-request pinned-read fast-path for co-batched
+            // fires (scheduler all_fast_path), so filling only 1 dst (the old
+            // size()==1 gate) left the other R-1 requests reading an UNFILLED pinned
+            // buffer = 0 → wrong sampled token → wrong next input → garbage.
+            std::vector<std::uint64_t> dsts(static_cast<std::size_t>(R));
+            std::vector<std::uint32_t> caps(static_cast<std::size_t>(R));
+            std::vector<const void*> srcs(static_cast<std::size_t>(R));
+            std::vector<std::size_t> nbytes(static_cast<std::size_t>(R),
+                                            sizeof(std::int32_t));
+            bool all_ok = true;
+            for (int r = 0; r < R; ++r) {
+                dsts[r] = view.sampling_output_dst_ptrs.data()[r];
+                caps[r] = view.sampling_output_dst_lens.data()[r];
+                const int row = static_cast<int>(h_qo[r + 1]) - 1;  // r's last sampled row
+                if (dsts[r] == 0 || caps[r] < sizeof(std::int32_t) ||
+                    row < 0 || row >= N) {
+                    all_ok = false;
+                    break;
+                }
+                srcs[r] = static_cast<const void*>(pi.sampled.data() + row);
+            }
+            if (all_ok) {
+                cudaEvent_t sample_done = nullptr;
+                CUDA_CHECK(cudaEventCreateWithFlags(&sample_done,
+                                                    cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventRecord(sample_done, cublas.stream()));
+                cudaEvent_t t_d2h_done =
+                    sampling_ir::TensorIoEngine::instance().eager_d2h_outputs(
+                        dsts.data(), caps.data(), srcs.data(), nbytes.data(),
+                        static_cast<std::size_t>(R), sample_done);
+                // ── X2 BRIDGE (a): relocate the carrier call to the a2 fire-commit ──
+                // guru ruled (a) BRIDGE: the mock enqueue's pie_frame_carry moves HERE,
+                // where the real per-fire `sample_done` + the executor's monotonic
+                // `committed_head` exist. If the host threaded the per-request carry
+                // cols (bravo's finalized SoA: carry_user_ptr/word_index/instance +
+                // version guard), fire the carrier per request. Ordering (guru):
+                // carry(forward_evt=sample_done) → word release-stores → done callback
+                // fires both consumers (delta pacing + alpha scan_channels). The carrier
+                // reuses this fire's `sample_done` as its cross-stream wait, so its D2H
+                // mirror serialises behind the committed cells. `sample_done` is
+                // destroyed AFTER this loop (persisted for it).
+                if (view.carry_user_ptr.size() == static_cast<std::size_t>(R)) {
+                    // VERSION GUARD (guru): loud-reject an ABI mismatch before trusting
+                    // the cols, rather than misread. carry_abi_version is [1] when present.
+                    if (view.carry_abi_version.empty() ||
+                        view.carry_abi_version.data()[0] != kCarryDescriptorVersion) {
+                        std::fprintf(stderr,
+                            "[executor] carry ABI mismatch (version=%u, expected %u) — abort\n",
+                            view.carry_abi_version.empty() ? 0u : view.carry_abi_version.data()[0],
+                            kCarryDescriptorVersion);
+                        std::abort();  // loud-reject (guru's version-guard rule)
+                    }
+                    for (int r = 0; r < R; ++r) {
+                        // Per-request instance (a2 batches R requests each under its OWN
+                        // bound instance — NOT one per fire).
+                        const std::uint64_t instance = view.carry_instance.data()[r];
+                        // MONOTONIC head: a2 greedy commits 1 token/request/fire ⇒ +1.
+                        const std::uint64_t head =
+                            ++executor.carry_commit_heads[instance];
+                        auto* user = reinterpret_cast<void*>(
+                            static_cast<std::uintptr_t>(view.carry_user_ptr.data()[r]));
+                        // done = nullptr ⇒ the once-registered cuda_carry_done (the runtime
+                        // calls pie_frame_set_carry_done at init; not threaded per-request).
+                        pie_frame_carry(instance, /*frame_offset=*/0, /*mirror_offset=*/0,
+                                        /*n_bytes=*/0,
+                                        static_cast<std::size_t>(view.carry_word_index.data()[r]),
+                                        /*target=*/head, /*forward_evt=*/sample_done,
+                                        /*done=*/nullptr, user);
+                    }
+                }
+                CUDA_CHECK(cudaEventDestroy(sample_done));
+                // Persist for the WAR guard at the NEXT forward's sampling tail (it
+                // waits this before t+1 overwrites single-buffer pi.sampled).
+                if (executor.last_eager_d2h_done)
+                    CUDA_CHECK(cudaEventDestroy(executor.last_eager_d2h_done));
+                executor.last_eager_d2h_done = t_d2h_done;
+                executor.last_fire_deferred = true;
+                // Deferred forward-done: count = R with EMPTY tokens[] — the sampled
+                // tokens ride the pinned buffers; serve_forever sends this response
+                // once, from the copy-stream host-func post-D2H, so the host's rx
+                // fires only once every pinned dst is filled.
+                out_resp = pie_driver::PieForwardResponseView{};
+                out_resp.num_requests = static_cast<std::uint32_t>(R);
+                write_probes(out_resp, executor, t_entry, t_wire_parse_end, t_plan_end,
+                             t_h2d_end, t_kernel_launch_end, t_sync_end,
+                             /*skip_device_idle=*/g3_go);
+                // G3 PART-2: stamp the CUDA-event device-idle gap on this response
+                // (the host stamp is invalid under back-to-back). No-op when g3
+                // mode is off or no measurement is ready yet.
+                if (g3_go) g3_drain(executor, &out_resp);
+                return;
+            }
+        }
+
+        // ── PTIR (thrust-3) stage-program dispatch ──────────────────────
+        // A request carrying `ptir_program_*` runs its stage program(s) on the
+        // forward's logits (the Logits intrinsic), keyed by the wire instance id
+        // (persistent channel state across fires); the committed READER-channel
+        // outputs marshal into `out_resp.ptir_output_*`. All the tier-0 device
+        // work lives behind `ptir_dispatch.cu` (this TU is host C++). Gated on an
+        // empty program list ⇒ DORMANT for every legacy fire, so the §6.1 /
+        // sampling paths below are untouched.
+        if (!view.ptir_program_hashes.empty()) {
+            if (!executor.ptir_dispatch)
+                executor.ptir_dispatch = std::make_unique<ptir::PtirDispatch>();
+            const std::uint32_t vocab = static_cast<std::uint32_t>(
+                executor.loaded_model.hf_config().vocab_size);
+            out_resp = pie_driver::PieForwardResponseView{};
+            // `ws.logits` is BF16; the tier-0 stage-runner reads the Logits
+            // intrinsic as F32. Widen the emitted logit rows bf16→f32 so the
+            // stage program argmaxes correct values (else it misreads bf16 as
+            // f32 → wrong token, §6.2: 19148 vs the correct 14582).
+            const std::size_t n_conv =
+                static_cast<std::size_t>(std::max(1, N)) * vocab;
+            if (executor.ptir_logits_f32.size() < n_conv)
+                executor.ptir_logits_f32 = DeviceBuffer<float>::alloc(n_conv);
+            kernels::launch_cast_bf16_to_fp32(
+                executor.ws.logits.data(), executor.ptir_logits_f32.data(),
+                n_conv, executor.cublas.stream());
+            executor.ptir_dispatch->run(view, out_resp,
+                                        executor.ptir_logits_f32.data(),
+                                        vocab, executor.cublas.stream());
+            out_resp.num_requests = static_cast<std::uint32_t>(R);
+            write_probes(out_resp, executor, t_entry, t_wire_parse_end, t_plan_end,
+                         t_h2d_end, t_kernel_launch_end, t_sync_end);
+            return;
+        }
 
         // ── Sampling-IR rich / multi-output marshaling ──────────────────
         // A program that emits anything beyond a single scalar Token —
@@ -3149,7 +4772,10 @@ void handle_fire_batch(
         // tokens, Scalar/Entropy → entropies, a multi-element (Vector<k>)
         // Token accept-prefix → spec_tokens (side-channel). Single-token
         // programs fall through to the dense token path below, unchanged.
-        // MVP: single IR request (outputs land on request 0).
+        // MVP single-program path: outputs land on request 0. (A co-batched
+        // forward_R≥2 fire of DISTINCT programs is handled earlier by the
+        // multi-program merged path, which scatters each program → per_req[p];
+        // this single-program branch only runs for num_programs==1.)
         if (ir_status == sampling_ir::RunStatus::Handled && R >= 1) {
             const sampling_ir::ProgramInterface* pif =
                 executor.sampling_ir_runtime.last_interface();
@@ -3161,52 +4787,89 @@ void handle_fire_batch(
             if (ir_rich) {
                 std::span<void* const> outs =
                     executor.sampling_ir_runtime.last_output_ptrs();
-                std::vector<pie_driver::PerRequestOutput> per_req(
-                    static_cast<std::size_t>(R));
-                auto& pr = per_req[0];
+                // D1: DEFER the rich response. Stage each output's eager-D2H into an
+                // OWNED pinned host buffer (ordered after the forward sample-done);
+                // the copy-stream host-func marshals + builds + sends post-drain, so
+                // the service thread never blocks on the sync marshal. Falls back to
+                // the inline sync marshal if nothing stageable (all-unbound outputs).
+                cudaEvent_t sample_done = nullptr;
+                CUDA_CHECK(cudaEventCreateWithFlags(&sample_done,
+                                                    cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventRecord(sample_done, cublas.stream()));
+                auto& tio = sampling_ir::TensorIoEngine::instance();
+                auto& pend = executor.pending_rich_defer;
+                pend.staged.clear();
+                pend.num_requests = static_cast<std::uint32_t>(R);
+                const std::uint32_t member = 0;  // single-program: outputs → request 0
+                const std::uint32_t n_out =
+                    static_cast<std::uint32_t>(pif->outputs.size());
+                std::vector<std::uint64_t> dsts;
+                std::vector<std::uint32_t> lens;
+                std::vector<const void*>   srcs;
+                std::vector<std::size_t>   nbs;
                 for (std::size_t i = 0;
                      i < pif->outputs.size() && i < outs.size(); ++i) {
                     const sampling_ir::DeclaredOutput& o = pif->outputs[i];
                     if (outs[i] == nullptr) continue;
+                    std::size_t elem_bytes;
                     switch (o.cls) {
-                        case sampling_ir::OutputClass::Token: {
-                            if (o.elem_count <= 1) {
-                                std::int32_t t = 0;
-                                CUDA_CHECK(cudaMemcpy(&t, outs[i], sizeof(t),
-                                                      cudaMemcpyDeviceToHost));
-                                pr.tokens.push_back(
-                                    static_cast<std::uint32_t>(t));
-                            } else {
-                                // Vector<k> accept-prefix → spec_tokens; emit
-                                // the non-(-1) prefix (sentinel = first reject).
-                                std::vector<std::int32_t> v(o.elem_count);
-                                CUDA_CHECK(cudaMemcpy(
-                                    v.data(), outs[i],
-                                    sizeof(std::int32_t) * o.elem_count,
-                                    cudaMemcpyDeviceToHost));
-                                for (std::int32_t x : v) {
-                                    if (x < 0) break;
-                                    pr.spec_tokens.push_back(
-                                        static_cast<std::uint32_t>(x));
-                                }
-                            }
-                            break;
-                        }
+                        case sampling_ir::OutputClass::Token:
+                            elem_bytes = sizeof(std::int32_t); break;
                         case sampling_ir::OutputClass::Scalar:
-                        case sampling_ir::OutputClass::Entropy: {
-                            float s = 0.f;
-                            CUDA_CHECK(cudaMemcpy(&s, outs[i], sizeof(s),
-                                                  cudaMemcpyDeviceToHost));
-                            pr.entropies.push_back(s);
-                            break;
-                        }
-                        default:
-                            // Logits / Logprobs / Dist rich outputs: later wave.
-                            break;
+                        case sampling_ir::OutputClass::Entropy:
+                            elem_bytes = sizeof(float); break;
+                        case sampling_ir::OutputClass::Logits:
+                            elem_bytes = sizeof(std::uint16_t); break;
+                        default: continue;
                     }
+                    // MtpTokens / [k]-Token: stage the declared UPPER BOUND
+                    // (elem_count); the −1 sentinel gives the actual count in the
+                    // trampoline (→ response header), since n_acc is unknown at submit.
+                    const std::uint32_t cap = std::max<std::uint32_t>(o.elem_count, 1);
+                    const std::size_t nbytes = elem_bytes * cap;
+                    // guru's CHECK: pinned_alloc CANNOT fail/return null — the pinned
+                    // SlabArena grows-on-demand (add_slab → cudaHostAlloc), reuses the
+                    // free-list, and aborts FAIL-LOUD on genuine host-OOM (TIO_CK →
+                    // std::abort), never returns null. So no sync-path divert is
+                    // needed here; a genuine OOM is an unrecoverable fail-loud, not a
+                    // divertible condition.
+                    void* host = tio.pinned_alloc(nbytes);
+                    dsts.push_back(reinterpret_cast<std::uint64_t>(host));
+                    lens.push_back(static_cast<std::uint32_t>(nbytes));
+                    srcs.push_back(outs[i]);
+                    nbs.push_back(nbytes);
+                    pend.staged.push_back({host, o.cls, cap, member,
+                                           static_cast<std::uint32_t>(i), n_out});
                 }
+                if (!pend.staged.empty()) {
+                    // ONE batched eager-D2H → a single copy-stream done event (FIFO,
+                    // WAR-guard-persisted exactly like a2's single-buffer guard).
+                    cudaEvent_t d2h_done = tio.eager_d2h_outputs(
+                        dsts.data(), lens.data(), srcs.data(), nbs.data(),
+                        dsts.size(), sample_done);
+                    if (executor.last_eager_d2h_done)
+                        CUDA_CHECK(cudaEventDestroy(executor.last_eager_d2h_done));
+                    executor.last_eager_d2h_done = d2h_done;
+                    CUDA_CHECK(cudaEventDestroy(sample_done));
+                    pend.active = true;
+                    executor.last_fire_deferred = true;
+                    // Empty-channel resp; the tokens/scalars ride the pinned buffers,
+                    // the trampoline builds the real response post-D2H.
+                    out_resp = pie_driver::PieForwardResponseView{};
+                    out_resp.num_requests = static_cast<std::uint32_t>(R);
+                    write_probes(out_resp, executor, t_entry, t_wire_parse_end,
+                                 t_plan_end, t_h2d_end, t_kernel_launch_end, t_sync_end);
+                    return;
+                }
+                // Nothing stageable → free the marker event + fall through to sync.
+                CUDA_CHECK(cudaEventDestroy(sample_done));
+                std::vector<pie_driver::PerRequestOutput> per_req(
+                    static_cast<std::size_t>(R));
+                marshal_ir_program_output(pif, outs, /*num_rows=*/1,
+                                          std::span<const std::uint32_t>(&member, 1),
+                                          per_req);
                 executor.response_builder.build(per_req, out_resp);
-                write_probes(out_resp, t_entry, t_wire_parse_end, t_plan_end,
+                write_probes(out_resp, executor, t_entry, t_wire_parse_end, t_plan_end,
                              t_h2d_end, t_kernel_launch_end, t_sync_end);
                 return;
             }
@@ -3246,7 +4909,7 @@ void handle_fire_batch(
                 std::span<const std::int32_t>(all_sampled,
                                               static_cast<std::size_t>(R)),
                 out_resp);
-            write_probes(out_resp, t_entry, t_wire_parse_end,
+            write_probes(out_resp, executor, t_entry, t_wire_parse_end,
                          t_plan_end, t_h2d_end,
                          t_kernel_launch_end, t_sync_end);
             if (executor.verbose && (handled <= 4 || handled % 100 == 0)) {
@@ -3636,8 +5299,68 @@ void handle_fire_batch(
                                            fwd_in);
                 }
             }
+            // Ph7 RS working-set fold-buffered (W9 piggyback): for each request
+            // flagged RS_FLAG_FOLD, replay the GDN recurrence over its first
+            // rs_fold_lens[r] BUFFERED tokens — gathered page-major from the
+            // buffered-activation pool (rs_buffer_slot_ids) rather than the
+            // verify stash — and write the advanced state into
+            // recurrent_state[rs_slot_ids[r]]. Reuses the commit-advance replay
+            // (commit_len-clamped conv+prep+fla; no in_proj/attention/MLP/lm_head),
+            // just sourced from the pool. RS_FLAG_RESET zeroes the slot first
+            // (a first fold replays from zero).
+            if (rs_is_fold) {
+                executor.rs_cache->set_verify_frozen(false);
+                std::vector<std::int32_t> fold_commit_len(
+                    static_cast<std::size_t>(R));
+                std::vector<std::int32_t> fold_slots(static_cast<std::size_t>(R));
+                std::vector<std::uint32_t> fold_qo(
+                    static_cast<std::size_t>(R) + 1);
+                fold_qo[0] = 0;
+                for (int r = 0; r < R; ++r) {
+                    const std::uint32_t n =
+                        (r < static_cast<int>(rs_fold_view.size()))
+                            ? rs_fold_view[r] : 0u;
+                    fold_commit_len[static_cast<std::size_t>(r)] =
+                        static_cast<std::int32_t>(n);
+                    fold_slots[static_cast<std::size_t>(r)] =
+                        static_cast<std::int32_t>(rs_slot_view[r]);
+                    fold_qo[static_cast<std::size_t>(r) + 1] = fold_qo[r] + n;
+                    if ((rs_flag_view[r] & 1u) != 0) {  // RS_FLAG_RESET
+                        executor.rs_cache->reset_slot(
+                            static_cast<int>(rs_slot_view[r]), cublas.stream());
+                    }
+                }
+                const int fold_N =
+                    static_cast<int>(fold_qo[static_cast<std::size_t>(R)]);
+                if (fold_N > 0) {
+                    pi.tokens.copy_from_host(std::span<const std::uint32_t>(
+                        reinterpret_cast<const std::uint32_t*>(
+                            fold_commit_len.data()),
+                        fold_commit_len.size()));
+                    pi.qo_indptr.copy_from_host(std::span<const std::uint32_t>(
+                        fold_qo.data(), fold_qo.size()));
+                    pi.slot_ids.copy_from_host(
+                        std::span<const std::int32_t>(fold_slots));
+
+                    pie_cuda_driver::ForwardFn::ForwardInputs fwd_in;
+                    fwd_in.qo_indptr_d   = pi.qo_indptr.data();
+                    fwd_in.qo_indptr_h   = fold_qo.data();
+                    fwd_in.total_tokens  = fold_N;
+                    fwd_in.num_requests  = R;
+                    fwd_in.is_pure_decode = false;
+                    fwd_in.slot_ids_h    = fold_slots.data();
+                    fwd_in.slot_ids_d    = pi.slot_ids.data();
+                    fwd_in.num_logit_rows = -1;
+                    fwd_in.commit_advance_gather_d =
+                        reinterpret_cast<const std::int32_t*>(pi.tokens.data());
+                    fwd_in.rs_buffer_fold = true;
+                    fwd_in.rs_buffer_slot_ids_h = rs_buf_id_view.data();
+                    fwd_in.rs_buffer_slot_indptr_h = rs_buf_indptr_view.data();
+                    forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
+                }
+            }
             executor.response_builder.build(per_req, out_resp);
-            write_probes(out_resp, t_entry, t_wire_parse_end,
+            write_probes(out_resp, executor, t_entry, t_wire_parse_end,
                          t_plan_end, t_h2d_end,
                          t_kernel_launch_end, t_sync_end);
 
@@ -3654,7 +5377,7 @@ void handle_fire_batch(
             std::span<const std::uint32_t>(per_request_counts),
             std::span<const std::uint32_t>(sampled_tokens),
             out_resp);
-        write_probes(out_resp, t_entry, t_wire_parse_end,
+        write_probes(out_resp, executor, t_entry, t_wire_parse_end,
                      t_plan_end, t_h2d_end,
                      t_kernel_launch_end, t_sync_end);
         if (executor.verbose && (handled <= 4 || handled % 100 == 0)) {
@@ -3888,8 +5611,9 @@ void tp_follower_serve(Executor& executor, std::atomic<bool>& stop) {
         const std::uint32_t graph_layout =
             executor.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
-            (tp_greedy_argmax ? 1u : 0u) |
-            (graph_layout << 3);
+            make_graph_variant(tp_greedy_argmax, /*single_gpu=*/false,
+                               /*fwd_handles=*/false, /*small_spec=*/false,
+                               /*rs_verify=*/false, graph_layout);
         if (try_graphs) {
             const ForwardGraphKey key{R, N, graph_variant};
             cudaGraphExec_t exec = executor.graph_cache->get(key);

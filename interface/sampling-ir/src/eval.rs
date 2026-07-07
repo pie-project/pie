@@ -220,6 +220,9 @@ fn eval_op(
         GatherRow { src, idx } => {
             one(gather_row(get(vals, src)?, shape_of(types, src)?, get(vals, idx)?)?)
         }
+        MaskApply { logits, mask } => {
+            one(mask_apply(get(vals, logits)?, shape_of(types, logits)?, get(vals, mask)?)?)
+        }
         ScatterAdd { base, idx, vals: v } => {
             one(scatter(get(vals, base)?, get(vals, idx)?, get(vals, v)?, true)?)
         }
@@ -453,14 +456,22 @@ fn pivot_threshold(
         }
         Ok(if v.len() == rows { v[r] } else { v[0] })
     };
+    let row_int = |id: ValueId, r: usize| -> Result<i64, EvalError> {
+        let v = get(vals, id)?.int_lanes()?;
+        if v.is_empty() {
+            return Err(EvalError::Shape("pivot threshold k operand empty".into()));
+        }
+        Ok(if v.len() == rows { v[r] } else { v[0] })
+    };
     let mut keep = vec![false; x.len()];
     for r in 0..rows {
         let row = &x[r * len..(r + 1) * len];
         let k = &mut keep[r * len..(r + 1) * len];
         match predicate {
-            Predicate::RankLe(kk) => {
+            Predicate::RankLe(k_id) => {
+                let kk = row_int(k_id, r)?.clamp(0, len as i64) as usize;
                 let (_, order) = sort_desc(row);
-                for &i in order.iter().take((kk as usize).min(len)) {
+                for &i in order.iter().take(kk) {
                     k[i as usize] = true;
                 }
             }
@@ -485,10 +496,49 @@ fn pivot_threshold(
 }
 
 fn gather(src: &Value, idx: &Value) -> Result<Value, EvalError> {
-    let s = src.to_f32();
+    // Dtype-PRESERVING (matches `validate` — `ValueType::vector(k, ts.dtype)` —
+    // and the driver-parity `interp::gather_flat_fill0`). An i32 gather (e.g. the
+    // Stage-2 seed `picked[n_acc]`, output as a Token) must stay i32; the old
+    // hardcoded-`F32` return was a latent bug that only escaped notice because
+    // gather results were previously always compared or reduced, never emitted.
     let ix = idx.int_lanes()?;
+    let n = src.len();
+    let pick = |i: i64| -> Option<usize> { (i >= 0 && (i as usize) < n).then_some(i as usize) };
+    Ok(match src {
+        Value::F32(x) => Value::F32(ix.iter().map(|&i| pick(i).map_or(0.0, |j| x[j])).collect()),
+        Value::I32(x) => Value::I32(ix.iter().map(|&i| pick(i).map_or(0, |j| x[j])).collect()),
+        Value::U32(x) => Value::U32(ix.iter().map(|&i| pick(i).map_or(0, |j| x[j])).collect()),
+        Value::Bool(x) => Value::Bool(ix.iter().map(|&i| pick(i).is_some_and(|j| x[j])).collect()),
+    })
+}
+
+/// Apply a packed allowed-token bitmask ([`Op::MaskApply`]) with the SAME mask
+/// broadcast over every row of a `[rows, n]` matrix (or the single row of a `[n]`
+/// vector): `out[r, c] = bit_c(mask) ? logits[r, c] : −∞`, `bit_c = (mask[c>>5] >>
+/// (c&31)) & 1` (bit 1 = allowed → pass-through, bit 0 = disallowed → `−∞`). The
+/// column index `c = j % n` is taken per-row so the `[ceil(n/32)]` packed mask
+/// (word-indexed over the `n` columns) applies identically to every row — matching
+/// `validate`'s per-row contract (a matrix keeps its shape) and echo's normative
+/// `matrix_mask_apply_packed` golden. `mask` is a packed `[ceil(n/32)]` U32
+/// vector; tail bits ≥ `n` are not read.
+fn mask_apply(logits: &Value, shape: Shape, mask: &Value) -> Result<Value, EvalError> {
+    let l = logits.to_f32();
+    let words = match mask {
+        Value::U32(w) => w,
+        _ => return Err(EvalError::Type("mask-apply: mask must be U32".into())),
+    };
+    // Column length (last axis) — the packed mask spans one row; broadcast it over
+    // rows by indexing the mask at the per-row column `j % n`.
+    let n = shape.last_len().unwrap_or(l.len() as u32) as usize;
     Ok(Value::F32(
-        ix.iter().map(|&i| if i >= 0 && (i as usize) < s.len() { s[i as usize] } else { 0.0 }).collect(),
+        l.iter()
+            .enumerate()
+            .map(|(j, &x)| {
+                let c = if n == 0 { j } else { j % n };
+                let bit = words.get(c >> 5).map_or(0, |&w| (w >> (c & 31)) & 1);
+                if bit == 1 { x } else { f32::NEG_INFINITY }
+            })
+            .collect(),
     ))
 }
 
@@ -549,12 +599,89 @@ fn rng(seed: u32, stream: u32, kind: RngKind, len: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Golden reference for the Quest `envelope_dot` importance score (PTIR M3.2,
+/// overview §6.1) — the parity oracle the driver `envelope_dot` kernel is checked
+/// against. For each `(kv_head, page)`, the MAX possible `q·k` over the page's
+/// per-dimension key min/max envelope (Quest page criticality):
+///
+/// ```text
+/// score[kh, p] = Σ_{qh ∈ GQA-group(kh)} Σ_d max(q[qh,d]·min[p,kh,d], q[qh,d]·max[p,kh,d])
+/// ```
+///
+/// `q` is `[num_q_heads, head_dim]` (this layer's projected query, M=1 decode);
+/// `env_min`/`env_max` are `[p_max, num_kv_heads, head_dim]` (the maintained
+/// per-page key envelope). Pages `p >= live_pages` are validity-coded `−∞` (never
+/// selected). The GQA group of `kv_head kh` is the `num_q_heads / num_kv_heads`
+/// query heads mapping to it (`qh = kh·group + g`).
+///
+/// **Thin-adapter TODO (reconcile with §6.1's `envelope_dot` intrinsic binding):**
+/// two knobs are provisional and MUST be reconciled with bravo's §6.1 program
+/// contract once it greens — (1) the GQA-group aggregation (this reference SUMS
+/// the group's query heads; §6.1 may want max/per-head), and (2) whether the
+/// program consumes this per-`kv_head` `[num_kv_heads, p_max]` core or a further
+/// reduction to a single `[p_max]` mask. The per-dimension `max(q·min, q·max)`
+/// core (the actual Quest math) is fixed and unambiguous; only the head layout
+/// reconciles. Keeping the kernel + this oracle on the per-`kv_head` core lets M3.2
+/// verify parity now without waiting on the binding.
+pub fn envelope_dot_reference(
+    q: &[f32],
+    env_min: &[f32],
+    env_max: &[f32],
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    p_max: usize,
+    live_pages: usize,
+) -> Vec<f32> {
+    let group = num_q_heads / num_kv_heads;
+    let live = if live_pages < p_max { live_pages } else { p_max };
+    let mut out = vec![f32::NEG_INFINITY; num_kv_heads * p_max];
+    for kh in 0..num_kv_heads {
+        for p in 0..live {
+            let env_base = (p * num_kv_heads + kh) * head_dim;
+            let mut acc = 0.0f32;
+            for g in 0..group {
+                let q_base = (kh * group + g) * head_dim;
+                for d in 0..head_dim {
+                    let qd = q[q_base + d];
+                    let lo = qd * env_min[env_base + d];
+                    let hi = qd * env_max[env_base + d];
+                    acc += if lo > hi { lo } else { hi };
+                }
+            }
+            out[kh * p_max + p] = acc;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn bind(inputs: &[Value]) -> InputBindings<'_> {
         InputBindings::new(inputs, 12345)
+    }
+
+    #[test]
+    fn envelope_dot_reference_quest_math() {
+        // 2 query heads → 1 kv head (GQA group 2), head_dim 2, P_MAX 3, live 2.
+        // q: head0 = [1, -1], head1 = [2, 0.5].
+        let q = [1.0f32, -1.0, 2.0, 0.5];
+        // env[p, kv_head=0, dim]: p0 min[0,0]/max[3,4]; p1 min[-2,1]/max[1,2];
+        // p2 don't-care (beyond live → −∞).
+        let env_min = [0.0f32, 0.0, -2.0, 1.0, 9.9, 9.9];
+        let env_max = [3.0f32, 4.0, 1.0, 2.0, 9.9, 9.9];
+        let out = envelope_dot_reference(
+            &q, &env_min, &env_max,
+            /*num_q_heads=*/ 2, /*num_kv_heads=*/ 1, /*head_dim=*/ 2,
+            /*p_max=*/ 3, /*live_pages=*/ 2,
+        );
+        // score[0,0] = g0(3+0) + g1(6+2) = 11; score[0,1] = g0(1-1) + g1(2+1) = 3.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], 11.0);
+        assert_eq!(out[1], 3.0);
+        assert_eq!(out[2], f32::NEG_INFINITY); // beyond live → validity-coded
     }
 
     #[test]
@@ -628,6 +755,45 @@ mod tests {
             Value::I32(v) => assert!((0..5).contains(&v[0])),
             _ => panic!("expected token"),
         }
+    }
+
+    #[test]
+    fn matrix_select_mask_k4_is_per_row_over_full_k_rows() {
+        // NORMATIVE pin for the §6.1 select-mask shape (bravo's cuda_mtpverify
+        // OOB): dselect(allow[k,v], logits[k,v], broadcast(-inf -> [k,v])) then
+        // per-row argmax. EVERY operand materializes k FULL rows (k*v elems,
+        // row-major); select/broadcast/argmax are per-row over the last axis.
+        // Non-degenerate: each row's RAW argmax is masked out, so a backend
+        // that drops/undersizes rows >= 1 (or reads bf16 storage with f32
+        // indexing) CANNOT pass by accident.
+        let (k, v) = (4u32, 8u32);
+        let p = SamplingProgram {
+            inputs: vec![
+                InputDecl::new(Shape::matrix(k, v), DType::F32),  // 0: logits
+                InputDecl::new(Shape::matrix(k, v), DType::Bool), // 1: allow
+            ],
+            ops: vec![
+                Op::Input(0),                                   // 0
+                Op::Input(1),                                   // 1
+                Op::Const(Literal::F32(f32::NEG_INFINITY)),     // 2
+                Op::Broadcast { value: 2, shape: Shape::matrix(k, v) }, // 3
+                Op::Select { cond: 1, a: 0, b: 3 },             // 4
+                Op::ReduceArgmax(4),                            // 5: [k] i32
+            ],
+            outputs: vec![OutputDecl::new(5, OutputKind::Token)],
+        };
+        p.validate().expect("validates");
+        // logits[r]: raw max 9.0 at col r (MASKED); allowed col (r+2)%8 = 1.0.
+        let mut logits = vec![0.0f32; (k * v) as usize];
+        let mut allow = vec![false; (k * v) as usize];
+        for r in 0..k as usize {
+            logits[r * v as usize + r] = 9.0;
+            let a = (r + 2) % v as usize;
+            logits[r * v as usize + a] = 1.0;
+            allow[r * v as usize + a] = true;
+        }
+        let out = eval(&p, &bind(&[Value::F32(logits), Value::Bool(allow)])).unwrap();
+        assert_eq!(out, vec![Value::I32(vec![2, 3, 4, 5])]);
     }
 
     #[test]

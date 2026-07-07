@@ -24,15 +24,24 @@ fn prog(b: &Built) -> SamplingProgram {
 fn bind(b: &Built, logits: &[f32], params: &[(u32, f32)]) -> Vec<EvalValue> {
     b.bindings
         .iter()
-        .map(|binding| match binding {
-            Binding::Logits => EvalValue::F32(logits.to_vec()),
+        .zip(b.program.inputs.iter())
+        .map(|(binding, decl)| match binding {
+            Binding::Logits | Binding::MtpLogits => EvalValue::F32(logits.to_vec()),
+            Binding::MtpDrafts => {
+                panic!("mtp-drafts device intrinsic not supplied by this host-eval harness")
+            }
             Binding::Tensor { key, .. } => {
                 let v = params
                     .iter()
                     .find(|(k, _)| k == key)
                     .map(|(_, v)| *v)
                     .unwrap_or_else(|| panic!("no value for param key {key}"));
-                EvalValue::F32(vec![v])
+                // Resolve the slot's declared dtype (#25: the top-k `k` slot is U32).
+                match decl.dtype {
+                    pie_sampling_ir::DType::U32 => EvalValue::U32(vec![v as u32]),
+                    pie_sampling_ir::DType::I32 => EvalValue::I32(vec![v as i32]),
+                    _ => EvalValue::F32(vec![v]),
+                }
             }
         })
         .collect()
@@ -190,15 +199,15 @@ fn nucleus(logits: &[f32], p: f32) -> std::collections::HashSet<usize> {
 
 #[test]
 fn top_k_structure() {
-    let (b, keys) = top_k(64, 5).unwrap();
+    let (b, keys) = top_k(64).unwrap();
     assert_eq!(b.outputs, vec![OutputKind::Token]);
-    assert_eq!(b.host_inputs.len(), 1); // temperature only; k is a baked immediate
-    assert!(keys.temperature.is_some() && keys.top_p.is_none());
+    assert_eq!(b.host_inputs.len(), 2); // temperature + k (both submit, #25)
+    assert!(keys.temperature.is_some() && keys.k.is_some() && keys.top_p.is_none());
     let p = prog(&b);
     p.validate().unwrap();
     assert!(p.ops.iter().any(|o| matches!(
         o,
-        Op::PivotThreshold { predicate: pie_sampling_ir::Predicate::RankLe(5), .. }
+        Op::PivotThreshold { predicate: pie_sampling_ir::Predicate::RankLe(_), .. }
     )));
     assert!(p.ops.iter().any(|o| matches!(o, Op::Rng { stream: 0, .. })));
 }
@@ -218,14 +227,14 @@ fn top_p_structure() {
 
 #[test]
 fn top_k_top_p_structure() {
-    let (b, keys) = top_k_top_p(64, 8).unwrap();
-    assert_eq!(b.host_inputs.len(), 2); // temperature + p; k is a baked immediate
-    assert!(keys.temperature.is_some() && keys.top_p.is_some());
+    let (b, keys) = top_k_top_p(64).unwrap();
+    assert_eq!(b.host_inputs.len(), 3); // temperature + p + k (all submit, #25)
+    assert!(keys.temperature.is_some() && keys.top_p.is_some() && keys.k.is_some());
     let p = prog(&b);
     p.validate().unwrap();
     assert!(p.ops.iter().any(|o| matches!(
         o,
-        Op::PivotThreshold { predicate: pie_sampling_ir::Predicate::RankLe(8), .. }
+        Op::PivotThreshold { predicate: pie_sampling_ir::Predicate::RankLe(_), .. }
     )));
     assert!(p.ops.iter().any(|o| matches!(
         o,
@@ -236,11 +245,15 @@ fn top_k_top_p_structure() {
 #[test]
 fn eval_top_k_token_in_top_k() {
     let k = 3u32;
-    let (b, keys) = top_k(8, k).unwrap();
+    let (b, keys) = top_k(8).unwrap();
     let logits = logits8();
     let topk = top_k_set(&logits, k as usize);
     for s in [3u32, 11, 256, 4096, 50000] {
-        let inputs = bind(&b, &logits, &[(keys.temperature.unwrap(), 1.0)]);
+        let inputs = bind(
+            &b,
+            &logits,
+            &[(keys.temperature.unwrap(), 1.0), (keys.k.unwrap(), k as f32)],
+        );
         let out = eval(&prog(&b), &InputBindings::new(&inputs, s)).unwrap();
         let t = token_of(&out[0]) as usize;
         assert!(topk.contains(&t), "seed {s}: token {t} not in top-{k}");
@@ -263,4 +276,178 @@ fn eval_top_p_token_in_nucleus() {
         let t = token_of(&out[0]) as usize;
         assert!(nuc.contains(&t), "seed {s}: token {t} not in top-p nucleus {nuc:?}");
     }
+}
+
+// ── canonical-kind recognizer (#8) ───────────────────────────────────────────
+
+use sampling_edsl::{CanonicalKind, SamplerSpec, build_sampler, canonical_kind, infer_kind};
+
+/// `canonical_kind` derives from the frozen ladder: for every sampler spec it
+/// equals `infer_kind(its params)` — the SDK-sugar↔recognizer drift-guard.
+#[test]
+fn canonical_kind_matches_ladder() {
+    let cases = [
+        (SamplerSpec::Argmax, CanonicalKind::Argmax),
+        (SamplerSpec::Multinomial { temperature: 0.8 }, CanonicalKind::Temperature),
+        (SamplerSpec::TopP { temperature: 0.8, p: 0.9 }, CanonicalKind::TopP),
+        (SamplerSpec::TopK { temperature: 0.8, k: 40 }, CanonicalKind::TopK),
+        (SamplerSpec::MinP { temperature: 0.8, p: 0.05 }, CanonicalKind::MinP),
+        (SamplerSpec::TopKTopP { temperature: 0.8, k: 40, p: 0.9 }, CanonicalKind::TopKTopP),
+    ];
+    for (spec, want) in cases {
+        assert_eq!(canonical_kind(spec), want, "{spec:?}");
+    }
+}
+
+/// `T<=0 -> Argmax` is unconditional (any k/p) — the greedy neutrality fix.
+#[test]
+fn greedy_collapses_to_argmax_any_filter() {
+    for spec in [
+        SamplerSpec::Multinomial { temperature: 0.0 },
+        SamplerSpec::TopK { temperature: 0.0, k: 50 },
+        SamplerSpec::TopP { temperature: -1.0, p: 0.9 },
+        SamplerSpec::TopKTopP { temperature: 0.0, k: 50, p: 0.9 },
+        SamplerSpec::MinP { temperature: 0.0, p: 0.1 },
+    ] {
+        assert_eq!(canonical_kind(spec), CanonicalKind::Argmax, "{spec:?}");
+    }
+}
+
+/// The combined `top-k && top-p` arm precedes the standalone arms (no filter
+/// dropped); degenerate filters (`p>=1`, `k=0`) fall through correctly.
+#[test]
+fn ladder_precedence_and_degenerate_filters() {
+    assert_eq!(infer_kind(0.8, 40, 0.9, 0.0), CanonicalKind::TopKTopP); // both
+    assert_eq!(infer_kind(0.8, 40, 1.0, 0.0), CanonicalKind::TopK); // p>=1 not a filter
+    assert_eq!(infer_kind(0.8, 0, 0.9, 0.0), CanonicalKind::TopP);
+    assert_eq!(infer_kind(0.8, 0, 1.0, 0.0), CanonicalKind::Temperature); // no filters
+    assert_eq!(infer_kind(0.8, 0, 1.0, 0.2), CanonicalKind::MinP);
+}
+
+/// The stamp lands on `Built`/`LoweredProgram`: sugar → its kind; `build_standard`
+/// → its kind; a `Graph`-authored program → `Custom`.
+#[test]
+fn built_carries_canonical_kind() {
+    // sugar
+    let b = build_sampler(SamplerSpec::TopK { temperature: 0.8, k: 40 }, 64).unwrap();
+    assert_eq!(b.canonical_kind, CanonicalKind::TopK);
+    assert_eq!(b.lower().canonical_kind, CanonicalKind::TopK);
+    // greedy sugar collapses to Argmax (matches the program it actually builds)
+    let g = build_sampler(SamplerSpec::TopP { temperature: 0.0, p: 0.9 }, 64).unwrap();
+    assert_eq!(g.canonical_kind, CanonicalKind::Argmax);
+    // standard
+    let (s, _) = build_standard(StandardSampler::MinP, 64).unwrap();
+    assert_eq!(s.canonical_kind, CanonicalKind::MinP);
+    // custom (Graph-authored): grammar program is not a recognized standard kind
+    let (custom, _) = sampling_edsl::program::grammar(64).unwrap();
+    assert_eq!(custom.canonical_kind, CanonicalKind::Custom);
+}
+
+/// The `top_p<=0` edge (#7 reconciliation): a degenerate nucleus mass is NOT a
+/// top-p filter — the recognizer's `0<top_p<1` correctly excludes it (the legacy
+/// bare `top_p<1` is looser; #7 aligns the agreement check to this side).
+#[test]
+fn top_p_le_zero_is_not_a_filter() {
+    assert_eq!(infer_kind(0.8, 0, 0.0, 0.0), CanonicalKind::Temperature); // T>0, no real filter
+    assert_eq!(infer_kind(0.8, 0, -0.5, 0.0), CanonicalKind::Temperature);
+    assert_eq!(infer_kind(0.8, 40, 0.0, 0.0), CanonicalKind::TopK); // top_p=0 => TopK, not TopKTopP
+    assert_eq!(infer_kind(0.8, 0, 0.0, 0.2), CanonicalKind::MinP); // falls through to min_p
+    // T<=0 still wins over everything (greedy), even with a degenerate top_p.
+    assert_eq!(infer_kind(0.0, 40, 0.0, 0.0), CanonicalKind::Argmax);
+}
+
+// ── #12 reference set + entropy probe (#15 foundations) ──────────────────────
+
+#[test]
+fn standard_programs_reference_set() {
+    use sampling_edsl::standard_programs;
+    let progs = standard_programs(128).unwrap();
+    // All 6 standard kinds, in order, each mapped to its CanonicalKind.
+    let kinds: Vec<CanonicalKind> = progs.iter().map(|(_, k)| *k).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CanonicalKind::Argmax,
+            CanonicalKind::Temperature,
+            CanonicalKind::MinP,
+            CanonicalKind::TopP,
+            CanonicalKind::TopK,
+            CanonicalKind::TopKTopP,
+        ]
+    );
+    // All-distinct bytecode => distinct hashes for alpha's {hash->kind} table.
+    let set: std::collections::HashSet<&Vec<u8>> = progs.iter().map(|(b, _)| b).collect();
+    assert_eq!(set.len(), 6, "standard program bytecode must be all-distinct");
+}
+
+#[test]
+fn standard_program_hashes_table_round_trips() {
+    use sampling_edsl::{standard_program_hashes, standard_programs};
+    use std::collections::HashMap;
+    let vocab = 128;
+    // All { program_hash → kind } entries (the #12 exact-hash table, all 6 kinds).
+    let table: HashMap<u64, CanonicalKind> =
+        standard_program_hashes(vocab).unwrap().into_iter().collect();
+    // All-distinct hashes ⇒ 6 entries, no collision — the recognizer is unambiguous.
+    assert_eq!(
+        table.len(),
+        6,
+        "the 6 standard program hashes must be all-distinct"
+    );
+    // Behavior-preserving proof: each standard program, hashed via the canonical
+    // `program_hash`, recognizes its OWN kind through the table (enum→graph).
+    for (bytecode, kind) in standard_programs(vocab).unwrap() {
+        let recognized = table.get(&pie_sampling_ir::program_hash(&bytecode)).copied();
+        assert_eq!(recognized, Some(kind), "program must hash-match its own kind");
+    }
+}
+
+// ── #25: top-k is k-invariant (k is a submit value-id, not a baked immediate) ──
+
+#[test]
+fn top_k_is_k_invariant_via_submit() {
+    let vocab = 128;
+    // Both k-bearing kinds declare a U32 `Submit` input for `k`, and the `RankLe`
+    // predicate references it — so the bytecode does NOT vary with the runtime k,
+    // and the kinds recognize by exact hash (no op-shape canonicalization).
+    for kind in [StandardSampler::TopK, StandardSampler::TopKTopP] {
+        let (b, keys) = build_standard(kind, vocab).unwrap();
+        assert!(keys.k.is_some(), "{kind:?} declares a submit k key");
+        let p = prog(&b);
+        p.validate().unwrap();
+        assert!(
+            p.ops.iter().any(|o| matches!(
+                o,
+                Op::PivotThreshold { predicate: pie_sampling_ir::Predicate::RankLe(_), .. }
+            )),
+            "{kind:?} has a RankLe predicate"
+        );
+        assert!(
+            p.inputs.iter().any(|d| d.dtype == pie_sampling_ir::DType::U32
+                && d.ready == pie_sampling_ir::Readiness::Submit),
+            "{kind:?} declares a U32 submit input (the value-id k)"
+        );
+    }
+}
+
+#[test]
+fn entropy_probe_structure_and_eval() {
+    use sampling_edsl::program::entropy;
+    let b = entropy(8).unwrap();
+    // Scalar-output measurement, classified Custom (not a token-sampler kind).
+    assert_eq!(b.outputs, vec![OutputKind::Scalar]);
+    assert_eq!(b.canonical_kind, CanonicalKind::Custom);
+    assert!(b.host_inputs.is_empty());
+
+    let logits = logits8();
+    let inputs = bind(&b, &logits, &[]);
+    let out = eval(&prog(&b), &InputBindings::new(&inputs, 1)).unwrap();
+    let h = match &out[0] {
+        EvalValue::F32(v) => v[0],
+        o => panic!("expected F32 scalar, got {o:?}"),
+    };
+    // Reference H = -Σ p·ln p.
+    let probs = softmax(&logits);
+    let expected: f32 = -probs.iter().map(|&p| p * p.ln()).sum::<f32>();
+    assert!((h - expected).abs() < 1e-4, "entropy {h} != reference {expected}");
 }

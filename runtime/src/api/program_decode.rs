@@ -19,10 +19,11 @@
 
 use crate::api::pie::core::tensor as wit;
 use pie_sampling_ir::{
-    DType, InputDecl, Literal, Op, OpKind, Predicate, RngKind, SamplingProgram, Shape,
+    DType, InputDecl, Literal, Op, OpKind, OutputDecl, OutputKind, Predicate, Readiness, RngKind,
+    SamplingProgram, Shape,
 };
 
-/// Decode the structured `(inputs, ops, output-ids)` handed to the WIT `program`
+/// Decode the structured `(inputs, ops, outputs)` handed to the WIT `program`
 /// resource constructor into a fully-validated [`SamplingProgram`].
 ///
 /// The IR is **positional SSA**: the op at list position `i` defines value ids
@@ -36,11 +37,22 @@ use pie_sampling_ir::{
 pub fn decode_program(
     inputs: Vec<wit::Input>,
     ops: Vec<wit::Op>,
-    output_ids: Vec<u32>,
+    outputs: Vec<wit::Output>,
 ) -> Result<SamplingProgram, String> {
     let inputs: Vec<InputDecl> = inputs
         .into_iter()
-        .map(|i| Ok(InputDecl::new(shape_from_wit(i.shape)?, dtype_from_wit(i.dtype))))
+        .map(|i| {
+            // lane-3 (#21): readiness now survives the WIT wire (golf lane-1
+            // `record input.ready` + foxtrot lane-2 emit). Carry it through so a
+            // `Late` input routes to the device-alias late channel (the gather in
+            // `attach_program`); v4 programs without it decode `Submit` (alpha's
+            // additive default — `tensor::Readiness::Submit`).
+            Ok(InputDecl::with_ready(
+                shape_from_wit(i.shape)?,
+                dtype_from_wit(i.dtype),
+                readiness_from_wit(i.ready),
+            ))
+        })
         .collect::<Result<_, String>>()?;
 
     let mut ir_ops: Vec<Op> = Vec::with_capacity(ops.len());
@@ -67,8 +79,29 @@ pub fn decode_program(
         ir_ops.push(ir_op);
     }
 
-    pie_sampling_ir::program_from_parts(inputs, ir_ops, &output_ids)
+    // Each declared output carries its marshaling kind EXPLICITLY (#18): the WIT
+    // front door no longer drops it, so typed float kinds
+    // (`Logits`/`Logprobs`/`Distribution`, all `F32`) survive instead of
+    // re-inferring to `Scalar` via `from_dtype`.
+    let output_decls: Vec<OutputDecl> = outputs
+        .into_iter()
+        .map(|o| OutputDecl::new(o.id, output_kind_from_wit(o.kind)))
+        .collect();
+
+    pie_sampling_ir::program_from_parts_typed(inputs, ir_ops, output_decls)
         .map_err(|e| format!("invalid sampling program: {e:?}"))
+}
+
+fn output_kind_from_wit(k: wit::OutputKind) -> OutputKind {
+    match k {
+        wit::OutputKind::Token => OutputKind::Token,
+        wit::OutputKind::Distribution => OutputKind::Distribution,
+        wit::OutputKind::Logits => OutputKind::Logits,
+        wit::OutputKind::Logprobs => OutputKind::Logprobs,
+        wit::OutputKind::Entropy => OutputKind::Entropy,
+        wit::OutputKind::Scalar => OutputKind::Scalar,
+        wit::OutputKind::Embedding => OutputKind::Embedding,
+    }
 }
 
 fn shape_from_wit(dims: Vec<u32>) -> Result<Shape, String> {
@@ -90,6 +123,13 @@ fn dtype_from_wit(d: wit::Dtype) -> DType {
     }
 }
 
+fn readiness_from_wit(r: wit::Readiness) -> Readiness {
+    match r {
+        wit::Readiness::Submit => Readiness::Submit,
+        wit::Readiness::Late => Readiness::Late,
+    }
+}
+
 fn literal_from_wit(l: wit::Literal) -> Literal {
     match l {
         wit::Literal::F32(v) => Literal::F32(v),
@@ -101,7 +141,11 @@ fn literal_from_wit(l: wit::Literal) -> Literal {
 
 fn predicate_from_wit(p: wit::Predicate) -> Predicate {
     match p {
-        wit::Predicate::RankLe(k) => Predicate::RankLe(k),
+        // #25: all three predicate thresholds are now host-submit input value-ids
+        // (SSA refs resolved per-row downstream in `program_from_parts`), so top-k's
+        // `k` is de-hardwired exactly like top-p's `p` / min-p's `thr` — no baked
+        // immediate. The decode is a uniform value-id pass-through for all three.
+        wit::Predicate::RankLe(v) => Predicate::RankLe(v),
         wit::Predicate::CummassLe(v) => Predicate::CummassLe(v),
         wit::Predicate::ProbGe(v) => Predicate::ProbGe(v),
     }
@@ -149,6 +193,7 @@ fn op_kind_from_wit(k: wit::OpKind) -> Result<OpKind, String> {
         wit::OpKind::GatherRow((a, b)) => OpKind::GatherRow((a, b)),
         wit::OpKind::ScatterAdd((a, b, c)) => OpKind::ScatterAdd((a, b, c)),
         wit::OpKind::ScatterSet((a, b, c)) => OpKind::ScatterSet((a, b, c)),
+        wit::OpKind::MaskApply((a, b)) => OpKind::MaskApply((a, b)),
         wit::OpKind::Rng((stream, shape, kind)) => {
             OpKind::Rng((stream, shape_from_wit(shape)?, rng_kind_from_wit(kind)))
         }
@@ -203,6 +248,7 @@ mod tests {
             (wit::OpKind::GatherRow((0, 1)), OpKind::GatherRow((0, 1))),
             (wit::OpKind::ScatterAdd((0, 1, 2)), OpKind::ScatterAdd((0, 1, 2))),
             (wit::OpKind::ScatterSet((0, 1, 2)), OpKind::ScatterSet((0, 1, 2))),
+            (wit::OpKind::MaskApply((0, 1)), OpKind::MaskApply((0, 1))),
             (wit::OpKind::Rng((0, vec![4], wit::RngKind::Uniform)), OpKind::Rng((0, Shape::vector(4), RngKind::Uniform))),
             (wit::OpKind::Rng((7, vec![2, 4], wit::RngKind::Gumbel)), OpKind::Rng((7, Shape::matrix(2, 4), RngKind::Gumbel))),
         ];
@@ -212,13 +258,44 @@ mod tests {
     }
 
     fn vinput(vocab: u32) -> wit::Input {
-        wit::Input { shape: vec![vocab], dtype: wit::Dtype::F32 }
+        wit::Input { shape: vec![vocab], dtype: wit::Dtype::F32, ready: wit::Readiness::Submit }
     }
     fn op_in0(vocab: u32) -> wit::Op {
         wit::Op {
             outputs: vec![wit::Value { id: 0, shape: vec![vocab], dtype: wit::Dtype::F32 }],
             kind: wit::OpKind::Input(0),
         }
+    }
+    fn tok_out(id: u32) -> wit::Output {
+        wit::Output { id, kind: wit::OutputKind::Token }
+    }
+
+    #[test]
+    fn decode_carries_input_readiness_lane3() {
+        // lane-3: the WIT `record input.ready` survives decode → `InputDecl.ready`,
+        // so a `Late` input routes to the device-alias late channel (the
+        // `attach_program` gather) instead of decoding all-`Submit`. The
+        // additive-v4 default (`Submit`) is preserved.
+        let argmax = || {
+            vec![
+                op_in0(8),
+                wit::Op {
+                    outputs: vec![wit::Value { id: 1, shape: vec![], dtype: wit::Dtype::I32 }],
+                    kind: wit::OpKind::ReduceArgmax(0),
+                },
+            ]
+        };
+        let late_in = wit::Input {
+            shape: vec![8],
+            dtype: wit::Dtype::F32,
+            ready: wit::Readiness::Late,
+        };
+        let prog = decode_program(vec![late_in], argmax(), vec![tok_out(1)]).expect("decodes");
+        assert_eq!(prog.inputs[0].ready, Readiness::Late);
+
+        // The `Submit` default (`vinput`) round-trips to `Submit`.
+        let prog2 = decode_program(vec![vinput(8)], argmax(), vec![tok_out(1)]).expect("decodes");
+        assert_eq!(prog2.inputs[0].ready, Readiness::Submit);
     }
 
     #[test]
@@ -232,7 +309,7 @@ mod tests {
                 kind: wit::OpKind::ReduceArgmax(0),
             },
         ];
-        let err = decode_program(vec![vinput(8)], ops, vec![1]).unwrap_err();
+        let err = decode_program(vec![vinput(8)], ops, vec![tok_out(1)]).unwrap_err();
         assert!(err.contains("not positional SSA"), "got: {err}");
     }
 
@@ -250,7 +327,7 @@ mod tests {
                 kind: wit::OpKind::ReduceArgmax(0),
             },
         ];
-        let err = decode_program(vec![vinput(8)], ops, vec![1]).unwrap_err();
+        let err = decode_program(vec![vinput(8)], ops, vec![tok_out(1)]).unwrap_err();
         assert!(err.contains("op-kind defines"), "got: {err}");
     }
 
@@ -270,7 +347,27 @@ mod tests {
         ];
         // output the sorted-value vector (id 1) — f32 ⇒ Scalar is wrong shape, so
         // use the index vector (id 2, i32 ⇒ Token) as the program output.
-        let program = decode_program(vec![vinput(8)], ops, vec![2]).expect("valid sortdesc");
+        let program = decode_program(vec![vinput(8)], ops, vec![tok_out(2)]).expect("valid sortdesc");
         assert_eq!(program.ops.len(), 2);
+    }
+
+    #[test]
+    fn decode_carries_logits_output_kind_18() {
+        // #18: a typed F32 `Logits` output survives the WIT front door instead of
+        // re-inferring to `Scalar` (the old `from_dtype(F32)=Scalar` bug). The
+        // value (input 0, `[8]` f32) is declared `Logits`; decode must preserve it
+        // so the driver marshals it as logits, not a scalar.
+        let prog = decode_program(
+            vec![vinput(8)],
+            vec![op_in0(8)],
+            vec![wit::Output { id: 0, kind: wit::OutputKind::Logits }],
+        )
+        .expect("decodes a logits output");
+        assert_eq!(prog.outputs.len(), 1);
+        assert_eq!(prog.outputs[0].kind, OutputKind::Logits, "Logits must survive, not Scalar");
+        // And the kind rides the encoded bytecode (the byte the driver reader reads).
+        let bytecode = pie_sampling_ir::encode(&prog);
+        let back = pie_sampling_ir::decode(&bytecode).expect("re-decode");
+        assert_eq!(back.outputs[0].kind, OutputKind::Logits);
     }
 }

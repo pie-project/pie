@@ -74,7 +74,12 @@ enum class BindingClass : std::uint8_t {
 };
 
 enum class IntrinsicKind : std::uint8_t {
-    Logits = 0,  // bf16 [vocab] row from `ws.logits`
+    Logits = 0,     // bf16 [vocab] row from `ws.logits` at `sample_row`
+    MtpLogits = 1,  // bf16 [vocab] row from `ws.logits` at the speculator DRAFT
+                    // row (`mtp_draft_row`) — the MTP head's next-token logits.
+    MtpDrafts = 2,  // I32 [k] SEPARATE device buffer (`ctx.mtp_drafts`) — the
+                    // device-resident spec-decode DRAFT TOKEN IDS (bravo's
+                    // retained `mtp_drafts` rows 1..=k). NOT a `ws.logits` row.
 };
 
 // One resolved per-fire binding. Produced by the runtime from the program's
@@ -191,6 +196,20 @@ public:
         return get_or_compile(bytecode);
     }
 
+    // Fire-and-forget prefetch (#11 TTFT): kick off the async NVRTC compile for
+    // `bytecode` + `manifest` at admission — before the consuming fire — so the
+    // PTX-gen overlaps the in-flight run-ahead steps off the critical path. The
+    // consuming `get_or_compile` then finds it Ready (or waits on the in-flight
+    // `shared_future`). Idempotent: dedup'd downstream by the program-cache key
+    // (`program_identity_hash(bytecode, manifest)`), the SAME key as the compile
+    // cache and #10's distinct-count, so prefetch ≡ compile ≡ dedup — no
+    // divergence. Default no-op: backends without async compile (mocks) inherit
+    // it unchanged; delta's `SamplingIrBackend` overrides it →
+    // `JitEngine::prefetch_compile`. `bytecode + manifest` in / nothing out keeps
+    // `IProgramBackend` backend-agnostic (no jit types leak).
+    virtual void prefetch_compile(std::span<const std::uint8_t> /*bytecode*/,
+                                  const ProgramManifest& /*manifest*/) {}
+
     // The program's declared input/output interface (from codegen).
     virtual const ProgramInterface& interface(ProgramHandle program) = 0;
 
@@ -285,6 +304,22 @@ struct FireContext {
     // The single logit row to sample (MVP single-row), OR the FIRST of
     // `num_rows` contiguous sampling rows for the batched de-hardwiring path.
     int                           sample_row = 0;
+    // #21 phase-2 mtp-logits: the `ws.logits` row an `IntrinsicKind::MtpLogits`
+    // binding reads — the speculator DRAFT position (MTP head output), vs
+    // `sample_row` for plain `Logits`. The MTP draft logits live in DRAFT ROWS
+    // of `ws.logits` (not a separate buffer), so this is a row-select. -1 = unset
+    // (no mtp-logits program this fire); the executor sets it from the MTP draft
+    // layout. When unset the resolver falls back to `sample_row` (safe default).
+    int                           mtp_draft_row = -1;
+    // Device-resident MTP spec-decode drafts (`IntrinsicKind::MtpDrafts`): the
+    // I32 `[k]` draft-token-ids buffer the executor source-selects from bravo's
+    // retained `mtp_drafts` (rows 1..=k of the `[k+1]` `[seed, drafts]` window
+    // retained by the PRIOR fire under this request's carrier link). A SEPARATE
+    // device buffer, NOT a `ws.logits` row — the resolver points the MtpDrafts
+    // intrinsic input straight at it. nullptr = unset (no mtp-drafts program /
+    // no retained source this fire); the resolver fails loud (no silent alias).
+    const void*                   mtp_drafts = nullptr;
+    std::size_t                   mtp_drafts_count = 0;
     // Number of contiguous sampling rows processed in one batched launch
     // (Task #4 [N,V] primitive). 1 = single-row (custom-program / MVP). The
     // bindings are base pointers (Intrinsic = block base at `sample_row`,

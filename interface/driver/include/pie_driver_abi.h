@@ -46,11 +46,33 @@ constexpr static const uint8_t PIE_SAMPLER_LOGPROBS = 9;
 
 constexpr static const uint8_t PIE_SAMPLER_ENTROPY = 10;
 
+/// Per-slot recurrent-state flags packed into [`ForwardRequest::rs_slot_flags`]
+/// (one `u8` per request). Bit flags — combine with bitwise OR. Kept as
+/// explicit `pub const`s (like the `PIE_SAMPLER_*` set) so cbindgen emits them
+/// verbatim as C consts for the driver's rs_cache kernels — single source of
+/// truth for the runtime producer and the driver consumer.
+///
+/// `RS_FLAG_RESET` (bit 0): reset the slot's recurrent state before executing
+/// the request (fresh context / replay-from-zero).
+constexpr static const uint8_t RS_FLAG_RESET = 1;
+
+/// `RS_FLAG_FOLD` (bit 1): after the pass, fold buffered recurrent state into
+/// the slot's folded state. The number of buffered tokens to fold is carried
+/// per request in [`ForwardRequest::rs_fold_lens`]. Set by the runtime in
+/// response to an explicit `inference.fold(set, n)` call.
+constexpr static const uint8_t RS_FLAG_FOLD = 2;
+
 /// Wire discriminant for a `Logits` slot.
 constexpr static const uint8_t SamplingBinding_KIND_LOGITS = 0;
 
 /// Wire discriminant for a `Tensor` slot.
 constexpr static const uint8_t SamplingBinding_KIND_TENSOR = 1;
+
+/// Wire discriminant for a `MtpLogits` (draft-logits intrinsic) slot.
+constexpr static const uint8_t SamplingBinding_KIND_MTP_LOGITS = 2;
+
+/// Wire discriminant for a `MtpDrafts` (draft-token-ids intrinsic) slot.
+constexpr static const uint8_t SamplingBinding_KIND_MTP_DRAFTS = 3;
 
 /// Copy direction for [`crate::CopyRequest`].
 enum PieCopyDir : uint8_t {
@@ -82,7 +104,7 @@ struct PieBrleDesc {
 };
 
 /// Per-slot adapter binding. `-1` sentinels mean "unbound" — both fields
-/// are signed so the wire form matches what portable's legacy SoA path
+/// are signed so the wire form matches what cuda's legacy SoA path
 /// already consumes (`.as<int64_t>()`), no shim conversion needed.
 struct PieAdapterBinding {
   /// `-1` means no adapter bound for this slot.
@@ -210,13 +232,78 @@ struct PieForwardRequestDesc {
   size_t sampling_binding_key_len;
   const uint32_t *sampling_binding_indptr_ptr;
   size_t sampling_binding_indptr_len;
+  const uint64_t *ptir_program_hashes_ptr;
+  size_t ptir_program_hashes_len;
+  const uint64_t *ptir_program_instances_ptr;
+  size_t ptir_program_instances_len;
+  const uint8_t *ptir_program_bytes_ptr;
+  size_t ptir_program_bytes_len;
+  const uint32_t *ptir_program_bytes_indptr_ptr;
+  size_t ptir_program_bytes_indptr_len;
+  const uint8_t *ptir_program_sidecar_bytes_ptr;
+  size_t ptir_program_sidecar_bytes_len;
+  const uint32_t *ptir_program_sidecar_indptr_ptr;
+  size_t ptir_program_sidecar_indptr_len;
+  const uint32_t *ptir_program_seed_channels_ptr;
+  size_t ptir_program_seed_channels_len;
+  const uint8_t *ptir_program_seed_blob_ptr;
+  size_t ptir_program_seed_blob_len;
+  const uint32_t *ptir_program_seed_lens_ptr;
+  size_t ptir_program_seed_lens_len;
+  const uint32_t *ptir_program_seed_indptr_ptr;
+  size_t ptir_program_seed_indptr_len;
+  const uint32_t *ptir_program_host_put_channels_ptr;
+  size_t ptir_program_host_put_channels_len;
+  const uint8_t *ptir_program_host_put_blob_ptr;
+  size_t ptir_program_host_put_blob_len;
+  const uint32_t *ptir_program_host_put_lens_ptr;
+  size_t ptir_program_host_put_lens_len;
+  const uint32_t *ptir_program_host_put_indptr_ptr;
+  size_t ptir_program_host_put_indptr_len;
   uint32_t pipeline_source_link;
+  uint8_t pipeline_source_kind;
   const uint32_t *next_input_producer_links_ptr;
   size_t next_input_producer_links_len;
   const uint32_t *next_input_src_rows_ptr;
   size_t next_input_src_rows_len;
   const uint32_t *next_input_dest_slots_ptr;
   size_t next_input_dest_slots_len;
+  const uint32_t *rs_fold_lens_ptr;
+  size_t rs_fold_lens_len;
+  const uint32_t *rs_buffer_slot_ids_ptr;
+  size_t rs_buffer_slot_ids_len;
+  const uint32_t *rs_buffer_slot_indptr_ptr;
+  size_t rs_buffer_slot_indptr_len;
+  const uint32_t *next_input_free_links_ptr;
+  size_t next_input_free_links_len;
+  const uint64_t *sampling_output_dst_ptrs_ptr;
+  size_t sampling_output_dst_ptrs_len;
+  const uint32_t *sampling_output_dst_lens_ptr;
+  size_t sampling_output_dst_lens_len;
+  const uint32_t *sampling_output_indptr_ptr;
+  size_t sampling_output_indptr_len;
+  const uint64_t *sampling_late_device_ptrs_ptr;
+  size_t sampling_late_device_ptrs_len;
+  const uint64_t *sampling_late_device_flags_ptr;
+  size_t sampling_late_device_flags_len;
+  const uint32_t *sampling_late_device_lens_ptr;
+  size_t sampling_late_device_lens_len;
+  const uint32_t *kv_len_ptr;
+  size_t kv_len_len;
+  const uint32_t *pipeline_source_links_ptr;
+  size_t pipeline_source_links_len;
+  const uint8_t *pipeline_source_kinds_ptr;
+  size_t pipeline_source_kinds_len;
+  const uint64_t *kv_len_device_ptr;
+  size_t kv_len_device_len;
+  const uint32_t *carry_abi_version_ptr;
+  size_t carry_abi_version_len;
+  const uint64_t *carry_user_ptr_ptr;
+  size_t carry_user_ptr_len;
+  const uint64_t *carry_word_index_ptr;
+  size_t carry_word_index_len;
+  const uint64_t *carry_instance_ptr;
+  size_t carry_instance_len;
 };
 
 struct PieCopyRequestDesc {
@@ -289,6 +376,21 @@ struct PieForwardResponseDesc {
   uint32_t probe_kernel_launch_us;
   uint32_t probe_sync_us;
   uint32_t probe_response_build_us;
+  uint32_t probe_device_idle_us;
+  const uint32_t *program_tokens_req_indptr_ptr;
+  size_t program_tokens_req_indptr_len;
+  const uint32_t *program_tokens_indptr_ptr;
+  size_t program_tokens_indptr_len;
+  const uint32_t *program_tokens_ptr;
+  size_t program_tokens_len;
+  const uint32_t *ptir_output_channels_ptr;
+  size_t ptir_output_channels_len;
+  const uint8_t *ptir_output_blob_ptr;
+  size_t ptir_output_blob_len;
+  const uint32_t *ptir_output_lens_ptr;
+  size_t ptir_output_lens_len;
+  const uint32_t *ptir_output_indptr_ptr;
+  size_t ptir_output_indptr_len;
 };
 
 /// Generic status response. Convention:

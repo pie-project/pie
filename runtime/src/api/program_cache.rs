@@ -22,20 +22,12 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use lru::LruCache;
-use pie_sampling_ir::{OutputKind, SamplingProgram, ValidationError};
+use pie_sampling_ir::{OutputKind, Readiness, SamplingProgram, ValidationError};
 
-/// FNV-1a 64-bit, byte-identical to the driver's `jit::fnv1a64` — so the host's
-/// program hash equals the driver `ProgramHandle` (one key across the boundary).
-pub fn program_hash(bytecode: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = OFFSET;
-    for &b in bytecode {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    h
-}
+/// FNV-1a 64-bit program-identity hash — re-exported from `pie-sampling-ir` (the
+/// single canonical impl beside `encode`, byte-identical to the driver's
+/// `jit::fnv1a64` ⇒ host hash == driver `ProgramHandle`).
+pub use pie_sampling_ir::program_hash;
 
 /// The interned, immutable artifact for one distinct sampler program.
 #[derive(Debug)]
@@ -46,8 +38,22 @@ pub struct CachedProgram {
     pub hash: u64,
     /// Per-output marshaling kinds, in declared order (host response routing).
     pub output_kinds: Vec<OutputKind>,
+    /// Per-output element count (`ValueType.shape.numel()`), in declared order.
+    /// `1` for a scalar/single-`Token`, `k` for a `[k]`-Token / `[k]` vector
+    /// output. Drives the shape-aware marshal (`[k]`-Token routing) and the
+    /// fast-path eligibility gate (single-`[1]`-Token only).
+    pub output_elem_counts: Vec<u32>,
     /// Declared input-slot count (binding-arity check at attach).
     pub num_inputs: usize,
+    /// Per-input-slot readiness (`Submit`/`Late`), in `Op::Input(i)` order, from
+    /// the program's `InputDecl.ready`. The host gather routes a bound `tensor`
+    /// per slot: `Submit` → `sampling_input_*` (gathered now), `Late` → the
+    /// device-alias `sampling_late_*` channel (#27 cut #2). Defaults all `Submit`.
+    pub input_readiness: Vec<Readiness>,
+    /// Per-input-slot declared types, in `Op::Input(i)` order — the attach-time
+    /// intrinsic shape contract (`validate::intrinsic_decl_ok`: Stage-2
+    /// `[K, vocab]` MtpLogits / matrix Logits) is checked against these.
+    pub input_decls: Vec<pie_sampling_ir::InputDecl>,
 }
 
 /// Default bound: high-concurrency unique-sampler churn (`#11`) must not grow the
@@ -80,11 +86,18 @@ impl ProgramCache {
         // Cold path only: derive the per-output marshaling kinds (re-validates,
         // but `program` is already decode-validated so this cannot fail here).
         let output_kinds = pie_sampling_ir::output_kinds(program)?;
+        let output_elem_counts = pie_sampling_ir::output_types(program)?
+            .iter()
+            .map(|t| t.shape.numel() as u32)
+            .collect();
         let entry = Arc::new(CachedProgram {
             bytecode,
             hash,
             output_kinds,
+            output_elem_counts,
             num_inputs: program.inputs.len(),
+            input_readiness: program.inputs.iter().map(|i| i.ready).collect(),
+            input_decls: program.inputs.clone(),
         });
         self.inner.put(hash, entry.clone());
         Ok(entry)
@@ -149,15 +162,6 @@ mod tests {
 
     fn enc(p: &SamplingProgram) -> Vec<u8> {
         pie_sampling_ir::encode(p)
-    }
-
-    #[test]
-    fn fnv1a64_matches_driver_vectors() {
-        // Standard FNV-1a-64 vectors == the driver's `jit::fnv1a64` (offset
-        // 0xcbf29ce484222325, prime 0x100000001b3).
-        assert_eq!(program_hash(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(program_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(program_hash(b"foobar"), 0x8594_4171_f739_67e8);
     }
 
     #[test]

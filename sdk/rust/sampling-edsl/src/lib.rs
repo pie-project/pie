@@ -32,14 +32,22 @@ extern crate alloc;
 pub mod builder;
 pub mod dynamic;
 pub mod ir;
+pub mod kinds;
 pub mod program;
 pub mod standard;
 pub mod sugar;
 
 pub use builder::{BuildError, Built, Graph, HostInputDecl, LoweredProgram, OutputKind};
 pub use dynamic::{DynValue, dselect};
-pub use standard::{StandardSampler, StdParamKeys, build_standard};
-pub use sugar::{SamplerSpec, build_sampler, lower_sampler};
+pub use kinds::{CanonicalKind, infer_kind};
+pub use standard::{
+    StandardSampler, StdParamKeys, build_standard, standard_program, standard_program_hashes,
+    standard_programs,
+};
+#[allow(deprecated)] // `lower_sampler` is deprecated (#17) but the path is kept for compat.
+pub use sugar::{
+    SamplerSpec, SubmitValues, build_sampler, canonical_kind, lower_sampler, lower_sampler_standard,
+};
 
 // IR enums an author touches at the surface.
 pub use ir::{DType, Readiness};
@@ -50,7 +58,9 @@ pub mod prelude {
     pub use crate::dynamic::{DynValue, dselect};
     pub use crate::ir::{DType, Readiness};
     pub use crate::program::{
-        grammar, grammar_sampled, mirostat, spec_verify_greedy, spec_verify_lossless,
+        grammar, grammar_sampled, mirostat, mirostat_argmax_floor, mirostat_floor,
+        spec_verify_greedy, spec_verify_lossless,
     };
+    #[allow(deprecated)] // `lower_sampler` is deprecated (#17); kept in the prelude for compat.
     pub use crate::sugar::{SamplerSpec, build_sampler, lower_sampler};
 }

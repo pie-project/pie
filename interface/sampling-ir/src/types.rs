@@ -139,17 +139,28 @@ impl ValueType {
     }
 }
 
-/// A typed input slot (the WIT `record input { shape, dtype }`). Binding-free;
-/// the binding is attached at forward-pass time.
+/// A typed input slot (the WIT `record input { shape, dtype, ready }`). The
+/// source binding (which slot is logits vs a host tensor) stays attach-time, but
+/// the **readiness** is a program property: a `Late` slot is injected per-fire
+/// before its first consuming op (e.g. a grammar mask computed post-logits), so
+/// a late-input program is a distinct recognized shape. Readiness is encoded
+/// additively in **bit 7 of the dtype byte**, so v4 bytecode decodes as `Submit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputDecl {
     pub shape: Shape,
     pub dtype: DType,
+    pub ready: Readiness,
 }
 
 impl InputDecl {
+    /// A `Submit`-readiness input slot (the common case).
     pub const fn new(shape: Shape, dtype: DType) -> Self {
-        Self { shape, dtype }
+        Self { shape, dtype, ready: Readiness::Submit }
+    }
+    /// An input slot with explicit readiness (`Late` = injected per-fire before
+    /// its first consuming op).
+    pub const fn with_ready(shape: Shape, dtype: DType, ready: Readiness) -> Self {
+        Self { shape, dtype, ready }
     }
     pub fn ty(&self) -> ValueType {
         ValueType::new(self.shape, self.dtype)
@@ -241,6 +252,15 @@ pub enum Op {
         vals: ValueId,
     },
 
+    /// Apply a packed allowed-token bitmask to logits: `out[j] = bit_j(mask) ?
+    /// logits[j] : −∞`, where `bit_j = (mask[j>>5] >> (j&31)) & 1` (word
+    /// `j/32`, bit `j%32`). **Bit 1 = allowed → pass-through, bit 0 =
+    /// disallowed → `−∞`.** `logits` is `[n]`; `mask` is `[ceil(n/32)]` U32
+    /// (word-indexed, NOT broadcast); result ≡ `logits` (shape + dtype). The
+    /// de-hardwired grammar/constrained-decode mask channel (the matcher emits
+    /// the packed bits; this op applies them in-program).
+    MaskApply { logits: ValueId, mask: ValueId },
+
     /// Per-element noise of `shape` (F32). **No seed operand:** the per-fire seed
     /// is ambient (the runtime's per-row `sample_seed`), folded into every key by
     /// codegen. `stream` is a static per-op salt decorrelating multiple `Rng`
@@ -266,8 +286,9 @@ impl Op {
     }
 
     /// The [`ValueId`]s this op reads, in a stable order. Leaves (`Input`,
-    /// `Const`) and immediates (input-index, shape, stream, predicate `k`) are
-    /// excluded; value-id predicate operands are included.
+    /// `Const`) and immediates (input-index, shape, stream) are excluded; the
+    /// value-id predicate operands (top-k `k`, top-p `p`, min-p `thr`) are
+    /// included.
     pub fn operands(&self) -> Vec<ValueId> {
         use alloc::vec;
         match *self {
@@ -298,7 +319,8 @@ impl Op {
             | Op::Ge(a, b)
             | Op::Eq(a, b)
             | Op::Gather { src: a, idx: b }
-            | Op::GatherRow { src: a, idx: b } => vec![a, b],
+            | Op::GatherRow { src: a, idx: b }
+            | Op::MaskApply { logits: a, mask: b } => vec![a, b],
 
             Op::Select { cond, a, b } => vec![cond, a, b],
             Op::ScatterAdd { base, idx, vals } | Op::ScatterSet { base, idx, vals } => {
@@ -306,8 +328,9 @@ impl Op {
             }
 
             Op::PivotThreshold { input, predicate } => match predicate {
-                Predicate::RankLe(_) => vec![input],
-                Predicate::CummassLe(v) | Predicate::ProbGe(v) => vec![input, v],
+                Predicate::RankLe(v) | Predicate::CummassLe(v) | Predicate::ProbGe(v) => {
+                    vec![input, v]
+                }
             },
         }
     }
@@ -316,8 +339,11 @@ impl Op {
 /// Threshold predicate for [`Op::PivotThreshold`] (top-k / top-p / min-p).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Predicate {
-    /// top-k: keep the top `k` (immediate).
-    RankLe(u32),
+    /// top-k: keep the top `k` — a value id (host-submit `U32` scalar, or a
+    /// per-row `[rows]` `U32` vector for a matrix input). De-hardwired like
+    /// top-p `p` / min-p `thr`, so the program bytecode is k-invariant (`k` is
+    /// supplied at submit, never a baked immediate).
+    RankLe(ValueId),
     /// top-p: inclusive nucleus to mass `p` (a Scalar-F32 value id).
     CummassLe(ValueId),
     /// min-p: keep `>= thr` (a Scalar-F32 value id, e.g. `p·max_prob`).
@@ -373,6 +399,35 @@ pub enum Readiness {
 pub enum Binding {
     /// The LM-head logits intrinsic (positions resolved host-side).
     Logits,
+    /// The speculator's **draft** logits intrinsic (de-hardwired speculation).
+    /// Source-selects the draft rows of `ws.logits` rather than a separate
+    /// buffer — host→driver as `IntrinsicKind::MtpLogits`, resolving to
+    /// draft-row offsets within `ws.logits`. A **distinct manifest variant**
+    /// (not a kind-byte on `Logits`) so a stale reader loud-rejects rather than
+    /// misparses a layout change. Manifest-only, additive — not in the bytecode.
+    ///
+    /// **Shape contract (Stage 2, overview §6.1):** the bound slot's
+    /// [`InputDecl`] is F32, either `[vocab]` (legacy single-draft, K=1 ⇒ the
+    /// M=1 draft row) or **`[K, vocab]`** — the MTP head's K next-step draft
+    /// proposals, one row per draft position. `K` is trace-known (the decl's
+    /// row count); the driver maps the K rows to the pass's draft rows
+    /// (`ctx.mtp_draft_row .. +K`) at fire time. Checked by
+    /// [`crate::validate::intrinsic_decl_ok`] — the one definition the
+    /// runtime attach and every backend enforce.
+    MtpLogits,
+    /// The MTP **draft tokens** intrinsic (device-resident spec-decode). The
+    /// `[k]` fresh drafts the MTP head proposed on the prior fire, injected
+    /// device-side via the drafts-channel carrier (`pipeline_source_kind =
+    /// PrevDrafts`) — the device-resident analog of `spec_verify_greedy`'s
+    /// host-supplied draft vector. A **distinct manifest variant** (not a
+    /// kind-byte on `Logits`) so a stale reader loud-rejects rather than
+    /// misparses; additive, manifest-only, not in the bytecode. Mirrors
+    /// [`Binding::MtpLogits`].
+    ///
+    /// **Shape contract:** the bound slot's [`InputDecl`] is I32, `[k]` (rank-1)
+    /// — the `k` next-step draft token ids (`k` trace-known = the decl's element
+    /// count). Checked by [`crate::validate::intrinsic_decl_ok`].
+    MtpDrafts,
     /// A host-visible `tensor` resource, keyed, ready per [`Readiness`].
     Tensor {
         key: TensorKey,

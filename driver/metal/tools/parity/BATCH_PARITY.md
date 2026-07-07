@@ -1,0 +1,76 @@
+# M>1 multi-batch parity gate
+
+The throughput bench runs **M sequences concurrently**. Correctness for batch=M
+reduces to one invariant:
+
+> **Every sequence in the batch produces output bit-identical-to-gate to what it
+> would produce ALONE (M=1).**
+
+i.e. batching introduces (a) no cross-sequence contamination, (b) correct per-seq
+paged-KV indexing, (c) ragged (mixed-length) prompts that don't perturb each other.
+
+`batch_parity.py` enforces it: for each slot `i`, it walks the batched run's seq-`i`
+taps through the **same per-kernel `cosine_bisect` comparison** against that prompt's
+sealed **M=1 golden**, AND checks the seq-`i` logits argmax matches the golden argmax.
+
+## Tap-emission contract (M>1 executor → LOCKED with beta)
+
+Each tap is ONE file `<layer>.<kernel>.npy` shaped **`[N, ...]`** (N = total tokens in
+the batch, Pie's token-major activation buffer — zero-copy row emission), plus
+**`qo_indptr.npy`** `[R+1]` emitted alongside. Sequence `i` owns activation rows
+**`[qo_indptr[i], qo_indptr[i+1])`**:
+- **Pure decode** (N==R, 1 tok/seq): seq `i` = row `i`.
+- **Ragged prefill** (the mbatch set, lengths 8/16/30/54): seq `i` owns its qo-span; the
+  gate compares the seq's **decision row** (last of the span — the token that feeds the next
+  decode) to the golden's decision row, or the **full span** with `--full-span` (golden and
+  candidate both span-sliced symmetrically — catches mid-prompt contamination). No padding —
+  qo_indptr-sliced, matching delta's paged-KV `qo_indptr` walk 1:1.
+
+Alternative `subdir` layout (`<dump>/seq<i>/<layer>.<kernel>.npy`, one vanilla dump dir per
+seq) is also supported via `--layout subdir`.
+
+Tap names + per-kernel execution order are IDENTICAL to the M=1 golden (see
+`cosine_bisect.py` `QWEN36_INTRA_ORDER` / `GEMMA4_INTRA_ORDER`). Same `--skip q_norm,k_norm`
+for gemma4 in-place-rope tap artifacts.
+
+## Prompt set (`mbatch_prompts.json`, varied lengths = ragged stress)
+
+| slot | qwen3.6 tok | gemma4 tok | intent |
+|---|---|---|---|
+| 0 | 8  | 9  | short (golden-style continuation) |
+| 1 | 16 | 17 | medium |
+| 2 | 30 | 24 | long |
+| 3 | 54 | 53 | longest (near-canonical 64-prompt) |
+
+The length spread forces ragged batching: per-seq positions, `qo_indptr` spans, and
+`kv_page_indptr`/`kv_last_page_lens` must all be correct or seqs cross-contaminate.
+
+## Goldens (NOT committed — live at `~/parity-golden/mbatch/`)
+
+- `reference_argmax.json` — cross-engine (mlx-lm) first-decode argmax per (model, slot):
+  the secondary cross-engine anchor each batched seq must hit.
+- `token_ids.json` + `ids_<model>_seq<i>.csv` — pre-tokenized prompt ids (per model) for the
+  golden producer below (BOS-prepended for gemma).
+- `m1/<model>/seq<i>/` — the **M=1 raw-Metal per-kernel goldens** (the primary gate target).
+  **Produced by the SAME M>1 harness run with a SINGLE prompt** (M=1) — emits the same
+  `[N_seq, ...]` rowslice taps + `qo_indptr.npy` = `[0, N_seq]` the gate already consumes.
+  Same binary lineage as the M=4 candidate ⇒ the gate isolates **batching only**, zero
+  cross-binary confound, leaning on the sealed *N=1-reduces-to-M=1* property. No standalone
+  `decode_run` / separate CMake path needed:
+  ```
+  # golden: one prompt alone (M=1)            # candidate: all four batched (M=4)
+  <m>1-harness --prompts $(cat ids_qwen3.6_seq0.csv) --dump m1/qwen3.6/seq0
+  <m>1-harness --prompts <four-prompts>       --dump batched/
+  ```
+  Legacy single-position goldens (e.g. `~/parity-golden/qwen36-pos7`, no `qo_indptr.npy`) are
+  loaded as-is for back-compat. [pending the M>1 harness — beta wires it w/ the first dump]
+
+## Usage
+
+```
+python batch_parity.py --batched <M>1-dump> \
+  --golden 0=~/parity-golden/mbatch/m1/qwen3.6/seq0 \
+           1=~/parity-golden/mbatch/m1/qwen3.6/seq1 ... \
+  --layout rowslice --threshold 0.999 [--qo-indptr <dump>/qo_indptr.npy] [--full-span] [--skip q_norm,k_norm]
+```
+Exit 0 = every seq matches its M=1 golden (cosine >= 0.999 + argmax exact); 1 = a seq diverged.

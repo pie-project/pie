@@ -1,15 +1,67 @@
 /** @module Interface pie:core/inference **/
-export type Pollable = import('./wasi-io-poll.js').Pollable;
 export type Error = import('./pie-core-types.js').Error;
-export type Context = import('./pie-core-context.js').Context;
-export type Model = import('./pie-core-model.js').Model;
-export type Tokenizer = import('./pie-core-model.js').Tokenizer;
 export type Adapter = import('./pie-core-adapter.js').Adapter;
-export type PageId = import('./pie-core-context.js').PageId;
+export type Image = import('./pie-core-media.js').Image;
+export type Audio = import('./pie-core-media.js').Audio;
+export type KvWorkingSet = import('./pie-core-working-set.js').KvWorkingSet;
+export type RsWorkingSet = import('./pie-core-working-set.js').RsWorkingSet;
 /**
  * binary run-length encoding
  */
 export type Brle = Uint32Array;
+/**
+ * ── Forward-pass memory contract (explicit read/write descriptors) ──────
+ * A forward pass READS the pages/tokens designated as *context* and WRITES
+ * only the indices/ranges designated as *output*. There is no ambient
+ * context handle and no implicit append. Output indices/ranges must be
+ * unique per pass; output may overlap context only when it is also
+ * declared as output. The runtime CoWs every write target before driver
+ * submission; on driver failure the output objects are left invalid /
+ * private and are NOT CAS-sealed.
+ * KV pages this pass reads as attention context: the half-open relative
+ * span [start, start + len) of `set`, of which the first `valid-tokens`
+ * tokens participate in attention (trailing reserved slots may be empty).
+ */
+export interface KvContext {
+  set: KvWorkingSet,
+  start: number,
+  len: number,
+  validTokens: number,
+}
+/**
+ * KV pages this pass writes: the relative `indices` of `set` that receive
+ * freshly computed KV, with `per-page-valid-lens[i]` valid tokens written
+ * into page `indices[i]` (the two lists are parallel). Indices must be
+ * unique. `generation` is the value the caller read from
+ * `set.generation()` when it captured `indices`; if `set` has since been
+ * structurally mutated (alloc/free/reorder/append) the runtime rejects the
+ * pass with a clean stale-generation error instead of writing stale slots.
+ */
+export interface KvOutput {
+  set: KvWorkingSet,
+  generation: number,
+  indices: Uint32Array,
+  perPageValidLens: Uint32Array,
+}
+/**
+ * Buffered recurrent state this pass reads: `len-tokens` tokens starting at
+ * buffered token offset `start-token` of `set`.
+ */
+export interface RsBufferContext {
+  set: RsWorkingSet,
+  startToken: number,
+  lenTokens: number,
+}
+/**
+ * Buffered recurrent state this pass writes: `len-tokens` tokens starting
+ * at `start-token` of `set`. Writing buffered RS does NOT fold it; folding
+ * is the separate `fold` operation.
+ */
+export interface RsBufferOutput {
+  set: RsWorkingSet,
+  startToken: number,
+  lenTokens: number,
+}
 export type Sampler = SamplerMultinomial | SamplerTopK | SamplerTopP | SamplerMinP | SamplerTopKTopP | SamplerEmbedding | SamplerDist | SamplerRawLogits | SamplerLogprob | SamplerLogprobs | SamplerEntropy;
 export interface SamplerMultinomial {
   tag: 'multinomial',
@@ -145,14 +197,60 @@ export interface Output {
 }
 
 export class ForwardPass {
-  constructor(model: Model)
-  context(context: Context): void;
+  constructor()
+  /**
+  * KV attention context this pass reads. Replaces the old opaque
+  * `context` handle. For hybrid models, combine with `rs-context`.
+  */
+  kvContext(ctx: KvContext): void;
+  /**
+  * KV pages this pass writes.
+  */
+  kvOutput(out: KvOutput): void;
+  /**
+  * Buffered recurrent state this pass reads (hybrid / linear-attention).
+  */
+  rsContext(ctx: RsBufferContext): void;
+  /**
+  * Buffered recurrent state this pass writes.
+  */
+  rsOutput(out: RsBufferOutput): void;
+  /**
+  * Fold the first `tokens` buffered recurrent-state tokens of this
+  * pass's RS working set into its folded state AS PART OF this forward
+  * — piggybacking on the in-forward fold the driver already does (e.g.
+  * cuda GDN commit-advance), not a separate op. Rides the pass's atomic
+  * txn + submit. `tokens` counts buffered tokens and must be a positive
+  * multiple of the model's fold granularity (`model.rs-fold-granularity`)
+  * and within the buffered suffix; the runtime rejects an invalid count
+  * before submission. No rollback across a fold — fork the RS working
+  * set first if you may need to revert. A pass may write buffered RS
+  * (`rs-output`) without folding; folding is opt-in via this call.
+  */
+  foldBuffered(tokens: number): void;
   inputTokens(tokens: Uint32Array, positions: Uint32Array): void;
+  /**
+  * Splice an encoded visual span (image or video clip) at sequence
+  * position `anchor`. The driver runs the vision encoder and scatters
+  * the projected rows into the hidden state for this span. See
+  * MULTIMODAL.md.
+  */
+  inputImage(image: Image, anchor: number): void;
+  /**
+  * Splice an encoded audio clip at sequence position `anchor`. The
+  * driver runs the gemma4_audio encoder and scatters the projected
+  * soft-token rows into the hidden state. See audio_frontend.md.
+  */
+  inputAudio(audio: Audio, anchor: number): void;
   inputSpeculativeTokens(tokens: Uint32Array, positions: Uint32Array): void;
   /**
   * enabled by default
   */
   outputSpeculativeTokens(flag: boolean): void;
+  /**
+  * Controls runtime pass-level speculation for this execute only.
+  */
+  passSpeculation(flag: boolean): void;
   /**
   * if not provided, fallback to causal mask
   */
@@ -163,19 +261,7 @@ export class ForwardPass {
   logitMask(mask: Brle): void;
   sampler(indices: Uint32Array, sampler: Sampler): void;
   adapter(adapter: Adapter): void;
-  execute(): FutureOutput;
-}
-
-export class FutureOutput {
-  /**
-   * This type does not have a public constructor.
-   */
-  private constructor();
-  /**
-  * Returns a pollable object to check when the result is ready
-  */
-  pollable(): Pollable;
-  get(): Output | undefined;
+  execute(): Promise<Output>;
 }
 
 export class Grammar {
@@ -208,9 +294,9 @@ export class Grammar {
 
 export class Matcher {
   /**
-  * Create a new matcher from a grammar and tokenizer.
+  * Create a new matcher from a grammar.
   */
-  constructor(grammar: Grammar, tokenizer: Tokenizer)
+  constructor(grammar: Grammar)
   /**
   * Accept one or more decoded tokens, advancing the matcher state.
   * Returns an error if any token violates the grammar.

@@ -138,7 +138,6 @@ impl RuntimeAbi {
         Ok(Self {
             name: match target.backend {
                 crate::types::BackendKind::Cuda => "pie-cuda".to_string(),
-                crate::types::BackendKind::Portable => "pie-portable".to_string(),
                 crate::types::BackendKind::Unknown => "pie".to_string(),
             },
             version: 1,

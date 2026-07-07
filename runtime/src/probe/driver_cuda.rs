@@ -78,6 +78,13 @@ pub struct DriverCudaProbes {
     /// C++-side: `response_builder.build_token_only_dense` (writes the
     /// sampled tokens into the IPC response slab).
     pub response_build_us: AtomicU64,
+    /// C++-side: the DEVICE-idle inter-fire bubble measured AT THE DRIVER — the
+    /// gap from the previous fire's kernel-retire (post final `cudaStreamSynchronize`)
+    /// to this fire's entry, before any GPU op. The precise bubble-p50 signal for
+    /// the `< 100 µs` gate: unlike the scheduler's host proxy (`inter_batch_bubble_us`,
+    /// stamped when the loop *receives* the completion → IPC-lagged, over-counts),
+    /// this is stamped inside the driver so it isolates the true GPU-idle gap.
+    pub device_idle_us: AtomicU64,
 }
 
 // =============================================================================

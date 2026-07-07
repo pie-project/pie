@@ -4,8 +4,7 @@
 // All meaningful logic lives in `run_impl`; the `extern "C"` wrapper
 // at the bottom catches any escaping C++ exception so we never
 // propagate across the FFI boundary (which would be UB). Mirrors
-// driver/portable/src/entry.cpp's shape — see that file for the
-// invariants.
+// the shared embedded-driver entry shape and invariants.
 
 #include "entry.hpp"
 
@@ -89,6 +88,17 @@
 #include "executor/executor.hpp"
 #include "service/inproc_service.hpp"
 #include <pie_ipc/inproc_server.hpp>
+
+// #11 prefetch-seam: the C-ABI NVRTC-warm trampoline (defined in
+// sampling_ir/jit_backend.cpp; canonical decl in jit_backend.hpp). Forward-
+// declared here — rather than pulling the heavy codegen/JIT headers into this
+// TU — so the in-proc serve setup can register it with the Rust InProcChannel
+// via `PieInProcVTable::register_prefetch` at backend-ready. The signature is
+// the locked `PiePrefetchFn` ABI (pie_ipc.h); a mismatch is a link error.
+extern "C" void pie_sampling_ir_prefetch_trampoline(
+    void* backend_ctx, const std::uint8_t* bytecode, std::size_t bytecode_len,
+    const std::uint8_t* binds_kind, const std::uint32_t* binds_key,
+    std::size_t binds_len);
 
 namespace {
 
@@ -480,7 +490,20 @@ int run_impl(int argc,
     // bucket larger than the real request count; charge that implementation
     // detail to the planner's safety headroom instead of reducing the
     // advertised runtime pool.
-    const int runtime_kv_pages = mem_plan.kv_pages;
+    // KV-page cap: `PIE_KV_PAGE_CAP` env (guru-approved test override) takes
+    // precedence, else the `[batching].total_pages` config field, else derive
+    // from gpu_mem_utilization. Forces a tiny deterministic pool for the
+    // contention/preempt e2e independent of the forward-layout budget floor.
+    const long kv_page_cap = [&]() -> long {
+        if (const char* e = std::getenv("PIE_KV_PAGE_CAP")) {
+            const long v = std::atol(e);
+            if (v > 0) return v;
+        }
+        return static_cast<long>(cfg.batching.total_pages);
+    }();
+    const int runtime_kv_pages = (kv_page_cap > 0)
+        ? std::min<int>(mem_plan.kv_pages, static_cast<int>(kv_page_cap))
+        : mem_plan.kv_pages;
     const int physical_kv_pages =
         mem_plan.kv_pages > 0 ? mem_plan.kv_pages + 1 : mem_plan.kv_pages;
     const int graph_pad_page =
@@ -647,6 +670,20 @@ int run_impl(int argc,
             const int stash_width = conv_dim + 2 * local_linear_value_heads;
             qwen3_5_state_cache.configure_verify_hidden_stash(
                 max_workspace_tokens, stash_width);
+            // Ph7 RS working-set fold-from-buffer: persistent slot-indexed
+            // buffered-activation pool. Same per-token [mixed_qkv|a|b] layout +
+            // width as the verify stash (so the fold replay's gather works), but
+            // PERSISTENT and slot-indexed. Sized to q35_alloc_slots: folded +
+            // buffered slabs draw distinct ids from one shared rs_gpu BlockPool
+            // (0..rs_blocks), so a buffered slab id can be anywhere in range.
+            // page_tokens = KV page size (rs-buffer-page-size == kv_page_size v1).
+            qwen3_5_state_cache.configure_rs_buffer_pool(
+                mem_plan.kv_page_size, stash_width, q35_alloc_slots);
+            if (verbose) {
+                std::cerr << "[pie-driver-cuda] qwen3.5 rs_buffer_pool: page_tokens="
+                          << mem_plan.kv_page_size << " width=" << stash_width
+                          << " slots=" << q35_alloc_slots << "\n";
+            }
         }
         const std::size_t recurrent_elem_bytes =
             pie_cuda_driver::RecurrentStateCache::recurrent_state_bf16_default()
@@ -1409,6 +1446,21 @@ int run_impl(int argc,
         }
         pie_cuda_driver::service::InProcService service{
             executor, kv_cache, swap_pool, csm_model.get()};
+        // #11 prefetch-seam: install the C++ NVRTC-warm trampoline into the Rust
+        // InProcChannel so host-side `driver::prefetch_compile` can warm the JIT
+        // PTX cache off-TTFT. Force-create the IR backend now (backend-ready —
+        // the CUDA context is current on this thread) so a prefetch that arrives
+        // before the first fire has a live compile-cache to warm; on NVRTC-init
+        // failure `ensure_*` returns null and the trampoline no-ops on it.
+        // Registered once here (vs per fire). `register_prefetch` is optional on
+        // the Rust side — a transport without prefetch leaves it null.
+        if (vtable_opt->register_prefetch != nullptr) {
+            auto* ir_backend =
+                pie_cuda_driver::ensure_sampling_ir_backend(executor);
+            vtable_opt->register_prefetch(
+                vtable_opt->ctx, &pie_sampling_ir_prefetch_trampoline,
+                ir_backend);
+        }
         service.serve_forever(*server_p);
         handled = service.handled();
         // Leader exited serve loop — wake followers so they can tear

@@ -12,8 +12,6 @@
 
 import * as _reasoning from 'pie:instruct/reasoning';
 
-import type { Model } from './model.js';
-
 // =============================================================================
 // Events
 // =============================================================================
@@ -67,8 +65,8 @@ export const Event = {
 export class Decoder {
   readonly #inner: _reasoning.Decoder;
 
-  constructor(model: Model) {
-    this.#inner = _reasoning.createDecoder(model._handle);
+  constructor() {
+    this.#inner = _reasoning.createDecoder();
   }
 
   /** Feed a token batch and get back the event that fired. Returns

@@ -1,0 +1,13 @@
+[package]
+name = "beam"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet.workspace = true
+inferlet-macros.workspace = true
+# SDK-authored: the faithful overview §6.2 beam trace via ForwardPass/Channel/epilogue.
+ptir = { path = "../../../../sdk/rust/ptir" }

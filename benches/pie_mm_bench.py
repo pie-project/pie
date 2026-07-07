@@ -87,10 +87,8 @@ def build_config(args: argparse.Namespace, port: int):
     device = [d.strip() for d in args.device.split(",")]
     if args.mode == "latency":
         max_concurrent: int | None = 1
-        batch_policy = "greedy"
     else:
         max_concurrent = None if args.concurrency == 0 else args.concurrency
-        batch_policy = "adaptive"
 
     driver_options = {
         "gpu_mem_utilization": args.gpu_mem_util,
@@ -113,7 +111,6 @@ def build_config(args: argparse.Namespace, port: int):
                 name="default",
                 hf_repo=args.model,
                 scheduler=SchedulerConfig(
-                    batch_policy=batch_policy,
                     default_token_limit=args.default_token_limit,
                     default_endowment_pages=args.endowment_pages,
                     admission_oversubscription_factor=args.admission_oversubscription_factor,
@@ -134,7 +131,6 @@ def build_config(args: argparse.Namespace, port: int):
         "modality": "image",
         "image": args.image,
         "driver": args.driver,
-        "scheduler": batch_policy,
         "endowment_pages": args.endowment_pages,
         "gpu_mem_utilization": args.gpu_mem_util,
         "max_concurrent_processes": max_concurrent,
@@ -260,7 +256,6 @@ async def run(args: argparse.Namespace):
                 try:
                     p = await client.launch_process(
                         pkg, input=make_input(i, max_tokens=max_tokens),
-                        token_budget=args.token_budget,
                     )
                     while True:
                         ev, msg = await asyncio.wait_for(p.recv(), timeout=args.request_timeout)
@@ -382,8 +377,6 @@ def main() -> None:
                         help="Scheduler admission oversubscription (match pie_bench).")
         sp.add_argument("--speculation-depth", type=int, default=None,
                         help="Pass-level chain-firing depth (hides guest<->host per-step round-trip).")
-        sp.add_argument("--token-budget", type=int, default=2048,
-                        help="Per-process admission token budget.")
         sp.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
         sp.add_argument("--dump-first-text", action="store_true",

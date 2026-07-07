@@ -35,8 +35,7 @@ fn bootstrap_succeeds() {
 #[test]
 fn model_registered() {
     let _ = state();
-    let models = pie::model::models();
-    assert_eq!(models, vec!["test-model"]);
+    assert_eq!(pie::model::model().name(), "test-model");
 }
 
 #[test]
@@ -54,7 +53,7 @@ fn all_devices_reachable() {
 #[test]
 fn tokenizer_round_trip() {
     let _ = state();
-    let model = pie::model::get_model(0).expect("model should be registered");
+    let model = pie::model::model();
     assert_eq!(model.name(), "test-model");
 
     let tokens = model.tokenize("hello");

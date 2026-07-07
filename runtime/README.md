@@ -22,9 +22,12 @@ cargo test --lib
 
 ### Integration tests
 
-Requires test inferlets to be compiled to `wasm32-wasip2` (handled automatically on first run):
+Requires test inferlets to be compiled to `wasm32-wasip3` (handled automatically
+on first run). `wasm32-wasip3` is a Tier-3 target, so run the one-time setup
+first (see the repo `README.md` "wasip3 toolchain" section):
 
 ```bash
+./scripts/setup-wasip3.sh   # once: wasm32-wasip2 libc donor + linker wrapper
 cargo test
 ```
 

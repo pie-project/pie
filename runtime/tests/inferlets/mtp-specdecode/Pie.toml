@@ -1,0 +1,4 @@
+[package]
+name = "mtp-specdecode"
+version = "0.1.0"
+description = "Test inferlet: device-resident MTP spec-decode (drafts-channel swap of mtp-native-verify; MtpDrafts intrinsic + carrier drafts-channel)"

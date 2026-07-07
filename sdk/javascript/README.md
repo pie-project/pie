@@ -26,7 +26,7 @@ export async function main(input: { prompt: string }) {
   speculation, adapters, and JSON collection.
 - `chat`, `reasoning`, `tools`: optional decoders and helpers for model-native
   formats.
-- `runtime`, `session`, `messaging`, `mcp`: host services exposed to inferlets.
+- `runtime`, `session`, `messaging`: host services exposed to inferlets.
 
 ## Development
 

@@ -8,6 +8,7 @@
 
 #include "sampling_ir/codegen.hpp"
 #include "sampling_ir/ir.hpp"
+#include "sampling_ir/program_identity.hpp"
 #include "sampling_ir/reader.hpp"
 
 namespace pie_cuda_driver::sampling_ir {
@@ -80,7 +81,13 @@ std::vector<Binding> manifest_to_slot_bindings(const ProgramManifest& manifest) 
         Binding bd;
         if (b.kind == BindKind::Logits) {
             bd.tag = BindingTag::Intrinsic;
-            bd.intrinsic = Intrinsic::Logits;
+            // Propagate the intrinsic KIND (Logits | MtpLogits | MtpDrafts) — the
+            // manifest carries it (executor.cpp sets b.intrinsic_kind from wire
+            // kind 2=MtpLogits / 3=MtpDrafts). Hardcoding Logits here dropped it
+            // for EVERY fire → the resolver read the sampled row for MtpLogits
+            // (drafts = target-greedy, not the produce'd MTP rows) and mis-typed
+            // MtpDrafts as a logits row → the (b) A/B zero-cascade.
+            bd.intrinsic = b.intrinsic_kind;
         } else {
             bd.tag = BindingTag::Host;
             bd.host_key = b.host_key;
@@ -89,24 +96,6 @@ std::vector<Binding> manifest_to_slot_bindings(const ProgramManifest& manifest) 
         slots.push_back(bd);
     }
     return slots;
-}
-
-// Fold the binding manifest into the program cache key: v4 bytecode is
-// binding-free, so two programs that share bytecode but differ in their binding
-// manifest are distinct compiled programs and must not collide in the cache.
-std::uint64_t manifest_hash(const ProgramManifest& manifest) {
-    std::vector<std::uint8_t> buf;
-    buf.reserve(manifest.size() * 6);
-    for (const InputBind& b : manifest) {
-        buf.push_back(static_cast<std::uint8_t>(b.kind));
-        buf.push_back(static_cast<std::uint8_t>(b.ready));
-        const std::uint32_t k = b.host_key;
-        buf.push_back(static_cast<std::uint8_t>(k & 0xFFu));
-        buf.push_back(static_cast<std::uint8_t>((k >> 8) & 0xFFu));
-        buf.push_back(static_cast<std::uint8_t>((k >> 16) & 0xFFu));
-        buf.push_back(static_cast<std::uint8_t>((k >> 24) & 0xFFu));
-    }
-    return jit::fnv1a64(buf.data(), buf.size());
 }
 
 }  // namespace
@@ -126,29 +115,28 @@ ProgramHandle SamplingIrBackend::get_or_compile(std::span<const std::uint8_t> by
         return kInvalidProgram;
     }
 
-    std::uint64_t hash = jit::fnv1a64(bytecode.data(), bytecode.size());
-    // v4 bytecode is binding-free: the manifest is part of the program identity,
-    // so fold it into the key (distinct bindings ⇒ distinct compiled program).
-    if (!manifest.empty()) hash ^= manifest_hash(manifest);
-    // Distinguish M=1 vs batched lowering in the cache key so a process that
-    // uses both (e.g. the bench) never returns the wrong DAG for the same bytes.
-    const std::uint64_t keyed = batched_lowering_ ? (hash ^ 0x9E3779B97F4A7C15ULL) : hash;
+    // #11 cost contract: the program IDENTITY (== this dedup key minus the
+    // batched bit) is the single shared key for #10 distinct-count + echo's
+    // M-batch grouping + #11 compile-dedup (see program_identity.hpp). v4
+    // bytecode is binding-free, so the manifest is folded in — distinct bindings
+    // ⇒ distinct compiled program.
+    const std::uint64_t identity = program_identity_hash(bytecode, manifest);
+    // The M=1-vs-batched lowering yields distinct PTX artifacts, so fold the
+    // process-constant batched bit on top for the COMPILE cache key (NOT the
+    // shared identity, which is pre-lowering — see program_identity.hpp banner).
+    const std::uint64_t keyed =
+        batched_lowering_ ? (identity ^ 0x9E3779B97F4A7C15ULL) : identity;
     const ProgramHandle handle = keyed ? keyed : 1;  // reserve 0 = kInvalidProgram
     if (programs_.find(handle) != programs_.end()) return handle;
 
-    // 1. Decode the IR (for input/output binding metadata: host keys, kinds).
-    //    v3/v2 bytecode is self-binding (`decode`); v4 is binding-free and takes
-    //    the per-slot bindings from `manifest` (`decode_v4`), which shims the v4
-    //    flat/Input-op form into the same inputs-first Program the codegen consumes.
+    // 1. Decode the IR -> Program (input/output binding metadata: host keys,
+    //    kinds). The version routing (v4 binding-free via `manifest` vs v2/v3
+    //    self-binding) lives in decode_program, shared with the thread-safe
+    //    prefetch path.
     Program program;
-    DecodeError derr;
-    const bool decoded =
-        manifest.empty()
-            ? decode(bytecode.data(), bytecode.size(), program, &derr)
-            : decode_v4(bytecode.data(), bytecode.size(),
-                        manifest_to_slot_bindings(manifest), program, &derr);
-    if (!decoded) {
-        last_error_ = "decode failed: " + derr.detail;
+    std::string derr;
+    if (!decode_program(bytecode, manifest, program, &derr)) {
+        last_error_ = derr;
         return kInvalidProgram;
     }
     return compile_decoded(program, keyed);
@@ -158,18 +146,144 @@ ProgramHandle SamplingIrBackend::compile_decoded(const Program& program,
                                                  std::uint64_t keyed) {
     const ProgramHandle handle = keyed ? keyed : 1;  // reserve 0 = kInvalidProgram
 
-    // 2. Lower IR -> fused CUDA-C kernel DAG (charlie's codegen). Batched
-    //    lowering emits one grid=num_rows kernel; the JIT supplies the dynamic
-    //    grid + capacity-sized batched buffers.
-    //
-    //    FALLBACK: the batched emit path doesn't cover every op (Gather /
-    //    GatherRow / Scatter* / SortDesc are M=1-only — e.g. mirostat's
-    //    `gather`). When batched lowering is requested but rejects such an op
-    //    (`lr.ok == false`), fall back to M=1 lowering so the program still runs
-    //    (per-row), keeping custom samplers green while standard samplers (no
-    //    such op) stay on the batched fast path. This makes "always-batched" the
-    //    production default safe for the open programmable surface.
-    bool batched_mode = batched_lowering_;
+    // 2. Lower IR -> KernelDAG (batched with M=1 fallback) via lower_with_fallback,
+    //    shared with prefetch_compile.
+    bool batched_mode = false;
+    LowerResult lr = lower_with_fallback(program, batched_mode);
+    if (!lr.ok) {
+        last_error_ = "lower failed: " + lr.error;
+        return kInvalidProgram;
+    }
+
+    // 3. Adapt the codegen KernelDAG -> jit::KernelDAG (shared with prefetch via
+    //    build_jdag).
+    jit::KernelDAG jdag = build_jdag(lr, keyed);
+
+    // 4. NVRTC-compile + allocate via the JIT engine.
+    jit::CompiledProgram* prog = nullptr;
+    try {
+        prog = &engine_.get_or_compile(jdag);
+    } catch (const std::exception& e) {
+        last_error_ = std::string("jit compile failed: ") + e.what();
+        return kInvalidProgram;
+    }
+
+    // 5. Build the declared interface + per-fire binding maps.
+    Entry entry;
+    entry.prog = prog;
+    entry.batched_mode = batched_mode;
+    std::size_t n_out = 0;
+    for (const BufferDecl& b : lr.dag.buffers)
+        if (b.cls == BufferClass::Output)
+            n_out = std::max<std::size_t>(n_out, static_cast<std::size_t>(b.output_index) + 1);
+    entry.output_buffers.assign(n_out, 0);
+    entry.iface.outputs.resize(n_out);
+
+    const Slot* slot0 = program.slots.empty() ? nullptr : &program.slots.front();
+    for (const BufferDecl& b : lr.dag.buffers) {
+        // Per-row byte stride for the custom-batch replay slicing. The intrinsic
+        // logits is bf16 (`Phys::BF16`), but its BufferDecl.dtype is a non-allocated
+        // F32 placeholder (codegen.cpp), so byte_size() would over-count — use
+        // elem_count*2. Host/output/row-seed buffers carry their true dtype.
+        if (b.cls != BufferClass::Intermediate) {
+            // IntrinsicLogits is bf16 on device (dtype is an F32 placeholder, so
+            // byte_size() would over-count) → elem_count*2. The MtpDrafts
+            // intrinsic is the exception: a real I32 [k] buffer, so use its true
+            // byte_size() (elem_count*4), not the bf16 stride.
+            entry.row_stride_bytes[b.id] =
+                (b.cls == BufferClass::IntrinsicLogits && b.dtype != DType::I32)
+                    ? static_cast<std::uint64_t>(b.elem_count) * 2u
+                    : b.byte_size();
+        }
+        switch (b.cls) {
+            case BufferClass::IntrinsicLogits:
+            case BufferClass::HostSubmit:
+            case BufferClass::HostLate: {
+                InputDecl in;
+                in.input_id = b.input_id;
+                in.cls = to_binding_class(b.cls);
+                // Bridge the manifest intrinsic (ir::Intrinsic, stamped onto
+                // BufferDecl.intrinsic_kind from the program manifest) to the
+                // runtime IntrinsicKind echo's resolver reads: MtpLogits selects
+                // ws.logits[mtp_draft_row], Logits the sampled row.
+                in.intrinsic = (b.intrinsic_kind == Intrinsic::MtpLogits)
+                                   ? IntrinsicKind::MtpLogits
+                               : (b.intrinsic_kind == Intrinsic::MtpDrafts)
+                                   ? IntrinsicKind::MtpDrafts
+                                   : IntrinsicKind::Logits;
+                in.host_key = (b.input_id < program.inputs.size())
+                                  ? program.inputs[b.input_id].binding.host_key
+                                  : 0;
+                in.elem_count = b.elem_count;
+                entry.iface.inputs.push_back(in);
+                entry.input_to_buffer[b.input_id] = b.id;
+                break;
+            }
+            case BufferClass::Output: {
+                DeclaredOutput od;
+                od.value_id = (slot0 && b.output_index < slot0->outputs.size())
+                                  ? slot0->outputs[b.output_index].value
+                                  : 0;
+                od.cls = static_cast<OutputClass>(b.output_kind);
+                od.elem_count = b.elem_count;
+                entry.iface.outputs[b.output_index] = od;
+                entry.output_buffers[b.output_index] = b.id;
+                break;
+            }
+            case BufferClass::Intermediate:
+                break;  // JIT-owned scratch; not part of the interface
+            case BufferClass::RowSeed:
+                // Ambient per-row seed S (Model B Op::Rng): external, bind-only,
+                // bound per-fire from LaunchArgs.row_seeds. NOT an Op::Input, so it
+                // is not part of the declared interface echo resolves by input_id;
+                // codegen reads rowseed[r] (seed_eff_stream). One per RNG program.
+                entry.row_seed_buffer = b.id;
+                entry.has_row_seed = true;
+                break;
+        }
+    }
+
+    programs_.emplace(handle, std::move(entry));
+    return handle;
+}
+
+bool SamplingIrBackend::decode_program(std::span<const std::uint8_t> bytecode,
+                                       const ProgramManifest& manifest,
+                                       Program& out, std::string* err) const {
+    // Route by the bytecode's AUTHORITATIVE PSIR version field (the "PSIR" magic
+    // then a little-endian u16 at offset 4), NOT by `manifest.empty()`. The old
+    // emptiness proxy mis-routed a v4 program that arrived with an empty manifest
+    // to the v2/v3 `decode`, which rejects version 4 (`reader.cpp` BadVersion) —
+    // the carrier→driver consolidation seam. v3/v2 self-bind (`decode`); v4 is
+    // binding-free and takes per-slot bindings from `manifest` (`decode_v4`). NB:
+    // v4 still binds one slot per input (decode_v4 asserts size==n_inputs), so a
+    // v4 program WITH inputs still needs its manifest populated by the carrier.
+    std::uint16_t psir_version = 0;
+    if (bytecode.size() >= 6 && bytecode[0] == 'P' && bytecode[1] == 'S' &&
+        bytecode[2] == 'I' && bytecode[3] == 'R') {
+        psir_version = static_cast<std::uint16_t>(
+            bytecode[4] | (static_cast<std::uint16_t>(bytecode[5]) << 8));
+    }
+    DecodeError derr;
+    const bool decoded =
+        psir_version >= 4
+            ? decode_v4(bytecode.data(), bytecode.size(),
+                        manifest_to_slot_bindings(manifest), out, &derr)
+            : decode(bytecode.data(), bytecode.size(), out, &derr);
+    if (!decoded) {
+        if (err) *err = "decode failed: " + derr.detail;
+        return false;
+    }
+    return true;
+}
+
+LowerResult SamplingIrBackend::lower_with_fallback(const Program& program,
+                                                   bool& batched_mode) const {
+    // Batched lowering emits one grid=num_rows kernel; FALLBACK to M=1 when the
+    // batched emit rejects an op (Gather/GatherRow/Scatter*/SortDesc are M=1-only,
+    // e.g. mirostat's gather) so custom samplers stay green while standard samplers
+    // ride the batched fast path. "always-batched" is the safe production default.
+    batched_mode = batched_lowering_;
     LowerResult lr = lower(program, LowerOptions{/*batched=*/batched_lowering_});
     if (batched_lowering_ && !lr.ok) {
         LowerResult m1 = lower(program, LowerOptions{/*batched=*/false});
@@ -178,14 +292,14 @@ ProgramHandle SamplingIrBackend::compile_decoded(const Program& program,
             batched_mode = false;  // M=1 per-row fallback
         }
     }
-    if (!lr.ok) {
-        last_error_ = "lower failed: " + lr.error;
-        return kInvalidProgram;
-    }
+    return lr;
+}
 
-    // 3. Adapt codegen KernelDAG -> jit::KernelDAG. Grid is recomputed per fire
-    //    from num_rows (Param 0) via the launch shape, so M>1 batches scale in a
-    //    single launch; vocab for grid-stride comes from the launch param table.
+jit::KernelDAG SamplingIrBackend::build_jdag(const LowerResult& lr,
+                                             std::uint64_t keyed) const {
+    // Adapt codegen KernelDAG -> jit::KernelDAG. Grid is recomputed per fire from
+    // num_rows (Param 0) via the launch shape, so M>1 batches scale in a single
+    // launch; vocab for grid-stride comes from the launch param table.
     std::uint32_t vocab = 0;
     for (const BufferDecl& b : lr.dag.buffers)
         if (b.cls == BufferClass::IntrinsicLogits) vocab = b.elem_count;
@@ -224,81 +338,32 @@ ProgramHandle SamplingIrBackend::compile_decoded(const Program& program,
         for (const KernelArg& a : k.args) jk.args.push_back(to_jit_arg(a));
         jdag.kernels.push_back(std::move(jk));
     }
+    return jdag;
+}
 
-    // 4. NVRTC-compile + allocate via the JIT engine.
-    jit::CompiledProgram* prog = nullptr;
-    try {
-        prog = &engine_.get_or_compile(jdag);
-    } catch (const std::exception& e) {
-        last_error_ = std::string("jit compile failed: ") + e.what();
-        return kInvalidProgram;
-    }
-
-    // 5. Build the declared interface + per-fire binding maps.
-    Entry entry;
-    entry.prog = prog;
-    entry.batched_mode = batched_mode;
-    std::size_t n_out = 0;
-    for (const BufferDecl& b : lr.dag.buffers)
-        if (b.cls == BufferClass::Output)
-            n_out = std::max<std::size_t>(n_out, static_cast<std::size_t>(b.output_index) + 1);
-    entry.output_buffers.assign(n_out, 0);
-    entry.iface.outputs.resize(n_out);
-
-    const Slot* slot0 = program.slots.empty() ? nullptr : &program.slots.front();
-    for (const BufferDecl& b : lr.dag.buffers) {
-        // Per-row byte stride for the custom-batch replay slicing. The intrinsic
-        // logits is bf16 (`Phys::BF16`), but its BufferDecl.dtype is a non-allocated
-        // F32 placeholder (codegen.cpp), so byte_size() would over-count — use
-        // elem_count*2. Host/output/row-seed buffers carry their true dtype.
-        if (b.cls != BufferClass::Intermediate) {
-            entry.row_stride_bytes[b.id] =
-                (b.cls == BufferClass::IntrinsicLogits)
-                    ? static_cast<std::uint64_t>(b.elem_count) * 2u
-                    : b.byte_size();
-        }
-        switch (b.cls) {
-            case BufferClass::IntrinsicLogits:
-            case BufferClass::HostSubmit:
-            case BufferClass::HostLate: {
-                InputDecl in;
-                in.input_id = b.input_id;
-                in.cls = to_binding_class(b.cls);
-                in.intrinsic = IntrinsicKind::Logits;
-                in.host_key = (b.input_id < program.inputs.size())
-                                  ? program.inputs[b.input_id].binding.host_key
-                                  : 0;
-                in.elem_count = b.elem_count;
-                entry.iface.inputs.push_back(in);
-                entry.input_to_buffer[b.input_id] = b.id;
-                break;
-            }
-            case BufferClass::Output: {
-                DeclaredOutput od;
-                od.value_id = (slot0 && b.output_index < slot0->outputs.size())
-                                  ? slot0->outputs[b.output_index].value
-                                  : 0;
-                od.cls = static_cast<OutputClass>(b.output_kind);
-                od.elem_count = b.elem_count;
-                entry.iface.outputs[b.output_index] = od;
-                entry.output_buffers[b.output_index] = b.id;
-                break;
-            }
-            case BufferClass::Intermediate:
-                break;  // JIT-owned scratch; not part of the interface
-            case BufferClass::RowSeed:
-                // Ambient per-row seed S (Model B Op::Rng): external, bind-only,
-                // bound per-fire from LaunchArgs.row_seeds. NOT an Op::Input, so it
-                // is not part of the declared interface echo resolves by input_id;
-                // codegen reads rowseed[r] (seed_eff_stream). One per RNG program.
-                entry.row_seed_buffer = b.id;
-                entry.has_row_seed = true;
-                break;
-        }
-    }
-
-    programs_.emplace(handle, std::move(entry));
-    return handle;
+void SamplingIrBackend::prefetch_compile(std::span<const std::uint8_t> bytecode,
+                                         const ProgramManifest& manifest) {
+    // Fire-and-forget, ANY THREAD (called at admission, off the context thread):
+    // warm the off-context PTX cache so the later context-thread get_or_compile
+    // finds the entry Ready (cache hit) -> TTFT win. Idempotent + dedup'd by the
+    // SAME identity key as get_or_compile/#10 (engine_.prefetch_compile keys on
+    // jdag.hash). Touches NO mutable backend state (programs_/last_error_), so it
+    // races nothing: decode_program (const, errors via out-param) + lower_with_
+    // fallback (pure) + build_jdag (pure) + the mu_-guarded JitEngine. The
+    // programs_ membership check is intentionally skipped (it's not thread-safe
+    // against the context thread); a redundant prefetch re-lowers (cheap) but the
+    // engine's compile-cache dedups the expensive NVRTC step.
+    if (bytecode.empty()) return;
+    const std::uint64_t identity = program_identity_hash(bytecode, manifest);
+    const std::uint64_t keyed =
+        batched_lowering_ ? (identity ^ 0x9E3779B97F4A7C15ULL) : identity;
+    Program program;
+    if (!decode_program(bytecode, manifest, program, /*err=*/nullptr)) return;
+    bool batched_mode = false;
+    LowerResult lr = lower_with_fallback(program, batched_mode);
+    if (!lr.ok) return;
+    jit::KernelDAG jdag = build_jdag(lr, keyed);
+    engine_.prefetch_compile(jdag);
 }
 
 const ProgramInterface& SamplingIrBackend::interface(ProgramHandle program) {
@@ -386,3 +451,35 @@ bool SamplingIrBackend::program_is_batched(ProgramHandle program) const {
 }
 
 }  // namespace pie_cuda_driver::sampling_ir
+
+extern "C" void pie_sampling_ir_prefetch_trampoline(
+    void* backend_ctx, const std::uint8_t* bytecode, std::size_t bytecode_len,
+    const std::uint8_t* binds_kind, const std::uint32_t* binds_key,
+    std::size_t binds_len) {
+    using namespace pie_cuda_driver::sampling_ir;
+    auto* backend = static_cast<IProgramBackend*>(backend_ctx);
+    if (backend == nullptr || bytecode == nullptr || bytecode_len == 0) return;
+
+    // Reconstruct the manifest EXACTLY as the submit path does (executor.cpp:3239-
+    // 3250): ready = SubmitBound for every bind (default), so the identity hash
+    // matches the real fire -> cache HIT. kind 1 = host tensor (carries key); kind
+    // 0/2 = the logits intrinsic (2 = MtpLogits draft row); key/intrinsic default.
+    ProgramManifest manifest;
+    manifest.reserve(binds_len);
+    for (std::size_t i = 0; i < binds_len; ++i) {
+        InputBind b;  // defaults: Logits, host_key=0, SubmitBound, Intrinsic::Logits
+        const std::uint32_t bk = binds_kind ? binds_kind[i] : 0u;
+        if (bk == 1u) {  // KIND_TENSOR
+            b.kind = BindKind::HostTensor;
+            b.host_key = binds_key ? binds_key[i] : 0u;
+            b.ready = HostAvailability::SubmitBound;
+        } else {  // KIND_LOGITS (0) / KIND_MTP_LOGITS (2) / KIND_MTP_DRAFTS (3)
+            b.kind = BindKind::Logits;
+            if (bk == 2u) b.intrinsic_kind = Intrinsic::MtpLogits;
+            else if (bk == 3u) b.intrinsic_kind = Intrinsic::MtpDrafts;
+        }
+        manifest.push_back(b);
+    }
+    backend->prefetch_compile(
+        std::span<const std::uint8_t>(bytecode, bytecode_len), manifest);
+}

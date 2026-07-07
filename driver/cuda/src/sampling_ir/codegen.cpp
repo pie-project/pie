@@ -27,7 +27,7 @@ namespace pie_cuda_driver::sampling_ir {
 
 namespace {
 
-enum class Phys { F32, I32, U32, BF16 };
+enum class Phys { F32, I32, U32, BF16, U8 };
 
 const char* phys_ptr_cty(Phys p) {
     switch (p) {
@@ -35,6 +35,8 @@ const char* phys_ptr_cty(Phys p) {
         case Phys::I32: return "int*";
         case Phys::U32: return "unsigned int*";
         case Phys::BF16: return "const unsigned short*";  // bf16 reinterpreted (no header)
+        case Phys::U8: return "const unsigned char*";     // BYTECODE.md §5: a Host Bool is
+                                                          // native 1-byte (0=false, nonzero=true)
     }
     return "float*";
 }
@@ -45,6 +47,7 @@ DType phys_to_dtype(Phys p) {
         case Phys::I32: return DType::I32;
         case Phys::U32: return DType::U32;
         case Phys::BF16: return DType::F32;  // external; size irrelevant (not allocated)
+        case Phys::U8: return DType::Bool;   // 1-byte host bool → byte_size = elem_count × 1
     }
     return DType::F32;
 }
@@ -54,7 +57,9 @@ Phys dtype_to_phys(DType d) {
         case DType::F32: return Phys::F32;
         case DType::I32: return Phys::I32;
         case DType::U32: return Phys::U32;
-        case DType::Bool: return Phys::F32;  // bool stored as 0.0f/1.0f
+        case DType::Bool: return Phys::F32;  // JIT intermediates: bool stored as 0.0f/1.0f.
+                                             // HOST Bool inputs override to Phys::U8 (BYTECODE.md
+                                             // §5, echo 720e45f6): native 1-byte on wire+device.
     }
     return Phys::F32;
 }
@@ -107,6 +112,13 @@ struct Codegen {
     BufferId row_seed_buffer = UINT32_MAX;     // ambient per-row seed S (external, bind-only)
     std::vector<std::uint32_t> use_count;      // consumers per SSA value (ops + outputs)
     std::vector<bool> inlined;                 // value folded into its consumer (no buffer/write)
+    // Passthrough outputs: a program output whose value is an input leaf (never
+    // an op result), e.g. grammar_submit_with_logits' raw-logits output aliases
+    // the IntrinsicLogits input. The op-result loop never materializes these, so
+    // each is copied — RAW, in the input's native storage dtype (bf16 for logits,
+    // honoring #28's no-f32-[vocab] rule; the host converts on readback) — into
+    // its own BufferClass::Output buffer by a tail kernel.
+    std::vector<std::pair<BufferId, BufferId>> passthrough_outputs;  // (source buffer, output buffer)
     bool ok = true;
     std::string err;
 
@@ -133,6 +145,7 @@ struct Codegen {
             case OpCode::Select:
             case OpCode::Broadcast: case OpCode::RowBroadcast:
             case OpCode::Rng:
+            case OpCode::MaskApply:
                 return true;
             default:
                 return false;
@@ -233,11 +246,12 @@ struct Codegen {
             case OpCode::MaxElem: case OpCode::MinElem:
             case OpCode::Gt: case OpCode::Ge: case OpCode::Eq:
             case OpCode::Gather: case OpCode::GatherRow: case OpCode::GatherCols:
+            case OpCode::MaskApply:   // (logits, mask)
                 return {op.a, op.b};
             case OpCode::PivotThreshold:
-                if (op.predicate.tag == PredTag::CummassLe || op.predicate.tag == PredTag::ProbGe)
-                    return {op.a, op.predicate.payload};
-                return {op.a};
+                // #25: all three predicates carry a value-id payload (RankLe `k`
+                // included — host-submit, no longer a baked immediate).
+                return {op.a, op.predicate.payload};
             case OpCode::Rng:
                 // v4 ambient (Model B): no value-id operand (seed is launch-side).
                 // v2/v3: op.a is the Host seed input.
@@ -292,6 +306,12 @@ struct Codegen {
                     vtype[r] = {broadcast(sh(op.a), sh(op.b)), dt(op.a)}; break;
                 case OpCode::Div:
                     vtype[r] = {broadcast(sh(op.a), sh(op.b)), DType::F32}; break;
+                case OpCode::MaskApply:
+                    // result ≡ logits SHAPE (op.a); mask (op.b) is [ceil(len/32)] u32,
+                    // word-indexed — NOT broadcast with logits, so it never shapes the
+                    // result. dtype = F32 (the codegen's working logit dtype; the bf16
+                    // `0xFF80` contract is the storage view on a final bf16 output write).
+                    vtype[r] = {sh(op.a), DType::F32}; break;
                 case OpCode::Gt: case OpCode::Ge: case OpCode::Eq:
                     vtype[r] = {broadcast(sh(op.a), sh(op.b)), DType::Bool}; break;
                 case OpCode::Select:
@@ -357,12 +377,36 @@ struct Codegen {
                     vi.lit = in.binding.lit;
                     break;
                 case BindingTag::Intrinsic: {
+                    // MtpDrafts is a device-resident I32 [k] draft-token buffer
+                    // (echo's resolver points it at ctx.mtp_drafts), NOT bf16
+                    // logits — bind it straight as an i32 intrinsic input. It must
+                    // NOT go through the bf16 IntrinsicLogits cast path, and must
+                    // NOT hijack `logits_value` (the single bf16-logits cast
+                    // tracker): reading the [k] i32 tokens with a 2-byte bf16
+                    // stride yielded a garbage verify operand (0 accepts), and
+                    // — since it was the LAST intrinsic — stole the materialized
+                    // cast from the real target/mtp logits → drf/out[1]=0. The
+                    // resolver (Intrinsic branch, IntrinsicKind::MtpDrafts) binds
+                    // the raw i32 buffer; consumers read it like B's host i32
+                    // `draft` (Phys::I32).
+                    if (in.binding.intrinsic == Intrinsic::MtpDrafts) {
+                        std::uint32_t ec = vi.rows * vi.len;
+                        BufferId draft_buf =
+                            new_buffer(BufferClass::IntrinsicLogits, Phys::I32, ec, i);
+                        buffers[draft_buf].intrinsic_kind = in.binding.intrinsic;
+                        vi.buffer = draft_buf;
+                        vi.phys = Phys::I32;
+                        break;
+                    }
                     // Raw bf16 logits (external) + (unless inlined) an f32 cast
                     // intermediate. For a Matrix{rows,len} intrinsic (spec-verify
                     // block) both buffers hold rows*len elements, row-major.
                     logits_value = i;
                     std::uint32_t ec = vi.rows * vi.len;
                     logits_raw = new_buffer(BufferClass::IntrinsicLogits, Phys::BF16, ec, i);
+                    // Carry the intrinsic kind (Logits | MtpLogits) so delta's
+                    // jit_backend wire can route MtpLogits to the draft row.
+                    buffers[logits_raw].intrinsic_kind = in.binding.intrinsic;
                     if (inline_logits_cast) {
                         // No materialized f32 — consumers read bf16 inline (cast
                         // in registers via melem_leaf's logits special-case).
@@ -376,7 +420,15 @@ struct Codegen {
                     break;
                 }
                 case BindingTag::Host: {
-                    Phys ph = dtype_to_phys(in.ty.dtype);
+                    // BYTECODE.md §5 (echo 720e45f6): a Host-bound Bool input is
+                    // NATIVE 1-byte (u8) on wire AND device — read the byte + widen
+                    // in-register (`!=0`), the bf16-logits precedent. Phys::F32-for-
+                    // Bool is JIT-internal only (intermediates), NEVER host inputs
+                    // (reading a 1-byte host bool as f32 walked 4× off the buffer —
+                    // the §6.1 psir_k0 OOB).
+                    Phys ph = (in.ty.dtype == DType::Bool)
+                                  ? Phys::U8
+                                  : dtype_to_phys(in.ty.dtype);
                     BufferClass cls = (in.binding.host_avail == HostAvailability::LateBound)
                                           ? BufferClass::HostLate : BufferClass::HostSubmit;
                     std::uint32_t ec = in.ty.shape.tag == ShapeTag::Matrix
@@ -430,6 +482,35 @@ struct Codegen {
                 else
                     vi.buffer = new_buffer(BufferClass::Intermediate, vi.phys, ec);
             }
+        }
+
+        // Passthrough outputs: a program output whose value is an INPUT leaf (or
+        // any value the op-result loop above didn't give a BufferClass::Output) —
+        // e.g. grammar_submit_with_logits declares `output(logits, Logits)`, which
+        // aliases the IntrinsicLogits input and is never an op result, so without
+        // this it gets no Output buffer → the declared-vs-compiled output count
+        // mismatches (n_out=1 vs 2) and the readback is dropped. Materialize a
+        // dedicated Output buffer per such output; a tail kernel copies the source
+        // value into it (analyze_fusion forces the logits f32-cast to materialize
+        // when logits is a direct output, so the source buffer is always live).
+        for (std::uint32_t oi = 0; oi < slot.outputs.size(); ++oi) {
+            ValueId v = slot.outputs[oi].value;
+            if (v >= vinfo.size()) continue;
+            BufferId vb = vinfo[v].buffer;
+            bool has_output_buffer = vb != UINT32_MAX && vb < buffers.size() &&
+                                     buffers[vb].cls == BufferClass::Output;
+            if (has_output_buffer) continue;   // op-result output, already materialized
+            // RAW passthrough: copy the input's NATIVE storage (bf16 for the
+            // intrinsic logits — #28 no-f32-[vocab] rule, the host converts on
+            // readback; the host buffer's dtype otherwise), NOT the f32 view.
+            BufferId src = (v == logits_value && logits_raw != UINT32_MAX) ? logits_raw : vb;
+            if (src == UINT32_MAX || src >= buffers.size()) continue;
+            std::uint32_t ec = vtype[v].shape.tag == ShapeTag::Matrix
+                                   ? vtype[v].shape.a * vtype[v].shape.b
+                                   : vtype[v].shape.last_len();
+            BufferId ob = new_buffer(BufferClass::Output, buf_phys[src], ec, 0, oi,
+                                     slot.outputs[oi].kind);
+            passthrough_outputs.push_back({src, ob});
         }
 
         // Ambient RNG seed (v4 Model B): one external per-row RowSeed buffer S[N],
@@ -546,6 +627,7 @@ struct Codegen {
         if (inline_logits_cast && id == logits_value)
             return "pie_ir_bf16_to_f32(b" + std::to_string(logits_raw) + "[" + idx + "])";
         std::string e = "b" + std::to_string(vi.buffer) + "[" + idx + "]";
+        if (vi.phys == Phys::U8) return "(float)(" + e + " != 0)";  // host bool byte → 0.0/1.0
         if (vi.phys == Phys::I32 || vi.phys == Phys::U32) return "(float)(" + e + ")";
         return e;
     }
@@ -585,11 +667,31 @@ struct Codegen {
         if (inline_logits_cast && id == logits_value)
             return "pie_ir_bf16_to_f32(b" + std::to_string(logits_raw) + "[" + idx + "])";
         std::string e = "b" + std::to_string(vi.buffer) + "[" + idx + "]";
+        if (vi.phys == Phys::U8) return "(float)(" + e + " != 0)";  // host bool byte → 0.0/1.0
         if (vi.phys == Phys::I32 || vi.phys == Phys::U32) return "(float)(" + e + ")";
         return e;
     }
 
-    // Per-element value expression for `id`: recursively inline elementwise
+    // Integer element access for value `id` — the analog of `melem_leaf` for an
+    // integer value (e.g. the top-k `k` predicate operand), returning the RAW
+    // integer (no float cast). A predicate `k` is a scalar (→ "0"/"r" batched) or
+    // a per-row `[rows]` vector (→ "r"); it is never per-column, so `j` is never
+    // referenced in the reduce-style (per-block) site where this is emitted.
+    std::string melem_int(ValueId id) {
+        const VInfo& vi = vinfo[id];
+        if (vi.is_const) {
+            if (vi.lit.dtype == DType::U32) return std::to_string(vi.lit.as_u32()) + "u";
+            return std::to_string(vi.lit.as_i32());
+        }
+        std::string idx;
+        if (batched) {
+            idx = vi.scalar ? "r" : ("r*" + std::to_string(vi.len) + "+j");
+        } else if (vi.scalar) idx = "0";
+        else if (vi.row_indexed) idx = "r";
+        else if (vi.rows > 1) idx = "r*" + std::to_string(vi.len) + "+j";
+        else idx = "j";
+        return "b" + std::to_string(vi.buffer) + "[" + idx + "]";
+    }
     // producers marked `inlined` (folding the map chain into the consumer's
     // loop, no global round-trip); otherwise a leaf read. For non-batched paths
     // `inlined` is all-false so this is exactly `melem_leaf`.
@@ -630,6 +732,15 @@ struct Codegen {
                 return "((" + elem_expr(op.a) + " != 0.0f) ? " + elem_expr(op.b) + " : " + elem_expr(op.c) + ")";
             case OpCode::Broadcast:
                 return elem_expr(op.a);                       // scalar replicated
+            case OpCode::MaskApply: {
+                // out = bit_j(mask) ? logits : -inf. mask (op.b) = packed u32,
+                // word-indexed (mask[j>>5] bit j&31); logits (op.a) = f32 elem.
+                // In batched, each sequence carries its own grammar mask → r*len.
+                const VInfo& mv = vinfo[op.b];
+                std::string maskbase = "b" + std::to_string(mv.buffer);
+                if (batched) maskbase += " + r*" + std::to_string(mv.len);
+                return "pie_ir_mask_apply(" + maskbase + ", j, " + elem_expr(op.a) + ")";
+            }
             case OpCode::RowBroadcast: {
                 const VInfo& pv = vinfo[op.a];                // Vector{rows} per-row
                 if (pv.is_const) return melem_leaf(op.a);
@@ -684,12 +795,20 @@ struct Codegen {
         // value inline (elem_expr — folds the whole map chain, no materialized
         // input buffer) and reduce the thread-local partial.
         std::uint32_t Lin = vinfo[op.a].len;
+        // Per-row reduce/argmax write index. Each block (row r) collapses its
+        // input row to exactly ONE value, so it writes the row's single slot: "r".
+        // NOT mwidx() — that is the elementwise "r*len+j", whose per-element j has
+        // no surrounding loop in a single-thread reduce write, so emitting it
+        // yields an undefined `j` (a k=1 single-row matrix lowered batched gives
+        // "r*1+j" → NVRTC compile failure). Matrix row_indexed results already map
+        // to "r"; this makes the batched per-row reduce do the same.
+        const std::string rrow = "r";
         auto reduce_fused = [&](const char* init, const char* acc, const char* reducer) {
             s << "  { float _acc = " << init << ";\n"
               << "    for (int j = tid; j < " << Lin << "; j += 256) { float _v = " << elem_expr(op.a)
               << "; " << acc << " }\n"
               << "    float _res = " << reducer << "(_acc);\n"
-              << "    if (tid == 0) " << buf_name(r) << "[" << mwidx(r) << "] = _res; __syncthreads(); }\n";
+              << "    if (tid == 0) " << buf_name(r) << "[" << rrow << "] = _res; __syncthreads(); }\n";
         };
         switch (op.code) {
             case OpCode::Exp: case OpCode::Log: case OpCode::Neg: case OpCode::Recip:
@@ -707,7 +826,7 @@ struct Codegen {
                   << "    for (int j = tid; j < " << Lin << "; j += 256) { float _v = " << elem_expr(op.a)
                   << "; if (_v > _best || (_v == _best && j < _bi)) { _best = _v; _bi = j; } }\n"
                   << "    int _res = pie_ir_block_argmax_reduce(_best, _bi);\n"
-                  << "    if (tid == 0) " << buf_name(r) << "[" << mwidx(r) << "] = _res; __syncthreads(); }\n";
+                  << "    if (tid == 0) " << buf_name(r) << "[" << rrow << "] = _res; __syncthreads(); }\n";
                 break;
             }
             case OpCode::Broadcast: case OpCode::RowBroadcast: case OpCode::Rng:
@@ -726,8 +845,9 @@ struct Codegen {
                 s << "  { float _t;\n";
                 switch (op.predicate.tag) {
                     case PredTag::RankLe:
+                        // #25: k is a value-id (host-submit U32), read per-row.
                         s << "    _t = pie_ir_pivot_topk_radix(" << buf_name(op.a) << " + r*" << Lin
-                          << ", " << Lin << ", " << op.predicate.payload << ");\n";
+                          << ", " << Lin << ", " << melem_int(op.predicate.payload) << ");\n";
                         break;
                     case PredTag::CummassLe:
                         s << "    _t = pie_ir_pivot_topp_radix(" << buf_name(op.a) << " + r*" << Lin
@@ -821,6 +941,18 @@ struct Codegen {
                   << "  __syncthreads();\n";
                 break;
             }
+            case OpCode::MaskApply: {
+                // Materialized (M=1): out[j] = bit_j(mask) ? logits[j] : -inf. mask
+                // (op.b) packed u32 word-indexed; result F32 (downstream reads f32;
+                // -inf truncates to bf16 0xFF80 only on a final bf16 output write).
+                ValueId r = op.result_id;
+                std::uint32_t L = vinfo[r].len;
+                s << "  for (int j = tid; j < " << L << "; j += 256) "
+                  << buf_name(r) << "[j] = pie_ir_mask_apply(" << buf_name(op.b) << ", j, "
+                  << ref_f32(op.a, "j") << ");\n"
+                  << "  __syncthreads();\n";
+                break;
+            }
             case OpCode::ReduceSum: emit_reduce(s, "pie_ir_block_sum", op); break;
             case OpCode::ReduceMax: emit_reduce(s, "pie_ir_block_max", op); break;
             case OpCode::ReduceMin: emit_reduce(s, "pie_ir_block_min", op); break;
@@ -863,8 +995,9 @@ struct Codegen {
                 s << "  { float _t;\n";
                 switch (op.predicate.tag) {
                     case PredTag::RankLe:
+                        // #25: k is a value-id (host-submit U32 scalar), read [0].
                         s << "    _t = pie_ir_pivot_topk_radix(" << buf_name(op.a) << ", " << L
-                          << ", " << op.predicate.payload << ");\n";
+                          << ", " << ref_int(op.predicate.payload) << ");\n";
                         break;
                     case PredTag::CummassLe:
                         s << "    _t = pie_ir_pivot_topp_radix(" << buf_name(op.a) << ", " << L
@@ -946,6 +1079,18 @@ struct Codegen {
             return std::to_string(vi.lit.as_i32());
         }
         return "b" + std::to_string(vi.buffer) + "[0]";
+    }
+
+    // Kernel parameter pointer type for a buffer. bf16 is read-only `const` when
+    // it's an external input (the intrinsic logits), but a WRITABLE `unsigned
+    // short*` when codegen produces it — e.g. the raw-bf16 logits-passthrough
+    // Output buffer, which a tail kernel writes (a const ptr there won't compile).
+    const char* param_ptr_cty(BufferId id) {
+        if (buf_phys[id] == Phys::BF16 &&
+            (buffers[id].cls == BufferClass::Output ||
+             buffers[id].cls == BufferClass::Intermediate))
+            return "unsigned short*";
+        return phys_ptr_cty(buf_phys[id]);
     }
 
     // Collect the buffers a kernel touches (operands + results) in ascending id
@@ -1041,10 +1186,55 @@ struct Codegen {
             if (!used[id]) continue;
             if (!first) params << ", ";
             first = false;
-            params << phys_ptr_cty(buf_phys[id]) << " b" << id;
+            params << param_ptr_cty(id) << " b" << id;
             kd.args.push_back(KernelArg::Buf(id));
         }
 
+        std::ostringstream src;
+        src << primitive_prelude() << "\n"
+            << "extern \"C\" __global__ void " << kd.entry_name << "(" << params.str() << ") {\n"
+            << body.str()
+            << "}\n";
+        kd.source = src.str();
+        return kd;
+    }
+
+    // Tail kernel that copies each passthrough output's source value into its
+    // dedicated BufferClass::Output buffer (see build_buffers). Emitted after the
+    // op kernels so the source (e.g. the materialized logits f32-cast) is live.
+    KernelDesc emit_passthrough_kernel(std::size_t kidx) {
+        std::ostringstream body;
+        if (batched) body << "  const int r = blockIdx.x;\n";
+        body << "  const int tid = threadIdx.x;\n";
+
+        std::vector<bool> used(buffers.size(), false);
+        auto use = [&](BufferId id) { if (id < used.size()) used[id] = true; };
+        for (const auto& pt : passthrough_outputs) {
+            BufferId src = pt.first;
+            BufferId ob = pt.second;
+            std::uint32_t L = buffers[ob].elem_count ? buffers[ob].elem_count : 1u;
+            std::string widx = batched ? ("r*" + std::to_string(L) + "+j") : "j";
+            // Raw, same-dtype element copy (bf16→bf16 for logits) — a verbatim
+            // passthrough; the host reinterprets per the output's storage dtype.
+            body << "  for (int j = tid; j < " << L << "; j += 256) b" << ob
+                 << "[" << widx << "] = b" << src << "[" << widx << "];\n";
+            use(ob);
+            use(src);
+        }
+        body << "  __syncthreads();\n";
+
+        KernelDesc kd;
+        kd.entry_name = "psir_k" + std::to_string(kidx);
+        kd.shape = LaunchShape::OneBlockPerRow;   // grid = num_rows (batched) / 1 (M=1)
+        std::ostringstream params;
+        bool first = true;
+        for (BufferId id = 0; id < buffers.size(); ++id) {
+            if (!used[id]) continue;
+            if (!first) params << ", ";
+            first = false;
+            params << param_ptr_cty(id) << " b" << id;
+            kd.args.push_back(KernelArg::Buf(id));
+        }
         std::ostringstream src;
         src << primitive_prelude() << "\n"
             << "extern \"C\" __global__ void " << kd.entry_name << "(" << params.str() << ") {\n"
@@ -1068,6 +1258,29 @@ LowerResult lower(const Program& program, const LowerOptions& opts) {
     cg.build_buffers();
     if (!cg.ok) { res.error = cg.err; return res; }
 
+    // Batched (M>1) lowering assumes per-batch-row INDEPENDENT work (one block per
+    // batch row, no cross-row geometry). A matrix program (a `[k, vocab]` intrinsic
+    // — spec-verify) instead carries a per-row MATRIX axis whose rows feed cross-row
+    // ops (per-row argmax → `[k]` vector → cumprod accept-scan → reduce). Folding
+    // that into one per-block batched kernel silently miscompiles the cross-row scan
+    // (each block sees only its own row). Reject matrix work here so the backend's
+    // M=1 fallback (jit_backend.cpp) re-lowers it on the correct per-row matrix path
+    // (Custom grid = k, baked from the bytecode; cross-row ops cut to their own
+    // single-block kernel). The standard batched samplers (temp/min-p/grammar/
+    // mirostat) are `[vocab]` vector programs with no matrix work — unaffected.
+    if (opts.batched) {
+        bool matrix_work = false;
+        for (const VInfo& vi : cg.vinfo)
+            if (vi.ty.shape.tag == ShapeTag::Matrix) { matrix_work = true; break; }
+        if (!matrix_work)
+            for (const Op& op : cg.slot.ops)
+                if (cg.op_is_matrix(op)) { matrix_work = true; break; }
+        if (matrix_work) {
+            res.error = "batched lowering does not support matrix (per-row) programs";
+            return res;   // ok stays false → backend re-lowers M=1
+        }
+    }
+
     auto groups = cg.partition();
 
     // The materialized logits cast goes in the first group that references logits
@@ -1089,6 +1302,14 @@ LowerResult lower(const Program& program, const LowerOptions& opts) {
         KernelDesc kd = cg.emit_kernel(g, groups[g], emit_cast, rows, is_matrix);
         if (!cg.ok) { res.error = cg.err; return res; }
         if (emit_cast) cast_emitted = true;
+        res.dag.kernels.push_back(std::move(kd));
+    }
+
+    // Tail copy kernel for passthrough outputs (input-leaf program outputs that
+    // the op-result loop never materialized — e.g. raw-logits in [Token, Logits]).
+    if (!cg.passthrough_outputs.empty()) {
+        KernelDesc kd = cg.emit_passthrough_kernel(groups.size());
+        if (!cg.ok) { res.error = cg.err; return res; }
         res.dag.kernels.push_back(std::move(kd));
     }
 
@@ -1129,7 +1350,7 @@ LowerResult lower_bytecode_v4(const std::uint8_t* data, std::size_t len,
         Binding bd;
         if (b.kind == BindKind::Logits) {
             bd.tag = BindingTag::Intrinsic;
-            bd.intrinsic = Intrinsic::Logits;
+            bd.intrinsic = b.intrinsic_kind;   // Logits | MtpLogits (manifest-only)
         } else {
             bd.tag = BindingTag::Host;
             bd.host_key = b.host_key;

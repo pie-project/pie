@@ -133,6 +133,11 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> qo_indptr;
     PieSlice<std::uint32_t> rs_slot_ids;
     PieSlice<std::uint8_t>  rs_slot_flags;
+    // Recurrent-state fold (RS_FLAG_FOLD): per-request fold token counts +
+    // the page-major buffered-slab ids (CSR) the fold-replay gathers from.
+    PieSlice<std::uint32_t> rs_fold_lens;
+    PieSlice<std::uint32_t> rs_buffer_slot_ids;
+    PieSlice<std::uint32_t> rs_buffer_slot_indptr;
 
     // Attention / logit masks
     PieSlice<std::uint32_t> flattened_masks;
@@ -161,6 +166,76 @@ struct PieForwardRequestView {
     PieSlice<std::uint8_t>  sampling_late_blob;             // host-late value bytes
     PieSlice<std::uint32_t> sampling_late_offsets;          // byte offset per late key
     PieSlice<std::uint32_t> sampling_late_lens;             // byte length per late key
+    PieSlice<std::uint8_t>  sampling_binding_kind;          // v4 manifest: per-slot bind kind (0=Logits,1=Tensor)
+    PieSlice<std::uint32_t> sampling_binding_key;           // v4 manifest: per-slot host key (Tensor only)
+    PieSlice<std::uint32_t> sampling_binding_indptr;        // per-program binding CSR
+
+    // PTIR program carrier (thrust-3 P2c). Empty for the legacy / Sampling-IR
+    // paths. `ptir_program_hashes` + `ptir_program_instances` are ALWAYS present
+    // (one per program in the fire's PTIR set): `hash` selects the compiled
+    // program (hash-keyed decode cache), `instance` selects the persistent
+    // channel arena (many instances share one hash). `bytes`/`sidecar` carry a
+    // program's container + PTIB sidecar ONLY on the first fire of its instance
+    // (empty CSR range thereafter ⇒ served from the hash cache; an empty-bytes
+    // MISS is a HARD protocol error). Seeds bind once at the instance's first
+    // fire; host-puts ride every fire (D1-coalesced). See schema.rs.
+    PieSlice<std::uint64_t> ptir_program_hashes;            // per-program container_hash (always)
+    PieSlice<std::uint64_t> ptir_program_instances;         // per-program instance id (always)
+    PieSlice<std::uint8_t>  ptir_program_bytes;             // concatenated container bytes (first fire)
+    PieSlice<std::uint32_t> ptir_program_bytes_indptr;      // per-program byte CSR
+    PieSlice<std::uint8_t>  ptir_program_sidecar_bytes;     // concatenated PTIB sidecars (first fire)
+    PieSlice<std::uint32_t> ptir_program_sidecar_indptr;    // per-program sidecar byte CSR
+    PieSlice<std::uint32_t> ptir_program_seed_channels;     // seed target channel per entry
+    PieSlice<std::uint8_t>  ptir_program_seed_blob;         // concatenated seed value bytes
+    PieSlice<std::uint32_t> ptir_program_seed_lens;         // byte length per seed entry
+    PieSlice<std::uint32_t> ptir_program_seed_indptr;       // per-program seed CSR
+    PieSlice<std::uint32_t> ptir_program_host_put_channels; // host-put target channel per entry
+    PieSlice<std::uint8_t>  ptir_program_host_put_blob;     // concatenated host-put value bytes
+    PieSlice<std::uint32_t> ptir_program_host_put_lens;     // byte length per host-put entry
+    PieSlice<std::uint32_t> ptir_program_host_put_indptr;   // per-program host-put CSR
+
+    // WS8 P2 device-resident next-input link (#6). `pipeline_source_link != 0`
+    // ⇒ retain this (batched) forward's `pi.sampled[N]` under that global link
+    // id; the consumer arrays source some of this fire's input tokens (`pi.tokens`)
+    // device-side from a prior producer's retained `pi.sampled`. Parallel arrays,
+    // one entry per fed consumer input. See schema.rs.
+    std::uint32_t           pipeline_source_link = 0;
+    PieSlice<std::uint32_t> pipeline_source_links;  // per-request producer link (R>1 co-batch); empty ⇒ scalar fallback
+    // Drafts-channel routing (§9): retain SOURCE per producer link. 0 = PrevSample
+    // (retain pi.sampled[N]) / 1 = PrevDrafts (retain the composed [k+1] [seed,drafts]
+    // window). Scalar (R=1) + per-request batched; empty/0 ⇒ all PrevSample.
+    std::uint8_t            pipeline_source_kind = 0;
+    PieSlice<std::uint8_t>  pipeline_source_kinds;
+    PieSlice<std::uint32_t> next_input_producer_links;  // global producer link id per fed input
+    PieSlice<std::uint32_t> next_input_src_rows;         // src row in the producer's pi.sampled
+    PieSlice<std::uint32_t> next_input_dest_slots;       // dest position in this fire's pi.tokens
+    PieSlice<std::uint32_t> next_input_free_links;       // link ids whose last consumer drains here
+
+    // #27 cut #1 output→tensor fast-path carrier (per-output host pinned dsts,
+    // CSR per program). Empty ⇒ legacy ForwardResponse marshal.
+    PieSlice<std::uint64_t> sampling_output_dst_ptrs;    // host pinned-buf ptr per output value
+    PieSlice<std::uint32_t> sampling_output_dst_lens;    // byte capacity per dst (bounds-check)
+    PieSlice<std::uint32_t> sampling_output_indptr;      // per-program CSR into the dst arrays
+
+    // (a) BRIDGE carry-descriptor channel (X2/X3). Per-request carrier descriptor:
+    // the a2 R-loop, when `carry_user_ptr` is non-empty, validates
+    // `carry_abi_version[0] == expected` (loud-reject) then calls
+    // `pie_frame_carry(instance, carry_word_index[r], committed_head[r], sample_done,
+    // <once-registered done>, (void*)carry_user_ptr[r])`. Empty ⇒ no carry channel.
+    PieSlice<std::uint32_t> carry_abi_version;  // [version] or empty (loud-reject guard)
+    PieSlice<std::uint64_t> carry_user_ptr;     // boxed CarryWake raw ptr per request
+    PieSlice<std::uint64_t> carry_word_index;   // pinned head word index per request
+    PieSlice<std::uint64_t> carry_instance;     // bound instance id per request
+
+    // #27 cut #2 (B) direct-H2D late channel: per-late-key device-resident value
+    // ptr (host `pie_device_alloc`'d, filled by `pie_tensor_write_async` straight
+    // from the guest's WASM-memory slice — @ingim's inferlet→GPU memcpy, no IPC
+    // staging) + the R12 self-arm flag ptr (set stream-ordered after the H2D).
+    // Parallel to `sampling_late_keys`; ptr==0 for a key ⇒ that key uses the
+    // staged `sampling_late_blob` path instead. The grammar mask rides this.
+    PieSlice<std::uint64_t> sampling_late_device_ptrs;   // device buf ptr per late key
+    PieSlice<std::uint64_t> sampling_late_device_flags;  // R12 self-arm flag ptr per late key
+    PieSlice<std::uint32_t> sampling_late_device_lens;   // device value byte-len per late key
 
     // Sampler attributes (SoA — read from the wire SoA arrays; view.hpp
     // applies only the small kind-remap / top_k / top_p-min_p fold).
@@ -263,6 +338,21 @@ struct PieForwardResponseView {
     std::uint32_t probe_kernel_launch_us = 0;
     std::uint32_t probe_sync_us = 0;
     std::uint32_t probe_response_build_us = 0;
+    std::uint32_t probe_device_idle_us = 0;
+
+    PieSlice<std::uint32_t> program_tokens_req_indptr; // num_requests+1, per-request → first output-slot
+    PieSlice<std::uint32_t> program_tokens_indptr;  // per-(request,output) [k]-Token CSR
+    PieSlice<std::uint32_t> program_tokens;         // [k]-Token output values, concatenated
+
+    // PTIR program outputs (thrust-3 P2c-fire). The host-visible Reader-channel
+    // cells a PTIR pass produced (`PtirInstance::harvest_outputs`), marshaled
+    // back to the host channel store. SoA + per-program CSR, mirroring the
+    // request's host-put table; program `p` here is program `p` of the request's
+    // PTIR set. Bool cells travel packed (D1). Empty for legacy paths.
+    PieSlice<std::uint32_t> ptir_output_channels;   // produced Reader channel per entry
+    PieSlice<std::uint8_t>  ptir_output_blob;       // concatenated produced-cell bytes
+    PieSlice<std::uint32_t> ptir_output_lens;       // byte length per output entry
+    PieSlice<std::uint32_t> ptir_output_indptr;     // per-program output CSR
 };
 
 // ---- Top-level request / response views -----------------------------------
@@ -293,6 +383,12 @@ struct PieInProcResponseView {
     std::uint32_t            method;
     std::int32_t             status;
     PieForwardResponseView   forward;
+    // (a2) programmable-sampling output fast-path: when set, the driver has
+    // enqueued the eager-D2H + will fire the forward-done from a copy-stream
+    // host-func once the pinned buffer is filled — `serve_forever` must NOT send
+    // inline (it hands the send to `InProcServer::defer_send_`). Default false ⇒
+    // the normal synchronous send (every legacy path + non-cuda backends).
+    bool                     deferred = false;
 };
 
 // ---- Per-batch arenas ------------------------------------------------------
@@ -382,6 +478,9 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.qo_indptr         = slice_from(f.qo_indptr_ptr, f.qo_indptr_len);
     out.rs_slot_ids       = slice_from(f.rs_slot_ids_ptr, f.rs_slot_ids_len);
     out.rs_slot_flags     = slice_from(f.rs_slot_flags_ptr, f.rs_slot_flags_len);
+    out.rs_fold_lens          = slice_from(f.rs_fold_lens_ptr, f.rs_fold_lens_len);
+    out.rs_buffer_slot_ids    = slice_from(f.rs_buffer_slot_ids_ptr, f.rs_buffer_slot_ids_len);
+    out.rs_buffer_slot_indptr = slice_from(f.rs_buffer_slot_indptr_ptr, f.rs_buffer_slot_indptr_len);
 
     // BRLE masks come over the wire as Vec<Brle>. The driver code path
     // wants a flat run-length buffer plus per-ROW byte offsets. Walk
@@ -450,6 +549,75 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.sampling_late_offsets_ptr, f.sampling_late_offsets_len);
     out.sampling_late_lens =
         slice_from(f.sampling_late_lens_ptr, f.sampling_late_lens_len);
+    out.sampling_binding_kind =
+        slice_from(f.sampling_binding_kind_ptr, f.sampling_binding_kind_len);
+    out.sampling_binding_key =
+        slice_from(f.sampling_binding_key_ptr, f.sampling_binding_key_len);
+    out.sampling_binding_indptr =
+        slice_from(f.sampling_binding_indptr_ptr, f.sampling_binding_indptr_len);
+    out.ptir_program_hashes =
+        slice_from(f.ptir_program_hashes_ptr, f.ptir_program_hashes_len);
+    out.ptir_program_instances =
+        slice_from(f.ptir_program_instances_ptr, f.ptir_program_instances_len);
+    out.ptir_program_bytes =
+        slice_from(f.ptir_program_bytes_ptr, f.ptir_program_bytes_len);
+    out.ptir_program_bytes_indptr =
+        slice_from(f.ptir_program_bytes_indptr_ptr, f.ptir_program_bytes_indptr_len);
+    out.ptir_program_sidecar_bytes =
+        slice_from(f.ptir_program_sidecar_bytes_ptr, f.ptir_program_sidecar_bytes_len);
+    out.ptir_program_sidecar_indptr =
+        slice_from(f.ptir_program_sidecar_indptr_ptr, f.ptir_program_sidecar_indptr_len);
+    out.ptir_program_seed_channels =
+        slice_from(f.ptir_program_seed_channels_ptr, f.ptir_program_seed_channels_len);
+    out.ptir_program_seed_blob =
+        slice_from(f.ptir_program_seed_blob_ptr, f.ptir_program_seed_blob_len);
+    out.ptir_program_seed_lens =
+        slice_from(f.ptir_program_seed_lens_ptr, f.ptir_program_seed_lens_len);
+    out.ptir_program_seed_indptr =
+        slice_from(f.ptir_program_seed_indptr_ptr, f.ptir_program_seed_indptr_len);
+    out.ptir_program_host_put_channels =
+        slice_from(f.ptir_program_host_put_channels_ptr, f.ptir_program_host_put_channels_len);
+    out.ptir_program_host_put_blob =
+        slice_from(f.ptir_program_host_put_blob_ptr, f.ptir_program_host_put_blob_len);
+    out.ptir_program_host_put_lens =
+        slice_from(f.ptir_program_host_put_lens_ptr, f.ptir_program_host_put_lens_len);
+    out.ptir_program_host_put_indptr =
+        slice_from(f.ptir_program_host_put_indptr_ptr, f.ptir_program_host_put_indptr_len);
+    out.pipeline_source_link = f.pipeline_source_link;
+    out.pipeline_source_links =
+        slice_from(f.pipeline_source_links_ptr, f.pipeline_source_links_len);
+    out.pipeline_source_kind = f.pipeline_source_kind;
+    out.pipeline_source_kinds =
+        slice_from(f.pipeline_source_kinds_ptr, f.pipeline_source_kinds_len);
+    out.next_input_producer_links =
+        slice_from(f.next_input_producer_links_ptr, f.next_input_producer_links_len);
+    out.next_input_src_rows =
+        slice_from(f.next_input_src_rows_ptr, f.next_input_src_rows_len);
+    out.next_input_dest_slots =
+        slice_from(f.next_input_dest_slots_ptr, f.next_input_dest_slots_len);
+    out.next_input_free_links =
+        slice_from(f.next_input_free_links_ptr, f.next_input_free_links_len);
+    out.sampling_output_dst_ptrs =
+        slice_from(f.sampling_output_dst_ptrs_ptr, f.sampling_output_dst_ptrs_len);
+    out.sampling_output_dst_lens =
+        slice_from(f.sampling_output_dst_lens_ptr, f.sampling_output_dst_lens_len);
+    out.sampling_output_indptr =
+        slice_from(f.sampling_output_indptr_ptr, f.sampling_output_indptr_len);
+    // (a) BRIDGE carry-descriptor channel (X2/X3).
+    out.carry_abi_version =
+        slice_from(f.carry_abi_version_ptr, f.carry_abi_version_len);
+    out.carry_user_ptr =
+        slice_from(f.carry_user_ptr_ptr, f.carry_user_ptr_len);
+    out.carry_word_index =
+        slice_from(f.carry_word_index_ptr, f.carry_word_index_len);
+    out.carry_instance =
+        slice_from(f.carry_instance_ptr, f.carry_instance_len);
+    out.sampling_late_device_ptrs =
+        slice_from(f.sampling_late_device_ptrs_ptr, f.sampling_late_device_ptrs_len);
+    out.sampling_late_device_flags =
+        slice_from(f.sampling_late_device_flags_ptr, f.sampling_late_device_flags_len);
+    out.sampling_late_device_lens =
+        slice_from(f.sampling_late_device_lens_ptr, f.sampling_late_device_lens_len);
     out.spec_token_ids    = slice_from(f.spec_token_ids_ptr, f.spec_token_ids_len);
     out.spec_position_ids = slice_from(f.spec_position_ids_ptr, f.spec_position_ids_len);
     out.spec_indptr       = slice_from(f.spec_indptr_ptr, f.spec_indptr_len);
@@ -653,6 +821,21 @@ inline void build_response_desc(std::uint32_t driver_id,
         fr.probe_kernel_launch_us = view.forward.probe_kernel_launch_us;
         fr.probe_sync_us          = view.forward.probe_sync_us;
         fr.probe_response_build_us = view.forward.probe_response_build_us;
+        fr.probe_device_idle_us   = view.forward.probe_device_idle_us;
+        fr.program_tokens_req_indptr_ptr = view.forward.program_tokens_req_indptr.data();
+        fr.program_tokens_req_indptr_len = view.forward.program_tokens_req_indptr.size();
+        fr.program_tokens_indptr_ptr = view.forward.program_tokens_indptr.data();
+        fr.program_tokens_indptr_len = view.forward.program_tokens_indptr.size();
+        fr.program_tokens_ptr        = view.forward.program_tokens.data();
+        fr.program_tokens_len        = view.forward.program_tokens.size();
+        fr.ptir_output_channels_ptr  = view.forward.ptir_output_channels.data();
+        fr.ptir_output_channels_len  = view.forward.ptir_output_channels.size();
+        fr.ptir_output_blob_ptr      = view.forward.ptir_output_blob.data();
+        fr.ptir_output_blob_len      = view.forward.ptir_output_blob.size();
+        fr.ptir_output_lens_ptr      = view.forward.ptir_output_lens.data();
+        fr.ptir_output_lens_len      = view.forward.ptir_output_lens.size();
+        fr.ptir_output_indptr_ptr    = view.forward.ptir_output_indptr.data();
+        fr.ptir_output_indptr_len    = view.forward.ptir_output_indptr.size();
     } else {
         // Everything else (copy / adapter / health / unknown) just
         // produces a StatusResponse with the int code.

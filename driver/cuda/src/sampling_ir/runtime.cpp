@@ -125,11 +125,48 @@ RunStatus SamplingIrRuntime::try_run(const FireContext& ctx) {
                 break;
 
             case BindingClass::Intrinsic: {
-                // intrinsic(logits) = the LM-head output row for this fire.
-                // `ctx.logits` is the bf16 [rows, vocab] base; take sample_row.
+                // intrinsic(logits) = the LM-head output row for this fire;
+                // intrinsic(mtp-logits) = the speculator DRAFT row (the MTP head's
+                // next-token logits). Both read `ctx.logits` — the bf16
+                // [rows, vocab] base — because the MTP draft logits live in DRAFT
+                // ROWS of `ws.logits`, not a separate buffer; only the row differs.
+                //
+                // intrinsic(mtp-drafts) is DIFFERENT: an I32 `[k]` SEPARATE device
+                // buffer (`ctx.mtp_drafts` = bravo's retained drafts, rows 1..=k),
+                // NOT a `ws.logits` row — point straight at it. A missing source
+                // (no retained drafts this fire) is a host/carrier bug, not a retry
+                // → fail loud (matches the HostSubmit missing-stage contract).
+                if (decl.intrinsic == IntrinsicKind::MtpDrafts) {
+                    if (ctx.mtp_drafts == nullptr) {
+                        if (std::getenv("PIE_SAMPLING_IR_TRACE")) {
+                            std::cerr << "[ir-trace] try_run FAILED: MtpDrafts "
+                                         "intrinsic but ctx.mtp_drafts unset "
+                                         "(no retained drafts source this fire)\n";
+                        }
+                        return RunStatus::Failed;
+                    }
+                    r.device_ptr = ctx.mtp_drafts;
+                    r.elem_count = (decl.elem_count != 0)
+                                       ? decl.elem_count
+                                       : ctx.mtp_drafts_count;
+                    r.present = true;
+                    break;
+                }
                 const auto* base = static_cast<const __nv_bfloat16*>(ctx.logits);
+                int row = ctx.sample_row;
+                if (decl.intrinsic == IntrinsicKind::MtpLogits)
+                    row = (ctx.mtp_draft_row >= 0) ? ctx.mtp_draft_row
+                                                   : ctx.sample_row;
+                if (std::getenv("PIE_MTP_RESOLVE_TRACE") != nullptr)
+                    std::cerr << "[mtp-resolve] intrinsic="
+                              << (decl.intrinsic == IntrinsicKind::MtpLogits ? "MtpLogits" : "Logits")
+                              << " sample_row=" << ctx.sample_row
+                              << " mtp_draft_row=" << ctx.mtp_draft_row
+                              << " → row=" << row
+                              << " elem_count=" << r.elem_count
+                              << " decl.elem_count=" << decl.elem_count << "\n";
                 r.device_ptr =
-                    base + static_cast<std::size_t>(ctx.sample_row) *
+                    base + static_cast<std::size_t>(row) *
                                static_cast<std::size_t>(ctx.vocab_size);
                 r.elem_count = static_cast<std::size_t>(ctx.vocab_size);
                 r.present = true;
@@ -173,8 +210,21 @@ RunStatus SamplingIrRuntime::try_run(const FireContext& ctx) {
                     return RunStatus::SkippedLateBindMiss;
                 }
                 r.device_ptr = e->device_ptr;
-                r.elem_count = e->elem_count;
+                // The device-alias carrier (#27 cut #2 (B)) ships only a ptr +
+                // self-arm flag, no length — take the shape from the program's
+                // declared InputDecl (as the staged path does) when the carrier
+                // didn't supply one.
+                r.elem_count = (e->elem_count != 0) ? e->elem_count : decl.elem_count;
                 r.present = true;
+                // Positive device-alias-resolution probe (item-1 merged-path
+                // debug): a non-null ptr logged HERE proves the Late carrier was
+                // consumed BEFORE the consuming kernel — distinguishing a real
+                // resolve from a SkippedLateBindMiss / pre-empted abort.
+                if (std::getenv("PIE_SAMPLING_IR_TRACE")) {
+                    std::cerr << "[ir-trace]   HostLate RESOLVED device-alias key="
+                              << decl.host_key << " ptr=" << r.device_ptr
+                              << " elem_count=" << r.elem_count << "\n";
+                }
                 break;
             }
         }

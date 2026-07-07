@@ -23,6 +23,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use crate::ir;
+use crate::kinds::CanonicalKind;
 
 /// SSA value id (final — assigned in creation order, never renumbered).
 pub type NodeId = u32;
@@ -55,6 +56,9 @@ pub struct LoweredProgram {
     /// (`Logits` or `Tensor{key, readiness}`). Binding-free v4 keeps this out of
     /// the bytecode; the SDK uses it to build the positional `input-binding` list.
     pub bindings: Vec<ir::Binding>,
+    /// The recognized [`CanonicalKind`] of this program (the de-hardwiring
+    /// routing tag; [`CanonicalKind::Custom`] for `Graph`-authored programs).
+    pub canonical_kind: CanonicalKind,
 }
 
 /// Result of [`Graph::build`]: the canonical IR program plus the output manifest,
@@ -67,6 +71,9 @@ pub struct Built {
     pub host_inputs: Vec<HostInputDecl>,
     /// Per input slot (slot order): the attach-time binding.
     pub bindings: Vec<ir::Binding>,
+    /// The recognized [`CanonicalKind`] of this program (the de-hardwiring
+    /// routing tag; [`CanonicalKind::Custom`] for `Graph`-authored programs).
+    pub canonical_kind: CanonicalKind,
 }
 
 impl Built {
@@ -77,6 +84,7 @@ impl Built {
             outputs: self.outputs.clone(),
             host_inputs: self.host_inputs.clone(),
             bindings: self.bindings.clone(),
+            canonical_kind: self.canonical_kind,
         }
     }
 }
@@ -112,6 +120,7 @@ pub struct GraphInner {
     inputs: Vec<(ir::InputDecl, ir::Binding)>,
     outputs: Vec<OutputEntry>,
     next_key: ir::TensorKey,
+    canonical_kind: CanonicalKind,
     errors: Vec<String>,
 }
 
@@ -132,7 +141,15 @@ impl GraphInner {
     /// the `Op::Input(slot)` that materializes it as a value.
     pub(crate) fn add_input(&mut self, ty: ir::ValueType, binding: ir::Binding) -> NodeId {
         let slot = self.inputs.len() as ir::InputIndex;
-        self.inputs.push((ir::InputDecl::new(ty.shape, ty.dtype), binding));
+        // Lower the binding's readiness into the IR input decl so the host can
+        // route Late inputs (e.g. the grammar mask) to the late H2D channel.
+        // Intrinsic (`Logits`) inputs are always available → Submit.
+        let ready = match &binding {
+            ir::Binding::Tensor { ready, .. } => *ready,
+            _ => ir::Readiness::Submit,
+        };
+        self.inputs
+            .push((ir::InputDecl::with_ready(ty.shape, ty.dtype, ready), binding));
         self.push(ir::Op::Input(slot), &[ty])
     }
 
@@ -166,6 +183,7 @@ impl Graph {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 next_key: 0,
+                canonical_kind: CanonicalKind::Custom,
                 errors: Vec::new(),
             })),
         }
@@ -174,6 +192,13 @@ impl Graph {
     /// The graph's runtime vocab (intrinsic-logits length).
     pub fn vocab(&self) -> u32 {
         self.inner.borrow().vocab
+    }
+
+    /// Tag the program's [`CanonicalKind`] (the de-hardwiring routing tag). It
+    /// defaults to [`CanonicalKind::Custom`]; the [`sugar`](crate::sugar) /
+    /// [`standard`](crate::standard) builders set the recognized kind.
+    pub fn set_canonical_kind(&self, kind: CanonicalKind) {
+        self.inner.borrow_mut().canonical_kind = kind;
     }
 
     pub(crate) fn inner_ref(&self) -> GraphRef {
@@ -254,7 +279,8 @@ impl Graph {
                     shape: decl.shape,
                     ready: *ready,
                 }),
-                ir::Binding::Logits => None,
+                // Intrinsics (logits / draft mtp-logits) are not host inputs.
+                ir::Binding::Logits | ir::Binding::MtpLogits | ir::Binding::MtpDrafts => None,
             })
             .collect();
         let bindings = g.inputs.iter().map(|(_, b)| *b).collect();
@@ -264,6 +290,7 @@ impl Graph {
             outputs,
             host_inputs,
             bindings,
+            canonical_kind: g.canonical_kind,
         })
     }
 

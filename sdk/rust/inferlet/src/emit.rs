@@ -10,7 +10,7 @@
 //!
 //! The program is binding-free: `Op::Input(i)` references a typed input slot, and
 //! the attach-time bindings (`LoweredProgram::bindings`) are golf's SDK concern
-//! (`Vec<InputBinding>` for [`Forward::sampler`](crate::forward::Forward::sampler)).
+//! (`Vec<InputBinding>` for the forward pass's `sampler` binding).
 //! This module owns only `SamplingProgram → tensor::Program`.
 //!
 //! [`SamplingProgram`]: crate::sampling::ir::SamplingProgram
@@ -36,7 +36,7 @@ pub fn emit_program(program: &ir::SamplingProgram) -> Result<tensor::Program> {
 pub(crate) struct ProgramParts {
     pub inputs: Vec<tensor::Input>,
     pub ops: Vec<tensor::Op>,
-    pub outputs: Vec<tensor::ValueId>,
+    pub outputs: Vec<tensor::Output>,
 }
 
 pub(crate) fn lower_parts(program: &ir::SamplingProgram) -> Result<ProgramParts> {
@@ -51,6 +51,7 @@ pub(crate) fn lower_parts(program: &ir::SamplingProgram) -> Result<ProgramParts>
         .map(|d| tensor::Input {
             shape: shape_to_wit(d.shape),
             dtype: dtype_to_wit(d.dtype),
+            ready: readiness_to_wit(d.ready),
         })
         .collect();
 
@@ -76,7 +77,14 @@ pub(crate) fn lower_parts(program: &ir::SamplingProgram) -> Result<ProgramParts>
         next_id += n;
     }
 
-    let outputs = program.outputs.iter().map(|o| o.value).collect();
+    // Carry the DECLARED OutputKind through the front door (not bare ids) so
+    // typed float kinds (logits/logprobs/distribution) survive the decode
+    // instead of re-inferring to scalar (#18).
+    let outputs = program
+        .outputs
+        .iter()
+        .map(|o| tensor::Output { id: o.value, kind: output_kind_to_wit(o.kind) })
+        .collect();
     Ok(ProgramParts {
         inputs,
         ops,
@@ -94,6 +102,31 @@ pub(crate) fn dtype_to_wit(d: ir::DType) -> tensor::Dtype {
         ir::DType::I32 => tensor::Dtype::I32,
         ir::DType::U32 => tensor::Dtype::U32,
         ir::DType::Bool => tensor::Dtype::Bool,
+    }
+}
+
+/// WIT `readiness`: when an input-slot's binding value is ready at attach. Late
+/// inputs (e.g. the grammar mask) ride the host late H2D channel; the host
+/// reconstructs `InputDecl.ready` from this on decode (lane-3).
+fn readiness_to_wit(r: ir::Readiness) -> tensor::Readiness {
+    match r {
+        ir::Readiness::Submit => tensor::Readiness::Submit,
+        ir::Readiness::Late => tensor::Readiness::Late,
+    }
+}
+
+/// WIT `output-kind`: the declared marshaling kind of a program output, carried
+/// explicitly so the typed float kinds (logits/logprobs/distribution) survive
+/// the front door instead of re-inferring to scalar (#18).
+fn output_kind_to_wit(k: ir::OutputKind) -> tensor::OutputKind {
+    match k {
+        ir::OutputKind::Token => tensor::OutputKind::Token,
+        ir::OutputKind::Distribution => tensor::OutputKind::Distribution,
+        ir::OutputKind::Logits => tensor::OutputKind::Logits,
+        ir::OutputKind::Logprobs => tensor::OutputKind::Logprobs,
+        ir::OutputKind::Entropy => tensor::OutputKind::Entropy,
+        ir::OutputKind::Scalar => tensor::OutputKind::Scalar,
+        ir::OutputKind::Embedding => tensor::OutputKind::Embedding,
     }
 }
 
@@ -161,6 +194,7 @@ fn op_kind_to_wit(k: ir::OpKind) -> tensor::OpKind {
         ir::OpKind::PivotThreshold((v, p)) => W::PivotThreshold((v, predicate_to_wit(p))),
         ir::OpKind::Gather(t) => W::Gather(t),
         ir::OpKind::GatherRow(t) => W::GatherRow(t),
+        ir::OpKind::MaskApply(t) => W::MaskApply(t),
         ir::OpKind::ScatterAdd(t) => W::ScatterAdd(t),
         ir::OpKind::ScatterSet(t) => W::ScatterSet(t),
         ir::OpKind::Rng((stream, s, kind)) => W::Rng((stream, shape_to_wit(s), rng_kind_to_wit(kind))),
@@ -209,6 +243,7 @@ mod tests {
             }
             W::Gather(t) => ir::OpKind::Gather(t),
             W::GatherRow(t) => ir::OpKind::GatherRow(t),
+            W::MaskApply(t) => ir::OpKind::MaskApply(t),
             W::ScatterAdd(t) => ir::OpKind::ScatterAdd(t),
             W::ScatterSet(t) => ir::OpKind::ScatterSet(t),
             W::Rng((stream, ref s, k)) => {
@@ -285,9 +320,23 @@ mod tests {
             next_id += n;
         }
 
-        // Program outputs: bare value ids, in order.
-        let want: Vec<u32> = program.outputs.iter().map(|o| o.value).collect();
-        assert_eq!(parts.outputs, want);
+        // Program outputs carry (value id, declared marshaling kind), in order —
+        // the OutputKind survives the front door (#18). The generated WIT variant
+        // has no `PartialEq`, so compare the kind via its frozen discriminant.
+        assert_eq!(parts.outputs.len(), program.outputs.len());
+        for (got, decl) in parts.outputs.iter().zip(&program.outputs) {
+            assert_eq!(got.id, decl.value);
+            let got_kind = match got.kind {
+                tensor::OutputKind::Token => 0u8,
+                tensor::OutputKind::Distribution => 1,
+                tensor::OutputKind::Logits => 2,
+                tensor::OutputKind::Logprobs => 3,
+                tensor::OutputKind::Entropy => 4,
+                tensor::OutputKind::Scalar => 5,
+                tensor::OutputKind::Embedding => 6,
+            };
+            assert_eq!(got_kind, decl.kind.to_u8(), "OutputKind drift");
+        }
     }
 
     #[test]

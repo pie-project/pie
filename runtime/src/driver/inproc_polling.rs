@@ -14,6 +14,7 @@ use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -22,8 +23,9 @@ use crossbeam::queue::ArrayQueue;
 use crossbeam::utils::CachePadded;
 use tokio::runtime::RuntimeFlavor;
 
+use super::prefetch::PrefetchEntry;
 use super::{DriverChannel, DriverRequest, DriverResponse};
-use pie_ipc::ffi::InProcVTable;
+use pie_ipc::ffi::{InProcVTable, PrefetchFn};
 use pie_driver_abi::schema::{PieFrameDesc, PieFrameView, PieResponseFrameDesc};
 
 const SLOT_BITS: u32 = 16;
@@ -131,6 +133,10 @@ struct InProcPollingState {
     slots: Vec<CachePadded<PollingSlot>>,
     free: ArrayQueue<usize>,
     ready: ArrayQueue<usize>,
+    /// #11 prefetch seam: the driver's JIT prefetch entry, registered ONCE by
+    /// the C++ backend at ready-time. `None` until registered (and forever for
+    /// non-JIT drivers) ⇒ `prefetch_compile` is a no-op.
+    prefetch: OnceLock<PrefetchEntry>,
 }
 
 impl InProcPollingState {
@@ -153,6 +159,7 @@ impl InProcPollingState {
                 .collect(),
             free,
             ready: ArrayQueue::new(capacity),
+            prefetch: OnceLock::new(),
         }))
     }
 
@@ -314,8 +321,29 @@ impl InProcPollingState {
         // each fire's wall time lives here — it covers the C++ side's
         // entire handle_fire_batch (host phases + GPU compute).
         let wait_start = std::time::Instant::now();
+        // LIVENESS WATCHDOG (ports the inproc.rs semantics to the polling
+        // transport — the LIVE channel for cuda_native/Latency): a lost or
+        // never-sent response would otherwise spin here FOREVER with zero
+        // diagnostics. WARN every `PIE_DRIVER_WAIT_WARN_SECS` naming the
+        // slot. NOTE: no hard-timeout bail on this transport — abandoning
+        // the wait would violate the slot state machine (the responder may
+        // still write; an abandoned-waiter state would be needed) — so the
+        // watchdog converts a silent hang into a diagnosed one only.
+        let warn_every =
+            std::time::Duration::from_secs(super::inproc::wait_warn_secs());
+        let mut next_warn = wait_start + warn_every;
         while slot.response_generation.load(Ordering::Acquire) != generation {
             self.spin_or_yield(&mut iters, &mut deadline);
+            if (iters & 0x3ff) == 0 && std::time::Instant::now() >= next_warn {
+                tracing::warn!(
+                    target: "pie::driver::inproc_polling",
+                    slot_idx,
+                    generation,
+                    waited_secs = wait_start.elapsed().as_secs(),
+                    "driver response still pending — possible lost response or driver stall"
+                );
+                next_warn += warn_every;
+            }
         }
         crate::probe::driver_cuda::record_gpu_wait(wait_start.elapsed());
 
@@ -482,6 +510,7 @@ impl InProcPollingChannel {
             recv: vt_recv,
             send_response: vt_send_response,
             ctx: ctx_ptr,
+            register_prefetch: vt_register_prefetch,
         }
     }
 
@@ -557,6 +586,28 @@ impl DriverChannel for InProcPollingChannel {
     fn abort(&self) {
         self.state.abort();
     }
+
+    fn prefetch_compile(&self, bytecode: &[u8], manifest: &[pie_sampling_ir::Binding]) {
+        // No-op until the C++ backend registers its trampoline (and forever for
+        // non-JIT embedded drivers). Fire-and-forget; correctness never depends
+        // on it landing — the real fire compiles either way.
+        if let Some(entry) = self.state.prefetch.get() {
+            entry.invoke(bytecode, manifest);
+        }
+    }
+}
+
+/// register_prefetch: the C++ backend hands Rust its JIT prefetch trampoline +
+/// backend context (the #11 prefetch seam). Called ONCE at backend-ready; stored
+/// set-once. A non-JIT driver never calls this (prefetch stays a no-op).
+unsafe extern "C" fn vt_register_prefetch(
+    ctx: *mut c_void,
+    prefetch: PrefetchFn,
+    backend_ctx: *mut c_void,
+) {
+    if let Some(state) = unsafe { InProcPollingChannel::state_from_ctx(ctx) } {
+        let _ = state.prefetch.set(PrefetchEntry::new(prefetch, backend_ctx));
+    }
 }
 
 unsafe extern "C" fn vt_recv(
@@ -620,13 +671,32 @@ unsafe extern "C" fn vt_send_response(
     response: *const PieResponseFrameDesc,
 ) {
     let Some(state) = (unsafe { InProcPollingChannel::state_from_ctx(ctx) }) else {
+        tracing::error!(
+            target: "pie::driver::inproc_polling",
+            req_id,
+            "send_response DROPPED: unknown channel ctx (torn down?)"
+        );
         return;
     };
     let Some((slot_idx, generation)) = state.decode_req_id(req_id) else {
+        tracing::error!(
+            target: "pie::driver::inproc_polling",
+            req_id,
+            "send_response DROPPED: undecodable req_id (driver id bug?) — a waiter may spin to the watchdog"
+        );
         return;
     };
     let slot = &state.slots[slot_idx];
     if slot.generation.load(Ordering::Acquire) != generation {
+        // A late response for a recycled slot (post-abort) is benign; a
+        // genuinely lost fresh response is not — log at warn so a stall
+        // investigation sees it either way.
+        tracing::warn!(
+            target: "pie::driver::inproc_polling",
+            req_id,
+            slot_idx,
+            "send_response for a stale slot generation — dropped (late/post-abort response, or a lost fresh one)"
+        );
         return;
     }
 
@@ -684,7 +754,14 @@ fn finish_unexpected_driver_response_state(
             unsafe { slot.clear_frame_view() };
             state.recycle_after_aborted_driver_and_waiter_done(slot_idx);
         }
-        _ => {}
+        other => {
+            tracing::error!(
+                target: "pie::driver::inproc_polling",
+                slot_idx,
+                state = other,
+                "send_response into an unexpected slot state — response dropped; the waiter (if any) spins to the watchdog"
+            );
+        }
     }
 }
 

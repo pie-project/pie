@@ -5,10 +5,77 @@
 //! the schema, so `serde_json::from_str` is the only step between the model
 //! output and the renderer.
 
-use inferlet::{
-    Context, Result, Schema, sample::Sampler, model::Model, runtime,
-};
+use inferlet::inference::ForwardPass;
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{chat, geometry, model, sampler, Constrain, JsonSchema, Result, Schema};
 use minijinja::Environment;
+
+async fn read_token(pass: ForwardPass) -> Result<u32> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(if bytes.len() >= 4 {
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
+    } else {
+        0
+    })
+}
+
+/// One SEQUENTIAL grammar fire (geometry + input + masked grammar sampler +
+/// execute). No carrier — the next mask depends on this token.
+fn grammar_fire(
+    kv: &KvWorkingSet,
+    seq_len: &mut u32,
+    fresh: &mut bool,
+    g: &sampler::LoweredGrammar,
+    tokens: &[u32],
+    packed_mask: &[u32],
+) -> Result<ForwardPass> {
+    let n = tokens.len() as u32;
+    let pass = ForwardPass::new();
+    if *fresh {
+        pass.fresh_generate();
+        *fresh = false;
+    }
+    let geom = geometry::ensure_pages(kv, geometry::kv_write_geometry(*seq_len, n, kv.page_size()))?;
+    geometry::attach_kv_write(&pass, kv, &geom);
+    let positions: Vec<u32> = (*seq_len..*seq_len + n).collect();
+    pass.input_tokens(tokens, &positions);
+    let decode_pos = *seq_len + n - 1;
+    pass.sampler(&g.program, g.bindings(decode_pos, packed_mask)?);
+    pass.execute();
+    *seq_len += n;
+    Ok(pass)
+}
+
+/// Sequential JsonSchema-constrained decode → decoded text (grammar keep-core).
+async fn constrained_generate(system: &str, user: &str, schema: &str, max_tokens: usize) -> Result<String> {
+    let vocab = model::output_vocab_size();
+    let g = sampler::grammar_program(vocab)?;
+    let mut matcher = JsonSchema(schema).build_constraint()?;
+    let stop = chat::stop_tokens();
+
+    let mut prompt = chat::system_user(system, user);
+    prompt.extend(chat::cue());
+
+    let kv = KvWorkingSet::new();
+    let mut seq = 0u32;
+    let mut fresh = true;
+    let mut pending = prompt;
+    let mut tokens: Vec<u32> = Vec::new();
+    for _ in 0..max_tokens {
+        let m = matcher.mask();
+        let packed: Vec<u32> = if m.is_empty() { vec![u32::MAX; g.mask_words] } else { m };
+        let pass = grammar_fire(&kv, &mut seq, &mut fresh, &g, &pending, &packed)?;
+        let token = read_token(pass).await?;
+        if stop.contains(&token) {
+            break;
+        }
+        tokens.push(token);
+        matcher.advance(&[token]);
+        pending = vec![token];
+    }
+    Ok(model::decode(&tokens).unwrap_or_default())
+}
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -84,23 +151,13 @@ fn render(data: &Value) -> std::result::Result<String, String> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
-
-    let mut ctx = Context::new(&model)?;
-    ctx.system(SYSTEM_PROMPT);
-    ctx.user(&format!(
-        "Generate product announcement data for: {}.",
-        input.prompt,
-    ));
-    ctx.cue();
-
-    let text = ctx
-        .generate(Sampler::Argmax)
-        .max_tokens(input.max_tokens)
-        .constrain_with(inferlet::JsonSchema(PRODUCT_SCHEMA))?
-        .collect_text()
-        .await?;
+    let text = constrained_generate(
+        SYSTEM_PROMPT,
+        &format!("Generate product announcement data for: {}.", input.prompt),
+        PRODUCT_SCHEMA,
+        input.max_tokens,
+    )
+    .await?;
 
     // Grammar enforces a structurally valid prefix at every step;
     // the parse can still fail when `max_tokens` cuts mid-string. On

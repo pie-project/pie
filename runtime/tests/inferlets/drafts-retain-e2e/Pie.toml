@@ -1,0 +1,4 @@
+[package]
+name = "drafts-retain-e2e"
+version = "0.1.0"
+description = "Drafts-channel retain plumbing gate: a single retain->inject cycle proves the [k+1] [seed,drafts] window is byte-identical through kind==1, isolated from MTP acceptance semantics (charlie)"

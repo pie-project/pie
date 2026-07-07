@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use self::output::LogStream;
 
-use crate::context;
 use crate::linker::InstancePolicy;
 use crate::process::ProcessId;
 
@@ -40,6 +40,10 @@ pub struct InstanceState {
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
 
+    /// Whether outbound network is permitted (gates `pie:core/http.fetch`,
+    /// parity with the wasi:http linker which is only wired when allowed).
+    network_allowed: bool,
+
     /// Per-instance scratch directory, deleted on Drop.
     scratch_dir: PathBuf,
 
@@ -51,23 +55,51 @@ pub struct InstanceState {
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
 
-    /// WS8 inter-pass pipeline links (`forward-pass.next-input`): a producer
-    /// pass's resolved output keyed by context, drained by the next pass on that
-    /// context to source its input tokens host-side (no guest round-trip). P1 is
-    /// host-resolved; P2 binds the device-resident `pi.sampled` instead.
-    pub(crate) pipeline_links: HashMap<crate::context::ContextId, crate::api::inference::PipelineLink>,
+    /// #6/#21 run-ahead next-input carry state, keyed **per-context**
+    /// (`context_id = kv_ws.rep()`). `pending_next_input[ctx]` holds context
+    /// `ctx`'s prior *producer* pass's pending carry (link id + dest positions +
+    /// producer row count) for its next pass (the implicit consumer) to inject.
+    /// Per-context (not a single slot) so N concurrently-decoding pipelines in one
+    /// instance never clobber each other's carry under co-batched submit
+    /// (thrust-2 Bug#2). Carrier link ids are drawn from a PROCESS-GLOBAL counter
+    /// in [`crate::api::next_input_map`] (not per-instance — else concurrent
+    /// instances collide in the driver's global retained map).
+    pub(crate) pending_next_input:
+        std::collections::HashMap<u32, crate::api::next_input_map::PendingNextInput>,
+    /// #23 overlap abort-isolation write-log: tracks each in-flight producer
+    /// link's resolved outcome so a consumer's finalize cascade-aborts if the
+    /// producer it injected from aborted (fail-closed on unresolved). Cleared at
+    /// each fresh `generate()` boundary.
+    pub(crate) overlap_links: crate::api::next_input_map::OverlapLinkLog,
+
+    /// Task-B (carrier ⋈ contention): table reps of this instance's
+    /// `ForwardPass` resources that hold a live `PendingForward`. The
+    /// contention drain walks this to finalize the lane's OWN already-retired
+    /// fires from inside a gated/parked task (releasing their pins + grace
+    /// refs so `classify_for_suspend` can yield). Registered at the
+    /// eager-submit store, removed when `output()`/`outputs()`/the drain
+    /// consume the pending forward. A stale rep (pass dropped without
+    /// `output()`) is lazily removed on the next drain walk.
+    pub(crate) pending_fires: Vec<u32>,
+
+    /// Depth-k run-ahead rollback (spec §4): every carrier producer link created
+    /// on a context this generation, so a fresh-`generate()` after a run-ahead STOP
+    /// can free-ALL of them — not just the one dangling `pending_next_input`. A
+    /// depth-k EOS over-shoot drops ≤depth−1 speculative fires; the last COMMITTED
+    /// fire's retained carry is then orphaned (its drain-gated free rode the FIRST
+    /// dropped fire's request, which never ran), while `pending` points at a
+    /// never-retained over-shot link. Free-all covers it. Safe: the driver free is
+    /// idempotent (find-or-skip) + drain-gated, so re-freeing an already-freed or
+    /// in-flight link is a no-op. Keyed per context (Bug#2 isolation); cleared per
+    /// generation boundary.
+    pub(crate) carrier_produced_links: std::collections::HashMap<u32, Vec<u32>>,
 }
 
 impl Drop for InstanceState {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
-        // WS8 links reference their producer pass (which owns its pin and
-        // releases it on its own drop), so the links hold no resources — just
-        // clear the map. The producer ForwardPass resources are dropped by the
-        // store teardown, releasing any still-held pins.
-        self.pipeline_links.clear();
-        // Unregister the process: destroy all contexts and remove process entries.
-        context::unregister_process(self.id);
+        // (Process/context unregister removed — Phase 5; working sets drop with
+        // the instance's resource table.)
     }
 }
 
@@ -81,12 +113,12 @@ impl WasiView for InstanceState {
 }
 
 impl WasiHttpView for InstanceState {
-    fn ctx(&mut self) -> &mut WasiHttpCtx {
-        &mut self.http_ctx
-    }
-
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.resource_table
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.resource_table,
+            hooks: Default::default(),
+        }
     }
 }
 
@@ -179,12 +211,21 @@ impl InstanceState {
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
+            network_allowed: policy.network.allow,
             scratch_dir,
             // Dynamic linking support
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
-            pipeline_links: HashMap::new(),
+            // #6/#21 run-ahead next-input carry (idle until a pass declares
+            // `next-inputs`).
+            pending_next_input: std::collections::HashMap::new(),
+            // #23 overlap abort-isolation write-log (empty until a producer pass).
+            overlap_links: crate::api::next_input_map::OverlapLinkLog::default(),
+            pending_fires: Vec::new(),
+
+            // Depth-k rollback free-all tracking (empty until a producer pass).
+            carrier_produced_links: std::collections::HashMap::new(),
         })
     }
 
@@ -194,6 +235,11 @@ impl InstanceState {
 
     pub fn get_username(&self) -> String {
         self.username.clone()
+    }
+
+    /// Whether outbound network is permitted for this inferlet.
+    pub fn network_allowed(&self) -> bool {
+        self.network_allowed
     }
 
     // ========================================================================

@@ -18,9 +18,177 @@
 //!   * `use_cache=false`                    -> never open a saved snapshot
 //!   * `save_cache=false`                   -> never save new snapshots
 
-use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
+//! Low-level ① rewrite (chat-EOS, pipelined + SNAPSHOT): off the `Context`/
+//! `Generator`/`Sampler` facade onto the keep-core. A small `Ctx` tracks the
+//! materialized token log in lockstep with `seq_len` (what the facade's `history`
+//! did); `snapshot::save`/`open` persist that manifest; `open` REPLAYS the log via
+//! `prefill::tokens` (the replay lives in the inferlet, not the SDK). The final
+//! answer decodes greedily on the run-ahead carrier. `Ctx`/`to_snapshot`/
+//! `from_snapshot` mirror echo's `demo-persistent-kv` template.
+
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{self, SamplerSpec};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{carrier, chat, model, prefill, snapshot, Result};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+
+/// A minimal chat context on the keep-core: KV + cursor + the materialized token
+/// log (`tokens`, = the facade's `history`) + the unflushed tail (`buffer`), so a
+/// snapshot is a serializable manifest and `open` replays the log via `prefill`.
+struct Ctx {
+    kv: KvWorkingSet,
+    page_size: u32,
+    seq_len: u32,
+    tokens: Vec<u32>,
+    buffer: Vec<u32>,
+    pending_system: Option<String>,
+    fresh: bool,
+}
+
+impl Ctx {
+    fn new() -> Result<Self> {
+        let kv = KvWorkingSet::new();
+        let page_size = kv.page_size();
+        Ok(Self { kv, page_size, seq_len: 0, tokens: Vec::new(), buffer: Vec::new(), pending_system: None, fresh: true })
+    }
+
+    /// Rebuild from a snapshot manifest by REPLAYING its token log (a prefill).
+    fn from_snapshot(snap: snapshot::SnapshotData) -> Result<Self> {
+        let mut ctx = Self::new()?;
+        if !snap.tokens.is_empty() {
+            prefill::tokens(&ctx.kv, &mut ctx.seq_len, &snap.tokens)?;
+            ctx.tokens = snap.tokens;
+            ctx.fresh = false;
+        }
+        ctx.buffer = snap.buffer;
+        ctx.pending_system = snap.pending_system;
+        Ok(ctx)
+    }
+
+    fn to_snapshot(&self) -> snapshot::SnapshotData {
+        snapshot::SnapshotData {
+            version: snapshot::SNAPSHOT_VERSION,
+            page_size: self.page_size,
+            seq_len: self.seq_len,
+            tokens: self.tokens.clone(),
+            buffer: self.buffer.clone(),
+            pending_system: self.pending_system.clone(),
+            cas_hashes: Vec::new(),
+        }
+    }
+
+    fn flush_pending_system(&mut self) {
+        if let Some(system) = self.pending_system.take() {
+            self.buffer.extend(chat::system(&system));
+        }
+    }
+
+    fn is_first_chat_fill(&self) -> bool {
+        self.seq_len == 0 && self.buffer.is_empty()
+    }
+
+    fn system(&mut self, message: &str) {
+        self.flush_pending_system();
+        self.pending_system = Some(message.to_string());
+    }
+
+    fn user(&mut self, message: &str) {
+        let tokens = match self.pending_system.take() {
+            Some(system) => chat::system_user(&system, message),
+            None if self.is_first_chat_fill() => chat::first_user(message),
+            None => chat::user(message),
+        };
+        self.buffer.extend(tokens);
+    }
+
+    fn cue(&mut self) {
+        self.flush_pending_system();
+        self.buffer.extend(chat::cue());
+    }
+
+    /// Materialize the buffered tail into KV (the keep-core prefill) + record it
+    /// into the log. Mirrors `Context::flush`.
+    fn flush(&mut self) -> Result<()> {
+        self.flush_pending_system();
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let tokens = std::mem::take(&mut self.buffer);
+        prefill::tokens(&self.kv, &mut self.seq_len, &tokens)?;
+        self.tokens.extend(tokens);
+        Ok(())
+    }
+}
+
+async fn read_token(pass: ForwardPass) -> Result<u32> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(if bytes.len() >= 4 {
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
+    } else {
+        0
+    })
+}
+
+fn pass_carries(stop_empty: bool, max_tokens: usize, produced_token_index: usize) -> bool {
+    !(stop_empty && max_tokens == produced_token_index)
+}
+
+/// Run-ahead (pipelined) chat-EOS decode with depth-1 EOS rollback, continuing
+/// from `*seq_len` (the prefilled module prefix). `prompt` is the buffered tail
+/// (the cue).
+async fn decode_pipelined(
+    kv: &KvWorkingSet,
+    seq_len: &mut u32,
+    fresh: &mut bool,
+    s: &sampler::LoweredSampler,
+    prompt: Vec<u32>,
+    max_tokens: usize,
+    stop: &[u32],
+) -> Result<Vec<u32>> {
+    let pending = if prompt.is_empty() { vec![0u32] } else { prompt };
+    let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
+    if max_tokens == 0 {
+        return Ok(out);
+    }
+    let prime_carry = pass_carries(stop.is_empty(), max_tokens, 1);
+    let mut producer = carrier::submit_pass(kv, seq_len, fresh, s, &pending, prime_carry)?;
+    let mut generated = 0usize;
+    loop {
+        let speculate = generated + 1 < max_tokens;
+        let consumer = if speculate {
+            let carry = pass_carries(stop.is_empty(), max_tokens, generated + 2);
+            Some(carrier::submit_pass(kv, seq_len, fresh, s, &[0u32], carry)?)
+        } else {
+            None
+        };
+        let token = read_token(producer).await?;
+        if stop.contains(&token) {
+            if let Some(c) = consumer {
+                carrier::discard_pass(c, seq_len).await;
+            }
+            break;
+        }
+        out.push(token);
+        generated += 1;
+        match consumer {
+            Some(c) => producer = c,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+fn decode_text(tokens: &[u32]) -> Result<String> {
+    let mut dec = chat::Decoder::new();
+    let mut text = String::new();
+    match dec.feed(tokens)? {
+        chat::Event::Delta(s) | chat::Event::Done(s) => text.push_str(&s),
+        _ => {}
+    }
+    Ok(text)
+}
 
 /// Bump this when the on-disk snapshot layout / key meaning changes so old
 /// snapshots can never be confused with new ones.
@@ -78,8 +246,6 @@ fn default_role() -> String { "user".to_string() }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let model = Model::load(runtime::models().first().ok_or("No models available")?)?;
-
     // If the caller did not provide a custom module graph, build a useful default.
     let modules = if input.modules.is_empty() {
         default_modules(&input.prompt)
@@ -96,11 +262,16 @@ async fn main(input: Input) -> Result<String> {
     println!("order={}", ordered.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(" -> "));
     println!("use_cache={} save_cache={}", input.use_cache, input.save_cache);
 
-    // Resume from the longest saved prefix. open() already forks (the snapshot
-    // stays immutable), so the context it hands back is ours to append to.
+    let vocab = model::output_vocab_size();
+    let s = sampler::sampler_program(SamplerSpec::Argmax, vocab)?;
+    let stop = chat::stop_tokens();
+
+    // Resume from the longest saved prefix. `snapshot::open` reads the manifest;
+    // `Ctx::from_snapshot` REPLAYS its token log (a prefill) — the snapshot blob
+    // stays on disk (an implicit fork).
     let mut resume_index = 0usize;
     let mut ctx = if input.use_cache {
-        match open_longest_prefix(&model, &ordered) {
+        match open_longest_prefix(&ordered) {
             Some((cached, len)) => {
                 println!("cache_hit_modules={}", len);
                 resume_index = len;
@@ -108,12 +279,12 @@ async fn main(input: Input) -> Result<String> {
             }
             None => {
                 println!("cache_miss");
-                Context::new(&model)?
+                Ctx::new()?
             }
         }
     } else {
         println!("cache_miss (use_cache=false)");
-        Context::new(&model)?
+        Ctx::new()?
     };
 
     // Append only the modules that were not already cached.
@@ -126,30 +297,31 @@ async fn main(input: Input) -> Result<String> {
             Role::User => { ctx.user(&module.text); }
         }
 
-        // flush() materializes this module's KV pages.
-        ctx.flush().await?;
+        // flush() materializes this module's KV pages (keep-core prefill).
+        ctx.flush()?;
 
         // Snapshot every prefix so a later run can resume from any stable one.
         // Best-effort: save() errors if an earlier run already saved this exact
         // prefix (names are content-addressed) — a miss shouldn't kill the run.
         if input.save_cache {
             let name = prefix_key(&ordered[..=i]);
-            match ctx.save(&name) {
+            match snapshot::save(&name, &ctx.to_snapshot()) {
                 Ok(()) => println!("saved={}", name),
                 Err(e) => println!("save_skipped={} ({})", name, e),
             }
         }
     }
 
-    // Mark assistant turn start for the chat template, then generate.
+    // Mark the assistant turn (the decode prime tail), then decode greedily on
+    // the run-ahead carrier.
     ctx.cue();
+    let prime = std::mem::take(&mut ctx.buffer);
+    let toks = decode_pipelined(
+        &ctx.kv, &mut ctx.seq_len, &mut ctx.fresh, &s, prime, input.max_tokens, &stop,
+    )
+    .await?;
 
-    let text = ctx.generate(Sampler::Argmax)
-        .max_tokens(input.max_tokens)
-        .collect_text()
-        .await?;
-
-    Ok(text)
+    Ok(decode_text(&toks)?)
 }
 
 fn default_modules(prompt: &str) -> Vec<Module> {
@@ -231,14 +403,16 @@ fn prefix_key(modules: &[Module]) -> String {
     format!("{}/{:016x}", CACHE_NS, fnv1a(&parts.join("\u{1f}")))
 }
 
-/// Open the longest saved prefix snapshot, returning the forked context and
-/// the number of modules it covers. Returns `None` if nothing is cached.
-fn open_longest_prefix(model: &Model, modules: &[Module]) -> Option<(Context, usize)> {
-    // Longest first; open() is Err when that prefix isn't cached, so fall through.
+/// Open the longest saved prefix snapshot, replay it, and return the rebuilt
+/// context + the number of modules it covers. `None` if nothing is cached.
+fn open_longest_prefix(modules: &[Module]) -> Option<(Ctx, usize)> {
+    // Longest first; snapshot::open is Err when that prefix isn't cached, so fall through.
     for len in (1..=modules.len()).rev() {
         let name = prefix_key(&modules[..len]);
-        if let Ok(ctx) = Context::open(model, &name) {
-            return Some((ctx, len));
+        if let Ok(snap) = snapshot::open(&name) {
+            if let Ok(ctx) = Ctx::from_snapshot(snap) {
+                return Some((ctx, len));
+            }
         }
     }
     None

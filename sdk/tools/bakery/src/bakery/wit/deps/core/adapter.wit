@@ -1,16 +1,13 @@
 interface adapter {
-    use wasi:io/poll@0.2.4.{pollable};
-
     use types.{error};
-    use model.{model};
     
     resource adapter {
 
-        create: static func(model: borrow<model>, name:string) -> result<adapter, error>;
+        create: static func(name:string) -> result<adapter, error>;
 
         destroy: func();
 
-        open: static func(model: borrow<model>, name:string) -> option<adapter>;
+        open: static func(name:string) -> option<adapter>;
 
         fork: func(name:string) -> adapter;
 

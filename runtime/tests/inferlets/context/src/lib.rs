@@ -1,31 +1,23 @@
-//! Context test inferlet — exercises model, context, and tokenizer host APIs.
+//! Context test inferlet — exercises model, working-set, and tokenizer host
+//! APIs on the raw keep-core surface (off the `Context` facade).
 
-use inferlet::{
-    Context,
-    model::Model,
-    runtime,
-    Result,
-};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{model, Result};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
-    // Load the first available model
-    let models = runtime::models();
-    let model = Model::load(&models[0])?;
+    // The engine serves exactly one model — encode directly.
+    let encoded = model::encode("hello world");
 
-    // Get tokenizer and encode a test string
-    let tokenizer = model.tokenizer();
-    let encoded = tokenizer.encode("hello world");
+    // The KV working set — the raw keep-core replacement for `Context`.
+    let kv = KvWorkingSet::new();
 
-    // Create a context
-    let mut ctx = Context::new(&model)?;
+    // The guest owns its own token buffer (the facade's `Context::append` /
+    // `buffer()` staging is now a plain guest-held Vec).
+    let buffered = encoded.clone();
 
-    // Stage some buffered tokens
-    ctx.append(&encoded);
-    let buffered = ctx.buffer();
-
-    // Query page info
-    let page_size = ctx.page_size();
+    // Query page info off the working set.
+    let page_size = kv.page_size();
 
     Ok(format!(
         "encoded:{} buffered:{} page_size:{}",

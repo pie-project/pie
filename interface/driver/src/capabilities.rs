@@ -5,7 +5,7 @@
 //! The runtime parses it into [`DriverCapabilities`] for scheduling and
 //! batching decisions. The shape is wire-stable — fields appear verbatim
 //! in the driver's ready-callback JSON (see `driver/cuda/src/entry.cpp`,
-//! `driver/portable/src/entry.cpp`, `driver/dummy/src/lib.rs`).
+//! `driver/metal/src/entry.cpp`, `driver/dummy/src/lib.rs`).
 //!
 //! This is intentionally not under `#[schema]` — the handshake happens
 //! once at driver startup and uses JSON over a side channel, not the

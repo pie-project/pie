@@ -69,11 +69,11 @@ class Server:
         cfg = Config(
             server=ServerConfig(port=0),
             auth=AuthConfig(enabled=False),
-            models=[ModelConfig(
+            model=ModelConfig(
                 name="default",
                 hf_repo="Qwen/Qwen3-0.6B",
                 driver=DriverConfig(type="dev", device=["cuda:0"]),
-            )],
+            ),
         )
         async with Server(cfg) as server:
             client = await server.connect()

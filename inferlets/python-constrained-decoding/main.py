@@ -18,7 +18,7 @@ typed output via a pure-Python validator.
 
 import json
 
-from inferlet import Context, JsonSchema, Model, Sampler, runtime, session
+from inferlet import Context, JsonSchema, Sampler, session
 
 
 PERSON_SCHEMA = json.dumps(
@@ -49,8 +49,7 @@ async def main(input: dict):
     prompt = input.get("prompt", DEFAULT_PROMPT)
     max_tokens = int(input.get("max_tokens", 512))
 
-    model = Model.load(runtime.models()[0])
-    ctx = Context(model)
+    ctx = Context()
     ctx.system(SYSTEM_PROMPT).user(prompt)
 
     person = await ctx.generate(

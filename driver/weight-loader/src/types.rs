@@ -64,22 +64,17 @@ pub enum CheckpointFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BackendKind {
     Cuda,
-    Portable,
     Unknown,
 }
 
 impl BackendKind {
     /// Whether this backend loads weights into a single contiguous persistent
-    /// device arena. Arena backends (CUDA) coalesce per-buffer `ExtentWrite`s
-    /// into arena-relative `BulkExtentWrite` / `SlabScatter` batched copies.
-    ///
-    /// The portable backend allocates each tensor as its own buffer (ggml has
-    /// no global weight arena), so those arena-relative instructions have no
-    /// valid destination there — it keeps plain per-buffer `ExtentWrite`s.
-    /// Every other backend (CUDA, and the generic test/`Unknown` target) loads
-    /// into a single arena, so the arena/bulk passes apply.
+    /// device arena. Arena backends (CUDA, and the generic test/`Unknown`
+    /// target) coalesce per-buffer `ExtentWrite`s into arena-relative
+    /// `BulkExtentWrite` / `SlabScatter` batched copies, so the arena/bulk
+    /// passes apply.
     pub fn uses_persistent_arena(self) -> bool {
-        !matches!(self, BackendKind::Portable)
+        matches!(self, BackendKind::Cuda | BackendKind::Unknown)
     }
 }
 

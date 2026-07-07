@@ -8,9 +8,10 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
-use crate::context::pagestore::{PhysicalPageId, compute_last_page_len};
+use crate::arena::PhysicalPageId;
+use crate::page_size::compute_last_page_len;
 use crate::driver::SchedulerLimits;
 use crate::inference::ForwardOutput;
 
@@ -95,6 +96,9 @@ impl PendingRequest {
             completion,
             physical_page_ids,
             last_page_len,
+            program_identity_hashes,
+            pipeline_id,
+            ..
         } = self;
         let Completion::Direct(response_tx) = completion else {
             unreachable!("chunk continuations returned above");
@@ -118,6 +122,11 @@ impl PendingRequest {
             },
             physical_page_ids: chunk.physical_page_ids,
             last_page_len: chunk.last_page_len,
+            // Carry the original request's identity onto the first chunk.
+            program_identity_hashes,
+            pipeline_id,
+            submitted_at_us: 0,
+            prebuilt: false,
         })
     }
 
@@ -138,6 +147,8 @@ impl PendingRequest {
             completion,
             physical_page_ids: _,
             last_page_len: _,
+            program_identity_hashes: _,
+            ..
         } = self;
 
         let result = result.map(Into::into);
@@ -168,12 +179,6 @@ impl PendingRequest {
                     continuation.response_tx.send(Err(e)).ok();
                 }
             },
-            Completion::Chain { state } => {
-                // Error path: the chain never had a healthy reply, so just
-                // forward the error to the inferlet / staged-entry holder
-                // and let the chain terminate (no next stage submitted).
-                let _ = state.response.send(result);
-            }
         }
     }
 }
@@ -275,6 +280,16 @@ impl ChunkContinuation {
             },
             physical_page_ids: chunk.physical_page_ids,
             last_page_len: chunk.last_page_len,
+            // Prefill-chunk continuation: re-enters the scheduler via `submit_tx`
+            // and re-announces its identity on arrival; the per-program hashes are
+            // recomputed at the decode/sampling step, not carried on the chunk.
+            program_identity_hashes: Vec::new(),
+            // M-A1: prefill-chunk continuations rejoin the wave on re-arrival;
+            // ChunkContinuation doesn't carry the pipeline_id (guru: thread it if
+            // chunked prefill must hold wave membership across chunks).
+            pipeline_id: None,
+            submitted_at_us: 0,
+            prebuilt: false,
         })
     }
 }
@@ -1130,7 +1145,7 @@ mod tests {
     use anyhow::Result;
     use tokio::sync::{mpsc, oneshot};
 
-    use crate::context::pagestore::compute_last_page_len;
+    use crate::page_size::compute_last_page_len;
     use crate::driver::SchedulerLimits;
 
     use super::super::{Completion, PendingRequest};
@@ -1175,6 +1190,9 @@ mod tests {
                 tx,
                 (0..pages).map(|p| 100 + p).collect(),
                 last_page_len,
+                Vec::new(),
+                None,
+                0,
             ),
             rx,
         )
@@ -1211,6 +1229,9 @@ mod tests {
             tx,
             (0..pages).map(|p| 100 + p).collect(),
             last_page_len,
+            Vec::new(),
+            None,
+            0,
         )
     }
 
@@ -1267,7 +1288,7 @@ mod tests {
     fn chunk_sampler_slots(req: &PendingRequest) -> &[usize] {
         match &req.completion {
             Completion::Chunk { sampler_slots, .. } => sampler_slots,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) => panic!("expected chunk continuation"),
         }
     }
 
@@ -1294,7 +1315,7 @@ mod tests {
                 assert_eq!(cont.physical_page_ids, vec![100, 101, 102]);
                 assert_eq!(cont.final_last_page_len, 2);
             }
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) => panic!("expected chunk continuation"),
         }
     }
 
@@ -1309,7 +1330,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) => panic!("expected chunk continuation"),
         };
 
         let next = match cont.into_next_pending(4) {
@@ -1324,7 +1345,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => assert_eq!(cont.chunk_end, 8),
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) => panic!("expected chunk continuation"),
         }
     }
 
@@ -1549,7 +1570,7 @@ mod tests {
                         seen.extend_from_slice(&current.request.token_ids);
 
                         match current.completion {
-                            Completion::Direct(_) | Completion::Chain { .. } => {
+                            Completion::Direct(_) => {
                                 assert!(tokens <= max_tokens);
                                 break;
                             }
@@ -1589,7 +1610,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected continuation"),
+            Completion::Direct(_) => panic!("expected continuation"),
         };
         let second = match cont.into_next_pending(4) {
             Ok(p) => p,
@@ -1603,7 +1624,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected continuation"),
+            Completion::Direct(_) => panic!("expected continuation"),
         };
         let final_chunk = match cont.into_next_pending(4) {
             Ok(p) => p,
@@ -1643,7 +1664,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected continuation"),
+            Completion::Direct(_) => panic!("expected continuation"),
         };
         let second = match cont.into_next_pending(page_size) {
             Ok(p) => p,
@@ -1661,7 +1682,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected continuation"),
+            Completion::Direct(_) => panic!("expected continuation"),
         };
         let final_chunk = match cont.into_next_pending(page_size) {
             Ok(p) => p,
@@ -1717,7 +1738,7 @@ mod tests {
 
                             offset += chunk_len;
                             match current.completion {
-                                Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+                                Completion::Direct(_) => panic!("expected chunk continuation"),
                                 Completion::Chunk {
                                     continuation: cont, ..
                                 } => {
@@ -2013,7 +2034,7 @@ mod tests {
             chunks += 1;
             total_seen += current.request.token_ids.len();
             match current.completion {
-                Completion::Direct(_) | Completion::Chain { .. } => break,
+                Completion::Direct(_) => break,
                 Completion::Chunk {
                     continuation: cont, ..
                 } => {

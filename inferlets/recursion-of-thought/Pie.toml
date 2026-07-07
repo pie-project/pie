@@ -6,7 +6,6 @@ authors = ["Pie Team"]
 
 [runtime]
 core = "^0.2.0"
-mcp = "^0.2.0"
 
 [parameters]
 question = {type = "string", optional = true, description = "The initial question to solve (default: 'Please calculate the expression (42 + 3) * 5 / 15.')"}

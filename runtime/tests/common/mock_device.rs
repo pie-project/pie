@@ -116,18 +116,22 @@ pub fn synthetic_logits(req_id: u64, vocab: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Vocab length of the program's `Logits`-bound input slot (per the carrier
-/// binding-map): the last dim of that input's declared shape.
-fn logits_vocab(
+/// Shape `(rows, vocab)` of the program's intrinsic-logits input slot — the
+/// `Logits` OR `MtpLogits` binding (the draft-head intrinsic sources the same
+/// logits on the mock, M=1). `rows` is the leading dim: 1 for a plain `[vocab]`
+/// vector (`intrinsic_logits`/`intrinsic_mtp_logits`), `k` for a `[k, vocab]`
+/// matrix (`intrinsic_logits_matrix(k)` — the spec-verify path). Lets the mock
+/// size its synthetic logits to `rows * vocab` so a matrix intrinsic sees all
+/// `k` rows (else it collapses to one row and the `[k]`-Token marshal emits 1).
+fn logits_shape(
     prog: &pie_sampling_ir::SamplingProgram,
     bindings: &[SamplingBinding],
-) -> Option<usize> {
+) -> Option<(u32, usize)> {
     bindings.iter().enumerate().find_map(|(i, b)| match b {
-        SamplingBinding::Logits => prog
+        SamplingBinding::Logits | SamplingBinding::MtpLogits => prog
             .inputs
             .get(i)
-            .and_then(|inp| inp.shape.last_len())
-            .map(|v| v as usize),
+            .map(|inp| (inp.shape.rows(), inp.shape.last_len().unwrap_or(0) as usize)),
         _ => None,
     })
 }
@@ -186,6 +190,18 @@ pub fn run_program_mock_outputs(
             .unwrap_or(SamplingBinding::Logits);
         let value = match binding {
             SamplingBinding::Logits => Value::F32(logits.to_vec()),
+            // The draft-logits intrinsic (#21 mtp): the mock has no separate
+            // draft buffer; it source-selects `ws.logits` draft rows (M=1 ⇒ the
+            // logits row), so the mock returns the same logits value as `Logits`.
+            SamplingBinding::MtpLogits => Value::F32(logits.to_vec()),
+            // Device-resident drafts ((b) spec-decode): an I32 [k] window the
+            // driver retains on-GPU. The mock has none — fail loud rather than
+            // alias to logits (a silent kind-collapse is the (b) bug class).
+            SamplingBinding::MtpDrafts => {
+                return Err(format!(
+                    "mock device has no device-resident MtpDrafts window (slot {i})"
+                ))
+            }
             SamplingBinding::Tensor { key } => {
                 let bytes = submission
                     .inputs
@@ -206,9 +222,13 @@ pub fn run_program_mock_outputs(
 
 /// Build a `ForwardResponse` for a batch of program evaluations, marshaling each
 /// request's outputs into the matching channels: `Token` → tokens slot,
-/// `Scalar`/`Entropy` → entropies slot (the shared per-slot scalar f32 channel,
-/// per the L6/L1 marshaling contract). One Token + (optionally) one scalar per
-/// request — the tier-1 mirostat/grammar shape.
+/// `Scalar`/`Entropy` → entropies slot (the shared per-slot scalar f32 channel),
+/// `Logits` (raw-logits output) → the per-request logits blob channel (f32 LE
+/// bytes). One Token + (optionally) one scalar + (optionally) one logits blob per
+/// request — the tier-1 mirostat / grammar shape. Marshaling the raw-logits
+/// output is what lets a `[Token, Logits]` program (e.g. grammar's
+/// `argmax(mask_apply(logits, mask))` + raw logits) surface BOTH outputs to the
+/// guest; without it, output slot 1 resolves to no tensor.
 fn build_program_response(
     per_request: &[Vec<(OutputKind, Value)>],
 ) -> pie_driver_abi::ForwardResponse {
@@ -216,6 +236,13 @@ fn build_program_response(
     let mut tokens: Vec<u32> = Vec::with_capacity(per_request.len());
     let mut entropies: Vec<f32> = Vec::new();
     let mut entropies_indptr: Vec<u32> = vec![0];
+    // Raw-logits output channel: one f32-LE blob per request that declares a
+    // `Logits` output. `logits_req_indptr` (per-request → blob CSR) +
+    // `logits_byte_indptr` (per-blob → byte CSR) mirror the driver's layout so
+    // `extract_per_request` slices each request's blob correctly.
+    let mut logits_bytes: Vec<u8> = Vec::new();
+    let mut logits_byte_indptr: Vec<u32> = vec![0];
+    let mut logits_req_indptr: Vec<u32> = vec![0];
 
     for outs in per_request {
         // Token (required for a token-producing program).
@@ -237,9 +264,59 @@ fn build_program_response(
             }
             None => entropies_indptr.push(entropies.len() as u32),
         }
+
+        // Raw logits → one f32-LE blob per request (0 or 1). The guest's
+        // `logits_as_f32` reads the f32 (vocab*4-byte) form directly.
+        let logits = outs.iter().find_map(|(k, v)| match (k, v) {
+            (OutputKind::Logits, Value::F32(x)) if !x.is_empty() => Some(x),
+            _ => None,
+        });
+        match logits {
+            Some(x) => {
+                for &f in x {
+                    logits_bytes.extend_from_slice(&f.to_le_bytes());
+                }
+                logits_byte_indptr.push(logits_bytes.len() as u32);
+                let prev = *logits_req_indptr.last().unwrap();
+                logits_req_indptr.push(prev + 1);
+            }
+            None => {
+                let prev = *logits_req_indptr.last().unwrap();
+                logits_req_indptr.push(prev);
+            }
+        }
     }
 
     let tokens_indptr: Vec<u32> = (0..=n).collect();
+
+    // #32/#33 `[k]`-Token `program_tokens` two-level CSR (mirrors the driver
+    // marshal + `extract_per_request`): one segment per (request, output) slot in
+    // declaration order. A `[k]`-Token output (`elem_count > 1`) fills its segment
+    // with the token values TRUNCATED at the first `-1` sentinel (the driver's
+    // `marshal_ir_program_output` compaction); every other output (single Token,
+    // Scalar, Logits, …) leaves an empty segment and reads its own channel. The
+    // runtime picks `program_tokens` vs the dense `tokens` channel per output by
+    // `elem_count`, so adding this is inert for the single-Token programs.
+    let mut program_tokens: Vec<u32> = Vec::new();
+    let mut program_tokens_indptr: Vec<u32> = vec![0];
+    let mut program_tokens_req_indptr: Vec<u32> = vec![0];
+    for outs in per_request {
+        for (kind, value) in outs {
+            if let (OutputKind::Token, Value::I32(x)) = (kind, value) {
+                if x.len() > 1 {
+                    for &t in x {
+                        if t < 0 {
+                            break; // sentinel: truncate the accepted prefix
+                        }
+                        program_tokens.push(t as u32);
+                    }
+                }
+            }
+            program_tokens_indptr.push(program_tokens.len() as u32);
+        }
+        program_tokens_req_indptr.push((program_tokens_indptr.len() - 1) as u32);
+    }
+
     pie_driver_abi::ForwardResponse {
         num_requests: n,
         tokens_indptr,
@@ -248,14 +325,17 @@ fn build_program_response(
         dists_kv_indptr: vec![0],
         dists_ids: Vec::new(),
         dists_probs: Vec::new(),
-        logits_req_indptr: vec![0; (n + 1) as usize],
-        logits_byte_indptr: vec![0],
-        logits_bytes: Vec::new(),
+        logits_req_indptr,
+        logits_byte_indptr,
+        logits_bytes,
         logprobs_req_indptr: vec![0; (n + 1) as usize],
         logprobs_val_indptr: vec![0],
         logprobs_values: Vec::new(),
         entropies_indptr,
         entropies,
+        program_tokens,
+        program_tokens_indptr,
+        program_tokens_req_indptr,
         ..Default::default()
     }
 }
@@ -274,11 +354,16 @@ impl Behavior for SamplingProgramBehavior {
         match req.sampling_program_at(0) {
             Some(sub) => {
                 let prog = bytecode::decode(&sub.bytecode).expect("decode program");
-                let vocab =
-                    logits_vocab(&prog, &sub.bindings).expect("program declares a Logits input");
+                let (rows, vocab) = logits_shape(&prog, &sub.bindings)
+                    .expect("program declares a Logits/MtpLogits input");
                 let per_request: Vec<Vec<(OutputKind, Value)>> = (0..n)
                     .map(|r| {
-                        let logits = synthetic_logits(r as u64, vocab);
+                        // Replicate the request's synthetic row `rows` times so a
+                        // `[k, vocab]` matrix intrinsic (spec-verify) sees all k
+                        // rows. The mock has no position dependence, so every row
+                        // is the same logits — matrix per-row argmax then equals
+                        // the sequential greedy decode (rows == 1 ⇒ the plain path).
+                        let logits = synthetic_logits(r as u64, vocab).repeat(rows as usize);
                         run_program_mock_outputs(&sub, &logits).expect("eval-mock run")
                     })
                     .collect();

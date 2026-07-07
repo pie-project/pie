@@ -19,9 +19,12 @@
 // behind this facade. The executor registers an instance via
 // `SamplingIrRuntime::set_backend(&backend)` at engine init.
 //
-// Cache: keyed by `fnv1a64(bytecode)`. A program is decoded+lowered+compiled
-// once; later fires reuse the compiled DAG and only rebind per-fire device
-// pointers + launch-context scalars.
+// Cache: keyed by the program IDENTITY `fnv1a64(bytecode) ^ manifest_hash(manifest)`
+// (v4 bytecode is binding-free, so distinct bindings ⇒ distinct program), XOR a
+// process-constant bit for M=1-vs-M-batch lowering — i.e. `program_identity_hash`
+// (program_identity.hpp) plus the batched bit. A program is
+// decoded+lowered+compiled once; later fires reuse the compiled DAG and only
+// rebind per-fire device pointers + launch-context scalars.
 //
 // MVP scope (design §3.3): single slot, single position, M=1 decode.
 
@@ -75,6 +78,15 @@ class SamplingIrBackend final : public IProgramBackend {
     void launch(ProgramHandle program, const LaunchArgs& args,
                 cudaStream_t stream) override;
 
+    // #11 prefetch (ANY THREAD, fire-and-forget): warm the off-context PTX cache
+    // for `(bytecode, manifest)` so a later `get_or_compile` finds it Ready (cache
+    // hit) — the TTFT win. Idempotent + dedup'd by the SAME program_identity_hash
+    // key as the compile cache / #10. Touches NO mutable backend state
+    // (programs_/last_error_) — only the pure lowering + the mu_-guarded
+    // `JitEngine::prefetch_compile` — so it races nothing on the context thread.
+    void prefetch_compile(std::span<const std::uint8_t> bytecode,
+                          const ProgramManifest& manifest) override;
+
     // Diagnostics: reason for the most recent `kInvalidProgram`, the NVRTC
     // target arch (e.g. "compute_89"), and whether a compiled program is on the
     // batched fast path or fell back to per-row M=1 (a batched-unsupported op
@@ -82,6 +94,10 @@ class SamplingIrBackend final : public IProgramBackend {
     // handles.
     const std::string& last_error() const override { return last_error_; }
     const std::string& arch() const { return engine_.arch(); }
+    // #11 dedup metric: total NVRTC compiles run. A prefetch-warmed program and
+    // its later on-demand get_or_compile share the off-context cache, so it
+    // compiles exactly once — delta's load-test asserts cache-HIT via this.
+    std::uint64_t compiles_run() const { return engine_.compiles_run(); }
     bool program_is_batched(ProgramHandle program) const;
 
   private:
@@ -113,6 +129,22 @@ class SamplingIrBackend final : public IProgramBackend {
     // cache key `keyed`. Returns the resulting (cached) handle.
     ProgramHandle compile_decoded(const Program& program, std::uint64_t keyed);
 
+    // Decode bytecode → Program: route by the authoritative PSIR version (v4
+    // binding-free, bindings from `manifest`; v2/v3 self-bind). `const` and writes
+    // any error to `*err` (NOT last_error_) so the thread-safe prefetch path reuses
+    // it without touching mutable backend state. Shared by get_or_compile + prefetch.
+    bool decode_program(std::span<const std::uint8_t> bytecode,
+                        const ProgramManifest& manifest, Program& out,
+                        std::string* err) const;
+
+    // Lower with the batched→M=1 fallback (codegen). Pure (reads batched_lowering_,
+    // calls the free `lower()`); shared by compile_decoded + prefetch_compile.
+    LowerResult lower_with_fallback(const Program& program, bool& batched_mode) const;
+
+    // Adapt the codegen KernelDAG → jit::KernelDAG under compile-cache hash `keyed`.
+    // Pure; shared by compile_decoded (→get_or_compile) + prefetch_compile.
+    jit::KernelDAG build_jdag(const LowerResult& lr, std::uint64_t keyed) const;
+
     // Bind every external buffer (logits / host inputs / outputs / ambient
     // row-seed) for one fire, each sliced to logical row `row` (base + row*stride;
     // row 0 = the buffer base). Used both for the normal single launch (row 0) and
@@ -126,3 +158,15 @@ class SamplingIrBackend final : public IProgramBackend {
 };
 
 }  // namespace pie_cuda_driver::sampling_ir
+
+// C-ABI trampoline for the #11 in-proc prefetch FFI (alpha's InProcVTable
+// `PrefetchFn`). Reconstructs a `ProgramManifest` from the `(kind, key)` wire
+// with `ready = SubmitBound` — IDENTICAL to the submit path (executor.cpp:3244,
+// the carrier conveys only `(kind, key)`) — so the prefetch-warm hash MATCHES the
+// real submit-fire hash ⇒ compile-cache HIT ⇒ the TTFT win. `backend_ctx` is the
+// `IProgramBackend*`; echo registers `&this` via `InProcVTable.register_prefetch`
+// once at backend-ready. kind: 0=Logits, 1=Tensor(host_key), 2=MtpLogits.
+extern "C" void pie_sampling_ir_prefetch_trampoline(
+    void* backend_ctx, const std::uint8_t* bytecode, std::size_t bytecode_len,
+    const std::uint8_t* binds_kind, const std::uint32_t* binds_key,
+    std::size_t binds_len);

@@ -1,0 +1,10 @@
+[package]
+name = "ptir-greedy-e2e"
+version = "0.1.0"
+description = "PTIR §6.2 end-to-end smoke test: register greedy_argmax → instantiate → submit → out.take()"
+authors = ["In Gim <in.gim@icloud.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]

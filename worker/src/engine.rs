@@ -3,7 +3,7 @@
 //!
 //! Wires the standalone's pieces in dependency order:
 //!   1. Translate user TOML to per-driver options.
-//!   2. For each `[[model]]`, partition devices into DP groups; for
+//!   2. For the `[model]`, partition devices into DP groups; for
 //!      each group spawn an [`EmbeddedDriver`] thread, attach an
 //!      a unified `DriverChannel` (one channel per driver carries
 //!   3. Translate the resulting handshakes → [`pie::bootstrap::Config`]
@@ -40,7 +40,7 @@ pub struct DriverHandle(EmbeddedDriver);
 
 impl DriverHandle {
     /// Returns the driver's shmem region name, if any. `None` for
-    /// embedded cuda/portable drivers (no shmem region opened).
+    /// embedded cuda/metal/dummy drivers (no shmem region opened).
     pub fn shmem_name(&self) -> Option<&str> {
         self.0.shmem_name.as_deref()
     }
@@ -278,42 +278,15 @@ struct StartupBanner {
 
 impl StartupBanner {
     fn from_config(cfg: &config::Config) -> Self {
-        let model = match cfg.models.as_slice() {
-            [m] => format!("{} ({})", m.name, m.hf_repo),
-            models => format!("{} models", models.len()),
-        };
-        let driver = match cfg.models.as_slice() {
-            [m] => m.driver.kind.as_str().to_string(),
-            models => {
-                let mut drivers = models
-                    .iter()
-                    .map(|m| m.driver.kind.as_str())
-                    .collect::<Vec<_>>();
-                drivers.sort_unstable();
-                drivers.dedup();
-                if drivers.len() == 1 {
-                    drivers[0].to_string()
-                } else {
-                    "mixed".to_string()
-                }
-            }
-        };
-        let device = match cfg.models.as_slice() {
-            [m] => {
-                let device = m.driver.device.join(", ");
-                if device.is_empty() {
-                    "-".to_string()
-                } else {
-                    device
-                }
-            }
-            models => {
-                let count = models.iter().map(|m| m.driver.device.len()).sum::<usize>();
-                if count == 0 {
-                    "-".to_string()
-                } else {
-                    format!("{count} devices")
-                }
+        let m = &cfg.model;
+        let model = format!("{} ({})", m.name, m.hf_repo);
+        let driver = m.driver.kind.as_str().to_string();
+        let device = {
+            let device = m.driver.device.join(", ");
+            if device.is_empty() {
+                "-".to_string()
+            } else {
+                device
             }
         };
 
@@ -389,7 +362,6 @@ async fn boot_engine(
     String,
     Vec<String>,
 )> {
-    let mut handshakes: Vec<ModelHandshake> = Vec::with_capacity(user_cfg.models.len());
     let mut drivers: Vec<DriverHandle> = Vec::new();
 
     // Global device index. The runtime's `driver::spawn` returns
@@ -399,7 +371,8 @@ async fn boot_engine(
     // up across all models, including DP > 1.
     let mut next_global_driver_idx: usize = 0;
 
-    for m in &user_cfg.models {
+    let handshake = {
+        let m = &user_cfg.model;
         let resolved = preflight::resolve_flavor(m.driver.kind, &m.name)?;
 
         // Determine TP/DP topology. For multi-DP, we spawn one driver
@@ -455,24 +428,20 @@ async fn boot_engine(
             drivers.extend(started.drivers);
         }
 
-        handshakes.push(ModelHandshake {
+        ModelHandshake {
             groups: group_handshakes,
-        });
-    }
+        }
+    };
 
-    let registration_caps = handshakes
+    let registration_caps = handshake
+        .groups
         .first()
-        .and_then(|model| model.groups.first())
         .map(|group| group.caps.clone())
         .context("no driver capabilities available for control-plane registration")?;
-    let registration_model = user_cfg
-        .models
-        .first()
-        .map(|model| model.name.clone())
-        .context("no model configured for control-plane registration")?;
+    let registration_model = user_cfg.model.name.clone();
 
-    let boot_cfg =
-        translate::build(user_cfg, &handshakes).context("translating to bootstrap::Config")?;
+    let boot_cfg = translate::build(user_cfg, std::slice::from_ref(&handshake))
+        .context("translating to bootstrap::Config")?;
 
     let boot = pie::bootstrap::bootstrap(boot_cfg)
         .await
@@ -767,17 +736,11 @@ fn start_embedded_drivers(
 }
 
 fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> DriverOptions {
-    #[cfg(not(any(feature = "driver-portable", feature = "driver-cuda")))]
+    #[cfg(not(feature = "driver-cuda"))]
     let _ = &device;
 
     #[allow(unreachable_patterns)]
     match base_opts {
-        #[cfg(feature = "driver-portable")]
-        DriverOptions::Portable(opts) => {
-            let mut opts = opts.clone();
-            opts.device = device;
-            DriverOptions::Portable(opts)
-        }
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => {
             let mut opts = opts.clone();
@@ -789,17 +752,17 @@ fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> Driver
 }
 
 fn apply_embedded_verbose(options: &mut DriverOptions, verbose: bool) {
-    #[cfg(feature = "driver-portable")]
-    if let DriverOptions::Portable(p) = options {
-        p.verbose = verbose;
-    }
-
     #[cfg(feature = "driver-cuda")]
     if let DriverOptions::CudaNative(opts) = options {
         opts.verbose = verbose;
     }
 
-    #[cfg(not(any(feature = "driver-portable", feature = "driver-cuda")))]
+    #[cfg(feature = "driver-metal")]
+    if let DriverOptions::Metal(opts) = options {
+        opts.verbose = verbose;
+    }
+
+    #[cfg(not(any(feature = "driver-cuda", feature = "driver-metal")))]
     let _ = (options, verbose);
 }
 
@@ -848,7 +811,7 @@ mod tests {
     fn startup_banner_render_includes_public_startup_fields_only() {
         let banner = StartupBanner {
             model: "default (Qwen/Qwen3-0.6B)".to_string(),
-            driver: "portable".to_string(),
+            driver: "dummy".to_string(),
             device: "cpu".to_string(),
         };
 

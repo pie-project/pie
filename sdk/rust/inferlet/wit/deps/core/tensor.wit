@@ -27,11 +27,31 @@ interface tensor {
     }
 
     /// -- tensor-program substrate -------------------
-    record input { shape: shape, dtype: dtype }
+
+    /// When a program input's value is gathered. `submit` = present at
+    /// `execute()` (bound via `resolve-bindings`); `late` = supplied after
+    /// submit through the late channel (`tensor.write` into the device-aliased
+    /// program input — e.g. a grammar mask computed post-logits). Encoded
+    /// additively (bit 7 of the dtype byte in L0 bytecode), so v4 decodes as
+    /// `submit`.
+    variant readiness { submit, late }
+
+    record input { shape: shape, dtype: dtype, ready: readiness }
     record value { id: value-id, shape: shape, dtype: dtype }
 
+    /// Marshaling kind of a declared program output — how the host routes the
+    /// value into the response. Mirrors sampling-ir `OutputKind`; discriminants
+    /// are FROZEN (token=0 .. embedding=6) — do not reorder/renumber.
+    variant output-kind { token, distribution, logits, logprobs, entropy, scalar, embedding }
+
+    /// A declared program output: the SSA value id to expose plus its marshaling
+    /// kind. The kind is carried EXPLICITLY (not inferred from dtype) so the
+    /// typed float kinds — `logits`/`logprobs`/`distribution`, all `f32` — survive
+    /// the front door instead of collapsing to `scalar`.
+    record output { id: value-id, kind: output-kind }
+
     variant literal { %f32(f32), %i32(s32), %u32(u32), %bool(bool) }
-    variant predicate { rank-le(u32), cummass-le(value-id), prob-ge(value-id) }
+    variant predicate { rank-le(value-id), cummass-le(value-id), prob-ge(value-id) }
     variant rng-kind { uniform, gumbel }
 
     variant op-kind {
@@ -55,6 +75,12 @@ interface tensor {
         /// ratio needs (`p[i, draft[i]]`). Out-of-range index → 0 in that lane.
         gather-row(tuple<value-id, value-id>),
         scatter-add(tuple<value-id, value-id, value-id>), scatter-set(tuple<value-id, value-id, value-id>),
+        /// Apply a packed allowed-token bitmask to logits: `out[j] =
+        /// bit_j(mask) ? logits[j] : -inf`, `bit_j = (mask[j>>5] >> (j&31)) & 1`.
+        /// Bit 1 = allowed (pass-through), bit 0 = disallowed (-inf). `logits`
+        /// `[n]`; `mask` `[ceil(n/32)]` u32 (word-indexed, not broadcast);
+        /// result is logits' shape/dtype. The de-hardwired grammar mask op.
+        mask-apply(tuple<value-id, value-id>),
         rng(tuple<u32, shape, rng-kind>),
     }
 
@@ -66,6 +92,6 @@ interface tensor {
     /// Reusable compiled tensor program. Construct once, then attach by
     /// borrowed handle from model-specific interfaces such as inference.
     resource program {
-        constructor(inputs: list<input>, ops: list<op>, outputs: list<value-id>);
+        constructor(inputs: list<input>, ops: list<op>, outputs: list<output>);
     }
 }

@@ -77,8 +77,6 @@ fn spawn_and_capture(s: &TestState, name: &str, input: String) -> Result<String,
             None,
             false,
             Some(tx),
-            None,
-            None,
         )
         .expect("spawn");
         rx
@@ -108,13 +106,31 @@ fn grammar_inferlet_constrains_output() {
         out.contains("\"sampler\":\"grammar\""),
         "unexpected grammar output: {out}"
     );
+    // Strong, NON-DEGENERATE grammar invariants (delta's catch) — this test is
+    // charlie's T3-M1 Sampling-IR parity gate, so it must verify the masking
+    // actually fired, not merely that a decode loop ran:
+    //   conform    — every device token ∈ alphabet AND == host apply_mask_argmax(
+    //                raw_logits, mask): the submit-bound mask constrained the
+    //                output, and device mask-apply == host semantics (checked
+    //                against the newly-marshaled raw-logits output tensor);
+    //   forced_out — at step 0 the mask forced a DIVERGENCE from the natural
+    //                (unconstrained) argmax: a broken / no-op mask FAILS this;
+    //   conformant — the composite (conform ∧ forced_out).
+    assert!(
+        out.contains("\"conform\":true"),
+        "device tokens must match host apply_mask_argmax (mask constrained output): {out}"
+    );
+    assert!(
+        out.contains("\"forced_out\":true"),
+        "the mask must force a divergence from the natural argmax (non-degenerate): {out}"
+    );
     assert!(
         out.contains("\"conformant\":true"),
-        "grammar output not marked conformant: {out}"
+        "grammar output not marked conformant (conform ∧ forced_out): {out}"
     );
     assert!(
         out.contains("\"count\":12"),
-        "expected 12 generated tokens: {out}"
+        "the constrained decode loop must run its full token budget: {out}"
     );
 }
 

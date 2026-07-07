@@ -150,6 +150,7 @@ bool read_op_operands(Cursor& c, OpCode code, Op& op, DecodeError* err) {
         case OpCode::MaxElem: case OpCode::MinElem:
         case OpCode::Gt: case OpCode::Ge: case OpCode::Eq:
         case OpCode::Gather: case OpCode::GatherRow: case OpCode::GatherCols:
+        case OpCode::MaskApply:   // (logits, mask)
             op.a = c.u32();
             op.b = c.u32();
             break;
@@ -209,7 +210,7 @@ bool is_known_opcode(std::uint8_t tag, OpCode& out) {
         case 0x30: case 0x31: case 0x32: case 0x33: case 0x38: case 0x39:
         case 0x40: case 0x41:
         case 0x50: case 0x58:
-        case 0x60: case 0x61: case 0x62: case 0x63: case 0x64:
+        case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65:
         case 0x70:
             out = static_cast<OpCode>(tag);
             return true;
@@ -268,6 +269,7 @@ void remap_op_v4(Op& op, const std::vector<std::uint32_t>& m) {
         case OpCode::MaxElem: case OpCode::MinElem:
         case OpCode::Gt: case OpCode::Ge: case OpCode::Eq:
         case OpCode::Gather: case OpCode::GatherRow: case OpCode::GatherCols:
+        case OpCode::MaskApply:
             op.b = r(op.b); [[fallthrough]];
         case OpCode::Exp: case OpCode::Log: case OpCode::Neg: case OpCode::Recip:
         case OpCode::Abs: case OpCode::Sign:
@@ -278,8 +280,9 @@ void remap_op_v4(Op& op, const std::vector<std::uint32_t>& m) {
             break;
         case OpCode::PivotThreshold:
             op.a = r(op.a);
-            if (op.predicate.tag == PredTag::CummassLe || op.predicate.tag == PredTag::ProbGe)
-                op.predicate.payload = r(op.predicate.payload);
+            // #25: ALL three predicates carry a value-id payload (RankLe `k` /
+            // CummassLe `p` / ProbGe `thr`) — remap it through the v4→mine map.
+            op.predicate.payload = r(op.predicate.payload);
             break;
         case OpCode::Rng:   // v4: no value-id operands (ambient seed + static stream)
             break;
@@ -314,10 +317,19 @@ bool read_program_v4(const std::uint8_t* data, std::size_t len,
     }
 
     // InputDecl[]: dtype:u8 | shape_v4 — typed slots, binding from `slot_bindings`.
+    // Readiness rides bit 7 of the dtype byte (alpha's additive-v4 encoding,
+    // bytecode.rs READY_LATE_BIT=0x80; DType tags are 0..=3 so the high bit is
+    // free). Clear ⇒ Submit (v4 bytecode that never set it decodes additively);
+    // set ⇒ Late. Mask it off before parse_dtype, and record it so a bytecode-
+    // declared Late slot upgrades its binding to LateBound below (the program is
+    // authoritative when it declares Late; the manifest still supplies Late for
+    // pre-lowering bytecode that hasn't set the bit yet).
     std::vector<ValueType> slot_ty(n_inputs);
+    std::vector<bool> slot_late(n_inputs, false);
     for (std::uint32_t i = 0; i < n_inputs; ++i) {
-        std::uint8_t dt = c.u8();
-        if (!parse_dtype(dt, slot_ty[i].dtype)) { if (err) { err->code = DecodeError::UnknownTag; err->detail = "input dtype"; } return false; }
+        std::uint8_t raw = c.u8();
+        slot_late[i] = (raw & 0x80u) != 0;
+        if (!parse_dtype(raw & 0x7fu, slot_ty[i].dtype)) { if (err) { err->code = DecodeError::UnknownTag; err->detail = "input dtype"; } return false; }
         if (!read_shape_v4(c, slot_ty[i].shape)) { if (err) { err->code = DecodeError::UnknownTag; err->detail = "input shape"; } return false; }
     }
 
@@ -361,6 +373,12 @@ bool read_program_v4(const std::uint8_t* data, std::size_t len,
     for (const Parsed& p : parsed) {
         if (p.kind == 0) {
             Input in; in.id = leaf_id; in.ty = slot_ty[p.slot_idx]; in.binding = slot_bindings[p.slot_idx];
+            // A bytecode-declared Late slot (bit 7) upgrades a host binding to
+            // LateBound regardless of the manifest — readiness is a program
+            // property. Never downgrades: a Submit bit leaves the manifest's
+            // host_avail intact (pre-lowering bytecode still relies on it).
+            if (slot_late[p.slot_idx] && in.binding.tag == BindingTag::Host)
+                in.binding.host_avail = HostAvailability::LateBound;
             out.inputs.push_back(in);
             v4_to_mine[p.v4_id] = leaf_id++;
         } else if (p.kind == 1) {

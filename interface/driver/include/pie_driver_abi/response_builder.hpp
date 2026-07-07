@@ -15,7 +15,7 @@
 // zero-length slots in the view — fine to leave unpopulated when the
 // request didn't ask for that sampler type.
 //
-// Header-only: shared between cuda and portable backends.
+// Header-only: shared between the cuda and metal backends.
 
 #pragma once
 
@@ -47,6 +47,15 @@ struct PerRequestOutput {
     // Next-iteration system-speculation drafts.
     std::vector<std::uint32_t> spec_tokens;
     std::vector<std::uint32_t> spec_positions;
+    // #32 per-(request,output) `[k]`-Token segments: one inner vector per
+    // declared program output (in output order, sized to the program's n_out),
+    // holding that output's `[k]` token values — non-empty ONLY for a Token
+    // output with elem_count>1. Routed here (off `spec_tokens`, the system-
+    // drafter channel) so the runtime maps `[k]`-Token back per output. Sized to
+    // n_out by the marshal so `ResponseBuilder` emits the program_tokens CSR
+    // segment-per-(request,output) consistently with the runtime's output_types
+    // n_out. Empty for non-IR / fast-path single-`[1]`-Token requests.
+    std::vector<std::vector<std::uint32_t>> program_tokens;
 };
 
 class ResponseBuilder {
@@ -79,6 +88,9 @@ public:
         spec_indptr_.clear();
         spec_tokens_.clear();
         spec_positions_.clear();
+        program_tokens_indptr_.clear();
+        program_tokens_.clear();
+        program_tokens_req_indptr_.clear();
 
         tokens_indptr_.reserve(R + 1);
         dists_req_indptr_.reserve(R + 1);
@@ -86,11 +98,14 @@ public:
         logprobs_req_indptr_.reserve(R + 1);
         entropies_indptr_.reserve(R + 1);
         spec_indptr_.reserve(R + 1);
+        program_tokens_req_indptr_.reserve(R + 1);
 
         // Two-level indptrs start with a leading 0 for the kv/byte/val side.
         dists_kv_indptr_.push_back(0);
         logits_byte_indptr_.push_back(0);
         logprobs_val_indptr_.push_back(0);
+        // #32 program_tokens CSR: per-(request,output) segments, leading 0.
+        program_tokens_indptr_.push_back(0);
 
         for (std::uint32_t r = 0; r < R; ++r) {
             const auto& pr = per_request[r];
@@ -104,6 +119,11 @@ public:
                 static_cast<std::uint32_t>(logprobs_val_indptr_.size() - 1));
             entropies_indptr_.push_back(static_cast<std::uint32_t>(entropies_.size()));
             spec_indptr_.push_back(static_cast<std::uint32_t>(spec_tokens_.size()));
+            // #32 two-level CSR (mirrors logprobs_req_indptr): request r's first
+            // program_tokens output-slot = the running cumulative slot count
+            // (program_tokens_indptr_ has a leading 0, so size-1 = Σ_{r'<r} n_out).
+            program_tokens_req_indptr_.push_back(
+                static_cast<std::uint32_t>(program_tokens_indptr_.size() - 1));
 
             tokens_.insert(tokens_.end(), pr.tokens.begin(), pr.tokens.end());
             entropies_.insert(entropies_.end(), pr.entropies.begin(), pr.entropies.end());
@@ -130,6 +150,19 @@ public:
                 logprobs_val_indptr_.push_back(
                     static_cast<std::uint32_t>(logprobs_values_.size()));
             }
+
+            // #32 program_tokens: one CSR segment per declared output (in output
+            // order), non-empty only for an elem_count>1 Token. `pr.program_tokens`
+            // is sized to the program's n_out by the marshal, so this emits exactly
+            // n_out segments per request — seg(r,o) = (Σ_{r'<r} n_out_{r'}) + o,
+            // matching the runtime's output_types read. Empty for requests that
+            // declared no program output (size 0 → no segments).
+            for (const auto& seg : pr.program_tokens) {
+                program_tokens_.insert(program_tokens_.end(),
+                                       seg.begin(), seg.end());
+                program_tokens_indptr_.push_back(
+                    static_cast<std::uint32_t>(program_tokens_.size()));
+            }
         }
 
         // Trailing indptr entries.
@@ -142,6 +175,8 @@ public:
             static_cast<std::uint32_t>(logprobs_val_indptr_.size() - 1));
         entropies_indptr_.push_back(static_cast<std::uint32_t>(entropies_.size()));
         spec_indptr_.push_back(static_cast<std::uint32_t>(spec_tokens_.size()));
+        program_tokens_req_indptr_.push_back(
+            static_cast<std::uint32_t>(program_tokens_indptr_.size() - 1));
 
         out = PieForwardResponseView{};
         out.num_requests = R;
@@ -162,6 +197,9 @@ public:
         out.spec_indptr          = slice_from(spec_indptr_.data(), spec_indptr_.size());
         out.spec_tokens          = slice_from(spec_tokens_.data(), spec_tokens_.size());
         out.spec_positions       = slice_from(spec_positions_.data(), spec_positions_.size());
+        out.program_tokens        = slice_from(program_tokens_.data(), program_tokens_.size());
+        out.program_tokens_indptr = slice_from(program_tokens_indptr_.data(), program_tokens_indptr_.size());
+        out.program_tokens_req_indptr = slice_from(program_tokens_req_indptr_.data(), program_tokens_req_indptr_.size());
     }
 
     inline void build_token_only(std::span<const std::uint32_t> per_request_counts,
@@ -225,6 +263,13 @@ private:
         dists_kv_indptr_.assign(1, 0);
         logits_byte_indptr_.assign(1, 0);
         logprobs_val_indptr_.assign(1, 0);
+        // #32 program_tokens: fast/token-only paths carry no `[k]`-Token outputs
+        // (gated to rich), so emit an empty CSR (leading 0 only) — never indexed.
+        // The per-request boundary points every request at slot 0 (R+1 zeros),
+        // mirroring logprobs_req_indptr's all-empty reset.
+        program_tokens_.clear();
+        program_tokens_indptr_.assign(1, 0);
+        program_tokens_req_indptr_.assign(static_cast<std::size_t>(R) + 1, 0);
     }
 
     inline void finish_view(std::uint32_t R, PieForwardResponseView& out) {
@@ -247,6 +292,8 @@ private:
         out.spec_indptr          = slice_from(spec_indptr_.data(), spec_indptr_.size());
         out.spec_tokens          = slice_from(spec_tokens_.data(), spec_tokens_.size());
         out.spec_positions       = slice_from(spec_positions_.data(), spec_positions_.size());
+        out.program_tokens        = slice_from(program_tokens_.data(), program_tokens_.size());
+        out.program_tokens_indptr = slice_from(program_tokens_indptr_.data(), program_tokens_indptr_.size());
     }
 
     // Concatenated bodies + R+1 indptrs. Reused fire-to-fire — `build()`
@@ -268,6 +315,9 @@ private:
     std::vector<std::uint32_t> spec_indptr_;
     std::vector<std::uint32_t> spec_tokens_;
     std::vector<std::uint32_t> spec_positions_;
+    std::vector<std::uint32_t> program_tokens_indptr_;
+    std::vector<std::uint32_t> program_tokens_;
+    std::vector<std::uint32_t> program_tokens_req_indptr_;
 };
 
 }  // namespace pie_driver

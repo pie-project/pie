@@ -149,13 +149,14 @@ fn matrix_pivot_threshold_per_row() {
     let p = SamplingProgram {
         inputs: vec![mat(m, n)],
         ops: vec![
-            Op::Input(0),                                                     // 0
-            Op::Const(Literal::F32(-1.0e30)),                                 // 1 mask fill
-            Op::PivotThreshold { input: 0, predicate: Predicate::RankLe(1) }, // 2 mask [m,n]
-            Op::Select { cond: 2, a: 0, b: 1 },                               // 3 masked logits
-            Op::ReduceArgmax(3),                                              // 4 per-row token
+            Op::Input(0),                                                     // 0 logits
+            Op::Const(Literal::U32(1)),                                       // 1 k = 1
+            Op::Const(Literal::F32(-1.0e30)),                                 // 2 mask fill
+            Op::PivotThreshold { input: 0, predicate: Predicate::RankLe(1) }, // 3 mask [m,n] (k=id 1)
+            Op::Select { cond: 3, a: 0, b: 2 },                               // 4 masked logits
+            Op::ReduceArgmax(4),                                              // 5 per-row token
         ],
-        outputs: vec![OutputDecl::new(4, OutputKind::Token)],
+        outputs: vec![OutputDecl::new(5, OutputKind::Token)],
     };
     p.validate().expect("valid");
 

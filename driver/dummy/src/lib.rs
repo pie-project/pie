@@ -1,6 +1,6 @@
 //! `pie_driver_dummy` — Rust dummy driver, C ABI.
 //!
-//! Exports the same shape as `driver/portable` and `driver/cuda`:
+//! Exports the same shape as `driver/cuda`:
 //!
 //! ```c
 //! int pie_driver_dummy_run(int argc, char** argv,

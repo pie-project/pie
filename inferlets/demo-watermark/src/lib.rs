@@ -25,7 +25,10 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, Result, chat, model::Model, runtime, sample::Distribution, wstd};
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{probe_program, LoweredProbe, ProbeKind};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{chat, geometry, model, Result};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -90,23 +93,19 @@ const RED: &str = "\x1b[31m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_one(&model, &model_name, &input, false).await?;
+            run_one(&model_name, &input, false).await?;
         }
         "watermarked" | "smart" => {
-            run_one(&model, &model_name, &input, true).await?;
+            run_one(&model_name, &input, true).await?;
         }
         "both" | "" => {
-            let b = run_one(&model, &model_name, &input, false).await?;
+            let b = run_one(&model_name, &input, false).await?;
             println!();
-            let w = run_one(&model, &model_name, &input, true).await?;
+            let w = run_one(&model_name, &input, true).await?;
             println!();
             comparison(&b, &w);
         }
@@ -128,13 +127,55 @@ struct ModeResult {
     z_score: f32,
 }
 
+// ── Raw keep-core decode context (no `Context` facade) ────────────────
+/// One KV working set + a sequence cursor. The first sampling fire clears the
+/// dangling run-ahead carrier (`fresh_generate`).
+struct Ctx {
+    kv: KvWorkingSet,
+    seq_len: u32,
+    fresh: bool,
+}
+impl Ctx {
+    fn new() -> Self {
+        Self { kv: KvWorkingSet::new(), seq_len: 0, fresh: true }
+    }
+    /// One measurement fire: geometry + input + probe sampler + execute.
+    fn probe_fire(&mut self, probe: &LoweredProbe, tokens: &[u32]) -> Result<ForwardPass> {
+        let n = tokens.len() as u32;
+        let pass = ForwardPass::new();
+        if self.fresh {
+            pass.fresh_generate();
+            self.fresh = false;
+        }
+        let geom = geometry::ensure_pages(
+            &self.kv,
+            geometry::kv_write_geometry(self.seq_len, n, self.kv.page_size()),
+        )?;
+        geometry::attach_kv_write(&pass, &self.kv, &geom);
+        let positions: Vec<u32> = (self.seq_len..self.seq_len + n).collect();
+        pass.input_tokens(tokens, &positions);
+        pass.sampler(&probe.program, probe.bindings(self.seq_len + n - 1)?);
+        pass.execute();
+        self.seq_len += n;
+        Ok(pass)
+    }
+}
+
+/// Read a dense `[vocab]` f32 distribution off the raw output tensor. `ids` are
+/// the implicit identity `0..vocab` (matching the facade `distribution()`).
+async fn read_distribution(pass: ForwardPass) -> Result<(Vec<u32>, Vec<f32>)> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    let probs: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let ids: Vec<u32> = (0..probs.len() as u32).collect();
+    Ok((ids, probs))
+}
+
 // ── Run one mode (watermark on or off) ────────────────────────────────
-async fn run_one(
-    model: &Model,
-    model_name: &str,
-    input: &Input,
-    watermark_on: bool,
-) -> Result<ModeResult> {
+async fn run_one(model_name: &str, input: &Input, watermark_on: bool) -> Result<ModeResult> {
     let (label, color, tagline) = if watermark_on {
         (
             "WATERMARKED",
@@ -152,19 +193,19 @@ async fn run_one(
 
     // Build the prompt up front so the first forward pass prefills it.
     // Subsequent passes feed one chosen token at a time.
-    let mut ctx = Context::new(model)?;
+    let mut ctx = Ctx::new();
+    let vocab = model::output_vocab_size();
+    let probe = probe_program(ProbeKind::Distribution, vocab)
+        .map_err(|e| format!("probe(Distribution) build: {e}"))?;
     let mut pending: Vec<u32> = Vec::new();
-    pending.extend(chat::system(model, &input.system));
-    pending.extend(chat::user(
-        model,
-        &format!("{} /no_think", input.prompt.trim()),
-    ));
-    pending.extend(chat::cue(model));
+    pending.extend(chat::system(&input.system));
+    pending.extend(chat::user(&format!("{} /no_think", input.prompt.trim())));
+    pending.extend(chat::cue());
 
-    let stop_tokens = chat::stop_tokens(model);
+    let stop_tokens = chat::stop_tokens();
     let mut watermark = WatermarkState::new(input.gamma, input.delta);
     let mut detector = Detector::new(input.gamma);
-    let mut chat_dec = chat::Decoder::new(model);
+    let mut chat_dec = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut generated: Vec<u32> = Vec::new();
 
@@ -173,35 +214,21 @@ async fn run_one(
 
     let start = Instant::now();
     for _ in 0..input.max_tokens {
-        let mut pass = ctx.forward();
-        pass.input(&pending);
-        let last_idx = (pending.len() - 1) as u32;
-        // temperature=1.0 returns the model's natural softmax (not a
-        // one-hot) so that adding +delta to green-list log-probs can
-        // actually change which token wins on the biased argmax.
-        // k=0 returns the full vocabulary.
-        let h = pass.probe(
-            last_idx,
-            Distribution {
-                temperature: 1.0,
-                k: 0,
-            },
-        );
-        let out = pass.execute().await?;
-        let (ids, probs) = match out.distribution(h) {
-            Some(d) => d,
-            None => break,
-        };
+        // The model's natural full softmax (over all vocab) at the decode
+        // position, so adding +delta to green-list log-probs can change which
+        // token wins on the biased argmax.
+        let pass = ctx.probe_fire(&probe, &pending)?;
+        let (ids, probs) = read_distribution(pass).await?;
 
         let chosen = if watermark_on {
-            watermark.sample_biased(ids, probs)
+            watermark.sample_biased(&ids, &probs)
         } else {
-            argmax_unbiased(ids, probs)
+            argmax_unbiased(&ids, &probs)
         };
 
         // Detector counts green-list hits using the same seeding rule.
         // It runs in either mode — for BASELINE we expect z ≈ 0.
-        detector.feed(chosen, ids);
+        detector.feed(chosen, &ids);
 
         if stop_tokens.contains(&chosen) {
             break;
@@ -216,7 +243,7 @@ async fn run_one(
                 print!("{}", rendered);
                 let _ = io::stdout().flush();
                 if input.delay > 0 {
-                    wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
+                    inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
                 }
             }
         }

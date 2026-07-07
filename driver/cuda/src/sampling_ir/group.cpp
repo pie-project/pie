@@ -33,4 +33,31 @@ void scatter_tokens_i32(const void* src_compact, std::span<const std::uint32_t> 
     }
 }
 
+namespace {
+// #10-phase-2 per-row scalar gather: compact one 4-byte element per group row
+// from a scattered `[*]` source into `[Ng]`. Same host-orchestrated D2D pattern
+// as `gather_logits_bf16` (proven), scalar stride instead of a `V`-wide row.
+inline void gather_scalar_4b(const void* src_base, std::span<const std::uint32_t> rows,
+                             void* dst, cudaStream_t stream) {
+    constexpr std::size_t es = 4;  // f32 / u32 / i32 — one 4-byte element per row
+    const char* src = static_cast<const char*>(src_base);
+    char* d = static_cast<char*>(dst);
+    for (std::size_t g = 0; g < rows.size(); ++g) {
+        cudaMemcpyAsync(d + g * es,
+                        src + static_cast<std::size_t>(rows[g]) * es, es,
+                        cudaMemcpyDeviceToDevice, stream);
+    }
+}
+}  // namespace
+
+void gather_f32(const void* src_base, std::span<const std::uint32_t> rows,
+                void* dst, cudaStream_t stream) {
+    gather_scalar_4b(src_base, rows, dst, stream);  // temp / top_p / min_p
+}
+
+void gather_u32(const void* src_base, std::span<const std::uint32_t> rows,
+                void* dst, cudaStream_t stream) {
+    gather_scalar_4b(src_base, rows, dst, stream);  // seed (u32); top_k (i32, bit-compatible)
+}
+
 }  // namespace pie_cuda_driver::sampling_ir

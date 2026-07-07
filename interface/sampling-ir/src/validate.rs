@@ -151,6 +151,77 @@ pub fn program_from_parts(
     Ok(program)
 }
 
+/// Like [`program_from_parts`] but takes the **declared** [`OutputDecl`]s
+/// (value id + [`OutputKind`]) instead of bare value-ids — so the front door
+/// carries the kind explicitly and the typed float kinds
+/// (`Logits`/`Logprobs`/`Distribution`, all `F32`) survive instead of
+/// re-inferring to `Scalar` via [`OutputKind::from_dtype`]. Each declared kind
+/// is validated against its value's dtype ([`OutputKind::accepts_dtype`]); a
+/// mismatch is rejected. This is the typed-output (#18) decode path.
+pub fn program_from_parts_typed(
+    inputs: Vec<InputDecl>,
+    ops: Vec<Op>,
+    outputs: Vec<OutputDecl>,
+) -> Result<SamplingProgram, ValidationError> {
+    // Type the SSA body first so each declared output's value dtype is known.
+    let scratch = SamplingProgram { inputs, ops, outputs: Vec::new() };
+    let types = compute_types(&scratch)?;
+    for (i, od) in outputs.iter().enumerate() {
+        let t = types
+            .get(od.value as usize)
+            .ok_or(ValidationError::OutputIdOutOfRange { value: od.value })?;
+        if !od.kind.accepts_dtype(t.dtype) {
+            return Err(ValidationError::OutputKindTypeMismatch { index: i as u32 });
+        }
+    }
+    let SamplingProgram { inputs, ops, .. } = scratch;
+    let program = SamplingProgram { inputs, ops, outputs };
+    validate(&program)?;
+    Ok(program)
+}
+
+// ===========================================================================
+// Attach-time intrinsic decl contract
+// ===========================================================================
+
+/// The intrinsic-binding shape contract (attach-time; the binding itself is
+/// not in the bytecode). One definition, shared by the runtime attach and
+/// every backend's bind so they cannot drift:
+///
+/// - [`Binding::Logits`]: F32, `[vocab]` or `[rows, vocab]` (the spec-verify
+///   readout rows).
+/// - [`Binding::MtpLogits`]: F32, `[vocab]` (legacy K=1) or **`[K, vocab]`**
+///   (Stage 2 — the MTP head's K draft proposals; K = the decl's row count,
+///   trace-known).
+/// - [`Binding::MtpDrafts`]: I32, `[k]` (rank-1) — the MTP head's `k` draft
+///   token ids for the prior fire (device-resident spec-decode drafts channel);
+///   `k` = the decl's element count, trace-known.
+/// - [`Binding::Tensor`]: any decl (host data; the full-extent byte rule in
+///   BYTECODE.md §5 governs the payload).
+///
+/// `vocab`: pass the model's vocab to pin the last axis; `None` skips that
+/// check (shape-only validation where the model is not yet known).
+pub fn intrinsic_decl_ok(binding: &Binding, decl: &InputDecl, vocab: Option<u32>) -> bool {
+    match binding {
+        Binding::Tensor { .. } => true,
+        Binding::MtpDrafts => {
+            decl.dtype == DType::I32 && matches!(*decl.shape.dims(), [k] if k >= 1)
+        }
+        Binding::Logits | Binding::MtpLogits => {
+            if decl.dtype != DType::F32 {
+                return false;
+            }
+            let dims = decl.shape.dims();
+            let last_ok = |n: u32| vocab.is_none_or(|v| n == v);
+            match *dims {
+                [n] => last_ok(n),
+                [k, n] => k >= 1 && last_ok(n),
+                _ => false,
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Late-bind use-site analysis
 // ===========================================================================
@@ -189,6 +260,19 @@ pub fn late_input_barriers(
 ) -> Result<Vec<(InputIndex, Option<u32>)>, ValidationError> {
     validate(p)?;
     Ok(late_indices.iter().map(|&i| (i, input_first_use(p, i))).collect())
+}
+
+/// The input indices the program declares [`Readiness::Late`] — derived directly
+/// from each [`InputDecl::ready`] (readiness is now a program property, no longer
+/// supplied externally). The runtime injects each before its [`input_first_use`]
+/// barrier; feed the result to [`late_input_barriers`].
+pub fn late_inputs(p: &SamplingProgram) -> Vec<InputIndex> {
+    p.inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, inp)| inp.ready == Readiness::Late)
+        .map(|(i, _)| i as InputIndex)
+        .collect()
 }
 
 // ===========================================================================
@@ -363,7 +447,19 @@ fn infer(
                 return Err(shape_err());
             }
             match predicate {
-                Predicate::RankLe(_) => {}
+                Predicate::RankLe(k_id) => {
+                    let kt = g(k_id)?;
+                    // `k` is an integer count: a shared scalar, or — for a matrix
+                    // input — a per-row `[rows]` vector (one `k` per row).
+                    if !kt.dtype.is_int() {
+                        return Err(dtype_err());
+                    }
+                    let per_row_ok =
+                        t.shape.rank() == 2 && *kt.shape.dims() == [t.shape.rows()];
+                    if !kt.shape.is_scalar() && !per_row_ok {
+                        return Err(shape_err());
+                    }
+                }
                 Predicate::CummassLe(thr) | Predicate::ProbGe(thr) => {
                     let tt = g(thr)?;
                     if tt.dtype != DType::F32 {
@@ -406,6 +502,21 @@ fn infer(
                 _ => return Err(shape_err()),
             }
             one(ValueType::vector(m, ts.dtype))
+        }
+        Op::MaskApply { logits, mask } => {
+            let (tl, tm) = (g(logits)?, g(mask)?);
+            // `mask` is a packed `[ceil(n/32)]` U32 bitmask over the `n`-length
+            // logits (word-indexed, not broadcast). Result ≡ logits.
+            let n = tl.shape.last_len().ok_or_else(shape_err)?;
+            let words = n.div_ceil(32);
+            if tm.dtype != DType::U32 {
+                return Err(dtype_err());
+            }
+            match *tm.shape.dims() {
+                [w] if w == words => {}
+                _ => return Err(shape_err()),
+            }
+            one(ValueType::new(tl.shape, tl.dtype))
         }
         Op::ScatterAdd { base, idx, vals } => one(scatter_ty(op_index, base, idx, vals, types, true)?),
         Op::ScatterSet { base, idx, vals } => one(scatter_ty(op_index, base, idx, vals, types, false)?),
@@ -462,6 +573,27 @@ mod tests {
     }
     fn islot(dims: &[u32], dtype: DType) -> InputDecl {
         InputDecl::new(Shape::new(dims).unwrap(), dtype)
+    }
+
+    #[test]
+    fn intrinsic_decl_contract_stage2() {
+        use crate::types::{Binding, Readiness};
+        let d = |dims: &[u32], dt: DType| InputDecl::new(Shape::new(dims).unwrap(), dt);
+        let v = 128u32;
+        // MtpLogits: [vocab] (legacy K=1) and [K, vocab] (Stage 2) accepted.
+        assert!(intrinsic_decl_ok(&Binding::MtpLogits, &d(&[v], DType::F32), Some(v)));
+        assert!(intrinsic_decl_ok(&Binding::MtpLogits, &d(&[3, v], DType::F32), Some(v)));
+        assert!(intrinsic_decl_ok(&Binding::Logits, &d(&[4, v], DType::F32), Some(v)));
+        // Wrong last axis / dtype / rank rejected.
+        assert!(!intrinsic_decl_ok(&Binding::MtpLogits, &d(&[3, v + 1], DType::F32), Some(v)));
+        assert!(!intrinsic_decl_ok(&Binding::MtpLogits, &d(&[3, v], DType::I32), Some(v)));
+        assert!(!intrinsic_decl_ok(&Binding::MtpLogits, &d(&[1, 3, v], DType::F32), Some(v)));
+        assert!(!intrinsic_decl_ok(&Binding::MtpLogits, &d(&[], DType::F32), Some(v)));
+        // vocab=None skips the last-axis pin (model-agnostic check).
+        assert!(intrinsic_decl_ok(&Binding::MtpLogits, &d(&[3, 999], DType::F32), None));
+        // Host tensors are unconstrained here (BYTECODE.md §5 governs payload).
+        let t = Binding::Tensor { key: 7, ready: Readiness::Submit };
+        assert!(intrinsic_decl_ok(&t, &d(&[2, 2], DType::Bool), Some(v)));
     }
 
     #[test]
@@ -596,6 +728,25 @@ mod tests {
         assert_eq!(validate(&mk(k)), Ok(()));
         // wrong-length [k+1] threshold → pivot shape mismatch
         assert_eq!(validate(&mk(k + 1)), Err(ValidationError::ShapeMismatch { op_index: 2 }));
+    }
+
+    #[test]
+    fn pivot_rank_le_k_is_a_value_id() {
+        // #25: RankLe `k` is a value-id — an integer scalar (or per-row [rows]
+        // vector), de-hardwired like top-p `p`.
+        let mk = |k_dtype: DType| SamplingProgram {
+            inputs: vec![logits(&[16]), islot(&[], k_dtype)],
+            ops: vec![
+                Op::Input(0),
+                Op::Input(1),
+                Op::PivotThreshold { input: 0, predicate: Predicate::RankLe(1) },
+            ],
+            outputs: vec![OutputDecl::new(0, OutputKind::Logits)],
+        };
+        // a U32 scalar `k` validates
+        assert_eq!(validate(&mk(DType::U32)), Ok(()));
+        // a float `k` is rejected — `k` is an integer count
+        assert_eq!(validate(&mk(DType::F32)), Err(ValidationError::DTypeMismatch { op_index: 2 }));
     }
 
     #[test]

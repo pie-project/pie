@@ -53,6 +53,14 @@ pub fn resolve_bindings(
         .iter()
         .map(|b| match b {
             ir::Binding::Logits => Ok(InputBinding::Logits(logits_positions.to_vec())),
+            // The draft-logits intrinsic (de-hardwired speculation): driver
+            // source-selects the draft row of `ws.logits`; no host data, like
+            // `Logits`. A unit attach binding — the resolver reads the kind.
+            ir::Binding::MtpLogits => Ok(InputBinding::MtpLogits),
+            // Device-resident drafts channel: the `[k]` i32 draft token ids
+            // consumed by device-side spec-decode verify. Unit attach binding
+            // (kind-only, no host data), like `MtpLogits`.
+            ir::Binding::MtpDrafts => Ok(InputBinding::MtpDrafts),
             ir::Binding::Tensor { key, .. } => {
                 let decl = host_inputs
                     .iter()
@@ -265,6 +273,7 @@ mod supply_api_tests {
                 decl(12, Readiness::Late),
             ],
             bindings: Vec::new(),
+            canonical_kind: Default::default(),
         };
 
         assert_eq!(prog.host_inputs.len(), 3);

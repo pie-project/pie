@@ -175,6 +175,37 @@ int main() {
         }
     }  // backend destroyed before ctx teardown
 
+    // ── #11 prefetch_compile: warm the off-context PTX cache, then get_or_compile
+    //    reuses it (exactly ONE NVRTC run). Also exercises the C-ABI trampoline
+    //    (the in-proc FFI entry: (kind,key)->SubmitBound manifest reconstruction).
+    {
+        SamplingIrBackend backend;
+        const std::uint32_t vocab = 256;
+        std::vector<std::uint8_t> bytecode = build_argmax_v2(vocab);
+
+        // Prefetch (idempotent) off the would-be context thread.
+        backend.prefetch_compile(std::span<const std::uint8_t>(bytecode),
+                                 ProgramManifest{});
+        backend.prefetch_compile(std::span<const std::uint8_t>(bytecode),
+                                 ProgramManifest{});
+
+        // The on-demand compile finds the prefetched PTX -> cache HIT, no recompile.
+        ProgramHandle h = backend.get_or_compile(bytecode);
+        CHECK(h != kInvalidProgram);
+        std::fprintf(stderr, "prefetch: compiles_run = %llu (expect 1)\n",
+                     static_cast<unsigned long long>(backend.compiles_run()));
+        CHECK(backend.compiles_run() == 1);  // one NVRTC run total (the prefetch's)
+
+        // The C-ABI trampoline reconstructs the SAME (empty) manifest -> same
+        // identity hash -> still a cache HIT (no extra compile). Pass the
+        // IProgramBackend* (as echo's register_prefetch does), not the derived.
+        IProgramBackend* base = &backend;
+        pie_sampling_ir_prefetch_trampoline(
+            static_cast<void*>(base), bytecode.data(), bytecode.size(),
+            /*binds_kind=*/nullptr, /*binds_key=*/nullptr, /*binds_len=*/0);
+        CHECK(backend.compiles_run() == 1);  // trampoline prefetch deduped
+    }
+
     // ── Fallback: a batched backend keeps Gather/Scatter/SortDesc programs
     //    runnable by lowering them M=1 (so "always-batched" production is safe
     //    for the open programmable surface — e.g. mirostat's `gather`). Standard

@@ -1,0 +1,43 @@
+[package]
+name = "ptir"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "PTIR tracing frontend (Thrust 3): Tensor / Channel / ForwardPass / Pipeline builder types that trace closures once into a validated PTIR trace container. The Rust SDK authoring surface for programmable dataflows."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+keywords = ["pie", "ptir", "tracing", "inferlet"]
+categories = ["api-bindings"]
+
+# Standalone crate (not in the host workspace, like sdk/rust/*) so it can be
+# `cargo test`ed on the host. Authors PTIR traces against the canonical
+# `pie-sampling-ir` primitives (Shape / DType / FNV-1a identity hash). The trace
+# container encoding + full op-table + validator are the P0 seam co-owned with
+# echo; this crate carries a PROVISIONAL encoder + validator behind the `lower`
+# module, seamed to swap for echo's canonical crate on convergence.
+[lib]
+name = "ptir"
+path = "src/lib.rs"
+
+[features]
+# `std` (default, host-side) enables the thread-local trace context + the
+# `std::error::Error` impls. The crate builds + authors in a `wasm32-wasip2`
+# inferlet AS-IS (wasip2 provides std `thread_local!`): an inferlet depends on
+# `ptir`, authors via `ForwardPass`/`Channel`/`epilogue`, then `traced.encode()`
+# → the WIT `register_program` runs it. Proof: `runtime/tests/inferlets/
+# ptir-sdk-greedy`. A `no_std` single-threaded context is only needed for
+# non-wasip2 no_std targets (not required for the inferlet fold).
+default = ["std"]
+std = ["pie-sampling-ir/std"]
+
+[dependencies]
+pie-sampling-ir = { path = "../../../interface/sampling-ir", default-features = false }
+
+# Host-only: the CPU reference interpreter (`eval`/`interp`) for tier-0
+# result-parity tests. Dev-deps are excluded from the wasm build, so this never
+# reaches the SDK.
+[dev-dependencies]
+pie-sampling-ir = { path = "../../../interface/sampling-ir", features = ["eval"] }
+
+[lints.rust]
+unsafe_code = "forbid"

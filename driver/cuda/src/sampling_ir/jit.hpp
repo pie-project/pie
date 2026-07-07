@@ -23,13 +23,19 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <cuda.h>
+
+#include "sampling_ir/program_hash.hpp"  // jit::fnv1a64 (inline, canonical)
+#include "sampling_ir/thread_pool.hpp"   // #11 off-context NVRTC PTX-gen pool
 
 // All JIT types live in the `::jit` sub-namespace so they never collide with
 // charlie's codegen types (`sampling_ir::KernelDAG`/`BufferDecl`/`KernelArg`)
@@ -216,7 +222,24 @@ class JitEngine {
     // Compile (or return cached) the program keyed by `dag.hash`. The first
     // call compiles every kernel and allocates non-external buffers; later
     // calls with the same hash are O(1).
+    //
+    // #11: a cold miss splits into off-context NVRTC PTX-gen (the worker pool)
+    // and on-context finalize (`cuModuleLoadData`/`cuMemAlloc`). Concurrent
+    // requesters for the same hash dedup on one shared PTX future. The context
+    // thread (this call) blocks on the PTX future then finalizes; the hot path
+    // (already Ready) is an O(1) cache hit, unchanged.
+    //
+    // CONTEXT-THREAD ONLY — this is the sole finalizer (it issues the cu* module
+    // load + buffer alloc). `prefetch_compile` (any thread) only submits PTX-gen.
     CompiledProgram& get_or_compile(const KernelDAG& dag);
+
+    // #11 compile-ahead hook: fire-and-forget — ensure NVRTC PTX-gen for `dag`
+    // is in flight on the worker pool, so a later `get_or_compile` finalizes
+    // fast (PTX already produced). Idempotent (dedup'd by `dag.hash`). Touches
+    // NO CUDA context (only NVRTC + the cache map under `mu_`), so it is safe to
+    // call from any thread — the scheduler calls it at recognize/admission so
+    // the ~10ms compile overlaps the in-flight run-ahead steps.
+    void prefetch_compile(const KernelDAG& dag);
 
     // Bind an externally-owned device buffer (logits in / response outputs) to
     // a BufferId, overriding any JIT allocation. Must be called for every
@@ -247,8 +270,51 @@ class JitEngine {
 
     const std::string& arch() const { return arch_; }
 
+    // #11 observability: total number of programs that actually went through
+    // NVRTC PTX-gen (one per distinct program — dedup'd misses don't recompile).
+    // For a burst of M requests over K distinct programs this is exactly K, so a
+    // test / the load-test can assert dedup. Relaxed: a monotonic counter.
+    std::uint64_t compiles_run() const {
+        return compiles_run_.load(std::memory_order_relaxed);
+    }
+
   private:
-    void compile_dag(const KernelDAG& dag, CompiledProgram& prog);
+    // #11 cold-compile state machine. A program's entry is created Compiling
+    // (PTX-gen enqueued on the pool); the context thread finalizes it to Ready
+    // (or Failed). One PTX compile per hash — concurrent requesters share
+    // `ptx_fut`.
+    enum class CompileState { Compiling, Ready, Failed };
+
+    // Off-thread NVRTC PTX-gen result for one program: the per-kernel PTX in
+    // `dag.kernels` order, or an error. Delivered via a `shared_future` so
+    // concurrent requesters dedup on a single compile.
+    struct PtxResult {
+        std::vector<std::string> ptx;  // one per KernelDef, in DAG order
+        bool ok = false;
+        std::string error;
+    };
+
+    struct CacheEntry {
+        CompileState state = CompileState::Compiling;
+        std::shared_future<PtxResult> ptx_fut;     // pool-produced; shared by waiters
+        std::unique_ptr<CompiledProgram> prog;     // non-null iff Ready (heap-stable)
+        std::string error;                          // set iff Failed
+    };
+
+    // Phase 2 of a cold compile, CONTEXT-THREAD ONLY: allocate the buffer table
+    // (`cuMemAlloc`), `cuModuleLoadData` each pre-built PTX + resolve its
+    // `CUfunction`, and build the launch param arrays. Takes the PTX produced
+    // off-thread (no NVRTC here).
+    void finalize(const KernelDAG& dag, const std::vector<std::string>& ptx,
+                  CompiledProgram& prog);
+
+    // Ensure NVRTC PTX-gen for `hash` is in flight (dedup) and return its shared
+    // future. Locks `mu_` only to look up / insert the cache entry; on a miss it
+    // captures a `shared_ptr<KernelDAG>` copy + enqueues the NVRTC work on
+    // `pool_`. Never touches a CUDA context.
+    std::shared_future<PtxResult> request_compile(std::uint64_t hash,
+                                                  const KernelDAG& dag);
+
     // Verify all referenced buffers are bound, then patch per-fire Param scalars
     // and issue one cuLaunchKernel per DAG node on `stream` (shared by direct
     // launch and graph capture). `num_rows`/`vocab` (from the param table) drive
@@ -260,8 +326,13 @@ class JitEngine {
     // pointer-to-pointer the launch params hold stays valid).
     void ensure_capacity(CompiledProgram& prog, std::size_t num_rows);
 
-    std::string arch_;  // NVRTC --gpu-architecture, e.g. "compute_89"
-    std::unordered_map<std::uint64_t, std::unique_ptr<CompiledProgram>> cache_;
+    std::string arch_;  // NVRTC --gpu-architecture, e.g. "compute_89" (set once at init)
+    std::mutex mu_;     // guards cache_ (context thread + any prefetch thread)
+    std::atomic<std::uint64_t> compiles_run_{0};  // #11 dedup metric (NVRTC runs)
+    std::unordered_map<std::uint64_t, CacheEntry> cache_;  // guarded by mu_
+    // PTX-gen pool. Declared LAST so it is destroyed FIRST (workers joined —
+    // all in-flight NVRTC tasks complete — before cache_/mu_ tear down).
+    ThreadPool pool_;
 };
 
 // Launch-param slot convention (frozen with charlie's ParamSlot): the JIT reads
@@ -269,7 +340,7 @@ class JitEngine {
 inline constexpr std::uint32_t kParamNumRows = 0;
 inline constexpr std::uint32_t kParamVocab = 1;
 
-// FNV-1a 64-bit hash, handy for keying the program cache off raw bytecode.
-std::uint64_t fnv1a64(const void* data, std::size_t len);
+// FNV-1a 64-bit hash (`program_hash.hpp`) — the canonical program identity /
+// cache key, header-inline. Re-exported here for existing `jit::fnv1a64` callers.
 
 }  // namespace pie_cuda_driver::sampling_ir::jit

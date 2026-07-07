@@ -30,8 +30,41 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, Result, Speculator, chat, model::Model, runtime, sample::Sampler, wstd};
+use inferlet::inference::ForwardPass;
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{chat, geometry, model, sampler, Result};
 use serde::Deserialize;
+
+/// Raw n-token KV rollback (the keep-core equivalent of `Context::truncate`):
+/// drop the trailing `n` materialized tokens and free the page slots that no
+/// longer hold a live token. `n` is clamped to `*seq_len`. Byte-identical to
+/// the jacobi/cacheback helper.
+fn kv_truncate(kv: &KvWorkingSet, seq_len: &mut u32, n: u32) {
+    let n = n.min(*seq_len);
+    if n == 0 {
+        return;
+    }
+    *seq_len -= n;
+    let page = kv.page_size();
+    let live_pages = seq_len.div_ceil(page);
+    let have = kv.size();
+    if have > live_pages {
+        // Best-effort: a stale trailing page is harmless — the next forward
+        // overwrites it. Matches the facade's non-fatal free.
+        let drop: Vec<u32> = (live_pages..have).collect();
+        let _ = kv.free(&drop);
+    }
+}
+
+/// Read a Token output tensor as `u32` ids.
+async fn read_tokens(pass: ForwardPass) -> Result<Vec<u32>> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("read: {e:?}"))?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32)
+        .collect())
+}
 
 #[derive(Deserialize)]
 struct Input {
@@ -120,23 +153,19 @@ const MAGENTA: &str = "\x1b[35m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_baseline(&model, &model_name, &input).await?;
+            run_baseline(&model_name, &input).await?;
         }
         "speculated" | "smart" => {
-            run_speculated(&model, &model_name, &input).await?;
+            run_speculated(&model_name, &input).await?;
         }
         "both" | "" => {
-            let p = run_baseline(&model, &model_name, &input).await?;
+            let p = run_baseline(&model_name, &input).await?;
             println!();
-            let s = run_speculated(&model, &model_name, &input).await?;
+            let s = run_speculated(&model_name, &input).await?;
             println!();
             comparison(&p, &s);
         }
@@ -160,7 +189,7 @@ struct ModeResult {
 }
 
 // ── BASELINE: vanilla one-token-per-step decode ───────────────────────────
-async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_baseline(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "BASELINE",
         YELLOW,
@@ -168,44 +197,73 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
         model_name,
     );
 
-    let mut ctx = Context::new(model)?;
-    ctx.system(&input.system);
-    ctx.user(&input.task);
-    ctx.cue();
+    let stop_tokens = chat::stop_tokens();
+    let vocab = model::output_vocab_size();
+    let mut prompt = chat::system_user(&input.system, &input.task);
+    prompt.extend(chat::cue());
+
+    let kv = KvWorkingSet::new();
+    let page = kv.page_size();
+    let mut seq_len: u32 = 0;
+    let greedy = sampler::sampler_program(sampler::SamplerSpec::Argmax, vocab)?;
 
     let start = Instant::now();
     print!("  {}>{} ", CYAN, RESET);
     let _ = io::stdout().flush();
 
-    let mut g = ctx
-        .generate(Sampler::Argmax)
-        .max_tokens(input.max_tokens)
-        .stop(&chat::stop_tokens(model));
-    let mut decoder = chat::Decoder::new(model);
+    let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut tokens = 0usize;
 
-    while let Some(step) = g.next()? {
-        let out = step.execute().await?;
-        if out.tokens.is_empty() {
-            continue;
+    // Bootstrap: fire the full prompt, argmax at the last position → the
+    // first response token (the fused prompt-prefill + first greedy sample).
+    let mut next = {
+        let n = prompt.len() as u32;
+        let pass = ForwardPass::new();
+        pass.fresh_generate();
+        let geom = geometry::ensure_pages(&kv, geometry::kv_write_geometry(seq_len, n, page))?;
+        geometry::attach_kv_write(&pass, &kv, &geom);
+        let positions: Vec<u32> = (seq_len..seq_len + n).collect();
+        pass.input_tokens(&prompt, &positions);
+        pass.sampler(&greedy.program, greedy.bindings(seq_len + n - 1)?);
+        pass.execute();
+        seq_len += n;
+        *read_tokens(pass)
+            .await?
+            .first()
+            .ok_or("bootstrap produced no token")?
+    };
+
+    // Vanilla one-token-per-step greedy decode. Stop tokens break the loop
+    // without being rendered (mirrors the facade's `stop` + empty-out drain).
+    loop {
+        if stop_tokens.contains(&next) || tokens >= input.max_tokens {
+            break;
         }
-        tokens += out.tokens.len();
-        match decoder.feed(&out.tokens)? {
-            chat::Event::Delta(s) => {
-                let visible = stripper.process(&s);
-                if !visible.is_empty() {
-                    let rendered = visible.replace('\n', "\n    ");
-                    print!("{}", rendered);
-                    let _ = io::stdout().flush();
-                    if input.delay > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
-                    }
+        if let chat::Event::Delta(s) = decoder.feed(&[next])? {
+            let visible = stripper.process(&s);
+            if !visible.is_empty() {
+                let rendered = visible.replace('\n', "\n    ");
+                print!("{}", rendered);
+                let _ = io::stdout().flush();
+                if input.delay > 0 {
+                    inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
                 }
             }
-            chat::Event::Done(_) => break,
-            _ => {}
         }
+        tokens += 1;
+
+        let pass = ForwardPass::new();
+        let geom = geometry::ensure_pages(&kv, geometry::kv_write_geometry(seq_len, 1, page))?;
+        geometry::attach_kv_write(&pass, &kv, &geom);
+        pass.input_tokens(&[next], &[seq_len]);
+        pass.sampler(&greedy.program, greedy.bindings(seq_len)?);
+        pass.execute();
+        seq_len += 1;
+        next = match read_tokens(pass).await?.first() {
+            Some(&t) => t,
+            None => break,
+        };
     }
     let elapsed = start.elapsed();
     println!();
@@ -219,8 +277,8 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
     })
 }
 
-// ── SPECULATED: prompt-lookup speculator via Generator::speculator ────────
-async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+// ── SPECULATED: prompt-lookup drafter, manual draft/verify/accept loop ────
+async fn run_speculated(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "SPECULATED",
         GREEN,
@@ -233,64 +291,54 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
     );
     println!();
 
-    let mut ctx = Context::new(model)?;
-    ctx.system(&input.system);
-    ctx.user(&input.task);
-    ctx.cue();
-    // Prefill the prompt as a standalone forward, then bootstrap the
-    // first model token, then enter the speculator loop. Letting the
-    // Generator fuse prompt prefill with the first verify pass works on
-    // some backends but not others: greedy-argmax is sensitive to small
-    // numerical differences between "prefill alone" and "prefill +
-    // multi-position samplers" kernel shapes, and on cuda 0.1.0 the
-    // fused shape produces logits that drift off the greedy trajectory.
-    // The split-pass pattern matches inferlets/cacheback-decoding.
-    ctx.flush().await?;
+    let stop_tokens = chat::stop_tokens();
+    let vocab = model::output_vocab_size();
+    let mut prompt = chat::system_user(&input.system, &input.task);
+    prompt.extend(chat::cue());
 
-    let tokenizer = model.tokenizer();
-    let prompt_str = format!("{}\n{}", input.system, input.task);
-    // Pool seeded from the user task tokenized stand-alone. Chat
-    // template alignment isn't critical: accepted tokens grow the pool
-    // as generation progresses, so n-gram suffix matches still find
-    // prompt-repetition hits across both halves.
-    let prompt_tokens = tokenizer.encode(&prompt_str);
-    let stop_tokens = chat::stop_tokens(model);
+    let kv = KvWorkingSet::new();
+    let page = kv.page_size();
+    let mut seq_len: u32 = 0;
+    let greedy = sampler::sampler_program(sampler::SamplerSpec::Argmax, vocab)?;
 
-    // Bootstrap: re-feed the last cue token at the next free slot and
-    // sample the model's first response token. The cue is already in
-    // KV from flush(); duplicating its last token kicks the decoder
-    // out of prefill into a normal sampling step.
-    let cue = chat::cue(model);
-    let trigger = *cue.last().ok_or("empty cue")?;
+    // Bootstrap: one prompt fire with a greedy sampler at the last position →
+    // the first response token. The canonical single-pass bootstrap (as in
+    // jacobi/cacheback) keeps the speculated greedy trajectory identical to
+    // BASELINE — the correctness guarantee of speculative decoding — and avoids
+    // the facade-era fused-vs-split first-token drift the old split worked
+    // around.
     let first_token = {
-        let mut pass = ctx.forward();
-        pass.input(&[trigger]);
-        let h = pass.sample(&[0], Sampler::Argmax);
-        let out = pass.execute().await?;
-        out.token(h).ok_or("bootstrap produced no token")?
+        let n = prompt.len() as u32;
+        let pass = ForwardPass::new();
+        pass.fresh_generate();
+        let geom = geometry::ensure_pages(&kv, geometry::kv_write_geometry(seq_len, n, page))?;
+        geometry::attach_kv_write(&pass, &kv, &geom);
+        let positions: Vec<u32> = (seq_len..seq_len + n).collect();
+        pass.input_tokens(&prompt, &positions);
+        pass.sampler(&greedy.program, greedy.bindings(seq_len + n - 1)?);
+        pass.execute();
+        seq_len += n;
+        *read_tokens(pass)
+            .await?
+            .first()
+            .ok_or("bootstrap produced no token")?
     };
-    // Stage first_token as iter 1's pending. The Generator drains
-    // buffer into pending on each `next()`, so iter 1 forwards it at
-    // position seq_len; drafts then start at seq_len + 1.
-    ctx.append(&[first_token]);
 
     let stats = Arc::new(Mutex::new(SpecStats::default()));
-    let cursor = ctx.seq_len() + ctx.buffer().len() as u32;
-    // Pre-seed the pool with first_token so iter 1's n-gram lookup
-    // searches suffix [last_prompt_tok, first_token]. Without this seed
-    // iter 1 would draft against a model-token-free pool and the very
-    // first lookup would miss.
-    let mut pool = prompt_tokens;
+    // Pool seeded from the prompt (tokenized stand-alone) plus first_token so
+    // iter 1's n-gram lookup searches suffix [.., first_token].
+    let prompt_str = format!("{}\n{}", input.system, input.task);
+    let mut pool = inferlet::model::encode(&prompt_str);
     pool.push(first_token);
-    let drafter = PromptLookup::new(
+    let mut drafter = PromptLookup::new(
         pool,
         input.ngram_n,
         input.draft_len,
-        cursor,
+        seq_len,
         Arc::clone(&stats),
     );
 
-    let mut decoder = chat::Decoder::new(model);
+    let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
 
     let start = Instant::now();
@@ -300,7 +348,7 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
     let mut tokens = 0usize;
     let mut rounds = 0usize;
 
-    // Render the bootstrap token (sampled outside the Generator loop).
+    // Render the bootstrap token (the first free pick).
     if let chat::Event::Delta(s) = decoder.feed(&[first_token])? {
         let visible = stripper.process(&s);
         if !visible.is_empty() {
@@ -308,53 +356,91 @@ async fn run_speculated(model: &Model, model_name: &str, input: &Input) -> Resul
             print!("{}", rendered);
             let _ = io::stdout().flush();
             if input.delay > 0 {
-                wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
+                inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
             }
         }
     }
     tokens += 1;
 
-    // If the very first sample is a stop token, skip the loop entirely.
-    let bootstrap_done = stop_tokens.contains(&first_token) || tokens >= input.max_tokens;
+    let mut anchor = first_token;
+    let mut done = stop_tokens.contains(&first_token) || tokens >= input.max_tokens;
 
-    let mut g = ctx
-        .generate(Sampler::Argmax)
-        .max_tokens(input.max_tokens.saturating_sub(tokens))
-        .stop(&stop_tokens)
-        .speculator(drafter);
+    // Manual draft/verify/accept loop (jacobi/cacheback pattern with the guest
+    // PromptLookup drafter). Each round: draft off the n-gram pool, verify
+    // [anchor] + drafts in ONE fire (argmax at every position), accept the
+    // longest converged prefix, roll back the rejected suffix.
+    while !done {
+        let (draft_tokens, _positions) = drafter.draft();
 
-    if !bootstrap_done {
-        while let Some(step) = g.next()? {
-            let out = step.execute().await?;
-            if out.tokens.is_empty() {
-                continue;
-            }
-            rounds += 1;
-            // out.tokens shape: [free_pick, ...accepted_drafts...]. Render
-            // the free pick in normal cyan stream color; color draft-
-            // accepted tokens green/bold so the burst is visible against
-            // BASELINE's steady drip.
-            for (idx, &t) in out.tokens.iter().enumerate() {
-                let from_draft = idx > 0;
-                if let chat::Event::Delta(s) = decoder.feed(&[t])? {
-                    let visible = stripper.process(&s);
-                    if !visible.is_empty() {
-                        let rendered = visible.replace('\n', "\n    ");
-                        if from_draft {
-                            print!("{}{}{}", BOLD, GREEN, rendered);
-                        } else {
-                            print!("{}", rendered);
-                        }
-                        print!("{}", RESET);
-                        let _ = io::stdout().flush();
-                        if input.delay > 0 {
-                            wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
-                        }
-                    }
-                }
-                tokens += 1;
+        let mut verify_input = vec![anchor];
+        verify_input.extend_from_slice(&draft_tokens);
+        let n = verify_input.len() as u32;
+        let verify = sampler::argmax_matrix_program(vocab, n)?;
+
+        let pass = ForwardPass::new();
+        let geom = geometry::ensure_pages(&kv, geometry::kv_write_geometry(seq_len, n, page))?;
+        geometry::attach_kv_write(&pass, &kv, &geom);
+        let positions: Vec<u32> = (seq_len..seq_len + n).collect();
+        pass.input_tokens(&verify_input, &positions);
+        pass.sampler(&verify.program, verify.bindings(&positions)?);
+        pass.execute();
+        let verified = read_tokens(pass).await?;
+        if verified.is_empty() {
+            break;
+        }
+
+        // Accepted = anchor's own prediction + each matching draft.
+        let mut accepted_count = 1usize;
+        for i in 1..verified.len().min(draft_tokens.len() + 1) {
+            if i - 1 < draft_tokens.len() && verified[i - 1] == draft_tokens[i - 1] {
+                accepted_count += 1;
+            } else {
+                break;
             }
         }
+        let newly_accepted: Vec<u32> = verified[..accepted_count.min(verified.len())].to_vec();
+
+        // Roll back the rejected suffix — keep `accepted_count` of the `n`
+        // written tokens.
+        kv_truncate(&kv, &mut seq_len, n - accepted_count as u32);
+
+        // Grow the drafter pool + attribute draft hits (accept() reads
+        // last_proposed for the accept-rate stats).
+        drafter.accept(&newly_accepted);
+        rounds += 1;
+
+        // Render the burst: idx 0 = free pick (normal cyan), idx > 0 =
+        // draft-accepted (green/bold). Stop tokens break without rendering.
+        for (idx, &t) in newly_accepted.iter().enumerate() {
+            if stop_tokens.contains(&t) {
+                done = true;
+                break;
+            }
+            let from_draft = idx > 0;
+            if let chat::Event::Delta(s) = decoder.feed(&[t])? {
+                let visible = stripper.process(&s);
+                if !visible.is_empty() {
+                    let rendered = visible.replace('\n', "\n    ");
+                    if from_draft {
+                        print!("{}{}{}", BOLD, GREEN, rendered);
+                    } else {
+                        print!("{}", rendered);
+                    }
+                    print!("{}", RESET);
+                    let _ = io::stdout().flush();
+                    if input.delay > 0 {
+                        inferlet::sleep(std::time::Duration::from_millis(input.delay)).await;
+                    }
+                }
+            }
+            tokens += 1;
+            if tokens >= input.max_tokens {
+                done = true;
+                break;
+            }
+        }
+
+        anchor = *newly_accepted.last().unwrap_or(&anchor);
     }
 
     let elapsed = start.elapsed();
@@ -497,7 +583,7 @@ impl PromptLookup {
     }
 }
 
-impl Speculator for PromptLookup {
+impl PromptLookup {
     fn draft(&mut self) -> (Vec<u32>, Vec<u32>) {
         let drafts = self.lookup();
         self.last_proposed = drafts.len();
@@ -518,9 +604,6 @@ impl Speculator for PromptLookup {
         self.pool.extend_from_slice(accepted);
         self.cursor += accepted.len() as u32;
     }
-
-    // rollback: pool only grows via accept(), so there's nothing to undo
-    // on draft rejection. Default no-op fits.
 }
 
 // ── TUI helpers ────────────────────────────────────────────────────────

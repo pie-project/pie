@@ -8,7 +8,9 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import model
+import componentize_py_async_support
+from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
+from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 @dataclass
@@ -33,7 +35,7 @@ class Decoder:
     
     def feed(self, tokens: List[int]) -> Event:
         """
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def reset(self) -> None:
@@ -50,7 +52,7 @@ class Decoder:
 
 
 
-def create_decoder(model: model.Model) -> Decoder:
+def create_decoder() -> Decoder:
     """
     Create a decoder to detect reasoning blocks in generated tokens
     """

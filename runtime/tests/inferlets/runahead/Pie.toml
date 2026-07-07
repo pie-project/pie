@@ -1,0 +1,4 @@
+[package]
+name = "runahead"
+version = "0.1.0"
+description = "Test inferlet: run-ahead carryover (Seam A §2.1) via collect_tokens_pipelined"

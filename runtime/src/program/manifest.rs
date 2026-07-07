@@ -145,7 +145,6 @@ readme = "README.md"
 
 [runtime]
 core = "0.2.0"
-mcp = "0.2.0"
 
 [parameters]
 prompt = { type = "string", description = "The user message to complete" }
@@ -175,7 +174,6 @@ bar = "0.2.0"
         assert_eq!(manifest.package.readme, Some("README.md".to_string()));
 
         assert_eq!(manifest.runtime.get("core"), Some(&"0.2.0".to_string()));
-        assert_eq!(manifest.runtime.get("mcp"), Some(&"0.2.0".to_string()));
 
         assert_eq!(manifest.parameters.len(), 3);
         assert!(manifest.parameters.contains_key("prompt"));

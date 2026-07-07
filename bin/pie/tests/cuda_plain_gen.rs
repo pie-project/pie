@@ -45,7 +45,7 @@ async fn plain_generate_on_real_driver() -> Result<()> {
     eprintln!("[diag] program installed, launching plain generate…");
 
     let mut proc = client
-        .launch_process("generate@0.1.0".to_string(), "{}".to_string(), true, None)
+        .launch_process("generate@0.1.0".to_string(), "{}".to_string(), true)
         .await
         .context("launch")?;
     let json = proc.wait_for_return().await.context("wait_for_return")?;

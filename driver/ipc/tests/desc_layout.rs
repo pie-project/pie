@@ -1,6 +1,6 @@
 //! Layout regression tests for the macro-emitted `Pie<T>Desc` POD types.
 //!
-//! The F1 compatibility shim in `driver/{portable,cuda}/src/_bridge/`
+//! The F1 compatibility shim in `driver/{cuda,metal}/src/_bridge/`
 //! relies on the Rust `#[repr(C)] Pie<T>Desc` field order, sizes, and
 //! offsets matching the C struct declarations in `include/pie_driver_abi.h`
 //! byte-for-byte. If the macro changes how it emits Desc fields

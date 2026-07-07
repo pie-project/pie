@@ -47,7 +47,8 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     ws.norm_y        = DeviceTensor::allocate(DType::BF16, {N, H});
     ws.gate          = DeviceTensor::allocate(DType::BF16, {N, I});
     ws.up            = DeviceTensor::allocate(DType::BF16, {N, I});
-    ws.logits        = DeviceTensor::allocate(DType::BF16, {O, V});
+    ws.logits        = DeviceTensor::allocate(DType::BF16, {O + kMtpDraftRowReserve, V});
+    ws.mtp_draft_row_base = O;
     ws.probs         = DeviceTensor::allocate(DType::FP32, {O, V});
     ws.greedy_values = DeviceTensor::allocate(DType::FP32, {N});
     ws.greedy_tokens = DeviceTensor::allocate(DType::INT32, {N});

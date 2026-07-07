@@ -23,7 +23,100 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use inferlet::{Context, JsonSchema, Result, chat, model::Model, runtime, sample::Sampler, wstd};
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{self, SamplerSpec};
+use inferlet::working_set::KvWorkingSet;
+use inferlet::{carrier, chat, geometry, model, Constrain, JsonSchema, Result, Schema};
+
+async fn read_token(pass: ForwardPass) -> Result<u32> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(if bytes.len() >= 4 {
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
+    } else {
+        0
+    })
+}
+
+fn pass_carries(stop_empty: bool, max_tokens: usize, produced_token_index: usize) -> bool {
+    !(stop_empty && max_tokens == produced_token_index)
+}
+
+/// Plain chat-EOS run-ahead decode (the BASELINE path — pipelined, depth-1 rollback).
+async fn decode_pipelined(
+    kv: &KvWorkingSet,
+    seq_len: &mut u32,
+    fresh: &mut bool,
+    s: &sampler::LoweredSampler,
+    prompt: Vec<u32>,
+    max_tokens: usize,
+    stop: &[u32],
+) -> Result<Vec<u32>> {
+    let pending = if prompt.is_empty() { vec![0u32] } else { prompt };
+    let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
+    if max_tokens == 0 {
+        return Ok(out);
+    }
+    let prime_carry = pass_carries(stop.is_empty(), max_tokens, 1);
+    let mut producer = carrier::submit_pass(kv, seq_len, fresh, s, &pending, prime_carry)?;
+    let mut generated = 0usize;
+    loop {
+        let speculate = generated + 1 < max_tokens;
+        let consumer = if speculate {
+            let carry = pass_carries(stop.is_empty(), max_tokens, generated + 2);
+            Some(carrier::submit_pass(kv, seq_len, fresh, s, &[0u32], carry)?)
+        } else {
+            None
+        };
+        let token = read_token(producer).await?;
+        if stop.contains(&token) {
+            if let Some(c) = consumer {
+                carrier::discard_pass(c, seq_len).await;
+            }
+            break;
+        }
+        out.push(token);
+        generated += 1;
+        match consumer {
+            Some(c) => producer = c,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// One SEQUENTIAL grammar fire (the CONSTRAINED path — geometry + input + masked
+/// grammar sampler + execute). No carrier: the next mask depends on this token.
+fn grammar_fire(
+    kv: &KvWorkingSet,
+    seq_len: &mut u32,
+    fresh: &mut bool,
+    g: &sampler::LoweredGrammar,
+    tokens: &[u32],
+    packed_mask: &[u32],
+) -> Result<ForwardPass> {
+    let n = tokens.len() as u32;
+    let pass = ForwardPass::new();
+    if *fresh {
+        pass.fresh_generate();
+        *fresh = false;
+    }
+    let geom = geometry::ensure_pages(kv, geometry::kv_write_geometry(*seq_len, n, kv.page_size()))?;
+    geometry::attach_kv_write(&pass, kv, &geom);
+    let positions: Vec<u32> = (*seq_len..*seq_len + n).collect();
+    pass.input_tokens(tokens, &positions);
+    let decode_pos = *seq_len + n - 1;
+    pass.sampler(&g.program, g.bindings(decode_pos, packed_mask)?);
+    pass.execute();
+    *seq_len += n;
+    Ok(pass)
+}
+
+fn chat_prompt(system: &str, user: &str) -> Vec<u32> {
+    let mut v = chat::system_user(system, user);
+    v.extend(chat::cue());
+    v
+}
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -96,23 +189,19 @@ const RED: &str = "\x1b[31m";
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = runtime::models()
-        .first()
-        .cloned()
-        .ok_or("No models available")?;
-    let model = Model::load(&model_name)?;
+    let model_name = inferlet::model::name();
 
     match mode.as_str() {
         "baseline" | "plain" => {
-            run_baseline(&model, &model_name, &input).await?;
+            run_baseline(&model_name, &input).await?;
         }
         "constrained" | "smart" => {
-            run_constrained(&model, &model_name, &input).await?;
+            run_constrained(&model_name, &input).await?;
         }
         "both" | "" => {
-            let p = run_baseline(&model, &model_name, &input).await?;
+            let p = run_baseline(&model_name, &input).await?;
             println!();
-            let s = run_constrained(&model, &model_name, &input).await?;
+            let s = run_constrained(&model_name, &input).await?;
             println!();
             comparison(&p, &s);
         }
@@ -137,7 +226,7 @@ struct ModeResult {
 }
 
 // ── BASELINE: free decode + serde_json::from_str + retry on failure ───
-async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_baseline(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "BASELINE",
         YELLOW,
@@ -167,15 +256,11 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
             BOLD, YELLOW, attempt, temp, RESET
         );
 
-        let mut ctx = Context::new(model)?;
-        ctx.system(&input.system);
-        ctx.user(&format!(
-            "Extract name, email, age from this bio: {}",
-            input.bio
-        ));
-        ctx.cue();
-
-        let text = stream_attempt(&mut ctx, model, input.max_tokens, temp, input.delay).await?;
+        let prompt = chat_prompt(
+            &input.system,
+            &format!("Extract name, email, age from this bio: {}", input.bio),
+        );
+        let text = stream_attempt(&prompt, input.max_tokens, temp, input.delay).await?;
         let attempt_tokens = approximate_tokens(&text);
         total_decoded += attempt_tokens;
 
@@ -213,7 +298,7 @@ async fn run_baseline(model: &Model, model_name: &str, input: &Input) -> Result<
 }
 
 // ── CONSTRAINED: per-token logit mask from in-WASM matcher ────────────
-async fn run_constrained(model: &Model, model_name: &str, input: &Input) -> Result<ModeResult> {
+async fn run_constrained(model_name: &str, input: &Input) -> Result<ModeResult> {
     print_header(
         "CONSTRAINED",
         GREEN,
@@ -222,51 +307,52 @@ async fn run_constrained(model: &Model, model_name: &str, input: &Input) -> Resu
         &input.bio,
     );
 
-    let mut ctx = Context::new(model)?;
-    ctx.system(&input.system);
-    ctx.user(&format!(
-        "Extract name, email, age from this bio: {}",
-        input.bio
-    ));
-    ctx.cue();
+    // CONSTRAINED = the sequential grammar decode on the keep-core: the kept
+    // `constraint::GrammarConstraint` (host Matcher) computes the per-step allowed
+    // mask; `sampler::grammar_program` applies it (`argmax(mask_apply(logits,
+    // mask))`) — NOTE this GENUINELY enforces the grammar (the shipped facade
+    // computed the mask but never applied it — unmasked sampling). No run-ahead:
+    // the next mask depends on this token.
+    let vocab = model::output_vocab_size();
+    let g = sampler::grammar_program(vocab)?;
+    let mut matcher = JsonSchema(&input.schema).build_constraint()?;
+    let stop = chat::stop_tokens();
+    let prompt = chat_prompt(
+        &input.system,
+        &format!("Extract name, email, age from this bio: {}", input.bio),
+    );
 
     let start = Instant::now();
     print!("  {}>{} ", CYAN, RESET);
     let _ = io::stdout().flush();
 
-    let mut g = ctx
-        .generate(Sampler::Argmax)
-        .max_tokens(input.max_tokens)
-        .constrain_with(JsonSchema(&input.schema))?;
-    let mut decoder = chat::Decoder::new(model);
-    let mut stripper = ThinkStripper::new();
+    let kv = KvWorkingSet::new();
+    let mut seq = 0u32;
+    let mut fresh = true;
+    let mut pending = prompt;
+    let mut decoder = chat::Decoder::new();
     let mut text = String::new();
 
-    while let Some(step) = g.next()? {
-        let out = step.execute().await?;
-        if out.tokens.is_empty() {
-            continue;
+    for _ in 0..input.max_tokens {
+        let m = matcher.mask();
+        let packed: Vec<u32> = if m.is_empty() { vec![u32::MAX; g.mask_words] } else { m };
+        let pass = grammar_fire(&kv, &mut seq, &mut fresh, &g, &pending, &packed)?;
+        let token = read_token(pass).await?;
+        if stop.contains(&token) {
+            break;
         }
-        match decoder.feed(&out.tokens)? {
-            chat::Event::Delta(s) => {
-                text.push_str(&s);
-                let visible = stripper.process(&s);
-                if !visible.is_empty() {
-                    print!("{}", visible);
-                    let _ = io::stdout().flush();
-                    if input.delay > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(input.delay)).await;
-                    }
-                }
-                if try_parse_payload(&text).is_ok() {
-                    break;
-                }
-            }
+        match decoder.feed(&[token])? {
+            chat::Event::Delta(s) => text.push_str(&s),
             chat::Event::Done(s) => {
                 text = s;
                 break;
             }
             _ => {}
+        }
+        matcher.advance(&[token]);
+        pending = vec![token];
+        if try_parse_payload(&text).is_ok() {
+            break;
         }
     }
     println!();
@@ -284,56 +370,35 @@ async fn run_constrained(model: &Model, model_name: &str, input: &Input) -> Resu
     })
 }
 
+/// BASELINE = plain chat-EOS run-ahead decode (unconstrained), off the facade.
 async fn stream_attempt(
-    ctx: &mut Context,
-    model: &Model,
+    prompt: &[u32],
     max_tokens: usize,
     temperature: f32,
-    delay_ms: u64,
+    _delay_ms: u64,
 ) -> Result<String> {
     print!("  {}>{} ", CYAN, RESET);
     let _ = io::stdout().flush();
 
-    let sampler = if temperature <= 0.0 {
-        Sampler::Argmax
+    let vocab = model::output_vocab_size();
+    let spec = if temperature <= 0.0 {
+        SamplerSpec::Argmax
     } else {
-        Sampler::TopP {
-            temperature,
-            p: 0.95,
-        }
+        SamplerSpec::TopP { temperature, p: 0.95 }
     };
-    let mut g = ctx
-        .generate(sampler)
-        .max_tokens(max_tokens)
-        .stop(&chat::stop_tokens(model));
-    let mut decoder = chat::Decoder::new(model);
-    let mut stripper = ThinkStripper::new();
-    let mut text = String::new();
+    let s = sampler::sampler_program(spec, vocab)?;
+    let stop = chat::stop_tokens();
 
-    while let Some(step) = g.next()? {
-        let out = step.execute().await?;
-        if out.tokens.is_empty() {
-            continue;
-        }
-        match decoder.feed(&out.tokens)? {
-            chat::Event::Delta(s) => {
-                text.push_str(&s);
-                let visible = stripper.process(&s);
-                if !visible.is_empty() {
-                    let rendered = visible.replace('\n', "\n    ");
-                    print!("{}", rendered);
-                    let _ = io::stdout().flush();
-                    if delay_ms > 0 {
-                        wstd::task::sleep(wstd::time::Duration::from_millis(delay_ms)).await;
-                    }
-                }
-            }
-            chat::Event::Done(s) => {
-                text = s;
-                break;
-            }
-            _ => {}
-        }
+    let kv = KvWorkingSet::new();
+    let mut seq = 0u32;
+    let mut fresh = true;
+    let toks = decode_pipelined(&kv, &mut seq, &mut fresh, &s, prompt.to_vec(), max_tokens, &stop).await?;
+
+    let mut decoder = chat::Decoder::new();
+    let mut text = String::new();
+    match decoder.feed(&toks)? {
+        chat::Event::Delta(s) | chat::Event::Done(s) => text.push_str(&s),
+        _ => {}
     }
     println!();
     Ok(text)

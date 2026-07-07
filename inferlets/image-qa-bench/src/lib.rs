@@ -16,9 +16,11 @@
 //! Single mode: one `image_b64` + `question`. Batch mode: `images_b64` /
 //! `questions` arrays driven in one process (used by `--single-process-batch`).
 
+use inferlet::inference::ForwardPass;
+use inferlet::sampler::{self, LoweredSampler, SamplerSpec};
+use inferlet::working_set::KvWorkingSet;
 use inferlet::{
-    Context, FutureStringExt, Result, chat, media::Image, model::Model, pie::core::session,
-    runtime, sample::Sampler,
+    carrier, chat, media::Image, model, pie::core::session, prefill, Result,
 };
 use serde::{Deserialize, Serialize};
 
@@ -122,19 +124,17 @@ fn b64_decode(s: &str) -> Result<Vec<u8>> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    let models = runtime::models();
-    let model = Model::load(models.first().ok_or("No models available")?)?;
     let stop_tokens: Vec<u32> = if input.ignore_eos {
         Vec::new()
     } else {
-        chat::stop_tokens(&model)
+        chat::stop_tokens()
     };
 
     let batch_len = input.images_b64.len().max(input.questions.len());
     if batch_len > 0 {
         if input.wait_for_start {
             session::send("ready");
-            let _ = session::receive().wait_async().await;
+            let _ = session::receive().await;
         }
         let batch_concurrency = input
             .batch_concurrency
@@ -153,7 +153,7 @@ async fn main(input: Input) -> Result<Output> {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(&input.image_b64);
                 let question = input.questions.get(i).unwrap_or(&input.question);
-                run_one(&model, &input, image_b64, question, &stop_tokens, false)
+                run_one(&input, image_b64, question, &stop_tokens, false)
             });
             for (j, result) in futures::future::join_all(futures).await.into_iter().enumerate() {
                 let r = result?;
@@ -175,7 +175,6 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let r = run_one(
-        &model,
         &input,
         &input.image_b64,
         &input.question,
@@ -198,8 +197,67 @@ struct RunResult {
     text: String,
 }
 
+/// Read the sampled token off a finalized pass's single-`Token` output tensor.
+async fn read_token(pass: ForwardPass) -> Result<u32> {
+    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
+    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
+    Ok(if bytes.len() >= 4 {
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
+    } else {
+        0
+    })
+}
+
+/// Pipelined greedy/parametric decode collecting raw tokens (the bench counts
+/// them; no chat detok). `stop` may be EMPTY (`ignore_eos` → run to exactly
+/// `max_tokens`, the no-discard run-ahead path); when non-empty this is the
+/// depth-1 EOS pipeline (speculate + `carrier::discard_pass` on a stop, dropping
+/// the stop token). `prompt` is the trailing prompt tail; media + lead text are
+/// already prefilled into `kv`.
+async fn decode_tokens(
+    kv: &KvWorkingSet,
+    seq_len: &mut u32,
+    fresh: &mut bool,
+    s: &LoweredSampler,
+    prompt: &[u32],
+    max_tokens: usize,
+    stop: &[u32],
+) -> Result<Vec<u32>> {
+    let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
+    if max_tokens == 0 {
+        return Ok(out);
+    }
+    let prompt = if prompt.is_empty() { &[0u32][..] } else { prompt };
+    let mut producer = carrier::submit_pass(kv, seq_len, fresh, s, prompt, true)?;
+    let mut generated = 0usize;
+    loop {
+        let speculate = generated + 1 < max_tokens;
+        let consumer = if speculate {
+            Some(carrier::submit_pass(kv, seq_len, fresh, s, &[0u32], true)?)
+        } else {
+            None
+        };
+        let token = read_token(producer).await?;
+        generated += 1;
+        let mut done = stop.contains(&token);
+        if !done {
+            out.push(token);
+        }
+        if generated >= max_tokens {
+            done = true;
+        }
+        if done {
+            if let Some(c) = consumer {
+                carrier::discard_pass(c, seq_len).await;
+            }
+            break;
+        }
+        producer = consumer.expect("consumer speculated when not terminal");
+    }
+    Ok(out)
+}
+
 async fn run_one(
-    model: &Model,
     input: &Input,
     image_b64: &str,
     question: &str,
@@ -212,44 +270,59 @@ async fn run_one(
     let bytes = b64_decode(image_b64)?;
 
     // Host-side: decode + resize + patchify per the bound model (timed).
-    let image = Image::from_bytes(model, &bytes).map_err(|e| e.to_string())?;
+    let image = Image::from_bytes(&bytes).map_err(|e| e.to_string())?;
 
-    // Build the same prompt shape as `image-qa`: system → "Here is an image:" →
-    // <image span> → question → cue. `append_image` runs the vision encoder and
-    // commits the soft-token KV (timed).
-    let mut ctx = Context::new(model)?;
-    ctx.system(&input.system).user("Here is an image:");
-    ctx.append_image(&image).await?;
-    ctx.user(question).cue();
-    // Full prompt = committed rows (system/user text + image soft tokens, which
-    // `append_image` already flushed) + the still-buffered trailing text
-    // (question + cue). Do NOT flush here: `generate()` must consume the trailing
-    // buffer to produce the first token.
-    let num_prompt_tokens = ctx.seq_len() as usize + ctx.buffer().len();
+    // Build the same prompt shape as `image-qa` on the raw WIT surface: system +
+    // "Here is an image:" (deferred system → system_user) + image span prefix →
+    // prefill; image soft tokens → prefill (the vision encoder runs driver-side,
+    // timed); span suffix + question + cue = the trailing tail the first decode
+    // pass samples from.
+    let kv = KvWorkingSet::new();
+    let mut seq_len: u32 = 0;
+    let mut fresh = true;
+
+    let mut lead = chat::system_user(&input.system, "Here is an image:");
+    lead.extend(image.prefix_tokens());
+    prefill::tokens(&kv, &mut seq_len, &lead)?;
+    prefill::image(&kv, &mut seq_len, &image)?;
+
+    let mut tail = image.suffix_tokens();
+    tail.extend(chat::user(question));
+    tail.extend(chat::cue());
+    // Full prompt = committed prefill rows (text + image soft tokens) + the
+    // trailing tail (question + cue) the first decode pass consumes.
+    let num_prompt_tokens = seq_len as usize + tail.len();
 
     if honor_wait_for_start && input.wait_for_start {
         session::send("ready");
-        let _ = session::receive().wait_async().await;
+        let _ = session::receive().await;
     }
 
-    let sampler = if input.temperature <= 0.0 {
-        Sampler::Argmax
+    let s = if input.temperature <= 0.0 {
+        sampler::sampler_program(SamplerSpec::Argmax, model::output_vocab_size())?
     } else {
-        Sampler::TopP {
-            temperature: input.temperature,
-            p: input.top_p,
-        }
+        sampler::sampler_program(
+            SamplerSpec::TopP {
+                temperature: input.temperature,
+                p: input.top_p,
+            },
+            model::output_vocab_size(),
+        )?
     };
-    let mut g = ctx.generate(sampler).max_tokens(input.max_tokens).stop(stop_tokens);
 
-    let mut tokens: Vec<u32> = Vec::with_capacity(input.max_tokens);
-    while let Some(step) = g.next()? {
-        let out = step.execute().await?;
-        tokens.extend(out.tokens.iter().copied());
-    }
+    let tokens = decode_tokens(
+        &kv,
+        &mut seq_len,
+        &mut fresh,
+        &s,
+        &tail,
+        input.max_tokens,
+        stop_tokens,
+    )
+    .await?;
 
     let text = if input.return_text {
-        model.tokenizer().decode(&tokens).unwrap_or_default()
+        model::decode(&tokens).unwrap_or_default()
     } else {
         String::new()
     };

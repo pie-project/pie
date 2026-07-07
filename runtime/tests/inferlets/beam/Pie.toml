@@ -1,0 +1,10 @@
+[package]
+name = "beam"
+version = "0.1.0"
+description = "Overview §6.2 beam search (freeze / designated-child / compact): SDK-authored PTIR trace transcribed from s6_2_beam_epilogue_binds, run register->instantiate->submit->take. The M3-G2 workload."
+authors = ["In Gim <in.gim@icloud.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
