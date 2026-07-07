@@ -23,6 +23,11 @@ target_link_libraries(qwen35_mtp_bench PRIVATE pie_driver_metal_lib)
 add_executable(qwen35_tput_bench qwen35_tput_bench.cpp)
 target_link_libraries(qwen35_tput_bench PRIVATE pie_driver_metal_lib)
 
+# Double-buffered (async_eval) pipelined decode executor — Metal vLLM-style
+# submit-N+1-before-collect-N; token-identity vs the synchronous path.
+add_executable(pipelined_executor pipelined_executor.cpp)
+target_link_libraries(pipelined_executor PRIVATE pie_driver_metal_lib)
+
 # General decode-path throughput (greedy/temp/top-k/top-p/min-p/grammar) under concurrency.
 add_executable(qwen35_decode_tput qwen35_decode_tput.cpp)
 target_link_libraries(qwen35_decode_tput PRIVATE pie_driver_metal_lib)
