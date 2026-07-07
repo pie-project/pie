@@ -79,14 +79,13 @@ std::vector<sampling::SamplerParams> Executor::build_sampler_params(
     return params;
 }
 
-void Executor::run_forward(const pie_driver::PieForwardRequestView& req,
-                           pie_driver::ResponseBuilder& builder,
-                           pie_driver::PieForwardResponseView& out) {
+Executor::InflightForward Executor::submit(const pie_driver::PieForwardRequestView& req) {
     const int n_total = static_cast<int>(req.token_ids.size());
     const int n_req   = static_cast<int>(req.qo_indptr.size()) - 1;
     const int n_slots = static_cast<int>(req.sampling_indices.size());
 
-    // ── plan: stage host index arrays ──
+    // ── plan: stage host index arrays (i32_view copies them into MLX, so stg_
+    //    is free to be reused by the next submit while this forward is in flight) ──
     copy_u32(req.token_ids, stg_.token_ids);
     copy_u32(req.position_ids, stg_.positions);
     copy_u32(req.sampling_indices, stg_.logit_rows);
@@ -96,9 +95,6 @@ void Executor::run_forward(const pie_driver::PieForwardRequestView& req,
     copy_u32(req.qo_indptr, stg_.qo_indptr);
     compute_write_indices(req);
 
-    // Per-request linear-attention state slots (qwen3.6). Prefer the wire
-    // `rs_slot_ids`; for paths that don't carry them (e.g. single-request
-    // parity) fall back to identity slots 0..n_req-1.
     if (req.rs_slot_ids.size() == static_cast<std::size_t>(n_req) && n_req > 0) {
         copy_u32(req.rs_slot_ids, stg_.slot_ids);
     } else {
@@ -106,8 +102,6 @@ void Executor::run_forward(const pie_driver::PieForwardRequestView& req,
         for (int r = 0; r < n_req; ++r) stg_.slot_ids[r] = r;
     }
 
-    // ── stage: build the ForwardBatch (aggregate-init; Tensor has no
-    // default ctor so every field must be provided up front) ──
     model::ForwardBatch batch{
         /*token_ids=*/        i32_view(stg_.token_ids),
         /*positions=*/        i32_view(stg_.positions),
@@ -122,42 +116,56 @@ void Executor::run_forward(const pie_driver::PieForwardRequestView& req,
         /*n_slots=*/          n_slots,
         /*pure_decode=*/      req.single_token_mode != 0,
     };
-
-    // ── hybrid linear-attention seam (qwen3.6) — null/empty for other archs ──
     batch.lin_cache = lin_cache_;
     if (n_req > 0) batch.slot_ids = i32_view(stg_.slot_ids);
-    batch.qo_indptr_host = stg_.qo_indptr;  // host CSR for the varlen path
-    // Host paged-KV CSR so paged_attention reads its loop bounds without a
-    // per-layer GPU->CPU readback (sync barriers + mx::compile blocker).
+    batch.qo_indptr_host         = stg_.qo_indptr;
     batch.kv_page_indptr_host    = stg_.kv_page_indptr;
     batch.kv_last_page_lens_host = stg_.kv_last_page_lens;
 
-    // ── forward + sample ──
-    per_req_.assign(n_req > 0 ? n_req : 0, pie_driver::PerRequestOutput{});
-
+    // ── forward + sample to a DEVICE token (lazy), async_eval WITHOUT waiting ──
+    Tensor result = graph_.forward(batch, kv_);  // [n_slots, vocab] (or KV barrier)
     if (n_slots > 0) {
-        Tensor logits = graph_.forward(batch, kv_);  // [n_slots, vocab]
         std::vector<sampling::SamplerParams> params = build_sampler_params(req);
-        std::vector<std::uint32_t> tokens =
-            sampling::sample_tokens(logits, params, fire_counter_);
-
-        // ── pack: group per request via the sampling CSR ──
-        const auto* sp_indptr = req.sampling_indptr.data();
-        for (int r = 0; r < n_req; ++r) {
-            const int s0 = static_cast<int>(sp_indptr[r]);
-            const int s1 = static_cast<int>(sp_indptr[r + 1]);
-            per_req_[r].tokens.assign(tokens.begin() + s0, tokens.begin() + s1);
-        }
-    } else {
-        // KV-fill / prefill-only pass: still advance the cache via the graph,
-        // but produce no sampled tokens.
-        Tensor dummy = graph_.forward(batch, kv_);
-        mx::eval(dummy);
+        // sample_token_device shares the exact sampling graph as sample_tokens
+        // (host), so tokens are bit-identical; it returns the FINAL [n_slots] u32
+        // device array — collect() items it directly (no new op, §D3.2).
+        result = sampling::sample_token_device(result, params, fire_counter_);
     }
-
+    mx::async_eval(std::vector<mx::array>{result});  // non-blocking command-buffer submit
     ++fire_counter_;
+
+    // Copy the per-request response grouping (the wire view may not outlive the
+    // deferred collect).
+    const auto* sp = req.sampling_indptr.data();
+    std::vector<std::uint32_t> indptr(sp, sp + req.sampling_indptr.size());
+    return InflightForward{std::move(result), std::move(indptr), n_req, n_slots};
+}
+
+void Executor::collect(InflightForward& h, pie_driver::ResponseBuilder& builder,
+                       pie_driver::PieForwardResponseView& out) {
+    per_req_.assign(h.n_req > 0 ? h.n_req : 0, pie_driver::PerRequestOutput{});
+    // Block-read the ALREADY-async_eval'd result — eval() is the sync point on the
+    // in-flight array (no freshly-created op, or the pipeline serializes, §D3.2).
+    h.result.eval();
+    if (h.n_slots > 0) {
+        const std::uint32_t* toks = h.result.data<std::uint32_t>();
+        const auto& sp = h.sampling_indptr;
+        for (std::int32_t r = 0; r < h.n_req; ++r) {
+            const std::uint32_t s0 = sp[r], s1 = sp[r + 1];
+            per_req_[r].tokens.assign(toks + s0, toks + s1);
+        }
+    }
     builder.build(per_req_, out);
-    out.num_requests = static_cast<std::uint32_t>(n_req);
+    out.num_requests = static_cast<std::uint32_t>(h.n_req);
+}
+
+void Executor::run_forward(const pie_driver::PieForwardRequestView& req,
+                           pie_driver::ResponseBuilder& builder,
+                           pie_driver::PieForwardResponseView& out) {
+    // Synchronous path == submit + immediate collect (the sync fallback; the
+    // deferred-response serve loop calls submit/collect with N+1 in between).
+    InflightForward h = submit(req);
+    collect(h, builder, out);
 }
 
 }  // namespace pie_metal_driver
