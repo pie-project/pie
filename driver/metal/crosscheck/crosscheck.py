@@ -172,6 +172,24 @@ def diff_mtp_specdecode(metal_mtp, cuda_mtp):
     if cuda_mtp.get("schema") != metal_mtp.get("schema"):
         results.append(("schema", "CHECK",
                         f"metal={metal_mtp.get('schema')} cuda={cuda_mtp.get('schema')}"))
+    # Known-bug guard: the CUDA GDN/FLA commit-advance fold (rs_cache T1 xfail,
+    # bravo's fix pending) currently ZEROS the committed decode tail on BOTH the
+    # device fast-path and the host-round-trip (charlie, 2026-07-07). The accept
+    # LOGIC is value-correct (mean_accept ~0.67/0.78, Δ≈0) but the absolute token
+    # VALUES are garbage. Detect the all-zero generated tail and report the known
+    # bug explicitly (NOT a Metal↔CUDA divergence) so the (e) verdict is honest.
+    cg = cuda_mtp.get("generated_ids", [])
+    if cg and all(x == 0 for x in cg):
+        results.append(("generated_ids", "CUDA-BUG",
+                        f"CUDA generated tail all-zero ({len(cg)} ids) — known GDN/FLA "
+                        f"commit-advance fold bug (rs_cache T1 xfail); (e) GATED on the CUDA "
+                        f"absolute-decode fix (bravo). Metal is the correct oracle "
+                        f"(first-gen={metal_mtp.get('generated_ids',[None])[0]})."))
+        results.append(("prompt_ids", "PASS" if metal_mtp.get("prompt_ids") == cuda_mtp.get("prompt_ids")
+                        else "CHECK",
+                        f"prompt {len(cuda_mtp.get('prompt_ids', []))} ids "
+                        f"{'match' if metal_mtp.get('prompt_ids') == cuda_mtp.get('prompt_ids') else 'differ'}"))
+        return results
     for fld in fields:
         mv, cv = metal_mtp.get(fld, []), cuda_mtp.get(fld, [])
         if mv == cv:
