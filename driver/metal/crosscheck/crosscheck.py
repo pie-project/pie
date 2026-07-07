@@ -146,6 +146,48 @@ def diff_decode(metal, cuda):
     return results
 
 
+def diff_mtp_specdecode(metal_mtp, cuda_mtp):
+    """Bit-exact token-level diff of the REAL-model MTP spec-decode (Qwen3.5-0.8B,
+    greedy verify — DETERMINISTIC). With identical model+weights+prompt+greedy,
+    the drafts, per-step accepts, and committed tokens MUST be identical on Metal
+    and CUDA. Any divergence is either a real cross-backend bug OR a BF16 argmax
+    tie-break difference (MLX vs CUDA numerics) — the harness flags the first
+    divergence point + count so a human can judge. This is a STRICTER cross-check
+    than the acceptance-trend band (which tolerates ±0.10)."""
+    results = []
+    if metal_mtp is None:
+        results.append(("mtp_specdecode", "MISSING",
+                        "Metal MTP JSON absent — run: MTP_JSON=crosscheck/mtp_metal_results.json "
+                        "qwen35_mtp /tmp/qwen35 30"))
+        return results
+    fields = ["prompt_ids", "per_step_n_acc", "mtp_drafts", "generated_ids"]
+    if cuda_mtp is None:
+        for fld in fields:
+            v = metal_mtp.get(fld, [])
+            results.append((fld, "GATED", f"metal[{len(v)}] staged; awaiting CUDA mtp_specdecode"))
+        results.append(("accepted_total", "GATED",
+                        f"metal={metal_mtp.get('accepted_total')} / {metal_mtp.get('steps')} steps"))
+        return results
+    # schema guard
+    if cuda_mtp.get("schema") != metal_mtp.get("schema"):
+        results.append(("schema", "CHECK",
+                        f"metal={metal_mtp.get('schema')} cuda={cuda_mtp.get('schema')}"))
+    for fld in fields:
+        mv, cv = metal_mtp.get(fld, []), cuda_mtp.get(fld, [])
+        if mv == cv:
+            results.append((fld, "PASS", f"{len(mv)} ids bit-identical"))
+            continue
+        n = min(len(mv), len(cv))
+        first = next((i for i in range(n) if mv[i] != cv[i]), n)
+        ndiff = sum(1 for i in range(n) if mv[i] != cv[i]) + abs(len(mv) - len(cv))
+        if len(mv) != len(cv):
+            detail = f"LEN metal={len(mv)} cuda={len(cv)}"
+        else:
+            detail = f"{ndiff} diffs; first @{first}: metal={mv[first]} cuda={cv[first]}"
+        results.append((fld, "FAIL", detail))
+    return results
+
+
 def diff_mtp(metal, cuda):
     results = []
     m = metal.get("mtp", {})
@@ -187,6 +229,7 @@ def report(title, rows):
 def main():
     ap = argparse.ArgumentParser(description="Metal<->CUDA PTIR cross-check")
     ap.add_argument("--cuda", help="CUDA results JSON (charlie); omit for GATED dry-run")
+    ap.add_argument("--mtp-cuda", help="CUDA mtp_specdecode JSON (charlie); bit-exact token diff")
     ap.add_argument("--bin", default=os.path.join(HERE, "../tier0/build"),
                     help="dir with the tier-0 cert binaries (for real Metal takes)")
     ap.add_argument("--emit-metal", help="write the Metal reference JSON and exit")
@@ -208,19 +251,27 @@ def main():
         return 0
 
     cuda = json.load(open(args.cuda)) if args.cuda else None
+    # Real-model MTP spec-decode bit-exact reference (Metal) + optional CUDA side.
+    mtp_metal_path = os.path.join(HERE, "mtp_metal_results.json")
+    mtp_metal = json.load(open(mtp_metal_path)) if os.path.exists(mtp_metal_path) else None
+    mtp_cuda = json.load(open(args.mtp_cuda)) if args.mtp_cuda else None
     tallies = {}
     for t in (report("goldens (bit-identical takes)", diff_goldens(oracle, cuda)),
               report("decode paths", diff_decode(metal, cuda)),
-              report("MTP acceptance / speedup", diff_mtp(metal, cuda))):
+              report("MTP acceptance / speedup", diff_mtp(metal, cuda)),
+              report("MTP spec-decode (bit-exact token IDs + per-step accepts)",
+                     diff_mtp_specdecode(mtp_metal, mtp_cuda))):
         for k, v in t.items():
             tallies[k] = tallies.get(k, 0) + v
 
     print("\n" + "=" * 60)
-    if cuda is None:
+    if cuda is None and mtp_cuda is None:
         print("STATUS: GATED — harness staged + Metal==oracle reference loaded.")
         print("        Drop charlie's CUDA outputs in: "
-              "python3 crosscheck.py --cuda cuda_results.json")
-        print(f"        (schema: crosscheck/cuda_results.template.json)")
+              "python3 crosscheck.py --cuda cuda_results.json \\")
+        print("                                       --mtp-cuda mtp_cuda_results.json")
+        print(f"        (schemas: crosscheck/cuda_results.template.json, "
+              f"crosscheck/mtp_cuda_results.template.json)")
         return 0
     fails = tallies.get("FAIL", 0) + tallies.get("CHECK", 0)
     print(f"RESULT: {tallies}")

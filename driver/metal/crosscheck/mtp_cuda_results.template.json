@@ -1,0 +1,17 @@
+{
+  "_doc": "CUDA-side template for the Metal<->CUDA MTP spec-decode bit-exact cross-check. charlie fills this from the CUDA `mtp_specdecode` (Qwen3.5-0.8B, K=1, greedy verify) on the SAME prompt_ids as the Metal side (crosscheck/mtp_metal_results.json), then: `python3 crosscheck.py --mtp-cuda mtp_cuda_results.json`. Schema = mtp_specdecode_crosscheck_v1 (identical to the Metal emitter in driver/metal/tests/qwen35_mtp.cpp, MTP_JSON=...).",
+  "_diff": "Greedy verify is DETERMINISTIC — with identical model+weights+prompt, per_step_n_acc / mtp_drafts / generated_ids must be BIT-IDENTICAL Metal==CUDA. The harness flags the first divergence + count. A divergence is either a real cross-backend bug or a BF16 argmax tie-break difference (MLX vs CUDA numerics) — inspect the first-diff token.",
+  "_align": "prompt_ids MUST equal the Metal run's prompt_ids (760 6511 314 9338 369 11751 13 561 6511 314 6124 369) — the harness compares them as a guard. Run the CUDA mtp_specdecode with these exact ids + steps=30.",
+
+  "schema": "mtp_specdecode_crosscheck_v1",
+  "backend": "CUDA (RTX 4090) — FILL from CUDA mtp_specdecode",
+  "model": "Qwen3.5-0.8B",
+  "draft_depth_K": 1,
+  "verify": "greedy",
+  "steps": 30,
+  "accepted_total": 0,
+  "prompt_ids": [760, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 6124, 369],
+  "per_step_n_acc": ["FILL: per-fire accept count, K=1 => 0/1, length=steps"],
+  "mtp_drafts": ["FILL: the K=1 MTP draft token per fire, length=steps"],
+  "generated_ids": ["FILL: the committed/generated token sequence, length=steps"]
+}

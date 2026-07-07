@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
     int p = plen - 1;
 
     int accepted = 0, total = 0;
-    std::vector<int> gen;
+    std::vector<int> gen, drafts_seq, per_step_acc;
     for (int s = 0; s < steps; ++s) {
         // Append the current entry (hidden_p, cur=t_{p+1} at pos p+1), then draft
         // t_{p+2} = argmax(mtp_logits) with attention over the full history.
@@ -273,6 +273,8 @@ int main(int argc, char** argv) {
         bool ok = (draft == truth);
         accepted += ok; ++total;
         gen.push_back(cur);
+        drafts_seq.push_back(draft);       // per-step MTP draft (cross-check)
+        per_step_acc.push_back(ok ? 1 : 0);  // per-step accept count (K=1 ⇒ 0/1)
         if (s < 8) std::printf("  step %d: mtp_draft=%d target=%d %s\n", s, draft, truth, ok ? "ACCEPT" : "reject");
         if (std::getenv("MTP_BLOCK")) std::printf("BLOCK %d %d\n", draft, truth);
         // advance
@@ -299,11 +301,47 @@ int main(int argc, char** argv) {
             std::fprintf(f, "prompt_ids:");
             for (int t : toks) std::fprintf(f, " %d", t);
             std::fprintf(f, "\nsteps: %d\naccepted: %d\nacceptance_pct: %.1f\n", total, accepted, 100.0 * accepted / std::max(1, total));
-            std::fprintf(f, "generated_ids:");
+            std::fprintf(f, "per_step_n_acc:");
+            for (int a : per_step_acc) std::fprintf(f, " %d", a);
+            std::fprintf(f, "\nmtp_drafts:");
+            for (int d : drafts_seq) std::fprintf(f, " %d", d);
+            std::fprintf(f, "\ngenerated_ids:");
             for (int t : gen) std::fprintf(f, " %d", t);
-            std::fprintf(f, "\nnote: greedy verify — deterministic. Match acceptance + generated_ids on CUDA Qwen3.5 MTP for cross-parity.\n");
+            std::fprintf(f, "\nnote: greedy verify — deterministic. Match per_step_n_acc + mtp_drafts + generated_ids on CUDA Qwen3.5 MTP for cross-parity.\n");
             std::fclose(f);
             std::printf("  cross-check golden written: %s\n", gp);
+        }
+    }
+
+    // Machine-diffable JSON in the shared Metal↔CUDA cross-check schema
+    // (crosscheck/mtp_specdecode_crosscheck_v1). charlie's CUDA `mtp_specdecode`
+    // emits the SAME schema → `crosscheck.py --mtp-cuda <cuda.json>` bit-exact
+    // diffs prompt_ids / per_step_n_acc / mtp_drafts / generated_ids (greedy
+    // verify is deterministic ⇒ identical model+weights MUST match exactly).
+    if (const char* jp = std::getenv("MTP_JSON")) {
+        std::FILE* f = std::fopen(jp, "w");
+        if (f) {
+            auto arr = [&](const char* name, const std::vector<int>& v, bool last) {
+                std::fprintf(f, "  \"%s\": [", name);
+                for (std::size_t i = 0; i < v.size(); ++i)
+                    std::fprintf(f, "%s%d", i ? ", " : "", v[i]);
+                std::fprintf(f, "]%s\n", last ? "" : ",");
+            };
+            std::fprintf(f, "{\n");
+            std::fprintf(f, "  \"schema\": \"mtp_specdecode_crosscheck_v1\",\n");
+            std::fprintf(f, "  \"backend\": \"Metal (Apple M1 Max, MLX 0.31.2)\",\n");
+            std::fprintf(f, "  \"model\": \"Qwen3.5-0.8B\",\n");
+            std::fprintf(f, "  \"draft_depth_K\": 1,\n");
+            std::fprintf(f, "  \"verify\": \"greedy\",\n");
+            std::fprintf(f, "  \"steps\": %d,\n", total);
+            std::fprintf(f, "  \"accepted_total\": %d,\n", accepted);
+            arr("prompt_ids", toks, false);
+            arr("per_step_n_acc", per_step_acc, false);
+            arr("mtp_drafts", drafts_seq, false);
+            arr("generated_ids", gen, true);
+            std::fprintf(f, "}\n");
+            std::fclose(f);
+            std::printf("  cross-check JSON written: %s\n", jp);
         }
     }
     std::printf("%s\n", accepted > 0 ? "QWEN35_MTP_OK" : "QWEN35_MTP_FAIL");
