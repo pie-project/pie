@@ -49,3 +49,8 @@ target_link_libraries(mtp_device_resident PRIVATE pie_driver_metal_lib)
 # checkpoint m == clean sub-forward of the first m tokens (lossless commit-advance).
 add_executable(gdn_checkpoint_test gdn_checkpoint_test.cpp)
 target_link_libraries(gdn_checkpoint_test PRIVATE pie_driver_metal_lib)
+
+# GDN rewind on the REAL Qwen3.5 backbone: speculative window forward + snapshot/
+# restore rewind recovers the greedy single-step state (S_fixed==S_ref) exactly.
+add_executable(qwen35_gdn_rewind qwen35_gdn_rewind.cpp)
+target_link_libraries(qwen35_gdn_rewind PRIVATE pie_driver_metal_lib)
