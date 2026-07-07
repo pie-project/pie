@@ -10,10 +10,12 @@
 // Scope: paged-KV / standard-attention (Qwen3-0.6B via llama_like) — dependency-
 // clean (per-step KV write, no GDN recurrent state). VALUE-verified on the Metal
 // GPU: the pipelined token sequence is bit-identical to the synchronous path
-// (greedy) — the correctness gate. Single-stream latency is GPU-bound (the win
-// is bounded by MLX's per-step stream-synchronizing item(); the full "device
-// never idles" value is the continuous-batching / wave regime that hides the
-// between-batch scheduler bubble — pairs with guru's CUDA async scheduling).
+// (greedy) — the correctness gate — AND the pipelined latency matches mlx-lm's
+// async pipelining (~1.08x single-stream, 119 tok/s == decode_bench). The win is
+// the CPU-encode + between-batch host bubble hidden behind the in-flight forward;
+// it grows with host overhead (the continuous-batching / wave regime). Correct
+// overlap requires collect() to item() the ALREADY-async_eval'd array (a new op
+// in collect enqueues behind the next submit and serializes the pipeline).
 //
 // Usage: pipelined_executor <hf_path> [prefill_len=8] [steps=64]
 
@@ -74,18 +76,24 @@ struct PipelinedExecutor {
     }
 
     // Submit forward for `tok_dev` at `pos`: forward -> sample_token_device ->
-    // async_eval (the N+1-ahead submit). Returns the lazy device token.
+    // async_eval (the N+1-ahead submit). Returns the lazy device token in its
+    // FINAL (int32) form — already async_eval'd — so collect() can item() it
+    // WITHOUT creating a new op (a new op would enqueue behind the next submit
+    // on the stream thread and serialize the pipeline; mlx-lm items the
+    // already-scheduled array directly).
     mx::array submit(const mx::array& tok_dev, int pos) {
         auto b = make_batch_dev(tok_dev, pos, ps);
         attach(b);
         mx::array logits = model.graph->forward(b, *model.kv);  // [1, vocab] lazy
-        mx::array next = sampling::sample_token_device(logits, params, seed);
+        mx::array next = mx::astype(sampling::sample_token_device(logits, params, seed), mx::int32);
         mx::async_eval(std::vector<mx::array>{next});  // non-blocking command-buffer submit
         return next;
     }
-    // Block-read a submitted forward's sampled token (the sync point).
+    // Block-read a submitted forward's sampled token (the sync point). Items the
+    // already-async_eval'd array — NO new op — so the stream thread can keep
+    // encoding/committing the next forward while this blocks.
     int collect(const mx::array& tok_dev) {
-        return static_cast<int>(mx::astype(tok_dev, mx::int32).item<std::int32_t>());
+        return static_cast<int>(tok_dev.item<std::int32_t>());
     }
 };
 
