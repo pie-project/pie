@@ -28,6 +28,13 @@ target_link_libraries(qwen35_tput_bench PRIVATE pie_driver_metal_lib)
 add_executable(pipelined_executor pipelined_executor.cpp)
 target_link_libraries(pipelined_executor PRIVATE pie_driver_metal_lib)
 
+# End-to-end deferred-response serve loop — the executor double-buffer wired
+# through the production InProcServer path (build_request_view → deferred branch
+# → defer_send_ → completion thread → collect → send_response); token-identity
+# vs the synchronous run_forward path + batched throughput.
+add_executable(pipelined_service pipelined_service.cpp)
+target_link_libraries(pipelined_service PRIVATE pie_driver_metal_lib)
+
 # General decode-path throughput (greedy/temp/top-k/top-p/min-p/grammar) under concurrency.
 add_executable(qwen35_decode_tput qwen35_decode_tput.cpp)
 target_link_libraries(qwen35_decode_tput PRIVATE pie_driver_metal_lib)

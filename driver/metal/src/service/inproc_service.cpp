@@ -78,12 +78,30 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
     // each `send_response`; it lives for the whole serve loop here.
     pie_driver::ResponseBuilder response_builder;
 
+    const bool deferred = (executor_ != nullptr && executor_->supports_deferred());
+    if (deferred) {
+        start_completion_thread();
+        // Deferred-send hook (§D3): when a Forward handler sets `out.deferred`,
+        // serve_forever calls this INSTEAD of the inline send. Hand the stashed
+        // in-flight submit + (req_id, driver_id, vtable) to the completion
+        // thread; no inline send, so the serve loop recvs + submits N+1 while N
+        // runs on the GPU. (The passed `resp` is the empty desc — Metal builds
+        // the real response at completion, after collect fills the tokens.)
+        server.defer_send_ = [this](::PieInProcVTable vt, std::uint32_t req_id,
+                                    const ::PieResponseFrameDesc&) {
+            enqueue_completion(Pending{vt, req_id, pending_driver_id_,
+                                       std::move(pending_submit_)});
+        };
+    }
+
     server.serve_forever(
         [&](std::uint32_t req_id,
             const pie_driver::PieInProcRequestView& req,
             pie_driver::PieInProcResponseView& out) {
             handle_request(req_id, req, out, response_builder);
         });
+
+    if (deferred) stop_completion_thread();
 }
 
 void InProcService::handle_request(std::uint32_t req_id,
@@ -99,6 +117,17 @@ void InProcService::handle_request(std::uint32_t req_id,
             // default MLX-free raw-Metal pipeline, or the optional MLX
             // ModelGraph. Only taken once a model is loaded + attached.
             if (executor_ != nullptr) {
+                if (executor_->supports_deferred()) {
+                    // Deferred (async) path: submit N (async_eval, non-blocking),
+                    // stash it + set out.deferred so serve_forever routes to
+                    // defer_send_ → the completion thread collects N off-thread
+                    // while the serve loop submits N+1. The wave's N+1-ahead.
+                    pending_submit_    = executor_->submit(fwd);
+                    pending_driver_id_ = req.driver_id;
+                    out.deferred       = true;
+                    out.status         = 0;
+                    break;
+                }
                 executor_->run_forward(fwd, response_builder, out.forward);
                 out.status = 0;
                 break;
@@ -144,6 +173,69 @@ void InProcService::handle_request(std::uint32_t req_id,
                       << " (req_id=" << req_id << ")\n";
             out.status = 2;
             break;
+    }
+}
+
+// ── Deferred-response completion thread (§D3) ───────────────────────────────
+InProcService::~InProcService() { stop_completion_thread(); }
+
+void InProcService::start_completion_thread() {    completion_stop_ = false;
+    completion_thread_ = std::thread([this] { completion_loop(); });
+}
+
+void InProcService::stop_completion_thread() {
+    {
+        std::lock_guard<std::mutex> lk(completion_mu_);
+        completion_stop_ = true;
+    }
+    completion_cv_.notify_all();
+    if (completion_thread_.joinable()) completion_thread_.join();
+}
+
+void InProcService::enqueue_completion(Pending p) {
+    {
+        std::lock_guard<std::mutex> lk(completion_mu_);
+        completion_q_.push_back(std::move(p));
+    }
+    completion_cv_.notify_one();
+}
+
+void InProcService::completion_loop() {
+    for (;;) {
+        Pending p;
+        {
+            std::unique_lock<std::mutex> lk(completion_mu_);
+            completion_cv_.wait(
+                lk, [this] { return completion_stop_ || !completion_q_.empty(); });
+            if (completion_q_.empty()) {
+                if (completion_stop_) return;
+                continue;
+            }
+            p = std::move(completion_q_.front());
+            completion_q_.pop_front();
+        }
+        // Collect the in-flight forward OFF the serve thread (its eval() runs
+        // inside executor_->collect, keeping this TU MLX-free), then fire the
+        // response. Rule 5b: ALWAYS reach send_response — success or error.
+        pie_driver::PieInProcResponseView out{};
+        out.method = pie_driver::PIE_METHOD_FORWARD;
+        out.status = 0;
+        try {
+            if (executor_ != nullptr && p.handle) {
+                executor_->collect(*p.handle, completion_builder_, out.forward);
+            } else {
+                out.status = -1;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[pie-driver-metal] deferred collect failed for req_id="
+                      << p.req_id << ": " << e.what() << "\n";
+            out.status = -1;
+        }
+        // The response desc's slice pointers alias completion_builder_'s scratch,
+        // which stays alive across the synchronous send_response below.
+        ::PieResponseFrameDesc resp{};
+        pie_driver::build_response_desc(p.driver_id, out, resp);
+        p.vt.send_response(p.vt.ctx, p.req_id, &resp);
     }
 }
 

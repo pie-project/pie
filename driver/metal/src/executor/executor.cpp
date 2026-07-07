@@ -79,7 +79,8 @@ std::vector<sampling::SamplerParams> Executor::build_sampler_params(
     return params;
 }
 
-Executor::InflightForward Executor::submit(const pie_driver::PieForwardRequestView& req) {
+std::unique_ptr<IForwardExecutor::Inflight> Executor::submit(
+    const pie_driver::PieForwardRequestView& req) {
     const int n_total = static_cast<int>(req.token_ids.size());
     const int n_req   = static_cast<int>(req.qo_indptr.size()) - 1;
     const int n_slots = static_cast<int>(req.sampling_indices.size());
@@ -138,11 +139,14 @@ Executor::InflightForward Executor::submit(const pie_driver::PieForwardRequestVi
     // deferred collect).
     const auto* sp = req.sampling_indptr.data();
     std::vector<std::uint32_t> indptr(sp, sp + req.sampling_indptr.size());
-    return InflightForward{std::move(result), std::move(indptr), n_req, n_slots};
+    return std::make_unique<InflightForward>(std::move(result), std::move(indptr),
+                                             n_req, n_slots);
 }
 
-void Executor::collect(InflightForward& h, pie_driver::ResponseBuilder& builder,
+void Executor::collect(IForwardExecutor::Inflight& handle,
+                       pie_driver::ResponseBuilder& builder,
                        pie_driver::PieForwardResponseView& out) {
+    auto& h = static_cast<InflightForward&>(handle);
     per_req_.assign(h.n_req > 0 ? h.n_req : 0, pie_driver::PerRequestOutput{});
     // Block-read the ALREADY-async_eval'd result — eval() is the sync point on the
     // in-flight array (no freshly-created op, or the pipeline serializes, §D3.2).
@@ -164,8 +168,8 @@ void Executor::run_forward(const pie_driver::PieForwardRequestView& req,
                            pie_driver::PieForwardResponseView& out) {
     // Synchronous path == submit + immediate collect (the sync fallback; the
     // deferred-response serve loop calls submit/collect with N+1 in between).
-    InflightForward h = submit(req);
-    collect(h, builder, out);
+    std::unique_ptr<IForwardExecutor::Inflight> h = submit(req);
+    collect(*h, builder, out);
 }
 
 }  // namespace pie_metal_driver

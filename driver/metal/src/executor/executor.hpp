@@ -43,23 +43,25 @@ public:
                      pie_driver::ResponseBuilder& builder,
                      pie_driver::PieForwardResponseView& out) override;
 
-    // ── Deferred-response (double-buffer) seam ─────────────────────────────
-    // The executor-local half of the async-scheduling pipeline (Metal dual of
-    // guru's CUDA driver-internal deferred-response, §D3): submit() builds +
-    // forwards + samples device-tokens + `async_eval`s them WITHOUT waiting;
-    // collect() `item()`s the ALREADY-async_eval'd tokens (no new op — §D3.2,
-    // or the pipeline serializes) and marshals the response. `run_forward` ==
-    // submit + collect. Lets the serve loop submit forward N+1 before collecting
-    // N (the wave's N+1-ahead) so the GPU never idles between fires.
-    struct InflightForward {
+    // ── Deferred-response (double-buffer) seam (overrides IForwardExecutor) ──
+    // submit() builds + forwards + samples device-tokens + `async_eval`s them
+    // WITHOUT waiting; collect() `item()`s the ALREADY-async_eval'd array (no new
+    // op — §D3.2) and marshals the response. `run_forward` == submit + collect.
+    struct InflightForward : IForwardExecutor::Inflight {
         Tensor result;                            // [n_slots] u32 tokens, or KV barrier
         std::vector<std::uint32_t> sampling_indptr;  // response grouping (copied)
         std::int32_t n_req = 0;
         std::int32_t n_slots = 0;
+        InflightForward(Tensor r, std::vector<std::uint32_t> sp,
+                        std::int32_t nr, std::int32_t ns)
+            : result(std::move(r)), sampling_indptr(std::move(sp)), n_req(nr), n_slots(ns) {}
     };
-    InflightForward submit(const pie_driver::PieForwardRequestView& req);
-    void collect(InflightForward& h, pie_driver::ResponseBuilder& builder,
-                 pie_driver::PieForwardResponseView& out);
+    bool supports_deferred() const override { return true; }
+    std::unique_ptr<IForwardExecutor::Inflight> submit(
+        const pie_driver::PieForwardRequestView& req) override;
+    void collect(IForwardExecutor::Inflight& handle,
+                 pie_driver::ResponseBuilder& builder,
+                 pie_driver::PieForwardResponseView& out) override;
 
 private:
     // Reusable host staging buffers (refilled per fire; their storage backs
