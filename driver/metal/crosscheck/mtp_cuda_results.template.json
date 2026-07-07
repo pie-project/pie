@@ -1,17 +1,14 @@
 {
-  "_doc": "CUDA-side template for the Metal<->CUDA MTP spec-decode bit-exact cross-check. charlie fills this from the CUDA `mtp_specdecode` (Qwen3.5-0.8B, K=1, greedy verify) on the SAME prompt_ids as the Metal side (crosscheck/mtp_metal_results.json), then: `python3 crosscheck.py --mtp-cuda mtp_cuda_results.json`. Schema = mtp_specdecode_crosscheck_v1 (identical to the Metal emitter in driver/metal/tests/qwen35_mtp.cpp, MTP_JSON=...).",
-  "_diff": "Greedy verify is DETERMINISTIC — with identical model+weights+prompt, per_step_n_acc / mtp_drafts / generated_ids must be BIT-IDENTICAL Metal==CUDA. The harness flags the first divergence + count. A divergence is either a real cross-backend bug or a BF16 argmax tie-break difference (MLX vs CUDA numerics) — inspect the first-diff token.",
-  "_align": "prompt_ids MUST equal the Metal run's prompt_ids (760 6511 314 9338 369 11751 13 561 6511 314 6124 369) — the harness compares them as a guard. Run the CUDA mtp_specdecode with these exact ids + steps=30.",
+  "_doc": "CUDA-side template for the Metal<->CUDA MTP spec-decode bit-exact cross-check. charlie fills generated_ids from the CUDA `mtp-specdecode` inferlet (bin/pie/tests/cuda_mtp_specdecode_ab.rs) on the SAME prompt, then: `python3 crosscheck.py --mtp-cuda mtp_cuda_results.json`. Schema = mtp_specdecode_crosscheck_v1.",
+  "_align": "PROMPT (charlie, dev 2535e29d): 'The quick brown fox jumps over' => prompt_ids [760,3841,13477,37550,33075,888] (n=6, NO BOS). Metal committed==greedy on this prompt: generated_ids [279,5983,40289,13,198,760,3841,13477,37550,33075,888,279,5983,40289,13,198] ('the lazy dog.' then greedy-repeats the prompt). k=4, MAX_TOKENS=16, greedy verify.",
+  "_note": "committed==greedy on BOTH backends, so k (4 vs Metal's 1) does NOT change generated_ids — only fires/acceptance. So generated_ids MUST be bit-identical Metal==CUDA iff the GDN backbones agree numerically. charlie's committed INCLUDES the 6 prompt ids at the front; the harness compares generated_ids (the post-prompt tail), so paste committed[6:] here as generated_ids (or the full committed and set prompt_ids to the 6).",
 
   "schema": "mtp_specdecode_crosscheck_v1",
-  "backend": "CUDA (RTX 4090) — FILL from CUDA mtp_specdecode",
+  "backend": "CUDA (RTX 4090) — FILL from cuda_mtp_specdecode_ab.rs committed[]",
   "model": "Qwen3.5-0.8B",
-  "draft_depth_K": 1,
+  "draft_depth_K": 4,
   "verify": "greedy",
-  "steps": 30,
-  "accepted_total": 0,
-  "prompt_ids": [760, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 6124, 369],
-  "per_step_n_acc": ["FILL: per-fire accept count, K=1 => 0/1, length=steps"],
-  "mtp_drafts": ["FILL: the K=1 MTP draft token per fire, length=steps"],
-  "generated_ids": ["FILL: the committed/generated token sequence, length=steps"]
+  "steps": 16,
+  "prompt_ids": [760, 3841, 13477, 37550, 33075, 888],
+  "generated_ids": ["FILL: CUDA committed generated tail (committed[6:]), length up to MAX_TOKENS=16"]
 }
