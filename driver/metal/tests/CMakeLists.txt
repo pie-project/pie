@@ -54,3 +54,8 @@ target_link_libraries(gdn_checkpoint_test PRIVATE pie_driver_metal_lib)
 # restore rewind recovers the greedy single-step state (S_fixed==S_ref) exactly.
 add_executable(qwen35_gdn_rewind qwen35_gdn_rewind.cpp)
 target_link_libraries(qwen35_gdn_rewind PRIVATE pie_driver_metal_lib)
+
+# REAL Qwen3.5 MTP spec-decode + GDN rewind: full autoregressive window loop
+# (real MTP head drafter + verify + rewind-on-reject); committed==greedy bit-exact.
+add_executable(qwen35_mtp_specdecode qwen35_mtp_specdecode.cpp)
+target_link_libraries(qwen35_mtp_specdecode PRIVATE pie_driver_metal_lib)
