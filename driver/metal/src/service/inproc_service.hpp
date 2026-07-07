@@ -81,6 +81,7 @@ private:
     void start_completion_thread();
     void stop_completion_thread();
     void completion_loop();
+    void deliver_completion(Pending& p);
     void enqueue_completion(Pending p);
 
     std::uint32_t vocab_size_;

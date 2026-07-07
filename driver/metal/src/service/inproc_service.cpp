@@ -179,7 +179,8 @@ void InProcService::handle_request(std::uint32_t req_id,
 // ── Deferred-response completion thread (§D3) ───────────────────────────────
 InProcService::~InProcService() { stop_completion_thread(); }
 
-void InProcService::start_completion_thread() {    completion_stop_ = false;
+void InProcService::start_completion_thread() {
+    completion_stop_ = false;
     completion_thread_ = std::thread([this] { completion_loop(); });
 }
 
@@ -214,29 +215,51 @@ void InProcService::completion_loop() {
             p = std::move(completion_q_.front());
             completion_q_.pop_front();
         }
-        // Collect the in-flight forward OFF the serve thread (its eval() runs
-        // inside executor_->collect, keeping this TU MLX-free), then fire the
-        // response. Rule 5b: ALWAYS reach send_response — success or error.
-        pie_driver::PieInProcResponseView out{};
-        out.method = pie_driver::PIE_METHOD_FORWARD;
-        out.status = 0;
+        // Tier-(c) — the OUTERMOST thread-liveness guard (§D3). No exception may
+        // escape this loop: a silently-dead completion thread would strand EVERY
+        // subsequent deferred response at the runtime watchdog. Rule 5b (the
+        // per-request error-send in deliver_completion) is the inner guard; this
+        // is the thread itself. Any escape past deliver_completion is logged
+        // LOUDLY and the loop continues (only the offending request is lost).
         try {
-            if (executor_ != nullptr && p.handle) {
-                executor_->collect(*p.handle, completion_builder_, out.forward);
-            } else {
-                out.status = -1;
-            }
+            deliver_completion(p);
         } catch (const std::exception& e) {
-            std::cerr << "[pie-driver-metal] deferred collect failed for req_id="
-                      << p.req_id << ": " << e.what() << "\n";
+            std::cerr << "[pie-driver-metal] FATAL: completion thread caught an "
+                         "escaped exception (req_id="
+                      << p.req_id << "): " << e.what()
+                      << " — thread survives; that response may be stranded\n";
+        } catch (...) {
+            std::cerr << "[pie-driver-metal] FATAL: completion thread caught an "
+                         "escaped non-std exception (req_id="
+                      << p.req_id << ") — thread survives\n";
+        }
+    }
+}
+
+void InProcService::deliver_completion(Pending& p) {
+    // Collect the in-flight forward OFF the serve thread (its eval() runs inside
+    // executor_->collect, keeping this TU MLX-free), then fire the response.
+    // Rule 5b: ALWAYS reach send_response — success or error.
+    pie_driver::PieInProcResponseView out{};
+    out.method = pie_driver::PIE_METHOD_FORWARD;
+    out.status = 0;
+    try {
+        if (executor_ != nullptr && p.handle) {
+            executor_->collect(*p.handle, completion_builder_, out.forward);
+        } else {
             out.status = -1;
         }
-        // The response desc's slice pointers alias completion_builder_'s scratch,
-        // which stays alive across the synchronous send_response below.
-        ::PieResponseFrameDesc resp{};
-        pie_driver::build_response_desc(p.driver_id, out, resp);
-        p.vt.send_response(p.vt.ctx, p.req_id, &resp);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-metal] deferred collect failed for req_id="
+                  << p.req_id << ": " << e.what() << "\n";
+        out.status  = -1;
+        out.forward = pie_driver::PieForwardResponseView{};  // drop partial fill
     }
+    // The response desc's slice pointers alias completion_builder_'s scratch,
+    // which stays alive across the synchronous send_response below.
+    ::PieResponseFrameDesc resp{};
+    pie_driver::build_response_desc(p.driver_id, out, resp);
+    p.vt.send_response(p.vt.ctx, p.req_id, &resp);
 }
 
 }  // namespace pie_metal_driver::service

@@ -103,6 +103,27 @@ struct RequestFrame {
     RequestFrame& operator=(const RequestFrame&) = delete;
 };
 
+// A non-forward request (a KV D2H copy) — handled inline-synchronously by the
+// serve loop (no out.deferred) even while deferred forwards are in flight on the
+// same MLX stream. Models the contention×pipelining seam (guru's CUDA ③).
+struct CopyFrame {
+    std::vector<std::uint32_t> srcs{0};
+    std::vector<std::uint32_t> dsts{0};
+    PieFrameDesc desc{};
+
+    explicit CopyFrame(std::uint32_t driver_id) {
+        desc.driver_id    = driver_id;
+        desc.payload.kind = PIE_REQUEST_PAYLOAD_COPY;
+        auto& c = desc.payload.copy;
+        c.dir      = PieCopyDir_D2H;
+        c.resource = PieCopyResource_Kv;
+        c.srcs_ptr = srcs.data(); c.srcs_len = srcs.size();
+        c.dsts_ptr = dsts.data(); c.dsts_len = dsts.size();
+    }
+    CopyFrame(const CopyFrame&) = delete;
+    CopyFrame& operator=(const CopyFrame&) = delete;
+};
+
 // Read the single sampled token out of a packed forward response.
 std::uint32_t token_of(const PieResponseFrameDesc& resp) {
     const auto& fwd = resp.payload.forward;
@@ -218,8 +239,55 @@ int main(int argc, char** argv) {
     auto [toks_sync, ms_sync] = run_sync();
     auto [toks_pipe, ms_pipe] = run_deferred();
 
+    // ── (C) mixed traffic: interleave inline-sync copies among deferred forwards
+    //        on the SAME MLX stream (contention × pipelining). Forwards must stay
+    //        token-identical; the inline copies must NOT be stranded. ──
+    struct MixedResult { bool fwd_ok; int copies_ok; int copies_total; double ms; };
+    auto run_deferred_mixed = [&]() -> MixedResult {
+        service::InProcService svc(model.caps.vocab_size);
+        svc.set_executor(&executor);
+
+        MockTransport transport;
+        std::vector<int> fwd_idx;  // per req_id: forward index into reqs, or -1 = copy
+        std::vector<std::unique_ptr<CopyFrame>> copies;
+        for (int i = 0; i < B; ++i) {
+            transport.frames.push_back(&reqs[i]->desc);
+            fwd_idx.push_back(i);
+            if ((i % 8) == 7) {  // inject a copy mid-flight every 8 forwards
+                copies.push_back(std::make_unique<CopyFrame>(90000u + i));
+                transport.frames.push_back(&copies.back()->desc);
+                fwd_idx.push_back(-1);
+            }
+        }
+
+        PieInProcVTable vt{};
+        vt.recv = &MockTransport::recv;
+        vt.send_response = &MockTransport::send_response;
+        vt.ctx = &transport;
+        pie_driver::InProcServer server(vt);
+
+        auto t0 = Clock::now();
+        svc.serve_forever(server);
+        double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+
+        MixedResult r{true, 0, 0, ms};
+        for (std::size_t rid = 0; rid < fwd_idx.size(); ++rid) {
+            auto it = transport.tokens.find(static_cast<std::uint32_t>(rid));
+            const bool responded = (it != transport.tokens.end());
+            if (fwd_idx[rid] >= 0) {
+                if (!responded || it->second != toks_sync[fwd_idx[rid]]) r.fwd_ok = false;
+            } else {
+                ++r.copies_total;
+                if (responded) ++r.copies_ok;  // inline copy not stranded
+            }
+        }
+        return r;
+    };
+    MixedResult mixed = run_deferred_mixed();
+
     // ── verdict ──
     bool identical = (toks_sync == toks_pipe);
+    bool mixed_ok  = mixed.fwd_ok && (mixed.copies_ok == mixed.copies_total);
     std::printf("\n[svc] %d independent greedy decodes through the Metal deferred serve loop:\n", B);
     std::printf("  synchronous (run_forward loop): %8.2f ms  (%.1f req/s)\n",
                 ms_sync, B * 1000.0 / ms_sync);
@@ -228,6 +296,9 @@ int main(int argc, char** argv) {
     std::printf("  throughput ratio (sync/deferred): %.3fx\n", ms_sync / ms_pipe);
     std::printf("  token-identity (deferred == synchronous): %s  <== correctness gate\n",
                 identical ? "YES" : "NO");
+    std::printf("  mixed traffic (inline copies + deferred forwards, same stream):\n");
+    std::printf("    forwards token-identical: %s ; inline copies answered: %d/%d  <== contention seam\n",
+                mixed.fwd_ok ? "YES" : "NO", mixed.copies_ok, mixed.copies_total);
     std::printf("  first 12 tokens:");
     for (int i = 0; i < 12 && i < B; ++i) std::printf(" %u", toks_sync[i]);
     std::printf("\n");
@@ -239,6 +310,7 @@ int main(int argc, char** argv) {
                 break;
             }
     }
-    std::printf("%s\n", identical ? "SERVICE_PIPELINE_OK" : "SERVICE_PIPELINE_FAIL");
-    return identical ? 0 : 1;
+    const bool ok = identical && mixed_ok;
+    std::printf("%s\n", ok ? "SERVICE_PIPELINE_OK" : "SERVICE_PIPELINE_FAIL");
+    return ok ? 0 : 1;
 }
