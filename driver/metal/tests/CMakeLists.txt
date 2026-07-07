@@ -38,3 +38,9 @@ target_link_libraries(pipelined_service PRIVATE pie_driver_metal_lib)
 # General decode-path throughput (greedy/temp/top-k/top-p/min-p/grammar) under concurrency.
 add_executable(qwen35_decode_tput qwen35_decode_tput.cpp)
 target_link_libraries(qwen35_decode_tput PRIVATE pie_driver_metal_lib)
+
+# Device-resident MTP spec-decode MACHINERY (std-attention, dependency-clean) —
+# the Metal dual of the CUDA fully-pipelined MTP: on-device verify DAG + [K+1]
+# window mx::array carrier + back-to-back async_eval; committed==greedy gate.
+add_executable(mtp_device_resident mtp_device_resident.cpp)
+target_link_libraries(mtp_device_resident PRIVATE pie_driver_metal_lib)
