@@ -2438,6 +2438,16 @@ bool handle_fire_batch(
                 slot_ids_h[r] = executor.graph_pad_slot;
                 is_fresh_h[r] = 0u;
             }
+            const int max_rs_slots = executor.rs_cache->max_slots();
+            for (int r = 0; r < slot_count; ++r) {
+                if (slot_ids_h[r] < 0 || slot_ids_h[r] >= max_rs_slots) {
+                    throw std::runtime_error(
+                        "rs_cache slot id " + std::to_string(slot_ids_h[r]) +
+                        " for request " + std::to_string(r) +
+                        " is outside allocated slot range [0, " +
+                        std::to_string(max_rs_slots) + ")");
+                }
+            }
             pi.slot_ids.copy_from_host(std::span<const std::int32_t>(slot_ids_h));
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
         }
