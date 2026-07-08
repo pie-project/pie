@@ -40,6 +40,7 @@
 #include "model/qwen3_forward.hpp"
 #include "ops/gemm.hpp"
 #include "kernels/argmax.hpp"
+#include "kernels/pack_dense_mask.hpp"
 #include "kernels/sample_temp.hpp"
 #include "sampler_type.hpp"
 #include "sampling_dispatch.hpp"
@@ -771,6 +772,22 @@ void run_mtp_draft_with_argmax(
 // → each step's [vocab] bf16 lands in ws.logits[0], which we argmax (next token) and
 // scatter to the reserved draft row. Row 0 is a live target logit row, so we
 // save/restore it around the chain.
+//
+// BREADCRUMB (step 1 sampling_ir removal): this helper is CURRENTLY UNCALLED. Its
+// only caller was the legacy sampling_ir program-run block that fed the sampling_ir
+// MtpLogits/MtpDrafts intrinsics — a path already DEAD before removal
+// (`sampling_program_bytes` is only ever `Vec::new()` in the runtime, so the block
+// never ran). Current MTP state after this removal:
+//   * MtpLOGITS: LIVE via PTIR — driver/cuda/src/ptir/bound.hpp PTIR_INTR_MTP_LOGITS=1,
+//     tier0_runner reads the K draft rows; plus the native drafter
+//     (`system_drafter.draft_step`), both untouched by step 1.
+//   * device-resident MtpDRAFTS: NOT implemented in the driver PTIR path — its
+//     intrinsic enum (ptir/trace.hpp, ptir_abi.h) has NO MtpDrafts; only the Rust
+//     interface/ptir defines MtpDrafts=6. The device-resident drafts source-select
+//     removed here has NO PTIR equivalent yet — a candidate for future re-expression
+//     as a first-class driver PTIR intrinsic if the feature is revived.
+// Kept (not deleted) so a future PTIR MTP-logits producer can reuse it; delete if
+// that never lands.
 bool produce_mtp_draft_logits(
     Executor& executor,
     int K,
@@ -1817,21 +1834,6 @@ struct SamplePlanInputs {
     bool is_pure_decode = false;
     bool have_custom_mask = false;
     bool has_spec_drafts = false;
-    bool has_custom_program = false;
-    // #12 phase-1: a standard sampler program recognized from the (migrated)
-    // program contract. When set, the program's dedicated-kernel params have been
-    // extracted into the fields below; the per-slot loop seeds `per_slot_*` from
-    // them (the program carries no legacy slot params) so the flag-set + dispatch
-    // route the fire to the SAME kernel a slot fire would (FlashInfer top-p /
-    // sample_temp min-p / greedy argmax / BakedIR temp) instead of falling through
-    // to CustomJIT. An unrecognized program keeps has_custom_program=true →
-    // CustomJIT. Seed stays ambient (`pi.sample_seed`; seed_view empty →
-    // fresh_sampling_seed, exactly as the pre-migration multisamp slot fire).
-    bool program_recognized = false;
-    float rec_temp = 1.0f;
-    float rec_top_p = 1.0f;
-    float rec_min_p = 0.0f;
-    std::int32_t rec_top_k = 0;
 };
 
 // Per-fire decisions emitted by the sample-plan phase. The spans on
@@ -1849,16 +1851,6 @@ struct SamplePlanResult {
     bool compact_logit_rows = false;
     bool tp_greedy_argmax = false;
     bool single_gpu_greedy_argmax = false;
-    // De-hardwiring (Task #4 / WS5 #7, env-gated PIE_DEHARDWIRE_STD_SAMPLERS):
-    // a fire whose every sampling row recognizes to a BakedIR kind (per the
-    // dispatch scorecard — temperature today) is routed through the driver-baked
-    // IR program over the full [N,V] block instead of the legacy `sample_temp`.
-    // Restricted to the dense pure-decode case (contiguous sampling rows, the
-    // M=1-decode MVP); mixed/compact fires fall to the legacy ladder. The IR
-    // path falls back to the legacy sampler on any non-Handled status.
-    bool dehardwire_baked_ir = false;
-    sampling_ir::StandardSamplerKind dehardwire_kind =
-        sampling_ir::StandardSamplerKind::Temperature;
     int logit_rows_required = 0;
     int prob_rows_required = 0;
 };
@@ -2088,22 +2080,19 @@ SamplePlanResult build_sample_plan(
                 const std::uint32_t type =
                     (s_idx < in.types_view.size()) ? in.types_view[s_idx] : 1u;
                 per_slot_type[k] = type;
-                const float T = in.program_recognized ? in.rec_temp
-                    : (s_idx < in.temp_view.size()) ? h_temp[s_idx] : 1.f;
-                float Tp = in.program_recognized ? in.rec_top_p
-                    : (s_idx < in.top_p_view.size()) ? h_top_p[s_idx] : 1.f;
+                const float T =
+                    (s_idx < in.temp_view.size()) ? h_temp[s_idx] : 1.f;
+                float Tp =
+                    (s_idx < in.top_p_view.size()) ? h_top_p[s_idx] : 1.f;
                 // Defensive (#7 boundary): valid top_p ∈ (0,1]; "no top-p" = 1.0
                 // (the driver default — confirmed: a non-top-p fire reads pi.top_p
                 // = 1.0, so top_p<=0 never occurs in prod). A degenerate top_p<=0
-                // (adversarial / full-param-space) clamps to no-filter (1.0),
-                // matching the recognizer's `0<top_p<1` so the dispatch agreement
-                // holds on every input incl. hotel's boundary fires. Never fires
-                // on a real fire; the recognizer (infer_kind) is left unchanged.
+                // (adversarial / full-param-space) clamps to no-filter (1.0).
                 if (Tp <= 0.f) Tp = 1.f;
-                const float Mp = in.program_recognized ? in.rec_min_p
-                    : (s_idx < in.min_p_view.size()) ? h_min_p[s_idx] : 0.f;
-                const std::int32_t Tk_raw = in.program_recognized ? in.rec_top_k
-                    : (s_idx < in.top_k_view.size())
+                const float Mp =
+                    (s_idx < in.min_p_view.size()) ? h_min_p[s_idx] : 0.f;
+                const std::int32_t Tk_raw =
+                    (s_idx < in.top_k_view.size())
                         ? static_cast<std::int32_t>(h_top_k[s_idx]) : 0;
                 const std::int32_t Tk =
                     (Tk_raw == 0) ? executor.loaded_model.hf_config().vocab_size : Tk_raw;
@@ -2161,30 +2150,21 @@ SamplePlanResult build_sample_plan(
         }
     }
 
-    // #7 (de-hardwiring LIVE): the recognizer is the SOLE dispatch flag source.
-    // Per fire, recognize each sampling slot's kind (infer_sampler_kind over the
-    // per-slot params) and derive the dispatch flag-set (all_rows_greedy /
-    // any_topk_topp) that the ~20 downstream readers consume. The fixed
-    // sampler_type→kernel flag computation is DELETED — the recognizer + the
-    // dispatch table replace it (verified token-exact across every kind: both
-    // safety nets green, §2f re-bench perf-neutral-or-better). On the fast-greedy
-    // path per_slot is empty but the fire is all-argmax by construction.
+    // Direct dispatch classify (post sampling-IR removal): greedy ⟺ temperature
+    // is 0 (argmax); a fire needs the top-k/top-p kernel iff any slot's wire
+    // sampler type is TopK/TopP/TopKTopP. Conservative and correctness-safe (a
+    // worst-case minor perf edge). On the fast-greedy path per_slot is empty but
+    // the fire is all-argmax by construction.
     if (num_sampling > 0) {
         bool all_greedy = true;
         bool any_topk_topp = false;
         if (!fast_dense_greedy_argmax) {
-            const std::int32_t vocab =
-                executor.loaded_model.hf_config().vocab_size;
             for (int k = 0; k < num_sampling; ++k) {
-                const sampling_ir::StandardSamplerKind kind =
-                    sampling_ir::infer_sampler_kind(sampling_ir::params_from_slot(
-                        per_slot_temp[k], per_slot_top_k[k], per_slot_top_p[k],
-                        per_slot_min_p[k], vocab));
-                if (kind != sampling_ir::StandardSamplerKind::Argmax)
-                    all_greedy = false;
-                if (kind == sampling_ir::StandardSamplerKind::TopK ||
-                    kind == sampling_ir::StandardSamplerKind::TopP ||
-                    kind == sampling_ir::StandardSamplerKind::TopKTopP)
+                if (per_slot_temp[k] != 0.f) all_greedy = false;
+                const std::uint32_t t = per_slot_type[k];
+                if (t == static_cast<std::uint32_t>(SamplerType::TopK) ||
+                    t == static_cast<std::uint32_t>(SamplerType::TopP) ||
+                    t == static_cast<std::uint32_t>(SamplerType::TopKTopP))
                     any_topk_topp = true;
             }
         }
@@ -2194,7 +2174,6 @@ SamplePlanResult build_sample_plan(
 
     out.compact_logit_rows =
         executor.forward_fn.supports_compact_logits &&
-        !in.has_custom_program &&  // a custom IR program reads the full [N,V] block
         !in.is_pure_decode &&
         !in.have_custom_mask &&
         !out.has_msgpack_only_slots &&
@@ -2225,59 +2204,6 @@ SamplePlanResult build_sample_plan(
         out.all_slots_token &&
         out.all_rows_greedy &&
         out.sample_rows_are_dense;
-    // De-hardwiring gate (env, default-off): a fire whose every sampling row
-    // recognizes to a BakedIR kind (temperature, per the dispatch scorecard) is
-    // routed to the driver-baked IR program over the full [N,V] block (Task #4 —
-    // temp is the ~2× win vs `sample_temp`). MVP-restricted to the dense
-    // pure-decode case so the [N,V] block is contiguous (sampling row r =
-    // workspace row r, sample_row 0) and `pi.sample_temp`/`pi.sample_seed`
-    // (uploaded pre-sampling) index 1:1; mixed/compact fires fall to legacy.
-    // `single_gpu_greedy_argmax`/`sample_temp` stay as the fallback (used iff
-    // try_run doesn't Handle). The graph is disabled at its site so the forward
-    // emits logits the IR samples over (parallel to the argmax path).
-    // #7 DEFAULT-ON (de-hardwiring WIN live): temp routes through the baked IR
-    // program by default (the 0.52× win — hotel three-rung signed-off, delta §2f
-    // benched, token-exact [271,...] either way). `PIE_DEHARDWIRE_STD_SAMPLERS=0`
-    // is a one-line revert escape-hatch for the first production window (delete in
-    // a follow-up once stable). Only temp qualifies (dispatch_target(Temperature)
-    // =BakedIR); min_p/argmax/top-k/p → DedicatedKernel → fall to their kernels.
-    static const char* dehardwire_env =
-        std::getenv("PIE_DEHARDWIRE_STD_SAMPLERS");
-    static const bool dehardwire_std =
-        dehardwire_env == nullptr || std::strcmp(dehardwire_env, "0") != 0;
-    out.dehardwire_baked_ir = false;
-    if (dehardwire_std && num_sampling > 0 && out.sample_rows_are_dense &&
-        out.all_slots_token && !out.all_rows_greedy && in.is_pure_decode &&
-        !out.any_topk_topp && !in.have_custom_mask &&
-        in.logit_masks_view.empty() && !in.has_spec_drafts &&
-        !in.has_custom_program) {
-        const std::int32_t vocab =
-            executor.loaded_model.hf_config().vocab_size;
-        bool all_baked_ir = true;
-        sampling_ir::StandardSamplerKind kind0 =
-            sampling_ir::StandardSamplerKind::Temperature;
-        for (int k = 0; k < num_sampling; ++k) {
-            const sampling_ir::SamplerParams pp = sampling_ir::params_from_slot(
-                per_slot_temp[k], per_slot_top_k[k], per_slot_top_p[k],
-                per_slot_min_p[k], vocab);
-            const sampling_ir::StandardSamplerKind kind =
-                sampling_ir::infer_sampler_kind(pp);
-            // #10: every row must be a BakedIR kind (temperature today; +min-p
-            // after #7). Mixed BakedIR kinds are allowed — the IR-hook partitions
-            // them by program. A DedicatedKernel/custom row → keep legacy.
-            if (k == 0) kind0 = kind;
-            if (sampling_ir::dispatch_target(kind) !=
-                sampling_ir::DispatchTarget::BakedIR) {
-                all_baked_ir = false;
-                break;
-            }
-        }
-        if (all_baked_ir) {
-            out.dehardwire_baked_ir = true;
-            out.dehardwire_kind = kind0;  // informational; IR-hook re-recognizes per group
-            out.compact_logit_rows = false;  // IR needs the full [N,V] block
-        }
-    }
     out.logit_rows_required =
         num_sampling == 0 ? 0
         : out.compact_logit_rows ? num_sampling
@@ -2453,56 +2379,6 @@ inline void g3_free_retained_links(Executor& executor,
     }
 }
 
-// Drafts-channel (`pipeline_source_kind == 1`) retain at the FRESH per-fire point.
-// The IR program's out_scratch (`last_output_ptrs`) is REUSED + overwritten by the
-// NEXT fire, and the merged IR dispatch marshals + RETURNS before the legacy
-// post-sample retain site (the per-req `pi.sampled` loop) — so that site reads a
-// STALE out_scratch for a drafts fire (its consumer then reads a prior fire's
-// leftover, or a zeroed buffer). Composing the window HERE — right after this fire's
-// program ran + synced — captures its OWN fresh output. The program emits
-// `[commit[k+1], drafts[k], seed]`; retain `[seed, drafts[k]]` as out[2]=seed→row0,
-// out[1]=drafts[k]→rows1..k. Per-link copy on the FIFO copy-stream ⇒ WAR-impossible.
-// No-op unless the 3 outputs are present (a non-drafts fire).
-inline void retain_drafts_window(Executor& executor,
-                                 std::uint32_t link,
-                                 std::span<void* const> out_ptrs,
-                                 const sampling_ir::ProgramInterface* iface,
-                                 cudaStream_t stream) {
-    if (link == 0 || out_ptrs.size() < 3 || iface == nullptr ||
-        iface->outputs.size() < 3)
-        return;
-    const std::size_t k = iface->outputs[1].elem_count;  // drafts [k]
-    const std::size_t k1 = k + 1;                         // [seed, drafts]
-    Executor::RetainedSampled& ret = executor.retained_next_input[link];
-    if (ret.copy.size() < k1)
-        ret.copy = DeviceBuffer<std::int32_t>::alloc(k1);
-    if (ret.done == nullptr) CUDA_CHECK(cudaEventCreate(&ret.done));
-    CUDA_CHECK(cudaMemcpyAsync(ret.copy.data(), out_ptrs[2], sizeof(std::int32_t),
-                               cudaMemcpyDeviceToDevice, stream));    // seed → row 0
-    CUDA_CHECK(cudaMemcpyAsync(ret.copy.data() + 1, out_ptrs[1],
-                               sizeof(std::int32_t) * k,
-                               cudaMemcpyDeviceToDevice, stream));    // drafts[k] → rows 1..k
-    CUDA_CHECK(cudaEventRecord(ret.done, stream));
-}
-
-// Look up request `member`'s pipeline-source link + kind from the wire view and, if
-// it is a drafts producer (kind == 1), retain its `[k+1]` window from the FRESH
-// program output. Called at each IR-dispatch marshal point (the merged paths return
-// before the legacy 4290 retain). Safe no-op for a non-drafts / unlinked request.
-inline void retain_drafts_window_for_member(Executor& executor,
-                                            const pie_driver::PieForwardRequestView& view,
-                                            std::uint32_t member,
-                                            cudaStream_t stream) {
-    const auto psl_v = view.pipeline_source_links.as<std::uint32_t>();
-    const auto psk_v = view.pipeline_source_kinds.as<std::uint8_t>();
-    const std::uint8_t sk =
-        (member < psk_v.size()) ? psk_v[member] : view.pipeline_source_kind;
-    if (sk != 1 || member >= psl_v.size() || psl_v[member] == 0) return;
-    retain_drafts_window(executor, psl_v[member],
-                         executor.sampling_ir_runtime.last_output_ptrs(),
-                         executor.sampling_ir_runtime.last_interface(), stream);
-}
-
 // Drain ready deferred measurements: for each pending item whose `idle_to`
 // first-kernel event has completed (⇒ `idle_from` retire event too — same
 // stream, later), compute the device-idle µs gap and (once per response) stamp
@@ -2631,8 +2507,8 @@ void handle_fire_batch(
         const auto tok_view_orig   = view.token_ids.as<std::uint32_t>();
         const auto pos_view_orig   = view.position_ids.as<std::uint32_t>();
         const auto qo_view_orig    = view.qo_indptr.as<std::uint32_t>();
-        const auto kvpi_view = view.kv_page_indices.as<std::uint32_t>();
-        const auto kvpp_view = view.kv_page_indptr.as<std::uint32_t>();
+        const auto kvpi_view_wire = view.kv_page_indices.as<std::uint32_t>();
+        const auto kvpp_view_wire = view.kv_page_indptr.as<std::uint32_t>();
         const auto kvlpl_view_orig = view.kv_last_page_lens.as<std::uint32_t>();
 
         const auto sidx_view_orig  = view.sampling_indices.as<std::uint32_t>();
@@ -2663,7 +2539,35 @@ void handle_fire_batch(
         const auto spec_iptr_view = view.spec_indptr.as<std::uint32_t>();
         const bool has_spec_drafts = !spec_tok_view.empty();
 
-        const int R = static_cast<int>(qo_view_orig.size()) - 1;
+        // ── W1.1: pre-forward device-geometry descriptor resolution ──────
+        // A device-geometry PTIR fire (a descriptor port binds a CHANNEL) ships
+        // EMPTY wire geometry; the driver mirrors the runtime's `map_geometry` by
+        // reading the program's port channels at fire time and feeds the resolved
+        // FireGeometry into the standard batch assembly below — no program-specific
+        // assembly (owner constraint §3.1). A not-ready descriptor channel fails
+        // the fire (W1.6). Legacy / const-port fires resolve nothing (dg_resolved
+        // = false, empty *err) and use the wire geometry unchanged.
+        ptir::FireGeometry fg;
+        bool dg_resolved = false;
+        if (!view.ptir_program_hashes.empty()) {
+            if (!executor.ptir_dispatch)
+                executor.ptir_dispatch = std::make_unique<ptir::PtirDispatch>();
+            std::string dg_err;
+            dg_resolved = executor.ptir_dispatch->resolve_descriptors(
+                view, static_cast<std::uint32_t>(kv_cache.page_size()), fg, &dg_err);
+            if (!dg_resolved && !dg_err.empty()) {
+                std::cerr << "[pie-driver-cuda] " << dg_err << "\n";
+                out_resp = pie_driver::PieForwardResponseView{};
+                return;
+            }
+        }
+
+        // R (lane count) from the ACTIVE geometry: fg for a device-geometry fire
+        // (wire qo is empty), else the wire. Computed before `expand_spec_batch`
+        // so a device-geometry fire (empty wire qo ⇒ wire R=-1) doesn't feed a
+        // negative R into the spec expansion.
+        const int R = static_cast<int>(
+            dg_resolved ? fg.qo_indptr.size() : qo_view_orig.size()) - 1;
 
         // Spec-decoding batch expansion. When `has_spec_drafts` is false
         // the result has empty vectors and `verify_slot_start[r] == -1`
@@ -2682,14 +2586,16 @@ void handle_fire_batch(
         const std::vector<int>& verify_slot_start = spec.verify_slot_start;
         const std::vector<int>& verify_n_drafts   = spec.verify_n_drafts;
 
-        // Active views: spec-expanded if drafts present, else direct
-        // wire. The rest of the function uses these.
-        const std::span<const std::uint32_t> tok_view   = spec.has_drafts ? std::span<const std::uint32_t>(spec.tokens)               : tok_view_orig;
-        const std::span<const std::uint32_t> pos_view   = spec.has_drafts ? std::span<const std::uint32_t>(spec.positions)            : pos_view_orig;
-        const std::span<const std::uint32_t> qo_view    = spec.has_drafts ? std::span<const std::uint32_t>(spec.qo_indptr)            : qo_view_orig;
-        const std::span<const std::uint32_t> kvlpl_view = spec.has_drafts ? std::span<const std::uint32_t>(spec.kv_last_page_lens)    : kvlpl_view_orig;
-        const std::span<const std::uint32_t> sidx_view  = spec.has_drafts ? std::span<const std::uint32_t>(spec.sampling_indices)     : sidx_view_orig;
-        const std::span<const std::uint32_t> sptr_view  = spec.has_drafts ? std::span<const std::uint32_t>(spec.sampling_indptr)      : sptr_view_orig;
+        // Active views: device-geometry (fg) takes precedence, then spec-expanded
+        // if drafts present, else direct wire. The rest of the function uses these.
+        const std::span<const std::uint32_t> tok_view   = dg_resolved ? std::span<const std::uint32_t>(fg.token_ids)         : spec.has_drafts ? std::span<const std::uint32_t>(spec.tokens)               : tok_view_orig;
+        const std::span<const std::uint32_t> pos_view   = dg_resolved ? std::span<const std::uint32_t>(fg.position_ids)      : spec.has_drafts ? std::span<const std::uint32_t>(spec.positions)            : pos_view_orig;
+        const std::span<const std::uint32_t> qo_view    = dg_resolved ? std::span<const std::uint32_t>(fg.qo_indptr)         : spec.has_drafts ? std::span<const std::uint32_t>(spec.qo_indptr)            : qo_view_orig;
+        const std::span<const std::uint32_t> kvpi_view  = dg_resolved ? std::span<const std::uint32_t>(fg.kv_page_indices)   : kvpi_view_wire;
+        const std::span<const std::uint32_t> kvpp_view  = dg_resolved ? std::span<const std::uint32_t>(fg.kv_page_indptr)    : kvpp_view_wire;
+        const std::span<const std::uint32_t> kvlpl_view = dg_resolved ? std::span<const std::uint32_t>(fg.kv_last_page_lens) : spec.has_drafts ? std::span<const std::uint32_t>(spec.kv_last_page_lens)    : kvlpl_view_orig;
+        const std::span<const std::uint32_t> sidx_view  = dg_resolved ? std::span<const std::uint32_t>(fg.sampling_indices)  : spec.has_drafts ? std::span<const std::uint32_t>(spec.sampling_indices)     : sidx_view_orig;
+        const std::span<const std::uint32_t> sptr_view  = dg_resolved ? std::span<const std::uint32_t>(fg.sampling_indptr)   : spec.has_drafts ? std::span<const std::uint32_t>(spec.sampling_indptr)      : sptr_view_orig;
         const std::span<const std::uint32_t> rns_view   = spec.has_drafts ? std::span<const std::uint32_t>(spec.request_num_samplers) : rns_view_orig;
         const std::span<const std::uint32_t> types_view = spec.has_drafts ? std::span<const std::uint32_t>(spec.sampler_types)        : types_view_orig;
         const std::span<const std::uint32_t> top_k_view = spec.has_drafts ? std::span<const std::uint32_t>(spec.sampler_top_k)        : top_k_view_orig;
@@ -2874,6 +2780,61 @@ void handle_fire_batch(
             }
         }
 
+        // ── W1.3: device-geometry AttnMask → FlashInfer packed custom mask ──
+        // A device-geometry fire may carry a DENSE [lanes, stride] per-cell mask
+        // on its AttnMask descriptor port (resolved into fg.mask). Pack it to
+        // FlashInfer's bit-packed custom mask (launch_pack_dense_mask) INTO
+        // pi.custom_mask, so the standard custom-mask forward path consumes it
+        // exactly like a BRLE-decoded wire mask. DORMANT unless a device-geometry
+        // program binds an AttnMask channel (fg.has_mask); the guest producer is
+        // W2.1. Correctness is validated once a real device-geometry fire exists.
+        if (dg_resolved && fg.has_mask && !fg.mask.empty()) {
+            const int lanes = static_cast<int>(qo_view.size()) - 1;
+            if (lanes > 0 &&
+                fg.mask.size() % static_cast<std::size_t>(lanes) == 0) {
+                const int stride =
+                    static_cast<int>(fg.mask.size() / static_cast<std::size_t>(lanes));
+                const std::uint32_t page =
+                    static_cast<std::uint32_t>(kv_cache.page_size());
+                // Per-lane physical KV span klen[l] from the resolved page geometry,
+                // and the packed byte-offset CSR (ceil(klen/8) per lane).
+                std::vector<std::uint32_t> klen(static_cast<std::size_t>(lanes), 0);
+                std::vector<std::int32_t> mindptr(static_cast<std::size_t>(lanes) + 1, 0);
+                for (int l = 0; l < lanes; ++l) {
+                    const std::uint32_t np =
+                        (l + 1 < static_cast<int>(fg.kv_page_indptr.size()))
+                            ? fg.kv_page_indptr[l + 1] - fg.kv_page_indptr[l] : 0u;
+                    const std::uint32_t lpl =
+                        (l < static_cast<int>(fg.kv_last_page_lens.size()))
+                            ? fg.kv_last_page_lens[l] : 0u;
+                    klen[l] = np == 0 ? 0u : (np - 1) * page + lpl;
+                    mindptr[l + 1] = mindptr[l] +
+                        static_cast<std::int32_t>((klen[l] + 7u) / 8u);
+                }
+                const std::size_t packed_bytes =
+                    static_cast<std::size_t>(mindptr[lanes]);
+                if (packed_bytes > 0 &&
+                    packed_bytes <= pi.custom_mask.size() &&
+                    static_cast<std::size_t>(lanes) + 1 <= pi.custom_mask_indptr.size()) {
+                    auto kvm_dev = DeviceBuffer<std::uint8_t>::from_bytes(
+                        std::span<const std::uint8_t>(fg.mask));
+                    auto klen_dev = DeviceBuffer<std::uint32_t>::from_host(
+                        std::span<const std::uint32_t>(klen));
+                    pi.custom_mask_indptr.copy_from_host(
+                        std::span<const std::int32_t>(mindptr));
+                    CUDA_CHECK(cudaMemsetAsync(pi.custom_mask.data(), 0,
+                                               packed_bytes, cublas.stream()));
+                    kernels::launch_pack_dense_mask(
+                        kvm_dev.data(), klen_dev.data(),
+                        pi.custom_mask_indptr.data(), pi.custom_mask.data(),
+                        lanes, stride, cublas.stream());
+                    have_custom_mask = true;
+                    mask_bytes = static_cast<int>(packed_bytes);
+                    mask_indptr_count = lanes + 1;
+                }
+            }
+        }
+
         // Linear-attention rs_cache slots. Runtime owns slot assignment;
         // RS-capable models must receive one slot id per request.
         std::vector<std::int32_t> slot_ids_h;
@@ -2931,96 +2892,6 @@ void handle_fire_batch(
             executor.rs_cache->set_verify_frozen(rs_frozen_verify);
         }
 
-        // ── #12 phase-1: recognize a standard sampler program ───────────
-        // The contract migration (#15) moved the sampler slot→program: a fire
-        // now carries the sampler as a bytecode program (with the legacy slot
-        // params EMPTY). Hash the program against the driver's own baked
-        // standard programs (`pie_standard_samplers.h`); a match → extract its
-        // dedicated-kernel params and plan the fire as the equivalent slot fire,
-        // restoring the pre-migration dispatch (FlashInfer top-p / sample_temp
-        // min-p / greedy argmax / BakedIR temp). A miss → a genuine custom
-        // program → CustomJIT via `try_run`, unchanged. Without this, every
-        // standard program falls through to CustomJIT (SplitMix64-Gumbel) ≠ the
-        // FlashInfer the slot fire used → silent token divergence.
-        bool program_recognized = false;
-        sampling_ir::DedicatedParams rec_params;
-        const bool prog_attached =
-            view.sampling_program_bytes_indptr.size() >= 2 &&
-            !view.sampling_program_bytes.empty();
-        if (prog_attached && num_sampling > 0) {
-            const std::uint32_t vocab = static_cast<std::uint32_t>(
-                executor.loaded_model.hf_config().vocab_size);
-            // Built once per vocab (fixed per model); per-fire = O(table) hash compare.
-            static thread_local std::uint32_t recog_vocab = 0;
-            static thread_local std::vector<sampling_ir::StandardKindEntry> recog_table;
-            if (recog_table.empty() || recog_vocab != vocab) {
-                recog_table = sampling_ir::build_standard_kind_table(vocab);
-                recog_vocab = vocab;
-            }
-            const std::uint32_t blo = view.sampling_program_bytes_indptr.data()[0];
-            const std::uint32_t bhi = view.sampling_program_bytes_indptr.data()[1];
-            const std::uint8_t* const prog_bc = view.sampling_program_bytes.data() + blo;
-            const std::size_t prog_len = static_cast<std::size_t>(bhi - blo);
-            // #25: ALL six standard kinds are k-invariant (top-k `k` rides a host-
-            // submit value-id) → recognized by EXACT hash, no op-shape canonicalize.
-            auto kind_opt = sampling_ir::recognize_standard_kind(recog_table, prog_bc, prog_len);
-            if (ir_trace && !kind_opt) {
-                const std::uint64_t wh = sampling_ir::jit::fnv1a64(prog_bc, prog_len);
-                std::cerr << "[ir-trace] recognize MISS wire_len=" << prog_len
-                          << " wire_hash=" << std::hex << wh << std::dec
-                          << " exact=" << recog_table.size() << "\n";
-            }
-            if (kind_opt) {
-                // Program 0's host-submit inputs (the WS1a slice) carry T + the
-                // filter (top_p/min_p) + k (TopK/TopKTopP) by input ordinal; extract
-                // them. #25: k is the LAST submit ordinal (U32), read like top_p/min_p.
-                std::vector<sampling_ir::SubmitInput> rec_submit;
-                if (view.sampling_input_indptr.size() >= 2) {
-                    const std::uint32_t ilo = view.sampling_input_indptr.data()[0];
-                    const std::uint32_t ihi = view.sampling_input_indptr.data()[1];
-                    const std::uint8_t* blob = view.sampling_input_blob.data();
-                    for (std::uint32_t i = ilo; i < ihi; ++i) {
-                        sampling_ir::SubmitInput si;
-                        si.key = view.sampling_input_keys.data()[i];
-                        si.data = blob + view.sampling_input_offsets.data()[i];
-                        si.len_bytes = view.sampling_input_lens.data()[i];
-                        rec_submit.push_back(si);
-                    }
-                }
-                rec_params =
-                    sampling_ir::extract_dedicated_params(*kind_opt, rec_submit);
-                program_recognized = true;
-                if (ir_trace) {
-                    std::cerr << "[ir-trace] program recognized kind="
-                              << static_cast<int>(*kind_opt) << " T=" << rec_params.temp
-                              << " top_p=" << rec_params.top_p
-                              << " min_p=" << rec_params.min_p
-                              << " top_k=" << rec_params.top_k
-                              << " → dedicated dispatch\n";
-                }
-                // echo's free agreement guard (#7-step-1 analog, env-gated, prod
-                // default-off): the extracted params MUST re-classify (param
-                // recognizer + #7 normalizations) to the hash kind — a mis-extract
-                // (wrong key → wrong param) is caught here, pre-HW. Under
-                // PIE_RECOGNIZER_AUDIT we ALSO dump the extracted VALUES every
-                // recognized fire (not just on disagreement) — the #12 stage-2
-                // "param-dump" gate: HW-readable proof the route AND the values are
-                // right (e.g. top_p==0.9, T==0.8), catching a wrong-VALUE extract
-                // that the kind-only agreement check can't (0.5 and 0.9 both → TopP).
-                if (std::getenv("PIE_RECOGNIZER_AUDIT")) {
-                    const bool agree = sampling_ir::extracted_params_agree(
-                        *kind_opt, rec_params,
-                        executor.loaded_model.hf_config().vocab_size);
-                    std::cerr << "[extract-audit] " << (agree ? "OK" : "DISAGREE")
-                              << " hash_kind=" << static_cast<int>(*kind_opt)
-                              << " extracted(T=" << rec_params.temp
-                              << " top_p=" << rec_params.top_p
-                              << " min_p=" << rec_params.min_p
-                              << " top_k=" << rec_params.top_k << ")\n";
-                }
-            }
-        }
-
         // ── Sample-plan construction (hoisted) ──────────────────
         // Sampling stays outside the CUDA graph because sampler/probe
         // layouts can vary even when the decode shape is identical. The
@@ -3046,14 +2917,6 @@ void handle_fire_batch(
             .is_pure_decode    = is_pure_decode,
             .have_custom_mask  = have_custom_mask,
             .has_spec_drafts   = has_spec_drafts,
-            // A recognized standard program is planned as the equivalent slot
-            // fire (not a custom program), so the dedicated ladder runs.
-            .has_custom_program = prog_attached && !program_recognized,
-            .program_recognized = program_recognized,
-            .rec_temp           = rec_params.temp,
-            .rec_top_p          = rec_params.top_p,
-            .rec_min_p          = rec_params.min_p,
-            .rec_top_k          = rec_params.top_k,
         });
         const bool has_rich_sampler_slots = sp.has_rich_sampler_slots;
         const bool need_msgpack          = sp.need_msgpack;
@@ -3064,27 +2927,13 @@ void handle_fire_batch(
         const bool compact_logit_rows    = sp.compact_logit_rows;
         const bool tp_greedy_argmax      = sp.tp_greedy_argmax;
         const bool single_gpu_greedy_argmax = sp.single_gpu_greedy_argmax;
-        const bool dehardwire_baked_ir   = sp.dehardwire_baked_ir;
-        // A custom IR sampling program (carrier path) owns the sampling and reads
-        // `ws.logits` via `try_run` — so, exactly like de-hardwiring, the forward
-        // must emit the full [N,V] logits. Otherwise a greedy custom fire takes the
-        // fused lm_head-argmax-only path (logits never materialized) and the IR
-        // argmax samples over unwritten logits → token 0. (Argmax routes to a
-        // DedicatedKernel, so this IR output path is unexercised until a real
-        // program-path argmax runs.)
-        // #12: a RECOGNIZED standard program is NOT custom — it runs the dedicated
-        // ladder (FlashInfer/sample_temp/argmax/BakedIR), so it follows the same
-        // logits-materialization rules as the equivalent slot fire (and lets the
-        // greedy-argmax fused path stay enabled when its kind is argmax).
-        const bool has_custom_program =
-            prog_attached && !program_recognized;
-        // De-hardwiring / custom-program: force the non-graph forward path so it
-        // emits the full [N,V] logits (the captured graph would fuse/own the
-        // sampling); the IR program then samples over the emitted logits.
+        // A PTIR stage program reads `ws.logits` via the Logits intrinsic, so a
+        // PTIR-attached fire must emit the full [N,V] logits; force the non-graph
+        // forward path (the captured graph would fuse/own the sampling).
         // `graph_shape_ok` is only consumed at the forward dispatch below, so
         // overriding it here is safe.
         const bool ptir_attached = !view.ptir_program_hashes.empty();
-        if (dehardwire_baked_ir || has_custom_program || ptir_attached) {
+        if (ptir_attached) {
             graph_shape_ok = false;
         }
         const int  logit_rows_required   = sp.logit_rows_required;
@@ -3197,15 +3046,12 @@ void handle_fire_batch(
             !any_topk_topp &&
             all_slots_token &&
             all_rows_greedy &&
-            !dehardwire_baked_ir &&  // de-hardwire needs full logits, not argmax-only
-            !has_custom_program &&   // a custom IR program samples over ws.logits → emit them
             view.ptir_program_hashes.empty();  // a PTIR stage program reads ws.logits via the Logits intrinsic → must emit the full [N,V] logits, not the fused argmax-only
         forward_fn.invoke_set_logits_argmax_only(logits_argmax_only);
         const bool forward_handles_argmax =
             forward_fn.supports_fused_lmhead_argmax &&
             logits_argmax_only &&
-            single_gpu_greedy_argmax &&
-            !dehardwire_baked_ir;  // IR owns the sampling → forward must emit logits
+            single_gpu_greedy_argmax;
         forward_fn.invoke_set_fused_argmax_output(
             forward_handles_argmax
                 ? reinterpret_cast<std::int32_t*>(pi.sampled.data())
@@ -3411,818 +3257,7 @@ void handle_fire_batch(
         // pass) produces no logits and no sampled tokens — skip every argmax /
         // sampling launch (they would read the unwritten, undersized
         // `ws.logits` over all N rows and fault).
-        // ── Sampling-IR (programmable sampler) mode-select ──────────────
-        // A request carrying a sampling program takes the IR path: a
-        // JIT-compiled kernel DAG over `ws.logits`, in place of the legacy
-        // per-slot sampler. MVP: single program / single sampling row / M=1
-        // decode. The backend is built lazily here (CUDA context is current
-        // mid-fire). A null backend or an absent program falls through to the
-        // legacy ladder unchanged. The IR Token output lands in
-        // `pi.sampled[sample_row]`, so the existing D2H + response build below
-        // marshal it like any other sampled token.
-        sampling_ir::RunStatus ir_status = sampling_ir::RunStatus::NoProgram;
-
-        // ── #10 gate-1: merged multi-program custom path ─────────────────────
-        // A co-batched forward_R≥2 fire of DISTINCT custom programs (the
-        // cross-request masking case) carries one program per request: every
-        // sampling CSR (`sampling_program_bytes_indptr`, `sampling_input_indptr`,
-        // `sampling_late_indptr`, `sampling_binding_indptr`) is R+1 entries (the
-        // verified `extend_sampling_programs_from` N-merge). The single-program
-        // branch below reads only slice [0..1] (program 0) — for R≥2 that drops
-        // requests 1..R-1. Here we loop p∈[0,R): fire program p at its own sample
-        // row with its own [p..p+1] submit/late/manifest slices, then scatter that
-        // fire's output → per_req[p]. R=1 / num_programs≤1 skips this entirely and
-        // takes the byte-identical single-program path below. Engaged only for the
-        // clean all-custom fire (num_programs==R, every slice non-empty); a mixed
-        // or partial fire falls through to legacy (token-exact) — a later wave.
-        const std::uint32_t num_programs =
-            view.sampling_program_bytes_indptr.size() >= 1
-                ? static_cast<std::uint32_t>(
-                      view.sampling_program_bytes_indptr.size() - 1)
-                : 0u;
-        if (num_sampling > 0 && num_programs > 1 &&
-            num_programs == static_cast<std::uint32_t>(R) &&
-            !view.sampling_program_bytes.empty() && !program_recognized &&
-            ensure_sampling_ir_backend(executor) != nullptr) {
-            std::vector<pie_driver::PerRequestOutput> per_req(
-                static_cast<std::size_t>(R));
-            bool all_handled = true;
-            // #34 M-batch (env-gated, default OFF): group contiguous identical
-            // programs and fire them as ONE num_rows=N launch (fire-axis
-            // occupancy, 10-122x per the #10 bench). Env-off takes the
-            // byte-identical per-program loop below. Only the clean case
-            // M-batches — per-row variation is the device-alias mask(s), gathered
-            // into [N, byte_len] via the carrier byte-len (sampling_late_device_lens);
-            // any per-row submit/late-value host bytes, non-contiguous, or
-            // non-dense group fires individually. Composes onto the same N-row
-            // marshal (group_member = ProgramGroup.rows), zero marshal change.
-            const bool mbatch_enabled =
-                std::getenv("PIE_SAMPLING_IR_MBATCH") != nullptr;
-            bool mbatch_dispatched = false;
-            if (mbatch_enabled) {
-                auto* irb = ensure_sampling_ir_backend(executor);
-                struct ProgData {
-                    std::span<const std::uint8_t>          bytecode;
-                    std::vector<sampling_ir::SubmitInput>  submit_inputs;
-                    std::vector<sampling_ir::SubmitInput>  late_value_inputs;
-                    std::vector<sampling_ir::LateInput>    late_inputs;
-                    std::vector<std::uint32_t>             late_byte_lens;
-                    sampling_ir::ProgramManifest           manifest;
-                    int sample_row = 0;
-                    // Stage-2 MTP: the ws.logits row base of this program's K MTP
-                    // draft rows (an `IntrinsicKind::MtpLogits` [K,vocab] matrix
-                    // binding reads `[mtp_draft_row .. mtp_draft_row+K)`). -1 =
-                    // unset ⇒ the resolver falls back to `sample_row` (safe). The
-                    // MTP-head integration (Stage-1 real drafts / the argmax
-                    // stand-in) sets this from the draft layout once it writes the
-                    // K rows into ws.logits; until then it stays -1 (no-op).
-                    int mtp_draft_row = -1;
-                };
-                std::vector<ProgData> progs(num_programs);
-                std::vector<sampling_ir::ProgramHandle> handles(
-                    num_programs, sampling_ir::kInvalidProgram);
-                bool extract_ok = (irb != nullptr);
-                for (std::uint32_t p = 0; extract_ok && p < num_programs; ++p) {
-                    const std::uint32_t blo = view.sampling_program_bytes_indptr.data()[p];
-                    const std::uint32_t bhi = view.sampling_program_bytes_indptr.data()[p + 1];
-                    if (bhi <= blo) { extract_ok = false; break; }
-                    ProgData& pd = progs[p];
-                    pd.bytecode = {view.sampling_program_bytes.data() + blo,
-                                   static_cast<std::size_t>(bhi - blo)};
-                    pd.sample_row = static_cast<int>(h_qo[p] + h_sidx[h_sptr[p]]);
-                    if (view.sampling_input_indptr.size() > p + 1) {
-                        const std::uint32_t ilo = view.sampling_input_indptr.data()[p];
-                        const std::uint32_t ihi = view.sampling_input_indptr.data()[p + 1];
-                        const std::uint8_t* blob = view.sampling_input_blob.data();
-                        for (std::uint32_t i = ilo; i < ihi; ++i) {
-                            sampling_ir::SubmitInput si;
-                            si.key = view.sampling_input_keys.data()[i];
-                            si.data = blob + view.sampling_input_offsets.data()[i];
-                            si.len_bytes = view.sampling_input_lens.data()[i];
-                            pd.submit_inputs.push_back(si);
-                        }
-                    }
-                    if (view.sampling_late_indptr.size() > p + 1) {
-                        const std::uint32_t llo = view.sampling_late_indptr.data()[p];
-                        const std::uint32_t lhi = view.sampling_late_indptr.data()[p + 1];
-                        if (!view.sampling_late_blob.empty()) {
-                            const std::uint8_t* lblob = view.sampling_late_blob.data();
-                            for (std::uint32_t i = llo; i < lhi; ++i) {
-                                if (i >= view.sampling_late_lens.size()) break;
-                                if (view.sampling_late_lens.data()[i] == 0) continue;
-                                sampling_ir::SubmitInput li;
-                                li.key = view.sampling_late_keys.data()[i];
-                                li.data = lblob + view.sampling_late_offsets.data()[i];
-                                li.len_bytes = view.sampling_late_lens.data()[i];
-                                pd.late_value_inputs.push_back(li);
-                            }
-                        }
-                        if (!view.sampling_late_device_ptrs.empty()) {
-                            for (std::uint32_t i = llo; i < lhi; ++i) {
-                                if (i >= view.sampling_late_device_ptrs.size()) break;
-                                const std::uint64_t dptr = view.sampling_late_device_ptrs.data()[i];
-                                if (dptr == 0) continue;
-                                sampling_ir::LateInput li;
-                                li.key = view.sampling_late_keys.data()[i];
-                                li.device_ptr = reinterpret_cast<const void*>(
-                                    static_cast<std::uintptr_t>(dptr));
-                                li.elem_count = 0;
-                                pd.late_inputs.push_back(li);
-                                pd.late_byte_lens.push_back(
-                                    i < view.sampling_late_device_lens.size()
-                                        ? view.sampling_late_device_lens.data()[i] : 0u);
-                            }
-                        }
-                    }
-                    if (view.sampling_binding_indptr.size() > p + 1) {
-                        const std::uint32_t mlo = view.sampling_binding_indptr.data()[p];
-                        const std::uint32_t mhi = view.sampling_binding_indptr.data()[p + 1];
-                        pd.manifest.reserve(mhi - mlo);
-                        for (std::uint32_t i = mlo; i < mhi; ++i) {
-                            sampling_ir::InputBind b;
-                            const std::uint32_t bk = view.sampling_binding_kind.data()[i];
-                            if (bk == 1) {
-                                b.kind = sampling_ir::BindKind::HostTensor;
-                                b.host_key = view.sampling_binding_key.data()[i];
-                                b.ready = sampling_ir::HostAvailability::SubmitBound;
-                            } else {
-                                b.kind = sampling_ir::BindKind::Logits;
-                                if (bk == 2) b.intrinsic_kind = sampling_ir::Intrinsic::MtpLogits;
-                                else if (bk == 3) b.intrinsic_kind = sampling_ir::Intrinsic::MtpDrafts;
-                            }
-                            pd.manifest.push_back(b);
-                        }
-                    }
-                    handles[p] = irb->get_or_compile(pd.bytecode, pd.manifest);
-                    if (handles[p] == sampling_ir::kInvalidProgram) extract_ok = false;
-                }
-                if (extract_ok) {
-                    const auto groups = sampling_ir::partition_by_program(
-                        std::span<const sampling_ir::ProgramHandle>(handles));
-                    bool ok = true;
-                    bool late_miss = false;
-                    auto fire_one = [&](const ProgData& pd, std::uint32_t member) -> bool {
-                        sampling_ir::FireContext ctx;
-                        ctx.program_bytecode  = pd.bytecode;
-                        ctx.submit_inputs     = pd.submit_inputs;
-                        ctx.late_value_inputs = pd.late_value_inputs;
-                        ctx.late_inputs       = pd.late_inputs;
-                        ctx.manifest          = pd.manifest;
-                        ctx.logits            = ws.logits.data();
-                        ctx.pi                = &pi;
-                        ctx.vocab_size        = engine.hf_config().vocab_size;
-                        ctx.sample_row        = pd.sample_row;
-                        ctx.mtp_draft_row     = pd.mtp_draft_row;
-                        ctx.row_seeds         = pi.sample_seed.data() + pd.sample_row;
-                        ctx.prng_offset       = static_cast<std::uint64_t>(handled);
-                        ctx.stream            = cublas.stream();
-                        const sampling_ir::RunStatus st =
-                            executor.sampling_ir_runtime.try_run(ctx);
-                        if (st == sampling_ir::RunStatus::SkippedLateBindMiss) {
-                            late_miss = true; return false;
-                        }
-                        if (st != sampling_ir::RunStatus::Handled) return false;
-                        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
-                        marshal_ir_program_output(
-                            executor.sampling_ir_runtime.last_interface(),
-                            executor.sampling_ir_runtime.last_output_ptrs(),
-                            1, std::span<const std::uint32_t>(&member, 1), per_req);
-                        // Drafts-channel retain at the FRESH point: this merged IR
-                        // path returns before the legacy 4290 retain, and out_scratch
-                        // is reused per fire — so retain `member`'s window HERE.
-                        retain_drafts_window_for_member(executor, view, member,
-                                                        cublas.stream());
-                        return true;
-                    };
-                    for (const auto& g : groups) {
-                        if (!ok) break;
-                        const std::uint32_t n = static_cast<std::uint32_t>(g.rows.size());
-                        const ProgData& head = progs[g.rows[0]];
-                        // Eligible: contiguous program indices, ≥2 rows, per-row
-                        // variation is ONLY device-alias masks, and the sample
-                        // rows are dense (head.sample_row + r) so num_rows=n strides.
-                        bool dense = sampling_ir::is_contiguous(g) && n >= 2 &&
-                                     head.submit_inputs.empty() &&
-                                     head.late_value_inputs.empty() &&
-                                     !head.late_inputs.empty();
-                        for (std::uint32_t r = 0; dense && r < n; ++r) {
-                            if (progs[g.rows[r]].sample_row !=
-                                head.sample_row + static_cast<int>(r))
-                                dense = false;
-                        }
-                        // #34: only single-[1]-Token-output programs M-batch today
-                        // — their N tokens land dense in pi.sampled[base+r], safe
-                        // with the 1-row scratch + the marshal guard. Rich outputs
-                        // (Scalar/Entropy/Logits/[k]) need the N-row scratch first →
-                        // fire individually (num_rows=1) until that lands.
-                        if (dense) {
-                            const auto& iface = irb->interface(handles[g.rows[0]]);
-                            for (const auto& od : iface.outputs)
-                                if (od.cls != sampling_ir::OutputClass::Token ||
-                                    od.elem_count > 1) { dense = false; break; }
-                        }
-                        bool mbatched = false;
-                        if (dense) {
-                            const std::size_t num_late = head.late_inputs.size();
-                            std::vector<void*> scratch(num_late, nullptr);
-                            std::vector<sampling_ir::LateInput> gathered(num_late);
-                            bool gather_ok = true;
-                            for (std::size_t j = 0; gather_ok && j < num_late; ++j) {
-                                const std::uint32_t blen = head.late_byte_lens[j];
-                                if (blen == 0) { gather_ok = false; break; }
-                                void* buf = nullptr;
-                                if (cudaMalloc(&buf, static_cast<std::size_t>(blen) * n)
-                                        != cudaSuccess) { gather_ok = false; break; }
-                                scratch[j] = buf;
-                                for (std::uint32_t r = 0; r < n; ++r) {
-                                    const ProgData& m = progs[g.rows[r]];
-                                    if (j >= m.late_inputs.size() ||
-                                        m.late_byte_lens[j] != blen) { gather_ok = false; break; }
-                                    CUDA_CHECK(cudaMemcpyAsync(
-                                        static_cast<std::uint8_t*>(buf) +
-                                            static_cast<std::size_t>(r) * blen,
-                                        m.late_inputs[j].device_ptr, blen,
-                                        cudaMemcpyDeviceToDevice, cublas.stream()));
-                                }
-                                gathered[j].key = head.late_inputs[j].key;
-                                gathered[j].device_ptr = buf;
-                                gathered[j].elem_count = 0;  // shape from InputDecl, strides/row
-                            }
-                            if (gather_ok) {
-                                sampling_ir::FireContext ctx;
-                                ctx.program_bytecode = head.bytecode;
-                                ctx.manifest         = head.manifest;
-                                ctx.late_inputs      = gathered;
-                                ctx.logits           = ws.logits.data();
-                                ctx.pi               = &pi;
-                                ctx.vocab_size       = engine.hf_config().vocab_size;
-                                ctx.sample_row       = head.sample_row;
-                                ctx.num_rows         = static_cast<int>(n);
-                                ctx.row_seeds        = pi.sample_seed.data() + head.sample_row;
-                                ctx.prng_offset      = static_cast<std::uint64_t>(handled);
-                                ctx.stream           = cublas.stream();
-                                const sampling_ir::RunStatus st =
-                                    executor.sampling_ir_runtime.try_run(ctx);
-                                if (st == sampling_ir::RunStatus::SkippedLateBindMiss) {
-                                    late_miss = true; ok = false;
-                                } else if (st != sampling_ir::RunStatus::Handled) {
-                                    ok = false;
-                                } else {
-                                    CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
-                                    marshal_ir_program_output(
-                                        executor.sampling_ir_runtime.last_interface(),
-                                        executor.sampling_ir_runtime.last_output_ptrs(),
-                                        static_cast<int>(n),
-                                        std::span<const std::uint32_t>(g.rows.data(),
-                                                                       g.rows.size()),
-                                        per_req);
-                                    mbatched = true;
-                                    // #34 grouping witness (permanent diagnostic,
-                                    // under the ir-trace gate): proves the M-batch
-                                    // num_rows=N fire actually occupied — without it
-                                    // a silent fallback to per-row fire_one produces
-                                    // correct tokens but no occupancy (false green).
-                                    if (std::getenv("PIE_SAMPLING_IR_TRACE"))
-                                        std::cerr << "[ir-trace] mbatch group n=" << n
-                                                  << " sample_row=" << head.sample_row
-                                                  << "\n";
-                                }
-                            }
-                            for (void* b : scratch) if (b) cudaFree(b);
-                        }
-                        if (!ok) break;
-                        if (!mbatched) {
-                            for (std::uint32_t r = 0; r < n; ++r) {
-                                if (!fire_one(progs[g.rows[r]], g.rows[r])) { ok = false; break; }
-                            }
-                        }
-                    }
-                    if (late_miss) {
-                        std::cerr << "[pie-driver-cuda] sampling-ir late-bind miss "
-                                     "(mbatch), req_id=" << req_id << " — discarding fire\n";
-                        out_resp = pie_driver::PieForwardResponseView{};
-                        return;
-                    }
-                    all_handled = ok;
-                    mbatch_dispatched = true;  // M-batch owned the dispatch (no re-run)
-                }
-            }
-            if (!mbatch_dispatched)
-            for (std::uint32_t p = 0; p < num_programs && all_handled; ++p) {
-                const std::uint32_t blo =
-                    view.sampling_program_bytes_indptr.data()[p];
-                const std::uint32_t bhi =
-                    view.sampling_program_bytes_indptr.data()[p + 1];
-                if (bhi <= blo) { all_handled = false; break; }  // empty (mixed fire)
-                const int sample_row =
-                    static_cast<int>(h_qo[p] + h_sidx[h_sptr[p]]);
-
-                std::vector<sampling_ir::SubmitInput> submit_inputs;
-                if (view.sampling_input_indptr.size() > p + 1) {
-                    const std::uint32_t ilo = view.sampling_input_indptr.data()[p];
-                    const std::uint32_t ihi = view.sampling_input_indptr.data()[p + 1];
-                    const std::uint8_t* blob = view.sampling_input_blob.data();
-                    for (std::uint32_t i = ilo; i < ihi; ++i) {
-                        sampling_ir::SubmitInput si;
-                        si.key = view.sampling_input_keys.data()[i];
-                        si.data = blob + view.sampling_input_offsets.data()[i];
-                        si.len_bytes = view.sampling_input_lens.data()[i];
-                        submit_inputs.push_back(si);
-                    }
-                }
-
-                std::vector<sampling_ir::SubmitInput> late_value_inputs;
-                std::vector<sampling_ir::LateInput> late_inputs;
-                if (view.sampling_late_indptr.size() > p + 1) {
-                    const std::uint32_t llo = view.sampling_late_indptr.data()[p];
-                    const std::uint32_t lhi = view.sampling_late_indptr.data()[p + 1];
-                    if (!view.sampling_late_blob.empty()) {
-                        const std::uint8_t* lblob = view.sampling_late_blob.data();
-                        for (std::uint32_t i = llo; i < lhi; ++i) {
-                            if (i >= view.sampling_late_lens.size()) break;
-                            if (view.sampling_late_lens.data()[i] == 0) continue;
-                            sampling_ir::SubmitInput li;
-                            li.key = view.sampling_late_keys.data()[i];
-                            li.data = lblob + view.sampling_late_offsets.data()[i];
-                            li.len_bytes = view.sampling_late_lens.data()[i];
-                            late_value_inputs.push_back(li);
-                        }
-                    }
-                    if (!view.sampling_late_device_ptrs.empty()) {
-                        for (std::uint32_t i = llo; i < lhi; ++i) {
-                            if (i >= view.sampling_late_device_ptrs.size()) break;
-                            const std::uint64_t dptr =
-                                view.sampling_late_device_ptrs.data()[i];
-                            if (dptr == 0) continue;  // rides the staged path
-                            sampling_ir::LateInput li;
-                            li.key = view.sampling_late_keys.data()[i];
-                            li.device_ptr = reinterpret_cast<const void*>(
-                                static_cast<std::uintptr_t>(dptr));
-                            li.elem_count = 0;  // shape from the program InputDecl
-                            late_inputs.push_back(li);
-                        }
-                    }
-                }
-
-                sampling_ir::ProgramManifest manifest;
-                if (view.sampling_binding_indptr.size() > p + 1) {
-                    const std::uint32_t mlo = view.sampling_binding_indptr.data()[p];
-                    const std::uint32_t mhi = view.sampling_binding_indptr.data()[p + 1];
-                    manifest.reserve(mhi - mlo);
-                    for (std::uint32_t i = mlo; i < mhi; ++i) {
-                        sampling_ir::InputBind b;
-                        const std::uint32_t bk = view.sampling_binding_kind.data()[i];
-                        if (bk == 1 /* KIND_TENSOR */) {
-                            b.kind = sampling_ir::BindKind::HostTensor;
-                            b.host_key = view.sampling_binding_key.data()[i];
-                            b.ready = sampling_ir::HostAvailability::SubmitBound;
-                        } else {
-                            b.kind = sampling_ir::BindKind::Logits;
-                            if (bk == 2 /* KIND_MTP_LOGITS */)
-                                b.intrinsic_kind = sampling_ir::Intrinsic::MtpLogits;
-                        }
-                        manifest.push_back(b);
-                    }
-                }
-
-                sampling_ir::FireContext ctx;
-                ctx.program_bytecode = {
-                    view.sampling_program_bytes.data() + blo,
-                    static_cast<std::size_t>(bhi - blo)};
-                ctx.submit_inputs = submit_inputs;
-                ctx.late_value_inputs = late_value_inputs;
-                ctx.late_inputs = late_inputs;
-                ctx.manifest = std::move(manifest);
-                ctx.logits = ws.logits.data();
-                ctx.pi = &pi;
-                ctx.vocab_size = engine.hf_config().vocab_size;
-                ctx.sample_row = sample_row;
-                ctx.row_seeds = pi.sample_seed.data() + sample_row;
-                ctx.prng_offset = static_cast<std::uint64_t>(handled);
-                ctx.stream = cublas.stream();
-
-                const sampling_ir::RunStatus st =
-                    executor.sampling_ir_runtime.try_run(ctx);
-                if (st == sampling_ir::RunStatus::SkippedLateBindMiss) {
-                    // spec §7.4: late-bind miss → discard + retry, fail loud.
-                    std::cerr << "[pie-driver-cuda] sampling-ir late-bind miss "
-                                 "(merged p=" << p << "), req_id=" << req_id
-                              << " — discarding fire\n";
-                    out_resp = pie_driver::PieForwardResponseView{};
-                    return;
-                }
-                if (st != sampling_ir::RunStatus::Handled) {
-                    all_handled = false;
-                    break;
-                }
-                // Each fire reuses the runtime's out_scratch / last_output_ptrs;
-                // sync + marshal THIS program before the next fire overwrites it.
-                CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
-                // Individual fire (num_rows=1): the one row maps to per_req[p].
-                // An M-batch fire of a contiguous identical group would instead
-                // pass num_rows=N + group_member=ProgramGroup.rows here.
-                const std::uint32_t member = p;
-                marshal_ir_program_output(
-                    executor.sampling_ir_runtime.last_interface(),
-                    executor.sampling_ir_runtime.last_output_ptrs(),
-                    /*num_rows=*/1, std::span<const std::uint32_t>(&member, 1),
-                    per_req);
-                // Drafts-channel retain at the FRESH point (fallback IR loop; same
-                // reasoning — out_scratch is reused, this path returns before 4290).
-                retain_drafts_window_for_member(executor, view, member,
-                                                cublas.stream());
-            }
-            if (all_handled) {
-                if (std::getenv("PIE_SAMPLING_IR_TRACE")) {
-                    std::cerr << "[ir-trace] de-hardwire merged multi-program "
-                                 "HANDLED programs=" << num_programs
-                              << " R=" << R << "\n";
-                }
-                // This path returns before the legacy-sampler timing markers; the
-                // per-fire cudaStreamSynchronize above already drained the work, so
-                // stamp kernel-launch/sync probes with the IR-completion time.
-                const auto t_ir_done = clock::now();
-                executor.response_builder.build(per_req, out_resp);
-                write_probes(out_resp, executor, t_entry, t_wire_parse_end, t_plan_end,
-                             t_h2d_end, t_ir_done, t_ir_done);
-                return;
-            }
-            // partial / mixed fire → fall through to single-program + legacy.
-        }
-
-        if (num_sampling > 0 &&
-            view.sampling_program_bytes_indptr.size() >= 2 &&
-            !view.sampling_program_bytes.empty() &&
-            !program_recognized &&  // #12: recognized standard → dedicated ladder, not CustomJIT
-            ensure_sampling_ir_backend(executor) != nullptr) {
-            const std::uint32_t blo = view.sampling_program_bytes_indptr.data()[0];
-            const std::uint32_t bhi = view.sampling_program_bytes_indptr.data()[1];
-            const int sample_row = static_cast<int>(h_qo[0] + h_sidx[0]);
-
-            // Submit-bound host inputs for program 0 (WS1a). The carrier packs
-            // every program's entries into one key/offset/len index table CSR'd
-            // by `sampling_input_indptr`; pull program 0's slice and point each
-            // SubmitInput at its bytes in `sampling_input_blob`. The runtime
-            // stages these to device before binding.
-            std::vector<sampling_ir::SubmitInput> submit_inputs;
-            if (view.sampling_input_indptr.size() >= 2) {
-                const std::uint32_t ilo = view.sampling_input_indptr.data()[0];
-                const std::uint32_t ihi = view.sampling_input_indptr.data()[1];
-                const std::uint8_t* blob = view.sampling_input_blob.data();
-                for (std::uint32_t i = ilo; i < ihi; ++i) {
-                    sampling_ir::SubmitInput si;
-                    si.key = view.sampling_input_keys.data()[i];
-                    si.data = blob + view.sampling_input_offsets.data()[i];
-                    si.len_bytes = view.sampling_input_lens.data()[i];
-                    submit_inputs.push_back(si);
-                }
-            }
-
-            // Host-late VALUES for program 0 (WS1b correctness path): the
-            // late-value table mirrors the submit index-table but is keyed by
-            // `sampling_late_keys`; pull program 0's keys and their bytes from
-            // `sampling_late_blob`. The runtime stages these like submit inputs;
-            // a declared HostLate input resolves to them, else skip.
-            std::vector<sampling_ir::SubmitInput> late_value_inputs;
-            if (view.sampling_late_indptr.size() >= 2 &&
-                !view.sampling_late_blob.empty()) {
-                const std::uint32_t llo = view.sampling_late_indptr.data()[0];
-                const std::uint32_t lhi = view.sampling_late_indptr.data()[1];
-                const std::uint8_t* lblob = view.sampling_late_blob.data();
-                for (std::uint32_t i = llo; i < lhi; ++i) {
-                    if (i >= view.sampling_late_lens.size()) break;
-                    // len == 0 ⇒ no staged host value for this late key (device
-                    // alias / skip-on-miss handles it); don't register it.
-                    if (view.sampling_late_lens.data()[i] == 0) continue;
-                    sampling_ir::SubmitInput li;
-                    li.key = view.sampling_late_keys.data()[i];
-                    li.data = lblob + view.sampling_late_offsets.data()[i];
-                    li.len_bytes = view.sampling_late_lens.data()[i];
-                    late_value_inputs.push_back(li);
-                }
-            }
-
-            // Host-late DEVICE-ALIAS inputs for program 0 (#27 cut #2 (B) direct
-            // H2D): a Late tensor (the grammar mask) is written straight to a
-            // device buffer by the host (`pie_tensor_write_async` from the guest's
-            // WASM-memory slice — @ingim's inferlet→GPU memcpy) and carried here as
-            // a device ptr in `sampling_late_device_ptrs`, NOT bytes in
-            // `sampling_late_blob`. Register one LateInput per late key whose
-            // device ptr != 0 so the runtime's HostLate device-alias branch
-            // resolves it. The host pre-syncs the (sequential) H2D before submit,
-            // so the buffer is resident this fire ("already on device" contract);
-            // the carried `sampling_late_device_flags` R12 self-arm is for the
-            // true-async follow-up. A late key with neither a staged value nor a
-            // device ptr resolves to SkippedLateBindMiss (loud, never stale).
-            std::vector<sampling_ir::LateInput> late_inputs;
-            if (view.sampling_late_indptr.size() >= 2 &&
-                !view.sampling_late_device_ptrs.empty()) {
-                const std::uint32_t llo = view.sampling_late_indptr.data()[0];
-                const std::uint32_t lhi = view.sampling_late_indptr.data()[1];
-                for (std::uint32_t i = llo; i < lhi; ++i) {
-                    if (i >= view.sampling_late_device_ptrs.size()) break;
-                    const std::uint64_t dptr =
-                        view.sampling_late_device_ptrs.data()[i];
-                    if (dptr == 0) continue;  // this key rides the staged path
-                    sampling_ir::LateInput li;
-                    li.key = view.sampling_late_keys.data()[i];
-                    li.device_ptr = reinterpret_cast<const void*>(
-                        static_cast<std::uintptr_t>(dptr));
-                    li.elem_count = 0;  // shape taken from the program's InputDecl
-                    late_inputs.push_back(li);
-                }
-            }
-
-            sampling_ir::FireContext ctx;
-            ctx.program_bytecode = {
-                view.sampling_program_bytes.data() + blo,
-                static_cast<std::size_t>(bhi - blo)};
-            ctx.submit_inputs = submit_inputs;
-            ctx.late_value_inputs = late_value_inputs;
-            ctx.late_inputs = late_inputs;
-            // v4 binding manifest for program 0: the per-slot binding-map (Logits
-            // intrinsic vs keyed HostTensor) the binding-free v4 bytecode omits.
-            // Without it, get_or_compile routes to the v3 self-binding decoder,
-            // which rejects version 4 ("decode failed: version 4").
-            sampling_ir::ProgramManifest manifest;
-            bool has_mtp_logits = false;
-            bool has_mtp_drafts = false;
-            if (view.sampling_binding_indptr.size() >= 2) {
-                const std::uint32_t mlo = view.sampling_binding_indptr.data()[0];
-                const std::uint32_t mhi = view.sampling_binding_indptr.data()[1];
-                manifest.reserve(mhi - mlo);
-                for (std::uint32_t i = mlo; i < mhi; ++i) {
-                    sampling_ir::InputBind b;
-                    // Wire kind (bravo's carrier): 0=Logits, 1=Tensor, 2=MtpLogits.
-                    // MUST switch on the explicit kind — a `!= 0` test mis-routes
-                    // the new MtpLogits(2) into HostTensor (charlie's latent-bug
-                    // catch). MtpLogits is payload-less (binding_key=0); it stays
-                    // a Logits-class intrinsic, only stamping intrinsic_kind so the
-                    // codegen → delta's jit_backend wire → runtime resolver reads
-                    // the DRAFT row. `intrinsic_kind`/`Intrinsic::MtpLogits` come
-                    // from charlie's 970bfdcd (resolved in the consolidation fold).
-                    const std::uint32_t bk = view.sampling_binding_kind.data()[i];
-                    if (bk == 1 /* KIND_TENSOR */) {
-                        b.kind = sampling_ir::BindKind::HostTensor;
-                        b.host_key = view.sampling_binding_key.data()[i];
-                        b.ready = sampling_ir::HostAvailability::SubmitBound;
-                    } else {
-                        b.kind = sampling_ir::BindKind::Logits;
-                        if (bk == 2 /* KIND_MTP_LOGITS */) {
-                            b.intrinsic_kind = sampling_ir::Intrinsic::MtpLogits;
-                            has_mtp_logits = true;
-                        } else if (bk == 3 /* KIND_MTP_DRAFTS */) {
-                            // Device-resident spec-decode drafts (echo's I32 [k]
-                            // MtpDrafts intrinsic): a Logits-class intrinsic like
-                            // MtpLogits, but resolved to `ctx.mtp_drafts` (bravo's
-                            // retained buffer), NOT a ws.logits row. Payload-less.
-                            b.intrinsic_kind = sampling_ir::Intrinsic::MtpDrafts;
-                            has_mtp_drafts = true;
-                        }
-                    }
-                    manifest.push_back(b);
-                }
-            }
-            ctx.manifest = std::move(manifest);
-            ctx.logits = ws.logits.data();
-            ctx.pi = &pi;
-            ctx.vocab_size = engine.hf_config().vocab_size;
-            ctx.sample_row = sample_row;
-            // Ambient per-row RNG seed S (Model B) for custom RNG programs (e.g.
-            // mirostat's Op::Rng). The de-hardwiring/#10 path sets this at its group
-            // base; the custom-program path must too, else a sampling custom's
-            // RowSeed buffer is unbound at launch (jit_backend bind_external skips it
-            // when args.row_seeds==nullptr). sample_row indexes the [N] seed block
-            // (= the seed legacy sample_temp uses for this row). Non-RNG customs
-            // (e.g. grammar's masked-argmax) declare no RowSeed and ignore it.
-            ctx.row_seeds = pi.sample_seed.data() + sample_row;
-            ctx.prng_offset = static_cast<std::uint64_t>(handled);
-            ctx.stream = cublas.stream();
-            // Stage-2 MTP: if this program binds `Intrinsic::MtpLogits`, run the
-            // native MTP head to produce K contiguous draft-logit rows at the
-            // reserved ws.logits tail and point the intrinsic there. The K drafts
-            // are the model's fresh proposals from the END of the verify window
-            // (its last token = row N-1). K = the native drafter's draft count,
-            // clamped to the reserved tail. -1 (the stub default) if unset.
-            if (has_mtp_logits && executor.system_drafter.draft_step &&
-                N >= 1 && !pos_view.empty()) {
-                const int reserve = tensor_rows(ws.logits) - ws.mtp_draft_row_base;
-                int K = executor.system_drafter.max_drafts;
-                if (K > reserve) K = reserve;
-                if (K > 0 && N >= 1) {
-                    // ANCHOR = the BONUS position (bravo's Stage-2 contract): out[1]
-                    // feeds the NEXT window as [seed, drafts] where seed =
-                    // committed.last() = the BONUS token = the target's greedy at the
-                    // LAST verify row (the definitely-committed next token). So the
-                    // MTP drafts must extend FROM the bonus: token(p+1) = bonus token
-                    // = argmax(logits[last verify row = sample_row+K]); hidden(p) =
-                    // ws.y row N-1 (the last window row, position base_position);
-                    // first draft = base_position+2. (Anchoring at the last WINDOW
-                    // token — a possibly-rejected draft — conditions one position too
-                    // early → the 0-draft-accept baseline.)
-                    const int base_position =
-                        static_cast<int>(pos_view[static_cast<std::size_t>(N - 1)]);
-                    // #17-(b) anchor fix (charlie, guru-diagnosed): the seed anchor is
-                    // the fire's LAST written target-logits row. For a verify fire
-                    // (k+1 window @ sample_row=0) that's `sample_row + K` (the bonus).
-                    // For the fire-0 BOOTSTRAP (M=1 over the PROMPT, sample_row = the
-                    // prompt's last row) there is NO k+1 verify window, so `sample_row
-                    // + K` indexes K rows PAST the last written row → argmax over an
-                    // UNWRITTEN row → 0 → the zero-cascade charlie's A/B caught. Clamp
-                    // to `N-1` (the last written row) so the anchor derives from the
-                    // fire's ACTUAL window shape, not the constant K.
-                    const int seed_logit_row  = std::min(sample_row + K, N - 1);
-                    const int base_hidden_row = N - 1;
-                    const int source_position = base_position;
-                    // The MTP attention indexes kv_page_indptr[request_ids[·]], so
-                    // request_ids must be the BATCH-LOCAL request index [0,R) — NOT
-                    // the global req_id (65536), which OOBs the [R+1] page-indptr.
-                    // The single-program MVP path is request 0.
-                    const int batch_req_index = 0;
-                    if (std::getenv("PIE_MTP_SEED_TRACE") != nullptr) {
-                        std::cerr << "[mtp-seed] fire: sample_row=" << sample_row
-                                  << " K=" << K << " seed_logit_row=" << seed_logit_row
-                                  << " N=" << N << " last_written_row=" << (N - 1)
-                                  << " mtp_draft_row_base=" << ws.mtp_draft_row_base
-                                  << " (seed_logit_row " << (seed_logit_row > N - 1 ? ">PAST" : "<=OK")
-                                  << " last_written)\n";
-                    }
-                    if (produce_mtp_draft_logits(
-                            executor, K, base_hidden_row, seed_logit_row,
-                            source_position, batch_req_index, ws.mtp_draft_row_base,
-                            cublas.stream())) {
-                        ctx.mtp_draft_row = ws.mtp_draft_row_base;
-                    }
-                }
-            }
-            // Device-resident spec-decode drafts (echo/pipe-audit/charlie (b)):
-            // if this program binds `Intrinsic::MtpDrafts`, source-select bravo's
-            // retained `mtp_drafts` — rows 1..=k of the `[k+1]` `[seed, drafts]`
-            // window the PRIOR fire retained under this request's carrier link
-            // (row 0 = seed, skipped) — as the verify's `draft` operand. This is
-            // the SAME retained buffer the forward-input inject (~3308) reads, so
-            // the carrier link is `next_input_producer_links[0]` (single-program
-            // MVP = request 0). Same copy-stream (`cublas.stream()`) as the retain
-            // ⇒ ordered; the retain event is waited for cross-fire safety.
-            // SEAM (charlie ⇄ bravo ⇄ pipe-audit): validated jointly with the
-            // guest mtp_specdecode_device loop + the accepted-tok/s A/B.
-            if (has_mtp_drafts && !view.next_input_producer_links.empty()) {
-                const std::uint32_t link = view.next_input_producer_links.data()[0];
-                auto it = executor.retained_next_input.find(link);
-                if (it != executor.retained_next_input.end() &&
-                    it->second.copy.size() >= 2) {
-                    ctx.mtp_drafts = it->second.copy.data() + 1;  // skip seed@row0
-                    ctx.mtp_drafts_count = it->second.copy.size() - 1;  // [k]
-                    if (it->second.done)
-                        CUDA_CHECK(cudaStreamWaitEvent(
-                            cublas.stream(), it->second.done, 0));
-                    if (ir_trace)
-                        std::cerr << "[ir-trace] mtp-drafts source-select link="
-                                  << link << " k=" << ctx.mtp_drafts_count << "\n";
-                }
-            }
-            ir_status = executor.sampling_ir_runtime.try_run(ctx);
-        }
-        // De-hardwiring branch (Task #4 / #10 cross-request batching): a fire whose
-        // every row recognizes to a BakedIR kind (temperature today; +min-p after #7)
-        // and that carries NO custom program is partitioned by program identity and
-        // each group launched over its [Ng,V] block. CONTIGUOUS groups launch in
-        // place (the keystone fast path, no gather); a SCATTERED group (≥2 BakedIR
-        // kinds interleaved — #7's temp+min_p — or sampling rows interleaved in a
-        // mixed fire) is deferred to the gather path (delta's group.hpp) → for now
-        // the whole fire falls back to the legacy sampler (token-exact, kept in the
-        // plan). Never fails the fire (hardwired-kernel replacement, not a program).
-        if (ir_status == sampling_ir::RunStatus::NoProgram && dehardwire_baked_ir &&
-            num_sampling > 0 && ensure_sampling_ir_backend(executor) != nullptr) {
-            auto* ir_backend = ensure_sampling_ir_backend(executor);
-            const std::uint32_t vocab =
-                static_cast<std::uint32_t>(engine.hf_config().vocab_size);
-            // Per-row program handle (= the canonical bytecode-hash / #9 cache key /
-            // #10 group key — one mechanism): recognize kind → baked program →
-            // get_or_compile. Cached per kind, so all rows of a kind share a handle.
-            struct KindProg {
-                sampling_ir::ProgramHandle           handle;
-                sampling_ir::StandardSamplerProgram  prog;
-                sampling_ir::StandardSamplerKind     kind;
-            };
-            std::unordered_map<int, KindProg> by_kind;
-            std::vector<sampling_ir::ProgramHandle> row_handles(
-                num_sampling, sampling_ir::kInvalidProgram);
-            std::vector<int> row_kind(num_sampling, 0);
-            bool resolve_ok = true;
-            for (int r = 0; r < num_sampling && resolve_ok; ++r) {
-                const sampling_ir::StandardSamplerKind kind =
-                    sampling_ir::infer_sampler_kind(sampling_ir::params_from_slot(
-                        per_slot_temp[r], per_slot_top_k[r], per_slot_top_p[r],
-                        per_slot_min_p[r], static_cast<std::int32_t>(vocab)));
-                const int ki = static_cast<int>(kind);
-                auto it = by_kind.find(ki);
-                if (it == by_kind.end()) {
-                    sampling_ir::StandardSamplerProgram prog =
-                        sampling_ir::standard_sampler_program(kind, vocab);
-                    if (!prog.valid) { resolve_ok = false; break; }
-                    const sampling_ir::ProgramHandle h = ir_backend->get_or_compile(
-                        std::span<const std::uint8_t>(prog.bytecode, prog.len),
-                        prog.manifest);
-                    if (h == sampling_ir::kInvalidProgram) { resolve_ok = false; break; }
-                    it = by_kind.emplace(ki, KindProg{h, prog, kind}).first;
-                }
-                row_handles[r] = it->second.handle;
-                row_kind[r] = ki;
-            }
-            std::vector<sampling_ir::ProgramGroup> groups;
-            bool all_contiguous = resolve_ok;
-            if (resolve_ok) {
-                groups = sampling_ir::partition_by_program(row_handles);
-                for (const auto& g : groups) {
-                    if (!sampling_ir::is_contiguous(g)) { all_contiguous = false; break; }
-                }
-            }
-            // MVP (#10 contiguous): launch only when every group is contiguous —
-            // in place at its base row, no gather copy. A scattered group defers to
-            // the gather→launch→scatter path (the multi-group honesty bench rides #7
-            // temp+min_p) → fall back to legacy now (token-exact).
-            if (resolve_ok && all_contiguous && !groups.empty()) {
-                bool all_handled = true;
-                for (const auto& g : groups) {
-                    const KindProg& kp = by_kind.at(row_kind[g.rows[0]]);
-                    const int first = static_cast<int>(g.rows[0]);
-                    const int ng    = static_cast<int>(g.rows.size());
-                    // Per-row params at offset `first`, keyed by the manifest host
-                    // keys (T = 0; min_p = 1 for MinP). The runtime stages [ng] host
-                    // bytes → device, binds the batched base; the kernel strides/row.
-                    std::vector<sampling_ir::SubmitInput> gin;
-                    sampling_ir::SubmitInput ti;
-                    ti.key = 0;
-                    ti.data = reinterpret_cast<const std::uint8_t*>(
-                        per_slot_temp.data() + first);
-                    ti.len_bytes = static_cast<std::uint32_t>(ng * sizeof(float));
-                    gin.push_back(ti);
-                    if (kp.kind == sampling_ir::StandardSamplerKind::MinP) {
-                        sampling_ir::SubmitInput mi;
-                        mi.key = 1;
-                        mi.data = reinterpret_cast<const std::uint8_t*>(
-                            per_slot_min_p.data() + first);
-                        mi.len_bytes = static_cast<std::uint32_t>(ng * sizeof(float));
-                        gin.push_back(mi);
-                    }
-                    sampling_ir::FireContext ctx;
-                    ctx.program_bytecode = std::span<const std::uint8_t>(
-                        kp.prog.bytecode, kp.prog.len);
-                    ctx.manifest      = kp.prog.manifest;
-                    ctx.submit_inputs = gin;
-                    ctx.logits        = ws.logits.data();
-                    ctx.pi            = &pi;
-                    ctx.vocab_size    = static_cast<int>(vocab);
-                    ctx.sample_row    = first;  // contiguous group base (dense ⇒ workspace row)
-                    ctx.num_rows      = ng;
-                    // Ambient per-row RNG seed S (Model B): the group's [ng] u32 slice
-                    // of the [N] block uploaded pre-sampling. Dense ⇒ sample_seed[r] is
-                    // sampling row r's seed (= what legacy sample_temp uses).
-                    ctx.row_seeds     = pi.sample_seed.data() + first;
-                    ctx.prng_offset   = static_cast<std::uint64_t>(handled);
-                    ctx.stream        = cublas.stream();
-                    if (executor.sampling_ir_runtime.try_run(ctx) !=
-                        sampling_ir::RunStatus::Handled) {
-                        all_handled = false;
-                        break;
-                    }
-                }
-                if (all_handled) {
-                    ir_status = sampling_ir::RunStatus::Handled;
-                    if (std::getenv("PIE_SAMPLING_IR_TRACE")) {
-                        std::cerr << "[ir-trace] de-hardwire baked-IR HANDLED groups="
-                                  << groups.size() << " rows=" << num_sampling << "\n";
-                    }
-                } else {
-                    std::cerr << "[pie-driver-cuda] de-hardwire baked-IR partial launch"
-                                 " — falling back to legacy\n";
-                    // ir_status stays NoProgram → legacy sampler runs (token-exact).
-                }
-            } else if (std::getenv("PIE_SAMPLING_IR_TRACE")) {
-                std::cerr << "[ir-trace] de-hardwire baked-IR deferred to legacy"
-                             " (resolve_ok=" << resolve_ok
-                          << " all_contiguous=" << all_contiguous << ")\n";
-            }
-        }
-        if (ir_status == sampling_ir::RunStatus::SkippedLateBindMiss) {
-            // spec §7.4: a late-bound input was missing → discard + retry,
-            // fail loud (no block, no default).
-            std::cerr << "[pie-driver-cuda] sampling-ir late-bind miss, req_id="
-                      << req_id << " — discarding fire\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
-        }
-        if (ir_status == sampling_ir::RunStatus::Failed) {
-            std::cerr << "[pie-driver-cuda] sampling-ir program failed, req_id="
-                      << req_id << "\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
-        }
-
-        if (ir_status == sampling_ir::RunStatus::Handled) {
-            // IR program wrote pi.sampled[sample_row]; skip the legacy sampler.
-        } else if (num_sampling == 0) {
+        if (num_sampling == 0) {
             // nothing to sample
         } else if (tp_greedy_argmax) {
             kernels::launch_select_global_argmax_pairs(
@@ -4295,60 +3330,6 @@ void handle_fire_batch(
                 const std::int64_t hi = static_cast<std::int64_t>(qo_psl_view[r + 1]);
                 const std::int64_t rows = hi - lo;
                 if (rows <= 0 || hi > static_cast<std::int64_t>(N)) continue;
-                // Drafts-channel routing (§9): `pipeline_source_kind == 1` (PrevDrafts)
-                // → retain the PROGRAM-composed `[k+1]` `[seed, drafts]` window
-                // (out[2]=seed→row0, out[1]=drafts[k]→rows1..k) instead of
-                // `pi.sampled[lo:hi]`. PER-LINK COPY on the single FIFO copy-stream
-                // (`cublas.stream()`) ⇒ WAR-impossible by construction (§9 cond-2);
-                // the tag is pure routing. Defensive: fall through to `pi.sampled`
-                // if the program's 3 outputs aren't present (non-drafts fire).
-                const auto psk_view = view.pipeline_source_kinds.as<std::uint8_t>();
-                const std::uint8_t src_kind =
-                    (r < psk_view.size()) ? psk_view[r] : view.pipeline_source_kind;
-                if (src_kind == 1) {
-                    auto out_ptrs = executor.sampling_ir_runtime.last_output_ptrs();
-                    const auto* iface = executor.sampling_ir_runtime.last_interface();
-                    if (out_ptrs.size() >= 3 && iface != nullptr &&
-                        iface->outputs.size() >= 3) {
-                        const std::size_t k = iface->outputs[1].elem_count; // drafts [k]
-                        const std::size_t k1 = k + 1;                       // [seed, drafts]
-                        Executor::RetainedSampled& ret = executor.retained_next_input[link];
-                        if (ret.copy.size() < k1)
-                            ret.copy = DeviceBuffer<std::int32_t>::alloc(k1);
-                        if (ret.done == nullptr) CUDA_CHECK(cudaEventCreate(&ret.done));
-                        // seed (out[2], 1 elem) → row 0
-                        CUDA_CHECK(cudaMemcpyAsync(
-                            ret.copy.data(), out_ptrs[2], sizeof(std::int32_t),
-                            cudaMemcpyDeviceToDevice, cublas.stream()));
-                        // drafts (out[1], k elems) → rows 1..k
-                        CUDA_CHECK(cudaMemcpyAsync(
-                            ret.copy.data() + 1, out_ptrs[1],
-                            sizeof(std::int32_t) * k,
-                            cudaMemcpyDeviceToDevice, cublas.stream()));
-                        CUDA_CHECK(cudaEventRecord(ret.done, cublas.stream()));
-                        // Plumbing-gate value-dump (charlie, PIE_DRAFTS_VERIFY): the
-                        // retained [k+1] window = [seed, drafts]. Gated (D2H sync) — test only.
-                        static const bool drafts_verify =
-                            std::getenv("PIE_DRAFTS_VERIFY") != nullptr;
-                        if (drafts_verify) {
-                            CUDA_CHECK(cudaEventSynchronize(ret.done));
-                            std::vector<std::int32_t> host(k1);
-                            CUDA_CHECK(cudaMemcpy(host.data(), ret.copy.data(),
-                                                  sizeof(std::int32_t) * k1,
-                                                  cudaMemcpyDeviceToHost));
-                            std::cerr << "[drafts-verify] RETAIN link=" << link
-                                      << " window[k+1]=[";
-                            for (std::size_t j = 0; j < host.size(); ++j)
-                                std::cerr << host[j] << (j + 1 < host.size() ? "," : "");
-                            std::cerr << "]\n";
-                        }
-                        if (ir_trace)
-                            std::cerr << "[ir-trace] next-input RETAIN (drafts [k+1]) link="
-                                      << link << " req=" << r << " k=" << k << "\n";
-                        continue;
-                    }
-                    // else: 3 outputs unavailable ⇒ fall through to pi.sampled.
-                }
                 Executor::RetainedSampled& ret = executor.retained_next_input[link];
                 if (ret.copy.size() < static_cast<std::size_t>(rows))
                     ret.copy = DeviceBuffer<std::int32_t>::alloc(static_cast<std::size_t>(rows));
@@ -4617,118 +3598,6 @@ void handle_fire_batch(
             write_probes(out_resp, executor, t_entry, t_wire_parse_end, t_plan_end,
                          t_h2d_end, t_kernel_launch_end, t_sync_end);
             return;
-        }
-
-        // ── Sampling-IR rich / multi-output marshaling ──────────────────
-        // A program that emits anything beyond a single scalar Token —
-        // mirostat's (token, surprise S); a spec-verify Vector<k> accept-
-        // prefix; entropy/logprob probes — is marshaled here into the
-        // ForwardResponse channels in the program's declared output order,
-        // mirroring the legacy rich path (response_builder.build). Token →
-        // tokens, Scalar/Entropy → entropies, a multi-element (Vector<k>)
-        // Token accept-prefix → spec_tokens (side-channel). Single-token
-        // programs fall through to the dense token path below, unchanged.
-        // MVP single-program path: outputs land on request 0. (A co-batched
-        // forward_R≥2 fire of DISTINCT programs is handled earlier by the
-        // multi-program merged path, which scatters each program → per_req[p];
-        // this single-program branch only runs for num_programs==1.)
-        if (ir_status == sampling_ir::RunStatus::Handled && R >= 1) {
-            const sampling_ir::ProgramInterface* pif =
-                executor.sampling_ir_runtime.last_interface();
-            const bool ir_rich =
-                pif != nullptr &&
-                !(pif->outputs.size() == 1 &&
-                  pif->outputs[0].cls == sampling_ir::OutputClass::Token &&
-                  pif->outputs[0].elem_count <= 1);
-            if (ir_rich) {
-                std::span<void* const> outs =
-                    executor.sampling_ir_runtime.last_output_ptrs();
-                // D1: DEFER the rich response. Stage each output's eager-D2H into an
-                // OWNED pinned host buffer (ordered after the forward sample-done);
-                // the copy-stream host-func marshals + builds + sends post-drain, so
-                // the service thread never blocks on the sync marshal. Falls back to
-                // the inline sync marshal if nothing stageable (all-unbound outputs).
-                cudaEvent_t sample_done = nullptr;
-                CUDA_CHECK(cudaEventCreateWithFlags(&sample_done,
-                                                    cudaEventDisableTiming));
-                CUDA_CHECK(cudaEventRecord(sample_done, cublas.stream()));
-                auto& tio = sampling_ir::TensorIoEngine::instance();
-                auto& pend = executor.pending_rich_defer;
-                pend.staged.clear();
-                pend.num_requests = static_cast<std::uint32_t>(R);
-                const std::uint32_t member = 0;  // single-program: outputs → request 0
-                const std::uint32_t n_out =
-                    static_cast<std::uint32_t>(pif->outputs.size());
-                std::vector<std::uint64_t> dsts;
-                std::vector<std::uint32_t> lens;
-                std::vector<const void*>   srcs;
-                std::vector<std::size_t>   nbs;
-                for (std::size_t i = 0;
-                     i < pif->outputs.size() && i < outs.size(); ++i) {
-                    const sampling_ir::DeclaredOutput& o = pif->outputs[i];
-                    if (outs[i] == nullptr) continue;
-                    std::size_t elem_bytes;
-                    switch (o.cls) {
-                        case sampling_ir::OutputClass::Token:
-                            elem_bytes = sizeof(std::int32_t); break;
-                        case sampling_ir::OutputClass::Scalar:
-                        case sampling_ir::OutputClass::Entropy:
-                            elem_bytes = sizeof(float); break;
-                        case sampling_ir::OutputClass::Logits:
-                            elem_bytes = sizeof(std::uint16_t); break;
-                        default: continue;
-                    }
-                    // MtpTokens / [k]-Token: stage the declared UPPER BOUND
-                    // (elem_count); the −1 sentinel gives the actual count in the
-                    // trampoline (→ response header), since n_acc is unknown at submit.
-                    const std::uint32_t cap = std::max<std::uint32_t>(o.elem_count, 1);
-                    const std::size_t nbytes = elem_bytes * cap;
-                    // guru's CHECK: pinned_alloc CANNOT fail/return null — the pinned
-                    // SlabArena grows-on-demand (add_slab → cudaHostAlloc), reuses the
-                    // free-list, and aborts FAIL-LOUD on genuine host-OOM (TIO_CK →
-                    // std::abort), never returns null. So no sync-path divert is
-                    // needed here; a genuine OOM is an unrecoverable fail-loud, not a
-                    // divertible condition.
-                    void* host = tio.pinned_alloc(nbytes);
-                    dsts.push_back(reinterpret_cast<std::uint64_t>(host));
-                    lens.push_back(static_cast<std::uint32_t>(nbytes));
-                    srcs.push_back(outs[i]);
-                    nbs.push_back(nbytes);
-                    pend.staged.push_back({host, o.cls, cap, member,
-                                           static_cast<std::uint32_t>(i), n_out});
-                }
-                if (!pend.staged.empty()) {
-                    // ONE batched eager-D2H → a single copy-stream done event (FIFO,
-                    // WAR-guard-persisted exactly like a2's single-buffer guard).
-                    cudaEvent_t d2h_done = tio.eager_d2h_outputs(
-                        dsts.data(), lens.data(), srcs.data(), nbs.data(),
-                        dsts.size(), sample_done);
-                    if (executor.last_eager_d2h_done)
-                        CUDA_CHECK(cudaEventDestroy(executor.last_eager_d2h_done));
-                    executor.last_eager_d2h_done = d2h_done;
-                    CUDA_CHECK(cudaEventDestroy(sample_done));
-                    pend.active = true;
-                    executor.last_fire_deferred = true;
-                    // Empty-channel resp; the tokens/scalars ride the pinned buffers,
-                    // the trampoline builds the real response post-D2H.
-                    out_resp = pie_driver::PieForwardResponseView{};
-                    out_resp.num_requests = static_cast<std::uint32_t>(R);
-                    write_probes(out_resp, executor, t_entry, t_wire_parse_end,
-                                 t_plan_end, t_h2d_end, t_kernel_launch_end, t_sync_end);
-                    return;
-                }
-                // Nothing stageable → free the marker event + fall through to sync.
-                CUDA_CHECK(cudaEventDestroy(sample_done));
-                std::vector<pie_driver::PerRequestOutput> per_req(
-                    static_cast<std::size_t>(R));
-                marshal_ir_program_output(pif, outs, /*num_rows=*/1,
-                                          std::span<const std::uint32_t>(&member, 1),
-                                          per_req);
-                executor.response_builder.build(per_req, out_resp);
-                write_probes(out_resp, executor, t_entry, t_wire_parse_end, t_plan_end,
-                             t_h2d_end, t_kernel_launch_end, t_sync_end);
-                return;
-            }
         }
 
         // CUDA's fast token samplers do not yet consume BRLE logit masks.

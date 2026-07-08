@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use pie_sampling_ir::types::{DType, Shape};
+use pie_ptir::types::{DType, Shape};
 
 use crate::context::{self, ChannelRef, ChannelState};
 use crate::error::Span;

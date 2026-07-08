@@ -2,12 +2,12 @@
 //! time (as today's `Graph::new(vocab)`). The inferlet configures them once; the
 //! trace is specialized to the concrete values (a different model = a different
 //! trace, batch-by-program). Also builds echo's bind-time
-//! [`ModelProfile`](pie_sampling_ir::ptir::registry::ModelProfile).
+//! [`ModelProfile`](pie_ptir::registry::ModelProfile).
 
 use core::cell::Cell;
 
-use pie_sampling_ir::ptir::registry::ModelProfile;
-use pie_sampling_ir::types::DType;
+use pie_ptir::registry::ModelProfile;
+use pie_ptir::types::DType;
 
 #[derive(Clone, Copy, Debug)]
 struct ModelConfig {

@@ -5,9 +5,9 @@
 //! round-trips. This is the correctness contract (NOT hash-equality with echo's
 //! hand-built containers; emission order may differ, results may not).
 
-use pie_sampling_ir::eval::Value;
-use pie_sampling_ir::ptir::container;
-use pie_sampling_ir::ptir::interp::{HostError, Instance, NoKernels, PassInputs};
+use pie_ptir::interp::Value;
+use pie_ptir::container;
+use pie_ptir::interp::{HostError, Instance, NoKernels, PassInputs};
 
 use ptir::prelude::*;
 use ptir::Channel;

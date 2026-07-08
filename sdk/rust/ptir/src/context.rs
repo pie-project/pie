@@ -1,7 +1,7 @@
 //! The trace-recording context: a thread-local **session** holding the stage
 //! currently being traced plus the channel registry. Channel/Tensor methods
 //! consult it — inside a traced stage closure they record echo's canonical
-//! [`ptir::op::Op`](pie_sampling_ir::ptir::op::Op); on the host they take the
+//! [`ptir::op::Op`](pie_ptir::op::Op); on the host they take the
 //! async path.
 //!
 //! Single-threaded by construction (wasm inferlets; host tests run each trace on
@@ -12,14 +12,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use pie_sampling_ir::ptir::op::{ChannelIndex, Op};
-use pie_sampling_ir::types::{DType, Shape, ValueType};
+use pie_ptir::op::{ChannelIndex, Op};
+use pie_ptir::types::{DType, Shape, ValueType};
 
 use crate::error::Span;
 use crate::value::ConstData;
 
-/// Attachment stage — re-export of echo's canonical [`Stage`](pie_sampling_ir::ptir::registry::Stage).
-pub use pie_sampling_ir::ptir::registry::Stage;
+/// Attachment stage — re-export of echo's canonical [`Stage`](pie_ptir::registry::Stage).
+pub use pie_ptir::registry::Stage;
 
 /// A channel's mutable shared state (behind `Rc<RefCell<..>>`; a `Channel` is a
 /// handle to it). Carries the trace decl, the per-instance seed flag, and the
@@ -64,7 +64,7 @@ pub type ChannelRef = Rc<RefCell<ChannelState>>;
 pub(crate) struct SinkCall {
     pub name: String,
     pub span: Span,
-    pub scope: pie_sampling_ir::ptir::registry::SinkScope,
+    pub scope: pie_ptir::registry::SinkScope,
 }
 
 /// The stage currently being traced.
@@ -283,7 +283,7 @@ pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
 pub(crate) fn record_sink(
     name: String,
     span: Span,
-    scope: pie_sampling_ir::ptir::registry::SinkScope,
+    scope: pie_ptir::registry::SinkScope,
 ) {
     SESSION.with_borrow_mut(|s| {
         s.as_mut()

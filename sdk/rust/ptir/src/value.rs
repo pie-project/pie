@@ -1,13 +1,13 @@
 //! `Tensor` — an SSA value (overview §1) — plus the free-function op surface that
 //! matches the overview §3/§6 examples verbatim. Ops emit echo's canonical
-//! [`ptir::op::Op`](pie_sampling_ir::ptir::op::Op); composed ops (`gumbel`,
-//! `mask_apply`, `softmax`, …) inline echo's [`expand`](pie_sampling_ir::ptir::expand)
+//! [`ptir::op::Op`](pie_ptir::op::Op); composed ops (`gumbel`,
+//! `mask_apply`, `softmax`, …) inline echo's [`expand`](pie_ptir::expand)
 //! expansions so a backend that fuses the core fuses these for free.
 
 use alloc::vec::Vec;
 
-use pie_sampling_ir::ptir::op::{IntrinsicId, Op};
-use pie_sampling_ir::types::{DType, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
+use pie_ptir::op::{IntrinsicId, Op};
+use pie_ptir::types::{DType, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
 
 use crate::context::emit;
 

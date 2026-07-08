@@ -1,6 +1,6 @@
 //! SDK span lints (overview P1.3): SPSC double-endpoint, readiness-direction
 //! conflict, and sink stage-precedence — caught during assembly with source
-//! spans. Echo's [`bind`](pie_sampling_ir::ptir::validate::bind) is the
+//! spans. Echo's [`bind`](pie_ptir::validate::bind) is the
 //! authoritative SPSC gate (host-role vs pass; the descriptor + all stages are
 //! one pass endpoint, so a channel touched by both the descriptor and a stage is
 //! legal). These run first for friendly, span-rich author errors and mirror
@@ -8,7 +8,7 @@
 
 use alloc::vec::Vec;
 
-use pie_sampling_ir::ptir::registry::{SinkScope, Stage};
+use pie_ptir::registry::{SinkScope, Stage};
 
 use crate::context::{ChannelRef, SinkCall};
 use crate::error::{Endpoint, Span, TraceError};

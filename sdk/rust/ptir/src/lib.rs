@@ -7,8 +7,8 @@
 //! different branch is a different program (batch-by-program).
 //!
 //! The trace lowers to echo's canonical
-//! [`TraceContainer`](pie_sampling_ir::ptir::container::TraceContainer) and is
-//! validated by echo's [`bind`](pie_sampling_ir::ptir::validate::bind) — the
+//! [`TraceContainer`](pie_ptir::container::TraceContainer) and is
+//! validated by echo's [`bind`](pie_ptir::validate::bind) — the
 //! shared P0 contract (`interface/sampling-ir/src/ptir`). This crate owns the
 //! authoring surface + trace-once memoization + the SDK span lints.
 //!
@@ -73,9 +73,9 @@ pub use value::{
 
 /// The canonical PTIR contract (op-table, container, validator, interpreter) —
 /// re-exported for tests and downstream carriers.
-pub use pie_sampling_ir::ptir;
-pub use pie_sampling_ir::ptir::registry::Stage;
-pub use pie_sampling_ir::types::{DType, Shape, ValueType};
+pub use pie_ptir as ptir;
+pub use pie_ptir::registry::Stage;
+pub use pie_ptir::types::{DType, Shape, ValueType};
 
 /// Glob-import surface for inferlet authors: the verbatim overview names.
 pub mod prelude {

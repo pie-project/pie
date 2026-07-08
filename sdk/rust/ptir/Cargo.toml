@@ -11,7 +11,7 @@ categories = ["api-bindings"]
 
 # Standalone crate (not in the host workspace, like sdk/rust/*) so it can be
 # `cargo test`ed on the host. Authors PTIR traces against the canonical
-# `pie-sampling-ir` primitives (Shape / DType / FNV-1a identity hash). The trace
+# `pie-ptir` primitives (Shape / DType / FNV-1a identity hash). The trace
 # container encoding + full op-table + validator are the P0 seam co-owned with
 # echo; this crate carries a PROVISIONAL encoder + validator behind the `lower`
 # module, seamed to swap for echo's canonical crate on convergence.
@@ -28,16 +28,16 @@ path = "src/lib.rs"
 # ptir-sdk-greedy`. A `no_std` single-threaded context is only needed for
 # non-wasip2 no_std targets (not required for the inferlet fold).
 default = ["std"]
-std = ["pie-sampling-ir/std"]
+std = ["pie-ptir/std"]
 
 [dependencies]
-pie-sampling-ir = { path = "../../../interface/sampling-ir", default-features = false }
+pie-ptir = { path = "../../../interface/ptir", default-features = false }
 
 # Host-only: the CPU reference interpreter (`eval`/`interp`) for tier-0
 # result-parity tests. Dev-deps are excluded from the wasm build, so this never
 # reaches the SDK.
 [dev-dependencies]
-pie-sampling-ir = { path = "../../../interface/sampling-ir", features = ["eval"] }
+pie-ptir = { path = "../../../interface/ptir", features = ["eval"] }
 
 [lints.rust]
 unsafe_code = "forbid"

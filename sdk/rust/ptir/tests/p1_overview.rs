@@ -311,7 +311,7 @@ fn s6_2_beam_epilogue_binds() {
     // The [B,P] shape MUST survive encode→decode, else `validate_seeds` rejects
     // the [B,P] seed as a byte-length mismatch (numel collapse).
     assert_eq!(c.channels[0].shape.numel(), (B * P) as u64, "pages [B,P] numel in built container");
-    let decoded = pie_sampling_ir::ptir::container::decode(&traced.encode())
+    let decoded = pie_ptir::container::decode(&traced.encode())
         .expect("decode beam container");
     assert_eq!(decoded.channels[0].shape.dims(), &[B, P], "pages 2D dims survive encode->decode");
     assert_eq!(

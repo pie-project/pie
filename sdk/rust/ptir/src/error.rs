@@ -3,15 +3,15 @@
 //! Two layers: the SDK **span lints** (double-endpoint, readiness-direction,
 //! sink misplacement) caught during assembly with `#[track_caller]` source
 //! spans (overview P1.3), and the authoritative **bind** verdict wrapping echo's
-//! [`ValidateError`](pie_sampling_ir::ptir::validate::ValidateError) on the
+//! [`ValidateError`](pie_ptir::validate::ValidateError) on the
 //! canonical container.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use pie_sampling_ir::ptir::registry::Stage;
-use pie_sampling_ir::ptir::validate::ValidateError;
+use pie_ptir::registry::Stage;
+use pie_ptir::validate::ValidateError;
 
 /// A source location captured at an author call site (`file:line:col`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,12 +1,12 @@
 //! `intrinsics::*` — first-party stage-scoped values + model constants (overview
 //! §4). Model constants are functions (a runtime value can't be a bare path in
 //! Rust; deviation approved). Stage-scoped values emit echo's
-//! [`Op::IntrinsicVal`](pie_sampling_ir::ptir::op::Op::IntrinsicVal) with the
+//! [`Op::IntrinsicVal`](pie_ptir::op::Op::IntrinsicVal) with the
 //! trace-known shape/dtype the registry checks. `intrinsics::kernel::*` second-
 //! party surface: a minimal `attn_page_mask` sink now; full rollout in P7.
 
-use pie_sampling_ir::ptir::op::IntrinsicId;
-use pie_sampling_ir::types::{DType, Shape};
+use pie_ptir::op::IntrinsicId;
+use pie_ptir::types::{DType, Shape};
 
 use crate::context::current_rows;
 use crate::model;
@@ -87,7 +87,7 @@ pub mod kernel {
     use crate::error::Span;
     use crate::value::AsTensor;
     use alloc::string::String;
-    use pie_sampling_ir::ptir::registry::SinkScope;
+    use pie_ptir::registry::SinkScope;
 
     /// `attn_page_mask(mask)` — a configuration sink (overview §6.1): this
     /// layer's attention consumes the page mask. Returns nothing. Recorded for

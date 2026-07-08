@@ -10,12 +10,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use pie_sampling_ir::ptir::container::{
+use pie_ptir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
-use pie_sampling_ir::ptir::op::Op;
-use pie_sampling_ir::ptir::registry::{Port, Stage};
-use pie_sampling_ir::ptir::validate::{bind, BoundTrace};
+use pie_ptir::op::Op;
+use pie_ptir::registry::{Port, Stage};
+use pie_ptir::validate::{bind, BoundTrace};
 
 use crate::channel::Channel;
 use crate::context::{self, ChannelRef, SinkCall};
