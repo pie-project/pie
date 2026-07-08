@@ -186,6 +186,7 @@ pub struct FutureOutput {
     spec_positions_for_fill: Vec<u32>,
     adapter_id: Option<crate::adapter::AdapterId>,
     adapter_seed: Option<i64>,
+    error: Option<String>,
 }
 
 impl FutureOutput {
@@ -262,13 +263,9 @@ impl FutureOutput {
         self.done = true;
     }
 
-    fn finish_empty(&mut self) {
+    fn finish_error(&mut self, error: String) {
         self.release_pin();
-        self.result = Some(pie::core::inference::Output {
-            slots: Vec::new(),
-            spec_tokens: Vec::new(),
-            spec_positions: Vec::new(),
-        });
+        self.error = Some(error);
         self.done = true;
     }
 }
@@ -306,10 +303,10 @@ impl Pollable for FutureOutput {
                 Ok(Ok(resp)) => self.finish_ok(resp),
                 Ok(Err(e)) => {
                     tracing::warn!("future output failed: {e:#}");
-                    self.finish_empty();
+                    self.finish_error(e.to_string());
                 }
                 Err(_) => {
-                    self.finish_empty();
+                    self.finish_error("future output channel closed".to_string());
                 }
             }
         } else {
@@ -593,8 +590,8 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             let img = self.ctx().table.get(&image)?;
             (
                 img.span.token_count,
-                img.span.grid,    // merged LLM grid (for M-RoPE positions)
-                img.patch_grid,   // pre-merge patch grid (for the driver encoder)
+                img.span.grid,  // merged LLM grid (for M-RoPE positions)
+                img.patch_grid, // pre-merge patch grid (for the driver encoder)
                 img.uses_mrope,
                 img.pixels.clone(),
                 img.positions.clone(),
@@ -671,7 +668,8 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // Log-mel features (f32 → little-endian bytes).
         req.audio_features
             .extend_from_slice(bytemuck::cast_slice(&mel));
-        req.audio_feature_indptr.push(req.audio_features.len() as u32);
+        req.audio_feature_indptr
+            .push(req.audio_features.len() as u32);
 
         Ok(())
     }
@@ -890,7 +888,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 let (system_spec_supported, system_spec_enabled) =
                     crate::model::get_model(model_id)
                         .map(|m| {
-                            (m.system_speculation_supported(), m.enable_system_speculation())
+                            (
+                                m.system_speculation_supported(),
+                                m.enable_system_speculation(),
+                            )
                         })
                         .unwrap_or((false, false));
                 if !system_spec_supported {
@@ -986,6 +987,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             spec_positions_for_fill,
             adapter_id,
             adapter_seed,
+            error: None,
         };
         let postprocess_start = profiling.then(Instant::now);
         let pushed = self.ctx().table.push(future_output)?;
@@ -1024,15 +1026,18 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
                     Ok(Err(e)) => {
                         result.rx = None;
                         tracing::warn!("future output failed: {e:#}");
-                        result.finish_empty();
+                        result.finish_error(e.to_string());
                     }
                     Err(TryRecvError::Closed) => {
                         result.rx = None;
-                        result.finish_empty();
+                        result.finish_error("future output channel closed".to_string());
                     }
                     Err(TryRecvError::Empty) => {}
                 }
             }
+        }
+        if let Some(error) = result.error.take() {
+            return Err(anyhow::anyhow!(error));
         }
         if result.done {
             Ok(take(&mut result.result))
@@ -1196,5 +1201,39 @@ impl pie::core::inference::HostMatcher for InstanceState {
     async fn drop(&mut self, this: Resource<Matcher>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn future_output_records_forward_errors() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err(anyhow::anyhow!("driver exploded"))).unwrap();
+
+        let mut future = FutureOutput {
+            result: None,
+            rx: Some(rx),
+            samplers: Vec::new(),
+            done: false,
+            model_id: 0,
+            context_id: None,
+            was_pinned: false,
+            fill_tokens: Vec::new(),
+            fill_positions: Vec::new(),
+            fill_masks: Vec::new(),
+            spec_tokens_for_fill: Vec::new(),
+            spec_positions_for_fill: Vec::new(),
+            adapter_id: None,
+            adapter_seed: None,
+            error: None,
+        };
+
+        future.ready().await;
+
+        assert!(future.result.is_none());
+        assert_eq!(future.error.as_deref(), Some("driver exploded"));
     }
 }

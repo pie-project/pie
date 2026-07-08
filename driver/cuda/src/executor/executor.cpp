@@ -2276,6 +2276,7 @@ void handle_fire_batch(
 
         const int N = static_cast<int>(tok_view.size());
         const int num_sampling = static_cast<int>(sidx_view.size());
+        const bool has_sampling = num_sampling > 0;
         dbg_R = R; dbg_N = N;
 
         // Qwen3-VL: assemble the per-token [N,3] M-RoPE positions. Text rows
@@ -2677,7 +2678,7 @@ void handle_fire_batch(
         // pass) produces no logits and no sampled tokens — skip every argmax /
         // sampling launch (they would read the unwritten, undersized
         // `ws.logits` over all N rows and fault).
-        if (num_sampling == 0) {
+        if (!has_sampling) {
             // nothing to sample
         } else if (tp_greedy_argmax) {
             kernels::launch_select_global_argmax_pairs(
@@ -2733,19 +2734,25 @@ void handle_fire_batch(
         // `h_per_*`, `h_sample_idx`) are still in scope here for the
         // response builder.
 
-        // Only copy the first N entries — `pi.sampled` is sized for
-        // max_workspace_tokens, but only [0, N) are valid this fire.
-        // Async on the same stream the sampler ran on so it slots into
-        // the stream's FIFO; we sync immediately after because the
-        // response payload depends on these tokens. (Future work moves
-        // the sync past the host-side response-prep so the host
-        // and GPU can overlap.)
-        std::int32_t* sampled_host =
-            sampled_pinned_buf(static_cast<std::size_t>(N));
-        CUDA_CHECK(cudaMemcpyAsync(sampled_host, pi.sampled.data(),
-                                   sizeof(std::int32_t) * N,
-                                   cudaMemcpyDeviceToHost,
-                                   cublas.stream()));
+        // Only sampled fires produce valid `pi.sampled` rows. Prefill-only
+        // fires (for example Context::flush) still need the stream sync below
+        // to observe KV writes, but must not copy sampled rows that no kernel
+        // wrote.
+        std::int32_t* sampled_host = nullptr;
+        if (has_sampling) {
+            // Copy the first N entries — `pi.sampled` is sized for
+            // max_workspace_tokens, but only [0, N) are valid this fire.
+            // Async on the same stream the sampler ran on so it slots into
+            // the stream's FIFO; we sync immediately after because the
+            // response payload depends on these tokens. (Future work moves
+            // the sync past the host-side response-prep so the host
+            // and GPU can overlap.)
+            sampled_host = sampled_pinned_buf(static_cast<std::size_t>(N));
+            CUDA_CHECK(cudaMemcpyAsync(sampled_host, pi.sampled.data(),
+                                       sizeof(std::int32_t) * N,
+                                       cudaMemcpyDeviceToHost,
+                                       cublas.stream()));
+        }
         const auto t_kernel_launch_end = clock::now();
         verify_timer.finish(cublas.stream());
         CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
@@ -2758,7 +2765,7 @@ void handle_fire_batch(
         // and benchmark traffic keep the GPU sampler result.
         const std::int32_t* all_sampled = sampled_host;
         std::vector<std::int32_t> sampled_override;
-        if (!logit_masks_view.empty()) {
+        if (has_sampling && !logit_masks_view.empty()) {
             sampled_override.assign(sampled_host, sampled_host + N);
             apply_logit_mask_overrides(
                 ws, sampled_override, logit_masks_view, logit_mask_indptr_view,
