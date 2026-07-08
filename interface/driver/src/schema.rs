@@ -342,9 +342,19 @@ pub struct ForwardRequest {
     /// Per-program byte CSR partitioning `ptir_program_sidecar_bytes` (leading 0).
     pub ptir_program_sidecar_indptr: Vec<u32>,
 
+    /// Dense-channel-index → global channel id map, concatenated across
+    /// programs. For program `p`, the global ids of its declared channels in
+    /// dense order occupy `ptir_program_channel_ids[indptr[p]..indptr[p+1]]`;
+    /// the driver binds the trace's dense channel references to the global
+    /// device channel registry through it (multi-pass channel sharing). Always
+    /// present alongside `ptir_program_hashes` under the global-id ABI.
+    pub ptir_program_channel_ids: Vec<u64>,
+    /// Per-program CSR into `ptir_program_channel_ids` (leading 0).
+    pub ptir_program_channel_ids_indptr: Vec<u32>,
+
     /// Seed table (per-instance `Channel::from` values for `seeded` channels;
-    /// per-instance data D2, NOT in the hash). Seeded channel index per entry.
-    pub ptir_program_seed_channels: Vec<u32>,
+    /// per-instance data D2, NOT in the hash). Global channel id per entry.
+    pub ptir_program_seed_channels: Vec<u64>,
     /// Concatenated seed value bytes.
     pub ptir_program_seed_blob: Vec<u8>,
     /// Byte length per seed entry (parallel to `ptir_program_seed_channels`).
@@ -353,14 +363,24 @@ pub struct ForwardRequest {
     pub ptir_program_seed_indptr: Vec<u32>,
 
     /// Host-put table (host `channel.put` inputs, D1-coalesced before submit).
-    /// Target channel index per entry.
-    pub ptir_program_host_put_channels: Vec<u32>,
+    /// Global channel id per entry.
+    pub ptir_program_host_put_channels: Vec<u64>,
     /// Concatenated host-put value bytes.
     pub ptir_program_host_put_blob: Vec<u8>,
     /// Byte length per host-put entry (parallel to `ptir_program_host_put_channels`).
     pub ptir_program_host_put_lens: Vec<u32>,
     /// Per-program CSR into the host-put entries (leading 0).
     pub ptir_program_host_put_indptr: Vec<u32>,
+
+    /// Release markers (W0.3): global channel ids whose device storage the
+    /// driver must free after serving this fire — sent when the runtime drops
+    /// the last handle to a channel. Rides any request (or a heartbeat submit);
+    /// order-independent, deduped host-side.
+    pub ptir_release_channel_ids: Vec<u64>,
+    /// Release markers: PTIR instance ids whose persistent channel-arena views
+    /// the driver must free (fixes the pre-existing instance-map leak). Sent
+    /// when the runtime drops a forward-pass.
+    pub ptir_release_instance_ids: Vec<u64>,
 
     // WS8 P2 device-resident next-input link (`forward-pass.next-input`). Sources
     // some of this request's input tokens device-side from a *prior* forward's
@@ -805,8 +825,10 @@ pub struct SamplingProgramSubmission {
 /// One per-channel value (a seed or a host-put) in a [`PtirProgramSubmission`].
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PtirChannelValue {
-    /// Channel index within the program's declarations.
-    pub channel: u32,
+    /// Global channel id (runtime-minted, inferlet-scoped) this value targets.
+    /// Re-keyed from the old program-local dense index so a channel bound to
+    /// several passes routes to one device cell (multi-pass channels).
+    pub channel: u64,
     /// Raw little-endian value bytes (packed per the channel's dtype; `bool`
     /// travels packed, D1).
     pub bytes: Vec<u8>,
@@ -831,6 +853,12 @@ pub struct PtirProgramSubmission {
     /// PTIB sidecar (`encode_bound`) on a first fire, alongside `bytes` (same
     /// hash-keyed lifecycle); `None` ⇒ steady state.
     pub sidecar: Option<Vec<u8>>,
+    /// Dense-channel-index → global channel id map (one entry per declared
+    /// channel, in dense order). Lets the driver bind this program's trace-local
+    /// channel references to the global device channel registry; identical for
+    /// every fire of the instance. Empty on a legacy submission that predates
+    /// global ids (the driver then treats seed/host-put `channel` as dense).
+    pub channel_ids: Vec<u64>,
     /// Per-instance seed values for `seeded` channels (D2; not in the hash).
     pub seeds: Vec<PtirChannelValue>,
     /// Host-put channel inputs (coalesced before submit).
@@ -1066,6 +1094,9 @@ impl ForwardRequest {
         if self.ptir_program_sidecar_indptr.is_empty() {
             self.ptir_program_sidecar_indptr.push(0);
         }
+        if self.ptir_program_channel_ids_indptr.is_empty() {
+            self.ptir_program_channel_ids_indptr.push(0);
+        }
         if self.ptir_program_seed_indptr.is_empty() {
             self.ptir_program_seed_indptr.push(0);
         }
@@ -1087,6 +1118,12 @@ impl ForwardRequest {
         }
         self.ptir_program_sidecar_indptr
             .push(self.ptir_program_sidecar_bytes.len() as u32);
+
+        // Dense-index → global-id map (one entry per declared channel).
+        self.ptir_program_channel_ids
+            .extend_from_slice(&prog.channel_ids);
+        self.ptir_program_channel_ids_indptr
+            .push(self.ptir_program_channel_ids.len() as u32);
 
         for s in &prog.seeds {
             self.ptir_program_seed_channels.push(s.channel);
@@ -1126,7 +1163,16 @@ impl ForwardRequest {
         let sidecar =
             if shi > slo { Some(self.ptir_program_sidecar_bytes[slo..shi].to_vec()) } else { None };
 
-        let read_table = |indptr: &[u32], channels: &[u32], blob: &[u8], lens: &[u32]| {
+        // Dense-index → global-id map for this program.
+        let clo = *self.ptir_program_channel_ids_indptr.get(p).unwrap_or(&0) as usize;
+        let chi = *self.ptir_program_channel_ids_indptr.get(p + 1).unwrap_or(&0) as usize;
+        let channel_ids = self
+            .ptir_program_channel_ids
+            .get(clo..chi)
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
+
+        let read_table = |indptr: &[u32], channels: &[u64], blob: &[u8], lens: &[u32]| {
             let lo = *indptr.get(p).unwrap_or(&0) as usize;
             let hi = *indptr.get(p + 1).unwrap_or(&0) as usize;
             let mut byte_off: usize =
@@ -1154,7 +1200,7 @@ impl ForwardRequest {
             &self.ptir_program_host_put_blob,
             &self.ptir_program_host_put_lens,
         );
-        Some(PtirProgramSubmission { hash, instance, bytes, sidecar, seeds, host_puts })
+        Some(PtirProgramSubmission { hash, instance, bytes, sidecar, channel_ids, seeds, host_puts })
     }
 
     /// Concatenate every PTIR program from `req` into `self` — the batch fold's
@@ -1462,8 +1508,8 @@ pub struct ForwardResponse {
     // (`ptir_program_hashes[p]`/`ptir_program_instances[p]`). Empty for the
     // legacy / Sampling-IR paths. Bool cells travel packed (D1), same as the
     // host-put wire.
-    /// Produced-channel index per output entry (a host-facing Reader channel).
-    pub ptir_output_channels: Vec<u32>,
+    /// Produced-channel global id per output entry (a host-facing Reader channel).
+    pub ptir_output_channels: Vec<u64>,
     /// Concatenated produced-cell value bytes (bool packed per the dtype, D1).
     pub ptir_output_blob: Vec<u8>,
     /// Byte length per output entry (parallel to `ptir_output_channels`).
@@ -1551,7 +1597,7 @@ pub struct AdapterRequest {
 mod ptir_carrier_tests {
     use super::{ForwardRequest, PtirChannelValue, PtirProgramSubmission};
 
-    fn cv(channel: u32, bytes: &[u8]) -> PtirChannelValue {
+    fn cv(channel: u64, bytes: &[u8]) -> PtirChannelValue {
         PtirChannelValue { channel, bytes: bytes.to_vec() }
     }
 
@@ -1562,8 +1608,9 @@ mod ptir_carrier_tests {
             instance: 1, // instance A's first fire ships bytes + sidecar + seeds
             bytes: Some(vec![1, 2, 3, 4, 5]), // first fire ships bytes
             sidecar: Some(vec![9, 8, 7]),     // + the PTIB sidecar, same lifecycle
-            seeds: vec![cv(0, &10u32.to_le_bytes()), cv(3, &[1, 0])],
-            host_puts: vec![cv(2, &[0xFF, 0x00, 0x00, 0x00])],
+            channel_ids: vec![100, 101, 102, 103], // dense idx -> global id
+            seeds: vec![cv(100, &10u32.to_le_bytes()), cv(103, &[1, 0])],
+            host_puts: vec![cv(102, &[0xFF, 0x00, 0x00, 0x00])],
         };
         // steady-state fire of another instance/hash: no bytes/seeds, driver
         // serves the program from cache + drives the already-built arena.
@@ -1572,8 +1619,9 @@ mod ptir_carrier_tests {
             instance: 2,
             bytes: None,
             sidecar: None,
+            channel_ids: vec![200, 201],
             seeds: vec![],
-            host_puts: vec![cv(1, &7u32.to_le_bytes())],
+            host_puts: vec![cv(201, &7u32.to_le_bytes())],
         };
 
         let mut req = ForwardRequest::default();

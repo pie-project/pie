@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::adapter;
 use crate::arena;
 use crate::auth;
 use crate::driver;
@@ -262,17 +261,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // default — the legacy error path is byte-for-byte unchanged. The
     // existing `scheduler.restore_pause_at_utilization` config gates the
     // restore anti-thrash pause (its long-reserved consumer).
-    if crate::contention::contention_mode() == crate::contention::ContentionMode::Preempt {
+    if crate::inference::contention::contention_mode() == crate::inference::contention::ContentionMode::Preempt {
         // Backend tiers: passive v1 (waiters ride natural frees — proven
         // e2e, M-AB ②③) by default; `PIE_KV_PREEMPT_ACTIVE=1` selects the
         // v2 self-suspend backend (active FCFS victim preempt).
-        let backend: Box<dyn crate::contention::ReclaimBackend> =
-            if crate::contention::preempt_active() {
-                Box::new(crate::contention::SelfSuspendBackend::new(arena_model_idx, 0))
+        let backend: Box<dyn crate::inference::contention::ReclaimBackend> =
+            if crate::inference::contention::preempt_active() {
+                Box::new(crate::inference::contention::SelfSuspendBackend::new(arena_model_idx, 0))
             } else {
-                Box::new(crate::contention::ArenaPoolBackend::new(arena_model_idx, 0))
+                Box::new(crate::inference::contention::ArenaPoolBackend::new(arena_model_idx, 0))
             };
-        crate::contention::init_contention(crate::contention::ContentionOrchestrator::new(
+        crate::inference::contention::init_contention(crate::inference::contention::ContentionOrchestrator::new(
             backend,
             cfg.scheduler.restore_pause_at_utilization,
         ));
@@ -286,7 +285,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         cfg.scheduler.request_timeout_secs,
     )
     .await;
-    adapter::spawn(&drivers);
 
     Ok(BootstrapHandle {
         token: auth::get_internal_auth_token().await?,

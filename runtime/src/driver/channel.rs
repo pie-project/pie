@@ -134,30 +134,6 @@ pub fn fire_batch_sync(
     }
 }
 
-/// Fire-and-forget JIT **prefetch** for `driver_idx` — the #11 prefetch seam.
-///
-/// Called host-side at `execute()` attach-time, BEFORE the forward is submitted
-/// (max lead): warms the driver's compile cache for a sampling program
-/// (`bytecode` + its `manifest` of input bindings) so the NVRTC compile overlaps
-/// the in-flight run-ahead steps and is off the TTFT path. The driver keys the
-/// compile on `program_identity_hash(bytecode, manifest)` — the SAME key as the
-/// #10 distinct-count / #11 compile-cache / M-batch grouping — so it dedups
-/// against the in-flight compile pool (idempotent: duplicate or already-compiled
-/// programs collapse to one).
-///
-/// Best-effort and non-blocking: a missing channel or a driver without a JIT
-/// sampling backend (the default trait no-op) simply skips — the later real
-/// `get_or_compile` then compiles as before (correctness never depends on the
-/// prefetch landing). Merged R≥2 passes prefetch each program individually.
-pub fn prefetch_compile(
-    driver_idx: DriverId,
-    bytecode: &[u8],
-    manifest: &[pie_sampling_ir::Binding],
-) {
-    if let Ok(ch) = get_channel(driver_idx) {
-        ch.prefetch_compile(bytecode, manifest);
-    }
-}
 
 /// A submitted-but-not-yet-awaited forward batch. The request is already
 /// enqueued (its submission order fixed at [`fire_batch_deferred`] call time);

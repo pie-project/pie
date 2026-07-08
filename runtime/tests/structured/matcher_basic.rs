@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use pie::inference::structured::bitmask;
-use pie::inference::structured::grammar::Grammar;
-use pie::inference::structured::matcher::GrammarMatcher;
+use pie::grammar::bitmask;
+use pie::grammar::grammar::Grammar;
+use pie::grammar::matcher::GrammarMatcher;
 use pie::model::tokenizer::Tokenizer;
 
 /// Build a matcher with a given vocabulary.

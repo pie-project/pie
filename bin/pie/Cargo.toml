@@ -24,14 +24,9 @@ path = "src/main.rs"
 default = []
 driver-cuda = ["pie-worker/driver-cuda"]
 driver-dummy = ["pie-worker/driver-dummy"]
-# Probe + PTIR thrust-2 passthroughs to the embedded worker (→ runtime).
+# Probe passthroughs to the embedded worker (→ runtime).
 profile-fire = ["pie-worker/profile-fire"]
 profile-driver-cuda = ["pie-worker/profile-driver-cuda"]
-run-ahead = ["pie-worker/run-ahead"]
-# PTIR thrust-3 host surface (register-program / instantiate / pipeline). Enables
-# the runtime `ptir` feature (host WIT impl + submit dispatch). pie-bin depends on
-# `pie` directly, and cargo unifies the feature across the embedded worker's `pie`.
-ptir = ["pie/ptir"]
 
 [dependencies]
 # Shared process skeleton (CLI flags, paths, tracing, signals, /metrics, banner).

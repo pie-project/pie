@@ -71,14 +71,11 @@ impl pie::core::model::Host for InstanceState {
     /// Arena accounting block size. v1: one KV page == one arena block, so this
     /// is the bound model's KV page size (tokens).
     async fn arena_block_size(&mut self) -> Result<u64> {
-        Ok(crate::page_size::tokens_per_page(0) as u64)
+        Ok(crate::working_set::page_size::tokens_per_page(0) as u64)
     }
 
     async fn encode(&mut self, text: String) -> Result<Vec<u32>> {
         let ids = model::model().tokenize(&text);
-        if std::env::var("PIE_ENCODE_TRACE").is_ok() {
-            eprintln!("[encode] {text:?} -> {ids:?}");
-        }
         Ok(ids)
     }
 

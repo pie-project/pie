@@ -16,7 +16,7 @@
 //! depend on the working-set WIT constructor wiring.
 
 use pie::arena::{Arena, ArenaConfig};
-use pie::page_hash::compute_page_hashes;
+use pie::working_set::page_hash::compute_page_hashes;
 use pie::inference::forward_prepare::{KvWrite, check_input_nonempty, project_kv};
 use pie::working_set::kv::{KvCas, KvWorkingSet};
 use pie_driver_abi::Brle;

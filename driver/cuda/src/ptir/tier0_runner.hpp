@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include "ptir/channels.hpp"
+#include "ptir/channel_registry.hpp"
 #include "ptir/tier0_launch.hpp"
 #include "ptir/trace.hpp"
 
@@ -58,23 +60,70 @@ struct PassResult {
 
 class Tier0Runner {
   public:
-    explicit Tier0Runner(const Trace& trace) : trace_(&trace) { arena_.init(trace.channels); }
+    explicit Tier0Runner(const Trace& trace) : trace_(&trace) {
+        cudaMalloc(&d_bits_, sizeof(std::uint32_t));
+        cudaMalloc(&d_commit_, sizeof(std::uint32_t));
+    }
+    ~Tier0Runner() {
+        if (d_bits_) cudaFree(d_bits_);
+        if (d_commit_) cudaFree(d_commit_);
+        if (d_slot_map_) cudaFree(d_slot_map_);
+    }
+    Tier0Runner(const Tier0Runner&) = delete;
+    Tier0Runner& operator=(const Tier0Runner&) = delete;
 
-    ChannelArena& arena() { return arena_; }
+    // Bind this runner's channel view (W0.1): the dense→global-slot map onto the
+    // shared device channel registry. Must be called (by `PtirInstance`) before
+    // the first `run_pass`. Uploads the slot map for `k_channel_bits`.
+    void bind_view(ChannelView* view) {
+        view_ = view;
+        const std::vector<std::uint32_t>& slots = view_->slots();
+        slot_map_len_ = (std::uint32_t)slots.size();
+        if (d_slot_map_) cudaFree(d_slot_map_);
+        d_slot_map_ = nullptr;
+        if (slot_map_len_ > 0) {
+            cudaMalloc(&d_slot_map_, slot_map_len_ * sizeof(std::uint32_t));
+            cudaMemcpy(d_slot_map_, slots.data(), slot_map_len_ * sizeof(std::uint32_t),
+                       cudaMemcpyHostToDevice);
+        }
+    }
+
+    ChannelView& view() { ensure_channels(); return *view_; }
+
+    // Back-compat accessor (driver tests): the channel VIEW exposes the same
+    // seed_cell / host_feed / host_take / committed_full / read_committed surface
+    // the old per-instance `ChannelArena` did. Auto-inits standalone channels if
+    // no shared view was bound (test convenience).
+    ChannelView& arena() { ensure_channels(); return *view_; }
+
+    // Standalone channel storage (tests / single-instance use): own a private
+    // registry + view with identity (1-based) global ids, so `run_pass` works
+    // without an external shared registry. Production binds a shared registry
+    // via `bind_view` instead.
+    void init_standalone_channels() {
+        standalone_reg_ = std::make_unique<DeviceChannelRegistry>();
+        std::vector<std::uint64_t> ids(trace_->channels.size());
+        for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = i + 1;  // 0 = null sentinel
+        std::string err;
+        standalone_view_.bind(standalone_reg_.get(), trace_->channels, ids, &err);
+        bind_view(&standalone_view_);
+    }
 
     // Run one pass of the trace over `in`. Returns commit status; on `!committed`
     // the channel rings are unchanged (dummy-run).
     PassResult run_pass(const FireInputs& in) {
         PassResult res;
         cudaStream_t s = in.stream;
+        ensure_channels();
 
         // pass_commit := 1 (structural predicate seed; stages AND into it).
         std::uint32_t one = 1;
-        cudaMemcpyAsync(arena_.d_commit(), &one, sizeof(one), cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(d_commit_, &one, sizeof(one), cudaMemcpyHostToDevice, s);
 
-        // Refresh the derived bits word the readiness check reads.
-        k_channel_bits<<<1, 1, 0, s>>>(arena_.d_full(), arena_.d_head(), arena_.d_cap1(),
-                                       arena_.num_channels(), arena_.d_bits());
+        // Refresh the derived bits word the readiness check reads (slot-mapped:
+        // the shared registry arrays back many instances).
+        k_channel_bits<<<1, 1, 0, s>>>(view_->d_full(), view_->d_head(), view_->d_cap1(),
+                                       d_slot_map_, view_->num_channels(), d_bits_);
 
         std::vector<void*> scratch;   // per-pass intermediate buffers to free
         std::vector<std::uint32_t> pass_taken, pass_put;   // channels to bump at commit
@@ -110,8 +159,8 @@ class Tier0Runner {
             for (const ChannelPut& p : st.puts) {
                 auto it = val_ptr_.find(p.value);
                 if (it == val_ptr_.end()) { res.ok = false; res.error = "put of unresolved value"; break; }
-                cudaMemcpyAsync(arena_.pending_cell(p.channel), it->second,
-                                arena_.cell_bytes(p.channel), cudaMemcpyDeviceToDevice, s);
+                cudaMemcpyAsync(view_->pending_cell(p.channel), it->second,
+                                view_->cell_bytes(p.channel), cudaMemcpyDeviceToDevice, s);
             }
             if (!res.ok) break;
         }
@@ -120,26 +169,30 @@ class Tier0Runner {
         if (res.ok) {
             // Register/SPSC semantics (T4): a channel consumed by multiple ops in
             // one pass (e.g. a descriptor port AND an epilogue take) advances its
-            // head exactly ONCE; multiple puts publish once (last wins). Dedup.
+            // head exactly ONCE; multiple puts publish once (last wins). Dedup,
+            // then REMAP dense channel ids → shared registry slots (the kernels
+            // index the shared arrays by slot).
             auto dedup = [](std::vector<std::uint32_t>& v) {
                 std::sort(v.begin(), v.end());
                 v.erase(std::unique(v.begin(), v.end()), v.end());
             };
             dedup(pass_taken);
             dedup(pass_put);
+            std::vector<std::uint32_t> taken_slots = view_->to_slots(pass_taken);
+            std::vector<std::uint32_t> put_slots = view_->to_slots(pass_put);
             std::uint32_t *d_taken = nullptr, *d_put = nullptr;
-            if (!pass_taken.empty()) { cudaMalloc(&d_taken, pass_taken.size() * 4);
-                cudaMemcpyAsync(d_taken, pass_taken.data(), pass_taken.size() * 4, cudaMemcpyHostToDevice, s); }
-            if (!pass_put.empty()) { cudaMalloc(&d_put, pass_put.size() * 4);
-                cudaMemcpyAsync(d_put, pass_put.data(), pass_put.size() * 4, cudaMemcpyHostToDevice, s); }
-            k_commit_bump<<<1, 1, 0, s>>>(arena_.d_full(), arena_.d_head(), arena_.d_tail(),
-                                          arena_.d_cap1(), d_taken, (std::uint32_t)pass_taken.size(),
-                                          d_put, (std::uint32_t)pass_put.size(), arena_.d_commit());
+            if (!taken_slots.empty()) { cudaMalloc(&d_taken, taken_slots.size() * 4);
+                cudaMemcpyAsync(d_taken, taken_slots.data(), taken_slots.size() * 4, cudaMemcpyHostToDevice, s); }
+            if (!put_slots.empty()) { cudaMalloc(&d_put, put_slots.size() * 4);
+                cudaMemcpyAsync(d_put, put_slots.data(), put_slots.size() * 4, cudaMemcpyHostToDevice, s); }
+            k_commit_bump<<<1, 1, 0, s>>>(view_->d_full(), view_->d_head(), view_->d_tail(),
+                                          view_->d_cap1(), d_taken, (std::uint32_t)taken_slots.size(),
+                                          d_put, (std::uint32_t)put_slots.size(), d_commit_);
             cudaStreamSynchronize(s);
             std::uint32_t committed = 0;
-            cudaMemcpy(&committed, arena_.d_commit(), sizeof(committed), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&committed, d_commit_, sizeof(committed), cudaMemcpyDeviceToHost);
             res.committed = committed != 0;
-            arena_.sync_host_rings();
+            view_->sync_host_rings();
             if (d_taken) cudaFree(d_taken);
             if (d_put) cudaFree(d_put);
         }
@@ -151,6 +204,12 @@ class Tier0Runner {
     }
 
   private:
+    // Lazily provision standalone channels if no shared view was bound (test
+    // convenience; a no-op once `bind_view` / `init_standalone_channels` ran).
+    void ensure_channels() {
+        if (view_ == nullptr) init_standalone_channels();
+    }
+
     // Collect this stage's channel direction requirements from its ops + puts.
     // `desc_taken` = channels already consumed by a descriptor port this pass
     // (loop-carried): a put to such a channel reuses the vacated cell, so it is
@@ -187,15 +246,19 @@ class Tier0Runner {
 
     void launch_readiness_channels(const std::vector<std::uint32_t>& need_full,
                                    const std::vector<std::uint32_t>& need_empty, cudaStream_t s) {
+        // Remap dense channel ids → shared registry slots (the kernel indexes the
+        // shared arrays by slot; unchanged otherwise).
+        std::vector<std::uint32_t> full_slots = view_->to_slots(need_full);
+        std::vector<std::uint32_t> empty_slots = view_->to_slots(need_empty);
         std::uint32_t *d_full = nullptr, *d_empty = nullptr;
-        if (!need_full.empty()) { cudaMalloc(&d_full, need_full.size() * 4);
-            cudaMemcpyAsync(d_full, need_full.data(), need_full.size() * 4, cudaMemcpyHostToDevice, s); }
-        if (!need_empty.empty()) { cudaMalloc(&d_empty, need_empty.size() * 4);
-            cudaMemcpyAsync(d_empty, need_empty.data(), need_empty.size() * 4, cudaMemcpyHostToDevice, s); }
-        k_stage_readiness<<<1, 1, 0, s>>>(arena_.d_full(), arena_.d_head(), arena_.d_tail(),
-                                          arena_.d_cap1(),
-                                          d_full, (std::uint32_t)need_full.size(),
-                                          d_empty, (std::uint32_t)need_empty.size(), arena_.d_commit());
+        if (!full_slots.empty()) { cudaMalloc(&d_full, full_slots.size() * 4);
+            cudaMemcpyAsync(d_full, full_slots.data(), full_slots.size() * 4, cudaMemcpyHostToDevice, s); }
+        if (!empty_slots.empty()) { cudaMalloc(&d_empty, empty_slots.size() * 4);
+            cudaMemcpyAsync(d_empty, empty_slots.data(), empty_slots.size() * 4, cudaMemcpyHostToDevice, s); }
+        k_stage_readiness<<<1, 1, 0, s>>>(view_->d_full(), view_->d_head(), view_->d_tail(),
+                                          view_->d_cap1(),
+                                          d_full, (std::uint32_t)full_slots.size(),
+                                          d_empty, (std::uint32_t)empty_slots.size(), d_commit_);
         cudaStreamSynchronize(s);   // readiness arrays are short-lived
         if (d_full) cudaFree(d_full);
         if (d_empty) cudaFree(d_empty);
@@ -276,7 +339,7 @@ class Tier0Runner {
             }
             case ValueSource::ChannelTake:
             case ValueSource::ChannelRead:
-                val_ptr_[id] = arena_.committed_cell(v->channel);
+                val_ptr_[id] = view_->committed_cell(v->channel);
                 return true;
         }
         err = "unhandled value source"; return false;
@@ -442,7 +505,13 @@ class Tier0Runner {
     }
 
     const Trace* trace_ = nullptr;
-    ChannelArena arena_;
+    ChannelView* view_ = nullptr;               // dense→global-slot view (W0.1); not owned
+    std::unique_ptr<DeviceChannelRegistry> standalone_reg_;  // owned only in standalone mode
+    ChannelView standalone_view_;               // owned only in standalone mode
+    std::uint32_t* d_bits_ = nullptr;           // pass-ephemeral derived bits word
+    std::uint32_t* d_commit_ = nullptr;         // pass-ephemeral commit flag
+    std::uint32_t* d_slot_map_ = nullptr;       // cached dense→slot map for k_channel_bits
+    std::uint32_t slot_map_len_ = 0;
     std::unordered_map<ValueId, void*> val_ptr_;
     std::unordered_map<ValueId, TensorType> val_type_;
 };

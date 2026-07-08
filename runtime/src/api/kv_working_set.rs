@@ -205,7 +205,7 @@ impl pie::core::working_set::HostKvWorkingSet for InstanceState {
             // A completing/terminating process just freed its KV pool blocks —
             // wake FCFS contention waiters + restore suspended processes. No-op
             // (None) unless PIE_KV_CONTENTION=preempt wired the orchestrator.
-            if let Some(o) = crate::contention::contention() {
+            if let Some(o) = crate::inference::contention::contention() {
                 o.on_blocks_freed();
             }
         }

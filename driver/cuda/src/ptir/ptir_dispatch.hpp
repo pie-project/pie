@@ -10,10 +10,13 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 #include <cuda_runtime.h>
 
 #include <pie_driver_abi/view.hpp>
+
+#include "ptir/fire_geometry.hpp"
 
 namespace pie_cuda_driver::ptir {
 
@@ -33,6 +36,19 @@ class PtirDispatch {
     bool run(const pie_driver::PieForwardRequestView& view,
              pie_driver::PieForwardResponseView& out_resp,
              const void* logits, std::uint32_t vocab, cudaStream_t stream);
+
+    // W1.1 PRE-FORWARD descriptor resolution: for the request's device-geometry
+    // PTIR program (descriptor ports bind channels), decode + get-or-build the
+    // instance (applying seeds on its first fire) and read its port channels'
+    // current cells into `out` — the standard forward geometry the executor
+    // feeds into batch assembly INSTEAD of the (empty) wire geometry fields.
+    // Returns true iff a device-geometry program was resolved; false with an
+    // empty `*err` if the request carries no such program, or false with a
+    // non-empty `*err` if a descriptor channel is not ready (W1.6 — the executor
+    // must fail the fire; the runtime's poison plumbing surfaces it to the guest).
+    bool resolve_descriptors(const pie_driver::PieForwardRequestView& view,
+                             std::uint32_t page_size, FireGeometry& out,
+                             std::string* err);
 
   private:
     struct Impl;

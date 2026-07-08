@@ -36,17 +36,22 @@ namespace pie_cuda_driver::ptir {
 
 // ─────────────────────────── device-side kernels ─────────────────────────
 
-// Recompute the readiness bits word from full[]/head[]: bit c set iff channel
-// c's committed (head) cell is full. One thread per channel word bit.
+// Recompute the readiness bits word from full[]/head[]: bit c set iff the
+// channel at dense index `c` (registry slot `slot_map[c]`) has its committed
+// (head) cell full. One thread. `slot_map` indirects dense→global-slot so the
+// shared registry arrays (channel_registry.hpp, W0.1) can back many instances;
+// pass an identity map for a standalone arena.
 __global__ void k_channel_bits(const std::uint8_t* __restrict__ full,
                                const std::uint32_t* __restrict__ head,
                                const std::uint32_t* __restrict__ cap1,
+                               const std::uint32_t* __restrict__ slot_map,
                                std::uint32_t num_channels, std::uint32_t* __restrict__ bits_word) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         std::uint32_t w = 0;
         for (std::uint32_t c = 0; c < num_channels && c < 32; ++c) {
-            std::uint32_t cell = head[c];
-            if (full[c * 8 /*MAX_RING*/ + cell]) w |= (1u << c);
+            std::uint32_t slot = slot_map ? slot_map[c] : c;
+            std::uint32_t cell = head[slot];
+            if (full[slot * 8 /*MAX_RING*/ + cell]) w |= (1u << c);
         }
         *bits_word = w;
     }

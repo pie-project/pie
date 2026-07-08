@@ -283,7 +283,7 @@ const SHMEM_RESP_BUF_DEFAULT: usize = 4 * 1024 * 1024;
 /// but legal — different ports) don't clobber each other's TOML or
 /// aux sockets.
 pub fn launch_state_dir() -> PathBuf {
-    pie::path::get_pie_home()
+    pie::util::get_pie_home()
         .join("standalone")
         .join(std::process::id().to_string())
 }

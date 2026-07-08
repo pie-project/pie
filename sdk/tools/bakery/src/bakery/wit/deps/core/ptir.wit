@@ -1,83 +1,122 @@
-// PTIR guest↔host surface (thrust-3 P2a). Append-only, gated behind the runtime
-// `ptir` cargo feature. Not yet included in `world imports` — the host wiring +
-// wit-bindgen regen + 5-copy sync land together when the feature goes live; this
-// file is the reviewable contract (echo's "container bytes are the wire
-// artifact" model).
+// PTIR guest↔host surface (thrust-3 P2a, redesigned to the first-class object
+// model). Gated behind the runtime `ptir` cargo feature: the interface is in
+// the world unconditionally (additive, no-op for legacy guests); when the
+// feature is off, `forward-pass.new` / `pipeline.submit` return a "ptir
+// disabled" error.
 //
-// Layering (echo-confirmed):
-//   guest traces a pass -> canonical PTIR container bytes (pie_sampling_ir::ptir)
-//   -> register-program(bytes) -> program-id (== FNV-1a container_hash, C3).
-//   The guest CANNOT bind (bind needs the backend ModelProfile); the host binds
-//   once at registration (malformed traces fail here with the validator's
-//   message) and ships (container-bytes, PTIB sidecar) to the driver, cached by
-//   hash. Instantiation is a separate call carrying per-instance seed values
-//   (Channel::from data, D2 — never part of registration/identity).
+// Layering (echo-confirmed): the guest traces a pass -> canonical PTIR
+// container bytes (pie_sampling_ir::ptir). WIT cannot carry closures, so the
+// container bytes stay the wire artifact — but everything the author
+// manipulates (channels, working sets, the pass, the pipeline) crosses the
+// boundary as a first-class resource, mirroring the ptir tracing DSL:
+//
+//   Channel::new([1], i32)      ->  channel constructor
+//   tok.put([BOS])              ->  channel.put         (seeds ride the channel)
+//   WorkingSet::new()/alloc(n)  ->  kv-working-set      (working-set.wit, reused)
+//   ForwardPass + epilogue      ->  forward-pass.new(bytes, channels, ws)
+//   Pipeline::new(); p.submit() ->  pipeline constructor + submit(fwd)
+//
+// The old registry surface (register-program / program-id / instantiate /
+// channel-seed / pipeline.channel(index)) is deleted: identity dedup (the
+// FNV-1a container hash, C3) and bind (against the backend ModelProfile —
+// the guest cannot bind) happen inside `forward-pass.new`, invisible to the
+// guest. Malformed traces fail there with the validator's message (the P2
+// exit). Seeds are per-instance data (D2, never identity): a `put` staged on a
+// `seeded` channel before the first submit is that channel's seed value.
 
 interface ptir {
     use types.{error};
     use tensor.{shape, dtype, data};
+    use working-set.{kv-working-set, rs-working-set};
 
-    /// A registered traced-pass identity: FNV-1a over the canonical container
-    /// bytes (contract C3). Same number the guest caches on, the runtime keys
-    /// the registry by, and thrust-2 batches by.
-    type program-id = u64;
-
-    /// Register a traced pass from its canonical PTIR container bytes. The host
-    /// decodes + binds ONCE against the model profile (hash-deduped: a duplicate
-    /// registration is a cache hit). A malformed trace fails here with the
-    /// validator's message (the P2 exit). Returns the identity hash.
-    register-program: func(container-bytes: data) -> result<program-id, error>;
-
-    /// A per-instance channel seed value (`Channel::from`), by dense channel
-    /// index (the container's declaration order). Per-instance data (D2) —
-    /// supplied at instantiation, never part of the program identity.
-    record channel-seed {
-        channel: u32,
-        value: data,
-    }
-
-    /// A host endpoint on an instance's host-facing channel (overview §1). The
-    /// container's `host-role` fixes the direction: a host-writer channel takes
-    /// `put`; a host-reader channel yields `take`/`read`. Blocking mirrors the
-    /// full/empty bits (async); a poisoned channel surfaces an `error` instead
-    /// of hanging (the `?` in `out.take().await?`).
+    /// A GPU-resident bounded queue of cells with full/empty bits (overview
+    /// §1). Guest-constructed and first-class: the SAME handle is bound into a
+    /// forward pass (by dense declaration index, via `forward-pass.new`) and
+    /// used for host `put`/`take`/`read`. `Channel::from(v)` in the DSL is
+    /// constructor + `put(v)`.
+    ///
+    /// The shape/dtype/capacity must match the container's declaration for the
+    /// index the handle is bound at — `forward-pass.new` validates this.
+    /// Direction comes from the container (`host-role`): a host-writer channel
+    /// takes `put`; a host-reader channel yields `take`/`read`. Before binding,
+    /// `put` stages freely (a seed or an early Writer cell); staged puts
+    /// coalesce into the next submit (D1). A poisoned channel surfaces an
+    /// `error` instead of hanging (the `?` in `out.take().await?`).
     resource channel {
-        /// Hand a value to the device (host-writer channels). Empty -> fill;
-        /// full -> back-pressure (blocks). Host puts coalesce before the next
-        /// submit (D1); `bool` channels travel packed.
-        put: func(value: data) -> result<_, error>;
-        /// Move the committed value out to the host (host-reader channels). Full
-        /// -> value + empty the cell; empty -> block until full.
+        constructor(shape: shape, dtype: dtype, capacity: u32);
+
+        /// Hand a value to the device. On a `seeded` channel before the first
+        /// fire this is the seed (D2); on a host-writer channel it is the next
+        /// staged cell (empty -> fill; full -> back-pressure). `bool` payloads
+        /// are dtype-native (1 byte per bool); the wire packs to bits.
+        put:  func(value: data) -> result<_, error>;
+
+        /// Move a committed value out to the host (host-reader channels). Full
+        /// -> value + empty the cell. Empty -> BLOCKS by awaiting the pass's
+        /// in-flight fires (submit order) until the cell fills; errors when no
+        /// in-flight fire remains (nothing will ever fill it) or the channel
+        /// is poisoned — a fire that feeds it failed, and the error carries
+        /// that fire's failure (under run-ahead, poison IS the error channel).
         take: func() -> result<data, error>;
-        /// Copy the committed value to the host, leaving the cell full.
+
+        /// Copy a committed value to the host, leaving the cell full. Same
+        /// await/poison discipline as `take`.
         read: func() -> result<data, error>;
     }
 
-    /// A run-ahead submission pipeline over one instance of a registered
-    /// program (overview §3). Ordering is carried entirely by the channels'
-    /// full/empty bits, not by host code.
+    /// A traced forward pass ready to submit: the canonical PTIR container
+    /// bytes (traced stages + embed/attn port bindings) plus the first-class
+    /// handles the container references. The container names channels by dense
+    /// declaration index; `channels[i]` supplies the handle for dense channel
+    /// `i` (the DSL emits both from the same objects, so authors never see
+    /// indices). This subsumes register-program + instantiate + channel-seed:
+    /// identity dedup and bind happen here, and seeds ride each channel's own
+    /// `put`.
+    resource forward-pass {
+        /// Decode + bind `container-bytes` against the bound model (hash-
+        /// deduped compile/bind cache; a duplicate container is a cache hit)
+        /// and bind the handles. Errors: a malformed trace (the validator's
+        /// message), a channel-count/shape/dtype/capacity mismatch against the
+        /// container's declarations, not exactly one
+        /// kv-working-set, or more than one rs-working-set (the single-model
+        /// v1 contract). An rs-working-set is required for hybrid /
+        /// linear-attention models (GDN, Mamba2); pure-attention models pass
+        /// none.
+        ///
+        /// The pass records the underlying state of its bound channels (safe
+        /// against the guest dropping a handle) and the working sets' reps
+        /// (the guest must keep them alive for the pass's lifetime, mirroring
+        /// the classic `forward-pass`'s borrows).
+        new: static func(
+            container-bytes: data,
+            channels:         list<borrow<channel>>,
+            kv-working-sets:  list<borrow<kv-working-set>>,
+            rs-working-sets:  list<borrow<rs-working-set>>,
+        ) -> result<forward-pass, error>;
+    }
+
+    /// A run-ahead submission pipeline (overview §3). Ordering is carried by
+    /// the channels' full/empty bits, not by host code.
     resource pipeline {
-        /// Instantiate `program` (allocate its declared channel cells; seed the
-        /// `seeded` channels from `seeds`). Fails if a seed's shape/dtype does
-        /// not match its channel declaration, or `program` is unregistered.
-        instantiate: static func(
-            program: program-id,
-            seeds: list<channel-seed>,
-        ) -> result<pipeline, error>;
+        constructor();
 
-        /// A host endpoint on the instance's channel at dense `index`. Errors if
-        /// the channel is device-private (`host-role = none`) — only host-facing
-        /// channels are reachable from the guest.
-        channel: func(index: u32) -> result<channel, error>;
+        /// Submit one pass, RUN-AHEAD: prepares + fires and returns
+        /// immediately — step t+1 may be submitted before t completes; the
+        /// channels' `take`/`read` are the await points. The first submit of
+        /// a `forward-pass` ships its container bytes + sidecar and binds its
+        /// seeds (one staged `put` per `seeded` channel — missing seeds error
+        /// here); steady-state submits carry the identity hash + instance
+        /// only. Staged host-writer puts are D1-coalesced into the fire.
+        ///
+        /// The result covers preparation/enqueue only. A fire that fails
+        /// AFTER submit poisons the pass's host-reader channels (surfaced at
+        /// `take`/`read` with the fire's error) and fails the pass — further
+        /// submits of it error with the root cause.
+        submit: func(fwd: borrow<forward-pass>) -> result<_, error>;
 
-        /// Submit one pass run-ahead: step t+1 may be enqueued before t
-        /// completes. Non-blocking; the pass fires when its per-stage readiness
-        /// holds (miss -> dummy-run, resubmit in order; overview §1).
-        submit: func() -> result<_, error>;
-
-        /// Signal no further submissions (implied by drop): in-flight passes run
-        /// as far as their inputs allow, parked instances are reclaimed at
-        /// teardown, and touched channels are unspecified after close.
-        close: func();
+        /// Signal no further submissions (implied by drop): in-flight passes
+        /// run as far as their inputs allow; touched channels are unspecified
+        /// after close.
+        close:  func();
     }
 }

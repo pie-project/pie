@@ -212,7 +212,7 @@ pub fn spawn(
     // Task-B contention: register with the preempt/restore orchestrator —
     // registration order is the FCFS clock (victim = youngest registered).
     // No-op unless PIE_KV_CONTENTION=preempt.
-    if let Some(o) = crate::contention::contention() {
+    if let Some(o) = crate::inference::contention::contention() {
         o.register(id);
     }
 
@@ -444,7 +444,7 @@ impl Process {
         let admission_wait_us = duration_us(admission_start.elapsed());
 
         let mut instantiate_us = 0u64;
-        let mut context_register_us = 0u64;
+        let context_register_us = 0u64;
         let mut wasm_run_us = 0u64;
         let result: Result<String, String> = async {
             let instantiate_start = Instant::now();
@@ -548,7 +548,7 @@ impl Process {
         // teardown, and drains — the exiting process's KV frees follow via the
         // WS-drop hook). Single exit funnel: covers natural completion AND
         // external terminate. No-op unless PIE_KV_CONTENTION=preempt.
-        if let Some(o) = crate::contention::contention() {
+        if let Some(o) = crate::inference::contention::contention() {
             o.unregister(self.process_id);
         }
     }

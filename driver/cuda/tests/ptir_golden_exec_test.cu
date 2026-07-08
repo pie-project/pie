@@ -254,7 +254,11 @@ void run_via_runtime(const std::string& dir) {
 
     // Instantiate with the D2 seed (chan0 token=[1], i32 LE) + fire echo's steps.
     std::vector<ChannelValue> seeds = {{0, {1, 0, 0, 0}}};
-    PtirInstance inst(*t, seeds);
+    DeviceChannelRegistry reg;
+    std::vector<std::uint64_t> ids(t->channels.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = i;  // identity global ids (test)
+    std::string ierr;
+    PtirInstance inst(*t, &reg, ids, seeds, &ierr);
     float* d_logits = nullptr; cudaMalloc(&d_logits, 8 * sizeof(float));
     auto step = [&](std::vector<float> logits, std::int32_t want) {
         cudaMemcpy(d_logits, logits.data(), 8 * sizeof(float), cudaMemcpyHostToDevice);
@@ -288,7 +292,11 @@ void run_via_runtime_stateful(const std::string& dir) {
 
     // Seed chan0 = 10 (u32) ONCE at instantiation; the arena persists across fires.
     std::vector<ChannelValue> seeds = {{0, {10, 0, 0, 0}}};
-    PtirInstance inst(*t, seeds);
+    DeviceChannelRegistry reg;
+    std::vector<std::uint64_t> ids(t->channels.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = i;  // identity global ids (test)
+    std::string ierr;
+    PtirInstance inst(*t, &reg, ids, seeds, &ierr);
     FireInputs in;
 
     PassResult r0 = inst.fire({}, in);

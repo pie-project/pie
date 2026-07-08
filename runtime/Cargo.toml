@@ -15,8 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 pie-ipc = { path = "../driver/ipc" }
 pie-driver-abi = { path = "../interface/driver" }
-pie-sampling-ir = { path = "../interface/sampling-ir" }
-sampling-edsl = { path = "../sdk/rust/sampling-edsl" }
+pie-ptir = { path = "../interface/ptir" }
 pie-client = { path = "../client/rust" }
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
@@ -43,7 +42,7 @@ dashmap = "6.1.0"
 boxcar = "0.2.13"
 thiserror = "2.0.11"
 futures = "0.3.31"
-pie-waker = { path = "waker", optional = true }
+pie-waker = { path = "waker" }
 rmp-serde = "1.3.0"
 blake3 = "1.8.2"
 num-traits = "0.2.19"
@@ -88,29 +87,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 [features]
 default = []
-# PTIR thrust 2 — pipelined execution & the quorum fire rule. Gates the
-# run-ahead submission lifecycle (non-blocking launch, producer links,
-# per-forward write txns, the quorum scheduler). Default-OFF until the
-# thrust's M1 exit, then default-on with the legacy fire path kept one
-# release (masterplan §4). Scheduler-only S0 scaffolding (probe fields,
-# the pure quorum model) compiles regardless; this flag turns on the
-# behaviour that supersedes the response-synchronous path.
-run-ahead = []
-# PTIR Thrust 1 / Phase M1 — slot-id working-set semantics. OFF (default) keeps
-# the legacy dense array: `free` compacts + renumbers, `alloc` grows a
-# contiguous range, `generation` bumps on every structural mutation. ON switches
-# `KvWorkingSet` to a stable slot table (`Vec<Option<PageSlot>>` + free list):
-# `free` tombstones (survivors never renumber; a freed suffix is truncated so it
-# leaves no hole), `alloc-slots` recycles freed ids before growing, `size()`
-# reports the LIVE count, and `generation` bumps only on `reorder`/`compact`
-# (W8). Flipped default-on at the M1 exit gate. See docs/ptir/thrust-1-memory.md.
-ws-slot-ids = []
-# PTIR (thrust-3) — the programmable-dataflow trace registry + `ptir` WIT
-# surface. The interface is present in the world unconditionally (additive,
-# no-op for legacy guests); this flag gates the host impl *behaviour* — OFF ⇒
-# `register-program`/`instantiate` return a "ptir disabled" error (default-off,
-# no-regression). ON ⇒ register binds+caches, instantiate validates seeds.
-# (The `ptir` feature is defined below with its `dep:pie-waker` — X0 substrate.)
 # Programmable-sampling output→tensor fast-path (#27 cut #1). Gates the host
 # eager-D2H populate: the `extern "C"` `pie_pinned_alloc`/`pie_pinned_free`
 # decls + the `sampling_output_*` carrier fill + the pinned `output()` read.
@@ -120,12 +96,6 @@ ws-slot-ids = []
 # path. ON (propagated from `pie-worker`'s `driver-cuda`, which links
 # `pie_driver_cuda_lib`) ⇒ the fast-path is active and the symbols resolve.
 driver-cuda = []
-# X0 waker substrate (Runtime–Driver Boundary spec, decisions B9–B12): the
-# Rust-owned tensor-waker slot table + the `pie_wake`/`pie_wake_past` FFI
-# exports (crate `pie-waker`, re-exported as `pie::driver::waker`).
-# Foundation for the direct-call + frames transport (X1–X4). Host-only,
-# mock-first; no driver linkage required.
-ptir = ["dep:pie-waker"]
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
 # sample rates and different audiences. The `probe_<domain>!` macros in
@@ -140,7 +110,7 @@ profile-all = ["profile-fire", "profile-driver-cuda"]       # everything
 
 [dev-dependencies]
 tempfile = "3"
-pie-sampling-ir = { path = "../interface/sampling-ir", features = ["eval"] }
+pie-ptir = { path = "../interface/ptir", features = ["eval"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 tokenizers = "0.21"
 

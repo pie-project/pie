@@ -35,9 +35,6 @@ profile-driver-cuda = ["pie/profile-driver-cuda"]
 profile-hot-path = ["pie/profile-hot-path"]
 profile-all = ["pie/profile-all"]
 
-# PTIR thrust-2 quorum fire rule (selected at runtime via PIE_SCHED_POLICY=quorum).
-run-ahead = ["pie/run-ahead"]
-
 [dependencies]
 # `pie` is the runtime crate. After Phase 8 deleted the legacy
 # `pie._runtime` maturin module, runtime has no `python` feature to

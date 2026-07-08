@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
-use pie::inference::structured::matcher::GrammarMatcher;
-use pie::inference::structured::regex::regex_to_grammar;
+use pie::grammar::matcher::GrammarMatcher;
+use pie::grammar::regex::regex_to_grammar;
 use pie::model::tokenizer::Tokenizer;
 
 fn is_regex_accept_string(pattern: &str, input: &str) -> bool {

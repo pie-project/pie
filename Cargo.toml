@@ -30,10 +30,10 @@ members = [
     "interface/controller",
     "interface/worker",
     "interface/client",
-    # Sampling IR — the cross-language seam for programmable samplers (typed IR +
-    # validation + versioned bytecode). `no_std` core; the wasm SDK depends on it
-    # with `default-features = false`.
-    "interface/sampling-ir",
+    # PTIR — the Pie Tensor IR: the cross-language seam for programmable dataflow
+    # (stage-tagged trace container + validation + versioned wire format).
+    # `no_std` core; the wasm SDK depends on it with `default-features = false`.
+    "interface/ptir",
     "driver/ipc",
     "driver/dummy",
     "driver/weight-loader",

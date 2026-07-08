@@ -1,5 +1,0 @@
-package pie:zo;
-
-world imports {
-    import zo;
-}

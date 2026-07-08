@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use tokio::sync::oneshot;
 use wasmtime::Engine as WasmEngine;
 use wasmtime::component::Component;

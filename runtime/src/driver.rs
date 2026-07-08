@@ -21,18 +21,14 @@
 //!     `sglang`). POSIX-shmem ring carrying rkyv-encoded frames.
 
 mod channel;
-#[cfg(feature = "ptir")]
 mod carry_bridge;
-#[cfg(feature = "ptir")]
 mod completion;
-#[cfg(feature = "ptir")]
 mod control;
-#[cfg(all(feature = "ptir", feature = "driver-cuda"))]
+#[cfg(feature = "driver-cuda")]
 mod control_cuda;
 mod inproc;
 mod inproc_polling;
 mod ops;
-mod prefetch;
 mod shmem;
 
 /// X0 — the tensor-waker substrate (Runtime–Driver Boundary B9–B12): the
@@ -40,7 +36,6 @@ mod shmem;
 /// (X1–X4) parks on. Lives in the leaf crate `pie-waker` (so the
 /// register/commit race is loom-model-checked without the runtime's
 /// dependency graph); re-exported here behind the `ptir` flag.
-#[cfg(feature = "ptir")]
 pub use pie_waker as waker;
 
 /// X2/X3 (a) BRIDGE — the runtime carry-descriptor + in-flight close-gate: the
@@ -49,7 +44,6 @@ pub use pie_waker as waker;
 /// stashes and the executor reads at a2 fire-commit; [`InFlightTracker`] gates
 /// `close_instance`'s frame region-free on in-flight == 0 (B6/§5.2 grace). Gated on
 /// `ptir` (FFI-free) so both are unit-tested without the CUDA driver lib.
-#[cfg(feature = "ptir")]
 pub use carry_bridge::{
     CarryDescriptor, CarryDescriptorError, CloseAction, InFlightTracker, CARRY_DESCRIPTOR_VERSION,
 };
@@ -60,7 +54,6 @@ pub use carry_bridge::{
 /// request/response [`DriverChannel`] trait (B2). Mock-first: [`MockControlPlane`]
 /// proves the `register → bind → enqueue → completion` shape with zero queue
 /// hops before CUDA frames (X2) exist. Gated behind the `ptir` flag.
-#[cfg(feature = "ptir")]
 pub use control::{
     BoundInstance, Completion, ControlPlane, EnqueueBatch, FrameAddresses, InstanceId,
     MockControlPlane, ProgramId,
@@ -71,7 +64,7 @@ pub use control::{
 /// pinned host mirror/words + the copy-stream carrier (the direct driver↔inferlet
 /// frame transport). Gated on `ptir` + `driver-cuda`; off either flag the
 /// `pie_frame_*` symbols are never referenced and only the mock exists.
-#[cfg(all(feature = "ptir", feature = "driver-cuda"))]
+#[cfg(feature = "driver-cuda")]
 pub use control_cuda::CudaControlPlane;
 
 /// X3 — the completion-wake consumer (Runtime–Driver Boundary B9–B11): the
@@ -81,7 +74,6 @@ pub use control_cuda::CudaControlPlane;
 /// [`waker::WakerTable::wake_past`] — the generalization of X1's single-batch
 /// [`MockControlPlane::complete_next`]. The device-side completion *signal* is
 /// built separately and plugs in via [`CompletionSource`]. Gated behind `ptir`.
-#[cfg(feature = "ptir")]
 pub use completion::{
     ChannelScan, CommittedIndex, CompletionConsumer, CompletionSource, PinnedRingWord, ScanReport,
 };
@@ -224,25 +216,11 @@ pub trait DriverChannel: Send + Sync {
     /// watchdog when it observes that the driver has exited.
     fn abort(&self);
 
-    /// Fire-and-forget JIT **prefetch** (the #11 prefetch seam): warm the
-    /// driver's compile cache for a sampling program so the later real fire
-    /// finds it `Ready` (the NVRTC compile overlaps the in-flight run-ahead
-    /// steps, off the TTFT path). The compile is keyed on
-    /// `program_identity_hash(bytecode, manifest)` — the SAME key as the #10
-    /// distinct-count / #11 compile-cache / M-batch grouping — so it dedups
-    /// against the in-flight compile pool (idempotent; duplicate or
-    /// already-compiled programs collapse). Never blocks, never reports errors.
-    ///
-    /// Default **no-op**: drivers without a JIT sampling backend, and the
-    /// out-of-proc/IPC path until its additive `DriverRequest::Prefetch` oneway
-    /// fast-follow lands. The embedded [`InProcChannel`] overrides this to drive
-    /// the C++ `IProgramBackend::prefetch_compile` over the in-proc FFI.
-    fn prefetch_compile(&self, _bytecode: &[u8], _manifest: &[pie_sampling_ir::Binding]) {}
 }
 
 pub use channel::{
     abort_all_driver_channels, fire_batch, fire_batch_deferred, fire_batch_sync, get_spec,
-    install_channel, install_spec, prefetch_compile, register_driver, FireHandle,
+    install_channel, install_spec, register_driver, FireHandle,
 };
 pub use inproc::{InProcChannel, InProcVTable};
 pub use inproc_polling::InProcPollingChannel;

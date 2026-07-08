@@ -475,7 +475,7 @@ impl Arena {
     /// [`offload_abort`](Self::offload_abort) to release the staged CPU blocks if
     /// the suspend is dropped.
     pub fn offload_stage(&mut self, id: ObjectId) -> Result<MovePlan, ArenaError> {
-        let (kind, size_blocks, residency, pinned, evictable, from) = {
+        let (_kind, size_blocks, residency, pinned, evictable, from) = {
             let obj = self.object(id)?;
             (
                 obj.kind,

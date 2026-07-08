@@ -27,7 +27,7 @@
 //! `resolve_read` / `resolve_write` (validate-only) / `page_size` / `size` /
 //! `generation` / `cow_write_slot` / `seal`, matching the frozen signatures echo
 //! drives from the forward-pass txn. CAS sealing reuses
-//! `crate::page_hash::compute_page_hashes` (unchanged).
+//! `crate::working_set::page_hash::compute_page_hashes` (unchanged).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -41,7 +41,7 @@ use crate::arena::{Arena, ArenaError, ArenaKind, ArenaTxn, CowPlan, MovePlan, Ob
 /// mutation). ON ⇒ stable slot table (tombstone-on-free with trailing-truncate,
 /// recycling `alloc_slots`, `size()` = live count, generation bumps only on
 /// `reorder`/`compact`, W8). Flipped default-on at the M1 exit gate.
-pub const SLOT_IDS: bool = cfg!(feature = "ws-slot-ids");
+pub const SLOT_IDS: bool = true;
 
 /// Content hash of a sealed full KV page. Identical to `pagestore::PageHash`;
 /// produced by `compute_page_hashes` at seal time.
@@ -1501,7 +1501,7 @@ impl KvWorkingSet {
 mod tests {
     use super::*;
     use crate::arena::{Arena, ArenaConfig};
-    use crate::page_hash::compute_page_hashes;
+    use crate::working_set::page_hash::compute_page_hashes;
     use pie_driver_abi::Brle;
 
     const PAGE: u32 = 4;
@@ -1608,43 +1608,8 @@ mod tests {
         assert_eq!(ws.alloc(0).unwrap(), PageRange { start: 3, len: 0 });
         assert_eq!(ws.generation(), STRUCT_BUMP); // no-op, no bump
     }
-
-    // 2. free (legacy dense compaction) — only meaningful with the flag off.
-    #[cfg(not(feature = "ws-slot-ids"))]
-    #[test]
-    fn free_dense_compacts_and_validates() {
-        let mut a = arena(16);
-        let mut cas = KvCas::new();
-        let mut ws = KvWorkingSet::new(PAGE, 0);
-        ws.alloc(5).unwrap();
-        // Materialise slots 1 and 4 so we can observe their pages being freed.
-        write_slot(&mut ws, &mut a, &mut cas, 1, None);
-        write_slot(&mut ws, &mut a, &mut cas, 4, None);
-        assert_eq!(a.live_objects(), 2);
-        let gen0 = ws.generation();
-
-        ws.free(&[3, 1], &mut a, &mut cas).unwrap();
-        assert_eq!(ws.size(), 3);
-        assert_eq!(slot(&ws, 0), None);
-        assert_eq!(slot(&ws, 1), None); // old slot 2
-        assert!(slot(&ws, 2).is_some()); // old slot 4 (materialised) survives
-        assert_eq!(a.live_objects(), 1); // slot-1's page freed; slot-4's survives
-        assert_eq!(ws.generation(), gen0 + 1);
-
-        assert_eq!(
-            ws.free(&[9], &mut a, &mut cas),
-            Err(WorkingSetError::IndexOutOfRange { index: 9, size: 3 })
-        );
-        assert_eq!(
-            ws.free(&[0, 0], &mut a, &mut cas),
-            Err(WorkingSetError::DuplicateIndex { index: 0 })
-        );
-        assert_eq!(ws.generation(), gen0 + 1); // unchanged after errors
-    }
-
     // 2b. free (slot-id tombstone) — stable ids; interior hole recycled ascending;
     // trailing free truncates; double-free / out-of-range rejected; no gen bump.
-    #[cfg(feature = "ws-slot-ids")]
     #[test]
     fn free_tombstones_keeps_stable_ids() {
         let mut a = arena(16);
@@ -2167,7 +2132,6 @@ mod tests {
     // stable-id invariants: no live id ever renumbers (a materialised slot keeps
     // its ObjectId until freed), `size()` is the live count, `free_list` is
     // exactly the tombstone set with no trailing hole, and commit round-trips.
-    #[cfg(feature = "ws-slot-ids")]
     #[test]
     fn soak_stable_ids_under_churn() {
         let mut a = arena(16384);
@@ -2807,7 +2771,6 @@ mod tests {
     // ── M4: mark-sweep, compact, grace period, generation-on-compact/reorder ──
 
     // 22. mark_dead — the live slots not in the reachable snapshot (host GC).
-    #[cfg(feature = "ws-slot-ids")]
     #[test]
     fn mark_dead_returns_live_unreachable_slots() {
         let mut a = arena(16);
@@ -2826,7 +2789,6 @@ mod tests {
 
     // 23. compact — pack live token runs densely; remap + gather plan + free src;
     //     generation bumps (W8). A run straddling the dst page boundary splits.
-    #[cfg(feature = "ws-slot-ids")]
     #[test]
     fn compact_packs_runs_remaps_and_bumps_generation() {
         let mut a = arena(32);
@@ -2892,7 +2854,6 @@ mod tests {
     }
 
     // 26. generation bumps EXACTLY on compact/reorder (W8) — not alloc/free/append.
-    #[cfg(feature = "ws-slot-ids")]
     #[test]
     fn generation_bumps_exactly_on_compact_and_reorder() {
         let mut a = arena(32);
@@ -2924,7 +2885,6 @@ mod tests {
 
     // 27. §6.2-shaped beam step: a lane dies and strands its private tail; the
     //     host waste model (stranded token count) matches what compact reclaims.
-    #[cfg(feature = "ws-slot-ids")]
     #[test]
     fn beam_strand_and_compact_reclaims_exact_waste() {
         let mut a = arena(64);
@@ -2975,7 +2935,6 @@ mod tests {
     /// an rc==1 continuing page is written IN PLACE, never CoW-copied+freed.
     /// If a fire frees the tail block, a concurrent request re-allocs the same
     /// physical page and clobbers it (charlie's page-9783 churn on the 4090).
-    #[cfg(feature = "ws-slot-ids")]
     #[test]
     fn decode_write_page_retained_across_fires() {
         let mut a = arena(16);
@@ -3021,7 +2980,6 @@ mod tests {
     /// prefill + decode against the shared arena, interleaved as concurrent
     /// admission does. Their live tail pages must occupy DISJOINT physical
     /// blocks at every step — no request is handed a block another still holds.
-    #[cfg(feature = "ws-slot-ids")]
     #[test]
     fn two_concurrent_contexts_get_disjoint_tail_blocks() {
         let mut a = arena(32);

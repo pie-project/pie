@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 
 use wasmtime::{Engine, Module};
 
-use crate::path;
+use crate::util;
 
 use super::snapshot;
 
@@ -48,7 +48,7 @@ pub fn init(engine: &Engine, snapshot_enabled: bool) {
     }
 
     let py_runtime_dir = {
-        let dir = path::get_py_runtime_dir();
+        let dir = util::get_py_runtime_dir();
         if dir.is_dir() {
             tracing::info!("Python runtime directory: {}", dir.display());
             Some(dir)

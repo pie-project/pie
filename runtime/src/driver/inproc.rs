@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -24,7 +24,6 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use tokio::runtime::RuntimeFlavor;
 
-use super::prefetch::PrefetchEntry;
 use super::{DriverChannel, DriverRequest, DriverResponse};
 use pie_driver_abi::schema::{PieFrameDesc, PieFrameView, PieResponseFrameDesc};
 
@@ -149,31 +148,15 @@ impl ResponseSlot {
     }
 }
 
-/// Watchdog WARN interval for a parked response wait, read once from
-/// `PIE_DRIVER_WAIT_WARN_SECS` (default 30, floored at 1).
+/// Watchdog WARN interval (secs) for a parked response wait.
 pub(super) fn wait_warn_secs() -> u64 {
-    static SECS: OnceLock<u64> = OnceLock::new();
-    *SECS.get_or_init(|| {
-        std::env::var("PIE_DRIVER_WAIT_WARN_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&s| s >= 1)
-            .unwrap_or(30)
-    })
+    30
 }
 
-/// Optional hard timeout for a parked response wait, read once from
-/// `PIE_DRIVER_WAIT_TIMEOUT_SECS` (default 0 = disabled — never fail a
-/// legitimate long fire; enable in stress/e2e runs to convert a hang into a
-/// loud failed batch).
+/// Hard timeout for a parked response wait (secs). 0 = disabled (never fail a
+/// legitimate long fire).
 pub(super) fn wait_timeout_secs() -> u64 {
-    static SECS: OnceLock<u64> = OnceLock::new();
-    *SECS.get_or_init(|| {
-        std::env::var("PIE_DRIVER_WAIT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0)
-    })
+    0
 }
 
 struct InProcState {
@@ -195,11 +178,6 @@ struct InProcState {
     /// Pending: req_id → entry.
     pending: Mutex<HashMap<u32, PendingEntry>>,
 
-    /// #11 prefetch seam: the driver's JIT prefetch entry, registered ONCE by
-    /// the C++ backend at ready-time via `InProcVTable::register_prefetch`.
-    /// `None` until registered (and forever for non-JIT drivers) ⇒
-    /// `prefetch_compile` is a no-op. Set-once, read-many.
-    prefetch: OnceLock<PrefetchEntry>,
 }
 
 impl InProcState {
@@ -211,7 +189,6 @@ impl InProcState {
             inbox: Mutex::new(VecDeque::new()),
             inbox_cv: Condvar::new(),
             pending: Mutex::new(HashMap::new()),
-            prefetch: OnceLock::new(),
         })
     }
 
@@ -502,14 +479,6 @@ impl DriverChannel for InProcChannel {
         }
     }
 
-    fn prefetch_compile(&self, bytecode: &[u8], manifest: &[pie_sampling_ir::Binding]) {
-        // No-op until the C++ backend has registered its trampoline (and forever
-        // for non-JIT embedded drivers). Fire-and-forget; correctness never
-        // depends on the prefetch landing — the real fire compiles either way.
-        if let Some(entry) = self.state.prefetch.get() {
-            entry.invoke(bytecode, manifest);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -569,14 +538,12 @@ fn recv_with_spin(state: &InProcState) -> Option<u32> {
 /// set-once so `prefetch_compile` can invoke it. A non-JIT driver never calls
 /// this, leaving the entry unregistered (prefetch stays a no-op).
 unsafe extern "C" fn vt_register_prefetch(
-    ctx: *mut c_void,
-    prefetch: PrefetchFn,
-    backend_ctx: *mut c_void,
+    _ctx: *mut c_void,
+    _prefetch: PrefetchFn,
+    _backend_ctx: *mut c_void,
 ) {
-    if let Some(state) = InProcState::from_ctx(ctx) {
-        // set-once: a duplicate registration (shouldn't happen) is ignored.
-        let _ = state.prefetch.set(PrefetchEntry::new(prefetch, backend_ctx));
-    }
+    // Programmable sampling (and its JIT prefetch seam) is removed; the
+    // backend registration is accepted and ignored (FFI slot kept for now).
 }
 
 /// recv: block until a request is queued or the channel is aborted.

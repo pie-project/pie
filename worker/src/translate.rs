@@ -5,7 +5,7 @@
 //! constructs through the pyo3 `pie._runtime.Config` builder. We do
 //! the same construction here in pure Rust, sourcing:
 //!   * scalars from the user TOML
-//!   * dirs (cache/log/auth) from `pie::path` (`~/.pie/...`)
+//!   * dirs (cache/log/auth) from `pie::util` (`~/.pie/...`)
 //!   * caps from the per-model
 //!     [`ModelHandshake`] inputs collected at boot.
 
@@ -52,7 +52,7 @@ pub fn build(
         );
     }
 
-    let pie_home = pie::path::get_pie_home();
+    let pie_home = pie::util::get_pie_home();
     let cache_dir = pie_home.join("programs");
     let log_dir = Some(pie_home.join("logs"));
     let auth_dir = pie_home.join("auth");

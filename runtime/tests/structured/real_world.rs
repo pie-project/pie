@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use pie::inference::structured::bitmask;
-use pie::inference::structured::grammar::Grammar;
-use pie::inference::structured::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
-use pie::inference::structured::matcher::GrammarMatcher;
+use pie::grammar::bitmask;
+use pie::grammar::grammar::Grammar;
+use pie::grammar::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
+use pie::grammar::matcher::GrammarMatcher;
 use pie::model::tokenizer::Tokenizer;
 
 // ---------------------------------------------------------------------------

@@ -123,23 +123,23 @@ __global__ void write_kv_at_positions_kernel(
     }
 }
 
-// Beam [B,P] freeze/heir KV write (SEAM 3): each beam b writes its ONE new-token
-// K/V into an EXPLICIT (physical_page[b], offset[b]) target — NOT a position→
-// (page,offset) derivation. The beam epilogue separates the write offset
-// (WOff = old tail fill, or 0 for a fresh page) from the attention length
-// (KvLen = new span), and the freeze case writes to a FRESH page (WSlot) that is
-// not the page-run tail — a linear `abs_pos/page_size` mapping cannot express it.
-// Single-cell append: touches exactly ONE (page,offset) per beam, so a frozen
-// sibling sharing the page read-only is safe (its kvm masks this cell); never
-// clears/reformats the page.
+// Explicit-descriptor KV write (the general WSlot/WOff lowering; formerly
+// write_kv_beam). Each lane writes its ONE new-token K/V into an EXPLICIT
+// (physical_page[lane], offset[lane]) target — NOT a position→(page,offset)
+// derivation. A program's descriptor separates the write offset (WOff = old tail
+// fill, or 0 for a fresh page) from the attention length (KvLen = new span), and
+// a fresh-page write (WSlot) that is not the page-run tail cannot be expressed by
+// a linear `abs_pos/page_size` mapping. Single-cell append: touches exactly ONE
+// (page,offset) per lane, so a sibling sharing the page read-only is safe (its
+// mask hides this cell); never clears/reformats the page.
 template <bool HND_LAYOUT>
-__global__ void write_kv_beam_kernel(
-    const __nv_bfloat16* __restrict__ k_curr,   // [B, h_kv, d]
+__global__ void write_kv_explicit_kernel(
+    const __nv_bfloat16* __restrict__ k_curr,   // [LANES, h_kv, d]
     const __nv_bfloat16* __restrict__ v_curr,
     __nv_bfloat16* __restrict__ k_pages,
     __nv_bfloat16* __restrict__ v_pages,
-    const std::uint32_t* __restrict__ w_page,   // [B] PHYSICAL page id per beam
-    const std::uint32_t* __restrict__ w_off,    // [B] offset-in-page per beam
+    const std::uint32_t* __restrict__ w_page,   // [LANES] PHYSICAL page id per lane
+    const std::uint32_t* __restrict__ w_off,    // [LANES] offset-in-page per lane
     int B,
     int page_size,
     int h_kv,
@@ -741,23 +741,23 @@ void launch_write_kv_to_pages_at_positions_bf16(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_write_kv_beam_bf16(
+void launch_write_kv_explicit_bf16(
     KvCacheLayerView layer,
-    const void* k_curr,                 // [B, h_kv, d]
+    const void* k_curr,                 // [LANES, h_kv, d]
     const void* v_curr,
-    const std::uint32_t* w_page,        // [B] PHYSICAL page id per beam
-    const std::uint32_t* w_off,         // [B] offset-in-page per beam
+    const std::uint32_t* w_page,        // [LANES] PHYSICAL page id per lane
+    const std::uint32_t* w_off,         // [LANES] offset-in-page per lane
     int B,
     cudaStream_t stream)
 {
     if (!layer.is_native_bf16()) {
         throw std::runtime_error(
-            "write_kv_beam_bf16 requires native bf16 KV cache");
+            "write_kv_explicit_bf16 requires native bf16 KV cache");
     }
     if (B <= 0) return;
     constexpr int BLOCK = 256;
     if (layer.hnd_layout) {
-        write_kv_beam_kernel<true><<<B, BLOCK, 0, stream>>>(
+        write_kv_explicit_kernel<true><<<B, BLOCK, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k_curr),
             static_cast<const __nv_bfloat16*>(v_curr),
             static_cast<__nv_bfloat16*>(layer.k_pages),
@@ -765,7 +765,7 @@ void launch_write_kv_beam_bf16(
             w_page, w_off, B, layer.page_size, layer.num_kv_heads,
             layer.head_dim);
     } else {
-        write_kv_beam_kernel<false><<<B, BLOCK, 0, stream>>>(
+        write_kv_explicit_kernel<false><<<B, BLOCK, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k_curr),
             static_cast<const __nv_bfloat16*>(v_curr),
             static_cast<__nv_bfloat16*>(layer.k_pages),

@@ -244,7 +244,11 @@ struct PieForwardRequestDesc {
   size_t ptir_program_sidecar_bytes_len;
   const uint32_t *ptir_program_sidecar_indptr_ptr;
   size_t ptir_program_sidecar_indptr_len;
-  const uint32_t *ptir_program_seed_channels_ptr;
+  const uint64_t *ptir_program_channel_ids_ptr;
+  size_t ptir_program_channel_ids_len;
+  const uint32_t *ptir_program_channel_ids_indptr_ptr;
+  size_t ptir_program_channel_ids_indptr_len;
+  const uint64_t *ptir_program_seed_channels_ptr;
   size_t ptir_program_seed_channels_len;
   const uint8_t *ptir_program_seed_blob_ptr;
   size_t ptir_program_seed_blob_len;
@@ -252,7 +256,7 @@ struct PieForwardRequestDesc {
   size_t ptir_program_seed_lens_len;
   const uint32_t *ptir_program_seed_indptr_ptr;
   size_t ptir_program_seed_indptr_len;
-  const uint32_t *ptir_program_host_put_channels_ptr;
+  const uint64_t *ptir_program_host_put_channels_ptr;
   size_t ptir_program_host_put_channels_len;
   const uint8_t *ptir_program_host_put_blob_ptr;
   size_t ptir_program_host_put_blob_len;
@@ -260,6 +264,10 @@ struct PieForwardRequestDesc {
   size_t ptir_program_host_put_lens_len;
   const uint32_t *ptir_program_host_put_indptr_ptr;
   size_t ptir_program_host_put_indptr_len;
+  const uint64_t *ptir_release_channel_ids_ptr;
+  size_t ptir_release_channel_ids_len;
+  const uint64_t *ptir_release_instance_ids_ptr;
+  size_t ptir_release_instance_ids_len;
   uint32_t pipeline_source_link;
   uint8_t pipeline_source_kind;
   const uint32_t *next_input_producer_links_ptr;
@@ -383,7 +391,7 @@ struct PieForwardResponseDesc {
   size_t program_tokens_indptr_len;
   const uint32_t *program_tokens_ptr;
   size_t program_tokens_len;
-  const uint32_t *ptir_output_channels_ptr;
+  const uint64_t *ptir_output_channels_ptr;
   size_t ptir_output_channels_len;
   const uint8_t *ptir_output_blob_ptr;
   size_t ptir_output_blob_len;

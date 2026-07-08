@@ -1,3 +1,2 @@
 core = "./core/wit"
-zo = "./zo/wit"
 instruct = "./instruct/wit"

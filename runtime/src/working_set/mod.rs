@@ -16,4 +16,6 @@
 
 pub mod kv;
 pub mod kv_cas;
+pub mod page_hash;
+pub mod page_size;
 pub mod rs;

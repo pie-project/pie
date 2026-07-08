@@ -33,7 +33,6 @@ wit_bindgen::generate!({
 
 // Re-export types that don't need async wrappers directly
 pub use pie::core::types;
-pub use pie::zo;
 
 // =============================================================================
 // Context
@@ -118,14 +117,6 @@ pub mod reasoning;
 pub mod tools;
 
 pub use tools::Tool;
-
-// =============================================================================
-// Adapter
-// =============================================================================
-
-pub mod adapter {
-    pub use crate::pie::core::adapter::Adapter;
-}
 
 // =============================================================================
 // Model
@@ -215,7 +206,6 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 /// `use inferlet::prelude::*;` covers the common case so inferlets don't
 /// have to maintain a hand-rolled import grocery list.
 pub mod prelude {
-    pub use crate::adapter::Adapter;
     pub use crate::messaging;
     pub use crate::model;
     pub use crate::runtime;

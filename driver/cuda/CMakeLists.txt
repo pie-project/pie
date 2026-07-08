@@ -4,7 +4,44 @@ include(cmake/DetectCudaArchitecture.cmake)
 detect_cuda_architectures()
 message(STATUS "Using CUDA architecture: ${CMAKE_CUDA_ARCHITECTURES}")
 
+# nvcc discovery. CMake reads CUDACXX / CMAKE_CUDA_COMPILER to locate nvcc;
+# some toolkits install CUDA under /usr/local/cuda without putting bin/ on
+# PATH. Probe the standard locations so workspace builds work without the
+# user sourcing CUDA's env script first. (Previously in worker/build.rs.)
+if(NOT CMAKE_CUDA_COMPILER
+   AND NOT DEFINED ENV{CUDACXX}
+   AND NOT DEFINED ENV{CMAKE_CUDA_COMPILER})
+  find_program(PIE_NVCC nvcc
+    HINTS
+      /usr/local/cuda/bin
+      /usr/local/cuda-13/bin
+      /usr/local/cuda-13.0/bin
+      /usr/local/cuda-12/bin
+      /usr/local/cuda-12.8/bin
+      /opt/cuda/bin)
+  if(PIE_NVCC)
+    set(CMAKE_CUDA_COMPILER "${PIE_NVCC}")
+  endif()
+endif()
+
 project(PIE_DRIVER_CUDA CUDA CXX)
+
+# Optional compiler cache (sccache/ccache) for nvcc + host C++ compiles.
+# Speeds clean rebuilds / branch switches; no effect on a cold cache. Honor
+# PIE_COMPILER_LAUNCHER, else auto-detect on PATH. (Previously in build.rs.)
+if(NOT CMAKE_CUDA_COMPILER_LAUNCHER)
+  if(DEFINED ENV{PIE_COMPILER_LAUNCHER} AND NOT "$ENV{PIE_COMPILER_LAUNCHER}" STREQUAL "")
+    set(PIE_COMPILER_LAUNCHER "$ENV{PIE_COMPILER_LAUNCHER}")
+  else()
+    find_program(PIE_COMPILER_LAUNCHER NAMES sccache ccache)
+  endif()
+  if(PIE_COMPILER_LAUNCHER)
+    set(CMAKE_C_COMPILER_LAUNCHER "${PIE_COMPILER_LAUNCHER}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${PIE_COMPILER_LAUNCHER}")
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${PIE_COMPILER_LAUNCHER}")
+    message(STATUS "Using compiler launcher: ${PIE_COMPILER_LAUNCHER}")
+  endif()
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -169,14 +206,9 @@ add_library(pie_driver_cuda_lib STATIC
   src/service/inproc_service.cpp
   src/response_subpass.cpp
   src/sampling_dispatch.cpp
-  src/sampling_ir/runtime.cpp
-  src/sampling_ir/reader.cpp
   src/sampling_ir/next_input.cpp
   src/sampling_ir/tensor_io.cpp
   src/sampling_ir/frame_carrier.cpp
-  src/sampling_ir/codegen.cpp
-  src/sampling_ir/jit.cpp
-  src/sampling_ir/jit_backend.cpp
   src/spec_expansion.cpp
   src/tensor.cpp
   src/model/weight_store.cpp
@@ -226,8 +258,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/kv_cache_format.cpp
   src/kv_cache.cpp
   src/ops/gemm.cpp
-  src/ops/beam_csrs.cpp
-  src/ops/beam_attention.cpp
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
   src/ops/attention_xqa.cu
@@ -244,7 +274,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/slab_scatter.cu
   src/kernels/argmax.cu
   src/kernels/kv_paged.cu
-  src/kernels/beam_mask_adapter.cu
+  src/kernels/pack_dense_mask.cu
   src/kernels/gather_tokens.cu
   src/kernels/envelope.cu
   src/kernels/geometry.cu
@@ -260,9 +290,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/logprobs.cu
   src/kernels/dist.cu
   src/kernels/gather_rows.cu
-  # Sampling-IR NVRTC JIT + driver-API launch (lane L3). Plain C++ (driver
-  # API + NVRTC), no nvcc needed; kept separable under src/sampling_ir/.
-  src/sampling_ir/jit.cpp
   src/kernels/add_bias.cu
   src/kernels/residual_add.cu
   src/kernels/topk_softmax.cu
@@ -456,6 +483,21 @@ option(PIE_MARLIN_ALL_SHAPES
   "Compile all Marlin dtype combos (fp16/bf16/int8 × u4/u4b8/fp8/mxfp4). \
 OFF (default) compiles only bf16×{u4,u4b8,mxfp4} — the shapes pie dispatches."
   OFF)
+# Env overrides (previously forwarded by worker/build.rs as -D...).
+if(DEFINED ENV{PIE_CUDA_BUILD_MARLIN})
+  string(TOLOWER "$ENV{PIE_CUDA_BUILD_MARLIN}" _pie_marlin)
+  if(_pie_marlin MATCHES "^(1|on|true|yes)$")
+    set(PIE_CUDA_BUILD_MARLIN ON)
+  else()
+    set(PIE_CUDA_BUILD_MARLIN OFF)
+  endif()
+endif()
+if(DEFINED ENV{PIE_MARLIN_ALL_SHAPES})
+  string(TOLOWER "$ENV{PIE_MARLIN_ALL_SHAPES}" _pie_marlin_all)
+  if(_pie_marlin_all MATCHES "^(1|on|true|yes)$")
+    set(PIE_MARLIN_ALL_SHAPES ON)
+  endif()
+endif()
 if(PIE_CUDA_BUILD_MARLIN)
     # CUDA 13 generates __global__ template stubs with static linkage,
     # breaking cross-TU explicit instantiations. marlin.cu now #includes
@@ -579,26 +621,17 @@ target_compile_options(test_gather_tokens PRIVATE
 target_link_libraries(test_gather_tokens PRIVATE CUDA::cudart)
 add_test(NAME gather_tokens COMMAND test_gather_tokens)
 
-# Beam [B,P] G2 SEAM 1 — kvm dense→packed-mask adapter, gated by the fork-freeze
-# golden geometry (echo: the goldens ARE the adapter's test vectors).
-add_executable(test_beam_mask_adapter
-  tests/beam_mask_adapter_test.cu
-  src/kernels/beam_mask_adapter.cu)
-target_include_directories(test_beam_mask_adapter PRIVATE
+# AttnMask-port dense mask → FlashInfer packed-mask adapter, gated by the
+# fork-freeze golden geometry (the goldens ARE the adapter's test vectors).
+add_executable(test_pack_dense_mask
+  tests/pack_dense_mask_test.cu
+  src/kernels/pack_dense_mask.cu)
+target_include_directories(test_pack_dense_mask PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_options(test_beam_mask_adapter PRIVATE
+target_compile_options(test_pack_dense_mask PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-target_link_libraries(test_beam_mask_adapter PRIVATE CUDA::cudart)
-add_test(NAME beam_mask_adapter COMMAND test_beam_mask_adapter)
-
-# Beam [B,P] G2 SEAM 1+3 host glue — per-beam CSR construction vs the fork-freeze
-# golden + alpha's slot-0 padding guardrail (pure host, no CUDA).
-add_executable(test_beam_csrs
-  tests/beam_csrs_test.cpp
-  src/ops/beam_csrs.cpp)
-target_include_directories(test_beam_csrs PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-add_test(NAME beam_csrs COMMAND test_beam_csrs)
+target_link_libraries(test_pack_dense_mask PRIVATE CUDA::cudart)
+add_test(NAME pack_dense_mask COMMAND test_pack_dense_mask)
 
 # PTIR M3.2 — Quest envelope kernels (envelope_recompute + envelope_dot).
 # Verifies the min/max maintenance vs a CPU reduction and the importance score

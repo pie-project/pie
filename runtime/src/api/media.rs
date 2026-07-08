@@ -11,7 +11,7 @@
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use crate::multimodal::{self, Processor, VisionArch};
+use crate::model::multimodal::{self, Processor, VisionArch};
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

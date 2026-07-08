@@ -156,11 +156,7 @@ impl RuntimeAbi {
 
         const MIN_GROUP_TENSORS: usize = 16;
         const DEFAULT_MAX_BANK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-        let max_bank_bytes = std::env::var("PIE_WEIGHT_LOADER_MAX_BANK_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_MAX_BANK_BYTES);
+        let max_bank_bytes = DEFAULT_MAX_BANK_BYTES;
 
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct GroupKey {
@@ -1883,10 +1879,7 @@ fn dense_fused_projection_budget_bytes() -> u64 {
     // selects which groups get a fused GEMM: all groups through 8B-class Qwen
     // models, and QKV-only above that where gate/up fusion has regressed.
     const DEFAULT_BUDGET: u64 = 10 * 1024 * 1024 * 1024;
-    std::env::var("PIE_CUDA_FUSED_PROJECTION_BUDGET_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_BUDGET)
+    DEFAULT_BUDGET
 }
 
 fn local_range(full: i64, target: &StorageTarget) -> Result<(i64, i64), CompileError> {

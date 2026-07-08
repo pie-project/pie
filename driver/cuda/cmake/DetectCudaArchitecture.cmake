@@ -1,6 +1,15 @@
 # DetectCudaArchitecture.cmake — auto-detect CUDA architecture from nvidia-smi.
 
 function(detect_cuda_architectures)
+  # Honor the CMAKE_CUDA_ARCHITECTURES env var when the cache var is unset —
+  # CI sets it for GPU-less runners, and CMake doesn't auto-initialize the
+  # cache var from the same-named env var. (Previously forwarded by build.rs.)
+  if((NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR NOT CMAKE_CUDA_ARCHITECTURES)
+     AND DEFINED ENV{CMAKE_CUDA_ARCHITECTURES}
+     AND NOT "$ENV{CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES "$ENV{CMAKE_CUDA_ARCHITECTURES}")
+  endif()
+
   if(DEFINED CMAKE_CUDA_ARCHITECTURES AND CMAKE_CUDA_ARCHITECTURES)
     string(REPLACE ";" ";" CUDA_ARCH_LIST "${CMAKE_CUDA_ARCHITECTURES}")
     set(CUDA_ARCH_LIST_NORMALIZED "")

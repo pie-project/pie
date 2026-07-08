@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "ptir/bound.hpp"
+#include "ptir/channel_registry.hpp"
 #include "ptir/container.hpp"
 #include "ptir/tier0_runner.hpp"
 #include "ptir/trace.hpp"
@@ -38,8 +39,9 @@ namespace pie_cuda_driver::ptir {
 
 // A per-channel host-supplied byte value — mirrors delta's `PtirChannelValue`.
 // Seeds are per-instance init (D2, not in the hash); host_puts are per-fire.
+// `channel` is the GLOBAL channel id (W0.2 re-key) — the device registry key.
 struct ChannelValue {
-    std::uint32_t channel = 0;
+    std::uint64_t channel = 0;
     std::vector<std::uint8_t> bytes;
 };
 
@@ -101,61 +103,82 @@ class PtirProgramCache {
     std::unordered_map<std::uint64_t, Trace> programs_;
 };
 
-// Per-instance execution context: the shared cached `Trace` + its own channel
-// arena. Seeded once at construction; fired synchronously (depth-0) thereafter.
+// Per-instance execution context: the shared cached `Trace` + a channel VIEW
+// onto the global device channel registry (W0.1). The view maps the trace's
+// dense channel indices to shared global slots (`channel_ids` from the wire);
+// channels shared across instances/passes resolve one device cell ring. Seeded
+// once at construction; fired synchronously (depth-0) thereafter.
 class PtirInstance {
   public:
-    // Instantiate over a cached `Trace`, applying the instance's D2 seed values
-    // to their `seeded` channels' initial cells (`Channel::from`).
-    PtirInstance(const Trace& trace, const std::vector<ChannelValue>& seeds)
-        : trace_(&trace), runner_(trace) {
-        for (const ChannelValue& s : seeds)
-            runner_.arena().seed_cell(static_cast<ChannelId>(s.channel),
-                                      s.bytes.data(), s.bytes.size());
+    // Instantiate over a cached `Trace`, binding its dense channels to the
+    // global registry via `channel_ids` (dense idx → global id) and applying the
+    // D2 seed values (keyed by GLOBAL id). `*err` set + `ok()==false` on a decl
+    // conflict / OOM.
+    PtirInstance(const Trace& trace, DeviceChannelRegistry* reg,
+                 const std::vector<std::uint64_t>& channel_ids,
+                 const std::vector<ChannelValue>& seeds, std::string* err)
+        : trace_(&trace), reg_(reg), runner_(trace) {
+        if (!view_.bind(reg, trace.channels, channel_ids, err)) {
+            ok_ = false;
+            return;
+        }
+        runner_.bind_view(&view_);
+        for (const ChannelValue& s : seeds) {
+            const std::uint32_t slot = reg_->slot_for(s.channel);
+            if (slot == DeviceChannelRegistry::kBadSlot) continue;
+            reg_->seed_cell(slot, s.bytes.data(), s.bytes.size());
+        }
     }
 
-    // One fire: bind per-fire host-puts (host-fed channels arriving) + the
-    // intrinsic/host-tensor `FireInputs`, then run one tier-0 pass. The result's
-    // `committed` reflects the end-of-pass predicated commit-bump.
+    bool ok() const { return ok_; }
+
+    // One fire: bind per-fire host-puts (host-fed channels arriving, keyed by
+    // GLOBAL id) + the intrinsic/host-tensor `FireInputs`, then run one tier-0
+    // pass. The result's `committed` reflects the end-of-pass predicated bump.
     PassResult fire(const std::vector<ChannelValue>& host_puts, const FireInputs& in) {
-        for (const ChannelValue& hp : host_puts)
-            runner_.arena().host_feed(static_cast<ChannelId>(hp.channel),
-                                      hp.bytes.data(), hp.bytes.size());
+        for (const ChannelValue& hp : host_puts) {
+            const std::uint32_t slot = reg_->slot_for(hp.channel);
+            if (slot == DeviceChannelRegistry::kBadSlot) continue;
+            reg_->host_feed(slot, hp.bytes.data(), hp.bytes.size());
+        }
         return runner_.run_pass(in);
     }
 
-    // Harvest a host-visible output channel's committed cell (post-commit).
-    // Returns false (WouldBlock) if the channel is not currently full.
+    // Harvest a host-visible output channel's committed cell (post-commit) by
+    // DENSE index. Returns false (WouldBlock) if the channel is not full.
     bool take_output(ChannelId c, void* out, std::size_t bytes) {
-        if (!runner_.arena().committed_full(c)) return false;
-        runner_.arena().host_take(c, out, bytes);
+        if (!view_.committed_full(c)) return false;
+        view_.host_take(c, out, bytes);
         return true;
     }
 
     // Enumerate the committed host-READER output channels post-fire →
-    // `(channel_id, wire_bytes)` pairs — delta's ForwardResponse `ptir_output_*`
-    // SoA. ONLY channels that committed THIS fire appear (back-pressure leaves
-    // others empty), so the list is a per-fire subset of the declared readers.
-    // Consumes (`host_take`) each — one harvest per fire.
-    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> harvest_outputs() {
-        std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> outs;
+    // `(GLOBAL channel id, wire_bytes)` pairs — delta's ForwardResponse
+    // `ptir_output_*` SoA (re-keyed by global id, W0.2). ONLY channels that
+    // committed THIS fire appear (back-pressure leaves others empty). Consumes
+    // (`host_take`) each — one harvest per fire.
+    std::vector<std::pair<std::uint64_t, std::vector<std::uint8_t>>> harvest_outputs() {
+        std::vector<std::pair<std::uint64_t, std::vector<std::uint8_t>>> outs;
         for (const Channel& ch : trace_->channels) {
             if (!ch.host_reader) continue;
-            if (!runner_.arena().committed_full(ch.id)) continue;
-            const std::size_t n = runner_.arena().cell_bytes(ch.id);
+            if (!view_.committed_full(ch.id)) continue;
+            const std::size_t n = view_.cell_bytes(ch.id);
             std::vector<std::uint8_t> bytes(n);
-            runner_.arena().host_take(ch.id, bytes.data(), n);
-            outs.emplace_back(static_cast<std::uint32_t>(ch.id), std::move(bytes));
+            view_.host_take(ch.id, bytes.data(), n);
+            outs.emplace_back(view_.global_id(ch.id), std::move(bytes));
         }
         return outs;
     }
 
     Tier0Runner& runner() { return runner_; }
-    ChannelArena& arena() { return runner_.arena(); }
+    ChannelView& view() { return view_; }
 
   private:
     const Trace* trace_;
+    DeviceChannelRegistry* reg_;
+    ChannelView view_;
     Tier0Runner runner_;
+    bool ok_ = true;
 };
 
 }  // namespace pie_cuda_driver::ptir

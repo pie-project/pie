@@ -9,7 +9,7 @@
 //!
 //! Reference: Mistral V3 Jinja chat template.
 
-use crate::inference::structured::grammar::Grammar;
+use crate::grammar::grammar::Grammar;
 use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder};
 use crate::model::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,

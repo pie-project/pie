@@ -1,32 +1,9 @@
 interface inference {
     use types.{error};
-    use adapter.{adapter};
     use media.{image, audio};
     use working-set.{kv-working-set, rs-working-set};
-    use tensor.{tensor, program};
 
     type brle = list<u32>;
-
-    variant input-binding {
-        /// Forward-pass output positions whose logits are bound to this input.
-        /// Shape `[vocab]` for one position, or `[len(positions), vocab]` for
-        /// multiple. A `logits` binding's positions are the pass's sampling
-        /// positions.
-        logits(list<u32>),
-        /// Bind this input to the model's multi-token-prediction (MTP) logits
-        /// for the pass's sampling positions.
-        mtp-logits,
-        /// Bind this input to the model's multi-token-prediction (MTP) draft
-        /// token ids for the pass's sampling positions. Device-resident `[k]`
-        /// i32 tokens — the drafts channel consumed by device-side spec-decode
-        /// verify (no host round-trip).
-        mtp-drafts,
-        /// A device tensor bound to a program input slot (a per-fire value,
-        /// mask, etc.). Submit-bound tensors are gathered at `execute()`;
-        /// late-bound values are written via `tensor.write` before the
-        /// consuming region (the run-ahead late channel).
-        tensor(tensor),
-    }
 
     // ── Forward-pass memory contract (explicit read/write descriptors) ──────
     // A forward pass READS its declared context tokens and WRITES only its
@@ -94,24 +71,6 @@ interface inference {
             mask: list<brle>,
         );
 
-        /// Attach one tensor program as the sampler. Binding `i` supplies the
-        /// program input at index `i`. The program's output is returned by
-        /// `output()` / `outputs()` as a raw tensor.
-        sampler: func(
-            program: borrow<program>,
-            inputs: list<input-binding>,
-        );
-
-        /// Attach multiple tensor programs as samplers. `inputs[i]` supplies
-        /// the positional bindings for `programs[i]`; outputs mirror `programs`.
-        samplers: func(
-            programs: list<borrow<program>>,
-            inputs: list<list<input-binding>>,
-        );
-
-        adapter: func(
-            adapter: borrow<adapter>,
-        );
 
         /// Run-ahead carrier (§2.1). Declares that the NEXT forward pass on
         /// this context carries THIS pass's sampled token(s) into the given
@@ -162,16 +121,10 @@ interface inference {
         /// carrier destinations declared on this pass are unaffected.
         fresh-generate: func();
 
-        /// Eager submit (synchronous): enqueue this pass's forward work. Await
-        /// the result via `output()` / `outputs()`.
+        /// Eager submit (synchronous): enqueue this pass's forward work. The
+        /// sampled token(s) surface through the `ptir` channel(s) the attached
+        /// sampler program writes (programmable sampling lives in `ptir`).
         execute: func();
-
-        /// The output tensor of a single-sampler pass. Awaits the fire; the
-        /// dtype/shape follow the program's declared output value.
-        output: async func() -> result<tensor, error>;
-
-        /// The output tensors of a multi-sampler pass, in `samplers` order.
-        outputs: async func() -> result<list<tensor>, error>;
     }
 
     /// Describes the structure that the LLM output must conform to.

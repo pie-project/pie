@@ -3,7 +3,7 @@
 //! Uses <|start_header_id|>role<|end_header_id|> delimiters.
 //! Tool responses use the `ipython` role.
 
-use crate::inference::structured::grammar::Grammar;
+use crate::grammar::grammar::Grammar;
 use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::model::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,

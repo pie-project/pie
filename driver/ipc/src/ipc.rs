@@ -176,14 +176,7 @@ fn checked_region_size(num_slots: usize, slot_stride: usize) -> Result<usize> {
 /// Hard upper bound on a single `ShmemClient::roundtrip` call. The
 /// server is expected to respond well within this; any longer and we
 /// treat the call as failed (typically the driver crashed).
-static HARD_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
-    std::env::var("PIE_SHMEM_HARD_TIMEOUT_S")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .map(Duration::from_secs_f64)
-        .unwrap_or_else(|| Duration::from_secs(60))
-});
+static HARD_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| Duration::from_secs(60));
 
 // ============================================================================
 // Small helpers for unaligned reads/writes against the mmap'd header.

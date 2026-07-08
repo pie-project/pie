@@ -1,6 +1,5 @@
 interface inference {
     use types.{error};
-    use adapter.{adapter};
     use media.{image, audio};
     use working-set.{kv-working-set, rs-working-set};
     use tensor.{tensor, program};
@@ -109,9 +108,6 @@ interface inference {
             inputs: list<list<input-binding>>,
         );
 
-        adapter: func(
-            adapter: borrow<adapter>,
-        );
 
         /// Run-ahead carrier (§2.1). Declares that the NEXT forward pass on
         /// this context carries THIS pass's sampled token(s) into the given

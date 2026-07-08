@@ -1,6 +1,13 @@
 //! Build the embedded native driver static libraries via CMake and link
 //! them into the `pie` binary as a single deployable artifact.
 //!
+//! This script is the Cargo↔native *link bridge*: it invokes each driver's
+//! CMake build, forwards the two include-dir handoffs, and emits the
+//! `cargo:rustc-link-*` directives for the final binary (which rustc, not
+//! CMake, links). Build-time *discovery* — nvcc location, CUDA arch,
+//! sccache/ccache, NCCL, Marlin toggles, the CPM cache — lives in
+//! `driver/*/CMakeLists.txt`, the native build system's proper home for it.
+//!
 //! Selection for native C++ drivers is via Cargo features. The Rust
 //! dummy driver is always linked; the resulting binary dispatches at
 //! runtime via `[model].driver.type` in the config TOML. The drivers
@@ -9,10 +16,8 @@
 //! static archives can coexist in one binary without symbol collisions.
 //!
 //!   - `driver-cuda`: native CUDA driver with flashinfer kernels.
-//!     Statically links the per-toolkit CUDA libs from `$CUDA_HOME`
-//!     (or `/usr/local/cuda`) so the resulting binary has zero CUDA
-//!     shared deps. Verified by the M3 spike (see
-//!     `driver/cuda/CMakeLists.txt`).
+//!     Dynamic-links the CUDA toolkit `.so`s from `$CUDA_HOME`
+//!     (or `/usr/local/cuda`); Linux-only.
 //!   - dummy: Rust staticlib — random tokens, no model load; always linked.
 
 use std::path::{Path, PathBuf};
@@ -85,97 +90,45 @@ fn build_metal() {
     }
 
     let driver_dir = PathBuf::from("../driver/metal");
-    println!("cargo:rerun-if-changed=../driver/metal/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=../driver/metal/src");
+    let mut cfg = driver_cmake_config(&driver_dir, "metal", "pie_driver_metal_lib");
 
-    let mut cfg = cmake::Config::new(&driver_dir);
-    // Per-flavor out_dir keeps multi-driver builds from clobbering each
-    // other's CMake cache.
-    cfg.out_dir(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("metal"));
-    cfg.build_target("pie_driver_metal_lib")
-        .define("BUILD_SHARED_LIBS", "OFF")
-        .define("PIE_SCHEMA_INCLUDE_DIR", pie_driver_abi_include_dir())
-        .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
-    enable_position_independent_archives(&mut cfg);
-
-    // Persistent CPM cache for the header-only deps (tomlplusplus / CLI11
-    // / nlohmann_json) and, when enabled, the MLX source tree.
+    // CPM cache is read by the CMakeLists via `$ENV{CPM_SOURCE_CACHE}`;
+    // declare the dep so a change reconfigures.
     println!("cargo:rerun-if-env-changed=CPM_SOURCE_CACHE");
-    if let Ok(cache) = std::env::var("CPM_SOURCE_CACHE") {
-        cfg.define("CPM_SOURCE_CACHE", cache);
-    }
 
-    // MLX is OFF by default — the raw-Metal driver is MLX-free. Left as an
-    // opt-in (PIE_METAL_WITH_MLX=1) for the legacy MLX executor path.
-    println!("cargo:rerun-if-env-changed=PIE_METAL_WITH_MLX");
-    let mlx_on = std::env::var("PIE_METAL_WITH_MLX")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
-        .unwrap_or(false);
+    // MLX is OFF by default (the raw-Metal driver is MLX-free); opt in with
+    // PIE_METAL_WITH_MLX=1 for the legacy MLX executor path. The flag also
+    // gates the link below, so read it here.
+    let mlx_on = env_is_truthy("PIE_METAL_WITH_MLX");
     cfg.define("PIE_METAL_WITH_MLX", if mlx_on { "ON" } else { "OFF" });
 
     // MLX provider: "fetch" (FetchContent from source, default) or "system"
-    // (link a prebuilt MLX via find_package(MLX), e.g. `brew install mlx`).
+    // (a prebuilt MLX via find_package(MLX), e.g. `brew install mlx`).
     println!("cargo:rerun-if-env-changed=PIE_METAL_MLX_PROVIDER");
     if let Ok(provider) = std::env::var("PIE_METAL_MLX_PROVIDER") {
         let provider = provider.to_ascii_lowercase();
         if !matches!(provider.as_str(), "fetch" | "system") {
-            panic!(
-                "PIE_METAL_MLX_PROVIDER must be \"fetch\" or \"system\" \
-                 (got {provider:?})"
-            );
+            panic!("PIE_METAL_MLX_PROVIDER must be \"fetch\" or \"system\" (got {provider:?})");
         }
         cfg.define("PIE_METAL_MLX_PROVIDER", provider);
     }
 
     // Source-fetch only: build MLX's Metal GPU backend (needs `xcrun metal`).
-    println!("cargo:rerun-if-env-changed=PIE_METAL_MLX_BUILD_METAL");
-    if let Ok(v) = std::env::var("PIE_METAL_MLX_BUILD_METAL") {
-        let on = matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes");
-        cfg.define("PIE_METAL_MLX_BUILD_METAL", if on { "ON" } else { "OFF" });
+    // Only forwarded when explicitly set (otherwise the CMake default holds).
+    let build_metal_gpu = env_is_truthy("PIE_METAL_MLX_BUILD_METAL");
+    if std::env::var_os("PIE_METAL_MLX_BUILD_METAL").is_some() {
+        cfg.define("PIE_METAL_MLX_BUILD_METAL", if build_metal_gpu { "ON" } else { "OFF" });
     }
 
-    let dst = cfg.build();
-    let build_dir = dst.join("build");
-
+    let build_dir = cfg.build().join("build");
     add_link_search_paths(&build_dir);
 
-    // Driver lib. tomlplusplus / nlohmann_json / CLI11 are header-only
-    // and produce no archive; the static lib is self-contained (modulo
-    // MLX, which adds its own archives picked up by add_link_search_paths
-    // when PIE_METAL_WITH_MLX=ON).
+    // --- link directives for the final rustc binary (CMake can't emit these) ---
     println!("cargo:rustc-link-lib=static=pie_driver_metal_lib");
-
-    // MLX link (opt-in legacy path only).
     if mlx_on {
-        let provider = std::env::var("PIE_METAL_MLX_PROVIDER")
-            .map(|p| p.to_ascii_lowercase())
-            .unwrap_or_else(|_| "fetch".to_string());
-        if provider == "system" {
-            let prefix = std::env::var("PIE_MLX_PREFIX")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    std::process::Command::new("brew")
-                        .args(["--prefix", "mlx"])
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .filter(|s| !s.is_empty())
-                })
-                .unwrap_or_else(|| "/opt/homebrew/opt/mlx".to_string());
-            let libdir = format!("{prefix}/lib");
-            println!("cargo:rustc-link-search=native={libdir}");
-            println!("cargo:rustc-link-lib=dylib=mlx");
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
-        } else {
-            println!("cargo:rustc-link-lib=static=mlx");
-        }
-        println!("cargo:rustc-link-lib=framework=QuartzCore");
+        link_mlx();
     }
-
-    // Apple frameworks the metal driver pulls. -framework on macOS is the
-    // moral equivalent of -l on linux.
+    // Apple frameworks the metal driver pulls. -framework is macOS's -l.
     println!("cargo:rustc-link-lib=framework=Accelerate");
     add_system_libs(/*metal=*/ true);
 
@@ -212,182 +165,37 @@ fn build_cuda() {
     }
 
     let driver_dir = PathBuf::from("../driver/cuda");
-    println!("cargo:rerun-if-changed=../driver/cuda/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=../driver/cuda/src");
+    let mut cfg = driver_cmake_config(&driver_dir, "cuda", "pie_driver_cuda_lib");
 
-    let mut cfg = cmake::Config::new(&driver_dir);
-    // Per-flavor out_dir keeps the CMake configurations from clobbering each
-    // other in multi-driver builds.
-    cfg.out_dir(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("cuda"));
-    cfg.build_target("pie_driver_cuda_lib")
-        .define("BUILD_SHARED_LIBS", "OFF")
-        .define("PIE_SCHEMA_INCLUDE_DIR", pie_driver_abi_include_dir())
-        .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
-    enable_position_independent_archives(&mut cfg);
-
-    // (The CUDA driver build no longer invokes Python: FlashInfer MoE
-    // launchers are vendored, so no kernel generator runs at build time.)
-
-    println!("cargo:rerun-if-env-changed=CPM_SOURCE_CACHE");
-    if let Ok(cache) = std::env::var("CPM_SOURCE_CACHE") {
-        cfg.define("CPM_SOURCE_CACHE", cache);
+    // nvcc discovery, CUDA arch, the sccache/ccache launcher, the Marlin
+    // toggles and the CPM source cache are all handled by driver/cuda's
+    // CMakeLists (via find_program / `$ENV{...}`); we only declare the env
+    // deps here so Cargo reconfigures when they change.
+    for var in [
+        "CUDACXX",
+        "CMAKE_CUDA_COMPILER",
+        "CMAKE_CUDA_ARCHITECTURES",
+        "PIE_COMPILER_LAUNCHER",
+        "PIE_CUDA_BUILD_MARLIN",
+        "PIE_MARLIN_ALL_SHAPES",
+        "CPM_SOURCE_CACHE",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
     }
 
-    // Optional Marlin W4A16 support. Keep it off by default because the
-    // vendored template kernels add substantial build time, but let Cargo
-    // builds opt into the same CMake path used by standalone driver builds.
-    println!("cargo:rerun-if-env-changed=PIE_CUDA_BUILD_MARLIN");
-    if let Ok(value) = std::env::var("PIE_CUDA_BUILD_MARLIN") {
-        let lower = value.to_ascii_lowercase();
-        let on = matches!(lower.as_str(), "1" | "on" | "true" | "yes");
-        cfg.define("PIE_CUDA_BUILD_MARLIN", if on { "ON" } else { "OFF" });
-    }
-    println!("cargo:rerun-if-env-changed=PIE_MARLIN_ALL_SHAPES");
-    if std::env::var("PIE_MARLIN_ALL_SHAPES")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
-        .unwrap_or(false)
-    {
-        cfg.define("PIE_MARLIN_ALL_SHAPES", "ON");
-    }
-
-    // nvcc discovery. CMake reads `CMAKE_CUDA_COMPILER` / `CUDACXX` to
-    // locate nvcc; some toolchains install CUDA under `/usr/local/cuda`
-    // without adding `/usr/local/cuda/bin` to the build user's PATH.
-    // Probe standard locations and hand CMake the explicit path so
-    // workspace builds work without the user having to source CUDA's
-    // env script first.
-    println!("cargo:rerun-if-env-changed=CUDACXX");
-    println!("cargo:rerun-if-env-changed=CMAKE_CUDA_COMPILER");
-    if std::env::var_os("CUDACXX").is_none() && std::env::var_os("CMAKE_CUDA_COMPILER").is_none() {
-        for candidate in [
-            "/usr/local/cuda/bin/nvcc",
-            "/usr/local/cuda-13/bin/nvcc",
-            "/usr/local/cuda-13.0/bin/nvcc",
-            "/usr/local/cuda-12/bin/nvcc",
-            "/usr/local/cuda-12.8/bin/nvcc",
-            "/opt/cuda/bin/nvcc",
-        ] {
-            if Path::new(candidate).exists() {
-                cfg.define("CMAKE_CUDA_COMPILER", candidate);
-                break;
-            }
-        }
-    }
-
-    // CUDA architecture. driver/cuda's `DetectCudaArchitecture.cmake`
-    // shells out to `nvidia-smi` if `CMAKE_CUDA_ARCHITECTURES` isn't
-    // pre-set, which fails on CI runners with no GPU. cmake-rs does
-    // not auto-forward env vars, so honor the standard
-    // `CMAKE_CUDA_ARCHITECTURES` env var explicitly.
-    println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
-    if let Ok(arch) = std::env::var("CMAKE_CUDA_ARCHITECTURES") {
-        cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
-    }
-
-    // Compiler cache for nvcc + host C++ compiles: prefer sccache (it has a
-    // GitHub Actions cache backend handy in CI), fall back to ccache. Speeds
-    // up clean rebuilds / branch switches; no effect on a cold cache. Wire
-    // only when one is on PATH so runners without it are unaffected. Override
-    // explicitly with PIE_COMPILER_LAUNCHER=<sccache|ccache|/path>.
-    println!("cargo:rerun-if-env-changed=PIE_COMPILER_LAUNCHER");
-    let launcher = std::env::var("PIE_COMPILER_LAUNCHER")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            ["sccache", "ccache"].into_iter().find(|c| {
-                std::process::Command::new(c)
-                    .arg("--version")
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false)
-            }).map(String::from)
-        });
-    if let Some(launcher) = launcher {
-        cfg.define("CMAKE_C_COMPILER_LAUNCHER", &launcher);
-        cfg.define("CMAKE_CXX_COMPILER_LAUNCHER", &launcher);
-        cfg.define("CMAKE_CUDA_COMPILER_LAUNCHER", &launcher);
-        println!("cargo:warning=cuda driver compiler launcher: {launcher}");
-    }
-
-    // NCCL discovery hint. The cuda driver's CMakeLists.txt does
-    // `find_path(NCCL_INCLUDE_DIR nccl.h ...)` against `/usr/include`
-    // and `/usr/local/include` by default. Sites that install NCCL
-    // sideways (e.g. the `nvidia-nccl-cu*` Python wheel under
-    // `site-packages/nvidia/nccl/`) need an escape hatch — set
-    // `PIE_NCCL_HOME` to its root so this build picks it up too.
-    println!("cargo:rerun-if-env-changed=PIE_NCCL_HOME");
-    if let Ok(nccl_home) = std::env::var("PIE_NCCL_HOME") {
-        let inc = Path::new(&nccl_home).join("include");
-        let lib = Path::new(&nccl_home).join("lib");
-        if !inc.is_dir() || !lib.is_dir() {
-            panic!(
-                "PIE_NCCL_HOME={nccl_home:?} must contain include/ and lib/ \
-                 subdirectories (got include={inc:?}, lib={lib:?})"
-            );
-        }
-        cfg.define("NCCL_INCLUDE_DIR", inc.display().to_string());
-        // Pin the exact library path so find_library doesn't trip over
-        // a versioned-only `libnccl.so.2` next to a missing `libnccl.so`.
-        let candidates = ["libnccl.so", "libnccl.so.2"];
-        let nccl_lib = candidates
-            .iter()
-            .map(|name| lib.join(name))
-            .find(|p| p.is_file())
-            .unwrap_or_else(|| {
-                panic!(
-                    "PIE_NCCL_HOME={nccl_home:?}: no libnccl.so / libnccl.so.2 \
-                     under {lib:?}"
-                )
-            });
-        cfg.define("NCCL_LIBRARY", nccl_lib.display().to_string());
-    }
-
-    let dst = cfg.build();
-    let build_dir = dst.join("build");
-
+    let build_dir = cfg.build().join("build");
     add_link_search_paths(&build_dir);
 
-    // Driver lib. tomlplusplus / nlohmann_json / CLI11 are header-only
-    // and produce no archive; the static lib is self-contained.
+    // --- link directives for the final rustc binary (CMake can't emit these) ---
     println!("cargo:rustc-link-lib=static=pie_driver_cuda_lib");
 
-    // CUDA toolkit: dynamic-link cudart + cublas + cublasLt + nvrtc.
-    // The cuda driver's `src/ops/gemm.cpp` directly references
-    // `cublasLt*` symbols (the native FP8 W8A16 path on sm_89+),
-    // and the Sampling-IR JIT (`src/sampling_ir/jit.cpp`) calls the
-    // NVRTC runtime-compilation API (`nvrtcCreateProgram`/`…CompileProgram`/
-    // `…GetPTX`, etc.), so we must satisfy them at link time. Runtime
-    // contract: the host has CUDA toolkit installed; all `.so` files ship
-    // together with the toolkit.
+    // CUDA toolkit: dynamic cudart + cublas + cublasLt + nvrtc (gemm.cpp
+    // references cublasLt directly; the Sampling-IR JIT calls the NVRTC
+    // runtime-compilation API), plus the driver-API stub (`-lcuda`). Runtime
+    // contract: the host ships the CUDA toolkit `.so`s.
     link_cuda_toolkit_dynamic(&["cudart", "cublas", "cublasLt", "nvrtc"]);
     link_cuda_driver_stub();
-
-    // NCCL: dynamic-linked. Two install shapes in the wild:
-    //   * System `libnccl-dev`: `libnccl.so` -> `libnccl.so.2.X` symlink,
-    //     so `-lnccl` resolves cleanly.
-    //   * `nvidia-nccl-cu*` Python wheel: ships only `libnccl.so.2`
-    //     (versioned), no unversioned symlink. rust-lld is strict and
-    //     refuses `-lnccl` against that, so we link the exact file
-    //     when `PIE_NCCL_HOME` points at a wheel install.
-    if let Ok(nccl_home) = std::env::var("PIE_NCCL_HOME") {
-        let nccl_lib_dir = Path::new(&nccl_home).join("lib");
-        println!("cargo:rustc-link-search=native={}", nccl_lib_dir.display());
-        // Prefer the unversioned name if it exists (some wheels do
-        // ship the symlink); otherwise fall back to libnccl.so.2.
-        let unversioned = nccl_lib_dir.join("libnccl.so");
-        if unversioned.is_file() {
-            println!("cargo:rustc-link-lib=nccl");
-        } else {
-            println!("cargo:rustc-link-arg=-l:libnccl.so.2");
-        }
-        // Embed the wheel's lib dir as an rpath so the binary loads
-        // libnccl.so.2 without requiring `LD_LIBRARY_PATH` at runtime.
-        // System-NCCL builds skip this — the loader finds the .so via
-        // the standard ld.so search path.
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", nccl_lib_dir.display());
-    } else {
-        println!("cargo:rustc-link-lib=nccl");
-    }
+    link_nccl();
 
     add_system_libs(/*metal=*/ false);
 
@@ -402,39 +210,30 @@ fn build_cuda() {
 // Shared helpers
 // -----------------------------------------------------------------------------
 
-fn define_vulkan_sdk_paths(cfg: &mut cmake::Config, target_os: &str) {
-    let Ok(sdk) = std::env::var("VULKAN_SDK") else {
-        return;
-    };
-    let sdk = PathBuf::from(sdk);
-
-    let include_dir = sdk.join("Include");
-    if include_dir.join("vulkan").join("vulkan.h").is_file() {
-        cfg.define("Vulkan_INCLUDE_DIR", include_dir.display().to_string());
-    }
-
-    let library_candidates: &[&str] = if target_os == "windows" {
-        &["Lib/vulkan-1.lib", "lib/vulkan-1.lib"]
-    } else if target_os == "macos" {
-        &["lib/libvulkan.dylib", "Lib/libvulkan.dylib"]
-    } else {
-        &["lib/libvulkan.so", "Lib/libvulkan.so"]
-    };
-    for candidate in library_candidates {
-        let library = sdk.join(candidate);
-        if library.is_file() {
-            cfg.define("Vulkan_LIBRARY", library.display().to_string());
-            break;
-        }
-    }
+/// Shared `cmake::Config` for a native driver flavor. Per-flavor `out_dir`
+/// keeps multi-driver builds from clobbering each other's CMake cache; the
+/// archives are static + PIC (downstream may relink them into the pyo3
+/// `pie-server` shared object), and the two include-dir handoffs published
+/// by `pie-driver-abi` / `pie-ipc`'s build scripts are forwarded so the C++
+/// targets can find the ABI + in-proc IPC headers.
+fn driver_cmake_config(driver_dir: &Path, out_subdir: &str, build_target: &str) -> cmake::Config {
+    let mut cfg = cmake::Config::new(driver_dir);
+    cfg.out_dir(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join(out_subdir));
+    cfg.build_target(build_target)
+        .define("BUILD_SHARED_LIBS", "OFF")
+        .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
+        .define("PIE_SCHEMA_INCLUDE_DIR", pie_driver_abi_include_dir())
+        .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
+    cfg
 }
 
-/// The embedded drivers are static CMake archives, but downstream crates may
-/// link them into a shared object (notably the pyo3 `pie-server` wheel). Keep
-/// the archives PIC-compatible so the same embedded driver build works for both
-/// the standalone CLI binary and Python extension module.
-fn enable_position_independent_archives(cfg: &mut cmake::Config) {
-    cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
+/// True when `env` is set to a truthy value (`1`/`on`/`true`/`yes`). Also
+/// registers a Cargo `rerun-if-env-changed` for it.
+fn env_is_truthy(env: &str) -> bool {
+    println!("cargo:rerun-if-env-changed={env}");
+    std::env::var(env)
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 /// Dynamic-link CUDA toolkit `.so`s (`-lcudart -lcublas` etc.) from
@@ -491,6 +290,47 @@ fn link_cuda_driver_stub() {
         }
     }
     println!("cargo:rustc-link-lib=cuda");
+}
+
+/// Emit the NCCL link directive for the final binary. Only system NCCL is
+/// supported: CMake's `find_library(nccl)` locates the header + library at
+/// configure time, and rustc resolves `-lnccl` at link time.
+fn link_nccl() {
+    println!("cargo:rustc-link-lib=nccl");
+}
+
+/// Emit MLX link directives (opt-in legacy path). The `system` provider
+/// dylib-links a brew/prefix MLX (+ rpath); `fetch` static-links the
+/// FetchContent build.
+fn link_mlx() {
+    let provider = std::env::var("PIE_METAL_MLX_PROVIDER")
+        .map(|p| p.to_ascii_lowercase())
+        .unwrap_or_else(|_| "fetch".to_string());
+    if provider == "system" {
+        let prefix = std::env::var("PIE_MLX_PREFIX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(brew_mlx_prefix)
+            .unwrap_or_else(|| "/opt/homebrew/opt/mlx".to_string());
+        let libdir = format!("{prefix}/lib");
+        println!("cargo:rustc-link-search=native={libdir}");
+        println!("cargo:rustc-link-lib=dylib=mlx");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{libdir}");
+    } else {
+        println!("cargo:rustc-link-lib=static=mlx");
+    }
+    println!("cargo:rustc-link-lib=framework=QuartzCore");
+}
+
+/// `brew --prefix mlx`, if brew is present and MLX is installed.
+fn brew_mlx_prefix() -> Option<String> {
+    std::process::Command::new("brew")
+        .args(["--prefix", "mlx"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn cuda_home() -> String {

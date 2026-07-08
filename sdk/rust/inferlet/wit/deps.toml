@@ -1,3 +1,2 @@
 core = "../../../../interface/inferlet/core/wit"
-zo = "../../../../interface/inferlet/zo/wit"
 instruct = "../../../../interface/inferlet/instruct/wit"

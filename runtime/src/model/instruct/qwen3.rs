@@ -5,7 +5,7 @@
 //!
 //! Reference: Qwen3 Jinja chat template with tool-calling support.
 
-use crate::inference::structured::grammar::Grammar;
+use crate::grammar::grammar::Grammar;
 use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, ThinkingDecoder};
 use crate::model::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,

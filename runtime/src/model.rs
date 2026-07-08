@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Result, anyhow};
 
 pub mod instruct;
+pub mod multimodal;
 pub mod tokenizer;
 
 use instruct::Instruct;

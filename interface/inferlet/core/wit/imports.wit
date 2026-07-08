@@ -2,7 +2,6 @@ package pie:core;
 
 world imports {
     import types;
-    import adapter;
     import working-set;
     import messaging;
     import session;

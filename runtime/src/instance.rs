@@ -62,15 +62,15 @@ pub struct InstanceState {
     /// Per-context (not a single slot) so N concurrently-decoding pipelines in one
     /// instance never clobber each other's carry under co-batched submit
     /// (thrust-2 Bug#2). Carrier link ids are drawn from a PROCESS-GLOBAL counter
-    /// in [`crate::api::next_input_map`] (not per-instance — else concurrent
+    /// in [`crate::inference::runahead`] (not per-instance — else concurrent
     /// instances collide in the driver's global retained map).
     pub(crate) pending_next_input:
-        std::collections::HashMap<u32, crate::api::next_input_map::PendingNextInput>,
+        std::collections::HashMap<u32, crate::inference::runahead::PendingNextInput>,
     /// #23 overlap abort-isolation write-log: tracks each in-flight producer
     /// link's resolved outcome so a consumer's finalize cascade-aborts if the
     /// producer it injected from aborted (fail-closed on unresolved). Cleared at
     /// each fresh `generate()` boundary.
-    pub(crate) overlap_links: crate::api::next_input_map::OverlapLinkLog,
+    pub(crate) overlap_links: crate::inference::runahead::OverlapLinkLog,
 
     /// Task-B (carrier ⋈ contention): table reps of this instance's
     /// `ForwardPass` resources that hold a live `PendingForward`. The
@@ -221,7 +221,7 @@ impl InstanceState {
             // `next-inputs`).
             pending_next_input: std::collections::HashMap::new(),
             // #23 overlap abort-isolation write-log (empty until a producer pass).
-            overlap_links: crate::api::next_input_map::OverlapLinkLog::default(),
+            overlap_links: crate::inference::runahead::OverlapLinkLog::default(),
             pending_fires: Vec::new(),
 
             // Depth-k rollback free-all tracking (empty until a producer pass).

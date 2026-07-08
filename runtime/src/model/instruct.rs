@@ -3,7 +3,7 @@
 //! Each model architecture provides its own implementation. The API layer
 //! delegates to the model's `Instruct` impl for all instruct operations.
 
-use crate::inference::structured::grammar::Grammar;
+use crate::grammar::grammar::Grammar;
 use crate::model::tokenizer::Tokenizer;
 use std::sync::Arc;
 

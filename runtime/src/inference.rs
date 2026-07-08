@@ -9,11 +9,16 @@
 //! Batch scheduling, RPC execution, and response notification are handled
 //! by individual BatchScheduler instances (one per driver).
 
-mod adaptive_policy;
-pub mod forward_prepare;
+mod policy;
+pub mod batch;
+pub mod contention;
+pub mod execute;
+pub mod paging;
+pub mod runahead;
 pub mod request;
+pub mod response;
 pub mod scheduler;
-pub mod structured;
+pub mod stats;
 
 use tokio::sync::oneshot;
 
@@ -25,7 +30,7 @@ use scheduler::BatchScheduler;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
-pub use scheduler::{BUBBLE_HIST_UPPER_US, SYSTEM_SPEC_DRAFT_POS_BUCKETS, SchedulerStats};
+pub use stats::{BUBBLE_HIST_UPPER_US, SYSTEM_SPEC_DRAFT_POS_BUCKETS, SchedulerStats};
 /// Aggregated inference stats for a single model (across all drivers).
 ///
 /// Always-on counters live at the top; per-domain probe averages

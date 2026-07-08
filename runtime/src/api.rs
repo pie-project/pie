@@ -1,30 +1,16 @@
-pub mod adapter;
 pub mod audio_out;
 pub mod http;
 pub mod inference;
-pub mod next_input_map;
 pub mod media;
 pub mod messaging;
 pub mod model;
 pub mod kv_working_set;
-pub mod program_cache;
-pub mod ptir_beam;
-pub mod ptir_channel_store;
-pub mod ptir_geometry;
-pub mod ptir_host;
-pub mod ptir_instance;
-pub mod ptir_kv;
-pub mod ptir_registry;
-pub mod ptir_rs;
-pub mod tensor_io;
-pub mod program_decode;
 pub mod runtime;
 pub mod rs_working_set;
 pub mod session;
 pub mod types;
 
 pub mod instruct;
-pub mod zo;
 
 use wasmtime::component::HasSelf;
 use crate::instance::InstanceState;
@@ -45,25 +31,19 @@ wasmtime::component::bindgen!({
         "wasi:random/random": wasmtime_wasi::p2::bindings::random::random,
         "wasi:random/insecure": wasmtime_wasi::p2::bindings::random::insecure,
         "wasi:random/insecure-seed": wasmtime_wasi::p2::bindings::random::insecure_seed,
-        // pie:core/tensor (de-hardwiring: the `program` resource + submit-bound
-        // `tensor` inputs that `sampler(program, inputs)` reads). P3 makes model
-        // global funcs and replaces context with working-sets, so neither maps a
-        // resource here — only tensor/program stay as resources.
-        "pie:core/tensor.tensor": inference::Tensor,
-        "pie:core/tensor.program": inference::Program,
         // pie:core/working-set (kv); rs-working-set below
         "pie:core/working-set.kv-working-set": crate::working_set::kv::KvWorkingSet,
         // pie:core/inference
         "pie:core/inference.forward-pass": inference::ForwardPass,
         "pie:core/inference.grammar": inference::Grammar,
         "pie:core/inference.matcher": inference::Matcher,
-        // pie:core/ptir (thrust-3 P2b) — the traced-pass registry + pipeline.
-        "pie:core/ptir.channel": ptir_host::Channel,
-        "pie:core/ptir.pipeline": ptir_host::Pipeline,
+        // pie:core/ptir (thrust-3 P2b) — first-class channels + forward-pass
+        // submission (the registry surface folded into forward-pass.new).
+        "pie:core/ptir.channel": crate::ptir::ptir_host::Channel,
+        "pie:core/ptir.forward-pass": crate::ptir::ptir_host::ForwardPass,
+        "pie:core/ptir.pipeline": crate::ptir::ptir_host::Pipeline,
         // pie:core/working-set (rs)
         "pie:core/working-set.rs-working-set": crate::working_set::rs::RsWorkingSet,
-        // pie:core/adapter
-        "pie:core/adapter.adapter": adapter::Adapter,
         // pie:core/media
         "pie:core/media.image": media::Image,
         "pie:core/media.video": media::Video,
@@ -96,18 +76,13 @@ pub fn add_to_linker(
     pie::core::working_set::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::http::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::model::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    // pie:core/tensor (de-hardwiring: tensor + program resources read by
-    // `sampler(program, inputs)`).
-    pie::core::tensor::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::inference::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::ptir::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::messaging::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::session::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::adapter::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::media::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::audio_out::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::core::runtime::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::zo::zo::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::instruct::chat::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::instruct::tool_use::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::instruct::reasoning::add_to_linker::<InstanceState, D>(linker, |s| s)?;

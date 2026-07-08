@@ -185,14 +185,18 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> ptir_program_bytes_indptr;      // per-program byte CSR
     PieSlice<std::uint8_t>  ptir_program_sidecar_bytes;     // concatenated PTIB sidecars (first fire)
     PieSlice<std::uint32_t> ptir_program_sidecar_indptr;    // per-program sidecar byte CSR
-    PieSlice<std::uint32_t> ptir_program_seed_channels;     // seed target channel per entry
+    PieSlice<std::uint64_t> ptir_program_channel_ids;       // dense idx -> global channel id, concatenated
+    PieSlice<std::uint32_t> ptir_program_channel_ids_indptr; // per-program channel-id CSR
+    PieSlice<std::uint64_t> ptir_program_seed_channels;     // seed target GLOBAL channel id per entry
     PieSlice<std::uint8_t>  ptir_program_seed_blob;         // concatenated seed value bytes
     PieSlice<std::uint32_t> ptir_program_seed_lens;         // byte length per seed entry
     PieSlice<std::uint32_t> ptir_program_seed_indptr;       // per-program seed CSR
-    PieSlice<std::uint32_t> ptir_program_host_put_channels; // host-put target channel per entry
+    PieSlice<std::uint64_t> ptir_program_host_put_channels; // host-put target GLOBAL channel id per entry
     PieSlice<std::uint8_t>  ptir_program_host_put_blob;     // concatenated host-put value bytes
     PieSlice<std::uint32_t> ptir_program_host_put_lens;     // byte length per host-put entry
     PieSlice<std::uint32_t> ptir_program_host_put_indptr;   // per-program host-put CSR
+    PieSlice<std::uint64_t> ptir_release_channel_ids;       // global channel ids to free (W0.3 release marker)
+    PieSlice<std::uint64_t> ptir_release_instance_ids;      // instance ids to free (W0.3 release marker)
 
     // WS8 P2 device-resident next-input link (#6). `pipeline_source_link != 0`
     // ⇒ retain this (batched) forward's `pi.sampled[N]` under that global link
@@ -349,7 +353,7 @@ struct PieForwardResponseView {
     // back to the host channel store. SoA + per-program CSR, mirroring the
     // request's host-put table; program `p` here is program `p` of the request's
     // PTIR set. Bool cells travel packed (D1). Empty for legacy paths.
-    PieSlice<std::uint32_t> ptir_output_channels;   // produced Reader channel per entry
+    PieSlice<std::uint64_t> ptir_output_channels;   // produced Reader GLOBAL channel id per entry
     PieSlice<std::uint8_t>  ptir_output_blob;       // concatenated produced-cell bytes
     PieSlice<std::uint32_t> ptir_output_lens;       // byte length per output entry
     PieSlice<std::uint32_t> ptir_output_indptr;     // per-program output CSR
@@ -567,6 +571,10 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.ptir_program_sidecar_bytes_ptr, f.ptir_program_sidecar_bytes_len);
     out.ptir_program_sidecar_indptr =
         slice_from(f.ptir_program_sidecar_indptr_ptr, f.ptir_program_sidecar_indptr_len);
+    out.ptir_program_channel_ids =
+        slice_from(f.ptir_program_channel_ids_ptr, f.ptir_program_channel_ids_len);
+    out.ptir_program_channel_ids_indptr =
+        slice_from(f.ptir_program_channel_ids_indptr_ptr, f.ptir_program_channel_ids_indptr_len);
     out.ptir_program_seed_channels =
         slice_from(f.ptir_program_seed_channels_ptr, f.ptir_program_seed_channels_len);
     out.ptir_program_seed_blob =
@@ -583,6 +591,10 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.ptir_program_host_put_lens_ptr, f.ptir_program_host_put_lens_len);
     out.ptir_program_host_put_indptr =
         slice_from(f.ptir_program_host_put_indptr_ptr, f.ptir_program_host_put_indptr_len);
+    out.ptir_release_channel_ids =
+        slice_from(f.ptir_release_channel_ids_ptr, f.ptir_release_channel_ids_len);
+    out.ptir_release_instance_ids =
+        slice_from(f.ptir_release_instance_ids_ptr, f.ptir_release_instance_ids_len);
     out.pipeline_source_link = f.pipeline_source_link;
     out.pipeline_source_links =
         slice_from(f.pipeline_source_links_ptr, f.pipeline_source_links_len);
