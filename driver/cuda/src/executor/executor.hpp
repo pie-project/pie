@@ -349,7 +349,7 @@ struct Executor {
 // cumulative fire counter used as PRNG offset and logging-cadence gate.
 // The caller's inproc transport hands `out_resp` to `send_response`
 // immediately after this returns.
-void handle_fire_batch(
+bool handle_fire_batch(
     std::uint32_t req_id,
     const pie_driver::PieForwardRequestView& view,
     pie_driver::PieForwardResponseView& out_resp,

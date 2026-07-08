@@ -2130,7 +2130,7 @@ inline void write_probes(pie_driver::PieForwardResponseView& out,
 }
 }  // namespace
 
-void handle_fire_batch(
+bool handle_fire_batch(
     std::uint32_t req_id,
     const pie_driver::PieForwardRequestView& view,
     pie_driver::PieForwardResponseView& out_resp,
@@ -2316,13 +2316,12 @@ void handle_fire_batch(
             // Empty batch — emit a zero-request response view.
             std::vector<pie_driver::PerRequestOutput> empty(std::max(R, 0));
             executor.response_builder.build(empty, out_resp);
-            return;
+            return true;
         }
         if (N > max_workspace_tokens) {
             std::cerr << "[pie-driver-cuda] batch tokens=" << N
                       << " exceeds workspace=" << max_workspace_tokens << "\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
+            return false;
         }
 
         // Compute max KV length across requests for shmem sizing.
@@ -2521,16 +2520,14 @@ void handle_fire_batch(
                       << logit_rows_required
                       << " logit rows, exceeding workspace capacity "
                       << tensor_rows(ws.logits) << "\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
+            return false;
         }
         if (prob_rows_required > tensor_rows(ws.probs)) {
             std::cerr << "[pie-driver-cuda] fire_batch needs "
                       << prob_rows_required
                       << " probability rows, exceeding workspace capacity "
                       << tensor_rows(ws.probs) << "\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
+            return false;
         }
 
         const SamplingPlan sample_plan{
@@ -2801,7 +2798,7 @@ void handle_fire_batch(
                           << " sampled=" << num_sampling
                           << " max_kv=" << max_kv_len << "\n";
             }
-            return;
+            return true;
         }
 
         // Flat-path arrays: token sampler is the only slot type allowed
@@ -3209,13 +3206,12 @@ void handle_fire_batch(
                       << " sampled=" << num_sampling
                       << " max_kv=" << max_kv_len << "\n";
         }
-        return;
+        return true;
 
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-cuda] fire_batch failed for req_id="
                   << req_id << ": " << e.what() << "\n";
-        out_resp = pie_driver::PieForwardResponseView{};
-        return;
+        return false;
     }
 }
 

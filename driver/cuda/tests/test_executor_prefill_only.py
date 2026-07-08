@@ -25,3 +25,20 @@ def test_llama_like_model_honors_per_fire_emit_logits_flag():
     assert "fwd.emit_logits = in.emit_logits;" in source
     assert "weights_, hf_config_, fwd, plan_," in source
     assert "weights_, hf_config_, fwd_cfg_, plan_," not in source
+
+
+def test_forward_failures_do_not_return_zero_request_forward_response():
+    executor_source = (CUDA_SRC / "executor" / "executor.cpp").read_text()
+    service_source = (CUDA_SRC / "service" / "inproc_service.cpp").read_text()
+
+    signature = "bool handle_fire_batch("
+    assert signature in executor_source
+    assert signature in (CUDA_SRC / "executor" / "executor.hpp").read_text()
+
+    assert "return false;" in executor_source
+    assert "out_resp = pie_driver::PieForwardResponseView{};" not in executor_source
+
+    assert "const bool ok = handle_fire_batch(" in service_source
+    assert "out.forward.num_requests == expected" in service_source
+    assert "out.method = pie_driver::PIE_METHOD_HEALTH;" in service_source
+    assert "out.status = -1;" in service_source
