@@ -270,6 +270,10 @@ impl FutureOutput {
     }
 }
 
+fn future_output_stderr_message(error: &str) -> String {
+    format!("Pie async forward failed: {error}")
+}
+
 fn empty_forward_request() -> pie_bridge::ForwardRequest {
     pie_bridge::ForwardRequest {
         adapter_bindings: vec![pie_bridge::AdapterBinding {
@@ -1037,6 +1041,7 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
             }
         }
         if let Some(error) = result.error.take() {
+            crate::process::stderr(self.id(), future_output_stderr_message(&error));
             return Err(anyhow::anyhow!(error));
         }
         if result.done {
@@ -1235,5 +1240,14 @@ mod tests {
 
         assert!(future.result.is_none());
         assert_eq!(future.error.as_deref(), Some("driver exploded"));
+    }
+
+    #[test]
+    fn future_output_stderr_preserves_driver_error() {
+        let message =
+            future_output_stderr_message("cuda illegal memory access at executor.cpp:2758");
+
+        assert!(message.contains("Pie async forward failed"));
+        assert!(message.contains("cuda illegal memory access at executor.cpp:2758"));
     }
 }
