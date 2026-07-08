@@ -43,14 +43,9 @@
 #include "kernels/sample_temp.hpp"
 #include "sampler_type.hpp"
 #include "sampling_dispatch.hpp"
-#include "sampling_ir/pie_standard_samplers.h"
-#include "sampling_ir/sampler_dispatch.hpp"
-#include "sampling_ir/group.hpp"
 #include "sampling_ir/next_input.hpp"
 #include "sampling_ir/tensor_io.hpp"
 #include "sampling_ir/frame_carrier.hpp"
-#include "sampling_ir/program_recognizer.hpp"
-#include "sampling_ir/param_extract.hpp"
 #include "spec_expansion.hpp"
 
 namespace pie_cuda_driver {
@@ -2534,149 +2529,10 @@ inline void g3_drain(Executor& executor, pie_driver::PieForwardResponseView* out
         executor.g3_pending.pop_front();
     }
 }
-}  // namespace  (split so ensure_sampling_ir_backend has external linkage)
-
-// Lazily construct the Sampling-IR JIT backend on the first program-carrying
-// fire — the JitEngine ctor resolves the device arch from the CUDA context,
-// which is current mid-fire. One-shot: a hard init failure (e.g. no NVRTC)
-// disables programmable sampling for the process and falls back to the legacy
-// sampler rather than retrying + re-logging every fire. External linkage
-// (declared in executor.hpp): the #11 prefetch-seam registration in entry.cpp
-// force-creates it at backend-ready so a host-side prefetch has a live cache.
-sampling_ir::SamplingIrBackend* ensure_sampling_ir_backend(Executor& ex) {
-    if (ex.sampling_ir_runtime.has_backend()) {
-        return ex.sampling_ir_backend.get();
-    }
-    if (ex.sampling_ir_init_attempted) {
-        return nullptr;
-    }
-    ex.sampling_ir_init_attempted = true;
-    try {
-        ex.sampling_ir_backend =
-            std::make_unique<sampling_ir::SamplingIrBackend>(/*batched=*/true);
-        ex.sampling_ir_runtime.set_backend(ex.sampling_ir_backend.get());
-        return ex.sampling_ir_backend.get();
-    } catch (const std::exception& e) {
-        std::cerr << "[pie-driver-cuda] sampling-ir backend init failed: "
-                  << e.what()
-                  << " — programmable sampling disabled (legacy path)\n";
-        ex.sampling_ir_backend.reset();
-        return nullptr;
-    }
-}
-
-namespace {
-// Marshal a fired sampling-IR program's declared outputs (read via the runtime's
-// `last_output_ptrs()`) into the per-request slots. This is the #32/#33/M-batch
-// unified marshal axis: it loops `r in 0..num_rows × o in 0..n_out`, reading
-// output `o`'s row `r` at `outs[o] + r*elem_count_o` and scattering it to
-// `per_req[group_member[r]]`. The three axes compose on this one read:
-//   • num_rows>1  → M-batch row-scatter (#34): one N-row fire, N requests;
-//   • n_out>1     → multi-output (#33): each program output → its own slot;
-//   • elem_count_o>1 (Token) → [k]-Token (#32, today still spec_tokens-routed).
-// `group_member[r]` is the batched row → per_req index map = `ProgramGroup.rows`
-// (partition_by_program); an individual fire passes num_rows=1 + a 1-element map
-// (the target request). Single-Token rows land dense in `pi.sampled[base+r]` (so
-// the N-row read works today); rich outputs (Scalar/Entropy/Logits/[k]) currently
-// use 1-row scratch — their N-row form needs the runtime's N-row scratch (a
-// follow-on), so today they're exercised only at num_rows==1.
-// Token→tokens (scalar) / spec_tokens (Vector<k> accept-prefix, sentinel -1 =
-// first reject); Scalar/Entropy→entropies; Logits→raw bf16 bytes.
-void marshal_ir_program_output(const sampling_ir::ProgramInterface* pif,
-                               std::span<void* const> outs,
-                               int num_rows,
-                               std::span<const std::uint32_t> group_member,
-                               std::vector<pie_driver::PerRequestOutput>& per_req) {
-    if (pif == nullptr) return;
-    // #34 fail-loud guard: rich outputs (Scalar/Entropy/Logits/[k]) read with a
-    // per-row stride that assumes an N-row [num_rows, elem_count] scratch, but the
-    // runtime scratch is 1-row today. Single-Token rows are dense-safe (pi.sampled
-    // [base+r]); any other output at num_rows>1 would OOB. No-op at num_rows==1
-    // (today's only path); makes a future #34 wiring fail LOUD, never silent-OOB.
-    if (num_rows > 1) {
-        bool all_single_token = true;
-        for (const auto& od : pif->outputs)
-            if (od.cls != sampling_ir::OutputClass::Token || od.elem_count > 1) {
-                all_single_token = false; break;
-            }
-        if (!all_single_token) {
-            std::fprintf(stderr, "[pie-driver-cuda] marshal num_rows=%d with a rich "
-                         "output needs the #34 N-row scratch (1-row today)\n", num_rows);
-            std::abort();  // fail-loud (assert compiles out under NDEBUG)
-        }
-    }
-    const int n = num_rows > 0 ? num_rows : 1;
-    for (int r = 0; r < n; ++r) {
-        if (static_cast<std::size_t>(r) >= group_member.size()) break;
-        const std::uint32_t req = group_member[r];
-        if (static_cast<std::size_t>(req) >= per_req.size()) continue;
-        pie_driver::PerRequestOutput& pr = per_req[req];
-        // #32: size this request's program_tokens to n_out so every declared
-        // output owns a CSR segment (empty for non-[k]) — keeps seg(r,o) =
-        // (Σ_{r'<r} n_out_{r'}) + o consistent with the runtime's output_types.
-        if (pr.program_tokens.size() < pif->outputs.size()) {
-            pr.program_tokens.resize(pif->outputs.size());
-        }
-        for (std::size_t i = 0; i < pif->outputs.size() && i < outs.size(); ++i) {
-            const sampling_ir::DeclaredOutput& o = pif->outputs[i];
-            if (outs[i] == nullptr) continue;
-            // Per-row stride within output i's [num_rows, elem_count] block.
-            const std::size_t stride = std::max<std::size_t>(o.elem_count, 1);
-            const std::size_t row_off = static_cast<std::size_t>(r) * stride;
-            switch (o.cls) {
-                case sampling_ir::OutputClass::Token: {
-                    const auto* base =
-                        static_cast<const std::int32_t*>(outs[i]) + row_off;
-                    if (o.elem_count <= 1) {
-                        std::int32_t t = 0;
-                        CUDA_CHECK(cudaMemcpy(&t, base, sizeof(t),
-                                              cudaMemcpyDeviceToHost));
-                        pr.tokens.push_back(static_cast<std::uint32_t>(t));
-                    } else {
-                        // #32 [k]-Token (elem_count>1) → the per-(request,output)
-                        // program_tokens CSR (output i's segment), OFF spec_tokens
-                        // (the system-drafter channel it was mis-routed to). The
-                        // -1 sentinel still truncates a spec-verify accept-prefix;
-                        // a plain [k] output has no -1 so all k tokens emit.
-                        std::vector<std::int32_t> v(o.elem_count);
-                        CUDA_CHECK(cudaMemcpy(v.data(), base,
-                                              sizeof(std::int32_t) * o.elem_count,
-                                              cudaMemcpyDeviceToHost));
-                        for (std::int32_t x : v) {
-                            if (x < 0) break;
-                            pr.program_tokens[i].push_back(
-                                static_cast<std::uint32_t>(x));
-                        }
-                    }
-                    break;
-                }
-                case sampling_ir::OutputClass::Scalar:
-                case sampling_ir::OutputClass::Entropy: {
-                    const auto* base =
-                        static_cast<const float*>(outs[i]) + row_off;
-                    float s = 0.f;
-                    CUDA_CHECK(cudaMemcpy(&s, base, sizeof(s),
-                                          cudaMemcpyDeviceToHost));
-                    pr.entropies.push_back(s);
-                    break;
-                }
-                case sampling_ir::OutputClass::Logits: {
-                    const std::size_t nbytes = o.elem_count * sizeof(std::uint16_t);
-                    const auto* base =
-                        static_cast<const std::uint16_t*>(outs[i]) + row_off;
-                    std::vector<std::uint8_t> bytes(nbytes);
-                    CUDA_CHECK(cudaMemcpy(bytes.data(), base, nbytes,
-                                          cudaMemcpyDeviceToHost));
-                    pr.logits.push_back(std::move(bytes));
-                    break;
-                }
-                default:
-                    break;
-            }
-        }
-    }
-}
 }  // namespace
+
+// (Sampling-IR program-output marshal removed — ptir succeeds it; PTIR outputs
+// marshal via `PtirDispatch::run` → `ForwardResponse.ptir_output_*`.)
 
 void handle_fire_batch(
     std::uint32_t req_id,

@@ -579,19 +579,6 @@ target_link_libraries(sampler_parity_test PRIVATE CUDA::cudart)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
    AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/runtime.hpp"
    AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/sampler_reference.hpp")
-  add_executable(test_sampling_ir_eval_mock_xcheck
-    tests/sampling_ir_eval_mock_xcheck.cu
-    src/sampling_ir/jit.cpp
-    src/sampling_ir/jit_backend.cpp
-    src/sampling_ir/codegen.cpp
-    src/sampling_ir/reader.cpp)
-  target_include_directories(test_sampling_ir_eval_mock_xcheck PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  target_compile_options(test_sampling_ir_eval_mock_xcheck PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-  target_link_libraries(test_sampling_ir_eval_mock_xcheck PRIVATE
-    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
   add_test(NAME sampling_ir_eval_mock_xcheck
     COMMAND test_sampling_ir_eval_mock_xcheck)
 endif()
@@ -789,12 +776,6 @@ target_link_libraries(test_sampling_ir_primitives PRIVATE
 # PSIR v1 bytecode reader (Lane L2 / charlie). Pure C++ (no CUDA): decodes the
 # wire format (interface/sampling-ir/BYTECODE.md) into the in-memory IR graph
 # and cross-validates against golden vectors from alpha's Rust encoder.
-add_executable(test_sampling_ir_reader
-  tests/sampling_ir_reader_test.cpp
-  src/sampling_ir/reader.cpp)
-target_include_directories(test_sampling_ir_reader PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
 # #24 graph_variant bitfield collision — pure-host boundary unit test. Proves the
 # latent collision was real at graph_layout=64 (OLD encoding aliased small_spec)
@@ -828,13 +809,6 @@ add_test(NAME sampling_ir_group COMMAND test_sampling_ir_group)
 
 # #10 gather/scatter device verify (delta) — compacts a scattered group to [Ng,V]
 # and scatters the [Ng] result back. Needs a GPU at runtime.
-add_executable(test_sampling_ir_group_device
-  tests/test_sampling_ir_group_device.cpp
-  src/sampling_ir/group.cpp)
-target_include_directories(test_sampling_ir_group_device PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(test_sampling_ir_group_device PRIVATE CUDA::cudart)
-add_test(NAME sampling_ir_group_device COMMAND test_sampling_ir_group_device)
 
 # #6 WS8 P2 next-input link device machinery (delta) — inject sampled tokens into
 # the consumer next-pass input at linked positions, + the event-ordered (cross-
@@ -879,41 +853,15 @@ add_test(NAME sampling_ir_frame_carrier_device COMMAND test_frame_carrier_device
 # KernelDAG, NVRTC-compiles + launches each kernel via the driver API, and checks
 # the result against a CPU reference (incl. Gumbel-max sample_temp parity). Needs
 # a GPU at runtime.
-add_executable(test_sampling_ir_codegen
-  tests/sampling_ir_codegen_test.cu
-  src/sampling_ir/codegen.cpp
-  src/sampling_ir/reader.cpp)
-target_include_directories(test_sampling_ir_codegen PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_compile_options(test_sampling_ir_codegen PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-target_link_libraries(test_sampling_ir_codegen PRIVATE
-  CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 # Sampling-IR NVRTC JIT + driver-API launch de-risk (lane L3). Pure C++
 # (driver API + NVRTC); compiles + launches a 2-kernel DAG on the live GPU and
 # verifies a cross-kernel value plus the program cache. Builds the jit TU
 # directly so it stays independent of the heavy driver lib.
-add_executable(test_sampling_ir_jit
-  tests/test_sampling_ir_jit.cpp
-  src/sampling_ir/jit.cpp)
-target_include_directories(test_sampling_ir_jit PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(test_sampling_ir_jit PRIVATE
-  CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
 # #11 JIT compile-axis load-test (delta). Drives JitEngine directly (no codegen)
 # to quantify the compile-axis coefficients for echo's M-batch + alpha's #10
 # cost model: compile/finalize/fire µs/program, dedup (compiles_run==K), and the
 # PIE_JIT_POOL_THREADS pool-width knee. Same minimal deps as test_sampling_ir_jit.
-add_executable(jit_load_test
-  tests/jit_load_test.cpp
-  src/sampling_ir/jit.cpp)
-target_include_directories(jit_load_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(jit_load_test PRIVATE
-  CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
-add_test(NAME jit_load COMMAND jit_load_test)
 
 # Sampling-IR backend test — exercises the full facade: PSIR bytecode → decode
 # (charlie reader) → lower (charlie codegen) → NVRTC JIT (delta) → driver-API
@@ -924,18 +872,6 @@ add_test(NAME jit_load COMMAND jit_load_test)
 # ctest the moment the sibling sources are present — no manual wiring needed.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
    AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/runtime.hpp")
-  add_executable(test_sampling_ir_backend
-    tests/test_sampling_ir_backend.cpp
-    src/sampling_ir/jit.cpp
-    src/sampling_ir/jit_backend.cpp
-    src/sampling_ir/codegen.cpp
-    src/sampling_ir/reader.cpp
-    src/kernels/sample_temp.cu)
-  target_include_directories(test_sampling_ir_backend PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(test_sampling_ir_backend PRIVATE
-    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
-  add_test(NAME sampling_ir_backend COMMAND test_sampling_ir_backend)
 
   # #12 driver-side program->kind recognizer (delta). Host-only: hashes the
   # driver's OWN baked standard_sampler_program(k,V) into a {hash->kind} table and
@@ -945,12 +881,6 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
   # at #12-phase-1. No CUDA: program_hash is header-inline, the programs are baked
   # consts. (Guarded with the backend block since pie_standard_samplers.h needs
   # codegen.hpp for the binding-manifest types.)
-  add_executable(test_sampling_ir_recognizer
-    tests/test_sampling_ir_recognizer.cpp
-    src/sampling_ir/reader.cpp)
-  target_include_directories(test_sampling_ir_recognizer PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  add_test(NAME sampling_ir_recognizer COMMAND test_sampling_ir_recognizer)
 
   # #35-A regression guard (lane L2 / charlie): batched (M>1) lowering must REJECT
   # matrix (per-row/cross-row) programs so the backend falls back to the M=1 matrix
@@ -958,89 +888,29 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
   # kernel conflates the matrix (k-draft) axis with the batch axis and miscompiles
   # cross-row ops (spec-verify's cumprod accept-scan). Pure host (lower_bytecode +
   # the matrix/vector goldens); no CUDA.
-  add_executable(test_sampling_ir_batched_matrix_reject
-    tests/test_sampling_ir_batched_matrix_reject.cpp
-    src/sampling_ir/codegen.cpp
-    src/sampling_ir/reader.cpp)
-  target_include_directories(test_sampling_ir_batched_matrix_reject PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   add_test(NAME sampling_ir_batched_matrix_reject
     COMMAND test_sampling_ir_batched_matrix_reject)
 
   # Driver-level parity gate (lane L4 / echo): the IR argmax program, run through
   # echo's IProgramBackend exactly as the executor invokes it, must match the
   # legacy `launch_argmax_bf16` kernel over the same bf16 logits rows.
-  add_executable(test_sampling_ir_executor_parity
-    tests/test_sampling_ir_executor_parity.cu
-    src/sampling_ir/jit.cpp
-    src/sampling_ir/jit_backend.cpp
-    src/sampling_ir/codegen.cpp
-    src/sampling_ir/reader.cpp
-    src/kernels/argmax.cu)
-  target_include_directories(test_sampling_ir_executor_parity PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_compile_options(test_sampling_ir_executor_parity PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-  target_link_libraries(test_sampling_ir_executor_parity PRIVATE
-    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
   add_test(NAME sampling_ir_executor_parity
     COMMAND test_sampling_ir_executor_parity)
 
   # WS5 removal gate (lane L7 / hotel): IR temp/min-p through SamplingIrBackend
   # must equal the production `launch_sample_temp_bf16` kernel token-for-token
   # (shared Gumbel RNG). Must be green before `sample_temp.cu` is deleted.
-  add_executable(test_sampling_ir_removal_gate
-    tests/sampling_ir_removal_gate.cu
-    src/sampling_ir/jit.cpp
-    src/sampling_ir/jit_backend.cpp
-    src/sampling_ir/codegen.cpp
-    src/sampling_ir/reader.cpp
-    src/kernels/sample_temp.cu)
-  target_include_directories(test_sampling_ir_removal_gate PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  target_compile_options(test_sampling_ir_removal_gate PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-  target_link_libraries(test_sampling_ir_removal_gate PRIVATE
-    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
   add_test(NAME sampling_ir_removal_gate
     COMMAND test_sampling_ir_removal_gate)
   # WS1a unit test (lane L4 / echo): per-fire submit-bound host-input binding
   # through SamplingIrRuntime::try_run (stage → bind → JIT argmax → token),
   # incl. per-fire refresh. Links runtime.cpp (the staging/binding logic).
-  add_executable(test_sampling_ir_host_submit
-    tests/test_sampling_ir_host_submit.cu
-    src/sampling_ir/runtime.cpp
-    src/sampling_ir/jit.cpp
-    src/sampling_ir/jit_backend.cpp
-    src/sampling_ir/codegen.cpp
-    src/sampling_ir/reader.cpp)
-  target_include_directories(test_sampling_ir_host_submit PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_compile_options(test_sampling_ir_host_submit PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-  target_link_libraries(test_sampling_ir_host_submit PRIVATE
-    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
   add_test(NAME sampling_ir_host_submit
     COMMAND test_sampling_ir_host_submit)
 
   # Task #4 (lane L4 / echo) — the batched [N,V] launch primitive: try_run with
   # num_rows=N over an [N,vocab] block (one grid=num_rows launch), [N] output
   # scatter. Proves the num_rows=1->N generalization the de-hardwiring batch rides.
-  add_executable(test_sampling_ir_batched
-    tests/test_sampling_ir_batched.cu
-    src/sampling_ir/runtime.cpp
-    src/sampling_ir/jit.cpp
-    src/sampling_ir/jit_backend.cpp
-    src/sampling_ir/codegen.cpp
-    src/sampling_ir/reader.cpp)
-  target_include_directories(test_sampling_ir_batched PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  target_compile_options(test_sampling_ir_batched PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-  target_link_libraries(test_sampling_ir_batched PRIVATE
-    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
   add_test(NAME sampling_ir_batched
     COMMAND test_sampling_ir_batched)
 
@@ -1067,26 +937,6 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
   # Regenerate bench_programs.h via:
   #   cargo run -p sampling-edsl --example gen_bench_programs -- \
   #     driver/cuda/tests/bench_programs.h
-  add_executable(bench_sampling_ir
-    tests/bench_sampling_ir.cu
-    src/sampling_ir/jit.cpp
-    src/sampling_ir/jit_backend.cpp
-    src/sampling_ir/codegen.cpp
-    src/sampling_ir/reader.cpp
-    src/kernels/sample_temp.cu
-    src/kernels/sample_flashinfer.cu
-    src/kernels/argmax.cu)
-  target_include_directories(bench_sampling_ir PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests
-    ${flashinfer_SOURCE_DIR}/include
-    ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
-    ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
-    ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
-  target_compile_options(bench_sampling_ir PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-  target_link_libraries(bench_sampling_ir PRIVATE
-    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
   # #10 M-batch occupancy/sync micro-bench (lane L4 / echo) — the land-vs-defer
   # measurement: the LANDED sequential scatter (N × num_rows=1 launch + N syncs)
@@ -1096,38 +946,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
   # ctest): cmake --build build --target bench_mbatch_occupancy
   #          ./build/bin/bench_mbatch_occupancy
   # IR-JIT path only (no hardwired/flashinfer comparison) ⇒ just the JIT sources.
-  add_executable(bench_mbatch_occupancy
-    tests/bench_mbatch_occupancy.cu
-    src/sampling_ir/jit.cpp
-    src/sampling_ir/jit_backend.cpp
-    src/sampling_ir/codegen.cpp
-    src/sampling_ir/reader.cpp)
-  target_include_directories(bench_mbatch_occupancy PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  target_compile_options(bench_mbatch_occupancy PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-  target_link_libraries(bench_mbatch_occupancy PRIVATE
-    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
   # WS4 part-1 test (lane L4 / echo): drive charlie's greedy spec-verify program
   # through SamplingIrRuntime::try_run — matrix Intrinsic(Logits) verify block +
   # submit-bound draft vector + multi-element Vector<k+1> Token output — vs a CPU
   # greedy verifier. Needs the golden bytecode header (tests/).
-  add_executable(test_sampling_ir_spec_verify
-    tests/test_sampling_ir_spec_verify.cu
-    src/sampling_ir/runtime.cpp
-    src/sampling_ir/jit.cpp
-    src/sampling_ir/jit_backend.cpp
-    src/sampling_ir/codegen.cpp
-    src/sampling_ir/reader.cpp)
-  target_include_directories(test_sampling_ir_spec_verify PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  target_compile_options(test_sampling_ir_spec_verify PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-  target_link_libraries(test_sampling_ir_spec_verify PRIVATE
-    CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
   add_test(NAME sampling_ir_spec_verify
     COMMAND test_sampling_ir_spec_verify)
 endif()
@@ -1218,11 +1041,8 @@ add_test(NAME kv_cache_quant COMMAND test_kv_cache_quant)
 add_test(NAME swap_pool COMMAND test_swap_pool)
 add_test(NAME mxfp4_marlin COMMAND test_mxfp4_marlin)
 add_test(NAME transcode_fused COMMAND test_transcode_fused)
-add_test(NAME sampling_ir_jit COMMAND test_sampling_ir_jit)
 add_test(NAME sampler_parity COMMAND sampler_parity_test)
 add_test(NAME sampling_ir_primitives COMMAND test_sampling_ir_primitives)
-add_test(NAME sampling_ir_reader COMMAND test_sampling_ir_reader)
-add_test(NAME sampling_ir_codegen COMMAND test_sampling_ir_codegen)
 add_test(NAME sampling_ir_matrix COMMAND test_sampling_ir_matrix)
 add_test(NAME ptir_tier0 COMMAND test_ptir_tier0)
 add_test(NAME ptir_runner COMMAND test_ptir_runner)

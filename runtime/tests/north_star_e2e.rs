@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 mod common;
-use common::{MockEnv, create_mock_env, inferlets, mock_device::SamplingProgramBehavior};
+use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
 use pie::process;
 use pie::program::ProgramName;
@@ -75,7 +75,7 @@ fn state() -> &'static TestState {
             "test-model",
             1,
             16,
-            Arc::new(SamplingProgramBehavior { fallback: 0 }),
+            Arc::new(EchoBehavior(0)),
         );
         let config = env.config();
         rt.block_on(async {

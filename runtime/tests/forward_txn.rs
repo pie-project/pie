@@ -17,7 +17,7 @@
 
 use pie::arena::{Arena, ArenaConfig};
 use pie::working_set::page_hash::compute_page_hashes;
-use pie::inference::forward_prepare::{KvWrite, check_input_nonempty, project_kv};
+use pie::inference::paging::{KvWrite, check_input_nonempty, project_kv};
 use pie::working_set::kv::{KvCas, KvWorkingSet};
 use pie_driver_abi::Brle;
 

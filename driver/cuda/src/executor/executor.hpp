@@ -24,7 +24,6 @@
 #include <pie_driver_abi/response_builder.hpp>
 #include <memory>
 
-#include "sampling_ir/jit_backend.hpp"
 #include "ptir/ptir_dispatch.hpp"
 
 namespace pie_cuda_driver {
@@ -363,17 +362,7 @@ struct Executor {
     // enough for the `send_response` that immediately follows.
     pie_driver::ResponseBuilder response_builder;
 
-    // Programmable sampling (Sampling IR, lane L4). The runtime owns the
-    // mode-select + input binding + skip policy and consumes the abstract
-    // `IProgramBackend`; the concrete `SamplingIrBackend` (codegen + NVRTC JIT)
-    // is constructed lazily on the first program-carrying fire — when a CUDA
-    // context is guaranteed current — and registered via `set_backend`. Null
-    // backend ⇒ `try_run` returns NoProgram ⇒ legacy sampler path.
-    sampling_ir::SamplingIrRuntime sampling_ir_runtime{};
-    std::unique_ptr<sampling_ir::SamplingIrBackend> sampling_ir_backend{};
-    // Guards one-shot lazy backend construction so a hard init failure (e.g.
-    // no NVRTC) doesn't retry + re-log every fire.
-    bool sampling_ir_init_attempted = false;
+    // (Sampling-IR programmable-sampling backend removed — ptir succeeds it.)
 
     // PTIR (thrust-3) stage-program runtime. `ptir_cache` is the C3 hash-keyed
     // decode cache (container+sidecar → Trace, first-fire-of-hash); `ptir_
@@ -454,7 +443,7 @@ struct Executor {
     // `defer_send_`; `active` is re-armed each fire.
     struct RichStagedOutput {
         void*                    host = nullptr;   // pinned; trampoline frees post-send
-        sampling_ir::OutputClass cls{};
+        std::uint32_t            cls = 0;          // (was sampling_ir::OutputClass; retired)
         std::uint32_t            elem_count = 0;   // staged cap (Token[k]/MtpTokens: k bound)
         std::uint32_t            req = 0;          // per_req index
         std::uint32_t            out_idx = 0;      // declared-output index (program_tokens CSR)
@@ -532,14 +521,6 @@ void handle_fire_batch(
 // Pre-capture the pure-decode CUDA graph lattice for graph-safe forwards.
 // Returns the number of graph execs inserted into `executor.graph_cache`.
 std::size_t capture_forward_graph_lattice(Executor& executor);
-
-// Lazily construct (and cache on `executor`) the Sampling-IR JIT backend — the
-// programmable-sampling compile-cache owner. Returns nullptr if NVRTC init
-// failed (programmable sampling disabled → legacy path). Must be called with a
-// current CUDA context: the JitEngine ctor resolves the device arch from it. The
-// #11 prefetch-seam registration force-creates it at backend-ready so a host-side
-// `driver::prefetch_compile` arriving before the first fire has a live cache.
-sampling_ir::SamplingIrBackend* ensure_sampling_ir_backend(Executor& executor);
 
 // TP-follower service loop. Called only on TP ranks > 0. Mirrors
 // `handle_fire_batch` minus shmem decode, sampling, and response: the
