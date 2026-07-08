@@ -48,8 +48,11 @@ void LlamaLikeModel::body(Qwen3Workspace& ws,
                           AttentionWorkspace& attn_ws,
                           ops::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
+    LlamaLikeForwardCfg fwd = fwd_cfg_;
+    fwd.emit_logits = in.emit_logits;
+
     llama_like_forward_paged(
-        weights_, hf_config_, fwd_cfg_, plan_,
+        weights_, hf_config_, fwd, plan_,
         ws, kv, attn_ws, cublas,
         in.token_ids, in.positions,
         in.qo_indptr_d, in.kv_page_indices_d, in.kv_page_indptr_d,
