@@ -18,6 +18,8 @@ PersistentInputs PersistentInputs::allocate(
     p.kv_page_indices    = DeviceBuffer<std::uint32_t>::alloc(max_kv_pages);
     p.custom_mask        = DeviceBuffer<std::uint8_t >::alloc(max_custom_mask_bytes);
     p.custom_mask_indptr = DeviceBuffer<std::int32_t >::alloc(static_cast<std::size_t>(max_requests) + 1);
+    p.w_page             = DeviceBuffer<std::uint32_t>::alloc(max_requests);
+    p.w_off              = DeviceBuffer<std::uint32_t>::alloc(max_requests);
     p.slot_ids           = DeviceBuffer<std::int32_t >::alloc(max_requests);
     p.is_fresh           = DeviceBuffer<std::uint8_t >::alloc(max_requests);
     p.mtp_request_ids    = DeviceBuffer<std::int32_t >::alloc(max_requests);
@@ -48,6 +50,7 @@ std::size_t persistent_input_bytes(int N,
     bytes += static_cast<std::size_t>(max_page_refs) * 4;
     bytes += static_cast<std::size_t>(max_custom_mask_bytes);
     bytes += static_cast<std::size_t>(R + 1) * 4;
+    bytes += static_cast<std::size_t>(R) * (4 + 4);  // w_page + w_off (B2)
     bytes += static_cast<std::size_t>(N) *
              (sizeof(float) * 3 + sizeof(std::int32_t) * 4 +
               sizeof(std::uint32_t) + sizeof(std::uint64_t) + sizeof(bool));

@@ -20,10 +20,17 @@
 //! page-geometry primitive ([`crate::geometry`]) — a keep-core building block,
 //! per `ptir-sdk-minimization-audit`.
 
-use crate::geometry;
 use crate::inference::ForwardPass;
+// The sampler-bound submit path (`submit_pass`/`submit_pass_with`) depends on
+// the `sampling` surface (`LoweredSampler`), A1/A4-gated. The non-sampling
+// carrier mechanics (`discard_pass`, `next_inputs_drafts`) stay available.
+#[cfg(feature = "sampling")]
 use crate::sampler::LoweredSampler;
+#[cfg(feature = "sampling")]
 use crate::working_set::KvWorkingSet;
+#[cfg(feature = "sampling")]
+use crate::geometry;
+#[cfg(feature = "sampling")]
 use crate::Result;
 
 /// Submit ONE forward pass (producer OR consumer) over `tokens` at the current
@@ -48,6 +55,7 @@ use crate::Result;
 /// not predictable at submit — a dangling link is cleared by the next generate's
 /// `fresh_generate`). The returned pass is **in flight**; finalize it with
 /// `output().await` (to read its token) or [`discard_pass`] (to roll it back).
+#[cfg(feature = "sampling")]
 pub fn submit_pass(
     kv: &KvWorkingSet,
     seq_len: &mut u32,
@@ -87,6 +95,7 @@ pub fn submit_pass(
 ///     |pass| pass.attention_mask(&[build_sink_mask(sl + n, sink, window)]),
 /// )?;
 /// ```
+#[cfg(feature = "sampling")]
 pub fn submit_pass_with(
     kv: &KvWorkingSet,
     seq_len: &mut u32,

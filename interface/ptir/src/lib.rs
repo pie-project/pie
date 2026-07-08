@@ -40,6 +40,7 @@ pub mod infer;
 pub mod op;
 pub mod registry;
 pub mod sidecar;
+pub mod stage_key;
 pub mod types;
 pub mod validate;
 

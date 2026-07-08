@@ -1,9 +1,9 @@
 //! **Overview §6.1 — native-MTP + grammar in ONE forward** (the M3-G1 real §6.1
-//! pass). SDK-authored: spec-verify over the driver's NATIVE draft heads
-//! (`intrinsics::mtp_logits()`) under a per-position grammar mask
-//! (`mask_apply`), fused in one epilogue — the §6.1 discipline (golden
-//! `rollout_trace` §2.2 is the reference), distinct from `mtpverify`'s host-fed
-//! drafts.
+//! pass). SDK-authored via the `inferlet::ptir` bridge: spec-verify over the
+//! driver's NATIVE draft heads (`intrinsics::mtp_logits()`) under a per-position
+//! grammar mask (`mask_apply`), fused in one epilogue — the §6.1 discipline
+//! (golden `rollout_trace` §2.2 is the reference), distinct from `mtpverify`'s
+//! host-fed drafts.
 //!
 //! Per position the target's grammar-constrained greedy argmax is compared to the
 //! MTP draft; the accept-prefix is the leading run of matches (`eq → cumprod →
@@ -11,15 +11,13 @@
 //! the verify accepts only grammar-legal tokens — the constraint composes with
 //! speculation, losslessly (overview §6.1).
 //!
-//! HOST-VALIDATED NOW: `fwd.trace()` binds (echo's `bind`); builds green to
-//! `wasm32-wasip2`. The GPU RUN is gated on charlie's MTP Stage-2 (the
-//! `mtp_logits` driver head); the intrinsic API is stable, so this pre-stages the
-//! §6.1 pass — `PIE_M3_S61_INFERLET=mtp-grammar` arms G1's accepted-tok/s when
-//! Stage-2 lands.
+//! A3: migrated off the deleted `register_program`/`ChannelSeed` WIT surface to
+//! the unified `inferlet::ptir` bridge. The GPU RUN is gated on charlie's MTP
+//! Stage-2 (`mtp_logits` driver head); the intrinsic API is stable, so this
+//! pre-stages the §6.1 pass.
 
-use inferlet::{Result, model as wit_model};
-use ptir::prelude::*;
-use ptir::DType;
+use inferlet::ptir::prelude::*;
+use inferlet::{model as wit_model, Result};
 
 /// MTP draft width (K); the verify window is `[K+1, V]`.
 const K: u32 = 3;
@@ -27,29 +25,26 @@ const PAGE_T: u32 = 16;
 const NUM_LAYERS: u32 = 28;
 const BOS: i32 = 1;
 
-// Channel indices (declaration order).
-const CH_GMASK: u32 = 0;
-const CH_OUT: u32 = 2;
+fn bx<T>(v: T) -> &'static T {
+    Box::leak(Box::new(v))
+}
 
-/// Build the §6.1 native-MTP + grammar spec-verify trace; return container bytes.
-fn s61_container(vocab: u32) -> core::result::Result<Vec<u8>, String> {
-    ptir::model::configure(vocab, PAGE_T, NUM_LAYERS);
-    ptir::model::configure_gates(/* has_mtp_logits */ true, /* has_value_head */ false);
+#[inferlet::main]
+async fn main(_input: String) -> Result<String> {
+    let vocab = wit_model::output_vocab_size();
     let v = vocab;
     let kp1 = K + 1;
+    model::configure(vocab, PAGE_T, NUM_LAYERS);
+    model::configure_gates(/* has_mtp_logits */ true, /* has_value_head */ false);
 
-    let bx = |c: Channel| -> &'static Channel { Box::leak(Box::new(c)) };
     // gmask: host-fed per-position grammar mask [K+1, V] bool (host-writer).
     let gmask = bx(Channel::new([kp1, v], dtype::bool).named("gmask"));
     // toks: the K+1 verify-window input tokens (seeded per instance).
     let toks = bx(Channel::from(vec![BOS; kp1 as usize]).named("toks"));
     // out: the committed accept-prefix (host-reader).
     let out = bx(Channel::new([kp1], dtype::i32).named("out"));
-    // gmask is host-fed each step (per-position grammar mask) — a host-side put
-    // marks it host-writer + produces its value (mirrors the beam's `fresh.put`).
-    gmask.put(vec![true; (kp1 * v) as usize]);
 
-    let fwd = ForwardPass::new();
+    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
     let lanes = Tensor::constant((0u32..=kp1).collect::<Vec<_>>()); // one token per window row
     fwd.embed(toks, lanes);
     fwd.epilogue(move || {
@@ -73,37 +68,18 @@ fn s61_container(vocab: u32) -> core::result::Result<Vec<u8>, String> {
         out.put(&commit);
     });
 
-    let traced = fwd.trace().map_err(|e| format!("§6.1 trace: {e:?}"))?;
-    Ok(traced.encode())
-}
-
-#[inferlet::main]
-async fn main(_input: String) -> Result<String> {
-    use inferlet::pie::core::ptir::{ChannelSeed, Pipeline, register_program};
-
-    let vocab = wit_model::output_vocab_size();
-    let bytes = s61_container(vocab).map_err(|e| format!("author §6.1: {e}"))?;
-    let program = register_program(&bytes).map_err(|e| format!("register-program: {e}"))?;
-
-    // Seed the K+1 window tokens (per-instance); gmask is host-fed each step.
-    let seeds: Vec<ChannelSeed> = Vec::new();
-    let pipeline =
-        Pipeline::instantiate(program, &seeds).map_err(|e| format!("instantiate: {e}"))?;
-
-    let gmask = pipeline.channel(CH_GMASK).map_err(|e| format!("channel(gmask): {e}"))?;
-    let out = pipeline.channel(CH_OUT).map_err(|e| format!("channel(out): {e}"))?;
-
-    // One §6.1 verify step: feed an all-allow grammar mask, submit, harvest the
-    // accept-prefix. (The multi-step accept-prefix decode loop + real grammar mask
-    // land with charlie's MTP Stage-2 driver; the pre-stage proves the wire.)
-    let kp1 = (K + 1) as usize;
-    let mask_bytes = vec![0xFFu8; kp1 * ((vocab as usize).div_ceil(8))]; // all-allow (packed bool)
-    gmask.put(&mask_bytes).map_err(|e| format!("gmask.put: {e}"))?;
-    pipeline.submit().map_err(|e| format!("submit: {e}"))?;
-    let committed = out.take().map_err(|e| format!("out.take: {e}"))?;
+    // One §6.1 verify step: feed an all-allow grammar mask (the host-writer put
+    // both marks `gmask` host-writer for the trace and supplies the fire-0
+    // value), submit, harvest the accept-prefix. Bool payloads are dtype-native
+    // (1 byte per bool; the wire packs to bits). The multi-step accept-prefix
+    // decode loop + a real grammar mask land with charlie's MTP Stage-2 driver.
+    let pipeline = Pipeline::new();
+    gmask.put(vec![true; (kp1 * v) as usize]); // all-allow
+    pipeline.submit(fwd).map_err(|e| format!("submit: {e}"))?;
+    let committed = out.take().get::<i32>().map_err(|e| format!("out.take: {e}"))?;
 
     let result = format!(
-        "MTP_GRAMMAR K={K} committed_bytes={} (SDK-authored §6.1 native-MTP+grammar, vocab={vocab})",
+        "MTP_GRAMMAR K={K} committed={} (SDK-authored §6.1 native-MTP+grammar, vocab={vocab})",
         committed.len()
     );
     println!("MTP_GRAMMAR_E2E {result}");

@@ -27,7 +27,6 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
 use crate::api::pie;
-use crate::inference::paging;
 use crate::instance::InstanceState;
 use crate::working_set::kv::KvWorkingSet;
 use crate::working_set::rs::RsWorkingSet;
@@ -39,6 +38,7 @@ use super::ptir_channel_store::{
     marshal_response, BoundCells, ChannelCell, ChannelError,
 };
 use super::ptir_kv;
+use super::ptir_lease::PageLease;
 use super::ptir_rs;
 
 /// A first-class, guest-constructed channel (overview §1). The SAME handle is
@@ -58,13 +58,27 @@ pub struct Channel {
 /// await (the fire is popped out, then awaited).
 pub type PendingFires = Arc<Mutex<VecDeque<PendingFire>>>;
 
+/// The open KV/arena transaction(s) one in-flight fire holds until it resolves.
+/// Two shapes: the ordinary single-seq / MTP projection (`ptir_kv`), or a
+/// device-geometry fire whose KV the driver resolves+writes itself (B2's
+/// explicit-KV path) — the runtime only pins the `PageLease`-granted physical
+/// pages for the fire, released at finalize (per-fire arena txn; the plan's
+/// "pin float bounded by run-ahead depth × B, riding the per-fire arena txns").
+enum FireKv {
+    Kv(ptir_kv::PtirKvTxn),
+    DeviceGeom {
+        arena_txn: crate::arena::ArenaTxn,
+        write_txn: crate::working_set::kv::WriteTxnId,
+    },
+}
+
 /// One in-flight PTIR fire: the driver round-trip plus everything needed to
 /// finalize when it resolves — the open KV/RS txns (pins/CoW held until
 /// commit/abort) and the bound cells to marshal outputs into (or poison on
 /// failure). The PTIR mirror of the classic `PendingForward`.
 pub struct PendingFire {
     rx: tokio::sync::oneshot::Receiver<anyhow::Result<crate::inference::ForwardOutput>>,
-    kvtxn: ptir_kv::PtirKvTxn,
+    kv: FireKv,
     rstxn: Option<ptir_rs::PtirRsTxn>,
     ws_rep: u32,
     rs_rep: Option<u32>,
@@ -114,14 +128,14 @@ pub struct ForwardPass {
     /// root cause (the KV cursor and device channel state are unspecified
     /// after a failed fire — the guest builds a fresh pass).
     pub failed: Option<String>,
-    /// §6.2 beam host-replay state (Design X). `Some` iff this is a beam
-    /// program whose [B,P] geometry is device-produced (`fire_geometry` can't
-    /// resolve it) — then each submit fires the replayed multi-lane batch
-    /// instead of the single-page projection. NOTE: the beam replay derives
-    /// fire t+1's geometry from t's harvested outputs, so the beam path is
-    /// inherently synchronous (submit awaits) — it does NOT run ahead. Slated
-    /// for deletion once the driver resolves device-produced geometry.
-    pub beam: Option<BeamRun>,
+    /// Device-geometry state (Track B): `Some` iff this pass's geometry
+    /// (`pages`/`w_slot`/…) is DEVICE-produced — the program traces the wire-form
+    /// geometry in-graph (`page_indptr = CumSum(np)`, packed live pages) and the
+    /// driver resolves it pre-forward, so the host neither replays the epilogue
+    /// arithmetic nor projects per-lane KV. The runtime only leases physical
+    /// pages (`PageLease`) and delivers fresh grants on the program's fresh
+    /// channel. Replaces the deleted host-replay beam branch.
+    pub devgeo: Option<DevGeo>,
 }
 
 /// A run-ahead submission pipeline (overview §3): the ORDERING domain (W3.1).
@@ -130,33 +144,51 @@ pub struct ForwardPass {
 /// reads, EXTENDED ACROSS PASSES (draft→verify chaining). `take`/`read` await
 /// this FIFO via each channel's recorded pipeline. Submission order rides the
 /// scheduler queue; completion order rides this FIFO.
+///
+/// **FIFO INVARIANT (B3, mandatory).** Fires of one pipeline keep submission
+/// order through the scheduler onto one stream, and every pass binding a shared
+/// channel MUST submit on the SAME pipeline (enforced by
+/// [`InstanceState::wire_channels_to_pipeline`]). This is the ENTIRE correctness
+/// argument for run-ahead + multi-pass chaining: because all interacting fires
+/// funnel onto one ordered FIFO, fire t's epilogue puts happen-before fire t+1's
+/// descriptor reads. `push_back` at submit + `pop_front` at finalize preserve
+/// that order; the same-pipeline check makes it an explicit invariant, not an
+/// accident. Tested by `tests::{detect_device_geometry_*, fifo_preserves_submission_order}`.
 pub struct Pipeline {
     pub fires: PendingFires,
 }
 
-/// Per-instance beam replay state carried across fires (Design X).
-pub struct BeamRun {
-    /// The host-tracked freeze/heir geometry state.
-    pub state: super::ptir_beam::BeamState,
-    /// The [B,P] geometry for the NEXT fire (seeded for fire 0; re-derived by
-    /// `BeamState::step` after each fire from the harvested `out_par`).
-    pub geom: super::ptir_beam::BeamGeometry,
-    /// `[B]` tokens to embed next fire (seeded prompt; then the harvested `out`).
-    pub toks: Vec<u32>,
-    /// `[B]` decode positions (advance by 1 per fire).
-    pub pos: Vec<u32>,
+/// Physical-page leasing + channel bookkeeping for a device-geometry pass
+/// (Track B / plan W3.3). The runtime seeds fire 0's `B` pages and grants `B`
+/// fresh physical ids per submit (delivered as a host-put on the `fresh`
+/// channel); after a fire commits it reclaims the UNUSED grants of continuing
+/// heirs (harvested `w_cont`), and everything on drop.
+pub struct DevGeo {
+    /// The physical-page lease (grant / reclaim / free-list bookkeeping).
+    pub lease: PageLease,
+    /// Beam / lane width `B` — the fresh grants per fire.
+    pub b: usize,
+    /// Dense channel index of the host-writer `fresh`-page input channel — where
+    /// the runtime injects each fire's grant.
+    pub fresh_dense: usize,
+    /// Dense channel index of the `w_cont` host-reader output ([B] bool) — read
+    /// at finalize to reclaim continuing heirs' unused fresh pages.
+    pub w_cont_dense: usize,
 }
 
-/// Detect a §6.2-style beam program: its geometry ports (`Pages`/`KvLen`) bind
-/// DEVICE-produced channels `fire_geometry` can't resolve. Returns `(B, P)` read
-/// from the `pages` channel's `[B, P]` shape (channel 0 by the beam convention).
-fn detect_beam(container: &pie_ptir::container::TraceContainer) -> Option<(usize, usize)> {
-    use pie_ptir::container::PortSource;
+/// Detect a device-geometry pass: its geometry ports (`WSlot`/`WOff` write
+/// descriptors — beam-specific, a plain decode's `attn_working_set` binds only
+/// `KvLen`) bind DEVICE-produced channels, and the `Pages` port's channel is
+/// `[B, P]` (`P > 1`). Returns `(B, fresh_dense, w_cont_dense)`: the single
+/// host-writer channel is `fresh`; the host-reader `[B]` bool channel is
+/// `w_cont` (the reclaim signal). `None` for an ordinary decode.
+fn detect_device_geometry(
+    container: &pie_ptir::container::TraceContainer,
+) -> Option<(usize, usize, usize)> {
+    use pie_ptir::container::{ChanDType, PortSource};
     use pie_ptir::registry::Port;
-    // STRUCTURAL beam signal: the WSlot/WOff write descriptors are beam-specific
-    // — a plain decode's `attn_working_set` binds only KvLen. This is robust to
-    // seeding (unlike `fire_geometry`'s MissingChannelValue, which host-known
-    // seeds for pages/klen/w_slot defeat → the beam would take the trivial path).
+    use pie_ptir::types::DType;
+
     let has_write_desc = container
         .ports
         .iter()
@@ -164,17 +196,23 @@ fn detect_beam(container: &pie_ptir::container::TraceContainer) -> Option<(usize
     if !has_write_desc {
         return None;
     }
-    // B, P from the [B, P] channel bound to the `Pages` port (P > 1 for a beam).
+    // B from the [B, P] channel bound to the `Pages` port (P > 1 for a beam).
     let pages_ch = container.ports.iter().find_map(|p| match (&p.port, &p.source) {
         (Port::Pages, PortSource::Channel(c)) => Some(*c as usize),
         _ => None,
     })?;
     let dims = container.channels.get(pages_ch)?.shape.dims();
-    if dims.len() == 2 && dims[1] > 1 {
-        Some((dims[0] as usize, dims[1] as usize))
-    } else {
-        None
-    }
+    let b = if dims.len() == 2 && dims[1] > 1 { dims[0] as usize } else { return None };
+
+    // fresh = the single host-Writer channel; w_cont = the host-Reader bool.
+    let fresh_dense = container
+        .channels
+        .iter()
+        .position(|c| c.host_role == HostRole::Writer)?;
+    let w_cont_dense = container.channels.iter().position(|c| {
+        c.host_role == HostRole::Reader && matches!(c.dtype, ChanDType::Concrete(DType::Bool))
+    })?;
+    Some((b, fresh_dense, w_cont_dense))
 }
 
 type Anyhow<T> = anyhow::Result<T>;
@@ -425,30 +463,23 @@ impl pie::core::ptir::HostForwardPass for InstanceState {
             let ws_rep = kv_working_sets[0].rep();
             let rs_rep = rs_working_sets.first().map(|r| r.rep());
 
-            // §6.2 beam: eagerly reserve B*P slots on the GUEST's working set
-            // (the runtime owns the [B,P] layout: beam `l`'s pages occupy
-            // [l*P, l*P+P)) + seed the replay state. A normal program's ws
-            // starts as the guest left it — `ptir_kv::ptir_kv_prepare` grows
-            // it per fire (the growing-KV decode/MTP lifecycle).
-            let page_size = crate::working_set::page_size::tokens_per_page(0);
-            let beam = match detect_beam(&prog.bound.container) {
-                Some((b, p)) => {
+            // Device-geometry pass (Track B): seed the physical-page lease with
+            // `B` fire-0 pages (one live page per lane) drawn from the guest's
+            // working set. The [B,P] geometry is device-produced (the program
+            // traces `page_indptr = CumSum(np)` + packed pages in-graph); the
+            // runtime no longer replays the epilogue arithmetic nor eagerly
+            // reserves B*P slots. A normal program's ws starts as the guest left
+            // it — `ptir_kv::ptir_kv_prepare` grows it per fire.
+            let devgeo = match detect_device_geometry(&prog.bound.container) {
+                Some((b, fresh_dense, w_cont_dense)) => {
                     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-                    if let Err(e) = self.ctx().table.get_mut(&ws_res)?.alloc((b * p) as u32) {
-                        return Ok(Err(format!("ptir: beam kv working-set alloc: {e}")));
-                    }
-                    let slot0: Vec<u32> = (0..b).map(|l| (l * p) as u32).collect();
-                    let state = super::ptir_beam::BeamState::seeded(b, p, page_size, &slot0);
-                    let geom = state.geometry();
-                    Some(BeamRun {
-                        state,
-                        geom,
-                        // Placeholder prompt token per beam (the toks seed in
-                        // echo's beam_trace); the real prompt is refined
-                        // during the 4090 bring-up.
-                        toks: vec![1u32; b],
-                        pos: vec![0u32; b],
-                    })
+                    let seed_pages = match self.ctx().table.get_mut(&ws_res)?.alloc_slots(b as u32) {
+                        Ok(ids) => ids,
+                        Err(e) => return Ok(Err(format!("ptir: device-geometry seed alloc: {e}"))),
+                    };
+                    let mut lease = PageLease::new(b);
+                    lease.seed(seed_pages);
+                    Some(DevGeo { lease, b, fresh_dense, w_cont_dense })
                 }
                 None => None,
             };
@@ -485,7 +516,7 @@ impl pie::core::ptir::HostForwardPass for InstanceState {
                 committed_tokens: 0,
                 shipped: false,
                 failed: None,
-                beam,
+                devgeo,
             })?;
             Ok(Ok(res))
         }
@@ -498,8 +529,26 @@ impl pie::core::ptir::HostForwardPass for InstanceState {
         // and the working sets (their own resources); the pass releases only
         // itself. Queue the instance id for device release (W0.3): frees the
         // driver's persistent per-instance view (also fixes the map leak).
-        let pass = self.ctx().table.delete(this)?;
+        let mut pass = self.ctx().table.delete(this)?;
         queue_instance_release(pass.instance.instance_id);
+        // Device-geometry: reclaim EVERY leased physical page (all in-flight
+        // grants + the fire-0 seed) back to the working set on pass drop.
+        if let Some(devgeo) = pass.devgeo.as_mut() {
+            let freed = devgeo.lease.reclaim_all();
+            if !freed.is_empty() {
+                let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(pass.kv_ws);
+                if let Ok(ws) = self.ctx().table.get(&ws_res) {
+                    let (m, d) = ws.device();
+                    let arena_arc = crate::arena::get(m, d);
+                    let cas_arc = crate::working_set::kv_cas::get(m, d);
+                    let mut arena = arena_arc.lock().unwrap();
+                    let mut cas = cas_arc.lock().unwrap();
+                    if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
+                        let _ = ws.free_slots(&freed, &mut arena, &mut cas);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -519,11 +568,14 @@ impl pie::core::ptir::HostPipeline for InstanceState {
         fwd: Resource<ForwardPass>,
     ) -> Anyhow<Result<(), String>> {
         {
-            // §6.2 beam: the [B,P] geometry is device-produced and replayed
-            // from each fire's harvested outputs, so the beam path is
-            // inherently synchronous — it awaits inside (see `ForwardPass::beam`).
-            if self.ctx().table.get(&fwd)?.beam.is_some() {
-                return self.fire_beam(fwd).await;
+            // Device-geometry pass (Track B): the [B,P] geometry is
+            // device-produced (the program traces the wire form in-graph) and
+            // the driver resolves it pre-forward, so this pass leases physical
+            // pages + fires solo/prebuilt via `map_geometry_relaxed` — but it
+            // RUNS AHEAD like any pass (the FIFO carries it; NOT synchronous like
+            // the deleted host-replay beam branch).
+            if self.ctx().table.get(&fwd)?.devgeo.is_some() {
+                return self.fire_device_geometry(this, fwd).await;
             }
             // W3.1: the PIPELINE owns the in-flight FIFO. Point each of this
             // pass's channels at this pipeline's queue so their `take`/`read`
@@ -701,7 +753,7 @@ impl pie::core::ptir::HostPipeline for InstanceState {
 
             pipe_fires.lock().unwrap().push_back(PendingFire {
                 rx,
-                kvtxn,
+                kv: FireKv::Kv(kvtxn),
                 rstxn,
                 ws_rep,
                 rs_rep,
@@ -760,7 +812,7 @@ impl InstanceState {
     /// cells — or, on failure, poison the pass's Reader channels + fail the
     /// pass. The PTIR mirror of the classic `await_and_finalize`.
     async fn finalize_fire(&mut self, fire: PendingFire) -> Anyhow<()> {
-        let PendingFire { rx, kvtxn, rstxn, ws_rep, rs_rep, fwd_rep, cells } = fire;
+        let PendingFire { rx, kv, rstxn, ws_rep, rs_rep, fwd_rep, cells } = fire;
         let result = rx.await;
         let success = matches!(result, Ok(Ok(_)));
 
@@ -768,11 +820,31 @@ impl InstanceState {
             let arena_arc = crate::arena::get(0, 0);
             let mut arena = arena_arc.lock().unwrap();
             let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-            match self.ctx().table.get_mut(&ws_res) {
-                Ok(ws) => {
-                    let _ = ptir_kv::ptir_kv_finalize(ws, &mut arena, kvtxn, success);
+            match kv {
+                FireKv::Kv(kvtxn) => match self.ctx().table.get_mut(&ws_res) {
+                    Ok(ws) => {
+                        let _ = ptir_kv::ptir_kv_finalize(ws, &mut arena, kvtxn, success);
+                    }
+                    Err(_) => ptir_kv::ptir_kv_abandon(&mut arena, kvtxn),
+                },
+                // Device-geometry fire: the driver resolved+wrote KV; the runtime
+                // only unpins the leased pages (commit persists the writes / abort
+                // discards them). The per-fire grant reclaim (via w_cont) happens
+                // below, after the response is in hand.
+                FireKv::DeviceGeom { arena_txn, write_txn } => {
+                    if success {
+                        let _ = arena.txn_commit(arena_txn);
+                    } else {
+                        arena.txn_abort(arena_txn);
+                    }
+                    if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
+                        if success {
+                            ws.commit_writes(write_txn);
+                        } else {
+                            ws.abort_writes(write_txn);
+                        }
+                    }
                 }
-                Err(_) => ptir_kv::ptir_kv_abandon(&mut arena, kvtxn),
             }
             if let Some(rstxn) = rstxn {
                 let rs_res: Resource<RsWorkingSet> =
@@ -802,6 +874,10 @@ impl InstanceState {
                     poison_readers(&cells, &reason);
                     self.fail_pass(fwd_rep, &reason);
                 }
+                // Device-geometry: reclaim the UNUSED fresh page grants of this
+                // fire's continuing heirs (harvested `w_cont`) back to the lease's
+                // free-list (bounding pin float to run-ahead depth × B).
+                self.reclaim_device_geometry_grants(fwd_rep, &produced);
             }
             Ok(Ok(_)) => {
                 // A non-Response output (legacy token fast-path) carries no
@@ -833,275 +909,231 @@ impl InstanceState {
     }
 }
 
-/// Parse a beam program-output channel's bytes as `[n]` little-endian u32 (tokens
-/// are non-negative i32 → the same bit pattern).
-fn beam_channel_u32(
-    produced: &[pie_driver_abi::PtirChannelValue],
-    channel: u64,
-    n: usize,
-) -> Option<Vec<u32>> {
-    let cell = produced.iter().find(|c| c.channel == channel)?;
-    if cell.bytes.len() < n * 4 {
-        return None;
-    }
-    Some(
-        cell.bytes[..n * 4]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    )
-}
-
 impl InstanceState {
-    /// §6.2 beam host-replay fire (Design X). Builds the [B,P] decode batch from
-    /// the replayed geometry (`BeamState`), resolves each beam's slots→physical in
-    /// Rust (read pages via `resolve_read`; the write page via
-    /// `write_slot_shared_inplace` for a HEIR continuing a shared tail, else
-    /// `cow_write_slot` for a FORK), folds the B lanes via the existing batch
-    /// assembly, fires the pre-assembled batch (bravo's `submit_prebuilt_async`),
-    /// marshals the [B] program outputs back to the bound cells, and replays the
-    /// epilogue (`BeamState::step` on the harvested `out_par`) for the next fire.
+    /// Device-geometry fire (Track B): the pass's [B,P] geometry is
+    /// DEVICE-produced (the program traces `page_indptr = CumSum(np)` + packed
+    /// live pages in-graph) and the driver resolves it pre-forward, so the host
+    /// neither replays the epilogue arithmetic nor projects per-lane KV. The
+    /// runtime leases `B` fresh physical pages, delivers them to the program as a
+    /// host-put on the `fresh` channel, marks the fire solo/prebuilt via
+    /// `map_geometry_relaxed` (wire fields empty), and fires it RUN-AHEAD onto the
+    /// pipeline FIFO (unlike the deleted synchronous host-replay beam branch).
+    /// The per-fire arena/write txns ride the `PendingFire`; `finalize_fire`
+    /// commits/aborts them and reclaims continuing heirs' unused grants (w_cont).
     ///
-    /// SYNCHRONOUS BY CONSTRUCTION: fire t+1's geometry comes from t's harvested
-    /// outputs, so this path awaits inside submit (no run-ahead). Slated for
-    /// deletion once the driver resolves device-produced geometry.
-    ///
-    /// BRING-UP (4090, with charlie): the fire-0 / prompt seeding + the fresh-slot
-    /// lifecycle (currently runtime-issued via `alloc_slots`) are refined against
-    /// the value-verify vs the 3 beam goldens; the freeze/heir REPLAY itself is
-    /// golden-verified host-side (`ptir_beam::tests`).
-    async fn fire_beam(&mut self, fwd: Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
-        use crate::inference::request;
-
-        let page_size = crate::working_set::page_size::tokens_per_page(0);
-
-        // 1) Snapshot the beam geometry + PTIR carrier (no borrow across await).
-        let (geom, toks, pos, submission, cells, channel_ids, ws_rep, b, p) = {
-            let pl = self.ctx().table.get_mut(&fwd)?;
-            if let Some(e) = &pl.failed {
-                return Ok(Err(format!("ptir: forward-pass failed by an earlier fire: {e}")));
-            }
-            if let Err(e) = bind_seeds_first_fire(pl) {
-                return Ok(Err(e));
-            }
-            let beam = pl.beam.as_ref().expect("fire_beam on a non-beam pass");
-            let geom = beam.geom.clone();
-            let toks = beam.toks.clone();
-            let pos = beam.pos.clone();
-            let (b, p) = (beam.state.b, beam.state.p);
-            let ship = !pl.shipped;
-            pl.shipped = true;
-            let channel_ids = pl.channel_ids.clone();
-            let host_puts = drain_host_puts(&pl.cells);
-            let submission = pl.instance.submission(ship, channel_ids.clone(), host_puts);
-            (geom, toks, pos, submission, pl.cells.clone(), channel_ids, pl.kv_ws, b, p)
-        };
-
-        // kvm → per-beam BRLE masks (1 query/beam).
-        let (masks, _mask_indptr) = geom.masks(p, page_size);
-
-        // 2) Resolve each beam's slots→physical + fold the B-lane batch under one
-        //    KV write txn. HEIR writes go in-place (shared page preserved, alpha's
-        //    `write_slot_shared_inplace`); FORK writes CoW-alloc a fresh page.
-        let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-        let arena_arc = crate::arena::get(0, 0);
-        let wtx = self.ctx().table.get_mut(&ws_res)?.begin_write_txn();
-
-        let built = {
-            let mut arena = arena_arc.lock().unwrap();
-            let mut txn = arena.txn_begin();
-            let ws = self.ctx().table.get_mut(&ws_res)?;
-
-            let mut batch = request::new_batched_forward_request_with_capacity(b);
-            let mut union_phys = Vec::new();
-            let mut err: Option<String> = None;
-
-            'lanes: for lane in 0..b {
-                let np_b = geom.np[lane] as usize;
-                // Read pages = the beam's live pages before the tail; the tail
-                // (index np_b-1 = w_slot) is the write page.
-                let mut read_pages = Vec::with_capacity(np_b.saturating_sub(1));
-                for pp in 0..np_b.saturating_sub(1) {
-                    let slot = geom.pages[lane * p + pp];
-                    match ws.resolve_read(slot, 1).map(|o| o[0]) {
-                        Ok(obj) => {
-                            if let Err(e) = arena.txn_pin(&mut txn, obj) {
-                                err = Some(format!("beam pin read {lane}/{pp}: {e}"));
-                                break 'lanes;
-                            }
-                            match arena.blocks(obj) {
-                                Ok(bl) => read_pages.push(bl[0]),
-                                Err(e) => {
-                                    err = Some(format!("beam blocks read {lane}/{pp}: {e}"));
-                                    break 'lanes;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            err = Some(format!("beam resolve_read slot {slot}: {e}"));
-                            break 'lanes;
-                        }
-                    }
-                }
-                // Write page: heir (shared in-place) vs fork (CoW fresh).
-                let w_slot = geom.w_slot[lane];
-                let write_obj = if geom.w_cont[lane] {
-                    match ws.write_slot_shared_inplace(wtx, w_slot) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            err = Some(format!("beam heir write slot {w_slot}: {e}"));
-                            break 'lanes;
-                        }
-                    }
-                } else {
-                    match ws.cow_write_slot(wtx, w_slot, &mut txn, &mut arena) {
-                        Ok((o, _)) => o,
-                        Err(e) => {
-                            err = Some(format!("beam fork write slot {w_slot}: {e}"));
-                            break 'lanes;
-                        }
-                    }
-                };
-                if let Err(e) = arena.txn_pin(&mut txn, write_obj) {
-                    err = Some(format!("beam pin write {lane}: {e}"));
-                    break 'lanes;
-                }
-                let write_page = match arena.blocks(write_obj) {
-                    Ok(bl) => bl[0],
-                    Err(e) => {
-                        err = Some(format!("beam blocks write {lane}: {e}"));
-                        break 'lanes;
-                    }
-                };
-
-                let write = paging::KvWrite {
-                    slot_index: (np_b - 1) as u32,
-                    page: write_page,
-                    valid_len: geom.w_off[lane] + 1,
-                };
-                let ctx_valid = np_b.saturating_sub(1) as u32 * page_size;
-                let proj = match paging::project_kv(&read_pages, ctx_valid, &[write], page_size) {
-                    Ok(pr) => pr,
-                    Err(e) => {
-                        err = Some(format!("beam project_kv {lane}: {e:?}"));
-                        break 'lanes;
-                    }
-                };
-                union_phys.extend_from_slice(&proj.physical_page_ids);
-
-                // Per-lane decode request (1 token, custom kvm mask) folded into
-                // the batch by the EXISTING assembly (physical kv_page_indices,
-                // kv_last_page_lens, qo_indptr=[0..=B]).
-                let req_l = request::new_per_request(
-                    0,
-                    vec![toks[lane]],
-                    vec![pos[lane]],
-                    vec![masks[lane].clone()],
-                    true,
-                    None,
-                    vec![0],
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    false,
-                    None,
-                    None,
-                );
-                request::append_request_with_options(
-                    &mut batch,
-                    &req_l,
-                    &proj.physical_page_ids,
-                    proj.last_page_len,
-                    page_size,
-                    false,
-                );
-            }
-
-            match err {
-                None => Ok((txn, batch, union_phys)),
-                Some(e) => {
-                    arena.txn_abort(txn);
-                    Err(e)
-                }
-            }
-        };
-
-        let (txn, mut batch, union_phys) = match built {
-            Ok(v) => v,
-            Err(e) => {
-                self.ctx().table.get_mut(&ws_res)?.abort_writes(wtx);
-                return Ok(Err(e));
-            }
-        };
-
-        // 3) Attach the PTIR carrier + fire the pre-assembled B-lane batch.
-        batch.push_ptir_program(&submission);
-        drain_releases_into(&mut batch);
-        let rx = match crate::inference::submit_prebuilt_async(batch, 0, union_phys, 0, Vec::new()) {
-            Ok(rx) => rx,
-            Err(e) => {
-                arena_arc.lock().unwrap().txn_abort(txn);
-                self.ctx().table.get_mut(&ws_res)?.abort_writes(wtx);
-                return Ok(Err(format!("beam submit_prebuilt: {e:#}")));
-            }
-        };
-        let result = rx.await;
-
-        // 4) Finalize the KV txn.
-        {
-            let mut arena = arena_arc.lock().unwrap();
-            let ws = self.ctx().table.get_mut(&ws_res)?;
-            if matches!(result, Ok(Ok(_))) {
-                let _ = arena.txn_commit(txn);
-                ws.commit_writes(wtx);
-            } else {
-                arena.txn_abort(txn);
-                ws.abort_writes(wtx);
-            }
+    /// BRING-UP (4090, shadow-verify): the exact fresh-page materialization
+    /// (`cow_write_slot`), the fire-0 seed source, and the physical-page ids fed
+    /// on `fresh` are validated against the beam goldens on device; the geometry
+    /// contract itself is host-verified (`ptir-dsl` `beam_goldens`).
+    async fn fire_device_geometry(
+        &mut self,
+        this: Resource<Pipeline>,
+        fwd: Resource<ForwardPass>,
+    ) -> Anyhow<Result<(), String>> {
+        // Wire each of this pass's channels at this pipeline's FIFO (§3.4: all
+        // passes binding a channel must submit on ONE pipeline — the entire
+        // ordering/FIFO correctness argument).
+        let pipe_fires = self.ctx().table.get(&this)?.fires.clone();
+        if let Err(e) = self.wire_channels_to_pipeline(&fwd, &pipe_fires)? {
+            return Ok(Err(e));
         }
 
-        // 5) Marshal the [B] program outputs back to the bound cells + replay the
-        //    epilogue (step on out_par) for the next fire.
-        match result {
-            Ok(Ok(crate::inference::ForwardOutput::Response(resp))) => {
-                let produced = resp.ptir_output_at(0).unwrap_or_default();
-                let tuples: Vec<(u64, Vec<u8>)> =
-                    produced.iter().map(|c| (c.channel, c.bytes.clone())).collect();
-                if let Err(e) = marshal_response(&cells, &tuples) {
-                    return Ok(Err(format!("beam output marshal failed: {e}")));
+        let page_size = crate::working_set::page_size::tokens_per_page(0);
+        let ws_rep = self.ctx().table.get(&fwd)?.kv_ws;
+        let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
+        let arena_arc = crate::arena::get(0, 0);
+
+        // Snapshot the carrier + grant B fresh physical pages, materializing +
+        // pinning them under one write/arena txn (no borrow held across submit).
+        let (submission, geometry, cells, fwd_rep, arena_txn, write_txn) = {
+            // Fail-fast + first-fire seed binding.
+            {
+                let p = self.ctx().table.get_mut(&fwd)?;
+                if let Some(e) = &p.failed {
+                    return Ok(Err(format!("ptir: forward-pass failed by an earlier fire: {e}")));
                 }
-                // out_par (dense ch14) = parent [B]; out (dense ch13) = survivor
-                // tokens [B]. Resolve the dense indices to global ids for the
-                // response lookup (outputs are keyed by global id under the new ABI).
-                let out_par_id = channel_ids.get(14).copied().unwrap_or(14);
-                let out_id = channel_ids.get(13).copied().unwrap_or(13);
-                let parent = beam_channel_u32(&produced, out_par_id, b);
-                let out = beam_channel_u32(&produced, out_id, b);
-                // Runtime-issued fresh slots for the next step's forks.
-                let fresh = match self.ctx().table.get_mut(&ws_res)?.alloc_slots(b as u32) {
-                    Ok(f) => f,
-                    Err(e) => return Ok(Err(format!("beam fresh alloc: {e}"))),
+                if let Err(e) = bind_seeds_first_fire(p) {
+                    return Ok(Err(e));
+                }
+            }
+
+            // Take the DevGeo out so the lease grant can borrow the ws (distinct
+            // table resources can't be borrowed mutably at once).
+            let mut devgeo = self
+                .ctx()
+                .table
+                .get_mut(&fwd)?
+                .devgeo
+                .take()
+                .expect("fire_device_geometry on a non-device-geometry pass");
+
+            let wtx = self.ctx().table.get_mut(&ws_res)?.begin_write_txn();
+            let mut arena = arena_arc.lock().unwrap();
+            let mut txn = arena.txn_begin();
+
+            // Grant B fresh pages (free-list first, then a fresh ws slot), then
+            // materialize + pin each so the driver's explicit-KV write (B2) lands
+            // on a live, un-evictable physical page.
+            let grant_slots = {
+                let ws = self.ctx().table.get_mut(&ws_res)?;
+                devgeo.lease.grant(|| {
+                    ws.alloc_slots(1).ok().and_then(|v| v.into_iter().next()).unwrap_or(0)
+                })
+            };
+            let mut phys_pages: Vec<u32> = Vec::with_capacity(grant_slots.len());
+            let mut grant_err: Option<String> = None;
+            for &slot in &grant_slots {
+                let ws = match self.ctx().table.get_mut(&ws_res) {
+                    Ok(ws) => ws,
+                    Err(e) => {
+                        grant_err = Some(format!("ptir: device-geometry ws: {e}"));
+                        break;
+                    }
                 };
-                let pl = self.ctx().table.get_mut(&fwd)?;
-                if let (Some(beam), Some(parent), Some(out)) = (pl.beam.as_mut(), parent, out) {
-                    beam.geom = beam.state.step(&parent, &fresh);
-                    beam.toks = out;
-                    beam.pos.iter_mut().for_each(|x| *x += 1);
+                match ws.cow_write_slot(wtx, slot, &mut txn, &mut arena) {
+                    Ok((obj, _)) => {
+                        if let Err(e) = arena.txn_pin(&mut txn, obj) {
+                            grant_err = Some(format!("ptir: device-geometry pin {slot}: {e}"));
+                            break;
+                        }
+                        match arena.blocks(obj) {
+                            Ok(bl) => phys_pages.push(bl[0]),
+                            Err(e) => {
+                                grant_err = Some(format!("ptir: device-geometry blocks {slot}: {e}"));
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        grant_err = Some(format!("ptir: device-geometry grant slot {slot}: {e}"));
+                        break;
+                    }
                 }
-                Ok(Ok(()))
             }
-            Ok(Ok(_)) => Ok(Ok(())),
-            Ok(Err(e)) => {
-                let reason = format!("beam forward failed: {e:#}");
-                poison_readers(&cells, &reason);
-                self.fail_pass(fwd.rep(), &reason);
-                Ok(Err(reason))
+            if let Some(e) = grant_err {
+                arena.txn_abort(txn);
+                drop(arena);
+                self.ctx().table.get_mut(&ws_res)?.abort_writes(wtx);
+                self.ctx().table.get_mut(&fwd)?.devgeo = Some(devgeo);
+                return Ok(Err(e));
             }
+            drop(arena);
+
+            // Deliver the fresh grant to the program as a host-put on its
+            // `fresh` channel (D1-coalesced into this fire's carrier).
+            let fresh_dense = devgeo.fresh_dense;
+            {
+                let p = self.ctx().table.get_mut(&fwd)?;
+                let bytes: Vec<u8> = phys_pages.iter().flat_map(|s| s.to_le_bytes()).collect();
+                if let Some(cell) = p.cells.get(fresh_dense) {
+                    let _ = cell.lock().unwrap().put(bytes);
+                }
+                p.devgeo = Some(devgeo);
+            }
+
+            // Build the carrier + the RELAXED geometry (device-produced ports
+            // ship empty; the driver resolves them pre-forward).
+            let p = self.ctx().table.get_mut(&fwd)?;
+            let ship = !p.shipped;
+            p.shipped = true;
+            let channel_ids = p.channel_ids.clone();
+            let host_puts = drain_host_puts(&p.cells);
+            let submission = p.instance.submission(ship, channel_ids, host_puts);
+            let geometry = p.instance.fire_geometry_relaxed(page_size).ok();
+            (submission, geometry, p.cells.clone(), fwd.rep(), txn, wtx)
+        };
+
+        // Assemble + fire the solo/prebuilt request; NO await (run-ahead FIFO).
+        let mut req = pie_driver_abi::ForwardRequest::default();
+        req.push_ptir_program(&submission);
+        if let Some(g) = &geometry {
+            g.apply_to(&mut req);
+        }
+        drain_releases_into(&mut req);
+        let rx = match crate::inference::submit_prebuilt_async(req, 0, Vec::new(), 0, Vec::new()) {
+            Ok(rx) => rx,
             Err(e) => {
-                let reason = format!("beam forward channel closed: {e}");
-                poison_readers(&cells, &reason);
-                self.fail_pass(fwd.rep(), &reason);
-                Ok(Err(reason))
+                let reason = format!("ptir: device-geometry submit failed: {e:#}");
+                arena_arc.lock().unwrap().txn_abort(arena_txn);
+                if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
+                    ws.abort_writes(write_txn);
+                }
+                self.ctx().table.get_mut(&fwd)?.failed = Some(reason.clone());
+                return Ok(Err(reason));
+            }
+        };
+
+        pipe_fires.lock().unwrap().push_back(PendingFire {
+            rx,
+            kv: FireKv::DeviceGeom { arena_txn, write_txn },
+            rstxn: None,
+            ws_rep,
+            rs_rep: None,
+            fwd_rep,
+            cells,
+        });
+        Ok(Ok(()))
+    }
+
+    /// Point each of a pass's channels at `pipe_fires` (the feeding pipeline's
+    /// FIFO), enforcing the same-pipeline invariant (§3.4). Returns `Ok(Err(..))`
+    /// if a channel is already bound to a DIFFERENT pipeline.
+    fn wire_channels_to_pipeline(
+        &mut self,
+        fwd: &Resource<ForwardPass>,
+        pipe_fires: &PendingFires,
+    ) -> Anyhow<Result<(), String>> {
+        let reps = self.ctx().table.get(fwd)?.channel_reps.clone();
+        for rep in reps {
+            let cres: Resource<Channel> = Resource::new_borrow(rep);
+            if let Ok(ch) = self.ctx().table.get_mut(&cres) {
+                match &ch.fires {
+                    Some(existing) if !Arc::ptr_eq(existing, pipe_fires) => {
+                        return Ok(Err("ptir: a channel is shared across pipelines \
+                             (all passes binding a channel must submit on the same \
+                             pipeline)"
+                            .into()));
+                    }
+                    _ => ch.fires = Some(pipe_fires.clone()),
+                }
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    /// Device-geometry per-fire page reclaim: read the harvested `w_cont`
+    /// (`[B]` bool: heir(true)/fork(false)) from `produced`, reclaim the
+    /// continuing heirs' UNUSED fresh page grants into the lease free-list, and
+    /// free those ws slots. No-op for a non-device-geometry pass.
+    fn reclaim_device_geometry_grants(&mut self, fwd_rep: u32, produced: &[(u64, Vec<u8>)]) {
+        let res: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
+        let (w_cont, ws_rep, reclaimed) = {
+            let Ok(p) = self.ctx().table.get_mut(&res) else { return };
+            let Some(devgeo) = p.devgeo.as_mut() else { return };
+            let w_cont_gid = p.channel_ids.get(devgeo.w_cont_dense).copied();
+            let Some(gid) = w_cont_gid else { return };
+            let w_cont: Vec<bool> = produced
+                .iter()
+                .find(|(c, _)| *c == gid)
+                .map(|(_, b)| b.iter().map(|&x| x != 0).collect())
+                .unwrap_or_default();
+            let reclaimed = devgeo.lease.reclaim_after_fire(&w_cont);
+            (w_cont, p.kv_ws, reclaimed)
+        };
+        let _ = w_cont;
+        if !reclaimed.is_empty() {
+            let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
+            let (m, d) = match self.ctx().table.get(&ws_res) {
+                Ok(ws) => ws.device(),
+                Err(_) => return,
+            };
+            // Lock order: arena → cas.
+            let arena_arc = crate::arena::get(m, d);
+            let cas_arc = crate::working_set::kv_cas::get(m, d);
+            let mut arena = arena_arc.lock().unwrap();
+            let mut cas = cas_arc.lock().unwrap();
+            if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
+                let _ = ws.free_slots(&reclaimed, &mut arena, &mut cas);
             }
         }
     }
@@ -1121,5 +1153,87 @@ fn model_profile() -> pie_ptir::registry::ModelProfile {
         has_mtp_drafts: false,
         has_value_head: false,
         kernels: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pie_ptir::container::{ChanDType, ChannelDecl, PortBinding, PortSource, StageProgram, TraceContainer};
+    use pie_ptir::registry::{Port, Stage};
+    use pie_ptir::types::{DType, Shape};
+    use std::collections::VecDeque;
+
+    fn ch(shape: Shape, dtype: DType, role: HostRole) -> ChannelDecl {
+        ChannelDecl { shape, dtype: ChanDType::Concrete(dtype), capacity: 1, host_role: role, seeded: false }
+    }
+
+    /// A minimal device-geometry container: a `[B,P]` Pages channel, WSlot/WOff
+    /// write descriptors, one host-Writer (`fresh`) + one host-Reader bool
+    /// (`w_cont`). Channels: 0 pages[B,P], 1 w_slot[B], 2 w_off[B], 3 fresh[B]
+    /// (Writer), 4 w_cont[B] bool (Reader).
+    fn devgeo_container(b: u32, p: u32) -> TraceContainer {
+        TraceContainer {
+            names: vec![],
+            channels: vec![
+                ch(Shape::matrix(b, p), DType::U32, HostRole::None),   // 0 pages
+                ch(Shape::vector(b), DType::U32, HostRole::None),      // 1 w_slot
+                ch(Shape::vector(b), DType::U32, HostRole::None),      // 2 w_off
+                ch(Shape::vector(b), DType::U32, HostRole::Writer),    // 3 fresh
+                ch(Shape::vector(b), DType::Bool, HostRole::Reader),   // 4 w_cont
+            ],
+            ports: vec![
+                PortBinding { port: Port::Pages, source: PortSource::Channel(0) },
+                PortBinding { port: Port::WSlot, source: PortSource::Channel(1) },
+                PortBinding { port: Port::WOff, source: PortSource::Channel(2) },
+            ],
+            stages: vec![StageProgram { stage: Stage::Epilogue, ops: vec![] }],
+            externs: vec![],
+        }
+    }
+
+    #[test]
+    fn detect_device_geometry_identifies_b_fresh_and_wcont() {
+        let c = devgeo_container(2, 3);
+        let (b, fresh, w_cont) = detect_device_geometry(&c).expect("device-geometry pass");
+        assert_eq!(b, 2, "B from the [B,P] Pages channel");
+        assert_eq!(fresh, 3, "fresh = the single host-Writer channel");
+        assert_eq!(w_cont, 4, "w_cont = the host-Reader bool channel");
+    }
+
+    #[test]
+    fn detect_device_geometry_rejects_plain_decode() {
+        // A plain decode: KvLen only (no WSlot/WOff write descriptors), P == 1.
+        let c = TraceContainer {
+            names: vec![],
+            channels: vec![ch(Shape::vector(1), DType::I32, HostRole::None)],
+            ports: vec![PortBinding { port: Port::KvLen, source: PortSource::Channel(0) }],
+            stages: vec![StageProgram { stage: Stage::Epilogue, ops: vec![] }],
+            externs: vec![],
+        };
+        assert!(detect_device_geometry(&c).is_none(), "no WSlot/WOff ⇒ not device-geometry");
+    }
+
+    #[test]
+    fn detect_device_geometry_rejects_single_page_width() {
+        // WSlot/WOff present but Pages is [B,1] (P == 1) — not a multi-page beam.
+        let mut c = devgeo_container(2, 1);
+        // pages [B,1]
+        c.channels[0] = ch(Shape::matrix(2, 1), DType::U32, HostRole::None);
+        assert!(detect_device_geometry(&c).is_none(), "P == 1 ⇒ not device-geometry");
+    }
+
+    /// The FIFO invariant primitive: fires enqueued in submission order drain in
+    /// that same order (the PendingFires deque semantics the same-pipeline check
+    /// funnels all interacting fires onto). `push_back` at submit + `pop_front`
+    /// at finalize preserve submission == completion order.
+    #[test]
+    fn fifo_preserves_submission_order() {
+        let mut fifo: VecDeque<u32> = VecDeque::new();
+        for fire in 0..8u32 {
+            fifo.push_back(fire); // submit order
+        }
+        let drained: Vec<u32> = std::iter::from_fn(|| fifo.pop_front()).collect();
+        assert_eq!(drained, (0..8).collect::<Vec<_>>(), "completion order == submission order");
     }
 }

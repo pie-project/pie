@@ -277,6 +277,9 @@ void llama_like_forward_paged(
     bool tp_greedy_argmax,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
+    const std::uint32_t* w_page_d,
+    const std::uint32_t* w_off_d,
+    bool has_write_desc,
     const LlamaLikeVisionInputs* vision)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
@@ -570,6 +573,18 @@ void llama_like_forward_paged(
         auto kv_view = cache.layer_view(L);
         if (fused_decode_qkv_post) {
             // Already written by launch_qkv_decode_qk_norm_rope_write_kv_bf16.
+        } else if (has_write_desc) {
+            // B2: explicit-descriptor KV write. Each lane writes its ONE new
+            // token's K/V into the program-supplied (physical page id
+            // `w_page_d[lane]`, offset `w_off_d[lane]`) target — the WSlot/WOff
+            // lowering — rather than re-deriving the position from the page
+            // table + last_page_len. Beam fork/freeze correctness: a frozen
+            // fork's cell is not overwritten (a sibling's mask hides it). R
+            // lanes = one new token per request (decode-shaped fire).
+            kernels::launch_write_kv_explicit_bf16(
+                kv_view,
+                const_cast<void*>(attn_k), const_cast<void*>(attn_v),
+                w_page_d, w_off_d, R, stream);
         } else {
             kernels::launch_write_kv_to_pages(
                 kv_view,

@@ -61,7 +61,9 @@ pub(crate) fn num_layers() -> u32 {
 
 /// The bind-time [`ModelProfile`] echo's validator uses (activation = F32 for the
 /// reference interpreter; the SDK carries no second-party kernels until P7).
-pub(crate) fn profile() -> ModelProfile {
+/// Native/test-only: the guest does not bind (D6); parity tests bind explicitly
+/// with this profile.
+pub fn profile() -> ModelProfile {
     let c = MODEL.with(|m| m.get());
     ModelProfile {
         vocab: c.vocab,

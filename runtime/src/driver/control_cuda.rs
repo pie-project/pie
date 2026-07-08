@@ -341,6 +341,11 @@ impl ControlPlane for CudaControlPlane {
         Ok(BoundInstance {
             id,
             addresses: FrameAddresses { frame_base, mirror_base, word_base },
+            // C1a: BoundInstance now carries the bind-fixed wake slots. The CUDA
+            // driver wires the real pacing + per-channel slots in C1b (the carrier
+            // callback → direct pie_wake_past rework); empty for now keeps the
+            // gated build consistent without changing behavior.
+            wakes: crate::driver::WakeSlots::default(),
         })
     }
 

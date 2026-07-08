@@ -107,6 +107,17 @@ struct ForwardFn {
         const std::uint8_t*  custom_mask_d        = nullptr;
         const std::int32_t*  custom_mask_indptr_d = nullptr;
 
+        // Optional: explicit KV-write descriptor (device-geometry WSlot/WOff,
+        // B2). When `has_write_desc`, the per-layer KV append lands each lane's
+        // new-token K/V at the EXPLICIT (physical page id `w_page_d[lane]`,
+        // offset `w_off_d[lane]`) target via `launch_write_kv_explicit_bf16`,
+        // instead of re-deriving the position from the page-table +
+        // last_page_len. Required for beam fork/freeze correctness (a frozen
+        // fork's cell must not be overwritten by the standard derivation).
+        const std::uint32_t* w_page_d             = nullptr;
+        const std::uint32_t* w_off_d              = nullptr;
+        bool                 has_write_desc       = false;
+
         // Optional: per-request rs-cache slot info
         const std::int32_t*  slot_ids_h           = nullptr;
         const std::uint8_t*  is_fresh_h           = nullptr;

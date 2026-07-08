@@ -58,6 +58,7 @@ pub mod audio;
 /// decode LOOP stays hand-written in the inferlet. See `ptir-sdk-minimization-audit`
 /// (keep-core) + `ptir-lowlevel-runahead-mechanics` (bravo, mechanics).
 pub mod carrier;
+#[cfg(feature = "sampling")]
 pub mod emit;
 /// KV page-geometry primitives (token→page math) as free functions over the
 /// raw WIT — the minimal-core geometry helper a low-level inferlet calls
@@ -70,6 +71,11 @@ pub mod mask;
 /// the keep-core twin of [`carrier`]; the raw-WIT form of `Context::flush` /
 /// `append_image` / `append_audio`. See `ptir-sdk-minimization-audit`.
 pub mod prefill;
+/// The author-facing PTIR bridge (overview §3/§5): `ForwardPass`/`Pipeline`/
+/// `WorkingSet`/`Channel` over the WIT `ptir` resources, driving the `ptir-dsl`
+/// trace `Builder`. The single home of the PTIR authoring surface.
+pub mod ptir;
+#[cfg(feature = "sampling")]
 pub mod program;
 
 /// Standard-sampler lowering (keep-core): turn a sampler spec into an
@@ -78,6 +84,10 @@ pub mod program;
 /// the per-kind Sampling-IR. The sampler analog of `geometry`/`carrier`; the
 /// `Sampler` enum + `.generate()` facade are the sugar that gets deleted. See
 /// `ptir-sdk-minimization-audit`.
+///
+/// A1/A4-gated (`feature = "sampling"`): built on `sampling-edsl`, removed by
+/// the PTIR refactor; off by default so the crate compiles for the PTIR path.
+#[cfg(feature = "sampling")]
 pub mod sampler;
 
 /// Snapshot manifests (keep-core): the thin `SnapshotData` + serde +
@@ -92,6 +102,10 @@ pub mod snapshot;
 /// `inferlet` dependency. Build a program, then (Stage 2, foxtrot's guest emit)
 /// lower it to a [`tensor::Program`](crate::tensor::Program) and attach it via
 /// [`Forward::sampler`](crate::forward::Forward::sampler).
+///
+/// A1/A4-gated (`feature = "sampling"`): `sampling-edsl` was removed by the PTIR
+/// refactor; off by default so the crate compiles for the PTIR path.
+#[cfg(feature = "sampling")]
 pub mod sampling {
     pub use sampling_edsl::*;
 }
@@ -212,6 +226,7 @@ pub mod prelude {
     pub use crate::{Result, Schema, Tool};
     pub use crate::{main, tool};
 
+    #[cfg(feature = "sampling")]
     pub use crate::program::{LoweredProgramExt, ProgramHandle};
     pub use crate::tensor;
     pub use crate::{chat, reasoning, tools};

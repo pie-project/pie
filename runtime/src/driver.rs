@@ -56,7 +56,7 @@ pub use carry_bridge::{
 /// hops before CUDA frames (X2) exist. Gated behind the `ptir` flag.
 pub use control::{
     BoundInstance, Completion, ControlPlane, EnqueueBatch, FrameAddresses, InstanceId,
-    MockControlPlane, ProgramId,
+    MockControlPlane, ProgramId, WakeSlots, WordLayout,
 };
 
 /// X2 — the CUDA control plane (Runtime–Driver Boundary): the real-device dual of

@@ -248,7 +248,7 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
     w
 }
 
-fn encode_op(w: &mut Vec<u8>, op: &Op) {
+pub(crate) fn encode_op(w: &mut Vec<u8>, op: &Op) {
     w.push(op.tag());
     match *op {
         Op::Const(lit) => encode_literal(w, lit),
@@ -365,7 +365,7 @@ fn encode_predicate(w: &mut Vec<u8>, pred: Predicate) {
     }
 }
 
-fn encode_shape(w: &mut Vec<u8>, shape: Shape) {
+pub(crate) fn encode_shape(w: &mut Vec<u8>, shape: Shape) {
     w.push(shape.rank() as u8);
     for &d in shape.dims() {
         put_u32(w, d);
@@ -393,10 +393,10 @@ fn encode_literal(w: &mut Vec<u8>, lit: Literal) {
     }
 }
 
-fn put_u16(w: &mut Vec<u8>, v: u16) {
+pub(crate) fn put_u16(w: &mut Vec<u8>, v: u16) {
     w.extend_from_slice(&v.to_le_bytes());
 }
-fn put_u32(w: &mut Vec<u8>, v: u32) {
+pub(crate) fn put_u32(w: &mut Vec<u8>, v: u32) {
     w.extend_from_slice(&v.to_le_bytes());
 }
 

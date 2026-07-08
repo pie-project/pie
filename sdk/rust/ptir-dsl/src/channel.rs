@@ -93,15 +93,20 @@ impl Channel {
     pub fn shape(&self) -> Shape {
         self.state.borrow().shape
     }
-
-    /// Record a descriptor-port token consume (`embed`/`positions`/`w_slot`/
-    /// `w_off`); the forward's consumer endpoint (overview §5.1).
-    pub(crate) fn claim_desc_take(&self, span: Span) {
-        self.state.borrow_mut().desc_takes.push(span);
+    /// The channel's global identity (declaration order). The
+    /// builder↔bridge contract: [`Traced::channel_order`](crate::Traced::channel_order)
+    /// lists these gids in dense declaration order, and the `inferlet` WIT bridge
+    /// orders its `forward-pass.new` handle list to match.
+    pub fn gid(&self) -> u64 {
+        self.state.borrow().gid
     }
-    /// Record a descriptor-port geometry/mask peek (exempt from the consumer count).
-    pub(crate) fn claim_desc_read(&self, span: Span) {
-        self.state.borrow_mut().desc_reads.push(span);
+
+    /// Record a host-writer/seed endpoint span on the trace side without staging
+    /// any data (the `inferlet` WIT bridge stages the bytes on the WIT channel
+    /// and calls this to keep the trace-side host-role derivation correct).
+    #[track_caller]
+    pub fn note_host_put(&self) {
+        self.state.borrow_mut().host_puts.push(Span::here());
     }
 
     /// `take()` — full ⇒ value + empty; empty ⇒ block. In-program: returns the

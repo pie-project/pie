@@ -1,0 +1,10 @@
+[package]
+name = "beam-devgeo"
+version = "0.1.0"
+description = "Overview §6.2 beam search, DEVICE-GEOMETRY form (B1): the guest beam epilogue traces the wire-form geometry in-graph — CSR page_indptr = CumSum(np) and densely-packed live pages — bound to the PageIndptr/Pages ports, so the driver reads the geometry directly with no host replay. Submitted via the inferlet::ptir bridge."
+authors = ["In Gim <in.gim@icloud.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]

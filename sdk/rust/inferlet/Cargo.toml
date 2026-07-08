@@ -18,13 +18,26 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 schemars = "0.8"
 pico-args = "0.5"
-sampling-edsl = { path = "../sampling-edsl", default-features = false }
+# The PTIR authoring DSL (eDSL + neutral trace Builder). Host-`cargo test`able,
+# wasm-buildable, no wit-bindgen (the single `wit_bindgen::generate!` stays here
+# in `inferlet`). The `inferlet::ptir` bridge wraps the WIT ptir resources and
+# drives this crate's `Builder`.
+ptir-dsl = { path = "../ptir-dsl" }
 
 [features]
+# A1/A4 transitional gate. The programmable-sampler authoring surface — the
+# `sampler`, `emit`, and `program` modules, the `sampling` re-export, and
+# `carrier`'s sampler-bound `submit_pass`/`submit_pass_with` — is built on the
+# `sampling-edsl` crate, which the PTIR refactor (4e2bf2e4) removed together
+# with the Sampling-IR. It is `#[cfg(feature = "sampling")]`-gated and OFF by
+# default so the crate compiles for the PTIR path (the A2 `inferlet::ptir`
+# bridge). Turning it back on requires restoring or replacing `sampling-edsl`
+# (deferred to A4, which decides the fate of the sampler surface). Keep-core
+# carrier mechanics (`discard_pass`, `next_inputs_drafts`) stay available.
+sampling = []
 # WS5 de-hardwiring: route the ergonomic `Sampler` enum through the Sampling-IR
 # (lower to an IR program via `sampling-edsl::sugar`) instead of the hardwired
 # WIT `sampler` variant. Off by default until the IR-JIT path is parity- and
-# perf-gated against the legacy CUDA kernels (hotel's removal gate). The
-# `Sampler::lower` / `SamplerSpec` bridge is always available; this flag gates
-# the in-loop swap.
-ir-sampler = []
+# perf-gated against the legacy CUDA kernels (hotel's removal gate). Depends on
+# the `sampling` surface (hence the `sampling-edsl` bridge).
+ir-sampler = ["sampling"]

@@ -1866,6 +1866,10 @@ struct ForwardDispatchInputs {
     int num_sampling = 0;
     bool is_pure_decode = false;
     bool have_custom_mask = false;
+    // Explicit KV-write descriptor present (device-geometry WSlot/WOff, B2).
+    // When set, the forward routes the per-layer KV append through the explicit
+    // (physical page, offset) kernel from pi.w_page/pi.w_off.
+    bool has_write_desc = false;
     bool small_spec_graph_shape = false;
     bool graph_shape_ok = false;
     bool tp_greedy_argmax = false;
@@ -2292,6 +2296,9 @@ ForwardDispatchResult run_forward_dispatch(
         fwd_in.is_pure_decode      = in.is_pure_decode;
         fwd_in.custom_mask_d        = in.have_custom_mask ? pi.custom_mask.data()        : nullptr;
         fwd_in.custom_mask_indptr_d = in.have_custom_mask ? pi.custom_mask_indptr.data() : nullptr;
+        fwd_in.w_page_d             = in.has_write_desc ? pi.w_page.data() : nullptr;
+        fwd_in.w_off_d              = in.has_write_desc ? pi.w_off.data()  : nullptr;
+        fwd_in.has_write_desc       = in.has_write_desc;
         fwd_in.slot_ids_h          = in.use_slots ? in.slot_ids_h_data : nullptr;
         fwd_in.is_fresh_h          = in.use_slots ? in.is_fresh_h_data : nullptr;
         fwd_in.slot_ids_d          = in.use_slots ? pi.slot_ids.data() : nullptr;
@@ -2458,6 +2465,7 @@ void handle_fire_batch(
     // stashed alongside so the TP broadcast knows how many bytes to fan
     // out to followers.
     bool have_custom_mask = false;
+    bool has_write_desc = false;
     int mask_bytes = 0;
     int mask_indptr_count = 0;
 
@@ -2835,6 +2843,21 @@ void handle_fire_batch(
             }
         }
 
+        // Explicit KV-write descriptor upload (device-geometry WSlot/WOff, B2).
+        // Parallels the mask pack above: when the program bound WSlot/WOff
+        // ports, the resolver filled fg.w_page/fg.w_off with per-lane PHYSICAL
+        // page ids + offsets for the single new-token K/V write. Upload them
+        // into the persistent pi.w_page/pi.w_off so the forward routes the
+        // per-layer KV append through launch_write_kv_explicit_bf16 instead of
+        // the standard page-derived write (beam fork/freeze correctness).
+        if (dg_resolved && fg.has_write_desc &&
+            !fg.w_page.empty() && fg.w_page.size() == fg.w_off.size() &&
+            fg.w_page.size() <= pi.w_page.size()) {
+            pi.w_page.copy_from_host(std::span<const std::uint32_t>(fg.w_page));
+            pi.w_off.copy_from_host(std::span<const std::uint32_t>(fg.w_off));
+            has_write_desc = true;
+        }
+
         // Linear-attention rs_cache slots. Runtime owns slot assignment;
         // RS-capable models must receive one slot id per request.
         std::vector<std::int32_t> slot_ids_h;
@@ -3209,6 +3232,7 @@ void handle_fire_batch(
                 .num_sampling = num_sampling,
                 .is_pure_decode = is_pure_decode,
                 .have_custom_mask = have_custom_mask,
+                .has_write_desc = has_write_desc,
                 .small_spec_graph_shape = small_spec_graph_shape,
                 .graph_shape_ok = graph_shape_ok,
                 .tp_greedy_argmax = tp_greedy_argmax,

@@ -1,476 +1,710 @@
-# Plan: Delete the PTIR beam hardwire, device-resolved geometry, multi-pass channels
+# Plan: PTIR layering refactor, device-geometry activation, boundary migration
 
-Status: approved direction, not started. Date: 2026-07-07.
-Scope: runtime (`runtime/src/ptir/*`), driver (`driver/cuda/*`), SDK (`sdk/rust/ptir`), ABI (`interface/driver/*`), WIT (`interface/inferlet/*` + 3 synced copies).
+Status date: 2026-07-08, as of commit `243f5b1e` (branch `dev`).
+This document contains ONLY remaining work. As-built history (the beam-hardwire
+workstreams W0-W3, the `pie_sampling_ir` -> `pie-ptir` migration, the executor
+sampling_ir removal, boundary Phase 0) lives in git: commits `4e2bf2e4`,
+`33d038bc`, `f2936467`, `243f5b1e`, and this file's own history.
+Companion spec: [boundary.md](boundary.md) is the runtime-driver boundary
+contract of record (decisions B1-B17, word layout, wake protocol); Track C
+below carries only its actionable migration phases.
 
-This document is a handover plan. It assumes no context beyond the repo; every claim
-is anchored to a file/line as of commit `33d038bc` (branch `dev`, with uncommitted
-work described in §2.1).
+Three tracks. A and C are independent; B is rooted at A.
 
----
-
-## 1. Goal
-
-Remove every beam-search-specific piece of host and driver code, and make beam an
-ordinary run-ahead PTIR program, by:
-
-1. Letting the **driver resolve forward geometry from the program's descriptor-port
-   channels at fire time** (today the host prefills it, and for beam the host
-   *replays the epilogue arithmetic* to do so).
-2. Making the **PTIR program compute wire-form geometry itself** (CSR page lists,
-   dense masks) so the driver's new code is a program-agnostic 1:1 port→field mapper.
-3. Making **channels first-class across forward passes**: one channel bindable to
-   many passes (draft→verify chaining etc.), which requires channel identity to be
-   global rather than per-program-instance.
-
-### 1.1 Non-negotiable architectural principles (owner's constraints)
-
-These override any implementation convenience:
-
-- **`pipeline.submit` must never block.** Run-ahead is the most important feature.
-  Fire t+1 may be submitted before fire t completes. (Already implemented for the
-  non-beam path, see §2.1.)
-- **The inferlet (traced PTIR program) does all heavy lifting. The driver is dumb
-  and general.** No program-specific assembly, CSR construction, or mask logic in
-  the executor. If a proposed driver change contains an algorithm name (e.g.
-  "beam"), the design is wrong.
-- **No beam-named files or symbols anywhere in `driver/cuda`** when this plan is
-  done. General mechanisms extracted from beam code must be renamed to describe
-  the mechanism.
-- **A channel/register must NOT be owned by one forward pass.** It must be
-  bindable to multiple passes.
+```
+Track A (SDK/WIT layering)   A1 -> A2 -> { A3, B1 } ;  A4 after A3 ;  A5 parallel
+Track B (device geometry)    B1 -> B3 -> B4 -> B5 ;  B2 parallel with B1
+Track C (boundary)           C1 -> C2 -> C3   (C2 touches ptir_host: sequence with B3)
+```
 
 ---
 
-## 2. Current state
+## 0. Where things stand (one paragraph per track)
 
-### 2.1 What is already implemented (uncommitted, this working tree)
+**A.** The IR crate is clean and final in shape: [interface/ptir](interface/ptir)
+(crate `pie-ptir`: op table, `TraceContainer` + canonical encoding,
+`registry::{Port, Stage}`, `validate::bind`, `interp`, sidecar). The SDK crate
+`sdk/rust/ptir` still squats on the `ptir` name and mixes the tracing eDSL with
+runtime objects that duplicate the host side of the WIT contract
+(`ForwardPass::trace` binds guest-side at
+[forward.rs:417](sdk/rust/ptir/src/forward.rs#L417); `WorkingSet` is a counter
+stub; `Pipeline` memoizes and does nothing). The WIT surface
+([ptir.wit](interface/inferlet/core/wit/ptir.wit): `channel`,
+`forward-pass.new(container-bytes, channels, kv-ws, rs-ws)`, `pipeline`) and the
+host behind it (non-blocking run-ahead submit, poison, pipeline-owned FIFOs,
+global channel ids, release markers) are built and verified; nothing guest-side
+drives them yet.
 
-The WIT surface was redesigned from a program-registry model to first-class
-objects, and the host side implements non-blocking run-ahead:
+**B.** All beam-deletion *mechanisms* are built and GPU-verified: global device
+channel registry, pre-forward descriptor resolver wired into the executor
+(`resolve_descriptors` at
+[executor.cpp:2556](driver/cuda/src/executor/executor.cpp#L2556), resolved
+`FireGeometry` feeds the active batch views, dense mask packed via
+`pack_dense_mask` at executor.cpp:2791-2827), tier-0 launcher coverage,
+`PageLease` (unit-tested, unwired), `map_geometry_relaxed`. What does not exist
+is the device-geometry *program* and its submission path: `detect_beam` /
+`fire_beam` / `BeamRun` / [ptir_beam.rs](runtime/src/ptir/ptir_beam.rs) (the
+host replay, and the sole home of the locked golden vectors) are still live.
 
-- **WIT** ([interface/inferlet/deps/core/ptir.wit](interface/inferlet/deps/core/ptir.wit),
-  synced to `interface/inferlet/core/wit/`, `sdk/rust/inferlet/wit/deps/core/`,
-  `sdk/tools/bakery/src/bakery/wit/deps/core/`): three resources.
-  - `channel` — guest-constructed `(shape, dtype, capacity)`; `put`/`take`/`read`.
-  - `forward-pass` — `new(container-bytes, channels, kv-working-sets, rs-working-sets)`;
-    decode+bind+validate happens here (hash-deduped compile/bind cache).
-  - `pipeline` — `constructor()`, `submit(fwd)` (non-blocking, run-ahead), `close()`.
-- **Host** ([runtime/src/ptir/ptir_host.rs](runtime/src/ptir/ptir_host.rs)):
-  - `submit` prepares (seed bind, host-put coalescing, KV/RS projection), calls
-    `submit_async`, pushes a `PendingFire` (oneshot rx + open `PtirKvTxn`/`PtirRsTxn`
-    + bound cells) onto the pass's FIFO, returns immediately. `committed_tokens`
-    advances optimistically at submit so fire t+1 prepares against t's post-state.
-  - `channel.take`/`read` are the await points: if the cell is empty, pop pending
-    fires FIFO, await + finalize (commit/abort txns, marshal outputs into cells),
-    recheck. `Empty` error only when no fire remains (a wasi-p2 guest is
-    single-threaded; truly blocking would self-deadlock — real cross-task blocking
-    is p3 follow-up).
-  - Fire failure: poisons the pass's host-reader channels with the error string
-    (first-poison-wins) and marks the pass `failed`; later submits error with the
-    root cause. Under non-blocking submit, poison IS the error channel.
-  - `ForwardPass::drop` drains all pending fires (pins safety).
-  - RS working sets wired: `ptir_rs_prepare`/`finalize` fill
-    `ForwardRequest.rs_slot_ids`/`rs_slot_flags` (RESET on first fire).
-- **v1 restrictions currently enforced in `HostForwardPass::new`** (to be lifted
-  by this plan): one channel binds to at most one forward-pass; exactly one
-  kv-working-set; at most one rs-working-set.
-- Known debt: unit-test target for the `pie` lib is blocked by a stale test module
-  in [runtime/src/api/inference.rs](runtime/src/api/inference.rs) owned by a
-  parallel migration (references deleted `sampling_edsl`); the SDK DSL
-  (`sdk/rust/ptir`) guest bridge to the new WIT is not wired; existing test
-  inferlets are intentionally NOT migrated.
-
-### 2.2 The beam hardwire (what this plan deletes)
-
-Beam §6.2 works today via **Design X, host replay**: the epilogue's geometry
-channels are device-produced, but the driver cannot read them into the next
-fire's geometry, so the host re-derives them.
-
-Runtime side:
-
-- [runtime/src/ptir/ptir_beam.rs](runtime/src/ptir/ptir_beam.rs) (~430 lines):
-  `BeamState::step` replays the freeze/heir/page-turn arithmetic host-side from
-  the harvested `out_par` channel; `BeamGeometry::{page_indptr,last_page_lens,
-  live_page_slots,masks}` convert [B,P] form to wire form. Contains the golden
-  vectors (`golden_charlie_fork_freeze_csrs`: `np=[3,2], pages=[5,6,7,5,6],
-  klen=[9,7]`) — these are the locked contract and must survive as tests elsewhere.
-- [runtime/src/ptir/ptir_host.rs](runtime/src/ptir/ptir_host.rs): `BeamRun`,
-  `detect_beam` (structural: WSlot/WOff ports present), `fire_beam` (~230 lines:
-  per-lane slot→physical resolution, `write_slot_shared_inplace` for heirs /
-  `cow_write_slot` for forks, folds B lanes with
-  `request::append_request_with_options`, fires via `submit_prebuilt_async`,
-  awaits inline — **synchronous by construction**, since fire t+1's geometry
-  needs t's harvested outputs), `beam_channel_u32`, placeholder prompt tokens
-  `vec![1u32; b]`, eager B*P working-set alloc in `new`.
-
-Driver side — an isolated island, **not wired into the serve path** (verified:
-`beam_attention_forward` and `beam_build_csrs` have no callers outside their own
-files and the two goldens; `executor.cpp` mentions beam only in comments):
-
-- [driver/cuda/src/ops/beam_attention.{cpp,hpp}](driver/cuda/src/ops/beam_attention.hpp)
-  — SEAM 1+3 orchestration (write→pack→custom-mask prefill). Its input contract
-  already expects **physical** page ids and **dense** kvm bytes.
-- [driver/cuda/src/ops/beam_csrs.{cpp,hpp}](driver/cuda/src/ops/beam_csrs.hpp)
-  — host CSR staging helper.
-- [driver/cuda/src/kernels/beam_mask_adapter.{cu,hpp}](driver/cuda/src/kernels/beam_mask_adapter.hpp)
-  — dense [B, P*PAGE] kvm → FlashInfer bit-packed mask (`launch_beam_pack_kvm`).
-  Signature is already lane-generic.
-- [driver/cuda/src/kernels/kv_paged.cu:136](driver/cuda/src/kernels/kv_paged.cu#L136)
-  `write_kv_beam_kernel` / `launch_write_kv_beam_bf16` (kv_paged.hpp:74) — writes
-  each lane's new-token K/V at an **explicit** `(w_page[B], w_off[B])` descriptor,
-  bypassing the standard geometry derivation. Already a general mechanism; only
-  the name is beam.
-- Goldens: `driver/cuda/tests/beam_csrs_test.cpp`, `tests/beam_mask_adapter_test.cu`
-  (CMakeLists.txt:261-262, 279, 628-636).
-
-### 2.3 Driver-side facts a new owner must know
-
-1. **PTIR programs already execute on device.** `PtirDispatch::run`
-   ([driver/cuda/src/ptir/ptir_dispatch.cu:65](driver/cuda/src/ptir/ptir_dispatch.cu#L65))
-   decodes/caches the container (`PtirProgramCache`), keeps persistent
-   per-instance state, applies host-puts, runs the trace via `Tier0Runner`,
-   harvests host-reader channels into `ForwardResponse.ptir_output_*`.
-   **But it is invoked only post-forward** (after logits), at
-   [executor.cpp:4732-4763](driver/cuda/src/executor/executor.cpp#L4732-L4763).
-   There is no pre-forward step that could source geometry from channels — that
-   is the central missing mechanism.
-2. **Channel storage is per-instance.** `ChannelArena`
-   ([driver/cuda/src/ptir/channels.hpp:112](driver/cuda/src/ptir/channels.hpp#L112))
-   is owned by `PtirInstance` (`program_runtime.hpp:106`), a single device blob
-   with per-channel rings (cap `kMaxRing=8`), full/empty bits, readiness/commit
-   kernels. This per-instance ownership is what forbids channel sharing across
-   passes (§4.3 replaces it).
-3. **The descriptor phase already exists in the runner.**
-   [tier0_runner.hpp:82-95](driver/cuda/src/ptir/tier0_runner.hpp#L82-L95) handles
-   §5.1 port consumption discipline (token family takes, geometry peeks) for
-   readiness/commit. Only the *value* read into forward geometry is missing.
-4. **The instance map leaks.** `PtirDispatch`'s `instances`
-   (`ptir_dispatch.cu:18-30`) has no eviction path. A release ABI is needed
-   regardless of this plan (W0.3).
-5. **The standard serve path already handles the beam wire shape.** `fire_beam`
-   ships a standard decode wire (physical `kv_page_indices`, `kv_last_page_lens`,
-   BRLE `masks`, 1 query/beam) via `submit_prebuilt_async`; the custom-mask
-   decode routing at [llama_like.cpp:343](driver/cuda/src/model/llama_like.cpp#L343)
-   serves it. This is why the beam_attention island can be deleted rather than
-   integrated.
-6. **The wire type** is `pie_driver_abi::ForwardRequest`
-   ([interface/driver/src/schema.rs:87](interface/driver/src/schema.rs#L87));
-   in-proc it crosses as a `#[repr(C)]` desc aliasing runtime heap
-   (`fill_forward_view`, [interface/driver/include/pie_driver_abi/view.hpp:464](interface/driver/include/pie_driver_abi/view.hpp#L464)).
-   PTIR fields: `ptir_program_hashes/_instances/_bytes/_sidecar_bytes`, seed table
-   `ptir_program_seed_*`, host-put table `ptir_program_host_put_*`
-   (schema.rs:326-363). Outputs return in
-   `ForwardResponse.ptir_output_*` (schema.rs:1466-1504), marshaled by
-   `finalize_fire` → `marshal_response`
-   ([runtime/src/ptir/ptir_channel_store.rs](runtime/src/ptir/ptir_channel_store.rs)).
-7. **Op coverage supports program-computed wire form.** The PTIR op set
-   ([interface/ptir/src/op.rs:99](interface/ptir/src/op.rs#L99)) already has
-   `CumSum`, `Gather`/`GatherRow`, `ScatterSet`/`ScatterAdd`, `Iota`, `Select`,
-   `Rem`, compares, `Reshape`. Result shapes must be trace-known, but scatter
-   *indices* may be data-dependent — which is exactly what CSR packing needs.
-   (Tier-0 *launcher* coverage for CumSum/ScatterSet/Gather must be audited: W1.2.)
-8. **The reference implementation of port→geometry mapping** is host-side
-   [runtime/src/ptir/ptir_geometry.rs `map_geometry`](runtime/src/ptir/ptir_geometry.rs#L74):
-   ports (`EmbedTokens/EmbedIndptr/Positions/Pages/PageIndptr/KvLen/Readout`) →
-   request fields, 1:1, program-agnostic. The driver's new pre-forward reader
-   (W1.1) is its device mirror. Port enum:
-   [interface/ptir/src/registry.rs:97](interface/ptir/src/registry.rs#L97).
+**C.** [boundary.md](boundary.md) Phase 0 (pie-waker module split) is committed.
+Phases 1-3 (accidental-complexity deletion, real frame layout + device word
+publish, activation) are pending.
 
 ---
 
-## 3. Target contracts
+## Track A: PTIR SDK/WIT layering refactor
 
-### 3.1 Ports carry wire-form geometry (the program does the math)
+### A.0 Target architecture
 
-Descriptor ports are defined to carry the forward's geometry **in final wire
-form**. The program (traced by the inferlet via the SDK) computes it; the driver
-only copies port values into the standard per-request fields.
+Three layers, one dependency direction:
 
-- **CSR-prefix contract**: for CSR port pairs, the indptr port's last element
-  defines the valid prefix length of the data port. Channels keep trace-known
-  fixed shapes (e.g. `pages: [B*P]`); the program densely packs live entries at
-  the front via `ScatterSet` with `CumSum`-derived destinations; the driver reads
-  `page_indptr[B]` entries and ignores the rest. General rule, no beam mention.
-- **AttnMask contract**: a dense u8/bool channel, one row per lane, valid span
-  per lane defined by `KvLen`. BRLE remains a *host wire* compression only; a
-  device-resident mask channel is consumed dense (packed to FlashInfer layout by
-  a general adapter, W1.3).
-- **`KvLen` = physical span**; the fixed derivation
-  `last_page_len = ((len-1) % page) + 1` stays in the generic mapper (it is port
-  semantics, not program policy — already the locked contract in `map_geometry`).
-- `WSlot`/`WOff` = explicit KV write descriptors (physical page id + in-page
-  offset per lane), consumed by the explicit write kernel (W1.4).
+```
+interface/ptir      crate pie-ptir     the IR (the multi-party contract)
+sdk/rust/ptir-dsl   crate ptir-dsl     tracer + eDSL (rename of sdk/rust/ptir)
+sdk/rust/inferlet   crate inferlet     WIT surface + author-facing objects
 
-### 3.2 Physical-space page ids (no slot→physical table)
+pie-ptir  <-  ptir-dsl  <-  inferlet  <-  inferlet programs
+    ^
+    +-- runtime (host bind/registry), echo, driver-side C++ mirror
+```
 
-Geometry channels operate on **physical page ids from the start**. The epilogue's
-freeze/heir arithmetic is pure gather/scatter on ids and does not care about the
-id space. The runtime seeds fire 0's pages and grants per-fire fresh pages as
-physical ids; the whole loop stays physical; the driver needs no translation
-table. Supporting evidence: the driver side already expects physical ids
-(beam_attention.hpp: "Pages/WSlot are PHYSICAL page ids (slot→physical resolved
-upstream)"), and `fire_beam` already ships physical ids on the wire today.
+- **`pie-ptir`**: unchanged in role. New in this refactor: `stage_key` (A5).
+- **`ptir-dsl`**: the embedded authoring language. Closures in, container bytes
+  out. No WIT, no wasm deps, host-`cargo test`-able, standalone. Tracing is its
+  implementation strategy, not its identity, hence the name (`ptir-trace`,
+  `ptir-capture`, `ptir-staging` rejected: mechanism-naming ages badly,
+  "capture" collides with forward-capture in the overview, "staging" collides
+  with `Stage`).
+- **`inferlet`**: the only home of the author-facing overview §3 surface
+  (`ForwardPass`, `Pipeline`, `WorkingSet`, `Channel` with host
+  `put`/`take().await?`). Wraps WIT resources, drives the ptir-dsl builder.
+  wasm32-wasip2 only; owns the single `wit_bindgen::generate!`.
 
-Correctness rests on the **freeze discipline**: a frozen (shared) page is never
-rewritten; forks write only into fresh granted pages; the heir continues the tail
-in place. This is structural in the epilogue program. Recommended cheap guard: the
-driver errors a fire whose `w_page` is outside the pass's leased set (a [B]-sized
-membership check against the lease list shipped per fire or tracked per instance
-— decide in W1.4; owner preference was to have the check).
+### A.1 Ratified design decisions
 
-### 3.3 Global channel identity (multi-pass channels)
+Debated and settled; recorded so they do not get relitigated.
 
-A channel is bindable to **multiple forward passes**. Three couplings must break:
+**D1. `ForwardPass`/`Pipeline`/`WorkingSet` are boundary objects, not DSL
+objects.** They name host-owned lifetime and semantics (submission ordering,
+slot allocation, bind identity). The DSL crate must not export them. The author
+still writes the overview surface verbatim; it lives in `inferlet`.
 
-1. Host: the `already-bound` validation in `HostForwardPass::new` (v1 restriction
-   — delete).
-2. Host: `PendingFires` is owned by the pass and `Channel.fires` is fixed at bind
-   — moves to the pipeline (§3.4).
-3. Device: `ChannelArena` owned by `PtirInstance` — replaced by a **global device
-   channel table**.
+**D2. The WIT `forward-pass` is one function, deliberately.**
+`new(container-bytes, channels, kv-working-sets, rs-working-sets)`. No builder
+methods (`embed`, `epilogue`, ...) at the WIT level:
 
-New model:
+- WIT cannot carry closures; stage bodies cross as bytes no matter what.
+- Stage ops reference channels by dense index internally; moving ports out of
+  the bytes does not remove the index table, it splits references in two styles.
+- Identity (C3 hash) needs one canonical artifact.
+- Validation is whole-pass; granular builders defer to a seal step anyway.
 
-- The runtime mints a **global channel id** (u64, unique per runtime; inferlet
-  scoped) when the WIT `channel` resource is constructed.
-- `forward-pass.new` builds a binding table `dense container index → global id`
-  per program; it owns nothing.
-- Driver: a device-side registry `global id → DeviceChannel { ring cells,
-  full/empty bits, decl }`. Allocated on first reference (decl comes with the
-  first program that binds it — validate decl equality on later binds).
-  `PtirInstance` holds views (index → table entry), not storage.
-- ABI additions (schema.rs + view.hpp + derive):
-  - per-program `ptir_program_channel_ids` (CSR over programs, parallel to the
-    existing per-program tables),
-  - re-key seeds / host-puts / outputs by **global channel id** instead of
-    program-local dense index,
-  - **release markers**: lists of channel ids and instance ids to free (fixes the
-    existing instance-map leak too). Ridden on any ForwardRequest, or on a
-    dedicated lightweight message if a request isn't imminent — decide in W0.3
-    (riding the next request is simpler; a pass/channel dropped with no further
-    fires can flush on the runtime's next heartbeat submit or on driver detach).
+The WIT pass resource is "identity + binding": decode, hash-dedup, bind against
+the ModelProfile, hold the handle table. Execution belongs to `pipeline` (the
+ordering domain). Everything per-step flows through `channel` resources. Seeds
+are not `new` arguments; a `put` staged on a seeded channel before the first
+submit is the seed.
 
-### 3.4 Pipeline is the ordering domain
+**D3. eDSL ops and intrinsics are IR vocabulary, not WIT.** Ops record IR
+nodes; they execute nowhere. WIT typing is shallower than the Rust eDSL's
+(Tensor vs Channel misuse is a Rust type error; through WIT everything degrades
+to handles). Intrinsics split three ways: stage values (`logits()`, `query()`,
+`layer`) and second-party kernels are pure IR ops (kernel availability is a
+bind-time property with fallback-as-different-program; WIT funcs would make a
+component naming a missing kernel fail at instantiation, foreclosing the
+fallback); model constants stay symbolic in the trace where the IR supports it,
+resolved at host bind, so one program hashes identically across backends; guest
+host-code needing concrete values (`ws.alloc(div_ceil(len, page_size))`)
+fetches them once at startup from the WIT `model` interface, replacing the
+`ptir::model::configure` global (which survives only for native tests).
+Verification story: Rust types at compile time, shared-crate lints at trace
+time guest-side, authoritative `bind` at `forward-pass.new` host-side; lint and
+bind live in `pie-ptir`, so guest and host run the same rules with zero drift.
 
-`PendingFires` moves from `ForwardPass` to `Pipeline` (currently a stateless
-struct in ptir_host.rs). Semantics:
+**D4. The container stays one monolithic canonical artifact.** Rejected:
+exploding ports/decls into WIT records with op streams as blobs. The canonical
+encoding cannot be eliminated (the C3 hash needs stable bytes, which WIT's
+canonical ABI does not provide, and the runtime -> driver ship is a process
+boundary with no WIT), so structured WIT would mean two representations plus
+reassembly glue. Port/stage/extern vocabulary evolves with the IR: in the
+container that is a wire-version byte (v1.1 externs encode as v1
+byte-identically when empty); in WIT, enum/variant extension is world-breaking,
+multiplied by the four synced WIT copies. Precedent: SPIR-V under Vulkan, PTX
+under CUDA, module bytes inside the component model. The current design is
+already the right hybrid: lifetime-crossing objects are WIT resources,
+trace-known data rides the artifact. Rule of thumb: WIT surface scales with
+runtime interaction points, never with language vocabulary. Mitigation for blob
+legibility: a `pie-ptir` disassembler (unscheduled, see A.6).
 
-- Fires submitted to the same pipeline are issued to the **same CUDA stream in
-  submission order**. Therefore: fire t's epilogue channel puts happen-before
-  fire t+1's descriptor reads — the entire run-ahead correctness argument, now
-  extended across passes.
-- `take`/`read` await the pending-fire FIFO of the pipeline that feeds the
-  channel (the channel records the pipeline at submit).
-- **v1 constraint**: all passes binding a given channel must be submitted on the
-  same pipeline. Checked at `submit`; cross-pipeline sharing is an error.
-- Poison unchanged: a failed fire poisons the channels it feeds; other passes
-  sharing those channels observe the same poison (correct — the value they would
-  consume is gone). Pass-level `failed` flag stays per-pass.
-- WIT: **no signature changes.** Only the doc line "a channel already bound to
-  another forward-pass (one pass per channel for now)" is removed from
-  `forward-pass.new`'s doc comment; sync all 4 WIT copies.
+**D5. Identity is two-level.** The overview §5.3: "a pass's identity is the
+tuple of its stage traces, and instances co-batch stage by stage". The C3
+container hash is the pass-level key (dedup, compile/bind cache, steady-state
+submit, driver ship; what
+[ptir_registry.rs](runtime/src/ptir/ptir_registry.rs) keys its LRU by).
+Per-stage batch keys are derived, host-side, post-bind: raw byte-equality of a
+`StageProgram` section does not capture "same epilogue" across passes (ops
+reference the pass-global dense channel table), so the key is a normalization:
+renumber channel refs in stage-local first-use order, attach referenced-channel
+signatures and resolved types from the sidecar, hash the canonical form. This
+refactor only cuts the seam (A5); scheduler use is future work. Batch keys
+never cross the wasm boundary, so this is orthogonal to D4.
 
-### 3.5 Device-resolved geometry fires
+**D6. The guest does not bind.** Remove `bind(container, model::profile())`
+from the guest trace path; keep span lints. Authoritative validation is
+`forward-pass.new`'s result. `bind` + interp remain for native parity tests
+behind dev-deps/features.
 
-For a program whose descriptor ports bind channels (device-produced geometry):
+**D7. The classic `forward-pass` (inference.wit) is retired, not reshaped.**
+Every func on it is a remnant of the pre-channel model, where the host replayed
+the decode carry. Mapping:
 
-- The runtime sends the wire's `token_ids`/`positions`/`qo_indptr`/`kv_page_*`/
-  `masks` **empty** and marks the fire solo (`submit_prebuilt_async` /
-  scheduler `prebuilt` flag, [runtime/src/scheduler.rs:698](runtime/src/scheduler.rs#L698)
-  — the batcher cannot co-batch what it cannot see). Host-known/const ports may
-  still be prefilled by `map_geometry` as today.
-- The driver resolves the ports pre-forward (W1.1) and feeds the **standard**
-  batch/attention machinery.
-- **Not-ready is an error, not a wait**: on a solo fire, if a descriptor channel
-  is not full (the producing fire failed), nothing will ever fill it — the driver
-  must fail the fire (not Tier0's silent dummy-run). The runtime's poison plumbing
-  (§2.1) surfaces it to the guest.
-- Scheduler/workspace sizing uses **static bounds from the container's channel
-  decls** (e.g. nnz ≤ B from the embed channel's shape) since the host no longer
-  knows exact per-fire geometry.
+| classic func | PTIR replacement |
+|---|---|
+| `input-tokens(tokens, positions)` | `embed` port (toks channel + indptr) + `positions` port |
+| `attention-mask(list<brle>)` | `attn-mask` port (bool channel, packed on the wire); BRLE dies |
+| `output-speculative-tokens(flag)` | `readout` port |
+| `next-inputs` / `next-attention-mask` / `set-pipeline-source-kind` / `fresh-generate` | deleted with nothing in their place: loop-carried channel ping-pong IS the carrier (`tok.put(t)` is next-inputs; a `prev_drafts` channel is the drafts carrier-kind; no host-pending carrier state exists to need fresh-generate) |
+| `kv-working-set(set, inp-start, ...)` scalar geometry | `attn_working_set` port family (pages/page_indptr/kv_len/w_slot/w_off channels) |
+| `execute` | `pipeline.submit` |
+| `input-image` / `input-audio` | SURVIVES in shape: resources cannot ride in bytes, so media splice becomes embed-family ports plus parallel handle lists on `new` (e.g. `images: list<borrow<image>>`). Future additive change. |
+| `rs-fold-buffered(tokens)` | OPEN: rs descriptor port vs channel-fed (A.7) |
 
----
+`grammar`/`matcher` stay: `matcher.mask()` produces the words the guest puts
+into the grammar-mask channel on both paths.
 
-## 4. Workstreams
+**D8. Naming: `ptir-dsl`.** `pie-ptir` defines the language, `ptir-dsl` is its
+embedded surface, `inferlet` is the runtime binding.
 
-Dependency graph: W0 → W1 → (integrate) ← W3;  W2 ∥ (W0,W1);  W4 last.
-W2 is CPU-only (no GPU needed); W0/W1 need CUDA + coordination with the driver
-owner (goldens); W3 is runtime-only Rust.
+### A.2 Code disposition (current `sdk/rust/ptir/src/`)
 
-### W0 — Driver + ABI: global channel table and release ABI
+| current | disposition |
+|---|---|
+| `value.rs`, `intrinsics.rs`, `dtype.rs` | stay in `ptir-dsl` (eDSL surface) |
+| `context.rs` (session recorder, channel interning) | stays |
+| `channel.rs` | split: trace-side declaration + endpoint-span recording stays; host transport goes to the `inferlet` wrapper |
+| `lint.rs`, `error.rs` | stay |
+| `forward.rs` port setters (`embed`/`positions`/`attn_working_set`/`attn_mask`/`readout`) + `Indptr`/`AttnWsArgs` sugar | move to `inferlet` `ForwardPass`; internally call the neutral builder |
+| `forward.rs` stage attachments + trace-once cache | move to `inferlet` `ForwardPass` (lifecycle owner) |
+| `forward.rs` `assemble()` machinery: gid re-key, HostRole derivation, terminal-output inference, reader auto-drain drop, decl building | stays as `builder.rs`: `bind_port(Port, PortSource)`, `stage(Stage, closure)`, `build() -> Traced` |
+| `forward.rs` `bind(...)` call + `TracedForward::bound()` | deleted from guest path (D6); `Traced` = container bytes + dense-order channel identities + names |
+| `forward.rs` `WorkingSet`/`SlotGrant`/`Remap` | deleted; `inferlet` wraps `kv-working-set` (`alloc-slots`/`free-slots`, real stable slot ids) |
+| `pipeline.rs` | deleted; `inferlet` wraps the WIT `pipeline` |
+| `model.rs` | demoted to test-only; builder takes model constants as inputs; guest uses the WIT `model` interface |
 
-*Prerequisite for W1 (write the port reader against the new table from the start;
-don't build it on the per-instance arena and refactor twice).*
+### A.3 Steps
 
-- W0.1 Replace per-instance `ChannelArena` ownership with a device channel
-  registry keyed by global channel id (§3.3). `PtirInstance` keeps a
-  `dense idx → registry entry` view. Preserve the ring/bits/readiness kernel
-  machinery (channels.hpp) — it moves, it doesn't change.
-- W0.2 ABI: add `ptir_program_channel_ids`; re-key `ptir_program_seed_*`,
-  `ptir_program_host_put_*`, `ptir_output_*` by global id. Update schema.rs,
-  the `#[schema]` derive, view.hpp `fill_forward_view`, and the runtime writers
-  (`PtirInstance::submission`, `drain_host_puts`, `marshal_response`).
-- W0.3 Release markers for channels + instances (fixes the pre-existing
-  `instances` leak). Runtime sends them from `Channel::drop` / `ForwardPass::drop`.
-- Verify: existing PTIR e2e (greedy decode) unchanged; a new driver unit test:
-  two instances binding the same channel id observe the same cell.
+**A1: carve `ptir-dsl` out of `sdk/rust/ptir`.** — **DONE** (commit follows).
+Crate renamed (`sdk/rust/ptir` → `sdk/rust/ptir-dsl`, package/lib `ptir_dsl`);
+neutral `builder.rs` extracted (`Builder::{bind_port, stage, build, debug_container}`,
+`PortInput`, `Traced`); `ForwardPass`/`WorkingSet`/`SlotGrant`/`Remap`/`pipeline.rs`
+and the guest `bind` call deleted (D6: `build()` lints only, native parity tests
+bind explicitly). Byte-identity verified: the §3/§6.2/§6.1 goldens hash-match and
+the §3 container is sha256-identical to the pre-A1 bytes. Consumer inferlets
+(`beam`, `mtp-grammar`) repointed at `ptir-dsl` but still author via `ForwardPass`
+→ migrated in A3.
+1. `git mv sdk/rust/ptir sdk/rust/ptir-dsl`; rename crate. Fix path deps
+   (`rg -l "sdk/rust/ptir\b"` over Cargo.tomls; check `runtime/tests`, executor
+   crates).
+2. Extract `builder.rs` from `forward.rs::assemble()`/`record()`. Keep the gid
+   re-key, HostRole derivation, terminal-output inference, and reader
+   auto-drain drop verbatim (subtle; see A.5). `build()` runs lints only.
+3. Delete `WorkingSet`/`SlotGrant`/`Remap`, `pipeline.rs`, the `bind` call,
+   `ForwardPass` itself. Keep a `debug_container()` equivalent.
+4. Gate `bind`/interp parity tests behind dev-deps (the `eval` feature dep
+   exists). Container-hash goldens must not move: byte-identical output is the
+   acceptance test for the extraction.
+5. `model.rs`: explicit constants passed to the session/builder; test-only
+   `configure` shim if it reduces churn.
 
-### W1 — Driver: generic pre-forward port reader; de-beam the driver tree
+**A2: the `inferlet::ptir` bridge.**
+1. New module `sdk/rust/inferlet/src/ptir/` (namespaced: the classic
+   `ForwardPass` wrapper exists elsewhere in the crate until A4).
+2. `Channel`: owns the trace declaration and the WIT `channel` resource,
+   constructed from the same `(shape, dtype, capacity)` so decl validation in
+   `forward-pass.new` passes by construction. In-program use delegates to the
+   trace side. Host-side `put` records the host-endpoint span on the trace side
+   AND forwards to the resource (the span feeds HostRole derivation, A.5).
+   `take()`/`read()` are async, surface poison as `Err`.
+3. `WorkingSet`: wraps `kv-working-set` (`alloc(n)` -> `alloc-slots`, `free` ->
+   `free-slots`, `page_size()` from model/resource). `SlotGrant` stays puttable
+   into channels as data.
+4. `ForwardPass`: verbatim overview surface; holds closures + port specs; on
+   first `submit` drives the builder, orders WIT channel handles by
+   `Traced.channel_order`, calls `forward-pass.new(...)`, memoizes the
+   resource. Bind errors surface here.
+5. `Pipeline`: wraps WIT `pipeline`; `submit` ensures the bound pass exists
+   then delegates; `close()` delegates.
+6. `inferlet::ptir::prelude` re-exports the eDSL plus the four wrapper types.
 
-- W1.1 **Pre-forward descriptor resolution** (the core mechanism). Split PTIR
-  handling into `resolve_descriptors(view) → FireGeometry` (pre-forward) +
-  existing `PtirDispatch::run` (post-logits epilogue). For each program whose
-  ports bind channels: read the port channels' current cells (v1: D2H of a few
-  hundred bytes — [B]/[B,P] cells; same-stream ordering makes this correct under
-  run-ahead) and fill `FireGeometry { token_ids, positions, qo_indptr,
-  kv_page_indices, kv_page_indptr, kv_last_page_lens, w_page, w_off, mask }`
-  applying the CSR-prefix and KvLen contracts (§3.1). Program-agnostic: it is
-  the device mirror of `map_geometry` — keep the two in explicit correspondence
-  (same port→field table). Feed the standard executor batch assembly
-  (fwd_in.* at executor.cpp:1197-1204) instead of the wire fields.
-- W1.2 **Tier-0 launcher audit**: ensure `CumSum`, `ScatterSet`, `Gather`,
-  `Iota`, `Rem`, `Select` have device launchers in
-  [tier0_launch.hpp](driver/cuda/src/ptir/tier0_launch.hpp) (the beam program
-  needs them to compute wire form, W2). Add any missing as plain generic ops.
-- W1.3 **Generalize the mask adapter**: rename `beam_mask_adapter` →
-  `pack_dense_mask` (kernels/), same kernel; it is the general "dense device mask
-  → FlashInfer packed" mechanism for any `AttnMask`-port program. Re-point its
-  golden test.
-- W1.4 **Rename the explicit KV write**: `write_kv_beam_kernel` /
-  `launch_write_kv_beam_bf16` → `write_kv_explicit_*` (semantics: "write where
-  the descriptor says"). Wire it to W1.1's `w_page`/`w_off`. Add the lease
-  membership guard (§3.2) if adopted.
-- W1.5 **Delete the beam island**: `ops/beam_attention.{cpp,hpp}`,
-  `ops/beam_csrs.{cpp,hpp}`, `tests/beam_csrs_test.cpp`; strip CMakeLists
-  entries. Re-target the golden *vectors* (§5) at the generic path.
-- W1.6 **Not-ready → fire error** (§3.5): a solo device-geometry fire with an
-  unfull descriptor channel returns a fire error carried in the normal error
-  path (runtime poisons readers).
-- End-state check: `grep -ri beam driver/cuda/src --include='*.cpp' ...` finds
-  no *symbols/files* (incidental comments describing history are acceptable but
-  prefer scrubbing). Optionally add this grep as a CI gate.
+**A3: migrate test inferlets** (`runtime/tests/inferlets/ptir-sdk-greedy` and
+other PTIR-path tests) to `inferlet::ptir::prelude`. Native goldens stay in
+`ptir-dsl`/`pie-ptir`.
 
-### W2 — SDK: the beam program computes wire-form geometry (parallel with W0/W1)
+**A4: retire the classic forward-pass** (separate PR series). Once the bridge
+covers the test matrix: delete the classic `forward-pass` resource from
+`inference.wit` (keep `grammar`/`matcher`), the host implementation, the
+carrier machinery (`pipeline-source-link` accumulate, retained buffers), the
+SDK modules built on it (`carrier.rs`, classic parts of
+`sampler.rs`/`prefill.rs`/`program.rs`), and the driver's remaining classic
+carrier code (the `sampling_ir/{next_input,tensor_io,frame_carrier}.hpp`
+includes and the `NextInputLink` injection around
+[executor.cpp:3079](driver/cuda/src/executor/executor.cpp#L3079); note
+`frame_carrier` is ALSO Track C's X2 mechanism, so only the classic-carrier use
+dies here, coordinate with C). Blocked on: media splice ports (D7) or an
+explicit decision to keep classic alive only for multimodal inferlets interim.
 
-- W2.1 Extend the §6.2 beam epilogue trace so the arithmetic currently in
-  `BeamGeometry`'s host methods is in-graph:
-  - `page_indptr` = `CumSum(np)` with a leading 0 (`ScatterSet` into a `[B+1]`
-    zeros + `Iota` destinations),
-  - packed live pages = `ScatterSet` of the `[B,P]` matrix's live entries into a
-    `[B*P]` channel at `CumSum`-derived destinations,
-  - `klen`, `kvm` (dense), `w_slot`, `w_off`, `out`, `out_par` already emitted;
-    bind `kvm` to the `AttnMask` port; `EmbedIndptr` stays const `[0..=B]`.
-  - All ids in physical space (§3.2); the `fresh` channel receives host-granted
-    physical ids.
-- W2.2 Goldens: port the vectors from
-  [ptir_beam.rs tests](runtime/src/ptir/ptir_beam.rs#L287) — especially
-  `golden_charlie_fork_freeze_csrs` (`np=[3,2]`, `pages=[5,6,7,5,6]`,
-  `klen=[9,7]`, `w_slot=[7,6]`, `w_off=[0,2]`, `w_cont=[false,true]`) and the
-  continue-tail / page-turn cases — into SDK trace tests: run the extended
-  program through the CPU reference interpreter and assert the emitted wire-form
-  port values. These vectors ARE the contract; they must exist somewhere before
-  W4 deletes ptir_beam.rs.
-- W2.3 D4 compaction is **out of scope** (see Follow-ups); v1 documents the
-  constraint: size P for the run's max length, or accept `np ≤ P` growth bounds
-  without repeated-fork densification.
+**A5 (parallel, small): `stage_key` in `pie-ptir`.** — **DONE** (commit follows).
+Implemented the D5 normalization in [interface/ptir/src/stage_key.rs](interface/ptir/src/stage_key.rs)
+(`stage_key(bound, stage)` / `stage_key_at`): stage-local first-use channel
+renumbering, referenced-channel resolved signatures + resolved SSA value types,
+FNV-1a over a `PTSK`-domain-separated canonical form. Golden tests green (same
+epilogue in two passes → equal keys; one-op diff → different keys; differently
+typed referenced channels → different keys). Sidecar carriage of per-stage keys
+left as the documented follow-up (A.6 item 4).
+Original: implement the D5
+normalization with golden tests (same epilogue embedded in two different passes
+yields equal keys; a one-op difference yields different keys). Optional:
+sidecar carriage of per-stage keys.
 
-### W3 — Runtime: pipeline-owned fires, multi-pass channels, page leasing
+### A.4 WIT copy sync
 
-- W3.1 **Move `PendingFires` from `ForwardPass` to `Pipeline`** (mechanical over
-  the existing run-ahead implementation; semantics unchanged for the
-  single-pass case). `Channel` records the feeding pipeline at submit;
-  `take`/`read` await that pipeline's FIFO. Enforce the same-pipeline
-  constraint at submit (§3.4). `Pipeline::drop`/`close` drains its FIFO (the
-  pins-safety drain currently in `ForwardPass::drop` follows the queue).
-- W3.2 **Lift the one-pass-per-channel restriction** in `HostForwardPass::new`
-  (delete the already-bound check; keep decl validation per container, and keep
-  duplicate-handle-within-one-pass detection). Remove the WIT doc line; sync 4
-  copies. Seeds: a seeded channel's staged put is consumed by the first fire of
-  whichever pass ships that channel first (seed table now keyed by global id,
-  W0.2).
-- W3.3 **PageLease** (per device-geometry pass): grant B physical pages at fire 0
-  (seed values), B fresh per submit delivered as a host-put on the `fresh`
-  channel (existing D1 coalescing path); reclaim unused grants at
-  `finalize_fire` by reading the harvested `w_cont` (host-reader channel);
-  reclaim everything on pass drop/failure. Pin float is bounded by
-  (run-ahead depth) × B pages. Pins ride the existing per-fire arena txns.
-- W3.4 **Unify submit**: delete the `detect_beam`/`fire_beam` branch. For
-  device-bound ports, relax `map_geometry`'s `MissingChannelValue` gate
-  ([ptir_geometry.rs:155](runtime/src/ptir/ptir_geometry.rs#L155)) to "leave the
-  wire field empty"; mark the fire solo/prebuilt. Assert the FIFO invariant:
-  fires of one pipeline keep submission order through the scheduler onto one
-  stream (this is the whole correctness story — make it an explicit, tested
-  invariant, not an accident).
-- W3.5 **Shadow verify (bring-up safety net)**: keep `ptir_beam.rs` alive for
-  one phase; in `finalize_fire`, debug-compare harvested geometry channels
-  (pages/np/klen) against the host replay. Run N steps green on the 4090
-  before W4.
+`interface/inferlet/core/wit` is the source; synced copies at
+`interface/inferlet/deps/core/`, `sdk/rust/inferlet/wit/deps/core/`,
+`sdk/tools/bakery/src/bakery/wit/deps/core/`. Any WIT change lands in all
+copies in the same commit.
 
-### W4 — Deletion (single commit, after shadow green)
+### A.5 Invariants and gotchas
 
-Runtime:
-- `runtime/src/ptir/ptir_beam.rs` — entire file (goldens live in W2.2 by now).
-- In `ptir_host.rs`: `BeamRun`, `detect_beam`, `fire_beam`, `beam_channel_u32`,
-  `ForwardPass::beam`, placeholder toks (`vec![1u32; b]`), eager B*P alloc,
-  the submit branch. (`submit_prebuilt_async` STAYS — it is the solo-fire carrier.)
-- `KvWorkingSet::write_slot_shared_inplace` if no other caller remains.
+- **Dense channel order.** The recorder interns channels in first-reference
+  order but the container is re-keyed to gid (declaration) order, remapping
+  every `ChanTake`/`ChanRead`/`ChanPut` and `PortSource::Channel`
+  ([forward.rs:295-330](sdk/rust/ptir/src/forward.rs#L295)). The bridge's
+  handle list must follow exactly this order; `Traced.channel_order` is the
+  contract between builder and bridge.
+- **HostRole derivation depends on pre-trace host endpoint spans.**
+  `host_role = Writer` requires a host `put` recorded before the trace runs
+  (the primed `mask_0` put in the software-pipelined loop). A host `take`
+  typically happens only after the first submit, which is why terminal-output
+  inference exists (program-produced, no program consumer, no descriptor use,
+  no host put, not seeded => Reader;
+  [forward.rs:349-367](sdk/rust/ptir/src/forward.rs#L349)). Preserve both
+  rules; the bridge wrapper must keep recording host endpoints on the trace
+  side even though the transport is the WIT resource.
+- **Reader auto-drain drop.** The tracer's auto-drain `ChanTake` for
+  host-Reader channels must be dropped or `bind` flags SecondConsumer
+  ([forward.rs:379-397](sdk/rust/ptir/src/forward.rs#L379)).
+- **Seeds.** `Channel::from(v)` = constructor + staged put; `seeded` today is
+  `st.seeded || (has_host_put && has_prog_put)`; first submit with a missing
+  seed errors host-side.
+- **Hash stability.** A1 must be a pure motion refactor for the container
+  bytes: same DSL program, byte-identical container, same C3 hash.
+- **Single `wit_bindgen::generate!`** (in `inferlet`). `ptir-dsl` must never
+  depend on wit-bindgen or generated types.
+- **`ptir-dsl` stays wasm-free and workspace-standalone**; `pie-ptir`'s `eval`
+  feature stays dev-only.
+- **`pipeline.submit` must never block** (owner constraint). The bridge submit
+  is enqueue-only; `take`/`read` are the await points.
 
-Driver (done in W1.5 but verify nothing crept back):
-- `ops/beam_attention.*`, `ops/beam_csrs.*`, `tests/beam_csrs_test.cpp`;
-  `beam_mask_adapter` and `write_kv_beam` exist only under their generic names.
+### A.6/A.7 Open questions
 
-### Follow-ups (recorded, out of scope)
-
-- **D4 compaction** under the same principle: the program computes the gather
-  plan (densify pages when repeated forks would exceed P) and emits it on
-  channels; the driver provides one generic KV-gather mechanism. Until then the
-  P-bound constraint of W2.3 applies.
-- Device-side geometry assembly without the D2H hop (performance).
-- Co-batching device-geometry fires with other requests (v1 is solo).
-- True blocking `take` across guest tasks (wasi-p3).
-- SDK DSL → new WIT guest bridge; migrating the test inferlets.
-
----
-
-## 5. Verification plan
-
-1. **W0**: existing ptir-greedy e2e unchanged; shared-channel driver unit test.
-2. **W1**: charlie's three beam goldens (continue-tail / page-turn / fork-freeze)
-   re-targeted: seed channels on an instance, run `resolve_descriptors`, assert
-   the produced geometry equals the locked vectors (source of truth in §2.2 /
-   W2.2). Mask adapter golden re-pointed at the generic name.
-3. **W2**: SDK trace tests assert the program's emitted wire-form port values
-   equal the same vectors (CPU reference interpreter).
-4. **W3**: channel-store and host unit tests extended for pipeline-owned FIFOs,
-   same-pipeline enforcement, multi-pass binding, lease reclaim; then
-   [bin/pie/tests/cuda_beam_e2e.rs](bin/pie/tests/cuda_beam_e2e.rs) rerouted
-   through the ordinary run-ahead submit; shadow verify green for N steps.
-5. **W4**: full e2e green with the replay deleted; grep gate clean.
+1. rs-fold home: rs descriptor port family vs a channel the pass drains.
+   Decide before hybrid/linear-attention models migrate off classic.
+2. Media splice timing: embed-family ports + parallel handle lists on `new`,
+   needed before classic deletion (or accept interim classic for multimodal).
+3. How far to push symbolic model constants: `ChanDType` supports a
+   model-intrinsic dtype; symbolic dims (`[vocab]`-shaped channels) may need IR
+   support to keep hashes backend-portable. Interim: concrete dims from the
+   WIT model interface, accepting per-backend hashes.
+4. Sidecar carriage of stage keys (A5): runtime-derived only, or shipped.
+5. `pie-ptir` disassembler/text format (D4 mitigation): unscheduled.
 
 ---
 
-## 6. Risks and open decisions
+## Track B: device-geometry activation and beam deletion endgame
 
-- **Stream/FIFO ordering is the entire correctness argument** for both run-ahead
-  and multi-pass chaining. If the scheduler reorders a pipeline's fires or splits
-  them across streams, t+1 reads stale/empty descriptor cells. W3.4's asserted
-  invariant is mandatory, not advisory.
-- **Freeze discipline** is assumed, not enforced, unless the W1.4 lease guard is
-  adopted (recommended; one [B] membership check per fire).
-- **Decl conflicts on shared channels**: two containers binding the same global
-  channel id must declare identical shape/dtype/capacity; validate at bind
-  (W0.1) with a clear error.
-- **Ring capacity** (`kMaxRing=8`, channels.hpp:106) bounds run-ahead depth per
-  channel; a deeper pipeline back-pressures at submit-prepare time (host-put
-  staging) — acceptable, but document it.
-- **Who reclaims shared channels**: with multi-pass binding, a channel's device
-  storage frees on the WIT resource drop (release marker), not on any pass drop.
-  Passes keep cells alive only through the runtime's `Arc<Mutex<ChannelCell>>`
-  host mirror — device lifetime follows the resource, host mirrors follow Arc.
-- **Coordination**: W0/W1 touch the driver owner's (charlie's) goldens and the
-  4090 bring-up slot is the schedule bottleneck. W2 needs no GPU; start it first.
-- Parallel in-flight migration (X2 bridge / `pie_sampling_ir` → `pie-ptir`,
-  `forward_prepare` → `paging` rename) owns
-  [runtime/src/api/inference.rs](runtime/src/api/inference.rs)'s stale test
-  module; don't fix it from this workstream, and don't revert the `paging` rename.
+Owner constraints (unchanged): `pipeline.submit` never blocks; the inferlet
+does all heavy lifting, the driver is dumb and general (no algorithm names in
+driver changes); no beam-named files/symbols in `driver/cuda` at the end; a
+channel is bindable to multiple passes.
+
+### B.0 Target contracts still to build against
+
+- **Ports carry wire-form geometry; the program does the math.** CSR-prefix
+  contract: for CSR port pairs the indptr port's last element defines the valid
+  prefix of the data port; channels keep trace-known fixed shapes
+  (`pages: [B*P]`), the program densely packs live entries at the front
+  (`ScatterSet` at `CumSum`-derived destinations), the driver reads
+  `page_indptr[B]` entries and ignores the rest. `KvLen` = physical span;
+  `last_page_len = ((len-1) % page) + 1` stays in the generic mapper.
+  `WSlot`/`WOff` = explicit physical write descriptors. AttnMask = dense
+  u8/bool channel, BRLE remains host-wire-only compression.
+- **Physical-space page ids everywhere** (no slot->physical table). The
+  runtime seeds fire 0's pages and grants per-fire fresh pages as physical ids.
+  Correctness rests on the freeze discipline (frozen pages never rewritten;
+  forks write only into fresh grants; the heir continues the tail in place).
+  Cheap guard (still undecided, owner leaned yes): driver errors a fire whose
+  `w_page` is outside the pass's leased set.
+- **Device-geometry fires are solo**: wire geometry ships empty, fire marked
+  solo/prebuilt (scheduler `prebuilt` flag,
+  [scheduler.rs:698](runtime/src/scheduler.rs#L698)); not-ready descriptor =
+  fire error (implemented in the resolver), surfaced through poison.
+  Scheduler/workspace sizing uses static bounds from the container's channel
+  decls.
+
+### B.1 (ROOT) Author the device-geometry beam program on the new bridge
+
+Blocked on A1+A2. A guest-authored beam epilogue tracing the geometry to
+wire form in-graph, submitted end to end through
+`forward-pass.new`/`pipeline.submit`:
+
+- `page_indptr` = `CumSum(np)` with a leading 0 (`ScatterSet` into `[B+1]`
+  zeros at `Iota` destinations); packed live pages = `ScatterSet` of the
+  `[B,P]` matrix's live entries into a `[B*P]` channel at `CumSum`-derived
+  destinations; `klen`, dense `kvm` (bound to the `AttnMask` port), `w_slot`,
+  `w_off`, `out`, `out_par` as already traced in the driver golden
+  (`beam_epilogue` in `ptir_golden_exec_test` proves the op coverage);
+  `EmbedIndptr` stays const `[0..=B]`.
+- All ids physical; the `fresh` channel receives host-granted physical ids
+  (the host-put convention B3 wires).
+- D4 compaction stays out of scope: size P for the run's max length, or accept
+  `np <= P` growth bounds (follow-ups).
+
+### B.2 Driver: finish the explicit-KV-write wiring (parallel with B1)
+
+`fg.w_page`/`fg.w_off` are resolved
+([fire_geometry.hpp](driver/cuda/src/ptir/fire_geometry.hpp) `has_write_desc`)
+but nothing calls `launch_write_kv_explicit_*`
+([kv_paged.cu](driver/cuda/src/kernels/kv_paged.cu)) from the forward path:
+route the KV append through the explicit kernel when `has_write_desc`, instead
+of the standard geometry derivation. Add the lease membership guard here if
+adopted (one [B] membership check per fire against the leased set).
+
+### B.3 Runtime: unified device-geometry submit (delete the beam branch)
+
+- Delete `detect_beam`/`fire_beam`/`BeamRun` submit branch in
+  [ptir_host.rs](runtime/src/ptir/ptir_host.rs); for device-bound ports use
+  `map_geometry_relaxed` (leave wire fields empty), mark the fire
+  solo/prebuilt, submit via `submit_prebuilt_async` (it stays: it is the
+  solo-fire carrier).
+- Wire `PageLease` ([ptir_lease.rs](runtime/src/ptir/ptir_lease.rs), built and
+  unit-tested): grant B physical pages at fire 0 (seed values), B fresh per
+  submit delivered as a host-put on the program's fresh-page channel (existing
+  D1 coalescing path), reclaim unused grants at `finalize_fire` by reading
+  harvested `w_cont`, reclaim everything on pass drop/failure. Pin float
+  bounded by run-ahead depth x B pages, riding the per-fire arena txns.
+- **Assert the FIFO invariant**: fires of one pipeline keep submission order
+  through the scheduler onto one stream. This is the entire correctness
+  argument for run-ahead and multi-pass chaining; make it an explicit, tested
+  invariant, not an accident.
+
+### B.4 Goldens and shadow verify
+
+- Port the locked golden vectors from
+  [ptir_beam.rs](runtime/src/ptir/ptir_beam.rs) tests into SDK trace tests
+  (ptir-dsl + CPU reference interp): `golden_charlie_fork_freeze_csrs`
+  (`np=[3,2]`, `pages=[5,6,7,5,6]`, `klen=[9,7]`, `w_slot=[7,6]`,
+  `w_off=[0,2]`, `w_cont=[false,true]`) plus the continue-tail and page-turn
+  cases. These vectors ARE the contract; they must exist outside ptir_beam.rs
+  before B5 deletes it.
+- Shadow verify: keep ptir_beam.rs alive one phase; in `finalize_fire`,
+  debug-compare harvested geometry channels (pages/np/klen) against the host
+  replay; run N steps green on the 4090. Then reroute
+  [cuda_beam_e2e.rs](bin/pie/tests/cuda_beam_e2e.rs) through the ordinary
+  run-ahead submit.
+
+### B.5 Deletion (single commit, after shadow green)
+
+- Runtime: `ptir_beam.rs` (entire file), `BeamRun`/`detect_beam`/`fire_beam`/
+  `beam_channel_u32`/`ForwardPass::beam`/placeholder toks/eager B*P alloc;
+  `KvWorkingSet::write_slot_shared_inplace` if no caller remains.
+- Driver: verify nothing crept back;
+  `grep -ri beam driver/cuda/src` finds no symbols/files. Optionally a CI gate.
+- **Test: retire/replace `bin/pie/tests/cuda_beam_e2e.rs`** — it drives the old
+  `beam` inferlet through the deleted classic replay path; `cuda_beam_devgeo_e2e.rs`
+  (the fresh PTIR device-geometry e2e, e7c5ec54) is its replacement. Don't leave a
+  test exercising the deleted path.
+
+### B follow-ups (recorded, out of scope)
+
+D4 compaction (program computes the gather plan, driver provides one generic
+KV-gather); device-side geometry assembly without the D2H hop; co-batching
+device-geometry fires (v1 is solo); true blocking `take` across guest tasks
+(wasi-p3).
+
+**Generalize B2 explicit-KV-write across ALL model forwards.** B2 (e7c5ec54) is
+TARGETED to Qwen3/`llama_like_forward_paged` only (all the beam-devgeo e2e on
+Qwen3-0.6B needs). The `ForwardInputs`/`ForwardDispatchInputs` fields
+(`w_page_d`/`w_off_d`/`has_write_desc`) + the executor upload are model-agnostic;
+generalizing = thread the 3 params + the `launch_write_kv_explicit_bf16` branch
+through each other `*_forward_paged` (gemma2/3n/4, mixtral, qwen3_5[_moe],
+nemotron_h, deepseek_v4, kimi, glm5). Mechanical, backward-compatible (they
+already default `has_write_desc=false`). Do when device-geometry needs a
+non-Qwen3 model.
+
+---
+
+## Track C: runtime-driver boundary migration
+
+Spec of record: [boundary.md](boundary.md) (B1-B17, word layout, protocol,
+mock-first rule). Phase 0 is done. Remaining, each phase merging independently:
+
+### C1 (= boundary Phase 1): remove accidental complexity while dormant
+
+- Extend bind: wake slot ids down, word-layout header shared by both sides.
+- Carrier callback reduced to word publish + direct `pie_wake_past` calls from
+  the driver's instance table.
+- Delete: `CarryWake`/`user_ptr` trampoline
+  ([control_cuda.rs](runtime/src/driver/control_cuda.rs)), carry SoA wire
+  columns + `InFlightTracker`/`CloseAction`/reap
+  ([carry_bridge.rs](runtime/src/driver/carry_bridge.rs) + 4 `ForwardRequest`
+  fields), the completion registry/scan
+  ([completion.rs](runtime/src/driver/completion.rs), keep `PinnedRingWord`),
+  the dead `PIE_CARRY_POPULATE` gate. Port the valuable regression tests
+  (monotonic head, close-during-in-flight) to the carrier layer.
+- `Completion` re-backed by the fixed pacing slot + `word[0]`.
+
+### C2 (= boundary Phase 2): real layout and the value path
+
+- Derive the frame layout from the trace (host-visible channel list, cell
+  offsets/sizes); per-channel delta D2H replaces whole-frame mirror; bake
+  static readiness/commit lists at registration (B4).
+- `k_commit_bump` stores head/tail + pacing into mapped pinned words
+  (device-side publish); host callback becomes wake-only; delete
+  `k_channel_bits`, the pass-end sync, the host ring mirrors.
+- Rewire [ptir_host.rs](runtime/src/ptir/ptir_host.rs): take/read park on
+  reader slots and load the mirror; put writes staging + epoch store (H2D of
+  dirty inputs at fire-build); `ForwardResponse` loses the PTIR output
+  marshal; `finalize_fire` keeps only KV/RS txn settlement.
+- **Sequencing with Track B**: B3 modifies the same submit/finalize code paths
+  on the current marshal transport; land B3 before or after C2, not
+  interleaved. The WIT surface is unchanged by C2, so Track A is unaffected.
+
+### C3 (= boundary Phase 3): activation and the fire rule
+
+- Scheduler paces run-ahead depth on pacing words.
+- Fire-skip heuristic (X4, as scheduler policy): skip an instance whose input
+  epochs are unchanged since its last dummy-run.
+- Profile; optionally fold wakes into the scheduler's polling loop with a
+  single idle doorbell.
+
+Separate tracks recorded in boundary.md §8: tier-1 fusion (P5.3), descriptor
+diet (B14), Metal/shmem ports.
+
+---
+
+## Cross-track: blockers, cleanup, verification
+
+### Blockers
+
+- **FlashInfer cutlass MoE build**: last known state, full `cargo build -p
+  pie-worker --features driver-cuda` died at `pie_flashinfer_cutlass_moe`
+  (sccache/OOM, not our code), blocking full-link e2e verification. Re-verify
+  on the current tree; try `RUSTC_WRAPPER` unset + low
+  `CMAKE_BUILD_PARALLEL_LEVEL`. Fast executor object-compile loop (bypasses
+  MoE): take `CXX_FLAGS`/`CXX_DEFINES`/`CXX_INCLUDES` from
+  `target/debug/build/pie-worker-*/out/cuda/build/CMakeFiles/pie_driver_cuda_lib.dir/flags.make`,
+  run under bash: `c++ $DEFS $INCS $FLAGS -fsyntax-only .../executor.cpp`.
+- **Verify box**: RTX 4090 over `ssh workstation`, CUDA 13.3, sccache + CPM
+  cache at `~/.cache/pie-cpm` (FlashInfer prefetched); tree copy at
+  `workstation:~/Workspace/pie-ptir-verify` (rsync, excl `target/`, `.git/`).
+
+### Cleanup (small, do opportunistically)
+
+- Untracked duplicate leftovers from the W1.3 rename: delete
+  `driver/cuda/src/kernels/beam_mask_adapter.cu` and
+  `driver/cuda/tests/beam_mask_adapter_test.cu` (verified byte-identical to
+  their committed `pack_dense_mask` twins).
+- `executor.cpp:776` breadcrumb: an uncalled helper whose only caller was the
+  deleted sampling_ir program-run block; remove with A4 or sooner.
+- `ptir_refact.md` was absorbed into this document and deleted.
+
+### Verification plan
+
+1. **A1**: `ptir-dsl` container-bytes goldens byte-identical pre/post
+   extraction; interp parity tests pass under the dev feature.
+2. **A2/A3**: ptir-greedy e2e through the bridge (guest -> WIT -> runtime ->
+   driver -> harvested output).
+3. **B**: SDK trace tests assert the program's emitted wire-form port values
+   equal the locked vectors; shadow verify N steps green on the 4090; after
+   B5, full e2e green with the replay deleted and the grep gate clean.
+4. **C**: loom checks stay green in `pie-waker`; `MockControlPlane` proves
+   `register -> bind -> put -> fire -> take` per phase; existing PTIR driver
+   tests (`ptir_runner_test`, `ptir_golden_exec_test`, `ptir_tier1_test`)
+   stay green after C2's runner rewiring.
+
+### Risks and open decisions
+
+- **Stream/FIFO ordering is the entire correctness argument** for run-ahead
+  and multi-pass chaining (B3's asserted invariant is mandatory).
+- **Freeze discipline** is assumed, not enforced, unless the B2 lease guard is
+  adopted (recommended).
+- **Ring capacity** (`kMaxRing=8`,
+  [channels.hpp:106](driver/cuda/src/ptir/channels.hpp#L106)) bounds run-ahead
+  depth per channel; deeper pipelines back-pressure at submit-prepare.
+- **Decl conflicts on shared channels**: containers binding the same global id
+  must declare identical shape/dtype/capacity; validated at bind, keep the
+  error message clear.
+- **A4 scope**: classic retirement depends on the media-splice decision and
+  touches the same executor files as C; sequence explicitly when both are
+  active.
+
+---
+
+## alpha progress log (proj2, branch tasks/proj2/agents/alpha)
+
+Delivered + pushed (base 243f5b1e):
+- A1 9bd1ee00 — carve ptir-dsl out of sdk/rust/ptir (neutral Builder; byte-identical goldens).
+- A5 1139f2a9 — stage_key D5 normalization in pie-ptir (3 golden tests).
+- gate a07c5091 — cfg-gate the missing sampling-edsl surface so inferlet compiles.
+- A2 a61c6976 (+ ecd7ec7f refinement) — inferlet::ptir bridge over the WIT ptir surface.
+- A3 b62827de — migrate beam + mtp-grammar to inferlet::ptir::prelude; fix workspace loader.
+- B4 484af58e — port beam geometry golden vectors to host ptir-dsl+interp tests (slot geometry).
+- B1 d5002c46 — device-geometry wire-form beam program (page_indptr=CumSum(np), packed pages) + interp goldens.
+- B1 f9472fce — beam-devgeo wasm inferlet on the bridge (ForwardPass::port_channel escape hatch).
+
+STATUS: Track A critical path (A1/A2/A3/A5) DONE. A4 deferred (media-splice/Oracle).
+B1 authoring + B4 host goldens DONE (host-verified on CPU interp). REMAINING B is
+device-verified: B1 e2e submit, B2 driver explicit-KV-write wiring, B3 runtime unified
+device-geometry submit (delete beam branch, wire PageLease), B4 shadow-verify N steps on
+4090, B5 deletion (ptir_beam.rs etc.). Track C not started (sequence after B per manager).
+
+NEXT: STOP for device (4090) verification — needs ssh workstation access.
+
+## C1 (boundary Phase 1) scope map — alpha, mapped 2026-07-08
+
+Atomic host+CUDA+ABI change (deletions + Completion re-backing + bind extension
+land together; deleting ForwardRequest carry fields forces the same-commit
+executor.cpp edit). Verifiability: carry_bridge.rs / completion.rs / control.rs
+are host-compiled (cargo check -p pie catches them); control_cuda.rs is
+driver-cuda-gated (inspection only, no CUDA build); frame_carrier.{hpp,cpp} +
+executor.cpp via g++ -fsyntax-only (flags.make). mock/loom for the carrier layer.
+
+Word layout (boundary.md §, fixed both sides): word[0]=pacing (committed fire
+count); word[1+2c]=channel c head; word[2+2c]=channel c tail. Wake slots:
+pacing + per-channel reader/writer, bind-time fixed, freed at close.
+
+DELETIONS (enumerated):
+- execute.rs: dead PIE_CARRY_POPULATE gate (+ populate_carry call).
+- carry_bridge.rs: CarryDescriptor SoA + push_carry_request; InFlightTracker /
+  CloseAction / reap (close-gate). Keep the valuable regression tests (monotonic
+  head, close-during-in-flight) → port to the carrier layer.
+- completion.rs: registry + scan (CompletionConsumer scan_instance/drain). KEEP
+  PinnedRingWord (the word reader).
+- control_cuda.rs: CarryWake + user_ptr trampoline + cuda_carry_done. Carrier
+  callback shrinks to word publish + direct pie_wake_past from the driver's
+  instance table.
+- schema.rs (ABI): 4 ForwardRequest carry cols (carry_abi_version/user_ptr/
+  word_index/instance) + CARRY_DESCRIPTOR_VERSION.
+- driver/cuda frame_carrier.{hpp,cpp} + executor.cpp: the classic-carrier reads
+  of those cols. CRITICAL: preserve the submit_prebuilt_async solo-fire carrier
+  that B3's device-geometry submit depends on — only the CLASSIC-carrier use dies.
+
+ADDITIVE / REWORK:
+- bind: return wake slot ids (down) + the shared word-layout header.
+- Completion: re-back on the fixed pacing slot + word[0] (parked(pacing_slot,
+  word0, target=fire_seq)).
+
+STATUS: fully scoped, ready to execute as one focused atomic unit. Deferred the
+blind partial-execution at session tail (atomic ABI change touching the B3
+carrier — safer as a focused effort). Device link + e2e = 4090 gate.
+
+### C1a (DONE, fc245640): bind wake-slot/word-layout extension + Completion pacing re-backing
+Fully host-verifiable half of boundary Phase 1 (split from C1b per manager).
+- BoundInstance: WakeSlots (bind-fixed pacing + per-channel ChannelWakers, freed at close) + WordLayout header (word[0]=pacing; word[1+2c]/word[2+2c]=chan c head/tail).
+- Completion re-backed on FIXED pacing slot + word[0] (parked_pacing, owns_slot=false); steady-state fires alloc no slot. Mock advances shared per-instance pacing word.
+- Ported regressions to carrier layer: monotonic_pacing_word_wakes_each_fire, non_monotonic_pacing_filters_the_second_fire, close_during_in_flight_is_safe.
+- Verified: cargo check -p pie clean; 8 driver::control tests green; pie-waker substrate 9 green (C1a touches no pie-waker → loom invariants untouched); clippy clean.
+
+### C1b (BLOCKED, 4090+fresh-session): the deletions + CUDA edits
+Delete carry SoA/InFlightTracker/CloseAction/reap, completion registry-scan (KEEP PinnedRingWord), CarryWake/user_ptr trampoline, PIE_CARRY_POPULATE gate, 4 ForwardRequest fields; frame_carrier.{hpp,cpp}+control_cuda edits. MUST preserve submit_prebuilt_async solo-fire carrier (B3 dep). Syntax(-fsyntax-only)+inspection only; full driver-cuda link + e2e = 4090 gate.
+
+## alpha device-verify session — 2026-07-08 (branch tasks/proj2/agents/alpha)
+
+KEY: the dev box IS the 4090 (hostname Workstation, `workstation`→127.0.1.1 self;
+RTX 4090 + CUDA 13.3 at /usr/local/cuda; CPM cache ~/.cache/pie-cpm). NO ssh/rsync
+— build+test in place. Full `cargo build -p pie-worker --features driver-cuda`
+clean in 5.5min with PIE_COMPILER_LAUNCHER=env + -j6 (NO FlashInfer MoE OOM).
+Standalone PTIR driver tests build via cmake in /tmp/pie-driver-build (targets
+test_ptir_golden_exec/runner/tier1 link only cudart/nvrtc — no MoE).
+
+DONE + pushed:
+- Driver PTIR tests GREEN on 4090: ptir_golden_exec 42/0 (incl beam_epilogue),
+  ptir_runner 14/0, ptir_tier1 24/0 (run from driver/cuda/ so tests/golden-ptir resolves).
+- B2 (e7c5ec54): explicit-KV-write wiring. ForwardInputs+ForwardDispatchInputs
+  +w_page_d/w_off_d/has_write_desc; pi.w_page/pi.w_off persistent buffers (per-request);
+  executor uploads fg.w_page/fg.w_off in the dg_resolved block (parallel to fg.mask->
+  pi.custom_mask); llama_like_forward_paged branches to launch_write_kv_explicit_bf16
+  when has_write_desc. Backward-compat (default false). Compiles clean; device path
+  NOT yet exercised.
+- beam-devgeo e2e (e7c5ec54): bin/pie/tests/cuda_beam_devgeo_e2e.rs. Boots Qwen3-0.6B,
+  builds beam_devgeo.wasm, submits, asserts BEAM_DEVGEO non-degenerate.
+  Run cmd: `cargo test -p pie-bin --features driver-cuda --test cuda_beam_devgeo_e2e -- --ignored --nocapture`.
+
+BLOCKED — fire-0 seeding bring-up: e2e fails at `submit @0: ptir: channel 0: seeded
+but no seed was put before the first fire`. Seeded loop-carried channels
+(pages/lens/kvm/page_indptr/packed) have no fire-0 seed. bind_seeds_first_fire
+(ptir_host.rs:250) requires one staged put per seeded channel. Old `beam` inferlet
+has the IDENTICAL gap (only worked via the deleted classic fire_beam path; never
+device-verified). DECISION PENDING (manager): (a) B3 runtime-seeds fire-0 pages from
+the PageLease grant [matches plan B.0/ptir_host.rs:162 "runtime seeds fire 0's pages"]
+vs (b) guest-seeds in beam-devgeo. alpha recommends (a).
+
+NOTE: cargo build.rs rerun-if-changed=../driver/cuda/src tracks the DIR mtime, not
+recursive file edits — so editing a driver .cpp does NOT auto-trigger cmake. Force
+via `touch driver/cuda/CMakeLists.txt` (watched) before cargo, or drive cmake directly:
+`cmake --build target/debug/build/pie-worker-*/out/cuda/build --target pie_driver_cuda_lib -j 6`.
+
+FIRM RULE (Oracle): never restore sampling-edsl / interface/sampling-ir; old sampling
+inferlets (mtp-native-verify/runahead/mtp-specdecode) + gated sampler.rs/emit.rs/program.rs
+are deliberately dead — skip on build trips, never fix/un-gate/migrate.
+
+### FIRE-0 SEEDING DESIGN GAP (alpha, 2026-07-08) — BLOCKS beam-devgeo e2e green
+Deep-dive finding on the device-geometry fire-0 init contract (bigger than mechanical seed):
+- Channel NAMES do NOT survive to the runtime ChannelDecl (container.rs:91 = shape/dtype/
+  capacity/host_role/seeded only). Runtime can ID port-bound channels (packed=Pages,
+  page_indptr=PageIndptr, kvm=AttnMask, w_slot/w_off=WSlot/WOff) but NOT the internal
+  loop-carried pages/lens/tslot (pages & lens both seeded [B,P] u32, no port → indistinguishable).
+- SPACE MISMATCH: guest ws.alloc → SLOT ids (sdk .../ptir.rs alloc_slots); runtime PageLease
+  owns PHYSICAL page ids, injects them on `fresh` (ptir_host.rs:1024-1032). Device-geometry =
+  "all physical, no slot→physical table". Fire-0 physical pages known ONLY to the runtime.
+- WALL: pages/tslot seeds need fire-0 PHYSICAL pages. (a) runtime can't ID those channels;
+  (b) guest can't know physical ids. Guest currently seeds tslot=0/pages=0 → fire-0 HEIR path
+  writes physical page 0 (corruption, not benign diff). Old `beam` sidestepped via deleted
+  classic replay (never device-verified).
+- Options: (i) add a PORT/host-role so runtime can ID+seed the pages/tslot carrier with grant
+  physical ids [alpha lean — smallest, matches plan "runtime seeds fire-0 pages", device-resident];
+  (ii) fire-0 special all-fork-from-prompt, pages/tslot seeds unused, physical pages only from
+  `fresh`; (iii) runtime resolves guest slot-seed→physical for pages carrier [against contract].
+- ESCALATED to manager (needs device-geometry designer / charlie's intended contract). PAUSED.
+  Checkpoint e7c5ec54 (B2+e2e) is clean; the e2e correctly surfaces this exact gap at submit @0.
+
+### DESIGN B — beam via logical mask-out + lazy compaction (2026-07-08, Oracle) — SUPERSEDES Design A
+Branch-heavy decoding (beam/forking) is now logical mask-out + lazy compaction, NOT eager
+freeze/heir/fresh-page-per-fork (Design A: p1_overview s6_2, ptir_beam.rs goldens, `beam`
+inferlet). This RESOLVES the fire-0 seeding gap above (no per-fork fresh-page handshake).
+Core: KV cache = prefix tree over a shared physical page pool w/ lazy GC. Shared ancestors
+written once, referenced by mask; live beams append at own tails; pruned beams excluded by
+mask (pages NOT reclaimed at prune); garbage reclaimed in occasional BATCHED compaction.
+
+Changes vs current Track B:
+- B.1 epilogue MUCH simpler: top-B(parent+token) + each survivor's tail-append pos + per-beam
+  AttnMask over the pool. NO heir election, NO freeze arithmetic, NO fresh-page selection, NO
+  per-step gather(pages,parent) reorder.
+- `fresh`-page per-fire handshake DISSOLVES. Host grows pool in bulk + reclaims on compaction.
+- Driver gains ONE new generic mechanism: KV-gather compaction (gather live page ids → dense
+  range). B2 write_kv_explicit + pack_dense_mask UNCHANGED (still hot path).
+- Goldens re-based (B.4): Design A vectors (golden_charlie_fork_freeze_csrs, w_cont=[false,true])
+  no longer target. Need Design B goldens: mask evolution across prune/fork + 1 compaction
+  gather-plan vector (outside ptir_beam.rs before B.5).
+- PageLease REPURPOSED (bulk growth + reclaim-on-compaction + reclaim-on-drop), not deleted.
+
+STAYS from B.0: physical page ids e2e; dense mask on AttnMask port; out_par; host owns alloc +
+driver program-agnostic; device-geo fires solo/prebuilt empty wire geo; run-ahead/submit-never-blocks.
+
+New open items: (1) compaction trigger policy + FIFO barrier scheduling (compaction is a non-solo
+pool-wide fire); (2) mask growth bound (cap pool-between-compactions or segmented/ragged mask);
+(3) CompactPlan port (live-page ids + dest map) — the ONE new host↔program handshake, replaces
+`fresh`; B.1 must define it.
+
+STATUS: new direction landed while alpha idle at e7c5ec54. NOT yet started (manager coordinating
++ alpha context long → refresh before implementing Design B). Existing B2 (e7c5ec54) survives intact.

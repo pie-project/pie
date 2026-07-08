@@ -121,6 +121,7 @@ void Qwen3VLModel::body(Qwen3Workspace& ws,
         in.logit_row_indices_d, in.num_logit_rows,
         in.tp_greedy_argmax,
         in.custom_mask_d, in.custom_mask_indptr_d,
+        in.w_page_d, in.w_off_d, in.has_write_desc,
         vision_ptr);
 }
 

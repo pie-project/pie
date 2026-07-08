@@ -4,13 +4,25 @@
 //! golden `greedy_argmax` / `section3_masked_gumbel` fixtures — and encode→decode
 //! round-trips. This is the correctness contract (NOT hash-equality with echo's
 //! hand-built containers; emission order may differ, results may not).
+//!
+//! The guest does not bind (D6): [`Builder::build`] lowers + lints only, and
+//! these native parity tests bind explicitly against a test profile (the same
+//! validator `forward-pass.new` runs host-side).
 
-use pie_ptir::interp::Value;
 use pie_ptir::container;
+use pie_ptir::interp::Value;
 use pie_ptir::interp::{HostError, Instance, NoKernels, PassInputs};
+use pie_ptir::validate::{bind, BoundTrace};
 
-use ptir::prelude::*;
-use ptir::Channel;
+use ptir_dsl::builder::Builder;
+use ptir_dsl::prelude::*;
+use ptir_dsl::{Channel, Traced};
+
+/// Bind a lowered [`Traced`] against the current model profile (native parity
+/// only — host-side this is `forward-pass.new`'s job).
+fn bound(traced: &Traced) -> BoundTrace {
+    bind(traced.container().clone(), ptir_dsl::model::profile()).expect("container binds")
+}
 
 /// Dense channel index of a named channel.
 fn idx(names: &[String], name: &str) -> u32 {
@@ -21,28 +33,33 @@ fn logits(v: Vec<f32>) -> PassInputs {
     PassInputs { logits: Some(Value::F32(v)), ..Default::default() }
 }
 
+fn leak<T>(v: T) -> &'static T {
+    Box::leak(Box::new(v))
+}
+
 // ---------------------------------------------------------------------------
 // greedy_argmax (VOCAB=8): argmax(logits) -> token. Golden tokens: 2, then 0.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn greedy_argmax_tier0_matches_golden() {
-    ptir::model::configure(8, 4, 2);
-    let tok = Channel::new([1], dtype::i32).named("tok");
-    let out = Channel::new([1], dtype::i32).named("out");
+    ptir_dsl::model::configure(8, 4, 2);
+    let tok: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok"));
+    let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
     tok.put([1i32]); // seed BOS
 
-    let fwd = ForwardPass::new();
-    fwd.embed(&tok, Tensor::constant([0u32, 1]));
-    fwd.epilogue(|| {
+    let mut b = Builder::new();
+    b.bind_port(Port::EmbedTokens, tok);
+    b.bind_port(Port::EmbedIndptr, Tensor::constant([0u32, 1]));
+    b.stage(Stage::Epilogue, move || {
         let t = reduce_argmax(intrinsics::logits());
         tok.put(&t);
         out.put(t);
     });
     let _ = out.take(); // host-reader signal (marks `out` HostRole::Reader)
 
-    let traced = fwd.trace().expect("greedy binds");
-    let bound = traced.bound();
+    let traced = b.build().expect("greedy builds");
+    let bound = bound(&traced);
     let names = traced.channel_names();
     let (tok_i, out_i) = (idx(names, "tok"), idx(names, "out"));
 
@@ -50,14 +67,14 @@ fn greedy_argmax_tier0_matches_golden() {
     let bytes = traced.encode();
     assert_eq!(container::decode(&bytes).unwrap(), *traced.container());
 
-    let mut inst = Instance::new(bound, &[(tok_i, Value::I32(vec![1]))]).unwrap();
+    let mut inst = Instance::new(&bound, &[(tok_i, Value::I32(vec![1]))]).unwrap();
 
-    let r = inst.step(bound, &logits(vec![0., 1., 9., 2., 0., 0., 0., 3.]), &mut NoKernels).unwrap();
+    let r = inst.step(&bound, &logits(vec![0., 1., 9., 2., 0., 0., 0., 3.]), &mut NoKernels).unwrap();
     assert!(r.committed, "step 0 commits");
-    assert_eq!(inst.host_take(bound, out_i).unwrap(), Value::I32(vec![2]), "golden token 2");
+    assert_eq!(inst.host_take(&bound, out_i).unwrap(), Value::I32(vec![2]), "golden token 2");
 
-    inst.step(bound, &logits(vec![7., 1., 0., 2., 0., 0., 0., 3.]), &mut NoKernels).unwrap();
-    assert_eq!(inst.host_take(bound, out_i).unwrap(), Value::I32(vec![0]), "golden token 0");
+    inst.step(&bound, &logits(vec![7., 1., 0., 2., 0., 0., 0., 3.]), &mut NoKernels).unwrap();
+    assert_eq!(inst.host_take(&bound, out_i).unwrap(), Value::I32(vec![0]), "golden token 0");
 }
 
 // ---------------------------------------------------------------------------
@@ -67,23 +84,22 @@ fn greedy_argmax_tier0_matches_golden() {
 
 const V32: u32 = 32;
 
-fn build_section3() -> ptir::ForwardPass<'static> {
+fn build_section3() -> Traced {
     // Channels live for 'static (test-only) so the pass owns nothing borrowed.
-    let ctr1: &'static Tensor = Box::leak(Box::new(Tensor::constant([0u32, 1])));
-    let tok: &'static Channel = Box::leak(Box::new(Channel::new([1], dtype::i32).named("tok")));
-    let out: &'static Channel = Box::leak(Box::new(Channel::new([1], dtype::i32).named("out")));
-    let mask: &'static Channel =
-        Box::leak(Box::new(Channel::new([intrinsics::vocab()], dtype::bool).named("mask")));
-    let len: &'static Channel = Box::leak(Box::new(Channel::from([1u32]).named("len")));
-    let rng: &'static Channel = Box::leak(Box::new(Channel::from([1234u32, 0]).named("rng")));
+    let ctr1: &'static Tensor = leak(Tensor::constant([0u32, 1]));
+    let tok: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok"));
+    let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
+    let mask: &'static Channel = leak(Channel::new([intrinsics::vocab()], dtype::bool).named("mask"));
+    let len: &'static Channel = leak(Channel::from([1u32]).named("len"));
+    let rng: &'static Channel = leak(Channel::from([1234u32, 0]).named("rng"));
 
     tok.put([1i32]); // seed BOS
 
-    let ws = WorkingSet::new();
-    let fwd = ForwardPass::new();
-    fwd.embed(tok, Tensor::constant([0u32, 1]));
-    fwd.attn_working_set(&ws, len);
-    fwd.epilogue(move || {
+    let mut b = Builder::new();
+    b.bind_port(Port::EmbedTokens, tok);
+    b.bind_port(Port::EmbedIndptr, Tensor::constant([0u32, 1]));
+    b.bind_port(Port::KvLen, len);
+    b.stage(Stage::Epilogue, move || {
         let logits = intrinsics::logits();
         let r = rng.take();
         let g = gumbel(&r, [intrinsics::vocab()]);
@@ -97,14 +113,14 @@ fn build_section3() -> ptir::ForwardPass<'static> {
     // (the §3 host-loop `mask.put(..)` / `out.take()` — mark Writer/Reader).
     mask.put(vec![true; V32 as usize]);
     let _ = out.take();
-    fwd
+    b.build().expect("section3 builds")
 }
 
 #[test]
 fn section3_tier0_matches_golden() {
-    ptir::model::configure(V32, 16, 32);
-    let traced = build_section3().trace().expect("section3 binds");
-    let bound = traced.bound();
+    ptir_dsl::model::configure(V32, 16, 32);
+    let traced = build_section3();
+    let bound = bound(&traced);
     let names = traced.channel_names();
     let (tok_i, out_i, mask_i, len_i, rng_i) = (
         idx(names, "tok"),
@@ -119,7 +135,7 @@ fn section3_tier0_matches_golden() {
 
     // Per-instance seeds (D2): tok=BOS, len=1, rng=[1234,0] (echo's golden seeds).
     let mut inst = Instance::new(
-        bound,
+        &bound,
         &[
             (tok_i, Value::I32(vec![1])),
             (len_i, Value::U32(vec![1])),
@@ -142,19 +158,19 @@ fn section3_tier0_matches_golden() {
     };
 
     // step 0: mask=allow_all -> token 7.
-    inst.host_put(bound, mask_i, Value::Bool(allow_all)).unwrap();
-    let r0 = inst.step(bound, &logits(peaked.clone()), &mut NoKernels).unwrap();
+    inst.host_put(&bound, mask_i, Value::Bool(allow_all)).unwrap();
+    let r0 = inst.step(&bound, &logits(peaked.clone()), &mut NoKernels).unwrap();
     assert!(r0.committed, "step 0 commits");
-    assert_eq!(inst.host_take(bound, out_i).unwrap(), Value::I32(vec![7]), "golden token 7");
+    assert_eq!(inst.host_take(&bound, out_i).unwrap(), Value::I32(vec![7]), "golden token 7");
 
     // step 1: mask consumed + not re-fed -> readiness miss (dummy-run), out empty.
-    let r1 = inst.step(bound, &logits(peaked.clone()), &mut NoKernels).unwrap();
+    let r1 = inst.step(&bound, &logits(peaked.clone()), &mut NoKernels).unwrap();
     assert!(!r1.committed, "step 1 is a late-mask miss");
-    assert_eq!(inst.host_take(bound, out_i), Err(HostError::WouldBlock), "no token on the miss");
+    assert_eq!(inst.host_take(&bound, out_i), Err(HostError::WouldBlock), "no token on the miss");
 
     // step 2: mask=allow_only([3]) -> recover to token 3.
-    inst.host_put(bound, mask_i, Value::Bool(allow_only_3)).unwrap();
-    let r2 = inst.step(bound, &logits(peaked), &mut NoKernels).unwrap();
+    inst.host_put(&bound, mask_i, Value::Bool(allow_only_3)).unwrap();
+    let r2 = inst.step(&bound, &logits(peaked), &mut NoKernels).unwrap();
     assert!(r2.committed, "step 2 recovers");
-    assert_eq!(inst.host_take(bound, out_i).unwrap(), Value::I32(vec![3]), "golden token 3");
+    assert_eq!(inst.host_take(&bound, out_i).unwrap(), Value::I32(vec![3]), "golden token 3");
 }
