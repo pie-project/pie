@@ -104,15 +104,14 @@ bool qwen_gdn_fused_step_enabled() {
 // FLA chunked-prefill default), so strictly less quantization than
 // the legacy per-element-round kernel.
 //
-// Default ON: +32% end-to-end throughput on Qwen/Qwen3.5-4B
-// (6924 -> 9166 tok/s). The launcher only routes here for the GQA
-// bf16 V-last decode shape (V_d==K_d==128, !k_last); everything else
-// falls back to the legacy kernel. Set PIE_QWEN35_GDN_SMEM_STEP=0 to
-// force the fallback.
+// Opt-in: this path is faster on saturated decode microbenches, but it
+// has not yet had the same forked/batched-context parity coverage as the
+// legacy BF16 GQA kernel. Keep the production default on the covered path;
+// set PIE_QWEN35_GDN_SMEM_STEP=1 to benchmark the SMEM variant.
 bool qwen_gdn_smem_step_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_GDN_SMEM_STEP");
-        if (v == nullptr || v[0] == '\0') return true;
+        if (v == nullptr || v[0] == '\0') return false;
         return v[0] != '0';
     }();
     return enabled;
