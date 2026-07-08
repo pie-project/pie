@@ -71,6 +71,7 @@ struct DistributedConfig {
 
 struct RuntimeConfig {
     bool verbose = false;
+    bool cuda_graphs = true;
 };
 
 struct Config {
@@ -178,6 +179,8 @@ inline Config load_config(const std::filesystem::path& path) {
     }
     if (auto r = tbl["runtime"].as_table()) {
         c.runtime.verbose = (*r)["verbose"].value_or(c.runtime.verbose);
+        c.runtime.cuda_graphs =
+            (*r)["cuda_graphs"].value_or(c.runtime.cuda_graphs);
     }
 
     if (c.model.snapshot_dir.empty()) {

@@ -812,6 +812,10 @@ pub struct CudaNativeDriverOptions {
     /// latency-regime win (helps at low batch, costs at compute saturation), so
     /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
     pub enable_system_speculation: bool,
+    /// Disable CUDA graph capture/replay for cuda_native. Tensor-parallel
+    /// deployments can require eager execution when a collective sequence cannot
+    /// be captured reliably.
+    pub disable_cuda_graphs: bool,
 
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
@@ -845,6 +849,7 @@ impl Default for CudaNativeDriverOptions {
             mtp_assistant_snapshot_dir: String::new(),
             mtp_num_drafts: 3,
             enable_system_speculation: false,
+            disable_cuda_graphs: false,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
         }
@@ -1265,6 +1270,7 @@ runtime_quant = "fp8"
 mxfp4_moe = "routed_dequant"
 mtp_assistant_snapshot_dir = "/models/gemma4-mtp"
 mtp_num_drafts = 6
+disable_cuda_graphs = true
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
@@ -1277,6 +1283,7 @@ mtp_num_drafts = 6
         assert_eq!(opts.mxfp4_moe, "routed_dequant");
         assert_eq!(opts.mtp_assistant_snapshot_dir, "/models/gemma4-mtp");
         assert_eq!(opts.mtp_num_drafts, 6);
+        assert!(opts.disable_cuda_graphs);
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
         assert_eq!(opts.kv_page_size, 32); // default
         assert_eq!(opts.kv_cache_dtype, "auto"); // default
@@ -1303,6 +1310,7 @@ device = ["cuda:0"]
         assert_eq!(opts.mxfp4_moe, "auto");
         assert!(opts.mtp_assistant_snapshot_dir.is_empty());
         assert_eq!(opts.mtp_num_drafts, 3);
+        assert!(!opts.disable_cuda_graphs);
         assert_eq!(opts.ready_timeout_s, 600.0);
         assert_eq!(opts.kv_cache_dtype, "auto");
     }
