@@ -36,9 +36,27 @@ void InProcService::serve_forever(pie_driver::InProcServer& server) {
             switch (req.method) {
                 case pie_driver::PIE_METHOD_FORWARD: {
                     ++handled_;
-                    handle_fire_batch(
+                    const bool ok = handle_fire_batch(
                         req_id, req.forward, out.forward, executor_, handled_);
-                    out.status = 0;
+                    if (ok) {
+                        const auto qo = req.forward.qo_indptr.as<std::uint32_t>();
+                        const auto expected = qo.empty()
+                            ? 0u
+                            : static_cast<std::uint32_t>(qo.size() - 1);
+                        if (out.forward.num_requests == expected) {
+                            out.status = 0;
+                        } else {
+                            std::cerr << "[pie-driver-cuda] fire_batch response count "
+                                      << "mismatch for req_id=" << req_id
+                                      << ": expected " << expected
+                                      << ", got " << out.forward.num_requests << "\n";
+                            out.method = pie_driver::PIE_METHOD_HEALTH;
+                            out.status = -1;
+                        }
+                    } else {
+                        out.method = pie_driver::PIE_METHOD_HEALTH;
+                        out.status = -1;
+                    }
                     break;
                 }
                 case pie_driver::PIE_METHOD_COPY_D2H: {
