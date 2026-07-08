@@ -3190,7 +3190,7 @@ bool handle_fire_batch(
                           << " sampled=" << num_sampling
                           << " max_kv=" << max_kv_len << "\n";
             }
-            return;
+            return true;
         }
 
         executor.response_builder.build_token_only(
