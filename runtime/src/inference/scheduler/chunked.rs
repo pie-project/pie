@@ -10,11 +10,11 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::context::pagestore::{PhysicalPageId, compute_last_page_len};
+use crate::context::pagestore::{compute_last_page_len, PhysicalPageId};
 use crate::driver::SchedulerLimits;
 use crate::inference::ForwardOutput;
 
-use super::{Completion, PendingRequest, RequestCapacityUsage, request_capacity_usage};
+use super::{request_capacity_usage, Completion, PendingRequest, RequestCapacityUsage};
 
 pub(super) struct ChunkContinuation {
     original_request: pie_bridge::ForwardRequest,
@@ -56,15 +56,16 @@ impl PendingRequest {
         }
 
         let usage = request_capacity_usage(&self, page_size);
-        if usage.forward_tokens <= limits.max_forward_tokens {
-            return Ok(self);
-        }
+        let chunk_size = match chunk_size_for_limits(&usage, limits) {
+            Ok(Some(chunk_size)) => chunk_size,
+            Ok(None) => return Ok(self),
+            Err(msg) => return Err((self, msg)),
+        };
 
-        if let Err(msg) = validate_chunkable_request(&self.request, limits.max_forward_tokens) {
+        if let Err(msg) = validate_chunkable_request(&self.request, chunk_size) {
             return Err((self, msg));
         }
 
-        let chunk_size = limits.max_forward_tokens;
         let chunk_end = chunk_size.min(self.request.token_ids.len());
         let sampler_slots_by_chunk = chunk_sampler_slots_by_chunk(&self.request, chunk_size);
         if let Err(msg) = validate_chunk_capacity(
@@ -658,11 +659,44 @@ fn response_nested_slot_count(
     Ok(count)
 }
 
+fn chunk_size_for_limits(
+    usage: &RequestCapacityUsage,
+    limits: SchedulerLimits,
+) -> std::result::Result<Option<usize>, String> {
+    let mut chunk_size = limits.max_forward_tokens;
+    let mut needs_chunking = usage.forward_tokens > limits.max_forward_tokens;
+
+    if usage.sampler_rows > 0 {
+        if usage.has_dense_logit_requirement && usage.forward_tokens > limits.max_logit_rows {
+            if limits.max_logit_rows == 0 {
+                return Err("driver max logit rows is zero".to_string());
+            }
+            chunk_size = chunk_size.min(limits.max_logit_rows);
+            needs_chunking = true;
+        }
+        if usage.has_prob_sampling && usage.forward_tokens > limits.max_prob_rows {
+            if limits.max_prob_rows == 0 {
+                return Err("driver max probability rows is zero".to_string());
+            }
+            chunk_size = chunk_size.min(limits.max_prob_rows);
+            needs_chunking = true;
+        }
+    }
+
+    if !needs_chunking {
+        return Ok(None);
+    }
+    if chunk_size == 0 {
+        return Err("driver max forward tokens is zero".to_string());
+    }
+    Ok(Some(chunk_size))
+}
+
 fn validate_chunkable_request(
     req: &pie_bridge::ForwardRequest,
-    max_forward_tokens: usize,
+    chunk_size: usize,
 ) -> std::result::Result<(), String> {
-    if max_forward_tokens == 0 {
+    if chunk_size == 0 {
         return Err("driver max forward tokens is zero".to_string());
     }
     if !req.spec_token_ids.is_empty() {
@@ -670,13 +704,13 @@ fn validate_chunkable_request(
             "forward request has {} input tokens and {} speculative tokens, exceeding driver limit {}; chunked prefill does not yet support speculative drafts",
             req.token_ids.len(),
             req.spec_token_ids.len(),
-            max_forward_tokens
+            chunk_size
         ));
     }
     validate_chunk_request_shape(req)?;
 
     let total = req.token_ids.len();
-    if total <= max_forward_tokens {
+    if total <= chunk_size {
         return Ok(());
     }
 
@@ -766,6 +800,20 @@ fn chunk_limit_error(usage: RequestCapacityUsage, limits: SchedulerLimits) -> Op
         return Some(format!(
             "forward request chunk has {} page refs, exceeding driver limit {}",
             usage.page_refs, limits.max_page_refs
+        ));
+    }
+
+    if usage.logit_rows > limits.max_logit_rows {
+        return Some(format!(
+            "forward request chunk needs {} logit rows, exceeding driver limit {}",
+            usage.logit_rows, limits.max_logit_rows
+        ));
+    }
+
+    if usage.prob_rows > limits.max_prob_rows {
+        return Some(format!(
+            "forward request chunk needs {} probability rows, exceeding driver limit {}",
+            usage.prob_rows, limits.max_prob_rows
         ));
     }
 
@@ -1019,8 +1067,9 @@ fn chunk_capacity_usage(
             .copied()
             .unwrap_or(false);
     }
+    let carries_sampler = !sampler_slots.is_empty();
     let has_dense_logit_requirement = original.has_user_mask
-        || !original.logit_masks.is_empty()
+        || (carries_sampler && !original.logit_masks.is_empty())
         || has_output_spec
         || !all_samplers_token;
     let user_custom_mask_bytes = if original.has_user_mask && chunk_len > 1 {
@@ -1034,16 +1083,14 @@ fn chunk_capacity_usage(
     Ok(RequestCapacityUsage {
         forward_tokens: chunk_len,
         page_refs: chunk_pages,
-        logit_rows: if has_dense_logit_requirement {
-            sampler_slots.len()
-        } else {
+        logit_rows: if sampler_slots.is_empty() {
             0
-        },
-        prob_rows: if has_prob_sampling {
-            sampler_slots.len()
+        } else if has_dense_logit_requirement {
+            chunk_len
         } else {
-            0
+            sampler_slots.len()
         },
+        prob_rows: if has_prob_sampling { chunk_len } else { 0 },
         sampler_rows: sampler_slots.len(),
         logprob_labels,
         user_custom_mask_bytes,
@@ -1278,7 +1325,9 @@ mod tests {
     fn chunk_sampler_slots(req: &PendingRequest) -> &[usize] {
         match &req.completion {
             Completion::Chunk { sampler_slots, .. } => sampler_slots,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) | Completion::Chain { .. } => {
+                panic!("expected chunk continuation")
+            }
         }
     }
 
@@ -1305,14 +1354,78 @@ mod tests {
                 assert_eq!(cont.physical_page_ids, vec![100, 101, 102]);
                 assert_eq!(cont.final_last_page_len, 2);
             }
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) | Completion::Chain { .. } => {
+                panic!("expected chunk continuation")
+            }
         }
     }
 
     #[test]
+    fn dense_logit_prefill_chunks_by_logit_row_limit() {
+        let mut pending = positioned_pending(10, 4);
+        pending.request.sampling_indices = vec![9];
+        pending.request.sampling_indptr = vec![0, 1];
+        pending.request.samplers = vec![pie_bridge::Sampler::TopK {
+            temperature: 0.0,
+            k: 1,
+        }];
+        pending.request.sampler_indptr = vec![0, 1];
+        pending.request.logit_masks = vec![pie_bridge::Brle::from_vec(vec![1, u32::MAX])];
+        pending.request.logit_mask_indptr = vec![0, 1];
+
+        let mut capped = limits(8, 100, 100);
+        capped.max_logit_rows = 4;
+
+        let chunked = match pending.maybe_start_chunking(capped, 4) {
+            Ok(p) => p,
+            Err((_, msg)) => panic!("{msg}"),
+        };
+
+        assert_eq!(chunked.request.token_ids, vec![0, 1, 2, 3]);
+        assert!(chunked.request.sampling_indices.is_empty());
+        assert!(chunked.request.samplers.is_empty());
+        assert!(chunked.request.logit_masks.is_empty());
+        assert_eq!(chunked.request.logit_mask_indptr, vec![0, 0]);
+        assert!(chunk_sampler_slots(&chunked).is_empty());
+
+        let (submit_tx, submit_rx) = crossbeam::channel::unbounded();
+        let weak_submit_tx = submit_tx.clone();
+        chunked.send_result(
+            Ok(pie_bridge::ForwardResponse {
+                num_requests: 1,
+                tokens_indptr: vec![0, 0],
+                ..Default::default()
+            }),
+            Some(&weak_submit_tx),
+            4,
+        );
+
+        let second = submit_rx.try_recv().expect("second chunk");
+        assert_eq!(second.request.token_ids, vec![4, 5, 6, 7]);
+        assert!(second.request.sampling_indices.is_empty());
+        second.send_result(
+            Ok(pie_bridge::ForwardResponse {
+                num_requests: 1,
+                tokens_indptr: vec![0, 0],
+                ..Default::default()
+            }),
+            Some(&weak_submit_tx),
+            4,
+        );
+
+        let final_chunk = submit_rx.try_recv().expect("final chunk");
+        assert_eq!(final_chunk.request.token_ids, vec![8, 9]);
+        assert_eq!(final_chunk.request.sampling_indices, vec![1]);
+        assert_eq!(final_chunk.request.samplers.len(), 1);
+        assert_eq!(final_chunk.request.logit_masks.len(), 1);
+        assert_eq!(final_chunk.request.logit_mask_indptr, vec![0, 1]);
+        assert_eq!(chunk_sampler_slots(&final_chunk), &[0]);
+    }
+
+    #[test]
     fn oversized_prefill_with_chain_completion_degrades_to_chunk() {
-        use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
 
         use dashmap::DashMap;
 
@@ -1368,7 +1481,9 @@ mod tests {
                 assert_eq!(cont.physical_page_ids, vec![100, 101, 102]);
                 assert_eq!(cont.final_last_page_len, 2);
             }
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) | Completion::Chain { .. } => {
+                panic!("expected chunk continuation")
+            }
         }
     }
 
@@ -1383,7 +1498,9 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) | Completion::Chain { .. } => {
+                panic!("expected chunk continuation")
+            }
         };
 
         let next = match cont.into_next_pending(4) {
@@ -1398,7 +1515,9 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => assert_eq!(cont.chunk_end, 8),
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) | Completion::Chain { .. } => {
+                panic!("expected chunk continuation")
+            }
         }
     }
 
@@ -1790,7 +1909,9 @@ mod tests {
 
                             offset += chunk_len;
                             match current.completion {
-                                Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+                                Completion::Direct(_) | Completion::Chain { .. } => {
+                                    panic!("expected chunk continuation")
+                                }
                                 Completion::Chunk {
                                     continuation: cont, ..
                                 } => {
