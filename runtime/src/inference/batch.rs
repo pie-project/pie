@@ -333,28 +333,6 @@ impl BatchAccumulator {
         self.would_exceed_with(&usage)
     }
 
-    /// Run-ahead token-carryover separation (one-step #6, R10): a candidate
-    /// forward `t+1` whose `next_input_producer_links` references the
-    /// `pipeline_source_link` of a forward `t` ALREADY in this batch must NOT
-    /// co-batch with it. `t+1`'s pre-forward `next-inputs` inject reads `t`'s
-    /// sampled token (a *prior* fire's retained buffer); `t` samples
-    /// post-forward, so co-batching would read a not-yet-sampled token → `t`
-    /// and `t+1` must fire in separate, ordered batches (`t` first). This is
-    /// purely the token-carryover data-dependency — not a KV/working-set
-    /// concern. Batch-local set-membership on the link ids (`0` = not a source;
-    /// links are 1-based). Depth ≤1 makes this a simple membership check; the
-    /// deeper-run-ahead path (queue depth > 1) is deferred (thrust-2 open Q5),
-    /// and the superseded RA parity-phase formula is not carried forward (F6).
-    pub(crate) fn would_depend_on_batch(&self, req: &PendingRequest) -> bool {
-        let deps = &req.request.next_input_producer_links;
-        if deps.is_empty() || self.requests.is_empty() {
-            return false;
-        }
-        self.requests.iter().any(|in_batch| {
-            let source_link = in_batch.request.pipeline_source_link;
-            source_link != 0 && deps.contains(&source_link)
-        })
-    }
 
     pub(crate) fn would_exceed_with(&self, usage: &RequestCapacityUsage) -> bool {
         if self.requests.is_empty() {

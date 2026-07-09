@@ -206,9 +206,9 @@ add_library(pie_driver_cuda_lib STATIC
   src/service/inproc_service.cpp
   src/response_subpass.cpp
   src/sampling_dispatch.cpp
-  src/sampling_ir/next_input.cpp
   src/sampling_ir/tensor_io.cpp
   src/sampling_ir/frame_carrier.cpp
+  src/sampling_ir/frame_carrier_kernels.cu
   src/spec_expansion.cpp
   src/tensor.cpp
   src/model/weight_store.cpp
@@ -810,16 +810,6 @@ add_test(NAME sampling_ir_group COMMAND test_sampling_ir_group)
 # #10 gather/scatter device verify (delta) — compacts a scattered group to [Ng,V]
 # and scatters the [Ng] result back. Needs a GPU at runtime.
 
-# #6 WS8 P2 next-input link device machinery (delta) — inject sampled tokens into
-# the consumer next-pass input at linked positions, + the event-ordered (cross-
-# stream) variant. Standalone de-risk before the e2e bring-up. Needs a GPU.
-add_executable(test_next_input_device
-  tests/test_next_input_device.cpp
-  src/sampling_ir/next_input.cpp)
-target_include_directories(test_next_input_device PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(test_next_input_device PRIVATE CUDA::cudart)
-add_test(NAME sampling_ir_next_input_device COMMAND test_next_input_device)
 
 # #6 WS-L4 tensor-I/O fast-path (echo) — host<->driver direct-FFI: dedicated copy
 # stream + two dedicated slab arenas (inferlet-device + sampler-output-pinned), the
@@ -843,7 +833,8 @@ add_test(NAME sampling_ir_tensor_io_device COMMAND test_tensor_io_device)
 # velocity-shift directive).
 add_executable(test_frame_carrier_device
   tests/test_frame_carrier_device.cpp
-  src/sampling_ir/frame_carrier.cpp)
+  src/sampling_ir/frame_carrier.cpp
+  src/sampling_ir/frame_carrier_kernels.cu)
 target_include_directories(test_frame_carrier_device PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_frame_carrier_device PRIVATE CUDA::cudart)

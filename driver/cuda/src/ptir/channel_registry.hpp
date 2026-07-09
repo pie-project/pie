@@ -145,6 +145,18 @@ class DeviceChannelRegistry {
         cudaMemcpy(d_head_ + slot, &nh, sizeof(nh), cudaMemcpyHostToDevice);
     }
 
+    // Host `consume`: the consume half of `host_take` WITHOUT the D2H read — mark
+    // the committed (head) cell empty + advance head. Phase-3 device value path:
+    // the cell already left by DMA straight from `committed_cell`, so no host read.
+    void host_consume(std::uint32_t slot) {
+        std::uint8_t zero = 0;
+        cudaMemcpy(d_full_ + (std::size_t)slot * kMaxRing + host_head_[slot], &zero, 1,
+                   cudaMemcpyHostToDevice);
+        const std::uint32_t nh = (host_head_[slot] + 1) % host_cap1_[slot];
+        host_head_[slot] = nh;
+        cudaMemcpy(d_head_ + slot, &nh, sizeof(nh), cudaMemcpyHostToDevice);
+    }
+
     bool committed_full(std::uint32_t slot) {
         std::uint8_t f = 0;
         cudaMemcpy(&f, d_full_ + (std::size_t)slot * kMaxRing + host_head_[slot], 1,
@@ -349,6 +361,7 @@ class ChannelView {
     void host_take(ChannelId c, void* out, std::size_t bytes) {
         reg_->host_take(slot(c), out, bytes);
     }
+    void host_consume(ChannelId c) { reg_->host_consume(slot(c)); }
     bool committed_full(ChannelId c) { return reg_->committed_full(slot(c)); }
     void read_committed(ChannelId c, void* out, std::size_t bytes) {
         reg_->read_committed(slot(c), out, bytes);

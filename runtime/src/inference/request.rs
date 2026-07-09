@@ -353,13 +353,6 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> pie_drive
         sampling_output_dst_ptrs: Vec::new(),
         sampling_output_dst_lens: Vec::new(),
         sampling_output_indptr: indptr(indptr_cap),
-        // WS8 P2 device-resident next-input link: empty/0 for the host-inject
-        // (P1) and no-pipelining paths; populated by the device-pipeline emission
-        // at integration (per-row arrays + the producer source-link).
-        pipeline_source_link: 0,
-        next_input_producer_links: Vec::new(),
-        next_input_src_rows: Vec::new(),
-        next_input_dest_slots: Vec::new(),
         // P3 recurrent-state fold fields (rs_fold_lens / rs_buffer_slot_*)
         // default to empty — the de-hardwiring forward path does not use them.
         ..Default::default()
@@ -629,51 +622,6 @@ pub fn append_request_with_options(
     // hook fires. Without it the merged batch drops the carrier (ptir_hashes=0).
     batch.extend_ptir_programs_from(req);
 
-    // Run-ahead next-input carrier (WS8 P2) — per-request device-resident link
-    // fold. Each fed consumer input names a producer link id + the source row in
-    // that producer's retained `pi.sampled`, and a dest slot in THIS request's
-    // `pi.tokens`. On batch merge: producer link ids + source rows are GLOBAL (a
-    // prior fire's per-link buffer) → verbatim; dest slots index this fire's own
-    // token buffer → rebased by `row_base` (the batch token-offset). The
-    // `u32::MAX` dest sentinel (skip-lane) is preserved un-rebased.
-    for i in 0..req.n_next_input_links() {
-        let dest = req.next_input_dest_slots[i];
-        let rebased_dest = if dest == u32::MAX { u32::MAX } else { dest + row_base };
-        batch.push_next_input_link(
-            req.next_input_producer_links[i],
-            req.next_input_src_rows[i],
-            rebased_dest,
-        );
-    }
-    // All-consumers-drained free signals — global link ids, verbatim.
-    for &link in &req.next_input_free_links {
-        batch.push_next_input_free_link(link);
-    }
-    // Producer source-link — PER-REQUEST (thrust-2 Bug#2 fix). Each co-batched
-    // producer must retain its OWN sampled token under its OWN global link. Append
-    // one `pipeline_source_links` entry per request (0 = not a producer) so an R>1
-    // co-batched PRODUCER fire keeps EVERY request's link, not just the last.
-    //
-    // (Supersedes the earlier batch-level `set_pipeline_source_link` overwrite,
-    // which resolved Open Q2 as batch-level on the false premise that depth-1
-    // admits at most one producer per batch. It does not: multiple DISTINCT
-    // requests co-batch as producers under continuous batching, and the overwrite
-    // kept only the final request's link → the others' producers never retained →
-    // their consumers retain-missed → placeholder token 0, the concurrent-decode
-    // corruption charlie root-caused. The executor retains request `r`'s producer
-    // row `qo_indptr[r+1]-1` under `pipeline_source_links[r]`.) The scalar
-    // `pipeline_source_link` is still set (last non-zero) for R=1 back-compat.
-    batch.pipeline_source_links.push(req.pipeline_source_link);
-    if req.pipeline_source_link != 0 {
-        batch.set_pipeline_source_link(req.pipeline_source_link);
-    }
-    // Drafts-channel routing (§9): fold the per-request source-kind parallel to the
-    // link. `0 = PrevSample` (retain `pi.sampled`) / `1 = PrevDrafts` (retain the
-    // composed `[k+1]` window). Empty ⇒ all PrevSample (the pushed 0s are harmless).
-    batch.pipeline_source_kinds.push(req.pipeline_source_kind);
-    if req.pipeline_source_kind != 0 {
-        batch.set_pipeline_source_kind(req.pipeline_source_kind);
-    }
 
     // Inference hint: prefill kernel when ANY request needs `custom_mask`.
     if req.token_ids.len() > 1 || req.has_user_mask {

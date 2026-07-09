@@ -574,17 +574,20 @@ void llama_like_forward_paged(
         if (fused_decode_qkv_post) {
             // Already written by launch_qkv_decode_qk_norm_rope_write_kv_bf16.
         } else if (has_write_desc) {
-            // B2: explicit-descriptor KV write. Each lane writes its ONE new
-            // token's K/V into the program-supplied (physical page id
-            // `w_page_d[lane]`, offset `w_off_d[lane]`) target — the WSlot/WOff
-            // lowering — rather than re-deriving the position from the page
-            // table + last_page_len. Beam fork/freeze correctness: a frozen
-            // fork's cell is not overwritten (a sibling's mask hides it). R
-            // lanes = one new token per request (decode-shaped fire).
+            // B2: explicit-descriptor KV write. Each query TOKEN writes its new
+            // K/V into the program-supplied (physical page id `w_page_d[c]`,
+            // offset `w_off_d[c]`) target — the WSlot/WOff lowering — rather than
+            // re-deriving the position from the page table + last_page_len. Beam
+            // fork/freeze correctness: a frozen fork's cell is not overwritten (a
+            // sibling's mask hides it). The write count is the number of query
+            // TOKENS N: a decode-shaped fire has N==R (one new token per lane); a
+            // variable-length prompt PREFILL has one lane (R==1) but N>1 tokens,
+            // so N (not R) cells must be written from `attn_k`/`attn_v` [N,·] and
+            // the N-entry WSlot/WOff descriptor.
             kernels::launch_write_kv_explicit_bf16(
                 kv_view,
                 const_cast<void*>(attn_k), const_cast<void*>(attn_v),
-                w_page_d, w_off_d, R, stream);
+                w_page_d, w_off_d, N, stream);
         } else {
             kernels::launch_write_kv_to_pages(
                 kv_view,

@@ -162,7 +162,7 @@ bool PtirDispatch::run(const pie_driver::PieForwardRequestView& view,
         fin.vocab = vocab;
         fin.stream = stream;
         it->second->fire(host_puts, fin);
-        auto outs = it->second->harvest_outputs();
+        auto outs = it->second->harvest_outputs_device();
         if (std::getenv("PIE_PTIR_TRACE"))
             std::fprintf(stderr, "[ptir-hook] program %zu: harvested %zu output(s)%s\n",
                          p, outs.size(), outs.empty() ? " (NONE — no committed READER channel)" : "");
@@ -205,26 +205,28 @@ bool PtirDispatch::run(const pie_driver::PieForwardRequestView& view,
             }
         }
 
-        // U2 publish (migration form): mirror the committed cells + advance the
-        // pinned head/tail/pacing words. Additive — the marshal above stays
-        // authoritative until the runtime flips to mirror reads (U4).
+        // U2 publish + P3 device value path: DMA the committed cells device→pinned
+        // mirror + advance the pinned head/tail/pacing words. The value moves by DMA
+        // straight from the device committed cell (no host harvest bounce, C5); the
+        // ring slot is freed (consume) after the copy stream drains.
         auto fit = s.frames.find(iid);
         if (fit != s.frames.end() && fit->second.n_reader > 0) {
             InstanceFrame& fr = fit->second;
-            std::vector<const void*> src(fr.n_reader, nullptr);
+            std::vector<const void*> src(fr.n_reader, nullptr);   // DEVICE committed-cell ptrs
             std::vector<std::uint32_t> ring_index(fr.n_reader, 0);
-            for (auto& kv : outs) {
-                auto rit = fr.gid_to_rank.find(kv.first);
+            for (auto& o : outs) {
+                auto rit = fr.gid_to_rank.find(o.gid);
                 if (rit == fr.gid_to_rank.end()) continue;  // internal channel
                 const std::uint32_t r = rit->second;
-                src[r] = kv.second.data();
+                src[r] = o.device_ptr;
                 const std::uint32_t prod = ++fr.produced[r];
                 ring_index[r] = (prod - 1) % fr.cap1[r];
                 fr.tail[r] = prod;  // cumulative produced (monotonic)
             }
-            sampling_ir::FrameCarrierEngine::instance().publish(
+            sampling_ir::FrameCarrierEngine::instance().publish_device(
                 fr.frame_id, fr.n_reader, src.data(), ring_index.data(),
                 fr.head.data(), fr.tail.data(), ++fr.fire_seq);
+            it->second->consume_outputs(outs);  // free the device ring slots (post-DMA)
         }
     }
 

@@ -399,18 +399,6 @@ struct Executor {
     // row the sampling program still reads, so it must be preserved across the chain.
     DeviceBuffer<std::uint16_t> mtp_row0_save;
 
-    // #6 WS8 P2 — device-resident next-input retention. A producer forward whose
-    // `pipeline_source_link != 0` has its `pi.sampled[N]` copied here under that
-    // global link id (the copy is READ, not consumed → fan-out safe). A later
-    // consumer's inject reads the retained copy (event-gated on `done`); the entry
-    // is freed when the host signals the link via `next_input_free_links`. The copy
-    // + event persist across fires (the Executor outlives a fire), unlike
-    // `pi.sampled` (alloc-once, reused every pass → t+1 overwrites the producer).
-    struct RetainedSampled {
-        DeviceBuffer<std::int32_t> copy;   // [N] retained producer sampled tokens
-        cudaEvent_t                done = nullptr;  // producer sample-done
-    };
-    std::map<std::uint32_t, RetainedSampled> retained_next_input;
 
     // #27 cut #1 (a2) — the most recent fast-path forward's eager-D2H completion
     // event (recorded on the tensor-I/O copy stream after that fire READ the
@@ -483,29 +471,16 @@ struct Executor {
     // next back-to-back fire reclaims a stale one before recording its own. Moved
     // into a `G3Pending.idle_to` when the fire takes the back-to-back a2 path.
     cudaEvent_t g3_cur_first = nullptr;
-    // A deferred device-idle measurement + retained-next-input free, gated on the
-    // fire's first-kernel event. `idle_to` ready ⇒ `idle_from` ready too (same
-    // stream, later) ⇒ (a) `elapsed(idle_from, idle_to)` = fire k's idle gap is
-    // computable, and (b) the consuming inject that read the retained buffers
-    // drained (idle_from = retire[k-1]) so `free_links` are hazard-free to free.
+    // A deferred device-idle measurement, gated on the fire's first-kernel event.
+    // `idle_to` ready ⇒ `idle_from` ready too (same stream, later) ⇒
+    // `elapsed(idle_from, idle_to)` = fire k's idle gap is computable.
     struct G3Pending {
         cudaEvent_t idle_from = nullptr;          // retire[k-1] (a)
         cudaEvent_t idle_to = nullptr;            // first[k]   (b)
-        std::vector<std::uint32_t> free_links;    // deferred retained-next-input frees
     };
     std::deque<G3Pending> g3_pending;
 
 
-    // #6 WS8 P2 — device ptr of producer `link`'s retained token buffer: the
-    // consumer's `late_inputs` device-alias source for `TokenRef::PrevSample`
-    // (echo's seam). nullptr if the producer hasn't retained → SkippedLateBindMiss.
-    // (a)-MVP returns the D2D copy buffer; (b) the reference-slot — same call site.
-    const void* retained_token_ptr(std::uint32_t producer_link) const {
-        auto it = retained_next_input.find(producer_link);
-        return it == retained_next_input.end()
-                   ? nullptr
-                   : static_cast<const void*>(it->second.copy.data());
-    }
 
 };
 

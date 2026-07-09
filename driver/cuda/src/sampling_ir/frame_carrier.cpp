@@ -7,6 +7,8 @@
 
 #include "sampling_ir/frame_carrier.hpp"
 
+#include "sampling_ir/frame_carrier_kernels.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <atomic>
@@ -171,10 +173,14 @@ std::uint64_t FrameCarrierEngine::bind_channels_locked(std::uint64_t id,
     fi->device_frame = nullptr;  // Q1 reconcile: no per-instance contiguous frame
     FC_CK(cudaHostAlloc(&fi->host_mirror, fi->mirror_bytes, cudaHostAllocDefault));
     std::memset(fi->host_mirror, 0, fi->mirror_bytes);
+    // P1: words are MAPPED so a device kernel can publish head/tail/pacing into
+    // them on the copy stream (P2). `words_dev` is the device-space alias.
     FC_CK(cudaHostAlloc(reinterpret_cast<void**>(&fi->host_words), word_bytes,
-                        cudaHostAllocDefault));
+                        cudaHostAllocMapped));
     std::fill(reinterpret_cast<char*>(fi->host_words),
               reinterpret_cast<char*>(fi->host_words) + word_bytes, 0);
+    FC_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&fi->words_dev),
+                                   fi->host_words, 0));
 
     instances_[id] = fi;
 
@@ -212,6 +218,35 @@ void FrameCarrierEngine::publish(std::uint64_t instance, std::uint32_t n_channel
     std::atomic_thread_fence(std::memory_order_release);
     reinterpret_cast<std::atomic<std::uint64_t>*>(&fi->host_words[0])
         ->store(pacing, std::memory_order_relaxed);
+}
+
+void FrameCarrierEngine::publish_device(std::uint64_t instance, std::uint32_t n_channels,
+                                        const void* const* src, const std::uint32_t* ring_index,
+                                        const std::uint32_t* head, const std::uint32_t* tail,
+                                        std::uint64_t pacing) {
+    std::lock_guard<std::mutex> guard(mu_);
+    FrameInstance* fi = lookup(instance);
+    if (fi == nullptr) {
+        std::fprintf(stderr, "[frame_carrier] publish_device on unknown instance %llu\n",
+                     static_cast<unsigned long long>(instance));
+        std::abort();
+    }
+    // Value moves by DMA (C5): each committed DEVICE cell → its pinned mirror ring
+    // slot on the copy stream — no host bounce buffer. The words (head/tail/pacing)
+    // are then DEVICE-published into the MAPPED word region on the SAME stream (P2)
+    // — stream-ordered AFTER the cell DMAs (publish-before-wake) — and one sync
+    // drains the whole publish. The runtime loads word[0] with acquire; the
+    // kernel's threadfence orders head/tail ahead of the pacing store.
+    for (std::uint32_t c = 0; c < n_channels && c < fi->host_vis.size(); ++c) {
+        const FrameChannel& fc = fi->host_vis[c];
+        if (src[c] != nullptr && fc.cell_bytes > 0) {
+            const std::size_t slot = static_cast<std::size_t>(ring_index[c]) * fc.cell_bytes;
+            FC_CK(cudaMemcpyAsync(static_cast<char*>(fi->host_mirror) + fc.mirror_off + slot,
+                                  src[c], fc.cell_bytes, cudaMemcpyDeviceToHost, stream_));
+        }
+    }
+    launch_publish_words(fi->words_dev, n_channels, head, tail, pacing, stream_);
+    FC_CK(cudaStreamSynchronize(stream_));
 }
 
 std::uint32_t FrameCarrierEngine::layout(std::uint64_t instance, std::uint32_t n_channels,

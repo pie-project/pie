@@ -14,7 +14,6 @@ pub mod batch;
 pub mod contention;
 pub mod execute;
 pub mod paging;
-pub mod runahead;
 pub mod request;
 pub mod response;
 pub mod scheduler;

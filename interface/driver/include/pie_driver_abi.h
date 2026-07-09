@@ -268,22 +268,12 @@ struct PieForwardRequestDesc {
   size_t ptir_release_channel_ids_len;
   const uint64_t *ptir_release_instance_ids_ptr;
   size_t ptir_release_instance_ids_len;
-  uint32_t pipeline_source_link;
-  uint8_t pipeline_source_kind;
-  const uint32_t *next_input_producer_links_ptr;
-  size_t next_input_producer_links_len;
-  const uint32_t *next_input_src_rows_ptr;
-  size_t next_input_src_rows_len;
-  const uint32_t *next_input_dest_slots_ptr;
-  size_t next_input_dest_slots_len;
   const uint32_t *rs_fold_lens_ptr;
   size_t rs_fold_lens_len;
   const uint32_t *rs_buffer_slot_ids_ptr;
   size_t rs_buffer_slot_ids_len;
   const uint32_t *rs_buffer_slot_indptr_ptr;
   size_t rs_buffer_slot_indptr_len;
-  const uint32_t *next_input_free_links_ptr;
-  size_t next_input_free_links_len;
   const uint64_t *sampling_output_dst_ptrs_ptr;
   size_t sampling_output_dst_ptrs_len;
   const uint32_t *sampling_output_dst_lens_ptr;
@@ -298,12 +288,16 @@ struct PieForwardRequestDesc {
   size_t sampling_late_device_lens_len;
   const uint32_t *kv_len_ptr;
   size_t kv_len_len;
-  const uint32_t *pipeline_source_links_ptr;
-  size_t pipeline_source_links_len;
-  const uint8_t *pipeline_source_kinds_ptr;
-  size_t pipeline_source_kinds_len;
   const uint64_t *kv_len_device_ptr;
   size_t kv_len_device_len;
+  const uint32_t *kv_move_dst_pages_ptr;
+  size_t kv_move_dst_pages_len;
+  const uint32_t *kv_move_dst_offs_ptr;
+  size_t kv_move_dst_offs_len;
+  const uint32_t *kv_move_src_pages_ptr;
+  size_t kv_move_src_pages_len;
+  const uint32_t *kv_move_src_offs_ptr;
+  size_t kv_move_src_offs_len;
 };
 
 struct PieCopyRequestDesc {

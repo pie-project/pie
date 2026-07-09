@@ -54,45 +54,6 @@ pub struct InstanceState {
     guest_resource_map: Vec<(ResourceAny, u32)>,
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
-
-    /// #6/#21 run-ahead next-input carry state, keyed **per-context**
-    /// (`context_id = kv_ws.rep()`). `pending_next_input[ctx]` holds context
-    /// `ctx`'s prior *producer* pass's pending carry (link id + dest positions +
-    /// producer row count) for its next pass (the implicit consumer) to inject.
-    /// Per-context (not a single slot) so N concurrently-decoding pipelines in one
-    /// instance never clobber each other's carry under co-batched submit
-    /// (thrust-2 Bug#2). Carrier link ids are drawn from a PROCESS-GLOBAL counter
-    /// in [`crate::inference::runahead`] (not per-instance — else concurrent
-    /// instances collide in the driver's global retained map).
-    pub(crate) pending_next_input:
-        std::collections::HashMap<u32, crate::inference::runahead::PendingNextInput>,
-    /// #23 overlap abort-isolation write-log: tracks each in-flight producer
-    /// link's resolved outcome so a consumer's finalize cascade-aborts if the
-    /// producer it injected from aborted (fail-closed on unresolved). Cleared at
-    /// each fresh `generate()` boundary.
-    pub(crate) overlap_links: crate::inference::runahead::OverlapLinkLog,
-
-    /// Task-B (carrier ⋈ contention): table reps of this instance's
-    /// `ForwardPass` resources that hold a live `PendingForward`. The
-    /// contention drain walks this to finalize the lane's OWN already-retired
-    /// fires from inside a gated/parked task (releasing their pins + grace
-    /// refs so `classify_for_suspend` can yield). Registered at the
-    /// eager-submit store, removed when `output()`/`outputs()`/the drain
-    /// consume the pending forward. A stale rep (pass dropped without
-    /// `output()`) is lazily removed on the next drain walk.
-    pub(crate) pending_fires: Vec<u32>,
-
-    /// Depth-k run-ahead rollback (spec §4): every carrier producer link created
-    /// on a context this generation, so a fresh-`generate()` after a run-ahead STOP
-    /// can free-ALL of them — not just the one dangling `pending_next_input`. A
-    /// depth-k EOS over-shoot drops ≤depth−1 speculative fires; the last COMMITTED
-    /// fire's retained carry is then orphaned (its drain-gated free rode the FIRST
-    /// dropped fire's request, which never ran), while `pending` points at a
-    /// never-retained over-shot link. Free-all covers it. Safe: the driver free is
-    /// idempotent (find-or-skip) + drain-gated, so re-freeing an already-freed or
-    /// in-flight link is a no-op. Keyed per context (Bug#2 isolation); cleared per
-    /// generation boundary.
-    pub(crate) carrier_produced_links: std::collections::HashMap<u32, Vec<u32>>,
 }
 
 impl Drop for InstanceState {
@@ -217,15 +178,6 @@ impl InstanceState {
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
-            // #6/#21 run-ahead next-input carry (idle until a pass declares
-            // `next-inputs`).
-            pending_next_input: std::collections::HashMap::new(),
-            // #23 overlap abort-isolation write-log (empty until a producer pass).
-            overlap_links: crate::inference::runahead::OverlapLinkLog::default(),
-            pending_fires: Vec::new(),
-
-            // Depth-k rollback free-all tracking (empty until a producer pass).
-            carrier_produced_links: std::collections::HashMap::new(),
         })
     }
 

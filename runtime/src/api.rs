@@ -34,7 +34,6 @@ wasmtime::component::bindgen!({
         // pie:core/working-set (kv); rs-working-set below
         "pie:core/working-set.kv-working-set": crate::working_set::kv::KvWorkingSet,
         // pie:core/inference
-        "pie:core/inference.forward-pass": inference::ForwardPass,
         "pie:core/inference.grammar": inference::Grammar,
         "pie:core/inference.matcher": inference::Matcher,
         // pie:core/ptir (thrust-3 P2b) — first-class channels + forward-pass

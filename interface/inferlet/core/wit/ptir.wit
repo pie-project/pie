@@ -114,6 +114,23 @@ interface ptir {
         /// submits of it error with the root cause.
         submit: func(fwd: borrow<forward-pass>) -> result<_, error>;
 
+        /// Compaction (Design-B lazy KV GC): move `n` token KV cells within the
+        /// working set `ws`, for ALL layers, from (`src-page-ids[i]`,
+        /// `src-tok-idx[i]`) -> (`dst-page-ids[i]`, `dst-tok-idx[i]`). The four
+        /// lists are parallel (index `i` = one cell move). Rides the SAME
+        /// in-flight FIFO as `submit`: ordered happens-AFTER every prior fire's
+        /// KV write and happens-BEFORE every later fire's descriptor read, so no
+        /// drain barrier is needed. Correct because KV is stored POST-RoPE (a
+        /// physical slot is pure storage; token positions live in the per-beam
+        /// mask, not the slot). The caller guarantees DISJOINT src/dst spans
+        /// (in-place two-pointer) and computes the post-move layout itself, so no
+        /// result is `take`n — this is a move, not a fire.
+        copy-into: func(
+            ws: borrow<kv-working-set>,
+            dst-page-ids: list<u32>, dst-tok-idx: list<u32>,
+            src-page-ids: list<u32>, src-tok-idx: list<u32>,
+        ) -> result<_, error>;
+
         /// Signal no further submissions (implied by drop): in-flight passes
         /// run as far as their inputs allow; touched channels are unspecified
         /// after close.

@@ -382,45 +382,6 @@ pub struct ForwardRequest {
     /// when the runtime drops a forward-pass.
     pub ptir_release_instance_ids: Vec<u64>,
 
-    // WS8 P2 device-resident next-input link (`forward-pass.next-input`). Sources
-    // some of this request's input tokens device-side from a *prior* forward's
-    // sampled tokens (`pi.sampled`, the producer), instead of host-injecting them
-    // (P1). Per-row + mergeable: under continuous batching one (batched) request
-    // carries N sequences, and a re-formed consumer batch can have rows whose
-    // producers sit in *different* prior batches — so the link is keyed per-row by
-    // a global producer link id, never per-request.
-    //
-    // RETENTION-UNTIL-DRAIN (load-bearing): a producer's `pi.sampled` MUST be
-    // retained until *all* its consumer links drain — the device/batched analog of
-    // P1's drain-before-producer-drop, per-row and across batch re-formation. The
-    // executor / page-manager owns this lifetime (retain on `pipeline_source_link`,
-    // free on drain); the driver's inject only *reads* the resolved retained
-    // pointer. Missing it = use-after-free on a re-formed batch.
-    /// Non-zero ⇒ retain this (batched) forward's `pi.sampled[N]` as a
-    /// device-resident next-input source under this **global** link id, until all
-    /// its consumer links drain (executor/page-manager owned). `0` = not a source.
-    pub pipeline_source_link: u32,
-    /// Drafts-channel routing (§9): which device SOURCE this producer link retains.
-    /// `0 = PrevSample` (retain `pi.sampled[N]`, the single-token carrier — the
-    /// back-compat default) / `1 = PrevDrafts` (retain the composed `[k+1]`
-    /// `[seed, drafts]` window from the program's out[2]/out[1] — the MTP
-    /// drafts-channel). Additive `u8` tag, pure routing (mirrors
-    /// `SamplingBinding::MtpLogits(2)`-vs-`Logits(0)`). `pipeline_source_kinds`
-    /// (below) is the per-request batched form.
-    pub pipeline_source_kind: u8,
-    /// Per fed consumer input: the global producer link id whose retained
-    /// `pi.sampled` is the source (rows may name different producers ⇒ different
-    /// ids; the executor groups by id like `partition_by_program` keyed on
-    /// producer). Parallel to `next_input_src_rows`/`next_input_dest_slots`.
-    pub next_input_producer_links: Vec<u32>,
-    /// Per fed consumer input: the source row within that producer's `pi.sampled`
-    /// — the producer sequence's `sampling_row` identity (echo's `h_sample_idx`).
-    pub next_input_src_rows: Vec<u32>,
-    /// Per fed consumer input: the destination slot in THIS request's input token
-    /// buffer (`token_ids`) that the producer's sampled token fills device-side
-    /// (`u32::MAX` = skip the lane, the `-1` sentinel). Rebased on batch merge by
-    /// the token offset (the only non-global field).
-    pub next_input_dest_slots: Vec<u32>,
 
     // ── Recurrent-state fold (RS_FLAG_FOLD) ─────────────────────────
     // Appended per the schema evolution rule (append-only). One entry per
@@ -449,15 +410,6 @@ pub struct ForwardRequest {
     pub rs_buffer_slot_ids: Vec<u32>,
     pub rs_buffer_slot_indptr: Vec<u32>,
 
-    // ── Device-resident next-input free signal (#6 WS8 P2) ──────────
-    // Appended per the schema evolution rule (append-only). Producer link ids
-    // (`pipeline_source_link`) whose LAST consumer drains on THIS pass: after
-    // the pass's stream sync the executor frees each link's retained
-    // `pi.sampled` copy + its sample-done event (the consumer inject that read
-    // it has completed, so the free is hazard-free). Host-emitted once a link's
-    // consumer refcount reaches 0; the driver is count-agnostic and frees
-    // strictly on this signal. Empty when no retained source is released here.
-    pub next_input_free_links: Vec<u32>,
 
     // ── Programmable-sampling output fast-path (#27 cut #1) ──────────
     // Appended per the schema evolution rule (append-only). Per-output
@@ -537,24 +489,6 @@ pub struct ForwardRequest {
     // (one entry per request); empty ⇒ derive from page metadata (back-compat).
     pub kv_len: Vec<u32>,
 
-    // ── Per-request next-input producer links (PTIR Thrust-2 Bug#2 fix) ──────
-    // Appended per the schema evolution rule (append-only). Supersedes the SCALAR
-    // `pipeline_source_link` for R>1 co-batched fires: one entry per request (0 =
-    // not a producer), so EACH co-batched producer row retains its own sampled
-    // token under its own global link — not just the last (the scalar merge kept
-    // only the final request's link, so every earlier co-batched producer's token
-    // was never retained → its consumer retain-missed → placeholder 0, the R>1
-    // concurrent-decode corruption). The executor retains request `r`'s producer
-    // row (`qo_indptr[r+1]-1`) under `pipeline_source_links[r]` when non-zero.
-    // Empty ⇒ fall back to the scalar `pipeline_source_link` (back-compat / R=1).
-    pub pipeline_source_links: Vec<u32>,
-    // ── Per-request drafts-channel routing (§9) ──────────────────────────────
-    // Parallel to `pipeline_source_links`: `pipeline_source_kinds[r]` routes the
-    // retain SOURCE for request `r`'s producer link (`0 = PrevSample` / `1 =
-    // PrevDrafts`). Empty ⇒ all `PrevSample(0)` (back-compat / the scalar
-    // `pipeline_source_kind` for R=1). Additive; a `PrevDrafts` link retains the
-    // program-composed `[k+1]` `[seed, drafts]` window instead of `pi.sampled[N]`.
-    pub pipeline_source_kinds: Vec<u8>,
 
     // ── Geometry-as-data device handle (PTIR Thrust-1 M5 / contract C1) ──────
     // Appended per the schema evolution rule (append-only). C1-FINAL length
@@ -577,6 +511,26 @@ pub struct ForwardRequest {
     // request length `R` is implicit from the request count. Frozen fork pages
     // count FULL (W6), same convention as the host-fed `kv_len`.
     pub kv_len_device: Vec<u64>,
+
+    // ── KV cell MOVE (Design-B compaction / `pipeline.copy-into`) ────────────
+    // Appended per the schema evolution rule (append-only). When
+    // `kv_move_dst_pages` is NON-EMPTY, this request is a MOVE, not a forward:
+    // the executor short-circuits the model step and moves `N =
+    // kv_move_dst_pages.len()` token KV cells, for ALL layers, from
+    // (`kv_move_src_pages[i]`, `kv_move_src_offs[i]`) -> (`kv_move_dst_pages[i]`,
+    // `kv_move_dst_offs[i]`) via `launch_copy_kv_cells_bf16` on the forward
+    // stream, then returns an empty response. It rides the SAME scheduler FIFO /
+    // stream as forward fires (submitted solo/prebuilt), so ordering is automatic
+    // (happens-after prior fires' KV writes, happens-before later fires' reads) —
+    // no drain barrier. Correct because KV is stored POST-RoPE (a slot is pure
+    // storage; positions live in the mask). All page ids are PHYSICAL pool page
+    // ids; offsets are token offset-in-page. The four arrays are parallel (index
+    // `i` = one cell move); the caller guarantees DISJOINT src/dst spans. All
+    // empty ⇒ an ordinary forward (back-compat).
+    pub kv_move_dst_pages: Vec<u32>,
+    pub kv_move_dst_offs: Vec<u32>,
+    pub kv_move_src_pages: Vec<u32>,
+    pub kv_move_src_offs: Vec<u32>,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`
@@ -1191,50 +1145,6 @@ impl ForwardRequest {
         self.sampling_program_bytes_indptr.len().saturating_sub(1)
     }
 
-    /// Mark this (batched) forward as a device-resident next-input source: its
-    /// `pi.sampled[N]` is retained under the **global** link id `link` until all
-    /// its consumer links drain (executor/page-manager owned). `0` clears it.
-    #[inline]
-    pub fn set_pipeline_source_link(&mut self, link: u32) {
-        self.pipeline_source_link = link;
-    }
-
-    /// Route this producer link's retain SOURCE (drafts-channel §9): `0 =
-    /// PrevSample` (retain `pi.sampled[N]`) / `1 = PrevDrafts` (retain the composed
-    /// `[k+1]` `[seed, drafts]` window). The guest surface is echo's
-    /// `carrier::next_inputs_drafts` + `set_pipeline_source_kind(1)`; a producer
-    /// that never calls it defaults to `PrevSample(0)` (byte-identical).
-    #[inline]
-    pub fn set_pipeline_source_kind(&mut self, kind: u8) {
-        self.pipeline_source_kind = kind;
-    }
-
-    /// Record one per-row device-resident next-input link (WS8 P2): the producer's
-    /// sampled token at `pi.sampled[src_row]` — in the forward retained under
-    /// producer link `producer_link` — fills this request's input token slot
-    /// `dest_slot` device-side. `dest_slot == u32::MAX` skips the lane. The host
-    /// emits these instead of the P1 host inject when device pipelining is active.
-    #[inline]
-    pub fn push_next_input_link(&mut self, producer_link: u32, src_row: u32, dest_slot: u32) {
-        self.next_input_producer_links.push(producer_link);
-        self.next_input_src_rows.push(src_row);
-        self.next_input_dest_slots.push(dest_slot);
-    }
-
-    /// Number of per-row device-resident next-input links on this request.
-    #[inline]
-    pub fn n_next_input_links(&self) -> usize {
-        self.next_input_producer_links.len()
-    }
-
-    /// Signal that producer link `link`'s LAST consumer drains on this pass: the
-    /// executor frees its retained `pi.sampled` copy + sample-done event after
-    /// the pass's stream sync. The host emits this once the link's consumer
-    /// refcount reaches 0 (the driver is count-agnostic — it frees on signal).
-    #[inline]
-    pub fn push_next_input_free_link(&mut self, link: u32) {
-        self.next_input_free_links.push(link);
-    }
 
     /// Reconstruct the [`SamplingProgramSubmission`] at program index `p` from
     /// the SoA carrier — the inverse of [`push_sampling_program`]. Returns

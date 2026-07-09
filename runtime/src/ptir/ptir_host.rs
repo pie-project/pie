@@ -93,8 +93,24 @@ pub struct Channel {
 }
 
 /// A pass's in-flight fires, submit order. Plain mutex: never held across an
-/// await (the fire is popped out, then awaited).
-pub type PendingFires = Arc<Mutex<VecDeque<PendingFire>>>;
+/// await (the op is popped out, then awaited).
+pub type PendingFires = Arc<Mutex<VecDeque<PendingOp>>>;
+
+/// A pipeline FIFO entry: a forward FIRE or a KV cell MOVE (Design-B
+/// compaction). Both hold an ordered slot on the same stream — the B3
+/// happens-before invariant; `take`/`read` drain them in submit order.
+pub enum PendingOp {
+    Fire(PendingFire),
+    Move(PendingMove),
+}
+
+/// One in-flight KV cell MOVE (`pipeline.copy-into`). Unlike a fire it carries
+/// no KV/RS transaction, no bound cells, no logits oneshot to marshal — it just
+/// holds an ordered slot in the pipeline FIFO and finalizes trivially (await the
+/// driver round-trip, discard). The guest computed the post-move layout itself.
+pub struct PendingMove {
+    rx: tokio::sync::oneshot::Receiver<anyhow::Result<crate::inference::ForwardOutput>>,
+}
 
 /// The open KV/arena transaction(s) one in-flight fire holds until it resolves.
 /// Two shapes: the ordinary single-seq / MTP projection (`ptir_kv`), or a
@@ -381,7 +397,7 @@ impl pie::core::ptir::HostChannel for InstanceState {
             }
             let fire = fires.as_ref().and_then(|f| f.lock().unwrap().pop_front());
             match fire {
-                Some(fire) => self.finalize_fire(fire).await?,
+                Some(fire) => self.finalize_op(fire).await?,
                 None => return Ok(Err(ChannelError::Empty.to_string())),
             }
         }
@@ -401,7 +417,7 @@ impl pie::core::ptir::HostChannel for InstanceState {
             }
             let fire = fires.as_ref().and_then(|f| f.lock().unwrap().pop_front());
             match fire {
-                Some(fire) => self.finalize_fire(fire).await?,
+                Some(fire) => self.finalize_op(fire).await?,
                 None => return Ok(Err(ChannelError::Empty.to_string())),
             }
         }
@@ -795,7 +811,7 @@ impl pie::core::ptir::HostPipeline for InstanceState {
             // the pass instead of rewinding.
             self.ctx().table.get_mut(&fwd)?.committed_tokens = next_committed;
 
-            pipe_fires.lock().unwrap().push_back(PendingFire {
+            pipe_fires.lock().unwrap().push_back(PendingOp::Fire(PendingFire {
                 rx,
                 kv: FireKv::Kv(kvtxn),
                 rstxn,
@@ -803,9 +819,76 @@ impl pie::core::ptir::HostPipeline for InstanceState {
                 rs_rep,
                 fwd_rep,
                 cells,
-            });
+            }));
             Ok(Ok(()))
         }
+    }
+
+    /// Compaction (Design-B lazy KV GC): move `n` token KV cells within `ws`,
+    /// all layers, from (`src_page_ids[i]`, `src_tok_idx[i]`) -> (`dst_page_ids[i]`,
+    /// `dst_tok_idx[i]`). Enqueues a `PendingOp::Move` on the SAME pipeline FIFO /
+    /// stream as forward fires (submitted solo/prebuilt), so ordering is automatic
+    /// (happens-after prior fires' KV writes, happens-before later fires' reads) —
+    /// no drain barrier (K6 dissolved). The guest's page ids are the PHYSICAL KV
+    /// block ids it also binds to the `Pages`/`WSlot` ports (Design B works in
+    /// physical page ids directly), so they pass straight through to the move — the
+    /// wire / kernel operate on exactly the physical pages the fires read/write.
+    /// The guest computed the post-move layout itself, so no result is taken.
+    async fn copy_into(
+        &mut self,
+        this: Resource<Pipeline>,
+        _ws: Resource<KvWorkingSet>,
+        dst_page_ids: Vec<u32>,
+        dst_tok_idx: Vec<u32>,
+        src_page_ids: Vec<u32>,
+        src_tok_idx: Vec<u32>,
+    ) -> Anyhow<Result<(), String>> {
+        let n = dst_page_ids.len();
+        if dst_tok_idx.len() != n || src_page_ids.len() != n || src_tok_idx.len() != n {
+            return Ok(Err(format!(
+                "ptir copy_into: the four (dst_page,dst_tok,src_page,src_tok) lists \
+                 must be equal length (got {}, {}, {}, {})",
+                dst_page_ids.len(),
+                dst_tok_idx.len(),
+                src_page_ids.len(),
+                src_tok_idx.len()
+            )));
+        }
+        if n == 0 {
+            return Ok(Ok(()));
+        }
+
+        // Design B works in PHYSICAL page ids directly: the guest's `pool.ids()`
+        // are the physical KV block ids it binds straight to the `Pages` and
+        // `WSlot` ports (no `slot_to_block` resolution — the fire/executor consume
+        // them as-is; `launch_resolve_slot_to_block` is unwired). `copy_into` must
+        // address cells the SAME way, so the move lands on exactly the physical
+        // pages the fires read/write. Resolving through `slot_to_block_table` here
+        // (as an earlier draft did) sent the move to a DIFFERENT physical page than
+        // the fire attended, so the moved cell was never read — pass through.
+        let kv_move_dst_pages: Vec<u32> = dst_page_ids;
+        let kv_move_src_pages: Vec<u32> = src_page_ids;
+
+        // Point this pipeline's FIFO at the move so a later `take`/`read` on any
+        // channel fed by this pipeline drains it in submit order.
+        let pipe_fires = self.ctx().table.get(&this)?.fires.clone();
+
+        let mut req = pie_driver_abi::ForwardRequest::default();
+        req.kv_move_dst_pages = kv_move_dst_pages;
+        req.kv_move_dst_offs = dst_tok_idx;
+        req.kv_move_src_pages = kv_move_src_pages;
+        req.kv_move_src_offs = src_tok_idx;
+        drain_releases_into(&mut req);
+
+        let rx = match crate::inference::submit_prebuilt_async(req, 0, Vec::new(), 0, Vec::new()) {
+            Ok(rx) => rx,
+            Err(e) => return Ok(Err(format!("ptir copy_into: submit failed: {e:#}"))),
+        };
+        pipe_fires
+            .lock()
+            .unwrap()
+            .push_back(PendingOp::Move(PendingMove { rx }));
+        Ok(Ok(()))
     }
 
     async fn close(&mut self, this: Resource<Pipeline>) -> Anyhow<()> {
@@ -818,7 +901,7 @@ impl pie::core::ptir::HostPipeline for InstanceState {
                 let fire = fires.lock().unwrap().pop_front();
                 match fire {
                     Some(f) => {
-                        let _ = self.finalize_fire(f).await;
+                        let _ = self.finalize_op(f).await;
                     }
                     None => break,
                 }
@@ -838,7 +921,7 @@ impl pie::core::ptir::HostPipeline for InstanceState {
                 let fire = fires.lock().unwrap().pop_front();
                 match fire {
                     Some(f) => {
-                        let _ = self.finalize_fire(f).await;
+                        let _ = self.finalize_op(f).await;
                     }
                     None => break,
                 }
@@ -850,6 +933,28 @@ impl pie::core::ptir::HostPipeline for InstanceState {
 }
 
 impl InstanceState {
+    /// Drain one pipeline FIFO entry in submit order: a forward fire finalizes
+    /// its KV/RS txns + marshals outputs; a KV cell MOVE just awaits its driver
+    /// round-trip and discards (no txn, no cells) — an async failure is logged
+    /// (the move poisons nothing the guest `take`s, since it produced no output).
+    async fn finalize_op(&mut self, op: PendingOp) -> Anyhow<()> {
+        match op {
+            PendingOp::Fire(fire) => self.finalize_fire(fire).await,
+            PendingOp::Move(mv) => {
+                match mv.rx.await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!("ptir kv-move (copy_into) fire failed: {e:#}")
+                    }
+                    Err(_) => {
+                        tracing::warn!("ptir kv-move (copy_into) dropped before completion")
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Resolve one in-flight fire: await the driver round-trip, finalize the
     /// KV/RS txns (commit on success / abort on failure; abandon if the guest
     /// dropped the working set mid-flight), then marshal the produced Reader
@@ -1207,7 +1312,7 @@ impl InstanceState {
             }
         };
 
-        pipe_fires.lock().unwrap().push_back(PendingFire {
+        pipe_fires.lock().unwrap().push_back(PendingOp::Fire(PendingFire {
             rx,
             kv: FireKv::DeviceGeom { arena_txn, write_txn },
             rstxn: None,
@@ -1215,7 +1320,7 @@ impl InstanceState {
             rs_rep: None,
             fwd_rep,
             cells,
-        });
+        }));
         Ok(Ok(()))
     }
 

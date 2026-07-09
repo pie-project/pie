@@ -30,6 +30,8 @@
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
 #include "kernels/dtype_cast.hpp"
+#include "kernels/argmax.hpp"
+#include "kernels/kv_paged.hpp"
 #include "distributed.hpp"
 #include "model/loaded_model.hpp"
 #include "kv_cache.hpp"
@@ -39,12 +41,11 @@
 #include "model/qwen3.hpp"
 #include "model/qwen3_forward.hpp"
 #include "ops/gemm.hpp"
-#include "kernels/argmax.hpp"
+
 #include "kernels/pack_dense_mask.hpp"
 #include "kernels/sample_temp.hpp"
 #include "sampler_type.hpp"
 #include "sampling_dispatch.hpp"
-#include "sampling_ir/next_input.hpp"
 #include "sampling_ir/tensor_io.hpp"
 #include "spec_expansion.hpp"
 
@@ -2359,22 +2360,6 @@ inline void write_probes(pie_driver::PieForwardResponseView& out, Executor& exec
 }
 
 // ── G3 PART-2 helpers ────────────────────────────────────────────────────────
-// Free retained-next-input entries (destroy the producer done-event + erase the
-// entry, releasing its DeviceBuffer). Factored out of the inline fire path so it
-// runs either inline (synchronous fires) or deferred (back-to-back, gated on the
-// fire's retire event via `g3_drain`).
-inline void g3_free_retained_links(Executor& executor,
-                                   const std::vector<std::uint32_t>& links) {
-    for (std::uint32_t link : links) {
-        auto it = executor.retained_next_input.find(link);
-        if (it != executor.retained_next_input.end()) {
-            if (it->second.done != nullptr)
-                CUDA_CHECK(cudaEventDestroy(it->second.done));
-            executor.retained_next_input.erase(it);
-        }
-    }
-}
-
 // Drain ready deferred measurements: for each pending item whose `idle_to`
 // first-kernel event has completed (⇒ `idle_from` retire event too — same
 // stream, later), compute the device-idle µs gap and (once per response) stamp
@@ -2395,7 +2380,6 @@ inline void g3_drain(Executor& executor, pie_driver::PieForwardResponseView* out
                 static_cast<std::uint32_t>(ms * 1000.f + 0.5f);
             stamped = true;
         }
-        g3_free_retained_links(executor, p.free_links);
         if (p.idle_from != nullptr) CUDA_CHECK(cudaEventDestroy(p.idle_from));
         if (p.idle_to != nullptr) CUDA_CHECK(cudaEventDestroy(p.idle_to));
         executor.g3_pending.pop_front();
@@ -2448,6 +2432,50 @@ void handle_fire_batch(
     auto& forward_fn           = executor.forward_fn;
     const int max_workspace_tokens = executor.max_workspace_tokens;
     const int graph_pad_page = executor.graph_pad_page;
+
+    // ── KV cell MOVE (Design-B compaction / pipeline.copy-into) ─────────────
+    // A move request short-circuits the whole model step: it just moves N token
+    // KV cells (all layers) on the fire stream and returns an empty response.
+    // It arrives solo/prebuilt on the SAME scheduler FIFO/stream as forward
+    // fires, so ordering is automatic (happens-after prior fires' KV writes,
+    // happens-before later fires' descriptor reads) — the B3 invariant, no
+    // drain barrier. Correct because KV is stored POST-RoPE (a slot is pure
+    // storage; positions live in the mask). See ForwardRequest::kv_move_*.
+    if (view.is_kv_move()) {
+        const auto dst_pages = view.kv_move_dst_pages.as<std::uint32_t>();
+        const auto dst_offs  = view.kv_move_dst_offs.as<std::uint32_t>();
+        const auto src_pages = view.kv_move_src_pages.as<std::uint32_t>();
+        const auto src_offs  = view.kv_move_src_offs.as<std::uint32_t>();
+        const std::size_t N = dst_pages.size();
+        if (dst_offs.size() != N || src_pages.size() != N || src_offs.size() != N) {
+            throw std::runtime_error(
+                "kv-move: the four (dst_page,dst_off,src_page,src_off) arrays "
+                "must be equal length");
+        }
+        if (N > 0) {
+            cudaStream_t stream = cublas.stream();
+            auto d_dst_page = DeviceBuffer<std::uint32_t>::from_host(dst_pages);
+            auto d_dst_off  = DeviceBuffer<std::uint32_t>::from_host(dst_offs);
+            auto d_src_page = DeviceBuffer<std::uint32_t>::from_host(src_pages);
+            auto d_src_off  = DeviceBuffer<std::uint32_t>::from_host(src_offs);
+            const int num_layers = kv_cache.num_layers();
+            for (int l = 0; l < num_layers; ++l) {
+                kernels::launch_copy_kv_cells_bf16(
+                    kv_cache.layer_view(l),
+                    d_dst_page.data(), d_dst_off.data(),
+                    d_src_page.data(), d_src_off.data(),
+                    static_cast<int>(N), stream);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        if (std::getenv("PIE_PTIR_TRACE")) {
+            std::fprintf(stderr, "[ptir-serve] kv-move req_id=%u: moved %zu cells "
+                         "x %d layers\n", req_id, N, kv_cache.num_layers());
+        }
+        out_resp = pie_driver::PieForwardResponseView{};
+        out_resp.num_requests = 0;
+        return;
+    }
 
     // Track whether the custom-mask path was populated this fire so the
     // forward kernel knows whether to consume `pi.custom_mask`. Sizes are
@@ -2787,14 +2815,20 @@ void handle_fire_batch(
         // W2.1. Correctness is validated once a real device-geometry fire exists.
         if (dg_resolved && fg.has_mask && !fg.mask.empty()) {
             const int lanes = static_cast<int>(qo_view.size()) - 1;
-            if (lanes > 0 &&
-                fg.mask.size() % static_cast<std::size_t>(lanes) == 0) {
+            // Total query rows = qo_indptr.back(). For a 1-query/lane decode this
+            // equals `lanes`; for a variable-length prefill a single lane carries
+            // N query rows, so the dense mask is [TOTAL_Q, STRIDE] (one row per
+            // QUERY token), STRIDE = mask.size()/TOTAL_Q.
+            const int total_q =
+                lanes > 0 ? static_cast<int>(qo_view[lanes]) : 0;
+            if (lanes > 0 && total_q > 0 &&
+                fg.mask.size() % static_cast<std::size_t>(total_q) == 0) {
                 const int stride =
-                    static_cast<int>(fg.mask.size() / static_cast<std::size_t>(lanes));
+                    static_cast<int>(fg.mask.size() / static_cast<std::size_t>(total_q));
                 const std::uint32_t page =
                     static_cast<std::uint32_t>(kv_cache.page_size());
                 // Per-lane physical KV span klen[l] from the resolved page geometry,
-                // and the packed byte-offset CSR (ceil(klen/8) per lane).
+                // and the packed byte-offset CSR (ceil(qo_len[l]·klen[l]/8) per lane).
                 std::vector<std::uint32_t> klen(static_cast<std::size_t>(lanes), 0);
                 std::vector<std::int32_t> mindptr(static_cast<std::size_t>(lanes) + 1, 0);
                 for (int l = 0; l < lanes; ++l) {
@@ -2805,8 +2839,12 @@ void handle_fire_batch(
                         (l < static_cast<int>(fg.kv_last_page_lens.size()))
                             ? fg.kv_last_page_lens[l] : 0u;
                     klen[l] = np == 0 ? 0u : (np - 1) * page + lpl;
+                    const std::uint32_t qo_len =
+                        qo_view[l + 1] - qo_view[l];
+                    const std::uint64_t bits =
+                        static_cast<std::uint64_t>(qo_len) * klen[l];
                     mindptr[l + 1] = mindptr[l] +
-                        static_cast<std::int32_t>((klen[l] + 7u) / 8u);
+                        static_cast<std::int32_t>((bits + 7u) / 8u);
                 }
                 const std::size_t packed_bytes =
                     static_cast<std::size_t>(mindptr[lanes]);
@@ -2817,12 +2855,14 @@ void handle_fire_batch(
                         std::span<const std::uint8_t>(fg.mask));
                     auto klen_dev = DeviceBuffer<std::uint32_t>::from_host(
                         std::span<const std::uint32_t>(klen));
+                    auto qo_dev = DeviceBuffer<std::uint32_t>::from_host(
+                        std::span<const std::uint32_t>(qo_view.data(), qo_view.size()));
                     pi.custom_mask_indptr.copy_from_host(
                         std::span<const std::int32_t>(mindptr));
                     CUDA_CHECK(cudaMemsetAsync(pi.custom_mask.data(), 0,
                                                packed_bytes, cublas.stream()));
                     kernels::launch_pack_dense_mask(
-                        kvm_dev.data(), klen_dev.data(),
+                        kvm_dev.data(), klen_dev.data(), qo_dev.data(),
                         pi.custom_mask_indptr.data(), pi.custom_mask.data(),
                         lanes, stride, cublas.stream());
                     have_custom_mask = true;
@@ -3071,76 +3111,6 @@ void handle_fire_batch(
 
         const auto t_h2d_end = clock::now();
 
-        // ── #6 WS8 P2: device-resident next-input inject ────────────────
-        // Source some of this fire's input tokens (`pi.tokens`) device-side from a
-        // PRIOR producer forward's retained `pi.sampled` (the next-input link), in
-        // place of a host-injected token — removing the host `output()`+copy between
-        // decode passes. Runs on the forward's stream so it strictly precedes the
-        // forward's `pi.tokens` read; event-gated on each producer's sample-done so
-        // the retained copy is ready cross-pass. The carrier groups entries by
-        // producer link id; one inject per distinct producer. A producer not in the
-        // retained map (e.g. its source pass hasn't run) is skipped.
-        if (!view.next_input_producer_links.empty()) {
-            const std::uint32_t* prod = view.next_input_producer_links.data();
-            const std::uint32_t* srcs = view.next_input_src_rows.data();
-            const std::uint32_t* dsts = view.next_input_dest_slots.data();
-            const std::size_t nlinks = view.next_input_producer_links.size();
-            std::size_t i = 0;
-            while (i < nlinks) {
-                const std::uint32_t link = prod[i];
-                std::vector<sampling_ir::NextInputLink> links;
-                for (; i < nlinks && prod[i] == link; ++i)
-                    links.push_back(sampling_ir::NextInputLink{srcs[i], dsts[i]});
-                auto it = executor.retained_next_input.find(link);
-                if (it != executor.retained_next_input.end()) {
-                    sampling_ir::inject_next_input_after(
-                        it->second.copy.data(), links, pi.tokens.data(),
-                        it->second.done, cublas.stream());
-                    // Plumbing-gate value-dump (charlie, PIE_DRAFTS_VERIFY): the
-                    // injected pi.tokens[dest_pos] must equal the retained window
-                    // (byte-identity through retain→inject) + src_rows==[0..=k].
-                    static const bool drafts_verify_inj =
-                        std::getenv("PIE_DRAFTS_VERIFY") != nullptr;
-                    if (drafts_verify_inj) {
-                        CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
-                        std::cerr << "[drafts-verify] INJECT link=" << link << " src_rows=[";
-                        for (std::size_t j = 0; j < links.size(); ++j)
-                            std::cerr << links[j].src_row << (j + 1 < links.size() ? "," : "");
-                        std::cerr << "] injected=[";
-                        for (std::size_t j = 0; j < links.size(); ++j) {
-                            std::int32_t v = 0;
-                            CUDA_CHECK(cudaMemcpy(&v, pi.tokens.data() + links[j].dest_pos,
-                                                  sizeof(std::int32_t), cudaMemcpyDeviceToHost));
-                            std::cerr << v << (j + 1 < links.size() ? "," : "");
-                        }
-                        std::cerr << "]\n";
-                    }
-                    if (ir_trace)
-                        std::cerr << "[ir-trace] next-input INJECT link=" << link
-                                  << " rows=" << links.size() << " → pi.tokens\n";
-                } else {
-                    // #23 Part B(a) fence — retain-MISS = no retained source: the
-                    // producer pass is un-run or errored, so there is no buffer to
-                    // inject from. This is NOT a use-after-free: the deferred-free
-                    // (next_input_free_links, all-consumers-drained gate ~3690) frees
-                    // the retain-FOUND buffer strictly AFTER its counted inject drains,
-                    // so a freed buffer is never injected from; here there is simply no
-                    // buffer. The conditional read skips cleanly (no copy, no stream-
-                    // point — the consumer's forward graph is the stream-point and runs
-                    // regardless). The dst keeps its valid host placeholder (a stale,
-                    // hence DIVERGENT, token), but correctness is the #23 Part A host
-                    // cascade: this consumer's `consumed_producer_link` is unresolved
-                    // ⇒ fail-closed ⇒ effective_success=false ⇒ the divergent token is
-                    // rolled back, never committed. So: clean skip + cascade-abort, no
-                    // device flag, no race.
-                    if (ir_trace)
-                        std::cerr << "[ir-trace] next-input retain-miss link=" << link
-                                  << " rows=" << links.size()
-                                  << " → clean skip (producer un-run/errored; consumer "
-                                     "cascade-aborts via Part A fail-closed, no commit)\n";
-                }
-            }
-        }
 
         // ── Forward pass ────────────────────────────────────────
         // Either replay a captured CUDA graph or invoke `forward_fn.body`
@@ -3320,59 +3290,6 @@ void handle_fire_batch(
             }
         }
 
-        // ── #6 WS8 P2: device-resident next-input retain ────────────────
-        // PER-REQUEST (thrust-2 Bug#2, bravo — UNTESTED CUDA, needs GPU verify):
-        // each producer REQUEST retains ITS OWN row-slice `[qo_indptr[r],
-        // qo_indptr[r+1])` of `pi.sampled` under ITS OWN link. The old scalar path
-        // retained all N rows under `view.pipeline_source_link` = the LAST request's
-        // id (the host merge overwrote it), so R>1 co-batched producers collapsed:
-        // earlier producers' tokens were never retained → their consumers
-        // retain-missed → placeholder token 0 (or the last link's row-0 token
-        // cross-injected, 9707) → wrong Q&K → garbage. Retaining each request's
-        // row-slice (indexed 0-based) preserves the inject/`src_row` contract: a
-        // consumer reads `retained[L_r][src_row]` where `src_row` is the row WITHIN
-        // request r (the builder's `n_rows-1`), now relative to that slice.
-        if (view.pipeline_source_links.as<std::uint32_t>().size() > 0 && N > 0) {
-            const auto psl_view = view.pipeline_source_links.as<std::uint32_t>();
-            const auto qo_psl_view = view.qo_indptr.as<std::uint32_t>();
-            for (std::size_t r = 0;
-                 r + 1 < qo_psl_view.size() && r < psl_view.size(); ++r) {
-                const std::uint32_t link = psl_view[r];
-                if (link == 0) continue;
-                const std::int64_t lo = static_cast<std::int64_t>(qo_psl_view[r]);
-                const std::int64_t hi = static_cast<std::int64_t>(qo_psl_view[r + 1]);
-                const std::int64_t rows = hi - lo;
-                if (rows <= 0 || hi > static_cast<std::int64_t>(N)) continue;
-                Executor::RetainedSampled& ret = executor.retained_next_input[link];
-                if (ret.copy.size() < static_cast<std::size_t>(rows))
-                    ret.copy = DeviceBuffer<std::int32_t>::alloc(static_cast<std::size_t>(rows));
-                if (ret.done == nullptr) CUDA_CHECK(cudaEventCreate(&ret.done));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    ret.copy.data(), pi.sampled.data() + lo,
-                    sizeof(std::int32_t) * static_cast<std::size_t>(rows),
-                    cudaMemcpyDeviceToDevice, cublas.stream()));
-                CUDA_CHECK(cudaEventRecord(ret.done, cublas.stream()));
-                if (ir_trace)
-                    std::cerr << "[ir-trace] next-input RETAIN (per-req) link=" << link
-                              << " req=" << r << " rows=" << rows << "\n";
-            }
-        } else if (view.pipeline_source_link != 0 && N > 0) {
-            // Back-compat scalar path (empty `pipeline_source_links`, e.g. a
-            // pre-fix caller): retain the whole `pi.sampled[N]` under one link.
-            Executor::RetainedSampled& r =
-                executor.retained_next_input[view.pipeline_source_link];
-            if (r.copy.size() < static_cast<std::size_t>(N))
-                r.copy = DeviceBuffer<std::int32_t>::alloc(static_cast<std::size_t>(N));
-            if (r.done == nullptr) CUDA_CHECK(cudaEventCreate(&r.done));
-            CUDA_CHECK(cudaMemcpyAsync(
-                r.copy.data(), pi.sampled.data(),
-                sizeof(std::int32_t) * static_cast<std::size_t>(N),
-                cudaMemcpyDeviceToDevice, cublas.stream()));
-            CUDA_CHECK(cudaEventRecord(r.done, cublas.stream()));
-            if (ir_trace)
-                std::cerr << "[ir-trace] next-input RETAIN (scalar back-compat) link="
-                          << view.pipeline_source_link << " rows=" << N << "\n";
-        }
 
         // Sample plan was built above the prepare hook (hoisted so the
         // sampling uploads are ready before the forward graph launch). The host
@@ -3429,8 +3346,6 @@ void handle_fire_batch(
             gp.idle_from = executor.g3_prev_retire;
             gp.idle_to = executor.g3_cur_first;   // move ownership into the pending pair
             executor.g3_cur_first = nullptr;
-            const std::uint32_t* fl = view.next_input_free_links.data();
-            gp.free_links.assign(fl, fl + view.next_input_free_links.size());
             executor.g3_pending.push_back(std::move(gp));
             executor.g3_prev_retire = g3_retire;
         } else {
@@ -3445,30 +3360,6 @@ void handle_fire_batch(
         }
         const auto t_sync_end = clock::now();
 
-        // ── #6 WS8 P2: free retained next-input sources signaled this pass ──
-        // The host appends a producer link id to `next_input_free_links` once its
-        // LAST consumer drained (whose inject read the retained copy above). The
-        // stream sync just completed → that inject finished → freeing the retained
-        // buffer + its event is hazard-free, and the global id is reclaimable.
-        // Driver is count-agnostic: it frees strictly on the host signal.
-        // G3 PART-2: skipped when back-to-back (g3_go) — there was no sync, so the
-        // free is deferred into the pending item above and processed by `g3_drain`
-        // once the fire's retire event completes (the consuming inject has drained).
-        if (!g3_go && !view.next_input_free_links.empty()) {
-            const std::uint32_t* freed = view.next_input_free_links.data();
-            const std::size_t nfree = view.next_input_free_links.size();
-            for (std::size_t k = 0; k < nfree; ++k) {
-                auto it = executor.retained_next_input.find(freed[k]);
-                if (it != executor.retained_next_input.end()) {
-                    if (it->second.done != nullptr)
-                        CUDA_CHECK(cudaEventDestroy(it->second.done));
-                    executor.retained_next_input.erase(it);  // DeviceBuffer dtor frees the copy
-                    if (ir_trace)
-                        std::cerr << "[ir-trace] next-input FREE link=" << freed[k]
-                                  << " (host all-consumers-drained signal)\n";
-                }
-            }
-        }
 
         // ── #27 cut #1 (a2): output→tensor fast-path ─────────────────────
         // If the host bound per-output pinned dsts (`sampling_output_dst_ptrs`),

@@ -198,22 +198,6 @@ struct PieForwardRequestView {
     PieSlice<std::uint64_t> ptir_release_channel_ids;       // global channel ids to free (W0.3 release marker)
     PieSlice<std::uint64_t> ptir_release_instance_ids;      // instance ids to free (W0.3 release marker)
 
-    // WS8 P2 device-resident next-input link (#6). `pipeline_source_link != 0`
-    // ⇒ retain this (batched) forward's `pi.sampled[N]` under that global link
-    // id; the consumer arrays source some of this fire's input tokens (`pi.tokens`)
-    // device-side from a prior producer's retained `pi.sampled`. Parallel arrays,
-    // one entry per fed consumer input. See schema.rs.
-    std::uint32_t           pipeline_source_link = 0;
-    PieSlice<std::uint32_t> pipeline_source_links;  // per-request producer link (R>1 co-batch); empty ⇒ scalar fallback
-    // Drafts-channel routing (§9): retain SOURCE per producer link. 0 = PrevSample
-    // (retain pi.sampled[N]) / 1 = PrevDrafts (retain the composed [k+1] [seed,drafts]
-    // window). Scalar (R=1) + per-request batched; empty/0 ⇒ all PrevSample.
-    std::uint8_t            pipeline_source_kind = 0;
-    PieSlice<std::uint8_t>  pipeline_source_kinds;
-    PieSlice<std::uint32_t> next_input_producer_links;  // global producer link id per fed input
-    PieSlice<std::uint32_t> next_input_src_rows;         // src row in the producer's pi.sampled
-    PieSlice<std::uint32_t> next_input_dest_slots;       // dest position in this fire's pi.tokens
-    PieSlice<std::uint32_t> next_input_free_links;       // link ids whose last consumer drains here
 
     // #27 cut #1 output→tensor fast-path carrier (per-output host pinned dsts,
     // CSR per program). Empty ⇒ legacy ForwardResponse marshal.
@@ -279,6 +263,18 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> audio_feature_indptr;    // [num_clips + 1] byte offsets
     PieSlice<std::uint32_t> audio_anchor_rows;       // batch row offset per clip
     PieSlice<std::uint32_t> audio_indptr;            // per-request CSR
+
+    // KV cell MOVE (Design-B compaction / pipeline.copy-into). When
+    // `kv_move_dst_pages` is non-empty this request is a MOVE, not a forward:
+    // move N=len token KV cells (all layers) from (src_page,src_off)->(dst_page,
+    // dst_off) via launch_copy_kv_cells_bf16 on the fire stream, then return an
+    // empty response. Physical page ids; token offset-in-page. Empty ⇒ a
+    // normal forward. See schema.rs.
+    PieSlice<std::uint32_t> kv_move_dst_pages;
+    PieSlice<std::uint32_t> kv_move_dst_offs;
+    PieSlice<std::uint32_t> kv_move_src_pages;
+    PieSlice<std::uint32_t> kv_move_src_offs;
+    constexpr bool is_kv_move() const noexcept { return !kv_move_dst_pages.empty(); }
 
     std::uint32_t driver_id;
     std::uint8_t  single_token_mode;
@@ -575,20 +571,6 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.ptir_release_channel_ids_ptr, f.ptir_release_channel_ids_len);
     out.ptir_release_instance_ids =
         slice_from(f.ptir_release_instance_ids_ptr, f.ptir_release_instance_ids_len);
-    out.pipeline_source_link = f.pipeline_source_link;
-    out.pipeline_source_links =
-        slice_from(f.pipeline_source_links_ptr, f.pipeline_source_links_len);
-    out.pipeline_source_kind = f.pipeline_source_kind;
-    out.pipeline_source_kinds =
-        slice_from(f.pipeline_source_kinds_ptr, f.pipeline_source_kinds_len);
-    out.next_input_producer_links =
-        slice_from(f.next_input_producer_links_ptr, f.next_input_producer_links_len);
-    out.next_input_src_rows =
-        slice_from(f.next_input_src_rows_ptr, f.next_input_src_rows_len);
-    out.next_input_dest_slots =
-        slice_from(f.next_input_dest_slots_ptr, f.next_input_dest_slots_len);
-    out.next_input_free_links =
-        slice_from(f.next_input_free_links_ptr, f.next_input_free_links_len);
     out.sampling_output_dst_ptrs =
         slice_from(f.sampling_output_dst_ptrs_ptr, f.sampling_output_dst_ptrs_len);
     out.sampling_output_dst_lens =
@@ -623,6 +605,12 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
     out.audio_feature_indptr   = slice_from(f.audio_feature_indptr_ptr, f.audio_feature_indptr_len);
     out.audio_anchor_rows      = slice_from(f.audio_anchor_rows_ptr, f.audio_anchor_rows_len);
     out.audio_indptr           = slice_from(f.audio_indptr_ptr, f.audio_indptr_len);
+
+    // KV cell MOVE (Design-B compaction / pipeline.copy-into) — pass-through.
+    out.kv_move_dst_pages      = slice_from(f.kv_move_dst_pages_ptr, f.kv_move_dst_pages_len);
+    out.kv_move_dst_offs       = slice_from(f.kv_move_dst_offs_ptr, f.kv_move_dst_offs_len);
+    out.kv_move_src_pages      = slice_from(f.kv_move_src_pages_ptr, f.kv_move_src_pages_len);
+    out.kv_move_src_offs       = slice_from(f.kv_move_src_offs_ptr, f.kv_move_src_offs_len);
 
     // Sampler SoA. The wire now carries raw per-attribute arrays (the AoS
     // `Sampler` enum is gone), so most fields pass straight through. Only the

@@ -548,6 +548,34 @@ impl Pipeline {
     pub fn close(&self) {
         self.wit.close();
     }
+
+    /// `copy_into(&ws, dst_pages, dst_toks, src_pages, src_toks)` — Design-B
+    /// lazy KV compaction: move `n` token KV cells within `ws` (all layers)
+    /// from (`src_page_ids[i]`, `src_tok_idx[i]`) to (`dst_page_ids[i]`,
+    /// `dst_tok_idx[i]`). Rides the SAME run-ahead FIFO as `submit` (ordered
+    /// after prior fires' writes, before later fires' reads — no barrier).
+    /// Correct because KV is stored post-RoPE (a slot is pure storage). Page ids
+    /// are the PHYSICAL KV page ids (the same ids bound to the `Pages`/`WSlot`
+    /// ports — Design B works in physical page ids directly); token indices are
+    /// in-page offsets. The four lists are parallel; the caller guarantees
+    /// disjoint src/dst spans and computes the post-move layout itself (a move,
+    /// not a fire — no result).
+    pub fn copy_into(
+        &self,
+        ws: &WorkingSet,
+        dst_page_ids: &[u32],
+        dst_tok_idx: &[u32],
+        src_page_ids: &[u32],
+        src_tok_idx: &[u32],
+    ) -> Result<(), String> {
+        self.wit.copy_into(
+            ws.kv.as_ref(),
+            dst_page_ids,
+            dst_tok_idx,
+            src_page_ids,
+            src_tok_idx,
+        )
+    }
 }
 
 impl Default for Pipeline {

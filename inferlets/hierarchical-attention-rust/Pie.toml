@@ -1,6 +1,6 @@
 [package]
 name = "hierarchical-attention-rust"
-version = "0.1.0"
+version = "0.4.0"
 description = "Hierarchical attention mask demo over chunk summaries plus selected local chunk"
 authors = ["Abraam Mankaruse"]
 

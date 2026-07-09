@@ -166,11 +166,44 @@ the decode carry. Mapping:
 | `next-inputs` / `next-attention-mask` / `set-pipeline-source-kind` / `fresh-generate` | deleted with nothing in their place: loop-carried channel ping-pong IS the carrier (`tok.put(t)` is next-inputs; a `prev_drafts` channel is the drafts carrier-kind; no host-pending carrier state exists to need fresh-generate) |
 | `kv-working-set(set, inp-start, ...)` scalar geometry | `attn_working_set` port family (pages/page_indptr/kv_len/w_slot/w_off channels) |
 | `execute` | `pipeline.submit` |
-| `input-image` / `input-audio` | SURVIVES in shape: resources cannot ride in bytes, so media splice becomes embed-family ports plus parallel handle lists on `new` (e.g. `images: list<borrow<image>>`). Future additive change. |
+| `input-image` / `input-audio` | new `EmbedPixels` port (media-embed family), channel-native — see D7-MEDIA below. `submit` stays arg-free; pixels ride a channel like tokens ride `EmbedTokens`. |
 | `rs-fold-buffered(tokens)` | OPEN: rs descriptor port vs channel-fed (A.7) |
 
 `grammar`/`matcher` stay: `matcher.mask()` produces the words the guest puts
 into the grammar-mask channel on both paths.
+
+**D7-MEDIA. Media embed = a new `EmbedPixels` port (channel-native)** (2026-07-08,
+Oracle — RESOLVES the `input-image`/`input-audio` open question above). `submit(fwd)`
+stays arg-free; media reaches the fire through a channel, exactly like tokens through
+`EmbedTokens`:
+```rust
+let pixels = Channel::new([MAX_PATCH, PATCH_DIM], dtype::f32); // ragged, indptr-bounded
+let anchor = Channel::new([1], dtype::u32);
+b.bind_port(Port::EmbedPixels, &pixels);   // driver encoder runs + scatters at anchor
+pixels.put(img);        // sugar: extract pixels+grid from the image resource, pad
+anchor.put([anchor_pos]);
+pipeline.submit(&fwd);
+```
+- New `Port::EmbedPixels` (media-embed family). The driver's vision/audio encoder runs
+  when the port's channel is populated (triggered like `EmbedTokens` triggers the embed
+  table) and scatters embeddings at the anchor rows.
+- SPLIT (same as classic; only the trigger changes — channel, not handle-list): the
+  `image`/`audio` resource stays a HOST-side decoder (pixels + grid + positions); the
+  encoder stays DRIVER-side (a model sub-network, not a PTIR op). Anchor travels WITH its
+  pixels (same channel) → no index-coupled parallel lists.
+- RESIDUALS (both existing patterns): ragged pixel size → CSR (`MAX_PATCH` bound +
+  indptr channel, like Pages/PageIndptr); grid + M-RoPE → small side channel, or host
+  computes M-RoPE into the `Positions` channel as today.
+- PROPERTIES: identity/hash untouched (pixels are put/seed data, not container bytes →
+  compile cache unaffected); hot decode path untouched. This UNBLOCKS the full A4 classic
+  `forward-pass` retirement; migration target = `image-qa`.
+- SCOPE: "audio embed" = INPUT (media.wit `audio`, same splice shape). Audio OUTPUT
+  (audio-out.wit / `AdapterOp::GenerateAudio`) is a separate cold path — OUT OF SCOPE.
+
+UNIFYING PRINCIPLE (both K3/K6 + D7-MEDIA): everything the host feeds a fire is a
+CHANNEL; everything that must be ordered is an ENTRY on the pipeline FIFO. Media stops
+being a submit argument (becomes a port/channel); compaction stops being a special
+barrier (becomes an ordinary ordered op in the same FIFO).
 
 **D8. Naming: `ptir-dsl`.** `pie-ptir` defines the language, `ptir-dsl` is its
 embedded surface, `inferlet` is the runtime binding.
@@ -240,7 +273,86 @@ the §3 container is sha256-identical to the pre-A1 bytes. Consumer inferlets
 other PTIR-path tests) to `inferlet::ptir::prelude`. Native goldens stay in
 `ptir-dsl`/`pie-ptir`.
 
-**A4: retire the classic forward-pass** (separate PR series). Once the bridge
+**A4 — ORACLE GREENLIT (2026-07-08): "completely clean up the legacy forward
+pass."** Scope-first inventory of every live classic-`forward-pass` consumer:
+- text/carrier: retire decode-carry funcs (input-tokens, attention-mask,
+  next-inputs, next-attention-mask, set-pipeline-source-kind, fresh-generate) —
+  D7 maps them to ptir embed/positions/attn-mask ports + loop-carried channel
+  ping-pong. SDK: carrier.rs, prefill.rs, sampler.rs classic parts.
+- LIVE inferlets still on classic (need ptir rewrite): mask family
+  (hierarchical-attention, attention-sink, windowed-attention → attn-mask port,
+  no WIT change); media family (image-qa, audio-qa, video-qa → input-image/
+  input-audio); rs family (linearfold=rs-working-set+rs-fold-buffered,
+  generate-gdn=rs-working-set). (mtp-*/runahead/specverify/carrierprobe are the
+  DELIBERATELY-DEAD sampling-edsl inferlets — excluded, not migrated.)
+- TWO genuine contract gaps to full deletion (NOT to be invented):
+  (1) MEDIA HANDLES on ptir `forward-pass.new` — ptir.wit `new` has NO image/
+      audio handle list; resources can't ride container bytes. D7's undesigned
+      "images: list<borrow<image>>" additive param (WIT+host+driver). HARD BLOCK.
+  (2) rs-fold-buffered OP HOME (A.7) — rs *binding* already rides ptir `new`
+      (rs-working-sets param); only the fold op needs a port/channel home.
+- FLAGGED to Oracle+manager: full-leap-now (design media-handle + rs-fold ports,
+  migrate all 8 live inferlets, delete classic across 5 layers) vs stage
+  (retire decode-carry + migrate text/mask now; slim classic kept for media+rs
+  interim). Awaiting the media-handle contract call before destructive deletion.
+
+**A4 MASK MIGRATION (greenlit by manager 2026-07-08, unblocked half) — DEVICE-GREEN.**
+Approach DECIDED: no ptir inferlet did variable-length prompt prefill (ptir-greedy-e2e
+is dead + seeds 1 tok; beam-designb/mtp-grammar seed fixed toks). Device-proven ptir
+shape = fixed 1-token/pass explicit-write (beam-designb). So masks migrate as
+TOKEN-AT-A-TIME (B=1), geometry + mask evolved IN-GRAPH in the epilogue (beam-designb
+wire-form). No WIT/contract change.
+- FINDING (device sub-question): the embed token MUST be DEVICE loop-carried — the
+  runtime resolves the EmbedTokens port from the device channel value (ptir_geometry.rs:113);
+  a host-fed embed leaves token_ids empty → ptir_kv_prepare rejects it (ptir_kv.rs:55).
+  So these migrate as GENERATION-FROM-SEED (fire-0 embeds prompt[0]; epilogue feeds each
+  argmax back into tok_in). Host-injected variable-length prompt PREFILL on the ptir
+  token-at-a-time path is NOT supported — a real limitation to flag (the sliding-window /
+  sink geometry itself is fully device-proven). Host-writer channels are for MASKS only.
+- GOTCHAS (ptir-dsl value-id desync, both fixed): (1) an early/interleaved `put` in the
+  epilogue desyncs the traced SSA value-ids → discipline: ALL takes+compute first, ALL
+  puts LAST (beam-designb). (2) a lazy VECTOR `Tensor::constant` (e.g. page_indptr
+  `[0,POOL_PAGES]`) materializes at put-time, interleaving with auto-drain ChanTakes →
+  forward-reference → build such vectors as compute NODES (`mul(&iota(2), POOL_PAGES)`).
+- windowed-attention: MIGRATED to inferlet::ptir. In-graph sliding-window mask
+  (j<=p AND j+window>p). DEVICE-GREEN: cuda_windowed_attention_e2e →
+  tokens=[14582,198,3838,374,279,1196,1196,1052].
+- attention-sink: MIGRATED. In-graph sink+window mask (j<=p AND (j<sink OR j+window>p)).
+  DEVICE-GREEN: cuda_attention_sink_e2e → tokens=[14582,198,3838,374,279,897,315,279].
+- hierarchical-attention-rust: MIGRATED (in-graph). KEY FINDING: the hierarchical
+  keep-set (sink + every chunk header + selected chunk body + recent window) LOOKS
+  arbitrary but, once the prompt-LEXICAL chunk selection is dropped (unavoidable —
+  no prompt prefill on the ptir path), it is a PURE FUNCTION of the query position +
+  constant chunk params → rides the proven IN-GRAPH pattern, no per-pass host mask
+  needed. Mask (col j, query base): causal(j<=base) AND (j<sink OR j%chunk<summary OR
+  j+window>base OR the `selected` most-recent-completed chunks). Recency replaces
+  lexical relevance. DEVICE-GREEN: cuda_hierarchical_attention_e2e →
+  tokens=[14582,198,3838,374,279,897,315,279] (varied, non-degenerate).
+- HOST-WRITER MASK — REAL FORK, FLAGGED (not needed after all): I first authored
+  hierarchical with a per-pass HOST-WRITTEN dense [1,POOL] attn_mask (the framing
+  the manager expected). It BUILT + ran + the driver ACCEPTED it (no crash), BUT the
+  tokens were DEGENERATE (14582×8) — the host puts did NOT take effect; attention
+  collapsed to a fixed point. Decisive A/B: identical code/params, only host-written
+  vs in-graph mask → degenerate vs varied. ROOT: beam-designb (the cited precedent)
+  only SEEDS its mask via Channel::from_shaped then DEVICE-evolves it (mask.take/put
+  in-graph) — there is NO per-pass host-written-attn_mask precedent. AttnMask is NOT
+  a geometry port (absent from ptir_geometry.rs resolve_opt); the driver reads it
+  from the channel's COMMITTED device cell (descriptor_resolve.hpp:171-175) BEFORE
+  the forward. A host `.put` stages via host_puts→host_feed H2D, but evidently is not
+  landed into the committed cell read at descriptor-resolve time for a device-geometry
+  fire (ordering/registration gap). => a genuinely arbitrary per-pass host-written
+  attention mask is a DISTINCT, currently-UNPROVEN device pattern. NO current inferlet
+  needs it (hierarchical didn't). DEFER; if ever needed, it needs a runtime
+  staging/commit fix (host_feed → committed cell before descriptor resolve), not an
+  inferlet change.
+- GUARDRAIL: cuda_beam_designb_e2e stays byte-identical
+  [106984,1,9370,91282,33108,101982,98362,125302] (no shared code touched).
+- The token-at-a-time B=1 explicit-write masked-decode PATTERN is DEVICE-PROVEN
+  (3 e2es: windowed/sink/hierarchical, same driver path as beam-designb). ALL THREE
+  legacy mask inferlets migrated off the classic forward-pass. Debug op-dump removed
+  from validate.rs.
+
+**A4 (original): retire the classic forward-pass** (separate PR series). Once the bridge
 covers the test matrix: delete the classic `forward-pass` resource from
 `inference.wit` (keep `grammar`/`matcher`), the host implementation, the
 carrier machinery (`pipeline-source-link` accumulate, retained buffers), the
@@ -252,6 +364,154 @@ includes and the `NextInputLink` injection around
 `frame_carrier` is ALSO Track C's X2 mechanism, so only the classic-carrier use
 dies here, coordinate with C). Blocked on: media splice ports (D7) or an
 explicit decision to keep classic alive only for multimodal inferlets interim.
+
+**A4 FULL-REMOVAL SCOPE (honest census, 2026-07-09 — the Track-A endgame).**
+The classic `forward-pass` is NOT a leaf: the DEFAULT decode path
+(`carrier::submit_pass` in `sdk/rust/inferlet/src/carrier.rs`, used by
+text-completion and ~40 inferlets via the high-level facade) still rides it —
+`inference::ForwardPass` (classic) and `ptir::ForwardPass` (new) coexist. Full
+removal therefore = the whole remaining Track-A endgame, staged:
+  1. **LINCHPIN — device-prove ptir multi-token PROMPT PREFILL.** No ptir
+     inferlet prefills a real prompt (ptir-greedy-e2e + all masks seed ONE tok
+     then decode). The geometry layer DOES build multi-token host-known
+     `token_ids` (ptir_geometry.rs test: `token_ids==[100,200]`, multi-row
+     qo_indptr) but it is UNPROVEN on device. The classic loop's variable-length
+     prefill is the capability that must exist on ptir first — everything below
+     depends on it. Prover: a HOST-geometry ptir fire (no descriptor port
+     channel-bound → host-known) with an N-token EmbedTokens + N-cell KV write,
+     then decode; new cuda e2e; beam-designb guardrail green.
+  2. Reimplement the generate loop (prefill + decode + run-ahead carrier
+     semantics: next-inputs / pipeline-source-kind / next-attention-mask /
+     fresh-generate) on the ptir Pipeline (beam-designb/drafts-retain already
+     prove pipelined token-carry).
+  3. Migrate the ~40 default inferlets (mechanical once the loop moves).
+  4. Media inferlets (image-qa/audio-qa/video-qa) via the D7 `EmbedPixels` port
+     (RESOLVED contract, driver-encoder trigger UNBUILT).
+  5. rs-fold inferlets (generate-gdn) via an rs-fold port (contract partial).
+  6. DELETE classic across the 5 layers (WIT resource + host impl + carrier.rs /
+     classic prefill.rs/sampler.rs/program.rs + driver classic-carrier code).
+Load-bearing contract calls flagged, NOT invented: the ptir default-generate /
+prefill / carrier surface (step 2) and the EmbedPixels driver encoder (step 4).
+Starting on step 1 (the linchpin) per the human's directive to drive the removal.
+
+**STEP-1 RESULT (2026-07-09, device-verified on the 4090) — BLOCKED on a real
+driver gap. Reproducer landed; contract call FLAGGED.**
+Authored `runtime/tests/inferlets/ptir-prefill-e2e` (N-wide prompt prefill in one
+fire → windowed decode over the shared pool) + `bin/pie/tests/cuda_ptir_prefill_e2e.rs`.
+Device runs prove: **a variable-length prompt prefill on the ptir path does NOT
+attend the prompt** — the continuation is incoherent garbage (prompt="The capital
+of France is the city of": explicit-write+mask variant → degenerate " Question"×N,
+distinct=1; standard-path variant → CJK garbage, g0=108085). The plumbing runs
+e2e (no crash) but the model behaves as if the prompt KV is absent. Both ptir
+paths are DECODE-SHAPED at the driver:
+  - `executor.cpp` dense-AttnMask pack (~L2788): `lanes = qo_indptr.size()-1` =
+    #SEQUENCES; `launch_pack_dense_mask` packs ONE mask row per lane → cannot
+    express an `[N_query, KV]` prefill mask (a single seq with N query rows
+    collapses to lanes=1 + garbled stride).
+  - explicit-KV-write (~L2838): "the single new-token K/V write" — ONE cell per
+    lane, not the N cells a prefill writes.
+  - standard (no WSlot/WOff, pure-causal) route: KvLen→kv_last_page_lens
+    read/write-range semantics are ambiguous for a fresh multi-query fire (no
+    classic inp_len/output_len/valid split) → queries don't attend the written
+    cells either.
+=> Variable-length prompt prefill on ptir is UNBUILT at the driver level. The
+contract call (how ptir expresses a prefill: a genuine multi-query custom-mask
+pack + multi-cell write, vs a classic-style page-derived causal prefill with
+explicit read/write ranges) is FLAGGED to the manager — NOT invented via
+device-run trial-and-error. The inferlet + cuda test are the KNOWN-RED
+reproducer / go-green target (the harness asserts plumbing-only, not correctness;
+coherence needs an oracle). Steps 2-6 stay blocked behind this driver decision.
+
+**CONTRACT RESOLVED (Oracle / In Gim, 2026-07-09):** prefill on ptir is a
+GENUINE multi-query custom-mask pack + multi-cell KV write — NOT a decode-shaped
+or classic-style page-derived causal path. Concretely the driver must, for a
+single-sequence fire with N query rows:
+  - pack an `[N_query, KV]` custom mask (N mask rows for the one lane), not one
+    row per lane (fix executor.cpp dense-AttnMask pack: rows = query count for
+    the seq, not lanes = #sequences);
+  - write N KV cells via the explicit-write descriptor (WSlot/WOff carry N
+    cells), not one new-token cell per lane.
+This UNBLOCKS A4 steps 2-6. Drive `ptir-prefill-e2e` to GREEN (coherent
+continuation) as the go-green target, then migrate the classic inferlets.
+
+**STEP 2/3 — text-completion MIGRATED to ptir + DEVICE-GREEN (2026-07-09).**
+Per the Oracle's narrowed directive ("don't migrate existing inferlets EXCEPT
+text-completion"), rewrote `inferlets/text-completion/src/lib.rs` off the classic
+`forward-pass` (it was NON-BUILDING — depended on the sampling-gated
+`carrier::submit_pass`) onto `inferlet::ptir`: prompt prefill in ONE N-wide fire
+(the just-landed multi-query driver path) + device-carried decode loop
+(beam-designb wire form) + an in-graph **top-p+temperature** sampler
+(`div(temp)→softmax→pivot_threshold(cummass_le)→gumbel-argmax`, all
+device-codegen'd). Kept chat templating/stop bindings + hand-written decode loop
+(SDK-minimize). Device-verified: `cuda_text_completion_e2e` (new harness) →
+prompt "The capital of France is" → coherent "Answer: Paris." Run-ahead
+(host-side depth-1 speculation over the ptir FIFO) noted as a latency follow-up;
+the device token-carry already removes the token host round-trip. NO shared
+driver code touched (inferlet + new test only) → beam/compact/prefill guardrails
+unaffected.
+
+**STEP 6 — CLASSIC forward-pass DELETION (2026-07-09).** Oracle greenlit
+("completely clean up legacy forward pass" + "breaking other inferlets is
+okay" — the ~48 classic inferlets were already non-building on default anyway).
+Removed across the layers, KEEPING grammar/matcher + the SHARED scheduler/batch/
+paging engine (ptir rides it):
+- WIT: deleted `resource forward-pass` from all 4 `inference.wit` copies
+  (interface pair + sdk/bakery pair) incl. the stale sampler/output/input-binding
+  in the SDK variant; stripped now-unused `use media/working-set/tensor` + brle.
+- Host: deleted `ForwardPass` struct + `HostForwardPass` impl (api/inference.rs),
+  the api.rs classic binding, and the classic engine `execute_impl` + classic
+  drain chain (`drain_retired_fires`/`drain_own_fires`) + dead `PendingForward`/
+  `finalize_received`/`test_force_producer_abort` + the `pending_fires` field.
+  Kept `finalize_forward_txn`/`self_suspend_park_restore`/profiling (shared) and
+  runahead.rs (the shared `finalize_forward_txn` — ptir path — still uses
+  overlap_links/pending_next_input). Runtime compiles clean (warnings only).
+- SDK: deleted carrier.rs/prefill.rs/sampler.rs/program.rs/emit.rs/geometry.rs +
+  the `sampling` module + prelude program re-export. text-completion + all kept
+  test inferlets (beam-designb, ptir-prefill-e2e, mtp-grammar) build clean.
+- Driver: the classic-carrier device code (frame_carrier/next_input/tensor_io,
+  NextInputLink) is Track C's X2 — HELD pending Track-C coordination (now dead,
+  harmless). Flagged to manager.
+  - **DONE (driver-carrier gate, 2026-07-09):** removed the classic next-input
+    carrier per manager go-ahead. Deleted `sampling_ir/next_input.{cpp,hpp}` +
+    its standalone test + CMake refs; excised executor.cpp inject/retain/free
+    regions + `g3_free_retained_links`, and executor.hpp `RetainedSampled` /
+    `retained_next_input` / `G3Pending.free_links` / `retained_token_ptr` (~420
+    LOC). PRESERVED `frame_carrier` (PTIR mirror) + `tensor_io` (shared
+    completion engine) + the shared G3 idle-overlap core. The dead Rust/ABI
+    `next_input_*`/`pipeline_source_*` fields (schema.rs/view.hpp/pie_driver_abi.h)
+    are left vestigial (always-empty, host-unpopulated) — removing them is a
+    broad shared-FFI change invisible to guardrails; deferred as a follow-up.
+    All 4 device guardrails re-verified GREEN (beam-designb + compact identical
+    tokens, prefill coherent, text-completion "Answer: Paris.").
+  - **DONE (dead Rust/ABI carrier cleanup, 2026-07-09):** removed the vestigial
+    `next_input_*`/`pipeline_source_*` fields + setters from schema.rs, view.hpp,
+    and regenerated pie_driver_abi.h (cbindgen). Key finding: `finalize_forward_txn`
+    (execute.rs) had ZERO callers workspace-wide (ptir uses its own
+    `ptir_kv_finalize`), so the whole classic run-ahead carrier chain was dead:
+    DELETED `runahead.rs`, `finalize_forward_txn`/`empty_forward_request`/
+    `ForwardTxnGuard`, instance.rs carrier fields, request.rs threading, batch.rs
+    `would_depend_on_batch`, and the full scheduler `dep_stash` run-ahead-separation
+    subsystem (provably behavior-neutral — every dep_stash op was gated on the
+    now-removed carrier). PRESERVED as unwired-features-to-rewire (NOT carrier
+    cruft): `self_suspend_park_restore` (contention preempt), profiling writers,
+    policy.rs run-ahead constants. All 4 guardrails GREEN.
+
+**PREFILL GREEN (device-verified, 2026-07-09):** driver multi-query prefill
+BUILT + coherent. Three surgical driver changes:
+  - `pack_dense_mask.cu`/`.hpp`: kernel generalized to QUERY-major — one block
+    per lane packs `qo_len[l]·klen[l]` bits (bit `qi·klen+j` from dense cell
+    `(qo_indptr[l]+qi)·STRIDE+j`), takes `qo_indptr`. Decode is the `qo_len==1`
+    special case → byte-identical to old behavior.
+  - `executor.cpp` dense-AttnMask pack (~L2834): `total_q = qo_indptr.back()`,
+    `stride = mask.size()/total_q` (dense mask is `[TOTAL_Q, STRIDE]`), CSR uses
+    `ceil(qo_len[l]·klen[l]/8)`, uploads `qo_view` to device + passes it through.
+  - `llama_like.cpp:587`: explicit-write count `R → N` (write N prompt cells;
+    N==R for decode so unchanged).
+Verified: `cuda_ptir_prefill_e2e` COHERENT (prompt "The capital of France is the
+city of" → attends prompt, yields "Paris"; was degenerate before). Guardrails
+UNCHANGED: `cuda_beam_designb_e2e` + `cuda_beam_designb_compact_e2e` both
+`[14582,25,16246,264,738,315,5109,11]` (shared mask-pack + write paths, fully
+backward-compat). A4 steps 2-6 now unblocked (blocked only on manager sequencing).
 
 **A5 (parallel, small): `stage_key` in `pie-ptir`.** — **DONE** (commit follows).
 Implemented the D5 normalization in [interface/ptir/src/stage_key.rs](interface/ptir/src/stage_key.rs)
@@ -520,6 +780,107 @@ mock-first rule). Phase 0 is done. Remaining, each phase merging independently:
 
 Separate tracks recorded in boundary.md §8: tier-1 fusion (P5.3), descriptor
 diet (B14), Metal/shmem ports.
+
+### PHASE 3 — ACTIVATION P-CUT (Oracle greenlit 2026-07-08 "Let's do it.")
+
+North star: the frame publish moves ONTO the device — the host `publish()`
+(host harvest + memcpy + word write) is eliminated; the value moves by DMA;
+the completion callback becomes wake-only (boundary.md §8, C5).
+
+CURRENT STATE (post-unification): the fire runs device-side; `k_commit_bump`
+advances the DEVICE rings (`full`/`head`/`tail` mod cap1) then `sync_host_rings`;
+`ptir_dispatch` HOST-harvests committed cells and calls `FrameCarrierEngine::
+publish()` which (a) memcpy's host cells → pinned mirror, (b) writes head/tail/
+pacing → pinned words host-side. Runtime reads mirror + waits on words.
+
+**CONTRACT SUBTLETY (load-bearing, NOT invented — mirrors existing host
+semantics exactly):** the FRAME word `tail[c]` the runtime waits on is the
+CUMULATIVE MONOTONIC PRODUCED COUNT (`fr.produced[c]`, ++ per fire), `head`=0
+always, `pacing`=`fire_seq`. This is DIFFERENT from the device ring head/tail
+(mod cap1). So "device publishes head/tail" (§8) is NOT a store of the device
+ring words — the device path must maintain a NEW monotonic per-host-visible-
+channel produced counter in the mapped words, ++'d iff pass_commit & the channel
+is a host-visible producer this pass. Implemented to match host `tail=produced`
+bit-for-bit (beam e2e identical-token guardrail catches any drift).
+
+- **P1 — map the pinned words + mirror into device space.** `frame_carrier`
+  alloc: `cudaHostAllocMapped` for words (+ expose `cudaHostGetDevicePointer`).
+  Lookup exposes the mapped device word ptr + per-channel word-slot layout to
+  the executor/runner. (Mirror stays host-alloc for now; P3 DMAs into it.)
+- **P2 — device-publish words.** A device store (in `k_commit_bump` or a sibling
+  epilogue kernel), iff pass_commit, ++'s the monotonic produced counter per
+  host-visible-producer channel into the mapped `tail` word + writes `pacing`
+  (release-ordered before pacing store). Host `publish()` STOPS writing words.
+  Thread the frame's mapped-word device ptr + host-visible-producer slot map
+  through tier0_runner into the launch. GUARDRAIL: beam e2e identical tokens.
+- **P3 — DMA cells device→pinned mirror.** [DONE 69707e70, beam-designb GREEN
+  identical tokens] Replaced the host harvest + memcpy with a copy-stream
+  `cudaMemcpyAsync(D2H)` of each committed cell → pinned mirror ring slot (value
+  moves by DMA, C5). `harvest_outputs_device` returns device committed-cell ptrs
+  (no D2H read); `publish_device` DMAs + syncs before publishing words;
+  `consume_outputs` frees the ring slot post-sync. Byte-identical to the old
+  host-bounce path (same source cell, same mirror slot).
+- **P4 — wake-only.** Largely ALREADY TRUE: U5 deleted the ForwardResponse PTIR
+  marshal, so the executor completion carries no PTIR data — it is already
+  wake-only w.r.t. the value path. Residual host `publish()` bookkeeping (word
+  writes) is subsumed by P2 when it lands. No separate work unless P2 lands.
+- **P1+P2 — device-published words. [DONE 2200d95a, beam-designb GREEN identical
+  tokens]** P1: frame_carrier words are `cudaHostAllocMapped`; `words_dev` is the
+  device alias (`cudaHostGetDevicePointer`). P2: `publish_device` stores
+  head/tail/pacing into the MAPPED words via `publish_words_kernel`
+  (frame_carrier_kernels.cu) on the copy stream, stream-ordered AFTER the cell
+  DMAs (publish-before-wake, `__threadfence_system`). Faithful monotonic-produced
+  semantics (host-computed, by-value kernel params — no extra copy). The VERIFIED
+  pass-atomic `k_commit_bump` is UNTOUCHED (the commit-path risk I flagged is
+  avoided). Device-AUTONOMOUS counter (host out of the per-fire loop) rides with
+  P5's async regime, where it gains a consumer (a device waiter).
+- **P4 — wake-only. [DONE — already true]** U5 deleted the ForwardResponse PTIR
+  marshal, so the executor completion carries no PTIR data (wake-only w.r.t. the
+  value path). The live path is `publish_device`; the host `publish()` remains
+  only for the isolation test's extern-C `pie_frame_publish`. No further work.
+- **NON-PREBUILT PATH TEST (cuda_ptir_e2e) — STRUCTURALLY DEAD, not a P3
+  regression.** `ptir-greedy-e2e` inferlet depends on BOTH the drifted ptir
+  `Pipeline::instantiate/submit` API AND the DELETED sampling-edsl surface
+  (`inferlet::sampling::Graph`, `inferlet::emit::emit_program`, `pie_sampling_ir`
+  — its oracle half). Un-runnable without restoring forbidden code. Closing the
+  non-prebuilt device-verification gap requires a FRESH non-prebuilt ptir
+  inferlet authored on the current `inferlet::ptir` surface (new-inferlet work,
+  needs manager/Oracle go-ahead — scope beyond Phase 3).
+- **P5 — scheduler fire-rule (SEPARABLE follow-on, runtime-side).** Scheduler
+  paces run-ahead depth on pacing words; fire-skip heuristic (X4). This is the
+  boundary.md §8 "optionally profile / fold wakes into the polling loop" tail —
+  genuinely decoupled from the P1-P4 device transport; flag to manager, likely
+  its own unit after P1-P4 land green.
+
+### P5 SCOPING (2026-07-08) — HITS A REAL CONTRACT FORK, FLAGGED, HOLDING
+
+Scope-first surfaced that P5 is NOT a localized scheduler tweak — it is the
+UNRESOLVED boundary.md §8 contract call ("does Phase-3 activation target the
+dormant frame_carrier substrate or evolve the live path?"). Evidence:
+
+- `CudaControlPlane` (runtime/src/driver/control_cuda.rs) — the pacing-word wake
+  substrate (`enqueue`/`bind_instance`/`parked_pacing` on word[0]=committed fire
+  count) — has `new()` but is NEVER constructed outside `#[cfg(test)]`. It is the
+  DORMANT X1/X2 boundary substrate, compiled but unwired.
+- The LIVE PTIR path (ptir_host.rs finalize_fire :858) awaits the EXECUTOR
+  ONESHOT (:860 `rx.await`), THEN plain-loads the device-published words+mirror
+  (:1015 "the oneshot happens-after publish"). It does NOT park on the pacing
+  word. Every fire is synchronous (submit → await oneshot → next); there is NO
+  run-ahead depth to pace or skip within today.
+
+So P5 = the §8 "completion switch": move the live PTIR completion OFF the
+executor oneshot ONTO parking on the device-published pacing word (activating the
+dormant CudaControlPlane substrate), enabling run-ahead depth. That entails:
+  (1) THE unresolved §8 contract call (dormant substrate vs evolve live path);
+  (2) rewiring the completion path for EVERY PTIR fire (blast radius: all fires,
+      verifiable only by beam e2e);
+  (3) the DEVICE-AUTONOMOUS counter in `k_commit_bump` (host leaves the per-fire
+      loop) — the exact verified-commit-core surgery deliberately kept OUT of P2.
+  (4) fire-skip (X4) presupposes the run-ahead loop from (1)-(3) exists.
+
+RECOMMENDATION: this needs the Oracle's explicit §8 call before any code. Not
+inventing it. Phase-3's device-transport half (P3+P1/P2+P4) is COMPLETE + green;
+P5 is the control-completion half and is genuinely a fork, not a tweak. HOLDING.
 
 ---
 
@@ -959,6 +1320,30 @@ compaction fire; overlap-preserving deferred). K3 submit-model = ESCALATED to Or
 method needs a new WS→pipeline back-ref; B move-only fire reuses the pipeline FIFO + gives K6 for
 free but departs from the ws.copy_into spelling; reconcile = ws.copy_into surface routed through the
 FIFO under the hood). HOLD K1/K2/K3 until the Oracle picks — it shapes the WIT.
+
+### COMPACTION — K3/K6 RESOLVED (2026-07-08, Oracle: `pipeline.copy_into`)
+The move verb lives on the ORDERING domain (pipeline), not the working-set:
+```wit
+// on the pipeline resource
+copy-into: func(ws: borrow<kv-working-set>,
+  dst-page-ids: list<u32>, dst-tok-idx: list<u32>,
+  src-page-ids: list<u32>, src-tok-idx: list<u32>) -> result<_, error>;
+```
+- LAYERING: on `pipeline` (not `kv-working-set`) → NO ws→pipeline back-ref, NO working-set.wit→ptir.wit
+  import edge. This resolves K3 (supersedes the A/B/reconcile escalation — it IS the reconcile).
+- SAME FIFO (dissolves K6 — NO quiesce/drain): copy_into enqueues into the SAME PendingFires FIFO on
+  the SAME stream as forward fires. Ordering is automatic via the B3 invariant: the move
+  happens-after all prior fires' KV writes, happens-before all later fires' descriptor reads.
+- IT'S A MOVE, NOT A FIRE: `enum PendingOp { Fire(PendingFire), Move(PendingMove) }`. A Move carries
+  no logits oneshot, no KV/RS transaction, no bound cells — holds an ordered slot, finalizes
+  trivially. Guest never `take`s a result (it computed the post-move layout itself).
+- IMMEDIATE DISPATCH ≠ BYPASS: skips model-step/batch accumulation but must land in submission order
+  behind prior submits — reuse the PREBUILT-SOLO scheduler flush (next_pending stash), NOT the
+  fire-and-forget copy_d2h control channel (that path would race).
+- STATUS: kernel `launch_copy_kv_cells_bf16` DONE (K4, all-layers/per-token; post-RoPE slot = pure
+  storage; two-pointer disjoint → one parallel copy, no scratch). REMAINS: `PendingOp::Move` variant,
+  scheduler solo-flush arm, WIT `copy-into`, SDK method, K5 guest trigger (dead>8×PAGE_T). Errors:
+  validate descriptors synchronously; async failure poisons the pipeline.
 
 K5 ALGORITHM (guest-computable, submit-agnostic — turnkey once K3 lands; NOT yet coded because
 touching beam-designb's POOL_PAGES/MAX_STEPS breaks the identical-token guardrail, and the helper's

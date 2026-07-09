@@ -170,7 +170,30 @@ class PtirInstance {
         return outs;
     }
 
-    Tier0Runner& runner() { return runner_; }
+    // Phase-3 DEVICE value path (C5 — values move by DMA): enumerate committed
+    // host-READER channels post-fire → (global id, DEVICE committed-cell ptr, cell
+    // bytes, dense id). Does NOT consume — the caller DMAs the device cell straight
+    // into the pinned mirror (no host bounce buffer), THEN calls `consume_outputs`
+    // to free the device ring slot (after the copy stream has drained the DMA).
+    struct DeviceOut {
+        std::uint64_t gid;
+        void*         device_ptr;
+        std::size_t   bytes;
+        ChannelId     ch;
+    };
+    std::vector<DeviceOut> harvest_outputs_device() {
+        std::vector<DeviceOut> outs;
+        for (const Channel& ch : trace_->channels) {
+            if (!ch.host_reader) continue;
+            if (!view_.committed_full(ch.id)) continue;
+            outs.push_back(DeviceOut{view_.global_id(ch.id), view_.committed_cell(ch.id),
+                                     view_.cell_bytes(ch.id), ch.id});
+        }
+        return outs;
+    }
+    void consume_outputs(const std::vector<DeviceOut>& outs) {
+        for (const DeviceOut& o : outs) view_.host_consume(o.ch);
+    }
     ChannelView& view() { return view_; }
 
   private:

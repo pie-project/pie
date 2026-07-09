@@ -76,6 +76,7 @@ struct FrameInstance {
     void*          device_frame = nullptr;  // frame_base  (device, vestigial)
     void*          host_mirror = nullptr;   // mirror_base (pinned host)
     std::uint64_t* host_words = nullptr;    // word_base   (pinned host ring words)
+    std::uint64_t* words_dev = nullptr;     // P1: MAPPED device ptr for host_words
     std::size_t    frame_bytes = 0;
     std::size_t    mirror_bytes = 0;
     std::size_t    word_bytes = 0;
@@ -136,6 +137,17 @@ public:
                  const void* const* src, const std::uint32_t* ring_index,
                  const std::uint32_t* head, const std::uint32_t* tail,
                  std::uint64_t pacing);
+
+    // COMMIT publish, DEVICE value path (Phase 3, B11/C5) — same as `publish` but
+    // `src[i]` are DEVICE committed-cell pointers: each cell moves by DMA
+    // (`cudaMemcpyAsync` D2H on the copy stream) straight into the pinned mirror
+    // ring slot `ring_index[i]` — no host bounce buffer (the harvest+memcpy is
+    // gone). The copy stream is synced before the head/tail/pacing words are
+    // published (publish-before-wake: the value lands before pacing[0]).
+    void publish_device(std::uint64_t instance, std::uint32_t n_channels,
+                        const void* const* src, const std::uint32_t* ring_index,
+                        const std::uint32_t* head, const std::uint32_t* tail,
+                        std::uint64_t pacing);
 
     // LOOKUP (U4 flip) — expose an instance's pinned mirror/word bases + the exact
     // per-channel layout (cell_bytes, cap1, mirror byte offset) so the runtime

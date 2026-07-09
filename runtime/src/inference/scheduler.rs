@@ -224,107 +224,6 @@ fn release_lane_in_flight(
     to_release.len()
 }
 
-/// Max per-pipeline `dep_stash` depth. bravo's device-resident carrier submits a
-/// k-deep chain UP FRONT (`decode_pipelined_deep`); the stash holds the ≤k links
-/// awaiting promotion. This is a generous fail-loud ceiling against a runaway
-/// pre-submission loop (unbounded stash growth = a memory leak), NOT a
-/// functional limit — a well-behaved carrier stays well under it.
-const MAX_DEP_STASH_PER_PIPELINE: usize = 64;
-
-/// N+k deep-pre-submission chain ordering (bravo's device-resident carrier).
-/// The carrier submits a k-deep chain (N+1…N+k) UP FRONT, each link consuming
-/// the prior fire's sample via next-input links. `would_depend_on_batch` only
-/// inspects the CURRENT batch, so a link whose producer is itself STASHED (not
-/// in the batch) reads as independent — it would co-batch with the head and
-/// read a not-yet-sampled token. Guard: once a pipeline has ANY stashed request,
-/// every subsequent request from it is the next chain link → stash it in FIFO
-/// order (promoted one-per-fire into successive waves at cap=k). Returns `None`
-/// if stashed (caller `continue`s); `Some(pending)` to batch it normally. Off
-/// WaitAll or untracked (`None` pid) → passthrough (legacy force-fire is correct
-/// there). A runaway chain past [`MAX_DEP_STASH_PER_PIPELINE`] fails loud.
-fn stash_chain_continuation(
-    dep_stash: &mut std::collections::HashMap<ProcessId, std::collections::VecDeque<PendingRequest>>,
-    waitall_active: bool,
-    pending: PendingRequest,
-) -> Option<PendingRequest> {
-    if !waitall_active {
-        return Some(pending);
-    }
-    let Some(pid) = pending.pipeline_id else {
-        return Some(pending);
-    };
-    match dep_stash.get(&pid) {
-        Some(q) if !q.is_empty() => {
-            if q.len() >= MAX_DEP_STASH_PER_PIPELINE {
-                pending.send_error(format!(
-                    "scheduler: pipeline pre-submission chain exceeded {MAX_DEP_STASH_PER_PIPELINE} deep (runaway carrier)"
-                ));
-                return None;
-            }
-            dep_stash.entry(pid).or_default().push_back(pending);
-            None
-        }
-        _ => Some(pending),
-    }
-}
-
-/// Halt a TERMINATED pipeline's stashed run-ahead chain (Phase-2). Drops the
-/// pid's `dep_stash` entry and errors each stashed forward so its staged
-/// txn/pins release. Applied only on [`LeaveKind::Terminate`] (dead: cancel /
-/// exit / miss-limit) — the pipeline's passes will never resume, so erroring is
-/// correct + reclaims. (A SUSPENDED victim is instead skip-promoted, never
-/// errored — it RESUMES its passes on restore.) Without this, the post-fire
-/// promotion keeps firing the dead pid's N+k links UNTRACKED — wasted device
-/// work + delivery to a closed channel. No-op if nothing was stashed.
-fn clear_left_pipeline_stash(
-    dep_stash: &mut std::collections::HashMap<ProcessId, std::collections::VecDeque<PendingRequest>>,
-    pid: ProcessId,
-) {
-    if let Some(stashed) = dep_stash.remove(&pid) {
-        for req in stashed {
-            req.send_error(
-                "scheduler: pipeline left the fleet (contention preempt / terminate) — \
-                 stashed run-ahead chain aborted"
-                    .to_string(),
-            );
-        }
-    }
-}
-
-/// Promote one link per NON-suspended pipeline from `dep_stash` into `batch`
-/// (Piece 4 + BAR 1). Each pipeline's stashed run-ahead chain advances one fire:
-/// pop its front link, mark it ready (`on_arrival`, tombstone-filtered), push it.
-/// SUSPENDED pipelines are skipped (parked for transparent resume on `Join`).
-/// Called post-fire AND at the BAR-1 ignition pump — the latter is the ONLY
-/// re-drive when NO fire is in flight (promotion otherwise runs only post-fire,
-/// so a zero-in-flight idle with a promotable stash would freeze permanently:
-/// no fire ⇒ no promotion ⇒ no submission ⇒ no fire).
-fn promote_dep_stash(
-    dep_stash: &mut std::collections::HashMap<ProcessId, std::collections::VecDeque<PendingRequest>>,
-    suspended: &std::collections::HashSet<ProcessId>,
-    policy: &mut FirePolicy,
-    tombstones: &Tombstones,
-    batch: &mut BatchAccumulator,
-) {
-    if dep_stash.is_empty() {
-        return;
-    }
-    let now = Instant::now();
-    let pids: Vec<ProcessId> = dep_stash.keys().copied().collect();
-    for pid in pids {
-        if suspended.contains(&pid) {
-            continue;
-        }
-        let req = dep_stash.get_mut(&pid).and_then(|q| q.pop_front());
-        if dep_stash.get(&pid).is_some_and(|q| q.is_empty()) {
-            dep_stash.remove(&pid);
-        }
-        if let Some(req) = req {
-            policy.on_arrival(&req.program_identity_hashes, tombstones.filter(Some(pid)), now);
-            batch.push(req);
-        }
-    }
-}
 
 /// Where a request went when the shared admission cascade [`try_admit`] handled
 /// it — the caller maps this to its own loop control flow (`continue`/`break`).
@@ -352,38 +251,13 @@ fn try_admit(
     allow_prebuilt_solo: bool,
     batch: &mut BatchAccumulator,
     next_pending: &mut Option<PendingRequest>,
-    dep_stash: &mut std::collections::HashMap<
-        ProcessId,
-        std::collections::VecDeque<PendingRequest>,
-    >,
     policy: &mut FirePolicy,
     tombstones: &Tombstones,
-    waitall_active: bool,
     driver_idx: usize,
 ) -> AdmitOutcome {
-    // N+k chain ordering (bravo deep pre-submission): a stashed pipeline's next
-    // request is the next chain link — stash it in order before any batch
-    // classification.
-    let Some(pending) = stash_chain_continuation(dep_stash, waitall_active, pending) else {
-        return AdmitOutcome::Consumed;
-    };
     // G2 prebuilt-passthrough: a prebuilt beam fire is a complete pre-assembled
     // multi-lane batch — it never co-batches. Stash it to force a solo fire.
     if allow_prebuilt_solo && (pending.prebuilt || batch.has_prebuilt()) {
-        *next_pending = Some(pending);
-        return AdmitOutcome::Deferred;
-    }
-    // Run-ahead one-step separation (R10): a forward `t+1` whose token-carryover
-    // source `t` is in this batch fires in the NEXT batch (co-batching would read
-    // a not-yet-sampled token). Under WaitAll, hold `t+1` per-pipeline and keep
-    // gathering the wave; untracked (`None`) requests force-fire.
-    if batch.would_depend_on_batch(&pending) {
-        if waitall_active {
-            if let Some(pid) = pending.pipeline_id {
-                dep_stash.entry(pid).or_default().push_back(pending);
-                return AdmitOutcome::Consumed;
-            }
-        }
         *next_pending = Some(pending);
         return AdmitOutcome::Deferred;
     }
@@ -430,14 +304,12 @@ fn apply_lifecycle_event(
     policy: &mut FirePolicy,
     tombstones: &mut Tombstones,
     suspended: &mut std::collections::HashSet<ProcessId>,
-    dep_stash: &mut std::collections::HashMap<ProcessId, std::collections::VecDeque<PendingRequest>>,
 ) {
     match ev {
         LifecycleEvent::Leave(pid, LeaveKind::Terminate) => {
             policy.on_pipeline_leave(pid);
             tombstones.insert(pid);
             suspended.remove(&pid);
-            clear_left_pipeline_stash(dep_stash, pid);
         }
         LifecycleEvent::Leave(pid, LeaveKind::Suspend) => {
             policy.on_pipeline_leave(pid);
@@ -944,12 +816,6 @@ struct LoopState {
     /// Pipelines removed from the wait-set (terminate/cancel/exit/preempt); a
     /// stale queued request from a tombstoned pid must not re-join the wave.
     tombstones: Tombstones,
-    /// Piece 4 per-pipeline dep-stash: a `would_depend_on_batch` `t+1` (token
-    /// source `t` in the gathering wave) is parked here per-pipeline instead of
-    /// force-firing, and promoted into the NEXT wave post-fire. Under deep
-    /// pre-submission it holds the k-deep chain (N+1..N+k), each link gated in
-    /// FIFO order by `stash_chain_continuation`.
-    dep_stash: std::collections::HashMap<ProcessId, std::collections::VecDeque<PendingRequest>>,
     /// Pipelines SUSPENDED by contention (`LeaveKind::Suspend`) whose dep-stash
     /// chain is PARKED - skip-promoted (not fired, not errored) until they rejoin
     /// (`LifecycleEvent::Join`), then resumed in chain order.
@@ -981,7 +847,6 @@ impl LoopState {
             )),
             next_pending: None,
             tombstones: Tombstones::new(4096),
-            dep_stash: std::collections::HashMap::new(),
             suspended: std::collections::HashSet::new(),
             in_flight_count: 0,
             device_idle_since: None,
@@ -1031,10 +896,8 @@ impl LoopState {
                 true,
                 &mut self.batch,
                 &mut self.next_pending,
-                &mut self.dep_stash,
                 &mut self.policy,
                 &self.tombstones,
-                waitall_active,
                 driver_idx,
             ) {
                 AdmitOutcome::Consumed => continue,
@@ -1196,7 +1059,6 @@ impl LoopState {
                     // Leave from `process::terminate` only arrives a
                     // loop-iteration later).
                     self.suspended.remove(&pid);
-                    clear_left_pipeline_stash(&mut self.dep_stash, pid);
                     crate::process::terminate(
                         pid,
                         Err("scheduler: wait-for-all miss-limit (unresponsive pipeline)"
@@ -1204,20 +1066,6 @@ impl LoopState {
                     );
                 }
 
-                // Piece 4: the fired wave cleared these pipelines' `t`
-                // (no longer in the now-empty batch), so their stashed
-                // `t+1` can join the forming NEXT wave (SUSPENDED
-                // pipelines skipped — parked for resume). Same promotion
-                // the BAR-1 ignition pump uses.
-                if waitall_active {
-                    promote_dep_stash(
-                        &mut self.dep_stash,
-                        &self.suspended,
-                        &mut self.policy,
-                        &self.tombstones,
-                        &mut self.batch,
-                    );
-                }
 
                 // Inter-batch bubble (host proxy): if the device had
                 // no batch outstanding when this fire launched, the
@@ -1363,7 +1211,6 @@ impl LoopState {
         wait_duration: Duration,
         req_rx: &crossbeam::channel::Receiver<PendingRequest>,
         latency_rx: &crossbeam::channel::Receiver<FireCompletion>,
-        waitall_active: bool,
         driver_idx: usize,
     ) -> std::ops::ControlFlow<()> {
         // `next_pending`-GUARD (guru #2): if a request is already
@@ -1401,10 +1248,8 @@ impl LoopState {
                             false,
                             &mut self.batch,
                             &mut self.next_pending,
-                            &mut self.dep_stash,
                             &mut self.policy,
                             &self.tombstones,
-                            waitall_active,
                             driver_idx,
                         ) {
                             AdmitOutcome::Consumed
@@ -1594,7 +1439,6 @@ impl BatchScheduler {
                     &mut st.policy,
                     &mut st.tombstones,
                     &mut st.suspended,
-                    &mut st.dep_stash,
                 );
             }
 
@@ -1608,25 +1452,6 @@ impl BatchScheduler {
             let was_empty = st.batch.is_empty();
             let mut first_submitted_at_us = 0u64;
             while st.batch.is_empty() {
-                // BAR 1 ignition: promotion runs only post-fire, so a zero-in-
-                // flight idle with the fleet's next fires PARKED in `dep_stash`
-                // (a burst-then-idle, or a `Join` that just un-parked them) would
-                // freeze forever — the resumed guests RESUME their parked passes,
-                // they don't re-submit, so `req_rx` never wakes. Pump a promotion
-                // whenever in-flight is idle + a promotable stash exists → the
-                // stash re-drives the fleet from the zero-in-flight instant.
-                if st.in_flight_count == 0 {
-                    promote_dep_stash(
-                        &mut st.dep_stash,
-                        &st.suspended,
-                        &mut st.policy,
-                        &st.tombstones,
-                        &mut st.batch,
-                    );
-                    if !st.batch.is_empty() {
-                        break;
-                    }
-                }
                 let pending = if let Some(pending) = st.next_pending.take() {
                     pending
                 } else {
@@ -1639,26 +1464,6 @@ impl BatchScheduler {
                     // lost-wakeup, M-AB). Draining here keeps `in_flight` accurate
                     // so the next fire isn't blocked by a phantom cap.
                     //
-                    // BAR 1 diagnostic: about to idle-BLOCK. If a non-empty
-                    // `dep_stash` exists here, the pump above did NOT re-drive —
-                    // log the freeze signature so a trace discriminates charlie's
-                    // stuck-fire hypothesis (`in_flight > 0` ⇒ a fire never
-                    // completed → the pump can't engage; driver-scope) from a pump
-                    // reach/logic bug (`in_flight == 0` + `promotable > 0` ⇒ the
-                    // pump SHOULD have fired → my scope) from a legit all-parked
-                    // wait (`promotable == 0` ⇒ waiting on a `Join`).
-                    if scheduler_trace_enabled() && !st.dep_stash.is_empty() {
-                        let promotable =
-                            st.dep_stash.keys().filter(|p| !st.suspended.contains(p)).count();
-                        sched_trace_write(&format!(
-                            "[pie-sched-trace] driver={} idle-block in_flight={} dep_stash={} promotable={} suspended_marked={}",
-                            driver_idx,
-                            st.in_flight_count,
-                            st.dep_stash.len(),
-                            promotable,
-                            st.suspended.len(),
-                        ));
-                    }
                     crossbeam::channel::select! {
                         recv(req_rx) -> msg => match msg {
                             Ok(p) => p,
@@ -1683,7 +1488,6 @@ impl BatchScheduler {
                                     &mut st.policy,
                                     &mut st.tombstones,
                                     &mut st.suspended,
-                                    &mut st.dep_stash,
                                 );
                             }
                             continue;
@@ -1691,11 +1495,6 @@ impl BatchScheduler {
                     }
                 };
                 let Some(pending) = prepare_pending_for_batch(&st.batch, pending) else {
-                    continue;
-                };
-                let Some(pending) =
-                    stash_chain_continuation(&mut st.dep_stash, waitall_active, pending)
-                else {
                     continue;
                 };
                 first_submitted_at_us = pending.submitted_at_us;
@@ -1775,10 +1574,8 @@ impl BatchScheduler {
                     true,
                     &mut st.batch,
                     &mut st.next_pending,
-                    &mut st.dep_stash,
                     &mut st.policy,
                     &st.tombstones,
-                    waitall_active,
                     driver_idx,
                 ) {
                     AdmitOutcome::Consumed => continue,
@@ -1827,7 +1624,7 @@ impl BatchScheduler {
                 }
                 FireOutcome::Wait(wait_duration) => {
                     if st
-                        .handle_wait(wait_duration, &req_rx, &latency_rx, waitall_active, driver_idx)
+                        .handle_wait(wait_duration, &req_rx, &latency_rx, driver_idx)
                         .is_break()
                     {
                         break 'run_loop;

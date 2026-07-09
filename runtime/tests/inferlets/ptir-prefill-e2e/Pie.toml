@@ -1,0 +1,10 @@
+[package]
+name = "ptir-prefill-e2e"
+version = "0.1.0"
+description = "PTIR multi-token PROMPT PREFILL device proof (A4 classic-forward-pass removal, step 1 linchpin): a single N-wide ForwardPass embeds a real chat prompt (N>1 tokens) in ONE fire, writing N KV cells over a shared physical page pool, then a windowed-style 1-wide decode loop continues over the SAME pool pages. A coherent on-topic continuation proves the prefill fire actually attended the real prompt (not a 1-token seed) — the capability the classic carrier::submit_pass variable-length prefill provides, now on the ptir path."
+authors = ["In Gim <in.gim@icloud.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
