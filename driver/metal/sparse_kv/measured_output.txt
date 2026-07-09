@@ -1,0 +1,31 @@
+tile=64KB virt=9GB
+
+=== P1: virtual buffer free, heap = physical, map adds nothing ===
+  start metal.alloc=    0.39 MB  proc.phys=    3.90 MB
+  after 8GB VIRTUAL sparse buf metal.alloc=    0.39 MB  proc.phys=    6.00 MB
+  after 128MB placement heap metal.alloc=  134.61 MB  proc.phys=    6.01 MB
+  after MAP all 2048 tiles metal.alloc=  134.61 MB  proc.phys=    6.19 MB
+
+=== P2: mapped tiles hold real data ===
+  GPU wrote 134MB -> mismatches=0 [PASS]
+
+=== P3: unmap != free; heap release == free ===
+  before unmap (heap still alive) metal.alloc=  134.61 MB  proc.phys=  278.17 MB
+  after UNMAP all tiles (heap kept) metal.alloc=  134.61 MB  proc.phys=  278.12 MB
+  after RELEASE heap object metal.alloc=    0.39 MB  proc.phys=  143.90 MB
+  after RELEASE virtual buffer metal.alloc=    0.39 MB  proc.phys=  143.92 MB
+
+=== P4: elastic chunked-heap KV pool (peak grows, then footprint shrinks) ===
+  pool start (only virtual kv buf) metal.alloc=    0.39 MB  proc.phys=  146.02 MB
+  PEAK: 8 chunks mapped (512MB) metal.alloc=  537.26 MB  proc.phys=  146.05 MB
+  after SHRINK to 2 chunks (release 6 empty) metal.alloc=  134.61 MB  proc.phys=  146.05 MB
+  after full release metal.alloc=    0.39 MB  proc.phys=  143.95 MB
+
+=== P5: map/unmap latency vs #tiles (128MB heap) ===
+  n=   1 tiles (  0.1MB): map=0.140 ms  unmap=0.140 ms  (avg over 50, incl GPU rtrip)
+  n=   8 tiles (  0.5MB): map=0.126 ms  unmap=0.126 ms  (avg over 50, incl GPU rtrip)
+  n=  64 tiles (  4.2MB): map=0.128 ms  unmap=0.131 ms  (avg over 50, incl GPU rtrip)
+  n= 512 tiles ( 33.6MB): map=0.127 ms  unmap=0.129 ms  (avg over 50, incl GPU rtrip)
+  n=2048 tiles (134.2MB): map=0.152 ms  unmap=0.157 ms  (avg over 50, incl GPU rtrip)
+
+DONE.
