@@ -488,22 +488,14 @@ mod tests {
     }
 
     #[test]
-    fn marshal_from_forward_response_roundtrips() {
-        // The exact response→channel path `ptir_host::submit` runs after a fire:
-        // a ForwardResponse's PTIR output table → `ptir_output_at` → the tuple
-        // form `marshal_response` consumes → the guest `take` sees the token.
-        use pie_driver_abi::ForwardResponse;
+    fn marshal_produced_cells_roundtrips() {
+        // The exact path `ptir_host::finalize_fire` runs after a fire: the
+        // produced Reader cells (post-unification: read from the pinned frame
+        // mirror as `(global_id, bytes)` tuples) → `marshal_response` → the guest
+        // `take` sees the token.
         let cells = bound(); // `out` is the host-Reader at channel 1
         let out_id = cells[1].lock().unwrap().global_id;
-        let mut resp = ForwardResponse::default();
-        resp.push_ptir_output(&[PtirChannelValue { channel: out_id, bytes: 5i32.to_le_bytes().to_vec() }]);
-
-        let produced: Vec<(u64, Vec<u8>)> = resp
-            .ptir_output_at(0)
-            .unwrap()
-            .into_iter()
-            .map(|c| (c.channel, c.bytes))
-            .collect();
+        let produced: Vec<(u64, Vec<u8>)> = vec![(out_id, 5i32.to_le_bytes().to_vec())];
         marshal_response(&cells, &produced).unwrap();
         assert_eq!(
             cells[1].lock().unwrap().take().unwrap(),

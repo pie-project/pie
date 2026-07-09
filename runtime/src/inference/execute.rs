@@ -1258,33 +1258,6 @@ pub(crate) async fn execute_impl(
             );
         }
 
-        // (a) BRIDGE carry populate (X2/X3 boundary-rework): stash a per-request
-        // carrier descriptor into `req`'s parallel carry SoA cols (`carry_user_ptr` /
-        // `carry_word_index` / `carry_instance` + the `carry_abi_version` guard) so
-        // the CUDA executor D2H-carries each committed frame straight to the bound
-        // inferlet at a2 fire-commit — the direct driver↔inferlet transport — and
-        // resolves completion through the X0 waker instead of the `ForwardResponse`
-        // marshal. Parallel to `populate_output_fastpath`: mutates `req` BEFORE submit.
-        //
-        // DORMANT by default (gated behind `PIE_CARRY_POPULATE`): with the cols empty,
-        // charlie's guarded a2 R-carry loop skips (`if !carry_user_ptr.is_empty()`) —
-        // ZERO behavior change. Full ACTIVATION is the fire-loop capstone (guru-
-        // sequenced) and requires, together: (1) charlie's a2 R-carry executor cut
-        // merged (reads the cols → `pie_frame_carry` → `cuda_carry_done` reclaims the
-        // boxed context — else the leaked contexts never drain the close-gate);
-        // (2) the frame-bind lifecycle (bind/close a device frame per instance);
-        // (3) the completion switch (await the returned carrier `Completion`s instead
-        // of `rx`). Provisional instance source: the per-PROGRAM `ptir_program_instances`
-        // (the real per-request bound-instance mapping — charlie's Q2 / the X1
-        // `bind_instance` unification — lands at the capstone).
-        #[cfg(feature = "driver-cuda")]
-        let _carry_completions = if std::env::var_os("PIE_CARRY_POPULATE").is_some() {
-            let instances = req.ptir_program_instances.clone();
-            crate::driver::CudaControlPlane::global().populate_carry(&mut req, &instances)
-        } else {
-            Vec::new()
-        };
-
         // Single-model: the SERVICE routes to the bound model; no model_id arg.
         let submit_result = inference::submit_async(
             req,

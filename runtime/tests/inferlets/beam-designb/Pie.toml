@@ -1,0 +1,10 @@
+[package]
+name = "beam-designb"
+version = "0.1.0"
+description = "Overview §6.2 beam search, DESIGN B form (logical mask-out + lazy compaction): the guest beam epilogue appends each survivor's new token at the next free flat pool position and encodes ancestry in the per-beam AttnMask (inherit parent's mask, set the one new cell) — no heir election, no freeze arithmetic, no fresh-page handshake, no page reorder. Pages/PageIndptr are constant (pool fixed between compactions); the mask does all per-beam selection; WSlot/WOff drive the explicit KV write. Compaction (generic KV cell-move) is out of scope here."
+authors = ["In Gim <in.gim@icloud.com>"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]

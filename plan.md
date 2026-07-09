@@ -479,6 +479,37 @@ mock-first rule). Phase 0 is done. Remaining, each phase merging independently:
   on the current marshal transport; land B3 before or after C2, not
   interleaved. The WIT surface is unchanged by C2, so Track A is unaffected.
 
+- **C2 RE-SEQUENCED (2026-07-08, alpha scoping + manager approval, option C).**
+  boundary.md §7/§8 Phase 2 was written assuming the X2 frame_carrier
+  (pinned-word / mirror / wake) is the LIVE value-path substrate to "make real".
+  C1b confirmed it is DORMANT / unwired: the live PTIR path is
+  `submit_prebuilt_async → tier0_runner → k_commit_bump (device mem) →
+  sync_host_rings → harvest_outputs → ForwardResponse.ptir_output_* →
+  finalize_fire → marshal_response`, which never touches frame_carrier. So the
+  Phase-2 bullets marked here ENTANGLE with the deferred Phase-3 activation:
+  device word-publish + wake-only callback + dropping the ForwardResponse
+  marshal all require the pinned-word/wake/bind substrate to be LIVE first
+  (activation), and dropping the marshal without it breaks the device-verified
+  `cuda_beam_designb_e2e`.
+  - **DONE now (live-path, cleanly independent):** delete `k_channel_bits`
+    (write-only, zero consumer); bake the static readiness/commit slot lists at
+    bind (`Tier0Runner::bake_static_lists`) — descriptor + per-stage full/empty
+    arrays + deduped commit taken/put arrays uploaded once, removing the per-pass
+    malloc/upload/free + intermediate readiness syncs from `run_pass`.
+  - **ALREADY REALIZED:** "real per-channel trace layout on device" — the live
+    `DeviceChannelRegistry::init_slot` already derives cell_bytes/cap1 from the
+    trace decl and allocates per slot at registration. The only remaining
+    "frame layout" sense (contiguous frame + cell offsets) is the dormant
+    frame_carrier model → deferred with activation.
+  - **DEFERRED to Phase 3 (activation):** pinned-word publish, wake-only host
+    callback, ForwardResponse marshal drop, ptir_host.rs take/read park + mirror
+    load, the pass-end sync + host-ring-mirror deletion. These need the bind
+    lifecycle + completion switch that Phase 3 owns (blocked with compaction on
+    the Oracle's policy calls). Manager is flagging the §8 inaccuracy + the
+    "Phase-3 targets frame_carrier vs evolve the live marshal path" question to
+    the Oracle as a Phase-3 contract call.
+
+
 ### C3 (= boundary Phase 3): activation and the fire rule
 
 - Scheduler paces run-ahead depth on pacing words.
@@ -708,3 +739,244 @@ pool-wide fire); (2) mask growth bound (cap pool-between-compactions or segmente
 
 STATUS: new direction landed while alpha idle at e7c5ec54. NOT yet started (manager coordinating
 + alpha context long → refresh before implementing Design B). Existing B2 (e7c5ec54) survives intact.
+
+### DESIGN B — HOST GOLDENS DONE (afcfa26f, 2026-07-08) + next steps
+CONSOLIDATION: all prior proj2 work squashed into ONE commit 68d2649b, pushed to BOTH local
+origin/dev (/home/ingim/Workspace/pie) AND github origin/dev (verified identical, parent =
+base 243f5b1e, clean squash). 20-commit history preserved in tag alpha-proj2-preconsolidate
+(b0241efb, pushed). agent branch == dev == 68d2649b. Design B goldens (afcfa26f) sit on top.
+
+DESIGN B STEADY-STATE EPILOGUE + GOLDENS (host-verified, DONE):
+- sdk/rust/ptir-dsl/tests/beam_designb_goldens.rs — 2 goldens GREEN on CPU interp.
+- Mechanism: each survivor appends at flat pool pos wpos=fill+lane; ancestry = mask edit
+  new_mask = gather(mask,parent) OR eq(col,wpos). NO heir/freeze/fresh-page/reorder.
+  Pages/PageIndptr CONSTANT (pool fixed between compactions). Write desc w_slot=wpos/PAGE_T,
+  w_off=wpos%PAGE_T → B2 write_kv_explicit (unchanged hot path).
+- Goldens: (1) fork-from-shared-prefix masks {0,1,2}/{0,1,3} w=[0,0]/[2,3]; (2) multistep+
+  page-turn masks accumulate {0,1,2,4}/{0,1,3,5} w_slot=[1,1]/w_off=[0,1].
+- Fire-0 seeding gap DISSOLVED under Design B (mask-seeded prompt, no per-fork fresh handshake).
+- Interp gotchas hit: broadcast2 needs equal-or-scalar(rank0), so [1]+[B] must broadcast [1]→[B]
+  first; reader terminal puts (out*/out_mask/out_wslot/out_woff) MUST come AFTER all loop-carried
+  puts (else SSA ValueIdOutOfRange from reader auto-drain drop).
+
+NEXT UNITS (manager-confirmed):
+- Write a NEW Design-B inferlet on inferlet::ptir (guest program; wasm-buildable). Keep the
+  Design-A beam-devgeo as reference until Design B is device-verified, then retire it.
+- Device e2e of the steady-state (no-compaction) path on the 4090 → exercises B2 explicit write.
+- DEFERRED (open contract, needs charlie/Oracle): compaction KV-gather + CompactPlan port,
+  compaction trigger/FIFO barrier, mask growth bound. Design B "lock status" being confirmed
+  with Oracle. Build ONLY on the stable steady-state part until the compaction contract lands.
+
+DEVICE-VERIFY ENV (still valid): box IS the 4090 (hostname Workstation, workstation→127.0.1.1);
+full driver-cuda build clean in ~5.5min with PIE_COMPILER_LAUNCHER=env + -j6 (no MoE OOM); cargo
+build.rs rerun-if-changed tracks DIR mtime not file edits → touch driver/cuda/CMakeLists.txt to
+force cmake, or drive cmake directly. Standalone PTIR driver tests build in /tmp/pie-driver-build.
+
+### FINISH-LINE DECISIONS (2026-07-08, In Gim / directing human)
+- **ORDERING: unification FIRST, compaction second.** Do the frame_carrier ↔ PTIR-instance
+  bind unification (boundary.md Option A: device word-publish + wake + FrameAddresses at bind;
+  ForwardResponse marshal DELETED, ptir_host take/read park+mirror) BEFORE the compaction path.
+  This is the deferred Phase-2 activation parts + C3/Phase-3 activation, driven together.
+- **COMPACTION TRIGGER = guest dead-slot threshold.** The inferlet (guest) tracks masked-out
+  (dead) token slots; when dead-slot count > 8 × PAGE_SIZE, it initiates compaction (calls the
+  copy_into move primitive). Guest-orchestrated (consistent with Design-B: driver only provides
+  the generic move; guest computes liveness + plan). This likely also SATISFIES the
+  "mask-growth-bound" open item (the 8×page threshold IS the bound). STILL OPEN: the FIFO-barrier
+  scheduling of the compaction fire (compaction is a non-solo pool-wide move; ordering vs
+  in-flight decode fires on the copy stream). Manager relaying to Oracle.
+
+### UNIFICATION — NORTH-STAR IMPL PLAN (2026-07-08, In Gim / Oracle: "big leaps, test+fix later")
+Oracle GO + directive: "Don't take the safe, incremental path. Make big leaps if it leads to the
+north star. We can test and fix later." → drive boundary.md Option A end-state directly, NOT the
+conservative layer-over-registry. Contract calls (self-resolved per the leap directive):
+- Q1 STORAGE = per-instance frame model wins for HOST-VISIBLE channels: the value they carry is
+  published into a per-instance pinned MIRROR + pinned WORDS (head/tail per host-visible ch +
+  pacing[0]). DeviceChannelRegistry stays the device cell store (its cross-instance sharing is for
+  INTERNAL device↔device channels; host-visible channels are per-instance I/O, so no conflict).
+  frame_base = the registry's per-slot device cells (not a new contiguous frame).
+- Q2 PUBLISH = migration form first (B11-sanctioned): after a fire commits, a HOST step D2H's the
+  committed host-visible cells → pinned mirror, stores head/tail → pinned words, stores ++pacing →
+  word[0], WAKES the instance pacing slot. (Device-side k_commit_bump pinned-word write = the pure
+  end-state, deferred tail — same architecture, impl detail.)
+- Q3 = value-path + activation together (one leap): ForwardResponse PTIR marshal DELETED; the
+  completion is the Completion waker-park on word[0]; take/read read the pinned mirror.
+
+CUT (dependency order):
+  U1 frame_carrier real layout: register_program derives FrameLayout from the trace's HOST-VISIBLE
+     channel list (per-channel cell_bytes × cap1 → mirror bytes; WordLayout::words(n_hostvis) →
+     word bytes). bind_instance allocs device_frame(unused/vestigial)+pinned mirror+pinned words.
+     Re-add a commit publish entrypoint: pie_frame_publish(instance, host-visible cells[], heads[],
+     tails[]) → memcpy into mirror + store words (host-side; the executor calls it post-fire).
+  U2 executor PTIR branch: after the fire's k_commit_bump + sync_host_rings, D2H the committed
+     host-visible cells (view.host_take equivalent, but into the instance's pinned mirror) + publish
+     head/tail words via pie_frame_publish; then wake. STOP marshaling cells into ForwardResponse.
+  U3 runtime control_cuda: real host-visible channel count from the trace (not PROVISIONAL 1);
+     bind allocs the real per-channel WakeSlots; enqueue parks Completion on word[0]/pacing.
+  U4 ptir_host rewire: PtirInstance bind → pie_frame_bind + FrameAddresses; submit returns a
+     Completion (park on word[0]) instead of the oneshot ForwardResponse rx; finalize_fire awaits
+     the Completion, settles KV/RS ONLY, drops marshal_response; take/read read the pinned mirror
+     via the words (reader park). put = stage into frame + epoch (host-fed carry_in).
+  U5 ForwardResponse: drop ptir_output_* fields + marshal_response + harvest_outputs.
+GUARDRAIL: cuda_beam_designb_e2e IDENTICAL tokens [106984,1,9370,91282,33108,101982,98362,125302].
+Full driver-cuda build (PIE_COMPILER_LAUNCHER=env -j6) + ptir units + beam e2e before gate.
+
+U1 LANDED (20a39ede): frame_carrier real layout. FrameChannel{cell_bytes,cap1,mirror_off};
+bind_channels(n,cell_bytes[],cap1[]) allocs pinned mirror(sum cell_bytes*cap1)+words(1+2n u64);
+publish(inst,n,src[],ring_index[],head[],tail[],pacing) memcpy cells→mirror ring slot + store
+head/tail/pacing words (release fence before pacing[0]). frame_base vestigial(0). isolation test
+extended+green.
+
+ID-RECONCILE (the elegant collapse): runtime mints the PTIR wire instance_id FROM
+pie_frame_bind_channels → executor PtirInstance (keyed by iid=ptir_program_instances[p]) == the
+frame carrier instance → publish(iid,...) needs ZERO new ABI fields. host_reader channels derived
+IDENTICALLY on both sides in DENSE order → mirror index = host_reader rank r.
+
+U2/BIND (runtime, ptir_host.rs forward-pass.new ~line 502): replace next_instance_id() with a
+CUDA-gated pie_frame_bind_channels(host_reader list) → (frame_id, mirror_base, word_base); use
+frame_id as instance_id; store bases+layout(rank→cell_bytes,cap1) on ForwardPass. Non-cuda/dummy
+driver → fall back to next_instance_id() + no frame (feature gate). host_reader cell_bytes =
+shape.numel()*program_dtype_size (F32/I32/U32=4, Bool=1); cap1=capacity+1. CAVEAT (flip-time):
+ChanDType::Act lowers to the model activation dtype device-side — if that's not F32 the computed
+cell_bytes mismatches harvested len; publish uses ACTUAL harvested len, so size the mirror slot to
+max(computed, harvested-observed) or verify Act=F32 for the model at flip. control_cuda.rs adds the
+extern pie_frame_bind_channels; close path calls pie_frame_close(frame_id) on pass drop.
+
+U2/PUBLISH (executor, ptir_dispatch.cu run ~line 157): after harvest_outputs(), iterate
+trace_->channels tracking host_reader rank r; for each committed one, memcpy its harvested bytes
+into a per-fire src[] and publish at ring slot=(produced_count[iid,r]%cap1), tail word=++produced
+(cumulative monotonic), pacing=fire_seq. Keep the existing out_resp.ptir_output_* marshal ALONGSIDE
+(additive → beam e2e stays green). Needs pie_frame_publish extern-C already in frame_carrier.
+Track produced_count in PtirDispatch state keyed by (iid,rank).
+
+U4/FLIP (runtime): take/read read mirror[rank ring slot] gated by tail(produced) word vs a
+per-channel host consumed cursor; finalize_fire drops marshal_response (KV/RS settlement only).
+U5: delete ForwardResponse.ptir_output_* + marshal_response + harvest's out_resp packing.
+ACTIVATION TAIL (deferred): device-side k_commit_bump pinned-word write + WakerTable word-park
+(replace the oneshot wake bridge). Same data architecture; wake-transport swap only.
+
+STATUS 2026-07-08 (In Gim/Oracle in-session "big leaps"): U1 (20a39ede), U2 (e640c7e0),
+U3=THE FLIP (51683b83) LANDED + device-proven. The PTIR VALUE PATH now flows through the pinned
+frame mirror, superseding the ForwardResponse marshal (north-star boundary is the live path on
+CUDA). cuda_beam_designb_e2e GREEN, IDENTICAL baseline tokens
+[106984,1,9370,91282,33108,101982,98362,125302]; frame_carrier isolation OK; 49 ptir units OK.
+Mechanism landed in U3: pie_frame_layout FFI + bind_channels_keyed(iid) (id-reconcile: frame
+carrier keyed by the wire instance id the runtime already holds); instances_ → map; ptir_dispatch
+frame-bind moved OUT of the instance first-sighting into ensure-before-publish (device-geometry
+programs create their instance in resolve_descriptors BEFORE run(), so the old bind branch was
+skipped — U2's publish was a silent no-op masked by the still-authoritative marshal; real bug
+caught only when U3 actually READS the mirror). ptir_host.finalize_fire.produced_cells reads the
+mirror ring (tail word vs per-channel pushed cursor), CUDA-gated; non-CUDA keeps the marshal.
+
+U5 DONE (59668419) — ptir_output marshal DELETED end to end; frame mirror is the SOLE PTIR value
+path. The earlier "routing-coupled → defer" worry was REFUTED by re-analysis: the real Token-vs-
+Response routing gate is BATCH-level at response.rs:152 (token_payload_only checks dists/logits/
+logprobs/entropies/program_tokens/spec_tokens — NOT ptir_output). The request.rs:728
+`ptir_output_indptr.is_empty()` clause lived INSIDE extract_per_request, which only runs in the
+rich-Response else-branch (response.rs:287) — it never governed batch routing, only whether the
+per-req carried the (now-redundant) value columns. The beam is prebuilt (response.rs:100
+passthrough → always Response) so its mirror read is unaffected; non-prebuilt ptir routing was
+already the batch gate's job, independent of ptir_output. Deleted: schema.rs ptir_output_* fields
++ push/count/at methods + 2 roundtrip tests; cbindgen .h (regenerated); view.hpp fields+mapping;
+ptir_dispatch.cu Impl out_* staging + packing + out_resp writes (KEEP harvest_outputs → publish);
+request.rs fast-path clause + slice block; ptir_host non-CUDA produced_cells → Vec::new();
+ptir_channel_store test rewritten to feed produced tuples directly. −196 LOC.
+
+U6/UNIFICATION COMPLETE + DEVICE-VERIFIED (59668419): full driver-cuda build links; beam e2e GREEN
+IDENTICAL tokens [106984,1,9370,91282,33108,101982,98362,125302]; 49 ptir units, 44 abi schema,
+frame_carrier isolation all green; non-CUDA compiles. The boundary.md Option A end-state is LIVE:
+one value path (pinned frame mirror), no parallel marshal. DEFERRED to Phase-3/activation (NOT in
+U1-U6): the pinned-word device-publish of head/tail as the completion-wake transport + wake-only
+host callback — the mirror is currently read after the oneshot resolves (host callback still the
+wake), which is correct; swapping the wake transport is the remaining activation, orthogonal to the
+value-path unification just completed.
+
+### DESIGN B — COMPACTION DECIDED + INFERLET AUTHORED (2026-07-08)
+COMPACTION (Oracle-decided): NOT a bespoke op — a GENERIC per-token, all-layers KV cell-MOVE
+primitive: working_set.copy_into(dst_page_ids, dst_tok_idx, src_page_ids, src_tok_idx), token
+indices len = PAGE_SIZE*len(page_ids). In-place two-pointer (move last-alive → first-empty;
+src/dst disjoint by construction → ONE parallel copy, NO scratch buffer). Correct because KV is
+stored POST-RoPE (llama_like.cpp:94 rope → :584/:589 write; attention reads stored K + custom
+mask, not slot-derived position) → physical slot is pure storage, positions are a SET. Confirmed:
+per-token, union-liveness (dead iff no live beam references it), all-layers. DISSOLVES the
+CompactPlan-port open item (it's just a generic move descriptor, same kernel family as B2
+write_kv_explicit). STILL TO BUILD (driver/runtime, later): the move kernel + compaction
+trigger/FIFO-barrier + mask-growth-bound (cap pool-between-compactions).
+
+INFERLET (18306311): runtime/tests/inferlets/beam-designb on inferlet::ptir. Mask-out epilogue =
+host-golden logic (top-B + flat tail-append wpos=fill+lane + gather/eq/or mask evolution).
+Pages/PageIndptr CONST via attn_working_set full-arity tuple (pages,page_indptr,klen,w_slot,w_off);
+WSlot/WOff drive B2 write; AttnMask = per-beam mask. ALL channels guest-seeded (shared BOS prompt
+at pool pos 0) → NO runtime physical-page handshake → fire-0 gap doesn't arise. Builds wasm32-wasip2.
+Kept beam-devgeo (Design A) as reference (retire at B5). ws is registered but not per-fork-alloc'd;
+device-side pool ownership (ws must own POOL_PAGES) is the one runtime seam for the device e2e.
+
+NEXT: device e2e — write bin/pie/tests/cuda_beam_designb_e2e.rs (mirror cuda_beam_devgeo_e2e:
+boot Qwen3-0.6B → build beam_designb.wasm → run → assert non-degenerate BEAM_DESIGNB tokens),
+full driver-cuda build (guardrails), run on 4090 → first real exercise of B2 write_kv_explicit.
+Fresh session recommended (clean-slate device-verify, context long). Boundary at 18306311.
+
+### COMPACTION — SCOPE (2026-07-08, Oracle-ordered second; trigger = dead-slots > 8×PAGE_SIZE)
+copy_into = a GENERIC per-token, all-layers device KV cell-MOVE. SCOPING FINDING: the primitive
+exists at NO layer, and there is currently NO device-side KV-cell-move ANYWHERE (reorder/free are
+host-metadata-only under `ws-slot-ids`; CopyRequest is NOT wired in the CUDA ptir path). So this is
+a full-stack new op, NOT a wiring-up of something dormant. Layer stack:
+
+K1 WIT (working-set.wit ×4: interface/inferlet/core, interface/inferlet/deps/core, sdk/rust,
+   bakery): add `copy-into` to `kv-working-set`. Move is DEVICE-side + needs a fire → decide
+   method-executes-device-op-at-call vs a ptir fire descriptor (leaning: a working-set structural
+   op that lowers to a driver move request through the pipeline FIFO — reorder's device analogue).
+   Args: dst/src page-relative-index + tok-idx lists (len = PAGE_T*len(page_ids)); host resolves
+   slot→physical.
+K2 Guest SDK: WorkingSet::copy_into in sdk/rust/inferlet/src/ptir.rs (+ KvWorkingSet binding). Sig
+   from the design: copy_into(dst_page_ids, dst_tok_idx, src_page_ids, src_tok_idx).
+K3 Runtime host: lower copy_into → resolve slot→physical dst/src, build move descriptor, submit
+   through the per-pipeline FIFO (new wire op or a ForwardRequest carrying a move-only descriptor).
+K4 Driver kernel: launch_copy_kv_cell_bf16 in kv_paged.cu — per (src_phys_page,src_off)→(dst_phys_
+   page,dst_off), copy K AND V across ALL LAYERS (strided over the KV cache layer dim). SAME family
+   as launch_write_kv_explicit_bf16 (physical page/off descriptors). RAW byte copy — correct
+   because KV is POST-RoPE (slot = pure storage). src/dst disjoint by two-pointer construction → one
+   parallel copy, no scratch.
+K5 Trigger (GUEST, beam-designb): track dead (masked-out) pool slots/step; when dead-count >
+   8×PAGE_T → compute in-place two-pointer plan (last-alive → first-empty), call copy_into, REMAP
+   every beam's AttnMask to the moved slot positions, reset dead count. Mask-growth-bound: size
+   POOL_PAGES with ≥8×PAGE_T headroom so the trigger fires before pool overflow.
+K6 FIFO-BARRIER (OPEN — the one item that may need a real contract call): a pool-wide move must be
+   ordered vs in-flight RUN-AHEAD decode fires (optimistic cursor overlaps N fires on the stream). A
+   prior fire may still be writing a to-be-moved cell. PROPOSAL: the compaction op enters the same
+   per-pipeline PendingFire FIFO; finalize DRAINS prior fires (await their rx) before issuing the
+   move on the stream, and the move completes before the next fire's write descriptor resolves —
+   i.e. compaction QUIESCES the pipeline (breaks run-ahead overlap) only for the rare compaction
+   fire. FLAG: confirm a periodic pipeline stall is acceptable vs an overlap-preserving scheme.
+DEVICE E2E: cuda_beam_designb_compact_e2e — a longer beam run that accumulates >8×PAGE_T dead slots
+   → triggers ≥1 copy_into; guardrail that actually exercises the move + mask remap on device.
+
+### COMPACTION — DECISIONS + K5 ALGORITHM (2026-07-08, manager calls)
+DECIDED: U5 KEEP (unification COMPLETE + device-verified; routing-neutrality proof accepted — the
+Token-vs-Response variant is the BATCH gate response.rs:152, never ptir_output; the else-branch
+emits Response unconditionally at :302, so the removed request.rs:728 clause only gated an internal
+empty-vec early-return, not the variant). K6 = QUIESCE (periodic pipeline stall for the rare
+compaction fire; overlap-preserving deferred). K3 submit-model = ESCALATED to Oracle (A ws.copy_into
+method needs a new WS→pipeline back-ref; B move-only fire reuses the pipeline FIFO + gives K6 for
+free but departs from the ws.copy_into spelling; reconcile = ws.copy_into surface routed through the
+FIFO under the hood). HOLD K1/K2/K3 until the Oracle picks — it shapes the WIT.
+
+K5 ALGORITHM (guest-computable, submit-agnostic — turnkey once K3 lands; NOT yet coded because
+touching beam-designb's POOL_PAGES/MAX_STEPS breaks the identical-token guardrail, and the helper's
+home (SDK vs inferlet-local) depends on the K3 surface):
+- LIVENESS from parent history alone (no device masks needed): the guest already takes out_par
+  (parent[b] per step). Maintain, per current beam b, the SET of flat pool positions it attends =
+  parent[b]'s set ∪ {its new wpos}. Slot BOS(pos 0) always live. A pool position < fill is DEAD iff
+  it is in NO current beam's set (union-liveness). dead_count = fill+1 − |∪_b set_b|.
+- POSITION↔(page,tok): flat pos p ↔ (pool_ids[p / PAGE_T], p % PAGE_T) — same map as the write
+  descriptor (beam lib.rs:137-139). copy_into args decompose from flat positions via this.
+- TRIGGER: when dead_count > 8×PAGE_T → compact. Requires POOL headroom: POOL_PAGES sized so
+  live + 8×PAGE_T ≤ POOL (else overflow before trigger). This lives in the NEW compaction-e2e
+  inferlet (a longer run), NOT beam-designb (guardrail must keep POOL_PAGES=8/MAX_STEPS=8 → tokens
+  [106984,1,9370,91282,33108,101982,98362,125302]).
+- TWO-POINTER MOVE PLAN (in-place, no scratch): lo=0, hi=fill-1. Advance lo to the first DEAD
+  slot, retreat hi to the last ALIVE slot; while lo<hi emit move (src=hi → dst=lo), mark lo alive/hi
+  dead, advance. Yields disjoint (dst_positions, src_positions) → decompose to the 4 copy_into arg
+  lists. After the move, live slots occupy [0, live_count); the pool tail is free for new appends.
+- MASK REMAP (K3-coupled — device mask edit): every beam's AttnMask bit at src moves to dst. In
+  option B this rides the compaction fire (a gather/scatter over the mask channel); the guest
+  rebuilds fill := live_count and continues. This is the one K5 part that needs the submit surface.

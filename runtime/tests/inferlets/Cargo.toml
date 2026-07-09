@@ -29,7 +29,7 @@ members = [
     "ptir-greedy-e2e",
     "beam",
     "beam-baseline",
-    "beam-devgeo",
+    "beam-designb",
     "mtp-grammar",
     "linearfold",
     "samplerprobe",

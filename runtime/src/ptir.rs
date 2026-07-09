@@ -1,10 +1,9 @@
 //! PTIR (pie tensor IR) engine surface — relocated out of `api/` (mechanical
 //! move; the WIT host glue in `ptir_host` stays, the rest is engine domain
-//! logic: registry, instance, channel store, geometry, beam replay, KV/RS
-//! projection). Names kept verbatim during the move; a later refactor renames
-//! `ptir_host`→`host`, `ptir_beam`→`beam`, etc.
+//! logic: registry, instance, channel store, geometry, KV/RS projection).
+//! Names kept verbatim during the move; a later refactor renames
+//! `ptir_host`→`host`, etc.
 
-pub mod ptir_beam;
 pub mod ptir_channel_store;
 pub mod ptir_geometry;
 pub mod ptir_host;

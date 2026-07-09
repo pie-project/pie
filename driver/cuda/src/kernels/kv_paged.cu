@@ -169,6 +169,52 @@ __global__ void write_kv_explicit_kernel(
     }
 }
 
+// Explicit-descriptor KV cell MOVE (compaction primitive, §Design-B lazy GC):
+// copy ONE token's K/V cell from (src physical page, src offset) → (dst physical
+// page, dst offset), for a single layer. `N` independent cells; block n handles
+// cell n. Correct as a raw element copy because the KV cache is stored POST-RoPE
+// (a physical slot is pure storage; positions live in the per-beam mask, not the
+// slot) — so a compaction move that renumbers slots preserves attention. The
+// caller guarantees src/dst spans are DISJOINT (in-place two-pointer: last-alive
+// → first-empty), so one parallel pass needs no scratch buffer. Native-bf16 KV.
+template <bool HND_LAYOUT>
+__global__ void copy_kv_cells_kernel(
+    __nv_bfloat16* __restrict__ k_pages,
+    __nv_bfloat16* __restrict__ v_pages,
+    const std::uint32_t* __restrict__ dst_page,  // [N] PHYSICAL page id per cell
+    const std::uint32_t* __restrict__ dst_off,   // [N] offset-in-page per cell
+    const std::uint32_t* __restrict__ src_page,  // [N] PHYSICAL page id per cell
+    const std::uint32_t* __restrict__ src_off,   // [N] offset-in-page per cell
+    int N,
+    int page_size,
+    int h_kv,
+    int d)
+{
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int dpage = static_cast<int>(dst_page[n]);
+    const int doff  = static_cast<int>(dst_off[n]);
+    const int spage = static_cast<int>(src_page[n]);
+    const int soff  = static_cast<int>(src_off[n]);
+    if (doff < 0 || doff >= page_size || soff < 0 || soff >= page_size) return;
+
+    const long long row = static_cast<long long>(h_kv) * d;
+    for (int i = threadIdx.x; i < row; i += blockDim.x) {
+        long long dst, src;
+        if constexpr (HND_LAYOUT) {
+            const int h = i / d;
+            const int j = i - h * d;
+            dst = ((static_cast<long long>(dpage) * h_kv + h) * page_size + doff) * d + j;
+            src = ((static_cast<long long>(spage) * h_kv + h) * page_size + soff) * d + j;
+        } else {
+            dst = ((static_cast<long long>(dpage) * page_size) + doff) * row + i;
+            src = ((static_cast<long long>(spage) * page_size) + soff) * row + i;
+        }
+        k_pages[dst] = k_pages[src];
+        v_pages[dst] = v_pages[src];
+    }
+}
+
 __device__ __forceinline__ void resolve_dst(
     const std::uint32_t* __restrict__ qo_indptr,
     const std::uint32_t* __restrict__ kv_page_indices,
@@ -772,6 +818,37 @@ void launch_write_kv_explicit_bf16(
             static_cast<__nv_bfloat16*>(layer.v_pages),
             w_page, w_off, B, layer.page_size, layer.num_kv_heads,
             layer.head_dim);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_copy_kv_cells_bf16(
+    KvCacheLayerView layer,
+    const std::uint32_t* dst_page,      // [N] PHYSICAL page id per cell
+    const std::uint32_t* dst_off,       // [N] offset-in-page per cell
+    const std::uint32_t* src_page,      // [N] PHYSICAL page id per cell
+    const std::uint32_t* src_off,       // [N] offset-in-page per cell
+    int N,
+    cudaStream_t stream)
+{
+    if (!layer.is_native_bf16()) {
+        throw std::runtime_error(
+            "copy_kv_cells_bf16 requires native bf16 KV cache");
+    }
+    if (N <= 0) return;
+    constexpr int BLOCK = 256;
+    if (layer.hnd_layout) {
+        copy_kv_cells_kernel<true><<<N, BLOCK, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            dst_page, dst_off, src_page, src_off, N, layer.page_size,
+            layer.num_kv_heads, layer.head_dim);
+    } else {
+        copy_kv_cells_kernel<false><<<N, BLOCK, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            dst_page, dst_off, src_page, src_off, N, layer.page_size,
+            layer.num_kv_heads, layer.head_dim);
     }
     CUDA_CHECK(cudaGetLastError());
 }

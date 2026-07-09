@@ -21,7 +21,6 @@
 //!     `sglang`). POSIX-shmem ring carrying rkyv-encoded frames.
 
 mod channel;
-mod carry_bridge;
 mod completion;
 mod control;
 #[cfg(feature = "driver-cuda")]
@@ -39,15 +38,6 @@ mod shmem;
 pub use pie_waker as waker;
 
 /// X2/X3 (a) BRIDGE — the runtime carry-descriptor + in-flight close-gate: the
-/// FFI-free heart of guru's ruled bridge shape. [`CarryDescriptor`] is the single
-/// typed (version/size-led, loud-reject) marshal point the runtime `enqueue`
-/// stashes and the executor reads at a2 fire-commit; [`InFlightTracker`] gates
-/// `close_instance`'s frame region-free on in-flight == 0 (B6/§5.2 grace). Gated on
-/// `ptir` (FFI-free) so both are unit-tested without the CUDA driver lib.
-pub use carry_bridge::{
-    CarryDescriptor, CarryDescriptorError, CloseAction, InFlightTracker, CARRY_DESCRIPTOR_VERSION,
-};
-
 /// X1 — the direct control plane (Runtime–Driver Boundary B1–B7, B14): the
 /// hot control verbs (`register_program`/`bind_instance`/`close_instance`/
 /// `enqueue`) as direct in-proc calls on an embedded driver, off the
@@ -67,16 +57,12 @@ pub use control::{
 #[cfg(feature = "driver-cuda")]
 pub use control_cuda::CudaControlPlane;
 
-/// X3 — the completion-wake consumer (Runtime–Driver Boundary B9–B11): the
-/// runtime side that turns a driver completion into per-channel X0 wakes. On a
-/// fire commit it scans the committed instance's host-visible channels, reads
-/// each committed head/tail from the pinned words, and issues the epoch-filtered
-/// [`waker::WakerTable::wake_past`] — the generalization of X1's single-batch
-/// [`MockControlPlane::complete_next`]. The device-side completion *signal* is
-/// built separately and plugs in via [`CompletionSource`]. Gated behind `ptir`.
-pub use completion::{
-    ChannelScan, CommittedIndex, CompletionConsumer, CompletionSource, PinnedRingWord, ScanReport,
-};
+/// The pinned ring-word reader (Runtime–Driver Boundary B8/B9/B13): the runtime
+/// side reads each committed head/tail straight from the pinned words the driver
+/// publishes (pure loads, never through the driver). The wake itself is the
+/// driver's direct `pie_wake_past` from its instance table (boundary Phase 1);
+/// [`PinnedRingWord`] is the host-side read handle. Gated behind `ptir`.
+pub use completion::PinnedRingWord;
 
 use anyhow::Result;
 use async_trait::async_trait;

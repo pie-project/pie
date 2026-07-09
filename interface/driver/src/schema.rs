@@ -577,39 +577,6 @@ pub struct ForwardRequest {
     // request length `R` is implicit from the request count. Frozen fork pages
     // count FULL (W6), same convention as the host-fed `kv_len`.
     pub kv_len_device: Vec<u64>,
-
-    // ── (a) BRIDGE carry-descriptor channel (X2/X3, guru-ruled) ──────────────────
-    // Appended per the append-only schema evolution rule; all-vecs (4-aligned ABI —
-    // see `kv_len_device` above; a bare scalar would 8-align + break `pie-ipc`
-    // archived_layout, so even the single version rides a 0-or-1 `Vec`). The
-    // per-request carrier descriptor for the direct driver↔inferlet frame transport:
-    // `enqueue` (runtime) populates these; the CUDA executor reads them at a2
-    // fire-commit and calls `pie_frame_carry(instance, carry_word_index[r],
-    // committed_head[r], sample_done, <once-registered done>, carry_user_ptr[r])`.
-    // ALL EMPTY ⇒ no carry channel (every non-bridge path / the mock — zero behavior
-    // change). The completion callback (`cuda_carry_done`) is a stable static
-    // registered ONCE (`pie_frame_set_carry_done`), NOT threaded per-request, so
-    // only `{user_data, word_index}` are per-request here.
-    //
-    // PROVISIONAL shape (guru's shared-schema nod pending): SoA cols + a version
-    // guard (this preserves guru's "unknown layouts loud-reject" ABI rule — the
-    // executor validates `carry_abi_version[0] == CARRY_DESCRIPTOR_VERSION` before
-    // trusting the cols — while giving the a2 read plain u64 cols, not a `Vec<u8>`
-    // blob). Populate + the enqueue→ForwardRequest relocation is the bridge capstone.
-    /// `[CARRY_DESCRIPTOR_VERSION]` when a carry channel is present, else empty. The
-    /// executor loud-rejects a mismatch (guru's version guard). 0-or-1 element.
-    pub carry_abi_version: Vec<u32>,
-    /// Boxed `CarryWake` raw pointer per request (the `user_data` the carrier hands
-    /// back to `cuda_carry_done`). Parallel to the request axis (like the a2
-    /// `sampling_output_dst_ptrs`). Empty ⇒ no carry.
-    pub carry_user_ptr: Vec<u64>,
-    /// Pinned head `word_index` per request (`2*c` for channel `c`; word 0 today).
-    /// Parallel to `carry_user_ptr`.
-    pub carry_word_index: Vec<u64>,
-    /// Bound instance id per request. a2 batches R requests each under its OWN bound
-    /// instance, so the carrier's `pie_frame_carry(instance, …)` needs the
-    /// per-request instance (NOT one per-fire). Parallel to `carry_user_ptr`.
-    pub carry_instance: Vec<u64>,
 }
 
 /// Per-slot sampler kind discriminants. Carried on the wire as the `u8`
@@ -1416,17 +1383,6 @@ impl ForwardRequest {
         for &off in req.sampling_output_indptr.iter().skip(1) {
             self.sampling_output_indptr.push(output_base + off);
         }
-
-        // (a) BRIDGE carry-descriptor cols: concat per-request. `carry_abi_version`
-        // is a single per-fire value (same ABI across reqs) — adopt the req's when
-        // present. Empty req cols ⇒ nothing appended (that lane has no carry).
-        self.carry_user_ptr.extend_from_slice(&req.carry_user_ptr);
-        self.carry_word_index
-            .extend_from_slice(&req.carry_word_index);
-        self.carry_instance.extend_from_slice(&req.carry_instance);
-        if self.carry_abi_version.is_empty() && !req.carry_abi_version.is_empty() {
-            self.carry_abi_version = req.carry_abi_version.clone();
-        }
     }
 }
 
@@ -1498,71 +1454,6 @@ pub struct ForwardResponse {
     pub program_tokens_indptr: Vec<u32>,
     /// `[k]`-Token output values, concatenated in `program_tokens_indptr` order.
     pub program_tokens: Vec<u32>,
-
-    // ── PTIR program outputs (thrust-3 P2c-fire) ────────────────────────
-    // The host-visible Reader-channel cells a PTIR pass produced, harvested by
-    // the driver's stage-runner (`PtirInstance::harvest_outputs`) and marshaled
-    // back to the host channel store (`ChannelStore::marshal_response`). SoA +
-    // per-program CSR, mirroring the REQUEST's host-put table exactly; program
-    // `p` here corresponds 1:1 to program `p` in the request's PTIR set
-    // (`ptir_program_hashes[p]`/`ptir_program_instances[p]`). Empty for the
-    // legacy / Sampling-IR paths. Bool cells travel packed (D1), same as the
-    // host-put wire.
-    /// Produced-channel global id per output entry (a host-facing Reader channel).
-    pub ptir_output_channels: Vec<u64>,
-    /// Concatenated produced-cell value bytes (bool packed per the dtype, D1).
-    pub ptir_output_blob: Vec<u8>,
-    /// Byte length per output entry (parallel to `ptir_output_channels`).
-    pub ptir_output_lens: Vec<u32>,
-    /// Per-program CSR into the output entries (leading 0), one boundary per
-    /// program in the fire's PTIR set.
-    pub ptir_output_indptr: Vec<u32>,
-}
-
-impl ForwardResponse {
-    /// Append one PTIR program's produced Reader-channel cells to the output SoA
-    /// (thrust-3 P2c-fire) — the response-side mirror of
-    /// [`ForwardRequest::push_ptir_program`]'s host-put table. Called once per
-    /// program in the fire's PTIR set, in the same order as the request.
-    pub fn push_ptir_output(&mut self, outputs: &[PtirChannelValue]) {
-        if self.ptir_output_indptr.is_empty() {
-            self.ptir_output_indptr.push(0);
-        }
-        for o in outputs {
-            self.ptir_output_channels.push(o.channel);
-            self.ptir_output_blob.extend_from_slice(&o.bytes);
-            self.ptir_output_lens.push(o.bytes.len() as u32);
-        }
-        self.ptir_output_indptr.push(self.ptir_output_channels.len() as u32);
-    }
-
-    /// Number of PTIR programs whose outputs are carried (`= ptir_output_indptr`
-    /// boundaries minus the leading 0). Zero for the legacy / Sampling-IR paths.
-    #[inline]
-    pub fn ptir_output_count(&self) -> usize {
-        self.ptir_output_indptr.len().saturating_sub(1)
-    }
-
-    /// Decode PTIR program `p`'s produced Reader-channel cells (round-trip of
-    /// [`push_ptir_output`](Self::push_ptir_output); the host's reference reader,
-    /// fed straight into `ChannelStore::marshal_response`). `None` if `p` is out
-    /// of range.
-    pub fn ptir_output_at(&self, p: usize) -> Option<Vec<PtirChannelValue>> {
-        let lo = *self.ptir_output_indptr.get(p)? as usize;
-        let hi = *self.ptir_output_indptr.get(p + 1)? as usize;
-        let mut byte_off: usize =
-            self.ptir_output_lens.iter().take(lo).map(|&l| l as usize).sum();
-        let mut out = Vec::with_capacity(hi - lo);
-        for e in lo..hi {
-            let len = self.ptir_output_lens[e] as usize;
-            out.push(PtirChannelValue {
-                channel: self.ptir_output_channels[e],
-                bytes: self.ptir_output_blob[byte_off..byte_off + len].to_vec(),
-            });
-            byte_off += len;
-        }
-        Some(out)
-    }
 }
 
 // =============================================================================
@@ -1645,31 +1536,5 @@ mod ptir_carrier_tests {
         let req = ForwardRequest::default();
         assert_eq!(req.ptir_program_count(), 0);
         assert_eq!(req.ptir_program_at(0), None);
-    }
-
-    #[test]
-    fn push_ptir_output_roundtrips() {
-        use super::ForwardResponse;
-        // program 0 produced 2 cells (out=token, plus a scalar), program 1 one.
-        let mut resp = ForwardResponse::default();
-        resp.push_ptir_output(&[cv(1, &5u32.to_le_bytes()), cv(2, &[0xAB])]);
-        resp.push_ptir_output(&[cv(1, &9u32.to_le_bytes())]);
-
-        assert_eq!(resp.ptir_output_count(), 2);
-        assert_eq!(
-            resp.ptir_output_at(0),
-            Some(vec![cv(1, &5u32.to_le_bytes()), cv(2, &[0xAB])]),
-            "program 0's produced cells round-trip in order"
-        );
-        assert_eq!(resp.ptir_output_at(1), Some(vec![cv(1, &9u32.to_le_bytes())]));
-        assert_eq!(resp.ptir_output_at(2), None, "out of range");
-    }
-
-    #[test]
-    fn empty_ptir_output_is_legacy_clean() {
-        use super::ForwardResponse;
-        let resp = ForwardResponse::default();
-        assert_eq!(resp.ptir_output_count(), 0);
-        assert_eq!(resp.ptir_output_at(0), None);
     }
 }

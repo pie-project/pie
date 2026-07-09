@@ -5,9 +5,6 @@
 //   * register → bind allocates a DEVICE frame + PINNED mirror + PINNED ring words,
 //     handing back three distinct, non-null bases (B5), fixed for the lifetime (B6).
 //   * WRITE leg (pie_frame_write): H2D a known pattern into the device frame.
-//   * the CARRIER (pie_frame_carry): D2H-mirrors the committed frame into the
-//     pinned mirror, publishes the pinned ring word (word[0]=target), and fires the
-//     copy-stream host callback (the X0 wake bridge) once it lands.
 //   * close reclaims the regions (live_instances → 0).
 // Exercises the real extern "C" FFI surface the runtime consumes. Needs a GPU;
 // device validation is deferred to the later batch per the velocity-shift directive.
@@ -38,12 +35,6 @@ using pie_cuda_driver::sampling_ir::FrameCarrierEngine;
         if (!(cond)) { std::fprintf(stderr, "FAIL: %s\n", (msg)); return 1; }  \
     } while (0)
 
-// The carrier's completion callback (the X0 wake bridge stand-in): flips a flag
-// once the copy-stream D2H mirror + ring-word publish have landed.
-static void CUDART_CB carry_done_cb(void* ud) {
-    *static_cast<int*>(ud) = 1;
-}
-
 int main() {
     FrameCarrierEngine& eng = FrameCarrierEngine::instance();
 
@@ -68,29 +59,55 @@ int main() {
     for (std::size_t i = 0; i < N; ++i) pattern[i] = static_cast<std::uint8_t>(i + 1);
     eng.carry_in(inst, pattern.data(), N, /*frame_offset=*/0);
 
-    // ── the CARRIER: mirror the whole committed frame + publish word[0] ───────
-    int done_flag = 0;
-    eng.carry(inst, /*frame_off=*/0, /*mirror_off=*/0, /*n_bytes=*/0,
-              /*word_index=*/0, /*target=*/1, /*forward_evt=*/nullptr,
-              carry_done_cb, &done_flag);
-
-    // Drain the copy stream: the H2D, D2H mirror, ring-word publish, and host
-    // callback are all enqueued on it, in order.
+    // Drain the copy stream (the H2D is enqueued on it), then read the device frame
+    // back directly to confirm the WRITE leg landed the pattern.
     CK(cudaStreamSynchronize(eng.copy_stream()));
-
-    EXPECT(done_flag == 1, "carrier completion callback did not fire");
-
-    // The pinned mirror holds the frame's committed cells (host reads it directly).
-    const auto* mirror = reinterpret_cast<const std::uint8_t*>(mirror_base);
-    EXPECT(std::memcmp(mirror, pattern.data(), N) == 0, "mirror != written frame");
-
-    // The pinned ring word passed the target (B9 — the host waits on this word).
-    const auto* words = reinterpret_cast<const std::uint64_t*>(word_base);
-    EXPECT(words[0] == 1, "ring word[0] not published to target");
+    std::vector<std::uint8_t> readback(N, 0);
+    CK(cudaMemcpy(readback.data(), reinterpret_cast<const void*>(frame_base), N,
+                  cudaMemcpyDeviceToHost));
+    EXPECT(std::memcmp(readback.data(), pattern.data(), N) == 0,
+           "device frame != written pattern");
 
     // ── close reclaims the regions ────────────────────────────────────────────
     eng.close_instance(inst);
     EXPECT(eng.live_instances() == 0, "live_instances != 0 after close");
+
+    // ── REAL channel-list bind + publish (the unification's live substrate) ────
+    // Two host-visible channels: ch0 cell=8B cap1=4, ch1 cell=16B cap1=2.
+    const std::uint32_t cell_bytes[2] = {8, 16};
+    const std::uint32_t cap1[2] = {4, 2};
+    std::uint64_t fb2 = 0, mirror2 = 0, words2 = 0;
+    const std::uint64_t inst2 =
+        eng.bind_channels(2, cell_bytes, cap1, &fb2, &mirror2, &words2);
+    EXPECT(inst2 != 0, "bind_channels returned 0");
+    EXPECT(mirror2 != 0 && words2 != 0, "null mirror/word base");
+    // frame_base is vestigial (registry owns cells) → 0 by design.
+    EXPECT(fb2 == 0, "frame_base should be vestigial (0)");
+
+    // Publish a fire: ch0 → cell bytes {0x10..}, ring slot 1, head 0 tail 2;
+    //                 ch1 → cell bytes {0x20..}, ring slot 0, head 0 tail 1; pacing=1.
+    std::vector<std::uint8_t> c0(8), c1(16);
+    for (std::size_t i = 0; i < 8; ++i) c0[i] = 0x10 + static_cast<std::uint8_t>(i);
+    for (std::size_t i = 0; i < 16; ++i) c1[i] = 0x20 + static_cast<std::uint8_t>(i);
+    const void* src[2] = {c0.data(), c1.data()};
+    const std::uint32_t ring_index[2] = {1, 0};
+    const std::uint32_t head[2] = {0, 0};
+    const std::uint32_t tail[2] = {2, 1};
+    eng.publish(inst2, 2, src, ring_index, head, tail, /*pacing=*/1);
+
+    // Read back: pacing word[0] == 1; head/tail words; mirror ring slots hold cells.
+    const std::uint64_t* w = reinterpret_cast<const std::uint64_t*>(words2);
+    EXPECT(w[0] == 1, "pacing word[0] != 1");
+    EXPECT(w[1] == 0 && w[2] == 2, "ch0 head/tail words wrong");   // head(0)=1, tail(0)=2
+    EXPECT(w[3] == 0 && w[4] == 1, "ch1 head/tail words wrong");   // head(1)=3, tail(1)=4
+    const std::uint8_t* m = reinterpret_cast<const std::uint8_t*>(mirror2);
+    // ch0 ring base = 0, slot 1 → offset 1*8 = 8.
+    EXPECT(std::memcmp(m + 8, c0.data(), 8) == 0, "ch0 mirror slot != published");
+    // ch1 ring base = 8*4 = 32, slot 0 → offset 32.
+    EXPECT(std::memcmp(m + 32, c1.data(), 16) == 0, "ch1 mirror slot != published");
+
+    eng.close_instance(inst2);
+    EXPECT(eng.live_instances() == 0, "live_instances != 0 after close(inst2)");
 
     std::printf("test_frame_carrier_device: OK\n");
     return 0;

@@ -46,7 +46,6 @@
 #include "sampling_dispatch.hpp"
 #include "sampling_ir/next_input.hpp"
 #include "sampling_ir/tensor_io.hpp"
-#include "sampling_ir/frame_carrier.hpp"
 #include "spec_expansion.hpp"
 
 namespace pie_cuda_driver {
@@ -92,16 +91,6 @@ bool ForwardFn::invoke_fused_argmax_done() {
 }
 
 namespace {
-
-// X2 BRIDGE (a) — the carry ABI version guard. bravo's FINALIZED shape
-// (x2-x3-bridge @ e3caa4b3) is per-request SoA cols on the ForwardRequest
-// (carry_abi_version / carry_user_ptr / carry_word_index / carry_instance),
-// NOT a blob: the a2 fire-commit validates `carry_abi_version[0]` == this
-// (LOUD-REJECT on mismatch — guru's version-guard ABI rule) before trusting the
-// cols. The completion callback (`cuda_carry_done`) is registered ONCE via
-// `pie_frame_set_carry_done`, so the carry call passes `done=nullptr` (→ the
-// once-registered completion) — done is not threaded per-request.
-constexpr std::uint32_t kCarryDescriptorVersion = 1;
 
 struct TpCpuGate {
     std::mutex mu;
@@ -3526,46 +3515,6 @@ void handle_fire_batch(
                     sampling_ir::TensorIoEngine::instance().eager_d2h_outputs(
                         dsts.data(), caps.data(), srcs.data(), nbytes.data(),
                         static_cast<std::size_t>(R), sample_done);
-                // ── X2 BRIDGE (a): relocate the carrier call to the a2 fire-commit ──
-                // guru ruled (a) BRIDGE: the mock enqueue's pie_frame_carry moves HERE,
-                // where the real per-fire `sample_done` + the executor's monotonic
-                // `committed_head` exist. If the host threaded the per-request carry
-                // cols (bravo's finalized SoA: carry_user_ptr/word_index/instance +
-                // version guard), fire the carrier per request. Ordering (guru):
-                // carry(forward_evt=sample_done) → word release-stores → done callback
-                // fires both consumers (delta pacing + alpha scan_channels). The carrier
-                // reuses this fire's `sample_done` as its cross-stream wait, so its D2H
-                // mirror serialises behind the committed cells. `sample_done` is
-                // destroyed AFTER this loop (persisted for it).
-                if (view.carry_user_ptr.size() == static_cast<std::size_t>(R)) {
-                    // VERSION GUARD (guru): loud-reject an ABI mismatch before trusting
-                    // the cols, rather than misread. carry_abi_version is [1] when present.
-                    if (view.carry_abi_version.empty() ||
-                        view.carry_abi_version.data()[0] != kCarryDescriptorVersion) {
-                        std::fprintf(stderr,
-                            "[executor] carry ABI mismatch (version=%u, expected %u) — abort\n",
-                            view.carry_abi_version.empty() ? 0u : view.carry_abi_version.data()[0],
-                            kCarryDescriptorVersion);
-                        std::abort();  // loud-reject (guru's version-guard rule)
-                    }
-                    for (int r = 0; r < R; ++r) {
-                        // Per-request instance (a2 batches R requests each under its OWN
-                        // bound instance — NOT one per fire).
-                        const std::uint64_t instance = view.carry_instance.data()[r];
-                        // MONOTONIC head: a2 greedy commits 1 token/request/fire ⇒ +1.
-                        const std::uint64_t head =
-                            ++executor.carry_commit_heads[instance];
-                        auto* user = reinterpret_cast<void*>(
-                            static_cast<std::uintptr_t>(view.carry_user_ptr.data()[r]));
-                        // done = nullptr ⇒ the once-registered cuda_carry_done (the runtime
-                        // calls pie_frame_set_carry_done at init; not threaded per-request).
-                        pie_frame_carry(instance, /*frame_offset=*/0, /*mirror_offset=*/0,
-                                        /*n_bytes=*/0,
-                                        static_cast<std::size_t>(view.carry_word_index.data()[r]),
-                                        /*target=*/head, /*forward_evt=*/sample_done,
-                                        /*done=*/nullptr, user);
-                    }
-                }
                 CUDA_CHECK(cudaEventDestroy(sample_done));
                 // Persist for the WAR guard at the NEXT forward's sampling tail (it
                 // waits this before t+1 overwrites single-buffer pi.sampled).

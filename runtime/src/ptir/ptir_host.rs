@@ -41,6 +41,44 @@ use super::ptir_kv;
 use super::ptir_lease::PageLease;
 use super::ptir_rs;
 
+/// U4 unification — the pinned frame mirror the runtime reads produced Reader
+/// cells straight from (superseding the ForwardResponse marshal). The driver
+/// D2H-published each committed cell into a per-channel ring in the pinned mirror
+/// at commit and advanced the pinned head/tail words; the runtime loads them with
+/// no driver round-trip. Populated lazily on the first finalize (once the frame is
+/// bound device-side). Rank order matches the device's dense host-reader order.
+pub struct FrameReader {
+    mirror_base: u64,
+    word_base: u64,
+    readers: Vec<FrameReaderChannel>,
+}
+
+/// One host-reader channel's cursor into the pinned mirror ring (rank-ordered).
+struct FrameReaderChannel {
+    global_id: u64,
+    cell_bytes: u32,
+    cap1: u32,
+    mirror_off: u64,
+    /// Cumulative cells consumed into the bound cell so far (vs the tail word).
+    pushed: u64,
+}
+
+#[cfg(feature = "driver-cuda")]
+unsafe extern "C" {
+    /// U4 — write the instance's pinned mirror/word bases + per-channel
+    /// {cell_bytes, cap1, mirror_off}; returns the host-visible channel count
+    /// (`0` = unknown instance / no frame). Implemented in `frame_carrier.cpp`.
+    fn pie_frame_layout(
+        instance: u64,
+        n_channels: u32,
+        out_cell_bytes: *mut u32,
+        out_cap1: *mut u32,
+        out_mirror_off: *mut u64,
+        out_mirror_base: *mut u64,
+        out_word_base: *mut u64,
+    ) -> u32;
+}
+
 /// A first-class, guest-constructed channel (overview §1). The SAME handle is
 /// bound into a forward pass (dense declaration index) and used for host
 /// `put`/`take`/`read`; the shared [`ChannelCell`] is Arc'd so a pass that
@@ -136,6 +174,11 @@ pub struct ForwardPass {
     /// pages (`PageLease`) and delivers fresh grants on the program's fresh
     /// channel. Replaces the deleted host-replay beam branch.
     pub devgeo: Option<DevGeo>,
+    /// U4 unification: the pinned frame mirror this instance's produced Reader
+    /// cells are read from at finalize (the driver publishes them at commit),
+    /// superseding the ForwardResponse marshal. Lazily bound on the first
+    /// finalize; `None` until then (and always `None` off `driver-cuda`).
+    pub frame: Option<FrameReader>,
 }
 
 /// A run-ahead submission pipeline (overview §3): the ORDERING domain (W3.1).
@@ -517,6 +560,7 @@ impl pie::core::ptir::HostForwardPass for InstanceState {
                 shipped: false,
                 failed: None,
                 devgeo,
+                frame: None,
             })?;
             Ok(Ok(res))
         }
@@ -860,15 +904,11 @@ impl InstanceState {
 
         match result {
             Ok(Ok(crate::inference::ForwardOutput::Response(resp))) => {
-                // The rich response carries the harvested Reader-channel cells;
-                // marshal program 0's outputs back into the bound cells so the
-                // guest's `take`/`read` see them.
-                let produced: Vec<(u64, Vec<u8>)> = resp
-                    .ptir_output_at(0)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|c| (c.channel, c.bytes))
-                    .collect();
+                // Marshal program 0's produced Reader cells back into the bound
+                // cells so the guest's `take`/`read` see them. On `driver-cuda`
+                // the value path is the pinned frame mirror the driver published
+                // at commit (the unification); otherwise the rich response.
+                let produced = self.produced_cells(fwd_rep, &cells, &resp);
                 if let Err(e) = marshal_response(&cells, &produced) {
                     let reason = format!("ptir: output marshal failed: {e}");
                     poison_readers(&cells, &reason);
@@ -895,6 +935,110 @@ impl InstanceState {
             }
         }
         Ok(())
+    }
+
+    /// Build the fire's produced Reader cells `(global_id, bytes)` for
+    /// [`marshal_response`]. On `driver-cuda` the value path is the pinned frame
+    /// mirror (the unification): read the newly-committed cells straight from the
+    /// per-channel ring the driver D2H-published at commit — no ForwardResponse
+    /// marshal. The response's `ptir_output` is ignored here (kept produced for
+    /// non-CUDA drivers, which have no frame carrier).
+    #[cfg(feature = "driver-cuda")]
+    fn produced_cells(
+        &mut self,
+        fwd_rep: u32,
+        cells: &BoundCells,
+        _resp: &pie_driver_abi::ForwardResponse,
+    ) -> Vec<(u64, Vec<u8>)> {
+        // Host-reader channels in dense declaration order == the device's dense
+        // host-reader RANK order (both filter Reader over the same dense list).
+        let reader_gids: Vec<u64> = cells
+            .iter()
+            .filter_map(|c| {
+                let g = c.lock().unwrap();
+                (g.role == Some(HostRole::Reader)).then_some(g.global_id)
+            })
+            .collect();
+        if reader_gids.is_empty() {
+            return Vec::new();
+        }
+        let res: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
+        let pass = match self.ctx().table.get_mut(&res) {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+        let iid = pass.instance.instance_id;
+        // Lazily bind the frame reader: query the device layout by the wire id
+        // (the id-reconcile makes the frame carrier key == this instance_id).
+        if pass.frame.is_none() {
+            let n = reader_gids.len();
+            let mut cell_bytes = vec![0u32; n];
+            let mut cap1 = vec![0u32; n];
+            let mut mirror_off = vec![0u64; n];
+            let (mut mirror_base, mut word_base) = (0u64, 0u64);
+            let got = unsafe {
+                pie_frame_layout(
+                    iid,
+                    n as u32,
+                    cell_bytes.as_mut_ptr(),
+                    cap1.as_mut_ptr(),
+                    mirror_off.as_mut_ptr(),
+                    &mut mirror_base,
+                    &mut word_base,
+                )
+            };
+            if got as usize != n {
+                if std::env::var("PIE_PTIR_TRACE").is_ok() {
+                    eprintln!(
+                        "[u4] frame_layout iid={iid} got={got} n={n} — NO frame, mirror read skipped"
+                    );
+                }
+                // No frame bound (e.g. the driver produced no host-reader frame
+                // this fire) — nothing to read from the mirror.
+                return Vec::new();
+            }
+            let readers = (0..n)
+                .map(|r| FrameReaderChannel {
+                    global_id: reader_gids[r],
+                    cell_bytes: cell_bytes[r],
+                    cap1: cap1[r],
+                    mirror_off: mirror_off[r],
+                    pushed: 0,
+                })
+                .collect();
+            pass.frame = Some(FrameReader { mirror_base, word_base, readers });
+        }
+        let fr = pass.frame.as_mut().unwrap();
+        let (mirror_base, word_base) = (fr.mirror_base, fr.word_base);
+        let mut produced = Vec::new();
+        for (rank, rc) in fr.readers.iter_mut().enumerate() {
+            // tail word = word[2 + 2*rank] (WordLayout: pacing[0], head/tail per
+            // channel). The oneshot from the executor happens-after publish, so a
+            // plain load observes the published words + mirror cells.
+            let tail = unsafe { *(word_base as *const u64).add(2 + 2 * rank) };
+            while rc.pushed < tail {
+                let slot = (rc.pushed % rc.cap1 as u64) * rc.cell_bytes as u64;
+                let ptr = (mirror_base + rc.mirror_off + slot) as *const u8;
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(ptr, rc.cell_bytes as usize).to_vec() };
+                produced.push((rc.global_id, bytes));
+                rc.pushed += 1;
+            }
+        }
+        produced
+    }
+
+    /// Non-CUDA build: no frame carrier and no ForwardResponse PTIR value path
+    /// (the CUDA executor is the only runtime producer of Reader cells). Nothing
+    /// to marshal — a non-CUDA driver never fires PTIR stage programs.
+    #[cfg(not(feature = "driver-cuda"))]
+    fn produced_cells(
+        &mut self,
+        _fwd_rep: u32,
+        _cells: &BoundCells,
+        _resp: &pie_driver_abi::ForwardResponse,
+    ) -> Vec<(u64, Vec<u8>)> {
+        Vec::new()
     }
 
     /// Mark a pass failed (first failure wins). The guest may have dropped
@@ -924,7 +1068,7 @@ impl InstanceState {
     /// BRING-UP (4090, shadow-verify): the exact fresh-page materialization
     /// (`cow_write_slot`), the fire-0 seed source, and the physical-page ids fed
     /// on `fresh` are validated against the beam goldens on device; the geometry
-    /// contract itself is host-verified (`ptir-dsl` `beam_goldens`).
+    /// contract itself is host-verified (`ptir-dsl` `beam_designb_goldens`).
     async fn fire_device_geometry(
         &mut self,
         this: Resource<Pipeline>,

@@ -39,6 +39,25 @@ impl Channel {
         Channel::build(data.shape, data.dtype, 1, Some(data))
     }
 
+    /// `Channel::from_shaped([shape], v)` — like [`from`], but reinterprets the
+    /// flat seed data `v` with the explicit multi-dim `shape` (element counts
+    /// must match). `IntoConst` only produces flat 1-D seeds, so use this for a
+    /// concrete multi-dim seed (e.g. a `[B, POOL]` bool attention mask) that
+    /// downstream ops (`gather`/`or`) type against as rank-2.
+    pub fn from_shaped(shape: impl IntoShape, v: impl IntoConst) -> Channel {
+        let mut data = v.into_const();
+        let shape = shape.into_shape();
+        assert_eq!(
+            shape.numel(),
+            data.shape.numel(),
+            "from_shaped: element count mismatch ({:?} vs seed {:?})",
+            shape,
+            data.shape,
+        );
+        data.shape = shape;
+        Channel::build(data.shape, data.dtype, 1, Some(data))
+    }
+
     /// A seeded channel of a given shape (`Channel::from` where the initial
     /// value is per-instance data supplied at instantiation, D2). Use for
     /// device loop-carried multi-dim channels (`pages [B,P]`, `kvm [B, P*page]`)

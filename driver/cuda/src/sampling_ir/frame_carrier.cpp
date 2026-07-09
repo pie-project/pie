@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace pie_cuda_driver::sampling_ir {
 
@@ -32,53 +34,6 @@ inline void ck(cudaError_t e, const char* what) {
 constexpr std::size_t kMinFrameBytes = 64;
 constexpr std::size_t kMirrorBytes = 64;
 constexpr std::size_t kWordBytes = 64;  // 8 u64 ring-index words
-
-// The carrier's copy-stream completion callback. Runs on a driver-internal thread
-// once all prior copy-stream work (the D2H mirror) has landed. Publishes the
-// pinned ring-index word (B11 — a plain CPU store into pinned host memory, visible
-// before the wake), then fires the X0 wake bridge. MUST NOT call CUDA APIs.
-struct CarryCtx {
-    std::uint64_t* word_slot;  // pinned host ring-index word to publish (B9)
-    std::uint64_t  target;     // value to publish
-    FrameCarryDone done;       // X0 wake bridge (runtime trampoline), may be null
-    void*          user;       // opaque runtime completion context
-};
-
-// The completion callback (`cuda_carry_done`) is a stable static — registered
-// ONCE by the runtime via `pie_frame_set_carry_done`, NOT threaded per fire. A
-// `carry()` whose `done` arg is null uses this registered default, so the (a)
-// BRIDGE executor call site passes only `{user_data, word_index}` and never
-// handles the fn-ptr. Atomic: set once at init, read on every carry.
-std::atomic<FrameCarryDone> g_carry_done{nullptr};
-
-void CUDART_CB frame_carry_host_cb(void* p) {
-    auto* ctx = static_cast<CarryCtx*>(p);
-    // Publish the committed head as a MONOTONIC-MAX, not a plain store (B11 —
-    // publish-before-signal via RELEASE). The head value is baked at ENQUEUE (submit
-    // order N, N+1) but written here at COMMIT (async). The carrier's SINGLE copy
-    // stream (see the ctor: one `stream_` for every instance + fire) commits carries
-    // FIFO, so per-instance commits already land in enqueue order today — the
-    // load-bearing invariant that keeps BOTH this head monotonic AND the D2H mirror
-    // fresh (the mirror is likewise last-writer-wins). The max is cheap
-    // defense-in-depth for the HEAD alone: if two carries for one instance ever
-    // committed out of order (a future per-instance / multi-stream topology, e.g.
-    // depth-2 run-ahead on separate streams), a plain store could regress the head →
-    // the reader's `wake_past` epoch-Filters → stall + lost advance. NOTE the mirror
-    // still requires the single-stream FIFO; the max guards the head word only.
-    if (ctx->word_slot != nullptr) {
-        std::uint64_t cur = __atomic_load_n(ctx->word_slot, __ATOMIC_RELAXED);
-        while (ctx->target > cur &&
-               !__atomic_compare_exchange_n(ctx->word_slot, &cur, ctx->target,
-                                            /*weak=*/true, __ATOMIC_RELEASE,
-                                            __ATOMIC_RELAXED)) {
-            // CAS failure reloads `cur`; retry until target <= cur or the swap lands.
-        }
-    }
-    if (ctx->done != nullptr) {
-        ctx->done(ctx->user);  // wake the parked host future through the X0 table
-    }
-    delete ctx;
-}
 }  // namespace
 
 #define FC_CK(x) ck((x), #x)
@@ -103,7 +58,8 @@ FrameCarrierEngine::FrameCarrierEngine() {
 }
 
 FrameCarrierEngine::~FrameCarrierEngine() {
-    for (FrameInstance* fi : instances_) {
+    for (auto& kv : instances_) {
+        FrameInstance* fi = kv.second;
         if (fi == nullptr) continue;
         if (fi->device_frame) cudaFree(fi->device_frame);
         if (fi->host_mirror) cudaFreeHost(fi->host_mirror);
@@ -151,8 +107,7 @@ std::uint64_t FrameCarrierEngine::bind_instance(std::uint64_t program,
               reinterpret_cast<char*>(fi->host_words) + layout.word_bytes, 0);
 
     const std::uint64_t id = next_instance_++;
-    if (instances_.size() < id) instances_.resize(id, nullptr);
-    instances_[id - 1] = fi;
+    instances_[id] = fi;
 
     *out_frame_base = reinterpret_cast<std::uint64_t>(fi->device_frame);
     *out_mirror_base = reinterpret_cast<std::uint64_t>(fi->host_mirror);
@@ -161,9 +116,124 @@ std::uint64_t FrameCarrierEngine::bind_instance(std::uint64_t program,
 }
 
 FrameInstance* FrameCarrierEngine::lookup(std::uint64_t instance) {
-    const std::size_t idx = static_cast<std::size_t>(instance - 1);
-    if (instance == 0 || idx >= instances_.size()) return nullptr;
-    return instances_[idx];
+    auto it = instances_.find(instance);
+    return it == instances_.end() ? nullptr : it->second;
+}
+
+std::uint64_t FrameCarrierEngine::bind_channels(std::uint32_t n_channels,
+                                                const std::uint32_t* cell_bytes,
+                                                const std::uint32_t* cap1,
+                                                std::uint64_t* out_frame_base,
+                                                std::uint64_t* out_mirror_base,
+                                                std::uint64_t* out_word_base) {
+    std::lock_guard<std::mutex> guard(mu_);
+    const std::uint64_t id = next_instance_++;
+    return bind_channels_locked(id, n_channels, cell_bytes, cap1, out_frame_base,
+                                out_mirror_base, out_word_base);
+}
+
+std::uint64_t FrameCarrierEngine::bind_channels_keyed(std::uint64_t key,
+                                                      std::uint32_t n_channels,
+                                                      const std::uint32_t* cell_bytes,
+                                                      const std::uint32_t* cap1,
+                                                      std::uint64_t* out_frame_base,
+                                                      std::uint64_t* out_mirror_base,
+                                                      std::uint64_t* out_word_base) {
+    std::lock_guard<std::mutex> guard(mu_);
+    return bind_channels_locked(key, n_channels, cell_bytes, cap1, out_frame_base,
+                                out_mirror_base, out_word_base);
+}
+
+// Shared bind body — caller holds mu_ and supplies the instance key (minted or the
+// caller-supplied wire id). Allocates the pinned mirror (per-channel rings) + words.
+std::uint64_t FrameCarrierEngine::bind_channels_locked(std::uint64_t id,
+                                                       std::uint32_t n_channels,
+                                                       const std::uint32_t* cell_bytes,
+                                                       const std::uint32_t* cap1,
+                                                       std::uint64_t* out_frame_base,
+                                                       std::uint64_t* out_mirror_base,
+                                                       std::uint64_t* out_word_base) {
+    auto* fi = new FrameInstance();
+    fi->program = 0;  // registry-owned cells; no provisional program layout
+    fi->host_vis.reserve(n_channels);
+    std::size_t mirror = 0;
+    for (std::uint32_t c = 0; c < n_channels; ++c) {
+        const std::uint32_t cb = cell_bytes[c] == 0 ? 1u : cell_bytes[c];
+        const std::uint32_t k1 = cap1[c] == 0 ? 1u : cap1[c];
+        fi->host_vis.push_back(FrameChannel{cb, k1, mirror});
+        mirror += static_cast<std::size_t>(cb) * k1;
+    }
+    // pacing[0] + head/tail per channel (WordLayout::words(n) = 1 + 2n).
+    const std::size_t word_bytes = (1u + 2u * n_channels) * sizeof(std::uint64_t);
+    fi->frame_bytes = 0;  // vestigial — device cells live in the registry
+    fi->mirror_bytes = mirror == 0 ? 1 : mirror;
+    fi->word_bytes = word_bytes;
+    fi->device_frame = nullptr;  // Q1 reconcile: no per-instance contiguous frame
+    FC_CK(cudaHostAlloc(&fi->host_mirror, fi->mirror_bytes, cudaHostAllocDefault));
+    std::memset(fi->host_mirror, 0, fi->mirror_bytes);
+    FC_CK(cudaHostAlloc(reinterpret_cast<void**>(&fi->host_words), word_bytes,
+                        cudaHostAllocDefault));
+    std::fill(reinterpret_cast<char*>(fi->host_words),
+              reinterpret_cast<char*>(fi->host_words) + word_bytes, 0);
+
+    instances_[id] = fi;
+
+    if (out_frame_base) *out_frame_base = 0;  // vestigial
+    if (out_mirror_base) *out_mirror_base = reinterpret_cast<std::uint64_t>(fi->host_mirror);
+    if (out_word_base) *out_word_base = reinterpret_cast<std::uint64_t>(fi->host_words);
+    return id;
+}
+
+void FrameCarrierEngine::publish(std::uint64_t instance, std::uint32_t n_channels,
+                                 const void* const* src, const std::uint32_t* ring_index,
+                                 const std::uint32_t* head, const std::uint32_t* tail,
+                                 std::uint64_t pacing) {
+    std::lock_guard<std::mutex> guard(mu_);
+    FrameInstance* fi = lookup(instance);
+    if (fi == nullptr) {
+        std::fprintf(stderr, "[frame_carrier] publish on unknown instance %llu\n",
+                     static_cast<unsigned long long>(instance));
+        std::abort();
+    }
+    // Copy each committed cell into its mirror ring slot + publish head/tail. The
+    // value lands before pacing[0] (publish-before-wake): the runtime loads word[0]
+    // with acquire, so the release fence below orders the mirror + head/tail writes
+    // ahead of the pacing store.
+    for (std::uint32_t c = 0; c < n_channels && c < fi->host_vis.size(); ++c) {
+        const FrameChannel& fc = fi->host_vis[c];
+        if (src[c] != nullptr && fc.cell_bytes > 0) {
+            const std::size_t slot = static_cast<std::size_t>(ring_index[c]) * fc.cell_bytes;
+            std::memcpy(static_cast<char*>(fi->host_mirror) + fc.mirror_off + slot,
+                        src[c], fc.cell_bytes);
+        }
+        fi->host_words[1 + 2 * c] = head[c];  // WordLayout::head(c)
+        fi->host_words[2 + 2 * c] = tail[c];  // WordLayout::tail(c)
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    reinterpret_cast<std::atomic<std::uint64_t>*>(&fi->host_words[0])
+        ->store(pacing, std::memory_order_relaxed);
+}
+
+std::uint32_t FrameCarrierEngine::layout(std::uint64_t instance, std::uint32_t n_channels,
+                                         std::uint32_t* out_cell_bytes,
+                                         std::uint32_t* out_cap1,
+                                         std::uint64_t* out_mirror_off,
+                                         std::uint64_t* out_mirror_base,
+                                         std::uint64_t* out_word_base) {
+    std::lock_guard<std::mutex> guard(mu_);
+    FrameInstance* fi = lookup(instance);
+    if (fi == nullptr) return 0;
+    if (out_mirror_base != nullptr)
+        *out_mirror_base = reinterpret_cast<std::uint64_t>(fi->host_mirror);
+    if (out_word_base != nullptr)
+        *out_word_base = reinterpret_cast<std::uint64_t>(fi->host_words);
+    for (std::uint32_t c = 0; c < n_channels && c < fi->host_vis.size(); ++c) {
+        const FrameChannel& fc = fi->host_vis[c];
+        if (out_cell_bytes != nullptr) out_cell_bytes[c] = fc.cell_bytes;
+        if (out_cap1 != nullptr) out_cap1[c] = fc.cap1;
+        if (out_mirror_off != nullptr) out_mirror_off[c] = fc.mirror_off;
+    }
+    return static_cast<std::uint32_t>(fi->host_vis.size());
 }
 
 void FrameCarrierEngine::close_instance(std::uint64_t instance) {
@@ -187,7 +257,7 @@ void FrameCarrierEngine::close_instance(std::uint64_t instance) {
     if (fi->host_mirror) FC_CK(cudaFreeHost(fi->host_mirror));
     if (fi->host_words) FC_CK(cudaFreeHost(fi->host_words));
     delete fi;
-    instances_[instance - 1] = nullptr;
+    instances_.erase(instance);
 }
 
 void FrameCarrierEngine::carry_in(std::uint64_t instance, const void* host_src,
@@ -209,72 +279,11 @@ void FrameCarrierEngine::carry_in(std::uint64_t instance, const void* host_src,
                           n_bytes, cudaMemcpyHostToDevice, stream_));
 }
 
-void FrameCarrierEngine::carry(std::uint64_t instance, std::size_t frame_offset,
-                               std::size_t mirror_offset, std::size_t n_bytes,
-                               std::size_t word_index, std::uint64_t target,
-                               void* forward_evt,
-                               FrameCarryDone done, void* user_data) {
-    std::lock_guard<std::mutex> guard(mu_);
-    FrameInstance* fi = lookup(instance);
-    if (fi == nullptr) {
-        std::fprintf(stderr, "[frame_carrier] carry on unknown instance %llu\n",
-                     static_cast<unsigned long long>(instance));
-        std::abort();
-    }
-    // n_bytes == 0 ⇒ mirror the whole committed frame (layout-agnostic default).
-    if (n_bytes == 0) {
-        const std::size_t frame_room =
-            frame_offset < fi->frame_bytes ? fi->frame_bytes - frame_offset : 0;
-        const std::size_t mirror_room =
-            mirror_offset < fi->mirror_bytes ? fi->mirror_bytes - mirror_offset : 0;
-        n_bytes = std::min(frame_room, mirror_room);
-    }
-    if (frame_offset + n_bytes > fi->frame_bytes ||
-        mirror_offset + n_bytes > fi->mirror_bytes) {
-        std::fprintf(stderr,
-                     "[frame_carrier] carry OOB: foff=%zu moff=%zu n=%zu "
-                     "(frame=%zu mirror=%zu)\n",
-                     frame_offset, mirror_offset, n_bytes, fi->frame_bytes,
-                     fi->mirror_bytes);
-        std::abort();
-    }
-    if ((word_index + 1) * sizeof(std::uint64_t) > fi->word_bytes) {
-        std::fprintf(stderr, "[frame_carrier] carry word idx %zu > words=%zu\n",
-                     word_index, fi->word_bytes / sizeof(std::uint64_t));
-        std::abort();
-    }
-
-    // Cross-stream ordering (B11 wake-correctness): the committed frame cells are
-    // produced by the executor's FORWARD stream, NOT this copy stream. Wait on the
-    // forward-done event before the D2H so the mirror can never capture pre-commit
-    // cells — otherwise the ring-word publish + X0 wake would fire on garbage, and
-    // X3/X4 consumers would resolve on an uncommitted frame. null ⇒ no forward
-    // stream (the isolation target) ⇒ no wait. The tensor_io opaque-event pattern.
-    if (forward_evt != nullptr) {
-        FC_CK(cudaStreamWaitEvent(stream_, static_cast<cudaEvent_t>(forward_evt), 0));
-    }
-
-    // The carrier: D2H the committed frame cells into the pinned mirror on the copy
-    // stream (B8/B13 — the host reads the mirror directly, never through us).
-    if (n_bytes > 0) {
-        FC_CK(cudaMemcpyAsync(static_cast<char*>(fi->host_mirror) + mirror_offset,
-                              static_cast<char*>(fi->device_frame) + frame_offset,
-                              n_bytes, cudaMemcpyDeviceToHost, stream_));
-    }
-    // Stream-ordered AFTER the mirror: publish the pinned ring word + wake (B11).
-    // `done == null` ⇒ the once-registered `g_carry_done` (the (a) BRIDGE executor
-    // passes null; the pre-bridge runtime may pass the fn directly — both resolve
-    // to the same stable `cuda_carry_done`).
-    FrameCarryDone effective_done = done ? done : g_carry_done.load(std::memory_order_acquire);
-    auto* ctx = new CarryCtx{fi->host_words + word_index, target, effective_done, user_data};
-    FC_CK(cudaLaunchHostFunc(stream_, frame_carry_host_cb, ctx));
-}
-
 std::size_t FrameCarrierEngine::live_instances() const {
     std::lock_guard<std::mutex> guard(mu_);
     std::size_t n = 0;
-    for (const FrameInstance* fi : instances_) {
-        if (fi != nullptr) ++n;
+    for (const auto& kv : instances_) {
+        if (kv.second != nullptr) ++n;
     }
     return n;
 }
@@ -297,29 +306,51 @@ std::uint64_t pie_frame_bind(std::uint64_t program, std::uint64_t* out_frame_bas
                                                         out_mirror_base, out_word_base);
 }
 
+std::uint64_t pie_frame_bind_channels(std::uint32_t n_channels,
+                                      const std::uint32_t* cell_bytes,
+                                      const std::uint32_t* cap1,
+                                      std::uint64_t* out_frame_base,
+                                      std::uint64_t* out_mirror_base,
+                                      std::uint64_t* out_word_base) {
+    return FrameCarrierEngine::instance().bind_channels(
+        n_channels, cell_bytes, cap1, out_frame_base, out_mirror_base, out_word_base);
+}
+
+std::uint64_t pie_frame_bind_channels_keyed(std::uint64_t key, std::uint32_t n_channels,
+                                            const std::uint32_t* cell_bytes,
+                                            const std::uint32_t* cap1,
+                                            std::uint64_t* out_frame_base,
+                                            std::uint64_t* out_mirror_base,
+                                            std::uint64_t* out_word_base) {
+    return FrameCarrierEngine::instance().bind_channels_keyed(
+        key, n_channels, cell_bytes, cap1, out_frame_base, out_mirror_base, out_word_base);
+}
+
+void pie_frame_publish(std::uint64_t instance, std::uint32_t n_channels,
+                       const void* const* src, const std::uint32_t* ring_index,
+                       const std::uint32_t* head, const std::uint32_t* tail,
+                       std::uint64_t pacing) {
+    FrameCarrierEngine::instance().publish(instance, n_channels, src, ring_index, head,
+                                           tail, pacing);
+}
+
 void pie_frame_close(std::uint64_t instance) {
     FrameCarrierEngine::instance().close_instance(instance);
+}
+
+std::uint32_t pie_frame_layout(std::uint64_t instance, std::uint32_t n_channels,
+                               std::uint32_t* out_cell_bytes, std::uint32_t* out_cap1,
+                               std::uint64_t* out_mirror_off,
+                               std::uint64_t* out_mirror_base,
+                               std::uint64_t* out_word_base) {
+    return FrameCarrierEngine::instance().layout(instance, n_channels, out_cell_bytes,
+                                                 out_cap1, out_mirror_off, out_mirror_base,
+                                                 out_word_base);
 }
 
 void pie_frame_write(std::uint64_t instance, const void* host_src, std::size_t n_bytes,
                      std::size_t frame_offset) {
     FrameCarrierEngine::instance().carry_in(instance, host_src, n_bytes, frame_offset);
-}
-
-void pie_frame_carry(std::uint64_t instance, std::size_t frame_offset,
-                     std::size_t mirror_offset, std::size_t n_bytes,
-                     std::size_t word_index, std::uint64_t target,
-                     void* forward_evt,
-                     void (*done)(void*), void* user_data) {
-    FrameCarrierEngine::instance().carry(instance, frame_offset, mirror_offset, n_bytes,
-                                         word_index, target, forward_evt, done, user_data);
-}
-
-void pie_frame_set_carry_done(void (*done)(void*)) {
-    // Register the stable completion callback ONCE (the runtime's cuda_carry_done).
-    // A `pie_frame_carry` with `done == null` then uses it — so the executor never
-    // threads the fn-ptr per fire.
-    pie_cuda_driver::sampling_ir::g_carry_done.store(done, std::memory_order_release);
 }
 
 }  // extern "C"

@@ -304,14 +304,6 @@ struct PieForwardRequestDesc {
   size_t pipeline_source_kinds_len;
   const uint64_t *kv_len_device_ptr;
   size_t kv_len_device_len;
-  const uint32_t *carry_abi_version_ptr;
-  size_t carry_abi_version_len;
-  const uint64_t *carry_user_ptr_ptr;
-  size_t carry_user_ptr_len;
-  const uint64_t *carry_word_index_ptr;
-  size_t carry_word_index_len;
-  const uint64_t *carry_instance_ptr;
-  size_t carry_instance_len;
 };
 
 struct PieCopyRequestDesc {
@@ -391,14 +383,6 @@ struct PieForwardResponseDesc {
   size_t program_tokens_indptr_len;
   const uint32_t *program_tokens_ptr;
   size_t program_tokens_len;
-  const uint64_t *ptir_output_channels_ptr;
-  size_t ptir_output_channels_len;
-  const uint8_t *ptir_output_blob_ptr;
-  size_t ptir_output_blob_len;
-  const uint32_t *ptir_output_lens_ptr;
-  size_t ptir_output_lens_len;
-  const uint32_t *ptir_output_indptr_ptr;
-  size_t ptir_output_indptr_len;
 };
 
 /// Generic status response. Convention:

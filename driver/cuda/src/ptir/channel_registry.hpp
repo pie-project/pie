@@ -14,12 +14,11 @@
 // through a per-instance dense-index → global-slot view (`ChannelView`): the
 // runner remaps its dense channel lists to slots host-side before each kernel
 // launch, so the list-taking kernels (`k_stage_readiness`, `k_commit_bump`) see
-// slots and need no signature change; `k_channel_bits` (which iterates by index)
-// takes an extra `slot_map` so bit `c` reflects the channel at dense index `c`.
+// slots and need no signature change.
 //
-// The pass-ephemeral scalars (`pass_commit`, the derived bits word) are NOT
-// shared — they live in the runner (`Tier0Runner`). Only the durable ring state
-// (cells, full[], head/tail, cap1) is registry-owned and shared.
+// The pass-ephemeral commit flag (`pass_commit`) is NOT shared — it lives in the
+// runner (`Tier0Runner`). Only the durable ring state (cells, full[], head/tail,
+// cap1) is registry-owned and shared.
 
 #include <cstddef>
 #include <cstdint>

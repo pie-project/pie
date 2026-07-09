@@ -14,8 +14,26 @@
 #include "ptir/program_runtime.hpp"
 
 #include "ptir/descriptor_resolve.hpp"
+#include "sampling_ir/frame_carrier.hpp"
 
 namespace pie_cuda_driver::ptir {
+
+// Unification U2 (frame publish, migration form): per-instance host-visible
+// (host_reader) frame state. On first sighting of an instance we bind a pinned
+// mirror+words frame for its READER channels (dense order → rank); after each
+// fire's harvest we publish the committed cells into the mirror + advance the
+// head/tail/pacing words. Additive to the ForwardResponse marshal (which stays
+// authoritative until the runtime flips to mirror reads, U4). Keyed by the SAME
+// wire instance id the runtime assigned → the runtime queries bases by that id.
+struct InstanceFrame {
+    std::uint64_t frame_id = 0;                        // FrameCarrierEngine instance
+    std::uint32_t n_reader = 0;
+    std::unordered_map<std::uint64_t, std::uint32_t> gid_to_rank;
+    std::vector<std::uint32_t> cap1;                   // per-rank mirror ring depth
+    std::vector<std::uint32_t> produced;               // per-rank cumulative published
+    std::vector<std::uint32_t> head, tail;             // per-rank published ring words
+    std::uint64_t fire_seq = 0;                        // pacing[0]
+};
 
 struct PtirDispatch::Impl {
     // C3 hash-keyed decode cache (container+sidecar → Trace, first-fire-of-hash).
@@ -27,11 +45,8 @@ struct PtirDispatch::Impl {
     // (cross-fire channel VIEW state survives). unique_ptr: PtirInstance owns its
     // view + runner, kept stable across rehashes.
     std::unordered_map<std::uint64_t, std::unique_ptr<PtirInstance>> instances;
-    // `out_resp.ptir_output_*` staging (per-program CSR of committed outputs).
-    std::vector<std::uint64_t> out_channels;
-    std::vector<std::uint8_t>  out_blob;
-    std::vector<std::uint32_t> out_lens;
-    std::vector<std::uint32_t> out_indptr;
+    // U2: per-instance host-visible frame (pinned mirror+words), keyed by wire id.
+    std::unordered_map<std::uint64_t, InstanceFrame> frames;
 };
 
 PtirDispatch::PtirDispatch() : impl_(std::make_unique<Impl>()) {}
@@ -99,11 +114,6 @@ bool PtirDispatch::run(const pie_driver::PieForwardRequestView& view,
                      n_prog, vocab, logits);
     }
 
-    s.out_channels.clear();
-    s.out_blob.clear();
-    s.out_lens.clear();
-    s.out_indptr.assign(1, 0);  // per-program output CSR, leading 0
-
     for (std::size_t p = 0; p < n_prog; ++p) {
         // Decode (first fire ships container+sidecar; steady-state empty ⇒ cache).
         const std::uint32_t blo = view.ptir_program_bytes_indptr.data()[p];
@@ -119,7 +129,6 @@ bool PtirDispatch::run(const pie_driver::PieForwardRequestView& view,
         if (trace == nullptr) {
             std::fprintf(stderr, "[pie-driver-cuda] ptir decode failed (program %zu): %s\n",
                          p, derr.c_str());
-            s.out_indptr.push_back(static_cast<std::uint32_t>(s.out_channels.size()));
             continue;
         }
 
@@ -140,7 +149,6 @@ bool PtirDispatch::run(const pie_driver::PieForwardRequestView& view,
             if (!inst->ok()) {
                 std::fprintf(stderr, "[pie-driver-cuda] ptir instance %zu bind failed: %s\n",
                              p, ierr.c_str());
-                s.out_indptr.push_back(static_cast<std::uint32_t>(s.out_channels.size()));
                 continue;
             }
             it = s.instances.emplace(iid, std::move(inst)).first;
@@ -158,31 +166,85 @@ bool PtirDispatch::run(const pie_driver::PieForwardRequestView& view,
         if (std::getenv("PIE_PTIR_TRACE"))
             std::fprintf(stderr, "[ptir-hook] program %zu: harvested %zu output(s)%s\n",
                          p, outs.size(), outs.empty() ? " (NONE — no committed READER channel)" : "");
-        for (auto& kv : outs) {
-            s.out_channels.push_back(kv.first);
-            s.out_blob.insert(s.out_blob.end(), kv.second.begin(), kv.second.end());
-            s.out_lens.push_back(static_cast<std::uint32_t>(kv.second.size()));
+
+        // U2/U4: ensure this instance's host-visible frame is bound (READER
+        // channels, dense order → rank). Done here (not in the instance
+        // first-sighting) because a DEVICE-GEOMETRY program creates its instance in
+        // resolve_descriptors BEFORE run() — so the frame bind must key off the
+        // frame's own presence, not the instance's. Mirror ring depth = capacity+1;
+        // cell size = the trace decl cell bytes. n_reader==0 ⇒ no frame.
+        if (s.frames.find(iid) == s.frames.end()) {
+            InstanceFrame fr;
+            std::vector<std::uint32_t> cell_bytes;
+            std::uint32_t rank = 0;
+            for (std::size_t c = 0; c < trace->channels.size(); ++c) {
+                const Channel& ch = trace->channels[c];
+                if (!ch.host_reader) continue;
+                const std::uint64_t gid = c < channel_ids.size() ? channel_ids[c]
+                                                                 : static_cast<std::uint64_t>(c);
+                std::size_t cb = ch.type.shape.numel() * dtype_size(ch.type.dtype);
+                if (cb == 0) cb = dtype_size(ch.type.dtype);
+                fr.gid_to_rank[gid] = rank;
+                cell_bytes.push_back(static_cast<std::uint32_t>(cb));
+                fr.cap1.push_back(ch.capacity + 1);
+                ++rank;
+            }
+            fr.n_reader = rank;
+            if (rank > 0) {
+                fr.produced.assign(rank, 0);
+                fr.head.assign(rank, 0);
+                fr.tail.assign(rank, 0);
+                std::uint64_t fb = 0, mb = 0, wb = 0;
+                // Key the frame by the WIRE instance id (== iid) so the runtime
+                // queries this frame's mirror/word bases + layout by the same id it
+                // already holds (the unification id-reconcile) — no minted-id
+                // round-trip back to the host.
+                fr.frame_id = sampling_ir::FrameCarrierEngine::instance().bind_channels_keyed(
+                    iid, rank, cell_bytes.data(), fr.cap1.data(), &fb, &mb, &wb);
+                s.frames.emplace(iid, std::move(fr));
+            }
         }
-        s.out_indptr.push_back(static_cast<std::uint32_t>(s.out_channels.size()));
+
+        // U2 publish (migration form): mirror the committed cells + advance the
+        // pinned head/tail/pacing words. Additive — the marshal above stays
+        // authoritative until the runtime flips to mirror reads (U4).
+        auto fit = s.frames.find(iid);
+        if (fit != s.frames.end() && fit->second.n_reader > 0) {
+            InstanceFrame& fr = fit->second;
+            std::vector<const void*> src(fr.n_reader, nullptr);
+            std::vector<std::uint32_t> ring_index(fr.n_reader, 0);
+            for (auto& kv : outs) {
+                auto rit = fr.gid_to_rank.find(kv.first);
+                if (rit == fr.gid_to_rank.end()) continue;  // internal channel
+                const std::uint32_t r = rit->second;
+                src[r] = kv.second.data();
+                const std::uint32_t prod = ++fr.produced[r];
+                ring_index[r] = (prod - 1) % fr.cap1[r];
+                fr.tail[r] = prod;  // cumulative produced (monotonic)
+            }
+            sampling_ir::FrameCarrierEngine::instance().publish(
+                fr.frame_id, fr.n_reader, src.data(), ring_index.data(),
+                fr.head.data(), fr.tail.data(), ++fr.fire_seq);
+        }
     }
 
     // Release markers (W0.3): free the device storage of dropped channels + the
     // views of dropped instances (also fixes the pre-existing instance-map leak).
     // Applied AFTER this request's fires so a channel referenced this fire is not
     // freed mid-use.
-    for (std::size_t i = 0; i < view.ptir_release_instance_ids.size(); ++i)
-        s.instances.erase(view.ptir_release_instance_ids.data()[i]);
+    for (std::size_t i = 0; i < view.ptir_release_instance_ids.size(); ++i) {
+        const std::uint64_t rid = view.ptir_release_instance_ids.data()[i];
+        s.instances.erase(rid);
+        auto fit = s.frames.find(rid);
+        if (fit != s.frames.end()) {
+            if (fit->second.frame_id != 0)
+                sampling_ir::FrameCarrierEngine::instance().close_instance(fit->second.frame_id);
+            s.frames.erase(fit);
+        }
+    }
     for (std::size_t i = 0; i < view.ptir_release_channel_ids.size(); ++i)
         s.channels.release(view.ptir_release_channel_ids.data()[i]);
 
-    out_resp.ptir_output_channels = pie_driver::PieSlice<std::uint64_t>{
-        s.out_channels.data(), s.out_channels.size()};
-    out_resp.ptir_output_blob = pie_driver::PieSlice<std::uint8_t>{
-        s.out_blob.data(), s.out_blob.size()};
-    out_resp.ptir_output_lens = pie_driver::PieSlice<std::uint32_t>{
-        s.out_lens.data(), s.out_lens.size()};
-    out_resp.ptir_output_indptr = pie_driver::PieSlice<std::uint32_t>{
-        s.out_indptr.data(), s.out_indptr.size()};
     return true;
 }
 

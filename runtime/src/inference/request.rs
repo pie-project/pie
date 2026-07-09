@@ -721,11 +721,6 @@ pub fn extract_per_request(
         && fr.logprobs_values.is_empty()
         && fr.entropies.is_empty()
         && fr.program_tokens.is_empty()
-        // A PTIR stage-program response carries its committed Reader-channel cells
-        // in `ptir_output_*` with EMPTY tokens/probes — it must NOT take the
-        // token-only early return, which would drop the outputs before the
-        // `ptir_output_*` slice below (§6.2 `out.take: no cell available` root).
-        && fr.ptir_output_indptr.is_empty()
         && out.spec_tokens.is_empty();
     if token_payload_only {
         if tok_hi == tok_lo + 1 {
@@ -810,32 +805,6 @@ pub fn extract_per_request(
     } else {
         out.program_tokens_req_indptr = vec![0];
         out.program_tokens_indptr = vec![0];
-    }
-
-    // PTIR outputs (§6.2 stage programs): a per-PROGRAM CSR — `ptir_output_indptr`
-    // partitions the committed READER-channel slots by program (program p ↔
-    // request p in the single-program-per-request fire). Slice this request's
-    // program slots + the matching blob range (blob offset = cumulative Σ lens;
-    // there is no byte_indptr, the blob is concatenated in slot order). Without
-    // this the driver-filled `ptir_output_*` is dropped by `..Default` and the
-    // guest's `out.take()` reads nothing.
-    if fr.ptir_output_indptr.len() >= 2 {
-        let (slot_lo, slot_hi) = indptr_range(&fr.ptir_output_indptr, r);
-        if slot_hi > slot_lo {
-            let byte_lo: usize =
-                fr.ptir_output_lens[..slot_lo].iter().map(|&n| n as usize).sum();
-            let byte_hi: usize = byte_lo
-                + fr.ptir_output_lens[slot_lo..slot_hi]
-                    .iter()
-                    .map(|&n| n as usize)
-                    .sum::<usize>();
-            out.ptir_output_channels = fr.ptir_output_channels[slot_lo..slot_hi].to_vec();
-            out.ptir_output_lens = fr.ptir_output_lens[slot_lo..slot_hi].to_vec();
-            out.ptir_output_blob = fr.ptir_output_blob[byte_lo..byte_hi].to_vec();
-            out.ptir_output_indptr = vec![0, (slot_hi - slot_lo) as u32];
-        } else {
-            out.ptir_output_indptr = vec![0, 0];
-        }
     }
 
     out

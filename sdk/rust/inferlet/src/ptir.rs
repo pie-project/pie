@@ -137,6 +137,26 @@ impl Channel {
         Channel::build(shape.into_shape(), dtype, 1, true)
     }
 
+    /// `Channel::from_shaped([shape], v)` — like [`from`], but reinterprets the
+    /// flat seed `v` with the explicit multi-dim `shape` (element counts must
+    /// match). `IntoConst` only produces flat 1-D seeds, so use this for a
+    /// concrete multi-dim seed (e.g. a `[B, POOL]` bool attention mask) that
+    /// downstream ops type against as rank-2.
+    pub fn from_shaped(shape: impl IntoShape, v: impl IntoConst) -> Channel {
+        let data: ConstData = v.into_const();
+        let shape = shape.into_shape();
+        assert_eq!(
+            shape.numel(),
+            data.shape.numel(),
+            "from_shaped: element count mismatch"
+        );
+        let ch = Channel::build(shape, data.dtype, 1, true);
+        ch.wit
+            .put(&data.bytes)
+            .expect("stage seed on a fresh channel");
+        ch
+    }
+
     fn build(shape: Shape, dtype: DType, capacity: u32, seeded: bool) -> Channel {
         let dsl = if seeded {
             DslChannel::seeded(shape, dtype)
@@ -298,6 +318,13 @@ impl Default for WorkingSet {
 /// A grant of slot ids — per-instance data (D2). Puttable into a channel.
 pub struct SlotGrant {
     ids: Vec<u32>,
+}
+
+impl SlotGrant {
+    /// The granted physical slot ids (stable page ids owned by the working set).
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
+    }
 }
 
 impl IntoPut for SlotGrant {

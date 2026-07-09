@@ -433,13 +433,6 @@ struct Executor {
     // `serve_forever` skips the inline send. Reset to false at each fire's entry.
     bool last_fire_deferred = false;
 
-    // X2 BRIDGE (a): per-instance MONOTONIC committed-head counter. The a2 carry loop
-    // publishes this to the instance's pinned head word (word 2c); alpha's scan_channels
-    // acquire-loads it → epoch-filtered wake_past(reader, head). MUST be monotonic — a
-    // per-fire constant filters fire-2+ (multi-fire decode stalls; single-fire false-greens).
-    // a2 greedy commits 1 token/request/fire ⇒ +1 per fire. Keyed by instance id.
-    std::map<std::uint64_t, std::uint64_t> carry_commit_heads;
-
     // ── D1: deferred RICH-output forward-done ─────────────────────────────────
     // Generalizes the (a2) single-Token deferral to multi-output / Scalar /
     // Entropy / [k]-Token programs so `handle_fire_batch` never blocks the service

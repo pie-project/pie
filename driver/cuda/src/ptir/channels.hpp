@@ -10,8 +10,8 @@
 // cell lives at `instance_base + channel_offset + ring_index * cell_bytes`. Each
 // channel is a ring of `capacity + 1` cells (capacity-1 = double buffer). Ring
 // indices head/tail track the committed-read / pending-write positions; a packed
-// bit per (channel, cell) records full/empty. The per-instance "bits word" the
-// readiness check reads (§7.1, C2) is derived: bit c = full[channel c @ head].
+// bit per (channel, cell) records full/empty. Stage readiness reads the full/head
+// bits directly (§7.1, C2): a channel is ready iff full[channel @ head].
 //
 // COMMIT (§7.1, T4): reads take the committed (head) cell, puts write the pending
 // (tail) cell; at pass end a predicated index bump publishes puts and consumes
@@ -35,27 +35,6 @@
 namespace pie_cuda_driver::ptir {
 
 // ─────────────────────────── device-side kernels ─────────────────────────
-
-// Recompute the readiness bits word from full[]/head[]: bit c set iff the
-// channel at dense index `c` (registry slot `slot_map[c]`) has its committed
-// (head) cell full. One thread. `slot_map` indirects dense→global-slot so the
-// shared registry arrays (channel_registry.hpp, W0.1) can back many instances;
-// pass an identity map for a standalone arena.
-__global__ void k_channel_bits(const std::uint8_t* __restrict__ full,
-                               const std::uint32_t* __restrict__ head,
-                               const std::uint32_t* __restrict__ cap1,
-                               const std::uint32_t* __restrict__ slot_map,
-                               std::uint32_t num_channels, std::uint32_t* __restrict__ bits_word) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        std::uint32_t w = 0;
-        for (std::uint32_t c = 0; c < num_channels && c < 32; ++c) {
-            std::uint32_t slot = slot_map ? slot_map[c] : c;
-            std::uint32_t cell = head[slot];
-            if (full[slot * 8 /*MAX_RING*/ + cell]) w |= (1u << c);
-        }
-        *bits_word = w;
-    }
-}
 
 // Stage readiness: AND this stage's requirement into the pass commit flag.
 // need_full_ch: channels whose first op is take/read (committed cell must be
@@ -153,7 +132,6 @@ class ChannelArena {
         cudaMalloc(&d_tail_, num_ * sizeof(std::uint32_t));
         cudaMalloc(&d_off_, num_ * sizeof(std::uint32_t));
         cudaMalloc(&d_full_, (std::size_t)num_ * kMaxRing);
-        cudaMalloc(&d_bits_, sizeof(std::uint32_t));
         cudaMalloc(&d_commit_, sizeof(std::uint32_t));
         cudaMemcpy(d_cap1_, h_cap1.data(), num_ * sizeof(std::uint32_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_head_, h_head.data(), num_ * sizeof(std::uint32_t), cudaMemcpyHostToDevice);
@@ -213,7 +191,6 @@ class ChannelArena {
     std::uint32_t* d_head() { return d_head_; }
     std::uint32_t* d_tail() { return d_tail_; }
     std::uint32_t* d_cap1() { return d_cap1_; }
-    std::uint32_t* d_bits() { return d_bits_; }
     std::uint32_t* d_commit() { return d_commit_; }
 
     // Host mirrors of head/tail for pointer resolution (tier-0 sync loop). Kept
@@ -264,9 +241,8 @@ class ChannelArena {
         if (d_tail_) cudaFree(d_tail_);
         if (d_off_) cudaFree(d_off_);
         if (d_full_) cudaFree(d_full_);
-        if (d_bits_) cudaFree(d_bits_);
         if (d_commit_) cudaFree(d_commit_);
-        d_blob_ = nullptr; d_cap1_ = d_head_ = d_tail_ = d_off_ = d_bits_ = d_commit_ = nullptr;
+        d_blob_ = nullptr; d_cap1_ = d_head_ = d_tail_ = d_off_ = d_commit_ = nullptr;
         d_full_ = nullptr;
         num_ = 0;
     }
@@ -276,7 +252,7 @@ class ChannelArena {
     void* d_blob_ = nullptr;
     std::uint32_t *d_cap1_ = nullptr, *d_head_ = nullptr, *d_tail_ = nullptr, *d_off_ = nullptr;
     std::uint8_t* d_full_ = nullptr;
-    std::uint32_t *d_bits_ = nullptr, *d_commit_ = nullptr;
+    std::uint32_t *d_commit_ = nullptr;
     std::vector<std::size_t> cell_bytes_;
     std::vector<std::uint32_t> host_off_, host_cap1_, host_head_, host_tail_;
 };

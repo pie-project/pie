@@ -24,6 +24,8 @@ pub enum BodyErrorKind {
     /// Operand id undefined at this point (out of range / forward ref).
     ValueIdOutOfRange(ValueId),
     ShapeMismatch,
+    /// Elementwise operand shapes that failed to broadcast (carries both).
+    ShapeMismatchBin(Shape, Shape),
     DTypeMismatch,
     /// Channel index outside the container's declaration table.
     ChannelOutOfRange(u32),
@@ -39,6 +41,9 @@ impl fmt::Display for BodyError {
             }
             BodyErrorKind::ShapeMismatch => {
                 write!(f, "op {}: incompatible operand shapes", self.op_index)
+            }
+            BodyErrorKind::ShapeMismatchBin(a, b) => {
+                write!(f, "op {}: incompatible operand shapes {a:?} vs {b:?}", self.op_index)
             }
             BodyErrorKind::DTypeMismatch => {
                 write!(f, "op {}: incompatible operand dtypes", self.op_index)
@@ -140,6 +145,9 @@ fn infer(
     ctx: &BodyCtx<'_>,
 ) -> Result<Results, BodyError> {
     let shape_err = || err(op_index, BodyErrorKind::ShapeMismatch);
+    let shape_err2 = |a: crate::types::Shape, b: crate::types::Shape| {
+        err(op_index, BodyErrorKind::ShapeMismatchBin(a, b))
+    };
     let dtype_err = || err(op_index, BodyErrorKind::DTypeMismatch);
     let g = |id: ValueId| -> Result<ValueType, BodyError> {
         types
@@ -194,7 +202,7 @@ fn infer(
             if !ta.dtype.is_numeric() || ta.dtype != tb.dtype {
                 return Err(dtype_err());
             }
-            push(&mut out, ValueType::new(broadcast2(ta.shape, tb.shape).ok_or_else(shape_err)?, ta.dtype));
+            push(&mut out, ValueType::new(broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?, ta.dtype));
         }
         Op::Div(a, b) => {
             // Unlike PSIR v4 (F32-only), PTIR `div` is defined on every
@@ -205,7 +213,7 @@ fn infer(
                 return Err(dtype_err());
             }
             push(&mut out, ValueType::new(
-                broadcast2(ta.shape, tb.shape).ok_or_else(shape_err)?,
+                broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
                 ta.dtype,
             ));
         }
@@ -216,7 +224,7 @@ fn infer(
                 return Err(dtype_err());
             }
             push(&mut out, ValueType::new(
-                broadcast2(ta.shape, tb.shape).ok_or_else(shape_err)?,
+                broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
                 DType::Bool,
             ));
         }
@@ -226,7 +234,7 @@ fn infer(
                 return Err(dtype_err());
             }
             push(&mut out, ValueType::new(
-                broadcast2(ta.shape, tb.shape).ok_or_else(shape_err)?,
+                broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
                 DType::Bool,
             ));
         }
@@ -243,7 +251,7 @@ fn infer(
             if tc.dtype != DType::Bool || ta.dtype != tb.dtype {
                 return Err(dtype_err());
             }
-            let ab = broadcast2(ta.shape, tb.shape).ok_or_else(shape_err)?;
+            let ab = broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?;
             push(&mut out, ValueType::new(broadcast2(ab, tc.shape).ok_or_else(shape_err)?, ta.dtype));
         }
 

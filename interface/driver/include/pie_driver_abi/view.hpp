@@ -221,16 +221,6 @@ struct PieForwardRequestView {
     PieSlice<std::uint32_t> sampling_output_dst_lens;    // byte capacity per dst (bounds-check)
     PieSlice<std::uint32_t> sampling_output_indptr;      // per-program CSR into the dst arrays
 
-    // (a) BRIDGE carry-descriptor channel (X2/X3). Per-request carrier descriptor:
-    // the a2 R-loop, when `carry_user_ptr` is non-empty, validates
-    // `carry_abi_version[0] == expected` (loud-reject) then calls
-    // `pie_frame_carry(instance, carry_word_index[r], committed_head[r], sample_done,
-    // <once-registered done>, (void*)carry_user_ptr[r])`. Empty ⇒ no carry channel.
-    PieSlice<std::uint32_t> carry_abi_version;  // [version] or empty (loud-reject guard)
-    PieSlice<std::uint64_t> carry_user_ptr;     // boxed CarryWake raw ptr per request
-    PieSlice<std::uint64_t> carry_word_index;   // pinned head word index per request
-    PieSlice<std::uint64_t> carry_instance;     // bound instance id per request
-
     // #27 cut #2 (B) direct-H2D late channel: per-late-key device-resident value
     // ptr (host `pie_device_alloc`'d, filled by `pie_tensor_write_async` straight
     // from the guest's WASM-memory slice — @ingim's inferlet→GPU memcpy, no IPC
@@ -347,16 +337,6 @@ struct PieForwardResponseView {
     PieSlice<std::uint32_t> program_tokens_req_indptr; // num_requests+1, per-request → first output-slot
     PieSlice<std::uint32_t> program_tokens_indptr;  // per-(request,output) [k]-Token CSR
     PieSlice<std::uint32_t> program_tokens;         // [k]-Token output values, concatenated
-
-    // PTIR program outputs (thrust-3 P2c-fire). The host-visible Reader-channel
-    // cells a PTIR pass produced (`PtirInstance::harvest_outputs`), marshaled
-    // back to the host channel store. SoA + per-program CSR, mirroring the
-    // request's host-put table; program `p` here is program `p` of the request's
-    // PTIR set. Bool cells travel packed (D1). Empty for legacy paths.
-    PieSlice<std::uint64_t> ptir_output_channels;   // produced Reader GLOBAL channel id per entry
-    PieSlice<std::uint8_t>  ptir_output_blob;       // concatenated produced-cell bytes
-    PieSlice<std::uint32_t> ptir_output_lens;       // byte length per output entry
-    PieSlice<std::uint32_t> ptir_output_indptr;     // per-program output CSR
 };
 
 // ---- Top-level request / response views -----------------------------------
@@ -615,15 +595,6 @@ inline void fill_forward_view(const PieForwardRequestDesc& f,
         slice_from(f.sampling_output_dst_lens_ptr, f.sampling_output_dst_lens_len);
     out.sampling_output_indptr =
         slice_from(f.sampling_output_indptr_ptr, f.sampling_output_indptr_len);
-    // (a) BRIDGE carry-descriptor channel (X2/X3).
-    out.carry_abi_version =
-        slice_from(f.carry_abi_version_ptr, f.carry_abi_version_len);
-    out.carry_user_ptr =
-        slice_from(f.carry_user_ptr_ptr, f.carry_user_ptr_len);
-    out.carry_word_index =
-        slice_from(f.carry_word_index_ptr, f.carry_word_index_len);
-    out.carry_instance =
-        slice_from(f.carry_instance_ptr, f.carry_instance_len);
     out.sampling_late_device_ptrs =
         slice_from(f.sampling_late_device_ptrs_ptr, f.sampling_late_device_ptrs_len);
     out.sampling_late_device_flags =
@@ -840,14 +811,6 @@ inline void build_response_desc(std::uint32_t driver_id,
         fr.program_tokens_indptr_len = view.forward.program_tokens_indptr.size();
         fr.program_tokens_ptr        = view.forward.program_tokens.data();
         fr.program_tokens_len        = view.forward.program_tokens.size();
-        fr.ptir_output_channels_ptr  = view.forward.ptir_output_channels.data();
-        fr.ptir_output_channels_len  = view.forward.ptir_output_channels.size();
-        fr.ptir_output_blob_ptr      = view.forward.ptir_output_blob.data();
-        fr.ptir_output_blob_len      = view.forward.ptir_output_blob.size();
-        fr.ptir_output_lens_ptr      = view.forward.ptir_output_lens.data();
-        fr.ptir_output_lens_len      = view.forward.ptir_output_lens.size();
-        fr.ptir_output_indptr_ptr    = view.forward.ptir_output_indptr.data();
-        fr.ptir_output_indptr_len    = view.forward.ptir_output_indptr.size();
     } else {
         // Everything else (copy / adapter / health / unknown) just
         // produces a StatusResponse with the int code.

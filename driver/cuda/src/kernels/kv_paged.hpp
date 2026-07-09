@@ -81,4 +81,19 @@ void launch_write_kv_explicit_bf16(
     int B,
     cudaStream_t stream);
 
+// Compaction primitive (Design-B lazy GC): move N token KV cells (single layer)
+// from explicit (src physical page, src offset) → (dst physical page, dst offset)
+// targets, for both K and V. Raw element copy — correct because the KV cache is
+// stored POST-RoPE (slot = pure storage; positions live in the per-beam mask).
+// Caller guarantees DISJOINT src/dst spans (in-place two-pointer) so one pass
+// needs no scratch. Invoke per layer to move all layers. Native-bf16 KV.
+void launch_copy_kv_cells_bf16(
+    KvCacheLayerView layer,
+    const std::uint32_t* dst_page,      // [N] physical page id per cell
+    const std::uint32_t* dst_off,       // [N] offset-in-page per cell
+    const std::uint32_t* src_page,      // [N] physical page id per cell
+    const std::uint32_t* src_off,       // [N] offset-in-page per cell
+    int N,
+    cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::kernels
