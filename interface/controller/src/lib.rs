@@ -87,7 +87,10 @@ pub struct WorkerInfo {
 /// Static identity a gateway declares when it joins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayInfo {
-    /// Where the gateway is reachable (e.g. `"10.0.0.9:8080"`).
+    /// The gateway's **worker-facing dial-in** endpoint (e.g. `"10.0.0.9:8001"`)
+    /// — the address workers dial INTO (M3 fan-in), NOT the client edge. The
+    /// controller republishes this in each worker's [`Neighbors`] gateway roster
+    /// so workers know where to dial.
     pub addr: String,
 }
 
@@ -126,14 +129,29 @@ pub struct NeighborPeer {
     pub role: Role,
 }
 
+/// One gateway a worker should dial INTO (M3 dial-in fan-in). The roster is
+/// **global** — every worker dials the same live gateway set — so each worker's
+/// [`Neighbors`] carries the identical list. Keyed by `addr` on the worker side
+/// (the dial target); `id` is for logging/observability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayEndpoint {
+    pub id: GatewayId,
+    pub addr: String,
+}
+
 /// A worker's scoped view, pushed by `watch_worker`: who it should coordinate
-/// with (TP group + prefill↔decode partners). `epoch` is the membership cursor
-/// the worker re-polls with (`since`); the controller replies only once `epoch`
-/// advances past the worker's last-seen value.
+/// with (TP group + prefill↔decode partners) plus the global gateway roster it
+/// should dial INTO. `epoch` is the membership cursor the worker re-polls with
+/// (`since`); the controller replies only once `epoch` advances past the
+/// worker's last-seen value. Gateway join/leave bumps this same epoch, so a
+/// worker learns the live gateway set over the connection it already long-polls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Neighbors {
     pub epoch: u64,
     pub peers: Vec<NeighborPeer>,
+    /// The live gateway roster (global; same for every worker). The worker
+    /// reconciles its dial-in links against this on each update.
+    pub gateways: Vec<GatewayEndpoint>,
 }
 
 /// One worker as seen by a gateway for routing decisions.

@@ -28,6 +28,8 @@ use tarpc::serde_transport::{tcp, unix};
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::watch;
 
+use super::gateway::GatewayLinkManager;
+
 /// Worker→controller heartbeat cadence. Matches the gateway's interval and sits
 /// well under the controller's liveness timeout (8s) → ~4× margin, so a few
 /// dropped beats never trip a false eviction.
@@ -96,6 +98,7 @@ impl ControlLink for ControlClient {
         let (tx, rx) = watch::channel(Neighbors {
             epoch: 0,
             peers: Vec::new(),
+            gateways: Vec::new(),
         });
         tokio::spawn(watch_neighbors_loop(self.clone(), id, tx));
         rx
@@ -166,10 +169,15 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
 ///   an [`Ack::ReRegister`].
 /// - **report** coarse load every [`REPORT_INTERVAL`].
 /// - **watch** the neighbor view: read-before-wait over the
-///   [`ControlLink::neighbors_watch`] receiver (full snapshots, coalesced).
+///   [`ControlLink::neighbors_watch`] receiver (full snapshots, coalesced). Each
+///   view also carries the global gateway roster; the watch loop owns the
+///   [`GatewayLinkManager`] and reconciles its dial-in links against every
+///   update (dial newly-added gateways, drop removed ones). Aborting this task
+///   on shutdown drops the manager, tearing down every dial-in link.
 pub fn spawn_control_tasks<C: ControlLink>(
     ctrl: C,
     worker_id: WorkerId,
+    mut gateways: GatewayLinkManager,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let heartbeat_ctrl = ctrl.clone();
     let heartbeat_task = tokio::spawn(async move {
@@ -223,9 +231,12 @@ pub fn spawn_control_tasks<C: ControlLink>(
             tracing::debug!(
                 worker = %worker_id,
                 peers = neighbors.peers.len(),
+                gateways = neighbors.gateways.len(),
                 epoch = neighbors.epoch,
                 "neighbor view updated"
             );
+            // Reconcile dial-in links against the freshly-pushed gateway roster.
+            gateways.reconcile(&neighbors.gateways).await;
             if rx.changed().await.is_err() {
                 break; // controller gone → shutdown
             }

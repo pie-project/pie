@@ -27,7 +27,7 @@
 //! runtime outbox is bounded, so a slow `push_tokens` (slow gateway/user) stalls
 //! the pump and backpressures generation (design §6).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -35,6 +35,7 @@ use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use pie_engine::server::ClientId;
 use pie_client_api::{ClientMessage, ServerMessage};
+use pie_controller_rpc::GatewayEndpoint;
 use pie_ids::{ReqId, SessionId, WorkerId};
 use pie_worker_rpc::{
     Accepted, Control, GatewayInboundClient, Priority, Request, Tokens, WorkerControl,
@@ -65,12 +66,14 @@ const TURN_QUEUE_DEPTH: usize = 64;
 /// inside [`connect_gateway_link`] and die with the transport; aborting the
 /// serve task tears the link down on shutdown.
 pub struct GatewayLink {
-    pub addr: String,
     serve_task: tokio::task::JoinHandle<()>,
 }
 
-impl GatewayLink {
-    pub fn abort(&self) {
+/// Tear the dial-in serve loop down when the link is dropped, so reconciliation
+/// (dropping a link that left the roster) and shutdown (dropping the manager)
+/// both stop the connection.
+impl Drop for GatewayLink {
+    fn drop(&mut self) {
         self.serve_task.abort();
     }
 }
@@ -120,10 +123,125 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
             }),
     );
 
-    Ok(GatewayLink {
-        addr: addr.to_string(),
-        serve_task,
-    })
+    Ok(GatewayLink { serve_task })
+}
+
+/// The worker's live dial-in links, reconciled against the controller-pushed
+/// gateway roster (design `gateway.md`). Owns one [`GatewayLink`] per dialed
+/// gateway, keyed by dial address.
+///
+/// `pinned` addresses (the static `--gateway` override) are always kept dialed
+/// regardless of the roster — the override for fixed/local topologies and the
+/// single-node in-proc gateway. Roster-derived links are added and dropped as
+/// the gateway fleet scales up/down within one watch round-trip.
+pub struct GatewayLinkManager {
+    worker_id: WorkerId,
+    pinned: HashSet<String>,
+    links: HashMap<String, GatewayLink>,
+}
+
+impl GatewayLinkManager {
+    /// A manager for `worker_id`, pinning `pinned` addresses (never dropped by
+    /// reconciliation). Nothing is dialed yet — call [`dial_pinned`] for boot
+    /// readiness and [`reconcile`] on each roster update. Addresses are
+    /// canonicalized (see [`canonical_addr`]) so a pinned `tcp://h:p` and a
+    /// roster `h:p` for the same gateway resolve to a single link.
+    ///
+    /// [`dial_pinned`]: Self::dial_pinned
+    /// [`reconcile`]: Self::reconcile
+    pub fn new(worker_id: WorkerId, pinned: Vec<String>) -> Self {
+        Self {
+            worker_id,
+            pinned: pinned.iter().map(|a| canonical_addr(a)).collect(),
+            links: HashMap::new(),
+        }
+    }
+
+    /// Dial every pinned address now, failing if any pinned dial fails — the
+    /// static override is a hard boot requirement (matches the pre-dynamic
+    /// contract). Roster dials, by contrast, are best-effort and never fail boot.
+    pub async fn dial_pinned(&mut self) -> Result<()> {
+        let mut pinned: Vec<String> = self.pinned.iter().cloned().collect();
+        pinned.sort(); // deterministic dial order / logs
+        for addr in pinned {
+            if self.links.contains_key(&addr) {
+                continue;
+            }
+            let link = connect_gateway(&addr, self.worker_id)
+                .await
+                .with_context(|| format!("dialing pinned gateway at {addr}"))?;
+            self.links.insert(addr, link);
+        }
+        Ok(())
+    }
+
+    /// Reconcile dial-in links against a fresh gateway roster: the desired set is
+    /// `pinned ∪ roster` (canonicalized). Drop (and abort, via [`GatewayLink`]'s
+    /// `Drop`) every link no longer desired, then dial every desired address not
+    /// yet linked. A roster dial that fails is logged and retried on the next
+    /// roster update.
+    pub async fn reconcile(&mut self, roster: &[GatewayEndpoint]) {
+        let desired: HashSet<String> = self
+            .pinned
+            .iter()
+            .cloned()
+            .chain(roster.iter().map(|g| canonical_addr(&g.addr)))
+            .collect();
+
+        // Drop links that left the roster (and are not pinned).
+        let stale: Vec<String> = self
+            .links
+            .keys()
+            .filter(|addr| !desired.contains(*addr))
+            .cloned()
+            .collect();
+        for addr in stale {
+            self.links.remove(&addr); // Drop aborts the serve task
+            tracing::info!(
+                worker = %self.worker_id,
+                gateway = %addr,
+                "dropped gateway link (left roster)"
+            );
+        }
+
+        // Dial newly-added desired addresses.
+        let to_dial: Vec<String> = desired
+            .into_iter()
+            .filter(|addr| !self.links.contains_key(addr))
+            .collect();
+        for addr in to_dial {
+            match connect_gateway(&addr, self.worker_id).await {
+                Ok(link) => {
+                    self.links.insert(addr, link);
+                }
+                Err(e) => tracing::warn!(
+                    worker = %self.worker_id,
+                    gateway = %addr,
+                    error = %e,
+                    "gateway dial failed; will retry on next roster update"
+                ),
+            }
+        }
+    }
+
+    /// The addresses currently linked — the advertised URL / boot banner.
+    pub fn addrs(&self) -> Vec<String> {
+        let mut addrs: Vec<String> = self.links.keys().cloned().collect();
+        addrs.sort();
+        addrs
+    }
+}
+
+/// Canonicalize a dial address so the same gateway reached via a pinned
+/// `tcp://host:port` and a roster `host:port` maps to one link key. Strips the
+/// `tcp://` scheme (which [`connect_gateway`] also treats as optional) while
+/// leaving `unix:` addresses intact.
+fn canonical_addr(addr: &str) -> String {
+    if addr.starts_with("unix:") {
+        addr.to_string()
+    } else {
+        addr.strip_prefix("tcp://").unwrap_or(addr).to_string()
+    }
 }
 
 /// The worker's `WorkerControl` server for one gateway connection. Cloned per

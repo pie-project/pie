@@ -74,10 +74,12 @@ impl DriverHandle {
 /// INTO the gateway(s) (distributed + single-node feature; M3 inversion).
 enum EdgeServer {
     Standalone(client_server::ClientServerHandle),
-    /// Post-inversion (M3): the worker dials INTO the gateway(s) — distributed
-    /// (real gateways from `--gateway`) or single-node (the in-proc gateway).
-    /// The live dial-in links serving `WorkerControl`.
-    GatewayLinks(Vec<gateway::GatewayLink>),
+    /// Post-inversion (M3): the worker dials INTO the gateway(s). The live links
+    /// are owned by the control-plane watch task, which reconciles them against
+    /// the controller-pushed gateway roster (`gateway.md`); this holds only the
+    /// addresses dialed at boot, for the advertised URL. Aborting the control
+    /// tasks (and dropping the manager) tears the links down.
+    GatewayLinks(Vec<String>),
 }
 
 impl EdgeServer {
@@ -87,13 +89,12 @@ impl EdgeServer {
     fn url(&self) -> String {
         match self {
             EdgeServer::Standalone(h) => h.bound.clone(),
-            EdgeServer::GatewayLinks(links) => {
+            EdgeServer::GatewayLinks(addrs) => {
                 // The worker is not client-facing in distributed mode — the
                 // gateway is. Report the gateway endpoint(s) it dialed into.
-                if links.is_empty() {
+                if addrs.is_empty() {
                     "gateway://<none>".to_string()
                 } else {
-                    let addrs: Vec<&str> = links.iter().map(|l| l.addr.as_str()).collect();
                     format!("gateway://{}", addrs.join(","))
                 }
             }
@@ -103,11 +104,9 @@ impl EdgeServer {
     fn abort(&self) {
         match self {
             EdgeServer::Standalone(h) => h.task.abort(),
-            EdgeServer::GatewayLinks(links) => {
-                for link in links {
-                    link.abort();
-                }
-            }
+            // Links live in the control-plane watch task; aborting the control
+            // tasks (which drops the GatewayLinkManager) tears them down.
+            EdgeServer::GatewayLinks(_) => {}
         }
     }
 }
@@ -591,14 +590,17 @@ async fn assemble_control_and_edge(
     }
 }
 
-/// Register the worker over `control`, spawn its three control loops, then dial
-/// INTO each gateway, serving `WorkerControl` over the links. Generic over the
+/// Register the worker over `control`, spawn its three control loops, and dial
+/// INTO the gateways, serving `WorkerControl` over the links. Generic over the
 /// [`ControlLink`] backend so the daemon injects a dialed [`ControlClient`] and
 /// the composition root (`bin/pie`) injects its in-proc `EmbeddedControl`.
 ///
 /// `register` happens BEFORE dialing the gateways, so the worker presents its
 /// controller-minted id on each gateway dial-in `register` (the join key for
-/// `routing ∩ connected`).
+/// `routing ∩ connected`). The static `gateways` are pinned (dialed eagerly for
+/// boot readiness); the control-plane watch loop then reconciles the dial-in set
+/// against the controller-pushed gateway roster (`gateway.md`), so an empty list
+/// means fully dynamic discovery.
 async fn assemble_distributed<C: ControlLink>(
     control: C,
     gateways: &[String],
@@ -616,16 +618,19 @@ async fn assemble_distributed<C: ControlLink>(
     let worker_id = ControlLink::register_worker(&control, info)
         .await
         .context("registering worker with controller")?;
-    let control_tasks = control::spawn_control_tasks(control, worker_id);
 
-    let mut links = Vec::with_capacity(gateways.len());
-    for gw in gateways {
-        let link = gateway::connect_gateway(gw, worker_id)
-            .await
-            .with_context(|| format!("dialing gateway at {gw}"))?;
-        links.push(link);
-    }
-    Ok((EdgeServer::GatewayLinks(links), control_tasks, worker_id))
+    // The static `gateways` are a pin/override: always kept dialed. Dial them
+    // eagerly for boot readiness, then hand the manager to the watch loop, which
+    // reconciles dial-in links against the controller-pushed roster (gateway.md).
+    let mut manager = gateway::GatewayLinkManager::new(worker_id, gateways.to_vec());
+    manager
+        .dial_pinned()
+        .await
+        .context("dialing pinned gateways")?;
+    let dialed = manager.addrs();
+    let control_tasks = control::spawn_control_tasks(control, worker_id, manager);
+
+    Ok((EdgeServer::GatewayLinks(dialed), control_tasks, worker_id))
 }
 
 struct StartedEmbeddedGroup {
