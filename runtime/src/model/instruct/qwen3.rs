@@ -122,9 +122,16 @@ static TEMPLATE: &str = r#"
 pub struct ChatMLConfig {
     pub has_thinking: bool,
     pub has_tools: bool,
+    pub tool_call_format: ToolCallFormat,
     pub generation_suffix: &'static str,
     /// Stop token strings (vary per sub-architecture)
     pub stop_tokens: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolCallFormat {
+    Json,
+    Qwen35Xml,
 }
 
 // =============================================================================
@@ -224,9 +231,8 @@ impl QwenInstruct {
         }
     }
 
-    /// Build the tool system prompt matching the Qwen reference format.
-    /// Both Qwen3 and Qwen2.5 use identical `<tools>` XML + `<tool_call>` format.
-    fn build_tool_system_prompt(tools: &[String]) -> String {
+    /// Build the tool system prompt matching the model's native tokenizer template.
+    fn build_tool_system_prompt(format: ToolCallFormat, tools: &[String]) -> String {
         let mut prompt = String::from(
             " # Tools\n\n\
              You may call one or more functions to assist with the user query.\n\n\
@@ -237,19 +243,38 @@ impl QwenInstruct {
             prompt.push('\n');
             prompt.push_str(tool);
         }
-        prompt.push_str(
-            "\n</tools>\n\n\
-             For each function call, return a json object with function name and arguments \
-             within <tool_call></tool_call> XML tags:\n\
-             <tool_call>\n\
-             {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
-             </tool_call>",
-        );
+        match format {
+            ToolCallFormat::Json => prompt.push_str(
+                "\n</tools>\n\n\
+                 For each function call, return a json object with function name and arguments \
+                 within <tool_call></tool_call> XML tags:\n\
+                 <tool_call>\n\
+                 {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
+                 </tool_call>",
+            ),
+            ToolCallFormat::Qwen35Xml => prompt.push_str(
+                "\n</tools>\n\n\
+                 If you choose to call a function ONLY reply in the following format with no suffix:\n\
+                 \n\
+                 <tool_call>\n\
+                 <function=example_function_name>\n\
+                 <parameter=example_parameter_1>\n\
+                 value_1\n\
+                 </parameter>\n\
+                 <parameter=example_parameter_2>\n\
+                 This is the value for the second parameter\n\
+                 that can span\n\
+                 multiple lines\n\
+                 </parameter>\n\
+                 </function>\n\
+                 </tool_call>",
+            ),
+        }
         prompt
     }
 
     /// Build an EBNF grammar for constrained Qwen tool-call generation.
-    fn build_tool_call_grammar(tools: &[String]) -> Option<String> {
+    fn build_tool_call_grammar(format: ToolCallFormat, tools: &[String]) -> Option<String> {
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
@@ -268,8 +293,9 @@ impl QwenInstruct {
         }
 
         let name_alt = names.join(" | ");
-        let grammar = format!(
-            r#"root ::= tool-call ("\n" tool-call)*
+        let grammar = match format {
+            ToolCallFormat::Json => format!(
+                r#"root ::= tool-call ("\n" tool-call)*
 tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
 tool-json ::= "{{"  "\"name\": \"" tool-name "\", \"arguments\": " json-object "}}"
 tool-name ::= {name_alt}
@@ -283,8 +309,20 @@ json-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA
 json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
 json-array ::= "[" (json-value ("," json-value)*)? "]"
 "#,
-            name_alt = name_alt
-        );
+                name_alt = name_alt
+            ),
+            ToolCallFormat::Qwen35Xml => format!(
+                r#"root ::= tool-call ("\n" tool-call)*
+tool-call ::= "<tool_call>\n<function=" tool-name ">\n" parameter* "</function>\n</tool_call>"
+tool-name ::= {name_alt}
+parameter ::= "<parameter=" parameter-name ">\n" parameter-value "\n</parameter>\n"
+parameter-name ::= [A-Za-z_][A-Za-z0-9_-]*
+parameter-value ::= parameter-char*
+parameter-char ::= [^<]
+"#,
+                name_alt = name_alt
+            ),
+        };
         Some(grammar)
     }
 }
@@ -322,7 +360,7 @@ impl Instruct for QwenInstruct {
         if !self.config.has_tools {
             return Vec::new();
         }
-        let prompt = Self::build_tool_system_prompt(tools);
+        let prompt = Self::build_tool_system_prompt(self.config.tool_call_format, tools);
         self.system(&prompt)
     }
 
@@ -364,6 +402,7 @@ impl Instruct for QwenInstruct {
             accumulated: String::new(),
             inside: false,
             has_tools: self.config.has_tools,
+            format: self.config.tool_call_format,
         })
     }
 
@@ -371,7 +410,7 @@ impl Instruct for QwenInstruct {
         if !self.config.has_tools || tools.is_empty() {
             return None;
         }
-        let source = Self::build_tool_call_grammar(tools)?;
+        let source = Self::build_tool_call_grammar(self.config.tool_call_format, tools)?;
         let grammar = Grammar::from_ebnf(&source, "root").ok()?;
         Some(ToolGrammar {
             source,
@@ -389,6 +428,65 @@ struct QwenToolDecoder {
     accumulated: String,
     inside: bool,
     has_tools: bool,
+    format: ToolCallFormat,
+}
+
+impl QwenToolDecoder {
+    fn parse_json_tool_call(call: &str) -> Option<(String, String)> {
+        let v = serde_json::from_str::<serde_json::Value>(call).ok()?;
+        let name = v.get("name")?.as_str()?.to_string();
+        let args = v
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+            .to_string();
+        Some((name, args))
+    }
+
+    fn parse_xml_tool_call(call: &str) -> Option<(String, String)> {
+        let call = call.trim();
+        let function_prefix = "<function=";
+        let function_start = call.find(function_prefix)? + function_prefix.len();
+        let function_name_end = call[function_start..].find('>')? + function_start;
+        let name = call[function_start..function_name_end].trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let function_body_start = function_name_end + 1;
+        let function_close = "</function>";
+        let function_body_end =
+            call[function_body_start..].find(function_close)? + function_body_start;
+        let mut rest = &call[function_body_start..function_body_end];
+        let mut args = serde_json::Map::new();
+
+        while let Some(parameter_pos) = rest.find("<parameter=") {
+            let name_start = parameter_pos + "<parameter=".len();
+            let name_end = rest[name_start..].find('>')? + name_start;
+            let param_name = rest[name_start..name_end].trim();
+            if param_name.is_empty() {
+                return None;
+            }
+            let value_start = name_end + 1;
+            let value_close = "</parameter>";
+            let value_end = rest[value_start..].find(value_close)? + value_start;
+            let value = rest[value_start..value_end].trim_matches('\n').to_string();
+            args.insert(param_name.to_string(), serde_json::Value::String(value));
+            rest = &rest[value_end + value_close.len()..];
+        }
+
+        Some((name, serde_json::Value::Object(args).to_string()))
+    }
+
+    fn parse_tool_call(&self, call: &str) -> Option<(String, String)> {
+        match self.format {
+            ToolCallFormat::Json => {
+                Self::parse_json_tool_call(call).or_else(|| Self::parse_xml_tool_call(call))
+            }
+            ToolCallFormat::Qwen35Xml => {
+                Self::parse_xml_tool_call(call).or_else(|| Self::parse_json_tool_call(call))
+            }
+        }
+    }
 }
 
 impl ToolDecoder for QwenToolDecoder {
@@ -412,9 +510,7 @@ impl ToolDecoder for QwenToolDecoder {
                 let call_json = self.accumulated[..pos].trim().to_string();
                 self.accumulated = self.accumulated[pos + "</tool_call>".len()..].to_string();
                 self.inside = false;
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call_json) {
-                    let name = v["name"].as_str().unwrap_or("").to_string();
-                    let args = v["arguments"].to_string();
+                if let Some((name, args)) = self.parse_tool_call(&call_json) {
                     return ToolEvent::Call(name, args);
                 }
             }
@@ -466,6 +562,7 @@ mod tests {
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: true,
+                tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -478,6 +575,7 @@ mod tests {
             ChatMLConfig {
                 has_thinking: false,
                 has_tools: true,
+                tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -490,6 +588,7 @@ mod tests {
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: false,
+                tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>"],
             },
@@ -553,11 +652,47 @@ mod tests {
 
     #[test]
     fn equip_format_matches_reference() {
-        let prompt = QwenInstruct::build_tool_system_prompt(&["{}".to_string()]);
+        let prompt =
+            QwenInstruct::build_tool_system_prompt(ToolCallFormat::Json, &["{}".to_string()]);
         assert!(prompt.contains("# Tools"));
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains("</tools>"));
         assert!(prompt.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn qwen35_tool_prompt_uses_native_function_parameter_template() {
+        let prompt =
+            QwenInstruct::build_tool_system_prompt(ToolCallFormat::Qwen35Xml, &["{}".to_string()]);
+        assert!(prompt.contains("<function=example_function_name>"));
+        assert!(prompt.contains("<parameter=example_parameter_1>"));
+        assert!(!prompt.contains(r#"{"name": <function-name>"#));
+    }
+
+    #[test]
+    fn qwen35_tool_grammar_uses_native_function_parameter_template() {
+        let tool = r#"{"function":{"name":"edit"}}"#.to_string();
+        let grammar = QwenInstruct::build_tool_call_grammar(ToolCallFormat::Qwen35Xml, &[tool])
+            .expect("grammar");
+        assert!(grammar.contains(r#"<function=""#));
+        assert!(grammar.contains(r#"<parameter=""#));
+        assert!(!grammar.contains(r#""\"name\": \""#));
+    }
+
+    #[test]
+    fn qwen35_tool_grammar_compiles() {
+        let inst = QwenInstruct::new(
+            make_tok(),
+            ChatMLConfig {
+                has_thinking: true,
+                has_tools: true,
+                tool_call_format: ToolCallFormat::Qwen35Xml,
+                generation_suffix: "",
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        );
+        let tool = r#"{"function":{"name":"edit"}}"#.to_string();
+        assert!(inst.tool_call_grammar(&[tool]).is_some());
     }
 
     #[test]
@@ -608,7 +743,7 @@ mod tests {
     #[test]
     fn tool_decoder_parses_call() {
         // Build vocab with the JSON content as a single entry
-        let mut v: Vec<String> = vec![
+        let v: Vec<String> = vec![
             "<|im_start|>",
             "<|im_end|>",
             "<|endoftext|>",
@@ -637,6 +772,7 @@ mod tests {
             ChatMLConfig {
                 has_thinking: true,
                 has_tools: true,
+                tool_call_format: ToolCallFormat::Json,
                 generation_suffix: "",
                 stop_tokens: &["<|im_end|>", "<|endoftext|>"],
             },
@@ -650,6 +786,64 @@ mod tests {
             ToolEvent::Call(name, args) => {
                 assert_eq!(name, "f");
                 assert_eq!(args, "{}");
+            }
+            other => panic!("expected Call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn qwen35_tool_decoder_parses_native_function_parameter_call() {
+        let v: Vec<String> = vec![
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "system",
+            "\n",
+            "user",
+            "assistant",
+            "Hello",
+            " world",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "<tools>",
+            "</tools>",
+            "<function=edit>",
+            "<parameter=path>",
+            "src/lib.rs",
+            "</parameter>",
+            "<parameter=replacement>",
+            "new body",
+            "</function>",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let tok = Arc::new(Tokenizer::from_vocab(&v));
+        let inst = QwenInstruct::new(
+            tok,
+            ChatMLConfig {
+                has_thinking: true,
+                has_tools: true,
+                tool_call_format: ToolCallFormat::Qwen35Xml,
+                generation_suffix: "",
+                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+            },
+        );
+        let mut dec = inst.tool_decoder();
+
+        dec.feed(&[11]);
+        dec.feed(&[4]);
+        let event = dec.feed(&[17, 4, 18, 4, 19, 4, 20, 4, 21, 4, 22, 4, 20, 4, 23, 4, 12]);
+        match event {
+            ToolEvent::Call(name, args) => {
+                assert_eq!(name, "edit");
+                let args: serde_json::Value = serde_json::from_str(&args).unwrap();
+                assert_eq!(args["path"], "src/lib.rs");
+                assert_eq!(args["replacement"], "new body");
             }
             other => panic!("expected Call, got {:?}", other),
         }
