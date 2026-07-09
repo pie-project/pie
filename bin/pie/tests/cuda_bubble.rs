@@ -5,7 +5,7 @@
 //! (`PIE_SCHED_POLICY=quorum` + the `run-ahead` feature), launches N concurrent
 //! greedy run-ahead decodes (the `runahead` inferlet's `collect_tokens_pipelined`
 //! carrier path), and reads the scheduler's fire probes in-process via
-//! `pie::inference::get_stats()`.
+//! `pie_engine::inference::get_stats()`.
 //!
 //! The `inter_batch_bubble_us` probe has a **host proxy** (stamps device "idle
 //! since" when the loop *receives* a completion with nothing queued behind it,
@@ -158,7 +158,7 @@ async fn bubble_p50_on_real_driver() -> Result<()> {
             let t0 = std::time::Instant::now();
             let mut samples: Vec<(u128, u64, u64)> = Vec::new();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let s = pie::inference::get_stats().await;
+                let s = pie_engine::inference::get_stats().await;
                 samples.push((t0.elapsed().as_millis(), s.total_batches, s.total_requests_processed));
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
@@ -203,7 +203,7 @@ async fn bubble_p50_on_real_driver() -> Result<()> {
     let (steady_mean, steady_batches, steady_requests) = steady_state_mean(&samples);
 
     // Read the scheduler's fire probes in-process (the engine ran here).
-    let stats = pie::inference::get_stats().await;
+    let stats = pie_engine::inference::get_stats().await;
     pie.shutdown().await;
 
     let total_batches = stats.total_batches;

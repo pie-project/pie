@@ -1365,3 +1365,154 @@ home (SDK vs inferlet-local) depends on the K3 surface):
 - MASK REMAP (K3-coupled — device mask edit): every beam's AttnMask bit at src moves to dst. In
   option B this rides the compaction fire (a gather/scatter over the mask channel); the guest
   rebuilds fill := live_count and continues. This is the one K5 part that needs the submit surface.
+
+================================================================================
+RUNTIME REFACTOR — crate extraction + weight-loader Variant A (contractor: alpha)
+================================================================================
+Breaking the ~55k-line `pie` monolith into layered crates, and moving weight-
+checkpoint parsing + StorageProgram compilation from the C++ driver into the
+Rust runtime (in-proc, no FFI). Batch HELD on tasks/proj2/agents/alpha; pushed
+to the lifecycle `origin` after each gate for durability; NOT pushed to dev
+(manager integrates at the end).
+
+SIX refactor items (status):
+1. pie-tokenizer  — extracted leaf crate (keystone). host-green.
+2. pie-grammar    — extracted leaf crate. host-green.
+3. pie-model      — extracted leaf crate. host-green.
+4. Engine-side auth removal — dropped 7 crypto deps from `pie`; wire kept
+   backward-compatible (internal gateway↔engine token preserved in `token`).
+5. pie-engine reorg — runtime/ is now a pure container of flat sibling crates
+   (engine/waker/tokenizer/grammar/model). `pie`→`pie-engine` (lib pie_engine).
+   Behavior-neutral. [commit f0a3376f]
+6. Weight-loader Variant A — STEP 1 (host-green) + STEP 2 (device-verified).
+
+WEIGHT-LOADER VARIANT A — architecture
+- STEP 1 [commit 7fd90664]: native Rust dense safetensors header parser
+  (checkpoint_header.rs — reads only the 8-byte len + JSON index, never bulk
+  bytes → CheckpointMetadata) + 5 serde-default device StorageTarget fields on
+  DriverCapabilities (storage_backend, max_tile_bytes, preferred_alignment,
+  mxfp4_moe_policy, native_mxfp4_moe).
+- STEP 2 (this unit):
+  * KEY FINDING: most quant-decision logic ALREADY lives in Rust (abi.rs):
+    MXFP4 gpt-oss recognition is by NAME (`*_blocks`/`*_scales`/`*_bias` pairs),
+    not a header dtype tag. The C++ `add_tensor` passes ALL checkpoint tensors
+    to Rust as Encoding::Raw + storage dtype; the compiler (default_for_target)
+    does the MXFP4 grouping/repack. Real MXFP4 checkpoints (tiny + 20b gpt-oss)
+    already declare blocks/scales as U8. `infer_rust_quant_attachments`
+    (fp8 `*_scale_inv` per-arch attachment) is POST-compile EXECUTE-side (keyed
+    on the compiled program view + HfConfig) — it STAYS in C++ with the
+    deserialize+execute path.
+  * checkpoint_header.rs: MXFP4 tags F4_E2M1/F8_E8M0 now map → U8 Raw (C++
+    parity), byte-size check relaxed only for sub-byte-packed F4_E2M1.
+  * gguf.rs: native Rust GGUF header parser (ports gguf_source.cpp). Streams the
+    header region only (bulk bytes never read). Dense GGML types → Raw; Q4_0 →
+    Quant(GgufQ4_0, 32-elem/18-byte blocks). Q4K/Q5/Q8 are enum-only (matches
+    C++). I64 rejected (no 64-bit loader dtype). Includes Q4_0 block decoder +
+    half_to_float parity helpers.
+  * inproc.rs: the Rust-native in-proc compile entry replacing the C++
+    parse→build-FFI-input→invoke-compile pipeline. discover_safetensors_files
+    (SingleFile preference, mirrors discover_safetensors_manifest);
+    parse_model_config (config.json → 6 coarse ModelConfig fields, HF-key
+    precedence from hf_config.cpp); compile_snapshot / compile_snapshot_to_bytes
+    → bincode StorageProgram bytes (same wire format the C++
+    pie_loader_program_deserialize consumes). RuntimeABI left implicit →
+    default_for_target, exactly as the FFI path (C++ sets only the ABI
+    name/version), so both paths compile BYTE-IDENTICAL programs.
+  * BOUNDARY / locality switch [IMPLEMENTED via (A) file+TOML handoff — the
+    C-ABI hook (B) was dropped as unnecessary]: model load is DRIVER-STARTUP-time
+    inside C++ LoadedModel::load (not a runtime control-plane op). The runtime
+    compiles the StorageProgram IN-PROCESS *before* launching the driver, in
+    worker/src/embedded_driver.rs::compile_cuda_storage_program (called from
+    write_cuda_startup_toml): it parses the checkpoint config (parse_model_config)
+    + builds the StorageTarget (static CUDA constants kStorageMaxTileBytes=64MiB /
+    kStoragePreferredAlignment=256, mirrored; mxfp4 policy resolved like the C++
+    select_mxfp4_moe_lowering), calls pie-weight-loader::inproc::
+    compile_snapshot_to_bytes, writes the bincode program to
+    `<launch>/driver.storage_program.bin`, and records its path in the boot TOML
+    as `[model].storage_program_path`. The driver (config.hpp parses the field;
+    rust_loader_bridge.hpp::read_storage_program_from_file) DESERIALIZES that file
+    (deserialize_rust_storage_program) instead of running its C++ compile.
+    LOCALITY SWITCH = PATH-PRESENT: path set (embedded) → deserialize, C++ compile
+    skipped; path empty (standalone/parity/remote/out-of-process) →
+    compile_rust_storage_program_cached (C++ FFI compile) UNCHANGED. C++
+    deserialize+execute + source-index + infer_rust_quant_attachments + cache_key
+    all UNCHANGED. Bulk weight bytes never cross — only the compiled IR does (the
+    .bin is ~56 KiB for Qwen3-0.6B, ~111 KiB for gpt-oss-20b/39 GB; it records
+    only tensor locations, the driver materializes payloads from its own disk
+    copy). No new C-ABI; generalizes to remote by shipping the same bytes.
+    Robustness: compile_cuda_storage_program DEFERS (omits the path → C++
+    fallback) when it cannot produce a provably-correct program — config unparseable,
+    or a device-cap-derived input the runtime can't query pre-load (see GAPS).
+  * MULTI-SHARD PARITY FIX (checkpoint_header.rs): tensor_ids are now assigned by
+    a GLOBAL ascending name sort across all shards, matching the C++ loader
+    (add_checkpoint_metadata_to_rust_input sorts the full loader.tensor_names()).
+    Load-bearing: the executor indexes source_tensor_names by the program's
+    tensor_id for strided source reads, so a per-shard ordering would mis-resolve
+    on multi-shard checkpoints (e.g. gpt-oss-20b, 3 shards). Single-file
+    checkpoints are unaffected (per-shard sort == global sort).
+  * cuda/metal entry.cpp: emit the 5 device StorageTarget caps. [DONE — cuda
+    emits real values from the load-time backend_target folding the tile/align
+    constants; metal advertises its backend tag with neutral values]
+  * ARCH-TABLE FIX (abi.rs) — gpt_oss `skip_dense_qkv_fusion: true`: gpt-oss
+    binds attention q/k/v SEPARATELY in the driver (gpt_oss.cpp:170-172 reads
+    `self_attn.q_proj.weight`/`k_proj`/`v_proj`, never a fused qkv), but its
+    arch profile omitted the flag, so the compiler's dense projection join fused
+    q/k/v into `self_attn.qkv_proj.fused.weight` → driver bind failed with
+    `gpt_oss: missing weight 'self_attn.q_proj.weight'`. Added the flag exactly
+    like the documented Qwen3-MoE precedent (abi.rs:528-539, same error/fix).
+    PRE-EXISTING gap (abi.rs untouched since 4e2bf2e4; gpt-oss had never been
+    device-loaded through the Rust storage compiler — the FFI path would fail
+    identically). This is the load-side proof of the MXFP4 device-verify.
+  * cxx_compat host test: the bridge header no longer includes pie_ipc.h (the
+    C-ABI hook was dropped), so compile_header_probe needs only the base include
+    dirs again (no driver/ipc + interface/driver additions) — reverted.
+
+GAPS / limitations (explicit — do NOT claim as device-proven):
+- GGUF: NO GGUF checkpoint exists on the verification box. gguf.rs is exercised
+  ONLY by synthetic fixtures (unit tests: dense F32, Q4_0 block-quant, bad
+  types, Q4_0 block-decode parity). It is COMPILE/parser-verified, NOT
+  device-proven end to end. Q4K/Q5/Q8 block schemes are not mapped (parity with
+  the C++ loader, which only handles Q4_0).
+- DEVICE-CAP-DERIVED COMPILE INPUTS (A file+TOML handoff): the runtime builds
+  the StorageTarget up-front, before the driver's device query (caps are reported
+  post-load). Two compile inputs are GPU-capability-derived and cannot be queried
+  pre-load, so compile_cuda_storage_program handles them conservatively:
+  (1) `native_mxfp4_moe` (sm_100+/Blackwell) → defaulted false; only affects the
+      program when model.mxfp4_moe="native" (NativeGemm), which the runtime DEFERS
+      to the C++ compile (device query available there). Routed/eager/auto on
+      non-Blackwell are device-independent → byte-identical (proven on this 4090).
+  (2) `runtime_quant="fp8"` → the driver clears it on GPUs without native FP8
+      (`fp8_native`); the runtime can't know that, so it DEFERS fp8 to the C++
+      compile. GAP: embedded-cuda MXFP4-native (Blackwell) + fp8 runtime-quant use
+      the C++ compile path (correct), not the in-proc path — a coverage gap, not a
+      correctness gap. A future pre-load device-caps probe would let the in-proc
+      path cover them.
+
+STEP 2 DEVICE-VERIFY RESULT (2026-07-09, RTX 4090, (A) in-proc-compile + file+TOML
+handoff — verified the runtime wrote `<launch>/driver.storage_program.bin` + the
+driver read `[model].storage_program_path`, bulk bytes never crossed):
+- DENSE baseline (Qwen3-0.6B): PASS — coherent "Answer: Paris"; runtime compiled
+  in-proc → 56 KiB IR .bin → driver deserialized (locality switch = path-present)
+  → deserialize+execute.
+- MXFP4 gpt-oss-20b (39GB, 3 shards): PASS — runtime compiled in-proc → 111 KiB IR
+  .bin (exercises the multi-shard global-sort parity fix) → driver deserialized →
+  coherent English ("# Answer\n\nSure! The ..."). Real proof of the MXFP4 quant
+  reimpl + multi-shard parity through the file+TOML path.
+- MXFP4 tiny-random-gpt-oss (13MB): LOADS successfully via (A) — 10 KiB IR .bin
+  written + deserialized, "engine up", all weights bound incl. unfused q/k/v +
+  MXFP4 experts (structural + scheme-recognition proven). Forward CRASHES ("batch
+  response count mismatch, got 0") on its DEGENERATE dims (hidden=32, head_dim=32,
+  2 layers) — a driver forward-kernel limit, NOT a load/quant issue (20b forwards
+  fine on real dims through the same gpt-oss kernels). Load-side objective met.
+- GGUF: compile-only (see GAPS) — no device run.
+
+DOCUMENTED FOLLOW-ONS (out of scope for this refactor; recorded for later):
+- AUTH 4b — wire/client-side crypto rip. Item 4 removed the ENGINE-side crypto
+  (7 deps) and kept the wire backward-compatible (gateway<->engine token in the
+  `token` module). The remaining wire/client-side crypto rip is DEFERRED because
+  it is unverifiable in-box (needs a real gateway/client round-trip).
+- GGUF device-verify — needs a real GGUF checkpoint on the box (none exists). The
+  parser is compile/fixture-verified only; Q4K/Q5/Q8 schemes are enum-only.
+- NATIVE-MXFP4 (Blackwell) pre-load caps probe — a runtime pre-load device-caps
+  probe would let the in-proc compile path cover mxfp4_moe="native" (sm_100+) and
+  fp8 runtime-quant, which currently DEFER to the C++ compile (see GAPS above).

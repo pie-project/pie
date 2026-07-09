@@ -6,8 +6,8 @@
 //!   2. For the `[model]`, partition devices into DP groups; for
 //!      each group spawn an [`EmbeddedDriver`] thread, attach an
 //!      a unified `DriverChannel` (one channel per driver carries
-//!   3. Translate the resulting handshakes → [`pie::bootstrap::Config`]
-//!      and call [`pie::bootstrap::bootstrap`]. The runtime now owns
+//!   3. Translate the resulting handshakes → [`pie_engine::bootstrap::Config`]
+//!      and call [`pie_engine::bootstrap::bootstrap`]. The runtime now owns
 //!      the runtime services + scheduler; the worker dials into the
 //!      gateway and serves `pie_worker_rpc::WorkerControl`.
 //!   4. Caller decides what to do with the [`EngineHandle`]:
@@ -197,7 +197,7 @@ impl EngineHandle {
         for d in &self.drivers {
             d.request_stop();
         }
-        pie::driver::abort_all_driver_channels();
+        pie_engine::driver::abort_all_driver_channels();
         for d in self.drivers {
             let rc = d.join();
             if rc != 0 {
@@ -443,9 +443,9 @@ async fn boot_engine(
     let boot_cfg = translate::build(user_cfg, std::slice::from_ref(&handshake))
         .context("translating to bootstrap::Config")?;
 
-    let boot = pie::bootstrap::bootstrap(boot_cfg)
+    let boot = pie_engine::bootstrap::bootstrap(boot_cfg)
         .await
-        .map_err(|e| anyhow!("pie::bootstrap::bootstrap: {e}"))?;
+        .map_err(|e| anyhow!("pie_engine::bootstrap::bootstrap: {e}"))?;
     let token = boot.token;
 
     let shmem_names: Vec<String> = drivers
@@ -663,14 +663,14 @@ fn start_embedded_group(
     let caps = primary.caps.clone();
     if let Some(shmem_name) = primary.shmem_name.as_deref() {
         let channel =
-            pie::driver::ShmemChannel::open(shmem_name, m.driver.effective_spin_budget_us())
+            pie_engine::driver::ShmemChannel::open(shmem_name, m.driver.effective_spin_budget_us())
                 .with_context(|| {
                     format!(
                         "opening shmem channel for embedded driver ({}) group {group_idx}",
                         flavor.as_str(),
                     )
                 })?;
-        pie::driver::install_channel(driver_idx, Arc::new(channel));
+        pie_engine::driver::install_channel(driver_idx, Arc::new(channel));
     }
     let handshake = GroupHandshake { caps };
     let drivers = group_drivers.into_iter().map(DriverHandle).collect();

@@ -513,8 +513,17 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
         ArchProfile { nemotron_packed_experts: true, ..GENERIC_ARCH },
     ),
     (
+        // GPT-OSS binds attention q/k/v separately (its CUDA builder reads
+        // `self_attn.q_proj.weight` / `k_proj` / `v_proj`, never a fused qkv), so
+        // opt out of the dense projection join like Qwen3-MoE — otherwise the
+        // join consumes q/k/v into `qkv_proj.fused.weight` and the bind path
+        // fails with `missing weight 'self_attn.q_proj.weight'`.
         &["gpt_oss", "gpt-oss", "gptoss"],
-        ArchProfile { gpt_oss_mxfp4_groups: true, ..GENERIC_ARCH },
+        ArchProfile {
+            gpt_oss_mxfp4_groups: true,
+            skip_dense_qkv_fusion: true,
+            ..GENERIC_ARCH
+        },
     ),
     (
         &["glm_moe_dsa"],

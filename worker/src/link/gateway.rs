@@ -19,9 +19,9 @@
 //!
 //! ## Runtime bridge
 //! Each gateway logical [`SessionId`] maps to one runtime session
-//! ([`pie::server::open_session`]) — warm KV across a multi-turn session. A
+//! ([`pie_engine::server::open_session`]) — warm KV across a multi-turn session. A
 //! per-session driver task feeds each turn's [`Request::message`] into the
-//! runtime ([`pie::server::send_client_message`]) and pumps the resulting
+//! runtime ([`pie_engine::server::send_client_message`]) and pumps the resulting
 //! `ServerMessage`s back out as [`Tokens::Chunk`], terminated by one
 //! [`Tokens::Eos`] when the turn completes. Backpressure is inherent: the
 //! runtime outbox is bounded, so a slow `push_tokens` (slow gateway/user) stalls
@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
-use pie::server::ClientId;
+use pie_engine::server::ClientId;
 use pie_client_api::{ClientMessage, ServerMessage};
 use pie_ids::{ReqId, SessionId, WorkerId};
 use pie_worker_rpc::{
@@ -230,7 +230,7 @@ impl WorkerControlServer {
         {
             return Ok(handle.turns.clone());
         }
-        let client_id = pie::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
+        let client_id = pie_engine::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
         let (turns_tx, turns_rx) = mpsc::channel::<Request>(TURN_QUEUE_DEPTH);
         let cancel = Arc::new(Notify::new());
         tokio::spawn(session_driver(
@@ -292,7 +292,7 @@ async fn session_driver(
             break;
         }
     }
-    pie::server::close_session(client_id);
+    pie_engine::server::close_session(client_id);
     // Best-effort removal; if the registry is already gone (the connection's
     // server dropped) the stale entry died with it.
     if let Some(reg) = registry.upgrade() {
@@ -333,14 +333,14 @@ async fn run_turn(
     // the normal request/response turn that surfaces the install result.
     if let Some((idx, total)) = upload_chunk_info(&req.message) {
         if idx + 1 < total {
-            if let Err(e) = pie::server::send_client_message(client_id, req.message) {
+            if let Err(e) = pie_engine::server::send_client_message(client_id, req.message) {
                 tracing::warn!(%req_id, error = %e, "feeding upload chunk into runtime failed");
             }
             return push_eos(gateway, req_id).await;
         }
     }
 
-    if let Err(e) = pie::server::send_client_message(client_id, req.message) {
+    if let Err(e) = pie_engine::server::send_client_message(client_id, req.message) {
         tracing::warn!(%req_id, error = %e, "feeding turn into runtime failed");
         return push_eos(gateway, req_id).await;
     }
@@ -350,13 +350,13 @@ async fn run_turn(
             _ = cancel.notified() => {
                 tracing::debug!(%req_id, "turn cancelled");
                 if let Some(pid) = &process_id {
-                    let _ = pie::server::send_client_message(client_id, terminate(pid));
+                    let _ = pie_engine::server::send_client_message(client_id, terminate(pid));
                 }
                 // Abort = bare channel-close on the gateway side (no Eos), per
                 // the Tokens contract; the gateway's TokenRx observes the close.
                 return TurnEnd::Aborted;
             }
-            recv = pie::server::recv_messages(client_id, 200, 64) => {
+            recv = pie_engine::server::recv_messages(client_id, 200, 64) => {
                 let msgs = match recv {
                     Ok(m) => m,
                     Err(e) => {
@@ -377,7 +377,7 @@ async fn run_turn(
                         Ok(Control::Abort) => {
                             tracing::debug!(%req_id, "gateway piggybacked abort");
                             if let Some(pid) = &process_id {
-                                let _ = pie::server::send_client_message(client_id, terminate(pid));
+                                let _ = pie_engine::server::send_client_message(client_id, terminate(pid));
                             }
                             return TurnEnd::Aborted;
                         }

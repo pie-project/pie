@@ -17,6 +17,14 @@ struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
+    // Runtime-compiled StorageProgram handoff (weight-loader Variant A). When an
+    // embedded/in-process driver's runtime compiles the checkpoint's storage
+    // program itself, it writes the serialized `bincode` IR to this path and
+    // names it here; the driver deserializes it instead of running its own C++
+    // checkpoint parse + compile (the *locality switch* = path-present). Empty
+    // (standalone / remote / out-of-process) keeps the C++ compile. The bulk
+    // weight bytes never cross this boundary — only the program IR does.
+    std::string storage_program_path;
     // Runtime quantization mode applied during load-plan materialization.
     // Empty (default) = no quantization. Recognised values:
     //   * "fp8"  — per-channel symmetric FP8_E4M3 for projection weights.
@@ -114,6 +122,8 @@ inline Config load_config(const std::filesystem::path& path) {
 
     if (auto m = tbl["model"].as_table()) {
         c.model.snapshot_dir  = (*m)["snapshot_dir"].value_or(std::string{});
+        c.model.storage_program_path =
+            (*m)["storage_program_path"].value_or(std::string{});
         c.model.device        = (*m)["device"].value_or(c.model.device);
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
         c.model.runtime_quant = (*m)["runtime_quant"].value_or(std::string{});

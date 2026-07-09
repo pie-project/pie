@@ -58,7 +58,7 @@ pub async fn watchdog(drivers: &[DriverHandle]) -> &'static str {
                     "driver ({}) exited unexpectedly; tearing down",
                     d.shmem_name().unwrap_or("inproc"),
                 );
-                pie::driver::abort_all_driver_channels();
+                pie_engine::driver::abort_all_driver_channels();
                 return "driver exited unexpectedly";
             }
         }

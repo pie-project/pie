@@ -24,16 +24,16 @@ crate-type = ["rlib"]
 # kept as a compatibility no-op for older build commands; the dummy
 # Rust driver is no longer gated.
 default = []
-driver-cuda = ["dep:pie-weight-loader", "pie/driver-cuda"]
+driver-cuda = ["dep:pie-weight-loader", "pie-engine/driver-cuda"]
 driver-metal = ["dep:pie-weight-loader"]
 driver-dummy = []
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
 # corresponding flag. See `pie/src/probe/` for the catalog of domains.
-profile-fire = ["pie/profile-fire"]
-profile-driver-cuda = ["pie/profile-driver-cuda"]
-profile-hot-path = ["pie/profile-hot-path"]
-profile-all = ["pie/profile-all"]
+profile-fire = ["pie-engine/profile-fire"]
+profile-driver-cuda = ["pie-engine/profile-driver-cuda"]
+profile-hot-path = ["pie-engine/profile-hot-path"]
+profile-all = ["pie-engine/profile-all"]
 
 [dependencies]
 # `pie` is the runtime crate. After Phase 8 deleted the legacy
@@ -41,7 +41,7 @@ profile-all = ["pie/profile-all"]
 # disable — pyo3 only lives in `driver/bridge_py/` (the Rust extension
 # bundled into the `pie-driver-bridge` wheel via maturin), not in the
 # runtime crate itself.
-pie = { path = "../runtime" }
+pie-engine = { path = "../runtime/engine" }
 # Shared tarpc control-plane contract.
 pie-controller-rpc = { path = "../interface/controller" }
 # Gateway data-plane RPC contract (post-inversion M3): GatewayInbound +

@@ -91,10 +91,10 @@ fn bubble_pct(hist: &[u64], p: f64) -> u64 {
     for (i, &c) in hist.iter().enumerate() {
         cum += c;
         if cum >= target {
-            return pie::inference::BUBBLE_HIST_UPPER_US[i];
+            return pie_engine::inference::BUBBLE_HIST_UPPER_US[i];
         }
     }
-    *pie::inference::BUBBLE_HIST_UPPER_US.last().unwrap()
+    *pie_engine::inference::BUBBLE_HIST_UPPER_US.last().unwrap()
 }
 
 /// Build an inferlet to wasm; return `(wasm, manifest)`.
@@ -187,11 +187,11 @@ async fn m3_integrated_acceptance_run() -> Result<()> {
         let mtp = env_str("PIE_M3_MTP_BASELINE_INFERLET", "mtp-native-verify");
         let (mw, mm) = build_inferlet(&mtp)?;
         setup.add_program(&mw, &mm, true).await.context("add MTP baseline")?;
-        let b0 = pie::inference::get_stats().await;
+        let b0 = pie_engine::inference::get_stats().await;
         let bstart = Instant::now();
         let bn_ok = run_fleet(&addr, &format!("{mtp}@0.1.0")).await;
         let bwall = bstart.elapsed();
-        let b1 = pie::inference::get_stats().await;
+        let b1 = pie_engine::inference::get_stats().await;
         let bd = b1
             .system_spec_draft_tokens_accepted
             .saturating_sub(b0.system_spec_draft_tokens_accepted);
@@ -205,11 +205,11 @@ async fn m3_integrated_acceptance_run() -> Result<()> {
 
     // ═══ PHASE A — steady-state §6.1 decode fleet under the quorum scheduler ═══
     // (G1 accepted-tok/s, G3 bubble p50, G4 dummy-run rate all read from this run.)
-    let base = pie::inference::get_stats().await;
+    let base = pie_engine::inference::get_stats().await;
     let phase_a_start = Instant::now();
     let n_ok = run_fleet(&addr, &s61_prog).await;
     let phase_a_wall = phase_a_start.elapsed();
-    let after = pie::inference::get_stats().await;
+    let after = pie_engine::inference::get_stats().await;
 
     // ── Gate metrics (deltas over Phase A) ──
     let d_batches = after.total_batches.saturating_sub(base.total_batches);

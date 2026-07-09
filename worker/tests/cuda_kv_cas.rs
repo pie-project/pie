@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use pie::arena::{ArenaKind, registry as arena_registry};
-use pie::program::ProgramName;
-use pie::working_set::kv_cas;
+use pie_engine::arena::{ArenaKind, registry as arena_registry};
+use pie_engine::program::ProgramName;
+use pie_engine::working_set::kv_cas;
 
 const MODEL_IDX: usize = 0;
 const DRIVER_IDX: usize = 0;
@@ -88,7 +88,7 @@ async fn run_concurrent_batch(
     for i in 0..k {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let input = format!(r#"{{"prompt":{:?},"max_tokens":8}}"#, input_for(i));
-        pie::process::spawn(
+        pie_engine::process::spawn(
             "cuda-test".into(),
             program.clone(),
             input,

@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
 
-use pie::program::{Manifest, ProgramName};
+use pie_engine::program::{Manifest, ProgramName};
 
 use crate::paths;
 
@@ -184,12 +184,12 @@ fn print_manifest(program: &ProgramName, manifest: &Manifest) {
     }
 }
 
-fn parameter_type_name(param_type: &pie::program::ParameterType) -> &'static str {
+fn parameter_type_name(param_type: &pie_engine::program::ParameterType) -> &'static str {
     match param_type {
-        pie::program::ParameterType::String => "string",
-        pie::program::ParameterType::Int => "int",
-        pie::program::ParameterType::Float => "float",
-        pie::program::ParameterType::Bool => "bool",
+        pie_engine::program::ParameterType::String => "string",
+        pie_engine::program::ParameterType::Int => "int",
+        pie_engine::program::ParameterType::Float => "float",
+        pie_engine::program::ParameterType::Bool => "bool",
     }
 }
 

@@ -24,7 +24,7 @@ unsafe extern "C" {
         install_signal_handlers: c_int,
         ready_cb: ReadyCb,
         ready_ctx: *mut c_void,
-        vtable: pie::driver::InProcVTable,
+        vtable: pie_engine::driver::InProcVTable,
     ) -> c_int;
     fn pie_driver_cuda_request_stop();
 }
@@ -40,7 +40,7 @@ unsafe extern "C" {
         install_signal_handlers: c_int,
         ready_cb: ReadyCb,
         ready_ctx: *mut c_void,
-        vtable: pie::driver::InProcVTable,
+        vtable: pie_engine::driver::InProcVTable,
     ) -> c_int;
     fn pie_driver_metal_request_stop();
 }
@@ -209,7 +209,7 @@ pub unsafe fn run_inproc(
     install_signal_handlers: c_int,
     ready_cb: ReadyCb,
     ready_ctx: *mut c_void,
-    vtable: pie::driver::InProcVTable,
+    vtable: pie_engine::driver::InProcVTable,
 ) -> Result<c_int, &'static str> {
     match flavor {
         #[cfg(feature = "driver-cuda")]

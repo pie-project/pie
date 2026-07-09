@@ -1412,6 +1412,12 @@ int run_impl(int argc,
             {"max_model_len",          c.max_model_len},
             {"activation_dtype",       c.activation_dtype},
             {"snapshot_dir",           c.snapshot_dir},
+            // Device storage-target hints (weight-loader Variant A).
+            {"storage_backend",        c.storage_backend},
+            {"max_tile_bytes",         c.max_tile_bytes},
+            {"preferred_alignment",    c.preferred_alignment},
+            {"mxfp4_moe_policy",       c.mxfp4_moe_policy},
+            {"native_mxfp4_moe",       c.native_mxfp4_moe},
         };
         if (verbose) {
             std::cerr << "[pie-driver-cuda] forward_limits: "

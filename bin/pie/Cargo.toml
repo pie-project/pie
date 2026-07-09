@@ -35,7 +35,7 @@ pie-bootstrap = { path = "../../bootstrap" }
 pie-controller = { path = "../../controller" }
 pie-gateway = { path = "../../gateway" }
 pie-worker = { path = "../../worker", default-features = false }
-pie = { path = "../../runtime" }  # program/manifest types for `pie inferlet`
+pie-engine = { path = "../../runtime/engine" }  # program/manifest types for `pie inferlet`
 # Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
 # GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
 # the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.
@@ -63,7 +63,7 @@ xz2 = "0.1"
 tempfile = "3"
 # The runtime lib (`pie`) — read `inference::get_stats()` in-process to observe
 # the scheduler's fire probes (the thrust-2 bubble/quorum gate) after a decode.
-pie = { path = "../../runtime" }
+pie-engine = { path = "../../runtime/engine" }
 # fd-level stderr capture for the gate-1 R=2 merge-witness assert (cuda_grammar_r2):
 # boot_4090 runs the engine in-process, so the scheduler/driver write their
 # `[pie-sched-trace] fire requests=N` / `[ir-trace] forward_R=N` merge witnesses

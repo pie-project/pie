@@ -1,11 +1,11 @@
 //! Translate the standalone's user-facing TOML config (`crate::config`)
-//! into the runtime's internal `pie::bootstrap::Config`.
+//! into the runtime's internal `pie_engine::bootstrap::Config`.
 //!
 //! The runtime's `bootstrap::Config` mirrors what `pie/server.py`
 //! constructs through the pyo3 `pie._runtime.Config` builder. We do
 //! the same construction here in pure Rust, sourcing:
 //!   * scalars from the user TOML
-//!   * dirs (cache/log/auth) from `pie::util` (`~/.pie/...`)
+//!   * dirs (cache/log/auth) from `pie_engine::util` (`~/.pie/...`)
 //!   * caps from the per-model
 //!     [`ModelHandshake`] inputs collected at boot.
 
@@ -35,7 +35,7 @@ pub struct ModelHandshake {
 pub fn build(
     user: &config::Config,
     handshakes: &[ModelHandshake],
-) -> Result<pie::bootstrap::Config> {
+) -> Result<pie_engine::bootstrap::Config> {
     if handshakes.len() != 1 {
         anyhow::bail!(
             "internal: expected exactly one handshake bundle for the single \
@@ -52,17 +52,17 @@ pub fn build(
         );
     }
 
-    let pie_home = pie::util::get_pie_home();
+    let pie_home = pie_engine::util::get_pie_home();
     let cache_dir = pie_home.join("programs");
     let log_dir = Some(pie_home.join("logs"));
     let auth_dir = pie_home.join("auth");
 
     let model = build_model(&user.model, handshake);
 
-    Ok(pie::bootstrap::Config {
+    Ok(pie_engine::bootstrap::Config {
         host: user.server.host.clone(),
         port: user.server.port,
-        auth: pie::bootstrap::AuthConfig {
+        auth: pie_engine::bootstrap::AuthConfig {
             enabled: user.auth.enabled,
             authorized_users_dir: auth_dir,
         },
@@ -70,12 +70,12 @@ pub fn build(
         verbose: user.server.verbose,
         log_dir,
         registry_url: user.server.registry.clone(),
-        telemetry: pie::bootstrap::TelemetryConfig {
+        telemetry: pie_engine::bootstrap::TelemetryConfig {
             enabled: user.telemetry.enabled,
             endpoint: user.telemetry.endpoint.clone(),
             service_name: user.telemetry.service_name.clone(),
         },
-        runtime: pie::bootstrap::RuntimeConfig {
+        runtime: pie_engine::bootstrap::RuntimeConfig {
             worker_threads: user.runtime.worker_threads,
             wasm_max_instances: user.runtime.wasm_max_instances,
             wasm_max_memory_mb: user.runtime.wasm_max_memory_mb,
@@ -96,7 +96,7 @@ pub fn build(
     })
 }
 
-fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::ModelConfig {
+fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie_engine::bootstrap::ModelConfig {
     // Arch + kv_page_size + tokenizer come from group 0; all groups
     // serve the same model so they agree. Per-group caps can differ in
     // memory-derived capacities — those flow through the per-driver entries.
@@ -112,14 +112,14 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
     let drivers = hs
         .groups
         .iter()
-        .map(|g| pie::bootstrap::DriverConfig {
+        .map(|g| pie_engine::bootstrap::DriverConfig {
             total_pages: g.caps.total_pages as usize,
             cpu_pages: g.caps.swap_pool_size as usize,
             rs_cache_required: g.caps.rs_cache_required,
             rs_cache_slots: g.caps.rs_cache_slots as usize,
             rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
             rs_cache_spec_rollback: g.caps.rs_cache_spec_rollback,
-            limits: pie::driver::SchedulerLimits {
+            limits: pie_engine::driver::SchedulerLimits {
                 max_forward_requests: g.caps.max_forward_requests as usize,
                 max_forward_tokens: g.caps.max_forward_tokens as usize,
                 max_page_refs: g.caps.max_page_refs as usize,
@@ -132,7 +132,7 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
         })
         .collect();
 
-    pie::bootstrap::ModelConfig {
+    pie_engine::bootstrap::ModelConfig {
         name: m.name.clone(),
         arch_name: group0_caps.arch_name.clone(),
         kv_page_size: group0_caps.kv_page_size as usize,
@@ -143,7 +143,7 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie::bootstrap::
             .all(|g| g.caps.system_speculation_supported),
         enable_system_speculation: hs.groups.iter().all(|g| g.caps.enable_system_speculation),
         drivers,
-        scheduler: pie::bootstrap::SchedulerConfig {
+        scheduler: pie_engine::bootstrap::SchedulerConfig {
             request_timeout_secs: m.scheduler.request_timeout_secs,
             restore_pause_at_utilization: m.scheduler.restore_pause_at_utilization,
         },
@@ -172,6 +172,11 @@ mod tests {
             max_model_len: 4096,
             activation_dtype: "bfloat16".into(),
             snapshot_dir: "/tmp/snapshot".into(),
+            storage_backend: String::new(),
+            max_tile_bytes: 0,
+            preferred_alignment: 0,
+            mxfp4_moe_policy: String::new(),
+            native_mxfp4_moe: false,
             shmem_name: Some("/pie_shmem_g0".into()),
             rs_cache_required: false,
             rs_cache_slots: 0,

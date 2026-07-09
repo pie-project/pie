@@ -175,7 +175,7 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
     eprintln!("[deep-coverify] fleet done: {n_match}/{FLEET} pipelines DEEP-k byte-identical");
 
     // Read the wait-for-all wave gauges in-process (the engine ran here).
-    let stats = pie::inference::get_stats().await;
+    let stats = pie_engine::inference::get_stats().await;
     pie.shutdown().await;
 
     let total_batches = stats.total_batches;

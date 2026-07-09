@@ -1,7 +1,7 @@
 //! Standalone client server — local-inference mode.
 //!
 //! Terminates client WebSockets **directly** and bridges each one to the runtime
-//! session broker (`pie::server::*`) with no gateway and no tarpc hop. This is
+//! session broker (`pie_engine::server::*`) with no gateway and no tarpc hop. This is
 //! the gateway-free local path: a client dials `ws://host:port` and talks
 //! msgpack `ClientMessage`/`ServerMessage` straight to this worker.
 //!
@@ -64,7 +64,7 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
     let ws = accept_async(stream).await.context("websocket handshake")?;
     let (tx, mut rx) = ws.split();
 
-    let client_id = pie::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
+    let client_id = pie_engine::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
 
     let ws_tx = Arc::new(TokioMutex::new(tx));
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -82,7 +82,7 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
                             break;
                         }
                     }
-                    poll = pie::server::recv_messages(client_id, 200, 64) => {
+                    poll = pie_engine::server::recv_messages(client_id, 200, 64) => {
                         let messages = match poll {
                             Ok(m) => m,
                             Err(e) => {
@@ -118,12 +118,12 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
         };
         let msg: ClientMessage =
             rmp_serde::from_slice(bytes.as_ref()).context("decode ClientMessage")?;
-        pie::server::send_client_message(client_id, msg)
+        pie_engine::server::send_client_message(client_id, msg)
             .map_err(|e| anyhow!("send client message: {e}"))?;
     }
 
     let _ = stop_tx.send(true);
     let _ = poll_task.await;
-    pie::server::close_session(client_id);
+    pie_engine::server::close_session(client_id);
     Ok(())
 }

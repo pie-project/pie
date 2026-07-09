@@ -149,6 +149,15 @@ std::string build_caps_json(const pie_metal_driver::Config& cfg,
         {"max_model_len", facts.max_model_len},
         {"activation_dtype", "bf16"},
         {"snapshot_dir", cfg.model.hf_path},
+        // Device storage-target hints (weight-loader Variant A). The Metal
+        // backend does not drive the Rust in-process storage compiler, so it
+        // advertises its backend tag with otherwise neutral values (the
+        // runtime's DriverCapabilities fields are serde-defaulted).
+        {"storage_backend", "metal"},
+        {"max_tile_bytes", 0},
+        {"preferred_alignment", 0},
+        {"mxfp4_moe_policy", ""},
+        {"native_mxfp4_moe", false},
     };
     return caps.dump();
 }

@@ -6,7 +6,7 @@
 //! [`crate::serve::topology::resolve_flavor`].
 //!
 //! The Rust [`Config`] type below is the user-facing TOML schema; the
-//! conversion to `pie::bootstrap::Config` (the runtime's own config)
+//! conversion to `pie_engine::bootstrap::Config` (the runtime's own config)
 //! happens in [`crate::translate`].
 
 use std::path::PathBuf;
@@ -550,7 +550,7 @@ fn default_random_seed() -> u64 {
     42
 }
 /// Default busy-spin budget (µs) before the driver-side channel falls
-/// back to parking. Matches `pie::driver::InProcChannel::new()`.
+/// back to parking. Matches `pie_engine::driver::InProcChannel::new()`.
 fn default_spin_budget_us() -> u64 {
     1_000
 }

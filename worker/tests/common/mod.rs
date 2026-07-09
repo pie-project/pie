@@ -2,7 +2,7 @@
 //!
 //! Boots the worker's prod embedded path in-proc — `pie_worker::run` in
 //! SingleNode mode loads the model onto the GPU via the embedded cuda driver and
-//! co-resides `pie::bootstrap::bootstrap` — then drives inferlets through the
+//! co-resides `pie_engine::bootstrap::bootstrap` — then drives inferlets through the
 //! same in-proc `program::add` → `process::spawn` flow the mock canary uses,
 //! bypassing the gateway/client edge (no msgpack/JSON codec, no identity header,
 //! no `pie-server-py`).
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use pie::program::{Manifest, ProgramName};
+use pie_engine::program::{Manifest, ProgramName};
 use pie_worker::WorkerHandle;
 
 /// Default local HF snapshot (Qwen3-0.6B dense) on the reference box. Override
@@ -127,10 +127,10 @@ pub fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
 /// spawns (one install per process; spawn many).
 pub async fn install_inferlet(name: &str) -> ProgramName {
     let (wasm, manifest, program_name) = load_prod_inferlet(name);
-    pie::program::add(wasm, manifest, true)
+    pie_engine::program::add(wasm, manifest, true)
         .await
         .expect("add program");
-    pie::program::install(&program_name)
+    pie_engine::program::install(&program_name)
         .await
         .expect("install program");
     program_name
@@ -152,7 +152,7 @@ pub async fn spawn_text(
 /// its result.
 pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<String, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    pie::process::spawn(
+    pie_engine::process::spawn(
         "cuda-test".into(),
         program.clone(),
         input_json.to_string(),

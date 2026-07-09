@@ -3,7 +3,7 @@
 //! Replaces the Python `pie_driver.worker` for the standalone
 //! path. The driver is no longer a subprocess — it runs as a thread
 //! linked into our binary. We still preserve the shmem + control-socket
-//! protocol so the runtime side (`pie::driver::*`) doesn't know the
+//! protocol so the runtime side (`pie_engine::driver::*`) doesn't know the
 //! difference between subprocess and embedded mode.
 //!
 //! This module exposes:
@@ -126,8 +126,8 @@ unsafe fn release_inproc_ctx(kind: Option<InProcCtxKind>, ctx: *mut c_void) {
         return;
     }
     match kind {
-        Some(InProcCtxKind::Blocking) => unsafe { pie::driver::InProcChannel::release(ctx) },
-        Some(InProcCtxKind::Polling) => unsafe { pie::driver::InProcPollingChannel::release(ctx) },
+        Some(InProcCtxKind::Blocking) => unsafe { pie_engine::driver::InProcChannel::release(ctx) },
+        Some(InProcCtxKind::Polling) => unsafe { pie_engine::driver::InProcPollingChannel::release(ctx) },
         None => {}
     }
 }
@@ -283,7 +283,7 @@ const SHMEM_RESP_BUF_DEFAULT: usize = 4 * 1024 * 1024;
 /// but legal — different ports) don't clobber each other's TOML or
 /// aux sockets.
 pub fn launch_state_dir() -> PathBuf {
-    pie::util::get_pie_home()
+    pie_engine::util::get_pie_home()
         .join("standalone")
         .join(std::process::id().to_string())
 }
@@ -447,6 +447,126 @@ pub fn write_metal_startup_toml(
     write_toml_table(out_path, doc)
 }
 
+/// Compile the checkpoint's StorageProgram in-process (weight-loader Variant A)
+/// and write it beside the startup TOML, returning the file path to record in
+/// `[model].storage_program_path`. The embedded cuda driver deserializes that
+/// file instead of running its own C++ checkpoint parse + compile (the
+/// *locality switch* = path-present). The **bulk weight bytes never cross**:
+/// the serialized program records only where each tensor lives; the driver
+/// reads the payloads from its own copy of the checkpoint at execution.
+///
+/// Returns `None` (and logs) when the in-process compile can't produce a
+/// provably-correct program for this checkpoint — e.g. the config can't be
+/// parsed, or the request needs a device capability the runtime can't query
+/// before load (`runtime_quant="fp8"` → `fp8_native`; `mxfp4_moe="native"` →
+/// Blackwell). The embedded driver then transparently falls back to its own
+/// C++ compile, which runs after the device query. See plan.md
+/// "device-cap-derived gaps".
+#[cfg(feature = "driver-cuda")]
+fn compile_cuda_storage_program(
+    out_path: &Path,
+    snapshot_dir: &Path,
+    opts: &CudaNativeDriverOptions,
+    tp: Option<&TpLaunch>,
+) -> Option<PathBuf> {
+    use pie_weight_loader::inproc::{compile_snapshot_to_bytes, parse_model_config};
+    use pie_weight_loader::storage::StorageTarget;
+    use pie_weight_loader::types::{BackendKind, Mxfp4MoePolicy};
+
+    // Static CUDA storage-target constants (mirror driver/cuda/src/model/
+    // loaded_model.cpp `kStorageMaxTileBytes` / `kStoragePreferredAlignment`).
+    const CUDA_MAX_TILE_BYTES: u64 = 64 * 1024 * 1024;
+    const CUDA_PREFERRED_ALIGNMENT: u32 = 256;
+
+    // `runtime_quant="fp8"` is cleared by the driver on GPUs without native FP8
+    // (`fp8_native`), a capability the runtime can't query before load; defer to
+    // the C++ compile so we never emit a program the device would reject.
+    if opts.runtime_quant == "fp8" {
+        tracing::info!(
+            "weight-loader: runtime_quant='fp8' is device-conditional (fp8_native); \
+             deferring storage compile to the embedded cuda driver"
+        );
+        return None;
+    }
+
+    let model = match parse_model_config(snapshot_dir, opts.runtime_quant.clone()) {
+        Ok(model) => model,
+        Err(err) => {
+            tracing::warn!(
+                "weight-loader: in-process storage compile skipped ({err}); the \
+                 embedded cuda driver will compile the checkpoint itself"
+            );
+            return None;
+        }
+    };
+
+    // Resolve the MXFP4 MoE policy the way the C++ driver does
+    // (select_mxfp4_moe_lowering) for a non-Blackwell target. `native_mxfp4_moe`
+    // is GPU-derived (sm_100+) and can't be device-queried before load, so it
+    // defaults to false; it only affects the compiled program when the model
+    // requests `mxfp4_moe="native"` (handled below) — routed/eager are
+    // device-independent.
+    let native_mxfp4_moe = false;
+    let mxfp4_moe = match opts.mxfp4_moe.as_str() {
+        "" | "auto" | "routed_dequant" | "packed" => Mxfp4MoePolicy::RoutedDecode,
+        "bf16" | "dequant" | "eager_bf16" => Mxfp4MoePolicy::EagerBf16,
+        "native" => {
+            tracing::info!(
+                "weight-loader: mxfp4_moe='native' needs a Blackwell device query \
+                 unavailable pre-load; deferring storage compile to the C++ path"
+            );
+            return None;
+        }
+        other => {
+            tracing::warn!(
+                "weight-loader: unknown mxfp4_moe='{other}'; deferring storage \
+                 compile to the embedded cuda driver"
+            );
+            return None;
+        }
+    };
+
+    let (tp_rank, tp_size) = tp.map(|t| (t.rank as u32, t.size as u32)).unwrap_or((0, 1));
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tp_rank,
+        tp_size,
+        max_tile_bytes: CUDA_MAX_TILE_BYTES,
+        preferred_alignment: CUDA_PREFERRED_ALIGNMENT,
+        mxfp4_moe,
+        native_mxfp4_moe,
+    };
+
+    let bytes = match compile_snapshot_to_bytes(snapshot_dir, &model, target) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                "weight-loader: in-process storage compile failed ({err}); the \
+                 embedded cuda driver will compile the checkpoint itself"
+            );
+            return None;
+        }
+    };
+
+    // Write beside the (already per-rank) startup TOML so concurrent TP ranks
+    // don't collide.
+    let bin_path = out_path.with_extension("storage_program.bin");
+    if let Err(err) = std::fs::write(&bin_path, &bytes) {
+        tracing::warn!(
+            "weight-loader: failed to write storage program {bin_path:?} ({err}); \
+             the embedded cuda driver will compile the checkpoint itself"
+        );
+        return None;
+    }
+    tracing::info!(
+        "weight-loader: compiled StorageProgram in-process → {} ({} bytes); the \
+         embedded cuda driver will deserialize it (bulk weights never cross)",
+        bin_path.display(),
+        bytes.len()
+    );
+    Some(bin_path)
+}
+
 /// Write the cuda driver's startup TOML. Schema mirrors
 /// `driver/cuda/src/config.hpp`: `[model]` with
 /// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional load policy knobs,
@@ -487,6 +607,12 @@ pub(crate) fn write_cuda_startup_toml(
         "enable_system_speculation",
         opts.enable_system_speculation,
     );
+    // Weight-loader Variant A: compile the StorageProgram in-process and hand it
+    // to the embedded cuda driver as a file path (bulk weights never cross).
+    #[cfg(feature = "driver-cuda")]
+    if let Some(bin_path) = compile_cuda_storage_program(out_path, snapshot_dir, opts, tp) {
+        insert_str(&mut model, "storage_program_path", path_string(&bin_path));
+    }
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -559,7 +685,7 @@ fn run_driver(
     argv: *mut *mut c_char,
     cb: driver_ffi::ReadyCb,
     ctx: *mut c_void,
-    inproc_vtable: Option<pie::driver::InProcVTable>,
+    inproc_vtable: Option<pie_engine::driver::InProcVTable>,
 ) -> i32 {
     if let Some(vtable) = inproc_vtable {
         return unsafe { driver_ffi::run_inproc(flavor, argc, argv, 0, cb, ctx, vtable) }
@@ -787,7 +913,7 @@ impl EmbeddedDriver {
         // (NCCL broadcasts) instead of serve_forever, so the channel
         // for a follower stays untouched.
         let tp_is_leader = tp.as_ref().map(|t| t.rank == 0).unwrap_or(true);
-        let mut inproc_vtable: Option<pie::driver::InProcVTable> = None;
+        let mut inproc_vtable: Option<pie_engine::driver::InProcVTable> = None;
         let mut inproc_ctx: *mut c_void = std::ptr::null_mut();
         let mut inproc_ctx_kind: Option<InProcCtxKind> = None;
         let uses_inproc = match flavor {
@@ -799,19 +925,19 @@ impl EmbeddedDriver {
         };
         if uses_inproc {
             let vtable = if use_inproc_polling_channel {
-                let channel = pie::driver::InProcPollingChannel::with_spin_budget(spin_budget_us)?;
+                let channel = pie_engine::driver::InProcPollingChannel::with_spin_budget(spin_budget_us)?;
                 let vtable = channel.ffi_vtable();
                 inproc_ctx_kind = Some(InProcCtxKind::Polling);
                 if tp_is_leader {
-                    pie::driver::install_channel(group_id, Arc::new(channel));
+                    pie_engine::driver::install_channel(group_id, Arc::new(channel));
                 }
                 vtable
             } else {
-                let channel = pie::driver::InProcChannel::with_spin_budget(spin_budget_us);
+                let channel = pie_engine::driver::InProcChannel::with_spin_budget(spin_budget_us);
                 let vtable = channel.ffi_vtable();
                 inproc_ctx_kind = Some(InProcCtxKind::Blocking);
                 if tp_is_leader {
-                    pie::driver::install_channel(group_id, Arc::new(channel));
+                    pie_engine::driver::install_channel(group_id, Arc::new(channel));
                 }
                 vtable
             };

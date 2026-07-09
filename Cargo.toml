@@ -8,9 +8,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "runtime",
+    "runtime/engine",
     # X0 tensor-waker substrate (leaf crate; loom-model-checked in isolation).
     "runtime/waker",
+    # Keystone leaf: BPE tokenizer (encode/decode) loaded from HF tokenizer.json.
+    "runtime/tokenizer",
+    # Constrained-decoding grammar engine (EBNF/regex/json-schema/matcher/bitmask).
+    "runtime/grammar",
+    # Model metadata + instruct chat templates + multimodal host-decode.
+    "runtime/model",
     # Shared process skeleton (paths, config sourcing, tracing/metrics, signals,
     # CLI skeleton). Depends on no role lib.
     "bootstrap",

@@ -19,7 +19,7 @@ use pie_bin::derive::derive_standalone;
 use pie_bin::{Mode, run_standalone};
 
 /// Install a `tracing` subscriber driven by `RUST_LOG` so the inproc
-/// forward-path debug probes (`pie::driver::inproc`) and any other `tracing`
+/// forward-path debug probes (`pie_engine::driver::inproc`) and any other `tracing`
 /// events surface on the diagnostic runs. Idempotent + non-panicking: a 2nd
 /// call (or a boot that already set a global) is a silent no-op.
 pub fn init_trace() {

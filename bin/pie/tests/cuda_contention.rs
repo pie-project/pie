@@ -222,7 +222,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         Some(tokio::spawn(async move {
             let t0 = std::time::Instant::now();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(orch) = pie::inference::contention::contention() {
+                if let Some(orch) = pie_engine::inference::contention::contention() {
                     let s = orch.stats();
                     use std::sync::atomic::Ordering::Relaxed;
                     eprintln!(
@@ -250,7 +250,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // "restore corruption" framing → the bug is not on the restore path).
     {
         use std::sync::atomic::Ordering as O;
-        if let Some(o) = pie::inference::contention::contention() {
+        if let Some(o) = pie_engine::inference::contention::contention() {
             let s = o.stats();
             eprintln!(
                 "[contention] final-engagement: parked={} woken={} suspends={} restores={}",
@@ -285,7 +285,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // `suspends`/`restores` are zero-by-design in v1 (they arm with the v2
     // state-save backend — logged for the record).
     use std::sync::atomic::Ordering;
-    let (parked, woken, suspends, restores) = pie::inference::contention::contention()
+    let (parked, woken, suspends, restores) = pie_engine::inference::contention::contention()
         .map(|o| {
             let s = o.stats();
             (
