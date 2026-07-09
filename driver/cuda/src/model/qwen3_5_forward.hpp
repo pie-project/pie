@@ -87,6 +87,12 @@ struct Qwen3_5ForwardCfg {
     // cache lookup should stay pinned to the verified source prefix while
     // draft positions advance for RoPE and history masking.
     bool mtp_global_cache_uses_prefix_position = false;
+
+    // False for KV-fill/flush fires that have no sampler rows. Those fires
+    // only need cache/state side effects; materializing dense logits is both
+    // wasted work and can violate the executor's no-sampling workspace
+    // contract.
+    bool emit_logits = true;
 };
 
 // Persistent decode-plan cache. Owned by main.cpp's serving setup so

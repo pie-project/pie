@@ -1367,12 +1367,11 @@ void qwen3_5_forward_paged(
     }
 
     // 3. Final norm.
-    // State-only forward (num_logit_rows < 0): the speculative repair re-runs
-    // the backbone purely to advance the rs_cache state (written in the layer
-    // loop above). Its logits/hidden are discarded, so skip final_norm,
-    // lm_head, and the final hidden copy entirely — that dense lm_head over all
-    // N repair tokens is the single largest piece of wasted work.
-    if (num_logit_rows < 0 || commit_advance) {
+    // State-only/no-sampler forward: the caller only needs KV/recurrent-state
+    // side effects, so skip final_norm, lm_head, and the final hidden copy.
+    // This covers speculative repair (num_logit_rows < 0) and ordinary
+    // Context::flush/KV-fill fires (emit_logits=false).
+    if (!fwd_cfg.emit_logits || num_logit_rows < 0 || commit_advance) {
         profile.end(stream);
         maybe_print_forward_profile(profile);
         return;

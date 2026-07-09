@@ -75,3 +75,17 @@ def test_qwen35_smem_gqa_decode_kernel_is_opt_in():
 
     assert "PIE_QWEN35_GDN_SMEM_STEP" in body
     assert "return false;" in body
+
+
+def test_qwen35_models_honor_per_fire_emit_logits_flag():
+    header = (CUDA_SRC / "model" / "qwen3_5_forward.hpp").read_text()
+    qwen_model = (CUDA_SRC / "model" / "qwen3_5_model.cpp").read_text()
+    moe_model = (CUDA_SRC / "model" / "qwen3_5_moe_model.cpp").read_text()
+    qwen_forward = (CUDA_SRC / "model" / "qwen3_5_forward.cpp").read_text()
+    moe_forward = (CUDA_SRC / "model" / "qwen3_5_moe_forward.cpp").read_text()
+
+    assert "bool emit_logits = true;" in header
+    assert "fwd.emit_logits = in.emit_logits;" in qwen_model
+    assert "fwd.emit_logits = in.emit_logits;" in moe_model
+    assert "if (!fwd_cfg.emit_logits || num_logit_rows < 0 || commit_advance)" in qwen_forward
+    assert "if (!fwd_cfg.emit_logits || num_logit_rows < 0 || commit_advance)" in moe_forward

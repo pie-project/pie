@@ -1774,10 +1774,8 @@ void qwen3_5_moe_forward_paged(
         }
     }
 
-    // State-only forward (num_logit_rows < 0) or recurrent-only commit-advance:
-    // logits/hidden are discarded, so skip final_norm + lm_head + final copy.
-    // See qwen3_5_forward.
-    if (num_logit_rows < 0 || commit_advance) {
+    // State-only/no-sampler forward: see qwen3_5_forward.
+    if (!fwd_cfg.emit_logits || num_logit_rows < 0 || commit_advance) {
         profile.end(stream);
         maybe_print_profile(profile);
         return;
