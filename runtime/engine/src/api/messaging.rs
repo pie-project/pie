@@ -56,7 +56,7 @@ impl<D> StreamProducer<D> for BroadcastStream {
     }
 }
 
-impl pie::core::messaging::Host for InstanceState {
+impl pie::inferlet::messaging::Host for InstanceState {
     async fn push(&mut self, topic: String, message: String) -> Result<()> {
         let topic = format!("{}:{}", self.get_username(), topic);
         messaging::push(topic, message)?;
@@ -70,7 +70,7 @@ impl pie::core::messaging::Host for InstanceState {
     }
 }
 
-impl pie::core::messaging::HostWithStore<InstanceState> for HasSelf<InstanceState> {
+impl pie::inferlet::messaging::HostWithStore<InstanceState> for HasSelf<InstanceState> {
     async fn pull(accessor: &Accessor<InstanceState, Self>, topic: String) -> Result<String> {
         let topic = accessor.with(|mut access| format!("{}:{}", access.get().get_username(), topic));
         messaging::pull(topic).await

@@ -13,7 +13,7 @@ use crate::server;
 use anyhow::Result;
 use wasmtime::component::{Accessor, HasSelf};
 
-impl pie::core::session::Host for InstanceState {
+impl pie::inferlet::session::Host for InstanceState {
     async fn send(&mut self, message: String) -> Result<()> {
         let inst_id = self.id();
         if let Ok(Some(client_id)) = process::get_client_id(inst_id).await {
@@ -31,7 +31,7 @@ impl pie::core::session::Host for InstanceState {
     }
 }
 
-impl pie::core::session::HostWithStore<InstanceState> for HasSelf<InstanceState> {
+impl pie::inferlet::session::HostWithStore<InstanceState> for HasSelf<InstanceState> {
     async fn receive(accessor: &Accessor<InstanceState, Self>) -> Result<Option<String>> {
         let topic = accessor.with(|mut access| access.get().id().to_string());
         match messaging::pull(topic).await {

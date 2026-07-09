@@ -1516,3 +1516,195 @@ DOCUMENTED FOLLOW-ONS (out of scope for this refactor; recorded for later):
 - NATIVE-MXFP4 (Blackwell) pre-load caps probe — a runtime pre-load device-caps
   probe would let the in-proc compile path cover mxfp4_moe="native" (sm_100+) and
   fp8 runtime-quant, which currently DEFER to the C++ compile (see GAPS above).
+
+================================================================================
+WIT INTERFACE REFACTOR — interface/inferlet (contractor: alpha)
+================================================================================
+Plan of record: files/paste (WIT Interface Refactor Plan). Unify pie:core +
+pie:instruct + pie:inferlet into a single versioned package pie:inferlet@0.2.0,
+give inferlets a REAL export contract (pie:inferlet/run), and narrow custom
+surfaces (http.wit, system.sleep) onto standard wasi 0.3. 4 phases, each lands
+independently green. Batch HELD on agent branch; per-gate push to origin
+(lifecycle repo), dev integration held for the end.
+
+--- PHASE 0 (hygiene + gate) — DONE ---
+- wasi-0.3 TOOLCHAIN SPIKE (gates Phase 3): GREEN.
+  * LEG 1 (Rust): PASS. wit-bindgen 0.58 generates usable CM-async bindings for
+    wasi:http/client@0.3.0 + wasi:clocks/monotonic-clock@0.3.0 +
+    wasi:filesystem/{types,preopens}@0.3.0; guest compiles to wasm32-wasip3
+    (nightly-2026-06-24, -Zbuild-std); component WIT shows the 0.3 imports; no
+    duplicate cabi_realloc.
+  * LEG 2 (host instantiate, wasmtime 46 p3): PASS ("instantiated") — after the
+    CORRECTION below.
+  * LEG 3: componentize-py present + accepts the world; jco NOT installed.
+  ** PLAN CORRECTION (spike finding):** outbound http import is
+     `wasi:http/client@0.3.0` (fn `send`), NOT `wasi:http/handler@0.3.0` as
+     §2.3/§3.4 wrote. `handler.handle` is the INCOMING-server side; `client.send`
+     is "send an outgoing request over the network" (same signature; the p3
+     http.wit self-documents this). wasmtime's p3::add_to_linker populates
+     `client` for outbound. → Phase 3 world imports wasi:http/client@0.3.0.
+  * Confirms §3.6 two-layer model exactly: our DECLARED imports resolve at 0.3
+    (http/client, clocks/monotonic-clock, filesystem/types+preopens); std emits
+    implicit 0.2.6 (cli, io, a 0.2.6 clocks). Engine links p2+p3 side by side.
+- Deleted the unused `world imports` from world.wit (byte-identical to
+  `world inferlet`, no consumers).
+- scripts/sync-wit.sh: one-way sync interface/inferlet -> the 2 vendored copies
+  (sdk/rust/inferlet/wit, sdk/tools/bakery/src/bakery/wit): copies world.wit +
+  runs `wit-deps update`. `--check` mode = CI drift gate. Re-syncing corrected
+  the observed drift (inference/ptir/tensor.wit) — the exact §1.3 regression.
+- CI: new `wit-drift` job in .github/workflows/ci.yml (installs wit-deps, runs
+  sync, fails on `git diff`).
+- ADJUSTMENT vs plan: the "delete leftover core/wit/deps{,.toml,.lock}" hygiene
+  item is FOLDED INTO PHASE 1 (not done in Phase 0). Reason: core/wit/deps.toml
+  is load-bearing — it declares the wasi `io` URL and core's transitive
+  clocks/filesystem/random; deleting it standalone breaks wit-deps resolution
+  (verified empirically). Phase 1's §2.1 rewrite deletes the entire core/ dir,
+  so the leftover disappears cleanly there with the wasi deps relocated to the
+  top-level deps.toml.
+- Verify: `cargo check -p pie-engine` green; helloworld inferlet builds
+  end-to-end (wasm32-wasip3) through the SDK generate!; vendored copies
+  byte-identical to source.
+
+## Phase 1 — package unification (COMMITTED, host-green)
+Single flat `pie:inferlet@0.2.0` package: core+instruct merged into one dir of
+sibling interfaces (interface/inferlet/*.wit + world.wit + wasi-only deps.toml).
+- WIT: tensor absorbed into `types` (shape/dtype/data type aliases); tokenizer
+  SPLIT out of model (encode/decode/vocabs/split-regex/special-tokens →
+  `tokenizer`); renames inference→grammar, ptir→forward, runtime→system,
+  audio-out→speech, tool-use→tools. §2.4: kv-working-set `free`+`free-slots`
+  collapsed into one `free(ids: list<u32>)` (slot-id tombstone; behavior-neutral
+  — under SLOT_IDS the engine `free` already delegated to `free_slots`).
+- Engine (runtime/engine): api.rs bindgen `with:`/`imports:`/`add_to_linker`
+  remapped pie:core|pie:instruct → pie:inferlet; api module files renamed
+  (inference→grammar, runtime→system, audio_out→speech, instruct/{chat,reasoning,
+  tool_use}→{chat,reasoning,tools}); NEW api/tokenizer.rs (5 fns moved from
+  model.rs); api/kv_working_set.rs free_slots method deleted; ~60 pie::core/
+  pie::instruct path refs + internal `crate::api::inference` refs rewritten.
+- SDK (sdk/rust/inferlet): generate! path/world unchanged; facade module NAMES
+  kept (inferlet::model/inference/runtime/tensor/…) for inferlet source-compat,
+  internal targets → pie::inferlet::* (model facade re-exports tokenizer fns;
+  tensor facade → types; tools.rs aliases `tools as tool_use`; ptir.rs
+  free_slots→free).
+- Vendored copies re-synced (sdk/rust/inferlet/wit, bakery); all 3 WIT trees
+  resolve via `wasm-tools component wit`.
+- GATE: `cargo check -p pie-engine` green; `cargo test -p pie-engine --lib`
+  199/199 pass; live inferlets build wasip3 (helloworld, text-completion,
+  tool-test, windowed-attention); sync-wit --check clean post-commit.
+
+### Phase 1 recorded gaps / follow-ons
+- **JS/Python committed bindings NOT regenerated.** Per componentize-py/jco,
+  these committed bindings are IDE-only STUBS; the REAL bindings are generated
+  fresh from the WIT at `componentize`/`jco` build time, so a JS/Python inferlet
+  builds correctly against the new package without touching them. Additionally
+  the Python SDK is ALREADY STALE at baseline (facades adapter.py/zo.py import
+  `wit_world.imports.{adapter,zo}` — interfaces absent from the WIT at HEAD),
+  so a faithful Python-SDK refresh is a separate cleanup, out of scope for a
+  WIT rename. jco is installable (npm devDep); componentize-py is present.
+- **Pre-existing broken inferlets (NOT regressions):** image-qa, sampler-suite,
+  and the lowlevel-chat test fixture reference SDK modules that never existed at
+  HEAD (`inferlet::sampler/carrier/prefill/sampling/geometry`,
+  `inference::ForwardPass`) — the deliberately-dead sampling surface. Confirmed
+  absent from sdk lib.rs at HEAD.
+
+## Phase 2 — export contract (COMMITTED, host-green)
+Inferlets now export the stock `pie:inferlet/run@0.2.0` (real interface), instead
+of a per-package synthesized `pie:{name}/run`.
+- WIT: `export run;` added to world.wit; run.wit is the real interface
+  (`run: async func(input: string) -> result<string, error>`). Vendored copies synced.
+- inferlet-macros `#[inferlet::main]`: deleted read_package_name/to_rust_ident/
+  inline-WIT `__pie_export` generate!; now implements the SDK-generated
+  `::inferlet::exports::pie::inferlet::run::Guest` and calls
+  `::inferlet::export!(__PieMain with_types_in ::inferlet)`. Dropped the `toml`
+  dep. (SDK generate! has `pub_export_macro: true` + `generate_all`, so with
+  `export run` in the world it emits the Guest trait + export! macro.)
+- Engine process.rs: replaced `format!("pie:{}/run", program.name)` with the
+  constant `"pie:inferlet/run@0.2.0"`. **NOTE (verified via wasmtime-46 source):
+  the name MUST be version-qualified — wasmtime's semver-aware NameMap only
+  version-matches when the *lookup* string itself carries a version; an
+  unversioned lookup returns None against a versioned component export. The
+  constant must track the world.wit package version.**
+- Bakery build.py: deleted `generate_dynamic_wit` + `to_wit_ident`; Python path
+  now `componentize-py -d <stock wit> -w inferlet`; JS path `--world-name inferlet`
+  against the stock wit. (componentize-py `-w inferlet` verified to resolve +
+  emit `wit_world/exports/run` against both the source and bakery vendored wit.)
+- GATE: cargo check -p pie-engine green; pie-engine --lib 199/199; helloworld
+  component verified to `export pie:inferlet/run@0.2.0` (wasm-tools); live
+  inferlets build wasip3 (helloworld, text-completion, tool-test).
+
+### Phase 2 recorded gap
+- **Python/JS bakery `componentize` NOT end-to-end device/build-verified.** The
+  world-switch is validated at the binding-generation layer, but a full
+  `componentize` of a real Python inferlet is blocked by the PRE-EXISTING stale
+  Python SDK (facades adapter.py/zo.py import interfaces absent from the WIT —
+  a baseline breakage, not this change). The bakery edits are mechanical +
+  correct against the new stock world.
+
+## Phase 3 — custom-surface removal → wasi 0.3 (COMMITTED, host-green)
+
+Goal: narrow the custom host surface onto standard wasi 0.3. Dropped the
+bespoke `pie:core/http` interface and the custom `system.sleep` func; routed
+outbound HTTP and timer-sleep through stock wasi 0.3 interfaces.
+
+WIT layer:
+- world.wit: dropped `import http;` + wasi-0.2.4 filesystem/random imports;
+  added `import wasi:http/client@0.3.0`, `wasi:clocks/monotonic-clock@0.3.0`,
+  `wasi:filesystem/{types,preopens}@0.3.0`. `export run;` unchanged.
+- system.wit: deleted the `sleep` func. http.wit: DELETED.
+- deps/: replaced the wit-deps-fetched 0.2.4 tree with the wasmtime-46 p3
+  wasi-0.3 single-file WIT packages (cli/clocks/filesystem/http/random/sockets),
+  sourced from the installed wasmtime-wasi-46.0.1 / wasmtime-wasi-http-46.0.1
+  crates so host + guest match exactly. deps.toml/deps.lock removed.
+- scripts/sync-wit.sh: reworked to `cp -r` deps/ verbatim (no wit-deps).
+
+Engine layer (host-green, `cargo test -p pie-engine --lib` = 199/199):
+- api.rs: removed `pub mod http`; bindgen `with:` swapped p2→p3 at package
+  level (`wasi:http`→wasmtime_wasi_http::p3, `wasi:clocks`/`wasi:filesystem`
+  →wasmtime_wasi::p3). api/http.rs DELETED; api/system.rs rewritten w/o sleep.
+- instance.rs: added `PieHttpHooks` (impl wasmtime_wasi_http::p3::WasiHttpHooks)
+  — network policy enforced by overriding `is_supported_scheme` to return false
+  when network is denied (the public, overridable choke point;
+  `send_request`'s HttpResult/HttpError are pub(crate), not externally
+  overridable). p2+p3 WasiHttpView impls side-by-side.
+- linker.rs: p3 `add_to_linker` for wasi + wasi-http added alongside the
+  retained p2 links (p2 http kept conditional for JS guests).
+- engine/Cargo.toml: `http = "1"` (names http::uri::Scheme for the hook);
+  `features=["p3"]` on wasmtime-wasi + wasmtime-wasi-http.
+
+SDK guest layer (compiles; clean-baseline inferlets build green):
+- lib.rs sleep: `system::sleep(nanos)` → `wasi::clocks::monotonic_clock::wait_for(nanos).await`.
+- http.rs: rewritten onto `wasi:http/client@0.3.0`. SDK-local buffered
+  Request/Response structs (same fields as before → fetch()/resolve_redirect +
+  tests unchanged); `send()` builds a wasi:http types.request (Fields::from_list,
+  parse_url→scheme/authority/path, optional body via wit_stream::new<u8> + a
+  spawn_local writer, trailers/req futures resolved immediately), calls
+  client::send, reads status/headers, consumes the body stream to EOF.
+- inferlet Cargo.toml: wit-bindgen `features=["async-spawn"]` (for spawn_local).
+
+Verification:
+- `cargo check -p pie-engine` + `cargo test -p pie-engine --lib` = 199/199 GREEN.
+- Clean-baseline inferlets build green on wasm32-wasip3: helloworld,
+  text-completion, and image-fetch (the http::fetch user).
+- `wasm-tools component wit` on the built image-fetch component shows
+  `import wasi:http/client@0.3.0` + `wasi:http/types@0.3.0` — the outbound
+  transport is genuinely wasi 0.3. (The residual wasi:cli / wasi:io@0.2.6 /
+  wall-clock imports are the std/wasi-libc donor's own runtime imports, not our
+  world.)
+- Pre-existing broken inferlets (demo-messaging, async-lm, etc.) still fail
+  IDENTICALLY at baseline HEAD 5d3f553e — they reference SDK modules that don't
+  exist (carrier, sampler, inference::ForwardPass, geometry, prefill). NOT a
+  Phase 3 regression (verified by git stash + rebuild at HEAD).
+
+### Phase 3 recorded gaps / follow-ons
+- LIVE-FETCH E2E UNVERIFIED (gap): the wasi:http@0.3 guest transport compiles
+  against the exact wit-bindgen-0.58 API and the component imports resolve, but
+  a real network round-trip (concurrent body-stream writer + consume_body
+  res-future semantics + response-stream drain) cannot be exercised on the box
+  without a live outbound fetch. Consistent with the north-star "test+fix later"
+  posture + the GGUF recorded-gap precedent. First live fetch on a networked
+  host is the remaining proof.
+- snapshot.rs stays on `std::fs` (works via the retained p2 filesystem link).
+  world.wit already imports `wasi:filesystem/{types,preopens}@0.3.0` (harmless /
+  tree-shaken, signals intent); migrating snapshot save/open/take/delete onto
+  the 0.3 stream-based filesystem API is a documented follow-on.
+- p2 http link kept conditional for JS guests (jco path still needs the p2
+  interface); the Rust/wasip3 guests are fully on p3.

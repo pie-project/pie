@@ -1,0 +1,36 @@
+interface chat {
+    use types.{error};
+
+    variant event {
+        /// Generated text chunk
+        delta(string),
+        /// Special token encountered (token ID)
+        interrupt(u32),
+        /// Generation complete (full accumulated text)
+        done(string),
+    }
+
+    /// Fill roles for history replay
+    system: func(message: string) -> list<u32>;
+    first-user: func(message: string) -> list<u32>;
+    user: func(message: string) -> list<u32>;
+    system-user: func(system: string, user: string) -> list<u32>;
+    assistant: func(message: string) -> list<u32>;
+
+    /// Cue the model to generate (fills generation header)
+    cue: func() -> list<u32>;
+
+    /// Seal the current turn (insert stop token)
+    seal: func() -> list<u32>;
+
+    /// Returns the stop token IDs for the model
+    stop-tokens: func() -> list<u32>;
+
+    /// Create a decoder to classify generated tokens
+    create-decoder: func() -> decoder;
+
+    resource decoder {
+        feed: func(tokens: list<u32>) -> result<event, error>;
+        reset: func();
+    }
+}

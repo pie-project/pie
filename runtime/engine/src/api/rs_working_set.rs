@@ -20,7 +20,7 @@ use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-impl pie::core::working_set::HostRsWorkingSet for InstanceState {
+impl pie::inferlet::working_set::HostRsWorkingSet for InstanceState {
     /// Fresh, empty RS working set bound to the single bound model (model 0).
     /// The WIT `constructor()` takes no handle (global-model runtime). Structural
     /// buffer ops before the first forward are arena-free. Geometry is read from
@@ -60,9 +60,9 @@ impl pie::core::working_set::HostRsWorkingSet for InstanceState {
         &mut self,
         this: Resource<RsWorkingSet>,
         n: u32,
-    ) -> Result<Result<pie::core::working_set::PageRange, String>> {
+    ) -> Result<Result<pie::inferlet::working_set::PageRange, String>> {
         let ws = self.ctx().table.get_mut(&this)?;
-        Ok(ws.alloc_buffer(n).map(|r| pie::core::working_set::PageRange {
+        Ok(ws.alloc_buffer(n).map(|r| pie::inferlet::working_set::PageRange {
             start: r.start,
             len: r.len,
         }).map_err(|e| e.to_string()))

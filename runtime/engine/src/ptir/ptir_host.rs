@@ -350,19 +350,19 @@ fn poison_readers(cells: &BoundCells, reason: &str) {
 
 // The interface has no free functions left (register-program folded into
 // forward-pass.new); the trait still anchors the resource types.
-impl pie::core::ptir::Host for InstanceState {}
+impl pie::inferlet::forward::Host for InstanceState {}
 
-impl pie::core::ptir::HostChannel for InstanceState {
+impl pie::inferlet::forward::HostChannel for InstanceState {
     async fn new(
         &mut self,
         shape: Vec<u32>,
-        dtype: pie::core::tensor::Dtype,
+        dtype: pie::inferlet::types::Dtype,
         capacity: u32,
     ) -> Anyhow<Resource<Channel>> {
         // Pure host bookkeeping — works with the `ptir` feature off too (the
         // WIT constructor cannot carry a result; the gate errors at
         // forward-pass.new / submit instead).
-        use pie::core::tensor::Dtype;
+        use pie::inferlet::types::Dtype;
         let dtype = match dtype {
             Dtype::F32 => pie_ptir::types::DType::F32,
             Dtype::I32 => pie_ptir::types::DType::I32,
@@ -435,7 +435,7 @@ impl pie::core::ptir::HostChannel for InstanceState {
     }
 }
 
-impl pie::core::ptir::HostForwardPass for InstanceState {
+impl pie::inferlet::forward::HostForwardPass for InstanceState {
     async fn new(
         &mut self,
         container_bytes: Vec<u8>,
@@ -613,7 +613,7 @@ impl pie::core::ptir::HostForwardPass for InstanceState {
     }
 }
 
-impl pie::core::ptir::HostPipeline for InstanceState {
+impl pie::inferlet::forward::HostPipeline for InstanceState {
     async fn new(&mut self) -> Anyhow<Resource<Pipeline>> {
         Ok(self.ctx().table.push(Pipeline {
             fires: Arc::new(Mutex::new(VecDeque::new())),

@@ -7,4 +7,4 @@
 use crate::api::pie;
 use crate::instance::InstanceState;
 
-impl pie::core::types::Host for InstanceState {}
+impl pie::inferlet::types::Host for InstanceState {}

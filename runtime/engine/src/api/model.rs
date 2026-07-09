@@ -8,7 +8,7 @@ use crate::instance::InstanceState;
 use pie_model as model;
 use anyhow::Result;
 
-impl pie::core::model::Host for InstanceState {
+impl pie::inferlet::model::Host for InstanceState {
     async fn name(&mut self) -> Result<String> {
         Ok(model::model().name().to_string())
     }
@@ -72,26 +72,5 @@ impl pie::core::model::Host for InstanceState {
     /// is the bound model's KV page size (tokens).
     async fn arena_block_size(&mut self) -> Result<u64> {
         Ok(crate::working_set::page_size::tokens_per_page(0) as u64)
-    }
-
-    async fn encode(&mut self, text: String) -> Result<Vec<u32>> {
-        let ids = model::model().tokenize(&text);
-        Ok(ids)
-    }
-
-    async fn decode(&mut self, tokens: Vec<u32>) -> Result<Result<String, String>> {
-        Ok(Ok(model::model().detokenize(&tokens)))
-    }
-
-    async fn vocabs(&mut self) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
-        Ok(model::model().get_vocabs())
-    }
-
-    async fn split_regex(&mut self) -> Result<String> {
-        Ok(model::model().get_split_regex())
-    }
-
-    async fn special_tokens(&mut self) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
-        Ok(model::model().get_special_tokens())
     }
 }

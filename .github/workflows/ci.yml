@@ -150,6 +150,31 @@ jobs:
             exit 1
           fi
 
+  # WIT drift — the canonical inferlet interface (interface/inferlet) is
+  # vendored into two SDK copies (sdk/rust/inferlet/wit,
+  # sdk/tools/bakery/src/bakery/wit). Manual three-way editing has regressed
+  # twice (commit 94043eb1). scripts/sync-wit.sh regenerates the copies from
+  # source; this job fails if a PR edited the interface without re-syncing.
+  wit-drift:
+    name: wit drift (sync-wit.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install wit-deps
+        run: cargo install --locked wit-deps-cli
+
+      - name: Regenerate vendored WIT copies
+        run: ./scripts/sync-wit.sh
+
+      - name: Fail if vendored WIT copies are stale
+        run: |
+          if ! git diff --exit-code -- sdk/rust/inferlet/wit sdk/tools/bakery/src/bakery/wit; then
+            echo "::error::Vendored WIT copies are out of sync with interface/inferlet."
+            echo "Regenerate with: ./scripts/sync-wit.sh   (then commit)"
+            exit 1
+          fi
+
   # Dummy driver — pure Rust, builds on every OS we support. Cheapest
   # gate for "did the standalone wiring break end to end". Runs the
   # full unit-test suite too since dummy doesn't pull in cmake.

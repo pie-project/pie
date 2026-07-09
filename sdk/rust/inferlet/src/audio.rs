@@ -16,13 +16,13 @@ use std::time::Duration;
 
 /// Which voice to synthesize in. Re-exported from the host binding so callers
 /// construct it directly: `Voice::Speaker(0)`.
-pub use crate::pie::core::audio_out::Voice;
+pub use crate::pie::inferlet::speech::Voice;
 
 /// A generated audio clip. **Self-describing** — it carries its own sample rate
 /// and channel count, so callers never hardcode a model constant like 24 kHz.
 /// Thin wrapper over the host `speech` resource; PCM is materialized on demand.
 pub struct Speech {
-    inner: crate::pie::core::audio_out::Speech,
+    inner: crate::pie::inferlet::speech::Speech,
 }
 
 impl Speech {
@@ -86,14 +86,14 @@ impl SpeechBuilder {
     /// a self-describing [`Speech`]. Errors if the model has no audio-output
     /// front-end (i.e. is not a CSM checkpoint).
     pub async fn generate(self) -> Result<Speech> {
-        let req = crate::pie::core::audio_out::SpeechRequest {
+        let req = crate::pie::inferlet::speech::SpeechRequest {
             text: self.text,
             voice: self.voice,
             max_duration_ms: self
                 .max_duration
                 .map(|d| d.as_millis().min(u32::MAX as u128) as u32),
         };
-        let inner = crate::pie::core::audio_out::Speech::generate(&req)?;
+        let inner = crate::pie::inferlet::speech::Speech::generate(&req)?;
         Ok(Speech { inner })
     }
 }

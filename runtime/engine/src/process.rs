@@ -462,10 +462,17 @@ impl Process {
             // (KV admission via the context actor removed — Phase 5; physical
             // admission is now the unified arena's concern.)
 
-            let run_interface = format!("pie:{}/run", program.name);
+            // Every inferlet now exports the same stock `pie:inferlet/run`
+            // (WIT-refactor Phase 2 — the per-package synthesized export is
+            // gone). Program identity comes from `program.name` metadata, not
+            // the export interface name. The name is version-qualified: an
+            // unversioned lookup does NOT match a versioned component export in
+            // wasmtime's semver-aware name map, so this must track the
+            // `pie:inferlet@<version>` package version declared in world.wit.
+            let run_interface = "pie:inferlet/run@0.2.0";
 
             let (_, run_export) = instance
-                .get_export(&mut store, None, &run_interface)
+                .get_export(&mut store, None, run_interface)
                 .ok_or_else(|| "No 'run' interface found".to_string())?;
 
             let (_, run_func_export) = instance

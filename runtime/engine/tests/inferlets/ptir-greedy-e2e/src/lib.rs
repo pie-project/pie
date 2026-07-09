@@ -12,7 +12,7 @@
 //! token. The harness asserts it equals a plain greedy decode of the same model.
 
 use inferlet::inference::{ForwardPass, InputBinding};
-use inferlet::pie::core::ptir::{self, ChannelSeed};
+use inferlet::pie::inferlet::forward::{self, ChannelSeed};
 use inferlet::sampling::{Graph, OutputKind};
 use inferlet::working_set::KvWorkingSet;
 use inferlet::{Result, model};

@@ -33,19 +33,19 @@ use crate::working_set::kv::{KvWorkingSet, PageRange};
 use crate::working_set::kv_cas;
 
 /// Convert the core [`PageRange`] into the WIT-generated record.
-fn wit_range(r: PageRange) -> pie::core::working_set::PageRange {
-    pie::core::working_set::PageRange {
+fn wit_range(r: PageRange) -> pie::inferlet::working_set::PageRange {
+    pie::inferlet::working_set::PageRange {
         start: r.start,
         len: r.len,
     }
 }
 
-// NOTE(working-set): the interface-level `impl pie::core::working_set::Host for
+// NOTE(working-set): the interface-level `impl pie::inferlet::working_set::Host for
 // InstanceState {}` aggregates BOTH HostKvWorkingSet (here) + HostRsWorkingSet
 // (delta). echo adds it (and the single `add_to_linker`) once both land, so it
 // is intentionally omitted from this shell.
 
-impl pie::core::working_set::HostKvWorkingSet for InstanceState {
+impl pie::inferlet::working_set::HostKvWorkingSet for InstanceState {
     async fn new(&mut self) -> Result<Resource<KvWorkingSet>> {
         // Single-model runtime: bind the one model (index 0). The driver is bound
         // lazily on the first forward write; page_size comes from its arena.
@@ -70,7 +70,7 @@ impl pie::core::working_set::HostKvWorkingSet for InstanceState {
         &mut self,
         this: Resource<KvWorkingSet>,
         n: u32,
-    ) -> Result<std::result::Result<pie::core::working_set::PageRange, String>> {
+    ) -> Result<std::result::Result<pie::inferlet::working_set::PageRange, String>> {
         // alloc reserves slots lazily — no arena access needed.
         match self.ctx().table.get_mut(&this)?.alloc(n) {
             Ok(range) => Ok(Ok(wit_range(range))),
@@ -116,24 +116,6 @@ impl pie::core::working_set::HostKvWorkingSet for InstanceState {
         // alloc_slots reserves/recycles slots lazily — no arena access needed.
         match self.ctx().table.get_mut(&this)?.alloc_slots(n) {
             Ok(ids) => Ok(Ok(ids)),
-            Err(e) => Ok(Err(e.to_string())),
-        }
-    }
-
-    async fn free_slots(
-        &mut self,
-        this: Resource<KvWorkingSet>,
-        ids: Vec<u32>,
-    ) -> Result<std::result::Result<(), String>> {
-        let (m, d) = self.ctx().table.get(&this)?.device();
-        // Lock order: arena → cas.
-        let arena_arc = arena_registry::get(m, d);
-        let cas_arc = kv_cas::get(m, d);
-        let mut arena = arena_arc.lock().unwrap();
-        let mut cas = cas_arc.lock().unwrap();
-        let ws = self.ctx().table.get_mut(&this)?;
-        match ws.free_slots(&ids, &mut arena, &mut cas) {
-            Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
     }

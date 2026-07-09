@@ -29,8 +29,8 @@ use ptir_dsl::{
     Tensor,
 };
 
-use crate::pie::core::ptir as wit;
-use crate::pie::core::tensor::Dtype as WitDtype;
+use crate::pie::inferlet::forward as wit;
+use crate::pie::inferlet::types::Dtype as WitDtype;
 use crate::working_set::KvWorkingSet;
 
 pub use ptir_dsl::intrinsics;
@@ -305,7 +305,7 @@ impl WorkingSet {
 
     /// Tombstone the slots at `ids` (non-compacting).
     pub fn free(&self, ids: Vec<u32>) -> Result<(), String> {
-        self.kv.free_slots(&ids)
+        self.kv.free(&ids)
     }
 }
 

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use wasmtime::component::Resource;
 use wasmtime::component::{Accessor, HasSelf};
 use wasmtime_wasi::WasiView;
-use crate::api::inference::*;
+use crate::api::grammar::*;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExecuteProfileSnapshot {

@@ -12,6 +12,9 @@ use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
+use wasmtime_wasi_http::p3::{
+    WasiHttpCtxView as P3WasiHttpCtxView, WasiHttpHooks, WasiHttpView as P3WasiHttpView,
+};
 
 use self::output::LogStream;
 
@@ -39,6 +42,10 @@ pub struct InstanceState {
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
+    /// wasi:http@0.3 host hooks. Enforces the instance's network policy at the
+    /// one host-side choke point (`is_supported_scheme`), the p3 analog of the
+    /// old `pie:core/http.fetch` `network_allowed()` gate.
+    http_hooks: PieHttpHooks,
 
     /// Whether outbound network is permitted (gates `pie:core/http.fetch`,
     /// parity with the wasi:http linker which is only wired when allowed).
@@ -79,6 +86,33 @@ impl WasiHttpView for InstanceState {
             ctx: &mut self.http_ctx,
             table: &mut self.resource_table,
             hooks: Default::default(),
+        }
+    }
+}
+
+/// wasi:http@0.3 hooks carrying the instance's network policy. When the
+/// network is disabled every scheme is reported unsupported, so
+/// `wasi:http/handler#handle` fails each outgoing request with a protocol
+/// error and the guest's `client.send` returns `Err` — instantiation still
+/// succeeds (parity with the old host-side `network_allowed()` gate; the p2
+/// path drops the link entirely instead).
+pub struct PieHttpHooks {
+    network_allowed: bool,
+}
+
+impl WasiHttpHooks for PieHttpHooks {
+    fn is_supported_scheme(&mut self, scheme: &http::uri::Scheme) -> bool {
+        self.network_allowed
+            && (*scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS)
+    }
+}
+
+impl P3WasiHttpView for InstanceState {
+    fn http(&mut self) -> P3WasiHttpCtxView<'_> {
+        P3WasiHttpCtxView {
+            ctx: &mut self.http_ctx,
+            table: &mut self.resource_table,
+            hooks: &mut self.http_hooks,
         }
     }
 }
@@ -172,6 +206,9 @@ impl InstanceState {
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
+            http_hooks: PieHttpHooks {
+                network_allowed: policy.network.allow,
+            },
             network_allowed: policy.network.allow,
             scratch_dir,
             // Dynamic linking support

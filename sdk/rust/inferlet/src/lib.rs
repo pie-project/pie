@@ -32,7 +32,7 @@ wit_bindgen::generate!({
 });
 
 // Re-export types that don't need async wrappers directly
-pub use pie::core::types;
+pub use pie::inferlet::types;
 
 // =============================================================================
 // Context
@@ -45,7 +45,7 @@ pub use constraint::{AnyJson, Constrain, Ebnf, GrammarConstraint, JsonSchema, Re
 /// The runtime working-set resources (KV page-slot array + recurrent state).
 /// Most inferlets use the [`Context`] facade; reach here for direct control.
 pub mod working_set {
-    pub use crate::pie::core::working_set::*;
+    pub use crate::pie::inferlet::working_set::*;
 }
 
 // =============================================================================
@@ -76,7 +76,7 @@ pub mod snapshot;
 /// attach it (with attach-time input bindings) via
 /// [`Forward::sampler`](crate::forward::Forward::sampler).
 pub mod tensor {
-    pub use crate::pie::core::tensor::*;
+    pub use crate::pie::inferlet::types::*;
 }
 
 // =============================================================================
@@ -97,10 +97,14 @@ pub use tools::Tool;
 /// that single bound model. There is no `Model`/`Tokenizer` handle to pass
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
-    pub use crate::pie::core::model::{
-        architecture, arena_block_size, decode, default_system_speculation, encode, is_linear,
-        name, output_vocab_size, rs_buffer_page_size, rs_fold_granularity, rs_state_size,
-        special_tokens, split_regex, vocabs,
+    pub use crate::pie::inferlet::model::{
+        architecture, arena_block_size, default_system_speculation, is_linear, name,
+        output_vocab_size, rs_buffer_page_size, rs_fold_granularity, rs_state_size,
+    };
+    // Tokenizer functions split into the `tokenizer` interface (§2.2); re-exported
+    // here so `model::encode`/`model::decode`/… keep working for inferlet source.
+    pub use crate::pie::inferlet::tokenizer::{
+        decode, encode, special_tokens, split_regex, vocabs,
     };
 }
 
@@ -109,7 +113,7 @@ pub mod model {
 // =============================================================================
 
 pub mod runtime {
-    pub use crate::pie::core::runtime::*;
+    pub use crate::pie::inferlet::system::*;
 }
 
 /// Suspend the current inferlet for `duration` without blocking the host
@@ -122,18 +126,18 @@ pub mod runtime {
 /// ```
 pub async fn sleep(duration: std::time::Duration) {
     let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
-    crate::pie::core::runtime::sleep(nanos).await;
+    crate::wasi::clocks::monotonic_clock::wait_for(nanos).await;
 }
 pub mod messaging {
-    pub use crate::pie::core::messaging::*;
+    pub use crate::pie::inferlet::messaging::*;
 }
 
 pub mod session {
-    pub use crate::pie::core::session::*;
+    pub use crate::pie::inferlet::session::*;
 }
 
 pub mod inference {
-    pub use crate::pie::core::inference::*;
+    pub use crate::pie::inferlet::grammar::*;
 }
 
 /// Multimodal input. The inferlet hands the host raw encoded bytes —
@@ -143,13 +147,13 @@ pub mod inference {
 /// `token-count` / `position-span` / `grid` describe how it occupies the
 /// context. No model-specific code lives in the inferlet. See MULTIMODAL.md.
 pub mod media {
-    pub use crate::pie::core::media::{Audio, Image, Video};
+    pub use crate::pie::inferlet::media::{Audio, Image, Video};
 }
 
 /// Grammar matcher — re-export for callers that build their own
 /// constraints around it. Most users should reach for [`Schema`] or
 /// [`GrammarConstraint`] instead.
-pub use crate::pie::core::inference::Matcher;
+pub use crate::pie::inferlet::grammar::Matcher;
 
 // Under component-model-async, the WIT `async func`s are generated as native
 // `async fn`s directly on the bindings — `forward-pass.execute().await`,

@@ -275,7 +275,7 @@ impl Session {
                             )
                         ),
                     );
-                    if let Some(exec) = crate::api::inference::execute_profile_snapshot() {
+                    if let Some(exec) = crate::api::grammar::execute_profile_snapshot() {
                         let mean_value = |total_us: u64, denom: u64| -> serde_json::Value {
                             serde_json::Value::from(if denom > 0 { total_us / denom } else { 0 })
                         };

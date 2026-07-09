@@ -1,16 +1,17 @@
-pub mod audio_out;
-pub mod http;
-pub mod inference;
+pub mod chat;
+pub mod grammar;
 pub mod media;
 pub mod messaging;
 pub mod model;
 pub mod kv_working_set;
-pub mod runtime;
+pub mod reasoning;
 pub mod rs_working_set;
 pub mod session;
+pub mod speech;
+pub mod system;
+pub mod tokenizer;
+pub mod tools;
 pub mod types;
-
-pub mod instruct;
 
 use wasmtime::component::HasSelf;
 use crate::instance::InstanceState;
@@ -23,42 +24,42 @@ wasmtime::component::bindgen!({
     // impls (anyhow `?`/`bail!`/`anyhow!`) continue to compile unchanged.
     anyhow: true,
     with: {
-        "wasi:io/poll": wasmtime_wasi::p2::bindings::io::poll,
-        "wasi:filesystem/types": wasmtime_wasi::p2::bindings::filesystem::types,
-        "wasi:filesystem/preopens": wasmtime_wasi::p2::bindings::filesystem::preopens,
-        "wasi:clocks/wall-clock": wasmtime_wasi::p2::bindings::clocks::wall_clock,
-        "wasi:io/streams": wasmtime_wasi::p2::bindings::io::streams,
-        "wasi:random/random": wasmtime_wasi::p2::bindings::random::random,
-        "wasi:random/insecure": wasmtime_wasi::p2::bindings::random::insecure,
-        "wasi:random/insecure-seed": wasmtime_wasi::p2::bindings::random::insecure_seed,
-        // pie:core/working-set (kv); rs-working-set below
-        "pie:core/working-set.kv-working-set": crate::working_set::kv::KvWorkingSet,
-        // pie:core/inference
-        "pie:core/inference.grammar": inference::Grammar,
-        "pie:core/inference.matcher": inference::Matcher,
-        // pie:core/ptir (thrust-3 P2b) — first-class channels + forward-pass
+        // Standard wasi 0.3 surfaces the world imports resolve to the wasmtime
+        // p3 host bindings (what the p3 linkers in linker.rs implement) rather
+        // than generating fresh host code. Package-level keys cover every
+        // reachable sub-interface (http/{client,types}, clocks/{types,
+        // monotonic-clock,system-clock}, filesystem/{types,preopens}).
+        "wasi:http": wasmtime_wasi_http::p3::bindings::http,
+        "wasi:clocks": wasmtime_wasi::p3::bindings::clocks,
+        "wasi:filesystem": wasmtime_wasi::p3::bindings::filesystem,
+        // pie:inferlet/working-set (kv); rs-working-set below
+        "pie:inferlet/working-set.kv-working-set": crate::working_set::kv::KvWorkingSet,
+        // pie:inferlet/grammar (ex inference)
+        "pie:inferlet/grammar.grammar": grammar::Grammar,
+        "pie:inferlet/grammar.matcher": grammar::Matcher,
+        // pie:inferlet/forward (ex ptir) — first-class channels + forward-pass
         // submission (the registry surface folded into forward-pass.new).
-        "pie:core/ptir.channel": crate::ptir::ptir_host::Channel,
-        "pie:core/ptir.forward-pass": crate::ptir::ptir_host::ForwardPass,
-        "pie:core/ptir.pipeline": crate::ptir::ptir_host::Pipeline,
-        // pie:core/working-set (rs)
-        "pie:core/working-set.rs-working-set": crate::working_set::rs::RsWorkingSet,
-        // pie:core/media
-        "pie:core/media.image": media::Image,
-        "pie:core/media.video": media::Video,
-        "pie:core/media.audio": media::Audio,
-        // pie:core/audio-out
-        "pie:core/audio-out.speech": audio_out::Speech,
-        // pie:instruct
-        "pie:instruct/chat.decoder": instruct::chat::Decoder,
-        "pie:instruct/tool-use.decoder": instruct::tool_use::Decoder,
-        "pie:instruct/reasoning.decoder": instruct::reasoning::Decoder,
+        "pie:inferlet/forward.channel": crate::ptir::ptir_host::Channel,
+        "pie:inferlet/forward.forward-pass": crate::ptir::ptir_host::ForwardPass,
+        "pie:inferlet/forward.pipeline": crate::ptir::ptir_host::Pipeline,
+        // pie:inferlet/working-set (rs)
+        "pie:inferlet/working-set.rs-working-set": crate::working_set::rs::RsWorkingSet,
+        // pie:inferlet/media
+        "pie:inferlet/media.image": media::Image,
+        "pie:inferlet/media.video": media::Video,
+        "pie:inferlet/media.audio": media::Audio,
+        // pie:inferlet/speech (ex audio-out)
+        "pie:inferlet/speech.speech": speech::Speech,
+        // pie:inferlet chat / tools / reasoning (ex pie:instruct)
+        "pie:inferlet/chat.decoder": chat::Decoder,
+        "pie:inferlet/tools.decoder": tools::Decoder,
+        "pie:inferlet/reasoning.decoder": reasoning::Decoder,
     },
     imports: {
         // subscribe returns a host-created stream<string>, which needs store
         // access to build -> generate it on HostWithStore (store flag), matching
         // how wasmtime_wasi p3 handles stream-returning funcs.
-        "pie:core/messaging.subscribe": store | async | trappable,
+        "pie:inferlet/messaging.subscribe": store | async | trappable,
         default: async | trappable,
     },
     exports: { default: async },
@@ -71,20 +72,20 @@ pub fn add_to_linker(
     // subscribe) are generated on `HostWithStore` traits implemented for
     // `HasSelf<InstanceState>`, so the linker `D` type must be concrete.
     type D = HasSelf<InstanceState>;
-    pie::core::types::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::working_set::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::http::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::model::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::inference::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::ptir::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::messaging::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::session::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::media::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::audio_out::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::core::runtime::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::instruct::chat::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::instruct::tool_use::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::instruct::reasoning::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::types::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::working_set::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::model::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::tokenizer::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::grammar::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::forward::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::messaging::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::session::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::media::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::speech::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::system::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::chat::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::tools::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::reasoning::add_to_linker::<InstanceState, D>(linker, |s| s)?;
 
     Ok(())
 }

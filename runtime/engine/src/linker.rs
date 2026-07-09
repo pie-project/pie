@@ -156,13 +156,26 @@ impl Linker {
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
 
+        // wasi 0.3 (p3) surfaces the pie:inferlet world imports directly:
+        // clocks (native async wait-for), filesystem (snapshot I/O), and http
+        // (outbound client.send). Linked alongside p2 — different package
+        // versions, so the two sets never collide (the supported wasmtime
+        // p2+p3 side-by-side config). p3 http is always linked; its network
+        // policy is enforced host-side by the InstanceState hooks
+        // (`is_supported_scheme`), so a network-denied inferlet still
+        // instantiates but every request fails.
+        wasmtime_wasi::p3::add_to_linker(&mut linker).expect("Failed to link WASI p3");
+        wasmtime_wasi_http::p3::add_to_linker(&mut linker)
+            .expect("Failed to link WASI HTTP p3");
+
         // wasi:http operates above wasi:sockets and bypasses the per-socket
         // policy hook (it uses the host's hyper stack with its own DNS).
         // Drop the binding entirely when the network is disabled so the
         // policy is honored end-to-end. With allow_network=true the hook
         // is wired; the allowlist still applies to wasi:sockets but
         // wasi:http is unrestricted (pre-DNS hostname allowlisting would
-        // require a DNS shim — not in v1).
+        // require a DNS shim — not in v1). This is the p2 link, kept for
+        // StarlingMonkey JS guests that still import wasi:http@0.2.
         if self.policy.network.allow {
             wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
                 .expect("Failed to link WASI HTTP");

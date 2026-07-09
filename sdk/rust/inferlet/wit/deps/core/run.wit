@@ -1,6 +1,0 @@
-interface run {
-
-    use types.{error};
-
-    run: async func(input: string) -> result<string, error>;
-}

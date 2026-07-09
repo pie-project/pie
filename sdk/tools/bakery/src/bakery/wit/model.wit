@@ -1,0 +1,58 @@
+interface model {
+
+    // The engine serves exactly one model; these are global functions over
+    // that single bound model (no `model` resource handle). Identity + memory-
+    // shaping capabilities only — the tokenizer surface (encode/decode/vocabs/
+    // special-tokens/split-regex) lives in the sibling `tokenizer` interface.
+
+    // Returns the name of the bound model
+    name: func() -> string;
+
+    // Returns the model architecture identifier (e.g. "gemma4", "qwen3_6")
+    architecture: func() -> string;
+
+    // Whether the bound model enables system speculation by default
+    default-system-speculation: func() -> bool;
+
+    // Whether the bound model is linear/recurrent — i.e. it carries a fused
+    // recurrent state that folds tokens IRREVERSIBLY (linear-attention / SSM:
+    // Qwen3.5 GDN, Nemotron-H Mamba2), as opposed to pure attention whose KV is
+    // per-token and reversibly discardable. TRUE iff the model has recurrent
+    // state (equivalently `rs-state-size() > 0`). The runtime uses this to pick
+    // the speculative-commit strategy — FOLD-COMMIT (fold only the accepted
+    // prefix via `forward-pass.rs-fold-buffered`; hold the uncertain tail in the
+    // RS buffer) for linear models vs KV-SLOT DISCARD for attention — so the
+    // inferlet's spec-decode loop can stay model-agnostic. Prefer this over
+    // reading `rs-state-size()` as a class flag: this pins the commit CONTRACT
+    // (irreversible fold ⇒ fold-commit), not a byte-accounting accident.
+    is-linear: func() -> bool;
+
+    // Logits/output dimension (= hf_config.vocab_size). May EXCEED the
+    // tokenizer's vocabs() token count due to padding. Use THIS for
+    // sampler-program lowering and any logits-shaped op; use vocabs() only for
+    // token-space work. Sourced from the model (not hardcoded) so the
+    // inferlet's lowering vocab == the driver's logits / recognizer-table vocab.
+    output-vocab-size: func() -> u32;
+
+    // ── Working-set / arena capabilities (global, over the bound model) ──
+    // Memory-shaping parameters of the bound model's driver, so an inferlet
+    // can size working sets and validate fold lengths before allocating.
+
+    // Size in bytes of one folded recurrent-state object. 0 if the model has
+    // no recurrent state (pure attention).
+    rs-state-size: func() -> u64;
+
+    // Tokens per buffered RS page. 0 if the model has no recurrent state.
+    rs-buffer-page-size: func() -> u32;
+
+    // Fold granularity in tokens: `forward-pass.fold-buffered(n)` requires `n`
+    // to be a positive multiple of this value. 1 (or 0) means unconstrained;
+    // 0 also implies the model has no recurrent state. (Token-causal RS models
+    // — Qwen3.5 GDN, Nemotron-H Mamba2 — report 1.)
+    rs-fold-granularity: func() -> u32;
+
+    // Size in bytes of one unified-arena accounting block. In v1 the KV page is
+    // exactly one block, so this is the byte size of one KV page; an RS slab
+    // occupies an integer number of these blocks.
+    arena-block-size: func() -> u64;
+}

@@ -104,9 +104,9 @@ fn sample_indices(n: usize, max_frames: usize) -> Vec<usize> {
     (0..k).map(|i| i * (n - 1) / (k - 1)).collect()
 }
 
-impl pie::core::media::Host for InstanceState {}
+impl pie::inferlet::media::Host for InstanceState {}
 
-impl pie::core::media::HostImage for InstanceState {
+impl pie::inferlet::media::HostImage for InstanceState {
     /// Decode + resize + patchify an encoded still image per the bound model.
     async fn from_bytes(
         &mut self,
@@ -166,7 +166,7 @@ impl pie::core::media::HostImage for InstanceState {
     }
 }
 
-impl pie::core::media::HostVideo for InstanceState {
+impl pie::inferlet::media::HostVideo for InstanceState {
     /// Decode an animated container, uniformly sample `<= max_frames` frames,
     /// and preprocess each per the bound model's per-frame budget.
     async fn from_bytes(
@@ -257,7 +257,7 @@ impl pie::core::media::HostVideo for InstanceState {
     }
 }
 
-impl pie::core::media::HostAudio for InstanceState {
+impl pie::inferlet::media::HostAudio for InstanceState {
     /// Decode (WAV) + resample + log-mel an encoded audio clip per the bound
     /// model. Non-audio models return a clean error.
     async fn from_bytes(
