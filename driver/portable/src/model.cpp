@@ -58,6 +58,20 @@ bool is_small_weight_for_upcast(const std::string& hf_name) {
            pie_driver_common::ends_with(hf_name, kBiasSuffix);
 }
 
+// Qwen3.5/3.6-only companion to `is_small_weight_for_upcast`: the
+// gated-delta-rule per-head decay params ([num_v_heads] floats per
+// linear-attention layer). `A_log` feeds `ggml_exp` directly; Metal has
+// no bf16 unary kernel, so leaving it bf16 forces one CPU-fallback node
+// per linear-attention layer. Callers must gate on
+// `hparams_.arch == PieArch::Qwen3_5` so other archs' load behavior is
+// untouched.
+bool is_qwen3_5_linear_decay_weight(const std::string& hf_name) {
+    static constexpr std::string_view kALogSuffix = "linear_attn.A_log";
+    static constexpr std::string_view kDtBiasSuffix = "linear_attn.dt_bias";
+    return pie_driver_common::ends_with(hf_name, kALogSuffix) ||
+           pie_driver_common::ends_with(hf_name, kDtBiasSuffix);
+}
+
 ggml_type st_to_ggml_dtype(StDtype dt, const std::string& tensor_name) {
     switch (dt) {
         case StDtype::F32:  return GGML_TYPE_F32;
@@ -535,9 +549,13 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     // implicit `ggml_cast` in `norm_scale` becomes a no-op. The actual
     // bf16 -> f32 byte conversion is a Rust storage-program TileMap.
     const bool gguf_typed = t.ggml_type_override >= 0;
+    const bool small_f32_weight =
+        is_small_weight_for_upcast(hf_name) ||
+        (hparams_.arch == PieArch::Qwen3_5 &&
+         is_qwen3_5_linear_decay_weight(hf_name));
     const bool upcast = !gguf_typed
                      && t.dtype == StDtype::BF16
-                     && is_small_weight_for_upcast(hf_name);
+                     && small_f32_weight;
     // Some HF releases (notably Gemma-2-2b) store weights as F32. The F32
     // mul_mat path is ~2x slower than BF16 on tensor-core hardware and
     // doubles VRAM. Downcast large matmul weights at load time, matching
@@ -556,7 +574,7 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     const bool keep_f32 = keep_f32_env || hparams_.arch == PieArch::Csm;
     const bool downcast = !gguf_typed
                        && t.dtype == StDtype::F32
-                       && !is_small_weight_for_upcast(hf_name)
+                       && !small_f32_weight
                        && !keep_f32;
     const bool fp8_decode = !gguf_typed && t.dtype == StDtype::F8_E4M3;
     if (!gguf_typed && t.dtype == StDtype::F8_E5M2) {

@@ -67,7 +67,12 @@ ggml_tensor* build_qwen3_5_linear_layer(
         : ggml_cast(ctx, L.lin_dt_bias, GGML_TYPE_F32);
     auto* alpha_dt = ggml_add(ctx, alpha, dt_bias);
     auto* sp_alpha = ggml_softplus(ctx, alpha_dt);
-    auto* A_pos = ggml_exp(ctx, L.lin_A_log);                  // [H]
+    // Metal has no bf16 unary kernel — cast to f32 before `exp` (the cast
+    // itself has a Metal CPY pipeline) so the node stays on the GPU.
+    auto* A_log = (L.lin_A_log->type == GGML_TYPE_F32)
+        ? L.lin_A_log
+        : ggml_cast(ctx, L.lin_A_log, GGML_TYPE_F32);
+    auto* A_pos = ggml_exp(ctx, A_log);                        // [H]
     auto* g = ggml_mul(ctx, sp_alpha, A_pos);                  // [H, n_tokens, n_seqs]
     g = ggml_scale(ctx, g, -1.0f);
 
