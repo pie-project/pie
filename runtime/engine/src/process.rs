@@ -448,15 +448,14 @@ impl Process {
         let mut wasm_run_us = 0u64;
         let result: Result<String, String> = async {
             let instantiate_start = Instant::now();
-            let output = if capture_outputs { OutputMode::Stream } else { OutputMode::Discard };
-            let (mut store, instance) = linker::instantiate(
-                process_id,
-                username,
-                &program,
-                output,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            let output = if capture_outputs {
+                OutputMode::Stream
+            } else {
+                OutputMode::Discard
+            };
+            let (mut store, instance) = linker::instantiate(process_id, username, &program, output)
+                .await
+                .map_err(|e| e.to_string())?;
             instantiate_us = duration_us(instantiate_start.elapsed());
 
             // (KV admission via the context actor removed — Phase 5; physical

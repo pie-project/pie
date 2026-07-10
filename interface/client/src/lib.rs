@@ -7,8 +7,7 @@
 //! disaggregated serving), plus the [`edge`] frames that wrap them on the
 //! gateway↔worker and worker↔local-client hops.
 //!
-//! Plain serde vocabulary — deliberately NOT `#[schema]`/rkyv (it never rides
-//! the zero-copy tensor ring), so it is NOT part of `SCHEMA_HASH`. Id atoms
+//! Plain serde vocabulary, independent of the local runtime-driver ABI. Id atoms
 //! (e.g. `SessionId`) live in `pie-ids`; this crate references none of them.
 
 pub mod edge;

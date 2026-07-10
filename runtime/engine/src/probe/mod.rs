@@ -36,5 +36,4 @@
 //!   the documented hierarchy; doc-comments explain the
 //!   contained-vs-sibling distinction.
 
-pub mod driver_cuda;
 pub mod fire;

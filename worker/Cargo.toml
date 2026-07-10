@@ -25,13 +25,12 @@ crate-type = ["rlib"]
 # Rust driver is no longer gated.
 default = []
 driver-cuda = ["dep:pie-weight-loader", "pie-engine/driver-cuda"]
-driver-metal = ["dep:pie-weight-loader"]
+driver-metal = ["dep:pie-weight-loader", "pie-engine/driver-metal"]
 driver-dummy = []
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
 # corresponding flag. See `pie/src/probe/` for the catalog of domains.
 profile-fire = ["pie-engine/profile-fire"]
-profile-driver-cuda = ["pie-engine/profile-driver-cuda"]
 profile-hot-path = ["pie-engine/profile-hot-path"]
 profile-all = ["pie-engine/profile-all"]
 
@@ -56,9 +55,6 @@ pie-driver-abi = { path = "../interface/driver" }
 # vocabulary (ClientMessage / ServerMessage) the gateway data plane carries.
 pie-ids = { path = "../interface/ids" }
 pie-client-api = { path = "../interface/client" }
-# Direct dep for the parallel `DEP_PIE_IPC_INCLUDE` handoff (the in-proc
-# vtable header `pie_ipc.h` + `pie_ipc/inproc_server.hpp`).
-pie-ipc = { path = "../driver/ipc" }
 anyhow = "1.0"
 rmp-serde = "1.3"
 # Verify content-addressed blob fetches (design §9): blake3(body) == BlobRef.hash.
@@ -82,11 +78,6 @@ tokio-tungstenite = "0.28.0"
 futures = "0.3.31"
 mimalloc = "0.1"
 tracing = "0.1"
-# `shm_unlink` for the hard-kill cleanup path; see serve.rs's shutdown
-# branch. Drivers normally clean up on graceful exit, but a SIGKILL
-# leaves the POSIX shmem region behind — we call shm_unlink directly
-# so the next launch doesn't trip on a stale segment.
-libc = "0.2"
 # Async HTTP client for the data-plane blob fetch (gateway_link.rs): the
 # worker pulls `GET {origin}/blob/{hash}` for multimodal inputs during
 # inference (design §9). Provisioning downloads (weights, py-runtime) live in

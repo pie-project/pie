@@ -5,7 +5,7 @@
 // weights straight into MLX arrays, binds them onto charlie's ModelWeights via
 // the per-arch bind_* schema, constructs the runtime ModelGraph, and allocates
 // the paged-KV cache sized from the real model geometry. The result is a
-// self-contained bundle the in-process service (alpha) drives for a forward.
+// self-contained bundle the direct Metal entry path drives for a forward.
 
 #include <memory>
 #include <string>

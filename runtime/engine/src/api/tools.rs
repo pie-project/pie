@@ -4,11 +4,11 @@
 //! Delegates to the model's `Instruct` implementation.
 
 use crate::api::pie;
+use crate::instance::InstanceState;
+use anyhow::Result;
 use pie_grammar::compiled_grammar::CompiledGrammar;
 use pie_grammar::matcher::GrammarMatcher;
-use crate::instance::InstanceState;
 use pie_model::instruct::{ToolDecoder, ToolEvent};
-use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 

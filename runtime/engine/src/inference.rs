@@ -9,13 +9,12 @@
 //! Batch scheduling, RPC execution, and response notification are handled
 //! by individual BatchScheduler instances (one per driver).
 
-mod policy;
 pub mod batch;
 pub mod contention;
 pub mod execute;
 pub mod paging;
+mod policy;
 pub mod request;
-pub mod response;
 pub mod scheduler;
 pub mod stats;
 
@@ -29,7 +28,7 @@ use scheduler::BatchScheduler;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
-pub use stats::{BUBBLE_HIST_UPPER_US, SYSTEM_SPEC_DRAFT_POS_BUCKETS, SchedulerStats};
+pub use stats::{BUBBLE_HIST_UPPER_US, SchedulerStats};
 /// Aggregated inference stats for a single model (across all drivers).
 ///
 /// Always-on counters live at the top; per-domain probe averages
@@ -51,10 +50,6 @@ pub struct InferenceStats {
     /// `profile-fire`. Mirrors `crate::probe::fire::FireProbes`.
     pub fire: FireStats,
 
-    pub system_spec_draft_tokens_proposed: u64,
-    pub system_spec_draft_tokens_accepted: u64,
-    pub system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
-    pub system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
     /// Per-identity (C3) co-batch density: `(program_identity_hash, fires, rows)`,
     /// merged across drivers, sorted by rows desc. Per-identity fire density =
     /// `rows / fires` (the pentathlon per-identity-batch-density probe).
@@ -68,51 +63,26 @@ pub struct InferenceStats {
     /// HOST PROXY (device-idle stamped at the Rust enqueue point → over-counts by
     /// the host submit/handshake delay). See [`Self::bubble_p50`].
     pub bubble_us_hist: [u64; BUBBLE_HIST_UPPER_US.len()],
-    /// Inter-batch bubble histogram fed by the CUDA driver's accurate
-    /// `probe_device_idle_us` device-idle stamp (no host over-count). Empty unless
-    /// the driver stamps it (profile-driver-cuda). [`Self::bubble_p50`] prefers
-    /// this when non-empty, else falls back to the host proxy above.
-    pub bubble_us_hist_driver: [u64; BUBBLE_HIST_UPPER_US.len()],
 }
 
 impl InferenceStats {
-    /// Inter-batch bubble p50 (µs) for the masterplan G3 gate — the DRIVER-STAMP
-    /// histogram (accurate `probe_device_idle_us`) when it has samples, else the
-    /// host-proxy histogram (which over-counts by the host submit delay). Returns
-    /// the p50 bucket's UPPER bound (so "≤ 100" ⇔ the p50 bucket is ≤ 100 µs).
+    /// Inter-batch bubble p50 (µs) from the scheduler's host-side histogram.
     pub fn bubble_p50(&self) -> u64 {
         self.bubble_percentile(0.50)
     }
 
-    /// Inter-batch bubble p99 (µs), driver-stamp preferred (see [`Self::bubble_p50`]).
+    /// Inter-batch bubble p99 (µs).
     pub fn bubble_p99(&self) -> u64 {
         self.bubble_percentile(0.99)
     }
 
-    /// `true` when the accurate driver-stamp histogram has samples (so
-    /// [`Self::bubble_p50`] reflects the device-idle stamp, not the host proxy).
-    /// `false` ⇒ no driver profiling; p50 came from the host proxy.
-    pub fn bubble_from_driver(&self) -> bool {
-        self.bubble_us_hist_driver.iter().sum::<u64>() > 0
-    }
-
-    /// p50 from the HOST-PROXY histogram only — the transition cross-check
-    /// (proxy vs driver as two independent producers of the same quantity).
+    /// Alias retained for callers that explicitly request the host proxy.
     pub fn bubble_p50_proxy(&self) -> u64 {
         Self::hist_percentile(&self.bubble_us_hist, 0.50)
     }
 
-    /// p50 from the DRIVER-STAMP histogram only — the transition cross-check.
-    pub fn bubble_p50_driver(&self) -> u64 {
-        Self::hist_percentile(&self.bubble_us_hist_driver, 0.50)
-    }
-
     fn bubble_percentile(&self, q: f64) -> u64 {
-        if self.bubble_from_driver() {
-            Self::hist_percentile(&self.bubble_us_hist_driver, q)
-        } else {
-            Self::hist_percentile(&self.bubble_us_hist, q)
-        }
+        Self::hist_percentile(&self.bubble_us_hist, q)
     }
 
     /// The upper bound of the bucket containing the `q`-quantile of `hist`
@@ -195,30 +165,6 @@ pub struct ExecuteStats {
     pub avg_total_us: u64,
     pub avg_batch_build_us: u64,
     pub avg_driver_fire_us: u64,
-    pub response_dispatch: ResponseDispatchStats,
-    pub driver_cuda: DriverCudaStats,
-}
-
-#[derive(Debug, Default, serde::Serialize)]
-pub struct ResponseDispatchStats {
-    pub avg_total_us: u64,
-    pub direct_count: u64,
-    pub chunk_count: u64,
-}
-
-#[derive(Debug, Default, serde::Serialize)]
-pub struct DriverCudaStats {
-    pub avg_ipc_submit_us: u64,
-    pub avg_gpu_wait_us: u64,
-    pub avg_ipc_recv_us: u64,
-    pub avg_wire_parse_us: u64,
-    pub avg_plan_us: u64,
-    pub avg_h2d_us: u64,
-    pub avg_kernel_launch_us: u64,
-    pub avg_sync_us: u64,
-    pub avg_response_build_us: u64,
-    pub sum_sync_us: u64,
-    pub sum_kernel_launch_us: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -234,11 +180,19 @@ pub struct PostDispatchStats {
 static SERVICE: Service<Message> = Service::new();
 
 /// Spawns the inference service for the single model.
+pub struct InferenceShutdownHandle;
+
+impl InferenceShutdownHandle {
+    pub async fn shutdown(self) -> Result<()> {
+        SERVICE.shutdown().await
+    }
+}
+
 pub async fn spawn(
     driver_indices: &[usize],
     page_size: u32,
     request_timeout_secs: u64,
-) {
+) -> Result<InferenceShutdownHandle> {
     // Fetch driver info before entering the sync closure.
     let driver_ids: Vec<DriverId> = driver_indices.to_vec();
     let mut driver_batch_limits = Vec::with_capacity(driver_indices.len());
@@ -249,101 +203,61 @@ pub async fn spawn(
         driver_batch_limits.push(info.scheduler_limits());
     }
 
-    SERVICE
-        .spawn(move || {
-            InferenceService::new(
-                driver_ids,
-                driver_batch_limits,
-                page_size,
-                request_timeout_secs,
-            )
-        })
-        .expect("Failed to spawn inference service")
+    SERVICE.spawn(move || {
+        InferenceService::new(
+            driver_ids,
+            driver_batch_limits,
+            page_size,
+            request_timeout_secs,
+        )
+    })?;
+    Ok(InferenceShutdownHandle)
 }
 
-
-
 pub fn submit_async(
-    request: pie_driver_abi::ForwardRequest,
+    request: crate::driver::LaunchPlan,
     driver_idx: usize,
+    instance_id: u64,
+    host_puts: Vec<crate::ptir::PtirChannelValue>,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
     program_identity_hashes: Vec<u64>,
     pipeline_id: Option<crate::process::ProcessId>,
-) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
-    let (tx, rx) = oneshot::channel();
-    // R-decomposition (charlie): stamp the guest's resubmit instant in the
-    // scheduler epoch so `service_queue_us` (submit→recv) is comparable.
+    completion: crate::driver::InstanceCompletion,
+) -> Result<()> {
     let submitted_at_us = crate::inference::scheduler::now_micros();
-    SERVICE.send(
-        Message::Submit {
-            request,
-            driver_idx,
-            physical_page_ids,
-            last_page_len,
-            program_identity_hashes,
-            pipeline_id,
-            submitted_at_us,
-            response: tx,
-        },
-    )?;
-    Ok(rx)
-}
-
-/// G2 prebuilt-passthrough submit — fires a COMPLETE, wire-final multi-lane
-/// `ForwardRequest` (a PTIR beam fire = B forward lanes, one program/epilogue)
-/// VERBATIM + SOLO, bypassing the scheduler's per-request re-fold. The whole
-/// rich `ForwardOutput::Response` is routed to the returned receiver;
-/// `physical_page_ids` is the union of all lanes' pages (KV-txn / ref tracking
-/// only). Used by `ptir_host.submit` for the beam fire.
-pub fn submit_prebuilt_async(
-    request: pie_driver_abi::ForwardRequest,
-    driver_idx: usize,
-    physical_page_ids: Vec<PhysicalPageId>,
-    last_page_len: u32,
-    program_identity_hashes: Vec<u64>,
-) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
-    let (tx, rx) = oneshot::channel();
-    SERVICE.send(Message::SubmitPrebuilt {
+    crate::driver::scheduler_handle(driver_idx)?.submit_with_identity(
         request,
-        driver_idx,
+        instance_id,
+        host_puts,
+        completion,
         physical_page_ids,
         last_page_len,
         program_identity_hashes,
-        response: tx,
-    })?;
-    Ok(rx)
+        pipeline_id,
+        submitted_at_us,
+    )
 }
 
-/// Internal forward result shape passed from the scheduler to a waiting
-/// inferlet. Normal decode returns a single token per request; carrying that
-/// directly avoids allocating a one-request `ForwardResponse` for every token.
-#[derive(Debug)]
-pub enum ForwardOutput {
-    Token(u32),
-    Tokens(Vec<u32>),
-    Response(pie_driver_abi::ForwardResponse),
-}
-
-impl ForwardOutput {
-    pub(crate) fn first_token(&self) -> Option<u32> {
-        match self {
-            Self::Token(t) => Some(*t),
-            Self::Tokens(tokens) => tokens.first().copied(),
-            Self::Response(resp) => resp.tokens.first().copied(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_response(resp: pie_driver_abi::ForwardResponse) -> Self {
-        Self::Response(resp)
-    }
-}
-
-impl From<pie_driver_abi::ForwardResponse> for ForwardOutput {
-    fn from(resp: pie_driver_abi::ForwardResponse) -> Self {
-        Self::Response(resp)
-    }
+pub fn submit_prebuilt_async(
+    request: crate::driver::LaunchPlan,
+    driver_idx: usize,
+    instance_id: u64,
+    host_puts: Vec<crate::ptir::PtirChannelValue>,
+    physical_page_ids: Vec<PhysicalPageId>,
+    last_page_len: u32,
+    program_identity_hashes: Vec<u64>,
+    completion: crate::driver::InstanceCompletion,
+) -> Result<()> {
+    crate::driver::scheduler_handle(driver_idx)?.submit_prebuilt(
+        request,
+        instance_id,
+        host_puts,
+        completion,
+        physical_page_ids,
+        last_page_len,
+        program_identity_hashes,
+    )
 }
 
 /// Returns aggregated inference stats for the model (lock-free, non-blocking).
@@ -352,8 +266,6 @@ pub async fn get_stats() -> InferenceStats {
     let _ = SERVICE.send(Message::GetStats { response: tx });
     rx.await.unwrap_or_default()
 }
-
-
 
 // =============================================================================
 // Inference Service
@@ -400,8 +312,6 @@ impl InferenceService {
 
         let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
 
-
-
         InferenceService {
             num_drivers,
             schedulers,
@@ -417,7 +327,6 @@ impl InferenceService {
         let mut max_forward_requests = 0u64;
         let mut hist = [0u64; 8];
         let mut bubble_hist = [0u64; BUBBLE_HIST_UPPER_US.len()];
-        let mut bubble_hist_driver = [0u64; BUBBLE_HIST_UPPER_US.len()];
         // Per-identity (C3) co-batch density, merged across drivers by hash.
         let mut per_identity: std::collections::HashMap<u64, (u64, u64)> =
             std::collections::HashMap::new();
@@ -437,18 +346,6 @@ impl InferenceService {
         let mut fire_execute_total = 0u64;
         let mut fire_execute_batch_build = 0u64;
         let mut fire_execute_driver_fire = 0u64;
-        let mut fire_execute_response_dispatch_total = 0u64;
-        let mut fire_execute_response_dispatch_direct = 0u64;
-        let mut fire_execute_response_dispatch_chunk = 0u64;
-        let mut dc_ipc_submit = 0u64;
-        let mut dc_gpu_wait = 0u64;
-        let mut dc_ipc_recv = 0u64;
-        let mut dc_wire_parse = 0u64;
-        let mut dc_plan = 0u64;
-        let mut dc_h2d = 0u64;
-        let mut dc_kernel_launch = 0u64;
-        let mut dc_sync = 0u64;
-        let mut dc_response_build = 0u64;
         let mut fire_post_dispatch_context_tick = 0u64;
         let mut fire_post_dispatch_stats_update = 0u64;
         let mut q_inter_batch_bubble = 0u64;
@@ -461,13 +358,6 @@ impl InferenceService {
         let mut q_wave_active_sum = 0u64;
         let mut q_wave_missing_sum = 0u64;
         let mut q_wave_fires = 0u64;
-        let mut system_spec_draft_tokens_proposed = 0u64;
-        let mut system_spec_draft_tokens_accepted = 0u64;
-        let mut system_spec_draft_tokens_proposed_per_pos =
-            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
-        let mut system_spec_draft_tokens_accepted_per_pos =
-            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
-
         for s in &self.scheduler_stats {
             total_batches += s.total_batches.load(Relaxed);
             total_tokens += s.total_tokens_processed.load(Relaxed);
@@ -490,19 +380,6 @@ impl InferenceService {
             fire_execute_total += f.execute.total_us.load(Relaxed);
             fire_execute_batch_build += f.execute.batch_build_us.load(Relaxed);
             fire_execute_driver_fire += f.execute.driver_fire_us.load(Relaxed);
-            fire_execute_response_dispatch_total += f.execute.response_dispatch.total_us.load(Relaxed);
-            fire_execute_response_dispatch_direct += f.execute.response_dispatch.direct_count.load(Relaxed);
-            fire_execute_response_dispatch_chunk += f.execute.response_dispatch.chunk_count.load(Relaxed);
-            let dc = &s.driver_cuda;
-            dc_ipc_submit += dc.ipc_submit_us.load(Relaxed);
-            dc_gpu_wait += dc.gpu_wait_us.load(Relaxed);
-            dc_ipc_recv += dc.ipc_recv_us.load(Relaxed);
-            dc_wire_parse += dc.wire_parse_us.load(Relaxed);
-            dc_plan += dc.plan_us.load(Relaxed);
-            dc_h2d += dc.h2d_us.load(Relaxed);
-            dc_kernel_launch += dc.kernel_launch_us.load(Relaxed);
-            dc_sync += dc.sync_us.load(Relaxed);
-            dc_response_build += dc.response_build_us.load(Relaxed);
             fire_post_dispatch_context_tick += f.post_dispatch.context_tick_us.load(Relaxed);
             fire_post_dispatch_stats_update += f.post_dispatch.stats_update_us.load(Relaxed);
             q_inter_batch_bubble += f.quorum.inter_batch_bubble_us.load(Relaxed);
@@ -515,20 +392,6 @@ impl InferenceService {
             q_wave_active_sum += f.quorum.wave_active_sum.load(Relaxed);
             q_wave_missing_sum += f.quorum.wave_missing_sum.load(Relaxed);
             q_wave_fires += f.quorum.wave_fires.load(Relaxed);
-            system_spec_draft_tokens_proposed += s.system_spec_draft_tokens_proposed.load(Relaxed);
-            system_spec_draft_tokens_accepted += s.system_spec_draft_tokens_accepted.load(Relaxed);
-            for (dst, src) in system_spec_draft_tokens_proposed_per_pos
-                .iter_mut()
-                .zip(s.system_spec_draft_tokens_proposed_per_pos.iter())
-            {
-                *dst += src.load(Relaxed);
-            }
-            for (dst, src) in system_spec_draft_tokens_accepted_per_pos
-                .iter_mut()
-                .zip(s.system_spec_draft_tokens_accepted_per_pos.iter())
-            {
-                *dst += src.load(Relaxed);
-            }
             // Merge this driver's bounded per-identity table by hash.
             for (i, hslot) in s.per_identity_hash.iter().enumerate() {
                 let h = hslot.load(Relaxed);
@@ -540,12 +403,6 @@ impl InferenceService {
             }
             identities_dropped += s.identities_dropped.load(Relaxed);
             for (dst, src) in bubble_hist.iter_mut().zip(s.bubble_us_hist.iter()) {
-                *dst += src.load(Relaxed);
-            }
-            for (dst, src) in bubble_hist_driver
-                .iter_mut()
-                .zip(s.bubble_us_hist_driver.iter())
-            {
                 *dst += src.load(Relaxed);
             }
         }
@@ -597,24 +454,6 @@ impl InferenceService {
                     avg_total_us: avg(fire_execute_total),
                     avg_batch_build_us: avg(fire_execute_batch_build),
                     avg_driver_fire_us: avg(fire_execute_driver_fire),
-                    response_dispatch: ResponseDispatchStats {
-                        avg_total_us: avg(fire_execute_response_dispatch_total),
-                        direct_count: fire_execute_response_dispatch_direct,
-                        chunk_count: fire_execute_response_dispatch_chunk,
-                    },
-                    driver_cuda: DriverCudaStats {
-                        avg_ipc_submit_us: avg(dc_ipc_submit),
-                        avg_gpu_wait_us: avg(dc_gpu_wait),
-                        avg_ipc_recv_us: avg(dc_ipc_recv),
-                        avg_wire_parse_us: avg(dc_wire_parse),
-                        avg_plan_us: avg(dc_plan),
-                        avg_h2d_us: avg(dc_h2d),
-                        avg_kernel_launch_us: avg(dc_kernel_launch),
-                        avg_sync_us: avg(dc_sync),
-                        avg_response_build_us: avg(dc_response_build),
-                        sum_sync_us: dc_sync,
-                        sum_kernel_launch_us: dc_kernel_launch,
-                    },
                 },
                 post_dispatch: PostDispatchStats {
                     avg_context_tick_us: avg(fire_post_dispatch_context_tick),
@@ -645,14 +484,9 @@ impl InferenceService {
                     wave_fires: q_wave_fires,
                 },
             },
-            system_spec_draft_tokens_proposed,
-            system_spec_draft_tokens_accepted,
-            system_spec_draft_tokens_proposed_per_pos,
-            system_spec_draft_tokens_accepted_per_pos,
             per_identity_batch,
             identities_dropped,
             bubble_us_hist: bubble_hist,
-            bubble_us_hist_driver: bubble_hist_driver,
         }
     }
 }
@@ -661,41 +495,8 @@ impl InferenceService {
 // ServiceHandler Implementation
 // =============================================================================
 
-/// Messages handled by InferenceService.
 #[derive(Debug)]
 enum Message {
-    /// Submit a pre-resolved forward pass to the scheduler.
-    /// All context operations must be done by the caller before sending this.
-    Submit {
-        request: pie_driver_abi::ForwardRequest,
-        driver_idx: usize,
-        physical_page_ids: Vec<PhysicalPageId>,
-        last_page_len: u32,
-        /// #10: per-program `program_identity_hash`es (distinct-count key, computed
-        /// host-side at attach). Empty ⇒ plain decode. Runtime-side only — never
-        /// placed on the wire request; reaches the policy via `submit_with_identity`.
-        program_identity_hashes: Vec<u64>,
-        /// M-A1 (wait-for-all): the submitting pipeline's `ProcessId` (wave
-        /// membership key); `None` for solo fires. Threaded to the scheduler via
-        /// `submit_with_identity`.
-        pipeline_id: Option<crate::process::ProcessId>,
-        /// R-decomposition probe (charlie): `now_micros()` at submit (guest
-        /// resubmit instant, scheduler epoch). See `PendingRequest::submitted_at_us`.
-        submitted_at_us: u64,
-        response: oneshot::Sender<Result<ForwardOutput>>,
-    },
-    /// G2 prebuilt-passthrough: submit a COMPLETE, wire-final multi-lane
-    /// `ForwardRequest` (a PTIR beam fire) that fires VERBATIM + SOLO. Same
-    /// fields as `Submit`; the scheduler skips the per-request re-fold and routes
-    /// the whole rich response to the single `response`.
-    SubmitPrebuilt {
-        request: pie_driver_abi::ForwardRequest,
-        driver_idx: usize,
-        physical_page_ids: Vec<PhysicalPageId>,
-        last_page_len: u32,
-        program_identity_hashes: Vec<u64>,
-        response: oneshot::Sender<Result<ForwardOutput>>,
-    },
     GetStats {
         response: oneshot::Sender<InferenceStats>,
     },
@@ -706,44 +507,6 @@ impl ServiceHandler for InferenceService {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Submit {
-                request,
-                driver_idx,
-                physical_page_ids,
-                last_page_len,
-                program_identity_hashes,
-                pipeline_id,
-                submitted_at_us,
-                response,
-            } => {
-                let idx = driver_idx.min(self.num_drivers.saturating_sub(1));
-                let _ = self.schedulers[idx].handle().submit_with_identity(
-                    request,
-                    response,
-                    physical_page_ids,
-                    last_page_len,
-                    program_identity_hashes,
-                    pipeline_id,
-                    submitted_at_us,
-                );
-            }
-            Message::SubmitPrebuilt {
-                request,
-                driver_idx,
-                physical_page_ids,
-                last_page_len,
-                program_identity_hashes,
-                response,
-            } => {
-                let idx = driver_idx.min(self.num_drivers.saturating_sub(1));
-                let _ = self.schedulers[idx].handle().submit_prebuilt(
-                    request,
-                    response,
-                    physical_page_ids,
-                    last_page_len,
-                    program_identity_hashes,
-                );
-            }
             Message::GetStats { response } => {
                 let _ = response.send(self.aggregate_stats());
             }

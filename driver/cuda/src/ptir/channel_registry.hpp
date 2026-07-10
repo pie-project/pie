@@ -62,6 +62,7 @@ class DeviceChannelRegistry {
                            " re-bound with a conflicting shape/dtype/capacity decl";
                 return kBadSlot;
             }
+            ++refcounts_[slot];
             return slot;
         }
         const std::uint32_t slot = alloc_slot();
@@ -72,6 +73,7 @@ class DeviceChannelRegistry {
         init_slot(slot, decl);
         slot_of_.emplace(id, slot);
         id_of_[slot] = id;
+        refcounts_[slot] = 1;
         return slot;
     }
 
@@ -84,14 +86,17 @@ class DeviceChannelRegistry {
         return it == slot_of_.end() ? kBadSlot : it->second;
     }
 
-    // Free a global channel's device storage (W0.3 release marker). Device
-    // lifetime follows the WIT resource drop (plan §6): the guest sends exactly
-    // one release marker when it drops the channel handle; a channel shared by
-    // several passes is kept alive by the guest for those passes' lifetimes.
+    // Release one bound-instance reference. Storage is freed only after the
+    // final ChannelView drops, so a guest handle drop cannot race a live pass.
     void release(std::uint64_t id) {
         auto it = slot_of_.find(id);
         if (it == slot_of_.end()) return;
-        free_slot(it->second);
+        const std::uint32_t slot = it->second;
+        if (refcounts_[slot] > 1) {
+            --refcounts_[slot];
+            return;
+        }
+        free_slot(slot);
         slot_of_.erase(it);
     }
 
@@ -168,6 +173,22 @@ class DeviceChannelRegistry {
         cudaMemcpy(out, committed_cell(slot), bytes, cudaMemcpyDeviceToHost);
     }
 
+    void apply_host_commit(const std::vector<std::uint32_t>& taken_slots,
+                           const std::vector<std::uint32_t>& put_slots) {
+        for (std::uint32_t slot : put_slots) {
+            host_tail_[slot] = (host_tail_[slot] + 1) % host_cap1_[slot];
+        }
+        for (std::uint32_t slot : taken_slots) {
+            host_head_[slot] = (host_head_[slot] + 1) % host_cap1_[slot];
+        }
+    }
+
+    void apply_host_consume(const std::vector<std::uint32_t>& slots) {
+        for (std::uint32_t slot : slots) {
+            host_head_[slot] = (host_head_[slot] + 1) % host_cap1_[slot];
+        }
+    }
+
     // Refresh the host head/tail mirrors of the given slots from the device
     // after a commit-bump (the runner passes the pass's touched slots).
     void sync_host_rings(const std::vector<std::uint32_t>& slots) {
@@ -237,6 +258,7 @@ class DeviceChannelRegistry {
             cell_base_[slot] = nullptr;
         }
         cell_bytes_[slot] = 0;
+        refcounts_[slot] = 0;
         id_of_[slot] = 0;
         free_slots_.push_back(slot);
     }
@@ -267,6 +289,7 @@ class DeviceChannelRegistry {
         cap_slots_ = new_cap;
         cell_base_.resize(new_cap, nullptr);
         cell_bytes_.resize(new_cap, 0);
+        refcounts_.resize(new_cap, 0);
         host_head_.resize(new_cap, 0);
         host_tail_.resize(new_cap, 0);
         host_cap1_.resize(new_cap, 1);
@@ -286,6 +309,7 @@ class DeviceChannelRegistry {
     std::vector<std::uint64_t> id_of_;
     std::vector<void*> cell_base_;
     std::vector<std::size_t> cell_bytes_;
+    std::vector<std::uint32_t> refcounts_;
     std::vector<std::uint32_t> host_head_, host_tail_, host_cap1_;
     std::vector<std::uint32_t> free_slots_;
     std::uint32_t next_slot_ = 0;
@@ -304,6 +328,9 @@ class DeviceChannelRegistry {
 class ChannelView {
   public:
     ChannelView() = default;
+    ~ChannelView() { release_all(); }
+    ChannelView(const ChannelView&) = delete;
+    ChannelView& operator=(const ChannelView&) = delete;
 
     // Bind this view's dense channels to the registry. `decls` are the trace's
     // channel declarations (dense order); `channel_ids[i]` is dense channel i's
@@ -314,13 +341,18 @@ class ChannelView {
               const std::vector<std::uint64_t>& channel_ids, std::string* err) {
         reg_ = reg;
         dense_to_slot_.assign(decls.size(), DeviceChannelRegistry::kBadSlot);
-        global_ids_ = channel_ids;
+        global_ids_.clear();
+        global_ids_.reserve(decls.size());
         for (std::size_t i = 0; i < decls.size(); ++i) {
             const std::uint64_t gid =
                 i < channel_ids.size() ? channel_ids[i] : (std::uint64_t)i;
             const std::uint32_t slot = reg_->get_or_create(gid, decls[i], err);
-            if (slot == DeviceChannelRegistry::kBadSlot) return false;
+            if (slot == DeviceChannelRegistry::kBadSlot) {
+                release_all();
+                return false;
+            }
             dense_to_slot_[i] = slot;
+            global_ids_.push_back(gid);
         }
         return true;
     }
@@ -368,10 +400,26 @@ class ChannelView {
     }
     // Refresh host mirrors of THIS view's slots after a commit-bump.
     void sync_host_rings() { reg_->sync_host_rings(dense_to_slot_); }
+    void apply_host_commit(const std::vector<std::uint32_t>& taken_slots,
+                           const std::vector<std::uint32_t>& put_slots) {
+        reg_->apply_host_commit(taken_slots, put_slots);
+    }
+    void apply_host_consume(const std::vector<std::uint32_t>& slots) {
+        reg_->apply_host_consume(slots);
+    }
 
     DeviceChannelRegistry* registry() { return reg_; }
 
   private:
+    void release_all() {
+        if (reg_ != nullptr) {
+            for (std::uint64_t id : global_ids_) reg_->release(id);
+        }
+        reg_ = nullptr;
+        dense_to_slot_.clear();
+        global_ids_.clear();
+    }
+
     DeviceChannelRegistry* reg_ = nullptr;
     std::vector<std::uint32_t> dense_to_slot_;
     std::vector<std::uint64_t> global_ids_;

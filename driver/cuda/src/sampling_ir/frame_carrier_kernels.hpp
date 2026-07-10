@@ -26,4 +26,15 @@ void launch_publish_words(std::uint64_t* words_dev, std::uint32_t n_channels,
                           const std::uint32_t* head, const std::uint32_t* tail,
                           std::uint64_t pacing, cudaStream_t stream);
 
+// Same as `launch_publish_words`, but only publishes when `*commit_dev != 0`.
+// A non-committed fire leaves the mapped words unchanged, so any speculative D2H
+// mirror bytes remain invisible to host readers because tail does not advance.
+void launch_publish_words_if_committed(std::uint64_t* words_dev,
+                                       const std::uint32_t* commit_dev,
+                                       std::uint32_t n_channels,
+                                       const std::uint32_t* head,
+                                       const std::uint32_t* tail,
+                                       std::uint64_t pacing,
+                                       cudaStream_t stream);
+
 }  // namespace pie_cuda_driver::sampling_ir

@@ -101,11 +101,17 @@ fn is_linear(state_size: u64) -> bool {
 fn is_linear_true_iff_recurrent_state_present() {
     // Pure attention (RS caps 0/0/1 per bootstrap.rs) → NOT linear: commit via
     // KV-slot discard, never a fold.
-    assert!(!is_linear(0), "state_size 0 (pure attention) must be non-linear");
+    assert!(
+        !is_linear(0),
+        "state_size 0 (pure attention) must be non-linear"
+    );
     // Any non-zero folded-state size (GDN / Mamba2 recurrent state) → linear:
     // commit via fold-commit (`rs-fold-buffered`).
     assert!(is_linear(4096), "a folded recurrent state must be linear");
-    assert!(is_linear(1), "even a 1-byte folded state counts as recurrent");
+    assert!(
+        is_linear(1),
+        "even a 1-byte folded state counts as recurrent"
+    );
 }
 
 // =============================================================================

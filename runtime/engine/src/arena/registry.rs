@@ -36,8 +36,7 @@ use super::{Arena, ArenaConfig};
 
 /// Append-only registry, indexed by `model_idx`. Each entry is a model's
 /// per-driver arenas, indexed by driver ordinal.
-static REGISTRY: LazyLock<boxcar::Vec<Vec<Arc<Mutex<Arena>>>>> =
-    LazyLock::new(boxcar::Vec::new);
+static REGISTRY: LazyLock<boxcar::Vec<Vec<Arc<Mutex<Arena>>>>> = LazyLock::new(boxcar::Vec::new);
 
 /// Register a model's per-driver arenas at bootstrap (called from
 /// `context::spawn`, in lock-step with `SERVICES`/`PAGE_SIZES`).
@@ -134,7 +133,11 @@ mod tests {
         let b = register_model(8, &[2], &[2], &[0]);
         assert_ne!(a, b);
         // Allocating in model a must not affect model b's pool.
-        let _h = get(a, 0).lock().unwrap().alloc(ArenaKind::KvPage, 1).unwrap();
+        let _h = get(a, 0)
+            .lock()
+            .unwrap()
+            .alloc(ArenaKind::KvPage, 1)
+            .unwrap();
         assert_eq!(get(a, 0).lock().unwrap().used(ArenaKind::KvPage), 1);
         assert_eq!(get(b, 0).lock().unwrap().used(ArenaKind::KvPage), 0);
     }

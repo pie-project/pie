@@ -2,8 +2,6 @@
 //! the full engine. Used during driver/standalone development; not
 //! part of the Python `pie_cli` surface.
 
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
@@ -52,13 +50,11 @@ fn check_summary(path: &Path, cfg: &config::Config) -> String {
     )
 }
 
-/// `pie smoke [--flavor <name>]` — exercise the FFI plumbing without a
-/// real model load. Invokes the requested driver's entry with `--help`
-/// and reports its rc.
+/// `pie smoke [--flavor <name>]` — verify the requested direct driver flavor is
+/// compiled. Full create/launch smoke tests use a real model configuration.
 ///
 /// `rpc` is accepted for backwards compatibility with older invocation
-/// scripts but is now a no-op — the cold-path RPC infrastructure has
-/// been retired in favor of the unified DriverChannel.
+/// scripts but is now a no-op.
 pub fn smoke(rpc: bool, flavor_name: Option<&str>) -> Result<()> {
     if rpc {
         eprintln!("[smoke] --rpc is a no-op; cold-path RpcServer has been retired");
@@ -89,36 +85,7 @@ fn pick_smoke_flavor(name: Option<&str>) -> Result<Flavor> {
     }
 }
 
-unsafe extern "C" fn smoke_ready_cb(caps_json: *const c_char, _ctx: *mut c_void) {
-    let json = unsafe { CStr::from_ptr(caps_json) }
-        .to_string_lossy()
-        .into_owned();
-    println!("[smoke] ready_cb fired with {json}");
-}
-
 fn smoke_ffi(flavor: Flavor) -> Result<()> {
-    println!(
-        "[smoke] invoking pie_driver_{}_run(--help)…\n",
-        flavor.as_str()
-    );
-    let argv_strs = [
-        CString::new(flavor.argv0()).unwrap(),
-        CString::new("--help").unwrap(),
-    ];
-    let mut argv_ptrs: Vec<*mut c_char> = argv_strs
-        .iter()
-        .map(|s| s.as_ptr() as *mut c_char)
-        .collect();
-    let rc = unsafe {
-        driver_ffi::run(
-            flavor,
-            argv_ptrs.len() as c_int,
-            argv_ptrs.as_mut_ptr(),
-            0,
-            smoke_ready_cb,
-            std::ptr::null_mut(),
-        )
-    };
-    println!("\n[smoke] driver entry returned rc={rc}");
+    println!("[smoke] direct {} driver is compiled", flavor.as_str());
     Ok(())
 }

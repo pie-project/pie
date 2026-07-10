@@ -32,10 +32,10 @@ Linux-only).
 
 | edge | contract |
 | --- | --- |
-| **↔driver** | driver pins KV buffers + exports a `pie_driver_abi::kv::KvHandle`; transport consumes it without owning/interpreting bytes. The per-backend registration shim lives on the driver's export surface. Transport never imports the driver — they meet only through the handle type. |
+| **↔driver** | driver pins KV buffers + exports a `pie_driver_abi::KvHandle`; transport consumes it without owning/interpreting bytes. The per-backend registration shim lives on the driver's export surface. Transport never imports the driver — they meet only through the handle type. |
 | **↔controller** | receives a pairing decision and *executes* it. No routing/scheduling here. |
 | **↔runtime** | transfers are async — transport exposes the start + a completion signal; *when* to await is the scheduler's job. |
-| **↔interface/driver** | the KV layout + handle type live in `pie_driver_abi::kv`, shared by driver / transport / runtime / controller. |
+| **↔interface/driver** | the KV layout + handle type live in `pie_driver_abi`, shared by driver / transport / runtime / controller. |
 
 ## Engine seam
 

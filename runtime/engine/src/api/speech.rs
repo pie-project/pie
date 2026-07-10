@@ -59,10 +59,7 @@ fn csm_frame_prompt(model: &pie_model::Model, text: &str, speaker: u32) -> Vec<u
 impl pie::inferlet::speech::Host for InstanceState {}
 
 impl pie::inferlet::speech::HostSpeech for InstanceState {
-    async fn generate(
-        &mut self,
-        req: SpeechRequest,
-    ) -> Result<Result<Resource<Speech>, String>> {
+    async fn generate(&mut self, req: SpeechRequest) -> Result<Result<Resource<Speech>, String>> {
         if req.text.trim().is_empty() {
             return Ok(Err("audio-out: empty text".into()));
         }

@@ -9,10 +9,9 @@ This is the macOS backend for Apple Silicon systems.
 
 ## Status
 
-Foundation skeleton: builds, links, and registers with `pie-worker`, and serves
-a Health + (stubbed) Forward round-trip through the in-process `InProcServer`.
-MLX compute (ops/executor/kernels), model graphs, and the weight loader are
-landed incrementally on top of this seam.
+Direct-ABI surface: builds, links, and registers with `pie-worker`. The Linux
+stub validates bind/layout/callback semantics; the Apple path layers MLX/Metal
+compute on the same entry surface.
 
 ## Build
 
@@ -31,7 +30,7 @@ cmake --build build
 ```
 
 `PIE_METAL_WITH_MLX=ON` (CMake option) fetches and links MLX. It is `OFF` by
-default for the bare skeleton; the compute layer turns it on.
+default for the direct surface; the compute layer turns it on.
 
 The development binary lands at `build/bin/pie_driver_metal`.
 

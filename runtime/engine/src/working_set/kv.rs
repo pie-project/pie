@@ -187,7 +187,6 @@ pub struct SuspendPlan {
     pub freed_on_grace: u32,
 }
 
-
 /// Errors are **returned**, never trapped (W2/W3). The WIT shell maps these to
 /// the inferlet-facing `error` via `Display`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,7 +249,10 @@ impl fmt::Display for WorkingSetError {
                 write!(f, "slot {index} has no written page")
             }
             WorkingSetError::StaleGeneration { captured, current } => {
-                write!(f, "stale generation: captured {captured}, current {current}")
+                write!(
+                    f,
+                    "stale generation: captured {captured}, current {current}"
+                )
             }
             WorkingSetError::OutOfBlocks {
                 kind,
@@ -611,12 +613,7 @@ impl KvWorkingSet {
     /// `DuplicateIndex` (the call never traps). Materialised pages are released to
     /// the arena/CAS. Debug builds assert each freed id is unreferenced by any
     /// in-flight pass (M1.4 grace-period precondition, W4).
-    pub fn free_slots(
-        &mut self,
-        ids: &[u32],
-        arena: &mut Arena,
-        cas: &mut KvCas,
-    ) -> Result<()> {
+    pub fn free_slots(&mut self, ids: &[u32], arena: &mut Arena, cas: &mut KvCas) -> Result<()> {
         let size = self.slots.len();
         let mut seen = vec![false; size];
         for &i in ids {
@@ -720,7 +717,9 @@ impl KvWorkingSet {
                 });
             }
             if self.slots[iu].is_none() {
-                return Err(WorkingSetError::FreedSlot { index: run.src_slot });
+                return Err(WorkingSetError::FreedSlot {
+                    index: run.src_slot,
+                });
             }
             if run.start + run.len > self.page_size {
                 return Err(WorkingSetError::RangeOutOfBounds {
@@ -980,9 +979,11 @@ impl KvWorkingSet {
             match slot {
                 None => return Err(WorkingSetError::FreedSlot { index: idx }),
                 Some(PageSlot::Reserved) => {
-                if std::env::var("PTIR_COW_TRACE").is_ok() {
-                    eprintln!("[COW] slot {idx}: Reserved -> txn_alloc FRESH page (no persist!)");
-                }
+                    if std::env::var("PTIR_COW_TRACE").is_ok() {
+                        eprintln!(
+                            "[COW] slot {idx}: Reserved -> txn_alloc FRESH page (no persist!)"
+                        );
+                    }
                     return Err(WorkingSetError::UnwrittenPage { index: idx });
                 }
                 Some(PageSlot::Page(id)) => out.push(*id),
@@ -1101,14 +1102,18 @@ impl KvWorkingSet {
             Some(PageSlot::Page(orig)) => match arena.txn_cow(txn, orig)? {
                 CowPlan::InPlace { handle } => {
                     if std::env::var("PTIR_COW_TRACE").is_ok() {
-                        eprintln!("[COW] slot {idx}: Page({orig:?}) -> InPlace (persisted, retained)");
+                        eprintln!(
+                            "[COW] slot {idx}: Page({orig:?}) -> InPlace (persisted, retained)"
+                        );
                     }
                     self.record_pending(write_txn, i, Some(PageSlot::Page(orig)));
                     Ok((handle.object_id, None))
                 }
                 CowPlan::Copy { handle, from, to } => {
                     if std::env::var("PTIR_COW_TRACE").is_ok() {
-                        eprintln!("[COW] slot {idx}: Page({orig:?}) -> Copy (rc>1, freed original)");
+                        eprintln!(
+                            "[COW] slot {idx}: Page({orig:?}) -> Copy (rc>1, freed original)"
+                        );
                     }
                     self.record_pending(write_txn, i, Some(PageSlot::Page(orig)));
                     self.slots[i] = Some(PageSlot::Page(handle.object_id));
@@ -1462,9 +1467,6 @@ impl KvWorkingSet {
         Ok(moves)
     }
 
-
-
-
     /// Seal a committed full-page write target (`valid_len == page_size`). echo
     /// host-hashes via `compute_page_hashes` and calls this per eligible page.
     /// On a CAS hit the slot is repointed to the canonical object and the
@@ -1482,9 +1484,7 @@ impl KvWorkingSet {
         }
         let id = match self.slots[idx as usize] {
             None => return Err(WorkingSetError::FreedSlot { index: idx }),
-            Some(PageSlot::Reserved) => {
-                return Err(WorkingSetError::UnwrittenPage { index: idx })
-            }
+            Some(PageSlot::Reserved) => return Err(WorkingSetError::UnwrittenPage { index: idx }),
             Some(PageSlot::Page(id)) => id,
         };
         let final_id = cas.seal(arena, id, hash)?;
@@ -1502,7 +1502,7 @@ mod tests {
     use super::*;
     use crate::arena::{Arena, ArenaConfig};
     use crate::working_set::page_hash::compute_page_hashes;
-    use pie_driver_abi::Brle;
+    use pie_grammar::brle::RunMask;
 
     const PAGE: u32 = 4;
 
@@ -1550,7 +1550,7 @@ mod tests {
 
     fn full_hash(toks: &[u32], prev: PageHash) -> PageHash {
         let positions: Vec<u32> = (0..toks.len() as u32).collect();
-        let masks: Vec<Brle> = (0..toks.len()).map(|i| Brle::all_true(i + 1)).collect();
+        let masks: Vec<RunMask> = (0..toks.len()).map(|i| RunMask::all_true(i + 1)).collect();
         *compute_page_hashes(PAGE as usize, toks, &positions, &masks, prev, None)
             .last()
             .unwrap()
@@ -1576,18 +1576,35 @@ mod tests {
         a.pin(id).unwrap();
         ws.free_slots(&[0], &mut a, &mut cas).unwrap();
         // cas.release cleaned the index at rc==1, before the pin-deferred decref.
-        assert_eq!(cas.len(), 0, "CAS reverse-map cleaned before the deferred free");
+        assert_eq!(
+            cas.len(),
+            0,
+            "CAS reverse-map cleaned before the deferred free"
+        );
         assert_eq!(a.refcount(id).unwrap(), 0, "rc hit 0");
-        assert!(a.is_pinned(id).unwrap(), "physical free deferred by the pin");
-        assert!(a.residency(id).is_ok(), "object still resolvable (a live zombie)");
+        assert!(
+            a.is_pinned(id).unwrap(),
+            "physical free deferred by the pin"
+        );
+        assert!(
+            a.residency(id).is_ok(),
+            "object still resolvable (a live zombie)"
+        );
 
         // The forward finalizes: the last unpin frees the object. CAS stays clean.
         a.unpin(id).unwrap();
         assert!(
-            matches!(a.residency(id), Err(crate::arena::ArenaError::UnknownObject(_))),
+            matches!(
+                a.residency(id),
+                Err(crate::arena::ArenaError::UnknownObject(_))
+            ),
             "freed at the last unpin"
         );
-        assert_eq!(cas.len(), 0, "no dangling CAS entry after the deferred free");
+        assert_eq!(
+            cas.len(),
+            0,
+            "no dangling CAS entry after the deferred free"
+        );
     }
 
     // 1. alloc — reserves empty slots lazily (no arena pages); generation policy.
@@ -1809,7 +1826,10 @@ mod tests {
         assert!(a.refcount(p1).is_err(), "p1 freed, index entry stale");
 
         let got = cas.seal(&mut a, p2, h).unwrap();
-        assert_eq!(got, p2, "sealed onto the fresh page, not the dead canonical");
+        assert_eq!(
+            got, p2,
+            "sealed onto the fresh page, not the dead canonical"
+        );
         assert_eq!(a.refcount(p2).unwrap(), 1, "p2 not spuriously increffed");
     }
 
@@ -1841,7 +1861,10 @@ mod tests {
         w2.alloc(1).unwrap();
         write_slot(&mut w2, &mut a, &mut cas, 0, Some(h));
         let p2 = slot(&w2, 0).unwrap();
-        assert_ne!(p2, p1, "w2 did NOT dedup onto the stashed (CPU-resident) p1");
+        assert_ne!(
+            p2, p1,
+            "w2 did NOT dedup onto the stashed (CPU-resident) p1"
+        );
         assert_eq!(
             a.residency(p2).unwrap(),
             crate::arena::Residency::Gpu,
@@ -2042,7 +2065,11 @@ mod tests {
         assert_eq!(table.len(), 4, "dense over the whole slot domain");
         // Slot 0 (a VALID slot id) → its physical page-pool block.
         let obj0 = slot(&ws, 0).unwrap();
-        assert_eq!(table[0], a.blocks(obj0).unwrap()[0], "slot 0 resolves, not special-cased");
+        assert_eq!(
+            table[0],
+            a.blocks(obj0).unwrap()[0],
+            "slot 0 resolves, not special-cased"
+        );
         assert_eq!(table[1], SLOT_UNMAPPED, "reserved → sentinel");
         assert_eq!(table[2], a.blocks(slot(&ws, 2).unwrap()).unwrap()[0]);
         assert_eq!(table[3], a.blocks(slot(&ws, 3).unwrap()).unwrap()[0]);
@@ -2052,7 +2079,11 @@ mod tests {
         let table2 = ws.slot_to_block_table(&a);
         assert_eq!(table2.len(), 4, "interior tombstone keeps the dense index");
         assert_eq!(table2[2], SLOT_UNMAPPED, "tombstoned → sentinel");
-        assert_eq!(table2[0], a.blocks(obj0).unwrap()[0], "unaffected slots stable");
+        assert_eq!(
+            table2[0],
+            a.blocks(obj0).unwrap()[0],
+            "unaffected slots stable"
+        );
 
         ws.destroy(&mut a, &mut cas);
     }
@@ -2171,7 +2202,10 @@ mod tests {
                     let ids = ws.alloc_slots(n).unwrap();
                     for id in ids {
                         // A recycled id must not point at stale data.
-                        assert!(expected.get(&id).is_none(), "recycled id {id} still tracked");
+                        assert!(
+                            expected.get(&id).is_none(),
+                            "recycled id {id} still tracked"
+                        );
                         if next() % 2 == 0 {
                             write_slot(&mut ws, &mut a, &mut cas, id, None);
                             expected.insert(id, slot(&ws, id as usize).unwrap());
@@ -2339,7 +2373,11 @@ mod tests {
         // in-flight repoint (ownership transferred to t+1).
         a.txn_commit(txn_t).unwrap();
         ws.commit_writes(wtx_t);
-        assert_eq!(slot(&ws, 0), t1_obj, "t's commit leaves t+1's write in place");
+        assert_eq!(
+            slot(&ws, 0),
+            t1_obj,
+            "t's commit leaves t+1's write in place"
+        );
 
         // t+1 commits — publishes the latest (append-chain) value.
         a.txn_commit(txn_t1).unwrap();
@@ -2372,7 +2410,11 @@ mod tests {
         let wtx = ws.begin_write_txn();
         let obj = ws.write_slot_shared_inplace(wtx, 0).unwrap();
         assert_eq!(obj, base, "returns the SHARED page (no fork)");
-        assert_eq!(slot(&ws, 0), Some(base), "slot mapping UNCHANGED (no repoint)");
+        assert_eq!(
+            slot(&ws, 0),
+            Some(base),
+            "slot mapping UNCHANGED (no repoint)"
+        );
         assert_eq!(
             a.refcount(base).unwrap(),
             2,
@@ -2381,7 +2423,11 @@ mod tests {
 
         // Abort is a slot-mapping no-op (the mapping never changed); rc still 2.
         ws.abort_writes(wtx);
-        assert_eq!(slot(&ws, 0), Some(base), "abort: mapping stays the shared page");
+        assert_eq!(
+            slot(&ws, 0),
+            Some(base),
+            "abort: mapping stays the shared page"
+        );
         assert_eq!(a.refcount(base).unwrap(), 2, "abort does not decref");
 
         // Commit path: drops the live-write marker, mapping still the shared page.
@@ -2459,20 +2505,39 @@ mod tests {
 
         // Suspend: the shared page stays mapped + resident, NEVER released.
         let plan = ws.suspend_pages_warm(&mut a, &mut cas);
-        assert!(plan.released_shared.is_empty(), "shared pages are never released");
+        assert!(
+            plan.released_shared.is_empty(),
+            "shared pages are never released"
+        );
         assert_eq!(plan.freed_now, 0, "a shared page frees no block");
-        assert_eq!(slot(&ws, 0), Some(shared_id), "shared page STILL mapped after suspend");
+        assert_eq!(
+            slot(&ws, 0),
+            Some(shared_id),
+            "shared page STILL mapped after suspend"
+        );
         assert_eq!(
             a.residency(shared_id).unwrap(),
             crate::arena::Residency::Gpu,
             "shared page still GPU-resident (not stashed)"
         );
-        assert_eq!(a.refcount(shared_id).unwrap(), 2, "our ref kept (rc unchanged)");
+        assert_eq!(
+            a.refcount(shared_id).unwrap(),
+            2,
+            "our ref kept (rc unchanged)"
+        );
 
         // Restore is a no-op for the shared page; KV intact across the cycle.
         let _ = ws.restore_pages_warm(&mut a, &plan).unwrap();
-        assert_eq!(slot(&ws, 0), Some(shared_id), "KV preserved across suspend/restore");
-        assert_eq!(a.refcount(shared_id).unwrap(), 2, "still shared, still ours");
+        assert_eq!(
+            slot(&ws, 0),
+            Some(shared_id),
+            "KV preserved across suspend/restore"
+        );
+        assert_eq!(
+            a.refcount(shared_id).unwrap(),
+            2,
+            "still shared, still ours"
+        );
 
         drop(sibling);
         ws.destroy(&mut a, &mut cas);
@@ -2496,7 +2561,10 @@ mod tests {
 
         let class = ws.classify_for_suspend(&a);
         assert_eq!(class.owned.len(), 1, "only the unpinned page is stashable");
-        assert_eq!(class.owned[0].0, 1, "slot 1 (unpinned) is the stashable one");
+        assert_eq!(
+            class.owned[0].0, 1,
+            "slot 1 (unpinned) is the stashable one"
+        );
         assert_eq!(class.freed_now, 1, "only the unpinned page frees now");
         assert_eq!(class.freed_on_grace, 1, "the pinned page is grace-deferred");
 
@@ -2504,7 +2572,10 @@ mod tests {
         // the plan reports the deferred count (not over-credited as freed).
         let plan = ws.suspend_pages_warm(&mut a, &mut cas);
         assert_eq!(plan.freed_now, 1, "suspend frees only the unpinned page");
-        assert_eq!(plan.freed_on_grace, 1, "pinned page carried as grace-deferred");
+        assert_eq!(
+            plan.freed_on_grace, 1,
+            "pinned page carried as grace-deferred"
+        );
         assert_eq!(slot(&ws, 0), Some(pinned_id), "pinned page still mapped");
         assert!(slot(&ws, 1).is_none(), "unpinned page stashed (Reserved)");
 
@@ -2529,8 +2600,14 @@ mod tests {
         let (id0, id1) = (slot(&ws, 0).unwrap(), slot(&ws, 1).unwrap());
 
         let mut plan = ws.stash_pages_warm(&mut a);
-        assert!(plan.stash.is_empty(), "nothing stashable without CPU headroom");
-        assert!(plan.cold.is_empty(), "cold is never populated (no replay path)");
+        assert!(
+            plan.stash.is_empty(),
+            "nothing stashable without CPU headroom"
+        );
+        assert!(
+            plan.cold.is_empty(),
+            "cold is never populated (no replay path)"
+        );
         let freed = ws.commit_suspend(&mut plan, &mut a, &mut cas);
         assert_eq!(freed, 0, "no blocks freed — pages kept resident");
         assert_eq!(slot(&ws, 0), Some(id0), "slot 0 still mapped");
@@ -2557,9 +2634,15 @@ mod tests {
         let plan = ws.suspend_pages_warm(&mut a, &mut cas);
         assert_eq!(plan.stash.len(), 2, "both owned pages stashed");
         assert_eq!(plan.freed_now, 2, "both blocks freed now (unpinned set)");
-        assert_eq!(plan.freed_on_grace, 0, "nothing grace-held on an unpinned set");
+        assert_eq!(
+            plan.freed_on_grace, 0,
+            "nothing grace-held on an unpinned set"
+        );
         assert_eq!(a.used(ArenaKind::KvPage), 0, "GPU blocks reclaimed");
-        assert!(slot(&ws, 0).is_none(), "slot repointed to Reserved (off-GPU)");
+        assert!(
+            slot(&ws, 0).is_none(),
+            "slot repointed to Reserved (off-GPU)"
+        );
 
         // Restore: H2D back to fresh GPU blocks; slot ids preserved.
         let moves = ws.restore_pages_warm(&mut a, &plan).unwrap();
@@ -2589,7 +2672,11 @@ mod tests {
         let mut plan = ws.stash_pages_warm(&mut a);
         assert_eq!(plan.stash.len(), 2);
         assert_eq!(plan.freed_now, 0, "nothing freed at stage yet");
-        assert_eq!(a.used(ArenaKind::KvPage), 2, "GPU NOT freed at stage (race fix)");
+        assert_eq!(
+            a.used(ArenaKind::KvPage),
+            2,
+            "GPU NOT freed at stage (race fix)"
+        );
         assert_eq!(
             a.residency(id0).unwrap(),
             crate::arena::Residency::Gpu,
@@ -2635,7 +2722,11 @@ mod tests {
 
         // A lost restore race: another lane grabs one of the two freed GPU blocks.
         let hog = a.alloc(ArenaKind::KvPage, 1).unwrap();
-        assert_eq!(a.available(ArenaKind::KvPage), 1, "only 1 free, restore needs 2");
+        assert_eq!(
+            a.available(ArenaKind::KvPage),
+            1,
+            "only 1 free, restore needs 2"
+        );
 
         let r = ws.restore_pages_warm(&mut a, &plan);
         assert!(
@@ -2745,12 +2836,23 @@ mod tests {
         let (target, _mv) = ws.cow_write_slot(wtx, 0, &mut txn, &mut a).unwrap();
         a.txn_pin(&mut txn, target).unwrap();
         let written = slot(&ws, 0);
-        assert_ne!(written, Some(committed), "slot repointed to the in-flight target");
+        assert_ne!(
+            written,
+            Some(committed),
+            "slot repointed to the in-flight target"
+        );
 
         // Suspend must LEAVE the in-flight write intact.
         let plan = ws.suspend_pages_warm(&mut a, &mut cas);
-        assert!(!ws.pending.is_empty(), "in-flight write-txn PRESERVED (not aborted)");
-        assert_eq!(slot(&ws, 0), written, "slot still points at the pinned target");
+        assert!(
+            !ws.pending.is_empty(),
+            "in-flight write-txn PRESERVED (not aborted)"
+        );
+        assert_eq!(
+            slot(&ws, 0),
+            written,
+            "slot still points at the pinned target"
+        );
         assert_eq!(
             a.residency(target).unwrap(),
             crate::arena::Residency::Gpu,
@@ -2803,8 +2905,16 @@ mod tests {
 
         // Keep slot0[0..2] (2 tok) + slot2[1..4] (3 tok) = 5 tok ⇒ 2 fresh pages.
         let runs = [
-            TokenRun { src_slot: 0, start: 0, len: 2 },
-            TokenRun { src_slot: 2, start: 1, len: 3 },
+            TokenRun {
+                src_slot: 0,
+                start: 0,
+                len: 2,
+            },
+            TokenRun {
+                src_slot: 2,
+                start: 1,
+                len: 3,
+            },
         ];
         // src pages captured before compact (they are freed after).
         let src0_pg = a.blocks(slot(&ws, 0).unwrap()).unwrap()[0];
@@ -2826,9 +2936,27 @@ mod tests {
         assert_eq!(
             remap.gather,
             vec![
-                GatherOp { src_slot: 0, src_off: 0, dst_slot: ns0, dst_off: 0, len: 2 },
-                GatherOp { src_slot: 2, src_off: 1, dst_slot: ns0, dst_off: 2, len: 2 },
-                GatherOp { src_slot: 2, src_off: 3, dst_slot: ns1, dst_off: 0, len: 1 },
+                GatherOp {
+                    src_slot: 0,
+                    src_off: 0,
+                    dst_slot: ns0,
+                    dst_off: 0,
+                    len: 2
+                },
+                GatherOp {
+                    src_slot: 2,
+                    src_off: 1,
+                    dst_slot: ns0,
+                    dst_off: 2,
+                    len: 2
+                },
+                GatherOp {
+                    src_slot: 2,
+                    src_off: 3,
+                    dst_slot: ns1,
+                    dst_off: 0,
+                    len: 1
+                },
             ]
         );
         // The page-level plan the gather received: same ops resolved to physical
@@ -2839,9 +2967,27 @@ mod tests {
         assert_eq!(
             remap.page_gather,
             vec![
-                PageGatherOp { src_page: src0_pg, src_off: 0, dst_page: ns0_pg, dst_off: 0, len: 2 },
-                PageGatherOp { src_page: src2_pg, src_off: 1, dst_page: ns0_pg, dst_off: 2, len: 2 },
-                PageGatherOp { src_page: src2_pg, src_off: 3, dst_page: ns1_pg, dst_off: 0, len: 1 },
+                PageGatherOp {
+                    src_page: src0_pg,
+                    src_off: 0,
+                    dst_page: ns0_pg,
+                    dst_off: 0,
+                    len: 2
+                },
+                PageGatherOp {
+                    src_page: src2_pg,
+                    src_off: 1,
+                    dst_page: ns0_pg,
+                    dst_off: 2,
+                    len: 2
+                },
+                PageGatherOp {
+                    src_page: src2_pg,
+                    src_off: 3,
+                    dst_page: ns1_pg,
+                    dst_off: 0,
+                    len: 1
+                },
             ]
         );
         assert_eq!(remap.freed_slots, vec![0, 2]); // src slots freed
@@ -2875,7 +3021,11 @@ mod tests {
         ws.reorder(&[0, 1, 2, 3]).unwrap();
         assert_eq!(ws.generation(), 1); // reorder: bump
 
-        let runs = [TokenRun { src_slot: 0, start: 0, len: 1 }];
+        let runs = [TokenRun {
+            src_slot: 0,
+            start: 0,
+            len: 1,
+        }];
         ws.compact(&runs, &mut a, &mut cas, |_| {}).unwrap();
         assert_eq!(ws.generation(), 2); // compact: bump
 
@@ -2904,9 +3054,21 @@ mod tests {
         // Compact the survivors: shared prefix (slots 0,1 full = 8 tok) + the live
         // lane's tail (slot 2 [0,2) = 2 tok) = 10 live tokens ⇒ 3 packed pages.
         let live_runs = [
-            TokenRun { src_slot: 0, start: 0, len: 4 },
-            TokenRun { src_slot: 1, start: 0, len: 4 },
-            TokenRun { src_slot: 2, start: 0, len: 2 },
+            TokenRun {
+                src_slot: 0,
+                start: 0,
+                len: 4,
+            },
+            TokenRun {
+                src_slot: 1,
+                start: 0,
+                len: 4,
+            },
+            TokenRun {
+                src_slot: 2,
+                start: 0,
+                len: 2,
+            },
         ];
         let live_tokens: u32 = live_runs.iter().map(|r| r.len).sum();
         let total_tokens = 5 * PAGE; // 5 pages fully materialised
@@ -2961,9 +3123,20 @@ mod tests {
             ws.commit_writes(wtx);
 
             // RETENTION: the tail page is unchanged and still live at rc≥1.
-            assert_eq!(slot(&ws, 0), Some(page0), "fire {fire}: tail ObjectId churned");
-            assert_eq!(a.blocks(page0).unwrap()[0], block0, "fire {fire}: block moved");
-            assert!(a.refcount(page0).unwrap() >= 1, "fire {fire}: tail page freed!");
+            assert_eq!(
+                slot(&ws, 0),
+                Some(page0),
+                "fire {fire}: tail ObjectId churned"
+            );
+            assert_eq!(
+                a.blocks(page0).unwrap()[0],
+                block0,
+                "fire {fire}: block moved"
+            );
+            assert!(
+                a.refcount(page0).unwrap() >= 1,
+                "fire {fire}: tail page freed!"
+            );
 
             // A concurrent request's fresh alloc must NOT be handed the live block.
             let other = a.alloc(ArenaKind::KvPage, 1).unwrap();
@@ -3014,5 +3187,4 @@ mod tests {
         wb.destroy(&mut a, &mut cas);
         assert_eq!(a.live_objects(), 0, "leaked pages");
     }
-
 }

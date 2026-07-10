@@ -5,8 +5,7 @@
 //! serving). The [`edge`](crate::edge) frames in this crate embed them, and the
 //! public `pie-client` crate re-exports them.
 //!
-//! Plain serde vocabulary — deliberately NOT `#[schema]`/rkyv (it never rides
-//! the zero-copy tensor ring), so it is NOT part of `SCHEMA_HASH`.
+//! Plain serde vocabulary, independent of the local runtime-driver ABI.
 
 use serde::{Deserialize, Serialize};
 

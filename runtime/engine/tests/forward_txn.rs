@@ -16,10 +16,10 @@
 //! depend on the working-set WIT constructor wiring.
 
 use pie_engine::arena::{Arena, ArenaConfig};
-use pie_engine::working_set::page_hash::compute_page_hashes;
 use pie_engine::inference::paging::{KvWrite, check_input_nonempty, project_kv};
 use pie_engine::working_set::kv::{KvCas, KvWorkingSet};
-use pie_driver_abi::Brle;
+use pie_engine::working_set::page_hash::compute_page_hashes;
+use pie_grammar::brle::RunMask;
 
 const PAGE: u32 = 4;
 
@@ -85,7 +85,11 @@ fn gate_overlapping_read_write() {
     }];
     let proj = project_kv(&ctx_pages, 12, &writes, PAGE).unwrap();
 
-    assert_eq!(proj.physical_page_ids.len(), 3, "active run covers slots 0..3");
+    assert_eq!(
+        proj.physical_page_ids.len(),
+        3,
+        "active run covers slots 0..3"
+    );
     assert_eq!(proj.physical_page_ids[0], ctx_pages[0]);
     assert_eq!(
         proj.physical_page_ids[1], out_page,
@@ -127,7 +131,11 @@ fn gate_cow_before_write() {
     a.txn_commit(txn).unwrap();
     ws1.commit_writes(wtx);
 
-    assert_eq!(ws1.resolve_read(0, 1).unwrap()[0], new_obj, "writer diverged");
+    assert_eq!(
+        ws1.resolve_read(0, 1).unwrap()[0],
+        new_obj,
+        "writer diverged"
+    );
     assert_eq!(
         ws2.resolve_read(0, 1).unwrap()[0],
         obj_orig,
@@ -173,7 +181,11 @@ fn gate_driver_failure_abort() {
         obj_orig,
         "aborted writer reverted to the prior mapping"
     );
-    assert_eq!(ws2.resolve_read(0, 1).unwrap()[0], obj_orig, "sharer untouched");
+    assert_eq!(
+        ws2.resolve_read(0, 1).unwrap()[0],
+        obj_orig,
+        "sharer untouched"
+    );
     assert_eq!(
         a.refcount(obj_orig).unwrap(),
         2,
@@ -196,9 +208,9 @@ fn gate_cas_seal_on_completion() {
 
     let tokens = vec![10u32, 11, 12, 13];
     let positions = vec![0u32, 1, 2, 3];
-    let masks: Vec<Brle> = positions
+    let masks: Vec<RunMask> = positions
         .iter()
-        .map(|&p| Brle::all_true((p + 1) as usize))
+        .map(|&p| RunMask::all_true((p + 1) as usize))
         .collect();
     let hash = compute_page_hashes(PAGE as usize, &tokens, &positions, &masks, 0, None)[0];
 
@@ -216,7 +228,11 @@ fn gate_cas_seal_on_completion() {
     assert_ne!(dup, canonical, "distinct object before sealing");
     ws2.seal(0, hash, &mut a, &mut cas).unwrap();
 
-    assert_eq!(cas.len(), 1, "identical page reuses the canonical, no new entry");
+    assert_eq!(
+        cas.len(),
+        1,
+        "identical page reuses the canonical, no new entry"
+    );
     assert_eq!(
         ws2.resolve_read(0, 1).unwrap()[0],
         canonical,
@@ -228,8 +244,17 @@ fn gate_cas_seal_on_completion() {
 /// so `execute()` never calls `seal` on it — it stays private-dirty (W7).
 #[test]
 fn gate_partial_page_never_sealed() {
-    let proj = project_kv(&[], 0, &[KvWrite { slot_index: 0, page: 100, valid_len: 3 }], PAGE)
-        .unwrap();
+    let proj = project_kv(
+        &[],
+        0,
+        &[KvWrite {
+            slot_index: 0,
+            page: 100,
+            valid_len: 3,
+        }],
+        PAGE,
+    )
+    .unwrap();
     assert!(
         proj.full_page_writes.is_empty(),
         "a partial page is not seal-eligible"
@@ -257,16 +282,38 @@ fn gate_prepare_validation_edges() {
     );
 
     let cur_gen = ws.generation();
-    assert!(ws.resolve_write(&[0, 0], cur_gen).is_err(), "duplicate index rejected");
-    assert!(ws.resolve_write(&[99], cur_gen).is_err(), "out-of-range index rejected");
-    assert!(ws.resolve_write(&[0, 2], cur_gen).is_ok(), "valid indices accepted");
+    assert!(
+        ws.resolve_write(&[0, 0], cur_gen).is_err(),
+        "duplicate index rejected"
+    );
+    assert!(
+        ws.resolve_write(&[99], cur_gen).is_err(),
+        "out-of-range index rejected"
+    );
+    assert!(
+        ws.resolve_write(&[0, 2], cur_gen).is_ok(),
+        "valid indices accepted"
+    );
 
     // A read window past the end is rejected before any arena work.
-    assert!(ws.resolve_read(0, 99).is_err(), "out-of-range read rejected");
+    assert!(
+        ws.resolve_read(0, 99).is_err(),
+        "out-of-range read rejected"
+    );
 
     // The projection rejects a non-contiguous active run the v1 ABI can't express.
     assert!(
-        project_kv(&[100], 4, &[KvWrite { slot_index: 3, page: 103, valid_len: 1 }], PAGE).is_err(),
+        project_kv(
+            &[100],
+            4,
+            &[KvWrite {
+                slot_index: 3,
+                page: 103,
+                valid_len: 1
+            }],
+            PAGE
+        )
+        .is_err(),
         "non-contiguous output rejected"
     );
 }

@@ -14,7 +14,7 @@ mod common;
 
 #[test]
 #[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda + a local model snapshot; one boot per process"]
-fn cuda_native_text_completion_decodes() {
+fn cuda_native_text_and_device_geometry_decode() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         // (1) Boot the embedded cuda engine in-proc (loads the model onto the GPU
@@ -32,6 +32,20 @@ fn cuda_native_text_completion_decodes() {
         assert!(
             !text.trim().is_empty(),
             "cuda forward must decode non-empty text, got empty"
+        );
+
+        // (4) Exercise the PTIR device-geometry wire form: all model geometry is
+        // loop-carried through channels while the borrowed launch slices stay empty.
+        let device_geometry = common::spawn_inferlet(
+            "windowed-attention",
+            r#"{"max_tokens":2,"window_size":2}"#,
+        )
+        .await
+        .expect("device-geometry inferlet errored on cuda");
+        eprintln!("[cuda_forward] DEVICE_GEOMETRY = {device_geometry:?}");
+        assert!(
+            device_geometry.starts_with("WINDOWED_ATTENTION"),
+            "device-geometry inferlet returned an unexpected verdict: {device_geometry}"
         );
 
         worker.shutdown().await;

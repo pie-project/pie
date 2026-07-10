@@ -222,8 +222,6 @@ def build_config(args: argparse.Namespace):
                     type=args.driver,
                     device=device,
                     tensor_parallel_size=args.tp_size,
-                    ipc_profile=args.ipc_profile,
-                    spin_budget_us=args.spin_budget_us,
                     options=driver_options,
                 ),
             )
@@ -669,40 +667,9 @@ async def run(args: argparse.Namespace):
                     ("default.fire.execute.total_us", "fire.execute.total_us"),
                     ("default.fire.execute.batch_build_us", "fire.execute.batch_build_us"),
                     ("default.fire.execute.driver_fire_us", "fire.execute.driver_fire_us"),
-                    ("default.fire.execute.response_dispatch.total_us", "fire.execute.response_dispatch.total_us"),
-                    ("default.fire.execute.response_dispatch.direct_count", "fire.execute.response_dispatch.direct_count"),
-                    ("default.fire.execute.response_dispatch.chain_count", "fire.execute.response_dispatch.chain_count"),
-                    ("default.fire.execute.response_dispatch.chunk_count", "fire.execute.response_dispatch.chunk_count"),
-                    ("default.fire.execute.driver_cuda.ipc_submit_us", "fire.execute.driver_cuda.ipc_submit_us"),
-                    ("default.fire.execute.driver_cuda.gpu_wait_us", "fire.execute.driver_cuda.gpu_wait_us"),
-                    ("default.fire.execute.driver_cuda.ipc_recv_us", "fire.execute.driver_cuda.ipc_recv_us"),
-                    ("default.fire.execute.driver_cuda.wire_parse_us", "fire.execute.driver_cuda.wire_parse_us"),
-                    ("default.fire.execute.driver_cuda.plan_us", "fire.execute.driver_cuda.plan_us"),
-                    ("default.fire.execute.driver_cuda.h2d_us", "fire.execute.driver_cuda.h2d_us"),
-                    ("default.fire.execute.driver_cuda.kernel_launch_us", "fire.execute.driver_cuda.kernel_launch_us"),
-                    ("default.fire.execute.driver_cuda.sync_us", "fire.execute.driver_cuda.sync_us"),
-                    ("default.fire.execute.driver_cuda.response_build_us", "fire.execute.driver_cuda.response_build_us"),
-                    ("default.fire.execute.driver_cuda.sum_sync_us", "fire.execute.driver_cuda.sum_sync_us"),
-                    ("default.fire.execute.driver_cuda.sum_kernel_launch_us", "fire.execute.driver_cuda.sum_kernel_launch_us"),
                     ("default.cumulative_batch_latency_us", "cumulative_batch_latency_us"),
                     ("default.fire.post_dispatch.context_tick_us", "fire.post_dispatch.context_tick_us"),
                     ("default.fire.post_dispatch.stats_update_us", "fire.post_dispatch.stats_update_us"),
-                    (
-                        "default.system_spec_draft_tokens_proposed",
-                        "system spec draft tokens proposed",
-                    ),
-                    (
-                        "default.system_spec_draft_tokens_accepted",
-                        "system spec draft tokens accepted",
-                    ),
-                    (
-                        "default.system_spec_draft_tokens_proposed_per_pos",
-                        "system spec draft tokens proposed per pos",
-                    ),
-                    (
-                        "default.system_spec_draft_tokens_accepted_per_pos",
-                        "system spec draft tokens accepted per pos",
-                    ),
                     ("default.last_batch_latency_us", "last batch latency us"),
                     ("default.bypass_hits", "bypass hits"),
                     ("default.chain_submits", "chain submits"),
@@ -878,13 +845,6 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
         sp.add_argument("--venv", default=None,
                         help="Path to a Python venv for subprocess drivers (vllm/sglang/tensorrt_llm/dev)")
-        sp.add_argument(
-            "--ipc-profile",
-            default=None,
-            choices=["latency", "balanced", "power"],
-            help="Driver IPC wait profile. latency uses the polling in-process channel.",
-        )
-        sp.add_argument("--spin-budget-us", type=int, default=None)
     return p
 
 

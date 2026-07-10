@@ -13,11 +13,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::bitmask::{self, set_bit};
+use crate::brle::RunMask;
 use crate::compiled_grammar::CompiledGrammar;
 use crate::fsm::{FsmEdge, StateId};
 use crate::grammar::Grammar;
 use pie_tokenizer::Tokenizer;
-use pie_driver_abi::Brle;
 
 use single_dfa::SingleDfaEngine;
 use stack_parser::{SmallDedup, StackParser, StackState};
@@ -248,11 +248,11 @@ impl GrammarMatcher {
         }
     }
 
-    /// Fill the next-token bitmask and return it as a [`Brle`].
-    pub fn fill_next_token_brle(&mut self) -> Brle {
+    /// Fill the next-token bitmask and return it as a [`RunMask`].
+    pub fn fill_next_token_brle(&mut self) -> RunMask {
         let mut scratch = std::mem::take(&mut self.bitmask_scratch);
         self.fill_next_token_bitmask(&mut scratch);
-        let brle = Brle::from_bitmask(&scratch, self.tokenizer.vocab_size());
+        let brle = RunMask::from_bitmask(&scratch, self.tokenizer.vocab_size());
         self.bitmask_scratch = scratch;
         brle
     }
@@ -260,7 +260,7 @@ impl GrammarMatcher {
     /// Fill the next-token bitmask and return it as a packed `[ceil(vocab/32)]`
     /// `u32` allowed-token bitmask (bit `i` set ⇒ token `i` allowed) — the
     /// de-hardwired `mask-apply` (`0x65`) mask operand. Exposes the packed bits
-    /// directly, without the `Brle` round-trip the old wire shape needed.
+    /// directly, without the `RunMask` round-trip the old wire shape needed.
     pub fn fill_next_token_mask(&mut self) -> Vec<u32> {
         let mut scratch = std::mem::take(&mut self.bitmask_scratch);
         self.fill_next_token_bitmask(&mut scratch);
@@ -982,9 +982,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_smoke() {
-        use crate::json_schema::{
-            JsonSchemaOptions, json_schema_to_grammar,
-        };
+        use crate::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
         let schema = r#"{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}"#;
         let opts = JsonSchemaOptions {
             any_whitespace: false,
@@ -1120,9 +1118,7 @@ mod tests {
     #[test]
     fn test_steady_state_json_schema() {
         // Test with actual JSON schema grammar (the primary use case)
-        use crate::json_schema::{
-            JsonSchemaOptions, json_schema_to_grammar,
-        };
+        use crate::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
         let schema =
             r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
         let opts = JsonSchemaOptions {
@@ -1170,9 +1166,7 @@ ws ::= [ \t\n\r]*
     #[test]
     fn test_chain_shortcircuit_long_string() {
         // Verify chain short-circuit handles long strings without O(N^2) blowup
-        use crate::json_schema::{
-            JsonSchemaOptions, json_schema_to_grammar,
-        };
+        use crate::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
         let schema =
             r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
         let opts = JsonSchemaOptions {

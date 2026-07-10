@@ -393,17 +393,6 @@ pub struct DriverConfig {
     pub activation_dtype: String,
     #[serde(default = "default_random_seed")]
     pub random_seed: u64,
-    /// IPC wait profile. When omitted, CUDA defaults to `latency`;
-    /// other drivers default to the hybrid `balanced` path.
-    /// `power` parks immediately whenever no work is ready.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipc_profile: Option<IpcProfile>,
-    /// Expert override for the profile's busy-spin window, in µs.
-    ///
-    /// Leave unset for the profile default. `0` parks immediately;
-    /// larger values trade CPU for lower wake latency.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spin_budget_us: Option<u64>,
     /// Driver-specific knobs. Embedded drivers parse this into typed
     /// option structs.
     #[serde(default)]
@@ -411,22 +400,6 @@ pub struct DriverConfig {
 }
 
 impl DriverConfig {
-    pub fn effective_ipc_profile(&self) -> IpcProfile {
-        self.ipc_profile.unwrap_or(match self.kind {
-            DriverKind::CudaNative => IpcProfile::Latency,
-            _ => IpcProfile::Balanced,
-        })
-    }
-
-    pub fn effective_spin_budget_us(&self) -> u64 {
-        self.spin_budget_us
-            .unwrap_or_else(|| self.effective_ipc_profile().default_spin_budget_us())
-    }
-
-    pub fn use_inproc_polling_channel(&self) -> bool {
-        self.effective_ipc_profile() == IpcProfile::Latency
-    }
-
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.device.is_empty(),
@@ -492,30 +465,6 @@ fn validate_kv_cache_dtype(value: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum IpcProfile {
-    /// Lowest wake latency. Uses the polling in-process channel for
-    /// embedded drivers and unbounded busy-spin for shmem drivers
-    /// unless `spin_budget_us` overrides it.
-    Latency,
-    /// Hybrid spin-then-park path. Good default for GPU-bound work.
-    #[default]
-    Balanced,
-    /// Park immediately after an empty poll. Minimizes idle CPU.
-    Power,
-}
-
-impl IpcProfile {
-    pub fn default_spin_budget_us(self) -> u64 {
-        match self {
-            Self::Latency => u64::MAX,
-            Self::Balanced => default_spin_budget_us(),
-            Self::Power => 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
@@ -549,12 +498,6 @@ fn default_activation_dtype() -> String {
 fn default_random_seed() -> u64 {
     42
 }
-/// Default busy-spin budget (µs) before the driver-side channel falls
-/// back to parking. Matches `pie_engine::driver::InProcChannel::new()`.
-fn default_spin_budget_us() -> u64 {
-    1_000
-}
-
 /// Accept either a single string or a list of strings, matching
 /// `pie/config.py::_parse_driver`'s `device` handling.
 fn deserialize_string_or_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
@@ -807,85 +750,7 @@ device = ["cpu"]
         cfg.validate().unwrap();
         assert_eq!(cfg.model.driver.kind, DriverKind::Metal);
         assert_eq!(cfg.model.driver.device, vec!["cpu".to_string()]);
-        assert_eq!(
-            cfg.model.driver.effective_ipc_profile(),
-            IpcProfile::Balanced
-        );
-        assert_eq!(cfg.model.driver.effective_spin_budget_us(), 1_000);
         assert_eq!(cfg.server.port, 8080);
-    }
-
-    #[test]
-    fn cuda_tp_defaults_to_latency_ipc() {
-        let text = r#"
-[model]
-name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
-
-[model.driver]
-type = "cuda_native"
-device = ["cuda:0"]
-tensor_parallel_size = 2
-
-[model.driver.options]
-gpu_mem_utilization = 0.90
-memory_profile = "balanced"
-"#;
-        let cfg: Config = toml::from_str(text).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(
-            cfg.model.driver.effective_ipc_profile(),
-            IpcProfile::Latency
-        );
-        assert!(cfg.model.driver.use_inproc_polling_channel());
-    }
-
-    #[test]
-    fn cuda_single_rank_defaults_to_latency_ipc() {
-        let text = r#"
-[model]
-name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
-
-[model.driver]
-type = "cuda_native"
-device = ["cuda:0"]
-
-[model.driver.options]
-gpu_mem_utilization = 0.90
-memory_profile = "balanced"
-"#;
-        let cfg: Config = toml::from_str(text).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(
-            cfg.model.driver.effective_ipc_profile(),
-            IpcProfile::Latency
-        );
-        assert!(cfg.model.driver.use_inproc_polling_channel());
-    }
-
-    #[test]
-    fn cuda_latency_profile_defaults_to_latency_ipc() {
-        let text = r#"
-[model]
-name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
-
-[model.driver]
-type = "cuda_native"
-device = ["cuda:0"]
-
-[model.driver.options]
-gpu_mem_utilization = 0.90
-memory_profile = "latency"
-"#;
-        let cfg: Config = toml::from_str(text).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(
-            cfg.model.driver.effective_ipc_profile(),
-            IpcProfile::Latency
-        );
-        assert!(cfg.model.driver.use_inproc_polling_channel());
     }
 
     #[test]
@@ -951,49 +816,6 @@ max_num_kv_pages = 1024
             };
             assert!(err.contains(key), "type={ty} key={key} got: {err}");
         }
-    }
-
-    #[test]
-    fn parses_ipc_profiles_and_spin_override() {
-        let latency = r#"
-[model]
-name = "m"
-hf_repo = "x"
-[model.driver]
-type = "metal"
-device = "cpu"
-ipc_profile = "latency"
-"#;
-        let cfg: Config = toml::from_str(latency).unwrap();
-        assert_eq!(cfg.model.driver.ipc_profile, Some(IpcProfile::Latency));
-        assert!(cfg.model.driver.use_inproc_polling_channel());
-        assert_eq!(cfg.model.driver.effective_spin_budget_us(), u64::MAX);
-
-        let power = r#"
-[model]
-name = "m"
-hf_repo = "x"
-[model.driver]
-type = "metal"
-device = "cpu"
-ipc_profile = "power"
-"#;
-        let cfg: Config = toml::from_str(power).unwrap();
-        assert_eq!(cfg.model.driver.ipc_profile, Some(IpcProfile::Power));
-        assert_eq!(cfg.model.driver.effective_spin_budget_us(), 0);
-
-        let override_spin = r#"
-[model]
-name = "m"
-hf_repo = "x"
-[model.driver]
-type = "metal"
-device = "cpu"
-ipc_profile = "latency"
-spin_budget_us = 25
-"#;
-        let cfg: Config = toml::from_str(override_spin).unwrap();
-        assert_eq!(cfg.model.driver.effective_spin_budget_us(), 25);
     }
 
     #[test]
@@ -1074,8 +896,7 @@ mtp_num_drafts = 6
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.model.driver.kind, DriverKind::CudaNative);
-        let opts: CudaNativeDriverOptions =
-            cfg.model.driver.options.clone().try_into().unwrap();
+        let opts: CudaNativeDriverOptions = cfg.model.driver.options.clone().try_into().unwrap();
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
         assert_eq!(opts.runtime_quant, "fp8");
@@ -1100,8 +921,7 @@ device = ["cuda:0"]
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
-        let opts: CudaNativeDriverOptions =
-            cfg.model.driver.options.clone().try_into().unwrap();
+        let opts: CudaNativeDriverOptions = cfg.model.driver.options.clone().try_into().unwrap();
         assert_eq!(opts.swap_pool_size, 0);
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Auto);

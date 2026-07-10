@@ -1,21 +1,18 @@
-//! Driver capability handshake — NOT a rkyv wire type.
+//! Cold create-time driver capabilities.
 //!
-//! Each driver advertises its capabilities (page geometry, forward limits,
-//! tokenizer arch, etc.) at startup via a JSON blob delivered to the runtime.
-//! The runtime parses it into [`DriverCapabilities`] for scheduling and
-//! batching decisions. The shape is wire-stable — fields appear verbatim
-//! in the driver's ready-callback JSON (see `driver/cuda/src/entry.cpp`,
-//! `driver/metal/src/entry.cpp`, `driver/dummy/src/lib.rs`).
-//!
-//! This is intentionally not under `#[schema]` — the handshake happens
-//! once at driver startup and uses JSON over a side channel, not the
-//! rkyv ring.
+//! Drivers return a versioned JSON document once at create time. The runtime uses
+//! the parsed [`DriverCapabilities`] for allocation ceilings, batching limits,
+//! model metadata, and weight-layout planning. Legacy IPC-only fields are
+//! intentionally gone from this final local contract.
 
 use serde::{Deserialize, Serialize};
 
 /// Static driver capabilities reported at handshake time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DriverCapabilities {
+    /// Local direct-FFI ABI version used by the capability payload.
+    pub abi_version: u32,
     /// Total KV pages available for context residency.
     pub total_pages: u32,
     /// KV page size in tokens.
@@ -31,35 +28,12 @@ pub struct DriverCapabilities {
     /// Bytes per recurrent-state slot, for accounting/telemetry.
     #[serde(default)]
     pub rs_cache_slot_bytes: u64,
-    /// True when the driver repairs recurrent state internally after
-    /// system-speculative draft rejection.
-    #[serde(default)]
-    pub rs_cache_spec_rollback: bool,
-    /// True when the driver wired a system drafter and can verify/return
-    /// system-provided speculative drafts (the capability signal).
-    #[serde(default)]
-    pub system_speculation_supported: bool,
-    /// Operator opt-in for system speculation (deployment config). The runtime
-    /// combines this with `system_speculation_supported` to decide whether to
-    /// drive drafts. Default false = off unless explicitly enabled.
-    #[serde(default)]
-    pub enable_system_speculation: bool,
     /// Maximum forward-pass tokens accepted in one driver fire.
     pub max_forward_tokens: u32,
     /// Maximum forward-pass requests accepted in one driver fire.
     pub max_forward_requests: u32,
     /// Maximum page references accepted in one driver fire.
     pub max_page_refs: u32,
-    /// Maximum logits rows the driver can return in one fire.
-    pub max_logit_rows: u32,
-    /// Maximum probability rows the driver can return in one fire.
-    pub max_prob_rows: u32,
-    /// Maximum custom-mask bytes accepted in one fire.
-    pub max_custom_mask_bytes: u32,
-    /// Maximum sampler rows accepted in one fire.
-    pub max_sampler_rows: u32,
-    /// Maximum logprob label count accepted in one fire.
-    pub max_logprob_labels: u32,
     /// Architecture name (e.g. `llama3`, `qwen3`) — used for tokenizer dispatch.
     pub arch_name: String,
     /// Vocabulary size — pinned by the loaded model.
@@ -95,10 +69,6 @@ pub struct DriverCapabilities {
     /// blocks/scales can stay quantized on device rather than dequantizing).
     #[serde(default)]
     pub native_mxfp4_moe: bool,
-    /// Optional shmem region name; only Some when the driver speaks shmem
-    /// (subprocess flavors). In-process drivers leave this absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shmem_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -110,17 +80,13 @@ mod tests {
     /// hints would emit.
     fn legacy_caps_json() -> &'static str {
         r#"{
+            "abi_version": 1,
             "total_pages": 1024,
             "kv_page_size": 16,
             "swap_pool_size": 0,
             "max_forward_tokens": 512,
             "max_forward_requests": 32,
             "max_page_refs": 4096,
-            "max_logit_rows": 512,
-            "max_prob_rows": 512,
-            "max_custom_mask_bytes": 0,
-            "max_sampler_rows": 512,
-            "max_logprob_labels": 0,
             "arch_name": "qwen3",
             "vocab_size": 151936,
             "max_model_len": 4096,
@@ -131,6 +97,7 @@ mod tests {
     #[test]
     fn storage_fields_default_to_neutral_when_absent() {
         let caps: DriverCapabilities = serde_json::from_str(legacy_caps_json()).unwrap();
+        assert_eq!(caps.abi_version, 1);
         assert_eq!(caps.storage_backend, "");
         assert_eq!(caps.max_tile_bytes, 0);
         assert_eq!(caps.preferred_alignment, 0);
@@ -153,5 +120,24 @@ mod tests {
         assert_eq!(back.preferred_alignment, 256);
         assert_eq!(back.mxfp4_moe_policy, "native_gemm");
         assert!(back.native_mxfp4_moe);
+    }
+
+    #[test]
+    fn deleted_legacy_fields_are_rejected() {
+        let json = r#"{
+            "abi_version": 1,
+            "total_pages": 1024,
+            "kv_page_size": 16,
+            "swap_pool_size": 0,
+            "max_forward_tokens": 512,
+            "max_forward_requests": 32,
+            "max_page_refs": 4096,
+            "arch_name": "qwen3",
+            "vocab_size": 151936,
+            "max_model_len": 4096,
+            "activation_dtype": "bf16",
+            "shmem_name": "/legacy"
+        }"#;
+        assert!(serde_json::from_str::<DriverCapabilities>(json).is_err());
     }
 }

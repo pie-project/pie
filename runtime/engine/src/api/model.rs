@@ -5,8 +5,8 @@
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use pie_model as model;
 use anyhow::Result;
+use pie_model as model;
 
 impl pie::inferlet::model::Host for InstanceState {
     async fn name(&mut self) -> Result<String> {
@@ -18,13 +18,7 @@ impl pie::inferlet::model::Host for InstanceState {
     }
 
     async fn default_system_speculation(&mut self) -> Result<bool> {
-        // The effective "speculate by default?" decision the SDK reflects: the
-        // model must support a system drafter AND the operator must have opted
-        // in (`enable_system_speculation`, default off). The runtime owns this
-        // decision; the SDK only requests system drafts when both hold. (Manual
-        // drafts are a separate path, gated in api/inference.rs.)
-        let m = model::model();
-        Ok(m.system_speculation_supported() && m.enable_system_speculation())
+        Ok(false)
     }
 
     /// Whether the bound model is linear/recurrent (carries a fused recurrent

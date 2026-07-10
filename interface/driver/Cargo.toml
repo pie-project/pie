@@ -3,7 +3,7 @@ name = "pie-driver-abi"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Canonical runtime↔driver ABI vocabulary for pie: the rkyv wire ring (schema/pod/brle), the repr(C) POD descriptors + generated C header, the DriverCapabilities handshake, and the KV layout/handle types."
+description = "Canonical runtime↔driver ABI vocabulary for pie: direct local FFI descriptors, the generated C header, create-time capabilities JSON, and Rust-only transfer types."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -18,22 +18,8 @@ crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-# `DriverCapabilities` (JSON handshake) + the KV layout types are plain serde.
+# `DriverCapabilities` (JSON handshake) + the transfer layout types are plain serde.
 serde = { version = "1.0", features = ["derive"] }
-# Derive macro: emits the `repr(C) Pie<T>Desc` + `as_desc`/`from_desc`
-# (in-proc Rust↔C++ surface) + the rkyv derive, from each schema type.
-pie-driver-abi-derive = { path = "derive" }
-# Canonical schema serialization. Zero-copy reads via `rkyv::access`,
-# owned reads via `rkyv::deserialize`.
-rkyv = { version = "0.8", default-features = false, features = [
-    "std",
-    "alloc",
-    "bytecheck",
-] }
-
-[build-dependencies]
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
-# `DriverCapabilities` handshake JSON round-trip tests.
 serde_json = "1.0"

@@ -62,10 +62,13 @@ impl pie::inferlet::working_set::HostRsWorkingSet for InstanceState {
         n: u32,
     ) -> Result<Result<pie::inferlet::working_set::PageRange, String>> {
         let ws = self.ctx().table.get_mut(&this)?;
-        Ok(ws.alloc_buffer(n).map(|r| pie::inferlet::working_set::PageRange {
-            start: r.start,
-            len: r.len,
-        }).map_err(|e| e.to_string()))
+        Ok(ws
+            .alloc_buffer(n)
+            .map(|r| pie::inferlet::working_set::PageRange {
+                start: r.start,
+                len: r.len,
+            })
+            .map_err(|e| e.to_string()))
     }
 
     /// Remove buffered slots at `indices` and densely compact. Decrefs any
@@ -84,7 +87,8 @@ impl pie::inferlet::working_set::HostRsWorkingSet for InstanceState {
             let arena = crate::arena::get(model_id, driver);
             let mut guard = arena.lock().unwrap();
             let ws = self.ctx().table.get_mut(&this)?;
-            ws.free_buffer(&mut guard, &indices).map_err(|e| e.to_string())
+            ws.free_buffer(&mut guard, &indices)
+                .map_err(|e| e.to_string())
         };
         Ok(res)
     }

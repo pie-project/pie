@@ -5,8 +5,8 @@
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use pie_model::instruct::{ChatDecoder, ChatEvent};
 use anyhow::Result;
+use pie_model::instruct::{ChatDecoder, ChatEvent};
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 

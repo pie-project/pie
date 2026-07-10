@@ -39,19 +39,31 @@ pub struct LogStream {
 
 impl LogStream {
     pub fn new_stdout(process_id: ProcessId) -> Self {
-        LogStream { dest: Dest::Process(process_id), is_stderr: false }
+        LogStream {
+            dest: Dest::Process(process_id),
+            is_stderr: false,
+        }
     }
 
     pub fn new_stderr(process_id: ProcessId) -> Self {
-        LogStream { dest: Dest::Process(process_id), is_stderr: true }
+        LogStream {
+            dest: Dest::Process(process_id),
+            is_stderr: true,
+        }
     }
 
     pub fn new_server_stdout(program: Arc<str>) -> Self {
-        LogStream { dest: Dest::Log(program), is_stderr: false }
+        LogStream {
+            dest: Dest::Log(program),
+            is_stderr: false,
+        }
     }
 
     pub fn new_server_stderr(program: Arc<str>) -> Self {
-        LogStream { dest: Dest::Log(program), is_stderr: true }
+        LogStream {
+            dest: Dest::Log(program),
+            is_stderr: true,
+        }
     }
 
     /// Dispatch output to its destination.

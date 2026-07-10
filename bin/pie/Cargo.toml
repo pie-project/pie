@@ -26,7 +26,6 @@ driver-cuda = ["pie-worker/driver-cuda"]
 driver-dummy = ["pie-worker/driver-dummy"]
 # Probe passthroughs to the embedded worker (→ runtime).
 profile-fire = ["pie-worker/profile-fire"]
-profile-driver-cuda = ["pie-worker/profile-driver-cuda"]
 
 [dependencies]
 # Shared process skeleton (CLI flags, paths, tracing, signals, /metrics, banner).

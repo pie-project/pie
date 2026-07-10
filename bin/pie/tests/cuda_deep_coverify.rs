@@ -22,10 +22,10 @@
 //! co-batched with their own head) while co-batching ACROSS pipelines into dense
 //! waves — so byte-identity (1) and density (2) hold together.
 //!
-//! `#[ignore]`, driver-cuda + run-ahead + profile-fire. Run:
+//! `#[ignore]`, driver-cuda + profile-fire. Run:
 //!   PIE_COMPILER_LAUNCHER=env RUSTC_WRAPPER=sccache CUDACXX=/usr/local/cuda/bin/nvcc \
 //!   CPM_SOURCE_CACHE=$HOME/.cache/pie-cpm \
-//!   cargo test -p pie-bin --features driver-cuda,run-ahead,profile-fire \
+//!   cargo test -p pie-bin --features driver-cuda,profile-fire \
 //!     --test cuda_deep_coverify -- --ignored --nocapture
 //!
 //! Config knobs (finalized to bravo's `lowlevel-chat` pilot on
@@ -45,7 +45,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use pie_client::client::Client;
 
-/// Fleet width — the 8-pipeline homogeneous decode fleet (matches cuda_bubble).
+/// Fleet width — the 8-pipeline homogeneous decode fleet.
 const FLEET: usize = 8;
 
 /// Chain depth k = the in-flight cap. bravo's `decode_pipelined_deep(k)` submits
@@ -89,7 +89,7 @@ fn pipeline_match_ok(json: &str) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "piece-2 co-verify: needs the 4090 + cuda + qwen-3-0.6b + bravo's decode_pipelined_deep; run under --features run-ahead,profile-fire"]
+#[ignore = "piece-2 co-verify: needs the 4090 + cuda + qwen-3-0.6b + decode_pipelined_deep"]
 async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
     let k = depth();
     // Scheduler policy + cap MUST be selected pre-boot (OnceLock read at loop

@@ -27,11 +27,11 @@ members = [
     "driver/transport",
     "client/rust",
     # Interface crates — boundary-named contracts (see designs/design-interface-restructure).
-    # ids: deduped id atoms (plain serde leaf). driver: rkyv ring + POD + capabilities + kv,
-    # with its 2 codegen tools. controller/worker/client: control-plane, data-plane, public-edge.
+    # ids: deduped id atoms (plain serde leaf). driver: direct local FFI ABI +
+    # cold capabilities + transfer vocabulary, with its cbindgen tool.
+    # controller/worker/client: control-plane, data-plane, public-edge.
     "interface/ids",
     "interface/driver",
-    "interface/driver/derive",
     "interface/driver/cbindgen",
     "interface/controller",
     "interface/worker",
@@ -40,7 +40,6 @@ members = [
     # (stage-tagged trace container + validation + versioned wire format).
     # `no_std` core; the wasm SDK depends on it with `default-features = false`.
     "interface/ptir",
-    "driver/ipc",
     "driver/dummy",
     "driver/weight-loader",
     "sdk/python-server",

@@ -40,8 +40,9 @@ pub fn register_cas(num_drivers: usize) -> usize {
 /// The KV CAS index for `(model_idx, driver_idx)`. Panics if the model/driver was
 /// not registered at bootstrap (a wiring bug, not a runtime input error).
 pub fn get(model_idx: usize, driver_idx: usize) -> Arc<Mutex<KvCas>> {
-    try_get(model_idx, driver_idx)
-        .unwrap_or_else(|| panic!("kv_cas: no CAS index for (model {model_idx}, driver {driver_idx})"))
+    try_get(model_idx, driver_idx).unwrap_or_else(|| {
+        panic!("kv_cas: no CAS index for (model {model_idx}, driver {driver_idx})")
+    })
 }
 
 /// Fallible accessor: `None` if `(model_idx, driver_idx)` is not registered.

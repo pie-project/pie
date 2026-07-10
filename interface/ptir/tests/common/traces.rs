@@ -290,4 +290,3 @@ pub fn beam_trace() -> TraceContainer {
 pub fn beam_profile() -> ModelProfile {
     ModelProfile { vocab: V, page_size: PAGE, num_layers: 2, ..ModelProfile::dummy() }
 }
-

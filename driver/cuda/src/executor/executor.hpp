@@ -1,9 +1,7 @@
 #pragma once
 
-// Forward executor for the `fire_batch` inproc method. Owns the per-
-// device persistent state (workspaces, KV cache, attention scratch,
-// graph cache) and dispatches each fire through ForwardFn onto the
-// active IModel implementation.
+// Forward executor for direct PTIR launches. Owns the per-device persistent
+// state and dispatches each fire through ForwardFn onto the active IModel.
 
 #include <cstddef>
 #include <cstdint>
@@ -11,18 +9,18 @@
 #include <span>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 #include <atomic>
-#include <deque>
 #include <map>
 
 #include "distributed.hpp"
 #include "executor/forward_graph.hpp"
-#include <pie_driver_abi/view.hpp>
+#include "pie_native/launch_view.hpp"
 #include "model/llama_like.hpp"
 #include "executor/persistent_inputs.hpp"
-#include <pie_driver_abi/response_builder.hpp>
 #include <memory>
+#include <pie_driver_abi.h>
 
 #include "ptir/ptir_dispatch.hpp"
 
@@ -133,8 +131,8 @@ struct ForwardFn {
         // ordinary text fires (which always sample ≥ 1 row) are unaffected.
         bool emit_logits = true;
 
-        // Sampling hint: if the executor only needs argmax, body may skip
-        // dense logits and write straight into the fused-argmax output.
+        // Internal TP/graph hint; direct PTIR launches leave this disabled so
+        // the selected logits remain available to the stage program.
         bool tp_greedy_argmax = false;
 
         // Recurrent-only commit-advance: when non-null, the forward runs ONLY
@@ -228,32 +226,6 @@ struct ForwardFn {
     bool invoke_fused_argmax_done();
 };
 
-struct SystemSpecDraftRequest {
-    int request_index = -1;
-    int source_row = -1;
-    std::uint32_t accepted_token = 0;
-    std::uint32_t source_position = 0;
-    std::uint32_t first_draft_position = 0;
-    int last_match = -1;
-    int last_num_drafts = 0;
-};
-
-struct SystemSpecDraftInputs {
-    model::Qwen3Workspace& target_ws;
-    KvCache& kv_cache;
-    AttentionWorkspace& attn_ws;
-    ops::CublasHandle& cublas;
-    std::span<const SystemSpecDraftRequest> requests;
-    std::span<const std::uint32_t> kv_page_indices;
-    std::span<const std::uint32_t> kv_page_indptr;
-    int page_size = 0;
-    int max_drafts = 0;
-};
-
-using NativeSystemDraftNextFn = std::function<void(
-    const SystemSpecDraftInputs&,
-    std::span<pie_driver::PerRequestOutput>)>;
-
 struct NativeSystemCommitInputs {
     model::Qwen3Workspace& target_ws;
     KvCache& kv_cache;
@@ -306,17 +278,12 @@ struct NativeSystemDrafter {
     // Optional phase used by drafters that maintain native cache/recurrent
     // state for the prefix that target verification accepted.
     CommitVerifiedPrefixFn commit_verified_prefix;
-    // Generic model-owned drafter. Gemma4 MTP implements the whole draft loop
-    // behind this callback.
-    NativeSystemDraftNextFn draft_next;
     // Lower-level single-step drafter. The executor can chain this on GPU while
-    // keeping shared response plumbing model-neutral.
+    // keeping the implementation model-neutral.
     DraftStepFn draft_step;
 
     explicit operator bool() const noexcept {
-        return max_drafts > 0 &&
-               (static_cast<bool>(draft_next) ||
-                static_cast<bool>(draft_step));
+        return max_drafts > 0 && static_cast<bool>(draft_step);
     }
 };
 
@@ -324,6 +291,41 @@ struct NativeSystemDrafter {
 // once after loaded-model/workspace allocation in entry.cpp and held by
 // the service.
 struct Executor {
+    Executor(LoadedModel& loaded_model,
+             model::Qwen3Workspace& ws,
+             KvCache& kv_cache,
+             AttentionWorkspace& attn_ws,
+             ops::CublasHandle& cublas,
+             int max_workspace_tokens,
+             int max_forward_requests,
+             int graph_pad_page,
+             int graph_pad_slot,
+             PersistentInputs& inputs,
+             bool verbose,
+             ForwardFn forward_fn,
+             NativeSystemDrafter system_drafter,
+             ForwardGraphCache* graph_cache = nullptr,
+             NcclComm* tp_comm = nullptr,
+             std::string tp_cpu_gate_key = {},
+             RecurrentStateCache* rs_cache = nullptr)
+        : loaded_model(loaded_model),
+          ws(ws),
+          kv_cache(kv_cache),
+          attn_ws(attn_ws),
+          cublas(cublas),
+          max_workspace_tokens(max_workspace_tokens),
+          max_forward_requests(max_forward_requests),
+          graph_pad_page(graph_pad_page),
+          graph_pad_slot(graph_pad_slot),
+          inputs(inputs),
+          verbose(verbose),
+          forward_fn(std::move(forward_fn)),
+          system_drafter(std::move(system_drafter)),
+          graph_cache(graph_cache),
+          tp_comm(tp_comm),
+          tp_cpu_gate_key(std::move(tp_cpu_gate_key)),
+          rs_cache(rs_cache) {}
+
     LoadedModel& loaded_model;
     model::Qwen3Workspace& ws;
     KvCache& kv_cache;
@@ -352,10 +354,10 @@ struct Executor {
     // attempt graph capture/replay; otherwise the forward runs directly.
     ForwardGraphCache* graph_cache = nullptr;
 
-    // Tensor-parallel comm. Non-null on rank 0 when tp_size > 1 — the
-    // executor broadcasts the per-fire inputs to TP followers
-    // before invoking the forward kernels. On TP followers a parallel
-    // service loop (`tp_follower_serve`) consumes those broadcasts.
+    // Tensor-parallel comm. Non-null on all TP ranks when tp_size > 1. Rank 0
+    // broadcasts the per-fire inputs to TP followers before invoking the
+    // forward kernels; TP followers consume those broadcasts from a background
+    // `tp_follower_serve` loop.
     NcclComm* tp_comm = nullptr;
     // Optional in-process CPU gate keyed by the embedded launch barrier path.
     // Rank 0 notifies before posting NCCL broadcasts; followers wait here
@@ -367,143 +369,35 @@ struct Executor {
     // recurrent-state slots.
     RecurrentStateCache* rs_cache = nullptr;
 
-    // Response-view builder. Reused fire-to-fire — the builder owns the
-    // concat scratch the `PieForwardResponseView` slices point into. The
-    // view stays valid until the next `build()` call, which is long
-    // enough for the `send_response` that immediately follows.
-    pie_driver::ResponseBuilder response_builder;
-
-    // (Sampling-IR programmable-sampling backend removed — ptir succeeds it.)
-
-    // PTIR (thrust-3) stage-program runtime. `ptir_cache` is the C3 hash-keyed
-    // decode cache (container+sidecar → Trace, first-fire-of-hash); `ptir_
-    // instances` are the persistent per-instance execution contexts keyed by the
-    // wire instance id (cross-fire channel state survives). The `ptir_out_*`
-    // staging Vecs back `out_resp.ptir_output_*` for the fire that produced them
-    // (valid until the next ptir dispatch, long enough for `send_response`).
-    // PTIR (thrust-3) stage-program dispatch. Opaque, CUDA-free handle (the impl
+    // PTIR stage-program dispatch. Opaque, CUDA-free handle (the impl
     // + the tier-0 device kernels live behind `ptir_dispatch.cu`, so this header
     // — included by host `.cpp` TUs — never pulls `__global__` code). Owns the C3
-    // hash-decode cache + the persistent per-instance execution contexts (keyed
-    // by the wire instance id) + the `ptir_output_*` response staging. Lazily
-    // constructed on the first ptir-carrying fire.
+    // hash-decode cache + the persistent per-instance execution contexts keyed
+    // by the bound instance id. Lazily constructed on the first PTIR fire.
     std::unique_ptr<ptir::PtirDispatch> ptir_dispatch;
-    // `ws.logits` is BF16, but the PTIR tier-0 stage-runner reads the Logits
-    // intrinsic as F32. Widen the emitted logit rows bf16→f32 into this scratch
-    // before dispatch so the stage program argmaxes correct values.
+    // PTIR consumes a compact F32 matrix ordered by `sampling_indices`. Gather
+    // the selected BF16 rows here, then widen them before dispatch.
+    DeviceBuffer<std::uint16_t> ptir_logits_bf16;
     DeviceBuffer<float> ptir_logits_f32;
-
-    // Stage-2 MTP: scratch to save/restore `ws.logits[0]` (bf16 [vocab]) while the
-    // native MTP-head draft chain transiently writes its per-step logits into row 0
-    // before scattering them to the reserved draft rows. Row 0 is a target logit
-    // row the sampling program still reads, so it must be preserved across the chain.
-    DeviceBuffer<std::uint16_t> mtp_row0_save;
-
-
-    // #27 cut #1 (a2) — the most recent fast-path forward's eager-D2H completion
-    // event (recorded on the tensor-I/O copy stream after that fire READ the
-    // single-buffer `pi.sampled`). delta's WAR guard waits this at the NEXT
-    // forward's sampling tail (`cudaStreamWaitEvent(forward, last_eager_d2h_done)`)
-    // so t+1's sampling WRITE to `pi.sampled` can't clobber t's still-draining D2H.
-    // nullptr until the first fast-path forward (no prior producer to gate on).
-    cudaEvent_t last_eager_d2h_done = nullptr;
-
-    // Thrust-2 bubble-p50: the previous fire's kernel-retire timestamp (the
-    // steady_clock count, post final `cudaStreamSynchronize`), stamped in
-    // `write_probes`. The next fire computes the DEVICE-idle gap = its entry −
-    // this, isolating the true inter-fire GPU bubble vs the runtime's IPC-lagged
-    // host proxy. `0` until the first fire retires.
-    std::uint64_t last_fire_retire_ns = 0;
-
-    // Set true by `handle_fire_batch` when it took the (a2) output→tensor
-    // fast-path (eager-D2H enqueued, forward-done deferred to the copy-stream
-    // host-func). The in-proc service reads it to set `out.deferred` so
-    // `serve_forever` skips the inline send. Reset to false at each fire's entry.
-    bool last_fire_deferred = false;
-
-    // ── D1: deferred RICH-output forward-done ─────────────────────────────────
-    // Generalizes the (a2) single-Token deferral to multi-output / Scalar /
-    // Entropy / [k]-Token programs so `handle_fire_batch` never blocks the service
-    // thread on the rich path's `cudaStreamSynchronize` + sync marshal. The rich
-    // branch stages each output's eager-D2H into an OWNED pinned host buffer
-    // (`pinned_alloc`; `SlabArena::free` is a mutex'd free-list push — no CUDA API —
-    // so the trampoline can free it host-func-safe) and records the shape here; the
-    // in-proc service's `defer_send_` (which holds the vtable + driver_id) wraps
-    // this into a copy-stream host-func that marshals the host buffers → per_req →
-    // a ctx-OWNED `ResponseBuilder` → send, once the D2H drains (avoids the
-    // per-iteration-arena UAF that empty-a2 sidesteps). Consumed once per fire by
-    // `defer_send_`; `active` is re-armed each fire.
-    struct RichStagedOutput {
-        void*                    host = nullptr;   // pinned; trampoline frees post-send
-        std::uint32_t            cls = 0;          // (was sampling_ir::OutputClass; retired)
-        std::uint32_t            elem_count = 0;   // staged cap (Token[k]/MtpTokens: k bound)
-        std::uint32_t            req = 0;          // per_req index
-        std::uint32_t            out_idx = 0;      // declared-output index (program_tokens CSR)
-        std::uint32_t            n_out = 0;        // #declared outputs for `req`
-    };
-    struct PendingRichDefer {
-        bool                          active = false;
-        std::uint32_t                 num_requests = 0;
-        std::vector<RichStagedOutput> staged;
-    };
-    PendingRichDefer pending_rich_defer{};
-
-    // ── G3 PART-2: env-gated back-to-back launch + CUDA-event device-idle ─────
-    // `PIE_G3_BACKTOBACK` removes the per-fire compute `cudaStreamSynchronize`
-    // from the launch critical path on the (a2) single-Token fast-path, so fire
-    // N+1's forward enqueues behind N's on `cublas.stream()` (stream-ordered →
-    // the inter-fire GPU bubble drops to ~0). Default OFF: T0/T1/GDN/beam
-    // correctness runs stay on the proven synchronous path; perf is A/B'd on the
-    // homogeneous single-Token decode gate. Only the a2 fast-path goes
-    // back-to-back; non-fast-path (rich / PTIR / sampling-IR) fires still sync.
-    bool g3_backtoback = [] {
-        const char* v = std::getenv("PIE_G3_BACKTOBACK");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    // The previous a2 fire's kernel-retire CUDA event (timing-enabled, recorded
-    // on `cublas.stream()` after the sampler = last compute). Paired with the
-    // next fire's first-kernel event to measure the true device-idle gap
-    // (`cudaEventElapsedTime`, 0 when back-to-back). nullptr until the first a2
-    // fire. Consumed (moved into a `G3Pending.idle_from`) by the next fire.
-    cudaEvent_t g3_prev_retire = nullptr;
-    // This fire's first-kernel event, held in executor state (not a bare local
-    // across the ~1000-line handler) so an early-return path can't leak it: the
-    // next back-to-back fire reclaims a stale one before recording its own. Moved
-    // into a `G3Pending.idle_to` when the fire takes the back-to-back a2 path.
-    cudaEvent_t g3_cur_first = nullptr;
-    // A deferred device-idle measurement, gated on the fire's first-kernel event.
-    // `idle_to` ready ⇒ `idle_from` ready too (same stream, later) ⇒
-    // `elapsed(idle_from, idle_to)` = fire k's idle gap is computable.
-    struct G3Pending {
-        cudaEvent_t idle_from = nullptr;          // retire[k-1] (a)
-        cudaEvent_t idle_to = nullptr;            // first[k]   (b)
-    };
-    std::deque<G3Pending> g3_pending;
-
-
 
 };
 
-// Run the forward pass + sampling pipeline on one forward-pass request
-// and fill out `out_resp` via `executor.response_builder`. `req_id` is the
-// per-fire identifier used in error logging; `handled` is the
-// cumulative fire counter used as PRNG offset and logging-cadence gate.
-// The caller's inproc transport hands `out_resp` to `send_response`
-// immediately after this returns.
+// Run the forward pass for one direct/PTIR fire.
+// `req_id` is used in error logging.
 void handle_fire_batch(
     std::uint32_t req_id,
-    const pie_driver::PieForwardRequestView& view,
-    pie_driver::PieForwardResponseView& out_resp,
+    const pie_native::LaunchView& view,
     Executor& executor,
-    std::uint64_t handled);
+    const PieRuntimeCallbacks& runtime,
+    PieCompletion completion);
 
 // Pre-capture the pure-decode CUDA graph lattice for graph-safe forwards.
 // Returns the number of graph execs inserted into `executor.graph_cache`.
 std::size_t capture_forward_graph_lattice(Executor& executor);
 
 // TP-follower service loop. Called only on TP ranks > 0. Mirrors
-// `handle_fire_batch` minus shmem decode, sampling, and response: the
-// loop blocks on `ncclBroadcast(root=0)` for each fire's header + inputs,
+// `handle_fire_batch` minus PTIR publication: the loop blocks on
+// `ncclBroadcast(root=0)` for each fire's header + inputs,
 // runs the same `forward_fn.body` so the all-reduces inside complete
 // against rank 0, then loops. `stop` is checked between fires; rank 0
 // also sends an explicit shutdown header before tearing down so a

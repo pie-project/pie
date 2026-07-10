@@ -116,8 +116,8 @@ if(NLOHMANN_JSON_INCLUDE)
     "-framework Metal"
     "-framework Foundation")
 
-  # decoder_smoke — correctness gate for RawMetalDecoder (the e2e seam body that alpha's
-  # RawMetalExecutor wraps): setup() once + step() the golden prompt → assert argmax==264.
+  # decoder_smoke — correctness gate for RawMetalDecoder: setup() once + step()
+  # the golden prompt → assert argmax==264.
   add_executable(decoder_smoke
     decoder_smoke.cpp
     decoder.cpp

@@ -4,6 +4,23 @@
 //! Names kept verbatim during the move; a later refactor renames
 //! `ptir_host`→`host`, etc.
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PtirChannelValue {
+    pub channel: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PtirProgramSubmission {
+    pub hash: u64,
+    pub instance: u64,
+    pub bytes: Option<Vec<u8>>,
+    pub sidecar: Option<Vec<u8>>,
+    pub channel_ids: Vec<u64>,
+    pub seeds: Vec<PtirChannelValue>,
+    pub host_puts: Vec<PtirChannelValue>,
+}
+
 pub mod ptir_channel_store;
 pub mod ptir_geometry;
 pub mod ptir_host;

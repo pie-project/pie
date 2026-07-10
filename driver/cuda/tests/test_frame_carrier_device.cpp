@@ -1,7 +1,6 @@
 // X2 — standalone device de-risk for the CUDA frames/mirrors carrier (bravo).
 // Verifies, in isolation on a live GPU (no executor / no forward), the real-device
-// dual of X1's mock control plane — the primitives the runtime `CudaControlPlane`
-// consumes over the `pie_frame_*` FFI:
+// bind-time frame primitives over the `pie_frame_*` isolation surface:
 //   * register → bind allocates a DEVICE frame + PINNED mirror + PINNED ring words,
 //     handing back three distinct, non-null bases (B5), fixed for the lifetime (B6).
 //   * WRITE leg (pie_frame_write): H2D a known pattern into the device frame.
@@ -19,6 +18,7 @@
 #include <cuda_runtime.h>
 
 using pie_cuda_driver::sampling_ir::FrameCarrierEngine;
+using pie_cuda_driver::sampling_ir::WordLayout;
 
 #define CK(x)                                                                  \
     do {                                                                       \
@@ -98,8 +98,12 @@ int main() {
     // Read back: pacing word[0] == 1; head/tail words; mirror ring slots hold cells.
     const std::uint64_t* w = reinterpret_cast<const std::uint64_t*>(words2);
     EXPECT(w[0] == 1, "pacing word[0] != 1");
-    EXPECT(w[1] == 0 && w[2] == 2, "ch0 head/tail words wrong");   // head(0)=1, tail(0)=2
-    EXPECT(w[3] == 0 && w[4] == 1, "ch1 head/tail words wrong");   // head(1)=3, tail(1)=4
+    EXPECT(w[WordLayout::head(0)] == 0 && w[WordLayout::tail(0)] == 2,
+           "ch0 head/tail words wrong");
+    EXPECT(w[WordLayout::poison(0)] == 0, "ch0 poison word wrong");
+    EXPECT(w[WordLayout::head(1)] == 0 && w[WordLayout::tail(1)] == 1,
+           "ch1 head/tail words wrong");
+    EXPECT(w[WordLayout::poison(1)] == 0, "ch1 poison word wrong");
     const std::uint8_t* m = reinterpret_cast<const std::uint8_t*>(mirror2);
     // ch0 ring base = 0, slot 1 → offset 1*8 = 8.
     EXPECT(std::memcmp(m + 8, c0.data(), 8) == 0, "ch0 mirror slot != published");

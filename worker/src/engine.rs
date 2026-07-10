@@ -3,10 +3,9 @@
 //!
 //! Wires the standalone's pieces in dependency order:
 //!   1. Translate user TOML to per-driver options.
-//!   2. For the `[model]`, partition devices into DP groups; for
-//!      each group spawn an [`EmbeddedDriver`] thread, attach an
-//!      a unified `DriverChannel` (one channel per driver carries
-//!   3. Translate the resulting handshakes → [`pie_engine::bootstrap::Config`]
+//!   2. For the `[model]`, partition devices into DP groups and create
+//!      native drivers directly, collecting their capabilities.
+//!   3. Translate the resulting native drivers → [`pie_engine::bootstrap::Config`]
 //!      and call [`pie_engine::bootstrap::bootstrap`]. The runtime now owns
 //!      the runtime services + scheduler; the worker dials into the
 //!      gateway and serves `pie_worker_rpc::WorkerControl`.
@@ -16,51 +15,22 @@
 //!        * `pie serve --monitor`: TUI runs concurrently and calls
 //!          [`EngineHandle::shutdown`] when the user quits.
 
-use std::path::Path;
-use std::sync::Arc;
-
 use anyhow::{Context, Result, anyhow, bail};
 use pie_controller_rpc::{ControlClient, Role, WorkerInfo};
 use pie_ids::WorkerId;
+use std::path::Path;
 
 use crate::config;
 use crate::driver_ffi::Flavor;
-use crate::embedded_driver::{DriverCapabilities, DriverOptions, EmbeddedDriver};
+use crate::embedded_driver::{DriverCapabilities, DriverOptions};
 use crate::link::control::{self, ControlLink};
 use crate::link::{gateway, topology};
 use crate::preflight::{self, ResolvedFlavor};
-use crate::translate::{self, GroupHandshake, ModelHandshake};
+use crate::translate::{self, GroupDriver, ModelDrivers};
 use crate::{client_server, lifecycle, weights};
 
 pub use crate::link::topology::{Coordinator, TopologyMode, connect};
 pub use crate::preflight::calculate_topology;
-
-/// Embedded driver supervisor.
-pub struct DriverHandle(EmbeddedDriver);
-
-impl DriverHandle {
-    /// Returns the driver's shmem region name, if any. `None` for
-    /// embedded cuda/metal/dummy drivers (no shmem region opened).
-    pub fn shmem_name(&self) -> Option<&str> {
-        self.0.shmem_name.as_deref()
-    }
-
-    pub fn caps(&self) -> &DriverCapabilities {
-        &self.0.caps
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.0.is_finished()
-    }
-
-    pub fn request_stop(&self) {
-        self.0.request_stop();
-    }
-
-    pub fn join(self) -> i32 {
-        self.0.join()
-    }
-}
 
 /// Live engine — drivers, RPC dispatch threads, the bootstrapped
 /// runtime token, and enough state to perform an orderly shutdown.
@@ -112,8 +82,7 @@ impl EdgeServer {
 }
 
 pub struct EngineHandle {
-    drivers: Vec<DriverHandle>,
-    shmem_names: Vec<String>,
+    runtime: Option<pie_engine::bootstrap::BootstrapHandle>,
     edge_server: EdgeServer,
     /// Controller heartbeat/report/watch tasks. Empty when there is no control
     /// plane (single-node without the `single-node` feature).
@@ -121,7 +90,7 @@ pub struct EngineHandle {
     /// Live control-plane state kept alive for the engine's lifetime: the dialed
     /// client (distributed) or the embedded controller handle + in-proc gateway
     /// task (single-node feature). `None` in gateway-free single-node.
-    control_plane: ControlPlane,
+    control_plane: ClusterControl,
     /// Bootstrapped engine internal auth token.
     pub token: String,
     /// Client endpoint this worker advertises: `ws://host:port` in single-node
@@ -132,7 +101,7 @@ pub struct EngineHandle {
 }
 
 /// Live control-plane resources held for the engine's lifetime, by topology.
-enum ControlPlane {
+enum ClusterControl {
     /// No control plane (single-node): the worker terminates clients directly
     /// and never registers.
     None,
@@ -149,37 +118,35 @@ enum ControlPlane {
     Embedded { worker_id: WorkerId },
 }
 
-impl ControlPlane {
+impl ClusterControl {
     /// The controller-minted worker id, if this worker registered.
     fn worker_id(&self) -> Option<WorkerId> {
         match self {
-            ControlPlane::None => None,
-            ControlPlane::Distributed { worker_id, .. } | ControlPlane::Embedded { worker_id } => {
-                Some(*worker_id)
-            }
+            ClusterControl::None => None,
+            ClusterControl::Distributed { worker_id, .. }
+            | ClusterControl::Embedded { worker_id } => Some(*worker_id),
         }
     }
 }
 
 impl EngineHandle {
-    /// Block on SIGINT / SIGTERM / driver-watchdog, then run the
+    /// Block on SIGINT / SIGTERM, then run the
     /// shutdown sequence. The original `run_with_config` flow.
     pub async fn wait_then_shutdown(self) -> Result<()> {
         let shutdown_reason = tokio::select! {
             biased;
             _ = tokio::signal::ctrl_c() => "SIGINT",
             _ = lifecycle::wait_for_sigterm() => "SIGTERM",
-            reason = lifecycle::watchdog(&self.drivers) => reason,
         };
         eprintln!("\nshutting down ({shutdown_reason})...");
-        self.shutdown();
+        self.shutdown().await;
         Ok(())
     }
 
     /// Tear down the engine without waiting for a signal. Used by the
     /// monitor TUI, which owns its own input loop and decides when to
     /// quit.
-    pub fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.edge_server.abort();
         for task in self.control_tasks {
             task.abort();
@@ -191,21 +158,10 @@ impl EngineHandle {
         // report.
         tracing::info!(worker = ?self.control_plane.worker_id(), "leaving control plane");
         drop(self.control_plane);
-        // Signal each driver's serve loop, wake any transport-side
-        // waiters/recv loops, then join the threads.
-        for d in &self.drivers {
-            d.request_stop();
-        }
-        pie_engine::driver::abort_all_driver_channels();
-        for d in self.drivers {
-            let rc = d.join();
-            if rc != 0 {
-                tracing::warn!("driver thread exited with rc={rc}");
+        if let Some(runtime) = self.runtime.take() {
+            if let Err(err) = runtime.shutdown().await {
+                tracing::error!(?err, "runtime shutdown failed");
             }
-        }
-        // Best-effort shmem cleanup — see `unlink_shmem`.
-        for name in &self.shmem_names {
-            lifecycle::unlink_shmem(name);
         }
     }
 }
@@ -229,12 +185,9 @@ impl WorkerHandle {
         &self.engine.token
     }
 
-    /// Drain in-flight work and stop the engine (drivers, control loops, edge).
+    /// Drain in-flight work and stop the engine (runtime, control loops, edge).
     pub async fn shutdown(self) {
-        // `EngineHandle::shutdown` joins native driver threads (blocking), so
-        // run it off the async runtime.
-        let engine = self.engine;
-        let _ = tokio::task::spawn_blocking(move || engine.shutdown()).await;
+        self.engine.shutdown().await;
     }
 }
 
@@ -348,29 +301,16 @@ pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtim
         .context("building tokio runtime")
 }
 
-/// Boot the drivers + bootstrap the runtime for `user_cfg`, returning the live
-/// driver handles, the registration model/capabilities, the runtime auth token,
-/// and the driver shmem region names. Shared by every engine entry point
-/// ([`start_engine`] daemon/wheel, [`start_engine_embedded`] in-proc root).
+/// Create native drivers, bootstrap the runtime, and return the registration
+/// caps plus runtime auth token. Shared by every engine entry point.
 async fn boot_engine(
     user_cfg: &config::Config,
 ) -> Result<(
-    Vec<DriverHandle>,
     String,
     DriverCapabilities,
-    String,
-    Vec<String>,
+    pie_engine::bootstrap::BootstrapHandle,
 )> {
-    let mut drivers: Vec<DriverHandle> = Vec::new();
-
-    // Global device index. The runtime's `driver::spawn` returns
-    // indices in call order; the driver-side shmem region is named
-    // `/pie_shmem_g{driver_idx}` (`runtime/src/device.rs::shmem_name`).
-    // Pass this counter as the driver's `group_id` so the names line
-    // up across all models, including DP > 1.
-    let mut next_global_driver_idx: usize = 0;
-
-    let handshake = {
+    let driver_groups = {
         let m = &user_cfg.model;
         let resolved = preflight::resolve_flavor(m.driver.kind, &m.name)?;
 
@@ -407,58 +347,40 @@ async fn boot_engine(
         let snapshot_dir = weights::resolve(&m.hf_repo)
             .with_context(|| format!("resolving hf_repo for model {:?}", m.name))?;
 
-        let mut group_handshakes: Vec<GroupHandshake> = Vec::with_capacity(topology.len());
+        let mut group_drivers: Vec<GroupDriver> = Vec::with_capacity(topology.len());
 
         for (group_idx, group) in topology.iter().enumerate() {
-            let driver_idx = next_global_driver_idx;
-            next_global_driver_idx += 1;
-
-            let started = start_embedded_group(
+            let created = create_native_group(
                 m,
                 group_idx,
                 group,
                 flavor,
                 &embedded_base_opts,
                 &snapshot_dir,
-                driver_idx,
                 tp_degree,
             )?;
-            group_handshakes.push(started.handshake);
-            drivers.extend(started.drivers);
+            group_drivers.push(created);
         }
 
-        ModelHandshake {
-            groups: group_handshakes,
+        ModelDrivers {
+            groups: group_drivers,
         }
     };
 
-    let registration_caps = handshake
+    let registration_caps = driver_groups
         .groups
         .first()
         .map(|group| group.caps.clone())
         .context("no driver capabilities available for control-plane registration")?;
     let registration_model = user_cfg.model.name.clone();
 
-    let boot_cfg = translate::build(user_cfg, std::slice::from_ref(&handshake))
-        .context("translating to bootstrap::Config")?;
+    let boot_cfg =
+        translate::build(user_cfg, driver_groups).context("translating to bootstrap::Config")?;
 
     let boot = pie_engine::bootstrap::bootstrap(boot_cfg)
         .await
         .map_err(|e| anyhow!("pie_engine::bootstrap::bootstrap: {e}"))?;
-    let token = boot.token;
-
-    let shmem_names: Vec<String> = drivers
-        .iter()
-        .filter_map(|d| d.shmem_name().map(|s| s.to_string()))
-        .collect();
-
-    Ok((
-        drivers,
-        registration_model,
-        registration_caps,
-        token,
-        shmem_names,
-    ))
+    Ok((registration_model, registration_caps, boot))
 }
 
 /// Boot the engine + assemble the control/edge plane for the resolved topology
@@ -469,18 +391,18 @@ pub async fn start_engine(
     user_cfg: config::Config,
     coordinator: Coordinator,
 ) -> Result<EngineHandle> {
-    let (drivers, model, caps, token, shmem_names) = boot_engine(&user_cfg).await?;
+    let (model, caps, runtime) = boot_engine(&user_cfg).await?;
+    let token = runtime.token.clone();
     let (edge_server, control_tasks, control_plane, url) =
         assemble_control_and_edge(coordinator, &user_cfg, model, caps).await?;
     log_serving(&user_cfg, &url, &token);
     Ok(EngineHandle {
-        drivers,
-        shmem_names,
         url,
         edge_server,
         control_tasks,
         control_plane,
         token,
+        runtime: Some(runtime),
     })
 }
 
@@ -493,7 +415,8 @@ pub async fn start_engine_embedded<C: ControlLink>(
     control: C,
     gateways: Vec<String>,
 ) -> Result<EngineHandle> {
-    let (drivers, model, caps, token, shmem_names) = boot_engine(&user_cfg).await?;
+    let (model, caps, runtime) = boot_engine(&user_cfg).await?;
+    let token = runtime.token.clone();
     let addr = topology::addr_from_host_port(&user_cfg.server.host, user_cfg.server.port);
     // A single-node-monolithic worker serves all stages; routing doesn't filter
     // by role yet, so Decode is an inert default (echo owns Role::Monolithic).
@@ -502,13 +425,12 @@ pub async fn start_engine_embedded<C: ControlLink>(
     let url = edge_server.url();
     log_serving(&user_cfg, &url, &token);
     Ok(EngineHandle {
-        drivers,
-        shmem_names,
         url,
         edge_server,
         control_tasks,
-        control_plane: ControlPlane::Embedded { worker_id },
+        control_plane: ClusterControl::Embedded { worker_id },
         token,
+        runtime: Some(runtime),
     })
 }
 
@@ -539,7 +461,7 @@ async fn assemble_control_and_edge(
 ) -> Result<(
     EdgeServer,
     Vec<tokio::task::JoinHandle<()>>,
-    ControlPlane,
+    ClusterControl,
     String,
 )> {
     match coordinator.mode {
@@ -566,7 +488,7 @@ async fn assemble_control_and_edge(
             Ok((
                 edge,
                 control_tasks,
-                ControlPlane::Distributed {
+                ClusterControl::Distributed {
                     _client: client,
                     worker_id,
                 },
@@ -585,7 +507,7 @@ async fn assemble_control_and_edge(
                     .context("starting standalone client server")?,
             );
             let url = edge.url();
-            Ok((edge, Vec::new(), ControlPlane::None, url))
+            Ok((edge, Vec::new(), ClusterControl::None, url))
         }
     }
 }
@@ -633,83 +555,29 @@ async fn assemble_distributed<C: ControlLink>(
     Ok((EdgeServer::GatewayLinks(dialed), control_tasks, worker_id))
 }
 
-struct StartedEmbeddedGroup {
-    handshake: GroupHandshake,
-    drivers: Vec<DriverHandle>,
-}
-
-fn start_embedded_group(
+fn create_native_group(
     m: &config::ModelConfig,
     group_idx: usize,
     group: &[usize],
     flavor: Flavor,
     base_opts: &DriverOptions,
     snapshot_dir: &Path,
-    driver_idx: usize,
     tp_degree: usize,
-) -> Result<StartedEmbeddedGroup> {
-    let group_drivers = start_embedded_drivers(
-        m,
-        group_idx,
-        group,
-        flavor,
-        base_opts,
-        snapshot_dir,
-        driver_idx,
-        tp_degree,
-    )?;
-
-    let primary = group_drivers.first().ok_or_else(|| {
-        anyhow!(
-            "starting driver for model {:?} group {group_idx} returned no ranks",
-            m.name,
-        )
-    })?;
-    let caps = primary.caps.clone();
-    if let Some(shmem_name) = primary.shmem_name.as_deref() {
-        let channel =
-            pie_engine::driver::ShmemChannel::open(shmem_name, m.driver.effective_spin_budget_us())
-                .with_context(|| {
-                    format!(
-                        "opening shmem channel for embedded driver ({}) group {group_idx}",
-                        flavor.as_str(),
-                    )
-                })?;
-        pie_engine::driver::install_channel(driver_idx, Arc::new(channel));
-    }
-    let handshake = GroupHandshake { caps };
-    let drivers = group_drivers.into_iter().map(DriverHandle).collect();
-
-    Ok(StartedEmbeddedGroup { handshake, drivers })
-}
-
-fn start_embedded_drivers(
-    m: &config::ModelConfig,
-    group_idx: usize,
-    group: &[usize],
-    flavor: Flavor,
-    base_opts: &DriverOptions,
-    snapshot_dir: &Path,
-    driver_idx: usize,
-    tp_degree: usize,
-) -> Result<Vec<EmbeddedDriver>> {
-    let spin_budget_us = m.driver.effective_spin_budget_us();
-    let use_inproc_polling_channel = m.driver.use_inproc_polling_channel();
-
+) -> Result<GroupDriver> {
     #[cfg(feature = "driver-cuda")]
     {
         if flavor == Flavor::Cuda && tp_degree > 1 {
             let rank_opts = cuda_rank_options(m, group_idx, group, base_opts)?;
-            return EmbeddedDriver::start_cuda_tp_group(
+            let tp_launches = crate::embedded_driver::tp_launches(rank_opts.len())?;
+            return crate::embedded_driver::create_native_driver_group(
                 &rank_opts,
                 snapshot_dir,
-                driver_idx,
-                use_inproc_polling_channel,
-                spin_budget_us,
+                group_idx,
+                &tp_launches,
             )
             .with_context(|| {
                 format!(
-                    "starting cuda TP driver group for model {:?} group {group_idx}",
+                    "creating cuda TP driver group for model {:?} group {group_idx}",
                     m.name,
                 )
             });
@@ -728,16 +596,8 @@ fn start_embedded_drivers(
     let device = group_driver(m, group_idx, first_driver_idx)?;
     let opts = embedded_opts_for_device(base_opts, device);
 
-    Ok(vec![
-        EmbeddedDriver::start(
-            &opts,
-            snapshot_dir,
-            driver_idx,
-            use_inproc_polling_channel,
-            spin_budget_us,
-        )
-        .with_context(|| format!("starting driver for model {:?} group {group_idx}", m.name,))?,
-    ])
+    crate::embedded_driver::create_native_driver(&opts, snapshot_dir, group_idx, None)
+        .with_context(|| format!("creating driver for model {:?} group {group_idx}", m.name,))
 }
 
 fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> DriverOptions {

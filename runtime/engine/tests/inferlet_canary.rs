@@ -67,9 +67,10 @@ fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let wasm_path = dir
         .join("target/wasm32-wasip2/release")
         .join(format!("{}.wasm", name.replace('-', "_")));
-    let wasm = std::fs::read(&wasm_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", wasm_path.display()));
-    let manifest = Manifest::parse(&std::fs::read_to_string(dir.join("Pie.toml")).unwrap()).unwrap();
+    let wasm =
+        std::fs::read(&wasm_path).unwrap_or_else(|e| panic!("read {}: {e}", wasm_path.display()));
+    let manifest =
+        Manifest::parse(&std::fs::read_to_string(dir.join("Pie.toml")).unwrap()).unwrap();
     let program_name = ProgramName::parse(&format!("{name}@{}", manifest.package.version)).unwrap();
     (wasm, manifest, program_name)
 }
@@ -81,7 +82,9 @@ fn run_prod_inferlet(name: &str, input: &str, timeout: Duration) -> Result<Strin
     let h = harness();
     let (wasm, manifest, program_name) = load_prod_inferlet(name);
     h.rt.block_on(async {
-        pie_engine::program::add(wasm, manifest, true).await.unwrap();
+        pie_engine::program::add(wasm, manifest, true)
+            .await
+            .unwrap();
         pie_engine::program::install(&program_name).await.unwrap();
         let (tx, rx) = oneshot::channel();
         let _pid = process::spawn(

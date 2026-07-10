@@ -3,7 +3,7 @@ name = "pie-grammar"
 version = "0.4.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Constrained-decoding grammar engine for Pie: EBNF/regex/JSON-schema compilation, FSM/stack matcher, and next-token bitmask. Depends only on pie-tokenizer + the driver-abi Brle wire type."
+description = "Constrained-decoding grammar engine for Pie: EBNF/regex/JSON-schema compilation, FSM/stack matcher, and next-token bitmask. Owns the Brle bitset helper used by the runtime and grammar matcher."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -13,7 +13,6 @@ path = "src/lib.rs"
 
 [dependencies]
 pie-tokenizer = { path = "../tokenizer" }
-pie-driver-abi = { path = "../../interface/driver" }
 anyhow = "1.0"
 lru = "0.16.3"
 rustc-hash = "2.1"

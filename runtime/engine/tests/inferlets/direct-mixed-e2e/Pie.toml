@@ -1,0 +1,4 @@
+[package]
+name = "direct-mixed-e2e"
+version = "0.1.0"
+description = "Executable mixed direct-channel output conformance"

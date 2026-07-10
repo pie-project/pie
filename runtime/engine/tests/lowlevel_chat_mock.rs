@@ -39,12 +39,7 @@ fn state() -> &'static TestState {
         let rt = tokio::runtime::Runtime::new().unwrap();
         // Generous page pool (128): the inferlet runs FOUR fresh decode contexts
         // (pipelined + sync + forced-stop ×2), each with its own KV working set.
-        let env = create_mock_env(
-            "test-model",
-            1,
-            128,
-            Arc::new(EchoBehavior(0)),
-        );
+        let env = create_mock_env("test-model", 1, 128, Arc::new(EchoBehavior(0)));
         let config = env.config();
         rt.block_on(async {
             pie_engine::bootstrap::bootstrap(config).await.unwrap();

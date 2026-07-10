@@ -1,7 +1,7 @@
 // RawMetalDecoder implementation — see decoder.hpp. The setup() body is decode_run.cpp's
 // main() prologue; step() is its per-token decode-loop body; reset_state() zeroes the
-// persistent GDN + KV state. Factored here so both the standalone decode_run bench and
-// alpha's RawMetalExecutor (pie e2e) drive the identical pipeline.
+// persistent GDN + KV state. Factored here so standalone tools and the direct
+// entry path drive the identical pipeline.
 
 #include "decoder.hpp"
 

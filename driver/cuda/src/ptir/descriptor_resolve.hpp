@@ -149,10 +149,14 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
         out.sampling_indices = detail::as_u32(b);
         out.sampling_indptr = {0, static_cast<std::uint32_t>(out.sampling_indices.size())};
     } else {
-        for (std::size_t l = 0; l < lanes; ++l)
-            out.sampling_indices.push_back(out.qo_indptr[l + 1] > 0 ? out.qo_indptr[l + 1] - 1 : 0);
-        out.sampling_indptr.resize(lanes + 1);
-        for (std::size_t i = 0; i <= lanes; ++i) out.sampling_indptr[i] = static_cast<std::uint32_t>(i);
+        out.sampling_indptr.push_back(0);
+        for (std::size_t lane = 0; lane < lanes; ++lane) {
+            if (out.qo_indptr[lane + 1] > out.qo_indptr[lane]) {
+                out.sampling_indices.push_back(out.qo_indptr[lane + 1] - 1);
+            }
+            out.sampling_indptr.push_back(
+                static_cast<std::uint32_t>(out.sampling_indices.size()));
+        }
     }
 
     // -- explicit KV write descriptor (w_slot/w_off → write_kv_explicit) --

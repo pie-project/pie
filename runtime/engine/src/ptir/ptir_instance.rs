@@ -9,12 +9,12 @@
 //! validated seeds to send at instantiation plus the host-channel index map.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pie_ptir::container::{self, HostRole};
 
-use super::ptir_registry::{lookup, RegisteredProgram};
+use super::ptir_registry::{RegisteredProgram, lookup};
 
 /// Process-wide monotonic source of instance identities (0 reserved as a null /
 /// "no instance" sentinel). Each `instantiate` mints a fresh id: the driver
@@ -62,7 +62,12 @@ impl PtirInstance {
 
     /// The host role of channel `index`, or `None` if the index is out of range.
     pub fn host_role(&self, index: u32) -> Option<HostRole> {
-        self.program.bound.container.channels.get(index as usize).map(|c| c.host_role)
+        self.program
+            .bound
+            .container
+            .channels
+            .get(index as usize)
+            .map(|c| c.host_role)
     }
 
     /// Assemble the host-known per-channel values for a fire's geometry map:
@@ -128,12 +133,15 @@ impl PtirInstance {
         &self,
         first_fire: bool,
         channel_ids: Vec<u64>,
-        host_puts: Vec<pie_driver_abi::PtirChannelValue>,
-    ) -> pie_driver_abi::PtirProgramSubmission {
+        host_puts: Vec<crate::ptir::PtirChannelValue>,
+    ) -> crate::ptir::PtirProgramSubmission {
         let global = |dense: u32| -> u64 {
-            channel_ids.get(dense as usize).copied().unwrap_or(dense as u64)
+            channel_ids
+                .get(dense as usize)
+                .copied()
+                .unwrap_or(dense as u64)
         };
-        pie_driver_abi::PtirProgramSubmission {
+        crate::ptir::PtirProgramSubmission {
             hash: self.program.hash,
             instance: self.instance_id,
             bytes: first_fire.then(|| self.program.bytes.clone()),
@@ -141,7 +149,7 @@ impl PtirInstance {
             seeds: if first_fire {
                 self.seeds
                     .iter()
-                    .map(|s| pie_driver_abi::PtirChannelValue {
+                    .map(|s| crate::ptir::PtirChannelValue {
                         channel: global(s.channel),
                         bytes: s.data.clone(),
                     })
@@ -169,7 +177,11 @@ pub enum InstantiateError {
     /// A declared `seeded` channel has no seed value.
     MissingSeed { channel: u32 },
     /// A seed's byte length does not match its channel's shape×dtype.
-    SeedShapeMismatch { channel: u32, expected: usize, got: usize },
+    SeedShapeMismatch {
+        channel: u32,
+        expected: usize,
+        got: usize,
+    },
 }
 
 impl fmt::Display for InstantiateError {
@@ -178,12 +190,19 @@ impl fmt::Display for InstantiateError {
         match self {
             UnknownProgram(h) => write!(f, "no registered program with identity {h:#018x}"),
             SeedForNonSeeded { channel } => {
-                write!(f, "channel {channel}: a seed was supplied but the channel is not seeded")
+                write!(
+                    f,
+                    "channel {channel}: a seed was supplied but the channel is not seeded"
+                )
             }
             SeedChannelOutOfRange { channel } => write!(f, "seed channel {channel} out of range"),
             DuplicateSeed { channel } => write!(f, "channel {channel}: duplicate seed"),
             MissingSeed { channel } => write!(f, "channel {channel}: seeded but no seed supplied"),
-            SeedShapeMismatch { channel, expected, got } => write!(
+            SeedShapeMismatch {
+                channel,
+                expected,
+                got,
+            } => write!(
                 f,
                 "channel {channel}: seed is {got} bytes, expected {expected} (shape×dtype)"
             ),
@@ -202,7 +221,11 @@ pub fn instantiate(
 ) -> Result<PtirInstance, InstantiateError> {
     let prog = lookup(program).ok_or(InstantiateError::UnknownProgram(program))?;
     let validated = validate_seeds(&prog, seeds)?;
-    Ok(PtirInstance { program: prog, instance_id: next_instance_id(), seeds: validated })
+    Ok(PtirInstance {
+        program: prog,
+        instance_id: next_instance_id(),
+        seeds: validated,
+    })
 }
 
 /// Validate + order the seeds against a program's channel declarations.
@@ -225,7 +248,8 @@ pub fn validate_seeds(
         if by_channel[idx].is_some() {
             return Err(InstantiateError::DuplicateSeed { channel: s.channel });
         }
-        let expected = decl.shape.numel() as usize * container::const_elem_size(decl.dtype.program_dtype());
+        let expected =
+            decl.shape.numel() as usize * container::const_elem_size(decl.dtype.program_dtype());
         if s.data.len() != expected {
             return Err(InstantiateError::SeedShapeMismatch {
                 channel: s.channel,
@@ -240,7 +264,10 @@ pub fn validate_seeds(
     let mut out = Vec::new();
     for (i, decl) in channels.iter().enumerate() {
         match (decl.seeded, by_channel[i].take()) {
-            (true, Some(data)) => out.push(ChannelSeed { channel: i as u32, data }),
+            (true, Some(data)) => out.push(ChannelSeed {
+                channel: i as u32,
+                data,
+            }),
             (true, None) => return Err(InstantiateError::MissingSeed { channel: i as u32 }),
             (false, _) => {}
         }
@@ -251,7 +278,7 @@ pub fn validate_seeds(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ptir::ptir_registry::{register, PtirRegistry};
+    use crate::ptir::ptir_registry::{PtirRegistry, register};
     use pie_ptir::container::{
         ChanDType, ChannelDecl, PortBinding, PortSource, StageProgram, TraceContainer,
     };
@@ -263,16 +290,32 @@ mod tests {
     const VOCAB: u32 = 32;
 
     fn chan(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
-        ChannelDecl { shape, dtype: ChanDType::Concrete(dtype), capacity: 1, host_role: role, seeded }
+        ChannelDecl {
+            shape,
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role: role,
+            seeded,
+        }
     }
 
     /// tok (i32 [1], seeded, device) + out (i32 [1], host-reader).
     fn greedy() -> TraceContainer {
         let ops = vec![
-            Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(1, VOCAB), dtype: DType::F32 },
-            Op::Reshape { value: 0, shape: Shape::vector(VOCAB) },
+            Op::IntrinsicVal {
+                intr: IntrinsicId::Logits,
+                shape: Shape::matrix(1, VOCAB),
+                dtype: DType::F32,
+            },
+            Op::Reshape {
+                value: 0,
+                shape: Shape::vector(VOCAB),
+            },
             Op::ReduceArgmax(1),
-            Op::Reshape { value: 2, shape: Shape::vector(1) },
+            Op::Reshape {
+                value: 2,
+                shape: Shape::vector(1),
+            },
             Op::ChanPut { chan: 1, value: 3 },
         ];
         TraceContainer {
@@ -283,7 +326,10 @@ mod tests {
                 chan(Shape::vector(1), DType::I32, HostRole::Reader, false),
             ],
             ports: vec![
-                PortBinding { port: Port::EmbedTokens, source: PortSource::Channel(0) },
+                PortBinding {
+                    port: Port::EmbedTokens,
+                    source: PortSource::Channel(0),
+                },
                 PortBinding {
                     port: Port::EmbedIndptr,
                     source: PortSource::Const {
@@ -293,24 +339,40 @@ mod tests {
                     },
                 },
             ],
-            stages: vec![StageProgram { stage: Stage::Epilogue, ops }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops,
+            }],
         }
     }
 
     fn registered() -> Arc<RegisteredProgram> {
         let mut r = PtirRegistry::new(NonZeroUsize::new(8).unwrap());
-        r.register(greedy().encode(), &ModelProfile { vocab: VOCAB, ..ModelProfile::dummy() }).unwrap()
+        r.register(
+            greedy().encode(),
+            &ModelProfile {
+                vocab: VOCAB,
+                ..ModelProfile::dummy()
+            },
+        )
+        .unwrap()
     }
 
     fn seed(ch: u32, val: i32) -> ChannelSeed {
-        ChannelSeed { channel: ch, data: val.to_le_bytes().to_vec() }
+        ChannelSeed {
+            channel: ch,
+            data: val.to_le_bytes().to_vec(),
+        }
     }
 
     #[test]
     fn valid_seeds_construct_instance() {
         let prog = registered();
-        let inst =
-            PtirInstance { program: prog.clone(), instance_id: 1, seeds: validate_seeds(&prog, vec![seed(0, 1)]).unwrap() };
+        let inst = PtirInstance {
+            program: prog.clone(),
+            instance_id: 1,
+            seeds: validate_seeds(&prog, vec![seed(0, 1)]).unwrap(),
+        };
         assert_eq!(inst.seeds, vec![seed(0, 1)]);
         assert_eq!(inst.host_channels(), vec![1], "only `out` is host-facing");
         assert_eq!(inst.host_role(0), Some(HostRole::None));
@@ -334,9 +396,19 @@ mod tests {
     #[test]
     fn wrong_seed_length_fails() {
         let prog = registered();
-        let bad = ChannelSeed { channel: 0, data: vec![1, 2] }; // 2 bytes, need 4
+        let bad = ChannelSeed {
+            channel: 0,
+            data: vec![1, 2],
+        }; // 2 bytes, need 4
         let e = validate_seeds(&prog, vec![bad]).unwrap_err();
-        assert_eq!(e, InstantiateError::SeedShapeMismatch { channel: 0, expected: 4, got: 2 });
+        assert_eq!(
+            e,
+            InstantiateError::SeedShapeMismatch {
+                channel: 0,
+                expected: 4,
+                got: 2
+            }
+        );
     }
 
     #[test]
@@ -361,7 +433,14 @@ mod tests {
     #[test]
     fn instantiate_via_process_registry_roundtrips() {
         let bytes = greedy().encode();
-        let prog = register(bytes.clone(), &ModelProfile { vocab: VOCAB, ..ModelProfile::dummy() }).unwrap();
+        let prog = register(
+            bytes.clone(),
+            &ModelProfile {
+                vocab: VOCAB,
+                ..ModelProfile::dummy()
+            },
+        )
+        .unwrap();
         let inst = instantiate(prog.hash, vec![seed(0, 42)]).unwrap();
         assert_eq!(inst.program.hash, prog.hash);
         assert_eq!(inst.seeds, vec![seed(0, 42)]);
@@ -371,8 +450,15 @@ mod tests {
     fn fire_geometry_prefills_request_from_seed() {
         // §3-shaped greedy: embed_tokens ← the seeded `tok` channel, embed_indptr
         // const [0,1]. The host-known geometry (token + qo_indptr + default
-        // positions/readout) prefills a ForwardRequest — no driver/ws needed.
-        let prog = register(greedy().encode(), &ModelProfile { vocab: VOCAB, ..ModelProfile::dummy() }).unwrap();
+        // positions/readout) prefills a LaunchPlan — no driver/ws needed.
+        let prog = register(
+            greedy().encode(),
+            &ModelProfile {
+                vocab: VOCAB,
+                ..ModelProfile::dummy()
+            },
+        )
+        .unwrap();
         let inst = instantiate(prog.hash, vec![seed(0, 42)]).unwrap();
 
         let g = inst.fire_geometry(16).unwrap();
@@ -381,15 +467,11 @@ mod tests {
         assert_eq!(g.position_ids, vec![0]);
         assert_eq!(g.sampling_indices, vec![0], "read out the only token");
 
-        let mut req = pie_driver_abi::ForwardRequest::default();
+        let mut req = crate::driver::LaunchPlan::default();
         g.apply_to(&mut req);
         assert_eq!(req.token_ids, vec![42]);
         assert_eq!(req.qo_indptr, vec![0, 1]);
         assert_eq!(req.sampling_indices, vec![0]);
-        // The carrier + geometry coexist on one request (they touch disjoint fields).
-        req.push_ptir_program(&inst.submission(true, vec![], vec![]));
-        assert_eq!(req.ptir_program_at(0).unwrap().instance, inst.instance_id);
-        assert_eq!(req.token_ids, vec![42], "carrier push leaves geometry intact");
     }
 
     /// P2/P3 exit gate: register → instantiate → run on echo's reference
@@ -399,7 +481,14 @@ mod tests {
     /// supplied logits and publishes the token to the host-reader `out` channel.
     #[test]
     fn submission_carrier_first_fire_vs_steady_state() {
-        let prog = register(greedy().encode(), &ModelProfile { vocab: VOCAB, ..ModelProfile::dummy() }).unwrap();
+        let prog = register(
+            greedy().encode(),
+            &ModelProfile {
+                vocab: VOCAB,
+                ..ModelProfile::dummy()
+            },
+        )
+        .unwrap();
         let inst = instantiate(prog.hash, vec![seed(0, 42)]).unwrap();
         assert_ne!(inst.instance_id, 0, "a fresh instance identity is minted");
 
@@ -407,9 +496,20 @@ mod tests {
         // tagged with this instance's identity.
         let first = inst.submission(true, vec![], vec![]);
         assert_eq!(first.hash, prog.hash);
-        assert_eq!(first.instance, inst.instance_id, "carries the instance identity");
-        assert_eq!(first.bytes.as_deref(), Some(prog.bytes.as_slice()), "first fire ships bytes");
-        assert_eq!(first.sidecar.as_deref(), Some(prog.sidecar.as_slice()), "first fire ships sidecar");
+        assert_eq!(
+            first.instance, inst.instance_id,
+            "carries the instance identity"
+        );
+        assert_eq!(
+            first.bytes.as_deref(),
+            Some(prog.bytes.as_slice()),
+            "first fire ships bytes"
+        );
+        assert_eq!(
+            first.sidecar.as_deref(),
+            Some(prog.sidecar.as_slice()),
+            "first fire ships sidecar"
+        );
         assert_eq!(first.seeds.len(), 1);
         assert_eq!(first.seeds[0].channel, 0);
         assert_eq!(first.seeds[0].bytes, 42i32.to_le_bytes().to_vec());
@@ -418,21 +518,28 @@ mod tests {
         // but the instance identity still routes the fire to its arena.
         let steady = inst.submission(false, vec![], vec![]);
         assert_eq!(steady.hash, prog.hash);
-        assert_eq!(steady.instance, inst.instance_id, "steady fire still routes by instance");
+        assert_eq!(
+            steady.instance, inst.instance_id,
+            "steady fire still routes by instance"
+        );
         assert!(steady.bytes.is_none(), "steady-state fire is hash-only");
         assert!(steady.sidecar.is_none(), "steady-state ships no sidecar");
-        assert!(steady.seeds.is_empty(), "seeds bind once at the instance's first fire");
+        assert!(
+            steady.seeds.is_empty(),
+            "seeds bind once at the instance's first fire"
+        );
 
         // Two instances of the SAME program get DISTINCT identities (independent
         // channel arenas) though they share one compiled `hash`.
         let inst2 = instantiate(prog.hash, vec![seed(0, 7)]).unwrap();
-        assert_eq!(inst2.program.hash, inst.program.hash, "same compiled program");
-        assert_ne!(inst2.instance_id, inst.instance_id, "distinct persistent instances");
-
-        // Round-trips through the request carrier.
-        let mut req = pie_driver_abi::ForwardRequest::default();
-        req.push_ptir_program(&first);
-        assert_eq!(req.ptir_program_at(0), Some(first));
+        assert_eq!(
+            inst2.program.hash, inst.program.hash,
+            "same compiled program"
+        );
+        assert_ne!(
+            inst2.instance_id, inst.instance_id,
+            "distinct persistent instances"
+        );
     }
 
     #[test]
@@ -440,7 +547,14 @@ mod tests {
         use pie_ptir::interp::Value;
         use pie_ptir::interp::{Instance as Interp, NoKernels, PassInputs};
 
-        let prog = register(greedy().encode(), &ModelProfile { vocab: VOCAB, ..ModelProfile::dummy() }).unwrap();
+        let prog = register(
+            greedy().encode(),
+            &ModelProfile {
+                vocab: VOCAB,
+                ..ModelProfile::dummy()
+            },
+        )
+        .unwrap();
         // Instance construction (seed validation) — the WIT `instantiate` core.
         let inst = instantiate(prog.hash, vec![seed(0, 1)]).unwrap();
         assert_eq!(inst.host_channels(), vec![1], "only `out` is host-facing");
@@ -459,9 +573,20 @@ mod tests {
         let mut l = vec![0.0f32; VOCAB as usize];
         l[5] = 9.0; // argmax at index 5
         let r = mock
-            .step(&prog.bound, &PassInputs { logits: Some(Value::F32(l)), ..Default::default() }, &mut NoKernels)
+            .step(
+                &prog.bound,
+                &PassInputs {
+                    logits: Some(Value::F32(l)),
+                    ..Default::default()
+                },
+                &mut NoKernels,
+            )
             .unwrap();
         assert!(r.committed, "the pass commits");
-        assert_eq!(mock.host_take(&prog.bound, out_i).unwrap(), Value::I32(vec![5]), "greedy token = argmax = 5");
+        assert_eq!(
+            mock.host_take(&prog.bound, out_i).unwrap(),
+            Value::I32(vec![5]),
+            "greedy token = argmax = 5"
+        );
     }
 }

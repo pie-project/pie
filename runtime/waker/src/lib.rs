@@ -47,7 +47,8 @@ mod table;
 mod wait;
 
 pub use table::{
-    ChannelWakers, MetricsSnapshot, WakeOutcome, WakerMetrics, WakerSlotId, WakerTable,
+    ChannelWakers, FIRST_COMPLETION_EPOCH, MetricsSnapshot, WakeOutcome, WakerMetrics,
+    WakerSlotId, WakerTable,
 };
 pub use wait::{Readiness, WaitFuture};
 #[cfg(not(loom))]

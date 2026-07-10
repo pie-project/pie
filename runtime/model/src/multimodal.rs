@@ -22,7 +22,7 @@
 //! layouts are parity-verified against the reference dumps.
 #![allow(dead_code)] // Some geometry/arch-completeness helpers are exercised only by tests.
 
-use image::{imageops::FilterType, DynamicImage};
+use image::{DynamicImage, imageops::FilterType};
 
 /// `(t, h, w)` patch grid, in **patch units** (matches Qwen's `image_grid_thw`).
 /// For Gemma this is unused; for Qwen, `h`/`w` are pre-merge patch counts.
@@ -167,9 +167,13 @@ impl GemmaImageConfig {
     /// `(patch_row, patch_col, channel)` (channels-last); patches are row-major;
     /// position `(x=col, y=row)`. Returns `(pixel_values [n_patch, c·p²],
     /// positions [n_patch])`. `h`/`w` must be multiples of `patch_size`.
-    pub fn patchify_chw(&self, resized: &[f32], c: usize, h: usize, w: usize)
-        -> (Vec<f32>, Vec<[u32; 2]>)
-    {
+    pub fn patchify_chw(
+        &self,
+        resized: &[f32],
+        c: usize,
+        h: usize,
+        w: usize,
+    ) -> (Vec<f32>, Vec<[u32; 2]>) {
         let p = self.patch_size as usize;
         let (ph, pw) = (h / p, w / p);
         let n = ph * pw;
@@ -464,7 +468,11 @@ impl Processor {
                 VisualSpan {
                     token_count: per.token_count * frames,
                     position_span: per.position_span * frames,
-                    grid: Grid { t: frames, h: 1, w: per.token_count },
+                    grid: Grid {
+                        t: frames,
+                        h: 1,
+                        w: per.token_count,
+                    },
                 }
             }
             Processor::Qwen(c) => c.layout(h, w, frames),
@@ -578,8 +586,8 @@ impl Processor {
 /// frame is later preprocessed as an ordinary image. Errors for non-animated /
 /// undecodable input.
 pub fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<(DynamicImage, f32)>, String> {
-    use image::codecs::gif::GifDecoder;
     use image::AnimationDecoder;
+    use image::codecs::gif::GifDecoder;
     let decoder =
         GifDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| format!("gif decode: {e}"))?;
     let frames = decoder
@@ -593,7 +601,11 @@ pub fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<(DynamicImage, f32)>, Strin
     let mut t_ms = 0.0f32;
     for f in frames {
         let (num, den) = f.delay().numer_denom_ms();
-        let frame_ms = if den != 0 { num as f32 / den as f32 } else { num as f32 };
+        let frame_ms = if den != 0 {
+            num as f32 / den as f32
+        } else {
+            num as f32
+        };
         out.push((DynamicImage::ImageRgba8(f.into_buffer()), t_ms / 1000.0));
         t_ms += frame_ms;
     }
@@ -913,12 +925,15 @@ pub mod audio {
             }
             (3, 64) => {
                 for c in data.chunks_exact(8) {
-                    let v =
-                        f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+                    let v = f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
                     samples.push(v as f32);
                 }
             }
-            _ => return Err(format!("WAV: unsupported format tag {fmt_tag} / {bits}-bit")),
+            _ => {
+                return Err(format!(
+                    "WAV: unsupported format tag {fmt_tag} / {bits}-bit"
+                ));
+            }
         }
 
         let n_frames = samples.len() / ch;
@@ -993,7 +1008,9 @@ mod tests {
     // Minimal f32/.npy reader (little-endian, C-order) for parity dumps.
     fn read_npy_f32(path: &str) -> Option<(Vec<usize>, Vec<f32>)> {
         let b = std::fs::read(path).ok()?;
-        if &b[..6] != b"\x93NUMPY" { return None; }
+        if &b[..6] != b"\x93NUMPY" {
+            return None;
+        }
         let hlen = u16::from_le_bytes([b[8], b[9]]) as usize;
         let hdr = std::str::from_utf8(&b[10..10 + hlen]).ok()?;
         let sp = hdr.find("'shape'")?;
@@ -1033,7 +1050,10 @@ mod tests {
         for i in 0..n * pd {
             max_abs = max_abs.max((pix[i] - ref_pix[i]).abs());
         }
-        assert!(max_abs < 1e-6, "patchify pixel_values differ: max_abs={max_abs}");
+        assert!(
+            max_abs < 1e-6,
+            "patchify pixel_values differ: max_abs={max_abs}"
+        );
         // positions exact.
         for i in 0..n {
             assert_eq!(pos[i][0] as f32, ref_pos[2 * i], "x mismatch at {i}");
@@ -1054,7 +1074,10 @@ mod tests {
             assert_eq!(th % unit, 0, "height not divisible by patch*pool_k");
             assert_eq!(tw % unit, 0, "width not divisible by patch*pool_k");
             let (gh, gw) = cfg.patch_grid(w, h);
-            assert!((gh / cfg.pooling_kernel_size) * (gw / cfg.pooling_kernel_size) <= cfg.max_soft_tokens);
+            assert!(
+                (gh / cfg.pooling_kernel_size) * (gw / cfg.pooling_kernel_size)
+                    <= cfg.max_soft_tokens
+            );
         }
     }
 
@@ -1099,7 +1122,10 @@ mod tests {
             span.position_span,
             span.token_count
         );
-        assert_eq!(span.position_span, span.grid.t.max(span.grid.h).max(span.grid.w));
+        assert_eq!(
+            span.position_span,
+            span.grid.t.max(span.grid.h).max(span.grid.w)
+        );
     }
 
     #[test]
@@ -1149,7 +1175,10 @@ mod tests {
         assert_eq!(max_h, anchor + span.grid.h - 1);
         assert_eq!(max_w, anchor + span.grid.w - 1);
         // The cursor advances past the largest extent.
-        assert_eq!(qwen_next_position(span.grid, anchor), anchor + span.position_span);
+        assert_eq!(
+            qwen_next_position(span.grid, anchor),
+            anchor + span.position_span
+        );
     }
 
     #[test]
@@ -1161,17 +1190,32 @@ mod tests {
         // Temporal index ranges over the merged temporal grid.
         let max_t = pos.iter().map(|p| p[0]).max().unwrap();
         assert_eq!(max_t, span.grid.t - 1);
-        assert!(span.grid.t > 1, "8 frames / temporal_patch_size should give t>1");
+        assert!(
+            span.grid.t > 1,
+            "8 frames / temporal_patch_size should give t>1"
+        );
     }
 
     // ── Arch selection ────────────────────────────────────────────────────
 
     #[test]
     fn arch_name_selection() {
-        assert_eq!(VisionArch::from_arch_name("gemma4"), Some(VisionArch::Gemma4));
-        assert_eq!(VisionArch::from_arch_name("Gemma4-27B"), Some(VisionArch::Gemma4));
-        assert_eq!(VisionArch::from_arch_name("qwen3_6"), Some(VisionArch::Qwen36));
-        assert_eq!(VisionArch::from_arch_name("qwen3_5_moe"), Some(VisionArch::Qwen36));
+        assert_eq!(
+            VisionArch::from_arch_name("gemma4"),
+            Some(VisionArch::Gemma4)
+        );
+        assert_eq!(
+            VisionArch::from_arch_name("Gemma4-27B"),
+            Some(VisionArch::Gemma4)
+        );
+        assert_eq!(
+            VisionArch::from_arch_name("qwen3_6"),
+            Some(VisionArch::Qwen36)
+        );
+        assert_eq!(
+            VisionArch::from_arch_name("qwen3_5_moe"),
+            Some(VisionArch::Qwen36)
+        );
         assert_eq!(VisionArch::from_arch_name("llama"), None);
     }
 

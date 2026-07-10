@@ -5,8 +5,8 @@
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use pie_model::instruct::{ReasoningDecoder, ReasoningEvent};
 use anyhow::Result;
+use pie_model::instruct::{ReasoningDecoder, ReasoningEvent};
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 

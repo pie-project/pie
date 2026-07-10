@@ -244,6 +244,15 @@ jobs:
       - name: cargo test (pie-worker)
         run: cargo test -p pie-worker --bin pie --no-default-features --features driver-metal
 
+      - name: Native Metal entrypoint validation
+        run: |
+          cmake -S driver/metal -B target/metal-validation -G Ninja \
+            -DPIE_METAL_WITH_MLX=OFF \
+            -DPIE_METAL_BUILD_STUB_TESTS=ON
+          cmake --build target/metal-validation --target metal_direct_stub_test
+          ctest --test-dir target/metal-validation \
+            --output-on-failure -R '^metal_direct_stub_test$'
+
   # Cuda build — runs only when an opt-in label or schedule fires
   # (no CUDA on the default GH-hosted runners). Add a self-hosted
   # runner with a CUDA toolkit to enable this. Until then, M3's
@@ -263,6 +272,16 @@ jobs:
         run: |
           cargo build -p pie-worker \
             --no-default-features --features driver-cuda
+
+      - name: Native CUDA entrypoint validation
+        run: |
+          CUDA_BUILD_DIR="$(find target/debug/build -type d \
+            -path '*/out/cuda/build' -print -quit)"
+          test -n "$CUDA_BUILD_DIR"
+          cmake --build "$CUDA_BUILD_DIR" \
+            --target test_entry_validation test_ptir_dispatch_bind
+          ctest --test-dir "$CUDA_BUILD_DIR" --output-on-failure \
+            -R '^(entry_validation|ptir_dispatch_bind)$'
 
       - name: Verify no CUDA shared deps
         run: |

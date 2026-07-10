@@ -1,8 +1,8 @@
 // decoder_smoke — proves RawMetalDecoder (the e2e seam body) drives the qwen3.6 raw_metal
 // pipeline correctly: setup() once, step() the golden prompt token-by-token (mirroring the
 // prefill→decode accumulation), and assert the final argmax == 264 (golden qwen36-pos7).
-// This is the standalone correctness gate for the host wrapper alpha's RawMetalExecutor
-// wraps; the e2e number itself comes from pie + benches/pie_bench.py.
+// This is the standalone correctness gate for the reusable host wrapper; the
+// e2e number itself comes from pie + benches/pie_bench.py.
 //
 // Usage: decoder_smoke <checkpoint_dir> <kernels_dir> [comma_prompt_ids] [expect_argmax]
 

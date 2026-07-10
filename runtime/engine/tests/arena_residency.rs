@@ -108,7 +108,10 @@ fn snapshot_blob_non_evictable_under_runtime() {
     let gpu_copy = a.alloc(ArenaKind::KvPage, 1).unwrap();
     a.set_evictable(gpu_copy.object_id, true).unwrap();
     a.mark_replayable(gpu_copy.object_id).unwrap();
-    assert_eq!(a.residency(gpu_copy.object_id).unwrap(), Residency::Replayable);
+    assert_eq!(
+        a.residency(gpu_copy.object_id).unwrap(),
+        Residency::Replayable
+    );
 
     // Blob still pinned in CPU, occupying capacity.
     assert_eq!(a.residency(blob.object_id).unwrap(), Residency::Cpu);

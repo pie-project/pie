@@ -2,7 +2,7 @@
 
 // LoadedModel — owns the loaded model. Built once at startup; queried from main
 // to populate the READY capability JSON and (later milestones) handed to the
-// shmem executor for forward-pass execution.
+// direct executor for forward-pass execution.
 
 #include <memory>
 #include <optional>

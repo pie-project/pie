@@ -11,8 +11,8 @@
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use pie_model::multimodal::{self, Processor, VisionArch};
 use anyhow::Result;
+use pie_model::multimodal::{self, Processor, VisionArch};
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -108,10 +108,7 @@ impl pie::inferlet::media::Host for InstanceState {}
 
 impl pie::inferlet::media::HostImage for InstanceState {
     /// Decode + resize + patchify an encoded still image per the bound model.
-    async fn from_bytes(
-        &mut self,
-        bytes: Vec<u8>,
-    ) -> Result<Result<Resource<Image>, String>> {
+    async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Image>, String>> {
         let (processor, prefix, suffix) = {
             let m = pie_model::model();
             let arch = m.arch_name();
@@ -260,10 +257,7 @@ impl pie::inferlet::media::HostVideo for InstanceState {
 impl pie::inferlet::media::HostAudio for InstanceState {
     /// Decode (WAV) + resample + log-mel an encoded audio clip per the bound
     /// model. Non-audio models return a clean error.
-    async fn from_bytes(
-        &mut self,
-        bytes: Vec<u8>,
-    ) -> Result<Result<Resource<Audio>, String>> {
+    async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Audio>, String>> {
         let (prefix, suffix) = {
             let m = pie_model::model();
             let arch = m.arch_name();

@@ -70,7 +70,11 @@ impl BlockPool {
     pub(crate) fn free(&mut self, ids: &[BlockId]) {
         for &id in ids {
             if id >= self.capacity {
-                tracing::error!(block = id, capacity = self.capacity, "arena: free of out-of-range block id");
+                tracing::error!(
+                    block = id,
+                    capacity = self.capacity,
+                    "arena: free of out-of-range block id"
+                );
                 continue;
             }
             if !self.free_set.insert(id) {

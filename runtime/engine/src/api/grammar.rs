@@ -2,15 +2,13 @@
 //! Tensor + Program resources.
 
 use crate::api::pie;
-use pie_grammar::compiled_grammar::CompiledGrammar;
-use pie_grammar::grammar::Grammar as InternalGrammar;
-use pie_grammar::json_schema::{
-    JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar,
-};
-use pie_grammar::matcher::GrammarMatcher;
-use pie_grammar::regex::regex_to_grammar;
 use crate::instance::InstanceState;
 use anyhow::Result;
+use pie_grammar::compiled_grammar::CompiledGrammar;
+use pie_grammar::grammar::Grammar as InternalGrammar;
+use pie_grammar::json_schema::{JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar};
+use pie_grammar::matcher::GrammarMatcher;
+use pie_grammar::regex::regex_to_grammar;
 use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -20,7 +18,6 @@ use wasmtime_wasi::WasiView;
 // moved free fns and the external `api::inference::execute_profile_snapshot`
 // path keeps resolving.
 pub(crate) use crate::inference::execute::*;
-
 
 impl pie::inferlet::grammar::Host for InstanceState {}
 
@@ -181,7 +178,6 @@ impl pie::inferlet::grammar::HostMatcher for InstanceState {
         Ok(())
     }
 }
-
 
 // The sampling-IR program tests (`is_recognized_standard`, `decode_program`,
 // `build_output_tensors`, bytecode round-trips) were removed with the

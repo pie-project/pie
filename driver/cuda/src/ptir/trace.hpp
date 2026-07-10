@@ -147,8 +147,8 @@ struct ChannelPut {
     ValueId   value = 0;
 };
 
-// A declared program output slot (host-facing marshaling), carried through to
-// ForwardResponse by the executor. `kind` mirrors the SDK OutputKind.
+// A declared program output slot (host-facing publication metadata). `kind`
+// mirrors the SDK OutputKind.
 enum class OutputKind : std::uint8_t {
     Token = 0, Distribution = 1, Logits = 2, Logprobs = 3,
     Entropy = 4, Scalar = 5, Embedding = 6,

@@ -2,7 +2,7 @@
 //! RS sibling of `ptir_kv`. A linear-attention / GDN model (Qwen3.5 GDN,
 //! Nemotron-H Mamba2 — `executor.rs_cache != nullptr`) requires every forward to
 //! carry one runtime-assigned recurrent-state slot per request in
-//! `ForwardRequest.rs_slot_ids`, else the executor throws "rs_cache forward
+//! `LaunchPlan.rs_slot_ids`, else the executor throws "rs_cache forward
 //! missing runtime-assigned slot ids" (executor.cpp:2671). The normal
 //! `execute_impl` path populates this from a WIT-bound `RsWorkingSet`; the PTIR
 //! pipeline has no such WIT call, so this module assigns the slot itself —
@@ -44,7 +44,7 @@ pub struct PtirRsTxn {
 /// columns for a single-request fire:
 ///
 /// Returns `(rs_slot_ids, rs_slot_flags, cow_move, txn)`: pass `rs_slot_ids` /
-/// `rs_slot_flags` into the `ForwardRequest` (parallel to the KV geometry), issue
+/// `rs_slot_flags` into the `LaunchPlan` (parallel to the KV geometry), issue
 /// `cow_move` as a d2d copy before the fire when present (a shared-fork CoW; empty
 /// for the single-context pipeline), hold `txn` across the fire, then
 /// [`ptir_rs_finalize`]. Single-request (R=1) — the PTIR pipeline fires one
@@ -58,7 +58,7 @@ pub fn ptir_rs_prepare(
     let block = arena.blocks(plan.folded_slot).map_err(|e| e.to_string())?[0];
     let rs_slot_ids = vec![block];
     let flag = if plan.reset {
-        pie_driver_abi::RS_FLAG_RESET
+        crate::driver::RS_FLAG_RESET
     } else {
         0u8
     };
@@ -139,11 +139,14 @@ mod tests {
         let mut w = ws();
         let (ids, flags, cow_move, txn) = ptir_rs_prepare(&mut w, &mut a).unwrap();
         assert_eq!(ids.len(), 1, "one folded slot for the single-request fire");
-        assert_eq!(flags, vec![pie_driver_abi::RS_FLAG_RESET], "fresh ⇒ RESET");
+        assert_eq!(flags, vec![crate::driver::RS_FLAG_RESET], "fresh ⇒ RESET");
         assert!(cow_move.is_none(), "fresh alloc ⇒ no CoW d2d");
         assert!(w.folded_object().is_none(), "not adopted until commit");
         ptir_rs_finalize(&mut w, &mut a, txn, true).unwrap();
-        assert!(w.folded_object().is_some(), "committed ⇒ folded slot adopted");
+        assert!(
+            w.folded_object().is_some(),
+            "committed ⇒ folded slot adopted"
+        );
     }
 
     /// A continuing decode fire (folded state already committed) CoW-continues the
@@ -155,7 +158,7 @@ mod tests {
         let mut w = ws();
         // Fire 1 (fresh): commit so the folded state exists.
         let (ids0, flags0, _m0, t0) = ptir_rs_prepare(&mut w, &mut a).unwrap();
-        assert_eq!(flags0, vec![pie_driver_abi::RS_FLAG_RESET]);
+        assert_eq!(flags0, vec![crate::driver::RS_FLAG_RESET]);
         ptir_rs_finalize(&mut w, &mut a, t0, true).unwrap();
         let slot0 = ids0[0];
 
@@ -164,7 +167,10 @@ mod tests {
         assert_eq!(ids1.len(), 1);
         assert_eq!(flags1, vec![0u8], "continuing fire ⇒ no RESET");
         ptir_rs_finalize(&mut w, &mut a, t1, true).unwrap();
-        assert!(w.folded_object().is_some(), "state still present after fire 2");
+        assert!(
+            w.folded_object().is_some(),
+            "state still present after fire 2"
+        );
         let _ = slot0;
     }
 
@@ -178,7 +184,7 @@ mod tests {
             let (ids, flags, _m, txn) = ptir_rs_prepare(&mut w, &mut a).unwrap();
             assert_eq!(ids.len(), 1, "step {step}");
             let want = if step == 0 {
-                pie_driver_abi::RS_FLAG_RESET
+                crate::driver::RS_FLAG_RESET
             } else {
                 0u8
             };
@@ -202,7 +208,11 @@ mod tests {
         );
         // The next fire is still fresh (re-resets) — no half-committed drift.
         let (_ids2, flags2, _m2, t2) = ptir_rs_prepare(&mut w, &mut a).unwrap();
-        assert_eq!(flags2, vec![pie_driver_abi::RS_FLAG_RESET], "re-fresh after abort");
+        assert_eq!(
+            flags2,
+            vec![crate::driver::RS_FLAG_RESET],
+            "re-fresh after abort"
+        );
         ptir_rs_finalize(&mut w, &mut a, t2, true).unwrap();
     }
 }

@@ -68,7 +68,11 @@ pub fn assert_mirostat_converged(json: &str, tol: f32) -> Check {
         return Err("s_flowed=false — Scalar S channel not marshaled; μ-update skipped".into());
     }
     if r.tokens.len() != r.count {
-        return Err(format!("token count mismatch: count={} tokens={}", r.count, r.tokens.len()));
+        return Err(format!(
+            "token count mismatch: count={} tokens={}",
+            r.count,
+            r.tokens.len()
+        ));
     }
     if r.count == 0 {
         return Err("mirostat produced zero tokens".into());
@@ -101,7 +105,11 @@ pub fn assert_grammar_conformant(json: &str, alphabet: &[u32]) -> Check {
         return Err("inferlet reported conformant=false".into());
     }
     if r.tokens.len() != r.count {
-        return Err(format!("token count mismatch: count={} tokens={}", r.count, r.tokens.len()));
+        return Err(format!(
+            "token count mismatch: count={} tokens={}",
+            r.count,
+            r.tokens.len()
+        ));
     }
     if r.count == 0 {
         return Err("grammar produced zero tokens".into());
@@ -110,13 +118,16 @@ pub fn assert_grammar_conformant(json: &str, alphabet: &[u32]) -> Check {
     let mut prev: Option<u32> = None;
     for (i, &t) in r.tokens.iter().enumerate() {
         if !alphabet.contains(&t) {
-            return Err(format!("token[{i}]={t} not in allowed alphabet {alphabet:?}"));
+            return Err(format!(
+                "token[{i}]={t} not in allowed alphabet {alphabet:?}"
+            ));
         }
         if Some(t) == prev {
-            return Err(format!("token[{i}]={t} repeats previous (no-repeat violated)"));
+            return Err(format!(
+                "token[{i}]={t} repeats previous (no-repeat violated)"
+            ));
         }
         prev = Some(t);
     }
     Ok(())
 }
-

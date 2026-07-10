@@ -1,29 +1,41 @@
-// pie_driver_cuda — standalone executable shim.
-//
-// All logic lives in entry.cpp / pie_driver_cuda_lib so the same
-// translation units back both this executable and the static lib that
-// `worker/standalone` links into the all-Rust binary when built with
-// `--features driver-cuda`.
-
 #include <iostream>
+#include <string>
 
-#include "entry.hpp"
+#include <pie_driver_abi.h>
 
 namespace {
 
-// Default capability handshake: emit `READY <json>` on stdout so the
-// Python wrapper (`pie/src/pie_driver_cuda_native/worker.py`) can pick
-// it up via line-buffered stdout. Library callers in worker/standalone
-// supply their own callback to receive the JSON in-process.
-void default_ready_to_stdout(const char* caps_json, void* /*ctx*/) {
-    std::cout << "READY " << caps_json << std::endl;
-}
+void noop_notify(void*, std::uint64_t, std::uint64_t) {}
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    return pie_driver_cuda_run(argc, argv,
-                               /*install_signal_handlers=*/1,
-                               default_ready_to_stdout,
-                               /*ready_ctx=*/nullptr);
+    std::string config_path = "dev.toml";
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if ((arg == "-c" || arg == "--config") && i + 1 < argc) {
+            config_path = argv[++i];
+        } else {
+            std::cerr << "usage: pie_driver_cuda [-c CONFIG]" << std::endl;
+            return 1;
+        }
+    }
+
+    PieDriverCreateDesc desc{};
+    desc.abi_version = PIE_DRIVER_ABI_VERSION;
+    desc.reserved0 = 0;
+    desc.runtime.abi_version = PIE_DRIVER_ABI_VERSION;
+    desc.runtime.reserved0 = 0;
+    desc.runtime.notify = noop_notify;
+    desc.config_bytes.ptr = reinterpret_cast<const std::uint8_t*>(config_path.data());
+    desc.config_bytes.len = config_path.size();
+    PieDriverCaps caps{};
+    PieDriver* driver = pie_cuda_create(&desc, &caps);
+    if (driver == nullptr) return 1;
+    std::cout << "READY "
+              << std::string(
+                     reinterpret_cast<const char*>(caps.json_bytes), caps.json_len)
+              << std::endl;
+    pie_cuda_destroy(driver);
+    return 0;
 }

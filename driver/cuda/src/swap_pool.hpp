@@ -44,6 +44,8 @@ public:
     int num_pages() const noexcept { return num_pages_; }
     int num_layers() const noexcept { return num_layers_; }
     std::size_t bytes_per_page() const noexcept { return page_bytes_; }
+    cudaStream_t stream() const noexcept { return stream_; }
+    void synchronize() const;
 
     // Bulk page copies, src/dst expressed as page indices. Pairs are
     // issued via `cudaMemcpyAsync` on a dedicated swap stream; we sync only
@@ -54,17 +56,28 @@ public:
     void copy_d2h(KvCache& cache,
                   std::span<const std::uint32_t> src_gpu_pages,
                   std::span<const std::uint32_t> dst_host_slots);
+    void copy_d2h_async(KvCache& cache,
+                        std::span<const std::uint32_t> src_gpu_pages,
+                        std::span<const std::uint32_t> dst_host_slots);
 
     void copy_h2d(KvCache& cache,
                   std::span<const std::uint32_t> src_host_slots,
                   std::span<const std::uint32_t> dst_gpu_pages);
+    void copy_h2d_async(KvCache& cache,
+                        std::span<const std::uint32_t> src_host_slots,
+                        std::span<const std::uint32_t> dst_gpu_pages);
 
     void copy_d2d(KvCache& cache,
                   std::span<const std::uint32_t> src_gpu_pages,
                   std::span<const std::uint32_t> dst_gpu_pages);
+    void copy_d2d_async(KvCache& cache,
+                        std::span<const std::uint32_t> src_gpu_pages,
+                        std::span<const std::uint32_t> dst_gpu_pages);
 
     void copy_h2h(std::span<const std::uint32_t> src_host_slots,
                   std::span<const std::uint32_t> dst_host_slots);
+    void copy_h2h_async(std::span<const std::uint32_t> src_host_slots,
+                        std::span<const std::uint32_t> dst_host_slots);
 
 private:
     int num_layers_ = 0;

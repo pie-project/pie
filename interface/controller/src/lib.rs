@@ -13,9 +13,8 @@
 //! (worker roster + coarse load) via long-poll watches, and tracks liveness from
 //! heartbeats.
 //!
-//! These are plain serde — deliberately NOT rkyv (`#[schema]`): the control
-//! plane is cross-node, low-rate Rust↔Rust and never rides the zero-copy tensor
-//! ring, so it is NOT part of `SCHEMA_HASH`. Cluster-unique id atoms
+//! These are plain serde: the control plane is cross-node and low-rate.
+//! Cluster-unique id atoms
 //! ([`WorkerId`]/[`GatewayId`]/[`NodeId`]) come from the leaf `pie-ids` crate and
 //! are re-exported here for ergonomics.
 

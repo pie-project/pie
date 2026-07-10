@@ -1,63 +1,51 @@
-// pie_driver_metal — MLX/Metal backend library entry point (foundation
-// skeleton).
-//
-// All meaningful logic lives in `run_impl`; the `extern "C"` wrappers at
-// the bottom catch any escaping C++ exception so we never propagate across
-// the FFI boundary (which would be UB). Mirrors the shape of
-// driver/cuda/src/entry.cpp.
-//
-// This is the seam beta/charlie/delta build on: the stub `InProcService`
-// answers Health + Forward (dummy tokens) so the driver compiles, links,
-// registers with `pie-worker`, and round-trips before the MLX compute
-// layer, model graphs, and weight loader land.
-
 #include "entry.hpp"
 
+#include <algorithm>
 #include <cctype>
-#include <csignal>
 #include <cstdint>
-#include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
-#include <CLI/CLI.hpp>
 #include <nlohmann/json.hpp>
-#include <pie_ipc/inproc_server.hpp>
 
 #include "config.hpp"
-#include "driver_startup.hpp"
-#include "raw_metal/raw_metal_executor.hpp"
-#include "service/inproc_service.hpp"
-
-#if defined(PIE_METAL_HAS_MLX)
-#include <cstdlib>
-
-#include <mlx/mlx.h>
-
-#include "executor/executor.hpp"
-#include "kv_cache.hpp"
-#include "loader/model_loader.hpp"
-#include "model/config.hpp"
-#include "model/model_graph.hpp"
-#include "model/weights.hpp"
-#endif
+#include "pie_native/abi_validation.hpp"
+#include "pie_native/ptir_channels.hpp"
 
 namespace {
 
-// Model facts the caps handshake needs. Read best-effort from the
-// snapshot's config.json; the stub falls back to neutral defaults when no
-// snapshot is wired (e.g. the standalone self-check). The weight loader
-// (delta) supersedes this with values pinned by the actual checkpoint.
+struct ProgramRecord {
+    std::uint64_t program_id = 0;
+    std::uint64_t program_hash = 0;
+    std::vector<std::uint8_t> canonical;
+    std::vector<std::uint8_t> sidecar;
+    std::vector<pie_native::PtirChannelDecl> channels;
+};
+
+struct InstanceRecord {
+    std::uint64_t instance_id = 0;
+    std::uint64_t program_id = 0;
+    std::uint64_t program_hash = 0;
+    std::vector<std::uint64_t> channel_ids;
+    std::vector<PieChannelWait> channel_waits;
+    std::vector<PieChannelBinding> channel_bindings;
+    std::vector<std::uint8_t> mirror;
+    std::vector<std::uint64_t> words;
+    std::uint64_t fire_seq = 0;
+};
+
 struct ModelFacts {
     std::uint32_t vocab_size = 32000;
     std::uint32_t max_model_len = 8192;
     std::string arch_name = "llama";
-    // True for hybrid linear-attention archs (qwen3.6 / qwen3_next): they need a
-    // recurrent-state slot pool (rs_cache) advertised so the runtime allocates
-    // per-request rs_slot_ids. Detected from config.json (incl. text_config).
     bool has_linear_attn = false;
 };
 
@@ -89,8 +77,6 @@ ModelFacts read_model_facts(const std::string& hf_path) {
             }
             if (!a.empty()) facts.arch_name = a;
         }
-        // Hybrid linear-attention detection (qwen3.6 / qwen3_next). Config keys
-        // live under `text_config` on multimodal-style dumps, else at the root.
         const nlohmann::json& tc =
             (j.contains("text_config") && j["text_config"].is_object())
                 ? j["text_config"]
@@ -102,8 +88,7 @@ ModelFacts read_model_facts(const std::string& hf_path) {
         }
         if (tc.contains("layer_types") && tc["layer_types"].is_array()) {
             for (const auto& t : tc["layer_types"]) {
-                if (t.is_string() &&
-                    t.get<std::string>() == "linear_attention") {
+                if (t.is_string() && t.get<std::string>() == "linear_attention") {
                     facts.has_linear_attn = true;
                     break;
                 }
@@ -118,41 +103,30 @@ ModelFacts read_model_facts(const std::string& hf_path) {
 
 std::string build_caps_json(const pie_metal_driver::Config& cfg,
                             const ModelFacts& facts) {
-    const std::uint32_t total_pages = cfg.batching.total_pages;
-    // Hybrid linear-attention archs (qwen3.6) need a recurrent-state slot pool:
-    // delta's LinearStateCache is sized to max_forward_requests, so advertise
-    // that many rs_cache slots and clamp max_forward_requests to it (mirrors the
-    // cuda driver). The runtime then allocates per-request rs_slot_ids in range.
     const bool rs_cache_required = facts.has_linear_attn;
     const std::uint32_t rs_cache_slots =
         rs_cache_required ? cfg.batching.max_forward_requests : 0u;
+    const std::uint32_t rs_cache_slot_bytes = 0u;
     const std::uint32_t max_forward_requests =
         rs_cache_required
             ? std::min(cfg.batching.max_forward_requests, rs_cache_slots)
             : cfg.batching.max_forward_requests;
     nlohmann::json caps = {
-        {"total_pages", total_pages},
+        {"abi_version", PIE_DRIVER_ABI_VERSION},
+        {"total_pages", cfg.batching.total_pages},
         {"kv_page_size", cfg.batching.kv_page_size},
         {"swap_pool_size", cfg.batching.cpu_pages},
-        {"max_forward_tokens", cfg.batching.max_forward_tokens},
-        {"max_forward_requests", max_forward_requests},
         {"rs_cache_required", rs_cache_required},
         {"rs_cache_slots", rs_cache_slots},
-        {"max_page_refs", total_pages},
-        {"max_logit_rows", UINT32_MAX},
-        {"max_prob_rows", UINT32_MAX},
-        {"max_custom_mask_bytes", UINT32_MAX},
-        {"max_sampler_rows", UINT32_MAX},
-        {"max_logprob_labels", UINT32_MAX},
+        {"rs_cache_slot_bytes", rs_cache_slot_bytes},
+        {"max_forward_tokens", cfg.batching.max_forward_tokens},
+        {"max_forward_requests", max_forward_requests},
+        {"max_page_refs", cfg.batching.total_pages},
         {"arch_name", facts.arch_name},
         {"vocab_size", facts.vocab_size},
         {"max_model_len", facts.max_model_len},
         {"activation_dtype", "bf16"},
         {"snapshot_dir", cfg.model.hf_path},
-        // Device storage-target hints (weight-loader Variant A). The Metal
-        // backend does not drive the Rust in-process storage compiler, so it
-        // advertises its backend tag with otherwise neutral values (the
-        // runtime's DriverCapabilities fields are serde-defaulted).
         {"storage_backend", "metal"},
         {"max_tile_bytes", 0},
         {"preferred_alignment", 0},
@@ -162,310 +136,403 @@ std::string build_caps_json(const pie_metal_driver::Config& cfg,
     return caps.dump();
 }
 
-#if defined(PIE_METAL_HAS_MLX)
-namespace mx = mlx::core;
+constexpr std::uint32_t pacing_word_index() noexcept { return 0; }
+constexpr std::uint32_t head_word_index(std::uint32_t channel) noexcept {
+    return 1 + 3 * channel;
+}
+constexpr std::uint32_t tail_word_index(std::uint32_t channel) noexcept {
+    return 2 + 3 * channel;
+}
+constexpr std::uint32_t poison_word_index(std::uint32_t channel) noexcept {
+    return 3 + 3 * channel;
+}
+constexpr std::uint32_t word_count(std::uint32_t channel_count) noexcept {
+    return 1 + 3 * channel_count;
+}
 
-// The live forward pipeline: charlie's arch graph + delta's paged KV cache +
-// beta's executor that drives them per Forward fire. Owned by the serve loop
-// and attached to the InProcService; the Executor borrows graph + kv, so field
-// order matters (graph + kv declared before, destroyed after, the executor).
-struct ModelRuntime {
-    std::unique_ptr<pie_metal_driver::model::ModelGraph> graph;
-    std::unique_ptr<pie_metal_driver::PagedKvCache>      kv;
-    // Hybrid linear-attention state store (qwen3.6); null for non-hybrid archs.
-    // Declared before `executor` so it outlives the borrowing Executor.
-    std::unique_ptr<pie_metal_driver::LinearStateCache>  lin_cache;
-    std::unique_ptr<pie_metal_driver::Executor>          executor;
+class MetalDriver {
+  public:
+    explicit MetalDriver(const PieDriverCreateDesc& desc) : runtime_(desc.runtime) {}
+
+    int initialize(const std::string& config_path) {
+        cfg_ = pie_metal_driver::load_config(config_path);
+        facts_ = read_model_facts(cfg_.model.hf_path);
+        caps_json_ = build_caps_json(cfg_, facts_);
+        return PIE_STATUS_OK;
+    }
+
+    void fill_caps(PieDriverCaps* caps) const {
+        if (caps == nullptr) return;
+        caps->json_bytes = reinterpret_cast<const std::uint8_t*>(caps_json_.data());
+        caps->json_len = caps_json_.size();
+    }
+
+    int register_program(const PieProgramDesc& program, std::uint64_t* program_id) {
+        auto found = program_ids_by_hash_.find(program.program_hash);
+        if (found != program_ids_by_hash_.end()) {
+            if (program_id != nullptr) *program_id = found->second;
+            return PIE_STATUS_OK;
+        }
+        if (program.canonical_bytes.len == 0)
+            return PIE_STATUS_INVALID_ARGUMENT;
+
+        ProgramRecord record;
+        record.program_id = next_program_id_++;
+        record.program_hash = program.program_hash;
+        record.canonical.assign(program.canonical_bytes.ptr,
+                                program.canonical_bytes.ptr + program.canonical_bytes.len);
+        std::string decode_error;
+        if (!pie_native::decode_ptir_channels(
+                record.canonical.data(), record.canonical.size(),
+                record.channels, &decode_error)) {
+            std::cerr << "[pie-driver-metal] register_program: "
+                      << decode_error << "\n";
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        if (program.sidecar_bytes.ptr != nullptr && program.sidecar_bytes.len > 0) {
+            record.sidecar.assign(program.sidecar_bytes.ptr,
+                                  program.sidecar_bytes.ptr + program.sidecar_bytes.len);
+        }
+        program_ids_by_hash_[record.program_hash] = record.program_id;
+        if (program_id != nullptr) *program_id = record.program_id;
+        programs_.emplace(record.program_id, std::move(record));
+        return PIE_STATUS_OK;
+    }
+
+    int bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding) {
+        if (programs_.find(instance.program_id) == programs_.end())
+            return PIE_STATUS_INVALID_ARGUMENT;
+        const std::uint64_t instance_id =
+            instance.requested_instance_id != 0 ? instance.requested_instance_id : next_instance_id_++;
+        InstanceRecord record;
+        record.instance_id = instance_id;
+        record.program_id = instance.program_id;
+        record.program_hash = programs_.at(instance.program_id).program_hash;
+        const ProgramRecord& program = programs_.at(instance.program_id);
+        if (instance.channel_ids.len != program.channels.size() ||
+            instance.channel_waits.len != program.channels.size()) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        {
+            std::unordered_set<std::uint64_t> unique_ids(
+                instance.channel_ids.ptr,
+                instance.channel_ids.ptr + instance.channel_ids.len);
+            if (unique_ids.size() != instance.channel_ids.len) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            std::unordered_set<std::uint64_t> seeded_ids;
+            for (std::size_t i = 0; i < instance.seed_values.len; ++i) {
+                const PieChannelValueDesc& seed = instance.seed_values.ptr[i];
+                const auto id = std::find(
+                    instance.channel_ids.ptr,
+                    instance.channel_ids.ptr + instance.channel_ids.len,
+                    seed.channel_id);
+                if (id == instance.channel_ids.ptr + instance.channel_ids.len ||
+                    !seeded_ids.insert(seed.channel_id).second) {
+                    return PIE_STATUS_INVALID_ARGUMENT;
+                }
+                const std::size_t channel =
+                    static_cast<std::size_t>(id - instance.channel_ids.ptr);
+                if (!program.channels[channel].seeded ||
+                    seed.bytes.len != program.channels[channel].cell_bytes()) {
+                    return PIE_STATUS_INVALID_ARGUMENT;
+                }
+            }
+        }
+        record.channel_ids.assign(
+            instance.channel_ids.ptr,
+            instance.channel_ids.ptr + instance.channel_ids.len);
+        record.channel_waits.assign(
+            instance.channel_waits.ptr,
+            instance.channel_waits.ptr + instance.channel_waits.len);
+        std::uint64_t mirror_offset = 0;
+        record.channel_bindings.reserve(record.channel_ids.size());
+        std::uint32_t reader_rank = 0;
+        for (std::size_t i = 0; i < record.channel_ids.size(); ++i) {
+            const auto& decl = program.channels[i];
+            if (decl.host_role != pie_native::PTIR_HOST_READER) continue;
+            const std::uint32_t cell_bytes = decl.cell_bytes();
+            record.channel_bindings.push_back(PieChannelBinding{
+                .channel_id = record.channel_ids[i],
+                .cell_bytes = cell_bytes,
+                .capacity = decl.capacity,
+                .mirror_offset = mirror_offset,
+                .head_word_index = head_word_index(reader_rank),
+                .tail_word_index = tail_word_index(reader_rank),
+                .poison_word_index = poison_word_index(reader_rank),
+                .reserved = 0,
+            });
+            mirror_offset +=
+                static_cast<std::uint64_t>(cell_bytes) * (decl.capacity + 1);
+            ++reader_rank;
+        }
+        record.mirror.assign(static_cast<std::size_t>(mirror_offset), 0);
+        record.words.assign(word_count(static_cast<std::uint32_t>(record.channel_bindings.size())), 0);
+        for (std::size_t s = 0; s < instance.seed_values.len; ++s) {
+            const PieChannelValueDesc& seed = instance.seed_values.ptr[s];
+            for (const PieChannelBinding& channel : record.channel_bindings) {
+                if (channel.channel_id != seed.channel_id) continue;
+                const std::size_t n = std::min<std::size_t>(
+                    channel.cell_bytes, seed.bytes.len);
+                if (n > 0 && seed.bytes.ptr != nullptr) {
+                    std::memcpy(record.mirror.data() + channel.mirror_offset,
+                                seed.bytes.ptr, n);
+                    record.words[channel.tail_word_index] = 1;
+                }
+                break;
+            }
+        }
+        if (binding != nullptr) {
+            std::memset(binding, 0, sizeof(*binding));
+            binding->instance_id = instance_id;
+            binding->mirror_base = reinterpret_cast<std::uint64_t>(record.mirror.data());
+            binding->word_base = reinterpret_cast<std::uint64_t>(record.words.data());
+            binding->channel_count =
+                static_cast<std::uint32_t>(record.channel_bindings.size());
+            binding->word_count = word_count(binding->channel_count);
+            binding->mirror_bytes = record.mirror.size();
+            binding->word_bytes = record.words.size() * sizeof(std::uint64_t);
+            binding->channels.ptr = record.channel_bindings.data();
+            binding->channels.len = record.channel_bindings.size();
+        }
+        instances_[instance_id] = std::move(record);
+        return PIE_STATUS_OK;
+    }
+
+    int launch(const PieLaunchDesc& launch, PieCompletion completion) {
+        for (std::size_t i = 0; i < launch.instance_ids.len; ++i) {
+            if (instances_.find(launch.instance_ids.ptr[i]) == instances_.end())
+                return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        if (launch.instance_ids.len == 0) {
+            notify_inline(completion);
+            return PIE_STATUS_OK;
+        }
+        for (std::size_t i = 0; i < launch.instance_ids.len; ++i) {
+            const InstanceRecord& instance =
+                instances_.at(launch.instance_ids.ptr[i]);
+            const ProgramRecord& program = programs_.at(instance.program_id);
+            std::unordered_set<std::uint64_t> put_ids;
+            const std::uint32_t lo = launch.host_put_indptr.len == 0
+                ? 0
+                : launch.host_put_indptr.ptr[i];
+            const std::uint32_t hi = launch.host_put_indptr.len == 0
+                ? 0
+                : launch.host_put_indptr.ptr[i + 1];
+            for (std::uint32_t e = lo; e < hi; ++e) {
+                const PieChannelValueDesc& value =
+                    launch.ptir_host_put_values.ptr[e];
+                const auto id = std::find(
+                    instance.channel_ids.begin(),
+                    instance.channel_ids.end(),
+                    value.channel_id);
+                if (id == instance.channel_ids.end() ||
+                    !put_ids.insert(value.channel_id).second) {
+                    return PIE_STATUS_INVALID_ARGUMENT;
+                }
+                const std::size_t channel =
+                    static_cast<std::size_t>(id - instance.channel_ids.begin());
+                if (program.channels[channel].host_role !=
+                        pie_native::PTIR_HOST_WRITER ||
+                    value.bytes.len != program.channels[channel].cell_bytes()) {
+                    return PIE_STATUS_INVALID_ARGUMENT;
+                }
+            }
+        }
+        const bool have_host_puts =
+            launch.host_put_indptr.ptr != nullptr &&
+            launch.host_put_indptr.len == launch.instance_ids.len + 1 &&
+            (launch.ptir_host_put_values.len == 0 ||
+             launch.ptir_host_put_values.ptr != nullptr);
+        for (std::size_t i = 0; i < launch.instance_ids.len; ++i) {
+            InstanceRecord& instance = instances_.at(launch.instance_ids.ptr[i]);
+            ++instance.fire_seq;
+            instance.words[pacing_word_index()] = instance.fire_seq;
+            if (!have_host_puts) continue;
+            const std::uint32_t lo = launch.host_put_indptr.ptr[i];
+            const std::uint32_t hi = launch.host_put_indptr.ptr[i + 1];
+            for (std::uint32_t e = lo; e < hi; ++e) {
+                const PieChannelValueDesc& value = launch.ptir_host_put_values.ptr[e];
+                for (std::size_t c = 0; c < instance.channel_bindings.size(); ++c) {
+                    const PieChannelBinding& channel = instance.channel_bindings[c];
+                    if (channel.channel_id != value.channel_id) continue;
+                    if (value.bytes.ptr != nullptr && !instance.mirror.empty()) {
+                        const std::size_t n = std::min<std::size_t>(
+                            channel.cell_bytes, value.bytes.len);
+                        std::memcpy(instance.mirror.data() + channel.mirror_offset,
+                                    value.bytes.ptr, n);
+                    }
+                    instance.words[channel.head_word_index] = 0;
+                    instance.words[channel.tail_word_index] = 1;
+                    instance.words[channel.poison_word_index] = 0;
+                    break;
+                }
+            }
+        }
+        notify_inline(completion);
+        return PIE_STATUS_OK;
+    }
+
+    int copy_kv(const PieKvCopyDesc&, PieCompletion completion) {
+        notify_inline(completion);
+        return PIE_STATUS_OK;
+    }
+    int copy_state(const PieStateCopyDesc&, PieCompletion completion) {
+        notify_inline(completion);
+        return PIE_STATUS_OK;
+    }
+    int resize_pool(const PiePoolResizeDesc&, PieCompletion completion) {
+        notify_inline(completion);
+        return PIE_STATUS_OK;
+    }
+
+    int close_instance(std::uint64_t instance_id) {
+        auto it = instances_.find(instance_id);
+        if (it == instances_.end()) return PIE_STATUS_CLOSED;
+        instances_.erase(it);
+        return PIE_STATUS_OK;
+    }
+
+  private:
+    void notify_inline(PieCompletion completion) const {
+        if (runtime_.notify != nullptr && completion.wait_id != 0) {
+            runtime_.notify(runtime_.ctx, completion.wait_id, completion.target_epoch);
+        }
+    }
+
+    PieRuntimeCallbacks runtime_{};
+    pie_metal_driver::Config cfg_{};
+    ModelFacts facts_{};
+    std::string caps_json_;
+    std::uint64_t next_program_id_ = 1;
+    std::uint64_t next_instance_id_ = 1;
+    std::unordered_map<std::uint64_t, ProgramRecord> programs_;
+    std::unordered_map<std::uint64_t, std::uint64_t> program_ids_by_hash_;
+    std::unordered_map<std::uint64_t, InstanceRecord> instances_;
 };
 
-// Random bf16 weight, scaled small to keep synthetic activations finite.
-pie_metal_driver::Tensor synth_w(std::initializer_list<int> shape,
-                                 float scale = 0.02f) {
-    mx::Shape s(shape);
-    return mx::astype(
-        mx::multiply(mx::random::normal(s, mx::float32), mx::array(scale)),
-        mx::bfloat16);
-}
-pie_metal_driver::Tensor synth_norm(int n) {
-    return mx::astype(mx::ones({n}, mx::float32), mx::bfloat16);
-}
-
-// Build a small random Llama-shaped model so the executor path can be driven
-// end-to-end on the Metal GPU before delta's weight_loader lands. Gated behind
-// PIE_METAL_SYNTHETIC_MODEL=1 — a dev/self-test affordance only. The real path
-// (delta's loader → ModelConfig + ModelWeights from the checkpoint) replaces
-// this builder; the rest of the wiring (graph + kv + executor) is identical.
-std::unique_ptr<ModelRuntime> build_synthetic_runtime(
-    const pie_metal_driver::Config& cfg, const ModelFacts& facts) {
-    using namespace pie_metal_driver;
-    using namespace pie_metal_driver::model;
-
-    model::ModelConfig mc;
-    mc.arch                    = PieArch::Llama3;
-    mc.hf_model_type           = "llama";
-    mc.num_hidden_layers       = 2;
-    mc.num_attention_heads     = 4;
-    mc.num_key_value_heads     = 2;
-    mc.head_dim                = 16;
-    mc.hidden_size             = mc.num_attention_heads * mc.head_dim;
-    mc.intermediate_size       = 128;
-    mc.vocab_size              = static_cast<std::int32_t>(facts.vocab_size);
-    mc.max_position_embeddings = static_cast<std::int32_t>(facts.max_model_len);
-    mc.rms_norm_eps            = 1e-6f;
-    mc.rope_theta              = 10000.0f;
-    mc.tie_word_embeddings     = true;
-
-    const int H   = mc.hidden_size;
-    const int qd  = mc.num_attention_heads * mc.head_dim;
-    const int kvd = mc.num_key_value_heads * mc.head_dim;
-    const int I   = mc.intermediate_size;
-    const int V   = mc.vocab_size;
-
-    ModelWeights w;
-    w.embed      = synth_w({V, H});
-    w.final_norm = synth_norm(H);
-    w.layers.resize(mc.num_hidden_layers);
-    for (auto& L : w.layers) {
-        L.attn_norm = synth_norm(H);
-        L.ffn_norm  = synth_norm(H);
-        L.q_proj    = synth_w({qd,  H});
-        L.k_proj    = synth_w({kvd, H});
-        L.v_proj    = synth_w({kvd, H});
-        L.o_proj    = synth_w({H,   qd});
-        L.gate_proj = synth_w({I,   H});
-        L.up_proj   = synth_w({I,   H});
-        L.down_proj = synth_w({H,   I});
-    }
-
-    auto rt = std::make_unique<ModelRuntime>();
-    rt->graph = make_model_graph(mc, std::move(w));
-
-    PagedKvGeometry geo;
-    geo.n_layers   = mc.num_hidden_layers;
-    geo.page_size  = static_cast<int>(cfg.batching.kv_page_size);
-    geo.n_pages    = static_cast<int>(cfg.batching.total_pages);
-    geo.n_kv_heads = mc.num_key_value_heads;
-    geo.head_dim   = mc.head_dim;
-    rt->kv = std::make_unique<PagedKvCache>(geo, DType::BF16);
-
-    rt->executor = std::make_unique<Executor>(*rt->graph, *rt->kv);
-    return rt;
+PieDriver* create_driver_impl(const PieDriverCreateDesc* desc, PieDriverCaps* caps) {
+    std::memset(caps, 0, sizeof(*caps));
+    const std::string config_path(
+        reinterpret_cast<const char*>(desc->config_bytes.ptr),
+        desc->config_bytes.len);
+    auto driver = std::make_unique<MetalDriver>(*desc);
+    const int rc = driver->initialize(config_path);
+    if (rc != PIE_STATUS_OK) return nullptr;
+    driver->fill_caps(caps);
+    return reinterpret_cast<PieDriver*>(driver.release());
 }
 
-// Construct the forward pipeline for the loaded model, or nullptr to fall back
-// to the stub Forward. Loads the real checkpoint at `cfg.model.hf_path` via
-// delta's loader (config.json + safetensors → graph + paged-KV); the
-// PIE_METAL_SYNTHETIC_MODEL env override swaps in a random dev model for
-// pipeline smoke-testing without a checkpoint.
-std::unique_ptr<ModelRuntime> build_model_runtime(
-    const pie_metal_driver::Config& cfg, const ModelFacts& facts) {
-    using namespace pie_metal_driver;
-
-    const char* synth = std::getenv("PIE_METAL_SYNTHETIC_MODEL");
-    if (synth != nullptr && synth[0] != '\0' && synth[0] != '0') {
-        std::cerr << "[pie-driver-metal] building SYNTHETIC dev model "
-                     "(PIE_METAL_SYNTHETIC_MODEL set) — random weights\n";
-        return build_synthetic_runtime(cfg, facts);
-    }
-
-    if (cfg.model.hf_path.empty()) {
-        std::cerr << "[pie-driver-metal] no model.hf_path configured — "
-                     "serving stub Forward\n";
-        return nullptr;
-    }
-
-    try {
-        // Real checkpoint: parse config.json + load/bind safetensors + build
-        // graph + allocate the paged-KV cache from model geometry (delta).
-        loader::LoadedModel lm =
-            loader::load_model(cfg.model.hf_path, cfg.batching);
-        std::cerr << "[pie-driver-metal] loaded " << lm.caps.arch_name
-                  << " (layers=" << lm.caps.num_hidden_layers
-                  << ", heads=" << lm.caps.num_attention_heads
-                  << ", kv_heads=" << lm.caps.num_key_value_heads
-                  << ", head_dim=" << lm.caps.head_dim
-                  << ", hidden=" << lm.caps.hidden_size
-                  << ", vocab=" << lm.caps.vocab_size
-                  << ", act=" << lm.caps.activation_dtype << ")\n";
-
-        auto rt = std::make_unique<ModelRuntime>();
-        rt->graph     = std::move(lm.graph);
-        rt->kv        = std::move(lm.kv);
-        rt->lin_cache = std::move(lm.lin_cache);  // null for non-hybrid archs
-        rt->executor  = std::make_unique<Executor>(*rt->graph, *rt->kv);
-        rt->executor->set_linear_state_cache(rt->lin_cache.get());
-        return rt;
-    } catch (const std::exception& e) {
-        std::cerr << "[pie-driver-metal] model load failed (" << e.what()
-                  << ") — serving stub Forward\n";
-        return nullptr;
-    }
-}
-#endif  // PIE_METAL_HAS_MLX
-
-// Resolve the directory holding the raw-Metal .metal kernel sources for runtime
-// PSO compilation: PIE_METAL_KERNELS_DIR env override, else the compiled-in
-// source-tree default (packaging an installed kernels dir is a follow-up).
-std::string resolve_kernels_dir() {
-    if (const char* env = std::getenv("PIE_METAL_KERNELS_DIR");
-        env != nullptr && env[0] != '\0') {
-        return env;
-    }
-#ifdef PIE_METAL_KERNELS_DIR_DEFAULT
-    return PIE_METAL_KERNELS_DIR_DEFAULT;
-#else
-    return "";
-#endif
-}
-
-// Build the default (MLX-free) raw-Metal forward executor for the configured
-// checkpoint, or nullptr to fall back to the stub Forward.
-std::unique_ptr<pie_metal_driver::raw_metal::RawMetalExecutor>
-build_raw_executor(const pie_metal_driver::Config& cfg, const ModelFacts& facts) {
-    if (cfg.model.hf_path.empty()) {
-        std::cerr << "[pie-driver-metal] no model.hf_path configured — "
-                     "serving stub Forward\n";
-        return nullptr;
-    }
-    const std::string kernels_dir = resolve_kernels_dir();
-    return pie_metal_driver::raw_metal::make_raw_metal_executor(
-        cfg.model.hf_path, kernels_dir, facts.vocab_size);
-}
-
-// `vtable_opt` is non-null for the in-process serve loop; null for the
-// standalone self-check (`pie_driver_metal_run`), which emits caps and
-// returns without serving.
-int run_impl(int argc,
-             char** argv,
-             int install_signal_handlers,
-             pie_driver_metal_ready_cb ready_cb,
-             void* ready_ctx,
-             const pie_driver::PieInProcVTable* vtable_opt) {
-    if (ready_cb == nullptr) {
-        std::cerr << "[pie-driver-metal] fatal: ready_cb is null\n";
-        return -1;
-    }
-
-    CLI::App app{"pie_driver_metal — MLX/Metal backend for Pie"};
-    std::string config_path = "dev.toml";
-    app.add_option("-c,--config", config_path, "Path to TOML config");
-    app.allow_extras();
-    try {
-        app.parse(argc, argv);
-    } catch (const CLI::ParseError& e) {
-        return app.exit(e);
-    }
-
-    const pie_metal_driver::Config cfg =
-        pie_metal_driver::load_config(config_path);
-    const ModelFacts facts = read_model_facts(cfg.model.hf_path);
-
-    const std::string caps = build_caps_json(cfg, facts);
-    ready_cb(caps.c_str(), ready_ctx);
-
-    if (vtable_opt == nullptr) {
-        // Standalone self-check: caps emitted, nothing to serve.
-        if (cfg.runtime.verbose) {
-            std::cerr << "[pie-driver-metal] standalone self-check complete; "
-                         "embed via pie_driver_metal_run_inproc to serve\n";
-        }
-        return 0;
-    }
-
-    auto server = std::make_unique<pie_driver::InProcServer>(*vtable_opt);
-    pie_metal_driver::register_server(server.get());
-
-    if (install_signal_handlers) {
-        std::signal(SIGINT, pie_metal_driver::on_signal);
-        std::signal(SIGTERM, pie_metal_driver::on_signal);
-    }
-
-    pie_metal_driver::service::InProcService service(facts.vocab_size);
-
-    // Default compute backend: the MLX-free raw-Metal pipeline. Held here so it
-    // outlives the serve loop. The optional MLX `ModelGraph` executor is built
-    // only on explicit opt-in (PIE_METAL_USE_MLX_EXECUTOR) when compiled in.
-    std::unique_ptr<pie_metal_driver::raw_metal::RawMetalExecutor> raw_exec;
-    bool attached = false;
-#if defined(PIE_METAL_HAS_MLX)
-    std::unique_ptr<ModelRuntime> runtime;
-    const char* use_mlx = std::getenv("PIE_METAL_USE_MLX_EXECUTOR");
-    const bool prefer_mlx = use_mlx != nullptr && use_mlx[0] != '\0' &&
-                            use_mlx[0] != '0';
-    if (prefer_mlx) {
-        runtime = build_model_runtime(cfg, facts);
-        if (runtime) {
-            service.set_executor(runtime->executor.get());
-            attached = true;
-            std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
-                      << ", vocab=" << facts.vocab_size
-                      << ", MLX executor on "
-                      << (mx::default_device() == mx::Device::gpu ? "Metal GPU"
-                                                                  : "CPU")
-                      << ")\n";
-        }
-    }
-#endif
-    if (!attached) {
-        raw_exec = build_raw_executor(cfg, facts);
-        if (raw_exec) {
-            service.set_executor(raw_exec.get());
-            attached = true;
-            std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
-                      << ", vocab=" << facts.vocab_size
-                      << ", raw-Metal executor)\n";
-        }
-    }
-    if (!attached) {
-        std::cerr << "[pie-driver-metal] serving (arch=" << facts.arch_name
-                  << ", vocab=" << facts.vocab_size
-                  << ", stub forward — no model attached)\n";
-    }
-    service.serve_forever(*server);
-
-    pie_metal_driver::unregister_server(server.get());
-    std::cerr << "[pie-driver-metal] shutting down (handled "
-              << service.handled() << " forward requests)\n";
-    return 0;
+MetalDriver* as_driver(PieDriver* driver) {
+    return reinterpret_cast<MetalDriver*>(driver);
 }
 
 }  // namespace
 
-extern "C" int pie_driver_metal_run(int argc,
-                                    char** argv,
-                                    int install_signal_handlers,
-                                    pie_driver_metal_ready_cb ready_cb,
-                                    void* ready_ctx) {
+extern "C" PieDriver* pie_metal_create(const PieDriverCreateDesc* desc,
+                                       PieDriverCaps* caps) {
+    if (pie_native::abi::validate_create_desc(desc, caps) != PIE_STATUS_OK) {
+        return nullptr;
+    }
     try {
-        return run_impl(argc, argv, install_signal_handlers, ready_cb, ready_ctx,
-                        /*vtable_opt=*/nullptr);
+        return create_driver_impl(desc, caps);
     } catch (const std::exception& e) {
-        std::cerr << "[pie-driver-metal] fatal: " << e.what() << "\n";
-        return -1;
+        std::cerr << "[pie-driver-metal] create: " << e.what() << "\n";
+        return nullptr;
     } catch (...) {
-        std::cerr << "[pie-driver-metal] fatal: unknown exception\n";
-        return -1;
+        std::cerr << "[pie-driver-metal] create: unknown exception\n";
+        return nullptr;
     }
 }
 
-extern "C" int pie_driver_metal_run_inproc(int argc,
-                                           char** argv,
-                                           int install_signal_handlers,
-                                           pie_driver_metal_ready_cb ready_cb,
-                                           void* ready_ctx,
-                                           pie_driver::PieInProcVTable vtable) {
+extern "C" int32_t pie_metal_register_program(PieDriver* driver,
+                                              const PieProgramDesc* program,
+                                              std::uint64_t* program_id) {
+    const int status = pie_native::abi::validate_program_desc(program, program_id);
+    if (status != PIE_STATUS_OK) return status;
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
-        return run_impl(argc, argv, install_signal_handlers, ready_cb, ready_ctx,
-                        &vtable);
-    } catch (const std::exception& e) {
-        std::cerr << "[pie-driver-metal] fatal: " << e.what() << "\n";
-        return -1;
+        return as_driver(driver)->register_program(*program, program_id);
     } catch (...) {
-        std::cerr << "[pie-driver-metal] fatal: unknown exception\n";
-        return -1;
+        return PIE_STATUS_DRIVER_ERROR;
     }
 }
 
-extern "C" void pie_driver_metal_request_stop(void) {
-    pie_metal_driver::stop_servers();
+extern "C" int32_t pie_metal_bind_instance(PieDriver* driver,
+                                           const PieInstanceDesc* instance,
+                                           PieInstanceBinding* binding) {
+    const int status = pie_native::abi::validate_instance_desc(instance, binding);
+    if (status != PIE_STATUS_OK) return status;
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_driver(driver)->bind_instance(*instance, binding);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" int32_t pie_metal_launch(PieDriver* driver,
+                                    const PieLaunchDesc* launch,
+                                    PieCompletion completion) {
+    const int status = pie_native::abi::validate_launch_desc(launch);
+    if (status != PIE_STATUS_OK) return status;
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_driver(driver)->launch(*launch, completion);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" int32_t pie_metal_copy_kv(PieDriver* driver,
+                                     const PieKvCopyDesc* copy,
+                                     PieCompletion completion) {
+    const int status = pie_native::abi::validate_kv_copy_desc(copy);
+    if (status != PIE_STATUS_OK) return status;
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_driver(driver)->copy_kv(*copy, completion);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" int32_t pie_metal_copy_state(PieDriver* driver,
+                                        const PieStateCopyDesc* copy,
+                                        PieCompletion completion) {
+    const int status = pie_native::abi::validate_state_copy_desc(copy);
+    if (status != PIE_STATUS_OK) return status;
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_driver(driver)->copy_state(*copy, completion);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" int32_t pie_metal_resize_pool(PieDriver* driver,
+                                         const PiePoolResizeDesc* resize,
+                                         PieCompletion completion) {
+    const int status = pie_native::abi::validate_pool_resize_desc(resize);
+    if (status != PIE_STATUS_OK) return status;
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_driver(driver)->resize_pool(*resize, completion);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" int32_t pie_metal_close_instance(PieDriver* driver,
+                                            std::uint64_t instance_id) {
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_driver(driver)->close_instance(instance_id);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" void pie_metal_destroy(PieDriver* driver) {
+    delete as_driver(driver);
 }

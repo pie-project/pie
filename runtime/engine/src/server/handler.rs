@@ -8,21 +8,12 @@ use pie_client::message::ServerMessage;
 
 use crate::inference;
 use crate::messaging;
-use pie_model as model;
 use crate::process::{self, ProcessId};
 use crate::program::{self, Manifest, ProgramName};
+use pie_model as model;
 
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
-
-fn trim_trailing_zeros(values: &[u64]) -> Vec<u64> {
-    let end = values
-        .iter()
-        .rposition(|&value| value != 0)
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
-    values[..end].to_vec()
-}
 
 // =============================================================================
 // Query Handlers
@@ -150,66 +141,6 @@ impl Session {
                         serde_json::Value::from(inf.fire.execute.avg_driver_fire_us),
                     );
                     stats.insert(
-                        format!("{}.fire.execute.response_dispatch.total_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.response_dispatch.avg_total_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.response_dispatch.direct_count", model_name),
-                        serde_json::Value::from(inf.fire.execute.response_dispatch.direct_count),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.response_dispatch.chunk_count", model_name),
-                        serde_json::Value::from(inf.fire.execute.response_dispatch.chunk_count),
-                    );
-                    // Driver-cuda phase breakdown. All-zero when built
-                    // without `profile-driver-cuda`. C++-side probes
-                    // (wire_parse through response_build) are zero until
-                    // the C++ instrumentation commit wires them.
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.ipc_submit_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_ipc_submit_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.gpu_wait_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_gpu_wait_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.ipc_recv_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_ipc_recv_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.wire_parse_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_wire_parse_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.plan_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_plan_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.h2d_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_h2d_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.kernel_launch_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_kernel_launch_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.sync_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_sync_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.response_build_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_response_build_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.sum_sync_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.sum_sync_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.driver_cuda.sum_kernel_launch_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.driver_cuda.sum_kernel_launch_us),
-                    );
-                    stats.insert(
                         format!("{}.fire.post_dispatch.context_tick_us", model_name),
                         serde_json::Value::from(inf.fire.post_dispatch.avg_context_tick_us),
                     );
@@ -244,36 +175,6 @@ impl Session {
                     stats.insert(
                         format!("{}.fire.quorum.readiness_miss", model_name),
                         serde_json::Value::from(inf.fire.quorum.readiness_miss),
-                    );
-                    stats.insert(
-                        format!("{}.system_spec_draft_tokens_proposed", model_name),
-                        serde_json::Value::from(inf.system_spec_draft_tokens_proposed),
-                    );
-                    stats.insert(
-                        format!("{}.system_spec_draft_tokens_accepted", model_name),
-                        serde_json::Value::from(inf.system_spec_draft_tokens_accepted),
-                    );
-                    stats.insert(
-                        format!(
-                            "{}.system_spec_draft_tokens_proposed_per_pos",
-                            model_name
-                        ),
-                        serde_json::json!(
-                            trim_trailing_zeros(
-                                &inf.system_spec_draft_tokens_proposed_per_pos
-                            )
-                        ),
-                    );
-                    stats.insert(
-                        format!(
-                            "{}.system_spec_draft_tokens_accepted_per_pos",
-                            model_name
-                        ),
-                        serde_json::json!(
-                            trim_trailing_zeros(
-                                &inf.system_spec_draft_tokens_accepted_per_pos
-                            )
-                        ),
                     );
                     if let Some(exec) = crate::api::grammar::execute_profile_snapshot() {
                         let mean_value = |total_us: u64, denom: u64| -> serde_json::Value {
@@ -489,7 +390,6 @@ impl Session {
             }
         }
     }
-
 }
 
 // =============================================================================

@@ -9,7 +9,7 @@
 use std::hash::{Hash, Hasher};
 
 use ahash::AHasher;
-use pie_driver_abi::Brle;
+use pie_grammar::brle::RunMask;
 
 /// A chained KV page content hash.
 pub type PageHash = u64;
@@ -21,7 +21,7 @@ pub fn compute_page_hashes(
     page_size: usize,
     tokens: &[u32],
     positions: &[u32],
-    masks: &[Brle],
+    masks: &[RunMask],
     prev_hash: PageHash,
     adapter_seed: Option<i64>,
 ) -> Vec<PageHash> {

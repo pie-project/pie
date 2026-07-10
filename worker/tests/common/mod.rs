@@ -10,7 +10,7 @@
 //! Reused by the cuda validation tests (`cuda_forward` = dense forward; the
 //! Lane-C CAS-dedup + Lane-D fold-parity tests compose on these helpers). Every
 //! cuda test is `#[ignore]`d (real GPU + `--features driver-cuda`) and boots
-//! ONCE per process (auth/shmem singletons forbid a 2nd boot).
+//! ONCE per process (global engine state forbids a second boot).
 //!
 //! The model snapshot is overridable via `PIE_CUDA_TEST_SNAPSHOT` (a local HF
 //! snapshot dir — R3: the worker never downloads); the default is the Qwen3-0.6B

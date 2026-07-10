@@ -88,6 +88,19 @@ class Tier0Runner {
     // no shared view was bound (test convenience).
     ChannelView& arena() { ensure_channels(); return *view_; }
 
+    std::uint32_t* commit_device_flag() const noexcept { return d_commit_; }
+    const std::vector<std::uint32_t>& commit_taken_slots() const noexcept {
+        return host_commit_taken_slots_;
+    }
+    const std::vector<std::uint32_t>& commit_put_slots() const noexcept {
+        return host_commit_put_slots_;
+    }
+    void apply_host_commit(bool committed) {
+        ensure_channels();
+        if (!committed) return;
+        view_->apply_host_commit(host_commit_taken_slots_, host_commit_put_slots_);
+    }
+
     // Standalone channel storage (tests / single-instance use): own a private
     // registry + view with identity (1-based) global ids, so `run_pass` works
     // without an external shared registry. Production binds a shared registry
@@ -114,26 +127,7 @@ class Tier0Runner {
 
         std::vector<void*> scratch;   // per-pass intermediate buffers to free
 
-        // ── descriptor phase: port consumption readiness (§5.1), baked at bind ──
-        launch_readiness_baked(desc_lists_, s);
-
-        for (std::size_t i = 0; i < trace_->stages.size(); ++i) {
-            const Stage& st = trace_->stages[i];
-            // ── readiness: this stage's channel direction requirements (baked) ──
-            launch_readiness_baked(stage_lists_[i], s);
-
-            // ── run the stage's op DAG ──
-            if (!run_stage(st, in, scratch, res.error)) { res.ok = false; break; }
-
-            // ── apply puts to PENDING cells (device→device) ──
-            for (const ChannelPut& p : st.puts) {
-                auto it = val_ptr_.find(p.value);
-                if (it == val_ptr_.end()) { res.ok = false; res.error = "put of unresolved value"; break; }
-                cudaMemcpyAsync(view_->pending_cell(p.channel), it->second,
-                                view_->cell_bytes(p.channel), cudaMemcpyDeviceToDevice, s);
-            }
-            if (!res.ok) break;
-        }
+        launch_pass_body(in, scratch, res);
 
         // ── end-of-pass predicated commit bump (pass-atomic, §7.1) ──
         if (res.ok) {
@@ -143,14 +137,39 @@ class Tier0Runner {
             k_commit_bump<<<1, 1, 0, s>>>(view_->d_full(), view_->d_head(), view_->d_tail(),
                                           view_->d_cap1(), d_commit_taken_, n_commit_taken_,
                                           d_commit_put_, n_commit_put_, d_commit_);
-            cudaStreamSynchronize(s);
             std::uint32_t committed = 0;
-            cudaMemcpy(&committed, d_commit_, sizeof(committed), cudaMemcpyDeviceToHost);
+            cudaMemcpyAsync(&committed, d_commit_, sizeof(committed),
+                            cudaMemcpyDeviceToHost, s);
+            free_scratch_async(scratch, s);
+            cudaStreamSynchronize(s);
             res.committed = committed != 0;
             view_->sync_host_rings();
+        } else {
+            free_scratch_async(scratch, s);
+            cudaStreamSynchronize(s);
         }
+        val_ptr_.clear();
+        val_type_.clear();
+        return res;
+    }
 
-        for (void* p : scratch) cudaFree(p);
+    PassResult launch_pass_async(const FireInputs& in, std::vector<void*>& scratch) {
+        PassResult res;
+        cudaStream_t s = in.stream;
+        ensure_channels();
+
+        std::uint32_t one = 1;
+        cudaMemcpyAsync(d_commit_, &one, sizeof(one), cudaMemcpyHostToDevice, s);
+        launch_pass_body(in, scratch, res);
+        if (res.ok) {
+            k_commit_bump<<<1, 1, 0, s>>>(view_->d_full(), view_->d_head(), view_->d_tail(),
+                                          view_->d_cap1(), d_commit_taken_, n_commit_taken_,
+                                          d_commit_put_, n_commit_put_, d_commit_);
+        } else {
+            std::uint32_t zero = 0;
+            cudaMemcpyAsync(d_commit_, &zero, sizeof(zero), cudaMemcpyHostToDevice, s);
+        }
+        free_scratch_async(scratch, s);
         val_ptr_.clear();
         val_type_.clear();
         return res;
@@ -256,8 +275,10 @@ class Tier0Runner {
         };
         dedup(pass_taken);
         dedup(pass_put);
-        upload_slots(view_->to_slots(pass_taken), d_commit_taken_, n_commit_taken_);
-        upload_slots(view_->to_slots(pass_put), d_commit_put_, n_commit_put_);
+        host_commit_taken_slots_ = view_->to_slots(pass_taken);
+        host_commit_put_slots_ = view_->to_slots(pass_put);
+        upload_slots(host_commit_taken_slots_, d_commit_taken_, n_commit_taken_);
+        upload_slots(host_commit_put_slots_, d_commit_put_, n_commit_put_);
     }
 
     // Upload a host slot list into a persistent device array (freeing any prior).
@@ -303,6 +324,44 @@ class Tier0Runner {
         return true;
     }
 
+    void launch_pass_body(const FireInputs& in,
+                          std::vector<void*>& scratch,
+                          PassResult& res) {
+        cudaStream_t s = in.stream;
+        launch_readiness_baked(desc_lists_, s);
+        for (std::size_t i = 0; i < trace_->stages.size(); ++i) {
+            const Stage& st = trace_->stages[i];
+            launch_readiness_baked(stage_lists_[i], s);
+            if (!run_stage(st, in, scratch, res.error)) { res.ok = false; break; }
+            for (const ChannelPut& p : st.puts) {
+                auto it = val_ptr_.find(p.value);
+                if (it == val_ptr_.end()) {
+                    res.ok = false;
+                    res.error = "put of unresolved value";
+                    break;
+                }
+                cudaMemcpyAsync(view_->pending_cell(p.channel), it->second,
+                                view_->cell_bytes(p.channel), cudaMemcpyDeviceToDevice, s);
+            }
+            if (!res.ok) break;
+        }
+    }
+
+    static void free_scratch_async(const std::vector<void*>& scratch, cudaStream_t stream) {
+        for (void* p : scratch) {
+            cudaFreeAsync(p, stream);
+        }
+    }
+
+    static void* alloc_scratch(std::size_t bytes,
+                               cudaStream_t stream,
+                               std::vector<void*>& scratch) {
+        void* d = nullptr;
+        cudaMallocAsync(&d, bytes, stream);
+        scratch.push_back(d);
+        return d;
+    }
+
     // Materialize a root value (Const/Intrinsic/HostInput/Channel take-read) to a
     // device pointer, recorded in val_ptr_. Op results are recorded by build_launch.
     bool resolve_root(ValueId id, const FireInputs& in, std::vector<void*>& scratch, std::string& err) {
@@ -316,7 +375,7 @@ class Tier0Runner {
             case ValueSource::Const: {
                 std::size_t bytes = v->type.shape.numel() * dtype_size(v->type.dtype);
                 if (bytes == 0) bytes = dtype_size(v->type.dtype);
-                void* d = nullptr; cudaMalloc(&d, bytes); scratch.push_back(d);
+                void* d = alloc_scratch(bytes, in.stream, scratch);
                 // Broadcast the scalar literal across numel (Const tensors in the
                 // examples are small trace-known vectors; tier-0 fills element 0
                 // and relies on codegen const-fold for larger ones — here we fill
@@ -468,7 +527,8 @@ class Tier0Runner {
                         meta[4 + d] = (sd[d] == 1 && meta[d] > 1) ? 0u : st;
                         st *= sd[d];
                     }
-                    std::uint32_t* d_meta = nullptr; cudaMalloc(&d_meta, sizeof(meta)); scratch.push_back(d_meta);
+                    auto* d_meta = static_cast<std::uint32_t*>(
+                        alloc_scratch(sizeof(meta), in.stream, scratch));
                     cudaMemcpyAsync(d_meta, meta, sizeof(meta), cudaMemcpyHostToDevice, in.stream);
                     lo.bcast_meta = d_meta; lo.bcast_rank = R;
                 }
@@ -506,7 +566,7 @@ class Tier0Runner {
         std::size_t out_bytes = lo.numel * dtype_size(rt.dtype);
         if (op.code == OpCode::TopK) out_bytes = (std::size_t)lo.rows * lo.k * sizeof(float);
         if (out_bytes == 0) out_bytes = dtype_size(rt.dtype);
-        void* d_out = nullptr; cudaMalloc(&d_out, out_bytes); scratch.push_back(d_out);
+        void* d_out = alloc_scratch(out_bytes, in.stream, scratch);
         lo.out = d_out;
         val_ptr_[op.result_id] = d_out;
         val_type_[op.result_id] = rt;
@@ -515,8 +575,10 @@ class Tier0Runner {
             cudaMemcpyAsync(d_out, lo.in[0], out_bytes, cudaMemcpyDeviceToDevice, in.stream);
         }
         if (op.code == OpCode::TopK) {   // second result = indices
-            void* d_idx = nullptr; cudaMalloc(&d_idx, (std::size_t)lo.rows * lo.k * sizeof(std::uint32_t));
-            scratch.push_back(d_idx); lo.out2 = d_idx;
+            void* d_idx = alloc_scratch(
+                (std::size_t)lo.rows * lo.k * sizeof(std::uint32_t),
+                in.stream, scratch);
+            lo.out2 = d_idx;
             if (op.result_count > 1) val_ptr_[op.result_id + 1] = d_idx;
         }
         return true;
@@ -534,6 +596,8 @@ class Tier0Runner {
     std::vector<StageChannelLists> stage_lists_;
     std::uint32_t* d_commit_taken_ = nullptr; std::uint32_t n_commit_taken_ = 0;
     std::uint32_t* d_commit_put_ = nullptr;   std::uint32_t n_commit_put_ = 0;
+    std::vector<std::uint32_t> host_commit_taken_slots_;
+    std::vector<std::uint32_t> host_commit_put_slots_;
     std::unordered_map<ValueId, void*> val_ptr_;
     std::unordered_map<ValueId, TensorType> val_type_;
 };

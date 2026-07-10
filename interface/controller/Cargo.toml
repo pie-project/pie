@@ -17,8 +17,7 @@ pie-ids = { path = "../ids" }
 # `WorkerInfo.capability` carries `DriverCapabilities`, which lives in
 # `pie-driver-abi` (`capabilities.rs`).
 pie-driver-abi = { path = "../driver" }
-# Plain serde — control vocabulary travels as serde over the control channel,
-# never on the rkyv tensor ring (so it is NOT part of `SCHEMA_HASH`).
+# Plain serde — control vocabulary travels over the control channel.
 serde = { version = "1.0", features = ["derive"] }
 # The RPC mechanism. `serde1` enables the serde derives on the macro-generated
 # request/response types; transport/codec features stay with the binaries.

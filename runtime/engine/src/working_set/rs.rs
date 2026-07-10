@@ -75,7 +75,9 @@ pub enum RsError {
     DuplicateIndex { index: u32 },
     #[error("rs working set: permutation is not a bijection over 0..{size}")]
     BadPermutation { size: u32 },
-    #[error("rs working set: buffer token range [{start}, {start}+{len}) exceeds capacity {capacity}")]
+    #[error(
+        "rs working set: buffer token range [{start}, {start}+{len}) exceeds capacity {capacity}"
+    )]
     BufferRangeOutOfRange { start: u32, len: u32, capacity: u32 },
     #[error("rs working set: buffered slot {index} read before it was written (materialized)")]
     UnmaterializedRead { index: u32 },
@@ -761,12 +763,19 @@ mod tests {
         // Stage on the CALLER's txn (as execute_impl does, alongside the KV writes).
         let mut txn = a.txn_begin();
         let plan = ws.prepare_write_in_txn(&mut txn, &mut a).unwrap();
-        assert!(plan.reset, "fresh folded slab ⇒ reset (driver zeroes before write)");
+        assert!(
+            plan.reset,
+            "fresh folded slab ⇒ reset (driver zeroes before write)"
+        );
         assert!(plan.cow_move.is_none(), "fresh alloc ⇒ no CoW d2d");
         // Resolves to a REAL driver block — not the `0` the old stub marshaled.
         let block = a.blocks(plan.folded_slot).unwrap()[0];
         let _ = block;
-        assert_eq!(ws.folded_object(), None, "not adopted until the shared txn commits");
+        assert_eq!(
+            ws.folded_object(),
+            None,
+            "not adopted until the shared txn commits"
+        );
         // Commit the shared txn, THEN adopt (finalize success branch).
         a.txn_commit(txn).unwrap();
         ws.adopt_write(&plan);
@@ -785,10 +794,16 @@ mod tests {
         // Fire 2 (continuing): CoW the existing folded slab, NO reset.
         let mut t1 = a.txn_begin();
         let p1 = ws.prepare_write_in_txn(&mut t1, &mut a).unwrap();
-        assert!(!p1.reset, "existing folded state is CoW-continued, not reset");
+        assert!(
+            !p1.reset,
+            "existing folded state is CoW-continued, not reset"
+        );
         a.txn_commit(t1).unwrap();
         ws.adopt_write(&p1);
-        assert!(ws.folded_object().is_some(), "recurrent state persists across fires");
+        assert!(
+            ws.folded_object().is_some(),
+            "recurrent state persists across fires"
+        );
     }
 
     #[test]
@@ -1193,7 +1208,10 @@ mod tests {
                 ws.free_buffer(&mut a, &[0]).unwrap(); // drop the fully-folded page
                 b = 0; // offset re-bases to the new front
             }
-            assert!(ws.buffer_size() <= 1, "decode buffer stays bounded (step {step})");
+            assert!(
+                ws.buffer_size() <= 1,
+                "decode buffer stays bounded (step {step})"
+            );
         }
     }
 }

@@ -2,6 +2,7 @@ use anyhow::{Context, Result, ensure};
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -11,13 +12,55 @@ use crate::driver;
 use crate::inference;
 use crate::linker;
 use crate::messaging;
-use pie_model as model;
 use crate::process;
 use crate::program;
 use crate::server;
 use crate::telemetry;
+use pie_model as model;
 
-#[derive(Debug, Clone)]
+static RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct ActiveRuntimeGuard {
+    armed: bool,
+}
+
+impl ActiveRuntimeGuard {
+    fn acquire() -> Result<Self> {
+        ensure!(
+            !RUNTIME_ACTIVE.swap(true, Ordering::AcqRel),
+            "runtime bootstrap is single-use in this process; start a fresh process for another engine"
+        );
+        Ok(Self { armed: true })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ActiveRuntimeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            RUNTIME_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+}
+
+struct RuntimeShutdown {
+    inference: inference::InferenceShutdownHandle,
+    driver_ids: Vec<usize>,
+}
+
+impl RuntimeShutdown {
+    async fn shutdown(self) -> Result<()> {
+        let inference_result = self.inference.shutdown().await;
+        for driver_id in self.driver_ids {
+            let _ = driver::registry::unregister_driver(driver_id);
+        }
+        inference_result
+    }
+}
+
 pub struct Config {
     pub host: String,
     pub port: u16,
@@ -89,33 +132,23 @@ pub struct RuntimeConfig {
     pub max_upload_mb: usize,
 }
 
-#[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub name: String,
     pub arch_name: String,
     pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
-    /// True when every driver group wired a system drafter (the capability
-    /// signal). Manual/user drafts require this; auto-drafting additionally
-    /// requires `enable_system_speculation`.
-    pub system_speculation_supported: bool,
-    /// Operator opt-in for system speculation (deployment config, default
-    /// false). The runtime drives system drafts only when this is true AND the
-    /// model supports it; manual/user-supplied drafts are honored regardless.
-    pub enable_system_speculation: bool,
     pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }
 
-#[derive(Debug, Clone)]
 pub struct DriverConfig {
     pub total_pages: usize,
     pub cpu_pages: usize,
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
-    pub rs_cache_spec_rollback: bool,
     pub limits: crate::driver::SchedulerLimits,
+    pub native_driver: crate::driver::NativeDriver,
 }
 
 #[derive(Debug, Clone)]
@@ -141,10 +174,20 @@ pub struct AuthConfig {
     pub authorized_users_dir: PathBuf,
 }
 
-#[derive(Debug, Clone)]
 pub struct BootstrapHandle {
     pub token: String,
     pub port: u16,
+    shutdown: Option<RuntimeShutdown>,
+}
+
+impl BootstrapHandle {
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown.shutdown().await
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
@@ -162,6 +205,7 @@ pub async fn bootstrap_with_listener(
 
 async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     verify_config(&config)?;
+    let mut active_guard = ActiveRuntimeGuard::acquire()?;
 
     if !config.skip_tracing {
         init_tracing(&config.log_dir, config.verbose, &config.telemetry)?;
@@ -200,36 +244,47 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     messaging::spawn();
     process::init_admission(config.max_concurrent_processes);
 
-    let cfg = &config.model;
+    let ModelConfig {
+        name,
+        arch_name,
+        kv_page_size,
+        tokenizer_path,
+        drivers: driver_configs,
+        scheduler,
+    } = config.model;
     // RS working-set caps from the driver handshake (uniform across a model's
     // drivers → take [0]). bravo-authored bootstrap bundle.
     let rs_caps = {
-        let d0 = cfg.drivers.first();
+        let d0 = driver_configs.first();
         let is_rs = d0.map(|d| d.rs_cache_slots > 0).unwrap_or(false);
         model::RsCaps {
             state_size: d0.map(|d| d.rs_cache_slot_bytes).unwrap_or(0),
-            buffer_page_size: if is_rs { cfg.kv_page_size as u32 } else { 0 },
+            buffer_page_size: if is_rs { kv_page_size as u32 } else { 0 },
             fold_granularity: 1, // token-causal; 0-RS models never read it
         }
     };
     model::register(
-        cfg.name.clone(),
-        &cfg.arch_name,
-        cfg.kv_page_size as u32,
+        name.clone(),
+        &arch_name,
+        kv_page_size as u32,
         rs_caps,
-        cfg.tokenizer_path.clone(),
-        cfg.system_speculation_supported,
-        cfg.enable_system_speculation,
+        tokenizer_path.clone(),
     )?;
 
-    let drivers: Vec<usize> = cfg
-        .drivers
-        .iter()
+    let arena_kv_pages: Vec<usize> = driver_configs.iter().map(|d| d.total_pages).collect();
+    let arena_cpu_pages: Vec<usize> = driver_configs.iter().map(|d| d.cpu_pages).collect();
+    let arena_rs_slots: Vec<usize> = driver_configs.iter().map(|d| d.rs_cache_slots).collect();
+    let driver_count = driver_configs.len();
+    let drivers: Vec<usize> = driver_configs
+        .into_iter()
         .map(|d| {
-            driver::register_driver(driver::DriverSpec {
-                num_kv_pages: d.total_pages,
-                limits: d.limits,
-            })
+            driver::register_native_driver(
+                driver::DriverSpec {
+                    num_kv_pages: d.total_pages,
+                    limits: d.limits,
+                },
+                d.native_driver,
+            )
         })
         .collect();
 
@@ -237,18 +292,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // registry. Capacities are read straight from `cfg.drivers[]`. The registry
     // is independent of the (removed) context actor and is where KV/RS working
     // sets + the forward `execute()` prepare lock `arena::registry::get(...)`.
-    let arena_kv_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.total_pages).collect();
-    let arena_cpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.cpu_pages).collect();
-    let arena_rs_slots: Vec<usize> = cfg.drivers.iter().map(|d| d.rs_cache_slots).collect();
     let arena_model_idx = arena::registry::register_model(
-        cfg.kv_page_size,
+        kv_page_size,
         &arena_kv_pages,
         &arena_cpu_pages,
         &arena_rs_slots,
     );
     // KvCas sibling registry: one content-addressed sharing index per driver,
     // pushed in lock-step with the arena registry so `kv_cas::get` aligns.
-    let kv_cas_model_idx = crate::working_set::kv_cas::register_cas(cfg.drivers.len());
+    let kv_cas_model_idx = crate::working_set::kv_cas::register_cas(driver_count);
     debug_assert_eq!(
         kv_cas_model_idx, arena_model_idx,
         "kv_cas registry desynced from arena/model index"
@@ -260,34 +312,49 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // default — the legacy error path is byte-for-byte unchanged. The
     // existing `scheduler.restore_pause_at_utilization` config gates the
     // restore anti-thrash pause (its long-reserved consumer).
-    if crate::inference::contention::contention_mode() == crate::inference::contention::ContentionMode::Preempt {
+    if crate::inference::contention::contention_mode()
+        == crate::inference::contention::ContentionMode::Preempt
+    {
         // Backend tiers: passive v1 (waiters ride natural frees — proven
         // e2e, M-AB ②③) by default; `PIE_KV_PREEMPT_ACTIVE=1` selects the
         // v2 self-suspend backend (active FCFS victim preempt).
         let backend: Box<dyn crate::inference::contention::ReclaimBackend> =
             if crate::inference::contention::preempt_active() {
-                Box::new(crate::inference::contention::SelfSuspendBackend::new(arena_model_idx, 0))
+                Box::new(crate::inference::contention::SelfSuspendBackend::new(
+                    arena_model_idx,
+                    0,
+                ))
             } else {
-                Box::new(crate::inference::contention::ArenaPoolBackend::new(arena_model_idx, 0))
+                Box::new(crate::inference::contention::ArenaPoolBackend::new(
+                    arena_model_idx,
+                    0,
+                ))
             };
-        crate::inference::contention::init_contention(crate::inference::contention::ContentionOrchestrator::new(
-            backend,
-            cfg.scheduler.restore_pause_at_utilization,
-        ));
+        crate::inference::contention::init_contention(
+            crate::inference::contention::ContentionOrchestrator::new(
+                backend,
+                scheduler.restore_pause_at_utilization,
+            ),
+        );
     }
 
     // (Context actor `context::spawn` removed — Phase 5. The unified arena
     // registry above is the per-model/driver physical home now.)
-    inference::spawn(
+    let inference_shutdown = inference::spawn(
         &drivers,
-        cfg.kv_page_size as u32,
-        cfg.scheduler.request_timeout_secs,
+        kv_page_size as u32,
+        scheduler.request_timeout_secs,
     )
-    .await;
+    .await?;
 
+    active_guard.disarm();
     Ok(BootstrapHandle {
         token: crate::token::generate_internal_token(),
         port: bound_port,
+        shutdown: Some(RuntimeShutdown {
+            inference: inference_shutdown,
+            driver_ids: drivers,
+        }),
     })
 }
 

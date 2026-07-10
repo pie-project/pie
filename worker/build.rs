@@ -2,7 +2,7 @@
 //! them into the `pie` binary as a single deployable artifact.
 //!
 //! This script is the Cargo↔native *link bridge*: it invokes each driver's
-//! CMake build, forwards the two include-dir handoffs, and emits the
+//! CMake build, forwards the direct ABI include handoff, and emits the
 //! `cargo:rustc-link-*` directives for the final binary (which rustc, not
 //! CMake, links). Build-time *discovery* — nvcc location, CUDA arch,
 //! sccache/ccache, NCCL, Marlin toggles, the CPM cache — lives in
@@ -10,10 +10,9 @@
 //!
 //! Selection for native C++ drivers is via Cargo features. The Rust
 //! dummy driver is always linked; the resulting binary dispatches at
-//! runtime via `[model].driver.type` in the config TOML. The drivers
-//! expose distinctly-named C entry points
-//! (`pie_driver_{cuda,metal,dummy}_run` / `_request_stop`) so their
-//! static archives can coexist in one binary without symbol collisions.
+//! runtime via `[model].driver.type` in the config TOML. CUDA and Metal expose
+//! distinct create/destroy/direct-operation symbols, so their static archives
+//! can coexist in one binary without symbol collisions.
 //!
 //!   - `driver-cuda`: native CUDA driver with flashinfer kernels.
 //!     Dynamic-links the CUDA toolkit `.so`s from `$CUDA_HOME`
@@ -36,6 +35,9 @@ fn main() {
         println!("cargo:rerun-if-changed=../driver/metal/cmake");
         println!("cargo:rerun-if-changed=../driver/metal/src");
     }
+    if cuda || metal {
+        println!("cargo:rerun-if-changed=../driver/common/include");
+    }
 
     if cuda {
         build_cuda();
@@ -47,30 +49,13 @@ fn main() {
 }
 
 /// Read `DEP_PIE_DRIVER_ABI_INCLUDE` — the directory where `pie-driver-abi`'s
-/// build.rs publishes the driver-ABI C header (`pie_driver_abi.h` + the
-/// `pie_driver_abi/` view/response_builder helpers). Pass-through to CMake via
-/// `-DPIE_SCHEMA_INCLUDE_DIR=...` — the CMake var name is deliberately kept (it
-/// is the contract with `driver/*/CMakeLists.txt`'s `if(NOT PIE_SCHEMA_INCLUDE_DIR)`
-/// fallback; renaming it would have to happen on both sides at once for zero gain)
-/// — so each C++ driver backend can pick the headers up with
-/// `target_include_directories`.
+/// build.rs publishes the generated direct-ABI C header. Pass-through to CMake via
+/// `-DPIE_DRIVER_ABI_INCLUDE_DIR=...` so each C++ driver backend can pick the
+/// headers up with `target_include_directories`.
 fn pie_driver_abi_include_dir() -> PathBuf {
     let dir = std::env::var("DEP_PIE_DRIVER_ABI_INCLUDE").expect(
         "pie-driver-abi's build.rs did not emit cargo:include — \
                  check that `links = \"pie_driver_abi\"` is set in interface/driver/Cargo.toml",
-    );
-    PathBuf::from(dir)
-}
-
-/// Read `DEP_PIE_IPC_INCLUDE` — the directory where `pie-ipc`'s build.rs
-/// publishes the in-proc mechanism C headers (`pie_ipc.h` vtable +
-/// `pie_ipc/inproc_server.hpp`). Pass-through to CMake via
-/// `-DPIE_IPC_INCLUDE_DIR=...`. These headers `#include <pie_driver_abi.h>`,
-/// so both include dirs are added to the C++ targets.
-fn pie_ipc_include_dir() -> PathBuf {
-    let dir = std::env::var("DEP_PIE_IPC_INCLUDE").expect(
-        "pie-ipc's build.rs did not emit cargo:include — \
-                 check that `links = \"pie_ipc\"` is set in driver/ipc/Cargo.toml",
     );
     PathBuf::from(dir)
 }
@@ -117,7 +102,10 @@ fn build_metal() {
     // Only forwarded when explicitly set (otherwise the CMake default holds).
     let build_metal_gpu = env_is_truthy("PIE_METAL_MLX_BUILD_METAL");
     if std::env::var_os("PIE_METAL_MLX_BUILD_METAL").is_some() {
-        cfg.define("PIE_METAL_MLX_BUILD_METAL", if build_metal_gpu { "ON" } else { "OFF" });
+        cfg.define(
+            "PIE_METAL_MLX_BUILD_METAL",
+            if build_metal_gpu { "ON" } else { "OFF" },
+        );
     }
 
     let build_dir = cfg.build().join("build");
@@ -144,10 +132,7 @@ fn build_metal() {
 // -----------------------------------------------------------------------------
 
 fn build_dummy() {
-    // pie-driver-dummy is a Cargo dep with crate-type = ["staticlib", "rlib"].
-    // Cargo links the rlib automatically through the dependency; nothing
-    // to build here. The rlib path is enough — the C ABI symbols
-    // (`pie_driver_dummy_run` / `_request_stop`) come along.
+    // pie-driver-dummy is a normal Rust dependency; Cargo links it directly.
 }
 
 // -----------------------------------------------------------------------------
@@ -213,17 +198,15 @@ fn build_cuda() {
 /// Shared `cmake::Config` for a native driver flavor. Per-flavor `out_dir`
 /// keeps multi-driver builds from clobbering each other's CMake cache; the
 /// archives are static + PIC (downstream may relink them into the pyo3
-/// `pie-server` shared object), and the two include-dir handoffs published
-/// by `pie-driver-abi` / `pie-ipc`'s build scripts are forwarded so the C++
-/// targets can find the ABI + in-proc IPC headers.
+/// `pie-server` shared object), and the direct ABI include handoff published
+/// by `pie-driver-abi` is forwarded so the C++ targets can find the headers.
 fn driver_cmake_config(driver_dir: &Path, out_subdir: &str, build_target: &str) -> cmake::Config {
     let mut cfg = cmake::Config::new(driver_dir);
     cfg.out_dir(PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join(out_subdir));
     cfg.build_target(build_target)
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
-        .define("PIE_SCHEMA_INCLUDE_DIR", pie_driver_abi_include_dir())
-        .define("PIE_IPC_INCLUDE_DIR", pie_ipc_include_dir());
+        .define("PIE_DRIVER_ABI_INCLUDE_DIR", pie_driver_abi_include_dir());
     cfg
 }
 

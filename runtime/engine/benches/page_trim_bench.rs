@@ -17,10 +17,9 @@
 
 use std::time::Instant;
 
-use pie_engine::inference::request::{
-    append_request, new_batched_forward_request_with_capacity, new_per_request,
-};
-use pie_driver_abi::Brle;
+use pie_engine::driver::LaunchPlan;
+use pie_engine::inference::request::{append_request, new_batched_forward_request_with_capacity};
+use pie_grammar::brle::RunMask;
 
 const PAGE_SIZE: u32 = 16;
 
@@ -50,25 +49,29 @@ fn fmt_time(ns: u64) -> String {
     }
 }
 
-fn make_request(masks: Vec<Brle>, num_input: u32, kv_before: u32) -> pie_driver_abi::ForwardRequest {
+fn make_request(masks: Vec<RunMask>, num_input: u32, kv_before: u32) -> LaunchPlan {
     let positions: Vec<u32> = (kv_before..kv_before + num_input).collect();
     let tokens: Vec<u32> = vec![0; num_input as usize];
     let has_user_mask = !masks.is_empty();
-    new_per_request(
-        0,
-        tokens,
-        positions,
+    let mask_count = masks.len() as u32;
+    LaunchPlan {
+        token_ids: tokens,
+        position_ids: positions,
+        kv_page_indptr: vec![0],
+        qo_indptr: vec![0, num_input],
         masks,
+        mask_indptr: vec![0, mask_count],
+        sampling_indptr: vec![0, 0],
+        context_ids: vec![0],
+        single_token_mode: !has_user_mask && num_input <= 1,
         has_user_mask,
-        None,
-        vec![],
-        vec![],
-        vec![],
-        vec![],
-        false,
-        None,
-        None,
-    )
+        image_indptr: vec![0, 0],
+        image_pixel_indptr: vec![0],
+        image_mrope_indptr: vec![0],
+        audio_feature_indptr: vec![0],
+        audio_indptr: vec![0, 0],
+        ..LaunchPlan::default()
+    }
 }
 
 fn last_page_len(total_kv: u32) -> u32 {
@@ -78,32 +81,32 @@ fn last_page_len(total_kv: u32) -> u32 {
 
 /// Build a causal mask for a token at absolute position `pos`. Matches the
 /// runtime's synthesized causal mask in `api/inference.rs`.
-fn causal_row(pos: u32) -> Brle {
-    Brle::all_true((pos + 1) as usize)
+fn causal_row(pos: u32) -> RunMask {
+    RunMask::all_true((pos + 1) as usize)
 }
 
 /// Sink+window mask covering [0, seq_len): sink leading trues, gap of falses,
 /// then window trailing trues.
-fn sink_window_row(seq_len: u32, sink: u32, window: u32) -> Brle {
+fn sink_window_row(seq_len: u32, sink: u32, window: u32) -> RunMask {
     if seq_len <= sink + window {
-        Brle::from_vec(vec![0, seq_len])
+        RunMask::from_vec(vec![0, seq_len])
     } else {
         let gap = seq_len - sink - window;
-        Brle::from_vec(vec![0, sink, gap, window])
+        RunMask::from_vec(vec![0, sink, gap, window])
     }
 }
 
 /// Sliding-window mask: gap of falses, then window of trues to the end.
-fn window_row(seq_len: u32, window: u32) -> Brle {
+fn window_row(seq_len: u32, window: u32) -> RunMask {
     if seq_len <= window {
-        Brle::from_vec(vec![0, seq_len])
+        RunMask::from_vec(vec![0, seq_len])
     } else {
         let gap = seq_len - window;
-        Brle::from_vec(vec![gap, window])
+        RunMask::from_vec(vec![gap, window])
     }
 }
 
-/// Run a scenario: build a fresh batched `ForwardRequest`, fold the per-request
+/// Run a scenario: build a fresh batched `LaunchPlan`, fold the per-request
 /// form in once, time the loop, and return wire-size stats from one iteration
 /// plus per-call wall time.
 struct ScenarioResult {
@@ -115,12 +118,7 @@ struct ScenarioResult {
     mask_bytes_after_trim: usize,
 }
 
-fn run_scenario(
-    req: &pie_driver_abi::ForwardRequest,
-    pages: &[u32],
-    last_page_len: u32,
-    iters: u32,
-) -> ScenarioResult {
+fn run_scenario(req: &LaunchPlan, pages: &[u32], last_page_len: u32, iters: u32) -> ScenarioResult {
     // Single-call wire stats (build once, inspect what got emitted).
     let mut probe = new_batched_forward_request_with_capacity(1);
     append_request(&mut probe, req, pages, last_page_len, PAGE_SIZE);
@@ -193,7 +191,7 @@ fn bench_causal_prefill(num_pages: u32, num_input: u32, iters: u32) {
     let last = last_page_len(total_kv);
     let pages: Vec<u32> = (0..num_pages).collect();
     let kv_before = total_kv - num_input;
-    let masks: Vec<Brle> = (0..num_input).map(|i| causal_row(kv_before + i)).collect();
+    let masks: Vec<RunMask> = (0..num_input).map(|i| causal_row(kv_before + i)).collect();
     let req = make_request(masks, num_input, kv_before);
     let r = run_scenario(&req, &pages, last, iters);
     print_row("causal_prefill", num_pages, num_input, r);
@@ -218,7 +216,7 @@ fn bench_sink_window_prefill(num_pages: u32, num_input: u32, iters: u32) {
     let last = last_page_len(total_kv);
     let pages: Vec<u32> = (0..num_pages).collect();
     let mask = sink_window_row(total_kv, 4, 64);
-    let masks: Vec<Brle> = (0..num_input).map(|_| mask.clone()).collect();
+    let masks: Vec<RunMask> = (0..num_input).map(|_| mask.clone()).collect();
     let kv_before = total_kv - num_input;
     let req = make_request(masks, num_input, kv_before);
     let r = run_scenario(&req, &pages, last, iters);
@@ -245,12 +243,12 @@ fn bench_disagree_early_exit(num_pages: u32, num_input: u32, iters: u32) {
     let pages: Vec<u32> = (0..num_pages).collect();
     // Row 0: false run [0, total_kv/2) then true to end.
     let half = total_kv / 2;
-    let row0 = Brle::from_vec(vec![half, total_kv - half]);
+    let row0 = RunMask::from_vec(vec![half, total_kv - half]);
     // Row 1: true [0, half), false [half, half+PAGE_SIZE), true rest.
     let mid_false = PAGE_SIZE;
-    let row1 = Brle::from_vec(vec![0, half, mid_false, total_kv - half - mid_false]);
+    let row1 = RunMask::from_vec(vec![0, half, mid_false, total_kv - half - mid_false]);
     // Fill remaining rows with row1 — row 1 already collapses eligibility.
-    let mut masks: Vec<Brle> = Vec::with_capacity(num_input as usize);
+    let mut masks: Vec<RunMask> = Vec::with_capacity(num_input as usize);
     masks.push(row0);
     for _ in 1..num_input {
         masks.push(row1.clone());

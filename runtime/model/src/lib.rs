@@ -34,8 +34,6 @@ pub fn register(
     kv_page_size: u32,
     rs: RsCaps,
     tokenizer_path: PathBuf,
-    system_speculation_supported: bool,
-    enable_system_speculation: bool,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
     let instruct = instruct::create(arch_name, tokenizer.clone());
@@ -45,8 +43,8 @@ pub fn register(
     // mock/fixture setups without a config.json. This is the dim the sampler
     // operates on + the driver's recognizer table is keyed by — NOT the
     // tokenizer token count, which may be smaller (qwen3: 151669 vs 151936).
-    let vocab_size = read_snapshot_vocab_size(&tokenizer_path)
-        .unwrap_or_else(|| tokenizer.vocab_size() as u32);
+    let vocab_size =
+        read_snapshot_vocab_size(&tokenizer_path).unwrap_or_else(|| tokenizer.vocab_size() as u32);
 
     let model = Arc::new(Model {
         name,
@@ -56,21 +54,17 @@ pub fn register(
         rs_caps: rs,
         tokenizer,
         vocab_size,
-        system_speculation_supported,
-        enable_system_speculation,
     });
-    MODEL
-        .set(model)
-        .map_err(|_| anyhow!("a model is already registered; the engine serves exactly one model"))?;
+    MODEL.set(model).map_err(|_| {
+        anyhow!("a model is already registered; the engine serves exactly one model")
+    })?;
     Ok(())
 }
 
 /// Returns the single registered model. Panics if called before bootstrap
 /// registers the model.
 pub fn model() -> &'static Arc<Model> {
-    MODEL
-        .get()
-        .expect("model accessed before registration")
+    MODEL.get().expect("model accessed before registration")
 }
 
 // =============================================================================
@@ -93,8 +87,6 @@ pub struct Model {
     /// config.json). May EXCEED tokenizer.vocab_size() due to padding — use
     /// THIS for sampler lowering / logits-shaped ops, NOT the tokenizer vocab.
     vocab_size: u32,
-    system_speculation_supported: bool,
-    enable_system_speculation: bool,
 }
 
 /// RS (recurrent-state) working-set capabilities surfaced to inferlets via
@@ -189,19 +181,5 @@ impl Model {
     /// `rs-fold-granularity`). 0/0/1 for pure-attention models.
     pub fn rs_caps(&self) -> RsCaps {
         self.rs_caps
-    }
-
-    /// Whether the driver wired a system drafter for this model (capability).
-    /// Required to verify manual drafts; auto-drafting additionally requires
-    /// [`Self::enable_system_speculation`].
-    pub fn system_speculation_supported(&self) -> bool {
-        self.system_speculation_supported
-    }
-
-    /// Operator opt-in for system speculation (deployment config, default
-    /// false). The runtime drives system drafts only when this is true; manual
-    /// (user-supplied) drafts are honored regardless of this flag.
-    pub fn enable_system_speculation(&self) -> bool {
-        self.enable_system_speculation
     }
 }

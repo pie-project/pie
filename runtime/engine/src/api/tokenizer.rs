@@ -6,8 +6,8 @@
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use pie_model as model;
 use anyhow::Result;
+use pie_model as model;
 
 impl pie::inferlet::tokenizer::Host for InstanceState {
     async fn encode(&mut self, text: String) -> Result<Vec<u32>> {

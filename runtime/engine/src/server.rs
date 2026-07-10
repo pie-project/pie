@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use dashmap::DashMap;
 use pie_client::message::{ClientMessage, ServerMessage as WireServerMessage};
@@ -42,8 +42,9 @@ pub type ClientId = u32;
 // =============================================================================
 
 static STATE: OnceLock<Arc<ServerState>> = OnceLock::new();
-static SESSION_OUTBOX: LazyLock<DashMap<ClientId, Arc<TokioMutex<mpsc::Receiver<WireServerMessage>>>>> =
-    LazyLock::new(DashMap::new);
+static SESSION_OUTBOX: LazyLock<
+    DashMap<ClientId, Arc<TokioMutex<mpsc::Receiver<WireServerMessage>>>>,
+> = LazyLock::new(DashMap::new);
 
 fn install_state(max_upload_bytes: usize) -> Arc<ServerState> {
     if let Some(state) = STATE.get() {

@@ -14,15 +14,34 @@ fn inferlets_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/inferlets")
 }
 
-/// Build all test inferlets. Panics on failure.
-pub fn build_inferlets() {
+fn target(name: &str) -> &'static str {
+    if matches!(name, "direct-channel-e2e" | "direct-mixed-e2e") {
+        "wasm32-wasip2"
+    } else {
+        "wasm32-wasip3"
+    }
+}
+
+fn build_inferlet(name: &str) {
     let status = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip3"])
+        .args(["build", "--target", target(name), "-p", name])
         .current_dir(inferlets_dir())
         .status()
-        .expect("Failed to run cargo build for test inferlets");
+        .unwrap_or_else(|error| panic!("failed to build test inferlet {name}: {error}"));
+    assert!(status.success(), "test inferlet {name} build failed");
+}
 
-    assert!(status.success(), "Test inferlet build failed");
+/// Build the current-SDK inferlets exercised by the executable e2e suite.
+pub fn build_inferlets() {
+    for name in [
+        "echo",
+        "context",
+        "error",
+        "direct-channel-e2e",
+        "direct-mixed-e2e",
+    ] {
+        build_inferlet(name);
+    }
 }
 
 /// Path to a compiled test inferlet WASM file.
@@ -30,7 +49,7 @@ pub fn inferlet_wasm_path(name: &str) -> PathBuf {
     // Cargo replaces hyphens with underscores in output filenames
     let filename = format!("{}.wasm", name.replace('-', "_"));
     inferlets_dir()
-        .join("target/wasm32-wasip3/debug")
+        .join(format!("target/{}/debug", target(name)))
         .join(filename)
 }
 
@@ -38,7 +57,7 @@ pub fn inferlet_wasm_path(name: &str) -> PathBuf {
 pub fn read_inferlet_wasm(name: &str) -> Vec<u8> {
     let path = inferlet_wasm_path(name);
     if !path.exists() {
-        build_inferlets();
+        build_inferlet(name);
     }
     std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e))
 }
@@ -57,7 +76,9 @@ pub async fn add_and_install(name: &str) -> ProgramName {
     let wasm = read_inferlet_wasm(name);
     let manifest = read_inferlet_manifest(name);
     let program_name = ProgramName::parse(&format!("{name}@0.1.0")).unwrap();
-    pie_engine::program::add(wasm, manifest, true).await.unwrap();
+    pie_engine::program::add(wasm, manifest, true)
+        .await
+        .unwrap();
     pie_engine::program::install(&program_name).await.unwrap();
     program_name
 }

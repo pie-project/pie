@@ -14,7 +14,7 @@
 //! slots per fire — real decode loops, §6.2 beam, §6.1 mtpverify.
 
 use crate::arena::{Arena, ArenaTxn, MovePlan};
-use crate::inference::paging::{project_kv, KvProjection, KvWrite, PhysicalPageId};
+use crate::inference::paging::{KvProjection, KvWrite, PhysicalPageId, project_kv};
 use crate::working_set::kv::{KvWorkingSet, WriteTxnId};
 
 /// The open KV/arena transactions for one in-flight PTIR fire — held across
@@ -42,7 +42,7 @@ pub struct PtirKvTxn {
 /// `proj.last_page_len` / `move_plans` into `submit_async`, hold `txn` across the
 /// fire, then [`ptir_kv_finalize`]. `new_tokens`' VALUES are unused here — the
 /// projection is pure page geometry keyed by the count; the token ids ride the
-/// `ForwardRequest`. `move_plans` is empty for the single-context pipeline (fresh
+/// `LaunchPlan`. `move_plans` is empty for the single-context pipeline (fresh
 /// BOS page + in-place decode appends); non-empty only under a forked/shared page.
 pub fn ptir_kv_prepare(
     ws: &mut KvWorkingSet,
@@ -176,8 +176,7 @@ mod tests {
         // Delta's shipped minimal: committed 0, one write slot, no prior context.
         let mut a = arena(8);
         let mut ws = KvWorkingSet::new(PAGE, 0);
-        let (proj, move_plans, txn) =
-            ptir_kv_prepare(&mut ws, 0, &toks(1), &mut a, PAGE).unwrap();
+        let (proj, move_plans, txn) = ptir_kv_prepare(&mut ws, 0, &toks(1), &mut a, PAGE).unwrap();
         assert_eq!(proj.physical_page_ids.len(), 1); // NON-EMPTY (the crash fix)
         assert_eq!(proj.last_page_len, 1);
         assert!(move_plans.is_empty());
@@ -197,7 +196,11 @@ mod tests {
                 ptir_kv_prepare(&mut ws, committed, &toks(1), &mut a, PAGE).unwrap();
             assert!(!proj.physical_page_ids.is_empty(), "step {step}");
             let want_pages = (committed + 1).div_ceil(PAGE);
-            assert_eq!(proj.physical_page_ids.len() as u32, want_pages, "step {step}");
+            assert_eq!(
+                proj.physical_page_ids.len() as u32,
+                want_pages,
+                "step {step}"
+            );
             assert_eq!(
                 proj.last_page_len,
                 (committed + 1) - (want_pages - 1) * PAGE,
@@ -223,8 +226,16 @@ mod tests {
                 ptir_kv_prepare(&mut ws, committed, &toks(K), &mut a, PAGE).unwrap();
             let total = committed + K;
             let want_pages = total.div_ceil(PAGE);
-            assert_eq!(proj.physical_page_ids.len() as u32, want_pages, "step {step}");
-            assert_eq!(proj.last_page_len, total - (want_pages - 1) * PAGE, "step {step}");
+            assert_eq!(
+                proj.physical_page_ids.len() as u32,
+                want_pages,
+                "step {step}"
+            );
+            assert_eq!(
+                proj.last_page_len,
+                total - (want_pages - 1) * PAGE,
+                "step {step}"
+            );
             committed = txn.committed_tokens_after;
             ptir_kv_finalize(&mut ws, &mut a, txn, true).unwrap();
         }

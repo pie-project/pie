@@ -1,4 +1,4 @@
-//! PTIR descriptor-ports → `ForwardRequest` geometry mapping (thrust-3 P2c-fire).
+//! PTIR descriptor-ports → `LaunchPlan` geometry mapping (thrust-3 P2c-fire).
 //!
 //! A **pure function** from a trace container's descriptor ports (+ the current
 //! per-channel values at fire time) to the request's forward geometry: the
@@ -6,7 +6,7 @@
 //! `token_ids`/`position_ids`/`qo_indptr`/`sampling_*`) and the port-provided KV
 //! family (`pages`/`page_indptr`/`kv_len` → `kv_page_indices`/`kv_page_indptr`/
 //! `kv_last_page_lens`). Unit-testable in isolation against the locked
-//! `ptir_program_at` contract — no driver decode, no GPU.
+//! bound program contract — no driver decode, no GPU.
 //!
 //! The one geometry piece that is NOT pure-from-ports is the **sugar** KV arity
 //! (`attn_working_set(&ws, &len)`, only `kv_len` bound): the page indices come
@@ -17,7 +17,7 @@
 use pie_ptir::container::{PortSource, TraceContainer};
 use pie_ptir::registry::Port;
 
-/// The forward geometry a PTIR pass contributes to a `ForwardRequest`.
+/// The forward geometry a PTIR pass contributes to a `LaunchPlan`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReqGeometry {
     /// Input token ids (from `embed_tokens`).
@@ -50,11 +50,11 @@ pub enum GeometryError {
 }
 
 impl ReqGeometry {
-    /// Write this geometry into a [`ForwardRequest`]'s forward-geometry fields
+    /// Write this geometry into a [`LaunchPlan`]'s forward-geometry fields
     /// (the host-known prefill for a PTIR fire). One-to-one with the request's
     /// `token_ids`/`position_ids`/`qo_indptr`/`kv_page_*`/`kv_last_page_lens`/
     /// `sampling_*` — leaves every other field (samplers, masks, carrier) intact.
-    pub fn apply_to(&self, req: &mut pie_driver_abi::ForwardRequest) {
+    pub fn apply_to(&self, req: &mut crate::driver::LaunchPlan) {
         req.token_ids = self.token_ids.clone();
         req.position_ids = self.position_ids.clone();
         req.qo_indptr = self.qo_indptr.clone();
@@ -203,7 +203,10 @@ fn resolve_opt(
 /// stored `i32` reinterpret bit-for-bit (the driver's `token_ids` is `u32`).
 fn as_u32(port: Port, bytes: &[u8]) -> Result<Vec<u32>, GeometryError> {
     if bytes.len() % 4 != 0 {
-        return Err(GeometryError::BadPayload { port, bytes: bytes.len() });
+        return Err(GeometryError::BadPayload {
+            port,
+            bytes: bytes.len(),
+        });
     }
     Ok(bytes
         .chunks_exact(4)
@@ -235,7 +238,13 @@ mod tests {
         }
     }
     fn chan(shape: Shape, dtype: DType) -> ChannelDecl {
-        ChannelDecl { shape, dtype: ChanDType::Concrete(dtype), capacity: 1, host_role: HostRole::None, seeded: true }
+        ChannelDecl {
+            shape,
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role: HostRole::None,
+            seeded: true,
+        }
     }
 
     /// §3 sugar: embed tok (chan 0) + embed_indptr const [0,1] + kv_len (chan 1).
@@ -248,11 +257,20 @@ mod tests {
                 chan(Shape::vector(1), DType::U32), // 1 len
             ],
             ports: vec![
-                PortBinding { port: Port::EmbedTokens, source: PortSource::Channel(0) },
+                PortBinding {
+                    port: Port::EmbedTokens,
+                    source: PortSource::Channel(0),
+                },
                 const_port(Port::EmbedIndptr, &[0, 1]),
-                PortBinding { port: Port::KvLen, source: PortSource::Channel(1) },
+                PortBinding {
+                    port: Port::KvLen,
+                    source: PortSource::Channel(1),
+                },
             ],
-            stages: vec![StageProgram { stage: Stage::Epilogue, ops: vec![Op::ChanTake(0)] }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![Op::ChanTake(0)],
+            }],
         }
     }
 
@@ -260,17 +278,30 @@ mod tests {
     fn section3_single_seq_decode_geometry() {
         let c = section3_container();
         // tok = [42] (i32), len = [5] (u32); page_size 16.
-        let values: Vec<Option<Vec<u8>>> =
-            vec![Some(42i32.to_le_bytes().to_vec()), Some(5u32.to_le_bytes().to_vec())];
+        let values: Vec<Option<Vec<u8>>> = vec![
+            Some(42i32.to_le_bytes().to_vec()),
+            Some(5u32.to_le_bytes().to_vec()),
+        ];
         let g = map_geometry(&c, &values, 16).unwrap();
 
         assert_eq!(g.token_ids, vec![42]);
         assert_eq!(g.qo_indptr, vec![0, 1], "one lane, one token");
         assert_eq!(g.position_ids, vec![0], "append order, one token");
-        assert_eq!(g.sampling_indices, vec![0], "read out the lane's last (only) token");
+        assert_eq!(
+            g.sampling_indices,
+            vec![0],
+            "read out the lane's last (only) token"
+        );
         assert_eq!(g.sampling_indptr, vec![0, 1]);
-        assert_eq!(g.kv_last_page_lens, vec![5], "len 5 in a 16-page → last page holds 5");
-        assert!(g.kv_page_indices.is_empty(), "sugar arity: page indices are ws-derived (staged)");
+        assert_eq!(
+            g.kv_last_page_lens,
+            vec![5],
+            "len 5 in a 16-page → last page holds 5"
+        );
+        assert!(
+            g.kv_page_indices.is_empty(),
+            "sugar arity: page indices are ws-derived (staged)"
+        );
     }
 
     /// §6.2 rectangular batch: B=2 lanes, full KV arity from ports.
@@ -279,20 +310,38 @@ mod tests {
             names: vec![],
             externs: vec![],
             channels: vec![
-                chan(Shape::vector(b), DType::I32),        // 0 toks
-                chan(Shape::vector(b), DType::U32),        // 1 pos
-                chan(Shape::matrix(b, p), DType::U32),     // 2 pages
-                chan(Shape::vector(b), DType::U32),        // 3 klen
+                chan(Shape::vector(b), DType::I32),    // 0 toks
+                chan(Shape::vector(b), DType::U32),    // 1 pos
+                chan(Shape::matrix(b, p), DType::U32), // 2 pages
+                chan(Shape::vector(b), DType::U32),    // 3 klen
             ],
             ports: vec![
-                PortBinding { port: Port::EmbedTokens, source: PortSource::Channel(0) },
+                PortBinding {
+                    port: Port::EmbedTokens,
+                    source: PortSource::Channel(0),
+                },
                 const_port(Port::EmbedIndptr, &(0..=b).collect::<Vec<_>>()),
-                PortBinding { port: Port::Positions, source: PortSource::Channel(1) },
-                PortBinding { port: Port::Pages, source: PortSource::Channel(2) },
-                const_port(Port::PageIndptr, &(0..=b).map(|i| i * p).collect::<Vec<_>>()),
-                PortBinding { port: Port::KvLen, source: PortSource::Channel(3) },
+                PortBinding {
+                    port: Port::Positions,
+                    source: PortSource::Channel(1),
+                },
+                PortBinding {
+                    port: Port::Pages,
+                    source: PortSource::Channel(2),
+                },
+                const_port(
+                    Port::PageIndptr,
+                    &(0..=b).map(|i| i * p).collect::<Vec<_>>(),
+                ),
+                PortBinding {
+                    port: Port::KvLen,
+                    source: PortSource::Channel(3),
+                },
             ],
-            stages: vec![StageProgram { stage: Stage::Epilogue, ops: vec![Op::ChanTake(0)] }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![Op::ChanTake(0)],
+            }],
         }
     }
 
@@ -300,17 +349,21 @@ mod tests {
     fn beam_rectangular_batch_geometry() {
         let c = beam_container(2, 3);
         let values: Vec<Option<Vec<u8>>> = vec![
-            Some(u32_bytes(&[100, 200])),          // 0 toks (reinterpret i32→u32)
-            Some(u32_bytes(&[7, 9])),              // 1 pos
+            Some(u32_bytes(&[100, 200])), // 0 toks (reinterpret i32→u32)
+            Some(u32_bytes(&[7, 9])),     // 1 pos
             Some(u32_bytes(&[10, 11, 12, 20, 21, 22])), // 2 pages [B,P] flat
-            Some(u32_bytes(&[20, 33])),            // 3 klen (physical spans)
+            Some(u32_bytes(&[20, 33])),   // 3 klen (physical spans)
         ];
         let g = map_geometry(&c, &values, 16).unwrap();
 
         assert_eq!(g.token_ids, vec![100, 200]);
         assert_eq!(g.qo_indptr, vec![0, 1, 2], "one token per lane");
         assert_eq!(g.position_ids, vec![7, 9]);
-        assert_eq!(g.sampling_indices, vec![0, 1], "last token of each of 2 lanes");
+        assert_eq!(
+            g.sampling_indices,
+            vec![0, 1],
+            "last token of each of 2 lanes"
+        );
         assert_eq!(g.sampling_indptr, vec![0, 1, 2]);
         assert_eq!(g.kv_page_indices, vec![10, 11, 12, 20, 21, 22]);
         assert_eq!(g.kv_page_indptr, vec![0, 3, 6]);
@@ -323,7 +376,13 @@ mod tests {
         let c = section3_container();
         let values: Vec<Option<Vec<u8>>> = vec![None, Some(5u32.to_le_bytes().to_vec())];
         let e = map_geometry(&c, &values, 16).unwrap_err();
-        assert_eq!(e, GeometryError::MissingChannelValue { port: Port::EmbedTokens, channel: 0 });
+        assert_eq!(
+            e,
+            GeometryError::MissingChannelValue {
+                port: Port::EmbedTokens,
+                channel: 0
+            }
+        );
     }
 
     /// W3.4 relaxed gate: a device-geometry fire whose port channels are unfilled
@@ -339,9 +398,16 @@ mod tests {
         assert!(g.kv_page_indices.is_empty(), "device pages left empty");
         assert!(g.kv_last_page_lens.is_empty(), "device kv_len left empty");
         // The const embed_indptr port ([0,1,2]) still prefills.
-        assert_eq!(g.qo_indptr, vec![0, 1, 2], "const port prefilled even in relaxed mode");
+        assert_eq!(
+            g.qo_indptr,
+            vec![0, 1, 2],
+            "const port prefilled even in relaxed mode"
+        );
         // strict mode still errors on the same input.
-        assert!(map_geometry(&c, &values, 16).is_err(), "strict gate still errors");
+        assert!(
+            map_geometry(&c, &values, 16).is_err(),
+            "strict gate still errors"
+        );
     }
 
     #[test]

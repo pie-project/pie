@@ -24,8 +24,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -123,25 +125,57 @@ class PtirInstance {
             return;
         }
         runner_.bind_view(&view_);
+        if (!validate_values(seeds, true, err)) {
+            ok_ = false;
+            return;
+        }
         for (const ChannelValue& s : seeds) {
-            const std::uint32_t slot = reg_->slot_for(s.channel);
-            if (slot == DeviceChannelRegistry::kBadSlot) continue;
-            reg_->seed_cell(slot, s.bytes.data(), s.bytes.size());
+            view_.seed_cell(dense_channel(s.channel), s.bytes.data(), s.bytes.size());
+        }
+        for (const Channel& ch : trace.channels) {
+            if (!ch.host_reader) continue;
+            bool produced = false;
+            for (const Stage& st : trace.stages) {
+                for (const ChannelPut& put : st.puts) {
+                    if (put.channel == ch.id) {
+                        produced = true;
+                        break;
+                    }
+                }
+                if (produced) break;
+            }
+            if (produced) host_reader_output_channels_.push_back(ch.id);
         }
     }
 
     bool ok() const { return ok_; }
 
+    bool validate_host_puts(const std::vector<ChannelValue>& values,
+                            std::string* err = nullptr) const {
+        return validate_values(values, false, err);
+    }
+
+    void feed_host_puts(const std::vector<ChannelValue>& values) {
+        for (const ChannelValue& value : values) {
+            view_.host_feed(
+                dense_channel(value.channel),
+                value.bytes.data(),
+                value.bytes.size());
+        }
+    }
+
     // One fire: bind per-fire host-puts (host-fed channels arriving, keyed by
     // GLOBAL id) + the intrinsic/host-tensor `FireInputs`, then run one tier-0
     // pass. The result's `committed` reflects the end-of-pass predicated bump.
     PassResult fire(const std::vector<ChannelValue>& host_puts, const FireInputs& in) {
-        for (const ChannelValue& hp : host_puts) {
-            const std::uint32_t slot = reg_->slot_for(hp.channel);
-            if (slot == DeviceChannelRegistry::kBadSlot) continue;
-            reg_->host_feed(slot, hp.bytes.data(), hp.bytes.size());
-        }
+        feed_host_puts(host_puts);
         return runner_.run_pass(in);
+    }
+
+    PassResult fire_async(const std::vector<ChannelValue>& host_puts, const FireInputs& in,
+                          std::vector<void*>& scratch) {
+        feed_host_puts(host_puts);
+        return runner_.launch_pass_async(in, scratch);
     }
 
     // Harvest a host-visible output channel's committed cell (post-commit) by
@@ -152,9 +186,9 @@ class PtirInstance {
         return true;
     }
 
-    // Enumerate the committed host-READER output channels post-fire →
-    // `(GLOBAL channel id, wire_bytes)` pairs — delta's ForwardResponse
-    // `ptir_output_*` SoA (re-keyed by global id, W0.2). ONLY channels that
+    // Enumerate the committed host-reader output channels post-fire as
+    // `(GLOBAL channel id, wire_bytes)` pairs in the runtime's publication
+    // order (re-keyed by global id, W0.2). ONLY channels that
     // committed THIS fire appear (back-pressure leaves others empty). Consumes
     // (`host_take`) each — one harvest per fire.
     std::vector<std::pair<std::uint64_t, std::vector<std::uint8_t>>> harvest_outputs() {
@@ -180,6 +214,7 @@ class PtirInstance {
         void*         device_ptr;
         std::size_t   bytes;
         ChannelId     ch;
+        std::uint32_t slot;
     };
     std::vector<DeviceOut> harvest_outputs_device() {
         std::vector<DeviceOut> outs;
@@ -187,21 +222,87 @@ class PtirInstance {
             if (!ch.host_reader) continue;
             if (!view_.committed_full(ch.id)) continue;
             outs.push_back(DeviceOut{view_.global_id(ch.id), view_.committed_cell(ch.id),
-                                     view_.cell_bytes(ch.id), ch.id});
+                                     view_.cell_bytes(ch.id), ch.id, view_.slot(ch.id)});
         }
         return outs;
     }
     void consume_outputs(const std::vector<DeviceOut>& outs) {
         for (const DeviceOut& o : outs) view_.host_consume(o.ch);
     }
+    std::vector<DeviceOut> predict_outputs_device() {
+        std::vector<DeviceOut> outs;
+        outs.reserve(host_reader_output_channels_.size());
+        for (ChannelId ch : host_reader_output_channels_) {
+            outs.push_back(DeviceOut{
+                view_.global_id(ch),
+                view_.pending_cell(ch),
+                view_.cell_bytes(ch),
+                ch,
+                view_.slot(ch),
+            });
+        }
+        return outs;
+    }
+    void apply_fire_result(bool committed, const std::vector<DeviceOut>& outs) {
+        runner_.apply_host_commit(committed);
+        if (!committed || outs.empty()) return;
+        std::vector<std::uint32_t> output_slots;
+        output_slots.reserve(outs.size());
+        for (const DeviceOut& out : outs) output_slots.push_back(out.slot);
+        view_.apply_host_consume(output_slots);
+    }
+    std::uint32_t* commit_device_flag() const noexcept {
+        return runner_.commit_device_flag();
+    }
     ChannelView& view() { return view_; }
 
   private:
+    ChannelId dense_channel(std::uint64_t global_id) const {
+        for (ChannelId dense = 0; dense < trace_->channels.size(); ++dense) {
+            if (view_.global_id(dense) == global_id) return dense;
+        }
+        return static_cast<ChannelId>(trace_->channels.size());
+    }
+
+    bool validate_values(const std::vector<ChannelValue>& values,
+                         bool seeds,
+                         std::string* err) const {
+        std::unordered_set<std::uint64_t> seen;
+        for (const ChannelValue& value : values) {
+            const ChannelId dense = dense_channel(value.channel);
+            if (dense >= trace_->channels.size()) {
+                if (err) *err = "ptir: channel value references an unbound channel";
+                return false;
+            }
+            if (!seen.insert(value.channel).second) {
+                if (err) *err = "ptir: duplicate channel value";
+                return false;
+            }
+            const Channel& channel = trace_->channels[dense];
+            if ((seeds && !channel.has_seed) ||
+                (!seeds &&
+                 (!channel.host_visible || channel.host_reader))) {
+                if (err) {
+                    *err = seeds
+                        ? "ptir: seed targets a non-seeded channel"
+                        : "ptir: host put targets a non-writer channel";
+                }
+                return false;
+            }
+            if (value.bytes.size() != view_.cell_bytes(dense)) {
+                if (err) *err = "ptir: channel value byte length mismatch";
+                return false;
+            }
+        }
+        return true;
+    }
+
     const Trace* trace_;
     DeviceChannelRegistry* reg_;
     ChannelView view_;
     Tier0Runner runner_;
     bool ok_ = true;
+    std::vector<ChannelId> host_reader_output_channels_;
 };
 
 }  // namespace pie_cuda_driver::ptir

@@ -5,27 +5,24 @@
 //! keeps the thin WIT resource types + Host trait impls.
 #![allow(unused_imports)]
 
+use crate::api::grammar::*;
 use crate::api::pie;
-use crate::inference::ForwardOutput;
+use crate::inference;
 use crate::inference::paging;
+use crate::instance::InstanceState;
+use anyhow::Result;
+use pie_grammar::brle::RunMask;
 use pie_grammar::compiled_grammar::CompiledGrammar;
 use pie_grammar::grammar::Grammar as InternalGrammar;
-use pie_grammar::json_schema::{
-    JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar,
-};
+use pie_grammar::json_schema::{JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar};
 use pie_grammar::matcher::GrammarMatcher;
 use pie_grammar::regex::regex_to_grammar;
-use crate::instance::InstanceState;
-use crate::inference;
-use anyhow::Result;
-use pie_driver_abi::Brle;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use wasmtime::component::Resource;
 use wasmtime::component::{Accessor, HasSelf};
 use wasmtime_wasi::WasiView;
-use crate::api::grammar::*;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExecuteProfileSnapshot {
@@ -138,9 +135,6 @@ pub(crate) fn record_execute_profile(sample: ExecuteProfileSample, total_us: u64
         .fetch_add(sample.postprocess_us, Ordering::Relaxed);
 }
 
-
-
-
 /// Pure targeting predicate for [`test_force_producer_abort`] (env-free, so it is
 /// unit-testable): abort iff a target link is configured AND this pass is the
 /// producer for it. An unset target (`None`) never matches ⇒ zero production
@@ -148,7 +142,6 @@ pub(crate) fn record_execute_profile(sample: ExecuteProfileSample, total_us: u64
 pub(crate) fn abort_target_matches(produced: Option<u32>, target: Option<u32>) -> bool {
     target.is_some() && produced == target
 }
-
 
 pub(crate) async fn self_suspend_park_restore(
     state: &mut InstanceState,
@@ -253,5 +246,3 @@ pub(crate) async fn self_suspend_park_restore(
     }
     freed_now
 }
-
-

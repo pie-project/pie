@@ -44,7 +44,12 @@ pub struct PageLease {
 impl PageLease {
     /// A fresh lease for `b` lanes.
     pub fn new(b: usize) -> Self {
-        PageLease { b, free: Vec::new(), pending: std::collections::VecDeque::new(), seed_pages: Vec::new() }
+        PageLease {
+            b,
+            free: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            seed_pages: Vec::new(),
+        }
     }
 
     /// Record the fire-0 seed pages (one live page per lane); reclaimed on drop.
@@ -139,7 +144,11 @@ mod tests {
         let _g = lease.grant(&mut alloc); // [1000, 1001]
         // lane 0 continued (heir, fresh unused → reclaim), lane 1 forked (keep).
         let reclaimed = lease.reclaim_after_fire(&[true, false]);
-        assert_eq!(reclaimed, vec![1000], "only the continuing lane's fresh page");
+        assert_eq!(
+            reclaimed,
+            vec![1000],
+            "only the continuing lane's fresh page"
+        );
         assert_eq!(lease.in_flight(), 0, "the oldest fire is retired");
     }
 
@@ -151,7 +160,11 @@ mod tests {
         lease.reclaim_after_fire(&[true, true]); // both continued → 1000,1001 freed
         // Next grant reuses the free-list (LIFO) before minting.
         let g1 = lease.grant(&mut alloc);
-        assert_eq!(g1, vec![1001, 1000], "reused freed pages, none newly minted");
+        assert_eq!(
+            g1,
+            vec![1001, 1000],
+            "reused freed pages, none newly minted"
+        );
     }
 
     #[test]
@@ -163,7 +176,11 @@ mod tests {
         let _g1 = lease.grant(&mut alloc); // [1002,1003]
         let mut all = lease.reclaim_all();
         all.sort();
-        assert_eq!(all, vec![500, 501, 1000, 1001, 1002, 1003], "everything freed on drop");
+        assert_eq!(
+            all,
+            vec![500, 501, 1000, 1001, 1002, 1003],
+            "everything freed on drop"
+        );
         assert_eq!(lease.in_flight(), 0);
     }
 

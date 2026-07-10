@@ -4,7 +4,7 @@
 Runs the SAME token-id prompt through:
   * the reference: mlx-lm (identical MLX numerics, the trusted oracle), and
   * the driver: the `parity_driver` C++ tool (loader -> graph -> paged-KV ->
-    InProcService Forward on the Metal GPU),
+    direct Metal driver launch on the GPU),
 
 then diffs the final-position logits: greedy-token parity (the headline
 accuracy gate), top-k index overlap, and logit-vector closeness (max abs diff,

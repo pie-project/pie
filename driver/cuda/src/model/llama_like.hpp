@@ -88,9 +88,8 @@ struct LlamaLikeForwardCfg {
     int tp_size = 1;
     NcclComm* tp_comm = nullptr;
 
-    // TP followers do not sample or build responses. After the final layer
-    // all-reduce there are no more collectives, so they can skip the rank-0
-    // logits tail.
+    // TP followers do not publish PTIR channels. After the final layer
+    // all-reduce there are no more collectives, so they can skip rank-0 logits.
     bool emit_logits = true;
 
     // ── Qwen3-VL M-RoPE ──────────────────────────────────────────────

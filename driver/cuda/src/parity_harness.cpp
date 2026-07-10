@@ -41,7 +41,7 @@ namespace pie_cuda_driver {
 
 // Run a one-shot forward pass on a binary file of i32 token ids and dump
 // the last token's logits (bf16, [vocab]) to `logits_out`. Used by the
-// numeric-parity harness; never invoked through the shmem path.
+// numeric-parity harness; separate from the direct runtime launch path.
 int run_parity(const Config& cfg,
                const std::string& tokens_in,
                const std::string& logits_out,

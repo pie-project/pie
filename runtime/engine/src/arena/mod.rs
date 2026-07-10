@@ -41,7 +41,7 @@ pub use txn::ArenaTxn;
 /// Bug#2 diagnostic (concurrent-decode KV-page churn): when `PTIR_ARENA_TRACE`
 /// is set, log every KvPage alloc/free — the free with a short backtrace so the
 /// churn's trigger (legitimate `KvWorkingSet::destroy` vs a per-fire release) is
-/// visible on a real-HW `cuda_bubble` run. Zero-cost when unset (one atomic
+/// visible on a real-HW `cuda_concurrent` run. Zero-cost when unset (one atomic
 /// load per alloc/free). Enable with `PTIR_ARENA_TRACE=1` on the repro.
 static ARENA_TRACE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("PTIR_ARENA_TRACE").is_ok());
@@ -83,7 +83,10 @@ pub enum ArenaKind {
 impl ArenaKind {
     /// Whether objects of this kind are device-resident when first allocated.
     fn allocates_on_gpu(self) -> bool {
-        matches!(self, ArenaKind::KvPage | ArenaKind::RsSlab | ArenaKind::Scratch)
+        matches!(
+            self,
+            ArenaKind::KvPage | ArenaKind::RsSlab | ArenaKind::Scratch
+        )
     }
 
     /// Whether objects of this kind may be evicted (offloaded / dropped to
@@ -152,7 +155,9 @@ pub struct MovePlan {
 /// Errors from arena operations. All are recoverable — the arena never traps.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ArenaError {
-    #[error("arena {device}: out of {kind:?} blocks (requested {requested}, available {available})")]
+    #[error(
+        "arena {device}: out of {kind:?} blocks (requested {requested}, available {available})"
+    )]
     OutOfBlocks {
         device: DriverId,
         kind: ArenaKind,
@@ -835,12 +840,17 @@ impl Arena {
                 let s = format!("{bt}");
                 let frame = s
                     .lines()
-                    .filter(|l| l.contains("pie::") && !l.contains("free_object") && !l.contains("::decref"))
+                    .filter(|l| {
+                        l.contains("pie::") && !l.contains("free_object") && !l.contains("::decref")
+                    })
                     .take(3)
                     .map(|l| l.trim())
                     .collect::<Vec<_>>()
                     .join(" <- ");
-                eprintln!("[ARENA] free   id={:?} blocks={:?} via {}", id, obj.blocks, frame);
+                eprintln!(
+                    "[ARENA] free   id={:?} blocks={:?} via {}",
+                    id, obj.blocks, frame
+                );
             }
             if obj.residency.has_physical() {
                 if let Some(pool) = self.pool_for_mut(obj.kind, obj.residency) {

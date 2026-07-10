@@ -72,7 +72,8 @@ impl pie::inferlet::messaging::Host for InstanceState {
 
 impl pie::inferlet::messaging::HostWithStore<InstanceState> for HasSelf<InstanceState> {
     async fn pull(accessor: &Accessor<InstanceState, Self>, topic: String) -> Result<String> {
-        let topic = accessor.with(|mut access| format!("{}:{}", access.get().get_username(), topic));
+        let topic =
+            accessor.with(|mut access| format!("{}:{}", access.get().get_username(), topic));
         messaging::pull(topic).await
     }
 
@@ -80,10 +81,15 @@ impl pie::inferlet::messaging::HostWithStore<InstanceState> for HasSelf<Instance
         accessor: &Accessor<InstanceState, Self>,
         topic: String,
     ) -> Result<StreamReader<String>> {
-        let topic = accessor.with(|mut access| format!("{}:{}", access.get().get_username(), topic));
+        let topic =
+            accessor.with(|mut access| format!("{}:{}", access.get().get_username(), topic));
         let (tx, rx) = mpsc::channel(64);
         let sub_id = messaging::subscribe(topic.clone(), tx).await?;
-        let producer = BroadcastStream { receiver: rx, topic, sub_id };
+        let producer = BroadcastStream {
+            receiver: rx,
+            topic,
+            sub_id,
+        };
         Ok(accessor.with(|mut access| StreamReader::new(&mut access, producer))?)
     }
 }

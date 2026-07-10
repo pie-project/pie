@@ -17,7 +17,7 @@
 //! order → a flipped argmax), so a lane can diverge from its batch-of-1 solo
 //! reference with NO KV corruption (verified: tp=16 engaged, suspends=101, still
 //! ~9 near-tie flips). The composite (charlie's Phase-2 finding):
-//!   (a) `cuda_bubble` FLEET=1 byte-exact — SEAL + carrier transparency with the
+//!   (a) the surviving `cuda_concurrent` single-lane reference — SEAL + carrier transparency with the
 //!       co-batch confound REMOVED (a single long-decode lane forced to preempt
 //!       via PIE_KV_PAGE_CAP, byte-identical to its sync reference);
 //!   (b) engaged multi-lane `restore_attributable == 0` HERE — a divergence first
@@ -315,7 +315,8 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // diverge from its batch-of-1 solo reference with NO KV corruption — even at
     // parked/suspends>0 (verified: tp=16 engaged, suspends=101, still ~9 lanes
     // near-tie flip). The exact-MATCH thus cannot be a hard gate here; the clean,
-    // un-confounded suspend/restore transparency proof is `cuda_bubble` FLEET=1
+    // un-confounded suspend/restore transparency proof is the single-lane
+    // `cuda_concurrent` reference
     // (a single long-decode lane forced to preempt via PIE_KV_PAGE_CAP,
     // byte-identical to its sync reference). What this harness CAN hard-gate is
     // genuine KV corruption, by the FIRST-DIVERGENCE POSITION of each mismatch
@@ -365,7 +366,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         eprintln!(
             "[contention] {} lane(s) {nbi_lanes:?} diverged in [1, {PAGE_SIZE}) — concurrent-decode \
              non-batch-invariance (co-batch bf16 near-tie flip), NOT KV corruption. Suspend/restore \
-             transparency in this band is gated by cuda_bubble FLEET=1 (byte-exact). Non-gating.",
+             transparency in this band is gated by the single-lane cuda_concurrent reference. Non-gating.",
             nbi_lanes.len()
         );
     }

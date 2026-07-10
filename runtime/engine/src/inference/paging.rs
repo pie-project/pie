@@ -24,7 +24,11 @@ pub enum PrepareError {
     /// (captured generation no longer matches). Rejected before any arena work.
     StaleGeneration { captured: u32, current: u32 },
     /// A per-page valid length is 0 or exceeds `page_size`.
-    InvalidValidLen { index: u32, valid_len: u32, page_size: u32 },
+    InvalidValidLen {
+        index: u32,
+        valid_len: u32,
+        page_size: u32,
+    },
     /// An output slot index appears more than once in one pass.
     DuplicateOutputIndex(u32),
     /// The active run `[0, active_len)` has a slot covered by neither context
@@ -148,7 +152,11 @@ pub fn project_kv(
         // Final slot is a read-only context tail page.
         let consumed = last_slot * page_size;
         let rem = context_valid_tokens.saturating_sub(consumed);
-        if rem == 0 || rem > page_size { page_size } else { rem }
+        if rem == 0 || rem > page_size {
+            page_size
+        } else {
+            rem
+        }
     };
 
     let active_page_idx = max_write_slot.map(|m| m as usize);
@@ -166,4 +174,3 @@ pub fn project_kv(
         full_page_writes,
     })
 }
-

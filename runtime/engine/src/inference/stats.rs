@@ -11,8 +11,6 @@ use std::time::Duration;
 // SchedulerStats (lock-free snapshot for monitoring)
 // =============================================================================
 
-pub const SYSTEM_SPEC_DRAFT_POS_BUCKETS: usize = 32;
-
 /// Bounded per-identity (C3) co-batch table width. Fleets carry ~10 distinct
 /// program identities; a first-seen table of this many slots covers them with
 /// headroom. A fleet exceeding it reads `identities_dropped > 0` (fail-loud
@@ -23,7 +21,22 @@ pub const PER_IDENTITY_BATCH_CAP: usize = 32;
 /// boundary is pinned at 100 (the masterplan p50 gate) so "p50 < 100 µs" reads as
 /// "the p50 bucket's upper bound ≤ 100". `u64::MAX` is the overflow catch-all.
 pub const BUBBLE_HIST_UPPER_US: [u64; 16] = [
-    1, 2, 4, 8, 16, 32, 64, 100, 150, 250, 500, 1_000, 2_000, 8_000, 32_000, u64::MAX,
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    100,
+    150,
+    250,
+    500,
+    1_000,
+    2_000,
+    8_000,
+    32_000,
+    u64::MAX,
 ];
 
 /// Cumulative stats exposed for monitoring. Updated atomically after each batch.
@@ -43,13 +56,6 @@ pub struct SchedulerStats {
     pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
-    pub system_spec_draft_tokens_proposed: AtomicU64,
-    pub system_spec_draft_tokens_accepted: AtomicU64,
-    pub system_spec_draft_tokens_proposed_per_pos:
-        [AtomicU64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
-    pub system_spec_draft_tokens_accepted_per_pos:
-        [AtomicU64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
-
     // ── Per-identity (C3) co-batch density (pentathlon per-identity-batch-density
     //    probe = rows / fires per program identity). First-seen bounded table keyed
     //    on `program_identity_hash` (bytecode ⊕ manifest — the SAME key the quorum
@@ -71,18 +77,9 @@ pub struct SchedulerStats {
     /// bucketed by [`BUBBLE_HIST_UPPER_US`]. Yields a true p50/p99 (the masterplan
     /// gate) across ALL fires (0 when enqueue-ahead covered the gap), unlike the
     /// probe-gated `fire.quorum.inter_batch_bubble_us` accumulator (average,
-    /// non-zero only). The host proxy stamps device-idle at the RUST enqueue point,
-    /// so it OVER-counts by the host submit/handshake delay — see the driver
-    /// histogram below for the accurate device-idle p50.
+    /// non-zero only). The host stamp includes scheduler wake/submit overhead, so
+    /// it is a conservative upper-bound measurement.
     pub bubble_us_hist: [AtomicU64; BUBBLE_HIST_UPPER_US.len()],
-    /// Inter-batch bubble histogram (DRIVER STAMP) — fed by the CUDA driver's
-    /// `probe_device_idle_us` (`t0_entry − t5_prev_retire`, the true on-device idle
-    /// between a batch retiring and the next entering). Populated only when the
-    /// driver stamps it (profile-driver-cuda on the driver side); empty otherwise,
-    /// in which case readers fall back to the host-proxy histogram. This is the
-    /// accurate G3 bubble-p50 measurement (no host-side over-count).
-    pub bubble_us_hist_driver: [AtomicU64; BUBBLE_HIST_UPPER_US.len()],
-
     // ── Fire-domain probes (gated behind `profile-fire` feature). ───────────
     //
     // Hierarchy + invariants documented in `crate::probe::fire`. Writers
@@ -90,14 +87,6 @@ pub struct SchedulerStats {
     // disappears when the feature is off. The struct itself is always
     // defined so callers and readers compile uniformly.
     pub fire: crate::probe::fire::FireProbes,
-
-    // ── Driver-fire phase breakdown (gated behind `profile-driver-cuda`). ──
-    //
-    // Decomposes the `fire.execute.driver_fire_us` bucket into Rust
-    // (ipc_submit / gpu_wait / ipc_recv) and C++ host phases (wire_parse
-    // / plan / h2d / kernel_launch / sync / response_build). See
-    // `crate::probe::driver_cuda` for the plumbing.
-    pub driver_cuda: crate::probe::driver_cuda::DriverCudaProbes,
 }
 
 impl SchedulerStats {
@@ -134,13 +123,6 @@ impl SchedulerStats {
         self.bubble_us_hist[Self::bubble_bucket(us)].fetch_add(1, Relaxed);
     }
 
-    /// Record one fire's inter-batch bubble (µs) into the DRIVER-STAMP histogram
-    /// (the accurate `probe_device_idle_us`). Called from the same single
-    /// scheduler thread at response-processing time.
-    pub fn record_bubble_us_driver(&self, us: u64) {
-        self.bubble_us_hist_driver[Self::bubble_bucket(us)].fetch_add(1, Relaxed);
-    }
-
     #[inline]
     fn bubble_bucket(us: u64) -> usize {
         BUBBLE_HIST_UPPER_US
@@ -150,30 +132,12 @@ impl SchedulerStats {
     }
 }
 
-// =============================================================================
-// Fire-completion telemetry folding
-// =============================================================================
-
-/// Out-of-band data execute_batch reports back to the run loop. Per-fire
-/// *timing* probes are no longer in this struct — they're recorded
-/// directly into `stats.fire.*` via `probe_fire!`. What's left here is
-/// genuine fire-output data (spec-decoding draft counters) that the run
-/// loop then folds into the spec-domain atomics.
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct BatchExecutionTiming {
-    pub(crate) system_spec_draft_tokens_proposed: u64,
-    pub(crate) system_spec_draft_tokens_accepted: u64,
-    pub(crate) system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
-    pub(crate) system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
-}
-
-/// Fold a completed batch's always-on counters + spec-domain accumulators
-/// into the shared stats. `latency` is the off-thread forward (GPU) wait —
+/// Fold a completed batch's always-on counters into the shared stats.
+/// `latency` is the off-thread forward (GPU) wait —
 /// the dominant component of the batch's wall time under the overlapped
 /// fire (the host build/enqueue overlaps the prior in-flight batch).
 pub(crate) fn record_fire_stats(
     stats: &SchedulerStats,
-    timing: &BatchExecutionTiming,
     latency: Duration,
     batch_size: u64,
     total_tokens: usize,
@@ -206,29 +170,5 @@ pub(crate) fn record_fire_stats(
         stats
             .cumulative_latency_us
             .fetch_add(latency.as_micros() as u64, Relaxed);
-        stats
-            .system_spec_draft_tokens_proposed
-            .fetch_add(timing.system_spec_draft_tokens_proposed, Relaxed);
-        stats
-            .system_spec_draft_tokens_accepted
-            .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
-        for (counter, value) in stats
-            .system_spec_draft_tokens_proposed_per_pos
-            .iter()
-            .zip(timing.system_spec_draft_tokens_proposed_per_pos)
-        {
-            if value != 0 {
-                counter.fetch_add(value, Relaxed);
-            }
-        }
-        for (counter, value) in stats
-            .system_spec_draft_tokens_accepted_per_pos
-            .iter()
-            .zip(timing.system_spec_draft_tokens_accepted_per_pos)
-        {
-            if value != 0 {
-                counter.fetch_add(value, Relaxed);
-            }
-        }
     });
 }

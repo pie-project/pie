@@ -9,7 +9,7 @@
 //! every selection + KV reorder is a host round-trip.
 //!
 //! The M3 acceptance harness measures THIS inferlet's wall time into
-//! `PIE_M3_BEAM_BASELINE_US`; G2 passes iff the fused `beam` inferlet's wall
+//! a standalone comparison point for the fused `beam` inferlet's wall
 //! time is within 10% of it. Because the fused form folds the whole
 //! reorder/select epilogue into ONE device pass (no per-step logits read-back,
 //! no host top-k, no re-fork), it should be strictly faster — this baseline is

@@ -33,9 +33,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
-use pie_engine::server::ClientId;
 use pie_client_api::{ClientMessage, ServerMessage};
 use pie_controller_rpc::GatewayEndpoint;
+use pie_engine::server::ClientId;
 use pie_ids::{ReqId, SessionId, WorkerId};
 use pie_worker_rpc::{
     Accepted, Control, GatewayInboundClient, Priority, Request, Tokens, WorkerControl,
@@ -348,7 +348,8 @@ impl WorkerControlServer {
         {
             return Ok(handle.turns.clone());
         }
-        let client_id = pie_engine::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
+        let client_id =
+            pie_engine::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
         let (turns_tx, turns_rx) = mpsc::channel::<Request>(TURN_QUEUE_DEPTH);
         let cancel = Arc::new(Notify::new());
         tokio::spawn(session_driver(

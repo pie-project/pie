@@ -43,6 +43,81 @@
     }
 
     #[test]
+    fn foreign_completion_publish_records_epoch_before_wake() {
+        let t = Arc::new(WakerTable::new());
+        let id = t.alloc();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let publisher = {
+            let t = Arc::clone(&t);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                t.publish(id, 7)
+            })
+        };
+        let observed = rt.block_on(async {
+            let t2 = Arc::clone(&t);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                WaitFuture::new(&*t, id, move || match t2.published(id) {
+                    Some(epoch) if epoch >= 7 => Readiness::Ready(epoch),
+                    Some(epoch) => Readiness::Pending { observed_epoch: epoch },
+                    None => Readiness::Ready(0),
+                }),
+            )
+            .await
+            .expect("foreign completion callback lost its wake")
+        });
+        let outcome = publisher.join().unwrap();
+        assert_eq!(observed, 7);
+        assert!(matches!(outcome, WakeOutcome::Woken | WakeOutcome::Empty));
+        t.free(id);
+    }
+
+    #[test]
+    fn published_completion_epoch_never_regresses() {
+        let t = WakerTable::new();
+        let id = t.alloc();
+        assert_eq!(t.publish(id, 7), WakeOutcome::Empty);
+        assert_eq!(t.publish(id, 3), WakeOutcome::Empty);
+        assert_eq!(t.published(id), Some(7));
+        t.free(id);
+    }
+
+    #[test]
+    fn reserved_epochs_are_rejected_in_release_logic() {
+        let t = WakerTable::new();
+        let id = t.alloc();
+        let (_, w) = flag_waker();
+        assert!(!t.register(id, &w, u64::MAX));
+        assert_eq!(t.publish(id, 0), WakeOutcome::InvalidEpoch);
+        assert_eq!(t.publish(id, u64::MAX), WakeOutcome::InvalidEpoch);
+        assert_eq!(t.wake_past(id, u64::MAX), WakeOutcome::InvalidEpoch);
+        assert_eq!(t.published(id), Some(0));
+        assert_eq!(t.metrics().invalid_epoch, 3);
+        t.free(id);
+    }
+
+    #[test]
+    fn generation_wrap_retires_slot_instead_of_reusing_zero() {
+        let t = WakerTable::new();
+        let first = t.alloc();
+        let wrapped = t
+            .force_generation_for_test(first, u32::MAX)
+            .expect("live slot");
+        let retired_index = wrapped as u32;
+        t.free(wrapped);
+        assert_eq!(t.wake(wrapped), WakeOutcome::Stale);
+
+        let next = t.alloc();
+        assert_ne!(next as u32, retired_index, "retired index must not be reused");
+        assert_ne!((next >> 32) as u32, 0, "generation zero is reserved");
+        t.free(next);
+    }
+
+    #[test]
     fn stale_generation_is_noop_b10() {
         let t = WakerTable::new();
         let id = t.alloc();
@@ -52,6 +127,8 @@
         // The dead channel's id, still held by "C++": every op is inert.
         assert_eq!(t.wake(id), WakeOutcome::Stale);
         assert_eq!(t.wake_past(id, 99), WakeOutcome::Stale);
+        assert_eq!(t.publish(id, 99), WakeOutcome::Stale);
+        assert_eq!(t.published(id), None);
         assert!(!t.register(id, &w, 0));
         // The recycled slot gets a NEW generation: old id still stale.
         let id2 = t.alloc();

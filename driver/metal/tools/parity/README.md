@@ -10,8 +10,8 @@ Built for Qwen2.5-0.5B (known-good) and reused as-is for gemma4 / qwen3.6.
 - `parity_driver.cpp` — C++ tool (`-DPIE_METAL_BUILD_PARITY=ON`). Loads a real
   HF checkpoint via the loader, runs a single-request prefill through charlie's
   graph + delta's paged-KV on the Metal GPU, writes the final-position `[vocab]`
-  logits row to a float32 `.npy`, and cross-checks that the **InProcService
-  Forward path** greedy-samples the same token as the raw-graph argmax.
+  logits row to a float32 `.npy`, and cross-checks that the direct driver launch
+  greedy-samples the same token as the raw-graph argmax.
 - `parity_check.py` — runs the identical token ids through mlx-lm, then diffs:
   greedy-token match, top-k index overlap, max abs logit diff, cosine, KL.
 
@@ -60,4 +60,3 @@ Notes:
 noise floor (~0.99996): a small broadband per-logit residual (uniform mean
 shift is softmax-invariant; not magnitude-dependent → not softcap/scale) that
 does not affect greedy decoding.
-

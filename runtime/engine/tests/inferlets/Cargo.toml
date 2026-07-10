@@ -4,6 +4,8 @@ members = [
     "echo",
     "context",
     "error",
+    "direct-channel-e2e",
+    "direct-mixed-e2e",
     "generate",
     "generate-gdn",
     "generate-gdn-n1",

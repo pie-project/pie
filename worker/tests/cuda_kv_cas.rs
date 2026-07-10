@@ -11,7 +11,7 @@
 //!     replay), via the result-captured canary harness.
 //!
 //! Shares the `common` cuda harness (`boot_cuda` + `install_inferlet` +
-//! `spawn_inferlet`). One boot per process (auth/shmem singletons). Run warm:
+//! `spawn_inferlet`). One boot per process (global engine state). Run warm:
 //!   cargo test -p pie-worker --features driver-cuda --test cuda_kv_cas -- --ignored --nocapture
 
 mod common;

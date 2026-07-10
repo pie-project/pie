@@ -328,4 +328,3 @@ impl WaitAllPolicy {
     /// submission-latency EWMA (F6, timing is a probe only).
     pub fn on_submitted(&mut self, _latency: Duration) {}
 }
-

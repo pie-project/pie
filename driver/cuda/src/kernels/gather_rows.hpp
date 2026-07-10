@@ -1,9 +1,7 @@
 #pragma once
 
-// Gather full rows of a 2-D bf16 buffer into a packed 2-D output.
-// Used by the RawLogits sub-pass to coalesce per-slot row copies into
-// a single D2H transfer. Treating the row payload as `std::uint16_t`
-// keeps the kernel ABI plain-CUDA (no `__nv_bfloat16` in callers).
+// Gather selected rows of a 2-D bf16 buffer into the compact PTIR logits
+// matrix. Treating the payload as `std::uint16_t` keeps the ABI plain CUDA.
 
 #include <cstdint>
 #include <cuda_runtime.h>

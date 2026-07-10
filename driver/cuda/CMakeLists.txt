@@ -80,11 +80,8 @@ if(CUDAToolkit_INCLUDE_DIRS)
   endif()
 endif()
 
-if(NOT PIE_SCHEMA_INCLUDE_DIR)
-  set(PIE_SCHEMA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include")
-endif()
-if(NOT PIE_IPC_INCLUDE_DIR)
-  set(PIE_IPC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ipc/include")
+if(NOT PIE_DRIVER_ABI_INCLUDE_DIR)
+  set(PIE_DRIVER_ABI_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include")
 endif()
 
 # NCCL for tensor-parallel collectives. Single-GPU runs never load it (the
@@ -195,21 +192,15 @@ endif()
 #     contains the driver. Per the M3 static-link spike below, this works
 #     with `cublas_static + cublasLt_static + cudart_static + culibos +
 #     pthread + rt + dl` and yields a binary with zero CUDA shared deps.
-#   - `pie_driver_cuda` (executable): a thin shim around the lib's
-#     `pie_driver_cuda_run` entry. Consumed by the Python wrapper
-#     `pie_driver_cuda_native` via subprocess.
+#   - `pie_driver_cuda` (executable): a thin direct-create diagnostic shim.
 add_library(pie_driver_cuda_lib STATIC
   src/entry.cpp
   src/executor/persistent_inputs.cpp
   src/executor/executor.cpp
   src/ptir/ptir_dispatch.cu
-  src/service/inproc_service.cpp
-  src/response_subpass.cpp
-  src/sampling_dispatch.cpp
   src/sampling_ir/tensor_io.cpp
   src/sampling_ir/frame_carrier.cpp
   src/sampling_ir/frame_carrier_kernels.cu
-  src/spec_expansion.cpp
   src/tensor.cpp
   src/model/weight_store.cpp
   src/mla_cache.cpp
@@ -225,7 +216,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/mixtral.cpp
   src/model/gemma2.cpp
   src/model/gemma4.cpp
-  src/model/gemma4_mtp.cpp
   src/model/gemma4_vision_forward.cu
   src/model/gemma4_vision_adapter.cpp
   src/model/gemma4_audio_forward.cu
@@ -286,9 +276,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/dsa_indexer.cu
   src/kernels/sample_temp.cu
   src/kernels/sample_flashinfer.cu
-  src/kernels/entropy.cu
-  src/kernels/logprobs.cu
-  src/kernels/dist.cu
   src/kernels/gather_rows.cu
   src/kernels/add_bias.cu
   src/kernels/residual_add.cu
@@ -315,7 +302,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/nemotron_h.cu
   src/recurrent_state_cache.cpp
   src/cuda_memory_planner.cpp
-  src/driver_startup.cpp
   src/parity_harness.cpp
   src/hf_snapshot.cpp
   src/model/qwen3_5_config.cpp
@@ -400,9 +386,9 @@ target_compile_options(pie_driver_cuda PRIVATE
 
 target_include_directories(pie_driver_cuda_lib
   PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${PIE_SCHEMA_INCLUDE_DIR}
-    ${PIE_IPC_INCLUDE_DIR}
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
     ${PIE_CCCL_INCLUDE_DIRS}
     ${flashinfer_SOURCE_DIR}/include
@@ -840,6 +826,22 @@ target_include_directories(test_frame_carrier_device PRIVATE
 target_link_libraries(test_frame_carrier_device PRIVATE CUDA::cudart)
 add_test(NAME sampling_ir_frame_carrier_device COMMAND test_frame_carrier_device)
 
+add_executable(test_ptir_dispatch_bind
+  tests/test_ptir_dispatch_bind.cpp
+  src/ptir/ptir_dispatch.cu
+  src/sampling_ir/frame_carrier.cpp
+  src/sampling_ir/frame_carrier_kernels.cu)
+target_include_directories(test_ptir_dispatch_bind PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  ${PIE_DRIVER_ABI_INCLUDE_DIR})
+target_compile_options(test_ptir_dispatch_bind PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_ptir_dispatch_bind PRIVATE CUDA::cudart)
+add_test(NAME ptir_dispatch_bind COMMAND test_ptir_dispatch_bind)
+set_tests_properties(ptir_dispatch_bind PROPERTIES
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
 # Sampling-IR codegen (Lane L2 / charlie, W2): lowers golden PSIR programs to a
 # KernelDAG, NVRTC-compiles + launches each kernel via the driver API, and checks
 # the result against a CPU reference (incl. Gumbel-max sample_temp parity). Needs
@@ -1056,6 +1058,10 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
   CUDA::nvrtc
   ${NCCL_LIBRARY}
 )
+
+add_executable(test_entry_validation tests/entry_validation_test.cpp)
+target_link_libraries(test_entry_validation PRIVATE pie_driver_cuda_lib)
+add_test(NAME entry_validation COMMAND test_entry_validation)
 
 # M3 static-link spike notes: a hello-world calling cublasCreate/Destroy
 # links cleanly with `-lcublas_static -lcublasLt_static -lcudart_static

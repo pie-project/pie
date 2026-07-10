@@ -5,9 +5,7 @@
 use std::sync::Arc;
 
 use pie_grammar::grammar::Grammar;
-use pie_grammar::json_schema::{
-    JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar,
-};
+use pie_grammar::json_schema::{JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar};
 use pie_grammar::matcher::GrammarMatcher;
 use pie_tokenizer::Tokenizer;
 

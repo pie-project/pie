@@ -1,7 +1,7 @@
 # cmake/FetchMLX.cmake — MLX C++ dependency for driver/metal.
 #
 # Gated behind the `PIE_METAL_WITH_MLX` option (see CMakeLists.txt). The
-# bare foundation skeleton (entry + stub service) does NOT need MLX, so the
+# bare direct surface (entry + bind/launch stub) does NOT need MLX, so the
 # option defaults OFF for a fast compile/link/register gate. The compute
 # layer (beta's src/ops, src/executor) turns it ON.
 #

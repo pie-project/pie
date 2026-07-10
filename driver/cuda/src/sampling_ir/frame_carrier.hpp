@@ -2,9 +2,7 @@
 
 // X2 — CUDA frames/mirrors carrier (Runtime–Driver Boundary B5/B6/B8/B9/B11/B13).
 //
-// The real-device dual of X1's `MockControlPlane` frame regions. X1 backed the
-// B5 address triple (`FrameAddresses{frame_base,mirror_base,word_base}`) with
-// plain host allocations; X2 backs it with the real thing:
+// Owns the stable frame/mirror/word regions returned by direct instance bind:
 //   * frame_base   — a DEVICE frame (`cudaMalloc`). Cells live at
 //                    `frame_base + channel offset + ring index`. FIXED for the
 //                    instance's lifetime (B6) — a dedicated allocation, never
@@ -27,12 +25,7 @@
 // the runtime declares directly), and is built + device-verified in isolation
 // (the `test_frame_carrier_device` target) before it composes into the executor.
 //
-// PROVISIONAL (velocity shift): the exact per-channel frame layout is guru's to
-// reconcile as he steers the boundary rework. This module builds the *mechanism*
-// against X1's `FrameAddresses` triple; the layout is a trace-derived
-// {frame,mirror,word} sizing stand-in (identical in shape to X1's `MockProgram`),
-// swapped for the real channel-list layout at the reconcile WITHOUT touching the
-// carrier. The runtime-side dual is `CudaControlPlane` (control_cuda.rs).
+// Channel layout is established once at bind and stays stable through close.
 
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +36,22 @@
 #include <cuda_runtime.h>
 
 namespace pie_cuda_driver::sampling_ir {
+
+struct WordLayout {
+    __host__ __device__ static constexpr std::uint32_t pacing() noexcept { return 0; }
+    __host__ __device__ static constexpr std::uint32_t head(std::uint32_t channel) noexcept {
+        return 1 + 3 * channel;
+    }
+    __host__ __device__ static constexpr std::uint32_t tail(std::uint32_t channel) noexcept {
+        return 2 + 3 * channel;
+    }
+    __host__ __device__ static constexpr std::uint32_t poison(std::uint32_t channel) noexcept {
+        return 3 + 3 * channel;
+    }
+    __host__ __device__ static constexpr std::uint32_t words(std::uint32_t channels) noexcept {
+        return 1 + 3 * channels;
+    }
+};
 
 // One host-visible channel's slot in the per-instance pinned mirror (the real
 // channel-list layout that supersedes the provisional trace-length sizing). The
@@ -57,7 +66,8 @@ struct FrameChannel {
 
 // Per-instance frame layout. The REAL channel-list layout (boundary.md §2): the
 // pinned mirror is sized to the host-visible channels' rings and the pinned words
-// are `WordLayout::words(n)` = pacing[0] + head/tail per host-visible channel.
+// are `WordLayout::words(n)` = pacing[0] + head/tail/poison per host-visible
+// channel.
 // `frame_bytes` is vestigial (the device cells live in the shared
 // DeviceChannelRegistry, not a per-instance contiguous frame — the Q1 reconcile);
 // kept non-zero so the legacy isolation-test bind still allocates a device probe.
@@ -105,7 +115,8 @@ public:
     // B4/B5 (REAL layout) — bind an instance directly from its host-visible
     // channel list (`cell_bytes[i]`, `cap1[i]` for i in [0,n)). Allocates the
     // pinned mirror (sum of per-channel rings) + the pinned words
-    // (`WordLayout::words(n)` = pacing[0] + head/tail per channel) and writes the
+    // (`WordLayout::words(n)` = pacing[0] + head/tail/poison per channel) and
+    // writes the
     // three bases. Returns the 1-based instance id. This is the unification's live
     // bind (the PTIR side owns the channel list); `bind_instance` above stays for
     // the isolation test's provisional path.
@@ -147,6 +158,7 @@ public:
     void publish_device(std::uint64_t instance, std::uint32_t n_channels,
                         const void* const* src, const std::uint32_t* ring_index,
                         const std::uint32_t* head, const std::uint32_t* tail,
+                        const std::uint32_t* commit_dev,
                         std::uint64_t pacing);
 
     // LOOKUP (U4 flip) — expose an instance's pinned mirror/word bases + the exact
@@ -203,10 +215,7 @@ private:
 
 }  // namespace pie_cuda_driver::sampling_ir
 
-// ── extern "C" FFI surface (host-declared in Rust; cbindgen-shaped like the
-//    pie_pinned_* / pie_device_* tensor-io surface). The runtime's
-//    `CudaControlPlane` calls these directly into `pie_driver_cuda_lib`,
-//    bypassing the IPC/driver channel — the X1 control plane's direct fast path. ──
+// Legacy frame-carrier isolation surface used only by its device test.
 extern "C" {
 
 // B4 — register a trace; returns a 1-based program handle (0 = rejected).

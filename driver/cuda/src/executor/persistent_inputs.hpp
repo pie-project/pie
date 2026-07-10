@@ -11,10 +11,9 @@
 // hardcodes pointer arguments at capture time. Replay with new
 // pointers would read stale memory and produce gibberish.
 //
-// With this struct, the 9 wire control arrays + sampled-token output
-// live at stable addresses. The executor refreshes their
-// *contents* via `copy_from_host` / `copy_from_bytes` per fire and
-// hands raw pointers to the forward + sampling kernels.
+// With this struct, launch geometry and model scratch live at stable addresses.
+// The executor refreshes their contents per fire and hands raw pointers to the
+// forward and PTIR kernels.
 //
 // All sizes are upper bounds derived from the configured workspace
 // limits. Allocation is one-shot at engine init; deallocation is
@@ -65,22 +64,8 @@ struct PersistentInputs {
     DeviceBuffer<std::uint8_t>  is_fresh;
     DeviceBuffer<std::int32_t>  mtp_request_ids;
 
-    // Sampler per-row parameters. Capacity = max_workspace_tokens.
-    // Refreshed per fire by `executor::handle_fire_batch`.
-    // Held here (rather than allocated inside `dispatch_sampling`) so
-    // the sampling kernel runs without per-fire `cudaMalloc/cudaFree`
-    // churn — the prior path opened 3–6 fresh device allocations per
-    // fire just for these scalar arrays, ~10k API calls over a
-    // throughput run.
-    DeviceBuffer<float>          sample_temp;
-    DeviceBuffer<float>          sample_top_p;
-    DeviceBuffer<float>          sample_min_p;
-    DeviceBuffer<std::int32_t>   sample_top_k;
-    DeviceBuffer<std::uint32_t>  sample_seed;
-    DeviceBuffer<std::uint64_t>  sample_seed64;
+    // Absolute model rows requested by the launched PTIR instances.
     DeviceBuffer<std::int32_t>   sample_idx;
-    DeviceBuffer<std::int32_t>   sample_per_token;
-    DeviceBuffer<bool>           sample_valid;
 
     static PersistentInputs allocate(
         int max_workspace_tokens,

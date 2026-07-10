@@ -1,9 +1,9 @@
 pub mod chat;
 pub mod grammar;
+pub mod kv_working_set;
 pub mod media;
 pub mod messaging;
 pub mod model;
-pub mod kv_working_set;
 pub mod reasoning;
 pub mod rs_working_set;
 pub mod session;
@@ -13,8 +13,8 @@ pub mod tokenizer;
 pub mod tools;
 pub mod types;
 
-use wasmtime::component::HasSelf;
 use crate::instance::InstanceState;
+use wasmtime::component::HasSelf;
 
 wasmtime::component::bindgen!({
     path: "../../interface/inferlet",

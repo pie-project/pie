@@ -22,9 +22,8 @@
 //!      channel's staged cell into the submission's seed table; every fire:
 //!      [`drain_host_puts`] **coalesces** the staged Writer puts into the
 //!      submit's host-put table (bool packed to the wire, D1);
-//!   3. the driver fires; the response carries the Reader channels' produced
-//!      cells, which [`marshal_response`] unpacks + enqueues;
-//!   4. guest `channel.take`/`read` retrieve them. A poisoned channel turns
+//!   3. the driver publishes Reader cells and epochs into the bound mirror;
+//!   4. guest `channel.take`/`read` load that mirror directly. A poisoned channel turns
 //!      every host `take`/`read` into an error (device-side fault surfaced to
 //!      the guest).
 //!
@@ -35,7 +34,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pie_driver_abi::PtirChannelValue;
+use crate::ptir::PtirChannelValue;
 use pie_ptir::container::{self, ChannelDecl, HostRole};
 use pie_ptir::types::DType;
 
@@ -74,10 +73,28 @@ pub struct ChannelCell {
     staged: VecDeque<Vec<u8>>,
     /// Device-produced cells awaiting host `take`/`read`, FIFO, dtype-native.
     produced: VecDeque<Vec<u8>>,
+    /// Direct driver-owned mirror endpoints for every pass that binds this
+    /// Reader channel. Completion publishes each endpoint's visible tail; the
+    /// guest host operation copies only then.
+    readers: Vec<ReaderMirror>,
     /// `Some(reason)` once a fire that feeds this channel failed: every later
     /// host `take`/`read` errors with the reason. Under run-ahead the submit
     /// returns before the fire resolves, so poison IS the error channel.
     poisoned: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ReaderMirror {
+    instance_id: u64,
+    mirror_base: u64,
+    word_base: u64,
+    cell_bytes: usize,
+    cap1: u64,
+    mirror_offset: u64,
+    tail_word_index: usize,
+    poison_word_index: usize,
+    published_tail: u64,
+    copied_tail: u64,
 }
 
 /// A channel host-op failure (surfaced to the guest as a WIT `result` error).
@@ -91,7 +108,7 @@ pub enum ChannelError {
     Empty,
     /// The channel is poisoned (a device-side fault), with the fire's error.
     Poisoned(String),
-    /// A put/marshal payload's length doesn't match the channel's shape×dtype.
+    /// A put or mirror payload's length doesn't match the channel's shape×dtype.
     BadLength { expected: usize, got: usize },
     /// A first fire found no staged seed on a `seeded` channel.
     MissingSeed,
@@ -131,6 +148,7 @@ impl ChannelCell {
             seed_taken: false,
             staged: VecDeque::new(),
             produced: VecDeque::new(),
+            readers: Vec::new(),
             poisoned: None,
         }
     }
@@ -149,14 +167,20 @@ impl ChannelCell {
     pub fn matches_decl(&self, decl: &ChannelDecl) -> Result<(), String> {
         let decl_dims = decl.shape.dims().to_vec();
         if self.shape != decl_dims {
-            return Err(format!("shape {:?} != declared {:?}", self.shape, decl_dims));
+            return Err(format!(
+                "shape {:?} != declared {:?}",
+                self.shape, decl_dims
+            ));
         }
         let decl_dtype = decl.dtype.program_dtype();
         if self.dtype != decl_dtype {
             return Err(format!("dtype {:?} != declared {decl_dtype:?}", self.dtype));
         }
         if self.capacity != decl.capacity {
-            return Err(format!("capacity {} != declared {}", self.capacity, decl.capacity));
+            return Err(format!(
+                "capacity {} != declared {}",
+                self.capacity, decl.capacity
+            ));
         }
         Ok(())
     }
@@ -173,7 +197,10 @@ impl ChannelCell {
     pub fn put(&mut self, native: Vec<u8>) -> Result<(), ChannelError> {
         let expected = self.native_len();
         if native.len() != expected {
-            return Err(ChannelError::BadLength { expected, got: native.len() });
+            return Err(ChannelError::BadLength {
+                expected,
+                got: native.len(),
+            });
         }
         match self.role {
             None | Some(HostRole::Writer) => {}
@@ -200,6 +227,7 @@ impl ChannelCell {
     /// Host `take` a produced cell (Reader), FIFO. An unbound channel is
     /// simply empty.
     pub fn take(&mut self) -> Result<Vec<u8>, ChannelError> {
+        self.refresh_reader_mirrors()?;
         if let Some(reason) = &self.poisoned {
             return Err(ChannelError::Poisoned(reason.clone()));
         }
@@ -212,7 +240,8 @@ impl ChannelCell {
     }
 
     /// Host `read` (peek, non-consuming) a produced cell (Reader).
-    pub fn read(&self) -> Result<Vec<u8>, ChannelError> {
+    pub fn read(&mut self) -> Result<Vec<u8>, ChannelError> {
+        self.refresh_reader_mirrors()?;
         if let Some(reason) = &self.poisoned {
             return Err(ChannelError::Poisoned(reason.clone()));
         }
@@ -250,19 +279,139 @@ impl ChannelCell {
             .collect()
     }
 
-    /// Enqueue a device-produced wire cell for host `take`/`read`, unpacking
-    /// bool from the wire.
-    fn marshal(&mut self, wire: &[u8]) -> Result<(), ChannelError> {
-        let native = if self.dtype == DType::Bool {
-            unpack_bool(wire, self.numel())
-        } else {
-            wire.to_vec()
-        };
-        let expected = self.native_len();
-        if native.len() != expected {
-            return Err(ChannelError::BadLength { expected, got: native.len() });
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_reader_mirror(
+        &mut self,
+        instance_id: u64,
+        mirror_base: u64,
+        word_base: u64,
+        cell_bytes: u32,
+        capacity: u32,
+        mirror_offset: u64,
+        tail_word_index: u32,
+        poison_word_index: u32,
+    ) -> Result<(), String> {
+        if self.role != Some(HostRole::Reader) {
+            return Err(format!(
+                "channel {}: driver mirror bound to {:?}, expected Reader",
+                self.global_id, self.role
+            ));
         }
-        self.produced.push_back(native);
+        if mirror_base == 0 || word_base == 0 || cell_bytes == 0 {
+            return Err(format!(
+                "channel {}: driver returned an invalid mirror binding",
+                self.global_id
+            ));
+        }
+        if self
+            .readers
+            .iter()
+            .any(|reader| reader.instance_id == instance_id)
+        {
+            return Err(format!(
+                "channel {}: instance {instance_id} mirror already attached",
+                self.global_id
+            ));
+        }
+        let native_len = self.native_len();
+        let packed_bool_len = self.numel().div_ceil(8);
+        let cell_bytes = cell_bytes as usize;
+        if cell_bytes != native_len && !(self.dtype == DType::Bool && cell_bytes == packed_bool_len)
+        {
+            return Err(format!(
+                "channel {}: mirror cell has {cell_bytes} bytes, expected {native_len}",
+                self.global_id
+            ));
+        }
+        self.readers.push(ReaderMirror {
+            instance_id,
+            mirror_base,
+            word_base,
+            cell_bytes,
+            cap1: u64::from(capacity).saturating_add(1),
+            mirror_offset,
+            tail_word_index: tail_word_index as usize,
+            poison_word_index: poison_word_index as usize,
+            published_tail: 0,
+            copied_tail: 0,
+        });
+        Ok(())
+    }
+
+    pub fn detach_reader_mirror(&mut self, instance_id: u64) {
+        self.readers
+            .retain(|reader| reader.instance_id != instance_id);
+    }
+
+    /// Make one completed instance's release-published mirror tail visible to
+    /// subsequent `take`/`read` calls. No value is copied here.
+    pub fn publish_reader_mirror(&mut self, instance_id: u64) -> Result<bool, String> {
+        let Some(reader) = self
+            .readers
+            .iter_mut()
+            .find(|reader| reader.instance_id == instance_id)
+        else {
+            return Err(format!(
+                "channel {}: no mirror for instance {instance_id}",
+                self.global_id
+            ));
+        };
+        let poison = load_word(reader.word_base, reader.poison_word_index);
+        if poison != 0 {
+            let reason = format!("driver published poison epoch {poison}");
+            self.poison(&reason);
+            return Ok(true);
+        }
+        let tail = load_word(reader.word_base, reader.tail_word_index);
+        if tail < reader.published_tail {
+            return Err(format!(
+                "channel {}: mirror tail regressed from {} to {tail}",
+                self.global_id, reader.published_tail
+            ));
+        }
+        if tail.saturating_sub(reader.copied_tail) > reader.cap1 {
+            return Err(format!(
+                "channel {}: mirror overrun (tail {tail}, copied {}, capacity {})",
+                self.global_id, reader.copied_tail, reader.cap1
+            ));
+        }
+        reader.published_tail = tail;
+        Ok(false)
+    }
+
+    pub fn latest_reader_value(
+        &mut self,
+        instance_id: u64,
+    ) -> Result<Option<Vec<u8>>, ChannelError> {
+        let dtype = self.dtype;
+        let numel = self.numel();
+        let native_len = self.native_len();
+        let Some(reader) = self
+            .readers
+            .iter()
+            .find(|reader| reader.instance_id == instance_id)
+        else {
+            return Ok(None);
+        };
+        if reader.published_tail == 0 {
+            return Ok(None);
+        }
+        let wire = read_mirror_cell(reader, reader.published_tail - 1);
+        decode_reader_cell(dtype, numel, native_len, &wire).map(Some)
+    }
+
+    fn refresh_reader_mirrors(&mut self) -> Result<(), ChannelError> {
+        let dtype = self.dtype;
+        let numel = self.numel();
+        let native_len = self.native_len();
+        let (readers, produced) = (&mut self.readers, &mut self.produced);
+        for reader in readers.iter_mut() {
+            while reader.copied_tail < reader.published_tail {
+                let wire = read_mirror_cell(reader, reader.copied_tail);
+                produced.push_back(decode_reader_cell(dtype, numel, native_len, &wire)?);
+                reader.copied_tail += 1;
+            }
+        }
         Ok(())
     }
 }
@@ -284,35 +433,52 @@ pub fn drain_host_puts(cells: &BoundCells) -> Vec<PtirChannelValue> {
         }
         let gid = c.global_id;
         for bytes in c.drain_wire() {
-            out.push(PtirChannelValue { channel: gid, bytes });
+            out.push(PtirChannelValue {
+                channel: gid,
+                bytes,
+            });
         }
     }
     out
 }
 
-/// Marshal a fired pass's produced Reader-channel cells back into its bound
-/// cells (the host-side half of the response path): each `(global_id,
-/// wire_bytes)` is routed to the cell with that global id, unpacked (bool bits
-/// → 1 byte/bool) and enqueued for host `take`/`read`.
-pub fn marshal_response(
-    cells: &BoundCells,
-    produced: &[(u64, Vec<u8>)],
-) -> Result<(), String> {
-    for (global_id, wire) in produced {
-        let cell = cells
-            .iter()
-            .find(|c| c.lock().unwrap().global_id == *global_id)
-            .ok_or_else(|| format!("channel {global_id}: not a channel of this pass"))?;
-        let mut c = cell.lock().unwrap();
-        if c.role != Some(HostRole::Reader) {
-            return Err(format!(
-                "channel {global_id}: marshal is illegal on a {:?} channel",
-                c.role
-            ));
+fn load_word(word_base: u64, index: usize) -> u64 {
+    // SAFETY: direct-driver bind returns an aligned atomic word array that
+    // remains alive until the instance is closed. Channel mirrors detach before
+    // that close.
+    unsafe { (&*((word_base as *const AtomicU64).add(index))).load(Ordering::Acquire) }
+}
+
+fn read_mirror_cell(reader: &ReaderMirror, sequence: u64) -> Vec<u8> {
+    let slot = (sequence % reader.cap1) * reader.cell_bytes as u64;
+    let ptr = (reader.mirror_base + reader.mirror_offset + slot) as *const u8;
+    // SAFETY: the binding validates the mirror extent, and the driver owns it
+    // through instance close.
+    unsafe { std::slice::from_raw_parts(ptr, reader.cell_bytes).to_vec() }
+}
+
+fn decode_reader_cell(
+    dtype: DType,
+    numel: usize,
+    native_len: usize,
+    wire: &[u8],
+) -> Result<Vec<u8>, ChannelError> {
+    let native = if dtype == DType::Bool {
+        if wire.len() == native_len {
+            wire.iter().map(|byte| u8::from(*byte != 0)).collect()
+        } else {
+            unpack_bool(wire, numel)
         }
-        c.marshal(wire).map_err(|e| format!("channel {global_id}: {e}"))?;
+    } else {
+        wire.to_vec()
+    };
+    if native.len() != native_len {
+        return Err(ChannelError::BadLength {
+            expected: native_len,
+            got: native.len(),
+        });
     }
-    Ok(())
+    Ok(native)
 }
 
 /// Pack a 1-byte-per-bool cell to the bit-packed wire (LSB-first, D1).
@@ -343,7 +509,13 @@ mod tests {
     use pie_ptir::types::{DType, Shape};
 
     fn decl(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
-        ChannelDecl { shape, dtype: ChanDType::Concrete(dtype), capacity: 1, host_role: role, seeded }
+        ChannelDecl {
+            shape,
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role: role,
+            seeded,
+        }
     }
 
     /// §3 shape: mask (bool [8], host Writer) + out (i32 [1], host Reader) +
@@ -356,10 +528,48 @@ mod tests {
             Arc::new(Mutex::new(c))
         };
         vec![
-            mk(vec![8], DType::Bool, &decl(Shape::vector(8), DType::Bool, HostRole::Writer, false)),
-            mk(vec![1], DType::I32, &decl(Shape::vector(1), DType::I32, HostRole::Reader, false)),
-            mk(vec![1], DType::I32, &decl(Shape::vector(1), DType::I32, HostRole::None, true)),
+            mk(
+                vec![8],
+                DType::Bool,
+                &decl(Shape::vector(8), DType::Bool, HostRole::Writer, false),
+            ),
+            mk(
+                vec![1],
+                DType::I32,
+                &decl(Shape::vector(1), DType::I32, HostRole::Reader, false),
+            ),
+            mk(
+                vec![1],
+                DType::I32,
+                &decl(Shape::vector(1), DType::I32, HostRole::None, true),
+            ),
         ]
+    }
+
+    fn publish_wire(cell: &Arc<Mutex<ChannelCell>>, instance_id: u64, wire: &[u8]) {
+        let capacity = cell.lock().unwrap().capacity;
+        let mut mirror = vec![0u8; wire.len() * capacity.saturating_add(1) as usize];
+        mirror[..wire.len()].copy_from_slice(wire);
+        let mirror = Box::leak(mirror.into_boxed_slice());
+        let words = Box::leak(vec![AtomicU64::new(0), AtomicU64::new(0)].into_boxed_slice());
+        cell.lock()
+            .unwrap()
+            .attach_reader_mirror(
+                instance_id,
+                mirror.as_ptr() as u64,
+                words.as_ptr() as u64,
+                wire.len() as u32,
+                capacity,
+                0,
+                0,
+                1,
+            )
+            .unwrap();
+        words[0].store(1, Ordering::Release);
+        cell.lock()
+            .unwrap()
+            .publish_reader_mirror(instance_id)
+            .unwrap();
     }
 
     #[test]
@@ -373,7 +583,10 @@ mod tests {
         // A second put on the fired device-private channel is illegal.
         assert_eq!(
             c.put(9i32.to_le_bytes().to_vec()).unwrap_err(),
-            ChannelError::WrongRole { role: HostRole::None, op: "put" }
+            ChannelError::WrongRole {
+                role: HostRole::None,
+                op: "put"
+            }
         );
         // A missing seed is a first-fire error.
         let mut m = ChannelCell::new(vec![1], DType::I32, 1);
@@ -384,22 +597,101 @@ mod tests {
     #[test]
     fn bind_validates_constructor_geometry() {
         let c = ChannelCell::new(vec![2, 3], DType::U32, 1);
-        assert!(c.matches_decl(&decl(Shape::matrix(2, 3), DType::U32, HostRole::None, false)).is_ok());
-        assert!(c.matches_decl(&decl(Shape::vector(6), DType::U32, HostRole::None, false)).is_err());
-        assert!(c.matches_decl(&decl(Shape::matrix(2, 3), DType::I32, HostRole::None, false)).is_err());
+        assert!(
+            c.matches_decl(&decl(
+                Shape::matrix(2, 3),
+                DType::U32,
+                HostRole::None,
+                false
+            ))
+            .is_ok()
+        );
+        assert!(
+            c.matches_decl(&decl(Shape::vector(6), DType::U32, HostRole::None, false))
+                .is_err()
+        );
+        assert!(
+            c.matches_decl(&decl(
+                Shape::matrix(2, 3),
+                DType::I32,
+                HostRole::None,
+                false
+            ))
+            .is_err()
+        );
     }
 
     #[test]
     fn writer_put_reader_take_roundtrip() {
         let cells = bound();
         let out_id = cells[1].lock().unwrap().global_id;
-        // out (Reader) is empty until a fire marshals into it.
-        assert_eq!(cells[1].lock().unwrap().take().unwrap_err(), ChannelError::Empty);
-        // a fire produced token 5 on `out`.
-        marshal_response(&cells, &[(out_id, 5i32.to_le_bytes().to_vec())]).unwrap();
-        assert_eq!(cells[1].lock().unwrap().read().unwrap(), 5i32.to_le_bytes().to_vec(), "read peeks");
-        assert_eq!(cells[1].lock().unwrap().take().unwrap(), 5i32.to_le_bytes().to_vec(), "take consumes");
-        assert_eq!(cells[1].lock().unwrap().take().unwrap_err(), ChannelError::Empty);
+        // out (Reader) is empty until its bound mirror publishes.
+        assert_eq!(
+            cells[1].lock().unwrap().take().unwrap_err(),
+            ChannelError::Empty
+        );
+        publish_wire(&cells[1], out_id, &5i32.to_le_bytes());
+        assert_eq!(
+            cells[1].lock().unwrap().read().unwrap(),
+            5i32.to_le_bytes().to_vec(),
+            "read peeks"
+        );
+        assert_eq!(
+            cells[1].lock().unwrap().take().unwrap(),
+            5i32.to_le_bytes().to_vec(),
+            "take consumes"
+        );
+        assert_eq!(
+            cells[1].lock().unwrap().take().unwrap_err(),
+            ChannelError::Empty
+        );
+    }
+
+    #[test]
+    fn mirror_tail_is_hidden_until_completion_publishes_epoch() {
+        let cells = bound();
+        let instance_id = 77;
+        let mirror = Box::leak(9i32.to_le_bytes().to_vec().into_boxed_slice());
+        let words = Box::leak(vec![AtomicU64::new(1), AtomicU64::new(0)].into_boxed_slice());
+        cells[1]
+            .lock()
+            .unwrap()
+            .attach_reader_mirror(
+                instance_id,
+                mirror.as_ptr() as u64,
+                words.as_ptr() as u64,
+                4,
+                0,
+                0,
+                0,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            cells[1].lock().unwrap().take().unwrap_err(),
+            ChannelError::Empty
+        );
+        cells[1]
+            .lock()
+            .unwrap()
+            .publish_reader_mirror(instance_id)
+            .unwrap();
+        assert_eq!(cells[1].lock().unwrap().take().unwrap(), 9i32.to_le_bytes());
+    }
+
+    #[test]
+    fn packed_bool_mirror_decodes_to_native_bytes() {
+        let mut cell = ChannelCell::new(vec![10], DType::Bool, 1);
+        cell.bind(&decl(
+            Shape::vector(10),
+            DType::Bool,
+            HostRole::Reader,
+            false,
+        ));
+        let cell = Arc::new(Mutex::new(cell));
+        let native = vec![1, 0, 0, 1, 1, 0, 1, 0, 1, 1];
+        publish_wire(&cell, 88, &pack_bool(&native));
+        assert_eq!(cell.lock().unwrap().take().unwrap(), native);
     }
 
     #[test]
@@ -407,16 +699,32 @@ mod tests {
         let cells = bound();
         // put on the Reader `out` is illegal.
         assert_eq!(
-            cells[1].lock().unwrap().put(0i32.to_le_bytes().to_vec()).unwrap_err(),
-            ChannelError::WrongRole { role: HostRole::Reader, op: "put" }
+            cells[1]
+                .lock()
+                .unwrap()
+                .put(0i32.to_le_bytes().to_vec())
+                .unwrap_err(),
+            ChannelError::WrongRole {
+                role: HostRole::Reader,
+                op: "put"
+            }
         );
         // take on the Writer `mask` is illegal.
         assert_eq!(
             cells[0].lock().unwrap().take().unwrap_err(),
-            ChannelError::WrongRole { role: HostRole::Writer, op: "take" }
+            ChannelError::WrongRole {
+                role: HostRole::Writer,
+                op: "take"
+            }
         );
         // seeded device-private `tok`: put stages until its seed is taken.
-        assert!(cells[2].lock().unwrap().put(1i32.to_le_bytes().to_vec()).is_ok());
+        assert!(
+            cells[2]
+                .lock()
+                .unwrap()
+                .put(1i32.to_le_bytes().to_vec())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -425,9 +733,18 @@ mod tests {
         // mask is bool[8] → 8 native bytes.
         assert_eq!(
             cells[0].lock().unwrap().put(vec![1, 0, 1]).unwrap_err(),
-            ChannelError::BadLength { expected: 8, got: 3 }
+            ChannelError::BadLength {
+                expected: 8,
+                got: 3
+            }
         );
-        assert!(cells[0].lock().unwrap().put(vec![1, 0, 1, 0, 1, 0, 1, 0]).is_ok());
+        assert!(
+            cells[0]
+                .lock()
+                .unwrap()
+                .put(vec![1, 0, 1, 0, 1, 0, 1, 0])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -435,14 +752,38 @@ mod tests {
         let cells = bound();
         let mask_id = cells[0].lock().unwrap().global_id;
         // two staged puts on the bool[8] mask.
-        cells[0].lock().unwrap().put(vec![1, 0, 1, 0, 0, 0, 0, 0]).unwrap(); // bits 0,2 → 5
-        cells[0].lock().unwrap().put(vec![0, 1, 0, 0, 0, 0, 0, 1]).unwrap(); // bits 1,7 → 130
+        cells[0]
+            .lock()
+            .unwrap()
+            .put(vec![1, 0, 1, 0, 0, 0, 0, 0])
+            .unwrap(); // bits 0,2 → 5
+        cells[0]
+            .lock()
+            .unwrap()
+            .put(vec![0, 1, 0, 0, 0, 0, 0, 1])
+            .unwrap(); // bits 1,7 → 130
         // a staged seed on the device-private `tok` is NOT a Writer put.
-        cells[2].lock().unwrap().put(1i32.to_le_bytes().to_vec()).unwrap();
+        cells[2]
+            .lock()
+            .unwrap()
+            .put(1i32.to_le_bytes().to_vec())
+            .unwrap();
         let puts = drain_host_puts(&cells);
         assert_eq!(puts.len(), 2, "one PtirChannelValue per staged Writer cell");
-        assert_eq!(puts[0], PtirChannelValue { channel: mask_id, bytes: vec![5] });
-        assert_eq!(puts[1], PtirChannelValue { channel: mask_id, bytes: vec![130] });
+        assert_eq!(
+            puts[0],
+            PtirChannelValue {
+                channel: mask_id,
+                bytes: vec![5]
+            }
+        );
+        assert_eq!(
+            puts[1],
+            PtirChannelValue {
+                channel: mask_id,
+                bytes: vec![130]
+            }
+        );
         // draining clears the queue.
         assert!(drain_host_puts(&cells).is_empty());
     }
@@ -451,7 +792,7 @@ mod tests {
     fn poison_faults_reader_with_reason() {
         let cells = bound();
         let out_id = cells[1].lock().unwrap().global_id;
-        marshal_response(&cells, &[(out_id, 7i32.to_le_bytes().to_vec())]).unwrap();
+        publish_wire(&cells[1], out_id, &7i32.to_le_bytes());
         cells[1].lock().unwrap().poison("fire 3 failed: OOM");
         assert_eq!(
             cells[1].lock().unwrap().take().unwrap_err(),
@@ -470,13 +811,14 @@ mod tests {
     }
 
     #[test]
-    fn marshal_response_rejects_non_reader() {
+    fn mirror_binding_rejects_non_reader() {
         let cells = bound();
-        let mask_id = cells[0].lock().unwrap().global_id;
-        // producing into the Writer `mask` is a protocol error.
-        assert!(marshal_response(&cells, &[(mask_id, vec![1])]).unwrap_err().contains("marshal is illegal"));
-        // an out-of-range channel is a protocol error.
-        assert!(marshal_response(&cells, &[(9_999_999, vec![1])]).unwrap_err().contains("not a channel"));
+        let err = cells[0]
+            .lock()
+            .unwrap()
+            .attach_reader_mirror(1, 1, 1, 1, 1, 0, 0, 1)
+            .unwrap_err();
+        assert!(err.contains("expected Reader"));
     }
 
     #[test]
@@ -488,15 +830,10 @@ mod tests {
     }
 
     #[test]
-    fn marshal_produced_cells_roundtrips() {
-        // The exact path `ptir_host::finalize_fire` runs after a fire: the
-        // produced Reader cells (post-unification: read from the pinned frame
-        // mirror as `(global_id, bytes)` tuples) → `marshal_response` → the guest
-        // `take` sees the token.
+    fn direct_mirror_roundtrips() {
         let cells = bound(); // `out` is the host-Reader at channel 1
         let out_id = cells[1].lock().unwrap().global_id;
-        let produced: Vec<(u64, Vec<u8>)> = vec![(out_id, 5i32.to_le_bytes().to_vec())];
-        marshal_response(&cells, &produced).unwrap();
+        publish_wire(&cells[1], out_id, &5i32.to_le_bytes());
         assert_eq!(
             cells[1].lock().unwrap().take().unwrap(),
             5i32.to_le_bytes().to_vec(),

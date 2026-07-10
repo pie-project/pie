@@ -19,7 +19,7 @@ use crate::core::{
 };
 use crate::engines::local::{D2dCopier, LocalEngine};
 use crate::error::{Result, TransportError};
-use pie_driver_abi::kv::KvHandle;
+use pie_driver_abi::KvHandle;
 
 /// Where an outward [`TransferId`] was issued: which engine, and that engine's
 /// own (per-engine) transfer id.

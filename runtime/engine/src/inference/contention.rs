@@ -307,8 +307,7 @@ impl ContentionOrchestrator {
         self.fire_retired.clone()
     }
 
-    /// A fire's responses were dispatched (scheduler response path) — wake any
-    /// lane gated on draining its own retired fires.
+    /// A fire retired — wake any lane gated on draining its own launches.
     pub fn on_fire_retired(&self) {
         self.fire_retired.notify_waiters();
     }
@@ -555,45 +554,45 @@ impl ContentionOrchestrator {
                     // reset the keystone deadline (reset-on-change, Q3).
                     exhausted_since = None;
                     match self.backend.suspend(v) {
-                    SuspendOutcome::Suspended { freed_now } => {
-                        {
+                        SuspendOutcome::Suspended { freed_now } => {
+                            {
+                                let mut inner = self.inner.lock().unwrap();
+                                if let Some(p) = inner.procs.get_mut(&v) {
+                                    p.state = ProcState::Suspended;
+                                    p.suspended_need = freed_now;
+                                    p.suspended_at = Some(Instant::now());
+                                    inner.restore_queue.push_back(v);
+                                    self.stats
+                                        .suspends
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            // The victim's blocks may also satisfy PARKED waiters,
+                            // not just this requester — wake the FIFO prefix (a
+                            // synchronous-suspend backend has no report_suspended
+                            // drain to do it for us).
+                            self.wake_waiters();
+                            // Loop: re-check free (another requester may race the
+                            // freed blocks; we then evict further or park).
+                        }
+                        SuspendOutcome::Requested => {
+                            // Self-suspend protocol: the victim saves its own
+                            // state at its next host-call boundary; its blocks
+                            // arrive via `report_suspended` → drain. Skip it for
+                            // this pass.
                             let mut inner = self.inner.lock().unwrap();
                             if let Some(p) = inner.procs.get_mut(&v) {
-                                p.state = ProcState::Suspended;
-                                p.suspended_need = freed_now;
-                                p.suspended_at = Some(Instant::now());
-                                inner.restore_queue.push_back(v);
-                                self.stats
-                                    .suspends
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                p.state = ProcState::ParkRequested;
                             }
+                            tried.insert(v);
                         }
-                        // The victim's blocks may also satisfy PARKED waiters,
-                        // not just this requester — wake the FIFO prefix (a
-                        // synchronous-suspend backend has no report_suspended
-                        // drain to do it for us).
-                        self.wake_waiters();
-                        // Loop: re-check free (another requester may race the
-                        // freed blocks; we then evict further or park).
-                    }
-                    SuspendOutcome::Requested => {
-                        // Self-suspend protocol: the victim saves its own
-                        // state at its next host-call boundary; its blocks
-                        // arrive via `report_suspended` → drain. Skip it for
-                        // this pass.
-                        let mut inner = self.inner.lock().unwrap();
-                        if let Some(p) = inner.procs.get_mut(&v) {
-                            p.state = ProcState::ParkRequested;
+                        SuspendOutcome::DeferredByGrace | SuspendOutcome::Unsupported => {
+                            let mut inner = self.inner.lock().unwrap();
+                            if let Some(p) = inner.procs.get_mut(&v) {
+                                p.state = ProcState::Running;
+                            }
+                            tried.insert(v);
                         }
-                        tried.insert(v);
-                    }
-                    SuspendOutcome::DeferredByGrace | SuspendOutcome::Unsupported => {
-                        let mut inner = self.inner.lock().unwrap();
-                        if let Some(p) = inner.procs.get_mut(&v) {
-                            p.state = ProcState::Running;
-                        }
-                        tried.insert(v);
-                    }
                     }
                 }
                 None => {
@@ -781,9 +780,7 @@ impl ContentionOrchestrator {
                         .procs
                         .get(&pid)
                         .and_then(|p| p.suspended_at)
-                        .is_some_and(|t| {
-                            t.elapsed() >= Duration::from_millis(restore_aging_ms())
-                        });
+                        .is_some_and(|t| t.elapsed() >= Duration::from_millis(restore_aging_ms()));
                     if !aged {
                         return; // wait for utilization to drop (or the head to age)
                     }
@@ -984,11 +981,10 @@ pub fn contention() -> Option<&'static ContentionOrchestrator> {
     CONTENTION.get()
 }
 
-/// Scheduler hook: a fire's responses were dispatched. No-op unless preempt
-/// mode is wired (one `OnceLock` load — safe on the hot dispatch path).
+/// Scheduler hook for payload-free fire retirement. No-op unless preempt mode
+/// is wired (one `OnceLock` load on the hot path).
 pub fn notify_fire_retired() {
     if let Some(o) = CONTENTION.get() {
         o.on_fire_retired();
     }
 }
-

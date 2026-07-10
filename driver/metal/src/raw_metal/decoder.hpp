@@ -4,9 +4,9 @@
 // make resident) behind setup(), and the per-token inner loop (write IO scalars →
 // ping-pong GDN conv-state → encode_decode_step → logits) behind step().
 //
-// This is the e2e seam body: alpha's RawMetalExecutor::run_forward holds ONE decoder and,
-// per marshaled PieForwardRequestView (batch=1 single-stream), threads token_ids /
-// position_ids through step() and reads logits()/argmax() back into the ResponseBuilder.
+// This is the reusable direct-launch decode body: the entry path can hold ONE
+// decoder and, per direct launch view (batch=1 single-stream), thread token_ids
+// / position_ids through step() and read logits()/argmax() back out.
 // State (GDN conv/recurrent + the contiguous KV ring) lives in the decoder's resident
 // heap and accumulates IN-PLACE across step() calls AND across run_forward calls, so
 // prefill→decode is seamless. reset_state() zeroes it for a fresh sequence (rs_slot NEW).

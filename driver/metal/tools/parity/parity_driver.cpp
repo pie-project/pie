@@ -4,10 +4,7 @@
 // Loads a real HF checkpoint via delta's loader, stages a single-request
 // prefill ForwardBatch exactly as the executor does, runs charlie's ModelGraph
 // over delta's PagedKvCache on the Metal GPU, and writes the `[vocab]` logits
-// row of the final prompt token to a float32 .npy. Also prints argmax + top-k
-// and (when an Executor is wired) cross-checks that the InProcService greedy
-// sample agrees with the raw argmax — i.e. the *driver Forward path* and the
-// raw graph logits pick the same token.
+// row of the final prompt token to a float32 .npy. Also prints argmax + top-k.
 //
 // Usage: parity_driver <hf_path> <comma_sep_token_ids> <out_logits.npy>
 // Pairs with parity_check.py (the mlx-lm reference + comparison driver).
@@ -23,13 +20,8 @@
 
 #include <mlx/mlx.h>
 
-#include <pie_driver_abi/response_builder.hpp>
-#include <pie_driver_abi/view.hpp>
-
-#include "executor/executor.hpp"
 #include "loader/model_loader.hpp"
 #include "model/model_graph.hpp"
-#include "service/inproc_service.hpp"
 
 namespace mx = mlx::core;
 using namespace pie_metal_driver;
@@ -297,71 +289,6 @@ int main(int argc, char** argv) {
 
     mx::save(out_npy, row);
     std::cerr << "[parity] wrote logits row -> " << out_npy << "\n";
-
-    // Cross-check: the real driver Forward path (InProcService -> Executor ->
-    // sampler) greedy-samples the same token as the raw-graph argmax.
-    //
-    // SKIP during golden capture (PIE_METAL_GOLDEN_DIR set): this cross-check
-    // runs an N=8 *prefill* Forward, whose per-kernel dump_kernel() taps would
-    // overwrite the decode-loop's N=1 step dumps (last-write-wins) — corrupting
-    // the M=1 decode golden the raw-Metal port is gated against. The sampler==
-    // argmax assertion isn't needed for the golden, so we skip it here.
-    if (std::getenv("PIE_METAL_GOLDEN_DIR") == nullptr) {
-        Executor exec(*model.graph, *model.kv);
-        exec.set_linear_state_cache(model.lin_cache.get());  // qwen3.6 hybrid
-        // The raw-graph forward above already wrote recurrent/conv state into
-        // lin_cache slot 0; reset it so this independent re-run starts clean
-        // (delta's recycle contract).
-        if (model.lin_cache) model.lin_cache->reset_slot(0);
-        service::InProcService service(
-            static_cast<std::uint32_t>(c.vocab_size));
-        service.set_executor(&exec);
-
-        std::vector<std::uint32_t> uids(ids.begin(), ids.end());
-        std::vector<std::uint32_t> upos(positions.begin(), positions.end());
-        std::vector<std::uint32_t> qo = {0, (std::uint32_t)n};
-        std::vector<std::uint32_t> kpi = {0};
-        std::vector<std::uint32_t> kpp = {0, 1};
-        std::vector<std::uint32_t> lpl = {(std::uint32_t)n};
-        std::vector<std::uint32_t> si = {(std::uint32_t)(n - 1)};
-        std::vector<std::uint32_t> sip = {0, 1};
-        std::vector<std::uint32_t> st = {pie_driver::SAMPLER_MULTINOMIAL};
-        std::vector<float> stemp = {0.0f};  // temp 0 -> greedy argmax
-        std::vector<std::uint32_t> stk = {0};
-        std::vector<float> stp = {1.0f}, smp = {0.0f};
-        std::vector<std::uint32_t> sseed = {0};
-
-        pie_driver::PieForwardRequestView fwd{};
-        fwd.token_ids         = pie_driver::slice_from_u32(uids.data(), uids.size());
-        fwd.position_ids      = pie_driver::slice_from_u32(upos.data(), upos.size());
-        fwd.qo_indptr         = pie_driver::slice_from_u32(qo.data(), qo.size());
-        fwd.kv_page_indices   = pie_driver::slice_from_u32(kpi.data(), kpi.size());
-        fwd.kv_page_indptr    = pie_driver::slice_from_u32(kpp.data(), kpp.size());
-        fwd.kv_last_page_lens = pie_driver::slice_from_u32(lpl.data(), lpl.size());
-        fwd.sampling_indices  = pie_driver::slice_from_u32(si.data(), si.size());
-        fwd.sampling_indptr   = pie_driver::slice_from_u32(sip.data(), sip.size());
-        fwd.sampler_types        = pie_driver::slice_from_u32(st.data(), st.size());
-        fwd.sampler_temperatures = pie_driver::slice_from_f32(stemp.data(), stemp.size());
-        fwd.sampler_top_k        = pie_driver::slice_from_u32(stk.data(), stk.size());
-        fwd.sampler_top_p        = pie_driver::slice_from_f32(stp.data(), stp.size());
-        fwd.sampler_min_p        = pie_driver::slice_from_f32(smp.data(), smp.size());
-        fwd.sampler_seeds        = pie_driver::slice_from_u32(sseed.data(), sseed.size());
-        fwd.single_token_mode = 0;
-
-        pie_driver::PieInProcRequestView req{};
-        req.method = pie_driver::PIE_METHOD_FORWARD;
-        req.forward = fwd;
-        pie_driver::ResponseBuilder builder;
-        pie_driver::PieInProcResponseView resp{};
-        service.handle_request(0, req, resp, builder);
-
-        const auto toks = resp.forward.tokens.as<std::uint32_t>();
-        const int svc_tok = toks.empty() ? -1 : static_cast<int>(toks[0]);
-        std::cerr << "[parity] InProcService greedy token = " << svc_tok
-                  << (svc_tok == argmax ? "  (== raw argmax OK)"
-                                        : "  (!= raw argmax MISMATCH)")
-                  << "\n";
-    }
 
     std::cout << argmax << "\n";  // stdout = the driver's greedy next token
     return 0;

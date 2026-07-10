@@ -103,7 +103,8 @@ fn headroom_alloc_is_in_flight_safe() {
     let t1_slot = size_before; // first freshly-alloc'd slot id
     let mut txn_t1 = a.txn_begin();
     let wtx_t1 = ws.begin_write_txn();
-    ws.cow_write_slot(wtx_t1, t1_slot, &mut txn_t1, &mut a).unwrap();
+    ws.cow_write_slot(wtx_t1, t1_slot, &mut txn_t1, &mut a)
+        .unwrap();
 
     // Commit `t` — its slot publishes; `t+1` (still in flight) is untouched.
     a.txn_commit(txn_t).unwrap();

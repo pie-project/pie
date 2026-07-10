@@ -72,7 +72,7 @@ fn greedy_verify_a2_obs(d: &[u32], a: &[u32]) -> Vec<u32> {
 /// Fire `mtp_self_spec_greedy_observable` with `input = prompt ++ drafts`; the
 /// verify device-aliases the k drafts off `pi.tokens+sample_row+1` (NO host upload —
 /// `resolve_bindings(.., &[])`, alpha's ballast fills the slot + carries the flag).
-/// Returns the `[k]`-Token accept set via the #32 `program_tokens` accessor.
+/// Returns the `[k]`-Token accept set through the bound reader channel.
 async fn fire_verify(
     context: &Context,
     prompt: &[u32],
@@ -89,8 +89,7 @@ async fn fire_verify(
     pass.input(&inp);
     let (built, _keys) = edsl::mtp_self_spec_greedy_observable(vocab, k)
         .map_err(|e| format!("mtp_self_spec build: {e:?}"))?;
-    let program =
-        inferlet::emit::emit_program(&built.program).map_err(|e| format!("emit: {e}"))?;
+    let program = inferlet::emit::emit_program(&built.program).map_err(|e| format!("emit: {e}"))?;
     // Matrix logit positions [start+l-1 .. start+l+k-2]: row r argmax conditioned on
     // prompt ++ D[0..r). Empty submit_values: the SelfSpecDraftInput draft is driver
     // source-selected (echo's resolver, pi.tokens+sample_row+1), the ballast fills it.
@@ -107,13 +106,8 @@ async fn fire_verify(
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
-    let params: serde_json::Value =
-        serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
-    let k: u32 = params
-        .get("k")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(4)
-        .max(2) as u32;
+    let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+    let k: u32 = params.get("k").and_then(|v| v.as_u64()).unwrap_or(4).max(2) as u32;
     let vocab = model::output_vocab_size();
     let j = (k / 2).max(1) as usize; // reject position
 

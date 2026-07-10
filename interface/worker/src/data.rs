@@ -21,8 +21,7 @@
 //! single-sourced in this crate (see [`link`](crate::link)) so the two ends
 //! can't diverge.
 //!
-//! This is plain serde vocabulary — deliberately NOT `#[schema]`/rkyv (it never
-//! rides the zero-copy tensor ring), so it is NOT part of `SCHEMA_HASH`.
+//! This is plain serde vocabulary, independent of the local driver ABI.
 
 use serde::{Deserialize, Serialize};
 

@@ -11,10 +11,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <cuda_runtime.h>
 
-#include <pie_driver_abi/view.hpp>
+#include <pie_driver_abi.h>
+
+#include "pie_native/launch_view.hpp"
 
 #include "ptir/fire_geometry.hpp"
 
@@ -27,15 +30,26 @@ class PtirDispatch {
     PtirDispatch(const PtirDispatch&) = delete;
     PtirDispatch& operator=(const PtirDispatch&) = delete;
 
-    // Decode / instantiate / fire the request's `ptir_program_*` stage programs
-    // on `logits` (the Logits-intrinsic base, `[rows, vocab]`) and fill
-    // `out_resp.ptir_output_*` — a per-program CSR of the committed READER-channel
-    // `(channel, wire_bytes)` outputs. The staging buffers live until the next
-    // `run()` (long enough for `send_response`). Returns true iff the request
-    // carried `ptir_program_*` (i.e. this dispatcher handled it).
-    bool run(const pie_driver::PieForwardRequestView& view,
-             pie_driver::PieForwardResponseView& out_resp,
-             const void* logits, std::uint32_t vocab, cudaStream_t stream);
+    int register_program(std::uint64_t program_hash,
+                         pie_native::ByteSlice canonical,
+                         pie_native::ByteSlice sidecar,
+                         std::string* err);
+
+    int bind_instance(std::uint64_t instance_id,
+                      std::uint64_t program_hash,
+                      std::uint64_t pacing_wait_id,
+                      const std::vector<std::uint64_t>& channel_ids,
+                      const std::vector<PieChannelWait>& channel_waits,
+                      const std::vector<PieChannelValueDesc>& seed_values,
+                      PieInstanceBinding* binding,
+                      std::string* err);
+
+    void close_instance(std::uint64_t instance_id);
+
+    bool run(const pie_native::LaunchView& view,
+             const void* logits, std::uint32_t vocab, cudaStream_t stream,
+             const PieRuntimeCallbacks* runtime,
+             PieCompletion completion);
 
     // W1.1 PRE-FORWARD descriptor resolution: for the request's device-geometry
     // PTIR program (descriptor ports bind channels), decode + get-or-build the
@@ -46,12 +60,15 @@ class PtirDispatch {
     // empty `*err` if the request carries no such program, or false with a
     // non-empty `*err` if a descriptor channel is not ready (W1.6 — the executor
     // must fail the fire; the runtime's poison plumbing surfaces it to the guest).
-    bool resolve_descriptors(const pie_driver::PieForwardRequestView& view,
-                             std::uint32_t page_size, FireGeometry& out,
+    bool resolve_descriptors(const pie_native::LaunchView& view,
+                             std::uint32_t page_size,
+                             std::uint32_t device_pages,
+                             FireGeometry& out,
                              std::string* err);
 
-  private:
     struct Impl;
+
+  private:
     std::unique_ptr<Impl> impl_;
 };
 

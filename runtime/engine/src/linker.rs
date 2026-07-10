@@ -165,8 +165,7 @@ impl Linker {
         // (`is_supported_scheme`), so a network-denied inferlet still
         // instantiates but every request fails.
         wasmtime_wasi::p3::add_to_linker(&mut linker).expect("Failed to link WASI p3");
-        wasmtime_wasi_http::p3::add_to_linker(&mut linker)
-            .expect("Failed to link WASI HTTP p3");
+        wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("Failed to link WASI HTTP p3");
 
         // wasi:http operates above wasi:sockets and bypasses the per-socket
         // policy hook (it uses the host's hyper stack with its own DNS).
@@ -314,9 +313,16 @@ impl ServiceHandler for Linker {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Instantiate { process_id, username, program_name, output, response } => {
+            Message::Instantiate {
+                process_id,
+                username,
+                program_name,
+                output,
+                response,
+            } => {
                 let _ = response.send(
-                    self.instantiate(process_id, username, &program_name, output).await
+                    self.instantiate(process_id, username, &program_name, output)
+                        .await,
                 );
             }
         }

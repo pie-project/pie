@@ -26,6 +26,8 @@
 // epilogue (P5.3).
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -83,6 +85,52 @@ __global__ void k_commit_bump(std::uint8_t* __restrict__ full,
         full[c * 8 + head[c]] = 0;               // consume the committed cell
         head[c] = (head[c] + 1) % cap1[c];
     }
+}
+
+inline constexpr std::uint32_t kMaxConditionalConsumeChannels = 64;
+
+struct ConditionalConsumeSlots {
+    std::uint32_t n = 0;
+    std::uint32_t slots[kMaxConditionalConsumeChannels] = {};
+};
+
+__global__ void k_consume_if_committed(
+    std::uint8_t* __restrict__ full,
+    std::uint32_t* __restrict__ head,
+    const std::uint32_t* __restrict__ cap1,
+    const std::uint32_t* __restrict__ pass_commit,
+    ConditionalConsumeSlots consume) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (!*pass_commit) return;
+    for (std::uint32_t i = 0; i < consume.n; ++i) {
+        const std::uint32_t c = consume.slots[i];
+        full[c * 8 + head[c]] = 0;
+        head[c] = (head[c] + 1) % cap1[c];
+    }
+}
+
+inline void launch_consume_if_committed(
+    std::uint8_t* full,
+    std::uint32_t* head,
+    const std::uint32_t* cap1,
+    const std::uint32_t* pass_commit,
+    const std::uint32_t* slots,
+    std::uint32_t n_slots,
+    cudaStream_t stream) {
+    if (n_slots == 0) return;
+    if (n_slots > kMaxConditionalConsumeChannels) {
+        std::fprintf(stderr,
+                     "[ptir] consume_if_committed: %u channels > max %u\n",
+                     n_slots, kMaxConditionalConsumeChannels);
+        std::abort();
+    }
+    ConditionalConsumeSlots consume;
+    consume.n = n_slots;
+    for (std::uint32_t i = 0; i < n_slots; ++i) {
+        consume.slots[i] = slots[i];
+    }
+    k_consume_if_committed<<<1, 1, 0, stream>>>(
+        full, head, cap1, pass_commit, consume);
 }
 
 // ──────────────────────────── host-side arena ────────────────────────────

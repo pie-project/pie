@@ -67,8 +67,6 @@ def run_case(args: argparse.Namespace, json_out: Path, extra_env: dict[str, str]
         str(args.request_timeout),
         "--server-startup-timeout",
         str(args.server_startup_timeout),
-        "--ipc-profile",
-        args.ipc_profile,
         "--memory-profile",
         "auto",
         "--json-out",
@@ -140,7 +138,6 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, default=512)
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--warmup-max-tokens", type=int, default=4)
-    p.add_argument("--ipc-profile", default="latency")
     p.add_argument("--request-timeout", type=float, default=2400.0)
     p.add_argument("--server-startup-timeout", type=float, default=700.0)
     p.add_argument("--candidate", action="append", help="profile:page_size:max_tokens:max_requests")

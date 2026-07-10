@@ -7,9 +7,8 @@
 // overhead dominates at small batch sizes. Capturing the launch sequence
 // once into a `cudaGraphExec_t` and replaying it on subsequent fires of
 // the same shape collapses N CPU-side forward launch invocations into a
-// single `cudaGraphLaunch`. Sampling/probe response work is intentionally
-// outside the graph because sampler layouts vary independently from the
-// forward shape.
+// single `cudaGraphLaunch`. PTIR publication remains outside the graph because
+// bound program/channel layouts vary independently from the forward shape.
 //
 // Constraints (correctness — gibberish if violated):
 //   1. **Pointer stability.** All kernel arguments (`pi.tokens`, `ws.*`,

@@ -1,0 +1,4 @@
+[package]
+name = "direct-channel-e2e"
+version = "0.1.0"
+description = "Executable direct PTIR bound-channel smoke"

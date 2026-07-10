@@ -254,15 +254,31 @@ fn offload_stage_defers_gpu_free_to_commit() {
 
     let mv = a.offload_stage(h.object_id).unwrap();
     assert_eq!(mv.from, gpu_blocks, "from = the still-resident GPU blocks");
-    assert_eq!(a.used(ArenaKind::KvPage), 1, "STAGE does NOT free the GPU block");
-    assert_eq!(a.residency(h.object_id).unwrap(), Residency::Gpu, "still GPU-resident");
-    assert_eq!(a.blocks(h.object_id).unwrap().to_vec(), gpu_blocks, "object still owns GPU");
+    assert_eq!(
+        a.used(ArenaKind::KvPage),
+        1,
+        "STAGE does NOT free the GPU block"
+    );
+    assert_eq!(
+        a.residency(h.object_id).unwrap(),
+        Residency::Gpu,
+        "still GPU-resident"
+    );
+    assert_eq!(
+        a.blocks(h.object_id).unwrap().to_vec(),
+        gpu_blocks,
+        "object still owns GPU"
+    );
     assert_eq!(a.used(ArenaKind::CpuStash), 1, "CPU dest staged");
 
     a.offload_commit(h.object_id, &mv.to).unwrap();
     assert_eq!(a.used(ArenaKind::KvPage), 0, "COMMIT frees the GPU block");
     assert_eq!(a.residency(h.object_id).unwrap(), Residency::Cpu);
-    assert_eq!(a.blocks(h.object_id).unwrap().to_vec(), mv.to, "repointed to CPU stash");
+    assert_eq!(
+        a.blocks(h.object_id).unwrap().to_vec(),
+        mv.to,
+        "repointed to CPU stash"
+    );
 }
 
 #[test]
@@ -273,7 +289,11 @@ fn offload_abort_releases_staged_cpu_and_leaves_gpu() {
     assert_eq!(a.used(ArenaKind::CpuStash), 1);
     a.offload_abort(&mv.to);
     assert_eq!(a.used(ArenaKind::CpuStash), 0, "staged CPU released");
-    assert_eq!(a.used(ArenaKind::KvPage), 1, "GPU untouched (never committed)");
+    assert_eq!(
+        a.used(ArenaKind::KvPage),
+        1,
+        "GPU untouched (never committed)"
+    );
     assert_eq!(a.residency(h.object_id).unwrap(), Residency::Gpu);
 }
 
@@ -282,10 +302,7 @@ fn offload_refuses_pinned_object() {
     let mut a = arena();
     let h = a.alloc(ArenaKind::KvPage, 1).unwrap();
     a.pin(h.object_id).unwrap();
-    assert!(matches!(
-        a.offload(h.object_id),
-        Err(ArenaError::Pinned(_))
-    ));
+    assert!(matches!(a.offload(h.object_id), Err(ArenaError::Pinned(_))));
     assert!(
         matches!(a.offload_stage(h.object_id), Err(ArenaError::Pinned(_))),
         "the staged variant refuses a pin too"
@@ -426,10 +443,7 @@ fn txn_pin_blocks_offload_until_finished() {
 
     let mut txn = a.txn_begin();
     a.txn_pin(&mut txn, h.object_id).unwrap();
-    assert!(matches!(
-        a.offload(h.object_id),
-        Err(ArenaError::Pinned(_))
-    ));
+    assert!(matches!(a.offload(h.object_id), Err(ArenaError::Pinned(_))));
 
     a.txn_commit(txn).unwrap();
     assert!(a.offload(h.object_id).is_ok());

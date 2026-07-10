@@ -1,16 +1,10 @@
-//! `[k]`-Token marshal e2e verify (#32/#33) — k>1 OFF `spec_tokens`.
+//! `[k]`-Token channel e2e verify.
 //!
-//! The 2a `specverify` used **k=1** to dodge the `[k]`-Token marshal truncation.
-//! #32/#33 route a `[k]`-Token (`elem_count > 1`) OFF the system-drafter
-//! `spec_tokens` channel into the per-(request,output) two-level CSR
-//! `program_tokens`, read back via the forward pass's `output()` tensor.
-//!
-//! Two layers, separated on purpose:
-//!  1. **ARGMAX-MATRIX PROBE (the marshal headline):** a `[k,vocab]` intrinsic →
+//! Two layers are separated on purpose:
+//!  1. **ARGMAX-MATRIX PROBE:** a `[k,vocab]` intrinsic →
 //!     per-row `argmax` → `[k]`-Token, with NO `-1` sentinel → ALL k argmax values
-//!     emit regardless of their correctness. So `probe_out.len() == k` PROVES the
-//!     `[k]` marshal routes all k off `program_tokens` (the #32 claim) independent
-//!     of any upstream value bug. `MARSHAL_EMITS_K` = this.
+//!     publish regardless of their correctness. `CHANNEL_EMITS_K` proves the
+//!     bound reader channel carries the complete value.
 //!  2. **MATRIX-ARGMAX VALUES (diagnostic):** `probe_out == g` (the target's greedy
 //!     continuation) iff the `[k,vocab]` matrix intrinsic feeds each row r the
 //!     logits at position L-1+r. `MATRIX_ARGMAX_OK` = this. (k=1 only ever
@@ -20,9 +14,8 @@
 //!
 //! Runs on the raw low-level WIT (keep-core): each arm's `Context::fork` +
 //! `forward` is a fresh `KvWorkingSet` + `geometry::*` write + raw `ForwardPass`,
-//! and the `[k]`-Token program output is read back with `output().read()` (the
-//! same marshalled/truncated `program_tokens` tensor the facade `Output::tokens`
-//! wrapped). The greedy `g` arm is a raw k-step argmax decode loop.
+//! and the `[k]`-Token channel is read back with `output().read()`. The greedy
+//! `g` arm is a raw k-step argmax decode loop.
 
 use inferlet::inference::{ForwardPass, InputBinding};
 use inferlet::program::{encode_i32, resolve_bindings};
@@ -30,14 +23,10 @@ use inferlet::sampling::program as edsl;
 use inferlet::sampling::{DType, Graph, OutputKind, Readiness, dselect};
 use inferlet::serde_json;
 use inferlet::working_set::KvWorkingSet;
-use inferlet::{geometry, model, sampler, Result};
+use inferlet::{Result, geometry, model, sampler};
 
-/// Fire a single-output `[k]`-Token program over `input` (fed at positions
-/// `0..n` of a fresh working set), then read back the marshalled token tensor as
-/// `u32` — the keep-core equivalent of `ctx.fork().forward().sampler(...)` +
-/// `Output::tokens`. The `[k]`-marshal truncation (first `-1` → drop) is a
-/// property of the returned tensor, preserved byte-for-byte.
-async fn fire_program_tokens(
+/// Fire a single-output `[k]`-Token program and read the bound reader channel.
+async fn fire_token_channel(
     program: &inferlet::tensor::Program,
     bindings: Vec<InputBinding>,
     input: &[u32],
@@ -63,13 +52,8 @@ async fn fire_program_tokens(
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
-    let params: serde_json::Value =
-        serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
-    let k: u32 = params
-        .get("k")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(4)
-        .max(2) as u32;
+    let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+    let k: u32 = params.get("k").and_then(|v| v.as_u64()).unwrap_or(4).max(2) as u32;
     let vocab = model::output_vocab_size();
     let page = KvWorkingSet::new().page_size();
 
@@ -143,7 +127,7 @@ async fn main(input: String) -> Result<String> {
             &positions(0),
             &[],
         )?;
-        fire_program_tokens(&probe_program, bindings, &base_inp(&g), page).await?
+        fire_token_channel(&probe_program, bindings, &base_inp(&g), page).await?
     };
 
     // ── 3. SPEC-VERIFY mixed arm (bonus): reject at j=k/2 ⇒ accept-prefix + -1. ──
@@ -170,7 +154,7 @@ async fn main(input: String) -> Result<String> {
             &positions(0),
             &[(keys.draft, encode_i32(&draft_i32))],
         )?;
-        fire_program_tokens(&sv_program, bindings, &base_inp(&g), page).await?
+        fire_token_channel(&sv_program, bindings, &base_inp(&g), page).await?
     };
 
     // ── ACCEPT-ALL spec-verify arm: draft == g → all rows match → output == g (no
@@ -185,7 +169,7 @@ async fn main(input: String) -> Result<String> {
             &positions(0),
             &[(keys.draft, encode_i32(&draft_i32))],
         )?;
-        fire_program_tokens(&sv_program, bindings, &base_inp(&g), page).await?
+        fire_token_channel(&sv_program, bindings, &base_inp(&g), page).await?
     };
 
     // ── REJECT-MID arm (the NON-DEGENERATE cumprod-collapse detector). The marshal
@@ -214,8 +198,8 @@ async fn main(input: String) -> Result<String> {
         let key = draft.input_key().expect("rj draft input");
         (gp.build().map_err(|e| format!("rj build: {e:?}"))?, key)
     };
-    let rj_program = inferlet::emit::emit_program(&rj_built.program)
-        .map_err(|e| format!("rj emit: {e}"))?;
+    let rj_program =
+        inferlet::emit::emit_program(&rj_built.program).map_err(|e| format!("rj emit: {e}"))?;
     let reject_mid_out: Vec<u32> = {
         // greedy conditioning ⇒ argmax == g; only the SUBMIT draft is perturbed
         let draft_i32: Vec<i32> = rj_draft.iter().map(|&t| t as i32).collect();
@@ -225,11 +209,11 @@ async fn main(input: String) -> Result<String> {
             &positions(0),
             &[(rj_key, encode_i32(&draft_i32))],
         )?;
-        fire_program_tokens(&rj_program, bindings, &base_inp(&g), page).await?
+        fire_token_channel(&rj_program, bindings, &base_inp(&g), page).await?
     };
 
     // ── Verdicts ──
-    let marshal_emits_k = probe_out.len() == k as usize; // #32 headline (value-independent)
+    let channel_emits_k = probe_out.len() == k as usize;
     let matrix_argmax_ok = probe_out == g; // [k,vocab] feeds each row its own position
     let pj = j.min(mixed_out.len());
     let spec_prefix_ok = pj > 0 && mixed_out[..pj] == g[..pj];
@@ -237,7 +221,9 @@ async fn main(input: String) -> Result<String> {
     // The cross-row accept-prefix: accept [0,j) == g, reject at j → 0, and rows > j
     // ALSO 0 (the cross-row cumprod zeros the whole suffix). A batched per-block
     // cumprod LEAKS draft at matched rows past j → reject_mid_out[r>j] == g[r] != 0.
-    let expect_rj: Vec<u32> = (0..k as usize).map(|i| if i < j { g[i] } else { 0 }).collect();
+    let expect_rj: Vec<u32> = (0..k as usize)
+        .map(|i| if i < j { g[i] } else { 0 })
+        .collect();
     let reject_mid_ok = reject_mid_out == expect_rj;
     // The 0-sentinel detector's invariant (foxtrot): a token-0 draft is
     // indistinguishable from a reject→0 sentinel → the mask returns. So ALL drafts
@@ -246,7 +232,7 @@ async fn main(input: String) -> Result<String> {
     let drafts_nonzero = g.iter().all(|&t| t != 0) && rj_draft.iter().all(|&t| t != 0);
 
     let result = format!(
-        "MARSHAL_EMITS_K={marshal_emits_k} MATRIX_ARGMAX_OK={matrix_argmax_ok} \
+        "CHANNEL_EMITS_K={channel_emits_k} MATRIX_ARGMAX_OK={matrix_argmax_ok} \
          SPEC_PREFIX_OK={spec_prefix_ok} SPEC_ACCEPT_ALL_OK={spec_accept_all_ok} \
          REJECT_MID_OK={reject_mid_ok} DRAFTS_NONZERO={drafts_nonzero} k={k} j={j} \
          g={g:?} probe_len={} probe_out={probe_out:?} mixed_out={mixed_out:?} \

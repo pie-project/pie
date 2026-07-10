@@ -7,7 +7,7 @@
 //!
 //! Modules are `pub` so external callers (the pyo3 wheel) can reach
 //! the surface they need — `serve::start_engine`, `config::Config`,
-//! `embedded_driver::EmbeddedDriver`, etc.
+//! and native-driver bootstrap helpers.
 
 pub mod config;
 pub mod driver_ffi;
@@ -15,8 +15,8 @@ pub mod embedded_driver;
 pub mod translate;
 pub mod weights;
 
-pub mod engine;
 mod client_server;
+pub mod engine;
 mod lifecycle;
 mod link;
 mod preflight;

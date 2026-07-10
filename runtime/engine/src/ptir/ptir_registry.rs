@@ -24,7 +24,7 @@ use lru::LruCache;
 use pie_ptir::container::{self, ContainerDecodeError, TraceContainer};
 use pie_ptir::container_hash;
 use pie_ptir::registry::ModelProfile;
-use pie_ptir::validate::{bind, BoundTrace, ValidateError};
+use pie_ptir::validate::{BoundTrace, ValidateError, bind};
 
 /// Registration-time pricing (thrust-3 P2.3): per-instance costs computed once
 /// per program and attached to its identity (feeds thrust-2's capacity
@@ -90,7 +90,9 @@ pub struct PtirRegistry {
 
 impl PtirRegistry {
     pub fn new(capacity: NonZeroUsize) -> Self {
-        Self { inner: LruCache::new(capacity) }
+        Self {
+            inner: LruCache::new(capacity),
+        }
     }
 
     /// Register `bytes` against `profile`: hash-deduped; on a miss, decode + bind
@@ -111,7 +113,13 @@ impl PtirRegistry {
         // The PTIB sidecar is the host→driver wire form of `BoundTrace`
         // (seed-independent, hash-keyed) — computed once, cached beside pricing.
         let sidecar = pie_ptir::sidecar::encode_bound(&bound);
-        let entry = Arc::new(RegisteredProgram { bytes, hash, bound, sidecar, pricing });
+        let entry = Arc::new(RegisteredProgram {
+            bytes,
+            hash,
+            bound,
+            sidecar,
+            pricing,
+        });
         self.inner.put(hash, entry.clone());
         Ok(entry)
     }
@@ -152,7 +160,12 @@ fn price(c: &TraceContainer) -> Pricing {
             container::PortSource::Channel(_) => None,
         })
         .unwrap_or(1);
-    Pricing { channel_bytes, num_channels: c.channels.len(), num_stages: c.stages.len(), rows }
+    Pricing {
+        channel_bytes,
+        num_channels: c.channels.len(),
+        num_stages: c.stages.len(),
+        rows,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +175,9 @@ fn price(c: &TraceContainer) -> Pricing {
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 static GLOBAL: LazyLock<Mutex<PtirRegistry>> = LazyLock::new(|| {
-    Mutex::new(PtirRegistry::new(NonZeroUsize::new(DEFAULT_CAPACITY).expect("nonzero capacity")))
+    Mutex::new(PtirRegistry::new(
+        NonZeroUsize::new(DEFAULT_CAPACITY).expect("nonzero capacity"),
+    ))
 });
 
 fn global() -> MutexGuard<'static, PtirRegistry> {
@@ -195,28 +210,47 @@ mod tests {
     const VOCAB: u32 = 32;
 
     fn chan(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
-        ChannelDecl { shape, dtype: ChanDType::Concrete(dtype), capacity: 1, host_role: role, seeded }
+        ChannelDecl {
+            shape,
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role: role,
+            seeded,
+        }
     }
 
     /// A minimal greedy-argmax pass: embed a seeded `tok`, epilogue argmaxes the
     /// logits and publishes the token to a host-read `out`.
     fn greedy(vocab: u32) -> TraceContainer {
         let ops = vec![
-            Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(1, vocab), dtype: DType::F32 },
-            Op::Reshape { value: 0, shape: Shape::vector(vocab) },
+            Op::IntrinsicVal {
+                intr: IntrinsicId::Logits,
+                shape: Shape::matrix(1, vocab),
+                dtype: DType::F32,
+            },
+            Op::Reshape {
+                value: 0,
+                shape: Shape::vector(vocab),
+            },
             Op::ReduceArgmax(1),
-            Op::Reshape { value: 2, shape: Shape::vector(1) },
+            Op::Reshape {
+                value: 2,
+                shape: Shape::vector(1),
+            },
             Op::ChanPut { chan: 1, value: 3 },
         ];
         TraceContainer {
             names: vec![],
             externs: vec![],
             channels: vec![
-                chan(Shape::vector(1), DType::I32, HostRole::None, true),   // 0 tok
+                chan(Shape::vector(1), DType::I32, HostRole::None, true), // 0 tok
                 chan(Shape::vector(1), DType::I32, HostRole::Reader, false), // 1 out
             ],
             ports: vec![
-                PortBinding { port: Port::EmbedTokens, source: PortSource::Channel(0) },
+                PortBinding {
+                    port: Port::EmbedTokens,
+                    source: PortSource::Channel(0),
+                },
                 PortBinding {
                     port: Port::EmbedIndptr,
                     source: PortSource::Const {
@@ -226,7 +260,10 @@ mod tests {
                     },
                 },
             ],
-            stages: vec![StageProgram { stage: Stage::Epilogue, ops }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops,
+            }],
         }
     }
 
@@ -237,7 +274,10 @@ mod tests {
     /// A dummy profile whose `vocab` matches the container's logits shape (bind
     /// checks `logits` against the profile's vocab).
     fn prof(vocab: u32) -> ModelProfile {
-        ModelProfile { vocab, ..ModelProfile::dummy() }
+        ModelProfile {
+            vocab,
+            ..ModelProfile::dummy()
+        }
     }
 
     #[test]
@@ -247,7 +287,10 @@ mod tests {
         let bytes = greedy(VOCAB).encode();
         let a = r.register(bytes.clone(), &p).unwrap();
         let b = r.register(bytes.clone(), &p).unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "identical containers must share one Arc (cache hit)");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "identical containers must share one Arc (cache hit)"
+        );
         assert_eq!(r.len(), 1);
         assert_eq!(a.hash, container_hash(&bytes));
         // pricing: 2 channels × [1] × 4 bytes × (1+1 ring) = 16 bytes.
@@ -264,7 +307,10 @@ mod tests {
         let bytes = greedy(VOCAB).encode();
         let prog = r.register(bytes.clone(), &prof(VOCAB)).unwrap();
         let decoded = pie_ptir::sidecar::decode_bound(&prog.sidecar).unwrap();
-        assert_eq!(decoded.container_hash, prog.hash, "PTIB inner hash == container identity");
+        assert_eq!(
+            decoded.container_hash, prog.hash,
+            "PTIB inner hash == container identity"
+        );
         assert_eq!(decoded.container_hash, container_hash(&bytes));
         assert!(!prog.sidecar.is_empty());
     }
@@ -282,8 +328,13 @@ mod tests {
     #[test]
     fn malformed_bytes_fail_with_decoder_message() {
         let mut r = reg(4);
-        let err = r.register(b"not a container".to_vec(), &prof(VOCAB)).unwrap_err();
-        assert!(matches!(err, RegisterError::Decode(_)), "bad magic → decode error");
+        let err = r
+            .register(b"not a container".to_vec(), &prof(VOCAB))
+            .unwrap_err();
+        assert!(
+            matches!(err, RegisterError::Decode(_)),
+            "bad magic → decode error"
+        );
         assert!(err.to_string().contains("decode"), "{err}");
     }
 
@@ -292,9 +343,16 @@ mod tests {
         // A structurally-decodable container whose body is ill-typed: put a
         // Bool value into an I32 channel (a ChanPut dtype mismatch).
         let ops = vec![
-            Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(1, VOCAB), dtype: DType::F32 },
-            Op::Reshape { value: 0, shape: Shape::vector(VOCAB) },
-            Op::Gt(1, 1), // Bool [VOCAB]
+            Op::IntrinsicVal {
+                intr: IntrinsicId::Logits,
+                shape: Shape::matrix(1, VOCAB),
+                dtype: DType::F32,
+            },
+            Op::Reshape {
+                value: 0,
+                shape: Shape::vector(VOCAB),
+            },
+            Op::Gt(1, 1),                      // Bool [VOCAB]
             Op::ChanPut { chan: 1, value: 2 }, // out is I32 [1] → dtype+shape mismatch
         ];
         let mut c = greedy(VOCAB);
@@ -303,7 +361,10 @@ mod tests {
 
         let mut r = reg(4);
         let err = r.register(bytes, &prof(VOCAB)).unwrap_err();
-        assert!(matches!(err, RegisterError::Bind(_)), "ill-typed body → bind error, got {err}");
+        assert!(
+            matches!(err, RegisterError::Bind(_)),
+            "ill-typed body → bind error, got {err}"
+        );
         assert!(err.to_string().contains("bind failed"), "{err}");
     }
 

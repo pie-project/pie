@@ -61,7 +61,7 @@ impl PyEngineHandle {
         let taken = self.inner.lock().unwrap().take();
         if let Some((handle, runtime)) = taken {
             py.allow_threads(|| {
-                handle.shutdown();
+                runtime.block_on(handle.shutdown());
                 // Drop the runtime; tokio joins worker threads.
                 drop(runtime);
             });
@@ -75,7 +75,7 @@ impl Drop for PyEngineHandle {
     /// Python `Server.__aexit__` raises before reaching `shutdown()`.
     fn drop(&mut self) {
         if let Some((handle, runtime)) = self.inner.lock().unwrap().take() {
-            handle.shutdown();
+            runtime.block_on(handle.shutdown());
             drop(runtime);
         }
     }

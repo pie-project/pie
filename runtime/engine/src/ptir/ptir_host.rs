@@ -10,7 +10,7 @@
 //!
 //! **Run-ahead** (overview §3): `pipeline.submit` NEVER blocks. It prepares the
 //! fire (seeds, host puts, KV/RS projection), hands the request to the
-//! scheduler, and enqueues a [`PendingFire`] (the driver round-trip + the open
+//! scheduler, and enqueues a [`PendingFire`] (the payload-free completion + the open
 //! KV/RS txns) on the pass — the classic `execute()`/`output()` split
 //! (`PendingForward`, Option A) applied to PTIR. Step t+1 is prepared against
 //! t's OPTIMISTIC post-state (the `committed_tokens` cursor advances at
@@ -34,50 +34,10 @@ use crate::working_set::rs::RsWorkingSet;
 use pie_ptir::container::HostRole;
 
 use super::ptir_channel_store::drain_host_puts;
-use super::ptir_channel_store::{
-    marshal_response, BoundCells, ChannelCell, ChannelError,
-};
+use super::ptir_channel_store::{BoundCells, ChannelCell, ChannelError};
 use super::ptir_kv;
 use super::ptir_lease::PageLease;
 use super::ptir_rs;
-
-/// U4 unification — the pinned frame mirror the runtime reads produced Reader
-/// cells straight from (superseding the ForwardResponse marshal). The driver
-/// D2H-published each committed cell into a per-channel ring in the pinned mirror
-/// at commit and advanced the pinned head/tail words; the runtime loads them with
-/// no driver round-trip. Populated lazily on the first finalize (once the frame is
-/// bound device-side). Rank order matches the device's dense host-reader order.
-pub struct FrameReader {
-    mirror_base: u64,
-    word_base: u64,
-    readers: Vec<FrameReaderChannel>,
-}
-
-/// One host-reader channel's cursor into the pinned mirror ring (rank-ordered).
-struct FrameReaderChannel {
-    global_id: u64,
-    cell_bytes: u32,
-    cap1: u32,
-    mirror_off: u64,
-    /// Cumulative cells consumed into the bound cell so far (vs the tail word).
-    pushed: u64,
-}
-
-#[cfg(feature = "driver-cuda")]
-unsafe extern "C" {
-    /// U4 — write the instance's pinned mirror/word bases + per-channel
-    /// {cell_bytes, cap1, mirror_off}; returns the host-visible channel count
-    /// (`0` = unknown instance / no frame). Implemented in `frame_carrier.cpp`.
-    fn pie_frame_layout(
-        instance: u64,
-        n_channels: u32,
-        out_cell_bytes: *mut u32,
-        out_cap1: *mut u32,
-        out_mirror_off: *mut u64,
-        out_mirror_base: *mut u64,
-        out_word_base: *mut u64,
-    ) -> u32;
-}
 
 /// A first-class, guest-constructed channel (overview §1). The SAME handle is
 /// bound into a forward pass (dense declaration index) and used for host
@@ -104,12 +64,10 @@ pub enum PendingOp {
     Move(PendingMove),
 }
 
-/// One in-flight KV cell MOVE (`pipeline.copy-into`). Unlike a fire it carries
-/// no KV/RS transaction, no bound cells, no logits oneshot to marshal — it just
-/// holds an ordered slot in the pipeline FIFO and finalizes trivially (await the
-/// driver round-trip, discard). The guest computed the post-move layout itself.
+/// One in-flight KV cell MOVE (`pipeline.copy-into`). It holds an ordered slot
+/// in the pipeline FIFO and finalizes by awaiting its payload-free completion.
 pub struct PendingMove {
-    rx: tokio::sync::oneshot::Receiver<anyhow::Result<crate::inference::ForwardOutput>>,
+    completion: crate::driver::Completion,
 }
 
 /// The open KV/arena transaction(s) one in-flight fire holds until it resolves.
@@ -126,12 +84,11 @@ enum FireKv {
     },
 }
 
-/// One in-flight PTIR fire: the driver round-trip plus everything needed to
+/// One in-flight PTIR fire: the driver completion plus everything needed to
 /// finalize when it resolves — the open KV/RS txns (pins/CoW held until
-/// commit/abort) and the bound cells to marshal outputs into (or poison on
-/// failure). The PTIR mirror of the classic `PendingForward`.
+/// commit/abort) and the bound cells whose mirror epochs become visible.
 pub struct PendingFire {
-    rx: tokio::sync::oneshot::Receiver<anyhow::Result<crate::inference::ForwardOutput>>,
+    completion: crate::driver::InstanceCompletion,
     kv: FireKv,
     rstxn: Option<ptir_rs::PtirRsTxn>,
     ws_rep: u32,
@@ -139,6 +96,7 @@ pub struct PendingFire {
     /// The owning pass, to fail it on a fire error (rep — the guest may have
     /// dropped the handle; failure marking is then moot).
     fwd_rep: u32,
+    instance_id: u64,
     cells: BoundCells,
 }
 
@@ -149,9 +107,9 @@ pub struct PendingFire {
 /// resolves one shared device cell and the pipeline orders the fires (§3.4).
 pub struct ForwardPass {
     pub instance: super::ptir_instance::PtirInstance,
-    /// The bound channel cells, dense declaration order: Writer puts staged
-    /// here are D1-coalesced into each fire's carrier; Reader cells the fire
-    /// produces are marshaled back here for the guest to `take`/`read`.
+    pub bound_instance: crate::driver::BoundInstance,
+    /// The bound channel cells, dense declaration order. Writer puts are
+    /// coalesced into each fire; Reader cells hold direct mirror bindings.
     pub cells: BoundCells,
     /// Dense-channel-index → global-channel-id map (captured at bind from the
     /// bound cells). Rides every submission so the driver binds the trace's
@@ -161,6 +119,9 @@ pub struct ForwardPass {
     /// `submit` can point each channel's await queue at the feeding pipeline
     /// (W3.1: the pipeline owns the FIFO; a pass may bind to any pipeline).
     pub channel_reps: Vec<u32>,
+    /// Pipeline FIFO this pass has submitted through. Stored on the pass so
+    /// teardown remains safe even if guest channel handles were dropped first.
+    pub fires: Option<PendingFires>,
     /// The guest-owned KV working set bound into this pass (the model forward
     /// writes the embedded token's K/V here + self-attends over it). The guest
     /// keeps it alive for the pass's lifetime (the classic `forward-pass`
@@ -177,7 +138,6 @@ pub struct ForwardPass {
     /// First-fire byte-ship tracking: the container bytes + seeds ride the
     /// first fire; steady-state fires carry the hash + instance id only
     /// (driver hash-cache + persistent arena).
-    pub shipped: bool,
     /// Set when a fire of this pass failed: further submits error with the
     /// root cause (the KV cursor and device channel state are unspecified
     /// after a failed fire — the guest builds a fresh pass).
@@ -190,11 +150,6 @@ pub struct ForwardPass {
     /// pages (`PageLease`) and delivers fresh grants on the program's fresh
     /// channel. Replaces the deleted host-replay beam branch.
     pub devgeo: Option<DevGeo>,
-    /// U4 unification: the pinned frame mirror this instance's produced Reader
-    /// cells are read from at finalize (the driver publishes them at commit),
-    /// superseding the ForwardResponse marshal. Lazily bound on the first
-    /// finalize; `None` until then (and always `None` off `driver-cuda`).
-    pub frame: Option<FrameReader>,
 }
 
 /// A run-ahead submission pipeline (overview §3): the ORDERING domain (W3.1).
@@ -256,12 +211,19 @@ fn detect_device_geometry(
         return None;
     }
     // B from the [B, P] channel bound to the `Pages` port (P > 1 for a beam).
-    let pages_ch = container.ports.iter().find_map(|p| match (&p.port, &p.source) {
-        (Port::Pages, PortSource::Channel(c)) => Some(*c as usize),
-        _ => None,
-    })?;
+    let pages_ch = container
+        .ports
+        .iter()
+        .find_map(|p| match (&p.port, &p.source) {
+            (Port::Pages, PortSource::Channel(c)) => Some(*c as usize),
+            _ => None,
+        })?;
     let dims = container.channels.get(pages_ch)?.shape.dims();
-    let b = if dims.len() == 2 && dims[1] > 1 { dims[0] as usize } else { return None };
+    let b = if dims.len() == 2 && dims[1] > 1 {
+        dims[0] as usize
+    } else {
+        return None;
+    };
 
     // fresh = the single host-Writer channel; w_cont = the host-Reader bool.
     let fresh_dense = container
@@ -276,64 +238,11 @@ fn detect_device_geometry(
 
 type Anyhow<T> = anyhow::Result<T>;
 
-/// Process-wide accumulator of PTIR device-resource release markers (W0.3):
-/// global channel ids + instance ids whose device storage the driver must free.
-/// Populated by `channel.drop` / `forward-pass.drop`, drained into the next
-/// submitted `ForwardRequest` (rides any fire; a drop with no imminent fire
-/// flushes on the runtime's next submit). Fixes the pre-existing driver
-/// instance-map leak too.
-static PENDING_RELEASE: Mutex<(Vec<u64>, Vec<u64>)> = Mutex::new((Vec::new(), Vec::new()));
-
-/// Queue a dropped channel's global id for device release.
-fn queue_channel_release(global_id: u64) {
-    PENDING_RELEASE.lock().unwrap().0.push(global_id);
-}
-
-/// Queue a dropped pass's instance id for device release.
-fn queue_instance_release(instance_id: u64) {
-    PENDING_RELEASE.lock().unwrap().1.push(instance_id);
-}
-
-/// Drain queued release markers into a request about to be submitted.
-fn drain_releases_into(req: &mut pie_driver_abi::ForwardRequest) {
-    let mut g = PENDING_RELEASE.lock().unwrap();
-    req.ptir_release_channel_ids.append(&mut g.0);
-    req.ptir_release_instance_ids.append(&mut g.1);
-}
-
-
 /// First fire only: bind the pass's seeds — one staged `put` per `seeded`
 /// channel, dense order (D2, per-instance data). A seeded channel with no
 /// staged put is the old `MissingSeed` instantiate error, surfaced at the
 /// first submit instead of hanging the fire.
-fn bind_seeds_first_fire(p: &mut ForwardPass) -> Result<(), String> {
-    if p.shipped {
-        return Ok(());
-    }
-    let seeded: Vec<bool> =
-        p.instance.program.bound.container.channels.iter().map(|c| c.seeded).collect();
-    let mut seeds = Vec::new();
-    for (i, is_seeded) in seeded.into_iter().enumerate() {
-        if !is_seeded {
-            continue;
-        }
-        // Multi-pass channels (W3.2): a shared seeded channel's staged seed is
-        // consumed by the first pass to ship it; a later pass sharing the same
-        // channel finds `seed_taken` and skips it (the device is already seeded
-        // — the seed table is de-duped by global id, W0.2).
-        {
-            if p.cells[i].lock().unwrap().seed_taken {
-                continue;
-            }
-        }
-        match p.cells[i].lock().unwrap().take_seed() {
-            Ok(data) => {
-                seeds.push(super::ptir_instance::ChannelSeed { channel: i as u32, data })
-            }
-            Err(e) => return Err(format!("ptir: channel {i}: {e}")),
-        }
-    }
-    p.instance.seeds = seeds;
+fn bind_seeds_first_fire(_p: &mut ForwardPass) -> Result<(), String> {
     Ok(())
 }
 
@@ -346,6 +255,17 @@ fn poison_readers(cells: &BoundCells, reason: &str) {
             c.poison(reason);
         }
     }
+}
+
+fn publish_reader_mirrors(cells: &BoundCells, instance_id: u64) -> Result<bool, String> {
+    let mut poisoned = false;
+    for cell in cells {
+        let mut cell = cell.lock().unwrap();
+        if cell.role == Some(HostRole::Reader) {
+            poisoned |= cell.publish_reader_mirror(instance_id)?;
+        }
+    }
+    Ok(poisoned)
 }
 
 // The interface has no free functions left (register-program folded into
@@ -425,12 +345,9 @@ impl pie::inferlet::forward::HostChannel for InstanceState {
 
     async fn drop(&mut self, this: Resource<Channel>) -> Anyhow<()> {
         // A pass that bound this channel holds its own Arc — dropping the
-        // guest handle never dangles an in-flight fire. Queue the channel's
-        // global id for device release (W0.3): device lifetime follows the WIT
-        // resource drop.
-        let ch = self.ctx().table.delete(this)?;
-        let global_id = ch.cell.lock().unwrap().global_id;
-        queue_channel_release(global_id);
+        // guest handle never dangles an in-flight fire. Native channel storage
+        // is reference-counted by bound instances and releases on instance close.
+        self.ctx().table.delete(this)?;
         Ok(())
     }
 }
@@ -532,13 +449,19 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
             let devgeo = match detect_device_geometry(&prog.bound.container) {
                 Some((b, fresh_dense, w_cont_dense)) => {
                     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-                    let seed_pages = match self.ctx().table.get_mut(&ws_res)?.alloc_slots(b as u32) {
+                    let seed_pages = match self.ctx().table.get_mut(&ws_res)?.alloc_slots(b as u32)
+                    {
                         Ok(ids) => ids,
                         Err(e) => return Ok(Err(format!("ptir: device-geometry seed alloc: {e}"))),
                     };
                     let mut lease = PageLease::new(b);
                     lease.seed(seed_pages);
-                    Some(DevGeo { lease, b, fresh_dense, w_cont_dense })
+                    Some(DevGeo {
+                        lease,
+                        b,
+                        fresh_dense,
+                        w_cont_dense,
+                    })
                 }
                 None => None,
             };
@@ -553,44 +476,137 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
             // Capture the dense-index → global-channel-id map now that the cells
             // are validated (multi-pass channels: a global id is stable across
             // every pass a channel binds into).
-            let channel_ids: Vec<u64> =
-                cells.iter().map(|c| c.lock().unwrap().global_id).collect();
+            let channel_ids: Vec<u64> = cells.iter().map(|c| c.lock().unwrap().global_id).collect();
             // Capture the bound channel resource reps so `submit` can point each
             // channel's await queue at the feeding pipeline (W3.1).
             let channel_reps: Vec<u32> = channels.iter().map(|c| c.rep()).collect();
+            let program_id = match crate::driver::register_program(
+                0,
+                crate::driver::ProgramRegistration {
+                    program_hash: prog.hash,
+                    canonical_bytes: prog.bytes.clone(),
+                    sidecar_bytes: prog.sidecar.clone(),
+                },
+            ) {
+                Ok(id) => id,
+                Err(e) => return Ok(Err(format!("ptir: register program: {e:#}"))),
+            };
+            let instance_id = super::ptir_instance::next_instance_id();
+            let mut instance_seeds = Vec::new();
+            let mut seed_values = Vec::new();
+            for (dense, cell) in cells.iter().enumerate() {
+                let mut cell = cell.lock().unwrap();
+                if !cell.seeded {
+                    continue;
+                }
+                let bytes = match cell.take_seed() {
+                    Ok(bytes) => bytes,
+                    Err(e) => return Ok(Err(format!("ptir: channel {dense} seed: {e}"))),
+                };
+                instance_seeds.push(super::ptir_instance::ChannelSeed {
+                    channel: dense as u32,
+                    data: bytes.clone(),
+                });
+                seed_values.push(crate::ptir::PtirChannelValue {
+                    channel: cell.global_id,
+                    bytes,
+                });
+            }
             let instance = super::ptir_instance::PtirInstance {
                 program: prog,
-                instance_id: super::ptir_instance::next_instance_id(),
-                // Seeds ride the channels' own staged puts — bound at the
-                // first submit (D2, never part of identity).
-                seeds: Vec::new(),
+                instance_id,
+                seeds: instance_seeds,
             };
+            let bound_instance = match crate::driver::bind_instance(
+                0,
+                program_id,
+                instance.instance_id,
+                channel_ids.clone(),
+                seed_values,
+            ) {
+                Ok(bound) => bound,
+                Err(e) => return Ok(Err(format!("ptir: bind instance: {e:#}"))),
+            };
+            let reader_count = cells
+                .iter()
+                .filter(|cell| cell.lock().unwrap().role == Some(HostRole::Reader))
+                .count();
+            if bound_instance.channel_bindings().len() != reader_count {
+                let _ = crate::driver::close_instance(&bound_instance);
+                return Ok(Err(format!(
+                    "ptir: driver returned {} reader bindings for {reader_count} channels",
+                    bound_instance.channel_bindings().len()
+                )));
+            }
+            for binding in bound_instance.channel_bindings() {
+                let Some(cell) = cells
+                    .iter()
+                    .find(|cell| cell.lock().unwrap().global_id == binding.channel_id)
+                else {
+                    let _ = crate::driver::close_instance(&bound_instance);
+                    return Ok(Err(format!(
+                        "ptir: driver returned unknown reader channel {}",
+                        binding.channel_id
+                    )));
+                };
+                if let Err(e) = cell.lock().unwrap().attach_reader_mirror(
+                    bound_instance.instance_id,
+                    bound_instance.binding.mirror_base,
+                    bound_instance.binding.word_base,
+                    binding.cell_bytes,
+                    binding.capacity,
+                    binding.mirror_offset,
+                    binding.tail_word_index,
+                    binding.poison_word_index,
+                ) {
+                    for cell in &cells {
+                        cell.lock()
+                            .unwrap()
+                            .detach_reader_mirror(bound_instance.instance_id);
+                    }
+                    let _ = crate::driver::close_instance(&bound_instance);
+                    return Ok(Err(format!("ptir: bind reader mirror: {e}")));
+                }
+            }
             let res = self.ctx().table.push(ForwardPass {
                 instance,
+                bound_instance,
                 cells,
                 channel_ids,
                 channel_reps,
+                fires: None,
                 kv_ws: ws_rep,
                 rs_ws: rs_rep,
                 committed_tokens: 0,
-                shipped: false,
                 failed: None,
                 devgeo,
-                frame: None,
             })?;
             Ok(Ok(res))
         }
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
-        // The pass's in-flight fires live on the PIPELINE's FIFO now (W3.1), not
-        // the pass — draining them (pins safety) follows the pipeline's
-        // drop/close, not the pass. The guest owns the channels (Arc'd cells)
-        // and the working sets (their own resources); the pass releases only
-        // itself. Queue the instance id for device release (W0.3): frees the
-        // driver's persistent per-instance view (also fixes the map leak).
+        // A pass can be dropped before its pipeline. Drain the shared FIFO first
+        // so every callback, mirror publication, and KV/RS transaction completes
+        // before raw mirror pointers are detached or pages become reusable.
+        let fires = self.ctx().table.get(&this)?.fires.clone();
+        if let Some(fires) = fires {
+            loop {
+                let op = fires.lock().unwrap().pop_front();
+                match op {
+                    Some(op) => self.finalize_op(op).await?,
+                    None => break,
+                }
+            }
+        }
+
         let mut pass = self.ctx().table.delete(this)?;
-        queue_instance_release(pass.instance.instance_id);
+        for cell in &pass.cells {
+            cell.lock()
+                .unwrap()
+                .detach_reader_mirror(pass.bound_instance.instance_id);
+        }
+        let _ = crate::driver::close_instance(&pass.bound_instance);
         // Device-geometry: reclaim EVERY leased physical page (all in-flight
         // grants + the fire-0 seed) back to the working set on pass drop.
         if let Some(devgeo) = pass.devgeo.as_mut() {
@@ -642,68 +658,43 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             // await the right FIFO — enforcing the same-pipeline constraint
             // (§3.4): every pass binding a channel must submit on one pipeline.
             let pipe_fires = self.ctx().table.get(&this)?.fires.clone();
-            {
-                let reps = self.ctx().table.get(&fwd)?.channel_reps.clone();
-                for rep in reps {
-                    let cres: Resource<Channel> = Resource::new_borrow(rep);
-                    if let Ok(ch) = self.ctx().table.get_mut(&cres) {
-                        match &ch.fires {
-                            Some(existing) if !Arc::ptr_eq(existing, &pipe_fires) => {
-                                return Ok(Err(
-                                    "ptir: a channel is shared across pipelines \
-                                     (all passes binding a channel must submit on \
-                                     the same pipeline)"
-                                        .into(),
-                                ));
-                            }
-                            _ => ch.fires = Some(pipe_fires.clone()),
-                        }
-                    }
-                }
+            if let Err(error) = self.wire_channels_to_pipeline(&fwd, &pipe_fires)? {
+                return Ok(Err(error));
             }
-            // Build the PTIR carrier for this fire (thrust-3 P2c host emit): ship
-            // the container bytes + the seeds (drained off the seeded channels'
-            // staged puts) on the pass's first fire, the hash + instance id only
-            // thereafter (driver compile-cache + persistent arena); attach the
-            // D1-coalesced host-puts drained from the bound Writer cells.
-            let (submission, geometry, cells, ws_rep, rs_rep, committed_tokens, fwd_rep) = {
+            let (
+                geometry,
+                cells,
+                ws_rep,
+                rs_rep,
+                committed_tokens,
+                fwd_rep,
+                instance_id,
+                host_puts,
+                completion,
+            ) = {
                 let p = self.ctx().table.get_mut(&fwd)?;
                 if let Some(e) = &p.failed {
                     return Ok(Err(format!(
                         "ptir: forward-pass failed by an earlier fire: {e}"
                     )));
                 }
-                if let Err(e) = bind_seeds_first_fire(p) {
-                    return Ok(Err(e));
-                }
-                let ship = !p.shipped;
-                p.shipped = true;
-                let channel_ids = p.channel_ids.clone();
-                let host_puts = drain_host_puts(&p.cells);
-                let submission = p.instance.submission(ship, channel_ids, host_puts);
-                // Host-known geometry prefill (token/positions/qo/readout for
-                // seeded ports, e.g. a §3 single-seq decode). `None` ⇒ a port
-                // binds a device-derived / ws / run-ahead channel the host can't
-                // resolve — the driver fills the descriptor ports itself.
                 let geometry = p.instance.fire_geometry(model_profile().page_size).ok();
                 (
-                    submission,
                     geometry,
                     p.cells.clone(),
                     p.kv_ws,
                     p.rs_ws,
                     p.committed_tokens,
                     fwd.rep(),
+                    p.bound_instance.instance_id,
+                    drain_host_puts(&p.cells),
+                    p.bound_instance.reserve_completion(),
                 )
             };
-            let mut req = pie_driver_abi::ForwardRequest::default();
-            req.push_ptir_program(&submission);
+            let mut req = crate::driver::LaunchPlan::default();
             if let Some(g) = &geometry {
                 g.apply_to(&mut req);
             }
-            // Ride any queued device-resource release markers on this fire (W0.3).
-            drain_releases_into(&mut req);
-
             // Project the guest-owned KV working set for this fire via `ptir_kv`
             // (alpha's ws-alloc + arena-txn + project_kv lifecycle). The held
             // `PtirKvTxn` rides the PendingFire across the async fire; finalized
@@ -772,54 +763,58 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             // Fire through the scheduler → charlie's PTIR executor hook — and
             // return. NO await: the PendingFire carries the round-trip; the
             // channels' take/read finalize it.
-            let rx = match crate::inference::submit_async(
+            if let Err(e) = crate::inference::submit_async(
                 req,
                 0,
+                instance_id,
+                host_puts,
                 proj.physical_page_ids,
                 proj.last_page_len,
                 Vec::new(),
                 None,
+                completion.clone(),
             ) {
-                Ok(rx) => rx,
-                Err(e) => {
-                    let reason = format!("ptir: submit failed: {e:#}");
-                    let mut arena = arena_arc.lock().unwrap();
-                    match self.ctx().table.get_mut(&ws_res) {
-                        Ok(ws) => {
-                            let _ = ptir_kv::ptir_kv_finalize(ws, &mut arena, kvtxn, false);
-                        }
-                        Err(_) => ptir_kv::ptir_kv_abandon(&mut arena, kvtxn),
+                let reason = format!("ptir: submit failed: {e:#}");
+                let mut arena = arena_arc.lock().unwrap();
+                match self.ctx().table.get_mut(&ws_res) {
+                    Ok(ws) => {
+                        let _ = ptir_kv::ptir_kv_finalize(ws, &mut arena, kvtxn, false);
                     }
-                    if let Some(rstxn) = rstxn {
-                        let rs_res: Resource<RsWorkingSet> =
-                            Resource::new_borrow(rs_rep.expect("rs txn implies rs rep"));
-                        match self.ctx().table.get_mut(&rs_res) {
-                            Ok(rs) => {
-                                let _ = ptir_rs::ptir_rs_finalize(rs, &mut arena, rstxn, false);
-                            }
-                            Err(_) => ptir_rs::ptir_rs_abandon(&mut arena, rstxn),
-                        }
-                    }
-                    drop(arena);
-                    self.ctx().table.get_mut(&fwd)?.failed = Some(reason.clone());
-                    return Ok(Err(reason));
+                    Err(_) => ptir_kv::ptir_kv_abandon(&mut arena, kvtxn),
                 }
-            };
+                if let Some(rstxn) = rstxn {
+                    let rs_res: Resource<RsWorkingSet> =
+                        Resource::new_borrow(rs_rep.expect("rs txn implies rs rep"));
+                    match self.ctx().table.get_mut(&rs_res) {
+                        Ok(rs) => {
+                            let _ = ptir_rs::ptir_rs_finalize(rs, &mut arena, rstxn, false);
+                        }
+                        Err(_) => ptir_rs::ptir_rs_abandon(&mut arena, rstxn),
+                    }
+                }
+                drop(arena);
+                self.ctx().table.get_mut(&fwd)?.failed = Some(reason.clone());
+                return Ok(Err(reason));
+            }
 
             // Optimistic cursor advance: the NEXT submit prepares against this
             // fire's post-state (the run-ahead overlap). A failed fire fails
             // the pass instead of rewinding.
             self.ctx().table.get_mut(&fwd)?.committed_tokens = next_committed;
 
-            pipe_fires.lock().unwrap().push_back(PendingOp::Fire(PendingFire {
-                rx,
-                kv: FireKv::Kv(kvtxn),
-                rstxn,
-                ws_rep,
-                rs_rep,
-                fwd_rep,
-                cells,
-            }));
+            pipe_fires
+                .lock()
+                .unwrap()
+                .push_back(PendingOp::Fire(PendingFire {
+                    completion,
+                    kv: FireKv::Kv(kvtxn),
+                    rstxn,
+                    ws_rep,
+                    rs_rep,
+                    fwd_rep,
+                    instance_id,
+                    cells,
+                }));
             Ok(Ok(()))
         }
     }
@@ -873,21 +868,29 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
         // channel fed by this pipeline drains it in submit order.
         let pipe_fires = self.ctx().table.get(&this)?.fires.clone();
 
-        let mut req = pie_driver_abi::ForwardRequest::default();
-        req.kv_move_dst_pages = kv_move_dst_pages;
-        req.kv_move_dst_offs = dst_tok_idx;
-        req.kv_move_src_pages = kv_move_src_pages;
-        req.kv_move_src_offs = src_tok_idx;
-        drain_releases_into(&mut req);
-
-        let rx = match crate::inference::submit_prebuilt_async(req, 0, Vec::new(), 0, Vec::new()) {
-            Ok(rx) => rx,
+        let cells = kv_move_dst_pages
+            .into_iter()
+            .zip(dst_tok_idx.into_iter())
+            .zip(kv_move_src_pages.into_iter().zip(src_tok_idx.into_iter()))
+            .map(
+                |((dst_page_id, dst_token_offset), (src_page_id, src_token_offset))| {
+                    pie_driver_abi::PieKvMoveCell {
+                        dst_page_id,
+                        dst_token_offset,
+                        src_page_id,
+                        src_token_offset,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        let completion = match crate::driver::copy_kv_cells(0, cells) {
+            Ok(completion) => completion,
             Err(e) => return Ok(Err(format!("ptir copy_into: submit failed: {e:#}"))),
         };
         pipe_fires
             .lock()
             .unwrap()
-            .push_back(PendingOp::Move(PendingMove { rx }));
+            .push_back(PendingOp::Move(PendingMove { completion }));
         Ok(Ok(()))
     }
 
@@ -934,36 +937,37 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
 
 impl InstanceState {
     /// Drain one pipeline FIFO entry in submit order: a forward fire finalizes
-    /// its KV/RS txns + marshals outputs; a KV cell MOVE just awaits its driver
-    /// round-trip and discards (no txn, no cells) — an async failure is logged
-    /// (the move poisons nothing the guest `take`s, since it produced no output).
+    /// its KV/RS txns and exposes mirror epochs; a KV cell MOVE awaits its
+    /// payload-free completion. Move failures are logged because no channel is
+    /// associated with the operation.
     async fn finalize_op(&mut self, op: PendingOp) -> Anyhow<()> {
         match op {
             PendingOp::Fire(fire) => self.finalize_fire(fire).await,
             PendingOp::Move(mv) => {
-                match mv.rx.await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!("ptir kv-move (copy_into) fire failed: {e:#}")
-                    }
-                    Err(_) => {
-                        tracing::warn!("ptir kv-move (copy_into) dropped before completion")
-                    }
+                if let Err(e) = mv.completion.await {
+                    tracing::warn!("ptir kv-move (copy_into) failed: {e:#}")
                 }
                 Ok(())
             }
         }
     }
 
-    /// Resolve one in-flight fire: await the driver round-trip, finalize the
-    /// KV/RS txns (commit on success / abort on failure; abandon if the guest
-    /// dropped the working set mid-flight), then marshal the produced Reader
-    /// cells — or, on failure, poison the pass's Reader channels + fail the
-    /// pass. The PTIR mirror of the classic `await_and_finalize`.
+    /// Resolve one in-flight fire: await the payload-free callback, finalize the
+    /// KV/RS txns, and expose the release-published mirror tails. Values remain
+    /// in driver-owned channel memory until `channel.take` or `channel.read`.
     async fn finalize_fire(&mut self, fire: PendingFire) -> Anyhow<()> {
-        let PendingFire { rx, kv, rstxn, ws_rep, rs_rep, fwd_rep, cells } = fire;
-        let result = rx.await;
-        let success = matches!(result, Ok(Ok(_)));
+        let PendingFire {
+            completion,
+            kv,
+            rstxn,
+            ws_rep,
+            rs_rep,
+            fwd_rep,
+            instance_id,
+            cells,
+        } = fire;
+        let result = completion.await;
+        let success = result.is_ok();
 
         {
             let arena_arc = crate::arena::get(0, 0);
@@ -976,11 +980,10 @@ impl InstanceState {
                     }
                     Err(_) => ptir_kv::ptir_kv_abandon(&mut arena, kvtxn),
                 },
-                // Device-geometry fire: the driver resolved+wrote KV; the runtime
-                // only unpins the leased pages (commit persists the writes / abort
-                // discards them). The per-fire grant reclaim (via w_cont) happens
-                // below, after the response is in hand.
-                FireKv::DeviceGeom { arena_txn, write_txn } => {
+                FireKv::DeviceGeom {
+                    arena_txn,
+                    write_txn,
+                } => {
                     if success {
                         let _ = arena.txn_commit(arena_txn);
                     } else {
@@ -1008,142 +1011,28 @@ impl InstanceState {
         }
 
         match result {
-            Ok(Ok(crate::inference::ForwardOutput::Response(resp))) => {
-                // Marshal program 0's produced Reader cells back into the bound
-                // cells so the guest's `take`/`read` see them. On `driver-cuda`
-                // the value path is the pinned frame mirror the driver published
-                // at commit (the unification); otherwise the rich response.
-                let produced = self.produced_cells(fwd_rep, &cells, &resp);
-                if let Err(e) = marshal_response(&cells, &produced) {
-                    let reason = format!("ptir: output marshal failed: {e}");
+            Ok(()) => match publish_reader_mirrors(&cells, instance_id) {
+                Ok(true) => {
+                    let reason = "ptir: driver published poisoned output channel".to_string();
                     poison_readers(&cells, &reason);
                     self.fail_pass(fwd_rep, &reason);
                 }
-                // Device-geometry: reclaim the UNUSED fresh page grants of this
-                // fire's continuing heirs (harvested `w_cont`) back to the lease's
-                // free-list (bounding pin float to run-ahead depth × B).
-                self.reclaim_device_geometry_grants(fwd_rep, &produced);
-            }
-            Ok(Ok(_)) => {
-                // A non-Response output (legacy token fast-path) carries no
-                // PTIR channel cells — nothing to marshal.
-            }
-            Ok(Err(e)) => {
-                let reason = format!("ptir: forward failed: {e:#}");
-                poison_readers(&cells, &reason);
-                self.fail_pass(fwd_rep, &reason);
-            }
+                Ok(false) => {
+                    self.reclaim_device_geometry_grants(fwd_rep, instance_id);
+                }
+                Err(e) => {
+                    let reason = format!("ptir: mirror publication failed: {e}");
+                    poison_readers(&cells, &reason);
+                    self.fail_pass(fwd_rep, &reason);
+                }
+            },
             Err(e) => {
-                let reason = format!("ptir: forward channel closed: {e}");
+                let reason = format!("ptir: forward failed: {e:#}");
                 poison_readers(&cells, &reason);
                 self.fail_pass(fwd_rep, &reason);
             }
         }
         Ok(())
-    }
-
-    /// Build the fire's produced Reader cells `(global_id, bytes)` for
-    /// [`marshal_response`]. On `driver-cuda` the value path is the pinned frame
-    /// mirror (the unification): read the newly-committed cells straight from the
-    /// per-channel ring the driver D2H-published at commit — no ForwardResponse
-    /// marshal. The response's `ptir_output` is ignored here (kept produced for
-    /// non-CUDA drivers, which have no frame carrier).
-    #[cfg(feature = "driver-cuda")]
-    fn produced_cells(
-        &mut self,
-        fwd_rep: u32,
-        cells: &BoundCells,
-        _resp: &pie_driver_abi::ForwardResponse,
-    ) -> Vec<(u64, Vec<u8>)> {
-        // Host-reader channels in dense declaration order == the device's dense
-        // host-reader RANK order (both filter Reader over the same dense list).
-        let reader_gids: Vec<u64> = cells
-            .iter()
-            .filter_map(|c| {
-                let g = c.lock().unwrap();
-                (g.role == Some(HostRole::Reader)).then_some(g.global_id)
-            })
-            .collect();
-        if reader_gids.is_empty() {
-            return Vec::new();
-        }
-        let res: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
-        let pass = match self.ctx().table.get_mut(&res) {
-            Ok(p) => p,
-            Err(_) => return Vec::new(),
-        };
-        let iid = pass.instance.instance_id;
-        // Lazily bind the frame reader: query the device layout by the wire id
-        // (the id-reconcile makes the frame carrier key == this instance_id).
-        if pass.frame.is_none() {
-            let n = reader_gids.len();
-            let mut cell_bytes = vec![0u32; n];
-            let mut cap1 = vec![0u32; n];
-            let mut mirror_off = vec![0u64; n];
-            let (mut mirror_base, mut word_base) = (0u64, 0u64);
-            let got = unsafe {
-                pie_frame_layout(
-                    iid,
-                    n as u32,
-                    cell_bytes.as_mut_ptr(),
-                    cap1.as_mut_ptr(),
-                    mirror_off.as_mut_ptr(),
-                    &mut mirror_base,
-                    &mut word_base,
-                )
-            };
-            if got as usize != n {
-                if std::env::var("PIE_PTIR_TRACE").is_ok() {
-                    eprintln!(
-                        "[u4] frame_layout iid={iid} got={got} n={n} — NO frame, mirror read skipped"
-                    );
-                }
-                // No frame bound (e.g. the driver produced no host-reader frame
-                // this fire) — nothing to read from the mirror.
-                return Vec::new();
-            }
-            let readers = (0..n)
-                .map(|r| FrameReaderChannel {
-                    global_id: reader_gids[r],
-                    cell_bytes: cell_bytes[r],
-                    cap1: cap1[r],
-                    mirror_off: mirror_off[r],
-                    pushed: 0,
-                })
-                .collect();
-            pass.frame = Some(FrameReader { mirror_base, word_base, readers });
-        }
-        let fr = pass.frame.as_mut().unwrap();
-        let (mirror_base, word_base) = (fr.mirror_base, fr.word_base);
-        let mut produced = Vec::new();
-        for (rank, rc) in fr.readers.iter_mut().enumerate() {
-            // tail word = word[2 + 2*rank] (WordLayout: pacing[0], head/tail per
-            // channel). The oneshot from the executor happens-after publish, so a
-            // plain load observes the published words + mirror cells.
-            let tail = unsafe { *(word_base as *const u64).add(2 + 2 * rank) };
-            while rc.pushed < tail {
-                let slot = (rc.pushed % rc.cap1 as u64) * rc.cell_bytes as u64;
-                let ptr = (mirror_base + rc.mirror_off + slot) as *const u8;
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(ptr, rc.cell_bytes as usize).to_vec() };
-                produced.push((rc.global_id, bytes));
-                rc.pushed += 1;
-            }
-        }
-        produced
-    }
-
-    /// Non-CUDA build: no frame carrier and no ForwardResponse PTIR value path
-    /// (the CUDA executor is the only runtime producer of Reader cells). Nothing
-    /// to marshal — a non-CUDA driver never fires PTIR stage programs.
-    #[cfg(not(feature = "driver-cuda"))]
-    fn produced_cells(
-        &mut self,
-        _fwd_rep: u32,
-        _cells: &BoundCells,
-        _resp: &pie_driver_abi::ForwardResponse,
-    ) -> Vec<(u64, Vec<u8>)> {
-        Vec::new()
     }
 
     /// Mark a pass failed (first failure wins). The guest may have dropped
@@ -1194,12 +1083,14 @@ impl InstanceState {
 
         // Snapshot the carrier + grant B fresh physical pages, materializing +
         // pinning them under one write/arena txn (no borrow held across submit).
-        let (submission, geometry, cells, fwd_rep, arena_txn, write_txn) = {
+        let (host_puts, completion, instance_id, cells, fwd_rep, arena_txn, write_txn, phys_pages) = {
             // Fail-fast + first-fire seed binding.
             {
                 let p = self.ctx().table.get_mut(&fwd)?;
                 if let Some(e) = &p.failed {
-                    return Ok(Err(format!("ptir: forward-pass failed by an earlier fire: {e}")));
+                    return Ok(Err(format!(
+                        "ptir: forward-pass failed by an earlier fire: {e}"
+                    )));
                 }
                 if let Err(e) = bind_seeds_first_fire(p) {
                     return Ok(Err(e));
@@ -1226,7 +1117,10 @@ impl InstanceState {
             let grant_slots = {
                 let ws = self.ctx().table.get_mut(&ws_res)?;
                 devgeo.lease.grant(|| {
-                    ws.alloc_slots(1).ok().and_then(|v| v.into_iter().next()).unwrap_or(0)
+                    ws.alloc_slots(1)
+                        .ok()
+                        .and_then(|v| v.into_iter().next())
+                        .unwrap_or(0)
                 })
             };
             let mut phys_pages: Vec<u32> = Vec::with_capacity(grant_slots.len());
@@ -1248,7 +1142,8 @@ impl InstanceState {
                         match arena.blocks(obj) {
                             Ok(bl) => phys_pages.push(bl[0]),
                             Err(e) => {
-                                grant_err = Some(format!("ptir: device-geometry blocks {slot}: {e}"));
+                                grant_err =
+                                    Some(format!("ptir: device-geometry blocks {slot}: {e}"));
                                 break;
                             }
                         }
@@ -1280,47 +1175,58 @@ impl InstanceState {
                 p.devgeo = Some(devgeo);
             }
 
-            // Build the carrier + the RELAXED geometry (device-produced ports
-            // ship empty; the driver resolves them pre-forward).
             let p = self.ctx().table.get_mut(&fwd)?;
-            let ship = !p.shipped;
-            p.shipped = true;
-            let channel_ids = p.channel_ids.clone();
             let host_puts = drain_host_puts(&p.cells);
-            let submission = p.instance.submission(ship, channel_ids, host_puts);
-            let geometry = p.instance.fire_geometry_relaxed(page_size).ok();
-            (submission, geometry, p.cells.clone(), fwd.rep(), txn, wtx)
+            let completion = p.bound_instance.reserve_completion();
+            (
+                host_puts,
+                completion,
+                p.bound_instance.instance_id,
+                p.cells.clone(),
+                fwd.rep(),
+                txn,
+                wtx,
+                phys_pages,
+            )
         };
 
-        // Assemble + fire the solo/prebuilt request; NO await (run-ahead FIFO).
-        let mut req = pie_driver_abi::ForwardRequest::default();
-        req.push_ptir_program(&submission);
-        if let Some(g) = &geometry {
-            g.apply_to(&mut req);
-        }
-        drain_releases_into(&mut req);
-        let rx = match crate::inference::submit_prebuilt_async(req, 0, Vec::new(), 0, Vec::new()) {
-            Ok(rx) => rx,
-            Err(e) => {
-                let reason = format!("ptir: device-geometry submit failed: {e:#}");
-                arena_arc.lock().unwrap().txn_abort(arena_txn);
-                if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
-                    ws.abort_writes(write_txn);
-                }
-                self.ctx().table.get_mut(&fwd)?.failed = Some(reason.clone());
-                return Ok(Err(reason));
+        let req = crate::driver::LaunchPlan::default();
+        let last_page_len = phys_pages.last().map(|_| page_size).unwrap_or(0);
+        if let Err(e) = crate::inference::submit_prebuilt_async(
+            req,
+            0,
+            instance_id,
+            host_puts,
+            phys_pages,
+            last_page_len,
+            Vec::new(),
+            completion.clone(),
+        ) {
+            let reason = format!("ptir: device-geometry submit failed: {e:#}");
+            arena_arc.lock().unwrap().txn_abort(arena_txn);
+            if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
+                ws.abort_writes(write_txn);
             }
-        };
+            self.ctx().table.get_mut(&fwd)?.failed = Some(reason.clone());
+            return Ok(Err(reason));
+        }
 
-        pipe_fires.lock().unwrap().push_back(PendingOp::Fire(PendingFire {
-            rx,
-            kv: FireKv::DeviceGeom { arena_txn, write_txn },
-            rstxn: None,
-            ws_rep,
-            rs_rep: None,
-            fwd_rep,
-            cells,
-        }));
+        pipe_fires
+            .lock()
+            .unwrap()
+            .push_back(PendingOp::Fire(PendingFire {
+                completion,
+                kv: FireKv::DeviceGeom {
+                    arena_txn,
+                    write_txn,
+                },
+                rstxn: None,
+                ws_rep,
+                rs_rep: None,
+                fwd_rep,
+                instance_id,
+                cells,
+            }));
         Ok(Ok(()))
     }
 
@@ -1332,6 +1238,13 @@ impl InstanceState {
         fwd: &Resource<ForwardPass>,
         pipe_fires: &PendingFires,
     ) -> Anyhow<Result<(), String>> {
+        if let Some(existing) = &self.ctx().table.get(fwd)?.fires {
+            if !Arc::ptr_eq(existing, pipe_fires) {
+                return Ok(Err(
+                    "ptir: a pass cannot submit across different pipelines".into()
+                ));
+            }
+        }
         let reps = self.ctx().table.get(fwd)?.channel_reps.clone();
         for rep in reps {
             let cres: Resource<Channel> = Resource::new_borrow(rep);
@@ -1347,29 +1260,37 @@ impl InstanceState {
                 }
             }
         }
+        self.ctx().table.get_mut(fwd)?.fires = Some(pipe_fires.clone());
         Ok(Ok(()))
     }
 
     /// Device-geometry per-fire page reclaim: read the harvested `w_cont`
-    /// (`[B]` bool: heir(true)/fork(false)) from `produced`, reclaim the
+    /// (`[B]` bool: heir(true)/fork(false)) from its bound mirror, reclaim the
     /// continuing heirs' UNUSED fresh page grants into the lease free-list, and
     /// free those ws slots. No-op for a non-device-geometry pass.
-    fn reclaim_device_geometry_grants(&mut self, fwd_rep: u32, produced: &[(u64, Vec<u8>)]) {
+    fn reclaim_device_geometry_grants(&mut self, fwd_rep: u32, instance_id: u64) {
         let res: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
-        let (w_cont, ws_rep, reclaimed) = {
-            let Ok(p) = self.ctx().table.get_mut(&res) else { return };
-            let Some(devgeo) = p.devgeo.as_mut() else { return };
-            let w_cont_gid = p.channel_ids.get(devgeo.w_cont_dense).copied();
-            let Some(gid) = w_cont_gid else { return };
-            let w_cont: Vec<bool> = produced
-                .iter()
-                .find(|(c, _)| *c == gid)
-                .map(|(_, b)| b.iter().map(|&x| x != 0).collect())
+        let (ws_rep, reclaimed) = {
+            let Ok(p) = self.ctx().table.get_mut(&res) else {
+                return;
+            };
+            let Some(devgeo) = p.devgeo.as_mut() else {
+                return;
+            };
+            let Some(cell) = p.cells.get(devgeo.w_cont_dense) else {
+                return;
+            };
+            let w_cont = cell
+                .lock()
+                .unwrap()
+                .latest_reader_value(instance_id)
+                .ok()
+                .flatten()
                 .unwrap_or_default();
+            let w_cont: Vec<bool> = w_cont.iter().map(|&byte| byte != 0).collect();
             let reclaimed = devgeo.lease.reclaim_after_fire(&w_cont);
-            (w_cont, p.kv_ws, reclaimed)
+            (p.kv_ws, reclaimed)
         };
-        let _ = w_cont;
         if !reclaimed.is_empty() {
             let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
             let (m, d) = match self.ctx().table.get(&ws_res) {
@@ -1408,13 +1329,21 @@ fn model_profile() -> pie_ptir::registry::ModelProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_ptir::container::{ChanDType, ChannelDecl, PortBinding, PortSource, StageProgram, TraceContainer};
+    use pie_ptir::container::{
+        ChanDType, ChannelDecl, PortBinding, PortSource, StageProgram, TraceContainer,
+    };
     use pie_ptir::registry::{Port, Stage};
     use pie_ptir::types::{DType, Shape};
     use std::collections::VecDeque;
 
     fn ch(shape: Shape, dtype: DType, role: HostRole) -> ChannelDecl {
-        ChannelDecl { shape, dtype: ChanDType::Concrete(dtype), capacity: 1, host_role: role, seeded: false }
+        ChannelDecl {
+            shape,
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role: role,
+            seeded: false,
+        }
     }
 
     /// A minimal device-geometry container: a `[B,P]` Pages channel, WSlot/WOff
@@ -1425,18 +1354,30 @@ mod tests {
         TraceContainer {
             names: vec![],
             channels: vec![
-                ch(Shape::matrix(b, p), DType::U32, HostRole::None),   // 0 pages
-                ch(Shape::vector(b), DType::U32, HostRole::None),      // 1 w_slot
-                ch(Shape::vector(b), DType::U32, HostRole::None),      // 2 w_off
-                ch(Shape::vector(b), DType::U32, HostRole::Writer),    // 3 fresh
-                ch(Shape::vector(b), DType::Bool, HostRole::Reader),   // 4 w_cont
+                ch(Shape::matrix(b, p), DType::U32, HostRole::None), // 0 pages
+                ch(Shape::vector(b), DType::U32, HostRole::None),    // 1 w_slot
+                ch(Shape::vector(b), DType::U32, HostRole::None),    // 2 w_off
+                ch(Shape::vector(b), DType::U32, HostRole::Writer),  // 3 fresh
+                ch(Shape::vector(b), DType::Bool, HostRole::Reader), // 4 w_cont
             ],
             ports: vec![
-                PortBinding { port: Port::Pages, source: PortSource::Channel(0) },
-                PortBinding { port: Port::WSlot, source: PortSource::Channel(1) },
-                PortBinding { port: Port::WOff, source: PortSource::Channel(2) },
+                PortBinding {
+                    port: Port::Pages,
+                    source: PortSource::Channel(0),
+                },
+                PortBinding {
+                    port: Port::WSlot,
+                    source: PortSource::Channel(1),
+                },
+                PortBinding {
+                    port: Port::WOff,
+                    source: PortSource::Channel(2),
+                },
             ],
-            stages: vec![StageProgram { stage: Stage::Epilogue, ops: vec![] }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![],
+            }],
             externs: vec![],
         }
     }
@@ -1456,11 +1397,20 @@ mod tests {
         let c = TraceContainer {
             names: vec![],
             channels: vec![ch(Shape::vector(1), DType::I32, HostRole::None)],
-            ports: vec![PortBinding { port: Port::KvLen, source: PortSource::Channel(0) }],
-            stages: vec![StageProgram { stage: Stage::Epilogue, ops: vec![] }],
+            ports: vec![PortBinding {
+                port: Port::KvLen,
+                source: PortSource::Channel(0),
+            }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![],
+            }],
             externs: vec![],
         };
-        assert!(detect_device_geometry(&c).is_none(), "no WSlot/WOff ⇒ not device-geometry");
+        assert!(
+            detect_device_geometry(&c).is_none(),
+            "no WSlot/WOff ⇒ not device-geometry"
+        );
     }
 
     #[test]
@@ -1469,7 +1419,10 @@ mod tests {
         let mut c = devgeo_container(2, 1);
         // pages [B,1]
         c.channels[0] = ch(Shape::matrix(2, 1), DType::U32, HostRole::None);
-        assert!(detect_device_geometry(&c).is_none(), "P == 1 ⇒ not device-geometry");
+        assert!(
+            detect_device_geometry(&c).is_none(),
+            "P == 1 ⇒ not device-geometry"
+        );
     }
 
     /// The FIFO invariant primitive: fires enqueued in submission order drain in
@@ -1483,6 +1436,10 @@ mod tests {
             fifo.push_back(fire); // submit order
         }
         let drained: Vec<u32> = std::iter::from_fn(|| fifo.pop_front()).collect();
-        assert_eq!(drained, (0..8).collect::<Vec<_>>(), "completion order == submission order");
+        assert_eq!(
+            drained,
+            (0..8).collect::<Vec<_>>(),
+            "completion order == submission order"
+        );
     }
 }

@@ -29,7 +29,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use dashmap::DashMap;
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task;
 
@@ -71,19 +71,23 @@ fn run_handler<H: ServiceHandler>(
 // Singleton Service
 // =============================================================================
 
+struct SingletonState<Msg: Send + 'static> {
+    tx: UnboundedSender<Msg>,
+    handle: task::JoinHandle<()>,
+}
+
 /// A singleton service address.
 ///
 /// Use when you need exactly one service instance (e.g., global services).
-/// Singletons are long-lived and don't support join.
 pub struct Service<Msg: Send + 'static> {
-    tx: OnceLock<UnboundedSender<Msg>>,
+    state: Mutex<Option<SingletonState<Msg>>>,
 }
 
 impl<Msg: Send + 'static> Service<Msg> {
     /// Creates a new empty service.
     pub const fn new() -> Self {
         Self {
-            tx: OnceLock::new(),
+            state: Mutex::new(None),
         }
     }
 
@@ -95,27 +99,40 @@ impl<Msg: Send + 'static> Service<Msg> {
     {
         let handler = factory();
         let (tx, rx) = unbounded_channel();
+        let handle = run_handler(handler, rx);
 
-        self.tx
-            .set(tx)
-            .map_err(|_| anyhow!("Service already spawned"))?;
-
-        let _ = run_handler(handler, rx);
+        let mut state = self.state.lock().unwrap();
+        ensure!(state.is_none(), "Service already spawned");
+        *state = Some(SingletonState { tx, handle });
         Ok(())
     }
 
     /// Sends a message to the service.
     pub fn send(&self, msg: Msg) -> Result<()> {
         let tx = self
-            .tx
-            .get()
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|state| state.tx.clone())
             .ok_or_else(|| anyhow!("Service not spawned"))?;
         tx.send(msg).map_err(|_| anyhow!("Service channel closed"))
     }
 
+    /// Stops the service and awaits its shutdown.
+    pub async fn shutdown(&self) -> Result<()> {
+        let Some(SingletonState { tx, handle }) = self.state.lock().unwrap().take() else {
+            return Ok(());
+        };
+        drop(tx);
+        handle
+            .await
+            .map_err(|e| anyhow!("Service task panicked: {}", e))
+    }
+
     /// Returns true if the service has been spawned.
     pub fn is_spawned(&self) -> bool {
-        self.tx.get().is_some()
+        self.state.lock().unwrap().is_some()
     }
 }
 

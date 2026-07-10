@@ -26,7 +26,7 @@
 //! # Boundaries
 //!
 //!   * **↔driver (handle boundary):** the driver pins its KV buffers and exports
-//!     a [`pie_driver_abi::kv::KvHandle`]; transport consumes it without owning or
+//!     a [`pie_driver_abi::KvHandle`]; transport consumes it without owning or
 //!     interpreting the bytes. The per-backend registration shim lives on the
 //!     driver's export surface. Transport never imports the driver — they meet
 //!     only through the handle type on the schema floor.
@@ -36,7 +36,7 @@
 //!     completion signal ([`Completion`]); *when* to await is the scheduler's
 //!     job.
 //!   * **↔interface/driver:** the KV layout and handle type live in
-//!     [`pie_driver_abi::kv`], shared by driver / transport / runtime / controller.
+//!     [`pie_driver_abi`], shared by driver / transport / runtime / controller.
 
 pub mod core;
 pub mod engines;
@@ -50,7 +50,7 @@ pub use engines::local::{D2dCopier, LocalEngine};
 pub use error::{Result, TransportError};
 pub use registry::Registry;
 
-pub use pie_driver_abi::kv::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
+pub use pie_driver_abi::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
 
 #[cfg(test)]
 mod tests {

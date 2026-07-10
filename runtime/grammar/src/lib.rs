@@ -108,6 +108,7 @@
 //! - [`bitmask`] -- Token bitmask utilities
 
 pub mod bitmask;
+pub mod brle;
 pub mod compiled_grammar;
 pub(crate) mod fsm;
 pub mod grammar;
