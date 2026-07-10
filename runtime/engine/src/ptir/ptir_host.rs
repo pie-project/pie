@@ -33,8 +33,10 @@ use crate::working_set::rs::RsWorkingSet;
 
 use pie_ptir::container::HostRole;
 
-use super::ptir_channel_store::drain_host_puts;
-use super::ptir_channel_store::{BoundCells, ChannelCell, ChannelError};
+use super::ptir_channel_store::{
+    BoundCells, ChannelCell, ChannelError, commit_host_puts, reserve_reader_capacity,
+    rollback_reader_capacity, snapshot_host_puts,
+};
 use super::ptir_kv;
 use super::ptir_lease::PageLease;
 use super::ptir_rs;
@@ -55,6 +57,7 @@ pub struct Channel {
 /// A pass's in-flight fires, submit order. Plain mutex: never held across an
 /// await (the op is popped out, then awaited).
 pub type PendingFires = Arc<Mutex<VecDeque<PendingOp>>>;
+type PipelineFailure = Arc<Mutex<Option<String>>>;
 
 /// A pipeline FIFO entry: a forward FIRE or a KV cell MOVE (Design-B
 /// compaction). Both hold an ordered slot on the same stream — the B3
@@ -64,10 +67,24 @@ pub enum PendingOp {
     Move(PendingMove),
 }
 
+impl PendingOp {
+    async fn wait_for_completion_signal(&self) {
+        match self {
+            Self::Fire(fire) => {
+                let _ = fire.completion.clone().await;
+            }
+            Self::Move(mv) => {
+                let _ = mv.completion.clone().await;
+            }
+        }
+    }
+}
+
 /// One in-flight KV cell MOVE (`pipeline.copy-into`). It holds an ordered slot
 /// in the pipeline FIFO and finalizes by awaiting its payload-free completion.
 pub struct PendingMove {
     completion: crate::driver::Completion,
+    failure: PipelineFailure,
 }
 
 /// The open KV/arena transaction(s) one in-flight fire holds until it resolves.
@@ -98,6 +115,7 @@ pub struct PendingFire {
     fwd_rep: u32,
     instance_id: u64,
     cells: BoundCells,
+    failure: PipelineFailure,
 }
 
 /// A traced forward pass bound to its first-class handles — one instance of a
@@ -170,6 +188,7 @@ pub struct ForwardPass {
 /// accident. Tested by `tests::{detect_device_geometry_*, fifo_preserves_submission_order}`.
 pub struct Pipeline {
     pub fires: PendingFires,
+    failure: PipelineFailure,
 }
 
 /// Physical-page leasing + channel bookkeeping for a device-geometry pass
@@ -295,15 +314,27 @@ impl pie::inferlet::forward::HostChannel for InstanceState {
 
     async fn put(&mut self, this: Resource<Channel>, value: Vec<u8>) -> Anyhow<Result<(), String>> {
         let cell = self.ctx().table.get(&this)?.cell.clone();
-        Ok(cell.lock().unwrap().put(value).map_err(|e| e.to_string()))
+        loop {
+            let result = cell.lock().unwrap().put_ref(&value);
+            match result {
+                Ok(()) => return Ok(Ok(())),
+                Err(ChannelError::Full) => {}
+                Err(error) => return Ok(Err(error.to_string())),
+            }
+            let wait = cell.lock().unwrap().writer_wait_state();
+            let Some((endpoint, observed_head)) = wait else {
+                return Ok(Err(ChannelError::Full.to_string()));
+            };
+            if let Err(error) = endpoint.wait_for_writer_change(observed_head).await {
+                return Ok(Err(error.to_string()));
+            }
+        }
     }
 
     /// The run-ahead await point: while the cell is empty, await + finalize
-    /// the pass's oldest in-flight fire (FIFO), then re-check. Errors when no
-    /// in-flight fire remains (nothing will ever fill the cell — a genuinely
-    /// blocking cross-task wait needs the wasi-p3 surface; a p2 guest awaiting
-    /// here without a prior submit would deadlock itself) or the channel is
-    /// poisoned (a fire that feeds it failed).
+    /// the pass's oldest in-flight fire (FIFO), then re-check. With no local
+    /// fire, wait directly on the endpoint so a producer in another task can
+    /// wake this channel. Poison and close are surfaced as errors.
     async fn take(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
         loop {
             let (cell, fires) = {
@@ -315,10 +346,30 @@ impl pie::inferlet::forward::HostChannel for InstanceState {
                 Err(ChannelError::Empty) => {}
                 Err(e) => return Ok(Err(e.to_string())),
             }
+            let wait = cell.lock().unwrap().reader_wait_state();
             let fire = fires.as_ref().and_then(|f| f.lock().unwrap().pop_front());
             match fire {
-                Some(fire) => self.finalize_op(fire).await?,
-                None => return Ok(Err(ChannelError::Empty.to_string())),
+                Some(fire) => {
+                    if let Some((endpoint, observed_tail)) = wait {
+                        tokio::select! {
+                            _ = endpoint.wait_for_reader_change(observed_tail) => {}
+                            _ = fire.wait_for_completion_signal() => {}
+                        }
+                    }
+                    self.finalize_op(fire).await?;
+                }
+                None => {
+                    let Some((endpoint, observed_tail)) = wait else {
+                        return Ok(Err(ChannelError::Empty.to_string()));
+                    };
+                    if let Err(error) = endpoint.wait_for_reader_change(observed_tail).await {
+                        return Ok(Err(error.to_string()));
+                    }
+                    let mut cell = cell.lock().unwrap();
+                    if let Err(error) = cell.publish_reader_mirror(0) {
+                        return Ok(Err(error));
+                    }
+                }
             }
         }
     }
@@ -335,10 +386,30 @@ impl pie::inferlet::forward::HostChannel for InstanceState {
                 Err(ChannelError::Empty) => {}
                 Err(e) => return Ok(Err(e.to_string())),
             }
+            let wait = cell.lock().unwrap().reader_wait_state();
             let fire = fires.as_ref().and_then(|f| f.lock().unwrap().pop_front());
             match fire {
-                Some(fire) => self.finalize_op(fire).await?,
-                None => return Ok(Err(ChannelError::Empty.to_string())),
+                Some(fire) => {
+                    if let Some((endpoint, observed_tail)) = wait {
+                        tokio::select! {
+                            _ = endpoint.wait_for_reader_change(observed_tail) => {}
+                            _ = fire.wait_for_completion_signal() => {}
+                        }
+                    }
+                    self.finalize_op(fire).await?;
+                }
+                None => {
+                    let Some((endpoint, observed_tail)) = wait else {
+                        return Ok(Err(ChannelError::Empty.to_string()));
+                    };
+                    if let Err(error) = endpoint.wait_for_reader_change(observed_tail).await {
+                        return Ok(Err(error.to_string()));
+                    }
+                    let mut cell = cell.lock().unwrap();
+                    if let Err(error) = cell.publish_reader_mirror(0) {
+                        return Ok(Err(error));
+                    }
+                }
             }
         }
     }
@@ -373,6 +444,23 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
             // Validate every handle against its dense declaration BEFORE
             // stamping any of them, so a failed `new` binds nothing.
             let decls = prog.bound.container.channels.clone();
+            let extern_bindings = decls
+                .iter()
+                .enumerate()
+                .map(|(dense, _)| {
+                    prog.bound
+                        .container
+                        .externs
+                        .iter()
+                        .find(|binding| binding.chan == dense as u32)
+                        .map(|binding| {
+                            (
+                                prog.bound.container.names[binding.name as usize].clone(),
+                                binding.dir,
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
             if channels.len() != decls.len() {
                 return Ok(Err(format!(
                     "ptir: {} channel handles supplied for {} declared channels",
@@ -396,7 +484,10 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
                     // device cell, and the pipeline enforces same-pipeline
                     // ordering (§3.4). Decl equality across the sharing passes is
                     // still validated (`matches_decl`) — a conflict is an error.
-                    if let Err(e) = c.matches_decl(&decls[i]) {
+                    let extern_binding = extern_bindings[i]
+                        .as_ref()
+                        .map(|(name, dir)| (name.as_str(), *dir));
+                    if let Err(e) = c.validate_attachment(&decls[i], extern_binding) {
                         return Ok(Err(format!("ptir: channel {i}: {e}")));
                     }
                     // Pre-bind staged puts must fit the declared role: a
@@ -466,13 +557,77 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
                 None => None,
             };
 
+            let instance_id = super::ptir_instance::next_instance_id();
+            for (dense, cell) in cells.iter().enumerate() {
+                let extern_binding = extern_bindings[dense]
+                    .as_ref()
+                    .map(|(name, dir)| (name.as_str(), *dir));
+                if let Err(error) =
+                    cell.lock()
+                        .unwrap()
+                        .attach(instance_id, &decls[dense], extern_binding)
+                {
+                    for attached in &cells {
+                        attached.lock().unwrap().detach(instance_id);
+                    }
+                    return Ok(Err(format!("ptir: channel {dense} attach: {error}")));
+                }
+            }
+            for (dense, cell) in cells.iter().enumerate() {
+                let existing = cell.lock().unwrap().endpoint();
+                let endpoint = match existing {
+                    Some(endpoint) => endpoint,
+                    None => {
+                        let extern_binding = extern_bindings[dense].as_ref();
+                        let plan = crate::driver::ChannelRegistrationPlan {
+                            driver_id: 0,
+                            channel_id: cell.lock().unwrap().global_id,
+                            shape: decls[dense].shape.dims().to_vec(),
+                            dtype: decls[dense].dtype.tag(),
+                            host_role: decls[dense].host_role as u8,
+                            seeded: decls[dense].seeded,
+                            extern_dir: extern_binding
+                                .map(|(_, dir)| match dir {
+                                    pie_ptir::container::ExternDir::Import => {
+                                        pie_driver_abi::PIE_CHANNEL_EXTERN_IMPORT
+                                    }
+                                    pie_ptir::container::ExternDir::Export => {
+                                        pie_driver_abi::PIE_CHANNEL_EXTERN_EXPORT
+                                    }
+                                })
+                                .unwrap_or(pie_driver_abi::PIE_CHANNEL_EXTERN_NONE),
+                            capacity: decls[dense].capacity,
+                            reader_wait_id: 0,
+                            writer_wait_id: 0,
+                            extern_name: extern_binding
+                                .map(|(name, _)| name.as_bytes().to_vec())
+                                .unwrap_or_default(),
+                        };
+                        match crate::driver::register_channel(0, plan) {
+                            Ok(endpoint) => endpoint,
+                            Err(error) => {
+                                for attached in &cells {
+                                    attached.lock().unwrap().detach(instance_id);
+                                }
+                                return Ok(Err(format!(
+                                    "ptir: register channel {dense}: {error:#}"
+                                )));
+                            }
+                        }
+                    }
+                };
+                if let Err(error) = cell.lock().unwrap().attach_endpoint(endpoint) {
+                    for attached in &cells {
+                        attached.lock().unwrap().detach(instance_id);
+                    }
+                    return Ok(Err(format!("ptir: channel {dense} endpoint: {error}")));
+                }
+            }
+
             // All validation passed — stamp the container's roles onto the
             // cells (the bind point) and mint the instance identity (the
             // driver's persistent channel-arena key). The await FIFO is owned by
             // the PIPELINE now (W3.1), wired to the channels at submit.
-            for (cell, decl) in cells.iter().zip(decls.iter()) {
-                cell.lock().unwrap().bind(decl);
-            }
             // Capture the dense-index → global-channel-id map now that the cells
             // are validated (multi-pass channels: a global id is stable across
             // every pass a channel binds into).
@@ -491,15 +646,14 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
                 Ok(id) => id,
                 Err(e) => return Ok(Err(format!("ptir: register program: {e:#}"))),
             };
-            let instance_id = super::ptir_instance::next_instance_id();
             let mut instance_seeds = Vec::new();
             let mut seed_values = Vec::new();
             for (dense, cell) in cells.iter().enumerate() {
-                let mut cell = cell.lock().unwrap();
+                let cell = cell.lock().unwrap();
                 if !cell.seeded {
                     continue;
                 }
-                let bytes = match cell.take_seed() {
+                let bytes = match cell.peek_seed() {
                     Ok(bytes) => bytes,
                     Err(e) => return Ok(Err(format!("ptir: channel {dense} seed: {e}"))),
                 };
@@ -525,47 +679,27 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
                 seed_values,
             ) {
                 Ok(bound) => bound,
-                Err(e) => return Ok(Err(format!("ptir: bind instance: {e:#}"))),
-            };
-            let reader_count = cells
-                .iter()
-                .filter(|cell| cell.lock().unwrap().role == Some(HostRole::Reader))
-                .count();
-            if bound_instance.channel_bindings().len() != reader_count {
-                let _ = crate::driver::close_instance(&bound_instance);
-                return Ok(Err(format!(
-                    "ptir: driver returned {} reader bindings for {reader_count} channels",
-                    bound_instance.channel_bindings().len()
-                )));
-            }
-            for binding in bound_instance.channel_bindings() {
-                let Some(cell) = cells
-                    .iter()
-                    .find(|cell| cell.lock().unwrap().global_id == binding.channel_id)
-                else {
-                    let _ = crate::driver::close_instance(&bound_instance);
-                    return Ok(Err(format!(
-                        "ptir: driver returned unknown reader channel {}",
-                        binding.channel_id
-                    )));
-                };
-                if let Err(e) = cell.lock().unwrap().attach_reader_mirror(
-                    bound_instance.instance_id,
-                    bound_instance.binding.mirror_base,
-                    bound_instance.binding.word_base,
-                    binding.cell_bytes,
-                    binding.capacity,
-                    binding.mirror_offset,
-                    binding.tail_word_index,
-                    binding.poison_word_index,
-                ) {
+                Err(e) => {
                     for cell in &cells {
-                        cell.lock()
-                            .unwrap()
-                            .detach_reader_mirror(bound_instance.instance_id);
+                        cell.lock().unwrap().detach(instance_id);
                     }
-                    let _ = crate::driver::close_instance(&bound_instance);
-                    return Ok(Err(format!("ptir: bind reader mirror: {e}")));
+                    return Ok(Err(format!("ptir: bind instance: {e:#}")));
+                }
+            };
+            for cell in &cells {
+                let mut cell = cell.lock().unwrap();
+                if cell.role == Some(HostRole::Reader) {
+                    if let Err(error) = cell.publish_reader_mirror(instance_id) {
+                        drop(cell);
+                        let _ = crate::driver::close_instance(&bound_instance);
+                        for cell in &cells {
+                            cell.lock().unwrap().detach(instance_id);
+                        }
+                        return Ok(Err(format!("ptir: publish bound reader endpoint: {error}")));
+                    }
+                }
+                if cell.seeded {
+                    cell.commit_seed();
                 }
             }
             let res = self.ctx().table.push(ForwardPass {
@@ -601,12 +735,10 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
         }
 
         let mut pass = self.ctx().table.delete(this)?;
-        for cell in &pass.cells {
-            cell.lock()
-                .unwrap()
-                .detach_reader_mirror(pass.bound_instance.instance_id);
-        }
         let _ = crate::driver::close_instance(&pass.bound_instance);
+        for cell in &pass.cells {
+            cell.lock().unwrap().detach(pass.bound_instance.instance_id);
+        }
         // Device-geometry: reclaim EVERY leased physical page (all in-flight
         // grants + the fire-0 seed) back to the working set on pass drop.
         if let Some(devgeo) = pass.devgeo.as_mut() {
@@ -633,6 +765,7 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
     async fn new(&mut self) -> Anyhow<Resource<Pipeline>> {
         Ok(self.ctx().table.push(Pipeline {
             fires: Arc::new(Mutex::new(VecDeque::new())),
+            failure: Arc::new(Mutex::new(None)),
         })?)
     }
 
@@ -658,6 +791,10 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             // await the right FIFO — enforcing the same-pipeline constraint
             // (§3.4): every pass binding a channel must submit on one pipeline.
             let pipe_fires = self.ctx().table.get(&this)?.fires.clone();
+            let pipeline_failure = self.ctx().table.get(&this)?.failure.clone();
+            if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
+                return Ok(Err(format!("ptir: pipeline failed: {reason}")));
+            }
             if let Err(error) = self.wire_channels_to_pipeline(&fwd, &pipe_fires)? {
                 return Ok(Err(error));
             }
@@ -687,7 +824,7 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
                     p.committed_tokens,
                     fwd.rep(),
                     p.bound_instance.instance_id,
-                    drain_host_puts(&p.cells),
+                    snapshot_host_puts(&p.cells),
                     p.bound_instance.reserve_completion(),
                 )
             };
@@ -763,18 +900,28 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             // Fire through the scheduler → charlie's PTIR executor hook — and
             // return. NO await: the PendingFire carries the round-trip; the
             // channels' take/read finalize it.
-            if let Err(e) = crate::inference::submit_async(
-                req,
-                0,
-                instance_id,
-                host_puts,
-                proj.physical_page_ids,
-                proj.last_page_len,
-                Vec::new(),
-                None,
-                completion.clone(),
-            ) {
-                let reason = format!("ptir: submit failed: {e:#}");
+            let reserved = reserve_reader_capacity(&cells);
+            let submit_error = match &reserved {
+                Err(error) => Some(format!("channel reservation failed: {error}")),
+                Ok(()) => crate::inference::submit_async(
+                    req,
+                    0,
+                    instance_id,
+                    host_puts,
+                    proj.physical_page_ids,
+                    proj.last_page_len,
+                    Vec::new(),
+                    None,
+                    completion.clone(),
+                )
+                .err()
+                .map(|error| format!("{error:#}")),
+            };
+            if let Some(error) = submit_error {
+                if reserved.is_ok() {
+                    rollback_reader_capacity(&cells);
+                }
+                let reason = format!("ptir: submit failed: {error}");
                 let mut arena = arena_arc.lock().unwrap();
                 match self.ctx().table.get_mut(&ws_res) {
                     Ok(ws) => {
@@ -801,6 +948,7 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             // fire's post-state (the run-ahead overlap). A failed fire fails
             // the pass instead of rewinding.
             self.ctx().table.get_mut(&fwd)?.committed_tokens = next_committed;
+            commit_host_puts(&cells);
 
             pipe_fires
                 .lock()
@@ -814,6 +962,7 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
                     fwd_rep,
                     instance_id,
                     cells,
+                    failure: pipeline_failure,
                 }));
             Ok(Ok(()))
         }
@@ -867,6 +1016,10 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
         // Point this pipeline's FIFO at the move so a later `take`/`read` on any
         // channel fed by this pipeline drains it in submit order.
         let pipe_fires = self.ctx().table.get(&this)?.fires.clone();
+        let pipeline_failure = self.ctx().table.get(&this)?.failure.clone();
+        if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
+            return Ok(Err(format!("ptir: pipeline failed: {reason}")));
+        }
 
         let cells = kv_move_dst_pages
             .into_iter()
@@ -890,7 +1043,10 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
         pipe_fires
             .lock()
             .unwrap()
-            .push_back(PendingOp::Move(PendingMove { completion }));
+            .push_back(PendingOp::Move(PendingMove {
+                completion,
+                failure: pipeline_failure,
+            }));
         Ok(Ok(()))
     }
 
@@ -945,7 +1101,12 @@ impl InstanceState {
             PendingOp::Fire(fire) => self.finalize_fire(fire).await,
             PendingOp::Move(mv) => {
                 if let Err(e) = mv.completion.await {
-                    tracing::warn!("ptir kv-move (copy_into) failed: {e:#}")
+                    let reason = format!("ptir kv-move (copy_into) failed: {e:#}");
+                    let mut failure = mv.failure.lock().unwrap();
+                    if failure.is_none() {
+                        *failure = Some(reason.clone());
+                    }
+                    tracing::warn!("{reason}");
                 }
                 Ok(())
             }
@@ -965,9 +1126,11 @@ impl InstanceState {
             fwd_rep,
             instance_id,
             cells,
+            failure,
         } = fire;
+        let prior_failure = failure.lock().unwrap().clone();
         let result = completion.await;
-        let success = result.is_ok();
+        let success = result.is_ok() && prior_failure.is_none();
 
         {
             let arena_arc = crate::arena::get(0, 0);
@@ -1010,26 +1173,42 @@ impl InstanceState {
             }
         }
 
-        match result {
+        if let Some(reason) = prior_failure {
+            poison_readers(&cells, &reason);
+            self.fail_pass(fwd_rep, &reason);
+            return Ok(());
+        }
+
+        let failure_reason = match result {
             Ok(()) => match publish_reader_mirrors(&cells, instance_id) {
                 Ok(true) => {
                     let reason = "ptir: driver published poisoned output channel".to_string();
                     poison_readers(&cells, &reason);
                     self.fail_pass(fwd_rep, &reason);
+                    Some(reason)
                 }
                 Ok(false) => {
                     self.reclaim_device_geometry_grants(fwd_rep, instance_id);
+                    None
                 }
                 Err(e) => {
                     let reason = format!("ptir: mirror publication failed: {e}");
                     poison_readers(&cells, &reason);
                     self.fail_pass(fwd_rep, &reason);
+                    Some(reason)
                 }
             },
             Err(e) => {
                 let reason = format!("ptir: forward failed: {e:#}");
                 poison_readers(&cells, &reason);
                 self.fail_pass(fwd_rep, &reason);
+                Some(reason)
+            }
+        };
+        if let Some(reason) = failure_reason {
+            let mut domain = failure.lock().unwrap();
+            if domain.is_none() {
+                *domain = Some(reason);
             }
         }
         Ok(())
@@ -1072,6 +1251,10 @@ impl InstanceState {
         // passes binding a channel must submit on ONE pipeline — the entire
         // ordering/FIFO correctness argument).
         let pipe_fires = self.ctx().table.get(&this)?.fires.clone();
+        let pipeline_failure = self.ctx().table.get(&this)?.failure.clone();
+        if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
+            return Ok(Err(format!("ptir: pipeline failed: {reason}")));
+        }
         if let Err(e) = self.wire_channels_to_pipeline(&fwd, &pipe_fires)? {
             return Ok(Err(e));
         }
@@ -1176,7 +1359,7 @@ impl InstanceState {
             }
 
             let p = self.ctx().table.get_mut(&fwd)?;
-            let host_puts = drain_host_puts(&p.cells);
+            let host_puts = snapshot_host_puts(&p.cells);
             let completion = p.bound_instance.reserve_completion();
             (
                 host_puts,
@@ -1192,17 +1375,27 @@ impl InstanceState {
 
         let req = crate::driver::LaunchPlan::default();
         let last_page_len = phys_pages.last().map(|_| page_size).unwrap_or(0);
-        if let Err(e) = crate::inference::submit_prebuilt_async(
-            req,
-            0,
-            instance_id,
-            host_puts,
-            phys_pages,
-            last_page_len,
-            Vec::new(),
-            completion.clone(),
-        ) {
-            let reason = format!("ptir: device-geometry submit failed: {e:#}");
+        let reserved = reserve_reader_capacity(&cells);
+        let submit_error = match &reserved {
+            Err(error) => Some(format!("channel reservation failed: {error}")),
+            Ok(()) => crate::inference::submit_prebuilt_async(
+                req,
+                0,
+                instance_id,
+                host_puts,
+                phys_pages,
+                last_page_len,
+                Vec::new(),
+                completion.clone(),
+            )
+            .err()
+            .map(|error| format!("{error:#}")),
+        };
+        if let Some(error) = submit_error {
+            if reserved.is_ok() {
+                rollback_reader_capacity(&cells);
+            }
+            let reason = format!("ptir: device-geometry submit failed: {error}");
             arena_arc.lock().unwrap().txn_abort(arena_txn);
             if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
                 ws.abort_writes(write_txn);
@@ -1210,6 +1403,7 @@ impl InstanceState {
             self.ctx().table.get_mut(&fwd)?.failed = Some(reason.clone());
             return Ok(Err(reason));
         }
+        commit_host_puts(&cells);
 
         pipe_fires
             .lock()
@@ -1226,6 +1420,7 @@ impl InstanceState {
                 fwd_rep,
                 instance_id,
                 cells,
+                failure: pipeline_failure,
             }));
         Ok(Ok(()))
     }

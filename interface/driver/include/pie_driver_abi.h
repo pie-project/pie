@@ -51,6 +51,61 @@
 #define PIE_RS_FLAG_FOLD 2
 
 /**
+ * Concrete F32 channel element type.
+ */
+#define PIE_CHANNEL_DTYPE_F32 0
+
+/**
+ * Concrete I32 channel element type.
+ */
+#define PIE_CHANNEL_DTYPE_I32 1
+
+/**
+ * Concrete U32 channel element type.
+ */
+#define PIE_CHANNEL_DTYPE_U32 2
+
+/**
+ * Concrete boolean channel element type.
+ */
+#define PIE_CHANNEL_DTYPE_BOOL 3
+
+/**
+ * Driver-resolved activation channel element type.
+ */
+#define PIE_CHANNEL_DTYPE_ACT 4
+
+/**
+ * Channel has no host endpoint.
+ */
+#define PIE_CHANNEL_HOST_ROLE_NONE 0
+
+/**
+ * Host produces values consumed by the device program.
+ */
+#define PIE_CHANNEL_HOST_ROLE_WRITER 1
+
+/**
+ * Device program produces values consumed by the host.
+ */
+#define PIE_CHANNEL_HOST_ROLE_READER 2
+
+/**
+ * Channel is private to one bound instance.
+ */
+#define PIE_CHANNEL_EXTERN_NONE 0
+
+/**
+ * Bound program consumes an externally produced channel.
+ */
+#define PIE_CHANNEL_EXTERN_IMPORT 1
+
+/**
+ * Bound program produces an externally consumed channel.
+ */
+#define PIE_CHANNEL_EXTERN_EXPORT 2
+
+/**
  * Opaque embedded-driver handle.
  */
 typedef void PieDriver;
@@ -132,22 +187,71 @@ typedef struct PieProgramDesc {
 } PieProgramDesc;
 
 /**
- * Per-channel runtime wait ids registered at bind time.
- */
-typedef struct PieChannelWait {
-  uint64_t reader_wait_id;
-  uint64_t writer_wait_id;
-} PieChannelWait;
-
-/**
- * Borrowed immutable slice of [`PieChannelWait`].
+ * Borrowed immutable `u32` slice.
  *
  * `ptr` may be null only when `len == 0`.
  */
-typedef struct PieChannelWaitSlice {
-  const struct PieChannelWait *ptr;
+typedef struct PieU32Slice {
+  const uint32_t *ptr;
   size_t len;
-} PieChannelWaitSlice;
+} PieU32Slice;
+
+/**
+ * Persistent channel endpoint registration descriptor.
+ */
+typedef struct PieChannelDesc {
+  uint32_t abi_version;
+  /**
+   * Must be zero in ABI v1.
+   */
+  uint32_t reserved0;
+  uint64_t channel_id;
+  struct PieU32Slice shape;
+  /**
+   * One of `PIE_CHANNEL_DTYPE_*`.
+   */
+  uint8_t dtype;
+  /**
+   * One of `PIE_CHANNEL_HOST_ROLE_*`.
+   */
+  uint8_t host_role;
+  /**
+   * Must be 0 or 1.
+   */
+  uint8_t seeded;
+  /**
+   * One of `PIE_CHANNEL_EXTERN_*`.
+   */
+  uint8_t extern_dir;
+  uint32_t capacity;
+  /**
+   * Must be zero in ABI v1.
+   */
+  uint32_t reserved1;
+  uint64_t reader_wait_id;
+  uint64_t writer_wait_id;
+  /**
+   * Canonical extern binding name. Empty for private channels.
+   */
+  struct PieBytes extern_name;
+} PieChannelDesc;
+
+/**
+ * Stable driver-owned host endpoint returned by channel registration.
+ */
+typedef struct PieChannelEndpointBinding {
+  uint64_t channel_id;
+  uint64_t mirror_base;
+  uint64_t word_base;
+  uint64_t mirror_bytes;
+  uint64_t word_bytes;
+  uint32_t cell_bytes;
+  uint32_t capacity;
+  uint32_t head_word_index;
+  uint32_t tail_word_index;
+  uint32_t poison_word_index;
+  uint32_t closed_word_index;
+} PieChannelEndpointBinding;
 
 /**
  * Borrowed immutable `u64` slice.
@@ -189,64 +293,47 @@ typedef struct PieInstanceDesc {
   uint64_t program_id;
   uint64_t requested_instance_id;
   uint64_t pacing_wait_id;
-  struct PieChannelWaitSlice channel_waits;
   struct PieU64Slice channel_ids;
   struct PieChannelValueDescSlice seed_values;
 } PieInstanceDesc;
 
 /**
- * Stable bound layout for one host-visible channel.
- */
-typedef struct PieChannelBinding {
-  uint64_t channel_id;
-  uint32_t cell_bytes;
-  uint32_t capacity;
-  uint64_t mirror_offset;
-  uint32_t head_word_index;
-  uint32_t tail_word_index;
-  uint32_t poison_word_index;
-  uint32_t reserved;
-} PieChannelBinding;
-
-/**
- * Slice of driver-owned [`PieChannelBinding`] records.
- *
- * The pointer remains valid until `close_instance` for the bound instance.
- * `ptr` may be null only when `len == 0`.
- */
-typedef struct PieChannelBindingSlice {
-  const struct PieChannelBinding *ptr;
-  size_t len;
-} PieChannelBindingSlice;
-
-/**
- * Stable addresses and counts returned from `*_bind_instance`.
+ * Driver-assigned identity returned from `*_bind_instance`.
  */
 typedef struct PieInstanceBinding {
   uint64_t instance_id;
-  uint64_t frame_base;
-  uint64_t mirror_base;
-  uint64_t word_base;
-  uint32_t channel_count;
-  uint32_t word_count;
-  uint64_t frame_bytes;
-  uint64_t mirror_bytes;
-  uint64_t word_bytes;
-  /**
-   * Driver-owned channel layout table, valid until `close_instance`.
-   */
-  struct PieChannelBindingSlice channels;
 } PieInstanceBinding;
 
 /**
- * Borrowed immutable `u32` slice.
- *
- * `ptr` may be null only when `len == 0`.
+ * Terminal completion outcome published by the native driver.
  */
-typedef struct PieU32Slice {
-  const uint32_t *ptr;
+typedef uint32_t PieTerminalOutcome;
+
+/**
+ * Host-visible terminal control cell.
+ *
+ * The `outcome` word is published with release semantics by the driver and
+ * read with acquire semantics by the runtime.
+ */
+typedef struct PieTerminalCell {
+  PieTerminalOutcome outcome;
+  /**
+   * Must be zero in ABI v1.
+   */
+  uint32_t reserved0;
+} PieTerminalCell;
+
+/**
+ * Borrowed immutable slice of terminal-cell pointers.
+ *
+ * The slice storage may be null only when `len == 0`. Each element must point
+ * at a distinct, properly aligned [`PieTerminalCell`] that remains stable until
+ * the corresponding accepted operation retires.
+ */
+typedef struct PieTerminalCellPtrSlice {
+  struct PieTerminalCell *const *ptr;
   size_t len;
-} PieU32Slice;
+} PieTerminalCellPtrSlice;
 
 /**
  * Borrowed immutable `u8` slice.
@@ -283,6 +370,10 @@ typedef struct PieLaunchDesc {
    * Bound instance ids, one per fire/program in scheduler order.
    */
   struct PieU64Slice instance_ids;
+  /**
+   * Stable terminal control cell addresses, one per `instance_ids` member.
+   */
+  struct PieTerminalCellPtrSlice terminal_cells;
   struct PieU32Slice token_ids;
   struct PieU32Slice position_ids;
   struct PieU32Slice kv_page_indices;
@@ -347,6 +438,11 @@ typedef struct PieLaunchDesc {
 typedef struct PieCompletion {
   uint64_t wait_id;
   uint64_t target_epoch;
+  /**
+   * Stable terminal control cell for value-less operations. Launch batches
+   * use the per-member `PieLaunchDesc::terminal_cells` instead.
+   */
+  struct PieTerminalCell *terminal_cell;
 } PieCompletion;
 
 /**
@@ -486,6 +582,21 @@ typedef struct PiePoolResizeDesc {
  */
 #define PIE_MEMORY_DOMAIN_METAL_PRIVATE 4
 
+/**
+ * The operation has not reached a terminal state yet.
+ */
+#define PIE_TERMINAL_OUTCOME_PENDING 0
+
+/**
+ * The operation completed successfully.
+ */
+#define PIE_TERMINAL_OUTCOME_SUCCESS 1
+
+/**
+ * The operation completed unsuccessfully.
+ */
+#define PIE_TERMINAL_OUTCOME_FAILED 2
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -496,6 +607,10 @@ extern PieDriver *pie_cuda_create(const struct PieDriverCreateDesc *desc,
 extern int32_t pie_cuda_register_program(PieDriver *driver,
                                          const struct PieProgramDesc *program,
                                          uint64_t *program_id);
+
+extern int32_t pie_cuda_register_channel(PieDriver *driver,
+                                         const struct PieChannelDesc *channel,
+                                         struct PieChannelEndpointBinding *binding);
 
 extern int32_t pie_cuda_bind_instance(PieDriver *driver,
                                       const struct PieInstanceDesc *instance,
@@ -519,6 +634,8 @@ extern int32_t pie_cuda_resize_pool(PieDriver *driver,
 
 extern int32_t pie_cuda_close_instance(PieDriver *driver, uint64_t instance_id);
 
+extern int32_t pie_cuda_close_channel(PieDriver *driver, uint64_t channel_id);
+
 extern void pie_cuda_destroy(PieDriver *driver);
 
 extern PieDriver *pie_metal_create(const struct PieDriverCreateDesc *desc,
@@ -527,6 +644,10 @@ extern PieDriver *pie_metal_create(const struct PieDriverCreateDesc *desc,
 extern int32_t pie_metal_register_program(PieDriver *driver,
                                           const struct PieProgramDesc *program,
                                           uint64_t *program_id);
+
+extern int32_t pie_metal_register_channel(PieDriver *driver,
+                                          const struct PieChannelDesc *channel,
+                                          struct PieChannelEndpointBinding *binding);
 
 extern int32_t pie_metal_bind_instance(PieDriver *driver,
                                        const struct PieInstanceDesc *instance,
@@ -549,6 +670,8 @@ extern int32_t pie_metal_resize_pool(PieDriver *driver,
                                      struct PieCompletion completion);
 
 extern int32_t pie_metal_close_instance(PieDriver *driver, uint64_t instance_id);
+
+extern int32_t pie_metal_close_channel(PieDriver *driver, uint64_t channel_id);
 
 extern void pie_metal_destroy(PieDriver *driver);
 

@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <span>
 
+#include <pie_driver_abi.h>
+
 namespace pie_native {
 
 template <typename T>
@@ -47,6 +49,7 @@ inline Slice<std::uint8_t> slice_from_u8(const std::uint8_t* p, std::size_t n) n
 }
 
 struct LaunchView {
+    Slice<PieTerminalCell*> terminal_cells;
     Slice<std::uint32_t> token_ids;
     Slice<std::uint32_t> position_ids;
 

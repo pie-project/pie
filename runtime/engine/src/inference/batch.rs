@@ -119,6 +119,7 @@ pub(crate) fn build_batch_request(
         return LaunchSubmission {
             plan: req.request.clone(),
             instance_ids: vec![req.instance_id],
+            terminal_cells: vec![req.completion.terminal_cell_ptr()],
             host_put_values: req.host_puts.clone(),
             host_put_indptr: vec![0, req.host_puts.len() as u32],
         };
@@ -131,11 +132,13 @@ pub(crate) fn build_batch_request(
     crate::probe_fire!(stats.fire.execute.batch_build_us, {
         let mut batch_req = request::new_batched_forward_request_with_capacity(requests.len());
         let mut instance_ids = Vec::with_capacity(requests.len());
+        let mut terminal_cells = Vec::with_capacity(requests.len());
         let mut host_put_values = Vec::new();
         let mut host_put_indptr = Vec::with_capacity(requests.len() + 1);
         host_put_indptr.push(0);
         for req in requests {
             instance_ids.push(req.instance_id);
+            terminal_cells.push(req.completion.terminal_cell_ptr());
             request::append_request_with_options(
                 &mut batch_req,
                 &req.request,
@@ -150,6 +153,7 @@ pub(crate) fn build_batch_request(
         LaunchSubmission {
             plan: batch_req,
             instance_ids,
+            terminal_cells,
             host_put_values,
             host_put_indptr,
         }

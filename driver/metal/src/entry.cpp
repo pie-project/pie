@@ -1,6 +1,7 @@
 #include "entry.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
@@ -35,11 +36,16 @@ struct InstanceRecord {
     std::uint64_t program_id = 0;
     std::uint64_t program_hash = 0;
     std::vector<std::uint64_t> channel_ids;
-    std::vector<PieChannelWait> channel_waits;
-    std::vector<PieChannelBinding> channel_bindings;
+    std::uint64_t fire_seq = 0;
+};
+
+struct ChannelRecord {
+    PieChannelDesc desc{};
+    std::vector<std::uint32_t> shape;
+    std::string extern_name;
     std::vector<std::uint8_t> mirror;
     std::vector<std::uint64_t> words;
-    std::uint64_t fire_seq = 0;
+    std::unordered_map<std::uint64_t, std::uint8_t> attachments;
 };
 
 struct ModelFacts {
@@ -136,24 +142,8 @@ std::string build_caps_json(const pie_metal_driver::Config& cfg,
     return caps.dump();
 }
 
-constexpr std::uint32_t pacing_word_index() noexcept { return 0; }
-constexpr std::uint32_t head_word_index(std::uint32_t channel) noexcept {
-    return 1 + 3 * channel;
-}
-constexpr std::uint32_t tail_word_index(std::uint32_t channel) noexcept {
-    return 2 + 3 * channel;
-}
-constexpr std::uint32_t poison_word_index(std::uint32_t channel) noexcept {
-    return 3 + 3 * channel;
-}
-constexpr std::uint32_t word_count(std::uint32_t channel_count) noexcept {
-    return 1 + 3 * channel_count;
-}
-
 class MetalDriver {
   public:
-    explicit MetalDriver(const PieDriverCreateDesc& desc) : runtime_(desc.runtime) {}
-
     int initialize(const std::string& config_path) {
         cfg_ = pie_metal_driver::load_config(config_path);
         facts_ = read_model_facts(cfg_.model.hf_path);
@@ -199,18 +189,62 @@ class MetalDriver {
         return PIE_STATUS_OK;
     }
 
+    int register_channel(const PieChannelDesc& channel,
+                         PieChannelEndpointBinding* binding) {
+        if (channels_.find(channel.channel_id) != channels_.end()) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        pie_native::PtirChannelDecl geometry;
+        geometry.dtype = channel.dtype;
+        geometry.dims.assign(channel.shape.ptr, channel.shape.ptr + channel.shape.len);
+        const std::uint32_t cell_bytes = geometry.cell_bytes();
+        if (cell_bytes == 0) return PIE_STATUS_INVALID_ARGUMENT;
+        ChannelRecord record;
+        record.desc = channel;
+        record.shape.assign(channel.shape.ptr, channel.shape.ptr + channel.shape.len);
+        record.desc.shape.ptr = record.shape.data();
+        if (channel.extern_name.len != 0) {
+            record.extern_name.assign(
+                reinterpret_cast<const char*>(channel.extern_name.ptr),
+                channel.extern_name.len);
+        }
+        record.desc.extern_name.ptr =
+            reinterpret_cast<const std::uint8_t*>(record.extern_name.data());
+        record.mirror.assign(
+            static_cast<std::size_t>(cell_bytes) * (channel.capacity + 1), 0);
+        record.words.assign(4, 0);
+        auto [it, inserted] =
+            channels_.emplace(channel.channel_id, std::move(record));
+        if (!inserted) return PIE_STATUS_INVALID_ARGUMENT;
+        ChannelRecord& stored = it->second;
+        stored.desc.shape.ptr = stored.shape.data();
+        stored.desc.extern_name.ptr =
+            reinterpret_cast<const std::uint8_t*>(stored.extern_name.data());
+        *binding = PieChannelEndpointBinding{
+            .channel_id = channel.channel_id,
+            .mirror_base = reinterpret_cast<std::uint64_t>(stored.mirror.data()),
+            .word_base = reinterpret_cast<std::uint64_t>(stored.words.data()),
+            .mirror_bytes = stored.mirror.size(),
+            .word_bytes = stored.words.size() * sizeof(std::uint64_t),
+            .cell_bytes = static_cast<std::uint32_t>(cell_bytes),
+            .capacity = channel.capacity,
+            .head_word_index = 0,
+            .tail_word_index = 1,
+            .poison_word_index = 2,
+            .closed_word_index = 3,
+        };
+        return PIE_STATUS_OK;
+    }
+
     int bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding) {
         if (programs_.find(instance.program_id) == programs_.end())
             return PIE_STATUS_INVALID_ARGUMENT;
         const std::uint64_t instance_id =
             instance.requested_instance_id != 0 ? instance.requested_instance_id : next_instance_id_++;
-        InstanceRecord record;
-        record.instance_id = instance_id;
-        record.program_id = instance.program_id;
-        record.program_hash = programs_.at(instance.program_id).program_hash;
+        if (instances_.find(instance_id) != instances_.end())
+            return PIE_STATUS_INVALID_ARGUMENT;
         const ProgramRecord& program = programs_.at(instance.program_id);
-        if (instance.channel_ids.len != program.channels.size() ||
-            instance.channel_waits.len != program.channels.size()) {
+        if (instance.channel_ids.len != program.channels.size()) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
         {
@@ -234,83 +268,69 @@ class MetalDriver {
                 const std::size_t channel =
                     static_cast<std::size_t>(id - instance.channel_ids.ptr);
                 if (!program.channels[channel].seeded ||
-                    seed.bytes.len != program.channels[channel].cell_bytes()) {
+                    seed.bytes.len != program.channels[channel].cell_bytes() ||
+                    seed.bytes.ptr == nullptr) {
                     return PIE_STATUS_INVALID_ARGUMENT;
                 }
             }
         }
+        for (std::size_t i = 0; i < instance.channel_ids.len; ++i) {
+            auto endpoint = channels_.find(instance.channel_ids.ptr[i]);
+            if (endpoint == channels_.end()) return PIE_STATUS_INVALID_ARGUMENT;
+            const auto& decl = program.channels[i];
+            const auto& endpoint_desc = endpoint->second.desc;
+            if (endpoint_desc.dtype != decl.dtype ||
+                endpoint_desc.capacity != decl.capacity ||
+                endpoint_desc.host_role != decl.host_role ||
+                endpoint_desc.seeded != static_cast<std::uint8_t>(decl.seeded) ||
+                endpoint->second.shape != decl.dims ||
+                (decl.extern_dir == PIE_CHANNEL_EXTERN_NONE
+                     ? endpoint_desc.extern_dir != PIE_CHANNEL_EXTERN_NONE ||
+                           !endpoint->second.attachments.empty()
+                     : endpoint_desc.extern_dir == PIE_CHANNEL_EXTERN_NONE ||
+                           endpoint->second.extern_name != decl.extern_name ||
+                           std::any_of(
+                               endpoint->second.attachments.begin(),
+                               endpoint->second.attachments.end(),
+                               [&](const auto& attachment) {
+                                   return attachment.second == decl.extern_dir;
+                               }))) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+        InstanceRecord record;
+        record.instance_id = instance_id;
+        record.program_id = instance.program_id;
+        record.program_hash = program.program_hash;
         record.channel_ids.assign(
             instance.channel_ids.ptr,
             instance.channel_ids.ptr + instance.channel_ids.len);
-        record.channel_waits.assign(
-            instance.channel_waits.ptr,
-            instance.channel_waits.ptr + instance.channel_waits.len);
-        std::uint64_t mirror_offset = 0;
-        record.channel_bindings.reserve(record.channel_ids.size());
-        std::uint32_t reader_rank = 0;
-        for (std::size_t i = 0; i < record.channel_ids.size(); ++i) {
-            const auto& decl = program.channels[i];
-            if (decl.host_role != pie_native::PTIR_HOST_READER) continue;
-            const std::uint32_t cell_bytes = decl.cell_bytes();
-            record.channel_bindings.push_back(PieChannelBinding{
-                .channel_id = record.channel_ids[i],
-                .cell_bytes = cell_bytes,
-                .capacity = decl.capacity,
-                .mirror_offset = mirror_offset,
-                .head_word_index = head_word_index(reader_rank),
-                .tail_word_index = tail_word_index(reader_rank),
-                .poison_word_index = poison_word_index(reader_rank),
-                .reserved = 0,
-            });
-            mirror_offset +=
-                static_cast<std::uint64_t>(cell_bytes) * (decl.capacity + 1);
-            ++reader_rank;
-        }
-        record.mirror.assign(static_cast<std::size_t>(mirror_offset), 0);
-        record.words.assign(word_count(static_cast<std::uint32_t>(record.channel_bindings.size())), 0);
         for (std::size_t s = 0; s < instance.seed_values.len; ++s) {
             const PieChannelValueDesc& seed = instance.seed_values.ptr[s];
-            for (const PieChannelBinding& channel : record.channel_bindings) {
-                if (channel.channel_id != seed.channel_id) continue;
-                const std::size_t n = std::min<std::size_t>(
-                    channel.cell_bytes, seed.bytes.len);
-                if (n > 0 && seed.bytes.ptr != nullptr) {
-                    std::memcpy(record.mirror.data() + channel.mirror_offset,
-                                seed.bytes.ptr, n);
-                    record.words[channel.tail_word_index] = 1;
-                }
-                break;
-            }
+            ChannelRecord& endpoint = channels_.at(seed.channel_id);
+            std::memcpy(endpoint.mirror.data(), seed.bytes.ptr, seed.bytes.len);
+            endpoint.words[1] = 1;
+        }
+        for (std::size_t i = 0; i < record.channel_ids.size(); ++i) {
+            channels_.at(record.channel_ids[i])
+                .attachments.emplace(instance_id, program.channels[i].extern_dir);
         }
         if (binding != nullptr) {
             std::memset(binding, 0, sizeof(*binding));
             binding->instance_id = instance_id;
-            binding->mirror_base = reinterpret_cast<std::uint64_t>(record.mirror.data());
-            binding->word_base = reinterpret_cast<std::uint64_t>(record.words.data());
-            binding->channel_count =
-                static_cast<std::uint32_t>(record.channel_bindings.size());
-            binding->word_count = word_count(binding->channel_count);
-            binding->mirror_bytes = record.mirror.size();
-            binding->word_bytes = record.words.size() * sizeof(std::uint64_t);
-            binding->channels.ptr = record.channel_bindings.data();
-            binding->channels.len = record.channel_bindings.size();
         }
         instances_[instance_id] = std::move(record);
         return PIE_STATUS_OK;
     }
 
     int launch(const PieLaunchDesc& launch, PieCompletion completion) {
+        static_cast<void>(completion);
         for (std::size_t i = 0; i < launch.instance_ids.len; ++i) {
-            if (instances_.find(launch.instance_ids.ptr[i]) == instances_.end())
+            const auto instance_it = instances_.find(launch.instance_ids.ptr[i]);
+            if (instance_it == instances_.end()) {
                 return PIE_STATUS_INVALID_ARGUMENT;
-        }
-        if (launch.instance_ids.len == 0) {
-            notify_inline(completion);
-            return PIE_STATUS_OK;
-        }
-        for (std::size_t i = 0; i < launch.instance_ids.len; ++i) {
-            const InstanceRecord& instance =
-                instances_.at(launch.instance_ids.ptr[i]);
+            }
+            const InstanceRecord& instance = instance_it->second;
             const ProgramRecord& program = programs_.at(instance.program_id);
             std::unordered_set<std::uint64_t> put_ids;
             const std::uint32_t lo = launch.host_put_indptr.len == 0
@@ -339,68 +359,46 @@ class MetalDriver {
                 }
             }
         }
-        const bool have_host_puts =
-            launch.host_put_indptr.ptr != nullptr &&
-            launch.host_put_indptr.len == launch.instance_ids.len + 1 &&
-            (launch.ptir_host_put_values.len == 0 ||
-             launch.ptir_host_put_values.ptr != nullptr);
-        for (std::size_t i = 0; i < launch.instance_ids.len; ++i) {
-            InstanceRecord& instance = instances_.at(launch.instance_ids.ptr[i]);
-            ++instance.fire_seq;
-            instance.words[pacing_word_index()] = instance.fire_seq;
-            if (!have_host_puts) continue;
-            const std::uint32_t lo = launch.host_put_indptr.ptr[i];
-            const std::uint32_t hi = launch.host_put_indptr.ptr[i + 1];
-            for (std::uint32_t e = lo; e < hi; ++e) {
-                const PieChannelValueDesc& value = launch.ptir_host_put_values.ptr[e];
-                for (std::size_t c = 0; c < instance.channel_bindings.size(); ++c) {
-                    const PieChannelBinding& channel = instance.channel_bindings[c];
-                    if (channel.channel_id != value.channel_id) continue;
-                    if (value.bytes.ptr != nullptr && !instance.mirror.empty()) {
-                        const std::size_t n = std::min<std::size_t>(
-                            channel.cell_bytes, value.bytes.len);
-                        std::memcpy(instance.mirror.data() + channel.mirror_offset,
-                                    value.bytes.ptr, n);
-                    }
-                    instance.words[channel.head_word_index] = 0;
-                    instance.words[channel.tail_word_index] = 1;
-                    instance.words[channel.poison_word_index] = 0;
-                    break;
-                }
-            }
-        }
-        notify_inline(completion);
-        return PIE_STATUS_OK;
+        return PIE_STATUS_UNSUPPORTED;
     }
 
     int copy_kv(const PieKvCopyDesc&, PieCompletion completion) {
-        notify_inline(completion);
-        return PIE_STATUS_OK;
+        static_cast<void>(completion);
+        return PIE_STATUS_UNSUPPORTED;
     }
     int copy_state(const PieStateCopyDesc&, PieCompletion completion) {
-        notify_inline(completion);
-        return PIE_STATUS_OK;
+        static_cast<void>(completion);
+        return PIE_STATUS_UNSUPPORTED;
     }
     int resize_pool(const PiePoolResizeDesc&, PieCompletion completion) {
-        notify_inline(completion);
-        return PIE_STATUS_OK;
+        static_cast<void>(completion);
+        return PIE_STATUS_UNSUPPORTED;
     }
 
     int close_instance(std::uint64_t instance_id) {
         auto it = instances_.find(instance_id);
         if (it == instances_.end()) return PIE_STATUS_CLOSED;
+        for (const std::uint64_t channel_id : it->second.channel_ids) {
+            auto channel = channels_.find(channel_id);
+            if (channel != channels_.end()) {
+                channel->second.attachments.erase(instance_id);
+            }
+        }
         instances_.erase(it);
         return PIE_STATUS_OK;
     }
 
-  private:
-    void notify_inline(PieCompletion completion) const {
-        if (runtime_.notify != nullptr && completion.wait_id != 0) {
-            runtime_.notify(runtime_.ctx, completion.wait_id, completion.target_epoch);
-        }
+    int close_channel(std::uint64_t channel_id) {
+        auto it = channels_.find(channel_id);
+        if (it == channels_.end()) return PIE_STATUS_CLOSED;
+        if (!it->second.attachments.empty()) return PIE_STATUS_INVALID_ARGUMENT;
+        std::atomic_ref<std::uint64_t>(it->second.words[3]).store(
+            1, std::memory_order_release);
+        channels_.erase(it);
+        return PIE_STATUS_OK;
     }
 
-    PieRuntimeCallbacks runtime_{};
+  private:
     pie_metal_driver::Config cfg_{};
     ModelFacts facts_{};
     std::string caps_json_;
@@ -409,6 +407,7 @@ class MetalDriver {
     std::unordered_map<std::uint64_t, ProgramRecord> programs_;
     std::unordered_map<std::uint64_t, std::uint64_t> program_ids_by_hash_;
     std::unordered_map<std::uint64_t, InstanceRecord> instances_;
+    std::unordered_map<std::uint64_t, ChannelRecord> channels_;
 };
 
 PieDriver* create_driver_impl(const PieDriverCreateDesc* desc, PieDriverCaps* caps) {
@@ -416,7 +415,7 @@ PieDriver* create_driver_impl(const PieDriverCreateDesc* desc, PieDriverCaps* ca
     const std::string config_path(
         reinterpret_cast<const char*>(desc->config_bytes.ptr),
         desc->config_bytes.len);
-    auto driver = std::make_unique<MetalDriver>(*desc);
+    auto driver = std::make_unique<MetalDriver>();
     const int rc = driver->initialize(config_path);
     if (rc != PIE_STATUS_OK) return nullptr;
     driver->fill_caps(caps);
@@ -458,6 +457,20 @@ extern "C" int32_t pie_metal_register_program(PieDriver* driver,
     }
 }
 
+extern "C" int32_t pie_metal_register_channel(
+    PieDriver* driver,
+    const PieChannelDesc* channel,
+    PieChannelEndpointBinding* binding) {
+    const int status = pie_native::abi::validate_channel_desc(channel, binding);
+    if (status != PIE_STATUS_OK) return status;
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_driver(driver)->register_channel(*channel, binding);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
 extern "C" int32_t pie_metal_bind_instance(PieDriver* driver,
                                            const PieInstanceDesc* instance,
                                            PieInstanceBinding* binding) {
@@ -476,6 +489,9 @@ extern "C" int32_t pie_metal_launch(PieDriver* driver,
                                     PieCompletion completion) {
     const int status = pie_native::abi::validate_launch_desc(launch);
     if (status != PIE_STATUS_OK) return status;
+    const int completion_status =
+        pie_native::abi::validate_completion(completion, false);
+    if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_driver(driver)->launch(*launch, completion);
@@ -489,6 +505,9 @@ extern "C" int32_t pie_metal_copy_kv(PieDriver* driver,
                                      PieCompletion completion) {
     const int status = pie_native::abi::validate_kv_copy_desc(copy);
     if (status != PIE_STATUS_OK) return status;
+    const int completion_status =
+        pie_native::abi::validate_completion(completion, true);
+    if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_driver(driver)->copy_kv(*copy, completion);
@@ -502,6 +521,9 @@ extern "C" int32_t pie_metal_copy_state(PieDriver* driver,
                                         PieCompletion completion) {
     const int status = pie_native::abi::validate_state_copy_desc(copy);
     if (status != PIE_STATUS_OK) return status;
+    const int completion_status =
+        pie_native::abi::validate_completion(completion, true);
+    if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_driver(driver)->copy_state(*copy, completion);
@@ -515,6 +537,9 @@ extern "C" int32_t pie_metal_resize_pool(PieDriver* driver,
                                          PieCompletion completion) {
     const int status = pie_native::abi::validate_pool_resize_desc(resize);
     if (status != PIE_STATUS_OK) return status;
+    const int completion_status =
+        pie_native::abi::validate_completion(completion, true);
+    if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_driver(driver)->resize_pool(*resize, completion);
@@ -528,6 +553,16 @@ extern "C" int32_t pie_metal_close_instance(PieDriver* driver,
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_driver(driver)->close_instance(instance_id);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" int32_t pie_metal_close_channel(PieDriver* driver,
+                                           std::uint64_t channel_id) {
+    if (driver == nullptr || channel_id == 0) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_driver(driver)->close_channel(channel_id);
     } catch (...) {
         return PIE_STATUS_DRIVER_ERROR;
     }

@@ -7,9 +7,11 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use rmp_serde::{decode, encode};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
@@ -38,6 +40,23 @@ pub enum ProcessEvent {
     Error(String),
 }
 
+#[derive(Debug)]
+enum ProcessEventRoute {
+    Buffered(BufferedProcessEvents),
+    Attached(mpsc::Sender<ProcessEvent>),
+}
+
+#[derive(Debug)]
+struct BufferedProcessEvents {
+    events: VecDeque<ProcessEvent>,
+    updated_at: Instant,
+    terminal: bool,
+}
+
+const MAX_BUFFERED_PROCESSES: usize = 1024;
+const MAX_BUFFERED_EVENTS_PER_PROCESS: usize = 1024;
+const BUFFERED_PROCESS_TTL: Duration = Duration::from_secs(60);
+
 /// Holds the state for a file being downloaded from the server.
 #[derive(Debug)]
 struct DownloadState {
@@ -59,8 +78,9 @@ struct ClientInner {
     corr_id_pool: IdPool<CorrId>,
     /// Single pending-request map: all request/reply commands use this.
     pending_requests: DashMap<CorrId, oneshot::Sender<(bool, String)>>,
-    /// Per-process event channels.
-    process_event_tx: DashMap<String, mpsc::Sender<ProcessEvent>>,
+    /// Per-process event routes. Events can precede the launch response, so
+    /// unmatched events remain buffered until `launch_process` attaches.
+    process_events: StdMutex<HashMap<String, ProcessEventRoute>>,
     /// In-flight file downloads (key: file_hash).
     pending_downloads: DashMap<String, Mutex<DownloadState>>,
 }
@@ -190,7 +210,7 @@ impl Client {
             ws_writer_tx: ws_writer_tx.clone(),
             corr_id_pool: IdPool::new(CorrId::MAX),
             pending_requests: DashMap::new(),
-            process_event_tx: DashMap::new(),
+            process_events: StdMutex::new(HashMap::new()),
             pending_downloads: DashMap::new(),
         });
 
@@ -486,8 +506,7 @@ impl Client {
 
         // result is the UUID string
         let process_id = result;
-        let (tx, rx) = mpsc::channel(64);
-        self.inner.process_event_tx.insert(process_id.clone(), tx);
+        let rx = attach_process_events(&self.inner, &process_id);
 
         Ok(Process {
             id: process_id,
@@ -509,10 +528,7 @@ impl Client {
             anyhow::bail!("Attach process failed: {}", result);
         }
 
-        let (tx, rx) = mpsc::channel(64);
-        self.inner
-            .process_event_tx
-            .insert(process_id.to_string(), tx);
+        let rx = attach_process_events(&self.inner, process_id);
 
         Ok(Process {
             id: process_id.to_string(),
@@ -589,26 +605,18 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
             event,
             value,
         } => {
-            if let Some(sender) = inner.process_event_tx.get(&process_id) {
-                let process_event = match event.as_str() {
-                    "stdout" => ProcessEvent::Stdout(value),
-                    "stderr" => ProcessEvent::Stderr(value),
-                    "message" => ProcessEvent::Message(value),
-                    "return" => ProcessEvent::Return(value),
-                    "error" => ProcessEvent::Error(value),
-                    _ => {
-                        eprintln!("Unknown event type: {}", event);
-                        return;
-                    }
-                };
-                sender.send(process_event).await.ok();
-
-                // Clean up event channel on terminal events
-                if event == "return" || event == "error" {
-                    drop(sender);
-                    inner.process_event_tx.remove(&process_id);
+            let process_event = match event.as_str() {
+                "stdout" => ProcessEvent::Stdout(value),
+                "stderr" => ProcessEvent::Stderr(value),
+                "message" => ProcessEvent::Message(value),
+                "return" => ProcessEvent::Return(value),
+                "error" => ProcessEvent::Error(value),
+                _ => {
+                    eprintln!("Unknown event type: {}", event);
+                    return;
                 }
-            }
+            };
+            route_process_event(inner, process_id, process_event).await;
         }
         ServerMessage::File {
             process_id,
@@ -645,12 +653,12 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
                 if let Some((_, state_mutex)) = inner.pending_downloads.remove(&file_hash) {
                     let final_state = state_mutex.into_inner();
                     if hash_blob(&final_state.buffer) == file_hash {
-                        if let Some(sender) = inner.process_event_tx.get(&final_state.process_id) {
-                            sender
-                                .send(ProcessEvent::File(final_state.buffer))
-                                .await
-                                .ok();
-                        }
+                        route_process_event(
+                            inner,
+                            final_state.process_id,
+                            ProcessEvent::File(final_state.buffer),
+                        )
+                        .await;
                     }
                 }
             }
@@ -661,6 +669,189 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
 /// When the server terminates, clear all pending state.
 async fn handle_server_termination(inner: &Arc<ClientInner>) {
     inner.pending_requests.clear();
-    inner.process_event_tx.clear();
+    inner
+        .process_events
+        .lock()
+        .expect("process event routes mutex poisoned")
+        .clear();
     inner.pending_downloads.clear();
+}
+
+fn is_terminal_process_event(event: &ProcessEvent) -> bool {
+    matches!(event, ProcessEvent::Return(_) | ProcessEvent::Error(_))
+}
+
+fn purge_expired_process_events(routes: &mut HashMap<String, ProcessEventRoute>) {
+    let now = Instant::now();
+    routes.retain(|process_id, route| {
+        let keep = match route {
+            ProcessEventRoute::Buffered(buffered) => {
+                now.duration_since(buffered.updated_at) <= BUFFERED_PROCESS_TTL
+            }
+            ProcessEventRoute::Attached(_) => true,
+        };
+        if !keep {
+            eprintln!("Discarding expired events for unattached process {process_id}");
+        }
+        keep
+    });
+}
+
+fn attach_process_events(inner: &ClientInner, process_id: &str) -> mpsc::Receiver<ProcessEvent> {
+    let mut routes = inner
+        .process_events
+        .lock()
+        .expect("process event routes mutex poisoned");
+    purge_expired_process_events(&mut routes);
+    let buffered = match routes.remove(process_id) {
+        Some(ProcessEventRoute::Buffered(buffered)) => buffered.events,
+        Some(ProcessEventRoute::Attached(_)) | None => VecDeque::new(),
+    };
+    let terminal = buffered.iter().any(is_terminal_process_event);
+    let (tx, rx) = mpsc::channel(buffered.len().max(64));
+    for event in buffered {
+        tx.try_send(event)
+            .expect("new process event channel has capacity for buffered events");
+    }
+    if !terminal {
+        routes.insert(process_id.to_string(), ProcessEventRoute::Attached(tx));
+    }
+    rx
+}
+
+async fn route_process_event(inner: &ClientInner, process_id: String, event: ProcessEvent) {
+    let terminal = is_terminal_process_event(&event);
+    let mut event = Some(event);
+    let sender = {
+        let mut routes = inner
+            .process_events
+            .lock()
+            .expect("process event routes mutex poisoned");
+        purge_expired_process_events(&mut routes);
+        match routes.get_mut(&process_id) {
+            Some(ProcessEventRoute::Attached(sender)) => {
+                let sender = sender.clone();
+                if terminal {
+                    routes.remove(&process_id);
+                }
+                Some(sender)
+            }
+            Some(ProcessEventRoute::Buffered(buffered)) => {
+                if buffered.terminal {
+                    eprintln!("Discarding event received after terminal event for {process_id}");
+                } else if buffered.events.len() >= MAX_BUFFERED_EVENTS_PER_PROCESS {
+                    buffered.events.clear();
+                    buffered.events.push_back(ProcessEvent::Error(
+                        "process event buffer overflowed before attachment".to_string(),
+                    ));
+                    buffered.terminal = true;
+                } else {
+                    buffered
+                        .events
+                        .push_back(event.take().expect("process event present"));
+                    buffered.terminal = terminal;
+                }
+                buffered.updated_at = Instant::now();
+                None
+            }
+            None => {
+                let buffered_count = routes
+                    .values()
+                    .filter(|route| matches!(route, ProcessEventRoute::Buffered(_)))
+                    .count();
+                if buffered_count >= MAX_BUFFERED_PROCESSES
+                    && let Some(oldest) = routes
+                        .iter()
+                        .filter_map(|(id, route)| match route {
+                            ProcessEventRoute::Buffered(buffered) => {
+                                Some((id.clone(), buffered.updated_at))
+                            }
+                            ProcessEventRoute::Attached(_) => None,
+                        })
+                        .min_by_key(|(_, updated_at)| *updated_at)
+                        .map(|(id, _)| id)
+                {
+                    routes.remove(&oldest);
+                    eprintln!("Discarding oldest unattached process events for {oldest}");
+                }
+                routes.insert(
+                    process_id,
+                    ProcessEventRoute::Buffered(BufferedProcessEvents {
+                        events: VecDeque::from([event.take().expect("process event present")]),
+                        updated_at: Instant::now(),
+                        terminal,
+                    }),
+                );
+                None
+            }
+        }
+    };
+    if let Some(sender) = sender {
+        sender
+            .send(event.expect("attached process event present"))
+            .await
+            .ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_inner() -> Arc<ClientInner> {
+        let (ws_writer_tx, _) = unbounded_channel();
+        Arc::new(ClientInner {
+            ws_writer_tx,
+            corr_id_pool: IdPool::new(CorrId::MAX),
+            pending_requests: DashMap::new(),
+            process_events: StdMutex::new(HashMap::new()),
+            pending_downloads: DashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn buffers_terminal_event_until_process_receiver_attaches() {
+        let inner = test_inner();
+        route_process_event(
+            &inner,
+            "fast-process".to_string(),
+            ProcessEvent::Return("done".to_string()),
+        )
+        .await;
+
+        let mut rx = attach_process_events(&inner, "fast-process");
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProcessEvent::Return(value)) if value == "done"
+        ));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn preserves_events_buffered_before_process_receiver_attaches() {
+        let inner = test_inner();
+        route_process_event(
+            &inner,
+            "process".to_string(),
+            ProcessEvent::Stdout("first".to_string()),
+        )
+        .await;
+        let mut rx = attach_process_events(&inner, "process");
+        route_process_event(
+            &inner,
+            "process".to_string(),
+            ProcessEvent::Return("second".to_string()),
+        )
+        .await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProcessEvent::Stdout(value)) if value == "first"
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProcessEvent::Return(value)) if value == "second"
+        ));
+        assert!(rx.recv().await.is_none());
+    }
 }

@@ -12,12 +12,14 @@ use pie_driver_abi::{
     PIE_MEMORY_DOMAIN_CUDA_DEVICE, PIE_MEMORY_DOMAIN_HOST_PINNED, PieKvMoveCell, PiePoolRange,
     PieStateCopyRange,
 };
+use std::sync::Arc;
 
 pub use backend::{LocalDriver, NativeDriver};
 pub use completion::{Completion, CompletionBroker, InstanceCompletion};
 pub use frame::{
-    BoundInstance, InstanceBindingPlan, InstanceId, KvCopyPlan, LaunchPlan, LaunchSubmission,
-    PoolResizePlan, ProgramId, ProgramRegistration, RS_FLAG_FOLD, RS_FLAG_RESET, StateCopyPlan,
+    BoundInstance, ChannelEndpoint, ChannelRegistrationPlan, InstanceBindingPlan, InstanceId,
+    KvCopyPlan, LaunchPlan, LaunchSubmission, PoolResizePlan, ProgramId, ProgramRegistration,
+    RS_FLAG_FOLD, RS_FLAG_RESET, RegisteredChannel, StateCopyPlan,
 };
 pub(crate) use registry::scheduler_handle;
 pub use registry::{
@@ -31,6 +33,26 @@ pub fn register_program(driver_idx: DriverId, plan: ProgramRegistration) -> Resu
     scheduler_handle(driver_idx)?.register_program(plan)
 }
 
+pub fn register_channel(
+    driver_idx: DriverId,
+    mut plan: ChannelRegistrationPlan,
+) -> Result<Arc<ChannelEndpoint>> {
+    let table = pie_waker::WakerTable::global();
+    plan.driver_id = driver_idx;
+    plan.reader_wait_id = table.alloc();
+    plan.writer_wait_id = table.alloc();
+    let result = scheduler_handle(driver_idx)?.register_channel(plan.clone());
+    match result {
+        Ok(channel) => Ok(Arc::new(ChannelEndpoint::new(channel))),
+        Err(error) => {
+            for wait_id in [plan.reader_wait_id, plan.writer_wait_id] {
+                table.free(wait_id);
+            }
+            Err(error)
+        }
+    }
+}
+
 pub fn bind_instance(
     driver_idx: DriverId,
     program_id: ProgramId,
@@ -40,28 +62,16 @@ pub fn bind_instance(
 ) -> Result<BoundInstance> {
     let table = pie_waker::WakerTable::global();
     let pacing_wait_id = table.alloc();
-    let channel_waits = channel_ids
-        .iter()
-        .map(|_| pie_driver_abi::PieChannelWait {
-            reader_wait_id: table.alloc(),
-            writer_wait_id: table.alloc(),
-        })
-        .collect::<Vec<_>>();
     let bind = scheduler_handle(driver_idx)?.bind_instance(InstanceBindingPlan {
         driver_id: driver_idx,
         program_id,
         requested_instance_id,
         pacing_wait_id,
-        channel_waits: channel_waits.clone(),
         channel_ids,
         seed_values,
     });
     if bind.is_err() {
         table.free(pacing_wait_id);
-        for waits in &channel_waits {
-            table.free(waits.reader_wait_id);
-            table.free(waits.writer_wait_id);
-        }
     }
     bind
 }

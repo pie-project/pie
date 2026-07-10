@@ -26,40 +26,21 @@
 
 namespace pie_cuda_driver::ptir {
 
-struct InstanceFrame {
-    std::uint64_t frame_id = 0;                        // FrameCarrierEngine instance
-    std::uint64_t frame_base = 0;
-    std::uint64_t mirror_base = 0;
-    std::uint64_t word_base = 0;
-    std::uint64_t frame_bytes = 0;
-    std::uint64_t mirror_bytes = 0;
-    std::uint64_t word_bytes = 0;
-    std::uint32_t n_reader = 0;
-    std::unordered_map<std::uint64_t, std::uint32_t> gid_to_rank;
-    std::vector<std::uint64_t> reader_wait_ids;
-    std::vector<std::uint32_t> cap1;                   // per-rank mirror ring depth
-    std::vector<std::uint32_t> produced;               // per-rank cumulative published
-    std::vector<std::uint32_t> head, tail;             // per-rank published ring words
-    std::uint64_t fire_seq = 0;                        // pacing[0]
-};
-
 struct BoundInstance {
+    struct CommitSnapshot {
+        std::uint32_t* device = nullptr;
+        std::uint32_t* host = nullptr;
+    };
+
     std::uint64_t program_hash = 0;
     std::uint64_t pacing_wait_id = 0;
     const Trace* trace = nullptr;
     std::vector<std::uint64_t> channel_ids;
-    std::vector<PieChannelWait> channel_waits;
     std::unique_ptr<PtirInstance> instance;
-    InstanceFrame frame;
-    std::vector<PieChannelBinding> channel_bindings;
+    std::uint64_t fire_seq = 0;
     cudaEvent_t fire_ready = nullptr;
     cudaEvent_t publish_done = nullptr;
-    std::uint32_t* commit_host = nullptr;
-};
-
-struct NotifyWait {
-    std::uint64_t wait_id = 0;
-    std::uint64_t epoch = 0;
+    std::vector<CommitSnapshot> commit_snapshots;
 };
 
 struct PtirDispatch::Impl {
@@ -73,10 +54,19 @@ struct NotifyContext {
     PieRuntimeCallbacks runtime{};
     PieCompletion completion{};
     struct FinalizeEntry {
-        std::uint64_t instance_id = 0;
+        struct EndpointUpdate {
+            std::uint32_t slot = DeviceChannelRegistry::kBadSlot;
+            std::uint64_t target = 0;
+            std::uint64_t wait_id = 0;
+        };
+        PieTerminalCell* terminal_cell = nullptr;
+        std::uint32_t* commit_host = nullptr;
         bool poison = false;
-        std::vector<NotifyWait> commit_waits;
-        std::vector<PtirInstance::DeviceOut> outs;
+        std::vector<EndpointUpdate> published;
+        std::vector<EndpointUpdate> consumed;
+        std::vector<EndpointUpdate> poisoned;
+        std::vector<ChannelValue> host_puts;
+        std::vector<std::vector<std::uint8_t>> host_staging;
     };
     PtirDispatch::Impl* impl = nullptr;
     std::vector<FinalizeEntry> entries;
@@ -85,53 +75,51 @@ struct NotifyContext {
 void CUDART_CB notify_runtime_callback(void* userdata) {
     std::unique_ptr<NotifyContext> ctx(static_cast<NotifyContext*>(userdata));
     if (ctx == nullptr) return;
-    std::vector<NotifyWait> waits;
-    if (ctx->impl != nullptr) {
-        for (const auto& entry : ctx->entries) {
-            auto it = ctx->impl->instances.find(entry.instance_id);
-            if (it == ctx->impl->instances.end()) continue;
-            BoundInstance& bound = it->second;
-            const bool committed =
-                bound.commit_host != nullptr && *(bound.commit_host) != 0;
-            bound.instance->apply_fire_result(committed, entry.outs);
-            if (entry.poison) {
-                auto* words = reinterpret_cast<std::atomic<std::uint64_t>*>(
-                    bound.frame.word_base);
-                if (words != nullptr) {
-                    const std::uint64_t poison_epoch =
-                        bound.frame.fire_seq == 0 ? 1 : bound.frame.fire_seq;
-                    for (const PieChannelBinding& binding : bound.channel_bindings) {
-                        words[binding.poison_word_index].store(
-                            poison_epoch, std::memory_order_release);
-                    }
-                }
-            } else if (committed) {
-                InstanceFrame& fr = bound.frame;
-                for (const auto& out : entry.outs) {
-                    const auto rit = fr.gid_to_rank.find(out.gid);
-                    if (rit == fr.gid_to_rank.end()) continue;
-                    const std::uint32_t r = rit->second;
-                    const std::uint32_t prod = ++fr.produced[r];
-                    fr.tail[r] = prod;
-                }
-            }
-            waits.insert(
-                waits.end(), entry.commit_waits.begin(), entry.commit_waits.end());
-        }
-    }
     const bool notify =
         ctx->runtime.notify != nullptr &&
         (ctx->impl == nullptr ||
          !ctx->impl->shutting_down.load(std::memory_order_acquire));
-    // No native instance/channel state is touched after the first wake: a woken
-    // runtime thread may immediately close the instance.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
+    for (const auto& entry : ctx->entries) {
+        const bool committed =
+            entry.commit_host != nullptr && *(entry.commit_host) != 0;
+        const bool failed = entry.poison || !committed;
+        if (ctx->impl != nullptr) {
+            for (const auto& update : entry.published) {
+                ctx->impl->channels.finalize_host_publish(
+                    update.slot, update.target, failed);
+                notifications.emplace_back(update.wait_id, update.target);
+            }
+            for (const auto& update : entry.consumed) {
+                ctx->impl->channels.finalize_host_consume(
+                    update.slot, update.target, failed);
+                notifications.emplace_back(update.wait_id, update.target);
+            }
+            if (failed) {
+                for (const auto& update : entry.poisoned) {
+                    ctx->impl->channels.finalize_host_publish(
+                        update.slot, update.target, true);
+                    notifications.emplace_back(update.wait_id, update.target);
+                }
+            }
+        }
+        if (entry.terminal_cell != nullptr) {
+            entry.terminal_cell->reserved0 = 0;
+            std::atomic_ref<std::uint32_t>(entry.terminal_cell->outcome).store(
+                failed ? PIE_TERMINAL_OUTCOME_FAILED
+                       : PIE_TERMINAL_OUTCOME_SUCCESS,
+                std::memory_order_release);
+        }
+    }
     if (notify) {
-        for (const NotifyWait& wait : waits) {
-            if (wait.wait_id != 0) {
-                ctx->runtime.notify(ctx->runtime.ctx, wait.wait_id, wait.epoch);
+        for (const auto& [wait_id, epoch] : notifications) {
+            if (wait_id != 0 && epoch != 0) {
+                ctx->runtime.notify(ctx->runtime.ctx, wait_id, epoch);
             }
         }
     }
+    // No native instance/channel state is touched after the batch wake: a woken
+    // runtime thread may immediately close the instance.
     if (notify && ctx->completion.wait_id != 0) {
         ctx->runtime.notify(
             ctx->runtime.ctx, ctx->completion.wait_id, ctx->completion.target_epoch);
@@ -155,29 +143,43 @@ PtirDispatch::~PtirDispatch() {
 
 namespace {
 
-// Slice program `p` out of a (channels, blob, lens, indptr) SoA into
-// ChannelValue[]. The blob offset for an entry is the running Σ of prior lens
-// (the blob is concatenated across all programs' entries in entry order).
-// `chans` is now the GLOBAL channel id per entry (W0.2 re-key).
-std::vector<ChannelValue> read_channel_values(
+// Decode the flattened host-put SoA in one linear pass. Computing each
+// program's blob offset independently made large batches quadratic.
+std::vector<std::vector<ChannelValue>> read_channel_values(
     const pie_native::Slice<std::uint64_t>& chans,
     const pie_native::Slice<std::uint8_t>& blob,
     const pie_native::Slice<std::uint32_t>& lens,
     const pie_native::Slice<std::uint32_t>& indptr,
-    std::size_t p) {
-    std::vector<ChannelValue> out;
-    if (indptr.size() < p + 2) return out;
-    const std::uint32_t lo = indptr.data()[p];
-    const std::uint32_t hi = indptr.data()[p + 1];
+    std::size_t programs) {
+    if (indptr.size() != programs + 1 || chans.size() != lens.size()) {
+        throw std::runtime_error("ptir host-put arrays are inconsistent");
+    }
+    std::vector<std::vector<ChannelValue>> out(programs);
     std::size_t off = 0;
-    for (std::uint32_t i = 0; i < lo; ++i) off += lens.data()[i];
-    for (std::uint32_t e = lo; e < hi; ++e) {
-        ChannelValue cv;
-        cv.channel = chans.data()[e];
-        const std::uint32_t n = lens.data()[e];
-        cv.bytes.assign(blob.data() + off, blob.data() + off + n);
-        off += n;
-        out.push_back(std::move(cv));
+    for (std::size_t program = 0; program < programs; ++program) {
+        const std::uint32_t lo = indptr.data()[program];
+        const std::uint32_t hi = indptr.data()[program + 1];
+        if (lo > hi || hi > lens.size()) {
+            throw std::runtime_error("ptir host-put indptr is invalid");
+        }
+        out[program].reserve(hi - lo);
+        for (std::uint32_t entry = lo; entry < hi; ++entry) {
+            const std::size_t bytes = lens.data()[entry];
+            if (off > blob.size() || bytes > blob.size() - off) {
+                throw std::runtime_error("ptir host-put blob is truncated");
+            }
+            ChannelValue value;
+            value.channel = chans.data()[entry];
+            if (bytes != 0) {
+                value.bytes.assign(
+                    blob.data() + off, blob.data() + off + bytes);
+            }
+            off += bytes;
+            out[program].push_back(std::move(value));
+        }
+    }
+    if (off != blob.size()) {
+        throw std::runtime_error("ptir host-put blob has trailing bytes");
     }
     return out;
 }
@@ -215,6 +217,32 @@ void ensure_event(cudaEvent_t* event) {
     }
 }
 
+BoundInstance::CommitSnapshot& commit_snapshot(
+    BoundInstance& bound,
+    std::size_t index) {
+    while (bound.commit_snapshots.size() <= index) {
+        BoundInstance::CommitSnapshot snapshot;
+        try {
+            CUDA_CHECK(cudaMalloc(
+                reinterpret_cast<void**>(&snapshot.device),
+                sizeof(std::uint32_t)));
+            CUDA_CHECK(cudaMallocHost(
+                reinterpret_cast<void**>(&snapshot.host),
+                sizeof(std::uint32_t)));
+            bound.commit_snapshots.push_back(snapshot);
+        } catch (...) {
+            if (snapshot.host != nullptr) {
+                cudaFreeHost(snapshot.host);
+            }
+            if (snapshot.device != nullptr) {
+                cudaFree(snapshot.device);
+            }
+            throw;
+        }
+    }
+    return bound.commit_snapshots[index];
+}
+
 void close_bound_instance(PtirDispatch::Impl& s, std::uint64_t instance_id) {
     auto it = s.instances.find(instance_id);
     if (it == s.instances.end()) return;
@@ -225,61 +253,16 @@ void close_bound_instance(PtirDispatch::Impl& s, std::uint64_t instance_id) {
     if (it->second.fire_ready != nullptr) {
         CUDA_CHECK(cudaEventDestroy(it->second.fire_ready));
     }
-    if (it->second.commit_host != nullptr) {
-        CUDA_CHECK(cudaFreeHost(it->second.commit_host));
-    }
-    if (it->second.frame.frame_id != 0) {
-        sampling_ir::FrameCarrierEngine::instance().close_instance(
-            it->second.frame.frame_id);
+    for (const BoundInstance::CommitSnapshot& snapshot :
+         it->second.commit_snapshots) {
+        if (snapshot.device != nullptr) {
+            CUDA_CHECK(cudaFree(snapshot.device));
+        }
+        if (snapshot.host != nullptr) {
+            CUDA_CHECK(cudaFreeHost(snapshot.host));
+        }
     }
     s.instances.erase(it);
-}
-
-bool make_instance_frame(const Trace& trace,
-                         const std::vector<std::uint64_t>& channel_ids,
-                         const std::vector<PieChannelWait>& channel_waits,
-                         std::uint64_t instance_id,
-                         InstanceFrame& frame) {
-    std::vector<std::uint32_t> cell_bytes;
-    std::vector<std::uint32_t> cap1;
-    std::uint32_t rank = 0;
-    for (std::size_t c = 0; c < trace.channels.size(); ++c) {
-        const Channel& ch = trace.channels[c];
-        if (!ch.host_reader) continue;
-        const std::uint64_t gid = c < channel_ids.size()
-            ? channel_ids[c]
-            : static_cast<std::uint64_t>(c);
-        std::size_t cb = ch.type.shape.numel() * dtype_size(ch.type.dtype);
-        if (cb == 0) cb = dtype_size(ch.type.dtype);
-        frame.gid_to_rank[gid] = rank;
-        cell_bytes.push_back(static_cast<std::uint32_t>(cb));
-        cap1.push_back(ch.capacity + 1);
-        // Host-visible channel publication advances the consumer-visible tail, so
-        // the wake goes to the channel's reader wait slot (not the writer/backpressure
-        // slot, which tracks host-writer head movement in the opposite direction).
-        frame.reader_wait_ids.push_back(
-            c < channel_waits.size() ? channel_waits[c].reader_wait_id : 0);
-        ++rank;
-    }
-    frame.n_reader = rank;
-    frame.cap1 = std::move(cap1);
-    if (rank == 0) return true;
-    frame.produced.assign(rank, 0);
-    frame.head.assign(rank, 0);
-    frame.tail.assign(rank, 0);
-    frame.word_bytes = static_cast<std::uint64_t>(
-        sampling_ir::WordLayout::words(rank) * sizeof(std::uint64_t));
-    frame.mirror_bytes = 0;
-    for (std::uint32_t i = 0; i < rank; ++i) {
-        frame.mirror_bytes +=
-            static_cast<std::uint64_t>(cell_bytes[i]) * frame.cap1[i];
-    }
-    sampling_ir::FrameCarrierEngine::instance().bind_channels_keyed(
-        instance_id, rank, cell_bytes.data(), frame.cap1.data(),
-        &frame.frame_base, &frame.mirror_base, &frame.word_base);
-    frame.frame_id = instance_id;
-    frame.frame_bytes = 0;
-    return true;
 }
 
 }  // namespace
@@ -311,11 +294,20 @@ int PtirDispatch::register_program(std::uint64_t program_hash,
     return PIE_STATUS_OK;
 }
 
+int PtirDispatch::register_channel(
+    const PieChannelDesc& channel,
+    PieChannelEndpointBinding* binding,
+    std::string* err) {
+    if (err) err->clear();
+    return impl_->channels.register_endpoint(channel, binding, err)
+        ? PIE_STATUS_OK
+        : PIE_STATUS_INVALID_ARGUMENT;
+}
+
 int PtirDispatch::bind_instance(std::uint64_t instance_id,
                                 std::uint64_t program_hash,
                                 std::uint64_t pacing_wait_id,
                                 const std::vector<std::uint64_t>& channel_ids,
-                                const std::vector<PieChannelWait>& channel_waits,
                                 const std::vector<PieChannelValueDesc>& seed_values,
                                 PieInstanceBinding* binding,
                                 std::string* err) {
@@ -329,6 +321,10 @@ int PtirDispatch::bind_instance(std::uint64_t instance_id,
     }
     if (channel_ids.size() != trace->channels.size()) {
         if (err) *err = "ptir instance channel count does not match program";
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (impl_->instances.find(instance_id) != impl_->instances.end()) {
+        if (err) *err = "ptir instance id is already bound";
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     {
@@ -347,44 +343,12 @@ int PtirDispatch::bind_instance(std::uint64_t instance_id,
         return PIE_STATUS_INVALID_ARGUMENT;
     }
 
-    close_bound_instance(*impl_, instance_id);
-
     BoundInstance bound;
     bound.program_hash = program_hash;
     bound.pacing_wait_id = pacing_wait_id;
     bound.trace = trace;
     bound.channel_ids = channel_ids;
-    bound.channel_waits = channel_waits;
     bound.instance = std::move(inst);
-    make_instance_frame(*trace, bound.channel_ids, bound.channel_waits, instance_id,
-                        bound.frame);
-    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&bound.commit_host),
-                              sizeof(std::uint32_t)));
-    *bound.commit_host = 0;
-    bound.channel_bindings.clear();
-    bound.channel_bindings.reserve(bound.frame.n_reader);
-    std::uint64_t mirror_offset = 0;
-    std::uint32_t rank = 0;
-    for (std::size_t c = 0; c < trace->channels.size(); ++c) {
-        const Channel& ch = trace->channels[c];
-        if (!ch.host_reader) continue;
-        std::size_t cell_bytes = ch.type.shape.numel() * dtype_size(ch.type.dtype);
-        if (cell_bytes == 0) cell_bytes = dtype_size(ch.type.dtype);
-        const std::uint64_t gid =
-            c < bound.channel_ids.size() ? bound.channel_ids[c] : static_cast<std::uint64_t>(c);
-        bound.channel_bindings.push_back(PieChannelBinding{
-            .channel_id = gid,
-            .cell_bytes = static_cast<std::uint32_t>(cell_bytes),
-            .capacity = ch.capacity,
-            .mirror_offset = mirror_offset,
-            .head_word_index = sampling_ir::WordLayout::head(rank),
-            .tail_word_index = sampling_ir::WordLayout::tail(rank),
-            .poison_word_index = sampling_ir::WordLayout::poison(rank),
-            .reserved = 0,
-        });
-        mirror_offset += cell_bytes * static_cast<std::size_t>(ch.capacity + 1);
-        ++rank;
-    }
     ensure_event(&bound.publish_done);
     CUDA_CHECK(cudaEventRecord(
         bound.publish_done, sampling_ir::FrameCarrierEngine::instance().copy_stream()));
@@ -392,16 +356,6 @@ int PtirDispatch::bind_instance(std::uint64_t instance_id,
     if (binding != nullptr) {
         std::memset(binding, 0, sizeof(*binding));
         binding->instance_id = instance_id;
-        binding->frame_base = bound.frame.frame_base;
-        binding->mirror_base = bound.frame.mirror_base;
-        binding->word_base = bound.frame.word_base;
-        binding->channel_count = bound.frame.n_reader;
-        binding->word_count = sampling_ir::WordLayout::words(bound.frame.n_reader);
-        binding->frame_bytes = bound.frame.frame_bytes;
-        binding->mirror_bytes = bound.frame.mirror_bytes;
-        binding->word_bytes = bound.frame.word_bytes;
-        binding->channels.ptr = bound.channel_bindings.data();
-        binding->channels.len = bound.channel_bindings.size();
     }
     impl_->instances.emplace(instance_id, std::move(bound));
     return PIE_STATUS_OK;
@@ -409,6 +363,69 @@ int PtirDispatch::bind_instance(std::uint64_t instance_id,
 
 void PtirDispatch::close_instance(std::uint64_t instance_id) {
     close_bound_instance(*impl_, instance_id);
+}
+
+int PtirDispatch::close_channel(std::uint64_t channel_id, std::string* err) {
+    if (err) err->clear();
+    return impl_->channels.close_endpoint(channel_id, err)
+        ? PIE_STATUS_OK
+        : (impl_->channels.contains(channel_id)
+               ? PIE_STATUS_INVALID_ARGUMENT
+               : PIE_STATUS_CLOSED);
+}
+
+int PtirDispatch::validate_launch(
+    const pie_native::LaunchView& view,
+    std::string* err) {
+    if (err) err->clear();
+    const std::size_t count = view.ptir_program_hashes.size();
+    if (count == 0 ||
+        view.ptir_program_instances.size() != count ||
+        view.terminal_cells.size() != count) {
+        if (err) *err = "ptir launch has inconsistent program arrays";
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    try {
+        const auto host_puts_by_program = read_channel_values(
+            view.ptir_program_host_put_channels,
+            view.ptir_program_host_put_blob,
+            view.ptir_program_host_put_lens,
+            view.ptir_program_host_put_indptr,
+            count);
+        for (std::size_t program = 0; program < count; ++program) {
+            const std::uint64_t instance_id =
+                view.ptir_program_instances.data()[program];
+            auto instance = impl_->instances.find(instance_id);
+            if (instance == impl_->instances.end() ||
+                instance->second.trace == nullptr ||
+                instance->second.program_hash !=
+                    view.ptir_program_hashes.data()[program]) {
+                if (err) *err = "ptir launch references an incompatible instance";
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            std::string value_error;
+            if (!instance->second.instance->validate_host_puts(
+                    host_puts_by_program[program], &value_error)) {
+                if (err) *err = value_error;
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            for (const auto& output :
+                 instance->second.instance->predict_outputs_device()) {
+                if (!impl_->channels.can_publish(output.slot)) {
+                    if (err) {
+                        *err = "ptir channel " +
+                            std::to_string(output.gid) +
+                            " has no host output capacity";
+                    }
+                    return PIE_STATUS_INVALID_ARGUMENT;
+                }
+            }
+        }
+    } catch (const std::exception& error) {
+        if (err) *err = error.what();
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
 }
 
 bool PtirDispatch::run(const pie_native::LaunchView& view,
@@ -426,6 +443,9 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
     if (view.ptir_program_instances.size() != n_prog) {
         throw std::runtime_error("ptir launch instance/hash count mismatch");
     }
+    if (view.terminal_cells.size() != n_prog) {
+        throw std::runtime_error("ptir launch terminal cell count mismatch");
+    }
     for (std::size_t p = 0; p < n_prog; ++p) {
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
@@ -439,28 +459,27 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
                 "ptir launch instance/hash mismatch for " + std::to_string(iid));
         }
     }
-    std::vector<std::vector<ChannelValue>> host_puts_by_program;
-    host_puts_by_program.reserve(n_prog);
+    auto host_puts_by_program = read_channel_values(
+        view.ptir_program_host_put_channels,
+        view.ptir_program_host_put_blob,
+        view.ptir_program_host_put_lens,
+        view.ptir_program_host_put_indptr,
+        n_prog);
     for (std::size_t p = 0; p < n_prog; ++p) {
-        auto host_puts = read_channel_values(
-            view.ptir_program_host_put_channels,
-            view.ptir_program_host_put_blob,
-            view.ptir_program_host_put_lens,
-            view.ptir_program_host_put_indptr,
-            p);
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         BoundInstance& bound = s.instances.at(iid);
         std::string value_error;
-        if (!bound.instance->validate_host_puts(host_puts, &value_error)) {
+        if (!bound.instance->validate_host_puts(
+                host_puts_by_program[p], &value_error)) {
             throw std::runtime_error(value_error);
         }
-        host_puts_by_program.push_back(std::move(host_puts));
     }
     sampling_ir::FrameCarrierEngine& carrier =
         sampling_ir::FrameCarrierEngine::instance();
     cudaStream_t callback_stream = carrier.copy_stream();
     std::vector<NotifyContext::FinalizeEntry> finalize_entries;
     std::vector<std::uint64_t> touched_instances;
+    std::unordered_map<std::uint64_t, std::size_t> instance_fire_counts;
 
     if (std::getenv("PIE_PTIR_TRACE")) {
         std::fprintf(stderr, "[ptir-hook] FIRED: n_prog=%zu vocab=%u logits=%p\n",
@@ -471,11 +490,13 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         BoundInstance& bound = it->second;
+        BoundInstance::CommitSnapshot& snapshot =
+            commit_snapshot(bound, instance_fire_counts[iid]++);
         ensure_event(&bound.fire_ready);
         ensure_event(&bound.publish_done);
         CUDA_CHECK(cudaStreamWaitEvent(stream, bound.publish_done, 0));
 
-        const auto& host_puts = host_puts_by_program[p];
+        auto& host_puts = host_puts_by_program[p];
 
         FireInputs fin;
         if (logits != nullptr &&
@@ -490,7 +511,15 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
         fin.vocab = vocab;
         fin.stream = stream;
         std::vector<void*> scratch;
-        const PassResult pass = bound.instance->fire_async(host_puts, fin, scratch);
+        std::vector<std::vector<std::uint8_t>> host_staging;
+        const PassResult pass =
+            bound.instance->fire_async(host_puts, fin, scratch, host_staging);
+        CUDA_CHECK(cudaMemcpyAsync(
+            snapshot.device,
+            bound.instance->commit_device_flag(),
+            sizeof(std::uint32_t),
+            cudaMemcpyDeviceToDevice,
+            stream));
         if (!pass.ok && !pass.error.empty()) {
             std::fprintf(stderr, "[pie-driver-cuda] ptir fire failed: %s\n",
                          pass.error.c_str());
@@ -502,66 +531,70 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
         CUDA_CHECK(cudaEventRecord(bound.fire_ready, stream));
         CUDA_CHECK(cudaStreamWaitEvent(callback_stream, bound.fire_ready, 0));
 
-        InstanceFrame& fr = bound.frame;
-        const std::uint64_t fire_seq = ++fr.fire_seq;
-        std::vector<NotifyWait> commit_waits;
+        ++bound.fire_seq;
         std::vector<std::uint32_t> output_slots;
         const bool poison = !pass.ok;
-        if (poison) {
-            for (std::uint32_t r = 0; r < fr.n_reader; ++r) {
-                const std::uint64_t wait_id =
-                    r < fr.reader_wait_ids.size() ? fr.reader_wait_ids[r] : 0;
-                if (wait_id != 0) {
-                    commit_waits.push_back(NotifyWait{wait_id, fr.produced[r] + 1});
-                }
-            }
+        std::vector<NotifyContext::FinalizeEntry::EndpointUpdate> published;
+        published.reserve(outs.size());
+        for (const auto& output : outs) {
+            published.push_back({
+                .slot = output.slot,
+                .target = s.channels.schedule_host_publish(
+                    output.slot, output.device_ptr, callback_stream),
+                .wait_id = s.channels.reader_wait_id(output.slot),
+            });
+            output_slots.push_back(output.slot);
         }
-        if (fr.n_reader > 0) {
-            std::vector<const void*> src(fr.n_reader, nullptr);
-            std::vector<std::uint32_t> ring_index(fr.n_reader, 0);
-            std::vector<std::uint32_t> tail_after = fr.tail;
-            for (auto& o : outs) {
-                auto rit = fr.gid_to_rank.find(o.gid);
-                if (rit == fr.gid_to_rank.end()) continue;
-                const std::uint32_t r = rit->second;
-                src[r] = o.device_ptr;
-                ring_index[r] = fr.produced[r] % fr.cap1[r];
-                tail_after[r] = fr.produced[r] + 1;
-                output_slots.push_back(o.slot);
-                const std::uint64_t wait_id =
-                    r < fr.reader_wait_ids.size() ? fr.reader_wait_ids[r] : 0;
-                if (wait_id != 0) {
-                    commit_waits.push_back(NotifyWait{wait_id, tail_after[r]});
-                }
+        std::vector<NotifyContext::FinalizeEntry::EndpointUpdate> consumed;
+        consumed.reserve(host_puts.size());
+        for (const ChannelValue& value : host_puts) {
+            const std::uint32_t slot = s.channels.slot_for(value.channel);
+            if (slot != DeviceChannelRegistry::kBadSlot) {
+                consumed.push_back({
+                    .slot = slot,
+                    .target = s.channels.schedule_host_consume(slot),
+                    .wait_id = s.channels.writer_wait_id(slot),
+                });
             }
-            carrier.publish_device(
-                fr.frame_id, fr.n_reader, src.data(), ring_index.data(),
-                fr.head.data(), tail_after.data(),
-                bound.instance->commit_device_flag(), fire_seq);
         }
         if (!output_slots.empty()) {
             launch_consume_if_committed(
                 bound.instance->view().d_full(),
                 bound.instance->view().d_head(),
                 bound.instance->view().d_cap1(),
-                bound.instance->commit_device_flag(),
+                snapshot.device,
                 output_slots.data(),
                 static_cast<std::uint32_t>(output_slots.size()),
                 callback_stream);
         }
-        CUDA_CHECK(cudaMemcpyAsync(bound.commit_host,
-                                   bound.instance->commit_device_flag(),
+        CUDA_CHECK(cudaMemcpyAsync(snapshot.host,
+                                   snapshot.device,
                                    sizeof(std::uint32_t),
                                    cudaMemcpyDeviceToHost,
                                    callback_stream));
-        if (bound.pacing_wait_id != 0) {
-            commit_waits.push_back(NotifyWait{bound.pacing_wait_id, fire_seq});
+        bound.instance->project_fire_success(outs);
+        std::vector<NotifyContext::FinalizeEntry::EndpointUpdate> poisoned;
+        for (std::size_t c = 0; c < bound.trace->channels.size(); ++c) {
+            if (!bound.trace->channels[c].host_visible) continue;
+            const std::uint32_t slot =
+                s.channels.slot_for(bound.channel_ids[c]);
+            if (slot != DeviceChannelRegistry::kBadSlot) {
+                poisoned.push_back({
+                    .slot = slot,
+                    .target = s.channels.poison_target(slot),
+                    .wait_id = s.channels.host_wait_id(slot),
+                });
+            }
         }
         finalize_entries.push_back(NotifyContext::FinalizeEntry{
-            .instance_id = iid,
+            .terminal_cell = view.terminal_cells.data()[p],
+            .commit_host = snapshot.host,
             .poison = poison,
-            .commit_waits = std::move(commit_waits),
-            .outs = std::move(outs),
+            .published = std::move(published),
+            .consumed = std::move(consumed),
+            .poisoned = std::move(poisoned),
+            .host_puts = std::move(host_puts),
+            .host_staging = std::move(host_staging),
         });
         touched_instances.push_back(iid);
     }
@@ -583,10 +616,60 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
             }
         }
         CUDA_CHECK(cudaLaunchHostFunc(
-            callback_stream, notify_runtime_callback, notify.release()));
+            callback_stream, notify_runtime_callback, notify.get()));
+        notify.release();
     }
 
     return true;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>>
+PtirDispatch::settle_failed_launch(
+    const pie_native::LaunchView& view,
+    cudaStream_t execution_stream) {
+    if (execution_stream != nullptr) {
+        const cudaError_t status = cudaStreamSynchronize(execution_stream);
+        if (status != cudaSuccess) {
+            std::fprintf(
+                stderr,
+                "[pie-driver-cuda] failed launch stream synchronization: %s\n",
+                cudaGetErrorString(status));
+        }
+    }
+    cudaStream_t callback_stream =
+        sampling_ir::FrameCarrierEngine::instance().copy_stream();
+    if (callback_stream != nullptr && callback_stream != execution_stream) {
+        const cudaError_t status = cudaStreamSynchronize(callback_stream);
+        if (status != cudaSuccess) {
+            std::fprintf(
+                stderr,
+                "[pie-driver-cuda] failed launch callback synchronization: %s\n",
+                cudaGetErrorString(status));
+        }
+    }
+
+    Impl& s = *impl_;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
+    for (std::size_t p = 0; p < view.ptir_program_instances.size(); ++p) {
+        const std::uint64_t instance_id =
+            view.ptir_program_instances.data()[p];
+        auto it = s.instances.find(instance_id);
+        if (it == s.instances.end()) continue;
+        BoundInstance& bound = it->second;
+        for (std::size_t c = 0; c < bound.trace->channels.size(); ++c) {
+            if (!bound.trace->channels[c].host_visible) continue;
+            const std::uint32_t slot =
+                s.channels.slot_for(bound.channel_ids[c]);
+            if (slot != DeviceChannelRegistry::kBadSlot) {
+                const std::uint64_t poison_epoch =
+                    s.channels.poison_target(slot);
+                s.channels.finalize_host_publish(slot, poison_epoch, true);
+                notifications.emplace_back(
+                    s.channels.host_wait_id(slot), poison_epoch);
+            }
+        }
+    }
+    return notifications;
 }
 
 bool PtirDispatch::resolve_descriptors(const pie_native::LaunchView& view,
@@ -604,7 +687,17 @@ bool PtirDispatch::resolve_descriptors(const pie_native::LaunchView& view,
     }
 
     std::vector<std::vector<ChannelValue>> host_puts_by_program;
-    host_puts_by_program.reserve(n_prog);
+    try {
+        host_puts_by_program = read_channel_values(
+            view.ptir_program_host_put_channels,
+            view.ptir_program_host_put_blob,
+            view.ptir_program_host_put_lens,
+            view.ptir_program_host_put_indptr,
+            n_prog);
+    } catch (const std::exception& error) {
+        if (err) *err = error.what();
+        return false;
+    }
     for (std::size_t p = 0; p < n_prog; ++p) {
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
@@ -622,18 +715,12 @@ bool PtirDispatch::resolve_descriptors(const pie_native::LaunchView& view,
             if (err) *err = "ptir descriptor resolution missing trace";
             return false;
         }
-        auto host_puts = read_channel_values(
-            view.ptir_program_host_put_channels,
-            view.ptir_program_host_put_blob,
-            view.ptir_program_host_put_lens,
-            view.ptir_program_host_put_indptr,
-            p);
         std::string value_error;
-        if (!it->second.instance->validate_host_puts(host_puts, &value_error)) {
+        if (!it->second.instance->validate_host_puts(
+                host_puts_by_program[p], &value_error)) {
             if (err) *err = value_error;
             return false;
         }
-        host_puts_by_program.push_back(std::move(host_puts));
     }
 
     for (std::size_t p = 0; p < n_prog; ++p) {

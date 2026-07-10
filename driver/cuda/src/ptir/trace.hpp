@@ -15,6 +15,7 @@
 // tier-0/1/2 backends consume; reader.cpp fills it from the wire.
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "ptir/op_table.hpp"
@@ -197,6 +198,8 @@ struct Channel {
     bool       has_seed = false;    // Channel::from(seed) — first cell put full
     bool       host_visible = false;
     bool       host_reader = false; // PtirHostRole::READER — host HARVESTS (output)
+    std::int8_t extern_dir = -1;     // -1 private, 0 import, 1 export
+    std::string extern_name;
 };
 
 // A descriptor-port binding: a forward-pass input port fed by a channel (C1).

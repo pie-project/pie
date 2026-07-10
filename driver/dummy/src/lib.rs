@@ -1,21 +1,26 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+#[cfg(test)]
+use std::sync::Condvar;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use pie_driver_abi::{
-    DriverCapabilities, PieBytes, PieChannelBinding, PieChannelBindingSlice,
-    PieChannelValueDescSlice, PieChannelWait, PieChannelWaitSlice, PieCompletion,
-    PieInstanceBinding, PieInstanceDesc, PieKvCopyDesc, PieLaunchDesc, PiePoolResizeDesc,
-    PieProgramDesc, PieRuntimeCallbacks, PieStateCopyDesc, PieU32Slice, PieU64Slice,
-    validate_instance_desc, validate_kv_copy_desc, validate_launch_desc, validate_pool_resize_desc,
-    validate_program_desc, validate_state_copy_desc,
+    DriverCapabilities, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL, PIE_CHANNEL_DTYPE_F32,
+    PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
+    PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieChannelDesc,
+    PieChannelEndpointBinding, PieChannelValueDescSlice, PieCompletion, PieInstanceBinding,
+    PieInstanceDesc, PieKvCopyDesc, PieLaunchDesc, PiePoolResizeDesc, PieProgramDesc,
+    PieRuntimeCallbacks, PieStateCopyDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice,
+    PieU64Slice, validate_channel_desc, validate_completion, validate_instance_desc,
+    validate_kv_copy_desc, validate_launch_desc, validate_pool_resize_desc, validate_program_desc,
+    validate_state_copy_desc,
 };
-use pie_ptir::container::{self, HostRole};
+use pie_ptir::container::{self, ExternDir, HostRole};
 use pie_ptir::interp::{
-    HostError, Instance as InterpInstance, NoKernels, PassInputs, StepError, Value,
+    ExternChannel, HostError, Instance as InterpInstance, NoKernels, PassInputs, StepError, Value,
 };
 use pie_ptir::op::{IntrinsicId, Op};
 use pie_ptir::registry::{KernelInfo, ModelProfile};
@@ -36,6 +41,9 @@ pub struct DummyDriverOptions {
     pub max_forward_requests: u32,
     pub max_page_refs: u32,
     pub callback_delay_ms: u64,
+    pub reject_launches: bool,
+    pub reject_launches_remaining: u32,
+    pub fail_launches_after_accept: bool,
     pub operation_log: Option<Arc<Mutex<Vec<String>>>>,
 }
 
@@ -54,6 +62,9 @@ impl Default for DummyDriverOptions {
             max_forward_requests: 256,
             max_page_refs: 65_536,
             callback_delay_ms: 0,
+            reject_launches: false,
+            reject_launches_remaining: 0,
+            fail_launches_after_accept: false,
             operation_log: None,
         }
     }
@@ -81,22 +92,31 @@ struct DummyChannel {
     global_id: u64,
     host_role: HostRole,
     ty: ValueType,
+    endpoint: Arc<Mutex<DummyEndpoint>>,
+}
+
+#[derive(Debug)]
+struct DummyEndpoint {
+    channel_id: u64,
+    shape: Vec<u32>,
+    dtype: u8,
+    host_role: u8,
+    seeded: bool,
     capacity: u32,
-    cell_bytes: usize,
-    mirror_offset: usize,
-    head_word_index: usize,
-    tail_word_index: usize,
-    poison_word_index: usize,
-    waits: PieChannelWait,
+    reader_wait_id: u64,
+    writer_wait_id: u64,
+    extern_name: Option<String>,
+    mirror: Box<[u8]>,
+    words: Box<[AtomicU64]>,
+    attachments: HashMap<u64, Option<ExternDir>>,
+    shared: Option<ExternChannel>,
 }
 
 #[derive(Debug)]
 struct BoundInstanceState {
     program: Arc<DummyProgram>,
     instance_id: u64,
-    pacing_wait_id: u64,
     inner: Mutex<BoundInstanceInner>,
-    cv: Condvar,
 }
 
 #[derive(Debug)]
@@ -104,17 +124,14 @@ struct BoundInstanceInner {
     interp: InterpInstance,
     channels: Vec<DummyChannel>,
     channel_index_by_id: HashMap<u64, usize>,
-    bindings: Box<[PieChannelBinding]>,
-    mirror: Box<[u8]>,
-    words: Box<[AtomicU64]>,
     next_pacing_epoch: u64,
-    in_flight: usize,
     closed: bool,
 }
 
 #[derive(Default)]
 struct DummyState {
     programs: HashMap<u64, Arc<DummyProgram>>,
+    channels: HashMap<u64, Arc<Mutex<DummyEndpoint>>>,
     instances: HashMap<u64, Arc<BoundInstanceState>>,
 }
 
@@ -135,23 +152,15 @@ struct LaunchInstanceWork {
     instance: Arc<BoundInstanceState>,
     pacing_epoch: u64,
     host_puts: Vec<PreparedHostPut>,
+    terminal_cell: *mut PieTerminalCell,
 }
 
-#[derive(Debug)]
-enum WorkItem {
-    Launch {
-        instances: Vec<LaunchInstanceWork>,
-        completion: PieCompletion,
-    },
-    CopyKv {
-        completion: PieCompletion,
-    },
-    CopyState {
-        completion: PieCompletion,
-    },
-    ResizePool {
-        completion: PieCompletion,
-    },
+unsafe impl Send for LaunchInstanceWork {}
+unsafe impl Sync for LaunchInstanceWork {}
+
+struct LaunchInstanceResult {
+    outcome: u32,
+    notifications: Vec<(u64, u64)>,
 }
 
 #[derive(Clone)]
@@ -164,14 +173,23 @@ struct SendableRuntimeCallbacks {
 unsafe impl Send for SendableRuntimeCallbacks {}
 unsafe impl Sync for SendableRuntimeCallbacks {}
 
+enum PreparedCallback {
+    Inline,
+    Worker(mpsc::Sender<()>),
+}
+
 pub struct DummyDriver {
     capabilities: DriverCapabilities,
     state: Arc<Mutex<DummyState>>,
     next_program_id: AtomicU64,
     next_instance_id: AtomicU64,
+    reject_launches: bool,
+    reject_launches_remaining: u32,
+    fail_launches_after_accept: bool,
+    callback_delay_ms: u64,
+    runtime: SendableRuntimeCallbacks,
+    callback_workers: Vec<std::thread::JoinHandle<()>>,
     operation_log: Option<Arc<Mutex<Vec<String>>>>,
-    work_tx: Option<mpsc::Sender<WorkItem>>,
-    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DummyDriver {
@@ -185,18 +203,12 @@ impl DummyDriver {
 
     pub fn with_runtime(options: DummyDriverOptions, runtime: PieRuntimeCallbacks) -> Self {
         let state = Arc::new(Mutex::new(DummyState::default()));
-        let (work_tx, work_rx) = mpsc::channel();
-        let callback_delay_ms = options.callback_delay_ms;
         let operation_log = options.operation_log.clone();
         let runtime = SendableRuntimeCallbacks {
             ctx: runtime.ctx as usize,
             notify: runtime.notify,
             operation_log: operation_log.clone(),
         };
-        let worker = std::thread::Builder::new()
-            .name("pie-dummy-driver".to_string())
-            .spawn(move || worker_loop(work_rx, runtime, callback_delay_ms))
-            .expect("spawn dummy driver worker");
         Self {
             capabilities: DriverCapabilities {
                 abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
@@ -223,9 +235,13 @@ impl DummyDriver {
             state,
             next_program_id: AtomicU64::new(1),
             next_instance_id: AtomicU64::new(1),
+            reject_launches: options.reject_launches,
+            reject_launches_remaining: options.reject_launches_remaining,
+            fail_launches_after_accept: options.fail_launches_after_accept,
+            callback_delay_ms: options.callback_delay_ms,
+            runtime,
+            callback_workers: Vec::new(),
             operation_log,
-            work_tx: Some(work_tx),
-            worker: Some(worker),
         }
     }
 
@@ -233,6 +249,63 @@ impl DummyDriver {
         if let Some(log) = &self.operation_log {
             log.lock().unwrap().push(name.to_string());
         }
+    }
+
+    fn prepare_callback(&mut self, completion: PieCompletion) -> Result<PreparedCallback> {
+        self.reap_callback_workers();
+        if self.callback_delay_ms == 0 {
+            return Ok(PreparedCallback::Inline);
+        }
+        let (tx, rx) = mpsc::channel();
+        let runtime = self.runtime.clone();
+        let callback_delay_ms = self.callback_delay_ms;
+        let worker = std::thread::Builder::new()
+            .name("pie-dummy-callback".to_string())
+            .spawn(move || {
+                if rx.recv().is_ok() {
+                    notify_completion(
+                        &runtime,
+                        completion.wait_id,
+                        completion.target_epoch,
+                        callback_delay_ms,
+                    );
+                }
+            })
+            .map_err(|err| anyhow!("spawn dummy callback worker: {err}"))?;
+        self.callback_workers.push(worker);
+        Ok(PreparedCallback::Worker(tx))
+    }
+
+    fn publish_callback(&self, callback: PreparedCallback, completion: PieCompletion) {
+        match callback {
+            PreparedCallback::Inline => notify_completion(
+                &self.runtime,
+                completion.wait_id,
+                completion.target_epoch,
+                0,
+            ),
+            PreparedCallback::Worker(trigger) if trigger.send(()).is_err() => {
+                notify_completion(
+                    &self.runtime,
+                    completion.wait_id,
+                    completion.target_epoch,
+                    self.callback_delay_ms,
+                );
+            }
+            PreparedCallback::Worker(_) => {}
+        }
+    }
+
+    fn reap_callback_workers(&mut self) {
+        let mut live = Vec::with_capacity(self.callback_workers.len());
+        for worker in self.callback_workers.drain(..) {
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                live.push(worker);
+            }
+        }
+        self.callback_workers = live;
     }
 
     pub fn capabilities(&self) -> &DriverCapabilities {
@@ -275,6 +348,63 @@ impl DummyDriver {
         Ok(program_id)
     }
 
+    pub fn register_channel(&mut self, desc: &PieChannelDesc) -> Result<PieChannelEndpointBinding> {
+        unsafe { validate_channel_desc(desc) }.map_err(|err| anyhow!(err))?;
+        self.record_op("register_channel");
+        let shape = copy_u32_slice(desc.shape, "channel.shape")?;
+        let extern_name = copy_bytes(desc.extern_name, "channel.extern_name")?;
+        let cell_bytes = channel_wire_bytes(&shape, desc.dtype)?;
+        let mirror_len = cell_bytes
+            .checked_mul(desc.capacity as usize + 1)
+            .ok_or_else(|| anyhow!("channel mirror size overflow"))?;
+        let endpoint = DummyEndpoint {
+            channel_id: desc.channel_id,
+            shape: shape.clone(),
+            dtype: desc.dtype,
+            host_role: desc.host_role,
+            seeded: desc.seeded != 0,
+            capacity: desc.capacity,
+            reader_wait_id: desc.reader_wait_id,
+            writer_wait_id: desc.writer_wait_id,
+            extern_name: if extern_name.is_empty() {
+                None
+            } else {
+                Some(
+                    String::from_utf8(extern_name)
+                        .map_err(|_| anyhow!("channel extern name must be UTF-8"))?,
+                )
+            },
+            mirror: vec![0; mirror_len].into_boxed_slice(),
+            words: (0..4)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            attachments: HashMap::new(),
+            shared: if desc.extern_dir == PIE_CHANNEL_EXTERN_NONE {
+                None
+            } else {
+                let dtype = channel_program_dtype(desc.dtype)?;
+                let shape = pie_ptir::types::Shape::new(&shape)
+                    .ok_or_else(|| anyhow!("channel shape rank is unsupported"))?;
+                Some(ExternChannel::new(
+                    ValueType::new(shape, dtype),
+                    desc.capacity,
+                ))
+            },
+        };
+        let binding = endpoint_binding(&endpoint);
+        let mut state = self.state.lock().unwrap();
+        ensure!(
+            !state.channels.contains_key(&desc.channel_id),
+            "channel {} is already registered",
+            desc.channel_id
+        );
+        state
+            .channels
+            .insert(desc.channel_id, Arc::new(Mutex::new(endpoint)));
+        Ok(binding)
+    }
+
     pub fn bind_instance(&mut self, desc: &PieInstanceDesc) -> Result<PieInstanceBinding> {
         unsafe { validate_instance_desc(desc) }.map_err(|err| anyhow!(err))?;
         ensure_abi(desc.abi_version)?;
@@ -284,21 +414,10 @@ impl DummyDriver {
             "bind requires a nonzero pacing wait id"
         );
         let channel_ids = copy_u64_slice(desc.channel_ids, "instance.channel_ids")?;
-        let channel_waits = copy_channel_waits(desc.channel_waits, "instance.channel_waits")?;
-        ensure!(
-            channel_waits.len() == channel_ids.len(),
-            "bind requires one channel wait pair per channel id"
-        );
         ensure!(
             channel_ids.iter().copied().collect::<HashSet<_>>().len() == channel_ids.len(),
             "bind channel ids must be unique"
         );
-        for (idx, wait) in channel_waits.iter().enumerate() {
-            ensure!(
-                wait.reader_wait_id != 0 && wait.writer_wait_id != 0,
-                "channel wait {idx} must use nonzero wait ids"
-            );
-        }
         let seed_values = copy_value_descs(desc.seed_values, "instance.seed_values")?;
 
         let mut state = self.state.lock().unwrap();
@@ -310,13 +429,50 @@ impl DummyDriver {
         let instance_id = if desc.requested_instance_id == 0 {
             self.next_instance_id.fetch_add(1, Ordering::Relaxed)
         } else {
-            ensure!(
-                !state.instances.contains_key(&desc.requested_instance_id),
-                "instance {} already bound",
-                desc.requested_instance_id
-            );
             desc.requested_instance_id
         };
+        ensure!(
+            !state.instances.contains_key(&instance_id),
+            "instance {instance_id} already bound"
+        );
+        let endpoints = channel_ids
+            .iter()
+            .map(|channel_id| {
+                state
+                    .channels
+                    .get(channel_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("channel {channel_id} is not registered"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut externs = Vec::new();
+        for (dense, (decl, endpoint)) in program
+            .bound
+            .container
+            .channels
+            .iter()
+            .zip(endpoints.iter())
+            .enumerate()
+        {
+            let endpoint = endpoint.lock().unwrap();
+            ensure_endpoint_matches_program(&endpoint, &program, dense, decl, instance_id)?;
+            if program
+                .bound
+                .container
+                .externs
+                .iter()
+                .any(|binding| binding.chan == dense as u32)
+            {
+                externs.push((
+                    dense as u32,
+                    endpoint
+                        .shared
+                        .clone()
+                        .ok_or_else(|| anyhow!("extern channel has no shared ring"))?,
+                ));
+            }
+        }
 
         ensure!(
             channel_ids.len() == program.bound.container.channels.len(),
@@ -344,49 +500,67 @@ impl DummyDriver {
                 Ok((dense as u32, value))
             })
             .collect::<Result<Vec<_>>>()?;
-        let interp = InterpInstance::new(&program.bound, &seeds)
+        let interp = InterpInstance::new_with_externs(&program.bound, &seeds, &externs)
             .map_err(|err| anyhow!("instance bind failed: {err:?}"))?;
-        let (channels, bindings, mirror, words) =
-            build_channel_layout(&program, &channel_ids, &channel_waits)?;
+        let channels = program
+            .bound
+            .container
+            .channels
+            .iter()
+            .zip(channel_ids.iter().copied())
+            .zip(endpoints.iter().cloned())
+            .enumerate()
+            .map(|(dense, ((decl, global_id), endpoint))| DummyChannel {
+                global_id,
+                host_role: decl.host_role,
+                ty: program.bound.channel_types[dense],
+                endpoint,
+            })
+            .collect::<Vec<_>>();
         let channel_index_by_id = channels
             .iter()
             .enumerate()
             .map(|(idx, channel)| (channel.global_id, idx))
             .collect();
         let instance = Arc::new(BoundInstanceState {
-            program,
+            program: Arc::clone(&program),
             instance_id,
-            pacing_wait_id: desc.pacing_wait_id,
             inner: Mutex::new(BoundInstanceInner {
                 interp,
                 channels,
                 channel_index_by_id,
-                bindings,
-                mirror,
-                words,
                 next_pacing_epoch: 1,
-                in_flight: 0,
                 closed: false,
             }),
-            cv: Condvar::new(),
         });
-        let binding = {
-            let inner = instance.inner.lock().unwrap();
-            PieInstanceBinding {
-                instance_id,
-                frame_base: 0,
-                mirror_base: inner.mirror.as_ptr() as u64,
-                word_base: inner.words.as_ptr() as u64,
-                channel_count: inner.bindings.len() as u32,
-                word_count: inner.words.len() as u32,
-                frame_bytes: 0,
-                mirror_bytes: inner.mirror.len() as u64,
-                word_bytes: (inner.words.len() * std::mem::size_of::<u64>()) as u64,
-                channels: PieChannelBindingSlice {
-                    ptr: inner.bindings.as_ptr(),
-                    len: inner.bindings.len(),
-                },
+        for (dense, value) in &seeds {
+            if program.bound.container.channels[*dense as usize].host_role != HostRole::Reader {
+                continue;
             }
+            let bytes = encode_wire_value(value, program.bound.channel_types[*dense as usize])?;
+            publish_endpoint_value(
+                &endpoints[*dense as usize],
+                channel_ids[*dense as usize],
+                &bytes,
+            )?;
+        }
+        for (dense, endpoint) in endpoints.iter().enumerate() {
+            let extern_dir = program
+                .bound
+                .container
+                .externs
+                .iter()
+                .find(|binding| binding.chan == dense as u32)
+                .map(|binding| binding.dir);
+            endpoint
+                .lock()
+                .unwrap()
+                .attachments
+                .insert(instance_id, extern_dir);
+        }
+        let binding = PieInstanceBinding {
+            instance_id,
+            ..PieInstanceBinding::default()
         };
         state.instances.insert(instance_id, instance);
         Ok(binding)
@@ -397,6 +571,7 @@ impl DummyDriver {
         ensure_abi(desc.abi_version)?;
         self.record_op("launch");
         let instance_ids = copy_u64_slice(desc.instance_ids, "launch.instance_ids")?;
+        let terminal_cells = copy_terminal_cell_ptrs(desc.terminal_cells)?;
         ensure!(
             !instance_ids.is_empty(),
             "launch requires at least one bound instance"
@@ -412,6 +587,14 @@ impl DummyDriver {
             instance_ids.len(),
             "launch.host_put_indptr",
         )?;
+        if self.reject_launches {
+            bail!("launch rejected by dummy test option");
+        }
+        if self.reject_launches_remaining != 0 {
+            self.reject_launches_remaining -= 1;
+            bail!("launch rejected by dummy test option");
+        }
+        ensure_unique_launch_members(&instance_ids, &terminal_cells)?;
 
         let state = self.state.lock().unwrap();
         let instances = instance_ids
@@ -429,7 +612,7 @@ impl DummyDriver {
         let mut prepared = Vec::with_capacity(instances.len());
         for (slot, instance) in instances.iter().enumerate() {
             let range = host_put_indptr[slot] as usize..host_put_indptr[slot + 1] as usize;
-            let mut inner = instance.inner.lock().unwrap();
+            let inner = instance.inner.lock().unwrap();
             ensure!(!inner.closed, "instance {} is closed", instance.instance_id);
             let mut puts = Vec::with_capacity(range.len());
             for value_desc in &host_put_values[range] {
@@ -457,31 +640,48 @@ impl DummyDriver {
                 });
             }
             let pacing_epoch = inner.next_pacing_epoch;
-            inner.next_pacing_epoch += 1;
-            inner.in_flight += 1;
             drop(inner);
             prepared.push(LaunchInstanceWork {
                 instance: Arc::clone(instance),
                 pacing_epoch,
                 host_puts: puts,
+                terminal_cell: terminal_cells[slot],
             });
         }
 
-        self.work_tx
-            .as_ref()
-            .ok_or_else(|| anyhow!("dummy driver worker is not available"))?
-            .send(WorkItem::Launch {
-                instances: prepared,
-                completion,
+        let callback = self.prepare_callback(completion)?;
+        for instance in &prepared {
+            let mut inner = instance.instance.inner.lock().unwrap();
+            debug_assert_eq!(inner.next_pacing_epoch, instance.pacing_epoch);
+            inner.next_pacing_epoch += 1;
+        }
+        let results = prepared
+            .iter()
+            .map(|instance| {
+                if self.fail_launches_after_accept {
+                    fail_launch_instance(instance, "forced launch failure")
+                } else {
+                    process_launch_instance(instance)
+                }
             })
-            .map_err(|_| anyhow!("dummy driver worker has shut down"))
+            .collect::<Vec<_>>();
+        for (instance, result) in prepared.iter().zip(results.iter()) {
+            publish_terminal(instance.terminal_cell, result.outcome);
+        }
+        for result in &results {
+            for &(wait_id, epoch) in &result.notifications {
+                notify_runtime(&self.runtime, wait_id, epoch);
+            }
+        }
+        self.publish_callback(callback, completion);
+        Ok(())
     }
 
     pub fn copy_kv(&mut self, desc: &PieKvCopyDesc, completion: PieCompletion) -> Result<()> {
         validate_kv_copy_desc(desc).map_err(|err| anyhow!(err))?;
         ensure_abi(desc.abi_version)?;
         self.record_op("copy_kv");
-        ensure_completion(completion)?;
+        ensure_completion_mode(completion, true)?;
         let _src_page_ids = copy_u32_slice(desc.src_page_ids, "copy_kv.src_page_ids")?;
         let _dst_page_ids = copy_u32_slice(desc.dst_page_ids, "copy_kv.dst_page_ids")?;
         let cells = copy_kv_cells(desc)?;
@@ -491,14 +691,14 @@ impl DummyDriver {
                 "copy_kv cells and whole-page lists are mutually exclusive"
             );
         }
-        self.enqueue_noop(WorkItem::CopyKv { completion })
+        self.complete_noop(completion)
     }
 
     pub fn copy_state(&mut self, desc: &PieStateCopyDesc, completion: PieCompletion) -> Result<()> {
         validate_state_copy_desc(desc).map_err(|err| anyhow!(err))?;
         ensure_abi(desc.abi_version)?;
         self.record_op("copy_state");
-        ensure_completion(completion)?;
+        ensure_completion_mode(completion, true)?;
         let ranges = copy_state_ranges(desc)?;
         if !ranges.is_empty() {
             ensure!(
@@ -508,7 +708,7 @@ impl DummyDriver {
                 "copy_state requires non-empty token counts or distinct src/dst slots"
             );
         }
-        self.enqueue_noop(WorkItem::CopyState { completion })
+        self.complete_noop(completion)
     }
 
     pub fn resize_pool(
@@ -519,10 +719,10 @@ impl DummyDriver {
         validate_pool_resize_desc(desc).map_err(|err| anyhow!(err))?;
         ensure_abi(desc.abi_version)?;
         self.record_op("resize_pool");
-        ensure_completion(completion)?;
+        ensure_completion_mode(completion, true)?;
         let _maps = copy_pool_ranges(desc.map_ranges, "resize_pool.map_ranges")?;
         let _unmaps = copy_pool_ranges(desc.unmap_ranges, "resize_pool.unmap_ranges")?;
-        self.enqueue_noop(WorkItem::ResizePool { completion })
+        self.complete_noop(completion)
     }
 
     pub fn close_instance(&mut self, instance_id: u64) -> Result<()> {
@@ -536,21 +736,44 @@ impl DummyDriver {
                 .ok_or_else(|| anyhow!("unknown instance {instance_id}"))?
         };
         let mut inner = instance.inner.lock().unwrap();
-        while inner.in_flight != 0 {
-            inner = instance.cv.wait(inner).unwrap();
-        }
         inner.closed = true;
+        let endpoints = inner
+            .channels
+            .iter()
+            .map(|channel| Arc::clone(&channel.endpoint))
+            .collect::<Vec<_>>();
         drop(inner);
         self.state.lock().unwrap().instances.remove(&instance_id);
+        for endpoint in endpoints {
+            endpoint.lock().unwrap().attachments.remove(&instance_id);
+        }
         Ok(())
     }
 
-    fn enqueue_noop(&mut self, item: WorkItem) -> Result<()> {
-        self.work_tx
-            .as_ref()
-            .ok_or_else(|| anyhow!("dummy driver worker is not available"))?
-            .send(item)
-            .map_err(|_| anyhow!("dummy driver worker has shut down"))
+    pub fn close_channel(&mut self, channel_id: u64) -> Result<()> {
+        self.record_op("close_channel");
+        let mut state = self.state.lock().unwrap();
+        let endpoint = state
+            .channels
+            .get(&channel_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown channel {channel_id}"))?;
+        let endpoint = endpoint.lock().unwrap();
+        ensure!(
+            endpoint.attachments.is_empty(),
+            "channel {channel_id} still has instance attachments"
+        );
+        endpoint.words[3].store(1, Ordering::Release);
+        drop(endpoint);
+        state.channels.remove(&channel_id);
+        Ok(())
+    }
+
+    fn complete_noop(&mut self, completion: PieCompletion) -> Result<()> {
+        let callback = self.prepare_callback(completion)?;
+        publish_terminal(completion.terminal_cell, PIE_TERMINAL_OUTCOME_SUCCESS);
+        self.publish_callback(callback, completion);
+        Ok(())
     }
 
     fn model_profile(&self) -> ModelProfile {
@@ -579,59 +802,18 @@ impl Default for DummyDriver {
 
 impl Drop for DummyDriver {
     fn drop(&mut self) {
-        let _ = self.work_tx.take();
-        if let Some(worker) = self.worker.take() {
+        for worker in self.callback_workers.drain(..) {
             let _ = worker.join();
         }
         self.record_op("destroy");
     }
 }
 
-fn worker_loop(
-    rx: mpsc::Receiver<WorkItem>,
-    runtime: SendableRuntimeCallbacks,
-    callback_delay_ms: u64,
-) {
-    while let Ok(item) = rx.recv() {
-        match item {
-            WorkItem::Launch {
-                instances,
-                completion,
-            } => {
-                for instance in instances {
-                    process_launch_instance(&instance, &runtime, callback_delay_ms);
-                }
-                notify_completion(
-                    &runtime,
-                    completion.wait_id,
-                    completion.target_epoch,
-                    callback_delay_ms,
-                );
-            }
-            WorkItem::CopyKv { completion }
-            | WorkItem::CopyState { completion }
-            | WorkItem::ResizePool { completion } => {
-                notify_completion(
-                    &runtime,
-                    completion.wait_id,
-                    completion.target_epoch,
-                    callback_delay_ms,
-                );
-            }
-        }
-    }
-}
-
-fn process_launch_instance(
-    instance: &LaunchInstanceWork,
-    runtime: &SendableRuntimeCallbacks,
-    callback_delay_ms: u64,
-) {
-    let mut notify_readers = Vec::new();
-    let pacing_wait_id = instance.instance.pacing_wait_id;
-    {
+fn process_launch_instance(instance: &LaunchInstanceWork) -> LaunchInstanceResult {
+    let mut notify_waits = Vec::new();
+    let outcome = {
         let mut inner = instance.instance.inner.lock().unwrap();
-        match run_instance_step(
+        let outcome = match run_instance_step(
             &mut inner,
             &instance.instance.program,
             instance.instance.instance_id,
@@ -639,29 +821,48 @@ fn process_launch_instance(
             &instance.host_puts,
         ) {
             Ok(reader_epochs) => {
-                for (wait_id, epoch) in reader_epochs {
-                    notify_readers.push((wait_id, epoch));
-                }
+                notify_waits.extend(reader_epochs);
+                PIE_TERMINAL_OUTCOME_SUCCESS
             }
             Err(err) => {
-                poison_instance(&mut inner, &mut notify_readers, &err.to_string());
+                eprintln!(
+                    "[pie-driver-dummy] instance {} launch failed: {err:#}",
+                    instance.instance.instance_id
+                );
+                poison_instance(&mut inner, &mut notify_waits, &err.to_string());
+                PIE_TERMINAL_OUTCOME_FAILED
             }
+        };
+        outcome
+    };
+    LaunchInstanceResult {
+        outcome,
+        notifications: notify_waits,
+    }
+}
+
+fn fail_launch_instance(instance: &LaunchInstanceWork, reason: &str) -> LaunchInstanceResult {
+    let mut notify_waits = Vec::new();
+    {
+        let mut inner = instance.instance.inner.lock().unwrap();
+        poison_instance(&mut inner, &mut notify_waits, reason);
+    }
+    LaunchInstanceResult {
+        outcome: PIE_TERMINAL_OUTCOME_FAILED,
+        notifications: notify_waits,
+    }
+}
+
+fn publish_terminal(cell: *mut PieTerminalCell, outcome: u32) {
+    if cell.is_null() {
+        return;
+    }
+    {
+        unsafe {
+            (*cell).reserved0 = 0;
+            AtomicU32::from_ptr(cell.cast::<u32>()).store(outcome, Ordering::Release);
         }
     }
-    for (wait_id, epoch) in notify_readers {
-        notify_completion(runtime, wait_id, epoch, callback_delay_ms);
-    }
-    if pacing_wait_id != 0 {
-        notify_completion(
-            runtime,
-            pacing_wait_id,
-            instance.pacing_epoch,
-            callback_delay_ms,
-        );
-    }
-    let mut inner = instance.instance.inner.lock().unwrap();
-    inner.in_flight = inner.in_flight.saturating_sub(1);
-    instance.instance.cv.notify_all();
 }
 
 fn run_instance_step(
@@ -671,6 +872,7 @@ fn run_instance_step(
     pacing_epoch: u64,
     host_puts: &[PreparedHostPut],
 ) -> Result<Vec<(u64, u64)>> {
+    let mut notify_waits = Vec::new();
     for host_put in host_puts {
         inner
             .interp
@@ -693,29 +895,36 @@ fn run_instance_step(
         .step(&program.bound, &pass_inputs, &mut NoKernels)
         .map_err(|err| anyhow!("interp step failed: {}", format_step_error(&err)))?;
     if !report.committed {
-        return Ok(Vec::new());
+        bail!(
+            "accepted launch missed its readiness invariant{}",
+            report
+                .missed
+                .map(|(channel, phase)| format!(" at channel {channel}, phase {phase:?}"))
+                .unwrap_or_default()
+        );
+    }
+    for host_put in host_puts {
+        let endpoint = inner.channels[host_put.dense_channel]
+            .endpoint
+            .lock()
+            .unwrap();
+        let head = endpoint.words[0].fetch_add(1, Ordering::Release) + 1;
+        notify_waits.push((endpoint.writer_wait_id, head));
     }
 
-    let mut notified = Vec::new();
     for dense in 0..inner.channels.len() {
         let channel = inner.channels[dense].clone();
         if channel.host_role != HostRole::Reader {
             continue;
         }
-        let mut channel_notified = false;
         loop {
             match inner.interp.host_take(&program.bound, dense as u32) {
                 Ok(value) => {
                     let bytes = encode_wire_value(&value, channel.ty).map_err(|err| {
                         anyhow!("channel {} encode failed: {err}", channel.global_id)
                     })?;
-                    let epoch = publish_reader_value(inner, dense, &bytes)?;
-                    if !channel_notified {
-                        notified.push((channel.waits.reader_wait_id, epoch));
-                        channel_notified = true;
-                    } else if let Some((_, last_epoch)) = notified.last_mut() {
-                        *last_epoch = epoch;
-                    }
+                    let publication = publish_reader_value(inner, dense, &bytes)?;
+                    notify_waits.push(publication);
                 }
                 Err(HostError::WouldBlock) => break,
                 Err(err) => bail!(
@@ -725,48 +934,67 @@ fn run_instance_step(
             }
         }
     }
-    Ok(notified)
+    Ok(notify_waits)
 }
 
 fn poison_instance(
     inner: &mut BoundInstanceInner,
-    notify_readers: &mut Vec<(u64, u64)>,
+    notify_waiters: &mut Vec<(u64, u64)>,
     _reason: &str,
 ) {
     inner.interp.poison();
     for channel in &inner.channels {
-        if channel.host_role != HostRole::Reader {
-            continue;
-        }
-        let tail = inner.words[channel.tail_word_index].load(Ordering::Acquire);
-        inner.words[channel.poison_word_index].store(1, Ordering::Release);
-        notify_readers.push((channel.waits.reader_wait_id, tail.saturating_add(1).max(1)));
+        let endpoint = channel.endpoint.lock().unwrap();
+        let tail = endpoint.words[1].load(Ordering::Acquire);
+        let poison_epoch = tail.saturating_add(1).max(1);
+        endpoint.words[2].store(poison_epoch, Ordering::Release);
+        let wait_id = match channel.host_role {
+            HostRole::Reader => endpoint.reader_wait_id,
+            HostRole::Writer => endpoint.writer_wait_id,
+            HostRole::None => 0,
+        };
+        notify_waiters.push((wait_id, poison_epoch));
     }
 }
 
-fn publish_reader_value(inner: &mut BoundInstanceInner, dense: usize, bytes: &[u8]) -> Result<u64> {
+fn publish_reader_value(
+    inner: &mut BoundInstanceInner,
+    dense: usize,
+    bytes: &[u8],
+) -> Result<(u64, u64)> {
     let channel = &inner.channels[dense];
+    let tail = publish_endpoint_value(&channel.endpoint, channel.global_id, bytes)?;
+    let wait_id = channel.endpoint.lock().unwrap().reader_wait_id;
+    Ok((wait_id, tail))
+}
+
+fn publish_endpoint_value(
+    endpoint: &Arc<Mutex<DummyEndpoint>>,
+    channel_id: u64,
+    bytes: &[u8],
+) -> Result<u64> {
+    let mut endpoint = endpoint.lock().unwrap();
+    let cell_bytes = channel_wire_bytes(&endpoint.shape, endpoint.dtype)?;
     ensure!(
-        bytes.len() == channel.cell_bytes,
+        bytes.len() == cell_bytes,
         "channel {} wrote {} bytes, expected {}",
-        channel.global_id,
+        channel_id,
         bytes.len(),
-        channel.cell_bytes
+        cell_bytes
     );
-    let tail = inner.words[channel.tail_word_index].load(Ordering::Acquire);
-    let ring_cells = channel.capacity as usize + 1;
-    let slot = (tail as usize % ring_cells) * channel.cell_bytes;
-    let start = channel.mirror_offset + slot;
-    let end = start + channel.cell_bytes;
-    inner.mirror[start..end].copy_from_slice(bytes);
+    let tail = endpoint.words[1].load(Ordering::Acquire);
+    let head = endpoint.words[0].load(Ordering::Acquire);
+    ensure!(
+        tail.saturating_sub(head) < endpoint.capacity as u64,
+        "channel {} has no reserved output capacity",
+        channel_id
+    );
+    let ring_cells = endpoint.capacity as usize + 1;
+    let slot = (tail as usize % ring_cells) * cell_bytes;
+    endpoint.mirror[slot..slot + cell_bytes].copy_from_slice(bytes);
     let next_tail = tail + 1;
-    inner.words[channel.tail_word_index].store(next_tail, Ordering::Release);
-    let head = inner.words[channel.head_word_index].load(Ordering::Acquire);
-    if next_tail.saturating_sub(head) > channel.capacity as u64 {
-        inner.words[channel.head_word_index]
-            .store(next_tail - channel.capacity as u64, Ordering::Release);
-    }
-    inner.words[channel.poison_word_index].store(0, Ordering::Release);
+    endpoint.words[1].store(next_tail, Ordering::Release);
+    endpoint.words[2].store(0, Ordering::Release);
     Ok(next_tail)
 }
 
@@ -785,6 +1013,13 @@ fn notify_completion(
     if let Some(log) = &runtime.operation_log {
         log.lock().unwrap().push("callback".to_string());
     }
+    notify_runtime(runtime, wait_id, epoch);
+}
+
+fn notify_runtime(runtime: &SendableRuntimeCallbacks, wait_id: u64, epoch: u64) {
+    if wait_id == 0 || epoch == 0 {
+        return;
+    }
     if let Some(notify) = runtime.notify {
         let _ = std::panic::catch_unwind(|| unsafe {
             notify(runtime.ctx as *mut std::ffi::c_void, wait_id, epoch)
@@ -792,69 +1027,102 @@ fn notify_completion(
     }
 }
 
-fn build_channel_layout(
-    program: &Arc<DummyProgram>,
-    channel_ids: &[u64],
-    channel_waits: &[PieChannelWait],
-) -> Result<(
-    Vec<DummyChannel>,
-    Box<[PieChannelBinding]>,
-    Box<[u8]>,
-    Box<[AtomicU64]>,
-)> {
-    let mut channels = Vec::with_capacity(program.bound.container.channels.len());
-    let mut bindings = Vec::new();
-    let mut mirror_bytes = 0usize;
-    let mut reader_rank = 0usize;
-    for (dense, decl) in program.bound.container.channels.iter().enumerate() {
-        let ty = program.bound.channel_types[dense];
-        let cell_bytes = wire_len(ty);
-        let (mirror_offset, head_word_index, tail_word_index, poison_word_index) =
-            if decl.host_role == HostRole::Reader {
-                let mirror_offset = mirror_bytes;
-                mirror_bytes += cell_bytes * (decl.capacity as usize + 1);
-                let head_word_index = reader_rank * 3;
-                let tail_word_index = head_word_index + 1;
-                let poison_word_index = head_word_index + 2;
-                reader_rank += 1;
-                bindings.push(PieChannelBinding {
-                    channel_id: channel_ids[dense],
-                    cell_bytes: cell_bytes as u32,
-                    capacity: decl.capacity,
-                    mirror_offset: mirror_offset as u64,
-                    head_word_index: head_word_index as u32,
-                    tail_word_index: tail_word_index as u32,
-                    poison_word_index: poison_word_index as u32,
-                    reserved: 0,
-                });
-                (
-                    mirror_offset,
-                    head_word_index,
-                    tail_word_index,
-                    poison_word_index,
-                )
-            } else {
-                (0, 0, 0, 0)
-            };
-        channels.push(DummyChannel {
-            global_id: channel_ids[dense],
-            host_role: decl.host_role,
-            ty,
-            capacity: decl.capacity,
-            cell_bytes,
-            mirror_offset,
-            head_word_index,
-            tail_word_index,
-            poison_word_index,
-            waits: channel_waits[dense],
-        });
+fn channel_program_dtype(dtype: u8) -> Result<DType> {
+    match dtype {
+        PIE_CHANNEL_DTYPE_F32 | PIE_CHANNEL_DTYPE_ACT => Ok(DType::F32),
+        PIE_CHANNEL_DTYPE_I32 => Ok(DType::I32),
+        PIE_CHANNEL_DTYPE_U32 => Ok(DType::U32),
+        PIE_CHANNEL_DTYPE_BOOL => Ok(DType::Bool),
+        _ => bail!("unsupported channel dtype {dtype}"),
     }
-    let mirror = vec![0xA5u8; mirror_bytes].into_boxed_slice();
-    let words = (0..reader_rank * 3)
-        .map(|_| AtomicU64::new(0))
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    Ok((channels, bindings.into_boxed_slice(), mirror, words))
+}
+
+fn channel_wire_bytes(shape: &[u32], dtype: u8) -> Result<usize> {
+    let numel = shape.iter().try_fold(1usize, |product, &dim| {
+        product
+            .checked_mul(dim as usize)
+            .ok_or_else(|| anyhow!("channel shape size overflow"))
+    })?;
+    Ok(if dtype == PIE_CHANNEL_DTYPE_BOOL {
+        numel.div_ceil(8)
+    } else {
+        numel
+            .checked_mul(4)
+            .ok_or_else(|| anyhow!("channel byte size overflow"))?
+    })
+}
+
+fn endpoint_binding(endpoint: &DummyEndpoint) -> PieChannelEndpointBinding {
+    PieChannelEndpointBinding {
+        channel_id: endpoint.channel_id,
+        mirror_base: endpoint.mirror.as_ptr() as u64,
+        word_base: endpoint.words.as_ptr() as u64,
+        mirror_bytes: endpoint.mirror.len() as u64,
+        word_bytes: (endpoint.words.len() * std::mem::size_of::<u64>()) as u64,
+        cell_bytes: channel_wire_bytes(&endpoint.shape, endpoint.dtype)
+            .expect("validated endpoint geometry") as u32,
+        capacity: endpoint.capacity,
+        head_word_index: 0,
+        tail_word_index: 1,
+        poison_word_index: 2,
+        closed_word_index: 3,
+    }
+}
+
+fn ensure_endpoint_matches_program(
+    endpoint: &DummyEndpoint,
+    program: &DummyProgram,
+    dense: usize,
+    decl: &pie_ptir::container::ChannelDecl,
+    instance_id: u64,
+) -> Result<()> {
+    ensure!(
+        endpoint.shape == decl.shape.dims()
+            && endpoint.dtype == decl.dtype.tag()
+            && endpoint.host_role == decl.host_role as u8
+            && endpoint.seeded == decl.seeded
+            && endpoint.capacity == decl.capacity,
+        "channel {} contract conflicts with program declaration",
+        endpoint.channel_id
+    );
+    let extern_decl = program
+        .bound
+        .container
+        .externs
+        .iter()
+        .find(|binding| binding.chan == dense as u32);
+    match extern_decl {
+        None => {
+            ensure!(
+                endpoint.extern_name.is_none() && endpoint.attachments.is_empty(),
+                "private channel {} is already attached",
+                endpoint.channel_id
+            );
+        }
+        Some(extern_decl) => {
+            let name = &program.bound.container.names[extern_decl.name as usize];
+            ensure!(
+                endpoint.extern_name.as_deref() == Some(name.as_str()),
+                "channel {} extern name conflicts with program",
+                endpoint.channel_id
+            );
+            ensure!(
+                !endpoint
+                    .attachments
+                    .values()
+                    .any(|dir| *dir == Some(extern_decl.dir)),
+                "channel {} extern {:?} endpoint is already attached",
+                endpoint.channel_id,
+                extern_decl.dir
+            );
+        }
+    }
+    ensure!(
+        !endpoint.attachments.contains_key(&instance_id),
+        "channel {} already attached to instance {instance_id}",
+        endpoint.channel_id
+    );
+    Ok(())
 }
 
 fn collect_intrinsics(bound: &BoundTrace) -> ProgramIntrinsics {
@@ -989,13 +1257,58 @@ fn ensure_abi(abi_version: u32) -> Result<()> {
 }
 
 fn ensure_completion(completion: PieCompletion) -> Result<()> {
+    ensure_completion_mode(completion, false)
+}
+
+fn ensure_completion_mode(completion: PieCompletion, require_terminal_cell: bool) -> Result<()> {
+    validate_completion(completion, require_terminal_cell).map_err(|err| anyhow!(err.message()))?;
+    if require_terminal_cell {
+        ensure_terminal_cell_pending(completion.terminal_cell)?;
+    } else {
+        ensure!(
+            completion.terminal_cell.is_null(),
+            "launch completion terminal_cell must be null"
+        );
+    }
+    Ok(())
+}
+
+fn copy_terminal_cell_ptrs(slice: PieTerminalCellPtrSlice) -> Result<Vec<*mut PieTerminalCell>> {
+    if slice.len == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(unsafe { std::slice::from_raw_parts(slice.ptr, slice.len) }.to_vec())
+}
+
+fn ensure_unique_launch_members(
+    instance_ids: &[u64],
+    terminal_cells: &[*mut PieTerminalCell],
+) -> Result<()> {
+    let mut unique_instances = HashSet::with_capacity(instance_ids.len());
+    let mut unique_cells = HashSet::with_capacity(terminal_cells.len());
+    for (&instance_id, &terminal_cell) in instance_ids.iter().zip(terminal_cells) {
+        ensure!(
+            unique_instances.insert(instance_id),
+            "launch contains duplicate instance {instance_id}"
+        );
+        ensure!(
+            unique_cells.insert(terminal_cell as usize),
+            "launch terminal cells must be distinct"
+        );
+        ensure_terminal_cell_pending(terminal_cell)?;
+    }
+    Ok(())
+}
+
+fn ensure_terminal_cell_pending(cell: *mut PieTerminalCell) -> Result<()> {
+    let outcome = unsafe { AtomicU32::from_ptr(cell.cast::<u32>()).load(Ordering::Acquire) };
     ensure!(
-        completion.wait_id != 0,
-        "completion wait_id must be nonzero"
+        outcome == pie_driver_abi::PIE_TERMINAL_OUTCOME_PENDING,
+        "terminal cell must be Pending before acceptance"
     );
     ensure!(
-        completion.target_epoch != 0,
-        "completion target_epoch must be nonzero"
+        unsafe { (*cell).reserved0 } == 0,
+        "terminal cell reserved0 must be zero"
     );
     Ok(())
 }
@@ -1198,17 +1511,6 @@ fn copy_u64_slice(slice: PieU64Slice, name: &str) -> Result<Vec<u64>> {
     Ok(unsafe { std::slice::from_raw_parts(slice.ptr, slice.len) }.to_vec())
 }
 
-fn copy_channel_waits(slice: PieChannelWaitSlice, name: &str) -> Result<Vec<PieChannelWait>> {
-    if slice.len == 0 {
-        return Ok(Vec::new());
-    }
-    ensure!(
-        !slice.ptr.is_null(),
-        "{name} pointer is null with nonzero length"
-    );
-    Ok(unsafe { std::slice::from_raw_parts(slice.ptr, slice.len) }.to_vec())
-}
-
 fn copy_value_descs(slice: PieChannelValueDescSlice, name: &str) -> Result<Vec<OwnedValueDesc>> {
     if slice.len == 0 {
         return Ok(Vec::new());
@@ -1375,15 +1677,44 @@ fn unpack_bool(wire: &[u8], numel: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pie_driver_abi::PieChannelValueDesc;
+    use pie_driver_abi::{
+        PIE_CHANNEL_EXTERN_EXPORT, PIE_CHANNEL_HOST_ROLE_NONE, PIE_TERMINAL_OUTCOME_PENDING,
+        PieChannelValueDesc,
+    };
     use pie_ptir::container::{
-        ChanDType, ChannelDecl, PortBinding, PortSource, StageProgram, TraceContainer,
+        ChanDType, ChannelDecl, ExternDecl, PortBinding, PortSource, StageProgram, TraceContainer,
     };
     use pie_ptir::expand;
     use pie_ptir::registry::{Port, Stage};
     use pie_ptir::types::{Literal, Shape};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Default)]
+    struct PieChannelWait {
+        reader_wait_id: u64,
+        writer_wait_id: u64,
+    }
+
+    struct TestInstanceBinding {
+        instance_id: u64,
+        endpoints: Vec<PieChannelEndpointBinding>,
+        reader_dense: Vec<usize>,
+        mirror_bytes: u64,
+        word_count: u32,
+        channel_count: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestChannelBinding {
+        channel_id: u64,
+        cell_bytes: u32,
+        mirror_offset: u64,
+        head_word_index: u32,
+        tail_word_index: u32,
+        poison_word_index: u32,
+        endpoint_index: usize,
+    }
 
     #[derive(Default)]
     struct CallbackState {
@@ -1402,28 +1733,38 @@ mod tests {
     }
 
     impl CallbackState {
-        fn wait_for(&self, expected: usize) {
+        fn notifications(&self) -> Vec<(u64, u64)> {
+            self.notifications.lock().unwrap().clone()
+        }
+
+        fn wait_for_notification(&self, expected: (u64, u64)) {
             let deadline = Instant::now() + Duration::from_secs(5);
             let (lock, cv) = &self.pair;
             let mut seen = lock.lock().unwrap();
-            while *seen < expected {
+            loop {
+                if self.notifications.lock().unwrap().contains(&expected) {
+                    return;
+                }
                 let now = Instant::now();
                 assert!(
                     now < deadline,
-                    "timed out waiting for {expected} notifications"
+                    "timed out waiting for notification {expected:?}"
                 );
                 let timeout = deadline.saturating_duration_since(now);
                 let (next_seen, wait) = cv.wait_timeout(seen, timeout).unwrap();
                 seen = next_seen;
                 assert!(
                     !wait.timed_out(),
-                    "timed out waiting for {expected} notifications"
+                    "timed out waiting for notification {expected:?}"
                 );
             }
         }
 
-        fn notifications(&self) -> Vec<(u64, u64)> {
-            self.notifications.lock().unwrap().clone()
+        fn notifications_for(&self, wait_id: u64) -> Vec<(u64, u64)> {
+            self.notifications()
+                .into_iter()
+                .filter(|notice| notice.0 == wait_id)
+                .collect()
         }
     }
 
@@ -1447,6 +1788,13 @@ mod tests {
         )
     }
 
+    fn pending_terminal_cell() -> PieTerminalCell {
+        PieTerminalCell {
+            outcome: 0,
+            reserved0: 0,
+        }
+    }
+
     fn bind_program(
         driver: &mut DummyDriver,
         bytes: Vec<u8>,
@@ -1454,7 +1802,56 @@ mod tests {
         waits: &[PieChannelWait],
         seeds: &[OwnedValueDesc],
         pacing_wait_id: u64,
-    ) -> PieInstanceBinding {
+    ) -> TestInstanceBinding {
+        let container = container::decode(&bytes).unwrap();
+        assert_eq!(channel_ids.len(), container.channels.len());
+        assert_eq!(waits.len(), container.channels.len());
+        let mut endpoints = Vec::with_capacity(channel_ids.len());
+        let mut reader_dense = Vec::new();
+        for (dense, ((&channel_id, wait), decl)) in channel_ids
+            .iter()
+            .zip(waits)
+            .zip(&container.channels)
+            .enumerate()
+        {
+            let extern_decl = container
+                .externs
+                .iter()
+                .find(|binding| binding.chan == dense as u32);
+            let (extern_dir, extern_name) = match extern_decl {
+                None => (PIE_CHANNEL_EXTERN_NONE, &[][..]),
+                Some(binding) => (
+                    match binding.dir {
+                        ExternDir::Import => pie_driver_abi::PIE_CHANNEL_EXTERN_IMPORT,
+                        ExternDir::Export => pie_driver_abi::PIE_CHANNEL_EXTERN_EXPORT,
+                    },
+                    container.names[binding.name as usize].as_bytes(),
+                ),
+            };
+            let desc = PieChannelDesc {
+                channel_id,
+                shape: PieU32Slice {
+                    ptr: decl.shape.dims().as_ptr(),
+                    len: decl.shape.dims().len(),
+                },
+                dtype: decl.dtype.tag(),
+                host_role: decl.host_role as u8,
+                seeded: u8::from(decl.seeded),
+                extern_dir,
+                capacity: decl.capacity,
+                reader_wait_id: wait.reader_wait_id,
+                writer_wait_id: wait.writer_wait_id,
+                extern_name: PieBytes {
+                    ptr: extern_name.as_ptr(),
+                    len: extern_name.len(),
+                },
+                ..PieChannelDesc::default()
+            };
+            endpoints.push(driver.register_channel(&desc).unwrap());
+            if decl.host_role == HostRole::Reader {
+                reader_dense.push(dense);
+            }
+        }
         let program_id = driver
             .register_program(&PieProgramDesc {
                 program_hash: pie_ptir::container_hash(&bytes),
@@ -1475,14 +1872,10 @@ mod tests {
                 },
             })
             .collect::<Vec<_>>();
-        driver
+        let instance = driver
             .bind_instance(&PieInstanceDesc {
                 program_id,
                 pacing_wait_id,
-                channel_waits: PieChannelWaitSlice {
-                    ptr: waits.as_ptr(),
-                    len: waits.len(),
-                },
                 channel_ids: PieU64Slice {
                     ptr: channel_ids.as_ptr(),
                     len: channel_ids.len(),
@@ -1493,7 +1886,18 @@ mod tests {
                 },
                 ..PieInstanceDesc::default()
             })
-            .unwrap()
+            .unwrap();
+        TestInstanceBinding {
+            instance_id: instance.instance_id,
+            mirror_bytes: reader_dense
+                .iter()
+                .map(|&dense| endpoints[dense].mirror_bytes)
+                .sum(),
+            word_count: (reader_dense.len() * 4) as u32,
+            channel_count: reader_dense.len() as u32,
+            endpoints,
+            reader_dense,
+        }
     }
 
     fn chan(shape: Shape, dtype: DType, host_role: HostRole, seeded: bool) -> ChannelDecl {
@@ -1503,6 +1907,111 @@ mod tests {
             capacity: 1,
             host_role,
             seeded,
+        }
+    }
+
+    fn endpoint_contract(
+        driver: &mut DummyDriver,
+        channel_id: u64,
+        extern_dir: u8,
+        extern_name: &[u8],
+    ) -> PieChannelEndpointBinding {
+        let shape = [1u32];
+        driver
+            .register_channel(&PieChannelDesc {
+                channel_id,
+                shape: PieU32Slice {
+                    ptr: shape.as_ptr(),
+                    len: shape.len(),
+                },
+                dtype: PIE_CHANNEL_DTYPE_U32,
+                host_role: PIE_CHANNEL_HOST_ROLE_NONE,
+                seeded: 0,
+                extern_dir,
+                capacity: 1,
+                reader_wait_id: channel_id + 1_000,
+                writer_wait_id: channel_id + 2_000,
+                extern_name: PieBytes {
+                    ptr: extern_name.as_ptr(),
+                    len: extern_name.len(),
+                },
+                ..PieChannelDesc::default()
+            })
+            .unwrap()
+    }
+
+    fn register_test_program(driver: &mut DummyDriver, container: TraceContainer) -> u64 {
+        let bytes = container.encode();
+        driver
+            .register_program(&PieProgramDesc {
+                program_hash: pie_ptir::container_hash(&bytes),
+                canonical_bytes: PieBytes {
+                    ptr: bytes.as_ptr(),
+                    len: bytes.len(),
+                },
+                ..PieProgramDesc::default()
+            })
+            .unwrap()
+    }
+
+    fn bind_existing_channels(
+        driver: &mut DummyDriver,
+        program_id: u64,
+        requested_instance_id: u64,
+        channel_ids: &[u64],
+    ) -> Result<PieInstanceBinding> {
+        driver.bind_instance(&PieInstanceDesc {
+            program_id,
+            requested_instance_id,
+            pacing_wait_id: requested_instance_id + 10_000,
+            channel_ids: PieU64Slice {
+                ptr: channel_ids.as_ptr(),
+                len: channel_ids.len(),
+            },
+            ..PieInstanceDesc::default()
+        })
+    }
+
+    fn private_container(channel_count: usize) -> TraceContainer {
+        TraceContainer {
+            names: vec![],
+            externs: vec![],
+            channels: (0..channel_count)
+                .map(|_| chan(Shape::vector(1), DType::U32, HostRole::None, false))
+                .collect(),
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![],
+            }],
+        }
+    }
+
+    fn extern_container(dir: ExternDir) -> TraceContainer {
+        let ops = match dir {
+            ExternDir::Export => vec![
+                Op::Const(Literal::U32(1)),
+                Op::Broadcast {
+                    value: 0,
+                    shape: Shape::vector(1),
+                },
+                Op::ChanPut { chan: 0, value: 1 },
+            ],
+            ExternDir::Import => vec![Op::ChanTake(0)],
+        };
+        TraceContainer {
+            names: vec!["shared".to_string()],
+            externs: vec![ExternDecl {
+                name: 0,
+                dir,
+                chan: 0,
+            }],
+            channels: vec![chan(Shape::vector(1), DType::U32, HostRole::None, false)],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops,
+            }],
         }
     }
 
@@ -1793,40 +2302,58 @@ mod tests {
         .encode()
     }
 
-    fn read_binding(binding: &PieInstanceBinding, index: usize) -> PieChannelBinding {
-        unsafe { *binding.channels.ptr.add(index) }
+    fn read_binding(binding: &TestInstanceBinding, index: usize) -> TestChannelBinding {
+        let endpoint_index = binding.reader_dense[index];
+        let endpoint = binding.endpoints[endpoint_index];
+        let mirror_offset = binding.reader_dense[..index]
+            .iter()
+            .map(|&dense| binding.endpoints[dense].mirror_bytes)
+            .sum();
+        TestChannelBinding {
+            channel_id: endpoint.channel_id,
+            cell_bytes: endpoint.cell_bytes,
+            mirror_offset,
+            head_word_index: (index * 4) as u32,
+            tail_word_index: (index * 4 + 1) as u32,
+            poison_word_index: (index * 4 + 2) as u32,
+            endpoint_index,
+        }
     }
 
-    fn read_bindings(binding: &PieInstanceBinding) -> Vec<PieChannelBinding> {
+    fn read_bindings(binding: &TestInstanceBinding) -> Vec<TestChannelBinding> {
         (0..binding.channel_count as usize)
             .map(|index| read_binding(binding, index))
             .collect()
     }
 
-    fn read_binding_by_id(binding: &PieInstanceBinding, channel_id: u64) -> PieChannelBinding {
+    fn read_binding_by_id(binding: &TestInstanceBinding, channel_id: u64) -> TestChannelBinding {
         read_bindings(binding)
             .into_iter()
             .find(|channel| channel.channel_id == channel_id)
             .unwrap_or_else(|| panic!("missing exported binding for channel {channel_id}"))
     }
 
-    fn read_words(binding: &PieInstanceBinding) -> Vec<u64> {
-        unsafe {
-            std::slice::from_raw_parts(
-                binding.word_base as *const AtomicU64,
-                binding.word_count as usize,
-            )
+    fn read_words(binding: &TestInstanceBinding) -> Vec<u64> {
+        let mut out = Vec::with_capacity(binding.word_count as usize);
+        for &dense in &binding.reader_dense {
+            let endpoint = binding.endpoints[dense];
+            let words =
+                unsafe { std::slice::from_raw_parts(endpoint.word_base as *const AtomicU64, 4) };
+            out.extend(words.iter().map(|word| word.load(Ordering::Acquire)));
         }
-        .iter()
-        .map(|word| word.load(Ordering::Acquire))
-        .collect()
+        out
     }
 
-    fn read_cell(binding: &PieInstanceBinding, channel: PieChannelBinding, slot: usize) -> Vec<u8> {
-        let offset = channel.mirror_offset as usize + slot * channel.cell_bytes as usize;
+    fn read_cell(
+        binding: &TestInstanceBinding,
+        channel: TestChannelBinding,
+        slot: usize,
+    ) -> Vec<u8> {
+        let endpoint = binding.endpoints[channel.endpoint_index];
+        let offset = slot * channel.cell_bytes as usize;
         unsafe {
             std::slice::from_raw_parts(
-                (binding.mirror_base as *const u8).add(offset),
+                (endpoint.mirror_base as *const u8).add(offset),
                 channel.cell_bytes as usize,
             )
         }
@@ -1834,7 +2361,44 @@ mod tests {
     }
 
     #[test]
-    fn launch_publishes_token_entropy_dist_logprobs_and_notifies_readers_pacing_and_batch() {
+    fn endpoint_attachments_are_exclusive_atomic_and_close_ordered() {
+        let mut driver = DummyDriver::default();
+
+        endpoint_contract(&mut driver, 1, PIE_CHANNEL_EXTERN_NONE, &[]);
+        let private_program = register_test_program(&mut driver, private_container(1));
+        let private = bind_existing_channels(&mut driver, private_program, 101, &[1]).unwrap();
+        assert!(bind_existing_channels(&mut driver, private_program, 102, &[1]).is_err());
+        assert!(driver.close_channel(1).is_err());
+        driver.close_instance(private.instance_id).unwrap();
+        driver.close_channel(1).unwrap();
+
+        endpoint_contract(&mut driver, 2, PIE_CHANNEL_EXTERN_EXPORT, b"shared");
+        let export_program =
+            register_test_program(&mut driver, extern_container(ExternDir::Export));
+        let import_program =
+            register_test_program(&mut driver, extern_container(ExternDir::Import));
+        let export = bind_existing_channels(&mut driver, export_program, 201, &[2]).unwrap();
+        let import = bind_existing_channels(&mut driver, import_program, 202, &[2]).unwrap();
+        assert!(bind_existing_channels(&mut driver, export_program, 203, &[2]).is_err());
+        assert!(driver.close_channel(2).is_err());
+        driver.close_instance(export.instance_id).unwrap();
+        driver.close_instance(import.instance_id).unwrap();
+        driver.close_channel(2).unwrap();
+
+        endpoint_contract(&mut driver, 3, PIE_CHANNEL_EXTERN_NONE, &[]);
+        endpoint_contract(&mut driver, 4, PIE_CHANNEL_EXTERN_NONE, &[]);
+        let occupied = bind_existing_channels(&mut driver, private_program, 301, &[4]).unwrap();
+        let two_channel_program = register_test_program(&mut driver, private_container(2));
+        assert!(bind_existing_channels(&mut driver, two_channel_program, 302, &[3, 4]).is_err());
+        let free = bind_existing_channels(&mut driver, private_program, 303, &[3]).unwrap();
+        driver.close_instance(free.instance_id).unwrap();
+        driver.close_instance(occupied.instance_id).unwrap();
+        driver.close_channel(3).unwrap();
+        driver.close_channel(4).unwrap();
+    }
+
+    #[test]
+    fn launch_publishes_outputs_terminals_and_one_batch_callback() {
         let (mut driver, callbacks) = driver_with_callbacks(0);
         let vocab = 8;
         let channels = [10u64, 11, 12, 13, 14];
@@ -1868,7 +2432,21 @@ mod tests {
             &[token_seed(10)],
             301,
         );
+        for &dense in &binding.reader_dense {
+            let endpoint = binding.endpoints[dense];
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    endpoint.mirror_base as *mut u8,
+                    endpoint.mirror_bytes as usize,
+                )
+            }
+            .fill(0xA5);
+        }
         let instance_ids = [binding.instance_id];
+        let mut terminal_cells = [pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let host_put_indptr = [0u32, 0u32];
         driver
             .launch(
@@ -1876,6 +2454,10 @@ mod tests {
                     instance_ids: PieU64Slice {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
+                    },
+                    terminal_cells: PieTerminalCellPtrSlice {
+                        ptr: terminal_ptrs.as_ptr(),
+                        len: terminal_ptrs.len(),
                     },
                     host_put_indptr: PieU32Slice {
                         ptr: host_put_indptr.as_ptr(),
@@ -1886,29 +2468,20 @@ mod tests {
                 PieCompletion {
                     wait_id: 401,
                     target_epoch: 7,
+                    terminal_cell: std::ptr::null_mut(),
                 },
             )
             .unwrap();
-        callbacks.wait_for(6);
-        let notices = callbacks.notifications();
-        assert_eq!(
-            notices
-                .iter()
-                .filter(|&&(id, epoch)| id == 401 && epoch == 7)
-                .count(),
-            1
-        );
-        assert!(
-            notices.contains(&(301, 1)),
-            "missing pacing notification: {notices:?}"
-        );
-        for wait_id in [101, 102, 103, 104] {
-            assert!(
-                notices
-                    .iter()
-                    .any(|&(id, epoch)| id == wait_id && epoch == 1)
+        callbacks.wait_for_notification((401, 7));
+        let notices = callbacks.notifications_for(401);
+        assert_eq!(notices, vec![(401, 7)]);
+        for reader_wait_id in [101, 102, 103, 104] {
+            assert_eq!(
+                callbacks.notifications_for(reader_wait_id),
+                vec![(reader_wait_id, 1)]
             );
         }
+        assert_eq!(terminal_cells[0].outcome, PIE_TERMINAL_OUTCOME_SUCCESS);
 
         let token = read_binding_by_id(&binding, 11);
         let entropy = read_binding_by_id(&binding, 12);
@@ -1986,6 +2559,10 @@ mod tests {
             321,
         );
         let instance_ids = [binding.instance_id];
+        let mut terminal_cells = [pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let host_put_indptr = [0u32, 0u32];
         driver
             .launch(
@@ -1993,6 +2570,10 @@ mod tests {
                     instance_ids: PieU64Slice {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
+                    },
+                    terminal_cells: PieTerminalCellPtrSlice {
+                        ptr: terminal_ptrs.as_ptr(),
+                        len: terminal_ptrs.len(),
                     },
                     host_put_indptr: PieU32Slice {
                         ptr: host_put_indptr.as_ptr(),
@@ -2003,10 +2584,13 @@ mod tests {
                 PieCompletion {
                     wait_id: 421,
                     target_epoch: 3,
+                    terminal_cell: std::ptr::null_mut(),
                 },
             )
             .unwrap();
-        callbacks.wait_for(3);
+        callbacks.wait_for_notification((421, 3));
+        assert_eq!(callbacks.notifications_for(421), vec![(421, 3)]);
+        assert_eq!(terminal_cells[0].outcome, PIE_TERMINAL_OUTCOME_SUCCESS);
         let channel = read_binding_by_id(&binding, 21);
         let bytes = read_cell(&binding, channel, 0);
         let entropy = f32::from_le_bytes(bytes.try_into().unwrap());
@@ -2067,6 +2651,10 @@ mod tests {
             341,
         );
         let instance_ids = [binding_a.instance_id, binding_b.instance_id];
+        let mut terminal_cells = [pending_terminal_cell(), pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let host_put_indptr = [0u32, 0u32, 0u32];
         driver
             .launch(
@@ -2074,6 +2662,10 @@ mod tests {
                     instance_ids: PieU64Slice {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
+                    },
+                    terminal_cells: PieTerminalCellPtrSlice {
+                        ptr: terminal_ptrs.as_ptr(),
+                        len: terminal_ptrs.len(),
                     },
                     host_put_indptr: PieU32Slice {
                         ptr: host_put_indptr.as_ptr(),
@@ -2084,10 +2676,17 @@ mod tests {
                 PieCompletion {
                     wait_id: 431,
                     target_epoch: 5,
+                    terminal_cell: std::ptr::null_mut(),
                 },
             )
             .unwrap();
-        callbacks.wait_for(5);
+        callbacks.wait_for_notification((431, 5));
+        assert_eq!(callbacks.notifications_for(431), vec![(431, 5)]);
+        assert!(
+            terminal_cells
+                .iter()
+                .all(|cell| cell.outcome == PIE_TERMINAL_OUTCOME_SUCCESS)
+        );
         let chan_a = read_binding_by_id(&binding_a, 32);
         let chan_b = read_binding_by_id(&binding_b, 42);
         let vals_a = read_cell(&binding_a, chan_a, 0)
@@ -2142,10 +2741,9 @@ mod tests {
             "only reader channels are exported"
         );
         assert_eq!(
-            binding.word_count, 6,
+            binding.word_count, 8,
             "only reader channels contribute words"
         );
-        assert_eq!(binding.word_bytes, 6 * std::mem::size_of::<u64>() as u64);
         assert_eq!(
             binding.mirror_bytes,
             2 * 2 * std::mem::size_of::<u32>() as u64
@@ -2163,9 +2761,9 @@ mod tests {
         assert_eq!(bindings[0].tail_word_index, 1);
         assert_eq!(bindings[0].poison_word_index, 2);
         assert_eq!(bindings[1].mirror_offset, 8);
-        assert_eq!(bindings[1].head_word_index, 3);
-        assert_eq!(bindings[1].tail_word_index, 4);
-        assert_eq!(bindings[1].poison_word_index, 5);
+        assert_eq!(bindings[1].head_word_index, 4);
+        assert_eq!(bindings[1].tail_word_index, 5);
+        assert_eq!(bindings[1].poison_word_index, 6);
     }
 
     #[test]
@@ -2211,6 +2809,10 @@ mod tests {
             },
         }];
         let instance_ids = [binding.instance_id];
+        let mut terminal_cells = [pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let host_put_indptr = [0u32, 1u32];
         driver
             .launch(
@@ -2218,6 +2820,10 @@ mod tests {
                     instance_ids: PieU64Slice {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
+                    },
+                    terminal_cells: PieTerminalCellPtrSlice {
+                        ptr: terminal_ptrs.as_ptr(),
+                        len: terminal_ptrs.len(),
                     },
                     ptir_host_put_values: PieChannelValueDescSlice {
                         ptr: host_puts.as_ptr(),
@@ -2232,21 +2838,25 @@ mod tests {
                 PieCompletion {
                     wait_id: 501,
                     target_epoch: 11,
+                    terminal_cell: std::ptr::null_mut(),
                 },
             )
             .unwrap();
-        callbacks.wait_for(4);
-        let notices = callbacks.notifications();
-        assert!(notices.contains(&(202, 1)));
-        assert!(notices.contains(&(203, 1)));
-        assert!(notices.contains(&(401, 1)));
-        assert!(notices.contains(&(501, 11)));
-        for wait_id in [200, 201, 204] {
-            assert!(
-                !notices.iter().any(|&(id, _)| id == wait_id),
-                "non-reader wait {wait_id} must not be notified: {notices:?}"
-            );
+        callbacks.wait_for_notification((501, 11));
+        let notices = callbacks.notifications_for(501);
+        assert_eq!(notices, vec![(501, 11)]);
+        for wait_id in [300, 202, 203] {
+            assert_eq!(callbacks.notifications_for(wait_id), vec![(wait_id, 1)]);
         }
+        assert_eq!(terminal_cells[0].outcome, PIE_TERMINAL_OUTCOME_SUCCESS);
+        let writer_words = unsafe {
+            std::slice::from_raw_parts(binding.endpoints[0].word_base as *const AtomicU64, 4)
+        };
+        assert_eq!(
+            writer_words[binding.endpoints[0].head_word_index as usize].load(Ordering::Acquire),
+            1,
+            "a committed host Writer value must release capacity"
+        );
 
         let reader0 = read_binding_by_id(&binding, 102);
         let reader1 = read_binding_by_id(&binding, 103);
@@ -2269,7 +2879,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_roles_kernel_fault_poisons_only_exported_readers() {
+    fn mixed_roles_kernel_fault_poisons_host_endpoints() {
         let (mut driver, callbacks) = driver_with_callbacks(0);
         let channel_ids = [110u64, 111, 112, 113];
         let waits = [
@@ -2307,6 +2917,10 @@ mod tests {
             },
         }];
         let instance_ids = [binding.instance_id];
+        let mut terminal_cells = [pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let host_put_indptr = [0u32, 1u32];
         driver
             .launch(
@@ -2314,6 +2928,10 @@ mod tests {
                     instance_ids: PieU64Slice {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
+                    },
+                    terminal_cells: PieTerminalCellPtrSlice {
+                        ptr: terminal_ptrs.as_ptr(),
+                        len: terminal_ptrs.len(),
                     },
                     ptir_host_put_values: PieChannelValueDescSlice {
                         ptr: host_puts.as_ptr(),
@@ -2328,21 +2946,17 @@ mod tests {
                 PieCompletion {
                     wait_id: 511,
                     target_epoch: 13,
+                    terminal_cell: std::ptr::null_mut(),
                 },
             )
             .unwrap();
-        callbacks.wait_for(4);
-        let notices = callbacks.notifications();
-        assert!(notices.contains(&(212, 1)));
-        assert!(notices.contains(&(213, 1)));
-        assert!(notices.contains(&(411, 1)));
-        assert!(notices.contains(&(511, 13)));
-        for wait_id in [210, 211] {
-            assert!(
-                !notices.iter().any(|&(id, _)| id == wait_id),
-                "non-reader wait {wait_id} must not be notified: {notices:?}"
-            );
+        callbacks.wait_for_notification((511, 13));
+        let notices = callbacks.notifications_for(511);
+        assert_eq!(notices, vec![(511, 13)]);
+        for wait_id in [310, 212, 213] {
+            assert_eq!(callbacks.notifications_for(wait_id), vec![(wait_id, 1)]);
         }
+        assert_eq!(terminal_cells[0].outcome, PIE_TERMINAL_OUTCOME_FAILED);
         let reader0 = read_binding_by_id(&binding, 112);
         let reader1 = read_binding_by_id(&binding, 113);
         let words = read_words(&binding);
@@ -2375,6 +2989,10 @@ mod tests {
             351,
         );
         let instance_ids = [binding.instance_id];
+        let mut terminal_cells = [pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let host_put_indptr = [0u32, 0u32];
         driver
             .launch(
@@ -2382,6 +3000,10 @@ mod tests {
                     instance_ids: PieU64Slice {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
+                    },
+                    terminal_cells: PieTerminalCellPtrSlice {
+                        ptr: terminal_ptrs.as_ptr(),
+                        len: terminal_ptrs.len(),
                     },
                     host_put_indptr: PieU32Slice {
                         ptr: host_put_indptr.as_ptr(),
@@ -2392,18 +3014,18 @@ mod tests {
                 PieCompletion {
                     wait_id: 451,
                     target_epoch: 9,
+                    terminal_cell: std::ptr::null_mut(),
                 },
             )
             .unwrap();
-        callbacks.wait_for(3);
+        callbacks.wait_for_notification((451, 9));
         let channel = read_binding_by_id(&binding, 51);
         let words = read_words(&binding);
         assert_eq!(words[channel.tail_word_index as usize], 0);
         assert_eq!(words[channel.poison_word_index as usize], 1);
-        let notices = callbacks.notifications();
-        assert!(notices.contains(&(151, 1)));
-        assert!(notices.contains(&(351, 1)));
-        assert!(notices.contains(&(451, 9)));
+        let notices = callbacks.notifications_for(451);
+        assert_eq!(notices, vec![(451, 9)]);
+        assert_eq!(terminal_cells[0].outcome, PIE_TERMINAL_OUTCOME_FAILED);
     }
 
     #[test]
@@ -2439,6 +3061,10 @@ mod tests {
         }];
         let binding = bind_program(&mut driver, bytes, &[61, 62], &waits, &seed, 361);
         let instance_ids = [binding.instance_id];
+        let mut terminal_cells = [pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let host_put_indptr = [1u32, 1u32];
         let err = driver
             .launch(
@@ -2446,6 +3072,10 @@ mod tests {
                     instance_ids: PieU64Slice {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
+                    },
+                    terminal_cells: PieTerminalCellPtrSlice {
+                        ptr: terminal_ptrs.as_ptr(),
+                        len: terminal_ptrs.len(),
                     },
                     host_put_indptr: PieU32Slice {
                         ptr: host_put_indptr.as_ptr(),
@@ -2456,6 +3086,7 @@ mod tests {
                 PieCompletion {
                     wait_id: 461,
                     target_epoch: 1,
+                    terminal_cell: std::ptr::null_mut(),
                 },
             )
             .unwrap_err();
@@ -2467,7 +3098,77 @@ mod tests {
     }
 
     #[test]
-    fn close_waits_for_inflight_then_rejects_stale_instance_id() {
+    fn later_invalid_batch_member_rejects_without_mutating_earlier_members() {
+        let (mut driver, callbacks) = driver_with_callbacks(0);
+        let waits = [
+            PieChannelWait {
+                reader_wait_id: 163,
+                writer_wait_id: 263,
+            },
+            PieChannelWait {
+                reader_wait_id: 164,
+                writer_wait_id: 264,
+            },
+        ];
+        let seed = [OwnedValueDesc {
+            channel_id: 63,
+            bytes: 0u32.to_le_bytes().to_vec(),
+        }];
+        let binding = bind_program(
+            &mut driver,
+            counter_container(),
+            &[63, 64],
+            &waits,
+            &seed,
+            362,
+        );
+        let instance_ids = [binding.instance_id, u64::MAX];
+        let mut terminal_cells = [pending_terminal_cell(), pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
+        let host_put_indptr = [0u32, 0u32, 0u32];
+
+        let err = driver
+            .launch(
+                &PieLaunchDesc {
+                    instance_ids: PieU64Slice {
+                        ptr: instance_ids.as_ptr(),
+                        len: instance_ids.len(),
+                    },
+                    terminal_cells: PieTerminalCellPtrSlice {
+                        ptr: terminal_ptrs.as_ptr(),
+                        len: terminal_ptrs.len(),
+                    },
+                    host_put_indptr: PieU32Slice {
+                        ptr: host_put_indptr.as_ptr(),
+                        len: host_put_indptr.len(),
+                    },
+                    ..PieLaunchDesc::default()
+                },
+                PieCompletion {
+                    wait_id: 462,
+                    target_epoch: 1,
+                    terminal_cell: std::ptr::null_mut(),
+                },
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("unknown instance"));
+        assert_eq!(
+            terminal_cells.map(|cell| cell.outcome),
+            [PIE_TERMINAL_OUTCOME_PENDING; 2]
+        );
+        assert_eq!(
+            read_words(&binding)[0],
+            0,
+            "earlier member must not execute"
+        );
+        assert!(callbacks.notifications().is_empty());
+    }
+
+    #[test]
+    fn close_after_terminal_publication_does_not_wait_for_callback() {
         let (mut driver, callbacks) = driver_with_callbacks(50);
         let waits = [
             PieChannelWait {
@@ -2492,6 +3193,10 @@ mod tests {
             371,
         );
         let instance_ids = [binding.instance_id];
+        let mut terminal_cells = [pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let host_put_indptr = [0u32, 0u32];
         driver
             .launch(
@@ -2499,6 +3204,10 @@ mod tests {
                     instance_ids: PieU64Slice {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
+                    },
+                    terminal_cells: PieTerminalCellPtrSlice {
+                        ptr: terminal_ptrs.as_ptr(),
+                        len: terminal_ptrs.len(),
                     },
                     host_put_indptr: PieU32Slice {
                         ptr: host_put_indptr.as_ptr(),
@@ -2509,13 +3218,15 @@ mod tests {
                 PieCompletion {
                     wait_id: 471,
                     target_epoch: 1,
+                    terminal_cell: std::ptr::null_mut(),
                 },
             )
             .unwrap();
         let started = Instant::now();
         driver.close_instance(binding.instance_id).unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(40));
-        callbacks.wait_for(3);
+        assert!(started.elapsed() < Duration::from_millis(40));
+        callbacks.wait_for_notification((471, 1));
+        assert_eq!(callbacks.notifications_for(471), vec![(471, 1)]);
         let err = driver.close_instance(binding.instance_id).unwrap_err();
         assert!(err.to_string().contains("unknown instance"));
     }
@@ -2546,6 +3257,10 @@ mod tests {
             381,
         );
         let instance_ids = [binding.instance_id];
+        let mut terminal_cells = [pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let host_put_indptr = [0u32, 0u32];
         driver
             .launch(
@@ -2553,6 +3268,10 @@ mod tests {
                     instance_ids: PieU64Slice {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
+                    },
+                    terminal_cells: PieTerminalCellPtrSlice {
+                        ptr: terminal_ptrs.as_ptr(),
+                        len: terminal_ptrs.len(),
                     },
                     host_put_indptr: PieU32Slice {
                         ptr: host_put_indptr.as_ptr(),
@@ -2563,6 +3282,7 @@ mod tests {
                 PieCompletion {
                     wait_id: 481,
                     target_epoch: 1,
+                    terminal_cell: std::ptr::null_mut(),
                 },
             )
             .unwrap();
@@ -2570,9 +3290,6 @@ mod tests {
         let at_drop = callbacks.count.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(80));
         assert_eq!(callbacks.count.load(Ordering::SeqCst), at_drop);
-        assert_eq!(
-            at_drop, 3,
-            "drop should wait for the in-flight callback work"
-        );
+        assert_eq!(callbacks.notifications_for(481), vec![(481, 1)]);
     }
 }

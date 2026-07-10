@@ -2,9 +2,10 @@ use anyhow::{Result, anyhow};
 
 use crate::driver::completion::{Completion, CompletionBroker};
 use crate::driver::frame::{
-    BoundInstance, InstanceBindingPlan, KvCopyDescBorrow, KvCopyPlan, LaunchDescBorrow,
-    LaunchSubmission, PoolResizeDescBorrow, PoolResizePlan, ProgramDescBorrow, ProgramRegistration,
-    StateCopyDescBorrow, StateCopyPlan,
+    BoundInstance, ChannelDescBorrow, ChannelRegistrationPlan, InstanceBindingPlan,
+    KvCopyDescBorrow, KvCopyPlan, LaunchDescBorrow, LaunchSubmission, PoolResizeDescBorrow,
+    PoolResizePlan, ProgramDescBorrow, ProgramRegistration, RegisteredChannel, StateCopyDescBorrow,
+    StateCopyPlan,
 };
 
 fn sync_status(status: i32, op: &str) -> Result<()> {
@@ -15,9 +16,10 @@ fn sync_status(status: i32, op: &str) -> Result<()> {
     }
 }
 use pie_driver_abi::{
-    PieBytes, PieDriver, PieDriverCaps, PieDriverCreateDesc, pie_metal_bind_instance,
-    pie_metal_close_instance, pie_metal_copy_kv, pie_metal_copy_state, pie_metal_create,
-    pie_metal_destroy, pie_metal_launch, pie_metal_register_program, pie_metal_resize_pool,
+    PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
+    pie_metal_bind_instance, pie_metal_close_channel, pie_metal_close_instance, pie_metal_copy_kv,
+    pie_metal_copy_state, pie_metal_create, pie_metal_destroy, pie_metal_launch,
+    pie_metal_register_channel, pie_metal_register_program, pie_metal_resize_pool,
 };
 
 pub struct MetalDriver {
@@ -43,7 +45,13 @@ impl MetalDriver {
         if driver.is_null() {
             return Err(anyhow!("pie_metal_create returned null"));
         }
-        let capabilities = parse_caps(caps)?;
+        let capabilities = match parse_caps(caps) {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                unsafe { pie_metal_destroy(driver) };
+                return Err(error);
+            }
+        };
         Ok((
             Self {
                 driver,
@@ -69,6 +77,25 @@ impl MetalDriver {
         )?;
         Ok(out)
     }
+    pub fn register_channel(
+        &mut self,
+        plan: &ChannelRegistrationPlan,
+    ) -> Result<RegisteredChannel> {
+        let borrowed = ChannelDescBorrow::new(plan);
+        let mut binding = PieChannelEndpointBinding::default();
+        sync_status(
+            unsafe { pie_metal_register_channel(self.driver, borrowed.as_raw(), &mut binding) },
+            "pie_metal_register_channel",
+        )?;
+        pie_driver_abi::validate_channel_endpoint_binding(&binding, borrowed.as_raw())
+            .map_err(|error| anyhow!(error))?;
+        Ok(RegisteredChannel {
+            driver_id: plan.driver_id,
+            binding,
+            reader_wait_id: plan.reader_wait_id,
+            writer_wait_id: plan.writer_wait_id,
+        })
+    }
     pub fn bind_instance(&mut self, plan: &InstanceBindingPlan) -> Result<BoundInstance> {
         let borrowed = crate::driver::frame::InstanceDescBorrow::new(plan);
         let mut binding = pie_driver_abi::PieInstanceBinding::default();
@@ -87,12 +114,11 @@ impl MetalDriver {
             plan.program_id,
             binding,
             plan.pacing_wait_id,
-            plan.channel_waits.clone(),
         ))
     }
     pub fn launch(&mut self, plan: &LaunchSubmission) -> Result<Completion> {
         let target_epoch = 1;
-        let (raw, completion) = self.broker.pie_completion(target_epoch);
+        let (raw, completion) = self.broker.launch_completion(target_epoch);
         let borrowed = LaunchDescBorrow::from_submission(plan);
         sync_status(
             unsafe { pie_metal_launch(self.driver, borrowed.as_raw(), raw) },
@@ -134,6 +160,12 @@ impl MetalDriver {
         sync_status(
             unsafe { pie_metal_close_instance(self.driver, instance_id) },
             "pie_metal_close_instance",
+        )
+    }
+    pub fn close_channel(&mut self, channel_id: u64) -> Result<()> {
+        sync_status(
+            unsafe { pie_metal_close_channel(self.driver, channel_id) },
+            "pie_metal_close_channel",
         )
     }
 }

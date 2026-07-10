@@ -7,15 +7,16 @@
 // launches one prebuilt tier-0 kernel per op (tier0_launch.hpp), (3) writes each
 // `put` to the channel's PENDING cell. After the last stage an end-of-pass
 // predicated commit-bump publishes puts / consumes takes only if the pass was
-// ready (pass-atomic, T3/T4). A miss → dummy-run, effects discarded.
+// ready (pass-atomic, T3/T4). A miss discards effects and is reported by the
+// dispatcher as a terminal failed launch.
 //
 // This is the tier-0 "interpret" backend (overview §7.3): correct on day one,
 // the golden model every other tier diffs against echo's host reference. Tier 1
 // (P5) fuses these launches per stage; the readiness/commit semantics are
 // identical.
 //
-// Synchronous submit loop (degenerate depth 0, thrust-3 §5): channels order
-// everything; the host blocks between passes. Depth/pipelining is thrust 2.
+// The synchronous test path blocks between passes. Production uses
+// `launch_pass_async`; projected host indices preserve stream-ordered run-ahead.
 
 #include <cstdint>
 #include <cstring>
@@ -51,7 +52,7 @@ struct FireInputs {
     int mtp_draft_row = -1;
 };
 
-// Result of one pass: whether the pass committed (all stages ready) or dummy-ran.
+// Result of one pass: whether the pass committed (all stages ready).
 struct PassResult {
     bool committed = false;
     bool ok = true;            // false → an op/dtype was uncovered by tier-0
@@ -115,7 +116,7 @@ class Tier0Runner {
     }
 
     // Run one pass of the trace over `in`. Returns commit status; on `!committed`
-    // the channel rings are unchanged (dummy-run).
+    // the channel rings are unchanged and the caller treats the fire as failed.
     PassResult run_pass(const FireInputs& in) {
         PassResult res;
         cudaStream_t s = in.stream;

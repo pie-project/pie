@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
@@ -6,15 +5,15 @@ use anyhow::{Result, anyhow};
 use crate::driver::backend::NativeDriver;
 use crate::driver::completion::{Completion, CompletionBroker};
 use crate::driver::frame::{
-    BoundInstance, InstanceBindingPlan, KvCopyDescBorrow, KvCopyPlan, LaunchDescBorrow,
-    LaunchSubmission, PoolResizePlan, ProgramRegistration, StateCopyPlan,
+    BoundInstance, ChannelRegistrationPlan, InstanceBindingPlan, KvCopyDescBorrow, KvCopyPlan,
+    LaunchDescBorrow, LaunchSubmission, PoolResizePlan, ProgramRegistration, RegisteredChannel,
+    StateCopyPlan,
 };
 use crate::inference::scheduler::SchedulerHandle;
 
 pub struct DummyLocalDriver {
     inner: pie_driver_dummy_lib::DummyDriver,
     broker: CompletionBroker,
-    next_epoch: AtomicU64,
 }
 
 unsafe impl Send for DummyLocalDriver {}
@@ -25,22 +24,30 @@ impl DummyLocalDriver {
         let broker = CompletionBroker::new();
         let inner =
             pie_driver_dummy_lib::DummyDriver::with_runtime(options, broker.runtime_callbacks());
-        Self {
-            inner,
-            broker,
-            next_epoch: AtomicU64::new(1),
-        }
+        Self { inner, broker }
     }
 
     pub fn capabilities(&self) -> &pie_driver_abi::DriverCapabilities {
         self.inner.capabilities()
     }
-    fn next_epoch(&self) -> u64 {
-        self.next_epoch.fetch_add(1, Ordering::Relaxed)
-    }
     pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
         let borrowed = crate::driver::frame::ProgramDescBorrow::new(desc);
         self.inner.register_program(borrowed.as_raw())
+    }
+    pub fn register_channel(
+        &mut self,
+        desc: &ChannelRegistrationPlan,
+    ) -> Result<RegisteredChannel> {
+        let borrowed = crate::driver::frame::ChannelDescBorrow::new(desc);
+        let binding = self.inner.register_channel(borrowed.as_raw())?;
+        pie_driver_abi::validate_channel_endpoint_binding(&binding, borrowed.as_raw())
+            .map_err(|error| anyhow!(error))?;
+        Ok(RegisteredChannel {
+            driver_id: desc.driver_id,
+            binding,
+            reader_wait_id: desc.reader_wait_id,
+            writer_wait_id: desc.writer_wait_id,
+        })
     }
     pub fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
         let borrowed = crate::driver::frame::InstanceDescBorrow::new(desc);
@@ -56,39 +63,37 @@ impl DummyLocalDriver {
             desc.program_id,
             binding,
             desc.pacing_wait_id,
-            desc.channel_waits.clone(),
         ))
     }
     pub fn launch(&mut self, desc: &LaunchSubmission) -> Result<Completion> {
-        let epoch = self.next_epoch();
-        let (raw, completion) = self.broker.pie_completion(epoch);
+        let (raw, completion) = self.broker.launch_completion(1);
         let borrowed = LaunchDescBorrow::from_submission(desc);
         self.inner.launch(borrowed.as_raw(), raw)?;
         Ok(completion)
     }
     pub fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<Completion> {
-        let epoch = self.next_epoch();
-        let (raw, completion) = self.broker.pie_completion(epoch);
+        let (raw, completion) = self.broker.pie_completion(1);
         let borrowed = KvCopyDescBorrow::new(desc);
         self.inner.copy_kv(borrowed.as_raw(), raw)?;
         Ok(completion)
     }
     pub fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<Completion> {
-        let epoch = self.next_epoch();
-        let (raw, completion) = self.broker.pie_completion(epoch);
+        let (raw, completion) = self.broker.pie_completion(1);
         let borrowed = crate::driver::frame::StateCopyDescBorrow::new(desc);
         self.inner.copy_state(borrowed.as_raw(), raw)?;
         Ok(completion)
     }
     pub fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<Completion> {
-        let epoch = self.next_epoch();
-        let (raw, completion) = self.broker.pie_completion(epoch);
+        let (raw, completion) = self.broker.pie_completion(1);
         let borrowed = crate::driver::frame::PoolResizeDescBorrow::new(desc);
         self.inner.resize_pool(borrowed.as_raw(), raw)?;
         Ok(completion)
     }
     pub fn close_instance(&mut self, id: u64) -> Result<()> {
         self.inner.close_instance(id)
+    }
+    pub fn close_channel(&mut self, id: u64) -> Result<()> {
+        self.inner.close_channel(id)
     }
 }
 

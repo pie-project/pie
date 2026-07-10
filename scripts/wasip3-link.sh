@@ -20,6 +20,11 @@ sysroot="$(rustc --print sysroot)"
 host="$(rustc -vV | sed -n 's/^host: //p')"
 lld="$sysroot/lib/rustlib/$host/bin/wasm-component-ld"
 
+# macOS SIP strips DYLD_* when exec'ing this (bash) wrapper, losing the
+# fallback path rustc set for rust-lld's @rpath/libLLVM.dylib. Re-export it
+# so the real linker (a non-restricted binary) resolves libLLVM again.
+export DYLD_FALLBACK_LIBRARY_PATH="$sysroot/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+
 if [ -n "${WASI_SDK_PATH:-}" ] && [ -d "$WASI_SDK_PATH/share/wasi-sysroot/lib/wasm32-wasip2" ]; then
   libc_dir="$WASI_SDK_PATH/share/wasi-sysroot/lib/wasm32-wasip2"
 else

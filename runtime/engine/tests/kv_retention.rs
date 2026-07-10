@@ -32,10 +32,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 mod common;
-use common::{
-    MockEnv, create_mock_env, inferlets,
-    mock_device::Behavior,
-};
+use common::{MockEnv, create_mock_env, inferlets, mock_device::Behavior};
 
 use pie_engine::process;
 use pie_engine::program::ProgramName;

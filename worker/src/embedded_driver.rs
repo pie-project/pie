@@ -515,6 +515,9 @@ fn dummy_native_options(
         max_forward_requests,
         max_page_refs: total_pages,
         callback_delay_ms: 0,
+        reject_launches: false,
+        reject_launches_remaining: 0,
+        fail_launches_after_accept: false,
         operation_log: None,
     })
 }

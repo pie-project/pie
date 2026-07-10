@@ -59,23 +59,34 @@ int main() {
                 "register rejects null output")) return 1;
 
     const std::uint64_t channel_id = 3;
-    const PieChannelWait wait{};
+    const std::uint32_t shape = 1;
+    PieChannelEndpointBinding endpoint{};
+    PieChannelDesc channel{};
+    channel.abi_version = PIE_DRIVER_ABI_VERSION + 1;
+    channel.channel_id = channel_id;
+    channel.shape = {.ptr = &shape, .len = 1};
+    channel.capacity = 1;
+    channel.reader_wait_id = 4;
+    channel.writer_wait_id = 5;
+    if (!expect(pie_cuda_register_channel(driver, &channel, &endpoint) ==
+                    PIE_STATUS_BAD_ABI_VERSION,
+                "channel rejects wrong ABI")) return 1;
+    channel.abi_version = PIE_DRIVER_ABI_VERSION;
+    channel.writer_wait_id = channel.reader_wait_id;
+    if (!expect(pie_cuda_register_channel(driver, &channel, &endpoint) ==
+                    PIE_STATUS_INVALID_ARGUMENT,
+                "channel rejects duplicate wait ids")) return 1;
+
     PieInstanceBinding binding{};
     PieInstanceDesc instance{};
     instance.abi_version = PIE_DRIVER_ABI_VERSION;
     instance.channel_ids = {.ptr = &channel_id, .len = 1};
-    instance.channel_waits = {.ptr = &wait, .len = 1};
 
     PieInstanceDesc bad_instance = instance;
     bad_instance.abi_version += 1;
     if (!expect(pie_cuda_bind_instance(driver, &bad_instance, &binding) ==
                     PIE_STATUS_BAD_ABI_VERSION,
                 "bind rejects wrong ABI")) return 1;
-    bad_instance = instance;
-    bad_instance.channel_waits.len = 0;
-    if (!expect(pie_cuda_bind_instance(driver, &bad_instance, &binding) ==
-                    PIE_STATUS_INVALID_ARGUMENT,
-                "bind rejects parallel count mismatch")) return 1;
     PieChannelValueDesc bad_seed{
         .channel_id = channel_id,
         .bytes = {.ptr = nullptr, .len = 1},

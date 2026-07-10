@@ -1,35 +1,41 @@
 # Runtime–Driver Boundary
 
-> **The boundary is addresses plus wakes, and it is asymmetric: the device
-> never waits; only the host parks.**
+> **The boundary is persistent addresses, terminal state, and payload-free
+> wakes. It is asymmetric: the device never waits; only the host parks.**
 
 The contract between the Rust **runtime** and the **driver** (embedded
-CUDA/Metal linked into `pie-worker`, or an out-of-proc subprocess) for PTIR
-channel programs. After an instance is bound, steady-state traffic is:
+CUDA/Metal linked into `pie-worker`) for PTIR channel programs. The direct-FFI
+completion and ownership decisions in [direct_ffi_fix.md](direct_ffi_fix.md)
+supersede the older speculative dummy-run design. Steady-state traffic is:
 
-1. **Addresses** (once, at bind): a fixed triple of base pointers (device
-   frame + pinned host mirror + pinned ring-index words), plus the trace-known
-   frame layout.
-2. **Epoch stores** (host → driver, per put): a `put` writes the cell and
-   release-stores the channel's word. No doorbell, no queue, no wake. The
-   device consumer reads whatever is committed at its next fire.
-3. **Wakes** (driver → host, per commit): after a fire commits, the driver
-   publishes the new ring indices into the pinned words and wakes exactly the
-   waiter slots of the channels it committed.
+1. **Channel endpoint addresses** (once, at channel registration): one
+   driver-local device ring, pinned/shared host mirror, control words, and
+   reader/writer wait-id pair per runtime-minted `ChannelId`.
+2. **Operation terminal state** (leased per submission): one runtime-owned,
+   stable host-visible terminal cell per launch member or value-less operation.
+   Cells are recycled only after native retirement; bind returns identity only.
+3. **Ordered channel publication**: host puts and accepted device operations
+   reserve bounded ring transitions through the scheduler. Committed values and
+   head/tail/poison state are published directly through the persistent
+   endpoint.
+4. **Wakes** (driver → runtime): after persistent state is visible, the driver
+   wakes affected channel slots and invokes one payload-free callback for the
+   accepted FFI operation.
 
 The value path never travels through the driver: the host reads committed
 cells directly from the pinned mirror; host-fed inputs are DMA'd, not
-marshaled. No heap pointer ever crosses the boundary; the only things that
-cross are addresses, ring indices, and opaque `u64` slot ids.
+marshaled. The callback carries no value or error payload. Error details are
+channel poison; fixed terminal state controls runtime commit or abort.
 
 This realizes the two surviving masterplan contracts (the original
 `ptir-plan/` notes are no longer in the tree; §9 restates what this document
 depends on):
 
-- **C2**: the device reads words at its cut points and proceeds
-  speculatively. A readiness miss is a dummy-run retried at the next fire,
-  never a wait.
-- **C5**: the boundary is addresses plus wakes.
+- **C2**: the scheduler atomically reserves trace-known channel transitions
+  before native acceptance. A known-not-ready fire remains queued. The device
+  rechecks readiness as an invariant; a post-acceptance miss is terminal
+  failure, never a wait, retry, or `Skipped` outcome.
+- **C5**: the boundary is persistent addresses, fixed control words, and wakes.
 
 Implementation status is mapped in §7; the migration plan is §8.
 
@@ -40,16 +46,13 @@ Implementation status is mapped in §7; the migration plan is §8.
 Channels are PTIR's only stateful construct, and their two endpoints have
 different blocking semantics:
 
-- **The device never blocks.** A pass's readiness is evaluated on device
-  (`k_stage_readiness`) against the freshest channel state (full bits, heads,
-  tails, which live in device memory because GPU stages are their primary
-  producers and consumers). If an input has not arrived, the pass dummy-runs:
-  the predicated commit bump (`k_commit_bump`) publishes nothing, pending
-  writes are discarded, and the next fire retries. Rings hold `capacity + 1`
-  cells so a writer always has a free slot. Consequence: the host → driver
-  direction needs **no signaling at all**. A `put` is a release-store that the
-  device observes at its next cut point.
-
+- **The device never blocks.** Before dispatch, the scheduler's endpoint
+  reservation ledger proves that required input occupancy and output capacity
+  exist in sequencer order, including transitions projected through earlier
+  accepted fires. The device's `k_stage_readiness` check is defense in depth.
+  A post-acceptance miss discards pending writes and publishes terminal
+  `Failed` plus affected channel poison. It is not normal backpressure and is
+  never retried as another outcome of the accepted fire.
 - **The host does block.** `take().await` on an empty channel must park a
   future and be woken later. Consequence: the driver → host direction needs
   exactly one primitive, an edge-triggered wake keyed by a ring-index word.
@@ -57,46 +60,60 @@ different blocking semantics:
 So one direction is a plain store and the other is a single wake. Nothing
 else crosses per step.
 
-Control verbs (register / bind / close / enqueue) are direct, bounded,
-non-blocking in-proc calls (B1). A control call is append-to-structure work
-that never holds a lock across a GPU wait and never calls a synchronizing
-device API. They are deliberately **off** the `DriverChannel` trait (B2): that
-trait serves the out-of-proc request/response path; embedded drivers get
-direct calls.
+Typed operations (register program/channel, bind/close instance, close channel,
+launch, copy, and resize) are direct, bounded, non-blocking in-proc calls (B1).
+They execute only on the per-driver scheduler thread and never hold a lock
+across a GPU wait or call a synchronizing device API.
 
 ---
 
-## 2. The bind contract (B5, bidirectional)
+## 2. Channel registration and instance bind (B5, bidirectional)
 
-Bind is the one moment the two sides exchange standing state. Both directions
-are fixed for the instance's lifetime (B6).
+Channel registration establishes endpoint state; bind attaches an instance to
+those endpoints and returns its identity. Endpoint addresses and wait ids remain
+fixed until the channel is closed (B6).
 
-**driver → runtime: the address triple**
+**driver → runtime: the channel endpoint addresses**
 
 | Base | Memory | Purpose |
 |------|--------|---------|
-| `frame_base` | device | Instance's device frame. Cells live at `frame_base + channel offset + ring index`. Never moves (B6). |
-| `mirror_base` | pinned host | The host reads committed cells here as pure loads, never through the driver (B8/B13). |
-| `word_base` | pinned host | Ring-index words: pacing plus per-channel head/tail (B9). Layout below. |
+| `ring_base` | device | The endpoint's device ring. Never moves while the channel is live (B6). |
+| `mirror_base` | pinned/shared host | The host reads committed cells here as pure loads (B8/B13). |
+| `word_base` | pinned/shared host | Producer tail, consumer head, poison, and closed publication words (B9). |
 
 **runtime → driver: the wake targets (B17)**
 
-For each host-visible channel `c`, an X0 slot-id pair `(reader, writer)`,
-plus one pacing slot per instance. Opaque `u64`s (B10); the driver stores
-them in its instance table next to the channel's ring words and never
-inspects them.
+Each endpoint has one X0 slot-id pair `(reader, writer)`. The runtime allocates
+and owns these generation-tagged ids; the driver stores but never inspects them.
+They are freed only after ordered native channel close retires.
 
-**The word layout** (fixed, shared by both sides):
+**runtime → driver: operation terminal state**
+
+Each launch supplies one distinct stable `PieTerminalCell*` per member.
+Value-less controls supply one through `PieCompletion`. The driver
+release-publishes `Success` or `Failed`; the runtime associates the cell with
+the candidate instance epoch and keeps it leased until retirement.
+
+The first attachment freezes endpoint geometry and SPSC claims. Host-visible,
+seeded, and non-extern private channels are single-instance. Cross-instance
+sharing is valid only for matching unseeded, host-invisible extern declarations
+with the same canonical extern binding name, exactly one `Export` producer, and
+exactly one `Import` consumer. Bind conflicts reject synchronously before
+native mutation.
+
+**The endpoint word layout** (fixed, shared by both sides):
 
 | word index | content | woken slot |
 |------------|---------|------------|
-| `0` | pacing: committed fire count (monotonic) | pacing slot |
-| `1 + 2c` | channel `c` committed head (net puts) | reader slot of `c` |
-| `2 + 2c` | channel `c` committed tail (net takes) | writer slot of `c` |
+| `0` | producer tail / published cell count | reader slot |
+| `1` | consumer head / released cell count | writer slot |
+| `2` | poison epoch or zero | reader and writer slots |
+| `3` | closed flag | reader and writer slots |
 
-After bind, no layout information and no wake-target information is ever
-exchanged again. All waker slots are bind-time fixed and freed only at close:
-steady state allocates nothing on either side (B15).
+After registration and bind, no endpoint layout or channel wake-target
+information is exchanged again. Channel wait slots are fixed-capacity. Terminal
+cells come from a reusable stable-cell pool, so steady-state retirement recycles
+control metadata rather than reallocating it (B15).
 
 ---
 
@@ -105,48 +122,50 @@ steady state allocates nothing on either side (B15).
 ```mermaid
 flowchart LR
     subgraph Host
-      P[put: staging write<br/>+ epoch store]
-      S[scheduler fire loop<br/>leasing + run-ahead]
+      P[put: reserve capacity<br/>+ publish cell/tail]
+      S[scheduler: reserve channels<br/>+ assign epoch/cell]
       T[take: park on reader slot<br/>→ pure load from mirror]
     end
     subgraph Device
-      R[readiness check<br/>speculative, dummy-run on miss]
+      R[readiness invariant check<br/>fail on mismatch]
       K[pass kernels<br/>pending-cell writes]
-      C[predicated commit bump<br/>+ word publish]
+      C[channel + terminal<br/>publication]
     end
-    P -- release store --> R
+    P -- endpoint state --> S
     S -- per-fire descriptor --> R
     R --> K --> C
     C -- D2H committed cells --> T
-    C -- pie_wake_past per committed channel --> T
-    C -- pacing word --> S
+    C -- channel wakes --> T
+    C -- one operation callback --> S
 ```
 
-1. **put (host)**: write the staging cell, release-store the channel word.
-   The fire-build enqueues H2D of dirty input cells on the copy stream. No
-   doorbell (B16).
-2. **fire (scheduler)**: the batch scheduler (its own OS thread) assembles
-   the fire and submits. The per-fire descriptor is the resource-leasing
-   decision: KV pages, batch composition (B14).
-3. **pass (device)**: readiness checked on device; the pass runs
-   pass-atomically; a miss dummy-runs and retries next fire (C2).
-4. **commit publish (driver)**, stream-ordered after the forward-done event:
+1. **put (host)**: reserve bounded endpoint capacity, write the staging cell,
+   and release-publish the producer tail. The fire-build enqueues H2D of dirty
+   input cells on the copy stream (B16).
+2. **fire (scheduler)**: atomically reserve the trace-known channel takes,
+   reads, and puts; assign one candidate instance epoch and terminal cell; then
+   include the fire in a native batch (B14).
+3. **accept (driver)**: validate and prepare the whole batch without durable
+   mutation. Synchronous rejection accepts no members. Successful enqueue
+   atomically accepts every member and causes exactly one later batch callback.
+4. **pass (device)**: recheck readiness and run pass-atomically. An invariant
+   miss or execution error publishes no value state and becomes `Failed`.
+5. **commit publish (driver)**, stream-ordered after the forward-done event:
    D2H the committed host-visible cells into the pinned mirror, then publish
-   the new head/tail into the pinned words, then bump the pacing word (B11).
-   FIFO on the single copy stream keeps every word monotonic by construction.
-5. **wake (driver)**: the committer wakes exactly what it committed, reading
-   slot ids from its own instance table: `pie_wake_past(reader, head)` /
-   `pie_wake_past(writer, tail)` / `pie_wake_past(pacing, fire_seq)`. No
-   registry, no channel scan, no rediscovery (B17). The CPU entry point (a
-   `cudaLaunchHostFunc` today) does nothing else.
-6. **take (host)**: the woken future re-polls (register-then-recheck, §6),
-   acquire-loads the head word, reads the cell from the mirror as a pure
+   new producer tail/consumer head, then release-publish terminal `Success`
+   (B11). Failure publishes poison then terminal `Failed`.
+6. **wake (driver)**: wake affected endpoint slots, then invoke the one batch
+   callback after every member terminal entry is visible. The callback carries
+   no result and means only “recheck persistent state” (B17).
+7. **take (host)**: the woken future re-polls (register-then-recheck, §6),
+   acquire-loads the producer-tail word, reads the cell from the mirror as a pure
    load, and copies once into WASM linear memory at the WIT boundary.
-7. **pacing (scheduler)**: run-ahead depth is enforced by awaiting
-   `Completion`s: thin waits on `(pacing slot, word[0], target = fire seq)`.
-8. **close**: remove the instance from future batches, then free after the
-   last in-flight carry retires in FIFO order on the copy stream (one stream
-   drain inside the driver). There is no host-side close gate (B6).
+8. **retire (scheduler)**: after the callback, acquire-load each leased terminal
+   cell. Commit only `Success` transactions; abort `Failed` transactions and
+   their dependent pipeline domains.
+9. **close**: detach instances first. Ordered channel close runs after all
+   endpoint references retire, marks the endpoint closed, wakes waiters, frees
+   native storage, and only then permits runtime wait-slot reclamation (B6).
 
 ---
 
@@ -154,28 +173,29 @@ flowchart LR
 
 **Control plane shape**
 - **B1 — Direct calls.** Control verbs are direct, bounded, non-blocking
-  in-proc calls. No submission queue, no response frames for control.
-- **B2 — Off the channel trait.** Control verbs are not `DriverChannel`
-  obligations; that trait serves the out-of-proc path.
+  in-proc calls on the sole per-driver scheduler. No response frames.
+- **B2 — Typed operations.** Program/channel registration, instance/channel
+  close, launch, copy, and resize remain separate typed operations.
 
 **Registration & binding**
 - **B4 — Register once.** `register_program(trace)` computes the frame
   layout, per-stage kernels, the host-visible channel list, **and bakes the
   trace-static readiness/commit channel lists** once. Nothing per-step
   re-sends state a word already carries.
-- **B5 — Addresses and wake targets, at bind.** Bind exchanges the address
-  triple (up) and the wake slot ids (down). The data plane exchanges no
-  layout or wake-target information after bind (§2).
-- **B6 — Fixed frame, FIFO-drained close.** The frame address never moves
-  while the instance is live. `close_instance` frees only after every
-  in-flight carry retires; the single FIFO copy stream enforces this with one
-  stream drain inside the driver. No host-side in-flight tracker.
+- **B5 — Endpoint registration, instance attachment.** `register_channel`
+  exchanges endpoint addresses and fixed wake ids. Bind attaches channel ids
+  and returns instance identity (§2).
+- **B6 — Stable storage, ordered close.** Endpoint and terminal addresses never
+  move while leased. Instance close detaches after its accepted operations
+  retire; channel close follows final detach and frees wait ids only after
+  native close.
 
 **Enqueue**
 - **B7 — Enqueue is the launch descriptor.** A batch names bound instances
-  plus opaque descriptor bytes. It carries **no wake context and no
-  pointers**: carries fire automatically for every bound instance in the
-  batch; wake targets were registered at bind.
+  plus one stable terminal-cell pointer per member. Candidate epochs remain
+  scheduler state. The descriptor carries no value or error response storage.
+  One `PieCompletion` wakes the operation after every member terminal cell is
+  visible.
 - **B14 — The per-fire call is the leasing function.** One host call per fire
   remains, because resource leasing (KV pages, batch composition) is
   inherently per-fire host work; this is the dumb-driver division of labor,
@@ -191,30 +211,28 @@ flowchart LR
   watches and registers `(waker, observed_epoch)`; the committer wakes when
   the word passes it (`wake_past`). The commit-lands-before-park race is
   closed by register-then-recheck (§6).
-- **B10 — C++ never holds a `Waker`.** The FFI surface is `pie_wake` /
-  `pie_wake_past`: opaque `u64` in, `0/1` out, callable from any thread,
-  never unwinds. Slots are generation-tagged, so a stale id held after close
-  is a harmless no-op.
+- **B10 — C++ never holds a `Waker`.** The callback surface receives opaque
+  `u64` wait ids, is callable from any thread, and never unwinds. Slots are
+  generation-tagged, so a stale id is a harmless no-op; close ordering prevents
+  normal callbacks from outliving storage.
 - **B11 — Publish before wake, stream-ordered.** The mirror D2H and the word
-  publish land in stream order before the wake fires. End state: the commit
-  bump itself stores head/tail into mapped pinned words (device-side
-  publish); during migration the carrier's host callback performs the store.
-  Monotonicity comes from FIFO order, not from CAS defense.
+  publish land in stream order before terminal publication and wake. Runtime
+  acquire-loads each leased terminal cell after callback.
 - **B12 — Sweep on poison/close/abort.** `sweep` wakes every registered slot
   of the touched channels unconditionally, so a blocked `take().await?`
   re-polls, observes the poison, and resolves to `Err`.
 
 **New in this revision**
-- **B15 — Zero steady-state allocation.** All waker slots are bind-time
-  fixed. No per-batch heap contexts, no exactly-once callback contracts, no
-  pointers cross the boundary in either direction.
-- **B16 — Put is a store.** Host → driver has no doorbell and no wake. The
-  device reads words at its cut points and speculates (C2); `capacity + 1`
-  rings and the predicated commit make the retry free of state corruption.
-- **B17 — The committer wakes what it committed.** Wake targets live in the
-  driver's instance table, registered at bind. There is no completion
-  registry, no per-instance channel scan, and no completion-source seam on
-  the runtime side.
+- **B15 — Reusable stable control state.** Endpoint wait slots are
+  lifetime-stable, and operation terminal cells remain stable while leased and
+  are pooled after retirement. An accepted FFI operation invokes exactly one
+  payload-free callback; no value/result arena crosses the boundary.
+- **B16 — Put and fire are capacity-reserved.** Host puts and scheduler
+  dispatch both reserve endpoint capacity. Known-not-ready work remains queued;
+  a post-acceptance miss is terminal failure.
+- **B17 — The committer wakes what changed.** Channel wake targets live with
+  the endpoint. The operation callback wakes the scheduler only after every
+  member terminal entry is durable.
 
 > **SPSC ⇒ two fixed slots per host-visible channel** (one reader-waiter, one
 > writer-waiter): no waiter lists, no thundering herd, O(1) memory per
@@ -227,52 +245,102 @@ flowchart LR
 ## 5. Key types
 
 ```rust
-// B5 — the bind-time address contract (driver → runtime).
-pub struct FrameAddresses {
-    pub frame_base:  u64, // device; never moves for the instance lifetime (B6)
-    pub mirror_base: u64, // pinned host; direct committed-cell reads (B8/B13)
-    pub word_base:   u64, // pinned host; pacing + per-channel head/tail words (§2)
+// B5 — runtime-owned identity and wait slots passed at channel registration.
+pub struct ChannelEndpointDesc {
+    pub channel_id: ChannelId,
+    pub shape: Vec<u32>,
+    pub dtype: ChannelDType,
+    pub capacity: u32,
+    pub reader_wait_id: WakerSlotId,
+    pub writer_wait_id: WakerSlotId,
 }
 
-// B5/B17 — the bind-time wake targets (runtime → driver). Opaque to the
-// driver: it stores the ids next to the ring words and calls pie_wake_past.
-pub struct InstanceWakes {
-    pub pacing:   WakerSlotId,        // woken past word[0]
-    pub channels: Vec<ChannelWakers>, // (reader, writer) per host-visible channel
+// B5 — stable driver-owned endpoint allocations returned to the runtime.
+pub struct ChannelEndpointBinding {
+    pub channel_id: u64,
+    pub mirror_base: u64,
+    pub word_base: u64,
+    pub mirror_bytes: u64,
+    pub word_bytes: u64,
+    pub cell_bytes: u32,
+    pub capacity: u32,
+    pub head_word_index: u32,
+    pub tail_word_index: u32,
+    pub poison_word_index: u32,
+    pub closed_word_index: u32,
 }
 
-// B7 — the launch descriptor (unchanged; carries no wake context).
-pub struct EnqueueBatch {
-    pub instance:   InstanceId,
-    pub descriptor: Vec<u8>,
+// B5 — bind returns identity; endpoint and terminal storage live elsewhere.
+pub struct InstanceBinding {
+    pub instance_id: InstanceId,
 }
 
-// B1/B4/B14 — the direct control plane.
-pub trait ControlPlane: Send + Sync {
-    fn register_program(&self, trace: &[u8]) -> Result<ProgramId>;              // B4
-    fn bind_instance(
-        &self,
-        program: ProgramId,
-        bindings: &[u8],
-        wakes: &InstanceWakes,                                                  // B5/B17
-    ) -> Result<BoundInstance>;
-    fn close_instance(&self, id: InstanceId) -> Result<()>;                     // B6
-    fn enqueue(&self, batch: EnqueueBatch) -> Result<Completion>;               // B14
+pub struct PieTerminalCell {
+    pub outcome: u32, // 0 = pending, 1 = success, 2 = failed
+    pub reserved: u32,
+}
+
+pub struct PieCompletion {
+    pub wait_id: WakerSlotId,
+    pub target_epoch: u64,
+    // Null for launch; launch members carry their own cells.
+    pub terminal_cell: Option<NonNull<PieTerminalCell>>,
+}
+
+// D2/B7 — one accepted fire within an atomically accepted native batch.
+pub struct LaunchMember {
+    pub instance_id: InstanceId,
+    pub terminal_cell: NonNull<PieTerminalCell>,
+}
+
+pub struct LaunchBatch {
+    pub members: Vec<LaunchMember>,
+    pub descriptor: LaunchDescriptor,
+    pub completion: PieCompletion, // one wake for the whole FFI operation
+}
+
+// B1/B2/B4/B14 — conceptual typed direct-ABI surface.
+pub trait LocalDriver {
+    fn register_program(&mut self, trace: &[u8]) -> Result<ProgramId>;
+    fn register_channel(
+        &mut self,
+        desc: &ChannelEndpointDesc,
+    ) -> Result<ChannelEndpointBinding>;
+    fn bind_instance(&mut self, desc: &InstanceDesc) -> Result<InstanceBinding>;
+    fn launch(&mut self, batch: &LaunchBatch) -> Result<()>;
+    fn copy_kv(&mut self, desc: &KvCopyDesc, completion: PieCompletion) -> Result<()>;
+    fn copy_state(
+        &mut self,
+        desc: &StateCopyDesc,
+        completion: PieCompletion,
+    ) -> Result<()>;
+    fn resize_pool(
+        &mut self,
+        desc: &PoolResizeDesc,
+        completion: PieCompletion,
+    ) -> Result<()>;
+    fn close_instance(&mut self, id: InstanceId) -> Result<()>;
+    fn close_channel(&mut self, id: ChannelId) -> Result<()>;
 }
 ```
 
-A `Completion` is a thin wait on the instance's **fixed pacing slot** against
-`word[0]` with `target = fire seq` (B15: no per-batch slot allocation).
-Awaiting it resolves when the driver's commit publish passes that fire.
-Dropping a still-pending `Completion` cancels the wait; a later wake on the
-fixed slot is filtered by the epoch or, after close, by the generation.
+The scheduler owns candidate epochs and terminal-cell leases. A synchronous
+`launch` error rejects the entire batch, consumes no candidate epoch, and
+causes no callback. A successful return accepts every member. The one
+`PieCompletion` callback arrives only after every member terminal cell is
+visible; it is a wake to recheck those cells, not proof of success.
+For copy, state-copy, and resize, `terminal_cell` is required and remains
+stable through callback and retirement. The driver publishes the ordered memory
+effect, then release-publishes `Success`; on failure it publishes affected
+channel poison, then `Failed`; only then may it invoke the one operation
+callback.
 
 ---
 
-## 6. Completion protocol: register-then-recheck (B9)
+## 6. Wait and completion protocol: register-then-recheck (B9)
 
-The race (a commit landing between the waiter's observation and its
-registration) is closed without a lock spanning the boundary:
+The race between persistent publication and waiter registration is closed
+without a lock spanning the boundary:
 
 1. **Fast path.** If the word already passed the target, resolve immediately.
 2. **Publish the waker** (`register(slot, waker, observed_epoch)`).
@@ -287,81 +355,46 @@ the store-buffering interleaving (loom-found; model-checked in `pie-waker`).
 it wrong. Spurious wakes are permitted everywhere (the futures contract); the
 epoch filter keeps them rare, never guarantees their absence.
 
+Operation completion adds one mandatory step: after the payload-free callback,
+the scheduler acquire-loads every leased terminal cell. It commits only
+`Success` members and aborts `Failed` members. A callback without a terminal
+outcome is a protocol violation,
+not success.
+
 ---
 
 ## 7. Implementation status
 
-The spec above is the target. What exists today, and its fate:
-
-| Piece | Source | Status / fate |
-|-------|--------|---------------|
-| X0 waker table + FFI + `WaitFuture` | `runtime/waker/src/lib.rs` (`pie-waker`) | **Built, loom-checked. Keep.** Hygiene split (modules, tests out of lib.rs) in Phase 0. |
-| X1 `ControlPlane` + `MockControlPlane` | `runtime/src/driver/control.rs` | **Built. Keep.** `bind_instance` gains `wakes`; `Completion` re-backed by the fixed pacing slot (Phase 1). |
-| X2 frame carrier (bind/carry/close, copy stream, forward-event ordering) | `driver/cuda/src/sampling_ir/frame_carrier.{hpp,cpp}` | **Built (mechanism). Keep.** Layout is a 64-byte stub; wake-slot table + direct wakes in Phase 1; real trace layout + device-side word publish in Phase 2. |
-| Device channel rings + predicated commit (`k_stage_readiness`, `k_commit_bump`) | `driver/cuda/src/ptir/channels.hpp` | **Built. Keep as-is.** The semantic core (C2, pass-atomicity). |
-| X3 completion consumer (registry + scan + `CompletionSource`) | `runtime/src/driver/completion.rs` | Built, **superseded by B17: delete.** Keep `PinnedRingWord` (the word reader). |
-| Carry bridge (`CarryDescriptor`, SoA wire cols, `InFlightTracker`, deferred-free/reap) | `runtime/src/driver/carry_bridge.rs` + 4 `ForwardRequest` fields | Built, **superseded by B15/B6/B7: delete**, wire fields included. |
-| `CarryWake` + `cuda_carry_done` + `pie_frame_set_carry_done` trampoline | `runtime/src/driver/control_cuda.rs` | **Superseded by B15/B17: delete.** The host callback shrinks to publish + wakes from the driver's own table. |
-| `PIE_CARRY_POPULATE` gate | `runtime/src/inference/execute.rs` | Dead flag (enabling it aborts: PTIR arena-instance ids were never `pie_frame_bind`-bound). **Delete**; the bind lifecycle itself becomes the gate. |
-| `k_channel_bits` | `driver/cuda/src/ptir/channels.hpp` | Write-only, no consumer. **Delete**; readiness is derivable from the published head/tail words. |
-| Tier-0 per-pass host chatter (commit-seed H2D, per-pass list mallocs/uploads, pass-end `cudaStreamSynchronize` + committed D2H + `sync_host_rings`) | `driver/cuda/src/ptir/tier0_runner.hpp` | Works, host-blocking by design (degenerate depth 0). Static lists bake at registration (B4); sync/D2H dissolve into word reads (Phase 2). |
-| Host take/read/put | `runtime/src/ptir/ptir_host.rs` | Works via `ForwardResponse` marshal + `finalize_fire` FIFO. Rewired in Phase 2: take parks on the reader slot and loads the mirror; put stores staging + epoch; `finalize_fire` keeps only KV/RS txn settlement. |
-
-Singletons after the rework: one (`WakerTable::global`, the FFI entry).
+The terminal-cell, global-endpoint, reservation, and ordered-close portions of
+this boundary are implemented. Metal direct model execution remains explicitly
+unsupported, and CUDA typed copy/resize controls explicitly reject tensor
+parallel configurations until an all-rank control protocol exists. Current
+backend limitations and remaining GPU-only validation are tracked in
+[direct_ffi_fix.md](direct_ffi_fix.md).
 
 ---
 
 ## 8. Migration plan
 
-Each phase merges independently; the system runs between phases.
+The normative migration order is the five-phase plan in
+[direct_ffi_fix.md](direct_ffi_fix.md#5-recommended-fix-order):
 
-**Phase 0 — hygiene (no behavior change).** Split `pie-waker` into
-`table` / `wait` / `ffi` / `loom` modules with a single sync-shim for the
-loom cfg; move tests out of `lib.rs`; trim history commentary to protocol
-invariants.
+1. Atomic acceptance and exact terminal completion.
+2. Global channel endpoints, immutable attachments, reservations, and
+   same-instance run-ahead.
+3. Real single-rank CUDA and Metal execution.
+4. Tensor-parallel typed operations and stable sparse/VMM pools.
+5. Obsolete-path removal and final validation.
 
-**Phase 1 — remove accidental complexity while the path is dormant.**
-- Extend bind: wake slot ids down, word-layout header shared by both sides.
-- Carrier callback reduced to word publish + direct `pie_wake_past` calls
-  from the driver's instance table.
-- Delete: `CarryWake`/`user_ptr` trampoline, carry SoA wire columns,
-  `InFlightTracker`/`CloseAction`/reap, `completion.rs` registry/scan,
-  `PIE_CARRY_POPULATE`. Port the valuable regression tests (monotonic head,
-  close-during-in-flight) to the carrier layer.
-- `Completion` re-backed by the fixed pacing slot + `word[0]`.
-
-**Phase 2 — real layout and the value path.**
-- Derive the frame layout from the trace (host-visible channel list, cell
-  offsets/sizes); per-channel delta D2H replaces whole-frame mirror; bake the
-  static readiness/commit lists at registration.
-- `k_commit_bump` stores head/tail (and pacing) into mapped pinned words;
-  the host callback becomes wake-only; delete `k_channel_bits`, the pass-end
-  sync, and the host ring mirrors.
-- Rewire `ptir_host`: take/read park on reader slots and load the mirror;
-  put writes staging + epoch store (H2D of dirty inputs at fire-build);
-  `ForwardResponse` loses the PTIR output marshal.
-
-**Phase 3 — activation and the fire rule.**
-- Completion switch: the scheduler paces run-ahead depth on pacing words.
-- Fire-skip heuristic (the X4 fire rule, as scheduler policy): skip an
-  instance whose input epochs are unchanged since its last dummy-run. Reads
-  the same pinned words; no new mechanism.
-- Profile; optionally fold wakes into the scheduler's polling loop with a
-  single idle doorbell.
-
-**Separate tracks (out of scope here).** Tier-1 fusion (P5.3: readiness into
-the first kernel's prologue, bump into the last kernel's epilogue; zero extra
-launches). Descriptor diet for B14. Metal/shmem ports: the design carries
-over unchanged (the word region lives in shared memory; the doorbell becomes
-a futex).
+The refactor is complete only after all five phases pass.
 
 ---
 
 ## 9. Relation to the north star
 
 The masterplan docs are gone; the fragments this design answers to are C2
-(device waits on words at cut points, in `pie-waker`'s header), C5 (boundary
-is addresses plus wakes), §7.3 "channels lower to addresses"
+(scheduler-reserved channel transitions plus device invariant checks), C5
+(boundary is persistent addresses plus wakes), §7.3 "channels lower to addresses"
 (`channels.hpp`), tier-1 P5.3 (fusion), and the dumb-driver principle (heavy
 lifting in PTIR programs; driver stays general; runtime does resource
 leasing).
@@ -380,12 +413,12 @@ leasing).
 
 ## 10. Mock-first (house rule)
 
-Each layer proves its shape with a mock before device code exists.
-`MockControlPlane` backs the bind contract with host allocations (real,
-distinct addresses) and plays the committer by advancing words and waking
-slots, so `register → bind → put → fire → take` proves out with zero queue
-hops and zero device code. The CUDA carrier is the real-device dual behind
-the same `ControlPlane`.
+Dummy must back the direct ABI with real host allocations for endpoint and
+terminal state. Its required test flow is
+`register channel → bind → reserve → atomic launch acceptance → publish
+terminal state → callback → take → ordered close` without device code or a
+second operation queue. CUDA and Metal must satisfy the same tests at their
+native boundary.
 
 ---
 
@@ -393,31 +426,22 @@ the same `ControlPlane`.
 
 | Concern | File |
 |---------|------|
-| Driver subsystem overview | `runtime/src/driver.rs` |
-| X0 waker substrate (slots, epochs, FFI, `WaitFuture`) | `runtime/waker/src/lib.rs` (`pie-waker`) |
-| X1 direct control plane + mock | `runtime/src/driver/control.rs` |
-| X2 CUDA control plane | `runtime/src/driver/control_cuda.rs` |
-| CUDA frame carrier (device side) | `driver/cuda/src/sampling_ir/frame_carrier.{hpp,cpp}` |
-| Device channel rings + predicated commit | `driver/cuda/src/ptir/channels.hpp` |
-| Tier-0 pass runner | `driver/cuda/src/ptir/tier0_runner.hpp` |
-| Host channel API (put/take/read hostcalls) | `runtime/src/ptir/ptir_host.rs` |
-
-`runtime/src/driver/completion.rs` and `runtime/src/driver/carry_bridge.rs`
-appear in the tree until Phase 1 lands; they are superseded by this spec
-(§7) and are not part of the target boundary.
+| Driver subsystem and typed operations | `runtime/engine/src/driver.rs` |
+| Per-driver ordering and batching | `runtime/engine/src/inference/scheduler.rs` |
+| Completion broker and register-then-recheck | `runtime/engine/src/driver/completion.rs` |
+| ABI types and generated C header | `interface/driver/src/local.rs`, `interface/driver/include/pie_driver_abi.h` |
+| Host channel API and endpoint state | `runtime/engine/src/ptir/ptir_host.rs`, `runtime/engine/src/ptir/ptir_channel_store.rs` |
+| CUDA direct driver and PTIR channels | `driver/cuda/src/entry.cpp`, `driver/cuda/src/ptir/` |
+| Metal direct driver | `driver/metal/src/entry.cpp` |
+| Dummy direct driver | `driver/dummy/src/lib.rs` |
 
 ---
 
 ## Provenance
 
-Rewritten 2026-07-07 from a design review of the previous X0–X4 shape. The
-review found the mechanism sound but the completion side over-built: a
-per-batch heap context crossed the wire, a runtime-side registry rediscovered
-what the committer already knew, and five host-side mechanisms compensated
-for close racing the copy stream. This revision replaces those with the
-bind-time wake-target table (B17), zero steady-state allocation (B15), the
-no-doorbell put (B16), and FIFO-drained close (B6), and states honestly which
-parts are built, dormant, or deleted (§7). Decision B3 remains unlabeled from
-the original numbering. The prior revision of this file reconstructed the
-spec from module doc-comments after the original `ptir-plan/` notes left the
-tree.
+Rewritten 2026-07-07 from the previous X0-X4 design and amended 2026-07-09
+after direct-FFI implementation review. The amendment replaces normal
+dummy-run/retry with scheduler reservations plus terminal invariant failure,
+moves channel storage and wait ids from instance bind to explicit global
+endpoint lifetime, and separates one batch callback from per-member terminal
+outcomes. Decision B3 remains unlabeled from the original numbering.

@@ -45,6 +45,8 @@ struct CChannel {
     std::uint32_t capacity = 1;
     std::uint8_t  host_role = 0;    // PtirHostRole
     std::uint8_t  seeded = 0;
+    std::int8_t   extern_dir = -1;  // -1 private, 0 import, 1 export
+    std::string   extern_name;
 };
 
 struct CPort {
@@ -108,7 +110,13 @@ struct Cur {
     std::size_t n;
     std::size_t i = 0;
     bool err = false;
-    bool need(std::size_t k) { if (i + k > n) { err = true; return false; } return true; }
+    bool need(std::size_t k) {
+        if (i > n || k > n - i) {
+            err = true;
+            return false;
+        }
+        return true;
+    }
     std::uint8_t u8() { if (!need(1)) return 0; return p[i++]; }
     std::uint16_t u16() { if (!need(2)) return 0; std::uint16_t v; std::memcpy(&v, p + i, 2); i += 2; return v; }
     std::uint32_t u32() { if (!need(4)) return 0; std::uint32_t v; std::memcpy(&v, p + i, 4); i += 4; return v; }
@@ -179,14 +187,16 @@ inline void decode_op(Cur& c, COp& op) {
 // its `hash`); on failure returns false and (if non-null) fills `err`.
 inline bool decode(const std::uint8_t* data, std::size_t len, Container& out, DecodeError* err = nullptr) {
     auto fail = [&](const char* m) { if (err) { err->ok = false; err->detail = m; } return false; };
+    out = {};
     detail::Cur c{data, len};
     if (len < 24) return fail("short header");
     if (std::memcmp(data, PTIR_MAGIC, 4) != 0) return fail("bad magic");
     c.skip(4);
     std::uint16_t version = c.u16();
-    if (version != PTIR_VERSION) return fail("bad version");
+    if (version != PTIR_VERSION && version != 2) return fail("bad version");
     c.u16();  // flags
     std::uint32_t n_names = c.u32(), n_channels = c.u32(), n_ports = c.u32(), n_stages = c.u32();
+    const std::uint32_t n_externs = version == 2 ? c.u32() : 0;
 
     for (std::uint32_t i = 0; i < n_names; ++i) {
         std::uint16_t l = c.u16();
@@ -232,6 +242,19 @@ inline bool decode(const std::uint8_t* data, std::size_t len, Container& out, De
             st.ops.push_back(std::move(op));
         }
         out.stages.push_back(std::move(st));
+    }
+    std::vector<bool> has_extern(out.channels.size(), false);
+    for (std::uint32_t i = 0; i < n_externs; ++i) {
+        const std::uint16_t name = c.u16();
+        const std::uint8_t direction = c.u8();
+        const std::uint32_t channel = c.u32();
+        if (c.err || name >= out.names.size() || direction > 1 ||
+            channel >= out.channels.size() || has_extern[channel]) {
+            return fail("invalid extern declaration");
+        }
+        has_extern[channel] = true;
+        out.channels[channel].extern_dir = static_cast<std::int8_t>(direction);
+        out.channels[channel].extern_name = out.names[name];
     }
     if (c.i != len) return fail("trailing bytes");
     out.hash = fnv1a64(data, len);

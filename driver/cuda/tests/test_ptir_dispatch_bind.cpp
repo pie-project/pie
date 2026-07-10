@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "ptir/ptir_dispatch.hpp"
-#include "sampling_ir/frame_carrier.hpp"
+#include "ptir/container.hpp"
 
 using pie_cuda_driver::ptir::PtirDispatch;
 
@@ -89,11 +89,40 @@ int main() {
     if (!expect(rc == PIE_STATUS_OK, err.c_str())) return 1;
 
     std::vector<std::uint64_t> channel_ids(2);
-    std::vector<PieChannelWait> waits(2);
+    pie_cuda_driver::ptir::container::Container container;
+    pie_cuda_driver::ptir::container::DecodeError decode_error;
+    if (!expect(
+            pie_cuda_driver::ptir::container::decode(
+                bytes.data(), bytes.size(), container, &decode_error),
+            decode_error.detail.c_str())) return 1;
+    if (!expect(container.channels.size() == channel_ids.size(),
+                "golden channel count")) return 1;
+    std::vector<PieChannelEndpointBinding> endpoints(channel_ids.size());
     for (std::size_t i = 0; i < channel_ids.size(); ++i) {
         channel_ids[i] = 1000 + i;
-        waits[i].reader_wait_id = 2000 + i;
-        waits[i].writer_wait_id = 3000 + i;
+        const auto& source = container.channels[i];
+        PieChannelDesc desc{};
+        desc.abi_version = PIE_DRIVER_ABI_VERSION;
+        desc.channel_id = channel_ids[i];
+        desc.shape = {.ptr = source.shape.dims, .len = source.shape.rank};
+        desc.dtype = source.dtype;
+        desc.host_role = source.host_role;
+        desc.seeded = source.seeded;
+        desc.extern_dir = source.extern_dir < 0
+            ? PIE_CHANNEL_EXTERN_NONE
+            : static_cast<std::uint8_t>(source.extern_dir + 1);
+        desc.capacity = source.capacity;
+        desc.reader_wait_id = 2000 + i;
+        desc.writer_wait_id = 3000 + i;
+        desc.extern_name = {
+            .ptr = reinterpret_cast<const std::uint8_t*>(
+                source.extern_name.data()),
+            .len = source.extern_name.size(),
+        };
+        if (!expect(
+                dispatch.register_channel(desc, &endpoints[i], &err) ==
+                    PIE_STATUS_OK,
+                err.c_str())) return 1;
     }
 
     PieInstanceBinding binding{};
@@ -107,7 +136,6 @@ int main() {
                     program_hash,
                     /*pacing_wait_id=*/1234,
                     channel_ids,
-                    waits,
                     {bad_seed},
                     &binding,
                     &err) == PIE_STATUS_INVALID_ARGUMENT,
@@ -119,54 +147,37 @@ int main() {
                     program_hash,
                     /*pacing_wait_id=*/1234,
                     duplicate_ids,
-                    waits,
                     {},
                     &binding,
                     &err) == PIE_STATUS_INVALID_ARGUMENT,
                 "reject duplicate channel ids")) return 1;
     const int bind_rc = dispatch.bind_instance(
         /*instance_id=*/77, program_hash, /*pacing_wait_id=*/1234,
-        channel_ids, waits, {}, &binding, &err);
+        channel_ids, {}, &binding, &err);
     if (!expect(bind_rc == PIE_STATUS_OK, err.c_str())) return 1;
     if (!expect(binding.instance_id == 77, "instance id")) return 1;
-    if (!expect(binding.channels.ptr != nullptr, "channels ptr")) return 1;
-    if (!expect(binding.channels.len == binding.channel_count, "channel slice len")) return 1;
-    if (!expect(binding.word_count ==
-                    pie_cuda_driver::sampling_ir::WordLayout::words(binding.channel_count),
-                "word count")) return 1;
-    if (!expect(binding.word_bytes ==
-                    static_cast<std::uint64_t>(binding.word_count) * sizeof(std::uint64_t),
-                "word bytes")) return 1;
-
-    std::uint64_t prev_mirror_end = 0;
-    for (std::size_t i = 0; i < binding.channels.len; ++i) {
-        const PieChannelBinding& channel = binding.channels.ptr[i];
-        bool found_channel_id = false;
-        for (std::uint64_t candidate : channel_ids) {
-            if (candidate == channel.channel_id) {
-                found_channel_id = true;
-                break;
-            }
-        }
-        if (!expect(found_channel_id, "stable channel id")) return 1;
-        if (!expect(channel.head_word_index ==
-                        pie_cuda_driver::sampling_ir::WordLayout::head(i),
-                    "head index")) return 1;
-        if (!expect(channel.tail_word_index ==
-                        pie_cuda_driver::sampling_ir::WordLayout::tail(i),
-                    "tail index")) return 1;
-        if (!expect(channel.poison_word_index ==
-                        pie_cuda_driver::sampling_ir::WordLayout::poison(i),
-                    "poison index")) return 1;
-        if (!expect(channel.mirror_offset >= prev_mirror_end, "mirror offsets monotonic"))
-            return 1;
-        prev_mirror_end =
-            channel.mirror_offset +
-            static_cast<std::uint64_t>(channel.cell_bytes) * (channel.capacity + 1ull);
+    for (std::size_t i = 0; i < endpoints.size(); ++i) {
+        const auto& endpoint = endpoints[i];
+        if (!expect(endpoint.channel_id == channel_ids[i], "stable channel id")) return 1;
+        if (!expect(endpoint.mirror_base != 0 && endpoint.word_base != 0,
+                    "endpoint storage")) return 1;
+        if (!expect(endpoint.head_word_index == 0 &&
+                        endpoint.tail_word_index == 1 &&
+                        endpoint.poison_word_index == 2 &&
+                        endpoint.closed_word_index == 3,
+                    "endpoint word layout")) return 1;
+        if (!expect(endpoint.word_bytes == 4 * sizeof(std::uint64_t),
+                    "endpoint word bytes")) return 1;
+        if (!expect(dispatch.close_channel(channel_ids[i], &err) ==
+                        PIE_STATUS_INVALID_ARGUMENT,
+                    "live endpoint close rejected")) return 1;
     }
-    if (!expect(prev_mirror_end <= binding.mirror_bytes, "mirror bytes cover bindings")) return 1;
 
     dispatch.close_instance(binding.instance_id);
+    for (std::uint64_t channel_id : channel_ids) {
+        if (!expect(dispatch.close_channel(channel_id, &err) == PIE_STATUS_OK,
+                    err.c_str())) return 1;
+    }
     std::puts("test_ptir_dispatch_bind: OK");
     return 0;
 }

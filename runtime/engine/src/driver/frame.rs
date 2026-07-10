@@ -1,15 +1,15 @@
 //! Runtime-owned launch and direct-driver descriptors.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 use pie_driver_abi::{
-    PIE_DRIVER_ABI_VERSION, PIE_MEMORY_DOMAIN_HOST_PINNED, PieBytes, PieChannelValueDesc,
-    PieChannelValueDescSlice, PieChannelWait, PieChannelWaitSlice, PieCompletion,
+    PIE_DRIVER_ABI_VERSION, PIE_MEMORY_DOMAIN_HOST_PINNED, PieBytes, PieChannelDesc,
+    PieChannelEndpointBinding, PieChannelValueDesc, PieChannelValueDescSlice, PieCompletion,
     PieInstanceBinding, PieInstanceDesc, PieKvCopyDesc, PieKvMoveCell, PieKvMoveCellSlice,
     PieMaskWordsDesc, PieMemoryDomain, PiePoolRange, PiePoolRangeSlice, PiePoolResizeDesc,
-    PieProgramDesc, PieStateCopyDesc, PieStateCopyRange, PieStateCopyRangeSlice, PieU8Slice,
-    PieU32Slice, PieU64Slice,
+    PieProgramDesc, PieStateCopyDesc, PieStateCopyRange, PieStateCopyRangeSlice, PieTerminalCell,
+    PieTerminalCellPtrSlice, PieU8Slice, PieU32Slice, PieU64Slice,
 };
 
 use crate::ptir::PtirChannelValue;
@@ -66,96 +66,213 @@ pub struct ProgramRegistration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRegistrationPlan {
+    pub driver_id: usize,
+    pub channel_id: u64,
+    pub shape: Vec<u32>,
+    pub dtype: u8,
+    pub host_role: u8,
+    pub seeded: bool,
+    pub extern_dir: u8,
+    pub capacity: u32,
+    pub reader_wait_id: u64,
+    pub writer_wait_id: u64,
+    pub extern_name: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredChannel {
+    pub driver_id: usize,
+    pub binding: PieChannelEndpointBinding,
+    pub reader_wait_id: u64,
+    pub writer_wait_id: u64,
+}
+
+#[derive(Debug)]
+pub struct ChannelEndpoint {
+    registered: RegisteredChannel,
+    closed: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelWaitError {
+    Poisoned(u64),
+    Closed,
+}
+
+impl std::fmt::Display for ChannelWaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Poisoned(epoch) => write!(f, "channel is poisoned at epoch {epoch}"),
+            Self::Closed => write!(f, "channel is closed"),
+        }
+    }
+}
+
+impl std::error::Error for ChannelWaitError {}
+
+fn load_channel_word(word_base: u64, index: u32) -> u64 {
+    unsafe { (&*((word_base as *const AtomicU64).add(index as usize))).load(Ordering::Acquire) }
+}
+
+impl ChannelEndpoint {
+    pub fn new(registered: RegisteredChannel) -> Self {
+        Self {
+            registered,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    pub fn registered(&self) -> &RegisteredChannel {
+        &self.registered
+    }
+
+    pub async fn wait_for_reader_change(&self, observed_tail: u64) -> Result<(), ChannelWaitError> {
+        self.wait_for_word_change(
+            self.registered.reader_wait_id,
+            self.registered.binding.tail_word_index,
+            observed_tail,
+        )
+        .await
+    }
+
+    pub async fn wait_for_writer_change(&self, observed_head: u64) -> Result<(), ChannelWaitError> {
+        self.wait_for_word_change(
+            self.registered.writer_wait_id,
+            self.registered.binding.head_word_index,
+            observed_head,
+        )
+        .await
+    }
+
+    async fn wait_for_word_change(
+        &self,
+        wait_id: u64,
+        word_index: u32,
+        observed: u64,
+    ) -> Result<(), ChannelWaitError> {
+        let binding = self.registered.binding;
+        pie_waker::WaitFuture::new(pie_waker::WakerTable::global(), wait_id, move || {
+            let poison = load_channel_word(binding.word_base, binding.poison_word_index);
+            if poison != 0 {
+                return pie_waker::Readiness::Ready(Err(ChannelWaitError::Poisoned(poison)));
+            }
+            if load_channel_word(binding.word_base, binding.closed_word_index) != 0 {
+                return pie_waker::Readiness::Ready(Err(ChannelWaitError::Closed));
+            }
+            let current = load_channel_word(binding.word_base, word_index);
+            if current > observed {
+                pie_waker::Readiness::Ready(Ok(()))
+            } else {
+                pie_waker::Readiness::Pending {
+                    observed_epoch: current,
+                }
+            }
+        })
+        .await
+    }
+
+    fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let table = pie_waker::WakerTable::global();
+        let wait_ids = [
+            self.registered.reader_wait_id,
+            self.registered.writer_wait_id,
+        ];
+        if let Ok(handle) = crate::driver::scheduler_handle(self.registered.driver_id) {
+            if let Err(error) = handle.close_channel(self.registered.binding.channel_id) {
+                tracing::warn!(
+                    channel_id = self.registered.binding.channel_id,
+                    ?error,
+                    "ordered channel close failed"
+                );
+            }
+        }
+        table.sweep(&wait_ids);
+        for wait_id in wait_ids {
+            table.deregister(wait_id);
+            table.free(wait_id);
+        }
+    }
+}
+
+impl Drop for ChannelEndpoint {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceBindingPlan {
     pub driver_id: usize,
     pub program_id: ProgramId,
     pub requested_instance_id: InstanceId,
     pub pacing_wait_id: u64,
-    pub channel_waits: Vec<PieChannelWait>,
     pub channel_ids: Vec<u64>,
     pub seed_values: Vec<PtirChannelValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedChannelBinding {
-    pub channel_id: u64,
-    pub cell_bytes: u32,
-    pub capacity: u32,
-    pub mirror_offset: u64,
-    pub head_word_index: u32,
-    pub tail_word_index: u32,
-    pub poison_word_index: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedInstanceBinding {
     pub instance_id: InstanceId,
-    pub frame_base: u64,
-    pub mirror_base: u64,
-    pub word_base: u64,
-    pub channel_count: u32,
-    pub word_count: u32,
-    pub frame_bytes: u64,
-    pub mirror_bytes: u64,
-    pub word_bytes: u64,
-    pub channels: Vec<OwnedChannelBinding>,
 }
 
 #[derive(Debug)]
 pub(crate) struct BoundWaitSlots {
     pacing_wait_id: u64,
-    channel_waits: Vec<PieChannelWait>,
+    completion_wait_ids: Mutex<Vec<u64>>,
     close_requested: AtomicBool,
     freed: AtomicBool,
     active_leases: AtomicUsize,
-    close_mu: Mutex<()>,
-    close_cv: Condvar,
 }
 
 impl BoundWaitSlots {
-    fn new(pacing_wait_id: u64, channel_waits: Vec<PieChannelWait>) -> Self {
+    fn new(pacing_wait_id: u64) -> Self {
         Self {
             pacing_wait_id,
-            channel_waits,
+            completion_wait_ids: Mutex::new(Vec::new()),
             close_requested: AtomicBool::new(false),
             freed: AtomicBool::new(false),
             active_leases: AtomicUsize::new(0),
-            close_mu: Mutex::new(()),
-            close_cv: Condvar::new(),
         }
     }
 
     fn acquire_completion_lease(
         this: &Arc<Self>,
+        completion_wait_id: u64,
     ) -> Arc<dyn crate::driver::completion::CompletionLease> {
+        this.completion_wait_ids
+            .lock()
+            .unwrap()
+            .push(completion_wait_id);
         this.active_leases.fetch_add(1, Ordering::AcqRel);
         Arc::new(BoundWaitLease {
             slots: Arc::clone(this),
+            completion_wait_id,
         })
     }
 
     pub(crate) fn close(&self) {
         if !self.close_requested.swap(true, Ordering::AcqRel) {
             pie_waker::WakerTable::global().sweep(&self.wait_ids());
+            let completion_wait_ids = self.completion_wait_ids.lock().unwrap().clone();
+            pie_waker::WakerTable::global().sweep(&completion_wait_ids);
             self.maybe_finalize();
         }
     }
 
-    pub(crate) fn close_and_wait(&self) {
-        self.close();
-        let mut guard = self.close_mu.lock().unwrap();
-        while !self.freed.load(Ordering::Acquire) {
-            guard = self.close_cv.wait(guard).unwrap();
-        }
-    }
-
-    fn release_completion_lease(&self) {
+    fn release_completion_lease_for(&self, completion_wait_id: u64) {
+        self.completion_wait_ids
+            .lock()
+            .unwrap()
+            .retain(|&id| id != completion_wait_id);
         let prev = self.active_leases.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(prev > 0);
         if prev == 1 {
             self.maybe_finalize();
         }
-        self.close_cv.notify_all();
     }
 
     fn maybe_finalize(&self) {
@@ -170,17 +287,10 @@ impl BoundWaitSlots {
             table.deregister(id);
             table.free(id);
         }
-        self.close_cv.notify_all();
     }
 
     fn wait_ids(&self) -> Vec<u64> {
-        let mut ids = Vec::with_capacity(1 + self.channel_waits.len() * 2);
-        ids.push(self.pacing_wait_id);
-        for waits in &self.channel_waits {
-            ids.push(waits.reader_wait_id);
-            ids.push(waits.writer_wait_id);
-        }
-        ids
+        vec![self.pacing_wait_id]
     }
 
     fn is_closed(&self) -> bool {
@@ -197,11 +307,13 @@ impl crate::driver::completion::CompletionLease for BoundWaitLease {
 #[derive(Debug)]
 struct BoundWaitLease {
     slots: Arc<BoundWaitSlots>,
+    completion_wait_id: u64,
 }
 
 impl Drop for BoundWaitLease {
     fn drop(&mut self) {
-        self.slots.release_completion_lease();
+        self.slots
+            .release_completion_lease_for(self.completion_wait_id);
     }
 }
 
@@ -212,8 +324,6 @@ pub struct BoundInstance {
     pub instance_id: InstanceId,
     pub binding: OwnedInstanceBinding,
     pub pacing_wait_id: u64,
-    pub channel_waits: Vec<PieChannelWait>,
-    next_target_epoch: AtomicU64,
     wait_slots: Arc<BoundWaitSlots>,
 }
 
@@ -223,59 +333,27 @@ impl BoundInstance {
         program_id: ProgramId,
         binding: PieInstanceBinding,
         pacing_wait_id: u64,
-        channel_waits: Vec<PieChannelWait>,
     ) -> Self {
-        let channels = if binding.channels.ptr.is_null() || binding.channels.len == 0 {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(binding.channels.ptr, binding.channels.len) }
-                .iter()
-                .map(|channel| OwnedChannelBinding {
-                    channel_id: channel.channel_id,
-                    cell_bytes: channel.cell_bytes,
-                    capacity: channel.capacity,
-                    mirror_offset: channel.mirror_offset,
-                    head_word_index: channel.head_word_index,
-                    tail_word_index: channel.tail_word_index,
-                    poison_word_index: channel.poison_word_index,
-                })
-                .collect()
-        };
-        let wait_slots = Arc::new(BoundWaitSlots::new(pacing_wait_id, channel_waits.clone()));
+        let wait_slots = Arc::new(BoundWaitSlots::new(pacing_wait_id));
         Self {
             driver_id,
             program_id,
             instance_id: binding.instance_id,
             binding: OwnedInstanceBinding {
                 instance_id: binding.instance_id,
-                frame_base: binding.frame_base,
-                mirror_base: binding.mirror_base,
-                word_base: binding.word_base,
-                channel_count: binding.channel_count,
-                word_count: binding.word_count,
-                frame_bytes: binding.frame_bytes,
-                mirror_bytes: binding.mirror_bytes,
-                word_bytes: binding.word_bytes,
-                channels,
             },
             pacing_wait_id,
-            channel_waits,
-            next_target_epoch: AtomicU64::new(1),
             wait_slots,
         }
     }
 
     pub fn reserve_completion(&self) -> crate::driver::completion::InstanceCompletion {
-        let target_epoch = self.next_target_epoch.fetch_add(1, Ordering::Relaxed);
+        let wait_id = pie_waker::WakerTable::global().alloc();
         crate::driver::completion::InstanceCompletion::with_guard(
-            self.pacing_wait_id,
-            target_epoch,
-            BoundWaitSlots::acquire_completion_lease(&self.wait_slots),
+            wait_id,
+            0,
+            BoundWaitSlots::acquire_completion_lease(&self.wait_slots, wait_id),
         )
-    }
-
-    pub fn channel_bindings(&self) -> &[OwnedChannelBinding] {
-        &self.binding.channels
     }
 
     pub(crate) fn wait_slots(&self) -> Arc<BoundWaitSlots> {
@@ -287,6 +365,7 @@ impl BoundInstance {
 pub struct LaunchSubmission {
     pub plan: LaunchPlan,
     pub instance_ids: Vec<u64>,
+    pub terminal_cells: Vec<*mut PieTerminalCell>,
     pub host_put_values: Vec<PtirChannelValue>,
     pub host_put_indptr: Vec<u32>,
 }
@@ -428,8 +507,41 @@ impl<'a> ProgramDescBorrow<'a> {
     }
 }
 
+pub struct ChannelDescBorrow<'a> {
+    _shape: &'a [u32],
+    _extern_name: &'a [u8],
+    raw: PieChannelDesc,
+}
+
+impl<'a> ChannelDescBorrow<'a> {
+    pub fn new(plan: &'a ChannelRegistrationPlan) -> Self {
+        Self {
+            _shape: &plan.shape,
+            _extern_name: &plan.extern_name,
+            raw: PieChannelDesc {
+                abi_version: PIE_DRIVER_ABI_VERSION,
+                reserved0: 0,
+                channel_id: plan.channel_id,
+                shape: u32_slice(&plan.shape),
+                dtype: plan.dtype,
+                host_role: plan.host_role,
+                seeded: u8::from(plan.seeded),
+                extern_dir: plan.extern_dir,
+                capacity: plan.capacity,
+                reserved1: 0,
+                reader_wait_id: plan.reader_wait_id,
+                writer_wait_id: plan.writer_wait_id,
+                extern_name: bytes_slice(&plan.extern_name),
+            },
+        }
+    }
+
+    pub fn as_raw(&self) -> &PieChannelDesc {
+        &self.raw
+    }
+}
+
 pub struct InstanceDescBorrow<'a> {
-    _channel_waits: &'a [PieChannelWait],
     _channel_ids: &'a [u64],
     _seed_values: Vec<PieChannelValueDesc>,
     raw: PieInstanceDesc,
@@ -450,10 +562,6 @@ impl<'a> InstanceDescBorrow<'a> {
             program_id: plan.program_id,
             requested_instance_id: plan.requested_instance_id,
             pacing_wait_id: plan.pacing_wait_id,
-            channel_waits: PieChannelWaitSlice {
-                ptr: plan.channel_waits.as_ptr(),
-                len: plan.channel_waits.len(),
-            },
             channel_ids: u64_slice(&plan.channel_ids),
             seed_values: PieChannelValueDescSlice {
                 ptr: seed_values.as_ptr(),
@@ -461,7 +569,6 @@ impl<'a> InstanceDescBorrow<'a> {
             },
         };
         Self {
-            _channel_waits: &plan.channel_waits,
             _channel_ids: &plan.channel_ids,
             _seed_values: seed_values,
             raw,
@@ -494,6 +601,10 @@ impl<'a> LaunchDescBorrow<'a> {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
             instance_ids: u64_slice(&submission.instance_ids),
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: submission.terminal_cells.as_ptr(),
+                len: submission.terminal_cells.len(),
+            },
             token_ids: u32_slice(&plan.token_ids),
             position_ids: u32_slice(&plan.position_ids),
             kv_page_indices: u32_slice(&plan.kv_page_indices),
@@ -628,4 +739,74 @@ impl<'a> PoolResizeDescBorrow<'a> {
 pub struct SchedulerCompletion {
     pub completion: PieCompletion,
     pub target_epoch: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_endpoint() -> (ChannelEndpoint, Box<[u8]>, Box<[AtomicU64]>, u64, u64) {
+        let mirror = vec![0; 8].into_boxed_slice();
+        let words = (0..4)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let table = pie_waker::WakerTable::global();
+        let reader_wait_id = table.alloc();
+        let writer_wait_id = table.alloc();
+        let endpoint = ChannelEndpoint::new(RegisteredChannel {
+            driver_id: usize::MAX,
+            binding: PieChannelEndpointBinding {
+                channel_id: 1,
+                mirror_base: mirror.as_ptr() as u64,
+                word_base: words.as_ptr() as u64,
+                mirror_bytes: mirror.len() as u64,
+                word_bytes: (words.len() * std::mem::size_of::<AtomicU64>()) as u64,
+                cell_bytes: 4,
+                capacity: 1,
+                head_word_index: 0,
+                tail_word_index: 1,
+                poison_word_index: 2,
+                closed_word_index: 3,
+            },
+            reader_wait_id,
+            writer_wait_id,
+        });
+        (endpoint, mirror, words, reader_wait_id, writer_wait_id)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_waits_register_then_recheck_reader_and_writer_words() {
+        let (endpoint, _mirror, words, reader_wait_id, writer_wait_id) = test_endpoint();
+        let reader = endpoint.wait_for_reader_change(0);
+        let publish_reader = async {
+            tokio::task::yield_now().await;
+            words[1].store(1, Ordering::Release);
+            let _ = pie_waker::WakerTable::global().publish(reader_wait_id, 1);
+        };
+        let (result, ()) = tokio::join!(reader, publish_reader);
+        result.unwrap();
+
+        let writer = endpoint.wait_for_writer_change(0);
+        let publish_writer = async {
+            tokio::task::yield_now().await;
+            words[0].store(1, Ordering::Release);
+            let _ = pie_waker::WakerTable::global().publish(writer_wait_id, 1);
+        };
+        let (result, ()) = tokio::join!(writer, publish_writer);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_wait_surfaces_poison_after_wakeup() {
+        let (endpoint, _mirror, words, reader_wait_id, _writer_wait_id) = test_endpoint();
+        let reader = endpoint.wait_for_reader_change(0);
+        let poison = async {
+            tokio::task::yield_now().await;
+            words[2].store(7, Ordering::Release);
+            let _ = pie_waker::WakerTable::global().publish(reader_wait_id, 7);
+        };
+        let (result, ()) = tokio::join!(reader, poison);
+        assert_eq!(result, Err(ChannelWaitError::Poisoned(7)));
+    }
 }

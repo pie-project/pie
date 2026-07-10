@@ -130,7 +130,12 @@ class PtirInstance {
             return;
         }
         for (const ChannelValue& s : seeds) {
-            view_.seed_cell(dense_channel(s.channel), s.bytes.data(), s.bytes.size());
+            const ChannelId dense = dense_channel(s.channel);
+            view_.seed_cell(dense, s.bytes.data(), s.bytes.size());
+            if (trace.channels[dense].host_reader) {
+                view_.publish_host_seed(
+                    dense, s.bytes.data(), s.bytes.size());
+            }
         }
         for (const Channel& ch : trace.channels) {
             if (!ch.host_reader) continue;
@@ -164,6 +169,20 @@ class PtirInstance {
         }
     }
 
+    void feed_host_puts_async(
+        const std::vector<ChannelValue>& values,
+        cudaStream_t stream,
+        std::vector<std::vector<std::uint8_t>>& staging) {
+        for (const ChannelValue& value : values) {
+            view_.host_feed_async(
+                dense_channel(value.channel),
+                value.bytes.data(),
+                value.bytes.size(),
+                stream,
+                staging);
+        }
+    }
+
     // One fire: bind per-fire host-puts (host-fed channels arriving, keyed by
     // GLOBAL id) + the intrinsic/host-tensor `FireInputs`, then run one tier-0
     // pass. The result's `committed` reflects the end-of-pass predicated bump.
@@ -172,9 +191,12 @@ class PtirInstance {
         return runner_.run_pass(in);
     }
 
-    PassResult fire_async(const std::vector<ChannelValue>& host_puts, const FireInputs& in,
-                          std::vector<void*>& scratch) {
-        feed_host_puts(host_puts);
+    PassResult fire_async(
+        const std::vector<ChannelValue>& host_puts,
+        const FireInputs& in,
+        std::vector<void*>& scratch,
+        std::vector<std::vector<std::uint8_t>>& host_staging) {
+        feed_host_puts_async(host_puts, in.stream, host_staging);
         return runner_.launch_pass_async(in, scratch);
     }
 
@@ -243,9 +265,9 @@ class PtirInstance {
         }
         return outs;
     }
-    void apply_fire_result(bool committed, const std::vector<DeviceOut>& outs) {
-        runner_.apply_host_commit(committed);
-        if (!committed || outs.empty()) return;
+    void project_fire_success(const std::vector<DeviceOut>& outs) {
+        runner_.apply_host_commit(true);
+        if (outs.empty()) return;
         std::vector<std::uint32_t> output_slots;
         output_slots.reserve(outs.size());
         for (const DeviceOut& out : outs) output_slots.push_back(out.slot);
@@ -289,7 +311,9 @@ class PtirInstance {
                 }
                 return false;
             }
-            if (value.bytes.size() != view_.cell_bytes(dense)) {
+            const std::size_t expected =
+                seeds ? view_.cell_bytes(dense) : view_.wire_bytes(dense);
+            if (value.bytes.size() != expected) {
                 if (err) *err = "ptir: channel value byte length mismatch";
                 return false;
             }

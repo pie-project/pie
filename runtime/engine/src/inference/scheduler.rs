@@ -1,14 +1,15 @@
 //! Per-driver direct batch scheduler.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::arena::PhysicalPageId;
 use crate::driver::{
-    BoundInstance, Completion, DriverId, InstanceBindingPlan, InstanceCompletion, LocalDriver,
-    NativeDriver, PoolResizePlan, ProgramRegistration, SchedulerLimits, StateCopyPlan,
+    BoundInstance, ChannelRegistrationPlan, Completion, DriverId, InstanceBindingPlan,
+    InstanceCompletion, LocalDriver, NativeDriver, PoolResizePlan, ProgramRegistration,
+    RegisteredChannel, SchedulerLimits, StateCopyPlan,
 };
 use crate::process::ProcessId;
 use crate::ptir::PtirChannelValue;
@@ -70,7 +71,6 @@ pub(crate) struct PendingRequest {
     pub(crate) pipeline_id: Option<ProcessId>,
     pub(crate) submitted_at_us: u64,
     pub(crate) prebuilt: bool,
-    acceptance: Option<crossbeam::channel::Sender<Result<()>>>,
 }
 
 impl PendingRequest {
@@ -97,7 +97,6 @@ impl PendingRequest {
             pipeline_id,
             submitted_at_us,
             prebuilt,
-            acceptance: None,
         }
     }
 }
@@ -105,11 +104,14 @@ impl PendingRequest {
 enum SchedulerItem {
     Launch {
         pending: PendingRequest,
-        response: crossbeam::channel::Sender<Result<()>>,
     },
     RegisterProgram {
         plan: ProgramRegistration,
         response: crossbeam::channel::Sender<Result<u64>>,
+    },
+    RegisterChannel {
+        plan: ChannelRegistrationPlan,
+        response: crossbeam::channel::Sender<Result<RegisteredChannel>>,
     },
     BindInstance {
         plan: InstanceBindingPlan,
@@ -130,6 +132,10 @@ enum SchedulerItem {
     CloseInstance {
         id: u64,
         pacing_wait_id: u64,
+        response: crossbeam::channel::Sender<Result<()>>,
+    },
+    CloseChannel {
+        id: u64,
         response: crossbeam::channel::Sender<Result<()>>,
     },
     Stop,
@@ -141,6 +147,10 @@ enum QueuedItem {
         plan: ProgramRegistration,
         response: crossbeam::channel::Sender<Result<u64>>,
     },
+    RegisterChannel {
+        plan: ChannelRegistrationPlan,
+        response: crossbeam::channel::Sender<Result<RegisteredChannel>>,
+    },
     BindInstance {
         plan: InstanceBindingPlan,
         response: crossbeam::channel::Sender<Result<BoundInstance>>,
@@ -160,6 +170,10 @@ enum QueuedItem {
     CloseInstance {
         id: u64,
         pacing_wait_id: u64,
+        response: crossbeam::channel::Sender<Result<()>>,
+    },
+    CloseChannel {
+        id: u64,
         response: crossbeam::channel::Sender<Result<()>>,
     },
 }
@@ -219,7 +233,6 @@ impl SchedulerHandle {
         pipeline_id: Option<ProcessId>,
         submitted_at_us: u64,
     ) -> Result<()> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
                 request,
@@ -233,9 +246,7 @@ impl SchedulerHandle {
                 submitted_at_us,
                 false,
             ),
-            response: tx,
-        })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+        })
     }
 
     pub fn submit_prebuilt(
@@ -248,7 +259,6 @@ impl SchedulerHandle {
         last_page_len: u32,
         program_identity_hashes: Vec<u64>,
     ) -> Result<()> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
                 request,
@@ -262,14 +272,18 @@ impl SchedulerHandle {
                 0,
                 true,
             ),
-            response: tx,
-        })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+        })
     }
 
     pub fn register_program(&self, plan: ProgramRegistration) -> Result<u64> {
         let (tx, rx) = crossbeam::channel::bounded(1);
         self.send(SchedulerItem::RegisterProgram { plan, response: tx })?;
+        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+    }
+
+    pub fn register_channel(&self, plan: ChannelRegistrationPlan) -> Result<RegisteredChannel> {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.send(SchedulerItem::RegisterChannel { plan, response: tx })?;
         rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
     }
 
@@ -304,6 +318,12 @@ impl SchedulerHandle {
             pacing_wait_id,
             response: tx,
         })?;
+        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+    }
+
+    pub fn close_channel(&self, id: u64) -> Result<()> {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.send(SchedulerItem::CloseChannel { id, response: tx })?;
         rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
     }
 }
@@ -380,6 +400,7 @@ impl BatchScheduler {
     ) {
         let mut driver = crate::driver::take_native_driver(driver_id).ok();
         let mut instances = HashMap::new();
+        let mut channels = HashSet::new();
         let mut pending = VecDeque::new();
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = None;
@@ -393,6 +414,7 @@ impl BatchScheduler {
             progress |= Self::dispatch_ready_items(
                 &mut driver,
                 &mut instances,
+                &mut channels,
                 &mut pending,
                 &mut in_flight_launches,
                 &mut in_flight_control,
@@ -461,6 +483,7 @@ impl BatchScheduler {
         }
 
         Self::shutdown_instances(&mut driver, &mut instances);
+        Self::shutdown_channels(&mut driver, &mut channels);
         drop(driver.take());
     }
 
@@ -474,31 +497,31 @@ impl BatchScheduler {
     ) {
         match item {
             SchedulerItem::Stop => *stopping = true,
-            SchedulerItem::Launch {
-                pending: mut launch,
-                response,
-            } => {
+            SchedulerItem::Launch { pending: launch } => {
                 let validation = BatchAccumulator::new(limits, page_size);
-                let result = if !instances.contains_key(&launch.instance_id) {
-                    Err(anyhow!(
+                let rejection = if !instances.contains_key(&launch.instance_id) {
+                    Some(format!(
                         "instance {} is unknown or stale",
                         launch.instance_id
                     ))
                 } else if let Some(message) = validation.single_request_limit_error(&launch) {
-                    Err(anyhow!(message))
+                    Some(message)
                 } else if *stopping {
-                    Err(anyhow!("scheduler shutting down"))
+                    Some("scheduler shutting down".to_string())
                 } else {
-                    launch.acceptance = Some(response.clone());
-                    pending.push_back(QueuedItem::Launch(launch));
-                    Ok(())
+                    None
                 };
-                if result.is_err() {
-                    let _ = response.send(result);
+                if let Some(message) = rejection {
+                    launch.completion.reject(message);
+                } else {
+                    pending.push_back(QueuedItem::Launch(launch));
                 }
             }
             SchedulerItem::RegisterProgram { plan, response } => {
                 pending.push_back(QueuedItem::RegisterProgram { plan, response });
+            }
+            SchedulerItem::RegisterChannel { plan, response } => {
+                pending.push_back(QueuedItem::RegisterChannel { plan, response });
             }
             SchedulerItem::BindInstance { plan, response } => {
                 pending.push_back(QueuedItem::BindInstance { plan, response });
@@ -523,12 +546,16 @@ impl BatchScheduler {
                     response,
                 });
             }
+            SchedulerItem::CloseChannel { id, response } => {
+                pending.push_back(QueuedItem::CloseChannel { id, response });
+            }
         }
     }
 
     fn dispatch_ready_items(
         driver: &mut Option<NativeDriver>,
         instances: &mut HashMap<u64, TrackedInstance>,
+        channels: &mut HashSet<u64>,
         pending: &mut VecDeque<QueuedItem>,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut Option<PendingControl>,
@@ -566,7 +593,13 @@ impl BatchScheduler {
                 _ if !in_flight_launches.is_empty() => break,
                 _ => {
                     let item = pending.pop_front().expect("front item present");
-                    Self::dispatch_ordered_item(driver, instances, in_flight_control, item);
+                    Self::dispatch_ordered_item(
+                        driver,
+                        instances,
+                        channels,
+                        in_flight_control,
+                        item,
+                    );
                     progress = true;
                 }
             }
@@ -577,6 +610,7 @@ impl BatchScheduler {
     fn dispatch_ordered_item(
         driver: &mut Option<NativeDriver>,
         instances: &mut HashMap<u64, TrackedInstance>,
+        channels: &mut HashSet<u64>,
         in_flight_control: &mut Option<PendingControl>,
         item: QueuedItem,
     ) {
@@ -588,17 +622,44 @@ impl BatchScheduler {
                     None => Err(anyhow!("driver has no native backend installed")),
                 });
             }
+            QueuedItem::RegisterChannel { plan, response } => {
+                let result = if channels.contains(&plan.channel_id) {
+                    Err(anyhow!("channel {} is already registered", plan.channel_id))
+                } else {
+                    match driver.as_mut() {
+                        Some(driver) => driver.register_channel(&plan).map(|channel| {
+                            channels.insert(plan.channel_id);
+                            channel
+                        }),
+                        None => Err(anyhow!("driver has no native backend installed")),
+                    }
+                };
+                let _ = response.send(result);
+            }
             QueuedItem::BindInstance { plan, response } => {
-                let result = match driver.as_mut() {
-                    Some(driver) => driver.bind_instance(&plan).and_then(|bound| {
-                        if instances.contains_key(&bound.instance_id) {
-                            let _ = driver.close_instance(bound.instance_id);
-                            return Err(anyhow!("instance {} is already bound", bound.instance_id));
-                        }
-                        instances.insert(bound.instance_id, TrackedInstance::from_bound(&bound));
-                        Ok(bound)
-                    }),
-                    None => Err(anyhow!("driver has no native backend installed")),
+                let result = if plan.requested_instance_id != 0
+                    && instances.contains_key(&plan.requested_instance_id)
+                {
+                    Err(anyhow!(
+                        "instance {} is already bound",
+                        plan.requested_instance_id
+                    ))
+                } else {
+                    match driver.as_mut() {
+                        Some(driver) => driver.bind_instance(&plan).and_then(|bound| {
+                            if instances.contains_key(&bound.instance_id) {
+                                let _ = driver.close_instance(bound.instance_id);
+                                return Err(anyhow!(
+                                    "instance {} is already bound",
+                                    bound.instance_id
+                                ));
+                            }
+                            instances
+                                .insert(bound.instance_id, TrackedInstance::from_bound(&bound));
+                            Ok(bound)
+                        }),
+                        None => Err(anyhow!("driver has no native backend installed")),
+                    }
                 };
                 let _ = response.send(result);
             }
@@ -658,7 +719,7 @@ impl BatchScheduler {
                                 Some(driver) => match driver.close_instance(id) {
                                     Ok(()) => {
                                         if let Some(instance) = instances.remove(&id) {
-                                            instance.close_wait_slots_and_wait();
+                                            instance.close_wait_slots();
                                         }
                                         Ok(())
                                     }
@@ -669,6 +730,19 @@ impl BatchScheduler {
                         }
                     }
                     _ => Err(anyhow!("instance {id} is unknown or stale")),
+                };
+                let _ = response.send(result);
+            }
+            QueuedItem::CloseChannel { id, response } => {
+                let result = if !channels.contains(&id) {
+                    Err(anyhow!("channel {id} is unknown or stale"))
+                } else {
+                    match driver.as_mut() {
+                        Some(driver) => driver.close_channel(id).map(|()| {
+                            channels.remove(&id);
+                        }),
+                        None => Err(anyhow!("driver has no native backend installed")),
+                    }
                 };
                 let _ = response.send(result);
             }
@@ -687,9 +761,7 @@ impl BatchScheduler {
         let mut batch = BatchAccumulator::new(limits, page_size);
         let mut batch_instances = std::collections::HashSet::new();
         while let Some(QueuedItem::Launch(next)) = pending.front() {
-            if instances
-                .get(&next.instance_id)
-                .is_some_and(|instance| instance.in_flight != 0)
+            if instances.get(&next.instance_id).is_none()
                 || !batch_instances.insert(next.instance_id)
             {
                 break;
@@ -715,17 +787,27 @@ impl BatchScheduler {
             .iter()
             .map(|req| req.request.token_ids.len())
             .sum::<usize>();
+        let mut candidate_epochs = Vec::with_capacity(requests.len());
+        for request in &requests {
+            let Some(instance) = instances.get(&request.instance_id) else {
+                for request in &mut requests {
+                    let message = format!("instance {} is unknown or stale", request.instance_id);
+                    request.completion.reject(message.clone());
+                }
+                return true;
+            };
+            candidate_epochs.push(instance.next_target_epoch);
+        }
         match driver.as_mut() {
             Some(driver) => match driver.launch(&submission) {
                 Ok(completion) => {
-                    for request in &mut requests {
-                        if let Some(acceptance) = request.acceptance.take() {
-                            let _ = acceptance.send(Ok(()));
-                        }
+                    for (request, &epoch) in requests.iter().zip(candidate_epochs.iter()) {
+                        request.completion.commit_target_epoch(epoch);
                     }
-                    for request in &requests {
+                    for (request, &epoch) in requests.iter().zip(candidate_epochs.iter()) {
                         if let Some(instance) = instances.get_mut(&request.instance_id) {
                             instance.in_flight += 1;
+                            instance.next_target_epoch = epoch + 1;
                         }
                     }
                     in_flight_launches.push_back(PendingLaunchBatch {
@@ -739,18 +821,15 @@ impl BatchScheduler {
                 Err(err) => {
                     let message = format!("direct launch rejected: {err:#}");
                     for request in &mut requests {
-                        if let Some(acceptance) = request.acceptance.take() {
-                            let _ = acceptance.send(Err(anyhow!(message.clone())));
-                        }
+                        request.completion.reject(message.clone());
                     }
                 }
             },
             None => {
                 for request in &mut requests {
-                    if let Some(acceptance) = request.acceptance.take() {
-                        let _ =
-                            acceptance.send(Err(anyhow!("driver has no native backend installed")));
-                    }
+                    request
+                        .completion
+                        .reject("driver has no native backend installed");
                 }
             }
         }
@@ -774,15 +853,29 @@ impl BatchScheduler {
                 }
             }
             match result {
-                Ok(()) => stats::record_fire_stats(
-                    stats,
-                    retired.started.elapsed(),
-                    retired.batch_size,
-                    retired.total_tokens,
-                ),
+                Ok(()) => {
+                    for request in &retired.requests {
+                        if let Err(err) = request.completion.resolve_from_terminal() {
+                            tracing::warn!(
+                                instance_id = request.instance_id,
+                                ?err,
+                                "direct launch terminal settlement failed"
+                            );
+                        }
+                    }
+                    stats::record_fire_stats(
+                        stats,
+                        retired.started.elapsed(),
+                        retired.batch_size,
+                        retired.total_tokens,
+                    )
+                }
                 Err(err) => {
                     tracing::warn!(?err, "direct launch completion closed before callback");
                     for request in &retired.requests {
+                        request.completion.reject(format!(
+                            "direct launch batch callback closed before terminal settlement: {err:#}"
+                        ));
                         if let Some(instance) = instances.get(&request.instance_id) {
                             instance.wait_slots.close();
                         }
@@ -823,7 +916,18 @@ impl BatchScheduler {
                     );
                 }
             }
-            instance.close_wait_slots_and_wait();
+            instance.close_wait_slots();
+        }
+    }
+
+    fn shutdown_channels(driver: &mut Option<NativeDriver>, channels: &mut HashSet<u64>) {
+        let outstanding = std::mem::take(channels);
+        for channel_id in outstanding {
+            if let Some(driver) = driver.as_mut()
+                && let Err(err) = driver.close_channel(channel_id)
+            {
+                tracing::warn!(channel_id, ?err, "scheduler shutdown close_channel failed");
+            }
         }
     }
 }
@@ -838,6 +942,7 @@ struct TrackedInstance {
     pacing_wait_id: u64,
     wait_slots: Arc<crate::driver::frame::BoundWaitSlots>,
     in_flight: usize,
+    next_target_epoch: u64,
 }
 
 impl TrackedInstance {
@@ -846,11 +951,12 @@ impl TrackedInstance {
             pacing_wait_id: bound.pacing_wait_id,
             wait_slots: bound.wait_slots(),
             in_flight: 0,
+            next_target_epoch: pie_waker::FIRST_COMPLETION_EPOCH,
         }
     }
 
-    fn close_wait_slots_and_wait(self) {
-        self.wait_slots.close_and_wait();
+    fn close_wait_slots(self) {
+        self.wait_slots.close();
     }
 }
 
@@ -869,7 +975,12 @@ mod tests {
 
     async fn setup_scheduler(
         operation_log: Arc<Mutex<Vec<String>>>,
-    ) -> anyhow::Result<(usize, BatchScheduler, crate::driver::BoundInstance)> {
+    ) -> anyhow::Result<(
+        usize,
+        BatchScheduler,
+        crate::driver::BoundInstance,
+        Vec<Arc<crate::driver::ChannelEndpoint>>,
+    )> {
         setup_scheduler_with_options(DummyDriverOptions {
             operation_log: Some(operation_log),
             ..DummyDriverOptions::default()
@@ -896,7 +1007,7 @@ mod tests {
         ChannelDecl {
             shape,
             dtype: ChanDType::Concrete(dtype),
-            capacity: 1,
+            capacity: 2,
             host_role: role,
             seeded,
         }
@@ -930,9 +1041,44 @@ mod tests {
         }
     }
 
+    fn register_test_channels(
+        driver_id: usize,
+        channel_ids: [u64; 2],
+    ) -> anyhow::Result<Vec<Arc<crate::driver::ChannelEndpoint>>> {
+        [
+            (channel_ids[0], HostRole::None, true),
+            (channel_ids[1], HostRole::Reader, false),
+        ]
+        .into_iter()
+        .map(|(channel_id, host_role, seeded)| {
+            driver::register_channel(
+                driver_id,
+                ChannelRegistrationPlan {
+                    driver_id,
+                    channel_id,
+                    shape: vec![1],
+                    dtype: pie_driver_abi::PIE_CHANNEL_DTYPE_U32,
+                    host_role: host_role as u8,
+                    seeded,
+                    extern_dir: pie_driver_abi::PIE_CHANNEL_EXTERN_NONE,
+                    capacity: 2,
+                    reader_wait_id: 0,
+                    writer_wait_id: 0,
+                    extern_name: Vec::new(),
+                },
+            )
+        })
+        .collect()
+    }
+
     async fn setup_scheduler_with_options(
         options: DummyDriverOptions,
-    ) -> anyhow::Result<(usize, BatchScheduler, crate::driver::BoundInstance)> {
+    ) -> anyhow::Result<(
+        usize,
+        BatchScheduler,
+        crate::driver::BoundInstance,
+        Vec<Arc<crate::driver::ChannelEndpoint>>,
+    )> {
         let driver_id = driver::register_native_driver(
             DriverSpec {
                 num_kv_pages: 16,
@@ -956,6 +1102,7 @@ mod tests {
             1,
         );
         let program_id = driver::register_program(driver_id, dummy_program())?;
+        let endpoints = register_test_channels(driver_id, [7, 8])?;
         let bound = driver::bind_instance(
             driver_id,
             program_id,
@@ -966,13 +1113,14 @@ mod tests {
                 bytes: 1u32.to_le_bytes().to_vec(),
             }],
         )?;
-        Ok((driver_id, scheduler, bound))
+        Ok((driver_id, scheduler, bound, endpoints))
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn typed_copy_paths_dispatch_to_distinct_driver_methods() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound) = setup_scheduler(operation_log.clone()).await?;
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler(operation_log.clone()).await?;
 
         timeout(
             Duration::from_secs(5),
@@ -1013,7 +1161,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn resize_ops_run_before_queued_launches() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound) = setup_scheduler(operation_log.clone()).await?;
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler(operation_log.clone()).await?;
 
         let resize = driver::resize_pool(
             driver_id,
@@ -1060,36 +1209,67 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn close_instance_retires_bound_wait_slots() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (_driver_id, _scheduler, bound) = setup_scheduler(operation_log).await?;
+        let (_driver_id, _scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
         let pacing_wait_id = bound.pacing_wait_id;
-        let channel_waits = bound.channel_waits.clone();
-
         driver::close_instance(&bound)?;
 
         assert!(matches!(
             pie_waker::WakerTable::global().publish(pacing_wait_id, 1),
             pie_waker::WakeOutcome::Stale
         ));
-        for waits in channel_waits {
-            assert!(matches!(
-                pie_waker::WakerTable::global().publish(waits.reader_wait_id, 1),
-                pie_waker::WakeOutcome::Stale
-            ));
-            assert!(matches!(
-                pie_waker::WakerTable::global().publish(waits.writer_wait_id, 1),
-                pie_waker::WakeOutcome::Stale
-            ));
-        }
         Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn close_waits_for_outstanding_completion_lease_before_retiring_slots()
-    -> anyhow::Result<()> {
+    async fn duplicate_bind_preserves_original_instance() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (_driver_id, _scheduler, bound) = setup_scheduler(operation_log).await?;
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler(operation_log.clone()).await?;
+
+        let error = driver::bind_instance(
+            driver_id,
+            bound.program_id,
+            bound.instance_id,
+            vec![17, 18],
+            vec![PtirChannelValue {
+                channel: 17,
+                bytes: 1u32.to_le_bytes().to_vec(),
+            }],
+        )
+        .expect_err("duplicate requested instance id must be rejected");
+        assert!(error.to_string().contains("already bound"));
+
+        let completion = bound.reserve_completion();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            Vec::new(),
+            0,
+            Vec::new(),
+            completion.clone(),
+        )?;
+        timeout(Duration::from_secs(5), completion).await??;
+        driver::close_instance(&bound)?;
+
+        let log = operation_log.lock().unwrap();
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.as_str() == "bind_instance")
+                .count(),
+            1,
+            "duplicate bind must be rejected before entering the backend"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_defers_slot_retirement_until_outstanding_completion_drops() -> anyhow::Result<()>
+    {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (_driver_id, _scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
         let pacing_wait_id = bound.pacing_wait_id;
-        let channel_waits = bound.channel_waits.clone();
         let outstanding = bound.reserve_completion();
 
         let close_bound = std::thread::spawn({
@@ -1099,33 +1279,31 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(10));
         assert!(
-            !close_bound.is_finished(),
-            "close should wait for outstanding completion leases"
+            close_bound.is_finished(),
+            "close must not block the scheduler on an externally held completion"
+        );
+        close_bound.join().unwrap()?;
+        assert!(
+            !matches!(
+                pie_waker::WakerTable::global().publish(pacing_wait_id, 1),
+                pie_waker::WakeOutcome::Stale
+            ),
+            "bound wait slots remain leased until the completion drops"
         );
         drop(outstanding);
-        close_bound.join().unwrap()?;
 
         assert!(matches!(
-            pie_waker::WakerTable::global().publish(pacing_wait_id, 1),
+            pie_waker::WakerTable::global().publish(pacing_wait_id, 2),
             pie_waker::WakeOutcome::Stale
         ));
-        for waits in channel_waits {
-            assert!(matches!(
-                pie_waker::WakerTable::global().publish(waits.reader_wait_id, 1),
-                pie_waker::WakeOutcome::Stale
-            ));
-            assert!(matches!(
-                pie_waker::WakerTable::global().publish(waits.writer_wait_id, 1),
-                pie_waker::WakeOutcome::Stale
-            ));
-        }
         Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn published_completion_survives_close_before_late_poll() -> anyhow::Result<()> {
+    async fn published_completion_survives_nonblocking_close_before_late_poll() -> anyhow::Result<()>
+    {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound) = setup_scheduler(operation_log).await?;
+        let (driver_id, _scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
         let completion = bound.reserve_completion();
         crate::inference::submit_prebuilt_async(
             dummy_launch(),
@@ -1157,24 +1335,127 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(10));
         assert!(
-            !close_bound.is_finished(),
-            "close should retain published slots until the late poll drops its lease"
+            close_bound.is_finished(),
+            "published terminal cells do not require close to wait for a late poll"
         );
+        close_bound.join().unwrap()?;
 
         timeout(Duration::from_secs(5), completion).await??;
-        close_bound.join().unwrap()?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_launch_rejection_has_no_callback_or_epoch_gap() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                reject_launches_remaining: 1,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+
+        let rejected = bound.reserve_completion();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            Vec::new(),
+            0,
+            Vec::new(),
+            rejected.clone(),
+        )?;
+        let err = timeout(Duration::from_secs(5), rejected.clone())
+            .await?
+            .expect_err("rejected launch must fail");
+        assert!(err.to_string().contains("direct launch rejected"));
+        assert_eq!(
+            rejected.target_epoch(),
+            0,
+            "rejected launch must not commit an epoch"
+        );
+
+        let accepted = bound.reserve_completion();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            Vec::new(),
+            0,
+            Vec::new(),
+            accepted.clone(),
+        )?;
+        timeout(Duration::from_secs(5), accepted.clone()).await??;
+        assert_eq!(
+            accepted.target_epoch(),
+            pie_waker::FIRST_COMPLETION_EPOCH,
+            "the first accepted launch must still claim the first completion epoch"
+        );
+
+        let log = operation_log.lock().unwrap().clone();
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.as_str() == "callback")
+                .count(),
+            1,
+            "only the accepted launch may emit a callback: {log:?}"
+        );
+        driver::close_instance(&bound)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_terminal_outcome_rejects_launch_completion() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                fail_launches_after_accept: true,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+
+        let completion = bound.reserve_completion();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            Vec::new(),
+            0,
+            Vec::new(),
+            completion.clone(),
+        )?;
+        let err = timeout(Duration::from_secs(5), completion)
+            .await?
+            .expect_err("failed launch terminal outcome must fail");
+        assert!(err.to_string().contains("Failed terminal outcome"));
+
+        let log = operation_log.lock().unwrap().clone();
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.as_str() == "callback")
+                .count(),
+            1,
+            "failed accepted launches still publish exactly one callback: {log:?}"
+        );
+        driver::close_instance(&bound)?;
         Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn launches_can_overlap_before_prior_callback_when_fifo_allows() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound_a) = setup_scheduler_with_options(DummyDriverOptions {
-            callback_delay_ms: 50,
-            operation_log: Some(operation_log.clone()),
-            ..DummyDriverOptions::default()
-        })
-        .await?;
+        let (driver_id, _scheduler, bound_a, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                callback_delay_ms: 50,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let _secondary_endpoints = register_test_channels(driver_id, [17, 18])?;
         let bound_b = driver::bind_instance(
             driver_id,
             bound_a.program_id,
@@ -1238,14 +1519,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn same_instance_launch_waits_for_prior_callback() -> anyhow::Result<()> {
+    async fn same_instance_launches_can_run_ahead_across_batches() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound) = setup_scheduler_with_options(DummyDriverOptions {
-            callback_delay_ms: 50,
-            operation_log: Some(operation_log.clone()),
-            ..DummyDriverOptions::default()
-        })
-        .await?;
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                callback_delay_ms: 50,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
 
         let first = bound.reserve_completion();
         crate::inference::submit_prebuilt_async(
@@ -1283,32 +1565,16 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.as_str() == "launch")
                 .count(),
-            1,
-            "same-instance launch 2 must not race launch 1 host bookkeeping"
+            2,
+            "same-instance launch 2 should be accepted before launch 1 callback"
         );
         assert!(
-            !second_submit.is_finished(),
-            "same-instance acceptance must wait for launch 1 callback"
+            second_submit.is_finished(),
+            "same-instance acceptance should not wait for launch 1 callback"
         );
 
-        timeout(Duration::from_secs(5), first).await??;
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if operation_log
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|entry| entry.as_str() == "launch")
-                    .count()
-                    >= 2
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await?;
         second_submit.join().unwrap()?;
+        timeout(Duration::from_secs(5), first).await??;
         timeout(Duration::from_secs(5), second).await??;
         driver::close_instance(&bound)?;
         Ok(())
@@ -1317,12 +1583,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn launch_then_control_then_launch_preserves_fifo_order() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound_a) = setup_scheduler_with_options(DummyDriverOptions {
-            callback_delay_ms: 50,
-            operation_log: Some(operation_log.clone()),
-            ..DummyDriverOptions::default()
-        })
-        .await?;
+        let (driver_id, _scheduler, bound_a, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                callback_delay_ms: 50,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let _secondary_endpoints = register_test_channels(driver_id, [17, 18])?;
         let bound_b = driver::bind_instance(
             driver_id,
             bound_a.program_id,
@@ -1389,26 +1657,26 @@ mod tests {
             "queued control should prevent later launches from bypassing the FIFO"
         );
         assert!(
-            !second_submit.is_finished(),
-            "launch acceptance should wait until the queued control retires"
+            second_submit.is_finished(),
+            "queue acceptance must not wait for the earlier native callback"
         );
 
         timeout(Duration::from_secs(5), first).await??;
         let resize = resize_join.join().unwrap()?;
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let log = operation_log.lock().unwrap().clone();
+        let during_control = operation_log.lock().unwrap().clone();
         assert_eq!(
-            log.iter()
+            during_control
+                .iter()
                 .filter(|entry| entry.as_str() == "launch")
                 .count(),
             1,
-            "second launch must still wait behind the queued control completion"
+            "second launch must wait until the control callback retires"
         );
         assert!(
-            log.iter().any(|entry| entry == "resize_pool"),
+            during_control.iter().any(|entry| entry == "resize_pool"),
             "resize should dispatch after launch 1 retires"
         );
-
         timeout(Duration::from_secs(5), resize).await??;
         timeout(Duration::from_secs(5), async {
             loop {
@@ -1422,10 +1690,27 @@ mod tests {
                 {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await?;
+        let log = operation_log.lock().unwrap().clone();
+        let resize_idx = log
+            .iter()
+            .position(|entry| entry == "resize_pool")
+            .expect("resize should dispatch after launch 1 retires");
+        let second_launch_idx = log
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.as_str() == "launch")
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("second launch should dispatch");
+        assert!(
+            resize_idx < second_launch_idx,
+            "second launch must remain behind the queued control effect: {log:?}"
+        );
+
         second_submit.join().unwrap()?;
         timeout(Duration::from_secs(5), second).await??;
         driver::close_instance(&bound_a)?;
@@ -1436,12 +1721,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn close_waits_for_accepted_launch_then_succeeds() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (_driver_id, _scheduler, bound) = setup_scheduler_with_options(DummyDriverOptions {
-            callback_delay_ms: 75,
-            operation_log: Some(operation_log.clone()),
-            ..DummyDriverOptions::default()
-        })
-        .await?;
+        let (_driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                callback_delay_ms: 75,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
 
         let launch = bound.reserve_completion();
         crate::inference::submit_prebuilt_async(
@@ -1489,7 +1775,8 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let (_driver_id, _scheduler, bound) = setup_scheduler(operation_log).await?;
+            let (_driver_id, _scheduler, bound, _endpoints) =
+                setup_scheduler(operation_log).await?;
             driver::close_instance(&bound)?;
             let err = driver::close_instance(&bound).unwrap_err();
             assert!(err.to_string().contains("stale"));
@@ -1501,13 +1788,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn scheduler_shutdown_drains_instances_and_destroys_once() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, scheduler, bound_a) = setup_scheduler_with_options(DummyDriverOptions {
-            callback_delay_ms: 40,
-            operation_log: Some(operation_log.clone()),
-            ..DummyDriverOptions::default()
-        })
-        .await?;
+        let (driver_id, scheduler, bound_a, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                callback_delay_ms: 40,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
         let program_id = driver::register_program(driver_id, dummy_program())?;
+        let _secondary_endpoints = register_test_channels(driver_id, [17, 18])?;
         let bound_b = driver::bind_instance(
             driver_id,
             program_id,
@@ -1582,12 +1871,13 @@ mod tests {
     async fn timeout_bounded_shutdown_stress() -> anyhow::Result<()> {
         timeout(Duration::from_secs(5), async {
             let operation_log = Arc::new(Mutex::new(Vec::new()));
-            let (driver_id, scheduler, bound) = setup_scheduler_with_options(DummyDriverOptions {
-                callback_delay_ms: 5,
-                operation_log: Some(operation_log),
-                ..DummyDriverOptions::default()
-            })
-            .await?;
+            let (driver_id, scheduler, bound, _endpoints) =
+                setup_scheduler_with_options(DummyDriverOptions {
+                    callback_delay_ms: 5,
+                    operation_log: Some(operation_log),
+                    ..DummyDriverOptions::default()
+                })
+                .await?;
             for _ in 0..16 {
                 let completion = bound.reserve_completion();
                 crate::inference::submit_prebuilt_async(

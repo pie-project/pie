@@ -30,24 +30,44 @@ fn rust_layout_matches_committed_header_contract() {
     assert_layout!(PieU8Slice, 16, 8, ptr => 0, len => 8);
     assert_layout!(PieU32Slice, 16, 8, ptr => 0, len => 8);
     assert_layout!(PieU64Slice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(PieChannelWait, 16, 8, reader_wait_id => 0, writer_wait_id => 8);
-    assert_layout!(PieChannelWaitSlice, 16, 8, ptr => 0, len => 8);
-    assert_layout!(PieChannelValueDesc, 24, 8, channel_id => 0, bytes => 8);
-    assert_layout!(PieChannelValueDescSlice, 16, 8, ptr => 0, len => 8);
+    assert_layout!(PieTerminalCell, 8, 4, outcome => 0, reserved0 => 4);
+    assert_layout!(PieTerminalCellPtrSlice, 16, 8, ptr => 0, len => 8);
     assert_layout!(
-        PieChannelBinding,
-        40,
+        PieChannelDesc,
+        80,
+        8,
+        abi_version => 0,
+        reserved0 => 4,
+        channel_id => 8,
+        shape => 16,
+        dtype => 32,
+        host_role => 33,
+        seeded => 34,
+        extern_dir => 35,
+        capacity => 36,
+        reserved1 => 40,
+        reader_wait_id => 48,
+        writer_wait_id => 56,
+        extern_name => 64
+    );
+    assert_layout!(
+        PieChannelEndpointBinding,
+        64,
         8,
         channel_id => 0,
-        cell_bytes => 8,
-        capacity => 12,
-        mirror_offset => 16,
-        head_word_index => 24,
-        tail_word_index => 28,
-        poison_word_index => 32,
-        reserved => 36
+        mirror_base => 8,
+        word_base => 16,
+        mirror_bytes => 24,
+        word_bytes => 32,
+        cell_bytes => 40,
+        capacity => 44,
+        head_word_index => 48,
+        tail_word_index => 52,
+        poison_word_index => 56,
+        closed_word_index => 60
     );
-    assert_layout!(PieChannelBindingSlice, 16, 8, ptr => 0, len => 8);
+    assert_layout!(PieChannelValueDesc, 24, 8, channel_id => 0, bytes => 8);
+    assert_layout!(PieChannelValueDescSlice, 16, 8, ptr => 0, len => 8);
     assert_layout!(
         PieMaskWordsDesc,
         48,
@@ -88,7 +108,14 @@ fn rust_layout_matches_committed_header_contract() {
         ctx => 8,
         notify => 16
     );
-    assert_layout!(PieCompletion, 16, 8, wait_id => 0, target_epoch => 8);
+    assert_layout!(
+        PieCompletion,
+        24,
+        8,
+        wait_id => 0,
+        target_epoch => 8,
+        terminal_cell => 16
+    );
     assert_layout!(
         PieDriverCreateDesc,
         48,
@@ -111,74 +138,60 @@ fn rust_layout_matches_committed_header_contract() {
     );
     assert_layout!(
         PieInstanceDesc,
-        80,
+        64,
         8,
         abi_version => 0,
         reserved0 => 4,
         program_id => 8,
         requested_instance_id => 16,
         pacing_wait_id => 24,
-        channel_waits => 32,
-        channel_ids => 48,
-        seed_values => 64
+        channel_ids => 32,
+        seed_values => 48
     );
-    assert_layout!(
-        PieInstanceBinding,
-        80,
-        8,
-        instance_id => 0,
-        frame_base => 8,
-        mirror_base => 16,
-        word_base => 24,
-        channel_count => 32,
-        word_count => 36,
-        frame_bytes => 40,
-        mirror_bytes => 48,
-        word_bytes => 56,
-        channels => 64
-    );
+    assert_layout!(PieInstanceBinding, 8, 8, instance_id => 0);
     assert_layout!(
         PieLaunchDesc,
-        576,
+        592,
         8,
         abi_version => 0,
         reserved0 => 4,
         instance_ids => 8,
-        token_ids => 24,
-        position_ids => 40,
-        kv_page_indices => 56,
-        kv_page_indptr => 72,
-        kv_last_page_lens => 88,
-        qo_indptr => 104,
-        rs_slot_ids => 120,
-        rs_slot_flags => 136,
-        rs_fold_lens => 152,
-        rs_buffer_slot_ids => 168,
-        rs_buffer_slot_indptr => 184,
-        masks => 200,
-        sampling_indices => 248,
-        sampling_indptr => 264,
-        context_ids => 280,
-        single_token_mode => 296,
-        has_user_mask => 297,
-        reserved_flags => 298,
-        image_indptr => 304,
-        image_grids => 320,
-        image_anchor_positions => 336,
-        image_pixels => 352,
-        image_pixel_indptr => 368,
-        image_mrope_positions => 384,
-        image_mrope_indptr => 400,
-        image_patch_positions => 416,
-        image_anchor_rows => 432,
-        audio_features => 448,
-        audio_feature_indptr => 464,
-        audio_anchor_rows => 480,
-        audio_indptr => 496,
-        ptir_host_put_values => 512,
-        host_put_indptr => 528,
-        kv_len => 544,
-        kv_len_device => 560
+        terminal_cells => 24,
+        token_ids => 40,
+        position_ids => 56,
+        kv_page_indices => 72,
+        kv_page_indptr => 88,
+        kv_last_page_lens => 104,
+        qo_indptr => 120,
+        rs_slot_ids => 136,
+        rs_slot_flags => 152,
+        rs_fold_lens => 168,
+        rs_buffer_slot_ids => 184,
+        rs_buffer_slot_indptr => 200,
+        masks => 216,
+        sampling_indices => 264,
+        sampling_indptr => 280,
+        context_ids => 296,
+        single_token_mode => 312,
+        has_user_mask => 313,
+        reserved_flags => 314,
+        image_indptr => 320,
+        image_grids => 336,
+        image_anchor_positions => 352,
+        image_pixels => 368,
+        image_pixel_indptr => 384,
+        image_mrope_positions => 400,
+        image_mrope_indptr => 416,
+        image_patch_positions => 432,
+        image_anchor_rows => 448,
+        audio_features => 464,
+        audio_feature_indptr => 480,
+        audio_anchor_rows => 496,
+        audio_indptr => 512,
+        ptir_host_put_values => 528,
+        host_put_indptr => 544,
+        kv_len => 560,
+        kv_len_device => 576
     );
     assert_layout!(
         PieKvCopyDesc,

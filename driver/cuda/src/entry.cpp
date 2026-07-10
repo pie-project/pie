@@ -104,10 +104,18 @@ void keep_alive(std::vector<OwnedValue>& owners, T&& value) {
     owners.push_back(OwnedValue{ptr, [](void* p) { delete static_cast<U*>(p); }});
 }
 
+void publish_terminal(PieTerminalCell* cell, std::uint32_t outcome) {
+    if (cell == nullptr) return;
+    cell->reserved0 = 0;
+    std::atomic_ref<std::uint32_t>(cell->outcome).store(
+        outcome, std::memory_order_release);
+}
+
 void CUDART_CB finish_async_completion(void* userdata) {
     std::unique_ptr<AsyncCompletionContext> ctx(
         static_cast<AsyncCompletionContext*>(userdata));
     if (ctx == nullptr) return;
+    publish_terminal(ctx->completion.terminal_cell, PIE_TERMINAL_OUTCOME_SUCCESS);
     if (ctx->runtime.notify != nullptr && ctx->completion.wait_id != 0) {
         ctx->runtime.notify(
             ctx->runtime.ctx,
@@ -176,6 +184,7 @@ struct LaunchScratch {
         }
 
         pie_native::LaunchView view{};
+        view.terminal_cells = pie_native::slice_from(launch.terminal_cells.ptr, launch.terminal_cells.len);
         view.token_ids = pie_native::slice_from_u32(launch.token_ids.ptr, launch.token_ids.len);
         view.position_ids = pie_native::slice_from_u32(launch.position_ids.ptr, launch.position_ids.len);
         view.kv_page_indices = pie_native::slice_from_u32(launch.kv_page_indices.ptr, launch.kv_page_indices.len);
@@ -299,12 +308,15 @@ class CudaDriver {
     }
 
     int register_program(const PieProgramDesc& program, std::uint64_t* program_id);
+    int register_channel(const PieChannelDesc& channel,
+                         PieChannelEndpointBinding* binding);
     int bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding);
     int launch(const PieLaunchDesc& launch, PieCompletion completion);
     int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion);
     int copy_state(const PieStateCopyDesc& copy, PieCompletion completion);
     int resize_pool(const PiePoolResizeDesc& resize, PieCompletion completion);
     int close_instance(std::uint64_t instance_id);
+    int close_channel(std::uint64_t channel_id);
 
   private:
     template <typename T>
@@ -1213,6 +1225,7 @@ int CudaDriver::register_program(const PieProgramDesc& program, std::uint64_t* p
         if (program_id != nullptr) *program_id = found->second;
         return PIE_STATUS_OK;
     }
+
     if (program.canonical_bytes.len == 0) return PIE_STATUS_INVALID_ARGUMENT;
     if (!executor_->ptir_dispatch)
         executor_->ptir_dispatch = std::make_unique<pie_cuda_driver::ptir::PtirDispatch>();
@@ -1244,6 +1257,23 @@ int CudaDriver::register_program(const PieProgramDesc& program, std::uint64_t* p
     return PIE_STATUS_OK;
 }
 
+int CudaDriver::register_channel(
+    const PieChannelDesc& channel,
+    PieChannelEndpointBinding* binding) {
+    if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
+    if (!executor_->ptir_dispatch) {
+        executor_->ptir_dispatch =
+            std::make_unique<pie_cuda_driver::ptir::PtirDispatch>();
+    }
+    std::string err;
+    const int rc =
+        executor_->ptir_dispatch->register_channel(channel, binding, &err);
+    if (rc != PIE_STATUS_OK && !err.empty()) {
+        std::cerr << "[pie-driver-cuda] register_channel: " << err << "\n";
+    }
+    return rc;
+}
+
 int CudaDriver::bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding) {
     if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
     auto pit = programs_.find(instance.program_id);
@@ -1251,13 +1281,6 @@ int CudaDriver::bind_instance(const PieInstanceDesc& instance, PieInstanceBindin
     std::vector<std::uint64_t> channel_ids(
         instance.channel_ids.ptr,
         instance.channel_ids.ptr + instance.channel_ids.len);
-    std::vector<PieChannelWait> waits;
-    if (instance.channel_waits.len > 0) {
-        waits.assign(instance.channel_waits.ptr,
-                     instance.channel_waits.ptr + instance.channel_waits.len);
-    }
-    if (waits.empty()) waits.assign(channel_ids.size(), PieChannelWait{});
-    if (waits.size() != channel_ids.size()) return PIE_STATUS_INVALID_ARGUMENT;
     std::vector<PieChannelValueDesc> seeds;
     if (instance.seed_values.len > 0) {
         seeds.assign(instance.seed_values.ptr,
@@ -1274,7 +1297,6 @@ int CudaDriver::bind_instance(const PieInstanceDesc& instance, PieInstanceBindin
         pit->second.program_hash,
         instance.pacing_wait_id,
         channel_ids,
-        waits,
         seeds,
         binding,
         &err);
@@ -1316,11 +1338,22 @@ int CudaDriver::launch(const PieLaunchDesc& launch, PieCompletion completion) {
     if (!has_ptir_launch) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
+    if (!executor_->ptir_dispatch) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    std::string ptir_error;
+    const int ptir_status =
+        executor_->ptir_dispatch->validate_launch(view, &ptir_error);
+    if (ptir_status != PIE_STATUS_OK) {
+        if (!ptir_error.empty()) {
+            std::cerr << "[pie-driver-cuda] launch rejected: "
+                      << ptir_error << "\n";
+        }
+        return ptir_status;
+    }
     try {
         if ((launch_instances.empty() || view.qo_indptr.empty() || view.token_ids.empty()) &&
             has_ptir_launch) {
-            if (!executor_->ptir_dispatch)
-                executor_->ptir_dispatch = std::make_unique<pie_cuda_driver::ptir::PtirDispatch>();
             executor_->ptir_dispatch->run(
                 view, nullptr, 0, executor_->cublas.stream(), &runtime_, completion);
         } else {
@@ -1330,13 +1363,44 @@ int CudaDriver::launch(const PieLaunchDesc& launch, PieCompletion completion) {
         return PIE_STATUS_OK;
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-cuda] launch: " << e.what() << "\n";
-        return PIE_STATUS_DRIVER_ERROR;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>
+            channel_notifications;
+        if (executor_->ptir_dispatch != nullptr) {
+            try {
+                channel_notifications =
+                    executor_->ptir_dispatch->settle_failed_launch(
+                    view, executor_->cublas.stream());
+            } catch (const std::exception& settle_error) {
+                std::cerr
+                    << "[pie-driver-cuda] launch failure settlement: "
+                    << settle_error.what() << "\n";
+            }
+        }
+        for (std::size_t i = 0; i < launch.terminal_cells.len; ++i) {
+            publish_terminal(
+                launch.terminal_cells.ptr[i],
+                PIE_TERMINAL_OUTCOME_FAILED);
+        }
+        if (runtime_.notify != nullptr) {
+            for (const auto& [wait_id, epoch] : channel_notifications) {
+                if (wait_id != 0 && epoch != 0) {
+                    runtime_.notify(runtime_.ctx, wait_id, epoch);
+                }
+            }
+        }
+        if (runtime_.notify != nullptr && completion.wait_id != 0) {
+            runtime_.notify(
+                runtime_.ctx, completion.wait_id, completion.target_epoch);
+        }
+        return PIE_STATUS_OK;
     }
 }
 
 int CudaDriver::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {
     if (executor_ == nullptr) return PIE_STATUS_CLOSED;
-    if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
+    // Typed control operations need an explicit TP control broadcast and
+    // all-rank completion barrier. Never report rank-0-only work as complete.
+    if (tp_size_ > 1) return PIE_STATUS_UNSUPPORTED;
     const int resource_status = pie_cuda_driver::abi::validate_kv_copy_resources(
         copy,
         static_cast<std::uint32_t>(device_ordinal_),
@@ -1415,7 +1479,7 @@ int CudaDriver::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {
 
 int CudaDriver::copy_state(const PieStateCopyDesc& copy, PieCompletion completion) {
     if (executor_ == nullptr) return PIE_STATUS_CLOSED;
-    if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
+    if (tp_size_ > 1) return PIE_STATUS_UNSUPPORTED;
     const int resource_status = pie_cuda_driver::abi::validate_state_copy_resources(
         copy,
         executor_->rs_cache != nullptr ? executor_->rs_cache->max_slots() : 0);
@@ -1439,7 +1503,7 @@ int CudaDriver::copy_state(const PieStateCopyDesc& copy, PieCompletion completio
 
 int CudaDriver::resize_pool(const PiePoolResizeDesc& resize, PieCompletion completion) {
     if (executor_ == nullptr) return PIE_STATUS_CLOSED;
-    if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
+    if (tp_size_ > 1) return PIE_STATUS_UNSUPPORTED;
     collect_ready_async_resources();
     if (resize.pool_id != 0) return PIE_STATUS_UNSUPPORTED;
     try {
@@ -1468,6 +1532,20 @@ int CudaDriver::close_instance(std::uint64_t instance_id) {
     if (executor_->ptir_dispatch) executor_->ptir_dispatch->close_instance(instance_id);
     instances_.erase(it);
     return PIE_STATUS_OK;
+}
+
+int CudaDriver::close_channel(std::uint64_t channel_id) {
+    if (executor_ == nullptr || !executor_->ptir_dispatch) {
+        return PIE_STATUS_CLOSED;
+    }
+    if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
+    drain_async_streams();
+    std::string err;
+    const int rc = executor_->ptir_dispatch->close_channel(channel_id, &err);
+    if (rc != PIE_STATUS_OK && !err.empty()) {
+        std::cerr << "[pie-driver-cuda] close_channel: " << err << "\n";
+    }
+    return rc;
 }
 
 PieDriver* create_driver_impl(const PieDriverCreateDesc* desc, PieDriverCaps* caps) {
@@ -1517,6 +1595,20 @@ extern "C" int32_t pie_cuda_register_program(PieDriver* driver,
     }
 }
 
+extern "C" int32_t pie_cuda_register_channel(
+    PieDriver* driver,
+    const PieChannelDesc* channel,
+    PieChannelEndpointBinding* binding) {
+    const int status = pie_native::abi::validate_channel_desc(channel, binding);
+    if (status != PIE_STATUS_OK) return status;
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_driver(driver)->register_channel(*channel, binding);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
 extern "C" int32_t pie_cuda_bind_instance(PieDriver* driver,
                                            const PieInstanceDesc* instance,
                                            PieInstanceBinding* binding) {
@@ -1535,6 +1627,9 @@ extern "C" int32_t pie_cuda_launch(PieDriver* driver,
                                     PieCompletion completion) {
     const int status = pie_native::abi::validate_launch_desc(launch);
     if (status != PIE_STATUS_OK) return status;
+    const int completion_status =
+        pie_native::abi::validate_completion(completion, false);
+    if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_driver(driver)->launch(*launch, completion);
@@ -1548,6 +1643,9 @@ extern "C" int32_t pie_cuda_copy_kv(PieDriver* driver,
                                      PieCompletion completion) {
     const int status = pie_native::abi::validate_kv_copy_desc(copy);
     if (status != PIE_STATUS_OK) return status;
+    const int completion_status =
+        pie_native::abi::validate_completion(completion, true);
+    if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_driver(driver)->copy_kv(*copy, completion);
@@ -1561,6 +1659,9 @@ extern "C" int32_t pie_cuda_copy_state(PieDriver* driver,
                                         PieCompletion completion) {
     const int status = pie_native::abi::validate_state_copy_desc(copy);
     if (status != PIE_STATUS_OK) return status;
+    const int completion_status =
+        pie_native::abi::validate_completion(completion, true);
+    if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_driver(driver)->copy_state(*copy, completion);
@@ -1574,6 +1675,9 @@ extern "C" int32_t pie_cuda_resize_pool(PieDriver* driver,
                                          PieCompletion completion) {
     const int status = pie_native::abi::validate_pool_resize_desc(resize);
     if (status != PIE_STATUS_OK) return status;
+    const int completion_status =
+        pie_native::abi::validate_completion(completion, true);
+    if (completion_status != PIE_STATUS_OK) return completion_status;
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_driver(driver)->resize_pool(*resize, completion);
@@ -1587,6 +1691,16 @@ extern "C" int32_t pie_cuda_close_instance(PieDriver* driver,
     if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     try {
         return as_driver(driver)->close_instance(instance_id);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
+extern "C" int32_t pie_cuda_close_channel(PieDriver* driver,
+                                          std::uint64_t channel_id) {
+    if (driver == nullptr || channel_id == 0) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_driver(driver)->close_channel(channel_id);
     } catch (...) {
         return PIE_STATUS_DRIVER_ERROR;
     }

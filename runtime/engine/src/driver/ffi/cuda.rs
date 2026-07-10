@@ -2,14 +2,16 @@ use anyhow::{Result, anyhow};
 
 use crate::driver::completion::{Completion, CompletionBroker};
 use crate::driver::frame::{
-    BoundInstance, InstanceBindingPlan, KvCopyDescBorrow, KvCopyPlan, LaunchDescBorrow,
-    LaunchSubmission, PoolResizeDescBorrow, PoolResizePlan, ProgramDescBorrow, ProgramRegistration,
-    StateCopyDescBorrow, StateCopyPlan,
+    BoundInstance, ChannelDescBorrow, ChannelRegistrationPlan, InstanceBindingPlan,
+    KvCopyDescBorrow, KvCopyPlan, LaunchDescBorrow, LaunchSubmission, PoolResizeDescBorrow,
+    PoolResizePlan, ProgramDescBorrow, ProgramRegistration, RegisteredChannel, StateCopyDescBorrow,
+    StateCopyPlan,
 };
 use pie_driver_abi::{
-    PieBytes, PieDriver, PieDriverCaps, PieDriverCreateDesc, pie_cuda_bind_instance,
-    pie_cuda_close_instance, pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_create,
-    pie_cuda_destroy, pie_cuda_launch, pie_cuda_register_program, pie_cuda_resize_pool,
+    PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
+    pie_cuda_bind_instance, pie_cuda_close_channel, pie_cuda_close_instance, pie_cuda_copy_kv,
+    pie_cuda_copy_state, pie_cuda_create, pie_cuda_destroy, pie_cuda_launch,
+    pie_cuda_register_channel, pie_cuda_register_program, pie_cuda_resize_pool,
 };
 
 struct CudaDriverHandle {
@@ -35,7 +37,13 @@ impl CudaDriverHandle {
         if driver.is_null() {
             return Err(anyhow!("pie_cuda_create returned null"));
         }
-        let capabilities = parse_caps(caps)?;
+        let capabilities = match parse_caps(caps) {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                unsafe { pie_cuda_destroy(driver) };
+                return Err(error);
+            }
+        };
         Ok(Self {
             driver,
             broker,
@@ -57,6 +65,23 @@ impl CudaDriverHandle {
         Ok(out)
     }
 
+    fn register_channel(&mut self, plan: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
+        let borrowed = ChannelDescBorrow::new(plan);
+        let mut binding = PieChannelEndpointBinding::default();
+        sync_status(
+            unsafe { pie_cuda_register_channel(self.driver, borrowed.as_raw(), &mut binding) },
+            "pie_cuda_register_channel",
+        )?;
+        pie_driver_abi::validate_channel_endpoint_binding(&binding, borrowed.as_raw())
+            .map_err(|error| anyhow!(error))?;
+        Ok(RegisteredChannel {
+            driver_id: plan.driver_id,
+            binding,
+            reader_wait_id: plan.reader_wait_id,
+            writer_wait_id: plan.writer_wait_id,
+        })
+    }
+
     fn bind_instance(&mut self, plan: &InstanceBindingPlan) -> Result<BoundInstance> {
         let borrowed = crate::driver::frame::InstanceDescBorrow::new(plan);
         let mut binding = pie_driver_abi::PieInstanceBinding::default();
@@ -75,13 +100,12 @@ impl CudaDriverHandle {
             plan.program_id,
             binding,
             plan.pacing_wait_id,
-            plan.channel_waits.clone(),
         ))
     }
 
     fn launch(&mut self, plan: &LaunchSubmission) -> Result<Completion> {
         let target_epoch = 1;
-        let (raw, completion) = self.broker.pie_completion(target_epoch);
+        let (raw, completion) = self.broker.launch_completion(target_epoch);
         let borrowed = LaunchDescBorrow::from_submission(plan);
         sync_status(
             unsafe { pie_cuda_launch(self.driver, borrowed.as_raw(), raw) },
@@ -127,6 +151,13 @@ impl CudaDriverHandle {
         sync_status(
             unsafe { pie_cuda_close_instance(self.driver, instance_id) },
             "pie_cuda_close_instance",
+        )
+    }
+
+    fn close_channel(&mut self, channel_id: u64) -> Result<()> {
+        sync_status(
+            unsafe { pie_cuda_close_channel(self.driver, channel_id) },
+            "pie_cuda_close_channel",
         )
     }
 }
@@ -216,6 +247,13 @@ impl CudaDriver {
         self.leader.register_program(plan)
     }
 
+    pub fn register_channel(
+        &mut self,
+        plan: &ChannelRegistrationPlan,
+    ) -> Result<RegisteredChannel> {
+        self.leader.register_channel(plan)
+    }
+
     pub fn bind_instance(&mut self, plan: &InstanceBindingPlan) -> Result<BoundInstance> {
         self.leader.bind_instance(plan)
     }
@@ -238,6 +276,10 @@ impl CudaDriver {
 
     pub fn close_instance(&mut self, instance_id: u64) -> Result<()> {
         self.leader.close_instance(instance_id)
+    }
+
+    pub fn close_channel(&mut self, channel_id: u64) -> Result<()> {
+        self.leader.close_channel(channel_id)
     }
 }
 

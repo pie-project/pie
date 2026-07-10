@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -35,21 +36,31 @@ class PtirDispatch {
                          pie_native::ByteSlice sidecar,
                          std::string* err);
 
+    int register_channel(const PieChannelDesc& channel,
+                         PieChannelEndpointBinding* binding,
+                         std::string* err);
+
     int bind_instance(std::uint64_t instance_id,
                       std::uint64_t program_hash,
                       std::uint64_t pacing_wait_id,
                       const std::vector<std::uint64_t>& channel_ids,
-                      const std::vector<PieChannelWait>& channel_waits,
                       const std::vector<PieChannelValueDesc>& seed_values,
                       PieInstanceBinding* binding,
                       std::string* err);
 
+    int validate_launch(const pie_native::LaunchView& view, std::string* err);
+
     void close_instance(std::uint64_t instance_id);
+    int close_channel(std::uint64_t channel_id, std::string* err);
 
     bool run(const pie_native::LaunchView& view,
              const void* logits, std::uint32_t vocab, cudaStream_t stream,
              const PieRuntimeCallbacks* runtime,
              PieCompletion completion);
+
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> settle_failed_launch(
+        const pie_native::LaunchView& view,
+        cudaStream_t execution_stream);
 
     // W1.1 PRE-FORWARD descriptor resolution: for the request's device-geometry
     // PTIR program (descriptor ports bind channels), decode + get-or-build the

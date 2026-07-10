@@ -34,8 +34,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::driver::ChannelEndpoint;
 use crate::ptir::PtirChannelValue;
-use pie_ptir::container::{self, ChannelDecl, HostRole};
+use pie_ptir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
 use pie_ptir::types::DType;
 
 /// Process-wide monotonic source of GLOBAL channel identities (0 reserved as a
@@ -68,15 +69,21 @@ pub struct ChannelCell {
     pub seeded: bool,
     /// Whether this cell's seed was consumed by a first fire.
     pub seed_taken: bool,
+    endpoint: Option<Arc<ChannelEndpoint>>,
+    declared_dtype: Option<ChanDType>,
+    extern_name: Option<String>,
+    attachments: Vec<ChannelAttachment>,
     /// Host-staged cells (seeds pre-first-fire; Writer stage cells otherwise),
     /// FIFO, dtype-native.
     staged: VecDeque<Vec<u8>>,
+    writer_tail: u64,
     /// Device-produced cells awaiting host `take`/`read`, FIFO, dtype-native.
     produced: VecDeque<Vec<u8>>,
+    reader_reserved_tail: u64,
     /// Direct driver-owned mirror endpoints for every pass that binds this
     /// Reader channel. Completion publishes each endpoint's visible tail; the
     /// guest host operation copies only then.
-    readers: Vec<ReaderMirror>,
+    reader: Option<ReaderMirror>,
     /// `Some(reason)` once a fire that feeds this channel failed: every later
     /// host `take`/`read` errors with the reason. Under run-ahead the submit
     /// returns before the fire resolves, so poison IS the error channel.
@@ -85,16 +92,22 @@ pub struct ChannelCell {
 
 #[derive(Clone, Debug)]
 struct ReaderMirror {
-    instance_id: u64,
     mirror_base: u64,
     word_base: u64,
     cell_bytes: usize,
     cap1: u64,
-    mirror_offset: u64,
+    head_word_index: usize,
     tail_word_index: usize,
     poison_word_index: usize,
+    closed_word_index: usize,
     published_tail: u64,
     copied_tail: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ChannelAttachment {
+    instance_id: u64,
+    extern_dir: Option<ExternDir>,
 }
 
 /// A channel host-op failure (surfaced to the guest as a WIT `result` error).
@@ -115,6 +128,10 @@ pub enum ChannelError {
     /// A second `put` on a seeded non-Writer channel before its first fire —
     /// the seed is exactly one staged cell.
     SeedAlreadyStaged,
+    /// A bounded channel has no host capacity.
+    Full,
+    /// The native endpoint was closed.
+    Closed,
 }
 
 impl std::fmt::Display for ChannelError {
@@ -129,6 +146,8 @@ impl std::fmt::Display for ChannelError {
             }
             MissingSeed => write!(f, "seeded but no seed was put before the first fire"),
             SeedAlreadyStaged => write!(f, "a seed is already staged (a seed is exactly one put)"),
+            Full => write!(f, "channel is full"),
+            Closed => write!(f, "channel is closed"),
         }
     }
 }
@@ -146,9 +165,15 @@ impl ChannelCell {
             role: None,
             seeded: false,
             seed_taken: false,
+            endpoint: None,
+            declared_dtype: None,
+            extern_name: None,
+            attachments: Vec::new(),
             staged: VecDeque::new(),
+            writer_tail: 0,
             produced: VecDeque::new(),
-            readers: Vec::new(),
+            reader_reserved_tail: 0,
+            reader: None,
             poisoned: None,
         }
     }
@@ -165,6 +190,14 @@ impl ChannelCell {
     /// Whether the cell's constructor-declared geometry matches a container
     /// channel declaration (bind-time validation).
     pub fn matches_decl(&self, decl: &ChannelDecl) -> Result<(), String> {
+        self.validate_attachment(decl, None)
+    }
+
+    pub fn validate_attachment(
+        &self,
+        decl: &ChannelDecl,
+        extern_binding: Option<(&str, ExternDir)>,
+    ) -> Result<(), String> {
         let decl_dims = decl.shape.dims().to_vec();
         if self.shape != decl_dims {
             return Err(format!(
@@ -182,19 +215,129 @@ impl ChannelCell {
                 self.capacity, decl.capacity
             ));
         }
+        if let Some(dtype) = self.declared_dtype
+            && dtype != decl.dtype
+        {
+            return Err(format!(
+                "declared dtype {:?} conflicts with prior {dtype:?}",
+                decl.dtype
+            ));
+        }
+        if !self.attachments.is_empty() {
+            let Some((name, dir)) = extern_binding else {
+                return Err("a private or host-visible channel may attach to only one pass".into());
+            };
+            if decl.host_role != HostRole::None || decl.seeded {
+                return Err("shared extern channels cannot have a host role or seed".into());
+            }
+            if self.extern_name.as_deref() != Some(name) {
+                return Err(format!(
+                    "extern binding name {name:?} conflicts with prior {:?}",
+                    self.extern_name
+                ));
+            }
+            if self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.extern_dir == Some(dir))
+            {
+                return Err(format!("extern {dir:?} endpoint is already claimed"));
+            }
+        } else if extern_binding.is_some() && (decl.host_role != HostRole::None || decl.seeded) {
+            return Err("extern channels cannot have a host role or seed".into());
+        }
         Ok(())
     }
 
-    /// Stamp the container's role/seeded onto the cell at bind.
     pub fn bind(&mut self, decl: &ChannelDecl) {
         self.role = Some(decl.host_role);
         self.seeded = decl.seeded;
+        self.declared_dtype = Some(decl.dtype);
+    }
+
+    pub fn attach(
+        &mut self,
+        instance_id: u64,
+        decl: &ChannelDecl,
+        extern_binding: Option<(&str, ExternDir)>,
+    ) -> Result<(), String> {
+        self.validate_attachment(decl, extern_binding)?;
+        self.bind(decl);
+        if let Some((name, _)) = extern_binding {
+            self.extern_name = Some(name.to_string());
+        }
+        self.attachments.push(ChannelAttachment {
+            instance_id,
+            extern_dir: extern_binding.map(|(_, dir)| dir),
+        });
+        Ok(())
+    }
+
+    pub fn detach(&mut self, instance_id: u64) {
+        self.attachments
+            .retain(|attachment| attachment.instance_id != instance_id);
+    }
+
+    pub fn endpoint(&self) -> Option<Arc<ChannelEndpoint>> {
+        self.endpoint.clone()
+    }
+
+    pub fn reader_wait_state(&self) -> Option<(Arc<ChannelEndpoint>, u64)> {
+        Some((self.endpoint.clone()?, self.reader.as_ref()?.published_tail))
+    }
+
+    pub fn writer_wait_state(&self) -> Option<(Arc<ChannelEndpoint>, u64)> {
+        let endpoint = self.endpoint.clone()?;
+        let binding = endpoint.registered().binding;
+        Some((
+            endpoint,
+            load_word(binding.word_base, binding.head_word_index as usize),
+        ))
+    }
+
+    pub fn attach_endpoint(&mut self, endpoint: Arc<ChannelEndpoint>) -> Result<(), String> {
+        let binding = endpoint.registered().binding;
+        if binding.channel_id != self.global_id {
+            return Err(format!(
+                "channel {} received endpoint {}",
+                self.global_id, binding.channel_id
+            ));
+        }
+        if let Some(existing) = &self.endpoint {
+            if !Arc::ptr_eq(existing, &endpoint) {
+                return Err(format!(
+                    "channel {} endpoint already registered",
+                    self.global_id
+                ));
+            }
+            return Ok(());
+        }
+        if self.role == Some(HostRole::Reader) {
+            self.attach_reader_mirror(
+                0,
+                binding.mirror_base,
+                binding.word_base,
+                binding.cell_bytes,
+                binding.capacity,
+                0,
+                binding.head_word_index,
+                binding.tail_word_index,
+                binding.poison_word_index,
+                binding.closed_word_index,
+            )?;
+        }
+        self.endpoint = Some(endpoint);
+        Ok(())
     }
 
     /// Host `put` a dtype-native cell. Pre-bind this stages freely (seed or
     /// early Writer cell); post-bind it must be a Writer stage cell or the one
     /// seed on a not-yet-fired `seeded` channel.
     pub fn put(&mut self, native: Vec<u8>) -> Result<(), ChannelError> {
+        self.put_ref(&native)
+    }
+
+    pub fn put_ref(&mut self, native: &[u8]) -> Result<(), ChannelError> {
         let expected = self.native_len();
         if native.len() != expected {
             return Err(ChannelError::BadLength {
@@ -213,7 +356,19 @@ impl ChannelCell {
                 }
             }
         }
-        self.staged.push_back(native);
+        let consumed = self
+            .endpoint
+            .as_ref()
+            .map(|endpoint| {
+                let binding = endpoint.registered().binding;
+                load_word(binding.word_base, binding.head_word_index as usize)
+            })
+            .unwrap_or(0);
+        let in_flight = self.writer_tail.saturating_sub(consumed);
+        if in_flight.saturating_add(self.staged.len() as u64) >= u64::from(self.capacity) {
+            return Err(ChannelError::Full);
+        }
+        self.staged.push_back(native.to_vec());
         Ok(())
     }
 
@@ -236,7 +391,12 @@ impl ChannelCell {
                 return Err(ChannelError::WrongRole { role, op: "take" });
             }
         }
-        self.produced.pop_front().ok_or(ChannelError::Empty)
+        let value = self.produced.pop_front().ok_or(ChannelError::Empty)?;
+        if let Some(reader) = &self.reader {
+            let head = load_word(reader.word_base, reader.head_word_index);
+            store_word(reader.word_base, reader.head_word_index, head + 1);
+        }
+        Ok(value)
     }
 
     /// Host `read` (peek, non-consuming) a produced cell (Reader).
@@ -270,26 +430,31 @@ impl ChannelCell {
         Ok(seed)
     }
 
-    /// Drain the staged Writer cells for one fire, packing bool to the wire.
-    fn drain_wire(&mut self) -> Vec<Vec<u8>> {
-        let pack = self.dtype == DType::Bool;
+    pub fn peek_seed(&self) -> Result<Vec<u8>, ChannelError> {
         self.staged
-            .drain(..)
-            .map(|cell| if pack { pack_bool(&cell) } else { cell })
-            .collect()
+            .front()
+            .cloned()
+            .ok_or(ChannelError::MissingSeed)
+    }
+
+    pub fn commit_seed(&mut self) {
+        let _ = self.staged.pop_front();
+        self.seed_taken = true;
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn attach_reader_mirror(
         &mut self,
-        instance_id: u64,
+        _instance_id: u64,
         mirror_base: u64,
         word_base: u64,
         cell_bytes: u32,
         capacity: u32,
-        mirror_offset: u64,
+        _mirror_offset: u64,
+        head_word_index: u32,
         tail_word_index: u32,
         poison_word_index: u32,
+        closed_word_index: u32,
     ) -> Result<(), String> {
         if self.role != Some(HostRole::Reader) {
             return Err(format!(
@@ -303,13 +468,9 @@ impl ChannelCell {
                 self.global_id
             ));
         }
-        if self
-            .readers
-            .iter()
-            .any(|reader| reader.instance_id == instance_id)
-        {
+        if self.reader.is_some() {
             return Err(format!(
-                "channel {}: instance {instance_id} mirror already attached",
+                "channel {}: endpoint mirror already attached",
                 self.global_id
             ));
         }
@@ -323,44 +484,37 @@ impl ChannelCell {
                 self.global_id
             ));
         }
-        self.readers.push(ReaderMirror {
-            instance_id,
+        self.reader = Some(ReaderMirror {
             mirror_base,
             word_base,
             cell_bytes,
             cap1: u64::from(capacity).saturating_add(1),
-            mirror_offset,
+            head_word_index: head_word_index as usize,
             tail_word_index: tail_word_index as usize,
             poison_word_index: poison_word_index as usize,
+            closed_word_index: closed_word_index as usize,
             published_tail: 0,
             copied_tail: 0,
         });
         Ok(())
     }
 
-    pub fn detach_reader_mirror(&mut self, instance_id: u64) {
-        self.readers
-            .retain(|reader| reader.instance_id != instance_id);
-    }
+    pub fn detach_reader_mirror(&mut self, _instance_id: u64) {}
 
     /// Make one completed instance's release-published mirror tail visible to
     /// subsequent `take`/`read` calls. No value is copied here.
-    pub fn publish_reader_mirror(&mut self, instance_id: u64) -> Result<bool, String> {
-        let Some(reader) = self
-            .readers
-            .iter_mut()
-            .find(|reader| reader.instance_id == instance_id)
-        else {
-            return Err(format!(
-                "channel {}: no mirror for instance {instance_id}",
-                self.global_id
-            ));
+    pub fn publish_reader_mirror(&mut self, _instance_id: u64) -> Result<bool, String> {
+        let Some(reader) = self.reader.as_mut() else {
+            return Err(format!("channel {}: no endpoint mirror", self.global_id));
         };
         let poison = load_word(reader.word_base, reader.poison_word_index);
         if poison != 0 {
             let reason = format!("driver published poison epoch {poison}");
             self.poison(&reason);
             return Ok(true);
+        }
+        if load_word(reader.word_base, reader.closed_word_index) != 0 {
+            return Err(format!("channel {} endpoint is closed", self.global_id));
         }
         let tail = load_word(reader.word_base, reader.tail_word_index);
         if tail < reader.published_tail {
@@ -369,28 +523,25 @@ impl ChannelCell {
                 self.global_id, reader.published_tail
             ));
         }
-        if tail.saturating_sub(reader.copied_tail) > reader.cap1 {
+        if tail.saturating_sub(reader.copied_tail) >= reader.cap1 {
             return Err(format!(
                 "channel {}: mirror overrun (tail {tail}, copied {}, capacity {})",
                 self.global_id, reader.copied_tail, reader.cap1
             ));
         }
         reader.published_tail = tail;
+        self.reader_reserved_tail = self.reader_reserved_tail.max(tail);
         Ok(false)
     }
 
     pub fn latest_reader_value(
         &mut self,
-        instance_id: u64,
+        _instance_id: u64,
     ) -> Result<Option<Vec<u8>>, ChannelError> {
         let dtype = self.dtype;
         let numel = self.numel();
         let native_len = self.native_len();
-        let Some(reader) = self
-            .readers
-            .iter()
-            .find(|reader| reader.instance_id == instance_id)
-        else {
+        let Some(reader) = self.reader.as_ref() else {
             return Ok(None);
         };
         if reader.published_tail == 0 {
@@ -404,8 +555,8 @@ impl ChannelCell {
         let dtype = self.dtype;
         let numel = self.numel();
         let native_len = self.native_len();
-        let (readers, produced) = (&mut self.readers, &mut self.produced);
-        for reader in readers.iter_mut() {
+        let (reader, produced) = (&mut self.reader, &mut self.produced);
+        if let Some(reader) = reader {
             while reader.copied_tail < reader.published_tail {
                 let wire = read_mirror_cell(reader, reader.copied_tail);
                 produced.push_back(decode_reader_cell(dtype, numel, native_len, &wire)?);
@@ -420,19 +571,22 @@ impl ChannelCell {
 /// container's channel `i`).
 pub type BoundCells = Vec<Arc<Mutex<ChannelCell>>>;
 
-/// Coalesce every staged Writer put across a pass's cells into the submit's
-/// host-put table (D1): one [`PtirChannelValue`] per staged cell, in
-/// channel-then-FIFO order, keyed by the channel's GLOBAL id, bool packed to
-/// the wire. Clears the Writer queues (shipped).
-pub fn drain_host_puts(cells: &BoundCells) -> Vec<PtirChannelValue> {
+/// Snapshot the next staged Writer put per channel without consuming it.
+pub fn snapshot_host_puts(cells: &BoundCells) -> Vec<PtirChannelValue> {
     let mut out = Vec::new();
-    for cell in cells.iter() {
-        let mut c = cell.lock().unwrap();
+    for cell in cells {
+        let c = cell.lock().unwrap();
         if c.role != Some(HostRole::Writer) {
             continue;
         }
         let gid = c.global_id;
-        for bytes in c.drain_wire() {
+        let pack = c.dtype == DType::Bool;
+        if let Some(native) = c.staged.front() {
+            let bytes = if pack {
+                pack_bool(native)
+            } else {
+                native.clone()
+            };
             out.push(PtirChannelValue {
                 channel: gid,
                 bytes,
@@ -442,6 +596,53 @@ pub fn drain_host_puts(cells: &BoundCells) -> Vec<PtirChannelValue> {
     out
 }
 
+pub fn commit_host_puts(cells: &BoundCells) {
+    for cell in cells {
+        let mut cell = cell.lock().unwrap();
+        if cell.role == Some(HostRole::Writer) && cell.staged.pop_front().is_some() {
+            cell.writer_tail += 1;
+        }
+    }
+}
+
+pub fn reserve_reader_capacity(cells: &BoundCells) -> Result<(), ChannelError> {
+    let mut reserved: Vec<Arc<Mutex<ChannelCell>>> = Vec::new();
+    for cell_arc in cells {
+        let mut cell = cell_arc.lock().unwrap();
+        if cell.role != Some(HostRole::Reader) {
+            continue;
+        }
+        let Some(endpoint) = &cell.endpoint else {
+            for prior in reserved {
+                prior.lock().unwrap().reader_reserved_tail -= 1;
+            }
+            return Err(ChannelError::Closed);
+        };
+        let binding = endpoint.registered().binding;
+        let head = load_word(binding.word_base, binding.head_word_index as usize);
+        if cell.reader_reserved_tail.saturating_sub(head) >= u64::from(cell.capacity) {
+            drop(cell);
+            for prior in reserved {
+                prior.lock().unwrap().reader_reserved_tail -= 1;
+            }
+            return Err(ChannelError::Full);
+        }
+        cell.reader_reserved_tail += 1;
+        drop(cell);
+        reserved.push(Arc::clone(cell_arc));
+    }
+    Ok(())
+}
+
+pub fn rollback_reader_capacity(cells: &BoundCells) {
+    for cell in cells {
+        let mut cell = cell.lock().unwrap();
+        if cell.role == Some(HostRole::Reader) && cell.reader_reserved_tail != 0 {
+            cell.reader_reserved_tail -= 1;
+        }
+    }
+}
+
 fn load_word(word_base: u64, index: usize) -> u64 {
     // SAFETY: direct-driver bind returns an aligned atomic word array that
     // remains alive until the instance is closed. Channel mirrors detach before
@@ -449,9 +650,13 @@ fn load_word(word_base: u64, index: usize) -> u64 {
     unsafe { (&*((word_base as *const AtomicU64).add(index))).load(Ordering::Acquire) }
 }
 
+fn store_word(word_base: u64, index: usize, value: u64) {
+    unsafe { (&*((word_base as *const AtomicU64).add(index))).store(value, Ordering::Release) }
+}
+
 fn read_mirror_cell(reader: &ReaderMirror, sequence: u64) -> Vec<u8> {
     let slot = (sequence % reader.cap1) * reader.cell_bytes as u64;
-    let ptr = (reader.mirror_base + reader.mirror_offset + slot) as *const u8;
+    let ptr = (reader.mirror_base + slot) as *const u8;
     // SAFETY: the binding validates the mirror extent, and the driver owns it
     // through instance close.
     unsafe { std::slice::from_raw_parts(ptr, reader.cell_bytes).to_vec() }
@@ -551,7 +756,15 @@ mod tests {
         let mut mirror = vec![0u8; wire.len() * capacity.saturating_add(1) as usize];
         mirror[..wire.len()].copy_from_slice(wire);
         let mirror = Box::leak(mirror.into_boxed_slice());
-        let words = Box::leak(vec![AtomicU64::new(0), AtomicU64::new(0)].into_boxed_slice());
+        let words = Box::leak(
+            vec![
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ]
+            .into_boxed_slice(),
+        );
         cell.lock()
             .unwrap()
             .attach_reader_mirror(
@@ -563,9 +776,11 @@ mod tests {
                 0,
                 0,
                 1,
+                2,
+                3,
             )
             .unwrap();
-        words[0].store(1, Ordering::Release);
+        words[1].store(1, Ordering::Release);
         cell.lock()
             .unwrap()
             .publish_reader_mirror(instance_id)
@@ -652,7 +867,15 @@ mod tests {
         let cells = bound();
         let instance_id = 77;
         let mirror = Box::leak(9i32.to_le_bytes().to_vec().into_boxed_slice());
-        let words = Box::leak(vec![AtomicU64::new(1), AtomicU64::new(0)].into_boxed_slice());
+        let words = Box::leak(
+            vec![
+                AtomicU64::new(0),
+                AtomicU64::new(1),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ]
+            .into_boxed_slice(),
+        );
         cells[1]
             .lock()
             .unwrap()
@@ -661,10 +884,12 @@ mod tests {
                 mirror.as_ptr() as u64,
                 words.as_ptr() as u64,
                 4,
-                0,
+                1,
                 0,
                 0,
                 1,
+                2,
+                3,
             )
             .unwrap();
         assert_eq!(
@@ -748,8 +973,13 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_drains_writer_puts_bool_packed() {
-        let cells = bound();
+    fn writer_puts_are_snapshotted_and_committed_one_at_a_time() {
+        let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, false);
+        declaration.capacity = 2;
+        let mut writer = ChannelCell::new(vec![8], DType::Bool, 2);
+        writer.matches_decl(&declaration).unwrap();
+        writer.bind(&declaration);
+        let cells = vec![Arc::new(Mutex::new(writer))];
         let mask_id = cells[0].lock().unwrap().global_id;
         // two staged puts on the bool[8] mask.
         cells[0]
@@ -762,14 +992,8 @@ mod tests {
             .unwrap()
             .put(vec![0, 1, 0, 0, 0, 0, 0, 1])
             .unwrap(); // bits 1,7 → 130
-        // a staged seed on the device-private `tok` is NOT a Writer put.
-        cells[2]
-            .lock()
-            .unwrap()
-            .put(1i32.to_le_bytes().to_vec())
-            .unwrap();
-        let puts = drain_host_puts(&cells);
-        assert_eq!(puts.len(), 2, "one PtirChannelValue per staged Writer cell");
+        let puts = snapshot_host_puts(&cells);
+        assert_eq!(puts.len(), 1, "only the next Writer cell is submitted");
         assert_eq!(
             puts[0],
             PtirChannelValue {
@@ -778,14 +1002,20 @@ mod tests {
             }
         );
         assert_eq!(
-            puts[1],
+            snapshot_host_puts(&cells),
+            puts,
+            "snapshotting must not consume a value before native acceptance"
+        );
+        commit_host_puts(&cells);
+        assert_eq!(
+            snapshot_host_puts(&cells)[0],
             PtirChannelValue {
                 channel: mask_id,
                 bytes: vec![130]
             }
         );
-        // draining clears the queue.
-        assert!(drain_host_puts(&cells).is_empty());
+        commit_host_puts(&cells);
+        assert!(snapshot_host_puts(&cells).is_empty());
     }
 
     #[test]
@@ -816,7 +1046,7 @@ mod tests {
         let err = cells[0]
             .lock()
             .unwrap()
-            .attach_reader_mirror(1, 1, 1, 1, 1, 0, 0, 1)
+            .attach_reader_mirror(1, 1, 1, 1, 1, 0, 0, 1, 2, 3)
             .unwrap_err();
         assert!(err.contains("expected Reader"));
     }

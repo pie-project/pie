@@ -173,6 +173,9 @@ mod tests {
             max_forward_requests: caps.max_forward_requests,
             max_page_refs: caps.max_page_refs,
             callback_delay_ms: 0,
+            reject_launches: false,
+            reject_launches_remaining: 0,
+            fail_launches_after_accept: false,
             operation_log: None,
         };
         let (native, _) = pie_engine::driver::NativeDriver::dummy(dummy).unwrap();
@@ -277,9 +280,6 @@ device = ["cpu"]
             .err()
             .unwrap()
             .to_string();
-        assert!(
-            err.contains("zero native drivers"),
-            "got: {err}"
-        );
+        assert!(err.contains("zero native drivers"), "got: {err}");
     }
 }

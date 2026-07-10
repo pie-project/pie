@@ -38,6 +38,13 @@ void push_u32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     }
 }
 
+PieTerminalCell pending_terminal() {
+    return PieTerminalCell{
+        .outcome = PIE_TERMINAL_OUTCOME_PENDING,
+        .reserved0 = 0,
+    };
+}
+
 std::vector<std::uint8_t> mixed_role_program(std::uint32_t capacity = 1) {
     std::vector<std::uint8_t> out{'P', 'T', 'I', 'R'};
     push_u16(out, 1);
@@ -54,6 +61,30 @@ std::vector<std::uint8_t> mixed_role_program(std::uint32_t capacity = 1) {
         out.push_back(role);
         out.push_back(role == 2 ? 1 : 0);
     }
+    return out;
+}
+
+std::vector<std::uint8_t> extern_program(std::uint8_t direction) {
+    constexpr char name[] = "shared";
+    std::vector<std::uint8_t> out{'P', 'T', 'I', 'R'};
+    push_u16(out, 2);
+    push_u16(out, 0);
+    push_u32(out, 1);  // names
+    push_u32(out, 1);  // channels
+    push_u32(out, 0);  // ports
+    push_u32(out, 0);  // stages
+    push_u32(out, 1);  // externs
+    push_u16(out, sizeof(name) - 1);
+    out.insert(out.end(), name, name + sizeof(name) - 1);
+    out.push_back(2);  // u32
+    out.push_back(1);  // rank
+    push_u32(out, 1);
+    push_u32(out, 1);  // capacity
+    out.push_back(0);  // host none
+    out.push_back(0);  // unseeded
+    push_u16(out, 0);  // name index
+    out.push_back(direction);
+    push_u32(out, 0);  // dense channel
     return out;
 }
 
@@ -150,11 +181,51 @@ int main() {
                 "cache miss requires canonical bytes")) return 1;
 
     const std::uint64_t channel_ids[] = {11, 22, 33};
-    const PieChannelWait waits[] = {
-        {.reader_wait_id = 101, .writer_wait_id = 201},
-        {.reader_wait_id = 102, .writer_wait_id = 202},
-        {.reader_wait_id = 103, .writer_wait_id = 203},
-    };
+    const std::uint32_t scalar_shape[] = {1};
+    PieChannelDesc channel_descs[3]{};
+    for (std::size_t i = 0; i < 3; ++i) {
+        channel_descs[i].abi_version = PIE_DRIVER_ABI_VERSION;
+        channel_descs[i].channel_id = channel_ids[i];
+        channel_descs[i].shape = {.ptr = scalar_shape, .len = 1};
+        channel_descs[i].dtype = PIE_CHANNEL_DTYPE_U32;
+        channel_descs[i].capacity = 1;
+        channel_descs[i].reader_wait_id = 101 + i;
+        channel_descs[i].writer_wait_id = 201 + i;
+    }
+    channel_descs[0].host_role = PIE_CHANNEL_HOST_ROLE_WRITER;
+    channel_descs[1].host_role = PIE_CHANNEL_HOST_ROLE_NONE;
+    channel_descs[2].host_role = PIE_CHANNEL_HOST_ROLE_READER;
+    channel_descs[2].seeded = 1;
+    PieChannelEndpointBinding endpoints[3]{};
+    PieChannelDesc bad_channel = channel_descs[0];
+    bad_channel.abi_version += 1;
+    if (!expect(pie_metal_register_channel(driver, &bad_channel, &endpoints[0]) ==
+                    PIE_STATUS_BAD_ABI_VERSION,
+                "channel rejects wrong ABI")) return 1;
+    bad_channel = channel_descs[0];
+    bad_channel.reader_wait_id = bad_channel.writer_wait_id;
+    if (!expect(pie_metal_register_channel(driver, &bad_channel, &endpoints[0]) ==
+                    PIE_STATUS_INVALID_ARGUMENT,
+                "channel rejects duplicate wait ids")) return 1;
+    for (std::size_t i = 0; i < 3; ++i) {
+        if (!expect(pie_metal_register_channel(
+                        driver, &channel_descs[i], &endpoints[i]) == PIE_STATUS_OK,
+                    "register_channel")) return 1;
+        if (!expect(endpoints[i].channel_id == channel_ids[i] &&
+                        endpoints[i].mirror_base != 0 &&
+                        endpoints[i].word_base != 0 &&
+                        endpoints[i].cell_bytes == sizeof(std::uint32_t) &&
+                        endpoints[i].capacity == 1 &&
+                        endpoints[i].head_word_index == 0 &&
+                        endpoints[i].tail_word_index == 1 &&
+                        endpoints[i].poison_word_index == 2 &&
+                        endpoints[i].closed_word_index == 3,
+                    "endpoint binding layout")) return 1;
+    }
+    if (!expect(pie_metal_register_channel(
+                    driver, &channel_descs[0], &endpoints[0]) ==
+                    PIE_STATUS_INVALID_ARGUMENT,
+                "duplicate channel registration rejected")) return 1;
     const std::uint8_t seed_bytes[] = {0xAA, 0xBB, 0xCC, 0xDD};
     const PieChannelValueDesc seeds[] = {{
         .channel_id = 33,
@@ -165,8 +236,6 @@ int main() {
     instance.program_id = program_id;
     instance.channel_ids.ptr = channel_ids;
     instance.channel_ids.len = 3;
-    instance.channel_waits.ptr = waits;
-    instance.channel_waits.len = 3;
     instance.seed_values.ptr = seeds;
     instance.seed_values.len = 1;
 
@@ -180,15 +249,10 @@ int main() {
                     PIE_STATUS_INVALID_ARGUMENT,
                 "bind rejects null output")) return 1;
     bad_instance = instance;
-    bad_instance.channel_waits = {.ptr = nullptr, .len = 3};
+    bad_instance.channel_ids.len = 2;
     if (!expect(pie_metal_bind_instance(driver, &bad_instance, &binding) ==
                     PIE_STATUS_INVALID_ARGUMENT,
-                "bind rejects null waits")) return 1;
-    bad_instance = instance;
-    bad_instance.channel_waits.len = 2;
-    if (!expect(pie_metal_bind_instance(driver, &bad_instance, &binding) ==
-                    PIE_STATUS_INVALID_ARGUMENT,
-                "bind rejects parallel count mismatch")) return 1;
+                "bind rejects channel count mismatch")) return 1;
     PieChannelValueDesc bad_seed = seeds[0];
     bad_seed.bytes = {.ptr = nullptr, .len = 4};
     bad_instance = instance;
@@ -216,21 +280,23 @@ int main() {
                 "bind rejects slice byte overflow")) return 1;
     if (!expect(pie_metal_bind_instance(driver, &instance, &binding) == PIE_STATUS_OK,
                 "bind_instance")) return 1;
-    if (!expect(binding.channel_count == 1, "reader-only channel_count")) return 1;
-    if (!expect(binding.word_count == 4, "reader-only word_count")) return 1;
-    if (!expect(binding.channels.ptr != nullptr && binding.channels.len == 1,
-                "binding slice")) return 1;
-    if (!expect(binding.channels.ptr[0].channel_id == 33, "reader channel id")) return 1;
-    if (!expect(binding.channels.ptr[0].head_word_index == 1 &&
-                    binding.channels.ptr[0].tail_word_index == 2 &&
-                    binding.channels.ptr[0].poison_word_index == 3,
-                "reader word layout")) return 1;
+    if (!expect(binding.instance_id != 0, "instance identity returned")) return 1;
+    if (!expect(pie_metal_close_channel(driver, 33) == PIE_STATUS_INVALID_ARGUMENT,
+                "close_channel rejects live attachment")) return 1;
 
-    auto* mirror = reinterpret_cast<const std::uint8_t*>(binding.mirror_base);
-    auto* words = reinterpret_cast<const std::uint64_t*>(binding.word_base);
+    auto* mirror = reinterpret_cast<const std::uint8_t*>(endpoints[2].mirror_base);
+    auto* words = reinterpret_cast<const std::uint64_t*>(endpoints[2].word_base);
     if (!expect(std::memcmp(mirror, seed_bytes, sizeof(seed_bytes)) == 0,
                 "seed mirrored")) return 1;
-    if (!expect(words[2] == 1, "seed tail published")) return 1;
+    if (!expect(words[1] == 1, "seed tail published")) return 1;
+
+    PieInstanceDesc duplicate_instance = instance;
+    duplicate_instance.requested_instance_id = binding.instance_id;
+    PieInstanceBinding duplicate_binding{};
+    if (!expect(pie_metal_bind_instance(
+                    driver, &duplicate_instance, &duplicate_binding) ==
+                    PIE_STATUS_INVALID_ARGUMENT,
+                "duplicate bind preserves original instance")) return 1;
 
     const std::uint8_t put_bytes[] = {0x10, 0x11, 0x12, 0x13};
     const PieChannelValueDesc puts[] = {{
@@ -243,16 +309,29 @@ int main() {
     launch.abi_version = PIE_DRIVER_ABI_VERSION;
     launch.instance_ids.ptr = instance_ids;
     launch.instance_ids.len = 1;
+    PieTerminalCell launch_terminal = pending_terminal();
+    PieTerminalCell* const launch_terminal_ptrs[] = {&launch_terminal};
+    launch.terminal_cells = {.ptr = launch_terminal_ptrs, .len = 1};
     launch.ptir_host_put_values.ptr = puts;
     launch.ptir_host_put_values.len = 1;
     launch.host_put_indptr.ptr = host_put_indptr;
     launch.host_put_indptr.len = 2;
-    const PieCompletion completion{.wait_id = 77, .target_epoch = 5};
-    const PieCompletion rejected_completion{.wait_id = 88, .target_epoch = 6};
+    PieTerminalCell rejected_terminal = pending_terminal();
+    const PieCompletion launch_completion{
+        .wait_id = 77,
+        .target_epoch = 5,
+        .terminal_cell = nullptr,
+    };
+    const PieCompletion rejected_completion{
+        .wait_id = 88,
+        .target_epoch = 6,
+        .terminal_cell = &rejected_terminal,
+    };
     const std::uint32_t empty_csr[] = {0};
     PieLaunchDesc device_geometry_launch{};
     device_geometry_launch.abi_version = PIE_DRIVER_ABI_VERSION;
     device_geometry_launch.instance_ids = {.ptr = instance_ids, .len = 1};
+    device_geometry_launch.terminal_cells = {.ptr = launch_terminal_ptrs, .len = 1};
     device_geometry_launch.masks.request_indptr = {
         .ptr = empty_csr,
         .len = 1,
@@ -261,23 +340,23 @@ int main() {
         .ptr = empty_csr,
         .len = 1,
     };
-    if (!expect(pie_metal_launch(driver, &device_geometry_launch, {}) ==
-                    PIE_STATUS_OK,
+    if (!expect(pie_metal_launch(driver, &device_geometry_launch, launch_completion) ==
+                    PIE_STATUS_UNSUPPORTED,
                 "device-geometry empty mask encoding")) return 1;
 
     PieLaunchDesc bad_launch = launch;
     bad_launch.abi_version += 1;
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_BAD_ABI_VERSION,
                 "launch rejects wrong ABI")) return 1;
     bad_launch = launch;
     bad_launch.single_token_mode = 2;
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects invalid bool")) return 1;
     bad_launch = launch;
     bad_launch.reserved_flags[3] = 1;
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects reserved flags")) return 1;
     const std::uint32_t bad_host_put_indptr[] = {0, 2};
@@ -286,14 +365,14 @@ int main() {
         .ptr = bad_host_put_indptr,
         .len = 2,
     };
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects malformed host-put CSR")) return 1;
     PieChannelValueDesc bad_put = puts[0];
     bad_put.bytes = {.ptr = nullptr, .len = 4};
     bad_launch = launch;
     bad_launch.ptir_host_put_values = {.ptr = &bad_put, .len = 1};
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects nested host-put bytes")) return 1;
     bad_put = {
@@ -302,7 +381,7 @@ int main() {
     };
     bad_launch = launch;
     bad_launch.ptir_host_put_values = {.ptr = &bad_put, .len = 1};
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects host put to non-writer channel")) return 1;
     const std::uint32_t token[] = {1};
@@ -311,15 +390,16 @@ int main() {
     bad_launch = {};
     bad_launch.abi_version = PIE_DRIVER_ABI_VERSION;
     bad_launch.instance_ids = {.ptr = instance_ids, .len = 1};
+    bad_launch.terminal_cells = {.ptr = launch_terminal_ptrs, .len = 1};
     bad_launch.token_ids = {.ptr = token, .len = 1};
     bad_launch.position_ids = {.ptr = position, .len = 1};
     bad_launch.qo_indptr = {.ptr = bad_qo_indptr, .len = 2};
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects nonterminal qo CSR")) return 1;
     const std::uint32_t qo_indptr[] = {0, 1};
     bad_launch.qo_indptr = {.ptr = qo_indptr, .len = 2};
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "model launch requires KV and sampling CSRs")) return 1;
     const std::uint32_t kv_page[] = {0};
@@ -335,7 +415,7 @@ int main() {
         .len = 1,
     };
     bad_launch.sampling_indptr = {.ptr = sampling_indptr, .len = 2};
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects out-of-range sampling row")) return 1;
     bad_launch = {};
@@ -344,7 +424,7 @@ int main() {
         .ptr = reinterpret_cast<const std::uint64_t*>(alignof(std::uint64_t)),
         .len = std::numeric_limits<std::size_t>::max(),
     };
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects count overflow")) return 1;
     const std::uint32_t rs_slot[] = {0};
@@ -352,9 +432,10 @@ int main() {
     bad_launch = {};
     bad_launch.abi_version = PIE_DRIVER_ABI_VERSION;
     bad_launch.instance_ids = {.ptr = instance_ids, .len = 1};
+    bad_launch.terminal_cells = {.ptr = launch_terminal_ptrs, .len = 1};
     bad_launch.rs_slot_ids = {.ptr = rs_slot, .len = 1};
     bad_launch.rs_slot_flags = {.ptr = bad_rs_flag, .len = 1};
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects invalid recurrent-state flags")) return 1;
     const std::uint32_t oversized_rs_slot[] = {
@@ -363,7 +444,7 @@ int main() {
     const std::uint8_t valid_rs_flag[] = {0};
     bad_launch.rs_slot_ids = {.ptr = oversized_rs_slot, .len = 1};
     bad_launch.rs_slot_flags = {.ptr = valid_rs_flag, .len = 1};
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects recurrent slot cast overflow")) return 1;
     const std::uint32_t image_grid[] = {1, 1, 1};
@@ -372,6 +453,7 @@ int main() {
     bad_launch = {};
     bad_launch.abi_version = PIE_DRIVER_ABI_VERSION;
     bad_launch.instance_ids = {.ptr = instance_ids, .len = 1};
+    bad_launch.terminal_cells = {.ptr = launch_terminal_ptrs, .len = 1};
     bad_launch.image_indptr = {.ptr = kv_indptr, .len = 2};
     bad_launch.image_grids = {.ptr = image_grid, .len = 3};
     bad_launch.image_anchor_positions = {.ptr = image_anchor, .len = 1};
@@ -380,17 +462,18 @@ int main() {
         .ptr = image_pixel_indptr,
         .len = 2,
     };
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects image anchor outside token rows")) return 1;
     bad_launch = {};
     bad_launch.abi_version = PIE_DRIVER_ABI_VERSION;
     bad_launch.instance_ids = {.ptr = instance_ids, .len = 1};
+    bad_launch.terminal_cells = {.ptr = launch_terminal_ptrs, .len = 1};
     bad_launch.token_ids = {
         .ptr = reinterpret_cast<const std::uint32_t*>(1),
         .len = 1,
     };
-    if (!expect(pie_metal_launch(driver, &bad_launch, rejected_completion) ==
+    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects unaligned slices")) return 1;
     if (!expect(notify.count == 0, "rejected launches do not notify")) return 1;
@@ -451,18 +534,154 @@ int main() {
                 "resize rejects target count overflow")) return 1;
     if (!expect(notify.count == 0, "rejected typed operations do not notify")) return 1;
 
-    if (!expect(pie_metal_launch(driver, &launch, completion) == PIE_STATUS_OK,
-                "launch")) return 1;
-    if (!expect(notify.count == 1 && notify.last_wait_id == 77 && notify.last_epoch == 5,
-                "notify once")) return 1;
-    if (!expect(words[0] == 2, "pacing word")) return 1;
-    if (!expect(std::memcmp(mirror + binding.channels.ptr[0].mirror_offset,
-                            seed_bytes, sizeof(seed_bytes)) == 0,
+    if (!expect(pie_metal_launch(driver, &launch, rejected_completion) ==
+                    PIE_STATUS_INVALID_ARGUMENT,
+                "launch rejects operation terminal cell")) return 1;
+    if (!expect(pie_metal_launch(driver, &launch, launch_completion) == PIE_STATUS_UNSUPPORTED,
+                "launch unsupported")) return 1;
+    if (!expect(notify.count == 0, "unsupported launch does not notify")) return 1;
+    if (!expect(words[0] == 0, "reader head unchanged")) return 1;
+    if (!expect(std::memcmp(mirror, seed_bytes, sizeof(seed_bytes)) == 0,
                 "reader seed remains visible")) return 1;
-    if (!expect(words[3] == 0, "poison stays clear")) return 1;
+    if (!expect(words[2] == 0, "poison stays clear")) return 1;
+    if (!expect(words[3] == 0, "closed stays clear")) return 1;
+    if (!expect(launch_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
+                "unsupported launch keeps member terminal pending")) return 1;
+    if (!expect(rejected_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
+                "rejected launch keeps operation terminal pending")) return 1;
+
+    PieTerminalCell copy_terminal = pending_terminal();
+    const PieCompletion copy_completion{
+        .wait_id = 91,
+        .target_epoch = 2,
+        .terminal_cell = &copy_terminal,
+    };
+    PieKvCopyDesc kv_copy{};
+    kv_copy.abi_version = PIE_DRIVER_ABI_VERSION;
+    kv_copy.src_domain = PIE_MEMORY_DOMAIN_HOST_PINNED;
+    kv_copy.dst_domain = PIE_MEMORY_DOMAIN_HOST_PINNED;
+    if (!expect(pie_metal_copy_kv(driver, &kv_copy, copy_completion) == PIE_STATUS_UNSUPPORTED,
+                "copy_kv unsupported")) return 1;
+    if (!expect(copy_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
+                "unsupported copy_kv keeps terminal pending")) return 1;
+
+    PieTerminalCell state_terminal = pending_terminal();
+    const PieCompletion state_completion{
+        .wait_id = 92,
+        .target_epoch = 3,
+        .terminal_cell = &state_terminal,
+    };
+    PieStateCopyDesc state_copy{};
+    state_copy.abi_version = PIE_DRIVER_ABI_VERSION;
+    if (!expect(
+            pie_metal_copy_state(driver, &state_copy, state_completion) == PIE_STATUS_UNSUPPORTED,
+            "copy_state unsupported")) return 1;
+    if (!expect(state_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
+                "unsupported copy_state keeps terminal pending")) return 1;
+
+    PieTerminalCell resize_terminal = pending_terminal();
+    const PieCompletion resize_completion{
+        .wait_id = 93,
+        .target_epoch = 4,
+        .terminal_cell = &resize_terminal,
+    };
+    PiePoolResizeDesc resize{};
+    resize.abi_version = PIE_DRIVER_ABI_VERSION;
+    if (!expect(
+            pie_metal_resize_pool(driver, &resize, resize_completion) == PIE_STATUS_UNSUPPORTED,
+            "resize unsupported")) return 1;
+    if (!expect(resize_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
+                "unsupported resize keeps terminal pending")) return 1;
+    if (!expect(notify.count == 0, "unsupported operations never notify")) return 1;
 
     if (!expect(pie_metal_close_instance(driver, binding.instance_id) == PIE_STATUS_OK,
                 "close_instance")) return 1;
+    for (const std::uint64_t channel_id : channel_ids) {
+        if (!expect(pie_metal_close_channel(driver, channel_id) == PIE_STATUS_OK,
+                   "close_channel")) return 1;
+        if (!expect(pie_metal_close_channel(driver, channel_id) == PIE_STATUS_CLOSED,
+                   "closed channel stays closed")) return 1;
+    }
+
+    const auto export_bytes = extern_program(1);
+    const auto import_bytes = extern_program(0);
+    PieProgramDesc export_program{};
+    export_program.abi_version = PIE_DRIVER_ABI_VERSION;
+    export_program.program_hash = 0x2001;
+    export_program.canonical_bytes = {
+        .ptr = export_bytes.data(),
+        .len = export_bytes.size(),
+    };
+    PieProgramDesc import_program = export_program;
+    import_program.program_hash = 0x2002;
+    import_program.canonical_bytes = {
+        .ptr = import_bytes.data(),
+        .len = import_bytes.size(),
+    };
+    std::uint64_t export_program_id = 0;
+    std::uint64_t import_program_id = 0;
+    if (!expect(pie_metal_register_program(
+                   driver, &export_program, &export_program_id) == PIE_STATUS_OK,
+                "register extern export program")) return 1;
+    if (!expect(pie_metal_register_program(
+                   driver, &import_program, &import_program_id) == PIE_STATUS_OK,
+                "register extern import program")) return 1;
+
+    const std::uint64_t shared_channel_id = 44;
+    const std::uint8_t shared_name[] = {'s', 'h', 'a', 'r', 'e', 'd'};
+    PieChannelDesc shared_channel{};
+    shared_channel.abi_version = PIE_DRIVER_ABI_VERSION;
+    shared_channel.channel_id = shared_channel_id;
+    shared_channel.shape = {.ptr = scalar_shape, .len = 1};
+    shared_channel.dtype = PIE_CHANNEL_DTYPE_U32;
+    shared_channel.extern_dir = PIE_CHANNEL_EXTERN_EXPORT;
+    shared_channel.capacity = 1;
+    shared_channel.reader_wait_id = 401;
+    shared_channel.writer_wait_id = 402;
+    shared_channel.extern_name = {
+        .ptr = shared_name,
+        .len = sizeof(shared_name),
+    };
+    PieChannelEndpointBinding shared_endpoint{};
+    if (!expect(pie_metal_register_channel(
+                   driver, &shared_channel, &shared_endpoint) == PIE_STATUS_OK,
+                "register shared endpoint")) return 1;
+    PieInstanceDesc export_instance{};
+    export_instance.abi_version = PIE_DRIVER_ABI_VERSION;
+    export_instance.program_id = export_program_id;
+    export_instance.requested_instance_id = 100;
+    export_instance.channel_ids = {.ptr = &shared_channel_id, .len = 1};
+    PieInstanceBinding export_binding{};
+    if (!expect(pie_metal_bind_instance(
+                   driver, &export_instance, &export_binding) == PIE_STATUS_OK,
+                "bind extern exporter")) return 1;
+    PieInstanceDesc import_instance = export_instance;
+    import_instance.program_id = import_program_id;
+    import_instance.requested_instance_id = 101;
+    PieInstanceBinding import_binding{};
+    if (!expect(pie_metal_bind_instance(
+                   driver, &import_instance, &import_binding) == PIE_STATUS_OK,
+                "bind extern importer")) return 1;
+    PieInstanceDesc duplicate_export = export_instance;
+    duplicate_export.requested_instance_id = 102;
+    PieInstanceBinding duplicate_export_binding{};
+    if (!expect(pie_metal_bind_instance(
+                   driver, &duplicate_export, &duplicate_export_binding) ==
+                   PIE_STATUS_INVALID_ARGUMENT,
+                "reject duplicate extern direction")) return 1;
+    if (!expect(pie_metal_close_channel(driver, shared_channel_id) ==
+                   PIE_STATUS_INVALID_ARGUMENT,
+                "shared endpoint rejects live close")) return 1;
+    if (!expect(pie_metal_close_instance(driver, export_binding.instance_id) ==
+                   PIE_STATUS_OK,
+                "close exporter")) return 1;
+    if (!expect(pie_metal_close_instance(driver, import_binding.instance_id) ==
+                   PIE_STATUS_OK,
+                "close importer")) return 1;
+    if (!expect(pie_metal_close_channel(driver, shared_channel_id) ==
+                   PIE_STATUS_OK,
+                "close shared endpoint")) return 1;
+
     pie_metal_destroy(driver);
     std::puts("metal_direct_stub_test: OK");
     return 0;

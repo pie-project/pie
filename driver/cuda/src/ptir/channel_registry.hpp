@@ -20,22 +20,45 @@
 // runner (`Tier0Runner`). Only the durable ring state (cells, full[], head/tail,
 // cap1) is registry-owned and shared.
 
+#include <algorithm>
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <pie_driver_abi.h>
 
 #include "ptir/channels.hpp"  // kMaxRing + the (unchanged) ring kernels
 #include "ptir/trace.hpp"
+#include "cuda_check.hpp"
 
 namespace pie_cuda_driver::ptir {
 
 // Registry device-array capacity in SLOTS (grows on demand). One inferlet's
 // live channel count is small; this is a generous initial reservation.
 inline constexpr std::uint32_t kInitialChannelSlots = 1024;
+
+static __global__ void pack_bool_channel_cell(
+    const std::uint8_t* source,
+    std::uint8_t* destination,
+    std::size_t numel) {
+    const std::size_t byte =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t packed_bytes = (numel + 7) / 8;
+    if (byte >= packed_bytes) return;
+    std::uint8_t packed = 0;
+    const std::size_t first = byte * 8;
+    for (std::size_t bit = 0; bit < 8 && first + bit < numel; ++bit) {
+        if (source[first + bit] != 0) {
+            packed |= static_cast<std::uint8_t>(1u << bit);
+        }
+    }
+    destination[byte] = packed;
+}
 
 // The shared, global device channel table. One per driver (owned by
 // `PtirDispatch::Impl`). Slots are compact indices into the shared device
@@ -47,11 +70,95 @@ class DeviceChannelRegistry {
     DeviceChannelRegistry(const DeviceChannelRegistry&) = delete;
     DeviceChannelRegistry& operator=(const DeviceChannelRegistry&) = delete;
 
-    // Resolve (creating on first sight) the compact device slot backing global
-    // channel `id`, using `decl` for shape/dtype/capacity/seed. On a later
-    // reference the decl MUST match the first registration (the multi-pass
-    // sharing invariant, §6 "Decl conflicts on shared channels"); a mismatch is
-    // a loud error. Returns `kBadSlot` and sets `*err` on conflict/OOM.
+    bool register_endpoint(const PieChannelDesc& desc,
+                           PieChannelEndpointBinding* binding,
+                           std::string* err) {
+        if (contains(desc.channel_id)) {
+            if (err) *err = "ptir: duplicate channel id";
+            return false;
+        }
+        const std::uint64_t wire_bytes = wire_cell_bytes(desc);
+        const std::uint64_t native_bytes = native_cell_bytes(desc);
+        if (wire_bytes == 0 || native_bytes == 0 ||
+            static_cast<std::uint64_t>(desc.capacity) + 1 > kMaxRing ||
+            wire_bytes > std::numeric_limits<std::size_t>::max() /
+                             (static_cast<std::uint64_t>(desc.capacity) + 1)) {
+            if (err) *err = "ptir: unsupported channel geometry";
+            return false;
+        }
+        const std::uint32_t slot = alloc_slot();
+        if (slot == kBadSlot) {
+            if (err) *err = "ptir: channel registry out of slots";
+            return false;
+        }
+        host_mirror_bytes_[slot] =
+            wire_bytes * (static_cast<std::uint64_t>(desc.capacity) + 1);
+        try {
+            init_slot(slot, desc);
+            if (desc.dtype == PIE_CHANNEL_DTYPE_BOOL) {
+                CUDA_CHECK(cudaMalloc(
+                    &wire_staging_[slot], host_mirror_bytes_[slot]));
+            }
+            CUDA_CHECK(cudaHostAlloc(
+                &host_mirror_[slot], host_mirror_bytes_[slot], cudaHostAllocPortable));
+            CUDA_CHECK(cudaHostAlloc(
+                reinterpret_cast<void**>(&host_words_[slot]),
+                4 * sizeof(std::uint64_t), cudaHostAllocPortable));
+        } catch (...) {
+            free_slot(slot);
+            throw;
+        }
+        slot_of_.emplace(desc.channel_id, slot);
+        id_of_[slot] = desc.channel_id;
+        refcounts_[slot] = 0;
+        dtype_[slot] = desc.dtype;
+        host_role_[slot] = desc.host_role;
+        reader_wait_ids_[slot] = desc.reader_wait_id;
+        writer_wait_ids_[slot] = desc.writer_wait_id;
+        seeded_[slot] = desc.seeded != 0;
+        extern_direction_[slot] = desc.extern_dir;
+        extern_names_[slot].clear();
+        if (desc.extern_name.len != 0) {
+            extern_names_[slot].assign(
+                reinterpret_cast<const char*>(desc.extern_name.ptr),
+                desc.extern_name.len);
+        }
+        attachment_direction_masks_[slot] = 0;
+        shapes_[slot].assign(desc.shape.ptr, desc.shape.ptr + desc.shape.len);
+        std::memset(host_mirror_[slot], 0, host_mirror_bytes_[slot]);
+        std::memset(host_words_[slot], 0, 4 * sizeof(std::uint64_t));
+        *binding = PieChannelEndpointBinding{
+            .channel_id = desc.channel_id,
+            .mirror_base = reinterpret_cast<std::uint64_t>(host_mirror_[slot]),
+            .word_base = reinterpret_cast<std::uint64_t>(host_words_[slot]),
+            .mirror_bytes = host_mirror_bytes_[slot],
+            .word_bytes = 4 * sizeof(std::uint64_t),
+            .cell_bytes = static_cast<std::uint32_t>(wire_bytes),
+            .capacity = desc.capacity,
+            .head_word_index = 0,
+            .tail_word_index = 1,
+            .poison_word_index = 2,
+            .closed_word_index = 3,
+        };
+        return true;
+    }
+
+    bool close_endpoint(std::uint64_t id, std::string* err) {
+        auto it = slot_of_.find(id);
+        if (it == slot_of_.end()) return false;
+        const std::uint32_t slot = it->second;
+        if (refcounts_[slot] != 0) {
+            if (err) *err = "ptir: channel still has instance attachments";
+            return false;
+        }
+        std::atomic_ref<std::uint64_t>(host_words_[slot][3]).store(
+            1, std::memory_order_release);
+        free_slot(slot);
+        slot_of_.erase(it);
+        return true;
+    }
+
+    // Resolve an explicitly registered endpoint for an instance attachment.
     std::uint32_t get_or_create(std::uint64_t id, const Channel& decl, std::string* err) {
         auto it = slot_of_.find(id);
         if (it != slot_of_.end()) {
@@ -62,19 +169,36 @@ class DeviceChannelRegistry {
                            " re-bound with a conflicting shape/dtype/capacity decl";
                 return kBadSlot;
             }
+            if (decl.extern_dir < 0) {
+                if (extern_direction_[slot] != PIE_CHANNEL_EXTERN_NONE ||
+                    refcounts_[slot] != 0) {
+                    if (err) *err = "ptir: private channel is already attached";
+                    return kBadSlot;
+                }
+            } else {
+                const std::uint8_t direction_bit =
+                    static_cast<std::uint8_t>(1u << decl.extern_dir);
+                if (extern_direction_[slot] == PIE_CHANNEL_EXTERN_NONE ||
+                    extern_names_[slot] != decl.extern_name ||
+                    (attachment_direction_masks_[slot] & direction_bit) != 0) {
+                    if (err) *err = "ptir: incompatible extern attachment";
+                    return kBadSlot;
+                }
+                attachment_direction_masks_[slot] |= direction_bit;
+            }
+            if (refcounts_[slot] >= (decl.extern_dir < 0 ? 1u : 2u)) {
+                if (err) {
+                    *err = "ptir: channel " + std::to_string(id) +
+                           " has too many instance attachments";
+                }
+                return kBadSlot;
+            }
             ++refcounts_[slot];
             return slot;
         }
-        const std::uint32_t slot = alloc_slot();
-        if (slot == kBadSlot) {
-            if (err) *err = "ptir: channel registry out of slots";
-            return kBadSlot;
-        }
-        init_slot(slot, decl);
-        slot_of_.emplace(id, slot);
-        id_of_[slot] = id;
-        refcounts_[slot] = 1;
-        return slot;
+        if (err) *err = "ptir: channel " + std::to_string(id) +
+                        " was not registered";
+        return kBadSlot;
     }
 
     bool contains(std::uint64_t id) const { return slot_of_.find(id) != slot_of_.end(); }
@@ -86,18 +210,17 @@ class DeviceChannelRegistry {
         return it == slot_of_.end() ? kBadSlot : it->second;
     }
 
-    // Release one bound-instance reference. Storage is freed only after the
-    // final ChannelView drops, so a guest handle drop cannot race a live pass.
-    void release(std::uint64_t id) {
+    // Release one bound-instance attachment. Endpoint storage remains owned by
+    // the explicit channel registration until close_endpoint.
+    void release(std::uint64_t id, std::int8_t extern_dir) {
         auto it = slot_of_.find(id);
         if (it == slot_of_.end()) return;
         const std::uint32_t slot = it->second;
-        if (refcounts_[slot] > 1) {
-            --refcounts_[slot];
-            return;
+        if (refcounts_[slot] != 0) --refcounts_[slot];
+        if (extern_dir >= 0) {
+            attachment_direction_masks_[slot] &= static_cast<std::uint8_t>(
+                ~(1u << static_cast<std::uint8_t>(extern_dir)));
         }
-        free_slot(slot);
-        slot_of_.erase(it);
     }
 
     std::size_t size() const { return slot_of_.size(); }
@@ -124,19 +247,169 @@ class DeviceChannelRegistry {
     }
     std::uint32_t host_head(std::uint32_t slot) const { return host_head_[slot]; }
     std::uint32_t host_tail(std::uint32_t slot) const { return host_tail_[slot]; }
+    std::uint64_t channel_id(std::uint32_t slot) const { return id_of_[slot]; }
+    std::uint64_t reader_wait_id(std::uint32_t slot) const {
+        return reader_wait_ids_[slot];
+    }
+    std::uint64_t writer_wait_id(std::uint32_t slot) const {
+        return writer_wait_ids_[slot];
+    }
+    std::uint64_t host_wait_id(std::uint32_t slot) const {
+        return host_role_[slot] == PIE_CHANNEL_HOST_READER
+            ? reader_wait_ids_[slot]
+            : (host_role_[slot] == PIE_CHANNEL_HOST_WRITER
+                   ? writer_wait_ids_[slot]
+                   : 0);
+    }
+    std::uint64_t poison_target(std::uint32_t slot) const {
+        return std::max(reserved_head_[slot], reserved_tail_[slot]) + 1;
+    }
+    void* host_mirror(std::uint32_t slot) const { return host_mirror_[slot]; }
+    std::uint64_t* host_words(std::uint32_t slot) const { return host_words_[slot]; }
+    std::size_t wire_bytes(std::uint32_t slot) const {
+        return host_mirror_bytes_[slot] / host_cap1_[slot];
+    }
+    bool can_publish(std::uint32_t slot) const {
+        const std::uint64_t head =
+            std::atomic_ref<const std::uint64_t>(host_words_[slot][0]).load(
+                std::memory_order_acquire);
+        return head <= reserved_tail_[slot] &&
+               reserved_tail_[slot] - head <
+                   static_cast<std::uint64_t>(host_cap1_[slot] - 1);
+    }
+
+    std::uint64_t schedule_host_publish(
+        std::uint32_t slot,
+        const void* device_ptr,
+        cudaStream_t stream) {
+        const std::uint64_t tail = reserved_tail_[slot]++;
+        const std::size_t bytes = wire_bytes(slot);
+        auto* destination = static_cast<std::uint8_t*>(host_mirror_[slot]) +
+            (tail % host_cap1_[slot]) * bytes;
+        const void* copy_source = device_ptr;
+        if (dtype_[slot] == PIE_CHANNEL_DTYPE_BOOL) {
+            auto* packed = static_cast<std::uint8_t*>(wire_staging_[slot]) +
+                (tail % host_cap1_[slot]) * bytes;
+            constexpr std::uint32_t kThreads = 256;
+            const std::uint32_t blocks = static_cast<std::uint32_t>(
+                (bytes + kThreads - 1) / kThreads);
+            pack_bool_channel_cell<<<blocks, kThreads, 0, stream>>>(
+                static_cast<const std::uint8_t*>(device_ptr),
+                packed,
+                cell_bytes_[slot]);
+            CUDA_CHECK(cudaGetLastError());
+            copy_source = packed;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            destination, copy_source, bytes, cudaMemcpyDeviceToHost, stream));
+        return tail + 1;
+    }
+
+    void finalize_host_publish(
+        std::uint32_t slot,
+        std::uint64_t target_tail,
+        bool failed) {
+        if (failed) {
+            std::atomic_ref<std::uint64_t>(host_words_[slot][2]).store(
+                target_tail == 0 ? 1 : target_tail, std::memory_order_release);
+            return;
+        }
+        std::atomic_ref<std::uint64_t>(host_words_[slot][1]).store(
+            target_tail, std::memory_order_release);
+        std::atomic_ref<std::uint64_t>(host_words_[slot][2]).store(
+            0, std::memory_order_release);
+    }
+
+    std::uint64_t schedule_host_consume(std::uint32_t slot) {
+        return ++reserved_head_[slot];
+    }
+
+    void finalize_host_consume(
+        std::uint32_t slot,
+        std::uint64_t target_head,
+        bool failed) {
+        if (failed) {
+            std::atomic_ref<std::uint64_t>(host_words_[slot][2]).store(
+                target_head == 0 ? 1 : target_head, std::memory_order_release);
+            return;
+        }
+        std::atomic_ref<std::uint64_t>(host_words_[slot][0]).store(
+            target_head, std::memory_order_release);
+    }
 
     // Seed a slot's committed cell contents (host bytes → cell 0), pre-loop.
     void seed_cell(std::uint32_t slot, const void* data, std::size_t bytes) {
-        cudaMemcpy(committed_base(slot), data, bytes, cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(
+            committed_base(slot), data, bytes, cudaMemcpyHostToDevice));
+    }
+
+    void publish_host_seed(std::uint32_t slot, const void* data, std::size_t bytes) {
+        auto* destination = static_cast<std::uint8_t*>(host_mirror_[slot]);
+        if (dtype_[slot] == PIE_CHANNEL_DTYPE_BOOL) {
+            std::memset(destination, 0, wire_bytes(slot));
+            const auto* native = static_cast<const std::uint8_t*>(data);
+            for (std::size_t i = 0; i < bytes; ++i) {
+                if (native[i] != 0) {
+                    destination[i / 8] |= static_cast<std::uint8_t>(1u << (i % 8));
+                }
+            }
+        } else {
+            std::memcpy(destination, data, bytes);
+        }
+        reserved_tail_[slot] = 1;
+        std::atomic_ref<std::uint64_t>(host_words_[slot][1]).store(
+            1, std::memory_order_release);
     }
 
     // Host `put`: fill the committed (head) cell + mark it full (host-fed
     // channel arriving — the direct host→driver path).
     void host_feed(std::uint32_t slot, const void* data, std::size_t bytes) {
-        cudaMemcpy(committed_cell(slot), data, bytes, cudaMemcpyHostToDevice);
+        if (dtype_[slot] == PIE_CHANNEL_DTYPE_BOOL) {
+            std::vector<std::uint8_t> native(cell_bytes_[slot], 0);
+            const auto* packed = static_cast<const std::uint8_t*>(data);
+            for (std::size_t i = 0; i < native.size(); ++i) {
+                native[i] = static_cast<std::uint8_t>(
+                    (packed[i / 8] >> (i % 8)) & 1u);
+            }
+            CUDA_CHECK(cudaMemcpy(
+                committed_cell(slot), native.data(), native.size(),
+                cudaMemcpyHostToDevice));
+        } else {
+            CUDA_CHECK(cudaMemcpy(
+                committed_cell(slot), data, bytes, cudaMemcpyHostToDevice));
+        }
         std::uint8_t one = 1;
-        cudaMemcpy(d_full_ + (std::size_t)slot * kMaxRing + host_head_[slot], &one, 1,
-                   cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(
+            d_full_ + (std::size_t)slot * kMaxRing + host_head_[slot],
+            &one, 1, cudaMemcpyHostToDevice));
+    }
+
+    void host_feed_async(
+        std::uint32_t slot,
+        const void* data,
+        std::size_t bytes,
+        cudaStream_t stream,
+        std::vector<std::vector<std::uint8_t>>& staging) {
+        const void* source = data;
+        std::size_t source_bytes = bytes;
+        if (dtype_[slot] == PIE_CHANNEL_DTYPE_BOOL) {
+            staging.emplace_back(cell_bytes_[slot], 0);
+            auto& native = staging.back();
+            const auto* packed = static_cast<const std::uint8_t*>(data);
+            for (std::size_t i = 0; i < native.size(); ++i) {
+                native[i] = static_cast<std::uint8_t>(
+                    (packed[i / 8] >> (i % 8)) & 1u);
+            }
+            source = native.data();
+            source_bytes = native.size();
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            committed_cell(slot), source, source_bytes,
+            cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemsetAsync(
+            d_full_ + static_cast<std::size_t>(slot) * kMaxRing +
+                host_head_[slot],
+            1, 1, stream));
     }
 
     // Host `take`: read the committed (head) cell, mark it empty, advance head.
@@ -205,7 +478,15 @@ class DeviceChannelRegistry {
   private:
     bool decl_matches(std::uint32_t slot, const Channel& decl) const {
         const std::size_t cb = decl_cell_bytes(decl);
-        return cell_bytes_[slot] == cb && host_cap1_[slot] == cap1_of(decl);
+        return cell_bytes_[slot] == cb &&
+               host_cap1_[slot] == cap1_of(decl) &&
+               dtype_[slot] == static_cast<std::uint8_t>(decl.type.dtype) &&
+               shapes_[slot] == decl.type.shape.dims &&
+               seeded_[slot] == decl.has_seed &&
+               host_role_[slot] ==
+                   (decl.host_reader ? PIE_CHANNEL_HOST_READER
+                                     : (decl.host_visible ? PIE_CHANNEL_HOST_WRITER
+                                                          : PIE_CHANNEL_HOST_NONE));
     }
     static std::uint32_t cap1_of(const Channel& decl) {
         std::uint32_t cap1 = decl.capacity + 1;
@@ -214,6 +495,41 @@ class DeviceChannelRegistry {
     static std::size_t decl_cell_bytes(const Channel& decl) {
         std::size_t cb = decl.type.shape.numel() * dtype_size(decl.type.dtype);
         return cb == 0 ? dtype_size(decl.type.dtype) : cb;
+    }
+
+    static std::uint64_t wire_cell_bytes(const PieChannelDesc& desc) {
+        std::uint64_t numel = 1;
+        for (std::size_t i = 0; i < desc.shape.len; ++i) {
+            if (numel > std::numeric_limits<std::uint64_t>::max() /
+                             desc.shape.ptr[i]) {
+                return 0;
+            }
+            numel *= desc.shape.ptr[i];
+        }
+        if (desc.dtype == PIE_CHANNEL_DTYPE_BOOL) {
+            return numel > std::numeric_limits<std::uint64_t>::max() - 7
+                ? 0
+                : (numel + 7) / 8;
+        }
+        return numel > std::numeric_limits<std::uint64_t>::max() / 4
+            ? 0
+            : numel * 4;
+    }
+
+    static std::uint64_t native_cell_bytes(const PieChannelDesc& desc) {
+        std::uint64_t numel = 1;
+        for (std::size_t i = 0; i < desc.shape.len; ++i) {
+            if (numel > std::numeric_limits<std::uint64_t>::max() /
+                             desc.shape.ptr[i]) {
+                return 0;
+            }
+            numel *= desc.shape.ptr[i];
+        }
+        const std::uint64_t element_bytes =
+            desc.dtype == PIE_CHANNEL_DTYPE_BOOL ? 1 : 4;
+        return numel > std::numeric_limits<std::size_t>::max() / element_bytes
+            ? 0
+            : numel * element_bytes;
     }
 
     std::uint32_t alloc_slot() {
@@ -227,29 +543,38 @@ class DeviceChannelRegistry {
         return next_slot_++;
     }
 
-    void init_slot(std::uint32_t slot, const Channel& decl) {
-        const std::uint32_t cap1 = cap1_of(decl);
-        const std::size_t cb = decl_cell_bytes(decl);
+    void init_slot(std::uint32_t slot, const PieChannelDesc& desc) {
+        const std::uint32_t cap1 = std::min<std::uint32_t>(
+            static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(desc.capacity) + 1),
+            kMaxRing);
+        std::uint64_t numel = 1;
+        for (std::size_t i = 0; i < desc.shape.len; ++i) {
+            numel *= desc.shape.ptr[i];
+        }
+        const std::size_t cb = static_cast<std::size_t>(
+            numel * (desc.dtype == PIE_CHANNEL_DTYPE_BOOL ? 1 : 4));
         cell_bytes_[slot] = cb;
         host_cap1_[slot] = cap1;
-        cudaMalloc(&cell_base_[slot], cb * cap1);
-        cudaMemset(cell_base_[slot], 0, cb * cap1);
-
-        std::uint32_t head0 = 0, tail0 = 0;
-        std::uint8_t full0[kMaxRing];
-        std::memset(full0, 0, kMaxRing);
-        if (decl.has_seed) {
-            // Channel::from(seed): cell 0 committed-full, tail past it.
-            full0[0] = 1;
-            tail0 = 1 % cap1;
-        }
+        CUDA_CHECK(cudaMalloc(&cell_base_[slot], cb * cap1));
+        CUDA_CHECK(cudaMemset(cell_base_[slot], 0, cb * cap1));
+        std::uint32_t head0 = 0;
+        std::uint32_t tail0 = desc.seeded != 0 ? 1 % cap1 : 0;
+        std::uint8_t full0[kMaxRing]{};
+        if (desc.seeded != 0) full0[0] = 1;
         host_head_[slot] = head0;
         host_tail_[slot] = tail0;
-        cudaMemcpy(d_cap1_ + slot, &cap1, sizeof(cap1), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_head_ + slot, &head0, sizeof(head0), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_tail_ + slot, &tail0, sizeof(tail0), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_full_ + (std::size_t)slot * kMaxRing, full0, kMaxRing,
-                   cudaMemcpyHostToDevice);
+        reserved_tail_[slot] = desc.seeded != 0 ? 1 : 0;
+        reserved_head_[slot] = 0;
+        CUDA_CHECK(cudaMemcpy(
+            d_cap1_ + slot, &cap1, sizeof(cap1), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            d_head_ + slot, &head0, sizeof(head0), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            d_tail_ + slot, &tail0, sizeof(tail0), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            d_full_ + static_cast<std::size_t>(slot) * kMaxRing,
+            full0, kMaxRing, cudaMemcpyHostToDevice));
     }
 
     void free_slot(std::uint32_t slot) {
@@ -257,8 +582,28 @@ class DeviceChannelRegistry {
             cudaFree(cell_base_[slot]);
             cell_base_[slot] = nullptr;
         }
+        if (wire_staging_[slot] != nullptr) {
+            cudaFree(wire_staging_[slot]);
+            wire_staging_[slot] = nullptr;
+        }
         cell_bytes_[slot] = 0;
+        if (host_mirror_[slot] != nullptr) {
+            cudaFreeHost(host_mirror_[slot]);
+            host_mirror_[slot] = nullptr;
+        }
+        if (host_words_[slot] != nullptr) {
+            cudaFreeHost(host_words_[slot]);
+            host_words_[slot] = nullptr;
+        }
+        host_mirror_bytes_[slot] = 0;
+        reserved_tail_[slot] = 0;
+        reserved_head_[slot] = 0;
+        shapes_[slot].clear();
+        extern_names_[slot].clear();
+        attachment_direction_masks_[slot] = 0;
         refcounts_[slot] = 0;
+        reader_wait_ids_[slot] = 0;
+        writer_wait_ids_[slot] = 0;
         id_of_[slot] = 0;
         free_slots_.push_back(slot);
     }
@@ -288,7 +633,22 @@ class DeviceChannelRegistry {
         d_full_ = nf; d_head_ = nh; d_tail_ = nt; d_cap1_ = nc;
         cap_slots_ = new_cap;
         cell_base_.resize(new_cap, nullptr);
+        wire_staging_.resize(new_cap, nullptr);
         cell_bytes_.resize(new_cap, 0);
+        host_mirror_.resize(new_cap, nullptr);
+        host_words_.resize(new_cap, nullptr);
+        host_mirror_bytes_.resize(new_cap, 0);
+        reserved_tail_.resize(new_cap, 0);
+        reserved_head_.resize(new_cap, 0);
+        shapes_.resize(new_cap);
+        dtype_.resize(new_cap, 0);
+        host_role_.resize(new_cap, 0);
+        reader_wait_ids_.resize(new_cap, 0);
+        writer_wait_ids_.resize(new_cap, 0);
+        seeded_.resize(new_cap, false);
+        extern_direction_.resize(new_cap, 0);
+        extern_names_.resize(new_cap);
+        attachment_direction_masks_.resize(new_cap, 0);
         refcounts_.resize(new_cap, 0);
         host_head_.resize(new_cap, 0);
         host_tail_.resize(new_cap, 0);
@@ -298,6 +658,9 @@ class DeviceChannelRegistry {
 
     void free_all() {
         for (void* p : cell_base_) if (p) cudaFree(p);
+        for (void* p : wire_staging_) if (p) cudaFree(p);
+        for (void* p : host_mirror_) if (p) cudaFreeHost(p);
+        for (std::uint64_t* p : host_words_) if (p) cudaFreeHost(p);
         if (d_full_) cudaFree(d_full_);
         if (d_head_) cudaFree(d_head_);
         if (d_tail_) cudaFree(d_tail_);
@@ -308,7 +671,19 @@ class DeviceChannelRegistry {
     std::unordered_map<std::uint64_t, std::uint32_t> slot_of_;
     std::vector<std::uint64_t> id_of_;
     std::vector<void*> cell_base_;
+    std::vector<void*> wire_staging_;
     std::vector<std::size_t> cell_bytes_;
+    std::vector<void*> host_mirror_;
+    std::vector<std::uint64_t*> host_words_;
+    std::vector<std::uint64_t> host_mirror_bytes_;
+    std::vector<std::uint64_t> reserved_tail_;
+    std::vector<std::uint64_t> reserved_head_;
+    std::vector<std::vector<std::uint32_t>> shapes_;
+    std::vector<std::uint8_t> dtype_, host_role_, extern_direction_;
+    std::vector<std::uint64_t> reader_wait_ids_, writer_wait_ids_;
+    std::vector<std::string> extern_names_;
+    std::vector<std::uint8_t> attachment_direction_masks_;
+    std::vector<bool> seeded_;
     std::vector<std::uint32_t> refcounts_;
     std::vector<std::uint32_t> host_head_, host_tail_, host_cap1_;
     std::vector<std::uint32_t> free_slots_;
@@ -343,6 +718,8 @@ class ChannelView {
         dense_to_slot_.assign(decls.size(), DeviceChannelRegistry::kBadSlot);
         global_ids_.clear();
         global_ids_.reserve(decls.size());
+        extern_directions_.clear();
+        extern_directions_.reserve(decls.size());
         for (std::size_t i = 0; i < decls.size(); ++i) {
             const std::uint64_t gid =
                 i < channel_ids.size() ? channel_ids[i] : (std::uint64_t)i;
@@ -353,6 +730,7 @@ class ChannelView {
             }
             dense_to_slot_[i] = slot;
             global_ids_.push_back(gid);
+            extern_directions_.push_back(decls[i].extern_dir);
         }
         return true;
     }
@@ -381,14 +759,26 @@ class ChannelView {
 
     // ── dense cell resolution (delegates to the registry via slot) ──
     std::size_t cell_bytes(ChannelId c) const { return reg_->cell_bytes(slot(c)); }
+    std::size_t wire_bytes(ChannelId c) const { return reg_->wire_bytes(slot(c)); }
     void* committed_cell(ChannelId c) { return reg_->committed_cell(slot(c)); }
     void* pending_cell(ChannelId c) { return reg_->pending_cell(slot(c)); }
     void* committed_base(ChannelId c) { return reg_->committed_base(slot(c)); }
     void seed_cell(ChannelId c, const void* data, std::size_t bytes) {
         reg_->seed_cell(slot(c), data, bytes);
     }
+    void publish_host_seed(ChannelId c, const void* data, std::size_t bytes) {
+        reg_->publish_host_seed(slot(c), data, bytes);
+    }
     void host_feed(ChannelId c, const void* data, std::size_t bytes) {
         reg_->host_feed(slot(c), data, bytes);
+    }
+    void host_feed_async(
+        ChannelId c,
+        const void* data,
+        std::size_t bytes,
+        cudaStream_t stream,
+        std::vector<std::vector<std::uint8_t>>& staging) {
+        reg_->host_feed_async(slot(c), data, bytes, stream, staging);
     }
     void host_take(ChannelId c, void* out, std::size_t bytes) {
         reg_->host_take(slot(c), out, bytes);
@@ -413,16 +803,20 @@ class ChannelView {
   private:
     void release_all() {
         if (reg_ != nullptr) {
-            for (std::uint64_t id : global_ids_) reg_->release(id);
+            for (std::size_t i = 0; i < global_ids_.size(); ++i) {
+                reg_->release(global_ids_[i], extern_directions_[i]);
+            }
         }
         reg_ = nullptr;
         dense_to_slot_.clear();
         global_ids_.clear();
+        extern_directions_.clear();
     }
 
     DeviceChannelRegistry* reg_ = nullptr;
     std::vector<std::uint32_t> dense_to_slot_;
     std::vector<std::uint64_t> global_ids_;
+    std::vector<std::int8_t> extern_directions_;
 };
 
 }  // namespace pie_cuda_driver::ptir

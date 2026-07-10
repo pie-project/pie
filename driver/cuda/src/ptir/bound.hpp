@@ -127,6 +127,8 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
         out.has_seed = ch.seeded != 0;
         out.host_visible = ch.host_role != PTIR_HOST_NONE;
         out.host_reader = ch.host_role == PTIR_HOST_READER;
+        out.extern_dir = ch.extern_dir;
+        out.extern_name = ch.extern_name;
         t.channels.push_back(out);
     }
     for (const container::CPort& p : c.ports)

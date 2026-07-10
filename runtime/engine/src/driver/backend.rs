@@ -6,19 +6,21 @@ use crate::driver::ffi::cuda::CudaDriver;
 #[cfg(feature = "driver-metal")]
 use crate::driver::ffi::metal::MetalDriver;
 use crate::driver::frame::{
-    BoundInstance, InstanceBindingPlan, KvCopyPlan, LaunchSubmission, PoolResizePlan,
-    ProgramRegistration, StateCopyPlan,
+    BoundInstance, ChannelRegistrationPlan, InstanceBindingPlan, KvCopyPlan, LaunchSubmission,
+    PoolResizePlan, ProgramRegistration, RegisteredChannel, StateCopyPlan,
 };
 
 pub trait LocalDriver: Send {
     fn capabilities(&self) -> &pie_driver_abi::DriverCapabilities;
     fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64>;
+    fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel>;
     fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance>;
     fn launch(&mut self, desc: &LaunchSubmission) -> Result<Completion>;
     fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<Completion>;
     fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<Completion>;
     fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<Completion>;
     fn close_instance(&mut self, id: u64) -> Result<()>;
+    fn close_channel(&mut self, id: u64) -> Result<()>;
 }
 
 pub enum NativeDriver {
@@ -80,6 +82,16 @@ impl LocalDriver for NativeDriver {
         }
     }
 
+    fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
+        match self {
+            Self::Dummy(driver) => driver.register_channel(desc),
+            #[cfg(feature = "driver-cuda")]
+            Self::Cuda(driver) => driver.register_channel(desc),
+            #[cfg(feature = "driver-metal")]
+            Self::Metal(driver) => driver.register_channel(desc),
+        }
+    }
+
     fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
         match self {
             Self::Dummy(driver) => driver.bind_instance(desc),
@@ -137,6 +149,16 @@ impl LocalDriver for NativeDriver {
             Self::Cuda(driver) => driver.close_instance(id),
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.close_instance(id),
+        }
+    }
+
+    fn close_channel(&mut self, id: u64) -> Result<()> {
+        match self {
+            Self::Dummy(driver) => driver.close_channel(id),
+            #[cfg(feature = "driver-cuda")]
+            Self::Cuda(driver) => driver.close_channel(id),
+            #[cfg(feature = "driver-metal")]
+            Self::Metal(driver) => driver.close_channel(id),
         }
     }
 }

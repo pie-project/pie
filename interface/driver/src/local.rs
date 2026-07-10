@@ -33,6 +33,31 @@ pub const PIE_RS_FLAG_RESET: u8 = 1;
 /// Fold buffered recurrent-state data into the slot after the pass.
 pub const PIE_RS_FLAG_FOLD: u8 = 2;
 
+/// Concrete F32 channel element type.
+pub const PIE_CHANNEL_DTYPE_F32: u8 = 0;
+/// Concrete I32 channel element type.
+pub const PIE_CHANNEL_DTYPE_I32: u8 = 1;
+/// Concrete U32 channel element type.
+pub const PIE_CHANNEL_DTYPE_U32: u8 = 2;
+/// Concrete boolean channel element type.
+pub const PIE_CHANNEL_DTYPE_BOOL: u8 = 3;
+/// Driver-resolved activation channel element type.
+pub const PIE_CHANNEL_DTYPE_ACT: u8 = 4;
+
+/// Channel has no host endpoint.
+pub const PIE_CHANNEL_HOST_ROLE_NONE: u8 = 0;
+/// Host produces values consumed by the device program.
+pub const PIE_CHANNEL_HOST_ROLE_WRITER: u8 = 1;
+/// Device program produces values consumed by the host.
+pub const PIE_CHANNEL_HOST_ROLE_READER: u8 = 2;
+
+/// Channel is private to one bound instance.
+pub const PIE_CHANNEL_EXTERN_NONE: u8 = 0;
+/// Bound program consumes an externally produced channel.
+pub const PIE_CHANNEL_EXTERN_IMPORT: u8 = 1;
+/// Bound program produces an externally consumed channel.
+pub const PIE_CHANNEL_EXTERN_EXPORT: u8 = 2;
+
 /// Memory domain tag for local KV residency copies.
 pub type PieMemoryDomain = u32;
 
@@ -98,22 +123,101 @@ pub struct PieU64Slice {
     pub len: usize,
 }
 
-/// Per-channel runtime wait ids registered at bind time.
+/// Terminal completion outcome published by the native driver.
+pub type PieTerminalOutcome = u32;
+
+/// The operation has not reached a terminal state yet.
+pub const PIE_TERMINAL_OUTCOME_PENDING: PieTerminalOutcome = 0;
+/// The operation completed successfully.
+pub const PIE_TERMINAL_OUTCOME_SUCCESS: PieTerminalOutcome = 1;
+/// The operation completed unsuccessfully.
+pub const PIE_TERMINAL_OUTCOME_FAILED: PieTerminalOutcome = 2;
+
+/// Host-visible terminal control cell.
+///
+/// The `outcome` word is published with release semantics by the driver and
+/// read with acquire semantics by the runtime.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PieChannelWait {
-    pub reader_wait_id: u64,
-    pub writer_wait_id: u64,
+pub struct PieTerminalCell {
+    pub outcome: PieTerminalOutcome,
+    /// Must be zero in ABI v1.
+    pub reserved0: u32,
 }
 
-/// Borrowed immutable slice of [`PieChannelWait`].
+/// Borrowed immutable slice of terminal-cell pointers.
 ///
-/// `ptr` may be null only when `len == 0`.
+/// The slice storage may be null only when `len == 0`. Each element must point
+/// at a distinct, properly aligned [`PieTerminalCell`] that remains stable until
+/// the corresponding accepted operation retires.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PieChannelWaitSlice {
-    pub ptr: *const PieChannelWait,
+pub struct PieTerminalCellPtrSlice {
+    pub ptr: *const *mut PieTerminalCell,
     pub len: usize,
+}
+
+/// Persistent channel endpoint registration descriptor.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieChannelDesc {
+    pub abi_version: u32,
+    /// Must be zero in ABI v1.
+    pub reserved0: u32,
+    pub channel_id: u64,
+    pub shape: PieU32Slice,
+    /// One of `PIE_CHANNEL_DTYPE_*`.
+    pub dtype: u8,
+    /// One of `PIE_CHANNEL_HOST_ROLE_*`.
+    pub host_role: u8,
+    /// Must be 0 or 1.
+    pub seeded: u8,
+    /// One of `PIE_CHANNEL_EXTERN_*`.
+    pub extern_dir: u8,
+    pub capacity: u32,
+    /// Must be zero in ABI v1.
+    pub reserved1: u32,
+    pub reader_wait_id: u64,
+    pub writer_wait_id: u64,
+    /// Canonical extern binding name. Empty for private channels.
+    pub extern_name: PieBytes,
+}
+
+impl Default for PieChannelDesc {
+    fn default() -> Self {
+        Self {
+            abi_version: PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            channel_id: 0,
+            shape: PieU32Slice::default(),
+            dtype: PIE_CHANNEL_DTYPE_F32,
+            host_role: PIE_CHANNEL_HOST_ROLE_NONE,
+            seeded: 0,
+            extern_dir: PIE_CHANNEL_EXTERN_NONE,
+            capacity: 0,
+            reserved1: 0,
+            reader_wait_id: 0,
+            writer_wait_id: 0,
+            extern_name: PieBytes::default(),
+        }
+    }
+}
+
+/// Stable driver-owned host endpoint returned by channel registration.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieChannelEndpointBinding {
+    pub channel_id: u64,
+    pub mirror_base: u64,
+    pub word_base: u64,
+    pub mirror_bytes: u64,
+    pub word_bytes: u64,
+    pub cell_bytes: u32,
+    pub capacity: u32,
+    pub head_word_index: u32,
+    pub tail_word_index: u32,
+    pub poison_word_index: u32,
+    pub closed_word_index: u32,
 }
 
 /// One channel-value payload used for PTIR seeds and host puts.
@@ -131,31 +235,6 @@ pub struct PieChannelValueDesc {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PieChannelValueDescSlice {
     pub ptr: *const PieChannelValueDesc,
-    pub len: usize,
-}
-
-/// Stable bound layout for one host-visible channel.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PieChannelBinding {
-    pub channel_id: u64,
-    pub cell_bytes: u32,
-    pub capacity: u32,
-    pub mirror_offset: u64,
-    pub head_word_index: u32,
-    pub tail_word_index: u32,
-    pub poison_word_index: u32,
-    pub reserved: u32,
-}
-
-/// Slice of driver-owned [`PieChannelBinding`] records.
-///
-/// The pointer remains valid until `close_instance` for the bound instance.
-/// `ptr` may be null only when `len == 0`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PieChannelBindingSlice {
-    pub ptr: *const PieChannelBinding,
     pub len: usize,
 }
 
@@ -260,7 +339,13 @@ impl Default for PieRuntimeCallbacks {
 pub struct PieCompletion {
     pub wait_id: u64,
     pub target_epoch: u64,
+    /// Stable terminal control cell for value-less operations. Launch batches
+    /// use the per-member `PieLaunchDesc::terminal_cells` instead.
+    pub terminal_cell: *mut PieTerminalCell,
 }
+
+unsafe impl Send for PieCompletion {}
+unsafe impl Sync for PieCompletion {}
 
 /// Driver creation descriptor.
 #[repr(C)]
@@ -327,7 +412,6 @@ pub struct PieInstanceDesc {
     pub program_id: u64,
     pub requested_instance_id: u64,
     pub pacing_wait_id: u64,
-    pub channel_waits: PieChannelWaitSlice,
     pub channel_ids: PieU64Slice,
     pub seed_values: PieChannelValueDescSlice,
 }
@@ -340,28 +424,17 @@ impl Default for PieInstanceDesc {
             program_id: 0,
             requested_instance_id: 0,
             pacing_wait_id: 0,
-            channel_waits: PieChannelWaitSlice::default(),
             channel_ids: PieU64Slice::default(),
             seed_values: PieChannelValueDescSlice::default(),
         }
     }
 }
 
-/// Stable addresses and counts returned from `*_bind_instance`.
+/// Driver-assigned identity returned from `*_bind_instance`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PieInstanceBinding {
     pub instance_id: u64,
-    pub frame_base: u64,
-    pub mirror_base: u64,
-    pub word_base: u64,
-    pub channel_count: u32,
-    pub word_count: u32,
-    pub frame_bytes: u64,
-    pub mirror_bytes: u64,
-    pub word_bytes: u64,
-    /// Driver-owned channel layout table, valid until `close_instance`.
-    pub channels: PieChannelBindingSlice,
 }
 
 /// One batched launch descriptor.
@@ -373,6 +446,8 @@ pub struct PieLaunchDesc {
     pub reserved0: u32,
     /// Bound instance ids, one per fire/program in scheduler order.
     pub instance_ids: PieU64Slice,
+    /// Stable terminal control cell addresses, one per `instance_ids` member.
+    pub terminal_cells: PieTerminalCellPtrSlice,
     pub token_ids: PieU32Slice,
     pub position_ids: PieU32Slice,
     pub kv_page_indices: PieU32Slice,
@@ -423,6 +498,7 @@ impl Default for PieLaunchDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
             instance_ids: PieU64Slice::default(),
+            terminal_cells: PieTerminalCellPtrSlice::default(),
             token_ids: PieU32Slice::default(),
             position_ids: PieU32Slice::default(),
             kv_page_indices: PieU32Slice::default(),
@@ -589,6 +665,14 @@ const fn bool_field_is_valid(value: u8) -> bool {
     value <= 1
 }
 
+/// Returns true when `outcome` is a valid [`PieTerminalOutcome`] discriminant.
+pub const fn pie_terminal_outcome_is_valid(outcome: PieTerminalOutcome) -> bool {
+    matches!(
+        outcome,
+        PIE_TERMINAL_OUTCOME_PENDING | PIE_TERMINAL_OUTCOME_SUCCESS | PIE_TERMINAL_OUTCOME_FAILED
+    )
+}
+
 /// Returns true when `domain` is a valid [`PieMemoryDomain`] discriminant.
 pub const fn pie_memory_domain_is_valid(domain: PieMemoryDomain) -> bool {
     matches!(
@@ -663,6 +747,19 @@ fn validate_bytes(bytes: PieBytes, name: &'static str) -> PieAbiValidationResult
     validate_slice_ptr(bytes.ptr, bytes.len, name)
 }
 
+fn validate_terminal_cell_ptr(
+    ptr: *mut PieTerminalCell,
+    name: &'static str,
+) -> PieAbiValidationResult {
+    if ptr.is_null() {
+        return Err(invalid_argument(name));
+    }
+    if (ptr as usize) % std::mem::align_of::<PieTerminalCell>() != 0 {
+        return Err(invalid_argument(name));
+    }
+    Ok(())
+}
+
 fn validate_u8_slice(slice: PieU8Slice, name: &'static str) -> PieAbiValidationResult {
     validate_slice_ptr(slice.ptr, slice.len, name)
 }
@@ -675,22 +772,23 @@ fn validate_u64_slice(slice: PieU64Slice, name: &'static str) -> PieAbiValidatio
     validate_slice_ptr(slice.ptr, slice.len, name)
 }
 
-fn validate_channel_wait_slice(
-    slice: PieChannelWaitSlice,
+fn validate_terminal_cell_ptr_slice(
+    slice: PieTerminalCellPtrSlice,
     name: &'static str,
 ) -> PieAbiValidationResult {
-    validate_slice_ptr(slice.ptr, slice.len, name)
+    validate_slice_ptr(slice.ptr, slice.len, name)?;
+    if slice.len == 0 {
+        return Ok(());
+    }
+    let ptrs = unsafe { std::slice::from_raw_parts(slice.ptr, slice.len) };
+    for &cell in ptrs {
+        validate_terminal_cell_ptr(cell, name)?;
+    }
+    Ok(())
 }
 
 fn validate_channel_value_desc_slice(
     slice: PieChannelValueDescSlice,
-    name: &'static str,
-) -> PieAbiValidationResult {
-    validate_slice_ptr(slice.ptr, slice.len, name)
-}
-
-fn validate_channel_binding_slice(
-    slice: PieChannelBindingSlice,
     name: &'static str,
 ) -> PieAbiValidationResult {
     validate_slice_ptr(slice.ptr, slice.len, name)
@@ -848,10 +946,6 @@ pub fn validate_program_desc(desc: &PieProgramDesc) -> PieAbiValidationResult {
 pub unsafe fn validate_instance_desc(desc: &PieInstanceDesc) -> PieAbiValidationResult {
     validate_pie_abi_version(desc.abi_version)?;
     validate_reserved_zero("instance reserved0 must be zero", desc.reserved0)?;
-    validate_channel_wait_slice(
-        desc.channel_waits,
-        "instance channel_waits ptr/len mismatch",
-    )?;
     validate_u64_slice(desc.channel_ids, "instance channel_ids ptr/len mismatch")?;
     unsafe {
         validate_nested_channel_values(
@@ -862,12 +956,136 @@ pub unsafe fn validate_instance_desc(desc: &PieInstanceDesc) -> PieAbiValidation
     }
 }
 
+/// Validates a persistent channel endpoint registration descriptor.
+pub unsafe fn validate_channel_desc(desc: &PieChannelDesc) -> PieAbiValidationResult {
+    validate_pie_abi_version(desc.abi_version)?;
+    validate_reserved_zero("channel reserved0 must be zero", desc.reserved0)?;
+    validate_reserved_zero("channel reserved1 must be zero", desc.reserved1)?;
+    if desc.channel_id == 0 {
+        return Err(invalid_argument("channel id must be nonzero"));
+    }
+    validate_u32_slice(desc.shape, "channel shape ptr/len mismatch")?;
+    if desc.dtype > PIE_CHANNEL_DTYPE_ACT {
+        return Err(invalid_argument("channel dtype is invalid"));
+    }
+    if desc.host_role > PIE_CHANNEL_HOST_ROLE_READER {
+        return Err(invalid_argument("channel host_role is invalid"));
+    }
+    validate_bool_field("channel seeded must be 0 or 1", desc.seeded)?;
+    if desc.extern_dir > PIE_CHANNEL_EXTERN_EXPORT {
+        return Err(invalid_argument("channel extern_dir is invalid"));
+    }
+    if desc.capacity == 0 {
+        return Err(invalid_argument("channel capacity must be nonzero"));
+    }
+    if desc.reader_wait_id == 0
+        || desc.writer_wait_id == 0
+        || desc.reader_wait_id == desc.writer_wait_id
+    {
+        return Err(invalid_argument(
+            "channel reader and writer wait ids must be nonzero and distinct",
+        ));
+    }
+    validate_bytes(desc.extern_name, "channel extern_name ptr/len mismatch")?;
+    if desc.extern_dir == PIE_CHANNEL_EXTERN_NONE {
+        if desc.extern_name.len != 0 {
+            return Err(invalid_argument(
+                "private channel must not have an extern name",
+            ));
+        }
+    } else if desc.extern_name.len == 0
+        || desc.host_role != PIE_CHANNEL_HOST_ROLE_NONE
+        || desc.seeded != 0
+    {
+        return Err(invalid_argument(
+            "extern channel requires a name, no host role, and no seed",
+        ));
+    }
+    if desc.shape.len != 0 {
+        let shape = unsafe { std::slice::from_raw_parts(desc.shape.ptr, desc.shape.len) };
+        if shape.contains(&0) {
+            return Err(invalid_argument("channel shape dimensions must be nonzero"));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a driver-owned channel endpoint binding.
+pub fn validate_channel_endpoint_binding(
+    binding: &PieChannelEndpointBinding,
+    desc: &PieChannelDesc,
+) -> PieAbiValidationResult {
+    if binding.channel_id != desc.channel_id {
+        return Err(invalid_argument("channel binding id mismatch"));
+    }
+    if binding.mirror_base == 0 || binding.word_base == 0 {
+        return Err(invalid_argument("channel binding bases must be nonzero"));
+    }
+    if binding.cell_bytes == 0 || binding.capacity != desc.capacity {
+        return Err(invalid_argument("channel binding geometry mismatch"));
+    }
+    let ring_cells = u64::from(desc.capacity)
+        .checked_add(1)
+        .ok_or_else(|| invalid_argument("channel binding ring size overflow"))?;
+    let expected_mirror = u64::from(binding.cell_bytes)
+        .checked_mul(ring_cells)
+        .ok_or_else(|| invalid_argument("channel binding mirror size overflow"))?;
+    if binding.mirror_bytes < expected_mirror
+        || binding.word_bytes < 4 * std::mem::size_of::<u64>() as u64
+    {
+        return Err(invalid_argument("channel binding storage is undersized"));
+    }
+    let indices = [
+        binding.head_word_index,
+        binding.tail_word_index,
+        binding.poison_word_index,
+        binding.closed_word_index,
+    ];
+    if indices
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != indices.len()
+        || indices
+            .iter()
+            .any(|&index| u64::from(index) * 8 >= binding.word_bytes)
+    {
+        return Err(invalid_argument("channel binding word layout is invalid"));
+    }
+    Ok(())
+}
+
 /// Validates a driver-owned instance-binding record returned from bind.
 pub fn validate_instance_binding(binding: &PieInstanceBinding) -> PieAbiValidationResult {
-    validate_channel_binding_slice(
-        binding.channels,
-        "instance binding channels ptr/len mismatch",
-    )
+    if binding.instance_id == 0 {
+        return Err(invalid_argument("instance binding id must be nonzero"));
+    }
+    Ok(())
+}
+
+/// Validates an operation completion descriptor.
+pub fn validate_completion(
+    completion: PieCompletion,
+    require_terminal_cell: bool,
+) -> PieAbiValidationResult {
+    if completion.wait_id == 0 {
+        return Err(invalid_argument("completion wait_id must be nonzero"));
+    }
+    if completion.target_epoch == 0 {
+        return Err(invalid_argument("completion target_epoch must be nonzero"));
+    }
+    if require_terminal_cell {
+        validate_terminal_cell_ptr(
+            completion.terminal_cell,
+            "completion terminal_cell must be non-null and aligned",
+        )?;
+    } else if !completion.terminal_cell.is_null() {
+        return Err(invalid_argument(
+            "launch completion terminal_cell must be null",
+        ));
+    }
+    Ok(())
 }
 
 /// Validates a launch descriptor.
@@ -881,6 +1099,10 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
     validate_pie_abi_version(desc.abi_version)?;
     validate_reserved_zero("launch reserved0 must be zero", desc.reserved0)?;
     validate_u64_slice(desc.instance_ids, "launch instance_ids ptr/len mismatch")?;
+    validate_terminal_cell_ptr_slice(
+        desc.terminal_cells,
+        "launch terminal_cells ptr/len mismatch",
+    )?;
     validate_u32_slice(desc.token_ids, "launch token_ids ptr/len mismatch")?;
     validate_u32_slice(desc.position_ids, "launch position_ids ptr/len mismatch")?;
     validate_u32_slice(
@@ -946,6 +1168,30 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
     validate_u64_slice(desc.kv_len_device, "launch kv_len_device ptr/len mismatch")?;
 
     let request_count = desc.instance_ids.len;
+    validate_row_count_u32(
+        desc.terminal_cells.len,
+        "launch terminal_cells length must match batch size",
+        request_count,
+        false,
+    )?;
+    if request_count != 0 {
+        let instance_ids =
+            unsafe { std::slice::from_raw_parts(desc.instance_ids.ptr, desc.instance_ids.len) };
+        let terminal_cells =
+            unsafe { std::slice::from_raw_parts(desc.terminal_cells.ptr, desc.terminal_cells.len) };
+        for index in 0..request_count {
+            if instance_ids[..index].contains(&instance_ids[index]) {
+                return Err(invalid_argument(
+                    "launch instance_ids must not contain duplicates",
+                ));
+            }
+            if terminal_cells[..index].contains(&terminal_cells[index]) {
+                return Err(invalid_argument(
+                    "launch terminal_cells must point to distinct cells",
+                ));
+            }
+        }
+    }
     if desc.position_ids.len != desc.token_ids.len {
         return Err(invalid_argument(
             "launch position_ids length must match token_ids length",
@@ -1177,6 +1423,11 @@ unsafe extern "C" {
         program: *const PieProgramDesc,
         program_id: *mut u64,
     ) -> i32;
+    pub fn pie_cuda_register_channel(
+        driver: *mut PieDriver,
+        channel: *const PieChannelDesc,
+        binding: *mut PieChannelEndpointBinding,
+    ) -> i32;
     pub fn pie_cuda_bind_instance(
         driver: *mut PieDriver,
         instance: *const PieInstanceDesc,
@@ -1203,6 +1454,7 @@ unsafe extern "C" {
         completion: PieCompletion,
     ) -> i32;
     pub fn pie_cuda_close_instance(driver: *mut PieDriver, instance_id: u64) -> i32;
+    pub fn pie_cuda_close_channel(driver: *mut PieDriver, channel_id: u64) -> i32;
     pub fn pie_cuda_destroy(driver: *mut PieDriver);
 }
 
@@ -1215,6 +1467,11 @@ unsafe extern "C" {
         driver: *mut PieDriver,
         program: *const PieProgramDesc,
         program_id: *mut u64,
+    ) -> i32;
+    pub fn pie_metal_register_channel(
+        driver: *mut PieDriver,
+        channel: *const PieChannelDesc,
+        binding: *mut PieChannelEndpointBinding,
     ) -> i32;
     pub fn pie_metal_bind_instance(
         driver: *mut PieDriver,
@@ -1242,6 +1499,7 @@ unsafe extern "C" {
         completion: PieCompletion,
     ) -> i32;
     pub fn pie_metal_close_instance(driver: *mut PieDriver, instance_id: u64) -> i32;
+    pub fn pie_metal_close_channel(driver: *mut PieDriver, channel_id: u64) -> i32;
     pub fn pie_metal_destroy(driver: *mut PieDriver);
 }
 
@@ -1351,22 +1609,89 @@ mod tests {
     }
 
     #[test]
-    fn instance_binding_defaults_keep_channel_mapping_at_bind() {
+    fn instance_binding_is_identity_only() {
         let instance = PieInstanceDesc::default();
         assert!(instance.channel_ids.ptr.is_null());
         assert_eq!(instance.channel_ids.len, 0);
         assert!(instance.seed_values.ptr.is_null());
         assert_eq!(instance.seed_values.len, 0);
 
-        let binding = PieInstanceBinding::default();
-        assert!(binding.channels.ptr.is_null());
-        assert_eq!(binding.channels.len, 0);
+        assert_eq!(PieInstanceBinding::default().instance_id, 0);
     }
 
     #[test]
     fn completion_layout_is_stable() {
-        assert_eq!(std::mem::size_of::<PieCompletion>(), 16);
+        assert_eq!(std::mem::size_of::<PieCompletion>(), 24);
         assert_eq!(std::mem::align_of::<PieCompletion>(), 8);
+    }
+
+    #[test]
+    fn completion_validator_enforces_terminal_cell_mode() {
+        let mut cell = PieTerminalCell {
+            outcome: PIE_TERMINAL_OUTCOME_PENDING,
+            reserved0: 0,
+        };
+        let control = PieCompletion {
+            wait_id: 1,
+            target_epoch: 1,
+            terminal_cell: &mut cell,
+        };
+        validate_completion(control, true).unwrap();
+        assert!(validate_completion(control, false).is_err());
+
+        let launch = PieCompletion {
+            terminal_cell: std::ptr::null_mut(),
+            ..control
+        };
+        validate_completion(launch, false).unwrap();
+        assert!(validate_completion(launch, true).is_err());
+    }
+
+    #[test]
+    fn launch_validator_rejects_duplicate_members_and_terminal_cells() {
+        let instance_ids = [7u64, 7];
+        let mut terminal_cells = [
+            PieTerminalCell {
+                outcome: PIE_TERMINAL_OUTCOME_PENDING,
+                reserved0: 0,
+            },
+            PieTerminalCell {
+                outcome: PIE_TERMINAL_OUTCOME_PENDING,
+                reserved0: 0,
+            },
+        ];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
+        let launch = PieLaunchDesc {
+            instance_ids: PieU64Slice {
+                ptr: instance_ids.as_ptr(),
+                len: instance_ids.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_ptrs.as_ptr(),
+                len: terminal_ptrs.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        assert!(err.message().contains("instance_ids"));
+
+        let distinct_instance_ids = [7u64, 8];
+        let duplicate_terminal_ptrs = [terminal_ptrs[0], terminal_ptrs[0]];
+        let launch = PieLaunchDesc {
+            instance_ids: PieU64Slice {
+                ptr: distinct_instance_ids.as_ptr(),
+                len: distinct_instance_ids.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: duplicate_terminal_ptrs.as_ptr(),
+                len: duplicate_terminal_ptrs.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        assert!(err.message().contains("distinct"));
     }
 
     #[test]
@@ -1420,36 +1745,12 @@ mod tests {
             PIE_STATUS_INVALID_ARGUMENT
         );
         assert_eq!(
-            validate_channel_wait_slice(
-                PieChannelWaitSlice {
-                    ptr: std::ptr::null(),
-                    len: 1,
-                },
-                "waits",
-            )
-            .unwrap_err()
-            .status(),
-            PIE_STATUS_INVALID_ARGUMENT
-        );
-        assert_eq!(
             validate_channel_value_desc_slice(
                 PieChannelValueDescSlice {
                     ptr: std::ptr::null(),
                     len: 1,
                 },
                 "channel values",
-            )
-            .unwrap_err()
-            .status(),
-            PIE_STATUS_INVALID_ARGUMENT
-        );
-        assert_eq!(
-            validate_channel_binding_slice(
-                PieChannelBindingSlice {
-                    ptr: std::ptr::null(),
-                    len: 1,
-                },
-                "bindings",
             )
             .unwrap_err()
             .status(),
@@ -1557,6 +1858,10 @@ mod tests {
     #[test]
     fn launch_validator_rejects_malformed_qo_indptr() {
         let instance_ids = [11u64, 12];
+        let mut terminal_cells = [PieTerminalCell::default(), PieTerminalCell::default()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let tokens = [1u32, 2, 3];
         let positions = [4u32, 5, 6];
         let qo_indptr = [0u32, 2];
@@ -1564,6 +1869,10 @@ mod tests {
             instance_ids: PieU64Slice {
                 ptr: instance_ids.as_ptr(),
                 len: instance_ids.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_ptrs.as_ptr(),
+                len: terminal_ptrs.len(),
             },
             token_ids: PieU32Slice {
                 ptr: tokens.as_ptr(),
@@ -1587,6 +1896,10 @@ mod tests {
     #[test]
     fn launch_validator_rejects_malformed_mask_relationships() {
         let instance_ids = [41u64];
+        let mut terminal_cells = [PieTerminalCell::default()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let tokens = [7u32];
         let positions = [9u32];
         let qo_indptr = [0u32, 1];
@@ -1596,6 +1909,10 @@ mod tests {
             instance_ids: PieU64Slice {
                 ptr: instance_ids.as_ptr(),
                 len: instance_ids.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_ptrs.as_ptr(),
+                len: terminal_ptrs.len(),
             },
             token_ids: PieU32Slice {
                 ptr: tokens.as_ptr(),
@@ -1630,6 +1947,10 @@ mod tests {
     #[test]
     fn launch_validator_rejects_image_count_mismatches() {
         let instance_ids = [51u64];
+        let mut terminal_cells = [PieTerminalCell::default()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
         let tokens = [1u32];
         let positions = [2u32];
         let qo_indptr = [0u32, 1];
@@ -1640,6 +1961,10 @@ mod tests {
             instance_ids: PieU64Slice {
                 ptr: instance_ids.as_ptr(),
                 len: instance_ids.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_ptrs.as_ptr(),
+                len: terminal_ptrs.len(),
             },
             token_ids: PieU32Slice {
                 ptr: tokens.as_ptr(),
@@ -1714,13 +2039,22 @@ mod tests {
         let program = header_block(&header, "PieProgramDesc");
         let instance = header_block(&header, "PieInstanceDesc");
         let binding = header_block(&header, "PieInstanceBinding");
+        let terminal_cell = header_block(&header, "PieTerminalCell");
+        let terminal_cell_ptr_slice = header_block(&header, "PieTerminalCellPtrSlice");
         let launch = header_block(&header, "PieLaunchDesc");
+        let completion = header_block(&header, "PieCompletion");
         let kv_copy = header_block(&header, "PieKvCopyDesc");
         let state_copy = header_block(&header, "PieStateCopyDesc");
         let pool_resize = header_block(&header, "PiePoolResizeDesc");
 
+        assert!(header.contains("typedef uint32_t PieTerminalOutcome;"));
+        assert!(terminal_cell.contains("PieTerminalOutcome outcome;"));
+        assert!(terminal_cell.contains("uint32_t reserved0;"));
+        assert!(terminal_cell_ptr_slice.contains("struct PieTerminalCell *const *ptr;"));
         assert!(launch.contains("struct PieU64Slice instance_ids;"));
+        assert!(launch.contains("struct PieTerminalCellPtrSlice terminal_cells;"));
         assert!(launch.contains("struct PieU32Slice host_put_indptr;"));
+        assert!(completion.contains("struct PieTerminalCell *terminal_cell;"));
         assert!(launch.contains("uint32_t reserved0;"));
         assert!(launch.contains("uint8_t reserved_flags[6];"));
         assert!(runtime.contains("uint32_t reserved0;"));
@@ -1730,9 +2064,9 @@ mod tests {
         assert!(program.contains("uint32_t reserved0;"));
         assert!(instance.contains("struct PieU64Slice channel_ids;"));
         assert!(!program.contains("channel_ids"));
-        assert!(header.contains("typedef struct PieChannelBinding {"));
-        assert!(header.contains("typedef struct PieChannelBindingSlice {"));
-        assert!(binding.contains("struct PieChannelBindingSlice channels;"));
+        assert!(binding.contains("uint64_t instance_id;"));
+        assert!(!header.contains("typedef struct PieChannelBinding"));
+        assert!(!header.contains("PieChannelWait"));
         assert!(kv_copy.contains("uint32_t reserved0;"));
         assert!(kv_copy.contains("struct PieU32Slice src_page_ids;"));
         assert!(kv_copy.contains("struct PieU32Slice dst_page_ids;"));

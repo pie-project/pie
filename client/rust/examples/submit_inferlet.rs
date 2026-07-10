@@ -76,7 +76,7 @@ pub async fn submit_inferlet(
         .with_context(|| format!("add_program {inferlet}"))?;
 
     let mut proc = client
-        .launch_process(inferlet.to_string(), input.to_string(), true, None)
+        .launch_process(inferlet.to_string(), input.to_string(), true)
         .await
         .with_context(|| format!("launch_process {inferlet}"))?;
 
