@@ -10,9 +10,9 @@ use pie_engine::bootstrap::{
 };
 use pie_engine::driver::{NativeDriver, SchedulerLimits};
 
-use super::mock_device::{Behavior, MockBackend};
+use super::mock_device::{Behavior, MockBackend, launch_observer};
 
-fn native_dummy_driver(num_pages: usize) -> NativeDriver {
+fn native_dummy_driver(num_pages: usize, behavior: Arc<dyn Behavior>) -> NativeDriver {
     let (native, _) = NativeDriver::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_pages as u32,
         kv_page_size: 16,
@@ -30,6 +30,7 @@ fn native_dummy_driver(num_pages: usize) -> NativeDriver {
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
         operation_log: None,
+        launch_observer: Some(launch_observer(behavior)),
     })
     .expect("create dummy native driver");
     native
@@ -40,6 +41,7 @@ pub struct MockEnv {
     model_name: String,
     num_devices: usize,
     num_pages: usize,
+    behavior: Arc<dyn Behavior>,
     temp_cache: TempDir,
     temp_auth: TempDir,
 }
@@ -61,7 +63,7 @@ impl MockEnv {
                     max_forward_tokens: 4096,
                     max_page_refs: self.num_pages,
                 },
-                native_driver: native_dummy_driver(self.num_pages),
+                native_driver: native_dummy_driver(self.num_pages, self.behavior.clone()),
             })
             .collect();
 
@@ -118,10 +120,11 @@ pub fn create_mock_env(
     behavior: Arc<dyn Behavior>,
 ) -> MockEnv {
     MockEnv {
-        backend: MockBackend::new(num_devices, behavior),
+        backend: MockBackend::new(num_devices, behavior.clone()),
         model_name: model_name.to_string(),
         num_devices,
         num_pages,
+        behavior,
         temp_cache: TempDir::new().expect("Failed to create temp cache dir"),
         temp_auth: TempDir::new().expect("Failed to create temp auth dir"),
     }

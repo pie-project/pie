@@ -58,6 +58,12 @@ struct NotifyContext {
             std::uint32_t slot = DeviceChannelRegistry::kBadSlot;
             std::uint64_t target = 0;
             std::uint64_t wait_id = 0;
+            // Pinned word block, resolved at enqueue time on the scheduler
+            // thread. The completion callback dereferences ONLY this stable
+            // pointer (plan §7): registry vectors may be reallocated by a
+            // concurrent register_endpoint, but the per-slot pinned block
+            // lives until the channel's ordered close.
+            std::uint64_t* words = nullptr;
         };
         PieTerminalCell* terminal_cell = nullptr;
         std::uint32_t* commit_host = nullptr;
@@ -65,12 +71,39 @@ struct NotifyContext {
         std::vector<EndpointUpdate> published;
         std::vector<EndpointUpdate> consumed;
         std::vector<EndpointUpdate> poisoned;
-        std::vector<ChannelValue> host_puts;
+        // CPU-unpacked bool cells the writer-ring pull copies from; must
+        // outlive the async H2D copies, so it rides to the callback.
         std::vector<std::vector<std::uint8_t>> host_staging;
     };
     PtirDispatch::Impl* impl = nullptr;
     std::vector<FinalizeEntry> entries;
 };
+
+// Word-pointer variants of DeviceChannelRegistry::finalize_host_publish /
+// finalize_host_consume for the completion callback: the callback must not
+// index registry vectors (a concurrent register_endpoint may reallocate
+// them), so it writes through the pinned word pointers precomputed at
+// enqueue. Word layout: [0]=head, [1]=tail, [2]=poison, [3]=closed.
+void finalize_publish_words(std::uint64_t* words, std::uint64_t target, bool failed) {
+    if (words == nullptr) return;
+    if (failed) {
+        std::atomic_ref<std::uint64_t>(words[2]).store(
+            target == 0 ? 1 : target, std::memory_order_release);
+        return;
+    }
+    std::atomic_ref<std::uint64_t>(words[1]).store(target, std::memory_order_release);
+    std::atomic_ref<std::uint64_t>(words[2]).store(0, std::memory_order_release);
+}
+
+void finalize_consume_words(std::uint64_t* words, std::uint64_t target, bool failed) {
+    if (words == nullptr) return;
+    if (failed) {
+        std::atomic_ref<std::uint64_t>(words[2]).store(
+            target == 0 ? 1 : target, std::memory_order_release);
+        return;
+    }
+    std::atomic_ref<std::uint64_t>(words[0]).store(target, std::memory_order_release);
+}
 
 void CUDART_CB notify_runtime_callback(void* userdata) {
     std::unique_ptr<NotifyContext> ctx(static_cast<NotifyContext*>(userdata));
@@ -84,23 +117,18 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
         const bool committed =
             entry.commit_host != nullptr && *(entry.commit_host) != 0;
         const bool failed = entry.poison || !committed;
-        if (ctx->impl != nullptr) {
-            for (const auto& update : entry.published) {
-                ctx->impl->channels.finalize_host_publish(
-                    update.slot, update.target, failed);
+        for (const auto& update : entry.published) {
+            finalize_publish_words(update.words, update.target, failed);
+            notifications.emplace_back(update.wait_id, update.target);
+        }
+        for (const auto& update : entry.consumed) {
+            finalize_consume_words(update.words, update.target, failed);
+            notifications.emplace_back(update.wait_id, update.target);
+        }
+        if (failed) {
+            for (const auto& update : entry.poisoned) {
+                finalize_publish_words(update.words, update.target, true);
                 notifications.emplace_back(update.wait_id, update.target);
-            }
-            for (const auto& update : entry.consumed) {
-                ctx->impl->channels.finalize_host_consume(
-                    update.slot, update.target, failed);
-                notifications.emplace_back(update.wait_id, update.target);
-            }
-            if (failed) {
-                for (const auto& update : entry.poisoned) {
-                    ctx->impl->channels.finalize_host_publish(
-                        update.slot, update.target, true);
-                    notifications.emplace_back(update.wait_id, update.target);
-                }
             }
         }
         if (entry.terminal_cell != nullptr) {
@@ -128,6 +156,50 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
 
 namespace {
 void close_bound_instance(PtirDispatch::Impl& s, std::uint64_t instance_id);
+
+// Batch-level channel budget (§4.3 availability + reader capacity): members
+// of one batch that share a channel are validated against the AGGREGATE of
+// their planned ring consumes and reader publishes. Checked one-by-one, two
+// members could both pass on the last available entry/slot and the second
+// would die as a device-side poison instead of a synchronous rejection.
+int validate_channel_budget(PtirDispatch::Impl& s,
+                            const pie_native::LaunchView& view,
+                            std::string* err) {
+    std::unordered_map<std::uint32_t, std::uint64_t> planned_consumes;
+    std::unordered_map<std::uint32_t, std::uint64_t> planned_publishes;
+    const std::size_t count = view.ptir_program_hashes.size();
+    for (std::size_t p = 0; p < count; ++p) {
+        const std::uint64_t instance_id = view.ptir_program_instances.data()[p];
+        auto it = s.instances.find(instance_id);
+        if (it == s.instances.end()) continue;  // caller resolves instances
+        for (const auto& [slot, gid] :
+             it->second.instance->writer_take_slots()) {
+            std::uint64_t& extra = planned_consumes[slot];
+            if (s.channels.writer_available(slot) < extra + 1) {
+                if (err) {
+                    *err = "ptir channel " + std::to_string(gid) +
+                        " has no host input for this fire "
+                        "(put must happen before submit)";
+                }
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            ++extra;
+        }
+        for (const auto& output :
+             it->second.instance->predict_outputs_device()) {
+            std::uint64_t& extra = planned_publishes[output.slot];
+            if (!s.channels.can_publish_n(output.slot, extra + 1)) {
+                if (err) {
+                    *err = "ptir channel " + std::to_string(output.gid) +
+                        " has no host output capacity";
+                }
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            ++extra;
+        }
+    }
+    return PIE_STATUS_OK;
+}
 }  // namespace
 
 PtirDispatch::PtirDispatch() : impl_(std::make_unique<Impl>()) {}
@@ -142,59 +214,6 @@ PtirDispatch::~PtirDispatch() {
 }
 
 namespace {
-
-// Decode the flattened host-put SoA in one linear pass. Computing each
-// program's blob offset independently made large batches quadratic.
-std::vector<std::vector<ChannelValue>> read_channel_values(
-    const pie_native::Slice<std::uint64_t>& chans,
-    const pie_native::Slice<std::uint8_t>& blob,
-    const pie_native::Slice<std::uint32_t>& lens,
-    const pie_native::Slice<std::uint32_t>& indptr,
-    std::size_t programs) {
-    if (indptr.size() != programs + 1 || chans.size() != lens.size()) {
-        throw std::runtime_error("ptir host-put arrays are inconsistent");
-    }
-    std::vector<std::vector<ChannelValue>> out(programs);
-    std::size_t off = 0;
-    for (std::size_t program = 0; program < programs; ++program) {
-        const std::uint32_t lo = indptr.data()[program];
-        const std::uint32_t hi = indptr.data()[program + 1];
-        if (lo > hi || hi > lens.size()) {
-            throw std::runtime_error("ptir host-put indptr is invalid");
-        }
-        out[program].reserve(hi - lo);
-        for (std::uint32_t entry = lo; entry < hi; ++entry) {
-            const std::size_t bytes = lens.data()[entry];
-            if (off > blob.size() || bytes > blob.size() - off) {
-                throw std::runtime_error("ptir host-put blob is truncated");
-            }
-            ChannelValue value;
-            value.channel = chans.data()[entry];
-            if (bytes != 0) {
-                value.bytes.assign(
-                    blob.data() + off, blob.data() + off + bytes);
-            }
-            off += bytes;
-            out[program].push_back(std::move(value));
-        }
-    }
-    if (off != blob.size()) {
-        throw std::runtime_error("ptir host-put blob has trailing bytes");
-    }
-    return out;
-}
-
-std::vector<std::uint64_t> read_channel_ids(
-    const pie_native::Slice<std::uint64_t>& ids,
-    const pie_native::Slice<std::uint32_t>& indptr,
-    std::size_t p) {
-    std::vector<std::uint64_t> out;
-    if (indptr.size() < p + 2) return out;
-    const std::uint32_t lo = indptr.data()[p];
-    const std::uint32_t hi = indptr.data()[p + 1];
-    for (std::uint32_t e = lo; e < hi; ++e) out.push_back(ids.data()[e]);
-    return out;
-}
 
 std::vector<ChannelValue> copy_seed_values(
     const std::vector<PieChannelValueDesc>& descs) {
@@ -386,12 +405,6 @@ int PtirDispatch::validate_launch(
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     try {
-        const auto host_puts_by_program = read_channel_values(
-            view.ptir_program_host_put_channels,
-            view.ptir_program_host_put_blob,
-            view.ptir_program_host_put_lens,
-            view.ptir_program_host_put_indptr,
-            count);
         for (std::size_t program = 0; program < count; ++program) {
             const std::uint64_t instance_id =
                 view.ptir_program_instances.data()[program];
@@ -403,24 +416,12 @@ int PtirDispatch::validate_launch(
                 if (err) *err = "ptir launch references an incompatible instance";
                 return PIE_STATUS_INVALID_ARGUMENT;
             }
-            std::string value_error;
-            if (!instance->second.instance->validate_host_puts(
-                    host_puts_by_program[program], &value_error)) {
-                if (err) *err = value_error;
-                return PIE_STATUS_INVALID_ARGUMENT;
-            }
-            for (const auto& output :
-                 instance->second.instance->predict_outputs_device()) {
-                if (!impl_->channels.can_publish(output.slot)) {
-                    if (err) {
-                        *err = "ptir channel " +
-                            std::to_string(output.gid) +
-                            " has no host output capacity";
-                    }
-                    return PIE_STATUS_INVALID_ARGUMENT;
-                }
-            }
         }
+        // §4.3 availability + reader capacity, aggregated across the batch: a
+        // fire that would take from an empty host-writer ring (or publish
+        // past the host reader's capacity) is rejected synchronously.
+        const int budget = validate_channel_budget(*impl_, view, err);
+        if (budget != PIE_STATUS_OK) return budget;
     } catch (const std::exception& error) {
         if (err) *err = error.what();
         return PIE_STATUS_INVALID_ARGUMENT;
@@ -459,19 +460,10 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
                 "ptir launch instance/hash mismatch for " + std::to_string(iid));
         }
     }
-    auto host_puts_by_program = read_channel_values(
-        view.ptir_program_host_put_channels,
-        view.ptir_program_host_put_blob,
-        view.ptir_program_host_put_lens,
-        view.ptir_program_host_put_indptr,
-        n_prog);
-    for (std::size_t p = 0; p < n_prog; ++p) {
-        const std::uint64_t iid = view.ptir_program_instances.data()[p];
-        BoundInstance& bound = s.instances.at(iid);
-        std::string value_error;
-        if (!bound.instance->validate_host_puts(
-                host_puts_by_program[p], &value_error)) {
-            throw std::runtime_error(value_error);
+    {
+        std::string budget_error;
+        if (validate_channel_budget(s, view, &budget_error) != PIE_STATUS_OK) {
+            throw std::runtime_error(budget_error);
         }
     }
     sampling_ir::FrameCarrierEngine& carrier =
@@ -496,8 +488,6 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
         ensure_event(&bound.publish_done);
         CUDA_CHECK(cudaStreamWaitEvent(stream, bound.publish_done, 0));
 
-        auto& host_puts = host_puts_by_program[p];
-
         FireInputs fin;
         if (logits != nullptr &&
             view.sampling_indptr.size() == n_prog + 1) {
@@ -512,8 +502,10 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
         fin.stream = stream;
         std::vector<void*> scratch;
         std::vector<std::vector<std::uint8_t>> host_staging;
-        const PassResult pass =
-            bound.instance->fire_async(host_puts, fin, scratch, host_staging);
+        // §4.3: pull the host-writer rings stream-ordered before the pass —
+        // the put already lives in the shared pinned ring.
+        bound.instance->pull_writer_inputs(stream, host_staging);
+        const PassResult pass = bound.instance->fire_async(fin, scratch);
         CUDA_CHECK(cudaMemcpyAsync(
             snapshot.device,
             bound.instance->commit_device_flag(),
@@ -542,20 +534,19 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
                 .target = s.channels.schedule_host_publish(
                     output.slot, output.device_ptr, callback_stream),
                 .wait_id = s.channels.reader_wait_id(output.slot),
+                .words = s.channels.host_words(output.slot),
             });
             output_slots.push_back(output.slot);
         }
         std::vector<NotifyContext::FinalizeEntry::EndpointUpdate> consumed;
-        consumed.reserve(host_puts.size());
-        for (const ChannelValue& value : host_puts) {
-            const std::uint32_t slot = s.channels.slot_for(value.channel);
-            if (slot != DeviceChannelRegistry::kBadSlot) {
-                consumed.push_back({
-                    .slot = slot,
-                    .target = s.channels.schedule_host_consume(slot),
-                    .wait_id = s.channels.writer_wait_id(slot),
-                });
-            }
+        for (const auto& [slot, target] :
+             bound.instance->schedule_writer_consumes()) {
+            consumed.push_back({
+                .slot = slot,
+                .target = target,
+                .wait_id = s.channels.writer_wait_id(slot),
+                .words = s.channels.host_words(slot),
+            });
         }
         if (!output_slots.empty()) {
             launch_consume_if_committed(
@@ -583,6 +574,7 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
                     .slot = slot,
                     .target = s.channels.poison_target(slot),
                     .wait_id = s.channels.host_wait_id(slot),
+                    .words = s.channels.host_words(slot),
                 });
             }
         }
@@ -593,7 +585,6 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
             .published = std::move(published),
             .consumed = std::move(consumed),
             .poisoned = std::move(poisoned),
-            .host_puts = std::move(host_puts),
             .host_staging = std::move(host_staging),
         });
         touched_instances.push_back(iid);
@@ -686,18 +677,6 @@ bool PtirDispatch::resolve_descriptors(const pie_native::LaunchView& view,
         return false;
     }
 
-    std::vector<std::vector<ChannelValue>> host_puts_by_program;
-    try {
-        host_puts_by_program = read_channel_values(
-            view.ptir_program_host_put_channels,
-            view.ptir_program_host_put_blob,
-            view.ptir_program_host_put_lens,
-            view.ptir_program_host_put_indptr,
-            n_prog);
-    } catch (const std::exception& error) {
-        if (err) *err = error.what();
-        return false;
-    }
     for (std::size_t p = 0; p < n_prog; ++p) {
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
@@ -716,8 +695,7 @@ bool PtirDispatch::resolve_descriptors(const pie_native::LaunchView& view,
             return false;
         }
         std::string value_error;
-        if (!it->second.instance->validate_host_puts(
-                host_puts_by_program[p], &value_error)) {
+        if (!it->second.instance->writer_inputs_available(&value_error)) {
             if (err) *err = value_error;
             return false;
         }
@@ -732,7 +710,11 @@ bool PtirDispatch::resolve_descriptors(const pie_native::LaunchView& view,
             if (!pb.is_const) { device_geometry = true; break; }
         if (!device_geometry) continue;
 
-        it->second.instance->feed_host_puts(host_puts_by_program[p]);
+        // Geometry resolution reads device channel state synchronously, so
+        // pull the writer rings on the default stream and drain it first.
+        std::vector<std::vector<std::uint8_t>> staging;
+        it->second.instance->pull_writer_inputs(nullptr, staging);
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
 
         if (!resolve_fire_geometry(
                 *trace, it->second.instance->view(), page_size, out, err)) {

@@ -117,50 +117,6 @@ impl PtirInstance {
         )
     }
 
-    /// Build this instance's PTIR carrier submission for a fire (thrust-3 P2c).
-    /// `first_fire` = the instance's first fire: it ships the container bytes +
-    /// PTIB sidecar (so the driver decodes/compiles + caches by hash) AND the
-    /// per-instance seeds (so the driver builds + binds this instance's channel
-    /// arena, keyed by `instance_id`). Steady-state fires (`first_fire = false`)
-    /// carry the hash + instance id only — the driver serves the compiled
-    /// program from cache and drives the already-built arena.
-    /// `channel_ids` is the dense-index → global-channel-id map (one entry per
-    /// declared channel, from the pass's bound cells); it re-keys the seeds and
-    /// rides every fire so the driver binds trace-local channels to the global
-    /// device registry. `host_puts` are the D1-coalesced host `channel.put`s
-    /// (already global-id keyed) staged for this fire.
-    pub fn submission(
-        &self,
-        first_fire: bool,
-        channel_ids: Vec<u64>,
-        host_puts: Vec<crate::ptir::PtirChannelValue>,
-    ) -> crate::ptir::PtirProgramSubmission {
-        let global = |dense: u32| -> u64 {
-            channel_ids
-                .get(dense as usize)
-                .copied()
-                .unwrap_or(dense as u64)
-        };
-        crate::ptir::PtirProgramSubmission {
-            hash: self.program.hash,
-            instance: self.instance_id,
-            bytes: first_fire.then(|| self.program.bytes.clone()),
-            sidecar: first_fire.then(|| self.program.sidecar.clone()),
-            seeds: if first_fire {
-                self.seeds
-                    .iter()
-                    .map(|s| crate::ptir::PtirChannelValue {
-                        channel: global(s.channel),
-                        bytes: s.data.clone(),
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            channel_ids,
-            host_puts,
-        }
-    }
 }
 
 /// An instantiation failure.
@@ -480,7 +436,7 @@ mod tests {
     /// oracle the CUDA backend diffs against — the greedy program argmaxes the
     /// supplied logits and publishes the token to the host-reader `out` channel.
     #[test]
-    fn submission_carrier_first_fire_vs_steady_state() {
+    fn instantiate_mints_distinct_persistent_identities() {
         let prog = register(
             greedy().encode(),
             &ModelProfile {
@@ -491,43 +447,9 @@ mod tests {
         .unwrap();
         let inst = instantiate(prog.hash, vec![seed(0, 42)]).unwrap();
         assert_ne!(inst.instance_id, 0, "a fresh instance identity is minted");
-
-        // First fire: ships the container bytes + sidecar + the seed (D2), all
-        // tagged with this instance's identity.
-        let first = inst.submission(true, vec![], vec![]);
-        assert_eq!(first.hash, prog.hash);
-        assert_eq!(
-            first.instance, inst.instance_id,
-            "carries the instance identity"
-        );
-        assert_eq!(
-            first.bytes.as_deref(),
-            Some(prog.bytes.as_slice()),
-            "first fire ships bytes"
-        );
-        assert_eq!(
-            first.sidecar.as_deref(),
-            Some(prog.sidecar.as_slice()),
-            "first fire ships sidecar"
-        );
-        assert_eq!(first.seeds.len(), 1);
-        assert_eq!(first.seeds[0].channel, 0);
-        assert_eq!(first.seeds[0].bytes, 42i32.to_le_bytes().to_vec());
-
-        // Steady state: hash-cache hit + persistent arena — no bytes/sidecar/seeds,
-        // but the instance identity still routes the fire to its arena.
-        let steady = inst.submission(false, vec![], vec![]);
-        assert_eq!(steady.hash, prog.hash);
-        assert_eq!(
-            steady.instance, inst.instance_id,
-            "steady fire still routes by instance"
-        );
-        assert!(steady.bytes.is_none(), "steady-state fire is hash-only");
-        assert!(steady.sidecar.is_none(), "steady-state ships no sidecar");
-        assert!(
-            steady.seeds.is_empty(),
-            "seeds bind once at the instance's first fire"
-        );
+        assert_eq!(inst.seeds.len(), 1);
+        assert_eq!(inst.seeds[0].channel, 0);
+        assert_eq!(inst.seeds[0].data, 42i32.to_le_bytes().to_vec());
 
         // Two instances of the SAME program get DISTINCT identities (independent
         // channel arenas) though they share one compiled `hash`.

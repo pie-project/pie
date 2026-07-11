@@ -19,6 +19,7 @@
 // `launch_pass_async`; projected host indices preserve stream-ordered run-ahead.
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <memory>
@@ -103,13 +104,40 @@ class Tier0Runner {
     }
 
     // Standalone channel storage (tests / single-instance use): own a private
-    // registry + view with identity (1-based) global ids, so `run_pass` works
-    // without an external shared registry. Production binds a shared registry
-    // via `bind_view` instead.
+    // registry, register an endpoint per trace channel under identity (1-based)
+    // global ids, and bind a view over them, so `run_pass` works without an
+    // external shared registry. Production registers endpoints through the
+    // driver entry and binds the shared registry via `bind_view` instead.
     void init_standalone_channels() {
         standalone_reg_ = std::make_unique<DeviceChannelRegistry>();
         std::vector<std::uint64_t> ids(trace_->channels.size());
         for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = i + 1;  // 0 = null sentinel
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            const Channel& decl = trace_->channels[i];
+            PieChannelDesc desc{};
+            desc.abi_version = PIE_DRIVER_ABI_VERSION;
+            desc.channel_id = ids[i];
+            desc.shape = {decl.type.shape.dims.data(), decl.type.shape.dims.size()};
+            desc.dtype = static_cast<std::uint8_t>(decl.type.dtype);
+            desc.host_role = decl.host_reader
+                ? PIE_CHANNEL_HOST_ROLE_READER
+                : (decl.host_visible ? PIE_CHANNEL_HOST_ROLE_WRITER
+                                     : PIE_CHANNEL_HOST_ROLE_NONE);
+            desc.seeded = decl.has_seed ? 1 : 0;
+            desc.extern_dir = PIE_CHANNEL_EXTERN_NONE;
+            desc.capacity = decl.capacity;
+            // Nonzero placeholder wait ids: standalone runs have no waker
+            // table; the notifies that would target them never fire here.
+            desc.reader_wait_id = 2 * ids[i] - 1;
+            desc.writer_wait_id = 2 * ids[i];
+            PieChannelEndpointBinding binding{};
+            std::string register_err;
+            if (!standalone_reg_->register_endpoint(desc, &binding, &register_err)) {
+                std::fprintf(stderr,
+                             "[tier0] standalone channel %zu registration failed: %s\n",
+                             i, register_err.c_str());
+            }
+        }
         std::string err;
         standalone_view_.bind(standalone_reg_.get(), trace_->channels, ids, &err);
         bind_view(&standalone_view_);

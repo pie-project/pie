@@ -7,8 +7,14 @@
 
 /**
  * Current direct local ABI version.
+ *
+ * v2: channel values no longer ride launch descriptors — host puts are
+ * direct writes into the registered channel endpoint's pinned ring, pulled
+ * by the driver before the consuming pass; `PieChannelDesc` wait ids are
+ * mandatory and every native driver must notify them per channel-word
+ * publication.
  */
-#define PIE_DRIVER_ABI_VERSION 1
+#define PIE_DRIVER_ABI_VERSION 2
 
 /**
  * Success.
@@ -420,14 +426,6 @@ typedef struct PieLaunchDesc {
   struct PieU32Slice audio_feature_indptr;
   struct PieU32Slice audio_anchor_rows;
   struct PieU32Slice audio_indptr;
-  /**
-   * Flattened PTIR host-put values for all launched instances.
-   */
-  struct PieChannelValueDescSlice ptir_host_put_values;
-  /**
-   * CSR partition of `ptir_host_put_values`, one segment per `instance_ids` entry.
-   */
-  struct PieU32Slice host_put_indptr;
   struct PieU32Slice kv_len;
   struct PieU64Slice kv_len_device;
 } PieLaunchDesc;

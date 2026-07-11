@@ -1,34 +1,46 @@
 //! Demo: KV state persists across requests via `snapshot::save` / `open`.
 //!
-//! Uniquely-Pie demo: a chat session's KV cache lives inside the engine
-//! and survives across inferlet invocations under a user-chosen name.
-//! Turn 2 reopens the snapshot and only pays the prefill cost for the
-//! new user message — the prior turn's pages are reused as-is. A naive
-//! client-server pattern (the way most apps work today on vLLM/TGI)
-//! has to replay the full conversation history every turn, paying the
-//! full prefill bill again and again.
+//! Uniquely-Pie demo: a chat session's token log lives in the engine under a
+//! user-chosen name and survives across inferlet invocations. Turn 2 reopens
+//! the snapshot and only pays *accounted* prefill cost for the new user
+//! message — a naive client-server pattern (the way most apps work today on
+//! vLLM/TGI) has to rebuild and re-account the full conversation history every
+//! turn.
 //!
 //! Two strategies, same conversation:
 //!
-//! - **BASELINE** — turn 1 runs a fresh `Ctx`. Turn 2 throws
-//!   that context away and rebuilds another fresh one with
-//!   system + user1 + assistant1 + user2 in its buffer. Pays prefill on
-//!   the entire history every time.
-//! - **RESUMED** — turn 1 saves the post-generation context under a
-//!   name. Turn 2 calls `snapshot::open(name)` + replays the log from the
-//!   saved snapshot, appends user2, and generates. Only the new user2
-//!   wrapper costs prefill on turn 2.
+//! - **BASELINE** — turn 1 runs a fresh `Ctx`. Turn 2 throws that context away
+//!   and rebuilds another fresh one with system + user1 + assistant1 + user2 in
+//!   its buffer. Pays prefill on the entire history every time.
+//! - **RESUMED** — turn 1 saves the post-generation context under a name. Turn
+//!   2 calls `snapshot::open(name)`, replays the saved token log, appends
+//!   user2, and generates. Only the new user2 wrapper is accounted as turn-2
+//!   prefill.
 //!
 //! `mode = plain | smart | both` (default `both`).
+//!
+//! **PTIR rewrite** (classic `forward-pass` / `carrier` / `prefill` keep-core
+//! retirement). Each generation is the text-completion wire form: the full
+//! token log + buffered prompt tail is materialized in ONE N-wide prefill fire
+//! (multi-query custom-mask pack + N-cell KV write) that also samples token 1,
+//! followed by a 1-wide device-loop-carried decode loop with the in-graph
+//! top-p sampler. For a snapshot-restored `Ctx` that single prefill fire IS
+//! the token-log REPLAY, fused with the new turn's prompt (the ptir prefill is
+//! position-0 anchored; an *incremental* offset prefill is not a proven ptir
+//! wire form, and every `Ctx` here generates exactly once, so fusing loses
+//! nothing). The `snapshot::` module stays the thin data + wasi:filesystem
+//! keep-core it already was.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use inferlet::inference::ForwardPass;
-use inferlet::sampler::{self, LoweredSampler, SamplerSpec};
-use inferlet::working_set::KvWorkingSet;
-use inferlet::{carrier, chat, prefill, snapshot, Result};
+use inferlet::ptir::prelude::*;
+use inferlet::ptir::Taken;
+use inferlet::{chat, model as wit_model, snapshot, Result};
 use serde::Deserialize;
+
+const PAGE_T: u32 = 16; // tokens per pool page
+const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
 
 #[derive(Deserialize)]
 struct Input {
@@ -85,55 +97,59 @@ const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 const MAGENTA: &str = "\x1b[35m";
 
-// ── In-inferlet decode context (raw-WIT keep-core, no `Context` facade) ──
+fn bx<T>(v: T) -> &'static T {
+    Box::leak(Box::new(v))
+}
+
+// ── In-inferlet decode context (ptir keep-core, no `Context` facade) ─────
 //
-// A minimal visible bundle: its own KV working set + sequence cursor, plus the
-// materialized token log (`tokens`, = the facade's `history`) so a snapshot can
-// be serialized, and a `buffer` of prompt tokens not yet prefilled. Chat
-// templating is the kept thin `chat::` bindings; the prefill / decode mechanics
-// are the `prefill` / `carrier` keep-core primitives. Restore replays the token
-// log through `prefill::tokens` (In Gim's SDK-minimize: the replay lives in the
-// inferlet, not a `Context::open` facade).
+// A minimal visible bundle: the materialized token log (`tokens`, = the
+// facade's `history`) so a snapshot can be serialized, a `buffer` of prompt
+// tokens not yet materialized, and the deferred system prompt. Chat templating
+// is the kept thin `chat::` bindings. There is no live device handle here: the
+// working set + fires are built inside `decode_stream` (each `Ctx` generates
+// exactly once), and the single N-wide prefill fire there materializes
+// `tokens ++ buffer` — for a snapshot-restored ctx that is the token-log
+// replay, fused with the new turn's prompt.
 struct Ctx {
-    kv: KvWorkingSet,
+    /// Tokens accounted as already materialized (the replayable log length).
     seq_len: u32,
-    fresh: bool,
+    /// The materialized token log a snapshot serializes / a restore replays.
     tokens: Vec<u32>,
+    /// Prompt tokens not yet materialized (the facade's unflushed buffer).
     buffer: Vec<u32>,
+    /// A deferred `chat::system` prompt not yet folded into the buffer.
     pending_system: Option<String>,
 }
 
 impl Ctx {
     fn new() -> Self {
         Self {
-            kv: KvWorkingSet::new(),
             seq_len: 0,
-            fresh: true,
             tokens: Vec::new(),
             buffer: Vec::new(),
             pending_system: None,
         }
     }
 
-    /// Rebuild from a snapshot manifest by REPLAYING its token log — one prefill
-    /// over `snap.tokens` rebuilds the KV (the sample is irrelevant; only the KV
-    /// write matters). The unflushed tail / deferred system ride on top.
+    /// Rebuild from a snapshot manifest. The token-log REPLAY is deferred into
+    /// the next `decode_stream`'s single N-wide prefill fire (fused with the
+    /// new turn's prompt); the log itself is accounted as already paid, so the
+    /// turn-2 prefill number stays "new tokens only" — the classic accounting.
     fn from_snapshot(snap: snapshot::SnapshotData) -> Result<Self> {
-        let mut ctx = Self::new();
-        if !snap.tokens.is_empty() {
-            prefill::tokens(&ctx.kv, &mut ctx.seq_len, &snap.tokens)?;
-            ctx.tokens = snap.tokens;
-        }
-        ctx.buffer = snap.buffer;
-        ctx.pending_system = snap.pending_system;
-        Ok(ctx)
+        Ok(Self {
+            seq_len: snap.tokens.len() as u32,
+            tokens: snap.tokens,
+            buffer: snap.buffer,
+            pending_system: snap.pending_system,
+        })
     }
 
     /// The manifest to serialize: the materialized log + unflushed tail + geometry.
     fn to_snapshot(&self) -> snapshot::SnapshotData {
         snapshot::SnapshotData {
             version: snapshot::SNAPSHOT_VERSION,
-            page_size: self.kv.page_size(),
+            page_size: PAGE_T,
             seq_len: self.seq_len,
             tokens: self.tokens.clone(),
             buffer: self.buffer.clone(),
@@ -176,16 +192,19 @@ impl Ctx {
         self.buffer.extend(chat::cue());
     }
 
-    /// Materialize any buffered prompt into the KV (a prefill), recording it in
-    /// the token log. Mirrors `Context::flush`.
+    /// Fold the buffer into the token log. Mirrors `Context::flush`: after this
+    /// the tokens are part of the replayable log a snapshot serializes (their
+    /// physical materialization happens in the restore replay / the next
+    /// generation's prefill fire — each `Ctx` here generates at most once, so
+    /// no separate flush fire is needed).
     fn flush(&mut self) -> Result<()> {
         self.flush_pending_system();
         if self.buffer.is_empty() {
             return Ok(());
         }
         let tokens = std::mem::take(&mut self.buffer);
-        prefill::tokens(&self.kv, &mut self.seq_len, &tokens)?;
         self.tokens.extend(tokens);
+        self.seq_len = self.tokens.len() as u32;
         Ok(())
     }
 
@@ -196,22 +215,24 @@ impl Ctx {
     }
 }
 
-/// Read the sampled token off a finalized pass's single-`Token` output tensor.
-async fn read_token(pass: ForwardPass) -> Result<u32> {
-    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
-    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
-    Ok(if bytes.len() >= 4 {
-        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
-    } else {
-        0
-    })
+/// In-graph top-p + temperature sampler over the read-out row logits. `r` is
+/// the taken `[2]` u32 rng state (`[key, ctr]`) driving the Gumbel noise.
+fn sample_token(r: &Taken, temperature: f32, top_p: f32, vocab: u32) -> Tensor {
+    let logits = intrinsics::logits();
+    let scaled = div(&logits, temperature.max(1e-4));
+    let probs = softmax(&scaled);
+    let keep = pivot_threshold(&probs, cummass_le(top_p));
+    let masked = mask_apply(&scaled, &keep);
+    let g = gumbel(r, [vocab]);
+    reduce_argmax(add(&masked, &g)) // [1] i32
 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let mode = input.mode.to_lowercase();
 
-    let model_name = inferlet::model::name();
+    let model_name = wit_model::name();
+    model::configure(wit_model::output_vocab_size(), PAGE_T, NUM_LAYERS);
 
     // Best-effort: clear stale snapshots before modes that create a new one.
     if !matches!(mode.as_str(), "open" | "turn2" | "resume-turn2") {
@@ -361,8 +382,8 @@ async fn run_resumed(model_name: &str, input: &Input) -> Result<ModeResult> {
     let t = Instant::now();
     let answer1 = decode_stream(&mut ctx, input.max_tokens, input.delay).await?;
     let turn1_elapsed = t.elapsed();
-    // Commit any working pages before saving so the snapshot includes
-    // the assistant's reply.
+    // Fold any residual into the log before saving so the snapshot includes
+    // the assistant's reply in full.
     ctx.flush()?;
     snapshot::save(&input.snapshot, &ctx.to_snapshot())?;
     println!(
@@ -476,119 +497,209 @@ async fn run_open_turn2(model_name: &str, input: &Input) -> Result<()> {
     Ok(())
 }
 
-// ── Stream one turn on the keep-core carrier, return the decoded text ─────
+// ── Stream one turn on the ptir keep-core, return the decoded text ────────
 //
-// Depth-1 EOS-rollback pipelined decode (`ptir-pipelined-eos-rollback-spec §4`):
-// the prime pass prefills the buffered prompt tail and samples token 1; each
-// step eagerly speculates the next forward BEFORE the producer's token is known
-// to be a stop, and rolls that speculation back with `carrier::discard_pass`
-// when the token IS a stop. Every materialized token (prompt tail + each accepted
-// generated token whose consumer runs) is recorded in `ctx.tokens` so a later
-// snapshot serializes the full log; a max-tokens terminal token (no consumer, so
-// unmaterialized) is parked in `ctx.buffer` as the facade's residual — a
-// following `flush()`/`save()` materializes it.
+// The text-completion wire form: ONE N-wide prefill fire materializes the full
+// token log + buffered tail (for a snapshot-restored ctx this IS the token-log
+// replay, fused with the new turn's prompt) and samples generation token 1;
+// then a 1-wide decode loop whose fires carry the sampled token device-side
+// (`tok_in`) and evolve geometry + mask in-graph. Every token embedded by a
+// fire is recorded in `ctx.tokens` (it is materialized KV); a sampled token
+// that never gets a follow-up fire is either a dropped stop token or — at the
+// max-tokens terminal — parked in `ctx.buffer` as the residual, exactly the
+// classic facade's stop-truncation / auto-buffer semantics.
 async fn decode_stream(ctx: &mut Ctx, max_tokens: usize, delay_ms: u64) -> Result<String> {
     print!("  {}>{} ", CYAN, RESET);
     let _ = io::stdout().flush();
 
-    let vocab = inferlet::model::output_vocab_size();
-    let s: LoweredSampler = sampler::sampler_program(
-        SamplerSpec::TopP {
-            temperature: 0.6,
-            p: 0.95,
-        },
-        vocab,
-    )?;
+    let vocab = wit_model::output_vocab_size();
+    let temperature = 0.6f32;
+    let top_p = 0.95f32;
     let stop = chat::stop_tokens();
     let mut decoder = chat::Decoder::new();
     let mut stripper = ThinkStripper::new();
     let mut text = String::new();
 
     if max_tokens == 0 {
-        // Nothing to decode: materialize the buffered prompt so history stays
-        // faithful (the facade's `generate` flushes the buffer first).
+        // Nothing to decode: fold the buffered prompt into the log so history
+        // stays faithful (the facade's `generate` flushes the buffer first).
         ctx.flush()?;
         println!();
         return Ok(strip_think_blocks(&text));
     }
 
-    // Prime producer: prefill the buffered prompt tail (materialized into KV +
-    // the token log) and sample generation token 1.
+    // The full materialization for this generation: log (replay) + buffered tail.
+    ctx.flush_pending_system();
     let head = std::mem::take(&mut ctx.buffer);
-    let head = if head.is_empty() { vec![0u32] } else { head };
     ctx.tokens.extend_from_slice(&head);
-    let mut producer =
-        carrier::submit_pass(&ctx.kv, &mut ctx.seq_len, &mut ctx.fresh, &s, &head, true)?;
+    if ctx.tokens.is_empty() {
+        ctx.tokens.push(0);
+    }
+    let n = ctx.tokens.len() as u32;
+    ctx.seq_len = n;
+
+    // Shared physical page pool: history + decode headroom, page-rounded.
+    let pool_pages = (n + max_tokens as u32 + 2 + PAGE_T - 1) / PAGE_T;
+    let pool = pool_pages * PAGE_T;
+    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let slots = ws.alloc(pool_pages).map_err(|e| format!("ws.alloc: {e}"))?;
+    let pool_ids: &'static Vec<u32> = bx(slots.ids().to_vec());
+
+    // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
+    let prefill_i32: Vec<i32> = ctx.tokens.iter().map(|&t| t as i32).collect();
+    let toks_p = bx(Channel::from(prefill_i32).named("toks_p"));
+    let embed_indptr_p = Tensor::constant(vec![0u32, n]);
+
+    let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
+    let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
+    let w_slot_p = bx(Channel::from(w_slot_pv).named("w_slot_p"));
+    let w_off_p = bx(Channel::from(w_off_pv).named("w_off_p"));
+    let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
+    let pages_p = bx(Channel::from(pool_ids.clone()).named("pages_p"));
+    let page_indptr_p = bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p"));
+    let mask_pv: Vec<bool> = (0..n).flat_map(|i| (0..pool).map(move |j| j <= i)).collect();
+    let mask_p = bx(Channel::from_shaped([n, pool], mask_pv).named("mask_p"));
+    let rng_p = bx(Channel::from(vec![0x51ed_u32, 0]).named("rng_p"));
+    let g0_ch = bx(Channel::new([1], dtype::i32).named("g0"));
+
+    let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
+    fwd_p.embed(toks_p, embed_indptr_p);
+    fwd_p.attn_working_set(ws, klen_p);
+    fwd_p.port_channel(Port::Pages, pages_p);
+    fwd_p.port_channel(Port::PageIndptr, page_indptr_p);
+    fwd_p.port_channel(Port::WSlot, w_slot_p);
+    fwd_p.port_channel(Port::WOff, w_off_p);
+    fwd_p.attn_mask(mask_p);
+    fwd_p.epilogue(move || {
+        let r = rng_p.take();
+        let tok = sample_token(&r, temperature, top_p, vocab);
+        let r_next = add(&r, iota(2));
+        g0_ch.put(&tok);
+        rng_p.put(&r_next);
+    });
+
+    let prefill = Pipeline::new();
+    prefill.submit(fwd_p).map_err(|e| format!("prefill submit: {e}"))?;
+    let g0 = g0_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?[0];
+    prefill.close();
+
+    // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
+    let phys_n = pool_ids[(n / PAGE_T) as usize];
+    let tok_in = bx(Channel::from(vec![g0; 1]).named("tok_in"));
+    let pos = bx(Channel::from(vec![n; 1]).named("pos"));
+    let fill = bx(Channel::from(vec![n + 1; 1]).named("fill"));
+    let klen = bx(Channel::from(vec![n + 1; 1]).named("klen"));
+    let w_slot = bx(Channel::from(vec![phys_n; 1]).named("w_slot"));
+    let w_off = bx(Channel::from(vec![n % PAGE_T; 1]).named("w_off"));
+    let seed_mask: Vec<bool> = (0..pool).map(|j| j <= n).collect();
+    let mask = bx(Channel::from_shaped([1, pool], seed_mask).named("mask"));
+    let pages = bx(Channel::from(pool_ids.clone()).named("pages"));
+    let page_indptr = bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr"));
+    let pool_ids_ch = bx(Channel::new([pool_pages], dtype::u32).named("pool_ids"));
+    let out = bx(Channel::new([1], dtype::i32).named("out"));
+    let rng = bx(Channel::from(vec![0x9e37_u32, 0]).named("rng"));
+    let lane1 = Tensor::constant(vec![0u32, 1u32]);
+
+    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
+    fwd.embed(tok_in, lane1);
+    fwd.positions(pos);
+    fwd.attn_working_set(ws, klen);
+    fwd.port_channel(Port::Pages, pages);
+    fwd.port_channel(Port::PageIndptr, page_indptr);
+    fwd.port_channel(Port::WSlot, w_slot);
+    fwd.port_channel(Port::WOff, w_off);
+    fwd.attn_mask(mask);
+    fwd.epilogue(move || {
+        // TAKES + compute first, PUTS last (value-id discipline).
+        let base = fill.take().tensor();
+        let pids = pool_ids_ch.take();
+        let r = rng.take();
+
+        let tok = sample_token(&r, temperature, top_p, vocab);
+        let r_next = add(&r, iota(2));
+
+        // Full causal mask for the query at `base`: attend all j <= base.
+        let col = iota(pool);
+        let base_b = broadcast(reshape(&base, [1]), [pool]);
+        let new_mask = reshape(le(&col, &base_b), [1, pool]);
+
+        let logical_slot = div(&base, PAGE_T);
+        let w_slot_v = gather(&pids, &logical_slot);
+        let w_off_v = rem(&base, PAGE_T);
+        let klen_v = add(&base, 1u32);
+        let next_free = add(&base, 1u32);
+        let pages_v = reshape(&pids, [pool_pages]);
+        let pidx_v = mul(&iota(2), pool_pages);
+
+        tok_in.put(&tok);
+        out.put(&tok);
+        mask.put(&new_mask);
+        w_slot.put(&w_slot_v);
+        w_off.put(&w_off_v);
+        klen.put(&klen_v);
+        pos.put(&base);
+        fill.put(&next_free);
+        pages.put(&pages_v);
+        page_indptr.put(&pidx_v);
+        rng.put(&r_next);
+    });
+
+    let decode = Pipeline::new();
     let mut generated = 0usize;
-
+    let mut residual: Option<u32> = None; // sampled but never materialized
+    let mut next_tok = g0 as u32;
     loop {
-        // Speculate the next consumer eagerly UNLESS this step is the last by
-        // count. `[0]` placeholder — the device carrier injects the producer's
-        // sampled token into input row 0.
-        let speculate = generated + 1 < max_tokens;
-        let consumer = if speculate {
-            Some(carrier::submit_pass(
-                &ctx.kv,
-                &mut ctx.seq_len,
-                &mut ctx.fresh,
-                &s,
-                &[0u32],
-                true,
-            )?)
-        } else {
-            None
-        };
-
-        let token = read_token(producer).await?;
-        let mut done = false;
-        // Stop token → drop it (never emitted, never materialized), matching the
-        // facade's stop-truncation semantics.
-        if stop.contains(&token) {
-            done = true;
-        } else {
-            generated += 1;
-            match decoder.feed(&[token])? {
-                chat::Event::Delta(sd) => {
-                    text.push_str(&sd);
-                    let visible = stripper.process(&sd);
-                    if !visible.is_empty() {
-                        let rendered = visible.replace('\n', "\n    ");
-                        print!("{}", rendered);
-                        let _ = io::stdout().flush();
-                        if delay_ms > 0 {
-                            inferlet::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        }
-                    }
-                }
-                chat::Event::Done(sd) => {
-                    text = sd;
-                    done = true;
-                }
-                _ => {}
-            }
-            if generated >= max_tokens {
-                done = true;
-            }
-            if consumer.is_some() && !done {
-                // The speculated consumer will materialize this token into KV →
-                // record it in the log so a snapshot captures it.
-                ctx.tokens.push(token);
-            } else if consumer.is_none() {
-                // Max-tokens terminal: no consumer runs, so this token is NOT in
-                // the KV. Park it as the residual (the facade auto-buffers the
-                // last token); a following `flush()`/`save()` materializes it.
-                ctx.buffer.push(token);
-            }
-        }
-
-        if done {
-            if let Some(c) = consumer {
-                carrier::discard_pass(c, &mut ctx.seq_len).await;
-            }
+        // Consume `next_tok` — sampled by the previous fire, not yet in KV.
+        if stop.contains(&next_tok) {
+            // Stop token → drop it (never emitted, never materialized),
+            // matching the facade's stop-truncation semantics.
             break;
         }
-        producer = consumer.expect("consumer speculated when not terminal");
+        generated += 1;
+        let mut done = false;
+        match decoder.feed(&[next_tok])? {
+            chat::Event::Delta(sd) => {
+                text.push_str(&sd);
+                let visible = stripper.process(&sd);
+                if !visible.is_empty() {
+                    let rendered = visible.replace('\n', "\n    ");
+                    print!("{}", rendered);
+                    let _ = io::stdout().flush();
+                    if delay_ms > 0 {
+                        inferlet::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+            chat::Event::Done(sd) => {
+                text = sd;
+                done = true; // accepted, but no follow-up fire → not in the log
+            }
+            _ => {}
+        }
+        if done {
+            break;
+        }
+        if generated >= max_tokens {
+            // Max-tokens terminal: this token never gets a fire, so it is NOT
+            // in the KV. Park it as the residual (the facade auto-buffers the
+            // last token); a following `flush()`/`save()` folds it into the log.
+            residual = Some(next_tok);
+            break;
+        }
+        // The next fire embeds `next_tok` (device loop-carried) → it becomes
+        // materialized KV → record it in the log so a snapshot captures it.
+        ctx.tokens.push(next_tok);
+        ctx.seq_len += 1;
+        pool_ids_ch.put(pool_ids.clone());
+        decode.submit(fwd).map_err(|e| format!("decode submit: {e}"))?;
+        let t = out.take().get::<i32>().map_err(|e| format!("out.take: {e}"))?;
+        next_tok = *t.first().unwrap_or(&0) as u32;
     }
+    decode.close();
+    if let Some(t) = residual {
+        ctx.buffer.push(t);
+    }
+
     println!();
     // Strip any think blocks from the captured assistant text so callers can
     // replay it cleanly.

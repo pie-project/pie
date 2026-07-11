@@ -218,7 +218,6 @@ pub fn submit_async(
     request: crate::driver::LaunchPlan,
     driver_idx: usize,
     instance_id: u64,
-    host_puts: Vec<crate::ptir::PtirChannelValue>,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
     program_identity_hashes: Vec<u64>,
@@ -229,7 +228,6 @@ pub fn submit_async(
     crate::driver::scheduler_handle(driver_idx)?.submit_with_identity(
         request,
         instance_id,
-        host_puts,
         completion,
         physical_page_ids,
         last_page_len,
@@ -243,7 +241,6 @@ pub fn submit_prebuilt_async(
     request: crate::driver::LaunchPlan,
     driver_idx: usize,
     instance_id: u64,
-    host_puts: Vec<crate::ptir::PtirChannelValue>,
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
     program_identity_hashes: Vec<u64>,
@@ -252,7 +249,6 @@ pub fn submit_prebuilt_async(
     crate::driver::scheduler_handle(driver_idx)?.submit_prebuilt(
         request,
         instance_id,
-        host_puts,
         completion,
         physical_page_ids,
         last_page_len,

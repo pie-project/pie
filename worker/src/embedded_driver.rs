@@ -519,6 +519,7 @@ fn dummy_native_options(
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
         operation_log: None,
+        launch_observer: None,
     })
 }
 

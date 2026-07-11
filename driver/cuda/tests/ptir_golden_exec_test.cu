@@ -232,6 +232,37 @@ void run_beam(const std::string& dir) {
 //    decode + cache-by-hash, steady-state cache hit on empty bytes, a loud miss
 //    on an uncached hash, and a seeded per-instance fire reproducing echo's
 //    argmax vectors through the wrapper (not the raw runner). ──
+
+// Register one endpoint per trace channel (1-based global ids — 0 is the null
+// sentinel) so a PtirInstance can bind, mirroring the production
+// register_channel → bind_instance order.
+std::vector<std::uint64_t> register_trace_endpoints(
+    DeviceChannelRegistry& reg, const Trace& t) {
+    std::vector<std::uint64_t> ids(t.channels.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        ids[i] = i + 1;
+        const Channel& decl = t.channels[i];
+        PieChannelDesc desc{};
+        desc.abi_version = PIE_DRIVER_ABI_VERSION;
+        desc.channel_id = ids[i];
+        desc.shape = {decl.type.shape.dims.data(), decl.type.shape.dims.size()};
+        desc.dtype = static_cast<std::uint8_t>(decl.type.dtype);
+        desc.host_role = decl.host_reader
+            ? PIE_CHANNEL_HOST_ROLE_READER
+            : (decl.host_visible ? PIE_CHANNEL_HOST_ROLE_WRITER
+                                 : PIE_CHANNEL_HOST_ROLE_NONE);
+        desc.seeded = decl.has_seed ? 1 : 0;
+        desc.extern_dir = PIE_CHANNEL_EXTERN_NONE;
+        desc.capacity = decl.capacity;
+        desc.reader_wait_id = 2 * ids[i] - 1;
+        desc.writer_wait_id = 2 * ids[i];
+        PieChannelEndpointBinding binding{};
+        std::string err;
+        reg.register_endpoint(desc, &binding, &err);
+    }
+    return ids;
+}
+
 void run_via_runtime(const std::string& dir) {
     std::printf("[program_runtime greedy_argmax]\n");
     std::string chex, shex; std::uint64_t fhash = 0;
@@ -253,19 +284,20 @@ void run_via_runtime(const std::string& dir) {
     expect(miss == nullptr, "runtime: uncached hash + empty bytes → loud miss");
 
     // Instantiate with the D2 seed (chan0 token=[1], i32 LE) + fire echo's steps.
-    std::vector<ChannelValue> seeds = {{0, {1, 0, 0, 0}}};
+    // Seeds are keyed by GLOBAL channel id (dense 0 -> global 1).
+    std::vector<ChannelValue> seeds = {{1, {1, 0, 0, 0}}};
     DeviceChannelRegistry reg;
-    std::vector<std::uint64_t> ids(t->channels.size());
-    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = i;  // identity global ids (test)
+    std::vector<std::uint64_t> ids = register_trace_endpoints(reg, *t);
     std::string ierr;
     PtirInstance inst(*t, &reg, ids, seeds, &ierr);
     float* d_logits = nullptr; cudaMalloc(&d_logits, 8 * sizeof(float));
     auto step = [&](std::vector<float> logits, std::int32_t want) {
         cudaMemcpy(d_logits, logits.data(), 8 * sizeof(float), cudaMemcpyHostToDevice);
         FireInputs in; in.logits = d_logits; in.vocab = 8;
-        PassResult r = inst.fire({}, in);   // greedy: seed + logits only, no host_puts
+        PassResult r = inst.fire(in);   // greedy: seed + logits only, no host_puts
         auto outs = inst.harvest_outputs(); // the (channel, wire_bytes) table for delta's response SoA
-        bool shape = (outs.size() == 1 && outs[0].first == 1 && outs[0].second.size() == 4);
+        // Keyed by GLOBAL id: dense output channel 1 registered as global 2.
+        bool shape = (outs.size() == 1 && outs[0].first == 2 && outs[0].second.size() == 4);
         std::int32_t v = shape ? *reinterpret_cast<const std::int32_t*>(outs[0].second.data()) : -1;
         expect(r.ok && r.committed && shape && v == want,
                "runtime: harvest_outputs [(1," + std::to_string(want) + ")] (chans=" +
@@ -291,22 +323,22 @@ void run_via_runtime_stateful(const std::string& dir) {
     if (!t) return;
 
     // Seed chan0 = 10 (u32) ONCE at instantiation; the arena persists across fires.
-    std::vector<ChannelValue> seeds = {{0, {10, 0, 0, 0}}};
+    // Seeds are keyed by GLOBAL channel id (dense 0 -> global 1).
+    std::vector<ChannelValue> seeds = {{1, {10, 0, 0, 0}}};
     DeviceChannelRegistry reg;
-    std::vector<std::uint64_t> ids(t->channels.size());
-    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = i;  // identity global ids (test)
+    std::vector<std::uint64_t> ids = register_trace_endpoints(reg, *t);
     std::string ierr;
     PtirInstance inst(*t, &reg, ids, seeds, &ierr);
     FireInputs in;
 
-    PassResult r0 = inst.fire({}, in);
+    PassResult r0 = inst.fire(in);
     expect(r0.ok && r0.committed, "runtime-sf: fire 0 committed");
-    PassResult r1 = inst.fire({}, in);
+    PassResult r1 = inst.fire(in);
     expect(r1.ok && !r1.committed, "runtime-sf: fire 1 back-pressure (!committed)");
     std::uint32_t v = 0;
     bool got = inst.take_output(1, &v, sizeof(v));
     expect(got && v == 11, "runtime-sf: take chan1 == 11 (persisted +1; got " + std::to_string(v) + ")");
-    PassResult r2 = inst.fire({}, in);
+    PassResult r2 = inst.fire(in);
     expect(r2.ok && r2.committed, "runtime-sf: fire 2 committed");
     inst.take_output(1, &v, sizeof(v));
     expect(v == 12, "runtime-sf: take chan1 == 12 (persisted +2; got " + std::to_string(v) + ")");

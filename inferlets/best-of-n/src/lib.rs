@@ -1,92 +1,39 @@
 //! Demonstrates Best-of-N generation with diversity ranking.
 //!
-//! Forks a context N times to generate N candidate responses in parallel,
-//! then uses `strsim` to compute pairwise similarity between the extracted
-//! answers and selects the most central (consensus) answer.
+//! Generates N candidate responses from a shared prompt prefix, then uses
+//! `strsim` to compute pairwise similarity between the extracted answers and
+//! selects the most central (consensus) answer.
+//!
+//! **PTIR rewrite** (classic `forward-pass` retirement). The classic version
+//! forked the prefilled base context per candidate (`kv-working-set.fork`, lazy
+//! CoW) and ran N concurrent carrier decode loops. On the `inferlet::ptir`
+//! surface the same fork-heavy shape is expressed as a shared physical page
+//! POOL in ONE working set (the device-proven beam-designb wire form):
+//!
+//! - the common prefix (system + question + cue) is prefilled ONCE in one
+//!   N-wide fire — every candidate physically shares those KV cells, exactly
+//!   what the CoW fork bought;
+//! - the N candidates then decode as N LANES of a single batched `ForwardPass`:
+//!   lane `c` appends its token at flat pool cell `fill + c` each fire, and its
+//!   per-lane `attn_mask` row admits the shared prefix plus its OWN appended
+//!   cells only. The mask is the entire fork/isolation mechanism — no page
+//!   duplication, no fork resource.
+//!
+//! Candidate divergence comes from per-lane Gumbel noise in the fully in-graph
+//! top-p sampler (`softmax → pivot_threshold(cummass_le) → gumbel-argmax`,
+//! independent noise rows per lane). Generation is genuinely parallel: one fire
+//! advances all N candidates a step (the classic version interleaved N async
+//! loops instead).
 
-//! Low-level ① rewrite (chat-EOS, pipelined, FORK): the common prefix is
-//! prefilled once via `prefill::tokens`, forked N times with `kv.fork()`
-//! (keep-core), and each candidate decodes concurrently on the run-ahead carrier
-//! (`sampler_program(TopP)` + `submit_pass`/`discard_pass` depth-1 EOS rollback,
-//! `chat::` templating) — NO `Context`/`Generator`/`Sampler` facade. Like the
-//! original, the fork happens while the prefix prefill is in-flight (Context::flush
-//! also only enqueues) — stream ordering serializes prefix-write → candidate-read.
-
-use futures::future;
-use inferlet::inference::ForwardPass;
-use inferlet::sampler::{self, SamplerSpec};
-use inferlet::working_set::KvWorkingSet;
-use inferlet::{carrier, chat, model, prefill, Result};
+use inferlet::ptir::prelude::*;
+use inferlet::{chat, model as wit_model, Result};
 use serde::Deserialize;
 use std::time::Instant;
 
-async fn read_token(pass: ForwardPass) -> Result<u32> {
-    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
-    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
-    Ok(if bytes.len() >= 4 {
-        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
-    } else {
-        0
-    })
-}
-
-fn pass_carries(stop_empty: bool, max_tokens: usize, produced_token_index: usize) -> bool {
-    !(stop_empty && max_tokens == produced_token_index)
-}
-
-/// Run-ahead (pipelined) chat-EOS decode with depth-1 rollback, continuing from
-/// the current `*seq_len` (so a forked/prefilled prefix on `kv` is reused).
-async fn decode_pipelined(
-    kv: &KvWorkingSet,
-    seq_len: &mut u32,
-    fresh: &mut bool,
-    s: &sampler::LoweredSampler,
-    prompt: Vec<u32>,
-    max_tokens: usize,
-    stop: &[u32],
-) -> Result<Vec<u32>> {
-    let pending = if prompt.is_empty() { vec![0u32] } else { prompt };
-    let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
-    if max_tokens == 0 {
-        return Ok(out);
-    }
-    let prime_carry = pass_carries(stop.is_empty(), max_tokens, 1);
-    let mut producer = carrier::submit_pass(kv, seq_len, fresh, s, &pending, prime_carry)?;
-    let mut generated = 0usize;
-    loop {
-        let speculate = generated + 1 < max_tokens;
-        let consumer = if speculate {
-            let carry = pass_carries(stop.is_empty(), max_tokens, generated + 2);
-            Some(carrier::submit_pass(kv, seq_len, fresh, s, &[0u32], carry)?)
-        } else {
-            None
-        };
-        let token = read_token(producer).await?;
-        if stop.contains(&token) {
-            if let Some(c) = consumer {
-                carrier::discard_pass(c, seq_len).await;
-            }
-            break;
-        }
-        out.push(token);
-        generated += 1;
-        match consumer {
-            Some(c) => producer = c,
-            None => break,
-        }
-    }
-    Ok(out)
-}
-
-fn decode_text(tokens: &[u32]) -> Result<String> {
-    let mut dec = chat::Decoder::new();
-    let mut text = String::new();
-    match dec.feed(tokens)? {
-        chat::Event::Delta(s) | chat::Event::Done(s) => text.push_str(&s),
-        _ => {}
-    }
-    Ok(text)
-}
+const PAGE_T: u32 = 16; // tokens per pool page
+const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
+const TEMPERATURE: f32 = 0.6;
+const TOP_P: f32 = 0.95;
 
 #[derive(Deserialize)]
 struct Input {
@@ -107,51 +54,238 @@ You are a helpful assistant that solves problems step by step. \
 Show your reasoning, then give your final answer on the last line \
 in the format: Final Answer: <answer>";
 
+fn bx<T>(v: T) -> &'static T {
+    Box::leak(Box::new(v))
+}
+
+fn decode_text(tokens: &[u32]) -> Result<String> {
+    if tokens.is_empty() {
+        return Ok(String::new());
+    }
+    let mut dec = chat::Decoder::new();
+    let mut text = String::new();
+    match dec.feed(tokens)? {
+        chat::Event::Delta(s) | chat::Event::Done(s) => text.push_str(&s),
+        _ => {}
+    }
+    Ok(text)
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let question = input.question;
     let num_candidates = input.num_candidates;
     let max_tokens = input.max_tokens;
+    if num_candidates == 0 {
+        return Err("num_candidates must be at least 1".into());
+    }
+    let b = num_candidates as u32;
 
     let start = Instant::now();
-    let vocab = model::output_vocab_size();
-    let s = sampler::sampler_program(SamplerSpec::TopP { temperature: 0.6, p: 0.95 }, vocab)?;
+    let vocab = wit_model::output_vocab_size();
+    model::configure(vocab, PAGE_T, NUM_LAYERS);
     let stop = chat::stop_tokens();
 
-    // Build + prefill the common prefix: system + user (deferred system → the
-    // combined `system_user` form). The prefill is in-flight; the forks below
-    // inherit it (stream-ordered), matching the original's flush-then-fork.
-    let base_kv = KvWorkingSet::new();
-    let mut base_seq = 0u32;
-    let prefix = chat::system_user(SYSTEM_PROMPT, &question);
-    prefill::tokens(&base_kv, &mut base_seq, &prefix)?;
+    // Shared prefix: system + question via the deferred-system `system_user`
+    // form, plus the assistant cue. The cue is identical for every candidate so
+    // it folds into the one shared prefill (the classic version prefilled the
+    // cue once per fork — same effective per-candidate sequence).
+    let mut prefix = chat::system_user(SYSTEM_PROMPT, &question);
+    prefix.extend(chat::cue());
+    if prefix.is_empty() {
+        prefix.push(0);
+    }
+    let n = prefix.len() as u32;
 
-    // --- Stage 1: Fork N candidates, decode concurrently ---
     println!("--- Generating {} candidates in parallel ---", num_candidates);
 
-    let mut forks: Vec<(KvWorkingSet, u32)> = Vec::with_capacity(num_candidates);
-    for _ in 0..num_candidates {
-        let fk = base_kv.fork().map_err(|e| format!("fork: {e}"))?;
-        forks.push((fk, base_seq)); // each inherits the prefilled prefix + cursor
+    let mut cand_tokens: Vec<Vec<u32>> = vec![Vec::new(); num_candidates];
+
+    if max_tokens > 0 {
+        // Shared physical page pool: prefix + all candidates' appends.
+        let pool_pages = (n + b * max_tokens as u32 + 2 + PAGE_T - 1) / PAGE_T;
+        let pool = pool_pages * PAGE_T;
+        let ws: &'static WorkingSet = bx(WorkingSet::new());
+        let slots = ws.alloc(pool_pages).map_err(|e| format!("ws.alloc: {e}"))?;
+        let pool_ids: &'static Vec<u32> = bx(slots.ids().to_vec()); // physical page ids
+
+        // ─────────────── 1. SHARED-PREFIX PREFILL FIRE (N-wide) ───────────────
+        // One fire writes the prefix KV cells 0..n every candidate shares, and
+        // samples B INDEPENDENT first tokens off the read-out row (per-lane
+        // Gumbel noise over the shared nucleus keep-mask).
+        let prefix_i32: Vec<i32> = prefix.iter().map(|&t| t as i32).collect();
+        let toks_p = bx(Channel::from(prefix_i32).named("toks_p")); // [N] i32 (seeded)
+        let embed_indptr_p = Tensor::constant(vec![0u32, n]); // qo_indptr [0,N]
+
+        // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
+        let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
+        let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
+        let w_slot_p = bx(Channel::from(w_slot_pv).named("w_slot_p"));
+        let w_off_p = bx(Channel::from(w_off_pv).named("w_off_p"));
+        let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
+        let pages_p = bx(Channel::from(pool_ids.clone()).named("pages_p"));
+        let page_indptr_p = bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p"));
+
+        // Causal prefill mask [N, POOL]: query row i attends KV cols j <= i.
+        let mask_pv: Vec<bool> = (0..n).flat_map(|i| (0..pool).map(move |j| j <= i)).collect();
+        let mask_p = bx(Channel::from_shaped([n, pool], mask_pv).named("mask_p"));
+        let rng_p = bx(Channel::from(vec![0x51ed_u32, 0]).named("rng_p"));
+        let g0s_ch = bx(Channel::new([b], dtype::i32).named("g0s"));
+
+        let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
+        fwd_p.embed(toks_p, embed_indptr_p);
+        fwd_p.attn_working_set(ws, klen_p);
+        fwd_p.port_channel(Port::Pages, pages_p);
+        fwd_p.port_channel(Port::PageIndptr, page_indptr_p);
+        fwd_p.port_channel(Port::WSlot, w_slot_p);
+        fwd_p.port_channel(Port::WOff, w_off_p);
+        fwd_p.attn_mask(mask_p);
+        fwd_p.epilogue(move || {
+            let r = rng_p.take();
+            // Shared nucleus keep-mask over the read-out row, then B independent
+            // Gumbel draws → B distinct first tokens.
+            let logits = intrinsics::logits(); // [vocab] (single read-out row)
+            let scaled = div(&logits, TEMPERATURE.max(1e-4));
+            let probs = softmax(&scaled);
+            let keep = pivot_threshold(&probs, cummass_le(TOP_P));
+            let masked = mask_apply(&scaled, &keep); // [vocab]
+            let wide = broadcast(reshape(&masked, [1, vocab]), [b, vocab]); // [B, vocab]
+            let g = gumbel(&r, [b, vocab]); // independent per-lane noise
+            let toks0 = reduce_argmax(add(&wide, &g)); // [B] i32
+            let r_next = add(&r, iota(2)); // advance ctr: [key, ctr+1]
+            g0s_ch.put(&toks0);
+            rng_p.put(&r_next);
+        });
+
+        let prefill = Pipeline::new();
+        prefill.submit(fwd_p).map_err(|e| format!("prefill submit: {e}"))?;
+        let g0s: Vec<i32> = g0s_ch.take().get::<i32>().map_err(|e| format!("g0s take: {e}"))?;
+        prefill.close();
+
+        let mut done = vec![false; num_candidates];
+        for (c, &t) in g0s.iter().enumerate().take(num_candidates) {
+            let t = t as u32;
+            if stop.contains(&t) {
+                done[c] = true;
+            } else {
+                cand_tokens[c].push(t);
+            }
+        }
+
+        // ──────────────── 2. BATCHED DECODE (B lanes = candidates) ────────────
+        // Lane c embeds its own previous token (device loop-carried) at logical
+        // position n + step and appends its KV at flat pool cell fill + c. All
+        // lanes share the pool pages; each lane's mask row admits the shared
+        // prefix plus its own cells only.
+        let tok_in = bx(Channel::from(g0s.clone()).named("tok_in")); // [B] device loop-carried
+        let pos = bx(Channel::from(vec![n; num_candidates]).named("pos"));
+        let fill = bx(Channel::from(vec![n + b; 1]).named("fill")); // next free flat cell
+        let klen = bx(Channel::from(vec![n + b; num_candidates]).named("klen"));
+        let w_slot_v: Vec<u32> = (0..b).map(|c| pool_ids[((n + c) / PAGE_T) as usize]).collect();
+        let w_off_v: Vec<u32> = (0..b).map(|c| (n + c) % PAGE_T).collect();
+        let w_slot = bx(Channel::from(w_slot_v).named("w_slot"));
+        let w_off = bx(Channel::from(w_off_v).named("w_off"));
+        // Lane c's seed mask: the shared prefix (j < n) plus its own fire-0 cell.
+        let seed_mask: Vec<bool> = (0..b)
+            .flat_map(|c| (0..pool).map(move |j| j < n || j == n + c))
+            .collect();
+        let mask = bx(Channel::from_shaped([b, pool], seed_mask).named("mask"));
+        let tiled: Vec<u32> = (0..b).flat_map(|_| pool_ids.iter().copied()).collect();
+        let pages = bx(Channel::from(tiled).named("pages")); // [B*POOL_PAGES]
+        let pidx_v: Vec<u32> = (0..=b).map(|c| c * pool_pages).collect();
+        let page_indptr = bx(Channel::from_shaped([b + 1], pidx_v).named("page_indptr"));
+        let pool_ids_ch = bx(Channel::new([pool_pages], dtype::u32).named("pool_ids"));
+        let out = bx(Channel::new([b], dtype::i32).named("out"));
+        let rng = bx(Channel::from(vec![0x9e37_u32, 0]).named("rng"));
+        let lanes = Tensor::constant((0..=b).collect::<Vec<u32>>()); // qo_indptr [0..=B]
+
+        let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
+        fwd.embed(tok_in, lanes);
+        fwd.positions(pos);
+        fwd.attn_working_set(ws, klen);
+        fwd.port_channel(Port::Pages, pages);
+        fwd.port_channel(Port::PageIndptr, page_indptr);
+        fwd.port_channel(Port::WSlot, w_slot);
+        fwd.port_channel(Port::WOff, w_off);
+        fwd.attn_mask(mask);
+        fwd.epilogue(move || {
+            // TAKES + compute first, PUTS last (value-id discipline).
+            let base = fill.take().tensor(); // [1] u32 — next fire's first append cell
+            let pids = pool_ids_ch.take(); // [POOL_PAGES] physical page ids
+            let r = rng.take();
+
+            // Per-lane top-p + temperature sample over [B, vocab] logits
+            // (row-wise nucleus, independent Gumbel noise per lane).
+            let logits = intrinsics::logits(); // [B, vocab]
+            let scaled = div(&logits, TEMPERATURE.max(1e-4));
+            let probs = softmax(&scaled);
+            let keep = pivot_threshold(&probs, cummass_le(TOP_P));
+            let masked = mask_apply(&scaled, &keep);
+            let g = gumbel(&r, [b, vocab]);
+            let toks = reduce_argmax(add(&masked, &g)); // [B] i32
+            let r_next = add(&r, iota(2));
+
+            // Flat append cells for the NEXT fire: wpos = base + lane.
+            let lane = iota(b);
+            let base_b = broadcast(reshape(&base, [1]), [b]);
+            let wpos = add(&base_b, &lane); // [B]
+
+            // Mask evolution: each lane keeps its own ancestry + its new cell.
+            let col = broadcast(reshape(iota(pool), [1, pool]), [b, pool]);
+            let wpos_c = broadcast(reshape(&wpos, [b, 1]), [b, pool]);
+            let new_mask = or(mask.take(), eq(col, wpos_c)); // [B, POOL]
+
+            // Explicit write descriptor via the host-fed physical pool ids.
+            let w_slot_n = gather(&pids, &div(&wpos, PAGE_T)); // [B]
+            let w_off_n = rem(&wpos, PAGE_T); // [B]
+            let filled = add(&base, b); // [1] span after the next fire's appends
+            let klen_n = broadcast(reshape(&filled, [1]), [b]);
+            let pos_n = add(pos.take(), 1u32);
+            let pages_n = reshape(
+                broadcast(reshape(&pids, [1, pool_pages]), [b, pool_pages]),
+                [b * pool_pages],
+            );
+            let pidx_n = mul(&iota(b + 1), pool_pages);
+
+            tok_in.put(&toks);
+            out.put(&toks);
+            mask.put(&new_mask);
+            w_slot.put(&w_slot_n);
+            w_off.put(&w_off_n);
+            klen.put(&klen_n);
+            pos.put(&pos_n);
+            fill.put(&filled);
+            pages.put(&pages_n);
+            page_indptr.put(&pidx_n);
+            rng.put(&r_next);
+        });
+
+        let decode = Pipeline::new();
+        let mut generated = 1usize; // the prefill's g0s already emitted
+        while generated < max_tokens && done.iter().any(|d| !d) {
+            pool_ids_ch.put(pool_ids.clone());
+            decode.submit(fwd).map_err(|e| format!("decode submit: {e}"))?;
+            let step: Vec<i32> = out.take().get::<i32>().map_err(|e| format!("out.take: {e}"))?;
+            generated += 1;
+            for (c, &t) in step.iter().enumerate().take(num_candidates) {
+                if done[c] {
+                    continue; // lane keeps firing; its output is ignored
+                }
+                let t = t as u32;
+                if stop.contains(&t) {
+                    done[c] = true;
+                } else {
+                    cand_tokens[c].push(t);
+                }
+            }
+        }
+        decode.close();
     }
 
-    let cue = chat::cue();
-    let s_ref = &s;
-    let stop_ref: &[u32] = &stop;
-    let futs = forks.into_iter().map(|(fk, seq)| {
-        let cue = cue.clone();
-        async move {
-            let mut fseq = seq;
-            let mut ffresh = false; // inherited (prefilled) context, not a fresh generate
-            let toks =
-                decode_pipelined(&fk, &mut fseq, &mut ffresh, s_ref, cue, max_tokens, stop_ref)
-                    .await?;
-            decode_text(&toks)
-        }
-    });
-
-    let results: Vec<Result<String>> = future::join_all(futs).await;
-    let candidates: Vec<String> = results.into_iter().collect::<Result<Vec<_>>>()?;
+    let candidates: Vec<String> = cand_tokens
+        .iter()
+        .map(|t| decode_text(t))
+        .collect::<Result<Vec<_>>>()?;
 
     let generation_time = start.elapsed();
     println!(

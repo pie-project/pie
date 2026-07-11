@@ -151,7 +151,7 @@ fn rust_layout_matches_committed_header_contract() {
     assert_layout!(PieInstanceBinding, 8, 8, instance_id => 0);
     assert_layout!(
         PieLaunchDesc,
-        592,
+        560,
         8,
         abi_version => 0,
         reserved0 => 4,
@@ -188,10 +188,8 @@ fn rust_layout_matches_committed_header_contract() {
         audio_feature_indptr => 480,
         audio_anchor_rows => 496,
         audio_indptr => 512,
-        ptir_host_put_values => 528,
-        host_put_indptr => 544,
-        kv_len => 560,
-        kv_len_device => 576
+        kv_len => 528,
+        kv_len_device => 544
     );
     assert_layout!(
         PieKvCopyDesc,

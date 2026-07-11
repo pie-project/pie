@@ -12,9 +12,29 @@ use pie_engine::driver::{
 };
 use pie_engine::inference::scheduler::BatchScheduler;
 
-/// Optional observer retained by older integration harnesses.
+/// Launch observer for harness probes, wired onto the dummy driver's launch
+/// path via [`launch_observer`]: it sees every accepted launch's forward
+/// geometry, and a sleeping implementation keeps that fire outstanding (the
+/// forced-overlap latency the concurrency suites rely on).
 pub trait Behavior: Send + Sync + 'static {
     fn observe_launch(&self, _req: &LaunchPlan) {}
+}
+
+/// Adapt a [`Behavior`] to the dummy driver's [`LaunchObserver`]: rebuild the
+/// observed forward geometry as a [`LaunchPlan`] and forward it to
+/// `observe_launch` synchronously on the launch path.
+pub fn launch_observer(behavior: Arc<dyn Behavior>) -> pie_driver_dummy_lib::LaunchObserver {
+    pie_driver_dummy_lib::LaunchObserver(Arc::new(move |obs| {
+        let plan = LaunchPlan {
+            token_ids: obs.token_ids.clone(),
+            qo_indptr: obs.qo_indptr.clone(),
+            kv_page_indices: obs.kv_page_indices.clone(),
+            kv_page_indptr: obs.kv_page_indptr.clone(),
+            kv_last_page_lens: obs.kv_last_page_lens.clone(),
+            ..LaunchPlan::default()
+        };
+        behavior.observe_launch(&plan);
+    }))
 }
 
 /// Helper: derive the request count from `qo_indptr`.
@@ -156,7 +176,11 @@ impl CallRecorder {
     }
 }
 
-fn register_dummy_driver(num_kv_pages: usize, driver_idx: usize) -> (usize, BatchScheduler) {
+fn register_dummy_driver(
+    num_kv_pages: usize,
+    driver_idx: usize,
+    behavior: Arc<dyn Behavior>,
+) -> (usize, BatchScheduler) {
     let (native, _) = NativeDriver::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_kv_pages as u32,
         kv_page_size: 16,
@@ -174,6 +198,7 @@ fn register_dummy_driver(num_kv_pages: usize, driver_idx: usize) -> (usize, Batc
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
         operation_log: None,
+        launch_observer: Some(launch_observer(behavior)),
     })
     .expect("create dummy native driver");
     let limits = SchedulerLimits {
@@ -200,10 +225,10 @@ pub struct MockBackend {
 }
 
 impl MockBackend {
-    pub fn new(num_devices: usize, _behavior: Arc<dyn Behavior>) -> Self {
+    pub fn new(num_devices: usize, behavior: Arc<dyn Behavior>) -> Self {
         let recorder = Arc::new(CallRecorder::new());
         let (driver_ids, schedulers) = (0..num_devices)
-            .map(|driver_idx| register_dummy_driver(64, driver_idx))
+            .map(|driver_idx| register_dummy_driver(64, driver_idx, behavior.clone()))
             .unzip();
         Self {
             driver_ids,

@@ -110,18 +110,18 @@ impl BatchAccumulator {
 }
 
 pub(crate) fn build_batch_request(
-    requests: &[PendingRequest],
+    requests: &mut [PendingRequest],
     page_size: u32,
     stats: &SchedulerStats,
 ) -> LaunchSubmission {
     if requests.len() == 1 && requests[0].prebuilt {
-        let req = &requests[0];
+        // Nothing reads a prebuilt plan after submission, so move it into the
+        // launch instead of cloning its geometry vectors.
+        let req = &mut requests[0];
         return LaunchSubmission {
-            plan: req.request.clone(),
+            plan: std::mem::take(&mut req.request),
             instance_ids: vec![req.instance_id],
             terminal_cells: vec![req.completion.terminal_cell_ptr()],
-            host_put_values: req.host_puts.clone(),
-            host_put_indptr: vec![0, req.host_puts.len() as u32],
         };
     }
     let elide_decode_masks = requests.iter().all(|req| {
@@ -133,9 +133,6 @@ pub(crate) fn build_batch_request(
         let mut batch_req = request::new_batched_forward_request_with_capacity(requests.len());
         let mut instance_ids = Vec::with_capacity(requests.len());
         let mut terminal_cells = Vec::with_capacity(requests.len());
-        let mut host_put_values = Vec::new();
-        let mut host_put_indptr = Vec::with_capacity(requests.len() + 1);
-        host_put_indptr.push(0);
         for req in requests {
             instance_ids.push(req.instance_id);
             terminal_cells.push(req.completion.terminal_cell_ptr());
@@ -147,15 +144,11 @@ pub(crate) fn build_batch_request(
                 page_size,
                 elide_decode_masks,
             );
-            host_put_values.extend(req.host_puts.iter().cloned());
-            host_put_indptr.push(host_put_values.len() as u32);
         }
         LaunchSubmission {
             plan: batch_req,
             instance_ids,
             terminal_cells,
-            host_put_values,
-            host_put_indptr,
         }
     })
 }

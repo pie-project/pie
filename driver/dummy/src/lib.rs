@@ -27,6 +27,29 @@ use pie_ptir::registry::{KernelInfo, ModelProfile};
 use pie_ptir::types::{DType, ValueType};
 use pie_ptir::validate::BoundTrace;
 
+/// One accepted `launch`'s forward geometry, copied out of the descriptor into
+/// owned vectors (safe to hold past the call) for test probes.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchObservation {
+    pub token_ids: Vec<u32>,
+    pub qo_indptr: Vec<u32>,
+    pub kv_page_indices: Vec<u32>,
+    pub kv_page_indptr: Vec<u32>,
+    pub kv_last_page_lens: Vec<u32>,
+}
+
+/// Synchronous observer invoked on the launch path for every accepted launch
+/// (test probes: page-assignment assertions, injected per-fire latency — a
+/// sleeping observer keeps the fire outstanding, forcing real overlap).
+#[derive(Clone)]
+pub struct LaunchObserver(pub Arc<dyn Fn(&LaunchObservation) + Send + Sync>);
+
+impl std::fmt::Debug for LaunchObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaunchObserver")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DummyDriverOptions {
     pub total_pages: u32,
@@ -45,6 +68,7 @@ pub struct DummyDriverOptions {
     pub reject_launches_remaining: u32,
     pub fail_launches_after_accept: bool,
     pub operation_log: Option<Arc<Mutex<Vec<String>>>>,
+    pub launch_observer: Option<LaunchObserver>,
 }
 
 impl Default for DummyDriverOptions {
@@ -66,6 +90,7 @@ impl Default for DummyDriverOptions {
             reject_launches_remaining: 0,
             fail_launches_after_accept: false,
             operation_log: None,
+            launch_observer: None,
         }
     }
 }
@@ -110,6 +135,14 @@ struct DummyEndpoint {
     words: Box<[AtomicU64]>,
     attachments: HashMap<u64, Option<ExternDir>>,
     shared: Option<ExternChannel>,
+    /// Host-writer ring cursors (plan §4.3). `pulled` counts host-published
+    /// ring entries already fed into the interp; `reserved_head` counts ring
+    /// consumes scheduled by accepted fires (the head word publishes to it on
+    /// success); `seed_credit` covers a seeded Writer's bind-time seed, which
+    /// the first consuming fire takes instead of a ring entry.
+    pulled: u64,
+    reserved_head: u64,
+    seed_credit: bool,
 }
 
 #[derive(Debug)]
@@ -123,7 +156,6 @@ struct BoundInstanceState {
 struct BoundInstanceInner {
     interp: InterpInstance,
     channels: Vec<DummyChannel>,
-    channel_index_by_id: HashMap<u64, usize>,
     next_pacing_epoch: u64,
     closed: bool,
 }
@@ -141,17 +173,19 @@ struct OwnedValueDesc {
     bytes: Vec<u8>,
 }
 
+/// One writer-channel consume scheduled for an accepted fire: the dense
+/// channel index and the head-word value to publish when the fire commits.
 #[derive(Clone, Debug)]
-struct PreparedHostPut {
+struct ScheduledConsume {
     dense_channel: usize,
-    value: Value,
+    target_head: u64,
 }
 
 #[derive(Debug)]
 struct LaunchInstanceWork {
     instance: Arc<BoundInstanceState>,
     pacing_epoch: u64,
-    host_puts: Vec<PreparedHostPut>,
+    writer_consumes: Vec<ScheduledConsume>,
     terminal_cell: *mut PieTerminalCell,
 }
 
@@ -190,6 +224,7 @@ pub struct DummyDriver {
     runtime: SendableRuntimeCallbacks,
     callback_workers: Vec<std::thread::JoinHandle<()>>,
     operation_log: Option<Arc<Mutex<Vec<String>>>>,
+    launch_observer: Option<LaunchObserver>,
 }
 
 impl DummyDriver {
@@ -242,6 +277,7 @@ impl DummyDriver {
             runtime,
             callback_workers: Vec::new(),
             operation_log,
+            launch_observer: options.launch_observer,
         }
     }
 
@@ -379,6 +415,10 @@ impl DummyDriver {
                 .map(|_| AtomicU64::new(0))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            pulled: 0,
+            reserved_head: 0,
+            seed_credit: desc.seeded != 0
+                && desc.host_role == pie_driver_abi::PIE_CHANNEL_HOST_ROLE_WRITER,
             attachments: HashMap::new(),
             shared: if desc.extern_dir == PIE_CHANNEL_EXTERN_NONE {
                 None
@@ -517,18 +557,12 @@ impl DummyDriver {
                 endpoint,
             })
             .collect::<Vec<_>>();
-        let channel_index_by_id = channels
-            .iter()
-            .enumerate()
-            .map(|(idx, channel)| (channel.global_id, idx))
-            .collect();
         let instance = Arc::new(BoundInstanceState {
             program: Arc::clone(&program),
             instance_id,
             inner: Mutex::new(BoundInstanceInner {
                 interp,
                 channels,
-                channel_index_by_id,
                 next_pacing_epoch: 1,
                 closed: false,
             }),
@@ -578,15 +612,6 @@ impl DummyDriver {
         );
         ensure_completion(completion)?;
         validate_launch_shape(desc, instance_ids.len())?;
-        let host_put_values =
-            copy_value_descs(desc.ptir_host_put_values, "launch.ptir_host_put_values")?;
-        let host_put_indptr = copy_u32_slice(desc.host_put_indptr, "launch.host_put_indptr")?;
-        validate_indptr(
-            &host_put_indptr,
-            host_put_values.len(),
-            instance_ids.len(),
-            "launch.host_put_indptr",
-        )?;
         if self.reject_launches {
             bail!("launch rejected by dummy test option");
         }
@@ -595,6 +620,22 @@ impl DummyDriver {
             bail!("launch rejected by dummy test option");
         }
         ensure_unique_launch_members(&instance_ids, &terminal_cells)?;
+
+        // Test probe: surface the accepted launch's forward geometry, on the
+        // launch path (a sleeping observer keeps this fire outstanding).
+        if let Some(observer) = &self.launch_observer {
+            let observation = LaunchObservation {
+                token_ids: copy_u32_slice(desc.token_ids, "launch.token_ids")?,
+                qo_indptr: copy_u32_slice(desc.qo_indptr, "launch.qo_indptr")?,
+                kv_page_indices: copy_u32_slice(desc.kv_page_indices, "launch.kv_page_indices")?,
+                kv_page_indptr: copy_u32_slice(desc.kv_page_indptr, "launch.kv_page_indptr")?,
+                kv_last_page_lens: copy_u32_slice(
+                    desc.kv_last_page_lens,
+                    "launch.kv_last_page_lens",
+                )?,
+            };
+            (observer.0)(&observation);
+        }
 
         let state = self.state.lock().unwrap();
         let instances = instance_ids
@@ -609,44 +650,78 @@ impl DummyDriver {
             .collect::<Result<Vec<_>>>()?;
         drop(state);
 
+        // §4.3: pull host-published writer ring entries into the interp, then
+        // validate availability for every launched instance BEFORE accepting
+        // anything — a missing put is a guest ordering bug and rejects the
+        // launch synchronously (no epoch consumed, no poison published).
         let mut prepared = Vec::with_capacity(instances.len());
+        let mut planned_extra: HashMap<usize, u64> = HashMap::new();
+        let mut planned_seed_spend: HashSet<usize> = HashSet::new();
         for (slot, instance) in instances.iter().enumerate() {
-            let range = host_put_indptr[slot] as usize..host_put_indptr[slot + 1] as usize;
-            let inner = instance.inner.lock().unwrap();
+            let mut inner = instance.inner.lock().unwrap();
             ensure!(!inner.closed, "instance {} is closed", instance.instance_id);
-            let mut puts = Vec::with_capacity(range.len());
-            for value_desc in &host_put_values[range] {
-                let dense = *inner
-                    .channel_index_by_id
-                    .get(&value_desc.channel_id)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "instance {} has no channel {}",
-                            instance.instance_id,
-                            value_desc.channel_id
-                        )
-                    })?;
-                let channel = &inner.channels[dense];
-                ensure!(
-                    channel.host_role == HostRole::Writer,
-                    "channel {} is not a host-writer channel",
-                    value_desc.channel_id
+            let program = Arc::clone(&instance.program);
+            let mut consumes = Vec::new();
+            for dense in 0..inner.channels.len() {
+                let channel = inner.channels[dense].clone();
+                if channel.host_role != HostRole::Writer {
+                    continue;
+                }
+                pull_writer_ring(&mut inner, &program, dense, &channel)?;
+                if !fire_takes_channel(&program.bound, dense as u32) {
+                    continue;
+                }
+                let endpoint_key = Arc::as_ptr(&channel.endpoint) as usize;
+                let endpoint = channel.endpoint.lock().unwrap();
+                let tail = endpoint.words[1].load(Ordering::Acquire);
+                let extra = planned_extra.entry(endpoint_key).or_insert(0);
+                let credit = u64::from(
+                    endpoint.seed_credit && !planned_seed_spend.contains(&endpoint_key),
                 );
-                let value = decode_wire_value(&value_desc.bytes, channel.ty)
-                    .map_err(|err| anyhow!("host put channel {}: {err}", value_desc.channel_id))?;
-                puts.push(PreparedHostPut {
-                    dense_channel: dense,
-                    value,
-                });
+                if tail.saturating_sub(endpoint.reserved_head + *extra) + credit < 1 {
+                    bail!(
+                        "channel {} has no host input for this fire \
+                         (put must happen before submit)",
+                        channel.global_id
+                    );
+                }
+                if credit == 1 {
+                    planned_seed_spend.insert(endpoint_key);
+                    consumes.push(ScheduledConsume {
+                        dense_channel: dense,
+                        target_head: endpoint.reserved_head + *extra,
+                    });
+                } else {
+                    *extra += 1;
+                    consumes.push(ScheduledConsume {
+                        dense_channel: dense,
+                        target_head: endpoint.reserved_head + *extra,
+                    });
+                }
             }
             let pacing_epoch = inner.next_pacing_epoch;
             drop(inner);
             prepared.push(LaunchInstanceWork {
                 instance: Arc::clone(instance),
                 pacing_epoch,
-                host_puts: puts,
+                writer_consumes: consumes,
                 terminal_cell: terminal_cells[slot],
             });
+        }
+        // Every member validated — commit the scheduled reservations.
+        for work in &prepared {
+            let inner = work.instance.inner.lock().unwrap();
+            for consume in &work.writer_consumes {
+                let mut endpoint = inner.channels[consume.dense_channel]
+                    .endpoint
+                    .lock()
+                    .unwrap();
+                if endpoint.seed_credit && consume.target_head == endpoint.reserved_head {
+                    endpoint.seed_credit = false;
+                } else {
+                    endpoint.reserved_head = consume.target_head;
+                }
+            }
         }
 
         let callback = self.prepare_callback(completion)?;
@@ -818,7 +893,7 @@ fn process_launch_instance(instance: &LaunchInstanceWork) -> LaunchInstanceResul
             &instance.instance.program,
             instance.instance.instance_id,
             instance.pacing_epoch,
-            &instance.host_puts,
+            &instance.writer_consumes,
         ) {
             Ok(reader_epochs) => {
                 notify_waits.extend(reader_epochs);
@@ -865,24 +940,72 @@ fn publish_terminal(cell: *mut PieTerminalCell, outcome: u32) {
     }
 }
 
+/// Whether one fire of `bound` consumes (takes) dense channel `dense` — via a
+/// stage `ChanTake` or a consuming descriptor port. Take is register-like
+/// within a pass (the ring index bumps at most once per fire), so this is the
+/// per-fire consume count.
+fn fire_takes_channel(bound: &BoundTrace, dense: u32) -> bool {
+    let stage_take = bound.container.stages.iter().any(|stage| {
+        stage
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::ChanTake(c) if *c == dense))
+    });
+    let port_take = bound.container.ports.iter().any(|binding| {
+        binding.port.consumes()
+            && matches!(binding.source, container::PortSource::Channel(c) if c == dense)
+    });
+    stage_take || port_take
+}
+
+/// §4.3 driver pull: move host-published writer-ring entries (mirror cells up
+/// to the release-published tail word) into the interp's channel queue,
+/// advancing the endpoint's `pulled` cursor. Interp backpressure leaves the
+/// remainder in the ring for a later fire.
+fn pull_writer_ring(
+    inner: &mut BoundInstanceInner,
+    program: &DummyProgram,
+    dense: usize,
+    channel: &DummyChannel,
+) -> Result<()> {
+    loop {
+        let (sequence, wire) = {
+            let endpoint = channel.endpoint.lock().unwrap();
+            let tail = endpoint.words[1].load(Ordering::Acquire);
+            if endpoint.pulled >= tail {
+                return Ok(());
+            }
+            let cell = channel_wire_bytes(&endpoint.shape, endpoint.dtype)?;
+            let cap1 = u64::from(endpoint.capacity) + 1;
+            let offset = (endpoint.pulled % cap1) as usize * cell;
+            (
+                endpoint.pulled,
+                endpoint.mirror[offset..offset + cell].to_vec(),
+            )
+        };
+        let value = decode_wire_value(&wire, channel.ty)
+            .map_err(|err| anyhow!("writer ring channel {}: {err}", channel.global_id))?;
+        match inner.interp.host_put(&program.bound, dense as u32, value) {
+            Ok(()) => {
+                channel.endpoint.lock().unwrap().pulled = sequence + 1;
+            }
+            Err(HostError::WouldBlock) => return Ok(()),
+            Err(err) => bail!(
+                "writer ring pull failed for channel {}: {err:?}",
+                channel.global_id
+            ),
+        }
+    }
+}
+
 fn run_instance_step(
     inner: &mut BoundInstanceInner,
     program: &DummyProgram,
     instance_id: u64,
     pacing_epoch: u64,
-    host_puts: &[PreparedHostPut],
+    writer_consumes: &[ScheduledConsume],
 ) -> Result<Vec<(u64, u64)>> {
     let mut notify_waits = Vec::new();
-    for host_put in host_puts {
-        inner
-            .interp
-            .host_put(
-                &program.bound,
-                host_put.dense_channel as u32,
-                host_put.value.clone(),
-            )
-            .map_err(|err| anyhow!("host put failed: {err:?}"))?;
-    }
     let pass_inputs = build_pass_inputs(
         &program.intrinsics,
         pacing_epoch,
@@ -903,13 +1026,18 @@ fn run_instance_step(
                 .unwrap_or_default()
         );
     }
-    for host_put in host_puts {
-        let endpoint = inner.channels[host_put.dense_channel]
+    // §4.4: publish the consumed head word per writer channel (release), then
+    // notify its writer wait slot with the new head — space became available.
+    for consume in writer_consumes {
+        let endpoint = inner.channels[consume.dense_channel]
             .endpoint
             .lock()
             .unwrap();
-        let head = endpoint.words[0].fetch_add(1, Ordering::Release) + 1;
-        notify_waits.push((endpoint.writer_wait_id, head));
+        let previous = endpoint.words[0].load(Ordering::Acquire);
+        if consume.target_head > previous {
+            endpoint.words[0].store(consume.target_head, Ordering::Release);
+            notify_waits.push((endpoint.writer_wait_id, consume.target_head));
+        }
     }
 
     for dense in 0..inner.channels.len() {
@@ -2344,6 +2472,25 @@ mod tests {
         out
     }
 
+    /// Direct host put (ABI v2): write the wire bytes into the writer
+    /// endpoint's pinned ring cell and release-publish the tail word.
+    fn ring_put(binding: &TestInstanceBinding, dense: usize, wire: &[u8]) {
+        let endpoint = binding.endpoints[dense];
+        let words =
+            unsafe { std::slice::from_raw_parts(endpoint.word_base as *const AtomicU64, 4) };
+        let tail = words[endpoint.tail_word_index as usize].load(Ordering::Acquire);
+        let cap1 = u64::from(endpoint.capacity) + 1;
+        let offset = (tail % cap1) as usize * endpoint.cell_bytes as usize;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                wire.as_ptr(),
+                (endpoint.mirror_base as *mut u8).add(offset),
+                wire.len(),
+            );
+        }
+        words[endpoint.tail_word_index as usize].store(tail + 1, Ordering::Release);
+    }
+
     fn read_cell(
         binding: &TestInstanceBinding,
         channel: TestChannelBinding,
@@ -2447,7 +2594,6 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let host_put_indptr = [0u32, 0u32];
         driver
             .launch(
                 &PieLaunchDesc {
@@ -2458,10 +2604,6 @@ mod tests {
                     terminal_cells: PieTerminalCellPtrSlice {
                         ptr: terminal_ptrs.as_ptr(),
                         len: terminal_ptrs.len(),
-                    },
-                    host_put_indptr: PieU32Slice {
-                        ptr: host_put_indptr.as_ptr(),
-                        len: host_put_indptr.len(),
                     },
                     ..PieLaunchDesc::default()
                 },
@@ -2563,7 +2705,6 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let host_put_indptr = [0u32, 0u32];
         driver
             .launch(
                 &PieLaunchDesc {
@@ -2574,10 +2715,6 @@ mod tests {
                     terminal_cells: PieTerminalCellPtrSlice {
                         ptr: terminal_ptrs.as_ptr(),
                         len: terminal_ptrs.len(),
-                    },
-                    host_put_indptr: PieU32Slice {
-                        ptr: host_put_indptr.as_ptr(),
-                        len: host_put_indptr.len(),
                     },
                     ..PieLaunchDesc::default()
                 },
@@ -2655,7 +2792,6 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let host_put_indptr = [0u32, 0u32, 0u32];
         driver
             .launch(
                 &PieLaunchDesc {
@@ -2666,10 +2802,6 @@ mod tests {
                     terminal_cells: PieTerminalCellPtrSlice {
                         ptr: terminal_ptrs.as_ptr(),
                         len: terminal_ptrs.len(),
-                    },
-                    host_put_indptr: PieU32Slice {
-                        ptr: host_put_indptr.as_ptr(),
-                        len: host_put_indptr.len(),
                     },
                     ..PieLaunchDesc::default()
                 },
@@ -2800,20 +2932,13 @@ mod tests {
             &[],
             401,
         );
-        let host_put_bytes = 7u32.to_le_bytes();
-        let host_puts = [PieChannelValueDesc {
-            channel_id: 100,
-            bytes: PieBytes {
-                ptr: host_put_bytes.as_ptr(),
-                len: std::mem::size_of::<u32>(),
-            },
-        }];
+        // ABI v2: the put is a direct ring write, pulled by the launch.
+        ring_put(&binding, 0, &7u32.to_le_bytes());
         let instance_ids = [binding.instance_id];
         let mut terminal_cells = [pending_terminal_cell()];
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let host_put_indptr = [0u32, 1u32];
         driver
             .launch(
                 &PieLaunchDesc {
@@ -2824,14 +2949,6 @@ mod tests {
                     terminal_cells: PieTerminalCellPtrSlice {
                         ptr: terminal_ptrs.as_ptr(),
                         len: terminal_ptrs.len(),
-                    },
-                    ptir_host_put_values: PieChannelValueDescSlice {
-                        ptr: host_puts.as_ptr(),
-                        len: host_puts.len(),
-                    },
-                    host_put_indptr: PieU32Slice {
-                        ptr: host_put_indptr.as_ptr(),
-                        len: host_put_indptr.len(),
                     },
                     ..PieLaunchDesc::default()
                 },
@@ -2908,20 +3025,13 @@ mod tests {
             &[],
             411,
         );
-        let host_put_bytes = 9u32.to_le_bytes();
-        let host_puts = [PieChannelValueDesc {
-            channel_id: 110,
-            bytes: PieBytes {
-                ptr: host_put_bytes.as_ptr(),
-                len: std::mem::size_of::<u32>(),
-            },
-        }];
+        // ABI v2: the put is a direct ring write, pulled by the launch.
+        ring_put(&binding, 0, &9u32.to_le_bytes());
         let instance_ids = [binding.instance_id];
         let mut terminal_cells = [pending_terminal_cell()];
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let host_put_indptr = [0u32, 1u32];
         driver
             .launch(
                 &PieLaunchDesc {
@@ -2932,14 +3042,6 @@ mod tests {
                     terminal_cells: PieTerminalCellPtrSlice {
                         ptr: terminal_ptrs.as_ptr(),
                         len: terminal_ptrs.len(),
-                    },
-                    ptir_host_put_values: PieChannelValueDescSlice {
-                        ptr: host_puts.as_ptr(),
-                        len: host_puts.len(),
-                    },
-                    host_put_indptr: PieU32Slice {
-                        ptr: host_put_indptr.as_ptr(),
-                        len: host_put_indptr.len(),
                     },
                     ..PieLaunchDesc::default()
                 },
@@ -2953,7 +3055,10 @@ mod tests {
         callbacks.wait_for_notification((511, 13));
         let notices = callbacks.notifications_for(511);
         assert_eq!(notices, vec![(511, 13)]);
-        for wait_id in [310, 212, 213] {
+        // The writer ring already published tail 1, so its poison epoch is 2;
+        // the untouched readers poison at 1.
+        assert_eq!(callbacks.notifications_for(310), vec![(310, 2)]);
+        for wait_id in [212, 213] {
             assert_eq!(callbacks.notifications_for(wait_id), vec![(wait_id, 1)]);
         }
         assert_eq!(terminal_cells[0].outcome, PIE_TERMINAL_OUTCOME_FAILED);
@@ -2993,7 +3098,6 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let host_put_indptr = [0u32, 0u32];
         driver
             .launch(
                 &PieLaunchDesc {
@@ -3004,10 +3108,6 @@ mod tests {
                     terminal_cells: PieTerminalCellPtrSlice {
                         ptr: terminal_ptrs.as_ptr(),
                         len: terminal_ptrs.len(),
-                    },
-                    host_put_indptr: PieU32Slice {
-                        ptr: host_put_indptr.as_ptr(),
-                        len: host_put_indptr.len(),
                     },
                     ..PieLaunchDesc::default()
                 },
@@ -3065,7 +3165,8 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let host_put_indptr = [1u32, 1u32];
+        // token_ids without matching position_ids is a malformed descriptor.
+        let tokens = [1u32];
         let err = driver
             .launch(
                 &PieLaunchDesc {
@@ -3077,9 +3178,9 @@ mod tests {
                         ptr: terminal_ptrs.as_ptr(),
                         len: terminal_ptrs.len(),
                     },
-                    host_put_indptr: PieU32Slice {
-                        ptr: host_put_indptr.as_ptr(),
-                        len: host_put_indptr.len(),
+                    token_ids: PieU32Slice {
+                        ptr: tokens.as_ptr(),
+                        len: tokens.len(),
                     },
                     ..PieLaunchDesc::default()
                 },
@@ -3127,7 +3228,6 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let host_put_indptr = [0u32, 0u32, 0u32];
 
         let err = driver
             .launch(
@@ -3139,10 +3239,6 @@ mod tests {
                     terminal_cells: PieTerminalCellPtrSlice {
                         ptr: terminal_ptrs.as_ptr(),
                         len: terminal_ptrs.len(),
-                    },
-                    host_put_indptr: PieU32Slice {
-                        ptr: host_put_indptr.as_ptr(),
-                        len: host_put_indptr.len(),
                     },
                     ..PieLaunchDesc::default()
                 },
@@ -3197,7 +3293,6 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let host_put_indptr = [0u32, 0u32];
         driver
             .launch(
                 &PieLaunchDesc {
@@ -3208,10 +3303,6 @@ mod tests {
                     terminal_cells: PieTerminalCellPtrSlice {
                         ptr: terminal_ptrs.as_ptr(),
                         len: terminal_ptrs.len(),
-                    },
-                    host_put_indptr: PieU32Slice {
-                        ptr: host_put_indptr.as_ptr(),
-                        len: host_put_indptr.len(),
                     },
                     ..PieLaunchDesc::default()
                 },
@@ -3261,7 +3352,6 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        let host_put_indptr = [0u32, 0u32];
         driver
             .launch(
                 &PieLaunchDesc {
@@ -3272,10 +3362,6 @@ mod tests {
                     terminal_cells: PieTerminalCellPtrSlice {
                         ptr: terminal_ptrs.as_ptr(),
                         len: terminal_ptrs.len(),
-                    },
-                    host_put_indptr: PieU32Slice {
-                        ptr: host_put_indptr.as_ptr(),
-                        len: host_put_indptr.len(),
                     },
                     ..PieLaunchDesc::default()
                 },

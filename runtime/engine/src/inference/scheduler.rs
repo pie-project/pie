@@ -1,7 +1,7 @@
 //! Per-driver direct batch scheduler.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,6 @@ use crate::driver::{
     RegisteredChannel, SchedulerLimits, StateCopyPlan,
 };
 use crate::process::ProcessId;
-use crate::ptir::PtirChannelValue;
 use anyhow::{Result, anyhow};
 
 use super::batch::{self, BatchAccumulator};
@@ -52,6 +51,16 @@ struct LifecycleEvent {
 pub(crate) fn notify_pipeline_leave(_pid: ProcessId, _kind: LeaveKind) {}
 pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
 
+/// Wake-class counter (plan §16.2): completions that the 250 ms hang backstop
+/// discovered already settled — a lost nudge. Steady state stays at zero; any
+/// increment is a wake-path regression worth a warning.
+pub(crate) static BACKSTOP_RETIREMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Total backstop-path retirements since process start (test observability).
+pub(crate) fn backstop_retirements() -> u64 {
+    BACKSTOP_RETIREMENTS.load(Ordering::Relaxed)
+}
+
 pub(crate) fn now_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -62,7 +71,6 @@ pub(crate) fn now_micros() -> u64 {
 pub(crate) struct PendingRequest {
     pub(crate) request: crate::driver::LaunchPlan,
     pub(crate) instance_id: u64,
-    pub(crate) host_puts: Vec<PtirChannelValue>,
     pub(crate) completion: InstanceCompletion,
     pub(crate) physical_page_ids: Vec<PhysicalPageId>,
     pub(crate) last_page_len: u32,
@@ -77,7 +85,6 @@ impl PendingRequest {
     fn direct(
         request: crate::driver::LaunchPlan,
         instance_id: u64,
-        host_puts: Vec<PtirChannelValue>,
         completion: InstanceCompletion,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
@@ -89,7 +96,6 @@ impl PendingRequest {
         Self {
             request,
             instance_id,
-            host_puts,
             completion,
             physical_page_ids,
             last_page_len,
@@ -138,7 +144,48 @@ enum SchedulerItem {
         id: u64,
         response: crossbeam::channel::Sender<Result<()>>,
     },
+    /// Event-driven retirement wake: sent by [`NudgeWaker`] when an in-flight
+    /// driver completion publishes. Carries no work; it only unblocks the
+    /// scheduler's wait so the retire pass runs immediately.
+    Nudge,
     Stop,
+}
+
+/// Wakes the scheduler thread through its own queue when a registered driver
+/// completion publishes, so batch/control retirement is event-driven instead
+/// of timeout-polled (plan §5.1).
+struct NudgeWaker {
+    tx: crossbeam::channel::Sender<SchedulerItem>,
+}
+
+impl std::task::Wake for NudgeWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.tx.send(SchedulerItem::Nudge);
+    }
+}
+
+/// Register the nudge waker on a pending completion's wait slot with
+/// register-then-recheck. Returns false when the completion has already
+/// settled (or its slot is gone) and the caller should retire immediately.
+fn arm_completion_nudge(completion: &Completion, waker: &std::task::Waker) -> bool {
+    if completion.is_settled() {
+        return false;
+    }
+    let table = pie_waker::WakerTable::global();
+    let slot = completion.wait_id();
+    let observed = table.published(slot).unwrap_or_default();
+    if !table.register(slot, waker, observed) {
+        return false;
+    }
+    if completion.is_settled() {
+        table.deregister(slot);
+        return false;
+    }
+    true
 }
 
 enum QueuedItem {
@@ -225,7 +272,6 @@ impl SchedulerHandle {
         &self,
         request: crate::driver::LaunchPlan,
         instance_id: u64,
-        host_puts: Vec<PtirChannelValue>,
         completion: InstanceCompletion,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
@@ -237,7 +283,6 @@ impl SchedulerHandle {
             pending: PendingRequest::direct(
                 request,
                 instance_id,
-                host_puts,
                 completion,
                 physical_page_ids,
                 last_page_len,
@@ -253,7 +298,6 @@ impl SchedulerHandle {
         &self,
         request: crate::driver::LaunchPlan,
         instance_id: u64,
-        host_puts: Vec<PtirChannelValue>,
         completion: InstanceCompletion,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
@@ -263,7 +307,6 @@ impl SchedulerHandle {
             pending: PendingRequest::direct(
                 request,
                 instance_id,
-                host_puts,
                 completion,
                 physical_page_ids,
                 last_page_len,
@@ -354,11 +397,12 @@ impl BatchScheduler {
         };
         let _ = crate::driver::registry::install_scheduler_handle(driver_id, handle.clone());
         let stats_for_loop = Arc::clone(&stats);
+        let nudge_tx = handle.inner.tx.clone();
         let thread = std::thread::Builder::new()
             .name(format!("pie-sched-{driver_idx}"))
             .spawn(move || {
                 let _request_timeout = Duration::from_secs(request_timeout_secs);
-                Self::run(driver_id, rx, page_size, limits, stats_for_loop);
+                Self::run(driver_id, rx, nudge_tx, page_size, limits, stats_for_loop);
             })
             .expect("spawn pie-sched thread");
         Self {
@@ -394,10 +438,12 @@ impl BatchScheduler {
     fn run(
         driver_id: DriverId,
         rx: crossbeam::channel::Receiver<SchedulerItem>,
+        nudge_tx: crossbeam::channel::Sender<SchedulerItem>,
         page_size: u32,
         limits: SchedulerLimits,
         stats: Arc<SchedulerStats>,
     ) {
+        let nudge_waker = std::task::Waker::from(Arc::new(NudgeWaker { tx: nudge_tx }));
         let mut driver = crate::driver::take_native_driver(driver_id).ok();
         let mut instances = HashMap::new();
         let mut channels = HashSet::new();
@@ -460,9 +506,45 @@ impl BatchScheduler {
                     }
                 }
             } else {
-                match rx.recv_timeout(Duration::from_millis(5)) {
+                // Event-driven retirement: park the nudge waker on the oldest
+                // in-flight completions so the driver callback wakes this
+                // thread the moment one publishes. The timeout is only a hang
+                // backstop, never the steady-state wake path.
+                let mut armed = true;
+                if let Some(front) = in_flight_launches.front() {
+                    armed &= arm_completion_nudge(&front.completion, &nudge_waker);
+                }
+                if let Some(control) = in_flight_control.as_ref() {
+                    armed &= arm_completion_nudge(&control.completion, &nudge_waker);
+                }
+                if !armed {
+                    // Something already settled; retire it on the next pass.
+                    continue;
+                }
+                match rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(item) => Some(item),
-                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => None,
+                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                        // A settled completion discovered by the backstop
+                        // means a wake was lost somewhere — the steady-state
+                        // count stays zero (plan §16.2). Shutdown races are
+                        // excluded: teardown may legitimately cross a tick.
+                        let missed = in_flight_launches
+                            .front()
+                            .is_some_and(|front| front.completion.is_settled())
+                            || in_flight_control
+                                .as_ref()
+                                .is_some_and(|control| control.completion.is_settled());
+                        if missed && !stopping {
+                            let total =
+                                BACKSTOP_RETIREMENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                            tracing::warn!(
+                                driver_id,
+                                total,
+                                "completion retired by the backstop poll, not the nudge"
+                            );
+                        }
+                        None
+                    }
                     Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                         stopping = true;
                         None
@@ -497,6 +579,9 @@ impl BatchScheduler {
     ) {
         match item {
             SchedulerItem::Stop => *stopping = true,
+            // A nudge only unblocks the wait; the retire pass at the top of
+            // the loop does the work.
+            SchedulerItem::Nudge => {}
             SchedulerItem::Launch { pending: launch } => {
                 let validation = BatchAccumulator::new(limits, page_size);
                 let rejection = if !instances.contains_key(&launch.instance_id) {
@@ -760,10 +845,23 @@ impl BatchScheduler {
     ) -> bool {
         let mut batch = BatchAccumulator::new(limits, page_size);
         let mut batch_instances = std::collections::HashSet::new();
+        let mut rejected_stale = false;
         while let Some(QueuedItem::Launch(next)) = pending.front() {
-            if instances.get(&next.instance_id).is_none()
-                || !batch_instances.insert(next.instance_id)
-            {
+            if instances.get(&next.instance_id).is_none() {
+                // A launch whose instance closed between enqueue validation
+                // and dispatch must be rejected here, not left at the queue
+                // front where it would head-of-line block the driver forever.
+                let Some(QueuedItem::Launch(stale)) = pending.pop_front() else {
+                    unreachable!();
+                };
+                stale.completion.reject(format!(
+                    "instance {} is unknown or stale",
+                    stale.instance_id
+                ));
+                rejected_stale = true;
+                continue;
+            }
+            if !batch_instances.insert(next.instance_id) {
                 break;
             }
             if batch.would_exceed(next) {
@@ -779,14 +877,16 @@ impl BatchScheduler {
         }
         let mut requests = batch.take();
         if requests.is_empty() {
-            return false;
+            return rejected_stale;
         }
-        let submission = batch::build_batch_request(&requests, page_size, stats);
         let batch_size = requests.len() as u64;
+        // Token stats must be read before build: a prebuilt single-request
+        // batch moves its plan into the submission.
         let total_tokens = requests
             .iter()
             .map(|req| req.request.token_ids.len())
             .sum::<usize>();
+        let submission = batch::build_batch_request(&mut requests, page_size, stats);
         let mut candidate_epochs = Vec::with_capacity(requests.len());
         for request in &requests {
             let Some(instance) = instances.get(&request.instance_id) else {
@@ -1180,7 +1280,6 @@ mod tests {
             driver_id,
             bound.instance_id,
             Vec::new(),
-            Vec::new(),
             0,
             Vec::new(),
             launch.clone(),
@@ -1244,7 +1343,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             Vec::new(),
             0,
             Vec::new(),
@@ -1310,7 +1408,6 @@ mod tests {
             driver_id,
             bound.instance_id,
             Vec::new(),
-            Vec::new(),
             0,
             Vec::new(),
             completion.clone(),
@@ -1361,7 +1458,6 @@ mod tests {
             driver_id,
             bound.instance_id,
             Vec::new(),
-            Vec::new(),
             0,
             Vec::new(),
             rejected.clone(),
@@ -1381,7 +1477,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             Vec::new(),
             0,
             Vec::new(),
@@ -1422,7 +1517,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             Vec::new(),
             0,
             Vec::new(),
@@ -1473,7 +1567,6 @@ mod tests {
             driver_id,
             bound_a.instance_id,
             Vec::new(),
-            Vec::new(),
             0,
             Vec::new(),
             first.clone(),
@@ -1484,7 +1577,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound_b.instance_id,
-            Vec::new(),
             Vec::new(),
             0,
             Vec::new(),
@@ -1535,7 +1627,6 @@ mod tests {
             driver_id,
             bound.instance_id,
             Vec::new(),
-            Vec::new(),
             0,
             Vec::new(),
             first.clone(),
@@ -1549,7 +1640,6 @@ mod tests {
                 dummy_launch(),
                 driver_id,
                 instance_id,
-                Vec::new(),
                 Vec::new(),
                 0,
                 Vec::new(),
@@ -1608,7 +1698,6 @@ mod tests {
             driver_id,
             bound_a.instance_id,
             Vec::new(),
-            Vec::new(),
             0,
             Vec::new(),
             first.clone(),
@@ -1637,7 +1726,6 @@ mod tests {
                 dummy_launch(),
                 second_driver_id,
                 second_instance_id,
-                Vec::new(),
                 Vec::new(),
                 0,
                 Vec::new(),
@@ -1735,7 +1823,6 @@ mod tests {
             bound.driver_id,
             bound.instance_id,
             Vec::new(),
-            Vec::new(),
             0,
             Vec::new(),
             launch.clone(),
@@ -1815,7 +1902,6 @@ mod tests {
             driver_id,
             bound_a.instance_id,
             Vec::new(),
-            Vec::new(),
             0,
             Vec::new(),
             a,
@@ -1825,7 +1911,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound_b.instance_id,
-            Vec::new(),
             Vec::new(),
             0,
             Vec::new(),
@@ -1868,6 +1953,462 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn completion_retirement_is_event_driven() -> anyhow::Result<()> {
+        // Plan §14 gate 6: the driver callback's nudge retires the batch, not
+        // the backstop poll. A retirement that misses the nudge waits out the
+        // 250 ms backstop and trips the bound below.
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                callback_delay_ms: 30,
+                operation_log: Some(operation_log),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let backstops_before = backstop_retirements();
+        let completion = bound.reserve_completion();
+        let started = Instant::now();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            Vec::new(),
+            completion.clone(),
+        )?;
+        timeout(Duration::from_secs(5), completion).await??;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "retirement must ride the completion nudge, not the backstop poll (took {elapsed:?})"
+        );
+        assert_eq!(
+            backstop_retirements(),
+            backstops_before,
+            "steady state retires with zero backstop-path wakeups (plan §16.2)"
+        );
+        driver::close_instance(&bound)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parked_reader_wakes_straight_from_the_driver_callback() -> anyhow::Result<()> {
+        // Plan §14 gates 2/3: a task that never submitted (and drains no
+        // pipeline FIFO) parks on the channel's reader wait slot and wakes
+        // straight from the driver's per-channel notify, with the published
+        // tail word already visible.
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, endpoints) =
+            setup_scheduler(operation_log).await?;
+        let waiter = tokio::spawn({
+            let endpoint = Arc::clone(&endpoints[1]);
+            async move { endpoint.wait_for_reader_change(0).await }
+        });
+        tokio::task::yield_now().await;
+
+        let completion = bound.reserve_completion();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            Vec::new(),
+            completion.clone(),
+        )?;
+        timeout(Duration::from_secs(5), waiter)
+            .await??
+            .expect("reader wake surfaces the new tail, not an error");
+        let binding = endpoints[1].registered().binding;
+        let tail = unsafe {
+            (&*((binding.word_base as *const std::sync::atomic::AtomicU64)
+                .add(binding.tail_word_index as usize)))
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(tail, 1, "the tail word is published before the wake");
+        timeout(Duration::from_secs(5), completion).await??;
+        driver::close_instance(&bound)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn writer_ring_backpressure_wakes_after_a_consuming_fire() -> anyhow::Result<()> {
+        // Plan §14 gates 4/5 over the REAL put path: `ChannelCell::put`
+        // writes the driver-shared ring directly; puts past capacity are
+        // Full; a fire with no put rejects synchronously; a consuming fire
+        // publishes the head word and notifies the writer wait slot.
+        use crate::ptir::ptir_channel_store::ChannelCell;
+        let driver_id = driver::register_native_driver(
+            DriverSpec {
+                num_kv_pages: 16,
+                limits: SchedulerLimits {
+                    max_forward_requests: 1,
+                    max_forward_tokens: 64,
+                    max_page_refs: 64,
+                },
+            },
+            NativeDriver::Dummy(crate::driver::DummyLocalDriver::new(
+                DummyDriverOptions::default(),
+            )),
+        );
+        let _scheduler = BatchScheduler::new(
+            driver_id,
+            driver_id,
+            16,
+            SchedulerLimits {
+                max_forward_requests: 1,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+            },
+            1,
+        );
+        // chan 0: host Writer u32[1], taken every fire; chan 1: host Reader.
+        let container_bytes = TraceContainer {
+            names: vec![],
+            externs: vec![],
+            channels: vec![
+                chan(Shape::vector(1), DType::U32, HostRole::Writer, false),
+                chan(Shape::vector(1), DType::U32, HostRole::Reader, false),
+            ],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![Op::ChanTake(0), Op::ChanPut { chan: 1, value: 0 }],
+            }],
+        }
+        .encode();
+        let program_id = driver::register_program(
+            driver_id,
+            ProgramRegistration {
+                program_hash: pie_ptir::container_hash(&container_bytes),
+                canonical_bytes: container_bytes,
+                sidecar_bytes: Vec::new(),
+            },
+        )?;
+        let writer_decl = ChannelDecl {
+            shape: Shape::vector(1),
+            dtype: ChanDType::Concrete(DType::U32),
+            capacity: 2,
+            host_role: HostRole::Writer,
+            seeded: false,
+        };
+        let mut writer_cell = ChannelCell::new(vec![1], DType::U32, 2);
+        writer_cell.bind(&writer_decl);
+        let reader_cell = ChannelCell::new(vec![1], DType::U32, 2);
+        let channel_ids = [writer_cell.global_id, reader_cell.global_id];
+        let endpoints = [
+            (channel_ids[0], HostRole::Writer),
+            (channel_ids[1], HostRole::Reader),
+        ]
+        .into_iter()
+        .map(|(channel_id, host_role)| {
+            driver::register_channel(
+                driver_id,
+                ChannelRegistrationPlan {
+                    driver_id,
+                    channel_id,
+                    shape: vec![1],
+                    dtype: pie_driver_abi::PIE_CHANNEL_DTYPE_U32,
+                    host_role: host_role as u8,
+                    seeded: false,
+                    extern_dir: pie_driver_abi::PIE_CHANNEL_EXTERN_NONE,
+                    capacity: 2,
+                    reader_wait_id: 0,
+                    writer_wait_id: 0,
+                    extern_name: Vec::new(),
+                },
+            )
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+        let bound = driver::bind_instance(
+            driver_id,
+            program_id,
+            51,
+            channel_ids.to_vec(),
+            Vec::new(),
+        )?;
+        writer_cell
+            .attach_endpoint(Arc::clone(&endpoints[0]))
+            .map_err(|error| anyhow!(error))?;
+
+        // Gate 5: a fire whose trace takes from the empty writer ring is
+        // rejected synchronously — no epoch, no poison.
+        let rejected = bound.reserve_completion();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            Vec::new(),
+            rejected.clone(),
+        )?;
+        let err = timeout(Duration::from_secs(5), rejected.clone())
+            .await?
+            .expect_err("a missing put must reject the launch");
+        assert!(
+            err.to_string().contains("no host input"),
+            "unexpected rejection: {err}"
+        );
+        assert_eq!(rejected.target_epoch(), 0, "no epoch consumed");
+
+        // Gate 4: puts fill the shared ring up to capacity, then Full.
+        writer_cell.put(1u32.to_le_bytes().to_vec()).unwrap();
+        writer_cell.put(2u32.to_le_bytes().to_vec()).unwrap();
+        assert_eq!(
+            writer_cell.put(3u32.to_le_bytes().to_vec()).unwrap_err(),
+            crate::ptir::ptir_channel_store::ChannelError::Full
+        );
+
+        // A consuming fire commits: the head word publishes and the writer
+        // wait slot is notified — the parked producer wakes and puts again.
+        let waiter = tokio::spawn({
+            let endpoint = Arc::clone(&endpoints[0]);
+            async move { endpoint.wait_for_writer_change(0).await }
+        });
+        tokio::task::yield_now().await;
+        let completion = bound.reserve_completion();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            Vec::new(),
+            completion.clone(),
+        )?;
+        timeout(Duration::from_secs(5), waiter)
+            .await??
+            .expect("writer wake surfaces the new head, not an error");
+        timeout(Duration::from_secs(5), completion).await??;
+        writer_cell
+            .put(3u32.to_le_bytes().to_vec())
+            .expect("space released by the consumed entry");
+        driver::close_instance(&bound)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parked_reader_wakes_into_poisoned_not_empty() -> anyhow::Result<()> {
+        // Plan §14 gate 7: a failed fire release-stores the poison word BEFORE
+        // the channel notify, so a parked reader wakes into Poisoned — never
+        // into a spurious Empty retry.
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                fail_launches_after_accept: true,
+                operation_log: Some(operation_log),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let waiter = tokio::spawn({
+            let endpoint = Arc::clone(&endpoints[1]);
+            async move { endpoint.wait_for_reader_change(0).await }
+        });
+        tokio::task::yield_now().await;
+        let completion = bound.reserve_completion();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            Vec::new(),
+            completion.clone(),
+        )?;
+        let woke = timeout(Duration::from_secs(5), waiter).await??;
+        assert!(
+            matches!(
+                woke,
+                Err(crate::driver::frame::ChannelWaitError::Poisoned(_))
+            ),
+            "a parked take classifies the failed fire as Poisoned, got {woke:?}"
+        );
+        let _ = timeout(Duration::from_secs(5), completion)
+            .await?
+            .expect_err("the failed fire's terminal outcome is surfaced");
+        driver::close_instance(&bound)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn extern_export_flows_into_importing_instance() -> anyhow::Result<()> {
+        // Plan §14 gate 3: instance A's fire fills a shared extern channel;
+        // instance B's fire consumes it and publishes to its host reader —
+        // cross-instance dataflow over one global channel registration.
+        use pie_ptir::container::{ExternDecl, ExternDir};
+        let driver_id = driver::register_native_driver(
+            DriverSpec {
+                num_kv_pages: 16,
+                limits: SchedulerLimits {
+                    max_forward_requests: 1,
+                    max_forward_tokens: 64,
+                    max_page_refs: 64,
+                },
+            },
+            NativeDriver::Dummy(crate::driver::DummyLocalDriver::new(
+                DummyDriverOptions::default(),
+            )),
+        );
+        let _scheduler = BatchScheduler::new(
+            driver_id,
+            driver_id,
+            16,
+            SchedulerLimits {
+                max_forward_requests: 1,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+            },
+            1,
+        );
+        let exporter_bytes = TraceContainer {
+            names: vec!["shared".to_string()],
+            externs: vec![ExternDecl {
+                name: 0,
+                dir: ExternDir::Export,
+                chan: 0,
+            }],
+            channels: vec![chan(Shape::vector(1), DType::U32, HostRole::None, false)],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::Const(Literal::U32(7)),
+                    Op::Broadcast {
+                        value: 0,
+                        shape: Shape::vector(1),
+                    },
+                    Op::ChanPut { chan: 0, value: 1 },
+                ],
+            }],
+        }
+        .encode();
+        let importer_bytes = TraceContainer {
+            names: vec!["shared".to_string()],
+            externs: vec![ExternDecl {
+                name: 0,
+                dir: ExternDir::Import,
+                chan: 0,
+            }],
+            channels: vec![
+                chan(Shape::vector(1), DType::U32, HostRole::None, false),
+                chan(Shape::vector(1), DType::U32, HostRole::Reader, false),
+            ],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![Op::ChanTake(0), Op::ChanPut { chan: 1, value: 0 }],
+            }],
+        }
+        .encode();
+        let exporter_program = driver::register_program(
+            driver_id,
+            ProgramRegistration {
+                program_hash: pie_ptir::container_hash(&exporter_bytes),
+                canonical_bytes: exporter_bytes,
+                sidecar_bytes: Vec::new(),
+            },
+        )?;
+        let importer_program = driver::register_program(
+            driver_id,
+            ProgramRegistration {
+                program_hash: pie_ptir::container_hash(&importer_bytes),
+                canonical_bytes: importer_bytes,
+                sidecar_bytes: Vec::new(),
+            },
+        )?;
+        let shared = driver::register_channel(
+            driver_id,
+            ChannelRegistrationPlan {
+                driver_id,
+                channel_id: 91,
+                shape: vec![1],
+                dtype: pie_driver_abi::PIE_CHANNEL_DTYPE_U32,
+                host_role: HostRole::None as u8,
+                seeded: false,
+                extern_dir: pie_driver_abi::PIE_CHANNEL_EXTERN_EXPORT,
+                capacity: 2,
+                reader_wait_id: 0,
+                writer_wait_id: 0,
+                extern_name: b"shared".to_vec(),
+            },
+        )?;
+        let reader = driver::register_channel(
+            driver_id,
+            ChannelRegistrationPlan {
+                driver_id,
+                channel_id: 92,
+                shape: vec![1],
+                dtype: pie_driver_abi::PIE_CHANNEL_DTYPE_U32,
+                host_role: HostRole::Reader as u8,
+                seeded: false,
+                extern_dir: pie_driver_abi::PIE_CHANNEL_EXTERN_NONE,
+                capacity: 2,
+                reader_wait_id: 0,
+                writer_wait_id: 0,
+                extern_name: Vec::new(),
+            },
+        )?;
+        let _ = shared;
+        let exporter = driver::bind_instance(
+            driver_id,
+            exporter_program,
+            61,
+            vec![91],
+            Vec::new(),
+        )?;
+        let importer = driver::bind_instance(
+            driver_id,
+            importer_program,
+            62,
+            vec![91, 92],
+            Vec::new(),
+        )?;
+
+        // A parked take on the importer's reader — a task that never
+        // submitted anything — observes the cross-instance flow end to end.
+        let waiter = tokio::spawn({
+            let endpoint = Arc::clone(&reader);
+            async move { endpoint.wait_for_reader_change(0).await }
+        });
+        tokio::task::yield_now().await;
+        let export_fire = exporter.reserve_completion();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            exporter.instance_id,
+            Vec::new(),
+            0,
+            Vec::new(),
+            export_fire.clone(),
+        )?;
+        let import_fire = importer.reserve_completion();
+        crate::inference::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            importer.instance_id,
+            Vec::new(),
+            0,
+            Vec::new(),
+            import_fire.clone(),
+        )?;
+        timeout(Duration::from_secs(5), export_fire).await??;
+        timeout(Duration::from_secs(5), import_fire).await??;
+        timeout(Duration::from_secs(5), waiter)
+            .await??
+            .expect("the importer's publish wakes the parked reader");
+        let binding = reader.registered().binding;
+        let value = unsafe {
+            std::ptr::read_unaligned(binding.mirror_base as *const u32)
+        };
+        assert_eq!(value, 7, "the exported value crossed instances");
+        driver::close_instance(&exporter)?;
+        driver::close_instance(&importer)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn timeout_bounded_shutdown_stress() -> anyhow::Result<()> {
         timeout(Duration::from_secs(5), async {
             let operation_log = Arc::new(Mutex::new(Vec::new()));
@@ -1884,7 +2425,6 @@ mod tests {
                     dummy_launch(),
                     driver_id,
                     bound.instance_id,
-                    Vec::new(),
                     Vec::new(),
                     0,
                     Vec::new(),

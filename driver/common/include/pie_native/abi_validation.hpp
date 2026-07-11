@@ -301,7 +301,6 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     PIE_VALIDATE_SLICE(audio_feature_indptr);
     PIE_VALIDATE_SLICE(audio_anchor_rows);
     PIE_VALIDATE_SLICE(audio_indptr);
-    PIE_VALIDATE_SLICE(host_put_indptr);
     PIE_VALIDATE_SLICE(kv_len);
     PIE_VALIDATE_SLICE(kv_len_device);
 #undef PIE_VALIDATE_SLICE
@@ -309,8 +308,6 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     status = validate_bytes(desc->image_pixels);
     if (status != PIE_STATUS_OK) return status;
     status = validate_bytes(desc->audio_features);
-    if (status != PIE_STATUS_OK) return status;
-    status = validate_channel_values(desc->ptir_host_put_values);
     if (status != PIE_STATUS_OK) return status;
     status = validate_masks(desc->masks, desc->instance_ids.len);
     if (status != PIE_STATUS_OK) return status;
@@ -350,8 +347,6 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
              desc->audio_feature_indptr.len,
              desc->audio_anchor_rows.len,
              desc->audio_indptr.len,
-             desc->ptir_host_put_values.len,
-             desc->host_put_indptr.len,
              desc->kv_len.len,
              desc->kv_len_device.len,
          }) {
@@ -416,11 +411,6 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     if (status != PIE_STATUS_OK) return status;
     status = validate_csr(
         desc->sampling_indptr, desc->sampling_indices.len, request_count);
-    if (status != PIE_STATUS_OK) return status;
-    status = validate_csr(
-        desc->host_put_indptr,
-        desc->ptir_host_put_values.len,
-        request_count);
     if (status != PIE_STATUS_OK) return status;
     if (desc->kv_page_indptr.len != 0 &&
         desc->kv_last_page_lens.len != request_count) {

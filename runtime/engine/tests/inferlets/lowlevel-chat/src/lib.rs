@@ -1,277 +1,363 @@
-//! **Low-level chat-EOS greedy generation with EXPLICIT run-ahead + rollback**
-//! (foxtrot ∥ bravo). In Gim's directive — inferlets on the RAW WIT API, NO
-//! helper-SDK decode loop (`Context` / `Generator` / `collect_*`). The whole
-//! decode loop, including the pipelining, is hand-written HERE in the inferlet:
+//! **Low-level chat-EOS greedy generation with EXPLICIT run-ahead + rollback**,
+//! rewritten on the PTIR surface (`inferlet::ptir`). The whole decode loop,
+//! including the pipelining, is still hand-written HERE in the inferlet:
 //!
-//!   fire (producer) → speculate the next fire (consumer) BEFORE awaiting the
-//!   producer → harvest the producer's token → if it is a chat-EOS stop, DISCARD
-//!   the ≤1 speculated over-shot fire (depth-1 rollback) and finish; else promote
-//!   the consumer and carry its sampled token device-side into the next fire.
+//!   submit (producer fire) → speculate the next fire (consumer submit) BEFORE
+//!   harvesting the producer's token off the `out` channel → if the harvested
+//!   token is a chat-EOS stop, DISCARD the ≤1 speculated over-shot fire's
+//!   output (depth-1 rollback) and finish; else keep draining. The sampled
+//!   token is carried DEVICE-side between fires (the loop-carried `tok_in`
+//!   channel put in the epilogue), so a speculated fire needs no host input.
 //!
-//! This proves BOTH directives at once: (1) an inferlet needs no helper SDK — it
-//! drives `inference::ForwardPass` / `working_set::KvWorkingSet` / a greedy
-//! `tensor::Program` / the `pie:instruct/chat` WIT bindings directly; and (2)
-//! pipelining is EXPLICIT and natural on the low-level API — the run-ahead carrier
-//! (`next_inputs(&[0])`) + the EOS rollback are written in plain view, not hidden
-//! in a `collect_*_pipelined` helper.
+//! MIGRATION MAP (classic → PTIR):
+//!   - `carrier::submit_pass(carry=true)`  → `pipeline.submit(&fwd)` where the
+//!     epilogue puts the sampled token into `tok_in` (the device carrier) and
+//!     evolves the KV geometry + causal mask in-graph (the text-completion /
+//!     ptir-prefill-e2e wire form).
+//!   - `SamplerSpec::Argmax` / `LoweredSampler` → the in-graph greedy program
+//!     `reduce_argmax(intrinsics::logits())` in the epilogue.
+//!   - `KvWorkingSet` + host cursor → `WorkingSet` page pool + seeded geometry
+//!     channels (`pos`/`fill`/`klen`/`w_slot`/`w_off`/`mask`), advanced by the
+//!     epilogue each fire.
+//!   - `carrier::discard_pass` (WAR-drain + cursor rollback) → take-and-drop
+//!     the over-shot fire's `out` value. A discarded fire has already run and
+//!     written its (unused) KV cell; the stream ends there, so the cell is
+//!     inert and the pool is torn down with the stream.
+//!   - prompt prefill: the classic path fed the prompt as the first pass's
+//!     input tokens; here it is ONE N-wide prefill fire (multi-query causal
+//!     mask + N-cell KV write) whose read-out row yields the first token g0.
 //!
-//! MECHANISM (owned by bravo): `ptir-pipelined-eos-rollback-spec` (§4.3 depth-1
-//! fire-past-EOS discard) + `runtime/tests/inferlets/runahead` (the raw run-ahead
-//! carrier template). The novelty vs `runahead::decode_pipelined`: we speculate
-//! the successor EVEN when a stop is configured, and clean up the over-shot
-//! fire(s) — so a chat generation that ends on EOS still pipelines (instead of
-//! degrading to sequential).
+//! NOT PRESERVED (and why): speculation ACROSS the prefill boundary. The
+//! classic loop speculated the successor of the prompt pass itself; the PTIR
+//! templates keep the prefill host-gated (read g0, then seed the decode
+//! channels from it), so run-ahead starts at the first decode fire. The
+//! rollback probe therefore forces the stop on the SECOND generated token
+//! (the first DECODE-fire token) so the deep loop still speculates past a
+//! stop and discards its over-shot fires.
 //!
-//! DEEP CARRIER (the production lever, bravo): `decode_pipelined_deep_eos` submits
-//! `depth` carrier-linked fires UPFRONT (FIFO drain + refill) via echo's
-//! `carrier::submit_pass(carry=true)`, discarding the ≤`depth`−1 over-shot on EOS
-//! via `carrier::discard_pass`. This keeps a pipeline's fires DENSELY resident (the
-//! co-batch 8× residency lever) AND cuts the per-token host round-trip (the
-//! reduce-R bubble-close) — the production analog of
-//! `runahead::decode_pipelined_deep_stop`. `DEEP_MATCH` self-checks deep == sync.
+//! DEEP CARRIER: `Mode::Deep(depth)` submits `depth` fires UPFRONT (FIFO
+//! drain + refill) over the ptir run-ahead FIFO, discarding the ≤`depth`−1
+//! over-shot outputs on EOS. `DEEP_MATCH` self-checks deep == sync.
 //!
-//! VALUE-VERIFY: the inferlet self-checks `pipelined == sequential` (`MATCH`) and
-//! that the rollback path fires cleanly under a forced early stop (`ROLLBACK_OK`).
-//! On the mock the device carrier is a no-op and the sampler is input-independent,
-//! so `MATCH` is DEGENERATE (both paths read the same constant) — the mock proves
-//! only that the loop + rollback run to completion without panic/hang. Real
-//! token-identity is the 4090 gate (`bin/pie/tests/cuda_lowlevel_chat.rs`).
+//! VALUE-VERIFY: the inferlet self-checks `pipelined == sequential` (`MATCH`)
+//! and that the forced-early-stop rollback path drains cleanly
+//! (`ROLLBACK_OK`). On the mock the dummy driver's deterministic logits vary
+//! per fire AND per pass instance, so the two streams need not be equal:
+//! the mock smoke (`lowlevel_chat_mock`) asserts only that the loops run to
+//! completion with the full `n=max_tokens` budget and a well-formed report.
+//! Token identity is the 4090 gate (`bin/pie/tests/cuda_lowlevel_chat.rs`).
+//! The mock run passes `no-rollback-probe`, which skips the deep + forced-stop
+//! device paths exactly like the classic version did.
 //!
-//! Input: optional token budget (default 8), e.g. `"16"`.
+//! Input: `"<max_tokens> [depth=<k>] [no-rollback-probe]"` (default 8 / 4).
 
-use inferlet::inference::ForwardPass;
-use inferlet::sampler::{self, LoweredSampler, SamplerSpec};
-use inferlet::working_set::KvWorkingSet;
-use inferlet::{carrier, chat, model, Result};
-use std::collections::VecDeque;
+use inferlet::ptir::prelude::*;
+use inferlet::{chat, model as wit_model, Result};
 
 const SYSTEM: &str = "You are a helpful assistant.";
 const USER: &str = "Say hello.";
 
-/// One decode context on the raw WIT surface: its own KV working set + cursor.
-/// `fresh` arms `fresh-generate()` on the next pass (the #26 dangling-carry
-/// clear — drops any carrier left pending on this context from a prior generate).
-/// The KV geometry + carrier mechanics live in the keep-core `carrier::`/
-/// `geometry::` primitives; this struct just holds the per-context state they mutate.
-struct Decoder {
-    kv: KvWorkingSet,
-    seq_len: u32,
-    fresh: bool,
+const PAGE_T: u32 = 16; // tokens per KV pool page (mock and Qwen3 page size)
+const NUM_LAYERS: u32 = 28; // Qwen3-0.6B (inert for epilogue-only passes)
+
+fn bx<T>(v: T) -> &'static T {
+    Box::leak(Box::new(v))
 }
 
-impl Decoder {
-    fn new() -> Self {
-        Self {
-            kv: KvWorkingSet::new(),
-            seq_len: 0,
-            fresh: true,
-        }
+/// How the decode fires are driven. All three run the SAME device-carried
+/// pass; they differ only in submission discipline (the point of this
+/// inferlet: pipelining is explicit host-side code, not a helper).
+#[derive(Clone, Copy)]
+enum Mode {
+    /// One fire at a time: submit → harvest → submit (the host round-trip
+    /// bubble per token). The reference stream.
+    Sync,
+    /// Depth-1 explicit run-ahead: speculate the successor fire BEFORE
+    /// harvesting the producer, even when a stop is configured; discard the
+    /// ≤1 over-shot output on EOS.
+    Pipelined,
+    /// Depth-k pre-submission (the production carrier): k fires in flight,
+    /// FIFO drain + refill; discard the ≤k−1 over-shot outputs on EOS.
+    Deep(usize),
+}
+
+/// One decode context: its own KV page pool + the device loop-carried decode
+/// pass. Replaces the classic `Decoder { KvWorkingSet, seq_len, fresh }`; the
+/// cursor now lives in the seeded geometry channels the epilogue advances.
+struct Stream {
+    pipeline: Pipeline,
+    decode: &'static ForwardPass<'static>,
+    out: &'static Channel,
+    pool_ids_ch: &'static Channel,
+    pool_ids: &'static Vec<u32>,
+}
+
+impl Stream {
+    /// Fire the decode pass once (never blocks; ordering rides the channels).
+    /// The physical page ids are per-instance data, so they ride a host-put
+    /// channel each fire (D2), exactly like the templates.
+    fn submit(&self) -> Result<()> {
+        self.pool_ids_ch.put(self.pool_ids.clone());
+        self.pipeline
+            .submit(self.decode)
+            .map_err(|e| format!("decode submit: {e}"))
+    }
+
+    /// Harvest one fire's sampled token off the `out` channel (blocks by
+    /// awaiting the in-flight fire; poison surfaces as `Err`).
+    fn take_token(&self) -> Result<u32> {
+        let v = self
+            .out
+            .take()
+            .get::<i32>()
+            .map_err(|e| format!("out take: {e}"))?;
+        Ok(v.first().copied().unwrap_or(0) as u32)
     }
 }
 
-/// Await a pass and read its single sampled token (first `u32` lane).
-async fn read_token(pass: ForwardPass) -> Result<u32> {
-    let out = pass.output().await.map_err(|e| format!("output: {e}"))?;
-    let bytes = out.read().map_err(|e| format!("tensor read: {e:?}"))?;
-    Ok(if bytes.len() >= 4 {
-        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
-    } else {
-        0
-    })
+/// Run the N-wide prompt prefill fire, then build the device loop-carried
+/// decode pass seeded from (n, g0). Returns the first generated token g0 and
+/// the armed decode stream. `budget` bounds the run-ahead window, so `out`
+/// gets `budget + 1` ring cells (every fire's token stays takeable even with
+/// the deep loop's k un-harvested fires in flight).
+fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
+    let n = prompt.len() as u32;
+    let pool_pages = (n + budget as u32 + 2).div_ceil(PAGE_T);
+    let pool = pool_pages * PAGE_T;
+
+    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let grant = ws.alloc(pool_pages).map_err(|e| format!("ws.alloc: {e}"))?;
+    let pool_ids: &'static Vec<u32> = bx(grant.ids().to_vec());
+
+    // ── 1. PREFILL FIRE (N-wide): causal [N, POOL] mask, N-cell KV write,
+    //       read-out row N−1, greedy argmax → g0. ──
+    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let toks_p = bx(Channel::from(prompt_i32).named("toks_p"));
+    let embed_indptr_p = Tensor::constant(vec![0u32, n]);
+
+    let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
+    let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
+    let w_slot_p = bx(Channel::from(w_slot_pv).named("w_slot_p"));
+    let w_off_p = bx(Channel::from(w_off_pv).named("w_off_p"));
+    let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
+    let pages_p = bx(Channel::from(pool_ids.clone()).named("pages_p"));
+    let page_indptr_p = bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p"));
+    let mask_pv: Vec<bool> = (0..n).flat_map(|i| (0..pool).map(move |j| j <= i)).collect();
+    let mask_p = bx(Channel::from_shaped([n, pool], mask_pv).named("mask_p"));
+    let g0_ch = bx(Channel::new([1], dtype::i32).named("g0"));
+
+    let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
+    fwd_p.embed(toks_p, embed_indptr_p);
+    fwd_p.attn_working_set(ws, klen_p);
+    fwd_p.port_channel(Port::Pages, pages_p);
+    fwd_p.port_channel(Port::PageIndptr, page_indptr_p);
+    fwd_p.port_channel(Port::WSlot, w_slot_p);
+    fwd_p.port_channel(Port::WOff, w_off_p);
+    fwd_p.attn_mask(mask_p);
+    fwd_p.epilogue(move || {
+        let tok = reduce_argmax(intrinsics::logits()); // greedy over row N−1
+        g0_ch.put(&tok);
+    });
+
+    let prefill = Pipeline::new();
+    prefill
+        .submit(fwd_p)
+        .map_err(|e| format!("prefill submit: {e}"))?;
+    let g0 = g0_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?;
+    let g0 = g0.first().copied().unwrap_or(0) as u32;
+    prefill.close();
+
+    // ── 2. DECODE PASS (1-wide, device loop-carried): the epilogue carries
+    //       the sampled token into the next fire's embed (the run-ahead
+    //       carrier) and advances geometry + mask in-graph. ──
+    let phys_n = pool_ids[(n / PAGE_T) as usize];
+    let tok_in = bx(Channel::from(vec![g0 as i32; 1]).named("tok_in"));
+    let pos = bx(Channel::from(vec![n; 1]).named("pos"));
+    let fill = bx(Channel::from(vec![n + 1; 1]).named("fill"));
+    let klen = bx(Channel::from(vec![n + 1; 1]).named("klen"));
+    let w_slot = bx(Channel::from(vec![phys_n; 1]).named("w_slot"));
+    let w_off = bx(Channel::from(vec![n % PAGE_T; 1]).named("w_off"));
+    let seed_mask: Vec<bool> = (0..pool).map(|j| j <= n).collect();
+    let mask = bx(Channel::from_shaped([1, pool], seed_mask).named("mask"));
+    let pages = bx(Channel::from(pool_ids.clone()).named("pages"));
+    let page_indptr = bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr"));
+    let pool_ids_ch = bx(Channel::new([pool_pages], dtype::u32).named("pool_ids"));
+    let out = bx(
+        Channel::new([1], dtype::i32)
+            .capacity(budget as u32 + 1)
+            .named("out"),
+    );
+    let lane1 = Tensor::constant(vec![0u32, 1u32]);
+
+    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
+    fwd.embed(tok_in, lane1);
+    fwd.positions(pos);
+    fwd.attn_working_set(ws, klen);
+    fwd.port_channel(Port::Pages, pages);
+    fwd.port_channel(Port::PageIndptr, page_indptr);
+    fwd.port_channel(Port::WSlot, w_slot);
+    fwd.port_channel(Port::WOff, w_off);
+    fwd.attn_mask(mask);
+    fwd.epilogue(move || {
+        // Takes + compute first, puts last (value-id discipline).
+        let base = fill.take().tensor(); // [1] u32: position this fire writes
+        let pids = pool_ids_ch.take();
+
+        let tok = reduce_argmax(intrinsics::logits()); // [1] i32, greedy
+
+        // Full causal mask for the query at `base`: attend all j <= base.
+        let col = iota(pool);
+        let base_b = broadcast(reshape(&base, [1]), [pool]);
+        let new_mask = reshape(le(&col, &base_b), [1, pool]);
+
+        let logical_slot = div(&base, PAGE_T);
+        let w_slot_v = gather(&pids, &logical_slot);
+        let w_off_v = rem(&base, PAGE_T);
+        let klen_v = add(&base, 1u32);
+        let next_free = add(&base, 1u32);
+        let pages_v = reshape(&pids, [pool_pages]);
+        let pidx_v = mul(&iota(2), pool_pages);
+
+        tok_in.put(&tok); // the device carrier: next fire embeds this token
+        out.put(&tok);
+        mask.put(&new_mask);
+        w_slot.put(&w_slot_v);
+        w_off.put(&w_off_v);
+        klen.put(&klen_v);
+        pos.put(&base);
+        fill.put(&next_free);
+        pages.put(&pages_v);
+        page_indptr.put(&pidx_v);
+    });
+
+    Ok((
+        g0,
+        Stream {
+            pipeline: Pipeline::new(),
+            decode: fwd,
+            out,
+            pool_ids_ch,
+            pool_ids,
+        },
+    ))
 }
 
-/// Whether the pass producing the `produced_index`-th token (1-based) should
-/// declare a run-ahead carrier: decline ONLY when this pass IS the terminal
-/// max-tokens pass (count-predictable → no successor to carry into). Independent
-/// of the stop set — with EOS-rollback we DO speculate past a possible stop.
-fn carries(max_tokens: usize, produced_index: usize) -> bool {
-    max_tokens != produced_index
-}
-
-/// **The explicit run-ahead + EOS-rollback greedy decode loop.** Hand-written on
-/// the raw WIT surface — this is the whole point of the inferlet. Speculates the
-/// successor fire one-ahead EVEN when a stop is configured; if the harvested
-/// token is a stop/EOS, discards the ≤1 over-shot fire (depth-1 rollback). The
-/// stop token is dropped, never emitted — byte-identical output to [`decode_sync`].
-async fn decode_pipelined_eos(
-    d: &mut Decoder,
-    sampler: &LoweredSampler,
-    prompt: Vec<u32>,
-    max_tokens: usize,
-    stop: &[u32],
-) -> Result<Vec<u32>> {
-    if max_tokens == 0 {
-        return Ok(Vec::new());
+/// **The explicit depth-1 run-ahead + EOS-rollback loop.** Speculates the
+/// successor fire BEFORE harvesting the producer, even with a stop configured
+/// (declining only at the count-predictable max-tokens boundary, R9); on a
+/// stop, drains + drops the ≤1 over-shot output (the rollback).
+fn decode_pipelined_eos(s: &Stream, remaining: usize, stop: &[u32]) -> Result<Vec<u32>> {
+    let mut out = Vec::with_capacity(remaining);
+    if remaining == 0 {
+        return Ok(out);
     }
-    let pending = if prompt.is_empty() { vec![0u32] } else { prompt };
-    let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
-
-    // Prime producer (the prompt tail). Carries unless it is itself the terminal
-    // (max_tokens == 1) pass. `carrier::submit_pass` does the fresh-clear + KV
-    // geometry + input + sampler + carrier + execute + advance-on-submit.
-    let mut producer = carrier::submit_pass(
-        &d.kv,
-        &mut d.seq_len,
-        &mut d.fresh,
-        sampler,
-        &pending,
-        carries(max_tokens, 1),
-    )?;
-
-    let mut generated = 0usize;
+    s.submit()?; // prime the producer
+    let mut submitted = 1usize;
+    let mut harvested = 0usize;
     loop {
-        // Speculate the next fire one-ahead — EVEN with a stop set (the rollback
-        // cleans up the ≤1 over-shot fire if this step terminates). Decline ONLY
-        // at the count-predictable max-tokens boundary (R9: never fire past max).
-        let speculate = generated + 1 < max_tokens;
-        let consumer = if speculate {
-            let carry = carries(max_tokens, generated + 2);
-            // Placeholder `0` token — the device carrier overwrites row 0 with the
-            // producer's sample pre-forward. `submit_pass` reserves the next slot.
-            let c = carrier::submit_pass(
-                &d.kv,
-                &mut d.seq_len,
-                &mut d.fresh,
-                sampler,
-                &[0u32],
-                carry,
-            )?;
-            Some(c)
-        } else {
-            None
-        };
-
-        // Harvest the producer's token, overlapped with the consumer's in-flight
-        // compute (the device carrier injects this token into the consumer's row 0).
-        let token = read_token(producer).await?;
-
+        // Speculate one ahead of the fire we are about to harvest.
+        if submitted < remaining {
+            s.submit()?;
+            submitted += 1;
+        }
+        let token = s.take_token()?;
+        harvested += 1;
         if stop.contains(&token) {
-            // EOS: discard the over-shot fire — `carrier::discard_pass` finalizes it
-            // (the WAR-guard drain, never an un-finalized drop) + rolls the
-            // speculative cursor back by one. The stop token is NOT emitted.
-            if let Some(c) = consumer {
-                carrier::discard_pass(c, &mut d.seq_len).await;
+            // EOS: drain + drop the over-shot speculated output. The stop
+            // token is NOT emitted.
+            while harvested < submitted {
+                let _ = s.take_token()?;
+                harvested += 1;
             }
             break;
         }
-
         out.push(token);
-        generated += 1;
-
-        match consumer {
-            // Promote the speculated successor: it already carries this token.
-            Some(c) => producer = c,
-            // No consumer ⟺ we were at the max-tokens boundary → done.
-            None => break,
+        if harvested == submitted {
+            break; // max-tokens boundary: nothing speculated past it
         }
     }
     Ok(out)
 }
 
-/// **The DEEP (depth-`k`) run-ahead + EOS-rollback greedy decode loop — the
-/// production carrier.** Generalizes `decode_pipelined_eos` (depth-1, one fire
-/// ahead) to a `depth`-deep pre-submission: submit `depth` carrier-linked fires
-/// UPFRONT (FIFO), then drain + refill to sustain `depth` in flight. This keeps a
-/// pipeline's fires DENSELY resident (the co-batch 8× residency lever) + cuts the
-/// per-token host round-trip (the reduce-R bubble-close). On an EOS it discards the
-/// ≤`depth`−1 over-shot fires via `carrier::discard_pass` (WAR-drain + per-fire
-/// cursor rollback — echo's kept-core, executor free, no leak). Byte-identical to
-/// `decode_sync(stop)`. The production analog of `runahead::decode_pipelined_deep_stop`
-/// on echo's `carrier::submit_pass`/`discard_pass` rather than the raw `build_pass`.
-async fn decode_pipelined_deep_eos(
-    d: &mut Decoder,
-    sampler: &LoweredSampler,
-    prompt: Vec<u32>,
-    max_tokens: usize,
+/// **The DEEP (depth-k) run-ahead + EOS-rollback loop.** Submits `depth`
+/// fires upfront (none harvested, speculating PAST a possible stop), then
+/// drains FIFO + refills one fire per non-stop token. On EOS, drains + drops
+/// the ≤depth−1 over-shot outputs.
+fn decode_pipelined_deep_eos(
+    s: &Stream,
+    remaining: usize,
     stop: &[u32],
     depth: usize,
 ) -> Result<Vec<u32>> {
-    if max_tokens == 0 {
-        return Ok(Vec::new());
-    }
-    let pending = if prompt.is_empty() { vec![0u32] } else { prompt };
-    let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
-    let mut inflight: VecDeque<ForwardPass> = VecDeque::with_capacity(depth.max(1));
-    let mut submitted = 0usize; // fires launched so far
-
-    // Deep pre-submission: launch up to `depth` carrier-linked fires UPFRONT, none
-    // awaited (speculating PAST a possible stop). Fire 0 carries the prompt tail;
-    // each later fire is a placeholder `[0]` the device carrier overwrites from its
-    // predecessor's sample. `carry` declines only at the max-tokens boundary.
-    while inflight.len() < depth.max(1) && submitted < max_tokens {
-        let carry = carries(max_tokens, submitted + 1);
-        let toks: &[u32] = if submitted == 0 { &pending } else { &[0u32] };
-        let pass = carrier::submit_pass(&d.kv, &mut d.seq_len, &mut d.fresh, sampler, toks, carry)?;
+    let mut out = Vec::with_capacity(remaining);
+    let mut submitted = 0usize;
+    let mut harvested = 0usize;
+    while submitted < depth.max(1).min(remaining) {
+        s.submit()?;
         submitted += 1;
-        inflight.push_back(pass);
     }
-
-    // Drain FIFO; refill one fire per non-stop token to sustain `depth` in flight.
-    while let Some(producer) = inflight.pop_front() {
-        let token = read_token(producer).await?;
+    while harvested < submitted {
+        let token = s.take_token()?;
+        harvested += 1;
         if stop.contains(&token) {
-            // EOS: discard the ≤depth−1 over-shot in-flight fires. Each
-            // `discard_pass` WAR-drains + frees (executor) + rolls the cursor back
-            // by one — never an un-finalized drop. The stop token is NOT emitted.
-            while let Some(c) = inflight.pop_front() {
-                carrier::discard_pass(c, &mut d.seq_len).await;
+            while harvested < submitted {
+                let _ = s.take_token()?;
+                harvested += 1;
             }
             break;
         }
         out.push(token);
-        if submitted < max_tokens {
-            let carry = carries(max_tokens, submitted + 1);
-            let pass =
-                carrier::submit_pass(&d.kv, &mut d.seq_len, &mut d.fresh, sampler, &[0u32], carry)?;
+        if submitted < remaining {
+            s.submit()?;
             submitted += 1;
-            inflight.push_back(pass);
         }
     }
     Ok(out)
 }
 
-/// Synchronous greedy decode (raw): build → execute → await → repeat, one pass
-/// per token, feeding each sampled token back as the next input HOST-side (the
-/// bubble). The reference the pipelined loop must match byte-for-byte. Stops on a
-/// `stop` token (dropping it).
-async fn decode_sync(
-    d: &mut Decoder,
-    sampler: &LoweredSampler,
-    prompt: Vec<u32>,
-    max_tokens: usize,
-    stop: &[u32],
-) -> Result<Vec<u32>> {
-    let mut pending = if prompt.is_empty() { vec![0u32] } else { prompt };
-    let mut out = Vec::with_capacity(max_tokens);
-    for _ in 0..max_tokens {
-        // No carrier (`carry = false`): the sync reference feeds each token back
-        // HOST-side (the bubble the pipelined loop eliminates). `submit_pass`
-        // advances the cursor on submit; no overlap, so it's one pass at a time.
-        let pass =
-            carrier::submit_pass(&d.kv, &mut d.seq_len, &mut d.fresh, sampler, &pending, false)?;
-        let token = read_token(pass).await?;
+/// Synchronous reference: one fire at a time, the host harvesting each token
+/// before submitting the next fire (the per-token round-trip bubble the
+/// pipelined loops close). Stops on a `stop` token (dropping it).
+fn decode_sync(s: &Stream, remaining: usize, stop: &[u32]) -> Result<Vec<u32>> {
+    let mut out = Vec::with_capacity(remaining);
+    for _ in 0..remaining {
+        s.submit()?;
+        let token = s.take_token()?;
         if stop.contains(&token) {
             break;
         }
         out.push(token);
-        pending = vec![token];
     }
     Ok(out)
 }
 
-/// Build the greedy-argmax sampler (`SamplerSpec::Argmax` → a `LoweredSampler`
-/// carrying the argmax program + its per-fire binding list) for `carrier::submit_pass`.
-fn greedy_sampler(vocab: u32) -> Result<LoweredSampler> {
-    sampler::sampler_program(SamplerSpec::Argmax, vocab)
-        .map_err(|e| format!("build greedy sampler: {e:?}"))
+/// One full greedy chat generation on a FRESH decode context (own KV pool),
+/// like the classic per-`Decoder` runs: prefill → g0 → decode loop per `mode`.
+fn generate(prompt: &[u32], max_tokens: usize, stop: &[u32], mode: Mode) -> Result<Vec<u32>> {
+    if max_tokens == 0 {
+        return Ok(Vec::new());
+    }
+    let (g0, stream) = start_stream(prompt, max_tokens)?;
+    if stop.contains(&g0) {
+        stream.pipeline.close();
+        return Ok(Vec::new());
+    }
+    let mut tokens = vec![g0];
+    let rest = match mode {
+        Mode::Sync => decode_sync(&stream, max_tokens - 1, stop)?,
+        Mode::Pipelined => decode_pipelined_eos(&stream, max_tokens - 1, stop)?,
+        Mode::Deep(depth) => decode_pipelined_deep_eos(&stream, max_tokens - 1, stop, depth)?,
+    };
+    tokens.extend(rest);
+    stream.pipeline.close();
+    Ok(tokens)
 }
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
-    // Input: "<max_tokens> [depth=<k>] [no-rollback-probe]". `depth` is the deep
-    // carrier's pre-submission window; align it to the scheduler cap
-    // (`PIE_SCHED_MAX_IN_FLIGHT=k`) so the co-verify is turnkey (default 4). The
-    // first whitespace token is `max_tokens`.
+    // Input: "<max_tokens> [depth=<k>] [no-rollback-probe]". `depth` is the
+    // deep carrier's pre-submission window; align it to the scheduler cap
+    // (`PIE_SCHED_MAX_IN_FLIGHT=k`) so the co-verify is turnkey (default 4).
     let max_tokens: usize = input
         .split_whitespace()
         .next()
@@ -281,72 +367,53 @@ async fn main(input: String) -> Result<String> {
         .split_whitespace()
         .find_map(|t| t.strip_prefix("depth=").and_then(|v| v.parse().ok()))
         .unwrap_or(4);
-    let vocab = model::output_vocab_size();
-    let sampler = greedy_sampler(vocab)?;
 
-    // Chat prompt via the raw `pie:instruct/chat` WIT bindings — the chat-template
-    // knowledge lives in the host runtime, so this is a minimal WIT binding, NOT a
-    // decode helper. `stop` is the chat-EOS set (e.g. <|im_end|>/<|endoftext|>).
+    let vocab = wit_model::output_vocab_size();
+    model::configure(vocab, PAGE_T, NUM_LAYERS);
+
+    // Chat prompt via the thin `pie:inferlet/chat` bindings (the template
+    // knowledge lives in the host runtime). `stop` is the chat-EOS set.
     let mut prompt = chat::system_user(SYSTEM, USER);
     prompt.extend(chat::cue());
+    if prompt.is_empty() {
+        prompt.push(0); // tiny test tokenizers may drop every template char
+    }
     let stop = chat::stop_tokens();
 
     // ── Primary: explicit run-ahead + EOS-rollback vs the sequential reference ──
-    let mut d_p = Decoder::new();
-    let tokens_p =
-        decode_pipelined_eos(&mut d_p, &sampler, prompt.clone(), max_tokens, &stop).await?;
-    let mut d_s = Decoder::new();
-    let tokens_s = decode_sync(&mut d_s, &sampler, prompt.clone(), max_tokens, &stop).await?;
+    let tokens_p = generate(&prompt, max_tokens, &stop, Mode::Pipelined)?;
+    let tokens_s = generate(&prompt, max_tokens, &stop, Mode::Sync)?;
     let matched = tokens_p == tokens_s;
 
-    // ── DEEP carrier (the production lever): depth-`k` pre-submission == sequential.
-    // Keeps a pipeline's fires densely resident (co-batch 8×) + cuts the per-token
-    // host round-trip (reduce-R bubble-close). Byte-identical to the sync stream.
-    // DEVICE-RESIDENT: the mock's no-op carrier + fail-closed finalize can't drive
-    // the deep pre-submission (>1 un-awaited carrier producer in flight) — the same
-    // property that mock-#[ignore]s `runahead::decode_pipelined`. So it's gated
-    // behind the device flag (`no-rollback-probe` skips both device-resident paths);
-    // real depth-k token-identity is the 4090 gate (`cuda_lowlevel_chat`, run with
-    // `PIE_SCHED_MAX_IN_FLIGHT=k` to exercise true k-in-flight residency).
+    // ── DEEP carrier: depth-k pre-submission == sequential. Device-gated
+    // (`no-rollback-probe` skips it, as on the classic path): token identity
+    // needs the real model; the mock's deterministic logits differ per pass
+    // instance, so only the 4090 gate asserts DEEP_MATCH. ──
     let run_device_paths = !input.contains("no-rollback-probe");
     let (deep_matched, tokens_d) = if run_device_paths {
-        let mut d_d = Decoder::new();
-        let tokens_d =
-            decode_pipelined_deep_eos(&mut d_d, &sampler, prompt.clone(), max_tokens, &stop, depth)
-                .await?;
-        (tokens_d == tokens_s, tokens_d)
+        let d = generate(&prompt, max_tokens, &stop, Mode::Deep(depth))?;
+        (d == tokens_s, d)
     } else {
-        (true, tokens_s.clone()) // skipped on the mock (device-resident)
+        (true, tokens_s.clone()) // skipped (device-gated)
     };
 
-    // ── Rollback coverage: force an early EOS (stop = the reference stream's first
-    // token) so a speculated successor MUST be discarded, then assert the pipelined
-    // stream still equals the sequential one and did not hang. The depth-k rollback
-    // discards ≤depth−1 over-shot fires via `carrier::discard_pass`. ──
-    //
-    // Same device-resident gate as the deep loop: the discard-drain awaits a
-    // speculated consumer whose producer terminated; the runtime's next-input
-    // finalize is FAIL-CLOSED (a consumer force-aborts unless the producer link it
-    // injected from is `Committed` — inference.rs). The mock cannot complete it (the
-    // reason `runahead`'s decode is mock-#[ignore]d); validated on the 4090.
-    let run_rollback_probe = run_device_paths;
-    let rollback_ok = match (run_rollback_probe, tokens_s.first()) {
-        (true, Some(&first)) => {
-            let forced = [first];
-            let mut d_fp = Decoder::new();
-            let fp =
-                decode_pipelined_deep_eos(&mut d_fp, &sampler, prompt.clone(), max_tokens, &forced, depth)
-                    .await?;
-            let mut d_fs = Decoder::new();
-            let fs = decode_sync(&mut d_fs, &sampler, prompt.clone(), max_tokens, &forced).await?;
+    // ── Rollback coverage: force an early EOS on the SECOND token (the first
+    // DECODE fire; the prefill boundary is host-gated on ptir, see module
+    // docs) so the deep loop MUST discard speculated over-shot fires, then
+    // assert the forced streams still agree and nothing hung. ──
+    let rollback_ok = match (run_device_paths, tokens_s.get(1)) {
+        (true, Some(&second)) => {
+            let forced = [second];
+            let fp = generate(&prompt, max_tokens, &forced, Mode::Deep(depth))?;
+            let fs = generate(&prompt, max_tokens, &forced, Mode::Sync)?;
             fp == fs
         }
-        // No tokens produced (immediate EOS) — the primary path already exercised
-        // the discard on its first step. Or the probe was skipped.
+        // Probe skipped, or the stream was too short to force a mid-stream
+        // stop (the primary path already exercised its boundary).
         _ => true,
     };
 
-    // Chat-decode the pipelined stream to text (raw WIT `chat::Decoder`).
+    // Chat-decode the pipelined stream to text (thin WIT `chat::Decoder`).
     let mut dec = chat::Decoder::new();
     let mut text = String::new();
     for t in &tokens_p {

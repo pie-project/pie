@@ -3,23 +3,27 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "entry.hpp"
+#include "ptir/container.hpp"  // fnv1a64 (the PTIB sidecar's container hash)
 
 namespace {
 
 struct NotifyState {
-    std::uint32_t count = 0;
-    std::uint64_t last_wait_id = 0;
-    std::uint64_t last_epoch = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> log;
+
+    std::size_t count() const { return log.size(); }
+    bool contains(std::uint64_t wait_id, std::uint64_t epoch) const {
+        for (const auto& [w, e] : log)
+            if (w == wait_id && e == epoch) return true;
+        return false;
+    }
 };
 
 void notify_cb(void* ctx, std::uint64_t wait_id, std::uint64_t epoch) {
-    auto* state = static_cast<NotifyState*>(ctx);
-    state->count += 1;
-    state->last_wait_id = wait_id;
-    state->last_epoch = epoch;
+    static_cast<NotifyState*>(ctx)->log.emplace_back(wait_id, epoch);
 }
 
 bool expect(bool cond, const char* msg) {
@@ -61,6 +65,74 @@ std::vector<std::uint8_t> mixed_role_program(std::uint32_t capacity = 1) {
         out.push_back(role);
         out.push_back(role == 2 ? 1 : 0);
     }
+    return out;
+}
+
+// Channel-plane container: c0 = host Writer u32[1], c1 = host Reader u32[1],
+// epilogue `v0 = c0.take(); v1 = const 1u; v2 = v0 + v1; c1.put(v2)`.
+std::vector<std::uint8_t> add_one_program(bool seeded_writer) {
+    std::vector<std::uint8_t> out{'P', 'T', 'I', 'R'};
+    push_u16(out, PTIR_VERSION);
+    push_u16(out, 0);
+    push_u32(out, 0);  // names
+    push_u32(out, 2);  // channels
+    push_u32(out, 0);  // ports
+    push_u32(out, 1);  // stages
+    for (int c = 0; c < 2; ++c) {
+        out.push_back(PTIR_DT_U32);
+        out.push_back(1);  // rank
+        push_u32(out, 1);
+        push_u32(out, 1);  // capacity
+        out.push_back(c == 0 ? PTIR_HOST_WRITER : PTIR_HOST_READER);
+        out.push_back(c == 0 && seeded_writer ? 1 : 0);
+    }
+    out.push_back(PTIR_STAGE_EPILOGUE);
+    push_u32(out, 4);  // ops
+    out.push_back(PTIR_OP_CHAN_TAKE);
+    push_u32(out, 0);
+    out.push_back(PTIR_OP_CONST);
+    out.push_back(PTIR_DT_U32);
+    push_u32(out, 1);
+    out.push_back(PTIR_OP_ADD);
+    push_u32(out, 0);
+    push_u32(out, 1);
+    out.push_back(PTIR_OP_CHAN_PUT);
+    push_u32(out, 1);
+    push_u32(out, 2);
+    return out;
+}
+
+// The matching PTIB sidecar: classes, the derived readiness table (c0 take →
+// NeedsFull, c1 leading put → NeedsEmpty, both at the epilogue), and the
+// epilogue's three SSA value types.
+std::vector<std::uint8_t> add_one_sidecar(const std::vector<std::uint8_t>& container) {
+    const std::uint64_t hash =
+        pie_cuda_driver::ptir::container::fnv1a64(container.data(), container.size());
+    std::vector<std::uint8_t> out{'P', 'T', 'I', 'B'};
+    push_u16(out, PTIB_VERSION);
+    push_u16(out, 0);
+    for (int b = 0; b < 8; ++b) out.push_back(static_cast<std::uint8_t>(hash >> (b * 8)));
+    push_u32(out, 2);  // channel classes
+    out.push_back(0);
+    out.push_back(0);
+    push_u32(out, 2);  // readiness entries
+    push_u32(out, 0);
+    out.push_back(PTIR_STAGE_EPILOGUE);
+    out.push_back(0);  // NeedsFull
+    push_u32(out, 1);
+    out.push_back(PTIR_STAGE_EPILOGUE);
+    out.push_back(1);  // NeedsEmpty
+    push_u32(out, 1);  // stages
+    out.push_back(PTIR_STAGE_EPILOGUE);
+    push_u32(out, 3);  // value types: u32[1], u32 scalar, u32[1]
+    out.push_back(PTIR_DT_U32);
+    out.push_back(1);
+    push_u32(out, 1);
+    out.push_back(PTIR_DT_U32);
+    out.push_back(0);
+    out.push_back(PTIR_DT_U32);
+    out.push_back(1);
+    push_u32(out, 1);
     return out;
 }
 
@@ -284,11 +356,14 @@ int main() {
     if (!expect(pie_metal_close_channel(driver, 33) == PIE_STATUS_INVALID_ARGUMENT,
                 "close_channel rejects live attachment")) return 1;
 
+    // Seeds are per-instance interp state (D2), never bind-time ring
+    // publications: the reader ring stays untouched until a fire produces.
     auto* mirror = reinterpret_cast<const std::uint8_t*>(endpoints[2].mirror_base);
     auto* words = reinterpret_cast<const std::uint64_t*>(endpoints[2].word_base);
-    if (!expect(std::memcmp(mirror, seed_bytes, sizeof(seed_bytes)) == 0,
-                "seed mirrored")) return 1;
-    if (!expect(words[1] == 1, "seed tail published")) return 1;
+    const std::uint8_t zero_cell[4] = {0, 0, 0, 0};
+    if (!expect(std::memcmp(mirror, zero_cell, sizeof(zero_cell)) == 0,
+                "bind leaves the reader ring untouched")) return 1;
+    if (!expect(words[1] == 0, "bind publishes no reader tail")) return 1;
 
     PieInstanceDesc duplicate_instance = instance;
     duplicate_instance.requested_instance_id = binding.instance_id;
@@ -298,13 +373,7 @@ int main() {
                     PIE_STATUS_INVALID_ARGUMENT,
                 "duplicate bind preserves original instance")) return 1;
 
-    const std::uint8_t put_bytes[] = {0x10, 0x11, 0x12, 0x13};
-    const PieChannelValueDesc puts[] = {{
-        .channel_id = 11,
-        .bytes = {.ptr = put_bytes, .len = sizeof(put_bytes)},
-    }};
     const std::uint64_t instance_ids[] = {binding.instance_id};
-    const std::uint32_t host_put_indptr[] = {0, 1};
     PieLaunchDesc launch{};
     launch.abi_version = PIE_DRIVER_ABI_VERSION;
     launch.instance_ids.ptr = instance_ids;
@@ -312,10 +381,6 @@ int main() {
     PieTerminalCell launch_terminal = pending_terminal();
     PieTerminalCell* const launch_terminal_ptrs[] = {&launch_terminal};
     launch.terminal_cells = {.ptr = launch_terminal_ptrs, .len = 1};
-    launch.ptir_host_put_values.ptr = puts;
-    launch.ptir_host_put_values.len = 1;
-    launch.host_put_indptr.ptr = host_put_indptr;
-    launch.host_put_indptr.len = 2;
     PieTerminalCell rejected_terminal = pending_terminal();
     const PieCompletion launch_completion{
         .wait_id = 77,
@@ -359,31 +424,6 @@ int main() {
     if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects reserved flags")) return 1;
-    const std::uint32_t bad_host_put_indptr[] = {0, 2};
-    bad_launch = launch;
-    bad_launch.host_put_indptr = {
-        .ptr = bad_host_put_indptr,
-        .len = 2,
-    };
-    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
-                    PIE_STATUS_INVALID_ARGUMENT,
-                "launch rejects malformed host-put CSR")) return 1;
-    PieChannelValueDesc bad_put = puts[0];
-    bad_put.bytes = {.ptr = nullptr, .len = 4};
-    bad_launch = launch;
-    bad_launch.ptir_host_put_values = {.ptr = &bad_put, .len = 1};
-    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
-                    PIE_STATUS_INVALID_ARGUMENT,
-                "launch rejects nested host-put bytes")) return 1;
-    bad_put = {
-        .channel_id = 33,
-        .bytes = {.ptr = put_bytes, .len = sizeof(put_bytes)},
-    };
-    bad_launch = launch;
-    bad_launch.ptir_host_put_values = {.ptr = &bad_put, .len = 1};
-    if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
-                    PIE_STATUS_INVALID_ARGUMENT,
-                "launch rejects host put to non-writer channel")) return 1;
     const std::uint32_t token[] = {1};
     const std::uint32_t position[] = {0};
     const std::uint32_t bad_qo_indptr[] = {0, 0};
@@ -476,7 +516,7 @@ int main() {
     if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects unaligned slices")) return 1;
-    if (!expect(notify.count == 0, "rejected launches do not notify")) return 1;
+    if (!expect(notify.count() == 0, "rejected launches do not notify")) return 1;
 
     PieKvCopyDesc bad_kv{};
     bad_kv.abi_version = PIE_DRIVER_ABI_VERSION + 1;
@@ -532,17 +572,19 @@ int main() {
     if (!expect(pie_metal_resize_pool(driver, &bad_resize, rejected_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "resize rejects target count overflow")) return 1;
-    if (!expect(notify.count == 0, "rejected typed operations do not notify")) return 1;
+    if (!expect(notify.count() == 0, "rejected typed operations do not notify")) return 1;
 
     if (!expect(pie_metal_launch(driver, &launch, rejected_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects operation terminal cell")) return 1;
+    // The mixed-role program ships no PTIB sidecar, so it is not executable
+    // on the host interpreter — launch rejects UNSUPPORTED without touching
+    // any ring state.
     if (!expect(pie_metal_launch(driver, &launch, launch_completion) == PIE_STATUS_UNSUPPORTED,
-                "launch unsupported")) return 1;
-    if (!expect(notify.count == 0, "unsupported launch does not notify")) return 1;
+                "launch of a sidecar-less program is unsupported")) return 1;
+    if (!expect(notify.count() == 0, "unsupported launch does not notify")) return 1;
     if (!expect(words[0] == 0, "reader head unchanged")) return 1;
-    if (!expect(std::memcmp(mirror, seed_bytes, sizeof(seed_bytes)) == 0,
-                "reader seed remains visible")) return 1;
+    if (!expect(words[1] == 0, "reader tail unchanged")) return 1;
     if (!expect(words[2] == 0, "poison stays clear")) return 1;
     if (!expect(words[3] == 0, "closed stays clear")) return 1;
     if (!expect(launch_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
@@ -592,7 +634,7 @@ int main() {
             "resize unsupported")) return 1;
     if (!expect(resize_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
                 "unsupported resize keeps terminal pending")) return 1;
-    if (!expect(notify.count == 0, "unsupported operations never notify")) return 1;
+    if (!expect(notify.count() == 0, "unsupported operations never notify")) return 1;
 
     if (!expect(pie_metal_close_instance(driver, binding.instance_id) == PIE_STATUS_OK,
                 "close_instance")) return 1;
@@ -601,6 +643,220 @@ int main() {
                    "close_channel")) return 1;
         if (!expect(pie_metal_close_channel(driver, channel_id) == PIE_STATUS_CLOSED,
                    "closed channel stays closed")) return 1;
+    }
+
+    // ── real execution: put → launch → publish/notify per plan §4.3/§4.4 ──
+    {
+        const auto exec_bytes = add_one_program(false);
+        const auto exec_sidecar = add_one_sidecar(exec_bytes);
+        PieProgramDesc exec_program{};
+        exec_program.abi_version = PIE_DRIVER_ABI_VERSION;
+        exec_program.program_hash = 0x3001;
+        exec_program.canonical_bytes = {.ptr = exec_bytes.data(), .len = exec_bytes.size()};
+        exec_program.sidecar_bytes = {.ptr = exec_sidecar.data(), .len = exec_sidecar.size()};
+        std::uint64_t exec_program_id = 0;
+        if (!expect(pie_metal_register_program(driver, &exec_program, &exec_program_id) ==
+                        PIE_STATUS_OK,
+                    "register add_one program")) return 1;
+
+        const std::uint64_t exec_channel_ids[] = {55, 66};
+        PieChannelDesc exec_descs[2]{};
+        for (std::size_t i = 0; i < 2; ++i) {
+            exec_descs[i].abi_version = PIE_DRIVER_ABI_VERSION;
+            exec_descs[i].channel_id = exec_channel_ids[i];
+            exec_descs[i].shape = {.ptr = scalar_shape, .len = 1};
+            exec_descs[i].dtype = PIE_CHANNEL_DTYPE_U32;
+            exec_descs[i].capacity = 1;
+            exec_descs[i].reader_wait_id = 501 + i * 10;
+            exec_descs[i].writer_wait_id = 502 + i * 10;
+        }
+        exec_descs[0].host_role = PIE_CHANNEL_HOST_ROLE_WRITER;
+        exec_descs[1].host_role = PIE_CHANNEL_HOST_ROLE_READER;
+        PieChannelEndpointBinding exec_endpoints[2]{};
+        for (std::size_t i = 0; i < 2; ++i) {
+            if (!expect(pie_metal_register_channel(driver, &exec_descs[i],
+                                                   &exec_endpoints[i]) == PIE_STATUS_OK,
+                        "register add_one channel")) return 1;
+        }
+        PieInstanceDesc exec_instance{};
+        exec_instance.abi_version = PIE_DRIVER_ABI_VERSION;
+        exec_instance.program_id = exec_program_id;
+        exec_instance.channel_ids = {.ptr = exec_channel_ids, .len = 2};
+        PieInstanceBinding exec_binding{};
+        if (!expect(pie_metal_bind_instance(driver, &exec_instance, &exec_binding) ==
+                        PIE_STATUS_OK,
+                    "bind add_one instance")) return 1;
+
+        auto* writer_mirror = reinterpret_cast<std::uint8_t*>(exec_endpoints[0].mirror_base);
+        auto* writer_words = reinterpret_cast<std::uint64_t*>(exec_endpoints[0].word_base);
+        auto* reader_mirror = reinterpret_cast<const std::uint8_t*>(exec_endpoints[1].mirror_base);
+        auto* reader_words = reinterpret_cast<std::uint64_t*>(exec_endpoints[1].word_base);
+
+        const std::uint64_t exec_instance_ids[] = {exec_binding.instance_id};
+        PieTerminalCell exec_terminal = pending_terminal();
+        PieTerminalCell* const exec_terminal_ptrs[] = {&exec_terminal};
+        PieLaunchDesc exec_launch{};
+        exec_launch.abi_version = PIE_DRIVER_ABI_VERSION;
+        exec_launch.instance_ids = {.ptr = exec_instance_ids, .len = 1};
+        exec_launch.terminal_cells = {.ptr = exec_terminal_ptrs, .len = 1};
+        const PieCompletion exec_completion{
+            .wait_id = 777,
+            .target_epoch = 9,
+            .terminal_cell = nullptr,
+        };
+
+        // §4.3 availability: a fire taking from an empty host-writer ring
+        // rejects synchronously — no epoch, no poison, no notify.
+        if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) ==
+                        PIE_STATUS_INVALID_ARGUMENT,
+                    "launch without a host put rejects")) return 1;
+        if (!expect(notify.count() == 0, "availability rejection does not notify")) return 1;
+        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
+                    "availability rejection keeps terminal pending")) return 1;
+
+        // Host put: wire bytes at `tail % cap1`, then the release tail store.
+        const std::uint32_t put_value = 7;
+        std::memcpy(writer_mirror, &put_value, sizeof(put_value));
+        writer_words[1] = 1;
+        if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) == PIE_STATUS_OK,
+                    "put → launch succeeds")) return 1;
+        std::uint32_t produced = 0;
+        std::memcpy(&produced, reader_mirror, sizeof(produced));
+        if (!expect(writer_words[0] == 1, "consumed writer head published")) return 1;
+        if (!expect(reader_words[1] == 1, "produced reader tail published")) return 1;
+        if (!expect(produced == 8, "epilogue computed take + 1")) return 1;
+        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_SUCCESS,
+                    "member terminal settles success")) return 1;
+        if (!expect(notify.contains(502, 1), "writer wake carries the new head")) return 1;
+        if (!expect(notify.contains(511, 1), "reader wake carries the new tail")) return 1;
+        if (!expect(!notify.log.empty() && notify.log.back() == std::make_pair(
+                        std::uint64_t{777}, std::uint64_t{9}),
+                    "batch notify lands last, exactly once")) return 1;
+
+        // Failure settlement (D4): a second fire with a fresh put but a full
+        // reader ring (no host take) poisons and fails the member terminal.
+        notify.log.clear();
+        exec_terminal = pending_terminal();
+        const std::uint32_t second_value = 20;
+        std::memcpy(writer_mirror + exec_endpoints[0].cell_bytes, &second_value,
+                    sizeof(second_value));
+        writer_words[1] = 2;
+        if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) == PIE_STATUS_OK,
+                    "accepted fire settles even when publication fails")) return 1;
+        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_FAILED,
+                    "publication failure fails the member terminal")) return 1;
+        if (!expect(reader_words[2] != 0, "reader poison word published")) return 1;
+        if (!expect(notify.contains(511, reader_words[2]),
+                    "reader wake carries the poison epoch")) return 1;
+        if (!expect(!notify.log.empty() && notify.log.back() == std::make_pair(
+                        std::uint64_t{777}, std::uint64_t{9}),
+                    "failed fire still notifies the batch slot last")) return 1;
+
+        if (!expect(pie_metal_close_instance(driver, exec_binding.instance_id) ==
+                        PIE_STATUS_OK,
+                    "close add_one instance")) return 1;
+        for (const std::uint64_t id : exec_channel_ids) {
+            if (!expect(pie_metal_close_channel(driver, id) == PIE_STATUS_OK,
+                        "close add_one channel")) return 1;
+        }
+    }
+
+    // ── seed credit: a seeded Writer channel's first take spends the seed
+    //    without a host put and without a head-word publish (§4.3) ──
+    {
+        const auto seeded_bytes = add_one_program(true);
+        const auto seeded_sidecar = add_one_sidecar(seeded_bytes);
+        PieProgramDesc seeded_program{};
+        seeded_program.abi_version = PIE_DRIVER_ABI_VERSION;
+        seeded_program.program_hash = 0x3002;
+        seeded_program.canonical_bytes = {.ptr = seeded_bytes.data(), .len = seeded_bytes.size()};
+        seeded_program.sidecar_bytes = {.ptr = seeded_sidecar.data(),
+                                        .len = seeded_sidecar.size()};
+        std::uint64_t seeded_program_id = 0;
+        if (!expect(pie_metal_register_program(driver, &seeded_program, &seeded_program_id) ==
+                        PIE_STATUS_OK,
+                    "register seeded add_one program")) return 1;
+
+        const std::uint64_t seeded_channel_ids[] = {77, 88};
+        PieChannelDesc seeded_descs[2]{};
+        for (std::size_t i = 0; i < 2; ++i) {
+            seeded_descs[i].abi_version = PIE_DRIVER_ABI_VERSION;
+            seeded_descs[i].channel_id = seeded_channel_ids[i];
+            seeded_descs[i].shape = {.ptr = scalar_shape, .len = 1};
+            seeded_descs[i].dtype = PIE_CHANNEL_DTYPE_U32;
+            seeded_descs[i].capacity = 1;
+            seeded_descs[i].reader_wait_id = 601 + i * 10;
+            seeded_descs[i].writer_wait_id = 602 + i * 10;
+        }
+        seeded_descs[0].host_role = PIE_CHANNEL_HOST_ROLE_WRITER;
+        seeded_descs[0].seeded = 1;
+        seeded_descs[1].host_role = PIE_CHANNEL_HOST_ROLE_READER;
+        PieChannelEndpointBinding seeded_endpoints[2]{};
+        for (std::size_t i = 0; i < 2; ++i) {
+            if (!expect(pie_metal_register_channel(driver, &seeded_descs[i],
+                                                   &seeded_endpoints[i]) == PIE_STATUS_OK,
+                        "register seeded channel")) return 1;
+        }
+        const std::uint32_t seed_value = 41;
+        const PieChannelValueDesc seeded_seeds[] = {{
+            .channel_id = 77,
+            .bytes = {.ptr = reinterpret_cast<const std::uint8_t*>(&seed_value),
+                      .len = sizeof(seed_value)},
+        }};
+        PieInstanceDesc seeded_instance{};
+        seeded_instance.abi_version = PIE_DRIVER_ABI_VERSION;
+        seeded_instance.program_id = seeded_program_id;
+        seeded_instance.channel_ids = {.ptr = seeded_channel_ids, .len = 2};
+        seeded_instance.seed_values = {.ptr = seeded_seeds, .len = 1};
+        PieInstanceBinding seeded_binding{};
+        if (!expect(pie_metal_bind_instance(driver, &seeded_instance, &seeded_binding) ==
+                        PIE_STATUS_OK,
+                    "bind seeded instance")) return 1;
+
+        auto* seeded_writer_words =
+            reinterpret_cast<const std::uint64_t*>(seeded_endpoints[0].word_base);
+        auto* seeded_reader_mirror =
+            reinterpret_cast<const std::uint8_t*>(seeded_endpoints[1].mirror_base);
+        const std::uint64_t seeded_instance_ids[] = {seeded_binding.instance_id};
+        PieTerminalCell seeded_terminal = pending_terminal();
+        PieTerminalCell* const seeded_terminal_ptrs[] = {&seeded_terminal};
+        PieLaunchDesc seeded_launch{};
+        seeded_launch.abi_version = PIE_DRIVER_ABI_VERSION;
+        seeded_launch.instance_ids = {.ptr = seeded_instance_ids, .len = 1};
+        seeded_launch.terminal_cells = {.ptr = seeded_terminal_ptrs, .len = 1};
+        const PieCompletion seeded_completion{
+            .wait_id = 888,
+            .target_epoch = 3,
+            .terminal_cell = nullptr,
+        };
+        notify.log.clear();
+        if (!expect(pie_metal_launch(driver, &seeded_launch, seeded_completion) ==
+                        PIE_STATUS_OK,
+                    "seed credit satisfies the first fire without a put")) return 1;
+        std::uint32_t seeded_out = 0;
+        std::memcpy(&seeded_out, seeded_reader_mirror, sizeof(seeded_out));
+        if (!expect(seeded_out == 42, "seed value flowed through the program")) return 1;
+        if (!expect(seeded_writer_words[0] == 0,
+                    "seed spend publishes no writer head")) return 1;
+        if (!expect(!notify.contains(602, 0) && !notify.contains(602, 1),
+                    "seed spend sends no writer wake")) return 1;
+        if (!expect(seeded_terminal.outcome == PIE_TERMINAL_OUTCOME_SUCCESS,
+                    "seeded fire settles success")) return 1;
+
+        // The credit is spent: a second fire needs a real host put.
+        seeded_terminal = pending_terminal();
+        if (!expect(pie_metal_launch(driver, &seeded_launch, seeded_completion) ==
+                        PIE_STATUS_INVALID_ARGUMENT,
+                    "spent seed credit no longer satisfies availability")) return 1;
+
+        if (!expect(pie_metal_close_instance(driver, seeded_binding.instance_id) ==
+                        PIE_STATUS_OK,
+                    "close seeded instance")) return 1;
+        for (const std::uint64_t id : seeded_channel_ids) {
+            if (!expect(pie_metal_close_channel(driver, id) == PIE_STATUS_OK,
+                        "close seeded channel")) return 1;
+        }
+        notify.log.clear();
     }
 
     const auto export_bytes = extern_program(1);

@@ -13,7 +13,13 @@ use std::ffi::c_void;
 use std::fmt;
 
 /// Current direct local ABI version.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 1;
+///
+/// v2: channel values no longer ride launch descriptors — host puts are
+/// direct writes into the registered channel endpoint's pinned ring, pulled
+/// by the driver before the consuming pass; `PieChannelDesc` wait ids are
+/// mandatory and every native driver must notify them per channel-word
+/// publication.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 2;
 
 /// Success.
 pub const PIE_STATUS_OK: i32 = 0;
@@ -484,10 +490,6 @@ pub struct PieLaunchDesc {
     pub audio_feature_indptr: PieU32Slice,
     pub audio_anchor_rows: PieU32Slice,
     pub audio_indptr: PieU32Slice,
-    /// Flattened PTIR host-put values for all launched instances.
-    pub ptir_host_put_values: PieChannelValueDescSlice,
-    /// CSR partition of `ptir_host_put_values`, one segment per `instance_ids` entry.
-    pub host_put_indptr: PieU32Slice,
     pub kv_len: PieU32Slice,
     pub kv_len_device: PieU64Slice,
 }
@@ -530,8 +532,6 @@ impl Default for PieLaunchDesc {
             audio_feature_indptr: PieU32Slice::default(),
             audio_anchor_rows: PieU32Slice::default(),
             audio_indptr: PieU32Slice::default(),
-            ptir_host_put_values: PieChannelValueDescSlice::default(),
-            host_put_indptr: PieU32Slice::default(),
             kv_len: PieU32Slice::default(),
             kv_len_device: PieU64Slice::default(),
         }
@@ -1157,13 +1157,6 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
         desc.audio_anchor_rows,
         "launch audio_anchor_rows ptr/len mismatch",
     )?;
-    unsafe {
-        validate_nested_channel_values(
-            desc.ptir_host_put_values,
-            "launch ptir_host_put_values ptr/len mismatch",
-            "launch ptir_host_put_values bytes ptr/len mismatch",
-        )
-    }?;
     validate_u32_slice(desc.kv_len, "launch kv_len ptr/len mismatch")?;
     validate_u64_slice(desc.kv_len_device, "launch kv_len_device ptr/len mismatch")?;
 
@@ -1223,13 +1216,6 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             desc.sampling_indptr,
             "launch sampling_indptr malformed",
             desc.sampling_indices.len,
-            request_count,
-            true,
-        )?;
-        validate_csr(
-            desc.host_put_indptr,
-            "launch host_put_indptr malformed",
-            desc.ptir_host_put_values.len,
             request_count,
             true,
         )?;
@@ -1600,8 +1586,6 @@ mod tests {
         let launch = PieLaunchDesc::default();
         assert!(launch.instance_ids.ptr.is_null());
         assert_eq!(launch.instance_ids.len, 0);
-        assert!(launch.host_put_indptr.ptr.is_null());
-        assert_eq!(launch.host_put_indptr.len, 0);
         assert!(launch.image_pixels.ptr.is_null());
         assert_eq!(launch.image_pixels.len, 0);
         assert_eq!(launch.single_token_mode, 0);
@@ -2053,7 +2037,10 @@ mod tests {
         assert!(terminal_cell_ptr_slice.contains("struct PieTerminalCell *const *ptr;"));
         assert!(launch.contains("struct PieU64Slice instance_ids;"));
         assert!(launch.contains("struct PieTerminalCellPtrSlice terminal_cells;"));
-        assert!(launch.contains("struct PieU32Slice host_put_indptr;"));
+        assert!(
+            !launch.contains("host_put"),
+            "ABI v2: launch descriptors carry no channel values"
+        );
         assert!(completion.contains("struct PieTerminalCell *terminal_cell;"));
         assert!(launch.contains("uint32_t reserved0;"));
         assert!(launch.contains("uint8_t reserved_flags[6];"));

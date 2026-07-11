@@ -125,6 +125,10 @@ class DeviceChannelRegistry {
         }
         attachment_direction_masks_[slot] = 0;
         shapes_[slot].assign(desc.shape.ptr, desc.shape.ptr + desc.shape.len);
+        pulled_tail_[slot] = 0;
+        seed_credit_[slot] = static_cast<std::uint8_t>(
+            desc.seeded != 0 &&
+            desc.host_role == PIE_CHANNEL_HOST_ROLE_WRITER);
         std::memset(host_mirror_[slot], 0, host_mirror_bytes_[slot]);
         std::memset(host_words_[slot], 0, 4 * sizeof(std::uint64_t));
         *binding = PieChannelEndpointBinding{
@@ -255,9 +259,9 @@ class DeviceChannelRegistry {
         return writer_wait_ids_[slot];
     }
     std::uint64_t host_wait_id(std::uint32_t slot) const {
-        return host_role_[slot] == PIE_CHANNEL_HOST_READER
+        return host_role_[slot] == PIE_CHANNEL_HOST_ROLE_READER
             ? reader_wait_ids_[slot]
-            : (host_role_[slot] == PIE_CHANNEL_HOST_WRITER
+            : (host_role_[slot] == PIE_CHANNEL_HOST_ROLE_WRITER
                    ? writer_wait_ids_[slot]
                    : 0);
     }
@@ -269,12 +273,17 @@ class DeviceChannelRegistry {
     std::size_t wire_bytes(std::uint32_t slot) const {
         return host_mirror_bytes_[slot] / host_cap1_[slot];
     }
-    bool can_publish(std::uint32_t slot) const {
+    bool can_publish(std::uint32_t slot) const { return can_publish_n(slot, 1); }
+
+    // Whether `count` MORE publishes fit the host-reader capacity — used by
+    // batch validation, which must aggregate every member's planned publish
+    // to a shared slot before any of them schedules.
+    bool can_publish_n(std::uint32_t slot, std::uint64_t count) const {
         const std::uint64_t head =
             std::atomic_ref<const std::uint64_t>(host_words_[slot][0]).load(
                 std::memory_order_acquire);
         return head <= reserved_tail_[slot] &&
-               reserved_tail_[slot] - head <
+               reserved_tail_[slot] + count - 1 - head <
                    static_cast<std::uint64_t>(host_cap1_[slot] - 1);
     }
 
@@ -320,21 +329,71 @@ class DeviceChannelRegistry {
             0, std::memory_order_release);
     }
 
-    std::uint64_t schedule_host_consume(std::uint32_t slot) {
+    // ── §4.3 writer-ring pull (host produces, device consumes) ──
+
+    // The host-published producer cursor (release-stored by the runtime put).
+    std::uint64_t host_ring_tail(std::uint32_t slot) const {
+        return std::atomic_ref<const std::uint64_t>(host_words_[slot][1]).load(
+            std::memory_order_acquire);
+    }
+
+    // Host inputs available to the next fire: published-but-unconsumed ring
+    // entries plus the one-shot seed credit of a seeded Writer channel.
+    std::uint64_t writer_available(std::uint32_t slot) const {
+        return host_ring_tail(slot) - reserved_head_[slot] +
+               (seed_credit_[slot] != 0 ? 1 : 0);
+    }
+
+    // Schedule one fire's consume of this writer channel: the seed credit is
+    // spent first (no ring entry moves — returns 0, no head word publishes),
+    // otherwise one ring entry is reserved and the returned target head is
+    // release-published by the completion callback on success.
+    std::uint64_t schedule_writer_consume(std::uint32_t slot) {
+        if (seed_credit_[slot] != 0) {
+            seed_credit_[slot] = 0;
+            return 0;
+        }
         return ++reserved_head_[slot];
     }
 
-    void finalize_host_consume(
-        std::uint32_t slot,
-        std::uint64_t target_head,
-        bool failed) {
-        if (failed) {
-            std::atomic_ref<std::uint64_t>(host_words_[slot][2]).store(
-                target_head == 0 ? 1 : target_head, std::memory_order_release);
-            return;
+    // Pull host-published ring entries (mirror cells up to the released tail
+    // word) into the device cell ring + full bits, stream-ordered before the
+    // pass that consumes them. Bool cells unpack on the CPU into `staging`,
+    // which must outlive the async copies (it rides the fire's finalize
+    // entry). A seeded ring holds its bind-time seed at device index 0, so
+    // host entries land one index later.
+    void pull_writer_ring(std::uint32_t slot,
+                          cudaStream_t stream,
+                          std::vector<std::vector<std::uint8_t>>& staging) {
+        const std::uint64_t tail = host_ring_tail(slot);
+        while (pulled_tail_[slot] < tail) {
+            const std::uint64_t sequence = pulled_tail_[slot]++;
+            const std::size_t bytes = wire_bytes(slot);
+            const auto* source =
+                static_cast<const std::uint8_t*>(host_mirror_[slot]) +
+                (sequence % host_cap1_[slot]) * bytes;
+            const std::uint64_t index =
+                (sequence + (seeded_[slot] ? 1 : 0)) % host_cap1_[slot];
+            const void* copy_source = source;
+            std::size_t copy_bytes = bytes;
+            if (dtype_[slot] == PIE_CHANNEL_DTYPE_BOOL) {
+                staging.emplace_back(cell_bytes_[slot], 0);
+                auto& native = staging.back();
+                for (std::size_t i = 0; i < native.size(); ++i) {
+                    native[i] = static_cast<std::uint8_t>(
+                        (source[i / 8] >> (i % 8)) & 1u);
+                }
+                copy_source = native.data();
+                copy_bytes = native.size();
+            }
+            CUDA_CHECK(cudaMemcpyAsync(
+                static_cast<std::uint8_t*>(cell_base_[slot]) +
+                    index * cell_bytes_[slot],
+                copy_source, copy_bytes, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemsetAsync(
+                d_full_ + static_cast<std::size_t>(slot) * kMaxRing + index,
+                1, 1, stream));
         }
-        std::atomic_ref<std::uint64_t>(host_words_[slot][0]).store(
-            target_head, std::memory_order_release);
     }
 
     // Seed a slot's committed cell contents (host bytes → cell 0), pre-loop.
@@ -361,55 +420,17 @@ class DeviceChannelRegistry {
             1, std::memory_order_release);
     }
 
-    // Host `put`: fill the committed (head) cell + mark it full (host-fed
-    // channel arriving — the direct host→driver path).
+    // Standalone/test surface: write NATIVE bytes into the committed (head)
+    // device cell and mark it full — the tier-0 runner tests drive channels
+    // directly, bypassing endpoints. The production host-input path is
+    // `pull_writer_ring` (the shared pinned ring, §4.3).
     void host_feed(std::uint32_t slot, const void* data, std::size_t bytes) {
-        if (dtype_[slot] == PIE_CHANNEL_DTYPE_BOOL) {
-            std::vector<std::uint8_t> native(cell_bytes_[slot], 0);
-            const auto* packed = static_cast<const std::uint8_t*>(data);
-            for (std::size_t i = 0; i < native.size(); ++i) {
-                native[i] = static_cast<std::uint8_t>(
-                    (packed[i / 8] >> (i % 8)) & 1u);
-            }
-            CUDA_CHECK(cudaMemcpy(
-                committed_cell(slot), native.data(), native.size(),
-                cudaMemcpyHostToDevice));
-        } else {
-            CUDA_CHECK(cudaMemcpy(
-                committed_cell(slot), data, bytes, cudaMemcpyHostToDevice));
-        }
+        CUDA_CHECK(cudaMemcpy(
+            committed_cell(slot), data, bytes, cudaMemcpyHostToDevice));
         std::uint8_t one = 1;
         CUDA_CHECK(cudaMemcpy(
             d_full_ + (std::size_t)slot * kMaxRing + host_head_[slot],
             &one, 1, cudaMemcpyHostToDevice));
-    }
-
-    void host_feed_async(
-        std::uint32_t slot,
-        const void* data,
-        std::size_t bytes,
-        cudaStream_t stream,
-        std::vector<std::vector<std::uint8_t>>& staging) {
-        const void* source = data;
-        std::size_t source_bytes = bytes;
-        if (dtype_[slot] == PIE_CHANNEL_DTYPE_BOOL) {
-            staging.emplace_back(cell_bytes_[slot], 0);
-            auto& native = staging.back();
-            const auto* packed = static_cast<const std::uint8_t*>(data);
-            for (std::size_t i = 0; i < native.size(); ++i) {
-                native[i] = static_cast<std::uint8_t>(
-                    (packed[i / 8] >> (i % 8)) & 1u);
-            }
-            source = native.data();
-            source_bytes = native.size();
-        }
-        CUDA_CHECK(cudaMemcpyAsync(
-            committed_cell(slot), source, source_bytes,
-            cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemsetAsync(
-            d_full_ + static_cast<std::size_t>(slot) * kMaxRing +
-                host_head_[slot],
-            1, 1, stream));
     }
 
     // Host `take`: read the committed (head) cell, mark it empty, advance head.
@@ -484,9 +505,10 @@ class DeviceChannelRegistry {
                shapes_[slot] == decl.type.shape.dims &&
                seeded_[slot] == decl.has_seed &&
                host_role_[slot] ==
-                   (decl.host_reader ? PIE_CHANNEL_HOST_READER
-                                     : (decl.host_visible ? PIE_CHANNEL_HOST_WRITER
-                                                          : PIE_CHANNEL_HOST_NONE));
+                   (decl.host_reader
+                        ? PIE_CHANNEL_HOST_ROLE_READER
+                        : (decl.host_visible ? PIE_CHANNEL_HOST_ROLE_WRITER
+                                             : PIE_CHANNEL_HOST_ROLE_NONE));
     }
     static std::uint32_t cap1_of(const Channel& decl) {
         std::uint32_t cap1 = decl.capacity + 1;
@@ -598,6 +620,8 @@ class DeviceChannelRegistry {
         host_mirror_bytes_[slot] = 0;
         reserved_tail_[slot] = 0;
         reserved_head_[slot] = 0;
+        pulled_tail_[slot] = 0;
+        seed_credit_[slot] = 0;
         shapes_[slot].clear();
         extern_names_[slot].clear();
         attachment_direction_masks_[slot] = 0;
@@ -640,6 +664,8 @@ class DeviceChannelRegistry {
         host_mirror_bytes_.resize(new_cap, 0);
         reserved_tail_.resize(new_cap, 0);
         reserved_head_.resize(new_cap, 0);
+        pulled_tail_.resize(new_cap, 0);
+        seed_credit_.resize(new_cap, 0);
         shapes_.resize(new_cap);
         dtype_.resize(new_cap, 0);
         host_role_.resize(new_cap, 0);
@@ -678,6 +704,8 @@ class DeviceChannelRegistry {
     std::vector<std::uint64_t> host_mirror_bytes_;
     std::vector<std::uint64_t> reserved_tail_;
     std::vector<std::uint64_t> reserved_head_;
+    std::vector<std::uint64_t> pulled_tail_;
+    std::vector<std::uint8_t> seed_credit_;
     std::vector<std::vector<std::uint32_t>> shapes_;
     std::vector<std::uint8_t> dtype_, host_role_, extern_direction_;
     std::vector<std::uint64_t> reader_wait_ids_, writer_wait_ids_;
@@ -769,16 +797,14 @@ class ChannelView {
     void publish_host_seed(ChannelId c, const void* data, std::size_t bytes) {
         reg_->publish_host_seed(slot(c), data, bytes);
     }
-    void host_feed(ChannelId c, const void* data, std::size_t bytes) {
-        reg_->host_feed(slot(c), data, bytes);
-    }
-    void host_feed_async(
+    void pull_writer_ring(
         ChannelId c,
-        const void* data,
-        std::size_t bytes,
         cudaStream_t stream,
         std::vector<std::vector<std::uint8_t>>& staging) {
-        reg_->host_feed_async(slot(c), data, bytes, stream, staging);
+        reg_->pull_writer_ring(slot(c), stream, staging);
+    }
+    void host_feed(ChannelId c, const void* data, std::size_t bytes) {
+        reg_->host_feed(slot(c), data, bytes);
     }
     void host_take(ChannelId c, void* out, std::size_t bytes) {
         reg_->host_take(slot(c), out, bytes);

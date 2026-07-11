@@ -34,8 +34,7 @@ use crate::working_set::rs::RsWorkingSet;
 use pie_ptir::container::HostRole;
 
 use super::ptir_channel_store::{
-    BoundCells, ChannelCell, ChannelError, commit_host_puts, reserve_reader_capacity,
-    rollback_reader_capacity, snapshot_host_puts,
+    BoundCells, ChannelCell, ChannelError, reserve_reader_capacity, rollback_reader_capacity,
 };
 use super::ptir_kv;
 use super::ptir_lease::PageLease;
@@ -68,14 +67,41 @@ pub enum PendingOp {
 }
 
 impl PendingOp {
-    async fn wait_for_completion_signal(&self) {
+    /// Non-blocking probe: whether the op's driver completion has settled.
+    fn is_settled(&self) -> bool {
         match self {
-            Self::Fire(fire) => {
-                let _ = fire.completion.clone().await;
-            }
-            Self::Move(mv) => {
-                let _ = mv.completion.clone().await;
-            }
+            PendingOp::Fire(fire) => fire.completion.is_settled(),
+            PendingOp::Move(mv) => mv.completion.is_settled(),
+        }
+    }
+
+    /// An owned, payload-free await on this op's completion (cloned so the
+    /// pipeline queue lock is not held across the await). The outcome is
+    /// ignored; the FIFO drain reads the real result.
+    fn completion_signal(&self) -> OpSignal {
+        match self {
+            PendingOp::Fire(fire) => OpSignal::Fire(fire.completion.clone()),
+            PendingOp::Move(mv) => OpSignal::Move(mv.completion.clone()),
+        }
+    }
+}
+
+/// See [`PendingOp::completion_signal`].
+enum OpSignal {
+    Fire(crate::driver::InstanceCompletion),
+    Move(crate::driver::Completion),
+}
+
+impl std::future::Future for OpSignal {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        match self.get_mut() {
+            OpSignal::Fire(completion) => std::pin::Pin::new(completion).poll(cx).map(|_| ()),
+            OpSignal::Move(completion) => std::pin::Pin::new(completion).poll(cx).map(|_| ()),
         }
     }
 }
@@ -257,14 +283,6 @@ fn detect_device_geometry(
 
 type Anyhow<T> = anyhow::Result<T>;
 
-/// First fire only: bind the pass's seeds — one staged `put` per `seeded`
-/// channel, dense order (D2, per-instance data). A seeded channel with no
-/// staged put is the old `MissingSeed` instantiate error, surfaced at the
-/// first submit instead of hanging the fire.
-fn bind_seeds_first_fire(_p: &mut ForwardPass) -> Result<(), String> {
-    Ok(())
-}
-
 /// Poison every host-reader cell of a pass with the failed fire's error —
 /// under run-ahead this IS the error channel (`take`/`read` surface it).
 fn poison_readers(cells: &BoundCells, reason: &str) {
@@ -272,19 +290,46 @@ fn poison_readers(cells: &BoundCells, reason: &str) {
         let mut c = cell.lock().unwrap();
         if c.role == Some(HostRole::Reader) {
             c.poison(reason);
+            // A waiter parked on the reader wait slot must observe the poison.
+            if let Some(endpoint) = c.endpoint() {
+                pie_waker::WakerTable::global().wake(endpoint.registered().reader_wait_id);
+            }
         }
     }
 }
 
-fn publish_reader_mirrors(cells: &BoundCells, instance_id: u64) -> Result<bool, String> {
-    let mut poisoned = false;
-    for cell in cells {
-        let mut cell = cell.lock().unwrap();
-        if cell.role == Some(HostRole::Reader) {
-            poisoned |= cell.publish_reader_mirror(instance_id)?;
+/// Park until the channel can make progress: its endpoint's reader word
+/// advances (the driver's completion callback wakes the reader wait slot
+/// directly), or the oldest in-flight pipeline op settles so the caller can
+/// drain it. Errors surface poison/closure or a definitively empty channel
+/// (no endpoint and nothing in flight: nothing can ever fill the cell).
+async fn await_channel_progress(
+    cell: &Arc<Mutex<ChannelCell>>,
+    fires: Option<&PendingFires>,
+) -> Result<(), String> {
+    let wait = cell.lock().unwrap().reader_wait_state();
+    let oldest = fires.and_then(|f| f.lock().unwrap().front().map(|op| op.completion_signal()));
+    match (wait, oldest) {
+        (Some((endpoint, observed_tail)), Some(signal)) => {
+            // Race the direct channel wake against the oldest op so a fire
+            // that resolves without producing here still unblocks the loop.
+            // Poison/closure re-classify on the caller's next take/read.
+            tokio::select! {
+                _ = endpoint.wait_for_reader_change(observed_tail) => {}
+                _ = signal => {}
+            }
+            Ok(())
         }
+        (Some((endpoint, observed_tail)), None) => endpoint
+            .wait_for_reader_change(observed_tail)
+            .await
+            .map_err(|error| error.to_string()),
+        (None, Some(signal)) => {
+            signal.await;
+            Ok(())
+        }
+        (None, None) => Err(ChannelError::Empty.to_string()),
     }
-    Ok(poisoned)
 }
 
 // The interface has no free functions left (register-program folded into
@@ -331,10 +376,14 @@ impl pie::inferlet::forward::HostChannel for InstanceState {
         }
     }
 
-    /// The run-ahead await point: while the cell is empty, await + finalize
-    /// the pass's oldest in-flight fire (FIFO), then re-check. With no local
-    /// fire, wait directly on the endpoint so a producer in another task can
-    /// wake this channel. Poison and close are surfaced as errors.
+    /// The direct-wake await point (plan §4.5): while the cell is empty,
+    /// non-blockingly drain already-settled pipeline ops (their KV/RS txns
+    /// finalize here, bounding pin float), then park on the channel's reader
+    /// wait slot — the driver's completion callback wakes it right after
+    /// publishing the mirror tail. The park races the oldest in-flight op so
+    /// a fire that resolves without producing on this channel still unblocks
+    /// the loop; with no endpoint and nothing in flight, nothing can ever
+    /// fill the cell and `Empty` is returned instead of parking.
     async fn take(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
         loop {
             let (cell, fires) = {
@@ -346,30 +395,11 @@ impl pie::inferlet::forward::HostChannel for InstanceState {
                 Err(ChannelError::Empty) => {}
                 Err(e) => return Ok(Err(e.to_string())),
             }
-            let wait = cell.lock().unwrap().reader_wait_state();
-            let fire = fires.as_ref().and_then(|f| f.lock().unwrap().pop_front());
-            match fire {
-                Some(fire) => {
-                    if let Some((endpoint, observed_tail)) = wait {
-                        tokio::select! {
-                            _ = endpoint.wait_for_reader_change(observed_tail) => {}
-                            _ = fire.wait_for_completion_signal() => {}
-                        }
-                    }
-                    self.finalize_op(fire).await?;
-                }
-                None => {
-                    let Some((endpoint, observed_tail)) = wait else {
-                        return Ok(Err(ChannelError::Empty.to_string()));
-                    };
-                    if let Err(error) = endpoint.wait_for_reader_change(observed_tail).await {
-                        return Ok(Err(error.to_string()));
-                    }
-                    let mut cell = cell.lock().unwrap();
-                    if let Err(error) = cell.publish_reader_mirror(0) {
-                        return Ok(Err(error));
-                    }
-                }
+            if self.drain_settled(fires.as_ref()).await? {
+                continue;
+            }
+            if let Err(error) = await_channel_progress(&cell, fires.as_ref()).await {
+                return Ok(Err(error));
             }
         }
     }
@@ -386,30 +416,11 @@ impl pie::inferlet::forward::HostChannel for InstanceState {
                 Err(ChannelError::Empty) => {}
                 Err(e) => return Ok(Err(e.to_string())),
             }
-            let wait = cell.lock().unwrap().reader_wait_state();
-            let fire = fires.as_ref().and_then(|f| f.lock().unwrap().pop_front());
-            match fire {
-                Some(fire) => {
-                    if let Some((endpoint, observed_tail)) = wait {
-                        tokio::select! {
-                            _ = endpoint.wait_for_reader_change(observed_tail) => {}
-                            _ = fire.wait_for_completion_signal() => {}
-                        }
-                    }
-                    self.finalize_op(fire).await?;
-                }
-                None => {
-                    let Some((endpoint, observed_tail)) = wait else {
-                        return Ok(Err(ChannelError::Empty.to_string()));
-                    };
-                    if let Err(error) = endpoint.wait_for_reader_change(observed_tail).await {
-                        return Ok(Err(error.to_string()));
-                    }
-                    let mut cell = cell.lock().unwrap();
-                    if let Err(error) = cell.publish_reader_mirror(0) {
-                        return Ok(Err(error));
-                    }
-                }
+            if self.drain_settled(fires.as_ref()).await? {
+                continue;
+            }
+            if let Err(error) = await_channel_progress(&cell, fires.as_ref()).await {
+                return Ok(Err(error));
             }
         }
     }
@@ -688,18 +699,21 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
             };
             for cell in &cells {
                 let mut cell = cell.lock().unwrap();
-                if cell.role == Some(HostRole::Reader) {
-                    if let Err(error) = cell.publish_reader_mirror(instance_id) {
-                        drop(cell);
-                        let _ = crate::driver::close_instance(&bound_instance);
-                        for cell in &cells {
-                            cell.lock().unwrap().detach(instance_id);
-                        }
-                        return Ok(Err(format!("ptir: publish bound reader endpoint: {error}")));
-                    }
-                }
                 if cell.seeded {
                     cell.commit_seed();
+                }
+                // A seeded Writer held its staging back until the seed
+                // settled into the instance descriptor — flush it now so
+                // direct ring puts take over (plan §4.2).
+                if cell.role == Some(HostRole::Writer)
+                    && let Err(error) = cell.flush_writer_staging()
+                {
+                    drop(cell);
+                    let _ = crate::driver::close_instance(&bound_instance);
+                    for cell in &cells {
+                        cell.lock().unwrap().detach(instance_id);
+                    }
+                    return Ok(Err(format!("ptir: writer staging flush: {error}")));
                 }
             }
             let res = self.ctx().table.push(ForwardPass {
@@ -792,23 +806,17 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             // (§3.4): every pass binding a channel must submit on one pipeline.
             let pipe_fires = self.ctx().table.get(&this)?.fires.clone();
             let pipeline_failure = self.ctx().table.get(&this)?.failure.clone();
+            // Non-blocking settlement drain (plan §6): resolved fires' KV/RS
+            // txns finalize here so arena pins stay bounded by run-ahead depth
+            // even when the guest never takes.
+            self.drain_settled(Some(&pipe_fires)).await?;
             if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
                 return Ok(Err(format!("ptir: pipeline failed: {reason}")));
             }
             if let Err(error) = self.wire_channels_to_pipeline(&fwd, &pipe_fires)? {
                 return Ok(Err(error));
             }
-            let (
-                geometry,
-                cells,
-                ws_rep,
-                rs_rep,
-                committed_tokens,
-                fwd_rep,
-                instance_id,
-                host_puts,
-                completion,
-            ) = {
+            let (geometry, cells, ws_rep, rs_rep, committed_tokens, fwd_rep, instance_id, completion) = {
                 let p = self.ctx().table.get_mut(&fwd)?;
                 if let Some(e) = &p.failed {
                     return Ok(Err(format!(
@@ -824,7 +832,6 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
                     p.committed_tokens,
                     fwd.rep(),
                     p.bound_instance.instance_id,
-                    snapshot_host_puts(&p.cells),
                     p.bound_instance.reserve_completion(),
                 )
             };
@@ -867,8 +874,21 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
                         req.rs_slot_ids = rs_slot_ids;
                         req.rs_slot_flags = rs_slot_flags;
                         if let Some(mp) = &cow_move {
-                            if let Err(e) = crate::driver::copy_d2d(0, &mp.from, &mp.to) {
-                                tracing::warn!("ptir rs CoW d2d copy failed: {e:#}");
+                            // The copy rides the pipeline FIFO (D4): an
+                            // asynchronous failure poisons the pipeline
+                            // failure domain instead of vanishing in a log.
+                            match crate::driver::copy_d2d(0, &mp.from, &mp.to) {
+                                Ok(move_completion) => {
+                                    pipe_fires.lock().unwrap().push_back(PendingOp::Move(
+                                        PendingMove {
+                                            completion: move_completion,
+                                            failure: pipeline_failure.clone(),
+                                        },
+                                    ));
+                                }
+                                Err(e) => {
+                                    tracing::warn!("ptir rs CoW d2d copy failed: {e:#}");
+                                }
                             }
                         }
                         Some(txn)
@@ -890,10 +910,23 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             };
 
             // D2D-copy every CoW'd write target before the fire (empty for the
-            // single-context pipeline; non-empty only under a forked/shared page).
+            // single-context pipeline; non-empty only under a forked/shared
+            // page). Each copy rides the pipeline FIFO (D4) so an asynchronous
+            // failure poisons the pipeline failure domain.
             for mp in &move_plans {
-                if let Err(e) = crate::driver::copy_d2d(0, &mp.from, &mp.to) {
-                    tracing::warn!("ptir forward CoW d2d copy failed: {e:#}");
+                match crate::driver::copy_d2d(0, &mp.from, &mp.to) {
+                    Ok(move_completion) => {
+                        pipe_fires
+                            .lock()
+                            .unwrap()
+                            .push_back(PendingOp::Move(PendingMove {
+                                completion: move_completion,
+                                failure: pipeline_failure.clone(),
+                            }));
+                    }
+                    Err(e) => {
+                        tracing::warn!("ptir forward CoW d2d copy failed: {e:#}");
+                    }
                 }
             }
 
@@ -907,7 +940,6 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
                     req,
                     0,
                     instance_id,
-                    host_puts,
                     proj.physical_page_ids,
                     proj.last_page_len,
                     Vec::new(),
@@ -948,7 +980,6 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             // fire's post-state (the run-ahead overlap). A failed fire fails
             // the pass instead of rewinding.
             self.ctx().table.get_mut(&fwd)?.committed_tokens = next_committed;
-            commit_host_puts(&cells);
 
             pipe_fires
                 .lock()
@@ -1096,6 +1127,34 @@ impl InstanceState {
     /// its KV/RS txns and exposes mirror epochs; a KV cell MOVE awaits its
     /// payload-free completion. Move failures are logged because no channel is
     /// associated with the operation.
+    /// Pop and finalize pipeline ops whose completions have already settled,
+    /// without blocking (plan §6): submit and take/read entry call this so
+    /// KV/RS transaction pins stay bounded by run-ahead depth while value
+    /// waiting rides the channel wait slots. Returns whether anything drained.
+    async fn drain_settled(&mut self, fires: Option<&PendingFires>) -> Anyhow<bool> {
+        let Some(fires) = fires else {
+            return Ok(false);
+        };
+        let mut drained = false;
+        loop {
+            let op = {
+                let mut queue = fires.lock().unwrap();
+                if queue.front().is_some_and(PendingOp::is_settled) {
+                    queue.pop_front()
+                } else {
+                    None
+                }
+            };
+            match op {
+                Some(op) => {
+                    self.finalize_op(op).await?;
+                    drained = true;
+                }
+                None => return Ok(drained),
+            }
+        }
+    }
+
     async fn finalize_op(&mut self, op: PendingOp) -> Anyhow<()> {
         match op {
             PendingOp::Fire(fire) => self.finalize_fire(fire).await,
@@ -1179,25 +1238,14 @@ impl InstanceState {
             return Ok(());
         }
 
+        // Values are already visible through the release-published tail words
+        // (plan §4.5) — resolving the fire only classifies success and settles
+        // the transactions above.
         let failure_reason = match result {
-            Ok(()) => match publish_reader_mirrors(&cells, instance_id) {
-                Ok(true) => {
-                    let reason = "ptir: driver published poisoned output channel".to_string();
-                    poison_readers(&cells, &reason);
-                    self.fail_pass(fwd_rep, &reason);
-                    Some(reason)
-                }
-                Ok(false) => {
-                    self.reclaim_device_geometry_grants(fwd_rep, instance_id);
-                    None
-                }
-                Err(e) => {
-                    let reason = format!("ptir: mirror publication failed: {e}");
-                    poison_readers(&cells, &reason);
-                    self.fail_pass(fwd_rep, &reason);
-                    Some(reason)
-                }
-            },
+            Ok(()) => {
+                self.reclaim_device_geometry_grants(fwd_rep, instance_id);
+                None
+            }
             Err(e) => {
                 let reason = format!("ptir: forward failed: {e:#}");
                 poison_readers(&cells, &reason);
@@ -1252,6 +1300,8 @@ impl InstanceState {
         // ordering/FIFO correctness argument).
         let pipe_fires = self.ctx().table.get(&this)?.fires.clone();
         let pipeline_failure = self.ctx().table.get(&this)?.failure.clone();
+        // Non-blocking settlement drain (plan §6), as in the ordinary submit.
+        self.drain_settled(Some(&pipe_fires)).await?;
         if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
             return Ok(Err(format!("ptir: pipeline failed: {reason}")));
         }
@@ -1264,19 +1314,16 @@ impl InstanceState {
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let arena_arc = crate::arena::get(0, 0);
 
-        // Snapshot the carrier + grant B fresh physical pages, materializing +
-        // pinning them under one write/arena txn (no borrow held across submit).
-        let (host_puts, completion, instance_id, cells, fwd_rep, arena_txn, write_txn, phys_pages) = {
-            // Fail-fast + first-fire seed binding.
+        // Grant B fresh physical pages, materializing + pinning them under one
+        // write/arena txn (no borrow held across submit).
+        let (completion, instance_id, cells, fwd_rep, arena_txn, write_txn, phys_pages) = {
+            // Fail-fast.
             {
                 let p = self.ctx().table.get_mut(&fwd)?;
                 if let Some(e) = &p.failed {
                     return Ok(Err(format!(
                         "ptir: forward-pass failed by an earlier fire: {e}"
                     )));
-                }
-                if let Err(e) = bind_seeds_first_fire(p) {
-                    return Ok(Err(e));
                 }
             }
 
@@ -1346,23 +1393,33 @@ impl InstanceState {
             }
             drop(arena);
 
-            // Deliver the fresh grant to the program as a host-put on its
-            // `fresh` channel (D1-coalesced into this fire's carrier).
+            // Deliver the fresh grant to the program as a direct put on its
+            // `fresh` channel — a shared-ring write the driver pulls before
+            // the pass (plan §4.2/§4.3).
             let fresh_dense = devgeo.fresh_dense;
-            {
+            let fresh_error = {
                 let p = self.ctx().table.get_mut(&fwd)?;
                 let bytes: Vec<u8> = phys_pages.iter().flat_map(|s| s.to_le_bytes()).collect();
-                if let Some(cell) = p.cells.get(fresh_dense) {
-                    let _ = cell.lock().unwrap().put(bytes);
-                }
+                let error = match p.cells.get(fresh_dense) {
+                    Some(cell) => cell.lock().unwrap().put(bytes).err(),
+                    None => Some(ChannelError::Empty),
+                };
                 p.devgeo = Some(devgeo);
+                error
+            };
+            if let Some(error) = fresh_error {
+                arena_arc.lock().unwrap().txn_abort(txn);
+                if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
+                    ws.abort_writes(wtx);
+                }
+                return Ok(Err(format!(
+                    "ptir: device-geometry fresh grant put: {error}"
+                )));
             }
 
             let p = self.ctx().table.get_mut(&fwd)?;
-            let host_puts = snapshot_host_puts(&p.cells);
             let completion = p.bound_instance.reserve_completion();
             (
-                host_puts,
                 completion,
                 p.bound_instance.instance_id,
                 p.cells.clone(),
@@ -1382,7 +1439,6 @@ impl InstanceState {
                 req,
                 0,
                 instance_id,
-                host_puts,
                 phys_pages,
                 last_page_len,
                 Vec::new(),
@@ -1403,7 +1459,6 @@ impl InstanceState {
             self.ctx().table.get_mut(&fwd)?.failed = Some(reason.clone());
             return Ok(Err(reason));
         }
-        commit_host_puts(&cells);
 
         pipe_fires
             .lock()

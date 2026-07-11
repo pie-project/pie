@@ -88,18 +88,26 @@ void test_fork_freeze() {
     std::uint8_t* d_kvm = nullptr;
     std::uint32_t* d_klen = nullptr;
     std::int32_t* d_indptr = nullptr;
+    std::uint32_t* d_qo_indptr = nullptr;
     std::uint8_t* d_packed = nullptr;
+    // One query row per lane: qo_indptr = [0, 1, .., B] keeps the classic
+    // per-lane bitmap semantics under the [TOTAL_Q, STRIDE] signature.
+    std::vector<std::uint32_t> qo_indptr(static_cast<std::size_t>(B) + 1);
+    for (int b = 0; b <= B; ++b) qo_indptr[static_cast<std::size_t>(b)] = b;
     CUDA_RT(cudaMalloc(&d_kvm, kvm.size()));
     CUDA_RT(cudaMalloc(&d_klen, klen.size() * 4));
     CUDA_RT(cudaMalloc(&d_indptr, indptr.size() * 4));
+    CUDA_RT(cudaMalloc(&d_qo_indptr, qo_indptr.size() * 4));
     CUDA_RT(cudaMalloc(&d_packed, want.size()));
     CUDA_RT(cudaMemcpy(d_kvm, kvm.data(), kvm.size(), cudaMemcpyHostToDevice));
     CUDA_RT(cudaMemcpy(d_klen, klen.data(), klen.size() * 4, cudaMemcpyHostToDevice));
     CUDA_RT(cudaMemcpy(d_indptr, indptr.data(), indptr.size() * 4, cudaMemcpyHostToDevice));
+    CUDA_RT(cudaMemcpy(d_qo_indptr, qo_indptr.data(), qo_indptr.size() * 4,
+                       cudaMemcpyHostToDevice));
     CUDA_RT(cudaMemset(d_packed, 0, want.size()));
 
     pie_cuda_driver::kernels::launch_pack_dense_mask(
-        d_kvm, d_klen, d_indptr, d_packed, B, P_PAGE, nullptr);
+        d_kvm, d_klen, d_qo_indptr, d_indptr, d_packed, B, P_PAGE, nullptr);
     CUDA_RT(cudaDeviceSynchronize());
 
     std::vector<std::uint8_t> got(want.size(), 0);

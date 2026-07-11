@@ -177,6 +177,7 @@ mod tests {
             reject_launches_remaining: 0,
             fail_launches_after_accept: false,
             operation_log: None,
+            launch_observer: None,
         };
         let (native, _) = pie_engine::driver::NativeDriver::dummy(dummy).unwrap();
         GroupDriver { caps, native }

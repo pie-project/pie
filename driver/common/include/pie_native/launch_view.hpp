@@ -70,10 +70,6 @@ struct LaunchView {
 
     Slice<std::uint64_t> ptir_program_hashes;
     Slice<std::uint64_t> ptir_program_instances;
-    Slice<std::uint64_t> ptir_program_host_put_channels;
-    Slice<std::uint8_t> ptir_program_host_put_blob;
-    Slice<std::uint32_t> ptir_program_host_put_lens;
-    Slice<std::uint32_t> ptir_program_host_put_indptr;
     Slice<std::uint32_t> image_grids;
     Slice<std::uint8_t> image_pixels;
     Slice<std::uint32_t> image_pixel_indptr;

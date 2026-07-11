@@ -353,6 +353,12 @@ impl Completion {
         }
     }
 
+    /// Non-blocking probe: whether the completion has settled (successfully
+    /// or not) without registering any waker.
+    pub(crate) fn is_settled(&self) -> bool {
+        self.check().is_some()
+    }
+
     pub(crate) fn check(&self) -> Option<Result<()>> {
         match &self.kind {
             CompletionKind::ReadyOk => Some(Ok(())),
@@ -607,6 +613,11 @@ impl InstanceCompletion {
 
     pub(crate) fn resolve_from_terminal(&self) -> Result<()> {
         self.state.resolve_from_terminal()
+    }
+
+    /// Non-blocking probe: whether this instance completion has resolved.
+    pub(crate) fn is_settled(&self) -> bool {
+        self.state.result().is_some()
     }
 }
 

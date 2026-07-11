@@ -140,10 +140,6 @@ struct InstanceRecord {
 struct LaunchScratch {
     std::vector<std::uint64_t> ptir_program_hashes;
     std::vector<std::uint64_t> ptir_program_instances;
-    std::vector<std::uint64_t> ptir_host_put_channels;
-    std::vector<std::uint8_t> ptir_host_put_blob;
-    std::vector<std::uint32_t> ptir_host_put_lens;
-    std::vector<std::uint32_t> ptir_host_put_indptr;
 
     pie_native::LaunchView build(
         const PieLaunchDesc& launch,
@@ -156,31 +152,6 @@ struct LaunchScratch {
         for (const InstanceRecord& inst : instances) {
             ptir_program_hashes.push_back(inst.program_hash);
             ptir_program_instances.push_back(inst.instance_id);
-        }
-
-        ptir_host_put_channels.clear();
-        ptir_host_put_blob.clear();
-        ptir_host_put_lens.clear();
-        if (launch.host_put_indptr.ptr != nullptr && launch.host_put_indptr.len == lanes + 1) {
-            ptir_host_put_indptr.assign(
-                launch.host_put_indptr.ptr,
-                launch.host_put_indptr.ptr + launch.host_put_indptr.len);
-        } else {
-            ptir_host_put_indptr.assign(lanes + 1, 0);
-        }
-        if (launch.ptir_host_put_values.ptr != nullptr) {
-            for (std::size_t i = 0; i < launch.ptir_host_put_values.len; ++i) {
-                const PieChannelValueDesc& value = launch.ptir_host_put_values.ptr[i];
-                ptir_host_put_channels.push_back(value.channel_id);
-                ptir_host_put_lens.push_back(
-                    static_cast<std::uint32_t>(value.bytes.len));
-                if (value.bytes.ptr != nullptr && value.bytes.len > 0) {
-                    ptir_host_put_blob.insert(
-                        ptir_host_put_blob.end(),
-                        value.bytes.ptr,
-                        value.bytes.ptr + value.bytes.len);
-                }
-            }
         }
 
         pie_native::LaunchView view{};
@@ -201,10 +172,6 @@ struct LaunchScratch {
         view.sampling_indptr = pie_native::slice_from_u32(launch.sampling_indptr.ptr, launch.sampling_indptr.len);
         view.ptir_program_hashes = pie_native::slice_from_u64(ptir_program_hashes.data(), ptir_program_hashes.size());
         view.ptir_program_instances = pie_native::slice_from_u64(ptir_program_instances.data(), ptir_program_instances.size());
-        view.ptir_program_host_put_channels = pie_native::slice_from_u64(ptir_host_put_channels.data(), ptir_host_put_channels.size());
-        view.ptir_program_host_put_blob = pie_native::slice_from_u8(ptir_host_put_blob.data(), ptir_host_put_blob.size());
-        view.ptir_program_host_put_lens = pie_native::slice_from_u32(ptir_host_put_lens.data(), ptir_host_put_lens.size());
-        view.ptir_program_host_put_indptr = pie_native::slice_from_u32(ptir_host_put_indptr.data(), ptir_host_put_indptr.size());
         view.image_grids = pie_native::slice_from_u32(launch.image_grids.ptr, launch.image_grids.len);
         view.image_pixels = pie_native::slice_from_u8(launch.image_pixels.ptr, launch.image_pixels.len);
         view.image_pixel_indptr = pie_native::slice_from_u32(launch.image_pixel_indptr.ptr, launch.image_pixel_indptr.len);

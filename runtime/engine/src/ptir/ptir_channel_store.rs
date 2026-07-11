@@ -17,12 +17,16 @@
 //! Reader-only.
 //!
 //! Fire lifecycle (the pure host halves, unit-testable here):
-//!   1. guest `channel.put`s cells (seeds and/or Writer stage cells, D1);
-//!   2. first fire: [`take_seed`](ChannelCell::take_seed) pops each `seeded`
-//!      channel's staged cell into the submission's seed table; every fire:
-//!      [`drain_host_puts`] **coalesces** the staged Writer puts into the
-//!      submit's host-put table (bool packed to the wire, D1);
-//!   3. the driver publishes Reader cells and epochs into the bound mirror;
+//!   1. guest `channel.put`s cells: pre-endpoint they stage host-side; once
+//!      the Writer endpoint exists a put writes the wire bytes straight into
+//!      the driver-shared pinned ring and release-publishes the tail word
+//!      (bool packed to the wire, D1) — no launch-descriptor involvement;
+//!   2. first bind: [`take_seed`](ChannelCell::take_seed) pops each `seeded`
+//!      channel's staged cell into the instance descriptor's seed table, then
+//!      [`flush_writer_staging`](ChannelCell::flush_writer_staging) moves any
+//!      remaining staged Writer cells into the ring;
+//!   3. the driver pulls Writer ring entries pre-pass, and publishes Reader
+//!      cells and the tail word into the bound mirror at pass completion;
 //!   4. guest `channel.take`/`read` load that mirror directly. A poisoned channel turns
 //!      every host `take`/`read` into an error (device-side fault surfaced to
 //!      the guest).
@@ -35,7 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::driver::ChannelEndpoint;
-use crate::ptir::PtirChannelValue;
+use pie_driver_abi::PieChannelEndpointBinding;
 use pie_ptir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
 use pie_ptir::types::DType;
 
@@ -100,7 +104,9 @@ struct ReaderMirror {
     tail_word_index: usize,
     poison_word_index: usize,
     closed_word_index: usize,
-    published_tail: u64,
+    /// Sequences already copied out of the mirror — the reader-side cursor.
+    /// Visibility is the release-published tail word itself; there is no
+    /// separate runtime-side publication step.
     copied_tail: u64,
 }
 
@@ -283,7 +289,7 @@ impl ChannelCell {
     }
 
     pub fn reader_wait_state(&self) -> Option<(Arc<ChannelEndpoint>, u64)> {
-        Some((self.endpoint.clone()?, self.reader.as_ref()?.published_tail))
+        Some((self.endpoint.clone()?, self.reader.as_ref()?.copied_tail))
     }
 
     pub fn writer_wait_state(&self) -> Option<(Arc<ChannelEndpoint>, u64)> {
@@ -327,12 +333,24 @@ impl ChannelCell {
             )?;
         }
         self.endpoint = Some(endpoint);
+        // Direct puts start here: move any pre-endpoint staged Writer cells
+        // into the shared ring (a seeded Writer flushes after its seed is
+        // settled instead — see `flush_writer_staging`).
+        if self.role == Some(HostRole::Writer)
+            && let Err(error) = self.flush_writer_staging()
+        {
+            return Err(format!("channel {}: staging flush: {error}", self.global_id));
+        }
         Ok(())
     }
 
     /// Host `put` a dtype-native cell. Pre-bind this stages freely (seed or
     /// early Writer cell); post-bind it must be a Writer stage cell or the one
-    /// seed on a not-yet-fired `seeded` channel.
+    /// seed on a not-yet-fired `seeded` channel. Once the Writer endpoint
+    /// exists (and the seed, when declared, is settled), a put is a direct
+    /// shared-memory write: wire bytes land in the pinned ring cell and the
+    /// tail word is release-published (plan §4.2) — independent of pipelines
+    /// and submissions.
     pub fn put(&mut self, native: Vec<u8>) -> Result<(), ChannelError> {
         self.put_ref(&native)
     }
@@ -356,6 +374,16 @@ impl ChannelCell {
                 }
             }
         }
+        if self.role == Some(HostRole::Writer)
+            && !(self.seeded && !self.seed_taken)
+            && let Some(endpoint) = self.endpoint.clone()
+        {
+            debug_assert!(
+                self.staged.is_empty(),
+                "writer staging must flush when the endpoint attaches"
+            );
+            return self.write_writer_ring(endpoint.registered().binding, native);
+        }
         let consumed = self
             .endpoint
             .as_ref()
@@ -369,6 +397,83 @@ impl ChannelCell {
             return Err(ChannelError::Full);
         }
         self.staged.push_back(native.to_vec());
+        Ok(())
+    }
+
+    /// Write one cell into the driver-shared Writer ring (plan §4.2): check
+    /// poison/closed/backpressure via the shared words, write the wire bytes
+    /// at `tail % cap1`, then release-publish the incremented tail word. The
+    /// spare `+1` ring cell distinguishes full from empty and holds the
+    /// not-yet-consumed producer cell.
+    fn write_writer_ring(
+        &mut self,
+        binding: PieChannelEndpointBinding,
+        native: &[u8],
+    ) -> Result<(), ChannelError> {
+        let poison = load_word(binding.word_base, binding.poison_word_index as usize);
+        if poison != 0 {
+            return Err(ChannelError::Poisoned(format!(
+                "driver published poison epoch {poison}"
+            )));
+        }
+        if load_word(binding.word_base, binding.closed_word_index as usize) != 0 {
+            return Err(ChannelError::Closed);
+        }
+        let head = load_word(binding.word_base, binding.head_word_index as usize);
+        if self.writer_tail.saturating_sub(head) >= u64::from(self.capacity) {
+            return Err(ChannelError::Full);
+        }
+        let cell_bytes = binding.cell_bytes as usize;
+        let wire_len = if self.dtype == DType::Bool {
+            native.len().div_ceil(8)
+        } else {
+            native.len()
+        };
+        if wire_len != cell_bytes {
+            return Err(ChannelError::BadLength {
+                expected: cell_bytes,
+                got: wire_len,
+            });
+        }
+        let cap1 = u64::from(binding.capacity).saturating_add(1);
+        let offset = (self.writer_tail % cap1) * cell_bytes as u64;
+        // SAFETY: the binding's pinned mirror was validated at registration
+        // (`mirror_bytes >= cell_bytes * cap1`) and stays alive until the
+        // channel's ordered close; the SPSC discipline makes this cell ours.
+        let cell = unsafe {
+            std::slice::from_raw_parts_mut((binding.mirror_base + offset) as *mut u8, cell_bytes)
+        };
+        if self.dtype == DType::Bool {
+            pack_bool_into(native, cell);
+        } else {
+            cell.copy_from_slice(native);
+        }
+        self.writer_tail += 1;
+        store_word(
+            binding.word_base,
+            binding.tail_word_index as usize,
+            self.writer_tail,
+        );
+        Ok(())
+    }
+
+    /// Flush pre-endpoint staged Writer cells into the shared ring, FIFO.
+    /// Runs once the endpoint exists and the seed (when declared) has been
+    /// settled into the instance descriptor; steady state has no staging.
+    pub fn flush_writer_staging(&mut self) -> Result<(), ChannelError> {
+        if self.role != Some(HostRole::Writer) || (self.seeded && !self.seed_taken) {
+            return Ok(());
+        }
+        let Some(endpoint) = self.endpoint.clone() else {
+            return Ok(());
+        };
+        let binding = endpoint.registered().binding;
+        while let Some(native) = self.staged.pop_front() {
+            if let Err(error) = self.write_writer_ring(binding, &native) {
+                self.staged.push_front(native);
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -493,7 +598,6 @@ impl ChannelCell {
             tail_word_index: tail_word_index as usize,
             poison_word_index: poison_word_index as usize,
             closed_word_index: closed_word_index as usize,
-            published_tail: 0,
             copied_tail: 0,
         });
         Ok(())
@@ -501,39 +605,8 @@ impl ChannelCell {
 
     pub fn detach_reader_mirror(&mut self, _instance_id: u64) {}
 
-    /// Make one completed instance's release-published mirror tail visible to
-    /// subsequent `take`/`read` calls. No value is copied here.
-    pub fn publish_reader_mirror(&mut self, _instance_id: u64) -> Result<bool, String> {
-        let Some(reader) = self.reader.as_mut() else {
-            return Err(format!("channel {}: no endpoint mirror", self.global_id));
-        };
-        let poison = load_word(reader.word_base, reader.poison_word_index);
-        if poison != 0 {
-            let reason = format!("driver published poison epoch {poison}");
-            self.poison(&reason);
-            return Ok(true);
-        }
-        if load_word(reader.word_base, reader.closed_word_index) != 0 {
-            return Err(format!("channel {} endpoint is closed", self.global_id));
-        }
-        let tail = load_word(reader.word_base, reader.tail_word_index);
-        if tail < reader.published_tail {
-            return Err(format!(
-                "channel {}: mirror tail regressed from {} to {tail}",
-                self.global_id, reader.published_tail
-            ));
-        }
-        if tail.saturating_sub(reader.copied_tail) >= reader.cap1 {
-            return Err(format!(
-                "channel {}: mirror overrun (tail {tail}, copied {}, capacity {})",
-                self.global_id, reader.copied_tail, reader.cap1
-            ));
-        }
-        reader.published_tail = tail;
-        self.reader_reserved_tail = self.reader_reserved_tail.max(tail);
-        Ok(false)
-    }
-
+    /// Peek the most recently release-published mirror cell (device-geometry
+    /// reclaim reads `w_cont` this way) without touching the take cursor.
     pub fn latest_reader_value(
         &mut self,
         _instance_id: u64,
@@ -544,66 +617,65 @@ impl ChannelCell {
         let Some(reader) = self.reader.as_ref() else {
             return Ok(None);
         };
-        if reader.published_tail == 0 {
+        let tail = load_word(reader.word_base, reader.tail_word_index);
+        if tail == 0 {
             return Ok(None);
         }
-        let wire = read_mirror_cell(reader, reader.published_tail - 1);
-        decode_reader_cell(dtype, numel, native_len, &wire).map(Some)
+        let wire = read_mirror_cell(reader, tail - 1);
+        decode_reader_cell(dtype, numel, native_len, wire).map(Some)
     }
 
     fn refresh_reader_mirrors(&mut self) -> Result<(), ChannelError> {
         let dtype = self.dtype;
         let numel = self.numel();
         let native_len = self.native_len();
+        // Direct-word visibility: the driver release-publishes the tail,
+        // poison, and closed words from its completion callback; the gate is
+        // the word itself, not a runtime-side finalize step.
+        let mut poison_reason = None;
+        let mut closed = false;
+        let mut visible_tail = 0;
+        if let Some(reader) = self.reader.as_ref() {
+            let poison = load_word(reader.word_base, reader.poison_word_index);
+            if poison != 0 {
+                poison_reason = Some(format!("driver published poison epoch {poison}"));
+            } else if load_word(reader.word_base, reader.closed_word_index) != 0 {
+                closed = true;
+            } else {
+                let tail = load_word(reader.word_base, reader.tail_word_index);
+                if tail.saturating_sub(reader.copied_tail) >= reader.cap1 {
+                    poison_reason = Some(format!(
+                        "channel mirror overrun (tail {tail}, copied {}, capacity {})",
+                        reader.copied_tail, reader.cap1
+                    ));
+                } else if tail > reader.copied_tail {
+                    visible_tail = tail;
+                }
+            }
+        }
+        self.reader_reserved_tail = self.reader_reserved_tail.max(visible_tail);
+        if let Some(reason) = poison_reason {
+            self.poison(&reason);
+        }
         let (reader, produced) = (&mut self.reader, &mut self.produced);
         if let Some(reader) = reader {
-            while reader.copied_tail < reader.published_tail {
+            while reader.copied_tail < visible_tail {
                 let wire = read_mirror_cell(reader, reader.copied_tail);
-                produced.push_back(decode_reader_cell(dtype, numel, native_len, &wire)?);
+                produced.push_back(decode_reader_cell(dtype, numel, native_len, wire)?);
                 reader.copied_tail += 1;
             }
         }
+        if closed && self.produced.is_empty() && self.poisoned.is_none() {
+            return Err(ChannelError::Closed);
+        }
         Ok(())
     }
+
 }
 
 /// A forward pass's bound cells, dense declaration order (`cells[i]` backs the
 /// container's channel `i`).
 pub type BoundCells = Vec<Arc<Mutex<ChannelCell>>>;
-
-/// Snapshot the next staged Writer put per channel without consuming it.
-pub fn snapshot_host_puts(cells: &BoundCells) -> Vec<PtirChannelValue> {
-    let mut out = Vec::new();
-    for cell in cells {
-        let c = cell.lock().unwrap();
-        if c.role != Some(HostRole::Writer) {
-            continue;
-        }
-        let gid = c.global_id;
-        let pack = c.dtype == DType::Bool;
-        if let Some(native) = c.staged.front() {
-            let bytes = if pack {
-                pack_bool(native)
-            } else {
-                native.clone()
-            };
-            out.push(PtirChannelValue {
-                channel: gid,
-                bytes,
-            });
-        }
-    }
-    out
-}
-
-pub fn commit_host_puts(cells: &BoundCells) {
-    for cell in cells {
-        let mut cell = cell.lock().unwrap();
-        if cell.role == Some(HostRole::Writer) && cell.staged.pop_front().is_some() {
-            cell.writer_tail += 1;
-        }
-    }
-}
 
 pub fn reserve_reader_capacity(cells: &BoundCells) -> Result<(), ChannelError> {
     let mut reserved: Vec<Arc<Mutex<ChannelCell>>> = Vec::new();
@@ -666,16 +738,16 @@ fn decode_reader_cell(
     dtype: DType,
     numel: usize,
     native_len: usize,
-    wire: &[u8],
+    wire: Vec<u8>,
 ) -> Result<Vec<u8>, ChannelError> {
     let native = if dtype == DType::Bool {
         if wire.len() == native_len {
-            wire.iter().map(|byte| u8::from(*byte != 0)).collect()
+            wire.into_iter().map(|byte| u8::from(byte != 0)).collect()
         } else {
-            unpack_bool(wire, numel)
+            unpack_bool(&wire, numel)
         }
     } else {
-        wire.to_vec()
+        wire
     };
     if native.len() != native_len {
         return Err(ChannelError::BadLength {
@@ -689,12 +761,19 @@ fn decode_reader_cell(
 /// Pack a 1-byte-per-bool cell to the bit-packed wire (LSB-first, D1).
 pub fn pack_bool(native: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; native.len().div_ceil(8)];
+    pack_bool_into(native, &mut out);
+    out
+}
+
+/// Pack directly into `out` (e.g. the pinned ring cell), no intermediate
+/// allocation. `out` must hold `native.len().div_ceil(8)` bytes.
+pub fn pack_bool_into(native: &[u8], out: &mut [u8]) {
+    out.fill(0);
     for (i, &b) in native.iter().enumerate() {
         if b != 0 {
             out[i / 8] |= 1 << (i % 8);
         }
     }
-    out
 }
 
 /// Unpack `numel` bits (LSB-first) from the wire into a 1-byte-per-bool cell.
@@ -780,11 +859,9 @@ mod tests {
                 3,
             )
             .unwrap();
+        // The release-published tail word IS the visibility gate (§4.5).
         words[1].store(1, Ordering::Release);
-        cell.lock()
-            .unwrap()
-            .publish_reader_mirror(instance_id)
-            .unwrap();
+        let _ = instance_id;
     }
 
     #[test]
@@ -863,14 +940,17 @@ mod tests {
     }
 
     #[test]
-    fn mirror_tail_is_hidden_until_completion_publishes_epoch() {
+    fn mirror_tail_word_is_the_visibility_gate() {
+        // Direct-word visibility (plan §4.5): the release-published tail word
+        // is the gate. A zero tail hides the cell; storing the tail makes it
+        // takeable with no runtime-side finalize step in between.
         let cells = bound();
         let instance_id = 77;
         let mirror = Box::leak(9i32.to_le_bytes().to_vec().into_boxed_slice());
         let words = Box::leak(
             vec![
                 AtomicU64::new(0),
-                AtomicU64::new(1),
+                AtomicU64::new(0),
                 AtomicU64::new(0),
                 AtomicU64::new(0),
             ]
@@ -896,11 +976,7 @@ mod tests {
             cells[1].lock().unwrap().take().unwrap_err(),
             ChannelError::Empty
         );
-        cells[1]
-            .lock()
-            .unwrap()
-            .publish_reader_mirror(instance_id)
-            .unwrap();
+        words[1].store(1, Ordering::Release);
         assert_eq!(cells[1].lock().unwrap().take().unwrap(), 9i32.to_le_bytes());
     }
 
@@ -972,50 +1048,111 @@ mod tests {
         );
     }
 
-    #[test]
-    fn writer_puts_are_snapshotted_and_committed_one_at_a_time() {
+    /// Builds a Writer ring the test owns (mirror + words), attached via the
+    /// direct-write path so `put` lands wire bytes in shared memory.
+    fn writer_ring(
+        capacity: u32,
+        cell_bytes: usize,
+    ) -> (ChannelCell, &'static [u8], &'static [AtomicU64]) {
         let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, false);
-        declaration.capacity = 2;
-        let mut writer = ChannelCell::new(vec![8], DType::Bool, 2);
+        declaration.capacity = capacity;
+        let mut writer = ChannelCell::new(vec![8], DType::Bool, capacity);
         writer.matches_decl(&declaration).unwrap();
         writer.bind(&declaration);
-        let cells = vec![Arc::new(Mutex::new(writer))];
-        let mask_id = cells[0].lock().unwrap().global_id;
-        // two staged puts on the bool[8] mask.
-        cells[0]
-            .lock()
-            .unwrap()
-            .put(vec![1, 0, 1, 0, 0, 0, 0, 0])
-            .unwrap(); // bits 0,2 → 5
-        cells[0]
-            .lock()
-            .unwrap()
-            .put(vec![0, 1, 0, 0, 0, 0, 0, 1])
-            .unwrap(); // bits 1,7 → 130
-        let puts = snapshot_host_puts(&cells);
-        assert_eq!(puts.len(), 1, "only the next Writer cell is submitted");
-        assert_eq!(
-            puts[0],
-            PtirChannelValue {
-                channel: mask_id,
-                bytes: vec![5]
-            }
+        let cap1 = capacity as usize + 1;
+        let mirror = Box::leak(vec![0u8; cell_bytes * cap1].into_boxed_slice());
+        let words = Box::leak(
+            (0..4)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         );
+        (writer, mirror, words)
+    }
+
+    fn attach_writer(
+        writer: &mut ChannelCell,
+        mirror: &[u8],
+        words: &[AtomicU64],
+        cell_bytes: u32,
+        capacity: u32,
+    ) {
+        let table = pie_waker::WakerTable::global();
+        let endpoint = ChannelEndpoint::new(crate::driver::RegisteredChannel {
+            driver_id: usize::MAX,
+            binding: PieChannelEndpointBinding {
+                channel_id: writer.global_id,
+                mirror_base: mirror.as_ptr() as u64,
+                word_base: words.as_ptr() as u64,
+                mirror_bytes: mirror.len() as u64,
+                word_bytes: (words.len() * std::mem::size_of::<AtomicU64>()) as u64,
+                cell_bytes,
+                capacity,
+                head_word_index: 0,
+                tail_word_index: 1,
+                poison_word_index: 2,
+                closed_word_index: 3,
+            },
+            reader_wait_id: table.alloc(),
+            writer_wait_id: table.alloc(),
+        });
+        writer.attach_endpoint(Arc::new(endpoint)).unwrap();
+    }
+
+    #[test]
+    fn writer_put_writes_the_shared_ring_directly() {
+        // Plan §4.2: with an endpoint attached, `put` is a shared-memory
+        // write — wire bytes at `tail % cap1`, then the release-published
+        // tail word. No staging, no launch-descriptor involvement.
+        let (mut writer, mirror, words) = writer_ring(2, 1);
+        attach_writer(&mut writer, mirror, words, 1, 2);
+        writer.put(vec![1, 0, 1, 0, 0, 0, 0, 0]).unwrap(); // bits 0,2 → 5
+        assert_eq!(words[1].load(Ordering::Acquire), 1, "tail word published");
+        assert_eq!(mirror[0], 5, "wire bytes written to the pinned ring");
+        writer.put(vec![0, 1, 0, 0, 0, 0, 0, 1]).unwrap(); // bits 1,7 → 130
+        assert_eq!(words[1].load(Ordering::Acquire), 2);
+        assert_eq!(mirror[1], 130);
+        // capacity 2, nothing consumed → the third put backpressures.
         assert_eq!(
-            snapshot_host_puts(&cells),
-            puts,
-            "snapshotting must not consume a value before native acceptance"
+            writer.put(vec![0; 8]).unwrap_err(),
+            ChannelError::Full,
+            "tail - head >= capacity is Full"
         );
-        commit_host_puts(&cells);
-        assert_eq!(
-            snapshot_host_puts(&cells)[0],
-            PtirChannelValue {
-                channel: mask_id,
-                bytes: vec![130]
-            }
-        );
-        commit_host_puts(&cells);
-        assert!(snapshot_host_puts(&cells).is_empty());
+        // The driver consuming one (head word advance) frees a cell; the
+        // spare +1 ring slot means the write wraps into slot 0's successor.
+        words[0].store(1, Ordering::Release);
+        writer.put(vec![1, 1, 0, 0, 0, 0, 0, 0]).unwrap(); // bits 0,1 → 3
+        assert_eq!(words[1].load(Ordering::Acquire), 3);
+        assert_eq!(mirror[2 % 3], 3, "sequence 2 lands at slot 2 of cap1=3");
+    }
+
+    #[test]
+    fn writer_staging_flushes_into_the_ring_at_attach() {
+        // Pre-endpoint puts stage host-side; attaching the endpoint flushes
+        // them FIFO into the ring (plan §4.2 pre-endpoint staging).
+        let (mut writer, mirror, words) = writer_ring(2, 1);
+        writer.put(vec![1, 0, 1, 0, 0, 0, 0, 0]).unwrap(); // 5
+        writer.put(vec![0, 1, 0, 0, 0, 0, 0, 1]).unwrap(); // 130
+        assert_eq!(writer.staged_len(), 2);
+        assert_eq!(words[1].load(Ordering::Acquire), 0, "nothing published yet");
+        attach_writer(&mut writer, mirror, words, 1, 2);
+        assert_eq!(writer.staged_len(), 0, "staging drained");
+        assert_eq!(words[1].load(Ordering::Acquire), 2, "both cells published");
+        assert_eq!(&mirror[..2], &[5, 130]);
+    }
+
+    #[test]
+    fn writer_put_surfaces_poison_and_close() {
+        let (mut writer, mirror, words) = writer_ring(2, 1);
+        attach_writer(&mut writer, mirror, words, 1, 2);
+        words[2].store(9, Ordering::Release);
+        assert!(matches!(
+            writer.put(vec![0; 8]).unwrap_err(),
+            ChannelError::Poisoned(_)
+        ));
+        words[2].store(0, Ordering::Release);
+        words[3].store(1, Ordering::Release);
+        assert_eq!(writer.put(vec![0; 8]).unwrap_err(), ChannelError::Closed);
     }
 
     #[test]

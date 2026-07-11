@@ -128,19 +128,6 @@ int main() {
     if (!expect(pie_cuda_launch(driver, &launch, completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "model launch requires KV and sampling CSRs")) return 1;
-    PieChannelValueDesc bad_put{
-        .channel_id = channel_id,
-        .bytes = {.ptr = nullptr, .len = 1},
-    };
-    const std::uint32_t host_put_indptr[] = {0, 1};
-    launch = {};
-    launch.abi_version = PIE_DRIVER_ABI_VERSION;
-    launch.instance_ids = {.ptr = &instance_id, .len = 1};
-    launch.ptir_host_put_values = {.ptr = &bad_put, .len = 1};
-    launch.host_put_indptr = {.ptr = host_put_indptr, .len = 2};
-    if (!expect(pie_cuda_launch(driver, &launch, completion) ==
-                    PIE_STATUS_INVALID_ARGUMENT,
-                "launch rejects nested host-put bytes")) return 1;
     const std::uint32_t sampling_index = 0;
     const std::uint32_t sampling_indptr[] = {0, 1};
     launch = {};

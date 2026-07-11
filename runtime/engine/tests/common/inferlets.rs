@@ -15,7 +15,21 @@ fn inferlets_dir() -> PathBuf {
 }
 
 fn target(name: &str) -> &'static str {
-    if matches!(name, "direct-channel-e2e" | "direct-mixed-e2e") {
+    // Guests using the `inferlet::ptir` bridge build as wasip2: the bridge's
+    // channel registry pulls std `HashMap`, whose wasip3 std imports
+    // `wasi:random/insecure-seed@0.3.0-rc-2026-03-15` — version-mismatched with
+    // the engine wasmtime's `@0.3.0`, so the component fails to instantiate.
+    if matches!(
+        name,
+        "direct-channel-e2e"
+            | "direct-mixed-e2e"
+            | "generate"
+            | "grammar"
+            | "runahead"
+            | "lowlevel-chat"
+            | "specverify"
+            | "mtpverify"
+    ) {
         "wasm32-wasip2"
     } else {
         "wasm32-wasip3"

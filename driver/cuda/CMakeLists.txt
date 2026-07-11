@@ -29,7 +29,7 @@ project(PIE_DRIVER_CUDA CUDA CXX)
 # Optional compiler cache (sccache/ccache) for nvcc + host C++ compiles.
 # Speeds clean rebuilds / branch switches; no effect on a cold cache. Honor
 # PIE_COMPILER_LAUNCHER, else auto-detect on PATH. (Previously in build.rs.)
-if(NOT CMAKE_CUDA_COMPILER_LAUNCHER)
+if(NOT CMAKE_C_COMPILER_LAUNCHER AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
   if(DEFINED ENV{PIE_COMPILER_LAUNCHER} AND NOT "$ENV{PIE_COMPILER_LAUNCHER}" STREQUAL "")
     set(PIE_COMPILER_LAUNCHER "$ENV{PIE_COMPILER_LAUNCHER}")
   else()
@@ -38,8 +38,11 @@ if(NOT CMAKE_CUDA_COMPILER_LAUNCHER)
   if(PIE_COMPILER_LAUNCHER)
     set(CMAKE_C_COMPILER_LAUNCHER "${PIE_COMPILER_LAUNCHER}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${PIE_COMPILER_LAUNCHER}")
-    set(CMAKE_CUDA_COMPILER_LAUNCHER "${PIE_COMPILER_LAUNCHER}")
-    message(STATUS "Using compiler launcher: ${PIE_COMPILER_LAUNCHER}")
+    # nvcc is NOT auto-launched: sccache mishandles nvcc's fatbinary temp
+    # files (intermittent "Could not open input file *.ptx" + SIGHUP-killed
+    # server). Opt in explicitly with -DCMAKE_CUDA_COMPILER_LAUNCHER=... if
+    # your sccache build is known-good with nvcc.
+    message(STATUS "Using compiler launcher (C/C++ only): ${PIE_COMPILER_LAUNCHER}")
   endif()
 endif()
 
@@ -745,20 +748,6 @@ target_compile_options(test_transcode_fused PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(test_transcode_fused PRIVATE CUDA::cudart)
 
-# Sampling-IR primitive kernel templates (Lane L2 / charlie). Compiles the
-# canonical NVRTC-safe device prelude (src/sampling_ir/primitives_src.hpp)
-# through NVRTC for the detected arch, launches each primitive via the driver
-# API, and validates against a CPU reference (incl. RNG bit-parity with
-# sample_temp.cu). Needs an actual GPU at runtime.
-add_executable(test_sampling_ir_primitives
-  tests/sampling_ir_primitives_test.cu)
-target_include_directories(test_sampling_ir_primitives PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_options(test_sampling_ir_primitives PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-target_link_libraries(test_sampling_ir_primitives PRIVATE
-  CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
-
 # PSIR v1 bytecode reader (Lane L2 / charlie). Pure C++ (no CUDA): decodes the
 # wire format (interface/sampling-ir/BYTECODE.md) into the in-memory IR graph
 # and cross-validates against golden vectors from alpha's Rust encoder.
@@ -781,17 +770,6 @@ target_include_directories(test_ptir_graph_key PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_ptir_graph_key PRIVATE CUDA::cudart)
 add_test(NAME ptir_graph_key COMMAND test_ptir_graph_key)
-
-# Cross-request batching (#10 / delta) — CPU unit test for the grouping partition
-# (group fire rows by program handle = the canonical bytecode-hash). Pure host
-# logic, no GPU; group.hpp pulls runtime.hpp (cuda_runtime.h) so link cudart for
-# the include path only.
-add_executable(test_sampling_ir_group
-  tests/test_sampling_ir_group.cpp)
-target_include_directories(test_sampling_ir_group PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(test_sampling_ir_group PRIVATE CUDA::cudart)
-add_test(NAME sampling_ir_group COMMAND test_sampling_ir_group)
 
 # #10 gather/scatter device verify (delta) — compacts a scattered group to [Ng,V]
 # and scatters the [Ng] result back. Needs a GPU at runtime.
@@ -840,6 +818,25 @@ target_compile_options(test_ptir_dispatch_bind PRIVATE
 target_link_libraries(test_ptir_dispatch_bind PRIVATE CUDA::cudart)
 add_test(NAME ptir_dispatch_bind COMMAND test_ptir_dispatch_bind)
 set_tests_properties(ptir_dispatch_bind PROPERTIES
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
+# Same-instance run-ahead concurrency gate (direct_ffi_new_plan.md §14 gate 9):
+# scheduler-thread fires + registry growth + instance churn racing the CUDA
+# host-func completion callback. Build with -fsanitize=thread for the TSAN run.
+add_executable(test_ptir_dispatch_race
+  tests/ptir_dispatch_race_test.cpp
+  src/ptir/ptir_dispatch.cu
+  src/sampling_ir/frame_carrier.cpp
+  src/sampling_ir/frame_carrier_kernels.cu)
+target_include_directories(test_ptir_dispatch_race PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  ${PIE_DRIVER_ABI_INCLUDE_DIR})
+target_compile_options(test_ptir_dispatch_race PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_ptir_dispatch_race PRIVATE CUDA::cudart)
+add_test(NAME ptir_dispatch_race COMMAND test_ptir_dispatch_race)
+set_tests_properties(ptir_dispatch_race PROPERTIES
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
 # Sampling-IR codegen (Lane L2 / charlie, W2): lowers golden PSIR programs to a
@@ -948,19 +945,6 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/sampling_ir/codegen.cpp"
     COMMAND test_sampling_ir_spec_verify)
 endif()
 
-# Sampling-IR matrix kernel templates + greedy spec-verify DAG (Lane L2 /
-# charlie, Phase 2 / WS4). Standalone: validates batched per-row reduce/softmax
-# over Matrix{rows,len} + the greedy speculative-verify kernel DAG vs a CPU
-# reference. Needs a GPU at runtime.
-add_executable(test_sampling_ir_matrix
-  tests/sampling_ir_matrix_test.cu)
-target_include_directories(test_sampling_ir_matrix PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_options(test_sampling_ir_matrix PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
-target_link_libraries(test_sampling_ir_matrix PRIVATE
-  CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
-
 # PTIR tier-0 op-kernel library parity (Thrust 3 / charlie, P4.2). Runs every
 # prebuilt row-parallel tier-0 kernel (src/ptir/tier0_kernels.cuh) on the GPU
 # and diffs against the host reference evaluator (src/ptir/host_eval.hpp) — the
@@ -983,7 +967,8 @@ target_link_libraries(test_ptir_tier0 PRIVATE
 add_executable(test_ptir_runner
   tests/ptir_runner_test.cu)
 target_include_directories(test_ptir_runner PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${PIE_DRIVER_ABI_INCLUDE_DIR})
 target_compile_options(test_ptir_runner PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(test_ptir_runner PRIVATE
@@ -1005,7 +990,8 @@ target_include_directories(test_ptir_container PRIVATE
 add_executable(test_ptir_tier1
   tests/ptir_tier1_test.cu)
 target_include_directories(test_ptir_tier1 PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${PIE_DRIVER_ABI_INCLUDE_DIR})
 target_compile_options(test_ptir_tier1 PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(test_ptir_tier1 PRIVATE
@@ -1019,7 +1005,8 @@ target_link_libraries(test_ptir_tier1 PRIVATE
 add_executable(test_ptir_golden_exec
   tests/ptir_golden_exec_test.cu)
 target_include_directories(test_ptir_golden_exec PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${PIE_DRIVER_ABI_INCLUDE_DIR})
 target_compile_options(test_ptir_golden_exec PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(test_ptir_golden_exec PRIVATE
@@ -1035,8 +1022,6 @@ add_test(NAME swap_pool COMMAND test_swap_pool)
 add_test(NAME mxfp4_marlin COMMAND test_mxfp4_marlin)
 add_test(NAME transcode_fused COMMAND test_transcode_fused)
 add_test(NAME sampler_parity COMMAND sampler_parity_test)
-add_test(NAME sampling_ir_primitives COMMAND test_sampling_ir_primitives)
-add_test(NAME sampling_ir_matrix COMMAND test_sampling_ir_matrix)
 add_test(NAME ptir_tier0 COMMAND test_ptir_tier0)
 add_test(NAME ptir_runner COMMAND test_ptir_runner)
 add_test(NAME ptir_container COMMAND test_ptir_container

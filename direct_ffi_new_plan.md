@@ -2,6 +2,67 @@
 
 ## Status
 
+**Implemented (2026-07-10).** Phases 0-3 are landed: scheduler nudge +
+callback contract + CoW-on-FIFO (Phase 0), direct reader wake + word-gated
+visibility + finalize decoupling (Phase 1), ring puts + driver pull +
+availability check + ABI v2 (Phase 2), gate tests + grep gates (Phase 3).
+
+§14 gate coverage: 1 (ABI fields deleted; dummy/CUDA pull tests), 2/3
+(`parked_reader_wakes_straight_from_the_driver_callback`,
+`extern_export_flows_into_importing_instance`), 4/5
+(`writer_ring_backpressure_wakes_after_a_consuming_fire`), 6
+(`completion_retirement_is_event_driven` + the §16.2 backstop wake-class
+counter asserting zero), 7 (`parked_reader_wakes_into_poisoned_not_empty`),
+8 (frame.rs register-then-recheck tests), 9 (`test_ptir_dispatch_race`:
+96 same-instance run-ahead fire pairs + registry growth + instance churn,
+TSAN-instrumented run on an RTX 4090 with zero reports, CUDA-runtime
+suppressions only), grep gates clean. Gate 10 (pin-float bound) is
+covered by construction (`drain_settled` at submit entry + the forward_txn
+suite); a full guest-driven test waits on the inferlet SDK restoration.
+
+Follow-up hardening sweep (same day): batch-level channel budgeting — one
+launch's members sharing a channel are validated against the AGGREGATE of
+their planned ring consumes and reader publishes (`validate_channel_budget`),
+closing the per-instance blind spot on both the CUDA and dummy drivers;
+`publish_reader_mirror` and the second reader cursor deleted (the released
+tail word is the only gate; `latest_reader_value` reads it directly); dead
+carrier code removed (`PtirProgramSubmission`, `bind_seeds_first_fire`,
+`read_channel_ids`); nvcc excluded from the sccache auto-launcher; orphaned
+sampling-ir test targets removed and `pack_dense_mask` updated to the
+[TOTAL_Q, STRIDE] signature.
+
+Validated: pie-engine 209 lib tests + integration suites (remaining failures
+are the pre-existing guest-SDK breakage, identical at the pre-change
+baseline); dummy/worker/abi/waker/ptir suites; the full driver/cuda ctest
+suite (30/30, including dispatch-race and golden-exec) on an RTX 4090; Metal
+stub test.
+
+Second sweep (same day): the deferred micro-optimizations landed — bool cells
+pack straight into the pinned ring (`pack_bool_into`, no intermediate
+allocation), reader cells decode by move instead of a second copy
+(`decode_reader_cell` takes ownership), and a prebuilt single-request batch
+moves its `LaunchPlan` into the submission instead of cloning it;
+`arm_completion_nudge` was assessed and left alone (one registration per
+scheduler block is already minimal, a cache only adds a lost-wake hazard).
+Metal gained its Phase-3 real-execution increment: `launch` executes
+channel-plane PTIR programs on a host interpreter
+(driver/metal/src/ptir/host_interp.hpp, a C++ mirror of the canonical
+interface/ptir interp over the shared pure-host decode headers under
+driver/cuda/src/ptir) and publishes per §4.3/§4.4 — writer-ring pull with
+batch-aggregated availability, seed credit, reader tail/poison publication,
+per-channel wakes, terminals, and the batch notify last. Intrinsic-,
+host-input-, per-layer-, and kernel-call programs still reject UNSUPPORTED
+until the Metal forward is wired. The stub test was rewritten to the
+execution contract (put→launch→take, availability rejection, poison
+settlement, seed credit; ctest green) and the worker links with the embedded
+driver. The guest inferlet SDK breakage is being closed by migrating the
+stale guests to `inferlet::ptir` (the SDK itself was never broken — the old
+`sampling`/`emit`/classic-ForwardPass surface was deliberately deleted);
+migrated so far: generate, lowlevel-chat, specverify, mtpverify (+
+no_context WIT-path fix, a dummy-driver `LaunchObserver` seam restoring
+mock fire observation, and wasip2 targets for ptir guests — the wasip3 std
+pulls a `wasi:random` rc version wasmtime does not link).
+
 Successor plan to [direct_ffi.md](direct_ffi.md) and [direct_ffi_fix.md](direct_ffi_fix.md)
 for the channel data plane and the wake paths. The direct FFI transport
 migration those documents drove is done and is not reopened here. This plan

@@ -3,7 +3,10 @@
 // PTIR program runtime — the driver-side stage-runner entry that consumes
 // delta's `PtirProgramSubmission` wire contract (P2c, `8a4b20bf`):
 //   { hash, bytes?(first-fire container), sidecar?(first-fire PTIB),
-//     seeds[](per-instance init D2), host_puts[](per-fire input) }.
+//     seeds[](per-instance init D2) }.
+// Host puts do not ride the wire (ABI v2): the runtime writes them into the
+// registered channel endpoint's pinned ring and the instance pulls them
+// stream-ordered before the consuming pass (`pull_writer_inputs`).
 //
 // Two pieces:
 //   * `PtirProgramCache` — the C3 hash-keyed DECODE cache (mirrors
@@ -14,9 +17,9 @@
 //     (the hash's payload D1); per-instance state lives in `PtirInstance`.
 //   * `PtirInstance` — a per-instance execution context (thrust-3 §5 degenerate
 //     depth-0 synchronous loop): the shared `Trace` + its own channel arena,
-//     seeded at construction with the instance's D2 seed values. Each fire binds
-//     the per-fire host-puts (`host_feed`) + intrinsics (`FireInputs`), runs one
-//     tier-0 pass, and harvests host-visible outputs (`host_take`).
+//     seeded at construction with the instance's D2 seed values. Each fire
+//     pulls the host-writer rings (`pull_writer_inputs`), binds the intrinsic
+//     `FireInputs`, runs one tier-0 pass, and harvests host-visible outputs.
 //
 // This is the driver half of P2c: delta's ~10-line runtime submit-fire binds a
 // `PtirProgramSubmission` onto the wire; the executor decodes it here and drives
@@ -40,7 +43,7 @@
 namespace pie_cuda_driver::ptir {
 
 // A per-channel host-supplied byte value — mirrors delta's `PtirChannelValue`.
-// Seeds are per-instance init (D2, not in the hash); host_puts are per-fire.
+// Seeds are per-instance init (D2, not in the hash).
 // `channel` is the GLOBAL channel id (W0.2 re-key) — the device registry key.
 struct ChannelValue {
     std::uint64_t channel = 0;
@@ -155,48 +158,75 @@ class PtirInstance {
 
     bool ok() const { return ok_; }
 
-    bool validate_host_puts(const std::vector<ChannelValue>& values,
-                            std::string* err = nullptr) const {
-        return validate_values(values, false, err);
-    }
-
-    void feed_host_puts(const std::vector<ChannelValue>& values) {
-        for (const ChannelValue& value : values) {
-            view_.host_feed(
-                dense_channel(value.channel),
-                value.bytes.data(),
-                value.bytes.size());
+    // §4.3 writer availability: every host-writer channel this trace takes
+    // must have a host input (a published ring entry or the one-shot seed
+    // credit) before the fire is accepted. A missing put is a guest ordering
+    // bug — the launch rejects synchronously, no epoch, no poison.
+    bool writer_inputs_available(std::string* err = nullptr) const {
+        for (const Channel& ch : trace_->channels) {
+            if (!ch.host_visible || ch.host_reader) continue;
+            if (!fire_takes_channel(ch.id)) continue;
+            if (reg_->writer_available(view_.slot(ch.id)) < 1) {
+                if (err) {
+                    *err = "ptir channel " +
+                        std::to_string(view_.global_id(ch.id)) +
+                        " has no host input for this fire "
+                        "(put must happen before submit)";
+                }
+                return false;
+            }
         }
+        return true;
     }
 
-    void feed_host_puts_async(
-        const std::vector<ChannelValue>& values,
+    // The registry slots one fire of this instance consumes a writer-ring
+    // entry from — batch validation aggregates these across members sharing
+    // a channel (multi-pass channels).
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> writer_take_slots() const {
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> out;
+        for (const Channel& ch : trace_->channels) {
+            if (!ch.host_visible || ch.host_reader) continue;
+            if (!fire_takes_channel(ch.id)) continue;
+            out.emplace_back(view_.slot(ch.id), view_.global_id(ch.id));
+        }
+        return out;
+    }
+
+    // §4.3 pull: move each host-writer channel's published ring entries into
+    // the device cells, stream-ordered before the pass.
+    void pull_writer_inputs(
         cudaStream_t stream,
         std::vector<std::vector<std::uint8_t>>& staging) {
-        for (const ChannelValue& value : values) {
-            view_.host_feed_async(
-                dense_channel(value.channel),
-                value.bytes.data(),
-                value.bytes.size(),
-                stream,
-                staging);
+        for (const Channel& ch : trace_->channels) {
+            if (ch.host_visible && !ch.host_reader) {
+                view_.pull_writer_ring(ch.id, stream, staging);
+            }
         }
     }
 
-    // One fire: bind per-fire host-puts (host-fed channels arriving, keyed by
-    // GLOBAL id) + the intrinsic/host-tensor `FireInputs`, then run one tier-0
-    // pass. The result's `committed` reflects the end-of-pass predicated bump.
-    PassResult fire(const std::vector<ChannelValue>& host_puts, const FireInputs& in) {
-        feed_host_puts(host_puts);
+    // Schedule this fire's writer-ring consumes: one per taken host-writer
+    // channel. Returns `(slot, target_head)` pairs for the completion
+    // callback's head-word publication; a seed-credit spend schedules no
+    // ring consume and is omitted.
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> schedule_writer_consumes() {
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> out;
+        for (const Channel& ch : trace_->channels) {
+            if (!ch.host_visible || ch.host_reader) continue;
+            if (!fire_takes_channel(ch.id)) continue;
+            const std::uint32_t slot = view_.slot(ch.id);
+            const std::uint64_t target = reg_->schedule_writer_consume(slot);
+            if (target != 0) out.emplace_back(slot, target);
+        }
+        return out;
+    }
+
+    // One fire: run one tier-0 pass over the already-pulled channel state.
+    // The result's `committed` reflects the end-of-pass predicated bump.
+    PassResult fire(const FireInputs& in) {
         return runner_.run_pass(in);
     }
 
-    PassResult fire_async(
-        const std::vector<ChannelValue>& host_puts,
-        const FireInputs& in,
-        std::vector<void*>& scratch,
-        std::vector<std::vector<std::uint8_t>>& host_staging) {
-        feed_host_puts_async(host_puts, in.stream, host_staging);
+    PassResult fire_async(const FireInputs& in, std::vector<void*>& scratch) {
         return runner_.launch_pass_async(in, scratch);
     }
 
@@ -284,6 +314,25 @@ class PtirInstance {
             if (view_.global_id(dense) == global_id) return dense;
         }
         return static_cast<ChannelId>(trace_->channels.size());
+    }
+
+    // Whether one fire consumes (takes) dense channel `dense` — a stage
+    // `chan_take` or a consuming descriptor port. A pass bumps a channel's
+    // ring index at most once (register semantics), so this is the per-fire
+    // consume count.
+    bool fire_takes_channel(ChannelId dense) const {
+        for (const Stage& stage : trace_->stages) {
+            for (ChannelId taken : stage.takes) {
+                if (taken == dense) return true;
+            }
+        }
+        for (const PortBinding& binding : trace_->ports) {
+            if (!binding.is_const && binding.channel == dense &&
+                port_consumes(binding.port)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     bool validate_values(const std::vector<ChannelValue>& values,

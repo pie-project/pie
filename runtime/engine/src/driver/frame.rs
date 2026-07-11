@@ -366,8 +366,6 @@ pub struct LaunchSubmission {
     pub plan: LaunchPlan,
     pub instance_ids: Vec<u64>,
     pub terminal_cells: Vec<*mut PieTerminalCell>,
-    pub host_put_values: Vec<PtirChannelValue>,
-    pub host_put_indptr: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,7 +578,6 @@ impl<'a> InstanceDescBorrow<'a> {
 }
 
 pub struct LaunchDescBorrow<'a> {
-    _host_put_values: Vec<PieChannelValueDesc>,
     _masks: MaskWordsStorage,
     raw: pie_driver_abi::PieLaunchDesc,
     _plan: &'a LaunchPlan,
@@ -588,14 +585,6 @@ pub struct LaunchDescBorrow<'a> {
 impl<'a> LaunchDescBorrow<'a> {
     pub fn from_submission(submission: &'a LaunchSubmission) -> Self {
         let plan = &submission.plan;
-        let host_put_values_raw: Vec<PieChannelValueDesc> = submission
-            .host_put_values
-            .iter()
-            .map(|value| PieChannelValueDesc {
-                channel_id: value.channel,
-                bytes: bytes_slice(&value.bytes),
-            })
-            .collect();
         let masks = MaskWordsStorage::from_plan(plan);
         let raw = pie_driver_abi::PieLaunchDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
@@ -636,16 +625,10 @@ impl<'a> LaunchDescBorrow<'a> {
             audio_feature_indptr: u32_slice(&plan.audio_feature_indptr),
             audio_anchor_rows: u32_slice(&plan.audio_anchor_rows),
             audio_indptr: u32_slice(&plan.audio_indptr),
-            ptir_host_put_values: PieChannelValueDescSlice {
-                ptr: host_put_values_raw.as_ptr(),
-                len: host_put_values_raw.len(),
-            },
-            host_put_indptr: u32_slice(&submission.host_put_indptr),
             kv_len: u32_slice(&plan.kv_len),
             kv_len_device: u64_slice(&plan.kv_len_device),
         };
         Self {
-            _host_put_values: host_put_values_raw,
             _masks: masks,
             raw,
             _plan: plan,

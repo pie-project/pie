@@ -120,6 +120,10 @@ target_include_directories(pie_driver_metal_lib
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    # Shared pure-host PTIR decode headers (container/bound/trace/op_table —
+    # CUDA-free; see op_table.hpp's note about the planned move to a common
+    # home). The host interpreter (src/ptir/host_interp.hpp) consumes them.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cuda/src
     ${PIE_DRIVER_ABI_INCLUDE_DIR})
 
 target_compile_options(pie_driver_metal_lib PRIVATE
