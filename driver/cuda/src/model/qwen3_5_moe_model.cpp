@@ -49,8 +49,11 @@ void Qwen35MoeModel::body(Qwen3Workspace& ws,
                           AttentionWorkspace& attn_ws,
                           ops::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
+    Qwen3_5ForwardCfg fwd = fwd_cfg_;
+    fwd.emit_logits = in.emit_logits;
+
     qwen3_5_moe_forward_paged(
-        weights_, hf_config_, fwd_cfg_, plan_state_,
+        weights_, hf_config_, fwd, plan_state_,
         ws, la_ws_, moe_ws_, kv, state_cache_,
         attn_ws, cublas,
         in.token_ids, in.positions,

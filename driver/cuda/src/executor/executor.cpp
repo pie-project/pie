@@ -2130,7 +2130,7 @@ inline void write_probes(pie_driver::PieForwardResponseView& out,
 }
 }  // namespace
 
-void handle_fire_batch(
+bool handle_fire_batch(
     std::uint32_t req_id,
     const pie_driver::PieForwardRequestView& view,
     pie_driver::PieForwardResponseView& out_resp,
@@ -2276,6 +2276,7 @@ void handle_fire_batch(
 
         const int N = static_cast<int>(tok_view.size());
         const int num_sampling = static_cast<int>(sidx_view.size());
+        const bool has_sampling = num_sampling > 0;
         dbg_R = R; dbg_N = N;
 
         // Qwen3-VL: assemble the per-token [N,3] M-RoPE positions. Text rows
@@ -2315,13 +2316,12 @@ void handle_fire_batch(
             // Empty batch — emit a zero-request response view.
             std::vector<pie_driver::PerRequestOutput> empty(std::max(R, 0));
             executor.response_builder.build(empty, out_resp);
-            return;
+            return true;
         }
         if (N > max_workspace_tokens) {
             std::cerr << "[pie-driver-cuda] batch tokens=" << N
                       << " exceeds workspace=" << max_workspace_tokens << "\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
+            return false;
         }
 
         // Compute max KV length across requests for shmem sizing.
@@ -2438,6 +2438,16 @@ void handle_fire_batch(
                 slot_ids_h[r] = executor.graph_pad_slot;
                 is_fresh_h[r] = 0u;
             }
+            const int max_rs_slots = executor.rs_cache->max_slots();
+            for (int r = 0; r < slot_count; ++r) {
+                if (slot_ids_h[r] < 0 || slot_ids_h[r] >= max_rs_slots) {
+                    throw std::runtime_error(
+                        "rs_cache slot id " + std::to_string(slot_ids_h[r]) +
+                        " for request " + std::to_string(r) +
+                        " is outside allocated slot range [0, " +
+                        std::to_string(max_rs_slots) + ")");
+                }
+            }
             pi.slot_ids.copy_from_host(std::span<const std::int32_t>(slot_ids_h));
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
         }
@@ -2520,16 +2530,14 @@ void handle_fire_batch(
                       << logit_rows_required
                       << " logit rows, exceeding workspace capacity "
                       << tensor_rows(ws.logits) << "\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
+            return false;
         }
         if (prob_rows_required > tensor_rows(ws.probs)) {
             std::cerr << "[pie-driver-cuda] fire_batch needs "
                       << prob_rows_required
                       << " probability rows, exceeding workspace capacity "
                       << tensor_rows(ws.probs) << "\n";
-            out_resp = pie_driver::PieForwardResponseView{};
-            return;
+            return false;
         }
 
         const SamplingPlan sample_plan{
@@ -2677,7 +2685,7 @@ void handle_fire_batch(
         // pass) produces no logits and no sampled tokens — skip every argmax /
         // sampling launch (they would read the unwritten, undersized
         // `ws.logits` over all N rows and fault).
-        if (num_sampling == 0) {
+        if (!has_sampling) {
             // nothing to sample
         } else if (tp_greedy_argmax) {
             kernels::launch_select_global_argmax_pairs(
@@ -2733,19 +2741,25 @@ void handle_fire_batch(
         // `h_per_*`, `h_sample_idx`) are still in scope here for the
         // response builder.
 
-        // Only copy the first N entries — `pi.sampled` is sized for
-        // max_workspace_tokens, but only [0, N) are valid this fire.
-        // Async on the same stream the sampler ran on so it slots into
-        // the stream's FIFO; we sync immediately after because the
-        // response payload depends on these tokens. (Future work moves
-        // the sync past the host-side response-prep so the host
-        // and GPU can overlap.)
-        std::int32_t* sampled_host =
-            sampled_pinned_buf(static_cast<std::size_t>(N));
-        CUDA_CHECK(cudaMemcpyAsync(sampled_host, pi.sampled.data(),
-                                   sizeof(std::int32_t) * N,
-                                   cudaMemcpyDeviceToHost,
-                                   cublas.stream()));
+        // Only sampled fires produce valid `pi.sampled` rows. Prefill-only
+        // fires (for example Context::flush) still need the stream sync below
+        // to observe KV writes, but must not copy sampled rows that no kernel
+        // wrote.
+        std::int32_t* sampled_host = nullptr;
+        if (has_sampling) {
+            // Copy the first N entries — `pi.sampled` is sized for
+            // max_workspace_tokens, but only [0, N) are valid this fire.
+            // Async on the same stream the sampler ran on so it slots into
+            // the stream's FIFO; we sync immediately after because the
+            // response payload depends on these tokens. (Future work moves
+            // the sync past the host-side response-prep so the host
+            // and GPU can overlap.)
+            sampled_host = sampled_pinned_buf(static_cast<std::size_t>(N));
+            CUDA_CHECK(cudaMemcpyAsync(sampled_host, pi.sampled.data(),
+                                       sizeof(std::int32_t) * N,
+                                       cudaMemcpyDeviceToHost,
+                                       cublas.stream()));
+        }
         const auto t_kernel_launch_end = clock::now();
         verify_timer.finish(cublas.stream());
         CUDA_CHECK(cudaStreamSynchronize(cublas.stream()));
@@ -2758,7 +2772,7 @@ void handle_fire_batch(
         // and benchmark traffic keep the GPU sampler result.
         const std::int32_t* all_sampled = sampled_host;
         std::vector<std::int32_t> sampled_override;
-        if (!logit_masks_view.empty()) {
+        if (has_sampling && !logit_masks_view.empty()) {
             sampled_override.assign(sampled_host, sampled_host + N);
             apply_logit_mask_overrides(
                 ws, sampled_override, logit_masks_view, logit_mask_indptr_view,
@@ -2794,7 +2808,7 @@ void handle_fire_batch(
                           << " sampled=" << num_sampling
                           << " max_kv=" << max_kv_len << "\n";
             }
-            return;
+            return true;
         }
 
         // Flat-path arrays: token sampler is the only slot type allowed
@@ -3186,7 +3200,7 @@ void handle_fire_batch(
                           << " sampled=" << num_sampling
                           << " max_kv=" << max_kv_len << "\n";
             }
-            return;
+            return true;
         }
 
         executor.response_builder.build_token_only(
@@ -3202,13 +3216,12 @@ void handle_fire_batch(
                       << " sampled=" << num_sampling
                       << " max_kv=" << max_kv_len << "\n";
         }
-        return;
+        return true;
 
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-cuda] fire_batch failed for req_id="
                   << req_id << ": " << e.what() << "\n";
-        out_resp = pie_driver::PieForwardResponseView{};
-        return;
+        return false;
     }
 }
 

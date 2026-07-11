@@ -626,7 +626,8 @@ int run_impl(int argc,
         // concurrent speculation.
         const int q35_planned_slots = std::max<int>(1, mem_plan.state_slots);
         qwen3_5_runtime_rs_slots = q35_planned_slots;
-        const int q35_alloc_slots = qwen3_5_runtime_rs_slots;
+        const int q35_alloc_slots =
+            qwen3_5_runtime_rs_slots + (graph_pad_slot >= 0 ? 1 : 0);
         qwen3_5_state_cache = pie_cuda_driver::RecurrentStateCache::allocate(
             qwen3_5_layer_is_linear, conv_dim, cfg_q.linear_conv_kernel_dim,
             local_linear_value_heads,
