@@ -1,6 +1,6 @@
 // Phase 3 (metal_ptir_plan.md §7) batch-scheduler gate — pure host unit test,
 // no Metal/Apple/checkpoint dependency (`plan_batch_execution` is defined
-// outside the `#if defined(__APPLE__)` split in executor.cpp, so this binary
+// outside the `#if defined(__APPLE__)` split in batch/forward.cpp, so this binary
 // always builds and runs on every platform).
 //
 // A launch batch of forward-needing members shares the ONE M=1 KV ring. The
@@ -20,12 +20,12 @@
 #include <unordered_map>
 #include <vector>
 
-#include "executor/executor.hpp"
+#include "batch/compose.hpp"
 
-using pie_metal_driver::executor::BatchExecPlan;
-using pie_metal_driver::executor::LinearSequenceState;
-using pie_metal_driver::executor::MemberForwardDesc;
-using pie_metal_driver::executor::plan_batch_execution;
+using pie::metal::batch::BatchExecPlan;
+using pie::metal::batch::LinearSequenceState;
+using pie::metal::batch::MemberForwardDesc;
+using pie::metal::batch::plan_batch_execution;
 
 namespace {
 

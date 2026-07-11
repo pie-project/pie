@@ -1,4 +1,0 @@
-# local build trees
-build/
-build-*/
-*.metallib

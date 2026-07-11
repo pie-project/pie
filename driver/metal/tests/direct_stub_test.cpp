@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-#include "entry.hpp"
+#include <pie_driver_abi.h>
 #include "pie_native/ptir/container.hpp"  // fnv1a64 (the PTIB sidecar's container hash)
 
 namespace {

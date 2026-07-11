@@ -13,8 +13,8 @@
 
 #include "mtl4_context.hpp"
 
-using pie_metal_driver::raw_metal::RawMetalContext;
-using pie_metal_driver::raw_metal::SlotHandle;
+using pie::metal::RawMetalContext;
+using pie::metal::SlotHandle;
 
 namespace {
 int g_pass = 0, g_fail = 0;

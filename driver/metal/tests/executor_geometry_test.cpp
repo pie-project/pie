@@ -1,10 +1,10 @@
 // Phase 1a/1b linear-sequence geometry gate (metal_ptir_plan.md §5.4, Phase
 // 1b state-slot fix) — pure host unit test, no Metal/Apple/checkpoint
 // dependency (`validate_linear_sequence_geometry` / `close_linear_sequence`
-// are defined outside the `#if defined(__APPLE__)` split in executor.cpp,
+// are defined outside the `#if defined(__APPLE__)` split in batch/forward.cpp,
 // so this binary always builds and runs).
 //
-// RawMetalDecoder's shared M=1 KV ring holds exactly ONE resident linear
+// MetalExecutor's shared M=1 KV ring holds exactly ONE resident linear
 // KV/GDN sequence at a time; this gate is what keeps that single-stream
 // assumption honest — accepting only a fresh sequence (for the same, or no,
 // RING-BACKED resident sequence) or the exact continuation of the currently
@@ -32,13 +32,13 @@
 #include <cstdio>
 #include <string>
 
-#include "executor/executor.hpp"
+#include "batch/forward.hpp"
 
-using pie_metal_driver::executor::close_linear_sequence;
-using pie_metal_driver::executor::LinearSequenceState;
-using pie_metal_driver::executor::MemberForwardDesc;
-using pie_metal_driver::executor::validate_linear_sequence_geometry;
-using pie_metal_driver::executor::global_readout_rows;
+using pie::metal::batch::close_linear_sequence;
+using pie::metal::batch::LinearSequenceState;
+using pie::metal::batch::MemberForwardDesc;
+using pie::metal::batch::validate_linear_sequence_geometry;
+using pie::metal::batch::global_readout_rows;
 
 namespace {
 

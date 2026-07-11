@@ -1,6 +1,6 @@
 // Phase 1b/3 paged-KV bridge multi-batch PSO compile gate — REAL Metal
 // shader compilation (runs on-device via `[MTLDevice newLibraryWithSource:]`,
-// see raw_metal/README.md's "Phase 0 compiles shaders at RUNTIME"), but needs
+// The driver compiles shaders at runtime, but this test needs
 // NO checkpoint at all — just the `kernels/*.metal` sources on disk and a
 // Metal device, both available on this Mac. Gated on Apple (this file only
 // builds/links where RawMetalContext is real; a non-Apple CI box has nothing
@@ -26,11 +26,11 @@
 #include "decode_psos.hpp"
 #include "mtl4_context.hpp"
 
-using pie_metal_driver::raw_metal::load_multibatch_psos;
-using pie_metal_driver::raw_metal::load_decode_psos;
-using pie_metal_driver::raw_metal::DecodeStepPsos;
-using pie_metal_driver::raw_metal::MultiBatchPsos;
-using pie_metal_driver::raw_metal::RawMetalContext;
+using pie::metal::load_multibatch_psos;
+using pie::metal::load_decode_psos;
+using pie::metal::DecodeStepPsos;
+using pie::metal::MultiBatchPsos;
+using pie::metal::RawMetalContext;
 
 namespace {
 int g_pass = 0, g_fail = 0;

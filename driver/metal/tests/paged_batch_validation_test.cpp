@@ -4,7 +4,7 @@
 
 #include "batch_schedule.hpp"
 
-using namespace pie_metal_driver::raw_metal;
+using namespace pie::metal;
 
 namespace {
 int pass = 0, fail = 0;

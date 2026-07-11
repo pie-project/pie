@@ -1,4 +1,4 @@
-// Phase 1b review-fix pure regression test for `raw_metal/heap_layout.hpp`'s
+// Phase 1b review-fix pure regression test for `loader/heap_layout.hpp`'s
 // `plan_heap` (metal_ptir_plan.md Phase 1b: real recurrent-state `copy_state`
 // support). Pure C++, no Metal/Apple/checkpoint dependency (plan_heap's own
 // doc comment: "the offset math is testable standalone") — always builds and
@@ -19,9 +19,9 @@
 
 #include "heap_layout.hpp"
 
-using pie_metal_driver::raw_metal::DecodeGeometry;
-using pie_metal_driver::raw_metal::HeapPlan;
-using pie_metal_driver::raw_metal::plan_heap;
+using pie::metal::DecodeGeometry;
+using pie::metal::HeapPlan;
+using pie::metal::plan_heap;
 
 namespace {
 
@@ -84,7 +84,7 @@ int main() {
     //    claim): within ANY one GDN layer's own conv/recurrent slab, slot 0
     //    is always at relative offset 0 * per_slot_stride == 0, regardless
     //    of how many total slots that slab was sized for. This is the exact
-    //    formula RawMetalDecoder::reset_state(slot)/copy_state_slot use. ──
+    //    formula MetalExecutor::reset_state(slot)/copy_state_slot use. ──
     const size_t conv_stride =
         size_t(g1.gdn_conv_dim) * g1.gdn_conv_k * 4;
     const size_t recur_stride =
@@ -94,7 +94,7 @@ int main() {
           "(the M=1 sealed decode path's implicit slot never moves)");
 
     // ── A non-hybrid-shaped geometry (zero GDN layers) reports zero state
-    //    bytes regardless of max_slots — matching RawMetalDecoder::
+    //    bytes regardless of max_slots — matching MetalExecutor::
     //    rs_slot_bytes()'s "no GDN layers -> 0" contract. ──
     {
         DecodeGeometry g_full_attn_only = DecodeGeometry{};
@@ -111,7 +111,7 @@ int main() {
 
     // ── Phase 1b state-slot fix: DecodeGeometry::gdn_conv_stride_bytes() /
     //    gdn_recurrent_stride_bytes() are the SINGLE shared formula
-    //    RawMetalDecoder::step() (per-step arg-table rebind offset),
+    //    MetalExecutor::step() (per-step arg-table rebind offset),
     //    reset_state(slot) (zeroing), and copy_state_slot() (memcpy) all
     //    now call — this proves the shipped qwen3.6 geometry's values match
     //    the hand-derived constants used elsewhere (caps_honesty_test's

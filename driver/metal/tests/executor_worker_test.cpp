@@ -1,7 +1,7 @@
 // Phase 3 (metal_ptir_plan.md §7, D4) executor-worker gate — pure host unit
 // test, no Metal/Apple/checkpoint dependency (`ExecutorWorker` is std::thread
 // only). Validates the single-owner serializer the driver routes every
-// RawMetalDecoder / RawMetalContext touch through:
+// MetalExecutor / RawMetalContext touch through:
 //   * every job runs on the ONE worker thread (device-object thread-affinity);
 //   * jobs run in FIFO submission order from a single submitter;
 //   * a job submitted re-entrantly FROM the worker runs inline (no deadlock);
@@ -21,9 +21,9 @@
 #include <thread>
 #include <vector>
 
-#include "executor/executor_worker.hpp"
+#include "batch/worker.hpp"
 
-using pie_metal_driver::executor::ExecutorWorker;
+using pie::metal::batch::ExecutorWorker;
 
 namespace {
 int g_pass = 0, g_fail = 0;
@@ -148,4 +148,3 @@ int main() {
     std::printf("\n==== executor_worker_test: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
-

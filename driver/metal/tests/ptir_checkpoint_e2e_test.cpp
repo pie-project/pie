@@ -4,7 +4,7 @@
 // vector), binds + launches it through the full `pie_metal_*` ABI surface
 // with real forward fields (token/position/qo/sampling CSR, rs_slot info),
 // and cross-checks the epilogue's sampled token against an INDEPENDENTLY
-// constructed `RawMetalDecoder::argmax()` for the identical (token,
+// constructed `MetalExecutor::argmax()` for the identical (token,
 // position) input. Two different code paths, same deterministic forward —
 // they must agree.
 //
@@ -26,8 +26,8 @@
 #include <thread>
 #include <vector>
 
-#include "entry.hpp"
-#include "decoder.hpp"
+#include <pie_driver_abi.h>
+#include "../tools/rawmetal/native_access.hpp"
 
 namespace {
 
@@ -43,11 +43,12 @@ bool expect(bool ok, const std::string& what) {
 // This is checkpoint-gated with the rest of this executable. ──
 void run_paged_numeric_gate(const std::string& ckpt_dir, const std::string& kernels_dir,
                             std::uint32_t token) {
-    using pie_metal_driver::raw_metal::BatchSchedule;
-    using pie_metal_driver::raw_metal::BatchStepInputs;
-    using pie_metal_driver::raw_metal::DecodeGeometry;
-    using pie_metal_driver::raw_metal::RawMetalDecoder;
-    using pie_metal_driver::raw_metal::build_batch_schedule;
+    using pie::metal::BatchSchedule;
+    using pie::metal::BatchStepInputs;
+    using pie::metal::DecodeGeometry;
+    using pie::metal::build_batch_schedule;
+    using pie::metal::batch::MetalExecutor;
+    using pie::metal::batch::NativeAccess;
 
     DecodeGeometry pg{};
     pg.paged_kv_enabled = true;
@@ -56,11 +57,12 @@ void run_paged_numeric_gate(const std::string& ckpt_dir, const std::string& kern
     pg.max_slots = 4;
     pg.total_pages = 4;
     pg.kv_page_size = 32;
-    RawMetalDecoder paged;
+    MetalExecutor paged;
     std::string paged_err;
-    if (expect(paged.setup(ckpt_dir, kernels_dir, pg, &paged_err),
+    if (expect(NativeAccess::setup(
+                   paged, ckpt_dir, kernels_dir, pg, &paged_err),
                "paged numeric decoder setup (" + paged_err + ")") &&
-        expect(paged.setup_kv_pool(4, 32, &paged_err),
+        expect(NativeAccess::setup_kv_pool(paged, 4, 32, &paged_err),
                "paged numeric pool setup (" + paged_err + ")")) {
         BatchStepInputs in;
         in.token_ids = {token, token + 1, token + 2, token + 3};
@@ -77,12 +79,14 @@ void run_paged_numeric_gate(const std::string& ckpt_dir, const std::string& kern
             in.token_ids.data(), 4, in.qo_indptr.data(), in.kv_page_indptr.data(),
             in.kv_last_page_lens.data(), in.rs_slot_ids.data(), in.rs_slot_flags.data(),
             2, 32);
-        expect(paged.run_batch_step(sched, in, &paged_err),
+        expect(NativeAccess::run_batch_step(paged, sched, in, &paged_err),
                "explicit paged append + paged SDPA launch (" + paged_err + ")");
-        const uint64_t bind_generation = paged.paged_bind_generation();
+        const uint64_t bind_generation =
+            NativeAccess::paged_bind_generation(paged);
         expect(paged.resize_kv_pool(5, /*unmapped_tail_pages=*/false, &paged_err) &&
-                   paged.paged_bind_generation() == bind_generation + 1 &&
-                   paged.run_batch_step(sched, in, &paged_err),
+                   NativeAccess::paged_bind_generation(paged) ==
+                       bind_generation + 1 &&
+                   NativeAccess::run_batch_step(paged, sched, in, &paged_err),
                "pool resize invalidates/rebinds paged tables before the next batch (" +
                    paged_err + ")");
 
@@ -90,7 +94,8 @@ void run_paged_numeric_gate(const std::string& ckpt_dir, const std::string& kern
         bool wrote_page3 = true, left_page0_zero = true;
         for (int l = 0; l < pg.n_layers; ++l) {
             if (!DecodeGeometry::is_full_attn(l)) continue;
-            const auto& lp = paged.kv_pool().layers[size_t(l)];
+            const auto& lp =
+                NativeAccess::kv_pool(paged).layers[size_t(l)];
             const auto* k = static_cast<const std::uint8_t*>(lp.k_pages.contents());
             const auto* v = static_cast<const std::uint8_t*>(lp.v_pages.contents());
             bool k3 = false, v3 = false, k0 = false, v0 = false;
@@ -106,21 +111,32 @@ void run_paged_numeric_gate(const std::string& ckpt_dir, const std::string& kern
         expect(wrote_page3 && left_page0_zero,
                "paged append honors explicit w_page/w_off (writes page 3, not page 0)");
 
-        RawMetalDecoder ring;
+        MetalExecutor ring;
         std::string ring_err;
-        if (expect(ring.setup(ckpt_dir, kernels_dir, DecodeGeometry{}, &ring_err),
+        if (expect(NativeAccess::setup(
+                       ring,
+                       ckpt_dir,
+                       kernels_dir,
+                       DecodeGeometry{},
+                       &ring_err),
                    "ring reference decoder setup (" + ring_err + ")")) {
-            ring.reset_state();
+            NativeAccess::reset_state(ring);
             for (size_t t = 0; t < in.token_ids.size(); ++t)
-                ring.step(in.token_ids[t], in.position_ids[t]);
-            std::vector<float> ring_logits(size_t(ring.vocab()));
-            std::vector<float> paged_logits(size_t(paged.vocab()));
-            ring.copy_logits_f32(ring_logits.data());
-            paged.copy_batch_logits_f32(3, paged_logits.data());
+                NativeAccess::step(
+                    ring, in.token_ids[t], in.position_ids[t]);
+            std::vector<float> ring_logits(
+                size_t(NativeAccess::vocab(ring)));
+            std::vector<float> paged_logits(
+                size_t(NativeAccess::vocab(paged)));
+            NativeAccess::copy_logits_f32(ring, ring_logits.data());
+            NativeAccess::copy_batch_logits_f32(
+                paged, 3, paged_logits.data());
             float max_abs = 0.0f;
             for (size_t i = 0; i < ring_logits.size(); ++i)
                 max_abs = std::max(max_abs, std::fabs(ring_logits[i] - paged_logits[i]));
-            expect(ring.argmax() == paged.argmax() && max_abs <= 2e-2f,
+            expect(NativeAccess::argmax(ring) ==
+                       NativeAccess::argmax(paged) &&
+                       max_abs <= 2e-2f,
                    "paged sequential prefill logits agree with repeated HND ring replay (max_abs=" +
                        std::to_string(max_abs) + ")");
         }
@@ -307,19 +323,27 @@ int main() {
         *reinterpret_cast<const std::uint64_t*>(chan1_binding.word_base + 8);
     expect(reader_tail == 1, "chan1 reader tail advanced to 1");
 
-    // Independent cross-check: a FRESH RawMetalDecoder, same checkpoint, the
+    // Independent cross-check: a fresh MetalExecutor, same checkpoint, the
     // exact same (token=1, position=0) input from a reset state.
-    pie_metal_driver::raw_metal::RawMetalDecoder cross_check;
+    pie::metal::batch::MetalExecutor cross_check;
     std::string decoder_err;
     const bool decoder_ready =
-        cross_check.setup(ckpt_dir, kernels_dir, pie_metal_driver::raw_metal::DecodeGeometry{},
-                          &decoder_err);
-    if (expect(decoder_ready, "cross-check RawMetalDecoder::setup (" + decoder_err + ")")) {
-        cross_check.reset_state();
-        cross_check.step(embed_token, 0);
-        const std::uint32_t want = cross_check.argmax();
+        pie::metal::batch::NativeAccess::setup(
+            cross_check,
+            ckpt_dir,
+            kernels_dir,
+            pie::metal::DecodeGeometry{},
+            &decoder_err);
+    if (expect(
+            decoder_ready,
+            "cross-check MetalExecutor setup (" + decoder_err + ")")) {
+        pie::metal::batch::NativeAccess::reset_state(cross_check);
+        pie::metal::batch::NativeAccess::step(
+            cross_check, embed_token, 0);
+        const std::uint32_t want =
+            pie::metal::batch::NativeAccess::argmax(cross_check);
         expect(sampled_token == static_cast<std::int32_t>(want),
-              "epilogue token == RawMetalDecoder::argmax() (epilogue=" +
+              "epilogue token == native argmax (epilogue=" +
                   std::to_string(sampled_token) + " decoder=" + std::to_string(want) + ")");
     }
 
@@ -455,7 +479,7 @@ int main() {
 
     // ── Phase 1b state-slot fix: DECISIVE hardware-level proof that
     //    copy_state_slot + step(..., slot) genuinely operate on independent
-    //    per-slot state (not silently aliasing slot 0). Uses RawMetalDecoder
+    //    per-slot state (not silently aliasing slot 0). Uses native test access
     //    directly (bypassing MetalExecutor's honest "not ring-backed"
     //    continuation gate, which is a DELIBERATE Phase-1a/1b M=1-ring
     //    limitation, not a limitation of the underlying per-slot mechanism
@@ -468,48 +492,63 @@ int main() {
     //    rebinding retargeted the GDN kernels correctly, and ping-pong
     //    parity resumed correctly on the copied slot. ──
     {
-        using pie_metal_driver::raw_metal::DecodeGeometry;
-        using pie_metal_driver::raw_metal::RawMetalDecoder;
+        using pie::metal::DecodeGeometry;
+        using pie::metal::batch::MetalExecutor;
+        using pie::metal::batch::NativeAccess;
 
         DecodeGeometry geom2slots{};
         geom2slots.max_slots = 2;
         const std::uint32_t tokA = embed_token, tokB = embed_token, tokC = embed_token;
 
-        RawMetalDecoder decoder_a;
+        MetalExecutor decoder_a;
         std::string err_a;
-        if (expect(decoder_a.setup(ckpt_dir, kernels_dir, geom2slots, &err_a),
+        if (expect(NativeAccess::setup(
+                      decoder_a,
+                      ckpt_dir,
+                      kernels_dir,
+                      geom2slots,
+                      &err_a),
                   "state-slot-fix decoder_a setup (" + err_a + ")")) {
-            decoder_a.reset_state(0);
-            decoder_a.step(tokA, 0, /*slot=*/0);
-            decoder_a.step(tokB, 1, /*slot=*/0);
+            NativeAccess::reset_state(decoder_a, 0);
+            NativeAccess::step(decoder_a, tokA, 0, /*slot=*/0);
+            NativeAccess::step(decoder_a, tokB, 1, /*slot=*/0);
             std::string copy_err;
-            expect(decoder_a.copy_state_slot(0, 1, &copy_err),
+            expect(NativeAccess::copy_state_slot(
+                      decoder_a, 0, 1, &copy_err),
                   "copy_state_slot(0 -> 1) after 2 steps on slot 0 (" + copy_err + ")");
 
             // Diverge slot 0: reset it and step it fresh with a DIFFERENT
             // token at position 0 — if slot 1 secretly aliased slot 0's
             // memory, this would corrupt slot 1's copied state too.
-            decoder_a.reset_state(0);
-            decoder_a.step(tokA + 1u, 0, /*slot=*/0);
+            NativeAccess::reset_state(decoder_a, 0);
+            NativeAccess::step(
+                decoder_a, tokA + 1u, 0, /*slot=*/0);
 
             // Continue slot 1 from its copied (2-step) state with the THIRD
             // token at position 2 — exactly the position slot 0's ORIGINAL
             // (pre-reset) history would have continued to.
-            decoder_a.step(tokC, 2, /*slot=*/1);
-            const std::uint32_t slot1_argmax = decoder_a.argmax();
+            NativeAccess::step(decoder_a, tokC, 2, /*slot=*/1);
+            const std::uint32_t slot1_argmax =
+                NativeAccess::argmax(decoder_a);
 
             // Independent reference: a SEPARATE fresh decoder that replays
             // the ORIGINAL unbroken 3-token sequence on slot 0 alone, never
             // touching a second slot at all.
-            RawMetalDecoder decoder_b;
+            MetalExecutor decoder_b;
             std::string err_b;
-            if (expect(decoder_b.setup(ckpt_dir, kernels_dir, DecodeGeometry{}, &err_b),
+            if (expect(NativeAccess::setup(
+                          decoder_b,
+                          ckpt_dir,
+                          kernels_dir,
+                          DecodeGeometry{},
+                          &err_b),
                       "state-slot-fix decoder_b (reference) setup (" + err_b + ")")) {
-                decoder_b.reset_state();
-                decoder_b.step(tokA, 0);
-                decoder_b.step(tokB, 1);
-                decoder_b.step(tokC, 2);
-                const std::uint32_t reference_argmax = decoder_b.argmax();
+                NativeAccess::reset_state(decoder_b);
+                NativeAccess::step(decoder_b, tokA, 0);
+                NativeAccess::step(decoder_b, tokB, 1);
+                NativeAccess::step(decoder_b, tokC, 2);
+                const std::uint32_t reference_argmax =
+                    NativeAccess::argmax(decoder_b);
                 expect(slot1_argmax == reference_argmax,
                       "slot 1's copied-then-continued argmax == an unbroken single-slot "
                       "replay's argmax (slot1=" + std::to_string(slot1_argmax) +

@@ -1,9 +1,8 @@
 # cmake/FetchMLX.cmake — MLX C++ dependency for driver/metal.
 #
 # Gated behind the `PIE_METAL_WITH_MLX` option (see CMakeLists.txt). The
-# bare direct surface (entry + bind/launch stub) does NOT need MLX, so the
-# option defaults OFF for a fast compile/link/register gate. The compute
-# layer (beta's src/ops, src/executor) turns it ON.
+# shipped driver does NOT need MLX. The option provisions the reference
+# implementation under tests/mlx for smoke and parity targets only.
 #
 # delta owns finalizing the exact MLX version / fetch strategy and any
 # Accelerate/Metal build knobs.
@@ -27,9 +26,9 @@
 
 include_guard(GLOBAL)
 
-# Pin a known-good MLX release (used by the `fetch` provider; also the version
-# the brew `system` provider is expected to supply). Kept on a tag so the
-# shared FetchContent cache stays warm.
+# Pin a known-good MLX release for the `fetch` provider. The `system` provider
+# may supply a newer compatible release. Kept on a tag so the shared
+# FetchContent cache stays warm.
 #
 # Pinned to v0.31.2 by @ingim ruling (see #mac): the real latest MLX (no 0.32
 # exists on GitHub tags or PyPI). beta/charlie/delta validate their ops

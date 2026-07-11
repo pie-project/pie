@@ -4,7 +4,7 @@
 // at `initialize()`), so this binary always builds and runs.
 //
 // Phase 1a's Metal forward is exactly ONE resident linear-sequence
-// RawMetalDecoder (a fixed `max_ctx_ = 4096` KV/GDN ring), not the runtime's
+// MetalExecutor (a fixed `max_ctx_ = 4096` KV/GDN ring), not the runtime's
 // multi-tenant paged pool — this proves the driver stops echoing the config
 // file's generic multi-request capacity once it knows the checkpoint needs
 // the forward (GDN-hybrid / qwen3.6 target), instead of advertising a
@@ -19,7 +19,7 @@
 #include <fstream>
 #include <string>
 
-#include "entry.hpp"
+#include <pie_driver_abi.h>
 
 namespace {
 

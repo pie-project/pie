@@ -9,8 +9,8 @@
 
 #include <mlx/mlx.h>
 
-#include "loader/model_loader.hpp"
-#include "model/model_graph.hpp"
+#include "mlx/loader/model_loader.hpp"
+#include "mlx/model/model_graph.hpp"
 
 namespace mx = mlx::core;
 using namespace pie_metal_driver;

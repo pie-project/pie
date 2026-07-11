@@ -8,7 +8,7 @@
 
 #include <mlx/mlx.h>
 
-#include "kv_cache.hpp"
+#include "mlx/kv_cache.hpp"
 
 namespace mx = mlx::core;
 using namespace pie_metal_driver;

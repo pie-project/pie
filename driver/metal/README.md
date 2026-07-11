@@ -1,17 +1,27 @@
 # driver/metal
 
-Embedded C++ driver for Pie targeting Apple Silicon (macOS, arm64). It uses
-[MLX](https://github.com/ml-explore/mlx) for compute and native Metal shaders
-where MLX lacks coverage, and runs through the same shared-memory driver ABI as
-the CUDA and dummy drivers.
-
-This is the macOS backend for Apple Silicon systems.
+Embedded C++ driver for Pie on Apple Silicon. The shipped path is a native
+Metal 4 decoder with one live model family, Qwen3.5 hybrid attention. It uses
+the same 11-function shared-memory ABI as the CUDA and dummy drivers.
 
 ## Status
 
-Direct-ABI surface: builds, links, and registers with `pie-worker`. The Linux
-stub validates bind/layout/callback semantics; the Apple path layers MLX/Metal
-compute on the same entry surface.
+The production path is:
+
+```text
+abi.cpp -> Context -> batch/ -> model/qwen3_5/ -> kernels/
+                    -> pipeline/ (CPU PTIR interpreter)
+                    -> loader/ + store/ + mtl4_context.mm
+```
+
+`src/` contains only shipping code. `tools/rawmetal/` contains standalone
+bring-up and diagnostic binaries, including the not-yet-live Gemma 4 work.
+`tests/mlx/` is an opt-in MLX reference oracle used by smoke and parity tests;
+the shipped driver never links it.
+
+Metal intentionally executes PTIR programs on the CPU. CUDA uses a GPU tier-0
+runner, but both drivers keep program, instance, and channel ownership under
+`pipeline/`.
 
 ## Build
 
@@ -29,10 +39,16 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ```
 
-`PIE_METAL_WITH_MLX=ON` (CMake option) fetches and links MLX. It is `OFF` by
-default for the direct surface; the compute layer turns it on.
+Useful options:
 
-The development binary lands at `build/bin/pie_driver_metal`.
+- `PIE_METAL_BUILD_TOOLS=ON` builds the native bring-up and diagnostic tools.
+- `PIE_METAL_WITH_MLX=ON` enables only the MLX test oracle.
+- `PIE_METAL_BUILD_TESTS=ON` builds the MLX smoke/KV targets.
+- `PIE_METAL_BUILD_PARITY=ON` builds `tests/parity/parity_driver`.
+- `PIE_METAL_MLX_PROVIDER=system` uses an installed MLX CMake package.
+
+The development binary lands at `build/bin/pie_driver_metal`. Its default
+configuration file is `dev.toml`; pass another path with `--config`.
 
 System requirements: CMake, Ninja, the Xcode command-line tools (Metal /
 Foundation / Accelerate frameworks), and an Apple Silicon GPU.
@@ -46,5 +62,6 @@ device = ["metal:0"]
 activation_dtype = "bfloat16"
 ```
 
-KV pages, page size, and forward limits are derived at startup and reported in
-`DriverCapabilities`.
+KV pages, page size, recurrent-state slots, and forward limits are derived at
+startup and reported in `DriverCapabilities`. The live path currently retains
+the 4096-token resident-ring limit.

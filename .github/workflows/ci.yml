@@ -57,6 +57,9 @@ jobs:
       - name: Enforce L0..L3 downward-only imports + legacy path absence
         run: ./scripts/check-engine-layering.sh
 
+      - name: Enforce Metal driver source layout
+        run: ./scripts/check-metal-driver-layout.sh
+
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a
   # curated subset, so new crates (`pie-transport`) and the benches were
@@ -237,7 +240,7 @@ jobs:
       - name: Install build dependencies
         run: |
           brew update
-          brew install cmake ninja ccache libomp
+          brew install cmake ninja ccache libomp mlx
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -263,9 +266,21 @@ jobs:
           cmake -S driver/metal -B target/metal-validation -G Ninja \
             -DPIE_METAL_WITH_MLX=OFF \
             -DPIE_METAL_BUILD_STUB_TESTS=ON
-          cmake --build target/metal-validation --target metal_direct_stub_test
+          cmake --build target/metal-validation
           ctest --test-dir target/metal-validation \
-            --output-on-failure -R '^metal_direct_stub_test$'
+            --output-on-failure
+          ./scripts/check-metal-driver-layout.sh \
+            target/metal-validation/lib/libpie_driver_metal_lib.a
+
+      - name: MLX reference and parity validation
+        run: |
+          cmake -S driver/metal -B target/metal-mlx -G Ninja \
+            -DPIE_METAL_WITH_MLX=ON \
+            -DPIE_METAL_MLX_PROVIDER=system \
+            -DPIE_METAL_BUILD_TESTS=ON \
+            -DPIE_METAL_BUILD_PARITY=ON
+          cmake --build target/metal-mlx
+          ctest --test-dir target/metal-mlx --output-on-failure
 
   # Cuda build — runs only when an opt-in label or schedule fires
   # (no CUDA on the default GH-hosted runners). Add a self-hosted
@@ -293,9 +308,9 @@ jobs:
             -path '*/out/cuda/build' -print -quit)"
           test -n "$CUDA_BUILD_DIR"
           cmake --build "$CUDA_BUILD_DIR" \
-            --target test_entry_validation test_ptir_dispatch_bind
+            --target test_entry_validation test_pipeline_dispatch_bind
           ctest --test-dir "$CUDA_BUILD_DIR" --output-on-failure \
-            -R '^(entry_validation|ptir_dispatch_bind)$'
+            -R '^(entry_validation|pipeline_dispatch_bind)$'
 
       - name: Verify no CUDA shared deps
         run: |

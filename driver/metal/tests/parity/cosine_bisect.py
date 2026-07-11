@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""cosine_bisect — localize the FIRST kernel/layer where a raw-Metal port
+diverges from the sealed MLX-path golden.
+
+The qwen3.6 reference graph (driver/metal/tests/mlx/model/qwen3_5.cpp) dumps per-kernel
+intermediates as `<layer>.<kernel>.npy` (layer-less tags `embed/final_norm/
+logits.npy`) when `PIE_METAL_GOLDEN_DIR` is set. delta/beta emit identically
+named raw-Metal dumps from the port. This tool walks both sets in *execution
+order*, computes per-tensor cosine similarity, and reports the FIRST tensor
+whose cosine drops below the gate (default 0.99999) — so a divergence reads as
+"gdn_core layer 7", not just "logits wrong".
+
+Usage:
+  cosine_bisect.py --golden <dir> --candidate <dir> [--threshold 0.99999] [-v]
+
+Exit code: 0 = all tensors pass the gate (port is bit-faithful to the gate);
+           1 = a divergence was localized (or a tensor is missing/misshaped).
+"""
+import argparse
+import os
+import sys
+
+import numpy as np
+
+# Per-kernel execution rank WITHIN a decoder layer. Ranks need only be monotonic
+# in dispatch order (gaps are fine); absent tags are simply skipped. The two
+# architectures have structurally different residual streams, so each gets its
+# own order (auto-selected per golden dir from marker tags below).
+#   qwen3.6  -> qwen3_5.cpp + decode_abi.hpp `Kernel` enum (GDN + full-attn)
+#   gemma4   -> gemma4.cpp dump taps (PLE block, 4-norm sandwich, geglu, no GDN)
+QWEN36_INTRA_ORDER = [
+    "attn_norm",                                   # rms (both layer types)
+    # ── GDN / linear-attention sublayer ──
+    "gdn_in_qkv", "gdn_in_z", "gdn_in_a", "gdn_in_b",
+    "gdn_core_pre",                                 # beta: pre-GatedRms fused core_out
+    "gdn_core",                                     # beta op output (folds gated_rms)
+    "gdn_out",
+    # ── full-attention sublayer ──
+    "q_proj", "k_proj", "v_proj",
+    "q_norm", "k_norm",
+    "rope_q", "rope_k",
+    "sdpa", "attn_gated", "o_proj",
+    # ── shared residual + MLP ──
+    "attn_resid",
+    "ffn_norm", "gate_proj", "up_proj", "swiglu", "down_proj",
+    "layer_out",
+]
+
+GEMMA4_INTRA_ORDER = [
+    "attn_norm",                                   # input_layernorm (plus_one=false)
+    # ── attention sublayer (q/k-norm + weightless v_norm, gemma rope order) ──
+    "q_proj", "q_norm", "k_proj", "v_proj", "k_norm", "v_norm",
+    "rope_k", "rope_q",
+    "sdpa", "o_proj",
+    "post_attn_norm", "attn_resid",                # post-attention norm + residual
+    # ── MLP (geglu-tanh, not swiglu) + post-ffn norm ──
+    "ffn_norm", "gate_proj", "up_proj", "geglu", "down_proj",
+    "post_ffn_norm", "ffn_resid",
+    # ── Per-Layer-Embedding block (gemma4-specific) ──
+    "ple_gate", "ple_gated", "ple_proj", "ple_norm", "ple_resid",
+    "layer_out",
+]
+
+# Default to qwen3.6; main() re-selects per golden dir via select_order().
+INTRA_LAYER_ORDER = QWEN36_INTRA_ORDER
+_INTRA_RANK = {name: i for i, name in enumerate(INTRA_LAYER_ORDER)}
+
+# Layer-less tags pinned to the start / end of the global sequence. `ple_input`
+# (gemma4 PLE precompute) runs after embed but before layer 0.
+HEAD_TAGS = {"embed": -2, "ple_input": -1}
+TAIL_TAGS = {"final_norm": 10**6, "logits": 10**6 + 1, "logits_softcap": 10**6 + 2}
+
+
+def select_order(tags):
+    """Pick the per-layer order from marker tags present in a golden dir.
+
+    gemma4 emits `ple_*`/`post_attn_norm`/`geglu`/`v_norm`; qwen3.6 emits
+    `gdn_*`/`attn_gated`. Falls back to qwen3.6 if no marker is seen.
+    """
+    global INTRA_LAYER_ORDER, _INTRA_RANK
+    kernels = {k for (_layer, k) in tags}
+    gemma_markers = {"ple_gate", "ple_proj", "post_attn_norm", "geglu", "v_norm"}
+    if kernels & gemma_markers:
+        INTRA_LAYER_ORDER = GEMMA4_INTRA_ORDER
+        arch = "gemma4"
+    else:
+        INTRA_LAYER_ORDER = QWEN36_INTRA_ORDER
+        arch = "qwen3.6"
+    _INTRA_RANK = {name: i for i, name in enumerate(INTRA_LAYER_ORDER)}
+    return arch
+
+
+def parse_tag(fname):
+    """`<layer>.<kernel>.npy` -> (layer:int, kernel:str); `<kernel>.npy` -> (None, kernel)."""
+    base = fname[:-4] if fname.endswith(".npy") else fname
+    head, _, tail = base.partition(".")
+    if tail and head.lstrip("-").isdigit():
+        return int(head), tail
+    return None, base
+
+
+def exec_key(layer, kernel):
+    """Global ordering key so files sort into true execution order."""
+    if layer is None:
+        if kernel in HEAD_TAGS:
+            return (HEAD_TAGS[kernel], 0)
+        if kernel in TAIL_TAGS:
+            return (TAIL_TAGS[kernel], 0)
+        return (10**6 + 100, kernel)  # unknown layer-less tag: after the tail
+    return (layer, _INTRA_RANK.get(kernel, len(INTRA_LAYER_ORDER) + hash(kernel) % 997))
+
+
+def load_dir(d):
+    out = {}
+    for fn in os.listdir(d):
+        if not fn.endswith(".npy"):
+            continue
+        layer, kernel = parse_tag(fn)
+        out[(layer, kernel)] = os.path.join(d, fn)
+    return out
+
+
+def cosine(a, b):
+    a = a.astype(np.float64).ravel()
+    b = b.astype(np.float64).ravel()
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0.0 and nb == 0.0:
+        return 1.0
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def fmt(layer, kernel):
+    return kernel if layer is None else f"{kernel} layer {layer}"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--golden", required=True, help="sealed MLX-path dump dir")
+    ap.add_argument("--candidate", required=True, help="raw-Metal port dump dir")
+    ap.add_argument("--threshold", type=float, default=0.99999,
+                    help="cosine gate (default 0.99999)")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="print every tensor, not just the divergence")
+    ap.add_argument("--skip", default="",
+                    help="comma-separated kernel tags to exclude from the walk "
+                         "(e.g. q_norm,k_norm when a candidate taps them post "
+                         "in-place rope). Still loaded, just not gated.")
+    args = ap.parse_args()
+
+    skip = {s.strip() for s in args.skip.split(",") if s.strip()}
+
+    golden = load_dir(args.golden)
+    cand = load_dir(args.candidate)
+    if not golden:
+        print(f"error: no .npy golden tensors in {args.golden}", file=sys.stderr)
+        return 2
+
+    arch = select_order(golden)
+    print(f"arch: {arch} ({len(golden)} golden tensors)"
+          + (f"; skipping {sorted(skip)}" if skip else ""))
+    keys = sorted(golden, key=lambda k: exec_key(*k))
+    first_bad = None
+    rows = []
+    for layer, kernel in keys:
+        if kernel in skip:
+            continue
+        g = np.load(golden[(layer, kernel)])
+        if (layer, kernel) not in cand:
+            rows.append((layer, kernel, None, "MISSING in candidate"))
+            if first_bad is None:
+                first_bad = (layer, kernel, "missing")
+            continue
+        c = np.load(cand[(layer, kernel)])
+        if g.shape != c.shape:
+            if g.size == c.size:
+                # Same elements, different tap annotation (e.g. golden stores
+                # q/k_norm flat [h*d]; a candidate may emit [h, d]). Ravel-compare
+                # rather than bailing the walk.
+                cos = cosine(g, c)
+                mae = float(np.max(np.abs(g.astype(np.float64).ravel()
+                                          - c.astype(np.float64).ravel())))
+                note = "" if cos >= args.threshold else "  <-- BELOW GATE"
+                rows.append((layer, kernel, cos,
+                             f"maxabs={mae:.3e} (reshaped {g.shape}->{c.shape}){note}"))
+                if cos < args.threshold and first_bad is None:
+                    first_bad = (layer, kernel, cos)
+                continue
+            rows.append((layer, kernel, None,
+                         f"SIZE {g.size} vs {c.size}"))
+            if first_bad is None:
+                first_bad = (layer, kernel, "shape")
+            continue
+        cos = cosine(g, c)
+        mae = float(np.max(np.abs(g.astype(np.float64) - c.astype(np.float64))))
+        note = "" if cos >= args.threshold else "  <-- BELOW GATE"
+        rows.append((layer, kernel, cos, f"maxabs={mae:.3e}{note}"))
+        if cos < args.threshold and first_bad is None:
+            first_bad = (layer, kernel, cos)
+
+    if args.verbose or first_bad is not None:
+        print(f"{'tensor':<28} {'cosine':>12}  detail")
+        print("-" * 70)
+        for layer, kernel, cos, detail in rows:
+            cs = "      -     " if cos is None else f"{cos:>12.8f}"
+            print(f"{fmt(layer, kernel):<28} {cs}  {detail}")
+        print("-" * 70)
+
+    if first_bad is None:
+        print(f"PASS: all {len(rows)} golden tensors >= cosine {args.threshold}")
+        return 0
+
+    layer, kernel, why = first_bad
+    if why == "missing":
+        print(f"DIVERGENCE: {fmt(layer, kernel)} is MISSING in candidate")
+    elif why == "shape":
+        print(f"DIVERGENCE: {fmt(layer, kernel)} shape mismatch")
+    else:
+        print(f"DIVERGENCE: first kernel below gate {args.threshold} = "
+              f"{fmt(layer, kernel)}  (cosine {why:.8f})")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

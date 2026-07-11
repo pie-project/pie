@@ -7,9 +7,9 @@
 #include "decode_consts.hpp"
 #include "decode_step_mb.hpp"
 #include "heap_bind.hpp"
-#include "scratch_schedule.hpp"
+#include "scratch.hpp"
 
-using namespace pie_metal_driver::raw_metal;
+using namespace pie::metal;
 
 namespace {
 int pass = 0, fail = 0;
