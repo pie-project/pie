@@ -74,8 +74,11 @@ ends. A terminal may still have children for longer WorkingSets. Local cache
 matching extends a WorkingSet from its own captured terminal and follows matching
 child runs; discovering a prefix owned by an unrelated WorkingSet is a
 `CacheFabric` lookup by page hash, not a local trie scan. The trie itself
-canonicalizes shared prefixes; there is no local reverse index from a hash to a
-node.
+canonicalizes shared prefixes. *(Amended in implementation: an EMPTY WorkingSet
+has no terminal to extend from and roots are implicit, so the store keeps one
+bounded local boundary index — canonical full page's boundary chain value `->`
+trie location, validated on lookup and lazily pruned — for same-store empty-WS
+prefill adoption. Cross-store discovery remains `CacheFabric`.)*
 
 Each WorkingSet keeps a flattened physical-id table: a pinned, address-stable,
 device-visible buffer holding `WorkingSetPageIndex -> PhysicalKvPageId` for its
@@ -163,6 +166,24 @@ the bound WorkingSet's shared flattened table. Device stages may select,
 permute, and mask logical indexes but never mint physical ids; new entries
 enter the table only through host mapping publication.
 
+**Implemented composed batch (2026-07).** "Device-geometry" is ONE predicate
+shared verbatim by the runtime (`detect_device_geometry`) and the driver
+(`is_device_geometry_trace`): `WSlot`/`WOff` write descriptors plus a
+channel-bound `[B, P>1]` `Pages` port. A merely non-const port (a host-put
+`KvLen`) does not make a pass device-geometry — its geometry is host-known
+and rides the wire. A batch may carry any mix: the launch ships a program →
+wire-request attribution CSR (`ptir_program_row_indptr`; a device-geometry
+fire's row is an empty placeholder), the driver resolves EVERY
+device-geometry program's channels (translated per program through its
+`kv_translation` segment) and composes wire rows first, resolved programs
+after (`batch_compose.hpp`), synthesizing standard-append `WSlot`/`WOff`
+targets for wire rows when any program in the batch carries explicit write
+descriptors. The post-forward dispatch receives per-PROGRAM gathered-logits
+offsets, not the per-request sampling CSR. v1 mask scope, enforced by the
+scheduler and defended in the driver: dense device masks (`AttnMask`
+channel) batch solo; custom BRLE wire masks never co-batch with
+device-geometry fires.
+
 - Beam/MCTS: branch topology, scores, logical pages, masks, and append cursors
 	stay in PTIR.
 - Quest: computes `attn_page_mask` in `on_attn_proj`; the WorkingSet and memory
@@ -181,7 +202,7 @@ primitive for beam/MCTS branching and self-correction.
 
 `slice` creates a structurally shared child from one range and rebases that range
 to page zero in the child. Rebasing needs no node chain: lookup anchors at the
-terminal, so the front cut is implicit in the child's smaller `page_len` (see
+terminal, so the front cut is implicit in the child's smaller `mapped_len` (see
 Page Table and Node Pages). A slice ending at a node boundary points directly at
 that node, whether or not the slice starts at page zero; a slice ending inside a
 node creates one prefix `Pages::ParentSelection` of that node as the child's
@@ -219,7 +240,7 @@ if they cover it:
 	terminal up to the node at the boundary, or to a prefix selection of the
 	node containing it.
 - A front-reaching range whose boundary lies above the terminal node is
-	expressed by `page_len` reduction alone; the excluded pages remain on the
+	expressed by reducing the mapped extent alone; the excluded pages remain on the
 	ancestor path, invisible to lookup but not reclaimable through this
 	WorkingSet.
 
@@ -269,7 +290,10 @@ struct KvPageTable {
 
 struct WorkingSetEntry {
 	terminal: Option<NodeId>,
+	// Logical extent including pending (reserved, unpublished) space.
 	page_len: u64,
+	// Exclusive end of the published mapping; the lookup anchor.
+	mapped_len: u64,
 	// Derived, device-visible flattened mapping. Pinned and address-stable
 	// (never a reallocating Vec), versioned, epoch-retired on rewrite.
 	flat_table: Option<FlatTableHandle>,
@@ -319,23 +343,27 @@ forks/parent selections but cannot be reproduced by an unrelated forward.
 Recipe-derived and opaque token-slot hashes occupy the same `token_hashes` entries;
 only the former support automatic matching from semantic inputs.
 
-`WorkingSetEntry.page_len` is the WorkingSet's current logical extent, not a
-constant. `reserve(n)` returns the range starting at `page_len` and advances it;
-`discard` reduces it, `slice` sets it to the selected range length, and `fork`
-copies it. Because lookup anchors at the terminal, `page_len` also encodes front
-truncation: ancestor pages beyond it are never reached by lookup, so a front cut
-from `slice` or a front-reaching `discard` needs no structural node. Keeping it
-explicitly also represents logical reservations whose terminal mapping has not
-yet been published and provides constant-time bounds checks.
+A `WorkingSetEntry` keeps two lengths. `page_len` is the logical extent
+including pending reservations: `reserve(n)` returns the range starting at
+`page_len` and advances it. `mapped_len <= page_len` is the exclusive end of
+the published mapping and the lookup anchor; publication advances it,
+`discard` reduces both, `slice` sets both to the selected range length, and
+`fork` copies both. The anchor must exclude reserved-but-unpublished space:
+with a purely logical `reserve`, anchoring at `page_len` would shift every
+committed index while a reservation is outstanding. Because lookup anchors at
+the terminal, `mapped_len` also encodes front truncation: ancestor pages
+beyond it are never reached by lookup, so a front cut from `slice` or a
+front-reaching `discard` needs no structural node.
 
 Given `WorkingSetPageIndex(i)`, lookup starts from the terminal with an exclusive
-end equal to `page_len`. At each node it subtracts the node-local page count to
+end equal to `mapped_len` (an index at or past it is unwritten or out of
+range). At each node it subtracts the node-local page count to
 derive that node's start. If `i` is within the resulting span,
 `Pages::Owned` reads the node-local id directly and `Pages::ParentSelection`
 resolves the offset through `runs` against its parent's id vector. Page hash
 lookup applies the same offset/runs to the parallel `page_hashes` vector. Otherwise lookup
 continues toward the logical predecessor with the derived start as its new
-exclusive end. A derived start may be negative when `page_len` truncates the
+exclusive end. A derived start may be negative when `mapped_len` truncates the
 front of the path; every valid index resolves before the walk passes index zero,
 and pages beyond the truncation are invisible to this WorkingSet. When
 stepping past a `ParentSelection`, it skips the parent
@@ -544,6 +572,50 @@ a prefix range and the local pass runs only the residual rows.
 For a hybrid model, a match is a cache bundle: the KV prefix and recurrent-state
 checkpoint at the same semantic boundary must both be available.
 
+**Implemented recognition and chain rules (2026-07, increments 1–2a).**
+Recognition is runtime-decided in two halves; a guest declaration could poison
+a cross-inferlet cache and is rejected as a design option.
+
+- *Bind time* (`canonical_kv_shape`): no `AttnMask`/`Positions`/device-geometry
+	ports, no `on-attn`/`on-attn-proj` stage programs, no extern channels, a
+	single trace-const lane, and a `KvLen` port present. Prologue/epilogue-only
+	passes (grammar, watermark, samplers) remain canonical.
+- *Fire time* (`canonical_fire_evidence`): the embed value THIS fire consumes
+	must be host-known — a trace constant, the staged Writer put shipping with
+	the fire, or (first fire) the seed — and the host-known kv-len must equal
+	`committed + new` (full-context attention). Device-carried decode tokens are
+	unknowable at prepare and hash opaque; prefix-cache value concentrates in
+	host-known prefill.
+- *Chain state* (per WorkingSet): the identity the next appended slot chains
+	from. Commit sets it to the fire's highest slot hash; fork and full-range
+	slice inherit it (continuations hash identically); tail-only surgery
+	continues from the last surviving slot hash; front/interior surgery refolds
+	the visible page identities so post-surgery appends never impersonate the
+	unedited continuation.
+- *Retention*: releasing a WorkingSet with canonical content leases its
+	terminal as a cache root (bounded FIFO, `PIE_KV_CACHE_ROOTS_MAX`); ladder
+	rung 1 reclaims retained roots under pressure, and the fire path runs rung 1
+	inline even in Error mode so retention never surfaces as guest OOM.
+- *Landed*: empty-WS longest-prefix graft (`adopt_path_prefix` /
+	`ptir_kv_match_prefix`, always leaving the readout token to compute).
+- *Landed (matching 2b)*: the fire-path trim, and it required NO driver or
+	compiled-program change — correcting the earlier "descriptor-level driver
+	rewrite" assessment, which conflated device-geometry programs with
+	canonical ones. Canonical programs are never device-geometry (the shape
+	gate forbids exactly the ports that would let the program own geometry),
+	so their forward geometry is runtime-derived launch DATA, and cache
+	eligibility (the two gates above) is exactly trim eligibility: token
+	values host-known, geometry host-owned, `KvLen` (total attended context)
+	invariant under the trim, post-forward programs row-relative over their
+	sampled-logits segment. `submit_pass` probes the CAS on the first
+	canonical fire of a fresh WorkingSet (probe capped so no adopted page
+	covers a sampled row), grafts, and slices the launch to the suffix with
+	`prepare(committed = grafted tokens)` — indistinguishable from a
+	continuation fire. Misses and ineligible shapes fall through to full
+	compute, so the cache stays a pure opportunistic optimization.
+	Device-geometry (Design-B) passes are not canonical and not cacheable by
+	construction.
+
 ### CoW
 
 Every PTIR KV output is a write intent. Preparing a write chooses:
@@ -605,8 +677,9 @@ Hash and mapping publication follows the Pipeline command order:
 	authoritative.
 7. `discard`: drain the same ranges from a private node's `ids`, `token_hashes`,
 	and `page_hashes` vectors, publish `Pages::ParentSelection` over the
-	existing owner, or reduce `page_len` alone for a front-reaching range above
-	the terminal node. No tombstone remains; suffix `WorkingSetPageIndex`s shift.
+	existing owner, or reduce the mapped extent alone for a front-reaching range
+	above the terminal node. No tombstone remains; suffix `WorkingSetPageIndex`s
+	shift.
 8. Backing reclaim/restore and pool resize preserve live physical ids and update
 	only driver/VMM backing state after in-flight users retire.
 

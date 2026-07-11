@@ -10,7 +10,7 @@ async fn main(_input: String) -> Result<String> {
     model::configure(wit_model::output_vocab_size(), 16, 1);
 
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    ws.alloc(1).map_err(|error| format!("ws.alloc: {error}"))?;
+    ws.reserve(1).map_err(|error| format!("ws.reserve: {error}"))?;
 
     let token = bx(Channel::from(vec![1i32]).named("token"));
     let klen = bx(Channel::from(vec![1u32]).named("klen"));
@@ -28,8 +28,7 @@ async fn main(_input: String) -> Result<String> {
     });
 
     let pipeline = Pipeline::new();
-    pipeline
-        .submit(pass)
+    pass.submit(&pipeline)
         .map_err(|error| format!("submit: {error}"))?;
     let value = out
         .take()

@@ -4,6 +4,7 @@ world inferlet {
     import types;
     import model;
     import tokenizer;
+    import pipeline;
     import working-set;
     import forward;
     import grammar;

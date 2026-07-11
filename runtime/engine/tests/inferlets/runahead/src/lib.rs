@@ -85,7 +85,7 @@ impl Decoder {
     fn new(capacity_tokens: u32) -> Result<Decoder> {
         let pool_pages = capacity_tokens.div_ceil(PAGE_T).max(1);
         let ws: &'static WorkingSet = bx(WorkingSet::new());
-        let grant = ws.alloc(pool_pages).map_err(|e| format!("ws.alloc: {e}"))?;
+        let grant = ws.reserve(pool_pages).map_err(|e| format!("ws.reserve: {e}"))?;
         let pool_ids: &'static Vec<u32> = bx(grant.ids().to_vec());
         Ok(Decoder { ws, pool_ids, pool_pages, pool: pool_pages * PAGE_T, seq: 0 })
     }
@@ -136,7 +136,7 @@ impl Decoder {
             g_ch.put(&tok);
         });
 
-        pipeline.submit(fwd).map_err(|e| format!("prefill submit: {e}"))?;
+        fwd.submit(&pipeline).map_err(|e| format!("prefill submit: {e}"))?;
         self.seq += n;
         let g0 = g_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?[0];
         Ok(g0 as u32)
@@ -226,7 +226,7 @@ impl DecodeLoop {
     /// the decoder cursor on SUBMIT, like the classic probe.
     fn submit(&self, d: &mut Decoder) -> Result<()> {
         d.pool_ids_ch_put(self.pool_ids_ch);
-        self.pipeline.submit(self.fwd).map_err(|e| format!("decode submit: {e}"))?;
+        self.fwd.submit(&self.pipeline).map_err(|e| format!("decode submit: {e}"))?;
         d.seq += 1;
         Ok(())
     }

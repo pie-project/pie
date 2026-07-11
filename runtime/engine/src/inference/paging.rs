@@ -13,7 +13,8 @@
 //! length, generation) and resolves slots to physical pages; this module owns the
 //! page-list assembly + the seal-eligibility split (full vs partial pages, W7).
 
-use crate::arena::BlockId;
+/// Physical block id within one pool's id-space.
+pub type BlockId = u32;
 
 /// A physical KV page id the driver consumes (arena `KvPage` block = one page).
 pub type PhysicalPageId = BlockId;

@@ -53,6 +53,12 @@ pub struct LaunchPlan {
     pub audio_indptr: Vec<u32>,
     pub kv_len: Vec<u32>,
     pub kv_len_device: Vec<u64>,
+    /// This fire's WorkingSet page translation: entry `i` = the PHYSICAL KV
+    /// page id backing WorkingSet-relative index `i` (committed mapping
+    /// overlaid with the prepared write targets). The driver maps channel-
+    /// resolved `Pages`/`WSlot` references through it; empty = no
+    /// WorkingSet-relative geometry in this fire.
+    pub kv_translation: Vec<u32>,
 }
 
 pub const RS_FLAG_RESET: u8 = 1;
@@ -366,6 +372,17 @@ pub struct LaunchSubmission {
     pub plan: LaunchPlan,
     pub instance_ids: Vec<u64>,
     pub terminal_cells: Vec<*mut PieTerminalCell>,
+    /// Flattened per-instance WorkingSet page translations (see
+    /// [`LaunchPlan::kv_translation`]) + their CSR partition.
+    pub kv_translation: Vec<u32>,
+    pub kv_translation_indptr: Vec<u32>,
+    /// Program → wire-request attribution CSR (`instance_ids.len() + 1`
+    /// entries): program `p` owns wire request rows
+    /// `[row_indptr[p], row_indptr[p+1])`. Batched fires contribute one row
+    /// each (a device-geometry fire's row is an empty placeholder the driver
+    /// replaces with channel-resolved geometry); a prebuilt solo plan owns
+    /// every row it shipped.
+    pub program_row_indptr: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -627,6 +644,9 @@ impl<'a> LaunchDescBorrow<'a> {
             audio_indptr: u32_slice(&plan.audio_indptr),
             kv_len: u32_slice(&plan.kv_len),
             kv_len_device: u64_slice(&plan.kv_len_device),
+            kv_translation: u32_slice(&submission.kv_translation),
+            kv_translation_indptr: u32_slice(&submission.kv_translation_indptr),
+            ptir_program_row_indptr: u32_slice(&submission.program_row_indptr),
         };
         Self {
             _masks: masks,

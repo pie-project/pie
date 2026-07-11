@@ -98,8 +98,8 @@ impl Stream {
     /// channel each fire (D2), exactly like the templates.
     fn submit(&self) -> Result<()> {
         self.pool_ids_ch.put(self.pool_ids.clone());
-        self.pipeline
-            .submit(self.decode)
+        self.decode
+            .submit(&self.pipeline)
             .map_err(|e| format!("decode submit: {e}"))
     }
 
@@ -126,7 +126,7 @@ fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     let pool = pool_pages * PAGE_T;
 
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let grant = ws.alloc(pool_pages).map_err(|e| format!("ws.alloc: {e}"))?;
+    let grant = ws.reserve(pool_pages).map_err(|e| format!("ws.reserve: {e}"))?;
     let pool_ids: &'static Vec<u32> = bx(grant.ids().to_vec());
 
     // ── 1. PREFILL FIRE (N-wide): causal [N, POOL] mask, N-cell KV write,
@@ -160,8 +160,8 @@ fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     });
 
     let prefill = Pipeline::new();
-    prefill
-        .submit(fwd_p)
+    fwd_p
+        .submit(&prefill)
         .map_err(|e| format!("prefill submit: {e}"))?;
     let g0 = g0_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?;
     let g0 = g0.first().copied().unwrap_or(0) as u32;

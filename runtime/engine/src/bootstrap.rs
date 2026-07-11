@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::arena;
 use crate::driver;
 use crate::inference;
 use crate::linker;
@@ -288,23 +287,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .collect();
 
-    // Register this model's per-driver unified arenas in the standalone
-    // registry. Capacities are read straight from `cfg.drivers[]`. The registry
-    // is independent of the (removed) context actor and is where KV/RS working
-    // sets + the forward `execute()` prepare lock `arena::registry::get(...)`.
-    let arena_model_idx = arena::registry::register_model(
-        kv_page_size,
+    // Register this model's per-driver typed stores (KvStore/RsStore) in the
+    // standalone registry. Capacities are read straight from `cfg.drivers[]`.
+    // The registry is where the WIT working-set resources and the PTIR fire
+    // path lock `store::registry::get(...)`.
+    let _ = driver_count;
+    let arena_model_idx = crate::store::registry::register_model(
+        kv_page_size as u32,
         &arena_kv_pages,
-        &arena_cpu_pages,
         &arena_rs_slots,
     );
-    // KvCas sibling registry: one content-addressed sharing index per driver,
-    // pushed in lock-step with the arena registry so `kv_cas::get` aligns.
-    let kv_cas_model_idx = crate::working_set::kv_cas::register_cas(driver_count);
-    debug_assert_eq!(
-        kv_cas_model_idx, arena_model_idx,
-        "kv_cas registry desynced from arena/model index"
-    );
+    let _ = arena_cpu_pages;
 
     // Task-B contention orchestrator (`PIE_KV_CONTENTION=preempt`): KV pool
     // exhaustion becomes FCFS preempt/restore instead of an inferlet error;
@@ -325,7 +318,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     0,
                 ))
             } else {
-                Box::new(crate::inference::contention::ArenaPoolBackend::new(
+                Box::new(crate::inference::contention::KvPoolBackend::new(
                     arena_model_idx,
                     0,
                 ))

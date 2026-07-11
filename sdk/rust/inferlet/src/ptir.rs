@@ -1,15 +1,16 @@
 //! `inferlet::ptir` — the author-facing PTIR bridge over the WIT `ptir` surface.
 //!
 //! This is the only home of the overview §3/§5 author surface
-//! (`ForwardPass`/`Pipeline`/`WorkingSet`/`Channel`). It wraps the WIT `ptir`
-//! resources (`channel`, `forward-pass`, `pipeline`) and drives the neutral
-//! [`Builder`](ptir_dsl::Builder) from the `ptir-dsl` crate: the author writes
-//! stage closures + port bindings, the bridge lowers them to the canonical PTIR
-//! container, orders the WIT channel handles by the builder↔bridge contract
+//! (`ForwardPass`/`Pipeline`/`WorkingSet`/`Channel`). It wraps the WIT
+//! resources (`channel`, `forward-pass`, `kv-working-set`, `pipeline`) and
+//! drives the neutral [`Builder`](ptir_dsl::Builder) from the `ptir-dsl`
+//! crate: the author writes stage closures + port bindings, the bridge lowers
+//! them to the canonical PTIR container, orders the WIT channel handles by the
+//! builder↔bridge contract
 //! ([`Traced::channel_order`](ptir_dsl::Traced::channel_order)), and calls
 //! `forward-pass.new` (which binds against the model — the guest does not bind,
 //! D6). Program identity, dedup, and validation happen host-side inside
-//! `forward-pass.new`/`pipeline.submit`.
+//! `forward-pass.new`/`forward-pass.submit`.
 //!
 //! A [`Channel`] owns BOTH sides: the `ptir-dsl` trace declaration (its `take`/
 //! `put`/`read` record ops inside a stage closure, and host `put`s record the
@@ -30,8 +31,9 @@ use ptir_dsl::{
 };
 
 use crate::pie::inferlet::forward as wit;
+use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
-use crate::working_set::KvWorkingSet;
+use crate::working_set::{KvWorkingSet, PageRange};
 
 pub use ptir_dsl::intrinsics;
 
@@ -274,8 +276,12 @@ impl HostElem for f32 {
 // WorkingSet
 // ---------------------------------------------------------------------------
 
-/// The attention working set (overview §5.2) — a flat pool of KV page slots.
-/// Wraps the WIT `kv-working-set`; the host owns its shape (`alloc`/`free`).
+/// The attention working set (overview §5.2) — a logical page address space
+/// over the runtime's KV mapping trie (kv_refact.md). Wraps the WIT
+/// `kv-working-set`. Every page reference on this surface is a
+/// WorkingSet-RELATIVE index (never a physical page id); the runtime
+/// translates at the kernel through the working set's flattened table.
+/// `reserve` is purely logical — no memory is held until a forward writes.
 pub struct WorkingSet {
     kv: Rc<KvWorkingSet>,
 }
@@ -290,22 +296,62 @@ impl WorkingSet {
         self.kv.page_size()
     }
 
-    /// Current number of page slots.
-    pub fn size(&self) -> u32 {
-        self.kv.size()
+    /// Current logical extent in pages, including reserved-but-unwritten space.
+    pub fn page_len(&self) -> u32 {
+        self.kv.page_len()
     }
 
-    /// Grant `n` fresh (or recycled) stable slot ids — per-instance data that
-    /// flows through a channel (`fresh.put(ws.alloc(B)?)`), never a trace
+    /// Extend the logical address space by `pages`; returns the granted index
+    /// range. Purely logical (physical pages are allocated only when a
+    /// forward writes them). The grant is per-instance data that flows
+    /// through a channel (`fresh.put(ws.reserve(B)?)`), never a trace
     /// constant (D2).
-    pub fn alloc(&self, n: u32) -> Result<SlotGrant, String> {
-        let ids = self.kv.alloc_slots(n)?;
-        Ok(SlotGrant { ids })
+    pub fn reserve(&self, pages: u32) -> Result<PageGrant, String> {
+        let range = self.kv.reserve(pages)?;
+        Ok(PageGrant {
+            start: range.start,
+            ids: (range.start..range.start + range.len).collect(),
+        })
     }
 
-    /// Tombstone the slots at `ids` (non-compacting).
-    pub fn free(&self, ids: Vec<u32>) -> Result<(), String> {
-        self.kv.free(&ids)
+    /// Remove `ranges` (pre-discard indexes, applied atomically), ordered on
+    /// `on`. Suffix indexes shift down — publish new PTIR geometry after. A
+    /// shared-path interior range errs (growth-boundary invariant).
+    pub fn discard(&self, on: &Pipeline, ranges: &[PageRange]) -> Result<(), String> {
+        self.kv.discard(&on.wit, ranges)
+    }
+
+    /// O(1) copy-on-write child over the complete logical address space,
+    /// ordered on `on` — the branching primitive (beam/MCTS/self-correct).
+    pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
+        Ok(WorkingSet { kv: Rc::new(self.kv.fork(&on.wit)?) })
+    }
+
+    /// Structurally shared child over `[start, start+len)`, rebased to page
+    /// zero in the child, ordered on `on`.
+    pub fn slice(&self, on: &Pipeline, start: u32, len: u32) -> Result<WorkingSet, String> {
+        let child = self.kv.slice(&on.wit, PageRange { start, len })?;
+        Ok(WorkingSet { kv: Rc::new(child) })
+    }
+
+    /// Ordered KV cell move within this working set (Design-B lazy KV
+    /// compaction): move `n` token cells, for ALL layers, from
+    /// (`src_page_ids[i]`, `src_tok_idx[i]`) to (`dst_page_ids[i]`,
+    /// `dst_tok_idx[i]`); the four lists are parallel. Page ids are
+    /// WorkingSet-relative indexes; token indices are in-page offsets. Rides
+    /// the same run-ahead FIFO as submits on `on` (ordered after prior fires'
+    /// writes, before later fires' reads — no barrier). The caller guarantees
+    /// disjoint src/dst spans and computes the post-move layout itself.
+    pub fn copy_into(
+        &self,
+        on: &Pipeline,
+        dst_page_ids: &[u32],
+        dst_tok_idx: &[u32],
+        src_page_ids: &[u32],
+        src_tok_idx: &[u32],
+    ) -> Result<(), String> {
+        self.kv
+            .copy_into(&on.wit, dst_page_ids, dst_tok_idx, src_page_ids, src_tok_idx)
     }
 }
 
@@ -315,19 +361,31 @@ impl Default for WorkingSet {
     }
 }
 
-/// A grant of slot ids — per-instance data (D2). Puttable into a channel.
-pub struct SlotGrant {
+/// A grant of fresh logical page indexes from [`WorkingSet::reserve`] —
+/// per-instance data (D2). Puttable into a channel.
+pub struct PageGrant {
+    start: u32,
     ids: Vec<u32>,
 }
 
-impl SlotGrant {
-    /// The granted physical slot ids (stable page ids owned by the working set).
+impl PageGrant {
+    /// First granted index.
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+
+    /// The granted WorkingSet-relative page indexes (contiguous).
     pub fn ids(&self) -> &[u32] {
         &self.ids
     }
+
+    /// The grant as a WIT `page-range` (e.g. to `discard` it later).
+    pub fn range(&self) -> PageRange {
+        PageRange { start: self.start, len: self.ids.len() as u32 }
+    }
 }
 
-impl IntoPut for SlotGrant {
+impl IntoPut for PageGrant {
     fn into_put(self) -> PutValue {
         PutValue::Data(self.ids.into_const())
     }
@@ -473,6 +531,14 @@ impl<'a> ForwardPass<'a> {
         self.invalidate();
     }
 
+    /// `submit(&pipeline)` — enqueue this pass run-ahead on `on`; never
+    /// blocks (the channels' `take`/`read` are the await points). The first
+    /// submit lowers + binds (`forward-pass.new`); bind errors surface here.
+    pub fn submit(&self, on: &Pipeline) -> Result<(), String> {
+        let bound = self.bound()?;
+        bound.submit(&on.wit)
+    }
+
     /// Lower + bind, memoized. Traces the stage closures once into the canonical
     /// container, orders the WIT channel handles by the builder↔bridge contract,
     /// and calls `forward-pass.new` (bind errors surface here as the validator's
@@ -526,55 +592,23 @@ impl<'a> Default for ForwardPass<'a> {
 // Pipeline
 // ---------------------------------------------------------------------------
 
-/// A run-ahead submission pipeline (overview §3). Ordering is carried by the
-/// channels' full/empty bits, not host code.
+/// A run-ahead ordering domain (overview §3, pipeline.wit) — every command on
+/// it linearizes in submission order through the per-driver sequencer.
+/// Ordering across fires is carried by the channels' full/empty bits, not
+/// host code. Working-set mutators ([`WorkingSet::fork`]/`slice`/`discard`/
+/// `copy_into`) and [`ForwardPass::submit`] take `&Pipeline`.
 pub struct Pipeline {
-    wit: wit::Pipeline,
+    wit: wit_pipeline::Pipeline,
 }
 
 impl Pipeline {
     pub fn new() -> Pipeline {
-        Pipeline { wit: wit::Pipeline::new() }
-    }
-
-    /// `submit(&fwd)` — enqueue a pass run-ahead. Ensures the bound pass exists
-    /// (first submit lowers + binds), then delegates; never blocks.
-    pub fn submit(&self, fwd: &ForwardPass<'_>) -> Result<(), String> {
-        let bound = fwd.bound()?;
-        self.wit.submit(bound.as_ref())
+        Pipeline { wit: wit_pipeline::Pipeline::new() }
     }
 
     /// `close()` — signal no further submissions (implied by drop).
     pub fn close(&self) {
         self.wit.close();
-    }
-
-    /// `copy_into(&ws, dst_pages, dst_toks, src_pages, src_toks)` — Design-B
-    /// lazy KV compaction: move `n` token KV cells within `ws` (all layers)
-    /// from (`src_page_ids[i]`, `src_tok_idx[i]`) to (`dst_page_ids[i]`,
-    /// `dst_tok_idx[i]`). Rides the SAME run-ahead FIFO as `submit` (ordered
-    /// after prior fires' writes, before later fires' reads — no barrier).
-    /// Correct because KV is stored post-RoPE (a slot is pure storage). Page ids
-    /// are the PHYSICAL KV page ids (the same ids bound to the `Pages`/`WSlot`
-    /// ports — Design B works in physical page ids directly); token indices are
-    /// in-page offsets. The four lists are parallel; the caller guarantees
-    /// disjoint src/dst spans and computes the post-move layout itself (a move,
-    /// not a fire — no result).
-    pub fn copy_into(
-        &self,
-        ws: &WorkingSet,
-        dst_page_ids: &[u32],
-        dst_tok_idx: &[u32],
-        src_page_ids: &[u32],
-        src_tok_idx: &[u32],
-    ) -> Result<(), String> {
-        self.wit.copy_into(
-            ws.kv.as_ref(),
-            dst_page_ids,
-            dst_tok_idx,
-            src_page_ids,
-            src_tok_idx,
-        )
     }
 }
 
@@ -655,7 +689,7 @@ impl AttnWsArgs for (&Channel, Tensor, &Channel, &Channel, &Channel) {
 /// Glob-import surface for PTIR inferlet authors: the eDSL vocabulary plus the
 /// four author-facing wrapper types.
 pub mod prelude {
-    pub use super::{Channel, ForwardPass, Pipeline, WorkingSet};
+    pub use super::{Channel, ForwardPass, PageGrant, Pipeline, WorkingSet};
     pub use ptir_dsl::dtype;
     pub use ptir_dsl::intrinsics;
     pub use ptir_dsl::value::{

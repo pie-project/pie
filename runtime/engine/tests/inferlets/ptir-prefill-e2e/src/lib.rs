@@ -67,7 +67,7 @@ async fn main(_input: String) -> Result<String> {
 
     // Shared physical page pool (the KV store both pipelines bind).
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let pool = ws.alloc(POOL_PAGES).map_err(|e| format!("ws.alloc: {e}"))?;
+    let pool = ws.reserve(POOL_PAGES).map_err(|e| format!("ws.reserve: {e}"))?;
     let pool_ids: &'static Vec<u32> = bx(pool.ids().to_vec()); // [POOL_PAGES] physical
 
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
@@ -111,7 +111,7 @@ async fn main(_input: String) -> Result<String> {
     });
 
     let prefill = Pipeline::new();
-    prefill.submit(fwd_p).map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&prefill).map_err(|e| format!("prefill submit: {e}"))?;
     let g0 = g0_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?[0];
     prefill.close();
     println!("[prefill] N-wide fire committed; first generated token g0={g0}");
@@ -182,7 +182,7 @@ async fn main(_input: String) -> Result<String> {
     generated.push(g0 as u32);
     for step in 0..DECODE_STEPS {
         pool_ids_ch.put(pool_ids.clone());
-        decode.submit(fwd).map_err(|e| format!("decode submit @{step}: {e}"))?;
+        fwd.submit(&decode).map_err(|e| format!("decode submit @{step}: {e}"))?;
         let t = out.take().get::<i32>().map_err(|e| format!("out.take @{step}: {e}"))?;
         if let Some(&t0) = t.first() {
             generated.push(t0 as u32);

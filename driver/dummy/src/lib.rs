@@ -369,7 +369,13 @@ impl DummyDriver {
         let container = container::decode(&canonical_bytes)
             .map_err(|err| anyhow!("program decode failed: {err}"))?;
         let bound = pie_ptir::validate::bind(container, self.model_profile())
-            .map_err(|err| anyhow!("program bind failed: {err}"))?;
+            .map_err(|err| {
+                anyhow!(
+                    "program bind failed: {err} (profile: vocab={}, page_size={})",
+                    self.model_profile().vocab,
+                    self.model_profile().page_size
+                )
+            })?;
         let program = Arc::new(DummyProgram {
             hash,
             intrinsics: collect_intrinsics(&bound),
@@ -604,6 +610,13 @@ impl DummyDriver {
         unsafe { validate_launch_desc(desc) }.map_err(|err| anyhow!(err))?;
         ensure_abi(desc.abi_version)?;
         self.record_op("launch");
+        // Shape trace for tests that assert on launch geometry (e.g. the
+        // prefix-cache trim). Extra entry — existing "launch" filters keep
+        // matching.
+        self.record_op(&format!(
+            "launch-shape tokens={} programs={}",
+            desc.token_ids.len, desc.instance_ids.len
+        ));
         let instance_ids = copy_u64_slice(desc.instance_ids, "launch.instance_ids")?;
         let terminal_cells = copy_terminal_cell_ptrs(desc.terminal_cells)?;
         ensure!(

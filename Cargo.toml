@@ -53,6 +53,11 @@ members = [
 exclude = [
     "inferlets",
     "sdk/rust",
+    # Worktree checkouts under .claude/worktrees/ must never be captured by
+    # THIS manifest when cargo walks up from a worktree's excluded package
+    # (e.g. .claude/worktrees/<x>/inferlets/<name> — the worktree's own root
+    # excludes it, so the walk continues up to here).
+    ".claude",
 ]
 
 # Distribution profile for `pie-worker`. Use

@@ -3,9 +3,15 @@
 //! In Gim's directive: KV-cache contention is handled by PREEMPT/RESTORE, not
 //! admission. `max_concurrent_processes` is a large physical safety cap only;
 //! when a forward's page allocation hits an exhausted pool
-//! ([`WorkingSetError::OutOfBlocks`](crate::working_set::kv::WorkingSetError)),
-//! the prep seam routes here instead of surfacing an inferlet error:
+//! ([`KvStoreError::OutOfPages`](crate::store::kv::KvStoreError) — typed, and
+//! raised only at forward preparation because `reserve` is logical), the fire
+//! path's prepare seam routes here instead of surfacing an inferlet error:
 //!
+//! 0. **Idle-lease rung** — the ladder's first step (kv_refact.md Scheduler):
+//!    drop cache-root leases nothing live reaches
+//!    ([`ReclaimBackend::reclaim_idle`] →
+//!    `KvStore::drop_unused_cache_leases`). Pure cache, no work lost; only
+//!    if pressure remains does the victim loop run.
 //! 1. **Victim loop** — FCFS-preempt: suspend the YOUNGEST running process
 //!    (latest spawn order; the oldest first-comer's progress is protected)
 //!    until the request fits. The physical state-save (D2H stash / drop-to-
@@ -24,7 +30,7 @@
 //!    context past the whole pool; the FCFS-oldest keystone then parks
 //!    unsatisfiable forever (no victim; restore only consumes free). After
 //!    `PIE_KV_EXHAUSTION_MS` of continuous quiet, `acquire` fails LOUD with
-//!    [`ContentionError::Exhausted`] (→ `OutOfBlocks` to the guest) instead of
+//!    [`ContentionError::Exhausted`] (→ `OutOfPages` to the guest) instead of
 //!    wedging. (Alternative not built: *victim-the-hog* — cold-drop the
 //!    survivor's own context to free the pool for the fleet; ship fail-loud.)
 //!
@@ -49,7 +55,7 @@ use crate::process::ProcessId;
 /// How the runtime reacts to a KV pool exhaustion at the prep seam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentionMode {
-    /// Legacy: surface `OutOfBlocks` to the inferlet as a forward error.
+    /// Legacy: surface `OutOfPages` to the inferlet as a forward error.
     Error,
     /// Task-B: route to the orchestrator (preempt/restore) and retry.
     Preempt,
@@ -101,6 +107,13 @@ pub enum SuspendOutcome {
 pub trait ReclaimBackend: Send + Sync + 'static {
     /// `(free, total)` blocks of the contended pool.
     fn pool_stats(&self) -> (u32, u32);
+    /// Ladder rung 1: reclaim whatever costs no work — cache-root leases
+    /// nothing live reaches. Returns blocks recycled NOW (0 when there is
+    /// nothing idle); the orchestrator re-checks the pool before escalating
+    /// to the victim loop.
+    fn reclaim_idle(&self) -> u32 {
+        0
+    }
     /// Save `victim`'s state and free its pool blocks.
     fn suspend(&self, victim: ProcessId) -> SuspendOutcome;
     /// Re-materialize a suspended process (H2D warm restore / replay). On
@@ -119,7 +132,7 @@ pub enum ContentionError {
     /// yield, `free < need`, and the requester is the FCFS-oldest keystone that
     /// never self-yields — its request cannot be met by ANY orchestrator action.
     /// A non-terminating guest grew its context past what the pool can free.
-    /// Fail LOUD to the guest (OutOfBlocks) instead of a silent wedge.
+    /// Fail LOUD to the guest (OutOfPages) instead of a silent wedge.
     Exhausted { need: u32, free: u32, total: u32 },
 }
 
@@ -218,7 +231,7 @@ struct Inner {
 /// Engagement counters (lock-free reads) — the e2e's proof that contention
 /// actually ENGAGED, so a trivially-passing run (pool never over-filled)
 /// can't masquerade as a validated preempt/restore path. NOTE for asserts:
-/// under the v1 passive backend (`ArenaPoolBackend`, suspend=Unsupported)
+/// under the v1 passive backend (`KvPoolBackend`, suspend=Unsupported)
 /// `suspends`/`restores` are ZERO BY DESIGN — v1 engagement is
 /// `waiters_parked > 0` (+ `waiters_woken > 0`); suspend/restore counts
 /// become meaningful with the v2 state-save backend.
@@ -518,6 +531,14 @@ impl ContentionOrchestrator {
             let (free, _) = self.backend.pool_stats();
             if free >= need {
                 break Ok(Acquired::Retry);
+            }
+
+            // Ladder rung 1: reclaim idle cache leases (no work lost) before
+            // any preemption. If it yielded, re-check the pool — the freed
+            // blocks may already satisfy us (and parked waiters).
+            if self.backend.reclaim_idle() > 0 {
+                self.wake_waiters();
+                continue;
             }
 
             // Pick the youngest running peer as victim (FCFS), reserving it
@@ -853,21 +874,22 @@ impl ContentionOrchestrator {
 }
 
 // =============================================================================
-// v1 backend — real pool stats over the unified arena; reclaim binds in M-B2
+// v1 backend — real pool stats + idle-lease reclaim over the typed KvStore
 // =============================================================================
 
-/// v1 [`ReclaimBackend`] over the unified arena's KV pool. Pool stats are
-/// real, so preempt mode gives FIFO wait-for-free + restore-queue plumbing
-/// end-to-end; `suspend` reports [`SuspendOutcome::Unsupported`] until the
-/// working-set state-save wrappers bind here (M-B2, alpha's
-/// `classify_for_suspend`/`suspend_pages_warm`/`restore_pages_warm`), which
-/// turns the victim loop live.
-pub struct ArenaPoolBackend {
+/// v1 [`ReclaimBackend`] over the typed `KvStore`'s physical page pool. Pool
+/// stats and the idle-lease rung are real, so preempt mode gives ladder rung
+/// 1 + FIFO wait-for-free + restore-queue plumbing end-to-end; `suspend`
+/// reports [`SuspendOutcome::Unsupported`] until the victim-side release
+/// path binds here (phase 1 preempt = release the victim's WorkingSets and
+/// recompute on resume — needs the recompute/replay machinery, a later
+/// increment; `KvStore::exclusive_footprint` is the sizing primitive).
+pub struct KvPoolBackend {
     model_idx: usize,
     driver_idx: usize,
 }
 
-impl ArenaPoolBackend {
+impl KvPoolBackend {
     pub fn new(model_idx: usize, driver_idx: usize) -> Self {
         Self {
             model_idx,
@@ -876,14 +898,24 @@ impl ArenaPoolBackend {
     }
 }
 
-impl ReclaimBackend for ArenaPoolBackend {
+impl ReclaimBackend for KvPoolBackend {
     fn pool_stats(&self) -> (u32, u32) {
-        use crate::arena::ArenaKind;
-        let arena = crate::arena::registry::get(self.model_idx, self.driver_idx);
-        let a = arena.lock().unwrap();
-        let free = a.available(ArenaKind::KvPage);
-        let total = free + a.used(ArenaKind::KvPage);
+        let stores = crate::store::registry::get(self.model_idx, self.driver_idx);
+        let kv = stores.kv.lock().unwrap();
+        let free = kv.available_pages() as u32;
+        let total = kv.capacity_pages();
         (free, total)
+    }
+
+    fn reclaim_idle(&self) -> u32 {
+        let stores = crate::store::registry::get(self.model_idx, self.driver_idx);
+        let mut kv = stores.kv.lock().unwrap();
+        let epoch = kv.current_epoch();
+        let freed = kv.drop_unused_cache_leases(epoch);
+        if freed > 0 {
+            kv.retire_idle();
+        }
+        freed as u32
     }
 
     fn suspend(&self, _victim: ProcessId) -> SuspendOutcome {
@@ -908,15 +940,15 @@ impl ReclaimBackend for ArenaPoolBackend {
 /// `restore()` here never runs for them. Selected by
 /// `PIE_KV_PREEMPT_ACTIVE=1` on top of `PIE_KV_CONTENTION=preempt`;
 /// engagement shows as `stats().suspends/restores > 0` (the pre-wired v2
-/// e2e assertion). Passive (`ArenaPoolBackend`) remains the default.
+/// e2e assertion). Passive (`KvPoolBackend`) remains the default.
 pub struct SelfSuspendBackend {
-    pool: ArenaPoolBackend,
+    pool: KvPoolBackend,
 }
 
 impl SelfSuspendBackend {
     pub fn new(model_idx: usize, driver_idx: usize) -> Self {
         Self {
-            pool: ArenaPoolBackend::new(model_idx, driver_idx),
+            pool: KvPoolBackend::new(model_idx, driver_idx),
         }
     }
 }
@@ -924,6 +956,10 @@ impl SelfSuspendBackend {
 impl ReclaimBackend for SelfSuspendBackend {
     fn pool_stats(&self) -> (u32, u32) {
         self.pool.pool_stats()
+    }
+
+    fn reclaim_idle(&self) -> u32 {
+        self.pool.reclaim_idle()
     }
 
     fn suspend(&self, _victim: ProcessId) -> SuspendOutcome {
@@ -986,5 +1022,87 @@ pub fn contention() -> Option<&'static ContentionOrchestrator> {
 pub fn notify_fire_retired() {
     if let Some(o) = CONTENTION.get() {
         o.on_fire_retired();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A pool with `free` blocks live plus `idle` blocks reclaimable at zero
+    /// cost (rung 1: unused cache leases).
+    struct MockPool {
+        free: AtomicU32,
+        idle: AtomicU32,
+        total: u32,
+    }
+
+    impl ReclaimBackend for MockPool {
+        fn pool_stats(&self) -> (u32, u32) {
+            (self.free.load(Ordering::SeqCst), self.total)
+        }
+        fn reclaim_idle(&self) -> u32 {
+            let n = self.idle.swap(0, Ordering::SeqCst);
+            self.free.fetch_add(n, Ordering::SeqCst);
+            n
+        }
+        fn suspend(&self, _victim: ProcessId) -> SuspendOutcome {
+            SuspendOutcome::Unsupported
+        }
+        fn restore(&self, _pid: ProcessId) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn orch(free: u32, idle: u32, total: u32) -> (ContentionOrchestrator, ProcessId) {
+        let orch = ContentionOrchestrator::new(
+            Box::new(MockPool {
+                free: AtomicU32::new(free),
+                idle: AtomicU32::new(idle),
+                total,
+            }),
+            0.85,
+        )
+        .with_exhaustion_ms(200);
+        let pid = ProcessId::new_v4();
+        orch.register(pid);
+        (orch, pid)
+    }
+
+    #[tokio::test]
+    async fn ladder_rung_1_reclaims_idle_leases_before_parking() {
+        // 2 free + 6 idle-reclaimable, need 5: rung 1 must satisfy the
+        // request without the requester ever parking.
+        let (orch, pid) = orch(2, 6, 16);
+        let got = orch.acquire(pid, 5).await;
+        assert_eq!(got, Ok(()));
+        assert_eq!(orch.stats().waiters_parked.load(Ordering::Relaxed), 0);
+        assert_eq!(orch.backend.pool_stats().0, 8); // idle blocks now free
+    }
+
+    #[tokio::test]
+    async fn keystone_with_nothing_reclaimable_parks_then_fails_loud() {
+        // 1 free, nothing idle, no peers: the FCFS-oldest keystone parks and,
+        // once the exhaustion deadline lapses with no free event, fails LOUD
+        // (#19) instead of wedging.
+        let (orch, pid) = orch(1, 0, 16);
+        let orch = std::sync::Arc::new(orch);
+        let waiter = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.acquire(pid, 4).await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(orch.contended());
+        let got = waiter.await.unwrap();
+        assert_eq!(
+            got,
+            Err(ContentionError::Exhausted {
+                need: 4,
+                free: 1,
+                total: 16
+            })
+        );
+        assert_eq!(orch.stats().waiters_parked.load(Ordering::Relaxed), 1);
     }
 }

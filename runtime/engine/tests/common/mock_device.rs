@@ -180,12 +180,18 @@ fn register_dummy_driver(
     num_kv_pages: usize,
     driver_idx: usize,
     behavior: Arc<dyn Behavior>,
+    vocab_size: u32,
+    operation_log: Arc<Mutex<Vec<String>>>,
 ) -> (usize, BatchScheduler) {
     let (native, _) = NativeDriver::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_kv_pages as u32,
         kv_page_size: 16,
         swap_pool_size: 0,
-        vocab_size: 32,
+        // MUST match the engine model's `vocab_size()` (the tokenizer
+        // fixture's vocab): guests declare `logits` as
+        // `[rows, output-vocab-size]` and the dummy validates the decl
+        // against this capability at program bind.
+        vocab_size,
         max_model_len: 8192,
         arch_name: "test-dummy".into(),
         activation_dtype: "f32".into(),
@@ -197,7 +203,7 @@ fn register_dummy_driver(
         reject_launches: false,
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
-        operation_log: None,
+        operation_log: Some(operation_log),
         launch_observer: Some(launch_observer(behavior)),
     })
     .expect("create dummy native driver");
@@ -225,10 +231,23 @@ pub struct MockBackend {
 }
 
 impl MockBackend {
-    pub fn new(num_devices: usize, behavior: Arc<dyn Behavior>) -> Self {
+    pub fn new(
+        num_devices: usize,
+        behavior: Arc<dyn Behavior>,
+        vocab_size: u32,
+        operation_log: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
         let recorder = Arc::new(CallRecorder::new());
         let (driver_ids, schedulers) = (0..num_devices)
-            .map(|driver_idx| register_dummy_driver(64, driver_idx, behavior.clone()))
+            .map(|driver_idx| {
+                register_dummy_driver(
+                    64,
+                    driver_idx,
+                    behavior.clone(),
+                    vocab_size,
+                    Arc::clone(&operation_log),
+                )
+            })
             .unzip();
         Self {
             driver_ids,

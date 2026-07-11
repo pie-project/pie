@@ -41,15 +41,16 @@ impl Session {
                 {
                     let model_name = model::model().name().to_string();
                     // KV page pool stats summed across the single model's
-                    // drivers' unified arenas (replaces the retired context
-                    // page store).
+                    // drivers' typed stores.
                     let (used, total) = {
                         let (mut u, mut t) = (0u64, 0u64);
                         let mut d = 0;
-                        while let Some(a) = crate::arena::try_get(0, d) {
-                            let arena = a.lock().unwrap();
-                            u += arena.used(crate::arena::ArenaKind::KvPage) as u64;
-                            t += arena.capacity(crate::arena::ArenaKind::KvPage) as u64;
+                        while let Some(stores) = crate::store::registry::try_get(0, d) {
+                            let kv = stores.kv.lock().unwrap();
+                            let capacity = kv.capacity_pages() as u64;
+                            let available = kv.available_pages() as u64;
+                            u += capacity - available;
+                            t += capacity;
                             d += 1;
                         }
                         (u, t)

@@ -75,7 +75,7 @@ async fn main(_input: String) -> Result<String> {
     // decode loop + a real grammar mask land with charlie's MTP Stage-2 driver.
     let pipeline = Pipeline::new();
     gmask.put(vec![true; (kp1 * v) as usize]); // all-allow
-    pipeline.submit(fwd).map_err(|e| format!("submit: {e}"))?;
+    fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
     let committed = out.take().get::<i32>().map_err(|e| format!("out.take: {e}"))?;
 
     let result = format!(

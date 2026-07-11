@@ -489,6 +489,9 @@ bool PtirDispatch::run(const pie_native::LaunchView& view,
         CUDA_CHECK(cudaStreamWaitEvent(stream, bound.publish_done, 0));
 
         FireInputs fin;
+        // The executor hands this dispatch view PER-PROGRAM offsets into the
+        // gathered sampled-logits rows (`n_prog + 1` entries, composed batch
+        // order) in `sampling_indptr` — NOT the per-request sampling CSR.
         if (logits != nullptr &&
             view.sampling_indptr.size() == n_prog + 1) {
             const std::size_t row_offset =
@@ -666,9 +669,10 @@ PtirDispatch::settle_failed_launch(
 bool PtirDispatch::resolve_descriptors(const pie_native::LaunchView& view,
                                        std::uint32_t page_size,
                                        std::uint32_t device_pages,
-                                       FireGeometry& out,
+                                       ResolvedPrograms& out,
                                        std::string* err) {
     if (err) err->clear();
+    out = ResolvedPrograms{};
     if (view.ptir_program_hashes.empty()) return false;
     Impl& s = *impl_;
     const std::size_t n_prog = view.ptir_program_hashes.size();
@@ -701,14 +705,13 @@ bool PtirDispatch::resolve_descriptors(const pie_native::LaunchView& view,
         }
     }
 
+    out.per_program.resize(n_prog);
+    out.is_device_geometry.assign(n_prog, 0);
     for (std::size_t p = 0; p < n_prog; ++p) {
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        bool device_geometry = false;
-        for (const PortBinding& pb : trace->ports)
-            if (!pb.is_const) { device_geometry = true; break; }
-        if (!device_geometry) continue;
+        if (!is_device_geometry_trace(*trace)) continue;
 
         // Geometry resolution reads device channel state synchronously, so
         // pull the writer rings on the default stream and drain it first.
@@ -716,13 +719,41 @@ bool PtirDispatch::resolve_descriptors(const pie_native::LaunchView& view,
         it->second.instance->pull_writer_inputs(nullptr, staging);
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
 
+        FireGeometry& fg = out.per_program[p];
         if (!resolve_fire_geometry(
-                *trace, it->second.instance->view(), page_size, out, err)) {
+                *trace, it->second.instance->view(), page_size, fg, err)) {
             return false;
         }
-        return validate_fire_geometry(out, device_pages, page_size, err);
+
+        // WorkingSet page translation (kv_refact.md flattened-table model):
+        // channel-resolved `Pages`/`WSlot` values are WorkingSet-RELATIVE
+        // indexes — the guest never holds physical ids. Map them through this
+        // instance's translation segment (committed mapping overlaid with the
+        // fire's prepared write targets, built at prepare). An index past the
+        // segment is a reserved-but-unwritten page (a masked-only attention
+        // candidate): map it to page 0 — readable garbage the mask discards.
+        // An EMPTY segment passes values through (legacy physical geometry).
+        if (view.kv_translation_indptr.size() == n_prog + 1) {
+            const std::uint32_t lo = view.kv_translation_indptr.data()[p];
+            const std::uint32_t hi = view.kv_translation_indptr.data()[p + 1];
+            if (hi > lo && hi <= view.kv_translation.size()) {
+                const std::uint32_t* tr = view.kv_translation.data() + lo;
+                const std::uint32_t tr_len = hi - lo;
+                auto translate = [&](std::vector<std::uint32_t>& ids) {
+                    for (std::uint32_t& v : ids) v = v < tr_len ? tr[v] : 0u;
+                };
+                translate(fg.kv_page_indices);
+                translate(fg.w_page);
+            }
+        }
+
+        if (!validate_fire_geometry(fg, device_pages, page_size, err)) {
+            return false;
+        }
+        out.is_device_geometry[p] = 1;
+        ++out.device_count;
     }
-    return false;
+    return out.device_count > 0;
 }
 
 }  // namespace pie_cuda_driver::ptir

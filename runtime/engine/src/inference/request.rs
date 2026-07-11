@@ -7,7 +7,7 @@
 
 use smallvec::{SmallVec, smallvec};
 
-use crate::arena::PhysicalPageId;
+use crate::inference::paging::PhysicalPageId;
 use pie_grammar::brle::RunMask;
 
 /// Inline storage for the page-trim bitmap. Sized to cover up to 1024 pages

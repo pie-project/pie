@@ -46,6 +46,36 @@ enum : std::uint8_t {
     kPortAttnMask    = 9,
 };
 
+// Device-geometry classification: a pass whose geometry STRUCTURE (page
+// selection, write targets, positions, masks) is channel-carried resolves
+// here, pre-forward, from its channels — the wire may hold stale host-mirror
+// values for device-written channels (the host replays a channel's last
+// host-known value; after the device epilogue rewrites it the mirror is
+// stale), so for these passes the channels are the ONLY truth. Conversely a
+// pass with no channel-bound structure port (the CANONICAL shape — token
+// embed + `KvLen`-only attention) is runtime-owned: its geometry is derived
+// host-side from the store projection and rides the wire, which is what
+// makes the transparent prefix-cache trim possible. `EmbedTokens`/
+// `EmbedIndptr`/`KvLen`/`Readout` channels do NOT trigger device geometry —
+// host-put/seeded values there are host-known and wire-carried.
+inline bool is_device_geometry_trace(const Trace& trace) {
+    for (const PortBinding& pb : trace.ports) {
+        if (pb.is_const) continue;
+        switch (pb.port) {
+            case kPortPositions:
+            case kPortPages:
+            case kPortPageIndptr:
+            case kPortWSlot:
+            case kPortWOff:
+            case kPortAttnMask:
+                return true;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
 namespace detail {
 
 // Read a channel-bound port's committed cell as raw bytes (D2H). Fails (W1.6) if

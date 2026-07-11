@@ -492,6 +492,26 @@ pub struct PieLaunchDesc {
     pub audio_indptr: PieU32Slice,
     pub kv_len: PieU32Slice,
     pub kv_len_device: PieU64Slice,
+    /// Per-instance WorkingSet page translation, flattened across the batch:
+    /// entry `i` of an instance's segment is the PHYSICAL KV page id backing
+    /// WorkingSet-relative page index `i` for THIS fire (committed mapping
+    /// overlaid with the fire's prepared write targets). The driver maps any
+    /// WorkingSet-relative page reference it resolves from device channels
+    /// (`Pages` / `WSlot` descriptor ports) through this table; guests never
+    /// see physical ids (kv_refact.md, flattened-table model). An empty
+    /// segment means the instance's channel geometry is already physical
+    /// (legacy) or absent.
+    pub kv_translation: PieU32Slice,
+    /// CSR partition of `kv_translation`, one segment per `instance_ids`
+    /// entry (`len == instance_ids.len + 1` when present, else empty).
+    pub kv_translation_indptr: PieU32Slice,
+    /// Program → wire-request attribution CSR (`len == instance_ids.len + 1`
+    /// when present, else empty): program `p` owns the wire request rows
+    /// `[row_indptr[p], row_indptr[p+1])` of `qo_indptr`/`kv_page_indptr`/
+    /// `sampling_indptr`. A device-geometry program's span is its empty
+    /// wire placeholder row; the driver substitutes its channel-resolved
+    /// geometry for that span when composing the forward batch.
+    pub ptir_program_row_indptr: PieU32Slice,
 }
 
 impl Default for PieLaunchDesc {
@@ -534,6 +554,9 @@ impl Default for PieLaunchDesc {
             audio_indptr: PieU32Slice::default(),
             kv_len: PieU32Slice::default(),
             kv_len_device: PieU64Slice::default(),
+            kv_translation: PieU32Slice::default(),
+            kv_translation_indptr: PieU32Slice::default(),
+            ptir_program_row_indptr: PieU32Slice::default(),
         }
     }
 }

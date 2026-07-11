@@ -70,6 +70,22 @@ struct LaunchView {
 
     Slice<std::uint64_t> ptir_program_hashes;
     Slice<std::uint64_t> ptir_program_instances;
+    // Per-instance WorkingSet page translation (relative index -> physical
+    // page id), CSR-partitioned per `ptir_program_instances` entry. Channel-
+    // resolved `Pages`/`WSlot` values are mapped through it; an empty
+    // segment passes values through untranslated (legacy physical geometry).
+    Slice<std::uint32_t> kv_translation;
+    Slice<std::uint32_t> kv_translation_indptr;
+    // Program → wire-request attribution CSR (`n_prog + 1` entries when
+    // present): program `p` owns wire request rows
+    // `[row_indptr[p], row_indptr[p+1])` of qo/kv/sampling. A device-geometry
+    // program's span is its empty wire placeholder; the composed batch
+    // substitutes its channel-resolved geometry for that span.
+    Slice<std::uint32_t> ptir_program_row_indptr;
+    // The batch carries a GUEST-supplied custom mask (vs engine-synthesized
+    // causal BRLE rows, which accompany every wire prefill and are safely
+    // dropped when a composed batch runs the standard causal path).
+    bool has_user_mask = false;
     Slice<std::uint32_t> image_grids;
     Slice<std::uint8_t> image_pixels;
     Slice<std::uint32_t> image_pixel_indptr;

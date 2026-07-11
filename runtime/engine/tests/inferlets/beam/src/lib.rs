@@ -124,9 +124,9 @@ async fn main(_input: String) -> Result<String> {
     let mut hyp_tokens: Vec<u32> = Vec::new();
     for step in 0..MAX_STEPS {
         // Fresh headroom for this fire: B grant ids from the working set (D2).
-        let grant = ws.alloc(B).map_err(|e| format!("ws.alloc @{step}: {e}"))?;
+        let grant = ws.reserve(B).map_err(|e| format!("ws.reserve @{step}: {e}"))?;
         fresh.put(grant);
-        pipeline.submit(fwd).map_err(|e| format!("submit @{step}: {e}"))?;
+        fwd.submit(&pipeline).map_err(|e| format!("submit @{step}: {e}"))?;
         let picked = out.take().get::<i32>().map_err(|e| format!("out.take @{step}: {e}"))?;
         let _parents = out_par.take().get::<u32>().map_err(|e| format!("out_par.take @{step}: {e}"))?;
         let _scr = out_scr.take().get::<f32>().map_err(|e| format!("out_scr.take @{step}: {e}"))?;

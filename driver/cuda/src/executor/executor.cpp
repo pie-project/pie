@@ -40,6 +40,7 @@
 #include "model/qwen3.hpp"
 #include "model/qwen3_forward.hpp"
 #include "ops/gemm.hpp"
+#include "ptir/batch_compose.hpp"
 
 #include "kernels/pack_dense_mask.hpp"
 #include "kernels/sample_temp.hpp"
@@ -1495,14 +1496,22 @@ void handle_fire_batch(
         const auto sptr_view_orig  = view.sampling_indptr.as<std::uint32_t>();
 
         // ── W1.1: pre-forward device-geometry descriptor resolution ──────
-        // A device-geometry PTIR fire (a descriptor port binds a CHANNEL) ships
-        // EMPTY wire geometry; the driver mirrors the runtime's `map_geometry` by
-        // reading the program's port channels at fire time and feeds the resolved
-        // FireGeometry into the standard batch assembly below — no program-specific
-        // assembly (owner constraint §3.1). A not-ready descriptor channel fails
-        // the fire (W1.6). Legacy / const-port fires resolve nothing (dg_resolved
-        // = false, empty *err) and use the wire geometry unchanged.
-        ptir::FireGeometry fg;
+        // EVERY device-geometry PTIR program in the batch (WSlot/WOff write
+        // descriptors + a channel-bound [B, P>1] Pages port — the runtime's
+        // `detect_device_geometry` mirror) ships EMPTY wire geometry; the
+        // driver reads its port channels at fire time and COMPOSES the
+        // resolved geometries with the wire programs' launch slices into one
+        // flat forward batch (batch_compose.hpp) — no program-specific
+        // assembly (owner constraint §3.1). A not-ready descriptor channel
+        // fails the fire (W1.6). Pure-wire batches resolve nothing
+        // (dg_resolved = false, empty *err) and use the wire geometry
+        // unchanged.
+        ptir::ResolvedPrograms rpg;
+        ptir::ComposedBatch composed;
+        // Per-PROGRAM offsets of each program's sampled rows within the
+        // gathered logits buffer (`n_prog + 1` entries) — what
+        // `PtirDispatch::run` slices each program's logits base from.
+        std::vector<std::uint32_t> prog_sample_offsets;
         bool dg_resolved = false;
         if (!view.ptir_program_hashes.empty()) {
             if (!executor.ptir_dispatch)
@@ -1512,26 +1521,62 @@ void handle_fire_batch(
                 view,
                 static_cast<std::uint32_t>(kv_cache.page_size()),
                 static_cast<std::uint32_t>(kv_cache.num_pages()),
-                fg,
+                rpg,
                 &dg_err);
             if (!dg_resolved && !dg_err.empty()) {
                 throw std::runtime_error(dg_err);
             }
+            if (dg_resolved) {
+                // v1 mask scope: a dense device mask (AttnMask channel)
+                // composes only SOLO — the runtime scheduler batches such
+                // fires alone; fail loud if the contract is violated.
+                if (rpg.per_program.size() > 1) {
+                    for (std::size_t p = 0; p < rpg.per_program.size(); ++p) {
+                        if (rpg.is_device_geometry[p] &&
+                            rpg.per_program[p].has_mask) {
+                            throw std::runtime_error(
+                                "ptir: dense device mask in a multi-program "
+                                "batch (scheduler contract violated)");
+                        }
+                    }
+                }
+                std::string compose_err;
+                if (!ptir::compose_forward_batch(
+                        view, rpg,
+                        static_cast<std::uint32_t>(kv_cache.page_size()),
+                        composed, &compose_err)) {
+                    throw std::runtime_error(compose_err);
+                }
+                prog_sample_offsets = composed.prog_sample_offsets;
+            } else {
+                std::string offs_err;
+                if (!ptir::wire_program_sample_offsets(
+                        view, prog_sample_offsets, &offs_err)) {
+                    throw std::runtime_error(offs_err);
+                }
+            }
         }
+        // Only the SOLO device-geometry fire may carry a dense device mask;
+        // its resolved geometry equals the composed batch.
+        const ptir::FireGeometry* solo_fg =
+            (dg_resolved && rpg.per_program.size() == 1 &&
+             rpg.is_device_geometry[0])
+                ? &rpg.per_program[0]
+                : nullptr;
 
-        // Device-resolved geometry takes precedence over the borrowed launch
+        // Composed geometry takes precedence over the borrowed launch
         // slices. No request/speculation carrier is expanded in the driver.
         const int R = static_cast<int>(
-            dg_resolved ? fg.qo_indptr.size() : qo_view_orig.size()) - 1;
+            dg_resolved ? composed.qo_indptr.size() : qo_view_orig.size()) - 1;
 
-        const std::span<const std::uint32_t> tok_view   = dg_resolved ? std::span<const std::uint32_t>(fg.token_ids)         : tok_view_orig;
-        const std::span<const std::uint32_t> pos_view   = dg_resolved ? std::span<const std::uint32_t>(fg.position_ids)      : pos_view_orig;
-        const std::span<const std::uint32_t> qo_view    = dg_resolved ? std::span<const std::uint32_t>(fg.qo_indptr)         : qo_view_orig;
-        const std::span<const std::uint32_t> kvpi_view  = dg_resolved ? std::span<const std::uint32_t>(fg.kv_page_indices)   : kvpi_view_wire;
-        const std::span<const std::uint32_t> kvpp_view  = dg_resolved ? std::span<const std::uint32_t>(fg.kv_page_indptr)    : kvpp_view_wire;
-        const std::span<const std::uint32_t> kvlpl_view = dg_resolved ? std::span<const std::uint32_t>(fg.kv_last_page_lens) : kvlpl_view_orig;
-        const std::span<const std::uint32_t> sidx_view  = dg_resolved ? std::span<const std::uint32_t>(fg.sampling_indices)  : sidx_view_orig;
-        const std::span<const std::uint32_t> sptr_view  = dg_resolved ? std::span<const std::uint32_t>(fg.sampling_indptr)   : sptr_view_orig;
+        const std::span<const std::uint32_t> tok_view   = dg_resolved ? std::span<const std::uint32_t>(composed.token_ids)         : tok_view_orig;
+        const std::span<const std::uint32_t> pos_view   = dg_resolved ? std::span<const std::uint32_t>(composed.position_ids)      : pos_view_orig;
+        const std::span<const std::uint32_t> qo_view    = dg_resolved ? std::span<const std::uint32_t>(composed.qo_indptr)         : qo_view_orig;
+        const std::span<const std::uint32_t> kvpi_view  = dg_resolved ? std::span<const std::uint32_t>(composed.kv_page_indices)   : kvpi_view_wire;
+        const std::span<const std::uint32_t> kvpp_view  = dg_resolved ? std::span<const std::uint32_t>(composed.kv_page_indptr)    : kvpp_view_wire;
+        const std::span<const std::uint32_t> kvlpl_view = dg_resolved ? std::span<const std::uint32_t>(composed.kv_last_page_lens) : kvlpl_view_orig;
+        const std::span<const std::uint32_t> sidx_view  = dg_resolved ? std::span<const std::uint32_t>(composed.sampling_indices)  : sidx_view_orig;
+        const std::span<const std::uint32_t> sptr_view  = dg_resolved ? std::span<const std::uint32_t>(composed.sampling_indptr)   : sptr_view_orig;
 
         const auto t_wire_parse_end = clock::now();
 
@@ -1657,30 +1702,53 @@ void handle_fire_batch(
         // `has_custom_mask` gate). This is the previously-noted "route decode
         // through the prefill kernel for custom-mask inferlets" fix; a normal
         // decode batch carries no mask (`fmask_view` empty) so it is unaffected.
+        // Wire BRLE masks are indexed by the WIRE request layout, so the
+        // causality check and decode run against the WIRE spans (identical to
+        // the selected spans on a pure-wire batch). A composed batch never
+        // carries a custom wire mask (the runtime scheduler keeps custom-mask
+        // wire fires and device-geometry fires apart — fail loud otherwise);
+        // pure-causal wire masks are simply dropped, as before.
         const auto fmask_view  = view.flattened_masks.as<std::uint32_t>();
         const auto mskptr_view = view.mask_indptr.as<std::uint32_t>();
         if (!fmask_view.empty()) {
-            const auto qo_span =
-                std::span<const std::uint32_t>(qo_view.data(), qo_view.size());
-            const auto kvpp_span =
-                std::span<const std::uint32_t>(kvpp_view.data(), kvpp_view.size());
-            const auto kvlpl_span =
-                std::span<const std::uint32_t>(kvlpl_view.data(), kvlpl_view.size());
+            const auto qo_span = std::span<const std::uint32_t>(
+                qo_view_orig.data(), qo_view_orig.size());
+            const auto kvpp_span = std::span<const std::uint32_t>(
+                kvpp_view_wire.data(), kvpp_view_wire.size());
+            const auto kvlpl_span = std::span<const std::uint32_t>(
+                kvlpl_view_orig.data(), kvlpl_view_orig.size());
             if (!pie_cuda_driver::brle::is_pure_causal(
                     fmask_view, mskptr_view,
                     qo_span, kvpp_span, kvlpl_span,
                     kv_cache.page_size())) {
-                auto decoded = pie_cuda_driver::brle::decode(
-                    fmask_view, mskptr_view,
-                    qo_span, kvpp_span, kvlpl_span,
-                    kv_cache.page_size());
-                pi.custom_mask.copy_from_host(
-                    std::span<const std::uint8_t>(decoded.packed));
-                pi.custom_mask_indptr.copy_from_host(
-                    std::span<const std::int32_t>(decoded.mask_indptr));
-                mask_bytes = static_cast<int>(decoded.packed.size());
-                mask_indptr_count = static_cast<int>(decoded.mask_indptr.size());
-                have_custom_mask = true;
+                if (dg_resolved) {
+                    // A MULTI-program batch cannot honor wire BRLE masks
+                    // (they index the wire request layout; the scheduler
+                    // batches mask-carrying fires solo — fail loud if not).
+                    // On a SOLO device-geometry fire the wire rows are
+                    // engine-SYNTHESIZED causal (a guest's mask is the DENSE
+                    // channel mask, packed below) and simply drop — the
+                    // resolved geometry runs the standard causal path.
+                    if (view.has_user_mask &&
+                        view.ptir_program_hashes.size() > 1) {
+                        throw std::runtime_error(
+                            "ptir: custom wire masks cannot co-batch with "
+                            "device-geometry programs (scheduler contract "
+                            "violated)");
+                    }
+                } else {
+                    auto decoded = pie_cuda_driver::brle::decode(
+                        fmask_view, mskptr_view,
+                        qo_span, kvpp_span, kvlpl_span,
+                        kv_cache.page_size());
+                    pi.custom_mask.copy_from_host(
+                        std::span<const std::uint8_t>(decoded.packed));
+                    pi.custom_mask_indptr.copy_from_host(
+                        std::span<const std::int32_t>(decoded.mask_indptr));
+                    mask_bytes = static_cast<int>(decoded.packed.size());
+                    mask_indptr_count = static_cast<int>(decoded.mask_indptr.size());
+                    have_custom_mask = true;
+                }
             }
         }
 
@@ -1692,7 +1760,8 @@ void handle_fire_batch(
         // exactly like a BRLE-decoded wire mask. DORMANT unless a device-geometry
         // program binds an AttnMask channel (fg.has_mask); the guest producer is
         // W2.1. Correctness is validated once a real device-geometry fire exists.
-        if (dg_resolved && fg.has_mask && !fg.mask.empty()) {
+        if (solo_fg != nullptr && solo_fg->has_mask && !solo_fg->mask.empty()) {
+            const ptir::FireGeometry& fg = *solo_fg;
             const int lanes = static_cast<int>(qo_view.size()) - 1;
             // Total query rows = qo_indptr.back(). For a 1-query/lane decode this
             // equals `lanes`; for a variable-length prefill a single lane carries
@@ -1752,17 +1821,25 @@ void handle_fire_batch(
         }
 
         // Explicit KV-write descriptor upload (device-geometry WSlot/WOff, B2).
-        // Parallels the mask pack above: when the program bound WSlot/WOff
-        // ports, the resolver filled fg.w_page/fg.w_off with per-lane PHYSICAL
-        // page ids + offsets for the single new-token K/V write. Upload them
-        // into the persistent pi.w_page/pi.w_off so the forward routes the
-        // per-layer KV append through launch_write_kv_explicit_bf16 instead of
-        // the standard page-derived write (beam fork/freeze correctness).
-        if (dg_resolved && fg.has_write_desc &&
-            !fg.w_page.empty() && fg.w_page.size() == fg.w_off.size() &&
-            fg.w_page.size() <= pi.w_page.size()) {
-            pi.w_page.copy_from_host(std::span<const std::uint32_t>(fg.w_page));
-            pi.w_off.copy_from_host(std::span<const std::uint32_t>(fg.w_off));
+        // Parallels the mask pack above: when any composed program bound
+        // WSlot/WOff ports, the composition carries per-TOKEN physical page
+        // ids + offsets for EVERY batch row (device-geometry rows from their
+        // translated descriptors; wire rows synthesized to their standard
+        // append target — `has_write_desc` routes the whole forward's
+        // per-layer KV append through launch_write_kv_explicit_bf16, so every
+        // row needs a target). Beam fork/freeze correctness: a frozen fork's
+        // cell is not overwritten (a sibling's mask hides it).
+        if (dg_resolved && composed.has_write_desc && !composed.w_page.empty()) {
+            if (composed.w_page.size() != composed.w_off.size() ||
+                composed.w_page.size() > pi.w_page.size()) {
+                throw std::runtime_error(
+                    "ptir: composed write descriptor exceeds persistent "
+                    "input capacity");
+            }
+            pi.w_page.copy_from_host(
+                std::span<const std::uint32_t>(composed.w_page));
+            pi.w_off.copy_from_host(
+                std::span<const std::uint32_t>(composed.w_off));
             has_write_desc = true;
         }
 
@@ -1990,11 +2067,16 @@ void handle_fire_batch(
                 executor.cublas.stream());
             ptir_logits = executor.ptir_logits_f32.data();
         }
+        // The post-forward dispatch slices each program's logits base from
+        // `sampling_indptr[p]` — hand it the PER-PROGRAM gathered-row offsets
+        // (`n_prog + 1` entries), not the per-request sampling CSR (the two
+        // coincided only while every batched program was exactly one wire
+        // request).
         pie_native::LaunchView dispatch_view = view;
         dispatch_view.sampling_indices = pie_native::slice_from_u32(
             sidx_view.data(), sidx_view.size());
         dispatch_view.sampling_indptr = pie_native::slice_from_u32(
-            sptr_view.data(), sptr_view.size());
+            prog_sample_offsets.data(), prog_sample_offsets.size());
         executor.ptir_dispatch->run(
             dispatch_view, ptir_logits, vocab, executor.cublas.stream(),
             &runtime, completion);

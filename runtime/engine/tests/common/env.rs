@@ -12,12 +12,39 @@ use pie_engine::driver::{NativeDriver, SchedulerLimits};
 
 use super::mock_device::{Behavior, MockBackend, launch_observer};
 
-fn native_dummy_driver(num_pages: usize, behavior: Arc<dyn Behavior>) -> NativeDriver {
+/// The mock model's logits/output vocab. MUST match what the engine model
+/// reports (`Model::vocab_size()`, which reads `vocab_size` from the
+/// fixture `config.json` beside the tokenizer, falling back to the
+/// tokenizer vocab): a guest declares its `logits` intrinsic as
+/// `[rows, output-vocab-size]` and the dummy driver validates that decl
+/// against ITS capability vocab — a mismatch rejects every logits-using
+/// PTIR program at bind.
+fn fixture_vocab_size() -> u32 {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/fixtures");
+    let cfg = std::fs::read_to_string(fixtures.join("config.json"))
+        .expect("read fixture config.json");
+    let cfg: serde_json::Value = serde_json::from_str(&cfg).expect("parse fixture config.json");
+    match cfg.get("vocab_size").and_then(|v| v.as_u64()) {
+        Some(v) => v as u32,
+        None => {
+            let tokenizer =
+                pie_tokenizer::Tokenizer::from_file(&fixtures.join("test_tokenizer.json"))
+                    .expect("load fixture tokenizer");
+            tokenizer.vocab_size() as u32
+        }
+    }
+}
+
+fn native_dummy_driver(
+    num_pages: usize,
+    behavior: Arc<dyn Behavior>,
+    operation_log: Arc<std::sync::Mutex<Vec<String>>>,
+) -> NativeDriver {
     let (native, _) = NativeDriver::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_pages as u32,
         kv_page_size: 16,
         swap_pool_size: 0,
-        vocab_size: 32,
+        vocab_size: fixture_vocab_size(),
         max_model_len: 8192,
         arch_name: "test-dummy".into(),
         activation_dtype: "f32".into(),
@@ -29,7 +56,7 @@ fn native_dummy_driver(num_pages: usize, behavior: Arc<dyn Behavior>) -> NativeD
         reject_launches: false,
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
-        operation_log: None,
+        operation_log: Some(operation_log),
         launch_observer: Some(launch_observer(behavior)),
     })
     .expect("create dummy native driver");
@@ -44,9 +71,19 @@ pub struct MockEnv {
     behavior: Arc<dyn Behavior>,
     temp_cache: TempDir,
     temp_auth: TempDir,
+    /// Dummy-driver operation log (shared across every device driver): op
+    /// names plus `launch-shape tokens=N programs=P` entries for geometry
+    /// assertions.
+    operation_log: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl MockEnv {
+    /// Snapshot of the dummy-driver operation log.
+    #[allow(dead_code)]
+    pub fn operations(&self) -> Vec<String> {
+        self.operation_log.lock().unwrap().clone()
+    }
+
     pub fn config(&self) -> Config {
         let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/common/fixtures/test_tokenizer.json");
@@ -63,7 +100,11 @@ impl MockEnv {
                     max_forward_tokens: 4096,
                     max_page_refs: self.num_pages,
                 },
-                native_driver: native_dummy_driver(self.num_pages, self.behavior.clone()),
+                native_driver: native_dummy_driver(
+                    self.num_pages,
+                    self.behavior.clone(),
+                    Arc::clone(&self.operation_log),
+                ),
             })
             .collect();
 
@@ -119,13 +160,20 @@ pub fn create_mock_env(
     num_pages: usize,
     behavior: Arc<dyn Behavior>,
 ) -> MockEnv {
+    let operation_log = Arc::new(std::sync::Mutex::new(Vec::new()));
     MockEnv {
-        backend: MockBackend::new(num_devices, behavior.clone()),
+        backend: MockBackend::new(
+            num_devices,
+            behavior.clone(),
+            fixture_vocab_size(),
+            Arc::clone(&operation_log),
+        ),
         model_name: model_name.to_string(),
         num_devices,
         num_pages,
         behavior,
         temp_cache: TempDir::new().expect("Failed to create temp cache dir"),
         temp_auth: TempDir::new().expect("Failed to create temp auth dir"),
+        operation_log,
     }
 }

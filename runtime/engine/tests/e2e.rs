@@ -164,6 +164,39 @@ fn direct_ptir_mixed_outputs_execute_end_to_end() {
 }
 
 #[test]
+fn prefix_cache_grafts_and_trims_second_prefill() {
+    let s = state();
+    // Two identical CANONICAL 24-token prefills over fresh working sets in
+    // one process. Round 1's WorkingSet drop retains the canonical path;
+    // round 2's fire must graft the cached full page (16 tokens) and launch
+    // only the 8-token suffix — asserted on the dummy driver's launch-shape
+    // trace (24 and 8 are unique to this inferlet across the e2e suite).
+    let result = spawn_and_capture(s, "prefix-cache-e2e", "{}".into());
+    assert!(
+        result.as_deref().is_ok_and(|r| r.contains("PREFIX_CACHE_E2E n=24")),
+        "prefix-cache inferlet should complete (got {result:?})"
+    );
+    let shapes: Vec<String> = s
+        .env
+        .operations()
+        .into_iter()
+        .filter(|op| op.starts_with("launch-shape"))
+        .collect();
+    let cold = shapes.iter().position(|op| op.contains("tokens=24"));
+    assert!(
+        cold.is_some(),
+        "round 0 should prefill all 24 tokens: {shapes:?}"
+    );
+    assert!(
+        shapes[cold.unwrap() + 1..]
+            .iter()
+            .any(|op| op.contains("tokens=8")),
+        "round 1 should graft the cached page and fire only the 8-token \
+         suffix: {shapes:?}"
+    );
+}
+
+#[test]
 fn spawn_after_termination() {
     let s = state();
     s.rt.block_on(async {

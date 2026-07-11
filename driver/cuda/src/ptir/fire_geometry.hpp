@@ -34,6 +34,17 @@ struct FireGeometry {
     bool has_mask = false;                        // attn_mask present
 };
 
+// Pre-forward descriptor resolution over a whole batch: one entry per
+// launched program, parallel to `ptir_program_instances`. Wire programs
+// (geometry on the launch wire) keep an empty `per_program` entry with
+// `is_device_geometry[p] == 0`; device-geometry programs carry their
+// channel-resolved, translation-mapped `FireGeometry`.
+struct ResolvedPrograms {
+    std::vector<FireGeometry>  per_program;
+    std::vector<std::uint8_t>  is_device_geometry;
+    std::size_t                device_count = 0;
+};
+
 inline bool validate_fire_geometry(const FireGeometry& geometry,
                                    std::uint32_t device_pages,
                                    std::uint32_t page_size,

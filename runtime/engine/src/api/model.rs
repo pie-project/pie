@@ -62,9 +62,8 @@ impl pie::inferlet::model::Host for InstanceState {
         Ok(model::model().rs_caps().fold_granularity)
     }
 
-    /// Arena accounting block size. v1: one KV page == one arena block, so this
-    /// is the bound model's KV page size (tokens).
+    /// KV page size (tokens) of the bound model.
     async fn arena_block_size(&mut self) -> Result<u64> {
-        Ok(crate::working_set::page_size::tokens_per_page(0) as u64)
+        Ok(crate::store::registry::get(0, 0).kv_page_size as u64)
     }
 }

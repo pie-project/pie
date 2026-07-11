@@ -33,7 +33,7 @@ wasmtime::component::bindgen!({
         "wasi:clocks": wasmtime_wasi::p3::bindings::clocks,
         "wasi:filesystem": wasmtime_wasi::p3::bindings::filesystem,
         // pie:inferlet/working-set (kv); rs-working-set below
-        "pie:inferlet/working-set.kv-working-set": crate::working_set::kv::KvWorkingSet,
+        "pie:inferlet/working-set.kv-working-set": crate::store::kv::working_set::KvWorkingSet,
         // pie:inferlet/grammar (ex inference)
         "pie:inferlet/grammar.grammar": grammar::Grammar,
         "pie:inferlet/grammar.matcher": grammar::Matcher,
@@ -41,9 +41,11 @@ wasmtime::component::bindgen!({
         // submission (the registry surface folded into forward-pass.new).
         "pie:inferlet/forward.channel": crate::ptir::ptir_host::Channel,
         "pie:inferlet/forward.forward-pass": crate::ptir::ptir_host::ForwardPass,
-        "pie:inferlet/forward.pipeline": crate::ptir::ptir_host::Pipeline,
+        // pie:inferlet/pipeline — the ordering domain (hoisted out of forward
+        // so working-set mutators can take borrow<pipeline> without a cycle).
+        "pie:inferlet/pipeline.pipeline": crate::ptir::ptir_host::Pipeline,
         // pie:inferlet/working-set (rs)
-        "pie:inferlet/working-set.rs-working-set": crate::working_set::rs::RsWorkingSet,
+        "pie:inferlet/working-set.rs-working-set": crate::store::rs::working_set::RsWorkingSet,
         // pie:inferlet/media
         "pie:inferlet/media.image": media::Image,
         "pie:inferlet/media.video": media::Video,
@@ -73,6 +75,7 @@ pub fn add_to_linker(
     // `HasSelf<InstanceState>`, so the linker `D` type must be concrete.
     type D = HasSelf<InstanceState>;
     pie::inferlet::types::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    pie::inferlet::pipeline::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::inferlet::working_set::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::inferlet::model::add_to_linker::<InstanceState, D>(linker, |s| s)?;
     pie::inferlet::tokenizer::add_to_linker::<InstanceState, D>(linker, |s| s)?;

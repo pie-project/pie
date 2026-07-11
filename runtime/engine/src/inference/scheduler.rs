@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::arena::PhysicalPageId;
+use crate::inference::paging::PhysicalPageId;
 use crate::driver::{
     BoundInstance, ChannelRegistrationPlan, Completion, DriverId, InstanceBindingPlan,
     InstanceCompletion, LocalDriver, NativeDriver, PoolResizePlan, ProgramRegistration,
@@ -845,6 +845,8 @@ impl BatchScheduler {
     ) -> bool {
         let mut batch = BatchAccumulator::new(limits, page_size);
         let mut batch_instances = std::collections::HashSet::new();
+        let mut batch_has_prebuilt = false;
+        let mut batch_has_user_mask = false;
         let mut rejected_stale = false;
         while let Some(QueuedItem::Launch(next)) = pending.front() {
             if instances.get(&next.instance_id).is_none() {
@@ -864,6 +866,15 @@ impl BatchScheduler {
             if !batch_instances.insert(next.instance_id) {
                 break;
             }
+            // Mask co-batch policy (v1 of the composed multi-program batch):
+            // the driver merges channel-resolved and wire geometry but not
+            // attention MASKS across programs. A mask-carrying fire (dense
+            // device mask or guest BRLE mask) runs SOLO.
+            let next_prebuilt = next.prebuilt;
+            let next_masked = next.request.has_user_mask;
+            if !batch.is_empty() && (next_masked || batch_has_user_mask) {
+                break;
+            }
             if batch.would_exceed(next) {
                 break;
             }
@@ -871,6 +882,12 @@ impl BatchScheduler {
                 unreachable!();
             };
             batch.push(next);
+            batch_has_prebuilt |= next_prebuilt;
+            batch_has_user_mask |= next_masked;
+            let _ = batch_has_prebuilt;
+            if next_masked {
+                break; // solo mask-carrying fire
+            }
             if batch.is_full() {
                 break;
             }

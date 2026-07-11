@@ -66,7 +66,7 @@ async fn main(input: String) -> Result<String> {
     // and the copy_into move. Flat pool position `wpos` maps to physical page
     // `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let pool = ws.alloc(POOL_PAGES).map_err(|e| format!("ws.alloc pool: {e}"))?;
+    let pool = ws.reserve(POOL_PAGES).map_err(|e| format!("ws.reserve pool: {e}"))?;
     let pool_ids: &'static Vec<u32> = bx(pool.ids().to_vec()); // [POOL_PAGES]
     let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect();
     let phys0 = pool_ids[0];
@@ -195,8 +195,7 @@ async fn main(input: String) -> Result<String> {
             remap_dst.put(vec![SRC_FLAT]);
         }
 
-        pipeline
-            .submit(fwd)
+        fwd.submit(&pipeline)
             .map_err(|e| format!("submit @{step}: {e}"))?;
 
         // The physical KV move rides the SAME FIFO right behind this fire: it
@@ -208,8 +207,7 @@ async fn main(input: String) -> Result<String> {
             let src_off = SRC_FLAT % PAGE_T;
             let dst_page = pool_ids[(DST_FLAT / PAGE_T) as usize];
             let dst_off = DST_FLAT % PAGE_T;
-            pipeline
-                .copy_into(ws, &[dst_page], &[dst_off], &[src_page], &[src_off])
+            ws.copy_into(&pipeline, &[dst_page], &[dst_off], &[src_page], &[src_off])
                 .map_err(|e| format!("copy_into @{step}: {e}"))?;
         }
 

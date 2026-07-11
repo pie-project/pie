@@ -1,218 +1,126 @@
-//! PTIR pipeline recurrent-state (rs_cache) slot assignment (§6.1 MTP GDN) — the
-//! RS sibling of `ptir_kv`. A linear-attention / GDN model (Qwen3.5 GDN,
-//! Nemotron-H Mamba2 — `executor.rs_cache != nullptr`) requires every forward to
-//! carry one runtime-assigned recurrent-state slot per request in
-//! `LaunchPlan.rs_slot_ids`, else the executor throws "rs_cache forward
-//! missing runtime-assigned slot ids" (executor.cpp:2671). The normal
-//! `execute_impl` path populates this from a WIT-bound `RsWorkingSet`; the PTIR
-//! pipeline has no such WIT call, so this module assigns the slot itself —
-//! mirroring `execute_impl`'s rs block, the RS analog of `ptir_kv`'s KV
-//! projection.
-//!
-//! Lifecycle: `ptir_host` allocates a persistent per-instance `RsWorkingSet` at
-//! `instantiate` (alongside the `KvWorkingSet`); each fire [`ptir_rs_prepare`]
-//! stages the folded recurrent-state write slot (a fresh RESET slab on the first
-//! fire, a CoW-continue of the prior state after — the recurrent state GROWS
-//! across the decode loop), threads it into `submit_async` as `rs_slot_ids` /
-//! `rs_slot_flags`, holds the returned [`PtirRsTxn`] across the async fire, then
-//! [`ptir_rs_finalize`]s it (commit → the written state persists for the next
-//! fire / abort → revert).
-//!
-//! Driver contract (handed to charlie): `rs_slot_ids[r]` = the folded slot's
-//! driver block — the GDN forward reads/writes the recurrent state THERE
-//! in-forward (the `commit_len` primitive); `rs_slot_flags[r] & RS_FLAG_RESET`
-//! on the fresh first fire (the driver zeroes the state before writing). The
-//! buffered fold-from-slabs channel (`rs_buffer_slot_ids`) is the parked Ph7
-//! extension — NOT needed for the in-forward write.
+//! PTIR fire RS (recurrent-state) preparation over the typed `RsStore`
+//! (kv_refact.md). The GDN / linear-attention forward writes the advanced
+//! folded state INTO the folded slot directly (the driver's in-forward
+//! `commit_len` path): [`ptir_rs_prepare`] classifies the folded-slot target
+//! (fresh+reset / CoW-after-fork / in-place), returns the driver lowering
+//! (`rs_slot_ids`, `rs_slot_flags`, pre-launch d2d copy), and the prepared
+//! write held across the async fire until [`ptir_rs_finalize`].
 
-use crate::arena::{Arena, ArenaTxn, MovePlan};
-use crate::working_set::rs::{RsWorkingSet, RsWritePlan};
+use crate::store::rs::write::RsPreparedWrite;
+use crate::store::rs::{RsStore, RsWorkingSetId};
 
-/// The open recurrent-state / arena transaction for one in-flight PTIR fire —
-/// held across `submit_async` until [`ptir_rs_finalize`]. Bundles the owned arena
-/// txn with the [`RsWritePlan`] (`commit_write` needs the plan's `folded_slot` to
-/// adopt), so the caller threads a single value through the async boundary — the
-/// RS mirror of `ptir_kv`'s `PtirKvTxn`.
+/// The prepared RS write for one in-flight PTIR fire.
 pub struct PtirRsTxn {
-    arena_txn: ArenaTxn,
-    plan: RsWritePlan,
+    prepared: RsPreparedWrite,
 }
 
-/// Prepare the recurrent-state slot for a PTIR fire on a persistent, per-instance
-/// `RsWorkingSet`. Stages the folded write target (fresh alloc + RESET on the
-/// first fire, CoW-continue of the prior state after) and returns the wire
-/// columns for a single-request fire:
-///
-/// Returns `(rs_slot_ids, rs_slot_flags, cow_move, txn)`: pass `rs_slot_ids` /
-/// `rs_slot_flags` into the `LaunchPlan` (parallel to the KV geometry), issue
-/// `cow_move` as a d2d copy before the fire when present (a shared-fork CoW; empty
-/// for the single-context pipeline), hold `txn` across the fire, then
-/// [`ptir_rs_finalize`]. Single-request (R=1) — the PTIR pipeline fires one
-/// sequence per forward; the executor's `rs_slot_ids.size() == R` gate is thus
-/// satisfied with one entry.
+/// Prepare the in-forward folded-state write. Returns
+/// `(rs_slot_ids, rs_slot_flags, (copy_src, copy_dst), txn)`: thread the ids
+/// and flags into the launch, issue one `driver::copy_d2d(copy_src,
+/// copy_dst)` before the launch when non-empty (shared-fork CoW), hold `txn`
+/// across the fire, then [`ptir_rs_finalize`].
 pub fn ptir_rs_prepare(
-    rs_ws: &mut RsWorkingSet,
-    arena: &mut Arena,
-) -> Result<(Vec<u32>, Vec<u8>, Option<MovePlan>, PtirRsTxn), String> {
-    let (plan, arena_txn) = rs_ws.prepare_write(arena).map_err(|e| e.to_string())?;
-    let block = arena.blocks(plan.folded_slot).map_err(|e| e.to_string())?[0];
-    let rs_slot_ids = vec![block];
-    let flag = if plan.reset {
+    store: &mut RsStore,
+    ws: RsWorkingSetId,
+) -> Result<(Vec<u32>, Vec<u8>, (Vec<u32>, Vec<u32>), PtirRsTxn), String> {
+    let prepared = store
+        .prepare_write(ws, true, None)
+        .map_err(|e| e.to_string())?;
+    let state = prepared.state().expect("write_state requested");
+    let rs_slot_ids = vec![state.slot.0];
+    let rs_slot_flags = vec![if state.reset {
         crate::driver::RS_FLAG_RESET
     } else {
-        0u8
+        0
+    }];
+    let copies = match state.copy_from {
+        Some(src) => (vec![src.0], vec![state.slot.0]),
+        None => (Vec::new(), Vec::new()),
     };
-    let rs_slot_flags = vec![flag];
-    let cow_move = plan.cow_move.clone();
-    Ok((
-        rs_slot_ids,
-        rs_slot_flags,
-        cow_move,
-        PtirRsTxn { arena_txn, plan },
-    ))
+    Ok((rs_slot_ids, rs_slot_flags, copies, PtirRsTxn { prepared }))
 }
 
-/// Abandon a fire's RS txn WITHOUT the working set (the guest dropped it while
-/// the fire was in flight): abort the arena txn so the staged slab releases.
-pub fn ptir_rs_abandon(arena: &mut Arena, txn: PtirRsTxn) {
-    arena.txn_abort(txn.arena_txn);
+/// Abandon a fire's prepared RS write (guest dropped the working set while
+/// the fire was in flight).
+pub fn ptir_rs_abandon(store: &mut RsStore, txn: PtirRsTxn) {
+    let seq = txn.prepared.seq();
+    let epoch = store.current_epoch();
+    store.abort(txn.prepared, epoch);
+    store.retire_through(seq);
 }
 
-/// Finalize a PTIR fire's recurrent-state txn after `submit_async` resolves.
-/// `success` commits (the written folded state persists as the recurrent state
-/// for the next fire); otherwise aborts (revert the staged slab / CoW copy, the
-/// prior state stays visible). Mirrors [`ptir_kv_finalize`](super::ptir_kv) /
-/// `execute_impl`'s finalize.
-pub fn ptir_rs_finalize(
-    rs_ws: &mut RsWorkingSet,
-    arena: &mut Arena,
-    txn: PtirRsTxn,
-    success: bool,
-) -> Result<(), String> {
+/// Finalize after the fire resolves: `success` adopts the folded slot for the
+/// next fire; otherwise the pending slot releases and the prior folded state
+/// stays visible.
+pub fn ptir_rs_finalize(store: &mut RsStore, txn: PtirRsTxn, success: bool) -> Result<(), String> {
+    let seq = txn.prepared.seq();
+    let epoch = store.current_epoch();
     if success {
-        rs_ws
-            .commit_write(arena, txn.arena_txn, &txn.plan)
-            .map_err(|e| e.to_string())?;
+        store.commit(txn.prepared, epoch).map_err(|e| e.to_string())?;
     } else {
-        rs_ws.abort_write(arena, txn.arena_txn);
+        store.abort(txn.prepared, epoch);
     }
+    store.retire_through(seq);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::{Arena, ArenaConfig};
-    use crate::working_set::rs::{RsGeometry, RsWorkingSet};
+    use crate::store::rs::RsGeometry;
 
-    const STATE_BLOCKS: u32 = 1;
-
-    fn arena(rs_blocks: u32) -> Arena {
-        Arena::new(ArenaConfig {
-            device: 0,
-            block_size: 4,
-            kv_pages: 0,
-            rs_blocks,
-            scratch_blocks: 0,
-            cpu_blocks: 0,
-        })
-    }
-
-    fn ws() -> RsWorkingSet {
-        RsWorkingSet::new(
-            0,
-            RsGeometry {
-                state_size: 64,
-                state_blocks: STATE_BLOCKS,
-                buffer_page_tokens: 4,
-                fold_granularity: 1,
-            },
-        )
-    }
-
-    /// Fresh first fire: allocates a real folded slot (a valid driver block, NOT
-    /// 0) and flags RESET so the driver zeroes the recurrent state before the
-    /// in-forward write — the fix that clears the executor's `size == R` gate.
-    #[test]
-    fn fresh_fire_allocates_slot_and_flags_reset() {
-        let mut a = arena(8);
-        let mut w = ws();
-        let (ids, flags, cow_move, txn) = ptir_rs_prepare(&mut w, &mut a).unwrap();
-        assert_eq!(ids.len(), 1, "one folded slot for the single-request fire");
-        assert_eq!(flags, vec![crate::driver::RS_FLAG_RESET], "fresh ⇒ RESET");
-        assert!(cow_move.is_none(), "fresh alloc ⇒ no CoW d2d");
-        assert!(w.folded_object().is_none(), "not adopted until commit");
-        ptir_rs_finalize(&mut w, &mut a, txn, true).unwrap();
-        assert!(
-            w.folded_object().is_some(),
-            "committed ⇒ folded slot adopted"
-        );
-    }
-
-    /// A continuing decode fire (folded state already committed) CoW-continues the
-    /// prior state: NO reset (prior recurrent state is read in), a valid slot id,
-    /// and the state persists across fires — the growing recurrent-state loop.
-    #[test]
-    fn continuing_fire_no_reset_and_persists() {
-        let mut a = arena(8);
-        let mut w = ws();
-        // Fire 1 (fresh): commit so the folded state exists.
-        let (ids0, flags0, _m0, t0) = ptir_rs_prepare(&mut w, &mut a).unwrap();
-        assert_eq!(flags0, vec![crate::driver::RS_FLAG_RESET]);
-        ptir_rs_finalize(&mut w, &mut a, t0, true).unwrap();
-        let slot0 = ids0[0];
-
-        // Fire 2 (continuing): CoW the prior folded state, no reset.
-        let (ids1, flags1, _m1, t1) = ptir_rs_prepare(&mut w, &mut a).unwrap();
-        assert_eq!(ids1.len(), 1);
-        assert_eq!(flags1, vec![0u8], "continuing fire ⇒ no RESET");
-        ptir_rs_finalize(&mut w, &mut a, t1, true).unwrap();
-        assert!(
-            w.folded_object().is_some(),
-            "state still present after fire 2"
-        );
-        let _ = slot0;
-    }
-
-    /// Multi-fire decode loop: 6 fires, only the first resets; the folded state is
-    /// adopted every fire (the persistent, growing recurrent state).
-    #[test]
-    fn decode_loop_resets_once() {
-        let mut a = arena(8);
-        let mut w = ws();
-        for step in 0..6u32 {
-            let (ids, flags, _m, txn) = ptir_rs_prepare(&mut w, &mut a).unwrap();
-            assert_eq!(ids.len(), 1, "step {step}");
-            let want = if step == 0 {
-                crate::driver::RS_FLAG_RESET
-            } else {
-                0u8
-            };
-            assert_eq!(flags, vec![want], "step {step} reset flag");
-            ptir_rs_finalize(&mut w, &mut a, txn, true).unwrap();
+    fn geom() -> RsGeometry {
+        RsGeometry {
+            state_size: 1024,
+            buffer_page_tokens: 4,
+            fold_granularity: 1,
         }
-        assert!(w.folded_object().is_some());
     }
 
-    /// Abort consistency: a fresh fire that aborts leaves NO folded state (the
-    /// staged alloc is reverted), so the next fire re-resets — no drift.
     #[test]
-    fn abort_reverts_to_no_folded_state() {
-        let mut a = arena(8);
-        let mut w = ws();
-        let (_ids, _flags, _m, txn) = ptir_rs_prepare(&mut w, &mut a).unwrap();
-        ptir_rs_finalize(&mut w, &mut a, txn, false).unwrap(); // abort
-        assert!(
-            w.folded_object().is_none(),
-            "aborted fresh fire ⇒ no folded state adopted"
-        );
-        // The next fire is still fresh (re-resets) — no half-committed drift.
-        let (_ids2, flags2, _m2, t2) = ptir_rs_prepare(&mut w, &mut a).unwrap();
-        assert_eq!(
-            flags2,
-            vec![crate::driver::RS_FLAG_RESET],
-            "re-fresh after abort"
-        );
-        ptir_rs_finalize(&mut w, &mut a, t2, true).unwrap();
+    fn first_fire_resets_then_continues_in_place() {
+        let mut store = RsStore::new(4);
+        let ws = store.create_working_set(geom());
+
+        let (ids, flags, (src, _), txn) = ptir_rs_prepare(&mut store, ws).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(flags, vec![crate::driver::RS_FLAG_RESET]);
+        assert!(src.is_empty());
+        ptir_rs_finalize(&mut store, txn, true).unwrap();
+        let slot = store.folded_slot(ws).unwrap().unwrap();
+
+        let (ids, flags, (src, _), txn) = ptir_rs_prepare(&mut store, ws).unwrap();
+        assert_eq!(ids, vec![slot.0]);
+        assert_eq!(flags, vec![0]);
+        assert!(src.is_empty());
+        ptir_rs_finalize(&mut store, txn, true).unwrap();
+    }
+
+    #[test]
+    fn forked_fire_copies_the_folded_state() {
+        let mut store = RsStore::new(4);
+        let ws = store.create_working_set(geom());
+        let (_, _, _, txn) = ptir_rs_prepare(&mut store, ws).unwrap();
+        ptir_rs_finalize(&mut store, txn, true).unwrap();
+        let shared = store.folded_slot(ws).unwrap().unwrap();
+
+        let forked = store.fork(ws).unwrap();
+        let (ids, flags, (src, dst), txn) = ptir_rs_prepare(&mut store, forked).unwrap();
+        assert_eq!(src, vec![shared.0]);
+        assert_eq!(dst, ids);
+        assert_eq!(flags, vec![0]); // copied, not reset
+        ptir_rs_finalize(&mut store, txn, true).unwrap();
+        assert_eq!(store.folded_slot(ws).unwrap(), Some(shared));
+        assert_ne!(store.folded_slot(forked).unwrap(), Some(shared));
+    }
+
+    #[test]
+    fn failed_fire_keeps_prior_state() {
+        let mut store = RsStore::new(2);
+        let ws = store.create_working_set(geom());
+        let (_, _, _, txn) = ptir_rs_prepare(&mut store, ws).unwrap();
+        ptir_rs_finalize(&mut store, txn, false).unwrap();
+        assert_eq!(store.folded_slot(ws).unwrap(), None);
+        assert_eq!(store.available_slots(), 2);
     }
 }

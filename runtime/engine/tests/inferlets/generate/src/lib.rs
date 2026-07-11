@@ -79,8 +79,8 @@ async fn main(input: String) -> Result<String> {
     });
 
     let prefill = Pipeline::new();
-    prefill
-        .submit(fwd_p)
+    fwd_p
+        .submit(&prefill)
         .map_err(|e| format!("prefill submit: {e}"))?;
     let g0 = g0_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?[0];
     prefill.close();
@@ -125,8 +125,7 @@ async fn main(input: String) -> Result<String> {
 
         let decode = Pipeline::new();
         for step in 1..max_tokens {
-            decode
-                .submit(fwd)
+            fwd.submit(&decode)
                 .map_err(|e| format!("decode submit @{step}: {e}"))?;
             let t = out
                 .take()

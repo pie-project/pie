@@ -86,7 +86,7 @@ async fn main(input: String) -> Result<String> {
     let seed_tok = *prompt.last().unwrap() as i32;
 
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    ws.alloc(1).map_err(|e| format!("ws.alloc: {e}"))?;
+    ws.reserve(1).map_err(|e| format!("ws.reserve: {e}"))?;
 
     // Channels: tok_in is the device loop-carried token (seeded; each fire's
     // embed takes it, the epilogue re-puts the constrained pick); gmask is the
@@ -130,8 +130,8 @@ async fn main(input: String) -> Result<String> {
             .collect();
 
         gmask.put(mask_bool);
-        pipeline
-            .submit(fwd)
+        fwd
+            .submit(&pipeline)
             .map_err(|e| format!("submit @{step}: {e}"))?;
         let token = tok_out
             .take()

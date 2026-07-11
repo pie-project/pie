@@ -677,6 +677,18 @@ impl ChannelCell {
 /// container's channel `i`).
 pub type BoundCells = Vec<Arc<Mutex<ChannelCell>>>;
 
+/// The next host-known Writer value on `cell` — the native value the driver
+/// will pull for the next fire (`None`: not a Writer channel, nothing
+/// staged, or the value is no longer host-known). The canonical-KV fire
+/// gate reads the embed/kv-len values through this.
+pub fn staged_put_bytes(cell: &Arc<Mutex<ChannelCell>>) -> Option<Vec<u8>> {
+    let c = cell.lock().unwrap();
+    if c.role != Some(HostRole::Writer) {
+        return None;
+    }
+    c.staged.front().cloned()
+}
+
 pub fn reserve_reader_capacity(cells: &BoundCells) -> Result<(), ChannelError> {
     let mut reserved: Vec<Arc<Mutex<ChannelCell>>> = Vec::new();
     for cell_arc in cells {

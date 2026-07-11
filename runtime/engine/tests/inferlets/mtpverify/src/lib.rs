@@ -92,8 +92,8 @@ fn verify_window(
         .collect();
 
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    ws.alloc(n.div_ceil(PAGE_T))
-        .map_err(|e| format!("ws.alloc: {e}"))?;
+    ws.reserve(n.div_ceil(PAGE_T))
+        .map_err(|e| format!("ws.reserve: {e}"))?;
 
     // Seeded inputs (single fire: the host geometry prefill reads seeds) + the
     // terminal [k]-Token reader output.
@@ -129,7 +129,7 @@ fn verify_window(
     });
 
     let pipeline = Pipeline::new();
-    pipeline.submit(fwd).map_err(|e| format!("submit: {e}"))?;
+    fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
     let raw = out
         .take()
         .get::<i32>()

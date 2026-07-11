@@ -62,19 +62,23 @@ class PtirDispatch {
         const pie_native::LaunchView& view,
         cudaStream_t execution_stream);
 
-    // W1.1 PRE-FORWARD descriptor resolution: for the request's device-geometry
-    // PTIR program (descriptor ports bind channels), decode + get-or-build the
-    // instance (applying seeds on its first fire) and read its port channels'
-    // current cells into `out` — the standard forward geometry the executor
-    // feeds into batch assembly INSTEAD of the (empty) wire geometry fields.
-    // Returns true iff a device-geometry program was resolved; false with an
-    // empty `*err` if the request carries no such program, or false with a
-    // non-empty `*err` if a descriptor channel is not ready (W1.6 — the executor
-    // must fail the fire; the runtime's poison plumbing surfaces it to the guest).
+    // W1.1 PRE-FORWARD descriptor resolution, over EVERY device-geometry
+    // program in the batch: for each program whose trace is device-geometry
+    // (the runtime's `detect_device_geometry` mirror — WSlot/WOff write
+    // descriptors + a channel-bound [B, P>1] `Pages` port), read its port
+    // channels' current cells into `out.per_program[p]` and map the resolved
+    // WorkingSet-relative page references through the program's
+    // `kv_translation` segment. Wire (non-device-geometry) programs keep an
+    // empty per-program entry; the executor composes both kinds into one
+    // forward batch (`compose_forward_batch`). Each resolved geometry is
+    // validated independently. Returns true iff at least one device-geometry
+    // program was resolved; false with an empty `*err` if the batch carries
+    // none, or false with a non-empty `*err` on failure (not-ready descriptor
+    // channel (W1.6), bad geometry — the executor must fail the fire).
     bool resolve_descriptors(const pie_native::LaunchView& view,
                              std::uint32_t page_size,
                              std::uint32_t device_pages,
-                             FireGeometry& out,
+                             ResolvedPrograms& out,
                              std::string* err);
 
     struct Impl;

@@ -20,7 +20,7 @@ pub mod stats;
 
 use tokio::sync::oneshot;
 
-use crate::arena::PhysicalPageId;
+use crate::inference::paging::PhysicalPageId;
 use crate::driver::{DriverId, SchedulerLimits};
 use crate::service::{Service, ServiceHandler};
 use anyhow::Result;

@@ -28,8 +28,8 @@ use wasmtime_wasi::WasiView;
 
 use crate::api::pie;
 use crate::instance::InstanceState;
-use crate::working_set::kv::KvWorkingSet;
-use crate::working_set::rs::RsWorkingSet;
+use crate::store::kv::working_set::KvWorkingSet;
+use crate::store::rs::working_set::RsWorkingSet;
 
 use pie_ptir::container::HostRole;
 
@@ -121,10 +121,10 @@ pub struct PendingMove {
 /// "pin float bounded by run-ahead depth × B, riding the per-fire arena txns").
 enum FireKv {
     Kv(ptir_kv::PtirKvTxn),
-    DeviceGeom {
-        arena_txn: crate::arena::ArenaTxn,
-        write_txn: crate::working_set::kv::WriteTxnId,
-    },
+    /// A device-geometry fire's prepared write over the lease-granted slots
+    /// (B2's explicit-KV path): same commit/abort protocol, no host
+    /// projection.
+    DeviceGeom { kvtxn: ptir_kv::PtirKvTxn },
 }
 
 /// One in-flight PTIR fire: the driver completion plus everything needed to
@@ -194,6 +194,19 @@ pub struct ForwardPass {
     /// pages (`PageLease`) and delivers fresh grants on the program's fresh
     /// channel. Replaces the deleted host-replay beam branch.
     pub devgeo: Option<DevGeo>,
+    /// Bind-time half of the canonical-KV gate ([`canonical_kv_shape`]): this
+    /// pass CAN produce semantically hashable KV. Each fire additionally
+    /// passes the fire-time host-known gate ([`canonical_fire_evidence`]).
+    pub canonical_kv: bool,
+    /// The pass binds an `AttnMask` descriptor channel (dense device mask).
+    /// Its fires are marked mask-carrying on the launch plan so the
+    /// scheduler batches them SOLO — the composed multi-program batch does
+    /// not merge dense device masks (v1 scope).
+    pub dense_mask: bool,
+    /// Whether a fire of this pass has been submitted. The first fire
+    /// consumes channel seeds, so the fire-time gate's seed rule only
+    /// applies while this is false.
+    pub fired_once: bool,
 }
 
 /// A run-ahead submission pipeline (overview §3): the ORDERING domain (W3.1).
@@ -233,6 +246,11 @@ pub struct DevGeo {
     /// Dense channel index of the `w_cont` host-reader output ([B] bool) — read
     /// at finalize to reclaim continuing heirs' unused fresh pages.
     pub w_cont_dense: usize,
+    /// The program binds an `AttnMask` descriptor channel (dense per-cell
+    /// mask). Such fires are scheduled SOLO: the driver's composed
+    /// multi-program batch does not merge dense device masks with other
+    /// programs' geometry (v1 scope).
+    pub has_mask: bool,
 }
 
 /// Detect a device-geometry pass: its geometry ports (`WSlot`/`WOff` write
@@ -279,6 +297,109 @@ fn detect_device_geometry(
         c.host_role == HostRole::Reader && matches!(c.dtype, ChanDType::Concrete(DType::Bool))
     })?;
     Some((b, fresh_dense, w_cont_dense))
+}
+
+/// Bind-time half of the canonical-KV gate (kv_refact.md, "Token-Slot
+/// Hashes, Page Hashes, and Trie Matching"): the pass writes exactly what
+/// the vanilla model produces for one appended token run under full causal
+/// self-attention over the working set — so its KV rows may carry chained
+/// semantic hashes. Rejected by anything that can perturb K/V production:
+/// an attention mask or explicit positions (they change hidden states, hence
+/// KV at layers > 0), device geometry (inferlet-managed layout), per-layer
+/// stage programs (they can rewrite projections), extern channels, or
+/// multi-lane batching. Prologue/epilogue programs only shape sampling —
+/// grammar, watermarking, and sampler passes all stay canonical. A `KvLen`
+/// port must exist so the fire-time gate can verify the pass attends the
+/// FULL context (a shorter span changes upper-layer KV).
+fn canonical_kv_shape(container: &pie_ptir::container::TraceContainer) -> bool {
+    use pie_ptir::container::PortSource;
+    use pie_ptir::registry::{Port, Stage};
+
+    if !container.externs.is_empty() {
+        return false;
+    }
+    let mut has_kv_len = false;
+    for binding in &container.ports {
+        match binding.port {
+            Port::AttnMask
+            | Port::Positions
+            | Port::Pages
+            | Port::PageIndptr
+            | Port::WSlot
+            | Port::WOff => return false,
+            Port::KvLen => has_kv_len = true,
+            Port::EmbedIndptr => {
+                // Single lane only: a trace-const two-entry CSR from 0.
+                match &binding.source {
+                    PortSource::Const { data, .. } => {
+                        if data.len() != 8 || data[0..4] != [0u8; 4] {
+                            return false;
+                        }
+                    }
+                    PortSource::Channel(_) => return false,
+                }
+            }
+            _ => {}
+        }
+    }
+    has_kv_len
+        && !container
+            .stages
+            .iter()
+            .any(|s| matches!(s.stage, Stage::OnAttnProj | Stage::OnAttn))
+}
+
+fn decode_le_u32s(bytes: &[u8]) -> Option<Vec<u32>> {
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// The host-known u32 payload the channel bound at `port` consumes on THIS
+/// fire: a trace constant, the staged Writer put shipping with this fire, or
+/// (first fire only) the channel's seed. `None` = device-carried — the host
+/// cannot see the value, so the fire cannot hash canonically.
+fn host_known_port_u32s(p: &ForwardPass, port: pie_ptir::registry::Port) -> Option<Vec<u32>> {
+    use pie_ptir::container::PortSource;
+
+    let container = &p.instance.program.bound.container;
+    let binding = container.ports.iter().find(|b| b.port == port)?;
+    match &binding.source {
+        PortSource::Const { data, .. } => decode_le_u32s(data),
+        PortSource::Channel(c) => {
+            let dense = *c as usize;
+            if let Some(bytes) = super::ptir_channel_store::staged_put_bytes(p.cells.get(dense)?) {
+                return decode_le_u32s(&bytes);
+            }
+            if !p.fired_once && container.channels.get(dense).is_some_and(|d| d.seeded) {
+                let seed = p.instance.seeds.iter().find(|s| s.channel as usize == dense)?;
+                return decode_le_u32s(&seed.data);
+            }
+            None
+        }
+    }
+}
+
+/// Fire-time half of the canonical-KV gate: the host-verified token values
+/// this fire embeds plus the kv-len the pass claims to attend. `None` unless
+/// the bind-time shape passed and the embed value is host-known. The caller
+/// still verifies the token count against the fire geometry and
+/// `kv_len == committed + new` (full-context attention) before hashing.
+fn canonical_fire_evidence(p: &ForwardPass) -> Option<(Vec<u32>, Option<u32>)> {
+    use pie_ptir::registry::Port;
+
+    if !p.canonical_kv {
+        return None;
+    }
+    let tokens = host_known_port_u32s(p, Port::EmbedTokens)?;
+    let kv_len = host_known_port_u32s(p, Port::KvLen).and_then(|v| v.first().copied());
+    Some((tokens, kv_len))
 }
 
 type Anyhow<T> = anyhow::Result<T>;
@@ -551,18 +672,28 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
             let devgeo = match detect_device_geometry(&prog.bound.container) {
                 Some((b, fresh_dense, w_cont_dense)) => {
                     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-                    let seed_pages = match self.ctx().table.get_mut(&ws_res)?.alloc_slots(b as u32)
-                    {
-                        Ok(ids) => ids,
+                    let ws = *self.ctx().table.get(&ws_res)?;
+                    let stores = crate::store::registry::get(ws.model, ws.driver as usize);
+                    let reserved = stores.kv.lock().unwrap().reserve(ws.id, b as u64);
+                    let seed_pages: Vec<u32> = match reserved {
+                        Ok(range) => (range.start as u32..range.end as u32).collect(),
                         Err(e) => return Ok(Err(format!("ptir: device-geometry seed alloc: {e}"))),
                     };
                     let mut lease = PageLease::new(b);
                     lease.seed(seed_pages);
+                    let has_mask = prog.bound.container.ports.iter().any(|p| {
+                        matches!(p.port, pie_ptir::registry::Port::AttnMask)
+                            && matches!(
+                                p.source,
+                                pie_ptir::container::PortSource::Channel(_)
+                            )
+                    });
                     Some(DevGeo {
                         lease,
                         b,
                         fresh_dense,
                         w_cont_dense,
+                        has_mask,
                     })
                 }
                 None => None,
@@ -716,6 +847,11 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
                     return Ok(Err(format!("ptir: writer staging flush: {error}")));
                 }
             }
+            let canonical_kv = canonical_kv_shape(&instance.program.bound.container);
+            let dense_mask = instance.program.bound.container.ports.iter().any(|p| {
+                matches!(p.port, pie_ptir::registry::Port::AttnMask)
+                    && matches!(p.source, pie_ptir::container::PortSource::Channel(_))
+            });
             let res = self.ctx().table.push(ForwardPass {
                 instance,
                 bound_instance,
@@ -728,6 +864,9 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
                 committed_tokens: 0,
                 failed: None,
                 devgeo,
+                canonical_kv,
+                dense_mask,
+                fired_once: false,
             })?;
             Ok(Ok(res))
         }
@@ -753,29 +892,34 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
         for cell in &pass.cells {
             cell.lock().unwrap().detach(pass.bound_instance.instance_id);
         }
-        // Device-geometry: reclaim EVERY leased physical page (all in-flight
-        // grants + the fire-0 seed) back to the working set on pass drop.
+        // Device-geometry: leased slots are logical reserve indexes in the
+        // store model. Unwritten grants hold no physical memory (reserve is
+        // logical); written grants are committed pages that stay mapped until
+        // the working set itself is discarded or dropped — discarding them
+        // here would shift the surviving indexes under other passes bound to
+        // the same working set, so the pass drop intentionally leaves the
+        // mapping alone.
         if let Some(devgeo) = pass.devgeo.as_mut() {
-            let freed = devgeo.lease.reclaim_all();
-            if !freed.is_empty() {
-                let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(pass.kv_ws);
-                if let Ok(ws) = self.ctx().table.get(&ws_res) {
-                    let (m, d) = ws.device();
-                    let arena_arc = crate::arena::get(m, d);
-                    let cas_arc = crate::working_set::kv_cas::get(m, d);
-                    let mut arena = arena_arc.lock().unwrap();
-                    let mut cas = cas_arc.lock().unwrap();
-                    if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
-                        let _ = ws.free_slots(&freed, &mut arena, &mut cas);
-                    }
-                }
-            }
+            let _ = devgeo.lease.reclaim_all();
         }
         Ok(())
     }
+
+    /// Run-ahead submit on `on`: prepare + fire + enqueue, NO await. See the
+    /// module docs; errors after this call surface via channel poison +
+    /// `take`.
+    async fn submit(
+        &mut self,
+        this: Resource<ForwardPass>,
+        on: Resource<Pipeline>,
+    ) -> Anyhow<Result<(), String>> {
+        self.submit_pass(on, this).await
+    }
 }
 
-impl pie::inferlet::forward::HostPipeline for InstanceState {
+impl pie::inferlet::pipeline::Host for InstanceState {}
+
+impl pie::inferlet::pipeline::HostPipeline for InstanceState {
     async fn new(&mut self) -> Anyhow<Resource<Pipeline>> {
         Ok(self.ctx().table.push(Pipeline {
             fires: Arc::new(Mutex::new(VecDeque::new())),
@@ -783,9 +927,18 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
         })?)
     }
 
-    /// Run-ahead submit: prepare + fire + enqueue, NO await. See the module
-    /// docs; errors after this call surface via channel poison + `take`.
-    async fn submit(
+    async fn close(&mut self, this: Resource<Pipeline>) -> Anyhow<()> {
+        self.pipeline_close(this).await
+    }
+
+    async fn drop(&mut self, this: Resource<Pipeline>) -> Anyhow<()> {
+        self.pipeline_drop(this).await
+    }
+}
+
+impl InstanceState {
+    /// The body behind `forward-pass.submit(on)`.
+    pub(crate) async fn submit_pass(
         &mut self,
         this: Resource<Pipeline>,
         fwd: Resource<ForwardPass>,
@@ -816,7 +969,18 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             if let Err(error) = self.wire_channels_to_pipeline(&fwd, &pipe_fires)? {
                 return Ok(Err(error));
             }
-            let (geometry, cells, ws_rep, rs_rep, committed_tokens, fwd_rep, instance_id, completion) = {
+            let (
+                geometry,
+                cells,
+                ws_rep,
+                rs_rep,
+                committed_tokens,
+                fwd_rep,
+                instance_id,
+                completion,
+                canonical_evidence,
+                dense_mask,
+            ) = {
                 let p = self.ctx().table.get_mut(&fwd)?;
                 if let Some(e) = &p.failed {
                     return Ok(Err(format!(
@@ -833,51 +997,207 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
                     fwd.rep(),
                     p.bound_instance.instance_id,
                     p.bound_instance.reserve_completion(),
+                    canonical_fire_evidence(p),
+                    p.dense_mask,
                 )
             };
             let mut req = crate::driver::LaunchPlan::default();
             if let Some(g) = &geometry {
                 g.apply_to(&mut req);
             }
-            // Project the guest-owned KV working set for this fire via `ptir_kv`
-            // (alpha's ws-alloc + arena-txn + project_kv lifecycle). The held
-            // `PtirKvTxn` rides the PendingFire across the async fire; finalized
-            // (commit → KV persists / abort → revert) when a take/read/drop
-            // drains it.
+            // A dense device mask (AttnMask channel) marks the fire
+            // mask-carrying: the scheduler batches it SOLO (the composed
+            // multi-program batch does not merge dense device masks — v1
+            // scope).
+            req.has_user_mask = dense_mask;
+            // Prepare the guest-owned KV working set for this fire via
+            // `ptir_kv` over the typed KvStore (reserve growth + fresh /
+            // in-place / CoW classification + geometry projection). The held
+            // `PtirKvTxn` rides the PendingFire across the async fire;
+            // finalized (commit → mapping publishes / abort → pending slots
+            // release) when a take/read/drop drains it.
             let new_tokens: Vec<u32> = req.token_ids.clone();
-            let page_size = crate::working_set::page_size::tokens_per_page(0);
+            // Canonical gate, fire-time half: hash under the host-verified
+            // token values only when they cover exactly this fire's embed
+            // AND the pass attends the FULL context. Anything else (device-
+            // carried decode tokens, partial/unknown kv-len) hashes opaque.
+            let hash_tokens: Option<Vec<u32>> = canonical_evidence.and_then(|(toks, kv_len)| {
+                (toks.len() == new_tokens.len()
+                    && kv_len == Some(committed_tokens + new_tokens.len() as u32))
+                .then_some(toks)
+            });
             let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-            let arena_arc = crate::arena::get(0, 0);
-            let prepared = {
-                let mut arena = arena_arc.lock().unwrap();
-                let ws = self.ctx().table.get_mut(&ws_res)?;
-                ptir_kv::ptir_kv_prepare(ws, committed_tokens, &new_tokens, &mut arena, page_size)
+            let ws = *self.ctx().table.get(&ws_res)?;
+            let stores = crate::store::registry::get(ws.model, ws.driver as usize);
+            let pid = self.id();
+
+            // A pass's optimistic cursor covers only ITS OWN pending fires;
+            // ANOTHER pass may have committed into the same working set
+            // before this pass's first fire (a prefill pass feeding a decode
+            // pass is the norm). Floor the cursor by the store's published
+            // extent so prepare appends after the real committed content
+            // instead of re-writing (CoW-forking) published slots. The
+            // cursor stays authoritative when it runs AHEAD (this pass's
+            // in-flight fires).
+            let committed_tokens = {
+                let kv = stores.kv.lock().unwrap();
+                committed_tokens.max(
+                    kv.committed_token_len(ws.id, ws.page_size).unwrap_or(0) as u32,
+                )
             };
-            let (proj, move_plans, kvtxn) = match prepared {
-                Ok(v) => v,
-                Err(e) => return Ok(Err(format!("ptir: kv prepare: {e}"))),
+
+            // Run-ahead can outpace finalization under the direct plane: the
+            // ring delivers a fire's value BEFORE its completion retires the
+            // txn that publishes its pages, so the guest's next submit may
+            // arrive while the flat table still lacks the context. Prepare
+            // projects the committed context from the PUBLISHED mapping, so
+            // drain pending fires (FIFO order — awaits their completions)
+            // until it covers the cursor. Bounded by run-ahead depth; only
+            // fires that crossed an unpublished page boundary wait.
+            while committed_tokens as u64 > {
+                let kv = stores.kv.lock().unwrap();
+                kv.committed_token_len(ws.id, ws.page_size).unwrap_or(0)
+            } {
+                let op = pipe_fires.lock().unwrap().pop_front();
+                match op {
+                    Some(op) => self.finalize_op(op).await?,
+                    None => break,
+                }
+            }
+
+            // ── Prefix-cache graft (kv_refact.md, the matching consumer) ──
+            // First canonical fire of a FRESH working set: probe the CAS for
+            // the longest cached full-page prefix of this fire's embed, adopt
+            // it (structurally shared pages — writes CoW like any shared
+            // path), and TRIM the launch to the uncached suffix. A pure
+            // execution-strategy swap, invisible to the guest: the total
+            // attended context (KvLen) is unchanged, the kv projection covers
+            // the full context from the store, sampled rows keep their
+            // identity (shifted to the computed suffix), and the chain state
+            // continues from the boundary hash — so the launch is
+            // indistinguishable from a continuation fire over `kts` committed
+            // tokens. Any miss or ineligible shape falls through to the full
+            // computation.
+            let (committed_tokens, new_tokens, hash_tokens) = {
+                let mut committed = committed_tokens;
+                let mut toks_new = new_tokens;
+                let mut toks_hash = hash_tokens;
+                let n = toks_new.len();
+                // Eligible: nothing committed yet, host-verified tokens for
+                // the whole embed, and the exact single-lane canonical shape.
+                let eligible = committed == 0
+                    && n > 1
+                    && req.qo_indptr == [0, n as u32]
+                    && req.position_ids.len() == n
+                    && req.sampling_indices.iter().all(|&s| (s as usize) < n);
+                if eligible {
+                    if let Some(toks) = toks_hash.as_deref() {
+                        // A sampled row must stay in the computed suffix: cap
+                        // the probe so no adopted page covers one.
+                        let min_sample = req
+                            .sampling_indices
+                            .iter()
+                            .copied()
+                            .min()
+                            .map(|s| s as usize)
+                            .unwrap_or(usize::MAX);
+                        let cap = n.min(min_sample.saturating_add(1));
+                        let adopted = {
+                            let mut kv = stores.kv.lock().unwrap();
+                            ptir_kv::ptir_kv_match_prefix(
+                                &mut kv,
+                                ws.id,
+                                &toks[..cap],
+                                ws.page_size,
+                            )
+                        };
+                        match adopted {
+                            Ok(Some(pages)) if pages > 0 => {
+                                let kts = pages as usize * ws.page_size as usize;
+                                debug_assert!(kts < n && kts <= min_sample);
+                                req.token_ids.drain(..kts);
+                                req.position_ids.drain(..kts);
+                                req.qo_indptr = vec![0, (n - kts) as u32];
+                                for s in &mut req.sampling_indices {
+                                    *s -= kts as u32;
+                                }
+                                toks_new.drain(..kts);
+                                toks_hash = toks_hash.map(|t| t[kts..].to_vec());
+                                committed = kts as u32;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::debug!("ptir prefix-cache probe miss: {e}");
+                            }
+                        }
+                    }
+                }
+                (committed, toks_new, toks_hash)
+            };
+
+            let (proj, (kv_copy_src, kv_copy_dst), kv_translation, kvtxn) = loop {
+                let prepared = {
+                    let mut kv = stores.kv.lock().unwrap();
+                    ptir_kv::ptir_kv_prepare(
+                        &mut kv,
+                        ws.id,
+                        committed_tokens,
+                        &new_tokens,
+                        ws.page_size,
+                        hash_tokens.as_deref(),
+                    )
+                }; // kv lock dropped before any contention await below
+                match prepared {
+                    Ok(v) => break v,
+                    Err(e @ ptir_kv::PtirKvError::OutOfPages { requested, .. }) => {
+                        // Contention ladder (kv_refact.md Scheduler): the
+                        // orchestrator drops idle cache leases, then waits
+                        // FIFO for frees (FCFS-preempting when a victim
+                        // backend is live); on Ok the prepare RETRIES. No
+                        // orchestrator wired (default Error mode) ⇒ still
+                        // run rung 1 inline — auto-retained prefix caches
+                        // must never surface as guest OOM — then error.
+                        let Some(orch) = crate::inference::contention::contention() else {
+                            let freed = {
+                                let mut kv = stores.kv.lock().unwrap();
+                                let epoch = kv.current_epoch();
+                                let freed = kv.drop_unused_cache_leases(epoch);
+                                kv.retire_idle();
+                                freed
+                            };
+                            if freed > 0 {
+                                continue;
+                            }
+                            return Ok(Err(format!("ptir: kv prepare: {e}")));
+                        };
+                        if let Err(hard) = orch.acquire(pid, requested as u32).await {
+                            return Ok(Err(format!("ptir: kv prepare: {hard}")));
+                        }
+                    }
+                    Err(e) => return Ok(Err(format!("ptir: kv prepare: {e}"))),
+                }
             };
             let next_committed = kvtxn.committed_tokens_after;
 
             // The recurrent-state slot for hybrid / linear-attention models
             // (GDN, Mamba2): fresh RESET slab on the first fire, CoW-continue
-            // after — mirrors `execute_impl`'s rs block via `ptir_rs`.
+            // after.
             let rstxn = if let Some(rs_rep) = rs_rep {
                 let rs_res: Resource<RsWorkingSet> = Resource::new_borrow(rs_rep);
+                let rs = *self.ctx().table.get(&rs_res)?;
                 let prepared = {
-                    let mut arena = arena_arc.lock().unwrap();
-                    let rs = self.ctx().table.get_mut(&rs_res)?;
-                    ptir_rs::ptir_rs_prepare(rs, &mut arena)
+                    let mut rs_store = stores.rs.lock().unwrap();
+                    ptir_rs::ptir_rs_prepare(&mut rs_store, rs.id)
                 };
                 match prepared {
-                    Ok((rs_slot_ids, rs_slot_flags, cow_move, txn)) => {
+                    Ok((rs_slot_ids, rs_slot_flags, (rs_copy_src, rs_copy_dst), txn)) => {
                         req.rs_slot_ids = rs_slot_ids;
                         req.rs_slot_flags = rs_slot_flags;
-                        if let Some(mp) = &cow_move {
+                        if !rs_copy_src.is_empty() {
                             // The copy rides the pipeline FIFO (D4): an
                             // asynchronous failure poisons the pipeline
                             // failure domain instead of vanishing in a log.
-                            match crate::driver::copy_d2d(0, &mp.from, &mp.to) {
+                            match crate::driver::copy_d2d(0, &rs_copy_src, &rs_copy_dst) {
                                 Ok(move_completion) => {
                                     pipe_fires.lock().unwrap().push_back(PendingOp::Move(
                                         PendingMove {
@@ -894,14 +1214,9 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
                         Some(txn)
                     }
                     Err(e) => {
-                        // Revert the KV txn we already opened for this fire.
-                        let mut arena = arena_arc.lock().unwrap();
-                        match self.ctx().table.get_mut(&ws_res) {
-                            Ok(ws) => {
-                                let _ = ptir_kv::ptir_kv_finalize(ws, &mut arena, kvtxn, false);
-                            }
-                            Err(_) => ptir_kv::ptir_kv_abandon(&mut arena, kvtxn),
-                        }
+                        // Revert the KV write we already prepared for this fire.
+                        let mut kv = stores.kv.lock().unwrap();
+                        let _ = ptir_kv::ptir_kv_finalize(&mut kv, kvtxn, false);
                         return Ok(Err(format!("ptir: rs prepare: {e}")));
                     }
                 }
@@ -909,12 +1224,17 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
                 None
             };
 
-            // D2D-copy every CoW'd write target before the fire (empty for the
+            // WorkingSet page translation for this fire: the driver maps any
+            // channel-resolved `Pages`/`WSlot` reference (guest-held relative
+            // indexes) through it (kv_refact.md flattened-table model).
+            req.kv_translation = kv_translation;
+
+            // D2D-copy the CoW-preserved pages before the fire (empty for the
             // single-context pipeline; non-empty only under a forked/shared
-            // page). Each copy rides the pipeline FIFO (D4) so an asynchronous
+            // tail). The copy rides the pipeline FIFO (D4) so an asynchronous
             // failure poisons the pipeline failure domain.
-            for mp in &move_plans {
-                match crate::driver::copy_d2d(0, &mp.from, &mp.to) {
+            if !kv_copy_src.is_empty() {
+                match crate::driver::copy_d2d(0, &kv_copy_src, &kv_copy_dst) {
                     Ok(move_completion) => {
                         pipe_fires
                             .lock()
@@ -954,24 +1274,14 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
                     rollback_reader_capacity(&cells);
                 }
                 let reason = format!("ptir: submit failed: {error}");
-                let mut arena = arena_arc.lock().unwrap();
-                match self.ctx().table.get_mut(&ws_res) {
-                    Ok(ws) => {
-                        let _ = ptir_kv::ptir_kv_finalize(ws, &mut arena, kvtxn, false);
-                    }
-                    Err(_) => ptir_kv::ptir_kv_abandon(&mut arena, kvtxn),
+                {
+                    let mut kv = stores.kv.lock().unwrap();
+                    let _ = ptir_kv::ptir_kv_finalize(&mut kv, kvtxn, false);
                 }
                 if let Some(rstxn) = rstxn {
-                    let rs_res: Resource<RsWorkingSet> =
-                        Resource::new_borrow(rs_rep.expect("rs txn implies rs rep"));
-                    match self.ctx().table.get_mut(&rs_res) {
-                        Ok(rs) => {
-                            let _ = ptir_rs::ptir_rs_finalize(rs, &mut arena, rstxn, false);
-                        }
-                        Err(_) => ptir_rs::ptir_rs_abandon(&mut arena, rstxn),
-                    }
+                    let mut rs_store = stores.rs.lock().unwrap();
+                    let _ = ptir_rs::ptir_rs_finalize(&mut rs_store, rstxn, false);
                 }
-                drop(arena);
                 self.ctx().table.get_mut(&fwd)?.failed = Some(reason.clone());
                 return Ok(Err(reason));
             }
@@ -979,7 +1289,11 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             // Optimistic cursor advance: the NEXT submit prepares against this
             // fire's post-state (the run-ahead overlap). A failed fire fails
             // the pass instead of rewinding.
-            self.ctx().table.get_mut(&fwd)?.committed_tokens = next_committed;
+            {
+                let p = self.ctx().table.get_mut(&fwd)?;
+                p.committed_tokens = next_committed;
+                p.fired_once = true; // seeds are consumed; the seed rule is off
+            }
 
             pipe_fires
                 .lock()
@@ -1009,10 +1323,10 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
     /// physical page ids directly), so they pass straight through to the move — the
     /// wire / kernel operate on exactly the physical pages the fires read/write.
     /// The guest computed the post-move layout itself, so no result is taken.
-    async fn copy_into(
+    pub(crate) async fn copy_into_inner(
         &mut self,
         this: Resource<Pipeline>,
-        _ws: Resource<KvWorkingSet>,
+        ws: Resource<KvWorkingSet>,
         dst_page_ids: Vec<u32>,
         dst_tok_idx: Vec<u32>,
         src_page_ids: Vec<u32>,
@@ -1033,16 +1347,33 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
             return Ok(Ok(()));
         }
 
-        // Design B works in PHYSICAL page ids directly: the guest's `pool.ids()`
-        // are the physical KV block ids it binds straight to the `Pages` and
-        // `WSlot` ports (no `slot_to_block` resolution — the fire/executor consume
-        // them as-is; `launch_resolve_slot_to_block` is unwired). `copy_into` must
-        // address cells the SAME way, so the move lands on exactly the physical
-        // pages the fires read/write. Resolving through `slot_to_block_table` here
-        // (as an earlier draft did) sent the move to a DIFFERENT physical page than
-        // the fire attended, so the moved cell was never read — pass through.
-        let kv_move_dst_pages: Vec<u32> = dst_page_ids;
-        let kv_move_src_pages: Vec<u32> = src_page_ids;
+        // The WIT contract passes WorkingSet-RELATIVE page indexes (guests
+        // never hold physical ids); translate through the flattened table so
+        // the move lands on exactly the physical pages the fires read/write.
+        // Translated at enqueue against the committed mapping: same-WS
+        // in-flight fires that could remap these pages (a CoW rebase) are the
+        // guest's ordering hazard, like any same-WS run-ahead write overlap.
+        let (kv_move_dst_pages, kv_move_src_pages): (Vec<u32>, Vec<u32>) = {
+            let ws = *self.ctx().table.get(&ws)?;
+            let stores = crate::store::registry::get(ws.model, ws.driver as usize);
+            let mut kv = stores.kv.lock().unwrap();
+            let (_, flat) = kv
+                .flat_table(ws.id)
+                .map_err(|e| anyhow::anyhow!("copy_into flat table: {e}"))?;
+            let translate = |ids: &[u32]| -> Result<Vec<u32>, String> {
+                ids.iter()
+                    .map(|&i| {
+                        flat.get(i as usize).map(|p| p.0).ok_or_else(|| {
+                            format!("copy_into: page index {i} beyond the mapped extent")
+                        })
+                    })
+                    .collect()
+            };
+            match (translate(&dst_page_ids), translate(&src_page_ids)) {
+                (Ok(d), Ok(s)) => (d, s),
+                (Err(e), _) | (_, Err(e)) => return Ok(Err(e)),
+            }
+        };
 
         // Point this pipeline's FIFO at the move so a later `take`/`read` on any
         // channel fed by this pipeline drains it in submit order.
@@ -1081,10 +1412,10 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
         Ok(Ok(()))
     }
 
-    async fn close(&mut self, this: Resource<Pipeline>) -> Anyhow<()> {
+    pub(crate) async fn pipeline_close(&mut self, this: Resource<Pipeline>) -> Anyhow<()> {
         // Signal no further submissions: drain the pipeline's in-flight FIFO so
-        // its fires' KV/RS txns (arena pins) finalize before the pipeline goes
-        // away (the pin-safety drain follows the FIFO now — W3.1).
+        // its fires' prepared KV/RS writes (snapshot pins) finalize before the
+        // pipeline goes away (the pin-safety drain follows the FIFO — W3.1).
         let fires = self.ctx().table.get(&this).ok().map(|p| p.fires.clone());
         if let Some(fires) = fires {
             loop {
@@ -1100,11 +1431,11 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
         Ok(())
     }
 
-    async fn drop(&mut self, this: Resource<Pipeline>) -> Anyhow<()> {
+    pub(crate) async fn pipeline_drop(&mut self, this: Resource<Pipeline>) -> Anyhow<()> {
         // Drain the pipeline's in-flight FIFO before releasing it: each fire
-        // holds open KV/RS txns (arena pins) and the GPU may still be writing the
-        // pinned pages — await + finalize, never abandon mid-flight (W3.1: the
-        // pins-safety drain lives here now, not on the pass).
+        // holds a prepared KV/RS write (snapshot pins, pending slots) and the
+        // GPU may still be writing — await + finalize, never abandon
+        // mid-flight (W3.1: the pin-safety drain lives here, not on the pass).
         let fires = self.ctx().table.get(&this).ok().map(|p| p.fires.clone());
         if let Some(fires) = fires {
             loop {
@@ -1120,6 +1451,22 @@ impl pie::inferlet::forward::HostPipeline for InstanceState {
         self.ctx().table.delete(this)?;
         Ok(())
     }
+}
+
+/// The body behind `kv-working-set.copy-into(on, ...)` (called from
+/// `api::kv_working_set`): an ordered KV cell move on the pipeline FIFO.
+pub(crate) async fn working_set_copy_into(
+    state: &mut InstanceState,
+    ws: Resource<KvWorkingSet>,
+    on: Resource<Pipeline>,
+    dst_page_ids: Vec<u32>,
+    dst_tok_idx: Vec<u32>,
+    src_page_ids: Vec<u32>,
+    src_tok_idx: Vec<u32>,
+) -> Anyhow<Result<(), String>> {
+    state
+        .copy_into_inner(on, ws, dst_page_ids, dst_tok_idx, src_page_ids, src_tok_idx)
+        .await
 }
 
 impl InstanceState {
@@ -1192,44 +1539,28 @@ impl InstanceState {
         let success = result.is_ok() && prior_failure.is_none();
 
         {
-            let arena_arc = crate::arena::get(0, 0);
-            let mut arena = arena_arc.lock().unwrap();
-            let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
+            // Single-model, single-driver v1: fires are keyed to stores (0,0).
+            let _ = ws_rep;
+            let stores = crate::store::registry::get(0, 0);
             match kv {
-                FireKv::Kv(kvtxn) => match self.ctx().table.get_mut(&ws_res) {
-                    Ok(ws) => {
-                        let _ = ptir_kv::ptir_kv_finalize(ws, &mut arena, kvtxn, success);
-                    }
-                    Err(_) => ptir_kv::ptir_kv_abandon(&mut arena, kvtxn),
-                },
-                FireKv::DeviceGeom {
-                    arena_txn,
-                    write_txn,
-                } => {
-                    if success {
-                        let _ = arena.txn_commit(arena_txn);
-                    } else {
-                        arena.txn_abort(arena_txn);
-                    }
-                    if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
-                        if success {
-                            ws.commit_writes(write_txn);
-                        } else {
-                            ws.abort_writes(write_txn);
-                        }
-                    }
+                FireKv::Kv(kvtxn) | FireKv::DeviceGeom { kvtxn } => {
+                    let mut kv_store = stores.kv.lock().unwrap();
+                    let _ = ptir_kv::ptir_kv_finalize(&mut kv_store, kvtxn, success);
                 }
             }
             if let Some(rstxn) = rstxn {
-                let rs_res: Resource<RsWorkingSet> =
-                    Resource::new_borrow(rs_rep.expect("rs txn implies rs rep"));
-                match self.ctx().table.get_mut(&rs_res) {
-                    Ok(rs) => {
-                        let _ = ptir_rs::ptir_rs_finalize(rs, &mut arena, rstxn, success);
-                    }
-                    Err(_) => ptir_rs::ptir_rs_abandon(&mut arena, rstxn),
-                }
+                let _ = rs_rep;
+                let mut rs_store = stores.rs.lock().unwrap();
+                let _ = ptir_rs::ptir_rs_finalize(&mut rs_store, rstxn, success);
             }
+        } // store locks released before the contention drain re-locks pools
+
+        // The fire's sequence retired: recycled slots (aborts, CoW'd tails,
+        // collected suffixes) are allocatable now — wake parked allocators
+        // and drain-gated lanes.
+        if let Some(orch) = crate::inference::contention::contention() {
+            orch.on_blocks_freed();
+            orch.on_fire_retired();
         }
 
         if let Some(reason) = prior_failure {
@@ -1309,14 +1640,24 @@ impl InstanceState {
             return Ok(Err(e));
         }
 
-        let page_size = crate::working_set::page_size::tokens_per_page(0);
         let ws_rep = self.ctx().table.get(&fwd)?.kv_ws;
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-        let arena_arc = crate::arena::get(0, 0);
+        let ws = *self.ctx().table.get(&ws_res)?;
+        let page_size = ws.page_size;
+        let stores = crate::store::registry::get(ws.model, ws.driver as usize);
 
-        // Grant B fresh physical pages, materializing + pinning them under one
-        // write/arena txn (no borrow held across submit).
-        let (completion, instance_id, cells, fwd_rep, arena_txn, write_txn, phys_pages) = {
+        // Grant B pages, allocating their physical backing under one prepared
+        // write (no borrow held across submit).
+        let (
+            completion,
+            instance_id,
+            cells,
+            fwd_rep,
+            kvtxn,
+            kv_translation,
+            wire_pages,
+            dense_mask,
+        ) = {
             // Fail-fast.
             {
                 let p = self.ctx().table.get_mut(&fwd)?;
@@ -1327,8 +1668,8 @@ impl InstanceState {
                 }
             }
 
-            // Take the DevGeo out so the lease grant can borrow the ws (distinct
-            // table resources can't be borrowed mutably at once).
+            // Take the DevGeo out so the lease grant can use the store
+            // (distinct table resources can't be borrowed mutably at once).
             let mut devgeo = self
                 .ctx()
                 .table
@@ -1337,69 +1678,92 @@ impl InstanceState {
                 .take()
                 .expect("fire_device_geometry on a non-device-geometry pass");
 
-            let wtx = self.ctx().table.get_mut(&ws_res)?.begin_write_txn();
-            let mut arena = arena_arc.lock().unwrap();
-            let mut txn = arena.txn_begin();
-
-            // Grant B fresh pages (free-list first, then a fresh ws slot), then
-            // materialize + pin each so the driver's explicit-KV write (B2) lands
-            // on a live, un-evictable physical page.
+            // Grant B slots: lease free-list first, then fresh logical
+            // reserves. Purely logical — this can never exhaust the pool, so
+            // it runs ONCE; only the physical prepare below retries under
+            // contention.
             let grant_slots = {
-                let ws = self.ctx().table.get_mut(&ws_res)?;
+                let mut kv = stores.kv.lock().unwrap();
                 devgeo.lease.grant(|| {
-                    ws.alloc_slots(1)
-                        .ok()
-                        .and_then(|v| v.into_iter().next())
-                        .unwrap_or(0)
+                    kv.reserve(ws.id, 1).map(|r| r.start as u32).unwrap_or(0)
                 })
             };
-            let mut phys_pages: Vec<u32> = Vec::with_capacity(grant_slots.len());
-            let mut grant_err: Option<String> = None;
-            for &slot in &grant_slots {
-                let ws = match self.ctx().table.get_mut(&ws_res) {
-                    Ok(ws) => ws,
-                    Err(e) => {
-                        grant_err = Some(format!("ptir: device-geometry ws: {e}"));
-                        break;
+            let pid = self.id();
+            let (pages, (copy_src, copy_dst), kv_translation, kvtxn) = loop {
+                let prepared = {
+                    let mut kv = stores.kv.lock().unwrap();
+                    // One prepared write covers the grants plus any unwritten
+                    // gap up to the mapped end (left by an aborted earlier
+                    // fire), so fresh publication stays contiguous. The gap
+                    // is recomputed per attempt: a parked retry may resume
+                    // after another of this pass's fires committed.
+                    let mapped = kv.mapped_len(ws.id).unwrap_or(0);
+                    let mut write_indexes: Vec<u64> =
+                        grant_slots.iter().map(|&s| s as u64).collect();
+                    if let Some(max_fresh) = write_indexes
+                        .iter()
+                        .copied()
+                        .filter(|&i| i >= mapped)
+                        .max()
+                    {
+                        write_indexes.extend(mapped..max_fresh);
                     }
-                };
-                match ws.cow_write_slot(wtx, slot, &mut txn, &mut arena) {
-                    Ok((obj, _)) => {
-                        if let Err(e) = arena.txn_pin(&mut txn, obj) {
-                            grant_err = Some(format!("ptir: device-geometry pin {slot}: {e}"));
-                            break;
-                        }
-                        match arena.blocks(obj) {
-                            Ok(bl) => phys_pages.push(bl[0]),
-                            Err(e) => {
-                                grant_err =
-                                    Some(format!("ptir: device-geometry blocks {slot}: {e}"));
-                                break;
+                    write_indexes.sort_unstable();
+                    write_indexes.dedup();
+                    ptir_kv::ptir_kv_prepare_explicit(&mut kv, ws.id, &write_indexes)
+                }; // kv lock dropped before any contention await below
+                match prepared {
+                    Ok(v) => break v,
+                    Err(e @ ptir_kv::PtirKvError::OutOfPages { requested, .. }) => {
+                        // Same contention-ladder seam as the host-geometry
+                        // path (see submit_pass), including the Error-mode
+                        // inline rung 1.
+                        let Some(orch) = crate::inference::contention::contention() else {
+                            let freed = {
+                                let mut kv = stores.kv.lock().unwrap();
+                                let epoch = kv.current_epoch();
+                                let freed = kv.drop_unused_cache_leases(epoch);
+                                kv.retire_idle();
+                                freed
+                            };
+                            if freed > 0 {
+                                continue;
                             }
+                            self.ctx().table.get_mut(&fwd)?.devgeo = Some(devgeo);
+                            return Ok(Err(format!("ptir: device-geometry grant: {e}")));
+                        };
+                        if let Err(hard) = orch.acquire(pid, requested as u32).await {
+                            self.ctx().table.get_mut(&fwd)?.devgeo = Some(devgeo);
+                            return Ok(Err(format!("ptir: device-geometry grant: {hard}")));
                         }
                     }
                     Err(e) => {
-                        grant_err = Some(format!("ptir: device-geometry grant slot {slot}: {e}"));
-                        break;
+                        self.ctx().table.get_mut(&fwd)?.devgeo = Some(devgeo);
+                        return Ok(Err(format!("ptir: device-geometry grant: {e}")));
                     }
                 }
+            };
+            if !copy_src.is_empty() {
+                if let Err(e) = crate::driver::copy_d2d(0, &copy_src, &copy_dst) {
+                    tracing::warn!("ptir device-geometry CoW d2d copy failed: {e:#}");
+                }
             }
-            if let Some(e) = grant_err {
-                arena.txn_abort(txn);
-                drop(arena);
-                self.ctx().table.get_mut(&ws_res)?.abort_writes(wtx);
-                self.ctx().table.get_mut(&fwd)?.devgeo = Some(devgeo);
-                return Ok(Err(e));
-            }
-            drop(arena);
-
+            // Wire page refs (scheduler capacity accounting): this fire's
+            // physical write targets.
+            let wire_pages: Vec<u32> = pages.iter().map(|&(_, dst)| dst).collect();
             // Deliver the fresh grant to the program as a direct put on its
             // `fresh` channel — a shared-ring write the driver pulls before
-            // the pass (plan §4.2/§4.3).
+            // the pass (plan §4.2/§4.3). The grants are WorkingSet-RELATIVE
+            // indexes — the program's in-graph geometry stays logical
+            // end-to-end and the driver translates its resolved
+            // `Pages`/`WSlot` values through `kv_translation` (which the
+            // prepared write above backs physically). This also matches the
+            // bind-time seed (`reserve(b)`), which was already logical.
             let fresh_dense = devgeo.fresh_dense;
+            let dense_mask = devgeo.has_mask;
             let fresh_error = {
                 let p = self.ctx().table.get_mut(&fwd)?;
-                let bytes: Vec<u8> = phys_pages.iter().flat_map(|s| s.to_le_bytes()).collect();
+                let bytes: Vec<u8> = grant_slots.iter().flat_map(|s| s.to_le_bytes()).collect();
                 let error = match p.cells.get(fresh_dense) {
                     Some(cell) => cell.lock().unwrap().put(bytes).err(),
                     None => Some(ChannelError::Empty),
@@ -1408,10 +1772,8 @@ impl InstanceState {
                 error
             };
             if let Some(error) = fresh_error {
-                arena_arc.lock().unwrap().txn_abort(txn);
-                if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
-                    ws.abort_writes(wtx);
-                }
+                let mut kv = stores.kv.lock().unwrap();
+                let _ = ptir_kv::ptir_kv_finalize(&mut kv, kvtxn, false);
                 return Ok(Err(format!(
                     "ptir: device-geometry fresh grant put: {error}"
                 )));
@@ -1424,14 +1786,20 @@ impl InstanceState {
                 p.bound_instance.instance_id,
                 p.cells.clone(),
                 fwd.rep(),
-                txn,
-                wtx,
-                phys_pages,
+                kvtxn,
+                kv_translation,
+                wire_pages,
+                dense_mask,
             )
         };
 
-        let req = crate::driver::LaunchPlan::default();
-        let last_page_len = phys_pages.last().map(|_| page_size).unwrap_or(0);
+        let mut req = crate::driver::LaunchPlan::default();
+        req.kv_translation = kv_translation;
+        // A dense device mask (AttnMask channel) marks the fire mask-carrying;
+        // the scheduler batches it SOLO (the composed multi-program batch
+        // does not merge dense device masks — v1 scope).
+        req.has_user_mask = dense_mask;
+        let last_page_len = wire_pages.last().map(|_| page_size).unwrap_or(0);
         let reserved = reserve_reader_capacity(&cells);
         let submit_error = match &reserved {
             Err(error) => Some(format!("channel reservation failed: {error}")),
@@ -1439,7 +1807,7 @@ impl InstanceState {
                 req,
                 0,
                 instance_id,
-                phys_pages,
+                wire_pages,
                 last_page_len,
                 Vec::new(),
                 completion.clone(),
@@ -1452,23 +1820,21 @@ impl InstanceState {
                 rollback_reader_capacity(&cells);
             }
             let reason = format!("ptir: device-geometry submit failed: {error}");
-            arena_arc.lock().unwrap().txn_abort(arena_txn);
-            if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
-                ws.abort_writes(write_txn);
+            {
+                let mut kv = stores.kv.lock().unwrap();
+                let _ = ptir_kv::ptir_kv_finalize(&mut kv, kvtxn, false);
             }
             self.ctx().table.get_mut(&fwd)?.failed = Some(reason.clone());
             return Ok(Err(reason));
         }
+        self.ctx().table.get_mut(&fwd)?.fired_once = true;
 
         pipe_fires
             .lock()
             .unwrap()
             .push_back(PendingOp::Fire(PendingFire {
                 completion,
-                kv: FireKv::DeviceGeom {
-                    arena_txn,
-                    write_txn,
-                },
+                kv: FireKv::DeviceGeom { kvtxn },
                 rstxn: None,
                 ws_rep,
                 rs_rep: None,
@@ -1541,21 +1907,11 @@ impl InstanceState {
             let reclaimed = devgeo.lease.reclaim_after_fire(&w_cont);
             (p.kv_ws, reclaimed)
         };
-        if !reclaimed.is_empty() {
-            let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-            let (m, d) = match self.ctx().table.get(&ws_res) {
-                Ok(ws) => ws.device(),
-                Err(_) => return,
-            };
-            // Lock order: arena → cas.
-            let arena_arc = crate::arena::get(m, d);
-            let cas_arc = crate::working_set::kv_cas::get(m, d);
-            let mut arena = arena_arc.lock().unwrap();
-            let mut cas = cas_arc.lock().unwrap();
-            if let Ok(ws) = self.ctx().table.get_mut(&ws_res) {
-                let _ = ws.free_slots(&reclaimed, &mut arena, &mut cas);
-            }
-        }
+        // Reclaimed grants return to the lease free-list (done above) and are
+        // re-granted to later fires; the store mapping keeps their committed
+        // pages until the working set discards or drops them (a discard here
+        // would shift live indexes under the pass — see the pass-drop note).
+        let _ = (ws_rep, reclaimed);
     }
 }
 
@@ -1566,7 +1922,7 @@ fn model_profile() -> pie_ptir::registry::ModelProfile {
     let m = pie_model::model();
     pie_ptir::registry::ModelProfile {
         vocab: m.vocab_size(),
-        page_size: crate::working_set::page_size::tokens_per_page(0) as u32,
+        page_size: crate::store::registry::get(0, 0).kv_page_size,
         num_layers: 1,
         activation: pie_ptir::types::DType::F32,
         has_mtp_logits: false,
@@ -1630,6 +1986,88 @@ mod tests {
             }],
             externs: vec![],
         }
+    }
+
+    /// A minimal canonical decode container: embed tokens + kv-len +
+    /// epilogue. Channels: 0 tok (device-loop), 1 klen.
+    fn plain_decode_container() -> TraceContainer {
+        TraceContainer {
+            names: vec![],
+            channels: vec![
+                ch(Shape::vector(1), DType::I32, HostRole::None),
+                ch(Shape::vector(1), DType::U32, HostRole::None),
+            ],
+            ports: vec![
+                PortBinding {
+                    port: Port::EmbedTokens,
+                    source: PortSource::Channel(0),
+                },
+                PortBinding {
+                    port: Port::KvLen,
+                    source: PortSource::Channel(1),
+                },
+            ],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![],
+            }],
+            externs: vec![],
+        }
+    }
+
+    #[test]
+    fn canonical_shape_accepts_the_plain_decode() {
+        assert!(canonical_kv_shape(&plain_decode_container()));
+    }
+
+    #[test]
+    fn canonical_shape_rejects_kv_perturbing_passes() {
+        // Attention mask: changes hidden states, hence KV at layers > 0.
+        let mut c = plain_decode_container();
+        c.ports.push(PortBinding {
+            port: Port::AttnMask,
+            source: PortSource::Channel(0),
+        });
+        assert!(!canonical_kv_shape(&c));
+
+        // Per-layer stage program: can rewrite the projections.
+        let mut c = plain_decode_container();
+        c.stages.push(StageProgram {
+            stage: Stage::OnAttn,
+            ops: vec![],
+        });
+        assert!(!canonical_kv_shape(&c));
+
+        // No KvLen port: the full-context claim cannot be verified.
+        let mut c = plain_decode_container();
+        c.ports.retain(|p| p.port != Port::KvLen);
+        assert!(!canonical_kv_shape(&c));
+
+        // Device geometry is inferlet-managed layout.
+        assert!(!canonical_kv_shape(&devgeo_container(2, 3)));
+    }
+
+    #[test]
+    fn canonical_shape_gates_embed_indptr_to_a_single_const_lane() {
+        // Const [0, n] single-lane CSR: canonical.
+        let mut c = plain_decode_container();
+        c.ports.push(PortBinding {
+            port: Port::EmbedIndptr,
+            source: PortSource::Const {
+                dtype: DType::U32,
+                shape: Shape::vector(2),
+                data: [0u32.to_le_bytes(), 4u32.to_le_bytes()].concat(),
+            },
+        });
+        assert!(canonical_kv_shape(&c));
+
+        // Channel-fed indptr (dynamic lanes): not canonical.
+        let mut c = plain_decode_container();
+        c.ports.push(PortBinding {
+            port: Port::EmbedIndptr,
+            source: PortSource::Channel(1),
+        });
+        assert!(!canonical_kv_shape(&c));
     }
 
     #[test]

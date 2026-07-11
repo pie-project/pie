@@ -1,101 +1,87 @@
 interface working-set {
 
     use types.{error};
+    use pipeline.{pipeline};
 
-    // Shared by both working-set kinds. A contiguous, half-open span
-    // [start, start + len) of relative page slots inside a working set's dense
-    // ordered array. `start`/`len` are in page-slot units. The ONLY references
-    // that ever cross this API are these relative indices into the array —
-    // never physical page ids, never vpage ids.
+    // A contiguous, half-open span [start, start + len) of WorkingSet-relative
+    // page indexes. The ONLY references that ever cross this API are these
+    // relative indexes — never physical page ids.
     record page-range {
         start: u32,
         len: u32,
     }
 
-    // KV working set: a dense, ordered array of KV page slots, owned by the
-    // inferlet. Public `u32` page references are relative indices into this
-    // array (see `page-range`). Token lengths, positions, replay history, and
-    // all semantic metadata are inferlet-owned — this resource is token-
-    // agnostic. Sharing (`slice`/`append`/`fork`) is lazy copy-on-write: page
-    // objects are shared by reference and the first divergent write copies.
-    // Full-page CAS sealing happens runtime-side after a forward pass writes a
-    // page; it never mutates other working sets' mappings.
+    // KV working set: a logical page address space over the runtime's KV
+    // mapping trie (kv_refact.md). It is a migration and memory-accounting
+    // domain and a handle to one terminal in a persistent prefix-sharing
+    // trie — not a physical allocator. PTIR geometry addresses pages by these
+    // relative indexes; the runtime translates them to physical pages at the
+    // kernel through the working set's flattened table.
+    //
+    // reserve is purely logical: no memory is held until a forward actually
+    // computes pages, so a fully cached prefix never holds pool space.
+    // discard removes ranges with no tombstone: all indexes at or after a
+    // removed range shift down and the inferlet must publish new PTIR
+    // geometry afterwards. On a shared path (after fork/slice), a discard
+    // range must fall within the terminal region, reach the tail, or reach
+    // the front; an interior range that would reroute a shared suffix is
+    // rejected with an error. fork is O(1) and shares everything
+    // copy-on-write; slice rebases [start, start+len) to page zero in the
+    // child. Writes to shared pages copy-on-write inside the runtime — no
+    // working set ever observes another's mutation.
     resource kv-working-set {
-        // Fresh, empty working set bound to `model` (and thus its device /
-        // unified arena). The model is captured at construction so the
-        // structural mutators (`alloc`/`free`/`slice`/`append`/`fork`) can
-        // resolve the arena without a forward pass; `slice`/`fork` inherit this
-        // model. In a single-model runtime every set binds to the single
-        // bound model.
         constructor();
-
-        // Current number of page slots in the array.
-        size: func() -> u32;
-
-        // Monotonic counter bumped ONLY on `reorder`/`compact` — the operations
-        // that renumber slot ids. Lets the SDK/inferlet detect that cached
-        // relative indices were invalidated by a reorder/compaction before it
-        // submits a forward pass. `alloc`/`alloc-slots`/`free`/`append` do NOT
-        // bump it: slot ids are stable handles that survive `free` (survivors
-        // never renumber), so allocation/reclamation cannot invalidate a cached
-        // id. (CoW page writes do NOT bump it either.)
-        generation: func() -> u32;
 
         // Tokens per KV page for this working set's model/driver.
         page-size: func() -> u32;
 
-        // Append `n` fresh page slots to the end of the array; returns the
-        // contiguous relative range that was added. `alloc(0)` returns an
-        // empty range at the current end.
-        alloc: func(n: u32) -> result<page-range, error>;
+        // Current logical extent in pages, including reserved space whose
+        // pages have not been written yet.
+        page-len: func() -> u32;
 
-        // Stable-id allocation: return `n` slot ids, recycling freed ids
-        // (ascending) before growing. Unlike `alloc`, the returned ids need not
-        // be contiguous. A slot id is a stable handle that never renumbers, so it
-        // stays valid until passed to `free`. `alloc-slots(0)` returns the
-        // empty list.
-        alloc-slots: func(n: u32) -> result<list<u32>, error>;
+        // Extend the logical address space by `pages`; returns the added
+        // range. Purely logical: physical pages are allocated only when a
+        // forward writes them.
+        reserve: func(pages: u32) -> result<page-range, error>;
 
-        // Tombstone the slots at `ids` (non-compacting): survivors keep their
-        // ids; freed ids are recycled by a later `alloc`/`alloc-slots`; a freed
-        // trailing run is truncated so a freed suffix leaves no hole. `ids` are
-        // interpreted against the array AT CALL TIME; all removals apply
-        // together. Out-of-range, already-freed, or duplicate ids return `error`
-        // (the call never traps). Precondition: the freed ids are unreachable
-        // from every in-flight forward pass (the arena recycles the page only
-        // after the grace period).
-        free: func(ids: list<u32>) -> result<_, error>;
+        // Remove `ranges` (pre-discard indexes, applied atomically) from the
+        // mapping, ordered on `on`. Suffix indexes shift; no tombstone
+        // remains. Rejected when an interior range on a shared path would
+        // reroute a shared suffix (growth-boundary invariant).
+        discard: func(on: borrow<pipeline>, ranges: list<page-range>) -> result<_, error>;
 
-        // Reorder the array by the full bijection `perm` over `0..size`: new
-        // slot `i` takes old slot `perm[i]`. `perm` must list every current
-        // index exactly once; otherwise returns `error`.
-        reorder: func(perm: list<u32>) -> result<_, error>;
+        // O(1) copy-on-write child over the complete logical address space,
+        // ordered on `on`. The normal primitive for beam/MCTS branching and
+        // self-correction.
+        fork: func(on: borrow<pipeline>) -> result<kv-working-set, error>;
 
-        // Create a new working set whose array is the slots in
-        // [start, start + len), sharing those page objects by reference (lazy
-        // CoW; first divergent write copies). Out-of-range spans return `error`.
-        slice: func(start: u32, len: u32) -> result<kv-working-set, error>;
+        // Structurally shared child over `range`, rebased to page zero,
+        // ordered on `on`. Pages in front of the range stay reachable (and
+        // unreclaimable) while the child lives.
+        slice: func(on: borrow<pipeline>, range: page-range) -> result<kv-working-set, error>;
 
-        // Append the slots of `other` onto the end of this array, sharing the
-        // page objects by reference (lazy CoW).
-        append: func(other: borrow<kv-working-set>) -> result<_, error>;
-
-        // Fork into a new working set that shares all current page objects by
-        // reference (lazy CoW; first divergent write copies).
-        fork: func() -> result<kv-working-set, error>;
+        // Ordered KV cell move within this working set (Design-B lazy KV
+        // GC): move token cells, for ALL layers, from
+        // (src-page-ids[i], src-tok-idx[i]) -> (dst-page-ids[i],
+        // dst-tok-idx[i]); the four lists are parallel. Page ids are
+        // WorkingSet-relative indexes. Rides the same in-flight FIFO as
+        // submissions on `on`: ordered after every prior fire's KV write and
+        // before every later fire's descriptor read. The caller guarantees
+        // DISJOINT src/dst spans and computes the post-move layout itself.
+        copy-into: func(
+            on: borrow<pipeline>,
+            dst-page-ids: list<u32>, dst-tok-idx: list<u32>,
+            src-page-ids: list<u32>, src-tok-idx: list<u32>,
+        ) -> result<_, error>;
     }
 
-    // RS (recurrent-state) working set: required for hybrid / linear-attention
-    // models. Holds a folded recurrent-state object plus a mutable buffered
-    // suffix of page slots. NOT forced into the KV `list<page>` model. A
-    // forward pass may write buffered RS state WITHOUT folding it; folding is a
-    // separate, explicit operation. Fork is lazy CoW: the first fold/write on a
-    // shared folded or buffered slab copies the relevant object before
-    // mutation. RS CAS sharing is out of scope for v1.
+    // RS (recurrent-state) working set: required for hybrid / linear-
+    // attention models. Holds a folded recurrent-state object plus a mutable
+    // buffered suffix of page slots. A forward pass may write buffered RS
+    // state WITHOUT folding it; folding is a separate, explicit operation.
+    // Fork is lazy CoW: the first fold/write on a shared folded or buffered
+    // slab copies the relevant object before mutation.
     resource rs-working-set {
-        // Fresh, empty RS working set bound to `model` (device / arena),
-        // captured at construction so `alloc-buffer`/`fork`/`fold` resolve the
-        // arena without a forward pass; `fork` inherits this binding.
         constructor();
 
         // Size in bytes of one folded recurrent-state object for this model.
@@ -108,19 +94,19 @@ interface working-set {
         buffer-page-size: func() -> u32;
 
         // Append `n` fresh buffered page slots; returns the contiguous range.
+        // Slots are materialized lazily on their first write.
         alloc-buffer: func(n: u32) -> result<page-range, error>;
 
         // Remove buffered slots at `indices` and densely compact (call-time
-        // interpretation, same rules as `kv-working-set.free`). Invalid or
-        // duplicate indices return `error`.
+        // interpretation). Invalid or duplicate indices return `error`.
         free-buffer: func(indices: list<u32>) -> result<_, error>;
 
         // Reorder the buffered slots by the full bijection `perm`.
         reorder-buffer: func(perm: list<u32>) -> result<_, error>;
 
-        // Fork into a new RS working set sharing the folded state and buffered
-        // slabs by reference (lazy CoW; first fold/write copies).
-        fork: func() -> result<rs-working-set, error>;
+        // Copy-on-write child sharing the folded state and buffered slabs,
+        // ordered on `on`.
+        fork: func(on: borrow<pipeline>) -> result<rs-working-set, error>;
     }
 
 }

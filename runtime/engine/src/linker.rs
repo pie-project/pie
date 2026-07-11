@@ -167,6 +167,27 @@ impl Linker {
         wasmtime_wasi::p3::add_to_linker(&mut linker).expect("Failed to link WASI p3");
         wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("Failed to link WASI HTTP p3");
 
+        // The wasm32-wasip3 rustc target's std imports the RC-versioned
+        // `wasi:random/insecure-seed` (std HashMap seeding, function
+        // `get-insecure-seed`) while wasmtime links the finalized
+        // `wasi:random@0.3.0` (`insecure-seed`) — without this shim any
+        // guest that touches a std HashMap fails to instantiate. A fixed
+        // seed is fine: hash-DoS resistance is irrelevant for sandboxed
+        // inferlets, and determinism helps reproducibility.
+        {
+            let mut root = linker.root();
+            let mut random = root
+                .instance("wasi:random/insecure-seed@0.3.0-rc-2026-03-15")
+                .expect("Failed to add wasi:random insecure-seed rc shim");
+            random
+                .func_wrap_async("get-insecure-seed", |_store, (): ()| {
+                    Box::new(async move {
+                        Ok(((0x9e37_79b9_7f4a_7c15u64, 0xbf58_476d_1ce4_e5b9u64),))
+                    })
+                })
+                .expect("Failed to shim get-insecure-seed");
+        }
+
         // wasi:http operates above wasi:sockets and bypasses the per-socket
         // policy hook (it uses the host's hyper stack with its own DNS).
         // Drop the binding entirely when the network is disabled so the

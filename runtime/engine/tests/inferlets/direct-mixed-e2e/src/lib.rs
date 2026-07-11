@@ -7,7 +7,7 @@ fn bx<T>(value: T) -> &'static T {
 
 fn geometry() -> Result<(&'static WorkingSet, &'static Channel, &'static Channel)> {
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    ws.alloc(1).map_err(|error| format!("ws.alloc: {error}"))?;
+    ws.reserve(1).map_err(|error| format!("ws.reserve: {error}"))?;
     Ok((
         ws,
         bx(Channel::from(vec![1i32]).named("token")),
@@ -70,8 +70,7 @@ async fn main(_input: String) -> Result<String> {
     });
 
     let pipeline = Pipeline::new();
-    pipeline
-        .submit(mixed)
+    mixed.submit(&pipeline)
         .map_err(|error| format!("mixed submit: {error}"))?;
     let token_value = mixed_token
         .take()
@@ -121,8 +120,7 @@ async fn main(_input: String) -> Result<String> {
         entropy.put(&entropy_value);
     });
     let entropy_pipeline = Pipeline::new();
-    entropy_pipeline
-        .submit(entropy_pass)
+    entropy_pass.submit(&entropy_pipeline)
         .map_err(|error| format!("entropy submit: {error}"))?;
     let entropy_value = entropy
         .take()

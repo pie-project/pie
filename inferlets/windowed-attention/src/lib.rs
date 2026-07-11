@@ -93,7 +93,7 @@ async fn main(input: Input) -> Result<String> {
     // offset `p % PAGE_T`. KV is never evicted; the window mask does all the
     // per-step attention restriction.
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let pool = ws.alloc(POOL_PAGES).map_err(|e| format!("ws.alloc pool: {e}"))?;
+    let pool = ws.reserve(POOL_PAGES).map_err(|e| format!("ws.reserve pool: {e}"))?;
     let pool_ids: &'static Vec<u32> = bx(pool.ids().to_vec()); // [POOL_PAGES] physical
     let phys0 = pool_ids[0];
 
@@ -201,7 +201,7 @@ async fn main(input: Input) -> Result<String> {
 
     for _ in 0..input.max_tokens {
         pool_ids_ch.put(pool_ids.clone());
-        pipeline.submit(fwd).map_err(|e| format!("submit: {e}"))?;
+        fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
         let sampled = out
             .take()
             .get::<i32>()
