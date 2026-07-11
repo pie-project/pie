@@ -203,7 +203,7 @@ async fn mbatch34_num_rows_n_occupancy_on_real_driver() -> Result<()> {
     }
     common::init_trace();
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     build_wasm(&ws, "grammarmb")?;
 
     let pie = common::boot_4090().await?;

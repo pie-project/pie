@@ -1122,7 +1122,7 @@ impl KvPageTable {
         freed: &mut Vec<PhysicalKvPageId>,
     ) -> Result<(), KvTableError> {
         let entry = self.entry(ws)?;
-        let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
+        let (terminal, mapped_len) = (entry.terminal, entry.mapped_len);
         let page_reduction = r.end - r.start;
 
         if r.start >= mapped_len {

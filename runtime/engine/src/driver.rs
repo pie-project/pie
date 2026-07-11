@@ -9,7 +9,6 @@
 //! given driver instance.
 
 pub mod backend;
-mod binding_validation;
 pub mod completion;
 pub mod ffi;
 pub mod frame;

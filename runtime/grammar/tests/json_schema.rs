@@ -1,4 +1,4 @@
-//! Ported from xgrammar: test_json_schema_converter.py
+//! JSON Schema conversion and matching behavior.
 //!
 //! Tests JSON Schema → Grammar conversion and acceptance.
 

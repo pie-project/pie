@@ -55,9 +55,7 @@ impl DummyLocalDriver {
     pub fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
         let borrowed = crate::driver::frame::InstanceDescBorrow::new(desc);
         let binding = self.inner.bind_instance(borrowed.as_raw())?;
-        if let Err(error) =
-            crate::driver::binding_validation::validate_instance_binding(&binding, desc)
-        {
+        if let Err(error) = desc.validate_binding(&binding) {
             let _ = self.inner.close_instance(binding.instance_id);
             return Err(error);
         }

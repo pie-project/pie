@@ -60,24 +60,25 @@ in-workspace, so path updates are a mechanical one-shot.
 ## Target structure
 
 ```
-src/inferlet/
-├── mod.rs           docs + re-exports: ProcessId, ProcessEvent, ProcessCtx,
+src/
+├── inferlet.rs      docs + re-exports: ProcessId, ProcessEvent, ProcessCtx,
 │                    ProgramName, Manifest, InstancePolicy
+└── inferlet/
 │
 │  ── artifact (at rest) ──
+├── program.rs       service actor + public API + ProgramName
 ├── program/
-│   ├── mod.rs       service actor + public API + ProgramName
 │   ├── manifest.rs
 │   └── repository.rs
 │
 │  ── instantiation ──
+├── linker.rs        linker actor, instantiate()
 ├── linker/
-│   ├── mod.rs       linker actor, instantiate()
 │   └── dynamic.rs   (was linker/dynamic_linking.rs)
 │
 │  ── execution ──
+├── process.rs       lifecycle actor: spawn/attach/terminate, registry, admission
 ├── process/
-│   ├── mod.rs       lifecycle actor: spawn/attach/terminate, registry, admission
 │   ├── ctx.rs       ProcessCtx (was InstanceState) + OutputMode
 │   └── output.rs    LogStream (was instance/output.rs)
 │
@@ -114,7 +115,7 @@ connotation), `run`/`exec` (awkward call sites, diverges from wire protocol).
 
 `instance.rs` does not describe a separate concept; it is the host-side
 execution context of one running process (the `T` in `Store<T>`). In OS terms
-`process/mod.rs` is the task lifecycle and `ctx.rs` is the address
+`process.rs` is the task lifecycle and `ctx.rs` is the address
 space / fd table. The rename unifies the execution vocabulary into one word
 family (`ProcessId`, `ProcessEvent`, `ProcessCtx`, `process::spawn()`) and
 frees "instance" to mean only wasmtime's `Instance`, removing the
@@ -135,7 +136,7 @@ It is a cross-cutting subsystem used at install time (`program`) and at
 instantiate time (`linker`). Promotion fixes the only upward-pointing
 dependency edge in the cluster: `python ← program, linker`.
 
-### 5. Narrow public surface via `inferlet/mod.rs`
+### 5. Narrow public surface via `inferlet.rs`
 
 `lib.rs` currently exposes every module as `pub mod` with no boundary.
 After the move, outsiders use `inferlet::ProcessId`, `inferlet::ProcessCtx`,
@@ -157,7 +158,7 @@ reviewable:
      rename `InstanceState` → `ProcessCtx`.
    - Promote `program/python/` → `inferlet/python/`;
      rename `linker/dynamic_linking.rs` → `linker/dynamic.rs`.
-   - Tighten visibility in `inferlet/mod.rs`.
+   - Tighten visibility in `inferlet.rs`.
 
 ## Out of scope
 

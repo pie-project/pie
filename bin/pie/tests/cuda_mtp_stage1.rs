@@ -236,7 +236,7 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
     // slots — so we use `generate-gdn` (binds BOTH the KvWorkingSet and an
     // RsWorkingSet), NOT the dense `generate` (KV-only, which the GDN forward
     // rejects with "rs_cache forward missing runtime-assigned slot ids").
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let gdn_pkg = std::env::var("PIE_GDN_INFERLET").unwrap_or_else(|_| "generate-gdn".to_string());
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", &gdn_pkg])

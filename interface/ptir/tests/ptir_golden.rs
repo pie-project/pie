@@ -663,6 +663,118 @@ fn golden_matrix_select_mask() {
 }
 
 #[test]
+fn golden_pivot_predicates_multistage() {
+    // Regression pin (charlie thrust-3 / driver bound.hpp): container.rs
+    // decodes `Predicate::{RankLe,CummassLe,ProbGe}`'s payload as a
+    // per-STAGE-LOCAL ValueId (same as any op arg) — a translator MUST remap
+    // it through that stage's global-id base before dereferencing it, exactly
+    // like `op.args`. This trace is deliberately MULTI-STAGE (a throwaway
+    // Prologue value ahead of the Epilogue hosting the real pivot_threshold
+    // ops) so the Epilogue's global base is NONZERO: a translator that
+    // forgot the remap — or one that (mis)treated the payload as an
+    // immediate `k`, CUDA tier-0's prior bug — would resolve the WRONG value
+    // (silently reading the Prologue's throwaway constant, or a garbage
+    // "k") instead of the real, host-fed, per-pass `p`/`thr` channels below.
+    // Also exercises CummassLe (top-p) and ProbGe (min-p-style) with dynamic
+    // (host-fed, not const-folded) thresholds, matching interp.rs exactly.
+    let v = 8u32;
+    let mut pro = B::new();
+    let _junk = pro.p(Op::Const(Literal::F32(999.0))); // Prologue: advances the Epilogue's global base by 1.
+
+    let mut b = B::new();
+    let lg = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::Logits,
+        shape: Shape::matrix(1, v),
+        dtype: DType::F32,
+    });
+    let probs = expand::softmax(&mut b.ops, lg, Shape::matrix(1, v));
+    let p = b.p(Op::ChanRead(0)); // dynamic top-p threshold (host-fed — NOT hardcoded)
+    let thr = b.p(Op::ChanRead(1)); // dynamic prob-ge threshold (host-fed — NOT hardcoded)
+    let mask_p = b.p(Op::PivotThreshold {
+        input: probs,
+        predicate: pie_ptir::types::Predicate::CummassLe(p),
+    });
+    let mask_t = b.p(Op::PivotThreshold {
+        input: probs,
+        predicate: pie_ptir::types::Predicate::ProbGe(thr),
+    });
+    b.p(Op::ChanPut {
+        chan: 2,
+        value: mask_p,
+    });
+    b.p(Op::ChanPut {
+        chan: 3,
+        value: mask_t,
+    });
+    let c = TraceContainer {
+        names: vec![],
+        channels: vec![
+            ChannelDecl {
+                shape: Shape::SCALAR,
+                dtype: ChanDType::Concrete(DType::F32),
+                capacity: 1,
+                host_role: HostRole::Writer,
+                seeded: false,
+            }, // 0 p (top-p threshold)
+            ChannelDecl {
+                shape: Shape::SCALAR,
+                dtype: ChanDType::Concrete(DType::F32),
+                capacity: 1,
+                host_role: HostRole::Writer,
+                seeded: false,
+            }, // 1 thr (prob-ge threshold)
+            ChannelDecl {
+                shape: Shape::matrix(1, v),
+                dtype: ChanDType::Concrete(DType::Bool),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            }, // 2 mask_p out
+            ChannelDecl {
+                shape: Shape::matrix(1, v),
+                dtype: ChanDType::Concrete(DType::Bool),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            }, // 3 mask_t out
+        ],
+        ports: vec![],
+        stages: vec![
+            StageProgram {
+                stage: Stage::Prologue,
+                ops: pro.ops,
+            },
+            StageProgram {
+                stage: Stage::Epilogue,
+                ops: b.ops,
+            },
+        ],
+        externs: Vec::new(),
+    };
+    let mut profile = ModelProfile::dummy();
+    profile.vocab = v;
+    let bound = bind(c.clone(), profile).unwrap();
+    let mut rep = Report::new("pivot_predicates_multistage", &c).verdict(&Ok(bound.clone()));
+    let mut inst = Instance::new(&bound, &[]).unwrap();
+    // logits = [0,1,9,2,0,0,0,3] (greedy_argmax's vector, reused for easy
+    // cross-checking): softmax is dominated by index 2 (logit 9), with a
+    // long shallow tail — enough separation to pin a non-trivial (not
+    // top-1-only) nucleus at p=0.999 and a non-trivial prob-ge set at
+    // thr=0.0003.
+    let logits = vec![0.0f32, 1.0, 9.0, 2.0, 0.0, 0.0, 0.0, 3.0];
+    let inputs = PassInputs {
+        logits: Some(f32s(&logits)),
+        ..Default::default()
+    };
+    rep = rep.line(&put_line(&mut inst, &bound, 0, Value::F32(vec![0.999])));
+    rep = rep.line(&put_line(&mut inst, &bound, 1, Value::F32(vec![0.0003])));
+    rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
+    rep = rep.line(&take_line(&mut inst, &bound, 2)); // CummassLe(0.999) mask
+    rep = rep.line(&take_line(&mut inst, &bound, 3)); // ProbGe(0.0003) mask
+    check("pivot_predicates_multistage", rep);
+}
+
+#[test]
 fn golden_mtp_verify_tail() {
     // The full MTP match-verify DAG at K=3, V=8 (overview §6.1 steps 1-6),
     // hand-checkable — the cross-backend anchor for the accept-prefix logic

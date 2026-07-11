@@ -110,6 +110,20 @@ pub struct PendingMove {
     failure: PipelineFailure,
 }
 
+/// Test-only inert FIFO entry: enough to make a pass's shared fires queue
+/// non-empty for `ForwardPass::can_close_native_on_drop`/`Drop` tests
+/// (`pipeline::instance`'s `native_cleanup` test module), without needing a
+/// live driver completion. `PendingMove`/`PendingFire`'s fields are private
+/// to this module, so cross-module tests construct a stub through here
+/// rather than reaching in directly.
+#[cfg(test)]
+pub(crate) fn test_pending_move_stub() -> PendingOp {
+    PendingOp::Move(PendingMove {
+        completion: crate::driver::Completion::ready(),
+        failure: Arc::new(Mutex::new(None)),
+    })
+}
+
 /// The open KV/arena transaction(s) one in-flight fire holds until it resolves.
 /// Two shapes: the ordinary single-seq / MTP projection ([`kv`]), or a
 /// device-geometry fire whose KV the driver resolves+writes itself (B2's
@@ -295,7 +309,7 @@ pub async fn submit_pass<C: FireContext>(
             .then_some(toks)
         });
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-        let ws = *ctx.resources().get(&ws_res)?;
+        let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.driver as usize);
         let pid = ctx.process_id();
 
@@ -445,7 +459,7 @@ pub async fn submit_pass<C: FireContext>(
         // after.
         let rstxn = if let Some(rs_rep) = rs_rep {
             let rs_res: Resource<RsWorkingSet> = Resource::new_borrow(rs_rep);
-            let rs = *ctx.resources().get(&rs_res)?;
+            let rs = ctx.resources().get(&rs_res)?.clone();
             let prepared = {
                 let mut rs_store = stores.rs.lock().unwrap();
                 rs::prepare(&mut rs_store, rs.id)
@@ -523,8 +537,7 @@ pub async fn submit_pass<C: FireContext>(
                 instance_id,
                 proj.physical_page_ids,
                 proj.last_page_len,
-                Vec::new(),
-                None,
+                Some(pid),
                 completion.clone(),
             )
             .err()
@@ -615,7 +628,7 @@ pub async fn copy_into_inner<C: FireContext>(
     // in-flight fires that could remap these pages (a CoW rebase) are the
     // guest's ordering hazard, like any same-WS run-ahead write overlap.
     let (kv_move_dst_pages, kv_move_src_pages): (Vec<u32>, Vec<u32>) = {
-        let ws = *ctx.resources().get(&ws)?;
+        let ws = ctx.resources().get(&ws)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.driver as usize);
         let mut kv_store = stores.kv.lock().unwrap();
         let (_, flat) = kv_store
@@ -910,7 +923,7 @@ async fn fire_device_geometry<C: FireContext>(
 
     let ws_rep = ctx.resources().get(&fwd)?.kv_ws;
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-    let ws = *ctx.resources().get(&ws_res)?;
+    let ws = ctx.resources().get(&ws_res)?.clone();
     let page_size = ws.page_size;
     let stores = crate::store::registry::get(ws.model, ws.driver as usize);
 
@@ -1066,7 +1079,6 @@ async fn fire_device_geometry<C: FireContext>(
             instance_id,
             wire_pages,
             last_page_len,
-            Vec::new(),
             completion.clone(),
         )
         .err()
@@ -1169,26 +1181,4 @@ fn reclaim_device_geometry_grants<C: FireContext>(ctx: &mut C, fwd_rep: u32, ins
     // pages until the working set discards or drops them (a discard here
     // would shift live indexes under the pass — see the pass-drop note).
     let _ = (ws_rep, reclaimed);
-}
-
-#[cfg(test)]
-mod tests {
-    /// The FIFO invariant primitive: fires enqueued in submission order drain in
-    /// that same order (the PendingFires deque semantics the same-pipeline check
-    /// funnels all interacting fires onto). `push_back` at submit + `pop_front`
-    /// at finalize preserve submission == completion order.
-    #[test]
-    fn fifo_preserves_submission_order() {
-        use std::collections::VecDeque;
-        let mut fifo: VecDeque<u32> = VecDeque::new();
-        for fire in 0..8u32 {
-            fifo.push_back(fire); // submit order
-        }
-        let drained: Vec<u32> = std::iter::from_fn(|| fifo.pop_front()).collect();
-        assert_eq!(
-            drained,
-            (0..8).collect::<Vec<_>>(),
-            "completion order == submission order"
-        );
-    }
 }

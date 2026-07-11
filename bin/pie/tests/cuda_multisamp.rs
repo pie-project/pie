@@ -37,7 +37,7 @@ async fn multisamp_on_real_driver() -> Result<()> {
         pie.listen_addr, dispatch
     );
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "multisamp"])
         .current_dir(&ws)

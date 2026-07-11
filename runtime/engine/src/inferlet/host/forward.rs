@@ -259,7 +259,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 match crate::pipeline::fire::lease::detect_device_geometry(&prog.bound.container) {
                     Some((b, fresh_dense, w_cont_dense)) => {
                         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-                        let ws = *self.ctx().table.get(&ws_res)?;
+                        let ws = self.ctx().table.get(&ws_res)?.clone();
                         let stores = crate::store::registry::get(ws.model, ws.driver as usize);
                         let reserved = stores.kv.lock().unwrap().reserve(ws.id, b as u64);
                         let seed_pages: Vec<u32> = match reserved {
@@ -456,6 +456,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 canonical_kv,
                 dense_mask,
                 fired_once: false,
+                closed: false,
             })?;
             Ok(Ok(res))
         }
@@ -476,21 +477,14 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             }
         }
 
+        // Native teardown (close the driver instance, detach every bound
+        // cell, reclaim device-geometry grants) is idempotent and shared
+        // with the `Drop` fallback (`ForwardPass::close_native`) — the local
+        // `pass` binding below drops at the end of this function and would
+        // otherwise repeat the work, but `close_native` no-ops the second
+        // time.
         let mut pass = self.ctx().table.delete(this)?;
-        let _ = crate::scheduler::close_instance(&pass.bound_instance);
-        for cell in &pass.cells {
-            cell.lock().unwrap().detach(pass.bound_instance.instance_id);
-        }
-        // Device-geometry: leased slots are logical reserve indexes in the
-        // store model. Unwritten grants hold no physical memory (reserve is
-        // logical); written grants are committed pages that stay mapped until
-        // the working set itself is discarded or dropped — discarding them
-        // here would shift the surviving indexes under other passes bound to
-        // the same working set, so the pass drop intentionally leaves the
-        // mapping alone.
-        if let Some(devgeo) = pass.devgeo.as_mut() {
-            let _ = devgeo.lease.reclaim_all();
-        }
+        pass.close_native();
         Ok(())
     }
 

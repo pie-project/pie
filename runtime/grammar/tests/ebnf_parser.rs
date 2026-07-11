@@ -1,4 +1,4 @@
-//! Tests for EBNF parser output format and error cases.
+//! EBNF parser output and error cases.
 //!
 //! Item 1: Round-trip tests (EBNF → Grammar → Display → verify).
 //! Item 2: Error case tests (malformed EBNF → Err with message).

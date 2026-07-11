@@ -187,7 +187,13 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
                     o.imm = op.imm;
                     o.rng_kind = op.kind ? RngKind::Gumbel : RngKind::Uniform;
                     o.predicate.tag = (PredTag)op.pred_tag;
-                    o.predicate.payload = op.pred_payload;
+                    // Only PivotThreshold populates pred_tag/pred_payload
+                    // (container.hpp decode); its payload is a stage-local
+                    // ValueId on the wire (interface/ptir container.rs — all
+                    // three PredTag variants carry a ValueId, RankLe included),
+                    // so it must be remapped through gid() exactly like any
+                    // other op operand — NOT treated as an immediate.
+                    o.predicate.payload = gid(op.pred_payload);
                     stage.ops.push_back(o);
                     // define result value(s)
                     for (std::uint32_t rr = 0; rr < op.results; ++rr) {

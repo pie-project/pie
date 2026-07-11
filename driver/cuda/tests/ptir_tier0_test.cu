@@ -273,6 +273,96 @@ void test_sampling_order_library() {
     CUDA_OK(cudaFree(dpt)); CUDA_OK(cudaFree(dtv)); CUDA_OK(cudaFree(dti));
 }
 
+// pivot_threshold's three DYNAMIC predicates (tier0_launch.hpp PivotThreshold
+// dispatch): unlike the standalone `rank_le` above (an immediate `k`), the
+// predicate payload here is ALWAYS a resolved device value (scalar or
+// per-row) — exercises k_pivot_rankle<I32/U32> (dynamic k + NaN contract),
+// k_pivot_probge (dynamic threshold), and k_pivot_cummassle (the CTA
+// selection loop, incl. a 151936-token peaked-vocab scale smoke test — the
+// "practical for 151k vocab" requirement).
+void test_pivot_predicates() {
+    std::printf("[pivot_threshold: dynamic rank_le/prob_ge/cummass_le predicates]\n");
+
+    // rank_le: 2 rows, per-row U32 k = {2, 3}; row 1 also carries a NaN
+    // (never selected, never counted toward another element's rank).
+    {
+        std::uint32_t rows = 2, len = 5;
+        std::vector<float> x{5, 1, 4, 2, 3,           // row 0: ranks desc 5>4>3>2>1
+                             std::nanf(""), 9, 9, 1, 2};  // row 1: NaN + a tie at 9
+        std::vector<std::uint32_t> k{2, 3};
+        float* dx = dev_from(x);
+        std::uint32_t* dk = dev_from(k);
+        std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
+        k_pivot_rankle<std::uint32_t><<<rows, kTier0Block>>>(dx, dout, rows, len, dk, (std::uint32_t)k.size());
+        CUDA_OK(cudaDeviceSynchronize());
+        check("pivot.rank_le (u32, per-row, NaN-safe)", to_host(dout, x.size()),
+              host_eval::pivot_rankle<std::uint32_t>(x, rows, len, k, (std::uint32_t)k.size()));
+        CUDA_OK(cudaFree(dx)); CUDA_OK(cudaFree(dk)); CUDA_OK(cudaFree(dout));
+    }
+    // rank_le: I32 k, scalar broadcast (k_numel=1).
+    {
+        std::uint32_t rows = 2, len = 4;
+        std::vector<float> x{4, 3, 2, 1, 1, 2, 3, 4};
+        std::vector<std::int32_t> k{2};
+        float* dx = dev_from(x);
+        std::int32_t* dk = dev_from(k);
+        std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
+        k_pivot_rankle<std::int32_t><<<rows, kTier0Block>>>(dx, dout, rows, len, dk, 1u);
+        CUDA_OK(cudaDeviceSynchronize());
+        check("pivot.rank_le (i32, scalar broadcast)", to_host(dout, x.size()),
+              host_eval::pivot_rankle<std::int32_t>(x, rows, len, k, 1u));
+        CUDA_OK(cudaFree(dx)); CUDA_OK(cudaFree(dk)); CUDA_OK(cudaFree(dout));
+    }
+    // prob_ge: per-row F32 threshold.
+    {
+        std::uint32_t rows = 2, len = 4;
+        std::vector<float> x{0.1f, 0.4f, 0.2f, 0.3f, 0.05f, 0.05f, 0.8f, 0.1f};
+        std::vector<float> thr{0.25f, 0.5f};
+        float* dx = dev_from(x);
+        float* dthr = dev_from(thr);
+        std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
+        k_pivot_probge<<<GS((std::uint64_t)rows * len), kTier0Block>>>(dx, dout, rows, len, dthr, (std::uint32_t)thr.size());
+        CUDA_OK(cudaDeviceSynchronize());
+        check("pivot.prob_ge (per-row)", to_host(dout, x.size()),
+              host_eval::pivot_probge(x, rows, len, thr, (std::uint32_t)thr.size()));
+        CUDA_OK(cudaFree(dx)); CUDA_OK(cudaFree(dthr)); CUDA_OK(cudaFree(dout));
+    }
+    // cummass_le: 2 rows — row 0 exercises a tie + a NaN tail; row 1 a plain
+    // descending nucleus — with a per-row F32 `p`.
+    {
+        std::uint32_t rows = 2, len = 5;
+        std::vector<float> x{0.5f, 0.5f, 0.3f, 0.2f, std::nanf(""),   // row 0: tie at 0.5, NaN last
+                             0.6f, 0.1f, 0.1f, 0.1f, 0.1f};            // row 1: peaked
+        std::vector<float> p{0.9f, 0.65f};
+        float* dx = dev_from(x);
+        float* dp = dev_from(p);
+        std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
+        k_pivot_cummassle<<<rows, kTier0Block>>>(dx, dout, rows, len, dp, (std::uint32_t)p.size());
+        CUDA_OK(cudaDeviceSynchronize());
+        check("pivot.cummass_le (ties + NaN, per-row p)", to_host(dout, x.size()),
+              host_eval::pivot_cummassle(x, rows, len, p, (std::uint32_t)p.size()));
+        CUDA_OK(cudaFree(dx)); CUDA_OK(cudaFree(dp)); CUDA_OK(cudaFree(dout));
+    }
+    // cummass_le at the 151936-token vocab scale (a real LM head width): a
+    // single sharply peaked row (one dominant logit) — the CTA selection
+    // loop must terminate in a handful of picks, not a `len`-way rank pass,
+    // to stay practical at this width.
+    {
+        std::uint32_t rows = 1, len = 151936;
+        std::vector<float> x(len, 1e-6f);
+        x[12345] = 1.0f;                       // one massively dominant token
+        std::vector<float> p{0.99f};
+        float* dx = dev_from(x);
+        float* dp = dev_from(p);
+        std::uint8_t* dout = dev_alloc<std::uint8_t>(x.size());
+        k_pivot_cummassle<<<rows, kTier0Block>>>(dx, dout, rows, len, dp, 1u);
+        CUDA_OK(cudaDeviceSynchronize());
+        check("pivot.cummass_le (151936-vocab peaked)", to_host(dout, x.size()),
+              host_eval::pivot_cummassle(x, rows, len, p, 1u));
+        CUDA_OK(cudaFree(dx)); CUDA_OK(cudaFree(dp)); CUDA_OK(cudaFree(dout));
+    }
+}
+
 void test_shape_linear() {
     // broadcast: scalar and per-row
     std::vector<float> scal{3.5f};
@@ -447,6 +537,7 @@ int main() {
     std::printf("[sampling/order/library]\n"); test_sampling_order_library();
     std::printf("[shape/linear]\n");          test_shape_linear();
     test_new_ops();
+    test_pivot_predicates();
 
     std::printf("\n==== tier-0 parity: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

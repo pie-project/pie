@@ -39,7 +39,7 @@ struct LaunchOp {
     std::uint32_t len = 1;          // per-row length of the primary shape
     std::uint64_t numel = 1;        // total elements of the result (elementwise)
 
-    std::uint32_t k = 0;            // top_k / rank_le / pivot_threshold immediate
+    std::uint32_t k = 0;            // top_k / rank_le (standalone) immediate
     int           bcast_mode = 0;   // broadcast: 0 scalar, 1 per-row
     std::uint32_t rng_stream = 0;   // gumbel stream salt
     const void*   row_seeds = nullptr;  // gumbel per-row seed buffer
@@ -48,6 +48,16 @@ struct LaunchOp {
     int           b_scalar = 0;     // broadcast: operand 1 is a scalar (index 0)
     const void*   bcast_meta = nullptr;  // general broadcast: [tdims(4), sstride(4)] device buf
     std::uint32_t bcast_rank = 0;        // general broadcast: target rank
+
+    // pivot_threshold predicate (interface/ptir interp.rs Op::PivotThreshold):
+    // the payload is ALWAYS a resolved trace value (scalar or per-row
+    // [rows] vector) — never a host immediate. The runner resolves it to a
+    // device pointer + its dtype + element count before launch (tier0_runner.hpp
+    // build_launch); `pred_numel<=1` means broadcast (scalar), else per-row.
+    PredTag       pred_tag = PredTag::RankLe;
+    const void*   pred_ptr = nullptr;
+    DType         pred_dtype = DType::F32;
+    std::uint32_t pred_numel = 1;
 
     cudaStream_t stream = nullptr;
 };
@@ -309,12 +319,43 @@ inline bool launch_op(const LaunchOp& o) {
             return true;
         // ── order ──
         case OpCode::RankLe:
+            // Composite/fusion-only form (0xE5, never emitted by container
+            // decode today): `k` really is a host immediate here (op.imm),
+            // unlike pivot_threshold's dynamic predicate below.
             k_rank_le<<<o.rows, kTier0Block, 0, o.stream>>>((const float*)o.in[0], (std::uint8_t*)o.out, o.rows, o.len, o.k);
             return true;
         case OpCode::PivotThreshold:
-            // Container pivot_threshold(input, rank_le(k)) → bool selection mask.
-            k_rank_le<<<o.rows, kTier0Block, 0, o.stream>>>((const float*)o.in[0], (std::uint8_t*)o.out, o.rows, o.len, o.k);
-            return true;
+            // Container pivot_threshold(input, predicate) → bool selection
+            // mask. The predicate payload is a resolved trace value (scalar
+            // or per-row), never an immediate (interface/ptir interp.rs).
+            switch (o.pred_tag) {
+                case PredTag::RankLe:
+                    switch (o.pred_dtype) {
+                        case DType::I32:
+                            k_pivot_rankle<std::int32_t><<<o.rows, kTier0Block, 0, o.stream>>>(
+                                (const float*)o.in[0], (std::uint8_t*)o.out, o.rows, o.len,
+                                (const std::int32_t*)o.pred_ptr, o.pred_numel);
+                            return true;
+                        case DType::U32:
+                            k_pivot_rankle<std::uint32_t><<<o.rows, kTier0Block, 0, o.stream>>>(
+                                (const float*)o.in[0], (std::uint8_t*)o.out, o.rows, o.len,
+                                (const std::uint32_t*)o.pred_ptr, o.pred_numel);
+                            return true;
+                        default:
+                            return false;   // RankLe's k must be I32/U32 (infer.rs dtype_is_int)
+                    }
+                case PredTag::CummassLe:
+                    k_pivot_cummassle<<<o.rows, kTier0Block, 0, o.stream>>>(
+                        (const float*)o.in[0], (std::uint8_t*)o.out, o.rows, o.len,
+                        (const float*)o.pred_ptr, o.pred_numel);
+                    return true;
+                case PredTag::ProbGe:
+                    k_pivot_probge<<<gs((std::uint64_t)o.rows * o.len), kTier0Block, 0, o.stream>>>(
+                        (const float*)o.in[0], (std::uint8_t*)o.out, o.rows, o.len,
+                        (const float*)o.pred_ptr, o.pred_numel);
+                    return true;
+            }
+            return false;
         // ── library kernels ──
         case OpCode::SortDesc:
             // full per-row sort = top_k with k = len (2 results, value-first).

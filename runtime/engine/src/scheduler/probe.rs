@@ -74,20 +74,6 @@ pub struct FireProbes {
     /// round-trip (inferlet/SERVICE), not scheduler processing or the driver.
     pub recv_block_wait_us: AtomicU64,
 
-    /// R-decomposition (charlie), part 1: `submit_at − last_dispatch_end` summed
-    /// over warm decode-fleet resubmits — the GUEST round-trip (fire-N dispatch →
-    /// guest wake + wasm next-input + request rebuild → `submit_async`). bravo's
-    /// device-side carrier targets this. Only `submitted_at_us != 0` (the
-    /// `submit_async` decode path) contributes; solo/prebuilt/chunked skip it.
-    pub guest_roundtrip_us: AtomicU64,
-
-    /// R-decomposition (charlie), part 2: `recv − submit_at` summed over the same
-    /// warm resubmits — the SERVICE actor queue hop (`submit_async` → SERVICE
-    /// mailbox tokio wakeup → scheduler `recv`). delta's SERVICE-bypass targets
-    /// this. Together with `guest_roundtrip_us` + the scheduler build/decide this
-    /// decomposes the round-trip R (pins bravo's carrier-vs-bypass fork).
-    pub service_queue_us: AtomicU64,
-
     /// Timestamp (micros from `sched_epoch`) of the most recent fire
     /// start. Used to compute `inter_fire_us` via `swap`. Cheap — kept
     /// always-on regardless of `profile-fire`.

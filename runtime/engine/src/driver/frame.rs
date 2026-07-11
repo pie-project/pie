@@ -259,6 +259,22 @@ pub struct InstanceBindingPlan {
     pub seed_values: Vec<ChannelValue>,
 }
 
+impl InstanceBindingPlan {
+    pub(crate) fn validate_binding(&self, binding: &PieInstanceBinding) -> anyhow::Result<()> {
+        pie_driver_abi::validate_instance_binding(binding)
+            .map_err(|err| anyhow::anyhow!("invalid native instance binding: {err}"))?;
+        if self.requested_instance_id != 0 {
+            anyhow::ensure!(
+                binding.instance_id == self.requested_instance_id,
+                "native binding returned instance {} for requested {}",
+                binding.instance_id,
+                self.requested_instance_id
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedInstanceBinding {
     pub instance_id: InstanceId,
@@ -850,5 +866,40 @@ mod tests {
         };
         let (result, ()) = tokio::join!(reader, poison);
         assert_eq!(result, Err(ChannelWaitError::Poisoned(7)));
+    }
+
+    fn binding_plan(requested_instance_id: u64) -> InstanceBindingPlan {
+        InstanceBindingPlan {
+            driver_id: 0,
+            program_id: 1,
+            requested_instance_id,
+            pacing_wait_id: 11,
+            channel_ids: vec![101],
+            seed_values: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn accepts_driver_or_requested_identity() {
+        binding_plan(0)
+            .validate_binding(&PieInstanceBinding { instance_id: 9 })
+            .unwrap();
+        binding_plan(7)
+            .validate_binding(&PieInstanceBinding { instance_id: 7 })
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_or_mismatched_identity() {
+        assert!(
+            binding_plan(0)
+                .validate_binding(&PieInstanceBinding::default())
+                .is_err()
+        );
+        assert!(
+            binding_plan(7)
+                .validate_binding(&PieInstanceBinding { instance_id: 8 })
+                .is_err()
+        );
     }
 }

@@ -33,12 +33,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         };
         let stores = store_registry::get(model, 0);
         let id = stores.rs.lock().unwrap().create_working_set(geom);
-        let ws = RsWorkingSet {
-            model,
-            driver: 0,
-            id,
-            geom,
-        };
+        let ws = RsWorkingSet::new(model, 0, id, geom);
         Ok(self.ctx().table.push(ws)?)
     }
 
@@ -47,7 +42,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     }
 
     async fn buffer_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
-        let ws = *self.ctx().table.get(&this)?;
+        let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let size = stores.rs.lock().unwrap().buffer_size(ws.id);
         Ok(size.map_err(anyhow::Error::from)?)
@@ -62,7 +57,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         n: u32,
     ) -> Result<Result<WitRange, String>> {
-        let ws = *self.ctx().table.get(&this)?;
+        let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let range = stores.rs.lock().unwrap().alloc_buffer(ws.id, n);
         Ok(range
@@ -78,7 +73,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         indices: Vec<u32>,
     ) -> Result<Result<(), String>> {
-        let ws = *self.ctx().table.get(&this)?;
+        let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let mut rs = stores.rs.lock().unwrap();
         let epoch = rs.current_epoch();
@@ -94,7 +89,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         perm: Vec<u32>,
     ) -> Result<Result<(), String>> {
-        let ws = *self.ctx().table.get(&this)?;
+        let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let out = stores
             .rs
@@ -110,12 +105,15 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         _on: Resource<Pipeline>,
     ) -> Result<Result<Resource<RsWorkingSet>, String>> {
-        let ws = *self.ctx().table.get(&this)?;
+        let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let forked = stores.rs.lock().unwrap().fork(ws.id);
         match forked {
             Ok(id) => {
-                let child = RsWorkingSet { id, ..ws };
+                // A distinct working-set id gets its OWN fresh lifecycle —
+                // never a clone of the parent's (see the KV working-set
+                // `fork`/`slice` for the identical rationale).
+                let child = RsWorkingSet::new(ws.model, ws.driver, id, ws.geom);
                 Ok(Ok(self.ctx().table.push(child)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -123,12 +121,12 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     }
 
     async fn drop(&mut self, this: Resource<RsWorkingSet>) -> Result<()> {
+        // `release` performs the exact `release_working_set` /
+        // `retire_idle` sequence and marks the shared lifecycle done; `ws`'s
+        // own drop just below (and the fallback `RsLifecycle::drop` it would
+        // otherwise trigger) is then a no-op.
         let ws = self.ctx().table.delete(this)?;
-        let stores = store_registry::get(ws.model, ws.driver as usize);
-        let mut rs = stores.rs.lock().unwrap();
-        let epoch = rs.current_epoch();
-        rs.release_working_set(ws.id, epoch);
-        rs.retire_idle();
+        ws.release();
         Ok(())
     }
 }

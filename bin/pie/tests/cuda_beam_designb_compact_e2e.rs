@@ -53,7 +53,7 @@ async fn beam_designb_compact_on_real_driver() -> Result<()> {
 
     // Build the compaction inferlet to wasm (member of the runtime test-inferlets
     // ws). The crate name normalizes to `beam_designb_compact.wasm`.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",

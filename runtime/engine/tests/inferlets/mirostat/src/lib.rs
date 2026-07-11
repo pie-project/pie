@@ -1,25 +1,25 @@
-//! Mirostat v2 test inferlet (Phase 2, WS2).
-//!
-//! Demonstrates the **sequential late-bind** loop for a sampler whose control
-//! value depends on the previous step's output. Each fire runs a Sampling-IR
-//! `mirostat` program that truncates to tokens with surprise `-log p ≤ μ`,
-//! Gumbel-samples among them, and returns BOTH the sampled `token` and the
-//! observed surprise `S = -log p(token)` (nats). The inferlet then runs the
+//! Mirostat v2 test inferlet (Phase 2, WS2) — **`inferlet::ptir` bridge
+//! rewrite**. Demonstrates the **sequential late-bind** loop for a sampler
+//! whose control value depends on the previous step's output. Each fire's
+//! epilogue truncates to tokens with surprise `-log p ≤ μ` (a
+//! `pivot_threshold(probs, prob_ge(exp(-μ)))` keep-mask), Gumbel-max samples
+//! among the kept set, and publishes BOTH the sampled `token` and the observed
+//! surprise `S = -log p(token)` (nats) — the eDSL-composed equivalent of the
+//! deleted `sampling::program::mirostat*` shapes. The inferlet then runs the
 //! mirostat v2 control update on the CPU — `μ ← μ − lr·(S − τ)` — and rebinds
-//! the new μ as a **submit-bound** input on the next fire. μ converges so the
-//! running mean surprise tracks the target τ, all through the IR.
+//! the new μ as a **host-writer channel put** on the next fire (D2 instance
+//! data, never a trace constant).
 //!
-//! Note: the program emits a Scalar `S` output (the entropy/scalar channel).
-//! Backends that only marshal the Token channel will read `S` as absent; this
-//! inferlet falls back to leaving μ unchanged in that case so it still runs to
-//! completion (the real-driver e2e exercises the full μ-update path).
+//! Floor selection (keeps the keep-mask non-empty regardless of μ):
+//!   - `"argmax"` (DEFAULT): OR the surprise mask with the max-prob token's own
+//!     indicator (`ge(probs, broadcast(reduce_max(probs)))`) — proven-ops,
+//!     never empty-keep.
+//!   - `"rank"` with `k_min>0`: OR with a top-`k_min` rank mask
+//!     (`pivot_threshold(logits, rank_le(k_min))`).
+//!   - `k_min=0` (no floor override): the plain, degenerate control.
 
-use inferlet::inference::ForwardPass;
-use inferlet::program::{encode_f32, resolve_bindings};
-use inferlet::sampling::program as edsl;
-use inferlet::serde_json;
-use inferlet::working_set::KvWorkingSet;
-use inferlet::{geometry, model, Result};
+use inferlet::ptir::prelude::*;
+use inferlet::{Result, model as wit_model, serde_json};
 
 /// Default target surprise τ (nats); override via `_input` `"tau"`.
 const TAU: f32 = 3.0;
@@ -28,134 +28,198 @@ const LR: f32 = 0.6;
 /// Default number of tokens to generate; override via `_input` `"max_tokens"`.
 const MAX_TOKENS: usize = 16;
 
-/// Optional `f32` field from the `_input` JSON (defaults if absent / unparseable).
-fn json_f32(v: &serde_json::Value, key: &str, default: f32) -> f32 {
-    v.get(key).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(default)
+#[derive(Clone, Copy)]
+enum Floor {
+    Argmax,
+    Rank(u32),
+    Plain,
 }
 
-/// Optional `usize` field from the `_input` JSON.
+fn bx<T>(v: T) -> &'static T {
+    Box::leak(Box::new(v))
+}
+
+fn json_f32(v: &serde_json::Value, key: &str, default: f32) -> f32 {
+    v.get(key)
+        .and_then(|x| x.as_f64())
+        .map(|x| x as f32)
+        .unwrap_or(default)
+}
 fn json_usize(v: &serde_json::Value, key: &str, default: usize) -> usize {
-    v.get(key).and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(default)
+    v.get(key)
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or(default)
+}
+
+/// The mirostat keep-mask + Gumbel-max sample + observed surprise, over the
+/// FULL (untruncated) `probs`/`logits` distribution. `mu` is reshaped to a
+/// scalar here — `pivot_threshold`'s predicate threshold operand is validated
+/// as EXACTLY scalar (or a per-row `[rows]` vector for rank-2 input), not a
+/// `[1]` vector, so a `[1]`-channel-sourced `mu` must be squeezed down. `r` is
+/// the taken `[2]` u32 rng state (`[key, ctr]`) — `gumbel`'s `state` operand is
+/// likewise validated as EXACTLY `[2]` u32. Returns `(token, surprise)`.
+fn mirostat_step(
+    floor: Floor,
+    logits: Tensor,
+    vocab: u32,
+    mu: Tensor,
+    r: impl AsTensor,
+) -> (Tensor, Tensor) {
+    let mu = reshape(mu, []); // [1] -> scalar
+    let probs = softmax(&logits);
+    let thr = exp(neg(&mu));
+    let base_mask = pivot_threshold(&probs, prob_ge(thr));
+    let mask = match floor {
+        Floor::Argmax => {
+            let argmax_ind = ge(&probs, broadcast(reduce_max(&probs), [vocab]));
+            or(base_mask, argmax_ind)
+        }
+        Floor::Rank(k_min) if k_min > 0 => {
+            let rank_mask = pivot_threshold(&logits, rank_le(k_min));
+            or(base_mask, rank_mask)
+        }
+        _ => base_mask,
+    };
+    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let masked = select(&mask, &logits, &neg_inf);
+    let g = gumbel(r, [vocab]);
+    let token = reduce_argmax(add(masked, g)); // [1] i32
+    let p_token = gather(&probs, cast(&token, DType::U32)); // [1] f32
+    let surprise = neg(log(p_token)); // [1] f32
+    (token, surprise)
 }
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
-    // Optional run params via JSON input (`{"tau":3.0,"lr":0.6,"max_tokens":32,
-    // "mu0":6.0}`); each falls back to its default so `"{}"` reproduces the
-    // built-in config. Lets a harness sweep without rebuilding the wasm.
     let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let tau = json_f32(&params, "tau", TAU);
     let lr = json_f32(&params, "lr", LR);
     let max_tokens = json_usize(&params, "max_tokens", MAX_TOKENS);
-    // Min-kept-set floor knob for the RankLe `{"floor":"rank"}` path (k_min top-by-
-    // logit). On the real spread vocab the surprise FLOOR (~10 nats, charlie's NVRTC)
-    // is far above μ0=2τ → plain mirostat's surprise gate empties → argmax-of-all-
-    // (-inf) → token-0 → μ runaway; the rank floor keeps ≥ k_min tokens regardless of
-    // μ. `{"k_min":0}` builds plain `mirostat` (the degenerate control).
     let k_min = json_usize(&params, "k_min", 8) as u32;
+    let floor_name = params
+        .get("floor")
+        .and_then(|v| v.as_str())
+        .unwrap_or("argmax");
+    let floor = match floor_name {
+        "argmax" => Floor::Argmax,
+        _ if k_min > 0 => Floor::Rank(k_min),
+        _ => Floor::Plain,
+    };
 
-    // Logits/output vocab (= hf_config.vocab_size), not the tokenizer token
-    // count: the sampler program is lowered + sampled over the logits dim.
-    let vocab = model::output_vocab_size();
+    let vocab = wit_model::output_vocab_size();
+    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    model::configure(vocab, ws.page_size(), 1);
 
-    let kv = KvWorkingSet::new();
-    let mut seq_len: u32 = 0;
-    let mut fresh = true;
-    let mut prompt = model::encode("hello world");
+    let mu0_default = (vocab as f32).ln() + 1.0;
+    let mut mu: f32 = json_f32(&params, "mu0", mu0_default);
+
+    let mut prompt = wit_model::encode("hello world");
     if prompt.is_empty() {
         prompt.push(0);
     }
+    let n = prompt.len() as u32;
 
-    // Build the mirostat program once (binding-free; reusable across fires).
-    // `keys.mu` is a submit-bound scalar rebound every fire. RNG is ambient
-    // (model B) — no seed input. Emit the WIT `tensor::program` once.
-    // Floor selection. DEFAULT = `argmax` (#19 honest close): the proven-ops floor
-    // (Ge/ReduceMax/Broadcast, no RankLe) keeps the argmax token → never empty-keep,
-    // and is robustly non-degenerate (4/4 in delta's e2e runs). The RankLe rank-floor
-    // `{"floor":"rank"}` (k_min top-by-logit) gives higher diversity when stable but is
-    // RNG-fragile (3/4 — the custom-JIT RankLe residual); `{"k_min":0}` → plain mirostat.
-    let floor = params.get("floor").and_then(|v| v.as_str()).unwrap_or("argmax");
-    let (built, keys) = match floor {
-        "argmax" => edsl::mirostat_argmax_floor(vocab)
-            .map_err(|e| format!("mirostat_argmax_floor build: {e:?}"))?,
-        _ if k_min > 0 => {
-            edsl::mirostat_floor(vocab, k_min).map_err(|e| format!("mirostat_floor build: {e:?}"))?
-        }
-        _ => edsl::mirostat(vocab).map_err(|e| format!("mirostat program build: {e:?}"))?,
-    };
-    let program =
-        inferlet::emit::emit_program(&built.program).map_err(|e| format!("mirostat emit: {e}"))?;
-    let n_out = built.outputs.len() as u32;
-
-    // μ-init re-tune (#19): the standard 2τ init is BELOW the spread-vocab surprise
-    // floor (~10 nats on 151936), which starves the gate. `ln(vocab)` is an upper
-    // bound on any distribution's min-surprise (= −log(1/vocab)), so μ0 = ln(vocab)+1
-    // guarantees a non-empty INITIAL keep regardless of the (unknown) floor; the rank
-    // floor (mirostat_floor) keeps it non-empty on every subsequent step too.
-    let mu0_default = (vocab as f32).ln() + 1.0;
-    let mut mu: f32 = json_f32(&params, "mu0", mu0_default);
     let mut surprises: Vec<f32> = Vec::with_capacity(max_tokens);
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
-    let mut pending: Vec<u32> = prompt;
 
-    for _ in 0..max_tokens {
-        let n = pending.len() as u32;
-        let pass = ForwardPass::new();
-        if fresh {
-            pass.fresh_generate();
-            fresh = false;
+    // ── PREFILL FIRE (N-wide) — first mirostat step over the prompt. ──
+    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let toks_p = bx(Channel::from(prompt_i32).named("toks_p"));
+    let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
+    let mu_p = bx(Channel::new([1], dtype::f32).named("mu_p"));
+    let rng_p = bx(Channel::from(vec![0x9e37_u32, 0]).named("rng_p"));
+    let tok_out_p = bx(Channel::new([1], dtype::i32).named("tok_out_p"));
+    let s_out_p = bx(Channel::new([1], dtype::f32).named("s_out_p"));
+
+    let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
+    fwd_p.embed(toks_p, Tensor::constant(vec![0u32, n]));
+    fwd_p.attn_working_set(ws, klen_p);
+    fwd_p.epilogue(move || {
+        let mu_v = mu_p.take().tensor();
+        let r = rng_p.take(); // [2] u32 rng state (key, ctr)
+        let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
+        let (token, surprise) = mirostat_step(floor, logits, vocab, mu_v, &r);
+        let r_next = add(&r, iota(2));
+        tok_out_p.put(&token);
+        s_out_p.put(&surprise);
+        rng_p.put(&r_next);
+    });
+
+    mu_p.put(vec![mu]);
+    let prefill = Pipeline::new();
+    fwd_p
+        .submit(&prefill)
+        .map_err(|e| format!("prefill submit: {e}"))?;
+    let g0 = tok_out_p
+        .take()
+        .get::<i32>()
+        .map_err(|e| format!("g0 take: {e}"))?[0];
+    let s0 = s_out_p
+        .take()
+        .get::<f32>()
+        .map_err(|e| format!("s0 take: {e}"))?[0];
+    prefill.close();
+
+    generated.push(g0 as u32);
+    surprises.push(s0);
+    mu -= lr * (s0 - tau);
+
+    // ── DECODE LOOP (1-wide) ──
+    if generated.len() < max_tokens {
+        let tok_in = bx(Channel::from(vec![g0; 1]).named("tok_in"));
+        let pos = bx(Channel::from(vec![n; 1]).named("pos"));
+        let klen = bx(Channel::from(vec![n + 1; 1]).named("klen"));
+        let fill = bx(Channel::from(vec![n + 1; 1]).named("fill"));
+        let mu_ch = bx(Channel::new([1], dtype::f32).named("mu_ch"));
+        let rng = bx(Channel::from(vec![0x51ed_u32, 0]).named("rng"));
+        let tok_out = bx(Channel::new([1], dtype::i32).named("tok_out"));
+        let s_out = bx(Channel::new([1], dtype::f32).named("s_out"));
+        let lane1 = Tensor::constant(vec![0u32, 1u32]);
+
+        let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
+        fwd.embed(tok_in, lane1);
+        fwd.positions(pos);
+        fwd.attn_working_set(ws, klen);
+        fwd.epilogue(move || {
+            // Takes + compute first, PUTS last (value-id discipline).
+            let base = fill.take().tensor(); // [1] u32
+            let mu_v = mu_ch.take().tensor(); // [1] f32, host-updated each step
+            let r = rng.take(); // [2] u32 rng state
+            let logits = intrinsics::logits(); // [vocab] f32
+            let (token, surprise) = mirostat_step(floor, logits, vocab, mu_v, &r);
+
+            let klen_v = add(&base, 1u32);
+            let next_free = add(&base, 1u32);
+            let r_next = add(&r, iota(2));
+
+            tok_in.put(&token);
+            tok_out.put(&token);
+            s_out.put(&surprise);
+            pos.put(&base);
+            klen.put(&klen_v);
+            fill.put(&next_free);
+            rng.put(&r_next);
+        });
+
+        let decode = Pipeline::new();
+        for step in 1..max_tokens {
+            mu_ch.put(vec![mu]);
+            fwd.submit(&decode)
+                .map_err(|e| format!("decode submit @{step}: {e}"))?;
+            let t = tok_out
+                .take()
+                .get::<i32>()
+                .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0];
+            let s = s_out
+                .take()
+                .get::<f32>()
+                .map_err(|e| format!("s_out.take @{step}: {e}"))?[0];
+            generated.push(t as u32);
+            surprises.push(s);
+            mu -= lr * (s - tau);
         }
-        let geom = geometry::ensure_pages(
-            &kv,
-            geometry::kv_write_geometry(seq_len, n, kv.page_size()),
-        )?;
-        geometry::attach_kv_write(&pass, &kv, &geom);
-        let positions: Vec<u32> = (seq_len..seq_len + n).collect();
-        pass.input_tokens(&pending, &positions);
-        // The program's `Logits` input is bound to the decode position (the last
-        // pending token); μ is the submit-bound scalar, rebound each fire.
-        let decode_pos = seq_len + n - 1;
-        let bindings = resolve_bindings(
-            &built.bindings,
-            &built.host_inputs,
-            &[decode_pos],
-            &[(keys.mu, encode_f32(&[mu]))],
-        )?;
-        // Raw keep-core sampler attach (2-arg): output count is inferred from the
-        // program's declared outputs; read them below via `outputs()`.
-        pass.sampler(&program, bindings);
-        pass.execute();
-        seq_len += n;
-
-        // The sampler's declared outputs in program order: [token] or
-        // [token, surprise]. `n_out` is carried only for the doc/degenerate note.
-        let _ = n_out;
-        let tensors = pass
-            .outputs()
-            .await
-            .map_err(|e| format!("mirostat: outputs: {e}"))?;
-        let tok_bytes = tensors
-            .first()
-            .ok_or_else(|| "mirostat: no token output".to_string())?
-            .read()
-            .map_err(|e| format!("mirostat: read token: {e:?}"))?;
-        let token = u32::from_le_bytes([tok_bytes[0], tok_bytes[1], tok_bytes[2], tok_bytes[3]]);
-        generated.push(token);
-
-        // CPU control update: μ ← μ − lr·(S − τ). The scalar S is the program's
-        // second output; if it is absent (single-output backend) skip the update
-        // for this step (still runs e2e).
-        if let Some(t_s) = tensors.get(1) {
-            if let Ok(sb) = t_s.read() {
-                if sb.len() >= 4 {
-                    let s = f32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
-                    surprises.push(s);
-                    mu -= lr * (s - tau);
-                }
-            }
-        }
-
-        pending = vec![token];
+        decode.close();
     }
 
     let mean_s = if surprises.is_empty() {
@@ -163,16 +227,12 @@ async fn main(input: String) -> Result<String> {
     } else {
         surprises.iter().sum::<f32>() / surprises.len() as f32
     };
-    // Late-window mean surprise (second half) — what a convergence assertion
-    // should check, since μ needs a few steps to settle toward τ.
     let tail_mean_s = if surprises.len() >= 2 {
         let tail = &surprises[surprises.len() / 2..];
         tail.iter().sum::<f32>() / tail.len() as f32
     } else {
         mean_s
     };
-    // `s_flowed` tells the harness whether the Scalar S channel was marshaled
-    // (true on the real driver / multi-output mock; false drops the μ-update).
     let s_flowed = !surprises.is_empty();
     let tokens_json = serde_json::to_string(&generated).unwrap_or_else(|_| "[]".to_string());
     let result = format!(

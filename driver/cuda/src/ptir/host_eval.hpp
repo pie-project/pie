@@ -342,6 +342,82 @@ inline std::vector<float> pivot_threshold_rankle(const std::vector<float>& in, s
     return o;
 }
 
+// ── pivot_threshold's three DYNAMIC predicates (interface/ptir interp.rs
+// Op::PivotThreshold) — the payload is ALWAYS a scalar/per-row trace value,
+// never an immediate. `*_numel == 1` broadcasts index 0 to every row (mirrors
+// interp.rs `pick(len, r)`), else one value per row. Unlike `rank_le` above
+// (the standalone/composite form, no NaN handling pinned), these mirror
+// interp.rs's rank/NaN contract exactly: a NaN element is NEVER selected, and
+// never counts toward another element's `greater` tally.
+template <class KT>
+inline std::vector<std::uint8_t> pivot_rankle(const std::vector<float>& in, std::uint32_t rows,
+                                              std::uint32_t len, const std::vector<KT>& k,
+                                              std::uint32_t k_numel) {
+    std::vector<std::uint8_t> o(in.size(), 0);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        const float* row = in.data() + (std::size_t)r * len;
+        std::int64_t kk = (std::int64_t)k[k_numel <= 1 ? 0u : r];
+        kk = kk < 0 ? 0 : (kk > (std::int64_t)len ? (std::int64_t)len : kk);
+        for (std::uint32_t i = 0; i < len; ++i) {
+            if (std::isnan(row[i])) { o[(std::size_t)r * len + i] = 0u; continue; }
+            std::int64_t greater = 0;
+            for (std::uint32_t j = 0; j < len; ++j)
+                if (!std::isnan(row[j]) && row[j] > row[i]) ++greater;
+            o[(std::size_t)r * len + i] = (greater < kk) ? 1u : 0u;
+        }
+    }
+    return o;
+}
+
+inline std::vector<std::uint8_t> pivot_probge(const std::vector<float>& in, std::uint32_t rows,
+                                              std::uint32_t len, const std::vector<float>& thr,
+                                              std::uint32_t thr_numel) {
+    std::vector<std::uint8_t> o(in.size(), 0);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        const float t = thr[thr_numel <= 1 ? 0u : r];
+        for (std::uint32_t i = 0; i < len; ++i)
+            o[(std::size_t)r * len + i] = (in[(std::size_t)r * len + i] >= t) ? 1u : 0u;
+    }
+    return o;
+}
+
+// Descending sort order used by cummass_le: value desc, ties -> lower index
+// first, NaN sorts last (ties among NaNs -> lower index first). Mirrors
+// interp.rs `sort_desc_order` exactly.
+inline std::vector<std::uint32_t> desc_order(const float* row, std::uint32_t len) {
+    std::vector<std::uint32_t> idx(len);
+    for (std::uint32_t i = 0; i < len; ++i) idx[i] = i;
+    std::stable_sort(idx.begin(), idx.end(), [&](std::uint32_t a, std::uint32_t b) {
+        float va = row[a], vb = row[b];
+        bool na = std::isnan(va), nb = std::isnan(vb);
+        if (na != nb) return nb;         // NaN sorts last
+        if (na && nb) return a < b;
+        if (va != vb) return va > vb;    // descending
+        return a < b;                    // ties -> lower index
+    });
+    return idx;
+}
+
+// cummass_le (top-p): keep the descending prefix whose EXCLUSIVE cumulative
+// mass stays `< p` (interp.rs: `k[i] = excl < p; excl += row[i]`).
+inline std::vector<std::uint8_t> pivot_cummassle(const std::vector<float>& in, std::uint32_t rows,
+                                                 std::uint32_t len, const std::vector<float>& p,
+                                                 std::uint32_t p_numel) {
+    std::vector<std::uint8_t> o(in.size(), 0);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        const float* row = in.data() + (std::size_t)r * len;
+        std::uint8_t* out_row = o.data() + (std::size_t)r * len;
+        const float pv = p[p_numel <= 1 ? 0u : r];
+        const auto order = desc_order(row, len);
+        float excl = 0.0f;
+        for (std::uint32_t i : order) {
+            out_row[i] = (excl < pv) ? 1u : 0u;
+            excl += row[i];
+        }
+    }
+    return o;
+}
+
 // ─────────────────────── library kernels (top_k, matmul) ─────────────────
 inline void topk(const std::vector<float>& in, std::uint32_t rows, std::uint32_t len,
                  std::uint32_t k, std::vector<float>& out_val, std::vector<std::uint32_t>& out_idx) {

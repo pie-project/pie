@@ -39,14 +39,14 @@ pub use ptir_dsl::intrinsics;
 
 // Re-export the eDSL vocabulary so an author writes stage closures with a single
 // `use inferlet::ptir::prelude::*;` (mirrors the old `ptir::prelude`).
+pub use ptir_dsl::{DType as Dtype, model};
 pub use ptir_dsl::{
-    add, and, broadcast, cast, cumprod, cummass_le, cumsum, div, dtype, eq, exp, gather,
+    add, and, broadcast, cast, cummass_le, cumprod, cumsum, div, dtype, eq, exp, gather,
     gather_row, ge, gt, gumbel, iota, l2norm, le, log, log_softmax, lt, mask_apply, matmul,
     max_elem, min_elem, mul, ne, neg, not, or, pivot_threshold, prob_ge, rank_le, reduce_argmax,
     reduce_max, reduce_min, reduce_sum, rem, reshape, rng, scatter_add, scatter_set, select,
     softmax, sub, top_k, transpose,
 };
-pub use ptir_dsl::{model, DType as Dtype};
 
 // ---------------------------------------------------------------------------
 // gid -> WIT channel registry
@@ -165,8 +165,16 @@ impl Channel {
         } else {
             DslChannel::new(shape, dtype)
         };
-        let dsl = if capacity != 1 { dsl.capacity(capacity) } else { dsl };
-        let wit = Rc::new(wit::Channel::new(&dims_of(shape), to_wit_dtype(dtype), capacity));
+        let dsl = if capacity != 1 {
+            dsl.capacity(capacity)
+        } else {
+            dsl
+        };
+        let wit = Rc::new(wit::Channel::new(
+            &dims_of(shape),
+            to_wit_dtype(dtype),
+            capacity,
+        ));
         register_channel(dsl.gid(), wit.clone());
         Channel { dsl, wit }
     }
@@ -184,13 +192,21 @@ impl Channel {
     /// `Err`).
     pub fn take(&self) -> Taken {
         let dsl = self.dsl.take();
-        Taken { dsl, wit: self.wit.clone(), dtype: self.dsl.dtype() }
+        Taken {
+            dsl,
+            wit: self.wit.clone(),
+            dtype: self.dsl.dtype(),
+        }
     }
 
     /// `read()` — peek a cell (leaves it full). Same dual as [`take`](Self::take).
     pub fn read(&self) -> Taken {
         let dsl = self.dsl.read();
-        Taken { dsl, wit: self.wit.clone(), dtype: self.dsl.dtype() }
+        Taken {
+            dsl,
+            wit: self.wit.clone(),
+            dtype: self.dsl.dtype(),
+        }
     }
 
     /// `put(v)` — in a stage closure `v` is an in-program [`Tensor`] (device
@@ -258,17 +274,23 @@ pub trait HostElem: Copy {
 }
 impl HostElem for i32 {
     fn decode(raw: &[u8]) -> Vec<i32> {
-        raw.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        raw.chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 }
 impl HostElem for u32 {
     fn decode(raw: &[u8]) -> Vec<u32> {
-        raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        raw.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 }
 impl HostElem for f32 {
     fn decode(raw: &[u8]) -> Vec<f32> {
-        raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        raw.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 }
 
@@ -288,7 +310,9 @@ pub struct WorkingSet {
 
 impl WorkingSet {
     pub fn new() -> WorkingSet {
-        WorkingSet { kv: Rc::new(KvWorkingSet::new()) }
+        WorkingSet {
+            kv: Rc::new(KvWorkingSet::new()),
+        }
     }
 
     /// Tokens per KV page for this working set's model.
@@ -324,7 +348,9 @@ impl WorkingSet {
     /// O(1) copy-on-write child over the complete logical address space,
     /// ordered on `on` — the branching primitive (beam/MCTS/self-correct).
     pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
-        Ok(WorkingSet { kv: Rc::new(self.kv.fork(&on.wit)?) })
+        Ok(WorkingSet {
+            kv: Rc::new(self.kv.fork(&on.wit)?),
+        })
     }
 
     /// Structurally shared child over `[start, start+len)`, rebased to page
@@ -350,8 +376,13 @@ impl WorkingSet {
         src_page_ids: &[u32],
         src_tok_idx: &[u32],
     ) -> Result<(), String> {
-        self.kv
-            .copy_into(&on.wit, dst_page_ids, dst_tok_idx, src_page_ids, src_tok_idx)
+        self.kv.copy_into(
+            &on.wit,
+            dst_page_ids,
+            dst_tok_idx,
+            src_page_ids,
+            src_tok_idx,
+        )
     }
 }
 
@@ -381,13 +412,58 @@ impl PageGrant {
 
     /// The grant as a WIT `page-range` (e.g. to `discard` it later).
     pub fn range(&self) -> PageRange {
-        PageRange { start: self.start, len: self.ids.len() as u32 }
+        PageRange {
+            start: self.start,
+            len: self.ids.len() as u32,
+        }
     }
 }
 
 impl IntoPut for PageGrant {
     fn into_put(self) -> PutValue {
         PutValue::Data(self.ids.into_const())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RsWorkingSet
+// ---------------------------------------------------------------------------
+
+/// The runtime's recurrent-state slots for hybrid / linear-attention models
+/// (GDN, Mamba2). Wraps the WIT `rs-working-set`. Bind via
+/// [`ForwardPass::rs_working_set`] for models whose `model::rs_state_size()`
+/// is nonzero; pure-attention models bind none (the single rs-working-set v1
+/// contract — `forward-pass.new` errs on more than one).
+pub struct RsWorkingSet {
+    rs: Rc<crate::working_set::RsWorkingSet>,
+}
+
+impl RsWorkingSet {
+    pub fn new() -> RsWorkingSet {
+        RsWorkingSet {
+            rs: Rc::new(crate::working_set::RsWorkingSet::new()),
+        }
+    }
+
+    /// Size in bytes of one folded recurrent-state object for this model.
+    pub fn state_size(&self) -> u64 {
+        self.rs.state_size()
+    }
+
+    /// Current number of buffered page slots.
+    pub fn buffer_size(&self) -> u32 {
+        self.rs.buffer_size()
+    }
+
+    /// Tokens per buffered RS page for this working set's model/driver.
+    pub fn buffer_page_size(&self) -> u32 {
+        self.rs.buffer_page_size()
+    }
+}
+
+impl Default for RsWorkingSet {
+    fn default() -> Self {
+        RsWorkingSet::new()
     }
 }
 
@@ -415,6 +491,7 @@ struct ForwardInner<'a> {
     ports: Vec<PortSpec>,
     stages: Vec<(Stage, StageClosure<'a>)>,
     working_sets: Vec<Rc<KvWorkingSet>>,
+    rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
     bound: Option<Rc<wit::ForwardPass>>,
 }
 
@@ -425,6 +502,7 @@ impl<'a> ForwardPass<'a> {
                 ports: Vec::new(),
                 stages: Vec::new(),
                 working_sets: Vec::new(),
+                rs_working_sets: Vec::new(),
                 bound: None,
             }),
         }
@@ -439,12 +517,12 @@ impl<'a> ForwardPass<'a> {
     pub fn embed(&self, toks: &Channel, indptr: impl Indptr) {
         {
             let mut inner = self.inner.borrow_mut();
-            inner.ports.push(PortSpec::Channel(Port::EmbedTokens, toks.dsl.clone()));
+            inner
+                .ports
+                .push(PortSpec::Channel(Port::EmbedTokens, toks.dsl.clone()));
             match indptr.resolve() {
                 IndptrSpec::Const(t) => inner.ports.push(PortSpec::Const(Port::EmbedIndptr, t)),
-                IndptrSpec::Channel(c) => {
-                    inner.ports.push(PortSpec::Channel(Port::EmbedIndptr, c))
-                }
+                IndptrSpec::Channel(c) => inner.ports.push(PortSpec::Channel(Port::EmbedIndptr, c)),
             }
         }
         self.invalidate();
@@ -452,7 +530,10 @@ impl<'a> ForwardPass<'a> {
 
     /// `positions(&pos)` — explicit RoPE positions; consumes (take).
     pub fn positions(&self, pos: &Channel) {
-        self.inner.borrow_mut().ports.push(PortSpec::Channel(Port::Positions, pos.dsl.clone()));
+        self.inner
+            .borrow_mut()
+            .ports
+            .push(PortSpec::Channel(Port::Positions, pos.dsl.clone()));
         self.invalidate();
     }
 
@@ -479,9 +560,22 @@ impl<'a> ForwardPass<'a> {
         self.invalidate();
     }
 
+    /// `rs_working_set(&rs)` — binds the recurrent-state slots for hybrid /
+    /// linear-attention models (GDN, Mamba2). No descriptor ports: presence in
+    /// `forward-pass.new`'s rs-working-sets list is itself the "this forward
+    /// writes recurrent state" signal (the single rs-working-set v1 contract).
+    /// Pure-attention models (`model::rs_state_size() == 0`) never call this.
+    pub fn rs_working_set(&self, rs: &RsWorkingSet) {
+        self.inner.borrow_mut().rs_working_sets.push(rs.rs.clone());
+        self.invalidate();
+    }
+
     /// `attn_mask(&m)` — masks this pass's queries over the KV axis (peeked).
     pub fn attn_mask(&self, m: &Channel) {
-        self.inner.borrow_mut().ports.push(PortSpec::Channel(Port::AttnMask, m.dsl.clone()));
+        self.inner
+            .borrow_mut()
+            .ports
+            .push(PortSpec::Channel(Port::AttnMask, m.dsl.clone()));
         self.invalidate();
     }
 
@@ -491,14 +585,20 @@ impl<'a> ForwardPass<'a> {
     /// `page_indptr`) cannot express. Records the port's endpoint claim per its
     /// consumption discipline, exactly like the other port setters.
     pub fn port_channel(&self, port: Port, ch: &Channel) {
-        self.inner.borrow_mut().ports.push(PortSpec::Channel(port, ch.dsl.clone()));
+        self.inner
+            .borrow_mut()
+            .ports
+            .push(PortSpec::Channel(port, ch.dsl.clone()));
         self.invalidate();
     }
 
     /// `readout(&out_idx)` — which positions are read out. A constant `out_idx`
     /// fixes the read-out row count.
     pub fn readout(&self, out_idx: &Tensor) {
-        self.inner.borrow_mut().ports.push(PortSpec::Const(Port::Readout, out_idx.clone()));
+        self.inner
+            .borrow_mut()
+            .ports
+            .push(PortSpec::Const(Port::Readout, out_idx.clone()));
         self.invalidate();
     }
 
@@ -556,7 +656,9 @@ impl<'a> ForwardPass<'a> {
                     PortSpec::Channel(port, ch) => {
                         builder.bind_port(*port, PortInput::Channel(ch.clone()))
                     }
-                    PortSpec::Const(port, t) => builder.bind_port(*port, PortInput::Const(t.clone())),
+                    PortSpec::Const(port, t) => {
+                        builder.bind_port(*port, PortInput::Const(t.clone()))
+                    }
                 }
             }
             for (stage, body) in &inner.stages {
@@ -573,8 +675,15 @@ impl<'a> ForwardPass<'a> {
             let borrows: Vec<&wit::Channel> = handles.iter().map(|rc| rc.as_ref()).collect();
             let kv_borrows: Vec<&KvWorkingSet> =
                 inner.working_sets.iter().map(|rc| rc.as_ref()).collect();
+            let rs_borrows: Vec<&crate::working_set::RsWorkingSet> =
+                inner.rs_working_sets.iter().map(|rc| rc.as_ref()).collect();
             let bytes = traced.encode();
-            Rc::new(wit::ForwardPass::new(&bytes, &borrows, &kv_borrows, &[])?)
+            Rc::new(wit::ForwardPass::new(
+                &bytes,
+                &borrows,
+                &kv_borrows,
+                &rs_borrows,
+            )?)
         };
 
         self.inner.borrow_mut().bound = Some(fp.clone());
@@ -603,7 +712,9 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new() -> Pipeline {
-        Pipeline { wit: wit_pipeline::Pipeline::new() }
+        Pipeline {
+            wit: wit_pipeline::Pipeline::new(),
+        }
     }
 
     /// `close()` — signal no further submissions (implied by drop).
@@ -689,16 +800,16 @@ impl AttnWsArgs for (&Channel, Tensor, &Channel, &Channel, &Channel) {
 /// Glob-import surface for PTIR inferlet authors: the eDSL vocabulary plus the
 /// four author-facing wrapper types.
 pub mod prelude {
-    pub use super::{Channel, ForwardPass, PageGrant, Pipeline, WorkingSet};
+    pub use super::{Channel, ForwardPass, PageGrant, Pipeline, RsWorkingSet, WorkingSet};
     pub use ptir_dsl::dtype;
     pub use ptir_dsl::intrinsics;
+    pub use ptir_dsl::model;
     pub use ptir_dsl::value::{
-        add, and, broadcast, cast, cumprod, cummass_le, cumsum, div, eq, exp, gather, gather_row,
-        ge, gt, gumbel, iota, l2norm, le, log, log_softmax, lt, mask_apply, matmul, max_elem,
-        min_elem, mul, ne, neg, not, or, pivot_threshold, prob_ge, rank_le, reduce_argmax,
-        reduce_max, reduce_min, reduce_sum, rem, reshape, rng, scatter_add, scatter_set, select,
-        softmax, sub, top_k, transpose, Tensor,
+        AsTensor, Tensor, add, and, broadcast, cast, cummass_le, cumprod, cumsum, div, eq, exp,
+        gather, gather_row, ge, gt, gumbel, iota, l2norm, le, log, log_softmax, lt, mask_apply,
+        matmul, max_elem, min_elem, mul, ne, neg, not, or, pivot_threshold, prob_ge, rank_le,
+        reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng, scatter_add,
+        scatter_set, select, softmax, sub, top_k, transpose,
     };
     pub use ptir_dsl::{DType, Port, Stage};
-    pub use ptir_dsl::model;
 }

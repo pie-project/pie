@@ -1,4 +1,4 @@
-//! Ported from xgrammar: test_grammar_matcher_basic.py
+//! Basic grammar matcher behavior.
 //!
 //! Tests basic matcher operations: token acceptance, bitmask, rollback,
 //! jump-forward, reset, termination.

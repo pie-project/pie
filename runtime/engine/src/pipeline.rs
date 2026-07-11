@@ -50,9 +50,7 @@ use fire::{PendingFires, PipelineFailure};
 /// fires funnel onto one ordered FIFO, fire t's epilogue puts happen-before
 /// fire t+1's descriptor reads. `push_back` at submit + `pop_front` at
 /// finalize preserve that order; the same-pipeline check makes it an explicit
-/// invariant, not an accident. Tested by
-/// `pipeline::fire::tests::fifo_preserves_submission_order` and
-/// `pipeline::fire::lease` device-geometry detection tests.
+/// invariant, not an accident.
 ///
 /// Domain state (not WIT glue), so it lives here rather than in
 /// `inferlet::host::pipeline`, which only holds the `Host`/`HostPipeline`

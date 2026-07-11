@@ -1,54 +1,42 @@
-//! Late-channel grammar masking verify (cut #2 production supply, `LATE_MASK_OK`).
+//! Late-channel grammar masking verify (cut #2 production supply, `LATE_MASK_OK`)
+//! — **`inferlet::ptir` bridge rewrite**. The classic split between a
+//! submit-staged blob mask and a `Readiness::Late` device-alias mask no
+//! longer exists at the guest surface: every host input rides a first-class
+//! `Channel`, and a host-writer channel's `put` (staged before `submit`,
+//! coalesced into the fire) IS the production device-alias supply path — the
+//! single channel mechanism now serves both the `grammar` (`MASK_OP_OK`) and
+//! this `grammar-late` (`LATE_MASK_OK`) verify. Kept as its own inferlet (own
+//! JSON knobs + result field names) so the R=2 barrier (`cuda_grammar_r2`)
+//! keeps its two DISJOINT-alphabet, distinguishable-token proof.
 //!
-//! The Late-supply counterpart to the `grammar` (`MASK_OP_OK`) op-verify: it
-//! drives the de-hardwired grammar-masking OP (Sampling-IR `0x65 mask-apply`)
-//! end-to-end through the **production Late-channel supply** — the packed mask is
-//! a `Readiness::Late` host input (`grammar_with_logits`), so it rides bravo's
-//! **device-alias carrier** (`sampling_late_device_*`) → @ingim's direct
-//! WASM-slice→device memcpy (`pie_tensor_write_async`, no IPC staging) → echo's
-//! `HostLate` resolve, instead of the submit-staged blob path.
-//!
-//! The mask supply is identical at the inferlet level (`resolve_bindings` builds
-//! `Tensor::from_data(mask_bytes)` for the mask slot) — the HOST routes it by the
-//! program's declared `InputDecl.ready == Late` into the device-alias channel.
-//! So this exercises the cut-#1-supply-drift class on the **real** production
-//! channel, which `MASK_OP_OK` (Submit) explicitly does NOT.
-//!
-//! Two non-degenerate asserts (the cut #1 discipline; an all-allowed no-op mask
-//! cannot pass):
+//! Two non-degenerate asserts (the cut #1 discipline — an all-allowed no-op
+//! mask cannot pass):
 //!   1. CONFORM: every step, the device token == `apply_mask_argmax(raw_logits,
 //!      mask)` recomputed host-side with the byte-identical CPU reference
-//!      (`inferlet::mask`). A misaligned/dropped device-alias carrier ⇒ wrong or
-//!      empty mask ⇒ conform fails (a dropped carrier ⇒ `SkippedLateBindMiss` ⇒
-//!      the constrained token is the unconstrained argmax ⇒ also fails #2).
-//!   2. FORCED-OUT @ step 0: the natural (unconstrained) argmax is DISALLOWED in
-//!      the mask AND absent from the output (the `-inf` actually fired through the
-//!      device-alias-supplied mask). The small alphabet disallows the model's
-//!      natural (large-id) pick, so a transparent/dropped mask is caught loud.
+//!      (`inferlet::mask`).
+//!   2. FORCED-OUT @ step 0: the natural (unconstrained) argmax is DISALLOWED
+//!      in the mask AND absent from the output (the `-inf` actually fired
+//!      through the channel-supplied mask).
 //!
-//! Run it on the MERGED run-ahead path (delta drives): the late carrier rides the
-//! batch-merged request (`extend_sampling_programs_from` concat — the exact cut #1
-//! drop site, now with the durable carrier-preservation guard).
+//! Loop-carried `pos`/`klen`/`fill` (the `isolatedtopp`/`mirostat` split: `klen`
+//! is the port-bound channel `attn_working_set` reads, `fill` is the internal
+//! carry the epilogue advances) grow the absolute RoPE position and the
+//! attended KV length by 1 every fire, so each fire embeds at the growing
+//! absolute position and attends the FULL committed KV — not a fixed 1-token
+//! window re-fired at position 0 forever.
 //!
-//! Build/run (GPU):
-//!   cargo build --target wasm32-wasip2 -p grammar-late
-//!   cargo test -p pie-bin --features driver-cuda --test cuda_grammar_late -- --ignored --nocapture
+//! JSON input: `{"alphabet":[..],"max_tokens":N}` (defaults `[10,11,12,13]`, 8).
 
-use inferlet::inference::ForwardPass;
-use inferlet::mask::{all_allowed, apply_mask_argmax, bf16_hi_to_f32, bit_allowed, pack_allowed};
-use inferlet::serde_json;
-use inferlet::working_set::KvWorkingSet;
-use inferlet::{geometry, model, sampler, Result};
+use inferlet::mask::{all_allowed, apply_mask_argmax, bit_allowed, pack_allowed};
+use inferlet::ptir::prelude::*;
+use inferlet::{Result, model as wit_model, serde_json};
 
-/// Default constraint alphabet: the only token ids the grammar ever allows. Small
-/// ids the model never naturally argmaxes, so the natural pick is always forced
-/// out. Override via `{"alphabet":[..]}` — the gate-1 R=2 barrier launches two
-/// procs with DISJOINT alphabets so their constrained tokens are distinguishable
-/// (`tok_A ∈ alphabet_A` ≠ `tok_B ∈ alphabet_B` by construction, ruling out a
-/// `per_req[0]→both` mask aliasing on the merged `forward_R=2` fire).
+/// Default constraint alphabet: the only token ids the grammar ever allows.
 const ALPHABET: [u32; 4] = [10, 11, 12, 13];
 /// Default tokens to generate; override via `{"max_tokens":N}`.
 const MAX_TOKENS: usize = 8;
+const PAGE_T: u32 = 16;
+const NUM_LAYERS: u32 = 1;
 
 /// Tiny DFA: allow any alphabet token except the one just emitted (no repeats).
 struct NoRepeatMatcher {
@@ -75,21 +63,8 @@ impl NoRepeatMatcher {
     }
 }
 
-/// Read a raw-logits output tensor as `f32`, converting bf16 storage exactly as
-/// the driver does (`bf16_hi_to_f32`) so the host CPU reference is byte-identical
-/// to the device's `0x65` f32-from-bf16 compute.
-fn logits_as_f32(bytes: &[u8], vocab: usize) -> Vec<f32> {
-    if bytes.len() == vocab * 2 {
-        bytes
-            .chunks_exact(2)
-            .map(|c| bf16_hi_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()
-    } else {
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
+fn bx<T>(v: T) -> &'static T {
+    Box::leak(Box::new(v))
 }
 
 #[inferlet::main]
@@ -100,88 +75,102 @@ async fn main(input: String) -> Result<String> {
         .and_then(|x| x.as_u64())
         .map(|x| x as usize)
         .unwrap_or(MAX_TOKENS);
-    // The grammar's allowed alphabet. The gate-1 R=2 barrier passes two DISJOINT
-    // alphabets (A=[10..13], B=[20..23]) so the two procs' constrained tokens are
-    // distinguishable on the merged `forward_R=2` fire (no `per_req[0]→both` alias).
     let alphabet: Vec<u32> = params
         .get("alphabet")
         .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect()
+        })
         .filter(|a: &Vec<u32>| !a.is_empty())
         .unwrap_or_else(|| ALPHABET.to_vec());
 
-    // Logits/output vocab (= hf_config.vocab_size); the program masks + samples
-    // over the logits dim.
-    let vocab = model::output_vocab_size();
+    let vocab = wit_model::output_vocab_size();
+    model::configure(vocab, PAGE_T, NUM_LAYERS);
 
-    let mut prompt = model::encode("hello world");
+    let mut prompt = wit_model::encode("hello world");
     if prompt.is_empty() {
         prompt.push(0);
     }
+    let seed_tok = *prompt.last().unwrap() as i32;
 
-    // Keep-core masked grammar sampler with raw logits + a **Late** mask (the
-    // production device-alias supply channel): `argmax(mask_apply(logits, mask))`
-    // → outputs [0]=constrained token, [1]=raw logits (read via `outputs()`). Off
-    // the `Context`/`Forward`/`program` facade; the mask value is supplied
-    // identically (`Tensor::from_data`) — the program's `Readiness::Late` routes it
-    // host-side into the device-alias carrier.
-    let g = sampler::grammar_program_with_logits_late(vocab)?;
+    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    ws.reserve(1).map_err(|e| format!("ws.reserve: {e}"))?;
 
-    let kv = KvWorkingSet::new();
-    let mut seq = 0u32;
-    let mut fresh = true;
+    // Channels: tok_in is the device loop-carried token (seeded; each fire's
+    // embed takes it, the epilogue re-puts the constrained pick); pos is the
+    // loop-carried absolute RoPE position of THIS fire's token; klen/fill grow
+    // the attended KV length by 1 every fire (klen is the port-bound channel
+    // read by attn_working_set; fill is the internal loop-carry advancing it
+    // — same split as `isolatedtopp`/`mirostat`) so each fire embeds at the
+    // growing absolute position and attends the FULL committed KV, not a
+    // fixed 1-token window. gmask is the per-step host-writer allowed mask
+    // (the production channel supply path); tok_out/raw are host-reader
+    // outputs (constrained token + RAW logits).
+    let tok_in = bx(Channel::from(vec![seed_tok]).named("tok_in"));
+    let pos = bx(Channel::from(vec![0u32]).named("pos"));
+    let klen = bx(Channel::from(vec![1u32]).named("klen"));
+    let fill = bx(Channel::from(vec![1u32]).named("fill"));
+    let gmask = bx(Channel::new([vocab], dtype::bool).named("gmask"));
+    let tok_out = bx(Channel::new([1], dtype::i32).named("tok_out"));
+    let raw = bx(Channel::new([vocab], dtype::f32).named("raw"));
+
+    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
+    fwd.embed(tok_in, Tensor::constant(vec![0u32, 1]));
+    fwd.positions(pos);
+    fwd.attn_working_set(ws, klen);
+    fwd.epilogue(move || {
+        // Takes + compute first, PUTS last (value-id discipline).
+        let base = fill.take().tensor(); // [1] u32 — this fire's absolute position
+        let m = gmask.take(); // [V] bool, host-fed per step
+        let lg = intrinsics::logits(); // [V] f32 (read-out row)
+        let tok = reshape(reduce_argmax(mask_apply(&lg, &m)), [1]); // [1] i32
+
+        let klen_v = add(&base, 1u32); // cells 0..=base after this fire
+        let next_free = add(&base, 1u32); // position the NEXT fire writes
+
+        tok_in.put(&tok);
+        tok_out.put(&tok);
+        raw.put(&lg);
+        pos.put(&base);
+        klen.put(&klen_v);
+        fill.put(&next_free);
+    });
 
     let mut matcher = NoRepeatMatcher::new(alphabet.clone());
     let mut tokens: Vec<u32> = Vec::with_capacity(max_tokens);
-    let mut pending: Vec<u32> = prompt;
 
     let mut conform_ok = true;
     let mut forced_out_ok = false;
     let mut natural0: i64 = -1;
 
+    let pipeline = Pipeline::new();
     for step in 0..max_tokens {
         let allowed = matcher.allowed();
         let packed = pack_allowed(vocab as usize, &allowed);
+        let mask_bool: Vec<bool> = (0..vocab as usize)
+            .map(|j| bit_allowed(&packed, j))
+            .collect();
 
-        // Raw grammar fire (geometry + input + Late-masked sampler + execute),
-        // reading BOTH outputs (Token, raw Logits) via the raw `outputs()`.
-        let n = pending.len() as u32;
-        let pass = ForwardPass::new();
-        if fresh {
-            pass.fresh_generate();
-            fresh = false;
-        }
-        let geom = geometry::ensure_pages(&kv, geometry::kv_write_geometry(seq, n, kv.page_size()))?;
-        geometry::attach_kv_write(&pass, &kv, &geom);
-        let positions: Vec<u32> = (seq..seq + n).collect();
-        pass.input_tokens(&pending, &positions);
-        let decode_pos = seq + n - 1;
-        pass.sampler(&g.program, g.bindings(decode_pos, &packed)?);
-        pass.execute();
-        seq += n;
+        gmask.put(mask_bool);
+        fwd.submit(&pipeline)
+            .map_err(|e| format!("submit @{step}: {e}"))?;
+        let token = tok_out
+            .take()
+            .get::<i32>()
+            .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
+        let logits = raw
+            .take()
+            .get::<f32>()
+            .map_err(|e| format!("raw.take @{step}: {e}"))?;
 
-        let outs = pass
-            .outputs()
-            .await
-            .map_err(|e| format!("outputs @{step}: {e}"))?;
-        let tok_bytes = outs[0].read().map_err(|e| format!("read token @{step}: {e:?}"))?;
-        let token = if tok_bytes.len() >= 4 {
-            i32::from_le_bytes([tok_bytes[0], tok_bytes[1], tok_bytes[2], tok_bytes[3]]) as u32
-        } else {
-            0
-        };
-        let logit_bytes = outs[1].read().map_err(|e| format!("read logits @{step}: {e:?}"))?;
-        let logits = logits_as_f32(&logit_bytes, vocab as usize);
-
-        // Assert #1 CONFORM: device token == host apply_mask_argmax(raw logits, mask).
+        // Assert #1 CONFORM: device token == host apply_mask_argmax(raw, mask).
         let host_token = apply_mask_argmax(&logits, &packed);
         if token != host_token {
             conform_ok = false;
-            eprintln!(
-                "[GRAMMAR-LATE] CONFORM mismatch @{step}: device={token} host={host_token}"
-            );
+            eprintln!("[GRAMMAR-LATE] CONFORM mismatch @{step}: device={token} host={host_token}");
         }
-        // Grammar conformance invariant: the constrained token is in the alphabet.
         if !alphabet.contains(&token) {
             conform_ok = false;
             eprintln!("[GRAMMAR-LATE] grammar violated @{step}: {token} not in alphabet");
@@ -189,7 +178,6 @@ async fn main(input: String) -> Result<String> {
 
         // Assert #2 FORCED-OUT @ step 0: the natural argmax is disallowed + forced out.
         if step == 0 {
-            // Step-0 raw logits ARE the unconstrained logits (history = prompt only).
             let u0 = apply_mask_argmax(&logits, &all_allowed(vocab as usize));
             natural0 = u0 as i64;
             let disallowed = !bit_allowed(&packed, u0 as usize);
@@ -201,8 +189,8 @@ async fn main(input: String) -> Result<String> {
 
         matcher.accept(token);
         tokens.push(token);
-        pending = vec![token];
     }
+    pipeline.close();
 
     let late_mask_ok = conform_ok && forced_out_ok;
     let result = format!(

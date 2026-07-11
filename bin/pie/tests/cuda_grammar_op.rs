@@ -39,7 +39,7 @@ async fn grammar_mask_op_on_real_driver() -> Result<()> {
     eprintln!("[grammar-op] booted, listen_addr={}", pie.listen_addr);
 
     // Build the grammar mask-apply OP verify inferlet.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "grammar"])
         .current_dir(&ws)
@@ -72,12 +72,14 @@ async fn grammar_mask_op_on_real_driver() -> Result<()> {
 
     pie.shutdown().await;
 
-    // The inferlet reports `MASK_OP_OK=<bool>` = CONFORM (device==CPU-ref) ∧
-    // FORCED-OUT (natural argmax disallowed + forced out). Non-degenerate by
-    // construction: an all-allowed mask fails FORCED-OUT, a wrong device mask
-    // fails CONFORM.
+    // CONFORM (device==CPU-ref) ∧ FORCED-OUT (natural argmax disallowed +
+    // forced out). Non-degenerate by construction: an all-allowed mask fails
+    // FORCED-OUT, a wrong device mask fails CONFORM.
+    let report: serde_json::Value =
+        serde_json::from_str(&json).context("parse grammar report")?;
     anyhow::ensure!(
-        json.contains("MASK_OP_OK=true"),
+        report.get("conform").and_then(|v| v.as_bool()) == Some(true)
+            && report.get("forced_out").and_then(|v| v.as_bool()) == Some(true),
         "grammar mask-apply OP verify failed — device mask-apply diverged from \
          the host CPU reference (conform) or the disallowed natural argmax was \
          NOT forced out (-inf didn't fire): {json}"

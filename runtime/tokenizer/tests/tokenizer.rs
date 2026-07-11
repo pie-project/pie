@@ -1,16 +1,18 @@
-use pie_tokenizer::Tokenizer;
-/// Integration tests using real HuggingFace tokenizer.json files.
-///
-/// These tests load actual model tokenizers from the HF cache and verify
-/// that encode/decode produce correct results.
-///
-/// Expected token IDs were obtained from the HuggingFace Python tokenizers library:
-/// ```python
-/// from transformers import AutoTokenizer
-/// tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-/// print(tok.encode("Hello, world!"))
-/// ```
+//! Integration tests using real HuggingFace tokenizer.json files.
+//!
+//! These tests load actual model tokenizers from the HF cache and verify
+//! that encode/decode produce correct results.
+//!
+//! Expected token IDs were obtained from the HuggingFace Python tokenizers library:
+//! ```python
+//! from transformers import AutoTokenizer
+//! tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+//! print(tok.encode("Hello, world!"))
+//! ```
+
 use std::path::Path;
+
+use pie_tokenizer::Tokenizer;
 
 // ---------------------------------------------------------------------------
 // Helper

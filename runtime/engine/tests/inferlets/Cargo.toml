@@ -27,7 +27,6 @@ members = [
     "mtp-specdecode",
     "mtpverify",
     "mtp-native-verify",
-    "drafts-retain-e2e",
     "ptir-greedy-e2e",
     "beam",
     "beam-designb",
@@ -38,6 +37,7 @@ members = [
     "linearfold",
     "samplerprobe",
     "carrierprobe",
+    "selfspec",
 ]
 
 [workspace.dependencies]

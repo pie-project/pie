@@ -54,32 +54,36 @@ InterpInstance make_inst(int n_channels) {
 int main() {
     std::printf("[is_device_geometry_trace]\n");
 
-    // Positions channel-bound => device geometry (the classification's
-    // canonical trigger — matches CUDA's is_device_geometry_trace exactly).
+    // Ordinary structural channels alone do not trigger device geometry.
     {
         Trace t = make_trace(1, {{kPortPositions, 0, false}});
-        expect(is_device_geometry_trace(t), "Positions channel-bound => device geometry");
+        expect(!is_device_geometry_trace(t), "Positions alone => runtime-owned geometry");
     }
-    // Pages / PageIndptr / WSlot / WOff / AttnMask each independently trigger it.
     {
         Trace t = make_trace(1, {{kPortPages, 0, false}});
-        expect(is_device_geometry_trace(t), "Pages channel-bound => device geometry");
-    }
-    {
-        Trace t = make_trace(1, {{kPortPageIndptr, 0, false}});
-        expect(is_device_geometry_trace(t), "PageIndptr channel-bound => device geometry");
+        expect(!is_device_geometry_trace(t), "Pages alone => runtime-owned geometry");
     }
     {
         Trace t = make_trace(1, {{kPortWSlot, 0, false}});
-        expect(is_device_geometry_trace(t), "WSlot channel-bound => device geometry");
-    }
-    {
-        Trace t = make_trace(1, {{kPortWOff, 0, false}});
-        expect(is_device_geometry_trace(t), "WOff channel-bound => device geometry");
+        expect(!is_device_geometry_trace(t), "WSlot alone => incomplete device geometry");
     }
     {
         Trace t = make_trace(1, {{kPortAttnMask, 0, false}});
-        expect(is_device_geometry_trace(t), "AttnMask channel-bound => device geometry");
+        expect(!is_device_geometry_trace(t), "AttnMask alone => runtime-owned geometry");
+    }
+
+    // Runtime contract: WSlot/WOff plus channel-bound [B,P] Pages with P>1.
+    {
+        Trace t = make_trace(3, {{kPortPages, 0, false},
+                                 {kPortWSlot, 1, false},
+                                 {kPortWOff, 2, false}});
+        t.channels[0].type.shape.dims = {2, 3};
+        expect(is_device_geometry_trace(t), "write descriptors + Pages[B,P>1] => device geometry");
+    }
+    {
+        Trace t = make_trace(2, {{kPortPages, 0, false}, {kPortWSlot, 1, false}});
+        t.channels[0].type.shape.dims = {2, 1};
+        expect(!is_device_geometry_trace(t), "Pages[B,1] => ordinary geometry");
     }
     // The canonical (runtime-owned) shape — token embed + KvLen-only
     // attention, plus a Readout channel — is NOT device geometry.

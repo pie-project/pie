@@ -29,7 +29,7 @@ pub(crate) mod stats;
 pub(crate) mod wire;
 pub mod worker;
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
 
@@ -93,6 +93,89 @@ pub(crate) fn scheduler_handle(driver_id: usize) -> Result<SchedulerHandle> {
 }
 
 // =============================================================================
+// Fire trace (`PIE_SCHED_TRACE` / `PIE_SCHED_TRACE_FILE`)
+// =============================================================================
+
+/// Whether the scheduler fire trace is enabled. Read once (cached, like
+/// `quorum::max_in_flight`'s env lever) — MUST be set before the first fire
+/// (before boot), since later env mutations are never re-observed. `worker`
+/// checks this before doing any per-fire trace bookkeeping (e.g. the
+/// distinct-program count), so tracing off costs nothing on the hot path.
+pub(crate) fn sched_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PIE_SCHED_TRACE").is_ok_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
+/// The optional trace sink (`PIE_SCHED_TRACE_FILE`), opened once in append
+/// mode. A real file — unlike `eprintln!`'s fd 2 — survives libtest's
+/// stdout/stderr capture-sink for a background scheduler thread (see
+/// `cuda_grammar10.rs`'s `StderrCapture` doc for why the file form exists
+/// alongside the fd-2 form `cuda_grammar_r2.rs` captures via `dup2`).
+fn sched_trace_file() -> Option<&'static Mutex<std::fs::File>> {
+    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::env::var_os("PIE_SCHED_TRACE_FILE")?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(Mutex::new)
+    })
+    .as_ref()
+}
+
+/// Appends one `[pie-sched-trace] …` fire line: to stderr (fd 2 — the
+/// `cuda_grammar_r2` capture) always when [`sched_trace_enabled`], and ALSO
+/// to `PIE_SCHED_TRACE_FILE` when set (the `cuda_grammar10` capture),
+/// flushed immediately so a polling reader observes it append-only and
+/// promptly. Callers should guard any per-fire bookkeeping this line needs
+/// (e.g. a distinct-program count) behind [`sched_trace_enabled`] first, so
+/// tracing-off costs nothing beyond that one flag read.
+pub(crate) fn sched_trace_write(args: std::fmt::Arguments) {
+    if !sched_trace_enabled() {
+        return;
+    }
+    eprintln!("[pie-sched-trace] {args}");
+    if let Some(file) = sched_trace_file() {
+        use std::io::Write;
+        let mut file = file.lock().unwrap();
+        let _ = writeln!(file, "[pie-sched-trace] {args}");
+        let _ = file.flush();
+    }
+}
+
+// =============================================================================
+// Demoted-pipeline reaper hook (M-A2)
+// =============================================================================
+
+/// `WaitAllPolicy::take_terminate_candidates` reaps a pipeline through the
+/// process facade (`inferlet::process::terminate`), which is L4 — above
+/// `scheduler` (L2) in the layering, so this module may not import it
+/// directly. A plain closure seam instead: `bootstrap` installs it once, at
+/// startup, wired to the real facade; a unit-test scheduler with no
+/// installed hook just leaves demoted candidates undrained (no reaper, no
+/// panic).
+type TerminateHook = Box<dyn Fn(ProcessId) + Send + Sync>;
+static TERMINATE_HOOK: std::sync::OnceLock<TerminateHook> = std::sync::OnceLock::new();
+
+/// Installs the demoted-pipeline reaper (called once, from `bootstrap`,
+/// after [`spawn`]).
+pub(crate) fn install_terminate_hook(hook: impl Fn(ProcessId) + Send + Sync + 'static) {
+    let _ = TERMINATE_HOOK.set(Box::new(hook));
+}
+
+/// Reaps a pipeline `WaitAllPolicy` demoted for missing too many consecutive
+/// wave deadlines. No-op until [`install_terminate_hook`] runs.
+pub(crate) fn terminate_demoted_pipeline(pid: ProcessId) {
+    if let Some(hook) = TERMINATE_HOOK.get() {
+        hook(pid);
+    }
+}
+
+// =============================================================================
 // Public API: spawn/get_stats/shutdown plain scheduler surfaces (no actor)
 // =============================================================================
 
@@ -153,20 +236,16 @@ pub fn submit_async(
     instance_id: u64,
     physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
     last_page_len: u32,
-    program_identity_hashes: Vec<u64>,
     pipeline_id: Option<ProcessId>,
     completion: crate::driver::InstanceCompletion,
 ) -> Result<()> {
-    let submitted_at_us = worker::now_micros();
     scheduler_handle(driver_idx)?.submit_with_identity(
         request,
         instance_id,
         completion,
         physical_page_ids,
         last_page_len,
-        program_identity_hashes,
         pipeline_id,
-        submitted_at_us,
     )
 }
 
@@ -176,7 +255,6 @@ pub fn submit_prebuilt_async(
     instance_id: u64,
     physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
     last_page_len: u32,
-    program_identity_hashes: Vec<u64>,
     completion: crate::driver::InstanceCompletion,
 ) -> Result<()> {
     scheduler_handle(driver_idx)?.submit_prebuilt(
@@ -185,7 +263,6 @@ pub fn submit_prebuilt_async(
         completion,
         physical_page_ids,
         last_page_len,
-        program_identity_hashes,
     )
 }
 

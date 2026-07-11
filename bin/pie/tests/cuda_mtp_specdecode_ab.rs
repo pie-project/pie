@@ -104,7 +104,7 @@ async fn mtp_specdecode_device_ab() -> Result<()> {
     let k = draft_k();
     eprintln!("[specdecode-ab] k = {k}");
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     build_wasm(&ws, "mtp-specdecode")?;
     build_wasm(&ws, "mtp-native-verify")?;
 

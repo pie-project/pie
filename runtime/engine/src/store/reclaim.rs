@@ -72,12 +72,30 @@ pub(crate) enum LeaveKind {
     Suspend,
 }
 
-/// Pipeline-leave/join hooks — no-ops until the scheduler wires a
-/// subscription here (see [`LeaveKind`]); kept so the reclaim ladder's call
-/// sites document the A×B coupling (`report_suspended`/restore) without
-/// reaching upward into `scheduler/`.
-pub(crate) fn notify_pipeline_leave(_pid: ProcessId, _kind: LeaveKind) {}
+/// Pipeline-leave/join hooks. `notify_pipeline_leave` forwards to the
+/// subscription the scheduler installs via [`set_pipeline_leave_hook`] (a
+/// plain closure, so this module never names `crate::scheduler` and stays
+/// below it in the layering — see [`LeaveKind`]'s doc for the A×B coupling
+/// this seam serves); a no-op until installed. `notify_pipeline_join` stays
+/// inert: the wait-all quorum's rejoin is implicit on a pipeline's next
+/// wave request, so a join event has nothing to do on the scheduler side
+/// either.
+pub(crate) fn notify_pipeline_leave(pid: ProcessId, _kind: LeaveKind) {
+    if let Some(hook) = PIPELINE_LEAVE_HOOK.get() {
+        hook(pid);
+    }
+}
 pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
+
+type PipelineLeaveHook = Box<dyn Fn(ProcessId) + Send + Sync>;
+static PIPELINE_LEAVE_HOOK: OnceLock<PipelineLeaveHook> = OnceLock::new();
+
+/// Installs the scheduler's wait-all leave subscription (called once, from
+/// `bootstrap`, wiring this to `scheduler::worker::notify_pipeline_leave`).
+/// A plain closure keeps `store` below `scheduler` in the layering.
+pub(crate) fn set_pipeline_leave_hook(hook: impl Fn(ProcessId) + Send + Sync + 'static) {
+    let _ = PIPELINE_LEAVE_HOOK.set(Box::new(hook));
+}
 
 /// How the runtime reacts to a KV pool exhaustion at the prep seam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

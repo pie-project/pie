@@ -41,7 +41,7 @@ async fn self_spec_device_alias_verify_on_real_driver() -> Result<()> {
     let pie = common::boot_4090().await?;
     eprintln!("[self-spec] booted, listen_addr={}", pie.listen_addr);
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "selfspec"])
         .current_dir(&ws)

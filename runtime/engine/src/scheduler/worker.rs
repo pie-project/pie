@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::driver::{
     BoundInstance, ChannelRegistrationPlan, Completion, DriverId, InstanceBindingPlan,
@@ -21,36 +21,36 @@ use super::stats::{self, SchedulerStats};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FireClause {
     Quorum,
-    SubmitAhead,
     IdleEscape,
     ColdHold,
-    Hold,
-}
-
-impl FireClause {
-    #[inline]
-    pub fn fires(self) -> bool {
-        !matches!(self, FireClause::Hold)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeaveKind {
     Terminate,
-    #[allow(dead_code)] // Suspend is now handled by store::reclaim's own local twin.
     Suspend,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LifecycleEvent {
-    #[allow(dead_code)]
-    pid: ProcessId,
-    #[allow(dead_code)]
-    kind: Option<LeaveKind>,
+/// A pipeline left the fleet (cancel / kill / exit / TASK-A terminate /
+/// TASK-B preempt). Broadcasts to EVERY registered driver's scheduler
+/// thread (a pipeline's requests may have landed on any of them) so each
+/// thread's local [`quorum::WaitAllPolicy`] drops `pid` from its wave
+/// wait-set. Fire-and-forget: a shutting-down/closed scheduler channel is
+/// silently skipped (nothing left there to notify). `_kind` is unused —
+/// the quorum drops a pipeline the same way whether it terminated or was
+/// merely suspended (see [`quorum::WaitAllPolicy::on_pipeline_leave`]'s
+/// doc); kept on the signature so call sites document which case fired.
+pub(crate) fn notify_pipeline_leave(pid: ProcessId, _kind: LeaveKind) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::PipelineLeave(pid));
+    }
 }
-
-pub(crate) fn notify_pipeline_leave(_pid: ProcessId, _kind: LeaveKind) {}
-#[allow(dead_code)] // store::reclaim now owns the join hook for its own callers.
+/// No-op: quorum rejoin is implicit on the pipeline's next
+/// [`quorum::WaitAllPolicy::on_pipeline_request`] call, so a join event has
+/// nothing to do here (`store::reclaim` owns the join hook for its own
+/// suspend/restore callers, which is equally inert for the same reason).
+#[allow(dead_code)] // no live caller — see doc.
 pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
 
 /// Wake-class counter (plan §16.2): completions that the 250 ms hang backstop
@@ -59,15 +59,9 @@ pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
 pub(crate) static BACKSTOP_RETIREMENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Total backstop-path retirements since process start (test observability).
+#[cfg(test)]
 pub(crate) fn backstop_retirements() -> u64 {
     BACKSTOP_RETIREMENTS.load(Ordering::Relaxed)
-}
-
-pub(crate) fn now_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or_default()
 }
 
 pub(crate) struct PendingRequest {
@@ -76,10 +70,11 @@ pub(crate) struct PendingRequest {
     pub(crate) completion: InstanceCompletion,
     pub(crate) physical_page_ids: Vec<PhysicalPageId>,
     pub(crate) last_page_len: u32,
-    pub(crate) program_identity_hashes: Vec<u64>,
-    #[allow(dead_code)]
+    /// The submitting pipeline's identity (`ProcessCtx::process_id()`), or
+    /// `None` for an untracked/prebuilt fire (device-geometry, beam replay,
+    /// this module's own unit tests) — the quorum wait-set key
+    /// ([`quorum::WaitAllPolicy::on_pipeline_request`]).
     pub(crate) pipeline_id: Option<ProcessId>,
-    pub(crate) submitted_at_us: u64,
     pub(crate) prebuilt: bool,
 }
 
@@ -90,9 +85,7 @@ impl PendingRequest {
         completion: InstanceCompletion,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
-        program_identity_hashes: Vec<u64>,
         pipeline_id: Option<ProcessId>,
-        submitted_at_us: u64,
         prebuilt: bool,
     ) -> Self {
         Self {
@@ -101,9 +94,7 @@ impl PendingRequest {
             completion,
             physical_page_ids,
             last_page_len,
-            program_identity_hashes,
             pipeline_id,
-            submitted_at_us,
             prebuilt,
         }
     }
@@ -156,6 +147,11 @@ enum SchedulerItem {
     /// driver completion publishes. Carries no work; it only unblocks the
     /// scheduler's wait so the retire pass runs immediately.
     Nudge,
+    /// A pipeline left the fleet ([`notify_pipeline_leave`]'s broadcast).
+    /// Handled immediately on dequeue (like [`SchedulerItem::Nudge`]): it
+    /// only mutates the run-loop's local `WaitAllPolicy`, never touching
+    /// `pending`, so it can't reorder control ops or launches.
+    PipelineLeave(ProcessId),
     Stop,
 }
 
@@ -290,9 +286,7 @@ impl SchedulerHandle {
         completion: InstanceCompletion,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
-        program_identity_hashes: Vec<u64>,
         pipeline_id: Option<ProcessId>,
-        submitted_at_us: u64,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
@@ -301,9 +295,7 @@ impl SchedulerHandle {
                 completion,
                 physical_page_ids,
                 last_page_len,
-                program_identity_hashes,
                 pipeline_id,
-                submitted_at_us,
                 false,
             ),
         })
@@ -316,7 +308,6 @@ impl SchedulerHandle {
         completion: InstanceCompletion,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
-        program_identity_hashes: Vec<u64>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
@@ -325,9 +316,7 @@ impl SchedulerHandle {
                 completion,
                 physical_page_ids,
                 last_page_len,
-                program_identity_hashes,
                 None,
-                0,
                 true,
             ),
         })
@@ -438,10 +427,6 @@ impl BatchScheduler {
         &self.stats
     }
 
-    pub(crate) fn handle(&self) -> SchedulerHandle {
-        self.handle.clone()
-    }
-
     fn shutdown(&mut self) {
         self.handle.begin_shutdown();
         crate::scheduler::clear_scheduler_handle(self.driver_id);
@@ -472,13 +457,21 @@ impl BatchScheduler {
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = None;
         let mut stopping = false;
+        // The wait-for-all-active-pipelines fire rule (overview §7.2): one
+        // instance per driver thread, mirroring `instances`/`channels` above.
+        let mut policy =
+            quorum::WaitAllPolicy::new(limits.max_forward_requests, Some(Arc::clone(&stats)));
 
         loop {
             let mut progress = false;
-            progress |=
-                Self::retire_ready_launches(&mut in_flight_launches, &mut instances, &stats);
+            progress |= Self::retire_ready_launches(
+                &mut in_flight_launches,
+                &mut instances,
+                &stats,
+                &mut policy,
+            );
             progress |= Self::retire_ready_control(&mut in_flight_control);
-            progress |= Self::dispatch_ready_items(
+            let (dispatched, wait_hint) = Self::dispatch_ready_items(
                 &mut driver,
                 &mut instances,
                 &mut channels,
@@ -488,7 +481,15 @@ impl BatchScheduler {
                 page_size,
                 limits,
                 &stats,
+                &mut policy,
             );
+            progress |= dispatched;
+            // M-A2: reap any pipeline the quorum just demoted for missing
+            // too many consecutive wave deadlines. Drained every pass (not
+            // only on a demoting fire) so a demotion is never left stranded.
+            for pid in policy.take_terminate_candidates() {
+                crate::scheduler::terminate_demoted_pipeline(pid);
+            }
 
             if stopping
                 && pending.is_empty()
@@ -506,6 +507,7 @@ impl BatchScheduler {
                     limits,
                     page_size,
                     &mut stopping,
+                    &mut policy,
                     item,
                 );
             }
@@ -542,20 +544,29 @@ impl BatchScheduler {
                     // Something already settled; retire it on the next pass.
                     continue;
                 }
-                match rx.recv_timeout(Duration::from_millis(250)) {
+                // A pending quorum hold (cold-hold gather / straggler
+                // deadline / depth-cap poll) re-arms the backstop at its own
+                // cadence — never longer than the 250ms hang backstop, so a
+                // held wave still fires on time even with no new arrival or
+                // completion nudge in between.
+                let backstop = Duration::from_millis(250);
+                let recv_wait = wait_hint.map(|hold| hold.min(backstop)).unwrap_or(backstop);
+                match rx.recv_timeout(recv_wait) {
                     Ok(item) => Some(item),
                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                         // A settled completion discovered by the backstop
                         // means a wake was lost somewhere — the steady-state
                         // count stays zero (plan §16.2). Shutdown races are
                         // excluded: teardown may legitimately cross a tick.
+                        // A quorum-hold timeout is NOT a lost wake (it is
+                        // the wait's own cadence), so it never counts here.
                         let missed = in_flight_launches
                             .front()
                             .is_some_and(|front| front.completion.is_settled())
                             || in_flight_control
                                 .as_ref()
                                 .is_some_and(|control| control.completion.is_settled());
-                        if missed && !stopping {
+                        if missed && !stopping && wait_hint.is_none() {
                             let total = BACKSTOP_RETIREMENTS.fetch_add(1, Ordering::Relaxed) + 1;
                             tracing::warn!(
                                 driver_id,
@@ -579,6 +590,7 @@ impl BatchScheduler {
                     limits,
                     page_size,
                     &mut stopping,
+                    &mut policy,
                     item,
                 );
             }
@@ -595,6 +607,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         page_size: u32,
         stopping: &mut bool,
+        policy: &mut quorum::WaitAllPolicy,
         item: SchedulerItem,
     ) {
         match item {
@@ -602,6 +615,10 @@ impl BatchScheduler {
             // A nudge only unblocks the wait; the retire pass at the top of
             // the loop does the work.
             SchedulerItem::Nudge => {}
+            // Immediate, not queued: this only mutates the local quorum
+            // policy (never `pending`/`instances`), so it can't reorder
+            // control ops or launches.
+            SchedulerItem::PipelineLeave(pid) => policy.on_pipeline_leave(pid),
             SchedulerItem::Launch { pending: launch } => {
                 let validation = BatchAccumulator::new(limits, page_size);
                 let rejection = if !instances.contains_key(&launch.instance_id) {
@@ -619,6 +636,11 @@ impl BatchScheduler {
                 if let Some(message) = rejection {
                     launch.completion.reject(message);
                 } else {
+                    // The wave gather starts at acceptance, not dispatch:
+                    // this request now counts toward `decide_wave_at`'s
+                    // wait-set/untracked-ready even while it sits in
+                    // `pending` behind an in-flight-depth or quorum hold.
+                    policy.on_pipeline_request(launch.pipeline_id, Instant::now());
                     pending.push_back(QueuedItem::Launch(launch));
                 }
             }
@@ -657,6 +679,66 @@ impl BatchScheduler {
         }
     }
 
+    /// Peeks how many requests at `pending`'s front would land in the NEXT
+    /// launch batch — same grouping rules `dispatch_launch_batch` applies
+    /// (same-instance dedup, mask-solo, structural capacity) — without
+    /// mutating the queue or the driver. Feeds `WaitAllPolicy::
+    /// decide_wave_at`'s `current_batch_size` so the quorum decision sees
+    /// the exact geometry the dispatcher is about to build (a stale item —
+    /// its instance closed after enqueue — is skipped here exactly like
+    /// the real dispatch skips/rejects it, so it never inflates the count).
+    fn peek_launch_batch_size(
+        pending: &VecDeque<QueuedItem>,
+        instances: &HashMap<u64, TrackedInstance>,
+        limits: SchedulerLimits,
+        page_size: u32,
+    ) -> usize {
+        let mut count = 0usize;
+        let mut total_tokens = 0usize;
+        let mut total_pages = 0usize;
+        let mut batch_instances: HashSet<u64> = HashSet::new();
+        let mut batch_has_user_mask = false;
+        for item in pending.iter() {
+            let QueuedItem::Launch(next) = item else {
+                break;
+            };
+            if !instances.contains_key(&next.instance_id) {
+                continue;
+            }
+            if batch_instances.contains(&next.instance_id) {
+                break;
+            }
+            let usage = batch::request_capacity_usage(next, page_size);
+            let next_masked = next.request.has_user_mask;
+            if count > 0 && (next_masked || batch_has_user_mask) {
+                break;
+            }
+            if count > 0
+                && (count + 1 > limits.max_forward_requests
+                    || total_tokens.saturating_add(usage.forward_tokens)
+                        > limits.max_forward_tokens
+                    || total_pages.saturating_add(usage.page_refs) > limits.max_page_refs)
+            {
+                break;
+            }
+            batch_instances.insert(next.instance_id);
+            total_tokens = total_tokens.saturating_add(usage.forward_tokens);
+            total_pages = total_pages.saturating_add(usage.page_refs);
+            batch_has_user_mask |= next_masked;
+            count += 1;
+            if next_masked {
+                break; // solo mask-carrying fire
+            }
+            if count >= limits.max_forward_requests
+                || total_tokens >= limits.max_forward_tokens
+                || total_pages >= limits.max_page_refs
+            {
+                break;
+            }
+        }
+        count
+    }
+
     fn dispatch_ready_items(
         driver: &mut Option<NativeDriver>,
         instances: &mut HashMap<u64, TrackedInstance>,
@@ -667,8 +749,10 @@ impl BatchScheduler {
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
-    ) -> bool {
+        policy: &mut quorum::WaitAllPolicy,
+    ) -> (bool, Option<Duration>) {
         let mut progress = false;
+        let mut wait_hint = None;
         loop {
             if in_flight_control.is_some() {
                 break;
@@ -681,6 +765,16 @@ impl BatchScheduler {
                     if in_flight_launches.len() >= quorum::max_in_flight() {
                         break;
                     }
+                    let candidate_size =
+                        Self::peek_launch_batch_size(pending, instances, limits, page_size);
+                    match policy.decide_wave_at(candidate_size, Instant::now()) {
+                        quorum::WaveDecision::Wait(hold) => {
+                            wait_hint = Some(hold);
+                            break;
+                        }
+                        quorum::WaveDecision::Fire { .. } => {}
+                    }
+                    let before = in_flight_launches.len();
                     let dispatched = Self::dispatch_launch_batch(
                         driver,
                         instances,
@@ -690,6 +784,15 @@ impl BatchScheduler {
                         limits,
                         stats,
                     );
+                    // Only a batch that actually reached `in_flight_launches`
+                    // (the driver accepted the launch) increments the
+                    // policy's depth counter — a synchronous
+                    // stale-instance-reject or `driver.launch` failure never
+                    // occupies a run-ahead slot, so nothing would ever
+                    // decrement it back.
+                    if in_flight_launches.len() > before {
+                        policy.on_wave_dispatched();
+                    }
                     progress |= dispatched;
                     if !dispatched {
                         break;
@@ -709,7 +812,7 @@ impl BatchScheduler {
                 }
             }
         }
-        progress
+        (progress, wait_hint)
     }
 
     fn dispatch_ordered_item(
@@ -977,6 +1080,7 @@ impl BatchScheduler {
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         instances: &mut HashMap<u64, TrackedInstance>,
         stats: &Arc<SchedulerStats>,
+        policy: &mut quorum::WaitAllPolicy,
     ) -> bool {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
@@ -984,6 +1088,7 @@ impl BatchScheduler {
                 break;
             };
             let retired = in_flight_launches.pop_front().expect("front batch exists");
+            policy.on_wave_retired();
             for request in &retired.requests {
                 if let Some(instance) = instances.get_mut(&request.instance_id) {
                     instance.in_flight = instance.in_flight.saturating_sub(1);
@@ -1080,6 +1185,11 @@ struct TrackedInstance {
     wait_slots: Arc<crate::driver::frame::BoundWaitSlots>,
     in_flight: usize,
     next_target_epoch: u64,
+    /// This instance's compiled program identity — the fire trace
+    /// (`PIE_SCHED_TRACE`) derives `distinct_programs` from these per
+    /// dispatched batch (no per-identity hash/stats table: this is just the
+    /// bind-time `BoundInstance::program_id` already tracked here).
+    program_id: crate::driver::ProgramId,
 }
 
 impl TrackedInstance {
@@ -1089,6 +1199,7 @@ impl TrackedInstance {
             wait_slots: bound.wait_slots(),
             in_flight: 0,
             next_target_epoch: pie_waker::FIRST_COMPLETION_EPOCH,
+            program_id: bound.program_id,
         }
     }
 
@@ -1217,28 +1328,42 @@ mod tests {
         crate::driver::BoundInstance,
         Vec<Arc<crate::driver::ChannelEndpoint>>,
     )> {
-        let driver_id = driver::register_native_driver(
-            DriverSpec {
-                num_kv_pages: 16,
-                limits: SchedulerLimits {
-                    max_forward_requests: 1,
-                    max_forward_tokens: 64,
-                    max_page_refs: 64,
-                },
-            },
-            NativeDriver::Dummy(crate::driver::DummyLocalDriver::new(options)),
-        );
-        let scheduler = BatchScheduler::new(
-            driver_id,
-            driver_id,
-            16,
+        setup_scheduler_with_limits(
+            options,
             SchedulerLimits {
                 max_forward_requests: 1,
                 max_forward_tokens: 64,
                 max_page_refs: 64,
             },
-            1,
+        )
+        .await
+    }
+
+    /// Like [`setup_scheduler_with_options`], but with a caller-chosen
+    /// `SchedulerLimits` — the quorum wait-all rule's structural cap
+    /// (`max_forward_requests`) short-circuits any cold-hold/deadline
+    /// delay once a batch saturates it (see `quorum::tests::
+    /// structural_cap_fires_immediately_even_cold`), so every other test in
+    /// this module runs at cap 1 and never observes the quorum hold. Tests
+    /// that need to actually exercise the hold (coalescing/deadline/leave)
+    /// use this with a cap > 1 instead.
+    async fn setup_scheduler_with_limits(
+        options: DummyDriverOptions,
+        limits: SchedulerLimits,
+    ) -> anyhow::Result<(
+        usize,
+        BatchScheduler,
+        crate::driver::BoundInstance,
+        Vec<Arc<crate::driver::ChannelEndpoint>>,
+    )> {
+        let driver_id = driver::register_native_driver(
+            DriverSpec {
+                num_kv_pages: 16,
+                limits,
+            },
+            NativeDriver::Dummy(crate::driver::DummyLocalDriver::new(options)),
         );
+        let scheduler = BatchScheduler::new(driver_id, driver_id, 16, limits, 1);
         let program_id = crate::scheduler::register_program(driver_id, dummy_program())?;
         let endpoints = register_test_channels(driver_id, [7, 8])?;
         let bound = crate::scheduler::bind_instance(
@@ -1319,7 +1444,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             launch.clone(),
         )?;
 
@@ -1383,7 +1507,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             completion.clone(),
         )?;
         timeout(Duration::from_secs(5), completion).await??;
@@ -1447,7 +1570,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             completion.clone(),
         )?;
 
@@ -1497,7 +1619,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             rejected.clone(),
         )?;
         let err = timeout(Duration::from_secs(5), rejected.clone())
@@ -1517,7 +1638,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             accepted.clone(),
         )?;
         timeout(Duration::from_secs(5), accepted.clone()).await??;
@@ -1557,7 +1677,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             completion.clone(),
         )?;
         let err = timeout(Duration::from_secs(5), completion)
@@ -1606,7 +1725,6 @@ mod tests {
             bound_a.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             first.clone(),
         )?;
 
@@ -1617,7 +1735,6 @@ mod tests {
             bound_b.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             second.clone(),
         )?;
 
@@ -1666,7 +1783,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             first.clone(),
         )?;
 
@@ -1680,7 +1796,6 @@ mod tests {
                 instance_id,
                 Vec::new(),
                 0,
-                Vec::new(),
                 second_for_submit,
             )
         });
@@ -1737,7 +1852,6 @@ mod tests {
             bound_a.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             first.clone(),
         )?;
 
@@ -1766,7 +1880,6 @@ mod tests {
                 second_instance_id,
                 Vec::new(),
                 0,
-                Vec::new(),
                 second_for_submit,
             )
         });
@@ -1862,7 +1975,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             launch.clone(),
         )?;
 
@@ -1941,7 +2053,6 @@ mod tests {
             bound_a.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             a,
         )?;
         let b = bound_b.reserve_completion();
@@ -1951,7 +2062,6 @@ mod tests {
             bound_b.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             b,
         )?;
         drop(resize);
@@ -2012,7 +2122,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             completion.clone(),
         )?;
         timeout(Duration::from_secs(5), completion).await??;
@@ -2051,7 +2160,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             completion.clone(),
         )?;
         timeout(Duration::from_secs(5), waiter)
@@ -2094,7 +2202,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             completion.clone(),
         )?;
         let woke = timeout(Duration::from_secs(5), waiter).await??;
@@ -2255,7 +2362,6 @@ mod tests {
             exporter.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             export_fire.clone(),
         )?;
         let import_fire = importer.reserve_completion();
@@ -2265,7 +2371,6 @@ mod tests {
             importer.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             import_fire.clone(),
         )?;
         timeout(Duration::from_secs(5), export_fire).await??;
@@ -2300,7 +2405,6 @@ mod tests {
                     bound.instance_id,
                     Vec::new(),
                     0,
-                    Vec::new(),
                     completion,
                 )?;
             }
@@ -2308,6 +2412,272 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         })
         .await??;
+        Ok(())
+    }
+
+    /// Every quorum-hold test below needs a structural cap big enough that
+    /// a single request never trivially saturates it (else the wait-all
+    /// rule short-circuits straight to a fire — see `quorum::tests::
+    /// structural_cap_fires_immediately_even_cold`).
+    fn coalescing_limits() -> SchedulerLimits {
+        SchedulerLimits {
+            max_forward_requests: 4,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        }
+    }
+
+    /// Binds a second instance on the same program/driver as `bound_a`, for
+    /// tests that need two independent pipelines' fires in flight at once.
+    fn bind_second_instance(
+        driver_id: usize,
+        bound_a: &crate::driver::BoundInstance,
+        channel_ids: [u64; 2],
+        requested_instance_id: u64,
+    ) -> anyhow::Result<(
+        crate::driver::BoundInstance,
+        Vec<Arc<crate::driver::ChannelEndpoint>>,
+    )> {
+        let endpoints = register_test_channels(driver_id, channel_ids)?;
+        let bound_b = crate::scheduler::bind_instance(
+            driver_id,
+            bound_a.program_id,
+            requested_instance_id,
+            channel_ids.to_vec(),
+            vec![ChannelValue {
+                channel: channel_ids[0],
+                bytes: 1u32.to_le_bytes().to_vec(),
+            }],
+        )?;
+        Ok((bound_b, endpoints))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_pipelines_coalesce_into_one_wave_after_cold_hold() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound_a, _endpoints) = setup_scheduler_with_limits(
+            DummyDriverOptions {
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            },
+            coalescing_limits(),
+        )
+        .await?;
+        let (bound_b, _secondary_endpoints) =
+            bind_second_instance(driver_id, &bound_a, [27, 28], 52)?;
+
+        let pid_a = ProcessId::new_v4();
+        let pid_b = ProcessId::new_v4();
+
+        // Submitted back-to-back, no await in between: both land in the
+        // scheduler's queue before it next drains, so both `on_pipeline_
+        // request` calls land in the SAME wave-gather — no timing race
+        // with the 500us cold-hold window.
+        let first = bound_a.reserve_completion();
+        crate::scheduler::submit_async(
+            dummy_launch(),
+            driver_id,
+            bound_a.instance_id,
+            Vec::new(),
+            0,
+            Some(pid_a),
+            first.clone(),
+        )?;
+        let second = bound_b.reserve_completion();
+        crate::scheduler::submit_async(
+            dummy_launch(),
+            driver_id,
+            bound_b.instance_id,
+            Vec::new(),
+            0,
+            Some(pid_b),
+            second.clone(),
+        )?;
+
+        // The wait-all quorum's bootstrap cold-hold gathers both pipelines'
+        // first requests into ONE dense wave (`requests=2`) instead of two
+        // solo fires — the dummy driver's launch-shape trace names the
+        // program count directly.
+        let coalesced = timeout(Duration::from_secs(5), async {
+            loop {
+                let hit = operation_log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry == "launch-shape tokens=2 programs=2");
+                if hit {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await?;
+        assert!(
+            coalesced,
+            "both pipelines' first requests should coalesce into one programs=2 wave: {:?}",
+            operation_log.lock().unwrap()
+        );
+
+        timeout(Duration::from_secs(5), first).await??;
+        timeout(Duration::from_secs(5), second).await??;
+        crate::scheduler::close_instance(&bound_a)?;
+        crate::scheduler::close_instance(&bound_b)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_missing_members_wave_deadline_fires_and_counts_a_miss() -> anyhow::Result<()> {
+        let (driver_id, _scheduler, bound_a, _endpoints) =
+            setup_scheduler_with_limits(DummyDriverOptions::default(), coalescing_limits()).await?;
+        let (bound_b, _secondary_endpoints) =
+            bind_second_instance(driver_id, &bound_a, [27, 28], 53)?;
+
+        let pid_a = ProcessId::new_v4();
+        let pid_b = ProcessId::new_v4();
+
+        // Wave 1: both pipelines are seen — establishes them in the
+        // wait-set (dense-fires quickly via the cold-hold gather).
+        let first_a = bound_a.reserve_completion();
+        crate::scheduler::submit_async(
+            dummy_launch(),
+            driver_id,
+            bound_a.instance_id,
+            Vec::new(),
+            0,
+            Some(pid_a),
+            first_a.clone(),
+        )?;
+        let first_b = bound_b.reserve_completion();
+        crate::scheduler::submit_async(
+            dummy_launch(),
+            driver_id,
+            bound_b.instance_id,
+            Vec::new(),
+            0,
+            Some(pid_b),
+            first_b.clone(),
+        )?;
+        timeout(Duration::from_secs(5), first_a).await??;
+        timeout(Duration::from_secs(5), first_b).await??;
+
+        // Wave 2: only `a` resubmits (its decode loop's next token); `b`
+        // never comes back. The quorum holds `a` for `b` up to the ~10ms
+        // wave deadline, then fires solo — a straggler deadline-fire, not
+        // an immediate dense fire.
+        let started = Instant::now();
+        let second_a = bound_a.reserve_completion();
+        crate::scheduler::submit_async(
+            dummy_launch(),
+            driver_id,
+            bound_a.instance_id,
+            Vec::new(),
+            0,
+            Some(pid_a),
+            second_a.clone(),
+        )?;
+        timeout(Duration::from_secs(5), second_a).await??;
+        assert!(
+            started.elapsed() >= Duration::from_millis(8),
+            "a solo wave missing `b` should hold roughly the full ~10ms wave \
+             deadline before firing, took {:?}",
+            started.elapsed()
+        );
+
+        crate::scheduler::close_instance(&bound_a)?;
+        crate::scheduler::close_instance(&bound_b)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn leave_unblocks_a_wave_holding_for_a_missing_member() -> anyhow::Result<()> {
+        let (driver_id, _scheduler, bound_a, _endpoints) =
+            setup_scheduler_with_limits(DummyDriverOptions::default(), coalescing_limits()).await?;
+        let (bound_b, _secondary_endpoints) =
+            bind_second_instance(driver_id, &bound_a, [27, 28], 54)?;
+
+        let pid_a = ProcessId::new_v4();
+        let pid_b = ProcessId::new_v4();
+
+        // Wave 1: both pipelines seen, both in the wait-set.
+        let first_a = bound_a.reserve_completion();
+        crate::scheduler::submit_async(
+            dummy_launch(),
+            driver_id,
+            bound_a.instance_id,
+            Vec::new(),
+            0,
+            Some(pid_a),
+            first_a.clone(),
+        )?;
+        let first_b = bound_b.reserve_completion();
+        crate::scheduler::submit_async(
+            dummy_launch(),
+            driver_id,
+            bound_b.instance_id,
+            Vec::new(),
+            0,
+            Some(pid_b),
+            first_b.clone(),
+        )?;
+        timeout(Duration::from_secs(5), first_a).await??;
+        timeout(Duration::from_secs(5), first_b).await??;
+
+        // Wave 2: only `a` resubmits; `b` instead LEAVES the fleet (as the
+        // process facade's terminate path would call on exit) before the
+        // wave deadline — the quorum should drop it from the wait-set and
+        // fire `a`'s wave immediately, not after the ~10ms deadline.
+        let started = Instant::now();
+        let second_a = bound_a.reserve_completion();
+        crate::scheduler::submit_async(
+            dummy_launch(),
+            driver_id,
+            bound_a.instance_id,
+            Vec::new(),
+            0,
+            Some(pid_a),
+            second_a.clone(),
+        )?;
+        notify_pipeline_leave(pid_b, LeaveKind::Terminate);
+        timeout(Duration::from_secs(5), second_a).await??;
+        assert!(
+            started.elapsed() < Duration::from_millis(8),
+            "leave should unblock the hold well before the ~10ms wave \
+             deadline, took {:?}",
+            started.elapsed()
+        );
+
+        crate::scheduler::close_instance(&bound_a)?;
+        crate::scheduler::close_instance(&bound_b)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn untracked_prebuilt_fire_never_blocks_on_the_quorum() -> anyhow::Result<()> {
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_limits(DummyDriverOptions::default(), coalescing_limits()).await?;
+
+        // `submit_prebuilt_async` always carries `pipeline_id: None` — it
+        // never joins the wait-set, so it must fire promptly even though
+        // nothing else is active to gather with it (bootstrap cold-hold at
+        // most, never the ~10ms straggler deadline).
+        let started = Instant::now();
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            completion.clone(),
+        )?;
+        timeout(Duration::from_secs(5), completion).await??;
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "an untracked prebuilt fire must never hold for the quorum, took {:?}",
+            started.elapsed()
+        );
+
+        crate::scheduler::close_instance(&bound)?;
         Ok(())
     }
 }

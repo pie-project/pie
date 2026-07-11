@@ -41,6 +41,11 @@ namespace pie_cuda_driver::ptir {
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
 using namespace pie_native::ptir;
 
+// Maximum physical ring slots per channel (`capacity + 1`). Run-ahead guests
+// use capacities above the original depth-7 prototype, so keep enough room
+// for the supported scheduler depths without truncating declarations.
+inline constexpr std::uint32_t kMaxRing = 64;
+
 // ─────────────────────────── device-side kernels ─────────────────────────
 
 // Stage readiness: AND this stage's requirement into the pass commit flag.
@@ -60,7 +65,7 @@ __global__ void k_stage_readiness(const std::uint8_t* __restrict__ full,
     std::uint32_t ok = 1;
     for (std::uint32_t i = 0; i < n_full; ++i) {
         std::uint32_t c = need_full_ch[i];
-        if (!full[c * 8 + head[c]]) ok = 0;
+        if (!full[c * kMaxRing + head[c]]) ok = 0;
     }
     for (std::uint32_t i = 0; i < n_empty; ++i) {
         std::uint32_t c = need_empty_ch[i];
@@ -82,12 +87,12 @@ __global__ void k_commit_bump(std::uint8_t* __restrict__ full,
     if (!*pass_commit) return;
     for (std::uint32_t i = 0; i < n_put; ++i) {
         std::uint32_t c = put_ch[i];
-        full[c * 8 + tail[c]] = 1;               // publish the pending cell
+        full[c * kMaxRing + tail[c]] = 1;        // publish the pending cell
         tail[c] = (tail[c] + 1) % cap1[c];
     }
     for (std::uint32_t i = 0; i < n_taken; ++i) {
         std::uint32_t c = taken_ch[i];
-        full[c * 8 + head[c]] = 0;               // consume the committed cell
+        full[c * kMaxRing + head[c]] = 0;        // consume the committed cell
         head[c] = (head[c] + 1) % cap1[c];
     }
 }
@@ -109,7 +114,7 @@ __global__ void k_consume_if_committed(
     if (!*pass_commit) return;
     for (std::uint32_t i = 0; i < consume.n; ++i) {
         const std::uint32_t c = consume.slots[i];
-        full[c * 8 + head[c]] = 0;
+        full[c * kMaxRing + head[c]] = 0;
         head[c] = (head[c] + 1) % cap1[c];
     }
 }
@@ -139,8 +144,6 @@ inline void launch_consume_if_committed(
 }
 
 // ──────────────────────────── host-side arena ────────────────────────────
-
-inline constexpr std::uint32_t kMaxRing = 8;   // cap+1 ceiling for tier-0 (matches the *8 stride above)
 
 // One instance's channel arena. Owns device memory for the cell blob + ring
 // bookkeeping (head/tail/full) + the derived bits word and the pass commit flag.

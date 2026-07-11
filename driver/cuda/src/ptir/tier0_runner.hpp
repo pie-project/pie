@@ -342,6 +342,11 @@ class Tier0Runner {
         for (const Op& op : st.ops) {
             for (ValueId a : op.args)
                 if (!resolve_root(a, in, scratch, err)) return false;
+            // pivot_threshold's predicate payload is a trace value (scalar or
+            // per-row), not an op arg — resolve it the same way (interface/ptir
+            // interp.rs: RankLe/CummassLe/ProbGe all carry a ValueId).
+            if (op.code == OpCode::PivotThreshold)
+                if (!resolve_root(op.predicate.payload, in, scratch, err)) return false;
 
             LaunchOp lo;
             if (!build_launch(op, in, scratch, lo, err)) return false;
@@ -572,9 +577,10 @@ class Tier0Runner {
                 lo.rows = prim_shape.rows(); lo.len = prim_shape.row_len(); lo.elem_dtype = prim; break;
             case OpCode::TopK: case OpCode::SortDesc:
                 // rows/len are the INPUT shape ([n] or [m,n]) — the axis top_k
-                // scans — NOT the [k] result. k = the immediate.
+                // scans — NOT the [k] result. k = the immediate (top_k/sort_desc
+                // have no predicate — that field is exclusively pivot_threshold's).
                 lo.rows = prim_shape.rows(); lo.len = prim_shape.row_len();
-                lo.k = op.predicate.payload ? op.predicate.payload : op.imm;
+                lo.k = op.imm;
                 if (op.code == OpCode::SortDesc) lo.k = lo.len;
                 break;
             case OpCode::Matmul:  // rows=M, len=K, k=N encoded in imm (N)
@@ -593,8 +599,25 @@ class Tier0Runner {
                 lo.rng_stream = op.imm; lo.row_seeds = in.row_seeds; break;
             default: break;
         }
-        if (op.code == OpCode::RankLe || op.code == OpCode::PivotThreshold)
-            lo.k = op.predicate.payload ? op.predicate.payload : op.imm;
+        if (op.code == OpCode::RankLe) {
+            // Composite/fusion-only form (0xE5): a true host immediate.
+            lo.k = op.imm;
+        } else if (op.code == OpCode::PivotThreshold) {
+            // The predicate payload is a resolved trace value (scalar or
+            // per-row [rows]) — never an immediate (interface/ptir interp.rs
+            // Op::PivotThreshold; all three PredTag variants carry a ValueId).
+            // Resolved above in run_stage via resolve_root before build_launch
+            // is called, so it must already be in val_ptr_ here.
+            auto pit = val_ptr_.find(op.predicate.payload);
+            if (pit == val_ptr_.end()) { err = "predicate operand unresolved"; return false; }
+            const Value* pv = trace_->value(op.predicate.payload);
+            if (!pv) { err = "predicate operand unknown value id"; return false; }
+            lo.pred_tag = op.predicate.tag;
+            lo.pred_ptr = pit->second;
+            lo.pred_dtype = pv->type.dtype;
+            std::uint64_t pn = pv->type.shape.numel();
+            lo.pred_numel = (std::uint32_t)(pn == 0 ? 1 : pn);
+        }
 
         // Allocate result buffer(s) (Reshape returned above).
         std::size_t out_bytes = lo.numel * dtype_size(rt.dtype);

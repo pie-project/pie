@@ -246,7 +246,7 @@ async fn grammar10_distinct_program_accounting_on_real_driver() -> Result<()> {
 
     // Build all inferlets used across the gates (one cargo invocation) BEFORE the
     // captures so the verbose build logs stay out of the trace files.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     build_wasm(&ws, &["grammar-late", "grammar", "mirostat"])?;
 
     let mask_input = format!("{{\"alphabet\":{ALPHABET:?},\"max_tokens\":{MAX_TOKENS}}}");

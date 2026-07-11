@@ -1,4 +1,4 @@
-//! Ported from xgrammar: test_grammar_matcher_ebnf.py
+//! EBNF grammar matching behavior.
 //!
 //! Tests EBNF grammar acceptance/rejection via the GrammarMatcher.
 

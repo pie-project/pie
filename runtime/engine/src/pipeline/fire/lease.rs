@@ -265,12 +265,6 @@ mod tests {
         assert_eq!(lease.in_flight(), 0);
     }
 
-    #[test]
-    fn reclaim_with_no_pending_is_noop() {
-        let mut lease = PageLease::new(2);
-        assert!(lease.reclaim_after_fire(&[true, true]).is_empty());
-    }
-
     use pie_ptir::container::{ChanDType, ChannelDecl, HostRole, PortBinding, PortSource};
     use pie_ptir::container::{StageProgram, TraceContainer};
     use pie_ptir::registry::{Port, Stage};

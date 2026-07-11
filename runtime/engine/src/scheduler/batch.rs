@@ -9,21 +9,17 @@ use crate::driver::{LaunchSubmission, SchedulerLimits};
 pub(crate) struct RequestCapacityUsage {
     pub(crate) forward_tokens: usize,
     pub(crate) page_refs: usize,
-    pub(crate) is_single_token_decode: bool,
 }
 
 pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapacityUsage {
     let input_tokens = req.request.token_ids.len();
     let forward_tokens = input_tokens;
-    let is_single_token_decode =
-        input_tokens == 1 && req.request.single_token_mode && !req.request.has_user_mask;
     let page_refs = req.physical_page_ids.len();
     let _ = page_size;
 
     RequestCapacityUsage {
         forward_tokens,
         page_refs,
-        is_single_token_decode,
     }
 }
 
@@ -92,14 +88,6 @@ impl BatchAccumulator {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.requests.is_empty()
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.requests.len()
-    }
-
-    pub(crate) fn total_tokens(&self) -> usize {
-        self.total_tokens
     }
 
     pub(crate) fn take(&mut self) -> Vec<PendingRequest> {
@@ -184,9 +172,7 @@ mod tests {
             request,
             instance_id,
             completion: InstanceCompletion::new(instance_id, 0),
-            program_identity_hashes: Vec::new(),
             pipeline_id: None,
-            submitted_at_us: 0,
             prebuilt,
         }
     }

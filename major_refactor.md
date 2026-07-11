@@ -40,19 +40,21 @@ manages, and no parallel legacy paths. Two modules are the main offenders today:
 
 ```
 runtime/engine/src
-├── driver/            L0  dumb backend ABI
+├── driver.rs          L0  dumb backend ABI module root
+├── driver/
 │   ├── frame.rs           LaunchPlan, LaunchSubmission, ChannelValue (moved down)
-│   ├── backend.rs  completion.rs  binding_validation.rs  ffi/{cuda,metal}.rs
+│   ├── backend.rs  completion.rs  ffi.rs  ffi/{cuda,metal}.rs
 │   └── registry.rs        driver specs only; scheduler handles move OUT
 │
-├── store/             L1  device memory: pages, slots, mappings
+├── store.rs           L1  device memory module root
+├── store/
 │   ├── kv/                page_table, hash, write, project.rs (new home of project_kv,
 │   │                      KvProjection, KvWrite, PhysicalPageId)
 │   ├── rs.rs  pool.rs  genmap.rs  registry.rs
 │   └── reclaim.rs         pressure ladder (from inference/contention.rs)
 │
-├── scheduler/         L2  per-driver batching: when accumulated fires launch
-│   ├── mod.rs             spawn/shutdown, SchedulerHandle + its own handle registry
+├── scheduler.rs       L2  spawn/shutdown, SchedulerHandle + its own handle registry
+├── scheduler/             per-driver batching: when accumulated fires launch
 │   ├── worker.rs          per-driver loop (from inference/scheduler.rs)
 │   ├── batch.rs           capacity accounting + accumulator
 │   ├── wire.rs            owned plans -> borrowed FFI descriptors, page trim
@@ -62,14 +64,15 @@ runtime/engine/src
 │   │                      InferenceStats family from the inference mod root)
 │   └── probe.rs           profile-fire probes (from inference/probe.rs)
 │
-├── pipeline/          L3  THE forward path: guest-programmed pipelines (from ptir/)
+├── pipeline.rs        L3  THE forward path module root
+├── pipeline/              guest-programmed pipelines (from ptir/)
 │   ├── program.rs         container bytes -> bind -> price -> cache (ptir_registry.rs;
 │   │                      absorbs model_profile() from ptir_host)
 │   ├── instance.rs        program + seeds -> Pipeline (ptir_instance.rs)
 │   ├── channel.rs         ChannelCell host endpoint, SPSC roles (ptir_channel_store.rs)
+│   ├── fire.rs            PendingFire engine, OpSignal, poison, FIFO finalization
+│   │                      (the non-glue ~60% of ptir_host.rs)
 │   └── fire/              one fire: prepare -> run-ahead submit -> finalize/poison
-│       ├── mod.rs         PendingFire engine, OpSignal, poison, FIFO finalization
-│       │                  (the non-glue ~60% of ptir_host.rs)
 │       ├── geometry.rs    ports -> LaunchPlan geometry, pure (ptir_geometry.rs)
 │       ├── kv.rs          KvTxn prepare/finalize (ptir_kv.rs; absorbs canonical-fire
 │       │                  evidence helpers + the descriptor validation from
@@ -78,9 +81,10 @@ runtime/engine/src
 │       └── lease.rs       device-geometry page grants (ptir_lease.rs; absorbs
 │                          detect_device_geometry)
 │
-├── inferlet/          L4  guest process runtime
+├── inferlet.rs        L4  guest process runtime module root
+├── inferlet/
+│   ├── host.rs            WIT bindgen! + add_to_linker (from api.rs)
 │   ├── host/              WIT boundary: one thin file per interface (from api/)
-│   │   ├── mod.rs         bindgen! + add_to_linker (from api.rs)
 │   │   ├── forward.rs     Host impls for pie:inferlet/forward (channel, forward-pass;
 │   │   │                  the glue ~40% of ptir_host.rs)
 │   │   ├── pipeline.rs    Host impls for pie:inferlet/pipeline
@@ -88,7 +92,8 @@ runtime/engine/src
 │   │                      session, media, speech, system, chat, tools, reasoning
 │   ├── program/  process/  linker/  python/  sandbox.rs   (unchanged)
 │
-├── server/            L5  client edge: sessions, handler, inbox, data transfer
+├── server.rs          L5  client edge module root
+├── server/                sessions, handler, inbox, data transfer
 │                          (unchanged; inbox.rs is already the u2i messaging home)
 │
 ├── service.rs             KEEP: shared actor utility (scheduler, server, program,
@@ -174,7 +179,7 @@ Gate: `store/` imports only `driver/` (+ leaf crates); reclaim tests still pass
    - `inference/probe.rs` -> `scheduler/probe.rs`
 2. **Scheduler owns its handle registry.** Move
    `install_scheduler_handle`/`clear_scheduler_handle`/`scheduler_handle` out of
-   `driver/registry.rs` into `scheduler/mod.rs` (or `scheduler/registry.rs`).
+   `driver/registry.rs` into `scheduler.rs` (or `scheduler/registry.rs`).
    `driver/registry.rs` keeps driver specs only.
 3. **Dissolve `InferenceService`.** It is a one-variant actor (`GetStats`).
    `spawn()` becomes `scheduler::spawn` (creates per-driver workers);
@@ -208,7 +213,7 @@ across both destinations.
      each impl body should be a call into `pipeline/`.
    - Run-ahead engine (`PendingFire`, `PendingMove`, `OpSignal`, `poison_readers`,
      FIFO finalization, the optimistic `committed_tokens` cursor) ->
-     `pipeline/fire/mod.rs`.
+     `pipeline/fire.rs`.
    - Helpers distribute: `model_profile()` -> `pipeline/program.rs`;
      `detect_device_geometry`, `DevGeo` -> `pipeline/fire/lease.rs`;
      `canonical_kv_shape`, `canonical_fire_evidence`, `host_known_port_u32s`,
@@ -223,7 +228,7 @@ across both destinations.
    The word "ptir" survives only where the IR is touched (imports of
    `pie_ptir::*` in `program.rs`, `fire/geometry.rs`).
 3. **Move `api/*` -> `inferlet/host/*`** and `api.rs` (bindgen! macro +
-   `add_to_linker`) -> `inferlet/host/mod.rs`. Every `crate::api::pie::` path
+   `add_to_linker`) -> `inferlet/host.rs`. Every `crate::api::pie::` path
    in the crate becomes `crate::inferlet::host::pie::`. To keep the diff
    reviewable, add a temporary `pub use inferlet::host as api;` shim in lib.rs,
    migrate call sites in a follow-up commit, then drop the shim.
@@ -233,7 +238,7 @@ across both destinations.
    link (the real one is `inferlet/program/`), the mod-root "later refactor
    renames ptir_host->host" note (this is that refactor).
 
-Accepted layering exception, document it in `inferlet/host/mod.rs`: `host/session.rs`
+Accepted layering exception, document it in `inferlet/host.rs`: `host/session.rs`
 calls `server::send_file` and `server::inbox::receive` (guest-to-client I/O goes
 through the server's facade). If it grates later, extract a `client_io` seam;
 out of scope here.
@@ -272,7 +277,7 @@ suite + cuda e2e + one real inferlet run via the workstation serve/client loop.
 
 | Current | Target | Phase |
 |---|---|---|
-| `inference.rs` (mod root) | dissolve: spawn -> `scheduler/mod.rs`, stats structs -> `scheduler/stats.rs`, submit fns -> `scheduler/` | 3 |
+| `inference.rs` (mod root) | dissolve: spawn -> `scheduler.rs`, stats structs -> `scheduler/stats.rs`, submit fns -> `scheduler/` | 3 |
 | `inference/scheduler.rs` | `scheduler/worker.rs` | 3 |
 | `inference/batch.rs` | `scheduler/batch.rs` | 3 |
 | `inference/request.rs` | `scheduler/wire.rs` | 3 |
@@ -283,7 +288,7 @@ suite + cuda e2e + one real inferlet run via the workstation serve/client loop.
 | `inference/paging.rs` | split: projection -> `store/kv/project.rs`, validation -> `pipeline/fire/kv.rs` | 2, 4 |
 | `inference/execute.rs` | delete (relocate grammar remnants) | 5 |
 | `ptir.rs` (mod root) | `ChannelValue` -> `driver/frame.rs`; rest dissolves | 1, 4 |
-| `ptir/ptir_host.rs` | split: glue -> `inferlet/host/{forward,pipeline}.rs`, engine -> `pipeline/fire/mod.rs`, helpers distributed | 4 |
+| `ptir/ptir_host.rs` | split: glue -> `inferlet/host/{forward,pipeline}.rs`, engine -> `pipeline/fire.rs`, helpers distributed | 4 |
 | `ptir/ptir_registry.rs` | `pipeline/program.rs` | 4 |
 | `ptir/ptir_instance.rs` | `pipeline/instance.rs` | 4 |
 | `ptir/ptir_channel_store.rs` | `pipeline/channel.rs` | 4 |
@@ -291,8 +296,8 @@ suite + cuda e2e + one real inferlet run via the workstation serve/client loop.
 | `ptir/ptir_kv.rs` | `pipeline/fire/kv.rs` | 4 |
 | `ptir/ptir_rs.rs` | `pipeline/fire/rs.rs` | 4 |
 | `ptir/ptir_lease.rs` | `pipeline/fire/lease.rs` | 4 |
-| `api.rs` + `api/*` | `inferlet/host/mod.rs` + `inferlet/host/*` | 4 |
-| `driver/registry.rs` scheduler handles | `scheduler/mod.rs` | 3 |
+| `api.rs` + `api/*` | `inferlet/host.rs` + `inferlet/host/*` | 4 |
+| `driver/registry.rs` scheduler handles | `scheduler.rs` | 3 |
 | `server/*`, `service.rs`, `telemetry.rs`, `bootstrap.rs`, `store/*`, `inferlet/{program,process,linker,python,sandbox}` | unchanged | - |
 
 ## Decision log

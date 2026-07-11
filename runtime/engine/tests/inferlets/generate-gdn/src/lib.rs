@@ -1,118 +1,155 @@
 //! **Greedy decode on a GDN/hybrid model (KV + RECURRENT-STATE working sets)**
-//! via DIRECT WIT bindings (bravo) — the MTP Stage-1 harness's model driver for
-//! Qwen3.5-0.8B. It is the `generate` inferlet extended for models with
-//! linear-attention layers: those layers need a RUNTIME-assigned recurrent-state
-//! (rs_cache) slot per request, exactly as the attention layers need KV page
-//! slots. The dense `generate` binds only `KvWorkingSet`; on a GDN model the
-//! driver's forward requires `rs_slot_ids` (executor.cpp:2671 "rs_cache forward
-//! missing runtime-assigned slot ids") — marshaled from a bound `RsWorkingSet`.
+//! — `inferlet::ptir` bridge rewrite (bravo) of the MTP Stage-1 harness's model
+//! driver for Qwen3.5-0.8B. It is the `generate` inferlet extended for models
+//! with linear-attention layers: those layers need a RUNTIME-assigned
+//! recurrent-state (rs_cache) slot per request, exactly as the attention
+//! layers need KV page slots. The dense `generate` binds only a
+//! [`WorkingSet`]; on a GDN model the driver's forward also requires an
+//! [`RsWorkingSet`] bound into `forward-pass.new`'s rs-working-sets list (the
+//! "this forward writes recurrent state" signal — `execute_impl`'s
+//! `prepare_write` allocates the folded slot, +`RS_FLAG_RESET` on the fresh
+//! fire, and the GDN forward writes it in-forward).
 //!
-//! **In-forward write (NOT the parked Ph7 buffered fold).** The basic MTP forward
-//! writes the recurrent state IN-FORWARD to the folded slot `rs_slot_ids[r]` (the
-//! `commit_len` GDN primitive, executor.cpp:2786) — reset-then-write on the fresh
-//! fire. So this inferlet just BINDS an `RsWorkingSet` (`pass.rs_working_set`) as
-//! the "this forward writes recurrent state" signal; execute_impl's `prepare_write`
-//! allocates the folded slot + sets `RS_FLAG_RESET` on the first fire, and the GDN
-//! forward writes it in-forward. NO `alloc_buffer`/`rs_fold_buffered` — the buffered
-//! fold-from-slabs (`rs_buffer_slot_ids`) path is the parked Ph7 real-driver work.
+//! Same greedy-argmax epilogue + KV/attn geometry sugar as `generate`
+//! (`attn_working_set(&ws, &klen)` — the host derives + projects the KV
+//! pages); the only addition is the RS working set binding, gated on
+//! `rs.state_size() > 0` (pure-attention models skip it entirely and behave
+//! like `generate`). Input: an optional token budget (default 5), e.g. `"24"`.
 //!
-//! Same greedy-argmax program + KV geometry as `generate` (read = prior FULL
-//! pages, write = the tail pages, `offset` = the mid-page cursor). Input: an
-//! optional token budget (default 5), e.g. `"24"`.
+//! RS wiring notes: the `RsWorkingSet` is attached on the prefill pass AND the
+//! decode pass (both forward passes that exist). The decode pass is bound
+//! ONCE and resubmitted every fire (a `Channel` may attach to only ONE pass
+//! for its lifetime — `forward-pass.new` errs "may attach to only one pass"
+//! on a second bind attempt, so `tok_in`/`pos`/`klen`/`fill` are wired into a
+//! single `ForwardPass` and that SAME pass is submitted `max_tokens-1` times,
+//! never rebuilt). `RsStore::prepare_write` (`runtime/engine/src/store/rs.rs`,
+//! `pipeline/fire.rs`) already keys reset-vs-continue-in-place off the
+//! `RsWorkingSet`'s OWN `folded` slot + ref-count (bumped only by an explicit
+//! `fork()`, which this inferlet never calls) — NOT off ForwardPass identity —
+//! so reusing one bound decode pass still resets exactly once (the prefill's
+//! first RS write) and continues in-place on every subsequent resubmit.
+//! `pos`/`klen`/`fill` device-loop-carry the growing absolute RoPE position +
+//! attended KV length across every fire (the `isolatedtopp`/`mirostat` split).
 
-use inferlet::inference::{ForwardPass, InputBinding};
-use inferlet::sampling::{Graph, OutputKind};
-use inferlet::working_set::{KvWorkingSet, RsWorkingSet};
-use inferlet::{Result, model};
+use inferlet::ptir::prelude::*;
+use inferlet::{Result, model as wit_model};
 
 const DEFAULT_MAX_TOKENS: usize = 5;
+
+fn bx<T>(v: T) -> &'static T {
+    Box::leak(Box::new(v))
+}
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let max_tokens: usize = input.trim().parse().unwrap_or(DEFAULT_MAX_TOKENS);
 
-    let vocab = model::output_vocab_size();
+    let vocab = wit_model::output_vocab_size();
+    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    model::configure(vocab, ws.page_size(), 1);
 
-    // Greedy-argmax program: `argmax(logits) -> Token`.
-    let g = Graph::new(vocab);
-    let token_v = g.intrinsic_logits_dyn().argmax();
-    g.output(&token_v, OutputKind::Token);
-    let built = g.build().map_err(|e| format!("build greedy program: {e:?}"))?;
-    let program =
-        inferlet::emit::emit_program(&built.program).map_err(|e| format!("emit: {e}"))?;
-
-    // Attention KV working set (identical geometry to `generate`).
-    let kv = KvWorkingSet::new();
-    let page = kv.page_size();
-
-    // Recurrent-state working set for the model's linear-attention layers. Its
-    // buffered pages hold the un-folded RS tokens; `rs-fold-buffered` advances
-    // the folded state. `state_size() == 0` ⇒ the model has no recurrent state
-    // (pure attention) → skip the RS path entirely (this inferlet then behaves
-    // like `generate`).
-    let rs = RsWorkingSet::new();
+    // Recurrent-state working set for the model's linear-attention layers.
+    // `state_size() == 0` ⇒ the model has no recurrent state (pure attention)
+    // → never bind it (this inferlet then behaves like `generate`).
+    let rs: &'static RsWorkingSet = bx(RsWorkingSet::new());
     let has_rs = rs.state_size() > 0;
+    eprintln!(
+        "[GENERATE_GDN] rs_state_size={} has_rs={has_rs}",
+        rs.state_size()
+    );
 
-    let prompt = model::encode("hello world");
-    let mut pending: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
-    let mut seq_len: u32 = 0;
+    if max_tokens == 0 {
+        let result = "generated 0 tokens: []".to_string();
+        eprintln!("[GENERATE_GDN] {result}");
+        return Ok(result);
+    }
+
+    let prompt = wit_model::encode("hello world");
+    let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
+    let n = prompt.len() as u32;
+
+    // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
+    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let toks_p = bx(Channel::from(prompt_i32).named("toks_p"));
+    let embed_indptr_p = Tensor::constant(vec![0u32, n]);
+    let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
+    let g0_ch = bx(Channel::new([1], dtype::i32).named("g0"));
+
+    let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
+    fwd_p.embed(toks_p, embed_indptr_p);
+    fwd_p.attn_working_set(ws, klen_p);
+    if has_rs {
+        fwd_p.rs_working_set(rs);
+    }
+    fwd_p.epilogue(move || {
+        let t = reduce_argmax(intrinsics::logits()); // [1] i32 greedy token
+        g0_ch.put(&t);
+    });
+
+    let prefill = Pipeline::new();
+    fwd_p
+        .submit(&prefill)
+        .map_err(|e| format!("prefill submit: {e}"))?;
+    let g0 = g0_ch
+        .take()
+        .get::<i32>()
+        .map_err(|e| format!("g0 take: {e}"))?[0];
+    prefill.close();
+
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
+    generated.push(g0 as u32);
 
-    for step in 0..max_tokens {
-        let n = pending.len() as u32;
+    // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
+    if generated.len() < max_tokens {
+        let tok_in = bx(Channel::from(vec![g0; 1]).named("tok_in"));
+        let pos = bx(Channel::from(vec![n; 1]).named("pos"));
+        let klen = bx(Channel::from(vec![n + 1; 1]).named("klen"));
+        let fill = bx(Channel::from(vec![n + 1; 1]).named("fill"));
+        let out = bx(Channel::new([1], dtype::i32).named("out"));
+        let lane1 = Tensor::constant(vec![0u32, 1u32]);
 
-        // KV geometry (read = prior full pages; write = tail pages).
-        let first_write_page = seq_len / page;
-        let total_pages = (seq_len + n).div_ceil(page);
-        let have = kv.size();
-        if total_pages > have {
-            kv.alloc(total_pages - have)
-                .map_err(|e| format!("kv.alloc @{step}: {e}"))?;
-        }
-
-        let pass = ForwardPass::new();
-        pass.kv_working_set(
-            &kv,
-            0,
-            first_write_page,
-            first_write_page * page,
-            first_write_page,
-            total_pages - first_write_page,
-            seq_len % page,
-        );
-
-        // RS in-forward write: bind the RS working set as the "this forward writes
-        // recurrent state" signal. execute_impl's `prepare_write` allocates the
-        // folded slot (+ RS_FLAG_RESET on the fresh fire) and the GDN forward
-        // writes the recurrent state IN-FORWARD to it (the `commit_len` primitive,
-        // executor.cpp:2786). NO `alloc_buffer`/`rs_fold_buffered` — the Ph7
-        // buffered fold-from-slabs path is parked; the basic MTP decode is
-        // in-forward-write. `start-token`/`len-tokens` are unused by the write path.
+        // ONE bound ForwardPass, resubmitted every fire: each channel may
+        // attach to only one pass for its lifetime, so `tok_in`/`pos`/`klen`/
+        // `fill` are wired here ONCE, not rebuilt per step. `rs_working_set`
+        // is attached to this SAME pass, and the RS store's own reset-once/
+        // continue-in-place tracking (keyed on the working set, not the pass)
+        // is correct across all of this pass's resubmits.
+        let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
+        fwd.embed(tok_in, lane1);
+        fwd.positions(pos);
+        fwd.attn_working_set(ws, klen);
         if has_rs {
-            pass.rs_working_set(&rs, 0, n);
+            fwd.rs_working_set(rs);
         }
+        fwd.epilogue(move || {
+            // Takes + compute first, PUTS last (value-id discipline).
+            let base = fill.take().tensor(); // [1] u32 — position the NEXT fire writes
+            let t = reduce_argmax(intrinsics::logits()); // [1] i32 greedy token
 
-        let positions: Vec<u32> = (seq_len..seq_len + n).collect();
-        pass.input_tokens(&pending, &positions);
+            let klen_v = add(&base, 1u32);
+            let next_free = add(&base, 1u32);
 
-        let decode_pos = seq_len + n - 1;
-        pass.sampler(&program, vec![InputBinding::Logits(vec![decode_pos])]);
+            tok_in.put(&t);
+            out.put(&t);
+            pos.put(&base);
+            klen.put(&klen_v);
+            fill.put(&next_free);
+        });
 
-        pass.execute();
-        let out = pass
-            .output()
-            .await
-            .map_err(|e| format!("output @{step}: {e}"))?;
-        let bytes = out.read().map_err(|e| format!("tensor read @{step}: {e:?}"))?;
-        let token = if bytes.len() >= 4 {
-            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u32
-        } else {
-            return Err(format!("output @{step}: short tensor ({} bytes)", bytes.len()));
-        };
-
-        generated.push(token);
-        seq_len += n;
-        pending = vec![token];
+        let decode = Pipeline::new();
+        for step in 1..max_tokens {
+            fwd.submit(&decode)
+                .map_err(|e| format!("decode submit @{step}: {e}"))?;
+            let t = out
+                .take()
+                .get::<i32>()
+                .map_err(|e| format!("out.take @{step}: {e}"))?;
+            let Some(&t0) = t.first() else {
+                return Err(format!("out.take @{step}: empty tensor"));
+            };
+            generated.push(t0 as u32);
+        }
+        decode.close();
     }
 
     let result = format!("generated {} tokens: {:?}", generated.len(), generated);

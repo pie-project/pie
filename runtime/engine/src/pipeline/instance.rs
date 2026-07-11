@@ -200,6 +200,119 @@ pub struct ForwardPass {
     /// consumes channel seeds, so the fire-time gate's seed rule only
     /// applies while this is false.
     pub fired_once: bool,
+    /// Idempotency guard for [`ForwardPass::close_native`]. Set the first
+    /// time native cleanup runs — either the explicit WIT `drop` (after it
+    /// drains the pass's pending FIFO) or, when a `ResourceTable`/
+    /// `ProcessCtx` teardown drops this value directly and bypasses the WIT
+    /// path, this type's own `Drop` fallback. Guards a second call from
+    /// double-closing the driver instance or double-detaching a cell.
+    pub(crate) closed: bool,
+}
+
+impl ForwardPass {
+    /// Idempotent synchronous native teardown: closes the bound driver
+    /// instance, detaches this pass's `instance_id` from every bound
+    /// `ChannelCell` it attached, and reclaims any outstanding
+    /// device-geometry page grants. Safe to call more than once — every step
+    /// is gated by `closed`, so a repeat call (explicit `drop` followed by
+    /// this type's `Drop`, or vice versa) is a pure no-op. Never panics and
+    /// never awaits: failures are logged, since teardown has no result
+    /// channel left to report to.
+    ///
+    /// Callers MUST first confirm [`Self::can_close_native_on_drop`] (or
+    /// have otherwise already drained the pass's fires FIFO, as
+    /// `HostForwardPass::drop` does) — this method does not itself check
+    /// for in-flight fires, since the explicit path calls it only after
+    /// draining and re-checking here would just be a second, redundant
+    /// lock/scan.
+    pub fn close_native(&mut self) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
+        if let Err(error) = crate::scheduler::close_instance(&self.bound_instance) {
+            tracing::warn!(
+                instance_id = self.bound_instance.instance_id,
+                %error,
+                "forward-pass native cleanup: close_instance failed"
+            );
+        }
+        for cell in &self.cells {
+            cell.lock().unwrap().detach(self.bound_instance.instance_id);
+        }
+        // Device-geometry: leased slots are logical reserve indexes in the
+        // store model. Unwritten grants hold no physical memory (reserve is
+        // logical); written grants are committed pages that stay mapped
+        // until the working set itself is discarded or dropped — discarding
+        // them here would shift the surviving indexes under other passes
+        // bound to the same working set, so cleanup intentionally leaves the
+        // mapping alone and only clears the lease's own pending/free
+        // bookkeeping.
+        if let Some(devgeo) = self.devgeo.as_mut() {
+            let _ = devgeo.lease.reclaim_all();
+        }
+    }
+
+    /// Whether it is safe to run [`Self::close_native`] from the `Drop`
+    /// fallback right now: the pass's shared fires FIFO (`None`, or `Some`
+    /// but empty) must hold no in-flight fire/move. A non-empty FIFO means
+    /// at least one op is still awaiting its driver completion and hasn't
+    /// been async-finalized (`crate::pipeline::fire::finalize_op` commits or
+    /// aborts its KV/RS txns and publishes its mirror epoch) — closing the
+    /// native instance, detaching channel cells, or reclaiming
+    /// device-geometry pages out from under that pending completion would
+    /// race a still-live driver write against page reuse (a use-after-free).
+    /// `Drop` cannot `.await` that drain, so it must check this predicate
+    /// instead of finalizing; the explicit `HostForwardPass::drop` path is
+    /// unaffected — it always awaits the drain first and so always finds
+    /// this true by the time it calls `close_native`.
+    pub(crate) fn can_close_native_on_drop(&self) -> bool {
+        match &self.fires {
+            None => true,
+            Some(fifo) => fifo.lock().unwrap().is_empty(),
+        }
+    }
+}
+
+impl Drop for ForwardPass {
+    /// Fallback for when a `ResourceTable`/`ProcessCtx` teardown drops this
+    /// value directly, bypassing `HostForwardPass::drop`'s async FIFO drain +
+    /// explicit `close_native` call (thrust-3 process-teardown hardening).
+    /// Idempotent with the explicit path via `closed`.
+    ///
+    /// Refuses to run native teardown while [`Self::can_close_native_on_drop`]
+    /// is false (a fire/move still in flight): `Drop` has no `.await` to
+    /// drain the FIFO safely, so forcing `close_native` here would risk a
+    /// use-after-free / premature device-geometry page reuse against that
+    /// pending completion. In that case this logs a high-signal error and
+    /// leaves the native instance, channel attachments, and page lease
+    /// alone — a bounded leak (reclaimed at process exit) rather than
+    /// silent memory corruption. This should not happen in practice: it
+    /// means a `ForwardPass` with in-flight fires was dropped without going
+    /// through `HostForwardPass::drop`, which is itself the bug to fix at
+    /// the call site.
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        if self.can_close_native_on_drop() {
+            self.close_native();
+        } else {
+            tracing::error!(
+                instance_id = self.bound_instance.instance_id,
+                pending_fires = self
+                    .fires
+                    .as_ref()
+                    .map(|fifo| fifo.lock().unwrap().len())
+                    .unwrap_or(0),
+                "forward-pass dropped with its fires FIFO non-empty, bypassing \
+                 HostForwardPass::drop's async drain; skipping native teardown \
+                 (close_instance / channel detach / device-geometry reclaim) to avoid \
+                 racing a live driver completion into a use-after-free or premature \
+                 page reuse — this leaks the driver instance and its channel \
+                 attachments until process exit"
+            );
+        }
+    }
 }
 
 /// An instantiation failure.
@@ -595,5 +708,363 @@ mod tests {
             Value::I32(vec![5]),
             "greedy token = argmax = 5"
         );
+    }
+
+    /// `ForwardPass::close_native` process-teardown fallback coverage
+    /// (thrust-3): a `ForwardPass` value constructed exactly like
+    /// `HostForwardPass::new` binds one, then DROPPED DIRECTLY — never
+    /// routed through `HostForwardPass::drop`'s FIFO drain + explicit
+    /// `close_native` call — must still close the bound driver instance and
+    /// detach every one of its cell attachments. This is the host-level
+    /// analog of the CUDA-contention "solo lane exhausts an 8-page pool at
+    /// lane 8" repro: every dropped pass that skips native cleanup leaves a
+    /// `close_channel: channel still has instance attachments` liability for
+    /// the next lane.
+    mod native_cleanup {
+        use super::*;
+        use crate::driver::{
+            self, BoundInstance, ChannelRegistrationPlan, ChannelValue, DriverSpec,
+            ProgramRegistration, SchedulerLimits,
+        };
+        use crate::pipeline::channel::ChannelCell;
+        use crate::scheduler::worker::BatchScheduler;
+        use pie_driver_dummy_lib::DummyDriverOptions;
+        use std::sync::Mutex;
+
+        /// A trivial driver-registerable program (no `Logits`/vocab
+        /// dependency — this harness only exercises bind/close, never a
+        /// fire): one seeded `HostRole::None` channel, one `Reader` channel.
+        fn dummy_program() -> ProgramRegistration {
+            let bytes = TraceContainer {
+                names: vec![],
+                externs: vec![],
+                channels: vec![
+                    chan(Shape::vector(1), DType::U32, HostRole::None, true),
+                    chan(Shape::vector(1), DType::U32, HostRole::Reader, false),
+                ],
+                ports: vec![],
+                stages: vec![StageProgram {
+                    stage: Stage::Epilogue,
+                    ops: vec![
+                        Op::ChanTake(0),
+                        Op::Const(pie_ptir::types::Literal::U32(1)),
+                        Op::Add(0, 1),
+                        Op::ChanPut { chan: 0, value: 2 },
+                        Op::ChanPut { chan: 1, value: 2 },
+                    ],
+                }],
+            }
+            .encode();
+            ProgramRegistration {
+                program_hash: pie_ptir::container_hash(&bytes),
+                canonical_bytes: bytes,
+                sidecar_bytes: Vec::new(),
+            }
+        }
+
+        /// Real scheduler + dummy driver, one bound instance, two bound
+        /// `ChannelCell`s (dense order matching `dummy_program`) — the exact
+        /// shape `HostForwardPass::new` binds, built directly so the test
+        /// can drop the resulting `ForwardPass` WITHOUT calling
+        /// `HostForwardPass::drop`.
+        fn setup(
+            operation_log: Arc<Mutex<Vec<String>>>,
+        ) -> (
+            BatchScheduler,
+            BoundInstance,
+            Vec<Arc<Mutex<ChannelCell>>>,
+            u64,
+        ) {
+            let driver_id = driver::register_native_driver(
+                DriverSpec {
+                    num_kv_pages: 16,
+                    limits: SchedulerLimits {
+                        max_forward_requests: 1,
+                        max_forward_tokens: 64,
+                        max_page_refs: 64,
+                    },
+                },
+                driver::NativeDriver::Dummy(driver::DummyLocalDriver::new(DummyDriverOptions {
+                    operation_log: Some(operation_log),
+                    ..DummyDriverOptions::default()
+                })),
+            );
+            let scheduler = BatchScheduler::new(
+                driver_id,
+                driver_id,
+                16,
+                SchedulerLimits {
+                    max_forward_requests: 1,
+                    max_forward_tokens: 64,
+                    max_page_refs: 64,
+                },
+                1,
+            );
+
+            let program_id =
+                crate::scheduler::register_program(driver_id, dummy_program()).unwrap();
+
+            let decls = [
+                chan(Shape::vector(1), DType::U32, HostRole::None, true),
+                chan(Shape::vector(1), DType::U32, HostRole::Reader, false),
+            ];
+            let cells: Vec<Arc<Mutex<ChannelCell>>> = decls
+                .iter()
+                .map(|decl| {
+                    Arc::new(Mutex::new(ChannelCell::new(
+                        decl.shape.dims().to_vec(),
+                        decl.dtype.program_dtype(),
+                        decl.capacity,
+                    )))
+                })
+                .collect();
+            let channel_ids: Vec<u64> = cells.iter().map(|c| c.lock().unwrap().global_id).collect();
+
+            let instance_id = next_instance_id();
+            for (cell, decl) in cells.iter().zip(&decls) {
+                cell.lock()
+                    .unwrap()
+                    .attach(instance_id, decl, None)
+                    .unwrap();
+            }
+            for (cell, decl) in cells.iter().zip(&decls) {
+                let global_id = cell.lock().unwrap().global_id;
+                let endpoint = crate::scheduler::register_channel(
+                    driver_id,
+                    ChannelRegistrationPlan {
+                        driver_id,
+                        channel_id: global_id,
+                        shape: decl.shape.dims().to_vec(),
+                        dtype: decl.dtype.tag(),
+                        host_role: decl.host_role as u8,
+                        seeded: decl.seeded,
+                        extern_dir: pie_driver_abi::PIE_CHANNEL_EXTERN_NONE,
+                        capacity: decl.capacity,
+                        reader_wait_id: 0,
+                        writer_wait_id: 0,
+                        extern_name: Vec::new(),
+                    },
+                )
+                .unwrap();
+                cell.lock().unwrap().attach_endpoint(endpoint).unwrap();
+            }
+
+            let seed_values = vec![ChannelValue {
+                channel: channel_ids[0],
+                bytes: 1u32.to_le_bytes().to_vec(),
+            }];
+            let bound = crate::scheduler::bind_instance(
+                driver_id,
+                program_id,
+                instance_id,
+                channel_ids,
+                seed_values,
+            )
+            .unwrap();
+
+            (scheduler, bound, cells, instance_id)
+        }
+
+        /// Assemble a `ForwardPass` exactly like `HostForwardPass::new`
+        /// would (minus channel-rep/devgeo/KV-ws plumbing this harness has
+        /// no use for) around an already-bound instance + cells.
+        fn make_pass(
+            bound_instance: BoundInstance,
+            cells: Vec<Arc<Mutex<ChannelCell>>>,
+        ) -> ForwardPass {
+            ForwardPass {
+                instance: Instance {
+                    program: registered(),
+                    instance_id: bound_instance.instance_id,
+                    seeds: Vec::new(),
+                },
+                bound_instance,
+                cells,
+                channel_ids: Vec::new(),
+                channel_reps: Vec::new(),
+                fires: None,
+                kv_ws: 0,
+                rs_ws: None,
+                committed_tokens: 0,
+                failed: None,
+                devgeo: None,
+                canonical_kv: false,
+                dense_mask: false,
+                fired_once: false,
+                closed: false,
+            }
+        }
+
+        #[test]
+        fn drop_without_host_drop_closes_instance_and_detaches_channels() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, instance_id) = setup(operation_log.clone());
+            let pass = make_pass(bound, cells.clone());
+
+            // Simulate a `ResourceTable`/`ProcessCtx` teardown dropping the
+            // `ForwardPass` value directly — `HostForwardPass::drop` (which
+            // drains the pending FIFO, then calls `close_native`) is never
+            // invoked.
+            drop(pass);
+
+            assert!(
+                operation_log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|op| op == "close_instance"),
+                "the Drop fallback closed the native instance"
+            );
+
+            // Every cell's attachment for `instance_id` must be gone: a
+            // FRESH instance can attach to the SAME cells without hitting
+            // channel.rs's "a private or host-visible channel may attach to
+            // only one pass" rule — which is exactly the driver-level
+            // symptom (`close_channel: channel still has instance
+            // attachments`) this fallback prevents.
+            let decls = [
+                chan(Shape::vector(1), DType::U32, HostRole::None, true),
+                chan(Shape::vector(1), DType::U32, HostRole::Reader, false),
+            ];
+            let other_instance = next_instance_id();
+            assert_ne!(other_instance, instance_id);
+            for (cell, decl) in cells.iter().zip(&decls) {
+                cell.lock()
+                    .unwrap()
+                    .attach(other_instance, decl, None)
+                    .expect(
+                        "the Drop fallback detached the old instance; a fresh \
+                         attach must succeed",
+                    );
+            }
+        }
+
+        #[test]
+        fn explicit_close_native_is_idempotent_with_the_drop_fallback() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, _instance_id) = setup(operation_log.clone());
+            let mut pass = make_pass(bound, cells.clone());
+
+            // The explicit path (what `HostForwardPass::drop` does after
+            // draining the FIFO).
+            pass.close_native();
+            let closes_after_explicit = operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| *op == "close_instance")
+                .count();
+            assert_eq!(closes_after_explicit, 1);
+
+            // The value's own `Drop` fires next when `pass` goes out of
+            // scope — must be a pure no-op (`closed` already set): no
+            // second `close_instance` dispatch, which would otherwise
+            // error against an already-removed native instance.
+            drop(pass);
+            let closes_after_drop = operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| *op == "close_instance")
+                .count();
+            assert_eq!(
+                closes_after_drop, 1,
+                "close_native is idempotent: the Drop fallback must not double-close"
+            );
+        }
+
+        #[test]
+        fn can_close_native_on_drop_is_true_with_no_or_empty_fifo() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, _instance_id) = setup(operation_log);
+            let mut pass = make_pass(bound, cells);
+
+            assert!(pass.fires.is_none());
+            assert!(
+                pass.can_close_native_on_drop(),
+                "no shared FIFO at all is trivially safe"
+            );
+
+            pass.fires = Some(Arc::new(Mutex::new(std::collections::VecDeque::new())));
+            assert!(
+                pass.can_close_native_on_drop(),
+                "a FIFO that exists but is drained (empty) is just as safe as None"
+            );
+        }
+
+        #[test]
+        fn can_close_native_on_drop_is_false_with_a_pending_fifo_entry() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, _instance_id) = setup(operation_log);
+            let mut pass = make_pass(bound, cells);
+
+            let mut fifo = std::collections::VecDeque::new();
+            fifo.push_back(crate::pipeline::fire::test_pending_move_stub());
+            pass.fires = Some(Arc::new(Mutex::new(fifo)));
+
+            assert!(
+                !pass.can_close_native_on_drop(),
+                "an in-flight fire/move must refuse native cleanup on drop"
+            );
+        }
+
+        /// The actual review finding this guards: a `ForwardPass` dropped
+        /// directly (bypassing `HostForwardPass::drop`'s FIFO drain) while a
+        /// fire/move is still in flight must NOT close the native instance,
+        /// detach cell attachments, or reclaim device-geometry pages — `Drop`
+        /// cannot `.await` the pending completion's async finalize, so doing
+        /// so would race a live driver write into a use-after-free /
+        /// premature page reuse. It must instead leave everything alone
+        /// (log-and-skip), unlike the empty-FIFO fallback case which DOES
+        /// run `close_native` (see `drop_without_host_drop_closes_instance_and_detaches_channels`).
+        #[test]
+        fn drop_with_pending_fifo_entry_skips_native_teardown() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, instance_id) = setup(operation_log.clone());
+            let mut pass = make_pass(bound, cells.clone());
+
+            let mut fifo = std::collections::VecDeque::new();
+            fifo.push_back(crate::pipeline::fire::test_pending_move_stub());
+            pass.fires = Some(Arc::new(Mutex::new(fifo)));
+
+            // Simulate a `ResourceTable`/`ProcessCtx` teardown dropping the
+            // `ForwardPass` value directly while its FIFO is non-empty.
+            drop(pass);
+
+            assert!(
+                !operation_log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|op| op == "close_instance"),
+                "the Drop fallback must not close the native instance while a fire/move \
+                 is still in flight"
+            );
+
+            // The old instance's attachment must still be present: a FRESH
+            // instance attaching to the same cells must be REJECTED by
+            // channel.rs's "a private or host-visible channel may attach to
+            // only one pass" rule — proof detach did not run.
+            let decls = [
+                chan(Shape::vector(1), DType::U32, HostRole::None, true),
+                chan(Shape::vector(1), DType::U32, HostRole::Reader, false),
+            ];
+            let other_instance = next_instance_id();
+            assert_ne!(other_instance, instance_id);
+            for (cell, decl) in cells.iter().zip(&decls) {
+                let error = cell
+                    .lock()
+                    .unwrap()
+                    .attach(other_instance, decl, None)
+                    .expect_err(
+                        "the old instance's attachment must remain: skipping teardown \
+                         also skips detach",
+                    );
+                assert!(
+                    error.contains("only one pass"),
+                    "unexpected attach error: {error}"
+                );
+            }
+        }
     }
 }

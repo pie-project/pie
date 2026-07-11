@@ -443,6 +443,49 @@ void run_dfa_ingraph(const std::string& dir) {
     cudaFree(d_logits);
 }
 
+// ── pivot_predicates_multistage: pivot_threshold(probs, CummassLe(p)) /
+//    pivot_threshold(probs, ProbGe(thr)) — both `p`/`thr` DYNAMIC (host-fed)
+//    trace values, never immediates. A throwaway Prologue value ahead of the
+//    Epilogue's real ops makes the Epilogue's global id base NONZERO — the
+//    exact container_to_trace / tier-0 regression this pins: the predicate
+//    payload is a per-STAGE-LOCAL ValueId (same contract as any op arg) that
+//    MUST be remapped through the stage's global-id base, never read as a
+//    bare local id (bound.hpp's prior bug) or a host immediate (CUDA
+//    tier-0's prior bug). ──
+void run_pivot_predicates(const std::string& dir) {
+    std::printf("[pivot_predicates_multistage]\n");
+    Trace t; if (!build_trace(dir, "pivot_predicates_multistage", t)) return;
+    const std::uint32_t V = 8;
+    Tier0Runner runner(t);
+
+    std::vector<float> logits{0.f, 1.f, 9.f, 2.f, 0.f, 0.f, 0.f, 3.f};
+    float* d_logits = nullptr; cudaMalloc(&d_logits, V * sizeof(float));
+    cudaMemcpy(d_logits, logits.data(), V * sizeof(float), cudaMemcpyHostToDevice);
+    FireInputs in; in.logits = d_logits; in.vocab = V;
+
+    // echo ptir_golden.rs: chan0 = p (top-p threshold), chan1 = thr (prob-ge
+    // threshold), both host-fed per pass — dynamic, never const-folded.
+    float p = 0.999f, thr = 0.0003f;
+    runner.arena().host_feed(0, &p, sizeof(p));
+    runner.arena().host_feed(1, &thr, sizeof(thr));
+
+    PassResult r = runner.run_pass(in);
+    std::uint8_t mask_p[8] = {0}, mask_t[8] = {0};
+    runner.arena().host_take(2, mask_p, sizeof(mask_p));
+    runner.arena().host_take(3, mask_t, sizeof(mask_t));
+
+    // echo golden (interface/ptir/tests/golden-ptir/pivot_predicates_multistage.txt):
+    //   take chan=2 = Bool([false,false,true,true,false,false,false,true])   (CummassLe 0.999)
+    //   take chan=3 = Bool([false,true,true,true,false,false,false,true])    (ProbGe 0.0003)
+    const std::uint8_t want_p[8] = {0, 0, 1, 1, 0, 0, 0, 1};
+    const std::uint8_t want_t[8] = {0, 1, 1, 1, 0, 0, 0, 1};
+    bool ok = r.ok && r.committed;
+    for (std::uint32_t i = 0; i < V && ok; ++i) ok = (mask_p[i] == want_p[i]) && (mask_t[i] == want_t[i]);
+    expect(ok, "cummass_le(0.999)/prob_ge(0.0003) masks match echo's golden (committed=" +
+               std::string(r.committed ? "T" : "F") + (r.ok ? "" : (", err=" + r.error)) + ")");
+    cudaFree(d_logits);
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : "tests/golden-ptir";
     cudaDeviceProp p{}; cudaGetDeviceProperties(&p, 0);
@@ -456,6 +499,7 @@ int main(int argc, char** argv) {
     run_beam(dir);
     run_mtp_verify_tail(dir);
     run_dfa_ingraph(dir);
+    run_pivot_predicates(dir);
     std::printf("\n==== golden step-exec: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

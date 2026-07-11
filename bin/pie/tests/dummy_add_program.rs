@@ -24,7 +24,7 @@ async fn add_program_completes_on_dummy_driver() -> Result<()> {
     let pie = common::boot_dummy().await?;
     eprintln!("[diag] booted, listen_addr={}", pie.listen_addr);
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "generate"])
         .current_dir(&ws)

@@ -56,7 +56,7 @@ async fn grammar_late_supply_on_real_driver() -> Result<()> {
     eprintln!("[grammar-late] booted, listen_addr={}", pie.listen_addr);
 
     // Build the Late-supply grammar masking verify inferlet.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "grammar-late"])
         .current_dir(&ws)

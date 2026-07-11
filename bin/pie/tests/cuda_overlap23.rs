@@ -84,7 +84,7 @@ async fn found_abort_overlap_on_real_driver() -> Result<()> {
     );
 
     // Build the run-ahead carryover inferlet (the overlap driver).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "runahead"])
         .current_dir(&ws)

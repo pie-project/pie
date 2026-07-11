@@ -1,4 +1,4 @@
-//! Ported from xgrammar: test_regex_converter.py
+//! Regex-to-grammar conversion behavior.
 //!
 //! Tests regex → EBNF conversion correctness.
 

@@ -292,7 +292,8 @@ use pie_client::client::Client;
 /// the `bin/pie` crate dir to the runtime test-inferlets workspace. Builds both
 /// (one cargo invocation) so a multi-capability harness pays the build once.
 pub fn build_inferlet(name: &str) -> (PathBuf, PathBuf) {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let workspace =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",

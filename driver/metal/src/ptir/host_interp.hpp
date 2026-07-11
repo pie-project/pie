@@ -619,7 +619,7 @@ struct Overlay {
 // Evaluate one compute op (SSA args already in `vals`). Mirrors interp.rs
 // eval_op case for case; returns false + `error` on a semantic fault.
 inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>& vals,
-                    std::string& error, std::uint32_t stage_base = 0) {
+                    std::string& error) {
     auto v = [&](std::uint32_t id) -> const Value& { return vals[id]; };
     auto ty = [&](std::uint32_t id) -> const cptir::TensorType& { return trace.values[id].type; };
     auto fault = [&](const std::string& m) {
@@ -965,13 +965,16 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             const std::size_t len = rows == 0 ? 0 : x.size() / rows;
             std::vector<std::uint8_t> keep(x.size(), 0);
             // Predicate payloads are VALUE IDS on the wire for all three tags
-            // (interface/ptir container.rs decode) — RankLe included.
+            // (interface/ptir container.rs decode) — RankLe included. Already
+            // mapped to a global trace id by container_to_trace (bound.hpp
+            // gid()), same as any other op operand — no stage-local rebasing
+            // needed here.
             for (std::size_t r = 0; r < rows; ++r) {
                 const float* row = x.data() + r * len;
                 std::uint8_t* k = keep.data() + r * len;
                 switch (op.predicate.tag) {
                     case cptir::PredTag::RankLe: {
-                        const auto kv = lanes_i64(v(stage_base + op.predicate.payload));
+                        const auto kv = lanes_i64(v(op.predicate.payload));
                         const std::int64_t kk = std::clamp<std::int64_t>(
                             kv[pick(kv.size(), r)], 0, static_cast<std::int64_t>(len));
                         for (std::size_t i = 0; i < len; ++i) {
@@ -984,7 +987,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
                         break;
                     }
                     case cptir::PredTag::CummassLe: {
-                        const auto pv = lanes_f32(v(stage_base + op.predicate.payload));
+                        const auto pv = lanes_f32(v(op.predicate.payload));
                         const float p = pv[pick(pv.size(), r)];
                         const auto order = sort_desc_order(row, len);
                         float excl = 0.0f;
@@ -995,7 +998,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
                         break;
                     }
                     case cptir::PredTag::ProbGe: {
-                        const auto tv = lanes_f32(v(stage_base + op.predicate.payload));
+                        const auto tv = lanes_f32(v(op.predicate.payload));
                         const float thr = tv[pick(tv.size(), r)];
                         for (std::size_t i = 0; i < len; ++i) k[i] = row[i] >= thr ? 1 : 0;
                         break;
@@ -1128,7 +1131,7 @@ inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePl
     for (std::uint32_t id = sp.base; id < sp.end;) {
         auto found = sp.op_by_result.find(id);
         if (found != sp.op_by_result.end()) {
-            if (!eval_op(*found->second, plan.trace, vals, error, sp.base)) return false;
+            if (!eval_op(*found->second, plan.trace, vals, error)) return false;
             id += found->second->result_count;
             continue;
         }

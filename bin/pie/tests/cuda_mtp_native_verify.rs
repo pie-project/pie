@@ -46,7 +46,7 @@ async fn mtp_logits_value_verify() -> Result<()> {
     eprintln!("[mtp-native-verify] k = {k}");
 
     // Build the mtp-native-verify inferlet (wasm).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",

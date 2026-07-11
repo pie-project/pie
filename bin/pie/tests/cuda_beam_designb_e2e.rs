@@ -44,7 +44,7 @@ async fn beam_designb_on_real_driver() -> Result<()> {
 
     // Build the `beam-designb` inferlet to wasm (member of the runtime
     // test-inferlets ws). The crate name normalizes to `beam_designb.wasm`.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "beam-designb"])
         .current_dir(&ws)

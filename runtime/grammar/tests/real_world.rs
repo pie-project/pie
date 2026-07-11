@@ -1,4 +1,4 @@
-//! Real-world production readiness tests.
+//! Real-world grammar scenarios.
 //!
 //! Covers deep nesting, all escape types, large collections, function-calling schemas,
 //! comprehensive negative cases, bitmask verification, and mixed-operation edge cases.

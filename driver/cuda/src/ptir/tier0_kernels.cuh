@@ -514,6 +514,153 @@ __global__ void k_pivot_threshold_rankle(const float* __restrict__ in, float* __
     }
 }
 
+// ──────────────────── pivot_threshold predicates (dynamic) ───────────────
+// The three `pivot_threshold` predicates (interface/ptir interp.rs eval_op,
+// Op::PivotThreshold): the payload is ALWAYS a trace value (scalar or
+// per-row [rows] vector), never a host immediate — resolved by the runner to
+// a device buffer + dtype + numel (tier0_runner.hpp build_launch) and read
+// here at launch time. `pred_numel<=1` broadcasts index 0 to every row
+// (mirrors interp.rs `pick(len, r)`), else it's one value per row.
+
+// Shared total order used by CummassLe's descending selection loop:
+// descending value, ties → lower original index first, NaN sorts last (ties
+// among NaNs → lower index first) — exactly `sort_desc_order`'s comparator.
+// Returns true iff (av,ai) sorts STRICTLY BEFORE (bv,bi) in that order.
+__device__ __forceinline__ bool t0_desc_before(float av, std::uint32_t ai, bool a_nan,
+                                               float bv, std::uint32_t bi, bool b_nan) {
+    if (!a_nan && !b_nan) return (av > bv) || (av == bv && ai < bi);
+    if (a_nan && b_nan) return ai < bi;
+    return !a_nan;   // non-NaN always sorts before NaN
+}
+
+// rank_le predicate inside pivot_threshold: `k` is a dynamic (scalar or
+// per-row) I32/U32 trace value — NOT a host immediate (unlike the standalone
+// `rank_le` op above). Ties/NaN contract mirrors interp.rs exactly: a NaN
+// element is NEVER selected (interp.rs `if xi.is_nan() { continue; }` leaves
+// its `keep` bit at the default false), and NaN elements never count toward
+// another element's `greater` tally. One CTA per row.
+template <class KT>
+__global__ void k_pivot_rankle(const float* __restrict__ in, std::uint8_t* __restrict__ out,
+                               std::uint32_t rows, std::uint32_t len,
+                               const KT* __restrict__ k_buf, std::uint32_t k_numel) {
+    const std::uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float* r = in + (std::uint64_t)row * len;
+    std::uint8_t* o = out + (std::uint64_t)row * len;
+    const std::int64_t k_raw = (std::int64_t)k_buf[(k_numel <= 1) ? 0u : row];
+    const std::int64_t kk = k_raw < 0 ? 0 : (k_raw > (std::int64_t)len ? (std::int64_t)len : k_raw);
+    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
+        const float v = r[i];
+        if (isnan(v)) { o[i] = 0u; continue; }
+        std::int64_t greater = 0;
+        for (std::uint32_t j = 0; j < len; ++j) {
+            const float y = r[j];
+            if (!isnan(y) && y > v) ++greater;
+        }
+        o[i] = (greater < kk) ? 1u : 0u;
+    }
+}
+
+// prob_ge predicate: elementwise `x[i] >= thr`, `thr` a dynamic (scalar or
+// per-row) F32 trace value. Purely elementwise — grid-stride over rows*len.
+__global__ void k_pivot_probge(const float* __restrict__ in, std::uint8_t* __restrict__ out,
+                               std::uint32_t rows, std::uint32_t len,
+                               const float* __restrict__ thr_buf, std::uint32_t thr_numel) {
+    const std::uint64_t n = (std::uint64_t)rows * len;
+    for (std::uint64_t t = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
+         t < n; t += (std::uint64_t)gridDim.x * blockDim.x) {
+        const std::uint32_t row = (std::uint32_t)(len == 0 ? 0 : t / len);
+        const float thr = thr_buf[(thr_numel <= 1) ? 0u : row];
+        out[t] = (in[t] >= thr) ? 1u : 0u;
+    }
+}
+
+// cummass_le predicate (top-p / nucleus): keep the descending prefix whose
+// EXCLUSIVE cumulative mass stays `< p` (interp.rs: `k[i] = excl < p; excl +=
+// row[i]`), `p` a dynamic (scalar or per-row) F32 trace value. This is a CTA
+// selection loop — one block-wide "next largest still-unpicked element" pick
+// per iteration (the same incremental-threshold technique as `k_topk_rows`,
+// generalized to the NaN-aware total order above) — instead of a `len`-way
+// per-element rank pass (which would cost O(len^2) unconditionally, i.e. ~2.3e10
+// ops at the 151936-token vocab this must stay practical for). Real LM
+// distributions are peaked, so the loop typically stops after a handful of
+// picks once the running mass clears `p`; pathological (near-uniform, p→1)
+// rows still complete correctly, just in up to `len` picks (matching the
+// dense case any correct implementation must cover). `out` is zero-inited so
+// unvisited (excluded) elements default to false.
+__global__ void k_pivot_cummassle(const float* __restrict__ in, std::uint8_t* __restrict__ out,
+                                  std::uint32_t rows, std::uint32_t len,
+                                  const float* __restrict__ p_buf, std::uint32_t p_numel) {
+    __shared__ float sh_v[kTier0Block];
+    __shared__ std::uint32_t sh_i[kTier0Block];
+    __shared__ std::uint8_t sh_nan[kTier0Block];
+    __shared__ float prev_v;
+    __shared__ std::uint32_t prev_i;
+    __shared__ std::uint8_t prev_nan;
+    __shared__ float excl;
+    __shared__ std::uint8_t stop;
+    constexpr std::uint32_t kNone = 0xFFFFFFFFu;
+
+    const std::uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float* r = in + (std::uint64_t)row * len;
+    std::uint8_t* o = out + (std::uint64_t)row * len;
+    const float p = p_buf[(p_numel <= 1) ? 0u : row];
+
+    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) o[i] = 0u;
+    if (threadIdx.x == 0) {
+        prev_v = t0_pos_inf(); prev_i = 0u; prev_nan = 0u;   // sentinel: before everything
+        excl = 0.0f; stop = 0u;
+    }
+    __syncthreads();
+
+    for (std::uint32_t pick = 0; pick < len; ++pick) {
+        if (stop) break;
+        const float pv = prev_v; const std::uint32_t pi = prev_i; const bool p_nan = prev_nan != 0u;
+        float best = 0.0f; std::uint32_t bi = kNone; bool best_nan = false;
+        for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
+            const float v = r[i];
+            const bool v_nan = isnan(v);
+            // Available iff it sorts strictly after the previous pick — the
+            // very first pick's `prev` (+inf, i=0, non-NaN) admits every i
+            // (any real value or NaN sorts after +inf).
+            if (!t0_desc_before(pv, pi, p_nan, v, i, v_nan)) continue;
+            if (bi == kNone || t0_desc_before(v, i, v_nan, best, bi, best_nan)) {
+                best = v; bi = i; best_nan = v_nan;
+            }
+        }
+        sh_v[threadIdx.x] = best; sh_i[threadIdx.x] = bi; sh_nan[threadIdx.x] = best_nan ? 1u : 0u;
+        __syncthreads();
+        for (std::uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                const std::uint32_t oi = sh_i[threadIdx.x + s];
+                if (oi != kNone &&
+                    (sh_i[threadIdx.x] == kNone ||
+                     t0_desc_before(sh_v[threadIdx.x + s], oi, sh_nan[threadIdx.x + s] != 0u,
+                                    sh_v[threadIdx.x], sh_i[threadIdx.x], sh_nan[threadIdx.x] != 0u))) {
+                    sh_v[threadIdx.x] = sh_v[threadIdx.x + s];
+                    sh_i[threadIdx.x] = oi;
+                    sh_nan[threadIdx.x] = sh_nan[threadIdx.x + s];
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const std::uint32_t idx = sh_i[0];
+            if (idx == kNone) {
+                stop = 1u;   // exhausted the row (len picks already done otherwise)
+            } else if (excl < p) {
+                o[idx] = 1u;
+                excl += r[idx];
+                prev_v = sh_v[0]; prev_i = idx; prev_nan = sh_nan[0];
+            } else {
+                stop = 1u;   // mass condition failed — descending order ⇒ all remaining fail too
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // ─────────────────────── library kernels (top_k, matmul) ─────────────────
 // Linked, not generated (T9/§7.3). Tier-0 provides a correct baseline; the perf
 // path swaps in bitonic top_k / cuBLASLt matmul.

@@ -53,7 +53,7 @@ async fn mtp_grammar_composition_on_real_driver() -> Result<()> {
     eprintln!("[mtp-verify] booted, listen_addr={}", pie.listen_addr);
 
     // Build the §6.1 composed spec-verify ⟂ per-position grammar inferlet.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "mtpverify"])
         .current_dir(&ws)

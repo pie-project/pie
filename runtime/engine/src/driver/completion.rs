@@ -55,7 +55,7 @@ fn terminal_cell_pool() -> &'static Mutex<Vec<Box<TerminalCellStorage>>> {
 
 impl OwnedTerminalCell {
     fn new() -> Self {
-        let mut raw = terminal_cell_pool()
+        let raw = terminal_cell_pool()
             .lock()
             .unwrap()
             .pop()
@@ -685,7 +685,7 @@ mod tests {
     fn foreign_thread_publish_completes_waiter() {
         let broker = CompletionBroker::new();
         let callbacks = broker_callbacks(&broker);
-        let (raw, mut completion) = broker.launch_completion(3);
+        let (raw, completion) = broker.launch_completion(3);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -794,7 +794,7 @@ mod tests {
     fn callbacks_are_ignored_after_broker_close() {
         let broker = CompletionBroker::new();
         let callbacks = broker_callbacks(&broker);
-        let (raw, mut completion) = broker.launch_completion(5);
+        let (raw, completion) = broker.launch_completion(5);
         broker.close_all("driver closed");
         unsafe { runtime_notify(callbacks.ctx, raw.wait_id, raw.target_epoch) };
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -838,16 +838,8 @@ mod tests {
     }
 
     #[test]
-    fn deferred_instance_completion_commits_epoch_only_on_acceptance() {
-        let completion = InstanceCompletion::deferred_with_guard(None);
-        assert_eq!(completion.target_epoch(), 0);
-        completion.commit_target_epoch(4);
-        assert_eq!(completion.target_epoch(), 4);
-    }
-
-    #[test]
     fn instance_completion_reports_terminal_failure() {
-        let mut completion = Box::pin(InstanceCompletion::deferred_with_guard(None));
+        let completion = Box::pin(InstanceCompletion::deferred_with_guard(None));
         store_terminal(completion.terminal_cell_ptr(), PIE_TERMINAL_OUTCOME_FAILED);
         let _ = completion.resolve_from_terminal();
         let rt = tokio::runtime::Builder::new_current_thread()

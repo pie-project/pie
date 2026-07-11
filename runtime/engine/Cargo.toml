@@ -108,11 +108,8 @@ profile-all = ["profile-fire"]       # everything
 
 [dev-dependencies]
 tempfile = "3"
-pie-tokenizer = { path = "../tokenizer" }
-pie-grammar = { path = "../grammar" }
 pie-ptir = { path = "../../interface/ptir", features = ["eval"] }
 criterion = { version = "0.5", features = ["html_reports"] }
-tokenizers = "0.21"
 
 #[profile.release]
 #lto = "fat"

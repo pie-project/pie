@@ -114,14 +114,6 @@ impl Session {
                         serde_json::Value::from(inf.fire.avg_recv_block_wait_us),
                     );
                     stats.insert(
-                        format!("{}.fire.guest_roundtrip_us", model_name),
-                        serde_json::Value::from(inf.fire.avg_guest_roundtrip_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.service_queue_us", model_name),
-                        serde_json::Value::from(inf.fire.avg_service_queue_us),
-                    );
-                    stats.insert(
                         format!("{}.fire.accumulate.accum_loop_us", model_name),
                         serde_json::Value::from(inf.fire.accumulate.avg_accum_loop_us),
                     );

@@ -49,7 +49,7 @@ async fn temp_dehardwire_on_real_driver() -> Result<()> {
     eprintln!("[temp-dehardwire] booted, listen_addr={}", pie.listen_addr);
 
     // Build the tempgen inferlet (Multinomial temperature sampler).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "tempgen"])
         .current_dir(&ws)

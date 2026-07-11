@@ -32,7 +32,7 @@ async fn runahead_carryover_on_real_driver() -> Result<()> {
     eprintln!("[runahead] booted, listen_addr={}", pie.listen_addr);
 
     // Build the run-ahead carryover inferlet.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "runahead"])
         .current_dir(&ws)

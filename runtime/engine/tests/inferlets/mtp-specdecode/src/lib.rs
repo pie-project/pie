@@ -1,289 +1,214 @@
-//! **MTP Stage-2 — DEVICE-RESIDENT spec-decode** (pipe-audit): the drafts-channel
-//! swap of `mtp-native-verify`. Where `mtp-native-verify` round-trips the drafts
-//! through host (`read out[1] → submit as next `draft``), this reads the CURRENT
-//! window's drafts DEVICE-RESIDENT via the `Binding::MtpDrafts` intrinsic — the
-//! driver source-selects bravo's retained `mtp_drafts` `[k]` buffer onto the
-//! verify's `draft` operand (`mtp_specdecode_device`, `hit = target_argmax ==
-//! mtp_drafts`). Zero host round-trip on the `[k]` drafts.
+//! **MTP Stage-2 — spec-decode, drafts-channel swap of `mtp-native-verify`**
+//! (`inferlet::ptir` bridge rewrite). The ORIGINAL classic-WIT design read this
+//! window's drafts DEVICE-RESIDENT via a `Binding::MtpDrafts` intrinsic + a
+//! driver-side `carrier::next_inputs_drafts` retain/inject command (zero host
+//! round-trip on the `[k]` drafts). Both that intrinsic's author-facing eDSL
+//! wrapper and the retain/inject WIT command have been REMOVED in the ptir
+//! refactor (there is no `intrinsics::mtp_drafts()` in `ptir-dsl`, and no
+//! `pipeline_source_kind`/retain surface anywhere in the current `forward`/
+//! `pipeline` WIT interfaces) — this is a genuine capability gap, not a stale
+//! rename, so it cannot be surgically restored without extending the WIT/driver
+//! surface (out of this migration's scope).
 //!
-//! Loop (PARTIAL-residency, seam-lock (b)): fire `mtp_specdecode_device` over the
-//! device-injected `[k+1]` window → `carrier::next_inputs_drafts(k)` declares the
-//! retain+inject of the NEXT window (`[seed, drafts]` = out[2]→row0, out[1]→rows
-//! 1..k, `pipeline_source_kind=1`) → read ONLY out[0] (the `[k+1]` commit tail)
-//! host-side for the committed count (`n_acc+1`, the scalar advance) + the
-//! committed text. out[1]/out[2] stay on-GPU (the retain injects them). The next
-//! fire's window rows are host placeholders that the carrier overwrites from the
-//! retained buffer.
+//! This inferlet is therefore, for now, IMPLEMENTATION-IDENTICAL to
+//! `mtp-native-verify`'s host-round-trip baseline (see that inferlet's module
+//! docs for the full dataflow): the `[k+1]` window is a host-writer channel
+//! re-`put` each iteration from the host's running commit/draft bookkeeping,
+//! and the draft is device-alias read (`toks.read()`, non-consuming peek) off
+//! the SAME embedded window tokens. `cuda_mtp_specdecode_ab.rs`'s hard gate is
+//! only that both A and B return a finite `mean_accept` and their own name in
+//! the result string — both hold here. The PERF/VALUE A-vs-B commentary in that
+//! harness (device-resident should avoid B's host round-trip and be ≥ as fast)
+//! is no longer a meaningful distinction until `MtpDrafts`/retain functionality
+//! is reintroduced on the `inferlet::ptir` surface; that harness is `#[ignore]`d
+//! and only soft-prints the delta, so this does not regress any hard assertion.
 //!
-//! ⚠️ GPU-only (like `mtp-native-verify`): the `MtpDrafts`/`MtpLogits` intrinsics
-//! are disabled in the host/mock profile → RUNS on the 4090 with charlie's CUDA
-//! source-select (the drafts-channel value-verify A/B vs `mtp-native-verify`,
-//! accepted-tok/s). Host-COMPILES now (the full binding plumbing type-checks).
-//! Two seams resolved on-device with bravo+charlie: the n_acc KV position-advance
-//! (guest advances the host cursor by out[0]'s count; the retain lands the window
-//! at that position) + the first-fire bootstrap (the MtpDrafts buffer is empty
-//! pre-fire-0, so fire 0's commit is discarded — its out[1] seeds fire 1).
+//! JSON/plain input: optional draft window `k` (default 4).
 
-use inferlet::inference::ForwardPass;
-use inferlet::program::{encode_f32, encode_i32, resolve_bindings, HostInputDecl};
-use inferlet::sampling::program::{
-    mtp_specdecode_bootstrap, mtp_specdecode_device, MtpSpecdecodeDeviceKeys,
-};
-use inferlet::working_set::{KvWorkingSet, RsWorkingSet};
-use inferlet::{carrier, model, tensor, Result};
+use inferlet::ptir::prelude::*;
+use inferlet::{Result, model as wit_model};
 
 const PROMPT: &str = "The quick brown fox jumps over";
 const MAX_TOKENS: u32 = 16;
+const PAGE_T: u32 = 16;
+const NUM_LAYERS: u32 = 28;
 
-/// The lowered `mtp_specdecode_device` program + its (lanes-only) host-input keys.
-/// Outputs: `[0]` = `[k+1]` committed tail; `[1]` = `[k]` next drafts (retained,
-/// NOT host-read); `[2]` = `[1]` seed (retained, NOT host-read).
-struct Composed {
-    program: tensor::Program,
-    bindings: Vec<inferlet::sampling::ir::Binding>,
-    host_inputs: Vec<HostInputDecl>,
-    keys: MtpSpecdecodeDeviceKeys,
-    k: u32,
+fn bx<T>(v: T) -> &'static T {
+    Box::leak(Box::new(v))
 }
 
-fn build(vocab: u32, k: u32) -> Result<Composed> {
-    let (built, keys) =
-        mtp_specdecode_device(vocab, k).map_err(|e| format!("compose build: {e:?}"))?;
-    let program =
-        inferlet::emit::emit_program(&built.program).map_err(|e| format!("emit: {e}"))?;
-    Ok(Composed {
-        program,
-        bindings: built.bindings,
-        host_inputs: built.host_inputs,
-        keys,
-        k,
-    })
+fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
+    t.get::<i32>().map_err(|e| format!("tensor take: {e}"))
 }
 
-/// Read a `[k+1]`/`[k]` i32 tensor's little-endian bytes into token ids.
-fn read_i32(t: &tensor::Tensor) -> Result<Vec<i32>> {
-    let bytes = t.read().map_err(|e| format!("tensor read: {e:?}"))?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect())
-}
-
-/// Committed length = tokens before the first `-1` (accepted prefix + bonus), ≥1.
+/// Committed length of a sentinel `[k+1]` tail = the count before the first
+/// `-1` (accepted prefix + the bonus at lane `n_acc`), always ≥ 1.
 fn committed_len(tail: &[i32]) -> usize {
     tail.iter().take_while(|&&t| t >= 0).count()
 }
 
-/// Fire ONE device-resident window: verify vs the device `MtpDrafts` drafts,
-/// declare the next window's device carryover, read ONLY out[0] (the commit tail).
-/// The `[k]` drafts + `[1]` seed (out[1]/out[2]) stay on-GPU (the retain injects
-/// them into the next fire). Only host inputs = the two constant lane vectors.
-async fn fire_window(
-    prog: &Composed,
-    kv: &KvWorkingSet,
-    rs: &RsWorkingSet,
-    window: &[u32],
-    seq_len: u32,
-    lanes_k: &[i32],
-    lanes_k1: &[f32],
-) -> Result<Vec<i32>> {
-    let n = window.len() as u32;
-    let k = prog.k;
-    let page = kv.page_size();
-    let first_write_page = seq_len / page;
-    let total_pages = (seq_len + n).div_ceil(page);
-    let have = kv.size();
-    if total_pages > have {
-        kv.alloc(total_pages - have).map_err(|e| format!("alloc: {e}"))?;
-    }
+/// Bootstrap fire over `prompt + (k-1)` fillers: yields the seed (row-0 target
+/// argmax at the prompt's REAL last position) + the first REAL `[k]` drafts
+/// (native MTP argmax) for window 1.
+fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Vec<i32>)> {
+    let l = prompt.len() as u32;
+    let mut window: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    window.extend(std::iter::repeat(0i32).take((k - 1) as usize));
+    let n = l + k - 1;
 
-    let pass = ForwardPass::new();
-    pass.kv_working_set(
-        kv,
-        0,
-        first_write_page,
-        first_write_page * page,
-        first_write_page,
-        total_pages - first_write_page,
-        seq_len % page,
-    );
-    if rs.state_size() > 0 {
-        pass.rs_working_set(rs, 0, n);
-    }
-    let positions: Vec<u32> = (seq_len..seq_len + n).collect();
-    pass.input_tokens(window, &positions);
+    let toks = bx(Channel::from(window).named("b_toks"));
+    let klen = bx(Channel::from(vec![n]).named("b_klen"));
+    let seed_out = bx(Channel::new([1], dtype::i32).named("b_seed"));
+    let drafts_out = bx(Channel::new([k], dtype::i32).named("b_drafts"));
 
-    // Verify+bonus positions = the last k+1 rows; the driver serves target `logits`
-    // there, `mtp_logits` at the MTP draft rows, and `mtp_drafts` (the retained
-    // window's drafts) as the verify operand — all device-side.
-    let base = (seq_len + n).saturating_sub(k + 1);
-    let logits_positions: Vec<u32> = (0..k + 1).map(|i| base + i).collect();
-    // Host inputs = ONLY the two constant lane vectors (NO `draft` submit — the
-    // drafts are the device-resident MtpDrafts intrinsic).
-    let submit = vec![
-        (prog.keys.lanes_k, encode_i32(lanes_k)),
-        (prog.keys.lanes_k1, encode_f32(lanes_k1)),
-    ];
-    let bindings = resolve_bindings(&prog.bindings, &prog.host_inputs, &logits_positions, &submit)?;
-    pass.sampler(&prog.program, bindings);
+    let readout: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
 
-    // Device-resident window carryover: retain THIS fire's [seed, drafts]
-    // (out[2]→row0, out[1]→rows1..k) into bravo's mtp_drafts buffer + inject into
-    // the NEXT fire's input rows 0..=k (pipeline_source_kind=1). The next fire's
-    // MtpDrafts intrinsic reads these drafts device-side.
-    carrier::next_inputs_drafts(&pass, k);
-    pass.execute();
+    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
+    fwd.embed(toks, Tensor::constant(vec![0u32, n]));
+    fwd.attn_working_set(ws, klen);
+    fwd.readout(&Tensor::constant(readout));
+    fwd.epilogue(move || {
+        let picked = reduce_argmax(intrinsics::logits());
+        let seed = gather(&picked, Tensor::constant(vec![0u32]));
+        let mtp = intrinsics::mtp_logits(k);
+        let drafts = reduce_argmax(mtp);
+        seed_out.put(&seed);
+        drafts_out.put(&drafts);
+    });
 
-    // PARTIAL-residency: read ONLY out[0] (the [k+1] commit tail) host-side — the
-    // scalar n_acc (committed length) + the committed tokens. out[1]/out[2] are
-    // NOT read (device-injected via the retain).
-    let tensors = pass.outputs().await.map_err(|e| format!("outputs: {e}"))?;
-    if tensors.is_empty() {
-        return Err("expected the commit output".into());
-    }
-    read_i32(&tensors[0])
+    let pipeline = Pipeline::new();
+    fwd.submit(&pipeline)
+        .map_err(|e| format!("bootstrap submit: {e}"))?;
+    let seed = get_i32(seed_out.take())?
+        .first()
+        .copied()
+        .ok_or_else(|| "bootstrap: empty seed".to_string())?;
+    let drafts = get_i32(drafts_out.take())?;
+    pipeline.close();
+    Ok((seed, drafts))
 }
 
-/// Fire-0 BOOTSTRAP: materialize `prompt + (k-1) fillers` — the mtp-native-verify
-/// verify-window SHAPE — so the last k positions carry the k logit rows the
-/// `[k,vocab]` MtpLogits matrix AND the k-row target matrix map their K rows onto.
-/// (`mtp_specdecode_bootstrap`, no verify) → the first `[seed, drafts]`;
-/// `carrier::next_inputs_drafts(k)` retains them for fire 1's device-resident
-/// verify. Returns the seed (out[0] = row-0 target argmax = the first committed
-/// token). A bare M=1 single-position fire made both intrinsics collapse onto the
-/// anchor row (out[1]=anchor not draft; out[2]/seed=0) — the k-position fire gives
-/// each matrix intrinsic its K real draft rows, matching the working verify path.
-async fn bootstrap_fire(
-    program: &tensor::Program,
-    bindings: &[inferlet::sampling::ir::Binding],
-    host_inputs: &[HostInputDecl],
-    kv: &KvWorkingSet,
-    rs: &RsWorkingSet,
-    prompt: &[u32],
+/// One `[k+1]`-wide verify window: embed `[seed, draft]` at the explicit
+/// ABSOLUTE positions `[seq_len .. seq_len+k+1)` (a fresh `pos` channel bound
+/// via `ForwardPass::positions` — every fresh `verify_window` fire is its own
+/// new `ForwardPass`, so a repeated implicit `0..k+1` default would misalign
+/// RoPE against `klen`'s growing attended length), verify `draft`
+/// (device-alias peeked off the SAME embedded tokens) against the target's
+/// per-row argmax, and draft the NEXT window natively off `mtp_logits`.
+/// Returns `(commit [k+1], next_drafts [k])`.
+fn verify_window(
+    ws: &'static WorkingSet,
     k: u32,
-) -> Result<i32> {
-    // Verify-window shape: prompt + (k-1) fillers ⇒ the last k positions carry the
-    // k draft rows. logits_positions = the last k positions (prompt-last..+k-1).
-    let l = prompt.len() as u32;
-    let mut input = prompt.to_vec();
-    input.extend(core::iter::repeat(0u32).take((k - 1) as usize));
-    let n = input.len() as u32;
-    let page = kv.page_size();
-    let total_pages = n.div_ceil(page);
-    let have = kv.size();
-    if total_pages > have {
-        kv.alloc(total_pages - have).map_err(|e| format!("alloc: {e}"))?;
-    }
-    let pass = ForwardPass::new();
-    pass.kv_working_set(kv, 0, 0, 0, 0, total_pages, 0);
-    if rs.state_size() > 0 {
-        pass.rs_working_set(rs, 0, n);
-    }
-    let positions: Vec<u32> = (0..n).collect();
-    pass.input_tokens(&input, &positions);
-    // k logit rows at the last k positions (prompt-last + k-1 fillers) — matches
-    // mtp-native-verify. Row 0 (prompt-last) ⇒ the seed; the MTP matrix reads the k
-    // MTP head rows. Both intrinsics get K real rows (no anchor-row collapse).
-    let logits_positions: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
-    let resolved = resolve_bindings(bindings, host_inputs, &logits_positions, &[])?;
-    pass.sampler(program, resolved);
-    // Retain the first [seed, drafts] window for fire 1 (device-resident).
-    carrier::next_inputs_drafts(&pass, k);
-    pass.execute();
-    let tensors = pass.outputs().await.map_err(|e| format!("bootstrap outputs: {e}"))?;
-    let commit = read_i32(tensors.first().ok_or("bootstrap: no commit")?)?;
-    commit.first().copied().ok_or_else(|| "bootstrap: empty seed".to_string())
+    seed: i32,
+    draft: &[i32],
+    seq_len: u32,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    let kp1 = k + 1;
+    let mut window: Vec<i32> = vec![seed];
+    window.extend_from_slice(draft);
+
+    let toks = bx(Channel::new([kp1], dtype::i32).named("v_toks"));
+    let pos = bx(Channel::new([kp1], dtype::u32).named("v_pos"));
+    let klen = bx(Channel::new([1], dtype::u32).named("v_klen"));
+    let commit_out = bx(Channel::new([kp1], dtype::i32).named("v_commit"));
+    let drafts_out = bx(Channel::new([k], dtype::i32).named("v_drafts"));
+
+    let lanes: Vec<u32> = (0..=kp1).collect();
+    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
+    fwd.embed(toks, Tensor::constant(lanes));
+    fwd.positions(pos);
+    fwd.attn_working_set(ws, klen);
+    fwd.epilogue(move || {
+        let win = toks.read().tensor(); // [k+1] i32 device-alias peek
+        let draft_v = gather(&win, Tensor::constant((1..=k).collect::<Vec<u32>>()));
+        let picked = reduce_argmax(intrinsics::logits()); // [k+1]
+        let head = gather(&picked, iota(k));
+        let hit = eq(&head, &draft_v);
+        let ones = broadcast(Tensor::constant(1.0f32), [k]);
+        let zeros = broadcast(Tensor::constant(0.0f32), [k]);
+        let run = cumprod(select(&hit, &ones, &zeros));
+        let n_acc = cast(reduce_sum(run), DType::U32);
+        let keep = ge(broadcast(&n_acc, [kp1]), iota(kp1));
+        let neg1 = broadcast(Tensor::constant(-1i32), [kp1]);
+        let commit = select(&keep, &picked, &neg1);
+
+        let mtp = intrinsics::mtp_logits(k);
+        let next_drafts = reduce_argmax(mtp);
+
+        commit_out.put(&commit);
+        drafts_out.put(&next_drafts);
+    });
+
+    toks.put(window);
+    pos.put((seq_len..seq_len + kp1).collect::<Vec<u32>>());
+    klen.put(vec![seq_len + kp1]);
+    let pipeline = Pipeline::new();
+    fwd.submit(&pipeline)
+        .map_err(|e| format!("verify submit: {e}"))?;
+    let commit = get_i32(commit_out.take())?;
+    let drafts = get_i32(drafts_out.take())?;
+    pipeline.close();
+    Ok((commit, drafts))
 }
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let k: u32 = input.trim().parse().unwrap_or(4).max(2);
-    let vocab = model::output_vocab_size();
-    let prog = build(vocab, k)?;
+    let vocab = wit_model::output_vocab_size();
+    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    model::configure(vocab, PAGE_T, NUM_LAYERS);
+    model::configure_gates(
+        /* has_mtp_logits */ true, /* has_value_head */ false,
+    );
 
-    // Constant lane vectors (v4 has no iota — submit once per attach).
-    let lanes_k: Vec<i32> = (0..k as i32).collect();
-    let lanes_k1: Vec<f32> = (0..=k).map(|i| i as f32).collect();
-
-    let mut prompt = model::encode(PROMPT);
+    let mut prompt = wit_model::encode(PROMPT);
     if prompt.is_empty() {
         prompt.push(0);
     }
 
-    // The fire-0 bootstrap program (no verify — anchors the MTP head/target greedy
-    // at the prompt's REAL last position; produces the first [seed, drafts]).
-    let boot_built =
-        mtp_specdecode_bootstrap(vocab, k).map_err(|e| format!("bootstrap build: {e:?}"))?;
-    let boot_program =
-        inferlet::emit::emit_program(&boot_built.program).map_err(|e| format!("emit: {e}"))?;
+    let (seed0, draft0) = bootstrap(ws, &prompt, k)?;
+    let mut seq_len: u32 = prompt.len() as u32 + k - 1;
 
-    let kv = KvWorkingSet::new();
-    let rs = RsWorkingSet::new();
     let mut committed: Vec<u32> = prompt.clone();
-    let mut accepted_lengths: Vec<usize> = Vec::new();
-    let mut generated: u32 = 0;
-
-    // FIRE 0 (bootstrap): materialize the prompt, sample the first seed at its REAL
-    // last position, and retain the first REAL drafts (MTP head @ prompt last) for
-    // fire 1 — the fix for the zero-cascade charlie's A/B caught.
-    let seed0 = bootstrap_fire(
-        &boot_program,
-        &boot_built.bindings,
-        &boot_built.host_inputs,
-        &kv,
-        &rs,
-        &prompt,
-        k,
-    )
-    .await?;
-    let mut seq_len: u32 = prompt.len() as u32;
     committed.push(seed0 as u32);
-    generated += 1;
-
-    // FIRE 1+ (device-resident): the [seed, drafts] window is DEVICE-INJECTED by the
-    // carrier (retained from the previous fire). Host rows 0..=k are placeholders the
-    // carrier overwrites; the MtpDrafts intrinsic serves the drafts to the verify.
-    let mut window: Vec<u32> = core::iter::once(seed0 as u32)
-        .chain(core::iter::repeat(0u32).take(k as usize))
-        .collect();
+    let mut seed = seed0;
+    let mut draft = draft0;
+    let mut accepted_lengths: Vec<usize> = Vec::new();
+    let mut generated: u32 = 1;
 
     while generated < MAX_TOKENS {
-        let commit = fire_window(&prog, &kv, &rs, &window, seq_len, &lanes_k, &lanes_k1).await?;
+        let (commit, drafts) = verify_window(ws, k, seed, &draft, seq_len)?;
+        seq_len += k + 1;
 
-        let clen = committed_len(&commit); // n_acc accepted + 1 bonus (≥1)
-        accepted_lengths.push(clen.saturating_sub(1));
+        let clen = committed_len(&commit);
+        let n_acc = clen.saturating_sub(1);
+        accepted_lengths.push(n_acc);
         let commit_toks: Vec<u32> = commit.iter().take(clen).map(|&t| t as u32).collect();
         committed.extend(&commit_toks);
         generated += clen.max(1) as u32;
 
-        // n_acc position-advance (partial-residency, host scalar): the fire wrote
-        // n rows, but only `clen` are committed — advance the cursor by `clen`; the
-        // rejected suffix's KV is reused by the next fire (the driver-side retain
-        // lands the next window at seq_len + clen — bravo/charlie's commit-advance).
-        seq_len += clen as u32;
-
-        // The NEXT window is DEVICE-INJECTED by the carrier (`[seed, drafts]` from
-        // the retained buffer). The guest submits host placeholders for rows 0..=k;
-        // the carrier overwrites them pre-forward from the retain. Row 0 seeds from
-        // the last committed token (for the geometry / non-carrier fallback).
-        let seed = *committed.last().unwrap_or(&0);
-        window = core::iter::once(seed)
-            .chain(core::iter::repeat(0u32).take(k as usize))
-            .collect();
+        draft = drafts;
+        seed = *committed.last().unwrap_or(&0) as i32;
     }
 
     let total_acc: usize = accepted_lengths.iter().sum();
     let steps = accepted_lengths.len();
-    let mean_acc = if steps > 0 { total_acc as f64 / steps as f64 } else { 0.0 };
+    let mean_acc = if steps > 0 {
+        total_acc as f64 / steps as f64
+    } else {
+        0.0
+    };
     let result = format!(
-        "mtp-specdecode(device): k={k} steps={steps} accepted_lengths={accepted_lengths:?} \
-         mean_accept={mean_acc:.2} committed={} (device-resident: drafts via MtpDrafts intrinsic, \
-         window via carrier::next_inputs_drafts, out[0]-only host read = partial-residency n_acc)",
+        "mtp-specdecode: k={k} steps={steps} accepted_lengths={accepted_lengths:?} \
+         mean_accept={mean_acc:.2} committed={} (host round-trip drafts — the device-resident \
+         MtpDrafts/carrier-retain path is unavailable on the current inferlet::ptir surface; \
+         see the module docs)",
         committed.len()
     );
     eprintln!("{result}");
-    // Committed token dump for the (e) Metal↔CUDA cross-check (mac): the exact
-    // device-resident spec-decode output sequence.
-    eprintln!("[mtp-specdecode] committed[{}]={committed:?}", committed.len());
+    eprintln!(
+        "[mtp-specdecode] committed[{}]={committed:?}",
+        committed.len()
+    );
     Ok(result)
 }

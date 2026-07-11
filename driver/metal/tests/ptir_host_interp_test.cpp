@@ -264,7 +264,7 @@ void run_classification_rejections() {
 }
 
 void run_multistage_pivot_payload() {
-    std::printf("[pivot_threshold: stage-local predicate payload]\n");
+    std::printf("[pivot_threshold: predicate payload is a plain global ValueId]\n");
     Trace trace;
     trace.values.resize(5);
     trace.values[3].type.dtype = cptir::DType::F32;
@@ -276,16 +276,20 @@ void run_multistage_pivot_payload() {
     op.result_id = 4;
     op.result_count = 1;
     op.predicate.tag = cptir::PredTag::ProbGe;
-    op.predicate.payload = 0;  // stage-local id; global id is stage_base + 0.
+    // Already a GLOBAL trace id (container_to_trace / bound.hpp remaps the
+    // wire's stage-local id through gid() before this point, exactly like any
+    // other op operand) — eval_op must dereference it directly, with no
+    // further stage-base rebasing of its own.
+    op.predicate.payload = 2;
 
     std::vector<Value> vals(5);
-    vals[0] = Value::f32({100.0f});  // Earlier-stage value: must not be read.
+    vals[0] = Value::f32({100.0f});  // A different (wrong) value: must not be read.
     vals[2] = Value::f32({0.5f});
     vals[3] = Value::f32({0.2f, 0.6f, 0.8f});
     std::string error;
-    const bool ok = detail::eval_op(op, trace, vals, error, /*stage_base=*/2);
+    const bool ok = detail::eval_op(op, trace, vals, error);
     expect(ok && vals[4].b == std::vector<std::uint8_t>({0, 1, 1}),
-           "predicate payload resolves through the current stage base");
+           "predicate payload dereferences the global id directly (no eval_op-side rebasing)");
 }
 
 }  // namespace

@@ -11,12 +11,6 @@ use std::time::Duration;
 // SchedulerStats (lock-free snapshot for monitoring)
 // =============================================================================
 
-/// Bounded per-identity (C3) co-batch table width. Fleets carry ~10 distinct
-/// program identities; a first-seen table of this many slots covers them with
-/// headroom. A fleet exceeding it reads `identities_dropped > 0` (fail-loud
-/// "saturated" — never silently missing an identity).
-pub const PER_IDENTITY_BATCH_CAP: usize = 32;
-
 /// Inter-batch bubble histogram: exclusive upper bounds (µs) per bucket. A
 /// boundary is pinned at 100 (the masterplan p50 gate) so "p50 < 100 µs" reads as
 /// "the p50 bucket's upper bound ≤ 100". `u64::MAX` is the overflow catch-all.
@@ -56,23 +50,6 @@ pub struct SchedulerStats {
     pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
-    // ── Per-identity (C3) co-batch density (pentathlon per-identity-batch-density
-    //    probe = rows / fires per program identity). First-seen bounded table keyed
-    //    on `program_identity_hash` (bytecode ⊕ manifest — the SAME key the quorum
-    //    scheduler batches / dedups / compiles on, so the telemetry can't disagree
-    //    with the batching identity it measures). Written by the single per-driver
-    //    scheduler thread; read (Relaxed) by `aggregate_stats`.
-    /// Slot key = `program_identity_hash` (0 = empty slot).
-    pub per_identity_hash: [AtomicU64; PER_IDENTITY_BATCH_CAP],
-    /// Fires that included ≥1 request of this identity.
-    pub per_identity_fires: [AtomicU64; PER_IDENTITY_BATCH_CAP],
-    /// Total rows (co-batched requests) fired for this identity.
-    pub per_identity_rows: [AtomicU64; PER_IDENTITY_BATCH_CAP],
-    /// Fire-records dropped because the table was saturated (drop-new). > 0 ⇒ the
-    /// fleet has more than `PER_IDENTITY_BATCH_CAP` distinct identities; the
-    /// per-identity table is a bounded sample, NOT silently missing.
-    pub identities_dropped: AtomicU64,
-
     /// Inter-batch bubble histogram (always-on, HOST PROXY) — one count per fire,
     /// bucketed by [`BUBBLE_HIST_UPPER_US`]. Yields a true p50/p99 (the masterplan
     /// gate) across ALL fires (0 when enqueue-ahead covered the gap), unlike the
@@ -90,32 +67,6 @@ pub struct SchedulerStats {
 }
 
 impl SchedulerStats {
-    /// Record one fire's contribution for `hash`: +1 fire, +`rows` co-batched
-    /// requests. First-seen linear insertion into the bounded per-identity table;
-    /// drop-new + bump `identities_dropped` on saturation (fail-loud). Called only
-    /// from the single per-driver scheduler thread, so plain load/store is race-free.
-    pub fn record_identity_fire(&self, hash: u64, rows: u64) {
-        if hash == 0 {
-            return; // 0 is the empty-slot sentinel; a hashless plain forward isn't C3-keyed.
-        }
-        for slot in 0..PER_IDENTITY_BATCH_CAP {
-            let cur = self.per_identity_hash[slot].load(Relaxed);
-            if cur == hash {
-                self.per_identity_fires[slot].fetch_add(1, Relaxed);
-                self.per_identity_rows[slot].fetch_add(rows, Relaxed);
-                return;
-            }
-            if cur == 0 {
-                self.per_identity_hash[slot].store(hash, Relaxed);
-                self.per_identity_fires[slot].fetch_add(1, Relaxed);
-                self.per_identity_rows[slot].fetch_add(rows, Relaxed);
-                return;
-            }
-        }
-        // Table saturated → drop this record, count it (fail-loud).
-        self.identities_dropped.fetch_add(1, Relaxed);
-    }
-
     /// Record one fire's inter-batch bubble (µs) into the HOST-PROXY histogram.
     /// Called only from the single per-driver scheduler thread (race-free plain
     /// fetch_add).
@@ -200,14 +151,6 @@ pub struct AggregateStats {
     /// `profile-fire`. Mirrors `crate::scheduler::probe::FireProbes`.
     pub fire: FireStats,
 
-    /// Per-identity (C3) co-batch density: `(program_identity_hash, fires, rows)`,
-    /// merged across drivers, sorted by rows desc. Per-identity fire density =
-    /// `rows / fires` (the pentathlon per-identity-batch-density probe).
-    pub per_identity_batch: Vec<(u64, u64, u64)>,
-    /// Distinct-identity fire-records dropped because the bounded per-identity
-    /// table saturated. `> 0` ⇒ the fleet has more identities than the table caps;
-    /// `per_identity_batch` is then a bounded sample (fail-loud, never silent).
-    pub identities_dropped: u64,
     /// Inter-batch bubble histogram (one count per fire), bucketed by
     /// [`BUBBLE_HIST_UPPER_US`] — for the p50/p99 bubble gate (masterplan M1).
     /// HOST PROXY (device-idle stamped at the Rust enqueue point → over-counts by
@@ -259,8 +202,6 @@ pub struct FireStats {
     pub avg_inter_fire_us: u64,
     pub avg_post_dispatch_to_fire_us: u64,
     pub avg_recv_block_wait_us: u64,
-    pub avg_guest_roundtrip_us: u64,
-    pub avg_service_queue_us: u64,
     pub accumulate: AccumulateStats,
     pub pre_dispatch: PreDispatchStats,
     pub execute: ExecuteStats,
@@ -334,10 +275,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     let mut max_forward_requests = 0u64;
     let mut hist = [0u64; 8];
     let mut bubble_hist = [0u64; BUBBLE_HIST_UPPER_US.len()];
-    // Per-identity (C3) co-batch density, merged across drivers by hash.
-    let mut per_identity: std::collections::HashMap<u64, (u64, u64)> =
-        std::collections::HashMap::new();
-    let mut identities_dropped = 0u64;
     let mut last_latency = 0u64;
     let mut cumulative_latency = 0u64;
     // Per-driver sums of probe atomics. Walked in the same shape
@@ -346,8 +283,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     let mut fire_inter = 0u64;
     let mut fire_post_dispatch_to_fire = 0u64;
     let mut fire_recv_block_wait = 0u64;
-    let mut fire_guest_roundtrip = 0u64;
-    let mut fire_service_queue = 0u64;
     let mut fire_accumulate_accum_loop = 0u64;
     let mut fire_pre_dispatch_fire_prepare = 0u64;
     let mut fire_execute_total = 0u64;
@@ -380,8 +315,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         fire_inter += f.inter_fire_us.load(Relaxed);
         fire_post_dispatch_to_fire += f.post_dispatch_to_fire_us.load(Relaxed);
         fire_recv_block_wait += f.recv_block_wait_us.load(Relaxed);
-        fire_guest_roundtrip += f.guest_roundtrip_us.load(Relaxed);
-        fire_service_queue += f.service_queue_us.load(Relaxed);
         fire_accumulate_accum_loop += f.accumulate.accum_loop_us.load(Relaxed);
         fire_pre_dispatch_fire_prepare += f.pre_dispatch.fire_prepare_us.load(Relaxed);
         fire_execute_total += f.execute.total_us.load(Relaxed);
@@ -399,26 +332,11 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         q_wave_active_sum += f.quorum.wave_active_sum.load(Relaxed);
         q_wave_missing_sum += f.quorum.wave_missing_sum.load(Relaxed);
         q_wave_fires += f.quorum.wave_fires.load(Relaxed);
-        // Merge this driver's bounded per-identity table by hash.
-        for (i, hslot) in s.per_identity_hash.iter().enumerate() {
-            let h = hslot.load(Relaxed);
-            if h != 0 {
-                let e = per_identity.entry(h).or_insert((0u64, 0u64));
-                e.0 += s.per_identity_fires[i].load(Relaxed);
-                e.1 += s.per_identity_rows[i].load(Relaxed);
-            }
-        }
-        identities_dropped += s.identities_dropped.load(Relaxed);
         for (dst, src) in bubble_hist.iter_mut().zip(s.bubble_us_hist.iter()) {
             *dst += src.load(Relaxed);
         }
     }
 
-    let mut per_identity_batch: Vec<(u64, u64, u64)> = per_identity
-        .into_iter()
-        .map(|(h, (fires, rows))| (h, fires, rows))
-        .collect();
-    per_identity_batch.sort_by(|a, b| b.2.cmp(&a.2)); // rows desc
     let avg = |value: u64| {
         if total_batches > 0 {
             value / total_batches
@@ -449,8 +367,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
             avg_inter_fire_us: avg_pair(fire_inter),
             avg_post_dispatch_to_fire_us: avg_pair(fire_post_dispatch_to_fire),
             avg_recv_block_wait_us: avg_pair(fire_recv_block_wait),
-            avg_guest_roundtrip_us: avg_pair(fire_guest_roundtrip),
-            avg_service_queue_us: avg_pair(fire_service_queue),
             accumulate: AccumulateStats {
                 avg_accum_loop_us: avg(fire_accumulate_accum_loop),
             },
@@ -491,8 +407,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
                 wave_fires: q_wave_fires,
             },
         },
-        per_identity_batch,
-        identities_dropped,
         bubble_us_hist: bubble_hist,
     }
 }

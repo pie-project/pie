@@ -51,34 +51,27 @@ enum : std::uint8_t {
     kPortAttnMask    = 9,
 };
 
-// Device-geometry classification: a pass whose geometry STRUCTURE (page
-// selection, write targets, positions, masks) is channel-carried resolves
-// here, pre-forward, from its channels — the wire may hold stale host-mirror
-// values for device-written channels (the host replays a channel's last
-// host-known value; after the device epilogue rewrites it the mirror is
-// stale), so for these passes the channels are the ONLY truth. Conversely a
-// pass with no channel-bound structure port (the CANONICAL shape — token
-// embed + `KvLen`-only attention) is runtime-owned: its geometry is derived
-// host-side from the store projection and rides the wire, which is what
-// makes the transparent prefix-cache trim possible. `EmbedTokens`/
-// `EmbedIndptr`/`KvLen`/`Readout` channels do NOT trigger device geometry —
-// host-put/seeded values there are host-known and wire-carried.
+// Device-geometry classification mirrors the runtime's bind-time detector:
+// explicit WSlot/WOff writes plus a channel-bound [B,P] Pages port with P>1.
+// Ordinary decode may carry Positions/AttnMask channels while its page mapping
+// remains runtime-owned on the wire; those channels alone must not divert it
+// into descriptor resolution.
 inline bool is_device_geometry_trace(const Trace& trace) {
+    bool has_write_desc = false;
+    ChannelId pages_channel = 0;
+    bool has_pages = false;
     for (const PortBinding& pb : trace.ports) {
         if (pb.is_const) continue;
-        switch (pb.port) {
-            case kPortPositions:
-            case kPortPages:
-            case kPortPageIndptr:
-            case kPortWSlot:
-            case kPortWOff:
-            case kPortAttnMask:
-                return true;
-            default:
-                break;
+        if (pb.port == kPortWSlot || pb.port == kPortWOff) {
+            has_write_desc = true;
+        } else if (pb.port == kPortPages) {
+            pages_channel = pb.channel;
+            has_pages = true;
         }
     }
-    return false;
+    if (!has_write_desc || !has_pages || pages_channel >= trace.channels.size()) return false;
+    const auto& dims = trace.channels[pages_channel].type.shape.dims;
+    return dims.size() == 2 && dims[1] > 1;
 }
 
 namespace detail {

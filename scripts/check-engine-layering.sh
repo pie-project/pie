@@ -8,7 +8,7 @@
 # crates such as `pie_ptir`, `wasmtime`, `tokio`, ...). There is NO accepted
 # exception at L0/L1/L2/L3 — the only documented upward exception anywhere
 # in the crate is `inferlet::host::session` -> `server` (guest-to-client I/O
-# facade, see `inferlet/host/mod.rs`'s module doc), which is L4 and outside
+# facade, see `inferlet/host.rs`'s module doc), which is L4 and outside
 # the scope of this script. This script fails if any of L0..L3 contains a
 # reference to `crate::<forbidden-layer>`, including fully-qualified inline
 # calls, and separately fails if the pre-refactor `ptir`/`api`/`inference`

@@ -89,7 +89,7 @@ async fn mirostat19_arbiter_on_4090() -> Result<()> {
     // boot (build logs stay out of the run). Fired after the mirostat configs to
     // prove a single non-Token output takes the rich path post-gate (not the
     // token-src a2 fast-path → a token's int-bits-as-f32 denormal).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "entropycheck"])
         .current_dir(&ws)

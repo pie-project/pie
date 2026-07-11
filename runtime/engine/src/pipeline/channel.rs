@@ -982,7 +982,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             rejected.clone(),
         )?;
         let err = timeout(Duration::from_secs(5), rejected.clone())
@@ -1016,7 +1015,6 @@ mod tests {
             bound.instance_id,
             Vec::new(),
             0,
-            Vec::new(),
             completion.clone(),
         )?;
         timeout(Duration::from_secs(5), waiter)

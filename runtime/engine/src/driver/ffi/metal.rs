@@ -103,9 +103,7 @@ impl MetalDriver {
             unsafe { pie_metal_bind_instance(self.driver, borrowed.as_raw(), &mut binding) },
             "pie_metal_bind_instance",
         )?;
-        if let Err(error) =
-            crate::driver::binding_validation::validate_instance_binding(&binding, plan)
-        {
+        if let Err(error) = plan.validate_binding(&binding) {
             let _ = unsafe { pie_metal_close_instance(self.driver, binding.instance_id) };
             return Err(error);
         }

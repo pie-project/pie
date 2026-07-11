@@ -88,7 +88,15 @@ class DeviceChannelRegistry {
             static_cast<std::uint64_t>(desc.capacity) + 1 > kMaxRing ||
             wire_bytes > std::numeric_limits<std::size_t>::max() /
                              (static_cast<std::uint64_t>(desc.capacity) + 1)) {
-            if (err) *err = "ptir: unsupported channel geometry";
+            if (err) {
+                *err = "ptir: unsupported channel geometry (channel=" +
+                       std::to_string(desc.channel_id) + ", dtype=" +
+                       std::to_string(desc.dtype) + ", rank=" +
+                       std::to_string(desc.shape.len) + ", capacity=" +
+                       std::to_string(desc.capacity) + ", wire_bytes=" +
+                       std::to_string(wire_bytes) + ", native_bytes=" +
+                       std::to_string(native_bytes) + ")";
+            }
             return false;
         }
         const std::uint32_t slot = alloc_slot();

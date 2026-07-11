@@ -1,4 +1,4 @@
-//! Ported from xgrammar: test_grammar_matcher_regex.py
+//! Regex grammar matching behavior.
 //!
 //! Tests regex-based grammar acceptance/rejection.
 

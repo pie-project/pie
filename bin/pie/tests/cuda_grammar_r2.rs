@@ -175,7 +175,7 @@ async fn grammar_r2_merge_survival_on_real_driver() -> Result<()> {
 
     // Build the (alphabet-parameterized) grammar-late inferlet to wasm BEFORE the
     // capture, so the verbose cargo build logs stay live + out of the trace file.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "grammar-late"])
         .current_dir(&ws)
