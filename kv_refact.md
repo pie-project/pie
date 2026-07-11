@@ -614,7 +614,11 @@ a cross-inferlet cache and is rejected as a design option.
 	continuation fire. Misses and ineligible shapes fall through to full
 	compute, so the cache stays a pure opportunistic optimization.
 	Device-geometry (Design-B) passes are not canonical and not cacheable by
-	construction.
+	construction. Device-verified (4090, 2026-07-11): a grafted fire is
+	argmax-IDENTICAL to the honest chunked continuation (same kernel
+	shapes); a FULL single-shot prefill may flip a near-tie argmax against
+	either (bf16 tiling numerics), which bounds what "cache == recompute"
+	can promise — the cache is exactly as faithful as chunked prefill.
 
 ### CoW
 
