@@ -230,8 +230,7 @@ pub fn cuda_mtp_standalone_toml(hf_repo: &str) -> String {
 /// it BEFORE calling this. Client edge at `handle.listen_addr`.
 pub async fn boot_4090_mtp() -> Result<pie_bin::StandaloneHandle> {
     let snapshot = resolve_qwen35_snapshot()?;
-    let (controller, gateway, worker) =
-        derive_standalone(&cuda_mtp_standalone_toml(&snapshot))?;
+    let (controller, gateway, worker) = derive_standalone(&cuda_mtp_standalone_toml(&snapshot))?;
     run_standalone(controller, gateway, worker, Mode::Local).await
 }
 
@@ -293,10 +292,19 @@ use pie_client::client::Client;
 /// the `bin/pie` crate dir to the runtime test-inferlets workspace. Builds both
 /// (one cargo invocation) so a multi-capability harness pays the build once.
 pub fn build_inferlet(name: &str) -> (PathBuf, PathBuf) {
-    let workspace =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
     let ok = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2", "-p", "generate", "-p", "mirostat", "-p", "grammar"])
+        .args([
+            "build",
+            "--target",
+            "wasm32-wasip2",
+            "-p",
+            "generate",
+            "-p",
+            "mirostat",
+            "-p",
+            "grammar",
+        ])
         .current_dir(&workspace)
         .status()
         .expect("spawn cargo build for capability inferlets")
@@ -305,7 +313,11 @@ pub fn build_inferlet(name: &str) -> (PathBuf, PathBuf) {
     let wasm = workspace.join(format!("target/wasm32-wasip2/debug/{name}.wasm"));
     let manifest = workspace.join(format!("{name}/Pie.toml"));
     assert!(wasm.exists(), "missing inferlet wasm: {}", wasm.display());
-    assert!(manifest.exists(), "missing manifest: {}", manifest.display());
+    assert!(
+        manifest.exists(),
+        "missing manifest: {}",
+        manifest.display()
+    );
     (wasm, manifest)
 }
 

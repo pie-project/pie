@@ -989,9 +989,8 @@ fn slab_scatter_ffi_carries_placement_fields() {
     let slab = slab.unwrap();
     assert_eq!(slab.slab_file_id, 0);
     assert!(slab.slab_span_bytes >= chunk * 2);
-    let placements = unsafe {
-        std::slice::from_raw_parts(slab.slab_placements.ptr, slab.slab_placements.len)
-    };
+    let placements =
+        unsafe { std::slice::from_raw_parts(slab.slab_placements.ptr, slab.slab_placements.len) };
     assert!(
         placements.len() >= 2,
         "SlabScatter must have >= 2 placements, got {}",

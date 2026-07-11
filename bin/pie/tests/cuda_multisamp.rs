@@ -51,8 +51,14 @@ async fn multisamp_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
-    client.add_program(&wasm, &manifest, true).await.context("add_program")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
+    client
+        .add_program(&wasm, &manifest, true)
+        .await
+        .context("add_program")?;
 
     let mut proc = client
         .launch_process("multisamp@0.1.0".to_string(), "{}".to_string(), true)
@@ -65,7 +71,11 @@ async fn multisamp_on_real_driver() -> Result<()> {
     let lb = json.find('[').context("no [")?;
     let rb = json[lb..].find(']').map(|i| lb + i).context("no ]")?;
     let inner = json[lb + 1..rb].trim();
-    let n = if inner.is_empty() { 0 } else { inner.split(',').count() };
+    let n = if inner.is_empty() {
+        0
+    } else {
+        inner.split(',').count()
+    };
     eprintln!("[multisamp] DISPATCH={dispatch:?} n_tokens={n}");
     anyhow::ensure!(n == 16, "expected 16 tokens (4 kinds × 4), got {n}");
 

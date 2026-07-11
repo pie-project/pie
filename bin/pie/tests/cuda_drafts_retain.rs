@@ -47,34 +47,54 @@ async fn drafts_retain_window_byte_identity() -> Result<()> {
     // Build the drafts-retain-e2e inferlet (wasm).
     let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
     let ok = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2", "-p", "drafts-retain-e2e"])
+        .args([
+            "build",
+            "--target",
+            "wasm32-wasip2",
+            "-p",
+            "drafts-retain-e2e",
+        ])
         .current_dir(&ws)
         .status()?
         .success();
     anyhow::ensure!(ok, "wasm build failed for drafts-retain-e2e");
 
     let pie = common::boot_4090_mtp().await?;
-    eprintln!("[drafts-retain] booted Qwen3.5-0.8B, listen_addr={}", pie.listen_addr);
+    eprintln!(
+        "[drafts-retain] booted Qwen3.5-0.8B, listen_addr={}",
+        pie.listen_addr
+    );
 
     let setup =
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect setup")?;
-    setup.authenticate("test-user", &None).await.context("auth setup")?;
+    setup
+        .authenticate("test-user", &None)
+        .await
+        .context("auth setup")?;
     let wasm = ws.join("target/wasm32-wasip2/debug/drafts_retain_e2e.wasm");
     let man = ws.join("drafts-retain-e2e/Pie.toml");
-    setup.add_program(&wasm, &man, true).await.context("add_program drafts-retain-e2e")?;
+    setup
+        .add_program(&wasm, &man, true)
+        .await
+        .context("add_program drafts-retain-e2e")?;
     drop(setup);
 
     let c = Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
         .await
         .context("connect session")?;
-    c.authenticate("test-user", &None).await.context("auth session")?;
+    c.authenticate("test-user", &None)
+        .await
+        .context("auth session")?;
     let mut proc = c
         .launch_process("drafts-retain-e2e@0.1.0".to_string(), k.to_string(), true)
         .await
         .context("launch drafts-retain-e2e")?;
-    let json = proc.wait_for_return().await.context("wait_for_return drafts-retain-e2e")?;
+    let json = proc
+        .wait_for_return()
+        .await
+        .context("wait_for_return drafts-retain-e2e")?;
     drop(c);
     eprintln!("[drafts-retain] result: {json}");
 

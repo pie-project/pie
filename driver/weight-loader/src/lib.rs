@@ -33,8 +33,8 @@ pub(crate) fn wl_debug_enabled() -> bool {
 }
 
 pub use ffi::{
-    PieLoaderProgramHandle, pie_loader_compile, pie_loader_error_free, pie_loader_program_free,
-    pie_loader_program_deserialize, pie_loader_program_serialize,
+    PieLoaderProgramHandle, pie_loader_compile, pie_loader_error_free,
+    pie_loader_program_deserialize, pie_loader_program_free, pie_loader_program_serialize,
     pie_loader_program_serialized_len, pie_loader_program_view,
 };
 pub use ffi_types::*;

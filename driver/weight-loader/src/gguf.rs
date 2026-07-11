@@ -232,9 +232,8 @@ impl GgufReader {
             CompileError::InvalidInput(format!("gguf: read failed for {context}: {err}"))
         })?;
         self.pos += len as u64;
-        String::from_utf8(buf).map_err(|_| {
-            CompileError::InvalidInput(format!("gguf: {context} is not valid UTF-8"))
-        })
+        String::from_utf8(buf)
+            .map_err(|_| CompileError::InvalidInput(format!("gguf: {context} is not valid UTF-8")))
     }
 
     fn skip(&mut self, bytes: u64, context: &str) -> Result<(), CompileError> {
@@ -301,7 +300,9 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, CompileError> {
 
 fn checked_mul(a: u64, b: u64, tensor_name: &str) -> Result<u64, CompileError> {
     a.checked_mul(b).ok_or_else(|| {
-        CompileError::InvalidInput(format!("gguf: tensor byte size overflows for '{tensor_name}'"))
+        CompileError::InvalidInput(format!(
+            "gguf: tensor byte size overflows for '{tensor_name}'"
+        ))
     })
 }
 
@@ -490,11 +491,7 @@ fn half_to_float(half: u16) -> f32 {
             (frac as f32 / 1024.0) * 2f32.powi(-14)
         }
     } else if exp == 31 {
-        if frac == 0 {
-            f32::INFINITY
-        } else {
-            f32::NAN
-        }
+        if frac == 0 { f32::INFINITY } else { f32::NAN }
     } else {
         (1.0 + frac as f32 / 1024.0) * 2f32.powi(exp as i32 - 15)
     };

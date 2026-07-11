@@ -91,7 +91,7 @@ src/inferlet/
 Everything else stays where it is. In particular:
 
 - **`api/` stays top-level.** It is the bridge layer between guest calls and
-  engine services (`working_set`, `inference`, `ptir`, `messaging`), not part
+  engine services (`working_set`, `inference`, `ptir`, session/runtime glue), not part
   of the inferlet execution machinery.
 - **`bootstrap.rs`, `server/` stay.** They orchestrate; they are callers.
 - **`ProcessEvent` stays in `process`.** It is the wire protocol event type,

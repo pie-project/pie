@@ -20,6 +20,7 @@
 // intermediate = 3584, qg = 4096 elems) — see scratch_schedule_probe for the exact count.
 
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 
 #include "decode_abi.hpp"
@@ -86,6 +87,7 @@ void bind_scratch(RawMetalContext& ctx,
                   const std::vector<Dispatch>& dag,
                   const ScratchSchedule& sched,
                   const SlotHandle* pool,
-                  int pool_n);
+                  int pool_n,
+                  size_t byte_offset = 0);
 
 }  // namespace pie_metal_driver::raw_metal

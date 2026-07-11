@@ -59,8 +59,14 @@ async fn beam_designb_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
-    client.add_program(&wasm, &manifest, true).await.context("add_program")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
+    client
+        .add_program(&wasm, &manifest, true)
+        .await
+        .context("add_program")?;
     eprintln!("[beam-designb-e2e] program installed, launching mask-out beam search…");
 
     let mut proc = client

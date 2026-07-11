@@ -34,13 +34,18 @@
 #include <utility>
 #include <vector>
 
-#include "ptir/bound.hpp"
+#include "pie_native/ptir/bound.hpp"
 #include "ptir/channel_registry.hpp"
-#include "ptir/container.hpp"
+#include "pie_native/ptir/container.hpp"
 #include "ptir/tier0_runner.hpp"
-#include "ptir/trace.hpp"
+#include "pie_native/ptir/trace.hpp"
 
 namespace pie_cuda_driver::ptir {
+
+// Shared pure-host PTIR decode model (trace/op-table/container/bound/
+// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// scope so the CUDA-side tier-0/1 code below can use it unqualified.
+using namespace pie_native::ptir;
 
 // A per-channel host-supplied byte value — mirrors delta's `PtirChannelValue`.
 // Seeds are per-instance init (D2, not in the hash).

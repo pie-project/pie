@@ -62,12 +62,13 @@ template <typename T>
   const uint row = tgpos.y;
   if (row >= N) return;
   const device T* wrow = w + (uint64_t)row * K;
+  x += uint64_t(tgpos.z) * K;
   float acc = 0.0f;
   for (uint k = simd_lid; k < K; k += 32) {
     acc += float(wrow[k]) * float(x[k]);
   }
   acc = simd_sum(acc);
-  if (simd_lid == 0) out[row] = T(acc);
+  if (simd_lid == 0) out[uint64_t(tgpos.z) * N + row] = T(acc);
 }
 
 #define instantiate_dense_gemv_coop(name, itype)                  \

@@ -173,7 +173,9 @@ fn prefix_cache_grafts_and_trims_second_prefill() {
     // trace (24 and 8 are unique to this inferlet across the e2e suite).
     let result = spawn_and_capture(s, "prefix-cache-e2e", "{}".into());
     assert!(
-        result.as_deref().is_ok_and(|r| r.contains("PREFIX_CACHE_E2E n=24")),
+        result
+            .as_deref()
+            .is_ok_and(|r| r.contains("PREFIX_CACHE_E2E n=24")),
         "prefix-cache inferlet should complete (got {result:?})"
     );
     let shapes: Vec<String> = s

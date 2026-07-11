@@ -48,35 +48,55 @@ async fn mtp_logits_value_verify() -> Result<()> {
     // Build the mtp-native-verify inferlet (wasm).
     let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
     let ok = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2", "-p", "mtp-native-verify"])
+        .args([
+            "build",
+            "--target",
+            "wasm32-wasip2",
+            "-p",
+            "mtp-native-verify",
+        ])
         .current_dir(&ws)
         .status()?
         .success();
     anyhow::ensure!(ok, "wasm build failed for mtp-native-verify");
 
     let pie = common::boot_4090_mtp().await?;
-    eprintln!("[mtp-native-verify] booted Qwen3.5-0.8B, listen_addr={}", pie.listen_addr);
+    eprintln!(
+        "[mtp-native-verify] booted Qwen3.5-0.8B, listen_addr={}",
+        pie.listen_addr
+    );
 
     let setup =
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect setup")?;
-    setup.authenticate("test-user", &None).await.context("auth setup")?;
+    setup
+        .authenticate("test-user", &None)
+        .await
+        .context("auth setup")?;
     let wasm = ws.join("target/wasm32-wasip2/debug/mtp_native_verify.wasm");
     let man = ws.join("mtp-native-verify/Pie.toml");
-    setup.add_program(&wasm, &man, true).await.context("add_program mtp-native-verify")?;
+    setup
+        .add_program(&wasm, &man, true)
+        .await
+        .context("add_program mtp-native-verify")?;
     drop(setup);
 
     // Launch the verify loop.
     let c = Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
         .await
         .context("connect verify session")?;
-    c.authenticate("test-user", &None).await.context("auth verify session")?;
+    c.authenticate("test-user", &None)
+        .await
+        .context("auth verify session")?;
     let mut proc = c
         .launch_process("mtp-native-verify@0.1.0".to_string(), k.to_string(), true)
         .await
         .context("launch mtp-native-verify")?;
-    let json = proc.wait_for_return().await.context("wait_for_return mtp-native-verify")?;
+    let json = proc
+        .wait_for_return()
+        .await
+        .context("wait_for_return mtp-native-verify")?;
     drop(c);
     eprintln!("[mtp-native-verify] result: {json}");
 

@@ -8,10 +8,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::driver;
-use crate::inference;
 use crate::inferlet::sandbox::{FsPolicy, NetworkPolicy};
 use crate::inferlet::{linker, process, program, python};
-use crate::messaging;
 use crate::server;
 use crate::telemetry;
 use pie_model as model;
@@ -45,24 +43,23 @@ impl Drop for ActiveRuntimeGuard {
 }
 
 struct RuntimeShutdown {
-    inference: inference::InferenceShutdownHandle,
+    scheduler: crate::scheduler::SchedulerShutdownHandle,
     driver_ids: Vec<usize>,
 }
 
 impl RuntimeShutdown {
     async fn shutdown(self) -> Result<()> {
-        let inference_result = self.inference.shutdown().await;
+        let scheduler_result = self.scheduler.shutdown().await;
         for driver_id in self.driver_ids {
             let _ = driver::registry::unregister_driver(driver_id);
         }
-        inference_result
+        scheduler_result
     }
 }
 
 pub struct Config {
     pub host: String,
     pub port: u16,
-    pub auth: AuthConfig,
     pub cache_dir: PathBuf,
     pub verbose: bool,
     pub log_dir: Option<PathBuf>,
@@ -128,6 +125,8 @@ pub struct RuntimeConfig {
     /// Per-upload cap on cumulative bytes (program installs +
     /// `session.send_file` blobs), in MiB.
     pub max_upload_mb: usize,
+    /// Concrete py-runtime root passed in by the embedding worker.
+    pub py_runtime_dir: PathBuf,
 }
 
 pub struct ModelConfig {
@@ -166,14 +165,7 @@ pub struct TelemetryConfig {
     pub service_name: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct AuthConfig {
-    pub enabled: bool,
-    pub authorized_users_dir: PathBuf,
-}
-
 pub struct BootstrapHandle {
-    pub token: String,
     pub port: u16,
     shutdown: Option<RuntimeShutdown>,
 }
@@ -215,7 +207,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // runtime state rather than loading their own copies.
     // The Python runtime shared modules must load before the linker and
     // program services spawn, so both read from shared runtime state.
-    python::runtime::init(&wasm_engine, config.python_snapshot);
+    python::runtime::init(
+        &wasm_engine,
+        &config.runtime.py_runtime_dir,
+        config.python_snapshot,
+    );
 
     program::spawn(
         &wasm_engine,
@@ -239,7 +235,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
     server::init(max_upload_bytes);
     let bound_port = config.port;
-    messaging::spawn();
     process::init_admission(config.max_concurrent_processes);
 
     let ModelConfig {
@@ -304,35 +299,31 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // default — the legacy error path is byte-for-byte unchanged. The
     // existing `scheduler.restore_pause_at_utilization` config gates the
     // restore anti-thrash pause (its long-reserved consumer).
-    if crate::inference::contention::contention_mode()
-        == crate::inference::contention::ContentionMode::Preempt
-    {
+    if crate::store::reclaim::contention_mode() == crate::store::reclaim::ContentionMode::Preempt {
         // Backend tiers: passive v1 (waiters ride natural frees — proven
         // e2e, M-AB ②③) by default; `PIE_KV_PREEMPT_ACTIVE=1` selects the
         // v2 self-suspend backend (active FCFS victim preempt).
-        let backend: Box<dyn crate::inference::contention::ReclaimBackend> =
-            if crate::inference::contention::preempt_active() {
-                Box::new(crate::inference::contention::SelfSuspendBackend::new(
+        let backend: Box<dyn crate::store::reclaim::ReclaimBackend> =
+            if crate::store::reclaim::preempt_active() {
+                Box::new(crate::store::reclaim::SelfSuspendBackend::new(
                     arena_model_idx,
                     0,
                 ))
             } else {
-                Box::new(crate::inference::contention::KvPoolBackend::new(
+                Box::new(crate::store::reclaim::KvPoolBackend::new(
                     arena_model_idx,
                     0,
                 ))
             };
-        crate::inference::contention::init_contention(
-            crate::inference::contention::ContentionOrchestrator::new(
-                backend,
-                scheduler.restore_pause_at_utilization,
-            ),
-        );
+        crate::store::reclaim::init_contention(crate::store::reclaim::ContentionOrchestrator::new(
+            backend,
+            scheduler.restore_pause_at_utilization,
+        ));
     }
 
     // (Context actor `context::spawn` removed — Phase 5. The unified arena
     // registry above is the per-model/driver physical home now.)
-    let inference_shutdown = inference::spawn(
+    let scheduler_shutdown = crate::scheduler::spawn(
         &drivers,
         kv_page_size as u32,
         scheduler.request_timeout_secs,
@@ -341,17 +332,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     active_guard.disarm();
     Ok(BootstrapHandle {
-        token: crate::token::generate_internal_token(),
         port: bound_port,
         shutdown: Some(RuntimeShutdown {
-            inference: inference_shutdown,
+            scheduler: scheduler_shutdown,
             driver_ids: drivers,
         }),
     })
 }
 
 /// Boot-time checks for the values pie's Python layer cannot validate
-/// itself: filesystem-side effects (cache/auth dirs) and worker-handshake
+/// itself: filesystem-side effects (cache dir) and worker-handshake
 /// outputs (tokenizer file, driver capability numbers). Field-level
 /// validation of user-supplied scalars (timeouts, etc.) happens in
 /// `pie.config.*.__post_init__` — by the time they reach Rust they're

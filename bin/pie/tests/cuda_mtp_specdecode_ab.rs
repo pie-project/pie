@@ -62,7 +62,9 @@ async fn run_inferlet(
     let c = Client::connect_with_identity(&format!("ws://{listen_addr}/v1/ws"), "test-user")
         .await
         .context("connect session")?;
-    c.authenticate("test-user", &None).await.context("auth session")?;
+    c.authenticate("test-user", &None)
+        .await
+        .context("auth session")?;
     let t0 = Instant::now();
     let mut proc = c
         .launch_process(prog.to_string(), k.to_string(), true)
@@ -107,14 +109,20 @@ async fn mtp_specdecode_device_ab() -> Result<()> {
     build_wasm(&ws, "mtp-native-verify")?;
 
     let pie = common::boot_4090_mtp().await?;
-    eprintln!("[specdecode-ab] booted Qwen3.5-0.8B, listen_addr={}", pie.listen_addr);
+    eprintln!(
+        "[specdecode-ab] booted Qwen3.5-0.8B, listen_addr={}",
+        pie.listen_addr
+    );
 
     // Register both programs on one setup session.
     let setup =
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect setup")?;
-    setup.authenticate("test-user", &None).await.context("auth setup")?;
+    setup
+        .authenticate("test-user", &None)
+        .await
+        .context("auth setup")?;
     for (pkg, file) in [
         ("mtp-specdecode", "mtp_specdecode.wasm"),
         ("mtp-native-verify", "mtp_native_verify.wasm"),
@@ -148,9 +156,15 @@ async fn mtp_specdecode_device_ab() -> Result<()> {
 
     let (a_mean, a_commit) = parse_metrics(&a_json);
     let (b_mean, b_commit) = parse_metrics(&b_json);
-    eprintln!("═══════════════════ (b) device-resident MTP swap A/B — 4090 / Qwen3.5-0.8B ═══════════════════");
-    eprintln!("  A device-resident : mean_accept={a_mean:.2}  committed={a_commit}  decode={a_dt:?}");
-    eprintln!("  B host round-trip : mean_accept={b_mean:.2}  committed={b_commit}  decode={b_dt:?}");
+    eprintln!(
+        "═══════════════════ (b) device-resident MTP swap A/B — 4090 / Qwen3.5-0.8B ═══════════════════"
+    );
+    eprintln!(
+        "  A device-resident : mean_accept={a_mean:.2}  committed={a_commit}  decode={a_dt:?}"
+    );
+    eprintln!(
+        "  B host round-trip : mean_accept={b_mean:.2}  committed={b_commit}  decode={b_dt:?}"
+    );
     eprintln!(
         "  VALUE  Δmean_accept = {:.2}  (≈0 ⇒ the MtpDrafts source-select feeds the verify \
          identically to the host round-trip — the swap is value-correct)",

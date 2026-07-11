@@ -14,11 +14,11 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use super::container::{ChannelDecl, ExternDir, HostRole, PortSource, TraceContainer};
-use super::infer::{body_types, BodyCtx, BodyError};
+use super::infer::{BodyCtx, BodyError, body_types};
 use super::op::{IntrinsicId, Op};
 use super::registry::{
-    intrinsic_model_gated, intrinsic_stages, ModelProfile, Phase, Port, SinkScope, Stage,
-    KNOWN_SINKS,
+    KNOWN_SINKS, ModelProfile, Phase, Port, SinkScope, Stage, intrinsic_model_gated,
+    intrinsic_stages,
 };
 use crate::types::{DType, Shape, ValueType};
 
@@ -75,51 +75,91 @@ pub struct BoundTrace {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValidateError {
     /// SSA/shape/dtype error inside a stage body.
-    Body { stage: Stage, err: BodyError },
+    Body {
+        stage: Stage,
+        err: BodyError,
+    },
     /// At most one program per stage; stages sorted by tag.
     DuplicateStage(Stage),
     StagesUnsorted,
     /// Ports sorted by tag, unique.
     DuplicatePort(Port),
     PortsUnsorted,
-    PortChannelOutOfRange { port: Port, chan: u32 },
+    PortChannelOutOfRange {
+        port: Port,
+        chan: u32,
+    },
     /// Const payload length must equal `numel × elem_size`.
-    PortConstPayload { port: Port },
+    PortConstPayload {
+        port: Port,
+    },
     /// Channel capacity must be ≥ 1 (trace-known constructor arg).
-    ZeroCapacity { chan: u32 },
+    ZeroCapacity {
+        chan: u32,
+    },
     /// T2 SPSC: the host writes this channel — no stage may put.
-    SecondProducer { chan: u32, stage: Stage },
+    SecondProducer {
+        chan: u32,
+        stage: Stage,
+    },
     /// T2 SPSC: the host reads this channel — no stage may take/read, and
     /// no port may bind it.
-    SecondConsumer { chan: u32, stage: Stage },
+    SecondConsumer {
+        chan: u32,
+        stage: Stage,
+    },
     /// T11: a sink at a stage that does not precede its consumption point
     /// (pass-wide ⇒ prologue-only; attention ⇒ prologue or attn-proj).
-    SinkMisplaced { name_index: u16, stage: Stage },
+    SinkMisplaced {
+        name_index: u16,
+        stage: Stage,
+    },
     /// A `SinkCall` names something the profile knows as a value kernel, or
     /// a `KernelCall` names a sink.
-    SinkKernelKindMismatch { name_index: u16 },
+    SinkKernelKindMismatch {
+        name_index: u16,
+    },
     /// Bind-time availability (overview §4): the backend lacks this
     /// second-party name.
-    KernelUnavailable { name_index: u16 },
+    KernelUnavailable {
+        name_index: u16,
+    },
     /// T10: the named kernel returns a time-/load-varying value.
-    NotReplayable { name_index: u16 },
+    NotReplayable {
+        name_index: u16,
+    },
     /// Stage-scoped intrinsic used outside its stages (overview §5.3).
-    IntrinsicWrongStage { intr: IntrinsicId, stage: Stage },
+    IntrinsicWrongStage {
+        intr: IntrinsicId,
+        stage: Stage,
+    },
     /// Model-gated intrinsic the profile lacks (overview §4).
-    IntrinsicUnavailable { intr: IntrinsicId },
+    IntrinsicUnavailable {
+        intr: IntrinsicId,
+    },
     /// Declared intrinsic type violates the registry rule (e.g. `logits`
     /// must be `[n_out, vocab]` F32 for the bound model).
-    IntrinsicTypeRule { intr: IntrinsicId, stage: Stage },
+    IntrinsicTypeRule {
+        intr: IntrinsicId,
+        stage: Stage,
+    },
     /// v1.1: extern table not sorted by channel / duplicate channel.
     ExternsUnsortedOrDup,
     /// v1.1: an extern channel must be device-role (`host_role = None`) and
     /// unseeded (the producing instance fills it).
-    ExternDeclConflict { chan: u32 },
+    ExternDeclConflict {
+        chan: u32,
+    },
     /// v1.1: extern name index outside the name table.
-    ExternNameOutOfRange { chan: u32 },
+    ExternNameOutOfRange {
+        chan: u32,
+    },
     /// v1.1 SPSC across the pair: a stage op (or port) on the wrong side of
     /// the extern direction (put on an Import; take/read/port on an Export).
-    ExternDirViolation { chan: u32, stage: Stage },
+    ExternDirViolation {
+        chan: u32,
+        stage: Stage,
+    },
 }
 
 impl fmt::Display for ValidateError {
@@ -154,20 +194,35 @@ impl fmt::Display for ValidateError {
                 stage.name()
             ),
             SinkKernelKindMismatch { name_index } => {
-                write!(f, "name #{name_index}: sink/kernel kind mismatch with the profile")
+                write!(
+                    f,
+                    "name #{name_index}: sink/kernel kind mismatch with the profile"
+                )
             }
             KernelUnavailable { name_index } => {
-                write!(f, "name #{name_index}: backend does not provide this kernel/sink")
+                write!(
+                    f,
+                    "name #{name_index}: backend does not provide this kernel/sink"
+                )
             }
             NotReplayable { name_index } => write!(
                 f,
                 "name #{name_index}: time-/load-varying return — a register read in disguise (T10)"
             ),
             IntrinsicWrongStage { intr, stage } => {
-                write!(f, "intrinsic {} not in scope at stage {}", intr.name(), stage.name())
+                write!(
+                    f,
+                    "intrinsic {} not in scope at stage {}",
+                    intr.name(),
+                    stage.name()
+                )
             }
             IntrinsicUnavailable { intr } => {
-                write!(f, "model-gated intrinsic {} unavailable on this model", intr.name())
+                write!(
+                    f,
+                    "model-gated intrinsic {} unavailable on this model",
+                    intr.name()
+                )
             }
             IntrinsicTypeRule { intr, stage } => write!(
                 f,
@@ -229,7 +284,10 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
         match &p.source {
             PortSource::Channel(c) => {
                 if *c as usize >= container.channels.len() {
-                    return Err(ValidateError::PortChannelOutOfRange { port: p.port, chan: *c });
+                    return Err(ValidateError::PortChannelOutOfRange {
+                        port: p.port,
+                        chan: *c,
+                    });
                 }
             }
             PortSource::Const { dtype, shape, data } => {
@@ -260,13 +318,17 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
     }
 
     // ── per-stage bodies: SSA + shape/dtype ──────────────────────────────
-    let channel_types: Vec<ValueType> =
-        container.channels.iter().map(channel_value_type).collect();
-    let ctx = BodyCtx { channel_types: &channel_types, n_names: container.names.len() as u16 };
+    let channel_types: Vec<ValueType> = container.channels.iter().map(channel_value_type).collect();
+    let ctx = BodyCtx {
+        channel_types: &channel_types,
+        n_names: container.names.len() as u16,
+    };
     let mut stage_types = Vec::with_capacity(container.stages.len());
     for sp in &container.stages {
-        let types = body_types(&sp.ops, &ctx)
-            .map_err(|err| ValidateError::Body { stage: sp.stage, err })?;
+        let types = body_types(&sp.ops, &ctx).map_err(|err| ValidateError::Body {
+            stage: sp.stage,
+            err,
+        })?;
         stage_types.push(types);
     }
 
@@ -275,7 +337,10 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
         for op in &sp.ops {
             if let Op::IntrinsicVal { intr, shape, dtype } = *op {
                 if !intrinsic_stages(intr).contains(&sp.stage) {
-                    return Err(ValidateError::IntrinsicWrongStage { intr, stage: sp.stage });
+                    return Err(ValidateError::IntrinsicWrongStage {
+                        intr,
+                        stage: sp.stage,
+                    });
                 }
                 if intrinsic_model_gated(intr) {
                     let ok = match intr {
@@ -289,7 +354,10 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                     }
                 }
                 if !intrinsic_type_ok(intr, shape, dtype, &profile) {
-                    return Err(ValidateError::IntrinsicTypeRule { intr, stage: sp.stage });
+                    return Err(ValidateError::IntrinsicTypeRule {
+                        intr,
+                        stage: sp.stage,
+                    });
                 }
             }
         }
@@ -358,29 +426,45 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
 
     // ── SPSC endpoints (T2; v1.1 extends across the extern pair) ─────────
     let extern_dir = |chan: u32| -> Option<ExternDir> {
-        container.externs.iter().find(|e| e.chan == chan).map(|e| e.dir)
+        container
+            .externs
+            .iter()
+            .find(|e| e.chan == chan)
+            .map(|e| e.dir)
     };
     for sp in &container.stages {
         for op in &sp.ops {
             match *op {
                 Op::ChanPut { chan, .. } => {
                     if container.channels[chan as usize].host_role == HostRole::Writer {
-                        return Err(ValidateError::SecondProducer { chan, stage: sp.stage });
+                        return Err(ValidateError::SecondProducer {
+                            chan,
+                            stage: sp.stage,
+                        });
                     }
                     if extern_dir(chan) == Some(ExternDir::Import) {
                         // The peer instance is the producer — a local put is a
                         // second producer endpoint.
-                        return Err(ValidateError::ExternDirViolation { chan, stage: sp.stage });
+                        return Err(ValidateError::ExternDirViolation {
+                            chan,
+                            stage: sp.stage,
+                        });
                     }
                 }
                 Op::ChanTake(chan) | Op::ChanRead(chan) => {
                     if container.channels[chan as usize].host_role == HostRole::Reader {
-                        return Err(ValidateError::SecondConsumer { chan, stage: sp.stage });
+                        return Err(ValidateError::SecondConsumer {
+                            chan,
+                            stage: sp.stage,
+                        });
                     }
                     if extern_dir(chan) == Some(ExternDir::Export) {
                         // The peer instance is the consumer — a local take/read
                         // is a second consumer endpoint.
-                        return Err(ValidateError::ExternDirViolation { chan, stage: sp.stage });
+                        return Err(ValidateError::ExternDirViolation {
+                            chan,
+                            stage: sp.stage,
+                        });
                     }
                 }
                 _ => {}
@@ -392,7 +476,10 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
     for p in &container.ports {
         if let PortSource::Channel(c) = p.source {
             if extern_dir(c) == Some(ExternDir::Export) {
-                return Err(ValidateError::ExternDirViolation { chan: c, stage: Stage::Prologue });
+                return Err(ValidateError::ExternDirViolation {
+                    chan: c,
+                    stage: Stage::Prologue,
+                });
             }
         }
     }
@@ -403,7 +490,10 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                 // Attribute to the descriptor; report with the epilogue tag
                 // absent a stage — use Prologue? Keep a dedicated message via
                 // SecondConsumer with the earliest stage marker.
-                return Err(ValidateError::SecondConsumer { chan: c, stage: Stage::Prologue });
+                return Err(ValidateError::SecondConsumer {
+                    chan: c,
+                    stage: Stage::Prologue,
+                });
             }
         }
     }
@@ -415,7 +505,15 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
     let classes = classify_channels(&container, &readiness);
 
     let hash = container.hash();
-    Ok(BoundTrace { container, profile, hash, channel_types, stage_types, readiness, classes })
+    Ok(BoundTrace {
+        container,
+        profile,
+        hash,
+        channel_types,
+        stage_types,
+        readiness,
+        classes,
+    })
 }
 
 fn resolve_name(c: &TraceContainer, idx: u16) -> &str {
@@ -424,7 +522,12 @@ fn resolve_name(c: &TraceContainer, idx: u16) -> &str {
 
 /// Registry type rules for the stage-scoped intrinsics, against the bound
 /// model. `query` is deliberately loose (backend-shaped): rank ≥ 1, F32.
-fn intrinsic_type_ok(intr: IntrinsicId, shape: Shape, dtype: DType, profile: &ModelProfile) -> bool {
+fn intrinsic_type_ok(
+    intr: IntrinsicId,
+    shape: Shape,
+    dtype: DType,
+    profile: &ModelProfile,
+) -> bool {
     match intr {
         IntrinsicId::Logits | IntrinsicId::MtpLogits => {
             dtype == DType::F32
@@ -437,9 +540,7 @@ fn intrinsic_type_ok(intr: IntrinsicId, shape: Shape, dtype: DType, profile: &Mo
         IntrinsicId::Query => dtype == DType::F32 && shape.rank() >= 1,
         IntrinsicId::Layer => dtype == DType::U32 && shape.is_scalar(),
         // `[k]` I32 draft tokens (k = row count, trace-known).
-        IntrinsicId::MtpDrafts => {
-            dtype == DType::I32 && shape.rank() == 1 && shape.dims()[0] >= 1
-        }
+        IntrinsicId::MtpDrafts => dtype == DType::I32 && shape.rank() == 1 && shape.dims()[0] >= 1,
     }
 }
 
@@ -570,13 +671,17 @@ pub fn classify_channels(c: &TraceContainer, readiness: &[ReadinessEntry]) -> Ve
         }
         let ops = &c.stages[tsi].ops;
         // Reachability: does `pval` depend on `tid`?
-        let mut reach = alloc::vec![false; ops.iter().map(|o| o.result_count()).sum::<u32>() as usize];
+        let mut reach =
+            alloc::vec![false; ops.iter().map(|o| o.result_count()).sum::<u32>() as usize];
         if (tid as usize) < reach.len() {
             reach[tid as usize] = true;
         }
         let mut next_id = 0u32;
         for op in ops.iter() {
-            let dep = op.operands().iter().any(|&v| reach.get(v as usize).copied().unwrap_or(false));
+            let dep = op
+                .operands()
+                .iter()
+                .any(|&v| reach.get(v as usize).copied().unwrap_or(false));
             for r in 0..op.result_count() {
                 let id = (next_id + r) as usize;
                 if dep {
@@ -592,9 +697,16 @@ pub fn classify_channels(c: &TraceContainer, readiness: &[ReadinessEntry]) -> Ve
         // Fallible-stage analysis: any fallible phase strictly after the
         // mutating stage's phase?
         let mstage = c.stages[tsi].stage;
-        let mpi = Phase::ORDER.iter().position(|p| *p == Phase::of_stage(mstage)).unwrap();
+        let mpi = Phase::ORDER
+            .iter()
+            .position(|p| *p == Phase::of_stage(mstage))
+            .unwrap();
         let followed_by_fallible = fallible[mpi + 1..].iter().any(|&f| f);
-        classes.push(if followed_by_fallible { ChannelClass::InPlaceUndo } else { ChannelClass::InPlace });
+        classes.push(if followed_by_fallible {
+            ChannelClass::InPlaceUndo
+        } else {
+            ChannelClass::InPlace
+        });
     }
     classes
 }
@@ -608,7 +720,13 @@ mod tests {
     use alloc::vec;
 
     fn chan(shape: Shape, dtype: DType, host_role: HostRole, seeded: bool) -> ChannelDecl {
-        ChannelDecl { shape, dtype: ChanDType::Concrete(dtype), capacity: 1, host_role, seeded }
+        ChannelDecl {
+            shape,
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role,
+            seeded,
+        }
     }
 
     /// The overview §3 shape: tok (loop), out (host-read), mask (host-fed,
@@ -623,10 +741,17 @@ mod tests {
             chan(Shape::vector(2), DType::U32, HostRole::None, true), // 4 rng
         ];
         let mut ops: Vec<Op> = vec![
-            Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(1, vocab), dtype: DType::F32 }, // 0
-            Op::Reshape { value: 0, shape: Shape::vector(vocab) }, // 1
-            Op::ChanTake(4),                                       // 2 r = rng.take()
-            Op::ChanTake(2),                                       // 3 m = mask.take()
+            Op::IntrinsicVal {
+                intr: IntrinsicId::Logits,
+                shape: Shape::matrix(1, vocab),
+                dtype: DType::F32,
+            }, // 0
+            Op::Reshape {
+                value: 0,
+                shape: Shape::vector(vocab),
+            }, // 1
+            Op::ChanTake(4), // 2 r = rng.take()
+            Op::ChanTake(2), // 3 m = mask.take()
         ];
         let g = crate::expand::gumbel(&mut ops, 2, Shape::vector(vocab)); // 4
         let masked = crate::expand::mask_apply(&mut ops, 1, 3); // 5,6
@@ -637,25 +762,46 @@ mod tests {
         // rng.put(add(r, CTR1)) — CTR1 = [0,1] not expressible as a scalar
         // const; use iota(2) (=[0,1]) as the counter increment.
         ops.push(Op::Iota { len: 2 }); // t+1
-        ops.push(Op::Cast { value: t + 1, dtype: DType::U32 }); // t+2 (identity; keeps ids readable)
+        ops.push(Op::Cast {
+            value: t + 1,
+            dtype: DType::U32,
+        }); // t+2 (identity; keeps ids readable)
         ops.push(Op::Add(2, t + 2)); // t+3
-        ops.push(Op::ChanPut { chan: 4, value: t + 3 });
+        ops.push(Op::ChanPut {
+            chan: 4,
+            value: t + 3,
+        });
         // tok.put(t) — argmax over [vocab] gives scalar; reshape to [1].
-        ops.push(Op::Reshape { value: t, shape: Shape::vector(1) }); // t+4
-        ops.push(Op::ChanPut { chan: 0, value: t + 4 });
+        ops.push(Op::Reshape {
+            value: t,
+            shape: Shape::vector(1),
+        }); // t+4
+        ops.push(Op::ChanPut {
+            chan: 0,
+            value: t + 4,
+        });
         // len.put(len.take() + 1)
         ops.push(Op::ChanTake(3)); // t+5
         ops.push(Op::Const(Literal::U32(1))); // t+6
         ops.push(Op::Add(t + 5, t + 6)); // t+7
-        ops.push(Op::ChanPut { chan: 3, value: t + 7 });
+        ops.push(Op::ChanPut {
+            chan: 3,
+            value: t + 7,
+        });
         // out.put(t)
-        ops.push(Op::ChanPut { chan: 1, value: t + 4 });
+        ops.push(Op::ChanPut {
+            chan: 1,
+            value: t + 4,
+        });
 
         TraceContainer {
             names: vec![],
             channels,
             ports: vec![
-                PortBinding { port: Port::EmbedTokens, source: PortSource::Channel(0) },
+                PortBinding {
+                    port: Port::EmbedTokens,
+                    source: PortSource::Channel(0),
+                },
                 PortBinding {
                     port: Port::EmbedIndptr,
                     source: PortSource::Const {
@@ -664,9 +810,15 @@ mod tests {
                         data: [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect(),
                     },
                 },
-                PortBinding { port: Port::KvLen, source: PortSource::Channel(3) },
+                PortBinding {
+                    port: Port::KvLen,
+                    source: PortSource::Channel(3),
+                },
             ],
-            stages: vec![StageProgram { stage: Stage::Epilogue, ops }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops,
+            }],
             externs: Vec::new(),
         }
     }
@@ -720,8 +872,14 @@ mod tests {
         // Host writes `mask` (chan 2); a stage put to it is a bind error.
         c.stages[0].ops.push(Op::Const(Literal::Bool(true)));
         let id = crate::expand::next_id(&c.stages[0].ops) - 1;
-        c.stages[0].ops.push(Op::Broadcast { value: id, shape: Shape::vector(32) });
-        c.stages[0].ops.push(Op::ChanPut { chan: 2, value: id + 1 });
+        c.stages[0].ops.push(Op::Broadcast {
+            value: id,
+            shape: Shape::vector(32),
+        });
+        c.stages[0].ops.push(Op::ChanPut {
+            chan: 2,
+            value: id + 1,
+        });
         assert!(matches!(
             bind(c, ModelProfile::dummy()),
             Err(ValidateError::SecondProducer { chan: 2, .. })
@@ -754,9 +912,15 @@ mod tests {
             ports: vec![],
             stages: vec![StageProgram {
                 stage,
-                ops: vec![Op::ChanRead(0), Op::SinkCall { name: 0, args: vec![0] }],
+                ops: vec![
+                    Op::ChanRead(0),
+                    Op::SinkCall {
+                        name: 0,
+                        args: vec![0],
+                    },
+                ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         assert!(bind(mk(Stage::Prologue), profile.clone()).is_ok());
         // lora at the epilogue: nothing after it consumes → T11 error.
@@ -777,19 +941,28 @@ mod tests {
                         input: 0,
                         predicate: crate::types::Predicate::ProbGe(1),
                     },
-                    Op::SinkCall { name: 0, args: vec![2] },
+                    Op::SinkCall {
+                        name: 0,
+                        args: vec![2],
+                    },
                 ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         // needs a threshold operand: insert const before pivot — rebuild:
         let apm = {
             let mut c = apm;
             c.stages[0].ops = vec![
-                Op::ChanRead(0),                       // 0
-                Op::Const(Literal::F32(0.5)),          // 1
-                Op::PivotThreshold { input: 0, predicate: crate::types::Predicate::ProbGe(1) }, // 2
-                Op::SinkCall { name: 0, args: vec![2] },
+                Op::ChanRead(0),              // 0
+                Op::Const(Literal::F32(0.5)), // 1
+                Op::PivotThreshold {
+                    input: 0,
+                    predicate: crate::types::Predicate::ProbGe(1),
+                }, // 2
+                Op::SinkCall {
+                    name: 0,
+                    args: vec![2],
+                },
             ];
             c
         };
@@ -818,13 +991,18 @@ mod tests {
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
                 ops: vec![
-                    Op::KernelCall { name: 0, args: vec![], shape: Shape::vector(1), dtype: DType::F32 },
+                    Op::KernelCall {
+                        name: 0,
+                        args: vec![],
+                        shape: Shape::vector(1),
+                        dtype: DType::F32,
+                    },
                     Op::ChanTake(0),
                     Op::Add(0, 1),
                     Op::ChanPut { chan: 0, value: 2 },
                 ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         assert!(matches!(
             bind(c, profile),
@@ -852,11 +1030,13 @@ mod tests {
                     Op::ChanPut { chan: 0, value: 1 },
                 ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         assert!(matches!(
             bind(c, profile),
-            Err(ValidateError::IntrinsicUnavailable { intr: IntrinsicId::MtpLogits })
+            Err(ValidateError::IntrinsicUnavailable {
+                intr: IntrinsicId::MtpLogits
+            })
         ));
     }
 
@@ -879,11 +1059,14 @@ mod tests {
                     Op::ChanPut { chan: 0, value: 1 },
                 ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         assert!(matches!(
             bind(c, ModelProfile::dummy()),
-            Err(ValidateError::IntrinsicWrongStage { intr: IntrinsicId::Logits, stage: Stage::Prologue })
+            Err(ValidateError::IntrinsicWrongStage {
+                intr: IntrinsicId::Logits,
+                stage: Stage::Prologue
+            })
         ));
     }
 }

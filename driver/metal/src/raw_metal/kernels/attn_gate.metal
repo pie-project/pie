@@ -24,12 +24,15 @@ template <typename T>
     device T* q_out          [[buffer(1)]],  // [n_q, head_dim]
     device T* gate_out       [[buffer(2)]],  // [n_q, head_dim]
     const constant int& head_dim [[buffer(3)]],
-    uint2 tid [[thread_position_in_grid]]) {
+    uint3 tid [[thread_position_in_grid]],
+    uint3 grid [[threads_per_grid]]) {
   const int i = int(tid.x);   // channel within head_dim
   const int h = int(tid.y);   // query head
   const int hd = head_dim;
-  q_out[h * hd + i]    = qg[h * 2 * hd + i];
-  gate_out[h * hd + i] = qg[h * 2 * hd + hd + i];
+  const int n_q = int(grid.y);
+  const size_t row = size_t(tid.z) * n_q * hd;
+  q_out[row + h * hd + i]    = qg[row * 2 + h * 2 * hd + i];
+  gate_out[row + h * hd + i] = qg[row * 2 + h * 2 * hd + hd + i];
 }
 
 // MLX's numerically-stable sigmoid (unary_ops.h Sigmoid). bf16/f16 have no native
@@ -48,7 +51,9 @@ template <typename T>
 [[kernel]] void attn_gate(
     device T* attn         [[buffer(0)]],  // [n_q*head_dim] in-place
     const device T* gate   [[buffer(1)]],  // [n_q*head_dim]
+    const constant int& width [[buffer(2)]],
     uint tid [[thread_position_in_grid]]) {
+  (void)width;
   attn[tid] = attn[tid] * sigmoid_mlx(gate[tid]);
 }
 
@@ -56,12 +61,12 @@ template <typename T>
   template [[host_name("q_gate_split_" #name)]]                   \
   [[kernel]] void q_gate_split<itype>(                            \
       const device itype*, device itype*, device itype*,          \
-      const constant int&, uint2);
+      const constant int&, uint3, uint3);
 
 #define instantiate_attn_gate(name, itype)                        \
   template [[host_name("attn_gate_" #name)]]                      \
   [[kernel]] void attn_gate<itype>(                               \
-      device itype*, const device itype*, uint);
+      device itype*, const device itype*, const constant int&, uint);
 
 instantiate_q_gate_split(float32, float)
 instantiate_q_gate_split(float16, half)

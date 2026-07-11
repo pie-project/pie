@@ -95,12 +95,10 @@ async fn grammar_late_supply_on_real_driver() -> Result<()> {
     let mut clients = Vec::with_capacity(N_CONCURRENT);
     let mut procs = Vec::with_capacity(N_CONCURRENT);
     for _ in 0..N_CONCURRENT {
-        let c = Client::connect_with_identity(
-            &format!("ws://{}/v1/ws", pie.listen_addr),
-            "test-user",
-        )
-        .await
-        .context("connect proc session")?;
+        let c =
+            Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
+                .await
+                .context("connect proc session")?;
         c.authenticate("test-user", &None)
             .await
             .context("auth proc session")?;

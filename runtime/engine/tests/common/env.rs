@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use pie_engine::bootstrap::{
-    AuthConfig, Config, DriverConfig, ModelConfig, RuntimeConfig, SchedulerConfig, TelemetryConfig,
+    Config, DriverConfig, ModelConfig, RuntimeConfig, SchedulerConfig, TelemetryConfig,
 };
 use pie_engine::driver::{NativeDriver, SchedulerLimits};
 
@@ -21,8 +21,8 @@ use super::mock_device::{Behavior, MockBackend, launch_observer};
 /// PTIR program at bind.
 fn fixture_vocab_size() -> u32 {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/fixtures");
-    let cfg = std::fs::read_to_string(fixtures.join("config.json"))
-        .expect("read fixture config.json");
+    let cfg =
+        std::fs::read_to_string(fixtures.join("config.json")).expect("read fixture config.json");
     let cfg: serde_json::Value = serde_json::from_str(&cfg).expect("parse fixture config.json");
     match cfg.get("vocab_size").and_then(|v| v.as_u64()) {
         Some(v) => v as u32,
@@ -70,7 +70,6 @@ pub struct MockEnv {
     num_pages: usize,
     behavior: Arc<dyn Behavior>,
     temp_cache: TempDir,
-    temp_auth: TempDir,
     /// Dummy-driver operation log (shared across every device driver): op
     /// names plus `launch-shape tokens=N programs=P` entries for geometry
     /// assertions.
@@ -111,10 +110,6 @@ impl MockEnv {
         Config {
             host: "127.0.0.1".into(),
             port: 0,
-            auth: AuthConfig {
-                enabled: false,
-                authorized_users_dir: self.temp_auth.path().to_path_buf(),
-            },
             cache_dir: self.temp_cache.path().to_path_buf(),
             verbose: false,
             log_dir: None,
@@ -146,6 +141,7 @@ impl MockEnv {
                 allow_network: false,
                 network_allowed_hosts: vec![],
                 max_upload_mb: 256,
+                py_runtime_dir: self.temp_cache.path().join("py-runtime"),
             },
             skip_tracing: true,
             max_concurrent_processes: None,
@@ -173,7 +169,6 @@ pub fn create_mock_env(
         num_pages,
         behavior,
         temp_cache: TempDir::new().expect("Failed to create temp cache dir"),
-        temp_auth: TempDir::new().expect("Failed to create temp auth dir"),
         operation_log,
     }
 }

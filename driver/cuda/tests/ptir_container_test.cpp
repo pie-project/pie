@@ -21,9 +21,9 @@
 #include <string>
 #include <vector>
 
-#include "ptir/container.hpp"
+#include "pie_native/ptir/container.hpp"
 
-using namespace pie_cuda_driver::ptir;
+using namespace pie_native::ptir;
 
 namespace {
 int g_pass = 0, g_fail = 0;

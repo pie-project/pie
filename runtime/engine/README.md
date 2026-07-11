@@ -45,14 +45,6 @@ cargo test --test smoke
 cargo test -- --nocapture
 ```
 
-## Benchmarks
-
-```bash
-cargo bench --bench inferlet_bench
-```
-
-Results are written to `target/criterion/` with HTML reports.
-
 ## Test Inferlets
 
 Source lives in `tests/inferlets/`. To build manually:

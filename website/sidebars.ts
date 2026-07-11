@@ -97,12 +97,11 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
-      label: 'I/O and messaging',
+      label: 'I/O',
       collapsed: false,
       items: [
         'guide/io/overview',
         'guide/io/session',
-        'guide/io/messaging',
         'guide/io/http',
         'guide/io/filesystem',
       ],

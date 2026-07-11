@@ -72,7 +72,6 @@ PieClient(server_uri: str)
 | Method | Description |
 |--------|-------------|
 | `authenticate(username, private_key=None)` | Public-key auth (challenge → signature). `private_key` may be `None` only if the server has auth disabled. |
-| `auth_by_token(token)` | Token-based auth used for backend ↔ engine connections. |
 
 ```python
 key = ParsedPrivateKey.from_file("~/.ssh/id_ed25519")

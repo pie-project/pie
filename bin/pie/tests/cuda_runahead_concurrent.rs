@@ -44,7 +44,9 @@ fn parse_pipelined(json: &str) -> Option<Vec<i64>> {
 async fn run_one(addr: &str) -> Result<Option<Vec<i64>>> {
     let c = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "test-user").await?;
     c.authenticate("test-user", &None).await?;
-    let mut proc = c.launch_process("runahead@0.1.0".into(), "8".into(), true).await?;
+    let mut proc = c
+        .launch_process("runahead@0.1.0".into(), "8".into(), true)
+        .await?;
     Ok(parse_pipelined(&proc.wait_for_return().await?))
 }
 
@@ -52,10 +54,14 @@ async fn run_fleet_concurrent(addr: &str) -> Vec<Option<Vec<i64>>> {
     let mut procs = Vec::new();
     for _ in 0..FLEET {
         let addr = addr.to_string();
-        procs.push(tokio::spawn(async move { run_one(&addr).await.ok().flatten() }));
+        procs.push(tokio::spawn(
+            async move { run_one(&addr).await.ok().flatten() },
+        ));
     }
     let mut out = Vec::new();
-    for h in procs { out.push(h.await.unwrap_or(None)); }
+    for h in procs {
+        out.push(h.await.unwrap_or(None));
+    }
     out
 }
 
@@ -68,7 +74,9 @@ async fn concurrent_runahead_matches_sequential() -> Result<()> {
     anyhow::ensure!(
         Command::new("cargo")
             .args(["build", "--target", "wasm32-wasip2", "-p", "runahead"])
-            .current_dir(&ws).status()?.success(),
+            .current_dir(&ws)
+            .status()?
+            .success(),
         "runahead wasm build failed"
     );
     let wasm = ws.join("target/wasm32-wasip2/debug/runahead.wasm");
@@ -80,7 +88,10 @@ async fn concurrent_runahead_matches_sequential() -> Result<()> {
 
     let setup = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "test-user").await?;
     setup.authenticate("test-user", &None).await?;
-    setup.add_program(&wasm, &manifest, true).await.context("add_program")?;
+    setup
+        .add_program(&wasm, &manifest, true)
+        .await
+        .context("add_program")?;
 
     // Reference: run ALONE, sequentially (no concurrency) — the carrier's RETAIN
     // strictly precedes its INJECT with no co-batch merge.
@@ -98,13 +109,19 @@ async fn concurrent_runahead_matches_sequential() -> Result<()> {
     let mut n_ok = 0usize;
     for k in 0..FLEET {
         let good = concurrent[k].is_some() && concurrent[k] == reference[k];
-        if good { n_ok += 1; }
+        if good {
+            n_ok += 1;
+        }
         eprintln!(
             "[runahead-conc] pipeline {k}: {} conc={:?} ref={:?}",
-            if good { "OK" } else { "MISMATCH" }, concurrent[k], reference[k]
+            if good { "OK" } else { "MISMATCH" },
+            concurrent[k],
+            reference[k]
         );
     }
-    eprintln!("[runahead-conc] {n_ok}/{FLEET} concurrent pipelined streams == their sequential reference");
+    eprintln!(
+        "[runahead-conc] {n_ok}/{FLEET} concurrent pipelined streams == their sequential reference"
+    );
 
     assert_eq!(
         n_ok, FLEET,

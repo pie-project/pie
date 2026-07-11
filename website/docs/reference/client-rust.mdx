@@ -71,13 +71,10 @@ impl Client {
         username: &str,
         private_key: &Option<ParsedPrivateKey>,
     ) -> Result<()>;
-
-    pub async fn auth_by_token(&self, token: &str) -> Result<()>;
 }
 ```
 
-`authenticate` runs a challenge-response handshake. `auth_by_token` is for
-backend ↔ engine internal connections. If the server has
+`authenticate` runs a challenge-response handshake. If the server has
 `[auth].enabled = false`, `authenticate` returns `Ok(())` even with a `None`
 key.
 

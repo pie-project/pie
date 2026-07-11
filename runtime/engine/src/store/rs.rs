@@ -26,6 +26,14 @@
 //! Like `KvStore`, prepare computes targets without mutating the mapping and
 //! commit applies them; at most one prepared write may be in flight per
 //! WorkingSet (the sequencer's same-WorkingSet batching rule).
+//!
+//! Complete typed-store API (kv_refact.md): some methods here are not yet
+//! called by the live single-model fire path (only a subset of the typed
+//! store surface is currently wired) but are exercised by this module's
+//! own unit test suite and reserved for upcoming increments (contention/
+//! reclaim expansion, RS buffer-write paths, etc.) — kept rather than
+//! deleted, allowed rather than silently masked.
+#![allow(dead_code)]
 
 pub mod working_set;
 pub mod write;
@@ -311,8 +319,7 @@ impl RsStore {
                 granularity,
             });
         }
-        let capacity =
-            (entry.buffer.len() as u32).saturating_mul(entry.geom.buffer_page_tokens);
+        let capacity = (entry.buffer.len() as u32).saturating_mul(entry.geom.buffer_page_tokens);
         if tokens > capacity {
             return Err(RsError::FoldExceedsBuffer { tokens, capacity });
         }
@@ -377,19 +384,16 @@ impl RsStore {
         let buffer_needs_alloc = buffer_targets_src
             .iter()
             .filter(|(_, slot)| match slot {
-                None => true,                             // materialize
-                Some(id) => self.ref_count(*id) > 1,      // CoW
+                None => true,                        // materialize
+                Some(id) => self.ref_count(*id) > 1, // CoW
             })
             .count();
 
         let need = usize::from(state_needs_alloc) + buffer_needs_alloc;
-        let allocated = self
-            .pool
-            .try_alloc_n(need)
-            .ok_or(RsError::OutOfSlots {
-                requested: need,
-                available: self.pool.available(),
-            })?;
+        let allocated = self.pool.try_alloc_n(need).ok_or(RsError::OutOfSlots {
+            requested: need,
+            available: self.pool.available(),
+        })?;
         let mut fresh_ids = allocated.iter().copied();
 
         let state = if write_state {
@@ -558,7 +562,11 @@ impl RsStore {
 
 /// Inclusive page-index span covering the token range, validated against the
 /// buffered capacity.
-fn page_span(entry: &RsEntry, start_token: u32, len_tokens: u32) -> Result<(usize, usize), RsError> {
+fn page_span(
+    entry: &RsEntry,
+    start_token: u32,
+    len_tokens: u32,
+) -> Result<(usize, usize), RsError> {
     let page = entry.geom.buffer_page_tokens.max(1);
     let capacity = (entry.buffer.len() as u32).saturating_mul(page);
     let end = start_token

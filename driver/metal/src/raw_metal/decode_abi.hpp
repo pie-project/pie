@@ -102,21 +102,54 @@ struct DecodeGeometry {
     int   kv_page_size      = 32;   // paged-KV page granularity (config kv_page_size)
     int   total_pages       = 1;    // paged-KV pool capacity (config total_pages); sizes
                                     // KvPageIndices[total_pages] + the KV page region (delta)
+    // Phase 1b/3 paged-KV bridge: explicit opt-in for the ADDITIVE KvPagePool
+    // + MbIo heap regions (heap_layout.hpp plan_heap). `total_pages`/
+    // `max_requests` above predate this bridge and default to placeholder
+    // values (1) that were NEVER actually consumed by plan_heap until now —
+    // gating on THEM directly would silently grow the sealed M=1 heap by a
+    // small but real amount every time. This flag is the single source of
+    // truth for "the paged bridge is engaged"; false (default) means
+    // byte-identical to a build with no such region at all, regardless of
+    // what total_pages/max_requests/max_tokens happen to be set to.
+    bool  paged_kv_enabled  = false;
 
     // Layer schedule: full-attention at layers {3,7,11,15,19,23}; GDN otherwise.
     static constexpr int full_attn_interval = 4;
     static constexpr bool is_full_attn(int layer) {
         return (layer % full_attn_interval) == (full_attn_interval - 1);
     }
+
+    // Phase 1b state-slot fix: the per-slot BYTE strides for one GDN layer's
+    // conv-state (ConvState/ConvStateOut, each `gdn_conv_dim * gdn_conv_k`
+    // f32 elements) and recurrent-state (`gdn_v_heads * gdn_v_dim *
+    // gdn_k_dim` f32 elements) slabs — slot N's region starts at byte
+    // offset `N * stride` within the shared per-layer buffer (heap_layout.hpp
+    // `plan_heap` packs slots at exactly this stride; heap_bind.cpp binds
+    // the whole multi-slot slab as one buffer). Single source of truth so
+    // `RawMetalDecoder::step()` (per-step arg rebind), `reset_state(slot)`
+    // (zeroing), and `copy_state_slot()` (memcpy) can never silently diverge
+    // on the addressing formula.
+    size_t gdn_conv_stride_bytes() const {
+        return size_t(gdn_conv_dim) * size_t(gdn_conv_k) * 4u;
+    }
+    size_t gdn_recurrent_stride_bytes() const {
+        return size_t(gdn_v_heads) * size_t(gdn_v_dim) * size_t(gdn_k_dim) * 4u;
+    }
 };
 
 // ── Heap regions (one MTLHeap, fixed offsets) ────────────────────────────────
 enum class Region : uint8_t {
-    Weights = 0,  // load-once RO: qmv (w/scales/biases), norms, embed(=lm_head)
-    KV      = 1,  // paged k/v pages for the 6 full-attn layers (append-only)
-    State   = 2,  // GDN resident conv_state + recurrent_state (S=1, in-place)
-    Scratch = 3,  // activation ping-pong pool (SCRATCH_POOL buffers)
-    IO      = 4,  // per-token CPU/GPU-touched scalars + logits
+    Weights   = 0,  // load-once RO: qmv (w/scales/biases), norms, embed(=lm_head)
+    KV        = 1,  // paged k/v pages for the 6 full-attn layers (append-only)
+    State     = 2,  // GDN resident conv_state + recurrent_state (S=1, in-place)
+    Scratch   = 3,  // activation ping-pong pool (SCRATCH_POOL buffers)
+    IO        = 4,  // per-token CPU/GPU-touched scalars + logits
+    // ── Phase 1b/3 paged-KV bridge additions (APPEND-ONLY; zero-sized and
+    //    zero-impact on the sealed M=1 regions above when total_pages==0/
+    //    max_requests<=1 — see heap_layout.hpp plan_heap) ──
+    MbIo      = 5,  // multi-batch CSR IO buffers (QoIndptr..ReqOfToken, IoSlot 5-11)
+    KvPagePool= 6,  // separate NHD paged K/V pool (kv_append_paged/sdpa_paged read
+                    // this; the M=1 HND ring above is UNTOUCHED/reinterpreted)
 };
 
 // Scratch ping-pong pool size (beta, from WAR/WAW chain). 6 max-shape buffers.
@@ -131,7 +164,7 @@ enum class IoSlot : uint8_t {
     TokenId   = 0,  // u32[max_tokens] — M=1 writes [0]; M>1 = per-token ids [N]
     Position  = 1,  // u32[max_tokens] — absolute positions [N] (rope/kv_append read)
     SeqLen    = 2,  // u32[max_tokens] — per-token kv extent (M=1: [0]; sdpa reads)
-    Logits    = 3,  // f32[vocab] OUT (M=1) — ALWAYS produced (I3); M>1 packs sampled rows
+    Logits    = 3,  // bf16[vocab] OUT (M=1); bf16[max_tokens,vocab] for paged fires
     NextToken = 4,  // u32[max_tokens] — OPTIONAL device-argmax substrate (I3)
     // ── Multi-batch CSR slots (Phase-1; bound only at M>1, absent at M=1 = no-op) ──
     // Canonical schema names (view.hpp / model_graph.hpp), marshaled by alpha from
@@ -145,7 +178,15 @@ enum class IoSlot : uint8_t {
     ReqOfToken     = 11, // u32[N] — per-token request id; ENTRY populates from beta's
                          // batch_schedule::tok_req (= qo_indptr expansion). Read by
                          // bind::KvAppend::ReqOfToken + bind::SdpaPaged::ReqOfToken.
+    // The slotted GDN kernel indexes state by TOKEN row, not by request.  Keeping this
+    // expansion distinct from RsSlotIds makes mixed/prefill fires unambiguous.
+    SlotOfToken    = 12, // u32[N] — rs_slot_ids[req_of_token[t]]
+    // Explicit physical placement for an append.  These are deliberately separate from
+    // the read CSR: a fork may write a new physical page while retaining a shared prefix.
+    WPage          = 13, // u32[N] — physical destination page for every appended token
+    WOff           = 14, // u32[N] — in-page destination offset for every appended token
 };
+inline constexpr int kIoSlotCount = static_cast<int>(IoSlot::WOff) + 1;
 
 // ── Per-kernel binding indices (arg order the encoder binds into MTL4ArgumentTable) ──
 // Grounded in MLX's host-side dispatch arg order, adjusted for I1 (scalars→buffers).
@@ -195,10 +236,10 @@ enum class SdpaPaged : uint8_t {
 enum class Rms : uint8_t { X = 0, W = 1, Out = 2, Params = 3 };
 
 // residual add (golden `attn_resid`, `layer_out`): Out = X + Residual, elementwise.
-enum class Residual : uint8_t { X = 0, Residual = 1, Out = 2 };
+enum class Residual : uint8_t { X = 0, Residual = 1, Out = 2, Width = 3 };
 
 // SwiGLU (golden `swiglu`): Out = silu(Gate) * Up, elementwise over intermediate.
-enum class SiluMul : uint8_t { Gate = 0, Up = 1, Out = 2 };
+enum class SiluMul : uint8_t { Gate = 0, Up = 1, Out = 2, Width = 3 };
 
 // dense bf16 GEMV (M=1) for GDN `gdn_in_a`/`gdn_in_b` (in_proj_a/b stored DENSE
 // bf16 [V_h,hidden], NOT 4-bit). Out[N] = sum_k W[N,K]*X[K], float accum.
@@ -209,7 +250,7 @@ enum class Dense : uint8_t { W = 0, X = 1, Out = 2, K = 3, N = 4 };
 enum class QSplit : uint8_t { Qg = 0, QOut = 1, GateOut = 2, HeadDim = 3 };
 
 // attn_gate: attn *= sigmoid(gate) before o_proj (golden tag `attn_gated`). In-place.
-enum class AttnGate : uint8_t { Attn = 0, Gate = 1 };
+enum class AttnGate : uint8_t { Attn = 0, Gate = 1, Width = 2 };
 
 // single-token rope (NeoX, partial). In-place on buffer 0; matches rope.metal exactly:
 //   0=x (activation, in/out), 1=position (IO::Position, I1), 2=scale, 3=base=log2(theta),
@@ -237,6 +278,16 @@ enum class KvAppend : uint8_t {
     PageSize      = 10, // u32              — kv_page_size (geometry const, default 32)
     ReqOfToken    = 11, // u32[N]           — per-token request id (derived from qo_indptr)
     NKvHeads      = 12, // u32              — n_kv_heads (page-row stride const)
+};
+
+// Paged append uses the established KvAppend prefix verbatim.  The two destination
+// vectors are append-only slots: explicit descriptors fill them directly; implicit
+// appends are normalized into the same vectors by the host before dispatch.
+enum class KvAppendPaged : uint8_t {
+    K = 0, V = 1, KPages = 2, VPages = 3, PositionIds = 4, HeadDim = 5,
+    KHeadStride = 6, KSeqStride = 7,
+    KvPageIndices = 8, KvPageIndptr = 9, PageSize = 10, ReqOfToken = 11,
+    NKvHeads = 12, WPage = 13, WOff = 14,
 };
 
 // GDN fused core (1 dispatch — beta): folds conv1d+silu + l2norm*2 + q-scale + gating +
@@ -297,6 +348,7 @@ enum class GdnPrep : uint8_t {
     PreGate      = 10, // out: gdn_pre_gate[R,Hv,2] fp32 (decay, beta)
     ConvStateOut = 11, // new_conv_state q/k channels (float, out)
     Params       = 12, // GdnCoreParams& (constant)
+    SlotOfToken  = 13, // u32[N] — append-only slotted-MB variant only
 };
 
 // Slimmed recurrent core (prep-path). Buffers 0-5 MATCH bind::GdnCore (minimal
@@ -313,6 +365,7 @@ enum class GdnCoreRecurrent : uint8_t {
     PreGate      = 8,  // in: gdn_pre_gate (fp32)
     ConvStateOut = 9,  // new_conv_state v channels (float, out)
     Params       = 10, // GdnCoreParams& (constant)
+    SlotOfToken  = 11, // u32[N] — append-only slotted-MB variant only
 };
 
 // gated RMSNorm (GDN; golden `gdn_core` = post-norm): Out = (1+0)·rmsnorm(X)·silu(Z)
@@ -359,6 +412,9 @@ enum class Kernel : uint8_t {
     FfnRms, QmvGate, QmvUp, SiluMul, QmvDown, LayerOut,
     // Layer-less tail:
     FinalRms, QmvLmHead, Argmax,
+    // Multi-batch-only variants.  APPEND ONLY: all pre-existing serialized
+    // Kernel values are part of the M=1 argument-table ABI.
+    KvAppendPaged, SdpaPaged, GdnCoreSlotted, GdnPrepSlotted,
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

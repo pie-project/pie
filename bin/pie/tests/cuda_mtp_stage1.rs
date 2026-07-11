@@ -80,7 +80,10 @@ fn degenerate_reason(tokens: &[u32]) -> Option<String> {
     if tokens.len() < 4 {
         return None;
     }
-    let distinct = tokens.iter().collect::<std::collections::HashSet<_>>().len();
+    let distinct = tokens
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     if distinct < 3 {
         return Some(format!(
             "only {distinct} distinct token id(s) across {} — the recurrent state is \
@@ -119,8 +122,11 @@ fn write_record(k: u32, elapsed_ms: u128, tokens: &[u32]) -> Result<()> {
         .map(|t| t.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    std::fs::write(record_path(k), format!("elapsed_ms={elapsed_ms}\ntokens={toks}\n"))
-        .context("write mtp-stage1 record")
+    std::fs::write(
+        record_path(k),
+        format!("elapsed_ms={elapsed_ms}\ntokens={toks}\n"),
+    )
+    .context("write mtp-stage1 record")
 }
 
 /// Read back a prior run's `(elapsed_ms, tokens)` if it exists.
@@ -165,7 +171,9 @@ fn read_acceptance() -> Option<(u64, u64)> {
         let field = |key: &str| -> Option<u64> {
             let s = line.find(key)? + key.len();
             let rest = &line[s..];
-            let e = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            let e = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
             rest[..e].parse::<u64>().ok()
         };
         if let (Some(e), Some(a)) = (field("emitted="), field("accepted=")) {
@@ -179,21 +187,31 @@ fn read_acceptance() -> Option<(u64, u64)> {
 
 /// Run the `generate` inferlet once for `DECODE_TOKENS` and return
 /// `(tokens, elapsed)`.
-async fn run_generate(listen_addr: &std::net::SocketAddr) -> Result<(Vec<u32>, std::time::Duration)> {
+async fn run_generate(
+    listen_addr: &std::net::SocketAddr,
+) -> Result<(Vec<u32>, std::time::Duration)> {
     let c = Client::connect_with_identity(&format!("ws://{listen_addr}/v1/ws"), "test-user")
         .await
         .context("connect generate session")?;
-    c.authenticate("test-user", &None).await.context("auth generate session")?;
+    c.authenticate("test-user", &None)
+        .await
+        .context("auth generate session")?;
     let start = Instant::now();
     let mut proc = c
         .launch_process(
-            format!("{}@0.1.0",
-                std::env::var("PIE_GDN_INFERLET")
-                    .unwrap_or_else(|_| "generate-gdn".to_string())),
-            DECODE_TOKENS.to_string(), true)
+            format!(
+                "{}@0.1.0",
+                std::env::var("PIE_GDN_INFERLET").unwrap_or_else(|_| "generate-gdn".to_string())
+            ),
+            DECODE_TOKENS.to_string(),
+            true,
+        )
         .await
         .context("launch generate")?;
-    let json = proc.wait_for_return().await.context("wait_for_return generate")?;
+    let json = proc
+        .wait_for_return()
+        .await
+        .context("wait_for_return generate")?;
     let elapsed = start.elapsed();
     drop(c);
     let tokens = parse_generated_tokens(&json)
@@ -219,8 +237,7 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
     // RsWorkingSet), NOT the dense `generate` (KV-only, which the GDN forward
     // rejects with "rs_cache forward missing runtime-assigned slot ids").
     let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
-    let gdn_pkg = std::env::var("PIE_GDN_INFERLET")
-        .unwrap_or_else(|_| "generate-gdn".to_string());
+    let gdn_pkg = std::env::var("PIE_GDN_INFERLET").unwrap_or_else(|_| "generate-gdn".to_string());
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", &gdn_pkg])
         .current_dir(&ws)
@@ -229,17 +246,29 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
     anyhow::ensure!(ok, "wasm build failed for {gdn_pkg}");
 
     let pie = common::boot_4090_mtp().await?;
-    eprintln!("[mtp-stage1] booted Qwen3.5-0.8B, listen_addr={}", pie.listen_addr);
+    eprintln!(
+        "[mtp-stage1] booted Qwen3.5-0.8B, listen_addr={}",
+        pie.listen_addr
+    );
 
     // Install the program once.
     let setup =
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect setup")?;
-    setup.authenticate("test-user", &None).await.context("auth setup")?;
-    let wasm = ws.join(format!("target/wasm32-wasip2/debug/{}.wasm", gdn_pkg.replace('-', "_")));
+    setup
+        .authenticate("test-user", &None)
+        .await
+        .context("auth setup")?;
+    let wasm = ws.join(format!(
+        "target/wasm32-wasip2/debug/{}.wasm",
+        gdn_pkg.replace('-', "_")
+    ));
     let man = ws.join(format!("{gdn_pkg}/Pie.toml"));
-    setup.add_program(&wasm, &man, true).await.context("add_program generate-gdn")?;
+    setup
+        .add_program(&wasm, &man, true)
+        .await
+        .context("add_program generate-gdn")?;
     drop(setup);
 
     // Decode + time.
@@ -288,7 +317,10 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
             "[mtp-stage1] T0: non-degeneracy OK ({} distinct tokens). No golden set yet — \
              EYEBALL the decoded tokens above for coherent output, then paste the leading ids \
              into GDN_GOLDEN to lock correctness (T1 parity alone false-passes on garbage).",
-            tokens.iter().collect::<std::collections::HashSet<_>>().len()
+            tokens
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
         );
     }
 
@@ -339,7 +371,11 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
              greedy token). This is a recurrent-state fold regression (see the commit_len gating \
              in gated_delta_net.cu).\n K={k}: {tokens:?}\n K={counterpart}: {other_tokens:?}"
         );
-        let (spec_ms, base_ms) = if k > 0 { (elapsed.as_millis(), other_ms) } else { (other_ms, elapsed.as_millis()) };
+        let (spec_ms, base_ms) = if k > 0 {
+            (elapsed.as_millis(), other_ms)
+        } else {
+            (other_ms, elapsed.as_millis())
+        };
         eprintln!(
             "[mtp-stage1] T1 PARITY OK (lossless). T4 THROUGHPUT: spec(K>0)={spec_ms}ms \
              base(K=0)={base_ms}ms ratio={:.2}x (honest — EXPECT ~1x-or-slower at small K; \

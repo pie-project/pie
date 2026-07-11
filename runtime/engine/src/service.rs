@@ -120,6 +120,7 @@ impl<Msg: Send + 'static> Service<Msg> {
     }
 
     /// Stops the service and awaits its shutdown.
+    #[allow(dead_code)] // framework completeness; no current caller needs a singleton shutdown.
     pub async fn shutdown(&self) -> Result<()> {
         let Some(SingletonState { tx, handle }) = self.state.lock().unwrap().take() else {
             return Ok(());
@@ -211,6 +212,7 @@ where
     }
 
     /// Removes a service and awaits its shutdown.
+    #[allow(dead_code)] // framework completeness; no current caller awaits a keyed shutdown.
     pub async fn join(&self, key: &K) -> Result<()> {
         self.map.remove(key);
         let (_, handle) = self
@@ -223,6 +225,7 @@ where
     }
 
     /// Returns true if a service with the given key exists.
+    #[allow(dead_code)] // framework completeness; `server::exists` is its only (currently uncalled) caller.
     pub fn contains(&self, key: &K) -> bool {
         self.map.contains_key(key)
     }
@@ -233,11 +236,13 @@ where
     }
 
     /// Returns the number of services.
+    #[allow(dead_code)] // framework completeness alongside `is_empty`.
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
     /// Returns true if no services exist.
+    #[allow(dead_code)] // framework completeness alongside `len`.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

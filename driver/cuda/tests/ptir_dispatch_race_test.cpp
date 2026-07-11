@@ -23,7 +23,7 @@
 
 #include <cuda_runtime.h>
 
-#include "ptir/container.hpp"
+#include "pie_native/ptir/container.hpp"
 #include "ptir/ptir_dispatch.hpp"
 
 using pie_cuda_driver::ptir::PtirDispatch;
@@ -75,7 +75,7 @@ extern "C" void count_notify(void*, std::uint64_t, std::uint64_t) {
 // `first_id`; fills `endpoints` and returns the ids.
 std::vector<std::uint64_t> register_channels(
     PtirDispatch& dispatch,
-    const pie_cuda_driver::ptir::container::Container& container,
+    const pie_native::ptir::container::Container& container,
     std::uint64_t first_id,
     std::vector<PieChannelEndpointBinding>& endpoints,
     std::string& err) {
@@ -149,9 +149,9 @@ int main() {
                 err.c_str())) return 1;
 
     g_stage = "decode";
-    pie_cuda_driver::ptir::container::Container container;
-    pie_cuda_driver::ptir::container::DecodeError decode_error;
-    if (!expect(pie_cuda_driver::ptir::container::decode(
+    pie_native::ptir::container::Container container;
+    pie_native::ptir::container::DecodeError decode_error;
+    if (!expect(pie_native::ptir::container::decode(
                     bytes.data(), bytes.size(), container, &decode_error),
                 decode_error.detail.c_str())) return 1;
 

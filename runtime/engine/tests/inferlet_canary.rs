@@ -85,7 +85,9 @@ fn run_prod_inferlet(name: &str, input: &str, timeout: Duration) -> Result<Strin
         pie_engine::inferlet::program::add(wasm, manifest, true)
             .await
             .unwrap();
-        pie_engine::inferlet::program::install(&program_name).await.unwrap();
+        pie_engine::inferlet::program::install(&program_name)
+            .await
+            .unwrap();
         let (tx, rx) = oneshot::channel();
         let _pid = process::spawn(
             "test-user".into(),

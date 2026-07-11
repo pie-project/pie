@@ -42,6 +42,10 @@ const char* kernel_name(Kernel k) {
         case Kernel::FinalRms:    return "final_rms";
         case Kernel::QmvLmHead:   return "qmv_lm_head";
         case Kernel::Argmax:      return "argmax";
+        case Kernel::KvAppendPaged: return "kv_append_paged";
+        case Kernel::SdpaPaged: return "sdpa_paged";
+        case Kernel::GdnCoreSlotted: return "gdn_core_slotted";
+        case Kernel::GdnPrepSlotted: return "gdn_prep_slotted";
     }
     return "unknown";
 }

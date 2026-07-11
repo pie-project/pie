@@ -132,6 +132,16 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
             }
 
+            case Kernel::GdnPrepSlotted: {
+                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
+                                       g.gdn_conv_dim, g.gdn_conv_k,
+                                       0, g.gdn_k_heads * g.gdn_k_dim,
+                                       2 * g.gdn_k_heads * g.gdn_k_dim,
+                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnPrep::Params, gp, &count);
+                break;
+            }
+
             case Kernel::GdnCore: {
                 const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
                                        g.gdn_conv_dim, g.gdn_conv_k,
@@ -141,6 +151,17 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 const uint8_t pbuf = gdn_prep ? (uint8_t)bind::GdnCoreRecurrent::Params
                                               : (uint8_t)bind::GdnCore::Params;
                 bind_const<GdnCoreParams>(ctx, ord, pbuf, gp, &count);
+                break;
+            }
+
+            case Kernel::GdnCoreSlotted: {
+                const GdnCoreParams gp{g.gdn_k_dim, g.gdn_v_dim, g.gdn_k_heads, g.gdn_v_heads,
+                                       g.gdn_conv_dim, g.gdn_conv_k,
+                                       0, g.gdn_k_heads * g.gdn_k_dim,
+                                       2 * g.gdn_k_heads * g.gdn_k_dim,
+                                       g.eps, 1.0f / std::sqrt(float(g.gdn_k_dim))};
+                bind_const<GdnCoreParams>(ctx, ord, (uint8_t)bind::GdnCoreRecurrent::Params,
+                                          gp, &count);
                 break;
             }
 
@@ -166,6 +187,21 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<size_t>(ctx, ord, (uint8_t)bind::KvAppend::KSeqStride,  seq_stride,  &count);
                 break;
 
+            case Kernel::KvAppendPaged:
+                bind_const<int>(ctx, ord, (uint8_t)bind::KvAppendPaged::HeadDim, g.head_dim, &count);
+                // These two preserved M=1 ABI entries are unused by the paged
+                // shader but intentionally bound so every declared table slot
+                // has a concrete value.
+                bind_const<size_t>(ctx, ord, (uint8_t)bind::KvAppendPaged::KHeadStride,
+                                   head_stride, &count);
+                bind_const<size_t>(ctx, ord, (uint8_t)bind::KvAppendPaged::KSeqStride,
+                                   seq_stride, &count);
+                bind_const<int>(ctx, ord, (uint8_t)bind::KvAppendPaged::PageSize,
+                                g.kv_page_size, &count);
+                bind_const<int>(ctx, ord, (uint8_t)bind::KvAppendPaged::NKvHeads,
+                                g.n_kv_heads, &count);
+                break;
+
             case Kernel::Sdpa:
                 bind_const<int>   (ctx, ord, (uint8_t)bind::Sdpa::GqaFactor,   gqa_factor,  &count);
                 bind_const<size_t>(ctx, ord, (uint8_t)bind::Sdpa::KHeadStride, head_stride, &count);
@@ -175,7 +211,28 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 bind_const<float> (ctx, ord, (uint8_t)bind::Sdpa::Scale,       sdpa_scale,  &count);
                 break;
 
-            // No const params: AttnGate, SiluMul, Residual, LayerOut, Argmax.
+            case Kernel::SdpaPaged:
+                bind_const<int>(ctx, ord, (uint8_t)bind::SdpaPaged::GqaFactor, gqa_factor, &count);
+                bind_const<int>(ctx, ord, (uint8_t)bind::SdpaPaged::PageSize,
+                                g.kv_page_size, &count);
+                bind_const<int>(ctx, ord, (uint8_t)bind::SdpaPaged::NKvHeads,
+                                g.n_kv_heads, &count);
+                bind_const<float>(ctx, ord, (uint8_t)bind::SdpaPaged::Scale, sdpa_scale, &count);
+                break;
+
+            case Kernel::AttnGate:
+                bind_const<int>(ctx, ord, (uint8_t)bind::AttnGate::Width,
+                                g.n_q_heads * g.head_dim, &count);
+                break;
+            case Kernel::SiluMul:
+                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width, g.intermediate, &count);
+                break;
+            case Kernel::Residual:
+            case Kernel::LayerOut:
+                bind_const<int>(ctx, ord, (uint8_t)bind::Residual::Width, g.hidden, &count);
+                break;
+
+            // No const params: Argmax.
             default:
                 break;
         }

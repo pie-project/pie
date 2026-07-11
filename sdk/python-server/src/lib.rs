@@ -23,14 +23,11 @@ use pie_worker::engine::{self, EngineHandle as ServeHandle};
 ///
 /// Methods:
 ///   - `url` (str)        — `ws://host:port` the engine is listening on
-///   - `token` (str)      — internal auth token (pass to `pie-client`'s
-///                          `auth_by_token`)
 ///   - `shutdown()`       — blocking, idempotent. Stops drivers + runtime.
 ///   - `is_running()`     — `True` until `shutdown()` returns.
 #[pyclass(name = "EngineHandle")]
 struct PyEngineHandle {
     url: String,
-    token: String,
     /// `(handle, runtime)` together — once `shutdown()` runs, both are
     /// taken to `None`. The runtime has to outlive every subprocess
     /// driver join, which `ServeHandle::shutdown` guarantees.
@@ -42,11 +39,6 @@ impl PyEngineHandle {
     #[getter]
     fn url(&self) -> String {
         self.url.clone()
-    }
-
-    #[getter]
-    fn token(&self) -> String {
-        self.token.clone()
     }
 
     /// True until `shutdown()` returns. Cheap; no blocking.
@@ -112,11 +104,8 @@ fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
             .map_err(|e| PyRuntimeError::new_err(format!("start_engine: {e:#}")))?;
 
         let url = handle.url.clone();
-        let token = handle.token.clone();
-
         Ok(PyEngineHandle {
             url,
-            token,
             inner: Mutex::new(Some((handle, runtime))),
         })
     })

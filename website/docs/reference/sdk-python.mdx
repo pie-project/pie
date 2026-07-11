@@ -445,27 +445,6 @@ from inferlet import session
 
 Signals from `process.signal(...)` arrive through `session.receive`.
 
-### Messaging
-
-```python
-from inferlet import messaging
-```
-
-| Function | Description |
-|---|---|
-| `messaging.broadcast(topic, message)` | Publish to every subscriber. |
-| `messaging.subscribe(topic) -> Subscription` | Open a subscription. |
-| `messaging.push(topic, message)` | Push onto a queue. |
-| `await messaging.pull(topic) -> str` | Wait for the next queued message. |
-
-`Subscription`:
-
-| Method | Description |
-|---|---|
-| `await sub.next() -> str \| None` | Wait for the next broadcast. `None` after unsubscribe. |
-| `sub.unsubscribe()` | Drop the subscription. |
-| `async for msg in sub:` | Async-iterable shorthand. |
-
 ### MCP
 
 ```python

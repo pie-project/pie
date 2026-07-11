@@ -59,7 +59,6 @@ An inferlet runs inside a WASI sandbox with three I/O surfaces:
 
 - **Session.** `session::send` and `session::receive` exchange text and binary payloads with the client that launched the inferlet. The engine streams tokens back through this channel.
 - **WASI HTTP and filesystem.** Inferlets can issue HTTP requests and read files from a sandboxed view. The `wstd` crate exposes `http::Client`, useful for fetching tool outputs, images, or documents inline. See the `image-fetch` inferlet.
-- **Messaging.** `messaging::broadcast` and `messaging::subscribe` exchange messages between inferlets running in the same engine. Useful for coordinating swarms.
 
 These surfaces enable patterns that are awkward when application logic runs outside the engine:
 

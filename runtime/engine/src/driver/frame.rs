@@ -12,11 +12,21 @@ use pie_driver_abi::{
     PieTerminalCellPtrSlice, PieU8Slice, PieU32Slice, PieU64Slice,
 };
 
-use crate::ptir::PtirChannelValue;
 use pie_grammar::brle::RunMask;
 
 pub type ProgramId = u64;
 pub type InstanceId = u64;
+
+/// One channel's initial (seed) value delivered at bind time — `channel` is
+/// the global channel identity, `bytes` its native-encoded wire payload. No
+/// IR semantics live here; this is purely the driver-facing seed-table
+/// entry `InstanceBindingPlan::seed_values` carries, next to the
+/// `LaunchPlan`/`InstanceBindingPlan` it feeds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelValue {
+    pub channel: u64,
+    pub bytes: Vec<u8>,
+}
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct LaunchPlan {
@@ -94,10 +104,30 @@ pub struct RegisteredChannel {
     pub writer_wait_id: u64,
 }
 
-#[derive(Debug)]
+/// Notifies whichever layer owns the channel's native binding that this
+/// endpoint has closed (physically closes/deregisters `channel_id` on the
+/// driver that owns it). A leaf callback type — it names no scheduler
+/// type — installed by whoever registers the channel and therefore already
+/// holds a handle to the owning driver's scheduler
+/// (`scheduler::dispatch::register_channel`); `None` in tests that only
+/// exercise wait/poison semantics and never call [`ChannelEndpoint::new`]
+/// with a closer installed.
+pub type ChannelCloser = Arc<dyn Fn(u64) -> anyhow::Result<()> + Send + Sync>;
+
 pub struct ChannelEndpoint {
     registered: RegisteredChannel,
     closed: AtomicBool,
+    closer: Option<ChannelCloser>,
+}
+
+impl std::fmt::Debug for ChannelEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelEndpoint")
+            .field("registered", &self.registered)
+            .field("closed", &self.closed)
+            .field("closer", &self.closer.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,7 +156,16 @@ impl ChannelEndpoint {
         Self {
             registered,
             closed: AtomicBool::new(false),
+            closer: None,
         }
+    }
+
+    /// Installs the close-notification callback (see [`ChannelCloser`]);
+    /// called by the scheduler dispatch facade, which already holds the
+    /// owning driver's scheduler handle.
+    pub fn with_closer(mut self, closer: ChannelCloser) -> Self {
+        self.closer = Some(closer);
+        self
     }
 
     pub fn registered(&self) -> &RegisteredChannel {
@@ -187,8 +226,8 @@ impl ChannelEndpoint {
             self.registered.reader_wait_id,
             self.registered.writer_wait_id,
         ];
-        if let Ok(handle) = crate::driver::scheduler_handle(self.registered.driver_id) {
-            if let Err(error) = handle.close_channel(self.registered.binding.channel_id) {
+        if let Some(closer) = self.closer.as_ref() {
+            if let Err(error) = closer(self.registered.binding.channel_id) {
                 tracing::warn!(
                     channel_id = self.registered.binding.channel_id,
                     ?error,
@@ -217,7 +256,7 @@ pub struct InstanceBindingPlan {
     pub requested_instance_id: InstanceId,
     pub pacing_wait_id: u64,
     pub channel_ids: Vec<u64>,
-    pub seed_values: Vec<PtirChannelValue>,
+    pub seed_values: Vec<ChannelValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -260,7 +260,10 @@ async fn grammar10_distinct_program_accounting_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect setup")?;
-    setup.authenticate("test-user", &None).await.context("auth setup")?;
+    setup
+        .authenticate("test-user", &None)
+        .await
+        .context("auth setup")?;
     for (pkg, manifest) in [
         ("grammar_late", "grammar-late"),
         ("grammar", "grammar"),

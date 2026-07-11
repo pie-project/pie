@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "ptir/ptir_dispatch.hpp"
-#include "ptir/container.hpp"
+#include "pie_native/ptir/container.hpp"
 
 using pie_cuda_driver::ptir::PtirDispatch;
 
@@ -89,10 +89,10 @@ int main() {
     if (!expect(rc == PIE_STATUS_OK, err.c_str())) return 1;
 
     std::vector<std::uint64_t> channel_ids(2);
-    pie_cuda_driver::ptir::container::Container container;
-    pie_cuda_driver::ptir::container::DecodeError decode_error;
+    pie_native::ptir::container::Container container;
+    pie_native::ptir::container::DecodeError decode_error;
     if (!expect(
-            pie_cuda_driver::ptir::container::decode(
+            pie_native::ptir::container::decode(
                 bytes.data(), bytes.size(), container, &decode_error),
             decode_error.detail.c_str())) return 1;
     if (!expect(container.channels.size() == channel_ids.size(),

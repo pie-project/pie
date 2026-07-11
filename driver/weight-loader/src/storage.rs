@@ -220,12 +220,15 @@ impl StorageProgram {
                     s.bulk_extent_write_count += 1;
                     s.bulk_extent_write_bytes += source.span_bytes;
                 }
-                StorageInstr::SlabScatter { placements, span_bytes, .. } => {
+                StorageInstr::SlabScatter {
+                    placements,
+                    span_bytes,
+                    ..
+                } => {
                     s.slab_scatter_count += 1;
                     s.slab_scatter_placement_count += placements.len();
                     s.slab_scatter_span_bytes += span_bytes;
-                    s.slab_scatter_payload_bytes +=
-                        placements.iter().map(|p| p.bytes).sum::<u64>();
+                    s.slab_scatter_payload_bytes += placements.iter().map(|p| p.bytes).sum::<u64>();
                 }
                 StorageInstr::TileMap { .. } => s.tile_map_count += 1,
                 StorageInstr::CreateView { .. } => s.create_view_count += 1,

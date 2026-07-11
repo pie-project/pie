@@ -28,7 +28,7 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
-#include "ptir/op_table.hpp"
+#include "pie_native/ptir/op_table.hpp"
 
 namespace pie_cuda_driver::ptir {
 

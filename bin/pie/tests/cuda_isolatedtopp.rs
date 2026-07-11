@@ -49,8 +49,14 @@ async fn isolatedtopp_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
-    client.add_program(&wasm, &manifest, true).await.context("add_program")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
+    client
+        .add_program(&wasm, &manifest, true)
+        .await
+        .context("add_program")?;
 
     let mut proc = client
         .launch_process("isolatedtopp@0.1.0".to_string(), "{}".to_string(), true)
@@ -62,7 +68,11 @@ async fn isolatedtopp_on_real_driver() -> Result<()> {
     let lb = json.find('[').context("no [")?;
     let rb = json[lb..].find(']').map(|i| lb + i).context("no ]")?;
     let inner = json[lb + 1..rb].trim();
-    let n = if inner.is_empty() { 0 } else { inner.split(',').count() };
+    let n = if inner.is_empty() {
+        0
+    } else {
+        inner.split(',').count()
+    };
     eprintln!("[isolatedtopp] seed={seed:?} n_tokens={n} tokens=[{inner}]");
     anyhow::ensure!(n == 4, "expected 4 tokens, got {n}");
 
@@ -71,7 +81,10 @@ async fn isolatedtopp_on_real_driver() -> Result<()> {
     // extract→FlashInfer path must reproduce the pre-migration FlashInfer
     // tokens. A drift (wrong vocab, wrong-key params, wrong dispatch) trips this.
     if seed == "12345" {
-        let toks: Vec<u32> = inner.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let toks: Vec<u32> = inner
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
         anyhow::ensure!(
             toks == [2025, 304, 272, 481],
             "isolated top-p token-identity regression: seed=12345 expected \

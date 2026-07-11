@@ -32,8 +32,8 @@ use crate::{client_server, lifecycle, weights};
 pub use crate::link::topology::{Coordinator, TopologyMode, connect};
 pub use crate::preflight::calculate_topology;
 
-/// Live engine — drivers, RPC dispatch threads, the bootstrapped
-/// runtime token, and enough state to perform an orderly shutdown.
+/// Live engine — drivers, RPC dispatch threads, and enough state to perform an
+/// orderly shutdown.
 /// Returned from [`start_engine`]; consumed by either
 /// [`EngineHandle::wait_then_shutdown`] (the `pie serve` path) or
 /// [`EngineHandle::shutdown`] (the `pie serve --monitor` path, where
@@ -91,8 +91,6 @@ pub struct EngineHandle {
     /// client (distributed) or the embedded controller handle + in-proc gateway
     /// task (single-node feature). `None` in gateway-free single-node.
     control_plane: ClusterControl,
-    /// Bootstrapped engine internal auth token.
-    pub token: String,
     /// Client endpoint this worker advertises: `ws://host:port` in single-node
     /// (direct client server, or the in-proc gateway), or `gateway://addr[,…]`
     /// in distributed (the gateway endpoint(s) the worker dialed into — clients
@@ -178,11 +176,6 @@ impl WorkerHandle {
     /// the `gateway://…` endpoint(s) it dialed into in distributed mode).
     pub fn url(&self) -> &str {
         &self.engine.url
-    }
-
-    /// The bootstrapped engine auth token.
-    pub fn token(&self) -> &str {
-        &self.engine.token
     }
 
     /// Drain in-flight work and stop the engine (runtime, control loops, edge).
@@ -302,7 +295,7 @@ pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtim
 }
 
 /// Create native drivers, bootstrap the runtime, and return the registration
-/// caps plus runtime auth token. Shared by every engine entry point.
+/// caps plus the runtime handle. Shared by every engine entry point.
 async fn boot_engine(
     user_cfg: &config::Config,
 ) -> Result<(
@@ -392,16 +385,14 @@ pub async fn start_engine(
     coordinator: Coordinator,
 ) -> Result<EngineHandle> {
     let (model, caps, runtime) = boot_engine(&user_cfg).await?;
-    let token = runtime.token.clone();
     let (edge_server, control_tasks, control_plane, url) =
         assemble_control_and_edge(coordinator, &user_cfg, model, caps).await?;
-    log_serving(&user_cfg, &url, &token);
+    log_serving(&user_cfg, &url);
     Ok(EngineHandle {
         url,
         edge_server,
         control_tasks,
         control_plane,
-        token,
         runtime: Some(runtime),
     })
 }
@@ -416,29 +407,26 @@ pub async fn start_engine_embedded<C: ControlLink>(
     gateways: Vec<String>,
 ) -> Result<EngineHandle> {
     let (model, caps, runtime) = boot_engine(&user_cfg).await?;
-    let token = runtime.token.clone();
     let addr = topology::addr_from_host_port(&user_cfg.server.host, user_cfg.server.port);
     // A single-node-monolithic worker serves all stages; routing doesn't filter
     // by role yet, so Decode is an inert default (echo owns Role::Monolithic).
     let (edge_server, control_tasks, worker_id) =
         assemble_distributed(control, &gateways, Role::Decode, model, addr, caps).await?;
     let url = edge_server.url();
-    log_serving(&user_cfg, &url, &token);
+    log_serving(&user_cfg, &url);
     Ok(EngineHandle {
         url,
         edge_server,
         control_tasks,
         control_plane: ClusterControl::Embedded { worker_id },
-        token,
         runtime: Some(runtime),
     })
 }
 
-/// Print the startup banner + token when `server.verbose` is set.
-fn log_serving(cfg: &config::Config, url: &str, token: &str) {
+/// Print the startup banner when `server.verbose` is set.
+fn log_serving(cfg: &config::Config, url: &str) {
     if cfg.server.verbose {
         eprintln!("{}", StartupBanner::from_config(cfg).render(url));
-        eprintln!("internal token: {token}");
     }
 }
 

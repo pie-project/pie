@@ -59,7 +59,8 @@ struct StderrCapture {
 impl StderrCapture {
     fn start(tag: &str) -> Result<Self> {
         use std::io::Write;
-        let path = std::env::temp_dir().join(format!("mbatch34_{}_{}.log", tag, std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mbatch34_{}_{}.log", tag, std::process::id()));
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -74,7 +75,11 @@ impl StderrCapture {
         let rc = unsafe { libc::dup2(file.as_raw_fd(), 2) };
         anyhow::ensure!(rc >= 0, "dup2(file, stderr) failed");
         drop(file);
-        Ok(Self { saved: Some(saved), path, tag: tag.to_string() })
+        Ok(Self {
+            saved: Some(saved),
+            path,
+            tag: tag.to_string(),
+        })
     }
 
     fn restore(&mut self) {
@@ -121,7 +126,9 @@ async fn launch_cobatch(
         let c = Client::connect_with_identity(&format!("ws://{listen_addr}/v1/ws"), "test-user")
             .await
             .context("connect proc session")?;
-        c.authenticate("test-user", &None).await.context("auth proc session")?;
+        c.authenticate("test-user", &None)
+            .await
+            .context("auth proc session")?;
         let p = c
             .launch_process(program.clone(), input.clone(), true)
             .await
@@ -149,7 +156,9 @@ fn max_mbatch_group_n(trace: &str) -> u32 {
         .filter_map(|l| {
             let s = l.find("mbatch group n=")? + "mbatch group n=".len();
             let rest = &l[s..];
-            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
             rest[..end].parse::<u32>().ok()
         })
         .max()
@@ -204,10 +213,16 @@ async fn mbatch34_num_rows_n_occupancy_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect setup")?;
-    setup.authenticate("test-user", &None).await.context("auth setup")?;
+    setup
+        .authenticate("test-user", &None)
+        .await
+        .context("auth setup")?;
     let wasm = ws.join("target/wasm32-wasip2/debug/grammarmb.wasm");
     let man = ws.join("grammarmb/Pie.toml");
-    setup.add_program(&wasm, &man, true).await.context("add_program grammarmb")?;
+    setup
+        .add_program(&wasm, &man, true)
+        .await
+        .context("add_program grammarmb")?;
     eprintln!("[mbatch34] grammarmb installed");
 
     let reqs: Vec<(String, String)> = ALPHABETS

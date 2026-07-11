@@ -25,7 +25,9 @@ template <typename T>
     const device T* gate [[buffer(0)]],   // [intermediate]
     const device T* up   [[buffer(1)]],   // [intermediate]
     device T* out        [[buffer(2)]],   // [intermediate]
+    const constant int& width [[buffer(3)]],
     uint tid [[thread_position_in_grid]]) {
+  (void)width;
   T g   = gate[tid];
   T sg  = sigmoid_mlx(g);                  // sigmoid(gate), rounded to T
   T sil = T(float(g) * float(sg));         // silu(gate) = gate*sigmoid(gate), round
@@ -35,7 +37,7 @@ template <typename T>
 #define instantiate_silu_mul(name, itype)                         \
   template [[host_name("silu_mul_" #name)]]                       \
   [[kernel]] void silu_mul<itype>(                                \
-      const device itype*, const device itype*, device itype*, uint);
+      const device itype*, const device itype*, device itype*, const constant int&, uint);
 
 instantiate_silu_mul(float32, float)
 instantiate_silu_mul(float16, half)

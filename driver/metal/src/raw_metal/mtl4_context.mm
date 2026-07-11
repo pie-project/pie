@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <atomic>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace pie_metal_driver::raw_metal {
 
@@ -61,6 +63,15 @@ struct RawMetalContext::Impl {
 
     NSMutableArray*           retained = nil;  // keeps PSOs / sub-buffers alive
     NSMutableDictionary*      argtables = nil;  // NSNumber(argkey) -> id<MTL4ArgumentTable>
+    std::unordered_set<uint64_t> bound_arg_slots;
+    std::unordered_map<uint64_t, uint64_t> bound_arg_addresses;
+
+    // Phase 3 (review item 4): standalone-buffer allocation accounting (the
+    // paged-KV pool buffers only, NOT heap sub-allocations). Kept exact by
+    // create_standalone_buffer / release_standalone_buffer so a lifecycle
+    // probe can prove grow/shrink does not leak.
+    size_t standalone_count = 0;
+    size_t standalone_bytes = 0;
 
     StepState step;  // active step (during run_step)
 
@@ -234,6 +245,56 @@ SlotHandle RawMetalContext::heap_alloc(size_t size, size_t align) {
     return h;
 }
 
+SlotHandle RawMetalContext::create_standalone_buffer(size_t size) {
+    auto& I = *impl_;
+    SlotHandle h;
+    if (size == 0) return h;
+    id<MTLBuffer> buf = [I.dev newBufferWithLength:size options:MTLResourceStorageModeShared];
+    if (buf == nil) {
+        fprintf(stderr, "[raw_metal] standalone buffer alloc failed (%zu bytes)\n", size);
+        return h;
+    }
+    [I.retained addObject:buf];  // keep it alive until release_standalone_buffer
+    // Incremental residency: safe to add + commit MORE allocations after the
+    // initial make_resident() (Metal 4's MTLResidencySet supports growing the
+    // set across its lifetime, not just a one-time build).
+    [I.rs addAllocation:buf];
+    [I.rs commit];
+    if (I.resident) [I.rs requestResidency];
+    I.standalone_count += 1;
+    I.standalone_bytes += size;
+
+    h.buffer       = (__bridge void*)buf;
+    h.contents_ptr = buf.contents;
+    h.gpu_address  = buf.gpuAddress;
+    h.offset       = 0;
+    h.size         = size;
+    return h;
+}
+
+void RawMetalContext::release_standalone_buffer(const SlotHandle& h) {
+    auto& I = *impl_;
+    if (h.buffer == nullptr) return;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)h.buffer;
+    // Drop from residency first, then from the retained-alive array so ARC can
+    // free the allocation. removeObject uses pointer identity here (same buf).
+    [I.rs removeAllocation:buf];
+    [I.rs commit];
+    if (I.resident) [I.rs requestResidency];
+    const NSUInteger before = I.retained.count;
+    [I.retained removeObject:buf];
+    if (I.retained.count < before) {
+        // Only adjust accounting when we actually owned it (idempotent /
+        // defensive against a double-release or a foreign handle).
+        I.standalone_count -= (I.standalone_count > 0 ? 1 : 0);
+        I.standalone_bytes -= (I.standalone_bytes >= h.size ? h.size : I.standalone_bytes);
+    }
+}
+
+size_t RawMetalContext::standalone_buffer_count() const { return impl_->standalone_count; }
+size_t RawMetalContext::standalone_bytes() const { return impl_->standalone_bytes; }
+
+
 void RawMetalContext::make_resident() {
     auto& I = *impl_;
     if (!I.resident) {
@@ -256,6 +317,20 @@ void RawMetalContext::arg_bind_ordinal(int ordinal, uint8_t bind_index, SlotHand
     id<MTL4ArgumentTable> t = I.argtable_for(ordinal, /*create=*/true);
     if (t == nil) return;
     [t setAddress:(slot.gpu_address + offset) atIndex:bind_index];
+    const uint64_t key = (uint64_t(uint32_t(ordinal)) << 8) | bind_index;
+    I.bound_arg_slots.insert(key);
+    I.bound_arg_addresses[key] = slot.gpu_address + offset;
+}
+
+bool RawMetalContext::arg_slot_is_bound(int ordinal, uint8_t bind_index) const {
+    const auto key = (uint64_t(uint32_t(ordinal)) << 8) | bind_index;
+    return impl_->bound_arg_slots.find(key) != impl_->bound_arg_slots.end();
+}
+
+uint64_t RawMetalContext::arg_slot_address(int ordinal, uint8_t bind_index) const {
+    const auto key = (uint64_t(uint32_t(ordinal)) << 8) | bind_index;
+    const auto it = impl_->bound_arg_addresses.find(key);
+    return it == impl_->bound_arg_addresses.end() ? 0 : it->second;
 }
 
 Pso RawMetalContext::compile_pso(const std::string& src, const std::string& fn,

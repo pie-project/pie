@@ -277,7 +277,7 @@ async def cli_pie_client(args: argparse.Namespace):
     startup_lines: list[str] = []
     server_lines: list[str] = startup_lines
     drain_task: asyncio.Task[None] | None = None
-    token: str | None = None
+    server_ready = False
     server_log_file = None
     if server_log_path := os.environ.get("PIE_BENCH_SERVER_LOG"):
         path = Path(server_log_path)
@@ -352,16 +352,15 @@ async def cli_pie_client(args: argparse.Namespace):
             if should_surface_server_line(text):
                 sys.stderr.write(text)
                 sys.stderr.flush()
-            marker = "internal token: "
-            if marker in text:
-                token = text.split(marker, 1)[1].strip()
+            if "Server ready at ws://" in text:
+                server_ready = True
                 break
             if proc.returncode is not None:
                 raise RuntimeError(
                     f"pie serve exited with {proc.returncode}:\n"
                     + "".join(startup_lines[-80:])
                 )
-        if token is None:
+        if not server_ready:
             raise TimeoutError(
                 "timed out waiting for pie serve startup:\n" + "".join(startup_lines[-80:])
             )
@@ -369,7 +368,6 @@ async def cli_pie_client(args: argparse.Namespace):
         drain_task = asyncio.create_task(drain_stdout())
         client = PieClient(f"ws://127.0.0.1:{cfg.server.port}")
         await client.connect()
-        await client.auth_by_token(token)
         try:
             yield client, {**engine_config, "pie_bin": str(pie_bin)}
         finally:

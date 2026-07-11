@@ -32,9 +32,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::CompileError;
 use crate::source::{CheckpointFile, CheckpointMetadata, RawTensor};
-use crate::types::{
-    CheckpointFormat, DType, Encoding, FileId, Layout, TensorId, tensor_nbytes,
-};
+use crate::types::{CheckpointFormat, DType, Encoding, FileId, Layout, TensorId, tensor_nbytes};
 
 /// Width of the safetensors little-endian header-length prefix.
 pub(crate) const SAFETENSORS_LEN_PREFIX: usize = 8;
@@ -237,12 +235,14 @@ pub fn tensors_from_safetensors_entries(
                 )));
             }
         }
-        let file_offset = data_section_offset.checked_add(entry.begin).ok_or_else(|| {
-            CompileError::InvalidInput(format!(
-                "safetensors tensor {} file offset overflows",
-                entry.name
-            ))
-        })?;
+        let file_offset = data_section_offset
+            .checked_add(entry.begin)
+            .ok_or_else(|| {
+                CompileError::InvalidInput(format!(
+                    "safetensors tensor {} file offset overflows",
+                    entry.name
+                ))
+            })?;
         let id = id_base.checked_add(index as u32).ok_or_else(|| {
             CompileError::InvalidInput("safetensors tensor id space overflows u32".to_string())
         })?;
@@ -354,9 +354,7 @@ mod tests {
     #[test]
     fn parses_single_dense_tensor() {
         // 2x3 F16 = 12 bytes.
-        let prefix = framed(
-            r#"{"w":{"dtype":"F16","shape":[2,3],"data_offsets":[0,12]}}"#,
-        );
+        let prefix = framed(r#"{"w":{"dtype":"F16","shape":[2,3],"data_offsets":[0,12]}}"#);
         let (header_size, entries) = parse_safetensors_index(&prefix).unwrap();
         assert_eq!(header_size as usize, prefix.len() - SAFETENSORS_LEN_PREFIX);
         assert_eq!(entries.len(), 1);
@@ -403,9 +401,8 @@ mod tests {
     fn maps_mxfp4_block_dtype_to_u8_without_bytesize_check() {
         // `F4_E2M1` packs two nibbles per byte: shape [16] logical elements are
         // stored in 8 bytes, so the span must not be validated against shape×1.
-        let prefix = framed(
-            r#"{"w_blocks":{"dtype":"F4_E2M1","shape":[16],"data_offsets":[0,8]}}"#,
-        );
+        let prefix =
+            framed(r#"{"w_blocks":{"dtype":"F4_E2M1","shape":[16],"data_offsets":[0,8]}}"#);
         let (header_size, entries) = parse_safetensors_index(&prefix).unwrap();
         let dso = SAFETENSORS_LEN_PREFIX as u64 + header_size;
         let tensors = tensors_from_safetensors_entries(&entries, FileId(0), dso, 0).unwrap();
@@ -438,9 +435,7 @@ mod tests {
     #[test]
     fn rejects_byte_size_mismatch() {
         // 2x3 F16 should be 12 bytes; declare 8.
-        let prefix = framed(
-            r#"{"w":{"dtype":"F16","shape":[2,3],"data_offsets":[0,8]}}"#,
-        );
+        let prefix = framed(r#"{"w":{"dtype":"F16","shape":[2,3],"data_offsets":[0,8]}}"#);
         let (_, entries) = parse_safetensors_index(&prefix).unwrap();
         let err = tensors_from_safetensors_entries(&entries, FileId(0), 8, 0).unwrap_err();
         assert!(format!("{err}").contains("mismatch"), "got: {err}");
@@ -449,17 +444,13 @@ mod tests {
     #[test]
     fn rejects_short_prefix_and_bad_offsets() {
         assert!(parse_safetensors_index(&[0u8; 4]).is_err());
-        let prefix = framed(
-            r#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[8,4]}}"#,
-        );
+        let prefix = framed(r#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[8,4]}}"#);
         assert!(parse_safetensors_index(&prefix).is_err());
     }
 
     #[test]
     fn reads_header_prefix_from_file_without_bulk() {
-        let prefix = framed(
-            r#"{"w":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#,
-        );
+        let prefix = framed(r#"{"w":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#);
         // Append fake bulk bytes the parser must never need.
         let mut file_bytes = prefix.clone();
         file_bytes.extend_from_slice(&[0xEEu8; 8]);

@@ -18,7 +18,6 @@ from test_agent_react import test_agent_react
 from test_agent_codeact import test_agent_codeact
 from test_image_fetch import test_image_fetch
 from test_prefix_tree import test_prefix_tree
-from test_agent_swarm import test_agent_swarm
 from test_output_validation import test_output_validation
 from test_constrained_decoding import test_constrained_decoding
 from test_watermarking import test_watermarking
@@ -55,7 +54,6 @@ ALL_TESTS = [
     test_image_fetch,
     # Tier 3: Low-level APIs
     test_prefix_tree,
-    test_agent_swarm,
     test_output_validation,
     test_constrained_decoding,
     test_json_schema_validation,

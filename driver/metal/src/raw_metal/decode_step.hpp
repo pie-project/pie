@@ -28,7 +28,7 @@
 namespace pie_metal_driver::raw_metal {
 
 // Number of Kernel kinds (for PSO-by-kind table sizing).
-inline constexpr int kKernelKindCount = static_cast<int>(Kernel::Argmax) + 1;
+inline constexpr int kKernelKindCount = static_cast<int>(Kernel::GdnPrepSlotted) + 1;
 
 // One emitted dispatch in the per-token DAG.
 struct Dispatch {

@@ -38,7 +38,10 @@ use pie_client::client::Client;
 async fn attention_sink_on_real_driver() -> Result<()> {
     common::init_trace();
     let pie = common::boot_4090().await?;
-    eprintln!("[attention-sink-e2e] booted, listen_addr={}", pie.listen_addr);
+    eprintln!(
+        "[attention-sink-e2e] booted, listen_addr={}",
+        pie.listen_addr
+    );
 
     // Build the `attention-sink` inferlet to wasm. It is a standalone crate
     // (excluded from the host workspace), so build in its own dir. The crate name
@@ -58,8 +61,14 @@ async fn attention_sink_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
-    client.add_program(&wasm, &manifest, true).await.context("add_program")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
+    client
+        .add_program(&wasm, &manifest, true)
+        .await
+        .context("add_program")?;
     eprintln!("[attention-sink-e2e] program installed, launching sink decode…");
 
     // Small sink + window + a few tokens: the decode passes quickly exceed

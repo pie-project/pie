@@ -1,9 +1,7 @@
 //! Unit tests for the KV mapping trie, hashes, pool, and KvStore protocol.
 
 use super::hash::{self, Hash256};
-use super::page_table::{
-    KvPageTable, KvTableError, PhysicalKvPageId, PublishedPage, WorkingSetId,
-};
+use super::page_table::{KvPageTable, KvTableError, PhysicalKvPageId, PublishedPage, WorkingSetId};
 use super::write::{PageCommit, PreparedTarget};
 use super::{KvStore, KvStoreError};
 use crate::store::pool::Pool;
@@ -437,8 +435,7 @@ fn path_hash_invalidates_on_in_place_extension() {
     publish(&mut t, ws, 3..5); // in place: same node, longer contribution
     let h5 = t.terminal_path_hash(ws).unwrap().unwrap();
     assert_ne!(h3, h5);
-    let expected =
-        hash::fold_path_hash(None, &(0..5).map(h).collect::<Vec<_>>()).unwrap();
+    let expected = hash::fold_path_hash(None, &(0..5).map(h).collect::<Vec<_>>()).unwrap();
     assert_eq!(h5, expected);
 }
 
@@ -517,16 +514,16 @@ fn store_fresh_append_roundtrip() {
     store.reserve(ws, 3).unwrap();
     let prepared = store.prepare_write(ws, &[0, 1, 2]).unwrap();
     assert_eq!(prepared.targets().len(), 3);
-    assert!(prepared
-        .targets()
-        .iter()
-        .all(|t| matches!(t, PreparedTarget::Fresh { .. })));
+    assert!(
+        prepared
+            .targets()
+            .iter()
+            .all(|t| matches!(t, PreparedTarget::Fresh { .. }))
+    );
     assert_eq!(prepared.copy_plan().count(), 0);
     assert_eq!(store.available_pages(), 5);
     let ids: Vec<PhysicalKvPageId> = prepared.targets().iter().map(|t| t.dst()).collect();
-    store
-        .commit(prepared, &[pc(0), pc(1), pc(2)], 1)
-        .unwrap();
+    store.commit(prepared, &[pc(0), pc(1), pc(2)], 1).unwrap();
     assert_eq!(store.mapped_len(ws).unwrap(), 3);
     for (i, id) in ids.iter().enumerate() {
         assert_eq!(store.lookup(ws, i as u64).unwrap(), *id);
@@ -604,10 +601,12 @@ fn store_shared_write_inside_the_tail_joins_the_rebase() {
     // though unwritten, because the mapping edit is a growth-boundary rebase.
     let prepared = store.prepare_write(b, &[1]).unwrap();
     assert_eq!(prepared.targets().len(), 2);
-    assert!(prepared
-        .targets()
-        .iter()
-        .all(|t| matches!(t, PreparedTarget::Cow { .. })));
+    assert!(
+        prepared
+            .targets()
+            .iter()
+            .all(|t| matches!(t, PreparedTarget::Cow { .. }))
+    );
     store.commit(prepared, &[pc(20), pc(21)], 2).unwrap();
     assert_eq!(store.lookup(b, 0).unwrap(), a_ids[0]);
     assert_ne!(store.lookup(b, 1).unwrap(), a_ids[1]);

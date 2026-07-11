@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use wasmtime::component::{Component, Instance, InstancePre, Linker as WasmLinker};
 use wasmtime::{Engine, Store};
 
-use crate::api;
+use crate::inferlet::host;
 use crate::service::{Service, ServiceHandler};
 
 use super::process::{OutputMode, ProcessCtx, ProcessId};
@@ -156,9 +156,9 @@ impl Linker {
                 .expect("Failed to add wasi:random insecure-seed rc shim");
             random
                 .func_wrap_async("get-insecure-seed", |_store, (): ()| {
-                    Box::new(async move {
-                        Ok(((0x9e37_79b9_7f4a_7c15u64, 0xbf58_476d_1ce4_e5b9u64),))
-                    })
+                    Box::new(
+                        async move { Ok(((0x9e37_79b9_7f4a_7c15u64, 0xbf58_476d_1ce4_e5b9u64),)) },
+                    )
                 })
                 .expect("Failed to shim get-insecure-seed");
         }
@@ -176,7 +176,7 @@ impl Linker {
                 .expect("Failed to link WASI HTTP");
         }
 
-        api::add_to_linker(&mut linker)?;
+        host::add_to_linker(&mut linker)?;
 
         // Register shared core modules (e.g. CPython interpreter) so Python
         // inferlets can dynamically import the runtime instead of bundling it.

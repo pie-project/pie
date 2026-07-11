@@ -33,7 +33,7 @@ use core::fmt;
 
 use super::registry::{Phase, Stage};
 use super::validate::{BoundTrace, ChannelClass, Direction};
-use crate::types::{DType, Shape, ValueType, MAX_RANK};
+use crate::types::{DType, MAX_RANK, Shape, ValueType};
 
 /// Sidecar magic: ASCII `"PTIB"` (PTIR bound/typed).
 pub const PTIB_MAGIC: [u8; 4] = *b"PTIB";
@@ -157,7 +157,12 @@ pub fn decode_bound(bytes: &[u8]) -> Result<BoundSidecar, SidecarDecodeError> {
             0 => ChannelClass::FullRing,
             1 => ChannelClass::InPlace,
             2 => ChannelClass::InPlaceUndo,
-            t => return Err(UnknownTag { what: "channel class", tag: t }),
+            t => {
+                return Err(UnknownTag {
+                    what: "channel class",
+                    tag: t,
+                });
+            }
         });
     }
     let n_rd = r.u32()? as usize;
@@ -168,7 +173,12 @@ pub fn decode_bound(bytes: &[u8]) -> Result<BoundSidecar, SidecarDecodeError> {
         let dir = match r.u8()? {
             0 => Direction::NeedsFull,
             1 => Direction::NeedsEmpty,
-            t => return Err(UnknownTag { what: "direction", tag: t }),
+            t => {
+                return Err(UnknownTag {
+                    what: "direction",
+                    tag: t,
+                });
+            }
         };
         readiness.push((chan, phase, dir));
     }
@@ -176,7 +186,10 @@ pub fn decode_bound(bytes: &[u8]) -> Result<BoundSidecar, SidecarDecodeError> {
     let mut stage_types = Vec::with_capacity(n_st);
     for _ in 0..n_st {
         let st = r.u8()?;
-        let stage = Stage::from_u8(st).ok_or(UnknownTag { what: "stage", tag: st })?;
+        let stage = Stage::from_u8(st).ok_or(UnknownTag {
+            what: "stage",
+            tag: st,
+        })?;
         let n_vals = r.u32()? as usize;
         let mut types = Vec::with_capacity(n_vals);
         for _ in 0..n_vals {
@@ -186,7 +199,12 @@ pub fn decode_bound(bytes: &[u8]) -> Result<BoundSidecar, SidecarDecodeError> {
                 1 => DType::I32,
                 2 => DType::U32,
                 3 => DType::Bool,
-                t => return Err(UnknownTag { what: "dtype", tag: t }),
+                t => {
+                    return Err(UnknownTag {
+                        what: "dtype",
+                        tag: t,
+                    });
+                }
             };
             let rank = r.u8()?;
             if rank as usize > MAX_RANK {
@@ -196,11 +214,19 @@ pub fn decode_bound(bytes: &[u8]) -> Result<BoundSidecar, SidecarDecodeError> {
             for d in dims.iter_mut().take(rank as usize) {
                 *d = r.u32()?;
             }
-            types.push(ValueType::new(Shape::new(&dims[..rank as usize]).unwrap(), dtype));
+            types.push(ValueType::new(
+                Shape::new(&dims[..rank as usize]).unwrap(),
+                dtype,
+            ));
         }
         stage_types.push((stage, types));
     }
-    Ok(BoundSidecar { container_hash, classes, readiness, stage_types })
+    Ok(BoundSidecar {
+        container_hash,
+        classes,
+        readiness,
+        stage_types,
+    })
 }
 
 // Re-exported phase-tag helper for readers: `0xFF` is the descriptor.
@@ -212,13 +238,11 @@ use Phase as _PhaseDocOnly;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{
-        ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer,
-    };
+    use crate::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
     use crate::op::Op;
     use crate::registry::ModelProfile;
-    use crate::validate::bind;
     use crate::types::Literal;
+    use crate::validate::bind;
     use alloc::vec;
 
     #[test]
@@ -242,7 +266,7 @@ mod tests {
                     Op::ChanPut { chan: 0, value: 2 },
                 ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         let b = bind(c, ModelProfile::dummy()).unwrap();
         let bytes = encode_bound(&b);

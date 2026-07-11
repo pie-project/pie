@@ -34,26 +34,34 @@ async fn add_program_completes_on_dummy_driver() -> Result<()> {
     let wasm = ws.join("target/wasm32-wasip2/debug/generate.wasm");
     let manifest = ws.join("generate/Pie.toml");
 
-    let client =
-        tokio::time::timeout(
-            Duration::from_secs(20),
-            Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user"),
-        )
-        .await
-        .context("connect TIMED OUT")?
-        .context("connect")?;
+    let client = tokio::time::timeout(
+        Duration::from_secs(20),
+        Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user"),
+    )
+    .await
+    .context("connect TIMED OUT")?
+    .context("connect")?;
     eprintln!("[diag] connected ✓");
 
-    tokio::time::timeout(Duration::from_secs(20), client.authenticate("test-user", &None))
-        .await
-        .context("authenticate TIMED OUT")?
-        .context("auth")?;
-    eprintln!("[diag] authed ✓; uploading {} bytes…", std::fs::metadata(&wasm)?.len());
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        client.authenticate("test-user", &None),
+    )
+    .await
+    .context("authenticate TIMED OUT")?
+    .context("auth")?;
+    eprintln!(
+        "[diag] authed ✓; uploading {} bytes…",
+        std::fs::metadata(&wasm)?.len()
+    );
 
-    tokio::time::timeout(Duration::from_secs(60), client.add_program(&wasm, &manifest, true))
-        .await
-        .context("add_program TIMED OUT (repro: chunked-upload bridge deadlock)")?
-        .context("add_program failed")?;
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        client.add_program(&wasm, &manifest, true),
+    )
+    .await
+    .context("add_program TIMED OUT (repro: chunked-upload bridge deadlock)")?
+    .context("add_program failed")?;
     eprintln!("[diag] program installed ✓");
 
     pie.shutdown().await;

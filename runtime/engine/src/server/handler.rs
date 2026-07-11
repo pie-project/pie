@@ -6,8 +6,6 @@
 use bytes::Bytes;
 use pie_client::message::ServerMessage;
 
-use crate::inference;
-use crate::messaging;
 use crate::inferlet::process;
 use crate::inferlet::program;
 use crate::inferlet::{Manifest, ProcessId, ProgramName};
@@ -15,6 +13,7 @@ use pie_model as model;
 
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
+use super::inbox;
 
 // =============================================================================
 // Query Handlers
@@ -66,7 +65,7 @@ impl Session {
                     );
 
                     // Inference stats (throughput, latency, batch count)
-                    let inf = inference::get_stats().await;
+                    let inf = crate::scheduler::get_stats().await;
                     stats.insert(
                         format!("{}.total_batches", model_name),
                         serde_json::Value::from(inf.total_batches),
@@ -100,7 +99,7 @@ impl Session {
                         serde_json::Value::from(inf.avg_batch_latency_us),
                     );
                     // Fire-domain probes. Dotted keys mirror the
-                    // `InferenceStats.fire.*` hierarchy. All-zero when the
+                    // `AggregateStats.fire.*` hierarchy. All-zero when the
                     // binary is built without `--features profile-fire`.
                     stats.insert(
                         format!("{}.fire.inter_fire_us", model_name),
@@ -178,51 +177,6 @@ impl Session {
                         format!("{}.fire.quorum.readiness_miss", model_name),
                         serde_json::Value::from(inf.fire.quorum.readiness_miss),
                     );
-                    if let Some(exec) = crate::api::grammar::execute_profile_snapshot() {
-                        let mean_value = |total_us: u64, denom: u64| -> serde_json::Value {
-                            serde_json::Value::from(if denom > 0 { total_us / denom } else { 0 })
-                        };
-                        stats.insert(
-                            format!("{}.execute_profile_calls", model_name),
-                            serde_json::Value::from(exec.calls),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_hits", model_name),
-                            serde_json::Value::from(exec.hits),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_misses", model_name),
-                            serde_json::Value::from(exec.misses),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_total_mean_us", model_name),
-                            mean_value(exec.total_us, exec.calls),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_prepare_mean_us", model_name),
-                            mean_value(exec.prepare_us, exec.calls),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_hit_wait_mean_us", model_name),
-                            mean_value(exec.hit_wait_us, exec.hits),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_cold_prepare_mean_us", model_name),
-                            mean_value(exec.cold_prepare_us, exec.misses),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_pin_mean_us", model_name),
-                            mean_value(exec.pin_us, exec.misses),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_submit_wait_mean_us", model_name),
-                            mean_value(exec.submit_wait_us, exec.misses),
-                        );
-                        stats.insert(
-                            format!("{}.execute_profile_postprocess_mean_us", model_name),
-                            mean_value(exec.postprocess_us, exec.calls),
-                        );
-                    }
                 }
 
                 self.send_response(corr_id, true, serde_json::Value::Object(stats).to_string())
@@ -442,10 +396,25 @@ impl Session {
     }
 
     pub(super) async fn handle_signal_process(&mut self, process_id_str: String, message: String) {
-        if let Some(process_id) = Self::parse_process_id(&process_id_str) {
-            if self.attached_processes.contains(&process_id) {
-                messaging::push(process_id.to_string(), message).unwrap();
-            }
+        let Some(process_id) = Self::parse_process_id(&process_id_str) else {
+            tracing::error!("SignalProcess: invalid process_id {}", process_id_str);
+            return;
+        };
+
+        if !self.attached_processes.contains(&process_id) {
+            tracing::warn!(
+                "SignalProcess: process {} not owned by client",
+                process_id_str
+            );
+            return;
+        }
+
+        if let Err(err) = inbox::send(process_id.to_string(), message) {
+            tracing::error!(
+                process_id = %process_id,
+                error = %err,
+                "SignalProcess delivery failed"
+            );
         }
     }
 
@@ -477,6 +446,43 @@ impl Session {
         process::terminate(process_id, Err("Signal".to_string()));
         self.send_response(corr_id, true, "Process terminated".to_string())
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::server::ServerState;
+
+    #[tokio::test]
+    async fn signal_process_routes_into_process_inbox() {
+        inbox::spawn();
+
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        let mut session = Session::new_inproc(
+            1,
+            Arc::new(ServerState {
+                next_client_id: AtomicU32::new(2),
+                max_upload_bytes: 1024,
+            }),
+            out_tx,
+        );
+        let process_id = Uuid::new_v4();
+        session.attached_processes.push(process_id);
+
+        session
+            .handle_signal_process(process_id.to_string(), "hello".to_string())
+            .await;
+
+        let received = inbox::receive(process_id.to_string()).await.unwrap();
+        assert_eq!(received, "hello");
+        let _ = inbox::clear(process_id.to_string());
     }
 }
 

@@ -953,7 +953,8 @@ endif()
 add_executable(test_ptir_tier0
   tests/ptir_tier0_test.cu)
 target_include_directories(test_ptir_tier0 PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 target_compile_options(test_ptir_tier0 PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(test_ptir_tier0 PRIVATE
@@ -968,6 +969,7 @@ add_executable(test_ptir_runner
   tests/ptir_runner_test.cu)
 target_include_directories(test_ptir_runner PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
   ${PIE_DRIVER_ABI_INCLUDE_DIR})
 target_compile_options(test_ptir_runner PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
@@ -981,7 +983,8 @@ target_link_libraries(test_ptir_runner PRIVATE
 add_executable(test_ptir_container
   tests/ptir_container_test.cpp)
 target_include_directories(test_ptir_container PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 
 # PTIR tier-1 JIT fusion gate (Thrust 3 / charlie, P5). Emits a fused epilogue
 # kernel (src/ptir/tier1_codegen.hpp), NVRTC-compiles + launches it, and asserts
@@ -991,6 +994,7 @@ add_executable(test_ptir_tier1
   tests/ptir_tier1_test.cu)
 target_include_directories(test_ptir_tier1 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
   ${PIE_DRIVER_ABI_INCLUDE_DIR})
 target_compile_options(test_ptir_tier1 PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
@@ -998,14 +1002,16 @@ target_link_libraries(test_ptir_tier1 PRIVATE
   CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
 
 # PTIR cross-backend golden step-exec gate (Thrust 3 / charlie, P4). Decodes
-# echo's ACTUAL golden container bytes + PTIB typed sidecar (src/ptir/bound.hpp),
-# translates to an executable Trace, and runs it through the tier-0 stage-runner
-# with echo's canonical inputs/seeds — matching echo's step/take results
-# byte-for-byte (the golden-model conformance oracle). Needs a GPU.
+# echo's ACTUAL golden container bytes + PTIB typed sidecar
+# (pie_native/ptir/bound.hpp), translates to an executable Trace, and runs it
+# through the tier-0 stage-runner with echo's canonical inputs/seeds —
+# matching echo's step/take results byte-for-byte (the golden-model
+# conformance oracle). Needs a GPU.
 add_executable(test_ptir_golden_exec
   tests/ptir_golden_exec_test.cu)
 target_include_directories(test_ptir_golden_exec PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
   ${PIE_DRIVER_ABI_INCLUDE_DIR})
 target_compile_options(test_ptir_golden_exec PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)

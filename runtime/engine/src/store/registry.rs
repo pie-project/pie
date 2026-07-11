@@ -1,7 +1,7 @@
 //! Per-(model, driver) store registry (kv_refact.md, `store/registry.rs`).
 //!
 //! Maps a model/driver pair to its owning `KvStore` and `RsStore` so
-//! `ptir_host.rs` and the WIT host resources resolve handles without each
+//! `pipeline::fire` and the WIT host resources resolve handles without each
 //! component holding a direct store reference. Mirrors the retired
 //! `arena::registry` shape: an append-only static keyed by `model_idx`
 //! (lock-step with bootstrap model registration), each entry a `Vec` indexed
@@ -37,11 +37,7 @@ static REGISTRY: LazyLock<boxcar::Vec<Vec<Stores>>> = LazyLock::new(boxcar::Vec:
 
 /// Register a model's per-driver stores at bootstrap. Capacities come from
 /// the driver-preallocated static pools. Returns the assigned model index.
-pub fn register_model(
-    kv_page_size: u32,
-    num_kv_pages: &[usize],
-    num_rs_slots: &[usize],
-) -> usize {
+pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_rs_slots: &[usize]) -> usize {
     let stores: Vec<Stores> = (0..num_kv_pages.len())
         .map(|d| Stores {
             kv: Arc::new(Mutex::new(KvStore::new(

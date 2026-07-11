@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use pie_engine::driver::{
     DriverSpec, LaunchPlan, NativeDriver, SchedulerLimits, register_native_driver,
 };
-use pie_engine::inference::scheduler::BatchScheduler;
+use pie_engine::scheduler::worker::BatchScheduler;
 
 /// Launch observer for harness probes, wired onto the dummy driver's launch
 /// path via [`launch_observer`]: it sees every accepted launch's forward

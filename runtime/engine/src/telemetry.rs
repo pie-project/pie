@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 
 /// All metric instruments for the Pie runtime
+#[allow(dead_code)] // scaffolded for scheduler/store call sites not yet wired to record these.
 pub struct Metrics {
     // Scheduler metrics
     pub scheduler_arrival_rate: Gauge<f64>,
@@ -111,6 +112,7 @@ impl Metrics {
 
 /// Get a reference to the global metrics.
 /// Returns None if metrics have not been initialized.
+#[allow(dead_code)] // scaffolded for scheduler/store call sites not yet wired to record these.
 pub fn metrics() -> Option<&'static Metrics> {
     METRICS.get()
 }
@@ -229,6 +231,7 @@ where
 }
 
 /// Shutdown OpenTelemetry, flushing any pending spans and metrics.
+#[allow(dead_code)] // scaffolded for a graceful-shutdown call site not yet wired.
 pub fn shutdown() {
     if METRICS.get().is_some() {
         opentelemetry::global::shutdown_tracer_provider();

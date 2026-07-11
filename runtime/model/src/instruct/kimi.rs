@@ -1,8 +1,6 @@
 //! Kimi K2/K2.5 instruct implementation.
 
-use crate::instruct::decoders::{
-    GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder,
-};
+use crate::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;

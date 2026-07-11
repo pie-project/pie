@@ -174,8 +174,8 @@ async def launch_server(args: argparse.Namespace):
         return (" WARN " in txt or " ERROR " in txt or "panic" in txt
                 or "[vtim]" in txt or "[fire]" in txt)
 
-    # Read startup until the auth token line appears.
-    token: str | None = None
+    # Read startup until the direct client server is ready.
+    server_ready = False
     deadline = time.perf_counter() + args.server_startup_timeout
     assert proc.stdout is not None
     while time.perf_counter() < deadline:
@@ -192,12 +192,12 @@ async def launch_server(args: argparse.Namespace):
         if surface(txt):
             sys.stderr.write(txt)
             sys.stderr.flush()
-        if "internal token: " in txt:
-            token = txt.split("internal token: ", 1)[1].strip()
+        if "Server ready at ws://" in txt:
+            server_ready = True
             break
         if proc.returncode is not None:
             raise RuntimeError(f"pie serve exited {proc.returncode}:\n" + "".join(lines[-60:]))
-    if token is None:
+    if not server_ready:
         raise TimeoutError("timed out waiting for pie serve startup:\n" + "".join(lines[-60:]))
 
     async def drain() -> None:
@@ -214,7 +214,7 @@ async def launch_server(args: argparse.Namespace):
                 sys.stderr.flush()
 
     drain_task = asyncio.create_task(drain())
-    return proc, port, token, drain_task, config_blob
+    return proc, port, drain_task, config_blob
 
 
 async def run(args: argparse.Namespace):
@@ -240,14 +240,13 @@ async def run(args: argparse.Namespace):
         }
 
     wasm, manifest, pkg = bench_inferlet_paths()
-    proc, port, token, drain_task, config_blob = await launch_server(args)
+    proc, port, drain_task, config_blob = await launch_server(args)
     first_text: list[str | None] = [None]
     sem = asyncio.Semaphore(args.concurrency) if (args.mode == "tput" and args.concurrency > 0) else None
 
     try:
         client = PieClient(f"ws://127.0.0.1:{port}")
         await client.connect()
-        await client.auth_by_token(token)
         try:
             await client.install_program(wasm, manifest, force_overwrite=True)
 

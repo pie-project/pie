@@ -35,7 +35,7 @@ struct BoundDecode {
     std::vector<KvSlots> kv;          // size n_layers; GDN entries unused
 
     // IO region (I1 per-token buffers + I3 logits). Indexed by IoSlot.
-    SlotHandle io[5];
+    SlotHandle io[kIoSlotCount];
 
     // device-argmax substrate (I3; allocated always, bound + read only when with_argmax):
     // argmax_params = ArgmaxParams const (vocab + inline EOS ids; Shared, runtime-writable),

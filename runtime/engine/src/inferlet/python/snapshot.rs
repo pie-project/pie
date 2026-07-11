@@ -112,10 +112,10 @@ use {
     },
 };
 
-use crate::api;
+use crate::inferlet::InstancePolicy;
+use crate::inferlet::host;
 use crate::inferlet::linker::dynamic;
 use crate::inferlet::process::{OutputMode, ProcessCtx};
-use crate::inferlet::InstancePolicy;
 
 use super::runtime as py_runtime;
 
@@ -1304,7 +1304,7 @@ pub(crate) async fn snapshot_from_bytes(
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
         .expect("Failed to link WASI HTTP");
-    api::add_to_linker(&mut linker)?;
+    host::add_to_linker(&mut linker)?;
 
     // Use FULL shared modules for snapshot creation: CPython must initialize
     // from scratch so the snapshot captures the post-init state. Stripped

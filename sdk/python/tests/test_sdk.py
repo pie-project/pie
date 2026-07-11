@@ -275,50 +275,13 @@ class TestForwardExecuteAsync:
 
 
 class TestAsyncIO:
-    """`messaging.pull` / `session.receive*` are also P3 async imports."""
-
-    def test_messaging_pull(self):
-        import asyncio
-
-        from inferlet import messaging
-        assert asyncio.run(messaging.pull("topic")) == "pulled"
+    """`session.receive*` are P3 async imports."""
 
     def test_session_receive(self):
         import asyncio
 
         from inferlet import session
         assert asyncio.run(session.receive()) == "received"
-
-
-class TestSubscription:
-    """`messaging.subscribe` returns a P3 `stream<string>`; the `Subscription`
-    wrapper async-iterates it (read-chunk + buffer), not the old pollable."""
-
-    def test_async_iteration_drains_stream(self):
-        import asyncio
-
-        from inferlet import messaging
-
-        async def run():
-            collected = []
-            with messaging.subscribe("events") as sub:
-                async for msg in sub:
-                    collected.append(msg)
-            return collected
-
-        assert asyncio.run(run()) == ["msg1", "msg2"]
-
-    def test_next_returns_none_when_stream_closed(self):
-        import asyncio
-
-        from inferlet import messaging
-
-        async def run():
-            sub = messaging.subscribe("events")
-            return [await sub.next(), await sub.next(), await sub.next()]
-
-        # Two messages then a clean end-of-stream sentinel.
-        assert asyncio.run(run()) == ["msg1", "msg2", None]
 
 
 # =============================================================================
@@ -545,7 +508,7 @@ class TestGrammar:
 
 
 # =============================================================================
-# Runtime / messaging / session — unchanged from before
+# Runtime / session — unchanged from before
 # =============================================================================
 
 
@@ -553,12 +516,6 @@ class TestRuntime:
     def test_version(self):
         from inferlet import runtime
         assert runtime.version() == "0.1.0-mock"
-
-
-class TestMessaging:
-    def test_push(self):
-        from inferlet import messaging
-        messaging.push("topic", "msg")
 
 
 class TestSession:

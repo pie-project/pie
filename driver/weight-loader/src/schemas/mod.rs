@@ -29,7 +29,14 @@ static GPT_OSS_SCHEMA: GenericSchema = GenericSchema {
     names: &["gpt_oss", "gpt-oss", "gptoss"],
 };
 static KIMI_DEEPSEEK_SCHEMA: GenericSchema = GenericSchema {
-    names: &["kimi", "kimi_k2", "kimi_k25", "deepseek_v2", "deepseek_v3", "deepseek_v4"],
+    names: &[
+        "kimi",
+        "kimi_k2",
+        "kimi_k25",
+        "deepseek_v2",
+        "deepseek_v3",
+        "deepseek_v4",
+    ],
 };
 static BUILTIN_SCHEMAS: &[&dyn ModelSchema] = &[
     &LLAMA_SCHEMA,

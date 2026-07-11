@@ -120,7 +120,9 @@ impl StderrCapture {
     fn finish(mut self) -> String {
         self.restore();
         let content = std::fs::read_to_string(&self.path).unwrap_or_default();
-        eprintln!("---- captured engine stderr (gate-1 R=2) ----\n{content}\n---- end captured stderr ----");
+        eprintln!(
+            "---- captured engine stderr (gate-1 R=2) ----\n{content}\n---- end captured stderr ----"
+        );
         let _ = std::fs::remove_file(&self.path);
         content
     }
@@ -167,7 +169,8 @@ async fn grammar_r2_merge_survival_on_real_driver() -> Result<()> {
         std::env::set_var("PIE_SCHED_TRACE", "1");
         std::env::set_var("PIE_SAMPLING_IR_TRACE", "1");
     }
-    let hold_us = std::env::var("PIE_SCHED_ACCUM_HOLD_US").unwrap_or_else(|_| ACCUM_HOLD_US.to_string());
+    let hold_us =
+        std::env::var("PIE_SCHED_ACCUM_HOLD_US").unwrap_or_else(|_| ACCUM_HOLD_US.to_string());
     common::init_trace();
 
     // Build the (alphabet-parameterized) grammar-late inferlet to wasm BEFORE the
@@ -255,7 +258,11 @@ async fn grammar_r2_merge_survival_on_real_driver() -> Result<()> {
 
     let captured = cap.finish();
     let results = run?;
-    anyhow::ensure!(results.len() == 2, "expected 2 proc results, got {}", results.len());
+    anyhow::ensure!(
+        results.len() == 2,
+        "expected 2 proc results, got {}",
+        results.len()
+    );
 
     // ── Witness 1 (load-bearing): the MERGE actually happened. ────────────────
     // `[pie-sched-trace] … fire requests=2` ⇒ the hold coalesced the two procs'
@@ -296,7 +303,9 @@ async fn grammar_r2_merge_survival_on_real_driver() -> Result<()> {
         .with_context(|| format!("parse tok_A from proc 0 result: {}", results[0]))?;
     let tok_b = first_token(&results[1])
         .with_context(|| format!("parse tok_B from proc 1 result: {}", results[1]))?;
-    eprintln!("[grammar-r2] tok_A[0]={tok_a} (∈{ALPHABET_A:?}?) tok_B[0]={tok_b} (∈{ALPHABET_B:?}?)");
+    eprintln!(
+        "[grammar-r2] tok_A[0]={tok_a} (∈{ALPHABET_A:?}?) tok_B[0]={tok_b} (∈{ALPHABET_B:?}?)"
+    );
     anyhow::ensure!(
         ALPHABET_A.contains(&tok_a),
         "tok_A[0]={tok_a} not in alphabet A {ALPHABET_A:?} — proc A masked wrong"

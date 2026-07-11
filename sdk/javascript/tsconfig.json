@@ -28,9 +28,6 @@
       "pie:core/runtime": [
         "./src/bindings/interfaces/pie-core-runtime.js"
       ],
-      "pie:core/messaging": [
-        "./src/bindings/interfaces/pie-core-messaging.js"
-      ],
       "pie:core/session": [
         "./src/bindings/interfaces/pie-core-session.js"
       ],

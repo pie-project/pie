@@ -4,7 +4,7 @@
 
 #include "entry.hpp"
 #include "entry_validation.hpp"
-#include "ptir/fire_geometry.hpp"
+#include "pie_native/ptir/fire_geometry.hpp"
 
 namespace {
 
@@ -281,7 +281,7 @@ int main() {
                     PIE_STATUS_INVALID_ARGUMENT,
                 "Gemma4 launch requires two positions per patch")) return 1;
 
-    pie_cuda_driver::ptir::FireGeometry geometry;
+    pie_native::ptir::FireGeometry geometry;
     geometry.token_ids = {1};
     geometry.position_ids = {0};
     geometry.qo_indptr = {0, 1};
@@ -294,11 +294,11 @@ int main() {
     geometry.w_off = {0};
     geometry.has_kv_family = true;
     geometry.has_write_desc = true;
-    if (!expect(pie_cuda_driver::ptir::validate_fire_geometry(
+    if (!expect(pie_native::ptir::validate_fire_geometry(
                     geometry, 4, 16),
                 "resolved device geometry accepts valid descriptor")) return 1;
     geometry.w_page[0] = 4;
-    if (!expect(!pie_cuda_driver::ptir::validate_fire_geometry(
+    if (!expect(!pie_native::ptir::validate_fire_geometry(
                     geometry, 4, 16),
                 "resolved device geometry rejects out-of-range write")) return 1;
     geometry.w_page[0] = 0;
@@ -307,7 +307,7 @@ int main() {
     geometry.qo_indptr[1] = 2;
     geometry.w_page.push_back(0);
     geometry.w_off.push_back(1);
-    if (!expect(!pie_cuda_driver::ptir::validate_fire_geometry(
+    if (!expect(!pie_native::ptir::validate_fire_geometry(
                     geometry, 4, 16),
                 "resolved device geometry rejects short KV extent")) return 1;
 

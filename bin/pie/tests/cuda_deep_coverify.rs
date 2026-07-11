@@ -130,7 +130,10 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect setup")?;
-    setup.authenticate("test-user", &None).await.context("auth setup")?;
+    setup
+        .authenticate("test-user", &None)
+        .await
+        .context("auth setup")?;
     setup
         .add_program(&wasm, &manifest, true)
         .await
@@ -145,7 +148,9 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
             Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
                 .await
                 .context("connect fleet")?;
-        c.authenticate("test-user", &None).await.context("auth fleet")?;
+        c.authenticate("test-user", &None)
+            .await
+            .context("auth fleet")?;
         let proc = c
             .launch_process(prog.clone(), input.clone(), true)
             .await
@@ -175,7 +180,7 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
     eprintln!("[deep-coverify] fleet done: {n_match}/{FLEET} pipelines DEEP-k byte-identical");
 
     // Read the wait-for-all wave gauges in-process (the engine ran here).
-    let stats = pie_engine::inference::get_stats().await;
+    let stats = pie_engine::scheduler::get_stats().await;
     pie.shutdown().await;
 
     let total_batches = stats.total_batches;
@@ -186,7 +191,9 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
         0.0
     };
     let q = &stats.fire.quorum;
-    eprintln!("═══════════ piece-2 co-verify — deep pre-submission × wait-for-all (cap={k}) ═══════════");
+    eprintln!(
+        "═══════════ piece-2 co-verify — deep pre-submission × wait-for-all (cap={k}) ═══════════"
+    );
     eprintln!(
         "  fleet={FLEET}  depth(k)={k}  total_batches={total_batches}  total_requests={total_requests}  mean_batch={mean_batch:.2}"
     );
@@ -211,7 +218,9 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
         "  post_dispatch_to_fire_us (avg) = {}   (host round-trip — the carrier's target)",
         stats.fire.avg_post_dispatch_to_fire_us
     );
-    eprintln!("═══════════════════════════════════════════════════════════════════════════════════════");
+    eprintln!(
+        "═══════════════════════════════════════════════════════════════════════════════════════"
+    );
 
     // ── Gate 1: DEEP-k byte-identity (ALWAYS hard) ──────────────────────────
     // The scheduler chain-stash + the carrier must produce the exact greedy

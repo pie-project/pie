@@ -15,9 +15,18 @@
 //!
 //! WIT resource wiring (`store/kv/working_set.rs`) and CAS/CacheFabric
 //! integration (`store/kv/cas.rs`) land in later increments.
+//!
+//! Complete typed-store API (kv_refact.md): some methods here are not yet
+//! called by the live single-model fire path (only a subset of the typed
+//! store surface is currently wired) but are exercised by this module's
+//! own unit test suite and reserved for upcoming increments (contention/
+//! reclaim expansion, RS buffer-write paths, etc.) — kept rather than
+//! deleted, allowed rather than silently masked.
+#![allow(dead_code)]
 
 pub mod hash;
 pub mod page_table;
+pub mod project;
 pub mod working_set;
 pub mod write;
 
@@ -174,7 +183,11 @@ impl KvStore {
         let old_mapped = self.table.mapped_len(ws)?;
         let removed: u64 = ranges
             .iter()
-            .map(|r| r.end.min(old_mapped).saturating_sub(r.start.min(old_mapped)))
+            .map(|r| {
+                r.end
+                    .min(old_mapped)
+                    .saturating_sub(r.start.min(old_mapped))
+            })
             .sum();
         let new_mapped = old_mapped - removed;
         let prefix_intact = ranges
@@ -500,7 +513,10 @@ impl KvStore {
             self.flat.entry(ws).or_default().cache = Some(flat);
         }
         let entry = self.flat.get(&ws).expect("just populated");
-        Ok((entry.version, entry.cache.as_deref().expect("just populated")))
+        Ok((
+            entry.version,
+            entry.cache.as_deref().expect("just populated"),
+        ))
     }
 
     fn invalidate_flat(&mut self, ws: WorkingSetId) {
@@ -562,7 +578,10 @@ impl KvStore {
             return Ok(0);
         }
         let hashes = self.table.page_token_hashes(ws, mapped - 1)?;
-        let last = hashes.iter().rposition(|h| h.is_some()).map_or(0, |i| i + 1);
+        let last = hashes
+            .iter()
+            .rposition(|h| h.is_some())
+            .map_or(0, |i| i + 1);
         Ok((mapped - 1) * page_size as u64 + last as u64)
     }
 

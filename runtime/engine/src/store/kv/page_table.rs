@@ -19,6 +19,14 @@
 //! the growth boundary of some WorkingSet mapping, and everything below a
 //! selection is created after it. Pre-existing shared nodes are never
 //! re-parented, so an interior discard on a shared path is rejected.
+//!
+//! Complete typed-store API (kv_refact.md): some methods here are not yet
+//! called by the live single-model fire path (only a subset of the typed
+//! store surface is currently wired) but are exercised by this module's
+//! own unit test suite and reserved for upcoming increments (contention/
+//! reclaim expansion, RS buffer-write paths, etc.) — kept rather than
+//! deleted, allowed rather than silently masked.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -122,7 +130,9 @@ pub enum KvTableError {
         mapped_len: u64,
         page_len: u64,
     },
-    #[error("publishing {count} pages exceeds the reservation (mapped {mapped_len}, page_len {page_len})")]
+    #[error(
+        "publishing {count} pages exceeds the reservation (mapped {mapped_len}, page_len {page_len})"
+    )]
     PublishExceedsReservation {
         count: u64,
         mapped_len: u64,
@@ -433,11 +443,8 @@ impl KvPageTable {
         let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
 
         // Normalize: sort descending by start, merge overlaps, validate.
-        let mut norm: Vec<Range<u64>> = ranges
-            .iter()
-            .filter(|r| r.start < r.end)
-            .cloned()
-            .collect();
+        let mut norm: Vec<Range<u64>> =
+            ranges.iter().filter(|r| r.start < r.end).cloned().collect();
         norm.sort_by_key(|r| r.start);
         let mut merged: Vec<Range<u64>> = Vec::with_capacity(norm.len());
         for r in norm {
@@ -479,11 +486,7 @@ impl KvPageTable {
     // Lookup
     // ------------------------------------------------------------------
 
-    pub fn lookup(
-        &self,
-        ws: WorkingSetId,
-        index: u64,
-    ) -> Result<PhysicalKvPageId, KvTableError> {
+    pub fn lookup(&self, ws: WorkingSetId, index: u64) -> Result<PhysicalKvPageId, KvTableError> {
         let entry = self.entry(ws)?;
         if index >= entry.page_len {
             return Err(KvTableError::IndexOutOfRange {
@@ -609,11 +612,7 @@ impl KvPageTable {
 
     /// Locate the owning node + node-local index of the page at `index` (CAS
     /// index bookkeeping).
-    pub fn locate_page(
-        &self,
-        ws: WorkingSetId,
-        index: u64,
-    ) -> Result<(NodeId, u64), KvTableError> {
+    pub fn locate_page(&self, ws: WorkingSetId, index: u64) -> Result<(NodeId, u64), KvTableError> {
         let entry = self.entry(ws)?;
         if index >= entry.mapped_len {
             return Err(KvTableError::Unwritten {
@@ -741,7 +740,10 @@ impl KvPageTable {
     /// hashes from the trie root through the terminal's contribution,
     /// independent of node boundaries. `None` when any contributing page hash
     /// is not yet valid (or the path is empty). Lazily computed and cached.
-    pub fn terminal_path_hash(&mut self, ws: WorkingSetId) -> Result<Option<Hash256>, KvTableError> {
+    pub fn terminal_path_hash(
+        &mut self,
+        ws: WorkingSetId,
+    ) -> Result<Option<Hash256>, KvTableError> {
         let terminal = self.entry(ws)?.terminal;
         Ok(match terminal {
             Some(node) => self.node_path_hash(node),
@@ -1082,8 +1084,10 @@ impl KvPageTable {
                 .map(|s| s.node)
                 .collect();
             if self.is_private_to(ws, &affected) {
-                let removed_below =
-                    (m.end as i64).min(sim_term_start).saturating_sub(m.start as i64).max(0);
+                let removed_below = (m.end as i64)
+                    .min(sim_term_start)
+                    .saturating_sub(m.start as i64)
+                    .max(0);
                 sim_term_start -= removed_below;
                 sim_mapped -= m_len;
             } else if (m.start as i64) >= sim_term_start {

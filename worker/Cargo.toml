@@ -29,7 +29,8 @@ driver-metal = ["dep:pie-weight-loader", "pie-engine/driver-metal"]
 driver-dummy = []
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
-# corresponding flag. See `pie/src/probe/` for the catalog of domains.
+# corresponding flag. See `runtime/engine/src/scheduler/probe.rs` for the
+# catalog of domains.
 profile-fire = ["pie-engine/profile-fire"]
 profile-hot-path = ["pie-engine/profile-hot-path"]
 profile-all = ["pie-engine/profile-all"]
@@ -41,6 +42,7 @@ profile-all = ["pie-engine/profile-all"]
 # bundled into the `pie-driver-bridge` wheel via maturin), not in the
 # runtime crate itself.
 pie-engine = { path = "../runtime/engine" }
+pie-bootstrap = { path = "../bootstrap" }
 # Shared tarpc control-plane contract.
 pie-controller-rpc = { path = "../interface/controller" }
 # Gateway data-plane RPC contract (post-inversion M3): GatewayInbound +

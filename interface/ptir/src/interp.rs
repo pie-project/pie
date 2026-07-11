@@ -159,7 +159,10 @@ pub enum HostError {
 pub enum StepError {
     Poisoned,
     /// A second-party kernel faulted; the instance is now poisoned.
-    KernelFault { name: String, message: String },
+    KernelFault {
+        name: String,
+        message: String,
+    },
     /// Missing per-pass intrinsic input (harness error, not program error).
     MissingIntrinsic(IntrinsicId),
     /// Internal evaluation fault (should be unreachable on a bound trace);
@@ -283,7 +286,10 @@ impl Instance {
             }
             channels.push(Chan::Local(st));
         }
-        Ok(Instance { channels, poisoned: false })
+        Ok(Instance {
+            channels,
+            poisoned: false,
+        })
     }
 
     /// Run `f` against channel `i`'s ring (locking a shared extern ring).
@@ -320,7 +326,11 @@ impl Instance {
         if self.poisoned {
             return Err(HostError::Poisoned);
         }
-        let decl = bound.container.channels.get(chan as usize).ok_or(HostError::BadIndex)?;
+        let decl = bound
+            .container
+            .channels
+            .get(chan as usize)
+            .ok_or(HostError::BadIndex)?;
         if decl.host_role != HostRole::Writer {
             return Err(HostError::NotHostChannel);
         }
@@ -340,7 +350,11 @@ impl Instance {
         if self.poisoned {
             return Err(HostError::Poisoned);
         }
-        let decl = bound.container.channels.get(chan as usize).ok_or(HostError::BadIndex)?;
+        let decl = bound
+            .container
+            .channels
+            .get(chan as usize)
+            .ok_or(HostError::BadIndex)?;
         if decl.host_role != HostRole::Reader {
             return Err(HostError::NotHostChannel);
         }
@@ -357,7 +371,11 @@ impl Instance {
         if self.poisoned {
             return Err(HostError::Poisoned);
         }
-        let decl = bound.container.channels.get(chan as usize).ok_or(HostError::BadIndex)?;
+        let decl = bound
+            .container
+            .channels
+            .get(chan as usize)
+            .ok_or(HostError::BadIndex)?;
         if decl.host_role != HostRole::Reader {
             return Err(HostError::NotHostChannel);
         }
@@ -424,7 +442,9 @@ impl Instance {
             };
             let ops = &bound.container.stages[si].ops;
             let types = &bound.stage_types[si];
-            exec_body(this, bound, ov, sinks, ops, types, stage, layer, inputs, host)
+            exec_body(
+                this, bound, ov, sinks, ops, types, stage, layer, inputs, host,
+            )
         };
 
         run(self, &mut ov, &mut sinks, Stage::Prologue, 0, host)?;
@@ -446,8 +466,16 @@ impl Instance {
 
         // Per-layer taps, layer by layer (forward anatomy).
         let layers = bound.profile.num_layers;
-        let has_proj = bound.container.stages.iter().any(|s| s.stage == Stage::OnAttnProj);
-        let has_attn = bound.container.stages.iter().any(|s| s.stage == Stage::OnAttn);
+        let has_proj = bound
+            .container
+            .stages
+            .iter()
+            .any(|s| s.stage == Stage::OnAttnProj);
+        let has_attn = bound
+            .container
+            .stages
+            .iter()
+            .any(|s| s.stage == Stage::OnAttn);
         if has_proj || has_attn {
             for l in 0..layers {
                 run(self, &mut ov, &mut sinks, Stage::OnAttnProj, l, host)?;
@@ -492,7 +520,12 @@ impl Instance {
             }
         }
 
-        Ok(StepReport { committed, missed, descriptor, sinks })
+        Ok(StepReport {
+            committed,
+            missed,
+            descriptor,
+            sinks,
+        })
     }
 }
 
@@ -537,13 +570,22 @@ fn const_value(dtype: DType, shape: Shape, data: &[u8]) -> Value {
     match dtype {
         DType::Bool => Value::Bool(data.iter().take(n).map(|&b| b != 0).collect()),
         DType::F32 => Value::F32(
-            data.chunks_exact(4).take(n).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            data.chunks_exact(4)
+                .take(n)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
         ),
         DType::I32 => Value::I32(
-            data.chunks_exact(4).take(n).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            data.chunks_exact(4)
+                .take(n)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
         ),
         DType::U32 => Value::U32(
-            data.chunks_exact(4).take(n).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            data.chunks_exact(4)
+                .take(n)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
         ),
     }
 }
@@ -603,7 +645,10 @@ fn exec_body(
                     }
                     Err(message) => {
                         inst.poisoned = true;
-                        return Err(StepError::KernelFault { name: n.into(), message });
+                        return Err(StepError::KernelFault {
+                            name: n.into(),
+                            message,
+                        });
                     }
                 }
             }
@@ -624,8 +669,15 @@ enum Evaled {
     One(Value),
     Two(Value, Value),
     Chan(ChanEffect),
-    Sink { name: u16, args: Vec<ValueId> },
-    Kernel { name: u16, args: Vec<ValueId>, result: ValueType },
+    Sink {
+        name: u16,
+        args: Vec<ValueId>,
+    },
+    Kernel {
+        name: u16,
+        args: Vec<ValueId>,
+        result: ValueType,
+    },
 }
 
 // ── value helpers (dtype-exact, unlike the PSIR f32 evaluator) ─────────────
@@ -662,27 +714,56 @@ fn pick(len: usize, i: usize) -> usize {
 }
 
 /// Elementwise binary, exact in the operands' common dtype.
-fn bin_arith(a: &Value, b: &Value, dtype: DType, f_f: impl Fn(f32, f32) -> f32, f_i: impl Fn(i64, i64) -> i64) -> Value {
+fn bin_arith(
+    a: &Value,
+    b: &Value,
+    dtype: DType,
+    f_f: impl Fn(f32, f32) -> f32,
+    f_i: impl Fn(i64, i64) -> i64,
+) -> Value {
     if dtype == DType::F32 {
         let (av, bv) = (lanes_f32(a), lanes_f32(b));
         let n = av.len().max(bv.len());
-        Value::F32((0..n).map(|i| f_f(av[pick(av.len(), i)], bv[pick(bv.len(), i)])).collect())
+        Value::F32(
+            (0..n)
+                .map(|i| f_f(av[pick(av.len(), i)], bv[pick(bv.len(), i)]))
+                .collect(),
+        )
     } else {
         let (av, bv) = (lanes_i64(a), lanes_i64(b));
         let n = av.len().max(bv.len());
-        from_i64(dtype, (0..n).map(|i| f_i(av[pick(av.len(), i)], bv[pick(bv.len(), i)])).collect())
+        from_i64(
+            dtype,
+            (0..n)
+                .map(|i| f_i(av[pick(av.len(), i)], bv[pick(bv.len(), i)]))
+                .collect(),
+        )
     }
 }
 
-fn cmp_op(a: &Value, b: &Value, in_dtype: DType, f_f: impl Fn(f32, f32) -> bool, f_i: impl Fn(i64, i64) -> bool) -> Value {
+fn cmp_op(
+    a: &Value,
+    b: &Value,
+    in_dtype: DType,
+    f_f: impl Fn(f32, f32) -> bool,
+    f_i: impl Fn(i64, i64) -> bool,
+) -> Value {
     if in_dtype == DType::F32 {
         let (av, bv) = (lanes_f32(a), lanes_f32(b));
         let n = av.len().max(bv.len());
-        Value::Bool((0..n).map(|i| f_f(av[pick(av.len(), i)], bv[pick(bv.len(), i)])).collect())
+        Value::Bool(
+            (0..n)
+                .map(|i| f_f(av[pick(av.len(), i)], bv[pick(bv.len(), i)]))
+                .collect(),
+        )
     } else {
         let (av, bv) = (lanes_i64(a), lanes_i64(b));
         let n = av.len().max(bv.len());
-        Value::Bool((0..n).map(|i| f_i(av[pick(av.len(), i)], bv[pick(bv.len(), i)])).collect())
+        Value::Bool(
+            (0..n)
+                .map(|i| f_i(av[pick(av.len(), i)], bv[pick(bv.len(), i)]))
+                .collect(),
+        )
     }
 }
 
@@ -759,7 +840,17 @@ fn eval_op(
         }),
         Op::Sign(a) => One(match v(a) {
             Value::F32(x) => Value::F32(
-                x.iter().map(|&a| if a > 0.0 { 1.0 } else if a < 0.0 { -1.0 } else { 0.0 }).collect(),
+                x.iter()
+                    .map(|&a| {
+                        if a > 0.0 {
+                            1.0
+                        } else if a < 0.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect(),
             ),
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.signum()).collect()),
             Value::U32(x) => Value::U32(x.iter().map(|&a| (a != 0) as u32).collect()),
@@ -784,9 +875,27 @@ fn eval_op(
             DType::Bool => Value::Bool(lanes_f32(v(value)).iter().map(|&x| x != 0.0).collect()),
         }),
 
-        Op::Add(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, |x, y| x + y, |x, y| x.wrapping_add(y))),
-        Op::Sub(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, |x, y| x - y, |x, y| x.wrapping_sub(y))),
-        Op::Mul(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, |x, y| x * y, |x, y| x.wrapping_mul(y))),
+        Op::Add(a, b) => One(bin_arith(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            |x, y| x + y,
+            |x, y| x.wrapping_add(y),
+        )),
+        Op::Sub(a, b) => One(bin_arith(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            |x, y| x - y,
+            |x, y| x.wrapping_sub(y),
+        )),
+        Op::Mul(a, b) => One(bin_arith(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            |x, y| x * y,
+            |x, y| x.wrapping_mul(y),
+        )),
         Op::Div(a, b) => One(bin_arith(
             v(a),
             v(b),
@@ -794,8 +903,12 @@ fn eval_op(
             |x, y| x / y,
             |x, y| if y == 0 { 0 } else { x.wrapping_div(y) },
         )),
-        Op::MaxElem(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, f32::max, |x, y| x.max(y))),
-        Op::MinElem(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, f32::min, |x, y| x.min(y))),
+        Op::MaxElem(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, f32::max, |x, y| {
+            x.max(y)
+        })),
+        Op::MinElem(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, f32::min, |x, y| {
+            x.min(y)
+        })),
         Op::Rem(a, b) => One(bin_arith(
             v(a),
             v(b),
@@ -804,12 +917,48 @@ fn eval_op(
             |x, y| if y == 0 { 0 } else { x.wrapping_rem(y) },
         )),
 
-        Op::Gt(a, b) => One(cmp_op(v(a), v(b), ty_of(a).dtype, |x, y| x > y, |x, y| x > y)),
-        Op::Ge(a, b) => One(cmp_op(v(a), v(b), ty_of(a).dtype, |x, y| x >= y, |x, y| x >= y)),
-        Op::Eq(a, b) => One(cmp_op(v(a), v(b), ty_of(a).dtype, |x, y| x == y, |x, y| x == y)),
-        Op::Ne(a, b) => One(cmp_op(v(a), v(b), ty_of(a).dtype, |x, y| x != y, |x, y| x != y)),
-        Op::Lt(a, b) => One(cmp_op(v(a), v(b), ty_of(a).dtype, |x, y| x < y, |x, y| x < y)),
-        Op::Le(a, b) => One(cmp_op(v(a), v(b), ty_of(a).dtype, |x, y| x <= y, |x, y| x <= y)),
+        Op::Gt(a, b) => One(cmp_op(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            |x, y| x > y,
+            |x, y| x > y,
+        )),
+        Op::Ge(a, b) => One(cmp_op(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            |x, y| x >= y,
+            |x, y| x >= y,
+        )),
+        Op::Eq(a, b) => One(cmp_op(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            |x, y| x == y,
+            |x, y| x == y,
+        )),
+        Op::Ne(a, b) => One(cmp_op(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            |x, y| x != y,
+            |x, y| x != y,
+        )),
+        Op::Lt(a, b) => One(cmp_op(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            |x, y| x < y,
+            |x, y| x < y,
+        )),
+        Op::Le(a, b) => One(cmp_op(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            |x, y| x <= y,
+            |x, y| x <= y,
+        )),
         Op::And(a, b) | Op::Or(a, b) => {
             let (Value::Bool(x), Value::Bool(y)) = (v(a), v(b)) else {
                 return Err(fault("and/or on non-bool".into()));
@@ -826,29 +975,64 @@ fn eval_op(
             ))
         }
         Op::Not(a) => {
-            let Value::Bool(x) = v(a) else { return Err(fault("not on non-bool".into())) };
+            let Value::Bool(x) = v(a) else {
+                return Err(fault("not on non-bool".into()));
+            };
             One(Value::Bool(x.iter().map(|&b| !b).collect()))
         }
 
         Op::Select { cond, a, b } => {
-            let Value::Bool(c) = v(cond) else { return Err(fault("select cond".into())) };
+            let Value::Bool(c) = v(cond) else {
+                return Err(fault("select cond".into()));
+            };
             let (av, bv) = (v(a), v(b));
             let n = c.len().max(av.len()).max(bv.len());
             let sel = |i: usize| c[pick(c.len(), i)];
             One(match ty_of(a).dtype {
                 DType::F32 => {
                     let (x, y) = (lanes_f32(av), lanes_f32(bv));
-                    Value::F32((0..n).map(|i| if sel(i) { x[pick(x.len(), i)] } else { y[pick(y.len(), i)] }).collect())
+                    Value::F32(
+                        (0..n)
+                            .map(|i| {
+                                if sel(i) {
+                                    x[pick(x.len(), i)]
+                                } else {
+                                    y[pick(y.len(), i)]
+                                }
+                            })
+                            .collect(),
+                    )
                 }
                 DType::Bool => {
                     let (Value::Bool(x), Value::Bool(y)) = (av, bv) else {
                         return Err(fault("select bool arms".into()));
                     };
-                    Value::Bool((0..n).map(|i| if sel(i) { x[pick(x.len(), i)] } else { y[pick(y.len(), i)] }).collect())
+                    Value::Bool(
+                        (0..n)
+                            .map(|i| {
+                                if sel(i) {
+                                    x[pick(x.len(), i)]
+                                } else {
+                                    y[pick(y.len(), i)]
+                                }
+                            })
+                            .collect(),
+                    )
                 }
                 d => {
                     let (x, y) = (lanes_i64(av), lanes_i64(bv));
-                    from_i64(d, (0..n).map(|i| if sel(i) { x[pick(x.len(), i)] } else { y[pick(y.len(), i)] }).collect())
+                    from_i64(
+                        d,
+                        (0..n)
+                            .map(|i| {
+                                if sel(i) {
+                                    x[pick(x.len(), i)]
+                                } else {
+                                    y[pick(y.len(), i)]
+                                }
+                            })
+                            .collect(),
+                    )
                 }
             })
         }
@@ -865,7 +1049,9 @@ fn eval_op(
                     Op::ReduceMax(_) => |r| r.iter().copied().fold(f32::NEG_INFINITY, f32::max),
                     _ => |r| r.iter().copied().fold(f32::INFINITY, f32::min),
                 };
-                One(Value::F32((0..rows).map(|r| f(&x[r * len..(r + 1) * len])).collect()))
+                One(Value::F32(
+                    (0..rows).map(|r| f(&x[r * len..(r + 1) * len])).collect(),
+                ))
             } else {
                 let x = lanes_i64(data);
                 let f: fn(&[i64]) -> i64 = match op {
@@ -873,7 +1059,10 @@ fn eval_op(
                     Op::ReduceMax(_) => |r| r.iter().copied().max().unwrap_or(0),
                     _ => |r| r.iter().copied().min().unwrap_or(0),
                 };
-                One(from_i64(t.dtype, (0..rows).map(|r| f(&x[r * len..(r + 1) * len])).collect()))
+                One(from_i64(
+                    t.dtype,
+                    (0..rows).map(|r| f(&x[r * len..(r + 1) * len])).collect(),
+                ))
             }
         }
         Op::ReduceArgmax(a) => {
@@ -881,7 +1070,11 @@ fn eval_op(
             let rows = rows_of(t.shape);
             let x = lanes_f32(v(a));
             let len = if rows == 0 { 0 } else { x.len() / rows };
-            One(Value::I32((0..rows).map(|r| argmax_row(&x[r * len..(r + 1) * len])).collect()))
+            One(Value::I32(
+                (0..rows)
+                    .map(|r| argmax_row(&x[r * len..(r + 1) * len]))
+                    .collect(),
+            ))
         }
 
         Op::Broadcast { value, shape } => {
@@ -891,7 +1084,9 @@ fn eval_op(
         Op::Reshape { value, .. } => One(v(value).clone()), // metadata only (row-major)
         Op::Transpose(a) => {
             let t = ty_of(a);
-            let [m, n] = *t.shape.dims() else { return Err(fault("transpose rank".into())) };
+            let [m, n] = *t.shape.dims() else {
+                return Err(fault("transpose rank".into()));
+            };
             let (m, n) = (m as usize, n as usize);
             let idx: Vec<usize> = (0..m * n).map(|o| (o % m) * n + o / m).collect();
             One(gather_flat(v(a), &idx))
@@ -940,8 +1135,12 @@ fn eval_op(
         }
         Op::MatMul(a, b) => {
             let (ta, tb) = (ty_of(a), ty_of(b));
-            let [m, kk] = *ta.shape.dims() else { return Err(fault("matmul a".into())) };
-            let [_, n] = *tb.shape.dims() else { return Err(fault("matmul b".into())) };
+            let [m, kk] = *ta.shape.dims() else {
+                return Err(fault("matmul a".into()));
+            };
+            let [_, n] = *tb.shape.dims() else {
+                return Err(fault("matmul b".into()));
+            };
             let (m, kk, n) = (m as usize, kk as usize, n as usize);
             let (x, y) = (lanes_f32(v(a)), lanes_f32(v(b)));
             let mut out = vec![0.0f32; m * n];
@@ -1005,7 +1204,11 @@ fn eval_op(
 
         Op::Gather { src, idx } => {
             let ts = ty_of(src);
-            let rest: usize = ts.shape.dims()[1..].iter().map(|&d| d as usize).product::<usize>().max(1);
+            let rest: usize = ts.shape.dims()[1..]
+                .iter()
+                .map(|&d| d as usize)
+                .product::<usize>()
+                .max(1);
             let n0 = ts.shape.dims()[0] as usize;
             let ix = lanes_i64(v(idx));
             let mut flat = Vec::with_capacity(ix.len() * rest);
@@ -1021,32 +1224,56 @@ fn eval_op(
         }
         Op::GatherRow { src, idx } => {
             let ts = ty_of(src);
-            let [m, n] = *ts.shape.dims() else { return Err(fault("gather_row".into())) };
+            let [m, n] = *ts.shape.dims() else {
+                return Err(fault("gather_row".into()));
+            };
             let (m, n) = (m as usize, n as usize);
             let ix = lanes_i64(v(idx));
             let flat: Vec<usize> = (0..m)
                 .map(|i| {
                     let c = ix[i];
-                    if c >= 0 && (c as usize) < n { i * n + c as usize } else { usize::MAX }
+                    if c >= 0 && (c as usize) < n {
+                        i * n + c as usize
+                    } else {
+                        usize::MAX
+                    }
                 })
                 .collect();
             One(gather_flat_fill0(v(src), &flat))
         }
-        Op::ScatterAdd { base, idx, vals: vv } | Op::ScatterSet { base, idx, vals: vv } => {
+        Op::ScatterAdd {
+            base,
+            idx,
+            vals: vv,
+        }
+        | Op::ScatterSet {
+            base,
+            idx,
+            vals: vv,
+        } => {
             let tb = ty_of(base);
-            let rest: usize = tb.shape.dims()[1..].iter().map(|&d| d as usize).product::<usize>().max(1);
+            let rest: usize = tb.shape.dims()[1..]
+                .iter()
+                .map(|&d| d as usize)
+                .product::<usize>()
+                .max(1);
             let n0 = tb.shape.dims()[0] as usize;
             let ix = lanes_i64(v(idx));
             let val = v(vv);
             let scalar_val = val.len() == 1 && ix.len() * rest != 1;
             let is_add = matches!(op, Op::ScatterAdd { .. });
-            if tb.dtype == DType::F32 || is_add && tb.dtype != DType::I32 && tb.dtype != DType::U32 {
+            if tb.dtype == DType::F32 || is_add && tb.dtype != DType::I32 && tb.dtype != DType::U32
+            {
                 let mut out = lanes_f32(v(base));
                 let vals_f = lanes_f32(val);
                 for (k, &i) in ix.iter().enumerate() {
                     if i >= 0 && (i as usize) < n0 {
                         for r in 0..rest {
-                            let src = if scalar_val { vals_f[0] } else { vals_f[k * rest + r] };
+                            let src = if scalar_val {
+                                vals_f[0]
+                            } else {
+                                vals_f[k * rest + r]
+                            };
                             let dst = &mut out[i as usize * rest + r];
                             if is_add { *dst += src } else { *dst = src }
                         }
@@ -1059,9 +1286,17 @@ fn eval_op(
                 for (k, &i) in ix.iter().enumerate() {
                     if i >= 0 && (i as usize) < n0 {
                         for r in 0..rest {
-                            let src = if scalar_val { vals_i[0] } else { vals_i[k * rest + r] };
+                            let src = if scalar_val {
+                                vals_i[0]
+                            } else {
+                                vals_i[k * rest + r]
+                            };
                             let dst = &mut out[i as usize * rest + r];
-                            if is_add { *dst = dst.wrapping_add(src) } else { *dst = src }
+                            if is_add {
+                                *dst = dst.wrapping_add(src)
+                            } else {
+                                *dst = src
+                            }
                         }
                     }
                 }
@@ -1077,7 +1312,9 @@ fn eval_op(
             // bool-mask form (select), not this packed op.
             let n = ty_of(logits).shape.last_len().unwrap_or(1) as usize;
             let x = lanes_f32(v(logits));
-            let Value::U32(words) = v(mask) else { return Err(fault("mask_apply mask".into())) };
+            let Value::U32(words) = v(mask) else {
+                return Err(fault("mask_apply mask".into()));
+            };
             One(Value::F32(
                 x.iter()
                     .enumerate()
@@ -1090,11 +1327,20 @@ fn eval_op(
             ))
         }
 
-        Op::Rng { stream, shape, kind } => {
+        Op::Rng {
+            stream,
+            shape,
+            kind,
+        } => {
             // Ambient-seed form: the per-fire seed is 0 in the reference
             // interpreter unless the harness overrides via a keyed op —
             // PTIR programs use rng_keyed; this stays for PSIR parity work.
-            One(Value::F32(rng_ambient(0, stream, kind, shape.numel() as usize)))
+            One(Value::F32(rng_ambient(
+                0,
+                stream,
+                kind,
+                shape.numel() as usize,
+            )))
         }
         Op::RngKeyed { state, shape, kind } => {
             let st = lanes_i64(v(state));
@@ -1140,12 +1386,20 @@ fn eval_op(
                 None => return Err(StepError::MissingIntrinsic(intr)),
             }
         }
-        Op::KernelCall { name, ref args, shape, dtype } => Evaled::Kernel {
+        Op::KernelCall {
+            name,
+            ref args,
+            shape,
+            dtype,
+        } => Evaled::Kernel {
             name,
             args: args.clone(),
             result: ValueType::new(shape, dtype),
         },
-        Op::SinkCall { name, ref args } => Evaled::Sink { name, args: args.clone() },
+        Op::SinkCall { name, ref args } => Evaled::Sink {
+            name,
+            args: args.clone(),
+        },
     })
 }
 
@@ -1161,9 +1415,21 @@ fn gather_flat(v: &Value, idx: &[usize]) -> Value {
 /// Flat gather where `usize::MAX` means fill-0.
 fn gather_flat_fill0(v: &Value, idx: &[usize]) -> Value {
     match v {
-        Value::F32(x) => Value::F32(idx.iter().map(|&i| if i == usize::MAX { 0.0 } else { x[i] }).collect()),
-        Value::I32(x) => Value::I32(idx.iter().map(|&i| if i == usize::MAX { 0 } else { x[i] }).collect()),
-        Value::U32(x) => Value::U32(idx.iter().map(|&i| if i == usize::MAX { 0 } else { x[i] }).collect()),
+        Value::F32(x) => Value::F32(
+            idx.iter()
+                .map(|&i| if i == usize::MAX { 0.0 } else { x[i] })
+                .collect(),
+        ),
+        Value::I32(x) => Value::I32(
+            idx.iter()
+                .map(|&i| if i == usize::MAX { 0 } else { x[i] })
+                .collect(),
+        ),
+        Value::U32(x) => Value::U32(
+            idx.iter()
+                .map(|&i| if i == usize::MAX { 0 } else { x[i] })
+                .collect(),
+        ),
         Value::Bool(x) => Value::Bool(idx.iter().map(|&i| i != usize::MAX && x[i]).collect()),
     }
 }
@@ -1240,7 +1506,13 @@ mod tests {
     use crate::validate::bind;
 
     fn chan(shape: Shape, dtype: DType, host_role: HostRole, seeded: bool) -> ChannelDecl {
-        ChannelDecl { shape, dtype: ChanDType::Concrete(dtype), capacity: 1, host_role, seeded }
+        ChannelDecl {
+            shape,
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role,
+            seeded,
+        }
     }
 
     /// Minimal ping-pong: counter channel c, out channel o.
@@ -1256,9 +1528,9 @@ mod tests {
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
                 ops: vec![
-                    Op::ChanTake(0),               // 0
-                    Op::Const(Literal::U32(1)),    // 1
-                    Op::Add(0, 1),                 // 2
+                    Op::ChanTake(0),            // 0
+                    Op::Const(Literal::U32(1)), // 1
+                    Op::Add(0, 1),              // 2
                     Op::ChanPut { chan: 0, value: 2 },
                     Op::ChanPut { chan: 1, value: 2 },
                 ],
@@ -1271,20 +1543,28 @@ mod tests {
     fn ping_pong_commits_and_back_pressures() {
         let b = bind(counter_trace(), ModelProfile::dummy()).unwrap();
         let mut inst = Instance::new(&b, &[(0, Value::U32(vec![10]))]).unwrap();
-        let r = inst.step(&b, &PassInputs::default(), &mut NoKernels).unwrap();
+        let r = inst
+            .step(&b, &PassInputs::default(), &mut NoKernels)
+            .unwrap();
         assert!(r.committed);
         assert_eq!(inst.host_take(&b, 1).unwrap(), Value::U32(vec![11]));
         // Second step commits (out drained).
-        let r = inst.step(&b, &PassInputs::default(), &mut NoKernels).unwrap();
+        let r = inst
+            .step(&b, &PassInputs::default(), &mut NoKernels)
+            .unwrap();
         assert!(r.committed);
         // Third step: out (cap 1) still full ⇒ leading-put NeedsEmpty fails ⇒
         // dummy-run, no commit, counter unchanged (§1 back-pressure).
-        let r = inst.step(&b, &PassInputs::default(), &mut NoKernels).unwrap();
+        let r = inst
+            .step(&b, &PassInputs::default(), &mut NoKernels)
+            .unwrap();
         assert!(!r.committed);
         assert_eq!(r.missed.unwrap().0, 1);
         assert_eq!(inst.host_take(&b, 1).unwrap(), Value::U32(vec![12]));
         // Resubmission after the harvest commits and continues exactly.
-        let r = inst.step(&b, &PassInputs::default(), &mut NoKernels).unwrap();
+        let r = inst
+            .step(&b, &PassInputs::default(), &mut NoKernels)
+            .unwrap();
         assert!(r.committed);
         assert_eq!(inst.host_take(&b, 1).unwrap(), Value::U32(vec![13]));
     }
@@ -1323,11 +1603,13 @@ mod tests {
                     Op::ChanPut { chan: 1, value: 1 },
                 ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         let b = bind(c, ModelProfile::dummy()).unwrap();
         let mut inst = Instance::new(&b, &[]).unwrap();
-        let r = inst.step(&b, &PassInputs::default(), &mut NoKernels).unwrap();
+        let r = inst
+            .step(&b, &PassInputs::default(), &mut NoKernels)
+            .unwrap();
         assert!(r.committed, "missed: {:?}", r.missed);
         assert_eq!(inst.host_take(&b, 1).unwrap(), Value::U32(vec![5]));
         // c: take popped nothing (was empty), put landed → now full with 5.
@@ -1355,19 +1637,23 @@ mod tests {
                     Op::ChanPut { chan: 2, value: 2 },
                 ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         let b = bind(c, ModelProfile::dummy()).unwrap();
         let mut inst = Instance::new(&b, &[(1, Value::U32(vec![100]))]).unwrap();
         // No mask yet: dummy-run (m's dummy = zeros), nothing commits.
-        let r = inst.step(&b, &PassInputs::default(), &mut NoKernels).unwrap();
+        let r = inst
+            .step(&b, &PassInputs::default(), &mut NoKernels)
+            .unwrap();
         assert!(!r.committed);
         assert_eq!(r.missed.unwrap().0, 0);
         assert_eq!(inst.host_take(&b, 2), Err(HostError::WouldBlock));
         assert_eq!(inst.len(1), 1, "acc untouched");
         // Host feeds m ⇒ resubmission commits with the real value.
         inst.host_put(&b, 0, Value::U32(vec![7])).unwrap();
-        let r = inst.step(&b, &PassInputs::default(), &mut NoKernels).unwrap();
+        let r = inst
+            .step(&b, &PassInputs::default(), &mut NoKernels)
+            .unwrap();
         assert!(r.committed);
         assert_eq!(inst.host_take(&b, 2).unwrap(), Value::U32(vec![107]));
     }
@@ -1385,12 +1671,16 @@ mod tests {
                 stage: Stage::Epilogue,
                 ops: vec![
                     Op::ChanTake(0),
-                    Op::RngKeyed { state: 0, shape: Shape::vector(4), kind: RngKind::Gumbel },
+                    Op::RngKeyed {
+                        state: 0,
+                        shape: Shape::vector(4),
+                        kind: RngKind::Gumbel,
+                    },
                     Op::ChanPut { chan: 0, value: 0 }, // ping-pong same state (replay!)
                     Op::ChanPut { chan: 1, value: 1 },
                 ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         let b = bind(mk(), ModelProfile::dummy()).unwrap();
         let seeds = [(0u32, Value::U32(vec![42, 7]))];
@@ -1415,17 +1705,30 @@ mod tests {
                 stage: Stage::OnAttn,
                 ops: vec![
                     Op::ChanTake(0), // 0 stats
-                    Op::IntrinsicVal { intr: IntrinsicId::Layer, shape: Shape::SCALAR, dtype: DType::U32 }, // 1
-                    Op::Cast { value: 1, dtype: DType::F32 }, // 2 imp (scalar)
-                    Op::ScatterSet { base: 0, idx: 1, vals: 2 }, // 3
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::Layer,
+                        shape: Shape::SCALAR,
+                        dtype: DType::U32,
+                    }, // 1
+                    Op::Cast {
+                        value: 1,
+                        dtype: DType::F32,
+                    }, // 2 imp (scalar)
+                    Op::ScatterSet {
+                        base: 0,
+                        idx: 1,
+                        vals: 2,
+                    }, // 3
                     Op::ChanPut { chan: 0, value: 3 },
                 ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         let b = bind(c, ModelProfile::dummy()).unwrap(); // num_layers = 2
         let mut inst = Instance::new(&b, &[(0, Value::F32(vec![-1.0, -1.0]))]).unwrap();
-        let r = inst.step(&b, &PassInputs::default(), &mut NoKernels).unwrap();
+        let r = inst
+            .step(&b, &PassInputs::default(), &mut NoKernels)
+            .unwrap();
         assert!(r.committed);
         // host can't read a device-private channel; inspect via a second
         // step's take: instead check internal state through len + dummy: use
@@ -1442,13 +1745,18 @@ mod tests {
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
                 ops: vec![
-                    Op::KernelCall { name: 0, args: vec![], shape: Shape::vector(1), dtype: DType::F32 },
+                    Op::KernelCall {
+                        name: 0,
+                        args: vec![],
+                        shape: Shape::vector(1),
+                        dtype: DType::F32,
+                    },
                     Op::ChanTake(0),
                     Op::Add(0, 1),
                     Op::ChanPut { chan: 0, value: 2 },
                 ],
             }],
-        externs: alloc::vec::Vec::new(),
+            externs: alloc::vec::Vec::new(),
         };
         let mut profile = ModelProfile::dummy();
         profile.kernels.push(crate::registry::KernelInfo {
@@ -1468,6 +1776,9 @@ mod tests {
         // NaN never selected; ties → lower index.
         assert_eq!(argmax_row(&[f32::NAN, 1.0, 1.0]), 1);
         assert_eq!(argmax_row(&[f32::NAN, f32::NAN]), 0);
-        assert_eq!(sort_desc_order(&[1.0, f32::NAN, 2.0, 1.0]), vec![2, 0, 3, 1]);
+        assert_eq!(
+            sort_desc_order(&[1.0, f32::NAN, 2.0, 1.0]),
+            vec![2, 0, 3, 1]
+        );
     }
 }

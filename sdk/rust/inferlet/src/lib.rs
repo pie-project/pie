@@ -19,8 +19,7 @@ pub use inferlet_macros::{main, tool};
 
 // Generate WIT bindings directly in lib.rs. With no `async:` option, the
 // WIT's own `async func` annotations drive async generation: only
-// run/execute/receive/pull become `async fn` (component-model-async) and
-// `stream<T>` (messaging.subscribe) becomes a StreamReader; sync funcs
+// run/execute/receive become `async fn` (component-model-async); sync funcs
 // (model::encode, chat::*, …) stay sync. wit-bindgen generates the wasi:io
 // bindings itself (0.58-suffixed cabi_realloc) so it doesn't collide with
 // std's 0.57.1 copy.
@@ -128,10 +127,6 @@ pub async fn sleep(duration: std::time::Duration) {
     let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
     crate::wasi::clocks::monotonic_clock::wait_for(nanos).await;
 }
-pub mod messaging {
-    pub use crate::pie::inferlet::messaging::*;
-}
-
 pub mod session {
     pub use crate::pie::inferlet::session::*;
 }
@@ -157,10 +152,8 @@ pub use crate::pie::inferlet::grammar::Matcher;
 
 // Under component-model-async, the WIT `async func`s are generated as native
 // `async fn`s directly on the bindings — `forward-pass.execute().await`,
-// `session::receive().await`, `messaging::pull().await` — and
-// `messaging::subscribe()` returns a `StreamReader<String>`. No SDK-side
-// pollable/future polling shim is needed (the old `ForwardPassExt`,
-// `SubscriptionExt`, `FutureStringExt`, `FutureBlobExt` and the `wstd`
+// `session::receive().await` — so no SDK-side pollable/future polling shim
+// is needed (the old `ForwardPassExt`, `FutureStringExt`, `FutureBlobExt` and the `wstd`
 // executor have been removed); the host event loop drives all of it.
 
 // =============================================================================
@@ -181,7 +174,6 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 /// `use inferlet::prelude::*;` covers the common case so inferlets don't
 /// have to maintain a hand-rolled import grocery list.
 pub mod prelude {
-    pub use crate::messaging;
     pub use crate::model;
     pub use crate::runtime;
     pub use crate::{Result, Schema, Tool};

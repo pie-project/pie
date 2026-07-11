@@ -3,11 +3,11 @@
 //! definition, so the golden files and the example tests cannot drift.)
 #![allow(dead_code)]
 
-use pie_ptir::interp::Value;
 use pie_ptir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
 use pie_ptir::expand;
+use pie_ptir::interp::Value;
 use pie_ptir::op::{IntrinsicId, Op};
 use pie_ptir::registry::{ModelProfile, Port, Stage};
 use pie_ptir::types::{DType, Literal, Shape};
@@ -31,7 +31,13 @@ impl B {
 }
 
 pub fn chan(shape: Shape, dtype: DType, host_role: HostRole, seeded: bool) -> ChannelDecl {
-    ChannelDecl { shape, dtype: ChanDType::Concrete(dtype), capacity: 1, host_role, seeded }
+    ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 1,
+        host_role,
+        seeded,
+    }
 }
 
 pub fn u32s(v: &[u32]) -> Value {
@@ -73,7 +79,10 @@ pub fn section3_trace() -> TraceContainer {
         shape: Shape::matrix(1, VOCAB),
         dtype: DType::F32,
     });
-    let logits = b.p(Op::Reshape { value: logits2, shape: Shape::vector(VOCAB) });
+    let logits = b.p(Op::Reshape {
+        value: logits2,
+        shape: Shape::vector(VOCAB),
+    });
     let r = b.p(Op::ChanTake(4)); // rng state [key, ctr]
     let m = b.p(Op::ChanTake(2)); // mask (readiness input)
     let g = expand::gumbel(&mut b.ops, r, Shape::vector(VOCAB));
@@ -84,7 +93,10 @@ pub fn section3_trace() -> TraceContainer {
     let ctr1 = b.p(Op::Iota { len: 2 }); // [0, 1] u32
     let r2 = b.p(Op::Add(r, ctr1));
     b.p(Op::ChanPut { chan: 4, value: r2 });
-    let t1 = b.p(Op::Reshape { value: t, shape: Shape::vector(1) });
+    let t1 = b.p(Op::Reshape {
+        value: t,
+        shape: Shape::vector(1),
+    });
     b.p(Op::ChanPut { chan: 0, value: t1 }); // tok
     let l = b.p(Op::ChanTake(3));
     let one = b.cu32(1);
@@ -102,11 +114,20 @@ pub fn section3_trace() -> TraceContainer {
             chan(Shape::vector(2), DType::U32, HostRole::None, true), // 4 rng
         ],
         ports: vec![
-            PortBinding { port: Port::EmbedTokens, source: PortSource::Channel(0) },
+            PortBinding {
+                port: Port::EmbedTokens,
+                source: PortSource::Channel(0),
+            },
             const_port(Port::EmbedIndptr, DType::U32, Shape::vector(2), &[0, 1]),
-            PortBinding { port: Port::KvLen, source: PortSource::Channel(3) },
+            PortBinding {
+                port: Port::KvLen,
+                source: PortSource::Channel(3),
+            },
         ],
-        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: b.ops,
+        }],
         externs: Vec::new(),
     }
 }
@@ -152,48 +173,94 @@ pub fn beam_trace() -> TraceContainer {
     });
     let lsm = expand::log_softmax(&mut b.ops, logits, Shape::matrix(BB, V));
     // broadcast [B] -> [B,V] must left-align as [B,1]; reshape first.
-    let s1 = b.p(Op::Reshape { value: scores, shape: Shape::matrix(BB, 1) });
-    let sbb = b.p(Op::Broadcast { value: s1, shape: Shape::matrix(BB, V) });
+    let s1 = b.p(Op::Reshape {
+        value: scores,
+        shape: Shape::matrix(BB, 1),
+    });
+    let sbb = b.p(Op::Broadcast {
+        value: s1,
+        shape: Shape::matrix(BB, V),
+    });
     let cand = b.p(Op::Add(sbb, lsm));
-    let candf = b.p(Op::Reshape { value: cand, shape: Shape::vector(BB * V) });
-    let s = b.p(Op::TopK { input: candf, k: BB }); // s, s+1 = i
+    let candf = b.p(Op::Reshape {
+        value: cand,
+        shape: Shape::vector(BB * V),
+    });
+    let s = b.p(Op::TopK {
+        input: candf,
+        k: BB,
+    }); // s, s+1 = i
     let i = s + 1;
     let vc = b.cu32(V);
     let parent = b.p(Op::Div(i, vc)); // integer division: flat id → row
     // reorder = row gathers
     let pg = {
         let t = b.p(Op::ChanTake(0));
-        b.p(Op::Gather { src: t, idx: parent })
+        b.p(Op::Gather {
+            src: t,
+            idx: parent,
+        })
     };
     let pl = {
         let t = b.p(Op::ChanTake(1));
-        b.p(Op::Gather { src: t, idx: parent })
+        b.p(Op::Gather {
+            src: t,
+            idx: parent,
+        })
     };
     let n = {
         let t = b.p(Op::ChanTake(5));
-        b.p(Op::Gather { src: t, idx: parent })
+        b.p(Op::Gather {
+            src: t,
+            idx: parent,
+        })
     };
     let tf = {
         let t = b.p(Op::ChanTake(7));
-        b.p(Op::Gather { src: t, idx: parent })
+        b.p(Op::Gather {
+            src: t,
+            idx: parent,
+        })
     };
     let lanes = b.p(Op::Iota { len: BB });
     // heir[p] = p's designated child (duplicate scatters: last wins)
-    let heir = b.p(Op::ScatterSet { base: lanes, idx: parent, vals: lanes });
-    let hp = b.p(Op::Gather { src: heir, idx: parent });
+    let heir = b.p(Op::ScatterSet {
+        base: lanes,
+        idx: parent,
+        vals: lanes,
+    });
+    let hp = b.p(Op::Gather {
+        src: heir,
+        idx: parent,
+    });
     let is_heir = b.p(Op::Eq(hp, lanes));
     let pagec = b.cu32(PAGE);
     let has_room = b.p(Op::Lt(tf, pagec));
     let cont = b.p(Op::And(is_heir, has_room));
     let tslot_t = b.p(Op::ChanTake(6));
-    let tsp = b.p(Op::Gather { src: tslot_t, idx: parent });
+    let tsp = b.p(Op::Gather {
+        src: tslot_t,
+        idx: parent,
+    });
     let fresh = b.p(Op::ChanTake(12));
-    let slot = b.p(Op::Select { cond: cont, a: tsp, b: fresh });
+    let slot = b.p(Op::Select {
+        cond: cont,
+        a: tsp,
+        b: fresh,
+    });
     let zero = b.cu32(0);
-    let off = b.p(Op::Select { cond: cont, a: tf, b: zero });
+    let off = b.p(Op::Select {
+        cond: cont,
+        a: tf,
+        b: zero,
+    });
     let one = b.cu32(1);
     let n1 = b.p(Op::Add(n, one));
-    let n2 = b.p(Op::Select { cond: cont, a: n, b: n1 });
+    let n2 = b.p(Op::Select {
+        cond: cont,
+        a: n,
+        b: n1,
+    });
     let pc = b.cu32(P);
     let n2m1 = b.p(Op::Sub(n2, one));
     let tcol = {
@@ -201,16 +268,42 @@ pub fn beam_trace() -> TraceContainer {
         b.p(Op::Add(t, n2m1))
     };
     // pages
-    let pgf = b.p(Op::Reshape { value: pg, shape: Shape::vector(BB * P) });
-    let pg2 = b.p(Op::ScatterSet { base: pgf, idx: tcol, vals: slot });
-    let pg3 = b.p(Op::Reshape { value: pg2, shape: Shape::matrix(BB, P) });
-    b.p(Op::ChanPut { chan: 0, value: pg3 });
+    let pgf = b.p(Op::Reshape {
+        value: pg,
+        shape: Shape::vector(BB * P),
+    });
+    let pg2 = b.p(Op::ScatterSet {
+        base: pgf,
+        idx: tcol,
+        vals: slot,
+    });
+    let pg3 = b.p(Op::Reshape {
+        value: pg2,
+        shape: Shape::matrix(BB, P),
+    });
+    b.p(Op::ChanPut {
+        chan: 0,
+        value: pg3,
+    });
     // lens (the single source) + derivatives
     let off1 = b.p(Op::Add(off, one));
-    let plf = b.p(Op::Reshape { value: pl, shape: Shape::vector(BB * P) });
-    let pl2f = b.p(Op::ScatterSet { base: plf, idx: tcol, vals: off1 });
-    let pl2 = b.p(Op::Reshape { value: pl2f, shape: Shape::matrix(BB, P) });
-    b.p(Op::ChanPut { chan: 1, value: pl2 });
+    let plf = b.p(Op::Reshape {
+        value: pl,
+        shape: Shape::vector(BB * P),
+    });
+    let pl2f = b.p(Op::ScatterSet {
+        base: plf,
+        idx: tcol,
+        vals: off1,
+    });
+    let pl2 = b.p(Op::Reshape {
+        value: pl2f,
+        shape: Shape::matrix(BB, P),
+    });
+    b.p(Op::ChanPut {
+        chan: 1,
+        value: pl2,
+    });
     let klen = {
         let t = b.p(Op::Mul(n2m1, pagec));
         b.p(Op::Add(t, off1))
@@ -220,34 +313,82 @@ pub fn beam_trace() -> TraceContainer {
     // capacity-1 full/empty bits a put without a drain would back-pressure
     // forever on step 2. (Overview §6.2 elides the drain; the trace can't.)
     b.p(Op::ChanTake(2));
-    b.p(Op::ChanPut { chan: 2, value: klen });
+    b.p(Op::ChanPut {
+        chan: 2,
+        value: klen,
+    });
     // kvm[b][j*page+o] = o < lens[b][j]
     let io = b.p(Op::Iota { len: PAGE });
-    let io3 = b.p(Op::Reshape { value: io, shape: Shape::new(&[1, 1, PAGE]).unwrap() });
-    let iob = b.p(Op::Broadcast { value: io3, shape: Shape::new(&[BB, P, PAGE]).unwrap() });
-    let l3 = b.p(Op::Reshape { value: pl2, shape: Shape::new(&[BB, P, 1]).unwrap() });
-    let lb = b.p(Op::Broadcast { value: l3, shape: Shape::new(&[BB, P, PAGE]).unwrap() });
+    let io3 = b.p(Op::Reshape {
+        value: io,
+        shape: Shape::new(&[1, 1, PAGE]).unwrap(),
+    });
+    let iob = b.p(Op::Broadcast {
+        value: io3,
+        shape: Shape::new(&[BB, P, PAGE]).unwrap(),
+    });
+    let l3 = b.p(Op::Reshape {
+        value: pl2,
+        shape: Shape::new(&[BB, P, 1]).unwrap(),
+    });
+    let lb = b.p(Op::Broadcast {
+        value: l3,
+        shape: Shape::new(&[BB, P, PAGE]).unwrap(),
+    });
     let kvm3 = b.p(Op::Lt(iob, lb));
-    let kvm = b.p(Op::Reshape { value: kvm3, shape: Shape::matrix(BB, P * PAGE) });
+    let kvm = b.p(Op::Reshape {
+        value: kvm3,
+        shape: Shape::matrix(BB, P * PAGE),
+    });
     b.p(Op::ChanTake(3)); // drain (see klen note)
-    b.p(Op::ChanPut { chan: 3, value: kvm });
+    b.p(Op::ChanPut {
+        chan: 3,
+        value: kvm,
+    });
     // pos (logical length, ping-pong)
     let pos = b.p(Op::ChanTake(4));
     let pos2 = b.p(Op::Add(pos, one));
-    b.p(Op::ChanPut { chan: 4, value: pos2 });
+    b.p(Op::ChanPut {
+        chan: 4,
+        value: pos2,
+    });
     // bookkeeping
     b.p(Op::ChanPut { chan: 5, value: n2 });
-    b.p(Op::ChanPut { chan: 6, value: slot });
-    b.p(Op::ChanPut { chan: 7, value: off1 });
-    b.p(Op::ChanPut { chan: 8, value: slot });
-    b.p(Op::ChanPut { chan: 9, value: off });
+    b.p(Op::ChanPut {
+        chan: 6,
+        value: slot,
+    });
+    b.p(Op::ChanPut {
+        chan: 7,
+        value: off1,
+    });
+    b.p(Op::ChanPut {
+        chan: 8,
+        value: slot,
+    });
+    b.p(Op::ChanPut {
+        chan: 9,
+        value: off,
+    });
     // tokens + scores + host-facing
     let tok_u = b.p(Op::Rem(i, vc));
-    let tok = b.p(Op::Cast { value: tok_u, dtype: DType::I32 });
-    b.p(Op::ChanPut { chan: 10, value: tok });
+    let tok = b.p(Op::Cast {
+        value: tok_u,
+        dtype: DType::I32,
+    });
+    b.p(Op::ChanPut {
+        chan: 10,
+        value: tok,
+    });
     b.p(Op::ChanPut { chan: 11, value: s });
-    b.p(Op::ChanPut { chan: 13, value: tok });
-    b.p(Op::ChanPut { chan: 14, value: parent });
+    b.p(Op::ChanPut {
+        chan: 13,
+        value: tok,
+    });
+    b.p(Op::ChanPut {
+        chan: 14,
+        value: parent,
+    });
     b.p(Op::ChanPut { chan: 15, value: s });
 
     let u32c = |shape: Shape, role, seeded| chan(shape, DType::U32, role, seeded);
@@ -257,7 +398,12 @@ pub fn beam_trace() -> TraceContainer {
             u32c(Shape::matrix(BB, P), HostRole::None, true), // 0 pages
             u32c(Shape::matrix(BB, P), HostRole::None, true), // 1 lens
             u32c(Shape::vector(BB), HostRole::None, true),    // 2 klen
-            chan(Shape::matrix(BB, P * PAGE), DType::Bool, HostRole::None, true), // 3 kvm
+            chan(
+                Shape::matrix(BB, P * PAGE),
+                DType::Bool,
+                HostRole::None,
+                true,
+            ), // 3 kvm
             u32c(Shape::vector(BB), HostRole::None, true),    // 4 pos
             u32c(Shape::vector(BB), HostRole::None, true),    // 5 np
             u32c(Shape::vector(BB), HostRole::None, true),    // 6 tslot
@@ -272,21 +418,60 @@ pub fn beam_trace() -> TraceContainer {
             chan(Shape::vector(BB), DType::F32, HostRole::Reader, false), // 15 out_scr
         ],
         ports: vec![
-            PortBinding { port: Port::EmbedTokens, source: PortSource::Channel(10) },
-            const_port(Port::EmbedIndptr, DType::U32, Shape::vector(BB + 1), &[0, 1, 2]),
-            PortBinding { port: Port::Positions, source: PortSource::Channel(4) },
-            PortBinding { port: Port::Pages, source: PortSource::Channel(0) },
-            const_port(Port::PageIndptr, DType::U32, Shape::vector(BB + 1), &[0, P, 2 * P]),
-            PortBinding { port: Port::KvLen, source: PortSource::Channel(2) },
-            PortBinding { port: Port::WSlot, source: PortSource::Channel(8) },
-            PortBinding { port: Port::WOff, source: PortSource::Channel(9) },
-            PortBinding { port: Port::AttnMask, source: PortSource::Channel(3) },
+            PortBinding {
+                port: Port::EmbedTokens,
+                source: PortSource::Channel(10),
+            },
+            const_port(
+                Port::EmbedIndptr,
+                DType::U32,
+                Shape::vector(BB + 1),
+                &[0, 1, 2],
+            ),
+            PortBinding {
+                port: Port::Positions,
+                source: PortSource::Channel(4),
+            },
+            PortBinding {
+                port: Port::Pages,
+                source: PortSource::Channel(0),
+            },
+            const_port(
+                Port::PageIndptr,
+                DType::U32,
+                Shape::vector(BB + 1),
+                &[0, P, 2 * P],
+            ),
+            PortBinding {
+                port: Port::KvLen,
+                source: PortSource::Channel(2),
+            },
+            PortBinding {
+                port: Port::WSlot,
+                source: PortSource::Channel(8),
+            },
+            PortBinding {
+                port: Port::WOff,
+                source: PortSource::Channel(9),
+            },
+            PortBinding {
+                port: Port::AttnMask,
+                source: PortSource::Channel(3),
+            },
         ],
-        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: b.ops,
+        }],
         externs: Vec::new(),
     }
 }
 
 pub fn beam_profile() -> ModelProfile {
-    ModelProfile { vocab: V, page_size: PAGE, num_layers: 2, ..ModelProfile::dummy() }
+    ModelProfile {
+        vocab: V,
+        page_size: PAGE,
+        num_layers: 2,
+        ..ModelProfile::dummy()
+    }
 }

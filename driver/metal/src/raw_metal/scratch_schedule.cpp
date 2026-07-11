@@ -70,8 +70,12 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
     auto rd = [&](int ord, uint8_t b, int val) { uses.push_back({ord, b, val, false}); };
     auto wr = [&](int ord, uint8_t b, int val) { uses.push_back({ord, b, val, true}); };
 
-    for (const Dispatch& d : dag) {
-        const int o = d.ordinal;
+    for (size_t dispatch_index = 0; dispatch_index < dag.size(); ++dispatch_index) {
+        const Dispatch& d = dag[dispatch_index];
+        // Schedules are indexed by DAG position, not argument-table ordinal.
+        // M=1 happens to use both as 0..N-1; paged DAG ordinals deliberately
+        // live in a disjoint range.
+        const int o = static_cast<int>(dispatch_index);
         switch (d.kind) {
             case Kernel::EmbedGather:
                 resid = fresh(); wr(o, bi::EmbedOut, resid);
@@ -99,13 +103,15 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
             case Kernel::GdnInB:
                 bg = fresh(); rd(o, bi::DenseX, normed); wr(o, bi::DenseOut, bg);
                 break;
-            case Kernel::GdnPrep:  // dv-independent q/k path → fp32 scratch (once/head)
+            case Kernel::GdnPrep:
+            case Kernel::GdnPrepSlotted:  // dv-independent q/k path → fp32 scratch (once/head)
                 pq = fresh(); pk = fresh(); pg = fresh();
                 rd(o, bi::GdnPrepMixed, mixed); rd(o, bi::GdnPrepAGate, ag); rd(o, bi::GdnPrepBGate, bg);
                 wr(o, bi::GdnPrepPreQ, pq); wr(o, bi::GdnPrepPreK, pk); wr(o, bi::GdnPrepPreGate, pg);
                 prep_pending = true;
                 break;
             case Kernel::GdnCore:
+            case Kernel::GdnCoreSlotted:
                 core = fresh();
                 if (prep_pending) {  // recurrent variant: reads prep's pre_q/k/gate scratch
                     rd(o, bi::GdnRecMixed, mixed);
@@ -159,10 +165,12 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
             case Kernel::RopeK:  // in-place on the key heads (kernel buffer 0 only)
                 rd(o, bi::RopeX, kk); wr(o, bi::RopeX, kk);
                 break;
-            case Kernel::KvAppend:  // k/v -> KV pages (delta's); k/v read from scratch
+            case Kernel::KvAppend:
+            case Kernel::KvAppendPaged:  // k/v -> KV pages; k/v read from scratch
                 rd(o, bi::KvAppendK, kk); rd(o, bi::KvAppendV, vv);
                 break;
-            case Kernel::Sdpa:  // Q from scratch, K/V from KV region; out -> attn
+            case Kernel::Sdpa:
+            case Kernel::SdpaPaged:  // Q from scratch, K/V from KV region; out -> attn
                 attn = fresh(); rd(o, bi::SdpaQ, q); wr(o, bi::SdpaOut, attn);
                 break;
             case Kernel::AttnGate:  // attn *= sigmoid(gate), in-place on attn
@@ -299,12 +307,14 @@ void bind_scratch(RawMetalContext& ctx,
                   const std::vector<Dispatch>& dag,
                   const ScratchSchedule& sched,
                   const SlotHandle* pool,
-                  int pool_n) {
-    (void)dag;
-    for (size_t ord = 0; ord < sched.per_dispatch.size(); ++ord) {
-        for (const ScratchBind& sb : sched.per_dispatch[ord].binds) {
+                  int pool_n,
+                  size_t byte_offset) {
+    const size_t n = std::min(dag.size(), sched.per_dispatch.size());
+    for (size_t di = 0; di < n; ++di) {
+        const int ordinal = dag[di].ordinal;
+        for (const ScratchBind& sb : sched.per_dispatch[di].binds) {
             if (sb.buffer_id < pool_n && pool[sb.buffer_id].valid()) {
-                ctx.arg_bind_ordinal((int)ord, sb.bind_index, pool[sb.buffer_id]);
+                ctx.arg_bind_ordinal(ordinal, sb.bind_index, pool[sb.buffer_id], byte_offset);
             }
         }
     }

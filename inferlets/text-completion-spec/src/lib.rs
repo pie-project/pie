@@ -133,7 +133,7 @@ async fn main(input: Input) -> Result<Output> {
         let pool_pages = (n + input.max_tokens as u32 + 2 + PAGE_T - 1) / PAGE_T;
         let pool = pool_pages * PAGE_T;
         let ws: &'static WorkingSet = bx(WorkingSet::new());
-        let slots = ws.alloc(pool_pages).map_err(|e| format!("ws.alloc: {e}"))?;
+        let slots = ws.reserve(pool_pages).map_err(|e| format!("ws.reserve: {e}"))?;
         let pool_ids: &'static Vec<u32> = bx(slots.ids().to_vec());
 
         // ──────────── 1. PREFILL FIRE (N-wide; = classic step 1) ────────────
@@ -178,7 +178,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let prefill_start = Instant::now();
         let prefill = Pipeline::new();
-        prefill.submit(fwd_p).map_err(|e| format!("prefill submit: {e}"))?;
+        fwd_p.submit(&prefill).map_err(|e| format!("prefill submit: {e}"))?;
         let g0 = g0_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?[0];
         prefill.close();
         prefill_elapsed = prefill_start.elapsed();
@@ -260,7 +260,7 @@ async fn main(input: Input) -> Result<Output> {
         let decode = Pipeline::new();
         while all_tokens.len() < input.max_tokens {
             pool_ids_ch.put(pool_ids.clone());
-            decode.submit(fwd).map_err(|e| format!("decode submit: {e}"))?;
+            fwd.submit(&decode).map_err(|e| format!("decode submit: {e}"))?;
             let t = out.take().get::<i32>().map_err(|e| format!("out.take: {e}"))?;
             all_tokens.push(*t.first().unwrap_or(&0) as u32);
             steps += 1;

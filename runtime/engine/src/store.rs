@@ -1,14 +1,22 @@
-//! Typed resource stores (kv_refact.md).
+//! Typed resource stores (kv_refact.md): device memory as pages, slots, and
+//! mappings. Replaces the generic KV-page-sized `Arena` with resource-specific
+//! stores over typed static backing pools.
 //!
-//! Replaces the generic KV-page-sized `Arena` with resource-specific stores
-//! over typed static backing pools. This module currently hosts the pure host
-//! core: the physical-id free list (`pool`), semantic hashing (`kv::hash`),
-//! and the KV mapping trie (`kv::page_table`). Wiring into WIT resources,
-//! the PTIR fire path, and driver flat-table publication lands in later
-//! increments; `arena/` and `working_set/` remain authoritative until then.
+//! - [`kv`]: `KvStore` — the mapping trie, hash lifecycle, and prepare/commit/
+//!   abort protocol over the physical KV page pool.
+//! - `rs`: `RsStore` — the recurrent-state slot store (GDN/Mamba2 folded
+//!   state) with the same prepare/commit/abort protocol.
+//! - `pool`/`genmap`: the physical-id free list and generational key map the
+//!   typed stores are built on.
+//! - `registry`: per-(model, driver) lookup of the owning `KvStore`/`RsStore`.
+//! - [`reclaim`]: the pressure ladder (idle-lease drop, preempt-youngest,
+//!   wait queue, restore-on-free) — the only submodule external tests reach
+//!   directly (`store::reclaim::contention()`), since it is this crate's
+//!   sole KV-contention diagnostic surface.
 
-pub mod genmap;
-pub mod kv;
-pub mod pool;
-pub mod registry;
-pub mod rs;
+pub(crate) mod genmap;
+pub(crate) mod kv;
+pub(crate) mod pool;
+pub mod reclaim;
+pub(crate) mod registry;
+pub(crate) mod rs;

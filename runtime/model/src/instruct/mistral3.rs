@@ -9,11 +9,11 @@
 //!
 //! Reference: Mistral V3 Jinja chat template.
 
-use pie_grammar::grammar::Grammar;
 use crate::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder};
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
+use pie_grammar::grammar::Grammar;
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;
 

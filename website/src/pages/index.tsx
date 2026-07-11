@@ -49,11 +49,6 @@ const IO_DEMOS: DemoMeta[] = [
         tab: 'Virtual filesystem',
         metric: 'std::fs to persistent /scratch',
     },
-    {
-        id: 'messaging',
-        tab: 'Messaging',
-        metric: 'Topics inside the engine',
-    },
 ];
 
 function Hero() {

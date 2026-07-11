@@ -39,7 +39,10 @@ use pie_client::client::Client;
 async fn windowed_attention_on_real_driver() -> Result<()> {
     common::init_trace();
     let pie = common::boot_4090().await?;
-    eprintln!("[windowed-attn-e2e] booted, listen_addr={}", pie.listen_addr);
+    eprintln!(
+        "[windowed-attn-e2e] booted, listen_addr={}",
+        pie.listen_addr
+    );
 
     // Build the `windowed-attention` inferlet to wasm. It is a standalone crate
     // (excluded from the host workspace), so build in its own dir. The crate name
@@ -59,8 +62,14 @@ async fn windowed_attention_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
-    client.add_program(&wasm, &manifest, true).await.context("add_program")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
+    client
+        .add_program(&wasm, &manifest, true)
+        .await
+        .context("add_program")?;
     eprintln!("[windowed-attn-e2e] program installed, launching windowed decode…");
 
     // Small window + a few tokens: the chat-templated prompt already exceeds

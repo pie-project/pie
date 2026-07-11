@@ -69,10 +69,10 @@ pub fn inferlet_wasm_path(name: &str) -> PathBuf {
 
 /// Read the WASM binary for a test inferlet. Builds if needed.
 pub fn read_inferlet_wasm(name: &str) -> Vec<u8> {
+    // The SDK/WIT is developed alongside these fixtures. Rebuild even when an
+    // artifact exists so stale components cannot hide interface changes.
+    build_inferlet(name);
     let path = inferlet_wasm_path(name);
-    if !path.exists() {
-        build_inferlet(name);
-    }
     std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {}: {}", path.display(), e))
 }
 
@@ -93,7 +93,9 @@ pub async fn add_and_install(name: &str) -> ProgramName {
     pie_engine::inferlet::program::add(wasm, manifest, true)
         .await
         .unwrap();
-    pie_engine::inferlet::program::install(&program_name).await.unwrap();
+    pie_engine::inferlet::program::install(&program_name)
+        .await
+        .unwrap();
     program_name
 }
 

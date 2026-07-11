@@ -14,11 +14,16 @@
 
 #include <cuda_runtime.h>
 
-#include "ptir/op_table.hpp"
+#include "pie_native/ptir/op_table.hpp"
 #include "ptir/tier0_kernels.cuh"
-#include "ptir/trace.hpp"
+#include "pie_native/ptir/trace.hpp"
 
 namespace pie_cuda_driver::ptir {
+
+// Shared pure-host PTIR decode model (trace/op-table/container/bound/
+// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// scope so the CUDA-side tier-0/1 code below can use it unqualified.
+using namespace pie_native::ptir;
 
 // The runner-resolved launch descriptor for one op.
 struct LaunchOp {

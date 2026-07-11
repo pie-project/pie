@@ -6,8 +6,8 @@ use crate::ffi_types::{
     PieLoaderOptimizerReportView, PieLoaderQuantScheme, PieLoaderRepackLayout, PieLoaderRowMap,
     PieLoaderSlabPlacementSlice, PieLoaderSlabPlacementView, PieLoaderSourceExtentView,
     PieLoaderStorageInstrKind, PieLoaderStorageInstrSlice, PieLoaderStorageInstrView,
-    PieLoaderStorageProgramView, PieLoaderStridedExtentView,
-    PieLoaderTensorDeclSlice, PieLoaderTensorDeclView, PieLoaderTileMapKind, PieLoaderU32Slice,
+    PieLoaderStorageProgramView, PieLoaderStridedExtentView, PieLoaderTensorDeclSlice,
+    PieLoaderTensorDeclView, PieLoaderTileMapKind, PieLoaderU32Slice,
 };
 use crate::storage::{
     DestExtent, SourceExtent, StorageInstr, StorageProgram, StridedExtent, TileMapKind,

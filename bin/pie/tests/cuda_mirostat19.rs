@@ -110,18 +110,33 @@ async fn mirostat19_arbiter_on_4090() -> Result<()> {
     // floor (the known RNG-fragile residual, now opt-in via {"floor":"rank"}) and
     // the plain no-floor degenerate control.
     let configs: [(&str, String); 4] = [
-        ("DEFAULT(argmax-floor) ", format!(r#"{{"max_tokens":{MAX_TOKENS}}}"#)),
-        ("argmax-floor mu0=3    ", format!(r#"{{"mu0":3,"max_tokens":{MAX_TOKENS}}}"#)),
-        ("RankLe-floor(diag)    ", format!(r#"{{"floor":"rank","k_min":8,"mu0":13,"max_tokens":{MAX_TOKENS}}}"#)),
-        ("plain no-floor(degen) ", format!(r#"{{"floor":"rank","k_min":0,"mu0":3,"max_tokens":{MAX_TOKENS}}}"#)),
+        (
+            "DEFAULT(argmax-floor) ",
+            format!(r#"{{"max_tokens":{MAX_TOKENS}}}"#),
+        ),
+        (
+            "argmax-floor mu0=3    ",
+            format!(r#"{{"mu0":3,"max_tokens":{MAX_TOKENS}}}"#),
+        ),
+        (
+            "RankLe-floor(diag)    ",
+            format!(r#"{{"floor":"rank","k_min":8,"mu0":13,"max_tokens":{MAX_TOKENS}}}"#),
+        ),
+        (
+            "plain no-floor(degen) ",
+            format!(r#"{{"floor":"rank","k_min":0,"mu0":3,"max_tokens":{MAX_TOKENS}}}"#),
+        ),
     ];
 
-    eprintln!("[MIRO19] config              | final_mu  tail_S | distinct%  win{WIN}% | s_flowed | non-degenerate");
+    eprintln!(
+        "[MIRO19] config              | final_mu  tail_S | distinct%  win{WIN}% | s_flowed | non-degenerate"
+    );
     let mut results: Vec<(String, MirostatResult, bool)> = Vec::new();
     for (label, input) in configs.iter() {
-        let json = common::run_inferlet(&pie.listen_addr, "mirostat", "mirostat@0.1.0", input).await?;
-        let r: MirostatResult =
-            serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("parse {label}: {e}\njson={json}"))?;
+        let json =
+            common::run_inferlet(&pie.listen_addr, "mirostat", "mirostat@0.1.0", input).await?;
+        let r: MirostatResult = serde_json::from_str(&json)
+            .map_err(|e| anyhow::anyhow!("parse {label}: {e}\njson={json}"))?;
         anyhow::ensure!(r.tokens.len() == r.count, "{label}: token count mismatch");
         let nd = non_degenerate(&r);
         eprintln!(
@@ -141,13 +156,13 @@ async fn mirostat19_arbiter_on_4090() -> Result<()> {
     // genuine Shannon entropy (a plausible positive f32), NOT a token id's
     // int-bits reinterpreted as f32 (a ~1e-40 denormal) from the token-src a2 path.
     let entropy_json = {
-        let c = Client::connect_with_identity(
-            &format!("ws://{}/v1/ws", pie.listen_addr),
-            "test-user",
-        )
-        .await
-        .context("connect entropycheck")?;
-        c.authenticate("test-user", &None).await.context("auth entropycheck")?;
+        let c =
+            Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
+                .await
+                .context("connect entropycheck")?;
+        c.authenticate("test-user", &None)
+            .await
+            .context("auth entropycheck")?;
         c.add_program(&entropy_wasm, &entropy_manifest, true)
             .await
             .context("add_program entropycheck")?;

@@ -98,7 +98,10 @@ async fn found_abort_overlap_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
     client
         .add_program(&wasm, &manifest, true)
         .await

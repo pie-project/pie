@@ -12,7 +12,6 @@ export type DemoId =
   | 'grammar'
   | 'persistent-kv'
   | 'filesystem'
-  | 'messaging'
   | 'watermark';
 
 export interface DemoMeta {

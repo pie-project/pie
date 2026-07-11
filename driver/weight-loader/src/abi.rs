@@ -109,20 +109,27 @@ impl RuntimeAbi {
             .filter(|contract| contract.shard_axis.is_some())
             .count();
         let (total_bytes, sharded_bytes) =
-            builder.tensors.iter().fold((0_u64, 0_u64), |(total, sharded), contract| {
-                let bytes = metadata
-                    .tensor(match contract.source {
-                        RuntimeTensorSource::DirectTensor(id) => id,
-                        RuntimeTensorSource::Repack { tensor, .. } => tensor,
-                        _ => TensorId(u32::MAX),
-                    })
-                    .map(|raw| raw.span_bytes)
-                    .unwrap_or(0);
-                (
-                    total.saturating_add(bytes),
-                    sharded.saturating_add(if contract.shard_axis.is_some() { bytes } else { 0 }),
-                )
-            });
+            builder
+                .tensors
+                .iter()
+                .fold((0_u64, 0_u64), |(total, sharded), contract| {
+                    let bytes = metadata
+                        .tensor(match contract.source {
+                            RuntimeTensorSource::DirectTensor(id) => id,
+                            RuntimeTensorSource::Repack { tensor, .. } => tensor,
+                            _ => TensorId(u32::MAX),
+                        })
+                        .map(|raw| raw.span_bytes)
+                        .unwrap_or(0);
+                    (
+                        total.saturating_add(bytes),
+                        sharded.saturating_add(if contract.shard_axis.is_some() {
+                            bytes
+                        } else {
+                            0
+                        }),
+                    )
+                });
         if crate::wl_debug_enabled() {
             eprintln!(
                 "[pie-weight-loader] default ABI model_type={} tp={}/{} tensors={} sharded={} bytes={} sharded_bytes={}",
@@ -209,9 +216,7 @@ impl RuntimeAbi {
                 layout: contract.layout.clone(),
                 alignment: contract.alignment,
             };
-            if let Some((_, indices)) = buckets
-                .iter_mut()
-                .find(|(candidate, _)| *candidate == key)
+            if let Some((_, indices)) = buckets.iter_mut().find(|(candidate, _)| *candidate == key)
             {
                 indices.push(index);
             } else {
@@ -500,17 +505,32 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
     ),
     (
         &["deepseek_v2", "deepseek_v3"],
-        ArchProfile { mla_fused_joins: true, ..GENERIC_ARCH },
+        ArchProfile {
+            mla_fused_joins: true,
+            ..GENERIC_ARCH
+        },
     ),
     (
         // Native `.ffn.experts.w*` naming + per-expert intermediate sharding.
         &["deepseek_v4"],
-        ArchProfile { shard_axis_fn: dsv4_shard_axis, ..GENERIC_ARCH },
+        ArchProfile {
+            shard_axis_fn: dsv4_shard_axis,
+            ..GENERIC_ARCH
+        },
     ),
-    (&["phi3"], ArchProfile { phi3_fused_splits: true, ..GENERIC_ARCH }),
+    (
+        &["phi3"],
+        ArchProfile {
+            phi3_fused_splits: true,
+            ..GENERIC_ARCH
+        },
+    ),
     (
         &["nemotron_h"],
-        ArchProfile { nemotron_packed_experts: true, ..GENERIC_ARCH },
+        ArchProfile {
+            nemotron_packed_experts: true,
+            ..GENERIC_ARCH
+        },
     ),
     (
         // GPT-OSS binds attention q/k/v separately (its CUDA builder reads
@@ -547,8 +567,19 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
         },
     ),
     (
-        &["qwen3", "qwen2", "llama", "llama3", "mistral", "qwen3_5", "qwen3_5_text"],
-        ArchProfile { bf16_runtime_quant: true, ..GENERIC_ARCH },
+        &[
+            "qwen3",
+            "qwen2",
+            "llama",
+            "llama3",
+            "mistral",
+            "qwen3_5",
+            "qwen3_5_text",
+        ],
+        ArchProfile {
+            bf16_runtime_quant: true,
+            ..GENERIC_ARCH
+        },
     ),
 ];
 
@@ -1191,7 +1222,9 @@ impl DefaultAbiBuilder<'_> {
             if by_name.contains_key(gate_up_name.as_str()) {
                 continue; // already pre-fused; leave to the direct/TP-slice paths.
             }
-            let Some(gate0) = by_name.get(format!("{prefix}0.gate_proj.weight").as_str()).copied()
+            let Some(gate0) = by_name
+                .get(format!("{prefix}0.gate_proj.weight").as_str())
+                .copied()
             else {
                 continue; // not a per-expert checkpoint at this layer.
             };
@@ -1213,9 +1246,15 @@ impl DefaultAbiBuilder<'_> {
             let mut down_spans = Vec::with_capacity(num_experts as usize);
             let mut consumed = Vec::with_capacity((num_experts * 3) as usize);
             for e in 0..num_experts {
-                let g = by_name.get(format!("{prefix}{e}.gate_proj.weight").as_str()).copied();
-                let u = by_name.get(format!("{prefix}{e}.up_proj.weight").as_str()).copied();
-                let d = by_name.get(format!("{prefix}{e}.down_proj.weight").as_str()).copied();
+                let g = by_name
+                    .get(format!("{prefix}{e}.gate_proj.weight").as_str())
+                    .copied();
+                let u = by_name
+                    .get(format!("{prefix}{e}.up_proj.weight").as_str())
+                    .copied();
+                let d = by_name
+                    .get(format!("{prefix}{e}.down_proj.weight").as_str())
+                    .copied();
                 let (Some(g), Some(u), Some(d)) = (g, u, d) else {
                     return Err(CompileError::InvalidInput(format!(
                         "qwen moe expert stack: layer {layer} expert {e} missing gate/up/down"
@@ -1237,7 +1276,8 @@ impl DefaultAbiBuilder<'_> {
                         "qwen moe expert stack: layer {layer} expert {e} dtype mismatch"
                     )));
                 }
-                let gate_up_base = checked_mul_i64(e, expert_gate_up_bytes, "qwen moe gate_up base")?;
+                let gate_up_base =
+                    checked_mul_i64(e, expert_gate_up_bytes, "qwen moe gate_up base")?;
                 let down_base = checked_mul_i64(e, half_bytes, "qwen moe down base")?;
                 gate_up_spans.push(RuntimeByteSpan {
                     tensor: g.id,
@@ -1938,10 +1978,7 @@ fn llama_like_shard_axis(name: &str) -> Option<Axis> {
         }
         if ends_with_any(
             name,
-            &[
-                ".down_proj.weight_packed",
-                ".down_proj.weight_scale",
-            ],
+            &[".down_proj.weight_packed", ".down_proj.weight_scale"],
         ) {
             return Some(Axis(1));
         }
@@ -2035,7 +2072,10 @@ fn runtime_quantizable_name(name: &str, scheme: QuantScheme) -> bool {
 
 fn is_glm_expert_weight(name: &str) -> bool {
     (name.contains(".mlp.experts.") || name.contains(".mlp.shared_experts."))
-        && ends_with_any(name, &[".gate_proj.weight", ".up_proj.weight", ".down_proj.weight"])
+        && ends_with_any(
+            name,
+            &[".gate_proj.weight", ".up_proj.weight", ".down_proj.weight"],
+        )
 }
 
 fn dsv4_shard_axis(name: &str) -> Option<Axis> {
@@ -2043,7 +2083,10 @@ fn dsv4_shard_axis(name: &str) -> Option<Axis> {
     // w1/w3 on axis 0 (gate/up out dim), w2 on axis 1 (down in dim).
     // Each rank computes a partial expert output; combined via all-reduce.
     if name.contains(".ffn.experts.") {
-        if ends_with_any(name, &[".w1.weight", ".w1.scale", ".w3.weight", ".w3.scale"]) {
+        if ends_with_any(
+            name,
+            &[".w1.weight", ".w1.scale", ".w3.weight", ".w3.scale"],
+        ) {
             return Some(Axis(0));
         }
         if ends_with_any(name, &[".w2.weight", ".w2.scale"]) {
@@ -2051,15 +2094,21 @@ fn dsv4_shard_axis(name: &str) -> Option<Axis> {
         }
     }
     // Shared experts: same column/row parallelism.
-    if ends_with_any(name, &[
-        ".shared_experts.w1.weight", ".shared_experts.w1.scale",
-        ".shared_experts.w3.weight", ".shared_experts.w3.scale",
-    ]) {
+    if ends_with_any(
+        name,
+        &[
+            ".shared_experts.w1.weight",
+            ".shared_experts.w1.scale",
+            ".shared_experts.w3.weight",
+            ".shared_experts.w3.scale",
+        ],
+    ) {
         return Some(Axis(0));
     }
-    if ends_with_any(name, &[
-        ".shared_experts.w2.weight", ".shared_experts.w2.scale",
-    ]) {
+    if ends_with_any(
+        name,
+        &[".shared_experts.w2.weight", ".shared_experts.w2.scale"],
+    ) {
         return Some(Axis(1));
     }
     // Everything else replicated (avoids TP communication in main path).

@@ -49,7 +49,10 @@ pub struct Shape {
 }
 
 impl Shape {
-    pub const SCALAR: Shape = Shape { dims: [0; MAX_RANK], rank: 0 };
+    pub const SCALAR: Shape = Shape {
+        dims: [0; MAX_RANK],
+        rank: 0,
+    };
 
     /// Build a shape from a dim slice. `None` if `dims.len() > MAX_RANK`.
     pub fn new(dims: &[u32]) -> Option<Shape> {
@@ -58,7 +61,10 @@ impl Shape {
         }
         let mut d = [0u32; MAX_RANK];
         d[..dims.len()].copy_from_slice(dims);
-        Some(Shape { dims: d, rank: dims.len() as u8 })
+        Some(Shape {
+            dims: d,
+            rank: dims.len() as u8,
+        })
     }
     pub fn vector(n: u32) -> Shape {
         Shape::new(&[n]).unwrap()
@@ -110,10 +116,16 @@ impl ValueType {
         Self { shape, dtype }
     }
     pub fn scalar(dtype: DType) -> Self {
-        Self { shape: Shape::SCALAR, dtype }
+        Self {
+            shape: Shape::SCALAR,
+            dtype,
+        }
     }
     pub fn vector(n: u32, dtype: DType) -> Self {
-        Self { shape: Shape::vector(n), dtype }
+        Self {
+            shape: Shape::vector(n),
+            dtype,
+        }
     }
 }
 

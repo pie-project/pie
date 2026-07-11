@@ -9,17 +9,15 @@ sidebar_position: 8
 Agent-shaped inferlets that loop generation against tools, code execution, or other agents.
 
 :::note[Running on the dummy driver?]
-`agent-react` and `agent-codeact` parse the model's output as JSON to extract the next action. The dummy driver returns uniform random tokens, so that JSON parse never succeeds — the loops hit `max_steps` without firing a tool. `agent-swarm`'s coordination layer (broadcast / subscribe) works correctly; only the message content is random.
+`agent-react` and `agent-codeact` parse the model's output as JSON to extract the next action. The dummy driver returns uniform random tokens, so that JSON parse never succeeds — the loops hit `max_steps` without firing a tool.
 :::
 
 | Inferlet | What it shows |
 |---|---|
 | [`agent-react`](https://github.com/pie-project/pie/tree/main/inferlets/agent-react) | ReAct (Reasoning + Acting) loop with tool execution. |
 | [`agent-codeact`](https://github.com/pie-project/pie/tree/main/inferlets/agent-codeact) | CodeACT: JavaScript code execution as the action space. |
-| [`agent-swarm`](https://github.com/pie-project/pie/tree/main/inferlets/agent-swarm) | Collaborative agent swarm coordinating via `messaging::broadcast/subscribe`. |
 
 ## Related guide
 
 - [Tool-call parser](../decoder/tool-calling): hand-rolled and native tool-call loops.
-- [Inferlet ↔ inferlet messaging](../io/messaging): pub/sub and queues — the swarm's coordination layer.
 - [HTTP](../io/http): tool transport for agent calls.

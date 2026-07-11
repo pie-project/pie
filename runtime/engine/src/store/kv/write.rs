@@ -6,6 +6,14 @@
 //! epoch. This is not a transaction manager: `KvStore` commits it on success
 //! and aborts/releases it on failure. `PendingFire` owns
 //! `Option<KvPreparedWrite>`.
+//!
+//! Complete typed-store API (kv_refact.md): some methods here are not yet
+//! called by the live single-model fire path (only a subset of the typed
+//! store surface is currently wired) but are exercised by this module's
+//! own unit test suite and reserved for upcoming increments (contention/
+//! reclaim expansion, RS buffer-write paths, etc.) — kept rather than
+//! deleted, allowed rather than silently masked.
+#![allow(dead_code)]
 
 use super::hash::Hash256;
 use super::page_table::{NodeId, PhysicalKvPageId, WorkingSetId};

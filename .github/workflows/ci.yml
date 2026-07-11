@@ -43,6 +43,20 @@ jobs:
           cargo test -p pie --lib
           cargo test -p pie-client --lib
 
+  # pie-engine layering gate — major_refactor.md's L0..L3 dependency direction
+  # (driver -> store -> scheduler -> pipeline -> inferlet/server, strictly
+  # downward). Pure text check (no Rust build needed), so it's the cheapest
+  # possible guard against a layer re-importing something above it. Also
+  # confirms the legacy `ptir`/`api`/`inference` module paths never come back.
+  engine-layering-gate:
+    name: pie-engine layering gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enforce L0..L3 downward-only imports + legacy path absence
+        run: ./scripts/check-engine-layering.sh
+
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a
   # curated subset, so new crates (`pie-transport`) and the benches were

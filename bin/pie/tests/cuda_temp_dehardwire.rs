@@ -63,8 +63,14 @@ async fn temp_dehardwire_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
-    client.add_program(&wasm, &manifest, true).await.context("add_program")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
+    client
+        .add_program(&wasm, &manifest, true)
+        .await
+        .context("add_program")?;
     eprintln!("[temp-dehardwire] program installed, launching tempgen…");
 
     let mut proc = client
@@ -79,7 +85,10 @@ async fn temp_dehardwire_on_real_driver() -> Result<()> {
     let toks_start = json
         .find("\"tokens\":")
         .context("response missing tokens field")?;
-    let lb = json[toks_start..].find('[').map(|i| toks_start + i).context("no [")?;
+    let lb = json[toks_start..]
+        .find('[')
+        .map(|i| toks_start + i)
+        .context("no [")?;
     let rb = json[lb..].find(']').map(|i| lb + i).context("no ]")?;
     let inner = json[lb + 1..rb].trim();
     let n_tokens = if inner.is_empty() {

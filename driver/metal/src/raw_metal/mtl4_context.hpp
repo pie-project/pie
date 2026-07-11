@@ -121,6 +121,35 @@ class RawMetalContext {
     // offsets in call order. align defaults to 256 (Metal buffer-offset alignment).
     SlotHandle heap_alloc(size_t size, size_t align = 256);
 
+    // Phase 1b/3 paged-KV bridge: a STANDALONE Shared-storage MTLBuffer, OUTSIDE
+    // the single placement heap (I2's "one resident heap, fixed offsets" is about
+    // the CORE decode weights/state/scratch/IO, which never move after setup();
+    // the paged-KV pool is explicitly designed to be independently GROWABLE —
+    // `resize_pool` allocates a NEW standalone buffer and copies old pages into
+    // it, without touching the core heap's layout/offsets at all). Individually
+    // registered with the residency set (incremental `addAllocation:`+`commit`,
+    // safe to call after the initial `make_resident()`). Returns an invalid
+    // (zero) SlotHandle on allocation failure.
+    SlotHandle create_standalone_buffer(size_t size);
+
+    // Phase 3 (review item 4) — release a standalone buffer previously handed
+    // out by create_standalone_buffer: drop it from the residency set
+    // (removeAllocation + commit) AND from the context's retained-alive array
+    // so ARC actually frees the GPU allocation. Without this, `resize_pool`'s
+    // repeated grow/shrink would leak the OLD K/V buffers forever (they stay
+    // retained + resident), growing GPU memory unbounded. `contents()`/
+    // `gpu_address` on `h` are invalid after this call. A no-op for an invalid
+    // (zero) handle or one this context never allocated.
+    void release_standalone_buffer(const SlotHandle& h);
+
+    // Phase 3 (review item 4) — host-visible allocation probe over the
+    // STANDALONE (non-heap) buffers only: how many are currently alive and
+    // their summed byte size. Lets a lifecycle test assert that a grow→shrink
+    // cycle returns to a bounded baseline (no per-resize leak). The core
+    // placement heap is not counted (it is fixed-size, allocated once).
+    size_t standalone_buffer_count() const;
+    size_t standalone_bytes() const;
+
     // Make the whole heap resident ONCE (invariant I2). Call after all heap_alloc +
     // all arg_bind, before the first encode.
     void make_resident();
@@ -136,6 +165,10 @@ class RawMetalContext {
     // Explicit ordinal-keyed form (kind elided — the ordinal is the only key).
     void arg_bind_ordinal(int ordinal, uint8_t bind_index, SlotHandle slot,
                           size_t offset = 0);
+    // Binding introspection for DAG coverage tests.  It reports host-side
+    // table population, not shader reflection, and is safe before residency.
+    bool arg_slot_is_bound(int ordinal, uint8_t bind_index) const;
+    uint64_t arg_slot_address(int ordinal, uint8_t bind_index) const;
     // delta's exact 1-arg-less form for singleton kernels (ordinal = -1).
     void arg_bind(Kernel k, uint8_t bind_index, SlotHandle slot, size_t offset = 0) {
         arg_bind(k, -1, bind_index, slot, offset);

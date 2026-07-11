@@ -77,7 +77,6 @@ from .spec import Speculator
 
 # --- Runtime / IO ---
 from . import runtime
-from . import messaging
 from . import session
 from . import zo
 
@@ -123,7 +122,6 @@ __all__ = [
     "Speculator",
     # Runtime / IO
     "runtime",
-    "messaging",
     "session",
     "zo",
 ]

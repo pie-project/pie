@@ -33,10 +33,15 @@
 #include <pie_driver_abi.h>
 
 #include "ptir/channels.hpp"  // kMaxRing + the (unchanged) ring kernels
-#include "ptir/trace.hpp"
+#include "pie_native/ptir/trace.hpp"
 #include "cuda_check.hpp"
 
 namespace pie_cuda_driver::ptir {
+
+// Shared pure-host PTIR decode model (trace/op-table/container/bound/
+// fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
+// scope so the CUDA-side tier-0/1 code below can use it unqualified.
+using namespace pie_native::ptir;
 
 // Registry device-array capacity in SLOTS (grows on demand). One inferlet's
 // live channel count is small; this is a generous initial reservation.

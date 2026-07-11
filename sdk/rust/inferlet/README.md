@@ -31,7 +31,7 @@ async fn main(_: ()) -> Result<String> {
   formats.
 - `model`: global functions over the single bound model (`encode`, `decode`,
   `name`, …).
-- `runtime`, `messaging`: host services exposed to inferlets.
+- `runtime`, `session`: host services exposed to inferlets.
 
 ## Build
 

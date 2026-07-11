@@ -368,14 +368,13 @@ impl DummyDriver {
         }
         let container = container::decode(&canonical_bytes)
             .map_err(|err| anyhow!("program decode failed: {err}"))?;
-        let bound = pie_ptir::validate::bind(container, self.model_profile())
-            .map_err(|err| {
-                anyhow!(
-                    "program bind failed: {err} (profile: vocab={}, page_size={})",
-                    self.model_profile().vocab,
-                    self.model_profile().page_size
-                )
-            })?;
+        let bound = pie_ptir::validate::bind(container, self.model_profile()).map_err(|err| {
+            anyhow!(
+                "program bind failed: {err} (profile: vocab={}, page_size={})",
+                self.model_profile().vocab,
+                self.model_profile().page_size
+            )
+        })?;
         let program = Arc::new(DummyProgram {
             hash,
             intrinsics: collect_intrinsics(&bound),
@@ -688,9 +687,8 @@ impl DummyDriver {
                 let endpoint = channel.endpoint.lock().unwrap();
                 let tail = endpoint.words[1].load(Ordering::Acquire);
                 let extra = planned_extra.entry(endpoint_key).or_insert(0);
-                let credit = u64::from(
-                    endpoint.seed_credit && !planned_seed_spend.contains(&endpoint_key),
-                );
+                let credit =
+                    u64::from(endpoint.seed_credit && !planned_seed_spend.contains(&endpoint_key));
                 if tail.saturating_sub(endpoint.reserved_head + *extra) + credit < 1 {
                     bail!(
                         "channel {} has no host input for this fire \

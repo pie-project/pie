@@ -57,9 +57,12 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, C
         let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
             CompileError::InvalidInput(format!("{} is not valid JSON: {err}", index.display()))
         })?;
-        let weight_map = value.get("weight_map").and_then(serde_json::Value::as_object).ok_or_else(
-            || CompileError::InvalidInput(format!("{} missing 'weight_map'", index.display())),
-        )?;
+        let weight_map = value
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                CompileError::InvalidInput(format!("{} missing 'weight_map'", index.display()))
+            })?;
         // Unique shard names, sorted — a BTreeSet reproduces the C++ dedup+sort.
         let mut shard_names = BTreeSet::new();
         for shard in weight_map.values() {
@@ -71,7 +74,10 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, C
             })?;
             shard_names.insert(shard.to_string());
         }
-        return Ok(shard_names.into_iter().map(|s| snapshot_dir.join(s)).collect());
+        return Ok(shard_names
+            .into_iter()
+            .map(|s| snapshot_dir.join(s))
+            .collect());
     }
 
     if single.is_file() {
@@ -95,7 +101,10 @@ fn discover_gguf_file(snapshot_dir: &Path) -> Option<PathBuf> {
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("gguf")))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        })
         .collect();
     ggufs.sort();
     ggufs.into_iter().next()

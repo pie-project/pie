@@ -122,11 +122,7 @@ fn parse_tokens(json: &str) -> Option<Vec<i64>> {
         .split(',')
         .filter_map(|s| s.trim().parse::<i64>().ok())
         .collect();
-    if toks.is_empty() {
-        None
-    } else {
-        Some(toks)
-    }
+    if toks.is_empty() { None } else { Some(toks) }
 }
 
 /// Run one pipeline to completion. Returns `Ok(Some(tokens))` on success, or
@@ -222,14 +218,16 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         Some(tokio::spawn(async move {
             let t0 = std::time::Instant::now();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(orch) = pie_engine::inference::contention::contention() {
+                if let Some(orch) = pie_engine::store::reclaim::contention() {
                     let s = orch.stats();
                     use std::sync::atomic::Ordering::Relaxed;
                     eprintln!(
                         "[contention-trace] t={}ms parked={} woken={} suspends={} restores={}",
                         t0.elapsed().as_millis(),
-                        s.waiters_parked.load(Relaxed), s.waiters_woken.load(Relaxed),
-                        s.suspends.load(Relaxed), s.restores.load(Relaxed),
+                        s.waiters_parked.load(Relaxed),
+                        s.waiters_woken.load(Relaxed),
+                        s.suspends.load(Relaxed),
+                        s.restores.load(Relaxed),
                     );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -250,7 +248,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // "restore corruption" framing → the bug is not on the restore path).
     {
         use std::sync::atomic::Ordering as O;
-        if let Some(o) = pie_engine::inference::contention::contention() {
+        if let Some(o) = pie_engine::store::reclaim::contention() {
             let s = o.stats();
             eprintln!(
                 "[contention] final-engagement: parked={} woken={} suspends={} restores={}",
@@ -285,7 +283,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // `suspends`/`restores` are zero-by-design in v1 (they arm with the v2
     // state-save backend — logged for the record).
     use std::sync::atomic::Ordering;
-    let (parked, woken, suspends, restores) = pie_engine::inference::contention::contention()
+    let (parked, woken, suspends, restores) = pie_engine::store::reclaim::contention()
         .map(|o| {
             let s = o.stats();
             (

@@ -218,7 +218,7 @@ pub fn spawn(
     // Task-B contention: register with the preempt/restore orchestrator —
     // registration order is the FCFS clock (victim = youngest registered).
     // No-op unless PIE_KV_CONTENTION=preempt.
-    if let Some(o) = crate::inference::contention::contention() {
+    if let Some(o) = crate::store::reclaim::contention() {
         o.register(id);
     }
 
@@ -248,9 +248,9 @@ pub fn terminate(process_id: ProcessId, result: Result<String, String>) {
     // M-A1 Stage 2: broadcast a wait-for-all pipeline `Leave` so the scheduler
     // drops this pid from its wave wait-set immediately (rather than after the
     // miss-counter backstop). No-op unless a waitall scheduler is registered.
-    crate::inference::scheduler::notify_pipeline_leave(
+    crate::scheduler::worker::notify_pipeline_leave(
         process_id,
-        crate::inference::scheduler::LeaveKind::Terminate,
+        crate::scheduler::worker::LeaveKind::Terminate,
     );
     let _ = SERVICES.send(&process_id, Message::Terminate { result });
 }
@@ -542,6 +542,7 @@ impl Process {
             Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),
         }
 
+        let _ = server::inbox::clear(self.process_id.to_string());
         SERVICES.remove(&self.process_id);
 
         // M-A1 wait-for-all: drop this pid from the scheduler's wave wait-set as
@@ -550,9 +551,9 @@ impl Process {
         // well before the miss-limit backstop would demote it. Idempotent with the
         // free fn's early `Leave{Terminate}`; no-op unless a waitall scheduler is
         // registered.
-        crate::inference::scheduler::notify_pipeline_leave(
+        crate::scheduler::worker::notify_pipeline_leave(
             self.process_id,
-            crate::inference::scheduler::LeaveKind::Terminate,
+            crate::scheduler::worker::LeaveKind::Terminate,
         );
 
         // Task-B contention: unregister from the preempt/restore orchestrator
@@ -560,7 +561,7 @@ impl Process {
         // teardown, and drains — the exiting process's KV frees follow via the
         // WS-drop hook). Single exit funnel: covers natural completion AND
         // external terminate. No-op unless PIE_KV_CONTENTION=preempt.
-        if let Some(o) = crate::inference::contention::contention() {
+        if let Some(o) = crate::store::reclaim::contention() {
             o.unregister(self.process_id);
         }
     }

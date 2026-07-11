@@ -1,3 +1,7 @@
+//! Driver specs and native-backend storage — the `DriverId` registry.
+//! Scheduler-handle lookup lives in the scheduler layer; this module keeps
+//! only what the driver ABI itself owns, `DriverSpec`/`NativeDriver`.
+
 use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
@@ -9,7 +13,6 @@ use crate::driver::frame::{
     LaunchDescBorrow, LaunchSubmission, PoolResizePlan, ProgramRegistration, RegisteredChannel,
     StateCopyPlan,
 };
-use crate::inference::scheduler::SchedulerHandle;
 
 pub struct DummyLocalDriver {
     inner: pie_driver_dummy_lib::DummyDriver,
@@ -119,7 +122,6 @@ impl DriverSpec {
 struct DriverRegistration {
     spec: DriverSpec,
     native: Option<NativeDriver>,
-    scheduler: Option<SchedulerHandle>,
 }
 
 fn registry() -> &'static RwLock<Vec<Option<DriverRegistration>>> {
@@ -130,11 +132,7 @@ fn registry() -> &'static RwLock<Vec<Option<DriverRegistration>>> {
 pub fn register_driver(spec: DriverSpec) -> usize {
     let mut drivers = registry().write().unwrap();
     let id = drivers.len();
-    drivers.push(Some(DriverRegistration {
-        spec,
-        native: None,
-        scheduler: None,
-    }));
+    drivers.push(Some(DriverRegistration { spec, native: None }));
     id
 }
 
@@ -144,36 +142,8 @@ pub fn register_native_driver(spec: DriverSpec, native: NativeDriver) -> usize {
     drivers.push(Some(DriverRegistration {
         spec,
         native: Some(native),
-        scheduler: None,
     }));
     id
-}
-
-pub(crate) fn install_scheduler_handle(driver_id: usize, scheduler: SchedulerHandle) -> Result<()> {
-    let mut drivers = registry().write().unwrap();
-    let Some(Some(driver)) = drivers.get_mut(driver_id) else {
-        return Err(anyhow!("unknown driver {driver_id}"));
-    };
-    driver.scheduler = Some(scheduler);
-    Ok(())
-}
-
-pub(crate) fn clear_scheduler_handle(driver_id: usize) -> Result<()> {
-    let mut drivers = registry().write().unwrap();
-    let Some(Some(driver)) = drivers.get_mut(driver_id) else {
-        return Err(anyhow!("unknown driver {driver_id}"));
-    };
-    driver.scheduler = None;
-    Ok(())
-}
-
-pub(crate) fn scheduler_handle(driver_id: usize) -> Result<SchedulerHandle> {
-    registry()
-        .read()
-        .unwrap()
-        .get(driver_id)
-        .and_then(|d| d.as_ref().and_then(|r| r.scheduler.clone()))
-        .ok_or_else(|| anyhow!("driver {driver_id} has no scheduler"))
 }
 
 pub async fn get_spec(driver_id: usize) -> Result<DriverSpec> {

@@ -901,11 +901,10 @@ fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileErro
 
     for buffer in &program.buffers {
         if let Some(offset) = buffer.persistent_offset {
-            persistent_bytes = persistent_bytes.max(
-                offset
-                    .checked_add(buffer.bytes)
-                    .ok_or_else(|| CompileError::InvalidInput("persistent byte overflow".to_string()))?,
-            );
+            persistent_bytes =
+                persistent_bytes.max(offset.checked_add(buffer.bytes).ok_or_else(|| {
+                    CompileError::InvalidInput("persistent byte overflow".to_string())
+                })?);
         } else if !buffer.temporary && buffer.tensor.is_some() {
             persistent_bytes = persistent_bytes.checked_add(buffer.bytes).ok_or_else(|| {
                 CompileError::InvalidInput("persistent byte overflow".to_string())
@@ -960,9 +959,10 @@ fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileErro
                     .ok_or_else(|| CompileError::InvalidInput("read byte overflow".to_string()))?;
                 let mut payload_bytes = 0u64;
                 for placement in placements {
-                    payload_bytes = payload_bytes
-                        .checked_add(placement.bytes)
-                        .ok_or_else(|| CompileError::InvalidInput("write byte overflow".to_string()))?;
+                    payload_bytes =
+                        payload_bytes.checked_add(placement.bytes).ok_or_else(|| {
+                            CompileError::InvalidInput("write byte overflow".to_string())
+                        })?;
                 }
                 device_write_bytes = device_write_bytes
                     .checked_add(payload_bytes)
@@ -1071,7 +1071,11 @@ fn persistent_source_order(
         let StorageInstr::ExtentWrite { source, dest, .. } = instr else {
             continue;
         };
-        let Some(buffer) = program.buffers.iter().find(|buffer| buffer.id == dest.buffer) else {
+        let Some(buffer) = program
+            .buffers
+            .iter()
+            .find(|buffer| buffer.id == dest.buffer)
+        else {
             continue;
         };
         if buffer.temporary || buffer.tensor.is_none() || buffer.bytes == 0 {
@@ -1157,9 +1161,10 @@ fn validate_persistent_layout(program: &StorageProgram) -> Result<(), CompileErr
             )));
         };
         let extent = extent_storage_bytes(&view.stride)?;
-        let end = view.offset.checked_add(extent).ok_or_else(|| {
-            CompileError::InvalidInput("CreateView window overflow".to_string())
-        })?;
+        let end = view
+            .offset
+            .checked_add(extent)
+            .ok_or_else(|| CompileError::InvalidInput("CreateView window overflow".to_string()))?;
         if end > backing.bytes {
             return Err(CompileError::InvalidInput(format!(
                 "CreateView window [{}, {}) escapes backing buffer {} ({} bytes)",
@@ -1215,7 +1220,11 @@ fn non_bulk_compatible_persistent_write_buffers(
         let StorageInstr::ExtentWrite { source, dest, .. } = instr else {
             continue;
         };
-        let Some(buffer) = program.buffers.iter().find(|buffer| buffer.id == dest.buffer) else {
+        let Some(buffer) = program
+            .buffers
+            .iter()
+            .find(|buffer| buffer.id == dest.buffer)
+        else {
             continue;
         };
         if buffer.persistent_offset.is_none() {
@@ -1376,13 +1385,10 @@ fn build_slab_scatter_writes(program: &mut StorageProgram) -> Result<(), Compile
                 std::collections::HashMap::new();
             for instr in &old_instrs {
                 if let StorageInstr::BulkExtentWrite { source, .. } = instr {
-                    file_groups
-                        .entry(source.file_id.0)
-                        .or_default()
-                        .push((
-                            source.file_offset + source.stride.base_offset,
-                            source.span_bytes,
-                        ));
+                    file_groups.entry(source.file_id.0).or_default().push((
+                        source.file_offset + source.stride.base_offset,
+                        source.span_bytes,
+                    ));
                 }
             }
             for (fid, mut entries) in file_groups {
@@ -1406,7 +1412,11 @@ fn build_slab_scatter_writes(program: &mut StorageProgram) -> Result<(), Compile
                     total_bytes as f64 / (1024.0 * 1024.0),
                     span as f64 / (1024.0 * 1024.0),
                     max_gap as f64 / (1024.0 * 1024.0),
-                    if total_bytes > 0 { span as f64 / total_bytes as f64 } else { 0.0 }
+                    if total_bytes > 0 {
+                        span as f64 / total_bytes as f64
+                    } else {
+                        0.0
+                    }
                 );
             }
         }
@@ -1601,7 +1611,11 @@ fn extent_write_as_bulk(
     {
         return Ok(None);
     }
-    let Some(buffer) = program.buffers.iter().find(|buffer| buffer.id == dest.buffer) else {
+    let Some(buffer) = program
+        .buffers
+        .iter()
+        .find(|buffer| buffer.id == dest.buffer)
+    else {
         return Err(CompileError::InvalidInput(format!(
             "destination buffer {} is missing",
             dest.buffer.0
@@ -1616,7 +1630,9 @@ fn extent_write_as_bulk(
     let dest_offset = base
         .checked_add(dest.offset)
         .and_then(|v| v.checked_add(dest.stride.base_offset))
-        .ok_or_else(|| CompileError::InvalidInput("bulk destination offset overflow".to_string()))?;
+        .ok_or_else(|| {
+            CompileError::InvalidInput("bulk destination offset overflow".to_string())
+        })?;
     Ok(Some(StorageInstr::BulkExtentWrite {
         id: *id,
         source: SourceExtent {
@@ -1716,9 +1732,11 @@ fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError>
                 ) || (*kind == TileMapKind::Encode
                     && matches!(
                         transform.to,
-                        Some(QuantScheme::Fp8E4M3
-                             | QuantScheme::Int8Symmetric
-                             | QuantScheme::Mxfp4E2M1E8M0)
+                        Some(
+                            QuantScheme::Fp8E4M3
+                                | QuantScheme::Int8Symmetric
+                                | QuantScheme::Mxfp4E2M1E8M0
+                        )
                     ))
                     || (*kind == TileMapKind::Repack
                         && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
@@ -2310,7 +2328,10 @@ mod persistent_layout_tests {
 
     #[test]
     fn accepts_aligned_disjoint_operands() {
-        let p = program_with(vec![operand(0, 256, 1, Some(0)), operand(1, 256, 1, Some(256))]);
+        let p = program_with(vec![
+            operand(0, 256, 1, Some(0)),
+            operand(1, 256, 1, Some(256)),
+        ]);
         assert!(validate_persistent_layout(&p).is_ok());
     }
 
@@ -2324,7 +2345,10 @@ mod persistent_layout_tests {
     #[test]
     fn rejects_overlapping_operands() {
         // [0,512) and [256,512) overlap; both bases are 256-aligned.
-        let p = program_with(vec![operand(0, 512, 1, Some(0)), operand(1, 256, 1, Some(256))]);
+        let p = program_with(vec![
+            operand(0, 512, 1, Some(0)),
+            operand(1, 256, 1, Some(256)),
+        ]);
         assert!(validate_persistent_layout(&p).is_err());
     }
 
@@ -2341,7 +2365,11 @@ mod persistent_layout_tests {
                 stride: StridedExtent {
                     base_offset: 0,
                     element_bytes: 1,
-                    dims: vec![DimSpec { count: 64, src_stride: 1, dst_stride: 1 }],
+                    dims: vec![DimSpec {
+                        count: 64,
+                        src_stride: 1,
+                        dst_stride: 1,
+                    }],
                 },
             },
             layout: crate::types::Layout::dense(1),

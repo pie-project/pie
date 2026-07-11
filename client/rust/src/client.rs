@@ -30,7 +30,7 @@ pub enum ProcessEvent {
     Stdout(String),
     /// Stderr output from the process.
     Stderr(String),
-    /// An inferlet text message (via messaging::send).
+    /// An inferlet text message (via session::send).
     Message(String),
     /// A binary file sent from the inferlet.
     File(Vec<u8>),
@@ -259,7 +259,6 @@ impl Client {
         let corr_id_ref = match &mut msg {
             ClientMessage::AuthIdentify { corr_id, .. }
             | ClientMessage::AuthProve { corr_id, .. }
-            | ClientMessage::AuthByToken { corr_id, .. }
             | ClientMessage::CheckProgram { corr_id, .. }
             | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
@@ -341,20 +340,6 @@ impl Client {
                 username,
                 result
             )
-        }
-    }
-
-    /// Authenticates the client with the server using an internal token.
-    pub async fn auth_by_token(&self, token: &str) -> Result<()> {
-        let msg = ClientMessage::AuthByToken {
-            corr_id: 0,
-            token: token.to_string(),
-        };
-        let (ok, result) = self.send_msg_and_wait(msg).await?;
-        if ok {
-            Ok(())
-        } else {
-            anyhow::bail!("Internal authentication failed: {}", result)
         }
     }
 

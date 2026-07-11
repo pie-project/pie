@@ -18,7 +18,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "ptir/op_table.hpp"
+#include "pie_native/ptir/op_table.hpp"
 #include "ptir/tier0_kernels.cuh"  // for the BinKind/UnKind/... enums (host-safe)
 
 namespace pie_cuda_driver::ptir::host_eval {

@@ -36,8 +36,7 @@ use std::path::PathBuf;
 
 /// Local `gemma-4-E4B` HF snapshot (vision + audio). Override with
 /// `PIE_CUDA_TEST_MM_SNAPSHOT=/path/to/snapshot`.
-const DEFAULT_MM_SNAPSHOT: &str =
-    "/home/ingim/.cache/huggingface/hub/models--google--gemma-4-E4B/snapshots/7aa32e6889efd6300124851b164f8b364314c3d8";
+const DEFAULT_MM_SNAPSHOT: &str = "/home/ingim/.cache/huggingface/hub/models--google--gemma-4-E4B/snapshots/7aa32e6889efd6300124851b164f8b364314c3d8";
 
 fn mm_snapshot() -> String {
     std::env::var("PIE_CUDA_TEST_MM_SNAPSHOT").unwrap_or_else(|_| DEFAULT_MM_SNAPSHOT.to_string())
@@ -92,8 +91,7 @@ async fn boot_mm_cuda(snapshot_path: &str) -> pie_worker::WorkerHandle {
 /// Standard base64 (RFC 4648, padded) — matches `image-qa-bench`'s self-contained
 /// `b64_decode` (accepts padded/unpadded, whitespace-tolerant).
 fn b64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;

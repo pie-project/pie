@@ -45,7 +45,11 @@ const PTSK_VERSION: u16 = 1;
 /// The D5 per-stage batch key for `stage`, or `None` if the bound trace has no
 /// program for that stage. See the module docs for the normalization.
 pub fn stage_key(bound: &BoundTrace, stage: Stage) -> Option<u64> {
-    let idx = bound.container.stages.iter().position(|s| s.stage == stage)?;
+    let idx = bound
+        .container
+        .stages
+        .iter()
+        .position(|s| s.stage == stage)?;
     Some(stage_key_at(bound, idx))
 }
 
@@ -71,9 +75,13 @@ pub fn stage_key_at(bound: &BoundTrace, stage_idx: usize) -> u64 {
         match op {
             Op::ChanTake(c) => encode_op(&mut w, &Op::ChanTake(local_id(&mut order, *c))),
             Op::ChanRead(c) => encode_op(&mut w, &Op::ChanRead(local_id(&mut order, *c))),
-            Op::ChanPut { chan, value } => {
-                encode_op(&mut w, &Op::ChanPut { chan: local_id(&mut order, *chan), value: *value })
-            }
+            Op::ChanPut { chan, value } => encode_op(
+                &mut w,
+                &Op::ChanPut {
+                    chan: local_id(&mut order, *chan),
+                    value: *value,
+                },
+            ),
             other => encode_op(&mut w, other),
         }
     }
@@ -144,7 +152,12 @@ mod tests {
             DType::Bool => Literal::Bool(true),
         };
         // ChanTake -> v0, Const -> v1, Add -> v2, ChanPut(v2).
-        vec![Op::ChanTake(c), Op::Const(one), Op::Add(0, 1), Op::ChanPut { chan: c, value: 2 }]
+        vec![
+            Op::ChanTake(c),
+            Op::Const(one),
+            Op::Add(0, 1),
+            Op::ChanPut { chan: c, value: 2 },
+        ]
     }
 
     fn bound_of(container: TraceContainer) -> BoundTrace {
@@ -161,13 +174,22 @@ mod tests {
             Op::ChanTake(u32_chan),
             Op::Const(Literal::U32(1)),
             Op::Add(0, 1),
-            Op::ChanPut { chan: u32_chan, value: 2 },
+            Op::ChanPut {
+                chan: u32_chan,
+                value: 2,
+            },
             Op::ChanTake(i32_chan),
             Op::Const(Literal::I32(1)),
             Op::Add(3, 4),
-            Op::ChanPut { chan: i32_chan, value: 5 },
+            Op::ChanPut {
+                chan: i32_chan,
+                value: 5,
+            },
         ];
-        StageProgram { stage: Stage::Epilogue, ops }
+        StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }
     }
 
     #[test]
@@ -190,7 +212,10 @@ mod tests {
             channels: vec![ch(DType::F32), ch(DType::I32), ch(DType::U32)],
             ports: vec![],
             stages: vec![
-                StageProgram { stage: Stage::Prologue, ops: self_loop(0, DType::F32) },
+                StageProgram {
+                    stage: Stage::Prologue,
+                    ops: self_loop(0, DType::F32),
+                },
                 two_loop_epilogue(2, 1),
             ],
             externs: vec![],
@@ -199,7 +224,10 @@ mod tests {
         assert_ne!(a.hash, b.hash, "the two passes are different programs (C3)");
         let ka = stage_key(&a, Stage::Epilogue).unwrap();
         let kb = stage_key(&b, Stage::Epilogue).unwrap();
-        assert_eq!(ka, kb, "same epilogue embedded in two passes shares a stage key");
+        assert_eq!(
+            ka, kb,
+            "same epilogue embedded in two passes shares a stage key"
+        );
 
         // The prologue-only stage exists in B, not A.
         assert!(stage_key(&b, Stage::Prologue).is_some());
@@ -223,7 +251,10 @@ mod tests {
             names: vec![],
             channels: vec![ch(DType::U32), ch(DType::I32)],
             ports: vec![],
-            stages: vec![StageProgram { stage: Stage::Epilogue, ops }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops,
+            }],
             externs: vec![],
         });
 
@@ -263,7 +294,10 @@ mod tests {
                 names: vec![],
                 channels: vec![ch(DType::I32), ch(DType::U32)],
                 ports: vec![],
-                stages: vec![StageProgram { stage: Stage::Epilogue, ops }],
+                stages: vec![StageProgram {
+                    stage: Stage::Epilogue,
+                    ops,
+                }],
                 externs: vec![],
             })
         };

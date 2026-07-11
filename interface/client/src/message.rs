@@ -25,9 +25,6 @@ pub enum ClientMessage {
     #[serde(rename = "auth_prove")]
     AuthProve { corr_id: u32, signature: String },
 
-    #[serde(rename = "auth_by_token")]
-    AuthByToken { corr_id: u32, token: String },
-
     #[serde(rename = "check_program")]
     CheckProgram {
         corr_id: u32,

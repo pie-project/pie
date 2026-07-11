@@ -5,6 +5,14 @@
 //! owns no CoW logic, hash maintenance, mapping, residency, or refcounts
 //! (kv_refact.md, `store/pool.rs`). Freed ids are recycled only after the
 //! completion epoch of their last in-flight user retires.
+//!
+//! Complete typed-store API (kv_refact.md): some methods here are not yet
+//! called by the live single-model fire path (only a subset of the typed
+//! store surface is currently wired) but are exercised by this module's
+//! own unit test suite and reserved for upcoming increments (contention/
+//! reclaim expansion, RS buffer-write paths, etc.) — kept rather than
+//! deleted, allowed rather than silently masked.
+#![allow(dead_code)]
 
 /// A typed physical id backed by a pool slot. Implemented by
 /// `PhysicalKvPageId` and RS-specific ids.

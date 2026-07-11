@@ -89,6 +89,7 @@ std::vector<WeightBind> weight_binds(Kernel kind, int layer, const DecodeGeometr
         //   GdnPrep: conv1d.weight(2) + A_log(4) + dt_bias(5) load-once weights.
         //   GdnCore-recurrent: ONLY conv1d.weight(4) — A_log/dt_bias fold into PreGate scratch.
         case Kernel::GdnPrep:
+        case Kernel::GdnPrepSlotted:
             w.push_back({static_cast<uint8_t>(bind::GdnPrep::ConvW),  p + "linear_attn.conv1d.weight"});
             w.push_back({static_cast<uint8_t>(bind::GdnPrep::ALog),   p + "linear_attn.A_log"});
             w.push_back({static_cast<uint8_t>(bind::GdnPrep::DtBias), p + "linear_attn.dt_bias"});
@@ -98,7 +99,8 @@ std::vector<WeightBind> weight_binds(Kernel kind, int layer, const DecodeGeometr
         //    ConvB has NO checkpoint tensor (conv1d is bias-less) -> zeroed slot (bound in
         //    bind_decode_dag). ConvState/RecurrentState/ConvStateOut are persistent STATE.
         case Kernel::GdnCore:
-            if (gdn_prep) {  // recurrent variant: conv1d.weight only (at slimmed buffer 4)
+        case Kernel::GdnCoreSlotted:
+            if (gdn_prep || kind == Kernel::GdnCoreSlotted) {
                 w.push_back({static_cast<uint8_t>(bind::GdnCoreRecurrent::ConvW),
                              p + "linear_attn.conv1d.weight"});
             } else {
@@ -123,7 +125,9 @@ std::vector<WeightBind> weight_binds(Kernel kind, int layer, const DecodeGeometr
         case Kernel::Rope:
         case Kernel::RopeK:
         case Kernel::KvAppend:
+        case Kernel::KvAppendPaged:
         case Kernel::Sdpa:
+        case Kernel::SdpaPaged:
         case Kernel::AttnGate:
         case Kernel::SiluMul:
         case Kernel::Residual:

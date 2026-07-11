@@ -5,9 +5,9 @@
 //! determinism (T8), beam reorder/freeze geometry exact.
 #![cfg(feature = "eval")]
 
-use pie_ptir::interp::Value;
 use pie_ptir::container::{decode, encode};
 use pie_ptir::container_hash;
+use pie_ptir::interp::Value;
 use pie_ptir::interp::{Instance, NoKernels, PassInputs};
 use pie_ptir::registry::{ModelProfile, Port};
 use pie_ptir::validate::bind;
@@ -34,15 +34,18 @@ fn section3_end_to_end_with_late_mask_and_recovery() {
     let c = section3_trace();
     let b = bind(c, ModelProfile::dummy()).unwrap();
     let seeds = [
-        (0u32, i32s(&[1])),          // BOS
-        (3u32, u32s(&[1])),          // len
-        (4u32, u32s(&[1234, 0])),    // rng [key, ctr]
+        (0u32, i32s(&[1])),       // BOS
+        (3u32, u32s(&[1])),       // len
+        (4u32, u32s(&[1234, 0])), // rng [key, ctr]
     ];
     let mut inst = Instance::new(&b, &seeds).unwrap();
 
     // Prime mask_0 (allow everything), fire step 0: strong logit on 7 wins.
     inst.host_put(&b, 2, allow_all()).unwrap();
-    let inputs = PassInputs { logits: Some(flat_logits(7, 100.0)), ..Default::default() };
+    let inputs = PassInputs {
+        logits: Some(flat_logits(7, 100.0)),
+        ..Default::default()
+    };
     let r = inst.step(&b, &inputs, &mut NoKernels).unwrap();
     assert!(r.committed);
     // Descriptor saw the seeded BOS token.
@@ -54,7 +57,10 @@ fn section3_end_to_end_with_late_mask_and_recovery() {
     let r = inst.step(&b, &inputs, &mut NoKernels).unwrap();
     assert!(!r.committed);
     assert_eq!(r.missed.unwrap().0, 2);
-    assert_eq!(inst.host_read(&b, 1), Err(pie_ptir::interp::HostError::WouldBlock));
+    assert_eq!(
+        inst.host_read(&b, 1),
+        Err(pie_ptir::interp::HostError::WouldBlock)
+    );
 
     // mask_1 excludes 7, allows only 3: resubmission commits with 3 even
     // though the raw logit still favors 7 — the grammar constrains exactly.
@@ -70,10 +76,17 @@ fn section3_replay_determinism_t8() {
     let c = section3_trace();
     let b = bind(c, ModelProfile::dummy()).unwrap();
     let run = || {
-        let seeds = [(0u32, i32s(&[1])), (3u32, u32s(&[9])), (4u32, u32s(&[77, 5]))];
+        let seeds = [
+            (0u32, i32s(&[1])),
+            (3u32, u32s(&[9])),
+            (4u32, u32s(&[77, 5])),
+        ];
         let mut inst = Instance::new(&b, &seeds).unwrap();
         // Flat logits: the gumbel noise alone decides — pure (key, ctr).
-        let inputs = PassInputs { logits: Some(f32s(&[0.0; VOCAB as usize])), ..Default::default() };
+        let inputs = PassInputs {
+            logits: Some(f32s(&[0.0; VOCAB as usize])),
+            ..Default::default()
+        };
         let mut toks = Vec::new();
         for _ in 0..4 {
             inst.host_put(&b, 2, allow_all()).unwrap();
@@ -138,7 +151,10 @@ fn beam_step_reorder_freeze_geometry_exact() {
     let mut logits = vec![0.0f32; (BB * V) as usize];
     logits[3] = 8.0; // row 0 → token 3
     logits[(V + 5) as usize] = 7.0; // row 1 → token 5
-    let inputs = PassInputs { logits: Some(Value::F32(logits)), ..Default::default() };
+    let inputs = PassInputs {
+        logits: Some(Value::F32(logits)),
+        ..Default::default()
+    };
     let r = inst.step(&b, &inputs, &mut NoKernels).unwrap();
     assert!(!r.committed);
     assert_eq!(r.missed.unwrap().0, 12);
@@ -152,23 +168,34 @@ fn beam_step_reorder_freeze_geometry_exact() {
 
     assert_eq!(inst.host_take(&b, 13).unwrap(), i32s(&[3, 5])); // tokens
     assert_eq!(inst.host_take(&b, 14).unwrap(), u32s(&[0, 1])); // parents
-    let Value::F32(scr) = inst.host_take(&b, 15).unwrap() else { panic!() };
+    let Value::F32(scr) = inst.host_take(&b, 15).unwrap() else {
+        panic!()
+    };
     assert!(scr[0] > scr[1], "row-0 winner scored higher: {scr:?}");
 
     // Descriptor for the NEXT pass sees the updated geometry.
     let r2 = inst.step(&b, &inputs, &mut NoKernels).unwrap();
     assert!(!r2.committed); // out not harvested → back-pressure parks it
-    let get = |p: Port| r2.descriptor.iter().find(|(q, _)| *q == p).unwrap().1.clone();
+    let get = |p: Port| {
+        r2.descriptor
+            .iter()
+            .find(|(q, _)| *q == p)
+            .unwrap()
+            .1
+            .clone()
+    };
     assert_eq!(get(Port::EmbedTokens), i32s(&[3, 5]));
     assert_eq!(get(Port::KvLen), u32s(&[7, 7])); // span grew by one
     assert_eq!(get(Port::Pages), u32s(&[5, 6, 0, 5, 6, 0])); // no page turn
     assert_eq!(get(Port::WSlot), u32s(&[6, 6]));
     assert_eq!(get(Port::WOff), u32s(&[2, 2])); // the chosen token lands at
-                                                // the old fill; tfill/lens
-                                                // already cover it (off+1)
+    // the old fill; tfill/lens
+    // already cover it (off+1)
     assert_eq!(get(Port::Positions), u32s(&[7, 7]));
     // kvm: per lane, page lens now [4, 3, 0].
-    let Value::Bool(m) = get(Port::AttnMask) else { panic!() };
+    let Value::Bool(m) = get(Port::AttnMask) else {
+        panic!()
+    };
     let lane0: Vec<bool> = m[..(P * PAGE) as usize].to_vec();
     let expect: Vec<bool> = (0..(P * PAGE) as usize)
         .map(|o| {
@@ -213,14 +240,24 @@ fn beam_page_turn_takes_fresh_slot() {
     let mut logits = vec![0.0f32; (BB * V) as usize];
     logits[3] = 8.0;
     logits[(V + 5) as usize] = 7.0;
-    let inputs = PassInputs { logits: Some(Value::F32(logits)), ..Default::default() };
+    let inputs = PassInputs {
+        logits: Some(Value::F32(logits)),
+        ..Default::default()
+    };
     let r = inst.step(&b, &inputs, &mut NoKernels).unwrap();
     assert!(r.committed, "missed: {:?}", r.missed);
     inst.host_take(&b, 13).unwrap();
     inst.host_take(&b, 14).unwrap();
     inst.host_take(&b, 15).unwrap();
     let r2 = inst.step(&b, &inputs, &mut NoKernels).unwrap();
-    let get = |p: Port| r2.descriptor.iter().find(|(q, _)| *q == p).unwrap().1.clone();
+    let get = |p: Port| {
+        r2.descriptor
+            .iter()
+            .find(|(q, _)| *q == p)
+            .unwrap()
+            .1
+            .clone()
+    };
     // Fresh slots 7/8 entered each row's third entry; writes land there at 0.
     assert_eq!(get(Port::Pages), u32s(&[5, 6, 7, 5, 6, 8]));
     assert_eq!(get(Port::KvLen), u32s(&[9, 9])); // (3-1)*4 + 1
@@ -254,14 +291,24 @@ fn beam_reorder_both_from_one_parent_freezes_sibling() {
     let mut logits = vec![0.0f32; (BB * V) as usize];
     logits[3] = 8.0;
     logits[4] = 7.5;
-    let inputs = PassInputs { logits: Some(Value::F32(logits)), ..Default::default() };
+    let inputs = PassInputs {
+        logits: Some(Value::F32(logits)),
+        ..Default::default()
+    };
     let r = inst.step(&b, &inputs, &mut NoKernels).unwrap();
     assert!(r.committed, "missed: {:?}", r.missed);
     assert_eq!(inst.host_take(&b, 14).unwrap(), u32s(&[0, 0])); // both from row 0
     assert_eq!(inst.host_take(&b, 13).unwrap(), i32s(&[3, 4]));
     inst.host_take(&b, 15).unwrap();
     let r2 = inst.step(&b, &inputs, &mut NoKernels).unwrap();
-    let get = |p: Port| r2.descriptor.iter().find(|(q, _)| *q == p).unwrap().1.clone();
+    let get = |p: Port| {
+        r2.descriptor
+            .iter()
+            .find(|(q, _)| *q == p)
+            .unwrap()
+            .1
+            .clone()
+    };
     // heir[0] = 1 (last child in lane order): lane 1 continues tail slot 6 at
     // offset 2; lane 0 froze and opened fresh slot 7 at offset 0.
     assert_eq!(get(Port::Pages), u32s(&[5, 6, 7, 5, 6, 0]));
@@ -269,10 +316,17 @@ fn beam_reorder_both_from_one_parent_freezes_sibling() {
     assert_eq!(get(Port::WOff), u32s(&[0, 2]));
     // lens: lane 0's inherited entry for slot 6 stays FROZEN at 2 (its kvm
     // row masks the sibling's new token); lane 1's advanced to 3.
-    let Value::Bool(m) = get(Port::AttnMask) else { panic!() };
-    let at = |lane: usize, page: usize, off: usize| m[lane * (P * PAGE) as usize + page * PAGE as usize + off];
+    let Value::Bool(m) = get(Port::AttnMask) else {
+        panic!()
+    };
+    let at = |lane: usize, page: usize, off: usize| {
+        m[lane * (P * PAGE) as usize + page * PAGE as usize + off]
+    };
     assert!(at(0, 1, 1)); // shared prefix visible
-    assert!(!at(0, 1, 2), "lane 0 must NOT see the sibling's tail token (freeze)");
+    assert!(
+        !at(0, 1, 2),
+        "lane 0 must NOT see the sibling's tail token (freeze)"
+    );
     assert!(at(1, 1, 2), "lane 1 (designated child) sees its own append");
     // klen presents frozen pages FULL? No — physical span counts each lane's
     // last page partial; lane 0's new tail is entry 3 at fill 1: (3-1)*4+1=9;

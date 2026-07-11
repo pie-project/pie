@@ -21,6 +21,7 @@
 //   kv_page_indices[total_pages], kv_last_page_lens[R], rs_slot_ids[R], rs_slot_flags[R](u8).
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace pie_metal_driver::raw_metal {
@@ -117,6 +118,69 @@ inline int find_request(const uint32_t* qo_indptr, int R, int t) {
     for (int r = 0; r < R; ++r)
         if (uint32_t(t) >= qo_indptr[r] && uint32_t(t) < qo_indptr[r + 1]) return r;
     return R > 0 ? R - 1 : 0;
+}
+
+// Final host-side safety gate before a paged GPU dispatch.  It validates the
+// exact address formula used by kv_append_paged/sdpa_paged, including explicit
+// writes, so invalid geometry is rejected before any pool cell can be touched.
+inline bool validate_paged_batch(const BatchSchedule& s,
+                                 const std::vector<uint32_t>& position_ids,
+                                 const std::vector<uint32_t>& page_indices,
+                                 const std::vector<uint32_t>& w_page,
+                                 const std::vector<uint32_t>& w_off,
+                                 uint32_t total_pages, uint32_t max_slots,
+                                 std::string* err = nullptr) {
+    auto fail = [&](const char* why) {
+        if (err) *err = why;
+        return false;
+    };
+    if (s.N <= 0 || s.R <= 0 || int(position_ids.size()) != s.N ||
+        int(w_page.size()) != s.N || int(w_off.size()) != s.N ||
+        s.spans.size() != size_t(s.R) || s.req_of_token.size() != size_t(s.N) ||
+        s.slot_of_token.size() != size_t(s.N) || s.page_size <= 0)
+        return fail("malformed paged batch vector sizes");
+    uint32_t expected_qo = 0, expected_pages = 0;
+    for (int r = 0; r < s.R; ++r) {
+        const RequestSpan& sp = s.spans[size_t(r)];
+        if (sp.qo_lo != expected_qo || sp.qo_lo >= sp.qo_hi || sp.qo_hi > uint32_t(s.N) ||
+            sp.pages_first != expected_pages || sp.num_pages == 0 ||
+            sp.pages_first + sp.num_pages > page_indices.size() ||
+            sp.rs_slot >= max_slots || sp.seqlen == 0 || sp.new_tokens > sp.seqlen ||
+            sp.pre_kv_len > sp.seqlen)
+            return fail("malformed request CSR span");
+        const uint32_t last = sp.seqlen - (sp.num_pages - 1) * uint32_t(s.page_size);
+        if (last == 0 || last > uint32_t(s.page_size))
+            return fail("invalid final page length");
+        for (uint32_t j = 0; j < sp.num_pages; ++j)
+            if (page_indices[sp.pages_first + j] >= total_pages)
+                return fail("physical page id exceeds pool");
+        expected_qo = sp.qo_hi;
+        expected_pages = sp.pages_first + sp.num_pages;
+    }
+    if (expected_qo != uint32_t(s.N) || expected_pages != page_indices.size())
+        return fail("CSR does not cover exactly the batch token/page arrays");
+    for (int t = 0; t < s.N; ++t) {
+        const uint32_t r = s.req_of_token[size_t(t)];
+        if (r >= uint32_t(s.R) || s.slot_of_token[size_t(t)] != s.spans[r].rs_slot)
+            return fail("invalid request/slot expansion");
+        const RequestSpan& sp = s.spans[r];
+        const uint32_t pos = position_ids[size_t(t)];
+        if (pos >= sp.seqlen || w_page[size_t(t)] >= total_pages ||
+            w_off[size_t(t)] >= uint32_t(s.page_size))
+            return fail("position or write descriptor exceeds extent");
+        const uint32_t expected = page_indices[sp.pages_first + pos / uint32_t(s.page_size)];
+        if (w_page[size_t(t)] != expected || w_off[size_t(t)] != pos % uint32_t(s.page_size))
+            return fail("write descriptor disagrees with page CSR");
+    }
+    return true;
+}
+
+inline bool validate_paged_batch_capacity(const BatchSchedule& s, uint32_t max_tokens,
+                                          uint32_t max_requests, std::string* err = nullptr) {
+    if (s.N > 0 && uint32_t(s.N) <= max_tokens && s.R > 0 && uint32_t(s.R) <= max_requests)
+        return true;
+    if (err) *err = "paged batch exceeds configured token/request capacity";
+    return false;
 }
 
 }  // namespace pie_metal_driver::raw_metal

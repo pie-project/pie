@@ -14,8 +14,8 @@ use wasmtime_wasi_http::p3::{
     WasiHttpCtxView as P3WasiHttpCtxView, WasiHttpHooks, WasiHttpView as P3WasiHttpView,
 };
 
-use super::output::LogStream;
 use super::ProcessId;
+use super::output::LogStream;
 use crate::inferlet::sandbox::InstancePolicy;
 
 /// Where a process's stdout/stderr are routed.

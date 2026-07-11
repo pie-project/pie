@@ -284,13 +284,6 @@ class PieClient:
                 f"Signature verification failed for username '{username}': {result}"
             )
 
-    async def auth_by_token(self, token: str) -> None:
-        """Authenticate using an internal token (backend/shell ↔ engine)."""
-        msg = {"type": "auth_by_token", "token": token}
-        ok, result = await self._send_msg_and_wait(msg)
-        if not ok:
-            raise Exception(f"Internal authentication failed: {result}")
-
     # =========================================================================
     # Queries
     # =========================================================================

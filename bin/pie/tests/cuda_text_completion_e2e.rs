@@ -22,7 +22,10 @@ use pie_client::client::Client;
 async fn text_completion_on_real_driver() -> Result<()> {
     common::init_trace();
     let pie = common::boot_4090().await?;
-    eprintln!("[text-completion-e2e] booted, listen_addr={}", pie.listen_addr);
+    eprintln!(
+        "[text-completion-e2e] booted, listen_addr={}",
+        pie.listen_addr
+    );
 
     // text-completion is a standalone cdylib crate (excluded from the workspace);
     // build it in place.
@@ -41,8 +44,14 @@ async fn text_completion_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
-    client.add_program(&wasm, &manifest, true).await.context("add_program")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
+    client
+        .add_program(&wasm, &manifest, true)
+        .await
+        .context("add_program")?;
     eprintln!("[text-completion-e2e] program installed, launching generation…");
 
     // A raw factual completion with a low temperature so a WORKING prefill+decode

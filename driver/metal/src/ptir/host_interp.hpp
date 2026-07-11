@@ -8,18 +8,21 @@
 // sort_desc NaN order, left-aligned broadcast, splitmix64/hash_uniform RNG).
 //
 // Decoded program model comes from the shared pure-host PTIR headers under
-// driver/cuda/src/ptir (container.hpp / bound.hpp / trace.hpp / op_table.hpp
-// — all CUDA-free; a future move to driver/common is planned, see the
-// op_table.hpp header note). One divergence from interp.rs is accepted: the
+// driver/common/include/pie_native/ptir (container.hpp / bound.hpp /
+// trace.hpp / op_table.hpp — all CUDA-free, namespace pie_native::ptir). One
+// divergence from interp.rs is accepted: the
 // translated Trace separates stage puts from op order, so a take AFTER a put
 // of the same channel WITHIN one stage resolves to the committed cell, not
 // the pending put. Cross-stage put→take visibility is preserved (the pending
 // overlay applies at stage granularity).
 //
-// Scope (direct_ffi_fix.md Phase 3 increment): programs whose values are all
-// Const / ChannelTake / ChannelRead / OpResult. Intrinsics (model taps),
-// host inputs, per-layer stages, and kernel calls are not executable here —
-// they need the Metal forward, which remains backend feature work.
+// Scope (direct_ffi_fix.md Phase 3 baseline; metal_ptir_plan.md Phase 1
+// extends it): programs whose values are Const / ChannelTake / ChannelRead /
+// OpResult / Intrinsic(Logits) / Intrinsic(MtpLogits) — the latter two need
+// a forward pass first (`ExecPlan::needs_logits` / `needs_mtp_logits`,
+// `PassInputs`, §5.3). Host inputs, per-layer taps, and other model
+// intrinsics (hidden/query/value-head) are not executable here — they need
+// backend feature work this increment does not add.
 
 #include <algorithm>
 #include <cmath>
@@ -33,14 +36,14 @@
 #include <unordered_map>
 #include <vector>
 
-#include "ptir/bound.hpp"
-#include "ptir/container.hpp"
-#include "ptir/op_table.hpp"
-#include "ptir/trace.hpp"
+#include "pie_native/ptir/bound.hpp"
+#include "pie_native/ptir/container.hpp"
+#include "pie_native/ptir/op_table.hpp"
+#include "pie_native/ptir/trace.hpp"
 
 namespace pie_metal_driver::ptir_host {
 
-namespace cptir = pie_cuda_driver::ptir;
+namespace cptir = pie_native::ptir;
 using cptir::DType;
 using cptir::OpCode;
 using cptir::Trace;
@@ -214,12 +217,24 @@ struct StagePlan {
 };
 
 // A registered program's decoded, executability-classified form.
+//
+// Classification, not a capability flag (metal_ptir_plan.md §3.2): a program
+// that reads Intrinsic(Logits)/Intrinsic(MtpLogits) is `executable` — it just
+// additionally needs a forward pass before `step()` (`needs_logits` /
+// `needs_mtp_logits`). Only genuinely unsupported constructs (HostInput,
+// per-layer taps, and non-logits intrinsics — hidden/query/value-head) still
+// hard-reject with `executable = false` + a precise `reject_reason`.
 struct ExecPlan {
     Trace trace;
     cptir::bound::Bound bound;
     std::vector<StagePlan> stages;  // container order (mirrors trace.stages)
     bool executable = false;
     std::string reject_reason;
+    // Set together with `executable = true` when the program reads the base
+    // Intrinsic(Logits) / Intrinsic(MtpLogits) root(s) — the launch path must
+    // run the Metal forward and bind `PassInputs` before `step()`.
+    bool needs_logits = false;
+    bool needs_mtp_logits = false;
 
     // One fire consumes (takes) dense channel `c` — a stage ChanTake or a
     // consuming descriptor port. Register-like: at most once per fire.
@@ -231,7 +246,57 @@ struct ExecPlan {
             if (!p.is_const && p.channel == c && cptir::port_consumes(p.port)) return true;
         return false;
     }
+
+    // True if the launch path must run the forward before `step()`.
+    bool needs_forward() const { return needs_logits || needs_mtp_logits; }
 };
+
+// Classify an already-translated Trace: split "rejected" (executable=false,
+// a precise reason) from "needs forward inputs" (needs_logits/
+// needs_mtp_logits, still executable). Pure function over the decoded Trace
+// — no container/sidecar bytes involved — so callers (registration AND
+// tests) can classify a hand-built Trace directly.
+inline void classify_exec_plan(ExecPlan& out) {
+    out.executable = true;
+    out.needs_logits = false;
+    out.needs_mtp_logits = false;
+    out.reject_reason.clear();
+    for (const cptir::Value& v : out.trace.values) {
+        if (v.source == cptir::ValueSource::Intrinsic) {
+            switch (v.intrinsic) {
+                case cptir::Intrinsic::Logits:
+                    out.needs_logits = true;
+                    break;
+                case cptir::Intrinsic::MtpLogits:
+                    out.needs_mtp_logits = true;
+                    break;
+                default:
+                    // Hidden / Query / ValueHead (and any intrinsic tag the
+                    // shared bound.hpp does not map — it falls back to
+                    // Logits there, not here) — the Metal forward exposes no
+                    // per-layer taps or auxiliary heads in this increment.
+                    out.executable = false;
+                    out.reject_reason =
+                        "program reads an unsupported model intrinsic (hidden/query/"
+                        "value-head; Metal forward not wired)";
+                    break;
+            }
+        } else if (v.source == cptir::ValueSource::HostInput) {
+            out.executable = false;
+            out.reject_reason = "program reads a submit-bound host input (not executable on Metal)";
+        }
+    }
+    for (const cptir::Stage& st : out.trace.stages) {
+        if (st.kind == cptir::StageKind::OnAttnProj || st.kind == cptir::StageKind::OnAttn) {
+            out.executable = false;
+            out.reject_reason = "program attaches per-layer taps (Metal forward not wired)";
+        }
+    }
+    if (!out.executable) {
+        out.needs_logits = false;
+        out.needs_mtp_logits = false;
+    }
+}
 
 // Decode + classify. Registration never fails on executability — the launch
 // path rejects with `reject_reason` instead.
@@ -273,22 +338,7 @@ inline bool build_exec_plan(const std::uint8_t* container_bytes, std::size_t con
         out.stages.push_back(std::move(plan));
     }
 
-    out.executable = true;
-    for (const cptir::Value& v : out.trace.values) {
-        if (v.source == cptir::ValueSource::Intrinsic) {
-            out.executable = false;
-            out.reject_reason = "program reads a model intrinsic (Metal forward not wired)";
-        } else if (v.source == cptir::ValueSource::HostInput) {
-            out.executable = false;
-            out.reject_reason = "program reads a submit-bound host input (not executable on Metal)";
-        }
-    }
-    for (const cptir::Stage& st : out.trace.stages) {
-        if (st.kind == cptir::StageKind::OnAttnProj || st.kind == cptir::StageKind::OnAttn) {
-            out.executable = false;
-            out.reject_reason = "program attaches per-layer taps (Metal forward not wired)";
-        }
-    }
+    classify_exec_plan(out);
     return true;
 }
 
@@ -522,6 +572,24 @@ inline Value broadcast_value(const Value& v, const cptir::Shape& src, const cpti
 
 // ─────────────────────────────── the pass ───────────────────────────────────
 
+// Per-fire forward inputs the interpreter binds into Intrinsic value roots —
+// the Metal mirror of CUDA's `FireInputs` (tier0_runner.hpp) / interp.rs's
+// `PassInputs`. `logits` is a `[rows, vocab]` row-major f32 matrix (the
+// executor's readout rows for this fire, D3: bf16→f32 conversion happens in
+// the executor, not here). `Intrinsic(Logits)` reads row 0; `Intrinsic
+// (MtpLogits)` reads the K draft rows starting at `mtp_draft_row` within the
+// SAME buffer, falling back to row 0 when unset (`-1`) — exactly the CUDA
+// fallback (`tier0_runner.hpp` `resolve_root`'s `ValueSource::Intrinsic`
+// case). C1 (channel-plane-only) fires pass a default-constructed
+// `PassInputs{}` (`logits == nullptr`); `step()` never dereferences it unless
+// the plan's trace actually roots an Intrinsic value.
+struct PassInputs {
+    const float* logits = nullptr;
+    std::uint32_t rows = 0;
+    std::uint32_t vocab = 0;
+    int mtp_draft_row = -1;
+};
+
 struct StepResult {
     bool ok = false;         // false → hard fault (`error`), instance poisoned
     bool committed = false;  // readiness held and channel effects landed
@@ -551,7 +619,7 @@ struct Overlay {
 // Evaluate one compute op (SSA args already in `vals`). Mirrors interp.rs
 // eval_op case for case; returns false + `error` on a semantic fault.
 inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>& vals,
-                    std::string& error) {
+                    std::string& error, std::uint32_t stage_base = 0) {
     auto v = [&](std::uint32_t id) -> const Value& { return vals[id]; };
     auto ty = [&](std::uint32_t id) -> const cptir::TensorType& { return trace.values[id].type; };
     auto fault = [&](const std::string& m) {
@@ -903,7 +971,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
                 std::uint8_t* k = keep.data() + r * len;
                 switch (op.predicate.tag) {
                     case cptir::PredTag::RankLe: {
-                        const auto kv = lanes_i64(v(op.predicate.payload));
+                        const auto kv = lanes_i64(v(stage_base + op.predicate.payload));
                         const std::int64_t kk = std::clamp<std::int64_t>(
                             kv[pick(kv.size(), r)], 0, static_cast<std::int64_t>(len));
                         for (std::size_t i = 0; i < len; ++i) {
@@ -916,7 +984,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
                         break;
                     }
                     case cptir::PredTag::CummassLe: {
-                        const auto pv = lanes_f32(v(op.predicate.payload));
+                        const auto pv = lanes_f32(v(stage_base + op.predicate.payload));
                         const float p = pv[pick(pv.size(), r)];
                         const auto order = sort_desc_order(row, len);
                         float excl = 0.0f;
@@ -927,7 +995,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
                         break;
                     }
                     case cptir::PredTag::ProbGe: {
-                        const auto tv = lanes_f32(v(op.predicate.payload));
+                        const auto tv = lanes_f32(v(stage_base + op.predicate.payload));
                         const float thr = tv[pick(tv.size(), r)];
                         for (std::size_t i = 0; i < len; ++i) k[i] = row[i] >= thr ? 1 : 0;
                         break;
@@ -1054,12 +1122,13 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
 }
 
 inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePlan& sp,
-                       Overlay& ov, std::vector<Value>& vals, std::string& error) {
+                       const PassInputs& in, Overlay& ov, std::vector<Value>& vals,
+                       std::string& error) {
     const cptir::Stage& stage = plan.trace.stages[sp.stage_index];
     for (std::uint32_t id = sp.base; id < sp.end;) {
         auto found = sp.op_by_result.find(id);
         if (found != sp.op_by_result.end()) {
-            if (!eval_op(*found->second, plan.trace, vals, error)) return false;
+            if (!eval_op(*found->second, plan.trace, vals, error, sp.base)) return false;
             id += found->second->result_count;
             continue;
         }
@@ -1080,6 +1149,40 @@ inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePl
             case cptir::ValueSource::ChannelRead:
                 vals[id] = ov.resolve(inst, root.channel);
                 break;
+            case cptir::ValueSource::Intrinsic: {
+                // Only Logits/MtpLogits reach here — classify_exec_plan()
+                // rejects every other intrinsic before a program is
+                // launchable, so any other tag means a plan/interp drift.
+                if (root.intrinsic != cptir::Intrinsic::Logits &&
+                    root.intrinsic != cptir::Intrinsic::MtpLogits) {
+                    error = "unresolved value root (unsupported intrinsic) reached execution";
+                    return false;
+                }
+                if (in.logits == nullptr || in.vocab == 0) {
+                    error = "logits intrinsic unbound (forward did not run before step)";
+                    return false;
+                }
+                const std::uint64_t want = std::max<std::uint64_t>(root.type.shape.numel(), 1);
+                if (want % in.vocab != 0) {
+                    error = "logits intrinsic shape mismatch (program vocab != model vocab)";
+                    return false;
+                }
+                const std::uint64_t rows_needed = want / in.vocab;
+                std::uint32_t base_row = 0;
+                if (root.intrinsic == cptir::Intrinsic::MtpLogits && in.mtp_draft_row >= 0) {
+                    base_row = static_cast<std::uint32_t>(in.mtp_draft_row);
+                }
+                if (static_cast<std::uint64_t>(base_row) + rows_needed > in.rows) {
+                    error = "logits intrinsic row range exceeds the forward's readout rows";
+                    return false;
+                }
+                std::vector<float> lane(want);
+                std::memcpy(lane.data(),
+                           in.logits + static_cast<std::size_t>(base_row) * in.vocab,
+                           want * sizeof(float));
+                vals[id] = Value::f32(std::move(lane));
+                break;
+            }
             default:
                 error = "unresolved value root (intrinsic/host input) reached execution";
                 return false;
@@ -1099,8 +1202,11 @@ inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePl
 
 // Execute one pass: readiness → prologue → descriptor ports → epilogue →
 // predicated commit (interp.rs step, minus the per-layer taps this
-// increment rejects at classification).
-inline StepResult step(InterpInstance& inst, const ExecPlan& plan) {
+// increment rejects at classification). `in` binds the Intrinsic(Logits)/
+// Intrinsic(MtpLogits) roots for C2 (forward-needing) plans; C1
+// (channel-plane-only) callers pass `PassInputs{}` (never dereferenced since
+// `plan.trace` roots no Intrinsic value in that case).
+inline StepResult step(InterpInstance& inst, const ExecPlan& plan, const PassInputs& in = {}) {
     StepResult result;
     if (inst.poisoned) {
         result.error = "instance is poisoned";
@@ -1128,7 +1234,7 @@ inline StepResult step(InterpInstance& inst, const ExecPlan& plan) {
     auto run_kind = [&](cptir::StageKind kind) -> bool {
         for (const StagePlan& sp : plan.stages) {
             if (plan.trace.stages[sp.stage_index].kind != kind) continue;
-            if (!detail::exec_stage(inst, plan, sp, ov, vals, result.error)) return false;
+            if (!detail::exec_stage(inst, plan, sp, in, ov, vals, result.error)) return false;
         }
         return true;
     };

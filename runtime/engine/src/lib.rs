@@ -1,16 +1,11 @@
 //! Pie - Programmable Inference Engine
 
-pub mod api;
 pub mod bootstrap;
 pub mod driver;
-pub mod inference;
 pub mod inferlet;
-pub mod messaging;
-pub mod probe;
-pub mod ptir;
+pub(crate) mod pipeline;
+pub mod scheduler;
 pub mod server;
-pub mod service;
+pub(crate) mod service;
 pub mod store;
-pub mod telemetry;
-pub mod token;
-pub mod util;
+pub(crate) mod telemetry;

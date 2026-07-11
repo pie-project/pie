@@ -30,13 +30,15 @@ template <typename T>
     device T* out            [[buffer(3)]],   // [V_h, V_d]
     constant GatedRmsParams& p [[buffer(4)]],
     uint3 tgpos       [[threadgroup_position_in_grid]],
+    uint3 tpg         [[threadgroups_per_grid]],
     uint3 lid3        [[thread_position_in_threadgroup]],
     uint  simd_lane   [[thread_index_in_simdgroup]],
     uint  simd_group  [[simdgroup_index_in_threadgroup]]) {
   const uint vd   = p.vd;
   const uint head = tgpos.y;          // value-head index
   const uint lid  = lid3.x;
-  const uint idx  = head * vd + lid;  // lid in [0, vd)
+  const uint heads = tpg.y;
+  const uint idx  = (tgpos.z * heads + head) * vd + lid;  // token-major
 
   float xi  = float(x[idx]);
   float acc = simd_sum(xi * xi);
@@ -72,7 +74,7 @@ template <typename T>
   template [[host_name("gated_rms_" #name)]]                      \
   [[kernel]] void gated_rms<itype>(                               \
       const device itype*, const device itype*, const device float*, \
-      device itype*, constant GatedRmsParams&, uint3, uint3, uint, uint);
+      device itype*, constant GatedRmsParams&, uint3, uint3, uint3, uint, uint);
 
 instantiate_gated_rms(float32, float)
 instantiate_gated_rms(float16, half)

@@ -25,7 +25,7 @@ async def main(input: dict) -> str:
   speculation, adapters, and JSON collection.
 - `chat`, `reasoning`, `tools`: optional decoders and helpers for model-native
   formats.
-- `runtime`, `session`, `messaging`: host services exposed to inferlets.
+- `runtime`, `session`: host services exposed to inferlets.
 
 ## Build notes
 

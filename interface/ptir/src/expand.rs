@@ -27,14 +27,28 @@ fn push(ops: &mut Vec<Op>, op: Op) -> ValueId {
 /// `gumbel(state, shape)` = `-log(-log(u))` over state-keyed uniform noise —
 /// exactly [`Op::RngKeyed`] with [`RngKind::Gumbel`] (the fused form).
 pub fn gumbel(ops: &mut Vec<Op>, state: ValueId, shape: Shape) -> ValueId {
-    push(ops, Op::RngKeyed { state, shape, kind: RngKind::Gumbel })
+    push(
+        ops,
+        Op::RngKeyed {
+            state,
+            shape,
+            kind: RngKind::Gumbel,
+        },
+    )
 }
 
 /// `mask_apply(logits, mask)` = `select(mask, logits, -inf)` — the composed
 /// bool-mask form (the packed-word special case is core [`Op::MaskApply`]).
 pub fn mask_apply(ops: &mut Vec<Op>, logits: ValueId, mask: ValueId) -> ValueId {
     let ninf = push(ops, Op::Const(Literal::F32(f32::NEG_INFINITY)));
-    push(ops, Op::Select { cond: mask, a: logits, b: ninf })
+    push(
+        ops,
+        Op::Select {
+            cond: mask,
+            a: logits,
+            b: ninf,
+        },
+    )
 }
 
 /// Numerically-stable row softmax: `exp(x - max) / sum(exp(x - max))`.
@@ -77,7 +91,7 @@ pub fn l2norm(ops: &mut Vec<Op>, x: ValueId, shape: Shape) -> ValueId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infer::{body_types, BodyCtx};
+    use crate::infer::{BodyCtx, body_types};
     use crate::types::{DType, ValueType};
     use alloc::vec;
 
@@ -98,7 +112,14 @@ mod tests {
         let sm = softmax(&mut ops, x, shape);
         let lsm = log_softmax(&mut ops, x, shape);
         let l2 = l2norm(&mut ops, x, shape);
-        let t = body_types(&ops, &BodyCtx { channel_types: &chans, n_names: 0 }).unwrap();
+        let t = body_types(
+            &ops,
+            &BodyCtx {
+                channel_types: &chans,
+                n_names: 0,
+            },
+        )
+        .unwrap();
         for id in [g, ma, sm, lsm, l2] {
             assert_eq!(t[id as usize], ValueType::new(shape, DType::F32), "id {id}");
         }

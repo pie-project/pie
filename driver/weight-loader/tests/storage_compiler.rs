@@ -109,9 +109,7 @@ fn direct_copy_lowers_to_identity_extent_write() {
         .instrs
         .iter()
         .filter_map(|instr| match instr {
-            StorageInstr::ExtentWrite { id, source, dest } => {
-                Some((id, source, dest.offset))
-            }
+            StorageInstr::ExtentWrite { id, source, dest } => Some((id, source, dest.offset)),
             StorageInstr::BulkExtentWrite {
                 id,
                 source,
@@ -563,8 +561,16 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         .collect::<Vec<_>>();
     // Experts are packed contiguously *within* their backing buffer (tight
     // 0/12 offsets), so the exposed `*.packed.weight` view is contiguous.
-    assert!(writes.iter().any(|(_, bytes, off)| *bytes == 12 && *off == 0));
-    assert!(writes.iter().any(|(_, bytes, off)| *bytes == 12 && *off == 12));
+    assert!(
+        writes
+            .iter()
+            .any(|(_, bytes, off)| *bytes == 12 && *off == 0)
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(_, bytes, off)| *bytes == 12 && *off == 12)
+    );
 
     // Each expert pack is one persistent backing buffer (2 experts × 12 B =
     // 24 B). Backing bases are aligned to PERSISTENT_OPERAND_ALIGNMENT (256)
@@ -872,7 +878,12 @@ fn slab_scatter_merges_nearby_bulk_extent_writes() {
         "expected at least one SlabScatter, got none; instrs: {:#?}",
         program.instrs,
     );
-    if let StorageInstr::SlabScatter { placements, span_bytes, .. } = slabs[0] {
+    if let StorageInstr::SlabScatter {
+        placements,
+        span_bytes,
+        ..
+    } = slabs[0]
+    {
         assert!(
             placements.len() >= 2,
             "slab must have at least 2 placements, got {}",
@@ -884,10 +895,7 @@ fn slab_scatter_merges_nearby_bulk_extent_writes() {
             span_bytes,
         );
         for p in placements {
-            assert!(
-                p.bytes > 0,
-                "placement bytes must be non-zero"
-            );
+            assert!(p.bytes > 0, "placement bytes must be non-zero");
         }
     }
 }
@@ -1026,11 +1034,31 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     let mut offset = 0u64;
     let mut tensors = Vec::new();
     let specs: Vec<(u32, &str, Vec<i64>)> = vec![
-        (0, "model.layers.0.self_attn.q_a_proj.weight", vec![q_lora, h]),
-        (1, "model.layers.0.self_attn.kv_a_proj_with_mqa.weight", vec![kv_lora_rope, h]),
-        (2, "model.layers.0.self_attn.q_a_layernorm.weight", vec![q_lora]),
-        (3, "model.layers.0.self_attn.q_b_proj.weight", vec![64, q_lora]),
-        (4, "model.layers.0.self_attn.kv_a_layernorm.weight", vec![12]),
+        (
+            0,
+            "model.layers.0.self_attn.q_a_proj.weight",
+            vec![q_lora, h],
+        ),
+        (
+            1,
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+            vec![kv_lora_rope, h],
+        ),
+        (
+            2,
+            "model.layers.0.self_attn.q_a_layernorm.weight",
+            vec![q_lora],
+        ),
+        (
+            3,
+            "model.layers.0.self_attn.q_b_proj.weight",
+            vec![64, q_lora],
+        ),
+        (
+            4,
+            "model.layers.0.self_attn.kv_a_layernorm.weight",
+            vec![12],
+        ),
         (5, "model.layers.0.self_attn.kv_b_proj.weight", vec![64, 12]),
         (6, "model.layers.0.self_attn.o_proj.weight", vec![h, 32]),
         (7, "model.layers.0.input_layernorm.weight", vec![h]),
@@ -1076,9 +1104,10 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     let summary = program.summary();
 
     // The fusion should have joined q_a_proj + kv_a_proj into one tensor
-    let has_fused = program.tensors.iter().any(|t| {
-        t.name.contains("q_kv_a_proj.fused")
-    });
+    let has_fused = program
+        .tensors
+        .iter()
+        .any(|t| t.name.contains("q_kv_a_proj.fused"));
     assert!(
         has_fused,
         "Expected fused q_kv_a_proj tensor; summary: {summary}\ntensors: {:?}",
@@ -1086,7 +1115,11 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     );
 
     // The fused tensor should have rows = q_lora + kv_lora_rope
-    let fused = program.tensors.iter().find(|t| t.name.contains("q_kv_a_proj.fused")).unwrap();
+    let fused = program
+        .tensors
+        .iter()
+        .find(|t| t.name.contains("q_kv_a_proj.fused"))
+        .unwrap();
     assert_eq!(fused.shape[0], q_lora + kv_lora_rope);
     assert_eq!(fused.shape[1], h);
 

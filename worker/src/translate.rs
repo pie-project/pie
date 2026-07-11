@@ -5,7 +5,7 @@
 //! constructs through the pyo3 `pie._runtime.Config` builder. We do
 //! the same construction here in pure Rust, sourcing:
 //!   * scalars from the user TOML
-//!   * dirs (cache/log/auth) from `pie_engine::util` (`~/.pie/...`)
+//!   * dirs (cache/log/runtime) from `bootstrap::paths::pie_home()` (`~/.pie/...`)
 //!   * caps/native-driver bundles collected before bootstrap.
 
 use std::path::PathBuf;
@@ -39,20 +39,15 @@ pub fn build(
         );
     }
 
-    let pie_home = pie_engine::util::get_pie_home();
+    let pie_home = bootstrap::paths::pie_home();
     let cache_dir = pie_home.join("programs");
     let log_dir = Some(pie_home.join("logs"));
-    let auth_dir = pie_home.join("auth");
 
     let model = build_model(&user.model, drivers)?;
 
     Ok(pie_engine::bootstrap::Config {
         host: user.server.host.clone(),
         port: user.server.port,
-        auth: pie_engine::bootstrap::AuthConfig {
-            enabled: user.auth.enabled,
-            authorized_users_dir: auth_dir,
-        },
         cache_dir,
         verbose: user.server.verbose,
         log_dir,
@@ -73,6 +68,7 @@ pub fn build(
             allow_network: user.runtime.allow_network,
             network_allowed_hosts: user.runtime.network_allowed_hosts.clone(),
             max_upload_mb: user.runtime.max_upload_mb,
+            py_runtime_dir: pie_home.join("py-runtime"),
         },
         model,
         // The `bootstrap` lib (Seam 2) installs the global tracing subscriber;

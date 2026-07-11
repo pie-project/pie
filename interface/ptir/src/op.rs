@@ -109,7 +109,10 @@ pub enum Op {
     Sign(ValueId),
     /// Element-wise dtype cast (`0x07`). numeric↔numeric; bool→numeric is
     /// `{0,1}`; numeric→bool is `x != 0`.
-    Cast { value: ValueId, dtype: DType },
+    Cast {
+        value: ValueId,
+        dtype: DType,
+    },
 
     // ── map (binary; scalar operand broadcasts) ─────────────────────────
     Add(ValueId, ValueId),
@@ -133,7 +136,11 @@ pub enum Op {
     Not(ValueId),
 
     // ── choice ───────────────────────────────────────────────────────────
-    Select { cond: ValueId, a: ValueId, b: ValueId },
+    Select {
+        cond: ValueId,
+        a: ValueId,
+        b: ValueId,
+    },
 
     // ── reduce (last axis; per-row for rank ≥ 2) ─────────────────────────
     ReduceSum(ValueId),
@@ -142,9 +149,15 @@ pub enum Op {
     ReduceArgmax(ValueId),
 
     // ── shape (metadata only) ────────────────────────────────────────────
-    Broadcast { value: ValueId, shape: Shape },
+    Broadcast {
+        value: ValueId,
+        shape: Shape,
+    },
     /// Same numel, new dims (`0x39`). Dtype preserved.
-    Reshape { value: ValueId, shape: Shape },
+    Reshape {
+        value: ValueId,
+        shape: Shape,
+    },
     /// Rank-2 transpose `[m, n] → [n, m]` (`0x3A`).
     Transpose(ValueId),
 
@@ -158,37 +171,70 @@ pub enum Op {
     /// Top-k over the last axis (`0x51`): `k` is a trace-known immediate
     /// (result shapes are trace-known, §5.1). 2 results value-first:
     /// values F32 `[.., k]`, indices U32 `[.., k]`. Ties → lower index.
-    TopK { input: ValueId, k: u32 },
+    TopK {
+        input: ValueId,
+        k: u32,
+    },
     /// Sort-free top-k/top-p/min-p mask (`0x58`), per-row for rank 2.
-    PivotThreshold { input: ValueId, predicate: Predicate },
+    PivotThreshold {
+        input: ValueId,
+        predicate: Predicate,
+    },
 
     // ── linear ───────────────────────────────────────────────────────────
     /// `[m, k] × [k, n] → [m, n]`, F32 (`0x55`). A library kernel (T9).
     MatMul(ValueId, ValueId),
 
     // ── index (axis-0 generalized; see module docs) ──────────────────────
-    Gather { src: ValueId, idx: ValueId },
+    Gather {
+        src: ValueId,
+        idx: ValueId,
+    },
     /// Per-row column pick `out[i] = src[i, idx[i]]` (`0x61`, v4-exact).
-    GatherRow { src: ValueId, idx: ValueId },
-    ScatterAdd { base: ValueId, idx: ValueId, vals: ValueId },
-    ScatterSet { base: ValueId, idx: ValueId, vals: ValueId },
+    GatherRow {
+        src: ValueId,
+        idx: ValueId,
+    },
+    ScatterAdd {
+        base: ValueId,
+        idx: ValueId,
+        vals: ValueId,
+    },
+    ScatterSet {
+        base: ValueId,
+        idx: ValueId,
+        vals: ValueId,
+    },
     /// `iota(len)` → U32 `[len]` = `0..len` (`0x64`).
-    Iota { len: u32 },
+    Iota {
+        len: u32,
+    },
     /// Packed-bitmask apply (`0x65`, v4-exact): `out[j] = bit_j(mask) ?
     /// logits[j] : -inf`; `mask` `[ceil(n/32)]` U32. (The PTIR-level
     /// `mask_apply(logits, bool-mask)` composed op expands to `Select`;
     /// this packed form is the wire-efficient special case, kept core.)
-    MaskApply { logits: ValueId, mask: ValueId },
+    MaskApply {
+        logits: ValueId,
+        mask: ValueId,
+    },
 
     // ── sampling ─────────────────────────────────────────────────────────
     /// Ambient-seed noise (`0x70`, v4-exact; per-fire seed folded by the
     /// runtime). Kept for epilogue-parity with shipped samplers.
-    Rng { stream: u32, shape: Shape, kind: RngKind },
+    Rng {
+        stream: u32,
+        shape: Shape,
+        kind: RngKind,
+    },
     /// State-keyed noise (`0x71`): noise is a **pure function of the `[2]`
     /// U32 `state = [key, ctr]` tensor and the element index** — the §3 `rng`
     /// channel discipline; replay-deterministic (T8). Exact function pinned
     /// in PTIR-CONTAINER.md §5.
-    RngKeyed { state: ValueId, shape: Shape, kind: RngKind },
+    RngKeyed {
+        state: ValueId,
+        shape: Shape,
+        kind: RngKind,
+    },
 
     // ── channels (the only effects) ──────────────────────────────────────
     /// Consume: full → value, set empty (`0x90`). In-pass register rule:
@@ -198,22 +244,37 @@ pub enum Op {
     ChanRead(ChannelIndex),
     /// Fill the pending cell (`0x92`); double-put = last wins (§7.1).
     /// Defines **0** result ids.
-    ChanPut { chan: ChannelIndex, value: ValueId },
+    ChanPut {
+        chan: ChannelIndex,
+        value: ValueId,
+    },
 
     // ── intrinsics / second-party ────────────────────────────────────────
     /// Materialize a first-party stage-scoped value (`0xA0`). The shape and
     /// dtype are trace-known and declared inline; the validator cross-checks
     /// them against the registry rule and the stage scope.
-    IntrinsicVal { intr: IntrinsicId, shape: Shape, dtype: DType },
+    IntrinsicVal {
+        intr: IntrinsicId,
+        shape: Shape,
+        dtype: DType,
+    },
     /// Named second-party kernel call (`0xA1`): `intrinsics::kernel::*`.
     /// Name from the container's name table; availability + replayability
     /// (T10) checked at bind against the [`registry::ModelProfile`]. Declares
     /// its result type; no effects beyond it.
-    KernelCall { name: NameIndex, args: Vec<ValueId>, shape: Shape, dtype: DType },
+    KernelCall {
+        name: NameIndex,
+        args: Vec<ValueId>,
+        shape: Shape,
+        dtype: DType,
+    },
     /// Named configuration sink (`0xA2`): takes tensors, returns nothing,
     /// configures THIS pass's forward (§4). Stage-precedence checked (T11).
     /// Defines **0** result ids.
-    SinkCall { name: NameIndex, args: Vec<ValueId> },
+    SinkCall {
+        name: NameIndex,
+        args: Vec<ValueId>,
+    },
 }
 
 impl Op {
@@ -475,58 +536,370 @@ pub const VARIADIC: u8 = 0xFF;
 /// The op table — one row per wire tag, sorted by tag. The generated C++
 /// header and any driver-side dispatch table MUST be derived from this list.
 pub const OP_TABLE: &[OpSpec] = &[
-    OpSpec { tag: 0x01, name: "exp", family: Family::Map, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x02, name: "log", family: Family::Map, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x03, name: "neg", family: Family::Map, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x04, name: "recip", family: Family::Map, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x05, name: "abs", family: Family::Map, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x06, name: "sign", family: Family::Map, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x07, name: "cast", family: Family::Map, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x10, name: "add", family: Family::Map, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x11, name: "sub", family: Family::Map, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x12, name: "mul", family: Family::Map, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x13, name: "div", family: Family::Map, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x14, name: "max_elem", family: Family::Map, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x15, name: "min_elem", family: Family::Map, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x16, name: "gt", family: Family::CompareLogic, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x17, name: "ge", family: Family::CompareLogic, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x18, name: "eq", family: Family::CompareLogic, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x19, name: "ne", family: Family::CompareLogic, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x1A, name: "lt", family: Family::CompareLogic, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x1B, name: "le", family: Family::CompareLogic, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x1C, name: "and", family: Family::CompareLogic, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x1D, name: "or", family: Family::CompareLogic, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x1E, name: "not", family: Family::CompareLogic, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x1F, name: "rem", family: Family::Map, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x20, name: "select", family: Family::Choice, val_operands: 3, results: 1 },
-    OpSpec { tag: 0x30, name: "reduce_sum", family: Family::ReduceScan, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x31, name: "reduce_max", family: Family::ReduceScan, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x32, name: "reduce_min", family: Family::ReduceScan, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x33, name: "reduce_argmax", family: Family::ReduceScan, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x38, name: "broadcast", family: Family::Shape, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x39, name: "reshape", family: Family::Shape, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x3A, name: "transpose", family: Family::Shape, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x40, name: "cumsum", family: Family::ReduceScan, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x41, name: "cumprod", family: Family::ReduceScan, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x50, name: "sort_desc", family: Family::Order, val_operands: 1, results: 2 },
-    OpSpec { tag: 0x51, name: "top_k", family: Family::Order, val_operands: 1, results: 2 },
-    OpSpec { tag: 0x55, name: "matmul", family: Family::Linear, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x58, name: "pivot_threshold", family: Family::Order, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x60, name: "gather", family: Family::Index, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x61, name: "gather_row", family: Family::Index, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x62, name: "scatter_add", family: Family::Index, val_operands: 3, results: 1 },
-    OpSpec { tag: 0x63, name: "scatter_set", family: Family::Index, val_operands: 3, results: 1 },
-    OpSpec { tag: 0x64, name: "iota", family: Family::Index, val_operands: 0, results: 1 },
-    OpSpec { tag: 0x65, name: "mask_apply_packed", family: Family::Sampling, val_operands: 2, results: 1 },
-    OpSpec { tag: 0x70, name: "rng", family: Family::Sampling, val_operands: 0, results: 1 },
-    OpSpec { tag: 0x71, name: "rng_keyed", family: Family::Sampling, val_operands: 1, results: 1 },
-    OpSpec { tag: 0x81, name: "const", family: Family::Leaf, val_operands: 0, results: 1 },
-    OpSpec { tag: 0x90, name: "chan_take", family: Family::Channel, val_operands: 0, results: 1 },
-    OpSpec { tag: 0x91, name: "chan_read", family: Family::Channel, val_operands: 0, results: 1 },
-    OpSpec { tag: 0x92, name: "chan_put", family: Family::Channel, val_operands: 1, results: 0 },
-    OpSpec { tag: 0xA0, name: "intrinsic_val", family: Family::Intrinsic, val_operands: 0, results: 1 },
-    OpSpec { tag: 0xA1, name: "kernel_call", family: Family::Intrinsic, val_operands: VARIADIC, results: 1 },
-    OpSpec { tag: 0xA2, name: "sink_call", family: Family::Intrinsic, val_operands: VARIADIC, results: 0 },
+    OpSpec {
+        tag: 0x01,
+        name: "exp",
+        family: Family::Map,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x02,
+        name: "log",
+        family: Family::Map,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x03,
+        name: "neg",
+        family: Family::Map,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x04,
+        name: "recip",
+        family: Family::Map,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x05,
+        name: "abs",
+        family: Family::Map,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x06,
+        name: "sign",
+        family: Family::Map,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x07,
+        name: "cast",
+        family: Family::Map,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x10,
+        name: "add",
+        family: Family::Map,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x11,
+        name: "sub",
+        family: Family::Map,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x12,
+        name: "mul",
+        family: Family::Map,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x13,
+        name: "div",
+        family: Family::Map,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x14,
+        name: "max_elem",
+        family: Family::Map,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x15,
+        name: "min_elem",
+        family: Family::Map,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x16,
+        name: "gt",
+        family: Family::CompareLogic,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x17,
+        name: "ge",
+        family: Family::CompareLogic,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x18,
+        name: "eq",
+        family: Family::CompareLogic,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x19,
+        name: "ne",
+        family: Family::CompareLogic,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x1A,
+        name: "lt",
+        family: Family::CompareLogic,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x1B,
+        name: "le",
+        family: Family::CompareLogic,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x1C,
+        name: "and",
+        family: Family::CompareLogic,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x1D,
+        name: "or",
+        family: Family::CompareLogic,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x1E,
+        name: "not",
+        family: Family::CompareLogic,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x1F,
+        name: "rem",
+        family: Family::Map,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x20,
+        name: "select",
+        family: Family::Choice,
+        val_operands: 3,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x30,
+        name: "reduce_sum",
+        family: Family::ReduceScan,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x31,
+        name: "reduce_max",
+        family: Family::ReduceScan,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x32,
+        name: "reduce_min",
+        family: Family::ReduceScan,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x33,
+        name: "reduce_argmax",
+        family: Family::ReduceScan,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x38,
+        name: "broadcast",
+        family: Family::Shape,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x39,
+        name: "reshape",
+        family: Family::Shape,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x3A,
+        name: "transpose",
+        family: Family::Shape,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x40,
+        name: "cumsum",
+        family: Family::ReduceScan,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x41,
+        name: "cumprod",
+        family: Family::ReduceScan,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x50,
+        name: "sort_desc",
+        family: Family::Order,
+        val_operands: 1,
+        results: 2,
+    },
+    OpSpec {
+        tag: 0x51,
+        name: "top_k",
+        family: Family::Order,
+        val_operands: 1,
+        results: 2,
+    },
+    OpSpec {
+        tag: 0x55,
+        name: "matmul",
+        family: Family::Linear,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x58,
+        name: "pivot_threshold",
+        family: Family::Order,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x60,
+        name: "gather",
+        family: Family::Index,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x61,
+        name: "gather_row",
+        family: Family::Index,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x62,
+        name: "scatter_add",
+        family: Family::Index,
+        val_operands: 3,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x63,
+        name: "scatter_set",
+        family: Family::Index,
+        val_operands: 3,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x64,
+        name: "iota",
+        family: Family::Index,
+        val_operands: 0,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x65,
+        name: "mask_apply_packed",
+        family: Family::Sampling,
+        val_operands: 2,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x70,
+        name: "rng",
+        family: Family::Sampling,
+        val_operands: 0,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x71,
+        name: "rng_keyed",
+        family: Family::Sampling,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x81,
+        name: "const",
+        family: Family::Leaf,
+        val_operands: 0,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x90,
+        name: "chan_take",
+        family: Family::Channel,
+        val_operands: 0,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x91,
+        name: "chan_read",
+        family: Family::Channel,
+        val_operands: 0,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x92,
+        name: "chan_put",
+        family: Family::Channel,
+        val_operands: 1,
+        results: 0,
+    },
+    OpSpec {
+        tag: 0xA0,
+        name: "intrinsic_val",
+        family: Family::Intrinsic,
+        val_operands: 0,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0xA1,
+        name: "kernel_call",
+        family: Family::Intrinsic,
+        val_operands: VARIADIC,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0xA2,
+        name: "sink_call",
+        family: Family::Intrinsic,
+        val_operands: VARIADIC,
+        results: 0,
+    },
 ];
 
 #[cfg(test)]
@@ -545,46 +918,126 @@ mod tests {
         // One representative per variant; table row must agree with tag(),
         // result_count(), and operands().len().
         let reps: Vec<Op> = vec![
-            Op::Exp(0), Op::Log(0), Op::Neg(0), Op::Recip(0), Op::Abs(0), Op::Sign(0),
-            Op::Cast { value: 0, dtype: DType::I32 },
-            Op::Add(0, 1), Op::Sub(0, 1), Op::Mul(0, 1), Op::Div(0, 1),
-            Op::MaxElem(0, 1), Op::MinElem(0, 1),
-            Op::Gt(0, 1), Op::Ge(0, 1), Op::Eq(0, 1), Op::Ne(0, 1), Op::Lt(0, 1), Op::Le(0, 1),
-            Op::And(0, 1), Op::Or(0, 1), Op::Not(0), Op::Rem(0, 1),
-            Op::Select { cond: 0, a: 1, b: 2 },
-            Op::ReduceSum(0), Op::ReduceMax(0), Op::ReduceMin(0), Op::ReduceArgmax(0),
-            Op::Broadcast { value: 0, shape: Shape::vector(4) },
-            Op::Reshape { value: 0, shape: Shape::vector(4) },
+            Op::Exp(0),
+            Op::Log(0),
+            Op::Neg(0),
+            Op::Recip(0),
+            Op::Abs(0),
+            Op::Sign(0),
+            Op::Cast {
+                value: 0,
+                dtype: DType::I32,
+            },
+            Op::Add(0, 1),
+            Op::Sub(0, 1),
+            Op::Mul(0, 1),
+            Op::Div(0, 1),
+            Op::MaxElem(0, 1),
+            Op::MinElem(0, 1),
+            Op::Gt(0, 1),
+            Op::Ge(0, 1),
+            Op::Eq(0, 1),
+            Op::Ne(0, 1),
+            Op::Lt(0, 1),
+            Op::Le(0, 1),
+            Op::And(0, 1),
+            Op::Or(0, 1),
+            Op::Not(0),
+            Op::Rem(0, 1),
+            Op::Select {
+                cond: 0,
+                a: 1,
+                b: 2,
+            },
+            Op::ReduceSum(0),
+            Op::ReduceMax(0),
+            Op::ReduceMin(0),
+            Op::ReduceArgmax(0),
+            Op::Broadcast {
+                value: 0,
+                shape: Shape::vector(4),
+            },
+            Op::Reshape {
+                value: 0,
+                shape: Shape::vector(4),
+            },
             Op::Transpose(0),
-            Op::CumSum(0), Op::CumProd(0),
+            Op::CumSum(0),
+            Op::CumProd(0),
             Op::SortDesc(0),
             Op::TopK { input: 0, k: 4 },
             Op::MatMul(0, 1),
-            Op::PivotThreshold { input: 0, predicate: Predicate::RankLe(1) },
+            Op::PivotThreshold {
+                input: 0,
+                predicate: Predicate::RankLe(1),
+            },
             Op::Gather { src: 0, idx: 1 },
             Op::GatherRow { src: 0, idx: 1 },
-            Op::ScatterAdd { base: 0, idx: 1, vals: 2 },
-            Op::ScatterSet { base: 0, idx: 1, vals: 2 },
+            Op::ScatterAdd {
+                base: 0,
+                idx: 1,
+                vals: 2,
+            },
+            Op::ScatterSet {
+                base: 0,
+                idx: 1,
+                vals: 2,
+            },
             Op::Iota { len: 8 },
             Op::MaskApply { logits: 0, mask: 1 },
-            Op::Rng { stream: 0, shape: Shape::vector(4), kind: RngKind::Gumbel },
-            Op::RngKeyed { state: 0, shape: Shape::vector(4), kind: RngKind::Uniform },
+            Op::Rng {
+                stream: 0,
+                shape: Shape::vector(4),
+                kind: RngKind::Gumbel,
+            },
+            Op::RngKeyed {
+                state: 0,
+                shape: Shape::vector(4),
+                kind: RngKind::Uniform,
+            },
             Op::Const(Literal::F32(1.0)),
-            Op::ChanTake(0), Op::ChanRead(0),
+            Op::ChanTake(0),
+            Op::ChanRead(0),
             Op::ChanPut { chan: 0, value: 0 },
-            Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(1, 8), dtype: DType::F32 },
-            Op::KernelCall { name: 0, args: vec![0, 1], shape: Shape::vector(4), dtype: DType::F32 },
-            Op::SinkCall { name: 0, args: vec![0] },
+            Op::IntrinsicVal {
+                intr: IntrinsicId::Logits,
+                shape: Shape::matrix(1, 8),
+                dtype: DType::F32,
+            },
+            Op::KernelCall {
+                name: 0,
+                args: vec![0, 1],
+                shape: Shape::vector(4),
+                dtype: DType::F32,
+            },
+            Op::SinkCall {
+                name: 0,
+                args: vec![0],
+            },
         ];
-        assert_eq!(reps.len(), OP_TABLE.len(), "one representative per table row");
+        assert_eq!(
+            reps.len(),
+            OP_TABLE.len(),
+            "one representative per table row"
+        );
         for op in &reps {
             let spec = OP_TABLE
                 .iter()
                 .find(|s| s.tag == op.tag())
                 .unwrap_or_else(|| panic!("no table row for {op:?}"));
-            assert_eq!(spec.results as u32, op.result_count(), "results for {}", spec.name);
+            assert_eq!(
+                spec.results as u32,
+                op.result_count(),
+                "results for {}",
+                spec.name
+            );
             if spec.val_operands != VARIADIC {
-                assert_eq!(spec.val_operands as usize, op.operands().len(), "arity for {}", spec.name);
+                assert_eq!(
+                    spec.val_operands as usize,
+                    op.operands().len(),
+                    "arity for {}",
+                    spec.name
+                );
             }
 
             // map_operands must visit exactly operands(), in order, and a
@@ -595,9 +1048,19 @@ mod tests {
                 visited.push(id);
                 id + 100
             });
-            assert_eq!(visited, op.operands(), "map_operands coverage for {}", spec.name);
+            assert_eq!(
+                visited,
+                op.operands(),
+                "map_operands coverage for {}",
+                spec.name
+            );
             let shifted: Vec<ValueId> = op.operands().iter().map(|id| id + 100).collect();
-            assert_eq!(rewritten.operands(), shifted, "map_operands rewrite for {}", spec.name);
+            assert_eq!(
+                rewritten.operands(),
+                shifted,
+                "map_operands rewrite for {}",
+                spec.name
+            );
         }
     }
 }

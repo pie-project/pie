@@ -36,8 +36,14 @@ fn parse_tokens(json: &str) -> Option<Vec<i64>> {
 async fn run_one(addr: &str, prompt: &str) -> Result<Option<Vec<i64>>> {
     let c = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "test-user").await?;
     c.authenticate("test-user", &None).await?;
-    let input = if prompt.is_empty() { "{}".to_string() } else { prompt.to_string() };
-    let mut proc = c.launch_process("generate@0.1.0".into(), input, true).await?;
+    let input = if prompt.is_empty() {
+        "{}".to_string()
+    } else {
+        prompt.to_string()
+    };
+    let mut proc = c
+        .launch_process("generate@0.1.0".into(), input, true)
+        .await?;
     Ok(parse_tokens(&proc.wait_for_return().await?))
 }
 
@@ -46,10 +52,14 @@ async fn run_fleet_concurrent(addr: &str, prompts: &[String]) -> Vec<Option<Vec<
     for p in prompts {
         let addr = addr.to_string();
         let p = p.clone();
-        procs.push(tokio::spawn(async move { run_one(&addr, &p).await.ok().flatten() }));
+        procs.push(tokio::spawn(async move {
+            run_one(&addr, &p).await.ok().flatten()
+        }));
     }
     let mut out = Vec::new();
-    for h in procs { out.push(h.await.unwrap_or(None)); }
+    for h in procs {
+        out.push(h.await.unwrap_or(None));
+    }
     out
 }
 
@@ -62,7 +72,9 @@ async fn concurrent_decode_matches_sequential() -> Result<()> {
     anyhow::ensure!(
         Command::new("cargo")
             .args(["build", "--target", "wasm32-wasip2", "-p", "generate"])
-            .current_dir(&ws).status()?.success(),
+            .current_dir(&ws)
+            .status()?
+            .success(),
         "generate wasm build failed"
     );
     let wasm = ws.join("target/wasm32-wasip2/debug/generate.wasm");
@@ -74,13 +86,25 @@ async fn concurrent_decode_matches_sequential() -> Result<()> {
 
     let setup = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "test-user").await?;
     setup.authenticate("test-user", &None).await?;
-    setup.add_program(&wasm, &manifest, true).await.context("add_program")?;
+    setup
+        .add_program(&wasm, &manifest, true)
+        .await
+        .context("add_program")?;
 
     let distinct = std::env::var_os("PIE_DISTINCT").is_some();
     let prompts: Vec<String> = (0..FLEET)
-        .map(|k| if distinct { format!("the quick brown fox number {k} jumps over the") } else { String::new() })
+        .map(|k| {
+            if distinct {
+                format!("the quick brown fox number {k} jumps over the")
+            } else {
+                String::new()
+            }
+        })
         .collect();
-    eprintln!("[concurrent] mode={}", if distinct { "DISTINCT" } else { "IDENTICAL" });
+    eprintln!(
+        "[concurrent] mode={}",
+        if distinct { "DISTINCT" } else { "IDENTICAL" }
+    );
 
     // Reference: run each prompt ALONE, sequentially (no concurrency).
     let mut reference = Vec::new();
@@ -96,10 +120,14 @@ async fn concurrent_decode_matches_sequential() -> Result<()> {
     let mut n_ok = 0usize;
     for k in 0..FLEET {
         let good = concurrent[k].is_some() && concurrent[k] == reference[k];
-        if good { n_ok += 1; }
+        if good {
+            n_ok += 1;
+        }
         eprintln!(
             "[concurrent] pipeline {k}: {} conc={:?} ref={:?}",
-            if good { "OK" } else { "MISMATCH" }, concurrent[k], reference[k]
+            if good { "OK" } else { "MISMATCH" },
+            concurrent[k],
+            reference[k]
         );
     }
     eprintln!("[concurrent] {n_ok}/{FLEET} concurrent streams == their sequential reference");

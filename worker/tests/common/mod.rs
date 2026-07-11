@@ -89,9 +89,11 @@ pub fn cuda_toml() -> String {
 /// validation, the dense default otherwise. Caller holds the handle and
 /// `shutdown()`s it.
 pub async fn boot_cuda_model(snapshot_path: &str) -> WorkerHandle {
-    let cfg = pie_worker::Config::parse(&cuda_toml_for(snapshot_path))
-        .expect("parse cuda worker config");
-    pie_worker::run(cfg).await.expect("boot embedded cuda engine")
+    let cfg =
+        pie_worker::Config::parse(&cuda_toml_for(snapshot_path)).expect("parse cuda worker config");
+    pie_worker::run(cfg)
+        .await
+        .expect("boot embedded cuda engine")
 }
 
 /// Boot the embedded cuda engine with the default dense model (Qwen3-0.6B).
@@ -114,12 +116,11 @@ pub fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let wasm_path = dir
         .join("target/wasm32-wasip2/release")
         .join(format!("{}.wasm", name.replace('-', "_")));
-    let wasm = std::fs::read(&wasm_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", wasm_path.display()));
+    let wasm =
+        std::fs::read(&wasm_path).unwrap_or_else(|e| panic!("read {}: {e}", wasm_path.display()));
     let manifest =
         Manifest::parse(&std::fs::read_to_string(dir.join("Pie.toml")).unwrap()).unwrap();
-    let program_name =
-        ProgramName::parse(&format!("{name}@{}", manifest.package.version)).unwrap();
+    let program_name = ProgramName::parse(&format!("{name}@{}", manifest.package.version)).unwrap();
     (wasm, manifest, program_name)
 }
 

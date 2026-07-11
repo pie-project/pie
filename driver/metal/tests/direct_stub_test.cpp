@@ -1,21 +1,66 @@
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "entry.hpp"
-#include "ptir/container.hpp"  // fnv1a64 (the PTIB sidecar's container hash)
+#include "pie_native/ptir/container.hpp"  // fnv1a64 (the PTIB sidecar's container hash)
 
 namespace {
 
+// Phase 3 (review item 1): launches are now ASYNC — the driver posts the
+// forward/settlement to its executor worker and `pie_metal_launch` returns
+// after acceptance. Terminals/words/notifies are published later, from the
+// worker thread. So this notify sink is thread-safe (the worker calls
+// `notify_cb` off the caller thread) and exposes `wait(wait_id, epoch)` so the
+// test blocks for a launch's BATCH notify — published last, after words +
+// terminals + per-channel notifies — before asserting settlement.
 struct NotifyState {
+    mutable std::mutex mu;
+    std::condition_variable cv;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> log;
 
-    std::size_t count() const { return log.size(); }
+    void record(std::uint64_t wait_id, std::uint64_t epoch) {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            log.emplace_back(wait_id, epoch);
+        }
+        cv.notify_all();
+    }
+    std::size_t count() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return log.size();
+    }
     bool contains(std::uint64_t wait_id, std::uint64_t epoch) const {
+        std::lock_guard<std::mutex> lock(mu);
+        return contains_locked(wait_id, epoch);
+    }
+    void clear() {
+        std::lock_guard<std::mutex> lock(mu);
+        log.clear();
+    }
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return log.empty();
+    }
+    std::pair<std::uint64_t, std::uint64_t> back() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return log.back();
+    }
+    // Block until (wait_id, epoch) has been recorded — the async launch's batch
+    // notify, which the driver publishes last.
+    void wait(std::uint64_t wait_id, std::uint64_t epoch) {
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return contains_locked(wait_id, epoch); });
+    }
+
+  private:
+    bool contains_locked(std::uint64_t wait_id, std::uint64_t epoch) const {
         for (const auto& [w, e] : log)
             if (w == wait_id && e == epoch) return true;
         return false;
@@ -23,7 +68,7 @@ struct NotifyState {
 };
 
 void notify_cb(void* ctx, std::uint64_t wait_id, std::uint64_t epoch) {
-    static_cast<NotifyState*>(ctx)->log.emplace_back(wait_id, epoch);
+    static_cast<NotifyState*>(ctx)->record(wait_id, epoch);
 }
 
 bool expect(bool cond, const char* msg) {
@@ -107,7 +152,7 @@ std::vector<std::uint8_t> add_one_program(bool seeded_writer) {
 // epilogue's three SSA value types.
 std::vector<std::uint8_t> add_one_sidecar(const std::vector<std::uint8_t>& container) {
     const std::uint64_t hash =
-        pie_cuda_driver::ptir::container::fnv1a64(container.data(), container.size());
+        pie_native::ptir::container::fnv1a64(container.data(), container.size());
     std::vector<std::uint8_t> out{'P', 'T', 'I', 'B'};
     push_u16(out, PTIB_VERSION);
     push_u16(out, 0);
@@ -720,6 +765,9 @@ int main() {
         writer_words[1] = 1;
         if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) == PIE_STATUS_OK,
                     "put → launch succeeds")) return 1;
+        // Async (review item 1): launch returns after acceptance; the worker
+        // publishes words/terminal/notifies. Wait for the batch notify (last).
+        notify.wait(777, 9);
         std::uint32_t produced = 0;
         std::memcpy(&produced, reader_mirror, sizeof(produced));
         if (!expect(writer_words[0] == 1, "consumed writer head published")) return 1;
@@ -729,13 +777,13 @@ int main() {
                     "member terminal settles success")) return 1;
         if (!expect(notify.contains(502, 1), "writer wake carries the new head")) return 1;
         if (!expect(notify.contains(511, 1), "reader wake carries the new tail")) return 1;
-        if (!expect(!notify.log.empty() && notify.log.back() == std::make_pair(
+        if (!expect(!notify.empty() && notify.back() == std::make_pair(
                         std::uint64_t{777}, std::uint64_t{9}),
                     "batch notify lands last, exactly once")) return 1;
 
         // Failure settlement (D4): a second fire with a fresh put but a full
         // reader ring (no host take) poisons and fails the member terminal.
-        notify.log.clear();
+        notify.clear();
         exec_terminal = pending_terminal();
         const std::uint32_t second_value = 20;
         std::memcpy(writer_mirror + exec_endpoints[0].cell_bytes, &second_value,
@@ -743,14 +791,90 @@ int main() {
         writer_words[1] = 2;
         if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) == PIE_STATUS_OK,
                     "accepted fire settles even when publication fails")) return 1;
+        notify.wait(777, 9);
         if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_FAILED,
                     "publication failure fails the member terminal")) return 1;
         if (!expect(reader_words[2] != 0, "reader poison word published")) return 1;
         if (!expect(notify.contains(511, reader_words[2]),
                     "reader wake carries the poison epoch")) return 1;
-        if (!expect(!notify.log.empty() && notify.log.back() == std::make_pair(
+        if (!expect(!notify.empty() && notify.back() == std::make_pair(
                         std::uint64_t{777}, std::uint64_t{9}),
                     "failed fire still notifies the batch slot last")) return 1;
+
+        // ── Driver-level async acceptance (review items 1/5): a fresh add_one
+        //    instance on its own channels. `pie_metal_launch` returns after
+        //    acceptance; `close_instance` then QUEUES BEHIND the launch job on
+        //    the executor worker (FIFO), so by the time close returns the launch
+        //    has fully settled — its terminal is SUCCESS and its batch notify
+        //    was delivered exactly once, all published asynchronously from the
+        //    worker (never from the launch call). This is the driver-level
+        //    counterpart to executor_worker_test's mechanism-level proof. ──
+        {
+            const std::uint64_t async_channel_ids[] = {155, 166};
+            PieChannelDesc async_descs[2]{};
+            for (std::size_t i = 0; i < 2; ++i) {
+                async_descs[i].abi_version = PIE_DRIVER_ABI_VERSION;
+                async_descs[i].channel_id = async_channel_ids[i];
+                async_descs[i].shape = {.ptr = scalar_shape, .len = 1};
+                async_descs[i].dtype = PIE_CHANNEL_DTYPE_U32;
+                async_descs[i].capacity = 1;
+                async_descs[i].reader_wait_id = 1550 + i;
+                async_descs[i].writer_wait_id = 1560 + i;
+            }
+            async_descs[0].host_role = PIE_CHANNEL_HOST_ROLE_WRITER;
+            async_descs[1].host_role = PIE_CHANNEL_HOST_ROLE_READER;
+            PieChannelEndpointBinding async_endpoints[2]{};
+            for (std::size_t i = 0; i < 2; ++i) {
+                if (!expect(pie_metal_register_channel(driver, &async_descs[i],
+                                                       &async_endpoints[i]) == PIE_STATUS_OK,
+                            "register async add_one channel")) return 1;
+            }
+            PieInstanceDesc async_instance{};
+            async_instance.abi_version = PIE_DRIVER_ABI_VERSION;
+            async_instance.program_id = exec_program_id;
+            async_instance.channel_ids = {.ptr = async_channel_ids, .len = 2};
+            PieInstanceBinding async_binding{};
+            if (!expect(pie_metal_bind_instance(driver, &async_instance, &async_binding) ==
+                            PIE_STATUS_OK,
+                        "bind async add_one instance")) return 1;
+
+            auto* async_writer_mirror =
+                reinterpret_cast<std::uint8_t*>(async_endpoints[0].mirror_base);
+            auto* async_writer_words =
+                reinterpret_cast<std::uint64_t*>(async_endpoints[0].word_base);
+            const std::uint32_t async_put = 41;
+            std::memcpy(async_writer_mirror, &async_put, sizeof(async_put));
+            async_writer_words[1] = 1;
+
+            const std::uint64_t async_instance_ids[] = {async_binding.instance_id};
+            PieTerminalCell async_terminal = pending_terminal();
+            PieTerminalCell* const async_terminal_ptrs[] = {&async_terminal};
+            PieLaunchDesc async_launch{};
+            async_launch.abi_version = PIE_DRIVER_ABI_VERSION;
+            async_launch.instance_ids = {.ptr = async_instance_ids, .len = 1};
+            async_launch.terminal_cells = {.ptr = async_terminal_ptrs, .len = 1};
+            const PieCompletion async_completion{.wait_id = 1777, .target_epoch = 4,
+                                                 .terminal_cell = nullptr};
+            notify.clear();
+            if (!expect(pie_metal_launch(driver, &async_launch, async_completion) == PIE_STATUS_OK,
+                        "async launch returns OK after acceptance (no wait)")) return 1;
+            // Close WITHOUT waiting on the completion: close is a worker job
+            // enqueued strictly behind the launch job (FIFO), so it cannot
+            // return until the launch has settled.
+            if (!expect(pie_metal_close_instance(driver, async_binding.instance_id) ==
+                            PIE_STATUS_OK,
+                        "close queues behind the in-flight launch")) return 1;
+            if (!expect(async_terminal.outcome == PIE_TERMINAL_OUTCOME_SUCCESS,
+                        "launch settled asynchronously before close returned (terminal SUCCESS)"))
+                return 1;
+            if (!expect(notify.contains(1777, 4),
+                        "batch completion notified exactly once from the worker")) return 1;
+            for (const std::uint64_t id : async_channel_ids) {
+                if (!expect(pie_metal_close_channel(driver, id) == PIE_STATUS_OK,
+                            "close async add_one channel")) return 1;
+            }
+            notify.clear();
+        }
 
         if (!expect(pie_metal_close_instance(driver, exec_binding.instance_id) ==
                         PIE_STATUS_OK,
@@ -829,10 +953,11 @@ int main() {
             .target_epoch = 3,
             .terminal_cell = nullptr,
         };
-        notify.log.clear();
+        notify.clear();
         if (!expect(pie_metal_launch(driver, &seeded_launch, seeded_completion) ==
                         PIE_STATUS_OK,
                     "seed credit satisfies the first fire without a put")) return 1;
+        notify.wait(888, 3);
         std::uint32_t seeded_out = 0;
         std::memcpy(&seeded_out, seeded_reader_mirror, sizeof(seeded_out));
         if (!expect(seeded_out == 42, "seed value flowed through the program")) return 1;
@@ -856,7 +981,7 @@ int main() {
             if (!expect(pie_metal_close_channel(driver, id) == PIE_STATUS_OK,
                         "close seeded channel")) return 1;
         }
-        notify.log.clear();
+        notify.clear();
     }
 
     const auto export_bytes = extern_program(1);

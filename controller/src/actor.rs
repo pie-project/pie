@@ -332,7 +332,11 @@ mod tests {
         assert_eq!(wrx.borrow().gateways.len(), 1);
         assert_eq!(wrx.borrow().gateways[0].id, g);
         assert_eq!(wrx.borrow().gateways[0].addr, "127.0.0.1:8000");
-        assert_eq!(grx.borrow().epoch, 1, "gateway join never moves the worker roster");
+        assert_eq!(
+            grx.borrow().epoch,
+            1,
+            "gateway join never moves the worker roster"
+        );
     }
 
     #[tokio::test]

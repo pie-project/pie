@@ -198,6 +198,108 @@ template <typename T>
   wb(v_off + hv_idx * Dv + dv_idx);
 }
 
+// Paged/multi-batch counterparts retain the prep/recurrent split (and thus the
+// exact DAG dependency) while redirecting only persistent state through the
+// per-token slot map.  Activations and prep scratch remain token-major.
+template <typename T>
+[[kernel]] void gdn_prep_slotted(
+    const device T* mixed [[buffer(0)]], const device float* conv_state [[buffer(1)]],
+    const device T* conv_w [[buffer(2)]], const device T* conv_b [[buffer(3)]],
+    const device float* A_log [[buffer(4)]], const device T* dt_bias [[buffer(5)]],
+    const device T* a_gate [[buffer(6)]], const device T* b_gate [[buffer(7)]],
+    device float* pre_q [[buffer(8)]], device float* pre_k [[buffer(9)]],
+    device float* pre_gate [[buffer(10)]], device float* new_conv_state [[buffer(11)]],
+    constant GdnCoreParams& p [[buffer(12)]], const device uint* slot_ids [[buffer(13)]],
+    uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
+  const int Dk = p.Dk, Hv = p.Hv, CDIM = p.conv_dim, Kc = p.Kc;
+  const int n = int(tpig.z), b_idx = n / Hv, hv_idx = n % Hv;
+  const int slot = int(slot_ids[b_idx]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
+  const int q_off = p.q_off, k_off = p.k_off;
+  auto convsilu = [&](int c) -> float {
+    float acc = float(conv_b[c]);
+    for (int j = 0; j < Kc - 1; ++j)
+      acc += conv_state[(slot * Kc + (j + 1)) * CDIM + c] * float(conv_w[c * Kc + j]);
+    acc += float(mixed[b_idx * CDIM + c]) * float(conv_w[c * Kc + (Kc - 1)]);
+    return acc / (1.0f + exp(-acc));
+  };
+  float qraw[8], kraw[8];
+  for (int i = 0; i < n_per_t; ++i) {
+    const int d = n_per_t * dk_idx + i;
+    qraw[i] = convsilu(q_off + hv_idx * Dk + d);
+    kraw[i] = convsilu(k_off + hv_idx * Dk + d);
+  }
+  float qsq = 0.0f, ksq = 0.0f;
+  for (int i = 0; i < n_per_t; ++i) { qsq += qraw[i] * qraw[i]; ksq += kraw[i] * kraw[i]; }
+  const float qinv = p.inv_sqrt_dk / sqrt(simd_sum(qsq) + p.eps);
+  const float kinv = 1.0f / sqrt(simd_sum(ksq) + p.eps);
+  device float* oq = pre_q + size_t(n) * Dk;
+  device float* ok = pre_k + size_t(n) * Dk;
+  for (int i = 0; i < n_per_t; ++i) {
+    const int d = n_per_t * dk_idx + i;
+    oq[d] = qraw[i] * qinv; ok[d] = kraw[i] * kinv;
+  }
+  if (dk_idx == 0) {
+    const float ad = float(a_gate[b_idx * Hv + hv_idx]) + float(dt_bias[hv_idx]);
+    const float sp = max(ad, 0.0f) + log(1.0f + exp(-fabs(ad)));
+    pre_gate[2 * n] = exp(-exp(float(A_log[hv_idx])) * sp);
+    pre_gate[2 * n + 1] = 1.0f / (1.0f + exp(-float(b_gate[b_idx * Hv + hv_idx])));
+  }
+  auto wb = [&](int c) {
+    for (int j = 0; j < Kc - 1; ++j)
+      new_conv_state[(slot * Kc + j) * CDIM + c] =
+          conv_state[(slot * Kc + (j + 1)) * CDIM + c];
+    new_conv_state[(slot * Kc + (Kc - 1)) * CDIM + c] = float(mixed[b_idx * CDIM + c]);
+  };
+  for (int i = 0; i < n_per_t; ++i) {
+    const int d = n_per_t * dk_idx + i;
+    wb(q_off + hv_idx * Dk + d); wb(k_off + hv_idx * Dk + d);
+  }
+}
+
+template <typename T>
+[[kernel]] void gdn_core_recurrent_slotted(
+    const device T* mixed [[buffer(0)]], const device float* conv_state [[buffer(1)]],
+    device float* rstate [[buffer(2)]], device T* core_out [[buffer(3)]],
+    const device T* conv_w [[buffer(4)]], const device T* conv_b [[buffer(5)]],
+    const device float* pre_q [[buffer(6)]], const device float* pre_k [[buffer(7)]],
+    const device float* pre_gate [[buffer(8)]], device float* new_conv_state [[buffer(9)]],
+    constant GdnCoreParams& p [[buffer(10)]], const device uint* slot_ids [[buffer(11)]],
+    uint3 tpig [[thread_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]]) {
+  const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv, CDIM = p.conv_dim, Kc = p.Kc;
+  const int n = int(tpig.z), b_idx = n / Hv, hv_idx = n % Hv, dv_idx = int(tpig.y);
+  const int slot = int(slot_ids[b_idx]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
+  auto convsilu = [&](int c) -> float {
+    float acc = float(conv_b[c]);
+    for (int j = 0; j < Kc - 1; ++j)
+      acc += conv_state[(slot * Kc + (j + 1)) * CDIM + c] * float(conv_w[c * Kc + j]);
+    acc += float(mixed[b_idx * CDIM + c]) * float(conv_w[c * Kc + (Kc - 1)]);
+    return acc / (1.0f + exp(-acc));
+  };
+  const float vval = convsilu(p.v_off + hv_idx * Dv + dv_idx);
+  const device float* iq = pre_q + size_t(n) * Dk;
+  const device float* ik = pre_k + size_t(n) * Dk;
+  float q[8], k[8], st[8];
+  device float* i_state = rstate + (size_t((slot * Hv + hv_idx) * Dv + dv_idx) * Dk);
+  float kv_mem = 0.0f;
+  for (int i = 0; i < n_per_t; ++i) {
+    const int d = n_per_t * dk_idx + i;
+    q[i] = iq[d]; k[i] = ik[d]; st[i] = i_state[d];
+    st[i] *= pre_gate[2 * n]; kv_mem += st[i] * k[i];
+  }
+  kv_mem = simd_sum(kv_mem);
+  const float delta = (vval - kv_mem) * pre_gate[2 * n + 1];
+  float out = 0.0f;
+  for (int i = 0; i < n_per_t; ++i) { st[i] += k[i] * delta; out += st[i] * q[i]; }
+  out = simd_sum(out);
+  if (simd_lane == 0) core_out[(b_idx * Hv + hv_idx) * Dv + dv_idx] = static_cast<T>(out);
+  for (int i = 0; i < n_per_t; ++i) i_state[n_per_t * dk_idx + i] = st[i];
+  const int c = p.v_off + hv_idx * Dv + dv_idx;
+  for (int j = 0; j < Kc - 1; ++j)
+    new_conv_state[(slot * Kc + j) * CDIM + c] =
+        conv_state[(slot * Kc + (j + 1)) * CDIM + c];
+  new_conv_state[(slot * Kc + (Kc - 1)) * CDIM + c] = float(mixed[b_idx * CDIM + c]);
+}
+
 #define instantiate_gdn_prep(name, itype)                                  \
   template [[host_name("gdn_prep_" #name)]] [[kernel]] void                \
   gdn_prep<itype>(                                                         \
@@ -213,6 +315,24 @@ template <typename T>
       const device float*, const device float*, const device float*,       \
       device float*, constant GdnCoreParams&, uint3, uint);
 
+#define instantiate_gdn_prep_slotted(name, itype)                           \
+  template [[host_name("gdn_prep_slotted_" #name)]] [[kernel]] void         \
+  gdn_prep_slotted<itype>(                                                  \
+      const device itype*, const device float*, const device itype*,        \
+      const device itype*, const device float*, const device itype*,        \
+      const device itype*, const device itype*, device float*,              \
+      device float*, device float*, device float*, constant GdnCoreParams&, \
+      const device uint*, uint3, uint);                                     \
+  template [[host_name("gdn_core_recurrent_slotted_" #name)]] [[kernel]] void \
+  gdn_core_recurrent_slotted<itype>(                                        \
+      const device itype*, const device float*, device float*, device itype*, \
+      const device itype*, const device itype*, const device float*,        \
+      const device float*, const device float*, device float*,              \
+      constant GdnCoreParams&, const device uint*, uint3, uint);
+
 instantiate_gdn_prep(float32, float)
 instantiate_gdn_prep(float16, half)
 instantiate_gdn_prep(bfloat16, bfloat)
+instantiate_gdn_prep_slotted(float32, float)
+instantiate_gdn_prep_slotted(float16, half)
+instantiate_gdn_prep_slotted(bfloat16, bfloat)

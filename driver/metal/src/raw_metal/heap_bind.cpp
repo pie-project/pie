@@ -18,6 +18,7 @@
 #include "heap_bind.hpp"
 #include "heap_bind_metal.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -97,8 +98,27 @@ BoundDecode stage_decode_weights(RawMetalContext& ctx, const SafetensorsView& vi
     b.io[static_cast<int>(IoSlot::TokenId)]   = alloc_zeroed(ctx, tok);
     b.io[static_cast<int>(IoSlot::Position)]  = alloc_zeroed(ctx, tok);
     b.io[static_cast<int>(IoSlot::SeqLen)]    = alloc_zeroed(ctx, tok);
-    b.io[static_cast<int>(IoSlot::Logits)]    = alloc_zeroed(ctx, size_t(g.vocab) * 4);
+    b.io[static_cast<int>(IoSlot::Logits)] = alloc_zeroed(
+        ctx, g.paged_kv_enabled
+                 ? size_t(g.vocab) * size_t(std::max(1, g.max_tokens)) * 2u
+                 : size_t(g.vocab) * 4u);
     b.io[static_cast<int>(IoSlot::NextToken)] = alloc_zeroed(ctx, tok);
+
+    if (g.paged_kv_enabled) {
+        const size_t r = size_t(std::max(1, g.max_requests));
+        const size_t n = size_t(std::max(1, g.max_tokens));
+        const size_t refs = r * size_t(std::max(1, g.total_pages));
+        b.io[static_cast<int>(IoSlot::QoIndptr)]       = alloc_zeroed(ctx, (r + 1) * 4u);
+        b.io[static_cast<int>(IoSlot::KvPageIndptr)]   = alloc_zeroed(ctx, (r + 1) * 4u);
+        b.io[static_cast<int>(IoSlot::KvPageIndices)]  = alloc_zeroed(ctx, refs * 4u);
+        b.io[static_cast<int>(IoSlot::KvLastPageLens)] = alloc_zeroed(ctx, r * 4u);
+        b.io[static_cast<int>(IoSlot::RsSlotIds)]      = alloc_zeroed(ctx, r * 4u);
+        b.io[static_cast<int>(IoSlot::RsSlotFlags)]    = alloc_zeroed(ctx, r);
+        b.io[static_cast<int>(IoSlot::ReqOfToken)]     = alloc_zeroed(ctx, n * 4u);
+        b.io[static_cast<int>(IoSlot::SlotOfToken)]    = alloc_zeroed(ctx, n * 4u);
+        b.io[static_cast<int>(IoSlot::WPage)]          = alloc_zeroed(ctx, n * 4u);
+        b.io[static_cast<int>(IoSlot::WOff)]           = alloc_zeroed(ctx, n * 4u);
+    }
 
     // device-argmax substrate (inert unless with_argmax): ArgmaxParams const + EosFlag out.
     b.argmax_params = alloc_zeroed(ctx, sizeof(ArgmaxParams));

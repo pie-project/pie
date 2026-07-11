@@ -22,7 +22,7 @@
 
 #include <cuda_runtime.h>
 
-#include "ptir/bound.hpp"
+#include "pie_native/ptir/bound.hpp"
 #include "ptir/program_runtime.hpp"
 #include "ptir/tier0_runner.hpp"
 
