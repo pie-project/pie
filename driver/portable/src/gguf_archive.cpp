@@ -111,6 +111,30 @@ std::string gguf_to_hf_name(const std::string& g) {
     if (suffix == "ffn_gate_exps.weight")    return layer + "mlp.experts.gate_proj.weight";
     if (suffix == "ffn_up_exps.weight")      return layer + "mlp.experts.up_proj.weight";
     if (suffix == "ffn_down_exps.weight")    return layer + "mlp.experts.down_proj.weight";
+    // Qwen 3.5 / 3.6 shared expert (qwen35moe). `ffn_gate_inp_shexp` is the
+    // 1-D sigmoid gate over the shared expert (HF `mlp.shared_expert_gate`),
+    // distinct from the per-token router `ffn_gate_inp`.
+    if (suffix == "ffn_gate_shexp.weight")     return layer + "mlp.shared_expert.gate_proj.weight";
+    if (suffix == "ffn_up_shexp.weight")       return layer + "mlp.shared_expert.up_proj.weight";
+    if (suffix == "ffn_down_shexp.weight")     return layer + "mlp.shared_expert.down_proj.weight";
+    if (suffix == "ffn_gate_inp_shexp.weight") return layer + "mlp.shared_expert_gate.weight";
+    // Qwen 3.5 / 3.6 hybrid gated-delta-rule linear attention. The GGUF
+    // (llama.cpp qwen35 convention) packs the linear-attn input projection
+    // as `attn_qkv` (the fused q/k/v of the delta net) + `attn_gate` (the
+    // output Z gate), and the gated-delta params as `ssm_*`. These names
+    // only ever appear on the *linear* layers; full-attention layers carry
+    // the ordinary `attn_q/k/v` handled above. The convert-time value
+    // transforms (A_log = -exp(raw); folded norm.weight +1) are inverted at
+    // load in `model.cpp::build_qwen3_5_`, not here.
+    if (suffix == "attn_qkv.weight")         return layer + "linear_attn.in_proj_qkv.weight";
+    if (suffix == "attn_gate.weight")        return layer + "linear_attn.in_proj_z.weight";
+    if (suffix == "ssm_alpha.weight")        return layer + "linear_attn.in_proj_a.weight";
+    if (suffix == "ssm_beta.weight")         return layer + "linear_attn.in_proj_b.weight";
+    if (suffix == "ssm_a")                   return layer + "linear_attn.A_log";
+    if (suffix == "ssm_dt.bias")             return layer + "linear_attn.dt_bias";
+    if (suffix == "ssm_conv1d.weight")       return layer + "linear_attn.conv1d.weight";
+    if (suffix == "ssm_norm.weight")         return layer + "linear_attn.norm.weight";
+    if (suffix == "ssm_out.weight")          return layer + "linear_attn.out_proj.weight";
     return {};
 }
 

@@ -509,10 +509,18 @@ void Model::resolve_tensor_prefix_() {
         case PieArch::Gemma3n:
         case PieArch::Qwen3_5:
         case PieArch::Qwen3VL:
-            // Gemma 4 / 3n, Qwen 3.5 / 3.6, and Qwen3-VL all ship as multimodal
-            // ForConditionalGeneration wrappers; the text decoder lives
-            // under `model.language_model.` (vision tower under `model.visual.`).
-            tensor_prefix_ = "model.language_model.";
+            // Gemma 4 / 3n, Qwen 3.5 / 3.6, and Qwen3-VL ship as multimodal
+            // ForConditionalGeneration wrappers whose safetensors nest the
+            // text decoder under `model.language_model.`. A GGUF, however,
+            // is always the flattened text model (llama.cpp drops the
+            // wrapper, e.g. `token_embd` -> `model.embed_tokens.weight`), so
+            // only apply the wrapper prefix when the canonical name is
+            // absent and the wrapped name is present — same archive-driven
+            // detection the Gemma 3 / Mistral 3 cases use below.
+            if (archive_->find("model.embed_tokens.weight") == nullptr &&
+                archive_->find("model.language_model.embed_tokens.weight") != nullptr) {
+                tensor_prefix_ = "model.language_model.";
+            }
             break;
         case PieArch::Gemma3:
             // Gemma 3 4B+ multimodal (Gemma3ForConditionalGeneration) puts
@@ -952,6 +960,23 @@ void Model::load_qwen3_5_moe_layer_(std::int32_t i, const std::string& p) {
 
     // Router: HF naming `mlp.gate.weight`, shape [num_experts, hidden].
     L.moe_router = declare_(p + "mlp.gate.weight");
+
+    // GGUF path: llama.cpp stores the experts as three SEPARATE stacked
+    // tensors (`ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps`, mapped to
+    // `mlp.experts.{gate,up,down}_proj`) already in ggml's mul_mat_id
+    // layout, so declare each directly — no fused gate_up split.
+    if (archive_->is_gguf()) {
+        L.moe_gate_exps = declare_(p + "mlp.experts.gate_proj.weight");
+        L.moe_up_exps   = declare_(p + "mlp.experts.up_proj.weight");
+        L.moe_down_exps = declare_(p + "mlp.experts.down_proj.weight");
+        if (h.shared_expert_intermediate_size > 0) {
+            L.moe_shared_gate_proj = declare_(p + "mlp.shared_expert.gate_proj.weight");
+            L.moe_shared_up_proj   = declare_(p + "mlp.shared_expert.up_proj.weight");
+            L.moe_shared_down_proj = declare_(p + "mlp.shared_expert.down_proj.weight");
+            L.moe_shared_gate      = declare_(p + "mlp.shared_expert_gate.weight");
+        }
+        return;
+    }
 
     // Fused experts. Source `mlp.experts.gate_up_proj` is one 3D safetensor
     // [n_exp, 2*ff, hidden]; we split into separate stacked gate / up
@@ -2222,30 +2247,118 @@ void Model::build_gpt_oss_() {
 // `[conv_dim, 1, conv_kernel]` BF16; ggml_ssm_conv requires the weight
 // to be 2D F32 (`[conv_kernel, conv_dim]`). Squeeze + convert at load
 // time using a synth tensor.
+// Read a small source weight (BF16 safetensors or BF16/F16/F32 GGUF) as a
+// flat F32 vector. Used by the Qwen 3.5 synth helpers below, which need the
+// raw float values to invert convert-time transforms. The element count is
+// derived from the source dtype so it works regardless of how the tensor was
+// stored. Throws on an unexpected (quantized) source.
+static std::vector<float> read_small_weight_as_f32_(const StTensor& src,
+                                                    const std::string& hf_name) {
+    // GGUF tensors carry their ggml type in `ggml_type_override`; safetensors
+    // leaves it -1 and uses `dtype`.
+    const bool is_gguf = src.ggml_type_override >= 0;
+    enum { TF32 = 0, TF16 = 1, TBF16 = 24 };  // ggml_type values
+    std::size_t elem_bytes;
+    int kind;  // 0=f32, 1=f16, 2=bf16
+    if (is_gguf) {
+        switch (src.ggml_type_override) {
+            case TF32:  elem_bytes = 4; kind = 0; break;
+            case TF16:  elem_bytes = 2; kind = 1; break;
+            case TBF16: elem_bytes = 2; kind = 2; break;
+            default:
+                throw std::runtime_error(
+                    "model qwen3_5: expected an unquantized small weight for "
+                    + hf_name);
+        }
+    } else if (src.dtype == StDtype::BF16) {
+        elem_bytes = 2; kind = 2;
+    } else if (src.dtype == StDtype::F32) {
+        elem_bytes = 4; kind = 0;
+    } else {
+        throw std::runtime_error(
+            "model qwen3_5: unsupported small-weight dtype for " + hf_name);
+    }
+    const std::size_t n = src.nbytes / elem_bytes;
+    std::vector<float> out(n);
+    if (kind == 0) {
+        std::memcpy(out.data(), src.data, n * sizeof(float));
+    } else if (kind == 2) {
+        const auto* p = reinterpret_cast<const std::uint16_t*>(src.data);
+        for (std::size_t i = 0; i < n; ++i) out[i] = bf16_to_f32(p[i]);
+    } else {  // f16
+        const auto* p = reinterpret_cast<const std::uint16_t*>(src.data);
+        for (std::size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(p[i]);
+    }
+    return out;
+}
+
 ggml_tensor* Model::declare_qwen3_5_conv1d_(const std::string& hf_name,
                                             std::int32_t conv_dim,
                                             std::int32_t conv_kernel) {
     const auto& src = archive_->at(hf_name);
-    if (src.dtype != StDtype::BF16) {
-        throw std::runtime_error(
-            "model qwen3_5: conv1d weight must be BF16 for " + hf_name);
-    }
+    // HF/safetensors ships BF16; the GGUF qwen35 converter squeezes the
+    // depthwise conv to a 2-D F32 (sometimes F16) tensor. Accept both.
+    const std::vector<float> vals = read_small_weight_as_f32_(src, hf_name);
+
     auto* t = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, conv_kernel, conv_dim);
     ggml_set_name(t, hf_name.c_str());
 
-    const std::size_t n_elems = src.nbytes / sizeof(std::uint16_t);
-    if (static_cast<std::int32_t>(n_elems) != conv_dim * conv_kernel) {
+    if (static_cast<std::int32_t>(vals.size()) != conv_dim * conv_kernel) {
         throw std::runtime_error(
             "model qwen3_5: conv1d weight size mismatch for " + hf_name);
     }
     SynthTensor s;
     s.tensor = t;
-    s.data.resize(n_elems * sizeof(float));
-    auto* dst_f32  = reinterpret_cast<float*>(s.data.data());
-    const auto* src_bf16 = reinterpret_cast<const std::uint16_t*>(src.data);
-    for (std::size_t i = 0; i < n_elems; ++i) {
-        dst_f32[i] = bf16_to_f32(src_bf16[i]);
+    s.data.resize(vals.size() * sizeof(float));
+    std::memcpy(s.data.data(), vals.data(), vals.size() * sizeof(float));
+    synth_.push_back(std::move(s));
+    return t;
+}
+
+// `A_log` inverse: the GGUF stores `-exp(A_log)`; the graph wants the raw
+// `A_log` (it applies `exp`). For a safetensors source the value is already
+// raw, so pass through to `declare_`.
+ggml_tensor* Model::declare_qwen3_5_a_log_(const std::string& hf_name) {
+    const auto& src = archive_->at(hf_name);
+    if (!archive_->is_gguf()) return declare_(hf_name);
+
+    std::vector<float> vals = read_small_weight_as_f32_(src, hf_name);
+    for (float& v : vals) v = std::log(-v);  // log(-(-exp(a))) == a
+
+    std::int64_t ne[4] = {1, 1, 1, 1};
+    for (std::size_t i = 0; i < src.shape.size(); ++i) {
+        ne[src.shape.size() - 1 - i] = src.shape[i];
     }
+    auto* t = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+    ggml_set_name(t, hf_name.c_str());
+    SynthTensor s;
+    s.tensor = t;
+    s.data.resize(vals.size() * sizeof(float));
+    std::memcpy(s.data.data(), vals.data(), vals.size() * sizeof(float));
+    synth_.push_back(std::move(s));
+    return t;
+}
+
+// Folded-norm inverse: the GGUF stores `1 + w` for every `*norm.weight`
+// except `linear_attn.norm`; the graph applies `plus_one=true` and so wants
+// the raw `w`. For a safetensors source the value is already raw.
+ggml_tensor* Model::declare_qwen3_5_folded_norm_(const std::string& hf_name) {
+    const auto& src = archive_->at(hf_name);
+    if (!archive_->is_gguf()) return declare_(hf_name);
+
+    std::vector<float> vals = read_small_weight_as_f32_(src, hf_name);
+    for (float& v : vals) v -= 1.0f;
+
+    std::int64_t ne[4] = {1, 1, 1, 1};
+    for (std::size_t i = 0; i < src.shape.size(); ++i) {
+        ne[src.shape.size() - 1 - i] = src.shape[i];
+    }
+    auto* t = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+    ggml_set_name(t, hf_name.c_str());
+    SynthTensor s;
+    s.tensor = t;
+    s.data.resize(vals.size() * sizeof(float));
+    std::memcpy(s.data.data(), vals.data(), vals.size() * sizeof(float));
     synth_.push_back(std::move(s));
     return t;
 }
@@ -2266,7 +2379,7 @@ void Model::build_qwen3_5_() {
 
     // ── top level ── (multimodal-wrapped via tensor_prefix_)
     weights_.tok_embd    = declare_(tname_("model.embed_tokens.weight"));
-    weights_.output_norm = declare_(tname_("model.norm.weight"));
+    weights_.output_norm = declare_qwen3_5_folded_norm_(tname_("model.norm.weight"));
     if (!h.tie_word_embeddings) {
         weights_.output_head = declare_("lm_head.weight");
     }
@@ -2286,9 +2399,9 @@ void Model::build_qwen3_5_() {
         const std::string p = tname_(layer_path(i));
         auto& L = weights_.layers[i];
 
-        // RMSNorms (same names on both layer types).
-        L.attn_norm = declare_(p + "input_layernorm.weight");
-        L.ffn_norm  = declare_(p + "post_attention_layernorm.weight");
+        // RMSNorms (same names on both layer types). GGUF folds +1.
+        L.attn_norm = declare_qwen3_5_folded_norm_(p + "input_layernorm.weight");
+        L.ffn_norm  = declare_qwen3_5_folded_norm_(p + "post_attention_layernorm.weight");
 
         // FFN: dense SwiGLU on Qwen 3.5; fused-stacked MoE + shared expert
         // on Qwen 3.6 (qwen3_5_moe). The MoE layout matches HF's
@@ -2313,8 +2426,10 @@ void Model::build_qwen3_5_() {
             L.lin_in_proj_z   = declare_(p + "linear_attn.in_proj_z.weight");
             L.lin_in_proj_a   = declare_(p + "linear_attn.in_proj_a.weight");
             L.lin_in_proj_b   = declare_(p + "linear_attn.in_proj_b.weight");
-            L.lin_A_log       = declare_(p + "linear_attn.A_log");
+            L.lin_A_log       = declare_qwen3_5_a_log_(p + "linear_attn.A_log");
             L.lin_dt_bias     = declare_(p + "linear_attn.dt_bias");
+            // linear_attn.norm is the ONE norm the GGUF converter does not
+            // fold +1 into, so it loads raw (the graph uses plus_one=false).
             L.lin_norm        = declare_(p + "linear_attn.norm.weight");
             L.lin_out_proj    = declare_(p + "linear_attn.out_proj.weight");
             L.lin_conv1d      = declare_qwen3_5_conv1d_(
@@ -2326,8 +2441,8 @@ void Model::build_qwen3_5_() {
             L.k_proj = declare_(p + "self_attn.k_proj.weight");
             L.v_proj = declare_(p + "self_attn.v_proj.weight");
             L.o_proj = declare_(p + "self_attn.o_proj.weight");
-            L.q_norm = declare_(p + "self_attn.q_norm.weight");
-            L.k_norm = declare_(p + "self_attn.k_norm.weight");
+            L.q_norm = declare_qwen3_5_folded_norm_(p + "self_attn.q_norm.weight");
+            L.k_norm = declare_qwen3_5_folded_norm_(p + "self_attn.k_norm.weight");
         } else {
             throw std::runtime_error(
                 "model qwen3_5: unexpected layer_type '" +
