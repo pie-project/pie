@@ -221,7 +221,7 @@ pub fn submit_async(
     physical_page_ids: Vec<PhysicalPageId>,
     last_page_len: u32,
     program_identity_hashes: Vec<u64>,
-    pipeline_id: Option<crate::process::ProcessId>,
+    pipeline_id: Option<crate::inferlet::ProcessId>,
     completion: crate::driver::InstanceCompletion,
 ) -> Result<()> {
     let submitted_at_us = crate::inference::scheduler::now_micros();

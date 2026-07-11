@@ -16,8 +16,8 @@ mod common;
 use common::mock_device::{DelayedBehavior, EchoBehavior};
 use common::{MockEnv, create_mock_env, inferlets};
 
-use pie_engine::process;
-use pie_engine::program::ProgramName;
+use pie_engine::inferlet::process;
+use pie_engine::inferlet::program::ProgramName;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
 /// Per-fire simulated device latency — long enough that the whole fleet is in

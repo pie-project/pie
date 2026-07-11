@@ -9,10 +9,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::driver;
 use crate::inference;
-use crate::linker;
+use crate::inferlet::sandbox::{FsPolicy, NetworkPolicy};
+use crate::inferlet::{linker, process, program, python};
 use crate::messaging;
-use crate::process;
-use crate::program;
 use crate::server;
 use crate::telemetry;
 use pie_model as model;
@@ -216,7 +215,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // runtime state rather than loading their own copies.
     // The Python runtime shared modules must load before the linker and
     // program services spawn, so both read from shared runtime state.
-    crate::program::python::runtime::init(&wasm_engine, config.python_snapshot);
+    python::runtime::init(&wasm_engine, config.python_snapshot);
 
     program::spawn(
         &wasm_engine,
@@ -227,11 +226,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // Compile per-instance security policies once. Network policy
     // parsing fails fast on bad config (typo'd CIDRs, `"*"` mixed with
     // rules, etc.) — better here than on the first inferlet launch.
-    let fs_policy = crate::policy::FsPolicy {
+    let fs_policy = FsPolicy {
         allow: config.runtime.allow_fs,
         base_dir: config.runtime.fs_scratch_dir.clone(),
     };
-    let network_policy = crate::policy::NetworkPolicy::parse(
+    let network_policy = NetworkPolicy::parse(
         config.runtime.allow_network,
         &config.runtime.network_allowed_hosts,
     )?;

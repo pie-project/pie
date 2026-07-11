@@ -11,7 +11,7 @@ use crate::driver::{
     InstanceCompletion, LocalDriver, NativeDriver, PoolResizePlan, ProgramRegistration,
     RegisteredChannel, SchedulerLimits, StateCopyPlan,
 };
-use crate::process::ProcessId;
+use crate::inferlet::ProcessId;
 use anyhow::{Result, anyhow};
 
 use super::batch::{self, BatchAccumulator};

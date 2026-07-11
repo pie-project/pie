@@ -2,4 +2,4 @@
 //! snapshot transformation pipeline for Python inferlets.
 
 pub(crate) mod runtime;
-pub(crate) mod snapshot;
+pub(super) mod snapshot;

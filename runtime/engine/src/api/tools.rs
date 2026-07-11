@@ -4,7 +4,7 @@
 //! Delegates to the model's `Instruct` implementation.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use anyhow::Result;
 use pie_grammar::compiled_grammar::CompiledGrammar;
 use pie_grammar::matcher::GrammarMatcher;
@@ -23,7 +23,7 @@ impl std::fmt::Debug for Decoder {
     }
 }
 
-impl pie::inferlet::tools::Host for InstanceState {
+impl pie::inferlet::tools::Host for ProcessCtx {
     async fn equip(
         &mut self,
         tools: Vec<String>,
@@ -77,7 +77,7 @@ impl pie::inferlet::tools::Host for InstanceState {
     }
 }
 
-impl pie::inferlet::tools::HostDecoder for InstanceState {
+impl pie::inferlet::tools::HostDecoder for ProcessCtx {
     async fn feed(
         &mut self,
         this: Resource<Decoder>,

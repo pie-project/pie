@@ -7,7 +7,7 @@
 //! they live on the `HostWithStore` trait taking an `Accessor`.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use crate::messaging;
 use anyhow::Result;
 use std::pin::Pin;
@@ -56,7 +56,7 @@ impl<D> StreamProducer<D> for BroadcastStream {
     }
 }
 
-impl pie::inferlet::messaging::Host for InstanceState {
+impl pie::inferlet::messaging::Host for ProcessCtx {
     async fn push(&mut self, topic: String, message: String) -> Result<()> {
         let topic = format!("{}:{}", self.get_username(), topic);
         messaging::push(topic, message)?;
@@ -70,15 +70,15 @@ impl pie::inferlet::messaging::Host for InstanceState {
     }
 }
 
-impl pie::inferlet::messaging::HostWithStore<InstanceState> for HasSelf<InstanceState> {
-    async fn pull(accessor: &Accessor<InstanceState, Self>, topic: String) -> Result<String> {
+impl pie::inferlet::messaging::HostWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
+    async fn pull(accessor: &Accessor<ProcessCtx, Self>, topic: String) -> Result<String> {
         let topic =
             accessor.with(|mut access| format!("{}:{}", access.get().get_username(), topic));
         messaging::pull(topic).await
     }
 
     async fn subscribe(
-        accessor: &Accessor<InstanceState, Self>,
+        accessor: &Accessor<ProcessCtx, Self>,
         topic: String,
     ) -> Result<StreamReader<String>> {
         let topic =

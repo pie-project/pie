@@ -11,6 +11,26 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 
+/// Security policies applied to each spawned inferlet.
+#[derive(Clone)]
+pub struct InstancePolicy {
+    pub(crate) fs: FsPolicy,
+    pub(crate) network: NetworkPolicy,
+}
+
+impl InstancePolicy {
+    /// Maximally restrictive policy for components instantiated for inspection.
+    pub(crate) fn deny_all() -> Self {
+        Self {
+            fs: FsPolicy {
+                allow: false,
+                base_dir: PathBuf::new(),
+            },
+            network: NetworkPolicy::parse(false, &[]).expect("deny-all parse"),
+        }
+    }
+}
+
 // =============================================================================
 // Filesystem
 // =============================================================================

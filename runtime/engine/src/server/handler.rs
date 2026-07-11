@@ -8,8 +8,9 @@ use pie_client::message::ServerMessage;
 
 use crate::inference;
 use crate::messaging;
-use crate::process::{self, ProcessId};
-use crate::program::{self, Manifest, ProgramName};
+use crate::inferlet::process;
+use crate::inferlet::program;
+use crate::inferlet::{Manifest, ProcessId, ProgramName};
 use pie_model as model;
 
 use super::Session;

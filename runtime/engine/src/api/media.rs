@@ -10,7 +10,7 @@
 //! unchanged — only the *source* of the bytes moved host-side. See MULTIMODAL.md.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use anyhow::Result;
 use pie_model::multimodal::{self, Processor, VisionArch};
 use wasmtime::component::Resource;
@@ -104,9 +104,9 @@ fn sample_indices(n: usize, max_frames: usize) -> Vec<usize> {
     (0..k).map(|i| i * (n - 1) / (k - 1)).collect()
 }
 
-impl pie::inferlet::media::Host for InstanceState {}
+impl pie::inferlet::media::Host for ProcessCtx {}
 
-impl pie::inferlet::media::HostImage for InstanceState {
+impl pie::inferlet::media::HostImage for ProcessCtx {
     /// Decode + resize + patchify an encoded still image per the bound model.
     async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Image>, String>> {
         let (processor, prefix, suffix) = {
@@ -163,7 +163,7 @@ impl pie::inferlet::media::HostImage for InstanceState {
     }
 }
 
-impl pie::inferlet::media::HostVideo for InstanceState {
+impl pie::inferlet::media::HostVideo for ProcessCtx {
     /// Decode an animated container, uniformly sample `<= max_frames` frames,
     /// and preprocess each per the bound model's per-frame budget.
     async fn from_bytes(
@@ -254,7 +254,7 @@ impl pie::inferlet::media::HostVideo for InstanceState {
     }
 }
 
-impl pie::inferlet::media::HostAudio for InstanceState {
+impl pie::inferlet::media::HostAudio for ProcessCtx {
     /// Decode (WAV) + resample + log-mel an encoded audio clip per the bound
     /// model. Non-audio models return a clean error.
     async fn from_bytes(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Audio>, String>> {

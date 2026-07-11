@@ -37,7 +37,7 @@ wasmtime = { version = "46.0.1", features = ["pooling-allocator"] }
 wasmtime-wasi = { version = "46.0.1", features = ["p3"] }
 wasmtime-wasi-http = { version = "46.0.1", features = ["p3"] }
 # Names `http::uri::Scheme` for the wasi:http@0.3 network-policy hook
-# (InstanceState::PieHttpHooks); shared with wasmtime-wasi-http's http 1.x.
+# (ProcessCtx::PieHttpHooks); shared with wasmtime-wasi-http's http 1.x.
 http = "1"
 bytes = "1.10.1"
 uuid = { version = "1.16.0", features = ["serde", "v4"] }

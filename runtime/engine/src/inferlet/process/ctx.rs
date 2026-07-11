@@ -1,9 +1,7 @@
-//! Instance state for WASM component execution.
+//! Process context for WASM component execution.
 //!
-//! Per-instance runtime state attached to every wasmtime `Store`: WASI
+//! Per-process runtime state attached to every wasmtime `Store`: WASI
 //! context, filesystem/Python preopens, and dynamic-linking resource maps.
-
-mod output;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,12 +14,11 @@ use wasmtime_wasi_http::p3::{
     WasiHttpCtxView as P3WasiHttpCtxView, WasiHttpHooks, WasiHttpView as P3WasiHttpView,
 };
 
-use self::output::LogStream;
+use super::output::LogStream;
+use super::ProcessId;
+use crate::inferlet::sandbox::InstancePolicy;
 
-use crate::linker::InstancePolicy;
-use crate::process::ProcessId;
-
-/// Where an instance's stdout/stderr are routed.
+/// Where a process's stdout/stderr are routed.
 pub enum OutputMode {
     /// Discard outputs (wasmtime's default sink). Used for snapshot init,
     /// where guest output is noise.
@@ -33,7 +30,7 @@ pub enum OutputMode {
     Log { program: String },
 }
 
-pub struct InstanceState {
+pub struct ProcessCtx {
     // Wasm states
     id: ProcessId,
     username: String,
@@ -63,7 +60,7 @@ pub struct InstanceState {
     next_dynamic_rep: u32,
 }
 
-impl Drop for InstanceState {
+impl Drop for ProcessCtx {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
         // (Process/context unregister removed — Phase 5; working sets drop with
@@ -71,7 +68,7 @@ impl Drop for InstanceState {
     }
 }
 
-impl WasiView for InstanceState {
+impl WasiView for ProcessCtx {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi_ctx,
@@ -80,7 +77,7 @@ impl WasiView for InstanceState {
     }
 }
 
-impl WasiHttpView for InstanceState {
+impl WasiHttpView for ProcessCtx {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
             ctx: &mut self.http_ctx,
@@ -107,7 +104,7 @@ impl WasiHttpHooks for PieHttpHooks {
     }
 }
 
-impl P3WasiHttpView for InstanceState {
+impl P3WasiHttpView for ProcessCtx {
     fn http(&mut self) -> P3WasiHttpCtxView<'_> {
         P3WasiHttpCtxView {
             ctx: &mut self.http_ctx,
@@ -117,7 +114,7 @@ impl P3WasiHttpView for InstanceState {
     }
 }
 
-impl InstanceState {
+impl ProcessCtx {
     pub async fn new(
         id: ProcessId,
         username: String,
@@ -200,7 +197,7 @@ impl InstanceState {
                 .expect("failed to preopen site-packages dir");
         }
 
-        Ok(InstanceState {
+        Ok(ProcessCtx {
             id,
             username,
             wasi_ctx: builder.build(),

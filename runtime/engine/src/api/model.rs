@@ -4,11 +4,11 @@
 //! single global [`pie_model::Model`] rather than resource methods.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use anyhow::Result;
 use pie_model as model;
 
-impl pie::inferlet::model::Host for InstanceState {
+impl pie::inferlet::model::Host for ProcessCtx {
     async fn name(&mut self) -> Result<String> {
         Ok(model::model().name().to_string())
     }

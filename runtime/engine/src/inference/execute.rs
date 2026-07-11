@@ -9,7 +9,7 @@ use crate::api::grammar::*;
 use crate::api::pie;
 use crate::inference;
 use crate::inference::paging;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use anyhow::Result;
 use pie_grammar::brle::RunMask;
 use pie_grammar::compiled_grammar::CompiledGrammar;

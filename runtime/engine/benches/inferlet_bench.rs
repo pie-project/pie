@@ -12,8 +12,8 @@ use std::time::Duration;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
-use pie_engine::process;
-use pie_engine::program::ProgramName;
+use pie_engine::inferlet::process;
+use pie_engine::inferlet::program::ProgramName;
 
 /// Shared state: MockEnv + tokio runtime.
 struct BenchState {

@@ -5,11 +5,11 @@
 //! resource methods.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use anyhow::Result;
 use pie_model as model;
 
-impl pie::inferlet::tokenizer::Host for InstanceState {
+impl pie::inferlet::tokenizer::Host for ProcessCtx {
     async fn encode(&mut self, text: String) -> Result<Vec<u32>> {
         let ids = model::model().tokenize(&text);
         Ok(ids)

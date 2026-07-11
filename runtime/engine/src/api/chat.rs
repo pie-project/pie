@@ -4,7 +4,7 @@
 //! Delegates to the model's `Instruct` implementation.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use anyhow::Result;
 use pie_model::instruct::{ChatDecoder, ChatEvent};
 use wasmtime::component::Resource;
@@ -21,7 +21,7 @@ impl std::fmt::Debug for Decoder {
     }
 }
 
-impl pie::inferlet::chat::Host for InstanceState {
+impl pie::inferlet::chat::Host for ProcessCtx {
     async fn system(&mut self, message: String) -> Result<Vec<u32>> {
         Ok(pie_model::model().instruct().system(&message))
     }
@@ -61,7 +61,7 @@ impl pie::inferlet::chat::Host for InstanceState {
     }
 }
 
-impl pie::inferlet::chat::HostDecoder for InstanceState {
+impl pie::inferlet::chat::HostDecoder for ProcessCtx {
     async fn feed(
         &mut self,
         this: Resource<Decoder>,

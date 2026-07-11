@@ -1,8 +1,14 @@
-//! Process - Per-instance lifecycle management
+//! Inferlet process lifecycle management.
 //!
 //! Each Process is a ServiceMap actor that manages a single WASM instance.
 //! Processes are registered in a global registry and receive messages via
 //! Direct Addressing.
+
+mod ctx;
+mod output;
+
+pub(crate) use ctx::OutputMode;
+pub use ctx::ProcessCtx;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -18,11 +24,11 @@ use uuid::Uuid;
 /// the cancellation result if the WASM task is aborted before it can send.
 type SharedResultTx = Arc<Mutex<Option<oneshot::Sender<Result<String, String>>>>>;
 
-use crate::instance::OutputMode;
-use crate::linker;
-use crate::program::ProgramName;
 use crate::server::{self, ClientId};
 use crate::service::{ServiceHandler, ServiceMap};
+
+use super::linker;
+use super::program::ProgramName;
 
 // =============================================================================
 // ProcessEvent

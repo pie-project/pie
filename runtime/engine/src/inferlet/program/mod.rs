@@ -15,13 +15,12 @@ use wasmtime::component::Component;
 use crate::service::{Service, ServiceHandler};
 
 mod manifest;
-pub(crate) mod python;
 mod repository;
 pub use manifest::{Manifest, ParameterType};
 pub use repository::Repository;
 
-use python::runtime as py_runtime;
-use python::snapshot;
+use super::python::runtime as py_runtime;
+use super::python::snapshot;
 
 // =============================================================================
 // Public API

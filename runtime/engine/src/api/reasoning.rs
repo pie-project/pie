@@ -4,7 +4,7 @@
 //! Delegates to the model's `Instruct` implementation.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use anyhow::Result;
 use pie_model::instruct::{ReasoningDecoder, ReasoningEvent};
 use wasmtime::component::Resource;
@@ -21,7 +21,7 @@ impl std::fmt::Debug for Decoder {
     }
 }
 
-impl pie::inferlet::reasoning::Host for InstanceState {
+impl pie::inferlet::reasoning::Host for ProcessCtx {
     async fn create_decoder(&mut self) -> Result<Resource<Decoder>> {
         let inner = pie_model::model().instruct().reasoning_decoder();
         let decoder = Decoder { inner };
@@ -29,7 +29,7 @@ impl pie::inferlet::reasoning::Host for InstanceState {
     }
 }
 
-impl pie::inferlet::reasoning::HostDecoder for InstanceState {
+impl pie::inferlet::reasoning::HostDecoder for ProcessCtx {
     async fn feed(
         &mut self,
         this: Resource<Decoder>,

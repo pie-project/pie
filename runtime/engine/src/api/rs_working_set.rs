@@ -10,7 +10,7 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use crate::ptir::ptir_host::Pipeline;
 use crate::store::registry as store_registry;
 use crate::store::rs::RsGeometry;
@@ -19,7 +19,7 @@ use pie_model as pie_model;
 
 type WitRange = pie::inferlet::working_set::PageRange;
 
-impl pie::inferlet::working_set::HostRsWorkingSet for InstanceState {
+impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     /// Fresh, empty RS working set bound to the single bound model (model 0),
     /// driver 0. Geometry comes from the model's RS caps (0/0/1 for
     /// pure-attention models).

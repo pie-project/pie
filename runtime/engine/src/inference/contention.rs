@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-use crate::process::ProcessId;
+use crate::inferlet::ProcessId;
 
 /// How the runtime reacts to a KV pool exhaustion at the prep seam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

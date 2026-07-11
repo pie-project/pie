@@ -27,7 +27,7 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::rs::working_set::RsWorkingSet;
 
@@ -219,7 +219,7 @@ pub struct ForwardPass {
 /// **FIFO INVARIANT (B3, mandatory).** Fires of one pipeline keep submission
 /// order through the scheduler onto one stream, and every pass binding a shared
 /// channel MUST submit on the SAME pipeline (enforced by
-/// [`InstanceState::wire_channels_to_pipeline`]). This is the ENTIRE correctness
+/// [`ProcessCtx::wire_channels_to_pipeline`]). This is the ENTIRE correctness
 /// argument for run-ahead + multi-pass chaining: because all interacting fires
 /// funnel onto one ordered FIFO, fire t's epilogue puts happen-before fire t+1's
 /// descriptor reads. `push_back` at submit + `pop_front` at finalize preserve
@@ -455,9 +455,9 @@ async fn await_channel_progress(
 
 // The interface has no free functions left (register-program folded into
 // forward-pass.new); the trait still anchors the resource types.
-impl pie::inferlet::forward::Host for InstanceState {}
+impl pie::inferlet::forward::Host for ProcessCtx {}
 
-impl pie::inferlet::forward::HostChannel for InstanceState {
+impl pie::inferlet::forward::HostChannel for ProcessCtx {
     async fn new(
         &mut self,
         shape: Vec<u32>,
@@ -555,7 +555,7 @@ impl pie::inferlet::forward::HostChannel for InstanceState {
     }
 }
 
-impl pie::inferlet::forward::HostForwardPass for InstanceState {
+impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     async fn new(
         &mut self,
         container_bytes: Vec<u8>,
@@ -917,9 +917,9 @@ impl pie::inferlet::forward::HostForwardPass for InstanceState {
     }
 }
 
-impl pie::inferlet::pipeline::Host for InstanceState {}
+impl pie::inferlet::pipeline::Host for ProcessCtx {}
 
-impl pie::inferlet::pipeline::HostPipeline for InstanceState {
+impl pie::inferlet::pipeline::HostPipeline for ProcessCtx {
     async fn new(&mut self) -> Anyhow<Resource<Pipeline>> {
         Ok(self.ctx().table.push(Pipeline {
             fires: Arc::new(Mutex::new(VecDeque::new())),
@@ -936,7 +936,7 @@ impl pie::inferlet::pipeline::HostPipeline for InstanceState {
     }
 }
 
-impl InstanceState {
+impl ProcessCtx {
     /// The body behind `forward-pass.submit(on)`.
     pub(crate) async fn submit_pass(
         &mut self,
@@ -1456,7 +1456,7 @@ impl InstanceState {
 /// The body behind `kv-working-set.copy-into(on, ...)` (called from
 /// `api::kv_working_set`): an ordered KV cell move on the pipeline FIFO.
 pub(crate) async fn working_set_copy_into(
-    state: &mut InstanceState,
+    state: &mut ProcessCtx,
     ws: Resource<KvWorkingSet>,
     on: Resource<Pipeline>,
     dst_page_ids: Vec<u32>,
@@ -1469,7 +1469,7 @@ pub(crate) async fn working_set_copy_into(
         .await
 }
 
-impl InstanceState {
+impl ProcessCtx {
     /// Drain one pipeline FIFO entry in submit order: a forward fire finalizes
     /// its KV/RS txns and exposes mirror epochs; a KV cell MOVE awaits its
     /// payload-free completion. Move failures are logged because no channel is
@@ -1605,7 +1605,7 @@ impl InstanceState {
     }
 }
 
-impl InstanceState {
+impl ProcessCtx {
     /// Device-geometry fire (Track B): the pass's [B,P] geometry is
     /// DEVICE-produced (the program traces `page_indptr = CumSum(np)` + packed
     /// live pages in-graph) and the driver resolves it pre-forward, so the host

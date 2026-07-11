@@ -14,7 +14,7 @@
 
 use crate::api::pie;
 use crate::api::pie::inferlet::speech::{SpeechRequest, Voice};
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -56,9 +56,9 @@ fn csm_frame_prompt(model: &pie_model::Model, text: &str, speaker: u32) -> Vec<u
     ids
 }
 
-impl pie::inferlet::speech::Host for InstanceState {}
+impl pie::inferlet::speech::Host for ProcessCtx {}
 
-impl pie::inferlet::speech::HostSpeech for InstanceState {
+impl pie::inferlet::speech::HostSpeech for ProcessCtx {
     async fn generate(&mut self, req: SpeechRequest) -> Result<Result<Resource<Speech>, String>> {
         if req.text.trim().is_empty() {
             return Ok(Err("audio-out: empty text".into()));

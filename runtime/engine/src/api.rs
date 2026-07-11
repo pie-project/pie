@@ -13,7 +13,7 @@ pub mod tokenizer;
 pub mod tools;
 pub mod types;
 
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use wasmtime::component::HasSelf;
 
 wasmtime::component::bindgen!({
@@ -68,27 +68,27 @@ wasmtime::component::bindgen!({
 });
 
 pub fn add_to_linker(
-    linker: &mut wasmtime::component::Linker<InstanceState>,
+    linker: &mut wasmtime::component::Linker<ProcessCtx>,
 ) -> Result<(), wasmtime::Error> {
-    // Concrete on InstanceState: the async-func imports (execute/receive/pull/
+    // Concrete on ProcessCtx: the async-func imports (execute/receive/pull/
     // subscribe) are generated on `HostWithStore` traits implemented for
-    // `HasSelf<InstanceState>`, so the linker `D` type must be concrete.
-    type D = HasSelf<InstanceState>;
-    pie::inferlet::types::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::pipeline::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::working_set::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::model::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::tokenizer::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::grammar::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::forward::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::messaging::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::session::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::media::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::speech::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::system::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::chat::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::tools::add_to_linker::<InstanceState, D>(linker, |s| s)?;
-    pie::inferlet::reasoning::add_to_linker::<InstanceState, D>(linker, |s| s)?;
+    // `HasSelf<ProcessCtx>`, so the linker `D` type must be concrete.
+    type D = HasSelf<ProcessCtx>;
+    pie::inferlet::types::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::pipeline::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::working_set::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::model::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::tokenizer::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::grammar::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::forward::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::messaging::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::session::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::media::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::speech::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::system::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::chat::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::tools::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::reasoning::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
 
     Ok(())
 }

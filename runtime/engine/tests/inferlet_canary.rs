@@ -17,8 +17,8 @@ use std::time::Duration;
 mod common;
 use common::{MockEnv, create_mock_env, mock_device::EchoBehavior};
 
-use pie_engine::process;
-use pie_engine::program::{Manifest, ProgramName};
+use pie_engine::inferlet::process;
+use pie_engine::inferlet::program::{Manifest, ProgramName};
 use tokio::sync::oneshot;
 
 /// Per-process bootstrap (LazyLock-backed runtime globals → bootstrap exactly once).
@@ -82,10 +82,10 @@ fn run_prod_inferlet(name: &str, input: &str, timeout: Duration) -> Result<Strin
     let h = harness();
     let (wasm, manifest, program_name) = load_prod_inferlet(name);
     h.rt.block_on(async {
-        pie_engine::program::add(wasm, manifest, true)
+        pie_engine::inferlet::program::add(wasm, manifest, true)
             .await
             .unwrap();
-        pie_engine::program::install(&program_name).await.unwrap();
+        pie_engine::inferlet::program::install(&program_name).await.unwrap();
         let (tx, rx) = oneshot::channel();
         let _pid = process::spawn(
             "test-user".into(),

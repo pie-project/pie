@@ -4,52 +4,27 @@
 //! Creates per-instance linkers with WASI, WASI HTTP, Pie API host bindings,
 //! and dynamically linked library dependencies.
 
-pub(crate) mod dynamic_linking;
+pub(super) mod dynamic;
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use anyhow::{Result, anyhow};
 use tokio::sync::oneshot;
-use wasmtime::component::{Component, Instance as WasmInstance, InstancePre, Linker as WasmLinker};
+use wasmtime::component::{Component, Instance, InstancePre, Linker as WasmLinker};
 use wasmtime::{Engine, Store};
 
 use crate::api;
-use crate::instance::{InstanceState, OutputMode};
-use crate::policy::{FsPolicy, NetworkPolicy};
-use crate::process::ProcessId;
-use crate::program::python::runtime as py_runtime;
-use crate::program::{self, InstalledComponent, ProgramName};
 use crate::service::{Service, ServiceHandler};
+
+use super::process::{OutputMode, ProcessCtx, ProcessId};
+use super::program::{self, InstalledComponent, ProgramName};
+use super::python::runtime as py_runtime;
+use super::sandbox::{FsPolicy, InstancePolicy, NetworkPolicy};
 
 // ---- Singleton Actor --------------------------------------------------------
 
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
-
-/// Per-instance security policies. Compiled once at bootstrap and
-/// shared by reference into every spawned inferlet.
-#[derive(Clone)]
-pub struct InstancePolicy {
-    pub fs: FsPolicy,
-    pub network: NetworkPolicy,
-}
-
-impl InstancePolicy {
-    /// Maximally restrictive policy: no filesystem, no network. Used
-    /// by code paths that instantiate a component for inspection only
-    /// (e.g. python-runtime snapshotting), not user execution.
-    pub fn deny_all() -> Self {
-        InstancePolicy {
-            fs: FsPolicy {
-                allow: false,
-                // Never used because allow=false blocks scratch creation;
-                // an empty path is fine here.
-                base_dir: std::path::PathBuf::new(),
-            },
-            network: NetworkPolicy::parse(false, &[]).expect("deny-all parse"),
-        }
-    }
-}
 
 /// Spawns the linker service with the given engine.
 pub fn spawn(engine: &Engine, fs: FsPolicy, network: NetworkPolicy) {
@@ -67,7 +42,7 @@ pub async fn instantiate(
     username: String,
     program_name: &ProgramName,
     output: OutputMode,
-) -> Result<(Store<InstanceState>, WasmInstance)> {
+) -> Result<(Store<ProcessCtx>, Instance)> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Instantiate {
         process_id,
@@ -84,7 +59,7 @@ pub async fn instantiate(
 struct Linker {
     engine: Engine,
     policy: InstancePolicy,
-    instance_pre_cache: HashMap<(ProgramName, u64), InstancePre<InstanceState>>,
+    instance_pre_cache: HashMap<(ProgramName, u64), InstancePre<ProcessCtx>>,
 }
 
 impl Linker {
@@ -102,7 +77,7 @@ impl Linker {
         username: String,
         program_name: &ProgramName,
         output: OutputMode,
-    ) -> Result<(Store<InstanceState>, WasmInstance)> {
+    ) -> Result<(Store<ProcessCtx>, Instance)> {
         // 1. Get the main component (with snapshot status + python-runtime decl)
         let main = program::get_wasm_component(program_name)
             .await
@@ -129,7 +104,7 @@ impl Linker {
         //    start sections have been baked into the snapshot image, so
         //    running them again would clobber it. Use full modules otherwise
         //    so CPython can initialize normally.
-        let (shared_modules_for_linker, py_runtime_dir_for_state) = if python_runtime.is_some() {
+        let (shared_modules_for_linker, py_runtime_dir_for_ctx) = if python_runtime.is_some() {
             let modules = if any_snapshotted {
                 py_runtime::stripped_modules()
             } else {
@@ -140,19 +115,19 @@ impl Linker {
             (&[][..], None)
         };
 
-        // 4. Create instance state and store
-        let inst_state = InstanceState::new(
+        // 4. Create process context and store
+        let process_ctx = ProcessCtx::new(
             process_id,
             username,
             output,
             &self.policy,
-            py_runtime_dir_for_state,
+            py_runtime_dir_for_ctx,
         )
         .await?;
-        let mut store = Store::new(&self.engine, inst_state);
+        let mut store = Store::new(&self.engine, process_ctx);
 
         // 5. Create and configure linker
-        let mut linker = WasmLinker::<InstanceState>::new(&self.engine);
+        let mut linker = WasmLinker::<ProcessCtx>::new(&self.engine);
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
 
@@ -161,7 +136,7 @@ impl Linker {
         // (outbound client.send). Linked alongside p2 — different package
         // versions, so the two sets never collide (the supported wasmtime
         // p2+p3 side-by-side config). p3 http is always linked; its network
-        // policy is enforced host-side by the InstanceState hooks
+        // policy is enforced host-side by the ProcessCtx hooks
         // (`is_supported_scheme`), so a network-denied inferlet still
         // instantiates but every request fails.
         wasmtime_wasi::p3::add_to_linker(&mut linker).expect("Failed to link WASI p3");
@@ -214,7 +189,7 @@ impl Linker {
 
         // 6. Instantiate library dependencies (dynamic linking)
         if !dependency_components.is_empty() {
-            dynamic_linking::instantiate_libraries(
+            dynamic::instantiate_libraries(
                 &self.engine,
                 &mut linker,
                 &mut store,
@@ -325,7 +300,7 @@ enum Message {
         username: String,
         program_name: ProgramName,
         output: OutputMode,
-        response: oneshot::Sender<Result<(Store<InstanceState>, WasmInstance)>>,
+        response: oneshot::Sender<Result<(Store<ProcessCtx>, Instance)>>,
     },
 }
 

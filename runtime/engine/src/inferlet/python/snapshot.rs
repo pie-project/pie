@@ -113,8 +113,9 @@ use {
 };
 
 use crate::api;
-use crate::instance::{InstanceState, OutputMode};
-use crate::linker::dynamic_linking;
+use crate::inferlet::linker::dynamic;
+use crate::inferlet::process::{OutputMode, ProcessCtx};
+use crate::inferlet::InstancePolicy;
 
 use super::runtime as py_runtime;
 
@@ -1299,7 +1300,7 @@ pub(crate) async fn snapshot_from_bytes(
     raw_bytes: &[u8],
     dep_components: Vec<Component>,
 ) -> Result<Vec<u8>> {
-    let mut linker = Linker::<InstanceState>::new(engine);
+    let mut linker = Linker::<ProcessCtx>::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
         .expect("Failed to link WASI HTTP");
@@ -1316,8 +1317,8 @@ pub(crate) async fn snapshot_from_bytes(
             .unwrap_or_else(|e| panic!("Failed to register shared module '{name}': {e}"));
     }
 
-    let snapshot_policy = crate::linker::InstancePolicy::deny_all();
-    let inst_state = InstanceState::new(
+    let snapshot_policy = InstancePolicy::deny_all();
+    let process_ctx = ProcessCtx::new(
         uuid::Uuid::new_v4(),
         "snapshot".to_string(),
         OutputMode::Discard, // snapshot init only — guest output is noise
@@ -1325,10 +1326,10 @@ pub(crate) async fn snapshot_from_bytes(
         py_runtime::dir(),
     )
     .await?;
-    let mut store = Store::new(engine, inst_state);
+    let mut store = Store::new(engine, process_ctx);
 
     if !dep_components.is_empty() {
-        dynamic_linking::instantiate_libraries(engine, &mut linker, &mut store, dep_components)
+        dynamic::instantiate_libraries(engine, &mut linker, &mut store, dep_components)
             .await
             .map_err(|e| anyhow!("Failed to instantiate deps for snapshot: {e}"))?;
     }

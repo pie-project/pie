@@ -16,9 +16,9 @@ use wasmtime_wasi::cli::IsTerminal;
 use wasmtime_wasi::cli::StdoutStream;
 use wasmtime_wasi::p2::{OutputStream, Pollable, StreamResult};
 
-use crate::process;
+use crate::inferlet::process;
 
-use crate::process::ProcessId;
+use super::ProcessId;
 
 /// Where a `LogStream`'s bytes are routed.
 #[derive(Clone)]

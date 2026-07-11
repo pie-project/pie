@@ -41,7 +41,7 @@
 //! resource to the defining component (e.g., calling a method on a resource), the proxy
 //! handle must be translated back to the real guest handle.
 //!
-//! We maintain bidirectional mappings in `InstanceState`:
+//! We maintain bidirectional mappings in `ProcessCtx`:
 //! - `dynamic_resource_map`: host rep → guest `ResourceAny`
 //! - `guest_resource_map`: guest `ResourceAny` → host rep (for identity preservation)
 //!
@@ -224,7 +224,7 @@ use wasmtime::component::{
 };
 use wasmtime::{Engine, Store, StoreContextMut};
 
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 
 /// Proxy marker type for host-defined resources used in dynamic linking.
 /// This is a phantom type used to create host resource handles.
@@ -340,7 +340,7 @@ struct TransformedArgs {
 /// proxy resource handle to the actual resource handle defined in the callee component.
 /// Cross-component borrows are tracked in borrows_to_end for cleanup after the call.
 fn transform_args_to_callee_view(
-    store: &mut StoreContextMut<'_, InstanceState>,
+    store: &mut StoreContextMut<'_, ProcessCtx>,
     args: &[Val],
     arg_types: &[Type],
     callee_defined_resource_types: &[ResourceType],
@@ -377,7 +377,7 @@ fn transform_args_to_callee_view(
 /// Only returned resources defined in the callee component are transformed to the host-defined
 /// proxy resource handle.
 fn transform_returns_to_caller_view(
-    store: &mut StoreContextMut<'_, InstanceState>,
+    store: &mut StoreContextMut<'_, ProcessCtx>,
     returns: SmallVec<[Val; 8]>,
     return_type: &[Type],
     callee_defined_resource_types: &[ResourceType],
@@ -407,7 +407,7 @@ fn transform_returns_to_caller_view(
 /// cross-component borrows that need to be ended after the call completes.
 /// This function recursively processes composite types to find all nested resource handles.
 fn recursive_transform_args_to_callee_view(
-    store: &mut StoreContextMut<'_, InstanceState>,
+    store: &mut StoreContextMut<'_, ProcessCtx>,
     val: Val,
     ty: &Type,
     callee_defined_resource_types: &[ResourceType],
@@ -659,7 +659,7 @@ fn recursive_transform_args_to_callee_view(
 /// Transform resource handles from callee view to caller view.
 /// This function recursively processes composite types to find all nested resource handles.
 fn recursive_transform_returns_to_caller_view(
-    store: &mut StoreContextMut<'_, InstanceState>,
+    store: &mut StoreContextMut<'_, ProcessCtx>,
     val: Val,
     ty: &Type,
     callee_defined_resource_types: &[ResourceType],
@@ -885,7 +885,7 @@ fn recursive_transform_returns_to_caller_view(
 /// 3. End any cross-component borrows by dropping their `ResourceAny` handles
 /// 4. Transform results back to caller view
 async fn forward_call(
-    store: &mut StoreContextMut<'_, InstanceState>,
+    store: &mut StoreContextMut<'_, ProcessCtx>,
     callee_func: &Func,
     args: &[Val],
     returns: &mut [Val],
@@ -937,7 +937,7 @@ async fn forward_call(
 /// dependency validation via `instantiate_pre`.
 fn register_stub_component_exports(
     engine: &Engine,
-    linker: &mut Linker<InstanceState>,
+    linker: &mut Linker<ProcessCtx>,
     component: &Component,
 ) -> Result<(), wasmtime::Error> {
     let component_type = linker.substituted_component_type(component)?;
@@ -955,7 +955,7 @@ fn register_stub_component_exports(
 /// Instead, they're only used for dependency validation via `instantiate_pre`.
 fn register_stub_interface_exports(
     engine: &Engine,
-    linker: &mut Linker<InstanceState>,
+    linker: &mut Linker<ProcessCtx>,
     interface_name: &str,
     instance_type: &ComponentInstanceType,
 ) -> Result<(), wasmtime::Error> {
@@ -1000,8 +1000,8 @@ fn register_stub_interface_exports(
 /// to the library instance.
 fn register_component_exports(
     engine: &Engine,
-    linker: &mut Linker<InstanceState>,
-    store: &mut Store<InstanceState>,
+    linker: &mut Linker<ProcessCtx>,
+    store: &mut Store<ProcessCtx>,
     library_component: &Component,
     library_instance: Instance,
 ) -> Result<(), wasmtime::Error> {
@@ -1068,8 +1068,8 @@ fn register_component_exports(
 /// Register forwarding implementations for an interface.
 fn register_interface_exports(
     engine: &Engine,
-    linker: &mut Linker<InstanceState>,
-    store: &mut Store<InstanceState>,
+    linker: &mut Linker<ProcessCtx>,
+    store: &mut Store<ProcessCtx>,
     interface_name: &str,
     instance_type: &ComponentInstanceType,
     library_instance: Instance,
@@ -1203,7 +1203,7 @@ fn register_interface_exports(
 /// types in their signature, registers the full forwarding closure with argument
 /// and return value transformation.
 fn register_call_forwarding(
-    inst: &mut LinkerInstance<'_, InstanceState>,
+    inst: &mut LinkerInstance<'_, ProcessCtx>,
     func_name: &str,
     func: Func,
     arg_types: Vec<Type>,
@@ -1250,8 +1250,8 @@ fn register_call_forwarding(
 /// components can import them.
 pub(crate) async fn instantiate_libraries(
     engine: &Engine,
-    linker: &mut Linker<InstanceState>,
-    store: &mut Store<InstanceState>,
+    linker: &mut Linker<ProcessCtx>,
+    store: &mut Store<ProcessCtx>,
     library_components: Vec<Component>,
 ) -> anyhow::Result<()> {
     for lib_component in library_components {

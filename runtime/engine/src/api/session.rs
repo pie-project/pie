@@ -6,14 +6,14 @@
 //! the `HostWithStore` trait taking an `Accessor` rather than `&mut self`.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::process;
+use crate::inferlet::{ProcessCtx, ProcessEvent};
 use crate::messaging;
-use crate::process::{self, ProcessEvent};
 use crate::server;
 use anyhow::Result;
 use wasmtime::component::{Accessor, HasSelf};
 
-impl pie::inferlet::session::Host for InstanceState {
+impl pie::inferlet::session::Host for ProcessCtx {
     async fn send(&mut self, message: String) -> Result<()> {
         let inst_id = self.id();
         if let Ok(Some(client_id)) = process::get_client_id(inst_id).await {
@@ -31,8 +31,8 @@ impl pie::inferlet::session::Host for InstanceState {
     }
 }
 
-impl pie::inferlet::session::HostWithStore<InstanceState> for HasSelf<InstanceState> {
-    async fn receive(accessor: &Accessor<InstanceState, Self>) -> Result<Option<String>> {
+impl pie::inferlet::session::HostWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
+    async fn receive(accessor: &Accessor<ProcessCtx, Self>) -> Result<Option<String>> {
         let topic = accessor.with(|mut access| access.get().id().to_string());
         match messaging::pull(topic).await {
             Ok(msg) => Ok(Some(msg)),
@@ -40,7 +40,7 @@ impl pie::inferlet::session::HostWithStore<InstanceState> for HasSelf<InstanceSt
         }
     }
 
-    async fn receive_file(accessor: &Accessor<InstanceState, Self>) -> Result<Option<Vec<u8>>> {
+    async fn receive_file(accessor: &Accessor<ProcessCtx, Self>) -> Result<Option<Vec<u8>>> {
         let process_id = accessor.with(|mut access| access.get().id());
         let client_id = process::get_client_id(process_id).await.ok().flatten();
         match client_id {

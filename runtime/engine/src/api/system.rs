@@ -5,11 +5,11 @@
 //! `system.sleep` is gone.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 
 use anyhow::Result;
 
-impl pie::inferlet::system::Host for InstanceState {
+impl pie::inferlet::system::Host for ProcessCtx {
     async fn version(&mut self) -> Result<String> {
         Ok(env!("CARGO_PKG_VERSION").to_string())
     }

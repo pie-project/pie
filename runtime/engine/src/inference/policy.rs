@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use super::scheduler::FireClause;
 use super::stats::SchedulerStats;
-use crate::process::ProcessId;
+use crate::inferlet::ProcessId;
 
 const RUN_AHEAD_EWMA_ALPHA: f64 = 0.25;
 

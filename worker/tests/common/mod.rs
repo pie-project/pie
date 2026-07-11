@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use pie_engine::program::{Manifest, ProgramName};
+use pie_engine::inferlet::program::{Manifest, ProgramName};
 use pie_worker::WorkerHandle;
 
 /// Default local HF snapshot (Qwen3-0.6B dense) on the reference box. Override
@@ -127,10 +127,10 @@ pub fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
 /// spawns (one install per process; spawn many).
 pub async fn install_inferlet(name: &str) -> ProgramName {
     let (wasm, manifest, program_name) = load_prod_inferlet(name);
-    pie_engine::program::add(wasm, manifest, true)
+    pie_engine::inferlet::program::add(wasm, manifest, true)
         .await
         .expect("add program");
-    pie_engine::program::install(&program_name)
+    pie_engine::inferlet::program::install(&program_name)
         .await
         .expect("install program");
     program_name
@@ -152,7 +152,7 @@ pub async fn spawn_text(
 /// its result.
 pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<String, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    pie_engine::process::spawn(
+    pie_engine::inferlet::process::spawn(
         "cuda-test".into(),
         program.clone(),
         input_json.to_string(),

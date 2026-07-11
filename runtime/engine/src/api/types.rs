@@ -5,6 +5,6 @@
 //! so `receive` / `receive-file` / `pull` await directly host-side.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 
-impl pie::inferlet::types::Host for InstanceState {}
+impl pie::inferlet::types::Host for ProcessCtx {}

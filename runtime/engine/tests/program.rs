@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 mod common;
 use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
-use pie_engine::program::{self, ProgramName};
+use pie_engine::inferlet::program::{self, ProgramName};
 
 /// Shared state: MockEnv + tokio runtime (must outlive the process).
 struct TestState {

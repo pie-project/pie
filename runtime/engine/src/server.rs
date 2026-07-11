@@ -30,8 +30,8 @@ use dashmap::DashMap;
 use pie_client::message::{ClientMessage, ServerMessage as WireServerMessage};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
-use crate::process::{self, ProcessEvent, ProcessId};
-use crate::program::ProgramName;
+use crate::inferlet::process;
+use crate::inferlet::{ProcessEvent, ProcessId, ProgramName};
 use crate::service::{ServiceHandler, ServiceMap};
 
 /// Unique identifier for a connected client.

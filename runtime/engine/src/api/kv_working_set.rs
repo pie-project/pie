@@ -16,7 +16,7 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use crate::ptir::ptir_host::Pipeline;
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::registry as store_registry;
@@ -37,7 +37,7 @@ fn cache_roots_max() -> usize {
     })
 }
 
-impl pie::inferlet::working_set::HostKvWorkingSet for InstanceState {
+impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<KvWorkingSet>> {
         // Single-model runtime: bind the one model (index 0), driver 0.
         let stores = store_registry::get(0, 0);

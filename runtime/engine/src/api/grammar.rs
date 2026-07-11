@@ -2,7 +2,7 @@
 //! Tensor + Program resources.
 
 use crate::api::pie;
-use crate::instance::InstanceState;
+use crate::inferlet::ProcessCtx;
 use anyhow::Result;
 use pie_grammar::compiled_grammar::CompiledGrammar;
 use pie_grammar::grammar::Grammar as InternalGrammar;
@@ -19,12 +19,12 @@ use wasmtime_wasi::WasiView;
 // path keeps resolving.
 pub(crate) use crate::inference::execute::*;
 
-impl pie::inferlet::grammar::Host for InstanceState {}
+impl pie::inferlet::grammar::Host for ProcessCtx {}
 
 /// Aggregate interface-level `Host` for `pie:core/working-set`, required by
 /// the generated `HostKvWorkingSet` (charlie) + `HostRsWorkingSet` (delta)
 /// resource impls. echo owns this (central bindgen) since it spans both lanes.
-impl pie::inferlet::working_set::Host for InstanceState {}
+impl pie::inferlet::working_set::Host for ProcessCtx {}
 
 /// v2 active self-suspend cycle (shared by the victim prologue and the
 /// `SelfSuspendFirst` requester-yield path). Saves `set`'s working set — D2H
@@ -44,7 +44,7 @@ pub struct Grammar {
     pub inner: Arc<InternalGrammar>,
 }
 
-impl pie::inferlet::grammar::HostGrammar for InstanceState {
+impl pie::inferlet::grammar::HostGrammar for ProcessCtx {
     async fn from_json_schema(
         &mut self,
         schema: String,
@@ -122,7 +122,7 @@ impl std::fmt::Debug for Matcher {
     }
 }
 
-impl pie::inferlet::grammar::HostMatcher for InstanceState {
+impl pie::inferlet::grammar::HostMatcher for ProcessCtx {
     async fn new(&mut self, grammar: Resource<Grammar>) -> Result<Resource<Matcher>> {
         let grammar_res = self.ctx().table.get(&grammar)?;
         let source = grammar_res.source.clone();
