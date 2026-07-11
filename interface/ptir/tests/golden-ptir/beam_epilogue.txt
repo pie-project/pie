@@ -47,10 +47,10 @@ seed chan=8 = U32([6, 6])
 seed chan=9 = U32([2, 2])
 seed chan=10 = I32([1, 2])
 seed chan=11 = F32([0.0, 0.0])
-inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 0: committed=false missed=Some((12, 3)) sinks=0
 host_put chan=12 = U32([7, 8])
-inputs 1: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 1: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 1: committed=true missed=None sinks=0
 take chan=13 = I32([3, 5])
 take chan=14 = U32([0, 1])

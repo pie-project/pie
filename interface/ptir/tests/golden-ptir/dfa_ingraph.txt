@@ -14,12 +14,12 @@ class: chan=3 FullRing
 seed chan=0 = Bool([false, true, true, false, false, false, false, false, false, false, false, true, false, false, false, false, true, false, false, false, false, false, false, false])
 seed chan=1 = U32([0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0])
 seed chan=2 = U32([0])
-inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 1.0, 0.0, 0.0, 9.0, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 1.0, 0.0, 0.0, 9.0, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 0: committed=true missed=None sinks=0
 take chan=3 = I32([2])
-inputs 1: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 9.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 1: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 9.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 1: committed=true missed=None sinks=0
 take chan=3 = I32([3])
-inputs 2: PassInputs { logits: Some(F32([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 2: PassInputs { logits: Some(F32([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 2: committed=true missed=None sinks=0
 take chan=3 = I32([0])

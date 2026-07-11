@@ -222,7 +222,11 @@ impl<'a> Builder<'a> {
         // `record_channel_put` auto-drain emits a device `ChanTake` for a channel
         // it sees as device-private at record time — but a terminal OUTPUT is
         // host-read, so that drain must be dropped (else `validate::bind` flags it
-        // SecondConsumer: a stage consumes a host-Reader).
+        // SecondConsumer: a stage consumes a host-Reader). ONLY the synthesized
+        // drains are dropped (their values are never exposed to the author); an
+        // author-written take/read on a host-Reader channel stays and surfaces
+        // as a validate error. SSA ids are positional, so dropping renumbers
+        // every later id in the stage — remap the survivors' operands.
         let reader_ch: Vec<bool> = channel_decls
             .iter()
             .map(|d| d.host_role == HostRole::Reader)
@@ -230,10 +234,15 @@ impl<'a> Builder<'a> {
         let stage_results: Vec<_> = stage_results
             .into_iter()
             .map(|mut r| {
-                r.ops.retain(|op| match op {
-                    Op::ChanTake(c) | Op::ChanRead(c) => !reader_ch[*c as usize],
-                    _ => true,
-                });
+                let drop: Vec<usize> = r
+                    .drains
+                    .iter()
+                    .copied()
+                    .filter(|&p| matches!(r.ops[p], Op::ChanTake(c) if reader_ch[c as usize]))
+                    .collect();
+                if !drop.is_empty() {
+                    drop_ops_renumber(&mut r.ops, &drop);
+                }
                 r
             })
             .collect();
@@ -322,6 +331,42 @@ impl<'a> Builder<'a> {
 impl<'a> Default for Builder<'a> {
     fn default() -> Self {
         Builder::new()
+    }
+}
+
+/// Remove the ops at the given positions and renumber the stage's positional
+/// SSA space (module docs of [`pie_ptir::op`]): every surviving operand id is
+/// remapped past the removed ops' result ids. The removed ops' own results
+/// must be unreferenced — true by construction for synthesized drains, whose
+/// values never reach the author.
+fn drop_ops_renumber(ops: &mut Vec<Op>, drop: &[usize]) {
+    // old id -> new id; u32::MAX marks a dropped op's result.
+    let mut map: Vec<u32> = Vec::new();
+    let mut next_new = 0u32;
+    for (pos, op) in ops.iter().enumerate() {
+        let dropped = drop.contains(&pos);
+        for _ in 0..op.result_count() {
+            map.push(if dropped {
+                u32::MAX
+            } else {
+                let id = next_new;
+                next_new += 1;
+                id
+            });
+        }
+    }
+    let mut pos = 0usize;
+    ops.retain(|_| {
+        let keep = !drop.contains(&pos);
+        pos += 1;
+        keep
+    });
+    for op in ops.iter_mut() {
+        op.map_operands(|id| {
+            let new = map[id as usize];
+            debug_assert_ne!(new, u32::MAX, "operand references a dropped drain value");
+            new
+        });
     }
 }
 

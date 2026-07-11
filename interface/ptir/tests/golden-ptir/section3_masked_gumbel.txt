@@ -17,13 +17,13 @@ seed chan=0 = I32([1])
 seed chan=3 = U32([1])
 seed chan=4 = U32([1234, 0])
 host_put chan=2 = Bool([true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true])
-inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 0: committed=true missed=None sinks=0
 take chan=1 = I32([7])
-inputs 1: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 1: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 1: committed=false missed=Some((2, 3)) sinks=0
 take chan=1 = ERR WouldBlock
 host_put chan=2 = Bool([false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false])
-inputs 2: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 2: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 2: committed=true missed=None sinks=0
 take chan=1 = I32([3])

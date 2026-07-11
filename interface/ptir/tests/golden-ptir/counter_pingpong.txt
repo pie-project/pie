@@ -8,12 +8,12 @@ readiness: chan=1 phase=0x03 dir=NeedsEmpty
 class: chan=0 InPlace
 class: chan=1 FullRing
 seed chan=0 = U32([10])
-inputs 0: PassInputs { logits: None, mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 0: PassInputs { logits: None, mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 0: committed=true missed=None sinks=0
-inputs 1: PassInputs { logits: None, mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 1: PassInputs { logits: None, mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 1: committed=false missed=Some((1, 3)) sinks=0
 take chan=1 = U32([11])
-inputs 2: PassInputs { logits: None, mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 2: PassInputs { logits: None, mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 2: committed=true missed=None sinks=0
 take chan=1 = U32([12])
 take chan=1 = ERR WouldBlock

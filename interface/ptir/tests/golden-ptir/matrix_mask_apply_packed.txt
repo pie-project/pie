@@ -5,6 +5,6 @@ verdict: OK
 sidecar: 50544942010000000be0db922b5f4f3201000000000100000000000000030101000000030500000000020200000008000000020002010100000000020200000008000000010102000000
 readiness: chan=0 phase=0x03 dir=NeedsEmpty
 class: chan=0 FullRing
-inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 3.0, 0.0, 9.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs 0: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 3.0, 0.0, 9.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 0: committed=true missed=None sinks=0
 take chan=0 = I32([5, 3])

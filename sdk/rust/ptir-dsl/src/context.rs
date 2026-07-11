@@ -81,6 +81,10 @@ pub(crate) struct Recorder {
     /// of pure-derivative device channels (put-without-take on a capacity-1
     /// full cell; overview §6.2 elides the drain, the trace can't).
     pub consumed: alloc::collections::BTreeSet<ChannelIndex>,
+    /// Positions (op indices) of the SYNTHESIZED drain `ChanTake`s this stage —
+    /// the only ops the builder may drop when a channel's derived role turns
+    /// out host-Reader (their result values are never exposed to the author).
+    pub drains: Vec<usize>,
 }
 
 impl Recorder {
@@ -93,6 +97,7 @@ impl Recorder {
             next_id: 0,
             sinks: Vec::new(),
             consumed: alloc::collections::BTreeSet::new(),
+            drains: Vec::new(),
         }
     }
 
@@ -175,7 +180,7 @@ pub(crate) fn trace_stage(stage: Stage, rows: u32, body: impl FnOnce()) -> Stage
     body();
     SESSION.with_borrow_mut(|s| {
         let rec = s.as_mut().expect("session active").current.take().expect("stage recorder");
-        StageResult { stage: rec.stage, ops: rec.ops, sinks: rec.sinks }
+        StageResult { stage: rec.stage, ops: rec.ops, sinks: rec.sinks, drains: rec.drains }
     })
 }
 
@@ -183,6 +188,8 @@ pub(crate) struct StageResult {
     pub stage: Stage,
     pub ops: Vec<Op>,
     pub sinks: Vec<SinkCall>,
+    /// Synthesized auto-drain positions in `ops` (see [`Recorder::drains`]).
+    pub drains: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +276,7 @@ pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
             let elem = ch.borrow().elem_ty();
             let rec = sess.current.as_mut().expect("stage active");
             rec.consumed.insert(dense);
+            rec.drains.push(rec.ops.len());
             rec.push(Op::ChanTake(dense), &[elem]);
         }
 

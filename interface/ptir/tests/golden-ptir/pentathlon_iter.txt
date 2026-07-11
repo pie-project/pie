@@ -38,7 +38,7 @@ class: chan=6 FullRing
 seed chan=2 = U32([2])
 host_put chan=0 = F32([0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 host_put chan=1 = Bool([true, true, true, true, true, true, true, true])
-inputs A: PassInputs { logits: Some(F32([0.0, 0.0, 6.0, 0.0, 0.0, 5.9, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: Some(F32([0.25])), query: [F32([2.0, 0.0, 0.0, 0.0]), F32([3.0, 0.0, 0.0, 0.0])] }
+inputs A: PassInputs { logits: Some(F32([0.0, 0.0, 6.0, 0.0, 0.0, 5.9, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: Some(F32([0.25])), query: [F32([2.0, 0.0, 0.0, 0.0]), F32([3.0, 0.0, 0.0, 0.0])] }
 step 0: committed=true missed=None sinks=2
 sink attn_page_mask: stage=OnAttnProj layer=0 args=[Bool([false, false, true, true])]
 sink attn_page_mask: stage=OnAttnProj layer=1 args=[Bool([false, false, true, true])]
@@ -49,7 +49,7 @@ take chan=5 = F32([0.25])
 seed chan=2 = U32([2])
 host_put chan=0 = F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 host_put chan=1 = Bool([false, true, false, true, false, false, false, false])
-inputs B: PassInputs { logits: Some(F32([0.0, 5.0, 0.0, 5.5, 0.0, 0.0, 9.0, 0.0])), mtp_logits: None, hidden: None, value_head: Some(F32([0.75])), query: [F32([-1.0, 0.0, 0.0, 0.0]), F32([0.0, 0.0, 0.0, 0.0])] }
+inputs B: PassInputs { logits: Some(F32([0.0, 5.0, 0.0, 5.5, 0.0, 0.0, 9.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: Some(F32([0.75])), query: [F32([-1.0, 0.0, 0.0, 0.0]), F32([0.0, 0.0, 0.0, 0.0])] }
 step 0: committed=true missed=None sinks=2
 sink attn_page_mask: stage=OnAttnProj layer=0 args=[Bool([false, false, true, true])]
 sink attn_page_mask: stage=OnAttnProj layer=1 args=[Bool([false, false, true, true])]
@@ -61,7 +61,7 @@ seed chan=0 = I32([5, 2, 7])
 seed chan=6 = U32([2])
 host_put chan=1 = Bool([true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, true, false, false, false, true, true, true, true, true, true, true, true])
 host_put chan=2 = F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-inputs A5: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0])), hidden: None, value_head: Some(F32([0.9, 0.8, 0.7, 0.6])), query: [F32([1.0, 0.0, 0.0, 0.0]), F32([2.0, 0.0, 0.0, 0.0])] }
+inputs A5: PassInputs { logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_drafts: None, hidden: None, value_head: Some(F32([0.9, 0.8, 0.7, 0.6])), query: [F32([1.0, 0.0, 0.0, 0.0]), F32([2.0, 0.0, 0.0, 0.0])] }
 step 0: committed=true missed=None sinks=2
 sink attn_page_mask: stage=OnAttnProj layer=0 args=[Bool([false, false, true, true])]
 sink attn_page_mask: stage=OnAttnProj layer=1 args=[Bool([false, false, true, true])]
@@ -73,7 +73,7 @@ seed chan=0 = I32([1, 1, 1])
 seed chan=6 = U32([2])
 host_put chan=1 = Bool([true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true])
 host_put chan=2 = F32([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 18.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-inputs B3: PassInputs { logits: Some(F32([0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 8.5, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0])), hidden: None, value_head: Some(F32([0.1, 0.2, 0.3, 0.4])), query: [F32([1.0, 0.0, 0.0, 0.0]), F32([2.0, 0.0, 0.0, 0.0])] }
+inputs B3: PassInputs { logits: Some(F32([0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 8.5, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: Some(F32([0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0])), mtp_drafts: None, hidden: None, value_head: Some(F32([0.1, 0.2, 0.3, 0.4])), query: [F32([1.0, 0.0, 0.0, 0.0]), F32([2.0, 0.0, 0.0, 0.0])] }
 step 0: committed=true missed=None sinks=2
 sink attn_page_mask: stage=OnAttnProj layer=0 args=[Bool([false, false, true, true])]
 sink attn_page_mask: stage=OnAttnProj layer=1 args=[Bool([false, false, true, true])]

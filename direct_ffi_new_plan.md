@@ -63,6 +63,24 @@ no_context WIT-path fix, a dummy-driver `LaunchObserver` seam restoring
 mock fire observation, and wasip2 targets for ptir guests — the wasip3 std
 pulls a `wasi:random` rc version wasmtime does not link).
 
+Third sweep: the ptir-dsl auto-drain corruption is fixed at the source.
+`assemble` used to retain-out every `ChanTake`/`ChanRead` on a derived
+host-Reader channel without renumbering the stage's positional SSA ids, so
+any op recorded after an early terminal-output `put` referenced shifted ids
+(guests worked around it by ordering terminal puts last). Now the tracer
+tags the positions of the synthesized drain takes (`Recorder::drains`), the
+builder drops ONLY those (an author-written take/read on a host-Reader now
+surfaces as a validate error instead of being silently deleted), and a
+renumbering pass remaps the survivors' operands via the new
+`Op::map_operands` (interface/ptir op.rs, with an operands()-parity test).
+Tail-position drops renumber to identity, so every existing container's
+bytes and C3 hash are unchanged (goldens pass unmodified); regression test
+sdk/rust/ptir-dsl/tests/drain_renumber.rs pins the early-put case. The
+guests' put-last ordering is no longer load-bearing. Also re-blessed the
+stale interface/ptir golden-ptir textual goldens (the `MtpDrafts` intrinsic
+append predated them; diff is only the `mtp_drafts: None` field in the
+`PassInputs` debug line — container/sidecar bytes identical).
+
 Successor plan to [direct_ffi.md](direct_ffi.md) and [direct_ffi_fix.md](direct_ffi_fix.md)
 for the channel data plane and the wake paths. The direct FFI transport
 migration those documents drove is done and is not reopened here. This plan

@@ -17,14 +17,14 @@ class: chan=0 FullRing
 class: chan=1 FullRing
 class: chan=2 FullRing
 host_put chan=1 = Bool([true, true, true, true, true, true, true, true])
-inputs expert-early: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 0.0, 0.0, 8.5, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs expert-early: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 0.0, 0.0, 8.5, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 0: committed=false missed=Some((0, 3)) sinks=0
-inputs amateur: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs amateur: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 1: committed=true missed=None sinks=0
-inputs amateur-again: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs amateur-again: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 2: committed=false missed=Some((0, 3)) sinks=0
-inputs expert: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 0.0, 0.0, 8.5, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs expert: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 0.0, 0.0, 8.5, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 3: committed=true missed=None sinks=0
 take chan=2 = I32([5])
-inputs amateur-refill: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, hidden: None, value_head: None, query: [] }
+inputs amateur-refill: PassInputs { logits: Some(F32([0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [] }
 step 4: committed=true missed=None sinks=0

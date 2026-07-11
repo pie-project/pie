@@ -294,6 +294,92 @@ impl Op {
         }
     }
 
+    /// Rewrite this op's value-id operands in place — the mutable counterpart
+    /// of [`Op::operands`], covering exactly the same ids (immediates
+    /// untouched). For passes that renumber a stage's positional SSA space
+    /// after inserting or removing ops.
+    pub fn map_operands(&mut self, mut f: impl FnMut(ValueId) -> ValueId) {
+        match self {
+            Op::Const(_)
+            | Op::Iota { .. }
+            | Op::Rng { .. }
+            | Op::ChanTake(_)
+            | Op::ChanRead(_)
+            | Op::IntrinsicVal { .. } => {}
+
+            Op::Exp(a)
+            | Op::Log(a)
+            | Op::Neg(a)
+            | Op::Recip(a)
+            | Op::Abs(a)
+            | Op::Sign(a)
+            | Op::Cast { value: a, .. }
+            | Op::Not(a)
+            | Op::ReduceSum(a)
+            | Op::ReduceMax(a)
+            | Op::ReduceMin(a)
+            | Op::ReduceArgmax(a)
+            | Op::Broadcast { value: a, .. }
+            | Op::Reshape { value: a, .. }
+            | Op::Transpose(a)
+            | Op::CumSum(a)
+            | Op::CumProd(a)
+            | Op::SortDesc(a)
+            | Op::TopK { input: a, .. }
+            | Op::RngKeyed { state: a, .. }
+            | Op::ChanPut { value: a, .. } => *a = f(*a),
+
+            Op::Add(a, b)
+            | Op::Sub(a, b)
+            | Op::Mul(a, b)
+            | Op::Div(a, b)
+            | Op::MaxElem(a, b)
+            | Op::MinElem(a, b)
+            | Op::Rem(a, b)
+            | Op::Gt(a, b)
+            | Op::Ge(a, b)
+            | Op::Eq(a, b)
+            | Op::Ne(a, b)
+            | Op::Lt(a, b)
+            | Op::Le(a, b)
+            | Op::And(a, b)
+            | Op::Or(a, b)
+            | Op::MatMul(a, b)
+            | Op::Gather { src: a, idx: b }
+            | Op::GatherRow { src: a, idx: b }
+            | Op::MaskApply { logits: a, mask: b } => {
+                *a = f(*a);
+                *b = f(*b);
+            }
+
+            Op::Select { cond, a, b } => {
+                *cond = f(*cond);
+                *a = f(*a);
+                *b = f(*b);
+            }
+            Op::ScatterAdd { base, idx, vals } | Op::ScatterSet { base, idx, vals } => {
+                *base = f(*base);
+                *idx = f(*idx);
+                *vals = f(*vals);
+            }
+
+            Op::PivotThreshold { input, predicate } => {
+                *input = f(*input);
+                match predicate {
+                    Predicate::RankLe(v) | Predicate::CummassLe(v) | Predicate::ProbGe(v) => {
+                        *v = f(*v)
+                    }
+                }
+            }
+
+            Op::KernelCall { args, .. } | Op::SinkCall { args, .. } => {
+                for a in args.iter_mut() {
+                    *a = f(*a);
+                }
+            }
+        }
+    }
+
     /// This op's wire tag (see [`OP_TABLE`]).
     pub fn tag(&self) -> u8 {
         match self {
@@ -500,6 +586,18 @@ mod tests {
             if spec.val_operands != VARIADIC {
                 assert_eq!(spec.val_operands as usize, op.operands().len(), "arity for {}", spec.name);
             }
+
+            // map_operands must visit exactly operands(), in order, and a
+            // rewrite must be readable back through operands().
+            let mut visited: Vec<ValueId> = Vec::new();
+            let mut rewritten = op.clone();
+            rewritten.map_operands(|id| {
+                visited.push(id);
+                id + 100
+            });
+            assert_eq!(visited, op.operands(), "map_operands coverage for {}", spec.name);
+            let shifted: Vec<ValueId> = op.operands().iter().map(|id| id + 100).collect();
+            assert_eq!(rewritten.operands(), shifted, "map_operands rewrite for {}", spec.name);
         }
     }
 }
