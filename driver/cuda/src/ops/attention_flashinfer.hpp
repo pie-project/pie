@@ -9,14 +9,14 @@
 
 #include <cuda_runtime.h>
 
-#include "attention_workspace.hpp"
-#include "kv_cache.hpp"
+#include "kernels/kv_cache_view.hpp"
+#include "ops/attention_workspace.hpp"
 
 namespace pie_cuda_driver::ops {
 
 // Opaque cache of flashinfer's `DecodePlanInfo` plus the few scheduling
 // fields the dispatch needs. Lifecycle: created once (e.g. in
-// Executor), reset each fire by `plan_attention_flashinfer_decode_bf16`,
+// BatchEngine), reset each fire by `plan_attention_flashinfer_decode_bf16`,
 // then reused by 28 per-layer dispatch calls within that fire. Hoisting
 // the plan out of the per-layer loop saves ~27 redundant DecodePlan
 // invocations per fire — the plan is identical across all layers in

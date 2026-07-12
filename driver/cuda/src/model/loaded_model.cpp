@@ -67,7 +67,7 @@ bool supports_tp(const std::string& mt) {
 // All members share an all-MoE MLP layout (no dense `intermediate_size`),
 // so the engine's TP divisibility checks on `intermediate_size` should
 // be skipped for them.
-bool is_qwen3_5_moe_arch(const std::string& mt) {
+bool model_type_is_qwen3_5_moe(const std::string& mt) {
     return mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
         || mt == "qwen3_moe";
 }
@@ -270,7 +270,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             || hf.model_type == "deepseek_v2" || hf.model_type == "deepseek_v3"
             || hf.model_type == "glm_moe_dsa";
         const bool is_dsv4 = hf.model_type == "deepseek_v4";
-        const bool is_q35_moe = is_qwen3_5_moe_arch(hf.model_type);
+        const bool is_q35_moe = model_type_is_qwen3_5_moe(hf.model_type);
         const bool is_nemotron_h = hf.model_type == "nemotron_h";
         if (!is_q35_moe && !is_kimi_k2 && !is_dsv4) {
             require_divisible(hf.intermediate_size, "intermediate_size");

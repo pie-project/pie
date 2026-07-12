@@ -1,0 +1,15 @@
+[package]
+name = "chat-completion"
+version = "0.1.0"
+description = "Chat completion with top-p and temperature sampling"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", description = "The user message to complete"}
+system = {type = "string", optional = true, description = "System prompt controlling assistant behavior"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 256)"}
+temperature = {type = "float", optional = true, description = "Sampling temperature (default: 0.6)"}
+top_p = {type = "float", optional = true, description = "Nucleus sampling threshold (default: 0.95)"}

@@ -1,0 +1,13 @@
+[package]
+name = "sliding-window-attention"
+version = "0.1.0"
+description = "Sliding-window attention for long-sequence generation"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 512)"}
+window_size = {type = "int", optional = true, description = "Recent-token attention window (default: 64)"}

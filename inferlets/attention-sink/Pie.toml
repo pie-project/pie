@@ -1,14 +1,14 @@
 [package]
 name = "attention-sink"
-version = "0.4.0"
-description = "Attention sink for managing long sequence generation with bounded KV cache"
+version = "0.1.0"
+description = "Attention sinks combined with a sliding attention window"
 authors = ["Pie Team"]
 
 [runtime]
 core = "^0.2.0"
 
 [parameters]
-prompt = {type = "string", optional = true, description = "The prompt to send to the model (default: 'Explain LLM decoding process in ELI5.')"}
-max_tokens = {type = "int", optional = true, description = "Maximum number of new tokens to generate (default: 512)"}
-sink_size = {type = "int", optional = true, description = "Initial size of the attention sink (default: 64)"}
-window_size = {type = "int", optional = true, description = "Sliding window size for the attention sink (default: 32)"}
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 512)"}
+sink_size = {type = "int", optional = true, description = "Number of initial sink tokens (default: 4)"}
+window_size = {type = "int", optional = true, description = "Recent-token attention window (default: 64)"}

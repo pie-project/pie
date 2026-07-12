@@ -27,9 +27,9 @@ use pie_driver_abi::{
 };
 
 use crate::driver::{
-    BoundInstance, ChannelEndpoint, ChannelRegistrationPlan, ChannelValue, Completion, DriverId,
+    BoundInstance, ChannelEndpoint, ChannelRegistrationPlan, ChannelValue, DriverId,
     InstanceBindingPlan, InstanceId, KvCopyPlan, PoolResizePlan, ProgramId, ProgramRegistration,
-    StateCopyPlan,
+    StateCopyPlan, SubmissionCompletion,
 };
 
 use super::scheduler_handle;
@@ -102,7 +102,7 @@ pub(crate) fn copy_d2h(
     driver_idx: DriverId,
     gpu_phys_ids: &[u32],
     cpu_pages: &[u32],
-) -> Result<Completion> {
+) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?.copy_kv(KvCopyPlan {
         src_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         src_device_ordinal: 0,
@@ -118,7 +118,7 @@ pub(crate) fn copy_h2d(
     driver_idx: DriverId,
     gpu_phys_ids: &[u32],
     cpu_pages: &[u32],
-) -> Result<Completion> {
+) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?.copy_kv(KvCopyPlan {
         src_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
         src_device_ordinal: 0,
@@ -134,7 +134,7 @@ pub(crate) fn copy_d2d(
     driver_idx: DriverId,
     src_phys_ids: &[u32],
     dst_phys_ids: &[u32],
-) -> Result<Completion> {
+) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?.copy_kv(KvCopyPlan {
         src_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         src_device_ordinal: 0,
@@ -150,7 +150,7 @@ pub(crate) fn copy_h2h(
     driver_idx: DriverId,
     src_slots: &[u32],
     dst_slots: &[u32],
-) -> Result<Completion> {
+) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?.copy_kv(KvCopyPlan {
         src_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
         src_device_ordinal: 0,
@@ -162,7 +162,10 @@ pub(crate) fn copy_h2h(
     })
 }
 
-pub(crate) fn copy_kv_cells(driver_idx: DriverId, cells: Vec<PieKvMoveCell>) -> Result<Completion> {
+pub(crate) fn copy_kv_cells(
+    driver_idx: DriverId,
+    cells: Vec<PieKvMoveCell>,
+) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?.copy_kv(KvCopyPlan {
         src_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
         src_device_ordinal: 0,
@@ -178,7 +181,7 @@ pub(crate) fn copy_rs_d2d(
     driver_idx: DriverId,
     src_slots: &[u32],
     dst_slots: &[u32],
-) -> Result<Completion> {
+) -> Result<SubmissionCompletion> {
     let slot_ranges = src_slots
         .iter()
         .zip(dst_slots.iter())
@@ -199,7 +202,7 @@ pub(crate) fn resize_pool(
     target_pages: u64,
     map_ranges: Vec<PiePoolRange>,
     unmap_ranges: Vec<PiePoolRange>,
-) -> Result<Completion> {
+) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?.resize_pool(PoolResizePlan {
         pool_id,
         target_pages,

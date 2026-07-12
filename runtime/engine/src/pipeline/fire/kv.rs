@@ -104,8 +104,11 @@ fn build_translation(
     ws: WorkingSetId,
 ) -> Result<Vec<u32>, KvStoreError> {
     let mut table: Vec<u32> = {
-        let (_, flat) = store.flat_table(ws)?;
-        flat.iter().map(|p| p.0).collect()
+        store
+            .visible_flat_table(ws)?
+            .into_iter()
+            .map(|p| p.0)
+            .collect()
     };
     let max_target = prepared
         .targets()
@@ -143,7 +146,7 @@ fn build_commits(
 ) -> Result<Vec<PageCommit>, KvStoreError> {
     let canonical = hash_tokens.is_some();
     let domain = store.domain();
-    let mut prev = store.chain_state(ws)?;
+    let mut prev = store.visible_chain_state(ws)?;
     let mut slot_hashes: Vec<Hash256> = Vec::with_capacity(n_new as usize);
     for j in 0..n_new {
         let h = match hash_tokens {
@@ -165,8 +168,8 @@ fn build_commits(
         let (mut hashes, existing_page_hash) = match target {
             PreparedTarget::Fresh { .. } => (Vec::new(), None),
             PreparedTarget::InPlace { index, .. } | PreparedTarget::Cow { index, .. } => (
-                store.page_token_hashes(ws, *index)?,
-                store.page_hash_at(ws, *index)?,
+                store.visible_page_token_hashes(ws, *index)?,
+                store.visible_page_hash_at(ws, *index)?,
             ),
         };
         hashes.resize(page_size as usize, None);
@@ -282,8 +285,12 @@ pub fn prepare(
     // the flattened table (write targets override their slots below).
     let valid_pages = (committed_tokens.div_ceil(page_size)) as usize;
     let context_pages: Vec<u32> = {
-        let (_, flat) = store.flat_table(ws)?;
-        flat.iter().take(valid_pages).map(|p| p.0).collect()
+        store
+            .visible_flat_table(ws)?
+            .into_iter()
+            .take(valid_pages)
+            .map(|p| p.0)
+            .collect()
     };
     if context_pages.len() < valid_pages {
         return Err(KvError::Fatal(format!(
@@ -343,6 +350,7 @@ pub fn prepare(
         hash_tokens,
     )?;
     let translation = build_translation(store, &prepared, ws)?;
+    store.track_pending_write(&prepared, &commits, Some(total as u64));
 
     Ok((
         proj,
@@ -377,7 +385,7 @@ pub fn prepare_explicit(
     // Device-geometry fires are non-canonical by construction, and the
     // device owns the token bookkeeping — commit with no hash metadata;
     // `KvStore::commit` poisons the chain state with an opaque draw.
-    let commits = prepared
+    let commits: Vec<PageCommit> = prepared
         .targets()
         .iter()
         .map(|_| PageCommit {
@@ -385,6 +393,7 @@ pub fn prepare_explicit(
             page_hash: None,
         })
         .collect();
+    store.track_pending_write(&prepared, &commits, None);
     Ok((
         pages,
         copies,
@@ -738,6 +747,151 @@ mod tests {
         assert!(src.is_empty()); // private -> no CoW copies
         finalize(&mut store, txn, true).unwrap();
         assert_eq!(store.lookup(ws, 1).unwrap(), before); // id stable in place
+    }
+
+    #[test]
+    fn pending_overlay_matches_synchronous_projection_translation_and_hashes() {
+        let page = 4u32;
+        let tokens: Vec<u32> = (1..=9).collect();
+        let chunks = [5usize, 1, 3];
+
+        let mut synchronous = KvStore::new(16, nonce());
+        let sync_ws = synchronous.create_working_set();
+        let mut sync_shapes = Vec::new();
+        let mut offset = 0usize;
+        for size in chunks {
+            let chunk = &tokens[offset..offset + size];
+            let (projection, _, translation, txn) = prepare(
+                &mut synchronous,
+                sync_ws,
+                offset as u32,
+                chunk,
+                page,
+                Some(chunk),
+            )
+            .unwrap();
+            sync_shapes.push((projection, translation));
+            finalize(&mut synchronous, txn, true).unwrap();
+            offset += size;
+        }
+
+        let mut runahead = KvStore::new(16, nonce());
+        let runahead_ws = runahead.create_working_set();
+        let mut pending = Vec::new();
+        let mut runahead_shapes = Vec::new();
+        offset = 0;
+        for size in chunks {
+            let chunk = &tokens[offset..offset + size];
+            let (projection, _, translation, txn) = prepare(
+                &mut runahead,
+                runahead_ws,
+                offset as u32,
+                chunk,
+                page,
+                Some(chunk),
+            )
+            .unwrap();
+            runahead_shapes.push((projection, translation));
+            pending.push(txn);
+            offset += size;
+        }
+
+        assert_eq!(runahead.mapped_len(runahead_ws).unwrap(), 0);
+        assert_eq!(
+            runahead.visible_token_len(runahead_ws, page).unwrap(),
+            tokens.len() as u64
+        );
+        assert_eq!(runahead_shapes, sync_shapes);
+
+        for txn in pending {
+            finalize(&mut runahead, txn, true).unwrap();
+        }
+        assert_eq!(
+            runahead.chain_state(runahead_ws).unwrap(),
+            synchronous.chain_state(sync_ws).unwrap()
+        );
+        for index in 0..tokens.len().div_ceil(page as usize) as u64 {
+            assert_eq!(
+                runahead.page_token_hashes(runahead_ws, index).unwrap(),
+                synchronous.page_token_hashes(sync_ws, index).unwrap()
+            );
+            assert_eq!(
+                runahead.page_hash_at(runahead_ws, index).unwrap(),
+                synchronous.page_hash_at(sync_ws, index).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn pending_overlay_reuses_cow_destination_and_preserves_hash_chain() {
+        let mut store = KvStore::new(32, nonce());
+        let page = 4u32;
+        let parent = store.create_working_set();
+        prefill(&mut store, parent, &[1, 2, 3, 4, 5, 6], &[6], page);
+        let synchronous = store.fork(parent).unwrap();
+        let runahead = store.fork(parent).unwrap();
+
+        let (_, _, _, sync_first) =
+            prepare(&mut store, synchronous, 6, &[7], page, Some(&[7])).unwrap();
+        finalize(&mut store, sync_first, true).unwrap();
+        let (_, _, _, sync_second) =
+            prepare(&mut store, synchronous, 7, &[8], page, Some(&[8])).unwrap();
+        finalize(&mut store, sync_second, true).unwrap();
+
+        let (_, (first_copy_src, _), first_translation, first) =
+            prepare(&mut store, runahead, 6, &[7], page, Some(&[7])).unwrap();
+        assert!(!first_copy_src.is_empty());
+        let (_, (second_copy_src, _), second_translation, second) =
+            prepare(&mut store, runahead, 7, &[8], page, Some(&[8])).unwrap();
+        assert!(
+            second_copy_src.is_empty(),
+            "the second pending fire writes the first fire's private CoW destination"
+        );
+        assert_eq!(first_translation[1], second_translation[1]);
+        finalize(&mut store, first, true).unwrap();
+        finalize(&mut store, second, true).unwrap();
+
+        assert_eq!(
+            store.chain_state(runahead).unwrap(),
+            store.chain_state(synchronous).unwrap()
+        );
+        assert_eq!(
+            store.page_token_hashes(runahead, 1).unwrap(),
+            store.page_token_hashes(synchronous, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_predecessor_pages_recycle_after_downstream_pending_fire_retires() {
+        let mut store = KvStore::new(4, nonce());
+        let ws = store.create_working_set();
+        let (_, _, _, first) =
+            prepare(&mut store, ws, 0, &[1, 2, 3, 4], 4, Some(&[1, 2, 3, 4])).unwrap();
+        let (_, _, _, second) = prepare(&mut store, ws, 4, &[5], 4, Some(&[5])).unwrap();
+        assert_eq!(store.available_pages(), 2);
+
+        finalize(&mut store, first, false).unwrap();
+        assert_eq!(
+            store.available_pages(),
+            2,
+            "the downstream translation can still reference the predecessor allocation"
+        );
+        finalize(&mut store, second, false).unwrap();
+        assert_eq!(store.available_pages(), 4);
+    }
+
+    #[test]
+    fn working_set_release_waits_for_pending_overlay_retirement() {
+        let mut store = KvStore::new(4, nonce());
+        let ws = store.create_working_set();
+        let (_, _, _, pending) =
+            prepare(&mut store, ws, 0, &[1, 2, 3, 4], 4, Some(&[1, 2, 3, 4])).unwrap();
+        store.release_working_set(ws, store.current_epoch());
+        assert_eq!(store.available_pages(), 3);
+
+        finalize(&mut store, pending, true).unwrap();
+        assert_eq!(store.available_pages(), 4);
+        assert!(store.mapped_len(ws).is_err());
     }
 
     #[test]

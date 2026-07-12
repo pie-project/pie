@@ -8,8 +8,11 @@ Modes:
 - `tput`: launches `--num-requests` requests together, useful for
   saturated throughput.
 
-Pie runs use the `text-completion-bench` inferlet so the runner can record
-actual prompt/output token counts.
+Pie runs use an external `text-completion-bench` project so the runner can
+record actual prompt/output token counts without adding benchmark-only code to
+the curated `inferlets/` collection.
+
+Pass its path with `--inferlet-dir` or set `PIE_BENCH_INFERLET_DIR`.
 
 ## Scripts
 
@@ -37,7 +40,7 @@ Run from the repo root.
 
 ```bash
 rustup target add wasm32-wasip2
-cargo build -p text-completion-bench --target wasm32-wasip2 --release
+( cd /path/to/text-completion-bench && cargo build --target wasm32-wasip2 --release )
 ```
 
 For Pie:
@@ -56,6 +59,7 @@ Pie latency:
 
 ```bash
 uv --project sdk/python-server run python benches/pie_bench.py latency \
+  --inferlet-dir /path/to/text-completion-bench \
   --driver cuda_native \
   --model Qwen/Qwen3-0.6B \
   --device cuda:0 \
@@ -68,6 +72,7 @@ Pie throughput:
 
 ```bash
 uv --project sdk/python-server run python benches/pie_bench.py tput \
+  --inferlet-dir /path/to/text-completion-bench \
   --driver cuda_native \
   --model Qwen/Qwen3-0.6B \
   --device cuda:0 \

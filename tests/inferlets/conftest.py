@@ -11,8 +11,8 @@ Each ``test_<name>.py`` file defines one or more async test functions and a
 
 Usage from project root::
 
-    uv run python tests/inferlets/test_watermarking.py --dummy
-    uv run python tests/inferlets/test_watermarking.py --model Qwen/Qwen3-0.6B
+    uv run python tests/inferlets/test_curated.py --dummy
+    uv run python tests/inferlets/test_curated.py --model Qwen/Qwen3-0.6B
 """
 
 from __future__ import annotations
@@ -121,10 +121,13 @@ async def run_inferlet(
     if extra_args is None:
         extra_args = []
     wasm_name = name.replace("-", "_")
-    # Rust: cargo emits to target/wasm32-wasip2/{release,debug}/<name>.wasm
+    # Rust workspace artifacts live under inferlets/target. Keep the member
+    # paths as fallbacks for inferlets built outside the curated workspace.
     # JS (bakery build) / Python (componentize-py): flat target/<name>.wasm
     inferlet_dir = INFERLETS_DIR / name
     candidates = [
+        INFERLETS_DIR / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
+        INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / f"{wasm_name}.wasm",

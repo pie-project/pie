@@ -359,7 +359,7 @@ impl Client {
 
     /// Check if a program exists on the server.
     ///
-    /// The `inferlet` must be in `name@version` format (e.g., "text-completion@0.1.0").
+    /// The `inferlet` must be in `name@version` format (e.g., "chat-completion@0.1.0").
     pub async fn check_program(
         &self,
         inferlet: &str,

@@ -1,0 +1,183 @@
+//! Applies a greenlist watermark while generating text.
+//!
+//! Each previously generated token deterministically partitions the vocabulary
+//! into a green and red list. Green-token logits receive a configurable bias
+//! before Gumbel-max sampling.
+
+use inferlet::ptir::prelude::*;
+use inferlet::{Result, chat, model as wit_model};
+use serde::Deserialize;
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_gamma")]
+    gamma: f32,
+    #[serde(default = "default_delta")]
+    delta: f32,
+}
+
+fn default_prompt() -> String {
+    "Explain language-model decoding in simple terms.".into()
+}
+
+fn default_max_tokens() -> usize {
+    256
+}
+
+fn default_gamma() -> f32 {
+    0.5
+}
+
+fn default_delta() -> f32 {
+    2.0
+}
+
+fn bx<T>(value: T) -> &'static T {
+    Box::leak(Box::new(value))
+}
+
+fn green_mask(vocab: u32, previous_token: u32, gamma: f32) -> Vec<bool> {
+    let threshold = (gamma * u64::MAX as f32) as u64;
+    (0..vocab)
+        .map(|token| {
+            let mut hasher = DefaultHasher::new();
+            previous_token.hash(&mut hasher);
+            token.hash(&mut hasher);
+            hasher.finish() <= threshold
+        })
+        .collect()
+}
+
+fn watermarked_sample(
+    logits: impl AsTensor,
+    green: impl AsTensor,
+    rng_state: impl AsTensor,
+    delta: f32,
+    vocab: u32,
+) -> Tensor {
+    let bias = select(
+        green,
+        broadcast(Tensor::constant(delta), [vocab]),
+        broadcast(Tensor::constant(0.0f32), [vocab]),
+    );
+    let perturbed = add(add(logits, bias), gumbel(rng_state, [vocab]));
+    reduce_argmax(perturbed)
+}
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<String> {
+    if !(0.0..=1.0).contains(&input.gamma) {
+        return Err("gamma must be between 0 and 1".into());
+    }
+    if !input.delta.is_finite() {
+        return Err("delta must be finite".into());
+    }
+    if input.max_tokens == 0 {
+        return Ok(String::new());
+    }
+
+    let vocab = wit_model::output_vocab_size();
+    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    model::configure(vocab, ws.page_size(), 1);
+
+    let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
+    prompt.extend(chat::cue());
+    if prompt.is_empty() {
+        prompt.push(0);
+    }
+    let n = prompt.len() as u32;
+    let stop_tokens = chat::stop_tokens();
+
+    let prompt_tokens = bx(Channel::from(
+        prompt.iter().map(|&token| token as i32).collect::<Vec<_>>(),
+    ));
+    let prefill_klen = bx(Channel::from(vec![n]));
+    let prefill_green = bx(Channel::new([vocab], dtype::bool).named("prefill_green"));
+    let prefill_rng = bx(Channel::from(vec![0x51ed_u32, 0]).named("prefill_rng"));
+    let first_out = bx(Channel::new([1], dtype::i32).named("first_token"));
+
+    let prefill: ForwardPass<'static> = ForwardPass::new();
+    prefill.embed(prompt_tokens, Tensor::constant(vec![0u32, n]));
+    prefill.attn_working_set(ws, prefill_klen);
+    let delta = input.delta;
+    prefill.epilogue(move || {
+        let green = prefill_green.take();
+        let rng = prefill_rng.take();
+        let token = watermarked_sample(intrinsics::logits(), &green, &rng, delta, vocab);
+        first_out.put(&token);
+        prefill_rng.put(add(&rng, iota(2)));
+    });
+
+    prefill_green.put(green_mask(vocab, *prompt.last().unwrap_or(&0), input.gamma));
+    let prefill_pipeline = Pipeline::new();
+    prefill
+        .submit(&prefill_pipeline)
+        .map_err(|e| format!("watermark prefill: {e}"))?;
+    let first = first_out
+        .take()
+        .get::<i32>()
+        .map_err(|e| format!("read first token: {e}"))?[0] as u32;
+    prefill_pipeline.close();
+
+    let mut generated = Vec::with_capacity(input.max_tokens);
+    if !stop_tokens.contains(&first) {
+        generated.push(first);
+    }
+
+    if generated.len() < input.max_tokens && !stop_tokens.contains(&first) {
+        let token_in = bx(Channel::from(vec![first as i32]).named("token_in"));
+        let position = bx(Channel::from(vec![n]).named("position"));
+        let klen = bx(Channel::from(vec![n + 1]).named("klen"));
+        let fill = bx(Channel::from(vec![n + 1]).named("fill"));
+        let green = bx(Channel::new([vocab], dtype::bool).named("green"));
+        let rng = bx(Channel::from(vec![0x9e37_u32, 0]).named("rng"));
+        let token_out = bx(Channel::new([1], dtype::i32).named("token_out"));
+
+        let decode: ForwardPass<'static> = ForwardPass::new();
+        decode.embed(token_in, Tensor::constant(vec![0u32, 1]));
+        decode.positions(position);
+        decode.attn_working_set(ws, klen);
+        decode.epilogue(move || {
+            let base = fill.take().tensor();
+            let green_value = green.take();
+            let rng_value = rng.take();
+            let token =
+                watermarked_sample(intrinsics::logits(), &green_value, &rng_value, delta, vocab);
+            let next = add(&base, 1u32);
+
+            token_in.put(&token);
+            token_out.put(&token);
+            position.put(&base);
+            klen.put(&next);
+            fill.put(&next);
+            rng.put(add(&rng_value, iota(2)));
+        });
+
+        let pipeline = Pipeline::new();
+        let mut previous = first;
+        while generated.len() < input.max_tokens {
+            green.put(green_mask(vocab, previous, input.gamma));
+            decode
+                .submit(&pipeline)
+                .map_err(|e| format!("watermark decode: {e}"))?;
+            let token = token_out
+                .take()
+                .get::<i32>()
+                .map_err(|e| format!("read generated token: {e}"))?[0]
+                as u32;
+            if stop_tokens.contains(&token) {
+                break;
+            }
+            generated.push(token);
+            previous = token;
+        }
+        pipeline.close();
+    }
+
+    wit_model::decode(&generated)
+}

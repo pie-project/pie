@@ -667,13 +667,16 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
         add_checkpoint_metadata_to_rust_input(input, loader, hf);
     const std::string cache_key = rust_loader_compile_cache_key(input.view());
     (void)snapshot_dir;
-    // Locality switch (weight-loader Variant A): an embedded/in-process driver's
-    // runtime compiles the StorageProgram in-process and hands it off as a file
-    // named in `[model].storage_program_path`; we only deserialize + execute it
-    // here. Remote/out-of-process (and standalone) drivers leave the path empty
-    // and keep the C++ FFI compile below. Either way the source index, quant
-    // attachments, coverage counts, and cache key are computed identically from
-    // the checkpoint metadata + HF config.
+    // Locality switch (weight-loader Variant A): both branches execute the same
+    // Rust-compiled StorageProgram; only the path to it differs. An
+    // embedded/in-process driver's runtime compiles the StorageProgram
+    // in-process and hands it off as a file named in
+    // `[model].storage_program_path`; we only deserialize + execute it here.
+    // Remote/out-of-process (and standalone) drivers leave the path empty, so we
+    // compile the StorageProgram via the Rust FFI in-process below and then
+    // execute it. Either way the source index, quant attachments, coverage
+    // counts, and cache key are computed identically from the checkpoint
+    // metadata + HF config.
     RustStorageProgram program =
         !storage_program_path.empty()
             ? read_storage_program_from_file(storage_program_path)

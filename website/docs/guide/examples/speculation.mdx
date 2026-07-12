@@ -1,12 +1,12 @@
 ---
 title: Speculative decoding
-description: Custom drafters
+description: Prompt-lookup and native MTP speculative decoding
 sidebar_position: 6
 ---
 
 # Speculative decoding
 
-Inferlets that implement custom draft strategies on top of Pie's `Speculator` trait. For the runtime-managed paths — the built-in n-gram drafter and a model's [native MTP head](../forward/speculation#native-mtp-drafters) — see [System speculation](../forward/speculation#system-speculation); the `text-completion-spec` inferlet under [Chat and generation](./chat) shows the n-gram path.
+Inferlets that implement and verify draft tokens before committing them.
 
 :::note[Running on the dummy driver?]
 The dummy driver samples a fresh random token for every slot, so every draft is rejected and these inferlets run in 1-token-per-step fallback — they complete correctly but no speedup is observable.
@@ -14,8 +14,8 @@ The dummy driver samples a fresh random token for every slot, so every draft is 
 
 | Inferlet | What it shows |
 |---|---|
-| [`jacobi-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/jacobi-decoding) | Parallel Jacobi decoding (custom drafter). |
-| [`cacheback-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/cacheback-decoding) | Cache-based drafter via n-gram matching. |
+| [`cacheback-speculative-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/cacheback-speculative-decoding) | Prompt-lookup n-gram drafting with batched target verification. |
+| [`mtp-speculative-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/mtp-speculative-decoding) | Native MTP drafting with explicit accept, correction, and bonus-token handling. |
 
 ## Related guide
 

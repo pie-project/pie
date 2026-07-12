@@ -1,6 +1,6 @@
 ---
 title: Examples
-description: A catalog of every runnable inferlet shipped with Pie
+description: The curated inference-time inferlets shipped with Pie
 sidebar_position: 1
 ---
 
@@ -11,27 +11,24 @@ Every inferlet listed in this section is a complete, runnable project under [`in
 Build and run any of them locally:
 
 ```bash
-bakery build inferlets/text-completion -o text-completion.wasm
-pie run --path ./text-completion.wasm --manifest inferlets/text-completion/Pie.toml -- --prompt "Write one sentence about Pie."
+bakery build inferlets/chat-completion -o chat-completion.wasm
+pie run --path ./chat-completion.wasm --manifest inferlets/chat-completion/Pie.toml -- --prompt "Write one sentence about Pie."
 ```
 
-For a published version: `pie run text-completion -- --prompt "Write one sentence about Pie."`.
+For a published version: `pie run chat-completion -- --prompt "Write one sentence about Pie."`.
 
 ## Categories
 
-- [Chat and generation](./chat). Minimal text generation in Rust, Python, and JavaScript.
-- [Samplers and probes](./samplers). Sampler outputs, scoring, watermarking.
-- [Structured output](./structured). Grammar, JSON Schema, and template-driven generation.
-- [Context and KV cache](./kv-cache). Forking, prefix sharing, sliding windows.
-- [Speculative decoding](./speculation). Custom drafters.
-- [Reasoning patterns](./reasoning). Tree, graph, and recursion of thought.
-- [Agents](./agents). ReAct, CodeACT, multi-agent swarms.
-- [I/O and integration](./integration). HTTP, MCP, OpenAI Responses, concurrency tests.
+- [Chat and generation](./chat). Minimal text generation.
+- [Sampling and search](./samplers). Logit primitives, ranking, adaptive sampling, watermarking, beam search, and contrastive decoding.
+- [Structured output](./structured). JSON Schema constrained decoding.
+- [Context and KV cache](./kv-cache). Prefix sharing and bounded attention.
+- [Speculative decoding](./speculation). Prompt lookup and native MTP drafting.
 
 Each sub-page is a small table of inferlets plus a pointer to the Guide section that teaches the underlying primitive.
 
 ## What you'll see
 
-- **Length.** Most inferlets are 50–300 lines. Read end-to-end in a few minutes.
-- **Languages.** Rust is the canonical SDK. Python and JavaScript variants exist where the surface differs (constrained decoding, MCP, basic chat).
-- **Status.** Some inferlets are demos, some are microbenchmarks. Each entry's "What it shows" makes the role clear.
+- **Scope.** Every example focuses on an inference-time algorithm rather than an application workflow.
+- **Language.** The curated collection is Rust-only.
+- **Status.** Each inferlet is a runnable reference implementation.

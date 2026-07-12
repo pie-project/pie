@@ -1,4 +1,4 @@
-// PTIR tier-2 graph-key extension test (charlie, thrust-3 P6.1). Pure-host unit
+// PTIR tier-2 graph-key extension test. Pure-host unit
 // test for the program-set hash (contract C3) added to ForwardGraphKey: proves
 // (a) the non-PTIR path is unchanged (default 0), (b) different program sets key
 // to different graphs, (c) the fold is order-independent + duplicate-insensitive
@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "executor/forward_graph.hpp"
+#include "batch/forward_graph.hpp"
 
 using namespace pie_cuda_driver;
 

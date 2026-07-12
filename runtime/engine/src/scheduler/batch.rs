@@ -103,13 +103,14 @@ pub(crate) fn build_batch_request(
     stats: &SchedulerStats,
 ) -> LaunchSubmission {
     if requests.len() == 1 && requests[0].prebuilt {
-        // Nothing reads a prebuilt plan after submission, so move it into the
-        // launch instead of cloning its geometry vectors. Its single program
-        // owns every wire request row it carries (possibly zero for a
-        // device-geometry fire, possibly several lanes for a wire beam).
+        // Keep the logical-fire payload intact across attempts. RETRY builds a
+        // fresh native launch from this same immutable request.
         let req = &mut requests[0];
-        let mut plan = std::mem::take(&mut req.request);
+        let mut plan = req.request.clone();
         let kv_translation = std::mem::take(&mut plan.kv_translation);
+        let channel_expected_head = plan.channel_expected_head.clone();
+        let channel_expected_tail = plan.channel_expected_tail.clone();
+        let channel_ticket_len = channel_expected_head.len() as u32;
         let rows = plan.qo_indptr.len().saturating_sub(1) as u32;
         return LaunchSubmission {
             kv_translation_indptr: vec![0, kv_translation.len() as u32],
@@ -118,6 +119,11 @@ pub(crate) fn build_batch_request(
             plan,
             instance_ids: vec![req.instance_id],
             terminal_cells: vec![req.completion.terminal_cell_ptr()],
+            logical_fire_ids: vec![req.logical_fire_id],
+            retry_eligible: vec![u8::from(req.retry_eligible)],
+            channel_expected_head,
+            channel_expected_tail,
+            channel_ticket_indptr: vec![0, channel_ticket_len],
         };
     }
     let elide_decode_masks = requests.iter().all(|req| {
@@ -132,12 +138,20 @@ pub(crate) fn build_batch_request(
         let mut kv_translation = Vec::new();
         let mut kv_translation_indptr = Vec::with_capacity(requests.len() + 1);
         kv_translation_indptr.push(0);
+        let mut logical_fire_ids = Vec::with_capacity(requests.len());
+        let mut retry_eligible = Vec::with_capacity(requests.len());
+        let mut channel_expected_head = Vec::new();
+        let mut channel_expected_tail = Vec::new();
+        let mut channel_ticket_indptr = Vec::with_capacity(requests.len() + 1);
+        channel_ticket_indptr.push(0);
         // Batched fires contribute exactly one wire request row each (a
         // device-geometry fire's row is an empty placeholder).
         let program_row_indptr: Vec<u32> = (0..=requests.len() as u32).collect();
         for req in requests {
             instance_ids.push(req.instance_id);
             terminal_cells.push(req.completion.terminal_cell_ptr());
+            logical_fire_ids.push(req.logical_fire_id);
+            retry_eligible.push(u8::from(req.retry_eligible));
             wire::append_request_with_options(
                 &mut batch_req,
                 &req.request,
@@ -148,6 +162,9 @@ pub(crate) fn build_batch_request(
             );
             kv_translation.extend(req.request.kv_translation.iter().copied());
             kv_translation_indptr.push(kv_translation.len() as u32);
+            channel_expected_head.extend(req.request.channel_expected_head.iter().copied());
+            channel_expected_tail.extend(req.request.channel_expected_tail.iter().copied());
+            channel_ticket_indptr.push(channel_expected_head.len() as u32);
         }
         LaunchSubmission {
             plan: batch_req,
@@ -156,6 +173,11 @@ pub(crate) fn build_batch_request(
             kv_translation,
             kv_translation_indptr,
             program_row_indptr,
+            logical_fire_ids,
+            retry_eligible,
+            channel_expected_head,
+            channel_expected_tail,
+            channel_ticket_indptr,
         }
     })
 }
@@ -163,17 +185,23 @@ pub(crate) fn build_batch_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{InstanceCompletion, LaunchPlan};
+    use crate::driver::{LaunchPlan, WorkItemCompletion};
 
     fn pending(request: LaunchPlan, instance_id: u64, prebuilt: bool) -> PendingRequest {
         PendingRequest {
+            logical_fire_id: 1,
             physical_page_ids: request.kv_page_indices.clone(),
             last_page_len: 1,
             request,
             instance_id,
-            completion: InstanceCompletion::new(instance_id, 0),
+            completion: WorkItemCompletion::new(instance_id, 0),
             pipeline_id: None,
             prebuilt,
+            retry_count: 0,
+            retry_eligible: true,
+            prelaunch_copy: None,
+            preparation: None,
+            preparation_retries: 0,
         }
     }
 

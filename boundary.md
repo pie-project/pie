@@ -300,27 +300,33 @@ pub struct LaunchBatch {
 }
 
 // B1/B2/B4/B14 — conceptual typed direct-ABI surface.
-pub trait LocalDriver {
-    fn register_program(&mut self, trace: &[u8]) -> Result<ProgramId>;
-    fn register_channel(
+pub enum DriverBackend {
+    Dummy(DummyDriver),
+    Cuda(CudaDriver),
+    Metal(MetalDriver),
+}
+
+impl DriverBackend {
+    pub fn register_program(&mut self, trace: &[u8]) -> Result<ProgramId>;
+    pub fn register_channel(
         &mut self,
         desc: &ChannelEndpointDesc,
     ) -> Result<ChannelEndpointBinding>;
-    fn bind_instance(&mut self, desc: &InstanceDesc) -> Result<InstanceBinding>;
-    fn launch(&mut self, batch: &LaunchBatch) -> Result<()>;
-    fn copy_kv(&mut self, desc: &KvCopyDesc, completion: PieCompletion) -> Result<()>;
-    fn copy_state(
+    pub fn bind_instance(&mut self, desc: &InstanceDesc) -> Result<InstanceBinding>;
+    pub fn launch(&mut self, batch: &LaunchBatch) -> Result<()>;
+    pub fn copy_kv(&mut self, desc: &KvCopyDesc, completion: PieCompletion) -> Result<()>;
+    pub fn copy_state(
         &mut self,
         desc: &StateCopyDesc,
         completion: PieCompletion,
     ) -> Result<()>;
-    fn resize_pool(
+    pub fn resize_pool(
         &mut self,
         desc: &PoolResizeDesc,
         completion: PieCompletion,
     ) -> Result<()>;
-    fn close_instance(&mut self, id: InstanceId) -> Result<()>;
-    fn close_channel(&mut self, id: ChannelId) -> Result<()>;
+    pub fn close_instance(&mut self, id: InstanceId) -> Result<()>;
+    pub fn close_channel(&mut self, id: ChannelId) -> Result<()>;
 }
 ```
 

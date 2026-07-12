@@ -303,6 +303,14 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     PIE_VALIDATE_SLICE(audio_indptr);
     PIE_VALIDATE_SLICE(kv_len);
     PIE_VALIDATE_SLICE(kv_len_device);
+    PIE_VALIDATE_SLICE(kv_translation);
+    PIE_VALIDATE_SLICE(kv_translation_indptr);
+    PIE_VALIDATE_SLICE(ptir_program_row_indptr);
+    PIE_VALIDATE_SLICE(logical_fire_ids);
+    PIE_VALIDATE_SLICE(retry_eligible);
+    PIE_VALIDATE_SLICE(channel_expected_head);
+    PIE_VALIDATE_SLICE(channel_expected_tail);
+    PIE_VALIDATE_SLICE(channel_ticket_indptr);
 #undef PIE_VALIDATE_SLICE
 
     status = validate_bytes(desc->image_pixels);
@@ -349,6 +357,14 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
              desc->audio_indptr.len,
              desc->kv_len.len,
              desc->kv_len_device.len,
+            desc->kv_translation.len,
+            desc->kv_translation_indptr.len,
+            desc->ptir_program_row_indptr.len,
+            desc->logical_fire_ids.len,
+            desc->retry_eligible.len,
+            desc->channel_expected_head.len,
+            desc->channel_expected_tail.len,
+            desc->channel_ticket_indptr.len,
          }) {
         if (len > max_int) return PIE_STATUS_INVALID_ARGUMENT;
     }
@@ -356,6 +372,37 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
         desc->terminal_cells.len != request_count ||
         desc->position_ids.len != desc->token_ids.len) {
         return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if ((desc->logical_fire_ids.len != 0 &&
+         desc->logical_fire_ids.len != request_count) ||
+        (desc->retry_eligible.len != 0 &&
+         desc->retry_eligible.len != request_count) ||
+        desc->channel_expected_head.len != desc->channel_expected_tail.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t i = 0; i < desc->retry_eligible.len; ++i) {
+        if (desc->retry_eligible.ptr[i] > 1) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    status = validate_csr(
+        desc->kv_translation_indptr,
+        desc->kv_translation.len,
+        request_count);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_csr(
+        desc->channel_ticket_indptr,
+        desc->channel_expected_head.len,
+        request_count);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->ptir_program_row_indptr.len != 0) {
+        const std::size_t wire_rows =
+            desc->qo_indptr.len == 0 ? 0 : desc->qo_indptr.len - 1;
+        status = validate_csr(
+            desc->ptir_program_row_indptr,
+            wire_rows,
+            request_count);
+        if (status != PIE_STATUS_OK) return status;
     }
     for (std::size_t i = 0; i < request_count; ++i) {
         for (std::size_t j = 0; j < i; ++j) {

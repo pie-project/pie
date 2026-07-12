@@ -1,0 +1,13 @@
+[package]
+name = "consensus-decoding"
+version = "0.1.0"
+description = "Parallel candidate generation with string-similarity consensus ranking"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+question = {type = "string", optional = true, description = "Question to answer"}
+num_candidates = {type = "int", optional = true, description = "Number of parallel candidates (default: 5)"}
+max_tokens = {type = "int", optional = true, description = "Maximum tokens per candidate (default: 1024)"}

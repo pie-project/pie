@@ -20,8 +20,8 @@
 //! glue is bypassed entirely, the table's clone is the only reference left
 //! and ITS `Drop` performs the release — the process-teardown fallback.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::page_table::WorkingSetId;
 use crate::driver::DriverId;
@@ -52,15 +52,26 @@ pub fn cache_roots_max() -> usize {
 #[derive(Debug)]
 struct KvLifecycle {
     released: AtomicBool,
+    release_requested: AtomicBool,
+    active_fire_leases: AtomicUsize,
     model: usize,
     driver: DriverId,
     id: WorkingSetId,
     cache_roots_max: usize,
+    pipeline_scope: Mutex<Option<u128>>,
 }
 
 impl KvLifecycle {
     fn release(&self) {
-        if self.released.swap(true, Ordering::AcqRel) {
+        self.release_requested.store(true, Ordering::Release);
+        self.maybe_release();
+    }
+
+    fn maybe_release(&self) {
+        if !self.release_requested.load(Ordering::Acquire)
+            || self.active_fire_leases.load(Ordering::Acquire) != 0
+            || self.released.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let stores = crate::store::registry::get(self.model, self.driver as usize);
@@ -75,6 +86,39 @@ impl KvLifecycle {
         // Freed pool space may unblock a preempted inferlet.
         if let Some(orchestrator) = crate::store::reclaim::contention() {
             orchestrator.on_blocks_freed();
+        }
+    }
+
+    fn acquire_fire_lease(this: &Arc<Self>) -> Result<KvFireLease, &'static str> {
+        if this.release_requested.load(Ordering::Acquire) {
+            return Err("working set release already requested");
+        }
+        this.active_fire_leases.fetch_add(1, Ordering::AcqRel);
+        if this.release_requested.load(Ordering::Acquire) {
+            let previous = this.active_fire_leases.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0);
+            this.maybe_release();
+            return Err("working set release raced fire preparation");
+        }
+        Ok(KvFireLease {
+            lifecycle: Arc::clone(this),
+        })
+    }
+}
+
+pub struct KvFireLease {
+    lifecycle: Arc<KvLifecycle>,
+}
+
+impl Drop for KvFireLease {
+    fn drop(&mut self) {
+        let previous = self
+            .lifecycle
+            .active_fire_leases
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        if previous == 1 {
+            self.lifecycle.maybe_release();
         }
     }
 }
@@ -118,12 +162,31 @@ impl KvWorkingSet {
             page_size,
             lifecycle: Arc::new(KvLifecycle {
                 released: AtomicBool::new(false),
+                release_requested: AtomicBool::new(false),
+                active_fire_leases: AtomicUsize::new(0),
                 model,
                 driver,
                 id,
                 cache_roots_max,
+                pipeline_scope: Mutex::new(None),
             }),
         }
+    }
+
+    pub fn claim_pipeline_scope(&self, scope: u128) -> Result<(), u128> {
+        let mut owner = self.lifecycle.pipeline_scope.lock().unwrap();
+        match *owner {
+            Some(existing) if existing != scope => Err(existing),
+            Some(_) => Ok(()),
+            None => {
+                *owner = Some(scope);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn fire_lease(&self) -> Result<KvFireLease, &'static str> {
+        KvLifecycle::acquire_fire_lease(&self.lifecycle)
     }
 
     /// Explicit release (the WIT `drop` path): runs

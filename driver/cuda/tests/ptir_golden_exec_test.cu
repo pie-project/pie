@@ -1,10 +1,10 @@
-// PTIR cross-backend golden step-exec gate (charlie, thrust-3 P4). The headline
-// conformance test: decode echo's ACTUAL golden container bytes + PTIB typed
+// PTIR cross-backend golden step-exec gate. The headline
+// conformance test: decode the ACTUAL golden container bytes + PTIB typed
 // sidecar (bound.hpp), translate to an executable Trace, run it through the
-// tier-0 stage-runner with echo's canonical inputs/seeds, and match echo's
+// tier-0 stage-runner with canonical inputs/seeds, and match the expected
 // step/take results (committed flags + taken token values) byte-for-byte.
 //
-// Inputs + seeds are transcribed from echo's generator (interface/sampling-ir/
+// Inputs + seeds are transcribed from the generator (interface/sampling-ir/
 // tests/ptir_golden.rs); the container/sidecar hex + expected hash come straight
 // from the vendored golden files, so this pins the same cross-language vectors.
 //
@@ -23,10 +23,10 @@
 #include <cuda_runtime.h>
 
 #include "pie_native/ptir/bound.hpp"
-#include "ptir/program_runtime.hpp"
-#include "ptir/tier0_runner.hpp"
+#include "pipeline/program_runtime.hpp"
+#include "pipeline/tier0/tier0_runner.hpp"
 
-using namespace pie_cuda_driver::ptir;
+using namespace pie_cuda_driver::pipeline;
 
 namespace {
 int g_pass = 0, g_fail = 0;
@@ -116,19 +116,19 @@ void run_greedy(const std::string& dir) {
         expect(r.ok && r.committed && v == want,
                "token == " + std::to_string(want) + " (got " + std::to_string(v) + ", committed=" + (r.committed?"T":"F") + ")");
     };
-    step({0, 1, 9, 2, 0, 0, 0, 3}, 2);   // echo step 0
-    step({7, 1, 0, 2, 0, 0, 0, 3}, 0);   // echo step 1
+    step({0, 1, 9, 2, 0, 0, 0, 3}, 2);   // golden step 0
+    step({7, 1, 0, 2, 0, 0, 0, 3}, 0);   // golden step 1
     cudaFree(d_logits);
 }
 
 // ── section3_masked_gumbel: overview §3 — greedy + grammar mask + gumbel, with
-//    the late-mask dummy-run + recover (P4 exit criterion). VOCAB=32. ──
+//    the late-mask dummy-run + recover. VOCAB=32. ──
 void run_section3(const std::string& dir) {
     std::printf("[section3_masked_gumbel]\n");
     Trace t; if (!build_trace(dir, "section3_masked_gumbel", t)) return;
     const std::uint32_t V = 32;
     Tier0Runner runner(t);
-    // seeds (echo ptir_golden.rs): chan0 tok=[1] i32, chan3 len=[1] u32, chan4 rng=[1234,0] u32
+    // seeds (ptir_golden.rs): chan0 tok=[1] i32, chan3 len=[1] u32, chan4 rng=[1234,0] u32
     std::int32_t s0 = 1;  runner.arena().seed_cell(0, &s0, sizeof(s0));
     std::uint32_t s3 = 1; runner.arena().seed_cell(3, &s3, sizeof(s3));
     std::uint32_t s4[2] = {1234, 0}; runner.arena().seed_cell(4, s4, sizeof(s4));
@@ -226,11 +226,11 @@ void run_beam(const std::string& dir) {
 
 }  // namespace
 
-// ── program_runtime: drive greedy_argmax through the P2c DRIVER-SIDE runtime
+// ── program_runtime: drive greedy_argmax through the driver-side runtime
 //    (PtirProgramCache hash-decode + PtirInstance seed/fire) — the entry point
-//    delta's ~10-line submit-fire calls. Proves: first-fire container+sidecar
+//    the runtime submit-fire path. Proves: first-fire container+sidecar
 //    decode + cache-by-hash, steady-state cache hit on empty bytes, a loud miss
-//    on an uncached hash, and a seeded per-instance fire reproducing echo's
+//    on an uncached hash, and a seeded per-instance fire reproducing the golden
 //    argmax vectors through the wrapper (not the raw runner). ──
 
 // Register one endpoint per trace channel (1-based global ids — 0 is the null
@@ -283,7 +283,7 @@ void run_via_runtime(const std::string& dir) {
     const Trace* miss = cache.get_or_decode(fhash ^ 0x1ull, nullptr, 0, nullptr, 0, &err);
     expect(miss == nullptr, "runtime: uncached hash + empty bytes → loud miss");
 
-    // Instantiate with the D2 seed (chan0 token=[1], i32 LE) + fire echo's steps.
+    // Instantiate with the D2 seed (chan0 token=[1], i32 LE) + fire the golden steps.
     // Seeds are keyed by GLOBAL channel id (dense 0 -> global 1).
     std::vector<ChannelValue> seeds = {{1, {1, 0, 0, 0}}};
     DeviceChannelRegistry reg;
@@ -295,7 +295,7 @@ void run_via_runtime(const std::string& dir) {
         cudaMemcpy(d_logits, logits.data(), 8 * sizeof(float), cudaMemcpyHostToDevice);
         FireInputs in; in.logits = d_logits; in.vocab = 8;
         PassResult r = inst.fire(in);   // greedy: seed + logits only, no host_puts
-        auto outs = inst.harvest_outputs(); // the (channel, wire_bytes) table for delta's response SoA
+        auto outs = inst.harvest_outputs(); // the (channel, wire_bytes) table for the response SoA
         // Keyed by GLOBAL id: dense output channel 1 registered as global 2.
         bool shape = (outs.size() == 1 && outs[0].first == 2 && outs[0].second.size() == 4);
         std::int32_t v = shape ? *reinterpret_cast<const std::int32_t*>(outs[0].second.data()) : -1;
@@ -303,8 +303,8 @@ void run_via_runtime(const std::string& dir) {
                "runtime: harvest_outputs [(1," + std::to_string(want) + ")] (chans=" +
                std::to_string(outs.size()) + " v=" + std::to_string(v) + ")");
     };
-    step({0, 1, 9, 2, 0, 0, 0, 3}, 2);   // echo step 0
-    step({7, 1, 0, 2, 0, 0, 0, 3}, 0);   // echo step 1
+    step({0, 1, 9, 2, 0, 0, 0, 3}, 2);   // golden step 0
+    step({7, 1, 0, 2, 0, 0, 0, 3}, 0);   // golden step 1
     cudaFree(d_logits);
 }
 
@@ -344,7 +344,7 @@ void run_via_runtime_stateful(const std::string& dir) {
     expect(v == 12, "runtime-sf: take chan1 == 12 (persisted +2; got " + std::to_string(v) + ")");
 }
 
-// ── mtp_verify_tail: echo's §6.1 match-verify K=3 cross-backend anchor. Exercises
+// ── mtp_verify_tail: §6.1 match-verify K=3 cross-backend anchor. Exercises
 //    the Stage-2 [K,vocab] MtpLogits MATRIX read — the K draft rows live in
 //    ws.logits AFTER the sample rows (mtp_draft_row = 4), read as a [3,8] matrix.
 //    logits [4,8] are the verify positions (K+1); a Bool[4,8] mask forces a
@@ -403,14 +403,14 @@ void run_mtp_verify_tail(const std::string& dir) {
 //    seeded once and READ every step (not consumed). Each step: gather the current
 //    state's allow row → mask logits → argmax = the constrained token → gather the
 //    next state from the transition table → update chan2 in place. VOCAB=8, a
-//    3-state DFA. This is the CUDA tier-0 analog of echo's cross-backend golden and
+//    3-state DFA. This is the CUDA tier-0 analog of the cross-backend golden and
 //    validates the InPlace channel class + loop-carried grammar state. ──
 void run_dfa_ingraph(const std::string& dir) {
     std::printf("[dfa_ingraph]\n");
     Trace t; if (!build_trace(dir, "dfa_ingraph", t)) return;
     const std::uint32_t V = 8;
     Tier0Runner runner(t);
-    // seeds (echo ptir_golden.rs): chan0 = allow-mask table Bool[3*8] (state-major),
+    // seeds (ptir_golden.rs): chan0 = allow-mask table Bool[3*8] (state-major),
     // chan1 = next-state table U32[3*8], chan2 = current DFA state U32([0]) (InPlace).
     std::uint8_t allow[24] = {
         0,1,1,0,0,0,0,0,   // state 0: tokens {1,2}
@@ -463,7 +463,7 @@ void run_pivot_predicates(const std::string& dir) {
     cudaMemcpy(d_logits, logits.data(), V * sizeof(float), cudaMemcpyHostToDevice);
     FireInputs in; in.logits = d_logits; in.vocab = V;
 
-    // echo ptir_golden.rs: chan0 = p (top-p threshold), chan1 = thr (prob-ge
+    // ptir_golden.rs: chan0 = p (top-p threshold), chan1 = thr (prob-ge
     // threshold), both host-fed per pass — dynamic, never const-folded.
     float p = 0.999f, thr = 0.0003f;
     runner.arena().host_feed(0, &p, sizeof(p));
@@ -474,14 +474,14 @@ void run_pivot_predicates(const std::string& dir) {
     runner.arena().host_take(2, mask_p, sizeof(mask_p));
     runner.arena().host_take(3, mask_t, sizeof(mask_t));
 
-    // echo golden (interface/ptir/tests/golden-ptir/pivot_predicates_multistage.txt):
+    // golden (interface/ptir/tests/golden-ptir/pivot_predicates_multistage.txt):
     //   take chan=2 = Bool([false,false,true,true,false,false,false,true])   (CummassLe 0.999)
     //   take chan=3 = Bool([false,true,true,true,false,false,false,true])    (ProbGe 0.0003)
     const std::uint8_t want_p[8] = {0, 0, 1, 1, 0, 0, 0, 1};
     const std::uint8_t want_t[8] = {0, 1, 1, 1, 0, 0, 0, 1};
     bool ok = r.ok && r.committed;
     for (std::uint32_t i = 0; i < V && ok; ++i) ok = (mask_p[i] == want_p[i]) && (mask_t[i] == want_t[i]);
-    expect(ok, "cummass_le(0.999)/prob_ge(0.0003) masks match echo's golden (committed=" +
+    expect(ok, "cummass_le(0.999)/prob_ge(0.0003) masks match the golden (committed=" +
                std::string(r.committed ? "T" : "F") + (r.ok ? "" : (", err=" + r.error)) + ")");
     cudaFree(d_logits);
 }

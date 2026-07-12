@@ -54,17 +54,23 @@ fn harness() -> &'static Harness {
 
 /// Build a production inferlet (`../inferlets/<name>`) → wasm + manifest + id.
 fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../inferlets")
-        .join(name);
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../inferlets");
+    let dir = workspace.join(name);
     let status = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2", "--release"])
-        .current_dir(&dir)
+        .args([
+            "build",
+            "--target",
+            "wasm32-wasip2",
+            "--release",
+            "-p",
+            name,
+        ])
+        .current_dir(&workspace)
         .status()
         .unwrap_or_else(|e| panic!("spawn cargo build for {name}: {e}"));
     assert!(status.success(), "build {name} failed");
 
-    let wasm_path = dir
+    let wasm_path = workspace
         .join("target/wasm32-wasip2/release")
         .join(format!("{}.wasm", name.replace('-', "_")));
     let wasm =
@@ -112,55 +118,6 @@ fn assert_ok(name: &str, result: Result<String, String>) {
     }
 }
 
-/// Fork-heavy KV canary: best-of-n forks the base context per candidate
-/// (`Context::fork()` → `kv-working-set.fork`), generates each, ranks.
-#[test]
-fn best_of_n_fork_heavy_runs() {
-    assert_ok(
-        "best-of-n",
-        run_prod_inferlet(
-            "best-of-n",
-            r#"{"question":"hi","num_candidates":3,"max_tokens":4}"#,
-            Duration::from_secs(60),
-        ),
-    );
-}
-
-/// Speculative-decoding canary: text-completion-spec sets `Speculation::Default`
-/// (every forward requests `output_speculative_tokens(true)`). Exercises the
-/// prefill path: the forward resolves only the `valid_tokens` prefix of the
-/// kv-context (trailing reserved slots are written this pass as kv-output, never
-/// read), so the turn-1 prefill no longer errors on a reserved slot.
-#[test]
-fn text_completion_spec_runs() {
-    assert_ok(
-        "text-completion-spec",
-        run_prod_inferlet(
-            "text-completion-spec",
-            r#"{"prompt":"hi","max_tokens":4}"#,
-            Duration::from_secs(60),
-        ),
-    );
-}
-
-/// Snapshot canary: demo-persistent-kv `smart` mode saves the turn-1 context to a
-/// `/scratch` blob (`snapshot::save`) then reopens it (`snapshot::open`) and
-/// REPLAYS the token log via a keep-core carrier prefill, then continues — the
-/// raw-WIT / keep-core rewrite (no `Context` facade; the thin `snapshot::` data +
-/// wasi:filesystem I/O primitive, `ptir-snapshot-keepcore-spec`). Exercises the
-/// prefill + snapshot replay round-trip end-to-end on the mock driver.
-#[test]
-fn snapshot_save_open_runs() {
-    assert_ok(
-        "demo-persistent-kv",
-        run_prod_inferlet(
-            "demo-persistent-kv",
-            r#"{"mode":"smart","turn1":"hi","turn2":"yo","max_tokens":3,"snapshot":"canary_snap"}"#,
-            Duration::from_secs(60),
-        ),
-    );
-}
-
 /// Masked-decode canary — attention-sink (echo, SDK-minimization ①): the
 /// raw-WIT / keep-core rewrite (no `Context`/`Sampler` facade) drives a decode
 /// loop that attaches a position-deterministic sink+window `attention_mask` in
@@ -179,36 +136,29 @@ fn attention_sink_masked_decode_runs() {
     );
 }
 
-/// Masked-decode canary — windowed-attention (echo, SDK-minimization ①): same
+/// Masked-decode canary — sliding-window-attention: same
 /// keep-core rewrite, sliding-window mask via the `submit_pass_with` bind seam.
 /// A small `window_size` fires the mask path within a few steps.
 #[test]
-fn windowed_attention_masked_decode_runs() {
+fn sliding_window_attention_masked_decode_runs() {
     assert_ok(
-        "windowed-attention",
+        "sliding-window-attention",
         run_prod_inferlet(
-            "windowed-attention",
+            "sliding-window-attention",
             r#"{"prompt":"hi","max_tokens":6,"window_size":2}"#,
             Duration::from_secs(60),
         ),
     );
 }
 
-/// Chat-EOS pipelined canary — text-completion (echo, SDK-minimization ①): the
-/// raw-WIT / keep-core rewrite (no `Context`/`Generator`/`Sampler` facade) drives
-/// the depth-1 EOS-rollback pipeline — each step speculates the next forward via
-/// `carrier::submit_pass` and rolls an over-shot pass back with
-/// `carrier::discard_pass` on a stop — with a parametric top-p `sampler_program`
-/// and kept `chat` templating + streaming `chat::Decoder` detok. This exercises
-/// the full lowering + pipelined-carrier + stop/decoder path on the mock end to
-/// end (rollback token-identity vs the sequential stream is a GPU MATCH gate, per
-/// `ptir-pipelined-eos-rollback-spec §7`).
+/// Chat completion canary: runs prompt prefill, top-p sampling, and decode on
+/// the mock driver.
 #[test]
-fn text_completion_pipelined_eos_runs() {
+fn chat_completion_runs() {
     assert_ok(
-        "text-completion",
+        "chat-completion",
         run_prod_inferlet(
-            "text-completion",
+            "chat-completion",
             r#"{"prompt":"hi","max_tokens":4}"#,
             Duration::from_secs(60),
         ),

@@ -20,7 +20,7 @@ The build chain depends on the language. All three end at a `.wasm` component yo
 
 Rust is the canonical SDK. A few advanced primitives (custom speculators, the `Constrain` trait, the raw `ctx.inner()` page operations) are Rust-only today.
 
-`bakery create` ships scaffolds for Rust (default) and TypeScript (`--ts`). For Python inferlets, copy the [`python-example`](https://github.com/pie-project/pie/tree/main/inferlets/python-example) tree as a starting point — its `Pie.toml` and `pyproject.toml` show what an inferlet needs.
+`bakery create` ships scaffolds for Rust (default) and TypeScript (`--ts`). Python projects currently require hand-authored `Pie.toml` and `pyproject.toml` files.
 
 ## bakery
 

@@ -132,7 +132,7 @@ batch terminal cells ──► notify(batch wait_id) ──► scheduler nudge �
 
 ## 2. What Stays
 
-- One queue: the scheduler thread exclusively owns the `NativeDriver` and is
+- One queue: the scheduler thread exclusively owns the `DriverBackend` and is
   the ordering point for launches and typed control operations
   (direct_ffi.md §4.1).
 - Typed operations, terminal cells, atomic batch acceptance, the epoch

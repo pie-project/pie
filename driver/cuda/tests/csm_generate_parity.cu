@@ -8,8 +8,8 @@
 //
 //   nvcc -O2 -arch=sm_89 -std=c++17 -diag-suppress 550 -I driver/cuda/src \
 //        driver/cuda/tests/csm_generate_parity.cu \
-//        driver/cuda/src/model/csm_depth_decoder_forward.cu \
-//        driver/cuda/src/model/mimi_decoder_forward.cu -o /tmp/cgp
+//        driver/cuda/src/model/csm/csm_depth_decoder_forward.cu \
+//        driver/cuda/src/model/csm/mimi_decoder_forward.cu -o /tmp/cgp
 //   /tmp/cgp
 #include <cstdint>
 #include <cstdio>
@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-#include "model/csm_backbone_forward.cu"
+#include "model/csm/csm_backbone_forward.cu"
 
 using namespace pie_cuda_driver::model;
 using BF = __nv_bfloat16;

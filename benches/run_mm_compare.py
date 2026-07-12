@@ -7,6 +7,7 @@ contend for the GPU), then prints a side-by-side table.
 
   python run_mm_compare.py \
       --model Qwen/Qwen3-VL-2B-Instruct --image assets/bench_image.png \
+      --inferlet-dir /path/to/image-qa-bench \
       --max-tokens 128 --latency-requests 16 --tput-requests 128 \
       --concurrency 32 --warmup 4 --out-dir out/mm
 
@@ -85,6 +86,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Pie vs vLLM multimodal head-to-head")
     ap.add_argument("--model", default="Qwen/Qwen3-VL-2B-Instruct")
     ap.add_argument("--image", default="assets/bench_image.png")
+    ap.add_argument("--inferlet-dir", required=True,
+                    help="Path to a built image-qa-bench inferlet project.")
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--latency-requests", type=int, default=16)
     ap.add_argument("--tput-requests", type=int, default=128)
@@ -106,14 +109,26 @@ def main() -> None:
         lat = ["--requests", str(args.latency_requests)]
         # vLLM first (clean GPU), then Pie. Order doesn't matter — sequential.
         v = _run(args.vllm_python, "vllm_mm_bench.py", "latency", out / "vllm_latency.json", common + lat)
-        p = _run(args.pie_python, "pie_mm_bench.py", "latency", out / "pie_latency.json", common + lat)
+        p = _run(
+            args.pie_python,
+            "pie_mm_bench.py",
+            "latency",
+            out / "pie_latency.json",
+            common + lat + ["--inferlet-dir", args.inferlet_dir],
+        )
         print("\n### LATENCY (single-stream, concurrency=1)")
         _table([("vLLM", v), ("Pie", p)])
 
     if "tput" not in args.skip:
         tp = ["--num-requests", str(args.tput_requests), "--concurrency", str(args.concurrency)]
         v = _run(args.vllm_python, "vllm_mm_bench.py", "tput", out / "vllm_tput.json", common + tp)
-        p = _run(args.pie_python, "pie_mm_bench.py", "tput", out / "pie_tput.json", common + tp)
+        p = _run(
+            args.pie_python,
+            "pie_mm_bench.py",
+            "tput",
+            out / "pie_tput.json",
+            common + tp + ["--inferlet-dir", args.inferlet_dir],
+        )
         print(f"\n### THROUGHPUT (concurrency={args.concurrency}, n={args.tput_requests})")
         _table([("vLLM", v), ("Pie", p)])
 

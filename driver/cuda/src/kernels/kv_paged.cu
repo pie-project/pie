@@ -684,9 +684,9 @@ void launch_write_kv_to_pages(
     }
 
     constexpr int BLOCK = 256;
-    switch (layer.format->scheme) {
+    switch (layer.scheme) {
         case KvCacheScheme::Fp8PerTensor: {
-            const auto fp8_kind = layer.format->storage_dtype == DType::FP8_E5M2
+            const auto fp8_kind = layer.storage_dtype == DType::FP8_E5M2
                 ? __NV_E5M2
                 : __NV_E4M3;
             write_kv_fp8_per_tensor_kernel<<<total_tokens, BLOCK, 0, stream>>>(
@@ -725,8 +725,8 @@ void launch_write_kv_to_pages(
             break;
         }
         case KvCacheScheme::Fp4Block: {
-            const int block_size = layer.format->block_size > 0
-                ? layer.format->block_size
+            const int block_size = layer.block_size > 0
+                ? layer.block_size
                 : 16;
             const int blocks = (head_dim + block_size - 1) / block_size;
             const dim3 grid(total_tokens, num_kv_heads, blocks);
@@ -866,9 +866,9 @@ void launch_dequant_kv_cache_layer_to_bf16_active(
         static_cast<long long>(num_pages_in_batch) * page_elems;
     const auto blocks = static_cast<unsigned>((logical_n + BLOCK - 1) / BLOCK);
 
-    switch (layer.format->scheme) {
+    switch (layer.scheme) {
         case KvCacheScheme::Fp8PerTensor: {
-            const auto fp8_kind = layer.format->storage_dtype == DType::FP8_E5M2
+            const auto fp8_kind = layer.storage_dtype == DType::FP8_E5M2
                 ? __NV_E5M2
                 : __NV_E4M3;
             dequant_fp8_pages_active_kernel<<<blocks, BLOCK, 0, stream>>>(
@@ -902,8 +902,8 @@ void launch_dequant_kv_cache_layer_to_bf16_active(
                 layer.head_dim);
             break;
         case KvCacheScheme::Fp4Block: {
-            const int block_size = layer.format->block_size > 0
-                ? layer.format->block_size
+            const int block_size = layer.block_size > 0
+                ? layer.block_size
                 : 16;
             dequant_fp4_pages_active_kernel<<<blocks, BLOCK, 0, stream>>>(
                 static_cast<const std::uint8_t*>(layer.k_pages),

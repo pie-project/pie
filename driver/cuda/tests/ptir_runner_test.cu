@@ -1,4 +1,4 @@
-// PTIR tier-0 stage-runner test (charlie, thrust-3 P4.2 milestone M-C).
+// PTIR tier-0 stage-runner test.
 //
 // Drives Tier0Runner over hand-built traces on the live GPU, verifying the
 // readiness → predicated-commit → epoch-ring-bump machinery (overview §7.1):
@@ -15,16 +15,17 @@
 //        -I../src tests/ptir_runner_test.cu -o ptir_runner_test && ./ptir_runner_test
 
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include <cuda_runtime.h>
 
-#include "ptir/host_eval.hpp"
-#include "ptir/tier0_runner.hpp"
+#include "support/host_eval.hpp"
+#include "pipeline/tier0/tier0_runner.hpp"
 
-using namespace pie_cuda_driver::ptir;
+using namespace pie_cuda_driver::pipeline;
 
 namespace {
 int g_pass = 0, g_fail = 0;
@@ -249,6 +250,116 @@ void test_log_softmax_expansion() {
     cudaFree(d_logits);
 }
 
+void test_lazy_packed_bool_pull() {
+    std::printf("[lazy packed-bool host pull]\n");
+    std::uint8_t* mirror = nullptr;
+    std::uint64_t* words = nullptr;
+    cudaHostAlloc(&mirror, 2, cudaHostAllocDefault);
+    cudaHostAlloc(&words, 4 * sizeof(std::uint64_t), cudaHostAllocDefault);
+    std::memset(mirror, 0, 2);
+    std::memset(words, 0, 4 * sizeof(std::uint64_t));
+    mirror[0] = 0b10000101;
+    words[1] = 1;
+
+    std::uint8_t* cells = nullptr;
+    std::uint8_t* full = nullptr;
+    std::uint32_t* commit = nullptr;
+    cudaMalloc(&cells, 16);
+    cudaMalloc(&full, kMaxRing);
+    cudaMalloc(&commit, sizeof(std::uint32_t));
+    cudaMemset(cells, 0, 16);
+    cudaMemset(full, 0, kMaxRing);
+    const std::uint32_t one = 1;
+    cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
+
+    const DeviceHostChannelTicket ticket{
+        .slot = 0,
+        .flags = kTicketConsume | kTicketHostWriter |
+                 kTicketPackedBool | kTicketRequireInput,
+        .expected_head = 0,
+        .expected_tail = kNoChannelTicket,
+        .words = words,
+        .mirror = mirror,
+        .cells = cells,
+        .cap1 = 2,
+        .wire_bytes = 1,
+        .native_bytes = 8,
+    };
+    DeviceHostChannelTicket* uploaded =
+        launch_pull_validate_host_channels({ticket}, full, commit, nullptr);
+    cudaDeviceSynchronize();
+    std::uint8_t native[8]{};
+    std::uint32_t committed = 0;
+    cudaMemcpy(native, cells, sizeof(native), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
+    expect(
+        committed == 1 &&
+            native[0] == 1 && native[1] == 0 && native[2] == 1 &&
+            native[7] == 1,
+        "published packed bool is acquired and unpacked on device");
+    cudaFree(uploaded);
+
+    words[1] = 0;
+    cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
+    uploaded = launch_pull_validate_host_channels(
+        {ticket}, full, commit, nullptr);
+    cudaDeviceSynchronize();
+    cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
+    expect(committed == 0, "withheld writer value clears commit without blocking");
+
+    cudaFree(uploaded);
+    DeviceHostChannelTicket later_ticket = ticket;
+    later_ticket.expected_head = 1;
+    words[0] = 0;
+    words[1] = 2;
+    cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
+    uploaded = launch_pull_validate_host_channels(
+        {later_ticket}, full, commit, nullptr);
+    cudaDeviceSynchronize();
+    cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
+    expect(
+        committed == 0,
+        "later fire ticket cannot steal a retried predecessor's entry");
+    cudaFree(uploaded);
+
+    const DeviceHostChannelTicket publish_ticket{
+        .slot = 0,
+        .flags = kTicketPublish,
+        .expected_head = kNoChannelTicket,
+        .expected_tail = 1,
+        .words = words,
+        .mirror = mirror,
+        .cells = cells,
+        .cap1 = 2,
+        .wire_bytes = 1,
+        .native_bytes = 8,
+    };
+    words[0] = 0;
+    words[1] = 1;
+    cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
+    uploaded = launch_pull_validate_host_channels(
+        {publish_ticket}, full, commit, nullptr);
+    cudaDeviceSynchronize();
+    cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
+    expect(committed == 0, "full host-reader ring retries at device commit");
+    cudaFree(uploaded);
+
+    words[0] = 1;
+    cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
+    uploaded = launch_pull_validate_host_channels(
+        {publish_ticket}, full, commit, nullptr);
+    cudaDeviceSynchronize();
+    cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
+    expect(committed == 1, "reader capacity released before execution commits");
+    cudaFree(uploaded);
+
+    cudaFree(commit);
+    cudaFree(full);
+    cudaFree(cells);
+    cudaFreeHost(words);
+    cudaFreeHost(mirror);
+}
+
 }  // namespace
 
 int main() {
@@ -262,6 +373,7 @@ int main() {
     test_backpressure();
     test_gather_row_routing();
     test_log_softmax_expansion();
+    test_lazy_packed_bool_pull();
 
     std::printf("\n==== runner: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

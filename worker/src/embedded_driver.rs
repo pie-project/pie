@@ -1,10 +1,10 @@
-//! Native-driver bootstrap helpers for pie-worker.
+//! Driver-backend bootstrap helpers for pie-worker.
 //!
 //! This module exposes:
 //!   * [`DriverCapabilities`] — typed driver capability payloads.
 //!   * [`write_cuda_startup_toml`] / [`write_metal_startup_toml`] — emit the
 //!     per-launch TOML each native driver reads at creation.
-//!   * [`create_native_driver`] — build a runtime-owned [`NativeDriver`]
+//!   * [`create_driver_backend`] — build a runtime-owned [`DriverBackend`]
 //!     plus its caps before `pie_engine::bootstrap`.
 
 #[cfg(feature = "driver-cuda")]
@@ -518,6 +518,7 @@ fn dummy_native_options(
         reject_launches: false,
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
+        retry_launches_remaining: 0,
         operation_log: None,
         launch_observer: None,
     })
@@ -535,7 +536,7 @@ fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
 }
 
 #[cfg(feature = "driver-cuda")]
-pub(crate) fn create_native_driver_group(
+pub(crate) fn create_driver_backend_group(
     rank_options: &[DriverOptions],
     snapshot_dir: &Path,
     group_id: usize,
@@ -566,11 +567,11 @@ pub(crate) fn create_native_driver_group(
         config_blobs.push(toml_path.to_string_lossy().into_owned().into_bytes());
     }
 
-    let (native, caps) = pie_engine::driver::NativeDriver::cuda_group_create(config_blobs)?;
-    Ok(crate::translate::GroupDriver { caps, native })
+    let (backend, caps) = pie_engine::driver::DriverBackend::cuda_group_create(config_blobs)?;
+    Ok(crate::translate::GroupDriver { caps, backend })
 }
 
-pub(crate) fn create_native_driver(
+pub(crate) fn create_driver_backend(
     options: &DriverOptions,
     snapshot_dir: &Path,
     group_id: usize,
@@ -579,14 +580,14 @@ pub(crate) fn create_native_driver(
     let _ = (group_id, tp);
     validate_snapshot_dir(snapshot_dir)?;
 
-    let (native, caps) = match options {
+    let (backend, caps) = match options {
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => {
             let state_dir = local_driver_state_dir(group_id, tp)?;
             let toml_path = state_dir.join("driver.toml");
             write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, tp)?;
             let config_path = toml_path.to_string_lossy();
-            pie_engine::driver::NativeDriver::cuda_create(config_path.as_bytes())?
+            pie_engine::driver::DriverBackend::cuda_create(config_path.as_bytes())?
         }
         #[cfg(feature = "driver-metal")]
         DriverOptions::Metal(opts) => {
@@ -594,7 +595,7 @@ pub(crate) fn create_native_driver(
             let toml_path = state_dir.join("driver.toml");
             write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id)?;
             let config_path = toml_path.to_string_lossy();
-            pie_engine::driver::NativeDriver::metal_create(config_path.as_bytes())?
+            pie_engine::driver::DriverBackend::metal_create(config_path.as_bytes())?
         }
         DriverOptions::Dummy {
             opts,
@@ -602,11 +603,11 @@ pub(crate) fn create_native_driver(
             activation_dtype,
         } => {
             let options = dummy_native_options(opts, snapshot_dir, *random_seed, activation_dtype)?;
-            pie_engine::driver::NativeDriver::dummy(options)?
+            pie_engine::driver::DriverBackend::dummy(options)?
         }
     };
 
-    Ok(crate::translate::GroupDriver { caps, native })
+    Ok(crate::translate::GroupDriver { caps, backend })
 }
 
 #[cfg(test)]

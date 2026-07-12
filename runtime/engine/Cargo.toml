@@ -42,6 +42,7 @@ bytes = "1.10.1"
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
 dashmap = "6.1.0"
 boxcar = "0.2.13"
+crossbeam-queue = "0.3"
 thiserror = "2.0.11"
 futures = "0.3.31"
 pie-waker = { path = "../waker" }

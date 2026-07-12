@@ -16,8 +16,8 @@
 #include <nlohmann/json.hpp>
 
 #include "cuda_check.hpp"
-#include <pie_driver_common/safetensors_manifest.hpp>
-#include <pie_driver_common/shard_plan.hpp>
+#include "loader/safetensors_manifest.hpp"
+#include "loader/shard_plan.hpp"
 
 namespace pie_cuda_driver {
 

@@ -22,7 +22,7 @@
 //
 // Pure host C++: links `brle.cpp` (no CUDA) + the reference oracle header.
 
-#include "brle.hpp"
+#include "batch/brle.hpp"
 #include "masked_attention_reference.hpp"
 
 #include <cmath>

@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::driver::{
-    BoundInstance, ChannelRegistrationPlan, Completion, DriverId, InstanceBindingPlan,
-    InstanceCompletion, LocalDriver, NativeDriver, PoolResizePlan, ProgramRegistration,
-    RegisteredChannel, SchedulerLimits, StateCopyPlan,
+    BoundInstance, ChannelRegistrationPlan, DriverBackend, DriverId, InstanceBindingPlan,
+    PoolResizePlan, ProgramRegistration, RegisteredChannel, SchedulerLimits, StateCopyPlan,
+    SubmissionCompletion, WorkItemAttemptOutcome, WorkItemCompletion,
 };
 use crate::scheduler::ProcessId;
 use crate::store::kv::project::PhysicalPageId;
@@ -17,6 +17,7 @@ use anyhow::{Result, anyhow};
 use super::batch::{self, BatchAccumulator};
 use super::quorum;
 use super::stats::{self, SchedulerStats};
+use super::{LaunchPreparation, LaunchPreparationError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FireClause {
@@ -57,6 +58,7 @@ pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
 /// discovered already settled — a lost nudge. Steady state stays at zero; any
 /// increment is a wake-path regression worth a warning.
 pub(crate) static BACKSTOP_RETIREMENTS: AtomicU64 = AtomicU64::new(0);
+static NEXT_LOGICAL_FIRE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Total backstop-path retirements since process start (test observability).
 #[cfg(test)]
@@ -64,10 +66,32 @@ pub(crate) fn backstop_retirements() -> u64 {
     BACKSTOP_RETIREMENTS.load(Ordering::Relaxed)
 }
 
+fn retry_warn_at() -> u32 {
+    static WARN_AT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *WARN_AT.get_or_init(|| {
+        std::env::var("PIE_FIRE_RETRY_WARN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+fn max_fire_retries() -> u32 {
+    static MAX_RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAX_RETRIES.get_or_init(|| {
+        std::env::var("PIE_FIRE_RETRY_MAX")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024)
+            .max(1)
+    })
+}
+
 pub(crate) struct PendingRequest {
+    pub(crate) logical_fire_id: u64,
     pub(crate) request: crate::driver::LaunchPlan,
     pub(crate) instance_id: u64,
-    pub(crate) completion: InstanceCompletion,
+    pub(crate) completion: WorkItemCompletion,
     pub(crate) physical_page_ids: Vec<PhysicalPageId>,
     pub(crate) last_page_len: u32,
     /// The submitting pipeline's identity (`ProcessCtx::process_id()`), or
@@ -76,19 +100,32 @@ pub(crate) struct PendingRequest {
     /// ([`quorum::WaitAllPolicy::on_pipeline_request`]).
     pub(crate) pipeline_id: Option<ProcessId>,
     pub(crate) prebuilt: bool,
+    /// Stable logical-fire retry state. The request payload and completion are
+    /// retained across attempts; only the native terminal cell is reset.
+    pub(crate) retry_count: u32,
+    pub(crate) retry_eligible: bool,
+    pub(crate) prelaunch_copy: Option<crate::driver::KvCopyPlan>,
+    pub(crate) preparation: Option<LaunchPreparation>,
+    pub(crate) preparation_retries: u32,
 }
 
 impl PendingRequest {
     fn direct(
         request: crate::driver::LaunchPlan,
         instance_id: u64,
-        completion: InstanceCompletion,
+        completion: WorkItemCompletion,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
         pipeline_id: Option<ProcessId>,
         prebuilt: bool,
+        prelaunch_copy: Option<crate::driver::KvCopyPlan>,
+        preparation: Option<LaunchPreparation>,
     ) -> Self {
+        let retry_eligible = request.rs_slot_ids.is_empty()
+            && request.rs_buffer_slot_ids.is_empty()
+            && request.rs_fold_lens.is_empty();
         Self {
+            logical_fire_id: NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed),
             request,
             instance_id,
             completion,
@@ -96,6 +133,11 @@ impl PendingRequest {
             last_page_len,
             pipeline_id,
             prebuilt,
+            retry_count: 0,
+            retry_eligible,
+            prelaunch_copy,
+            preparation,
+            preparation_retries: 0,
         }
     }
 }
@@ -118,7 +160,7 @@ enum SchedulerItem {
     },
     CopyKv {
         plan: crate::driver::KvCopyPlan,
-        response: crossbeam::channel::Sender<Result<Completion>>,
+        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
     },
     // Only reached via `SchedulerHandle::copy_state`/`resize_pool`, which
     // the mock-driver fire path doesn't call yet (`scheduler::resize_pool`
@@ -127,12 +169,12 @@ enum SchedulerItem {
     #[allow(dead_code)]
     CopyState {
         plan: StateCopyPlan,
-        response: crossbeam::channel::Sender<Result<Completion>>,
+        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
     },
     #[allow(dead_code)]
     ResizePool {
         plan: PoolResizePlan,
-        response: crossbeam::channel::Sender<Result<Completion>>,
+        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
     },
     CloseInstance {
         id: u64,
@@ -144,7 +186,7 @@ enum SchedulerItem {
         response: crossbeam::channel::Sender<Result<()>>,
     },
     /// Event-driven retirement wake: sent by [`NudgeWaker`] when an in-flight
-    /// driver completion publishes. Carries no work; it only unblocks the
+    /// driver submission completion publishes. Carries no work; it only unblocks the
     /// scheduler's wait so the retire pass runs immediately.
     Nudge,
     /// A pipeline left the fleet ([`notify_pipeline_leave`]'s broadcast).
@@ -156,7 +198,7 @@ enum SchedulerItem {
 }
 
 /// Wakes the scheduler thread through its own queue when a registered driver
-/// completion publishes, so batch/control retirement is event-driven instead
+/// submission completion publishes, so batch/control retirement is event-driven instead
 /// of timeout-polled (plan §5.1).
 struct NudgeWaker {
     tx: crossbeam::channel::Sender<SchedulerItem>,
@@ -175,7 +217,7 @@ impl std::task::Wake for NudgeWaker {
 /// Register the nudge waker on a pending completion's wait slot with
 /// register-then-recheck. Returns false when the completion has already
 /// settled (or its slot is gone) and the caller should retire immediately.
-fn arm_completion_nudge(completion: &Completion, waker: &std::task::Waker) -> bool {
+fn arm_completion_nudge(completion: &SubmissionCompletion, waker: &std::task::Waker) -> bool {
     if completion.is_settled() {
         return false;
     }
@@ -194,6 +236,11 @@ fn arm_completion_nudge(completion: &Completion, waker: &std::task::Waker) -> bo
 
 enum QueuedItem {
     Launch(PendingRequest),
+    Prepare(PendingRequest),
+    PreLaunchCopy {
+        plan: crate::driver::KvCopyPlan,
+        logical_completion: WorkItemCompletion,
+    },
     RegisterProgram {
         plan: ProgramRegistration,
         response: crossbeam::channel::Sender<Result<u64>>,
@@ -208,15 +255,15 @@ enum QueuedItem {
     },
     CopyKv {
         plan: crate::driver::KvCopyPlan,
-        response: crossbeam::channel::Sender<Result<Completion>>,
+        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
     },
     CopyState {
         plan: StateCopyPlan,
-        response: crossbeam::channel::Sender<Result<Completion>>,
+        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
     },
     ResizePool {
         plan: PoolResizePlan,
-        response: crossbeam::channel::Sender<Result<Completion>>,
+        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
     },
     CloseInstance {
         id: u64,
@@ -230,7 +277,7 @@ enum QueuedItem {
 }
 
 struct PendingLaunchBatch {
-    completion: Completion,
+    completion: SubmissionCompletion,
     requests: Vec<PendingRequest>,
     started: Instant,
     batch_size: u64,
@@ -238,7 +285,8 @@ struct PendingLaunchBatch {
 }
 
 struct PendingControl {
-    completion: Completion,
+    completion: SubmissionCompletion,
+    logical_completion: Option<WorkItemCompletion>,
 }
 
 struct SchedulerControl {
@@ -279,14 +327,15 @@ impl SchedulerHandle {
         Arc::clone(&self.inner.stats)
     }
 
-    pub fn submit_with_identity(
+    pub fn submit_with_identity_and_copy(
         &self,
         request: crate::driver::LaunchPlan,
         instance_id: u64,
-        completion: InstanceCompletion,
+        completion: WorkItemCompletion,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
         pipeline_id: Option<ProcessId>,
+        prelaunch_copy: Option<crate::driver::KvCopyPlan>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
@@ -297,17 +346,20 @@ impl SchedulerHandle {
                 last_page_len,
                 pipeline_id,
                 false,
+                prelaunch_copy,
+                None,
             ),
         })
     }
 
-    pub fn submit_prebuilt(
+    pub fn submit_prebuilt_with_copy(
         &self,
         request: crate::driver::LaunchPlan,
         instance_id: u64,
-        completion: InstanceCompletion,
+        completion: WorkItemCompletion,
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
+        prelaunch_copy: Option<crate::driver::KvCopyPlan>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
@@ -318,6 +370,31 @@ impl SchedulerHandle {
                 last_page_len,
                 None,
                 true,
+                prelaunch_copy,
+                None,
+            ),
+        })
+    }
+
+    pub fn submit_deferred(
+        &self,
+        request: crate::driver::LaunchPlan,
+        instance_id: u64,
+        completion: WorkItemCompletion,
+        pipeline_id: Option<ProcessId>,
+        preparation: LaunchPreparation,
+    ) -> Result<()> {
+        self.send(SchedulerItem::Launch {
+            pending: PendingRequest::direct(
+                request,
+                instance_id,
+                completion,
+                Vec::new(),
+                0,
+                pipeline_id,
+                false,
+                None,
+                Some(preparation),
             ),
         })
     }
@@ -340,7 +417,7 @@ impl SchedulerHandle {
         rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
     }
 
-    pub fn copy_kv(&self, plan: crate::driver::KvCopyPlan) -> Result<Completion> {
+    pub fn copy_kv(&self, plan: crate::driver::KvCopyPlan) -> Result<SubmissionCompletion> {
         let (tx, rx) = crossbeam::channel::bounded(1);
         self.send(SchedulerItem::CopyKv { plan, response: tx })?;
         rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
@@ -350,14 +427,14 @@ impl SchedulerHandle {
     // (not yet issued by the mock-driver fire path) and this module's own
     // unit tests — see `scheduler::dispatch`'s module doc.
     #[allow(dead_code)]
-    pub fn copy_state(&self, plan: StateCopyPlan) -> Result<Completion> {
+    pub fn copy_state(&self, plan: StateCopyPlan) -> Result<SubmissionCompletion> {
         let (tx, rx) = crossbeam::channel::bounded(1);
         self.send(SchedulerItem::CopyState { plan, response: tx })?;
         rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
     }
 
     #[allow(dead_code)]
-    pub fn resize_pool(&self, plan: PoolResizePlan) -> Result<Completion> {
+    pub fn resize_pool(&self, plan: PoolResizePlan) -> Result<SubmissionCompletion> {
         let (tx, rx) = crossbeam::channel::bounded(1);
         self.send(SchedulerItem::ResizePool { plan, response: tx })?;
         rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
@@ -450,7 +527,7 @@ impl BatchScheduler {
         stats: Arc<SchedulerStats>,
     ) {
         let nudge_waker = std::task::Waker::from(Arc::new(NudgeWaker { tx: nudge_tx }));
-        let mut driver = crate::driver::take_native_driver(driver_id).ok();
+        let mut driver = crate::driver::take_driver_backend(driver_id).ok();
         let mut instances = HashMap::new();
         let mut channels = HashSet::new();
         let mut pending = VecDeque::new();
@@ -467,8 +544,10 @@ impl BatchScheduler {
             progress |= Self::retire_ready_launches(
                 &mut in_flight_launches,
                 &mut instances,
+                &mut pending,
                 &stats,
                 &mut policy,
+                stopping,
             );
             progress |= Self::retire_ready_control(&mut in_flight_control);
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
@@ -482,6 +561,7 @@ impl BatchScheduler {
                 limits,
                 &stats,
                 &mut policy,
+                stopping,
             );
             progress |= dispatched;
             // M-A2: reap any pipeline the quorum just demoted for missing
@@ -635,13 +715,16 @@ impl BatchScheduler {
                 };
                 if let Some(message) = rejection {
                     launch.completion.reject(message);
+                } else if launch.preparation.is_some() {
+                    policy.on_retry_participation(launch.pipeline_id);
+                    pending.push_back(QueuedItem::Prepare(launch));
                 } else {
                     // The wave gather starts at acceptance, not dispatch:
                     // this request now counts toward `decide_wave_at`'s
                     // wait-set/untracked-ready even while it sits in
                     // `pending` behind an in-flight-depth or quorum hold.
                     policy.on_pipeline_request(launch.pipeline_id, Instant::now());
-                    pending.push_back(QueuedItem::Launch(launch));
+                    Self::queue_attempt_back(pending, launch);
                 }
             }
             SchedulerItem::RegisterProgram { plan, response } => {
@@ -676,6 +759,30 @@ impl BatchScheduler {
             SchedulerItem::CloseChannel { id, response } => {
                 pending.push_back(QueuedItem::CloseChannel { id, response });
             }
+        }
+    }
+
+    fn queue_attempt_back(pending: &mut VecDeque<QueuedItem>, request: PendingRequest) {
+        if let Some(plan) = request.prelaunch_copy.clone() {
+            pending.push_back(QueuedItem::PreLaunchCopy {
+                plan,
+                logical_completion: request.completion.clone(),
+            });
+        }
+        pending.push_back(QueuedItem::Launch(request));
+    }
+
+    fn queue_attempt_front(pending: &mut VecDeque<QueuedItem>, request: PendingRequest) {
+        let copy = request
+            .prelaunch_copy
+            .clone()
+            .map(|plan| QueuedItem::PreLaunchCopy {
+                plan,
+                logical_completion: request.completion.clone(),
+            });
+        pending.push_front(QueuedItem::Launch(request));
+        if let Some(copy) = copy {
+            pending.push_front(copy);
         }
     }
 
@@ -740,7 +847,7 @@ impl BatchScheduler {
     }
 
     fn dispatch_ready_items(
-        driver: &mut Option<NativeDriver>,
+        driver: &mut Option<DriverBackend>,
         instances: &mut HashMap<u64, TrackedInstance>,
         channels: &mut HashSet<u64>,
         pending: &mut VecDeque<QueuedItem>,
@@ -750,6 +857,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         policy: &mut quorum::WaitAllPolicy,
+        stopping: bool,
     ) -> (bool, Option<Duration>) {
         let mut progress = false;
         let mut wait_hint = None;
@@ -761,18 +869,75 @@ impl BatchScheduler {
                 break;
             };
             match item {
+                QueuedItem::Prepare(_) => {
+                    let Some(QueuedItem::Prepare(mut request)) = pending.pop_front() else {
+                        unreachable!();
+                    };
+                    let result = request
+                        .preparation
+                        .as_mut()
+                        .expect("prepare item carries a preparation")(
+                        &mut request.request
+                    );
+                    match result {
+                        Ok(prepared) => {
+                            request.physical_page_ids = prepared.page_refs;
+                            request.last_page_len = prepared.last_page_len;
+                            request.prelaunch_copy = (!prepared.copy_src.is_empty()).then_some(
+                                crate::driver::KvCopyPlan {
+                                    src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+                                    src_device_ordinal: 0,
+                                    dst_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+                                    dst_device_ordinal: 0,
+                                    src_page_ids: prepared.copy_src,
+                                    dst_page_ids: prepared.copy_dst,
+                                    cells: Vec::new(),
+                                },
+                            );
+                            request.preparation = None;
+                            let validation = BatchAccumulator::new(limits, page_size);
+                            if let Some(message) = validation.single_request_limit_error(&request) {
+                                request.completion.reject(message);
+                            } else {
+                                policy.on_pipeline_request(request.pipeline_id, Instant::now());
+                                Self::queue_attempt_back(pending, request);
+                            }
+                        }
+                        Err(LaunchPreparationError::Retry(reason)) => {
+                            request.preparation_retries += 1;
+                            if request.preparation_retries > max_fire_retries() {
+                                request.completion.reject(format!(
+                                    "dispatch preparation exceeded retry limit: {reason}"
+                                ));
+                            } else {
+                                policy.on_retry_participation(request.pipeline_id);
+                                pending.push_back(QueuedItem::Prepare(request));
+                                wait_hint =
+                                    Some(Duration::from_micros(super::quorum::QUORUM_POLL_US));
+                            }
+                            progress = true;
+                            break;
+                        }
+                        Err(LaunchPreparationError::Failed(reason)) => {
+                            request.completion.reject(reason);
+                        }
+                    }
+                    progress = true;
+                }
                 QueuedItem::Launch(_) => {
                     if in_flight_launches.len() >= quorum::max_in_flight() {
                         break;
                     }
                     let candidate_size =
                         Self::peek_launch_batch_size(pending, instances, limits, page_size);
-                    match policy.decide_wave_at(candidate_size, Instant::now()) {
-                        quorum::WaveDecision::Wait(hold) => {
-                            wait_hint = Some(hold);
-                            break;
+                    if !stopping {
+                        match policy.decide_wave_at(candidate_size, Instant::now()) {
+                            quorum::WaveDecision::Wait(hold) => {
+                                wait_hint = Some(hold);
+                                break;
+                            }
+                            quorum::WaveDecision::Fire { .. } => {}
                         }
-                        quorum::WaveDecision::Fire { .. } => {}
                     }
                     let before = in_flight_launches.len();
                     let dispatched = Self::dispatch_launch_batch(
@@ -791,7 +956,14 @@ impl BatchScheduler {
                     // occupies a run-ahead slot, so nothing would ever
                     // decrement it back.
                     if in_flight_launches.len() > before {
-                        policy.on_wave_dispatched();
+                        let participants = in_flight_launches
+                            .back()
+                            .expect("accepted batch is present")
+                            .requests
+                            .iter()
+                            .map(|request| request.pipeline_id)
+                            .collect::<Vec<_>>();
+                        policy.on_wave_dispatched(&participants);
                     }
                     progress |= dispatched;
                     if !dispatched {
@@ -816,18 +988,36 @@ impl BatchScheduler {
     }
 
     fn dispatch_ordered_item(
-        driver: &mut Option<NativeDriver>,
+        driver: &mut Option<DriverBackend>,
         instances: &mut HashMap<u64, TrackedInstance>,
         channels: &mut HashSet<u64>,
         in_flight_control: &mut Option<PendingControl>,
         item: QueuedItem,
     ) {
         match item {
-            QueuedItem::Launch(_) => unreachable!(),
+            QueuedItem::Launch(_) | QueuedItem::Prepare(_) => unreachable!(),
+            QueuedItem::PreLaunchCopy {
+                plan,
+                logical_completion,
+            } => match driver.as_mut() {
+                Some(driver) => match driver.copy_kv(&plan) {
+                    Ok(completion) => {
+                        *in_flight_control = Some(PendingControl {
+                            completion,
+                            logical_completion: Some(logical_completion),
+                        });
+                    }
+                    Err(error) => {
+                        logical_completion
+                            .reject(format!("pre-launch KV copy rejected: {error:#}"));
+                    }
+                },
+                None => logical_completion.reject("driver has no backend installed"),
+            },
             QueuedItem::RegisterProgram { plan, response } => {
                 let _ = response.send(match driver.as_mut() {
                     Some(driver) => driver.register_program(&plan),
-                    None => Err(anyhow!("driver has no native backend installed")),
+                    None => Err(anyhow!("driver has no backend installed")),
                 });
             }
             QueuedItem::RegisterChannel { plan, response } => {
@@ -839,7 +1029,7 @@ impl BatchScheduler {
                             channels.insert(plan.channel_id);
                             channel
                         }),
-                        None => Err(anyhow!("driver has no native backend installed")),
+                        None => Err(anyhow!("driver has no backend installed")),
                     }
                 };
                 let _ = response.send(result);
@@ -866,7 +1056,7 @@ impl BatchScheduler {
                                 .insert(bound.instance_id, TrackedInstance::from_bound(&bound));
                             Ok(bound)
                         }),
-                        None => Err(anyhow!("driver has no native backend installed")),
+                        None => Err(anyhow!("driver has no backend installed")),
                     }
                 };
                 let _ = response.send(result);
@@ -877,12 +1067,13 @@ impl BatchScheduler {
                         Ok(completion) => {
                             *in_flight_control = Some(PendingControl {
                                 completion: completion.clone(),
+                                logical_completion: None,
                             });
                             Ok(completion)
                         }
                         Err(err) => Err(err),
                     },
-                    None => Err(anyhow!("driver has no native backend installed")),
+                    None => Err(anyhow!("driver has no backend installed")),
                 });
             }
             QueuedItem::CopyState { plan, response } => {
@@ -891,12 +1082,13 @@ impl BatchScheduler {
                         Ok(completion) => {
                             *in_flight_control = Some(PendingControl {
                                 completion: completion.clone(),
+                                logical_completion: None,
                             });
                             Ok(completion)
                         }
                         Err(err) => Err(err),
                     },
-                    None => Err(anyhow!("driver has no native backend installed")),
+                    None => Err(anyhow!("driver has no backend installed")),
                 });
             }
             QueuedItem::ResizePool { plan, response } => {
@@ -905,12 +1097,13 @@ impl BatchScheduler {
                         Ok(completion) => {
                             *in_flight_control = Some(PendingControl {
                                 completion: completion.clone(),
+                                logical_completion: None,
                             });
                             Ok(completion)
                         }
                         Err(err) => Err(err),
                     },
-                    None => Err(anyhow!("driver has no native backend installed")),
+                    None => Err(anyhow!("driver has no backend installed")),
                 });
             }
             QueuedItem::CloseInstance {
@@ -933,7 +1126,7 @@ impl BatchScheduler {
                                     }
                                     Err(err) => Err(err),
                                 },
-                                None => Err(anyhow!("driver has no native backend installed")),
+                                None => Err(anyhow!("driver has no backend installed")),
                             }
                         }
                     }
@@ -949,7 +1142,7 @@ impl BatchScheduler {
                         Some(driver) => driver.close_channel(id).map(|()| {
                             channels.remove(&id);
                         }),
-                        None => Err(anyhow!("driver has no native backend installed")),
+                        None => Err(anyhow!("driver has no backend installed")),
                     }
                 };
                 let _ = response.send(result);
@@ -958,7 +1151,7 @@ impl BatchScheduler {
     }
 
     fn dispatch_launch_batch(
-        driver: &mut Option<NativeDriver>,
+        driver: &mut Option<DriverBackend>,
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut VecDeque<QueuedItem>,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
@@ -972,6 +1165,11 @@ impl BatchScheduler {
         let mut batch_has_user_mask = false;
         let mut rejected_stale = false;
         while let Some(QueuedItem::Launch(next)) = pending.front() {
+            if next.completion.is_settled() {
+                pending.pop_front();
+                rejected_stale = true;
+                continue;
+            }
             if instances.get(&next.instance_id).is_none() {
                 // A launch whose instance closed between enqueue validation
                 // and dispatch must be rejected here, not left at the queue
@@ -1067,9 +1265,7 @@ impl BatchScheduler {
             },
             None => {
                 for request in &mut requests {
-                    request
-                        .completion
-                        .reject("driver has no native backend installed");
+                    request.completion.reject("driver has no backend installed");
                 }
             }
         }
@@ -1079,8 +1275,10 @@ impl BatchScheduler {
     fn retire_ready_launches(
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         instances: &mut HashMap<u64, TrackedInstance>,
+        pending: &mut VecDeque<QueuedItem>,
         stats: &Arc<SchedulerStats>,
         policy: &mut quorum::WaitAllPolicy,
+        stopping: bool,
     ) -> bool {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
@@ -1088,7 +1286,12 @@ impl BatchScheduler {
                 break;
             };
             let retired = in_flight_launches.pop_front().expect("front batch exists");
-            policy.on_wave_retired();
+            let participants = retired
+                .requests
+                .iter()
+                .map(|request| request.pipeline_id)
+                .collect::<Vec<_>>();
+            policy.on_wave_retired(&participants);
             for request in &retired.requests {
                 if let Some(instance) = instances.get_mut(&request.instance_id) {
                     instance.in_flight = instance.in_flight.saturating_sub(1);
@@ -1096,14 +1299,50 @@ impl BatchScheduler {
             }
             match result {
                 Ok(()) => {
-                    for request in &retired.requests {
-                        if let Err(err) = request.completion.resolve_from_terminal() {
-                            tracing::warn!(
-                                instance_id = request.instance_id,
-                                ?err,
-                                "direct launch terminal settlement failed"
-                            );
+                    let mut retries = Vec::new();
+                    for mut request in retired.requests {
+                        match request.completion.resolve_from_terminal() {
+                            Ok(
+                                WorkItemAttemptOutcome::Committed | WorkItemAttemptOutcome::Failed,
+                            ) => {}
+                            Ok(WorkItemAttemptOutcome::Retry) => {
+                                request.retry_count += 1;
+                                if stopping {
+                                    request
+                                        .completion
+                                        .reject("scheduler shutdown interrupted a retrying fire");
+                                } else if !request.retry_eligible {
+                                    request.completion.reject(
+                                        "driver requested RETRY for an RS-carrying, retry-ineligible fire",
+                                    );
+                                } else if request.retry_count > max_fire_retries() {
+                                    request.completion.reject(format!(
+                                        "fire exceeded retry limit {}",
+                                        max_fire_retries()
+                                    ));
+                                } else {
+                                    if request.retry_count == retry_warn_at() {
+                                        tracing::warn!(
+                                            instance_id = request.instance_id,
+                                            retries = request.retry_count,
+                                            "logical fire remains uncommitted and will retry"
+                                        );
+                                    }
+                                    policy.on_pipeline_request(request.pipeline_id, Instant::now());
+                                    retries.push(request);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    instance_id = request.instance_id,
+                                    ?err,
+                                    "direct launch terminal settlement failed"
+                                );
+                            }
                         }
+                    }
+                    for request in retries.into_iter().rev() {
+                        Self::queue_attempt_front(pending, request);
                     }
                     stats::record_fire_stats(
                         stats,
@@ -1112,6 +1351,7 @@ impl BatchScheduler {
                         retired.total_tokens,
                     )
                 }
+
                 Err(err) => {
                     tracing::warn!(?err, "direct launch completion closed before callback");
                     for request in &retired.requests {
@@ -1138,13 +1378,19 @@ impl BatchScheduler {
         };
         if let Err(err) = result {
             tracing::warn!(?err, "direct control completion closed before callback");
+            if let Some(logical) = in_flight_control
+                .as_ref()
+                .and_then(|pending| pending.logical_completion.as_ref())
+            {
+                logical.reject(format!("pre-launch KV copy failed: {err:#}"));
+            }
         }
         *in_flight_control = None;
         true
     }
 
     fn shutdown_instances(
-        driver: &mut Option<NativeDriver>,
+        driver: &mut Option<DriverBackend>,
         instances: &mut HashMap<u64, TrackedInstance>,
     ) {
         let outstanding = std::mem::take(instances);
@@ -1162,7 +1408,7 @@ impl BatchScheduler {
         }
     }
 
-    fn shutdown_channels(driver: &mut Option<NativeDriver>, channels: &mut HashSet<u64>) {
+    fn shutdown_channels(driver: &mut Option<DriverBackend>, channels: &mut HashSet<u64>) {
         let outstanding = std::mem::take(channels);
         for channel_id in outstanding {
             if let Some(driver) = driver.as_mut()
@@ -1182,7 +1428,7 @@ impl Drop for BatchScheduler {
 
 struct TrackedInstance {
     pacing_wait_id: u64,
-    wait_slots: Arc<crate::driver::frame::BoundWaitSlots>,
+    wait_slots: Arc<crate::driver::instance::BoundWaitSlots>,
     in_flight: usize,
     next_target_epoch: u64,
     /// This instance's compiled program identity — the fire trace
@@ -1356,12 +1602,12 @@ mod tests {
         crate::driver::BoundInstance,
         Vec<Arc<crate::driver::ChannelEndpoint>>,
     )> {
-        let driver_id = driver::register_native_driver(
+        let driver_id = driver::register_driver_backend(
             DriverSpec {
                 num_kv_pages: 16,
                 limits,
             },
-            NativeDriver::Dummy(crate::driver::DummyLocalDriver::new(options)),
+            DriverBackend::Dummy(crate::driver::DummyDriver::new(options)),
         );
         let scheduler = BatchScheduler::new(driver_id, driver_id, 16, limits, 1);
         let program_id = crate::scheduler::register_program(driver_id, dummy_program())?;
@@ -1656,6 +1902,225 @@ mod tests {
             "only the accepted launch may emit a callback: {log:?}"
         );
         crate::scheduler::close_instance(&bound)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_requeues_the_same_logical_fire_without_publishing_effects() -> anyhow::Result<()>
+    {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                retry_launches_remaining: 1,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_prebuilt_async_with_kv_copy(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            completion.clone(),
+            vec![1],
+            vec![2],
+        )?;
+        timeout(Duration::from_secs(5), completion.clone()).await??;
+
+        assert_eq!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == "launch")
+                .count(),
+            2
+        );
+        assert_eq!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == "copy_kv")
+                .count(),
+            2,
+            "every attempt replays the pre-launch snapshot copy"
+        );
+        assert_eq!(
+            completion.target_epoch(),
+            pie_waker::FIRST_COMPLETION_EPOCH + 1
+        );
+        let binding = endpoints[1].registered().binding;
+        let tail = unsafe {
+            (&*((binding.word_base as *const std::sync::atomic::AtomicU64)
+                .add(binding.tail_word_index as usize)))
+                .load(Ordering::Acquire)
+        };
+        let value = unsafe { std::ptr::read_unaligned(binding.mirror_base as *const u32) };
+        assert_eq!(tail, 1, "the RETRY attempt publishes no reader cell");
+        assert_eq!(value, 2, "the retried fire executes exactly once logically");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rs_carrying_fire_is_retry_ineligible() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                retry_launches_remaining: 1,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let mut launch = dummy_launch();
+        launch.rs_slot_ids = vec![0];
+        launch.rs_slot_flags = vec![crate::driver::RS_FLAG_RESET];
+        launch.rs_fold_lens = vec![0];
+
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_prebuilt_async(
+            launch,
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            completion.clone(),
+        )?;
+        let error = timeout(Duration::from_secs(5), completion)
+            .await?
+            .expect_err("RS non-commit must fail rather than retry");
+        assert!(
+            error.to_string().contains("retry-ineligible"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == "launch")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ticket_mismatch_retries_later_fire_instead_of_stealing_predecessor_state()
+    -> anyhow::Result<()> {
+        let (driver_id, _scheduler, bound, endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                retry_launches_remaining: 1,
+                callback_delay_ms: 20,
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let mut first_plan = dummy_launch();
+        first_plan.channel_expected_head = vec![0, crate::driver::command::CHANNEL_TICKET_NONE];
+        first_plan.channel_expected_tail = vec![1, 0];
+        let mut second_plan = dummy_launch();
+        second_plan.channel_expected_head = vec![1, crate::driver::command::CHANNEL_TICKET_NONE];
+        second_plan.channel_expected_tail = vec![2, 1];
+
+        let first = bound.reserve_completion();
+        crate::scheduler::submit_prebuilt_async(
+            first_plan,
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            first.clone(),
+        )?;
+        let second = bound.reserve_completion();
+        crate::scheduler::submit_prebuilt_async(
+            second_plan,
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            second.clone(),
+        )?;
+        timeout(Duration::from_secs(5), first).await??;
+        timeout(Duration::from_secs(5), second).await??;
+
+        let binding = endpoints[1].registered().binding;
+        let first_value = unsafe { std::ptr::read_unaligned(binding.mirror_base as *const u32) };
+        let second_value =
+            unsafe { std::ptr::read_unaligned((binding.mirror_base as *const u32).add(1)) };
+        assert_eq!((first_value, second_value), (2, 3));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn permanent_retry_escalates_to_failure() -> anyhow::Result<()> {
+        let retries = max_fire_retries() + 1;
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                retry_launches_remaining: retries,
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            completion.clone(),
+        )?;
+        let error = timeout(Duration::from_secs(5), completion)
+            .await?
+            .expect_err("permanent retry must eventually fail");
+        assert!(error.to_string().contains("exceeded retry limit"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_preparation_retries_before_the_single_driver_attempt() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler(operation_log.clone()).await?;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_in_prepare = attempts.clone();
+        let preparation: crate::scheduler::LaunchPreparation = Box::new(move |request| {
+            let attempt = attempts_in_prepare.fetch_add(1, Ordering::AcqRel);
+            if attempt == 0 {
+                return Err(crate::scheduler::LaunchPreparationError::Retry(
+                    "predecessor translation not ready".to_string(),
+                ));
+            }
+            request.kv_translation = Vec::new();
+            Ok(crate::scheduler::PreparedLaunch {
+                page_refs: Vec::new(),
+                last_page_len: 0,
+                copy_src: Vec::new(),
+                copy_dst: Vec::new(),
+            })
+        });
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_async_deferred(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Some(ProcessId::new_v4()),
+            completion.clone(),
+            preparation,
+        )?;
+        timeout(Duration::from_secs(5), completion).await??;
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert_eq!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == "launch")
+                .count(),
+            1
+        );
         Ok(())
     }
 
@@ -2208,7 +2673,7 @@ mod tests {
         assert!(
             matches!(
                 woke,
-                Err(crate::driver::frame::ChannelWaitError::Poisoned(_))
+                Err(crate::driver::channel::ChannelWaitError::Poisoned(_))
             ),
             "a parked take classifies the failed fire as Poisoned, got {woke:?}"
         );
@@ -2225,7 +2690,7 @@ mod tests {
         // instance B's fire consumes it and publishes to its host reader —
         // cross-instance dataflow over one global channel registration.
         use pie_ptir::container::{ExternDecl, ExternDir};
-        let driver_id = driver::register_native_driver(
+        let driver_id = driver::register_driver_backend(
             DriverSpec {
                 num_kv_pages: 16,
                 limits: SchedulerLimits {
@@ -2234,7 +2699,7 @@ mod tests {
                     max_page_refs: 64,
                 },
             },
-            NativeDriver::Dummy(crate::driver::DummyLocalDriver::new(
+            DriverBackend::Dummy(crate::driver::DummyDriver::new(
                 DummyDriverOptions::default(),
             )),
         );

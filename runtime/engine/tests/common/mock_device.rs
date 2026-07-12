@@ -1,14 +1,14 @@
 //! Mock-driver helpers for integration tests.
 //!
 //! These helpers keep the existing harness source compiling on top of direct
-//! native-driver registration.
+//! driver-backend registration.
 
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pie_engine::driver::{
-    DriverSpec, LaunchPlan, NativeDriver, SchedulerLimits, register_native_driver,
+    DriverBackend, DriverSpec, LaunchPlan, SchedulerLimits, register_driver_backend,
 };
 use pie_engine::scheduler::worker::BatchScheduler;
 
@@ -183,7 +183,7 @@ fn register_dummy_driver(
     vocab_size: u32,
     operation_log: Arc<Mutex<Vec<String>>>,
 ) -> (usize, BatchScheduler) {
-    let (native, _) = NativeDriver::dummy(pie_driver_dummy_lib::DummyDriverOptions {
+    let (backend, _) = DriverBackend::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_kv_pages as u32,
         kv_page_size: 16,
         swap_pool_size: 0,
@@ -203,21 +203,22 @@ fn register_dummy_driver(
         reject_launches: false,
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
+        retry_launches_remaining: 0,
         operation_log: Some(operation_log),
         launch_observer: Some(launch_observer(behavior)),
     })
-    .expect("create dummy native driver");
+    .expect("create dummy driver backend");
     let limits = SchedulerLimits {
         max_forward_requests: 32,
         max_forward_tokens: 4096,
         max_page_refs: num_kv_pages.max(1),
     };
-    let driver_id = register_native_driver(
+    let driver_id = register_driver_backend(
         DriverSpec {
             num_kv_pages,
             limits,
         },
-        native,
+        backend,
     );
     let scheduler = BatchScheduler::new(driver_id, driver_idx, 16, limits, 30);
     (driver_id, scheduler)

@@ -339,7 +339,7 @@ The following parts of the plan are implemented convincingly:
 
 - `DriverChannel`, request/response payloads, deferred responses, and service loops are gone.
 - CUDA and Metal expose generated direct create/destroy/register/bind/launch/copy/resize symbols.
-- The per-driver scheduler owns `NativeDriver`; arbitrary runtime threads do not invoke it directly.
+- The per-driver scheduler owns `DriverBackend`; arbitrary runtime threads do not invoke it directly.
 - Ordered control operations and launches share the scheduler queue.
 - The runtime callback table is versioned and supplied at driver creation.
 - Rust catches unwinding inside the foreign callback.

@@ -26,8 +26,12 @@ inline int validate_launch_resources(const PieLaunchDesc& launch,
     if (device_pages < 0 || page_size <= 0) {
         return PIE_STATUS_DRIVER_ERROR;
     }
-    for (std::size_t i = 0; i < launch.kv_page_indices.len; ++i) {
-        if (launch.kv_page_indices.ptr[i] >=
+    const PieU32Slice physical_pages =
+        launch.kv_translation.len != 0
+            ? launch.kv_translation
+            : launch.kv_page_indices;
+    for (std::size_t i = 0; i < physical_pages.len; ++i) {
+        if (physical_pages.ptr[i] >=
             static_cast<std::uint32_t>(device_pages)) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }

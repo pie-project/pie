@@ -2,9 +2,10 @@
 
 // CUDA-FREE geometry POD for the PTIR pre-forward descriptor resolver (W1.1).
 // Split out of descriptor_resolve.hpp so the host-side dispatch façade
-// (ptir_dispatch.hpp, included by CUDA-free .cpp TUs) can name it without
-// pulling device headers. The resolver (descriptor_resolve.hpp, nvcc TU) fills
-// it; the executor feeds it into the standard batch assembly.
+// (driver/cuda's pipeline/dispatch.hpp, included by CUDA-free .cpp TUs) can
+// name it without pulling device headers. The resolver
+// (driver/cuda's pipeline/descriptor_resolve.hpp, nvcc TU) fills it; the
+// executor feeds it into the standard batch assembly.
 
 #include <cstddef>
 #include <cstdint>

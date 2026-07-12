@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "model/gemma4_audio_forward.cu"  // encoder under test + kernels + .hpp
+#include "model/gemma4/gemma4_audio_forward.cu"  // encoder under test + kernels + .hpp
 
 using pie_cuda_driver::model::AudioClipRaw;
 using pie_cuda_driver::model::AudioFfnRaw;

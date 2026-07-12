@@ -775,7 +775,7 @@ mod tests {
             Vec<Arc<Mutex<ChannelCell>>>,
             u64,
         ) {
-            let driver_id = driver::register_native_driver(
+            let driver_id = driver::register_driver_backend(
                 DriverSpec {
                     num_kv_pages: 16,
                     limits: SchedulerLimits {
@@ -784,7 +784,7 @@ mod tests {
                         max_page_refs: 64,
                     },
                 },
-                driver::NativeDriver::Dummy(driver::DummyLocalDriver::new(DummyDriverOptions {
+                driver::DriverBackend::Dummy(driver::DummyDriver::new(DummyDriverOptions {
                     operation_log: Some(operation_log),
                     ..DummyDriverOptions::default()
                 })),

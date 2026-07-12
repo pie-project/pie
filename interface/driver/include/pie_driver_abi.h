@@ -14,7 +14,7 @@
  * mandatory and every native driver must notify them per channel-word
  * publication.
  */
-#define PIE_DRIVER_ABI_VERSION 2
+#define PIE_DRIVER_ABI_VERSION 3
 
 /**
  * Success.
@@ -454,6 +454,17 @@ typedef struct PieLaunchDesc {
    * geometry for that span when composing the forward batch.
    */
   struct PieU32Slice ptir_program_row_indptr;
+  /**
+   * Immutable logical-fire ids and retry eligibility, one per instance.
+   */
+  struct PieU64Slice logical_fire_ids;
+  struct PieU8Slice retry_eligible;
+  /**
+   * Dense-channel sequence tickets, CSR-partitioned per instance.
+   */
+  struct PieU64Slice channel_expected_head;
+  struct PieU64Slice channel_expected_tail;
+  struct PieU32Slice channel_ticket_indptr;
 } PieLaunchDesc;
 
 /**
@@ -620,6 +631,11 @@ typedef struct PiePoolResizeDesc {
  * The operation completed unsuccessfully.
  */
 #define PIE_TERMINAL_OUTCOME_FAILED 2
+
+/**
+ * The accepted work item committed no effects and must be attempted again.
+ */
+#define PIE_TERMINAL_OUTCOME_RETRY 3
 
 #ifdef __cplusplus
 extern "C" {

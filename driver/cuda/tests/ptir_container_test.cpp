@@ -1,13 +1,13 @@
-// PTIR container reader conformance test (charlie, thrust-3 P2/P4).
+// PTIR container reader conformance test.
 //
-// Decodes echo's golden `PTIR` v1 containers (interface/sampling-ir/tests/
+// Decodes the golden `PTIR` v1 containers (interface/sampling-ir/tests/
 // golden-ptir, vendored under tests/golden-ptir) and checks two things against
 // the golden oracle byte-for-byte:
-//   1. container_hash — my FNV-1a64 over the raw bytes == echo's `hash:` line;
+//   1. container_hash — my FNV-1a64 over the raw bytes == the golden `hash:` line;
 //   2. readiness table — my per-channel first-op direction derivation ==
-//      echo's `readiness:` lines (C2's producer, the stage-runner's input).
+//      the golden `readiness:` lines (C2's producer, the stage-runner's input).
 // Negative (validator-ERR) goldens are checked for a clean structural decode +
-// hash only — the semantic verdict is echo's validator's job, not the reader's.
+// hash only — the semantic verdict is the validator's job, not the reader's.
 //
 // Host-only (no CUDA). Golden dir = argv[1] (default tests/golden-ptir).
 //   g++ -std=c++17 -Isrc tests/ptir_container_test.cpp -o ptir_container_test
@@ -96,7 +96,7 @@ void run_one(const std::string& dir, const std::string& name) {
     expect(!g.has_hash || c.hash == g.hash, name + ": container_hash");
 
     bool is_negative = g.verdict.rfind("ERR", 0) == 0;
-    if (is_negative) return;   // validator verdict is echo's; reader only decodes+hashes
+    if (is_negative) return;   // validator verdict is external; reader only decodes+hashes
 
     auto rt = container::derive_readiness(c);
     std::map<std::uint32_t, std::pair<std::uint8_t, bool>> got;
@@ -121,7 +121,7 @@ void run_one(const std::string& dir, const std::string& name) {
 
 int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : "tests/golden-ptir";
-    std::printf("PTIR container reader conformance vs echo goldens (%s)\n", dir.c_str());
+    std::printf("PTIR container reader conformance vs golden vectors (%s)\n", dir.c_str());
     const char* names[] = {
         "greedy_argmax", "counter_pingpong", "section3_masked_gumbel", "beam_epilogue",
         "neg_spsc_second_producer", "neg_sink_at_epilogue", "neg_t10_nonreplayable",

@@ -8,10 +8,9 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
-#include <pie_driver_common/hf_config_json.hpp>
-#include <pie_driver_common/safetensors_manifest.hpp>
-#include <pie_driver_common/shard_plan.hpp>
-#include <pie_driver_common/tensor_names.hpp>
+#include "model/hf_config_json.hpp"
+#include "loader/safetensors_manifest.hpp"
+#include "loader/shard_plan.hpp"
 
 namespace {
 
@@ -125,29 +124,6 @@ void test_safetensors_manifest_errors() {
     }
 }
 
-void test_tensor_names() {
-    namespace common = pie_driver_common;
-    CHECK(common::starts_with("model.layers.0", "model."));
-    CHECK(!common::starts_with("lm_head.weight", "model."));
-    CHECK(common::ends_with("model.norm.weight", "norm.weight"));
-    CHECK(!common::ends_with("model.norm.weight", ".bias"));
-    CHECK_EQ(common::strip_prefix("language_model.model.foo",
-                                  "language_model."),
-             std::string("model.foo"));
-    CHECK_EQ(common::strip_prefix("model.foo", "language_model."),
-             std::string("model.foo"));
-    CHECK_EQ(common::strip_suffix("model.layers.", "."),
-             std::string("model.layers"));
-    CHECK_EQ(common::strip_suffix("model.foo", ".bar"),
-             std::string("model.foo"));
-    CHECK_EQ(common::apply_tensor_prefix("model.layers.0.weight",
-                                         "language_model.model."),
-             std::string("language_model.model.layers.0.weight"));
-    CHECK_EQ(common::apply_tensor_prefix("lm_head.weight",
-                                         "language_model."),
-             std::string("language_model.lm_head.weight"));
-}
-
 void test_shard_plan() {
     namespace common = pie_driver_common;
     auto axis0 = common::plan_axis_shard({8, 4}, 0, 1, 2, "axis0");
@@ -226,7 +202,6 @@ void test_hf_config_json() {
 int main() {
     test_safetensors_manifest_single_and_index_preferences();
     test_safetensors_manifest_errors();
-    test_tensor_names();
     test_shard_plan();
     test_hf_config_json();
 

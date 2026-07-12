@@ -19,7 +19,7 @@ use std::fmt;
 /// by the driver before the consuming pass; `PieChannelDesc` wait ids are
 /// mandatory and every native driver must notify them per channel-word
 /// publication.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 2;
+pub const PIE_DRIVER_ABI_VERSION: u32 = 3;
 
 /// Success.
 pub const PIE_STATUS_OK: i32 = 0;
@@ -138,6 +138,8 @@ pub const PIE_TERMINAL_OUTCOME_PENDING: PieTerminalOutcome = 0;
 pub const PIE_TERMINAL_OUTCOME_SUCCESS: PieTerminalOutcome = 1;
 /// The operation completed unsuccessfully.
 pub const PIE_TERMINAL_OUTCOME_FAILED: PieTerminalOutcome = 2;
+/// The accepted work item committed no effects and must be attempted again.
+pub const PIE_TERMINAL_OUTCOME_RETRY: PieTerminalOutcome = 3;
 
 /// Host-visible terminal control cell.
 ///
@@ -512,6 +514,13 @@ pub struct PieLaunchDesc {
     /// wire placeholder row; the driver substitutes its channel-resolved
     /// geometry for that span when composing the forward batch.
     pub ptir_program_row_indptr: PieU32Slice,
+    /// Immutable logical-fire ids and retry eligibility, one per instance.
+    pub logical_fire_ids: PieU64Slice,
+    pub retry_eligible: PieU8Slice,
+    /// Dense-channel sequence tickets, CSR-partitioned per instance.
+    pub channel_expected_head: PieU64Slice,
+    pub channel_expected_tail: PieU64Slice,
+    pub channel_ticket_indptr: PieU32Slice,
 }
 
 impl Default for PieLaunchDesc {
@@ -557,6 +566,11 @@ impl Default for PieLaunchDesc {
             kv_translation: PieU32Slice::default(),
             kv_translation_indptr: PieU32Slice::default(),
             ptir_program_row_indptr: PieU32Slice::default(),
+            logical_fire_ids: PieU64Slice::default(),
+            retry_eligible: PieU8Slice::default(),
+            channel_expected_head: PieU64Slice::default(),
+            channel_expected_tail: PieU64Slice::default(),
+            channel_ticket_indptr: PieU32Slice::default(),
         }
     }
 }
@@ -692,7 +706,10 @@ const fn bool_field_is_valid(value: u8) -> bool {
 pub const fn pie_terminal_outcome_is_valid(outcome: PieTerminalOutcome) -> bool {
     matches!(
         outcome,
-        PIE_TERMINAL_OUTCOME_PENDING | PIE_TERMINAL_OUTCOME_SUCCESS | PIE_TERMINAL_OUTCOME_FAILED
+        PIE_TERMINAL_OUTCOME_PENDING
+            | PIE_TERMINAL_OUTCOME_SUCCESS
+            | PIE_TERMINAL_OUTCOME_FAILED
+            | PIE_TERMINAL_OUTCOME_RETRY
     )
 }
 
@@ -1182,8 +1199,50 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
     )?;
     validate_u32_slice(desc.kv_len, "launch kv_len ptr/len mismatch")?;
     validate_u64_slice(desc.kv_len_device, "launch kv_len_device ptr/len mismatch")?;
+    validate_u32_slice(
+        desc.kv_translation,
+        "launch kv_translation ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.kv_translation_indptr,
+        "launch kv_translation_indptr ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.ptir_program_row_indptr,
+        "launch ptir_program_row_indptr ptr/len mismatch",
+    )?;
+    validate_u64_slice(
+        desc.logical_fire_ids,
+        "launch logical_fire_ids ptr/len mismatch",
+    )?;
+    validate_u8_slice(
+        desc.retry_eligible,
+        "launch retry_eligible ptr/len mismatch",
+    )?;
+    validate_u64_slice(
+        desc.channel_expected_head,
+        "launch channel_expected_head ptr/len mismatch",
+    )?;
+    validate_u64_slice(
+        desc.channel_expected_tail,
+        "launch channel_expected_tail ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.channel_ticket_indptr,
+        "launch channel_ticket_indptr ptr/len mismatch",
+    )?;
 
     let request_count = desc.instance_ids.len;
+    if desc.kv_translation.len != 0 && desc.kv_translation_indptr.len == 0 {
+        return Err(invalid_argument(
+            "launch kv_translation_indptr is required when translation values are present",
+        ));
+    }
+    if desc.channel_expected_head.len != 0 && desc.channel_ticket_indptr.len == 0 {
+        return Err(invalid_argument(
+            "launch channel_ticket_indptr is required when ticket values are present",
+        ));
+    }
     validate_row_count_u32(
         desc.terminal_cells.len,
         "launch terminal_cells length must match batch size",
@@ -1256,6 +1315,58 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             request_count,
             true,
         )?;
+        validate_csr(
+            desc.kv_translation_indptr,
+            "launch kv_translation_indptr malformed",
+            desc.kv_translation.len,
+            request_count,
+            true,
+        )?;
+        validate_csr(
+            desc.channel_ticket_indptr,
+            "launch channel_ticket_indptr malformed",
+            desc.channel_expected_head.len,
+            request_count,
+            true,
+        )?;
+    }
+    if desc.channel_expected_head.len != desc.channel_expected_tail.len {
+        return Err(invalid_argument(
+            "launch channel ticket head/tail vectors must be parallel",
+        ));
+    }
+    validate_row_count_u32(
+        desc.logical_fire_ids.len,
+        "launch logical_fire_ids length must match batch size",
+        request_count,
+        true,
+    )?;
+    validate_row_count_u32(
+        desc.retry_eligible.len,
+        "launch retry_eligible length must match batch size",
+        request_count,
+        true,
+    )?;
+    if desc.retry_eligible.len != 0 {
+        let values =
+            unsafe { std::slice::from_raw_parts(desc.retry_eligible.ptr, desc.retry_eligible.len) };
+        if values.iter().any(|&value| value > 1) {
+            return Err(invalid_argument(
+                "launch retry_eligible values must be 0 or 1",
+            ));
+        }
+    }
+    if desc.ptir_program_row_indptr.len != 0 {
+        let wire_rows = desc.qo_indptr.len.saturating_sub(1);
+        unsafe {
+            validate_csr(
+                desc.ptir_program_row_indptr,
+                "launch ptir_program_row_indptr malformed",
+                wire_rows,
+                request_count,
+                false,
+            )?;
+        }
     }
 
     validate_row_count_u32(
@@ -2013,6 +2124,38 @@ mod tests {
         let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
         assert_eq!(err.status(), PIE_STATUS_INVALID_ARGUMENT);
         assert!(err.message().contains("single_token_mode"));
+    }
+
+    #[test]
+    fn launch_validator_rejects_malformed_ticket_and_translation_csr() {
+        let translation = [7u32];
+        let launch = PieLaunchDesc {
+            kv_translation: PieU32Slice {
+                ptr: translation.as_ptr(),
+                len: translation.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        assert!(err.message().contains("kv_translation_indptr"));
+
+        let heads = [0u64];
+        let ticket_indptr = [0u32, 1];
+        let launch = PieLaunchDesc {
+            channel_expected_head: PieU64Slice {
+                ptr: heads.as_ptr(),
+                len: heads.len(),
+            },
+            channel_ticket_indptr: PieU32Slice {
+                ptr: ticket_indptr.as_ptr(),
+                len: ticket_indptr.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        assert!(
+            err.message().contains("channel_ticket_indptr") || err.message().contains("head/tail")
+        );
     }
 
     #[test]

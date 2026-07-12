@@ -5,7 +5,7 @@
 // read is per-request correct given correct KV/Q. So the concurrent-decode
 // corruption is in the KV/Q *production* — and the Qwen3 decode produces both
 // via `launch_qkv_decode_qk_norm_rope_write_kv_bf16` (fused_decode_qkv_post),
-// NOT the `resolve_dst` path charlie verified. This test isolates that fused
+// NOT the `resolve_dst` path already verified. This test isolates that fused
 // kernel: run it for R=4 requests (distinct packed QKV + distinct rope
 // positions + disjoint pages), then run each request ALONE (R=1), and assert
 // the produced q_out row AND the written K/V page slot are bit-identical.

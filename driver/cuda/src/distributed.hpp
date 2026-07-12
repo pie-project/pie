@@ -17,7 +17,7 @@
 
 namespace pie_cuda_driver {
 
-class CustomAllReduce;  // see custom_all_reduce.hpp
+class CustomAllReduce;  // see kernels/custom_all_reduce.hpp
 
 #define NCCL_CHECK(expr)                                                       \
     do {                                                                       \

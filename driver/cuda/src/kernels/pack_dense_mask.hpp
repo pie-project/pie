@@ -1,5 +1,5 @@
 // Dense per-lane attention mask → FlashInfer packed-mask adapter (the general
-// AttnMask-port lowering; formerly beam_mask_adapter). See pack_dense_mask.cu
+// AttnMask-port lowering. See pack_dense_mask.cu.
 // for the full contract.
 #pragma once
 

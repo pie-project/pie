@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     // input is a JSON string. Use serde_json::to_string(&MyInput { … })?.
     let mut process = client
         .launch_process(
-            "text-completion@0.1.0".into(),
+            "chat-completion@0.1.0".into(),
             r#"{"prompt":"Hello","max_tokens":64}"#.into(),
             true,
             None,

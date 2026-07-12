@@ -1,41 +1,64 @@
-use anyhow::Result;
+//! Driver specs, backend storage (the `DriverId` registry), and concrete
+//! backend dispatch. Scheduler-handle lookup lives in the scheduler layer;
+//! this module keeps only what the driver ABI itself owns: `DriverSpec`
+//! plus the optional `DriverBackend` it's paired with.
 
-use crate::driver::completion::Completion;
+use std::sync::{OnceLock, RwLock};
+
+use anyhow::{Result, anyhow};
+
 #[cfg(feature = "driver-cuda")]
-use crate::driver::ffi::cuda::CudaDriver;
+mod cuda;
+mod dummy;
 #[cfg(feature = "driver-metal")]
-use crate::driver::ffi::metal::MetalDriver;
-use crate::driver::frame::{
-    BoundInstance, ChannelRegistrationPlan, InstanceBindingPlan, KvCopyPlan, LaunchSubmission,
-    PoolResizePlan, ProgramRegistration, RegisteredChannel, StateCopyPlan,
-};
+mod metal;
 
-pub trait LocalDriver: Send {
-    fn capabilities(&self) -> &pie_driver_abi::DriverCapabilities;
-    fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64>;
-    fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel>;
-    fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance>;
-    fn launch(&mut self, desc: &LaunchSubmission) -> Result<Completion>;
-    fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<Completion>;
-    fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<Completion>;
-    fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<Completion>;
-    fn close_instance(&mut self, id: u64) -> Result<()>;
-    fn close_channel(&mut self, id: u64) -> Result<()>;
+#[cfg(feature = "driver-cuda")]
+pub use cuda::CudaDriver;
+pub use dummy::DummyDriver;
+#[cfg(feature = "driver-metal")]
+pub use metal::MetalDriver;
+
+use crate::driver::channel::RegisteredChannel;
+use crate::driver::command::{
+    ChannelRegistrationPlan, KvCopyPlan, PoolResizePlan, ProgramRegistration, StateCopyPlan,
+};
+use crate::driver::completion::SubmissionCompletion;
+use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
+use crate::driver::submission::LaunchSubmission;
+
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerLimits {
+    pub max_forward_requests: usize,
+    pub max_forward_tokens: usize,
+    pub max_page_refs: usize,
 }
 
-pub enum NativeDriver {
-    Dummy(crate::driver::registry::DummyLocalDriver),
+#[derive(Debug, Clone)]
+pub struct DriverSpec {
+    pub num_kv_pages: usize,
+    pub limits: SchedulerLimits,
+}
+
+impl DriverSpec {
+    pub fn scheduler_limits(&self) -> SchedulerLimits {
+        self.limits
+    }
+}
+
+pub enum DriverBackend {
+    Dummy(DummyDriver),
     #[cfg(feature = "driver-cuda")]
     Cuda(CudaDriver),
     #[cfg(feature = "driver-metal")]
     Metal(MetalDriver),
 }
 
-impl NativeDriver {
+impl DriverBackend {
     pub fn dummy(
         options: pie_driver_dummy_lib::DummyDriverOptions,
     ) -> Result<(Self, pie_driver_abi::DriverCapabilities)> {
-        let driver = crate::driver::registry::DummyLocalDriver::new(options);
+        let driver = DummyDriver::new(options);
         let caps = driver.capabilities().clone();
         Ok((Self::Dummy(driver), caps))
     }
@@ -59,10 +82,8 @@ impl NativeDriver {
         let (driver, caps) = MetalDriver::create(config_bytes)?;
         Ok((Self::Metal(driver), caps))
     }
-}
 
-impl LocalDriver for NativeDriver {
-    fn capabilities(&self) -> &pie_driver_abi::DriverCapabilities {
+    pub fn capabilities(&self) -> &pie_driver_abi::DriverCapabilities {
         match self {
             Self::Dummy(driver) => driver.capabilities(),
             #[cfg(feature = "driver-cuda")]
@@ -72,7 +93,7 @@ impl LocalDriver for NativeDriver {
         }
     }
 
-    fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
+    pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
         match self {
             Self::Dummy(driver) => driver.register_program(desc),
             #[cfg(feature = "driver-cuda")]
@@ -82,7 +103,10 @@ impl LocalDriver for NativeDriver {
         }
     }
 
-    fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
+    pub fn register_channel(
+        &mut self,
+        desc: &ChannelRegistrationPlan,
+    ) -> Result<RegisteredChannel> {
         match self {
             Self::Dummy(driver) => driver.register_channel(desc),
             #[cfg(feature = "driver-cuda")]
@@ -92,7 +116,7 @@ impl LocalDriver for NativeDriver {
         }
     }
 
-    fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
+    pub fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
         match self {
             Self::Dummy(driver) => driver.bind_instance(desc),
             #[cfg(feature = "driver-cuda")]
@@ -102,7 +126,7 @@ impl LocalDriver for NativeDriver {
         }
     }
 
-    fn launch(&mut self, desc: &LaunchSubmission) -> Result<Completion> {
+    pub fn launch(&mut self, desc: &LaunchSubmission) -> Result<SubmissionCompletion> {
         match self {
             Self::Dummy(driver) => driver.launch(desc),
             #[cfg(feature = "driver-cuda")]
@@ -112,7 +136,7 @@ impl LocalDriver for NativeDriver {
         }
     }
 
-    fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<Completion> {
+    pub fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
         match self {
             Self::Dummy(driver) => driver.copy_kv(desc),
             #[cfg(feature = "driver-cuda")]
@@ -122,7 +146,7 @@ impl LocalDriver for NativeDriver {
         }
     }
 
-    fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<Completion> {
+    pub fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
         match self {
             Self::Dummy(driver) => driver.copy_state(desc),
             #[cfg(feature = "driver-cuda")]
@@ -132,7 +156,7 @@ impl LocalDriver for NativeDriver {
         }
     }
 
-    fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<Completion> {
+    pub fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
         match self {
             Self::Dummy(driver) => driver.resize_pool(desc),
             #[cfg(feature = "driver-cuda")]
@@ -142,7 +166,7 @@ impl LocalDriver for NativeDriver {
         }
     }
 
-    fn close_instance(&mut self, id: u64) -> Result<()> {
+    pub fn close_instance(&mut self, id: u64) -> Result<()> {
         match self {
             Self::Dummy(driver) => driver.close_instance(id),
             #[cfg(feature = "driver-cuda")]
@@ -152,7 +176,7 @@ impl LocalDriver for NativeDriver {
         }
     }
 
-    fn close_channel(&mut self, id: u64) -> Result<()> {
+    pub fn close_channel(&mut self, id: u64) -> Result<()> {
         match self {
             Self::Dummy(driver) => driver.close_channel(id),
             #[cfg(feature = "driver-cuda")]
@@ -161,4 +185,63 @@ impl LocalDriver for NativeDriver {
             Self::Metal(driver) => driver.close_channel(id),
         }
     }
+}
+
+struct DriverRegistration {
+    spec: DriverSpec,
+    backend: Option<DriverBackend>,
+}
+
+fn registry() -> &'static RwLock<Vec<Option<DriverRegistration>>> {
+    static REGISTRY: OnceLock<RwLock<Vec<Option<DriverRegistration>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+pub fn register_driver(spec: DriverSpec) -> usize {
+    let mut drivers = registry().write().unwrap();
+    let id = drivers.len();
+    drivers.push(Some(DriverRegistration {
+        spec,
+        backend: None,
+    }));
+    id
+}
+
+pub fn register_driver_backend(spec: DriverSpec, backend: DriverBackend) -> usize {
+    let mut drivers = registry().write().unwrap();
+    let id = drivers.len();
+    drivers.push(Some(DriverRegistration {
+        spec,
+        backend: Some(backend),
+    }));
+    id
+}
+
+pub fn get_spec(driver_id: usize) -> Result<DriverSpec> {
+    registry()
+        .read()
+        .unwrap()
+        .get(driver_id)
+        .and_then(|d| d.as_ref().map(|r| r.spec.clone()))
+        .ok_or_else(|| anyhow!("unknown driver {driver_id}"))
+}
+
+pub fn take_driver_backend(driver_id: usize) -> Result<DriverBackend> {
+    let mut drivers = registry().write().unwrap();
+    let Some(Some(driver)) = drivers.get_mut(driver_id) else {
+        return Err(anyhow!("unknown driver {driver_id}"));
+    };
+    driver
+        .backend
+        .take()
+        .ok_or_else(|| anyhow!("driver {driver_id} has no backend installed"))
+}
+
+pub fn unregister_driver(driver_id: usize) -> Result<()> {
+    let mut drivers = registry().write().unwrap();
+    let Some(slot) = drivers.get_mut(driver_id) else {
+        return Err(anyhow!("unknown driver {driver_id}"));
+    };
+    slot.take();
+    Ok(())
 }

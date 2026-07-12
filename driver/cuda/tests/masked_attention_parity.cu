@@ -23,8 +23,7 @@
 
 #include <cuda_runtime.h>
 
-#include "attention_workspace.hpp"
-#include "brle.hpp"
+#include "batch/brle.hpp"
 #include "ops/attention_flashinfer.hpp"
 
 #include "masked_attention_reference.hpp"

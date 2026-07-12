@@ -469,6 +469,13 @@ void plan_attention_flashinfer_decode_bf16(
     bool hnd_layout)
 {
     const int gqa_group_size = num_q_heads / num_kv_heads;
+    if (head_dim != 64 && head_dim != 96 && head_dim != 128 &&
+        head_dim != 256 && head_dim != 512) {
+        throw std::runtime_error(
+            "flashinfer decode: unsupported head_dim " +
+            std::to_string(head_dim) +
+            " (instantiated: 64, 96, 128, 256, 512)");
+    }
 
     if (can_use_static_nonsplit_decode_plan(
             static_cast<uint32_t>(num_requests))) {

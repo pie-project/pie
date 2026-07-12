@@ -7,9 +7,9 @@
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
-#include "kv_cache.hpp"
-#include "kv_cache_format.hpp"
-#include "swap_pool.hpp"
+#include "store/kv_cache.hpp"
+#include "store/kv_cache_format.hpp"
+#include "store/swap_pool.hpp"
 
 namespace {
 

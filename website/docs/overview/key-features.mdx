@@ -23,8 +23,8 @@ let out = fwd.execute().await?;
 A primitive at this level is enough to express decoding strategies that other serving systems either hardcode or do not support at all. Each of the following is a library on top of `forward()`, not an engine feature:
 
 - **Constrained decoding.** Mask logits against a grammar or JSON schema before sampling. See [Structured generation](../guide/forward/constrained).
-- **Speculative decoding.** Run a drafter, verify with the target model, accept or reject. Pie ships an n-gram speculator, a Jacobi decoder, and **native MTP drafters** for models with an MTP head (Gemma-4, Qwen3.5), and you can write your own. See [Speculative decoding](../guide/forward/speculation) and the `text-completion-spec`, `cacheback-decoding`, and `jacobi-decoding` inferlets.
-- **Custom samplers and raw logits.** Score candidate strings, compute entropy, or pull the full distribution back into your inferlet. See the `sampler-suite` and `output-validation` inferlets.
+- **Speculative decoding.** Run a drafter, verify with the target model, accept or reject. Pie supports prompt-lookup and **native MTP drafting** for models with an MTP head. See [Speculative decoding](../guide/forward/speculation), [`cacheback-speculative-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/cacheback-speculative-decoding), and [`mtp-speculative-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/mtp-speculative-decoding).
+- **Custom samplers and raw logits.** Score candidate strings, compute entropy, or pull the full distribution back into your inferlet. See [`sampling-primitives`](https://github.com/pie-project/pie/tree/main/inferlets/sampling-primitives).
 - **Custom attention masks.** Sliding window, attention sink, hierarchical masks, anything that can be expressed as a per-token mask. See [Customize generation](../guide/forward/overview).
 - **LoRA adapters.** Attach an adapter for a single forward pass or for every step of a generation loop.
 
@@ -49,8 +49,8 @@ let resp = ctx.generate(sampler).collect_text().await?;
 Patterns this supports:
 
 - **Prompt prefix caching.** Compute a long system prompt once, save it, fork from the snapshot for every request. The prefill cost is paid once for the lifetime of the snapshot.
-- **Best-of-N and tree of thought.** Branch from a shared prefix N times. Each branch's compute and memory scales with its divergent tokens, not with the prompt length. See the `best-of-n`, `tree-of-thought`, and `graph-of-thought` inferlets.
-- **Sliding window and attention sink.** Drop pages that fall out of the window, keep the sink pages pinned. See the `windowed-attention` and `attention-sink` inferlets.
+- **Parallel candidates and tree search.** Branch from a shared prefix N times. Each branch's compute and memory scales with its divergent tokens, not with the prompt length. See [`consensus-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/consensus-decoding) and [`prefix-tree-kv-cache`](https://github.com/pie-project/pie/tree/main/inferlets/prefix-tree-kv-cache).
+- **Sliding window and attention sink.** Mask positions that fall out of the window while keeping sink positions visible. See [`sliding-window-attention`](https://github.com/pie-project/pie/tree/main/inferlets/sliding-window-attention) and [`attention-sink`](https://github.com/pie-project/pie/tree/main/inferlets/attention-sink).
 - **Resumable sessions.** A named context outlives the inferlet that created it. The next request reattaches by name.
 
 ## Integrated I/O

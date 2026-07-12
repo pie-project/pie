@@ -9,7 +9,7 @@
 
 #include <toml++/toml.hpp>
 
-#include "kv_cache_format.hpp"
+#include "store/kv_cache_format.hpp"
 
 namespace pie_cuda_driver {
 
@@ -17,13 +17,10 @@ struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
-    // Runtime-compiled StorageProgram handoff (weight-loader Variant A). When an
-    // embedded/in-process driver's runtime compiles the checkpoint's storage
-    // program itself, it writes the serialized `bincode` IR to this path and
-    // names it here; the driver deserializes it instead of running its own C++
-    // checkpoint parse + compile (the *locality switch* = path-present). Empty
-    // (standalone / remote / out-of-process) keeps the C++ compile. The bulk
-    // weight bytes never cross this boundary — only the program IR does.
+    // Optional serialized StorageProgram produced by the Rust weight loader.
+    // When absent, the driver invokes that same Rust compiler through FFI;
+    // when present, it deserializes the supplied program. Weight bytes never
+    // cross this boundary.
     std::string storage_program_path;
     // Runtime quantization mode applied during load-plan materialization.
     // Empty (default) = no quantization. Recognised values:
@@ -66,7 +63,7 @@ struct BatchingConfig {
 // in the forward path runs collectives. Embedded TP launches set tp_size,
 // tp_rank, and nccl_unique_id_hex per process. `nccl_unique_id_hex`
 // also acts as the in-process rendezvous key for the startup barrier
-// and per-fire CPU gate (see `entry.cpp::tp_startup_cpu_barrier`).
+// and per-fire CPU gate (see `context.cpp::tp_startup_cpu_barrier`).
 struct DistributedConfig {
     int tp_size = 1;
     int tp_rank = 0;

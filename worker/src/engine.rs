@@ -343,7 +343,7 @@ async fn boot_engine(
         let mut group_drivers: Vec<GroupDriver> = Vec::with_capacity(topology.len());
 
         for (group_idx, group) in topology.iter().enumerate() {
-            let created = create_native_group(
+            let created = create_driver_group(
                 m,
                 group_idx,
                 group,
@@ -543,7 +543,7 @@ async fn assemble_distributed<C: ControlLink>(
     Ok((EdgeServer::GatewayLinks(dialed), control_tasks, worker_id))
 }
 
-fn create_native_group(
+fn create_driver_group(
     m: &config::ModelConfig,
     group_idx: usize,
     group: &[usize],
@@ -557,7 +557,7 @@ fn create_native_group(
         if flavor == Flavor::Cuda && tp_degree > 1 {
             let rank_opts = cuda_rank_options(m, group_idx, group, base_opts)?;
             let tp_launches = crate::embedded_driver::tp_launches(rank_opts.len())?;
-            return crate::embedded_driver::create_native_driver_group(
+            return crate::embedded_driver::create_driver_backend_group(
                 &rank_opts,
                 snapshot_dir,
                 group_idx,
@@ -584,7 +584,7 @@ fn create_native_group(
     let device = group_driver(m, group_idx, first_driver_idx)?;
     let opts = embedded_opts_for_device(base_opts, device);
 
-    crate::embedded_driver::create_native_driver(&opts, snapshot_dir, group_idx, None)
+    crate::embedded_driver::create_driver_backend(&opts, snapshot_dir, group_idx, None)
         .with_context(|| format!("creating driver for model {:?} group {group_idx}", m.name,))
 }
 

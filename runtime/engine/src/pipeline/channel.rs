@@ -92,9 +92,12 @@ pub struct ChannelCell {
     writer_tail: u64,
     /// Device-produced cells awaiting host `take`/`read`, FIFO, dtype-native.
     produced: VecDeque<Vec<u8>>,
-    reader_reserved_tail: u64,
+    /// Logical device-ring sequences assigned to submitted fires. These are
+    /// immutable tickets, not availability projections.
+    device_reserved_head: u64,
+    device_reserved_tail: u64,
     /// Direct driver-owned mirror endpoints for every pass that binds this
-    /// Reader channel. Completion publishes each endpoint's visible tail; the
+    /// Reader channel. Submission completion publishes each endpoint's visible tail; the
     /// guest host operation copies only then.
     reader: Option<ReaderMirror>,
     /// `Some(reason)` once a fire that feeds this channel failed: every later
@@ -187,7 +190,8 @@ impl ChannelCell {
             staged: VecDeque::new(),
             writer_tail: 0,
             produced: VecDeque::new(),
-            reader_reserved_tail: 0,
+            device_reserved_head: 0,
+            device_reserved_tail: 0,
             reader: None,
             poisoned: None,
         }
@@ -265,6 +269,13 @@ impl ChannelCell {
     }
 
     pub fn bind(&mut self, decl: &ChannelDecl) {
+        if self.attachments.is_empty() {
+            self.device_reserved_head = 0;
+            self.device_reserved_tail = u64::from(decl.seeded);
+            if decl.seeded && decl.host_role == HostRole::Writer {
+                self.writer_tail = 1;
+            }
+        }
         self.role = Some(decl.host_role);
         self.seeded = decl.seeded;
         self.declared_dtype = Some(decl.dtype);
@@ -295,6 +306,35 @@ impl ChannelCell {
 
     pub fn endpoint(&self) -> Option<Arc<ChannelEndpoint>> {
         self.endpoint.clone()
+    }
+
+    pub fn reserve_device_ticket(&mut self, consume: bool, publish: bool) -> (u64, u64) {
+        let expected_head = if consume {
+            let expected = self.device_reserved_head;
+            self.device_reserved_head += 1;
+            expected
+        } else {
+            crate::driver::command::CHANNEL_TICKET_NONE
+        };
+        let expected_tail = if publish {
+            let expected = self.device_reserved_tail;
+            self.device_reserved_tail += 1;
+            expected
+        } else {
+            crate::driver::command::CHANNEL_TICKET_NONE
+        };
+        (expected_head, expected_tail)
+    }
+
+    pub fn rollback_device_ticket(&mut self, expected_head: u64, expected_tail: u64) {
+        if expected_tail != crate::driver::command::CHANNEL_TICKET_NONE {
+            debug_assert_eq!(self.device_reserved_tail, expected_tail + 1);
+            self.device_reserved_tail = expected_tail;
+        }
+        if expected_head != crate::driver::command::CHANNEL_TICKET_NONE {
+            debug_assert_eq!(self.device_reserved_head, expected_head + 1);
+            self.device_reserved_head = expected_head;
+        }
     }
 
     pub fn reader_wait_state(&self) -> Option<(Arc<ChannelEndpoint>, u64)> {
@@ -665,7 +705,6 @@ impl ChannelCell {
                 }
             }
         }
-        self.reader_reserved_tail = self.reader_reserved_tail.max(visible_tail);
         if let Some(reason) = poison_reason {
             self.poison(&reason);
         }
@@ -715,44 +754,6 @@ pub fn staged_put_bytes(cell: &Arc<Mutex<ChannelCell>>) -> Option<Vec<u8>> {
         return None;
     }
     c.staged.front().cloned()
-}
-
-pub fn reserve_reader_capacity(cells: &BoundCells) -> Result<(), ChannelError> {
-    let mut reserved: Vec<Arc<Mutex<ChannelCell>>> = Vec::new();
-    for cell_arc in cells {
-        let mut cell = cell_arc.lock().unwrap();
-        if cell.role != Some(HostRole::Reader) {
-            continue;
-        }
-        let Some(endpoint) = &cell.endpoint else {
-            for prior in reserved {
-                prior.lock().unwrap().reader_reserved_tail -= 1;
-            }
-            return Err(ChannelError::Closed);
-        };
-        let binding = endpoint.registered().binding;
-        let head = load_word(binding.word_base, binding.head_word_index as usize);
-        if cell.reader_reserved_tail.saturating_sub(head) >= u64::from(cell.capacity) {
-            drop(cell);
-            for prior in reserved {
-                prior.lock().unwrap().reader_reserved_tail -= 1;
-            }
-            return Err(ChannelError::Full);
-        }
-        cell.reader_reserved_tail += 1;
-        drop(cell);
-        reserved.push(Arc::clone(cell_arc));
-    }
-    Ok(())
-}
-
-pub fn rollback_reader_capacity(cells: &BoundCells) {
-    for cell in cells {
-        let mut cell = cell.lock().unwrap();
-        if cell.role == Some(HostRole::Reader) && cell.reader_reserved_tail != 0 {
-            cell.reader_reserved_tail -= 1;
-        }
-    }
 }
 
 fn load_word(word_base: u64, index: usize) -> u64 {
@@ -875,7 +876,7 @@ mod tests {
 
     /// Plan §14 gates 4/5 over the REAL put path: `ChannelCell::put` writes
     /// the driver-shared ring directly; puts past capacity are `Full`; a
-    /// fire with no put rejects synchronously; a consuming fire publishes
+    /// fire with no put retries without effects; a consuming fire publishes
     /// the head word and notifies the writer wait slot.
     ///
     /// Lives here (not `scheduler::tests`) because it exercises `ChannelCell`
@@ -885,7 +886,7 @@ mod tests {
     /// `scheduler`/`driver`, never the reverse).
     #[tokio::test(flavor = "current_thread")]
     async fn writer_ring_backpressure_wakes_after_a_consuming_fire() -> anyhow::Result<()> {
-        let driver_id = driver::register_native_driver(
+        let driver_id = driver::register_driver_backend(
             DriverSpec {
                 num_kv_pages: 16,
                 limits: SchedulerLimits {
@@ -894,8 +895,11 @@ mod tests {
                     max_page_refs: 64,
                 },
             },
-            crate::driver::NativeDriver::Dummy(crate::driver::DummyLocalDriver::new(
-                DummyDriverOptions::default(),
+            crate::driver::DriverBackend::Dummy(crate::driver::DummyDriver::new(
+                DummyDriverOptions {
+                    callback_delay_ms: 20,
+                    ..DummyDriverOptions::default()
+                },
             )),
         );
         let _scheduler = BatchScheduler::new(
@@ -973,41 +977,8 @@ mod tests {
             .attach_endpoint(Arc::clone(&endpoints[0]))
             .map_err(|error| anyhow::anyhow!(error))?;
 
-        // Gate 5: a fire whose trace takes from the empty writer ring is
-        // rejected synchronously — no epoch, no poison.
-        let rejected = bound.reserve_completion();
-        crate::scheduler::submit_prebuilt_async(
-            dummy_launch(),
-            driver_id,
-            bound.instance_id,
-            Vec::new(),
-            0,
-            rejected.clone(),
-        )?;
-        let err = timeout(Duration::from_secs(5), rejected.clone())
-            .await?
-            .expect_err("a missing put must reject the launch");
-        assert!(
-            err.to_string().contains("no host input"),
-            "unexpected rejection: {err}"
-        );
-        assert_eq!(rejected.target_epoch(), 0, "no epoch consumed");
-
-        // Gate 4: puts fill the shared ring up to capacity, then Full.
-        writer_cell.put(1u32.to_le_bytes().to_vec()).unwrap();
-        writer_cell.put(2u32.to_le_bytes().to_vec()).unwrap();
-        assert_eq!(
-            writer_cell.put(3u32.to_le_bytes().to_vec()).unwrap_err(),
-            ChannelError::Full
-        );
-
-        // A consuming fire commits: the head word publishes and the writer
-        // wait slot is notified — the parked producer wakes and puts again.
-        let waiter = tokio::spawn({
-            let endpoint = Arc::clone(&endpoints[0]);
-            async move { endpoint.wait_for_writer_change(0).await }
-        });
-        tokio::task::yield_now().await;
+        // Submit while empty. The first attempt RETRYs without poison; a put
+        // before the next attempt is the execution-time deadline.
         let completion = bound.reserve_completion();
         crate::scheduler::submit_prebuilt_async(
             dummy_launch(),
@@ -1017,10 +988,30 @@ mod tests {
             0,
             completion.clone(),
         )?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Gate 4: puts fill the shared ring up to capacity, then Full.
+        writer_cell.put(1u32.to_le_bytes().to_vec()).unwrap();
+        writer_cell.put(2u32.to_le_bytes().to_vec()).unwrap();
+        assert_eq!(
+            writer_cell.put(3u32.to_le_bytes().to_vec()).unwrap_err(),
+            ChannelError::Full
+        );
+
+        // The retained logical fire retries and commits: the head word
+        // publishes and the parked producer wakes.
+        let waiter = tokio::spawn({
+            let endpoint = Arc::clone(&endpoints[0]);
+            async move { endpoint.wait_for_writer_change(0).await }
+        });
         timeout(Duration::from_secs(5), waiter)
             .await??
             .expect("writer wake surfaces the new head, not an error");
-        timeout(Duration::from_secs(5), completion).await??;
+        timeout(Duration::from_secs(5), completion.clone()).await??;
+        assert!(
+            completion.target_epoch() > pie_waker::FIRST_COMPLETION_EPOCH,
+            "the empty first attempt must have retried"
+        );
         writer_cell
             .put(3u32.to_le_bytes().to_vec())
             .expect("space released by the consumed entry");

@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include "brle.hpp"
+#include "batch/brle.hpp"
 
 namespace {
 

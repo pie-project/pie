@@ -103,9 +103,8 @@ pub(crate) fn scheduler_handle(driver_id: usize) -> Result<SchedulerHandle> {
 /// distinct-program count), so tracing off costs nothing on the hot path.
 pub(crate) fn sched_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PIE_SCHED_TRACE").is_ok_and(|v| v != "0" && !v.is_empty())
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var("PIE_SCHED_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()))
 }
 
 /// The optional trace sink (`PIE_SCHED_TRACE_FILE`), opened once in append
@@ -207,7 +206,6 @@ pub async fn spawn(
     let mut driver_batch_limits = Vec::with_capacity(driver_indices.len());
     for &driver_idx in driver_indices {
         let info = crate::driver::get_spec(driver_idx)
-            .await
             .unwrap_or_else(|e| panic!("Failed to get driver info for index {driver_idx}: {e}"));
         driver_batch_limits.push(info.scheduler_limits());
     }
@@ -230,6 +228,25 @@ pub async fn spawn(
     Ok(SchedulerShutdownHandle { schedulers })
 }
 
+pub struct PreparedLaunch {
+    pub page_refs: Vec<crate::store::kv::project::PhysicalPageId>,
+    pub last_page_len: u32,
+    pub copy_src: Vec<u32>,
+    pub copy_dst: Vec<u32>,
+}
+
+pub enum LaunchPreparationError {
+    Retry(String),
+    Failed(String),
+}
+
+pub type LaunchPreparation = Box<
+    dyn FnMut(
+            &mut crate::driver::LaunchPlan,
+        ) -> std::result::Result<PreparedLaunch, LaunchPreparationError>
+        + Send,
+>;
+
 pub fn submit_async(
     request: crate::driver::LaunchPlan,
     driver_idx: usize,
@@ -237,15 +254,68 @@ pub fn submit_async(
     physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
     last_page_len: u32,
     pipeline_id: Option<ProcessId>,
-    completion: crate::driver::InstanceCompletion,
+    completion: crate::driver::WorkItemCompletion,
 ) -> Result<()> {
-    scheduler_handle(driver_idx)?.submit_with_identity(
+    submit_async_with_kv_copy(
+        request,
+        driver_idx,
+        instance_id,
+        physical_page_ids,
+        last_page_len,
+        pipeline_id,
+        completion,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn submit_async_deferred(
+    request: crate::driver::LaunchPlan,
+    driver_idx: usize,
+    instance_id: u64,
+    pipeline_id: Option<ProcessId>,
+    completion: crate::driver::WorkItemCompletion,
+    preparation: LaunchPreparation,
+) -> Result<()> {
+    scheduler_handle(driver_idx)?.submit_deferred(
+        request,
+        instance_id,
+        completion,
+        pipeline_id,
+        preparation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn submit_async_with_kv_copy(
+    request: crate::driver::LaunchPlan,
+    driver_idx: usize,
+    instance_id: u64,
+    physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
+    last_page_len: u32,
+    pipeline_id: Option<ProcessId>,
+    completion: crate::driver::WorkItemCompletion,
+    copy_src: Vec<u32>,
+    copy_dst: Vec<u32>,
+) -> Result<()> {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
+        src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_device_ordinal: 0,
+        dst_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_device_ordinal: 0,
+        src_page_ids: copy_src,
+        dst_page_ids: copy_dst,
+        cells: Vec::new(),
+    });
+    scheduler_handle(driver_idx)?.submit_with_identity_and_copy(
         request,
         instance_id,
         completion,
         physical_page_ids,
         last_page_len,
         pipeline_id,
+        prelaunch_copy,
     )
 }
 
@@ -255,14 +325,47 @@ pub fn submit_prebuilt_async(
     instance_id: u64,
     physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
     last_page_len: u32,
-    completion: crate::driver::InstanceCompletion,
+    completion: crate::driver::WorkItemCompletion,
 ) -> Result<()> {
-    scheduler_handle(driver_idx)?.submit_prebuilt(
+    submit_prebuilt_async_with_kv_copy(
+        request,
+        driver_idx,
+        instance_id,
+        physical_page_ids,
+        last_page_len,
+        completion,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn submit_prebuilt_async_with_kv_copy(
+    request: crate::driver::LaunchPlan,
+    driver_idx: usize,
+    instance_id: u64,
+    physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
+    last_page_len: u32,
+    completion: crate::driver::WorkItemCompletion,
+    copy_src: Vec<u32>,
+    copy_dst: Vec<u32>,
+) -> Result<()> {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
+        src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_device_ordinal: 0,
+        dst_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_device_ordinal: 0,
+        src_page_ids: copy_src,
+        dst_page_ids: copy_dst,
+        cells: Vec::new(),
+    });
+    scheduler_handle(driver_idx)?.submit_prebuilt_with_copy(
         request,
         instance_id,
         completion,
         physical_page_ids,
         last_page_len,
+        prelaunch_copy,
     )
 }
 

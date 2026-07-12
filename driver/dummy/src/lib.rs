@@ -10,13 +10,13 @@ use anyhow::{Result, anyhow, bail, ensure};
 use pie_driver_abi::{
     DriverCapabilities, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL, PIE_CHANNEL_DTYPE_F32,
     PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
-    PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieChannelDesc,
-    PieChannelEndpointBinding, PieChannelValueDescSlice, PieCompletion, PieInstanceBinding,
-    PieInstanceDesc, PieKvCopyDesc, PieLaunchDesc, PiePoolResizeDesc, PieProgramDesc,
-    PieRuntimeCallbacks, PieStateCopyDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice,
-    PieU64Slice, validate_channel_desc, validate_completion, validate_instance_desc,
-    validate_kv_copy_desc, validate_launch_desc, validate_pool_resize_desc, validate_program_desc,
-    validate_state_copy_desc,
+    PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_RETRY, PIE_TERMINAL_OUTCOME_SUCCESS,
+    PieBytes, PieChannelDesc, PieChannelEndpointBinding, PieChannelValueDescSlice, PieCompletion,
+    PieInstanceBinding, PieInstanceDesc, PieKvCopyDesc, PieLaunchDesc, PiePoolResizeDesc,
+    PieProgramDesc, PieRuntimeCallbacks, PieStateCopyDesc, PieTerminalCell,
+    PieTerminalCellPtrSlice, PieU32Slice, PieU64Slice, validate_channel_desc, validate_completion,
+    validate_instance_desc, validate_kv_copy_desc, validate_launch_desc, validate_pool_resize_desc,
+    validate_program_desc, validate_state_copy_desc,
 };
 use pie_ptir::container::{self, ExternDir, HostRole};
 use pie_ptir::interp::{
@@ -67,6 +67,7 @@ pub struct DummyDriverOptions {
     pub reject_launches: bool,
     pub reject_launches_remaining: u32,
     pub fail_launches_after_accept: bool,
+    pub retry_launches_remaining: u32,
     pub operation_log: Option<Arc<Mutex<Vec<String>>>>,
     pub launch_observer: Option<LaunchObserver>,
 }
@@ -89,6 +90,7 @@ impl Default for DummyDriverOptions {
             reject_launches: false,
             reject_launches_remaining: 0,
             fail_launches_after_accept: false,
+            retry_launches_remaining: 0,
             operation_log: None,
             launch_observer: None,
         }
@@ -135,13 +137,10 @@ struct DummyEndpoint {
     words: Box<[AtomicU64]>,
     attachments: HashMap<u64, Option<ExternDir>>,
     shared: Option<ExternChannel>,
-    /// Host-writer ring cursors (plan §4.3). `pulled` counts host-published
-    /// ring entries already fed into the interp; `reserved_head` counts ring
-    /// consumes scheduled by accepted fires (the head word publishes to it on
-    /// success); `seed_credit` covers a seeded Writer's bind-time seed, which
-    /// the first consuming fire takes instead of a ring entry.
+    /// Host-writer ring cursor. `pulled` counts host-published ring entries
+    /// already staged into the interpreter; actual head/tail words remain
+    /// commit-predicated and ticket-authoritative.
     pulled: u64,
-    reserved_head: u64,
     seed_credit: bool,
 }
 
@@ -173,19 +172,18 @@ struct OwnedValueDesc {
     bytes: Vec<u8>,
 }
 
-/// One writer-channel consume scheduled for an accepted fire: the dense
-/// channel index and the head-word value to publish when the fire commits.
-#[derive(Clone, Debug)]
-struct ScheduledConsume {
-    dense_channel: usize,
-    target_head: u64,
+#[derive(Clone, Copy, Debug, Default)]
+struct ChannelTicket {
+    expected_head: Option<u64>,
+    expected_tail: Option<u64>,
+    require_input: bool,
 }
 
 #[derive(Debug)]
 struct LaunchInstanceWork {
     instance: Arc<BoundInstanceState>,
     pacing_epoch: u64,
-    writer_consumes: Vec<ScheduledConsume>,
+    tickets: Vec<ChannelTicket>,
     terminal_cell: *mut PieTerminalCell,
 }
 
@@ -220,6 +218,7 @@ pub struct DummyDriver {
     reject_launches: bool,
     reject_launches_remaining: u32,
     fail_launches_after_accept: bool,
+    retry_launches_remaining: u32,
     callback_delay_ms: u64,
     runtime: SendableRuntimeCallbacks,
     callback_workers: Vec<std::thread::JoinHandle<()>>,
@@ -273,6 +272,7 @@ impl DummyDriver {
             reject_launches: options.reject_launches,
             reject_launches_remaining: options.reject_launches_remaining,
             fail_launches_after_accept: options.fail_launches_after_accept,
+            retry_launches_remaining: options.retry_launches_remaining,
             callback_delay_ms: options.callback_delay_ms,
             runtime,
             callback_workers: Vec::new(),
@@ -421,7 +421,6 @@ impl DummyDriver {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             pulled: 0,
-            reserved_head: 0,
             seed_credit: desc.seeded != 0
                 && desc.host_role == pie_driver_abi::PIE_CHANNEL_HOST_ROLE_WRITER,
             attachments: HashMap::new(),
@@ -583,6 +582,14 @@ impl DummyDriver {
                 &bytes,
             )?;
         }
+        for (dense, _) in &seeds {
+            let role = program.bound.container.channels[*dense as usize].host_role;
+            let mut endpoint = endpoints[*dense as usize].lock().unwrap();
+            endpoint.words[1].store(1, Ordering::Release);
+            if role == HostRole::Writer {
+                endpoint.pulled = 1;
+            }
+        }
         for (dense, endpoint) in endpoints.iter().enumerate() {
             let extern_dir = program
                 .bound
@@ -618,6 +625,12 @@ impl DummyDriver {
         ));
         let instance_ids = copy_u64_slice(desc.instance_ids, "launch.instance_ids")?;
         let terminal_cells = copy_terminal_cell_ptrs(desc.terminal_cells)?;
+        let ticket_heads =
+            copy_u64_slice(desc.channel_expected_head, "launch.channel_expected_head")?;
+        let ticket_tails =
+            copy_u64_slice(desc.channel_expected_tail, "launch.channel_expected_tail")?;
+        let ticket_indptr =
+            copy_u32_slice(desc.channel_ticket_indptr, "launch.channel_ticket_indptr")?;
         ensure!(
             !instance_ids.is_empty(),
             "launch requires at least one bound instance"
@@ -662,77 +675,37 @@ impl DummyDriver {
             .collect::<Result<Vec<_>>>()?;
         drop(state);
 
-        // §4.3: pull host-published writer ring entries into the interp, then
-        // validate availability for every launched instance BEFORE accepting
-        // anything — a missing put is a guest ordering bug and rejects the
-        // launch synchronously (no epoch consumed, no poison published).
-        let mut prepared = Vec::with_capacity(instances.len());
-        let mut planned_extra: HashMap<usize, u64> = HashMap::new();
-        let mut planned_seed_spend: HashSet<usize> = HashSet::new();
-        for (slot, instance) in instances.iter().enumerate() {
-            let mut inner = instance.inner.lock().unwrap();
-            ensure!(!inner.closed, "instance {} is closed", instance.instance_id);
-            let program = Arc::clone(&instance.program);
-            let mut consumes = Vec::new();
-            for dense in 0..inner.channels.len() {
-                let channel = inner.channels[dense].clone();
-                if channel.host_role != HostRole::Writer {
-                    continue;
-                }
-                pull_writer_ring(&mut inner, &program, dense, &channel)?;
-                if !fire_takes_channel(&program.bound, dense as u32) {
-                    continue;
-                }
-                let endpoint_key = Arc::as_ptr(&channel.endpoint) as usize;
-                let endpoint = channel.endpoint.lock().unwrap();
-                let tail = endpoint.words[1].load(Ordering::Acquire);
-                let extra = planned_extra.entry(endpoint_key).or_insert(0);
-                let credit =
-                    u64::from(endpoint.seed_credit && !planned_seed_spend.contains(&endpoint_key));
-                if tail.saturating_sub(endpoint.reserved_head + *extra) + credit < 1 {
-                    bail!(
-                        "channel {} has no host input for this fire \
-                         (put must happen before submit)",
-                        channel.global_id
-                    );
-                }
-                if credit == 1 {
-                    planned_seed_spend.insert(endpoint_key);
-                    consumes.push(ScheduledConsume {
-                        dense_channel: dense,
-                        target_head: endpoint.reserved_head + *extra,
-                    });
-                } else {
-                    *extra += 1;
-                    consumes.push(ScheduledConsume {
-                        dense_channel: dense,
-                        target_head: endpoint.reserved_head + *extra,
-                    });
-                }
+        if self.retry_launches_remaining != 0 {
+            self.retry_launches_remaining -= 1;
+            let callback = self.prepare_callback(completion)?;
+            for (instance, terminal_cell) in instances.iter().zip(&terminal_cells) {
+                instance.inner.lock().unwrap().next_pacing_epoch += 1;
+                publish_terminal(*terminal_cell, PIE_TERMINAL_OUTCOME_RETRY);
             }
+            self.publish_callback(callback, completion);
+            return Ok(());
+        }
+
+        let mut prepared = Vec::with_capacity(instances.len());
+        for (slot, instance) in instances.iter().enumerate() {
+            let inner = instance.inner.lock().unwrap();
+            ensure!(!inner.closed, "instance {} is closed", instance.instance_id);
+            let tickets = launch_tickets(
+                &inner,
+                &instance.program,
+                slot,
+                &ticket_heads,
+                &ticket_tails,
+                &ticket_indptr,
+            )?;
             let pacing_epoch = inner.next_pacing_epoch;
             drop(inner);
             prepared.push(LaunchInstanceWork {
                 instance: Arc::clone(instance),
                 pacing_epoch,
-                writer_consumes: consumes,
+                tickets,
                 terminal_cell: terminal_cells[slot],
             });
-        }
-        // Every member validated — commit the scheduled reservations.
-        for work in &prepared {
-            let inner = work.instance.inner.lock().unwrap();
-            for consume in &work.writer_consumes {
-                let mut endpoint = inner.channels[consume.dense_channel]
-                    .endpoint
-                    .lock()
-                    .unwrap();
-                if endpoint.seed_credit && consume.target_head == endpoint.reserved_head {
-                    endpoint.seed_credit = false;
-                } else {
-                    endpoint.reserved_head = consume.target_head;
-                }
-            }
         }
 
         let callback = self.prepare_callback(completion)?;
@@ -895,21 +868,46 @@ impl Drop for DummyDriver {
     }
 }
 
+enum InstanceStepResult {
+    Committed(Vec<(u64, u64)>),
+    Retry,
+}
+
 fn process_launch_instance(instance: &LaunchInstanceWork) -> LaunchInstanceResult {
     let mut notify_waits = Vec::new();
     let outcome = {
         let mut inner = instance.instance.inner.lock().unwrap();
+        if !tickets_ready(&inner, &instance.tickets) {
+            return LaunchInstanceResult {
+                outcome: PIE_TERMINAL_OUTCOME_RETRY,
+                notifications: Vec::new(),
+            };
+        }
+        for dense in 0..inner.channels.len() {
+            let channel = inner.channels[dense].clone();
+            if channel.host_role == HostRole::Writer
+                && let Err(err) =
+                    pull_writer_ring(&mut inner, &instance.instance.program, dense, &channel)
+            {
+                poison_instance(&mut inner, &mut notify_waits, &err.to_string());
+                return LaunchInstanceResult {
+                    outcome: PIE_TERMINAL_OUTCOME_FAILED,
+                    notifications: notify_waits,
+                };
+            }
+        }
         let outcome = match run_instance_step(
             &mut inner,
             &instance.instance.program,
             instance.instance.instance_id,
             instance.pacing_epoch,
-            &instance.writer_consumes,
+            &instance.tickets,
         ) {
-            Ok(reader_epochs) => {
+            Ok(InstanceStepResult::Committed(reader_epochs)) => {
                 notify_waits.extend(reader_epochs);
                 PIE_TERMINAL_OUTCOME_SUCCESS
             }
+            Ok(InstanceStepResult::Retry) => PIE_TERMINAL_OUTCOME_RETRY,
             Err(err) => {
                 eprintln!(
                     "[pie-driver-dummy] instance {} launch failed: {err:#}",
@@ -969,6 +967,102 @@ fn fire_takes_channel(bound: &BoundTrace, dense: u32) -> bool {
     stage_take || port_take
 }
 
+fn fire_puts_channel(bound: &BoundTrace, dense: u32) -> bool {
+    bound.container.stages.iter().any(|stage| {
+        stage
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::ChanPut { chan, .. } if *chan == dense))
+    })
+}
+
+fn fire_requires_channel_input(bound: &BoundTrace, dense: u32) -> bool {
+    if bound
+        .container
+        .ports
+        .iter()
+        .any(|binding| matches!(binding.source, container::PortSource::Channel(c) if c == dense))
+    {
+        return true;
+    }
+    for stage in &bound.container.stages {
+        for op in &stage.ops {
+            match *op {
+                Op::ChanPut { chan, .. } if chan == dense => return false,
+                Op::ChanTake(chan) | Op::ChanRead(chan) if chan == dense => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+fn launch_tickets(
+    inner: &BoundInstanceInner,
+    program: &DummyProgram,
+    program_index: usize,
+    heads: &[u64],
+    tails: &[u64],
+    indptr: &[u32],
+) -> Result<Vec<ChannelTicket>> {
+    if !heads.is_empty() || !tails.is_empty() {
+        ensure!(
+            indptr.len() > program_index + 1,
+            "channel tickets require a per-program CSR"
+        );
+        let lo = indptr[program_index] as usize;
+        let hi = indptr[program_index + 1] as usize;
+        ensure!(
+            hi - lo == inner.channels.len(),
+            "channel ticket segment length {} does not match instance channel count {}",
+            hi - lo,
+            inner.channels.len()
+        );
+        return Ok(heads[lo..hi]
+            .iter()
+            .zip(&tails[lo..hi])
+            .enumerate()
+            .map(|(dense, (&head, &tail))| ChannelTicket {
+                expected_head: (head != u64::MAX).then_some(head),
+                expected_tail: (tail != u64::MAX).then_some(tail),
+                require_input: fire_requires_channel_input(&program.bound, dense as u32),
+            })
+            .collect());
+    }
+
+    Ok(inner
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(dense, channel)| {
+            let endpoint = channel.endpoint.lock().unwrap();
+            let consume = fire_takes_channel(&program.bound, dense as u32);
+            let publish = fire_puts_channel(&program.bound, dense as u32);
+            ChannelTicket {
+                expected_head: consume.then(|| endpoint.words[0].load(Ordering::Acquire)),
+                expected_tail: publish.then(|| endpoint.words[1].load(Ordering::Acquire)),
+                require_input: fire_requires_channel_input(&program.bound, dense as u32),
+            }
+        })
+        .collect())
+}
+
+fn tickets_ready(inner: &BoundInstanceInner, tickets: &[ChannelTicket]) -> bool {
+    inner.channels.iter().zip(tickets).all(|(channel, ticket)| {
+        let endpoint = channel.endpoint.lock().unwrap();
+        let head = endpoint.words[0].load(Ordering::Acquire);
+        let tail = endpoint.words[1].load(Ordering::Acquire);
+        let consume_ready = ticket.expected_head.is_none_or(|expected| head == expected)
+            && (!ticket.require_input || tail > head);
+        let publish_ready = ticket.expected_tail.is_none_or(|expected| {
+            let same_fire_consume = u64::from(ticket.expected_head.is_some());
+            tail == expected
+                && tail.saturating_sub(head) < u64::from(endpoint.capacity) + same_fire_consume
+        });
+        consume_ready && publish_ready
+    })
+}
+
 /// §4.3 driver pull: move host-published writer-ring entries (mirror cells up
 /// to the release-published tail word) into the interp's channel queue,
 /// advancing the endpoint's `pulled` cursor. Interp backpressure leaves the
@@ -1014,8 +1108,8 @@ fn run_instance_step(
     program: &DummyProgram,
     instance_id: u64,
     pacing_epoch: u64,
-    writer_consumes: &[ScheduledConsume],
-) -> Result<Vec<(u64, u64)>> {
+    tickets: &[ChannelTicket],
+) -> Result<InstanceStepResult> {
     let mut notify_waits = Vec::new();
     let pass_inputs = build_pass_inputs(
         &program.intrinsics,
@@ -1029,25 +1123,26 @@ fn run_instance_step(
         .step(&program.bound, &pass_inputs, &mut NoKernels)
         .map_err(|err| anyhow!("interp step failed: {}", format_step_error(&err)))?;
     if !report.committed {
-        bail!(
-            "accepted launch missed its readiness invariant{}",
-            report
-                .missed
-                .map(|(channel, phase)| format!(" at channel {channel}, phase {phase:?}"))
-                .unwrap_or_default()
-        );
+        return Ok(InstanceStepResult::Retry);
     }
-    // §4.4: publish the consumed head word per writer channel (release), then
-    // notify its writer wait slot with the new head — space became available.
-    for consume in writer_consumes {
-        let endpoint = inner.channels[consume.dense_channel]
-            .endpoint
-            .lock()
-            .unwrap();
-        let previous = endpoint.words[0].load(Ordering::Acquire);
-        if consume.target_head > previous {
-            endpoint.words[0].store(consume.target_head, Ordering::Release);
-            notify_waits.push((endpoint.writer_wait_id, consume.target_head));
+
+    for (dense, ticket) in tickets.iter().enumerate() {
+        let channel = &inner.channels[dense];
+        let mut endpoint = channel.endpoint.lock().unwrap();
+        if fire_takes_channel(&program.bound, dense as u32) && endpoint.seed_credit {
+            endpoint.seed_credit = false;
+        }
+        if let Some(expected) = ticket.expected_head {
+            let next = expected + 1;
+            endpoint.words[0].store(next, Ordering::Release);
+            if channel.host_role == HostRole::Writer {
+                notify_waits.push((endpoint.writer_wait_id, next));
+            }
+        }
+        if let Some(expected) = ticket.expected_tail
+            && channel.host_role == HostRole::None
+        {
+            endpoint.words[1].store(expected + 1, Ordering::Release);
         }
     }
 
@@ -1073,7 +1168,7 @@ fn run_instance_step(
             }
         }
     }
-    Ok(notify_waits)
+    Ok(InstanceStepResult::Committed(notify_waits))
 }
 
 fn poison_instance(

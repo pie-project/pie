@@ -33,7 +33,7 @@ async def main():
         # Launch an inferlet from the registry. JSON input becomes the
         # inferlet's typed `Input` struct.
         process = await client.launch_process(
-            "text-completion@0.1.0",
+            "chat-completion@0.1.0",
             input={"prompt": "Hello world", "max_tokens": 64},
         )
 

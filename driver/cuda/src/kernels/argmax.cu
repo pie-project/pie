@@ -1085,6 +1085,20 @@ void launch_argmax_bf16_tile_pair(
     }
 }
 
+void launch_select_global_argmax_pairs(
+    const std::uint64_t* pairs,
+    std::int32_t* token_ids,
+    int num_rows,
+    int num_parts,
+    cudaStream_t stream)
+{
+    if (num_rows <= 0 || num_parts <= 0) return;
+    dim3 block(128);
+    dim3 grid((num_rows + block.x - 1) / block.x);
+    select_lm_head_argmax_pairs_kernel<<<grid, block, 0, stream>>>(
+        pairs, token_ids, num_rows, num_parts);
+}
+
 void launch_masked_embedding_argmax_bf16(
     const void* centroid_logits,
     const void* hidden_states,

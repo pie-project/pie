@@ -1,5 +1,9 @@
 #pragma once
 
+// loader/: snapshot -> WeightStore. `CheckpointSource` is the abstract read
+// side (implemented by `safetensors.{hpp,cpp}`); the Rust-planned storage
+// executor writes the result into a `WeightStore` (`model/weight_store.hpp`).
+
 #include <cstdint>
 #include <filesystem>
 #include <string>

@@ -1,0 +1,17 @@
+[package]
+name = "mirostat-v2-sampling"
+version = "0.1.0"
+description = "Mirostat v2 adaptive-surprise sampling"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+tau = {type = "float", optional = true, description = "Target surprise in nats (default: 3.0)"}
+learning_rate = {type = "float", optional = true, description = "Control learning rate (default: 0.6)"}
+mu0 = {type = "float", optional = true, description = "Initial Mirostat control value"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 64)"}
+k_min = {type = "int", optional = true, description = "Minimum retained-token floor (default: 8)"}
+floor = {type = "string", optional = true, description = "Floor mode: argmax, rank, or plain (default: argmax)"}

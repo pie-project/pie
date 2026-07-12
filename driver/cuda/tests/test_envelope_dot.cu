@@ -1,4 +1,4 @@
-// PTIR M3.2 — Quest envelope kernels: correctness vs the CPU golden.
+// Quest envelope kernels: correctness vs the CPU golden.
 //
 // The CPU references here MIRROR `pie_sampling_ir::eval::envelope_dot_reference`
 // (the canonical golden, verified in `interface/sampling-ir` with the SAME
@@ -6,7 +6,7 @@
 //   1. `envelope_recompute` == per-(page,kv_head,dim) min/max over live keys.
 //   2. `envelope_dot` == Σ_group Σ_dim max(q·min, q·max), −inf beyond live.
 //
-// `#[ignore]`-equivalent: needs a CUDA device. Run in the M3 GPU window.
+// Requires a CUDA device.
 
 #include <cmath>
 #include <cstdint>

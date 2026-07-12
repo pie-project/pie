@@ -1,0 +1,13 @@
+[package]
+name = "mtp-speculative-decoding"
+version = "0.1.0"
+description = "Native multi-token-prediction drafting and target-model verification"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 64)"}
+k = {type = "int", optional = true, description = "MTP draft-window length (default: 4, range: 1-32)"}

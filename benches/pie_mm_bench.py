@@ -17,7 +17,8 @@ Modes (from common.add_mode_subcommands):
 
 Run:
   python pie_mm_bench.py latency --model Qwen/Qwen3-VL-2B-Instruct \
-      --image assets/bench_image.png --requests 16 --max-tokens 128 \
+      --image assets/bench_image.png --inferlet-dir /path/to/image-qa-bench \
+      --requests 16 --max-tokens 128 \
       --json-out out/pie_latency.json
 """
 from __future__ import annotations
@@ -47,14 +48,13 @@ SERVER_SDK = ROOT / "sdk" / "python-server" / "python"
 if str(SERVER_SDK) not in sys.path:
     sys.path.insert(0, str(SERVER_SDK))
 
-BENCH_INFERLET = "image-qa-bench"
 WASM_NAME = "image_qa_bench.wasm"
 
 
-def bench_inferlet_paths() -> tuple[Path, Path, str]:
+def bench_inferlet_paths(inferlet_dir: str) -> tuple[Path, Path, str]:
     import tomllib
 
-    d = ROOT / "inferlets" / BENCH_INFERLET
+    d = Path(inferlet_dir).expanduser().resolve()
     wasm = d / "target" / "wasm32-wasip2" / "release" / WASM_NAME
     manifest = d / "Pie.toml"
     if not wasm.exists():
@@ -239,7 +239,7 @@ async def run(args: argparse.Namespace):
             "return_text": args.dump_first_text,
         }
 
-    wasm, manifest, pkg = bench_inferlet_paths()
+    wasm, manifest, pkg = bench_inferlet_paths(args.inferlet_dir)
     proc, port, drain_task, config_blob = await launch_server(args)
     first_text: list[str | None] = [None]
     sem = asyncio.Semaphore(args.concurrency) if (args.mode == "tput" and args.concurrency > 0) else None
@@ -363,6 +363,8 @@ def main() -> None:
     for sp in parser._subparsers._group_actions[0].choices.values():
         sp.add_argument("--image", default="assets/bench_image.png",
                         help="Local image fed (base64) to every request.")
+        sp.add_argument("--inferlet-dir", required=True,
+                        help="Path to a built image-qa-bench inferlet project.")
         sp.add_argument("--question",
                         default="What is in this image? Answer in one sentence.")
         sp.add_argument("--driver", default="cuda_native")

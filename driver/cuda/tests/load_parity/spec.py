@@ -16,6 +16,34 @@ the expectation from the source by byte-reconstruction, so either kind is checka
 
 Dims are kept TP-safe: every block-FP8 axis (`weight_block_size [128,128]`) that
 the loader shards on is a multiple of 128*tp(=2) so its block count stays even.
+
+Coverage note (cpp-refact.md Phase 5): `qwen3_vl_text` and `gemma4_text` are
+covered above — both text towers reduce to the existing mha/dense composition
+(a plain Qwen3 shape and a PLE/MoE-off Gemma-4 shape respectively). Three
+families do NOT fit this composer without materially extending it, and are
+intentionally left out rather than faked:
+  * `gpt_oss` — its expert tensors are dispatched by NAME PRESENCE, not a
+    config/runtime flag (`model/mixtral/gpt_oss.cpp`'s `has_native_mxfp4_experts`
+    checks only whether `experts.{gate,up,down}_proj.weight` exist, not their
+    dtype), so a synthetic BF16 tensor at those exact names is ambiguous with
+    the packed-MXFP4 native path and would need a fourth generic-loader
+    concept (arch-specific dispatch-by-presence) to model safely.
+  * `nemotron_h` — per-layer type is heterogeneous (mamba / attention / moe
+    from `hybrid_override_pattern`) with SSM tensors (`A_log`, `D`, `dt_bias`,
+    `conv1d.*`) this DSL's `ffn_plan` (FFN-only per layer) has no primitive for.
+  * `gemma3n` — AltUp + Laurel are mandatory (binder throws if
+    `altup_num_inputs<=1` or `laurel_rank<=0`), adding a whole new per-layer
+    tensor family (`altup.*`, `laurel.*`, per-layer-embedding residuals) with
+    no dense/MoE analog to compose from.
+Their gate for this phase is the existing CMake-wired parity/compile targets
+(`gemma4_audio_full_parity`, `gemma4_vision_full_parity(_bf16)`,
+`gemma4_vision_patch_parity`, `qwen3_vl_vision_full_parity` for the
+vision/audio adapters; `csm_backbone_parity` / `csm_depth_decoder_parity` /
+`csm_generate_parity` / `mimi_decoder_full_parity` for `csm`, which isn't a
+causal-LM shape at all and so was never a candidate for this harness).
+`nemotron_h` and `gpt_oss` currently have no dedicated harness; that gap is
+flagged here for a follow-up pass rather than papered over with a recipe that
+would not actually exercise their binder.
 """
 
 from __future__ import annotations
@@ -173,6 +201,13 @@ class Recipe:
     runtime_quant: str = ""      # "" or "mxfp4" (driver flag)
     quant_method: str = ""       # "" or "fp8"  (config.quantization_config)
     tp_engine_ok: bool = True    # False = engine gates tp>1 (linear-attn hybrids)
+    extra_config: dict = field(default_factory=dict)  # verbatim config.json
+                                                        # keys a family needs
+                                                        # that the generic
+                                                        # composer doesn't
+                                                        # already derive
+                                                        # (e.g. gemma4-text's
+                                                        # `layer_types`).
     name: str = ""
 
 
@@ -217,6 +252,7 @@ def _config(r: Recipe) -> dict:
     if r.quant_method == "fp8":
         cfg["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
                                       "weight_block_size": [128, 128]}
+    cfg.update(r.extra_config)
     return cfg
 
 
@@ -271,6 +307,14 @@ def named_recipes() -> dict[str, Recipe]:
         r[mt] = _dense(mt)
     for mt in ("qwen3", "olmo2", "olmo3"):
         r[mt] = _dense(mt, qk_norm=True)
+    r["qwen3_vl_text"] = _dense("qwen3_vl_text", qk_norm=True)  # HF: text tower
+                                                                 # of Qwen3-VL is
+                                                                 # standard Qwen3;
+                                                                 # the vision tower
+                                                                 # is a separate
+                                                                 # adapter this
+                                                                 # harness doesn't
+                                                                 # model.
     for mt in ("qwen3_5", "qwen3_5_text"):
         r[mt] = _dense(mt, qk_norm=True, tp_engine_ok=False)
     r["phi3"] = Recipe("phi3", attn="fused_qkv", ffn_plan=["fused_gate_up"] * 2,
@@ -286,6 +330,14 @@ def named_recipes() -> dict[str, Recipe]:
         r[mt] = _gemma(mt)
     for mt in ("gemma3", "gemma3_text"):
         r[mt] = _gemma(mt, qk_norm=True)
+    # gemma4_text: the dense (non-MoE, no vision/audio) Gemma-4 shape — PLE
+    # (`hidden_size_per_layer_input`) and `enable_moe_block` both default off,
+    # so the binder only needs the standard mha + 4-norm-per-layer tensors
+    # plus `layer_types` (required, but an all-"full_attention" plan keeps
+    # the sliding-window / kv-sharing branches inert for this smoke shape).
+    r["gemma4_text"] = _gemma("gemma4_text", qk_norm=True,
+                              extra_config={"layer_types":
+                                            ["full_attention", "full_attention"]})
     r["glm_moe_dsa"] = _mla("glm_moe_dsa", indexer=True, layers=4, dense=3,
                             gate_bias=True, weight_dtype="F8_E4M3",
                             quant_method="fp8", runtime_quant="mxfp4")

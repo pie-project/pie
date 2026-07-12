@@ -1,6 +1,0 @@
-{
-    "name": "modular-cache-js",
-    "version": "0.1.0",
-    "type": "module",
-    "main": "index.ts"
-}

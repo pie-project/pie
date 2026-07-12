@@ -115,12 +115,12 @@ async def run_test(args) -> int:
 
     script_dir = Path(__file__).parent.resolve()
     repo_root = script_dir.parent.parent.parent
-    wasm_path = (repo_root / "inferlets" / "text-completion" / "target"
-                 / "wasm32-wasip2" / "release" / "text_completion.wasm")
-    manifest_path = repo_root / "inferlets" / "text-completion" / "Pie.toml"
+    wasm_path = (repo_root / "inferlets" / "target"
+                 / "wasm32-wasip2" / "release" / "chat_completion.wasm")
+    manifest_path = repo_root / "inferlets" / "chat-completion" / "Pie.toml"
     if not wasm_path.exists():
-        print(f"text_completion.wasm not built at {wasm_path}")
-        print("Run `cargo build --target wasm32-wasip2 --release` in inferlets/text-completion first.")
+        print(f"chat_completion.wasm not built at {wasm_path}")
+        print("Run `cargo build --target wasm32-wasip2 --release -p chat-completion` in inferlets first.")
         return 2
 
     cfg = Config(

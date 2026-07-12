@@ -18,7 +18,7 @@
 //! `model.type=BPE`, `pre_tokenizer.type=ByteLevel`, empty `merges` → each ASCII byte = 1 token). **Boot-validated**
 //! (booted `bin/worker` → exit 0). The runtime parses the tokenizer at boot unconditionally
 //! (`model::register` → `Tokenizer::from_file`), so it must be valid — this is. The direct-channel
-//! and text-completion inferlets use the fixture's single-byte token range and verify the actual
+//! and chat-completion inferlets use the fixture's single-byte token range and verify the actual
 //! dummy-driver PTIR path.
 
 use std::path::PathBuf;
@@ -99,17 +99,23 @@ fn build_direct_channel_inferlet() -> Result<(PathBuf, PathBuf)> {
     Ok((wasm, manifest))
 }
 
-fn build_text_completion_inferlet() -> Result<(PathBuf, PathBuf)> {
-    let crate_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../inferlets/text-completion");
+fn build_chat_completion_inferlet() -> Result<(PathBuf, PathBuf)> {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../inferlets");
+    let crate_dir = workspace.join("chat-completion");
     let status = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2"])
-        .current_dir(&crate_dir)
+        .args([
+            "build",
+            "--target",
+            "wasm32-wasip2",
+            "-p",
+            "chat-completion",
+        ])
+        .current_dir(&workspace)
         .status()
-        .context("build text-completion inferlet")?;
-    anyhow::ensure!(status.success(), "text-completion build failed");
+        .context("build chat-completion inferlet")?;
+    anyhow::ensure!(status.success(), "chat-completion build failed");
 
-    let wasm = crate_dir.join("target/wasm32-wasip2/debug/text_completion.wasm");
+    let wasm = workspace.join("target/wasm32-wasip2/debug/chat_completion.wasm");
     let manifest = crate_dir.join("Pie.toml");
     anyhow::ensure!(wasm.exists(), "missing inferlet wasm: {}", wasm.display());
     Ok((wasm, manifest))
@@ -124,7 +130,7 @@ fn build_text_completion_inferlet() -> Result<(PathBuf, PathBuf)> {
 /// production inferlet runs prefill and decode against synthetic logits and returns decoded text.
 /// Then shuts down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn standalone_runs_ping_direct_ffi_and_text_completion_then_shuts_down() -> Result<()> {
+async fn standalone_runs_ping_direct_ffi_and_chat_completion_then_shuts_down() -> Result<()> {
     let pie = boot().await?;
 
     // (1) Tier-1: three planes co-reside, worker dialed in, both ephemeral loopback addrs resolved.
@@ -205,16 +211,16 @@ async fn standalone_runs_ping_direct_ffi_and_text_completion_then_shuts_down() -
     assert_eq!(result, "value=42");
     drop(process);
 
-    // (4) Run the production text-completion inferlet. Dummy logits are synthetic, so only
+    // (4) Run the production chat-completion inferlet. Dummy logits are synthetic, so only
     // execution and non-empty decoding are meaningful; coherence belongs to real-driver tests.
-    let (wasm, manifest) = build_text_completion_inferlet()?;
+    let (wasm, manifest) = build_chat_completion_inferlet()?;
     tokio::time::timeout(
         Duration::from_secs(30),
         client.add_program(&wasm, &manifest, true),
     )
     .await
-    .context("text-completion upload timed out")?
-    .context("upload text-completion")?;
+    .context("chat-completion upload timed out")?
+    .context("upload chat-completion")?;
     let input = serde_json::json!({
         "prompt": "Say hello.",
         "system": "Answer briefly.",
@@ -225,20 +231,20 @@ async fn standalone_runs_ping_direct_ffi_and_text_completion_then_shuts_down() -
     .to_string();
     let mut process = tokio::time::timeout(
         Duration::from_secs(20),
-        client.launch_process("text-completion@0.2.15".into(), input, true),
+        client.launch_process("chat-completion@0.1.0".into(), input, true),
     )
     .await
-    .context("text-completion launch timed out")?
-    .context("launch text-completion")?;
+    .context("chat-completion launch timed out")?
+    .context("launch chat-completion")?;
     let completion = tokio::time::timeout(Duration::from_secs(30), process.wait_for_return())
         .await
-        .context("text-completion timed out")?
-        .context("wait for text-completion")?;
+        .context("chat-completion timed out")?
+        .context("wait for chat-completion")?;
     anyhow::ensure!(
         !completion.is_empty(),
-        "Dummy text-completion returned no decoded text"
+        "Dummy chat-completion returned no decoded text"
     );
-    eprintln!("[dummy-text-completion] returned: {completion:?}");
+    eprintln!("[dummy-chat-completion] returned: {completion:?}");
 
     drop(process);
     drop(client);

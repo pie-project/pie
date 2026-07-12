@@ -1697,7 +1697,7 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
         bh_state[j] = __floats2bfloat162_rn(s0, s1);
     }
 
-    // COMMIT-LEN-GATED rounding (charlie, verified on the 4090): the SAME kernel
+    // COMMIT-LEN-GATED rounding (verified on the 4090): the SAME kernel
     // serves two ops with DIFFERENT bit-exactness references:
     //   * commit_len == nullptr (plain PREFILL, K=0 & K=2 initial): fold N fresh
     //     tokens into a reset state. The HF reference (T0 GDN_GOLDEN) matches the
@@ -1705,7 +1705,7 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
     //     warp-tiled-bug signature). So plain prefill KEEPS double-round.
     //   * commit_len != nullptr (COMMIT-ADVANCE replay [input|accepted]): must
     //     bit-match the K=0 decode-step kernel (single bf16 round/token) so the
-    //     spec-verify is lossless → SINGLE-round (fixes T1 K=0==K=2). bravo's fix.
+    //     spec-verify is lossless → SINGLE-round (fixes T1 K=0==K=2).
     // Verified: gating → T0 HF-exact (golden) AND T1 K=0==K=2 both green; ungated
     // single-round gave T1 green but T0 red (both glitch); double-round-only gave
     // T0 green but T1 red. (:1625 is shared prefill+commit-advance.)

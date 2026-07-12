@@ -39,10 +39,10 @@ Normative references:
 - Semantics oracle: `interface/ptir/src/interp.rs` (the tier-0 golden model).
   Every observable behavior (argmax tie-break, sort order, splitmix64 RNG,
   readiness, pass-atomic commit) is pinned there and in `PTIR-CONTAINER.md`.
-- ABI: `interface/driver/include/pie_driver_abi.h` (v2). The engine-side FFI
-  for Metal is complete (`runtime/engine/src/driver/ffi/metal.rs` marshals
-  all eleven entry points), so **no runtime/engine changes are required by
-  this plan** except test enablement.
+- ABI: `interface/driver/include/pie_driver_abi.h` (v2). The engine-side backend
+  adapter for Metal is complete (`runtime/engine/src/driver/backend/metal.rs`
+  marshals all eleven entry points), so **no runtime/engine changes are
+  required by this plan** except test enablement.
 
 ## 2. Current state (anchors)
 
@@ -334,7 +334,7 @@ Per phase, in addition to "previous gates stay green":
   `RawMetalDecoder::argmax()`.
 - G1.3 E2E on a Mac: `bin/pie` boot with `driver-metal`, run the migrated
   `generate` / `lowlevel-chat` inferlets (the `inferlet::ptir` guests from
-  the SDK migration) to completion. Mirror of `cuda_text_completion_e2e.rs`.
+  the SDK migration) to completion. Mirror of `cuda_chat_completion_e2e.rs`.
 - G1.4 Dummy-vs-Metal determinism: identical program + seeds + injected
   logits → identical channel outputs (runs in CI without a GPU by faking
   the executor behind a test seam).

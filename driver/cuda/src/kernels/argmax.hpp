@@ -64,6 +64,14 @@ void launch_argmax_bf16_tile_pair(
     int token_offset,
     cudaStream_t stream);
 
+// Select the global token from rank/tile-major packed (value, token) pairs.
+void launch_select_global_argmax_pairs(
+    const std::uint64_t* pairs,
+    std::int32_t* token_ids,
+    int num_rows,
+    int num_parts,
+    cudaStream_t stream);
+
 // Gemma4 MTP ordered-embedding argmax. The assistant first selects top
 // centroids, then scores only the tokens assigned to those centroids.
 void launch_masked_embedding_argmax_bf16(

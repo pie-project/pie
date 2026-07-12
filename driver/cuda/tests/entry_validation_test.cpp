@@ -2,7 +2,8 @@
 #include <cstdio>
 #include <limits>
 
-#include "entry.hpp"
+#include <pie_driver_abi.h>
+
 #include "entry_validation.hpp"
 #include "pie_native/ptir/fire_geometry.hpp"
 

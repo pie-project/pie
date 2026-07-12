@@ -48,6 +48,8 @@ jobs:
   # downward). Pure text check (no Rust build needed), so it's the cheapest
   # possible guard against a layer re-importing something above it. Also
   # confirms the legacy `ptir`/`api`/`inference` module paths never come back.
+  # Same job also carries the Metal and CUDA driver structural gates (source
+  # layout + include layering); neither needs a GPU or toolchain to run.
   engine-layering-gate:
     name: pie-engine layering gate
     runs-on: ubuntu-latest
@@ -59,6 +61,9 @@ jobs:
 
       - name: Enforce Metal driver source layout
         run: ./scripts/check-metal-driver-layout.sh
+
+      - name: Enforce CUDA driver source layout
+        run: ./driver/cuda/check-structure.sh
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a
@@ -284,9 +289,7 @@ jobs:
 
   # Cuda build — runs only when an opt-in label or schedule fires
   # (no CUDA on the default GH-hosted runners). Add a self-hosted
-  # runner with a CUDA toolkit to enable this. Until then, M3's
-  # static-link spike + manual M4 verification are the canonical
-  # checkpoints.
+  # runner with a CUDA toolkit to enable this.
   pie-worker-cuda:
     name: pie-worker (driver-cuda)
     runs-on: [self-hosted, cuda]

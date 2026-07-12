@@ -31,7 +31,7 @@ await client.connect();
 await client.authByToken(process.env.PIE_TOKEN);
 
 const proc = await client.launchProcess(
-  "text-completion@0.1.0",
+  "chat-completion@0.1.0",
   { prompt: "Hello", max_tokens: 64 },
 );
 

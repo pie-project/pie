@@ -34,7 +34,6 @@ if str(SERVER_SDK) not in sys.path:
     sys.path.insert(0, str(SERVER_SDK))
 
 
-BENCH_INFERLET = "text-completion-bench"
 EMBEDDED_CLI_DRIVERS: set[str] = {
     "cuda_native",
     "dummy",
@@ -55,8 +54,13 @@ KV_CACHE_DTYPES = [
 ]
 
 
-def bench_inferlet_paths() -> tuple[Path, Path, str]:
-    inferlet_dir = ROOT / "inferlets" / BENCH_INFERLET
+def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
+    if not inferlet_dir:
+        raise FileNotFoundError(
+            "text-completion-bench is not part of the curated inferlets; pass "
+            "--inferlet-dir or set PIE_BENCH_INFERLET_DIR"
+        )
+    inferlet_dir = Path(inferlet_dir).expanduser().resolve()
     wasm = (
         inferlet_dir / "target" / "wasm32-wasip2" / "release"
         / "text_completion_bench.wasm"
@@ -408,7 +412,7 @@ async def run(args: argparse.Namespace):
         prompt_token_ids, _ = hf_chat_token_ids_and_counts(
             args.model, args.system, prompts
         )
-    wasm, manifest, pkg = bench_inferlet_paths()
+    wasm, manifest, pkg = bench_inferlet_paths(args.inferlet_dir)
 
     async with pie_client(args) as (client, engine_config):
         await client.install_program(wasm, manifest, force_overwrite=True)
@@ -717,6 +721,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Pie canonical latency/throughput benchmark")
     add_mode_subcommands(p)
     for sp in p._subparsers._group_actions[0].choices.values():
+        sp.add_argument(
+            "--inferlet-dir",
+            default=os.environ.get("PIE_BENCH_INFERLET_DIR"),
+            help="Path to a built text-completion-bench inferlet project "
+                 "(or set PIE_BENCH_INFERLET_DIR).",
+        )
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--driver", default="cuda_native",
                         choices=["cuda_native", "vllm", "sglang", "tensorrt_llm", "dummy"])

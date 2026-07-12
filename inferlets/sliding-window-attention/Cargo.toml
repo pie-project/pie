@@ -1,0 +1,11 @@
+[package]
+name = "sliding-window-attention"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet = { path = "../../sdk/rust/inferlet" }
+serde = { version = "1.0", features = ["derive"] }

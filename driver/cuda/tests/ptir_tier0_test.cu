@@ -1,8 +1,8 @@
-// PTIR tier-0 kernel parity test (charlie, thrust-3 P4.2 milestone M-A/M-B).
+// PTIR tier-0 kernel parity test.
 //
 // Runs every tier-0 op kernel (tier0_kernels.cuh) on the live GPU and diffs the
 // result against the host reference evaluator (host_eval.hpp). This is the
-// self-check gate that must hold before diffing against echo's canonical golden
+// self-check gate that must hold before diffing against the canonical golden
 // vectors. Standalone: compiled directly by nvcc, no driver-lib dependency.
 //
 //   nvcc -std=c++17 -I../src tests/ptir_tier0_test.cu -o ptir_tier0_test && ./ptir_tier0_test
@@ -15,10 +15,10 @@
 
 #include <cuda_runtime.h>
 
-#include "ptir/host_eval.hpp"
-#include "ptir/tier0_kernels.cuh"
+#include "support/host_eval.hpp"
+#include "pipeline/tier0/tier0_kernels.cuh"
 
-using namespace pie_cuda_driver::ptir;
+using namespace pie_cuda_driver::pipeline;
 
 namespace {
 

@@ -62,7 +62,7 @@ configuration, and old schema machinery are gone. The current local path is:
 ```text
 pipeline
   -> per-driver scheduler queue
-  -> typed NativeDriver operation
+  -> typed DriverBackend operation
   -> direct CUDA / Metal FFI or direct Rust Dummy call
   -> GPU
   -> persistent channel/terminal publication
@@ -230,7 +230,8 @@ int32_t pie_cuda_close_channel(PieDriver* driver, uint64_t channel_id);
 void pie_cuda_destroy(PieDriver* driver);
 ```
 
-Metal exposes the same shape with `pie_metal_*` symbols. Dummy implements the equivalent Rust `LocalDriver` interface directly and does not need C FFI.
+Metal exposes the same shape with `pie_metal_*` symbols. Dummy implements the
+equivalent `DriverBackend` operations directly in Rust and does not need C FFI.
 
 `PieLaunchDesc` carries one stable terminal-cell pointer per instance id.
 Validation and acceptance are atomic for the whole call. `PieCompletion` is
@@ -326,39 +327,48 @@ Replace the current driver module with:
 
 ```text
 runtime/engine/src/driver/
-├── mod.rs              # public local-driver API
-├── backend.rs          # LocalDriver + NativeDriver enum
+├── backend.rs          # DriverBackend dispatch and concrete-backend exports
+├── backend/
+│   ├── dummy.rs        # Rust adapter over pie-driver-dummy
+│   ├── cuda.rs         # CUDA adapter over pie-driver-abi symbols
+│   └── metal.rs        # Metal adapter over pie-driver-abi symbols
 ├── registry.rs         # immutable per-driver registry/specs
 ├── completion.rs       # wait slots, pinned words, Completion future
-├── frame.rs            # bound instance/frame/channel layout
-└── ffi/
-    ├── mod.rs
-    ├── cuda.rs
-    └── metal.rs
+└── frame.rs            # bound instance/frame/channel layout
 ```
+
+Raw FFI declarations and ABI types remain in `pie_driver_abi`; the engine
+backend modules own lifecycle, frame conversion, completion, and validation.
 
 Suggested Rust API:
 
 ```rust
-pub trait LocalDriver: Send {
-    fn capabilities(&self) -> &DriverCapabilities;
-    fn register_program(&mut self, desc: &ProgramDesc) -> Result<ProgramId>;
-    fn register_channel(&mut self, desc: &ChannelDesc) -> Result<BoundChannel>;
-    fn bind_instance(&mut self, desc: &InstanceDesc) -> Result<BoundInstance>;
-    fn launch(&mut self, desc: &LaunchDesc) -> Result<Completion>;
-    fn copy_kv(&mut self, desc: &KvCopyDesc) -> Result<Completion>;
-    fn copy_state(&mut self, desc: &StateCopyDesc) -> Result<Completion>;
-    fn resize_pool(&mut self, desc: &PoolResizeDesc) -> Result<Completion>;
-    fn close_instance(&mut self, id: InstanceId) -> Result<()>;
-    fn close_channel(&mut self, id: ChannelId) -> Result<()>;
+pub enum DriverBackend {
+    Dummy(DummyDriver),
+    Cuda(CudaDriver),
+    Metal(MetalDriver),
+}
+
+impl DriverBackend {
+    pub fn capabilities(&self) -> &DriverCapabilities;
+    pub fn register_program(&mut self, desc: &ProgramDesc) -> Result<ProgramId>;
+    pub fn register_channel(&mut self, desc: &ChannelDesc) -> Result<BoundChannel>;
+    pub fn bind_instance(&mut self, desc: &InstanceDesc) -> Result<BoundInstance>;
+    pub fn launch(&mut self, desc: &LaunchDesc) -> Result<Completion>;
+    pub fn copy_kv(&mut self, desc: &KvCopyDesc) -> Result<Completion>;
+    pub fn copy_state(&mut self, desc: &StateCopyDesc) -> Result<Completion>;
+    pub fn resize_pool(&mut self, desc: &PoolResizeDesc) -> Result<Completion>;
+    pub fn close_instance(&mut self, id: InstanceId) -> Result<()>;
+    pub fn close_channel(&mut self, id: ChannelId) -> Result<()>;
 }
 ```
 
-This trait is synchronous at invocation time. Its returned `Completion` is asynchronous.
+These operations are synchronous at invocation time. Returned `Completion`
+values are asynchronous.
 
-Each scheduler owns one `NativeDriver` for its thread lifetime. The immutable
+Each scheduler owns one `DriverBackend` for its thread lifetime. The immutable
 registry contains cloneable scheduler handles and capabilities, not
-`Arc<NativeDriver>`; arbitrary runtime threads cannot call the driver directly.
+`Arc<DriverBackend>`; arbitrary runtime threads cannot call the driver directly.
 Channel registration is explicit, serialized by that scheduler, and performed
 lazily on a channel's first bind.
 
@@ -461,7 +471,7 @@ impl DummyDriver {
 }
 ```
 
-It is used through `NativeDriver::Dummy` without C FFI or shmem. Its remaining
+It is used through `DriverBackend::Dummy` without C FFI or shmem. Its remaining
 architectural defect is the private `mpsc` worker queue behind the scheduler.
 Remove that second ordering queue, validate a whole batch before mutation, run
 deterministic Dummy work directly, and dispatch only the final callback
@@ -502,8 +512,8 @@ spawn driver thread -> pie_driver_*_run_inproc -> ready callback
 -> recv/send service loop -> request_stop + join
 
 new:
-pie_*_create -> NativeDriver + capabilities
--> move NativeDriver into the per-driver scheduler thread
+pie_*_create -> DriverBackend + capabilities
+-> move DriverBackend into the per-driver scheduler thread
 -> register scheduler handle with engine
 -> stop submission + drain + join -> pie_*_destroy
 ```
@@ -513,8 +523,8 @@ No leader service thread is needed. Model loading may block during `create` at w
 ### 12.2 Files to simplify
 
 - `worker/src/driver_ffi.rs`: declare create/destroy/direct-operation symbols only.
-- `worker/src/embedded_driver.rs`: remove vtable context, channel construction, inproc/shmem selection, server thread lifecycle, and process-style stop logic. Rename to `native_driver.rs` if the remaining code is primarily driver ownership.
-- `worker/src/engine.rs`: start the scheduler with `NativeDriver` ownership and install its handle, not `DriverChannel`.
+- `worker/src/embedded_driver.rs`: remove vtable context, channel construction, inproc/shmem selection, server thread lifecycle, and process-style stop logic. Rename to `driver_backend.rs` if the remaining code is primarily backend ownership.
+- `worker/src/engine.rs`: start the scheduler with `DriverBackend` ownership and install its handle, not `DriverChannel`.
 - `worker/src/config.rs`: remove all IPC profile configuration.
 
 ## 13. Configuration Deletion

@@ -1,6 +1,6 @@
 #pragma once
 
-// PTIR M5 — Geometry as data, C1 final form (overview §5.1 / thrust-1-memory §5.M5).
+// PTIR — Geometry as data, C1 final form (overview §5.1).
 //
 // C1 has two forms:
 //   * INTERIM — the host computes forward geometry (pages / kv_len / mask /
@@ -12,7 +12,7 @@
 //     a device buffer the HOST NEVER READS, and the consuming forward binds that
 //     device buffer instead of a host-fed scalar column (ForwardRequest
 //     `kv_len_device`, the u64 device-handle column). The handshake exit
-//     (thrust-1-memory §5.M5): a forward whose geometry was device-produced
+//     handshake exit: a forward whose geometry was device-produced
 //     matches the host-fed run BIT FOR BIT.
 //
 // This kernel is the FINAL-form producer for the length column: it derives
@@ -28,9 +28,9 @@
 // Frozen fork pages are counted FULL (W6): sub-page validity rides the attention
 // mask, never this total. The parity test (`test_kv_len_geometry`) asserts the
 // device-produced `kv_len` equals the host formula bit-for-bit over randomized
-// page geometries — the standalone half of the M5 handshake (the full
+// page geometries — the standalone half of the handshake (the full
 // forward-binds-device-buffer integration rides the executor's late-bind
-// read-seam, extended per thrust-1-memory §5.M5 item 1).
+// read-seam, extended for that late-bind path).
 
 #include <cstdint>
 
@@ -51,7 +51,7 @@ void launch_derive_kv_len(
     std::uint32_t* kv_len,
     cudaStream_t stream);
 
-// PTIR M5 / C1-FINAL — device-side working-set SLOT → PHYSICAL page-pool BlockId
+// PTIR / C1-FINAL — device-side working-set SLOT → PHYSICAL page-pool BlockId
 // resolution, for the beam/§6.1 device-produced `pages` geometry (G2). The beam
 // epilogue produces a `pages` channel of working-set SLOT ids into a device
 // buffer the host never reads; the attention kernel needs PHYSICAL `kv_page_index`

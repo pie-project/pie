@@ -8,9 +8,9 @@
 #include <optional>
 #include <utility>
 
-#include "config.hpp"
+#include <config.hpp>
 #include "loader/backend_target.hpp"
-#include "loader/hf_config.hpp"
+#include "model/config.hpp"
 #include "loader/safetensors.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
@@ -45,12 +45,14 @@ public:
     /// TP-aware runtime quantization (cross-rank absmax all-reduce for
     /// row-parallel weights). For single-GPU (tp_size=1) this can be null.
     ///
-    /// When `boot_cfg.model.storage_program_path` is set (weight-loader Variant
-    /// A, embedded driver), the checkpoint was compiled by the *runtime*
-    /// in-process; this driver reads the serialized StorageProgram from that
-    /// file and only deserializes + executes it — the bulk weight bytes never
-    /// cross that boundary (the program records only tensor locations). An empty
-    /// path (standalone / remote) keeps the driver's own C++ checkpoint compile
+    /// Both branches execute the same Rust-compiled `StorageProgram`; only the
+    /// path to it differs. When `boot_cfg.model.storage_program_path` is set
+    /// (weight-loader Variant A, embedded driver), the checkpoint was compiled
+    /// by the *runtime* in-process; this driver reads the serialized
+    /// StorageProgram from that file and only deserializes + executes it — the
+    /// bulk weight bytes never cross that boundary (the program records only
+    /// tensor locations). An empty path (standalone / remote) instead compiles
+    /// the StorageProgram via the Rust FFI in-process here, then executes it
     /// (the *locality switch* = path-present).
     static LoadedModel load(const Config& boot_cfg,
                             NcclComm* tp_comm = nullptr);

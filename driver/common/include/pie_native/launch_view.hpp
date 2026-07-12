@@ -82,6 +82,11 @@ struct LaunchView {
     // program's span is its empty wire placeholder; the composed batch
     // substitutes its channel-resolved geometry for that span.
     Slice<std::uint32_t> ptir_program_row_indptr;
+    Slice<std::uint64_t> logical_fire_ids;
+    Slice<std::uint8_t> retry_eligible;
+    Slice<std::uint64_t> channel_expected_head;
+    Slice<std::uint64_t> channel_expected_tail;
+    Slice<std::uint32_t> channel_ticket_indptr;
     // The batch carries a GUEST-supplied custom mask (vs engine-synthesized
     // causal BRLE rows, which accompany every wire prefill and are safely
     // dropped when a composed batch runs the standard causal path).

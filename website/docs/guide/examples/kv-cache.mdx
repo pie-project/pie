@@ -6,19 +6,13 @@ sidebar_position: 5
 
 # Context and KV cache
 
-Inferlets that exercise the page-based KV cache — forking from a shared prefix, building prefix trees, sliding-window attention, and the runtime's automatic page-trim.
-
-:::note[Running on the dummy driver?]
-`parallel-generation` and `prefix-tree` fork from a shared prefix and rely on each branch producing a related continuation. On the dummy, branches share KV pages correctly but each branch's tokens are drawn independently — the page state machine is exercised, the branch *content* is unrelated random. `windowed-attention`, `attention-sink`, and `page-trim-bench` are unaffected; they exercise mask and page-trim plumbing, not token semantics.
-:::
+Inferlets that exercise shared KV prefixes and bounded attention masks.
 
 | Inferlet | What it shows |
 |---|---|
-| [`parallel-generation`](https://github.com/pie-project/pie/tree/main/inferlets/parallel-generation) | Forked contexts that share committed pages and decode in parallel. |
-| [`prefix-tree`](https://github.com/pie-project/pie/tree/main/inferlets/prefix-tree) | Prefix-tree caching with concurrent generation from one shared context. |
-| [`windowed-attention`](https://github.com/pie-project/pie/tree/main/inferlets/windowed-attention) | Sliding window: bounded-memory generation by masking + releasing pages. |
+| [`prefix-tree-kv-cache`](https://github.com/pie-project/pie/tree/main/inferlets/prefix-tree-kv-cache) | Two-level copy-on-write branching from shared prefixes. |
+| [`sliding-window-attention`](https://github.com/pie-project/pie/tree/main/inferlets/sliding-window-attention) | Decode while attending only to the most recent token window. |
 | [`attention-sink`](https://github.com/pie-project/pie/tree/main/inferlets/attention-sink) | Sink + sliding window ([StreamingLLM](https://arxiv.org/abs/2309.17453)). |
-| [`page-trim-bench`](https://github.com/pie-project/pie/tree/main/inferlets/page-trim-bench) | Benchmarks the runtime's page-trim optimization on a sink+window mask. |
 
 ## Related guide
 

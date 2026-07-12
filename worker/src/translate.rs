@@ -6,7 +6,7 @@
 //! the same construction here in pure Rust, sourcing:
 //!   * scalars from the user TOML
 //!   * dirs (cache/log/runtime) from `bootstrap::paths::pie_home()` (`~/.pie/...`)
-//!   * caps/native-driver bundles collected before bootstrap.
+//!   * capability/backend bundles collected before bootstrap.
 
 use std::path::PathBuf;
 
@@ -18,10 +18,10 @@ use crate::embedded_driver::DriverCapabilities;
 /// Per-driver bundle created before bootstrap.
 pub struct GroupDriver {
     pub caps: DriverCapabilities,
-    pub native: pie_engine::driver::NativeDriver,
+    pub backend: pie_engine::driver::DriverBackend,
 }
 
-/// Per-model bundle of concrete native drivers. One model with DP=N produces
+/// Per-model bundle of concrete driver backends. One model with DP=N produces
 /// `N` entries here; one entry per bootstrap driver config.
 pub struct ModelDrivers {
     pub groups: Vec<GroupDriver>,
@@ -109,7 +109,7 @@ fn build_model(
                 max_forward_tokens: g.caps.max_forward_tokens as usize,
                 max_page_refs: g.caps.max_page_refs as usize,
             },
-            native_driver: g.native,
+            driver_backend: g.backend,
         })
         .collect();
 
@@ -172,11 +172,12 @@ mod tests {
             reject_launches: false,
             reject_launches_remaining: 0,
             fail_launches_after_accept: false,
+            retry_launches_remaining: 0,
             operation_log: None,
             launch_observer: None,
         };
-        let (native, _) = pie_engine::driver::NativeDriver::dummy(dummy).unwrap();
-        GroupDriver { caps, native }
+        let (backend, _) = pie_engine::driver::DriverBackend::dummy(dummy).unwrap();
+        GroupDriver { caps, backend }
     }
 
     #[test]

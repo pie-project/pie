@@ -10,7 +10,7 @@
 #include "../../../weight-loader/include/weight_loader.h"
 #include "loader/backend_target.hpp"
 #include "loader/checkpoint_source.hpp"
-#include "loader/hf_config.hpp"
+#include "model/config.hpp"
 
 namespace pie_cuda_driver {
 

@@ -1,6 +1,6 @@
-// Beam [B,P] kvm packed-mask adapter (SEAM 1) unit test — the fork-freeze golden
-// is the adapter's correctness gate (echo: "the 3 fork-freeze/page-turn/continue
-// goldens ARE the adapter's test vectors"). Verifies launch_beam_pack_kvm packs
+// Beam [B,P] kvm packed-mask adapter unit test. The three
+// fork-freeze/page-turn/continue goldens are the adapter's test vectors.
+// Verifies launch_beam_pack_kvm packs
 // the dense per-cell kvm over each beam's klen span into FlashInfer's bit-packed
 // bitmap, bit-exact against a host oracle, on the fork-freeze geometry.
 //

@@ -1,7 +1,7 @@
 #include <cassert>
 #include <iostream>
 
-#include "kv_cache_format.hpp"
+#include "store/kv_cache_format.hpp"
 
 using pie_cuda_driver::KvCacheScaleLayout;
 using pie_cuda_driver::KvCacheScheme;

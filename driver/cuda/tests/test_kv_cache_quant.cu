@@ -11,8 +11,8 @@
 
 #include "cuda_check.hpp"
 #include "kernels/kv_paged.hpp"
-#include "kv_cache.hpp"
-#include "kv_cache_format.hpp"
+#include "store/kv_cache.hpp"
+#include "store/kv_cache_format.hpp"
 #include "tensor.hpp"
 
 using pie_cuda_driver::DType;

@@ -1,46 +1,88 @@
-# driver/cuda
+# CUDA driver
 
-Embedded C++/CUDA driver for Pie. It owns model weights and CUDA forward
-passes; the Rust runtime owns scheduling, inferlet execution, and the
-shared-memory control path.
+The native C++/CUDA backend owns model weights, device stores, and forward
+execution. Rust owns scheduling, inferlet execution, and the control plane.
+
+## ABI
+
+`interface/driver/include/pie_driver_abi.h` is the frozen boundary. The driver
+implements exactly these 11 exports:
+
+`pie_cuda_create`, `pie_cuda_register_program`, `pie_cuda_register_channel`,
+`pie_cuda_bind_instance`, `pie_cuda_launch`, `pie_cuda_copy_kv`,
+`pie_cuda_copy_state`, `pie_cuda_resize_pool`, `pie_cuda_close_instance`,
+`pie_cuda_close_channel`, and `pie_cuda_destroy`.
+
+`src/abi.cpp` only validates and converts ABI handles. `src/context.*` is the
+composition root behind that boundary.
+
+## Modules
+
+| Path | Responsibility |
+| --- | --- |
+| `src/batch/` | Compose and execute one submitted batch |
+| `src/pipeline/` | Own PTIR programs, instances, channels, and dispatch |
+| `src/model/` | Architecture registry, family weights, and forwards |
+| `src/ops/` | Reusable attention, GEMM, MoE, and state-space wrappers |
+| `src/kernels/` | Leaf CUDA kernels; no higher-layer includes |
+| `src/store/` | Long-lived KV/MLA/DSA/state/swap storage and memory planning |
+| `src/loader/` | Rust-planned checkpoint materialization into `WeightStore` |
+
+`tensor.*` and `distributed.*` are shared core types.
 
 ## Build
 
-Normally this driver is built into `pie`:
+Build the driver as part of the Rust `pie` binary (see `worker/README.md`):
 
-```bash
+```sh
 CUDACXX=/usr/local/cuda/bin/nvcc \
   cargo build -p pie-worker --release --features driver-cuda
 ```
 
-For driver-only development:
+The binary lands at `target/release/pie`.
 
-```bash
-cd driver/cuda
-cmake -S . -B build -G Ninja
-cmake --build build
+For the standalone diagnostic shim:
+
+```sh
+cmake -S driver/cuda -B target/cuda -G Ninja
+cmake --build target/cuda --target pie_driver_cuda
+target/cuda/bin/pie_driver_cuda --config driver/cuda/dev.toml
 ```
 
-System requirements: CMake, Ninja, a CUDA toolkit, and an NVIDIA GPU with
-SM 8.0 or newer.
+The standalone target requires CMake, Cargo, a CUDA toolkit, and system NCCL.
+Edit `driver/cuda/dev.toml` so `[model].snapshot_dir` names a local checkpoint.
 
-## Config
+To run the same commands on a GPU workstation:
 
-```toml
-[model.driver]
-type = "cuda_native"
-device = ["cuda:0"]
-tensor_parallel_size = 1
-activation_dtype = "bfloat16"
-
-[model.driver.options]
-gpu_mem_utilization = 0.90
-memory_profile = "auto"
+```sh
+ssh workstation 'cd /path/to/pie && \
+  cmake -S driver/cuda -B target/cuda -G Ninja && \
+  cmake --build target/cuda'
 ```
 
-`memory_profile` may be `auto`, `latency`, `balanced`, `throughput`, or `capacity`.
-The driver derives forward capacity, Qwen3.5 state slots, and KV pages after
-weights load.
+## Structure and tests
 
-Run `pie driver cuda-native doctor` to confirm the installed `pie` binary has
-the driver compiled in and can see the GPU.
+The text-only structural gate needs neither CUDA nor a GPU:
+
+```sh
+./driver/cuda/check-structure.sh
+```
+
+After building all test targets on a CUDA host:
+
+```sh
+cmake --build target/cuda
+ctest --test-dir target/cuda --output-on-failure
+```
+
+Some parity harnesses are build-only because they require external reference
+dumps; they are intentionally not registered with CTest.
+
+## Configuration boundary
+
+`driver/cuda/dev.toml` is only the C++ `pie_driver_cuda` shim's direct config
+and uses `[model]`, `[batching]`, `[distributed]`, and `[runtime]`.
+
+The Rust `pie` and `pie-worker` processes use a separate user-facing
+configuration and translate it into the frozen driver ABI. That service
+configuration is not accepted by `pie_driver_cuda`.

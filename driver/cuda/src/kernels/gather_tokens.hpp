@@ -1,10 +1,10 @@
 #pragma once
 
-// PTIR M3 — `gather_tokens`: the driver-side op behind `compact` (W5). Packs
+// `gather_tokens`: the driver-side op behind `compact`. Packs
 // live token runs densely into fresh page slots per a host-given plan, so the
 // working set reclaims token-space waste (frozen fork tails, H2O-style
 // eviction). A STANDALONE streaming-copy kernel, NOT an attention-kernel
-// modification — outside the W11 attention-kernel ban (open question 5).
+// modification (open question 5).
 //
 // The default KV page layout is NHD `[num_pages, page_size, num_kv_heads,
 // head_dim]`, so a run of `len` consecutive tokens WITHIN a page is a single

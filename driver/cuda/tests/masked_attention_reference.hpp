@@ -1,7 +1,7 @@
 #pragma once
 
-// CPU golden reference for the PTIR M2b masked-attention parity test
-// (Thrust-1, overview §5.2/§6.4 fork-sharing enabler).
+// CPU golden reference for the PTIR masked-attention parity test
+// (overview §5.2/§6.4 fork-sharing enabler).
 //
 // The production path (`ops::launch_attention_flashinfer_prefill_custom`,
 // FlashInfer `MaskMode::kCustom`) presents FROZEN fork pages as FULL — they

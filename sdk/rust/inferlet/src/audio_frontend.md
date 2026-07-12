@@ -267,8 +267,8 @@ Like vision's decode (the `image` crate inside the inferlet), audio acquisition
   resampling is identity).
 - Then call `Audio::from_pcm`.
 
-A `inferlets/audio-qa/` example (mirroring `inferlets/image-qa/`) would: fetch a
-clip → decode/resample → `Audio::from_pcm` → `ctx.append_audio` (wrapped by the
+A complete audio inferlet would fetch a clip → decode/resample →
+`Audio::from_pcm` → `ctx.append_audio` (wrapped by the
 `<|audio>` / `<audio|>` open/close markers — see the instruct edit in the
 integration checklist) → `ctx.user(question).cue()` → generate.
 

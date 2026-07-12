@@ -51,7 +51,7 @@ impl RuntimeShutdown {
     async fn shutdown(self) -> Result<()> {
         let scheduler_result = self.scheduler.shutdown().await;
         for driver_id in self.driver_ids {
-            let _ = driver::registry::unregister_driver(driver_id);
+            let _ = driver::backend::unregister_driver(driver_id);
         }
         scheduler_result
     }
@@ -145,7 +145,7 @@ pub struct DriverConfig {
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
     pub limits: crate::driver::SchedulerLimits,
-    pub native_driver: crate::driver::NativeDriver,
+    pub driver_backend: crate::driver::DriverBackend,
 }
 
 #[derive(Debug, Clone)]
@@ -271,12 +271,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let drivers: Vec<usize> = driver_configs
         .into_iter()
         .map(|d| {
-            driver::register_native_driver(
+            driver::register_driver_backend(
                 driver::DriverSpec {
                     num_kv_pages: d.total_pages,
                     limits: d.limits,
                 },
-                d.native_driver,
+                d.driver_backend,
             )
         })
         .collect();

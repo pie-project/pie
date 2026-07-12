@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#include "mla_cache.hpp"
+#include "kernels/mla_cache_view.hpp"
 
 namespace pie_cuda_driver::kernels {
 

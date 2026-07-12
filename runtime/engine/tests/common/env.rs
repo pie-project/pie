@@ -8,7 +8,7 @@ use tempfile::TempDir;
 use pie_engine::bootstrap::{
     Config, DriverConfig, ModelConfig, RuntimeConfig, SchedulerConfig, TelemetryConfig,
 };
-use pie_engine::driver::{NativeDriver, SchedulerLimits};
+use pie_engine::driver::{DriverBackend, SchedulerLimits};
 
 use super::mock_device::{Behavior, MockBackend, launch_observer};
 
@@ -35,12 +35,12 @@ fn fixture_vocab_size() -> u32 {
     }
 }
 
-fn native_dummy_driver(
+fn dummy_driver_backend(
     num_pages: usize,
     behavior: Arc<dyn Behavior>,
     operation_log: Arc<std::sync::Mutex<Vec<String>>>,
-) -> NativeDriver {
-    let (native, _) = NativeDriver::dummy(pie_driver_dummy_lib::DummyDriverOptions {
+) -> DriverBackend {
+    let (backend, _) = DriverBackend::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_pages as u32,
         kv_page_size: 16,
         swap_pool_size: 0,
@@ -56,11 +56,12 @@ fn native_dummy_driver(
         reject_launches: false,
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
+        retry_launches_remaining: 0,
         operation_log: Some(operation_log),
         launch_observer: Some(launch_observer(behavior)),
     })
-    .expect("create dummy native driver");
-    native
+    .expect("create dummy driver backend");
+    backend
 }
 
 pub struct MockEnv {
@@ -99,7 +100,7 @@ impl MockEnv {
                     max_forward_tokens: 4096,
                     max_page_refs: self.num_pages,
                 },
-                native_driver: native_dummy_driver(
+                driver_backend: dummy_driver_backend(
                     self.num_pages,
                     self.behavior.clone(),
                     Arc::clone(&self.operation_log),

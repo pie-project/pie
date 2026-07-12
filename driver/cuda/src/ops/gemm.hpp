@@ -1,5 +1,7 @@
 #pragma once
 
+// ops/: attention, GEMM, MoE, and SSM kernel wrappers shared by every model forward.
+//
 // Thin cuBLAS wrapper for bf16 matmul.
 //
 // The transformer linear layers are all of shape `out = act @ W^T`, where
@@ -14,7 +16,7 @@
 #include <cuda_runtime.h>
 #include <memory>
 
-#include "model/loaded_model.hpp"
+#include "ops/quant_meta.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::ops {
@@ -141,10 +143,9 @@ private:
 //   y:   [M, N]
 // Default beta = 0 (overwrite). Pass beta = 1 to fuse a residual add.
 //
-// Dispatcher entry point. Currently routes only `(BF16, BF16)` to the
-// existing cuBLAS path; M1 adds `(BF16, FP8_E4M3)` and M3 adds
-// `(BF16, INT4_PACKED)` via marlin. Throws on unsupported combos rather
-// than silently miscomputing.
+// Dispatcher entry point. Routes supported dense and quantized combinations
+// through cuBLAS/cuBLASLt or Marlin, and throws on unsupported combinations
+// rather than silently miscomputing.
 //
 // `act_dtype` / `y_dtype` default to BF16 so the common-case call site
 // just passes `(handle, act, w_tensor, y, M, N, K[, beta])` unchanged

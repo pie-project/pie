@@ -1,0 +1,13 @@
+[package]
+name = "json-schema-constrained-decoding"
+version = "0.1.0"
+description = "JSON generation constrained by a JSON Schema"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Description of the JSON value to generate"}
+schema = {type = "string", optional = true, description = "JSON Schema used to constrain generation"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 512)"}

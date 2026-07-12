@@ -1,4 +1,4 @@
-#include "pie_driver_common/safetensors_manifest.hpp"
+#include "loader/safetensors_manifest.hpp"
 
 #include <algorithm>
 #include <fstream>

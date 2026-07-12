@@ -13,7 +13,7 @@
 #include <cstdio>
 #include <set>
 
-#include "executor/graph_variant.hpp"
+#include "batch/graph_variant.hpp"
 
 using pie_cuda_driver::gv_old_encode_for_proof;
 using pie_cuda_driver::make_graph_variant;

@@ -1,0 +1,15 @@
+[package]
+name = "contrastive-decoding"
+version = "0.1.0"
+description = "Same-model contrastive decoding with full-context expert and bounded-context amateur passes"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 256)"}
+amateur_window = {type = "int", optional = true, description = "Attention window used by the amateur pass (default: 8)"}
+lambda = {type = "float", optional = true, description = "Amateur log-probability penalty (default: 0.5)"}
+alpha = {type = "float", optional = true, description = "Expert plausibility threshold relative to its best token (default: 0.1)"}

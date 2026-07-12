@@ -1,0 +1,14 @@
+[package]
+name = "greenlist-watermarking"
+version = "0.1.0"
+description = "Greenlist token watermarking during generation"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 256)"}
+gamma = {type = "float", optional = true, description = "Fraction of vocabulary assigned to the greenlist (default: 0.5)"}
+delta = {type = "float", optional = true, description = "Logit bias applied to green tokens (default: 2.0)"}

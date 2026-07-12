@@ -45,7 +45,7 @@ Deduplication happens at the op/kernel level only, where it already exists.
 
 1. **The ABI is frozen.** The 11 `pie_cuda_*` functions and `pie_driver_abi.h` do not
    change. The Rust engine is untouched by this plan. Every phase must leave the
-   driver linkable against the same `runtime/engine/src/driver/ffi/cuda.rs`.
+   driver linkable against the same `runtime/engine/src/driver/backend/cuda.rs`.
 2. **Idiomatic C++ naming.** A file is named for the class it defines
    (`kv_cache.cpp` : `KvCache`); a module name is a membership test; classes are
    unprefixed inside `namespace pie::cuda` (the handle-based C ABI maps to a

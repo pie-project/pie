@@ -43,9 +43,6 @@ const sidebars: SidebarsConfig = {
         'guide/examples/structured',
         'guide/examples/kv-cache',
         'guide/examples/speculation',
-        'guide/examples/reasoning',
-        'guide/examples/agents',
-        'guide/examples/integration',
       ],
     },
     {

@@ -19,8 +19,8 @@ pub enum InferletCmd {
 
 #[derive(Args, Debug)]
 pub struct InfoArgs {
-    /// Inferlet name, with optional version (e.g. `text-completion`
-    /// or `text-completion@0.2.14`).
+    /// Inferlet name, with optional version (e.g. `chat-completion`
+    /// or `chat-completion@0.1.0`).
     pub inferlet: String,
 
     /// Config TOML to use for the registry URL. Defaults to

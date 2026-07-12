@@ -1,7 +1,7 @@
 // Bug#2 DEFINITIVE splitter: chained {prefill + fused-decode-write + attention}
 // co-batched R>1 vs alone, checking BOTH the written K/V CONTENT and the attn_out.
 //
-// charlie's metadata dump proved the kernel receives correct indptr/last_page_len/
+// The metadata dump proved the kernel receives correct indptr/last_page_len/
 // pages under R>1, and my two isolated guards proved the attention read (on
 // hand-built KV) and the fused write (to fresh pages) are each per-request
 // correct. This test chains them through a NON-FRESH prefill page — the exact
@@ -11,7 +11,7 @@
 //   CONTENT identical but attn_out diverges  → genuine kernel bug the fresh-page
 //       guard missed → bisect the kernel.
 //
-// Regime = charlie's failing shape: R=2 co-batched, kv_len {3,4} (both attend a
+// Regime = the failing shape: R=2 co-batched, kv_len {3,4} (both attend a
 // decode-written token; len-2 pure-prefill is the bit-exact control).
 
 #include <cmath>
@@ -23,7 +23,6 @@
 
 #include <cuda_runtime.h>
 
-#include "attention_workspace.hpp"
 #include "kernels/split_packed.hpp"
 #include "ops/attention_flashinfer.hpp"
 
@@ -154,14 +153,14 @@ ChainResult run_chain(const std::vector<Req>& reqs, int first, int R, int num_st
 
     // Decode STEPS: each step s is a separate fused write appending request i's
     // token at slot prefill[i]+s onto the SAME (accumulating, non-fresh) page —
-    // exactly charlie's step0/step1/... regime (step1+ = attends a prior step's
+    // exactly the step0/step1/... regime (step1+ = attends a prior step's
     // decode-written token). Per-step geometry (position + last_page_len).
     for (int s = 0; s < num_steps; ++s) {
         for (int i = 0; i < R; ++i) {
             positions_h[i] = prefill[i] + s;
             // Mechanism repro: PIE_INJECT_WRONG_POS simulates the upstream bug —
             // a non-first (r>=1) co-batched row receiving the wrong position
-            // (here, row 0's). If this yields charlie's wrong-decode-K/attn_out
+            // (here, row 0's). If this yields the wrong-decode-K/attn_out
             // for r>=1 (co-batched) vs correct alone, the mechanism is confirmed.
             static const bool inject = std::getenv("PIE_INJECT_WRONG_POS") != nullptr;
             if (inject && R > 1 && i >= 1) positions_h[i] = prefill[0] + s;
@@ -229,9 +228,9 @@ float maxdiff(const float* a, const float* b, std::size_t n) {
 int main() {
     std::mt19937 rng(0xC0BA7Cu);
     constexpr int R = 2;
-    // charlie's failing shape: R=2 co-batched, prefill_len {2,3}. Sweep decode
-    // steps: step0 attends only prefill (his bit-exact control), step1/step2
-    // attend PRIOR decode-written tokens (his diverging regime).
+    // the failing shape: R=2 co-batched, prefill_len {2,3}. Sweep decode
+    // steps: step0 attends only prefill (the bit-exact control), step1/step2
+    // attend PRIOR decode-written tokens (the diverging regime).
     const int prefill_lens[R] = {2, 3};
 
     std::uniform_real_distribution<float> u(0.5f, 1.5f);

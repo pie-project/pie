@@ -223,19 +223,20 @@ edit — hence flagged as a deliberate next step rather than landed here.
 | `pie_mm_bench.py`  | Pie driver (`pie serve` + `image-qa-bench` over PieClient) |
 | `run_mm_compare.py`| runs both, sequentially, prints the side-by-side table |
 | `assets/bench_image.png` | the shared 896×896 test image |
-| `../inferlets/image-qa-bench/` | the Pie bench inferlet (base64 image in, exact token counts out) |
+| external `image-qa-bench` project | the Pie bench inferlet (base64 image in, exact token counts out) |
 | `out/mm/*.json` | saved per-run summaries + per-request detail |
 
 ## Reproduce
 
 ```bash
 cd benches
-# build the bench inferlet once
-( cd ../inferlets/image-qa-bench && cargo build --release --target wasm32-wasip2 )
+# build your image-qa-bench project once
+( cd /path/to/image-qa-bench && cargo build --release --target wasm32-wasip2 )
 
 # full head-to-head (Pie under system python, vLLM under its venv)
 python3 run_mm_compare.py \
     --model Qwen/Qwen3-VL-2B-Instruct --image assets/bench_image.png \
+    --inferlet-dir /path/to/image-qa-bench \
     --max-tokens 128 --latency-requests 16 --tput-requests 128 \
     --concurrency 32 --warmup 4 --out-dir out/mm
 
