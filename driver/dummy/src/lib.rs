@@ -213,7 +213,7 @@ enum PreparedCallback {
 pub struct DummyDriver {
     device_facts: DeviceFacts,
     capabilities: DriverCapabilities,
-    storage: Option<pie_weight_loader::host_executor::HostStorage>,
+    load_storage: Option<pie_load_planner::host_executor::HostStorage>,
     state: Arc<Mutex<DummyState>>,
     next_program_id: AtomicU64,
     next_instance_id: AtomicU64,
@@ -254,6 +254,7 @@ impl DummyDriver {
                 native_mxfp4_moe: false,
                 storage_alignment: std::mem::align_of::<usize>() as u32,
                 storage_max_tile_bytes: 64 * 1024 * 1024,
+                storage_tile_map_mask: pie_load_planner::load_plan::HOST_TILE_MAP_MASK,
                 page_size: 1,
             },
             capabilities: DriverCapabilities {
@@ -261,6 +262,14 @@ impl DummyDriver {
                 total_pages: options.total_pages,
                 kv_page_size: options.kv_page_size,
                 swap_pool_size: options.swap_pool_size,
+                kv_copy_domain_mask: if options.swap_pool_size > 0 {
+                    pie_driver_abi::KV_COPY_DEVICE_TO_DEVICE
+                        | pie_driver_abi::KV_COPY_DEVICE_TO_HOST
+                        | pie_driver_abi::KV_COPY_HOST_TO_DEVICE
+                        | pie_driver_abi::KV_COPY_HOST_TO_HOST
+                } else {
+                    pie_driver_abi::KV_COPY_DEVICE_TO_DEVICE
+                },
                 rs_cache_required: false,
                 rs_cache_slots: 0,
                 rs_cache_slot_bytes: 0,
@@ -273,7 +282,7 @@ impl DummyDriver {
                 activation_dtype: options.activation_dtype,
                 snapshot_dir: options.snapshot_dir,
             },
-            storage: None,
+            load_storage: None,
             state,
             next_program_id: AtomicU64::new(1),
             next_instance_id: AtomicU64::new(1),
@@ -361,19 +370,19 @@ impl DummyDriver {
     }
 
     pub fn load_model(&mut self, desc: &ModelLoadDesc) -> Result<DriverCapabilities> {
-        ensure!(self.storage.is_none(), "dummy model is already loaded");
+        ensure!(self.load_storage.is_none(), "dummy model is already loaded");
         ensure!(
-            desc.compiler_version == pie_weight_loader::storage::compiler_version(),
+            desc.compiler_version == pie_load_planner::load_plan::compiler_version(),
             "dummy compiler version mismatch"
         );
         self.record_op("load_model");
-        let storage = pie_weight_loader::host_executor::execute_serialized_program(
-            &desc.program_bytes,
+        let storage = pie_load_planner::host_executor::execute_serialized_plan(
+            &desc.load_plan_bytes,
             &desc.snapshot_dir,
         )
-        .map_err(|err| anyhow!("dummy storage program execution failed: {err}"))?;
+        .map_err(|err| anyhow!("dummy LoadPlan execution failed: {err}"))?;
         self.capabilities.snapshot_dir = desc.snapshot_dir.display().to_string();
-        self.storage = Some(storage);
+        self.load_storage = Some(storage);
         Ok(self.capabilities.clone())
     }
 

@@ -31,10 +31,6 @@ fn default_max_tokens() -> usize {
     16
 }
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let max_steps = input.max_tokens;
@@ -54,11 +50,11 @@ async fn main(input: Input) -> Result<String> {
 
     // Allocate a fixed logical page pool. Flat position `wpos` maps to
     // `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     let pool = ws
         .reserve(POOL_PAGES)
         .map_err(|e| format!("ws.reserve pool: {e}"))?;
-    let pool_ids: &'static Vec<u32> = bx(pool.ids().to_vec());
+    let pool_ids = pool.ids().to_vec();
     let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect(); // [B*POOL_PAGES]
     let pool0 = pool_ids[0];
 
@@ -68,23 +64,17 @@ async fn main(input: Input) -> Result<String> {
     let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..POOL).map(|p| p == 0)).collect();
 
     // Loop-carried search and page geometry.
-    let mask = bx(Channel::from_shaped([B, POOL], init_mask).named("mask")); // [B, POOL] bool
+    let mask = Channel::from_shaped([B, POOL], init_mask).named("mask"); // [B, POOL] bool
     let mut initial_scores = vec![f32::NEG_INFINITY; B as usize];
     initial_scores[0] = 0.0;
-    let scores = bx(Channel::from(initial_scores).named("scores"));
-    let toks = bx(Channel::from(vec![BOS; B as usize]).named("toks"));
-    let pos = bx(Channel::from(vec![0u32; B as usize]).named("pos"));
-    let fill = bx(Channel::from(vec![1u32; 1]).named("fill")); // next free flat position
-    let klen = bx(Channel::from(vec![1u32; B as usize]).named("klen"));
-    let w_slot = bx(Channel::from(vec![pool0; B as usize]).named("w_slot"));
-    let w_off = bx(Channel::from(vec![0u32; B as usize]).named("w_off"));
-    let pages = bx(Channel::from(tiled.clone()).named("pages"));
-    // Pool ids are host-fed each fire and gathered in-graph for writes.
-    let pool_ids_ch = bx(Channel::new([POOL_PAGES], dtype::u32).named("pool_ids"));
-    let out = bx(Channel::new([B], dtype::i32).named("out"));
-    let out_par = bx(Channel::new([B], dtype::u32).named("out_par"));
-    let out_scr = bx(Channel::new([B], dtype::f32).named("out_scr"));
-
+    let scores = Channel::from(initial_scores).named("scores");
+    let toks = Channel::from(vec![BOS; B as usize]).named("toks");
+    let pos = Channel::from(vec![0u32; B as usize]).named("pos");
+    let fill = Channel::from(vec![1u32; 1]).named("fill"); // next free flat position
+    let klen = Channel::from(vec![1u32; B as usize]).named("klen");
+    let w_slot = Channel::from(vec![pool0; B as usize]).named("w_slot");
+    let w_off = Channel::from(vec![0u32; B as usize]).named("w_off");
+    let pages = Channel::from(tiled.clone()).named("pages");
     // Constant pool geometry: page_indptr = [0, POOL_PAGES, 2*POOL_PAGES] (each
     // beam references all pool pages). Bound via a CHANNEL (not the sugar's const
     // PageIndptr): a fire that binds ANY descriptor port to a channel is a
@@ -95,22 +85,27 @@ async fn main(input: Input) -> Result<String> {
     // the same constant) keeps every descriptor port channel-bound (the
     // device-geometry-fire wire-form).
     let pidx_const: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
-    let page_indptr = bx(Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr"));
+    let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
     let lanes_b = Tensor::constant((0u32..=B).collect::<Vec<_>>());
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(toks, lanes_b);
-    fwd.positions(pos);
+    let pool_ids_ch = Channel::new([POOL_PAGES], dtype::u32).named("pool_ids");
+    let out = Channel::new([B], dtype::i32).named("out");
+    let out_par = Channel::new([B], dtype::u32).named("out_par");
+    let out_scr = Channel::new([B], dtype::f32).named("out_scr");
+
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, lanes_b);
+    fwd.positions(&pos);
     // All descriptor ports channel-bound (device-geometry fire wire-form):
     // Pages ← pages, PageIndptr ← page_indptr, KvLen ← klen, WSlot/WOff ← the
     // explicit write descriptor. The pool is fixed so these carry constant values.
-    fwd.attn_working_set(ws, klen);
-    fwd.port_channel(Port::Pages, pages);
-    fwd.port_channel(Port::PageIndptr, page_indptr);
-    fwd.port_channel(Port::WSlot, w_slot);
-    fwd.port_channel(Port::WOff, w_off);
-    fwd.attn_mask(mask);
-    fwd.epilogue(move || {
+    fwd.attn_working_set(&ws, &klen);
+    fwd.port_channel(Port::Pages, &pages);
+    fwd.port_channel(Port::PageIndptr, &page_indptr);
+    fwd.port_channel(Port::WSlot, &w_slot);
+    fwd.port_channel(Port::WOff, &w_off);
+    fwd.attn_mask(&mask);
+    fwd.epilogue(|| {
         // 1. top-B over the flattened [B,V] cand block.
         let cand = add(
             broadcast(reshape(scores.take(), [B, 1]), [B, v]),
@@ -160,7 +155,7 @@ async fn main(input: Input) -> Result<String> {
         pages.put(&pages_ig);
         // Re-emit the constant page_indptr each fire (channel-bound; peeked ports
         // still want a fresh value each pass). [0, POOL_PAGES, 2*POOL_PAGES].
-        page_indptr.put(&Tensor::constant(
+        page_indptr.put(Tensor::constant(
             (0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>(),
         ));
 

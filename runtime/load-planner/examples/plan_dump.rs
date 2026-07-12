@@ -1,15 +1,17 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use pie_weight_loader::dump::dump_storage_program_json;
-use pie_weight_loader::inproc::{compile_snapshot, parse_model_config};
-use pie_weight_loader::storage::StorageTarget;
-use pie_weight_loader::types::{BackendKind, Mxfp4MoePolicy};
+use pie_load_planner::dump::dump_load_plan_json;
+use pie_load_planner::inproc::{compile_snapshot, parse_model_config};
+use pie_load_planner::load_plan::{
+    CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MASK, StorageTarget,
+};
+use pie_load_planner::types::{BackendKind, Mxfp4MoePolicy};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let snapshot = args.next().map(PathBuf::from).unwrap_or_else(|| {
-        eprintln!("usage: compile_dump SNAPSHOT [cuda|metal|dummy] [runtime_quant] [mxfp4_policy]");
+        eprintln!("usage: plan_dump SNAPSHOT [cuda|metal|dummy] [runtime_quant] [mxfp4_policy]");
         std::process::exit(2);
     });
     let backend = match args.next().as_deref().unwrap_or("cuda") {
@@ -41,20 +43,25 @@ fn main() {
         tp_size: 1,
         max_tile_bytes: 64 << 20,
         preferred_alignment: 256,
+        tile_map_mask: match backend {
+            BackendKind::Cuda => CUDA_TILE_MAP_MASK,
+            BackendKind::Metal => METAL_TILE_MAP_MASK,
+            BackendKind::Unknown => HOST_TILE_MAP_MASK,
+        },
         mxfp4_moe,
         native_mxfp4_moe: mxfp4_moe == Mxfp4MoePolicy::NativeGemm,
     };
     let started = Instant::now();
-    let program = compile_snapshot(&snapshot, &model, target).unwrap_or_else(|error| {
+    let plan = compile_snapshot(&snapshot, &model, target).unwrap_or_else(|error| {
         eprintln!("compile failed: {error}");
         std::process::exit(1);
     });
     eprintln!(
         "compiled {} source tensors into {} runtime tensors and {} instructions in {:?}",
-        program.sources.len(),
-        program.tensors.len(),
-        program.instrs.len(),
+        plan.sources.len(),
+        plan.tensors.len(),
+        plan.instrs.len(),
         started.elapsed()
     );
-    println!("{}", dump_storage_program_json(&program).unwrap());
+    println!("{}", dump_load_plan_json(&plan).unwrap());
 }

@@ -12,8 +12,8 @@
 #include "cuda_check.hpp"
 #include "distributed.hpp"
 #include "ops/gemm.hpp"
-#include "loader/rust_loader_bridge.hpp"
-#include "loader/rust_storage_executor.hpp"
+#include "loader/load_plan_bridge.hpp"
+#include "loader/load_plan_executor.hpp"
 #include "model/weight_artifact_cache.hpp"
 #include "tensor.hpp"
 
@@ -106,7 +106,7 @@ private:
 LoadedModel LoadedModel::load(
     const Config& boot_cfg,
     NcclComm* tp_comm,
-    std::span<const std::uint8_t> program_bytes,
+    std::span<const std::uint8_t> load_plan_bytes,
     std::uint64_t compiler_version) {
     (void)tp_comm;
 
@@ -171,21 +171,21 @@ LoadedModel LoadedModel::load(
         .gptq_marlin_int4 = gptq_marlin_int4,
         .mxfp4_native_gemm = mxfp4_native_gemm,
     };
-    RustStorageProgram storage_program =
-        deserialize_rust_storage_program(program_bytes, compiler_version);
-    switch (storage_program.mxfp4_moe()) {
-    case pie_weight_loader::PieLoaderMxfp4MoePolicy::NativeGemm:
+    LoadPlan load_plan =
+        deserialize_load_plan(load_plan_bytes, compiler_version);
+    switch (load_plan.mxfp4_moe()) {
+    case pie_load_planner::PieLoaderMxfp4MoePolicy::NativeGemm:
         if (!backend_target.mxfp4_native_gemm) {
             throw std::runtime_error(
-                "engine: StorageProgram requires native MXFP4 MoE, but this "
+                "engine: LoadPlan requires native MXFP4 MoE, but this "
                 "device/build does not provide it");
         }
         backend_target.mxfp4_moe = Mxfp4MoeLowering::NativeGemm;
         break;
-    case pie_weight_loader::PieLoaderMxfp4MoePolicy::EagerBf16:
+    case pie_load_planner::PieLoaderMxfp4MoePolicy::EagerBf16:
         backend_target.mxfp4_moe = Mxfp4MoeLowering::Bf16Dequant;
         break;
-    case pie_weight_loader::PieLoaderMxfp4MoePolicy::RoutedDecode:
+    case pie_load_planner::PieLoaderMxfp4MoePolicy::RoutedDecode:
         backend_target.mxfp4_moe = Mxfp4MoeLowering::RoutedDequant;
         break;
     }
@@ -286,16 +286,16 @@ LoadedModel LoadedModel::load(
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    log_stage("decode storage program begin");
-    RustLoaderCompileResult rust_plan =
-        load_rust_storage_program(
+    log_stage("decode LoadPlan begin");
+    LoadPlanResult planned_load =
+        prepare_load_plan(
             e.hf_,
-            std::move(storage_program),
-            program_bytes,
+            std::move(load_plan),
+            load_plan_bytes,
             compiler_version);
-    log_stage("decode storage program done");
-    WeightStoreBuilder(e.weights_).reserve(rust_plan.runtime_tensor_count);
-    const auto rust_view = rust_plan.program.view();
+    log_stage("decode LoadPlan done");
+    WeightStoreBuilder(e.weights_).reserve(planned_load.runtime_tensor_count);
+    const auto load_view = planned_load.plan.view();
     if (const char* dump_path =
             std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
         dump_path && dump_path[0] != '\0') {
@@ -305,35 +305,35 @@ LoadedModel LoadedModel::load(
                 "engine: failed to open PIE_CUDA_RUST_LAYOUT_PLAN_DUMP "
                 "path: " + std::string(dump_path));
         }
-        out << dump_rust_storage_program_json(
-            rust_view,
-            rust_plan.source_tensor_count,
-            rust_plan.covered_contract_count,
-            rust_plan.runtime_tensor_count);
+        out << dump_load_plan_json(
+            load_view,
+            planned_load.source_tensor_count,
+            planned_load.covered_contract_count,
+            planned_load.runtime_tensor_count);
     }
     if (verbose) {
         std::cerr
             << "[pie-driver-cuda] layout compiler: rust RuntimeABI -> "
-               "algebra -> storage program\n";
+               "algebra -> LoadPlan\n";
         std::cerr << "[pie-driver-cuda] rust loader compiler: "
-                  << describe_rust_storage_program(
-                         rust_view,
-                         rust_plan.source_tensor_count,
-                         rust_plan.covered_contract_count,
-                         rust_plan.runtime_tensor_count)
+                  << describe_load_plan(
+                         load_view,
+                         planned_load.source_tensor_count,
+                         planned_load.covered_contract_count,
+                         planned_load.runtime_tensor_count)
                   << "\n";
     }
-    if (rust_plan.covered_contract_count != rust_plan.runtime_tensor_count) {
+    if (planned_load.covered_contract_count != planned_load.runtime_tensor_count) {
         throw std::runtime_error(
             "engine: Rust loader did not cover the full RuntimeABI; covered " +
-            std::to_string(rust_plan.covered_contract_count) + "/" +
-            std::to_string(rust_plan.runtime_tensor_count) +
+            std::to_string(planned_load.covered_contract_count) + "/" +
+            std::to_string(planned_load.runtime_tensor_count) +
             " runtime tensors. Add schema/RuntimeABI coverage before enabling "
             "this model.");
     }
 
     // Materialized-weight artifact cache (WEIGHT_LOADER_TODO.md A3.1). The
-    // materialized weights are a deterministic function of rust_plan.cache_key,
+    // materialized weights are a deterministic function of the load-plan cache key,
     // so on a hit we reload them straight into device memory and skip the
     // executor pass below. The compile above is cheap (~tens of ms) and still
     // runs every boot, validating the key + full ABI coverage.
@@ -344,7 +344,7 @@ LoadedModel LoadedModel::load(
         try {
             WeightStoreBuilder cache_builder(e.weights_);
             weight_cache_hit = read_weight_artifact_cache(
-                cache_builder, rust_plan.cache_key, weight_cache_dir);
+                cache_builder, planned_load.cache_key, weight_cache_dir);
         } catch (const std::exception& ex) {
             std::cerr << "[pie-driver-cuda] weight cache: reload failed ("
                       << ex.what() << "); falling back to materialize\n";
@@ -364,11 +364,11 @@ LoadedModel LoadedModel::load(
         // (DeviceTensor RAII). A no-op when the restore left nothing.
         e.weights_ = WeightStore{};
         WeightStoreBuilder rust_builder(e.weights_);
-        RustStorageProgramExecutor rust_executor(
+        LoadPlanExecutor load_executor(
             loader,
             rust_builder,
-            std::move(rust_plan.quant_attachments));
-        log_stage("materialize storage program begin");
+            std::move(planned_load.quant_attachments));
+        log_stage("materialize LoadPlan begin");
         LoadExecutionStats load_memory_stats;
         const bool sample_load_memory =
             verbose || std::getenv("PIE_CUDA_PROFILE_LOAD_MEMORY") != nullptr;
@@ -379,10 +379,10 @@ LoadedModel LoadedModel::load(
         {
             ScopedDeviceTensorMemoryCallback callback(
                 sample_load_memory ? &load_memory_sampler : nullptr);
-            materialized = rust_executor.execute(rust_view);
+            materialized = load_executor.execute(load_view);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
-        log_stage("materialize storage program done");
+        log_stage("materialize LoadPlan done");
         if (sample_load_memory) {
             std::size_t free_after = 0;
             std::size_t total_after = 0;
@@ -414,7 +414,7 @@ LoadedModel LoadedModel::load(
             bool wrote = false;
             try {
                 wrote = write_weight_artifact_cache(
-                    e.weights_, rust_plan.cache_key, weight_cache_dir);
+                    e.weights_, planned_load.cache_key, weight_cache_dir);
             } catch (const std::exception& ex) {
                 std::cerr << "[pie-driver-cuda] weight cache: write failed ("
                           << ex.what() << ")\n";
@@ -431,7 +431,7 @@ LoadedModel LoadedModel::load(
         const double mib_after =
             static_cast<double>(materialized.runtime_quant_bytes_after) /
             (1024.0 * 1024.0);
-        std::cerr << "[pie-driver-cuda] storage program quantised "
+        std::cerr << "[pie-driver-cuda] LoadPlan quantised "
                   << materialized.runtime_quantized_weights
                   << " projections: "
                   << static_cast<std::uint64_t>(mib_before) << " -> "
@@ -464,12 +464,12 @@ LoadedModel LoadedModel::load(
                   << " MiB across "
                   << materialized.cuda_memory_samples << " samples\n";
     }
-    if (const char* profile = std::getenv("PIE_WEIGHT_LOADER_PROFILE");
+    if (const char* profile = std::getenv("PIE_LOAD_EXECUTOR_PROFILE");
         profile != nullptr && profile[0] != '\0' && profile[0] != '0') {
         const auto to_mib = [](std::uint64_t bytes) {
             return bytes / (1024ull * 1024ull);
         };
-        std::cerr << "[pie-driver-cuda] weight loader profile: h2d_copies="
+        std::cerr << "[pie-driver-cuda] load executor profile: h2d_copies="
                   << materialized.h2d_copy_count
                   << " bulk_copies=" << materialized.h2d_bulk_copy_count
                   << " pinned_copies="
@@ -493,7 +493,7 @@ LoadedModel LoadedModel::load(
                   << materialized.h2d_batch_calls
                   << " max_pending="
                   << materialized.max_pending_copies_seen << "\n";
-        std::cerr << "[pie-driver-cuda] weight loader phases: alloc="
+        std::cerr << "[pie-driver-cuda] load executor phases: alloc="
                   << static_cast<int>(materialized.phase_alloc_ms)
                   << "ms transfer=" << static_cast<int>(materialized.phase_transfer_ms)
                   << "ms (pinned_alloc="

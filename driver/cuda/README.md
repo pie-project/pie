@@ -26,7 +26,7 @@ composition root behind that boundary.
 | `src/ops/` | Reusable attention, GEMM, MoE, and state-space wrappers |
 | `src/kernels/` | Leaf CUDA kernels; no higher-layer includes |
 | `src/store/` | Long-lived KV/MLA/DSA/state/swap storage and memory planning |
-| `src/loader/` | Execute runtime-compiled storage programs into `WeightStore` |
+| `src/loader/` | Execute runtime-compiled LoadPlans into `WeightStore` |
 
 `tensor.*` and `distributed.*` are shared core types.
 
@@ -50,7 +50,7 @@ target/cuda/bin/pie_driver_cuda --config driver/cuda/dev.toml
 ```
 
 The standalone target validates device creation. Full model boot is composed by
-`pie-worker`, which compiles and supplies the mandatory storage program before
+`pie-worker`, which compiles and supplies the mandatory LoadPlan before
 serving.
 
 To run the same commands on a GPU workstation:

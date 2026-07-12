@@ -43,6 +43,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
         dtype: pie::inferlet::types::Dtype,
         capacity: u32,
     ) -> Anyhow<Resource<Channel>> {
+        crate::inferlet::process::preemption::honor(self).await?;
         // Pure host bookkeeping — never fails at construction (the WIT
         // constructor cannot carry a result; a channel/decl mismatch instead
         // errors at forward-pass.new / submit).
@@ -58,6 +59,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
     }
 
     async fn put(&mut self, this: Resource<Channel>, value: Vec<u8>) -> Anyhow<Result<(), String>> {
+        crate::inferlet::process::preemption::contention_gate(self).await?;
         let cell = self.ctx().table.get(&this)?.cell.clone();
         loop {
             let result = cell.lock().unwrap().put_ref(&value);
@@ -70,7 +72,13 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
             let Some((endpoint, observed_head)) = wait else {
                 return Ok(Err(ChannelError::Full.to_string()));
             };
-            if let Err(error) = endpoint.wait_for_writer_change(observed_head).await {
+            if let Err(error) = crate::inferlet::process::preemption::await_writer_progress(
+                self,
+                &endpoint,
+                observed_head,
+            )
+            .await
+            {
                 return Ok(Err(error.to_string()));
             }
         }
@@ -86,6 +94,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
     /// fill the cell and `Empty` is returned instead of parking.
     async fn take(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
         loop {
+            crate::inferlet::process::preemption::honor(self).await?;
             let (cell, fires) = {
                 let ch = self.ctx().table.get(&this)?;
                 (ch.cell.clone(), ch.fires.clone())
@@ -98,8 +107,12 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
             if crate::pipeline::fire::drain_settled(self, fires.as_ref()).await? {
                 continue;
             }
-            if let Err(error) =
-                crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
+            if let Err(error) = crate::inferlet::process::preemption::await_channel_progress(
+                self,
+                &cell,
+                fires.as_ref(),
+            )
+            .await
             {
                 return Ok(Err(error));
             }
@@ -109,6 +122,7 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
     /// Non-consuming peek; same await discipline as `take`.
     async fn read(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
         loop {
+            crate::inferlet::process::preemption::honor(self).await?;
             let (cell, fires) = {
                 let ch = self.ctx().table.get(&this)?;
                 (ch.cell.clone(), ch.fires.clone())
@@ -121,8 +135,12 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
             if crate::pipeline::fire::drain_settled(self, fires.as_ref()).await? {
                 continue;
             }
-            if let Err(error) =
-                crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
+            if let Err(error) = crate::inferlet::process::preemption::await_channel_progress(
+                self,
+                &cell,
+                fires.as_ref(),
+            )
+            .await
             {
                 return Ok(Err(error));
             }
@@ -496,6 +514,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         this: Resource<ForwardPass>,
         on: Resource<crate::pipeline::Pipeline>,
     ) -> Anyhow<Result<(), String>> {
+        crate::inferlet::process::preemption::contention_gate(self).await?;
         crate::pipeline::fire::submit_pass(self, on, this).await
     }
 }

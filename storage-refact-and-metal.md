@@ -1,16 +1,16 @@
 # Storage Refactor and Metal Weight Loading
 
-> **The runtime compiles every checkpoint into a `StorageProgram`; every driver
+> **The runtime compiles every checkpoint into a `LoadPlan`; every driver
 > only executes one.** Drivers state device facts, the runtime decides policy,
 > and bulk weight bytes never cross the boundary.
 
-This plan finishes what weight-loader Variant A started
-(`runtime/weight-loader/src/inproc.rs`, `worker/src/embedded_driver.rs`): the
+This plan finishes what the load-planner migration started
+(`runtime/load-planner/src/inproc.rs`, `worker/src/embedded_driver.rs`): the
 runtime-side compile becomes the *only* compile path, driver creation is split
 from model load so the compiler can see device facts, the C++ compile bridge
 and the crate's FFI surface are deleted, and Metal is ported from its own
 hand-rolled loader to the plan-executor model. It deliberately supersedes the
-"Metal keeps its own loader; no Rust weight-loader adoption in this plan"
+"Metal keeps its own loader; no Rust load-planner adoption in this plan"
 carve-out in `cpp-refact-metal.md` — that plan scoped adoption out of the file
 moves; this plan is the adoption.
 
@@ -22,23 +22,23 @@ contract), [cpp-refact.md](cpp-refact.md) (CUDA source layout),
 
 ## 1. Where we are
 
-One Rust compiler (`driver/weight-loader`), two invocation paths, three
+One Rust planner (`runtime/load-planner`), two invocation paths, three
 backends in three different states:
 
 | Backend | Compile | Execute | State |
 |---------|---------|---------|-------|
-| CUDA | Runtime in-proc (`compile_snapshot_to_bytes`) when possible, else C++ parse + `pie_loader_compile` FFI in-driver | `rust_storage_executor.hpp` interprets the program (file IO, staging, H2D, transcode) | Variant A live, with fallbacks |
-| Metal | none — no `StorageProgram` involvement | `heap_bind` / `heap_layout` / `safetensors_view`: mmap → memcpy into one resident `MTLHeap`, per-model name registry baked into `heap_bind_names.cpp` | independent loader |
+| CUDA | Runtime in-proc planning when possible, else C++ parse + legacy FFI in-driver | `load_plan_executor.hpp` interprets the plan (file IO, staging, H2D, transcode) | Variant A live, with fallbacks |
+| Metal | none — no `LoadPlan` involvement | `heap_bind` / `heap_layout` / `safetensors_view`: mmap → memcpy into one resident `MTLHeap`, per-model name registry baked into `heap_bind_names.cpp` | independent loader |
 | Dummy | none | none (no weights) | no coverage of the plan path |
 
 The two CUDA paths run the *same* Rust compiler; the difference is
-compile-via-FFI vs deserialize-from-file (`rust_loader_bridge.hpp`, and the
+compile-via-FFI vs deserialize-from-file (`load_plan_bridge.hpp`, and the
 doc fix already recorded in `cpp-refact.md` Phase 6). The locality switch is
-`[model].storage_program_path` presence in the boot TOML.
+legacy plan-path key presence in the boot TOML.
 
-**Why the fallback path still exists.** `compile_cuda_storage_program`
+**Why the fallback path still exists.** the old CUDA compile helper
 (`worker/src/embedded_driver.rs:265`) bails to the in-driver compile in three
-cases, all rooted in one ordering defect: the program is compiled *before* the
+cases, all rooted in one ordering defect: the plan is compiled *before* the
 driver exists, so the runtime cannot ask the device anything.
 
 1. `runtime_quant="fp8"` — needs the `fp8_native` device query.
@@ -65,14 +65,14 @@ means editing a C++ name registry.
 ```mermaid
 sequenceDiagram
     participant W as worker (boot)
-    participant C as weight-loader (runtime crate)
+    participant C as load-planner (runtime crate)
     participant D as driver
 
     W->>D: create(context config)         %% device select, CUDA ctx / MTL4 ctx, NCCL
     D-->>W: device facts (JSON)           %% fp8_native, sm_100, alignment, tile, UMA
     W->>C: compile(snapshot, config, StorageTarget from facts)
-    C-->>W: serialized StorageProgram     %% placement + transforms; no payloads
-    W->>D: load_model(program bytes)      %% driver executes: reads payloads, places
+    C-->>W: serialized LoadPlan           %% placement + transforms; no payloads
+    W->>D: load_model(plan bytes)         %% driver executes: reads payloads, places
     D-->>W: model capabilities (JSON)     %% arch_name, total_pages, rs_cache_*, ...
 ```
 
@@ -87,7 +87,7 @@ Division of labor (the dumb-driver principle applied to storage):
 | Checkpoint *payload* reading | driver executor, from its own copy |
 | KV/state/scratch pools, page counts | driver at load (unchanged) |
 
-The value invariant is unchanged from Variant A: the program records where
+The value invariant is unchanged from Variant A: the plan records where
 each tensor lives (file id + offset + span) and how to place and transform it;
 **bulk weight bytes never cross the boundary in either direction.**
 
@@ -96,12 +96,12 @@ each tensor lives (file id + offset + span) and how to place and transform it;
 ## 3. Locked decisions
 
 - **S1 — One compiler, runtime-owned.** The crate moves to
-  `runtime/weight-loader` (consumers: `worker`, tests). The in-driver compile
+  `runtime/load-planner` (consumers: `worker`, tests). The in-driver compile
   path is deleted, not deprecated. Layering becomes honest: today a `driver/`
   crate is linked by `worker/`.
 - **S2 — Create and load are separate boot calls.** `create` brings up the
   device context (device select, CUDA ctx / MTL4 ctx, NCCL) and loads no
-  model. `load_model` takes serialized program bytes and executes them. Both
+  model. `load_model` takes serialized plan bytes and executes them. Both
   are blocking boot-time calls, explicitly *outside* the B1 steady-state
   contract of boundary.md (B1 governs bounded per-step verbs; model load is
   seconds long, as `create` already is today).
@@ -116,15 +116,15 @@ each tensor lives (file id + offset + span) and how to place and transform it;
   constants die: `StorageTarget.max_tile_bytes` / `preferred_alignment` come
   from the facts payload, never from copied `#define`s.
 - **S5 — Bulk bytes never cross.** Unchanged invariant, restated because it
-  shapes S7/S8: the program is placement + transforms, payloads are read
+  shapes S7/S8: the plan is placement + transforms, payloads are read
   driver-side.
-- **S6 — Program-present is the only switch, then no switch.** During
-  migration, `load_model` with program bytes executes them and without bytes
+- **S6 — LoadPlan-present is the only switch, then no switch.** During
+  migration, `load_model` with plan bytes executes them and without bytes
   runs the backend's legacy loader (generalizing today's
-  `storage_program_path` presence switch). End state: bytes are mandatory,
+  legacy path-key switch). End state: bytes are mandatory,
   the legacy branch is deleted.
 - **S7 — Metal is an arena backend.** The single resident heap stays. The
-  *weights region's internal layout and size* become program-owned
+  *weights region's internal layout and size* become plan-owned
   (arena-relative offsets = heap offsets); KV/State/Scratch/IO regions remain
   driver-owned (weights are model facts; the rest is runtime state). This is
   the same split `cpp-refact-metal.md` already chose for `heap_layout.hpp`
@@ -136,12 +136,12 @@ each tensor lives (file id + offset + span) and how to place and transform it;
   making decode latency hostage to the pager. The existing resident-once
   invariant (I2, `mtl4_context.mm`) exists precisely to prevent this. mmap
   stays as the zero-copy *read* side during load only.
-- **S9 — Mock-first.** The dummy driver executes `StorageProgram`s against a
+- **S9 — Mock-first.** The dummy driver executes `LoadPlan`s against a
   host-memory arena before either GPU backend changes. One conformance suite,
   three backends (boundary.md §10 house rule).
-- **S10 — The program format is versioned at deserialize.** The serialized
-  program carries the compiler version (the `pie_loader_compiler_version`
-  hash already exists); the executor rejects a mismatch. Embedded drivers
+- **S10 — The LoadPlan format is versioned at deserialize.** The serialized
+  plan carries the `compiler_version` source hash; the executor rejects a
+  mismatch. Embedded drivers
   ship in the same binary so skew is impossible today; the check is cheap
   insurance for any future split.
 
@@ -158,7 +158,7 @@ moves; this plan is a deliberate, planned change to the frozen surface.
 `pie_cuda_create` / `pie_metal_create` keep their shape (config blob in, caps
 out — the channel already exists at `runtime/engine/src/driver/backend/cuda.rs:39`)
 but the semantics narrow: no model load. The boot TOML's `[model]` section
-loses `storage_program_path` and every load-policy knob the compiler now owns
+loses the legacy plan-path key and every load-policy knob the planner now owns
 (`runtime_quant`, `mxfp4_moe` move to compile inputs); `snapshot_dir` stays
 (the executor reads payloads from it).
 
@@ -188,28 +188,28 @@ it does not belong here (S4).
 pub fn load_model(&mut self, desc: &ModelLoadDesc) -> Result<DriverCapabilities>;
 
 pub struct ModelLoadDesc {
-    pub program_bytes: Vec<u8>,   // serialized StorageProgram (mandatory, end state)
+    pub load_plan_bytes: Vec<u8>, // serialized LoadPlan (mandatory, end state)
     pub snapshot_dir: PathBuf,    // payload source, driver-local
     pub compiler_version: u64,    // expected source hash; executor rejects skew
 }
 ```
 
 Delivery is bytes through the call, not a temp file beside the TOML; the
-`*.storage_program.bin` file and its path key die with the migration. A
+The temporary serialized-plan file and its path key die with the migration. A
 possible later evolution (dynamic model load/unload with a `PieCompletion`)
 is explicitly out of scope.
 
 ### 4.4 Tensor parallel
 
 `cuda_group_create` returns per-rank device facts; the runtime compiles one
-program per rank (`StorageTarget` already carries `tp_rank`/`tp_size`) and
+plan per rank (`StorageTarget` already carries `tp_rank`/`tp_size`) and
 issues one `load_model` per rank. NCCL init stays in create, where it is
 today.
 
 ### 4.5 Dummy
 
 `create` returns synthetic facts (`unified_memory=true`, host alignment);
-`load_model` executes the program against a host arena and returns the caps
+`load_model` executes the plan against a host arena and returns the caps
 it currently fabricates from options. This is what makes the conformance
 suite (S9) run in CI without a GPU.
 
@@ -248,16 +248,16 @@ suite (S9) run in CI without a GPU.
 ### 6.1 Kill the fallbacks
 
 With facts available at compile time, all three `return None` branches in
-`compile_cuda_storage_program` are deleted; the runtime compile is
+the CUDA compile fallback branches are deleted; runtime planning is
 unconditional. The config-parse fallback needs a parity audit first: today a
 Rust `parse_model_config` failure is silently masked by the C++ `HfConfig`
 parse. Gate: every checkpoint in the test/bench fleet compiles through
-`parse_model_config` (use `compile_dump` for goldens) *before* the mask is
+`parse_model_config` (use `plan_dump` for goldens) *before* the mask is
 removed, so no model regresses from "loads via C++ parse" to "hard error".
 
 ### 6.2 Delete the compile side, keep the executor
 
-Stays (execution machinery): `rust_storage_executor.hpp` (681),
+Stays (execution machinery): `load_plan_executor.hpp`,
 `transcode_engine.hpp` (1,176), `weight_copy_engine.hpp` (458),
 `staged_h2d.hpp` (172), `strided_copy.hpp` (95), `weight_store_codec.hpp`
 (529), `safetensors_manifest.*` (94; file-id → path order must keep matching
@@ -270,7 +270,7 @@ Dies (compile input machinery):
 | File | Lines | Note |
 |------|-------|------|
 | `loader/rust_loader_input.hpp` | 438 | FFI input construction |
-| `loader/rust_loader_bridge.hpp` | 863 → ~150 | shrinks to deserialize-only wrapper |
+| `loader/load_plan_bridge.hpp` | shrinks to deserialize-only wrapper |
 | `loader/safetensors.{cpp,hpp}` | 785 | header parse fed the compile; audit executor for residual uses before deleting |
 | `loader/dtype_map.hpp`, `tensor_spec.hpp` | 136 | audit: compile-input-only? |
 | crate `ffi.rs`, `ffi_arena.rs`, `ffi_types.rs` | 1,583 | whole FFI surface |
@@ -287,16 +287,16 @@ Roughly 3.5–4k lines net-deleted, in the deletion-first spirit of
 ### 7.1 Executor semantics on UMA
 
 Much simpler than CUDA's: no pinned staging, no H2D, no streams, no
-load-time GPU compute in v1. Interpret the program's placements as CPU writes
+load-time GPU compute in v1. Interpret the plan's placements as CPU writes
 into the shared-storage heap: raw or strided `memcpy` from the mmap
 (`SafetensorsView` is reused as the payload source) into
 `weights_region_base + arena_offset`; any dtype transforms run on the CPU
 during load. If a transform ever becomes load-time-critical, a Metal compute
-pass can be added later without changing the program format.
+pass can be added later without changing the LoadPlan format.
 
 ### 7.2 Arena mapping and binding
 
-The program's arena is the weights region of the single heap. Because the
+The plan's arena is the weights region of the single heap. Because the
 compiler emits offsets, binding can move from thousands of placed
 per-tensor `MTLBuffer` objects to **one region + offsets** —
 `MTL4ArgumentTable` binds `gpuAddress + offset` anyway. Fewer API objects,
@@ -347,13 +347,13 @@ denser packing, and the residency story stays O(1) (one heap in one
 Each phase is independently shippable; gates are blocking.
 
 **Phase 0 — Boundary split.** `create`/`load_model` verbs, capability split
-(§4), program delivery as bytes. All backends keep their current load
-behavior behind S6's program-absent branch (Metal and dummy take no program
+(§4), LoadPlan delivery as bytes. All backends keep their current load
+behavior behind S6's plan-absent branch (Metal and dummy take no plan
 yet; CUDA accepts bytes where it read a file). ABI version bump.
 *Gate:* every existing model boots through the two-call sequence on
 cuda/metal/dummy; TP group boots per-rank.
 
-**Phase 1 — Mock-first executor.** Dummy executes programs against a host
+**Phase 1 — Mock-first executor.** Dummy executes LoadPlans against a host
 arena; the conformance suite (place, strided copy, transform, tile bounds,
 version rejection) runs in CI.
 *Gate:* suite green with no GPU.
@@ -364,25 +364,25 @@ facts; delete the three fallbacks after the config-parity audit (§6.1).
 hardware; `cuda_plain_gen` and the loader bench are unchanged.
 
 **Phase 3 — Deletion + crate move.** Delete the C++ compile bridge and the
-crate FFI surface (§6.2); `git mv driver/weight-loader runtime/weight-loader`.
+crate FFI surface (§6.2); move the planner crate to `runtime/load-planner`.
 *Gate:* build + ctest; `grep -rn "pie_loader_compile" driver/` is empty;
 no `driver/`-path dependency remains in `worker/Cargo.toml`.
 
 **Phase 4 — Compiler learns Metal.** `BackendKind::Metal`, `MlxAffineU4`,
 schema port from `heap_bind_names.cpp`, `"pie-metal"` ABI contracts (§5).
-*Gate:* `compile_dump` golden for the Qwen3.5 checkpoint; offline layout
+*Gate:* `plan_dump` golden for the Qwen3.5 checkpoint; offline layout
 diff vs the current heap plan (§7.4).
 
-**Phase 5 — Metal executor.** Execute programs into the heap's weights
+**Phase 5 — Metal executor.** Execute LoadPlans into the heap's weights
 region (§7); delete `heap_bind_names.cpp` and the weights half of
 `heap_layout.hpp`; shrink `heap_bind.cpp` to region alloc + ordinal binding.
 *Gate:* decode parity token-for-token; latency unchanged; S6's
-program-absent branch deleted for Metal.
+plan-absent branch deleted for Metal.
 
-**Phase 6 — Sweep.** Make `program_bytes` mandatory everywhere; supersede
+**Phase 6 — Sweep.** Make `load_plan_bytes` mandatory everywhere; supersede
 the `cpp-refact-metal.md` carve-out and stale comments; update boundary.md's
 source map and §7 status line for Metal.
-*Gate:* `grep -rn "storage_program_path"` is empty; docs point here.
+*Gate:* the legacy plan-path key is absent; docs point here.
 
 ---
 
@@ -391,9 +391,9 @@ source map and §7 status line for Metal.
 | Area | What | Lines (approx) |
 |------|------|-------|
 | CUDA loader | `rust_loader_input.hpp`, bridge shrink, `safetensors.{cpp,hpp}`, input-only headers | ~2,000 |
-| weight-loader crate | `ffi.rs`, `ffi_arena.rs`, `ffi_types.rs`, cbindgen/build/include, FFI tests | ~1,800 |
+| load-planner crate | `ffi.rs`, `ffi_arena.rs`, `ffi_types.rs`, cbindgen/build/include, FFI tests | ~1,800 |
 | Metal loader | `heap_bind_names.cpp` (173), `heap_layout.hpp` weights half, `heap_bind.cpp` staging shrink | ~350 |
-| Worker | three fallback branches, mirrored constants, program temp-file plumbing, dead `mtp_assistant_snapshot_dir` key | ~130 |
+| Worker | three fallback branches, mirrored constants, plan temp-file plumbing, dead `mtp_assistant_snapshot_dir` key | ~130 |
 
 New code: device-facts payload + `load_model` verb (small), dummy executor
 (small, host memcpy interpreter), Metal executor (§7.1, small by design),
@@ -411,16 +411,16 @@ compiler Metal knowledge (§5 — the one genuinely new component).
   The parity gate (§7.4) exists for this; land it as its own commit.
 - **MLX group-size variants.** g32/g128 checkpoints exist in the wild;
   `MlxAffineU4` must key off `QuantSpec.group_size`, not assume 64.
-- **GGUF on Metal.** `validate_snapshot_dir` accepts `.gguf` and the
-  compiler parses GGUF headers, but the Metal executor targets safetensors
-  payload reads first. Scope: safetensors in Phase 5, GGUF after.
+- **GGUF remains deferred.** The planner can inspect direct GGUF metadata, but
+  worker boot rejects `.gguf` explicitly until model-config planning and native
+  payload execution support it end to end.
 - **`mtp_assistant_snapshot_dir` is dead plumbing, not an open question.**
   The worker writes the key into the boot TOML (`config.rs:651`,
   `embedded_driver.rs:397`) but no driver reads it; the CUDA config parses
   only `mtp_num_drafts`. MTP weights ride the main snapshot (`mtp.*`
   tensors; `registry.hpp` derives `has_mtp` from the bound weights), which
   matches how current checkpoints ship. The verb stays one snapshot → one
-  program → one `load_model`; the dead key is deleted in the Phase 6 sweep.
+  plan → one `load_model`; the dead key is deleted in the Phase 6 sweep.
 - **Alignment assumptions.** Do not assume 256/16 KB on future devices;
   everything flows from the facts payload by construction (S4). The risk is
   a hardcode sneaking back in — the Phase 6 sweep greps for the literals.
@@ -431,14 +431,14 @@ compiler Metal knowledge (§5 — the one genuinely new component).
 
 | Concern | File |
 |---------|------|
-| Runtime-side compile entry | `runtime/weight-loader/src/inproc.rs` |
-| Compiler core | `runtime/weight-loader/src/{storage_compiler,frontend,semantic,schema,optimizer,typecheck}.rs` |
+| Runtime-side planning entry | `runtime/load-planner/src/inproc.rs` |
+| Planner core | `runtime/load-planner/src/{planner,frontend,semantic,schema,optimizer,typecheck}.rs` |
 | Worker boot compile + fallbacks | `worker/src/embedded_driver.rs:265-368` |
 | Driver create + caps channel | `runtime/engine/src/driver/backend/{cuda,metal,dummy}.rs` |
 | Capabilities payload | `interface/driver/src/capabilities.rs` |
 | ABI types / generated header | `interface/driver/src/local.rs`, `interface/driver/include/pie_driver_abi.h` |
 | CUDA compile bridge (dies) | `driver/cuda/src/loader/rust_loader_{bridge,input}.hpp` |
-| CUDA executor (stays) | `driver/cuda/src/loader/rust_storage_executor.hpp` + copy/transcode engines |
+| CUDA executor (stays) | `driver/cuda/src/loader/load_plan_executor.hpp` + copy/transcode engines |
 | Metal loader (replaced) | `driver/metal/src/loader/{heap_bind*,heap_layout,safetensors_view}.*` |
 | Metal context / residency | `driver/metal/src/mtl4_context.{hpp,mm}` |
 
@@ -447,7 +447,7 @@ compiler Metal knowledge (§5 — the one genuinely new component).
 ## Provenance
 
 Authored 2026-07-11 from the create/load-split and Metal-adoption design
-discussion. Supersedes the weight-loader non-goals in `cpp-refact-metal.md`
-(§ non-goals, "Rust weight-loader adoption") and completes the Variant A
-migration described in `runtime/weight-loader/src/inproc.rs` and
+discussion. Supersedes the load-planner non-goals in `cpp-refact-metal.md`
+(§ non-goals, "Rust load-planner adoption") and completes the migration
+described in `runtime/load-planner/src/inproc.rs` and
 `worker/src/embedded_driver.rs`.

@@ -13,7 +13,7 @@
 #include "decode_abi.hpp"
 #include "heap_layout.hpp"      // HeapPlan
 #include "mtl4_context.hpp"     // RawMetalContext, SlotHandle
-#include "pie_native/storage_program.hpp"
+#include "pie_native/load_plan.hpp"
 
 namespace pie::metal {
 
@@ -54,9 +54,9 @@ struct BoundDecode {
 BoundDecode stage_decode_storage(
     RawMetalContext& ctx,
     const SafetensorsView& view,
-    const pie_weight_loader::StorageProgram& program,
+    const pie_load_planner::LoadPlan& load_plan,
     const DecodeGeometry& g,
-    const HeapPlan& plan);
+    const HeapPlan& heap_plan);
 
 // Walk beta's DAG; bind delta's weight/state/KV/IO slots for each dispatch by ordinal.
 void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,

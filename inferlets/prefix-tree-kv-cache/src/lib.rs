@@ -18,33 +18,22 @@ fn default_num_tokens() -> usize {
     32
 }
 
-fn bx<T>(value: T) -> &'static T {
-    Box::leak(Box::new(value))
-}
-
-fn append_tokens(
-    ws: &'static WorkingSet,
-    pipeline: &Pipeline,
-    start: u32,
-    tokens: &[u32],
-) -> Result<i32> {
+fn append_tokens(ws: &WorkingSet, pipeline: &Pipeline, start: u32, tokens: &[u32]) -> Result<i32> {
     if tokens.is_empty() {
         return Err("cannot append an empty token sequence".into());
     }
     let n = tokens.len() as u32;
     let total = start + n;
-    let token_input = bx(Channel::from(
-        tokens.iter().map(|&token| token as i32).collect::<Vec<_>>(),
-    ));
-    let positions = bx(Channel::from((start..total).collect::<Vec<_>>()));
-    let klen = bx(Channel::from(vec![total]));
-    let next_token = bx(Channel::new([1], dtype::i32).named("next_token"));
+    let token_input = Channel::from(tokens.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let positions = Channel::from((start..total).collect::<Vec<_>>());
+    let klen = Channel::from(vec![total]);
+    let next_token = Channel::new([1], dtype::i32).named("next_token");
 
-    let fwd: ForwardPass<'static> = ForwardPass::new();
-    fwd.embed(token_input, Tensor::constant(vec![0u32, n]));
-    fwd.positions(positions);
-    fwd.attn_working_set(ws, klen);
-    fwd.epilogue(move || {
+    let fwd = ForwardPass::new();
+    fwd.embed(&token_input, Tensor::constant(vec![0u32, n]));
+    fwd.positions(&positions);
+    fwd.attn_working_set(ws, &klen);
+    fwd.epilogue(|| {
         next_token.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
     fwd.submit(pipeline)
@@ -56,7 +45,7 @@ fn append_tokens(
 }
 
 fn generate(
-    ws: &'static WorkingSet,
+    ws: &WorkingSet,
     seq_len: u32,
     first_token: i32,
     max_tokens: usize,
@@ -74,17 +63,17 @@ fn generate(
         return Ok(generated);
     }
 
-    let token_in = bx(Channel::from(vec![first_token]).named("token_in"));
-    let position = bx(Channel::from(vec![seq_len]).named("position"));
-    let klen = bx(Channel::from(vec![seq_len + 1]).named("klen"));
-    let fill = bx(Channel::from(vec![seq_len + 1]).named("fill"));
-    let token_out = bx(Channel::new([1], dtype::i32).named("token_out"));
+    let token_in = Channel::from(vec![first_token]).named("token_in");
+    let position = Channel::from(vec![seq_len]).named("position");
+    let klen = Channel::from(vec![seq_len + 1]).named("klen");
+    let fill = Channel::from(vec![seq_len + 1]).named("fill");
+    let token_out = Channel::new([1], dtype::i32).named("token_out");
 
-    let fwd: ForwardPass<'static> = ForwardPass::new();
-    fwd.embed(token_in, Tensor::constant(vec![0u32, 1]));
-    fwd.positions(position);
-    fwd.attn_working_set(ws, klen);
-    fwd.epilogue(move || {
+    let fwd = ForwardPass::new();
+    fwd.embed(&token_in, Tensor::constant(vec![0u32, 1]));
+    fwd.positions(&position);
+    fwd.attn_working_set(ws, &klen);
+    fwd.epilogue(|| {
         let base = fill.take().tensor();
         let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
         let next = add(&base, 1u32);
@@ -115,14 +104,14 @@ fn generate(
 
 struct Branch {
     label: String,
-    ws: &'static WorkingSet,
+    ws: WorkingSet,
     seq_len: u32,
 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
-    let root: &'static WorkingSet = bx(WorkingSet::new());
+    let root = WorkingSet::new();
     model::configure(vocab, root.page_size(), 1);
 
     let root_tokens = wit_model::encode("Write a short scene set");
@@ -131,14 +120,14 @@ async fn main(input: Input) -> Result<String> {
     }
 
     let tree_pipeline = Pipeline::new();
-    append_tokens(root, &tree_pipeline, 0, &root_tokens)?;
+    append_tokens(&root, &tree_pipeline, 0, &root_tokens)?;
     let root_len = root_tokens.len() as u32;
 
     let mut first_level = Vec::new();
     for suffix in [" in a city", " in a forest"] {
-        let child: &'static WorkingSet = bx(root.fork(&tree_pipeline)?);
+        let child = root.fork(&tree_pipeline)?;
         let tokens = wit_model::encode(suffix);
-        append_tokens(child, &tree_pipeline, root_len, &tokens)?;
+        append_tokens(&child, &tree_pipeline, root_len, &tokens)?;
         first_level.push(Branch {
             label: suffix.trim().into(),
             ws: child,
@@ -149,9 +138,9 @@ async fn main(input: Input) -> Result<String> {
     let mut leaves = Vec::new();
     for parent in first_level {
         for suffix in [" at dawn", " at night"] {
-            let leaf: &'static WorkingSet = bx(parent.ws.fork(&tree_pipeline)?);
+            let leaf = parent.ws.fork(&tree_pipeline)?;
             let tokens = wit_model::encode(suffix);
-            let first = append_tokens(leaf, &tree_pipeline, parent.seq_len, &tokens)?;
+            let first = append_tokens(&leaf, &tree_pipeline, parent.seq_len, &tokens)?;
             leaves.push((
                 format!("{} {}", parent.label, suffix.trim()),
                 leaf,
@@ -164,7 +153,7 @@ async fn main(input: Input) -> Result<String> {
 
     let mut outputs = Vec::with_capacity(leaves.len());
     for (label, ws, seq_len, first) in leaves {
-        let generated = generate(ws, seq_len, first, input.num_tokens)?;
+        let generated = generate(&ws, seq_len, first, input.num_tokens)?;
         outputs.push(format!("{label}: {}", wit_model::decode(&generated)?));
     }
     Ok(outputs.join("\n"))

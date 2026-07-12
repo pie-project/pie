@@ -1,8 +1,8 @@
 use crate::config::ModelConfig;
 use crate::error::CompileError;
+use crate::load_plan::StorageTarget;
 use crate::semantic::SemanticRole;
 use crate::source::{CheckpointMetadata, RawTensor};
-use crate::storage::StorageTarget;
 use crate::types::{
     Axis, BackendKind, DType, Encoding, Layout, Mxfp4MoePolicy, QuantScheme, QuantSpec,
     RepackLayout, RepackSpec, RowMap, Sharding, TensorId,
@@ -104,9 +104,9 @@ impl RuntimeAbi {
                         }),
                     )
                 });
-        if crate::wl_debug_enabled() {
+        if crate::planner_debug_enabled() {
             eprintln!(
-                "[pie-weight-loader] default ABI model_type={} tp={}/{} tensors={} sharded={} bytes={} sharded_bytes={}",
+                "[pie-load-planner] default ABI model_type={} tp={}/{} tensors={} sharded={} bytes={} sharded_bytes={}",
                 cfg.model_type,
                 target.tp_rank,
                 target.tp_size,
@@ -233,10 +233,10 @@ impl RuntimeAbi {
             return Ok(self.clone());
         }
 
-        if crate::wl_debug_enabled() {
+        if crate::planner_debug_enabled() {
             let coalesced = groups.iter().map(Vec::len).sum::<usize>();
             eprintln!(
-                "[pie-weight-loader] row-shard coalescing groups={} tensors={} max_bank_bytes={}",
+                "[pie-load-planner] row-shard coalescing groups={} tensors={} max_bank_bytes={}",
                 groups.len(),
                 coalesced,
                 max_bank_bytes
@@ -443,6 +443,8 @@ struct ArchProfile {
     /// qwen3_5_moe forward expects. Plain Qwen3-MoE (Qwen3-30B-A3B) ships
     /// per-expert weights; qwen3_5_moe checkpoints ship pre-fused (then a no-op).
     stack_per_expert_moe: bool,
+    /// The canonical Metal Qwen3.5/GDN storage schema is defined for this arch.
+    metal_qwen35: bool,
     /// Tensor-parallel shard-axis strategy, keyed by tensor name. Defaults to the
     /// llama-family rules; archs with a different expert/attention layout (e.g.
     /// DeepSeek-V4's native `.ffn.experts.w*`) register their own function.
@@ -461,6 +463,7 @@ const GENERIC_ARCH: ArchProfile = ArchProfile {
     bf16_runtime_quant: false,
     skip_dense_qkv_fusion: false,
     stack_per_expert_moe: false,
+    metal_qwen35: false,
     shard_axis_fn: llama_like_shard_axis,
 };
 
@@ -543,14 +546,20 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
     ),
     (
         &[
-            "qwen3",
-            "qwen2",
-            "llama",
-            "llama3",
-            "mistral",
             "qwen3_5",
             "qwen3_5_text",
+            "qwen3_next",
+            "qwen3_next_text",
+            "qwen3_6",
         ],
+        ArchProfile {
+            bf16_runtime_quant: true,
+            metal_qwen35: true,
+            ..GENERIC_ARCH
+        },
+    ),
+    (
+        &["qwen3", "qwen2", "llama", "llama3", "mistral"],
         ArchProfile {
             bf16_runtime_quant: true,
             ..GENERIC_ARCH
@@ -567,19 +576,32 @@ fn arch_profile(model_type: &str) -> ArchProfile {
     GENERIC_ARCH
 }
 
-fn metal_qwen35_runtime_name(raw_name: &str) -> Option<String> {
+fn metal_qwen35_runtime_name(raw_name: &str) -> Result<Option<String>, CompileError> {
+    if raw_name.starts_with("model.visual.") || raw_name.starts_with("mtp.") {
+        return Ok(None);
+    }
     if let Some(suffix) = raw_name.strip_prefix("lm_head.") {
-        return Some(format!("shared_embedding.{suffix}"));
+        return Ok(Some(format!("shared_embedding.{suffix}")));
     }
     if raw_name == "model.language_model.norm.weight" {
-        return Some("final_norm.weight".to_string());
+        return Ok(Some("final_norm.weight".to_string()));
     }
-    let rest = raw_name.strip_prefix("model.language_model.layers.")?;
-    let (layer, suffix) = rest.split_once('.')?;
+    let Some(rest) = raw_name.strip_prefix("model.language_model.layers.") else {
+        return Err(CompileError::InvalidInput(format!(
+            "Metal Qwen3.5 schema has no declared mapping or skip for '{raw_name}'"
+        )));
+    };
+    let Some((layer, suffix)) = rest.split_once('.') else {
+        return Err(CompileError::InvalidInput(format!(
+            "Metal Qwen3.5 layer tensor '{raw_name}' is malformed"
+        )));
+    };
     if layer.is_empty() || !layer.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+        return Err(CompileError::InvalidInput(format!(
+            "Metal Qwen3.5 layer tensor '{raw_name}' has an invalid layer index"
+        )));
     }
-    Some(format!("layers.{layer}.{suffix}"))
+    Ok(Some(format!("layers.{layer}.{suffix}")))
 }
 
 impl DefaultAbiBuilder<'_> {
@@ -589,14 +611,7 @@ impl DefaultAbiBuilder<'_> {
 
     fn build(&mut self) -> Result<(), CompileError> {
         if self.target.backend == BackendKind::Metal {
-            if self.metadata.tensors.iter().any(|tensor| {
-                tensor.name == "lm_head.weight" && tensor.encoding == Encoding::Raw(DType::U32)
-            }) && self
-                .metadata
-                .tensors
-                .iter()
-                .any(|tensor| tensor.name.starts_with("model.language_model.layers."))
-            {
+            if self.profile().metal_qwen35 {
                 return self.add_metal_qwen35_contracts();
             }
             return Err(CompileError::InvalidInput(format!(
@@ -633,21 +648,24 @@ impl DefaultAbiBuilder<'_> {
     fn add_metal_qwen35_contracts(&mut self) -> Result<(), CompileError> {
         let tensors = self.metadata.tensors.clone();
         for raw in &tensors {
-            let Some(output_name) = metal_qwen35_runtime_name(&raw.name) else {
+            let Some(output_name) = metal_qwen35_runtime_name(&raw.name)? else {
                 continue;
             };
-            if raw.name.ends_with(".weight")
-                && raw.encoding == Encoding::Raw(DType::U32)
-                && let Some(base) = raw.name.strip_suffix(".weight")
-                && let (Some(scales), Some(biases)) = (
+            if raw.name.ends_with(".weight") && raw.encoding == Encoding::Raw(DType::U32) {
+                let base = raw.name.strip_suffix(".weight").expect("suffix checked");
+                let (Some(scales), Some(biases)) = (
                     tensors
                         .iter()
                         .find(|candidate| candidate.name == format!("{base}.scales")),
                     tensors
                         .iter()
                         .find(|candidate| candidate.name == format!("{base}.biases")),
-                )
-            {
+                ) else {
+                    return Err(CompileError::InvalidInput(format!(
+                        "Metal affine-U4 weight '{}' is missing scales or biases",
+                        raw.name
+                    )));
+                };
                 self.push_mlx_affine_u4(raw, scales, biases, output_name)?;
             } else {
                 self.push_direct(raw, output_name, None);

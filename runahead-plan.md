@@ -156,10 +156,11 @@ translation-segment overlay in `dispatch.cu` is the seed of it).
   added at prepare, merged into the table at commit, removed at abort;
   pass drop drains the FIFO in order, so entries retire in order.
 - **Unready translation is not an error.** A fire whose translation cannot
-  be completed at dispatch (predecessor never prepared, pages unavailable)
-  is a RETRY row (Section 4.4). OutOfPages at dispatch routes into the
-  contention ladder and then RETRY; it must escalate (Section 4.4), never
-  silently livelock.
+  be completed because a predecessor has not prepared is a RETRY row
+  (Section 4.4). OutOfPages is different: the preparation leaves the hot
+  rotation as BLOCKED, the contention ladder owns its reservation-backed
+  wait, and a grant or terminal error nudges it back into preparation.
+  Blocked time does not consume `PIE_FIRE_RETRY_MAX`.
 - **Admission bound.** Pending fires consume real pages before they
   commit. Runahead depth bounds this today (depth x pages per fire);
   deeper depths require an explicit allocation credit so pending fires
@@ -292,7 +293,8 @@ constant.
 | Outcome | Trigger | Channel effects | KV/RS effects | Scheduler action |
 |---|---|---|---|---|
 | COMMITTED | all commit preconditions pass | consumes at `expected_head`, publishes at `expected_tail` (device-side, predicated) | txn finalizes, mapping publishes | retire fire, guest FIFO drains |
-| RETRY | required entry absent; ticket mismatch (predecessor retried); no output capacity; translation unready at dispatch | none (rings untouched) | none (pending mapping stays, pages retained) | requeue the same LogicalFire; re-issue copy plans; count as wave participation |
+| RETRY | required entry absent; ticket mismatch (predecessor retried); no output capacity; non-memory translation dependency unready | none (rings untouched) | none (pending mapping stays, pages retained) | requeue the same LogicalFire; re-issue copy plans; count as wave participation |
+| BLOCKED | KV allocation awaits a contention grant or requester restore | none (rings untouched) | no prepared txn; concrete grant is reserved for one process/request | remove from retry rotation; nudge and reinsert on grant/restore/error |
 | FAILED | `pass.ok == false`, driver error, launch exception, escalation threshold | poison all host-visible channels | txn aborts, epoch-deferred page recycle | fail the pass, poison readers, pipeline terminates |
 
 The runtime-side identity that makes RETRY coherent:
@@ -439,8 +441,8 @@ works); phases 2-3 make P3/P4 real; phases 4-5 finish the end state.
   `KvTxn` lifecycle, and OutOfPages policy at dispatch time. The driver
   consumes finished translation segments.
 - Submission carries WS-relative geometry only; unready translation maps
-  to RETRY; OutOfPages routes through the contention ladder then RETRY
-  with escalation.
+  to RETRY; OutOfPages routes through the contention ladder and becomes an
+  event-driven BLOCKED preparation until a concrete grant or terminal error.
 - Allocation credit bounds pending-fire pool usage before deeper depths
   unlock.
 - `match_prefix` stays a submit-time committed-only read; the trim

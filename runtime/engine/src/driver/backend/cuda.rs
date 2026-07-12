@@ -72,9 +72,9 @@ impl CudaDriverHandle {
             abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
             compiler_version: desc.compiler_version,
-            program_bytes: PieBytes {
-                ptr: desc.program_bytes.as_ptr(),
-                len: desc.program_bytes.len(),
+            load_plan_bytes: PieBytes {
+                ptr: desc.load_plan_bytes.as_ptr(),
+                len: desc.load_plan_bytes.len(),
             },
             snapshot_dir: PieBytes {
                 ptr: snapshot.as_ptr(),

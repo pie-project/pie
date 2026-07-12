@@ -47,10 +47,6 @@ fn default_alpha() -> f32 {
     0.1
 }
 
-fn bx<T>(value: T) -> &'static T {
-    Box::leak(Box::new(value))
-}
-
 fn contrastive_pick(amateur_logits: impl AsTensor, lambda: f32, alpha: f32, vocab: u32) -> Tensor {
     let expert = log_softmax(intrinsics::logits());
     let amateur = log_softmax(amateur_logits);
@@ -105,44 +101,43 @@ async fn main(input: Input) -> Result<String> {
 
     // The amateur uses a dedicated KV pool so its bounded-context hidden states
     // never contaminate the expert's full-context state.
-    let amateur_ws: &'static WorkingSet = bx(WorkingSet::new());
+    let amateur_ws = WorkingSet::new();
     let amateur_slots = amateur_ws
         .reserve(pool_pages)
         .map_err(|error| format!("reserve amateur KV: {error}"))?;
-    let amateur_ids: &'static Vec<u32> = bx(amateur_slots.ids().to_vec());
+    let amateur_ids = amateur_slots.ids().to_vec();
 
     let prompt_i32 = prompt.iter().map(|&token| token as i32).collect::<Vec<_>>();
-    let amateur_prompt = bx(Channel::from(prompt_i32.clone()).named("amateur_prompt"));
-    let amateur_prefill_slots = bx(Channel::from(
+    let amateur_prompt = Channel::from(prompt_i32.clone()).named("amateur_prompt");
+    let amateur_prefill_slots = Channel::from(
         (0..n)
             .map(|position| amateur_ids[(position / PAGE_T) as usize])
             .collect::<Vec<_>>(),
-    ));
-    let amateur_prefill_offsets = bx(Channel::from(
-        (0..n).map(|position| position % PAGE_T).collect::<Vec<_>>(),
-    ));
-    let amateur_prefill_klen = bx(Channel::from(vec![n]));
-    let amateur_prefill_pages = bx(Channel::from(amateur_ids.clone()));
-    let amateur_prefill_indptr = bx(Channel::from_shaped([2], vec![0u32, pool_pages]));
-    let amateur_prefill_mask = bx(Channel::from_shaped(
+    );
+    let amateur_prefill_offsets =
+        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>());
+    let amateur_prefill_klen = Channel::from(vec![n]);
+    let amateur_prefill_pages = Channel::from(amateur_ids.clone());
+    let amateur_prefill_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    let amateur_prefill_mask = Channel::from_shaped(
         [n, pool_len],
         (0..n)
             .flat_map(|query| {
                 (0..pool_len).map(move |key| key <= query && key.saturating_add(window) > query)
             })
             .collect::<Vec<_>>(),
-    ));
-    let amateur_prefill_out = bx(Channel::new([vocab], dtype::f32).named("amateur_prefill_logits"));
+    );
+    let amateur_prefill_out = Channel::new([vocab], dtype::f32).named("amateur_prefill_logits");
 
-    let amateur_prefill: ForwardPass<'static> = ForwardPass::new();
-    amateur_prefill.embed(amateur_prompt, Tensor::constant(vec![0u32, n]));
-    amateur_prefill.attn_working_set(amateur_ws, amateur_prefill_klen);
-    amateur_prefill.port_channel(Port::Pages, amateur_prefill_pages);
-    amateur_prefill.port_channel(Port::PageIndptr, amateur_prefill_indptr);
-    amateur_prefill.port_channel(Port::WSlot, amateur_prefill_slots);
-    amateur_prefill.port_channel(Port::WOff, amateur_prefill_offsets);
-    amateur_prefill.attn_mask(amateur_prefill_mask);
-    amateur_prefill.epilogue(move || {
+    let amateur_prefill = ForwardPass::new();
+    amateur_prefill.embed(&amateur_prompt, Tensor::constant(vec![0u32, n]));
+    amateur_prefill.attn_working_set(&amateur_ws, &amateur_prefill_klen);
+    amateur_prefill.port_channel(Port::Pages, &amateur_prefill_pages);
+    amateur_prefill.port_channel(Port::PageIndptr, &amateur_prefill_indptr);
+    amateur_prefill.port_channel(Port::WSlot, &amateur_prefill_slots);
+    amateur_prefill.port_channel(Port::WOff, &amateur_prefill_offsets);
+    amateur_prefill.attn_mask(&amateur_prefill_mask);
+    amateur_prefill.epilogue(|| {
         amateur_prefill_out.put(intrinsics::logits());
     });
 
@@ -158,19 +153,18 @@ async fn main(input: Input) -> Result<String> {
 
     // The expert keeps the complete context and consumes the amateur logits in
     // its epilogue to perform the contrastive token selection on-device.
-    let expert_ws: &'static WorkingSet = bx(WorkingSet::new());
-    let expert_prompt = bx(Channel::from(prompt_i32).named("expert_prompt"));
-    let expert_prefill_klen = bx(Channel::from(vec![n]));
-    let expert_prefill_amateur =
-        bx(Channel::new([vocab], dtype::f32).named("expert_prefill_amateur"));
-    let first_out = bx(Channel::new([1], dtype::i32).named("first_token"));
+    let expert_ws = WorkingSet::new();
+    let expert_prompt = Channel::from(prompt_i32).named("expert_prompt");
+    let expert_prefill_klen = Channel::from(vec![n]);
+    let expert_prefill_amateur = Channel::new([vocab], dtype::f32).named("expert_prefill_amateur");
+    let first_out = Channel::new([1], dtype::i32).named("first_token");
     let lambda = input.lambda;
     let alpha = input.alpha;
 
-    let expert_prefill: ForwardPass<'static> = ForwardPass::new();
-    expert_prefill.embed(expert_prompt, Tensor::constant(vec![0u32, n]));
-    expert_prefill.attn_working_set(expert_ws, expert_prefill_klen);
-    expert_prefill.epilogue(move || {
+    let expert_prefill = ForwardPass::new();
+    expert_prefill.embed(&expert_prompt, Tensor::constant(vec![0u32, n]));
+    expert_prefill.attn_working_set(&expert_ws, &expert_prefill_klen);
+    expert_prefill.epilogue(|| {
         let token = contrastive_pick(expert_prefill_amateur.take(), lambda, alpha, vocab);
         first_out.put(token);
     });
@@ -180,7 +174,7 @@ async fn main(input: Input) -> Result<String> {
     expert_prefill
         .submit(&expert_prefill_pipeline)
         .map_err(|error| format!("expert prefill: {error}"))?;
-    let first = read_expert_token(first_out)?;
+    let first = read_expert_token(&first_out)?;
     expert_prefill_pipeline.close();
 
     let mut generated = Vec::with_capacity(input.max_tokens);
@@ -191,33 +185,33 @@ async fn main(input: Input) -> Result<String> {
         return wit_model::decode(&generated);
     }
 
-    let amateur_token = bx(Channel::new([1], dtype::i32).named("amateur_token"));
-    let amateur_position = bx(Channel::from(vec![n]).named("amateur_position"));
-    let amateur_fill = bx(Channel::from(vec![n + 1]).named("amateur_fill"));
-    let amateur_klen = bx(Channel::from(vec![n + 1]).named("amateur_klen"));
-    let amateur_write_slot = bx(Channel::from(vec![amateur_ids[(n / PAGE_T) as usize]]));
-    let amateur_write_offset = bx(Channel::from(vec![n % PAGE_T]));
-    let amateur_mask = bx(Channel::from_shaped(
+    let amateur_token = Channel::new([1], dtype::i32).named("amateur_token");
+    let amateur_position = Channel::from(vec![n]).named("amateur_position");
+    let amateur_fill = Channel::from(vec![n + 1]).named("amateur_fill");
+    let amateur_klen = Channel::from(vec![n + 1]).named("amateur_klen");
+    let amateur_write_slot = Channel::from(vec![amateur_ids[(n / PAGE_T) as usize]]);
+    let amateur_write_offset = Channel::from(vec![n % PAGE_T]);
+    let amateur_mask = Channel::from_shaped(
         [1, pool_len],
         (0..pool_len)
             .map(|key| key <= n && key.saturating_add(window) > n)
             .collect::<Vec<_>>(),
-    ));
-    let amateur_pages = bx(Channel::from(amateur_ids.clone()));
-    let amateur_page_indptr = bx(Channel::from_shaped([2], vec![0u32, pool_pages]));
-    let amateur_ids_input = bx(Channel::new([pool_pages], dtype::u32).named("amateur_pool_ids"));
-    let amateur_logits_out = bx(Channel::new([vocab], dtype::f32).named("amateur_logits"));
+    );
+    let amateur_pages = Channel::from(amateur_ids.clone());
+    let amateur_page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    let amateur_ids_input = Channel::new([pool_pages], dtype::u32).named("amateur_pool_ids");
+    let amateur_logits_out = Channel::new([vocab], dtype::f32).named("amateur_logits");
 
-    let amateur_decode: ForwardPass<'static> = ForwardPass::new();
-    amateur_decode.embed(amateur_token, Tensor::constant(vec![0u32, 1]));
-    amateur_decode.positions(amateur_position);
-    amateur_decode.attn_working_set(amateur_ws, amateur_klen);
-    amateur_decode.port_channel(Port::Pages, amateur_pages);
-    amateur_decode.port_channel(Port::PageIndptr, amateur_page_indptr);
-    amateur_decode.port_channel(Port::WSlot, amateur_write_slot);
-    amateur_decode.port_channel(Port::WOff, amateur_write_offset);
-    amateur_decode.attn_mask(amateur_mask);
-    amateur_decode.epilogue(move || {
+    let amateur_decode = ForwardPass::new();
+    amateur_decode.embed(&amateur_token, Tensor::constant(vec![0u32, 1]));
+    amateur_decode.positions(&amateur_position);
+    amateur_decode.attn_working_set(&amateur_ws, &amateur_klen);
+    amateur_decode.port_channel(Port::Pages, &amateur_pages);
+    amateur_decode.port_channel(Port::PageIndptr, &amateur_page_indptr);
+    amateur_decode.port_channel(Port::WSlot, &amateur_write_slot);
+    amateur_decode.port_channel(Port::WOff, &amateur_write_offset);
+    amateur_decode.attn_mask(&amateur_mask);
+    amateur_decode.epilogue(|| {
         let base = amateur_fill.take().tensor();
         let ids = amateur_ids_input.take();
         let columns = iota(pool_len);
@@ -242,18 +236,18 @@ async fn main(input: Input) -> Result<String> {
         amateur_page_indptr.put(mul(iota(2), pool_pages));
     });
 
-    let expert_token = bx(Channel::from(vec![first as i32]).named("expert_token"));
-    let expert_position = bx(Channel::from(vec![n]).named("expert_position"));
-    let expert_fill = bx(Channel::from(vec![n + 1]).named("expert_fill"));
-    let expert_klen = bx(Channel::from(vec![n + 1]).named("expert_klen"));
-    let expert_amateur = bx(Channel::new([vocab], dtype::f32).named("expert_amateur_logits"));
-    let expert_token_out = bx(Channel::new([1], dtype::i32).named("expert_token_out"));
+    let expert_token = Channel::from(vec![first as i32]).named("expert_token");
+    let expert_position = Channel::from(vec![n]).named("expert_position");
+    let expert_fill = Channel::from(vec![n + 1]).named("expert_fill");
+    let expert_klen = Channel::from(vec![n + 1]).named("expert_klen");
+    let expert_amateur = Channel::new([vocab], dtype::f32).named("expert_amateur_logits");
+    let expert_token_out = Channel::new([1], dtype::i32).named("expert_token_out");
 
-    let expert_decode: ForwardPass<'static> = ForwardPass::new();
-    expert_decode.embed(expert_token, Tensor::constant(vec![0u32, 1]));
-    expert_decode.positions(expert_position);
-    expert_decode.attn_working_set(expert_ws, expert_klen);
-    expert_decode.epilogue(move || {
+    let expert_decode = ForwardPass::new();
+    expert_decode.embed(&expert_token, Tensor::constant(vec![0u32, 1]));
+    expert_decode.positions(&expert_position);
+    expert_decode.attn_working_set(&expert_ws, &expert_klen);
+    expert_decode.epilogue(|| {
         let base = expert_fill.take().tensor();
         let token = contrastive_pick(expert_amateur.take(), lambda, alpha, vocab);
         let next = add(&base, 1u32);
@@ -283,7 +277,7 @@ async fn main(input: Input) -> Result<String> {
         expert_decode
             .submit(&expert_pipeline)
             .map_err(|error| format!("expert decode: {error}"))?;
-        let token = read_expert_token(expert_token_out)?;
+        let token = read_expert_token(&expert_token_out)?;
         if stop_tokens.contains(&token) {
             break;
         }

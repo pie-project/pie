@@ -46,10 +46,6 @@ fn default_top_p() -> f32 {
     0.95
 }
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 /// In-graph top-p + temperature sampler over the read-out row logits `[1,vocab]`.
 /// `r` is the taken `[2]` u32 rng state (`[key, ctr]`) driving the Gumbel noise.
 /// Returns the sampled token `[1]` i32. Temperature is clamped to a small epsilon
@@ -96,59 +92,62 @@ async fn main(input: Input) -> Result<String> {
     let pool_pages = ((n + max_tokens as u32 + 2) + PAGE_T - 1) / PAGE_T;
     let pool = pool_pages * PAGE_T;
 
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     let slots = ws
         .reserve(pool_pages)
         .map_err(|e| format!("ws.reserve: {e}"))?;
-    let pool_ids: &'static Vec<u32> = bx(slots.ids().to_vec());
+    let pool_ids = slots.ids().to_vec();
 
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
-    let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
-    let toks_p = bx(Channel::from(prompt_i32).named("toks_p")); // [N] i32 (seeded)
-    let embed_indptr_p = Tensor::constant(vec![0u32, n]); // qo_indptr [0,N]
+    let g0 = {
+        let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
+        let toks_p = Channel::from(prompt_i32).named("toks_p"); // [N] i32 (seeded)
+        let embed_indptr_p = Tensor::constant(vec![0u32, n]); // qo_indptr [0,N]
 
-    // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
-    let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
-    let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
-    let w_slot_p = bx(Channel::from(w_slot_pv).named("w_slot_p"));
-    let w_off_p = bx(Channel::from(w_off_pv).named("w_off_p"));
-    let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
-    let pages_p = bx(Channel::from(pool_ids.clone()).named("pages_p"));
-    let page_indptr_p = bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p"));
+        // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
+        let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
+        let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
+        let w_slot_p = Channel::from(w_slot_pv).named("w_slot_p");
+        let w_off_p = Channel::from(w_off_pv).named("w_off_p");
+        let klen_p = Channel::from(vec![n; 1]).named("klen_p");
+        let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
+        let page_indptr_p = Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p");
 
-    // Causal prefill mask [N, POOL]: query row i attends KV cols j <= i.
-    let mask_pv: Vec<bool> = (0..n)
-        .flat_map(|i| (0..pool).map(move |j| j <= i))
-        .collect();
-    let mask_p = bx(Channel::from_shaped([n, pool], mask_pv).named("mask_p"));
-    let rng_p = bx(Channel::from(vec![0x51ed_u32, 0]).named("rng_p"));
-    let g0_ch = bx(Channel::new([1], dtype::i32).named("g0"));
+        // Causal prefill mask [N, POOL]: query row i attends KV cols j <= i.
+        let mask_pv: Vec<bool> = (0..n)
+            .flat_map(|i| (0..pool).map(move |j| j <= i))
+            .collect();
+        let mask_p = Channel::from_shaped([n, pool], mask_pv).named("mask_p");
+        let rng_p = Channel::from(vec![0x51ed_u32, 0]).named("rng_p");
+        let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
-    let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd_p.embed(toks_p, embed_indptr_p);
-    fwd_p.attn_working_set(ws, klen_p);
-    fwd_p.port_channel(Port::Pages, pages_p);
-    fwd_p.port_channel(Port::PageIndptr, page_indptr_p);
-    fwd_p.port_channel(Port::WSlot, w_slot_p);
-    fwd_p.port_channel(Port::WOff, w_off_p);
-    fwd_p.attn_mask(mask_p);
-    fwd_p.epilogue(move || {
-        let r = rng_p.take();
-        let tok = sample_token(&r, temperature, top_p, vocab);
-        let r_next = add(&r, iota(2)); // advance ctr: [key, ctr+1]
-        g0_ch.put(&tok);
-        rng_p.put(&r_next);
-    });
+        let fwd_p = ForwardPass::new();
+        fwd_p.embed(&toks_p, embed_indptr_p);
+        fwd_p.attn_working_set(&ws, &klen_p);
+        fwd_p.port_channel(Port::Pages, &pages_p);
+        fwd_p.port_channel(Port::PageIndptr, &page_indptr_p);
+        fwd_p.port_channel(Port::WSlot, &w_slot_p);
+        fwd_p.port_channel(Port::WOff, &w_off_p);
+        fwd_p.attn_mask(&mask_p);
+        fwd_p.epilogue(|| {
+            let r = rng_p.take();
+            let tok = sample_token(&r, temperature, top_p, vocab);
+            let r_next = add(&r, iota(2)); // advance ctr: [key, ctr+1]
+            g0_ch.put(&tok);
+            rng_p.put(&r_next);
+        });
 
-    let prefill = Pipeline::new();
-    fwd_p
-        .submit(&prefill)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    prefill.close();
+        let prefill = Pipeline::new();
+        fwd_p
+            .submit(&prefill)
+            .map_err(|e| format!("prefill submit: {e}"))?;
+        let first = g0_ch
+            .take()
+            .get::<i32>()
+            .map_err(|e| format!("g0 take: {e}"))?[0];
+        prefill.close();
+        first
+    };
 
     let mut chat_dec = chat::Decoder::new();
     let mut text = String::new();
@@ -164,31 +163,31 @@ async fn main(input: Input) -> Result<String> {
 
     // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
     let slot_n = pool_ids[(n / PAGE_T) as usize];
-    let tok_in = bx(Channel::from(vec![g0; 1]).named("tok_in"));
-    let pos = bx(Channel::from(vec![n; 1]).named("pos"));
-    let fill = bx(Channel::from(vec![n + 1; 1]).named("fill"));
-    let klen = bx(Channel::from(vec![n + 1; 1]).named("klen"));
-    let w_slot = bx(Channel::from(vec![slot_n; 1]).named("w_slot"));
-    let w_off = bx(Channel::from(vec![n % PAGE_T; 1]).named("w_off"));
+    let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
+    let pos = Channel::from(vec![n; 1]).named("pos");
+    let fill = Channel::from(vec![n + 1; 1]).named("fill");
+    let klen = Channel::from(vec![n + 1; 1]).named("klen");
+    let w_slot = Channel::from(vec![slot_n; 1]).named("w_slot");
+    let w_off = Channel::from(vec![n % PAGE_T; 1]).named("w_off");
     let seed_mask: Vec<bool> = (0..pool).map(|j| j <= n).collect();
-    let mask = bx(Channel::from_shaped([1, pool], seed_mask).named("mask"));
-    let pages = bx(Channel::from(pool_ids.clone()).named("pages"));
-    let page_indptr = bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr"));
-    let pool_ids_ch = bx(Channel::new([pool_pages], dtype::u32).named("pool_ids"));
-    let out = bx(Channel::new([1], dtype::i32).named("out"));
-    let rng = bx(Channel::from(vec![0x9e37_u32, 0]).named("rng"));
+    let mask = Channel::from_shaped([1, pool], seed_mask).named("mask");
+    let pages = Channel::from(pool_ids.clone()).named("pages");
+    let page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr");
+    let pool_ids_ch = Channel::new([pool_pages], dtype::u32).named("pool_ids");
+    let out = Channel::new([1], dtype::i32).named("out");
+    let rng = Channel::from(vec![0x9e37_u32, 0]).named("rng");
     let lane1 = Tensor::constant(vec![0u32, 1u32]);
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(tok_in, lane1);
-    fwd.positions(pos);
-    fwd.attn_working_set(ws, klen);
-    fwd.port_channel(Port::Pages, pages);
-    fwd.port_channel(Port::PageIndptr, page_indptr);
-    fwd.port_channel(Port::WSlot, w_slot);
-    fwd.port_channel(Port::WOff, w_off);
-    fwd.attn_mask(mask);
-    fwd.epilogue(move || {
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, lane1);
+    fwd.positions(&pos);
+    fwd.attn_working_set(&ws, &klen);
+    fwd.port_channel(Port::Pages, &pages);
+    fwd.port_channel(Port::PageIndptr, &page_indptr);
+    fwd.port_channel(Port::WSlot, &w_slot);
+    fwd.port_channel(Port::WOff, &w_off);
+    fwd.attn_mask(&mask);
+    fwd.epilogue(|| {
         // TAKES + compute first, PUTS last (value-id discipline).
         let base = fill.take().tensor(); // [1] u32 — position this fire writes
         let pids = pool_ids_ch.take();

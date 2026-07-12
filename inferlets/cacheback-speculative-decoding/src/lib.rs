@@ -38,10 +38,6 @@ fn default_max_ngram() -> usize {
     8
 }
 
-fn bx<T>(value: T) -> &'static T {
-    Box::leak(Box::new(value))
-}
-
 fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Vec<u32> {
     if draft_length == 0 || tokens.len() < 2 {
         return Vec::new();
@@ -76,20 +72,18 @@ fn verify(committed: &[u32], draft: &[u32], page_size: u32) -> Result<Vec<u32>> 
     let readout_start = committed.len() as u32 - 1;
     let readout = (readout_start..readout_start + rows).collect::<Vec<_>>();
 
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     ws.reserve(total.div_ceil(page_size))
         .map_err(|e| format!("reserve verification KV: {e}"))?;
-    let tokens = bx(Channel::from(
-        input.iter().map(|&token| token as i32).collect::<Vec<_>>(),
-    ));
-    let klen = bx(Channel::from(vec![total]));
-    let target_out = bx(Channel::new([rows], dtype::i32).named("target_tokens"));
+    let tokens = Channel::from(input.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let klen = Channel::from(vec![total]);
+    let target_out = Channel::new([rows], dtype::i32).named("target_tokens");
 
-    let fwd: ForwardPass<'static> = ForwardPass::new();
-    fwd.embed(tokens, Tensor::constant(vec![0u32, total]));
-    fwd.attn_working_set(ws, klen);
+    let fwd = ForwardPass::new();
+    fwd.embed(&tokens, Tensor::constant(vec![0u32, total]));
+    fwd.attn_working_set(&ws, &klen);
     fwd.readout(&Tensor::constant(readout));
-    fwd.epilogue(move || {
+    fwd.epilogue(|| {
         target_out.put(reduce_argmax(intrinsics::logits()));
     });
 

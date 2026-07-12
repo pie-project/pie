@@ -24,6 +24,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     /// driver 0. Geometry comes from the model's RS caps (0/0/1 for
     /// pure-attention models).
     async fn new(&mut self) -> Result<Resource<RsWorkingSet>> {
+        crate::inferlet::process::preemption::honor(self).await?;
         let model = 0;
         let caps = pie_model::model().rs_caps();
         let geom = RsGeometry {
@@ -34,14 +35,17 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         let stores = store_registry::get(model, 0);
         let id = stores.rs.lock().unwrap().create_working_set(geom);
         let ws = RsWorkingSet::new(model, 0, id, geom);
+        self.register_rs_working_set(model, 0, id);
         Ok(self.ctx().table.push(ws)?)
     }
 
     async fn state_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u64> {
+        crate::inferlet::process::preemption::honor(self).await?;
         Ok(self.ctx().table.get(&this)?.geom.state_size)
     }
 
     async fn buffer_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
+        crate::inferlet::process::preemption::honor(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let size = stores.rs.lock().unwrap().buffer_size(ws.id);
@@ -49,6 +53,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     }
 
     async fn buffer_page_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
+        crate::inferlet::process::preemption::honor(self).await?;
         Ok(self.ctx().table.get(&this)?.geom.buffer_page_tokens)
     }
 
@@ -57,6 +62,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         n: u32,
     ) -> Result<Result<WitRange, String>> {
+        crate::inferlet::process::preemption::honor(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let range = stores.rs.lock().unwrap().alloc_buffer(ws.id, n);
@@ -73,6 +79,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         indices: Vec<u32>,
     ) -> Result<Result<(), String>> {
+        crate::inferlet::process::preemption::honor(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let mut rs = stores.rs.lock().unwrap();
@@ -89,6 +96,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         perm: Vec<u32>,
     ) -> Result<Result<(), String>> {
+        crate::inferlet::process::preemption::honor(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let out = stores
@@ -105,6 +113,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         this: Resource<RsWorkingSet>,
         _on: Resource<Pipeline>,
     ) -> Result<Result<Resource<RsWorkingSet>, String>> {
+        crate::inferlet::process::preemption::honor(self).await?;
         let ws = self.ctx().table.get(&this)?.clone();
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let forked = stores.rs.lock().unwrap().fork(ws.id);
@@ -114,6 +123,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
                 // never a clone of the parent's (see the KV working-set
                 // `fork`/`slice` for the identical rationale).
                 let child = RsWorkingSet::new(ws.model, ws.driver, id, ws.geom);
+                self.register_rs_working_set(ws.model, ws.driver, id);
                 Ok(Ok(self.ctx().table.push(child)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -121,11 +131,13 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     }
 
     async fn drop(&mut self, this: Resource<RsWorkingSet>) -> Result<()> {
+        crate::inferlet::process::preemption::honor(self).await?;
         // `release` performs the exact `release_working_set` /
         // `retire_idle` sequence and marks the shared lifecycle done; `ws`'s
         // own drop just below (and the fallback `RsLifecycle::drop` it would
         // otherwise trigger) is then a no-op.
         let ws = self.ctx().table.delete(this)?;
+        self.unregister_rs_working_set(ws.model, ws.driver, ws.id);
         ws.release();
         Ok(())
     }

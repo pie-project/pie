@@ -27,6 +27,7 @@
 #include <toml++/toml.hpp>
 
 #include "pie_native/launch_view.hpp"
+#include "pie_native/load_plan.hpp"
 #include "pie_native/ptir_channels.hpp"
 #include "pipeline/interp.hpp"
 #include "pipeline/descriptor_resolve.hpp"
@@ -53,6 +54,7 @@ using executor::LaunchMember;
 
 enum class TicketPreparation { Ready, Retry, Failed };
 enum class MemberRunOutcome { Committed, Retry, Failed };
+enum class ForwardBuildResult { Ready, Retry, Failed };
 
 // Directory the compiled-in default .metal kernel library resolves to
 // (driver/metal/CMakeLists.txt), overridable at run time.
@@ -321,7 +323,8 @@ std::string build_caps_json(const Config& cfg,
         {"abi_version", PIE_DRIVER_ABI_VERSION},
         {"total_pages", total_pages},
         {"kv_page_size", cfg.batching.kv_page_size},
-        {"swap_pool_size", cfg.batching.cpu_pages},
+        {"swap_pool_size", 0},
+        {"kv_copy_domain_mask", 1},
         {"rs_cache_required", rs_cache_required},
         {"rs_cache_slots", rs_cache_slots},
         {"rs_cache_slot_bytes", rs_cache_slot_bytes},
@@ -377,6 +380,7 @@ class Context::Impl {
             {"native_mxfp4_moe", false},
             {"storage_alignment", alignment},
             {"storage_max_tile_bytes", 64ull * 1024ull * 1024ull},
+            {"storage_tile_map_mask", pie_load_planner::kMetalTileMapMask},
             {"page_size", page_size},
         }.dump();
         storage_page_size_ = page_size;
@@ -398,9 +402,9 @@ class Context::Impl {
         cfg_.model.hf_path.assign(
             reinterpret_cast<const char*>(load.snapshot_dir.ptr),
             load.snapshot_dir.len);
-        program_bytes_.assign(
-            load.program_bytes.ptr,
-            load.program_bytes.ptr + load.program_bytes.len);
+        load_plan_bytes_.assign(
+            load.load_plan_bytes.ptr,
+            load.load_plan_bytes.ptr + load.load_plan_bytes.len);
         compiler_version_ = load.compiler_version;
         facts_ = read_model_facts(cfg_.model.hf_path);
         caps_json_ = build_caps_json(cfg_, facts_);
@@ -590,11 +594,12 @@ class Context::Impl {
                 }
                 if (!lm.needs_forward) continue;
                 executor::MemberForwardDesc desc;
-                if (build_forward_desc_for_member(
-                        view, m, M, member, program, desc, lm.build_err)) {
+                const ForwardBuildResult built = build_forward_desc_for_member(
+                    view, m, M, member, program, desc, lm.build_err);
+                if (built == ForwardBuildResult::Ready) {
                     lm.fwd_slot = static_cast<int>(job->fwd_descs.size());
                     job->fwd_descs.push_back(std::move(desc));
-                } else if (lm.build_err.find("not ready") != std::string::npos) {
+                } else if (built == ForwardBuildResult::Retry) {
                     outcomes[m] = PIE_TERMINAL_OUTCOME_RETRY;
                     lm.build_err.clear();
                 }
@@ -1053,7 +1058,7 @@ class Context::Impl {
         setup_cfg.kv_page_size = cfg_.batching.kv_page_size;
         setup_cfg.max_forward_tokens = cfg_.batching.max_forward_tokens;
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
-        setup_cfg.storage_program = program_bytes_;
+        setup_cfg.load_plan = load_plan_bytes_;
         setup_cfg.compiler_version = compiler_version_;
         setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):
@@ -1078,23 +1083,56 @@ class Context::Impl {
     // descriptor for member `m`. For a device-geometry (C3) program, resolves
     // its descriptor-port channels into a `FireGeometry` BEFORE the forward
     // (Phase 2, W1.1) and feeds that instead of the wire CSR fields; a
-    // not-ready descriptor channel fails the fire here (no dummy-run) — the
-    // caller poisons only this member. Otherwise slices the wire fields as
+    // not-ready descriptor channel returns a typed retry unless its producer
+    // endpoint is poisoned. Otherwise slices the wire fields as
     // before (C2, Phase 1). The actual forward is run for the WHOLE batch at
     // once by `forward_batch` (Phase 3, §7); this only prepares one member's
     // descriptor + arbitrates its device geometry.
-    bool build_forward_desc_for_member(const pie_native::LaunchView& view, std::size_t m,
-                                       std::size_t member_count, InstanceRecord& member,
-                                       const ProgramRecord& program,
-                                       executor::MemberForwardDesc& desc, std::string& failure) {
+    ForwardBuildResult build_forward_desc_for_member(
+        const pie_native::LaunchView& view,
+        std::size_t m,
+        std::size_t member_count,
+        InstanceRecord& member,
+        const ProgramRecord& program,
+        executor::MemberForwardDesc& desc,
+        std::string& failure) {
         desc.sequence_id = member.instance_id;
 
         pie_native::ptir::FireGeometry resolved;
         const bool device_geometry = interp::is_device_geometry_trace(program.plan.trace);
         if (device_geometry) {
-            if (!interp::resolve_fire_geometry(program.plan.trace, member.interp,
-                                              cfg_.batching.kv_page_size, resolved, &failure)) {
-                return false;
+            const interp::GeometryResolveResult resolution =
+                interp::resolve_fire_geometry_typed(
+                    program.plan.trace,
+                    member.interp,
+                    cfg_.batching.kv_page_size,
+                    resolved,
+                    &failure);
+            if (resolution.status == interp::GeometryResolveStatus::NotReady) {
+                if (resolution.channel >= member.channel_ids.size()) {
+                    failure = "descriptor resolver returned an invalid channel id";
+                    return ForwardBuildResult::Failed;
+                }
+                ChannelRecord* endpoint =
+                    registry_.find_channel(member.channel_ids[resolution.channel]);
+                if (endpoint == nullptr) {
+                    failure = "descriptor channel is closed";
+                    return ForwardBuildResult::Failed;
+                }
+                const std::uint64_t poison = load_word(endpoint->words, 2);
+                const std::uint64_t closed = load_word(endpoint->words, 3);
+                if (poison != 0 || closed != 0) {
+                    failure =
+                        poison != 0
+                            ? "descriptor producer failed for channel " +
+                                  std::to_string(resolution.channel)
+                            : "descriptor channel is closed";
+                    return ForwardBuildResult::Failed;
+                }
+                return ForwardBuildResult::Retry;
+            }
+            if (resolution.status == interp::GeometryResolveStatus::Failed) {
+                return ForwardBuildResult::Failed;
             }
             // WorkingSet page translation (Phase 2 review fix A): apply
             // BEFORE validation, so validate_fire_geometry checks the
@@ -1111,17 +1149,19 @@ class Context::Impl {
                 effective_total_pages(cfg_, facts_.has_linear_attn);
             if (!pie_native::ptir::validate_fire_geometry(
                     resolved, device_pages, cfg_.batching.kv_page_size, &failure)) {
-                return false;
+                return ForwardBuildResult::Failed;
             }
         }
         return executor::build_member_forward_desc(
-            view,
-            m,
-            member_count,
-            facts_.has_linear_attn,
-            device_geometry ? &resolved : nullptr,
-            desc,
-            failure);
+                   view,
+                   m,
+                   member_count,
+                   facts_.has_linear_attn,
+                   device_geometry ? &resolved : nullptr,
+                   desc,
+                   failure)
+                   ? ForwardBuildResult::Ready
+                   : ForwardBuildResult::Failed;
     }
 
     MemberRunOutcome run_member(
@@ -1213,7 +1253,7 @@ class Context::Impl {
     ModelFacts facts_{};
     std::string caps_json_;
     std::string device_facts_json_;
-    std::vector<std::uint8_t> program_bytes_;
+    std::vector<std::uint8_t> load_plan_bytes_;
     std::uint64_t compiler_version_ = 0;
     bool load_attempted_ = false;
     std::uint32_t storage_page_size_ = 1;

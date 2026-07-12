@@ -39,10 +39,6 @@ fn default_window_size() -> u32 {
     64
 }
 
-fn bx<T>(value: T) -> &'static T {
-    Box::leak(Box::new(value))
-}
-
 fn sink_window_mask(pool_len: u32, query: u32, sink: u32, window: u32) -> Vec<bool> {
     (0..pool_len)
         .map(|key| key <= query && (key < sink || key.saturating_add(window) > query))
@@ -70,43 +66,40 @@ async fn main(input: Input) -> Result<String> {
     let pool_pages = (n + input.max_tokens as u32 + 2).div_ceil(PAGE_T);
     let pool_len = pool_pages * PAGE_T;
 
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     let slots = ws
         .reserve(pool_pages)
         .map_err(|e| format!("reserve attention-sink KV: {e}"))?;
-    let pool_ids: &'static Vec<u32> = bx(slots.ids().to_vec());
+    let pool_ids = slots.ids().to_vec();
 
-    let prompt_tokens = bx(Channel::from(
-        prompt.iter().map(|&token| token as i32).collect::<Vec<_>>(),
-    ));
-    let prefill_slots = bx(Channel::from(
+    let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let prefill_slots = Channel::from(
         (0..n)
             .map(|position| pool_ids[(position / PAGE_T) as usize])
             .collect::<Vec<_>>(),
-    ));
-    let prefill_offsets = bx(Channel::from(
-        (0..n).map(|position| position % PAGE_T).collect::<Vec<_>>(),
-    ));
-    let prefill_klen = bx(Channel::from(vec![n]));
-    let prefill_pages = bx(Channel::from(pool_ids.clone()));
-    let prefill_indptr = bx(Channel::from_shaped([2], vec![0u32, pool_pages]));
-    let causal = bx(Channel::from_shaped(
+    );
+    let prefill_offsets =
+        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>());
+    let prefill_klen = Channel::from(vec![n]);
+    let prefill_pages = Channel::from(pool_ids.clone());
+    let prefill_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    let causal = Channel::from_shaped(
         [n, pool_len],
         (0..n)
             .flat_map(|query| (0..pool_len).map(move |key| key <= query))
             .collect::<Vec<_>>(),
-    ));
-    let first_out = bx(Channel::new([1], dtype::i32).named("first_token"));
+    );
+    let first_out = Channel::new([1], dtype::i32).named("first_token");
 
-    let prefill: ForwardPass<'static> = ForwardPass::new();
-    prefill.embed(prompt_tokens, Tensor::constant(vec![0u32, n]));
-    prefill.attn_working_set(ws, prefill_klen);
-    prefill.port_channel(Port::Pages, prefill_pages);
-    prefill.port_channel(Port::PageIndptr, prefill_indptr);
-    prefill.port_channel(Port::WSlot, prefill_slots);
-    prefill.port_channel(Port::WOff, prefill_offsets);
-    prefill.attn_mask(causal);
-    prefill.epilogue(move || {
+    let prefill = ForwardPass::new();
+    prefill.embed(&prompt_tokens, Tensor::constant(vec![0u32, n]));
+    prefill.attn_working_set(&ws, &prefill_klen);
+    prefill.port_channel(Port::Pages, &prefill_pages);
+    prefill.port_channel(Port::PageIndptr, &prefill_indptr);
+    prefill.port_channel(Port::WSlot, &prefill_slots);
+    prefill.port_channel(Port::WOff, &prefill_offsets);
+    prefill.attn_mask(&causal);
+    prefill.epilogue(|| {
         first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
 
@@ -128,31 +121,28 @@ async fn main(input: Input) -> Result<String> {
         return wit_model::decode(&generated);
     }
 
-    let token_in = bx(Channel::from(vec![first as i32]).named("token_in"));
-    let position = bx(Channel::from(vec![n]).named("position"));
-    let fill = bx(Channel::from(vec![n + 1]).named("fill"));
-    let klen = bx(Channel::from(vec![n + 1]).named("klen"));
-    let write_slot = bx(Channel::from(vec![pool_ids[(n / PAGE_T) as usize]]));
-    let write_offset = bx(Channel::from(vec![n % PAGE_T]));
-    let mask = bx(Channel::from_shaped(
-        [1, pool_len],
-        sink_window_mask(pool_len, n, sink, window),
-    ));
-    let pages = bx(Channel::from(pool_ids.clone()));
-    let page_indptr = bx(Channel::from_shaped([2], vec![0u32, pool_pages]));
-    let pool_ids_input = bx(Channel::new([pool_pages], dtype::u32).named("pool_ids"));
-    let token_out = bx(Channel::new([1], dtype::i32).named("token_out"));
+    let token_in = Channel::from(vec![first as i32]).named("token_in");
+    let position = Channel::from(vec![n]).named("position");
+    let fill = Channel::from(vec![n + 1]).named("fill");
+    let klen = Channel::from(vec![n + 1]).named("klen");
+    let write_slot = Channel::from(vec![pool_ids[(n / PAGE_T) as usize]]);
+    let write_offset = Channel::from(vec![n % PAGE_T]);
+    let mask = Channel::from_shaped([1, pool_len], sink_window_mask(pool_len, n, sink, window));
+    let pages = Channel::from(pool_ids.clone());
+    let page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]);
+    let pool_ids_input = Channel::new([pool_pages], dtype::u32).named("pool_ids");
+    let token_out = Channel::new([1], dtype::i32).named("token_out");
 
-    let decode: ForwardPass<'static> = ForwardPass::new();
-    decode.embed(token_in, Tensor::constant(vec![0u32, 1]));
-    decode.positions(position);
-    decode.attn_working_set(ws, klen);
-    decode.port_channel(Port::Pages, pages);
-    decode.port_channel(Port::PageIndptr, page_indptr);
-    decode.port_channel(Port::WSlot, write_slot);
-    decode.port_channel(Port::WOff, write_offset);
-    decode.attn_mask(mask);
-    decode.epilogue(move || {
+    let decode = ForwardPass::new();
+    decode.embed(&token_in, Tensor::constant(vec![0u32, 1]));
+    decode.positions(&position);
+    decode.attn_working_set(&ws, &klen);
+    decode.port_channel(Port::Pages, &pages);
+    decode.port_channel(Port::PageIndptr, &page_indptr);
+    decode.port_channel(Port::WSlot, &write_slot);
+    decode.port_channel(Port::WOff, &write_offset);
+    decode.attn_mask(&mask);
+    decode.epilogue(|| {
         let base = fill.take().tensor();
         let ids = pool_ids_input.take();
         let token = reshape(reduce_argmax(intrinsics::logits()), [1]);

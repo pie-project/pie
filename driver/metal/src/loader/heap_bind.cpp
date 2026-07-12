@@ -1,6 +1,6 @@
 // heap_bind.cpp — delta's Metal-side weight staging + per-ordinal arg-table binding.
 //
-// Executes the runtime-owned StorageProgram into one weights region, allocates
+// Executes the runtime-owned LoadPlan into one weights region, allocates
 // persistent GDN state + KV pages + IO scalars from heap_layout, then walks beta's
 // build_decode_dag and binds each dispatch's WEIGHT / STATE / KV / IO slots BY ORDINAL.
 // beta binds the per-dispatch activation/scratch X/Out (his WAR/WAW ping-pong) over the
@@ -34,7 +34,7 @@ namespace {
 
 SlotHandle slice_slot(const SlotHandle& parent, std::uint64_t offset, std::uint64_t bytes) {
     if (!parent.valid() || offset > parent.size || bytes > parent.size - offset) {
-        throw std::runtime_error("storage program buffer exceeds weights region");
+        throw std::runtime_error("LoadPlan buffer exceeds weights region");
     }
     SlotHandle out = parent;
     out.contents_ptr = static_cast<std::uint8_t*>(parent.contents()) + offset;
@@ -52,18 +52,18 @@ SlotHandle alloc_zeroed(RawMetalContext& ctx, size_t nbytes) {
 }
 
 std::uint64_t extent_bytes(
-    const pie_weight_loader::PieLoaderStridedExtentView& extent) {
-    return pie_weight_loader::cpp::extent_bytes(extent, "metal storage executor");
+    const pie_load_planner::PieLoaderStridedExtentView& extent) {
+    return pie_load_planner::cpp::extent_bytes(extent, "metal load executor");
 }
 
 void copy_extent(
     const SafetensorsView& source,
-    const pie_weight_loader::PieLoaderSourceExtentView& src,
-    const pie_weight_loader::PieLoaderDestExtentView& dst,
+    const pie_load_planner::PieLoaderSourceExtentView& src,
+    const pie_load_planner::PieLoaderDestExtentView& dst,
     const SlotHandle& target,
     std::uint64_t max_tile_bytes) {
-    if (!pie_weight_loader::cpp::compact_extent(src.stride) ||
-        !pie_weight_loader::cpp::compact_extent(dst.stride)) {
+    if (!pie_load_planner::cpp::compact_extent(src.stride) ||
+        !pie_load_planner::cpp::compact_extent(dst.stride)) {
         throw std::runtime_error(
             "metal storage executor: non-compact ExtentWrite is unsupported");
     }
@@ -90,42 +90,46 @@ void copy_extent(
 BoundDecode stage_decode_storage(
     RawMetalContext& ctx,
     const SafetensorsView& view,
-    const pie_weight_loader::StorageProgram& program,
+    const pie_load_planner::LoadPlan& load,
     const DecodeGeometry& g,
-    const HeapPlan& plan) {
+    const HeapPlan& heap_plan) {
     BoundDecode b;
-    b.plan = plan;
+    b.plan = heap_plan;
     b.gdn.resize(g.n_layers);
     b.kv.resize(g.n_layers);
 
-    const auto storage = program.view();
-    if (program.backend() != pie_weight_loader::PieLoaderBackendKind::Metal) {
-        throw std::runtime_error("metal storage executor received a non-Metal program");
+    const auto load_plan = load.view();
+    if (load.backend() != pie_load_planner::PieLoaderBackendKind::Metal) {
+        throw std::runtime_error("Metal load executor received a non-Metal plan");
     }
-    for (std::size_t i = 0; i < storage.tensors.len; ++i) {
-        const auto& tensor = storage.tensors.ptr[i];
+    if (load.tile_map_mask() != pie_load_planner::kMetalTileMapMask) {
+        throw std::runtime_error(
+            "Metal load plan advertises unsupported TileMap transforms");
+    }
+    for (std::size_t i = 0; i < load_plan.tensors.len; ++i) {
+        const auto& tensor = load_plan.tensors.ptr[i];
         if (tensor.quant_scheme ==
-                pie_weight_loader::PieLoaderQuantScheme::MlxAffineU4 &&
+                pie_load_planner::PieLoaderQuantScheme::MlxAffineU4 &&
             (tensor.quant_bits_per_element != 4 ||
              tensor.quant_group_size != 64)) {
             throw std::runtime_error(
-                "metal qmv kernels require MLX affine-U4 g64/b4; program requested g" +
+                "metal qmv kernels require MLX affine-U4 g64/b4; plan requested g" +
                 std::to_string(tensor.quant_group_size) + "/b" +
                 std::to_string(tensor.quant_bits_per_element));
         }
     }
     b.weights_region = ctx.heap_alloc(
-        plan.weights_bytes,
-        std::max<std::size_t>(1, program.preferred_alignment()));
+        heap_plan.weights_bytes,
+        std::max<std::size_t>(1, load.preferred_alignment()));
     if (!b.weights_region.valid()) {
         throw std::runtime_error("heap_alloc failed for program-owned weights region");
     }
     std::unordered_map<std::uint32_t, SlotHandle> buffers;
-    pie_weight_loader::cpp::StorageProgramIndex index("metal storage executor");
-    index.reset(storage);
-    for (std::size_t step = 0; step < storage.schedule.len; ++step) {
-        const auto& instr = index.instruction(storage.schedule.ptr[step]);
-        using K = pie_weight_loader::PieLoaderStorageInstrKind;
+    pie_load_planner::cpp::LoadPlanIndex index("metal load executor");
+    index.reset(load_plan);
+    for (std::size_t step = 0; step < load_plan.schedule.len; ++step) {
+        const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
+        using K = pie_load_planner::PieLoaderStorageInstrKind;
         switch (instr.kind) {
         case K::Allocate: {
             const auto& decl = index.buffer(instr.buffer_id);
@@ -156,7 +160,7 @@ BoundDecode stage_decode_storage(
                 instr.source,
                 instr.dest,
                 target->second,
-                program.max_tile_bytes());
+                load.max_tile_bytes());
             break;
         }
         case K::BulkExtentWrite: {
@@ -176,7 +180,7 @@ BoundDecode stage_decode_storage(
                 instr.source.file_offset + instr.source.stride.base_offset,
                 instr.source.span_bytes,
                 static_cast<std::uint8_t*>(b.weights_region.contents()) + offset,
-                program.max_tile_bytes());
+                load.max_tile_bytes());
             break;
         }
         case K::SlabScatter:
@@ -194,7 +198,7 @@ BoundDecode stage_decode_storage(
                     placement.bytes,
                     static_cast<std::uint8_t*>(b.weights_region.contents()) +
                         placement.dest_offset,
-                    program.max_tile_bytes());
+                    load.max_tile_bytes());
             }
             break;
         case K::CreateView: {
@@ -222,7 +226,7 @@ BoundDecode stage_decode_storage(
                     "metal storage executor: finalized buffer is missing");
             }
             const std::string name =
-                pie_weight_loader::cpp::bytes_to_string(instr.name);
+                pie_load_planner::cpp::bytes_to_string(instr.name);
             if (!b.weights.emplace(name, buffer->second).second) {
                 throw std::runtime_error(
                     "metal storage executor: duplicate runtime tensor " + name);
@@ -241,7 +245,7 @@ BoundDecode stage_decode_storage(
     }
 
     // ── KV region: k/v pages per full-attn layer (append-only, I4) ──
-    const size_t kv_one = plan.kv_per_layer / 2;  // bytes for k (== v)
+    const size_t kv_one = heap_plan.kv_per_layer / 2;  // bytes for k (== v)
     for (int L = 0; L < g.n_layers; ++L) {
         if (!DecodeGeometry::is_full_attn(L)) continue;
         b.kv[L].k_pages = alloc_zeroed(ctx, kv_one);
@@ -266,7 +270,7 @@ BoundDecode stage_decode_storage(
 
     // ── Scratch pool (beta assigns X/Out per dispatch) ──
     for (int i = 0; i < SCRATCH_POOL; ++i)
-        b.scratch[i] = ctx.heap_alloc(plan.scratch_slot_bytes);
+        b.scratch[i] = ctx.heap_alloc(heap_plan.scratch_slot_bytes);
 
     // ── IO region (I1 per-token scalars + I3 logits) ──
     // M>1: scalar slots widen to u32[max_tokens]; logits stays f32[vocab]. Byte-identical at M=1.

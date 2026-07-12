@@ -374,7 +374,7 @@ not success.
 The terminal-cell, global-endpoint, reservation, ordered-close, and direct
 CUDA/Metal model-execution portions of this boundary are implemented. Driver
 creation is device-only; the blocking `load_model` boot verb executes the
-runtime-compiled `StorageProgram` before any PTIR registration. CUDA typed
+runtime-compiled `LoadPlan` before any PTIR registration. CUDA typed
 copy/resize controls still reject tensor-parallel configurations until an
 all-rank control protocol exists. Storage boot details are specified in
 [storage-refact-and-metal.md](storage-refact-and-metal.md).
@@ -438,7 +438,7 @@ native boundary.
 | Completion broker and register-then-recheck | `runtime/engine/src/driver/completion.rs` |
 | ABI types and generated C header | `interface/driver/src/local.rs`, `interface/driver/include/pie_driver_abi.h` |
 | Host channel API and endpoint state | `runtime/engine/src/pipeline/channel.rs`, `runtime/engine/src/driver/channel.rs` |
-| Runtime storage compiler | `runtime/weight-loader/` |
+| Runtime load planner | `runtime/load-planner/` |
 | CUDA direct driver and PTIR channels | `driver/cuda/src/{abi,context}.cpp`, `driver/cuda/src/pipeline/` |
 | Metal direct driver | `driver/metal/src/{abi,context}.cpp` |
 | Dummy direct driver | `driver/dummy/src/lib.rs` |

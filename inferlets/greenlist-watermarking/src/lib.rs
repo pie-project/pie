@@ -37,10 +37,6 @@ fn default_delta() -> f32 {
     2.0
 }
 
-fn bx<T>(value: T) -> &'static T {
-    Box::leak(Box::new(value))
-}
-
 fn green_mask(vocab: u32, previous_token: u32, gamma: f32) -> Vec<bool> {
     let threshold = (gamma * u64::MAX as f32) as u64;
     (0..vocab)
@@ -82,7 +78,7 @@ async fn main(input: Input) -> Result<String> {
     }
 
     let vocab = wit_model::output_vocab_size();
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     model::configure(vocab, ws.page_size(), 1);
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
@@ -92,20 +88,18 @@ async fn main(input: Input) -> Result<String> {
     }
     let n = prompt.len() as u32;
     let stop_tokens = chat::stop_tokens();
-
-    let prompt_tokens = bx(Channel::from(
-        prompt.iter().map(|&token| token as i32).collect::<Vec<_>>(),
-    ));
-    let prefill_klen = bx(Channel::from(vec![n]));
-    let prefill_green = bx(Channel::new([vocab], dtype::bool).named("prefill_green"));
-    let prefill_rng = bx(Channel::from(vec![0x51ed_u32, 0]).named("prefill_rng"));
-    let first_out = bx(Channel::new([1], dtype::i32).named("first_token"));
-
-    let prefill: ForwardPass<'static> = ForwardPass::new();
-    prefill.embed(prompt_tokens, Tensor::constant(vec![0u32, n]));
-    prefill.attn_working_set(ws, prefill_klen);
     let delta = input.delta;
-    prefill.epilogue(move || {
+
+    let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let prefill_klen = Channel::from(vec![n]);
+    let prefill_green = Channel::new([vocab], dtype::bool).named("prefill_green");
+    let prefill_rng = Channel::from(vec![0x51ed_u32, 0]).named("prefill_rng");
+    let first_out = Channel::new([1], dtype::i32).named("first_token");
+
+    let prefill = ForwardPass::new();
+    prefill.embed(&prompt_tokens, Tensor::constant(vec![0u32, n]));
+    prefill.attn_working_set(&ws, &prefill_klen);
+    prefill.epilogue(|| {
         let green = prefill_green.take();
         let rng = prefill_rng.take();
         let token = watermarked_sample(intrinsics::logits(), &green, &rng, delta, vocab);
@@ -130,19 +124,19 @@ async fn main(input: Input) -> Result<String> {
     }
 
     if generated.len() < input.max_tokens && !stop_tokens.contains(&first) {
-        let token_in = bx(Channel::from(vec![first as i32]).named("token_in"));
-        let position = bx(Channel::from(vec![n]).named("position"));
-        let klen = bx(Channel::from(vec![n + 1]).named("klen"));
-        let fill = bx(Channel::from(vec![n + 1]).named("fill"));
-        let green = bx(Channel::new([vocab], dtype::bool).named("green"));
-        let rng = bx(Channel::from(vec![0x9e37_u32, 0]).named("rng"));
-        let token_out = bx(Channel::new([1], dtype::i32).named("token_out"));
+        let token_in = Channel::from(vec![first as i32]).named("token_in");
+        let position = Channel::from(vec![n]).named("position");
+        let klen = Channel::from(vec![n + 1]).named("klen");
+        let fill = Channel::from(vec![n + 1]).named("fill");
+        let green = Channel::new([vocab], dtype::bool).named("green");
+        let rng = Channel::from(vec![0x9e37_u32, 0]).named("rng");
+        let token_out = Channel::new([1], dtype::i32).named("token_out");
 
-        let decode: ForwardPass<'static> = ForwardPass::new();
-        decode.embed(token_in, Tensor::constant(vec![0u32, 1]));
-        decode.positions(position);
-        decode.attn_working_set(ws, klen);
-        decode.epilogue(move || {
+        let decode = ForwardPass::new();
+        decode.embed(&token_in, Tensor::constant(vec![0u32, 1]));
+        decode.positions(&position);
+        decode.attn_working_set(&ws, &klen);
+        decode.epilogue(|| {
             let base = fill.take().tensor();
             let green_value = green.take();
             let rng_value = rng.take();

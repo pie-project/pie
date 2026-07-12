@@ -55,6 +55,16 @@ pub enum DriverBackend {
 }
 
 impl DriverBackend {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Dummy(_) => "dummy",
+            #[cfg(feature = "driver-cuda")]
+            Self::Cuda(_) => "cuda",
+            #[cfg(feature = "driver-metal")]
+            Self::Metal(_) => "metal",
+        }
+    }
+
     pub fn dummy(
         options: pie_driver_dummy_lib::DummyDriverOptions,
     ) -> Result<(Self, pie_driver_abi::DeviceFacts)> {

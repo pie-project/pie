@@ -45,10 +45,6 @@ fn default_max_tokens() -> usize {
     512
 }
 
-fn bx<T>(value: T) -> &'static T {
-    Box::leak(Box::new(value))
-}
-
 fn unpack_mask(packed: &[u32], vocab: u32) -> Vec<bool> {
     if packed.is_empty() {
         return vec![true; vocab as usize];
@@ -65,7 +61,7 @@ async fn main(input: Input) -> Result<String> {
     }
 
     let vocab = wit_model::output_vocab_size();
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     model::configure(vocab, ws.page_size(), 1);
     let mut constraint = JsonSchema(&input.schema).build_constraint()?;
 
@@ -79,17 +75,15 @@ async fn main(input: Input) -> Result<String> {
     }
     let n = prompt.len() as u32;
 
-    let prompt_tokens = bx(Channel::from(
-        prompt.iter().map(|&token| token as i32).collect::<Vec<_>>(),
-    ));
-    let prefill_klen = bx(Channel::from(vec![n]));
-    let prefill_mask = bx(Channel::new([vocab], dtype::bool).named("prefill_mask"));
-    let first_out = bx(Channel::new([1], dtype::i32).named("first_token"));
+    let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let prefill_klen = Channel::from(vec![n]);
+    let prefill_mask = Channel::new([vocab], dtype::bool).named("prefill_mask");
+    let first_out = Channel::new([1], dtype::i32).named("first_token");
 
-    let prefill: ForwardPass<'static> = ForwardPass::new();
-    prefill.embed(prompt_tokens, Tensor::constant(vec![0u32, n]));
-    prefill.attn_working_set(ws, prefill_klen);
-    prefill.epilogue(move || {
+    let prefill = ForwardPass::new();
+    prefill.embed(&prompt_tokens, Tensor::constant(vec![0u32, n]));
+    prefill.attn_working_set(&ws, &prefill_klen);
+    prefill.epilogue(|| {
         let allowed = prefill_mask.take();
         let token = reshape(
             reduce_argmax(mask_apply(intrinsics::logits(), &allowed)),
@@ -113,18 +107,18 @@ async fn main(input: Input) -> Result<String> {
     constraint.advance(&[first]);
 
     if !constraint.is_terminated() && generated.len() < input.max_tokens {
-        let token_in = bx(Channel::from(vec![first as i32]).named("token_in"));
-        let position = bx(Channel::from(vec![n]).named("position"));
-        let klen = bx(Channel::from(vec![n + 1]).named("klen"));
-        let fill = bx(Channel::from(vec![n + 1]).named("fill"));
-        let grammar_mask = bx(Channel::new([vocab], dtype::bool).named("grammar_mask"));
-        let token_out = bx(Channel::new([1], dtype::i32).named("token_out"));
+        let token_in = Channel::from(vec![first as i32]).named("token_in");
+        let position = Channel::from(vec![n]).named("position");
+        let klen = Channel::from(vec![n + 1]).named("klen");
+        let fill = Channel::from(vec![n + 1]).named("fill");
+        let grammar_mask = Channel::new([vocab], dtype::bool).named("grammar_mask");
+        let token_out = Channel::new([1], dtype::i32).named("token_out");
 
-        let decode: ForwardPass<'static> = ForwardPass::new();
-        decode.embed(token_in, Tensor::constant(vec![0u32, 1]));
-        decode.positions(position);
-        decode.attn_working_set(ws, klen);
-        decode.epilogue(move || {
+        let decode = ForwardPass::new();
+        decode.embed(&token_in, Tensor::constant(vec![0u32, 1]));
+        decode.positions(&position);
+        decode.attn_working_set(&ws, &klen);
+        decode.epilogue(|| {
             let base = fill.take().tensor();
             let allowed = grammar_mask.take();
             let token = reshape(

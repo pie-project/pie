@@ -2,13 +2,17 @@
 //!
 //! Each Process is a ServiceMap actor that manages a single WASM instance.
 //! Processes are registered in a global registry and receive messages via
-//! Direct Addressing.
+//! Direct Addressing. Process-owned KV quiesce/suspend/restore lives in the
+//! `preemption` submodule; WIT host modules only delegate into it.
 
 mod ctx;
 mod output;
+pub(crate) mod preemption;
+mod residency;
 
 pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
+pub(crate) use residency::ProcessResidency;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -203,7 +207,12 @@ pub fn spawn(
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
 ) -> Result<ProcessId> {
+    let id = Uuid::new_v4();
+    if let Some(orchestrator) = crate::store::reclaim::contention() {
+        orchestrator.register(id);
+    }
     let process = Process::new(
+        id,
         username,
         program_name,
         input,
@@ -211,15 +220,11 @@ pub fn spawn(
         capture_outputs,
         result_tx,
     );
-    let id = process.process_id;
-
-    SERVICES.spawn(id, || process)?;
-
-    // Task-B contention: register with the preempt/restore orchestrator —
-    // registration order is the FCFS clock (victim = youngest registered).
-    // No-op unless PIE_KV_CONTENTION=preempt.
-    if let Some(o) = crate::store::reclaim::contention() {
-        o.register(id);
+    if let Err(error) = SERVICES.spawn(id, || process) {
+        if let Some(orchestrator) = crate::store::reclaim::contention() {
+            orchestrator.unregister(id);
+        }
+        return Err(error);
     }
 
     Ok(id)
@@ -361,6 +366,7 @@ struct Process {
 impl Process {
     /// Creates a new Process, generating a UUID, and spawns its WASM execution task.
     fn new(
+        process_id: ProcessId,
         username: String,
         program: ProgramName,
         input: String,
@@ -368,7 +374,6 @@ impl Process {
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<Result<String, String>>>,
     ) -> Self {
-        let process_id = Uuid::new_v4();
         let result_tx: SharedResultTx = Arc::new(Mutex::new(result_tx));
 
         let handle = tokio::spawn(Self::run(

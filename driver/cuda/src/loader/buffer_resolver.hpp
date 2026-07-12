@@ -1,6 +1,6 @@
 #pragma once
 
-// Resolves a storage-program buffer id to its DeviceTensor. A buffer is either
+// Resolves a LoadPlan buffer id to its DeviceTensor. A buffer is either
 // still live in the executor's working set (`buffers`) or has been finalized into
 // the WeightStore (`finalized_names` -> `weights`). Shared by the executor
 // (CreateView) and the transcode engine, which both need to read input buffers

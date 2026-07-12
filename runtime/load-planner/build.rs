@@ -2,8 +2,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 /// Content-hash every `.rs` file under `dir` (recursively, name-sorted for
-/// determinism) into an FNV-1a 64-bit value. Fingerprints the loader's compiler
-/// logic so the on-disk storage-program cache auto-invalidates when that logic
+/// determinism) into an FNV-1a 64-bit value. Fingerprints the planner's compiler
+/// logic so the on-disk LoadPlan cache auto-invalidates when that logic
 /// changes — no manual `cache-vN` bump. Content-based (not mtime), so a no-op
 /// rebuild keeps the same hash and the cache stays warm.
 fn hash_sources(dir: &Path) -> u64 {
@@ -39,7 +39,7 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let compiler_hash = hash_sources(&manifest_dir.join("src"));
-    println!("cargo:rustc-env=PIE_WL_COMPILER_HASH={compiler_hash}");
+    println!("cargo:rustc-env=PIE_LOAD_PLANNER_COMPILER_HASH={compiler_hash}");
 
     println!("cargo:rerun-if-changed=src");
 }

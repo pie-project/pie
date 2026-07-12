@@ -2,7 +2,7 @@
 
 // Tiny scoped timer that adds its lifetime (ms) to *sink on destruction. Used to
 // attribute a weight load to its phases (alloc / transfer / transform) for the
-// PIE_WEIGHT_LOADER_PROFILE output. Shared by the storage executor and the copy
+// PIE_LOAD_EXECUTOR_PROFILE output. Shared by the load executor and the copy
 // engine so both report into the same LoadExecutionStats phase counters.
 
 #include <chrono>

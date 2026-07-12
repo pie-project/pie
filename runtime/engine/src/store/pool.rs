@@ -61,6 +61,18 @@ impl<I: PoolId> Pool<I> {
         }
     }
 
+    /// Return ids that were reserved but never published or submitted to a
+    /// driver operation. No completion epoch is required because no device
+    /// user could have observed them.
+    pub fn release_reserved(&mut self, ids: Vec<I>) {
+        debug_assert!(ids.iter().all(|id| id.index() < self.capacity));
+        debug_assert!(
+            ids.iter()
+                .all(|id| !self.free.iter().any(|free| free.index() == id.index()))
+        );
+        self.free.extend(ids);
+    }
+
     /// Retire all epochs `<= epoch`, returning their ids to the free list.
     pub fn retire_through(&mut self, epoch: u64) {
         let mut i = 0;

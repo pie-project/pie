@@ -133,7 +133,7 @@ struct SetupConfig {
     std::uint32_t kv_page_size = 0;
     std::uint32_t max_forward_tokens = 1;
     std::uint32_t max_forward_requests = 1;
-    std::vector<std::uint8_t> storage_program;
+    std::vector<std::uint8_t> load_plan;
     std::uint64_t compiler_version = 0;
     std::uint32_t storage_page_size = 1;
 };

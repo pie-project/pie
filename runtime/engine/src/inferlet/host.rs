@@ -38,6 +38,20 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
     fn process_id(&self) -> uuid::Uuid {
         self.id()
     }
+
+    fn kv_working_sets(
+        &self,
+    ) -> std::collections::HashSet<crate::store::kv::page_table::WorkingSetId> {
+        self.residency_snapshot()
+            .kv_working_sets
+            .into_iter()
+            .filter_map(|(model, driver, ws)| (model == 0 && driver == 0).then_some(ws))
+            .collect()
+    }
+
+    async fn honor_preemption(&mut self) -> anyhow::Result<()> {
+        crate::inferlet::process::preemption::honor(self).await
+    }
 }
 
 wasmtime::component::bindgen!({

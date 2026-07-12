@@ -88,7 +88,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # Always-linked Rust dummy driver — random tokens, no model load.
 pie-driver-dummy = { path = "../driver/dummy" }
-pie-weight-loader = { path = "../runtime/weight-loader" }
+pie-load-planner = { path = "../runtime/load-planner" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
 # the engine subprocess we boot. Same crate the dummy_roundtrip example

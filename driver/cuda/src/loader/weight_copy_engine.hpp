@@ -6,7 +6,7 @@
 // queue. Callers enqueue copies (a checkpoint file span -> a raw device dst) and
 // flush(); the engine batches / pins / pipelines the H2D. Its only dependencies
 // are the checkpoint source (for host bytes) and an optional LoadExecutionStats
-// sink for counters — it does not touch the buffer map or the storage program.
+// sink for counters — it does not touch the buffer map or the LoadPlan.
 
 #include <algorithm>
 #include <cstdint>

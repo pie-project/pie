@@ -209,8 +209,10 @@ pub fn spawn_control_tasks<C: ControlLink>(
         loop {
             ticker.tick().await;
             let status = WorkerStatus {
-                kv_pressure_bucket: 0,
-                inflight: 0,
+                kv_pressure_bucket: pie_engine::store::kv_pressure_bucket(),
+                inflight: pie_engine::inferlet::process::list()
+                    .len()
+                    .min(u32::MAX as usize) as u32,
             };
             if let Err(e) = report_ctrl.report_worker(worker_id, status).await {
                 tracing::warn!(

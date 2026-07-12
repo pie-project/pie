@@ -1,4 +1,4 @@
-//! Native Rust GGUF header parser (weight-loader Variant A, step 2).
+//! Native Rust GGUF header parser for load planning.
 //!
 //! Ports the checkpoint-parsing half of the C++ `GgufCheckpointSource`
 //! (`driver/cuda/src/loader/gguf_source.cpp`) to Rust. Like the safetensors
@@ -542,7 +542,10 @@ mod tests {
     }
 
     fn write_tmp(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("wl_gguf_{tag}_{}.gguf", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "load_planner_gguf_{tag}_{}.gguf",
+            std::process::id()
+        ));
         std::fs::write(&path, bytes).unwrap();
         path
     }

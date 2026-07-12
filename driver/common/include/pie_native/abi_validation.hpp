@@ -146,8 +146,8 @@ inline int validate_model_load_desc(const PieModelLoadDesc* desc,
     if (desc->reserved0 != 0 || desc->compiler_version == 0) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    status = validate_bytes(desc->program_bytes);
-    if (status != PIE_STATUS_OK || desc->program_bytes.len == 0) {
+    status = validate_bytes(desc->load_plan_bytes);
+    if (status != PIE_STATUS_OK || desc->load_plan_bytes.len == 0) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     status = validate_bytes(desc->snapshot_dir);

@@ -247,16 +247,16 @@ pub fn write_metal_startup_toml(
     write_toml_table(out_path, doc)
 }
 
-fn compile_storage_program(
+fn compile_load_plan_bytes(
     snapshot_dir: &Path,
     facts: &pie_driver_abi::DeviceFacts,
     runtime_quant: &str,
     mxfp4_moe: &str,
     tp: Option<&TpLaunch>,
 ) -> Result<Vec<u8>> {
-    use pie_weight_loader::inproc::{compile_snapshot_to_bytes, parse_model_config};
-    use pie_weight_loader::storage::StorageTarget;
-    use pie_weight_loader::types::{BackendKind, Mxfp4MoePolicy};
+    use pie_load_planner::inproc::{compile_snapshot_to_plan_bytes, parse_model_config};
+    use pie_load_planner::load_plan::StorageTarget;
+    use pie_load_planner::types::{BackendKind, Mxfp4MoePolicy};
 
     if facts.abi_version != pie_driver_abi::PIE_DRIVER_ABI_VERSION {
         return Err(anyhow!(
@@ -277,7 +277,7 @@ fn compile_storage_program(
     };
     let effective_runtime_quant = if runtime_quant == "fp8" && !facts.fp8_native {
         tracing::info!(
-            "weight-loader: runtime_quant='fp8' disabled because device facts report \
+            "load-planner: runtime_quant='fp8' disabled because device facts report \
              fp8_native=false"
         );
         ""
@@ -285,7 +285,7 @@ fn compile_storage_program(
         runtime_quant
     };
     let model = parse_model_config(snapshot_dir, effective_runtime_quant)
-        .map_err(|err| anyhow!("weight-loader model config parse failed: {err}"))?;
+        .map_err(|err| anyhow!("load-planner model config parse failed: {err}"))?;
     let mxfp4_moe = match mxfp4_moe {
         "" | "auto" => {
             if facts.native_mxfp4_moe {
@@ -315,14 +315,15 @@ fn compile_storage_program(
         tp_size,
         max_tile_bytes: facts.storage_max_tile_bytes,
         preferred_alignment: facts.storage_alignment.max(1),
+        tile_map_mask: facts.storage_tile_map_mask,
         mxfp4_moe,
         native_mxfp4_moe: facts.native_mxfp4_moe,
     };
 
-    let bytes = compile_snapshot_to_bytes(snapshot_dir, &model, target)
-        .map_err(|err| anyhow!("weight-loader storage compile failed: {err}"))?;
+    let bytes = compile_snapshot_to_plan_bytes(snapshot_dir, &model, target)
+        .map_err(|err| anyhow!("load planning failed: {err}"))?;
     tracing::info!(
-        "weight-loader: compiled StorageProgram in-process ({} bytes); the driver \
+        "load-planner: compiled LoadPlan in-process ({} bytes); the driver \
          will execute it from the boot call (bulk weights never cross)",
         bytes.len()
     );
@@ -337,9 +338,15 @@ fn model_load_desc(
     tp: Option<&TpLaunch>,
 ) -> Result<pie_driver_abi::ModelLoadDesc> {
     Ok(pie_driver_abi::ModelLoadDesc {
-        program_bytes: compile_storage_program(snapshot_dir, facts, runtime_quant, mxfp4_moe, tp)?,
+        load_plan_bytes: compile_load_plan_bytes(
+            snapshot_dir,
+            facts,
+            runtime_quant,
+            mxfp4_moe,
+            tp,
+        )?,
         snapshot_dir: snapshot_dir.to_path_buf(),
-        compiler_version: pie_weight_loader::storage::compiler_version(),
+        compiler_version: pie_load_planner::load_plan::compiler_version(),
     })
 }
 
@@ -482,11 +489,19 @@ fn dummy_native_options(
 }
 
 fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
-    let is_gguf_file =
-        snapshot_dir.is_file() && snapshot_dir.extension().is_some_and(|e| e == "gguf");
-    if !snapshot_dir.is_dir() && !is_gguf_file {
+    let is_gguf_file = snapshot_dir.is_file()
+        && snapshot_dir
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
+    if is_gguf_file {
         return Err(anyhow!(
-            "snapshot_dir {snapshot_dir:?} does not exist, or is not a directory or .gguf file"
+            "GGUF model loading is deferred by the LoadPlan executors; \
+             use a Hugging Face safetensors snapshot directory"
+        ));
+    }
+    if !snapshot_dir.is_dir() {
+        return Err(anyhow!(
+            "snapshot_dir {snapshot_dir:?} does not exist or is not a directory"
         ));
     }
     Ok(())
@@ -521,7 +536,7 @@ pub(crate) fn create_driver_backend_group(
         if !opts.mtp_assistant_snapshot_dir.is_empty() {
             return Err(anyhow!(
                 "mtp_assistant_snapshot_dir is not supported by the single-model \
-                 StorageProgram boot contract"
+                 LoadPlan boot contract"
             ));
         }
         let state_dir = local_driver_state_dir(group_id, Some(tp))?;
@@ -574,7 +589,7 @@ pub(crate) fn create_driver_backend(
             if !opts.mtp_assistant_snapshot_dir.is_empty() {
                 return Err(anyhow!(
                     "mtp_assistant_snapshot_dir is not supported by the single-model \
-                     StorageProgram boot contract"
+                     LoadPlan boot contract"
                 ));
             }
             let state_dir = local_driver_state_dir(group_id, tp)?;
@@ -686,6 +701,15 @@ mod tests {
         assert_eq!(group.caps.arch_name, "qwen3");
         assert_eq!(group.caps.vocab_size, 32);
         assert_eq!(group.caps.snapshot_dir, snapshot.display().to_string());
+    }
+
+    #[test]
+    fn gguf_boot_is_rejected_before_compilation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf = tmp.path().join("model.gguf");
+        std::fs::write(&gguf, b"GGUF").unwrap();
+        let error = validate_snapshot_dir(&gguf).unwrap_err().to_string();
+        assert!(error.contains("GGUF model loading is deferred"));
     }
 
     #[cfg(feature = "driver-cuda")]

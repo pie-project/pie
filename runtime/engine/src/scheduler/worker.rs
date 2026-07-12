@@ -44,7 +44,7 @@ pub(crate) enum LeaveKind {
 pub(crate) fn notify_pipeline_leave(pid: ProcessId, _kind: LeaveKind) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::PipelineLeave(pid));
+        let _ = handle.send(SchedulerItem::PipelineLeave(pid, _kind));
     }
 }
 /// No-op: quorum rejoin is implicit on the pipeline's next
@@ -243,6 +243,11 @@ enum SchedulerItem {
         id: u64,
         response: crossbeam::channel::Sender<Result<()>>,
     },
+    FreezePipeline {
+        pid: ProcessId,
+        response: crossbeam::channel::Sender<()>,
+    },
+    ResumePipeline(ProcessId),
     /// Event-driven retirement wake: sent by [`NudgeWaker`] when an in-flight
     /// driver submission completion publishes. Carries no work; it only unblocks the
     /// scheduler's wait so the retire pass runs immediately.
@@ -251,7 +256,7 @@ enum SchedulerItem {
     /// Handled immediately on dequeue (like [`SchedulerItem::Nudge`]): it
     /// only mutates the run-loop's local `WaitAllPolicy`, never touching
     /// `pending`, so it can't reorder control ops or launches.
-    PipelineLeave(ProcessId),
+    PipelineLeave(ProcessId, LeaveKind),
     Stop,
 }
 
@@ -298,6 +303,7 @@ enum QueuedItem {
     PreLaunchCopy {
         plan: crate::driver::KvCopyPlan,
         logical_completion: WorkItemCompletion,
+        pipeline_id: Option<ProcessId>,
     },
     RegisterProgram {
         plan: ProgramRegistration,
@@ -351,6 +357,7 @@ struct PendingLaunchBatch {
 struct PendingControl {
     completion: SubmissionCompletion,
     logical_completion: Option<WorkItemCompletion>,
+    pipeline_id: Option<ProcessId>,
 }
 
 struct SchedulerControl {
@@ -469,6 +476,20 @@ impl SchedulerHandle {
                 retry_classifier,
             ),
         })
+    }
+
+    pub(crate) fn nudge(&self) -> Result<()> {
+        self.send(SchedulerItem::Nudge)
+    }
+
+    pub(crate) fn freeze_pipeline(&self, pid: ProcessId) -> Result<()> {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.send(SchedulerItem::FreezePipeline { pid, response: tx })?;
+        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))
+    }
+
+    pub(crate) fn resume_pipeline(&self, pid: ProcessId) -> Result<()> {
+        self.send(SchedulerItem::ResumePipeline(pid))
     }
 
     pub fn register_program(&self, plan: ProgramRegistration) -> Result<u64> {
@@ -603,6 +624,8 @@ impl BatchScheduler {
         let mut instances = HashMap::new();
         let mut channels = HashSet::new();
         let mut pending = VecDeque::new();
+        let mut blocked_preparations = VecDeque::new();
+        let mut frozen_pipelines = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = None;
         let mut stopping = false;
@@ -627,6 +650,8 @@ impl BatchScheduler {
                 &mut instances,
                 &mut channels,
                 &mut pending,
+                &mut blocked_preparations,
+                &frozen_pipelines,
                 &mut in_flight_launches,
                 &mut in_flight_control,
                 page_size,
@@ -645,6 +670,7 @@ impl BatchScheduler {
 
             if stopping
                 && pending.is_empty()
+                && blocked_preparations.is_empty()
                 && in_flight_launches.is_empty()
                 && in_flight_control.is_none()
             {
@@ -655,6 +681,9 @@ impl BatchScheduler {
                 progress = true;
                 Self::enqueue_item(
                     &mut pending,
+                    &mut blocked_preparations,
+                    &mut frozen_pipelines,
+                    &mut in_flight_control,
                     &instances,
                     limits,
                     page_size,
@@ -669,6 +698,7 @@ impl BatchScheduler {
             }
 
             let item = if pending.is_empty()
+                && blocked_preparations.is_empty()
                 && in_flight_launches.is_empty()
                 && in_flight_control.is_none()
                 && !stopping
@@ -738,6 +768,9 @@ impl BatchScheduler {
             if let Some(item) = item {
                 Self::enqueue_item(
                     &mut pending,
+                    &mut blocked_preparations,
+                    &mut frozen_pipelines,
+                    &mut in_flight_control,
                     &instances,
                     limits,
                     page_size,
@@ -755,6 +788,9 @@ impl BatchScheduler {
 
     fn enqueue_item(
         pending: &mut VecDeque<QueuedItem>,
+        blocked_preparations: &mut VecDeque<PendingRequest>,
+        frozen_pipelines: &mut HashSet<ProcessId>,
+        in_flight_control: &mut Option<PendingControl>,
         instances: &HashMap<u64, TrackedInstance>,
         limits: SchedulerLimits,
         page_size: u32,
@@ -763,14 +799,45 @@ impl BatchScheduler {
         item: SchedulerItem,
     ) {
         match item {
-            SchedulerItem::Stop => *stopping = true,
+            SchedulerItem::Stop => {
+                *stopping = true;
+                pending.extend(blocked_preparations.drain(..).map(QueuedItem::Prepare));
+            }
             // A nudge only unblocks the wait; the retire pass at the top of
             // the loop does the work.
-            SchedulerItem::Nudge => {}
+            SchedulerItem::Nudge => {
+                pending.extend(blocked_preparations.drain(..).map(QueuedItem::Prepare));
+            }
+            SchedulerItem::FreezePipeline { pid, response } => {
+                frozen_pipelines.insert(pid);
+                let _ = response.send(());
+            }
+            SchedulerItem::ResumePipeline(pid) => {
+                frozen_pipelines.remove(&pid);
+                pending.extend(blocked_preparations.drain(..).map(QueuedItem::Prepare));
+            }
             // Immediate, not queued: this only mutates the local quorum
             // policy (never `pending`/`instances`), so it can't reorder
             // control ops or launches.
-            SchedulerItem::PipelineLeave(pid) => policy.on_pipeline_leave(pid),
+            SchedulerItem::PipelineLeave(pid, kind) => {
+                policy.on_pipeline_leave(pid);
+                if kind == LeaveKind::Terminate {
+                    frozen_pipelines.remove(&pid);
+                    let protected = in_flight_control
+                        .as_ref()
+                        .filter(|control| control.pipeline_id == Some(pid))
+                        .and_then(|control| control.logical_completion.clone());
+                    if let Some(completion) = &protected {
+                        completion.request_cancel();
+                    }
+                    Self::reject_pipeline_queued(
+                        pending,
+                        blocked_preparations,
+                        pid,
+                        protected.as_ref(),
+                    );
+                }
+            }
             SchedulerItem::Launch { pending: launch } => {
                 let validation = BatchAccumulator::new(limits, page_size);
                 let rejection = if launch.completion.cancel_requested() {
@@ -789,6 +856,12 @@ impl BatchScheduler {
                 };
                 if let Some(message) = rejection {
                     launch.completion.reject_unsubmitted(message);
+                } else if launch.preparation.is_some()
+                    && launch
+                        .pipeline_id
+                        .is_some_and(|pid| frozen_pipelines.contains(&pid))
+                {
+                    blocked_preparations.push_back(launch);
                 } else if launch.preparation.is_some() {
                     policy.on_retry_participation(launch.pipeline_id);
                     pending.push_back(QueuedItem::Prepare(launch));
@@ -801,6 +874,7 @@ impl BatchScheduler {
                     Self::queue_attempt(pending, launch, QueueEnd::Back);
                 }
             }
+
             SchedulerItem::RegisterProgram { plan, response } => {
                 pending.push_back(QueuedItem::RegisterProgram { plan, response });
             }
@@ -836,6 +910,63 @@ impl BatchScheduler {
         }
     }
 
+    fn reject_pipeline_queued(
+        pending: &mut VecDeque<QueuedItem>,
+        blocked_preparations: &mut VecDeque<PendingRequest>,
+        pid: ProcessId,
+        protected: Option<&WorkItemCompletion>,
+    ) {
+        let mut kept = VecDeque::with_capacity(pending.len());
+        while let Some(item) = pending.pop_front() {
+            let reject = match &item {
+                QueuedItem::Prepare(request) | QueuedItem::Launch(request) => {
+                    request.pipeline_id == Some(pid)
+                        && protected
+                            .is_none_or(|completion| !request.completion.same_request(completion))
+                }
+                QueuedItem::PreLaunchCopy {
+                    pipeline_id,
+                    logical_completion,
+                    ..
+                } => {
+                    *pipeline_id == Some(pid)
+                        && protected
+                            .is_none_or(|completion| !logical_completion.same_request(completion))
+                }
+                _ => false,
+            };
+            if reject {
+                match item {
+                    QueuedItem::Prepare(request) | QueuedItem::Launch(request) => request
+                        .completion
+                        .reject_unsubmitted("pipeline terminated while queued"),
+                    QueuedItem::PreLaunchCopy {
+                        logical_completion, ..
+                    } => logical_completion
+                        .reject_unsubmitted("pipeline terminated before pre-launch copy"),
+                    _ => unreachable!("rejected item kind checked above"),
+                }
+            } else {
+                kept.push_back(item);
+            }
+        }
+        *pending = kept;
+
+        let mut kept = VecDeque::with_capacity(blocked_preparations.len());
+        while let Some(request) = blocked_preparations.pop_front() {
+            if request.pipeline_id == Some(pid)
+                && protected.is_none_or(|completion| !request.completion.same_request(completion))
+            {
+                request
+                    .completion
+                    .reject_unsubmitted("pipeline terminated while preparation was blocked");
+            } else {
+                kept.push_back(request);
+            }
+        }
+        *blocked_preparations = kept;
+    }
+
     fn queue_attempt(pending: &mut VecDeque<QueuedItem>, request: PendingRequest, end: QueueEnd) {
         let copy = request
             .prelaunch_copy
@@ -843,6 +974,7 @@ impl BatchScheduler {
             .map(|plan| QueuedItem::PreLaunchCopy {
                 plan,
                 logical_completion: request.completion.clone(),
+                pipeline_id: request.pipeline_id,
             });
         match end {
             QueueEnd::Front => {
@@ -914,6 +1046,8 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         channels: &mut HashSet<u64>,
         pending: &mut VecDeque<QueuedItem>,
+        blocked_preparations: &mut VecDeque<PendingRequest>,
+        frozen_pipelines: &HashSet<ProcessId>,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut Option<PendingControl>,
         page_size: u32,
@@ -933,6 +1067,22 @@ impl BatchScheduler {
             };
             match item {
                 QueuedItem::Prepare(_) => {
+                    if pending.front().is_some_and(|item| {
+                        matches!(
+                            item,
+                            QueuedItem::Prepare(request)
+                                if request
+                                    .pipeline_id
+                                    .is_some_and(|pid| frozen_pipelines.contains(&pid))
+                        )
+                    }) {
+                        let Some(QueuedItem::Prepare(request)) = pending.pop_front() else {
+                            unreachable!();
+                        };
+                        blocked_preparations.push_back(request);
+                        progress = true;
+                        continue;
+                    }
                     if pending.front().is_some_and(|item| {
                         matches!(
                             item,
@@ -981,6 +1131,8 @@ impl BatchScheduler {
                         Ok(prepared) => {
                             request.physical_page_ids = prepared.page_refs;
                             request.last_page_len = prepared.last_page_len;
+                            request.request.kv_translation_version =
+                                prepared.kv_translation_version;
                             request.prelaunch_copy = (!prepared.copy_src.is_empty()).then_some(
                                 crate::driver::KvCopyPlan {
                                     src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
@@ -1025,6 +1177,9 @@ impl BatchScheduler {
                             }
                             progress = true;
                             break;
+                        }
+                        Err(LaunchPreparationError::Blocked(_reason)) => {
+                            blocked_preparations.push_back(request);
                         }
                         Err(LaunchPreparationError::Failed(reason)) => {
                             request.completion.reject_unsubmitted(reason);
@@ -1107,6 +1262,7 @@ impl BatchScheduler {
             QueuedItem::PreLaunchCopy {
                 plan: _,
                 logical_completion,
+                ..
             } if logical_completion.cancel_requested() => {
                 logical_completion
                     .reject_unsubmitted("logical fire cancelled before pre-launch copy");
@@ -1114,12 +1270,14 @@ impl BatchScheduler {
             QueuedItem::PreLaunchCopy {
                 plan,
                 logical_completion,
+                pipeline_id,
             } => match driver.as_mut() {
                 Some(driver) => match driver.copy_kv(&plan) {
                     Ok(completion) => {
                         *in_flight_control = Some(PendingControl {
                             completion,
                             logical_completion: Some(logical_completion),
+                            pipeline_id,
                         });
                     }
                     Err(error) => {
@@ -1183,6 +1341,7 @@ impl BatchScheduler {
                             *in_flight_control = Some(PendingControl {
                                 completion: completion.clone(),
                                 logical_completion: None,
+                                pipeline_id: None,
                             });
                             Ok(completion)
                         }
@@ -1198,6 +1357,7 @@ impl BatchScheduler {
                             *in_flight_control = Some(PendingControl {
                                 completion: completion.clone(),
                                 logical_completion: None,
+                                pipeline_id: None,
                             });
                             Ok(completion)
                         }
@@ -1213,6 +1373,7 @@ impl BatchScheduler {
                             *in_flight_control = Some(PendingControl {
                                 completion: completion.clone(),
                                 logical_completion: None,
+                                pipeline_id: None,
                             });
                             Ok(completion)
                         }
@@ -2257,6 +2418,7 @@ mod tests {
             Ok(crate::scheduler::PreparedLaunch {
                 page_refs: Vec::new(),
                 last_page_len: 0,
+                kv_translation_version: 0,
                 copy_src: Vec::new(),
                 copy_dst: Vec::new(),
             })
@@ -2309,6 +2471,7 @@ mod tests {
             Ok(crate::scheduler::PreparedLaunch {
                 page_refs: Vec::new(),
                 last_page_len: 0,
+                kv_translation_version: 0,
                 copy_src: Vec::new(),
                 copy_dst: Vec::new(),
             })
@@ -2339,6 +2502,160 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn blocked_preparation_runs_only_after_an_event_nudge() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler(operation_log.clone()).await?;
+        let ready = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prepare_ready = ready.clone();
+        let prepare_attempts = attempts.clone();
+        let preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
+            prepare_attempts.fetch_add(1, Ordering::AcqRel);
+            if !prepare_ready.load(Ordering::Acquire) {
+                return Err(crate::scheduler::LaunchPreparationError::Blocked(
+                    "waiting for contention grant".to_string(),
+                ));
+            }
+            Ok(crate::scheduler::PreparedLaunch {
+                page_refs: Vec::new(),
+                last_page_len: 0,
+                kv_translation_version: 0,
+                copy_src: Vec::new(),
+                copy_dst: Vec::new(),
+            })
+        });
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_async_deferred(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Some(ProcessId::new_v4()),
+            None,
+            completion.clone(),
+            preparation,
+            None,
+        )?;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+        assert!(!completion.is_settled());
+
+        ready.store(true, Ordering::Release);
+        crate::scheduler::nudge(driver_id);
+        timeout(Duration::from_secs(5), completion).await??;
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert_eq!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == "launch")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipeline_freeze_blocks_preparation_until_resume() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
+        let pid = ProcessId::new_v4();
+        scheduler.handle.freeze_pipeline(pid)?;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prepare_attempts = attempts.clone();
+        let preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
+            prepare_attempts.fetch_add(1, Ordering::AcqRel);
+            Ok(crate::scheduler::PreparedLaunch {
+                page_refs: Vec::new(),
+                last_page_len: 0,
+                kv_translation_version: 0,
+                copy_src: Vec::new(),
+                copy_dst: Vec::new(),
+            })
+        });
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_async_deferred(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Some(pid),
+            None,
+            completion.clone(),
+            preparation,
+            None,
+        )?;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(attempts.load(Ordering::Acquire), 0);
+        assert!(!completion.is_settled());
+
+        scheduler.handle.resume_pipeline(pid)?;
+        timeout(Duration::from_secs(5), completion).await??;
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn termination_rejects_frozen_preparation() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
+        let pid = ProcessId::new_v4();
+        scheduler.handle.freeze_pipeline(pid)?;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prepare_attempts = attempts.clone();
+        let preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
+            prepare_attempts.fetch_add(1, Ordering::AcqRel);
+            Err(crate::scheduler::LaunchPreparationError::Failed(
+                "must not run".to_string(),
+            ))
+        });
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_async_deferred(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Some(pid),
+            None,
+            completion.clone(),
+            preparation,
+            None,
+        )?;
+        notify_pipeline_leave(pid, LeaveKind::Terminate);
+        let error = timeout(Duration::from_secs(5), completion)
+            .await?
+            .expect_err("termination must reject blocked preparation");
+        assert!(error.to_string().contains("terminated"));
+        assert_eq!(attempts.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn termination_preserves_launch_until_its_inflight_prelaunch_copy_retires() {
+        let pid = ProcessId::new_v4();
+        let completion = WorkItemCompletion::deferred_with_guard(None);
+        let request = PendingRequest::direct(
+            dummy_launch(),
+            1,
+            completion.clone(),
+            Vec::new(),
+            0,
+            Some(pid),
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        let mut pending = VecDeque::from([QueuedItem::Launch(request)]);
+        let mut blocked = VecDeque::new();
+        completion.request_cancel();
+        BatchScheduler::reject_pipeline_queued(&mut pending, &mut blocked, pid, Some(&completion));
+        assert_eq!(pending.len(), 1);
+        assert!(completion.cancel_requested());
+        assert!(!completion.is_settled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn retrying_preparation_preserves_lane_order_without_global_blocking()
     -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
@@ -2359,6 +2676,7 @@ mod tests {
             Ok(crate::scheduler::PreparedLaunch {
                 page_refs: Vec::new(),
                 last_page_len: 0,
+                kv_translation_version: 0,
                 copy_src: Vec::new(),
                 copy_dst: Vec::new(),
             })
@@ -2374,6 +2692,7 @@ mod tests {
             Ok(crate::scheduler::PreparedLaunch {
                 page_refs: Vec::new(),
                 last_page_len: 0,
+                kv_translation_version: 0,
                 copy_src: Vec::new(),
                 copy_dst: Vec::new(),
             })

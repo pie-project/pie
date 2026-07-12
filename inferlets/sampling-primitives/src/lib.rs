@@ -11,10 +11,6 @@ use serde::Deserialize;
 #[derive(Deserialize, Default)]
 struct Input {}
 
-fn bx<T>(value: T) -> &'static T {
-    Box::leak(Box::new(value))
-}
-
 fn argmax(values: &[f32]) -> usize {
     values
         .iter()
@@ -27,7 +23,7 @@ fn argmax(values: &[f32]) -> usize {
 #[inferlet::main]
 async fn main(_input: Input) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     model::configure(vocab, ws.page_size(), 1);
 
     let mut prompt = wit_model::encode("The capital of France is");
@@ -36,20 +32,18 @@ async fn main(_input: Input) -> Result<String> {
     }
     let n = prompt.len() as u32;
 
-    let toks = bx(Channel::from(
-        prompt.iter().map(|&token| token as i32).collect::<Vec<_>>(),
-    ));
-    let klen = bx(Channel::from(vec![n]));
-    let token_out = bx(Channel::new([1], dtype::i32).named("token"));
-    let logits_out = bx(Channel::new([vocab], dtype::f32).named("logits"));
-    let entropy_out = bx(Channel::new([1], dtype::f32).named("entropy"));
-    let probs_out = bx(Channel::new([vocab], dtype::f32).named("probabilities"));
-    let logprobs_out = bx(Channel::new([vocab], dtype::f32).named("log_probabilities"));
+    let toks = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let klen = Channel::from(vec![n]);
+    let token_out = Channel::new([1], dtype::i32).named("token");
+    let logits_out = Channel::new([vocab], dtype::f32).named("logits");
+    let entropy_out = Channel::new([1], dtype::f32).named("entropy");
+    let probs_out = Channel::new([vocab], dtype::f32).named("probabilities");
+    let logprobs_out = Channel::new([vocab], dtype::f32).named("log_probabilities");
 
-    let fwd: ForwardPass<'static> = ForwardPass::new();
-    fwd.embed(toks, Tensor::constant(vec![0u32, n]));
-    fwd.attn_working_set(ws, klen);
-    fwd.epilogue(move || {
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
+    fwd.attn_working_set(&ws, &klen);
+    fwd.epilogue(|| {
         let logits = intrinsics::logits();
         let logprobs = log_softmax(&logits);
         let probabilities = exp(&logprobs);

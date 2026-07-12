@@ -55,6 +55,11 @@ pub struct LaunchPlan {
     /// resolved `Pages`/`WSlot` references through it; empty = no
     /// WorkingSet-relative geometry in this fire.
     pub kv_translation: Vec<u32>,
+    /// Store mapping version that produced `kv_translation`. The direct ABI
+    /// ships the complete translation every launch (drivers keep no mapping
+    /// cache), but retaining the version here makes remap publication
+    /// observable and prevents the runtime from silently discarding it.
+    pub kv_translation_version: u64,
     /// Dense-channel-order immutable sequence tickets. `u64::MAX` means this
     /// fire does not consume/publish that channel.
     pub channel_expected_head: Vec<u64>,

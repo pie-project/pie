@@ -12,7 +12,7 @@
 // simply unused (empty) on Llama/Qwen. MoE tensors are empty on dense models.
 //
 // Binding is delta's job: it produces a populated `ModelWeights` from the
-// weight_loader. The `bind_*` free functions declared here are the agreed
+// load planner. The `bind_*` free functions declared here are the agreed
 // seam — delta implements name resolution, this dir defines the target shape.
 
 #include <cstdint>
@@ -190,7 +190,7 @@ struct ModelWeights {
 // WeightSource — the binding seam delta implements. Resolves an HF tensor
 // name to an MLX `Tensor` (already resident on-device), or std::nullopt when
 // the tensor is absent. The `bind_*` builders below call this; keeping the
-// interface abstract lets delta back it with the weight_loader / a name map
+// interface abstract lets delta back it with the load planner / a name map
 // without this dir depending on loader internals.
 class WeightSource {
 public:

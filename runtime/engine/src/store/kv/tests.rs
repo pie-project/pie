@@ -1,5 +1,7 @@
 //! Unit tests for the KV mapping trie, hashes, pool, and KvStore protocol.
 
+use std::collections::HashSet;
+
 use super::hash::{self, Hash256};
 use super::page_table::{KvPageTable, KvTableError, PhysicalKvPageId, PublishedPage, WorkingSetId};
 use super::write::{PageCommit, PreparedTarget};
@@ -670,6 +672,223 @@ fn store_flat_table_versions_bump_only_on_mapping_change() {
     let (v2, flat) = store.flat_table(ws).unwrap();
     assert_ne!(v1, v2);
     assert_eq!(flat, &ids[1..]);
+}
+
+#[test]
+fn store_suspend_restore_roundtrip_remaps_without_exposing_stale_ids() {
+    let mut store = KvStore::new_with_swap(4, 4, h(42));
+    let ws = store.create_working_set();
+    let original = commit_fresh(&mut store, ws, 3, 1);
+    let working_sets = HashSet::from([ws]);
+    let (before_version, _) = store.flat_table(ws).unwrap();
+
+    let txn = match store.prepare_suspend(&working_sets).unwrap() {
+        super::KvSuspendPrepare::Prepared(txn) => txn,
+        other => panic!("expected suspend transaction, got {other:?}"),
+    };
+    assert_eq!(txn.page_count(), 3);
+    assert_eq!(store.host_swap_available(), 1);
+    assert_eq!(store.available_pages(), 1);
+    store.commit_suspend(txn).unwrap();
+
+    assert_eq!(store.available_pages(), 4);
+    assert_eq!(store.host_swap_available(), 1);
+    assert!(matches!(
+        store.lookup(ws, 0),
+        Err(KvStoreError::Table(KvTableError::NonResident { index: 0 }))
+    ));
+    assert!(store.flat_table(ws).is_err());
+
+    let granted = store.reserve_device_pages(3).unwrap();
+    let restored_ids = granted.clone();
+    let txn = store.prepare_restore(&working_sets, granted).unwrap();
+    assert_eq!(txn.page_count(), 3);
+    store.commit_restore(txn).unwrap();
+
+    let (after_version, flat) = store.flat_table(ws).unwrap();
+    let flat = flat.to_vec();
+    assert!(after_version > before_version);
+    let mut flat_ids: Vec<_> = flat.iter().map(|id| id.0).collect();
+    let mut granted_ids: Vec<_> = restored_ids.iter().map(|id| id.0).collect();
+    flat_ids.sort_unstable();
+    granted_ids.sort_unstable();
+    assert_eq!(flat_ids, granted_ids);
+    assert_eq!(store.host_swap_available(), 4);
+    assert_eq!(store.available_pages(), 1);
+    assert_eq!(original.len(), flat.len());
+}
+
+#[test]
+fn store_suspend_and_restore_abort_are_leak_free() {
+    let mut store = KvStore::new_with_swap(4, 4, h(42));
+    let ws = store.create_working_set();
+    let original = commit_fresh(&mut store, ws, 2, 1);
+    let working_sets = HashSet::from([ws]);
+
+    let suspend = match store.prepare_suspend(&working_sets).unwrap() {
+        super::KvSuspendPrepare::Prepared(txn) => txn,
+        other => panic!("expected suspend transaction, got {other:?}"),
+    };
+    store.abort_suspend(suspend);
+    assert_eq!(store.host_swap_available(), 4);
+    assert_eq!(store.available_pages(), 2);
+    assert_eq!(store.flat_table(ws).unwrap().1, original.as_slice());
+
+    let suspend = match store.prepare_suspend(&working_sets).unwrap() {
+        super::KvSuspendPrepare::Prepared(txn) => txn,
+        other => panic!("expected suspend transaction, got {other:?}"),
+    };
+    store.commit_suspend(suspend).unwrap();
+    let granted = store.reserve_device_pages(2).unwrap();
+    let restore = store.prepare_restore(&working_sets, granted).unwrap();
+    store.abort_restore(restore);
+    assert_eq!(store.available_pages(), 4);
+    assert_eq!(store.host_swap_available(), 2);
+    assert!(store.flat_table(ws).is_err());
+}
+
+#[test]
+fn host_swap_reservation_is_all_or_nothing() {
+    let mut store = KvStore::new_with_swap(4, 1, h(42));
+    let ws = store.create_working_set();
+    let original = commit_fresh(&mut store, ws, 2, 1);
+    let error = store.prepare_suspend(&HashSet::from([ws])).unwrap_err();
+    assert_eq!(
+        error,
+        KvStoreError::HostSwapFull {
+            requested: 2,
+            available: 1
+        }
+    );
+    assert_eq!(store.host_swap_available(), 1);
+    assert_eq!(store.flat_table(ws).unwrap().1, original.as_slice());
+}
+
+#[test]
+fn store_suspend_preserves_pages_shared_with_an_external_working_set() {
+    let mut store = KvStore::new_with_swap(8, 8, h(42));
+    let a = store.create_working_set();
+    let original = commit_fresh(&mut store, a, 3, 1);
+    let b = store.fork(a).unwrap();
+    store.reserve(b, 1).unwrap();
+    let prepared = store.prepare_write(b, &[3]).unwrap();
+    store.commit(prepared, &[pc(9)], 2).unwrap();
+
+    let txn = match store.prepare_suspend(&HashSet::from([b])).unwrap() {
+        super::KvSuspendPrepare::Prepared(txn) => txn,
+        other => panic!("expected suspend transaction, got {other:?}"),
+    };
+    assert_eq!(txn.page_count(), 1);
+    store.commit_suspend(txn).unwrap();
+
+    assert_eq!(store.flat_table(a).unwrap().1, original.as_slice());
+    assert!(store.flat_table(b).is_err());
+    assert_eq!(store.backing_counts(), (3, 1));
+}
+
+#[test]
+fn post_drain_reclaimability_excludes_shared_and_cache_anchored_pages() {
+    let mut store = KvStore::new_with_swap(4, 4, h(42));
+    let a = store.create_working_set();
+    commit_fresh(&mut store, a, 2, 1);
+    let b = store.fork(a).unwrap();
+    assert_eq!(
+        store
+            .post_drain_reclaimable_page_count(&HashSet::from([b]))
+            .unwrap(),
+        0
+    );
+
+    let epoch = store.current_epoch();
+    store.release_working_set(b, epoch);
+    let terminal = store.terminal(a).unwrap().unwrap();
+    store.lease_cache_root(terminal);
+    assert_eq!(
+        store
+            .post_drain_reclaimable_page_count(&HashSet::from([a]))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn releasing_a_swapped_working_set_returns_host_slots() {
+    let mut store = KvStore::new_with_swap(4, 4, h(42));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 3, 1);
+    let working_sets = HashSet::from([ws]);
+    let txn = match store.prepare_suspend(&working_sets).unwrap() {
+        super::KvSuspendPrepare::Prepared(txn) => txn,
+        other => panic!("expected suspend transaction, got {other:?}"),
+    };
+    store.commit_suspend(txn).unwrap();
+    assert_eq!(store.host_swap_available(), 1);
+
+    let epoch = store.current_epoch();
+    store.release_working_set(ws, epoch);
+    store.retire_idle();
+    assert_eq!(store.host_swap_available(), 4);
+    assert_eq!(store.available_pages(), 4);
+}
+
+#[test]
+fn teardown_during_residency_transactions_reclaims_pinned_orphans() {
+    let mut store = KvStore::new_with_swap(4, 4, h(42));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 2, 1);
+    let working_sets = HashSet::from([ws]);
+    let suspend = match store.prepare_suspend(&working_sets).unwrap() {
+        super::KvSuspendPrepare::Prepared(txn) => txn,
+        other => panic!("expected suspend transaction, got {other:?}"),
+    };
+    let epoch = store.current_epoch();
+    store.release_working_set(ws, epoch);
+    store.abort_suspend(suspend);
+    assert_eq!(store.available_pages(), 4);
+    assert_eq!(store.host_swap_available(), 4);
+
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 2, 2);
+    let working_sets = HashSet::from([ws]);
+    let suspend = match store.prepare_suspend(&working_sets).unwrap() {
+        super::KvSuspendPrepare::Prepared(txn) => txn,
+        other => panic!("expected suspend transaction, got {other:?}"),
+    };
+    store.commit_suspend(suspend).unwrap();
+    let granted = store.reserve_device_pages(2).unwrap();
+    let restore = store.prepare_restore(&working_sets, granted).unwrap();
+    let epoch = store.current_epoch();
+    store.release_working_set(ws, epoch);
+    store.abort_restore(restore);
+    assert_eq!(store.available_pages(), 4);
+    assert_eq!(store.host_swap_available(), 4);
+}
+
+#[test]
+fn cas_adoption_rejects_a_path_pinned_by_suspend() {
+    let mut store = KvStore::new_with_swap(4, 4, h(42));
+    let source = store.create_working_set();
+    store.reserve(source, 1).unwrap();
+    let prepared = store.prepare_write(source, &[0]).unwrap();
+    let key = h(77);
+    store
+        .commit(
+            prepared,
+            &[PageCommit {
+                token_hashes: vec![Some(key)],
+                page_hash: Some(h(88)),
+            }],
+            1,
+        )
+        .unwrap();
+    let target = store.create_working_set();
+    let suspend = match store.prepare_suspend(&HashSet::from([source])).unwrap() {
+        super::KvSuspendPrepare::Prepared(txn) => txn,
+        other => panic!("expected suspend transaction, got {other:?}"),
+    };
+    assert_eq!(store.adopt_cached_prefix(target, &key, 1).unwrap(), None);
+    store.abort_suspend(suspend);
+    assert_eq!(store.adopt_cached_prefix(target, &key, 1).unwrap(), Some(1));
 }
 
 #[test]

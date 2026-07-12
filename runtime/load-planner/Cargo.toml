@@ -1,5 +1,5 @@
 [package]
-name = "pie-weight-loader"
+name = "pie-load-planner"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
@@ -8,11 +8,12 @@ license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [lib]
-name = "pie_weight_loader"
+name = "pie_load_planner"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
+half = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"

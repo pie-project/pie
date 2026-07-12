@@ -13,7 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace pie_weight_loader {
+namespace pie_load_planner {
 
 enum class PieLoaderBackendKind { Cuda = 0, Metal = 1, Unknown = 255 };
 enum class PieLoaderDType {
@@ -55,6 +55,17 @@ enum class PieLoaderStorageInstrKind {
 enum class PieLoaderTileMapKind {
     Cast, Decode, Encode, Transcode, Reblock, Reorder, Repack, None,
 };
+inline constexpr std::uint32_t kTileMapCast = 1u << 0;
+inline constexpr std::uint32_t kTileMapDecode = 1u << 1;
+inline constexpr std::uint32_t kTileMapEncode = 1u << 2;
+inline constexpr std::uint32_t kTileMapTranscode = 1u << 3;
+inline constexpr std::uint32_t kTileMapReblock = 1u << 4;
+inline constexpr std::uint32_t kTileMapReorder = 1u << 5;
+inline constexpr std::uint32_t kTileMapRepack = 1u << 6;
+inline constexpr std::uint32_t kCudaTileMapMask =
+    kTileMapCast | kTileMapEncode | kTileMapReblock | kTileMapReorder |
+    kTileMapRepack;
+inline constexpr std::uint32_t kMetalTileMapMask = 0;
 
 struct PieLoaderBytes {
     const std::uint8_t* ptr = nullptr;
@@ -206,7 +217,7 @@ struct PieLoaderOptimizerPassStatsSlice {
 struct PieLoaderOptimizerReportView {
     PieLoaderOptimizerPassStatsSlice passes{};
 };
-struct PieLoaderStorageProgramView {
+struct LoadPlanView {
     std::uint32_t version = 0;
     PieLoaderSourceTensorSlice sources{};
     PieLoaderTensorDeclSlice tensors{};
@@ -228,10 +239,27 @@ inline PieLoaderBytes bytes(const std::string& value) {
 
 template <typename T>
 inline std::uint32_t id(const T& value, const char* field) {
-    if (!value.is_number_unsigned() && !value.is_number_integer()) {
-        throw std::runtime_error(std::string("storage program: ") + field + " is not an id");
+    std::uint64_t narrowed = 0;
+    if (value.is_number_unsigned()) {
+        narrowed = value.template get<std::uint64_t>();
+    } else if (value.is_number_integer()) {
+        const std::int64_t signed_value =
+            value.template get<std::int64_t>();
+        if (signed_value < 0) {
+            throw std::runtime_error(
+                std::string("load plan: ") + field +
+                " must be non-negative");
+        }
+        narrowed = static_cast<std::uint64_t>(signed_value);
+    } else {
+        throw std::runtime_error(std::string("load plan: ") + field + " is not an id");
     }
-    return value.template get<std::uint32_t>();
+    if (narrowed > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error(
+            std::string("load plan: ") + field +
+            " exceeds uint32 range");
+    }
+    return static_cast<std::uint32_t>(narrowed);
 }
 
 inline PieLoaderDType dtype(const std::string& value) {
@@ -244,7 +272,7 @@ inline PieLoaderDType dtype(const std::string& value) {
         {"U8", PieLoaderDType::U8}, {"Bool", PieLoaderDType::Bool},
     };
     const auto it = map.find(value);
-    if (it == map.end()) throw std::runtime_error("storage program: unknown dtype " + value);
+    if (it == map.end()) throw std::runtime_error("load plan: unknown dtype " + value);
     return it->second;
 }
 
@@ -267,7 +295,7 @@ inline PieLoaderQuantScheme quant(const std::string& value) {
     };
     const auto it = map.find(value);
     if (it == map.end()) {
-        throw std::runtime_error("storage program: unknown quant scheme " + value);
+        throw std::runtime_error("load plan: unknown quant scheme " + value);
     }
     return it->second;
 }
@@ -282,7 +310,7 @@ inline PieLoaderTileMapKind tile_kind(const std::string& value) {
         {"Repack", PieLoaderTileMapKind::Repack},
     };
     const auto it = map.find(value);
-    if (it == map.end()) throw std::runtime_error("storage program: unknown TileMap " + value);
+    if (it == map.end()) throw std::runtime_error("load plan: unknown TileMap " + value);
     return it->second;
 }
 
@@ -291,37 +319,37 @@ inline PieLoaderRepackLayout repack(const std::string& value) {
     if (value == "MarlinMxfp4Weight") return PieLoaderRepackLayout::MarlinMxfp4Weight;
     if (value == "MarlinMxfp4Scale") return PieLoaderRepackLayout::MarlinMxfp4Scale;
     if (value == "DenseRowGather") return PieLoaderRepackLayout::DenseRowGather;
-    throw std::runtime_error("storage program: unknown repack layout " + value);
+    throw std::runtime_error("load plan: unknown repack layout " + value);
 }
 
 inline PieLoaderRowMap row_map(const std::string& value) {
     if (value == "Identity") return PieLoaderRowMap::Identity;
     if (value == "Even") return PieLoaderRowMap::Even;
     if (value == "Odd") return PieLoaderRowMap::Odd;
-    throw std::runtime_error("storage program: unknown row map " + value);
+    throw std::runtime_error("load plan: unknown row map " + value);
 }
 
 }  // namespace detail
 
-class StorageProgram {
+class LoadPlan {
   public:
-    StorageProgram() = default;
-    StorageProgram(const StorageProgram&) = delete;
-    StorageProgram& operator=(const StorageProgram&) = delete;
-    StorageProgram(StorageProgram&&) noexcept = default;
-    StorageProgram& operator=(StorageProgram&&) noexcept = default;
+    LoadPlan() = default;
+    LoadPlan(const LoadPlan&) = delete;
+    LoadPlan& operator=(const LoadPlan&) = delete;
+    LoadPlan(LoadPlan&&) noexcept = default;
+    LoadPlan& operator=(LoadPlan&&) noexcept = default;
 
-    static StorageProgram deserialize(
+    static LoadPlan deserialize(
         std::span<const std::uint8_t> bytes,
         std::uint64_t expected_compiler_version = 0) {
-        if (bytes.empty()) throw std::runtime_error("storage program is empty");
+        if (bytes.empty()) throw std::runtime_error("load plan is empty");
         const nlohmann::json root = nlohmann::json::parse(bytes.begin(), bytes.end());
-        StorageProgram program;
-        program.parse(root, expected_compiler_version);
-        return program;
+        LoadPlan plan;
+        plan.parse(root, expected_compiler_version);
+        return plan;
     }
 
-    PieLoaderStorageProgramView view() const noexcept {
+    LoadPlanView view() const noexcept {
         return {
             version_,
             {sources_.data(), sources_.size()},
@@ -341,6 +369,7 @@ class StorageProgram {
         return preferred_alignment_;
     }
     std::uint64_t max_tile_bytes() const noexcept { return max_tile_bytes_; }
+    std::uint32_t tile_map_mask() const noexcept { return tile_map_mask_; }
     std::uint64_t compiler_version() const noexcept { return compiler_version_; }
 
   private:
@@ -419,7 +448,7 @@ class StorageProgram {
 
     PieLoaderStorageInstrView instruction(const nlohmann::json& tagged) {
         if (tagged.size() != 1) {
-            throw std::runtime_error("storage program: instruction must have one tag");
+            throw std::runtime_error("load plan: instruction must have one tag");
         }
         const std::string tag = tagged.begin().key();
         const auto& value = tagged.begin().value();
@@ -534,7 +563,7 @@ class StorageProgram {
             out.output_buffers = {u32_slices_.back().data(), 1};
             out.name = store_string(value.at("name").get<std::string>());
         } else {
-            throw std::runtime_error("storage program: unknown instruction " + tag);
+            throw std::runtime_error("load plan: unknown instruction " + tag);
         }
         return out;
     }
@@ -543,10 +572,10 @@ class StorageProgram {
         const nlohmann::json& root,
         std::uint64_t expected_compiler_version) {
         version_ = root.at("version").get<std::uint32_t>();
-        if (version_ != 4) {
+        if (version_ != 5) {
             throw std::runtime_error(
-                "storage program version " + std::to_string(version_) +
-                " does not match executor version 4");
+                "load plan version " + std::to_string(version_) +
+                " does not match executor version 5");
         }
         compiler_version_ = root.at("compiler_version").get<std::uint64_t>();
         if (expected_compiler_version != 0 &&
@@ -559,17 +588,32 @@ class StorageProgram {
 
         const auto& target = root.at("target");
         const std::string backend = target.at("backend").get<std::string>();
-        backend_ = backend == "Cuda" ? PieLoaderBackendKind::Cuda
-                 : backend == "Metal" ? PieLoaderBackendKind::Metal
-                 : PieLoaderBackendKind::Unknown;
+        if (backend == "Cuda") {
+            backend_ = PieLoaderBackendKind::Cuda;
+        } else if (backend == "Metal") {
+            backend_ = PieLoaderBackendKind::Metal;
+        } else if (backend == "Unknown") {
+            backend_ = PieLoaderBackendKind::Unknown;
+        } else {
+            throw std::runtime_error(
+                "load plan: unknown backend " + backend);
+        }
         const std::string policy = target.at("mxfp4_moe").get<std::string>();
-        mxfp4_moe_ = policy == "NativeGemm" ? PieLoaderMxfp4MoePolicy::NativeGemm
-                    : policy == "EagerBf16" ? PieLoaderMxfp4MoePolicy::EagerBf16
-                    : PieLoaderMxfp4MoePolicy::RoutedDecode;
+        if (policy == "NativeGemm") {
+            mxfp4_moe_ = PieLoaderMxfp4MoePolicy::NativeGemm;
+        } else if (policy == "EagerBf16") {
+            mxfp4_moe_ = PieLoaderMxfp4MoePolicy::EagerBf16;
+        } else if (policy == "RoutedDecode") {
+            mxfp4_moe_ = PieLoaderMxfp4MoePolicy::RoutedDecode;
+        } else {
+            throw std::runtime_error(
+                "load plan: unknown mxfp4_moe policy " + policy);
+        }
         native_mxfp4_moe_ = target.at("native_mxfp4_moe").get<bool>();
         preferred_alignment_ =
             target.at("preferred_alignment").get<std::uint32_t>();
         max_tile_bytes_ = target.at("max_tile_bytes").get<std::uint64_t>();
+        tile_map_mask_ = target.at("tile_map_mask").get<std::uint32_t>();
 
         const auto& tensor_json = root.at("tensors");
         tensors_.reserve(tensor_json.size());
@@ -672,6 +716,7 @@ class StorageProgram {
     bool native_mxfp4_moe_ = false;
     std::uint32_t preferred_alignment_ = 1;
     std::uint64_t max_tile_bytes_ = 0;
+    std::uint32_t tile_map_mask_ = 0;
     std::deque<std::string> strings_;
     std::deque<std::vector<std::int64_t>> i64_slices_;
     std::deque<std::vector<std::uint32_t>> u32_slices_;
@@ -750,28 +795,28 @@ inline std::uint64_t extent_bytes(
     return elements * extent.element_bytes;
 }
 
-class StorageProgramIndex {
+class LoadPlanIndex {
   public:
-    explicit StorageProgramIndex(std::string context)
+    explicit LoadPlanIndex(std::string context)
         : context_(std::move(context)) {}
 
-    void reset(const PieLoaderStorageProgramView& program) {
+    void reset(const LoadPlanView& plan) {
         instr_by_id_.clear();
         buffer_by_id_.clear();
         tensor_by_id_.clear();
         source_by_id_.clear();
         source_by_name_.clear();
-        for (std::size_t i = 0; i < program.instrs.len; ++i) {
-            instr_by_id_.emplace(program.instrs.ptr[i].id, &program.instrs.ptr[i]);
+        for (std::size_t i = 0; i < plan.instrs.len; ++i) {
+            instr_by_id_.emplace(plan.instrs.ptr[i].id, &plan.instrs.ptr[i]);
         }
-        for (std::size_t i = 0; i < program.buffers.len; ++i) {
-            buffer_by_id_.emplace(program.buffers.ptr[i].id, &program.buffers.ptr[i]);
+        for (std::size_t i = 0; i < plan.buffers.len; ++i) {
+            buffer_by_id_.emplace(plan.buffers.ptr[i].id, &plan.buffers.ptr[i]);
         }
-        for (std::size_t i = 0; i < program.tensors.len; ++i) {
-            tensor_by_id_.emplace(program.tensors.ptr[i].id, &program.tensors.ptr[i]);
+        for (std::size_t i = 0; i < plan.tensors.len; ++i) {
+            tensor_by_id_.emplace(plan.tensors.ptr[i].id, &plan.tensors.ptr[i]);
         }
-        for (std::size_t i = 0; i < program.sources.len; ++i) {
-            const auto* source = &program.sources.ptr[i];
+        for (std::size_t i = 0; i < plan.sources.len; ++i) {
+            const auto* source = &plan.sources.ptr[i];
             source_by_id_.emplace(source->id, source);
             source_by_name_.emplace(bytes_to_string(source->name), source);
         }
@@ -820,4 +865,4 @@ class StorageProgramIndex {
 };
 
 }  // namespace cpp
-}  // namespace pie_weight_loader
+}  // namespace pie_load_planner

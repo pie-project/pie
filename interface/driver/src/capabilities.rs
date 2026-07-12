@@ -7,10 +7,15 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub const KV_COPY_DEVICE_TO_DEVICE: u32 = 1 << 0;
+pub const KV_COPY_DEVICE_TO_HOST: u32 = 1 << 1;
+pub const KV_COPY_HOST_TO_DEVICE: u32 = 1 << 2;
+pub const KV_COPY_HOST_TO_HOST: u32 = 1 << 3;
+
 /// Runtime-owned payload for the blocking model-load boot call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelLoadDesc {
-    pub program_bytes: Vec<u8>,
+    pub load_plan_bytes: Vec<u8>,
     pub snapshot_dir: PathBuf,
     pub compiler_version: u64,
 }
@@ -26,10 +31,11 @@ pub struct DeviceFacts {
     pub native_mxfp4_moe: bool,
     pub storage_alignment: u32,
     pub storage_max_tile_bytes: u64,
+    pub storage_tile_map_mask: u32,
     pub page_size: u32,
 }
 
-/// Model-derived capabilities returned after the storage program is executed.
+/// Model-derived capabilities returned after the LoadPlan is executed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DriverCapabilities {
@@ -41,6 +47,9 @@ pub struct DriverCapabilities {
     pub kv_page_size: u32,
     /// Number of CPU-resident swap-pool pages (0 if no swap support).
     pub swap_pool_size: u32,
+    /// Supported whole-page KV copy directions.
+    #[serde(default)]
+    pub kv_copy_domain_mask: u32,
     /// True when the model needs runtime-assigned recurrent-state slots.
     #[serde(default)]
     pub rs_cache_required: bool,
@@ -79,6 +88,7 @@ mod tests {
             "total_pages": 1024,
             "kv_page_size": 16,
             "swap_pool_size": 0,
+            "kv_copy_domain_mask": 0,
             "max_forward_tokens": 512,
             "max_forward_requests": 32,
             "max_page_refs": 4096,
@@ -109,6 +119,7 @@ mod tests {
             native_mxfp4_moe: false,
             storage_alignment: 256,
             storage_max_tile_bytes: 64 << 20,
+            storage_tile_map_mask: 0,
             page_size: 16 << 10,
         };
         let json = serde_json::to_string(&facts).unwrap();
@@ -122,6 +133,7 @@ mod tests {
             "total_pages": 1024,
             "kv_page_size": 16,
             "swap_pool_size": 0,
+            "kv_copy_domain_mask": 0,
             "max_forward_tokens": 512,
             "max_forward_requests": 32,
             "max_page_refs": 4096,

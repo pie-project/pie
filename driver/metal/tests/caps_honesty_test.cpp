@@ -5,6 +5,8 @@
 #include <nlohmann/json.hpp>
 #include <pie_driver_abi.h>
 
+#include "pie_native/load_plan.hpp"
+
 namespace {
 
 void notify_cb(void*, std::uint64_t, std::uint64_t) {}
@@ -54,6 +56,10 @@ int main() {
     failures += !expect(
         facts.at("storage_alignment").get<std::uint32_t>() > 0,
         "storage alignment is device-derived and nonzero");
+    failures += !expect(
+        facts.at("storage_tile_map_mask").get<std::uint32_t>() ==
+            pie_load_planner::kMetalTileMapMask,
+        "device facts match the Metal load executor transforms");
     failures += !expect(
         facts.at("page_size").get<std::uint32_t>() > 0,
         "host/GPU page size is reported");

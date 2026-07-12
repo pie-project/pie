@@ -38,10 +38,25 @@ static REGISTRY: LazyLock<boxcar::Vec<Vec<Stores>>> = LazyLock::new(boxcar::Vec:
 /// Register a model's per-driver stores at bootstrap. Capacities come from
 /// the driver-preallocated static pools. Returns the assigned model index.
 pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_rs_slots: &[usize]) -> usize {
+    register_model_with_swap(
+        kv_page_size,
+        num_kv_pages,
+        &vec![0; num_kv_pages.len()],
+        num_rs_slots,
+    )
+}
+
+pub fn register_model_with_swap(
+    kv_page_size: u32,
+    num_kv_pages: &[usize],
+    num_host_pages: &[usize],
+    num_rs_slots: &[usize],
+) -> usize {
     let stores: Vec<Stores> = (0..num_kv_pages.len())
         .map(|d| Stores {
-            kv: Arc::new(Mutex::new(KvStore::new(
+            kv: Arc::new(Mutex::new(KvStore::new_with_swap(
                 num_kv_pages[d] as u32,
+                num_host_pages.get(d).copied().unwrap_or(0) as u32,
                 rand::random::<[u8; 32]>(),
             ))),
             rs: Arc::new(Mutex::new(RsStore::new(

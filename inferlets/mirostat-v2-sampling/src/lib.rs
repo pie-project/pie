@@ -76,10 +76,6 @@ enum Floor {
     Plain,
 }
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 /// The mirostat keep-mask + Gumbel-max sample + observed surprise, over the
 /// FULL (untruncated) `probs`/`logits` distribution. `mu` is reshaped to a
 /// scalar here — `pivot_threshold`'s predicate threshold operand is validated
@@ -142,7 +138,7 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
 
     let vocab = wit_model::output_vocab_size();
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     model::configure(vocab, ws.page_size(), 1);
 
     let mut mu = input.mu0.unwrap_or_else(|| (vocab as f32).ln() + 1.0);
@@ -169,17 +165,17 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── PREFILL FIRE (N-wide) — first mirostat step over the prompt. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = bx(Channel::from(prompt_i32).named("toks_p"));
-    let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
-    let mu_p = bx(Channel::new([1], dtype::f32).named("mu_p"));
-    let rng_p = bx(Channel::from(vec![0x9e37_u32, 0]).named("rng_p"));
-    let tok_out_p = bx(Channel::new([1], dtype::i32).named("tok_out_p"));
-    let s_out_p = bx(Channel::new([1], dtype::f32).named("s_out_p"));
+    let toks_p = Channel::from(prompt_i32).named("toks_p");
+    let klen_p = Channel::from(vec![n; 1]).named("klen_p");
+    let mu_p = Channel::new([1], dtype::f32).named("mu_p");
+    let rng_p = Channel::from(vec![0x9e37_u32, 0]).named("rng_p");
+    let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
+    let s_out_p = Channel::new([1], dtype::f32).named("s_out_p");
 
-    let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd_p.embed(toks_p, Tensor::constant(vec![0u32, n]));
-    fwd_p.attn_working_set(ws, klen_p);
-    fwd_p.epilogue(move || {
+    let fwd_p = ForwardPass::new();
+    fwd_p.embed(&toks_p, Tensor::constant(vec![0u32, n]));
+    fwd_p.attn_working_set(&ws, &klen_p);
+    fwd_p.epilogue(|| {
         let mu_v = mu_p.take().tensor();
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
         let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
@@ -211,21 +207,21 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE LOOP (1-wide) ──
     if generated.len() < max_tokens {
-        let tok_in = bx(Channel::from(vec![g0; 1]).named("tok_in"));
-        let pos = bx(Channel::from(vec![n; 1]).named("pos"));
-        let klen = bx(Channel::from(vec![n + 1; 1]).named("klen"));
-        let fill = bx(Channel::from(vec![n + 1; 1]).named("fill"));
-        let mu_ch = bx(Channel::new([1], dtype::f32).named("mu_ch"));
-        let rng = bx(Channel::from(vec![0x51ed_u32, 0]).named("rng"));
-        let tok_out = bx(Channel::new([1], dtype::i32).named("tok_out"));
-        let s_out = bx(Channel::new([1], dtype::f32).named("s_out"));
+        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
+        let pos = Channel::from(vec![n; 1]).named("pos");
+        let klen = Channel::from(vec![n + 1; 1]).named("klen");
+        let fill = Channel::from(vec![n + 1; 1]).named("fill");
+        let mu_ch = Channel::new([1], dtype::f32).named("mu_ch");
+        let rng = Channel::from(vec![0x51ed_u32, 0]).named("rng");
+        let tok_out = Channel::new([1], dtype::i32).named("tok_out");
+        let s_out = Channel::new([1], dtype::f32).named("s_out");
         let lane1 = Tensor::constant(vec![0u32, 1u32]);
 
-        let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-        fwd.embed(tok_in, lane1);
-        fwd.positions(pos);
-        fwd.attn_working_set(ws, klen);
-        fwd.epilogue(move || {
+        let fwd = ForwardPass::new();
+        fwd.embed(&tok_in, lane1);
+        fwd.positions(&pos);
+        fwd.attn_working_set(&ws, &klen);
+        fwd.epilogue(|| {
             // Takes + compute first, PUTS last (value-id discipline).
             let base = fill.take().tensor(); // [1] u32
             let mu_v = mu_ch.take().tensor(); // [1] f32, host-updated each step

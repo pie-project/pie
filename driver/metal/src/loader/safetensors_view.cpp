@@ -75,6 +75,7 @@ struct SafetensorsView::Impl {
     struct Entry { const uint8_t* data; size_t nbytes; std::string dtype; std::vector<int64_t> shape; };
     std::unordered_map<std::string, Entry> tensors;
     bool indexed = false;
+    std::uintptr_t page_size = 1;
 };
 
 void SafetensorsView::ensure_index() const {
@@ -110,6 +111,9 @@ void SafetensorsView::ensure_index() const {
 
 SafetensorsView::SafetensorsView(const std::string& hf_path) : impl_(new Impl()) {
     try {
+        const long page_size = ::sysconf(_SC_PAGESIZE);
+        impl_->page_size =
+            static_cast<std::uintptr_t>(page_size > 0 ? page_size : 1);
         for (const auto& shard : resolve_shards(fs::path(hf_path))) {
             Mapping m = mmap_file(shard);
             impl_->maps.push_back(m);
@@ -173,14 +177,14 @@ void SafetensorsView::copy_storage_bytes(
     void* destination,
     std::uint64_t max_tile_bytes) const {
     if (file_id >= impl_->maps.size()) {
-        throw std::runtime_error("storage program file id is out of range");
+        throw std::runtime_error("LoadPlan file id is out of range");
     }
     const Mapping& mapping = impl_->maps[file_id];
     if (file_offset > mapping.len || bytes > mapping.len - file_offset) {
-        throw std::runtime_error("storage program file extent is out of range");
+        throw std::runtime_error("LoadPlan file extent is out of range");
     }
     if (bytes != 0 && destination == nullptr) {
-        throw std::runtime_error("storage program destination is null");
+        throw std::runtime_error("LoadPlan destination is null");
     }
     const std::uint64_t tile =
         max_tile_bytes == 0 ? std::max<std::uint64_t>(1, bytes)
@@ -191,23 +195,24 @@ void SafetensorsView::copy_storage_bytes(
     for (std::uint64_t copied = 0; copied < bytes;) {
         const std::uint64_t chunk = std::min(tile, bytes - copied);
         std::memcpy(dest + copied, source + copied, static_cast<std::size_t>(chunk));
-        copied += chunk;
-    }
-    if (bytes != 0) {
-        const long page_size = ::sysconf(_SC_PAGESIZE);
-        if (page_size > 0) {
-            const std::uintptr_t start =
-                reinterpret_cast<std::uintptr_t>(source) &
-                ~static_cast<std::uintptr_t>(page_size - 1);
-            const std::uintptr_t end =
-                (reinterpret_cast<std::uintptr_t>(source + bytes) +
-                 static_cast<std::uintptr_t>(page_size - 1)) &
-                ~static_cast<std::uintptr_t>(page_size - 1);
+        const std::uint64_t next = copied + chunk;
+        const std::uintptr_t page = impl_->page_size;
+        const std::uintptr_t start_addr =
+            reinterpret_cast<std::uintptr_t>(source + copied);
+        const std::uintptr_t end_addr =
+            reinterpret_cast<std::uintptr_t>(source + next);
+        const std::uintptr_t advise_start = start_addr - start_addr % page;
+        const std::uintptr_t advise_end =
+            next == bytes
+                ? end_addr + (page - end_addr % page) % page
+                : end_addr - end_addr % page;
+        if (advise_end > advise_start) {
             (void)::madvise(
-                reinterpret_cast<void*>(start),
-                static_cast<std::size_t>(end - start),
+                reinterpret_cast<void*>(advise_start),
+                static_cast<std::size_t>(advise_end - advise_start),
                 MADV_DONTNEED);
         }
+        copied = next;
     }
 }
 

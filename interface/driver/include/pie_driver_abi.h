@@ -5,11 +5,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define KV_COPY_DEVICE_TO_DEVICE (1 << 0)
+
+#define KV_COPY_DEVICE_TO_HOST (1 << 1)
+
+#define KV_COPY_HOST_TO_DEVICE (1 << 2)
+
+#define KV_COPY_HOST_TO_HOST (1 << 3)
+
 /**
  * Current direct local ABI version.
  *
  * v4: driver creation reports device facts only; model loading is a separate,
- * blocking `*_load_model` call carrying mandatory StorageProgram bytes.
+ * blocking `*_load_model` call carrying mandatory LoadPlan bytes.
  */
 #define PIE_DRIVER_ABI_VERSION 4
 
@@ -186,9 +194,9 @@ typedef struct PieModelLoadDesc {
    */
   uint64_t compiler_version;
   /**
-   * Serialized, versioned StorageProgram. Empty programs are invalid.
+   * Serialized, versioned LoadPlan. Empty plans are invalid.
    */
-  struct PieBytes program_bytes;
+  struct PieBytes load_plan_bytes;
   /**
    * UTF-8 path to the driver-local checkpoint payload root.
    */

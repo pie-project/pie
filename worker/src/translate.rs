@@ -98,18 +98,23 @@ fn build_model(
     let drivers = drivers
         .groups
         .into_iter()
-        .map(|g| pie_engine::bootstrap::DriverConfig {
-            total_pages: g.caps.total_pages as usize,
-            cpu_pages: g.caps.swap_pool_size as usize,
-            rs_cache_required: g.caps.rs_cache_required,
-            rs_cache_slots: g.caps.rs_cache_slots as usize,
-            rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
-            limits: pie_engine::driver::SchedulerLimits {
-                max_forward_requests: g.caps.max_forward_requests as usize,
-                max_forward_tokens: g.caps.max_forward_tokens as usize,
-                max_page_refs: g.caps.max_page_refs as usize,
-            },
-            driver_backend: g.backend,
+        .map(|g| {
+            let backend_kind = g.backend.kind().to_string();
+            pie_engine::bootstrap::DriverConfig {
+                total_pages: g.caps.total_pages as usize,
+                cpu_pages: g.caps.swap_pool_size as usize,
+                kv_copy_domain_mask: g.caps.kv_copy_domain_mask,
+                backend_kind,
+                rs_cache_required: g.caps.rs_cache_required,
+                rs_cache_slots: g.caps.rs_cache_slots as usize,
+                rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
+                limits: pie_engine::driver::SchedulerLimits {
+                    max_forward_requests: g.caps.max_forward_requests as usize,
+                    max_forward_tokens: g.caps.max_forward_tokens as usize,
+                    max_page_refs: g.caps.max_page_refs as usize,
+                },
+                driver_backend: g.backend,
+            }
         })
         .collect();
 
@@ -136,6 +141,7 @@ mod tests {
             total_pages: 1024,
             kv_page_size: 32,
             swap_pool_size: 0,
+            kv_copy_domain_mask: pie_driver_abi::KV_COPY_DEVICE_TO_DEVICE,
             max_forward_tokens: 4096,
             max_forward_requests: 512,
             max_page_refs: 262144,

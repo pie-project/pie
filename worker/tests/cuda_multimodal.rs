@@ -24,7 +24,7 @@
 //! activation workspace exceed a 24G 4090 even at the max-fit config (gpu_mem
 //! 0.97 + fp8 KV → ~2545 MiB planner budget, still no viable forward layout).
 //! The weight-halving lever (`runtime_quant=fp8`) is unimplemented for gemma4 in
-//! the weight loader, so it can't free the weight side. The splice CODE is
+//! the load planner, so it can't free the weight side. The splice CODE is
 //! shipped + complete (this builds green vs the SDK + drives the real path);
 //! hardware validation needs a >24G GPU (or a driver-supported smaller / fp8
 //! vision checkpoint). Run there:

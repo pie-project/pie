@@ -279,7 +279,7 @@ struct MetalExecutor::Impl {
         const std::string& checkpoint_dir,
         const std::string& kernels_dir,
         const DecodeGeometry& geometry,
-        const pie_weight_loader::StorageProgram& storage_program,
+        const pie_load_planner::LoadPlan& load_plan,
         std::size_t storage_page_size,
         std::string* error);
     bool ready() const { return ctx_ != nullptr; }
@@ -389,15 +389,15 @@ bool copy_slot_region(const SlotHandle& s, size_t src_off, size_t dst_off, size_
 
 bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& kernels_dir,
                             const DecodeGeometry& geom,
-                            const pie_weight_loader::StorageProgram& storage_program,
+                            const pie_load_planner::LoadPlan& load_plan,
                             std::size_t storage_page_size,
                             std::string* err) {
     g_ = geom;
 
-    // The mmap is transient: the StorageProgram copies each finalized tensor
+    // The mmap is transient: the LoadPlan copies each finalized tensor
     // once into the resident weights region.
     SafetensorsView view(ckpt_dir);
-    const auto storage = storage_program.view();
+    const auto storage = load_plan.view();
     plan_ = plan_heap(
         g_,
         storage.memory.persistent_bytes,
@@ -405,7 +405,7 @@ bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& 
         4,
         2,
         std::max<std::size_t>(1, storage_page_size),
-        std::max<std::size_t>(1, storage_program.preferred_alignment()));
+        std::max<std::size_t>(1, load_plan.preferred_alignment()));
 
     // ── Build the decode DAG (shipped config: GdnPrep ON, no argmax dispatch — host samples). ──
     dag_ = build_decode_dag(g_, /*with_argmax=*/false, fuse_residual_, gdn_prep_);
@@ -438,7 +438,7 @@ bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& 
     }
 
     // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal. ──
-    b_ = stage_decode_storage(*ctx_, view, storage_program, g_, plan_);
+    b_ = stage_decode_storage(*ctx_, view, load_plan, g_, plan_);
     bind_decode_dag(*ctx_, b_, dag_, g_, gdn_prep_);
 
     // ── Scratch pool (colors_used slots) → beta's bind pass. ──
@@ -1073,18 +1073,18 @@ bool MetalExecutor::setup_native(
     const std::string& kernels_dir,
     const DecodeGeometry& geometry,
     std::string* error) {
-    const char* program_path = std::getenv("PIE_METAL_STORAGE_PROGRAM");
-    if (program_path == nullptr || program_path[0] == '\0') {
+    const char* plan_path = std::getenv("PIE_METAL_LOAD_PLAN");
+    if (plan_path == nullptr || plan_path[0] == '\0') {
         if (error != nullptr) {
             *error =
-                "native setup requires PIE_METAL_STORAGE_PROGRAM=<compiled JSON>";
+                "native setup requires PIE_METAL_LOAD_PLAN=<compiled JSON>";
         }
         return false;
     }
-    std::ifstream input(program_path, std::ios::binary);
+    std::ifstream input(plan_path, std::ios::binary);
     if (!input) {
         if (error != nullptr) {
-            *error = std::string("cannot open StorageProgram: ") + program_path;
+            *error = std::string("cannot open LoadPlan: ") + plan_path;
         }
         return false;
     }
@@ -1100,7 +1100,7 @@ bool MetalExecutor::setup_native(
         static_cast<std::uint32_t>(std::max(1, geometry.max_tokens));
     config.max_forward_requests =
         static_cast<std::uint32_t>(std::max(1, geometry.max_requests));
-    config.storage_program.assign(
+    config.load_plan.assign(
         std::istreambuf_iterator<char>(input),
         std::istreambuf_iterator<char>());
     config.storage_page_size =
@@ -1184,21 +1184,21 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         return false;
     }
     auto impl = std::make_unique<Impl>();
-    pie_weight_loader::StorageProgram storage_program;
+    pie_load_planner::LoadPlan load_plan;
     try {
-        storage_program = pie_weight_loader::StorageProgram::deserialize(
+        load_plan = pie_load_planner::LoadPlan::deserialize(
             std::span<const std::uint8_t>(
-                cfg.storage_program.data(), cfg.storage_program.size()),
+                cfg.load_plan.data(), cfg.load_plan.size()),
             cfg.compiler_version);
     } catch (const std::exception& error) {
         if (err != nullptr) {
-            *err = std::string("StorageProgram decode failed: ") + error.what();
+            *err = std::string("LoadPlan decode failed: ") + error.what();
         }
         return false;
     }
-    if (storage_program.backend() !=
-        pie_weight_loader::PieLoaderBackendKind::Metal) {
-        if (err != nullptr) *err = "StorageProgram target is not Metal";
+    if (load_plan.backend() !=
+        pie_load_planner::PieLoaderBackendKind::Metal) {
+        if (err != nullptr) *err = "LoadPlan target is not Metal";
         return false;
     }
     DecodeGeometry geom{};  // shipped qwen3.6 defaults
@@ -1237,7 +1237,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             cfg.checkpoint_dir,
             cfg.kernels_dir,
             geom,
-            storage_program,
+            load_plan,
             cfg.storage_page_size,
             &derr)) {
         if (err != nullptr) *err = "Metal forward setup failed: " + derr;

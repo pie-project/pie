@@ -132,7 +132,7 @@ Historical eager-vLLM comparison, retained only as context:
   component.
 - Added TP2 native loader sharding for Nemotron-H and skipped unused multimodal
   tensors for text-only native serving.
-- Added a persistent weight arena for direct-copy storage programs. TP2 load
+- Added a persistent weight arena for direct-copy LoadPlans. TP2 load
   high-water now matches the plan: about 31,644 MiB planned per rank and about
   31,646 MiB observed CUDA memory delta.
 - Enabled custom all-reduce by default when peer access is available, with
@@ -164,7 +164,7 @@ Historical eager-vLLM comparison, retained only as context:
   with exact decode enabled versus 3194.24 tok/s with it disabled in the same
   build. It is default-on with `PIE_NEMOTRON_DISABLE_EXACT_DECODE_MOE=1` as the
   escape hatch.
-- Added packed Nemotron expert backings in the weight-loader ABI:
+- Added packed Nemotron expert backings in the load-planner ABI:
   `experts.up_proj.packed.weight` and `experts.down_proj.packed.weight` are
   materialized once per MoE layer, and the original per-expert tensor names are
   exposed as views. A Join/Partition optimizer rewrite keeps TP2 down-projection
@@ -591,7 +591,7 @@ L40 non-regression (legacy path still default):
   a CUDA translation unit pulled in `toml++` and triggered an nvcc template
   error. Removed; revisit only with a narrow wrapper that avoids those headers
   or a prebuilt FlashInfer extension boundary.
-- A later packed-expert foundation pass succeeded: the weight loader now
+- A later packed-expert foundation pass succeeded: the load planner now
   creates per-layer `experts.up_proj.packed.weight` and
   `experts.down_proj.packed.weight` backings and exposes the legacy per-expert
   names as views. The real Nemotron TP2 layout dump had 46 extra contracts

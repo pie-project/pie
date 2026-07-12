@@ -751,6 +751,10 @@ impl WorkItemCompletion {
     pub(crate) fn is_settled(&self) -> bool {
         self.state.result().is_some()
     }
+
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
 }
 
 impl std::future::Future for WorkItemCompletion {

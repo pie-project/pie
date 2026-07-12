@@ -108,7 +108,7 @@ driver/metal/src
 │                       (PSO cache/table)
 ├── store/              resident ring + paged KV pool + linear-state slots
 │                       (extracted from heap_layout.hpp + decoder residency)
-└── loader/             StorageProgram -> resident heap: safetensors_view,
+└── loader/             LoadPlan -> resident heap: safetensors_view,
                         heap_bind, heap_layout (region sizing)
 
 driver/metal/tests

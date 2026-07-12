@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
@@ -16,7 +16,10 @@ use wasmtime_wasi_http::p3::{
 
 use super::ProcessId;
 use super::output::LogStream;
+use super::residency::{ProcessResidency, ResidencySnapshot};
 use crate::inferlet::sandbox::InstancePolicy;
+use crate::store::kv::page_table::WorkingSetId;
+use crate::store::rs::RsWorkingSetId;
 
 /// Where a process's stdout/stderr are routed.
 pub enum OutputMode {
@@ -58,13 +61,14 @@ pub struct ProcessCtx {
     guest_resource_map: Vec<(ResourceAny, u32)>,
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
+    residency: Arc<Mutex<ProcessResidency>>,
 }
 
 impl Drop for ProcessCtx {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
-        // (Process/context unregister removed — Phase 5; working sets drop with
-        // the instance's resource table.)
+        let resources = std::mem::replace(&mut self.resource_table, ResourceTable::new());
+        super::preemption::defer_resource_teardown(self.id, resources, self.residency.clone());
     }
 }
 
@@ -212,6 +216,7 @@ impl ProcessCtx {
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
+            residency: Arc::new(Mutex::new(ProcessResidency::default())),
         })
     }
 
@@ -226,6 +231,74 @@ impl ProcessCtx {
     /// Whether outbound network is permitted for this inferlet.
     pub fn network_allowed(&self) -> bool {
         self.network_allowed
+    }
+
+    pub(crate) fn residency_handle(&self) -> Arc<Mutex<ProcessResidency>> {
+        self.residency.clone()
+    }
+
+    pub(crate) fn residency_snapshot(&self) -> ResidencySnapshot {
+        self.residency.lock().unwrap().snapshot()
+    }
+
+    pub(crate) fn register_kv_working_set(
+        &self,
+        model: usize,
+        driver: crate::driver::DriverId,
+        id: WorkingSetId,
+    ) {
+        self.residency
+            .lock()
+            .unwrap()
+            .kv_working_sets
+            .insert((model, driver, id));
+    }
+
+    pub(crate) fn unregister_kv_working_set(
+        &self,
+        model: usize,
+        driver: crate::driver::DriverId,
+        id: WorkingSetId,
+    ) {
+        self.residency
+            .lock()
+            .unwrap()
+            .kv_working_sets
+            .remove(&(model, driver, id));
+    }
+
+    pub(crate) fn register_rs_working_set(
+        &self,
+        model: usize,
+        driver: crate::driver::DriverId,
+        id: RsWorkingSetId,
+    ) {
+        self.residency
+            .lock()
+            .unwrap()
+            .rs_working_sets
+            .insert((model, driver, id));
+    }
+
+    pub(crate) fn unregister_rs_working_set(
+        &self,
+        model: usize,
+        driver: crate::driver::DriverId,
+        id: RsWorkingSetId,
+    ) {
+        self.residency
+            .lock()
+            .unwrap()
+            .rs_working_sets
+            .remove(&(model, driver, id));
+    }
+
+    pub(crate) fn register_pipeline(&self, fires: &crate::pipeline::fire::PendingFires) {
+        let mut residency = self.residency.lock().unwrap();
+        residency
+            .pipelines
+            .retain(|pipeline| pipeline.strong_count() > 0);
+        residency.pipelines.push(Arc::downgrade(fires));
     }
 
     // ========================================================================

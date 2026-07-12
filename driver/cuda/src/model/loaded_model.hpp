@@ -40,7 +40,7 @@ public:
     ///
     static LoadedModel load(const Config& boot_cfg,
                             NcclComm* tp_comm,
-                            std::span<const std::uint8_t> program_bytes,
+                            std::span<const std::uint8_t> load_plan_bytes,
                             std::uint64_t compiler_version);
 
     LoadedModel() = default;
@@ -72,7 +72,7 @@ public:
     std::optional<QuantMeta> quant_meta(const std::string& name) const;
 
 private:
-    // Owns runtime-layout tensors produced by the Rust storage-program loader.
+    // Owns runtime-layout tensors produced by LoadPlan execution.
     // Some names are non-owning views into packed backing tensors so older
     // forward paths can keep their unfused fallback pointers.
     Config boot_;

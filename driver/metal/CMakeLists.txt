@@ -259,8 +259,8 @@ add_metal_host_test(pipeline_interp_test tests/pipeline_interp_test.cpp)
 add_metal_host_test(
   pipeline_descriptor_resolve_test
   tests/pipeline_descriptor_resolve_test.cpp)
-add_metal_host_test(storage_program_decode_test tests/storage_program_decode_test.cpp)
-target_link_libraries(storage_program_decode_test PRIVATE nlohmann_json::nlohmann_json)
+add_metal_host_test(load_plan_decode_test tests/load_plan_decode_test.cpp)
+target_link_libraries(load_plan_decode_test PRIVATE nlohmann_json::nlohmann_json)
 
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE

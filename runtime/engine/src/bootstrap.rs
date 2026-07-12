@@ -141,6 +141,8 @@ pub struct ModelConfig {
 pub struct DriverConfig {
     pub total_pages: usize,
     pub cpu_pages: usize,
+    pub kv_copy_domain_mask: u32,
+    pub backend_kind: String,
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
@@ -286,12 +288,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // The registry is where the WIT working-set resources and the PTIR fire
     // path lock `store::registry::get(...)`.
     let _ = driver_count;
-    let arena_model_idx = crate::store::registry::register_model(
+    let arena_model_idx = crate::store::registry::register_model_with_swap(
         kv_page_size as u32,
         &arena_kv_pages,
+        &arena_cpu_pages,
         &arena_rs_slots,
     );
-    let _ = arena_cpu_pages;
 
     // Task-B contention orchestrator (`PIE_KV_CONTENTION=preempt`): KV pool
     // exhaustion becomes FCFS preempt/restore instead of an inferlet error;
@@ -402,6 +404,34 @@ fn verify_config(config: &Config) -> Result<()> {
         ensure!(
             dev.limits.max_page_refs > 0,
             "Model {:?} driver {i}: max_page_refs must be > 0",
+            model.name
+        );
+    }
+    if crate::store::reclaim::contention_mode() == crate::store::reclaim::ContentionMode::Preempt
+        && crate::store::reclaim::preempt_active()
+    {
+        ensure!(
+            model.drivers.len() == 1,
+            "Model {:?}: active KV preemption currently requires exactly one driver",
+            model.name
+        );
+        let driver = &model.drivers[0];
+        ensure!(
+            matches!(driver.backend_kind.as_str(), "cuda" | "dummy"),
+            "Model {:?}: active KV preemption requires CUDA (dummy is allowed for deterministic tests), got {}",
+            model.name,
+            driver.backend_kind
+        );
+        ensure!(
+            driver.cpu_pages > 0,
+            "Model {:?}: active KV preemption requires a non-empty host-pinned swap pool",
+            model.name
+        );
+        let required =
+            pie_driver_abi::KV_COPY_DEVICE_TO_HOST | pie_driver_abi::KV_COPY_HOST_TO_DEVICE;
+        ensure!(
+            driver.kv_copy_domain_mask & required == required,
+            "Model {:?}: active KV preemption requires device-to-host and host-to-device KV copies",
             model.name
         );
     }

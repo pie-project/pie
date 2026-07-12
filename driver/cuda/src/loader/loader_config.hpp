@@ -1,7 +1,7 @@
 #pragma once
 
 // loader/: Rust-planned checkpoint materialization into the model WeightStore.
-// Single source of truth for the CUDA weight loader's tunable constants and the
+// Single source of truth for the CUDA load executor's tunable constants and the
 // PIE_CUDA_* environment knobs. Every default lives here, and every knob is read
 // through one of the helpers below so the parse convention is stated once rather
 // than re-spelled at each call site. Conventions:

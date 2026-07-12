@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
+#include "pie_native/load_plan.hpp"
 #include "batch/workspace.hpp"
 #include "config.hpp"
 #include "distributed.hpp"
@@ -448,14 +449,21 @@ int Context::Impl::initialize(
     CUDA_CHECK(cudaGetDeviceProperties(&dev_prop, device_ordinal_));
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
+    const bool native_mxfp4_moe =
+#ifdef PIE_CUDA_HAS_MARLIN
+        dev_prop.major >= 10;
+#else
+        false;
+#endif
     nlohmann::json facts = {
         {"abi_version", PIE_DRIVER_ABI_VERSION},
         {"backend", "cuda"},
         {"unified_memory", false},
         {"fp8_native", fp8_native},
-        {"native_mxfp4_moe", dev_prop.major >= 10},
+        {"native_mxfp4_moe", native_mxfp4_moe},
         {"storage_alignment", 256},
         {"storage_max_tile_bytes", 64ull * 1024ull * 1024ull},
+        {"storage_tile_map_mask", pie_load_planner::kCudaTileMapMask},
         {"page_size", 0},
     };
     device_facts_json_ = facts.dump();
@@ -474,11 +482,11 @@ int Context::Impl::load_model(
     cfg.model.snapshot_dir.assign(
         reinterpret_cast<const char*>(load.snapshot_dir.ptr),
         load.snapshot_dir.len);
-    const std::span<const std::uint8_t> program_bytes(
-        load.program_bytes.ptr, load.program_bytes.len);
+    const std::span<const std::uint8_t> load_plan_bytes(
+        load.load_plan_bytes.ptr, load.load_plan_bytes.len);
 
     auto* engine_p = own_value(LoadedModel::load(
-        cfg, tp_comm_, program_bytes, load.compiler_version));
+        cfg, tp_comm_, load_plan_bytes, load.compiler_version));
     auto& engine = *engine_p;
 
     // THE arch table decides support: an unrecognized `model_type` is a
@@ -1080,6 +1088,7 @@ int Context::Impl::load_model(
         {"total_pages", c.total_pages},
         {"kv_page_size", mem_plan.kv_page_size},
         {"swap_pool_size", c.swap_pool_size},
+        {"kv_copy_domain_mask", local_tp_size == 1 ? 15u : 1u},
         {"rs_cache_required", rs_cache_required},
         {"rs_cache_slots", rs_cache_slots},
         {"rs_cache_slot_bytes", rs_cache_slot_bytes},

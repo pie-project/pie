@@ -91,6 +91,13 @@ pub struct KvTxn {
     /// (`committed_tokens + new_tokens.len()`). The caller stores it on the
     /// pass (the growing cursor) and passes it back next fire.
     pub committed_tokens_after: u32,
+    mapping_version: u64,
+}
+
+impl KvTxn {
+    pub fn mapping_version(&self) -> u64 {
+        self.mapping_version
+    }
 }
 
 /// The fire's WorkingSet page translation (kv_refact.md flattened-table
@@ -102,7 +109,8 @@ fn build_translation(
     store: &mut KvStore,
     prepared: &KvPreparedWrite,
     ws: WorkingSetId,
-) -> Result<Vec<u32>, KvStoreError> {
+) -> Result<(u64, Vec<u32>), KvStoreError> {
+    let version = store.flat_table(ws)?.0;
     let mut table: Vec<u32> = {
         store
             .visible_flat_table(ws)?
@@ -122,7 +130,7 @@ fn build_translation(
     for t in prepared.targets() {
         table[t.index() as usize] = t.dst().0;
     }
-    Ok(table)
+    Ok((version, table))
 }
 
 /// Build the per-target [`PageCommit`]s for a fire appending `n_new` tokens
@@ -264,6 +272,69 @@ pub fn prepare(
     page_size: u32,
     hash_tokens: Option<&[u32]>,
 ) -> Result<(KvProjection, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
+    prepare_impl(
+        store,
+        ws,
+        committed_tokens,
+        new_tokens,
+        page_size,
+        hash_tokens,
+        None,
+    )
+}
+
+pub fn prepare_granted(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    committed_tokens: u32,
+    new_tokens: &[u32],
+    page_size: u32,
+    hash_tokens: Option<&[u32]>,
+    granted: Vec<crate::store::kv::page_table::PhysicalKvPageId>,
+) -> Result<(KvProjection, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
+    prepare_impl(
+        store,
+        ws,
+        committed_tokens,
+        new_tokens,
+        page_size,
+        hash_tokens,
+        Some(granted),
+    )
+}
+
+pub fn required_pages(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    committed_tokens: u32,
+    new_token_count: u32,
+    page_size: u32,
+) -> Result<usize, KvError> {
+    if new_token_count == 0 {
+        return Err(KvError::Fatal(
+            "required_pages: new_token_count must be non-empty".to_string(),
+        ));
+    }
+    let total = committed_tokens + new_token_count;
+    let needed_pages = total.div_ceil(page_size) as u64;
+    let page_len = store.page_len(ws)?;
+    if page_len < needed_pages {
+        store.reserve(ws, needed_pages - page_len)?;
+    }
+    let output_start = (committed_tokens / page_size) as u64;
+    let write_indexes: Vec<u64> = (output_start..needed_pages).collect();
+    Ok(store.required_pages(ws, &write_indexes)?)
+}
+
+fn prepare_impl(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    committed_tokens: u32,
+    new_tokens: &[u32],
+    page_size: u32,
+    hash_tokens: Option<&[u32]>,
+    granted: Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>>,
+) -> Result<(KvProjection, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
     debug_assert!(hash_tokens.is_none_or(|t| t.len() == new_tokens.len()));
     let n_new = new_tokens.len() as u32;
     if n_new == 0 {
@@ -271,6 +342,7 @@ pub fn prepare(
             "prepare: new_tokens must be non-empty".to_string(),
         ));
     }
+
     let total = committed_tokens + n_new;
     let needed_pages = total.div_ceil(page_size) as u64;
 
@@ -304,7 +376,10 @@ pub fn prepare(
     // routes it into the contention ladder and retries.
     let output_start = (committed_tokens / page_size) as u64;
     let write_indexes: Vec<u64> = (output_start..needed_pages).collect();
-    let prepared = store.prepare_write(ws, &write_indexes)?;
+    let prepared = match granted {
+        Some(granted) => store.prepare_write_granted(ws, &write_indexes, granted)?,
+        None => store.prepare_write(ws, &write_indexes)?,
+    };
 
     // Driver geometry: every prepared target is a written slot (the CoW
     // rebase never reaches below the first written committed page).
@@ -349,7 +424,7 @@ pub fn prepare(
         page_size,
         hash_tokens,
     )?;
-    let translation = build_translation(store, &prepared, ws)?;
+    let (translation_version, translation) = build_translation(store, &prepared, ws)?;
     store.track_pending_write(&prepared, &commits, Some(total as u64));
 
     Ok((
@@ -360,6 +435,7 @@ pub fn prepare(
             prepared,
             commits,
             committed_tokens_after: total,
+            mapping_version: translation_version,
         },
     ))
 }
@@ -374,14 +450,35 @@ pub fn prepare_explicit(
     ws: WorkingSetId,
     write_indexes: &[u64],
 ) -> Result<(Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
-    let prepared = store.prepare_write(ws, write_indexes)?;
+    prepare_explicit_impl(store, ws, write_indexes, None)
+}
+
+pub fn prepare_explicit_granted(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    write_indexes: &[u64],
+    granted: Vec<crate::store::kv::page_table::PhysicalKvPageId>,
+) -> Result<(Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
+    prepare_explicit_impl(store, ws, write_indexes, Some(granted))
+}
+
+fn prepare_explicit_impl(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    write_indexes: &[u64],
+    granted: Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>>,
+) -> Result<(Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
+    let prepared = match granted {
+        Some(granted) => store.prepare_write_granted(ws, write_indexes, granted)?,
+        None => store.prepare_write(ws, write_indexes)?,
+    };
     let pages: Vec<(u64, u32)> = prepared
         .targets()
         .iter()
         .map(|t| (t.index(), t.dst().0))
         .collect();
     let copies = prepared.copy_plan().map(|(s, d)| (s.0, d.0)).unzip();
-    let translation = build_translation(store, &prepared, ws)?;
+    let (translation_version, translation) = build_translation(store, &prepared, ws)?;
     // Device-geometry fires are non-canonical by construction, and the
     // device owns the token bookkeeping — commit with no hash metadata;
     // `KvStore::commit` poisons the chain state with an opaque draw.
@@ -402,6 +499,7 @@ pub fn prepare_explicit(
             prepared,
             commits,
             committed_tokens_after: 0,
+            mapping_version: translation_version,
         },
     ))
 }

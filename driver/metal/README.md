@@ -20,8 +20,8 @@ bring-up and diagnostic binaries, including the not-yet-live Gemma 4 work.
 the shipped driver never links it.
 
 At boot, `pie-worker` first creates the Metal device context and reads device
-facts, then `runtime/weight-loader` compiles the checkpoint headers into a
-versioned `StorageProgram`. `load_model` executes that plan into one resident
+facts, then `runtime/load-planner` compiles the checkpoint headers into a
+versioned `LoadPlan`. `load_model` executes that plan into one resident
 weights region; checkpoint payload bytes stay driver-local.
 
 Metal intentionally executes PTIR programs on the CPU. CUDA uses a GPU tier-0

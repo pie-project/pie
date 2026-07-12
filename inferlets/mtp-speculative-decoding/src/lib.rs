@@ -34,33 +34,29 @@ fn default_k() -> u32 {
     4
 }
 
-fn bx<T>(value: T) -> &'static T {
-    Box::leak(Box::new(value))
-}
-
 fn draft_window(context: &[u32], k: u32) -> Result<(u32, Vec<u32>)> {
     if context.is_empty() {
         return Err("cannot draft from an empty context".into());
     }
     let n = context.len() as u32;
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     ws.reserve(n.div_ceil(PAGE_T))
         .map_err(|e| format!("reserve draft KV: {e}"))?;
 
-    let tokens = bx(Channel::from(
+    let tokens = Channel::from(
         context
             .iter()
             .map(|&token| token as i32)
             .collect::<Vec<_>>(),
-    ));
-    let klen = bx(Channel::from(vec![n]));
-    let seed_out = bx(Channel::new([1], dtype::i32).named("seed"));
-    let drafts_out = bx(Channel::new([k], dtype::i32).named("drafts"));
+    );
+    let klen = Channel::from(vec![n]);
+    let seed_out = Channel::new([1], dtype::i32).named("seed");
+    let drafts_out = Channel::new([k], dtype::i32).named("drafts");
 
-    let fwd: ForwardPass<'static> = ForwardPass::new();
-    fwd.embed(tokens, Tensor::constant(vec![0u32, n]));
-    fwd.attn_working_set(ws, klen);
-    fwd.epilogue(move || {
+    let fwd = ForwardPass::new();
+    fwd.embed(&tokens, Tensor::constant(vec![0u32, n]));
+    fwd.attn_working_set(&ws, &klen);
+    fwd.epilogue(|| {
         seed_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
         drafts_out.put(reduce_argmax(intrinsics::mtp_logits(k)));
     });
@@ -93,22 +89,20 @@ fn verify_window(context: &[u32], drafts: &[u32]) -> Result<Vec<u32>> {
     let rows = drafts.len() as u32 + 1;
     let readout_start = context.len() as u32 - 1;
 
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     ws.reserve(n.div_ceil(PAGE_T))
         .map_err(|e| format!("reserve verify KV: {e}"))?;
-    let tokens = bx(Channel::from(
-        input.iter().map(|&token| token as i32).collect::<Vec<_>>(),
-    ));
-    let klen = bx(Channel::from(vec![n]));
-    let target_out = bx(Channel::new([rows], dtype::i32).named("targets"));
+    let tokens = Channel::from(input.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let klen = Channel::from(vec![n]);
+    let target_out = Channel::new([rows], dtype::i32).named("targets");
 
-    let fwd: ForwardPass<'static> = ForwardPass::new();
-    fwd.embed(tokens, Tensor::constant(vec![0u32, n]));
-    fwd.attn_working_set(ws, klen);
+    let fwd = ForwardPass::new();
+    fwd.embed(&tokens, Tensor::constant(vec![0u32, n]));
+    fwd.attn_working_set(&ws, &klen);
     fwd.readout(&Tensor::constant(
         (readout_start..readout_start + rows).collect::<Vec<_>>(),
     ));
-    fwd.epilogue(move || {
+    fwd.epilogue(|| {
         target_out.put(reduce_argmax(intrinsics::logits()));
     });
 

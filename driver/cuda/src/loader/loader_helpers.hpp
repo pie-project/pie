@@ -1,7 +1,7 @@
 #pragma once
 
 // Stateless arithmetic / checked-narrowing helpers factored out of
-// rust_storage_executor.hpp so the executor body stays materialize logic, not
+// load_plan_executor.hpp so the executor body stays materialize logic, not
 // utility math. Free functions in the driver namespace, so the executor's
 // existing unqualified call sites resolve here unchanged.
 

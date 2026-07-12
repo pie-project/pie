@@ -1,10 +1,10 @@
-use pie_weight_loader::abi::RuntimeAbi;
-use pie_weight_loader::config::ModelConfig;
-use pie_weight_loader::ir::{LayoutExpr, LayoutPlan};
-use pie_weight_loader::source::{CheckpointFile, CheckpointMetadata, RawTensor};
-use pie_weight_loader::storage::{StorageInstr, StorageTarget, TileMapKind};
-use pie_weight_loader::storage_compiler::{compile_storage_program, lower_layout_plan};
-use pie_weight_loader::types::{
+use pie_load_planner::abi::RuntimeAbi;
+use pie_load_planner::config::ModelConfig;
+use pie_load_planner::ir::{LayoutExpr, LayoutPlan};
+use pie_load_planner::load_plan::{StorageInstr, StorageTarget, TileMapKind};
+use pie_load_planner::planner::{compile_load_plan, lower_layout_plan};
+use pie_load_planner::source::{CheckpointFile, CheckpointMetadata, RawTensor};
+use pie_load_planner::types::{
     Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, Layout, Mxfp4MoePolicy,
     QuantScheme, QuantSpec, RepackLayout, RowMap, Sharding, TensorDecl, TensorId,
 };
@@ -75,6 +75,7 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
     };
     let target = StorageTarget {
         backend: BackendKind::Metal,
+        tile_map_mask: pie_load_planner::load_plan::METAL_TILE_MAP_MASK,
         max_tile_bytes: 64 << 20,
         preferred_alignment: 256,
         ..StorageTarget::default()
@@ -106,7 +107,29 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
     assert_eq!(spec.group_size, 64);
     assert_eq!(shared.shape, vec![2, 64]);
 
-    let program = compile_storage_program(&metadata, &config, &abi, target).unwrap();
+    let alias_config = ModelConfig {
+        model_type: "qwen3_next".to_string(),
+        ..config.clone()
+    };
+    assert!(RuntimeAbi::default_for_target(&metadata, &alias_config, &target).is_ok());
+
+    let mut unexpected = metadata.clone();
+    unexpected.tensors.push(RawTensor {
+        id: TensorId(unexpected.tensors.len() as u32),
+        name: "model.unmapped.weight".to_string(),
+        file_id: FileId(0),
+        file_offset: offset,
+        span_bytes: 2,
+        shape: vec![1],
+        encoding: Encoding::Raw(DType::BF16),
+        layout: Layout::dense(1),
+    });
+    let error = RuntimeAbi::default_for_target(&unexpected, &config, &target)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no declared mapping or skip"));
+
+    let program = compile_load_plan(&metadata, &config, &abi, target).unwrap();
     assert!(
         !program
             .instrs
@@ -151,7 +174,7 @@ fn buffer_join_tile_maps_carry_destination_offsets() {
     let joined_decl = decl(4, "joined", &[4], Encoding::Raw(DType::BF16));
     let joined = plan.push(LayoutExpr::Join {
         inputs: vec![a_cast, b_cast],
-        axis: pie_weight_loader::types::Axis(0),
+        axis: pie_load_planner::types::Axis(0),
         decl: joined_decl.clone(),
     });
     let realized = plan.push(LayoutExpr::Realize {
@@ -370,6 +393,7 @@ fn target_support_rejects_cuda_decode_at_compile_time() {
         &plan,
         StorageTarget {
             backend: BackendKind::Cuda,
+            tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
             ..StorageTarget::default()
         },
     )
@@ -418,7 +442,7 @@ fn packed_quant_source_requires_exact_affine_size() {
 
 #[test]
 fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
-    let cfg = pie_weight_loader::config::ModelConfig {
+    let cfg = pie_load_planner::config::ModelConfig {
         model_type: "gpt_oss".to_string(),
         quant_method: String::new(),
         runtime_quant: String::new(),
@@ -428,14 +452,15 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
+        tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
         mxfp4_moe: Mxfp4MoePolicy::NativeGemm,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
     };
     let metadata = gpt_oss_mxfp4_metadata();
     let abi =
-        pie_weight_loader::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
-    let program = compile_storage_program(&metadata, &cfg, &abi, target).unwrap();
+        pie_load_planner::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
+    let program = compile_load_plan(&metadata, &cfg, &abi, target).unwrap();
 
     let repacks: Vec<_> = program
         .instrs
@@ -479,7 +504,7 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
 
 #[test]
 fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
-    let cfg = pie_weight_loader::config::ModelConfig {
+    let cfg = pie_load_planner::config::ModelConfig {
         model_type: "gpt_oss".to_string(),
         quant_method: String::new(),
         runtime_quant: String::new(),
@@ -489,6 +514,7 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
+        tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
         tp_rank: 1,
         tp_size: 2,
         mxfp4_moe: Mxfp4MoePolicy::NativeGemm,
@@ -497,12 +523,12 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
     };
     let metadata = gpt_oss_mxfp4_metadata_with_intermediate(128);
     let abi =
-        pie_weight_loader::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
+        pie_load_planner::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
     let abi_repacks = abi
         .tensors
         .iter()
         .filter_map(|contract| match contract.source {
-            pie_weight_loader::abi::RuntimeTensorSource::Repack { spec, .. } => Some(spec),
+            pie_load_planner::abi::RuntimeTensorSource::Repack { spec, .. } => Some(spec),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -526,7 +552,7 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
                 && spec.source_cols == 64)
     );
 
-    let program = compile_storage_program(&metadata, &cfg, &abi, target).unwrap();
+    let program = compile_load_plan(&metadata, &cfg, &abi, target).unwrap();
 
     let repacks = program
         .instrs
@@ -612,7 +638,7 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
 
 #[test]
 fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
-    let cfg = pie_weight_loader::config::ModelConfig {
+    let cfg = pie_load_planner::config::ModelConfig {
         model_type: "nemotron_h".to_string(),
         quant_method: String::new(),
         runtime_quant: String::new(),
@@ -622,6 +648,7 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
+        tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
         tp_rank: 1,
         tp_size: 2,
         preferred_alignment: 256,
@@ -629,7 +656,7 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
     };
     let metadata = nemotron_h_expert_metadata();
     let abi =
-        pie_weight_loader::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
+        pie_load_planner::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
 
     assert!(abi.tensors.iter().any(|contract| {
         contract.output_name
@@ -651,7 +678,7 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
             && contract.shape == vec![3, 2]
     }));
 
-    let program = compile_storage_program(&metadata, &cfg, &abi, target).unwrap();
+    let program = compile_load_plan(&metadata, &cfg, &abi, target).unwrap();
     let names = program
         .tensors
         .iter()
@@ -980,6 +1007,7 @@ fn slab_scatter_merges_nearby_bulk_extent_writes() {
 
     let target = StorageTarget {
         backend: BackendKind::Cuda,
+        tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
     let program = lower_layout_plan(&meta, &plan, target).unwrap();
@@ -1050,6 +1078,7 @@ fn slab_scatter_rejects_excessive_overread() {
     }
     let target = StorageTarget {
         backend: BackendKind::Cuda,
+        tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
     let program = lower_layout_plan(&meta, &plan, target).unwrap();
@@ -1099,6 +1128,7 @@ fn slab_scatter_placement_offsets_are_within_span() {
     }
     let target = StorageTarget {
         backend: BackendKind::Cuda,
+        tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
     let program = lower_layout_plan(&meta, &plan, target).unwrap();
@@ -1141,8 +1171,8 @@ fn raw_big(id: u32, name: &str, offset: u64, span_bytes: u64, dtype: DType) -> R
 
 #[test]
 fn mla_q_kv_a_fusion_produces_joined_tensor() {
-    use pie_weight_loader::config::ModelConfig;
-    use pie_weight_loader::storage_compiler::compile_storage_program;
+    use pie_load_planner::config::ModelConfig;
+    use pie_load_planner::planner::compile_load_plan;
 
     let h = 128i64;
     let q_lora = 32i64;
@@ -1213,10 +1243,11 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
+        tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
-    let abi = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
-    let program = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    let abi = pie_load_planner::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let program = compile_load_plan(&meta, &cfg, &abi, target).unwrap();
     let summary = program.summary();
 
     // The fusion should have joined q_a_proj + kv_a_proj into one tensor
@@ -1239,12 +1270,12 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     assert_eq!(fused.shape[0], q_lora + kv_lora_rope);
     assert_eq!(fused.shape[1], h);
 
-    // Summary should show the program compiled successfully
+    // Summary should show the plan compiled successfully
     assert!(summary.tensor_count > 0);
     assert!(summary.finalize_count > 0);
 }
 
-fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {
+fn instr_id(instr: &StorageInstr) -> pie_load_planner::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
         | StorageInstr::ExtentWrite { id, .. }

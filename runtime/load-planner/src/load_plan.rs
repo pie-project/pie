@@ -6,10 +6,23 @@ use crate::types::{
     TensorDecl, TensorId,
 };
 
-pub const STORAGE_PROGRAM_VERSION: u32 = 4;
+pub const LOAD_PLAN_VERSION: u32 = 5;
+pub const TILE_MAP_CAST: u32 = 1 << 0;
+pub const TILE_MAP_DECODE: u32 = 1 << 1;
+pub const TILE_MAP_ENCODE: u32 = 1 << 2;
+pub const TILE_MAP_TRANSCODE: u32 = 1 << 3;
+pub const TILE_MAP_REBLOCK: u32 = 1 << 4;
+pub const TILE_MAP_REORDER: u32 = 1 << 5;
+pub const TILE_MAP_REPACK: u32 = 1 << 6;
+pub const HOST_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_REBLOCK;
+pub const CUDA_TILE_MAP_MASK: u32 =
+    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_REBLOCK | TILE_MAP_REORDER | TILE_MAP_REPACK;
+pub const METAL_TILE_MAP_MASK: u32 = 0;
 
 pub fn compiler_version() -> u64 {
-    env!("PIE_WL_COMPILER_HASH").parse::<u64>().unwrap_or(0)
+    env!("PIE_LOAD_PLANNER_COMPILER_HASH")
+        .parse::<u64>()
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +41,7 @@ pub struct StorageTarget {
     pub tp_size: u32,
     pub max_tile_bytes: u64,
     pub preferred_alignment: u32,
+    pub tile_map_mask: u32,
     pub mxfp4_moe: Mxfp4MoePolicy,
     pub native_mxfp4_moe: bool,
 }
@@ -40,6 +54,7 @@ impl Default for StorageTarget {
             tp_size: 1,
             max_tile_bytes: 0,
             preferred_alignment: 1,
+            tile_map_mask: HOST_TILE_MAP_MASK,
             mxfp4_moe: Mxfp4MoePolicy::RoutedDecode,
             native_mxfp4_moe: false,
         }
@@ -113,6 +128,20 @@ pub enum TileMapKind {
     Reblock,
     Reorder,
     Repack,
+}
+
+impl TileMapKind {
+    pub const fn capability_bit(self) -> u32 {
+        match self {
+            Self::Cast => TILE_MAP_CAST,
+            Self::Decode => TILE_MAP_DECODE,
+            Self::Encode => TILE_MAP_ENCODE,
+            Self::Transcode => TILE_MAP_TRANSCODE,
+            Self::Reblock => TILE_MAP_REBLOCK,
+            Self::Reorder => TILE_MAP_REORDER,
+            Self::Repack => TILE_MAP_REPACK,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,7 +220,7 @@ pub enum StorageInstr {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorageProgram {
+pub struct LoadPlan {
     pub version: u32,
     pub compiler_version: u64,
     pub target: StorageTarget,
@@ -204,10 +233,10 @@ pub struct StorageProgram {
     pub memory: MemoryPlan,
 }
 
-impl StorageProgram {
+impl LoadPlan {
     pub fn empty(target: StorageTarget) -> Self {
         Self {
-            version: STORAGE_PROGRAM_VERSION,
+            version: LOAD_PLAN_VERSION,
             compiler_version: compiler_version(),
             target,
             optimizer: OptimizerReport::default(),
@@ -220,8 +249,8 @@ impl StorageProgram {
         }
     }
 
-    pub fn summary(&self) -> StorageProgramSummary {
-        let mut s = StorageProgramSummary::default();
+    pub fn summary(&self) -> LoadPlanSummary {
+        let mut s = LoadPlanSummary::default();
         s.tensor_count = self.tensors.len();
         s.buffer_count = self.buffers.len();
         s.schedule_len = self.schedule.len();
@@ -261,7 +290,7 @@ impl StorageProgram {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct StorageProgramSummary {
+pub struct LoadPlanSummary {
     pub tensor_count: usize,
     pub buffer_count: usize,
     pub schedule_len: usize,
@@ -284,7 +313,7 @@ pub struct StorageProgramSummary {
     pub finalize_count: usize,
 }
 
-impl std::fmt::Display for StorageProgramSummary {
+impl std::fmt::Display for LoadPlanSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,

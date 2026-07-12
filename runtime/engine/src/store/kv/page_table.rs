@@ -61,6 +61,34 @@ impl PoolId for PhysicalKvPageId {
     }
 }
 
+/// A host-pinned slot in the driver's KV swap pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HostKvSlotId(pub u32);
+
+impl PoolId for HostKvSlotId {
+    fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+    fn index(self) -> u32 {
+        self.0
+    }
+}
+
+/// Physical backing for one committed logical KV page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KvPageBacking {
+    Resident(PhysicalKvPageId),
+    Swapped(HostKvSlotId),
+}
+
+/// Stable location of an owned page while a suspend/restore transaction pins
+/// the process's trie terminals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TriePageLocation {
+    pub node: NodeId,
+    pub local: u64,
+}
+
 type Runs = SmallVec<[Range<u32>; 2]>;
 
 /// One committed page being published into the mapping.
@@ -75,7 +103,7 @@ pub struct PublishedPage {
 
 enum Pages {
     Owned {
-        ids: Vec<PhysicalKvPageId>,
+        backings: Vec<KvPageBacking>,
         token_hashes: Vec<Vec<Option<Hash256>>>,
         page_hashes: Vec<Option<Hash256>>,
     },
@@ -140,6 +168,10 @@ pub enum KvTableError {
     },
     #[error("interior discard on a shared path is rejected (growth-boundary invariant)")]
     SharedInteriorDiscard,
+    #[error("working set page {index} is swapped out")]
+    NonResident { index: u64 },
+    #[error("page backing changed while a residency transaction was in flight")]
+    BackingChanged,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -270,11 +302,11 @@ impl KvPageTable {
             return Ok(());
         }
 
-        let mut ids = Vec::with_capacity(pages.len());
+        let mut backings = Vec::with_capacity(pages.len());
         let mut token_hashes = Vec::with_capacity(pages.len());
         let mut page_hashes = Vec::with_capacity(pages.len());
         for page in pages {
-            ids.push(page.id);
+            backings.push(KvPageBacking::Resident(page.id));
             token_hashes.push(page.token_hashes);
             page_hashes.push(page.page_hash);
         }
@@ -284,11 +316,11 @@ impl KvPageTable {
                 let node = self.nodes.get_mut(t).expect("live terminal");
                 match &mut node.pages {
                     Pages::Owned {
-                        ids: node_ids,
+                        backings: node_backings,
                         token_hashes: node_tokens,
                         page_hashes: node_pages,
                     } => {
-                        node_ids.extend(ids);
+                        node_backings.extend(backings);
                         node_tokens.extend(token_hashes);
                         node_pages.extend(page_hashes);
                     }
@@ -304,7 +336,7 @@ impl KvPageTable {
                     parent: terminal,
                     children: SmallVec::new(),
                     pages: Pages::Owned {
-                        ids,
+                        backings,
                         token_hashes,
                         page_hashes,
                     },
@@ -476,10 +508,23 @@ impl KvPageTable {
 
     /// Drop a WorkingSet and reclaim everything only it kept alive.
     pub fn release_working_set(&mut self, ws: WorkingSetId) -> Vec<PhysicalKvPageId> {
+        self.release_working_set_backings(ws)
+            .into_iter()
+            .filter_map(|backing| match backing {
+                KvPageBacking::Resident(id) => Some(id),
+                KvPageBacking::Swapped(_) => {
+                    debug_assert!(false, "swapped backing must be released through KvStore");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn release_working_set_backings(&mut self, ws: WorkingSetId) -> Vec<KvPageBacking> {
         if self.working_sets.remove(ws).is_none() {
             return Vec::new();
         }
-        self.collect()
+        self.collect_backings()
     }
 
     // ------------------------------------------------------------------
@@ -504,7 +549,9 @@ impl KvPageTable {
         for seg in &segs {
             if (index as i64) >= seg.start {
                 let local = (index as i64 - seg.start) as u64;
-                return Ok(self.resolve_id(seg.node, local));
+                return self
+                    .resolve_id(seg.node, local)
+                    .ok_or(KvTableError::NonResident { index });
             }
         }
         unreachable!("published mapping covers [0, mapped_len)");
@@ -521,7 +568,12 @@ impl KvPageTable {
         for seg in segs.iter().rev() {
             let from = (-seg.start).max(0) as u64; // clip hidden front
             for local in from..seg.len {
-                out.push(self.resolve_id(seg.node, local));
+                out.push(
+                    self.resolve_id(seg.node, local)
+                        .ok_or(KvTableError::NonResident {
+                            index: out.len() as u64,
+                        })?,
+                );
             }
         }
         debug_assert_eq!(out.len() as u64, mapped_len);
@@ -633,7 +685,7 @@ impl KvPageTable {
     /// Whether a CAS-index entry still points at a live owned page slot.
     pub fn page_location_alive(&self, node: NodeId, local: u64) -> bool {
         match self.nodes.get(node).map(|n| &n.pages) {
-            Some(Pages::Owned { ids, .. }) => (local as usize) < ids.len(),
+            Some(Pages::Owned { backings, .. }) => (local as usize) < backings.len(),
             _ => false,
         }
     }
@@ -836,7 +888,7 @@ impl KvPageTable {
 
     fn contribution_len(&self, node: NodeId) -> u64 {
         match &self.nodes.get(node).expect("live node").pages {
-            Pages::Owned { ids, .. } => ids.len() as u64,
+            Pages::Owned { backings, .. } => backings.len() as u64,
             Pages::ParentSelection { runs } => runs_len(runs),
         }
     }
@@ -890,11 +942,26 @@ impl KvPageTable {
         }
     }
 
-    fn resolve_id(&self, node: NodeId, local: u64) -> PhysicalKvPageId {
+    fn resolve_location(&self, node: NodeId, local: u64) -> TriePageLocation {
         let (owner, owner_local) = self.resolve_owner(node, local);
-        match &self.nodes.get(owner).expect("live node").pages {
-            Pages::Owned { ids, .. } => ids[owner_local as usize],
+        TriePageLocation {
+            node: owner,
+            local: owner_local,
+        }
+    }
+
+    fn resolve_backing(&self, node: NodeId, local: u64) -> KvPageBacking {
+        let location = self.resolve_location(node, local);
+        match &self.nodes.get(location.node).expect("live node").pages {
+            Pages::Owned { backings, .. } => backings[location.local as usize],
             Pages::ParentSelection { .. } => unreachable!("resolved to owner"),
+        }
+    }
+
+    fn resolve_id(&self, node: NodeId, local: u64) -> Option<PhysicalKvPageId> {
+        match self.resolve_backing(node, local) {
+            KvPageBacking::Resident(id) => Some(id),
+            KvPageBacking::Swapped(_) => None,
         }
     }
 
@@ -921,8 +988,8 @@ impl KvPageTable {
         let (owner, runs) = {
             let n = self.nodes.get(node).expect("live node");
             match &n.pages {
-                Pages::Owned { ids, .. } => {
-                    debug_assert!(off < ids.len() as u64);
+                Pages::Owned { backings, .. } => {
+                    debug_assert!(off < backings.len() as u64);
                     let runs: Runs = smallvec![0..off as u32];
                     (node, runs)
                 }
@@ -940,8 +1007,8 @@ impl KvPageTable {
         let (owner, runs) = {
             let n = self.nodes.get(node).expect("live node");
             match &n.pages {
-                Pages::Owned { ids, .. } => {
-                    let full: Runs = smallvec![0..ids.len() as u32];
+                Pages::Owned { backings, .. } => {
+                    let full: Runs = smallvec![0..backings.len() as u32];
                     (node, runs_remove(&full, a, b))
                 }
                 Pages::ParentSelection { runs } => {
@@ -1038,11 +1105,20 @@ impl KvPageTable {
         let n = self.nodes.get_mut(node).expect("live node");
         match &mut n.pages {
             Pages::Owned {
-                ids,
+                backings,
                 token_hashes,
                 page_hashes,
             } => {
-                let freed: Vec<_> = ids.drain(a as usize..b as usize).collect();
+                let freed: Vec<_> = backings
+                    .drain(a as usize..b as usize)
+                    .filter_map(|backing| match backing {
+                        KvPageBacking::Resident(id) => Some(id),
+                        KvPageBacking::Swapped(_) => {
+                            debug_assert!(false, "guest discard cannot target swapped pages");
+                            None
+                        }
+                    })
+                    .collect();
                 token_hashes.drain(a as usize..b as usize);
                 page_hashes.drain(a as usize..b as usize);
                 freed
@@ -1252,17 +1328,233 @@ impl KvPageTable {
             if others.contains(&node) {
                 break; // everything above here is shared
             }
-            if let Pages::Owned { ids, .. } = &self.nodes.get(node).expect("live node").pages {
-                pages += ids.len() as u64;
+            if let Pages::Owned { backings, .. } = &self.nodes.get(node).expect("live node").pages {
+                pages += backings.len() as u64;
             }
             cursor = self.nodes.get(node).expect("live node").parent;
         }
         Ok(pages)
     }
 
+    /// Exact private resident pages reachable by `working_sets`. Sharing
+    /// between members of the set is counted once; pages visible from any
+    /// outside WorkingSet, cache root, or in-flight pin are excluded.
+    ///
+    /// The boolean reports whether an in-flight pin overlaps the target
+    /// residency. Callers defer the whole suspend transaction in that case.
+    pub fn private_resident_pages(
+        &self,
+        working_sets: &HashSet<WorkingSetId>,
+    ) -> Result<(Vec<(TriePageLocation, PhysicalKvPageId)>, bool), KvTableError> {
+        let mut target = HashSet::new();
+        for &ws in working_sets {
+            target.extend(self.working_set_locations(ws)?);
+        }
+
+        let mut pinned = HashSet::new();
+        for &terminal in self.pins.keys() {
+            pinned.extend(self.anchor_locations(terminal));
+        }
+        if target.iter().any(|location| pinned.contains(location)) {
+            return Ok((Vec::new(), true));
+        }
+
+        let mut external = HashSet::new();
+        for (ws, _) in self.working_sets.iter() {
+            if !working_sets.contains(&ws) {
+                external.extend(self.working_set_locations(ws)?);
+            }
+        }
+        for &terminal in self.cache_roots.keys() {
+            external.extend(self.anchor_locations(terminal));
+        }
+
+        let pages = target
+            .into_iter()
+            .filter(|location| !external.contains(location))
+            .filter_map(|location| match self.backing_at(&location).ok()? {
+                KvPageBacking::Resident(id) => Some((location, id)),
+                KvPageBacking::Swapped(_) => None,
+            })
+            .collect();
+        Ok((pages, false))
+    }
+
+    /// Private resident pages after this process drains its own fire pins.
+    /// External WorkingSets and cache roots still exclude shared pages.
+    pub fn post_drain_private_resident_pages(
+        &self,
+        working_sets: &HashSet<WorkingSetId>,
+    ) -> Result<Vec<(TriePageLocation, PhysicalKvPageId)>, KvTableError> {
+        let mut target = HashSet::new();
+        for &ws in working_sets {
+            target.extend(self.working_set_locations(ws)?);
+        }
+        let mut external = HashSet::new();
+        for (ws, _) in self.working_sets.iter() {
+            if !working_sets.contains(&ws) {
+                external.extend(self.working_set_locations(ws)?);
+            }
+        }
+        for &terminal in self.cache_roots.keys() {
+            external.extend(self.anchor_locations(terminal));
+        }
+        Ok(target
+            .into_iter()
+            .filter(|location| !external.contains(location))
+            .filter_map(|location| match self.backing_at(&location).ok()? {
+                KvPageBacking::Resident(id) => Some((location, id)),
+                KvPageBacking::Swapped(_) => None,
+            })
+            .collect())
+    }
+
+    pub fn swapped_pages(
+        &self,
+        working_sets: &HashSet<WorkingSetId>,
+    ) -> Result<Vec<(TriePageLocation, HostKvSlotId)>, KvTableError> {
+        let mut locations = HashSet::new();
+        for &ws in working_sets {
+            locations.extend(self.working_set_locations(ws)?);
+        }
+        Ok(locations
+            .into_iter()
+            .filter_map(|location| match self.backing_at(&location).ok()? {
+                KvPageBacking::Swapped(slot) => Some((location, slot)),
+                KvPageBacking::Resident(_) => None,
+            })
+            .collect())
+    }
+
+    pub fn pin_working_sets(
+        &mut self,
+        working_sets: &HashSet<WorkingSetId>,
+    ) -> Result<Vec<NodeId>, KvTableError> {
+        let mut terminals = HashSet::new();
+        for &ws in working_sets {
+            if let Some(terminal) = self.entry(ws)?.terminal {
+                terminals.insert(terminal);
+            }
+        }
+        for &terminal in &terminals {
+            self.pin(terminal);
+        }
+        Ok(terminals.into_iter().collect())
+    }
+
+    pub fn unpin_terminals(&mut self, terminals: &[NodeId]) {
+        for &terminal in terminals {
+            self.unpin(terminal);
+        }
+    }
+
+    pub fn backing_at(&self, location: &TriePageLocation) -> Result<KvPageBacking, KvTableError> {
+        let node = self
+            .nodes
+            .get(location.node)
+            .ok_or(KvTableError::BackingChanged)?;
+        match &node.pages {
+            Pages::Owned { backings, .. } => backings
+                .get(location.local as usize)
+                .copied()
+                .ok_or(KvTableError::BackingChanged),
+            Pages::ParentSelection { .. } => Err(KvTableError::BackingChanged),
+        }
+    }
+
+    pub fn page_location_pinned(&self, location: TriePageLocation) -> bool {
+        self.pins
+            .keys()
+            .any(|terminal| self.anchor_locations(*terminal).contains(&location))
+    }
+
+    pub fn replace_backings(
+        &mut self,
+        replacements: &[(TriePageLocation, KvPageBacking, KvPageBacking)],
+    ) -> Result<(), KvTableError> {
+        for (location, expected, _) in replacements {
+            if self.backing_at(location)? != *expected {
+                return Err(KvTableError::BackingChanged);
+            }
+        }
+        for (location, _, replacement) in replacements {
+            let node = self
+                .nodes
+                .get_mut(location.node)
+                .ok_or(KvTableError::BackingChanged)?;
+            match &mut node.pages {
+                Pages::Owned { backings, .. } => {
+                    backings[location.local as usize] = *replacement;
+                }
+                Pages::ParentSelection { .. } => return Err(KvTableError::BackingChanged),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn backing_counts(&self) -> (usize, usize) {
+        self.nodes
+            .iter()
+            .fold((0, 0), |(resident, swapped), (_, node)| match &node.pages {
+                Pages::Owned { backings, .. } => {
+                    backings
+                        .iter()
+                        .fold(
+                            (resident, swapped),
+                            |(resident, swapped), backing| match backing {
+                                KvPageBacking::Resident(_) => (resident + 1, swapped),
+                                KvPageBacking::Swapped(_) => (resident, swapped + 1),
+                            },
+                        )
+                }
+                Pages::ParentSelection { .. } => (resident, swapped),
+            })
+    }
+
+    fn working_set_locations(
+        &self,
+        ws: WorkingSetId,
+    ) -> Result<HashSet<TriePageLocation>, KvTableError> {
+        let entry = self.entry(ws)?;
+        let mut locations = HashSet::new();
+        for segment in self.segments(entry.terminal, entry.mapped_len).iter().rev() {
+            let from = (-segment.start).max(0) as u64;
+            for local in from..segment.len {
+                locations.insert(self.resolve_location(segment.node, local));
+            }
+        }
+        Ok(locations)
+    }
+
+    fn anchor_locations(&self, terminal: NodeId) -> HashSet<TriePageLocation> {
+        let mut locations = HashSet::new();
+        let mut cursor = Some(terminal);
+        while let Some(node) = cursor {
+            let trie_node = self.nodes.get(node).expect("live anchor");
+            match &trie_node.pages {
+                Pages::Owned { backings, .. } => {
+                    locations.extend(
+                        (0..backings.len() as u64).map(|local| TriePageLocation { node, local }),
+                    );
+                }
+                Pages::ParentSelection { runs } => {
+                    let owner = trie_node.parent.expect("selection has owner");
+                    locations.extend(runs.iter().flat_map(|run| run.clone()).map(|local| {
+                        TriePageLocation {
+                            node: owner,
+                            local: u64::from(local),
+                        }
+                    }));
+                }
+            }
+            cursor = self.predecessor(node);
+        }
+        locations
+    }
+
     /// Mark-and-sweep from all anchors (WorkingSet terminals, cache roots,
-    /// pins), then apply the owner-compaction rule. Returns freed ids.
-    pub fn collect(&mut self) -> Vec<PhysicalKvPageId> {
+    /// pins), then apply the owner-compaction rule.
+    pub fn collect_backings(&mut self) -> Vec<KvPageBacking> {
         let mut exact_anchors: HashSet<NodeId> = HashSet::new();
         for (_, entry) in self.working_sets.iter() {
             if let Some(t) = entry.terminal {
@@ -1278,8 +1570,8 @@ impl KvPageTable {
         let mut freed = Vec::new();
         for node in unmarked {
             let removed = self.nodes.remove(node).expect("live node");
-            if let Pages::Owned { ids, .. } = removed.pages {
-                freed.extend(ids);
+            if let Pages::Owned { backings, .. } = removed.pages {
+                freed.extend(backings);
             }
         }
         // Prune dangling child edges on survivors.
@@ -1310,11 +1602,25 @@ impl KvPageTable {
         freed
     }
 
+    /// Resident-only compatibility wrapper used by the page-table unit tests.
+    pub fn collect(&mut self) -> Vec<PhysicalKvPageId> {
+        self.collect_backings()
+            .into_iter()
+            .filter_map(|backing| match backing {
+                KvPageBacking::Resident(id) => Some(id),
+                KvPageBacking::Swapped(_) => {
+                    debug_assert!(false, "swapped backing must be released through KvStore");
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn try_compact_owner(
         &mut self,
         owner: NodeId,
         exact_anchors: &HashSet<NodeId>,
-    ) -> Vec<PhysicalKvPageId> {
+    ) -> Vec<KvPageBacking> {
         if exact_anchors.contains(&owner) {
             return Vec::new();
         }
@@ -1332,34 +1638,34 @@ impl KvPageTable {
 
         let kept: Vec<u32> = runs.iter().flat_map(|r| r.clone()).collect();
         let node = self.nodes.get_mut(owner).expect("live node");
-        let (ids, token_hashes, page_hashes) = match &mut node.pages {
+        let (backings, token_hashes, page_hashes) = match &mut node.pages {
             Pages::Owned {
-                ids,
+                backings,
                 token_hashes,
                 page_hashes,
-            } => (ids, token_hashes, page_hashes),
+            } => (backings, token_hashes, page_hashes),
             Pages::ParentSelection { .. } => unreachable!("checked owned"),
         };
-        if kept.len() == ids.len() {
+        if kept.len() == backings.len() {
             return Vec::new(); // full-coverage selection: nothing to free
         }
 
         let keep_set: HashSet<u32> = kept.iter().copied().collect();
         let mut freed = Vec::new();
-        let mut new_ids = Vec::with_capacity(kept.len());
+        let mut new_backings = Vec::with_capacity(kept.len());
         let mut new_tokens = Vec::with_capacity(kept.len());
         let mut new_pages = Vec::with_capacity(kept.len());
         for &index in &kept {
-            new_ids.push(ids[index as usize]);
+            new_backings.push(backings[index as usize]);
             new_tokens.push(std::mem::take(&mut token_hashes[index as usize]));
             new_pages.push(page_hashes[index as usize]);
         }
-        for (index, id) in ids.iter().enumerate() {
+        for (index, backing) in backings.iter().enumerate() {
             if !keep_set.contains(&(index as u32)) {
-                freed.push(*id);
+                freed.push(*backing);
             }
         }
-        *ids = new_ids;
+        *backings = new_backings;
         *token_hashes = new_tokens;
         *page_hashes = new_pages;
         node.cached_path_hash = None; // full contribution changed (unobserved)

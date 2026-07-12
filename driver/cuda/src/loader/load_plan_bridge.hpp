@@ -12,19 +12,19 @@
 #include <vector>
 
 #include "loader/rust_quant_attachment.hpp"
-#include "loader/rust_storage_program.hpp"
+#include "loader/load_plan.hpp"
 
 #include "model/config.hpp"
 
 namespace pie_cuda_driver {
 
 inline std::string rust_loader_bytes_to_string(
-    pie_weight_loader::PieLoaderBytes bytes) {
-    return pie_weight_loader::cpp::bytes_to_string(bytes);
+    pie_load_planner::PieLoaderBytes bytes) {
+    return pie_load_planner::cpp::bytes_to_string(bytes);
 }
 
-struct RustLoaderCompileResult {
-    RustStorageProgram program;
+struct LoadPlanResult {
+    LoadPlan plan;
     std::vector<RustQuantAttachment> quant_attachments;
     std::size_t source_tensor_count = 0;
     std::size_t covered_contract_count = 0;
@@ -41,7 +41,7 @@ inline bool rust_loader_ends_with(
 
 inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
     const HfConfig& hf,
-    const pie_weight_loader::PieLoaderStorageProgramView& view) {
+    const pie_load_planner::LoadPlanView& view) {
     (void)hf;
     std::unordered_set<std::string> present;
     present.reserve(view.tensors.len);
@@ -68,14 +68,14 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
             return true;
         };
 
-        if (tensor.encoding_kind == pie_weight_loader::PieLoaderEncodingKind::Quant) {
+        if (tensor.encoding_kind == pie_load_planner::PieLoaderEncodingKind::Quant) {
             if (tensor.quant_scheme ==
-                    pie_weight_loader::PieLoaderQuantScheme::Fp8E4M3 ||
+                    pie_load_planner::PieLoaderQuantScheme::Fp8E4M3 ||
                 tensor.quant_scheme ==
-                    pie_weight_loader::PieLoaderQuantScheme::Int8Symmetric) {
+                    pie_load_planner::PieLoaderQuantScheme::Int8Symmetric) {
                 attach(name + "_scale_inv", QuantGranularity::PerChannel, 0, 0);
             } else if (tensor.quant_scheme ==
-                       pie_weight_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
+                       pie_load_planner::PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
                 if (!attach(name + "_scale", QuantGranularity::PerGroup, 32, 1) &&
                     rust_loader_ends_with(name, ".weight")) {
                     attach(
@@ -87,7 +87,7 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
             }
             continue;
         }
-        if (tensor.dtype != pie_weight_loader::PieLoaderDType::F8E4M3 ||
+        if (tensor.dtype != pie_load_planner::PieLoaderDType::F8E4M3 ||
             !rust_loader_ends_with(name, ".weight")) {
             continue;
         }
@@ -103,7 +103,7 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
     return attachments;
 }
 
-inline std::string storage_program_cache_key(std::span<const std::uint8_t> bytes) {
+inline std::string load_plan_cache_key(std::span<const std::uint8_t> bytes) {
     std::uint64_t hash = 1469598103934665603ull;
     for (const std::uint8_t byte : bytes) {
         hash ^= byte;
@@ -114,31 +114,35 @@ inline std::string storage_program_cache_key(std::span<const std::uint8_t> bytes
     return out.str();
 }
 
-inline RustLoaderCompileResult load_rust_storage_program(
+inline LoadPlanResult prepare_load_plan(
     const HfConfig& hf,
-    RustStorageProgram program,
-    std::span<const std::uint8_t> program_bytes,
+    LoadPlan plan,
+    std::span<const std::uint8_t> load_plan_bytes,
     std::uint64_t compiler_version) {
-    if (program.compiler_version() != compiler_version) {
-        throw std::runtime_error("engine: StorageProgram compiler version mismatch");
+    if (plan.compiler_version() != compiler_version) {
+        throw std::runtime_error("engine: LoadPlan compiler version mismatch");
     }
-    if (program.backend() != pie_weight_loader::PieLoaderBackendKind::Cuda) {
-        throw std::runtime_error("engine: CUDA received a non-CUDA StorageProgram");
+    if (plan.backend() != pie_load_planner::PieLoaderBackendKind::Cuda) {
+        throw std::runtime_error("engine: CUDA received a non-CUDA LoadPlan");
     }
-    const auto view = program.view();
+    if ((plan.tile_map_mask() & ~pie_load_planner::kCudaTileMapMask) != 0) {
+        throw std::runtime_error(
+            "engine: CUDA LoadPlan advertises unsupported TileMap transforms");
+    }
+    const auto view = plan.view();
     const std::size_t runtime_tensor_count = view.tensors.len;
     return {
-        .program = std::move(program),
+        .plan = std::move(plan),
         .quant_attachments = infer_rust_quant_attachments(hf, view),
         .source_tensor_count = view.sources.len,
         .covered_contract_count = runtime_tensor_count,
         .runtime_tensor_count = runtime_tensor_count,
-        .cache_key = storage_program_cache_key(program_bytes),
+        .cache_key = load_plan_cache_key(load_plan_bytes),
     };
 }
 
-inline std::string describe_rust_storage_program(
-    const pie_weight_loader::PieLoaderStorageProgramView& view,
+inline std::string describe_load_plan(
+    const pie_load_planner::LoadPlanView& view,
     std::size_t source_tensor_count,
     std::size_t covered_contract_count,
     std::size_t runtime_tensor_count) {
@@ -147,7 +151,7 @@ inline std::string describe_rust_storage_program(
         optimizer_rewrites += view.optimizer.passes.ptr[i].rewrites;
     }
     std::ostringstream out;
-    out << "storage_program(version=" << view.version
+    out << "load_plan(version=" << view.version
         << ", source_tensors=" << source_tensor_count
         << ", contracts=" << covered_contract_count << "/" << runtime_tensor_count
         << ", tensors=" << view.tensors.len
@@ -163,9 +167,9 @@ inline std::string describe_rust_storage_program(
     return out.str();
 }
 
-inline const char* rust_storage_instr_kind_name(
-    pie_weight_loader::PieLoaderStorageInstrKind kind) noexcept {
-    using K = pie_weight_loader::PieLoaderStorageInstrKind;
+inline const char* load_instr_kind_name(
+    pie_load_planner::PieLoaderStorageInstrKind kind) noexcept {
+    using K = pie_load_planner::PieLoaderStorageInstrKind;
     switch (kind) {
     case K::Allocate: return "Allocate";
     case K::ExtentWrite: return "ExtentWrite";
@@ -181,8 +185,8 @@ inline const char* rust_storage_instr_kind_name(
 }
 
 inline const char* rust_tile_map_kind_name(
-    pie_weight_loader::PieLoaderTileMapKind kind) noexcept {
-    using K = pie_weight_loader::PieLoaderTileMapKind;
+    pie_load_planner::PieLoaderTileMapKind kind) noexcept {
+    using K = pie_load_planner::PieLoaderTileMapKind;
     switch (kind) {
     case K::Cast: return "Cast";
     case K::Decode: return "Decode";
@@ -196,8 +200,8 @@ inline const char* rust_tile_map_kind_name(
     return "Unknown";
 }
 
-inline std::string dump_rust_storage_program_json(
-    const pie_weight_loader::PieLoaderStorageProgramView& view,
+inline std::string dump_load_plan_json(
+    const pie_load_planner::LoadPlanView& view,
     std::size_t source_tensor_count,
     std::size_t covered_contract_count,
     std::size_t runtime_tensor_count) {
@@ -205,13 +209,13 @@ inline std::string dump_rust_storage_program_json(
     std::map<std::string, std::size_t> tile_map_kinds;
     for (std::size_t i = 0; i < view.instrs.len; ++i) {
         const auto& instr = view.instrs.ptr[i];
-        ++instruction_kinds[rust_storage_instr_kind_name(instr.kind)];
-        if (instr.kind == pie_weight_loader::PieLoaderStorageInstrKind::TileMap) {
+        ++instruction_kinds[load_instr_kind_name(instr.kind)];
+        if (instr.kind == pie_load_planner::PieLoaderStorageInstrKind::TileMap) {
             ++tile_map_kinds[rust_tile_map_kind_name(instr.tile_kind)];
         }
     }
     nlohmann::json out = {
-        {"summary", describe_rust_storage_program(
+        {"summary", describe_load_plan(
             view, source_tensor_count, covered_contract_count,
             runtime_tensor_count)},
         {"version", view.version},

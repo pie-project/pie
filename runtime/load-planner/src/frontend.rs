@@ -1,9 +1,9 @@
 use crate::abi::{RuntimeAbi, RuntimeTensorContract, RuntimeTensorSource};
 use crate::error::CompileError;
 use crate::ir::{ByteSpan, LayoutExpr, LayoutPlan};
+use crate::load_plan::StorageTarget;
 use crate::semantic::SemanticGraph;
 use crate::source::{CheckpointMetadata, RawTensor};
-use crate::storage::StorageTarget;
 use crate::types::{
     DType, Encoding, QuantScheme, QuantSpec, Sharding, TensorDecl, TensorId, encoding_nbytes,
 };

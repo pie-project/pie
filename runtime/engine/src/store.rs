@@ -20,3 +20,20 @@ pub(crate) mod pool;
 pub mod reclaim;
 pub(crate) mod registry;
 pub(crate) mod rs;
+
+/// Coarse worker-routing signal derived from real KV residency and contention.
+pub fn kv_pressure_bucket() -> u8 {
+    if let Some(orchestrator) = reclaim::contention() {
+        return orchestrator.kv_pressure_bucket();
+    }
+    let Some(stores) = registry::try_get(0, 0) else {
+        return 0;
+    };
+    let kv = stores.kv.lock().unwrap();
+    let total = kv.capacity_pages();
+    if total == 0 {
+        return 0;
+    }
+    let used = total.saturating_sub(kv.available_pages() as u32);
+    (f64::from(used) / f64::from(total) * 255.0).round() as u8
+}

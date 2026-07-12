@@ -1,13 +1,13 @@
-//! In-process compile entry (weight-loader Variant A, step 2).
+//! In-process load-planning entry.
 //!
 //! This is the Rust-native replacement for the C++ loader's
 //! parse-checkpoint → build-FFI-input → invoke-compile pipeline
-//! (`driver/cuda/src/loader/rust_loader_bridge.hpp`,
+//! (`driver/cuda/src/loader/load_plan_bridge.hpp`,
 //! `compile_rust_loader_plan_from_metadata`). The runtime links this crate as
-//! an `rlib` and calls [`compile_snapshot_to_bytes`] directly — no FFI — to
-//! turn a checkpoint directory into a serialized [`StorageProgram`] IR that is
+//! an `rlib` and calls [`compile_snapshot_to_plan_bytes`] directly — no FFI — to
+//! turn a checkpoint directory into a serialized [`LoadPlan`] that is
 //! shipped to the driver. The **bulk weight bytes never cross this boundary**:
-//! the program only records where each tensor lives (file + offset + span) and
+//! the plan only records where each tensor lives (file + offset + span) and
 //! how to place it; the driver reads the payloads from its own copy of the
 //! checkpoint during execution.
 //!
@@ -20,7 +20,7 @@
 //! * the RuntimeABI is left implicit so the compiler uses
 //!   [`RuntimeAbi::default_for_target`] — the C++ side only sets the ABI
 //!   *name*/*version* (`"pie-cuda"`, `1`), never the tensor contracts, so the
-//!   two paths compile byte-identical programs.
+//!   two paths compile byte-identical plans.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -30,9 +30,9 @@ use crate::checkpoint_header::parse_safetensors_checkpoint;
 use crate::config::ModelConfig;
 use crate::error::CompileError;
 use crate::gguf::parse_gguf_checkpoint;
+use crate::load_plan::{LOAD_PLAN_VERSION, LoadPlan, StorageTarget, compiler_version};
+use crate::planner::compile_load_plan;
 use crate::source::CheckpointMetadata;
-use crate::storage::{STORAGE_PROGRAM_VERSION, StorageProgram, StorageTarget, compiler_version};
-use crate::storage_compiler::compile_storage_program;
 
 /// Discover the safetensors shard files for a snapshot directory, matching the
 /// C++ `discover_safetensors_manifest` with a `SingleFile` layout preference.
@@ -93,6 +93,13 @@ pub fn discover_safetensors_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, C
 /// The single GGUF checkpoint file for a snapshot directory, if present. GGUF
 /// checkpoints are a single-file format (`model.gguf` or a lone `*.gguf`).
 fn discover_gguf_file(snapshot_dir: &Path) -> Option<PathBuf> {
+    if snapshot_dir.is_file()
+        && snapshot_dir
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        return Some(snapshot_dir.to_path_buf());
+    }
     let named = snapshot_dir.join("model.gguf");
     if named.is_file() {
         return Some(named);
@@ -114,6 +121,11 @@ fn discover_gguf_file(snapshot_dir: &Path) -> Option<PathBuf> {
 /// picking the on-disk format (safetensors, else GGUF). Only headers are read;
 /// bulk tensor bytes are never mapped.
 pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetadata, CompileError> {
+    if let Some(gguf) = discover_gguf_file(snapshot_dir)
+        && snapshot_dir.is_file()
+    {
+        return parse_gguf_checkpoint(&gguf);
+    }
     // Safetensors takes precedence — it is the canonical HF snapshot format and
     // the C++ loader opens it first.
     match discover_safetensors_files(snapshot_dir) {
@@ -128,7 +140,7 @@ pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetada
     }
 }
 
-/// Compile a checkpoint directory into a [`StorageProgram`] entirely in-process.
+/// Compile a checkpoint directory into a [`LoadPlan`] entirely in-process.
 ///
 /// `model` and `target` carry the same coarse configuration the C++ bridge
 /// builds from the HF config + backend caps. The RuntimeABI is derived with
@@ -138,48 +150,46 @@ pub fn compile_snapshot(
     snapshot_dir: &Path,
     model: &ModelConfig,
     target: StorageTarget,
-) -> Result<StorageProgram, CompileError> {
+) -> Result<LoadPlan, CompileError> {
     let metadata = parse_checkpoint_metadata(snapshot_dir)?;
     let abi = RuntimeAbi::default_for_target(&metadata, model, &target)?;
-    compile_storage_program(&metadata, model, &abi, target)
+    compile_load_plan(&metadata, model, &abi, target)
 }
 
-/// Compile a checkpoint directory and serialize the resulting program with the
-/// same `bincode` wire format the C++ deserialize+execute path consumes
-/// (`pie_loader_program_deserialize`). This is the payload the runtime ships to
-/// the driver over the new storage-program boundary op.
-pub fn compile_snapshot_to_bytes(
+/// Compile a checkpoint directory and serialize the resulting plan as the
+/// versioned JSON document consumed by native and host executors.
+pub fn compile_snapshot_to_plan_bytes(
     snapshot_dir: &Path,
     model: &ModelConfig,
     target: StorageTarget,
 ) -> Result<Vec<u8>, CompileError> {
     let program = compile_snapshot(snapshot_dir, model, target)?;
-    serialize_program(&program)
+    serialize_load_plan(&program)
 }
 
-pub fn serialize_program(program: &StorageProgram) -> Result<Vec<u8>, CompileError> {
-    serde_json::to_vec(program)
-        .map_err(|err| CompileError::Internal(format!("storage program serialize failed: {err}")))
+pub fn serialize_load_plan(plan: &LoadPlan) -> Result<Vec<u8>, CompileError> {
+    serde_json::to_vec(plan)
+        .map_err(|err| CompileError::Internal(format!("load plan serialize failed: {err}")))
 }
 
-pub fn deserialize_program(bytes: &[u8]) -> Result<StorageProgram, CompileError> {
-    let program: StorageProgram = serde_json::from_slice(bytes).map_err(|err| {
-        CompileError::InvalidInput(format!("storage program deserialize failed: {err}"))
+pub fn deserialize_load_plan(bytes: &[u8]) -> Result<LoadPlan, CompileError> {
+    let plan: LoadPlan = serde_json::from_slice(bytes).map_err(|err| {
+        CompileError::InvalidInput(format!("load plan deserialize failed: {err}"))
     })?;
-    if program.version != STORAGE_PROGRAM_VERSION {
+    if plan.version != LOAD_PLAN_VERSION {
         return Err(CompileError::InvalidInput(format!(
-            "storage program version {} does not match executor version {}",
-            program.version, STORAGE_PROGRAM_VERSION
+            "load plan version {} does not match executor version {}",
+            plan.version, LOAD_PLAN_VERSION
         )));
     }
     let expected = compiler_version();
-    if program.compiler_version != expected {
+    if plan.compiler_version != expected {
         return Err(CompileError::InvalidInput(format!(
-            "storage compiler version {:#x} does not match executor version {expected:#x}",
-            program.compiler_version
+            "load planner version {:#x} does not match executor version {expected:#x}",
+            plan.compiler_version
         )));
     }
-    Ok(program)
+    Ok(plan)
 }
 
 /// Parse the coarse [`ModelConfig`] fields the storage compiler needs from a
@@ -201,6 +211,17 @@ pub fn parse_model_config(
     snapshot_dir: &Path,
     runtime_quant: impl Into<String>,
 ) -> Result<ModelConfig, CompileError> {
+    if snapshot_dir.is_file()
+        && snapshot_dir
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        return Err(CompileError::InvalidInput(format!(
+            "GGUF model-config compilation is deferred; use a Hugging Face \
+             safetensors snapshot directory instead of {}",
+            snapshot_dir.display()
+        )));
+    }
     let path = snapshot_dir.join("config.json");
     let text = std::fs::read_to_string(&path).map_err(|err| {
         CompileError::InvalidInput(format!("cannot read {}: {err}", path.display()))
@@ -267,7 +288,8 @@ mod tests {
     }
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("wl_inproc_{tag}_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("load_planner_inproc_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -344,6 +366,17 @@ mod tests {
         );
         let cfg = parse_model_config(&dir, "").unwrap();
         assert_eq!(cfg.num_experts, 8);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn direct_gguf_paths_are_discovered_but_model_compile_is_explicitly_deferred() {
+        let dir = tmpdir("direct_gguf");
+        let path = dir.join("model.gguf");
+        std::fs::write(&path, b"GGUF").unwrap();
+        assert_eq!(discover_gguf_file(&path), Some(path.clone()));
+        let error = parse_model_config(&path, "").unwrap_err().to_string();
+        assert!(error.contains("GGUF model-config compilation is deferred"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

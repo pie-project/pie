@@ -24,4 +24,13 @@ pub trait FireContext {
     /// are the same `uuid::Uuid` representation; returned as the leaf-crate
     /// type directly so this trait need not name either module).
     fn process_id(&self) -> uuid::Uuid;
+
+    /// Process-owned KV membership captured independently of WIT handles.
+    fn kv_working_sets(
+        &self,
+    ) -> std::collections::HashSet<crate::store::kv::page_table::WorkingSetId>;
+
+    /// Honor a requester self-suspend decision while this task still owns the
+    /// process continuation.
+    async fn honor_preemption(&mut self) -> anyhow::Result<()>;
 }

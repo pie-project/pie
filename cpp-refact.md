@@ -114,9 +114,9 @@ driver/cuda/src
 │   ├── dsa_cache.{hpp,cpp} (stub today; keep, see decision log)
 │   ├── recurrent_state_cache.{hpp,cpp}  swap_pool.{hpp,cpp}
 │   └── memory_planner.{hpp,cpp}   (from cuda_memory_planner.*, prefix dropped)
-└── loader/             StorageProgram -> WeightStore
+└── loader/             LoadPlan -> WeightStore
     ├── safetensors_manifest.* checkpoint_source.{hpp,cpp}
-    ├── rust_loader_bridge.hpp rust_storage_executor.hpp
+    ├── load_plan_bridge.hpp load_plan_executor.hpp
     ├── transcode_engine.hpp weight_copy_engine.hpp weight_store_codec.hpp
     └── (hf_config moves OUT to model/config; gguf_source deleted)
 ```
@@ -205,7 +205,7 @@ corresponding `tests/` sources.
 ### 1d. Dead loader / top-level / kernel files
 
 - `src/loader/gguf_source.{cpp,hpp}` (479+): `GgufCheckpointSource` has zero
-  construction sites; GGUF planning lives in the Rust weight-loader.
+  construction sites; GGUF planning lives in the Rust load planner.
 - `src/parity_harness.{cpp,hpp}` (597): `run_parity` has no caller and no ABI
   export. Also delete the two functions it kept alive:
   `qwen3_forward_prefill` and `qwen3_forward_paged`
@@ -376,8 +376,8 @@ Mechanical moves, no logic changes:
 - `tensor.{cpp,hpp}` and `distributed.{cpp,hpp}` stay top-level next to
   `context.*` (core type; Context-owned comms).
 - Doc fix while touching `loader/`: the "driver's own C++ checkpoint compile"
-  comments (`loaded_model.hpp:44-55`, `rust_loader_bridge.hpp:674`) are wrong;
-  both branches execute the Rust-compiled StorageProgram, the difference is
+  comments (`loaded_model.hpp:44-55`, `load_plan_bridge.hpp`) are wrong;
+  both branches execute the Rust-compiled LoadPlan, the difference is
   compile-via-FFI vs deserialize-from-file. Say so.
 
 Gate: build + ctest + `cuda_plain_gen` (moves only; a full sweep at Phase 8).
@@ -519,7 +519,7 @@ workstation.
 - `driver/metal`: same layout and names should apply later (it already mirrors the
   old structure at 1/10 the size), but only after the CUDA tree lands.
 - `interface/driver` ABI and `interface/ptir`: unchanged.
-- The storage compiler moved to `runtime/weight-loader`; see
+- The load planner moved to `runtime/load-planner`; see
   `storage-refact-and-metal.md`.
 - Engine-side work: tracked in `major_refactor.md`.
 - Re-enabling rank-0 CUDA-graph replay; tier-1 NVRTC fusion productization; the

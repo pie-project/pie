@@ -4,25 +4,25 @@ use crate::abi::{RuntimeAbi, RuntimeTensorSource};
 use crate::error::CompileError;
 use crate::frontend::{plan_from_semantics, runtime_bytes};
 use crate::ir::{LayoutExpr, LayoutPlan};
+use crate::load_plan::{
+    BufferDecl, DestExtent, DimSpec, LoadPlan, MetadataSpec, SlabPlacement, SourceExtent,
+    StorageInstr, StorageTarget, StridedExtent, TileMapKind, TileSpec, TransformSpec,
+};
 use crate::optimizer::{OptimizerPassStats, optimize_with_report};
 use crate::schema::build_semantic_graph;
 use crate::source::{CheckpointMetadata, RawTensor};
-use crate::storage::{
-    BufferDecl, DestExtent, DimSpec, MetadataSpec, SlabPlacement, SourceExtent, StorageInstr,
-    StorageProgram, StorageTarget, StridedExtent, TileMapKind, TileSpec, TransformSpec,
-};
 use crate::typecheck::typecheck;
 use crate::types::{
-    Axis, BackendKind, BufferId, DType, Encoding, ExprId, InstrId, QuantScheme, RepackLayout,
-    RepackSpec, TensorDecl, TensorId, encoding_dense_element_bytes, encoding_nbytes, tensor_nbytes,
+    Axis, BufferId, DType, Encoding, ExprId, InstrId, QuantScheme, RepackLayout, RepackSpec,
+    TensorDecl, TensorId, encoding_dense_element_bytes, encoding_nbytes, tensor_nbytes,
 };
 
-pub fn compile_storage_program(
+pub fn compile_load_plan(
     metadata: &CheckpointMetadata,
     cfg: &crate::config::ModelConfig,
     abi: &RuntimeAbi,
     target: StorageTarget,
-) -> Result<StorageProgram, CompileError> {
+) -> Result<LoadPlan, CompileError> {
     let abi = abi.coalesce_direct_row_shards(metadata, &target)?;
     let needs_semantic_graph = abi
         .tensors
@@ -44,12 +44,12 @@ pub fn lower_layout_plan(
     metadata: &CheckpointMetadata,
     plan: &LayoutPlan,
     target: StorageTarget,
-) -> Result<StorageProgram, CompileError> {
+) -> Result<LoadPlan, CompileError> {
     typecheck(plan)?;
     let mut compiler = StorageCompiler {
         metadata,
         plan,
-        program: StorageProgram::empty(target),
+        program: LoadPlan::empty(target),
         values: HashMap::new(),
         finalized_names: HashSet::new(),
         next_buffer: 0,
@@ -58,7 +58,7 @@ pub fn lower_layout_plan(
     compiler.program.sources = metadata
         .tensors
         .iter()
-        .map(|tensor| crate::storage::SourceTensorDecl {
+        .map(|tensor| crate::load_plan::SourceTensorDecl {
             id: tensor.id,
             name: tensor.name.clone(),
             file_id: tensor.file_id,
@@ -90,7 +90,7 @@ struct SourceView {
 struct StorageCompiler<'a> {
     metadata: &'a CheckpointMetadata,
     plan: &'a LayoutPlan,
-    program: StorageProgram,
+    program: LoadPlan,
     values: HashMap<ExprId, ValueLoc>,
     finalized_names: HashSet<String>,
     next_buffer: u32,
@@ -903,7 +903,7 @@ fn mark_reachable(
     Ok(())
 }
 
-fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileError> {
+fn recompute_memory_plan(program: &mut LoadPlan) -> Result<(), CompileError> {
     let mut persistent_bytes = 0u64;
     let mut live_bytes = 0u64;
     let mut live_peak = 0u64;
@@ -1029,7 +1029,7 @@ fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileErro
     Ok(())
 }
 
-fn assign_persistent_offsets(program: &mut StorageProgram) -> Result<(), CompileError> {
+fn assign_persistent_offsets(program: &mut LoadPlan) -> Result<(), CompileError> {
     let mut next = 0u64;
     let source_order = persistent_source_order(program)?;
     let mut order = (0..program.buffers.len()).collect::<Vec<_>>();
@@ -1064,7 +1064,7 @@ fn assign_persistent_offsets(program: &mut StorageProgram) -> Result<(), Compile
 }
 
 fn persistent_source_order(
-    program: &StorageProgram,
+    program: &LoadPlan,
 ) -> Result<HashMap<BufferId, (u32, u64, u32)>, CompileError> {
     let mut order = HashMap::new();
     for instr in &program.instrs {
@@ -1112,7 +1112,7 @@ fn align_up_u64(value: u64, alignment: u64) -> Result<u64, CompileError> {
 }
 
 /// Operand-unit invariants the optimizer/ABI must preserve and the C++ executor
-/// relies on. Checked explicitly on the final program so a future rewrite fails
+/// relies on. Checked explicitly on the final plan so a future rewrite fails
 /// fast instead of silently regressing — these were previously only an implicit
 /// assumption in `assign_persistent_offsets`:
 ///   1. every persistent operand buffer base is aligned to the device target
@@ -1121,7 +1121,7 @@ fn align_up_u64(value: u64, alignment: u64) -> Result<u64, CompileError> {
 ///   3. every `CreateView` reads a single backing buffer that exists, and the
 ///      view window lies within it — i.e. packed members stay *internal* to one
 ///      backing buffer, which is what makes (1) safe for packed weights.
-fn validate_persistent_layout(program: &StorageProgram) -> Result<(), CompileError> {
+fn validate_persistent_layout(program: &LoadPlan) -> Result<(), CompileError> {
     let mut spans: Vec<(u64, u64, u32)> = Vec::new();
     for buffer in &program.buffers {
         let Some(offset) = buffer.persistent_offset else {
@@ -1178,7 +1178,7 @@ fn validate_persistent_layout(program: &StorageProgram) -> Result<(), CompileErr
     Ok(())
 }
 
-fn coalesce_persistent_arena_writes(program: &mut StorageProgram) -> Result<(), CompileError> {
+fn coalesce_persistent_arena_writes(program: &mut LoadPlan) -> Result<(), CompileError> {
     if program.schedule.is_empty() {
         return Ok(());
     }
@@ -1192,7 +1192,7 @@ fn coalesce_persistent_arena_writes(program: &mut StorageProgram) -> Result<(), 
 
         if let Some(bulk) = extent_write_as_bulk(program, instr, &blocked_buffers)? {
             if let Some(previous) = merged.last_mut()
-                && try_merge_bulk_extent_write(previous, &bulk)?
+                && try_merge_bulk_extent_write(previous, &bulk, program.target.max_tile_bytes)?
             {
                 rewrites += 1;
                 continue;
@@ -1216,7 +1216,7 @@ fn coalesce_persistent_arena_writes(program: &mut StorageProgram) -> Result<(), 
 }
 
 fn non_bulk_compatible_persistent_write_buffers(
-    program: &StorageProgram,
+    program: &LoadPlan,
 ) -> Result<HashSet<BufferId>, CompileError> {
     let mut blocked = HashSet::new();
     for instr in &program.instrs {
@@ -1243,7 +1243,7 @@ fn non_bulk_compatible_persistent_write_buffers(
     Ok(blocked)
 }
 
-fn hoist_bulk_extent_writes(program: &mut StorageProgram) -> Result<(), CompileError> {
+fn hoist_bulk_extent_writes(program: &mut LoadPlan) -> Result<(), CompileError> {
     if program.schedule.len() < 2 {
         return Ok(());
     }
@@ -1265,7 +1265,12 @@ fn hoist_bulk_extent_writes(program: &mut StorageProgram) -> Result<(), CompileE
         }
     }
     result.append(&mut allocations);
-    flush_pending_bulk(&mut result, &mut pending_bulk, &mut rewrites)?;
+    flush_pending_bulk(
+        &mut result,
+        &mut pending_bulk,
+        &mut rewrites,
+        program.target.max_tile_bytes,
+    )?;
     result.append(&mut rest);
 
     rewrite_program_instrs(program, result)?;
@@ -1284,6 +1289,7 @@ fn flush_pending_bulk(
     result: &mut Vec<StorageInstr>,
     pending_bulk: &mut Vec<StorageInstr>,
     rewrites: &mut u64,
+    max_merged_bytes: u64,
 ) -> Result<(), CompileError> {
     if pending_bulk.is_empty() {
         return Ok(());
@@ -1307,7 +1313,7 @@ fn flush_pending_bulk(
     });
     for instr in pending_bulk.drain(..) {
         if let Some(previous) = result.last_mut()
-            && try_merge_bulk_extent_write(previous, &instr)?
+            && try_merge_bulk_extent_write(previous, &instr, max_merged_bytes)?
         {
             *rewrites += 1;
             continue;
@@ -1331,7 +1337,7 @@ struct SlabConfig {
     max_overread_den: u64,
 }
 
-fn build_slab_scatter_writes(program: &mut StorageProgram) -> Result<(), CompileError> {
+fn build_slab_scatter_writes(program: &mut LoadPlan) -> Result<(), CompileError> {
     if program.schedule.len() < 2 {
         return Ok(());
     }
@@ -1364,7 +1370,7 @@ fn build_slab_scatter_writes(program: &mut StorageProgram) -> Result<(), Compile
 
     rewrite_program_instrs(program, result)?;
 
-    if crate::wl_debug_enabled() {
+    if crate::planner_debug_enabled() {
         let bulk_count = old_instrs
             .iter()
             .filter(|i| matches!(i, StorageInstr::BulkExtentWrite { .. }))
@@ -1380,7 +1386,7 @@ fn build_slab_scatter_writes(program: &mut StorageProgram) -> Result<(), Compile
             .filter(|i| matches!(i, StorageInstr::BulkExtentWrite { .. }))
             .count();
         eprintln!(
-            "[pie-weight-loader] slab-scatter pass: input_bulk={bulk_count} → output_slab={slab_count} remaining_bulk={remaining_bulk} rewrites={rewrites}"
+            "[pie-load-planner] slab-scatter pass: input_bulk={bulk_count} → output_slab={slab_count} remaining_bulk={remaining_bulk} rewrites={rewrites}"
         );
 
         if slab_count == 0 && bulk_count > 0 {
@@ -1411,7 +1417,7 @@ fn build_slab_scatter_writes(program: &mut StorageProgram) -> Result<(), Compile
                     0
                 };
                 eprintln!(
-                    "[pie-weight-loader]   file={fid} entries={count} total={:.1}MiB span={:.1}MiB max_gap={:.1}MiB overread_ratio={:.2}",
+                    "[pie-load-planner]   file={fid} entries={count} total={:.1}MiB span={:.1}MiB max_gap={:.1}MiB overread_ratio={:.2}",
                     total_bytes as f64 / (1024.0 * 1024.0),
                     span as f64 / (1024.0 * 1024.0),
                     max_gap as f64 / (1024.0 * 1024.0),
@@ -1601,7 +1607,7 @@ fn emit_slab_or_bulk(
 }
 
 fn extent_write_as_bulk(
-    program: &StorageProgram,
+    program: &LoadPlan,
     instr: &StorageInstr,
     blocked_buffers: &HashSet<BufferId>,
 ) -> Result<Option<StorageInstr>, CompileError> {
@@ -1655,6 +1661,7 @@ fn extent_write_as_bulk(
 fn try_merge_bulk_extent_write(
     previous: &mut StorageInstr,
     current: &StorageInstr,
+    max_merged_bytes: u64,
 ) -> Result<bool, CompileError> {
     let (
         StorageInstr::BulkExtentWrite {
@@ -1695,6 +1702,9 @@ fn try_merge_bulk_extent_write(
         .span_bytes
         .checked_add(cur_source.span_bytes)
         .ok_or_else(|| CompileError::InvalidInput("merged bulk extent overflow".to_string()))?;
+    if max_merged_bytes != 0 && span_bytes > max_merged_bytes {
+        return Ok(false);
+    }
     prev_source.file_offset = prev_source_start;
     prev_source.span_bytes = span_bytes;
     prev_source.stride = byte_extent(span_bytes);
@@ -1718,7 +1728,7 @@ fn compact_extent_for_copy(extent: &StridedExtent) -> bool {
     true
 }
 
-fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError> {
+fn validate_target_support(program: &LoadPlan) -> Result<(), CompileError> {
     for instr in &program.instrs {
         let StorageInstr::TileMap {
             kind, transform, ..
@@ -1726,37 +1736,27 @@ fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError>
         else {
             continue;
         };
-        let supported = match program.target.backend {
-            BackendKind::Unknown => true,
-            BackendKind::Metal => {
-                matches!(
-                    kind,
-                    TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder
-                )
-            }
-            BackendKind::Cuda => {
-                matches!(
-                    kind,
-                    TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder
-                ) || (*kind == TileMapKind::Encode
-                    && matches!(
-                        transform.to,
-                        Some(
-                            QuantScheme::Fp8E4M3
-                                | QuantScheme::Int8Symmetric
-                                | QuantScheme::Mxfp4E2M1E8M0
-                        )
-                    ))
-                    || (*kind == TileMapKind::Repack
-                        && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
-                            || (program.target.native_mxfp4_moe
-                                && matches!(
-                                    transform.repack.layout,
-                                    RepackLayout::MarlinMxfp4Weight
-                                        | RepackLayout::MarlinMxfp4Scale
-                                ))))
-            }
-        };
+        let advertised = program.target.tile_map_mask & kind.capability_bit() != 0;
+        let supported = advertised
+            && (matches!(
+                kind,
+                TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder
+            ) || (*kind == TileMapKind::Encode
+                && matches!(
+                    transform.to,
+                    Some(
+                        QuantScheme::Fp8E4M3
+                            | QuantScheme::Int8Symmetric
+                            | QuantScheme::Mxfp4E2M1E8M0
+                    )
+                ))
+                || (*kind == TileMapKind::Repack
+                    && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
+                        || (program.target.native_mxfp4_moe
+                            && matches!(
+                                transform.repack.layout,
+                                RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale
+                            )))));
         if !supported {
             return Err(CompileError::InvalidInput(format!(
                 "{:?} target does not support {:?} TileMap ({:?}->{:?})",
@@ -1767,7 +1767,7 @@ fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError>
     Ok(())
 }
 
-fn merge_adjacent_extent_writes(program: &mut StorageProgram) -> Result<(), CompileError> {
+fn merge_adjacent_extent_writes(program: &mut LoadPlan) -> Result<(), CompileError> {
     if program.schedule.len() < 2 {
         return Ok(());
     }
@@ -1801,7 +1801,7 @@ fn merge_adjacent_extent_writes(program: &mut StorageProgram) -> Result<(), Comp
 }
 
 fn rewrite_program_instrs(
-    program: &mut StorageProgram,
+    program: &mut LoadPlan,
     merged: Vec<StorageInstr>,
 ) -> Result<(), CompileError> {
     program.instrs.clear();
@@ -2048,7 +2048,7 @@ fn narrow_repack_source(
     Ok((source, narrowed))
 }
 
-fn buffer_bytes(program: &StorageProgram, id: BufferId) -> Result<u64, CompileError> {
+fn buffer_bytes(program: &LoadPlan, id: BufferId) -> Result<u64, CompileError> {
     program
         .buffers
         .get(id.0 as usize)
@@ -2317,6 +2317,7 @@ fn dtype_to_quant_marker(dtype: DType) -> QuantScheme {
 #[cfg(test)]
 mod persistent_layout_tests {
     use super::*;
+    use crate::types::FileId;
 
     fn operand(id: u32, bytes: u64, alignment: u32, offset: Option<u64>) -> BufferDecl {
         BufferDecl {
@@ -2329,8 +2330,8 @@ mod persistent_layout_tests {
         }
     }
 
-    fn program_with(buffers: Vec<BufferDecl>) -> StorageProgram {
-        let mut p = StorageProgram::empty(StorageTarget {
+    fn program_with(buffers: Vec<BufferDecl>) -> LoadPlan {
+        let mut p = LoadPlan::empty(StorageTarget {
             preferred_alignment: 256,
             ..StorageTarget::default()
         });
@@ -2388,5 +2389,52 @@ mod persistent_layout_tests {
         });
         // window [32, 96) escapes the 64-byte backing buffer.
         assert!(validate_persistent_layout(&p).is_err());
+    }
+
+    #[test]
+    fn bulk_merge_respects_target_tile_bound() {
+        let make = |id, file_offset, dest_offset| StorageInstr::BulkExtentWrite {
+            id: InstrId(id),
+            source: SourceExtent {
+                file_id: FileId(0),
+                tensor_id: TensorId(id),
+                file_offset,
+                span_bytes: 8,
+                stride: byte_extent(8),
+            },
+            dest_offset,
+        };
+        let mut first = make(0, 0, 0);
+        let second = make(1, 8, 8);
+        assert!(!try_merge_bulk_extent_write(&mut first, &second, 8).unwrap());
+        assert!(try_merge_bulk_extent_write(&mut first, &second, 16).unwrap());
+    }
+
+    #[test]
+    fn target_transform_matrix_matches_host_and_metal_executors() {
+        let tile = |kind| StorageInstr::TileMap {
+            id: InstrId(0),
+            kind,
+            source: None,
+            dest: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            tile: TileSpec { max_tile_bytes: 1 },
+            transform: TransformSpec::default(),
+        };
+
+        let mut host = LoadPlan::empty(StorageTarget::default());
+        host.instrs.push(tile(TileMapKind::Cast));
+        assert!(validate_target_support(&host).is_ok());
+        host.instrs[0] = tile(TileMapKind::Reorder);
+        assert!(validate_target_support(&host).is_err());
+
+        let mut metal = LoadPlan::empty(StorageTarget {
+            backend: crate::types::BackendKind::Metal,
+            tile_map_mask: crate::load_plan::METAL_TILE_MAP_MASK,
+            ..StorageTarget::default()
+        });
+        metal.instrs.push(tile(TileMapKind::Cast));
+        assert!(validate_target_support(&metal).is_err());
     }
 }

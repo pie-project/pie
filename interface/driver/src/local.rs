@@ -15,7 +15,7 @@ use std::fmt;
 /// Current direct local ABI version.
 ///
 /// v4: driver creation reports device facts only; model loading is a separate,
-/// blocking `*_load_model` call carrying mandatory StorageProgram bytes.
+/// blocking `*_load_model` call carrying mandatory LoadPlan bytes.
 pub const PIE_DRIVER_ABI_VERSION: u32 = 4;
 
 /// Success.
@@ -391,8 +391,8 @@ pub struct PieModelLoadDesc {
     pub reserved0: u32,
     /// Compiler source hash expected by this runtime.
     pub compiler_version: u64,
-    /// Serialized, versioned StorageProgram. Empty programs are invalid.
-    pub program_bytes: PieBytes,
+    /// Serialized, versioned LoadPlan. Empty plans are invalid.
+    pub load_plan_bytes: PieBytes,
     /// UTF-8 path to the driver-local checkpoint payload root.
     pub snapshot_dir: PieBytes,
 }
@@ -403,7 +403,7 @@ impl Default for PieModelLoadDesc {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
             compiler_version: 0,
-            program_bytes: PieBytes::default(),
+            load_plan_bytes: PieBytes::default(),
             snapshot_dir: PieBytes::default(),
         }
     }
@@ -998,16 +998,16 @@ pub fn validate_model_load_desc(desc: &PieModelLoadDesc) -> PieAbiValidationResu
     validate_pie_abi_version(desc.abi_version)?;
     validate_reserved_zero("model load reserved0 must be zero", desc.reserved0)?;
     validate_bytes(
-        desc.program_bytes,
-        "model load program_bytes ptr/len mismatch",
+        desc.load_plan_bytes,
+        "model load load_plan_bytes ptr/len mismatch",
     )?;
     validate_bytes(
         desc.snapshot_dir,
         "model load snapshot_dir ptr/len mismatch",
     )?;
-    if desc.program_bytes.len == 0 {
+    if desc.load_plan_bytes.len == 0 {
         return Err(invalid_argument(
-            "model load requires non-empty program_bytes",
+            "model load requires non-empty load_plan_bytes",
         ));
     }
     if desc.compiler_version == 0 {
@@ -2029,7 +2029,7 @@ mod tests {
         assert!(validate_model_load_desc(&desc).is_err());
         let program = [1u8];
         let snapshot = b"/tmp/model";
-        desc.program_bytes = PieBytes {
+        desc.load_plan_bytes = PieBytes {
             ptr: program.as_ptr(),
             len: program.len(),
         };
@@ -2325,7 +2325,7 @@ mod tests {
         assert!(runtime.contains("uint32_t reserved0;"));
         assert!(runtime.contains("PieRuntimeNotifyFn notify;"));
         assert!(create.contains("uint32_t reserved0;"));
-        assert!(load.contains("struct PieBytes program_bytes;"));
+        assert!(load.contains("struct PieBytes load_plan_bytes;"));
         assert!(load.contains("struct PieBytes snapshot_dir;"));
         assert!(load.contains("uint64_t compiler_version;"));
         assert!(program.contains("uint64_t program_hash;"));

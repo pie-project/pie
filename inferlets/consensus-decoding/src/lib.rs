@@ -43,10 +43,6 @@ You are a helpful assistant that solves problems step by step. \
 Show your reasoning, then give your final answer on the last line \
 in the format: Final Answer: <answer>";
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 fn decode_text(tokens: &[u32]) -> Result<String> {
     if tokens.is_empty() {
         return Ok(String::new());
@@ -94,48 +90,48 @@ async fn main(input: Input) -> Result<String> {
 
     if max_tokens > 0 {
         // Shared logical page pool: prefix + all candidates' appends.
-        let pool_pages = (n + b * max_tokens as u32 + 2 + PAGE_T - 1) / PAGE_T;
+        let pool_pages = (n + b * max_tokens as u32 + 2).div_ceil(PAGE_T);
         let pool = pool_pages * PAGE_T;
-        let ws: &'static WorkingSet = bx(WorkingSet::new());
+        let ws = WorkingSet::new();
         let slots = ws
             .reserve(pool_pages)
             .map_err(|e| format!("ws.reserve: {e}"))?;
-        let pool_ids: &'static Vec<u32> = bx(slots.ids().to_vec());
+        let pool_ids = slots.ids().to_vec();
 
         // ─────────────── 1. SHARED-PREFIX PREFILL FIRE (N-wide) ───────────────
         // One fire writes the prefix KV cells 0..n every candidate shares, and
         // samples B INDEPENDENT first tokens off the read-out row (per-lane
         // Gumbel noise over the shared nucleus keep-mask).
         let prefix_i32: Vec<i32> = prefix.iter().map(|&t| t as i32).collect();
-        let toks_p = bx(Channel::from(prefix_i32).named("toks_p")); // [N] i32 (seeded)
+        let toks_p = Channel::from(prefix_i32).named("toks_p"); // [N] i32 (seeded)
         let embed_indptr_p = Tensor::constant(vec![0u32, n]); // qo_indptr [0,N]
 
         // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
         let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
         let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
-        let w_slot_p = bx(Channel::from(w_slot_pv).named("w_slot_p"));
-        let w_off_p = bx(Channel::from(w_off_pv).named("w_off_p"));
-        let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
-        let pages_p = bx(Channel::from(pool_ids.clone()).named("pages_p"));
-        let page_indptr_p = bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p"));
+        let w_slot_p = Channel::from(w_slot_pv).named("w_slot_p");
+        let w_off_p = Channel::from(w_off_pv).named("w_off_p");
+        let klen_p = Channel::from(vec![n; 1]).named("klen_p");
+        let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
+        let page_indptr_p = Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p");
 
         // Causal prefill mask [N, POOL]: query row i attends KV cols j <= i.
         let mask_pv: Vec<bool> = (0..n)
             .flat_map(|i| (0..pool).map(move |j| j <= i))
             .collect();
-        let mask_p = bx(Channel::from_shaped([n, pool], mask_pv).named("mask_p"));
-        let rng_p = bx(Channel::from(vec![0x51ed_u32, 0]).named("rng_p"));
-        let g0s_ch = bx(Channel::new([b], dtype::i32).named("g0s"));
+        let mask_p = Channel::from_shaped([n, pool], mask_pv).named("mask_p");
+        let rng_p = Channel::from(vec![0x51ed_u32, 0]).named("rng_p");
+        let g0s_ch = Channel::new([b], dtype::i32).named("g0s");
 
-        let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
-        fwd_p.embed(toks_p, embed_indptr_p);
-        fwd_p.attn_working_set(ws, klen_p);
-        fwd_p.port_channel(Port::Pages, pages_p);
-        fwd_p.port_channel(Port::PageIndptr, page_indptr_p);
-        fwd_p.port_channel(Port::WSlot, w_slot_p);
-        fwd_p.port_channel(Port::WOff, w_off_p);
-        fwd_p.attn_mask(mask_p);
-        fwd_p.epilogue(move || {
+        let fwd_p = ForwardPass::new();
+        fwd_p.embed(&toks_p, embed_indptr_p);
+        fwd_p.attn_working_set(&ws, &klen_p);
+        fwd_p.port_channel(Port::Pages, &pages_p);
+        fwd_p.port_channel(Port::PageIndptr, &page_indptr_p);
+        fwd_p.port_channel(Port::WSlot, &w_slot_p);
+        fwd_p.port_channel(Port::WOff, &w_off_p);
+        fwd_p.attn_mask(&mask_p);
+        fwd_p.epilogue(|| {
             let r = rng_p.take();
             // Shared nucleus keep-mask over the read-out row, then B independent
             // Gumbel draws → B distinct first tokens.
@@ -177,40 +173,40 @@ async fn main(input: Input) -> Result<String> {
         // position n + step and appends its KV at flat pool cell fill + c. All
         // lanes share the pool pages; each lane's mask row admits the shared
         // prefix plus its own cells only.
-        let tok_in = bx(Channel::from(g0s.clone()).named("tok_in")); // [B] device loop-carried
-        let pos = bx(Channel::from(vec![n; num_candidates]).named("pos"));
-        let fill = bx(Channel::from(vec![n + b; 1]).named("fill")); // next free flat cell
-        let klen = bx(Channel::from(vec![n + b; num_candidates]).named("klen"));
+        let tok_in = Channel::from(g0s.clone()).named("tok_in"); // [B] device loop-carried
+        let pos = Channel::from(vec![n; num_candidates]).named("pos");
+        let fill = Channel::from(vec![n + b; 1]).named("fill"); // next free flat cell
+        let klen = Channel::from(vec![n + b; num_candidates]).named("klen");
         let w_slot_v: Vec<u32> = (0..b)
             .map(|c| pool_ids[((n + c) / PAGE_T) as usize])
             .collect();
         let w_off_v: Vec<u32> = (0..b).map(|c| (n + c) % PAGE_T).collect();
-        let w_slot = bx(Channel::from(w_slot_v).named("w_slot"));
-        let w_off = bx(Channel::from(w_off_v).named("w_off"));
+        let w_slot = Channel::from(w_slot_v).named("w_slot");
+        let w_off = Channel::from(w_off_v).named("w_off");
         // Lane c's seed mask: the shared prefix (j < n) plus its own fire-0 cell.
         let seed_mask: Vec<bool> = (0..b)
             .flat_map(|c| (0..pool).map(move |j| j < n || j == n + c))
             .collect();
-        let mask = bx(Channel::from_shaped([b, pool], seed_mask).named("mask"));
+        let mask = Channel::from_shaped([b, pool], seed_mask).named("mask");
         let tiled: Vec<u32> = (0..b).flat_map(|_| pool_ids.iter().copied()).collect();
-        let pages = bx(Channel::from(tiled).named("pages")); // [B*POOL_PAGES]
+        let pages = Channel::from(tiled).named("pages"); // [B*POOL_PAGES]
         let pidx_v: Vec<u32> = (0..=b).map(|c| c * pool_pages).collect();
-        let page_indptr = bx(Channel::from_shaped([b + 1], pidx_v).named("page_indptr"));
-        let pool_ids_ch = bx(Channel::new([pool_pages], dtype::u32).named("pool_ids"));
-        let out = bx(Channel::new([b], dtype::i32).named("out"));
-        let rng = bx(Channel::from(vec![0x9e37_u32, 0]).named("rng"));
+        let page_indptr = Channel::from_shaped([b + 1], pidx_v).named("page_indptr");
+        let pool_ids_ch = Channel::new([pool_pages], dtype::u32).named("pool_ids");
+        let out = Channel::new([b], dtype::i32).named("out");
+        let rng = Channel::from(vec![0x9e37_u32, 0]).named("rng");
         let lanes = Tensor::constant((0..=b).collect::<Vec<u32>>()); // qo_indptr [0..=B]
 
-        let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-        fwd.embed(tok_in, lanes);
-        fwd.positions(pos);
-        fwd.attn_working_set(ws, klen);
-        fwd.port_channel(Port::Pages, pages);
-        fwd.port_channel(Port::PageIndptr, page_indptr);
-        fwd.port_channel(Port::WSlot, w_slot);
-        fwd.port_channel(Port::WOff, w_off);
-        fwd.attn_mask(mask);
-        fwd.epilogue(move || {
+        let fwd = ForwardPass::new();
+        fwd.embed(&tok_in, lanes);
+        fwd.positions(&pos);
+        fwd.attn_working_set(&ws, &klen);
+        fwd.port_channel(Port::Pages, &pages);
+        fwd.port_channel(Port::PageIndptr, &page_indptr);
+        fwd.port_channel(Port::WSlot, &w_slot);
+        fwd.port_channel(Port::WOff, &w_off);
+        fwd.attn_mask(&mask);
+        fwd.epilogue(|| {
             // TAKES + compute first, PUTS last (value-id discipline).
             let base = fill.take().tensor(); // [1] u32 — next fire's first append cell
             let pids = pool_ids_ch.take();
@@ -238,7 +234,7 @@ async fn main(input: Input) -> Result<String> {
             let new_mask = or(mask.take(), eq(col, wpos_c)); // [B, POOL]
 
             // Explicit write descriptor via the host-fed pool ids.
-            let w_slot_n = gather(&pids, &div(&wpos, PAGE_T)); // [B]
+            let w_slot_n = gather(&pids, div(&wpos, PAGE_T)); // [B]
             let w_off_n = rem(&wpos, PAGE_T); // [B]
             let filled = add(&base, b); // [1] span after the next fire's appends
             let klen_n = broadcast(reshape(&filled, [1]), [b]);
@@ -247,7 +243,7 @@ async fn main(input: Input) -> Result<String> {
                 broadcast(reshape(&pids, [1, pool_pages]), [b, pool_pages]),
                 [b * pool_pages],
             );
-            let pidx_n = mul(&iota(b + 1), pool_pages);
+            let pidx_n = mul(iota(b + 1), pool_pages);
 
             tok_in.put(&toks);
             out.put(&toks);

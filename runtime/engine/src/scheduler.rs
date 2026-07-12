@@ -231,11 +231,13 @@ pub async fn spawn(
 pub struct PreparedLaunch {
     pub page_refs: Vec<crate::store::kv::project::PhysicalPageId>,
     pub last_page_len: u32,
+    pub kv_translation_version: u64,
     pub copy_src: Vec<u32>,
     pub copy_dst: Vec<u32>,
 }
 
 pub enum LaunchPreparationError {
+    Blocked(String),
     Retry(String),
     Failed(String),
 }
@@ -291,6 +293,39 @@ pub fn submit_async_deferred(
         preparation,
         retry_classifier,
     )
+}
+
+pub(crate) fn nudge(driver_idx: usize) {
+    if let Ok(handle) = scheduler_handle(driver_idx) {
+        let _ = handle.nudge();
+    }
+}
+
+pub(crate) fn freeze_pipeline(pid: ProcessId) -> Result<()> {
+    let handles: Vec<_> = handle_registry()
+        .read()
+        .unwrap()
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    for handle in handles {
+        handle.freeze_pipeline(pid)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn resume_pipeline(pid: ProcessId) {
+    let handles: Vec<_> = handle_registry()
+        .read()
+        .unwrap()
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    for handle in handles {
+        let _ = handle.resume_pipeline(pid);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

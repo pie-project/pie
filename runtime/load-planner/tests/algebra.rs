@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use pie_weight_loader::ir::{LayoutExpr, LayoutPlan};
-use pie_weight_loader::optimizer::optimize;
-use pie_weight_loader::reference::{TensorValue, evaluate};
-use pie_weight_loader::typecheck::typecheck;
-use pie_weight_loader::types::{
+use pie_load_planner::ir::{LayoutExpr, LayoutPlan};
+use pie_load_planner::optimizer::optimize;
+use pie_load_planner::reference::{TensorValue, evaluate};
+use pie_load_planner::typecheck::typecheck;
+use pie_load_planner::types::{
     Axis, DType, Encoding, ExprId, Layout, QuantScheme, QuantSpec, Sharding, TensorDecl, TensorId,
 };
 

@@ -54,6 +54,80 @@ use pie_ptir::container::HostRole;
 pub type PendingFires = Arc<Mutex<VecDeque<PendingOp>>>;
 pub type PipelineFailure = Arc<Mutex<Option<String>>>;
 
+#[derive(Clone)]
+struct AcquireCancellation {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl AcquireCancellation {
+    async fn cancelled(&self) {
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+struct AcquireOwner {
+    cancellation: AcquireCancellation,
+}
+
+impl AcquireOwner {
+    fn new() -> Self {
+        Self {
+            cancellation: AcquireCancellation {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                notify: Arc::new(tokio::sync::Notify::new()),
+            },
+        }
+    }
+
+    fn cancellation(&self) -> AcquireCancellation {
+        self.cancellation.clone()
+    }
+}
+
+impl Drop for AcquireOwner {
+    fn drop(&mut self) {
+        self.cancellation.cancelled.store(true, Ordering::Release);
+        self.cancellation.notify.notify_waiters();
+    }
+}
+
+fn reclaimable_probe(
+    model: usize,
+    driver: usize,
+    process_id: uuid::Uuid,
+    working_sets: std::collections::HashSet<crate::store::kv::page_table::WorkingSetId>,
+) -> crate::store::reclaim::ReclaimableProbe {
+    Arc::new(move || {
+        let stores = crate::store::registry::get(model, driver);
+        match stores
+            .kv
+            .lock()
+            .unwrap()
+            .post_drain_reclaimable_page_count(&working_sets)
+        {
+            Ok(pages) => pages > 0,
+            Err(error) => {
+                tracing::warn!(
+                    pid = %process_id,
+                    %error,
+                    "failed to refresh KV reclaimability"
+                );
+                false
+            }
+        }
+    })
+}
+
 /// A pipeline FIFO entry: a forward FIRE or a KV cell MOVE (Design-B
 /// compaction). Both hold an ordered slot on the same stream — the B3
 /// happens-before invariant; `take`/`read` drain them in submit order.
@@ -84,7 +158,35 @@ impl PendingOp {
     fn request_cancel(&self) {
         if let PendingOp::Fire(fire) = self {
             fire.completion.request_cancel();
+            crate::scheduler::nudge(0);
         }
+    }
+
+    pub(crate) fn is_preemption_safe_unprepared(&self) -> bool {
+        matches!(
+            self,
+            PendingOp::Fire(PendingFire {
+                kv: FireKv::Deferred(slot),
+                ..
+            }) if slot.lock().unwrap().is_none()
+        )
+    }
+
+    pub(crate) fn is_preemption_detachable(&self) -> bool {
+        matches!(
+            self,
+            PendingOp::Move(_)
+                | PendingOp::Fire(PendingFire {
+                    kv: FireKv::Deferred(_),
+                    ..
+                })
+        )
+    }
+
+    pub(crate) fn preemption_signal(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(self.completion_signal())
     }
 }
 
@@ -361,6 +463,7 @@ pub async fn submit_pass<C: FireContext>(
         let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.driver as usize);
         let pid = ctx.process_id();
+        let process_working_sets = ctx.kv_working_sets();
         if let Err(owner) = ws.claim_pipeline_scope(pid.as_u128()) {
             return Ok(Err(format!(
                 "pipeline: KV working set is already scoped to pipeline {owner:032x}"
@@ -547,29 +650,135 @@ pub async fn submit_pass<C: FireContext>(
         let mut deferred_new_tokens = Some(new_tokens);
         let mut deferred_hash_tokens = Some(hash_tokens);
         let acquire_started = Arc::new(AtomicBool::new(false));
-        let acquire_result = Arc::new(Mutex::new(None::<Result<(), String>>));
+        let acquire_result = Arc::new(Mutex::new(
+            None::<Result<crate::store::reclaim::Acquired, String>>,
+        ));
+        let self_suspend_wait = Arc::new(AtomicBool::new(false));
+        let acquire_owner = AcquireOwner::new();
         let runtime = tokio::runtime::Handle::current();
         let preparation: crate::scheduler::LaunchPreparation = Box::new(move |request| {
+            if let Some(orchestrator) = crate::store::reclaim::contention()
+                && !orchestrator.is_running(pid)
+            {
+                if orchestrator.is_registered(pid) {
+                    return Err(crate::scheduler::LaunchPreparationError::Blocked(
+                        "pipeline is quiesced for KV suspension".to_string(),
+                    ));
+                }
+                return Err(crate::scheduler::LaunchPreparationError::Failed(
+                    "pipeline terminated during KV preparation".to_string(),
+                ));
+            }
             let new_tokens = deferred_new_tokens
                 .as_ref()
                 .expect("dispatch preparation payload remains live");
             let hash_tokens = deferred_hash_tokens
                 .as_ref()
                 .expect("dispatch preparation hash payload remains live");
+            if self_suspend_wait.load(Ordering::Acquire) {
+                if crate::store::reclaim::contention()
+                    .is_some_and(|orchestrator| orchestrator.is_running(pid))
+                {
+                    self_suspend_wait.store(false, Ordering::Release);
+                } else {
+                    return Err(crate::scheduler::LaunchPreparationError::Blocked(
+                        "KV requester is self-suspended".to_string(),
+                    ));
+                }
+            }
+            let grant = match acquire_result.lock().unwrap().take() {
+                Some(Ok(crate::store::reclaim::Acquired::Granted(grant))) => {
+                    acquire_started.store(false, Ordering::Release);
+                    Some(grant.into_pages())
+                }
+                Some(Ok(crate::store::reclaim::Acquired::SelfSuspendFirst)) => {
+                    acquire_started.store(false, Ordering::Release);
+                    self_suspend_wait.store(true, Ordering::Release);
+                    return Err(crate::scheduler::LaunchPreparationError::Blocked(
+                        "KV requester must self-suspend".to_string(),
+                    ));
+                }
+                Some(Err(error)) => {
+                    acquire_started.store(false, Ordering::Release);
+                    return Err(crate::scheduler::LaunchPreparationError::Failed(format!(
+                        "pipeline: KV contention: {error}"
+                    )));
+                }
+                None => None,
+            };
             let stores = crate::store::registry::get(model, driver);
+            if grant.is_none()
+                && let Some(orchestrator) = crate::store::reclaim::contention()
+                && orchestrator.allocation_requires_grant()
+            {
+                let requested = {
+                    let mut kv_store = stores.kv.lock().unwrap();
+                    kv::required_pages(
+                        &mut kv_store,
+                        ws_id,
+                        committed_tokens,
+                        new_tokens.len() as u32,
+                        page_size,
+                    )
+                    .map_err(|error| {
+                        crate::scheduler::LaunchPreparationError::Failed(format!(
+                            "pipeline: KV grant sizing: {error}"
+                        ))
+                    })?
+                };
+                if requested > 0 && !acquire_started.swap(true, Ordering::AcqRel) {
+                    let reclaimable =
+                        reclaimable_probe(model, driver, pid, process_working_sets.clone());
+                    let result = acquire_result.clone();
+                    let cancellation = acquire_owner.cancellation();
+                    runtime.spawn(async move {
+                        let acquire = orchestrator.acquire_or_self_suspend_live(
+                            pid,
+                            requested as u32,
+                            reclaimable,
+                        );
+                        tokio::pin!(acquire);
+                        tokio::select! {
+                            outcome = &mut acquire => {
+                                *result.lock().unwrap() =
+                                    Some(outcome.map_err(|error| error.to_string()));
+                                crate::scheduler::nudge(driver);
+                            }
+                            _ = cancellation.cancelled() => {}
+                        }
+                    });
+                }
+                if requested > 0 {
+                    return Err(crate::scheduler::LaunchPreparationError::Blocked(
+                        "KV allocation waits for an older grant".to_string(),
+                    ));
+                }
+            }
             let prepared = {
                 let mut kv_store = stores.kv.lock().unwrap();
-                kv::prepare(
-                    &mut kv_store,
-                    ws_id,
-                    committed_tokens,
-                    new_tokens,
-                    page_size,
-                    hash_tokens.as_deref(),
-                )
+                match grant {
+                    Some(granted) => kv::prepare_granted(
+                        &mut kv_store,
+                        ws_id,
+                        committed_tokens,
+                        new_tokens,
+                        page_size,
+                        hash_tokens.as_deref(),
+                        granted,
+                    ),
+                    None => kv::prepare(
+                        &mut kv_store,
+                        ws_id,
+                        committed_tokens,
+                        new_tokens,
+                        page_size,
+                        hash_tokens.as_deref(),
+                    ),
+                }
             };
             match prepared {
                 Ok((projection, (copy_src, copy_dst), translation, txn)) => {
+                    let translation_version = txn.mapping_version();
                     request.kv_translation = translation;
                     *deferred_slot.lock().unwrap() = Some(txn);
                     deferred_new_tokens.take();
@@ -577,6 +786,7 @@ pub async fn submit_pass<C: FireContext>(
                     Ok(crate::scheduler::PreparedLaunch {
                         page_refs: (0..projection.physical_page_ids.len() as u32).collect(),
                         last_page_len: projection.last_page_len,
+                        kv_translation_version: translation_version,
                         copy_src,
                         copy_dst,
                     })
@@ -590,23 +800,31 @@ pub async fn submit_pass<C: FireContext>(
                     if reclaimed == 0
                         && let Some(orchestrator) = crate::store::reclaim::contention()
                     {
-                        if let Some(result) = acquire_result.lock().unwrap().take() {
-                            acquire_started.store(false, Ordering::Release);
-                            if let Err(error) = result {
-                                return Err(crate::scheduler::LaunchPreparationError::Failed(
-                                    format!("pipeline: KV contention: {error}"),
-                                ));
-                            }
-                        } else if !acquire_started.swap(true, Ordering::AcqRel) {
+                        if !acquire_started.swap(true, Ordering::AcqRel) {
+                            let reclaimable =
+                                reclaimable_probe(model, driver, pid, process_working_sets.clone());
                             let result = acquire_result.clone();
+                            let cancellation = acquire_owner.cancellation();
                             runtime.spawn(async move {
-                                let outcome = orchestrator
-                                    .acquire(pid, requested as u32)
-                                    .await
-                                    .map_err(|error| error.to_string());
-                                *result.lock().unwrap() = Some(outcome);
+                                let acquire = orchestrator.acquire_or_self_suspend_live(
+                                    pid,
+                                    requested as u32,
+                                    reclaimable,
+                                );
+                                tokio::pin!(acquire);
+                                tokio::select! {
+                                    outcome = &mut acquire => {
+                                        *result.lock().unwrap() =
+                                            Some(outcome.map_err(|error| error.to_string()));
+                                        crate::scheduler::nudge(driver);
+                                    }
+                                    _ = cancellation.cancelled() => {}
+                                }
                             });
                         }
+                        return Err(crate::scheduler::LaunchPreparationError::Blocked(
+                            "KV pages unavailable at dispatch".to_string(),
+                        ));
                     }
                     Err(crate::scheduler::LaunchPreparationError::Retry(
                         "KV pages unavailable at dispatch".to_string(),
@@ -912,6 +1130,73 @@ pub async fn finalize_op<C: FireContext>(ctx: &mut C, op: PendingOp) -> Anyhow<(
     }
 }
 
+/// Finalize an ordinary host-geometry op without a `ResourceTable` borrow.
+/// Used by accessor-based long host awaits after the scheduler freeze barrier.
+/// Device-geometry fires are excluded because their lease reclamation lives on
+/// the `ForwardPass` resource and still requires `FireContext`.
+pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
+    match op {
+        PendingOp::Move(mv) => {
+            if let Err(error) = mv.completion.await {
+                let reason = format!("pipeline kv-move (copy_into) failed: {error:#}");
+                let mut failure = mv.failure.lock().unwrap();
+                if failure.is_none() {
+                    *failure = Some(reason.clone());
+                }
+                tracing::warn!("{reason}");
+            }
+            Ok(())
+        }
+        PendingOp::Fire(fire) => {
+            let PendingFire {
+                completion,
+                kv,
+                rstxn,
+                ws_guard,
+                ws_rep: _,
+                rs_rep: _,
+                fwd_rep: _,
+                instance_id: _,
+                cells,
+                failure,
+            } = fire;
+            let FireKv::Deferred(slot) = kv else {
+                unreachable!("device-geometry fires require FireContext finalization");
+            };
+            let prior_failure = failure.lock().unwrap().clone();
+            let result = completion.await;
+            let success = result.is_ok() && prior_failure.is_none();
+            let stores = crate::store::registry::get(0, 0);
+            if let Some(kvtxn) = slot.lock().unwrap().take() {
+                let mut kv_store = stores.kv.lock().unwrap();
+                let _ = kv::finalize(&mut kv_store, kvtxn, success);
+            }
+            if let Some(rstxn) = rstxn {
+                let mut rs_store = stores.rs.lock().unwrap();
+                let _ = rs::finalize(&mut rs_store, rstxn, success);
+            }
+            if let Some(orchestrator) = crate::store::reclaim::contention() {
+                orchestrator.on_blocks_freed();
+                orchestrator.on_fire_retired();
+            }
+            let reason = prior_failure.or_else(|| {
+                result
+                    .err()
+                    .map(|error| format!("pipeline: forward failed: {error:#}"))
+            });
+            if let Some(reason) = reason {
+                poison_readers(&cells, &reason);
+                let mut domain = failure.lock().unwrap();
+                if domain.is_none() {
+                    *domain = Some(reason);
+                }
+            }
+            drop(ws_guard);
+            Ok(())
+        }
+    }
+}
+
 /// Resolve one in-flight fire: await the payload-free callback, finalize the
 /// KV/RS txns, and expose the release-published mirror tails. Values remain
 /// in driver-owned channel memory until `channel.take` or `channel.read`.
@@ -1063,6 +1348,7 @@ async fn fire_device_geometry<C: FireContext>(
         cells,
         fwd_rep,
         kvtxn,
+        kv_translation_version,
         kv_translation,
         wire_pages,
         copy_src,
@@ -1102,7 +1388,63 @@ async fn fire_device_geometry<C: FireContext>(
                     .unwrap_or(0)
             })
         };
+        let mut allocation_grant: Option<crate::store::reclaim::AllocationGrant> = None;
         let (pages, (copy_src, copy_dst), kv_translation, kvtxn) = loop {
+            if allocation_grant.is_none()
+                && let Some(orchestrator) = crate::store::reclaim::contention()
+                && orchestrator.allocation_requires_grant()
+            {
+                let required = (|| -> Result<usize, kv::KvError> {
+                    let mut kv_store = stores.kv.lock().unwrap();
+                    let mapped = kv_store
+                        .visible_mapped_len(ws.id)
+                        .map_err(kv::KvError::from)?;
+                    let mut write_indexes: Vec<u64> =
+                        grant_slots.iter().map(|&slot| u64::from(slot)).collect();
+                    if let Some(max_fresh) =
+                        write_indexes.iter().copied().filter(|&i| i >= mapped).max()
+                    {
+                        write_indexes.extend(mapped..max_fresh);
+                    }
+                    write_indexes.sort_unstable();
+                    write_indexes.dedup();
+                    kv_store
+                        .required_pages(ws.id, &write_indexes)
+                        .map_err(kv::KvError::from)
+                })();
+                let required = match required {
+                    Ok(required) => required,
+                    Err(error) => {
+                        ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+                        return Ok(Err(format!(
+                            "pipeline: device-geometry grant sizing: {error}"
+                        )));
+                    }
+                };
+                if required > 0 {
+                    let reclaimable =
+                        reclaimable_probe(ws.model, ws.driver as usize, pid, ctx.kv_working_sets());
+                    match orchestrator
+                        .acquire_or_self_suspend_live(pid, required as u32, reclaimable)
+                        .await
+                    {
+                        Ok(crate::store::reclaim::Acquired::Granted(grant)) => {
+                            allocation_grant = Some(grant);
+                        }
+                        Ok(crate::store::reclaim::Acquired::SelfSuspendFirst) => {
+                            if let Err(error) = ctx.honor_preemption().await {
+                                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+                                return Err(error);
+                            }
+                        }
+                        Err(error) => {
+                            ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+                            return Ok(Err(format!("pipeline: device-geometry grant: {error}")));
+                        }
+                    }
+                    continue;
+                }
+            }
             let prepared = (|| {
                 let mut kv_store = stores.kv.lock().unwrap();
                 // One prepared write covers the grants plus any unwritten
@@ -1121,7 +1463,15 @@ async fn fire_device_geometry<C: FireContext>(
                 }
                 write_indexes.sort_unstable();
                 write_indexes.dedup();
-                kv::prepare_explicit(&mut kv_store, ws.id, &write_indexes)
+                match allocation_grant.take() {
+                    Some(grant) => kv::prepare_explicit_granted(
+                        &mut kv_store,
+                        ws.id,
+                        &write_indexes,
+                        grant.into_pages(),
+                    ),
+                    None => kv::prepare_explicit(&mut kv_store, ws.id, &write_indexes),
+                }
             })(); // kv lock dropped before any contention await below
             match prepared {
                 Ok(v) => break v,
@@ -1143,9 +1493,25 @@ async fn fire_device_geometry<C: FireContext>(
                         ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
                         return Ok(Err(format!("pipeline: device-geometry grant: {e}")));
                     };
-                    if let Err(hard) = orch.acquire(pid, requested as u32).await {
-                        ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                        return Ok(Err(format!("pipeline: device-geometry grant: {hard}")));
+                    let reclaimable =
+                        reclaimable_probe(ws.model, ws.driver as usize, pid, ctx.kv_working_sets());
+                    match orch
+                        .acquire_or_self_suspend_live(pid, requested as u32, reclaimable)
+                        .await
+                    {
+                        Ok(crate::store::reclaim::Acquired::Granted(grant)) => {
+                            allocation_grant = Some(grant)
+                        }
+                        Ok(crate::store::reclaim::Acquired::SelfSuspendFirst) => {
+                            if let Err(error) = ctx.honor_preemption().await {
+                                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+                                return Err(error);
+                            }
+                        }
+                        Err(hard) => {
+                            ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+                            return Ok(Err(format!("pipeline: device-geometry grant: {hard}")));
+                        }
                     }
                 }
                 Err(e) => {
@@ -1188,12 +1554,14 @@ async fn fire_device_geometry<C: FireContext>(
         let p = ctx.resources().get_mut(&fwd)?;
         let completion = p.bound_instance.reserve_completion();
         let accesses = p.instance.program.channel_accesses.clone();
+        let kv_translation_version = kvtxn.mapping_version();
         (
             completion,
             p.bound_instance.instance_id,
             p.cells.clone(),
             fwd.rep(),
             kvtxn,
+            kv_translation_version,
             kv_translation,
             wire_pages,
             copy_src,
@@ -1205,6 +1573,7 @@ async fn fire_device_geometry<C: FireContext>(
 
     let mut req = crate::driver::LaunchPlan::default();
     req.kv_translation = kv_translation;
+    req.kv_translation_version = kv_translation_version;
     // A dense device mask (AttnMask channel) marks the fire mask-carrying;
     // the scheduler batches it SOLO (the composed multi-program batch
     // does not merge dense device masks — v1 scope).

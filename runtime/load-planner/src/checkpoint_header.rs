@@ -1,4 +1,4 @@
-//! Native Rust safetensors header parser (weight-loader Variant A).
+//! Native Rust safetensors header parser for load planning.
 //!
 //! This module reads *only* the safetensors framing — the leading 8-byte
 //! little-endian header length followed by the JSON tensor index — and never
@@ -73,7 +73,8 @@ pub fn dtype_from_safetensors(s: &str) -> Result<DType, CompileError> {
         // the storage compiler. Real gpt-oss checkpoints already declare these
         // as `U8`; the packed tags are accepted for C++ parity.
         "F4_E2M1" | "F8_E8M0" => DType::U8,
-        // 64-bit dtypes have no dense device representation here.
+        // LoadPlan v4 has no 64-bit runtime dtype or executor contract.
+        // Reject explicitly rather than narrowing checkpoint metadata.
         "F64" | "I64" | "U64" => {
             return Err(CompileError::InvalidInput(format!(
                 "safetensors 64-bit dtype {s} is unsupported by the header parser"
@@ -299,7 +300,7 @@ pub fn read_safetensors_header_prefix(path: &Path) -> Result<Vec<u8>, CompileErr
 /// `loader.tensor_names()` set before numbering
 /// (`add_checkpoint_metadata_to_rust_input`). This global ordering is
 /// load-bearing: the driver's executor indexes its `source_tensor_names` list
-/// by the program's `tensor_id`, so a per-shard ordering would mis-resolve
+/// by the plan's `tensor_id`, so a per-shard ordering would mis-resolve
 /// strided source reads on multi-shard checkpoints.
 pub fn parse_safetensors_checkpoint(files: &[PathBuf]) -> Result<CheckpointMetadata, CompileError> {
     let mut checkpoint_files = Vec::with_capacity(files.len());
@@ -453,7 +454,10 @@ mod tests {
         let mut file_bytes = prefix.clone();
         file_bytes.extend_from_slice(&[0xEEu8; 8]);
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("wl_ckpt_header_{}.safetensors", std::process::id()));
+        let path = dir.join(format!(
+            "load_planner_ckpt_header_{}.safetensors",
+            std::process::id()
+        ));
         std::fs::write(&path, &file_bytes).unwrap();
 
         let meta = parse_safetensors_checkpoint(std::slice::from_ref(&path)).unwrap();

@@ -109,8 +109,31 @@ int main() {
         InterpInstance inst = make_inst(1);
         cptir::FireGeometry fg;
         std::string err;
+        const GeometryResolveResult typed =
+            resolve_fire_geometry_typed(t, inst, 4, fg, &err);
+        expect(
+            typed.status == GeometryResolveStatus::NotReady &&
+                typed.channel == 0 && contains(err, "not yet produced") &&
+                !contains(err, "failed"),
+            "not-ready classification is typed");
+        err.clear();
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(!ok && contains(err, "not ready"), "not-ready positions channel fails resolve (" + err + ")");
+    }
+
+    // A present but malformed descriptor is permanently failed, never retryable.
+    {
+        Trace t = make_trace(1, {{kPortPositions, 0, false}});
+        InterpInstance inst = make_inst(1);
+        inst.channels[0]->queue.push_back(Value::f32({1.0f}));
+        cptir::FireGeometry fg;
+        std::string err;
+        const GeometryResolveResult typed =
+            resolve_fire_geometry_typed(t, inst, 4, fg, &err);
+        expect(
+            typed.status == GeometryResolveStatus::Failed &&
+                contains(err, "unsupported dtype"),
+            "malformed descriptor classification is permanently failed");
     }
 
     // Take-once / peek semantics: resolving is non-destructive — the actual

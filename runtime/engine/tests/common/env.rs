@@ -43,7 +43,7 @@ fn dummy_driver_backend(
     let (backend, _) = DriverBackend::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_pages as u32,
         kv_page_size: 16,
-        swap_pool_size: 0,
+        swap_pool_size: (num_pages * 4) as u32,
         vocab_size: fixture_vocab_size(),
         max_model_len: 8192,
         arch_name: "test-dummy".into(),
@@ -92,6 +92,11 @@ impl MockEnv {
             .map(|_| DriverConfig {
                 total_pages: self.num_pages,
                 cpu_pages: self.num_pages * 4,
+                kv_copy_domain_mask: pie_driver_abi::KV_COPY_DEVICE_TO_DEVICE
+                    | pie_driver_abi::KV_COPY_DEVICE_TO_HOST
+                    | pie_driver_abi::KV_COPY_HOST_TO_DEVICE
+                    | pie_driver_abi::KV_COPY_HOST_TO_HOST,
+                backend_kind: "dummy".to_string(),
                 rs_cache_required: false,
                 rs_cache_slots: 0,
                 rs_cache_slot_bytes: 0,
