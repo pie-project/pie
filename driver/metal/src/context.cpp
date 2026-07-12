@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 #include <nlohmann/json.hpp>
 #include <toml++/toml.hpp>
@@ -33,6 +35,9 @@
 #include "batch/forward.hpp"
 #include "batch/worker.hpp"
 #include "decode_abi.hpp"
+#if defined(__APPLE__)
+#include "mtl4_context.hpp"
+#endif
 
 namespace pie::metal {
 namespace {
@@ -45,7 +50,9 @@ using pipeline::InstanceRecord;
 using pipeline::ProgramRecord;
 using executor::LaunchJobData;
 using executor::LaunchMember;
-using executor::WriterConsume;
+
+enum class TicketPreparation { Ready, Retry, Failed };
+enum class MemberRunOutcome { Committed, Retry, Failed };
 
 // Directory the compiled-in default .metal kernel library resolves to
 // (driver/metal/CMakeLists.txt), overridable at run time.
@@ -328,11 +335,6 @@ std::string build_caps_json(const Config& cfg,
         {"max_model_len", max_model_len},
         {"activation_dtype", "bf16"},
         {"snapshot_dir", cfg.model.hf_path},
-        {"storage_backend", "metal"},
-        {"max_tile_bytes", 0},
-        {"preferred_alignment", 0},
-        {"mxfp4_moe_policy", ""},
-        {"native_mxfp4_moe", false},
     };
     return caps.dump();
 }
@@ -357,16 +359,62 @@ class Context::Impl {
 
     int initialize(const std::string& config_path, const PieRuntimeCallbacks& runtime) {
         cfg_ = load_config(config_path);
-        facts_ = read_model_facts(cfg_.model.hf_path);
-        caps_json_ = build_caps_json(cfg_, facts_);
         runtime_ = runtime;
+        std::uint32_t alignment = alignof(std::max_align_t);
+        const long host_page_size = ::sysconf(_SC_PAGESIZE);
+        std::uint32_t page_size =
+            static_cast<std::uint32_t>(host_page_size > 0 ? host_page_size : 1);
+#if defined(__APPLE__)
+        const MetalStorageFacts storage = query_metal_storage_facts();
+        alignment = storage.alignment;
+        page_size = storage.page_size;
+#endif
+        device_facts_json_ = nlohmann::json{
+            {"abi_version", PIE_DRIVER_ABI_VERSION},
+            {"backend", "metal"},
+            {"unified_memory", true},
+            {"fp8_native", false},
+            {"native_mxfp4_moe", false},
+            {"storage_alignment", alignment},
+            {"storage_max_tile_bytes", 64ull * 1024ull * 1024ull},
+            {"page_size", page_size},
+        }.dump();
+        storage_page_size_ = page_size;
         return PIE_STATUS_OK;
     }
 
-    void fill_caps(PieDriverCaps* caps) const {
+    void fill_device_facts(PieDriverCaps* caps) const {
         if (caps == nullptr) return;
-        caps->json_bytes = reinterpret_cast<const std::uint8_t*>(caps_json_.data());
-        caps->json_len = caps_json_.size();
+        caps->json_bytes =
+            reinterpret_cast<const std::uint8_t*>(device_facts_json_.data());
+        caps->json_len = device_facts_json_.size();
+    }
+
+    int load_model(const PieModelLoadDesc& load, PieDriverCaps* caps) {
+        if (load_attempted_) {
+            return PIE_STATUS_CLOSED;
+        }
+        load_attempted_ = true;
+        cfg_.model.hf_path.assign(
+            reinterpret_cast<const char*>(load.snapshot_dir.ptr),
+            load.snapshot_dir.len);
+        program_bytes_.assign(
+            load.program_bytes.ptr,
+            load.program_bytes.ptr + load.program_bytes.len);
+        compiler_version_ = load.compiler_version;
+        facts_ = read_model_facts(cfg_.model.hf_path);
+        caps_json_ = build_caps_json(cfg_, facts_);
+        std::string error;
+        if (!ensure_executor(error)) {
+            std::cerr << "[pie-driver-metal] load_model: " << error << "\n";
+            return PIE_STATUS_UNSUPPORTED;
+        }
+        if (caps != nullptr) {
+            caps->json_bytes =
+                reinterpret_cast<const std::uint8_t*>(caps_json_.data());
+            caps->json_len = caps_json_.size();
+        }
+        return PIE_STATUS_OK;
     }
 
     int register_program(const PieProgramDesc& program, std::uint64_t* program_id) {
@@ -437,61 +485,15 @@ class Context::Impl {
             }
         }
 
-        // §4.3: pull host-published writer-ring entries into the interp, then
-        // validate availability for every member BEFORE accepting anything —
-        // aggregated across members sharing an endpoint. A missing put is a
-        // guest ordering bug and rejects synchronously (no epoch, no poison).
-        std::vector<std::vector<WriterConsume>> consumes(members.size());
-        std::unordered_map<ChannelRecord*, std::uint64_t> planned_extra;
-        std::unordered_set<ChannelRecord*> planned_seed_spend;
-        for (std::size_t m = 0; m < members.size(); ++m) {
-            InstanceRecord& member = *members[m];
-            const ProgramRecord& program =
-                *registry_.find_program(member.program_id);
-            for (std::size_t dense = 0; dense < member.channel_ids.size(); ++dense) {
-                ChannelRecord& endpoint =
-                    *registry_.find_channel(member.channel_ids[dense]);
-                if (endpoint.desc.host_role != PIE_CHANNEL_HOST_ROLE_WRITER) continue;
-                const int rc = pull_writer_ring(member, program, dense, endpoint);
-                if (rc != PIE_STATUS_OK) return rc;
-                if (!program.plan.takes_channel(static_cast<std::uint32_t>(dense))) continue;
-                const std::uint64_t tail = load_word(endpoint.words, 1);
-                std::uint64_t& extra = planned_extra[&endpoint];
-                const bool credit =
-                    endpoint.seed_credit && planned_seed_spend.count(&endpoint) == 0;
-                const std::uint64_t reserved = endpoint.reserved_head + extra;
-                const std::uint64_t available =
-                    (tail > reserved ? tail - reserved : 0) + (credit ? 1 : 0);
-                if (available < 1) {
-                    std::cerr << "[pie-driver-metal] launch: channel "
-                              << member.channel_ids[dense]
-                              << " has no host input for this fire (put must happen "
-                                 "before submit)\n";
-                    return PIE_STATUS_INVALID_ARGUMENT;
-                }
-                if (credit) {
-                    planned_seed_spend.insert(&endpoint);
-                    consumes[m].push_back({member.channel_ids[dense], dense, reserved});
-                } else {
-                    ++extra;
-                    consumes[m].push_back({member.channel_ids[dense], dense, reserved + 1});
-                }
-            }
-        }
-        // Every member validated — commit the scheduled reservations.
-        for (const auto& member_consumes : consumes) {
-            for (const WriterConsume& consume : member_consumes) {
-                ChannelRecord& endpoint =
-                    *registry_.find_channel(consume.channel_id);
-                if (endpoint.seed_credit && consume.target_head == endpoint.reserved_head) {
-                    endpoint.seed_credit = false;
-                } else {
-                    endpoint.reserved_head = consume.target_head;
-                }
-            }
+        if (launch.channel_ticket_indptr.len != members.size() + 1 ||
+            launch.channel_expected_head.len != launch.channel_expected_tail.len) {
+            std::cerr << "[pie-driver-metal] launch: channel tickets are required\n";
+            return PIE_STATUS_INVALID_ARGUMENT;
         }
 
-        // Phase 3 (review item 1): preflight is done — deep-copy the accepted
+        // Deep-copy the accepted batch and its immutable sequence tickets.
+        // Availability is checked on the worker immediately before execution;
+        // accepting the launch never consumes or reserves a host-ring entry.
         // launch into an OWNED job and POST it to the executor worker, then
         // return WITHOUT waiting. The worker runs the (possibly multi-ms) GPU
         // forward + interp step + settlement + publication; `pie_metal_launch`
@@ -500,27 +502,45 @@ class Context::Impl {
         // the state mutex, instances alive), so the job borrows no launch-array
         // pointer after this returns. Instances are re-resolved by id on the
         // worker so a close racing the in-flight job is handled, not UAF'd.
-        const pie_native::LaunchView view = executor::build_launch_view(launch);
         auto job = std::make_shared<LaunchJobData>();
         job->completion = completion;
+        job->launch = executor::OwnedLaunchView::capture(launch);
         job->members.resize(members.size());
         for (std::size_t m = 0; m < members.size(); ++m) {
             LaunchMember& lm = job->members[m];
             lm.instance_id = members[m]->instance_id;
-            lm.consumes = std::move(consumes[m]);
             lm.terminal_cell = launch.terminal_cells.ptr[m];
             const ProgramRecord& program =
                 *registry_.find_program(members[m]->program_id);
-            if (!program.plan.needs_forward()) continue;
-            lm.needs_forward = true;
-            executor::MemberForwardDesc desc;
-            std::string build_err;
-            if (build_forward_desc_for_member(view, m, members.size(), *members[m], program, desc,
-                                              build_err)) {
-                lm.fwd_slot = static_cast<int>(job->fwd_descs.size());
-                job->fwd_descs.push_back(std::move(desc));
-            } else {
-                lm.build_err = build_err;  // poisoned individually; not in the batch
+            lm.needs_forward = program.plan.needs_forward();
+            const std::size_t lo = launch.channel_ticket_indptr.ptr[m];
+            const std::size_t hi = launch.channel_ticket_indptr.ptr[m + 1];
+            if (hi < lo || hi - lo != members[m]->channel_ids.size() ||
+                hi > launch.channel_expected_head.len) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            lm.tickets.reserve(hi - lo);
+            for (std::size_t dense = 0; dense < hi - lo; ++dense) {
+                const std::uint64_t expected_head =
+                    launch.channel_expected_head.ptr[lo + dense];
+                const std::uint64_t expected_tail =
+                    launch.channel_expected_tail.ptr[lo + dense];
+                if ((program.plan.takes_channel(static_cast<std::uint32_t>(dense)) &&
+                     expected_head == executor::kNoChannelTicket) ||
+                    (program.plan.puts_channel(static_cast<std::uint32_t>(dense)) &&
+                     expected_tail == executor::kNoChannelTicket)) {
+                    return PIE_STATUS_INVALID_ARGUMENT;
+                }
+                lm.tickets.push_back(executor::ChannelTicket{
+                    .channel_id = members[m]->channel_ids[dense],
+                    .dense = dense,
+                    .expected_head = expected_head,
+                    .expected_tail = expected_tail,
+                    .requires_input =
+                        expected_head != executor::kNoChannelTicket ||
+                        program.plan.requires_channel_input(
+                            static_cast<std::uint32_t>(dense)),
+                });
             }
         }
         lock_holder.unlock();  // never hold state_mutex_ across the worker post/return
@@ -542,6 +562,45 @@ class Context::Impl {
         std::vector<std::uint32_t> outcomes(M, PIE_TERMINAL_OUTCOME_SUCCESS);
         std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
 
+        // ── Phase 0: execution-time ticket validation and lazy host pull. ──
+        const pie_native::LaunchView view = job->launch.view();
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            job->fwd_descs.clear();
+            for (std::size_t m = 0; m < M; ++m) {
+                LaunchMember& lm = job->members[m];
+                InstanceRecord* instance = registry_.find_instance(lm.instance_id);
+                if (instance == nullptr) {
+                    lm.build_err = "instance closed before execution";
+                    continue;
+                }
+                InstanceRecord& member = *instance;
+                const ProgramRecord& program =
+                    *registry_.find_program(member.program_id);
+                std::string prepare_error;
+                const TicketPreparation prepared =
+                    prepare_member_tickets(member, program, lm.tickets, prepare_error);
+                if (prepared == TicketPreparation::Retry) {
+                    outcomes[m] = PIE_TERMINAL_OUTCOME_RETRY;
+                    continue;
+                }
+                if (prepared == TicketPreparation::Failed) {
+                    lm.build_err = std::move(prepare_error);
+                    continue;
+                }
+                if (!lm.needs_forward) continue;
+                executor::MemberForwardDesc desc;
+                if (build_forward_desc_for_member(
+                        view, m, M, member, program, desc, lm.build_err)) {
+                    lm.fwd_slot = static_cast<int>(job->fwd_descs.size());
+                    job->fwd_descs.push_back(std::move(desc));
+                } else if (lm.build_err.find("not ready") != std::string::npos) {
+                    outcomes[m] = PIE_TERMINAL_OUTCOME_RETRY;
+                    lm.build_err.clear();
+                }
+            }
+        }
+
         // ── Phase 1: GPU forward (no mutex; executor is worker-owned) ──
         std::vector<executor::LogitsOut> fwd_outs;
         std::vector<std::uint8_t> fwd_ok;
@@ -549,9 +608,11 @@ class Context::Impl {
         std::string setup_err;
         bool executor_ready = true;
         bool has_forward = false;
-        for (const LaunchMember& lm : job->members) {
-            if (lm.needs_forward && lm.build_err.empty()) has_forward = true;
-        }
+        for (std::size_t m = 0; m < M; ++m)
+            if (outcomes[m] == PIE_TERMINAL_OUTCOME_SUCCESS &&
+                job->members[m].needs_forward &&
+                job->members[m].build_err.empty())
+                has_forward = true;
         if (has_forward) {
             try {
                 executor_ready = ensure_executor(setup_err);  // inline on the worker
@@ -572,6 +633,7 @@ class Context::Impl {
             std::lock_guard<std::mutex> lock(state_mutex_);
             for (std::size_t m = 0; m < M; ++m) {
                 LaunchMember& lm = job->members[m];
+                if (outcomes[m] == PIE_TERMINAL_OUTCOME_RETRY) continue;
                 InstanceRecord* instance = registry_.find_instance(lm.instance_id);
                 if (instance == nullptr) {
                     // Instance closed after acceptance (guest ordering bug): fail
@@ -611,9 +673,14 @@ class Context::Impl {
                     }
                 }
                 try {
-                    if (ok &&
-                        !run_member(member, program, lm.consumes, pass_in, notifications, failure)) {
-                        ok = false;
+                    if (ok) {
+                        const MemberRunOutcome run = run_member(
+                            member, program, lm.tickets, pass_in, notifications, failure);
+                        if (run == MemberRunOutcome::Retry) {
+                            outcomes[m] = PIE_TERMINAL_OUTCOME_RETRY;
+                            continue;
+                        }
+                        if (run == MemberRunOutcome::Failed) ok = false;
                     }
                 } catch (const std::exception& e) {
                     ok = false;
@@ -866,9 +933,68 @@ class Context::Impl {
         runtime_.notify(runtime_.ctx, wait_id, epoch);
     }
 
-    // §4.3 driver pull: move host-published writer-ring cells (mirror cells up
-    // to the release-published tail word) into the interp ring, advancing
-    // `pulled`. Interp backpressure leaves the remainder for a later fire.
+    TicketPreparation prepare_member_tickets(
+        InstanceRecord& member,
+        const ProgramRecord& program,
+        const std::vector<executor::ChannelTicket>& tickets,
+        std::string& failure) {
+        for (const auto& ticket : tickets) {
+            ChannelRecord* endpoint = registry_.find_channel(ticket.channel_id);
+            if (endpoint == nullptr) {
+                failure = "ticket references a closed channel";
+                return TicketPreparation::Failed;
+            }
+            const std::uint64_t poison = load_word(endpoint->words, 2);
+            const std::uint64_t closed = load_word(endpoint->words, 3);
+            if (poison != 0 || closed != 0) {
+                failure = poison != 0 ? "ticket channel is poisoned"
+                                      : "ticket channel is closed";
+                return TicketPreparation::Failed;
+            }
+            const std::uint64_t head = load_word(endpoint->words, 0);
+            const std::uint64_t tail = load_word(endpoint->words, 1);
+            if (tail < head) {
+                failure = "channel tail precedes head";
+                return TicketPreparation::Failed;
+            }
+            if (ticket.expected_head != executor::kNoChannelTicket &&
+                head != ticket.expected_head) {
+                return TicketPreparation::Retry;
+            }
+            if (ticket.requires_input && tail <= head) {
+                return TicketPreparation::Retry;
+            }
+            if (ticket.expected_tail != executor::kNoChannelTicket) {
+                const std::uint64_t same_fire_consume =
+                    ticket.expected_head != executor::kNoChannelTicket ? 1 : 0;
+                if (tail != ticket.expected_tail ||
+                    tail - head >=
+                        static_cast<std::uint64_t>(endpoint->desc.capacity) +
+                            same_fire_consume) {
+                    return TicketPreparation::Retry;
+                }
+            }
+        }
+
+        for (const auto& ticket : tickets) {
+            ChannelRecord& endpoint = *registry_.find_channel(ticket.channel_id);
+            if (endpoint.desc.host_role != PIE_CHANNEL_HOST_ROLE_WRITER ||
+                !ticket.requires_input) {
+                continue;
+            }
+            const int status =
+                pull_writer_ring(member, program, ticket.dense, endpoint);
+            if (status != PIE_STATUS_OK) {
+                failure = "writer ring pull failed for channel " +
+                          std::to_string(ticket.channel_id);
+                return TicketPreparation::Failed;
+            }
+        }
+        return TicketPreparation::Ready;
+    }
+
+    // Execution-time driver pull: move host-published writer-ring cells into
+    // the interpreter only after immutable ticket validation succeeds.
     int pull_writer_ring(InstanceRecord& member, const ProgramRecord& program,
                          std::size_t dense, ChannelRecord& endpoint) {
         const std::size_t cell =
@@ -927,6 +1053,9 @@ class Context::Impl {
         setup_cfg.kv_page_size = cfg_.batching.kv_page_size;
         setup_cfg.max_forward_tokens = cfg_.batching.max_forward_tokens;
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
+        setup_cfg.storage_program = program_bytes_;
+        setup_cfg.compiler_version = compiler_version_;
+        setup_cfg.storage_page_size = storage_page_size_;
         // Create + `setup()` the executor ON THE WORKER THREAD (Phase 3, §7):
         // MetalExecutor::setup builds the Metal device/heap/PSOs, which must
         // be created on the same thread that will later drive them.
@@ -995,69 +1124,68 @@ class Context::Impl {
             failure);
     }
 
-    // One member's fire: interp step, then §4.4 word publication — consumed
-    // writer heads (release + writer wake), produced reader cells + tails
-    // (release + reader wake). Returns false with `failure` set on any fault;
-    // the caller poisons. `pass_in` is empty for C1 (channel-plane-only)
-    // members; C2 members carry the forward's materialized logits (§5.3).
-    bool run_member(InstanceRecord& member, const ProgramRecord& program,
-                    const std::vector<WriterConsume>& member_consumes,
-                    const interp::PassInputs& pass_in,
-                    std::vector<std::pair<std::uint64_t, std::uint64_t>>& notifications,
-                    std::string& failure) {
+    MemberRunOutcome run_member(
+        InstanceRecord& member,
+        const ProgramRecord& program,
+        const std::vector<executor::ChannelTicket>& tickets,
+        const interp::PassInputs& pass_in,
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>& notifications,
+        std::string& failure) {
         const interp::StepResult report = interp::step(member.interp, program.plan, pass_in);
         if (!report.ok) {
             failure = report.error;
-            return false;
+            return MemberRunOutcome::Failed;
         }
         if (!report.committed) {
-            failure = "accepted launch missed its readiness invariant at channel " +
-                      std::to_string(report.missed_channel);
-            return false;
+            return MemberRunOutcome::Retry;
         }
-        for (const auto& consume : member_consumes) {
-            ChannelRecord& endpoint =
-                *registry_.find_channel(consume.channel_id);
-            const std::uint64_t previous = load_word(endpoint.words, 0);
-            if (consume.target_head > previous) {
-                store_word(endpoint.words, 0, consume.target_head);
-                notifications.emplace_back(endpoint.desc.writer_wait_id, consume.target_head);
+
+        for (const auto& ticket : tickets) {
+            ChannelRecord& endpoint = *registry_.find_channel(ticket.channel_id);
+            if (ticket.expected_tail == executor::kNoChannelTicket ||
+                endpoint.desc.host_role != PIE_CHANNEL_HOST_ROLE_READER) {
+                continue;
             }
+            interp::Value value;
+            const interp::HostOp status = interp::host_take(
+                member.interp,
+                program.plan,
+                static_cast<std::uint32_t>(ticket.dense),
+                value);
+            if (status != interp::HostOp::Ok) {
+                failure = "host output unavailable for channel " +
+                          std::to_string(endpoint.desc.channel_id);
+                return MemberRunOutcome::Failed;
+            }
+            const std::size_t cell =
+                interp::wire_cell_bytes(endpoint.program_dtype(), endpoint.numel());
+            const std::uint64_t cap1 =
+                static_cast<std::uint64_t>(endpoint.desc.capacity) + 1;
+            interp::encode_wire(
+                value,
+                endpoint.mirror.data() +
+                    static_cast<std::size_t>(ticket.expected_tail % cap1) * cell);
         }
-        for (std::size_t dense = 0; dense < member.channel_ids.size(); ++dense) {
-            ChannelRecord& endpoint =
-                *registry_.find_channel(member.channel_ids[dense]);
-            if (endpoint.desc.host_role != PIE_CHANNEL_HOST_ROLE_READER) continue;
-            for (;;) {
-                interp::Value value;
-                const interp::HostOp rc = interp::host_take(
-                    member.interp, program.plan, static_cast<std::uint32_t>(dense), value);
-                if (rc == interp::HostOp::WouldBlock) break;
-                if (rc != interp::HostOp::Ok) {
-                    failure = "host take failed for channel " +
-                              std::to_string(endpoint.desc.channel_id);
-                    return false;
+
+        for (const auto& ticket : tickets) {
+            ChannelRecord& endpoint = *registry_.find_channel(ticket.channel_id);
+            if (ticket.expected_head != executor::kNoChannelTicket) {
+                const std::uint64_t actual = ticket.expected_head + 1;
+                store_word(endpoint.words, 0, actual);
+                if (endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_WRITER) {
+                    notifications.emplace_back(endpoint.desc.writer_wait_id, actual);
                 }
-                const std::uint64_t tail = load_word(endpoint.words, 1);
-                const std::uint64_t head = load_word(endpoint.words, 0);
-                if (tail - head >= endpoint.desc.capacity) {
-                    failure = "channel " + std::to_string(endpoint.desc.channel_id) +
-                              " has no reserved output capacity";
-                    return false;
-                }
-                const std::size_t cell =
-                    interp::wire_cell_bytes(endpoint.program_dtype(), endpoint.numel());
-                const std::uint64_t cap1 =
-                    static_cast<std::uint64_t>(endpoint.desc.capacity) + 1;
-                interp::encode_wire(
-                    value, endpoint.mirror.data() +
-                               static_cast<std::size_t>(tail % cap1) * cell);
-                store_word(endpoint.words, 1, tail + 1);
+            }
+            if (ticket.expected_tail != executor::kNoChannelTicket) {
+                const std::uint64_t actual = ticket.expected_tail + 1;
+                store_word(endpoint.words, 1, actual);
                 store_word(endpoint.words, 2, 0);
-                notifications.emplace_back(endpoint.desc.reader_wait_id, tail + 1);
+                if (endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_READER) {
+                    notifications.emplace_back(endpoint.desc.reader_wait_id, actual);
+                }
             }
         }
-        return true;
+        return MemberRunOutcome::Committed;
     }
 
     // D4 failure settlement: poison every attached channel's word (epoch
@@ -1084,6 +1212,11 @@ class Context::Impl {
     Config cfg_{};
     ModelFacts facts_{};
     std::string caps_json_;
+    std::string device_facts_json_;
+    std::vector<std::uint8_t> program_bytes_;
+    std::uint64_t compiler_version_ = 0;
+    bool load_attempted_ = false;
+    std::uint32_t storage_page_size_ = 1;
     PieRuntimeCallbacks runtime_{};
     pipeline::Registry registry_;
     // Phase 3 (§7, D4): coherent single mutex over ALL driver state (programs/
@@ -1114,8 +1247,12 @@ int Context::initialize(
     return impl_->initialize(config_path, runtime);
 }
 
-void Context::fill_caps(PieDriverCaps* caps) const {
-    impl_->fill_caps(caps);
+void Context::fill_device_facts(PieDriverCaps* caps) const {
+    impl_->fill_device_facts(caps);
+}
+
+int Context::load_model(const PieModelLoadDesc& load, PieDriverCaps* caps) {
+    return impl_->load_model(load, caps);
 }
 
 int Context::register_program(

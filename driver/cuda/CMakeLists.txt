@@ -299,7 +299,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/store/recurrent_state_cache.cpp
   src/store/swap_pool.cpp
   # loader/ -- snapshot -> WeightStore
-  src/loader/safetensors.cpp
+  src/loader/checkpoint_source.cpp
   src/loader/safetensors_manifest.cpp
   # ops/ -- attention / GEMM / MoE / SSM wrappers
   src/ops/attention_flashinfer.cu
@@ -385,44 +385,10 @@ target_include_directories(pie_driver_cuda_lib
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
 
-# ---- Rust weight-loader staticlib ------------------------------------------
-
-find_program(CARGO_EXECUTABLE cargo REQUIRED)
-set(PIE_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-set(PIE_WEIGHT_LOADER_MANIFEST
-    "${PIE_WORKSPACE_ROOT}/driver/weight-loader/Cargo.toml")
-set(PIE_WEIGHT_LOADER_STATICLIB_PATH
-    "${PIE_WORKSPACE_ROOT}/target/release/libpie_weight_loader.a")
-add_custom_target(pie_weight_loader_staticlib
-  COMMAND "${CARGO_EXECUTABLE}" build
-          --manifest-path "${PIE_WEIGHT_LOADER_MANIFEST}"
-          --release
-  WORKING_DIRECTORY "${PIE_WORKSPACE_ROOT}"
-  BYPRODUCTS "${PIE_WEIGHT_LOADER_STATICLIB_PATH}"
-  COMMENT "Building Rust weight-loader static library")
-add_library(pie_weight_loader_static STATIC IMPORTED GLOBAL)
-set_target_properties(pie_weight_loader_static PROPERTIES
-  IMPORTED_LOCATION "${PIE_WEIGHT_LOADER_STATICLIB_PATH}")
-add_dependencies(pie_weight_loader_static pie_weight_loader_staticlib)
-
-set(PIE_WEIGHT_LOADER_SYSTEM_LIBS Threads::Threads ${CMAKE_DL_LIBS} m)
-if(UNIX AND NOT APPLE)
-  list(APPEND PIE_WEIGHT_LOADER_SYSTEM_LIBS rt util)
-endif()
-
 # ---- pie_driver_cuda (standalone diagnostic executable) --------------------
 
 add_executable(pie_driver_cuda src/main.cpp)
-target_link_libraries(pie_driver_cuda PRIVATE
-  pie_driver_cuda_lib
-  # The C++ declarations are weak so server builds can link the CUDA driver
-  # archive before Cargo supplies Rust symbols. For this standalone binary,
-  # force the Rust staticlib into the link -- weak references alone do not
-  # cause archive extraction.
-  "-Wl,--whole-archive"
-  pie_weight_loader_static
-  "-Wl,--no-whole-archive"
-  ${PIE_WEIGHT_LOADER_SYSTEM_LIBS})
+target_link_libraries(pie_driver_cuda PRIVATE pie_driver_cuda_lib)
 
 # ---- FlashInfer generated CUTLASS MoE (vendored) ---------------------------
 # Pre-generated FlashInfer CUTLASS grouped-GEMM MoE launchers, vendored under

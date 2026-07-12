@@ -114,9 +114,9 @@ driver/cuda/src
 │   ├── dsa_cache.{hpp,cpp} (stub today; keep, see decision log)
 │   ├── recurrent_state_cache.{hpp,cpp}  swap_pool.{hpp,cpp}
 │   └── memory_planner.{hpp,cpp}   (from cuda_memory_planner.*, prefix dropped)
-└── loader/             snapshot -> WeightStore (unchanged name)
-    ├── safetensors.* safetensors_manifest.* checkpoint_source.hpp
-    ├── rust_loader_bridge.hpp rust_loader_input.hpp rust_storage_executor.hpp
+└── loader/             StorageProgram -> WeightStore
+    ├── safetensors_manifest.* checkpoint_source.{hpp,cpp}
+    ├── rust_loader_bridge.hpp rust_storage_executor.hpp
     ├── transcode_engine.hpp weight_copy_engine.hpp weight_store_codec.hpp
     └── (hf_config moves OUT to model/config; gguf_source deleted)
 ```
@@ -519,7 +519,8 @@ workstation.
 - `driver/metal`: same layout and names should apply later (it already mirrors the
   old structure at 1/10 the size), but only after the CUDA tree lands.
 - `interface/driver` ABI and `interface/ptir`: unchanged.
-- `driver/weight-loader` (Rust): unchanged; it is the correctly-layered part.
+- The storage compiler moved to `runtime/weight-loader`; see
+  `storage-refact-and-metal.md`.
 - Engine-side work: tracked in `major_refactor.md`.
 - Re-enabling rank-0 CUDA-graph replay; tier-1 NVRTC fusion productization; the
   `dsa_cache` implementation: real features, separate efforts.

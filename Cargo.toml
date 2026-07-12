@@ -41,7 +41,7 @@ members = [
     # `no_std` core; the wasm SDK depends on it with `default-features = false`.
     "interface/ptir",
     "driver/dummy",
-    "driver/weight-loader",
+    "runtime/weight-loader",
     "sdk/python-server",
     # Thin binary shells composing bootstrap + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).

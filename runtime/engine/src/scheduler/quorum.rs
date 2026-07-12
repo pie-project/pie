@@ -21,7 +21,7 @@ use crate::scheduler::ProcessId;
 
 /// One-step run-ahead (R10): the DEFAULT run-ahead depth — at most one batch
 /// computing + one prefetched. Override via `PIE_SCHED_MAX_IN_FLIGHT`
-/// (see [`max_in_flight`]).
+/// (see [`configured_max_in_flight`]).
 const DEFAULT_MAX_IN_FLIGHT: usize = 2;
 
 const COLD_HOLD_US: u64 = 500;
@@ -41,10 +41,6 @@ pub(super) fn configured_max_in_flight() -> usize {
     *CONFIGURED.get_or_init(|| {
         parse_max_in_flight(std::env::var("PIE_SCHED_MAX_IN_FLIGHT").ok().as_deref())
     })
-}
-
-pub(super) fn max_in_flight() -> usize {
-    configured_max_in_flight()
 }
 
 /// Bounded poll for the quorum-hold wait. The completion channel and new
@@ -96,7 +92,7 @@ struct PipelineWaveState {
 pub(super) struct WaitAllPolicy {
     /// Structural cap — a full batch always fires immediately.
     max_forward_requests: usize,
-    /// Batches enqueued but not yet retired; bounded by `max_in_flight()`.
+    /// Batches enqueued but not yet retired; bounded by the configured depth.
     in_flight: usize,
     /// THE wait-set: every active pipeline and its wave participation.
     /// BTreeMap for deterministic `missing` ordering.
@@ -199,7 +195,7 @@ impl WaitAllPolicy {
         // channel preempts the wait the instant a batch retires. Misses are
         // NOT counted while capped: a straggler can't be blamed for a wave
         // that couldn't fire anyway.
-        if self.in_flight >= max_in_flight() {
+        if self.in_flight >= configured_max_in_flight() {
             return WaveDecision::Wait(Duration::from_micros(QUORUM_POLL_US));
         }
         // Structural capacity cap — a full batch fires immediately, no miss
@@ -355,7 +351,7 @@ mod tests {
         assert_eq!(parse_max_in_flight(Some("0")), 1);
         assert_eq!(parse_max_in_flight(Some("4")), 4);
         assert_eq!(parse_max_in_flight(Some("invalid")), DEFAULT_MAX_IN_FLIGHT);
-        assert!(max_in_flight() >= 1);
+        assert!(configured_max_in_flight() >= 1);
     }
 
     /// Drives a fresh `policy` through its bootstrap cold-hold (arm at `t0`,

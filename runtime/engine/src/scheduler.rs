@@ -247,6 +247,8 @@ pub type LaunchPreparation = Box<
         + Send,
 >;
 
+pub type RetryClassifier = Box<dyn Fn() -> Option<String> + Send + Sync>;
+
 pub fn submit_async(
     request: crate::driver::LaunchPlan,
     driver_idx: usize,
@@ -275,15 +277,19 @@ pub fn submit_async_deferred(
     driver_idx: usize,
     instance_id: u64,
     pipeline_id: Option<ProcessId>,
+    preparation_order_key: Option<u64>,
     completion: crate::driver::WorkItemCompletion,
     preparation: LaunchPreparation,
+    retry_classifier: Option<RetryClassifier>,
 ) -> Result<()> {
     scheduler_handle(driver_idx)?.submit_deferred(
         request,
         instance_id,
         completion,
         pipeline_id,
+        preparation_order_key,
         preparation,
+        retry_classifier,
     )
 }
 

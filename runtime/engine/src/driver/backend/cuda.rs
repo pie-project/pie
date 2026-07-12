@@ -13,15 +13,16 @@ use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
 use crate::driver::submission::LaunchSubmission;
 use pie_driver_abi::{
     PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
-    pie_cuda_bind_instance, pie_cuda_close_channel, pie_cuda_close_instance, pie_cuda_copy_kv,
-    pie_cuda_copy_state, pie_cuda_create, pie_cuda_destroy, pie_cuda_launch,
-    pie_cuda_register_channel, pie_cuda_register_program, pie_cuda_resize_pool,
+    PieModelLoadDesc, pie_cuda_bind_instance, pie_cuda_close_channel, pie_cuda_close_instance,
+    pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_create, pie_cuda_destroy, pie_cuda_launch,
+    pie_cuda_load_model, pie_cuda_register_channel, pie_cuda_register_program,
+    pie_cuda_resize_pool,
 };
 
 struct CudaDriverHandle {
     driver: *mut PieDriver,
     broker: CompletionBroker,
-    capabilities: pie_driver_abi::DriverCapabilities,
+    device_facts: pie_driver_abi::DeviceFacts,
 }
 
 impl CudaDriverHandle {
@@ -41,8 +42,8 @@ impl CudaDriverHandle {
         if driver.is_null() {
             return Err(anyhow!("pie_cuda_create returned null"));
         }
-        let capabilities = match parse_caps(caps) {
-            Ok(capabilities) => capabilities,
+        let device_facts: pie_driver_abi::DeviceFacts = match parse_json(caps, "device facts") {
+            Ok(device_facts) => device_facts,
             Err(error) => {
                 unsafe { pie_cuda_destroy(driver) };
                 return Err(error);
@@ -51,12 +52,43 @@ impl CudaDriverHandle {
         Ok(Self {
             driver,
             broker,
-            capabilities,
+            device_facts,
         })
     }
 
-    fn capabilities(&self) -> &pie_driver_abi::DriverCapabilities {
-        &self.capabilities
+    fn device_facts(&self) -> &pie_driver_abi::DeviceFacts {
+        &self.device_facts
+    }
+
+    fn load_model(
+        &mut self,
+        desc: &pie_driver_abi::ModelLoadDesc,
+    ) -> Result<pie_driver_abi::DriverCapabilities> {
+        let snapshot = desc
+            .snapshot_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("model snapshot path must be UTF-8"))?;
+        let raw = PieModelLoadDesc {
+            abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            compiler_version: desc.compiler_version,
+            program_bytes: PieBytes {
+                ptr: desc.program_bytes.as_ptr(),
+                len: desc.program_bytes.len(),
+            },
+            snapshot_dir: PieBytes {
+                ptr: snapshot.as_ptr(),
+                len: snapshot.len(),
+            },
+        };
+        let mut caps = PieDriverCaps::default();
+        sync_status(
+            unsafe { pie_cuda_load_model(self.driver, &raw, &mut caps) },
+            "pie_cuda_load_model",
+        )?;
+        let capabilities: pie_driver_abi::DriverCapabilities =
+            parse_json(caps, "model capabilities")?;
+        Ok(capabilities)
     }
 
     fn register_program(&mut self, plan: &ProgramRegistration) -> Result<u64> {
@@ -182,13 +214,17 @@ pub struct CudaDriver {
 }
 
 impl CudaDriver {
-    pub fn create(config_bytes: &[u8]) -> Result<(Self, pie_driver_abi::DriverCapabilities)> {
-        Self::create_group(vec![config_bytes.to_vec()])
+    pub fn create(config_bytes: &[u8]) -> Result<(Self, pie_driver_abi::DeviceFacts)> {
+        let (driver, mut facts) = Self::create_group(vec![config_bytes.to_vec()])?;
+        let facts = facts
+            .pop()
+            .ok_or_else(|| anyhow!("cuda create returned no device facts"))?;
+        Ok((driver, facts))
     }
 
     pub fn create_group(
         config_blobs: Vec<Vec<u8>>,
-    ) -> Result<(Self, pie_driver_abi::DriverCapabilities)> {
+    ) -> Result<(Self, Vec<pie_driver_abi::DeviceFacts>)> {
         if config_blobs.is_empty() {
             return Err(anyhow!("cuda group requires at least one rank config"));
         }
@@ -227,13 +263,15 @@ impl CudaDriver {
 
         let mut created = created;
         let leader = created.remove(0);
-        let capabilities = leader.capabilities().clone();
+        let mut device_facts = Vec::with_capacity(created.len() + 1);
+        device_facts.push(leader.device_facts().clone());
+        device_facts.extend(created.iter().map(|driver| driver.device_facts().clone()));
         Ok((
             Self {
                 leader,
                 followers: created,
             },
-            capabilities,
+            device_facts,
         ))
     }
 
@@ -241,8 +279,60 @@ impl CudaDriver {
         Err(anyhow!("CUDA local driver is not available in this build"))
     }
 
-    pub fn capabilities(&self) -> &pie_driver_abi::DriverCapabilities {
-        self.leader.capabilities()
+    pub fn device_facts(&self) -> Vec<pie_driver_abi::DeviceFacts> {
+        std::iter::once(self.leader.device_facts().clone())
+            .chain(
+                self.followers
+                    .iter()
+                    .map(|driver| driver.device_facts().clone()),
+            )
+            .collect()
+    }
+
+    pub fn load_model(
+        &mut self,
+        descs: Vec<pie_driver_abi::ModelLoadDesc>,
+    ) -> Result<pie_driver_abi::DriverCapabilities> {
+        if descs.len() != self.followers.len() + 1 {
+            return Err(anyhow!(
+                "cuda model-load descriptor count {} does not match rank count {}",
+                descs.len(),
+                self.followers.len() + 1
+            ));
+        }
+        let mut results = Vec::with_capacity(descs.len());
+        let (leader_desc, follower_descs) = descs
+            .split_first()
+            .ok_or_else(|| anyhow!("cuda group has no model-load descriptor"))?;
+        let Self { leader, followers } = self;
+        std::thread::scope(|scope| {
+            let mut joins = Vec::with_capacity(descs.len());
+            joins.push(scope.spawn(|| leader.load_model(leader_desc)));
+            for (follower, desc) in followers.iter_mut().zip(follower_descs) {
+                joins.push(scope.spawn(move || follower.load_model(desc)));
+            }
+            for join in joins {
+                results.push(
+                    join.join()
+                        .map_err(|_| anyhow!("cuda rank model-load thread panicked"))?,
+                );
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
+        let mut capabilities = results.into_iter().collect::<Result<Vec<_>>>()?.into_iter();
+        let leader = capabilities
+            .next()
+            .ok_or_else(|| anyhow!("cuda group has no leader capabilities"))?;
+        if capabilities.any(|caps| {
+            caps.arch_name != leader.arch_name
+                || caps.vocab_size != leader.vocab_size
+                || caps.kv_page_size != leader.kv_page_size
+        }) {
+            return Err(anyhow!(
+                "cuda tensor-parallel ranks reported incompatible model capabilities"
+            ));
+        }
+        Ok(leader)
     }
 
     pub fn register_program(&mut self, plan: &ProgramRegistration) -> Result<u64> {
@@ -302,12 +392,12 @@ pub(crate) fn sync_status(status: i32, op: &str) -> Result<()> {
     }
 }
 
-fn parse_caps(caps: PieDriverCaps) -> Result<pie_driver_abi::DriverCapabilities> {
+fn parse_json<T: serde::de::DeserializeOwned>(caps: PieDriverCaps, label: &str) -> Result<T> {
     if caps.json_bytes.is_null() {
-        return Err(anyhow!("driver creation returned null capability payload"));
+        return Err(anyhow!("driver returned null {label} payload"));
     }
     let bytes = unsafe { std::slice::from_raw_parts(caps.json_bytes, caps.json_len) };
-    serde_json::from_slice(bytes).map_err(|e| anyhow!("driver capability payload parse: {e}"))
+    serde_json::from_slice(bytes).map_err(|e| anyhow!("driver {label} payload parse: {e}"))
 }
 
 #[allow(dead_code)]

@@ -53,7 +53,8 @@ struct Dispatch::Impl {
     DeviceChannelRegistry channels;
     std::unordered_map<std::uint64_t, BoundInstance> instances;
     std::atomic<bool> shutting_down{false};
-    bool force_retry_consumed = false;
+    std::uint32_t force_retry_launches_remaining =
+        std::getenv("PIE_CUDA_FORCE_RETRY_ONCE") != nullptr ? 1u : 0u;
 };
 
 struct NotifyContext {
@@ -74,7 +75,6 @@ struct NotifyContext {
         PieTerminalCell* terminal_cell = nullptr;
         std::uint32_t* commit_host = nullptr;
         bool poison = false;
-        bool retry_eligible = true;
         std::vector<EndpointUpdate> published;
         std::vector<EndpointUpdate> consumed;
         std::vector<EndpointUpdate> poisoned;
@@ -110,8 +110,7 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
     for (const auto& entry : ctx->entries) {
         const bool committed =
             entry.commit_host != nullptr && *(entry.commit_host) != 0;
-        const bool failed =
-            entry.poison || (!committed && !entry.retry_eligible);
+        const bool failed = entry.poison;
         const bool retry = !failed && !committed;
         if (committed) {
             for (const auto& update : entry.published) {
@@ -176,16 +175,18 @@ std::vector<DeviceHostChannelTicket> build_channel_tickets(
             view.ptir_program_instances.size() + 1 &&
         view.channel_expected_head.size() ==
             view.channel_expected_tail.size();
+    if (!supplied) {
+        throw std::runtime_error(
+            "ptir launch requires runtime-assigned channel tickets");
+    }
     std::size_t lo = 0;
     std::size_t hi = 0;
-    if (supplied) {
-        lo = view.channel_ticket_indptr.data()[program];
-        hi = view.channel_ticket_indptr.data()[program + 1];
-        if (hi < lo || hi - lo != count ||
-            hi > view.channel_expected_head.size()) {
-            throw std::runtime_error(
-                "ptir launch channel ticket segment does not match instance");
-        }
+    lo = view.channel_ticket_indptr.data()[program];
+    hi = view.channel_ticket_indptr.data()[program + 1];
+    if (hi < lo || hi - lo != count ||
+        hi > view.channel_expected_head.size()) {
+        throw std::runtime_error(
+            "ptir launch channel ticket segment does not match instance");
     }
 
     std::vector<DeviceHostChannelTicket> tickets;
@@ -196,22 +197,8 @@ std::vector<DeviceHostChannelTicket> build_channel_tickets(
         const bool publishes = bound.instance->puts_channel(dense);
         std::uint64_t expected_head = kNoChannelTicket;
         std::uint64_t expected_tail = kNoChannelTicket;
-        if (supplied) {
-            expected_head = view.channel_expected_head.data()[lo + dense];
-            expected_tail = view.channel_expected_tail.data()[lo + dense];
-        } else {
-            std::uint64_t* words = channels.host_words(slot);
-            if (consumes) {
-                expected_head =
-                    std::atomic_ref<std::uint64_t>(words[0]).load(
-                        std::memory_order_acquire);
-            }
-            if (publishes) {
-                expected_tail =
-                    std::atomic_ref<std::uint64_t>(words[1]).load(
-                        std::memory_order_acquire);
-            }
-        }
+        expected_head = view.channel_expected_head.data()[lo + dense];
+        expected_tail = view.channel_expected_tail.data()[lo + dense];
 
         std::uint32_t flags = 0;
         if (consumes && expected_head != kNoChannelTicket) {
@@ -560,6 +547,20 @@ bool Dispatch::run(const pie_native::LaunchView& view,
         std::vector<void*> scratch;
         std::vector<DeviceHostChannelTicket> tickets =
             build_channel_tickets(view, p, bound, s.channels);
+        if (s.force_retry_launches_remaining != 0) {
+            for (DeviceHostChannelTicket& ticket : tickets) {
+                if ((ticket.flags & kTicketConsume) != 0) {
+                    ++ticket.expected_head;
+                    --s.force_retry_launches_remaining;
+                    break;
+                }
+                if ((ticket.flags & kTicketPublish) != 0) {
+                    ++ticket.expected_tail;
+                    --s.force_retry_launches_remaining;
+                    break;
+                }
+            }
+        }
         bound.instance->reset_commit(stream);
         DeviceHostChannelTicket* device_tickets =
             launch_pull_validate_host_channels(
@@ -567,15 +568,6 @@ bool Dispatch::run(const pie_native::LaunchView& view,
                 bound.instance->view().d_full(),
                 bound.instance->commit_device_flag(),
                 stream);
-        if (std::getenv("PIE_CUDA_FORCE_RETRY_ONCE") != nullptr &&
-            !s.force_retry_consumed) {
-            s.force_retry_consumed = true;
-            CUDA_CHECK(cudaMemsetAsync(
-                bound.instance->commit_device_flag(),
-                0,
-                sizeof(std::uint32_t),
-                stream));
-        }
         const PassResult pass = bound.instance->fire_async(fin, scratch, false);
         CUDA_CHECK(cudaMemcpyAsync(
             snapshot.device,
@@ -673,10 +665,6 @@ bool Dispatch::run(const pie_native::LaunchView& view,
             .terminal_cell = view.terminal_cells.data()[p],
             .commit_host = snapshot.host,
             .poison = poison,
-            .retry_eligible =
-                view.retry_eligible.size() == n_prog
-                    ? view.retry_eligible.data()[p] != 0
-                    : view.rs_slot_ids.empty(),
             .published = std::move(published),
             .consumed = std::move(consumed),
             .poisoned = std::move(poisoned),
@@ -789,11 +777,6 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             if (err) *err = "ptir descriptor resolution missing trace";
             return false;
         }
-        std::string value_error;
-        if (!it->second.instance->writer_inputs_available(&value_error)) {
-            if (err) *err = value_error;
-            return false;
-        }
     }
 
     out.per_program.resize(n_prog);
@@ -803,6 +786,11 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
         if (!is_device_geometry_trace(*trace)) continue;
+
+        std::string value_error;
+        if (!it->second.instance->writer_inputs_available(&value_error)) {
+            throw RetryableLaunchError(value_error);
+        }
 
         // Geometry resolution reads device channel state synchronously, so
         // pull the writer rings on the default stream and drain it first.

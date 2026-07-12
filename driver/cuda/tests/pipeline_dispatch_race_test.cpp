@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -138,6 +139,7 @@ int main() {
     if (!expect(!bytes.empty() && !sidecar.empty() && hash != 0,
                 "load golden PTIR")) return 1;
 
+    setenv("PIE_CUDA_FORCE_RETRY_ONCE", "1", 1);
     Dispatch dispatch;
     std::string err;
     g_stage = "register_program";
@@ -199,6 +201,8 @@ int main() {
     static PieTerminalCell terminals[kIterations * kFiresPerIteration]{};
     const std::uint64_t instance_ids[1] = {binding.instance_id};
     const std::uint32_t sampling_indptr[2] = {0, 1};
+    const std::uint32_t channel_ticket_indptr[2] = {0, 2};
+    constexpr std::uint64_t kNoTicket = std::numeric_limits<std::uint64_t>::max();
 
     // Forced benign non-commit: terminal RETRY, no ring actuals move. The same
     // logical payload then commits normally.
@@ -214,6 +218,14 @@ int main() {
             pie_native::slice_from_u64(&hash, 1);
         retry_view.ptir_program_instances =
             pie_native::slice_from_u64(instance_ids, 1);
+        const std::uint64_t retry_heads[2] = {0, kNoTicket};
+        const std::uint64_t retry_tails[2] = {kNoTicket, 0};
+        retry_view.channel_expected_head =
+            pie_native::slice_from_u64(retry_heads, 2);
+        retry_view.channel_expected_tail =
+            pie_native::slice_from_u64(retry_tails, 2);
+        retry_view.channel_ticket_indptr =
+            pie_native::slice_from_u32(channel_ticket_indptr, 2);
         auto* reader_words =
             reinterpret_cast<std::uint64_t*>(endpoints[1].word_base);
         const std::uint64_t tail_before =
@@ -221,7 +233,6 @@ int main() {
                 reader_words[endpoints[1].tail_word_index])
                 .load(std::memory_order_acquire);
 
-        setenv("PIE_CUDA_FORCE_RETRY_ONCE", "1", 1);
         if (!expect(dispatch.run(
                         retry_view, d_logits, kVocab, stream, &runtime,
                         PieCompletion{.wait_id = 399,
@@ -264,15 +275,20 @@ int main() {
             return 1;
         }
         advance_reader_head(endpoints[1]);
+        const std::uint32_t next_token[1] = {1};
+        ring_put(endpoints[0], next_token, sizeof(next_token));
     }
 
     std::uint64_t churn_channel_id = 50000;
     std::uint64_t churn_instance_id = 200;
+    std::uint64_t next_sequence = 1;
     int fired = 0;
     for (int i = 0; i < kIterations; ++i) {
         // Two back-to-back fires: fire N+1's prep (pull, snapshot copy,
         // schedule_host_publish) overlaps fire N's callback.
         for (int burst = 0; burst < kFiresPerIteration; ++burst) {
+            const std::uint64_t fire_sequence =
+                next_sequence + static_cast<std::uint64_t>(burst);
             PieTerminalCell* cell = &terminals[fired++];
             PieTerminalCell* cells[1] = {cell};
             pie_native::LaunchView view{};
@@ -283,6 +299,14 @@ int main() {
             view.ptir_program_hashes = pie_native::slice_from_u64(&hash, 1);
             view.ptir_program_instances =
                 pie_native::slice_from_u64(instance_ids, 1);
+            const std::uint64_t ticket_heads[2] = {fire_sequence, kNoTicket};
+            const std::uint64_t ticket_tails[2] = {kNoTicket, fire_sequence};
+            view.channel_expected_head =
+                pie_native::slice_from_u64(ticket_heads, 2);
+            view.channel_expected_tail =
+                pie_native::slice_from_u64(ticket_tails, 2);
+            view.channel_ticket_indptr =
+                pie_native::slice_from_u32(channel_ticket_indptr, 2);
             g_stage = "validate_launch";
             const int validate_rc = dispatch.validate_launch(view, &err);
             if (!expect(validate_rc == PIE_STATUS_OK, err.c_str())) return 1;
@@ -295,20 +319,23 @@ int main() {
             if (!expect(dispatch.run(view, d_logits, kVocab, stream, &runtime,
                                      completion),
                         "run accepted")) return 1;
-            // Simulated host endpoints: eager-take the reader outputs and
-            // keep the writer rings fed for the next run-ahead fire.
-            const std::uint32_t token[1] = {1};
-            for (std::size_t c = 0; c < container.channels.size(); ++c) {
-                if (container.channels[c].host_role ==
-                    PIE_CHANNEL_HOST_ROLE_READER) {
-                    advance_reader_head(endpoints[c]);
-                }
-                if (container.channels[c].host_role ==
-                    PIE_CHANNEL_HOST_ROLE_WRITER) {
-                    ring_put(endpoints[c], token, sizeof(token));
-                }
-            }
         }
+
+        cudaDeviceSynchronize();
+        int committed = 0;
+        for (int burst = 0; burst < kFiresPerIteration; ++burst) {
+            const auto outcome = std::atomic_ref<std::uint32_t>(
+                terminals[fired - kFiresPerIteration + burst].outcome)
+                                     .load(std::memory_order_acquire);
+            committed += outcome == PIE_TERMINAL_OUTCOME_SUCCESS ? 1 : 0;
+        }
+        if (!expect(committed == 1, "one ordered fire commits per capacity-1 pair")) {
+            return 1;
+        }
+        advance_reader_head(endpoints[1]);
+        const std::uint32_t token[1] = {1};
+        ring_put(endpoints[0], token, sizeof(token));
+        next_sequence += static_cast<std::uint64_t>(committed);
 
         // Scheduler-thread churn concurrent with the in-flight callbacks:
         // registry growth (vector reallocation) …

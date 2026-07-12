@@ -20,13 +20,30 @@
 #include <cstdlib>
 #include <cstring>
 #include <strings.h>
+#include <unistd.h>
 #include <algorithm>
 #include <atomic>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace pie::metal {
+
+MetalStorageFacts query_metal_storage_facts() {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (device == nil) {
+        throw std::runtime_error("no Metal device");
+    }
+    const MTLSizeAndAlign sa = [device
+        heapBufferSizeAndAlignWithLength:1
+        options:MTLResourceStorageModeShared];
+    const long page = ::sysconf(_SC_PAGESIZE);
+    return MetalStorageFacts{
+        .alignment = static_cast<std::uint32_t>(std::max<NSUInteger>(1, sa.align)),
+        .page_size = static_cast<std::uint32_t>(page > 0 ? page : 1),
+    };
+}
 
 namespace {
 using clk = std::chrono::high_resolution_clock;

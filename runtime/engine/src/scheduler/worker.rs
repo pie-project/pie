@@ -17,7 +17,7 @@ use anyhow::{Result, anyhow};
 use super::batch::{self, BatchAccumulator};
 use super::quorum;
 use super::stats::{self, SchedulerStats};
-use super::{LaunchPreparation, LaunchPreparationError};
+use super::{LaunchPreparation, LaunchPreparationError, RetryClassifier};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FireClause {
@@ -99,13 +99,17 @@ pub(crate) struct PendingRequest {
     /// this module's own unit tests) — the quorum wait-set key
     /// ([`quorum::WaitAllPolicy::on_pipeline_request`]).
     pub(crate) pipeline_id: Option<ProcessId>,
+    /// Submit-order lane for deferred preparation. Requests in the same
+    /// `(pipeline_id, key)` lane may not prepare out of logical-fire order,
+    /// while unrelated lanes may pass a retrying preparation.
+    pub(crate) preparation_order_key: Option<u64>,
     pub(crate) prebuilt: bool,
     /// Stable logical-fire retry state. The request payload and completion are
     /// retained across attempts; only the native terminal cell is reset.
     pub(crate) retry_count: u32,
-    pub(crate) retry_eligible: bool,
     pub(crate) prelaunch_copy: Option<crate::driver::KvCopyPlan>,
     pub(crate) preparation: Option<LaunchPreparation>,
+    pub(crate) retry_classifier: Option<RetryClassifier>,
     pub(crate) preparation_retries: u32,
 }
 
@@ -117,13 +121,12 @@ impl PendingRequest {
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
         pipeline_id: Option<ProcessId>,
+        preparation_order_key: Option<u64>,
         prebuilt: bool,
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
         preparation: Option<LaunchPreparation>,
+        retry_classifier: Option<RetryClassifier>,
     ) -> Self {
-        let retry_eligible = request.rs_slot_ids.is_empty()
-            && request.rs_buffer_slot_ids.is_empty()
-            && request.rs_fold_lens.is_empty();
         Self {
             logical_fire_id: NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed),
             request,
@@ -132,13 +135,68 @@ impl PendingRequest {
             physical_page_ids,
             last_page_len,
             pipeline_id,
+            preparation_order_key,
             prebuilt,
             retry_count: 0,
-            retry_eligible,
             prelaunch_copy,
             preparation,
+            retry_classifier,
             preparation_retries: 0,
         }
+    }
+
+    fn retry_eligible(&self) -> bool {
+        self.request.rs_slot_ids.is_empty()
+            && self.request.rs_buffer_slot_ids.is_empty()
+            && self.request.rs_fold_lens.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct LaunchGrouping {
+    instances: HashSet<u64>,
+    count: usize,
+    forward_tokens: usize,
+    page_refs: usize,
+    has_prebuilt: bool,
+    has_user_mask: bool,
+}
+
+impl LaunchGrouping {
+    fn accepts(&self, request: &PendingRequest, limits: SchedulerLimits, page_size: u32) -> bool {
+        if self.instances.contains(&request.instance_id) {
+            return false;
+        }
+        if self.count != 0
+            && (request.prebuilt
+                || self.has_prebuilt
+                || request.request.has_user_mask
+                || self.has_user_mask)
+        {
+            return false;
+        }
+        if self.count == 0 {
+            return true;
+        }
+        let usage = batch::request_capacity_usage(request, page_size);
+        self.count + 1 <= limits.max_forward_requests
+            && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
+            && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
+    }
+
+    fn push(&mut self, request: &PendingRequest, limits: SchedulerLimits, page_size: u32) -> bool {
+        let usage = batch::request_capacity_usage(request, page_size);
+        self.instances.insert(request.instance_id);
+        self.count += 1;
+        self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
+        self.page_refs = self.page_refs.saturating_add(usage.page_refs);
+        self.has_prebuilt |= request.prebuilt;
+        self.has_user_mask |= request.request.has_user_mask;
+        request.prebuilt
+            || request.request.has_user_mask
+            || self.count >= limits.max_forward_requests
+            || self.forward_tokens >= limits.max_forward_tokens
+            || self.page_refs >= limits.max_page_refs
     }
 }
 
@@ -276,6 +334,12 @@ enum QueuedItem {
     },
 }
 
+#[derive(Clone, Copy)]
+enum QueueEnd {
+    Front,
+    Back,
+}
+
 struct PendingLaunchBatch {
     completion: SubmissionCompletion,
     requests: Vec<PendingRequest>,
@@ -345,8 +409,10 @@ impl SchedulerHandle {
                 physical_page_ids,
                 last_page_len,
                 pipeline_id,
+                None,
                 false,
                 prelaunch_copy,
+                None,
                 None,
             ),
         })
@@ -369,8 +435,10 @@ impl SchedulerHandle {
                 physical_page_ids,
                 last_page_len,
                 None,
+                None,
                 true,
                 prelaunch_copy,
+                None,
                 None,
             ),
         })
@@ -382,7 +450,9 @@ impl SchedulerHandle {
         instance_id: u64,
         completion: WorkItemCompletion,
         pipeline_id: Option<ProcessId>,
+        preparation_order_key: Option<u64>,
         preparation: LaunchPreparation,
+        retry_classifier: Option<RetryClassifier>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
@@ -392,9 +462,11 @@ impl SchedulerHandle {
                 Vec::new(),
                 0,
                 pipeline_id,
+                preparation_order_key,
                 false,
                 None,
                 Some(preparation),
+                retry_classifier,
             ),
         })
     }
@@ -701,7 +773,9 @@ impl BatchScheduler {
             SchedulerItem::PipelineLeave(pid) => policy.on_pipeline_leave(pid),
             SchedulerItem::Launch { pending: launch } => {
                 let validation = BatchAccumulator::new(limits, page_size);
-                let rejection = if !instances.contains_key(&launch.instance_id) {
+                let rejection = if launch.completion.cancel_requested() {
+                    Some("logical fire cancelled before scheduler admission".to_string())
+                } else if !instances.contains_key(&launch.instance_id) {
                     Some(format!(
                         "instance {} is unknown or stale",
                         launch.instance_id
@@ -714,7 +788,7 @@ impl BatchScheduler {
                     None
                 };
                 if let Some(message) = rejection {
-                    launch.completion.reject(message);
+                    launch.completion.reject_unsubmitted(message);
                 } else if launch.preparation.is_some() {
                     policy.on_retry_participation(launch.pipeline_id);
                     pending.push_back(QueuedItem::Prepare(launch));
@@ -724,7 +798,7 @@ impl BatchScheduler {
                     // wait-set/untracked-ready even while it sits in
                     // `pending` behind an in-flight-depth or quorum hold.
                     policy.on_pipeline_request(launch.pipeline_id, Instant::now());
-                    Self::queue_attempt_back(pending, launch);
+                    Self::queue_attempt(pending, launch, QueueEnd::Back);
                 }
             }
             SchedulerItem::RegisterProgram { plan, response } => {
@@ -762,17 +836,7 @@ impl BatchScheduler {
         }
     }
 
-    fn queue_attempt_back(pending: &mut VecDeque<QueuedItem>, request: PendingRequest) {
-        if let Some(plan) = request.prelaunch_copy.clone() {
-            pending.push_back(QueuedItem::PreLaunchCopy {
-                plan,
-                logical_completion: request.completion.clone(),
-            });
-        }
-        pending.push_back(QueuedItem::Launch(request));
-    }
-
-    fn queue_attempt_front(pending: &mut VecDeque<QueuedItem>, request: PendingRequest) {
+    fn queue_attempt(pending: &mut VecDeque<QueuedItem>, request: PendingRequest, end: QueueEnd) {
         let copy = request
             .prelaunch_copy
             .clone()
@@ -780,10 +844,37 @@ impl BatchScheduler {
                 plan,
                 logical_completion: request.completion.clone(),
             });
-        pending.push_front(QueuedItem::Launch(request));
-        if let Some(copy) = copy {
-            pending.push_front(copy);
+        match end {
+            QueueEnd::Front => {
+                pending.push_front(QueuedItem::Launch(request));
+                if let Some(copy) = copy {
+                    pending.push_front(copy);
+                }
+            }
+            QueueEnd::Back => {
+                if let Some(copy) = copy {
+                    pending.push_back(copy);
+                }
+                pending.push_back(QueuedItem::Launch(request));
+            }
         }
+    }
+
+    fn preparation_has_earlier_lane_member(
+        pending: &VecDeque<QueuedItem>,
+        request: &PendingRequest,
+    ) -> bool {
+        let Some(key) = request.preparation_order_key else {
+            return false;
+        };
+        pending.iter().skip(1).any(|item| {
+            let QueuedItem::Prepare(earlier) = item else {
+                return false;
+            };
+            earlier.pipeline_id == request.pipeline_id
+                && earlier.preparation_order_key == Some(key)
+                && earlier.logical_fire_id < request.logical_fire_id
+        })
     }
 
     /// Peeks how many requests at `pending`'s front would land in the NEXT
@@ -800,11 +891,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         page_size: u32,
     ) -> usize {
-        let mut count = 0usize;
-        let mut total_tokens = 0usize;
-        let mut total_pages = 0usize;
-        let mut batch_instances: HashSet<u64> = HashSet::new();
-        let mut batch_has_user_mask = false;
+        let mut grouping = LaunchGrouping::default();
         for item in pending.iter() {
             let QueuedItem::Launch(next) = item else {
                 break;
@@ -812,38 +899,14 @@ impl BatchScheduler {
             if !instances.contains_key(&next.instance_id) {
                 continue;
             }
-            if batch_instances.contains(&next.instance_id) {
+            if !grouping.accepts(next, limits, page_size) {
                 break;
             }
-            let usage = batch::request_capacity_usage(next, page_size);
-            let next_masked = next.request.has_user_mask;
-            if count > 0 && (next_masked || batch_has_user_mask) {
-                break;
-            }
-            if count > 0
-                && (count + 1 > limits.max_forward_requests
-                    || total_tokens.saturating_add(usage.forward_tokens)
-                        > limits.max_forward_tokens
-                    || total_pages.saturating_add(usage.page_refs) > limits.max_page_refs)
-            {
-                break;
-            }
-            batch_instances.insert(next.instance_id);
-            total_tokens = total_tokens.saturating_add(usage.forward_tokens);
-            total_pages = total_pages.saturating_add(usage.page_refs);
-            batch_has_user_mask |= next_masked;
-            count += 1;
-            if next_masked {
-                break; // solo mask-carrying fire
-            }
-            if count >= limits.max_forward_requests
-                || total_tokens >= limits.max_forward_tokens
-                || total_pages >= limits.max_page_refs
-            {
+            if grouping.push(next, limits, page_size) {
                 break;
             }
         }
-        count
+        grouping.count
     }
 
     fn dispatch_ready_items(
@@ -870,9 +933,44 @@ impl BatchScheduler {
             };
             match item {
                 QueuedItem::Prepare(_) => {
+                    if pending.front().is_some_and(|item| {
+                        matches!(
+                            item,
+                            QueuedItem::Prepare(request)
+                                if request.completion.cancel_requested()
+                        )
+                    }) {
+                        let Some(QueuedItem::Prepare(request)) = pending.pop_front() else {
+                            unreachable!();
+                        };
+                        request.completion.reject_unsubmitted(
+                            "logical fire cancelled during dispatch preparation",
+                        );
+                        progress = true;
+                        continue;
+                    }
+                    let should_defer = match pending.front() {
+                        Some(QueuedItem::Prepare(request)) => {
+                            Self::preparation_has_earlier_lane_member(pending, request)
+                        }
+                        _ => false,
+                    };
+                    if should_defer {
+                        let request = pending.pop_front().expect("prepare front");
+                        pending.push_back(request);
+                        progress = true;
+                        continue;
+                    }
                     let Some(QueuedItem::Prepare(mut request)) = pending.pop_front() else {
                         unreachable!();
                     };
+                    if stopping {
+                        request.completion.reject_unsubmitted(
+                            "scheduler shutdown interrupted dispatch preparation",
+                        );
+                        progress = true;
+                        continue;
+                    }
                     let result = request
                         .preparation
                         .as_mut()
@@ -896,17 +994,27 @@ impl BatchScheduler {
                             );
                             request.preparation = None;
                             let validation = BatchAccumulator::new(limits, page_size);
-                            if let Some(message) = validation.single_request_limit_error(&request) {
-                                request.completion.reject(message);
+                            if request.completion.cancel_requested() {
+                                request.completion.reject_unsubmitted(
+                                    "logical fire cancelled during dispatch preparation",
+                                );
+                            } else if let Some(message) =
+                                validation.single_request_limit_error(&request)
+                            {
+                                request.completion.reject_unsubmitted(message);
                             } else {
                                 policy.on_pipeline_request(request.pipeline_id, Instant::now());
-                                Self::queue_attempt_back(pending, request);
+                                Self::queue_attempt(pending, request, QueueEnd::Back);
                             }
                         }
                         Err(LaunchPreparationError::Retry(reason)) => {
                             request.preparation_retries += 1;
-                            if request.preparation_retries > max_fire_retries() {
-                                request.completion.reject(format!(
+                            if request.completion.cancel_requested() {
+                                request.completion.reject_unsubmitted(
+                                    "logical fire cancelled during dispatch preparation",
+                                );
+                            } else if request.preparation_retries > max_fire_retries() {
+                                request.completion.reject_unsubmitted(format!(
                                     "dispatch preparation exceeded retry limit: {reason}"
                                 ));
                             } else {
@@ -919,13 +1027,13 @@ impl BatchScheduler {
                             break;
                         }
                         Err(LaunchPreparationError::Failed(reason)) => {
-                            request.completion.reject(reason);
+                            request.completion.reject_unsubmitted(reason);
                         }
                     }
                     progress = true;
                 }
                 QueuedItem::Launch(_) => {
-                    if in_flight_launches.len() >= quorum::max_in_flight() {
+                    if in_flight_launches.len() >= quorum::configured_max_in_flight() {
                         break;
                     }
                     let candidate_size =
@@ -997,6 +1105,13 @@ impl BatchScheduler {
         match item {
             QueuedItem::Launch(_) | QueuedItem::Prepare(_) => unreachable!(),
             QueuedItem::PreLaunchCopy {
+                plan: _,
+                logical_completion,
+            } if logical_completion.cancel_requested() => {
+                logical_completion
+                    .reject_unsubmitted("logical fire cancelled before pre-launch copy");
+            }
+            QueuedItem::PreLaunchCopy {
                 plan,
                 logical_completion,
             } => match driver.as_mut() {
@@ -1009,10 +1124,10 @@ impl BatchScheduler {
                     }
                     Err(error) => {
                         logical_completion
-                            .reject(format!("pre-launch KV copy rejected: {error:#}"));
+                            .reject_unsubmitted(format!("pre-launch KV copy rejected: {error:#}"));
                     }
                 },
-                None => logical_completion.reject("driver has no backend installed"),
+                None => logical_completion.reject_unsubmitted("driver has no backend installed"),
             },
             QueuedItem::RegisterProgram { plan, response } => {
                 let _ = response.send(match driver.as_mut() {
@@ -1160,13 +1275,21 @@ impl BatchScheduler {
         stats: &Arc<SchedulerStats>,
     ) -> bool {
         let mut batch = BatchAccumulator::new(limits, page_size);
-        let mut batch_instances = std::collections::HashSet::new();
-        let mut batch_has_prebuilt = false;
-        let mut batch_has_user_mask = false;
+        let mut grouping = LaunchGrouping::default();
         let mut rejected_stale = false;
         while let Some(QueuedItem::Launch(next)) = pending.front() {
             if next.completion.is_settled() {
                 pending.pop_front();
+                rejected_stale = true;
+                continue;
+            }
+            if next.completion.cancel_requested() {
+                let Some(QueuedItem::Launch(cancelled)) = pending.pop_front() else {
+                    unreachable!();
+                };
+                cancelled
+                    .completion
+                    .reject_unsubmitted("logical fire cancelled before native launch");
                 rejected_stale = true;
                 continue;
             }
@@ -1177,39 +1300,22 @@ impl BatchScheduler {
                 let Some(QueuedItem::Launch(stale)) = pending.pop_front() else {
                     unreachable!();
                 };
-                stale.completion.reject(format!(
+                stale.completion.reject_unsubmitted(format!(
                     "instance {} is unknown or stale",
                     stale.instance_id
                 ));
                 rejected_stale = true;
                 continue;
             }
-            if !batch_instances.insert(next.instance_id) {
-                break;
-            }
-            // Mask co-batch policy (v1 of the composed multi-program batch):
-            // the driver merges channel-resolved and wire geometry but not
-            // attention MASKS across programs. A mask-carrying fire (dense
-            // device mask or guest BRLE mask) runs SOLO.
-            let next_prebuilt = next.prebuilt;
-            let next_masked = next.request.has_user_mask;
-            if !batch.is_empty() && (next_masked || batch_has_user_mask) {
-                break;
-            }
-            if batch.would_exceed(next) {
+            if !grouping.accepts(next, limits, page_size) {
                 break;
             }
             let QueuedItem::Launch(next) = pending.pop_front().expect("launch front") else {
                 unreachable!();
             };
+            let stop = grouping.push(&next, limits, page_size);
             batch.push(next);
-            batch_has_prebuilt |= next_prebuilt;
-            batch_has_user_mask |= next_masked;
-            let _ = batch_has_prebuilt;
-            if next_masked {
-                break; // solo mask-carrying fire
-            }
-            if batch.is_full() {
+            if stop {
                 break;
             }
         }
@@ -1230,7 +1336,7 @@ impl BatchScheduler {
             let Some(instance) = instances.get(&request.instance_id) else {
                 for request in &mut requests {
                     let message = format!("instance {} is unknown or stale", request.instance_id);
-                    request.completion.reject(message.clone());
+                    request.completion.reject_unsubmitted(message.clone());
                 }
                 return true;
             };
@@ -1259,13 +1365,15 @@ impl BatchScheduler {
                 Err(err) => {
                     let message = format!("direct launch rejected: {err:#}");
                     for request in &mut requests {
-                        request.completion.reject(message.clone());
+                        request.completion.reject_unsubmitted(message.clone());
                     }
                 }
             },
             None => {
                 for request in &mut requests {
-                    request.completion.reject("driver has no backend installed");
+                    request
+                        .completion
+                        .reject_unsubmitted("driver has no backend installed");
                 }
             }
         }
@@ -1299,6 +1407,9 @@ impl BatchScheduler {
             }
             match result {
                 Ok(()) => {
+                    for request in &retired.requests {
+                        request.completion.mark_native_retired();
+                    }
                     let mut retries = Vec::new();
                     for mut request in retired.requests {
                         match request.completion.resolve_from_terminal() {
@@ -1307,14 +1418,26 @@ impl BatchScheduler {
                             ) => {}
                             Ok(WorkItemAttemptOutcome::Retry) => {
                                 request.retry_count += 1;
-                                if stopping {
+                                if request.completion.cancel_requested() {
+                                    request
+                                        .completion
+                                        .reject("logical fire cancelled after native attempt");
+                                } else if stopping {
                                     request
                                         .completion
                                         .reject("scheduler shutdown interrupted a retrying fire");
-                                } else if !request.retry_eligible {
+                                } else if !request.retry_eligible() {
                                     request.completion.reject(
                                         "driver requested RETRY for an RS-carrying, retry-ineligible fire",
                                     );
+                                } else if let Some(reason) = request
+                                    .retry_classifier
+                                    .as_ref()
+                                    .and_then(|classify| classify())
+                                {
+                                    request.completion.reject(format!(
+                                        "driver requested RETRY for a permanent channel condition: {reason}"
+                                    ));
                                 } else if request.retry_count > max_fire_retries() {
                                     request.completion.reject(format!(
                                         "fire exceeded retry limit {}",
@@ -1342,7 +1465,7 @@ impl BatchScheduler {
                         }
                     }
                     for request in retries.into_iter().rev() {
-                        Self::queue_attempt_front(pending, request);
+                        Self::queue_attempt(pending, request, QueueEnd::Front);
                     }
                     stats::record_fire_stats(
                         stats,
@@ -1382,7 +1505,7 @@ impl BatchScheduler {
                 .as_ref()
                 .and_then(|pending| pending.logical_completion.as_ref())
             {
-                logical.reject(format!("pre-launch KV copy failed: {err:#}"));
+                logical.reject_unsubmitted(format!("pre-launch KV copy failed: {err:#}"));
             }
         }
         *in_flight_control = None;
@@ -2080,6 +2203,95 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_stops_retry_after_the_live_attempt_retires() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                retry_launches_remaining: max_fire_retries(),
+                callback_delay_ms: 20,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            completion.clone(),
+        )?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        completion.request_cancel();
+
+        let error = timeout(Duration::from_secs(5), completion)
+            .await?
+            .expect_err("cancelled retry must reject");
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == "launch")
+                .count(),
+            1,
+            "cancellation waits for the live attempt but never launches another"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn permanent_retry_classifier_fails_without_burning_the_retry_budget()
+    -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                retry_launches_remaining: max_fire_retries(),
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let preparation: crate::scheduler::LaunchPreparation = Box::new(|_| {
+            Ok(crate::scheduler::PreparedLaunch {
+                page_refs: Vec::new(),
+                last_page_len: 0,
+                copy_src: Vec::new(),
+                copy_dst: Vec::new(),
+            })
+        });
+        let classifier: crate::scheduler::RetryClassifier =
+            Box::new(|| Some("writer endpoint closed".to_string()));
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_async_deferred(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Some(ProcessId::new_v4()),
+            None,
+            completion.clone(),
+            preparation,
+            Some(classifier),
+        )?;
+
+        let error = timeout(Duration::from_secs(5), completion)
+            .await?
+            .expect_err("permanent retry cause must reject");
+        assert!(error.to_string().contains("writer endpoint closed"));
+        assert_eq!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == "launch")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dispatch_preparation_retries_before_the_single_driver_attempt() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) =
@@ -2107,8 +2319,10 @@ mod tests {
             driver_id,
             bound.instance_id,
             Some(ProcessId::new_v4()),
+            None,
             completion.clone(),
             preparation,
+            None,
         )?;
         timeout(Duration::from_secs(5), completion).await??;
         assert_eq!(attempts.load(Ordering::Acquire), 2);
@@ -2120,6 +2334,103 @@ mod tests {
                 .filter(|entry| entry.as_str() == "launch")
                 .count(),
             1
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retrying_preparation_preserves_lane_order_without_global_blocking()
+    -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
+        let pid = ProcessId::new_v4();
+        let allow_first = Arc::new(AtomicBool::new(false));
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let first_allow = allow_first.clone();
+        let first_order = order.clone();
+        let first_preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
+            if !first_allow.load(Ordering::Acquire) {
+                return Err(crate::scheduler::LaunchPreparationError::Retry(
+                    "first lane member is waiting".to_string(),
+                ));
+            }
+            first_order.lock().unwrap().push("first");
+            Ok(crate::scheduler::PreparedLaunch {
+                page_refs: Vec::new(),
+                last_page_len: 0,
+                copy_src: Vec::new(),
+                copy_dst: Vec::new(),
+            })
+        });
+        let second_allow = allow_first.clone();
+        let second_order = order.clone();
+        let second_preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
+            assert!(
+                second_allow.load(Ordering::Acquire),
+                "a later same-lane preparation overtook its predecessor"
+            );
+            second_order.lock().unwrap().push("second");
+            Ok(crate::scheduler::PreparedLaunch {
+                page_refs: Vec::new(),
+                last_page_len: 0,
+                copy_src: Vec::new(),
+                copy_dst: Vec::new(),
+            })
+        });
+        let unblock_order = order.clone();
+        let unblock_preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
+            unblock_order.lock().unwrap().push("unrelated");
+            allow_first.store(true, Ordering::Release);
+            Err(crate::scheduler::LaunchPreparationError::Failed(
+                "test-only unrelated preparation stop".to_string(),
+            ))
+        });
+
+        let first = bound.reserve_completion();
+        crate::scheduler::submit_async_deferred(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Some(pid),
+            Some(7),
+            first.clone(),
+            first_preparation,
+            None,
+        )?;
+        let second = bound.reserve_completion();
+        crate::scheduler::submit_async_deferred(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Some(pid),
+            Some(7),
+            second.clone(),
+            second_preparation,
+            None,
+        )?;
+        let unrelated = bound.reserve_completion();
+        crate::scheduler::submit_async_deferred(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            Some(pid),
+            Some(8),
+            unrelated.clone(),
+            unblock_preparation,
+            None,
+        )?;
+
+        timeout(Duration::from_secs(5), async {
+            first.await?;
+            second.await?;
+            let _ = unrelated.await.expect_err("unrelated preparation stops");
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            ["unrelated", "first", "second"]
         );
         Ok(())
     }

@@ -55,6 +55,19 @@ pub fn lower_layout_plan(
         next_buffer: 0,
         next_instr: 0,
     };
+    compiler.program.sources = metadata
+        .tensors
+        .iter()
+        .map(|tensor| crate::storage::SourceTensorDecl {
+            id: tensor.id,
+            name: tensor.name.clone(),
+            file_id: tensor.file_id,
+            file_offset: tensor.file_offset,
+            span_bytes: tensor.span_bytes,
+            shape: tensor.shape.clone(),
+            encoding: tensor.encoding.clone(),
+        })
+        .collect();
     compiler.lower()?;
     Ok(compiler.program)
 }
@@ -1016,12 +1029,6 @@ fn recompute_memory_plan(program: &mut StorageProgram) -> Result<(), CompileErro
     Ok(())
 }
 
-/// Minimum alignment (bytes) for every persistent operand buffer in the
-/// arena. 256 matches the cudaMalloc arena-base granularity and guarantees
-/// the ≥16-byte alignment cuBLASLt needs to select its fast `align8` sm_80
-/// bf16 tensor kernels (vs. slow `align1` sm_75 fallbacks).
-const PERSISTENT_OPERAND_ALIGNMENT: u32 = 256;
-
 fn assign_persistent_offsets(program: &mut StorageProgram) -> Result<(), CompileError> {
     let mut next = 0u64;
     let source_order = persistent_source_order(program)?;
@@ -1038,22 +1045,15 @@ fn assign_persistent_offsets(program: &mut StorageProgram) -> Result<(), Compile
             buffer.persistent_offset = None;
             continue;
         }
-        // Alignment is a property of the allocation *unit* — the persistent
-        // buffer a runtime kernel receives as an operand (a standalone
-        // weight, or a packed backing buffer that experts/shards are written
-        // into and exposed from via single-backing `CreateView`s). Packed
-        // members live as internal offsets *within* one backing buffer, so
-        // aligning the buffer moves the whole unit together and never breaks
-        // a packed view. We therefore align every persistent operand buffer
-        // to `PERSISTENT_OPERAND_ALIGNMENT`: a <16-byte base pointer forces
-        // cuBLASLt off its fast `align8` sm_80 tensor kernels onto slow
-        // `align1` sm_75 ones (~6% dense-bf16 decode regression on
-        // gemma-4-E4B). Honor any larger declared `buffer.alignment` too.
-        // Cost: minor per-unit arena padding + reduced *cross-unit* bulk-copy
-        // coalescing (intra-unit coalescing is preserved) — inference
-        // throughput dominates one-time load. Previously hardcoded to 1
-        // purely to maximize coalescing.
-        let alignment = u64::from(buffer.alignment.max(PERSISTENT_OPERAND_ALIGNMENT));
+        // Alignment belongs to the persistent allocation unit. The driver
+        // reports the device minimum in StorageTarget; a tensor contract may
+        // request a larger value. Packed views remain internal to that unit.
+        let alignment = u64::from(
+            buffer
+                .alignment
+                .max(program.target.preferred_alignment)
+                .max(1),
+        );
         let offset = align_up_u64(next, alignment)?;
         next = offset
             .checked_add(buffer.bytes)
@@ -1115,10 +1115,8 @@ fn align_up_u64(value: u64, alignment: u64) -> Result<u64, CompileError> {
 /// relies on. Checked explicitly on the final program so a future rewrite fails
 /// fast instead of silently regressing — these were previously only an implicit
 /// assumption in `assign_persistent_offsets`:
-///   1. every persistent operand buffer base is aligned to its contract
-///      (`>= PERSISTENT_OPERAND_ALIGNMENT`, honoring a larger declared
-///      `alignment`). A sub-16-byte base drops cuBLASLt off its fast `align8`
-///      sm_80 kernels (the ~6% gemma-4-E4B dense regression).
+///   1. every persistent operand buffer base is aligned to the device target
+///      and its tensor contract.
 ///   2. persistent operand buffers occupy disjoint arena ranges.
 ///   3. every `CreateView` reads a single backing buffer that exists, and the
 ///      view window lies within it — i.e. packed members stay *internal* to one
@@ -1129,7 +1127,12 @@ fn validate_persistent_layout(program: &StorageProgram) -> Result<(), CompileErr
         let Some(offset) = buffer.persistent_offset else {
             continue;
         };
-        let alignment = u64::from(buffer.alignment.max(PERSISTENT_OPERAND_ALIGNMENT));
+        let alignment = u64::from(
+            buffer
+                .alignment
+                .max(program.target.preferred_alignment)
+                .max(1),
+        );
         if offset % alignment != 0 {
             return Err(CompileError::InvalidInput(format!(
                 "persistent buffer {} base offset {} violates operand alignment {}",
@@ -1725,6 +1728,12 @@ fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError>
         };
         let supported = match program.target.backend {
             BackendKind::Unknown => true,
+            BackendKind::Metal => {
+                matches!(
+                    kind,
+                    TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Reorder
+                )
+            }
             BackendKind::Cuda => {
                 matches!(
                     kind,
@@ -2321,7 +2330,10 @@ mod persistent_layout_tests {
     }
 
     fn program_with(buffers: Vec<BufferDecl>) -> StorageProgram {
-        let mut p = StorageProgram::empty(StorageTarget::default());
+        let mut p = StorageProgram::empty(StorageTarget {
+            preferred_alignment: 256,
+            ..StorageTarget::default()
+        });
         p.buffers = buffers;
         p
     }
@@ -2337,7 +2349,7 @@ mod persistent_layout_tests {
 
     #[test]
     fn rejects_misaligned_operand_base() {
-        // 128 is not a multiple of PERSISTENT_OPERAND_ALIGNMENT (256).
+        // 128 is not a multiple of the fixture target's 256-byte alignment.
         let p = program_with(vec![operand(0, 64, 1, Some(128))]);
         assert!(validate_persistent_layout(&p).is_err());
     }

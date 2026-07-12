@@ -12,8 +12,7 @@
 #include <utility>
 #include <vector>
 
-#include "../../../weight-loader/include/weight_loader.h"
-#include "../../../weight-loader/include/weight_loader_cpp.hpp"
+#include "pie_native/storage_program.hpp"
 #include "loader_config.hpp"
 #include "loader_helpers.hpp"
 #include "loader/dtype_map.hpp"
@@ -37,7 +36,7 @@
 #include "kernels/slab_scatter.hpp"  // slab_scatter() — the transcode kernels moved to transcode_engine.hpp
 #endif
 #include "loader/rust_quant_attachment.hpp"
-#include "loader/safetensors.hpp"
+#include "loader/checkpoint_source.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
 
@@ -48,13 +47,11 @@ namespace wl_cpp = pie_weight_loader::cpp;
 class RustStorageProgramExecutor {
 public:
     RustStorageProgramExecutor(
-        SafetensorsCheckpointSource& loader,
+        CheckpointSource& loader,
         WeightStoreBuilder& weights,
-        std::vector<std::string> source_tensor_names,
         std::vector<RustQuantAttachment> quant_attachments)
         : loader_(loader),
           weights_(weights),
-          source_tensor_names_(std::move(source_tensor_names)),
           quant_attachments_(std::move(quant_attachments))
     {}
 
@@ -285,10 +282,6 @@ private:
             throw std::runtime_error(
                 "rust storage executor: ExtentWrite missing source/dest");
         }
-        if (instr.source.tensor_id >= source_tensor_names_.size()) {
-            throw std::runtime_error(
-                "rust storage executor: source tensor id out of range");
-        }
         auto dst_it = buffers_.find(instr.dest.buffer_id);
         if (dst_it == buffers_.end()) {
             throw std::runtime_error(
@@ -303,7 +296,7 @@ private:
         }
         if (!wl_cpp::compact_extent(instr.source.stride)) {
             copy_strided_extent_to_device(
-                loader_, source_tensor_names_, instr,
+                loader_, instr,
                 dst,
                 wl_cpp::extent_shape(instr.dest.stride));
             return;
@@ -650,9 +643,8 @@ private:
         }
     }
 
-    SafetensorsCheckpointSource& loader_;
+    CheckpointSource& loader_;
     WeightStoreBuilder& weights_;
-    std::vector<std::string> source_tensor_names_;
     std::vector<RustQuantAttachment> quant_attachments_;
     std::unordered_map<std::uint32_t, DeviceTensor> buffers_;
     std::unordered_map<std::uint32_t, std::string> finalized_buffer_names_;
@@ -673,7 +665,7 @@ private:
 #endif
     wl_cpp::StorageProgramIndex program_index_{"rust storage executor"};
     BufferResolver resolver_{buffers_, finalized_buffer_names_, weights_};
-    TranscodeEngine transcode_{loader_, source_tensor_names_, copy_engine_, program_index_, resolver_};
+    TranscodeEngine transcode_{loader_, copy_engine_, program_index_, resolver_};
 };
 
 }  // namespace pie_cuda_driver

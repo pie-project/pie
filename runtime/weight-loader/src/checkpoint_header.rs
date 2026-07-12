@@ -8,9 +8,7 @@
 //! payloads.
 //!
 //! Every checkpoint tensor is emitted as [`Encoding::Raw`] with the storage
-//! dtype the safetensors header declares — exactly like the C++ loader's
-//! `add_tensor` (`driver/cuda/src/loader/rust_loader_input.hpp`), which passes
-//! all tensors through as `Raw`. The scheme-recognition that turns MXFP4
+//! dtype the safetensors header declares. Scheme recognition that turns MXFP4
 //! `*_blocks`/`*_scales` pairs (or block-FP8 weights) into quantized runtime
 //! tensors happens later, by *name*, inside the storage compiler
 //! (`abi.rs::default_for_target`). Real MXFP4 checkpoints (gpt-oss) already

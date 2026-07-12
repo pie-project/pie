@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #include "batch_schedule.hpp"
 #include "decode_consts.hpp"
@@ -110,7 +111,16 @@ int main() {
     if (!ctx) return 1;
     BoundDecode b;
     b.gdn.resize(g.n_layers);
-    for (const std::string& name : decode_weight_tensors(g)) b.weights.emplace(name, ctx->heap_alloc(256));
+    std::unordered_set<std::string> weight_names;
+    for (const auto& dispatch : mb4) {
+        for (const auto& binding :
+             weight_binds(dispatch.kind, dispatch.layer, g, true)) {
+            weight_names.insert(binding.tensor);
+        }
+    }
+    for (const std::string& name : weight_names) {
+        b.weights.emplace(name, ctx->heap_alloc(256));
+    }
     for (int i = 0; i < kIoSlotCount; ++i) b.io[i] = ctx->heap_alloc(4096);
     for (int l = 0; l < g.n_layers; ++l) {
         if (!DecodeGeometry::is_full_attn(l)) {

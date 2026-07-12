@@ -32,6 +32,17 @@ impl DummyDriver {
         self.inner.capabilities()
     }
 
+    pub fn device_facts(&self) -> &pie_driver_abi::DeviceFacts {
+        self.inner.device_facts()
+    }
+
+    pub fn load_model(
+        &mut self,
+        desc: &pie_driver_abi::ModelLoadDesc,
+    ) -> Result<pie_driver_abi::DriverCapabilities> {
+        self.inner.load_model(desc)
+    }
+
     pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
         let borrowed = ProgramDescBorrow::new(desc);
         self.inner.register_program(borrowed.as_raw())

@@ -138,6 +138,25 @@ inline int validate_create_desc(const PieDriverCreateDesc* desc,
     return PIE_STATUS_OK;
 }
 
+inline int validate_model_load_desc(const PieModelLoadDesc* desc,
+                                    PieDriverCaps* caps) noexcept {
+    if (desc == nullptr || caps == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = validate_version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0 || desc->compiler_version == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = validate_bytes(desc->program_bytes);
+    if (status != PIE_STATUS_OK || desc->program_bytes.len == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = validate_bytes(desc->snapshot_dir);
+    if (status != PIE_STATUS_OK || desc->snapshot_dir.len == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
+}
+
 inline int validate_program_desc(const PieProgramDesc* desc,
                                  std::uint64_t* program_id) noexcept {
     if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
@@ -307,7 +326,6 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     PIE_VALIDATE_SLICE(kv_translation_indptr);
     PIE_VALIDATE_SLICE(ptir_program_row_indptr);
     PIE_VALIDATE_SLICE(logical_fire_ids);
-    PIE_VALIDATE_SLICE(retry_eligible);
     PIE_VALIDATE_SLICE(channel_expected_head);
     PIE_VALIDATE_SLICE(channel_expected_tail);
     PIE_VALIDATE_SLICE(channel_ticket_indptr);
@@ -361,7 +379,6 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
             desc->kv_translation_indptr.len,
             desc->ptir_program_row_indptr.len,
             desc->logical_fire_ids.len,
-            desc->retry_eligible.len,
             desc->channel_expected_head.len,
             desc->channel_expected_tail.len,
             desc->channel_ticket_indptr.len,
@@ -375,15 +392,8 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     }
     if ((desc->logical_fire_ids.len != 0 &&
          desc->logical_fire_ids.len != request_count) ||
-        (desc->retry_eligible.len != 0 &&
-         desc->retry_eligible.len != request_count) ||
         desc->channel_expected_head.len != desc->channel_expected_tail.len) {
         return PIE_STATUS_INVALID_ARGUMENT;
-    }
-    for (std::size_t i = 0; i < desc->retry_eligible.len; ++i) {
-        if (desc->retry_eligible.ptr[i] > 1) {
-            return PIE_STATUS_INVALID_ARGUMENT;
-        }
     }
     status = validate_csr(
         desc->kv_translation_indptr,
@@ -395,6 +405,12 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
         desc->channel_expected_head.len,
         request_count);
     if (status != PIE_STATUS_OK) return status;
+    if (desc->channel_ticket_indptr.len != 0 &&
+        desc->channel_ticket_indptr.ptr[
+            desc->channel_ticket_indptr.len - 1] !=
+            desc->channel_expected_head.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
     if (desc->ptir_program_row_indptr.len != 0) {
         const std::size_t wire_rows =
             desc->qo_indptr.len == 0 ? 0 : desc->qo_indptr.len - 1;

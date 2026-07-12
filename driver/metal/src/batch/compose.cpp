@@ -6,6 +6,12 @@ namespace {
 
 constexpr std::uint8_t kRsFlagReset = 1;
 
+template <typename T>
+std::vector<T> copy_slice(const T* ptr, std::size_t len) {
+    if (len == 0) return {};
+    return std::vector<T>(ptr, ptr + len);
+}
+
 }  // namespace
 
 pie_native::LaunchView build_launch_view(const PieLaunchDesc& launch) {
@@ -52,6 +58,58 @@ pie_native::LaunchView build_launch_view(const PieLaunchDesc& launch) {
         pie_native::slice_from_u32(
             launch.kv_translation_indptr.ptr,
             launch.kv_translation_indptr.len);
+    return view;
+}
+
+OwnedLaunchView OwnedLaunchView::capture(const PieLaunchDesc& launch) {
+    OwnedLaunchView owned;
+    owned.token_ids = copy_slice(launch.token_ids.ptr, launch.token_ids.len);
+    owned.position_ids = copy_slice(launch.position_ids.ptr, launch.position_ids.len);
+    owned.kv_page_indices =
+        copy_slice(launch.kv_page_indices.ptr, launch.kv_page_indices.len);
+    owned.kv_page_indptr =
+        copy_slice(launch.kv_page_indptr.ptr, launch.kv_page_indptr.len);
+    owned.kv_last_page_lens =
+        copy_slice(launch.kv_last_page_lens.ptr, launch.kv_last_page_lens.len);
+    owned.qo_indptr = copy_slice(launch.qo_indptr.ptr, launch.qo_indptr.len);
+    owned.rs_slot_ids = copy_slice(launch.rs_slot_ids.ptr, launch.rs_slot_ids.len);
+    owned.rs_slot_flags =
+        copy_slice(launch.rs_slot_flags.ptr, launch.rs_slot_flags.len);
+    owned.sampling_indices =
+        copy_slice(launch.sampling_indices.ptr, launch.sampling_indices.len);
+    owned.sampling_indptr =
+        copy_slice(launch.sampling_indptr.ptr, launch.sampling_indptr.len);
+    owned.kv_translation =
+        copy_slice(launch.kv_translation.ptr, launch.kv_translation.len);
+    owned.kv_translation_indptr =
+        copy_slice(launch.kv_translation_indptr.ptr, launch.kv_translation_indptr.len);
+    return owned;
+}
+
+pie_native::LaunchView OwnedLaunchView::view() const {
+    pie_native::LaunchView view{};
+    view.token_ids = pie_native::slice_from_u32(token_ids.data(), token_ids.size());
+    view.position_ids =
+        pie_native::slice_from_u32(position_ids.data(), position_ids.size());
+    view.kv_page_indices =
+        pie_native::slice_from_u32(kv_page_indices.data(), kv_page_indices.size());
+    view.kv_page_indptr =
+        pie_native::slice_from_u32(kv_page_indptr.data(), kv_page_indptr.size());
+    view.kv_last_page_lens =
+        pie_native::slice_from_u32(kv_last_page_lens.data(), kv_last_page_lens.size());
+    view.qo_indptr = pie_native::slice_from_u32(qo_indptr.data(), qo_indptr.size());
+    view.rs_slot_ids =
+        pie_native::slice_from_u32(rs_slot_ids.data(), rs_slot_ids.size());
+    view.rs_slot_flags =
+        pie_native::slice_from_u8(rs_slot_flags.data(), rs_slot_flags.size());
+    view.sampling_indices =
+        pie_native::slice_from_u32(sampling_indices.data(), sampling_indices.size());
+    view.sampling_indptr =
+        pie_native::slice_from_u32(sampling_indptr.data(), sampling_indptr.size());
+    view.kv_translation =
+        pie_native::slice_from_u32(kv_translation.data(), kv_translation.size());
+    view.kv_translation_indptr = pie_native::slice_from_u32(
+        kv_translation_indptr.data(), kv_translation_indptr.size());
     return view;
 }
 

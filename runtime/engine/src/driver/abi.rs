@@ -64,15 +64,15 @@ impl MaskWordsStorage {
         let mut words = Vec::new();
         word_indptr.push(0);
         for mask in &plan.masks {
-            let bits = mask.to_vec();
-            for chunk in bits.chunks(32) {
-                let mut word = 0u32;
-                for (bit, value) in chunk.iter().enumerate() {
-                    if *value {
-                        word |= 1u32 << bit;
+            let word_count = pie_grammar::bitmask::bitmask_size(mask.len());
+            let start = words.len();
+            words.resize(start + word_count, 0);
+            for (value, run_start, run_end) in mask.iter_runs() {
+                if value {
+                    for bit in run_start..run_end {
+                        pie_grammar::bitmask::set_bit(&mut words[start..], bit);
                     }
                 }
-                words.push(word);
             }
             word_indptr.push(words.len() as u32);
         }
@@ -242,7 +242,6 @@ impl<'a> LaunchDescBorrow<'a> {
             kv_translation_indptr: u32_slice(&submission.kv_translation_indptr),
             ptir_program_row_indptr: u32_slice(&submission.program_row_indptr),
             logical_fire_ids: u64_slice(&submission.logical_fire_ids),
-            retry_eligible: u8_slice(&submission.retry_eligible),
             channel_expected_head: u64_slice(&submission.channel_expected_head),
             channel_expected_tail: u64_slice(&submission.channel_expected_tail),
             channel_ticket_indptr: u32_slice(&submission.channel_ticket_indptr),

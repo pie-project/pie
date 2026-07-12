@@ -6,7 +6,11 @@ use crate::types::{
     TensorDecl, TensorId,
 };
 
-pub const STORAGE_PROGRAM_VERSION: u32 = 3;
+pub const STORAGE_PROGRAM_VERSION: u32 = 4;
+
+pub fn compiler_version() -> u64 {
+    env!("PIE_WL_COMPILER_HASH").parse::<u64>().unwrap_or(0)
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
@@ -50,6 +54,17 @@ pub struct BufferDecl {
     pub alignment: u32,
     pub temporary: bool,
     pub persistent_offset: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceTensorDecl {
+    pub id: TensorId,
+    pub name: String,
+    pub file_id: FileId,
+    pub file_offset: u64,
+    pub span_bytes: u64,
+    pub shape: Vec<i64>,
+    pub encoding: crate::types::Encoding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,8 +193,10 @@ pub enum StorageInstr {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageProgram {
     pub version: u32,
+    pub compiler_version: u64,
     pub target: StorageTarget,
     pub optimizer: OptimizerReport,
+    pub sources: Vec<SourceTensorDecl>,
     pub tensors: Vec<TensorDecl>,
     pub buffers: Vec<BufferDecl>,
     pub instrs: Vec<StorageInstr>,
@@ -191,8 +208,10 @@ impl StorageProgram {
     pub fn empty(target: StorageTarget) -> Self {
         Self {
             version: STORAGE_PROGRAM_VERSION,
+            compiler_version: compiler_version(),
             target,
             optimizer: OptimizerReport::default(),
+            sources: Vec::new(),
             tensors: Vec::new(),
             buffers: Vec::new(),
             instrs: Vec::new(),

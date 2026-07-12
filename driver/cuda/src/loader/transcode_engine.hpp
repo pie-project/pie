@@ -15,12 +15,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../../../weight-loader/include/weight_loader.h"
-#include "../../../weight-loader/include/weight_loader_cpp.hpp"
+#include "pie_native/storage_program.hpp"
 #include "loader_config.hpp"
 #include "loader_helpers.hpp"
 #include "tensor.hpp"
-#include "loader/safetensors.hpp"
+#include "loader/checkpoint_source.hpp"
 #include "loader/buffer_resolver.hpp"
 #include "loader/strided_copy.hpp"
 #include "loader/weight_copy_engine.hpp"
@@ -53,13 +52,11 @@ namespace wl_cpp = pie_weight_loader::cpp;
 
 class TranscodeEngine {
 public:
-    TranscodeEngine(SafetensorsCheckpointSource& loader,
-                    const std::vector<std::string>& source_tensor_names,
+    TranscodeEngine(CheckpointSource& loader,
                     WeightCopyEngine& copy_engine,
                     const wl_cpp::StorageProgramIndex& program_index,
                     BufferResolver& resolver)
-        : loader_(loader), source_tensor_names_(source_tensor_names),
-          copy_engine_(copy_engine), program_index_(program_index),
+        : loader_(loader), copy_engine_(copy_engine), program_index_(program_index),
           resolver_(resolver) {}
 
     ~TranscodeEngine() { free_scratch_noexcept(); }
@@ -159,20 +156,15 @@ private:
         auto* dst = static_cast<std::uint8_t*>(out.data()) + dst_offset;
 
         if (instr.has_source) {
-            if (instr.source.tensor_id >= source_tensor_names_.size()) {
-                throw std::runtime_error(
-                    "rust storage executor: Cast source tensor id out of range");
-            }
             if (!wl_cpp::compact_extent(instr.source.stride)) {
                 throw std::runtime_error(
                     "rust storage executor: non-compact Cast source is not "
                     "implemented");
             }
-            const TensorInfo& info =
-                loader_.info(source_tensor_names_[instr.source.tensor_id]);
+            const auto& info = program_index_.source(instr.source.tensor_id);
             DeviceTensor scratch =
                 DeviceTensor::allocate(
-                    info.dtype,
+                    dtype_from_rust(info.dtype),
                     wl_cpp::extent_shape(instr.source.stride));
             if (scratch.nbytes() != instr.source.span_bytes) {
                 throw std::runtime_error(
@@ -210,12 +202,8 @@ private:
         };
         DeviceTensor source;
         if (instr.has_source) {
-            if (instr.source.tensor_id >= source_tensor_names_.size()) {
-                throw std::runtime_error(
-                    "rust storage executor: Encode source tensor id out of range");
-            }
-            const TensorInfo& info =
-                loader_.info(source_tensor_names_[instr.source.tensor_id]);
+            const auto& info = program_index_.source(instr.source.tensor_id);
+            const DType source_dtype = dtype_from_rust(info.dtype);
             const bool compact = wl_cpp::compact_extent(instr.source.stride);
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
             // Reuse a persistent device tile buffer for compact sources — the
@@ -232,18 +220,18 @@ private:
                 const std::size_t want_bytes =
                     static_cast<std::size_t>(rows) *
                     static_cast<std::size_t>(cols) *
-                    dtype_bytes(info.dtype);
-                const bool is_fp8 = info.dtype == DType::FP8_E4M3;
+                    dtype_bytes(source_dtype);
+                const bool is_fp8 = source_dtype == DType::FP8_E4M3;
                 void*& tile_ptr =
                     is_fp8 ? fp8_source_tile_ptr_ : bf16_source_tile_ptr_;
                 std::size_t& tile_cap =
                     is_fp8 ? fp8_source_tile_bytes_ : bf16_source_tile_bytes_;
                 ensure_dev_buffer(tile_ptr, tile_cap, want_bytes);
-                source = DeviceTensor::view(tile_ptr, info.dtype, tile_shape);
+                source = DeviceTensor::view(tile_ptr,                 source_dtype, tile_shape);
             } else
 #endif
             {
-                source = DeviceTensor::allocate(info.dtype, tile_shape);
+                source = DeviceTensor::allocate(source_dtype, tile_shape);
             }
             if (!compact) {
                 if (row_start != 0 || rows != full_shape[0]) {
@@ -251,9 +239,10 @@ private:
                         "rust storage executor: tiled Encode for non-compact "
                         "sources is not implemented");
                 }
-                copy_strided_extent_to_device(loader_, source_tensor_names_, instr, source.data(), full_shape);
+                copy_strided_extent_to_device(
+                    loader_, instr, source.data(), full_shape);
             } else {
-                const std::uint64_t elem = dtype_bytes(info.dtype);
+                const std::uint64_t elem = dtype_bytes(source_dtype);
                 const std::uint64_t row_bytes =
                     static_cast<std::uint64_t>(cols) * elem;
                 const std::uint64_t off =
@@ -359,9 +348,9 @@ private:
     // caching saves both disk I/O and cudaMalloc churn.
     void ensure_fp8_scale_loaded(
         const std::string& scale_name,
-        const TensorInfo& scale_info,
+        const pie_weight_loader::PieLoaderSourceTensorView& scale_info,
         std::size_t scale_nbytes,
-        const TensorStorageInfo& storage)
+        const pie_weight_loader::PieLoaderSourceTensorView& storage)
     {
         auto it = fp8_scale_cache_.find(scale_name);
         if (it != fp8_scale_cache_.end()) return;
@@ -377,8 +366,8 @@ private:
         // expert weights, each syncing every copy stream. Stream-0 ordering
         // is free.
         copy_engine_.queue_on_stream(
-            storage.shard_id, storage.file_offset,
-            storage.nbytes, entry.data, /*stream=*/0);
+            storage.file_id, storage.file_offset,
+            storage.span_bytes, entry.data, /*stream=*/0);
         (void)scale_info;
         fp8_scale_cache_.emplace(scale_name, entry);
     }
@@ -407,16 +396,19 @@ private:
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode source must be 2-D");
         }
-        const std::string& weight_name =
-            source_tensor_names_[instr.source.tensor_id];
+        const auto& weight_info = program_index_.source(instr.source.tensor_id);
+        const std::string weight_name =
+            pie_weight_loader::cpp::bytes_to_string(weight_info.name);
         const std::string scale_name = weight_name + "_scale_inv";
-        if (!loader_.contains(scale_name)) {
+        const auto* scale_info = program_index_.find_source(scale_name);
+        if (scale_info == nullptr) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode source '" + weight_name +
                 "' has no '_scale_inv' sibling tensor");
         }
-        const TensorInfo& scale_info = loader_.info(scale_name);
-        if (scale_info.shape.size() != 2) {
+        const auto scale_shape =
+            pie_weight_loader::cpp::i64_slice_to_vector(scale_info->shape);
+        if (scale_shape.size() != 2) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode scale '" + scale_name +
                 "' must be 2-D (block-scaled FP8)");
@@ -424,16 +416,17 @@ private:
         // Get the FULL (un-sharded) weight shape from the checkpoint so we
         // can compute the true group_size. The tile's `full_shape` may be
         // TP-sharded and not match the on-disk scale dimensions.
-        const TensorInfo& weight_info = loader_.info(weight_name);
-        if (weight_info.shape.size() != 2) {
+        const auto weight_shape =
+            pie_weight_loader::cpp::i64_slice_to_vector(weight_info.shape);
+        if (weight_shape.size() != 2) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode weight '" + weight_name +
                 "' must be 2-D on disk");
         }
-        const int true_rows = checked_int(weight_info.shape[0], "FP8 weight rows");
-        const int true_cols = checked_int(weight_info.shape[1], "FP8 weight cols");
-        const int scale_rows = checked_int(scale_info.shape[0], "FP8 scale rows");
-        const int scale_cols = checked_int(scale_info.shape[1], "FP8 scale cols");
+        const int true_rows = checked_int(weight_shape[0], "FP8 weight rows");
+        const int true_cols = checked_int(weight_shape[1], "FP8 weight cols");
+        const int scale_rows = checked_int(scale_shape[0], "FP8 scale rows");
+        const int scale_cols = checked_int(scale_shape[1], "FP8 scale cols");
         const int true_group_rows = (scale_rows > 0) ? (true_rows / scale_rows) : 0;
         const int true_group_cols = (scale_cols > 0) ? (true_cols / scale_cols) : 0;
         if (true_group_rows <= 0 || true_group_cols <= 0
@@ -458,17 +451,17 @@ private:
         const std::uint64_t rank_row_off_full = base_byte / true_cols;
         const std::uint64_t rank_col_off_full = base_byte % true_cols;
 
-        if (scale_info.dtype != DType::FP32) {
+        if (dtype_from_rust(scale_info->dtype) != DType::FP32) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode scale '" + scale_name +
                 "' must be FP32");
         }
         // Cache the full FP8 scale per weight: one disk read + one cudaMalloc
         // amortised across every tile of the same Encode instruction.
-        const TensorStorageInfo storage = loader_.storage_info(scale_name);
         const std::size_t scale_nbytes =
             static_cast<std::size_t>(scale_rows) * scale_cols * sizeof(float);
-        ensure_fp8_scale_loaded(scale_name, scale_info, scale_nbytes, storage);
+        ensure_fp8_scale_loaded(
+            scale_name, *scale_info, scale_nbytes, *scale_info);
         const auto& cached_scale = fp8_scale_cache_[scale_name];
         const float* scale_full_ptr =
             static_cast<const float*>(cached_scale.data);
@@ -582,11 +575,8 @@ private:
         const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
         if (instr.has_source) {
-            if (instr.source.tensor_id >= source_tensor_names_.size()) {
-                throw std::runtime_error(
-                    "rust storage executor: Encode source tensor id out of range");
-            }
-            return loader_.info(source_tensor_names_[instr.source.tensor_id]).dtype;
+            return dtype_from_rust(
+                program_index_.source(instr.source.tensor_id).dtype);
         }
         if (instr.input_buffers.len != 1) {
             throw std::runtime_error(
@@ -893,16 +883,12 @@ private:
         const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
         if (instr.has_source) {
-            if (instr.source.tensor_id >= source_tensor_names_.size()) {
-                throw std::runtime_error(
-                    "rust storage executor: Repack source tensor id out of range");
-            }
             DeviceTensor scratch = DeviceTensor::allocate(
                 DType::UINT8,
                 {static_cast<std::int64_t>(instr.source.span_bytes)});
             if (!wl_cpp::compact_extent(instr.source.stride)) {
                 copy_strided_extent_to_device(
-                    loader_, source_tensor_names_, instr,
+                    loader_, instr,
                     scratch.data(),
                     wl_cpp::extent_shape(instr.source.stride));
             } else {
@@ -1153,8 +1139,7 @@ private:
     }
 
 
-    SafetensorsCheckpointSource& loader_;
-    const std::vector<std::string>& source_tensor_names_;
+    CheckpointSource& loader_;
     WeightCopyEngine& copy_engine_;
     const wl_cpp::StorageProgramIndex& program_index_;
     BufferResolver& resolver_;

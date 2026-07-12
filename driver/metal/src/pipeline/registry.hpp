@@ -38,8 +38,6 @@ struct ChannelRecord {
     std::vector<std::uint64_t> words;
     std::unordered_map<std::uint64_t, std::uint8_t> attachments;
     std::uint64_t pulled = 0;
-    std::uint64_t reserved_head = 0;
-    bool seed_credit = false;
     std::shared_ptr<ChannelState> shared_state;
 
     std::size_t numel() const;

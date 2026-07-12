@@ -22,7 +22,6 @@ pub struct LaunchSubmission {
     /// every row it shipped.
     pub program_row_indptr: Vec<u32>,
     pub logical_fire_ids: Vec<u64>,
-    pub retry_eligible: Vec<u8>,
     pub channel_expected_head: Vec<u64>,
     pub channel_expected_tail: Vec<u64>,
     pub channel_ticket_indptr: Vec<u32>,

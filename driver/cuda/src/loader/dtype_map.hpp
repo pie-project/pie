@@ -4,7 +4,7 @@
 // types. No state, no CUDA — factored out of the storage executor so its body
 // stays materialize logic.
 
-#include "../../../weight-loader/include/weight_loader.h"
+#include "pie_native/storage_program.hpp"
 #include "tensor.hpp"
 #include "loader/tensor_spec.hpp"
 #include "model/weight_store.hpp"

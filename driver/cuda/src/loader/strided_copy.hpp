@@ -8,88 +8,82 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <limits>
+#include <cstring>
 
-#include "../../../weight-loader/include/weight_loader.h"
+#include <cuda_runtime.h>
+
+#include "pie_native/storage_program.hpp"
 #include "tensor.hpp"
-#include "loader/safetensors.hpp"
+#include "loader/checkpoint_source.hpp"
 
 namespace pie_cuda_driver {
 
 inline void copy_strided_extent_to_device(
-    SafetensorsCheckpointSource& loader,
-    const std::vector<std::string>& source_tensor_names,
-        const pie_weight_loader::PieLoaderStorageInstrView& instr,
-        void* dst,
-        const std::vector<std::int64_t>& dst_shape)
-    {
-        const std::string& name = source_tensor_names[instr.source.tensor_id];
-        const TensorInfo& info = loader.info(name);
-        const TensorStorageInfo storage = loader.storage_info(name);
-        if (instr.source.file_offset < storage.file_offset) {
-            throw std::runtime_error(
-                "rust storage executor: strided source starts before tensor");
-        }
-        const auto rank = info.shape.size();
-        if (instr.source.stride.dims.len != rank) {
-            throw std::runtime_error(
-                "rust storage executor: strided source rank mismatch for '" +
-                name + "'");
-        }
-
-        std::vector<std::int64_t> dense_strides(rank, 1);
-        std::int64_t stride = static_cast<std::int64_t>(dtype_bytes(info.dtype));
-        for (std::size_t i = rank; i > 0; --i) {
-            dense_strides[i - 1] = stride;
-            stride *= info.shape[i - 1];
-        }
-
-        std::uint64_t relative =
-            instr.source.file_offset - storage.file_offset +
-            instr.source.stride.base_offset;
-        std::vector<TensorSlice> slices;
-        slices.reserve(rank);
-        for (std::size_t axis = 0; axis < rank; ++axis) {
-            const auto& dim = instr.source.stride.dims.ptr[axis];
-            if (dim.src_stride != dense_strides[axis]) {
-                throw std::runtime_error(
-                    "rust storage executor: unsupported strided source layout "
-                    "for '" + name + "'");
-            }
-            if (dim.count < 0 || dim.count > info.shape[axis]) {
-                throw std::runtime_error(
-                    "rust storage executor: strided source count out of range "
-                    "for '" + name + "'");
-            }
-            const auto axis_stride =
-                static_cast<std::uint64_t>(dense_strides[axis]);
-            const std::int64_t start =
-                axis_stride == 0
-                    ? 0
-                    : static_cast<std::int64_t>(relative / axis_stride);
-            relative = axis_stride == 0 ? relative : relative % axis_stride;
-            if (start < 0 || start + dim.count > info.shape[axis]) {
-                throw std::runtime_error(
-                    "rust storage executor: strided source offset out of "
-                    "range for '" + name + "'");
-            }
-            if (start != 0 || dim.count != info.shape[axis]) {
-                slices.push_back(TensorSlice{
-                    .axis = static_cast<int>(axis),
-                    .start = start,
-                    .length = dim.count,
-                });
-            }
-        }
-        if (relative != 0) {
-            throw std::runtime_error(
-                "rust storage executor: strided source offset is not aligned "
-                "to tensor strides for '" + name + "'");
-        }
-        loader.copy_strided_to_device(
-            name,
-            slices,
-            dst,
-            dst_shape);
+    CheckpointSource& loader,
+    const pie_weight_loader::PieLoaderStorageInstrView& instr,
+    void* dst,
+    const std::vector<std::int64_t>& dst_shape) {
+    const auto& extent = instr.source.stride;
+    if (extent.dims.len != dst_shape.size()) {
+        throw std::runtime_error(
+            "storage executor: strided source rank mismatch");
     }
+    std::uint64_t physical_bytes = extent.element_bytes;
+    std::uint64_t elements = 1;
+    for (std::size_t axis = 0; axis < extent.dims.len; ++axis) {
+        const auto& dim = extent.dims.ptr[axis];
+        if (dim.count < 0 || dim.src_stride < 0 ||
+            dim.count != dst_shape[axis]) {
+            throw std::runtime_error(
+                "storage executor: invalid strided source geometry");
+        }
+        const std::uint64_t count = static_cast<std::uint64_t>(dim.count);
+        if (count != 0) {
+            physical_bytes += (count - 1) *
+                static_cast<std::uint64_t>(dim.src_stride);
+        }
+        if (count != 0 &&
+            elements > std::numeric_limits<std::uint64_t>::max() / count) {
+            throw std::runtime_error(
+                "storage executor: strided element count overflow");
+        }
+        elements *= count;
+    }
+    const std::uint64_t compact_bytes =
+        elements * static_cast<std::uint64_t>(extent.element_bytes);
+    if (compact_bytes != instr.source.span_bytes) {
+        throw std::runtime_error(
+            "storage executor: strided compact byte count mismatch");
+    }
+    const auto* source = loader.storage_host_ptr(
+        instr.source.file_id,
+        instr.source.file_offset + extent.base_offset,
+        physical_bytes);
+    std::vector<std::uint8_t> compact(
+        static_cast<std::size_t>(compact_bytes));
+    for (std::uint64_t linear = 0; linear < elements; ++linear) {
+        std::uint64_t remaining = linear;
+        std::uint64_t source_offset = 0;
+        for (std::size_t axis = extent.dims.len; axis > 0; --axis) {
+            const std::uint64_t count =
+                static_cast<std::uint64_t>(extent.dims.ptr[axis - 1].count);
+            const std::uint64_t index = count == 0 ? 0 : remaining % count;
+            remaining = count == 0 ? remaining : remaining / count;
+            source_offset += index *
+                static_cast<std::uint64_t>(
+                    extent.dims.ptr[axis - 1].src_stride);
+        }
+        std::memcpy(
+            compact.data() + linear * extent.element_bytes,
+            source + source_offset,
+            extent.element_bytes);
+    }
+    CUDA_CHECK(cudaMemcpy(
+        dst,
+        compact.data(),
+        compact.size(),
+        cudaMemcpyHostToDevice));
+}
 
 }  // namespace pie_cuda_driver

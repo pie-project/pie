@@ -1,13 +1,35 @@
-//! Cold create-time driver capabilities.
+//! Cold driver facts returned by the two boot calls.
 //!
-//! Drivers return a versioned JSON document once at create time. The runtime uses
-//! the parsed [`DriverCapabilities`] for allocation ceilings, batching limits,
-//! model metadata, and weight-layout planning. Legacy IPC-only fields are
-//! intentionally gone from this final local contract.
+//! `create` returns [`DeviceFacts`], which contains only properties that can be
+//! queried before a model exists. `load_model` returns [`DriverCapabilities`],
+//! which contains model-derived limits and metadata.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-/// Static driver capabilities reported at handshake time.
+/// Runtime-owned payload for the blocking model-load boot call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelLoadDesc {
+    pub program_bytes: Vec<u8>,
+    pub snapshot_dir: PathBuf,
+    pub compiler_version: u64,
+}
+
+/// Create-time device properties used by the runtime storage compiler.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceFacts {
+    pub abi_version: u32,
+    pub backend: String,
+    pub unified_memory: bool,
+    pub fp8_native: bool,
+    pub native_mxfp4_moe: bool,
+    pub storage_alignment: u32,
+    pub storage_max_tile_bytes: u64,
+    pub page_size: u32,
+}
+
+/// Model-derived capabilities returned after the storage program is executed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DriverCapabilities {
@@ -45,42 +67,15 @@ pub struct DriverCapabilities {
     /// Optional snapshot directory the driver can use to persist state.
     #[serde(default)]
     pub snapshot_dir: String,
-    // ---- Device storage-target hints (weight-loader Variant A) ----
-    // These describe how the device wants persistent weights laid out so the
-    // in-process storage compiler can plan residency. All are `serde(default)`
-    // so drivers that predate the handshake (or don't care) parse cleanly with
-    // neutral values.
-    /// Device storage backend tag (e.g. `cuda`); empty = unspecified/neutral.
-    #[serde(default)]
-    pub storage_backend: String,
-    /// Maximum single-copy tile size in bytes the device prefers for staged
-    /// H2D weight transfers; 0 = no limit / driver default.
-    #[serde(default)]
-    pub max_tile_bytes: u64,
-    /// Preferred byte alignment for persistent weight buffers; 0 = neutral
-    /// (compiler falls back to its own default).
-    #[serde(default)]
-    pub preferred_alignment: u32,
-    /// MXFP4 MoE handling policy tag the device advertises (e.g.
-    /// `routed_decode` / `native_gemm` / `eager_bf16`); empty = neutral.
-    #[serde(default)]
-    pub mxfp4_moe_policy: String,
-    /// True when the device has a native MXFP4 MoE GEMM path (so packed
-    /// blocks/scales can stay quantized on device rather than dequantizing).
-    #[serde(default)]
-    pub native_mxfp4_moe: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A minimal handshake JSON carrying only the required (non-default)
-    /// fields — i.e. what an older driver that predates the storage-target
-    /// hints would emit.
-    fn legacy_caps_json() -> &'static str {
+    fn caps_json() -> &'static str {
         r#"{
-            "abi_version": 1,
+            "abi_version": 4,
             "total_pages": 1024,
             "kv_page_size": 16,
             "swap_pool_size": 0,
@@ -95,37 +90,35 @@ mod tests {
     }
 
     #[test]
-    fn storage_fields_default_to_neutral_when_absent() {
-        let caps: DriverCapabilities = serde_json::from_str(legacy_caps_json()).unwrap();
-        assert_eq!(caps.abi_version, 1);
-        assert_eq!(caps.storage_backend, "");
-        assert_eq!(caps.max_tile_bytes, 0);
-        assert_eq!(caps.preferred_alignment, 0);
-        assert_eq!(caps.mxfp4_moe_policy, "");
-        assert!(!caps.native_mxfp4_moe);
+    fn capabilities_round_trip() {
+        let caps: DriverCapabilities = serde_json::from_str(caps_json()).unwrap();
+        let json = serde_json::to_string(&caps).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DriverCapabilities>(&json).unwrap(),
+            caps
+        );
     }
 
     #[test]
-    fn storage_fields_round_trip_through_json() {
-        let mut caps: DriverCapabilities = serde_json::from_str(legacy_caps_json()).unwrap();
-        caps.storage_backend = "cuda".to_string();
-        caps.max_tile_bytes = 64 * 1024 * 1024;
-        caps.preferred_alignment = 256;
-        caps.mxfp4_moe_policy = "native_gemm".to_string();
-        caps.native_mxfp4_moe = true;
-        let json = serde_json::to_string(&caps).unwrap();
-        let back: DriverCapabilities = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.storage_backend, "cuda");
-        assert_eq!(back.max_tile_bytes, 64 * 1024 * 1024);
-        assert_eq!(back.preferred_alignment, 256);
-        assert_eq!(back.mxfp4_moe_policy, "native_gemm");
-        assert!(back.native_mxfp4_moe);
+    fn device_facts_round_trip() {
+        let facts = DeviceFacts {
+            abi_version: 4,
+            backend: "metal".to_string(),
+            unified_memory: true,
+            fp8_native: false,
+            native_mxfp4_moe: false,
+            storage_alignment: 256,
+            storage_max_tile_bytes: 64 << 20,
+            page_size: 16 << 10,
+        };
+        let json = serde_json::to_string(&facts).unwrap();
+        assert_eq!(serde_json::from_str::<DeviceFacts>(&json).unwrap(), facts);
     }
 
     #[test]
     fn deleted_legacy_fields_are_rejected() {
         let json = r#"{
-            "abi_version": 1,
+            "abi_version": 4,
             "total_pages": 1024,
             "kv_page_size": 16,
             "swap_pool_size": 0,

@@ -13,6 +13,6 @@ pub mod capabilities;
 pub mod local;
 pub mod transfer;
 
-pub use capabilities::DriverCapabilities;
+pub use capabilities::{DeviceFacts, DriverCapabilities, ModelLoadDesc};
 pub use local::*;
 pub use transfer::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};

@@ -371,12 +371,13 @@ not success.
 
 ## 7. Implementation status
 
-The terminal-cell, global-endpoint, reservation, and ordered-close portions of
-this boundary are implemented. Metal direct model execution remains explicitly
-unsupported, and CUDA typed copy/resize controls explicitly reject tensor
-parallel configurations until an all-rank control protocol exists. Current
-backend limitations and remaining GPU-only validation are tracked in
-[direct_ffi_fix.md](direct_ffi_fix.md).
+The terminal-cell, global-endpoint, reservation, ordered-close, and direct
+CUDA/Metal model-execution portions of this boundary are implemented. Driver
+creation is device-only; the blocking `load_model` boot verb executes the
+runtime-compiled `StorageProgram` before any PTIR registration. CUDA typed
+copy/resize controls still reject tensor-parallel configurations until an
+all-rank control protocol exists. Storage boot details are specified in
+[storage-refact-and-metal.md](storage-refact-and-metal.md).
 
 ---
 
@@ -432,13 +433,14 @@ native boundary.
 
 | Concern | File |
 |---------|------|
-| Driver subsystem and typed operations | `runtime/engine/src/driver.rs` |
-| Per-driver ordering and batching | `runtime/engine/src/inference/scheduler.rs` |
+| Driver subsystem and typed operations | `runtime/engine/src/driver/` |
+| Per-driver ordering and batching | `runtime/engine/src/scheduler/` |
 | Completion broker and register-then-recheck | `runtime/engine/src/driver/completion.rs` |
 | ABI types and generated C header | `interface/driver/src/local.rs`, `interface/driver/include/pie_driver_abi.h` |
-| Host channel API and endpoint state | `runtime/engine/src/ptir/ptir_host.rs`, `runtime/engine/src/ptir/ptir_channel_store.rs` |
-| CUDA direct driver and PTIR channels | `driver/cuda/src/entry.cpp`, `driver/cuda/src/ptir/` |
-| Metal direct driver | `driver/metal/src/entry.cpp` |
+| Host channel API and endpoint state | `runtime/engine/src/pipeline/channel.rs`, `runtime/engine/src/driver/channel.rs` |
+| Runtime storage compiler | `runtime/weight-loader/` |
+| CUDA direct driver and PTIR channels | `driver/cuda/src/{abi,context}.cpp`, `driver/cuda/src/pipeline/` |
+| Metal direct driver | `driver/metal/src/{abi,context}.cpp` |
 | Dummy direct driver | `driver/dummy/src/lib.rs` |
 
 ---

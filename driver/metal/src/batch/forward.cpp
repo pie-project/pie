@@ -2,8 +2,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <type_traits>
+#include <unistd.h>
 
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
@@ -275,6 +279,8 @@ struct MetalExecutor::Impl {
         const std::string& checkpoint_dir,
         const std::string& kernels_dir,
         const DecodeGeometry& geometry,
+        const pie_weight_loader::StorageProgram& storage_program,
+        std::size_t storage_page_size,
         std::string* error);
     bool ready() const { return ctx_ != nullptr; }
     int vocab() const { return g_.vocab; }
@@ -382,17 +388,24 @@ bool copy_slot_region(const SlotHandle& s, size_t src_off, size_t dst_off, size_
 }  // namespace
 
 bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& kernels_dir,
-                            const DecodeGeometry& geom, std::string* err) {
+                            const DecodeGeometry& geom,
+                            const pie_weight_loader::StorageProgram& storage_program,
+                            std::size_t storage_page_size,
+                            std::string* err) {
     g_ = geom;
 
-    // ── Open the checkpoint (zero-copy mmap) + size the heap from the manifest. The view is
-    //    transient: stage_decode_weights memcpy's every weight into the resident heap, so the
-    //    mmap is released at the end of setup(). ──
+    // The mmap is transient: the StorageProgram copies each finalized tensor
+    // once into the resident weights region.
     SafetensorsView view(ckpt_dir);
-    size_t weights_bytes = 0;
-    for (const auto& name : decode_weight_tensors(g_))
-        weights_bytes += view.get(name).nbytes;
-    plan_ = plan_heap(g_, weights_bytes, max_ctx_);
+    const auto storage = storage_program.view();
+    plan_ = plan_heap(
+        g_,
+        storage.memory.persistent_bytes,
+        max_ctx_,
+        4,
+        2,
+        std::max<std::size_t>(1, storage_page_size),
+        std::max<std::size_t>(1, storage_program.preferred_alignment()));
 
     // ── Build the decode DAG (shipped config: GdnPrep ON, no argmax dispatch — host samples). ──
     dag_ = build_decode_dag(g_, /*with_argmax=*/false, fuse_residual_, gdn_prep_);
@@ -425,7 +438,7 @@ bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& 
     }
 
     // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal. ──
-    b_ = stage_decode_weights(*ctx_, view, g_, plan_);
+    b_ = stage_decode_storage(*ctx_, view, storage_program, g_, plan_);
     bind_decode_dag(*ctx_, b_, dag_, g_, gdn_prep_);
 
     // ── Scratch pool (colors_used slots) → beta's bind pass. ──
@@ -1060,14 +1073,39 @@ bool MetalExecutor::setup_native(
     const std::string& kernels_dir,
     const DecodeGeometry& geometry,
     std::string* error) {
-    auto impl = std::make_unique<Impl>();
-    if (!impl->setup(checkpoint_dir, kernels_dir, geometry, error)) {
+    const char* program_path = std::getenv("PIE_METAL_STORAGE_PROGRAM");
+    if (program_path == nullptr || program_path[0] == '\0') {
+        if (error != nullptr) {
+            *error =
+                "native setup requires PIE_METAL_STORAGE_PROGRAM=<compiled JSON>";
+        }
         return false;
     }
-    impl_ = std::move(impl);
-    vocab_ = static_cast<std::uint32_t>(impl_->vocab());
-    slot_states_.clear();
-    return true;
+    std::ifstream input(program_path, std::ios::binary);
+    if (!input) {
+        if (error != nullptr) {
+            *error = std::string("cannot open StorageProgram: ") + program_path;
+        }
+        return false;
+    }
+    SetupConfig config;
+    config.checkpoint_dir = checkpoint_dir;
+    config.kernels_dir = kernels_dir;
+    config.arch_name = "qwen3_5";
+    config.vocab_size = static_cast<std::uint32_t>(geometry.vocab);
+    config.has_linear_attn = true;
+    config.total_pages = static_cast<std::uint32_t>(std::max(0, geometry.total_pages));
+    config.kv_page_size = static_cast<std::uint32_t>(std::max(1, geometry.kv_page_size));
+    config.max_forward_tokens =
+        static_cast<std::uint32_t>(std::max(1, geometry.max_tokens));
+    config.max_forward_requests =
+        static_cast<std::uint32_t>(std::max(1, geometry.max_requests));
+    config.storage_program.assign(
+        std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>());
+    config.storage_page_size =
+        static_cast<std::uint32_t>(std::max<long>(1, ::sysconf(_SC_PAGESIZE)));
+    return setup(config, error);
 }
 
 bool MetalExecutor::setup_kv_pool_native(
@@ -1146,6 +1184,23 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         return false;
     }
     auto impl = std::make_unique<Impl>();
+    pie_weight_loader::StorageProgram storage_program;
+    try {
+        storage_program = pie_weight_loader::StorageProgram::deserialize(
+            std::span<const std::uint8_t>(
+                cfg.storage_program.data(), cfg.storage_program.size()),
+            cfg.compiler_version);
+    } catch (const std::exception& error) {
+        if (err != nullptr) {
+            *err = std::string("StorageProgram decode failed: ") + error.what();
+        }
+        return false;
+    }
+    if (storage_program.backend() !=
+        pie_weight_loader::PieLoaderBackendKind::Metal) {
+        if (err != nullptr) *err = "StorageProgram target is not Metal";
+        return false;
+    }
     DecodeGeometry geom{};  // shipped qwen3.6 defaults
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes
@@ -1178,7 +1233,13 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         return false;
     }
     std::string derr;
-    if (!impl->setup(cfg.checkpoint_dir, cfg.kernels_dir, geom, &derr)) {
+    if (!impl->setup(
+            cfg.checkpoint_dir,
+            cfg.kernels_dir,
+            geom,
+            storage_program,
+            cfg.storage_page_size,
+            &derr)) {
         if (err != nullptr) *err = "Metal forward setup failed: " + derr;
         return false;
     }

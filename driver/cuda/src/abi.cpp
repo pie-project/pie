@@ -28,8 +28,27 @@ PieDriver* create_context(const PieDriverCreateDesc& desc, PieDriverCaps* caps) 
     if (context->initialize(config_path, desc.runtime) != PIE_STATUS_OK) {
         return nullptr;
     }
-    context->fill_caps(caps);
+    context->fill_device_facts(caps);
     return reinterpret_cast<PieDriver*>(context.release());
+}
+
+extern "C" int32_t pie_cuda_load_model(
+    PieDriver* driver,
+    const PieModelLoadDesc* load,
+    PieDriverCaps* caps) {
+    const int status = pie_native::abi::validate_model_load_desc(load, caps);
+    if (status != PIE_STATUS_OK) return status;
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        std::memset(caps, 0, sizeof(*caps));
+        return as_context(driver)->load_model(*load, caps);
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-cuda] load_model: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
+    } catch (...) {
+        std::cerr << "[pie-driver-cuda] load_model: unknown exception\n";
+        return PIE_STATUS_DRIVER_ERROR;
+    }
 }
 
 }  // namespace

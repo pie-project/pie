@@ -21,24 +21,6 @@ namespace pie_cuda_driver {
 
 namespace {
 
-// Device storage-target constants advertised to the runtime and used by the
-// driver-side storage compile. The device prefers 64 MiB staged H2D tiles and
-// 256-byte-aligned persistent weight buffers.
-constexpr std::uint64_t kStorageMaxTileBytes = 64ull * 1024ull * 1024ull;
-constexpr std::uint32_t kStoragePreferredAlignment = 256;
-
-// Map the driver's MXFP4 MoE lowering choice onto the wire policy tag the
-// runtime's DriverCapabilities exposes (`mxfp4_moe_policy`).
-inline const char* mxfp4_moe_policy_tag(Mxfp4MoeLowering lowering) noexcept {
-    switch (lowering) {
-        case Mxfp4MoeLowering::NativeGemm:  return "native_gemm";
-        case Mxfp4MoeLowering::Bf16Dequant: return "eager_bf16";
-        case Mxfp4MoeLowering::RoutedDequant:
-        default:                            return "routed_decode";
-    }
-}
-
-
 // llama-like and assumes the standard name layout — gemma/mixtral/MoE need
 // their own plan (per-expert weights, dual-norm, etc.).
 bool supports_tp(const std::string& mt) {
@@ -70,37 +52,6 @@ bool supports_tp(const std::string& mt) {
 bool model_type_is_qwen3_5_moe(const std::string& mt) {
     return mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
         || mt == "qwen3_moe";
-}
-
-Mxfp4MoeLowering select_mxfp4_moe_lowering(
-    const ModelConfig& model_cfg,
-    const BackendTarget& target)
-{
-    const std::string& policy = model_cfg.mxfp4_moe;
-    if (policy.empty() || policy == "auto") {
-        return target.mxfp4_native_gemm
-            ? Mxfp4MoeLowering::NativeGemm
-            : Mxfp4MoeLowering::RoutedDequant;
-    }
-    if (policy == "routed_dequant" || policy == "packed") {
-        return Mxfp4MoeLowering::RoutedDequant;
-    }
-    if (policy == "bf16" || policy == "dequant" ||
-        policy == "eager_bf16") {
-        return Mxfp4MoeLowering::Bf16Dequant;
-    }
-    if (policy == "native") {
-        if (!target.mxfp4_native_gemm) {
-            throw std::runtime_error(
-                "engine: model.mxfp4_moe='native' requested a true MXFP4 "
-                "MoE GEMM backend, but this build has no registered native "
-                "MXFP4 expert GEMM kernels");
-        }
-        return Mxfp4MoeLowering::NativeGemm;
-    }
-    throw std::runtime_error(
-        "engine: model.mxfp4_moe must be one of "
-        "{auto,routed_dequant,packed,bf16,dequant,eager_bf16,native}");
 }
 
 struct LoadMemorySampler {
@@ -152,7 +103,11 @@ private:
 
 }  // namespace
 
-LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
+LoadedModel LoadedModel::load(
+    const Config& boot_cfg,
+    NcclComm* tp_comm,
+    std::span<const std::uint8_t> program_bytes,
+    std::uint64_t compiler_version) {
     (void)tp_comm;
 
     if (boot_cfg.model.snapshot_dir.empty()) {
@@ -199,13 +154,6 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     CUDA_CHECK(cudaGetDeviceProperties(&dev_prop, dev_id));
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
-    if (boot_cfg.model.runtime_quant == "fp8" && !fp8_native) {
-        std::cerr << "[pie-driver-cuda] runtime_quant=fp8 skipped: "
-                  << "sm" << dev_prop.major << dev_prop.minor
-                  << " has no native FP8 GEMM. Weights stay bf16 "
-                  << "(use runtime_quant=int8 or marlin Int4 / GPTQ "
-                  << "for memory + perf wins on this generation).\n";
-    }
 #ifdef PIE_CUDA_HAS_MARLIN
     const bool gptq_marlin_int4 = true;
     // Native MXFP4 expert execution requires a Blackwell-class FP4 path.
@@ -223,17 +171,31 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         .gptq_marlin_int4 = gptq_marlin_int4,
         .mxfp4_native_gemm = mxfp4_native_gemm,
     };
-    backend_target.mxfp4_moe =
-        select_mxfp4_moe_lowering(boot_cfg.model, backend_target);
+    RustStorageProgram storage_program =
+        deserialize_rust_storage_program(program_bytes, compiler_version);
+    switch (storage_program.mxfp4_moe()) {
+    case pie_weight_loader::PieLoaderMxfp4MoePolicy::NativeGemm:
+        if (!backend_target.mxfp4_native_gemm) {
+            throw std::runtime_error(
+                "engine: StorageProgram requires native MXFP4 MoE, but this "
+                "device/build does not provide it");
+        }
+        backend_target.mxfp4_moe = Mxfp4MoeLowering::NativeGemm;
+        break;
+    case pie_weight_loader::PieLoaderMxfp4MoePolicy::EagerBf16:
+        backend_target.mxfp4_moe = Mxfp4MoeLowering::Bf16Dequant;
+        break;
+    case pie_weight_loader::PieLoaderMxfp4MoePolicy::RoutedDecode:
+        backend_target.mxfp4_moe = Mxfp4MoeLowering::RoutedDequant;
+        break;
+    }
     e.mxfp4_moe_lowering_ = backend_target.mxfp4_moe;
-    e.mxfp4_native_gemm_ = backend_target.mxfp4_native_gemm;
 
     log_stage("open safetensors begin");
-    auto loader = SafetensorsCheckpointSource::open(snapshot);
+    auto loader = CheckpointSource::open(snapshot);
     log_stage("open safetensors done");
 
     const int tp_size = boot_cfg.distributed.tp_size;
-    const int tp_rank = boot_cfg.distributed.tp_rank;
     if (tp_size > 1 && !supports_tp(e.hf_.model_type)) {
         throw std::runtime_error(
             "engine: tensor-parallelism not yet supported for model_type='" +
@@ -324,22 +286,15 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    WeightStoreBuilder(e.weights_).reserve(loader.num_tensors());
-
-    std::string runtime_quant = boot_cfg.model.runtime_quant;
-    if (runtime_quant == "fp8" && !fp8_native) {
-        runtime_quant.clear();
-    }
-    log_stage("compile rust loader plan begin");
+    log_stage("decode storage program begin");
     RustLoaderCompileResult rust_plan =
-        compile_rust_loader_plan_from_metadata(
-            e.hf_, loader, runtime_quant, tp_rank, tp_size,
-            kStorageMaxTileBytes,
-            kStoragePreferredAlignment,
-            backend_target,
-            boot_cfg.model.snapshot_dir,
-            boot_cfg.model.storage_program_path);
-    log_stage("compile rust loader plan done");
+        load_rust_storage_program(
+            e.hf_,
+            std::move(storage_program),
+            program_bytes,
+            compiler_version);
+    log_stage("decode storage program done");
+    WeightStoreBuilder(e.weights_).reserve(rust_plan.runtime_tensor_count);
     const auto rust_view = rust_plan.program.view();
     if (const char* dump_path =
             std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
@@ -412,7 +367,6 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         RustStorageProgramExecutor rust_executor(
             loader,
             rust_builder,
-            std::move(rust_plan.source_tensor_names),
             std::move(rust_plan.quant_attachments));
         log_stage("materialize storage program begin");
         LoadExecutionStats load_memory_stats;
@@ -477,8 +431,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         const double mib_after =
             static_cast<double>(materialized.runtime_quant_bytes_after) /
             (1024.0 * 1024.0);
-        std::cerr << "[pie-driver-cuda] runtime_quant="
-                  << boot_cfg.model.runtime_quant << " quantised "
+        std::cerr << "[pie-driver-cuda] storage program quantised "
                   << materialized.runtime_quantized_weights
                   << " projections: "
                   << static_cast<std::uint64_t>(mib_before) << " -> "
@@ -592,11 +545,6 @@ LoadedModelCapabilities LoadedModel::capabilities() const {
     c.max_model_len = hf_.max_position_embeddings;
     c.activation_dtype = boot_.model.dtype;
     c.snapshot_dir = boot_.model.snapshot_dir;
-    c.storage_backend = "cuda";
-    c.max_tile_bytes = kStorageMaxTileBytes;
-    c.preferred_alignment = kStoragePreferredAlignment;
-    c.mxfp4_moe_policy = mxfp4_moe_policy_tag(mxfp4_moe_lowering_);
-    c.native_mxfp4_moe = mxfp4_native_gemm_;
     return c;
 }
 

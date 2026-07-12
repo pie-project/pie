@@ -1,14 +1,7 @@
 use crate::config::ModelConfig;
 use crate::error::CompileError;
-use crate::ffi_types::{
-    PieLoaderRuntimeAbiView, PieLoaderRuntimeByteSpanSlice, PieLoaderRuntimeSourceKind,
-    PieLoaderRuntimeTensorContractView, PieLoaderSemanticRole,
-};
 use crate::semantic::SemanticRole;
-use crate::source::{
-    CheckpointMetadata, RawTensor, ffi_dtype, ffi_i64_slice, ffi_optional_axis, ffi_quant_scheme,
-    ffi_string,
-};
+use crate::source::{CheckpointMetadata, RawTensor};
 use crate::storage::StorageTarget;
 use crate::types::{
     Axis, BackendKind, DType, Encoding, Layout, Mxfp4MoePolicy, QuantScheme, QuantSpec,
@@ -71,25 +64,6 @@ pub struct RuntimeByteSpan {
 }
 
 impl RuntimeAbi {
-    pub fn from_ffi(view: &PieLoaderRuntimeAbiView) -> Result<Self, CompileError> {
-        let contracts = if view.tensors.len == 0 {
-            &[][..]
-        } else {
-            if view.tensors.ptr.is_null() {
-                return Err(CompileError::NullArgument("runtime_abi.tensors"));
-            }
-            unsafe { std::slice::from_raw_parts(view.tensors.ptr, view.tensors.len) }
-        };
-        Ok(Self {
-            name: ffi_string(view.name, "runtime_abi.name")?,
-            version: view.version,
-            tensors: contracts
-                .iter()
-                .map(RuntimeTensorContract::from_ffi)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
-
     pub fn default_for_target(
         metadata: &CheckpointMetadata,
         cfg: &ModelConfig,
@@ -145,6 +119,7 @@ impl RuntimeAbi {
         Ok(Self {
             name: match target.backend {
                 crate::types::BackendKind::Cuda => "pie-cuda".to_string(),
+                crate::types::BackendKind::Metal => "pie-metal".to_string(),
                 crate::types::BackendKind::Unknown => "pie".to_string(),
             },
             version: 1,
@@ -592,12 +567,43 @@ fn arch_profile(model_type: &str) -> ArchProfile {
     GENERIC_ARCH
 }
 
+fn metal_qwen35_runtime_name(raw_name: &str) -> Option<String> {
+    if let Some(suffix) = raw_name.strip_prefix("lm_head.") {
+        return Some(format!("shared_embedding.{suffix}"));
+    }
+    if raw_name == "model.language_model.norm.weight" {
+        return Some("final_norm.weight".to_string());
+    }
+    let rest = raw_name.strip_prefix("model.language_model.layers.")?;
+    let (layer, suffix) = rest.split_once('.')?;
+    if layer.is_empty() || !layer.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("layers.{layer}.{suffix}"))
+}
+
 impl DefaultAbiBuilder<'_> {
     fn profile(&self) -> ArchProfile {
         arch_profile(&self.cfg.model_type)
     }
 
     fn build(&mut self) -> Result<(), CompileError> {
+        if self.target.backend == BackendKind::Metal {
+            if self.metadata.tensors.iter().any(|tensor| {
+                tensor.name == "lm_head.weight" && tensor.encoding == Encoding::Raw(DType::U32)
+            }) && self
+                .metadata
+                .tensors
+                .iter()
+                .any(|tensor| tensor.name.starts_with("model.language_model.layers."))
+            {
+                return self.add_metal_qwen35_contracts();
+            }
+            return Err(CompileError::InvalidInput(format!(
+                "Metal storage schema does not support model_type='{}'",
+                self.cfg.model_type
+            )));
+        }
         let runtime_quant = self.runtime_quant_scheme()?;
         self.add_phi3_fused_splits()?;
         self.add_gpt_oss_mxfp4_groups()?;
@@ -621,6 +627,97 @@ impl DefaultAbiBuilder<'_> {
                 self.push_direct(raw, self.output_name(&raw.name), self.shard_axis(&raw.name));
             }
         }
+        Ok(())
+    }
+
+    fn add_metal_qwen35_contracts(&mut self) -> Result<(), CompileError> {
+        let tensors = self.metadata.tensors.clone();
+        for raw in &tensors {
+            let Some(output_name) = metal_qwen35_runtime_name(&raw.name) else {
+                continue;
+            };
+            if raw.name.ends_with(".weight")
+                && raw.encoding == Encoding::Raw(DType::U32)
+                && let Some(base) = raw.name.strip_suffix(".weight")
+                && let (Some(scales), Some(biases)) = (
+                    tensors
+                        .iter()
+                        .find(|candidate| candidate.name == format!("{base}.scales")),
+                    tensors
+                        .iter()
+                        .find(|candidate| candidate.name == format!("{base}.biases")),
+                )
+            {
+                self.push_mlx_affine_u4(raw, scales, biases, output_name)?;
+            } else {
+                self.push_direct(raw, output_name, None);
+            }
+        }
+        if self.tensors.is_empty() {
+            return Err(CompileError::InvalidInput(
+                "Metal Qwen3.5 schema found no text-decoder tensors".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn push_mlx_affine_u4(
+        &mut self,
+        raw: &RawTensor,
+        scales: &RawTensor,
+        biases: &RawTensor,
+        output_name: String,
+    ) -> Result<(), CompileError> {
+        if raw.shape.len() != 2 || scales.shape.len() != 2 || biases.shape != scales.shape {
+            return Err(CompileError::InvalidInput(format!(
+                "MLX affine-U4 triplet '{}' has incompatible shapes: weight={:?} scales={:?} biases={:?}",
+                raw.name, raw.shape, scales.shape, biases.shape
+            )));
+        }
+        let rows = raw.shape[0];
+        let logical_cols = raw.shape[1].checked_mul(8).ok_or_else(|| {
+            CompileError::InvalidInput("MLX U4 logical shape overflow".to_string())
+        })?;
+        if rows != scales.shape[0] || scales.shape[1] <= 0 || logical_cols % scales.shape[1] != 0 {
+            return Err(CompileError::InvalidInput(format!(
+                "MLX affine-U4 triplet '{}' cannot derive a group size from weight={:?} scales={:?}",
+                raw.name, raw.shape, scales.shape
+            )));
+        }
+        let group_size = u32::try_from(logical_cols / scales.shape[1]).map_err(|_| {
+            CompileError::InvalidInput("MLX affine-U4 group size does not fit u32".to_string())
+        })?;
+        let scale_dtype = dtype_for_encoding(&scales.encoding);
+        let bias_dtype = dtype_for_encoding(&biases.encoding);
+        self.tensors.push(RuntimeTensorContract {
+            output_name,
+            source: RuntimeTensorSource::ByteSpans(vec![RuntimeByteSpan {
+                tensor: raw.id,
+                source_offset_bytes: 0,
+                dest_offset_bytes: 0,
+                span_bytes: raw.span_bytes,
+            }]),
+            metadata: Vec::new(),
+            dtype: DType::BF16,
+            encoding: Encoding::Quant(
+                QuantSpec {
+                    scheme: QuantScheme::MlxAffineU4,
+                    logical_dtype: DType::BF16,
+                    bits_per_element: 4,
+                    group_size,
+                    channel_axis: Some(Axis(1)),
+                    scale_dtype: Some(scale_dtype),
+                    zero_point_dtype: Some(bias_dtype),
+                    block_shape: vec![i64::from(group_size)],
+                }
+                .normalized(),
+            ),
+            shape: vec![rows, logical_cols],
+            layout: Layout::dense(self.alignment()),
+            sharding: Sharding::replicated(),
+            alignment: self.alignment(),
+            shard_axis: None,
+        });
         Ok(())
     }
 
@@ -2117,216 +2214,4 @@ fn dsv4_shard_axis(name: &str) -> Option<Axis> {
 
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {
     suffixes.iter().any(|suffix| value.ends_with(suffix))
-}
-
-impl RuntimeTensorContract {
-    fn from_ffi(view: &PieLoaderRuntimeTensorContractView) -> Result<Self, CompileError> {
-        let dtype = ffi_dtype(view.dtype);
-        let encoding = match view.encoding_kind {
-            crate::ffi_types::PieLoaderEncodingKind::Raw => Encoding::Raw(dtype),
-            crate::ffi_types::PieLoaderEncodingKind::Quant => Encoding::Quant(
-                QuantSpec {
-                    scheme: ffi_quant_scheme(view.quant_scheme),
-                    logical_dtype: dtype,
-                    bits_per_element: view.quant_bits_per_element,
-                    group_size: view.quant_group_size,
-                    channel_axis: ffi_optional_axis(view.quant_channel_axis)?,
-                    scale_dtype: view
-                        .quant_has_scale_dtype
-                        .then_some(ffi_dtype(view.quant_scale_dtype)),
-                    zero_point_dtype: view
-                        .quant_has_zero_point_dtype
-                        .then_some(ffi_dtype(view.quant_zero_point_dtype)),
-                    block_shape: ffi_i64_slice(
-                        view.quant_block_shape,
-                        "runtime_tensor.quant_block_shape",
-                    )?,
-                }
-                .normalized(),
-            ),
-        };
-        let shape = ffi_i64_slice(view.shape, "runtime_tensor.shape")?;
-        for dim in &shape {
-            if *dim < 0 {
-                return Err(CompileError::InvalidInput(format!(
-                    "runtime tensor '{}' has negative dimension {}",
-                    ffi_string(view.output_name, "runtime_tensor.output_name")?,
-                    dim
-                )));
-            }
-        }
-        let output_name = ffi_string(view.output_name, "runtime_tensor.output_name")?;
-        let shard_axis = if view.shard_axis < 0 {
-            None
-        } else {
-            let axis = u8::try_from(view.shard_axis).map_err(|_| {
-                CompileError::InvalidInput(format!(
-                    "runtime tensor '{}' shard_axis {} is out of range",
-                    output_name, view.shard_axis
-                ))
-            })?;
-            Some(Axis(axis))
-        };
-        Ok(Self {
-            output_name: output_name.clone(),
-            source: runtime_source(view)?,
-            metadata: ffi_u32_slice(
-                view.metadata_tensor_ids,
-                "runtime_tensor.metadata_tensor_ids",
-            )?
-            .into_iter()
-            .map(TensorId)
-            .collect(),
-            dtype,
-            encoding,
-            shape,
-            layout: Layout::dense(view.alignment.max(1)),
-            sharding: Sharding {
-                axis: shard_axis,
-                world: 1,
-                rank: 0,
-            },
-            alignment: view.alignment,
-            shard_axis,
-        })
-    }
-}
-
-fn runtime_source(
-    view: &PieLoaderRuntimeTensorContractView,
-) -> Result<RuntimeTensorSource, CompileError> {
-    match view.source_kind {
-        PieLoaderRuntimeSourceKind::DirectTensor => {
-            return Ok(RuntimeTensorSource::DirectTensor(TensorId(
-                view.source_tensor_id,
-            )));
-        }
-        PieLoaderRuntimeSourceKind::Semantic => {}
-        PieLoaderRuntimeSourceKind::Join => {
-            let ids = ffi_u32_slice(view.source_tensor_ids, "runtime_tensor.source_tensor_ids")?;
-            if ids.is_empty() {
-                return Err(CompileError::InvalidInput(
-                    "Join runtime tensor source has no inputs".to_string(),
-                ));
-            }
-            return Ok(RuntimeTensorSource::Join {
-                tensors: ids.into_iter().map(TensorId).collect(),
-                axis: ffi_axis(view.axis, "runtime_tensor.axis")?,
-            });
-        }
-        PieLoaderRuntimeSourceKind::ByteSpans => {
-            let spans = ffi_byte_spans(view.byte_spans, "runtime_tensor.byte_spans")?;
-            if spans.is_empty() {
-                return Err(CompileError::InvalidInput(
-                    "ByteSpans runtime tensor source has no spans".to_string(),
-                ));
-            }
-            return Ok(RuntimeTensorSource::ByteSpans(spans));
-        }
-        PieLoaderRuntimeSourceKind::Select => {
-            if view.length <= 0 {
-                return Err(CompileError::InvalidInput(
-                    "Select runtime tensor source must have positive length".to_string(),
-                ));
-            }
-            return Ok(RuntimeTensorSource::SelectContract {
-                contract: usize::try_from(view.source_contract_id).map_err(|_| {
-                    CompileError::InvalidInput(format!(
-                        "Select source_contract_id {} is out of range",
-                        view.source_contract_id
-                    ))
-                })?,
-                axis: ffi_axis(view.axis, "runtime_tensor.axis")?,
-                start: view.start,
-                length: view.length,
-            });
-        }
-    }
-    Ok(RuntimeTensorSource::Semantic {
-        role: semantic_role(view.semantic_role)?,
-        layer: view.has_layer.then_some(view.layer),
-        expert: view.has_expert.then_some(view.expert),
-    })
-}
-
-fn ffi_byte_spans(
-    slice: PieLoaderRuntimeByteSpanSlice,
-    name: &'static str,
-) -> Result<Vec<RuntimeByteSpan>, CompileError> {
-    if slice.len == 0 {
-        return Ok(Vec::new());
-    }
-    if slice.ptr.is_null() {
-        return Err(CompileError::NullArgument(name));
-    }
-    unsafe { std::slice::from_raw_parts(slice.ptr, slice.len) }
-        .iter()
-        .enumerate()
-        .map(|(index, span)| {
-            if span.span_bytes == 0 {
-                return Err(CompileError::InvalidInput(format!(
-                    "{name}[{index}] has zero span"
-                )));
-            }
-            Ok(RuntimeByteSpan {
-                tensor: TensorId(span.source_tensor_id),
-                source_offset_bytes: span.source_offset_bytes,
-                dest_offset_bytes: span.dest_offset_bytes,
-                span_bytes: span.span_bytes,
-            })
-        })
-        .collect()
-}
-
-fn ffi_u32_slice(
-    slice: crate::ffi_types::PieLoaderU32Slice,
-    name: &'static str,
-) -> Result<Vec<u32>, CompileError> {
-    if slice.len == 0 {
-        return Ok(Vec::new());
-    }
-    if slice.ptr.is_null() {
-        return Err(CompileError::NullArgument(name));
-    }
-    Ok(unsafe { std::slice::from_raw_parts(slice.ptr, slice.len) }.to_vec())
-}
-
-fn ffi_axis(axis: i32, name: &'static str) -> Result<Axis, CompileError> {
-    if axis < 0 {
-        return Err(CompileError::InvalidInput(format!(
-            "{name} must be non-negative"
-        )));
-    }
-    Ok(Axis(u8::try_from(axis).map_err(|_| {
-        CompileError::InvalidInput(format!("{name} {axis} is out of range"))
-    })?))
-}
-
-fn semantic_role(role: PieLoaderSemanticRole) -> Result<SemanticRole, CompileError> {
-    Ok(match role {
-        PieLoaderSemanticRole::DirectTensor => {
-            return Err(CompileError::InvalidInput(
-                "DirectTensor is not a semantic role".to_string(),
-            ));
-        }
-        PieLoaderSemanticRole::TokenEmbedding => SemanticRole::TokenEmbedding,
-        PieLoaderSemanticRole::OutputEmbedding => SemanticRole::OutputEmbedding,
-        PieLoaderSemanticRole::AttentionQ => SemanticRole::AttentionQ,
-        PieLoaderSemanticRole::AttentionK => SemanticRole::AttentionK,
-        PieLoaderSemanticRole::AttentionV => SemanticRole::AttentionV,
-        PieLoaderSemanticRole::AttentionO => SemanticRole::AttentionO,
-        PieLoaderSemanticRole::MlpGate => SemanticRole::MlpGate,
-        PieLoaderSemanticRole::MlpUp => SemanticRole::MlpUp,
-        PieLoaderSemanticRole::MlpDown => SemanticRole::MlpDown,
-        PieLoaderSemanticRole::ExpertRouter => SemanticRole::ExpertRouter,
-        PieLoaderSemanticRole::ExpertGate => SemanticRole::ExpertGate,
-        PieLoaderSemanticRole::ExpertUp => SemanticRole::ExpertUp,
-        PieLoaderSemanticRole::ExpertDown => SemanticRole::ExpertDown,
-        PieLoaderSemanticRole::ExpertBias => SemanticRole::ExpertBias,
-        PieLoaderSemanticRole::Norm => SemanticRole::Norm,
-        PieLoaderSemanticRole::QuantData => SemanticRole::QuantData,
-        PieLoaderSemanticRole::QuantScale => SemanticRole::QuantScale,
-        PieLoaderSemanticRole::QuantZeroPoint => SemanticRole::QuantZeroPoint,
-        PieLoaderSemanticRole::QuantGroupIndex => SemanticRole::QuantGroupIndex,
-    })
 }

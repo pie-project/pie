@@ -64,6 +64,7 @@ pub enum CheckpointFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BackendKind {
     Cuda,
+    Metal,
     Unknown,
 }
 
@@ -74,7 +75,10 @@ impl BackendKind {
     /// `BulkExtentWrite` / `SlabScatter` batched copies, so the arena/bulk
     /// passes apply.
     pub fn uses_persistent_arena(self) -> bool {
-        matches!(self, BackendKind::Cuda | BackendKind::Unknown)
+        matches!(
+            self,
+            BackendKind::Cuda | BackendKind::Metal | BackendKind::Unknown
+        )
     }
 }
 
@@ -88,6 +92,7 @@ pub enum QuantScheme {
     AwqInt4,
     GptqInt4,
     Mxfp4E2M1E8M0,
+    MlxAffineU4,
     GgufQ4_0,
     GgufQ4K,
     GgufQ5_0,
@@ -101,6 +106,7 @@ impl QuantScheme {
             Self::AwqInt4
             | Self::GptqInt4
             | Self::Mxfp4E2M1E8M0
+            | Self::MlxAffineU4
             | Self::GgufQ4_0
             | Self::GgufQ4K => 4,
             Self::GgufQ5_0 | Self::GgufQ5K => 5,
@@ -116,6 +122,7 @@ impl QuantScheme {
     pub fn default_group_size(self) -> u32 {
         match self {
             Self::AwqInt4 | Self::GptqInt4 | Self::Mxfp4E2M1E8M0 => 32,
+            Self::MlxAffineU4 => 64,
             Self::GgufQ4_0 | Self::GgufQ4K | Self::GgufQ5_0 | Self::GgufQ5K => 32,
             Self::Fp8E4M3
             | Self::Fp8E5M2

@@ -270,10 +270,21 @@ impl ChannelCell {
 
     pub fn bind(&mut self, decl: &ChannelDecl) {
         if self.attachments.is_empty() {
-            self.device_reserved_head = 0;
-            self.device_reserved_tail = u64::from(decl.seeded);
+            if let Some(endpoint) = &self.endpoint {
+                let binding = endpoint.registered().binding;
+                self.device_reserved_head =
+                    load_word(binding.word_base, binding.head_word_index as usize);
+                self.device_reserved_tail =
+                    load_word(binding.word_base, binding.tail_word_index as usize);
+                if decl.host_role == HostRole::Writer {
+                    self.writer_tail = self.writer_tail.max(self.device_reserved_tail);
+                }
+            } else {
+                self.device_reserved_head = 0;
+                self.device_reserved_tail = u64::from(decl.seeded);
+            }
             if decl.seeded && decl.host_role == HostRole::Writer {
-                self.writer_tail = 1;
+                self.writer_tail = self.writer_tail.max(1);
             }
         }
         self.role = Some(decl.host_role);
@@ -308,6 +319,27 @@ impl ChannelCell {
         self.endpoint.clone()
     }
 
+    pub fn permanent_retry_cause(&self, accessed: bool) -> Option<String> {
+        if !accessed {
+            return None;
+        }
+        let Some(endpoint) = &self.endpoint else {
+            return Some(format!("channel {} has no native endpoint", self.global_id));
+        };
+        let binding = endpoint.registered().binding;
+        let poison = load_word(binding.word_base, binding.poison_word_index as usize);
+        if poison != 0 {
+            return Some(format!(
+                "channel {} is poisoned at epoch {poison}",
+                self.global_id
+            ));
+        }
+        if load_word(binding.word_base, binding.closed_word_index as usize) != 0 {
+            return Some(format!("channel {} is closed", self.global_id));
+        }
+        None
+    }
+
     pub fn reserve_device_ticket(&mut self, consume: bool, publish: bool) -> (u64, u64) {
         let expected_head = if consume {
             let expected = self.device_reserved_head;
@@ -326,15 +358,23 @@ impl ChannelCell {
         (expected_head, expected_tail)
     }
 
-    pub fn rollback_device_ticket(&mut self, expected_head: u64, expected_tail: u64) {
+    pub fn rollback_device_ticket(&mut self, expected_head: u64, expected_tail: u64) -> bool {
+        let mut complete = true;
         if expected_tail != crate::driver::command::CHANNEL_TICKET_NONE {
-            debug_assert_eq!(self.device_reserved_tail, expected_tail + 1);
-            self.device_reserved_tail = expected_tail;
+            if self.device_reserved_tail == expected_tail + 1 {
+                self.device_reserved_tail = expected_tail;
+            } else {
+                complete = false;
+            }
         }
         if expected_head != crate::driver::command::CHANNEL_TICKET_NONE {
-            debug_assert_eq!(self.device_reserved_head, expected_head + 1);
-            self.device_reserved_head = expected_head;
+            if self.device_reserved_head == expected_head + 1 {
+                self.device_reserved_head = expected_head;
+            } else {
+                complete = false;
+            }
         }
+        complete
     }
 
     pub fn reader_wait_state(&self) -> Option<(Arc<ChannelEndpoint>, u64)> {
@@ -1341,6 +1381,33 @@ mod tests {
         writer.put(vec![1, 1, 0, 0, 0, 0, 0, 0]).unwrap(); // bits 0,1 → 3
         assert_eq!(words[1].load(Ordering::Acquire), 3);
         assert_eq!(mirror[2 % 3], 3, "sequence 2 lands at slot 2 of cap1=3");
+    }
+
+    #[test]
+    fn cold_rebind_resynchronizes_device_tickets_from_the_live_ring() {
+        let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, false);
+        declaration.capacity = 2;
+        let mut writer = ChannelCell::new(vec![8], DType::Bool, 2);
+        writer.attach(11, &declaration, None).unwrap();
+        let mirror = Box::leak(vec![0u8; 3].into_boxed_slice());
+        let words = Box::leak(
+            (0..4)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        attach_writer(&mut writer, mirror, words, 1, 2);
+
+        words[0].store(3, Ordering::Release);
+        words[1].store(5, Ordering::Release);
+        writer.detach(11);
+        writer.attach(12, &declaration, None).unwrap();
+
+        assert_eq!(
+            writer.reserve_device_ticket(true, true),
+            (3, 5),
+            "a persistent endpoint's actual words define the first rebind ticket"
+        );
     }
 
     #[test]

@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use pie_driver_abi::{
-    DriverCapabilities, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL, PIE_CHANNEL_DTYPE_F32,
-    PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
+    DeviceFacts, DriverCapabilities, ModelLoadDesc, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL,
+    PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
     PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_RETRY, PIE_TERMINAL_OUTCOME_SUCCESS,
     PieBytes, PieChannelDesc, PieChannelEndpointBinding, PieChannelValueDescSlice, PieCompletion,
     PieInstanceBinding, PieInstanceDesc, PieKvCopyDesc, PieLaunchDesc, PiePoolResizeDesc,
@@ -211,7 +211,9 @@ enum PreparedCallback {
 }
 
 pub struct DummyDriver {
+    device_facts: DeviceFacts,
     capabilities: DriverCapabilities,
+    storage: Option<pie_weight_loader::host_executor::HostStorage>,
     state: Arc<Mutex<DummyState>>,
     next_program_id: AtomicU64,
     next_instance_id: AtomicU64,
@@ -244,6 +246,16 @@ impl DummyDriver {
             operation_log: operation_log.clone(),
         };
         Self {
+            device_facts: DeviceFacts {
+                abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
+                backend: "dummy".to_string(),
+                unified_memory: true,
+                fp8_native: false,
+                native_mxfp4_moe: false,
+                storage_alignment: std::mem::align_of::<usize>() as u32,
+                storage_max_tile_bytes: 64 * 1024 * 1024,
+                page_size: 1,
+            },
             capabilities: DriverCapabilities {
                 abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
                 total_pages: options.total_pages,
@@ -260,12 +272,8 @@ impl DummyDriver {
                 max_model_len: options.max_model_len,
                 activation_dtype: options.activation_dtype,
                 snapshot_dir: options.snapshot_dir,
-                storage_backend: String::new(),
-                max_tile_bytes: 0,
-                preferred_alignment: 0,
-                mxfp4_moe_policy: String::new(),
-                native_mxfp4_moe: false,
             },
+            storage: None,
             state,
             next_program_id: AtomicU64::new(1),
             next_instance_id: AtomicU64::new(1),
@@ -346,6 +354,27 @@ impl DummyDriver {
 
     pub fn capabilities(&self) -> &DriverCapabilities {
         &self.capabilities
+    }
+
+    pub fn device_facts(&self) -> &DeviceFacts {
+        &self.device_facts
+    }
+
+    pub fn load_model(&mut self, desc: &ModelLoadDesc) -> Result<DriverCapabilities> {
+        ensure!(self.storage.is_none(), "dummy model is already loaded");
+        ensure!(
+            desc.compiler_version == pie_weight_loader::storage::compiler_version(),
+            "dummy compiler version mismatch"
+        );
+        self.record_op("load_model");
+        let storage = pie_weight_loader::host_executor::execute_serialized_program(
+            &desc.program_bytes,
+            &desc.snapshot_dir,
+        )
+        .map_err(|err| anyhow!("dummy storage program execution failed: {err}"))?;
+        self.capabilities.snapshot_dir = desc.snapshot_dir.display().to_string();
+        self.storage = Some(storage);
+        Ok(self.capabilities.clone())
     }
 
     pub fn register_program(&mut self, desc: &PieProgramDesc) -> Result<u64> {

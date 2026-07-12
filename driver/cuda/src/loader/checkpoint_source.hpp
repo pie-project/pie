@@ -1,60 +1,61 @@
 #pragma once
 
-// loader/: snapshot -> WeightStore. `CheckpointSource` is the abstract read
-// side (implemented by `safetensors.{hpp,cpp}`); the Rust-planned storage
-// executor writes the result into a `WeightStore` (`model/weight_store.hpp`).
-
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <string>
 #include <vector>
-
-#include "tensor.hpp"
 
 namespace pie_cuda_driver {
 
-struct TensorInfo {
-    DType dtype;
-    std::vector<std::int64_t> shape;
-    std::string encoding;
-    std::uint32_t block_elements = 0;
-    std::uint32_t block_bytes = 0;
-    // Offset into the source tensor data segment, when the container has one.
-    std::uint64_t data_offset = 0;
-    std::uint64_t nbytes = 0;
-    std::uint32_t shard_id = 0;
-};
-
-struct TensorSlice {
-    int axis = -1;
-    std::int64_t start = 0;
-    std::int64_t length = 0;
-};
-
-struct TensorStorageInfo {
-    std::filesystem::path path;
-    std::uint64_t file_offset = 0;
-    std::uint64_t nbytes = 0;
-    std::uint32_t shard_id = 0;
-};
-
 class CheckpointSource {
-public:
-    virtual ~CheckpointSource() = default;
+  public:
+    static CheckpointSource open(const std::filesystem::path& snapshot_dir);
 
-    virtual std::vector<std::string> tensor_names() const = 0;
-    virtual std::size_t num_tensors() const noexcept = 0;
-    virtual const TensorInfo& info(const std::string& name) const = 0;
-    virtual bool contains(const std::string& name) const noexcept = 0;
-    virtual TensorStorageInfo storage_info(const std::string& name) const {
-        const auto& ti = info(name);
-        return TensorStorageInfo{
-            .path = {},
-            .file_offset = ti.data_offset,
-            .nbytes = ti.nbytes,
-            .shard_id = ti.shard_id,
-        };
-    }
+    CheckpointSource() = default;
+    ~CheckpointSource();
+    CheckpointSource(const CheckpointSource&) = delete;
+    CheckpointSource& operator=(const CheckpointSource&) = delete;
+    CheckpointSource(CheckpointSource&&) noexcept = default;
+    CheckpointSource& operator=(CheckpointSource&&) noexcept = default;
+
+    std::size_t file_count() const noexcept { return files_.size(); }
+    void copy_storage_bytes_to_device(
+        std::uint32_t file_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        void* dst);
+    void copy_storage_bytes_to_device_async(
+        std::uint32_t file_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        void* dst,
+        void* stream);
+    const std::uint8_t* storage_host_ptr(
+        std::uint32_t file_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes);
+    void read_storage_bytes_to_host(
+        std::uint32_t file_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        void* dst);
+
+  private:
+    struct File {
+        std::filesystem::path path;
+        int fd = -1;
+        std::size_t mapped_size = 0;
+        const std::uint8_t* data = nullptr;
+    };
+
+    void open_file_(File& file) const;
+    void map_file_(File& file) const;
+    File& checked_file_(
+        std::uint32_t file_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes);
+
+    std::vector<File> files_;
 };
 
 }  // namespace pie_cuda_driver

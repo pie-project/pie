@@ -59,6 +59,13 @@ struct KvLifecycle {
     id: WorkingSetId,
     cache_roots_max: usize,
     pipeline_scope: Mutex<Option<u128>>,
+    submitted_cursor: Mutex<SubmittedCursor>,
+}
+
+#[derive(Debug, Default)]
+struct SubmittedCursor {
+    next_token: u64,
+    generation: u64,
 }
 
 impl KvLifecycle {
@@ -123,6 +130,43 @@ impl Drop for KvFireLease {
     }
 }
 
+/// Submit-order token extent reserved on one working set.
+///
+/// Mapping allocation remains dispatch-time work, but every later submit must
+/// immediately see this extent. A reservation rolls back only while it is
+/// still the newest reservation; once a successor exists, failure poisons the
+/// owning pipeline and the cursor must not rewind underneath that successor.
+pub struct KvTokenExtentReservation {
+    lifecycle: Arc<KvLifecycle>,
+    start_token: u64,
+    end_token: u64,
+    previous_next_token: u64,
+    generation: u64,
+    committed: bool,
+}
+
+impl KvTokenExtentReservation {
+    pub fn start_token(&self) -> u64 {
+        self.start_token
+    }
+
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for KvTokenExtentReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut cursor = self.lifecycle.submitted_cursor.lock().unwrap();
+        if cursor.generation == self.generation && cursor.next_token == self.end_token {
+            cursor.next_token = self.previous_next_token;
+        }
+    }
+}
+
 impl Drop for KvLifecycle {
     /// The process-teardown fallback: runs only when the LAST `Arc` clone of
     /// a [`KvWorkingSet`]'s lifecycle drops. No-ops if [`KvWorkingSet::release`]
@@ -169,6 +213,7 @@ impl KvWorkingSet {
                 id,
                 cache_roots_max,
                 pipeline_scope: Mutex::new(None),
+                submitted_cursor: Mutex::new(SubmittedCursor::default()),
             }),
         }
     }
@@ -187,6 +232,36 @@ impl KvWorkingSet {
 
     pub fn fire_lease(&self) -> Result<KvFireLease, &'static str> {
         KvLifecycle::acquire_fire_lease(&self.lifecycle)
+    }
+
+    pub fn reserve_token_extent(
+        &self,
+        pass_cursor: u64,
+        committed_floor: u64,
+        token_count: u64,
+    ) -> Result<KvTokenExtentReservation, &'static str> {
+        if token_count == 0 {
+            return Err("token extent must be non-empty");
+        }
+        if self.lifecycle.release_requested.load(Ordering::Acquire) {
+            return Err("working set release already requested");
+        }
+        let mut cursor = self.lifecycle.submitted_cursor.lock().unwrap();
+        let previous_next_token = cursor.next_token;
+        let start_token = pass_cursor.max(committed_floor).max(cursor.next_token);
+        let end_token = start_token
+            .checked_add(token_count)
+            .ok_or("working set token extent overflow")?;
+        cursor.generation = cursor.generation.wrapping_add(1);
+        cursor.next_token = end_token;
+        Ok(KvTokenExtentReservation {
+            lifecycle: Arc::clone(&self.lifecycle),
+            start_token,
+            end_token,
+            previous_next_token,
+            generation: cursor.generation,
+            committed: false,
+        })
     }
 
     /// Explicit release (the WIT `drop` path): runs
@@ -355,5 +430,48 @@ mod tests {
 
         drop(parent);
         assert_eq!(stores.kv.lock().unwrap().available_pages(), 4);
+    }
+
+    #[test]
+    fn submitted_token_extents_are_visible_across_clones_before_prepare() {
+        let model = fresh_model(4);
+        let stores = registry::get(model, 0);
+        let id = stores.kv.lock().unwrap().create_working_set();
+        let ws = KvWorkingSet::new(model, 0, id, 16);
+        let other_pass = ws.clone();
+
+        let first = ws.reserve_token_extent(0, 0, 4).unwrap();
+        assert_eq!(first.start_token(), 0);
+        first.commit();
+
+        let second = other_pass.reserve_token_extent(0, 0, 1).unwrap();
+        assert_eq!(
+            second.start_token(),
+            4,
+            "a later pass sees the earlier submit before mapping preparation"
+        );
+        second.commit();
+    }
+
+    #[test]
+    fn newest_uncommitted_token_extent_rolls_back_without_rewinding_successors() {
+        let model = fresh_model(4);
+        let stores = registry::get(model, 0);
+        let id = stores.kv.lock().unwrap().create_working_set();
+        let ws = KvWorkingSet::new(model, 0, id, 16);
+
+        drop(ws.reserve_token_extent(0, 0, 4).unwrap());
+        let replacement = ws.reserve_token_extent(0, 0, 2).unwrap();
+        assert_eq!(replacement.start_token(), 0);
+        replacement.commit();
+
+        let earlier = ws.reserve_token_extent(0, 0, 3).unwrap();
+        let later = ws.reserve_token_extent(0, 0, 1).unwrap();
+        drop(earlier);
+        assert_eq!(later.start_token(), 5);
+        later.commit();
+
+        let next = ws.reserve_token_extent(0, 0, 1).unwrap();
+        assert_eq!(next.start_token(), 6);
     }
 }

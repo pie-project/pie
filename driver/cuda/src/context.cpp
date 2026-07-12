@@ -149,7 +149,6 @@ struct LaunchScratch {
         view.kv_translation_indptr = pie_native::slice_from_u32(launch.kv_translation_indptr.ptr, launch.kv_translation_indptr.len);
         view.ptir_program_row_indptr = pie_native::slice_from_u32(launch.ptir_program_row_indptr.ptr, launch.ptir_program_row_indptr.len);
         view.logical_fire_ids = pie_native::slice_from_u64(launch.logical_fire_ids.ptr, launch.logical_fire_ids.len);
-        view.retry_eligible = pie_native::slice_from_u8(launch.retry_eligible.ptr, launch.retry_eligible.len);
         view.channel_expected_head = pie_native::slice_from_u64(launch.channel_expected_head.ptr, launch.channel_expected_head.len);
         view.channel_expected_tail = pie_native::slice_from_u64(launch.channel_expected_tail.ptr, launch.channel_expected_tail.len);
         view.channel_ticket_indptr = pie_native::slice_from_u32(launch.channel_ticket_indptr.ptr, launch.channel_ticket_indptr.len);
@@ -262,11 +261,13 @@ class Context::Impl {
     }
 
     int initialize(const std::string& config_path, const PieRuntimeCallbacks& runtime);
-    void fill_caps(PieDriverCaps* caps) const {
+    void fill_device_facts(PieDriverCaps* caps) const {
         if (caps == nullptr) return;
-        caps->json_bytes = reinterpret_cast<const std::uint8_t*>(caps_json_.data());
-        caps->json_len = caps_json_.size();
+        caps->json_bytes =
+            reinterpret_cast<const std::uint8_t*>(device_facts_json_.data());
+        caps->json_len = device_facts_json_.size();
     }
+    int load_model(const PieModelLoadDesc& load, PieDriverCaps* caps);
 
     int register_program(const PieProgramDesc& program, std::uint64_t* program_id);
     int register_channel(const PieChannelDesc& channel,
@@ -366,6 +367,7 @@ class Context::Impl {
     }
 
     PieRuntimeCallbacks runtime_{};
+    pie_cuda_driver::Config* cfg_ = nullptr;
     std::vector<OwnedValue> owners_;
     pie_cuda_driver::BatchEngine* executor_ = nullptr;
     pie_cuda_driver::pipeline::Registry* registry_ = nullptr;
@@ -373,6 +375,8 @@ class Context::Impl {
     pie_cuda_driver::SwapPool* swap_pool_ = nullptr;
     pie_cuda_driver::NcclComm* tp_comm_ = nullptr;
     std::string caps_json_;
+    std::string device_facts_json_;
+    bool load_attempted_ = false;
     std::string tp_cpu_gate_key_;
     int device_ordinal_ = 0;
     int tp_size_ = 1;
@@ -388,9 +392,8 @@ int Context::Impl::initialize(
     using namespace pie_cuda_driver;
     runtime_ = runtime;
 
-    auto* cfg_p = own_value(load_config(config_path));
-    Config& cfg = *cfg_p;
-    const bool verbose = cfg.runtime.verbose;
+    cfg_ = own_value(load_config(config_path));
+    Config& cfg = *cfg_;
     tp_size_ = std::max(1, cfg.distributed.tp_size);
     tp_rank_ = cfg.distributed.tp_rank;
     tp_cpu_gate_key_ = cfg.distributed.nccl_unique_id_hex;
@@ -441,7 +444,41 @@ int Context::Impl::initialize(
         CUDA_CHECK(cudaStreamDestroy(stream));
     }
 
-    auto* engine_p = own_value(LoadedModel::load(cfg, tp_comm_ptr));
+    cudaDeviceProp dev_prop{};
+    CUDA_CHECK(cudaGetDeviceProperties(&dev_prop, device_ordinal_));
+    const bool fp8_native = (dev_prop.major > 8) ||
+                            (dev_prop.major == 8 && dev_prop.minor >= 9);
+    nlohmann::json facts = {
+        {"abi_version", PIE_DRIVER_ABI_VERSION},
+        {"backend", "cuda"},
+        {"unified_memory", false},
+        {"fp8_native", fp8_native},
+        {"native_mxfp4_moe", dev_prop.major >= 10},
+        {"storage_alignment", 256},
+        {"storage_max_tile_bytes", 64ull * 1024ull * 1024ull},
+        {"page_size", 0},
+    };
+    device_facts_json_ = facts.dump();
+    return PIE_STATUS_OK;
+}
+
+int Context::Impl::load_model(
+    const PieModelLoadDesc& load,
+    PieDriverCaps* caps_out) {
+    using namespace pie_cuda_driver;
+    if (cfg_ == nullptr || load_attempted_) return PIE_STATUS_CLOSED;
+    load_attempted_ = true;
+    Config& cfg = *cfg_;
+    const bool verbose = cfg.runtime.verbose;
+    NcclComm* tp_comm_ptr = tp_comm_;
+    cfg.model.snapshot_dir.assign(
+        reinterpret_cast<const char*>(load.snapshot_dir.ptr),
+        load.snapshot_dir.len);
+    const std::span<const std::uint8_t> program_bytes(
+        load.program_bytes.ptr, load.program_bytes.len);
+
+    auto* engine_p = own_value(LoadedModel::load(
+        cfg, tp_comm_, program_bytes, load.compiler_version));
     auto& engine = *engine_p;
 
     // THE arch table decides support: an unrecognized `model_type` is a
@@ -1054,17 +1091,18 @@ int Context::Impl::initialize(
         {"max_model_len", c.max_model_len},
         {"activation_dtype", c.activation_dtype},
         {"snapshot_dir", c.snapshot_dir},
-        {"storage_backend", c.storage_backend},
-        {"max_tile_bytes", c.max_tile_bytes},
-        {"preferred_alignment", c.preferred_alignment},
-        {"mxfp4_moe_policy", c.mxfp4_moe_policy},
-        {"native_mxfp4_moe", c.native_mxfp4_moe},
     };
     caps_json_ = caps.dump();
+    if (caps_out != nullptr) {
+        caps_out->json_bytes =
+            reinterpret_cast<const std::uint8_t*>(caps_json_.data());
+        caps_out->json_len = caps_json_.size();
+    }
     return PIE_STATUS_OK;
 }
 
 int Context::Impl::register_program(const PieProgramDesc& program, std::uint64_t* program_id) {
+    if (registry_ == nullptr) return PIE_STATUS_CLOSED;
     if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
     std::string err;
     const int rc = registry_->register_program(program, program_id, &err);
@@ -1077,6 +1115,7 @@ int Context::Impl::register_program(const PieProgramDesc& program, std::uint64_t
 int Context::Impl::register_channel(
     const PieChannelDesc& channel,
     PieChannelEndpointBinding* binding) {
+    if (registry_ == nullptr) return PIE_STATUS_CLOSED;
     if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
     std::string err;
     const int rc = registry_->register_channel(channel, binding, &err);
@@ -1087,6 +1126,7 @@ int Context::Impl::register_channel(
 }
 
 int Context::Impl::bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding) {
+    if (registry_ == nullptr) return PIE_STATUS_CLOSED;
     if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
     std::string err;
     const int rc = registry_->bind_instance(instance, binding, &err);
@@ -1131,6 +1171,18 @@ int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion)
     try {
         pie_cuda_driver::handle_fire_batch(
             0, view, *executor_, runtime_, completion);
+        return PIE_STATUS_OK;
+    } catch (const pie_cuda_driver::pipeline::RetryableLaunchError& e) {
+        std::cerr << "[pie-driver-cuda] launch retry: " << e.what() << "\n";
+        for (std::size_t i = 0; i < launch.terminal_cells.len; ++i) {
+            publish_terminal(
+                launch.terminal_cells.ptr[i],
+                PIE_TERMINAL_OUTCOME_RETRY);
+        }
+        if (runtime_.notify != nullptr && completion.wait_id != 0) {
+            runtime_.notify(
+                runtime_.ctx, completion.wait_id, completion.target_epoch);
+        }
         return PIE_STATUS_OK;
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-cuda] launch: " << e.what() << "\n";
@@ -1318,8 +1370,12 @@ int Context::initialize(const std::string& config_path, const PieRuntimeCallback
     return impl_->initialize(config_path, runtime);
 }
 
-void Context::fill_caps(PieDriverCaps* caps) const {
-    impl_->fill_caps(caps);
+void Context::fill_device_facts(PieDriverCaps* caps) const {
+    impl_->fill_device_facts(caps);
+}
+
+int Context::load_model(const PieModelLoadDesc& load, PieDriverCaps* caps) {
+    return impl_->load_model(load, caps);
 }
 
 int Context::register_program(const PieProgramDesc& program, std::uint64_t* program_id) {

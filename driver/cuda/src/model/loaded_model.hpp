@@ -6,12 +6,13 @@
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <utility>
 
 #include <config.hpp>
 #include "loader/backend_target.hpp"
 #include "model/config.hpp"
-#include "loader/safetensors.hpp"
+#include "loader/checkpoint_source.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
 
@@ -26,14 +27,6 @@ struct LoadedModelCapabilities {
     int max_model_len = 0;
     std::string activation_dtype;
     std::string snapshot_dir;
-    // Device storage-target hints (weight-loader Variant A). These tell the
-    // in-process storage compiler how this device wants persistent weights
-    // laid out. Values mirror the constants the driver-side compile uses.
-    std::string storage_backend;
-    std::uint64_t max_tile_bytes = 0;
-    std::uint32_t preferred_alignment = 0;
-    std::string mxfp4_moe_policy;
-    bool native_mxfp4_moe = false;
 };
 
 class NcclComm;  // distributed.hpp
@@ -45,17 +38,10 @@ public:
     /// TP-aware runtime quantization (cross-rank absmax all-reduce for
     /// row-parallel weights). For single-GPU (tp_size=1) this can be null.
     ///
-    /// Both branches execute the same Rust-compiled `StorageProgram`; only the
-    /// path to it differs. When `boot_cfg.model.storage_program_path` is set
-    /// (weight-loader Variant A, embedded driver), the checkpoint was compiled
-    /// by the *runtime* in-process; this driver reads the serialized
-    /// StorageProgram from that file and only deserializes + executes it — the
-    /// bulk weight bytes never cross that boundary (the program records only
-    /// tensor locations). An empty path (standalone / remote) instead compiles
-    /// the StorageProgram via the Rust FFI in-process here, then executes it
-    /// (the *locality switch* = path-present).
     static LoadedModel load(const Config& boot_cfg,
-                            NcclComm* tp_comm = nullptr);
+                            NcclComm* tp_comm,
+                            std::span<const std::uint8_t> program_bytes,
+                            std::uint64_t compiler_version);
 
     LoadedModel() = default;
     LoadedModel(const LoadedModel&) = delete;
@@ -93,10 +79,6 @@ private:
     HfConfig hf_;
     WeightStore weights_;
     Mxfp4MoeLowering mxfp4_moe_lowering_ = Mxfp4MoeLowering::Bf16Dequant;
-    // Whether this device has a native MXFP4 MoE GEMM path (Blackwell-class
-    // FP4). Cached from the load-time backend target so `capabilities()` can
-    // advertise it in the storage-target hints.
-    bool mxfp4_native_gemm_ = false;
 };
 
 namespace ops { struct RuntimeQuantScratchSpec; }

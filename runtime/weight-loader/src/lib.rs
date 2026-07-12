@@ -9,11 +9,9 @@ pub mod checkpoint_header;
 pub mod config;
 pub mod dump;
 pub mod error;
-pub mod ffi;
-pub mod ffi_arena;
-pub mod ffi_types;
 pub mod frontend;
 pub mod gguf;
+pub mod host_executor;
 pub mod inproc;
 pub mod ir;
 pub mod optimizer;
@@ -31,10 +29,3 @@ pub mod types;
 pub(crate) fn wl_debug_enabled() -> bool {
     std::env::var_os("PIE_WEIGHT_LOADER_DEBUG").is_some()
 }
-
-pub use ffi::{
-    PieLoaderProgramHandle, pie_loader_compile, pie_loader_error_free,
-    pie_loader_program_deserialize, pie_loader_program_free, pie_loader_program_serialize,
-    pie_loader_program_serialized_len, pie_loader_program_view,
-};
-pub use ffi_types::*;

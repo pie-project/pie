@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,6 +31,11 @@ namespace pie_cuda_driver::pipeline {
 // fire-geometry) now lives in pie_native::ptir (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
 using namespace pie_native::ptir;
+
+class RetryableLaunchError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
 
 class Dispatch {
   public:

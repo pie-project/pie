@@ -249,6 +249,22 @@ struct ExecPlan {
         return false;
     }
 
+    bool puts_channel(std::uint32_t c) const {
+        for (const auto& st : trace.stages)
+            for (const auto& put : st.puts)
+                if (put.channel == c) return true;
+        return false;
+    }
+
+    bool requires_channel_input(std::uint32_t c) const {
+        return std::any_of(
+            bound.readiness.begin(), bound.readiness.end(),
+            [c](const auto& entry) {
+                return entry.chan == c &&
+                       entry.dir == cptir::container::Direction::NeedsFull;
+            });
+    }
+
     // True if the launch path must run the forward before `step()`.
     bool needs_forward() const { return needs_logits || needs_mtp_logits; }
 };

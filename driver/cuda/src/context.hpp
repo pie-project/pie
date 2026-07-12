@@ -22,15 +22,12 @@ class Context {
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
 
-    // Composition-root initializer: parses `config_path`, loads the model,
-    // runs the memory planner, allocates stores, constructs the batch engine
-    // and pipeline registry, and bootstraps TP. Returns a `PIE_STATUS_*`
-    // code; on any non-OK return the `Context` must not be used and should
-    // be destroyed (a partially initialized `Context` never leaks: all
-    // intermediate allocations are owned and torn down by the destructor).
+    // Create-time initialization: parse device/group config, select the CUDA
+    // context, and initialize NCCL. No checkpoint metadata or payload is read.
     int initialize(const std::string& config_path, const PieRuntimeCallbacks& runtime);
 
-    void fill_caps(PieDriverCaps* caps) const;
+    void fill_device_facts(PieDriverCaps* caps) const;
+    int load_model(const PieModelLoadDesc& load, PieDriverCaps* caps);
     int register_program(const PieProgramDesc& program, std::uint64_t* program_id);
     int register_channel(const PieChannelDesc& channel, PieChannelEndpointBinding* binding);
     int bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding);

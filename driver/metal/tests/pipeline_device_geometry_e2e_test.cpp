@@ -1,6 +1,6 @@
-// Device-geometry (Phase 2, C3) driver-level poison/settlement gate
-// (metal_ptir_plan.md §9 G2.3-style: "not-ready descriptor channel fails the
-// fire and poisons per D4"). Drives the FULL `pie_metal_*` ABI surface (no
+// Device-geometry driver-level RETRY/settlement gate. A not-ready descriptor
+// ticket must retry with no effects while unrelated batch members settle.
+// Drives the FULL `pie_metal_*` ABI surface (no
 // checkpoint/Apple/Metal dependency needed: the not-ready descriptor channel
 // fails `resolve_fire_geometry` BEFORE `MetalExecutor` is ever touched), so
 // this binary always builds and runs.
@@ -12,8 +12,7 @@
 //     (W1.6, no dummy-run), poisoning ONLY this member.
 //   - B: an ordinary channel-plane passthrough (C1, take -> put) with no
 //     forward dependency at all.
-// Expects: A's terminal outcome is FAILED and its attached channel is
-// poisoned + its wait id notified; B's terminal outcome is SUCCESS and its
+// Expects: A's terminal outcome is RETRY with no channel effects; B's is SUCCESS and its
 // own put/notify settle exactly as if A were not in the batch — proving
 // per-member failure isolation (D4) and that settlement/notify ordering for
 // the REST of the batch is unaffected by one member's descriptor-resolve
@@ -24,6 +23,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -384,6 +384,13 @@ int main() {
     launch.abi_version = PIE_DRIVER_ABI_VERSION;
     launch.instance_ids = {.ptr = instance_ids, .len = 2};
     launch.terminal_cells = {.ptr = terminal_ptrs, .len = 2};
+    const std::uint64_t no_ticket = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t ticket_heads[] = {0, 0, no_ticket};
+    const std::uint64_t ticket_tails[] = {no_ticket, no_ticket, 0};
+    const std::uint32_t ticket_indptr[] = {0, 1, 3};
+    launch.channel_expected_head = {.ptr = ticket_heads, .len = 3};
+    launch.channel_expected_tail = {.ptr = ticket_tails, .len = 3};
+    launch.channel_ticket_indptr = {.ptr = ticket_indptr, .len = 3};
 
     const PieCompletion completion{.wait_id = 99, .target_epoch = 1, .terminal_cell = nullptr};
     const int32_t launch_rc = pie_metal_launch(driver, &launch, completion);
@@ -392,17 +399,12 @@ int main() {
     // batch notify (published last) before asserting settlement.
     notify_state.wait(99, 1);
 
-    // -- A: poisoned (not-ready descriptor channel, no dummy-run) --
-    expect(a_terminal.outcome == PIE_TERMINAL_OUTCOME_FAILED,
-          "A's terminal outcome == FAILED (got " + std::to_string(a_terminal.outcome) + ")");
+    // -- A: not-ready descriptor ticket RETRYs with no effects. --
+    expect(a_terminal.outcome == PIE_TERMINAL_OUTCOME_RETRY,
+          "A's terminal outcome == RETRY (got " + std::to_string(a_terminal.outcome) + ")");
     const std::uint64_t a_poison =
         *reinterpret_cast<const std::uint64_t*>(a_chan0_binding.word_base + 16);  // word[2] = poison
-    expect(a_poison != 0, "A's positions channel word is poisoned (nonzero epoch)");
-    // chan0 is host_role=NONE (a realistic device-geometry descriptor
-    // channel), so `poison_instance` has no reader/writer wait id to notify
-    // for it (`notify()` itself no-ops on wait_id == 0) — the channel's own
-    // poison WORD is the only observable here; B's notify below is the
-    // meaningful "did the batch keep settling/notifying correctly" check.
+    expect(a_poison == 0, "A's positions channel remains unpoisoned");
     expect(!notify_state.contains(0, a_poison),
           "no spurious wait_id==0 notification is queued for A's NONE-role channel");
 
@@ -417,11 +419,11 @@ int main() {
         *reinterpret_cast<const std::uint64_t*>(b_chan1_binding.word_base + 8);  // word[1] = tail
     expect(b_reader_tail == 1, "B's reader tail advanced to 1");
     expect(notify_state.contains(b_chan1.reader_wait_id, 1),
-          "B's reader wait id was notified (unaffected by A's poison)");
+          "B's reader wait id was notified (unaffected by A's retry)");
 
     // -- the batch-level completion still notifies exactly once --
     expect(notify_state.contains(completion.wait_id, completion.target_epoch),
-          "batch completion notified exactly once despite A's per-member failure");
+          "batch completion notified exactly once despite A's per-member retry");
 
     pie_metal_destroy(driver);
     std::remove(config_path.c_str());

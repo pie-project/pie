@@ -30,11 +30,3 @@ pub use engine::{WorkerHandle, run, run_with};
 // The control-plane seam `run_with` is generic over — re-exported so the
 // composition root (`bin/pie`) can impl it for its `EmbeddedControl` adapter.
 pub use link::control::ControlLink;
-
-#[cfg(any(feature = "driver-cuda", feature = "driver-metal"))]
-#[used]
-static PIE_WEIGHT_LOADER_LINK_ANCHOR: unsafe extern "C" fn(
-    *const pie_weight_loader::PieLoaderCompileInput,
-    *mut *mut pie_weight_loader::PieLoaderProgramHandle,
-    *mut pie_weight_loader::PieLoaderError,
-) -> pie_weight_loader::PieLoaderStatus = pie_weight_loader::pie_loader_compile;

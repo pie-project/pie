@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include "decode_abi.hpp"
 
 namespace pie::metal {
@@ -54,18 +55,26 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
                           size_t weights_bytes_from_manifest,
                           int max_ctx = 4096,
                           int state_dtype_bytes = 4,
-                          int act_dtype_bytes = 2) {
+                          int act_dtype_bytes = 2,
+                          size_t region_alignment = 256,
+                          size_t slot_alignment = 256) {
     HeapPlan p;
+    const auto align_region = [region_alignment](size_t bytes) {
+        return align_up(bytes, std::max<size_t>(1, region_alignment));
+    };
+    const auto align_slot = [slot_alignment](size_t bytes) {
+        return align_up(bytes, std::max<size_t>(1, slot_alignment));
+    };
 
     // ── Weights (load-once RO) ── sized from the loader manifest.
-    p.weights_bytes = align_up(weights_bytes_from_manifest);
+    p.weights_bytes = align_region(weights_bytes_from_manifest);
 
     // ── KV (append-only, full-attn layers only) ──
     int n_full = 0;
     for (int L = 0; L < g.n_layers; ++L) n_full += DecodeGeometry::is_full_attn(L) ? 1 : 0;
     // per full-attn layer: k + v, each [n_kv_heads, max_ctx, head_dim] act-dtype.
     p.kv_per_layer = size_t(2) * g.n_kv_heads * max_ctx * g.head_dim * act_dtype_bytes;
-    p.kv_bytes = align_up(size_t(n_full) * p.kv_per_layer);
+    p.kv_bytes = align_region(size_t(n_full) * p.kv_per_layer);
 
     // ── State (GDN resident; per-slot slabs, S = g.max_slots; in-place at S=1) ──
     int n_gdn = g.n_layers - n_full;
@@ -80,9 +89,9 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
         size_t(g.gdn_v_heads) * g.gdn_v_dim * g.gdn_k_dim * state_dtype_bytes;
     const size_t slots = size_t(g.max_slots);
     p.state_per_layer =
-        2 * align_up(slots * conv_state)   // ConvState + ConvStateOut (ping-pong), S slots each
-        + align_up(slots * recur_state);   // RecurrentState (in-place), S slots
-    p.state_bytes = align_up(size_t(n_gdn) * p.state_per_layer);
+        2 * align_slot(slots * conv_state)
+        + align_slot(slots * recur_state);
+    p.state_bytes = align_region(size_t(n_gdn) * p.state_per_layer);
 
     // ── Scratch (activation ping-pong pool) ──
     // One slot must hold the largest M=1 activation that ping-pongs through the DAG.
@@ -96,19 +105,19 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
     const size_t scratch_rows = g.paged_kv_enabled
                                   ? size_t(g.max_tokens < 1 ? 1 : g.max_tokens)
                                   : 1u;
-    p.scratch_slot_bytes = align_up(size_t(widest) * scratch_rows * act_dtype_bytes);
-    p.scratch_bytes = align_up(size_t(SCRATCH_POOL) * p.scratch_slot_bytes);
+    p.scratch_slot_bytes = align_slot(size_t(widest) * scratch_rows * act_dtype_bytes);
+    p.scratch_bytes = align_region(size_t(SCRATCH_POOL) * p.scratch_slot_bytes);
 
     // ── IO (per-token scalars + logits; scalars widen to max_tokens at M>1) ──
     // TokenId/Position/SeqLen/NextToken: u32[max_tokens] each (slot-aligned). Logits: f32[vocab].
     // At max_tokens=1 each scalar is align_up(4) — byte-identical to the sealed single-token IO.
-    const size_t scalars = 4 * align_up(size_t(4) * g.max_tokens);
+    const size_t scalars = 4 * align_slot(size_t(4) * g.max_tokens);
     // lm_head writes bf16.  The historical M=1 allocation was four bytes per
     // logit; retain it exactly there, while paged output is densely [N,vocab].
     const size_t logits = g.paged_kv_enabled
-                              ? align_up(size_t(g.vocab) * scratch_rows * act_dtype_bytes)
-                              : align_up(size_t(g.vocab) * 4);
-    p.io_bytes = align_up(scalars + logits);
+                              ? align_slot(size_t(g.vocab) * scratch_rows * act_dtype_bytes)
+                              : align_slot(size_t(g.vocab) * 4);
+    p.io_bytes = align_region(scalars + logits);
 
     // ── MbIo (Phase 1b/3; additive — zero bytes unless explicitly opted
     //    into via `g.paged_kv_enabled`, byte-identical to no region at all
@@ -119,23 +128,23 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
     //    many distinct physical pages). ──
     if (g.paged_kv_enabled) {
         const size_t r1 = size_t(g.max_requests) + 1;
-        const size_t qo_indptr        = align_up(r1 * 4);
-        const size_t kv_page_indptr   = align_up(r1 * 4);
+        const size_t qo_indptr        = align_slot(r1 * 4);
+        const size_t kv_page_indptr   = align_slot(r1 * 4);
         // A physical page may legitimately occur in multiple request CSR
         // segments (shared prefixes/forks).  Capacity is therefore references,
         // not unique physical pages.
         p.max_page_refs = size_t(g.max_requests) * size_t(g.total_pages);
-        const size_t kv_page_indices  = align_up(p.max_page_refs * 4);
-        const size_t kv_last_page_len = align_up(size_t(g.max_requests) * 4);
-        const size_t rs_slot_ids      = align_up(size_t(g.max_requests) * 4);
-        const size_t rs_slot_flags    = align_up(size_t(g.max_requests) * 1);
-        const size_t req_of_token     = align_up(size_t(g.max_tokens) * 4);
-        const size_t slot_of_token    = align_up(size_t(g.max_tokens) * 4);
-        const size_t w_page           = align_up(size_t(g.max_tokens) * 4);
-        const size_t w_off            = align_up(size_t(g.max_tokens) * 4);
-        p.mb_io_bytes = align_up(qo_indptr + kv_page_indptr + kv_page_indices +
-                                 kv_last_page_len + rs_slot_ids + rs_slot_flags +
-                                 req_of_token + slot_of_token + w_page + w_off);
+        const size_t kv_page_indices  = align_slot(p.max_page_refs * 4);
+        const size_t kv_last_page_len = align_slot(size_t(g.max_requests) * 4);
+        const size_t rs_slot_ids      = align_slot(size_t(g.max_requests) * 4);
+        const size_t rs_slot_flags    = align_slot(size_t(g.max_requests) * 1);
+        const size_t req_of_token     = align_slot(size_t(g.max_tokens) * 4);
+        const size_t slot_of_token    = align_slot(size_t(g.max_tokens) * 4);
+        const size_t w_page           = align_slot(size_t(g.max_tokens) * 4);
+        const size_t w_off            = align_slot(size_t(g.max_tokens) * 4);
+        p.mb_io_bytes = align_region(qo_indptr + kv_page_indptr + kv_page_indices +
+                                    kv_last_page_len + rs_slot_ids + rs_slot_flags +
+                                    req_of_token + slot_of_token + w_page + w_off);
     }
 
     // ── KvPagePool (Phase 1b/3; additive — zero bytes unless explicitly
@@ -147,18 +156,18 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
     if (g.paged_kv_enabled) {
         p.kv_pool_per_layer = size_t(2) * size_t(g.total_pages) * size_t(g.kv_page_size) *
                               g.n_kv_heads * g.head_dim * act_dtype_bytes;
-        p.kv_pool_bytes = align_up(size_t(n_full) * p.kv_pool_per_layer);
+        p.kv_pool_bytes = align_region(size_t(n_full) * p.kv_pool_per_layer);
     }
 
     // ── Lay out regions back-to-back, each 256-aligned ──
     size_t off = 0;
-    p.weights_off = off; off = align_up(off + p.weights_bytes);
-    p.kv_off      = off; off = align_up(off + p.kv_bytes);
-    p.state_off   = off; off = align_up(off + p.state_bytes);
-    p.scratch_off = off; off = align_up(off + p.scratch_bytes);
-    p.io_off      = off; off = align_up(off + p.io_bytes);
-    p.mb_io_off   = off; off = align_up(off + p.mb_io_bytes);
-    p.kv_pool_off = off; off = align_up(off + p.kv_pool_bytes);
+    p.weights_off = off; off = align_region(off + p.weights_bytes);
+    p.kv_off      = off; off = align_region(off + p.kv_bytes);
+    p.state_off   = off; off = align_region(off + p.state_bytes);
+    p.scratch_off = off; off = align_region(off + p.scratch_bytes);
+    p.io_off      = off; off = align_region(off + p.io_bytes);
+    p.mb_io_off   = off; off = align_region(off + p.mb_io_bytes);
+    p.kv_pool_off = off; off = align_region(off + p.kv_pool_bytes);
     p.total = off;
     return p;
 }

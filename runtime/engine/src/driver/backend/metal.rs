@@ -21,19 +21,20 @@ fn sync_status(status: i32, op: &str) -> Result<()> {
 }
 use pie_driver_abi::{
     PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
-    pie_metal_bind_instance, pie_metal_close_channel, pie_metal_close_instance, pie_metal_copy_kv,
-    pie_metal_copy_state, pie_metal_create, pie_metal_destroy, pie_metal_launch,
-    pie_metal_register_channel, pie_metal_register_program, pie_metal_resize_pool,
+    PieModelLoadDesc, pie_metal_bind_instance, pie_metal_close_channel, pie_metal_close_instance,
+    pie_metal_copy_kv, pie_metal_copy_state, pie_metal_create, pie_metal_destroy, pie_metal_launch,
+    pie_metal_load_model, pie_metal_register_channel, pie_metal_register_program,
+    pie_metal_resize_pool,
 };
 
 pub struct MetalDriver {
     driver: *mut PieDriver,
     broker: CompletionBroker,
-    capabilities: pie_driver_abi::DriverCapabilities,
+    device_facts: pie_driver_abi::DeviceFacts,
 }
 
 impl MetalDriver {
-    pub fn create(config_bytes: &[u8]) -> Result<(Self, pie_driver_abi::DriverCapabilities)> {
+    pub fn create(config_bytes: &[u8]) -> Result<(Self, pie_driver_abi::DeviceFacts)> {
         let broker = CompletionBroker::new();
         let desc = PieDriverCreateDesc {
             abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
@@ -49,8 +50,8 @@ impl MetalDriver {
         if driver.is_null() {
             return Err(anyhow!("pie_metal_create returned null"));
         }
-        let capabilities = match parse_caps(caps) {
-            Ok(capabilities) => capabilities,
+        let device_facts: pie_driver_abi::DeviceFacts = match parse_json(caps, "device facts") {
+            Ok(device_facts) => device_facts,
             Err(error) => {
                 unsafe { pie_metal_destroy(driver) };
                 return Err(error);
@@ -60,17 +61,47 @@ impl MetalDriver {
             Self {
                 driver,
                 broker,
-                capabilities: capabilities.clone(),
+                device_facts: device_facts.clone(),
             },
-            capabilities,
+            device_facts,
         ))
     }
 
     pub fn unsupported() -> Result<Self> {
         Err(anyhow!("Metal local driver is not available in this build"))
     }
-    pub fn capabilities(&self) -> &pie_driver_abi::DriverCapabilities {
-        &self.capabilities
+    pub fn device_facts(&self) -> &pie_driver_abi::DeviceFacts {
+        &self.device_facts
+    }
+    pub fn load_model(
+        &mut self,
+        desc: &pie_driver_abi::ModelLoadDesc,
+    ) -> Result<pie_driver_abi::DriverCapabilities> {
+        let snapshot = desc
+            .snapshot_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("model snapshot path must be UTF-8"))?;
+        let raw = PieModelLoadDesc {
+            abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            compiler_version: desc.compiler_version,
+            program_bytes: PieBytes {
+                ptr: desc.program_bytes.as_ptr(),
+                len: desc.program_bytes.len(),
+            },
+            snapshot_dir: PieBytes {
+                ptr: snapshot.as_ptr(),
+                len: snapshot.len(),
+            },
+        };
+        let mut caps = PieDriverCaps::default();
+        sync_status(
+            unsafe { pie_metal_load_model(self.driver, &raw, &mut caps) },
+            "pie_metal_load_model",
+        )?;
+        let capabilities: pie_driver_abi::DriverCapabilities =
+            parse_json(caps, "model capabilities")?;
+        Ok(capabilities)
     }
     pub fn register_program(&mut self, plan: &ProgramRegistration) -> Result<u64> {
         let borrowed = ProgramDescBorrow::new(plan);
@@ -182,12 +213,12 @@ impl Drop for MetalDriver {
     }
 }
 
-fn parse_caps(caps: PieDriverCaps) -> Result<pie_driver_abi::DriverCapabilities> {
+fn parse_json<T: serde::de::DeserializeOwned>(caps: PieDriverCaps, label: &str) -> Result<T> {
     if caps.json_bytes.is_null() {
-        return Err(anyhow!("driver creation returned null capability payload"));
+        return Err(anyhow!("driver returned null {label} payload"));
     }
     let bytes = unsafe { std::slice::from_raw_parts(caps.json_bytes, caps.json_len) };
-    serde_json::from_slice(bytes).map_err(|e| anyhow!("driver capability payload parse: {e}"))
+    serde_json::from_slice(bytes).map_err(|e| anyhow!("driver {label} payload parse: {e}"))
 }
 
 #[allow(dead_code)]

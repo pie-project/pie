@@ -57,39 +57,58 @@ pub enum DriverBackend {
 impl DriverBackend {
     pub fn dummy(
         options: pie_driver_dummy_lib::DummyDriverOptions,
-    ) -> Result<(Self, pie_driver_abi::DriverCapabilities)> {
+    ) -> Result<(Self, pie_driver_abi::DeviceFacts)> {
         let driver = DummyDriver::new(options);
-        let caps = driver.capabilities().clone();
-        Ok((Self::Dummy(driver), caps))
+        let facts = driver.device_facts().clone();
+        Ok((Self::Dummy(driver), facts))
     }
 
     #[cfg(feature = "driver-cuda")]
-    pub fn cuda_create(config_bytes: &[u8]) -> Result<(Self, pie_driver_abi::DriverCapabilities)> {
-        let (driver, caps) = CudaDriver::create(config_bytes)?;
-        Ok((Self::Cuda(driver), caps))
+    pub fn cuda_create(config_bytes: &[u8]) -> Result<(Self, pie_driver_abi::DeviceFacts)> {
+        let (driver, facts) = CudaDriver::create(config_bytes)?;
+        Ok((Self::Cuda(driver), facts))
     }
 
     #[cfg(feature = "driver-cuda")]
     pub fn cuda_group_create(
         config_blobs: Vec<Vec<u8>>,
-    ) -> Result<(Self, pie_driver_abi::DriverCapabilities)> {
-        let (driver, caps) = CudaDriver::create_group(config_blobs)?;
-        Ok((Self::Cuda(driver), caps))
+    ) -> Result<(Self, Vec<pie_driver_abi::DeviceFacts>)> {
+        let (driver, facts) = CudaDriver::create_group(config_blobs)?;
+        Ok((Self::Cuda(driver), facts))
     }
 
     #[cfg(feature = "driver-metal")]
-    pub fn metal_create(config_bytes: &[u8]) -> Result<(Self, pie_driver_abi::DriverCapabilities)> {
-        let (driver, caps) = MetalDriver::create(config_bytes)?;
-        Ok((Self::Metal(driver), caps))
+    pub fn metal_create(config_bytes: &[u8]) -> Result<(Self, pie_driver_abi::DeviceFacts)> {
+        let (driver, facts) = MetalDriver::create(config_bytes)?;
+        Ok((Self::Metal(driver), facts))
     }
 
-    pub fn capabilities(&self) -> &pie_driver_abi::DriverCapabilities {
+    pub fn load_model(
+        &mut self,
+        descs: Vec<pie_driver_abi::ModelLoadDesc>,
+    ) -> Result<pie_driver_abi::DriverCapabilities> {
         match self {
-            Self::Dummy(driver) => driver.capabilities(),
+            Self::Dummy(driver) => {
+                let [desc] = descs.as_slice() else {
+                    return Err(anyhow!(
+                        "dummy model load requires exactly one descriptor, got {}",
+                        descs.len()
+                    ));
+                };
+                driver.load_model(desc)
+            }
             #[cfg(feature = "driver-cuda")]
-            Self::Cuda(driver) => driver.capabilities(),
+            Self::Cuda(driver) => driver.load_model(descs),
             #[cfg(feature = "driver-metal")]
-            Self::Metal(driver) => driver.capabilities(),
+            Self::Metal(driver) => {
+                let [desc] = descs.as_slice() else {
+                    return Err(anyhow!(
+                        "metal model load requires exactly one descriptor, got {}",
+                        descs.len()
+                    ));
+                };
+                driver.load_model(desc)
+            }
         }
     }
 

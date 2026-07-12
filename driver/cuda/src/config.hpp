@@ -17,30 +17,6 @@ struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
-    // Optional serialized StorageProgram produced by the Rust weight loader.
-    // When absent, the driver invokes that same Rust compiler through FFI;
-    // when present, it deserializes the supplied program. Weight bytes never
-    // cross this boundary.
-    std::string storage_program_path;
-    // Runtime quantization mode applied during load-plan materialization.
-    // Empty (default) = no quantization. Recognised values:
-    //   * "fp8"  — per-channel symmetric FP8_E4M3 for projection weights.
-    //   * "int8" — per-channel symmetric INT8 for projection weights.
-    //   * "fp4" / "mxfp4" — MXFP4 (E2M1 weight + E8M0 block scale) for the
-    //                      target model's expert weights. Used by GLM-5.1 to
-    //                      transcode the checkpoint's FP8 routed-expert
-    //                      weights to MXFP4 at materialize time, halving
-    //                      the per-rank expert footprint.
-    // Norms, biases, embeddings, and lm_head stay in their native dtype.
-    std::string runtime_quant;
-    // GPT-OSS MXFP4 MoE load/runtime policy. "auto" selects native packed
-    // MXFP4 expert GEMM on supported Blackwell-class GPUs/builds and uses the
-    // routed-dequant fallback on legacy GPUs. Recognised values:
-    //   * "routed_dequant" / "packed" — keep MXFP4 resident and dequantize
-    //     only routed experts into bounded BF16 runtime scratch.
-    //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
-    //   * "native" — require a true MXFP4 MoE GEMM backend.
-    std::string mxfp4_moe = "auto";
     int mtp_num_drafts = 3;
 };
 
@@ -111,12 +87,8 @@ inline Config load_config(const std::filesystem::path& path) {
 
     if (auto m = tbl["model"].as_table()) {
         c.model.snapshot_dir  = (*m)["snapshot_dir"].value_or(std::string{});
-        c.model.storage_program_path =
-            (*m)["storage_program_path"].value_or(std::string{});
         c.model.device        = (*m)["device"].value_or(c.model.device);
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
-        c.model.runtime_quant = (*m)["runtime_quant"].value_or(std::string{});
-        c.model.mxfp4_moe     = (*m)["mxfp4_moe"].value_or(c.model.mxfp4_moe);
         c.model.mtp_num_drafts = static_cast<int>(
             (*m)["mtp_num_drafts"].value_or<int64_t>(c.model.mtp_num_drafts));
     }

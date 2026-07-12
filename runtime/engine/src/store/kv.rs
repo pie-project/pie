@@ -602,6 +602,20 @@ impl KvStore {
         Ok(table)
     }
 
+    pub fn visible_mapped_len(&mut self, ws: WorkingSetId) -> Result<u64, KvStoreError> {
+        let (_, committed) = self.flat_table(ws)?;
+        let committed_len = committed.len() as u64;
+        let pending_len = self
+            .pending
+            .get(&ws)
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .flat_map(|entry| entry.mappings.iter().map(|(index, _)| index + 1))
+            .max()
+            .unwrap_or(0);
+        Ok(committed_len.max(pending_len))
+    }
+
     pub fn visible_chain_state(&self, ws: WorkingSetId) -> Result<Option<Hash256>, KvStoreError> {
         if let Some(state) = self
             .pending
@@ -684,27 +698,33 @@ impl KvStore {
     }
 
     fn pending_target(&self, ws: WorkingSetId, index: u64) -> Option<PhysicalKvPageId> {
-        self.pending.get(&ws).and_then(|entries| {
-            entries.iter().rev().find_map(|entry| {
-                entry
-                    .mappings
-                    .iter()
-                    .rev()
-                    .find_map(|&(candidate, page)| (candidate == index).then_some(page))
-            })
+        self.latest_pending(ws, |entry| {
+            entry
+                .mappings
+                .iter()
+                .rev()
+                .find_map(|&(candidate, page)| (candidate == index).then_some(page))
         })
     }
 
     fn pending_page(&self, ws: WorkingSetId, index: u64) -> Option<&PageCommit> {
-        self.pending.get(&ws).and_then(|entries| {
-            entries.iter().rev().find_map(|entry| {
-                entry
-                    .pages
-                    .iter()
-                    .rev()
-                    .find_map(|(candidate, commit)| (*candidate == index).then_some(commit))
-            })
+        self.latest_pending(ws, |entry| {
+            entry
+                .pages
+                .iter()
+                .rev()
+                .find_map(|(candidate, commit)| (*candidate == index).then_some(commit))
         })
+    }
+
+    fn latest_pending<'a, T>(
+        &'a self,
+        ws: WorkingSetId,
+        mut find: impl FnMut(&'a PendingOverlay) -> Option<T>,
+    ) -> Option<T> {
+        self.pending
+            .get(&ws)
+            .and_then(|entries| entries.iter().rev().find_map(&mut find))
     }
 
     fn retire_pending_overlay(&mut self, ws: WorkingSetId, seq: u64) {

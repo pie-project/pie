@@ -14,12 +14,9 @@ use std::fmt;
 
 /// Current direct local ABI version.
 ///
-/// v2: channel values no longer ride launch descriptors — host puts are
-/// direct writes into the registered channel endpoint's pinned ring, pulled
-/// by the driver before the consuming pass; `PieChannelDesc` wait ids are
-/// mandatory and every native driver must notify them per channel-word
-/// publication.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 3;
+/// v4: driver creation reports device facts only; model loading is a separate,
+/// blocking `*_load_model` call carrying mandatory StorageProgram bytes.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 4;
 
 /// Success.
 pub const PIE_STATUS_OK: i32 = 0;
@@ -377,12 +374,39 @@ impl Default for PieDriverCreateDesc {
     }
 }
 
-/// Cold JSON capability payload returned from `*_create`.
+/// Driver-owned JSON payload returned from a cold boot call.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PieDriverCaps {
     pub json_bytes: *const u8,
     pub json_len: usize,
+}
+
+/// Blocking model-load descriptor.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieModelLoadDesc {
+    pub abi_version: u32,
+    /// Must be zero.
+    pub reserved0: u32,
+    /// Compiler source hash expected by this runtime.
+    pub compiler_version: u64,
+    /// Serialized, versioned StorageProgram. Empty programs are invalid.
+    pub program_bytes: PieBytes,
+    /// UTF-8 path to the driver-local checkpoint payload root.
+    pub snapshot_dir: PieBytes,
+}
+
+impl Default for PieModelLoadDesc {
+    fn default() -> Self {
+        Self {
+            abi_version: PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            compiler_version: 0,
+            program_bytes: PieBytes::default(),
+            snapshot_dir: PieBytes::default(),
+        }
+    }
 }
 
 /// Static program registration descriptor.
@@ -514,9 +538,8 @@ pub struct PieLaunchDesc {
     /// wire placeholder row; the driver substitutes its channel-resolved
     /// geometry for that span when composing the forward batch.
     pub ptir_program_row_indptr: PieU32Slice,
-    /// Immutable logical-fire ids and retry eligibility, one per instance.
+    /// Immutable logical-fire ids, one per instance.
     pub logical_fire_ids: PieU64Slice,
-    pub retry_eligible: PieU8Slice,
     /// Dense-channel sequence tickets, CSR-partitioned per instance.
     pub channel_expected_head: PieU64Slice,
     pub channel_expected_tail: PieU64Slice,
@@ -567,7 +590,6 @@ impl Default for PieLaunchDesc {
             kv_translation_indptr: PieU32Slice::default(),
             ptir_program_row_indptr: PieU32Slice::default(),
             logical_fire_ids: PieU64Slice::default(),
-            retry_eligible: PieU8Slice::default(),
             channel_expected_head: PieU64Slice::default(),
             channel_expected_tail: PieU64Slice::default(),
             channel_ticket_indptr: PieU32Slice::default(),
@@ -971,6 +993,36 @@ pub fn validate_driver_create_desc(desc: &PieDriverCreateDesc) -> PieAbiValidati
     validate_runtime_callbacks(&desc.runtime)
 }
 
+/// Validates a model-load descriptor.
+pub fn validate_model_load_desc(desc: &PieModelLoadDesc) -> PieAbiValidationResult {
+    validate_pie_abi_version(desc.abi_version)?;
+    validate_reserved_zero("model load reserved0 must be zero", desc.reserved0)?;
+    validate_bytes(
+        desc.program_bytes,
+        "model load program_bytes ptr/len mismatch",
+    )?;
+    validate_bytes(
+        desc.snapshot_dir,
+        "model load snapshot_dir ptr/len mismatch",
+    )?;
+    if desc.program_bytes.len == 0 {
+        return Err(invalid_argument(
+            "model load requires non-empty program_bytes",
+        ));
+    }
+    if desc.compiler_version == 0 {
+        return Err(invalid_argument(
+            "model load requires a nonzero compiler_version",
+        ));
+    }
+    if desc.snapshot_dir.len == 0 {
+        return Err(invalid_argument(
+            "model load requires non-empty snapshot_dir",
+        ));
+    }
+    Ok(())
+}
+
 /// Validates a program-registration descriptor.
 pub fn validate_program_desc(desc: &PieProgramDesc) -> PieAbiValidationResult {
     validate_pie_abi_version(desc.abi_version)?;
@@ -1215,10 +1267,6 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
         desc.logical_fire_ids,
         "launch logical_fire_ids ptr/len mismatch",
     )?;
-    validate_u8_slice(
-        desc.retry_eligible,
-        "launch retry_eligible ptr/len mismatch",
-    )?;
     validate_u64_slice(
         desc.channel_expected_head,
         "launch channel_expected_head ptr/len mismatch",
@@ -1335,27 +1383,25 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             "launch channel ticket head/tail vectors must be parallel",
         ));
     }
+    if desc.channel_ticket_indptr.len != 0 {
+        let indptr = unsafe {
+            std::slice::from_raw_parts(
+                desc.channel_ticket_indptr.ptr,
+                desc.channel_ticket_indptr.len,
+            )
+        };
+        if indptr.last().copied().unwrap_or_default() as usize != desc.channel_expected_head.len {
+            return Err(invalid_argument(
+                "launch channel_ticket_indptr must cover every ticket",
+            ));
+        }
+    }
     validate_row_count_u32(
         desc.logical_fire_ids.len,
         "launch logical_fire_ids length must match batch size",
         request_count,
         true,
     )?;
-    validate_row_count_u32(
-        desc.retry_eligible.len,
-        "launch retry_eligible length must match batch size",
-        request_count,
-        true,
-    )?;
-    if desc.retry_eligible.len != 0 {
-        let values =
-            unsafe { std::slice::from_raw_parts(desc.retry_eligible.ptr, desc.retry_eligible.len) };
-        if values.iter().any(|&value| value > 1) {
-            return Err(invalid_argument(
-                "launch retry_eligible values must be 0 or 1",
-            ));
-        }
-    }
     if desc.ptir_program_row_indptr.len != 0 {
         let wire_rows = desc.qo_indptr.len.saturating_sub(1);
         unsafe {
@@ -1538,6 +1584,11 @@ unsafe extern "C" {
         desc: *const PieDriverCreateDesc,
         caps: *mut PieDriverCaps,
     ) -> *mut PieDriver;
+    pub fn pie_cuda_load_model(
+        driver: *mut PieDriver,
+        load: *const PieModelLoadDesc,
+        caps: *mut PieDriverCaps,
+    ) -> i32;
     pub fn pie_cuda_register_program(
         driver: *mut PieDriver,
         program: *const PieProgramDesc,
@@ -1583,6 +1634,11 @@ unsafe extern "C" {
         desc: *const PieDriverCreateDesc,
         caps: *mut PieDriverCaps,
     ) -> *mut PieDriver;
+    pub fn pie_metal_load_model(
+        driver: *mut PieDriver,
+        load: *const PieModelLoadDesc,
+        caps: *mut PieDriverCaps,
+    ) -> i32;
     pub fn pie_metal_register_program(
         driver: *mut PieDriver,
         program: *const PieProgramDesc,
@@ -1687,6 +1743,10 @@ mod tests {
             PIE_DRIVER_ABI_VERSION
         );
         assert_eq!(
+            PieModelLoadDesc::default().abi_version,
+            PIE_DRIVER_ABI_VERSION
+        );
+        assert_eq!(
             PieProgramDesc::default().abi_version,
             PIE_DRIVER_ABI_VERSION
         );
@@ -1706,6 +1766,7 @@ mod tests {
         );
         assert_eq!(PieRuntimeCallbacks::default().reserved0, 0);
         assert_eq!(PieDriverCreateDesc::default().reserved0, 0);
+        assert_eq!(PieModelLoadDesc::default().reserved0, 0);
         assert_eq!(PieProgramDesc::default().reserved0, 0);
         assert_eq!(PieInstanceDesc::default().reserved0, 0);
         assert_eq!(PieLaunchDesc::default().reserved0, 0);
@@ -1963,6 +2024,24 @@ mod tests {
     }
 
     #[test]
+    fn model_load_validator_requires_program_and_snapshot() {
+        let mut desc = PieModelLoadDesc::default();
+        assert!(validate_model_load_desc(&desc).is_err());
+        let program = [1u8];
+        let snapshot = b"/tmp/model";
+        desc.program_bytes = PieBytes {
+            ptr: program.as_ptr(),
+            len: program.len(),
+        };
+        desc.snapshot_dir = PieBytes {
+            ptr: snapshot.as_ptr(),
+            len: snapshot.len(),
+        };
+        desc.compiler_version = 1;
+        validate_model_load_desc(&desc).unwrap();
+    }
+
+    #[test]
     fn kv_copy_validator_rejects_invalid_memory_domain() {
         let desc = PieKvCopyDesc {
             src_domain: 99,
@@ -2156,6 +2235,38 @@ mod tests {
         assert!(
             err.message().contains("channel_ticket_indptr") || err.message().contains("head/tail")
         );
+
+        let instance_ids = [1u64];
+        let mut terminal = PieTerminalCell::default();
+        let terminal_cells = [&mut terminal as *mut PieTerminalCell];
+        let heads = [0u64, 1];
+        let tails = [0u64, 1];
+        let undercovered = [0u32, 1];
+        let launch = PieLaunchDesc {
+            instance_ids: PieU64Slice {
+                ptr: instance_ids.as_ptr(),
+                len: instance_ids.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_cells.as_ptr(),
+                len: terminal_cells.len(),
+            },
+            channel_expected_head: PieU64Slice {
+                ptr: heads.as_ptr(),
+                len: heads.len(),
+            },
+            channel_expected_tail: PieU64Slice {
+                ptr: tails.as_ptr(),
+                len: tails.len(),
+            },
+            channel_ticket_indptr: PieU32Slice {
+                ptr: undercovered.as_ptr(),
+                len: undercovered.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+        let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
+        assert!(err.message().contains("cover every ticket"));
     }
 
     #[test]
@@ -2186,6 +2297,7 @@ mod tests {
         let header = committed_header();
         let runtime = header_block(&header, "PieRuntimeCallbacks");
         let create = header_block(&header, "PieDriverCreateDesc");
+        let load = header_block(&header, "PieModelLoadDesc");
         let program = header_block(&header, "PieProgramDesc");
         let instance = header_block(&header, "PieInstanceDesc");
         let binding = header_block(&header, "PieInstanceBinding");
@@ -2213,6 +2325,9 @@ mod tests {
         assert!(runtime.contains("uint32_t reserved0;"));
         assert!(runtime.contains("PieRuntimeNotifyFn notify;"));
         assert!(create.contains("uint32_t reserved0;"));
+        assert!(load.contains("struct PieBytes program_bytes;"));
+        assert!(load.contains("struct PieBytes snapshot_dir;"));
+        assert!(load.contains("uint64_t compiler_version;"));
         assert!(program.contains("uint64_t program_hash;"));
         assert!(program.contains("uint32_t reserved0;"));
         assert!(instance.contains("struct PieU64Slice channel_ids;"));

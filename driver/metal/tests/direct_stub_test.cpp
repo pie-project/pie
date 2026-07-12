@@ -401,14 +401,13 @@ int main() {
     if (!expect(pie_metal_close_channel(driver, 33) == PIE_STATUS_INVALID_ARGUMENT,
                 "close_channel rejects live attachment")) return 1;
 
-    // Seeds are per-instance interp state (D2), never bind-time ring
-    // publications: the reader ring stays untouched until a fire produces.
+    // A host-reader seed is sequence zero on both the interpreter and the
+    // host-visible ring, matching the runtime/CUDA ticket origin.
     auto* mirror = reinterpret_cast<const std::uint8_t*>(endpoints[2].mirror_base);
     auto* words = reinterpret_cast<const std::uint64_t*>(endpoints[2].word_base);
-    const std::uint8_t zero_cell[4] = {0, 0, 0, 0};
-    if (!expect(std::memcmp(mirror, zero_cell, sizeof(zero_cell)) == 0,
-                "bind leaves the reader ring untouched")) return 1;
-    if (!expect(words[1] == 0, "bind publishes no reader tail")) return 1;
+    if (!expect(std::memcmp(mirror, seed_bytes, sizeof(seed_bytes)) == 0,
+                "bind publishes the reader seed")) return 1;
+    if (!expect(words[1] == 1, "bind publishes the reader seed tail")) return 1;
 
     PieInstanceDesc duplicate_instance = instance;
     duplicate_instance.requested_instance_id = binding.instance_id;
@@ -629,7 +628,7 @@ int main() {
                 "launch of a sidecar-less program is unsupported")) return 1;
     if (!expect(notify.count() == 0, "unsupported launch does not notify")) return 1;
     if (!expect(words[0] == 0, "reader head unchanged")) return 1;
-    if (!expect(words[1] == 0, "reader tail unchanged")) return 1;
+    if (!expect(words[1] == 1, "reader seed tail unchanged")) return 1;
     if (!expect(words[2] == 0, "poison stays clear")) return 1;
     if (!expect(words[3] == 0, "closed stays clear")) return 1;
     if (!expect(launch_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
@@ -744,22 +743,32 @@ int main() {
         exec_launch.abi_version = PIE_DRIVER_ABI_VERSION;
         exec_launch.instance_ids = {.ptr = exec_instance_ids, .len = 1};
         exec_launch.terminal_cells = {.ptr = exec_terminal_ptrs, .len = 1};
+        std::uint64_t exec_ticket_heads[] = {0, std::numeric_limits<std::uint64_t>::max()};
+        std::uint64_t exec_ticket_tails[] = {std::numeric_limits<std::uint64_t>::max(), 0};
+        const std::uint32_t exec_ticket_indptr[] = {0, 2};
+        exec_launch.channel_expected_head = {.ptr = exec_ticket_heads, .len = 2};
+        exec_launch.channel_expected_tail = {.ptr = exec_ticket_tails, .len = 2};
+        exec_launch.channel_ticket_indptr = {.ptr = exec_ticket_indptr, .len = 2};
         const PieCompletion exec_completion{
             .wait_id = 777,
             .target_epoch = 9,
             .terminal_cell = nullptr,
         };
 
-        // §4.3 availability: a fire taking from an empty host-writer ring
-        // rejects synchronously — no epoch, no poison, no notify.
-        if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) ==
-                        PIE_STATUS_INVALID_ARGUMENT,
-                    "launch without a host put rejects")) return 1;
-        if (!expect(notify.count() == 0, "availability rejection does not notify")) return 1;
-        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
-                    "availability rejection keeps terminal pending")) return 1;
+        // Missing input is accepted and classified at execution time as RETRY.
+        notify.clear();
+        if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) == PIE_STATUS_OK,
+                    "launch without a host put is accepted")) return 1;
+        notify.wait(777, 9);
+        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_RETRY,
+                    "missing host input publishes RETRY")) return 1;
+        if (!expect(writer_words[0] == 0 && reader_words[1] == 0 &&
+                        reader_words[2] == 0,
+                    "RETRY has no channel effects")) return 1;
 
         // Host put: wire bytes at `tail % cap1`, then the release tail store.
+        notify.clear();
+        exec_terminal = pending_terminal();
         const std::uint32_t put_value = 7;
         std::memcpy(writer_mirror, &put_value, sizeof(put_value));
         writer_words[1] = 1;
@@ -781,25 +790,26 @@ int main() {
                         std::uint64_t{777}, std::uint64_t{9}),
                     "batch notify lands last, exactly once")) return 1;
 
-        // Failure settlement (D4): a second fire with a fresh put but a full
-        // reader ring (no host take) poisons and fails the member terminal.
+        // A second logical fire with a full reader ring RETRYs without poison.
         notify.clear();
         exec_terminal = pending_terminal();
+        exec_ticket_heads[0] = 1;
+        exec_ticket_tails[1] = 1;
         const std::uint32_t second_value = 20;
         std::memcpy(writer_mirror + exec_endpoints[0].cell_bytes, &second_value,
                     sizeof(second_value));
         writer_words[1] = 2;
         if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) == PIE_STATUS_OK,
-                    "accepted fire settles even when publication fails")) return 1;
+                    "backpressured fire is accepted")) return 1;
         notify.wait(777, 9);
-        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_FAILED,
-                    "publication failure fails the member terminal")) return 1;
-        if (!expect(reader_words[2] != 0, "reader poison word published")) return 1;
-        if (!expect(notify.contains(511, reader_words[2]),
-                    "reader wake carries the poison epoch")) return 1;
+        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_RETRY,
+                    "output backpressure publishes RETRY")) return 1;
+        if (!expect(reader_words[2] == 0, "backpressure does not poison")) return 1;
+        if (!expect(writer_words[0] == 1 && reader_words[1] == 1,
+                    "backpressure leaves channel words unchanged")) return 1;
         if (!expect(!notify.empty() && notify.back() == std::make_pair(
                         std::uint64_t{777}, std::uint64_t{9}),
-                    "failed fire still notifies the batch slot last")) return 1;
+                    "retrying fire still notifies the batch slot last")) return 1;
 
         // ── Driver-level async acceptance (review items 1/5): a fresh add_one
         //    instance on its own channels. `pie_metal_launch` returns after
@@ -853,6 +863,14 @@ int main() {
             async_launch.abi_version = PIE_DRIVER_ABI_VERSION;
             async_launch.instance_ids = {.ptr = async_instance_ids, .len = 1};
             async_launch.terminal_cells = {.ptr = async_terminal_ptrs, .len = 1};
+            const std::uint64_t async_ticket_heads[] = {
+                0, std::numeric_limits<std::uint64_t>::max()};
+            const std::uint64_t async_ticket_tails[] = {
+                std::numeric_limits<std::uint64_t>::max(), 0};
+            const std::uint32_t async_ticket_indptr[] = {0, 2};
+            async_launch.channel_expected_head = {.ptr = async_ticket_heads, .len = 2};
+            async_launch.channel_expected_tail = {.ptr = async_ticket_tails, .len = 2};
+            async_launch.channel_ticket_indptr = {.ptr = async_ticket_indptr, .len = 2};
             const PieCompletion async_completion{.wait_id = 1777, .target_epoch = 4,
                                                  .terminal_cell = nullptr};
             notify.clear();
@@ -885,8 +903,7 @@ int main() {
         }
     }
 
-    // ── seed credit: a seeded Writer channel's first take spends the seed
-    //    without a host put and without a head-word publish (§4.3) ──
+    // ── seeded Writer: sequence zero is a normal immutable consume ticket. ──
     {
         const auto seeded_bytes = add_one_program(true);
         const auto seeded_sidecar = add_one_sidecar(seeded_bytes);
@@ -948,6 +965,14 @@ int main() {
         seeded_launch.abi_version = PIE_DRIVER_ABI_VERSION;
         seeded_launch.instance_ids = {.ptr = seeded_instance_ids, .len = 1};
         seeded_launch.terminal_cells = {.ptr = seeded_terminal_ptrs, .len = 1};
+        std::uint64_t seeded_ticket_heads[] = {
+            0, std::numeric_limits<std::uint64_t>::max()};
+        std::uint64_t seeded_ticket_tails[] = {
+            std::numeric_limits<std::uint64_t>::max(), 0};
+        const std::uint32_t seeded_ticket_indptr[] = {0, 2};
+        seeded_launch.channel_expected_head = {.ptr = seeded_ticket_heads, .len = 2};
+        seeded_launch.channel_expected_tail = {.ptr = seeded_ticket_tails, .len = 2};
+        seeded_launch.channel_ticket_indptr = {.ptr = seeded_ticket_indptr, .len = 2};
         const PieCompletion seeded_completion{
             .wait_id = 888,
             .target_epoch = 3,
@@ -961,18 +986,24 @@ int main() {
         std::uint32_t seeded_out = 0;
         std::memcpy(&seeded_out, seeded_reader_mirror, sizeof(seeded_out));
         if (!expect(seeded_out == 42, "seed value flowed through the program")) return 1;
-        if (!expect(seeded_writer_words[0] == 0,
-                    "seed spend publishes no writer head")) return 1;
-        if (!expect(!notify.contains(602, 0) && !notify.contains(602, 1),
-                    "seed spend sends no writer wake")) return 1;
+        if (!expect(seeded_writer_words[0] == 1,
+                    "seed consume publishes the writer head")) return 1;
+        if (!expect(notify.contains(602, 1),
+                    "seed consume wakes the writer")) return 1;
         if (!expect(seeded_terminal.outcome == PIE_TERMINAL_OUTCOME_SUCCESS,
                     "seeded fire settles success")) return 1;
 
-        // The credit is spent: a second fire needs a real host put.
+        // The seed is spent: a second fire without a real host put RETRYs.
+        notify.clear();
         seeded_terminal = pending_terminal();
+        seeded_ticket_heads[0] = 1;
+        seeded_ticket_tails[1] = 1;
         if (!expect(pie_metal_launch(driver, &seeded_launch, seeded_completion) ==
-                        PIE_STATUS_INVALID_ARGUMENT,
-                    "spent seed credit no longer satisfies availability")) return 1;
+                        PIE_STATUS_OK,
+                    "spent seed launch is accepted")) return 1;
+        notify.wait(888, 3);
+        if (!expect(seeded_terminal.outcome == PIE_TERMINAL_OUTCOME_RETRY,
+                    "spent seed without a put RETRYs")) return 1;
 
         if (!expect(pie_metal_close_instance(driver, seeded_binding.instance_id) ==
                         PIE_STATUS_OK,

@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -307,6 +308,13 @@ int main() {
     launch.sampling_indptr = {.ptr = sampling_indptr, .len = 2};
     launch.rs_slot_ids = {.ptr = rs_slot_ids, .len = 1};
     launch.rs_slot_flags = {.ptr = rs_slot_flags, .len = 1};
+    const std::uint64_t no_ticket = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t ticket_heads[] = {0, no_ticket};
+    const std::uint64_t ticket_tails[] = {no_ticket, 0};
+    const std::uint32_t ticket_indptr[] = {0, 2};
+    launch.channel_expected_head = {.ptr = ticket_heads, .len = 2};
+    launch.channel_expected_tail = {.ptr = ticket_tails, .len = 2};
+    launch.channel_ticket_indptr = {.ptr = ticket_indptr, .len = 2};
 
     const PieCompletion completion{.wait_id = 0, .target_epoch = 0, .terminal_cell = nullptr};
     const int32_t launch_rc = pie_metal_launch(driver, &launch, completion);
@@ -612,9 +620,36 @@ int main() {
         expect(pie_metal_bind_instance(driver, &instance2, &binding2) == PIE_STATUS_OK,
               "bind_instance (2nd member)");
 
-        // Fresh both members: reset slot 0 and slot 1 so neither continues the
-        // ring left resident by the earlier single-member launch.
-        const std::uint64_t batch_instance_ids[] = {binding.instance_id, binding2.instance_id};
+        PieChannelDesc chan4 = chan2;
+        chan4.channel_id = 5;
+        chan4.reader_wait_id = 9;
+        chan4.writer_wait_id = 10;
+        PieChannelEndpointBinding chan4_binding{};
+        expect(pie_metal_register_channel(driver, &chan4, &chan4_binding) == PIE_STATUS_OK,
+              "register_channel(chan5, 3rd member embed token)");
+        PieChannelDesc chan5 = chan3;
+        chan5.channel_id = 6;
+        chan5.reader_wait_id = 11;
+        chan5.writer_wait_id = 12;
+        PieChannelEndpointBinding chan5_binding{};
+        expect(pie_metal_register_channel(driver, &chan5, &chan5_binding) == PIE_STATUS_OK,
+              "register_channel(chan6, 3rd member sampled token)");
+        const std::uint64_t channel_ids3[] = {5, 6};
+        PieChannelValueDesc seed3{};
+        seed3.channel_id = 5;
+        seed3.bytes = {.ptr = seed_bytes, .len = 4};
+        PieInstanceDesc instance3{};
+        instance3.abi_version = PIE_DRIVER_ABI_VERSION;
+        instance3.program_id = program_id;
+        instance3.channel_ids = {.ptr = channel_ids3, .len = 2};
+        instance3.seed_values = {.ptr = &seed3, .len = 1};
+        PieInstanceBinding binding3{};
+        expect(pie_metal_bind_instance(driver, &instance3, &binding3) == PIE_STATUS_OK,
+              "bind_instance (3rd member)");
+
+        // Both batch members are fresh; the earlier single-member reference
+        // already consumed its seed and is not reused.
+        const std::uint64_t batch_instance_ids[] = {binding2.instance_id, binding3.instance_id};
         PieTerminalCell t0{.outcome = PIE_TERMINAL_OUTCOME_PENDING, .reserved0 = 0};
         PieTerminalCell t1{.outcome = PIE_TERMINAL_OUTCOME_PENDING, .reserved0 = 0};
         PieTerminalCell* batch_terminal_ptrs[] = {&t0, &t1};
@@ -643,6 +678,14 @@ int main() {
         batch.sampling_indptr = {.ptr = batch_sampling_indptr, .len = 3};
         batch.rs_slot_ids = {.ptr = batch_rs_slot_ids, .len = 2};
         batch.rs_slot_flags = {.ptr = batch_rs_slot_flags, .len = 2};
+        const std::uint64_t batch_ticket_heads[] = {
+            0, no_ticket, 0, no_ticket};
+        const std::uint64_t batch_ticket_tails[] = {
+            no_ticket, 0, no_ticket, 0};
+        const std::uint32_t batch_ticket_indptr[] = {0, 2, 4};
+        batch.channel_expected_head = {.ptr = batch_ticket_heads, .len = 4};
+        batch.channel_expected_tail = {.ptr = batch_ticket_tails, .len = 4};
+        batch.channel_ticket_indptr = {.ptr = batch_ticket_indptr, .len = 3};
 
         // The driver was created with a no-op notify; the batch completion here
         // uses wait_id 0 (no batch notify), so we assert on terminals only.
@@ -658,8 +701,8 @@ int main() {
               "both batch members settle their terminals SUCCESS exactly once");
 
         std::int32_t tok0 = -1, tok1 = -1;
-        std::memcpy(&tok0, reinterpret_cast<void*>(chan1_binding.mirror_base), 4);
-        std::memcpy(&tok1, reinterpret_cast<void*>(chan3_binding.mirror_base), 4);
+        std::memcpy(&tok0, reinterpret_cast<void*>(chan3_binding.mirror_base), 4);
+        std::memcpy(&tok1, reinterpret_cast<void*>(chan5_binding.mirror_base), 4);
         expect(tok0 == sampled_token && tok1 == sampled_token,
               "each batch member's sampled token == the single-member reference (member0=" +
                   std::to_string(tok0) + " member1=" + std::to_string(tok1) + " ref=" +

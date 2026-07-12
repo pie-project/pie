@@ -17,7 +17,8 @@ class Context {
     Context& operator=(const Context&) = delete;
 
     int initialize(const std::string& config_path, const PieRuntimeCallbacks& runtime);
-    void fill_caps(PieDriverCaps* caps) const;
+    void fill_device_facts(PieDriverCaps* caps) const;
+    int load_model(const PieModelLoadDesc& load, PieDriverCaps* caps);
     int register_program(const PieProgramDesc& program, std::uint64_t* program_id);
     int register_channel(const PieChannelDesc& channel, PieChannelEndpointBinding* binding);
     int bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding);

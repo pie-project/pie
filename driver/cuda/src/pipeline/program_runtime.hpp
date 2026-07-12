@@ -163,10 +163,9 @@ class PtirInstance {
 
     bool ok() const { return ok_; }
 
-    // §4.3 writer availability: every host-writer channel this trace takes
-    // must have a host input (a published ring entry or the one-shot seed
-    // credit) before the fire is accepted. A missing put is a guest ordering
-    // bug — the launch rejects synchronously, no epoch, no poison.
+    // Device-geometry descriptor resolution still needs host-published
+    // geometry before composition. Ordinary fires never call this eager probe;
+    // their ticket kernel validates inputs at execution and reports RETRY.
     bool writer_inputs_available(std::string* err = nullptr) const {
         for (const Channel& ch : trace_->channels) {
             if (!ch.host_visible || ch.host_reader) continue;

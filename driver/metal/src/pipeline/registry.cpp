@@ -212,9 +212,14 @@ int Registry::bind_instance(
                 value)) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
+        if (endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_READER) {
+            encode_wire(value, endpoint.mirror.data());
+        }
         seeds.emplace(dense, std::move(value));
+        std::atomic_ref<std::uint64_t>(endpoint.words[1]).store(
+            1, std::memory_order_release);
         if (endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_WRITER) {
-            endpoint.seed_credit = true;
+            endpoint.pulled = 1;
         }
     }
 

@@ -25,8 +25,6 @@ pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> Re
 
 pub(crate) struct BatchAccumulator {
     requests: Vec<PendingRequest>,
-    total_tokens: usize,
-    total_pages: usize,
     page_size: u32,
     limits: SchedulerLimits,
 }
@@ -35,17 +33,12 @@ impl BatchAccumulator {
     pub(crate) fn new(limits: SchedulerLimits, page_size: u32) -> Self {
         Self {
             requests: Vec::new(),
-            total_tokens: 0,
-            total_pages: 0,
             page_size,
             limits,
         }
     }
 
     pub(crate) fn push(&mut self, req: PendingRequest) {
-        let usage = request_capacity_usage(&req, self.page_size);
-        self.total_tokens = self.total_tokens.saturating_add(usage.forward_tokens);
-        self.total_pages = self.total_pages.saturating_add(usage.page_refs);
         self.requests.push(req);
     }
 
@@ -69,30 +62,7 @@ impl BatchAccumulator {
         None
     }
 
-    pub(crate) fn would_exceed(&self, req: &PendingRequest) -> bool {
-        if self.requests.is_empty() {
-            return false;
-        }
-        let usage = request_capacity_usage(req, self.page_size);
-        self.requests.len() + 1 > self.limits.max_forward_requests
-            || self.total_tokens.saturating_add(usage.forward_tokens)
-                > self.limits.max_forward_tokens
-            || self.total_pages.saturating_add(usage.page_refs) > self.limits.max_page_refs
-    }
-
-    pub(crate) fn is_full(&self) -> bool {
-        self.requests.len() >= self.limits.max_forward_requests
-            || self.total_tokens >= self.limits.max_forward_tokens
-            || self.total_pages >= self.limits.max_page_refs
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.requests.is_empty()
-    }
-
     pub(crate) fn take(&mut self) -> Vec<PendingRequest> {
-        self.total_tokens = 0;
-        self.total_pages = 0;
         std::mem::take(&mut self.requests)
     }
 }
@@ -120,7 +90,6 @@ pub(crate) fn build_batch_request(
             instance_ids: vec![req.instance_id],
             terminal_cells: vec![req.completion.terminal_cell_ptr()],
             logical_fire_ids: vec![req.logical_fire_id],
-            retry_eligible: vec![u8::from(req.retry_eligible)],
             channel_expected_head,
             channel_expected_tail,
             channel_ticket_indptr: vec![0, channel_ticket_len],
@@ -139,7 +108,6 @@ pub(crate) fn build_batch_request(
         let mut kv_translation_indptr = Vec::with_capacity(requests.len() + 1);
         kv_translation_indptr.push(0);
         let mut logical_fire_ids = Vec::with_capacity(requests.len());
-        let mut retry_eligible = Vec::with_capacity(requests.len());
         let mut channel_expected_head = Vec::new();
         let mut channel_expected_tail = Vec::new();
         let mut channel_ticket_indptr = Vec::with_capacity(requests.len() + 1);
@@ -151,7 +119,6 @@ pub(crate) fn build_batch_request(
             instance_ids.push(req.instance_id);
             terminal_cells.push(req.completion.terminal_cell_ptr());
             logical_fire_ids.push(req.logical_fire_id);
-            retry_eligible.push(u8::from(req.retry_eligible));
             wire::append_request_with_options(
                 &mut batch_req,
                 &req.request,
@@ -174,7 +141,6 @@ pub(crate) fn build_batch_request(
             kv_translation_indptr,
             program_row_indptr,
             logical_fire_ids,
-            retry_eligible,
             channel_expected_head,
             channel_expected_tail,
             channel_ticket_indptr,
@@ -196,11 +162,12 @@ mod tests {
             instance_id,
             completion: WorkItemCompletion::new(instance_id, 0),
             pipeline_id: None,
+            preparation_order_key: None,
             prebuilt,
             retry_count: 0,
-            retry_eligible: true,
             prelaunch_copy: None,
             preparation: None,
+            retry_classifier: None,
             preparation_retries: 0,
         }
     }

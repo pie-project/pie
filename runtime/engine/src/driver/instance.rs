@@ -64,14 +64,30 @@ impl BoundWaitSlots {
         this: &Arc<Self>,
         completion_wait_id: u64,
     ) -> Arc<dyn crate::driver::completion::CompletionLease> {
+        if this.close_requested.load(Ordering::Acquire) {
+            return Arc::new(BoundWaitLease {
+                slots: Arc::clone(this),
+                completion_wait_id,
+                active: false,
+            });
+        }
         this.completion_wait_ids
             .lock()
             .unwrap()
             .push(completion_wait_id);
         this.active_leases.fetch_add(1, Ordering::AcqRel);
+        if this.close_requested.load(Ordering::Acquire) {
+            this.release_completion_lease_for(completion_wait_id);
+            return Arc::new(BoundWaitLease {
+                slots: Arc::clone(this),
+                completion_wait_id,
+                active: false,
+            });
+        }
         Arc::new(BoundWaitLease {
             slots: Arc::clone(this),
             completion_wait_id,
+            active: true,
         })
     }
 
@@ -129,12 +145,15 @@ impl crate::driver::completion::CompletionLease for BoundWaitLease {
 struct BoundWaitLease {
     slots: Arc<BoundWaitSlots>,
     completion_wait_id: u64,
+    active: bool,
 }
 
 impl Drop for BoundWaitLease {
     fn drop(&mut self) {
-        self.slots
-            .release_completion_lease_for(self.completion_wait_id);
+        if self.active {
+            self.slots
+                .release_completion_lease_for(self.completion_wait_id);
+        }
     }
 }
 

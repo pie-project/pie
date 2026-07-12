@@ -13,6 +13,7 @@
 #include "decode_abi.hpp"
 #include "heap_layout.hpp"      // HeapPlan
 #include "mtl4_context.hpp"     // RawMetalContext, SlotHandle
+#include "pie_native/storage_program.hpp"
 
 namespace pie::metal {
 
@@ -22,6 +23,7 @@ struct Dispatch;  // beta: decode_step.hpp
 // Every slot delta allocates: the bind pass + the beta scratch handoff read from this.
 struct BoundDecode {
     HeapPlan plan;
+    SlotHandle weights_region;
 
     // load-once weights, keyed by HF tensor name (tied lm_head appears once).
     std::unordered_map<std::string, SlotHandle> weights;
@@ -49,8 +51,12 @@ struct BoundDecode {
 
 // Stage all weights/state/KV/IO/scratch into the single resident heap (allocation order
 // follows the region plan). The view must outlive nothing (zero-copy mmap is read here).
-BoundDecode stage_decode_weights(RawMetalContext& ctx, const SafetensorsView& view,
-                                 const DecodeGeometry& g, const HeapPlan& plan);
+BoundDecode stage_decode_storage(
+    RawMetalContext& ctx,
+    const SafetensorsView& view,
+    const pie_weight_loader::StorageProgram& program,
+    const DecodeGeometry& g,
+    const HeapPlan& plan);
 
 // Walk beta's DAG; bind delta's weight/state/KV/IO slots for each dispatch by ordinal.
 void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,

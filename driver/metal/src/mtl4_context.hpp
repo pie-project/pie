@@ -28,6 +28,13 @@
 
 namespace pie::metal {
 
+struct MetalStorageFacts {
+    std::uint32_t alignment = 1;
+    std::uint32_t page_size = 1;
+};
+
+MetalStorageFacts query_metal_storage_facts();
+
 // ── Opaque handles (borrowed; lifetime owned by RawMetalContext) ──────────────
 
 // A sub-range of the single resident heap. `contents()` is the CPU-visible pointer

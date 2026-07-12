@@ -108,8 +108,8 @@ driver/metal/src
 │                       (PSO cache/table)
 ├── store/              resident ring + paged KV pool + linear-state slots
 │                       (extracted from heap_layout.hpp + decoder residency)
-└── loader/             snapshot -> resident heap: safetensors_view,
-                        heap_bind, heap_bind_names, heap_layout (weights half)
+└── loader/             StorageProgram -> resident heap: safetensors_view,
+                        heap_bind, heap_layout (region sizing)
 
 driver/metal/tests
 ├── mlx/                the relocated MLX cluster (ops, model graph, loader,
@@ -241,7 +241,7 @@ proven on the bigger tree first. File-by-file:
 | `decode_psos.cpp`, `decode_timing.cpp` | `kernels/` (PSO table), `batch/` (timing) | |
 | `batch_schedule.hpp`, `forward_marshal.hpp` | `batch/compose.cpp` orbit | launch-to-work translation |
 | `scratch_schedule.cpp` | `batch/scratch.{hpp,cpp}` | per-step scratch planning (CUDA analog: batch/workspace) |
-| `heap_bind.cpp`, `heap_bind_names.cpp`, `heap_bind_metal.hpp` | `loader/` | weight-name -> heap binding |
+| `heap_bind.cpp`, `heap_bind_metal.hpp` | `loader/` | program arena execution + canonical operand binding |
 | `safetensors_view.cpp` | `loader/` | mmap checkpoint reader |
 | `heap_layout.hpp` | split: weight regions -> `loader/`; KV ring/pool/state regions -> `store/` | the one file straddling both memories |
 | `mtl4_context.mm` + `.hpp` | top-level `src/` | Context-owned Metal substrate |
@@ -311,10 +311,10 @@ Gate: clean-clone configure + build + ctest on Apple Silicon; serve/client run.
 - **CPU host interpreter stays the production PTIR engine** (rule 10). Metal
   gets a GPU sampling plane only if profiling shows the host hop matters at
   metal's batch sizes; that is a feature project, not this refactor.
-- **Metal keeps its own loader; no Rust weight-loader adoption in this plan.**
-  The live path is mmap + heap bind for one arch; adopting the StorageProgram
-  pipeline is worth revisiting when metal supports multiple quantized families,
-  not before.
+- **Storage adoption is specified separately.** This refactor originally kept
+  Metal's loader unchanged; [storage-refact-and-metal.md](storage-refact-and-metal.md)
+  supersedes that carve-out. The live path now executes the runtime compiler's
+  arena plan and retains mmap only as the payload source.
 - **`qwen36` -> `qwen3_5`** so the same model family greps identically across
   drivers. Display strings that reach users may keep "qwen3.6" if that is the
   product label; identifiers and paths align with CUDA.
@@ -339,6 +339,7 @@ it is the canary for accidental capability drift behind the frozen ABI.
 - gemma4 productization (bring-up continues in `tools/rawmetal/`; wiring it into
   the executor is its own effort with its own parity gates).
 - A GPU-side PTIR execution plane for metal (tier-0 analog).
-- Rust weight-loader adoption.
+- Additional Metal model-family schemas beyond the runtime compiler support in
+  `storage-refact-and-metal.md`.
 - `driver/portable` and `driver/dummy`: untouched.
 - Lifting the 4096-token / single-ring caps: capacity work, not layout work.

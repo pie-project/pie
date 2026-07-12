@@ -33,9 +33,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lru::LruCache;
-use pie_ptir::container::{self, ContainerDecodeError, TraceContainer};
+use pie_ptir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use pie_ptir::container_hash;
-use pie_ptir::registry::ModelProfile;
+use pie_ptir::op::Op;
+use pie_ptir::registry::{ModelProfile, Port};
 use pie_ptir::validate::{BoundTrace, ValidateError, bind};
 
 /// Registration-time pricing (thrust-3 P2.3): per-instance costs computed once
@@ -64,6 +65,8 @@ pub struct RegisteredProgram {
     pub hash: u64,
     /// The validated, typed artifact (types, readiness, §7.1 classes).
     pub bound: BoundTrace,
+    /// Dense-channel `(consume, publish)` mask, derived once from immutable IR.
+    pub channel_accesses: Vec<(bool, bool)>,
     /// The PTIB typed sidecar (`encode_bound(&bound)`) — the wire form of
     /// `BoundTrace` shipped beside the container bytes to the driver
     /// (seed-independent, hash-keyed; its inner `container_hash` == [`Self::hash`],
@@ -121,6 +124,7 @@ impl Registry {
         }
         let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
         let pricing = price(&decoded);
+        let channel_accesses = Self::channel_accesses(&decoded);
         let bound = bind(decoded, profile.clone()).map_err(RegisterError::Bind)?;
         // The PTIB sidecar is the host→driver wire form of `BoundTrace`
         // (seed-independent, hash-keyed) — computed once, cached beside pricing.
@@ -129,11 +133,37 @@ impl Registry {
             bytes,
             hash,
             bound,
+            channel_accesses,
             sidecar,
             pricing,
         });
         self.inner.put(hash, entry.clone());
         Ok(entry)
+    }
+
+    fn channel_accesses(container: &TraceContainer) -> Vec<(bool, bool)> {
+        let mut accesses = vec![(false, false); container.channels.len()];
+        for stage in &container.stages {
+            for op in &stage.ops {
+                match *op {
+                    Op::ChanTake(channel) => accesses[channel as usize].0 = true,
+                    Op::ChanPut { chan, .. } => accesses[chan as usize].1 = true,
+                    _ => {}
+                }
+            }
+        }
+        for binding in &container.ports {
+            let PortSource::Channel(channel) = &binding.source else {
+                continue;
+            };
+            if matches!(
+                binding.port,
+                Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff
+            ) {
+                accesses[*channel as usize].0 = true;
+            }
+        }
+        accesses
     }
 
     /// Probe by identity hash (a hit bumps LRU recency).

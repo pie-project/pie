@@ -48,23 +48,35 @@ unsafe impl Sync for TerminalCellStorage {}
 #[derive(Debug)]
 struct OwnedTerminalCell {
     raw: Option<Box<TerminalCellStorage>>,
+    recyclable: bool,
 }
 
-// Dropped cells are quarantined here and never reused: the driver may still
-// hold a raw pointer after the owning future is dropped, and recycling that
-// address would let a late terminal store ABA-corrupt a newer work item.
+// Only cells whose last accepted native attempt has retired enter this pool.
+// Cells dropped while native retirement is uncertain remain quarantined.
 fn terminal_cell_pool() -> &'static SegQueue<Box<TerminalCellStorage>> {
     static POOL: OnceLock<SegQueue<Box<TerminalCellStorage>>> = OnceLock::new();
     POOL.get_or_init(SegQueue::new)
 }
 
+fn terminal_cell_quarantine() -> &'static SegQueue<Box<TerminalCellStorage>> {
+    static QUARANTINE: OnceLock<SegQueue<Box<TerminalCellStorage>>> = OnceLock::new();
+    QUARANTINE.get_or_init(SegQueue::new)
+}
+
 impl OwnedTerminalCell {
     fn new() -> Self {
-        let raw = Box::new(TerminalCellStorage(UnsafeCell::new(PieTerminalCell {
-            outcome: PIE_TERMINAL_OUTCOME_PENDING,
-            reserved0: 0,
-        })));
-        Self { raw: Some(raw) }
+        let raw = terminal_cell_pool().pop().unwrap_or_else(|| {
+            Box::new(TerminalCellStorage(UnsafeCell::new(PieTerminalCell {
+                outcome: PIE_TERMINAL_OUTCOME_PENDING,
+                reserved0: 0,
+            })))
+        });
+        let cell = Self {
+            raw: Some(raw),
+            recyclable: false,
+        };
+        cell.reset();
+        cell
     }
 
     fn as_mut_ptr(&self) -> *mut PieTerminalCell {
@@ -87,12 +99,20 @@ impl OwnedTerminalCell {
             };
         }
     }
+
+    fn mark_recyclable(&mut self) {
+        self.recyclable = true;
+    }
 }
 
 impl Drop for OwnedTerminalCell {
     fn drop(&mut self) {
         if let Some(raw) = self.raw.take() {
-            terminal_cell_pool().push(raw);
+            if self.recyclable {
+                terminal_cell_pool().push(raw);
+            } else {
+                terminal_cell_quarantine().push(raw);
+            }
         }
     }
 }
@@ -520,6 +540,8 @@ struct WorkItemCompletionState {
     target_epoch: AtomicU64,
     terminal: OwnedTerminalCell,
     resolution: AtomicU32,
+    cancel_requested: AtomicBool,
+    native_retired: AtomicBool,
     message: Mutex<Option<String>>,
     guard: Option<Arc<dyn CompletionLease>>,
 }
@@ -532,6 +554,10 @@ impl WorkItemCompletionState {
             target_epoch: AtomicU64::new(target_epoch),
             terminal: OwnedTerminalCell::new(),
             resolution: AtomicU32::new(WORK_ITEM_RESOLUTION_PENDING),
+            cancel_requested: AtomicBool::new(false),
+            // Unknown until the scheduler either retires an accepted native
+            // attempt or explicitly proves the request was never submitted.
+            native_retired: AtomicBool::new(false),
             message: Mutex::new(None),
             guard,
         }
@@ -547,6 +573,7 @@ impl WorkItemCompletionState {
 
     fn commit_target_epoch(&self, target_epoch: u64) {
         assert!(target_epoch >= FIRST_COMPLETION_EPOCH);
+        self.native_retired.store(false, Ordering::Release);
         let previous = self.target_epoch.swap(target_epoch, Ordering::AcqRel);
         assert!(
             previous == 0 || target_epoch > previous,
@@ -565,6 +592,18 @@ impl WorkItemCompletionState {
         self.resolution
             .store(WORK_ITEM_RESOLUTION_FAILED, Ordering::Release);
         let _ = WakerTable::global().publish(self.slot, 1);
+    }
+
+    fn request_cancel(&self) {
+        self.cancel_requested.store(true, Ordering::Release);
+    }
+
+    fn cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::Acquire)
+    }
+
+    fn mark_native_retired(&self) {
+        self.native_retired.store(true, Ordering::Release);
     }
 
     fn result(&self) -> Option<Result<()>> {
@@ -615,6 +654,14 @@ impl WorkItemCompletionState {
                     "work item completion published invalid terminal outcome {value}"
                 ))
             }
+        }
+    }
+}
+
+impl Drop for WorkItemCompletionState {
+    fn drop(&mut self) {
+        if self.native_retired.load(Ordering::Acquire) {
+            self.terminal.mark_recyclable();
         }
     }
 }
@@ -679,6 +726,23 @@ impl WorkItemCompletion {
         self.state.resolve_failure(message);
     }
 
+    pub(crate) fn reject_unsubmitted(&self, message: impl Into<String>) {
+        self.state.mark_native_retired();
+        self.state.resolve_failure(message);
+    }
+
+    pub(crate) fn request_cancel(&self) {
+        self.state.request_cancel();
+    }
+
+    pub(crate) fn cancel_requested(&self) -> bool {
+        self.state.cancel_requested()
+    }
+
+    pub(crate) fn mark_native_retired(&self) {
+        self.state.mark_native_retired();
+    }
+
     pub(crate) fn resolve_from_terminal(&self) -> Result<WorkItemAttemptOutcome> {
         self.state.resolve_from_terminal()
     }
@@ -734,6 +798,39 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    fn pool_contains(
+        pool: &SegQueue<Box<TerminalCellStorage>>,
+        pointer: *mut PieTerminalCell,
+    ) -> bool {
+        let mut drained = Vec::new();
+        let mut found = false;
+        while let Some(cell) = pool.pop() {
+            found |= cell.0.get() == pointer;
+            drained.push(cell);
+        }
+        for cell in drained {
+            pool.push(cell);
+        }
+        found
+    }
+
+    #[test]
+    fn terminal_cells_recycle_only_after_native_attempt_retirement() {
+        let retired = WorkItemCompletion::new(WakerTable::global().alloc(), 0);
+        let retired_pointer = retired.terminal_cell_ptr();
+        retired.commit_target_epoch(FIRST_COMPLETION_EPOCH);
+        retired.mark_native_retired();
+        drop(retired);
+        assert!(pool_contains(terminal_cell_pool(), retired_pointer));
+
+        let uncertain = WorkItemCompletion::new(WakerTable::global().alloc(), 0);
+        let uncertain_pointer = uncertain.terminal_cell_ptr();
+        uncertain.commit_target_epoch(FIRST_COMPLETION_EPOCH);
+        drop(uncertain);
+        assert!(!pool_contains(terminal_cell_pool(), uncertain_pointer));
+        assert!(pool_contains(terminal_cell_quarantine(), uncertain_pointer));
     }
 
     fn counter_waker() -> (Arc<CountWaker>, Waker) {

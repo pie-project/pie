@@ -31,7 +31,7 @@ use crate::config::ModelConfig;
 use crate::error::CompileError;
 use crate::gguf::parse_gguf_checkpoint;
 use crate::source::CheckpointMetadata;
-use crate::storage::{StorageProgram, StorageTarget};
+use crate::storage::{STORAGE_PROGRAM_VERSION, StorageProgram, StorageTarget, compiler_version};
 use crate::storage_compiler::compile_storage_program;
 
 /// Discover the safetensors shard files for a snapshot directory, matching the
@@ -154,8 +154,32 @@ pub fn compile_snapshot_to_bytes(
     target: StorageTarget,
 ) -> Result<Vec<u8>, CompileError> {
     let program = compile_snapshot(snapshot_dir, model, target)?;
-    bincode::serialize(&program)
+    serialize_program(&program)
+}
+
+pub fn serialize_program(program: &StorageProgram) -> Result<Vec<u8>, CompileError> {
+    serde_json::to_vec(program)
         .map_err(|err| CompileError::Internal(format!("storage program serialize failed: {err}")))
+}
+
+pub fn deserialize_program(bytes: &[u8]) -> Result<StorageProgram, CompileError> {
+    let program: StorageProgram = serde_json::from_slice(bytes).map_err(|err| {
+        CompileError::InvalidInput(format!("storage program deserialize failed: {err}"))
+    })?;
+    if program.version != STORAGE_PROGRAM_VERSION {
+        return Err(CompileError::InvalidInput(format!(
+            "storage program version {} does not match executor version {}",
+            program.version, STORAGE_PROGRAM_VERSION
+        )));
+    }
+    let expected = compiler_version();
+    if program.compiler_version != expected {
+        return Err(CompileError::InvalidInput(format!(
+            "storage compiler version {:#x} does not match executor version {expected:#x}",
+            program.compiler_version
+        )));
+    }
+    Ok(program)
 }
 
 /// Parse the coarse [`ModelConfig`] fields the storage compiler needs from a

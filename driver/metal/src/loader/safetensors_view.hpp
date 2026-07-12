@@ -49,7 +49,15 @@ class SafetensorsView {
     size_t                   size() const;          // number of tensors
     std::vector<std::string> names() const;
 
+    void copy_storage_bytes(
+        std::uint32_t file_id,
+        std::uint64_t file_offset,
+        std::uint64_t bytes,
+        void* destination,
+        std::uint64_t max_tile_bytes) const;
+
   private:
+    void ensure_index() const;
     struct Impl;
     Impl* impl_;
 };

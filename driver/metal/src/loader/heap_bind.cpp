@@ -1,6 +1,6 @@
 // heap_bind.cpp — delta's Metal-side weight staging + per-ordinal arg-table binding.
 //
-// Stages every load-once weight (name registry: heap_bind_names.cpp), allocates the
+// Executes the runtime-owned StorageProgram into one weights region, allocates
 // persistent GDN state + KV pages + IO scalars from heap_layout, then walks beta's
 // build_decode_dag and binds each dispatch's WEIGHT / STATE / KV / IO slots BY ORDINAL.
 // beta binds the per-dispatch activation/scratch X/Out (his WAR/WAW ping-pong) over the
@@ -32,11 +32,16 @@ namespace pie::metal {
 
 namespace {
 
-SlotHandle stage_tensor(RawMetalContext& ctx, const RawTensor& rt) {
-    SlotHandle s = ctx.heap_alloc(rt.nbytes);
-    if (!s.valid()) throw std::runtime_error("heap_alloc failed (weights region exhausted)");
-    std::memcpy(s.contents(), rt.data, rt.nbytes);
-    return s;
+SlotHandle slice_slot(const SlotHandle& parent, std::uint64_t offset, std::uint64_t bytes) {
+    if (!parent.valid() || offset > parent.size || bytes > parent.size - offset) {
+        throw std::runtime_error("storage program buffer exceeds weights region");
+    }
+    SlotHandle out = parent;
+    out.contents_ptr = static_cast<std::uint8_t*>(parent.contents()) + offset;
+    out.gpu_address = parent.gpu_address + offset;
+    out.offset = parent.offset + offset;
+    out.size = static_cast<std::size_t>(bytes);
+    return out;
 }
 
 SlotHandle alloc_zeroed(RawMetalContext& ctx, size_t nbytes) {
@@ -46,22 +51,193 @@ SlotHandle alloc_zeroed(RawMetalContext& ctx, size_t nbytes) {
     return s;
 }
 
+std::uint64_t extent_bytes(
+    const pie_weight_loader::PieLoaderStridedExtentView& extent) {
+    return pie_weight_loader::cpp::extent_bytes(extent, "metal storage executor");
+}
+
+void copy_extent(
+    const SafetensorsView& source,
+    const pie_weight_loader::PieLoaderSourceExtentView& src,
+    const pie_weight_loader::PieLoaderDestExtentView& dst,
+    const SlotHandle& target,
+    std::uint64_t max_tile_bytes) {
+    if (!pie_weight_loader::cpp::compact_extent(src.stride) ||
+        !pie_weight_loader::cpp::compact_extent(dst.stride)) {
+        throw std::runtime_error(
+            "metal storage executor: non-compact ExtentWrite is unsupported");
+    }
+    const std::uint64_t bytes = extent_bytes(dst.stride);
+    if (bytes != src.span_bytes) {
+        throw std::runtime_error(
+            "metal storage executor: source/destination extent size mismatch");
+    }
+    const std::uint64_t offset = dst.offset + dst.stride.base_offset;
+    if (offset > target.size || bytes > target.size - offset) {
+        throw std::runtime_error(
+            "metal storage executor: ExtentWrite destination is out of bounds");
+    }
+    source.copy_storage_bytes(
+        src.file_id,
+        src.file_offset + src.stride.base_offset,
+        bytes,
+        static_cast<std::uint8_t*>(target.contents()) + offset,
+        max_tile_bytes);
+}
+
 }  // namespace
 
-// Stage all weights/state/KV/IO/scratch into the single resident heap. Allocation order
-// follows the region plan (weights → kv → state → scratch → io) so alpha's bump allocator
-// lands each slot in its planned region.
-BoundDecode stage_decode_weights(RawMetalContext& ctx, const SafetensorsView& view,
-                                 const DecodeGeometry& g, const HeapPlan& plan) {
+BoundDecode stage_decode_storage(
+    RawMetalContext& ctx,
+    const SafetensorsView& view,
+    const pie_weight_loader::StorageProgram& program,
+    const DecodeGeometry& g,
+    const HeapPlan& plan) {
     BoundDecode b;
     b.plan = plan;
     b.gdn.resize(g.n_layers);
     b.kv.resize(g.n_layers);
 
-    // ── Weights region: stage every text-decode tensor (tied lm_head once) ──
-    for (const auto& name : decode_weight_tensors(g)) {
-        const RawTensor rt = view.get(name);   // throws if absent (probe-verified present)
-        b.weights.emplace(name, stage_tensor(ctx, rt));
+    const auto storage = program.view();
+    if (program.backend() != pie_weight_loader::PieLoaderBackendKind::Metal) {
+        throw std::runtime_error("metal storage executor received a non-Metal program");
+    }
+    for (std::size_t i = 0; i < storage.tensors.len; ++i) {
+        const auto& tensor = storage.tensors.ptr[i];
+        if (tensor.quant_scheme ==
+                pie_weight_loader::PieLoaderQuantScheme::MlxAffineU4 &&
+            (tensor.quant_bits_per_element != 4 ||
+             tensor.quant_group_size != 64)) {
+            throw std::runtime_error(
+                "metal qmv kernels require MLX affine-U4 g64/b4; program requested g" +
+                std::to_string(tensor.quant_group_size) + "/b" +
+                std::to_string(tensor.quant_bits_per_element));
+        }
+    }
+    b.weights_region = ctx.heap_alloc(
+        plan.weights_bytes,
+        std::max<std::size_t>(1, program.preferred_alignment()));
+    if (!b.weights_region.valid()) {
+        throw std::runtime_error("heap_alloc failed for program-owned weights region");
+    }
+    std::unordered_map<std::uint32_t, SlotHandle> buffers;
+    pie_weight_loader::cpp::StorageProgramIndex index("metal storage executor");
+    index.reset(storage);
+    for (std::size_t step = 0; step < storage.schedule.len; ++step) {
+        const auto& instr = index.instruction(storage.schedule.ptr[step]);
+        using K = pie_weight_loader::PieLoaderStorageInstrKind;
+        switch (instr.kind) {
+        case K::Allocate: {
+            const auto& decl = index.buffer(instr.buffer_id);
+            if (!decl.has_persistent_offset || decl.temporary) {
+                throw std::runtime_error(
+                    "metal storage executor requires arena-resident buffers");
+            }
+            buffers.emplace(
+                decl.id,
+                slice_slot(
+                    b.weights_region,
+                    decl.persistent_offset,
+                    decl.bytes));
+            break;
+        }
+        case K::ExtentWrite: {
+            if (!instr.has_source || !instr.has_dest) {
+                throw std::runtime_error(
+                    "metal storage executor: ExtentWrite missing source/dest");
+            }
+            const auto target = buffers.find(instr.dest.buffer_id);
+            if (target == buffers.end()) {
+                throw std::runtime_error(
+                    "metal storage executor: destination buffer is missing");
+            }
+            copy_extent(
+                view,
+                instr.source,
+                instr.dest,
+                target->second,
+                program.max_tile_bytes());
+            break;
+        }
+        case K::BulkExtentWrite: {
+            if (!instr.has_source || !instr.has_dest) {
+                throw std::runtime_error(
+                    "metal storage executor: BulkExtentWrite missing source/dest");
+            }
+            const std::uint64_t offset =
+                instr.dest.offset + instr.dest.stride.base_offset;
+            if (offset > b.weights_region.size ||
+                instr.source.span_bytes > b.weights_region.size - offset) {
+                throw std::runtime_error(
+                    "metal storage executor: bulk destination is out of bounds");
+            }
+            view.copy_storage_bytes(
+                instr.source.file_id,
+                instr.source.file_offset + instr.source.stride.base_offset,
+                instr.source.span_bytes,
+                static_cast<std::uint8_t*>(b.weights_region.contents()) + offset,
+                program.max_tile_bytes());
+            break;
+        }
+        case K::SlabScatter:
+            for (std::size_t i = 0; i < instr.slab_placements.len; ++i) {
+                const auto& placement = instr.slab_placements.ptr[i];
+                if (placement.dest_offset > b.weights_region.size ||
+                    placement.bytes >
+                        b.weights_region.size - placement.dest_offset) {
+                    throw std::runtime_error(
+                        "metal storage executor: slab destination is out of bounds");
+                }
+                view.copy_storage_bytes(
+                    instr.slab_file_id,
+                    instr.slab_file_offset + placement.src_offset,
+                    placement.bytes,
+                    static_cast<std::uint8_t*>(b.weights_region.contents()) +
+                        placement.dest_offset,
+                    program.max_tile_bytes());
+            }
+            break;
+        case K::CreateView: {
+            if (instr.input_buffers.len != 1 ||
+                instr.output_buffers.len != 1 ||
+                !instr.has_dest) {
+                throw std::runtime_error(
+                    "metal storage executor: malformed CreateView");
+            }
+            const auto input = buffers.find(instr.input_buffers.ptr[0]);
+            if (input == buffers.end()) {
+                throw std::runtime_error(
+                    "metal storage executor: view input buffer is missing");
+            }
+            buffers[instr.output_buffers.ptr[0]] = slice_slot(
+                input->second,
+                instr.dest.offset + instr.dest.stride.base_offset,
+                extent_bytes(instr.dest.stride));
+            break;
+        }
+        case K::Finalize: {
+            const auto buffer = buffers.find(instr.buffer_id);
+            if (buffer == buffers.end()) {
+                throw std::runtime_error(
+                    "metal storage executor: finalized buffer is missing");
+            }
+            const std::string name =
+                pie_weight_loader::cpp::bytes_to_string(instr.name);
+            if (!b.weights.emplace(name, buffer->second).second) {
+                throw std::runtime_error(
+                    "metal storage executor: duplicate runtime tensor " + name);
+            }
+            break;
+        }
+        case K::Attach:
+            break;
+        case K::Release:
+            buffers.erase(instr.buffer_id);
+            break;
+        case K::TileMap:
+            throw std::runtime_error(
+                "metal storage executor: compiler emitted an unsupported load-time transform");
+        }
     }
 
     // ── KV region: k/v pages per full-attn layer (append-only, I4) ──
@@ -129,6 +305,134 @@ BoundDecode stage_decode_weights(RawMetalContext& ctx, const SafetensorsView& vi
         p->n_eos = 0;  // executor/resident loop rewrites vocab+eos per generation
     }
     return b;
+}
+
+std::string layer_prefix(int layer) {
+    return "layers." + std::to_string(layer) + ".";
+}
+
+namespace {
+
+void push_quant(std::vector<WeightBind>& out, const std::string& base) {
+    out.push_back({0, base + ".weight"});
+    out.push_back({1, base + ".scales"});
+    out.push_back({2, base + ".biases"});
+}
+
+}  // namespace
+
+std::vector<WeightBind> weight_binds(
+    Kernel kind,
+    int layer,
+    const DecodeGeometry& g,
+    bool gdn_prep) {
+    (void)g;
+    std::vector<WeightBind> weights;
+    const std::string prefix = layer >= 0 ? layer_prefix(layer) : std::string();
+    switch (kind) {
+    case Kernel::EmbedGather:
+    case Kernel::QmvLmHead:
+        push_quant(weights, "shared_embedding");
+        break;
+    case Kernel::FinalRms:
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::Rms::W),
+            "final_norm.weight",
+        });
+        break;
+    case Kernel::Rms:
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::Rms::W),
+            prefix + "input_layernorm.weight",
+        });
+        break;
+    case Kernel::FfnRms:
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::Rms::W),
+            prefix + "post_attention_layernorm.weight",
+        });
+        break;
+    case Kernel::QNorm:
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::Rms::W),
+            prefix + "self_attn.q_norm.weight",
+        });
+        break;
+    case Kernel::KNorm:
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::Rms::W),
+            prefix + "self_attn.k_norm.weight",
+        });
+        break;
+    case Kernel::QmvQ: push_quant(weights, prefix + "self_attn.q_proj"); break;
+    case Kernel::QmvK: push_quant(weights, prefix + "self_attn.k_proj"); break;
+    case Kernel::QmvV: push_quant(weights, prefix + "self_attn.v_proj"); break;
+    case Kernel::QmvO: push_quant(weights, prefix + "self_attn.o_proj"); break;
+    case Kernel::QmvIn: push_quant(weights, prefix + "linear_attn.in_proj_qkv"); break;
+    case Kernel::QmvInZ: push_quant(weights, prefix + "linear_attn.in_proj_z"); break;
+    case Kernel::QmvOut: push_quant(weights, prefix + "linear_attn.out_proj"); break;
+    case Kernel::GdnInA:
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::Dense::W),
+            prefix + "linear_attn.in_proj_a.weight",
+        });
+        break;
+    case Kernel::GdnInB:
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::Dense::W),
+            prefix + "linear_attn.in_proj_b.weight",
+        });
+        break;
+    case Kernel::GdnPrep:
+    case Kernel::GdnPrepSlotted:
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::GdnPrep::ConvW),
+            prefix + "linear_attn.conv1d.weight",
+        });
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::GdnPrep::ALog),
+            prefix + "linear_attn.A_log",
+        });
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::GdnPrep::DtBias),
+            prefix + "linear_attn.dt_bias",
+        });
+        break;
+    case Kernel::GdnCore:
+    case Kernel::GdnCoreSlotted:
+        if (gdn_prep || kind == Kernel::GdnCoreSlotted) {
+            weights.push_back({
+                static_cast<std::uint8_t>(bind::GdnCoreRecurrent::ConvW),
+                prefix + "linear_attn.conv1d.weight",
+            });
+        } else {
+            weights.push_back({
+                static_cast<std::uint8_t>(bind::GdnCore::ConvW),
+                prefix + "linear_attn.conv1d.weight",
+            });
+            weights.push_back({
+                static_cast<std::uint8_t>(bind::GdnCore::ALog),
+                prefix + "linear_attn.A_log",
+            });
+            weights.push_back({
+                static_cast<std::uint8_t>(bind::GdnCore::DtBias),
+                prefix + "linear_attn.dt_bias",
+            });
+        }
+        break;
+    case Kernel::GatedRms:
+        weights.push_back({
+            static_cast<std::uint8_t>(bind::GatedRms::W),
+            prefix + "linear_attn.norm.weight",
+        });
+        break;
+    case Kernel::QmvGate: push_quant(weights, prefix + "mlp.gate_proj"); break;
+    case Kernel::QmvUp: push_quant(weights, prefix + "mlp.up_proj"); break;
+    case Kernel::QmvDown: push_quant(weights, prefix + "mlp.down_proj"); break;
+    default:
+        break;
+    }
+    return weights;
 }
 
 namespace {

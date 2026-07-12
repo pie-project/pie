@@ -247,129 +247,105 @@ pub fn write_metal_startup_toml(
     write_toml_table(out_path, doc)
 }
 
-/// Compile the checkpoint's StorageProgram in-process (weight-loader Variant A)
-/// and write it beside the startup TOML, returning the file path to record in
-/// `[model].storage_program_path`. The embedded cuda driver deserializes that
-/// file instead of running its own C++ checkpoint parse + compile (the
-/// *locality switch* = path-present). The **bulk weight bytes never cross**:
-/// the serialized program records only where each tensor lives; the driver
-/// reads the payloads from its own copy of the checkpoint at execution.
-///
-/// Returns `None` (and logs) when the in-process compile can't produce a
-/// provably-correct program for this checkpoint — e.g. the config can't be
-/// parsed, or the request needs a device capability the runtime can't query
-/// before load (`runtime_quant="fp8"` → `fp8_native`; `mxfp4_moe="native"` →
-/// Blackwell). The embedded driver then transparently falls back to its own
-/// C++ compile, which runs after the device query. See plan.md
-/// "device-cap-derived gaps".
-#[cfg(feature = "driver-cuda")]
-fn compile_cuda_storage_program(
-    out_path: &Path,
+fn compile_storage_program(
     snapshot_dir: &Path,
-    opts: &CudaNativeDriverOptions,
+    facts: &pie_driver_abi::DeviceFacts,
+    runtime_quant: &str,
+    mxfp4_moe: &str,
     tp: Option<&TpLaunch>,
-) -> Option<PathBuf> {
+) -> Result<Vec<u8>> {
     use pie_weight_loader::inproc::{compile_snapshot_to_bytes, parse_model_config};
     use pie_weight_loader::storage::StorageTarget;
     use pie_weight_loader::types::{BackendKind, Mxfp4MoePolicy};
 
-    // Static CUDA storage-target constants (mirror driver/cuda/src/model/
-    // loaded_model.cpp `kStorageMaxTileBytes` / `kStoragePreferredAlignment`).
-    const CUDA_MAX_TILE_BYTES: u64 = 64 * 1024 * 1024;
-    const CUDA_PREFERRED_ALIGNMENT: u32 = 256;
-
-    // `runtime_quant="fp8"` is cleared by the driver on GPUs without native FP8
-    // (`fp8_native`), a capability the runtime can't query before load; defer to
-    // the C++ compile so we never emit a program the device would reject.
-    if opts.runtime_quant == "fp8" {
-        tracing::info!(
-            "weight-loader: runtime_quant='fp8' is device-conditional (fp8_native); \
-             deferring storage compile to the embedded cuda driver"
-        );
-        return None;
+    if facts.abi_version != pie_driver_abi::PIE_DRIVER_ABI_VERSION {
+        return Err(anyhow!(
+            "driver device facts ABI {} does not match runtime ABI {}",
+            facts.abi_version,
+            pie_driver_abi::PIE_DRIVER_ABI_VERSION
+        ));
     }
-
-    let model = match parse_model_config(snapshot_dir, opts.runtime_quant.clone()) {
-        Ok(model) => model,
-        Err(err) => {
-            tracing::warn!(
-                "weight-loader: in-process storage compile skipped ({err}); the \
-                 embedded cuda driver will compile the checkpoint itself"
-            );
-            return None;
+    let backend = match facts.backend.as_str() {
+        "cuda" => BackendKind::Cuda,
+        "metal" => BackendKind::Metal,
+        "dummy" => BackendKind::Unknown,
+        other => {
+            return Err(anyhow!(
+                "unsupported storage backend in device facts: {other}"
+            ));
         }
     };
-
-    // Resolve the MXFP4 MoE policy the way the C++ driver does
-    // (select_mxfp4_moe_lowering) for a non-Blackwell target. `native_mxfp4_moe`
-    // is GPU-derived (sm_100+) and can't be device-queried before load, so it
-    // defaults to false; it only affects the compiled program when the model
-    // requests `mxfp4_moe="native"` (handled below) — routed/eager are
-    // device-independent.
-    let native_mxfp4_moe = false;
-    let mxfp4_moe = match opts.mxfp4_moe.as_str() {
-        "" | "auto" | "routed_dequant" | "packed" => Mxfp4MoePolicy::RoutedDecode,
+    let effective_runtime_quant = if runtime_quant == "fp8" && !facts.fp8_native {
+        tracing::info!(
+            "weight-loader: runtime_quant='fp8' disabled because device facts report \
+             fp8_native=false"
+        );
+        ""
+    } else {
+        runtime_quant
+    };
+    let model = parse_model_config(snapshot_dir, effective_runtime_quant)
+        .map_err(|err| anyhow!("weight-loader model config parse failed: {err}"))?;
+    let mxfp4_moe = match mxfp4_moe {
+        "" | "auto" => {
+            if facts.native_mxfp4_moe {
+                Mxfp4MoePolicy::NativeGemm
+            } else {
+                Mxfp4MoePolicy::RoutedDecode
+            }
+        }
+        "routed_dequant" | "packed" => Mxfp4MoePolicy::RoutedDecode,
         "bf16" | "dequant" | "eager_bf16" => Mxfp4MoePolicy::EagerBf16,
         "native" => {
-            tracing::info!(
-                "weight-loader: mxfp4_moe='native' needs a Blackwell device query \
-                 unavailable pre-load; deferring storage compile to the C++ path"
-            );
-            return None;
+            if !facts.native_mxfp4_moe {
+                return Err(anyhow!(
+                    "mxfp4_moe='native' requested, but device facts report \
+                     native_mxfp4_moe=false"
+                ));
+            }
+            Mxfp4MoePolicy::NativeGemm
         }
-        other => {
-            tracing::warn!(
-                "weight-loader: unknown mxfp4_moe='{other}'; deferring storage \
-                 compile to the embedded cuda driver"
-            );
-            return None;
-        }
+        other => return Err(anyhow!("unknown mxfp4_moe policy '{other}'")),
     };
 
     let (tp_rank, tp_size) = tp.map(|t| (t.rank as u32, t.size as u32)).unwrap_or((0, 1));
     let target = StorageTarget {
-        backend: BackendKind::Cuda,
+        backend,
         tp_rank,
         tp_size,
-        max_tile_bytes: CUDA_MAX_TILE_BYTES,
-        preferred_alignment: CUDA_PREFERRED_ALIGNMENT,
+        max_tile_bytes: facts.storage_max_tile_bytes,
+        preferred_alignment: facts.storage_alignment.max(1),
         mxfp4_moe,
-        native_mxfp4_moe,
+        native_mxfp4_moe: facts.native_mxfp4_moe,
     };
 
-    let bytes = match compile_snapshot_to_bytes(snapshot_dir, &model, target) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::warn!(
-                "weight-loader: in-process storage compile failed ({err}); the \
-                 embedded cuda driver will compile the checkpoint itself"
-            );
-            return None;
-        }
-    };
-
-    // Write beside the (already per-rank) startup TOML so concurrent TP ranks
-    // don't collide.
-    let bin_path = out_path.with_extension("storage_program.bin");
-    if let Err(err) = std::fs::write(&bin_path, &bytes) {
-        tracing::warn!(
-            "weight-loader: failed to write storage program {bin_path:?} ({err}); \
-             the embedded cuda driver will compile the checkpoint itself"
-        );
-        return None;
-    }
+    let bytes = compile_snapshot_to_bytes(snapshot_dir, &model, target)
+        .map_err(|err| anyhow!("weight-loader storage compile failed: {err}"))?;
     tracing::info!(
-        "weight-loader: compiled StorageProgram in-process → {} ({} bytes); the \
-         embedded cuda driver will deserialize it (bulk weights never cross)",
-        bin_path.display(),
+        "weight-loader: compiled StorageProgram in-process ({} bytes); the driver \
+         will execute it from the boot call (bulk weights never cross)",
         bytes.len()
     );
-    Some(bin_path)
+    Ok(bytes)
+}
+
+fn model_load_desc(
+    snapshot_dir: &Path,
+    facts: &pie_driver_abi::DeviceFacts,
+    runtime_quant: &str,
+    mxfp4_moe: &str,
+    tp: Option<&TpLaunch>,
+) -> Result<pie_driver_abi::ModelLoadDesc> {
+    Ok(pie_driver_abi::ModelLoadDesc {
+        program_bytes: compile_storage_program(snapshot_dir, facts, runtime_quant, mxfp4_moe, tp)?,
+        snapshot_dir: snapshot_dir.to_path_buf(),
+        compiler_version: pie_weight_loader::storage::compiler_version(),
+    })
 }
 
 /// Write the cuda driver's startup TOML. Schema mirrors
 /// `driver/cuda/src/config.hpp`: `[model]` with
-/// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional load policy knobs,
+/// `snapshot_dir`/`device`/`dtype` plus model-execution knobs,
 /// `[batching]` with KV-page geometry plus `swap_pool_size`, and `[runtime]`
 /// with the server verbosity flag.
 ///
@@ -388,31 +364,12 @@ pub(crate) fn write_cuda_startup_toml(
     insert_str(&mut model, "snapshot_dir", path_string(snapshot_dir));
     insert_str(&mut model, "device", &opts.device);
     insert_str(&mut model, "dtype", opts.weight_dtype.clone());
-    if !opts.runtime_quant.is_empty() {
-        insert_str(&mut model, "runtime_quant", opts.runtime_quant.clone());
-    }
-    if !opts.mxfp4_moe.is_empty() && opts.mxfp4_moe != "auto" {
-        insert_str(&mut model, "mxfp4_moe", opts.mxfp4_moe.clone());
-    }
-    if !opts.mtp_assistant_snapshot_dir.is_empty() {
-        insert_str(
-            &mut model,
-            "mtp_assistant_snapshot_dir",
-            opts.mtp_assistant_snapshot_dir.clone(),
-        );
-    }
     insert_int(&mut model, "mtp_num_drafts", opts.mtp_num_drafts);
     insert_bool(
         &mut model,
         "enable_system_speculation",
         opts.enable_system_speculation,
     );
-    // Weight-loader Variant A: compile the StorageProgram in-process and hand it
-    // to the embedded cuda driver as a file path (bulk weights never cross).
-    #[cfg(feature = "driver-cuda")]
-    if let Some(bin_path) = compile_cuda_storage_program(out_path, snapshot_dir, opts, tp) {
-        insert_str(&mut model, "storage_program_path", path_string(&bin_path));
-    }
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -561,13 +518,44 @@ pub(crate) fn create_driver_backend_group(
                 "cuda group creation requires cuda-native rank options"
             ));
         };
+        if !opts.mtp_assistant_snapshot_dir.is_empty() {
+            return Err(anyhow!(
+                "mtp_assistant_snapshot_dir is not supported by the single-model \
+                 StorageProgram boot contract"
+            ));
+        }
         let state_dir = local_driver_state_dir(group_id, Some(tp))?;
         let toml_path = state_dir.join("driver.toml");
         write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, Some(tp))?;
         config_blobs.push(toml_path.to_string_lossy().into_owned().into_bytes());
     }
 
-    let (backend, caps) = pie_engine::driver::DriverBackend::cuda_group_create(config_blobs)?;
+    let (mut backend, facts) = pie_engine::driver::DriverBackend::cuda_group_create(config_blobs)?;
+    if facts.len() != rank_options.len() {
+        return Err(anyhow!(
+            "cuda group returned {} device-facts payloads for {} ranks",
+            facts.len(),
+            rank_options.len()
+        ));
+    }
+    let descs = rank_options
+        .iter()
+        .zip(tp_launches)
+        .zip(&facts)
+        .map(|((options, tp), facts)| {
+            let DriverOptions::CudaNative(opts) = options else {
+                unreachable!("validated cuda options above");
+            };
+            model_load_desc(
+                snapshot_dir,
+                facts,
+                &opts.runtime_quant,
+                &opts.mxfp4_moe,
+                Some(tp),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let caps = backend.load_model(descs)?;
     Ok(crate::translate::GroupDriver { caps, backend })
 }
 
@@ -580,14 +568,27 @@ pub(crate) fn create_driver_backend(
     let _ = (group_id, tp);
     validate_snapshot_dir(snapshot_dir)?;
 
-    let (backend, caps) = match options {
+    let (mut backend, facts, runtime_quant, mxfp4_moe) = match options {
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => {
+            if !opts.mtp_assistant_snapshot_dir.is_empty() {
+                return Err(anyhow!(
+                    "mtp_assistant_snapshot_dir is not supported by the single-model \
+                     StorageProgram boot contract"
+                ));
+            }
             let state_dir = local_driver_state_dir(group_id, tp)?;
             let toml_path = state_dir.join("driver.toml");
             write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, tp)?;
             let config_path = toml_path.to_string_lossy();
-            pie_engine::driver::DriverBackend::cuda_create(config_path.as_bytes())?
+            let (backend, facts) =
+                pie_engine::driver::DriverBackend::cuda_create(config_path.as_bytes())?;
+            (
+                backend,
+                facts,
+                opts.runtime_quant.as_str(),
+                opts.mxfp4_moe.as_str(),
+            )
         }
         #[cfg(feature = "driver-metal")]
         DriverOptions::Metal(opts) => {
@@ -595,7 +596,9 @@ pub(crate) fn create_driver_backend(
             let toml_path = state_dir.join("driver.toml");
             write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id)?;
             let config_path = toml_path.to_string_lossy();
-            pie_engine::driver::DriverBackend::metal_create(config_path.as_bytes())?
+            let (backend, facts) =
+                pie_engine::driver::DriverBackend::metal_create(config_path.as_bytes())?;
+            (backend, facts, "", "auto")
         }
         DriverOptions::Dummy {
             opts,
@@ -603,9 +606,12 @@ pub(crate) fn create_driver_backend(
             activation_dtype,
         } => {
             let options = dummy_native_options(opts, snapshot_dir, *random_seed, activation_dtype)?;
-            pie_engine::driver::DriverBackend::dummy(options)?
+            let (backend, facts) = pie_engine::driver::DriverBackend::dummy(options)?;
+            (backend, facts, "", "auto")
         }
     };
+    let desc = model_load_desc(snapshot_dir, &facts, runtime_quant, mxfp4_moe, tp)?;
+    let caps = backend.load_model(vec![desc])?;
 
     Ok(crate::translate::GroupDriver { caps, backend })
 }
@@ -617,7 +623,7 @@ mod tests {
     #[test]
     fn caps_json_round_trips() {
         let json = r#"{
-            "abi_version": 1,
+            "abi_version": 4,
             "total_pages": 1024,
             "kv_page_size": 32,
             "swap_pool_size": 0,
@@ -631,12 +637,55 @@ mod tests {
             "snapshot_dir": "/tmp/snap"
         }"#;
         let caps = parse_caps_json(json).unwrap();
-        assert_eq!(caps.abi_version, 1);
+        assert_eq!(caps.abi_version, pie_driver_abi::PIE_DRIVER_ABI_VERSION);
         assert_eq!(caps.total_pages, 1024);
         assert_eq!(caps.arch_name, "qwen3");
         assert_eq!(caps.snapshot_dir, "/tmp/snap");
         assert_eq!(caps.max_forward_tokens, 4096);
         assert_eq!(caps.max_page_refs, 262144);
+    }
+
+    #[test]
+    fn dummy_boot_uses_create_compile_load_sequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join("snapshot");
+        std::fs::create_dir(&snapshot).unwrap();
+        std::fs::write(
+            snapshot.join("config.json"),
+            r#"{
+                "model_type": "qwen3",
+                "architectures": ["Qwen3ForCausalLM"],
+                "num_hidden_layers": 1,
+                "vocab_size": 32,
+                "max_position_embeddings": 128
+            }"#,
+        )
+        .unwrap();
+        let header =
+            r#"{"model.embed_tokens.weight":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#;
+        let mut checkpoint = (header.len() as u64).to_le_bytes().to_vec();
+        checkpoint.extend_from_slice(header.as_bytes());
+        checkpoint.extend_from_slice(&[1, 2, 3, 4]);
+        std::fs::write(snapshot.join("model.safetensors"), checkpoint).unwrap();
+
+        let group = create_driver_backend(
+            &DriverOptions::Dummy {
+                opts: DummyDriverOptions {
+                    vocab_size: None,
+                    arch_name: None,
+                    ready_timeout_s: 5.0,
+                },
+                random_seed: 7,
+                activation_dtype: "f32".to_string(),
+            },
+            &snapshot,
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(group.caps.arch_name, "qwen3");
+        assert_eq!(group.caps.vocab_size, 32);
+        assert_eq!(group.caps.snapshot_dir, snapshot.display().to_string());
     }
 
     #[cfg(feature = "driver-cuda")]
@@ -716,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_startup_toml_emits_runtime_quant_when_set() {
+    fn cuda_startup_toml_keeps_runtime_quant_out_of_driver_config() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
         let snap = tmp.path().join("snap");
@@ -728,12 +777,12 @@ mod tests {
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(val["model"]["runtime_quant"].as_str().unwrap(), "fp8");
+        assert!(val["model"].get("runtime_quant").is_none());
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:1");
     }
 
     #[test]
-    fn cuda_startup_toml_emits_mxfp4_policy_when_non_default() {
+    fn cuda_startup_toml_keeps_mxfp4_policy_out_of_driver_config() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
         let snap = tmp.path().join("snap");
@@ -745,7 +794,7 @@ mod tests {
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(val["model"]["mxfp4_moe"].as_str().unwrap(), "bf16");
+        assert!(val["model"].get("mxfp4_moe").is_none());
     }
 
     #[test]

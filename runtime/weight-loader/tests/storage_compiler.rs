@@ -1,3 +1,5 @@
+use pie_weight_loader::abi::RuntimeAbi;
+use pie_weight_loader::config::ModelConfig;
 use pie_weight_loader::ir::{LayoutExpr, LayoutPlan};
 use pie_weight_loader::source::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_weight_loader::storage::{StorageInstr, StorageTarget, TileMapKind};
@@ -6,6 +8,120 @@ use pie_weight_loader::types::{
     Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, Layout, Mxfp4MoePolicy,
     QuantScheme, QuantSpec, RepackLayout, RowMap, Sharding, TensorDecl, TensorId,
 };
+
+#[test]
+fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
+    let specs = [
+        ("lm_head.weight", vec![2, 8], DType::U32),
+        ("lm_head.scales", vec![2, 1], DType::BF16),
+        ("lm_head.biases", vec![2, 1], DType::BF16),
+        ("model.language_model.norm.weight", vec![64], DType::BF16),
+        (
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            vec![64, 8],
+            DType::U32,
+        ),
+        (
+            "model.language_model.layers.0.self_attn.q_proj.scales",
+            vec![64, 1],
+            DType::BF16,
+        ),
+        (
+            "model.language_model.layers.0.self_attn.q_proj.biases",
+            vec![64, 1],
+            DType::BF16,
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+            vec![16, 64],
+            DType::BF16,
+        ),
+        ("model.visual.patch.weight", vec![1], DType::BF16),
+        ("mtp.fc.weight", vec![1], DType::BF16),
+    ];
+    let mut offset = 0u64;
+    let tensors = specs
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, shape, dtype))| {
+            let span_bytes = shape.iter().product::<i64>() as u64 * dtype.bytes();
+            let tensor = RawTensor {
+                id: TensorId(index as u32),
+                name: name.to_string(),
+                file_id: FileId(0),
+                file_offset: offset,
+                span_bytes,
+                shape,
+                encoding: Encoding::Raw(dtype),
+                layout: Layout::dense(1),
+            };
+            offset += span_bytes;
+            tensor
+        })
+        .collect();
+    let metadata = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    };
+    let config = ModelConfig {
+        model_type: "qwen3_5".to_string(),
+        num_hidden_layers: 1,
+        ..ModelConfig::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Metal,
+        max_tile_bytes: 64 << 20,
+        preferred_alignment: 256,
+        ..StorageTarget::default()
+    };
+    let abi = RuntimeAbi::default_for_target(&metadata, &config, &target).unwrap();
+    let names = abi
+        .tensors
+        .iter()
+        .map(|tensor| tensor.output_name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"shared_embedding.weight"));
+    assert!(names.contains(&"final_norm.weight"));
+    assert!(names.contains(&"layers.0.self_attn.q_proj.weight"));
+    assert!(names.contains(&"layers.0.linear_attn.in_proj_a.weight"));
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.contains("visual") || name.contains("mtp"))
+    );
+    let shared = abi
+        .tensors
+        .iter()
+        .find(|tensor| tensor.output_name == "shared_embedding.weight")
+        .unwrap();
+    let Encoding::Quant(spec) = &shared.encoding else {
+        panic!("shared embedding should carry MLX affine-U4 encoding");
+    };
+    assert_eq!(spec.scheme, QuantScheme::MlxAffineU4);
+    assert_eq!(spec.group_size, 64);
+    assert_eq!(shared.shape, vec![2, 64]);
+
+    let program = compile_storage_program(&metadata, &config, &abi, target).unwrap();
+    assert!(
+        !program
+            .instrs
+            .iter()
+            .any(|instr| matches!(instr, StorageInstr::TileMap { .. }))
+    );
+    assert!(
+        program
+            .buffers
+            .iter()
+            .filter_map(|buffer| buffer.persistent_offset)
+            .all(|offset| offset % 256 == 0)
+    );
+    assert_eq!(program.sources.len(), metadata.tensors.len());
+}
 
 #[test]
 fn buffer_join_tile_maps_carry_destination_offsets() {
@@ -508,6 +624,7 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         backend: BackendKind::Cuda,
         tp_rank: 1,
         tp_size: 2,
+        preferred_alignment: 256,
         ..StorageTarget::default()
     };
     let metadata = nemotron_h_expert_metadata();
@@ -573,10 +690,9 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
     );
 
     // Each expert pack is one persistent backing buffer (2 experts × 12 B =
-    // 24 B). Backing bases are aligned to PERSISTENT_OPERAND_ALIGNMENT (256)
-    // so cuBLAS(Lt) selects its fast `align8` tensor kernels rather than the
-    // slow `align1` fallback. Packing tightness is *internal* to each
-    // backing and unaffected by the base alignment.
+    // 24 B). The CUDA target reports a 256-byte operand alignment, so
+    // cuBLAS(Lt) can select its fast `align8` kernels. Packing tightness is
+    // internal to each backing and unaffected by the base alignment.
     let backings = program
         .buffers
         .iter()

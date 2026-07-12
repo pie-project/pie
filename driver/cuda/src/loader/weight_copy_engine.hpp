@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-#include "loader/safetensors.hpp"
+#include "loader/checkpoint_source.hpp"
 #include "loader/tensor_spec.hpp"
 #include "loader/loader_config.hpp"
 #include "loader/loader_helpers.hpp"
@@ -33,7 +33,7 @@ namespace pie_cuda_driver {
 
 class WeightCopyEngine {
 public:
-    explicit WeightCopyEngine(SafetensorsCheckpointSource& loader)
+    explicit WeightCopyEngine(CheckpointSource& loader)
         : loader_(loader) {}
 
     ~WeightCopyEngine() { destroy_noexcept(); }
@@ -436,7 +436,7 @@ private:
 #endif
     }
 
-    SafetensorsCheckpointSource& loader_;
+    CheckpointSource& loader_;
     LoadExecutionStats* stats_ = nullptr;
     double transfer_ms_sink_ = 0.0;
     std::size_t pending_copy_count_ = 0;

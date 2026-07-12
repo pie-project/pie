@@ -47,9 +47,7 @@ use crate::pipeline::instance::ForwardPass;
 use crate::store::kv::working_set::{KvFireLease, KvWorkingSet};
 use crate::store::rs::working_set::RsWorkingSet;
 use lease::DevGeo;
-use pie_ptir::container::{HostRole, PortSource, TraceContainer};
-use pie_ptir::op::Op;
-use pie_ptir::registry::Port;
+use pie_ptir::container::HostRole;
 
 /// A pass's in-flight fires, submit order. Plain mutex: never held across an
 /// await (the op is popped out, then awaited).
@@ -80,6 +78,12 @@ impl PendingOp {
         match self {
             PendingOp::Fire(fire) => OpSignal::Fire(fire.completion.clone()),
             PendingOp::Move(mv) => OpSignal::Move(mv.completion.clone()),
+        }
+    }
+
+    fn request_cancel(&self) {
+        if let PendingOp::Fire(fire) = self {
+            fire.completion.request_cancel();
         }
     }
 }
@@ -175,49 +179,52 @@ fn poison_readers(cells: &BoundCells, reason: &str) {
     }
 }
 
-fn channel_accesses(container: &TraceContainer) -> Vec<(bool, bool)> {
-    let mut accesses = vec![(false, false); container.channels.len()];
-    for stage in &container.stages {
-        for op in &stage.ops {
-            match *op {
-                Op::ChanTake(channel) => accesses[channel as usize].0 = true,
-                Op::ChanPut { chan, .. } => accesses[chan as usize].1 = true,
-                _ => {}
+struct TicketReservation {
+    cells: BoundCells,
+    heads: Vec<u64>,
+    tails: Vec<u64>,
+    committed: bool,
+}
+
+impl TicketReservation {
+    fn new(cells: &BoundCells, accesses: &[(bool, bool)]) -> Self {
+        let (heads, tails) = cells
+            .iter()
+            .zip(accesses)
+            .map(|(cell, &(consume, publish))| {
+                cell.lock().unwrap().reserve_device_ticket(consume, publish)
+            })
+            .unzip();
+        Self {
+            cells: cells.clone(),
+            heads,
+            tails,
+            committed: false,
+        }
+    }
+
+    fn apply_to(&self, request: &mut crate::driver::LaunchPlan) {
+        request.channel_expected_head.clone_from(&self.heads);
+        request.channel_expected_tail.clone_from(&self.tails);
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TicketReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for ((cell, &head), &tail) in self.cells.iter().zip(&self.heads).zip(&self.tails).rev() {
+            if !cell.lock().unwrap().rollback_device_ticket(head, tail) {
+                tracing::error!(
+                    "channel ticket rollback lost LIFO ownership; preserving newer reservations"
+                );
             }
         }
-    }
-    for binding in &container.ports {
-        let PortSource::Channel(channel) = &binding.source else {
-            continue;
-        };
-        if matches!(
-            binding.port,
-            Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff
-        ) {
-            accesses[*channel as usize].0 = true;
-        }
-    }
-    accesses
-}
-
-fn reserve_channel_tickets(cells: &BoundCells, accesses: &[(bool, bool)]) -> (Vec<u64>, Vec<u64>) {
-    cells
-        .iter()
-        .zip(accesses)
-        .map(|(cell, &(consume, publish))| {
-            cell.lock().unwrap().reserve_device_ticket(consume, publish)
-        })
-        .unzip()
-}
-
-fn rollback_channel_tickets(
-    cells: &BoundCells,
-    accesses: &[(bool, bool)],
-    heads: &[u64],
-    tails: &[u64],
-) {
-    for (((cell, _), &head), &tail) in cells.iter().zip(accesses).zip(heads).zip(tails).rev() {
-        cell.lock().unwrap().rollback_device_ticket(head, tail);
     }
 }
 
@@ -319,7 +326,7 @@ pub async fn submit_pass<C: FireContext>(
                 &p.instance.seeds,
                 p.fired_once,
             );
-            let accesses = channel_accesses(&p.instance.program.bound.container);
+            let accesses = p.instance.program.channel_accesses.clone();
             (
                 geometry,
                 p.cells.clone(),
@@ -343,9 +350,6 @@ pub async fn submit_pass<C: FireContext>(
         // multi-program batch does not merge dense device masks — v1
         // scope).
         req.has_user_mask = dense_mask;
-        let (ticket_heads, ticket_tails) = reserve_channel_tickets(&cells, &accesses);
-        req.channel_expected_head = ticket_heads.clone();
-        req.channel_expected_tail = ticket_tails.clone();
         // Prepare the guest-owned KV working set for this fire via
         // `pipeline::fire::kv` over the typed KvStore (reserve growth +
         // fresh / in-place / CoW classification + geometry projection).
@@ -353,15 +357,6 @@ pub async fn submit_pass<C: FireContext>(
         // finalized (commit → mapping publishes / abort → pending slots
         // release) when a take/read/drop drains it.
         let new_tokens: Vec<u32> = req.token_ids.clone();
-        // Canonical gate, fire-time half: hash under the host-verified
-        // token values only when they cover exactly this fire's embed
-        // AND the pass attends the FULL context. Anything else (device-
-        // carried decode tokens, partial/unknown kv-len) hashes opaque.
-        let hash_tokens: Option<Vec<u32>> = canonical_evidence.and_then(|(toks, kv_len)| {
-            (toks.len() == new_tokens.len()
-                && kv_len == Some(committed_tokens + new_tokens.len() as u32))
-            .then_some(toks)
-        });
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.driver as usize);
@@ -376,22 +371,101 @@ pub async fn submit_pass<C: FireContext>(
             Err(error) => return Ok(Err(format!("pipeline: KV working set: {error}"))),
         };
 
-        // A pass's optimistic cursor covers its own pending fires. Another
-        // pass on the same pipeline may also have prepared into this working
-        // set, so floor it by the pipeline-scoped committed+pending view.
-        // Other pipelines and the prefix CAS continue to see committed state.
-        //
-        // ANOTHER pass may have committed into the same working set
-        // before this pass's first fire (a prefill pass feeding a decode
-        // pass is the norm). Floor the cursor by the store's published
-        // extent so prepare appends after the real committed content
-        // instead of re-writing (CoW-forking) published slots. The
-        // cursor stays authoritative when it runs AHEAD (this pass's
-        // in-flight fires).
-        let committed_tokens = {
-            let kv = stores.kv.lock().unwrap();
-            committed_tokens.max(kv.visible_token_len(ws.id, ws.page_size).unwrap_or(0) as u32)
+        // The recurrent-state slot for hybrid / linear-attention models
+        // (GDN, Mamba2): fresh RESET slab on the first fire, CoW-continue
+        // after. This remains before token/ticket reservation so every error
+        // path is reservation-free.
+        let rstxn = if let Some(rs_rep) = rs_rep {
+            let rs_res: Resource<RsWorkingSet> = Resource::new_borrow(rs_rep);
+            let rs = ctx.resources().get(&rs_res)?.clone();
+            let prepared = {
+                let mut rs_store = stores.rs.lock().unwrap();
+                rs::prepare(&mut rs_store, rs.id)
+            };
+            match prepared {
+                Ok((rs_slot_ids, rs_slot_flags, (rs_copy_src, rs_copy_dst), txn)) => {
+                    req.rs_slot_ids = rs_slot_ids;
+                    req.rs_slot_flags = rs_slot_flags;
+                    if !rs_copy_src.is_empty() {
+                        match crate::scheduler::copy_d2d(0, &rs_copy_src, &rs_copy_dst) {
+                            Ok(move_completion) => {
+                                pipe_fires.lock().unwrap().push_back(PendingOp::Move(
+                                    PendingMove {
+                                        completion: move_completion,
+                                        failure: pipeline_failure.clone(),
+                                    },
+                                ));
+                            }
+                            Err(e) => {
+                                tracing::warn!("pipeline rs CoW d2d copy failed: {e:#}");
+                            }
+                        }
+                    }
+                    Some(txn)
+                }
+                Err(e) => {
+                    return Ok(Err(format!("pipeline: rs prepare: {e}")));
+                }
+            }
+        } else {
+            None
         };
+
+        // Mapping allocation is deferred, but extent order is not: publish the
+        // submitted token extent now so another pass sharing this WS cannot
+        // prepare over it before this fire reaches dispatch.
+        let committed_floor = match {
+            let kv = stores.kv.lock().unwrap();
+            kv.visible_token_len(ws.id, ws.page_size)
+        } {
+            Ok(floor) => floor,
+            Err(error) => {
+                if let Some(rstxn) = rstxn {
+                    let mut rs_store = stores.rs.lock().unwrap();
+                    let _ = rs::finalize(&mut rs_store, rstxn, false);
+                }
+                return Ok(Err(format!("pipeline: KV visible token extent: {error}")));
+            }
+        };
+        let extent_reservation = match ws.reserve_token_extent(
+            u64::from(committed_tokens),
+            committed_floor,
+            new_tokens.len() as u64,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                if let Some(rstxn) = rstxn {
+                    let mut rs_store = stores.rs.lock().unwrap();
+                    let _ = rs::finalize(&mut rs_store, rstxn, false);
+                }
+                return Ok(Err(format!("pipeline: KV working set: {error}")));
+            }
+        };
+        let committed_tokens = match u32::try_from(extent_reservation.start_token()) {
+            Ok(cursor) => cursor,
+            Err(_) => {
+                if let Some(rstxn) = rstxn {
+                    let mut rs_store = stores.rs.lock().unwrap();
+                    let _ = rs::finalize(&mut rs_store, rstxn, false);
+                }
+                return Ok(Err("pipeline: KV token cursor exceeds u32".to_string()));
+            }
+        };
+        let reserved_end = match committed_tokens.checked_add(new_tokens.len() as u32) {
+            Some(end) => end,
+            None => {
+                if let Some(rstxn) = rstxn {
+                    let mut rs_store = stores.rs.lock().unwrap();
+                    let _ = rs::finalize(&mut rs_store, rstxn, false);
+                }
+                return Ok(Err("pipeline: KV token cursor exceeds u32".to_string()));
+            }
+        };
+        // Canonical gate, fire-time half: hash under the host-verified token
+        // values only when they cover this fire's full-context append.
+        let hash_tokens: Option<Vec<u32>> = canonical_evidence.and_then(|(toks, kv_len)| {
+            (toks.len() == new_tokens.len() && kv_len == Some(reserved_end)).then_some(toks)
+        });
 
         // ── Prefix-cache graft (kv_refact.md, the matching consumer) ──
         // First canonical fire of a FRESH working set: probe the CAS for
@@ -458,50 +532,12 @@ pub async fn submit_pass<C: FireContext>(
             (committed, toks_new, toks_hash)
         };
 
-        let next_committed = committed_tokens + new_tokens.len() as u32;
+        debug_assert_eq!(
+            u64::from(committed_tokens) + new_tokens.len() as u64,
+            u64::from(reserved_end)
+        );
+        let next_committed = reserved_end;
         let kvtxn_slot = Arc::new(Mutex::new(None));
-
-        // The recurrent-state slot for hybrid / linear-attention models
-        // (GDN, Mamba2): fresh RESET slab on the first fire, CoW-continue
-        // after.
-        let rstxn = if let Some(rs_rep) = rs_rep {
-            let rs_res: Resource<RsWorkingSet> = Resource::new_borrow(rs_rep);
-            let rs = ctx.resources().get(&rs_res)?.clone();
-            let prepared = {
-                let mut rs_store = stores.rs.lock().unwrap();
-                rs::prepare(&mut rs_store, rs.id)
-            };
-            match prepared {
-                Ok((rs_slot_ids, rs_slot_flags, (rs_copy_src, rs_copy_dst), txn)) => {
-                    req.rs_slot_ids = rs_slot_ids;
-                    req.rs_slot_flags = rs_slot_flags;
-                    if !rs_copy_src.is_empty() {
-                        // The copy rides the pipeline FIFO (D4): an
-                        // asynchronous failure poisons the pipeline
-                        // failure domain instead of vanishing in a log.
-                        match crate::scheduler::copy_d2d(0, &rs_copy_src, &rs_copy_dst) {
-                            Ok(move_completion) => {
-                                pipe_fires.lock().unwrap().push_back(PendingOp::Move(
-                                    PendingMove {
-                                        completion: move_completion,
-                                        failure: pipeline_failure.clone(),
-                                    },
-                                ));
-                            }
-                            Err(e) => {
-                                tracing::warn!("pipeline rs CoW d2d copy failed: {e:#}");
-                            }
-                        }
-                    }
-                    Some(txn)
-                }
-                Err(e) => {
-                    return Ok(Err(format!("pipeline: rs prepare: {e}")));
-                }
-            }
-        } else {
-            None
-        };
 
         let model = ws.model;
         let driver = ws.driver as usize;
@@ -583,18 +619,33 @@ pub async fn submit_pass<C: FireContext>(
         });
 
         // Fire through the scheduler → dispatch-time KV preparation → driver.
+        let ticket_reservation = TicketReservation::new(&cells, &accesses);
+        ticket_reservation.apply_to(&mut req);
+        let retry_cells = cells.clone();
+        let retry_accesses = accesses.clone();
+        let retry_classifier: crate::scheduler::RetryClassifier = Box::new(move || {
+            retry_cells
+                .iter()
+                .zip(&retry_accesses)
+                .find_map(|(cell, &(consume, publish))| {
+                    cell.lock()
+                        .unwrap()
+                        .permanent_retry_cause(consume || publish)
+                })
+        });
         let submit_error = crate::scheduler::submit_async_deferred(
             req,
             0,
             instance_id,
             Some(pid),
+            Some(u64::from(ws_rep)),
             completion.clone(),
             preparation,
+            Some(retry_classifier),
         )
         .err()
         .map(|error| format!("{error:#}"));
         if let Some(error) = submit_error {
-            rollback_channel_tickets(&cells, &accesses, &ticket_heads, &ticket_tails);
             let reason = format!("pipeline: submit failed: {error}");
             if let Some(rstxn) = rstxn {
                 let mut rs_store = stores.rs.lock().unwrap();
@@ -603,6 +654,8 @@ pub async fn submit_pass<C: FireContext>(
             ctx.resources().get_mut(&fwd)?.failed = Some(reason.clone());
             return Ok(Err(reason));
         }
+        ticket_reservation.commit();
+        extent_reservation.commit();
 
         // Optimistic cursor advance: the NEXT submit prepares against this
         // fire's post-state (the run-ahead overlap). A failed fire fails
@@ -743,6 +796,9 @@ pub async fn pipeline_close<C: FireContext>(ctx: &mut C, this: Resource<Pipeline
     // pipeline goes away (the pin-safety drain follows the FIFO — W3.1).
     let fires = ctx.resources().get(&this).ok().map(|p| p.fires.clone());
     if let Some(fires) = fires {
+        for fire in fires.lock().unwrap().iter() {
+            fire.request_cancel();
+        }
         loop {
             let fire = fires.lock().unwrap().pop_front();
             match fire {
@@ -763,6 +819,9 @@ pub async fn pipeline_drop<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>
     // mid-flight (W3.1: the pin-safety drain lives here, not on the pass).
     let fires = ctx.resources().get(&this).ok().map(|p| p.fires.clone());
     if let Some(fires) = fires {
+        for fire in fires.lock().unwrap().iter() {
+            fire.request_cancel();
+        }
         loop {
             let fire = fires.lock().unwrap().pop_front();
             match fire {
@@ -1044,7 +1103,7 @@ async fn fire_device_geometry<C: FireContext>(
             })
         };
         let (pages, (copy_src, copy_dst), kv_translation, kvtxn) = loop {
-            let prepared = {
+            let prepared = (|| {
                 let mut kv_store = stores.kv.lock().unwrap();
                 // One prepared write covers the grants plus any unwritten
                 // gap up to the mapped end (left by an aborted earlier
@@ -1052,8 +1111,8 @@ async fn fire_device_geometry<C: FireContext>(
                 // is recomputed per attempt: a parked retry may resume
                 // after another of this pass's fires committed.
                 let mapped = kv_store
-                    .visible_flat_table(ws.id)
-                    .map_or(0, |table| table.len() as u64);
+                    .visible_mapped_len(ws.id)
+                    .map_err(kv::KvError::from)?;
                 let mut write_indexes: Vec<u64> = grant_slots.iter().map(|&s| s as u64).collect();
                 if let Some(max_fresh) =
                     write_indexes.iter().copied().filter(|&i| i >= mapped).max()
@@ -1063,7 +1122,7 @@ async fn fire_device_geometry<C: FireContext>(
                 write_indexes.sort_unstable();
                 write_indexes.dedup();
                 kv::prepare_explicit(&mut kv_store, ws.id, &write_indexes)
-            }; // kv lock dropped before any contention await below
+            })(); // kv lock dropped before any contention await below
             match prepared {
                 Ok(v) => break v,
                 Err(e @ kv::KvError::OutOfPages { requested, .. }) => {
@@ -1128,7 +1187,7 @@ async fn fire_device_geometry<C: FireContext>(
 
         let p = ctx.resources().get_mut(&fwd)?;
         let completion = p.bound_instance.reserve_completion();
-        let accesses = channel_accesses(&p.instance.program.bound.container);
+        let accesses = p.instance.program.channel_accesses.clone();
         (
             completion,
             p.bound_instance.instance_id,
@@ -1150,9 +1209,8 @@ async fn fire_device_geometry<C: FireContext>(
     // the scheduler batches it SOLO (the composed multi-program batch
     // does not merge dense device masks — v1 scope).
     req.has_user_mask = dense_mask;
-    let (ticket_heads, ticket_tails) = reserve_channel_tickets(&cells, &accesses);
-    req.channel_expected_head = ticket_heads.clone();
-    req.channel_expected_tail = ticket_tails.clone();
+    let ticket_reservation = TicketReservation::new(&cells, &accesses);
+    ticket_reservation.apply_to(&mut req);
     let last_page_len = wire_pages.last().map(|_| page_size).unwrap_or(0);
     let submit_error = crate::scheduler::submit_prebuilt_async_with_kv_copy(
         req,
@@ -1167,7 +1225,6 @@ async fn fire_device_geometry<C: FireContext>(
     .err()
     .map(|error| format!("{error:#}"));
     if let Some(error) = submit_error {
-        rollback_channel_tickets(&cells, &accesses, &ticket_heads, &ticket_tails);
         let reason = format!("pipeline: device-geometry submit failed: {error}");
         {
             let mut kv_store = stores.kv.lock().unwrap();
@@ -1176,6 +1233,7 @@ async fn fire_device_geometry<C: FireContext>(
         ctx.resources().get_mut(&fwd)?.failed = Some(reason.clone());
         return Ok(Err(reason));
     }
+    ticket_reservation.commit();
     ctx.resources().get_mut(&fwd)?.fired_once = true;
 
     pipe_fires

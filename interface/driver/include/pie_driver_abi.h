@@ -8,13 +8,10 @@
 /**
  * Current direct local ABI version.
  *
- * v2: channel values no longer ride launch descriptors — host puts are
- * direct writes into the registered channel endpoint's pinned ring, pulled
- * by the driver before the consuming pass; `PieChannelDesc` wait ids are
- * mandatory and every native driver must notify them per channel-word
- * publication.
+ * v4: driver creation reports device facts only; model loading is a separate,
+ * blocking `*_load_model` call carrying mandatory StorageProgram bytes.
  */
-#define PIE_DRIVER_ABI_VERSION 3
+#define PIE_DRIVER_ABI_VERSION 4
 
 /**
  * Success.
@@ -168,12 +165,35 @@ typedef struct PieDriverCreateDesc {
 } PieDriverCreateDesc;
 
 /**
- * Cold JSON capability payload returned from `*_create`.
+ * Driver-owned JSON payload returned from a cold boot call.
  */
 typedef struct PieDriverCaps {
   const uint8_t *json_bytes;
   size_t json_len;
 } PieDriverCaps;
+
+/**
+ * Blocking model-load descriptor.
+ */
+typedef struct PieModelLoadDesc {
+  uint32_t abi_version;
+  /**
+   * Must be zero.
+   */
+  uint32_t reserved0;
+  /**
+   * Compiler source hash expected by this runtime.
+   */
+  uint64_t compiler_version;
+  /**
+   * Serialized, versioned StorageProgram. Empty programs are invalid.
+   */
+  struct PieBytes program_bytes;
+  /**
+   * UTF-8 path to the driver-local checkpoint payload root.
+   */
+  struct PieBytes snapshot_dir;
+} PieModelLoadDesc;
 
 /**
  * Static program registration descriptor.
@@ -455,10 +475,9 @@ typedef struct PieLaunchDesc {
    */
   struct PieU32Slice ptir_program_row_indptr;
   /**
-   * Immutable logical-fire ids and retry eligibility, one per instance.
+   * Immutable logical-fire ids, one per instance.
    */
   struct PieU64Slice logical_fire_ids;
-  struct PieU8Slice retry_eligible;
   /**
    * Dense-channel sequence tickets, CSR-partitioned per instance.
    */
@@ -644,6 +663,10 @@ extern "C" {
 extern PieDriver *pie_cuda_create(const struct PieDriverCreateDesc *desc,
                                   struct PieDriverCaps *caps);
 
+extern int32_t pie_cuda_load_model(PieDriver *driver,
+                                   const struct PieModelLoadDesc *load,
+                                   struct PieDriverCaps *caps);
+
 extern int32_t pie_cuda_register_program(PieDriver *driver,
                                          const struct PieProgramDesc *program,
                                          uint64_t *program_id);
@@ -680,6 +703,10 @@ extern void pie_cuda_destroy(PieDriver *driver);
 
 extern PieDriver *pie_metal_create(const struct PieDriverCreateDesc *desc,
                                    struct PieDriverCaps *caps);
+
+extern int32_t pie_metal_load_model(PieDriver *driver,
+                                    const struct PieModelLoadDesc *load,
+                                    struct PieDriverCaps *caps);
 
 extern int32_t pie_metal_register_program(PieDriver *driver,
                                           const struct PieProgramDesc *program,
