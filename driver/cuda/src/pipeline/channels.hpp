@@ -79,13 +79,16 @@ __global__ void k_stage_readiness(const std::uint8_t* __restrict__ full,
 // End-of-pass predicated commit bump (§7.1). Iff *pass_commit: for each taken
 // channel advance head (consume), for each put channel advance tail (publish).
 // A channel both taken and put (loop-carried ping-pong) advances both.
-__global__ void k_commit_bump(std::uint8_t* __restrict__ full,
-                              std::uint32_t* __restrict__ head, std::uint32_t* __restrict__ tail,
-                              const std::uint32_t* __restrict__ cap1,
-                              const std::uint32_t* __restrict__ taken_ch, std::uint32_t n_taken,
-                              const std::uint32_t* __restrict__ put_ch, std::uint32_t n_put,
-                              const std::uint32_t* __restrict__ pass_commit) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+__device__ inline void commit_bump(
+    std::uint8_t* full,
+    std::uint32_t* head,
+    std::uint32_t* tail,
+    const std::uint32_t* cap1,
+    const std::uint32_t* taken_ch,
+    std::uint32_t n_taken,
+    const std::uint32_t* put_ch,
+    std::uint32_t n_put,
+    const std::uint32_t* pass_commit) {
     if (!*pass_commit) return;
     for (std::uint32_t i = 0; i < n_put; ++i) {
         std::uint32_t c = put_ch[i];
@@ -97,6 +100,69 @@ __global__ void k_commit_bump(std::uint8_t* __restrict__ full,
         full[c * kMaxRing + head[c]] = 0;        // consume the committed cell
         head[c] = (head[c] + 1) % cap1[c];
     }
+}
+
+__global__ void k_commit_bump(std::uint8_t* __restrict__ full,
+                              std::uint32_t* __restrict__ head, std::uint32_t* __restrict__ tail,
+                              const std::uint32_t* __restrict__ cap1,
+                              const std::uint32_t* __restrict__ taken_ch, std::uint32_t n_taken,
+                              const std::uint32_t* __restrict__ put_ch, std::uint32_t n_put,
+                              const std::uint32_t* __restrict__ pass_commit) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    commit_bump(
+        full, head, tail, cap1, taken_ch, n_taken,
+        put_ch, n_put, pass_commit);
+}
+
+struct CommitBumpLane {
+    std::uint8_t* full = nullptr;
+    std::uint32_t* head = nullptr;
+    std::uint32_t* tail = nullptr;
+    const std::uint32_t* cap1 = nullptr;
+    const std::uint32_t* taken = nullptr;
+    std::uint32_t taken_count = 0;
+    const std::uint32_t* put = nullptr;
+    std::uint32_t put_count = 0;
+    const std::uint32_t* commit = nullptr;
+};
+
+__global__ void k_commit_bump_batch(
+    const CommitBumpLane* lanes,
+    std::uint32_t count) {
+    const std::uint32_t lane = blockIdx.x;
+    if (lane >= count || threadIdx.x != 0) return;
+    const CommitBumpLane value = lanes[lane];
+    commit_bump(
+        value.full,
+        value.head,
+        value.tail,
+        value.cap1,
+        value.taken,
+        value.taken_count,
+        value.put,
+        value.put_count,
+        value.commit);
+}
+
+inline void launch_commit_bump_batch(
+    const std::vector<CommitBumpLane>& lanes,
+    cudaStream_t stream) {
+    if (lanes.empty()) return;
+    CommitBumpLane* device = nullptr;
+    CUDA_CHECK(cudaMallocAsync(
+        reinterpret_cast<void**>(&device),
+        lanes.size() * sizeof(CommitBumpLane),
+        stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        device,
+        lanes.data(),
+        lanes.size() * sizeof(CommitBumpLane),
+        cudaMemcpyHostToDevice,
+        stream));
+    k_commit_bump_batch<<<lanes.size(), 1, 0, stream>>>(
+        device, static_cast<std::uint32_t>(lanes.size()));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaFreeAsync(device, stream));
 }
 
 inline constexpr std::uint32_t kMaxConditionalConsumeChannels = 64;
@@ -247,6 +313,72 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
             store_system_release(ticket.words + 1, ticket.expected_tail + 1);
             store_system_release(ticket.words + 2, 0);
         }
+    }
+
+    struct HostChannelSettlementLane {
+        std::uint8_t* full = nullptr;
+        std::uint32_t* head = nullptr;
+        const std::uint32_t* cap1 = nullptr;
+        const std::uint32_t* commit = nullptr;
+        ConditionalConsumeSlots consume{};
+        const DeviceHostChannelTicket* tickets = nullptr;
+        std::uint32_t ticket_count = 0;
+    };
+
+    __global__ void k_settle_host_channels_batch(
+        const HostChannelSettlementLane* lanes,
+        std::uint32_t count) {
+        const std::uint32_t lane_index = blockIdx.x;
+        if (lane_index >= count) return;
+        const HostChannelSettlementLane lane = lanes[lane_index];
+        if (*lane.commit == 0) return;
+        if (threadIdx.x == 0) {
+            for (std::uint32_t i = 0; i < lane.consume.n; ++i) {
+                const std::uint32_t slot = lane.consume.slots[i];
+                lane.full[
+                    static_cast<std::size_t>(slot) * kMaxRing +
+                    lane.head[slot]] = 0;
+                lane.head[slot] =
+                    (lane.head[slot] + 1) % lane.cap1[slot];
+            }
+        }
+        __syncthreads();
+        for (std::uint32_t ticket_index = threadIdx.x;
+             ticket_index < lane.ticket_count;
+             ticket_index += blockDim.x) {
+            const DeviceHostChannelTicket& ticket =
+                lane.tickets[ticket_index];
+            if ((ticket.flags & kTicketConsume) != 0) {
+                store_system_release(
+                    ticket.words + 0, ticket.expected_head + 1);
+            }
+            if ((ticket.flags & kTicketPublish) != 0) {
+                store_system_release(
+                    ticket.words + 1, ticket.expected_tail + 1);
+                store_system_release(ticket.words + 2, 0);
+            }
+        }
+    }
+
+    inline void launch_settle_host_channels_batch(
+        const std::vector<HostChannelSettlementLane>& lanes,
+        cudaStream_t stream) {
+        if (lanes.empty()) return;
+        HostChannelSettlementLane* device = nullptr;
+        CUDA_CHECK(cudaMallocAsync(
+            reinterpret_cast<void**>(&device),
+            lanes.size() * sizeof(HostChannelSettlementLane),
+            stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            device,
+            lanes.data(),
+            lanes.size() * sizeof(HostChannelSettlementLane),
+            cudaMemcpyHostToDevice,
+            stream));
+        k_settle_host_channels_batch<<<lanes.size(), 128, 0, stream>>>(
+            device, static_cast<std::uint32_t>(lanes.size()));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaFreeAsync(device, stream));
     }
 
     inline DeviceHostChannelTicket* launch_pull_validate_host_channels(

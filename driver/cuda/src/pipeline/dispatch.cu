@@ -178,12 +178,16 @@ struct NotifyContext {
         PieTerminalCell* terminal_cell = nullptr;
         std::uint32_t* commit_host = nullptr;
         bool poison = false;
+        std::uint64_t instance_id = 0;
+        std::vector<DeviceHostChannelTicket> tickets;
         std::vector<EndpointUpdate> published;
         std::vector<EndpointUpdate> consumed;
         std::vector<EndpointUpdate> poisoned;
     };
     Dispatch::Impl* impl = nullptr;
     std::vector<FinalizeEntry> entries;
+    std::vector<CommitBumpLane> commit_lanes;
+    std::vector<HostChannelSettlementLane> settlement_lanes;
 };
 
 // Word-pointer variants of DeviceChannelRegistry::finalize_host_publish /
@@ -215,6 +219,32 @@ void CUDART_CB notify_runtime_callback(void* userdata) {
             entry.commit_host != nullptr && *(entry.commit_host) != 0;
         const bool failed = entry.poison;
         const bool retry = !failed && !committed;
+        if ((retry || committed) &&
+            std::getenv("PIE_CHANNEL_RETRY_TRACE") != nullptr) {
+            std::fprintf(
+                stderr,
+                "[channel-%s] instance=%llu tickets=%zu\n",
+                retry ? "retry" : "commit",
+                static_cast<unsigned long long>(entry.instance_id),
+                entry.tickets.size());
+            for (const auto& ticket : entry.tickets) {
+                const std::uint64_t head =
+                    std::atomic_ref<std::uint64_t>(ticket.words[0]).load(
+                        std::memory_order_acquire);
+                const std::uint64_t tail =
+                    std::atomic_ref<std::uint64_t>(ticket.words[1]).load(
+                        std::memory_order_acquire);
+                std::fprintf(
+                    stderr,
+                    "  slot=%u flags=%x head=%llu/%llu tail=%llu/%llu\n",
+                    ticket.slot,
+                    ticket.flags,
+                    static_cast<unsigned long long>(head),
+                    static_cast<unsigned long long>(ticket.expected_head),
+                    static_cast<unsigned long long>(tail),
+                    static_cast<unsigned long long>(ticket.expected_tail));
+            }
+        }
         if (committed) {
             for (const auto& update : entry.published) {
                 const std::uint64_t actual =
@@ -1662,11 +1692,33 @@ bool Dispatch::finish(
     notify->completion = completion;
     notify->impl = impl_.get();
     notify->entries.reserve(program_count);
+    const bool batch_settlement =
+        std::getenv("PIE_DISABLE_BATCH_SETTLEMENT") == nullptr;
+    notify->commit_lanes.reserve(program_count);
     for (auto& lane_ptr : state.lanes) {
         StagedLane& lane = *lane_ptr;
-        lane.bound->instance->finalize_commit(
-            stream, lane.snapshot->device);
+        PtirInstance& instance = *lane.bound->instance;
+        if (!batch_settlement) {
+            instance.finalize_commit(stream, lane.snapshot->device);
+            continue;
+        }
+        ChannelView& channel_view = instance.view();
+        notify->commit_lanes.push_back(CommitBumpLane{
+            .full = channel_view.d_full(),
+            .head = channel_view.d_head(),
+            .tail = channel_view.d_tail(),
+            .cap1 = channel_view.d_cap1(),
+            .taken = instance.commit_taken_device(),
+            .taken_count = instance.commit_taken_count(),
+            .put = instance.commit_put_device(),
+            .put_count = instance.commit_put_count(),
+            .commit = lane.snapshot->device,
+        });
     }
+    if (batch_settlement) {
+        launch_commit_bump_batch(notify->commit_lanes, stream);
+    }
+    notify->settlement_lanes.reserve(program_count);
     for (auto& lane_ptr : state.lanes) {
         StagedLane& lane = *lane_ptr;
         BoundInstance& bound = *lane.bound;
@@ -1710,25 +1762,51 @@ bool Dispatch::finish(
                 .words = ticket.words,
             });
         }
-        if (!output_slots.empty()) {
-            launch_consume_if_committed(
-                bound.instance->view().d_full(),
-                bound.instance->view().d_head(),
-                bound.instance->view().d_cap1(),
-                lane.snapshot->device,
-                output_slots.data(),
-                static_cast<std::uint32_t>(output_slots.size()),
-                callback_stream);
+        if (output_slots.size() >
+            kMaxConditionalConsumeChannels) {
+            throw std::runtime_error(
+                "PTIR host output count exceeds settlement capacity");
         }
-        launch_publish_host_channel_actuals(
-            lane.device_tickets,
-            lane.device_ticket_count,
-            lane.snapshot->device,
-            callback_stream);
-        if (lane.device_tickets != nullptr) {
-            CUDA_CHECK(cudaFreeAsync(
-                lane.device_tickets, callback_stream));
-            lane.device_tickets = nullptr;
+        HostChannelSettlementLane settlement{
+            .full = bound.instance->view().d_full(),
+            .head = bound.instance->view().d_head(),
+            .cap1 = bound.instance->view().d_cap1(),
+            .commit = lane.snapshot->device,
+            .tickets = lane.device_tickets,
+            .ticket_count = lane.device_ticket_count,
+        };
+        settlement.consume.n =
+            static_cast<std::uint32_t>(output_slots.size());
+        for (std::size_t index = 0;
+             index < output_slots.size();
+             ++index) {
+            settlement.consume.slots[index] =
+                output_slots[index];
+        }
+        if (batch_settlement) {
+            notify->settlement_lanes.push_back(settlement);
+        } else {
+            if (!output_slots.empty()) {
+                launch_consume_if_committed(
+                    bound.instance->view().d_full(),
+                    bound.instance->view().d_head(),
+                    bound.instance->view().d_cap1(),
+                    lane.snapshot->device,
+                    output_slots.data(),
+                    static_cast<std::uint32_t>(
+                        output_slots.size()),
+                    callback_stream);
+            }
+            launch_publish_host_channel_actuals(
+                lane.device_tickets,
+                lane.device_ticket_count,
+                lane.snapshot->device,
+                callback_stream);
+            if (lane.device_tickets != nullptr) {
+                CUDA_CHECK(cudaFreeAsync(
+                    lane.device_tickets, callback_stream));
+                lane.device_tickets = nullptr;
+            }
         }
         CUDA_CHECK(cudaMemcpyAsync(
             lane.snapshot->host,
@@ -1756,10 +1834,27 @@ bool Dispatch::finish(
             .terminal_cell = view.terminal_cells.data()[lane.program],
             .commit_host = lane.snapshot->host,
             .poison = false,
+            .instance_id = lane.instance_id,
+            .tickets =
+                std::getenv("PIE_CHANNEL_RETRY_TRACE") != nullptr
+                ? lane.tickets
+                : std::vector<DeviceHostChannelTicket>{},
             .published = std::move(published),
             .consumed = std::move(consumed),
             .poisoned = std::move(poisoned),
         });
+    }
+    if (batch_settlement) {
+        launch_settle_host_channels_batch(
+            notify->settlement_lanes, callback_stream);
+        for (auto& lane_ptr : state.lanes) {
+            StagedLane& lane = *lane_ptr;
+            if (lane.device_tickets != nullptr) {
+                CUDA_CHECK(cudaFreeAsync(
+                    lane.device_tickets, callback_stream));
+                lane.device_tickets = nullptr;
+            }
+        }
     }
 
     std::sort(

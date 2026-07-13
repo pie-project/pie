@@ -352,24 +352,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     //    `WaitAllPolicy` only via this installed subscription (the natural
     //    terminate path calls `scheduler::worker::notify_pipeline_leave`
     //    directly from `inferlet::process`, which needs no such hook).
-    //  - the demoted-pipeline reaper needs the process facade (L4), which
-    //    `scheduler` (L2) may not import directly.
     crate::store::reclaim::set_pipeline_leave_hook(|pid| {
         crate::scheduler::worker::notify_pipeline_leave(
             pid,
             crate::scheduler::worker::LeaveKind::Suspend,
         );
     });
-    crate::scheduler::install_terminate_hook(|pid| {
-        crate::inferlet::process::terminate(
-            pid,
-            Err(
-                "scheduler: demoted after missing too many consecutive wait-all wave deadlines"
-                    .to_string(),
-            ),
-        );
-    });
-
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,

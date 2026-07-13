@@ -752,9 +752,8 @@ impl ContentionOrchestrator {
     //      ids, restores H2D, publishes remapped metadata, then calls
     //      `report_restored`; only that final report makes it runnable.
     //
-    // The scheduler wait-set Leave (a parked pipeline must not be awaited) is
-    // emitted at `report_suspended` time once the lifecycle_rx wiring lands
-    // (M-AB); until then the wave deadline + miss-demote bounds the wait.
+    // The scheduler wait-set Leave is mandatory: a parked pipeline must not be
+    // awaited by the pure wait-all barrier.
     // =========================================================================
 
     /// Victim-side step 1: does `pid` have a pending park request?
@@ -1751,13 +1750,10 @@ impl ContentionOrchestrator {
                                     .waiters_parked
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 drop(inner);
-                                // A×B: a PLAIN-parked waiter must also LEAVE
-                                // the wave (first park only). Without this it
-                                // accrues wave misses while blocked here and
-                                // the miss-limit TERMINATES a live lane (the
-                                // BAR-2 "unresponsive pipeline" demote of a
-                                // preempt-cycling carrier lane). Join is
-                                // emitted on acquire exit.
+                                // A×B: a plain parked waiter must also leave
+                                // the wave (first park only), otherwise pure
+                                // wait-all blocks the fleet indefinitely.
+                                // Join is emitted on acquire exit.
                                 notify_pipeline_leave(requester, LeaveKind::Suspend);
                                 notify
                             }

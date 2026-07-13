@@ -240,8 +240,7 @@ pub struct QuorumStats {
     /// at each WaitAll fire. ≈ fleet width ⇒ persistent wait-set (waves should
     /// be dense); ≈1 ⇒ transient/singleton. 0 if no WaitAll fire.
     pub avg_active_pipelines_at_fire: u64,
-    /// Wait-for-all wave: mean stragglers fired without (deadline holds). >0 ⇒
-    /// waves hold to the deadline then fire partial; ≈0 ⇒ all-ready fires.
+    /// Compatibility field; pure wait-all never fires without stragglers.
     pub avg_missing_at_fire: u64,
     /// Cumulative numerator for `avg_active_pipelines_at_fire`.
     pub wave_active_sum: u64,

@@ -527,6 +527,18 @@ class PtirInstance {
     const std::vector<std::uint32_t>& commit_put_slots() const noexcept {
         return runner_.commit_put_slots();
     }
+    const std::uint32_t* commit_taken_device() const noexcept {
+        return runner_.commit_taken_device();
+    }
+    std::uint32_t commit_taken_count() const noexcept {
+        return runner_.commit_taken_count();
+    }
+    const std::uint32_t* commit_put_device() const noexcept {
+        return runner_.commit_put_device();
+    }
+    std::uint32_t commit_put_count() const noexcept {
+        return runner_.commit_put_count();
+    }
     const Trace& trace() const noexcept { return *trace_; }
     void reset_commit(cudaStream_t stream) { runner_.reset_commit(stream); }
     void finalize_commit(

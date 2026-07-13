@@ -193,34 +193,6 @@ pub(crate) fn sched_trace_write(args: std::fmt::Arguments) {
 }
 
 // =============================================================================
-// Demoted-pipeline reaper hook (M-A2)
-// =============================================================================
-
-/// `WaitAllPolicy::take_terminate_candidates` reaps a pipeline through the
-/// process facade (`inferlet::process::terminate`), which is L4 — above
-/// `scheduler` (L2) in the layering, so this module may not import it
-/// directly. A plain closure seam instead: `bootstrap` installs it once, at
-/// startup, wired to the real facade; a unit-test scheduler with no
-/// installed hook just leaves demoted candidates undrained (no reaper, no
-/// panic).
-type TerminateHook = Box<dyn Fn(ProcessId) + Send + Sync>;
-static TERMINATE_HOOK: std::sync::OnceLock<TerminateHook> = std::sync::OnceLock::new();
-
-/// Installs the demoted-pipeline reaper (called once, from `bootstrap`,
-/// after [`spawn`]).
-pub(crate) fn install_terminate_hook(hook: impl Fn(ProcessId) + Send + Sync + 'static) {
-    let _ = TERMINATE_HOOK.set(Box::new(hook));
-}
-
-/// Reaps a pipeline `WaitAllPolicy` demoted for missing too many consecutive
-/// wave deadlines. No-op until [`install_terminate_hook`] runs.
-pub(crate) fn terminate_demoted_pipeline(pid: ProcessId) {
-    if let Some(hook) = TERMINATE_HOOK.get() {
-        hook(pid);
-    }
-}
-
-// =============================================================================
 // Public API: spawn/get_stats/shutdown plain scheduler surfaces (no actor)
 // =============================================================================
 

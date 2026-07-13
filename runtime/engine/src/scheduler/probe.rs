@@ -143,14 +143,12 @@ pub struct QuorumProbes {
     pub readiness_miss: AtomicU64,
 
     /// Wait-for-all wave diagnostics (M-AB, delta). Sampled at each WaitAll
-    /// fire: `wave_active_sum` = Σ active_pipelines (the wait-set size),
-    /// `wave_missing_sum` = Σ stragglers fired without (deadline fires),
+    /// fire: `wave_active_sum` = Σ active_pipelines (the wait-set size) and
     /// `wave_fires` = the denominator. `avg_active = wave_active_sum /
     /// wave_fires` discriminates a PERSISTENT wait-set (converges to fleet
     /// width ⇒ waves should be dense) from a TRANSIENT one (stuck ≈1 ⇒
-    /// singleton waves). `avg_missing` high ⇒ the wave holds to the deadline
-    /// then fires partial; ≈0 ⇒ it fires all-ready (dense or firing-early).
-    /// Zero on legacy/quorum (never a WaitAll fire).
+    /// singleton waves). `wave_missing_sum` is retained for status-schema
+    /// compatibility and remains zero under pure wait-all.
     pub wave_active_sum: AtomicU64,
     pub wave_missing_sum: AtomicU64,
     pub wave_fires: AtomicU64,

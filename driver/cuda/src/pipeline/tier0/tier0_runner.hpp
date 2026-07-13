@@ -106,6 +106,18 @@ class Tier0Runner {
     const std::vector<std::uint32_t>& commit_put_slots() const noexcept {
         return host_commit_put_slots_;
     }
+    const std::uint32_t* commit_taken_device() const noexcept {
+        return d_commit_taken_;
+    }
+    std::uint32_t commit_taken_count() const noexcept {
+        return n_commit_taken_;
+    }
+    const std::uint32_t* commit_put_device() const noexcept {
+        return d_commit_put_;
+    }
+    std::uint32_t commit_put_count() const noexcept {
+        return n_commit_put_;
+    }
     void apply_host_commit(bool committed) {
         ensure_channels();
         if (!committed) return;

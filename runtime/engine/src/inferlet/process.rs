@@ -552,10 +552,9 @@ impl Process {
 
         // M-A1 wait-for-all: drop this pid from the scheduler's wave wait-set as
         // an explicit step of the SINGLE exit funnel — so NATURAL completion (not
-        // only the external-terminate free fn) promptly stops holding the wave,
-        // well before the miss-limit backstop would demote it. Idempotent with the
-        // free fn's early `Leave{Terminate}`; no-op unless a waitall scheduler is
-        // registered.
+        // only the external-terminate free fn) promptly stops holding the wave.
+        // Idempotent with the free fn's early `Leave{Terminate}`; no-op unless a
+        // waitall scheduler is registered.
         crate::scheduler::worker::notify_pipeline_leave(
             self.process_id,
             crate::scheduler::worker::LeaveKind::Terminate,
