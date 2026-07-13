@@ -17,6 +17,64 @@ struct MultimodalLimits {
     int audio_mel_bins = 0;
 };
 
+inline int validate_encode_resources(
+    const PieEncodeDesc& encode,
+    const MultimodalLimits& multimodal,
+    int hidden_size) noexcept {
+    if (multimodal.gemma4_pool_kernel <= 0 ||
+        multimodal.gemma4_position_table <= 0 || hidden_size <= 0) {
+        return PIE_STATUS_UNSUPPORTED;
+    }
+    const std::uint64_t patch_bytes =
+        3u * 16u * 16u * sizeof(float);
+    const std::uint64_t pool_area =
+        static_cast<std::uint64_t>(multimodal.gemma4_pool_kernel) *
+        static_cast<std::uint64_t>(multimodal.gemma4_pool_kernel);
+    std::uint64_t patch_count = 0;
+    std::uint64_t output_rows = 0;
+    for (std::size_t image = 0; image < encode.image_anchor_rows.len; ++image) {
+        const std::uint64_t begin = encode.image_pixel_indptr.ptr[image];
+        const std::uint64_t end = encode.image_pixel_indptr.ptr[image + 1];
+        if (end <= begin || (end - begin) % patch_bytes != 0) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        const std::uint64_t patches = (end - begin) / patch_bytes;
+        if (patches == 0 || patches % pool_area != 0 ||
+            patch_count > std::numeric_limits<std::uint64_t>::max() - patches ||
+            output_rows > std::numeric_limits<std::uint64_t>::max() -
+                patches / pool_area) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        for (std::uint64_t patch = 0; patch < patches; ++patch) {
+            const std::uint64_t position = (patch_count + patch) * 2;
+            if (position + 1 >= encode.image_patch_positions.len ||
+                encode.image_patch_positions.ptr[position] >=
+                    static_cast<std::uint32_t>(
+                        multimodal.gemma4_position_table) ||
+                encode.image_patch_positions.ptr[position + 1] >=
+                    static_cast<std::uint32_t>(
+                        multimodal.gemma4_position_table)) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+        patch_count += patches;
+        output_rows += patches / pool_area;
+    }
+    if (patch_count > std::numeric_limits<std::size_t>::max() / 2 ||
+        encode.image_patch_positions.len !=
+            static_cast<std::size_t>(patch_count) * 2 ||
+        output_rows > std::numeric_limits<std::uint32_t>::max()) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    const std::uint64_t required_bytes =
+        output_rows * static_cast<std::uint64_t>(hidden_size) *
+        sizeof(std::uint16_t);
+    if (required_bytes > encode.output_rows.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
+}
+
 inline int validate_launch_resources(const PieLaunchDesc& launch,
                                      int device_pages,
                                      int page_size,

@@ -27,6 +27,15 @@
 
 namespace pie_cuda_driver {
 
+struct PrecomputedEmbeddingInputs {
+    const std::uint8_t* rows_h = nullptr;
+    const std::uint32_t* byte_indptr_h = nullptr;
+    const std::uint32_t* shapes_h = nullptr;
+    const std::uint8_t* dtypes_h = nullptr;
+    const std::uint32_t* anchor_rows_h = nullptr;
+    int num_blocks = 0;
+};
+
 class LoadedModel;
 class KvCache;
 class AttentionWorkspace;
@@ -198,6 +207,7 @@ struct ForwardFn {
         const std::uint32_t* audio_feature_byte_indptr_h = nullptr; // n_clip+1 byte offsets
         const std::uint32_t* audio_anchor_rows_h      = nullptr;  // n_clip row offsets
         int                  num_clips                 = 0;
+        PrecomputedEmbeddingInputs precomputed_embeddings;
 
         // Launch-scoped PTIR anatomical hooks. Null for ordinary forwards and
         // TP followers; direct staged launches install this only on rank 0.
@@ -556,6 +566,7 @@ struct ForwardDispatchInputs {
     const std::uint32_t* audio_feature_byte_indptr_h = nullptr;
     const std::uint32_t* audio_anchor_rows_h = nullptr;
     int                  num_clips = 0;
+    PrecomputedEmbeddingInputs precomputed_embeddings;
     const model::StageHooks* stage_hooks = nullptr;
 };
 

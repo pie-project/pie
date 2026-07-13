@@ -27,6 +27,7 @@ default = []
 driver-cuda = ["pie-engine/driver-cuda"]
 driver-metal = ["pie-engine/driver-metal"]
 driver-dummy = []
+nixl = ["dep:pie-transport", "pie-transport/nixl"]
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
 # corresponding flag. See `runtime/engine/src/scheduler/probe.rs` for the
@@ -53,6 +54,7 @@ pie-worker-rpc = { path = "../interface/worker" }
 # Direct dep so this crate's build script receives `DEP_PIE_DRIVER_ABI_INCLUDE`
 # (the C header dir) from pie-driver-abi's `links` build-script handoff.
 pie-driver-abi = { path = "../interface/driver" }
+pie-transport = { path = "../driver/transport", optional = true }
 # Shared id atoms (WorkerId / NodeId / ReqId / SessionId) and the client wire
 # vocabulary (ClientMessage / ServerMessage) the gateway data plane carries.
 pie-ids = { path = "../interface/ids" }
@@ -97,6 +99,7 @@ pie-client = { path = "../client/rust" }
 
 [dev-dependencies]
 tempfile = "3"
+pie-ptir = { path = "../interface/ptir" }
 
 [build-dependencies]
 cmake = "0.1"

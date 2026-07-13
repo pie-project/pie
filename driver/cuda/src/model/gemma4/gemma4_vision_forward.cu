@@ -177,4 +177,95 @@ void scatter_gemma4_vision(const Gemma4VisionInputs& vin, bf* hidden,
     }
 }
 
+void encode_gemma4_vision(const Gemma4VisionInputs& vin,
+                          std::uint16_t* output_rows_h,
+                          std::size_t output_bytes,
+                          std::uint32_t* output_row_indptr_h,
+                          cudaStream_t S) {
+    if (vin.weights == nullptr || vin.num_images <= 0 ||
+        output_rows_h == nullptr || output_row_indptr_h == nullptr) {
+        throw std::runtime_error("gemma4_vision: invalid standalone encode inputs");
+    }
+    const VisRawWeights& w = *vin.weights;
+    const int patch_dim = 3 * 16 * 16;
+    const int pk2 = w.pool_kernel * w.pool_kernel;
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(w.text_hidden) * sizeof(bf);
+    std::size_t output_rows = 0;
+    long patch_off = 0;
+    output_row_indptr_h[0] = 0;
+    for (int im = 0; im < vin.num_images; ++im) {
+        const long blo = vin.pixel_byte_indptr_h[im];
+        const long bhi = vin.pixel_byte_indptr_h[im + 1];
+        const int n_floats = static_cast<int>((bhi - blo) / 4);
+        const int n_patch = n_floats / patch_dim;
+        if (n_patch <= 0 || n_patch % pk2 != 0) {
+            throw std::runtime_error("gemma4_vision: invalid patch count");
+        }
+        const int out_len = n_patch / pk2;
+        if ((output_rows + static_cast<std::size_t>(out_len)) * row_bytes >
+            output_bytes) {
+            throw std::runtime_error("gemma4_vision: encode output buffer too small");
+        }
+        const float* pix_h = vin.pixels_h + blo / 4;
+        const std::uint32_t* pos_h = vin.patch_positions_h + patch_off * 2;
+
+        float* pix_f32_d;
+        VCK(cudaMalloc(&pix_f32_d, static_cast<long>(n_floats) * 4));
+        VCK(cudaMemcpyAsync(pix_f32_d, pix_h,
+                            static_cast<long>(n_floats) * 4,
+                            cudaMemcpyHostToDevice, S));
+        bf* pix_bf_d;
+        VCK(cudaMalloc(&pix_bf_d,
+                       static_cast<long>(n_floats) * sizeof(bf)));
+        k_f32_to_bf16<<<(n_floats + 255) / 256, 256, 0, S>>>(
+            pix_f32_d, pix_bf_d, n_floats);
+
+        std::vector<float> posf(n_patch * 2);
+        std::vector<int> grp(n_patch);
+        int maxx = 0;
+        for (int p = 0; p < n_patch; ++p) {
+            maxx = std::max(maxx, static_cast<int>(pos_h[2 * p]));
+        }
+        const int gx = (maxx + 1) / w.pool_kernel;
+        for (int p = 0; p < n_patch; ++p) {
+            posf[2 * p] = static_cast<float>(pos_h[2 * p]);
+            posf[2 * p + 1] = static_cast<float>(pos_h[2 * p + 1]);
+            grp[p] = static_cast<int>(pos_h[2 * p]) / w.pool_kernel +
+                     gx * (static_cast<int>(pos_h[2 * p + 1]) /
+                           w.pool_kernel);
+        }
+        float* pos_d;
+        VCK(cudaMalloc(&pos_d, static_cast<long>(n_patch) * 2 * 4));
+        VCK(cudaMemcpyAsync(pos_d, posf.data(),
+                            static_cast<long>(n_patch) * 2 * 4,
+                            cudaMemcpyHostToDevice, S));
+        int* grp_d;
+        VCK(cudaMalloc(&grp_d, static_cast<long>(n_patch) * 4));
+        VCK(cudaMemcpyAsync(grp_d, grp.data(),
+                            static_cast<long>(n_patch) * 4,
+                            cudaMemcpyHostToDevice, S));
+        bf* proj_d;
+        VCK(cudaMalloc(&proj_d,
+                       static_cast<long>(out_len) * w.text_hidden *
+                           sizeof(bf)));
+        run_gemma4_vision(
+            w, pix_bf_d, pos_d, grp_d, n_patch, out_len, proj_d, S);
+        VCK(cudaMemcpyAsync(
+            output_rows_h + output_rows * w.text_hidden, proj_d,
+            static_cast<long>(out_len) * w.text_hidden * sizeof(bf),
+            cudaMemcpyDeviceToHost, S));
+        VCK(cudaStreamSynchronize(S));
+        cudaFree(pix_f32_d);
+        cudaFree(pix_bf_d);
+        cudaFree(pos_d);
+        cudaFree(grp_d);
+        cudaFree(proj_d);
+        output_rows += static_cast<std::size_t>(out_len);
+        output_row_indptr_h[im + 1] =
+            static_cast<std::uint32_t>(output_rows);
+        patch_off += n_patch;
+    }
+}
+
 }  // namespace pie_cuda_driver::model

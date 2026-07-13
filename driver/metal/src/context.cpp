@@ -394,6 +394,9 @@ class Context::Impl {
             return PIE_STATUS_CLOSED;
         }
         load_attempted_ = true;
+        if (load.component != PIE_MODEL_COMPONENT_FULL) {
+            return PIE_STATUS_UNSUPPORTED;
+        }
         cfg_.model.hf_path.assign(
             reinterpret_cast<const char*>(load.snapshot_dir.ptr),
             load.snapshot_dir.len);

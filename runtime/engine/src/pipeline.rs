@@ -27,6 +27,7 @@
 pub mod channel;
 pub mod fire;
 pub mod instance;
+pub mod offload;
 pub mod program;
 
 use std::collections::VecDeque;

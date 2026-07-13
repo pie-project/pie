@@ -5,9 +5,10 @@
 
 use pie_driver_abi::{
     PIE_DRIVER_ABI_VERSION, PieBytes, PieChannelDesc, PieChannelValueDesc,
-    PieChannelValueDescSlice, PieInstanceDesc, PieKvCopyDesc, PieKvMoveCellSlice, PieMaskWordsDesc,
-    PiePoolRangeSlice, PiePoolResizeDesc, PieProgramDesc, PieStateCopyDesc, PieStateCopyRangeSlice,
-    PieTerminalCellPtrSlice, PieU8Slice, PieU32Slice, PieU64Slice,
+    PieChannelValueDescSlice, PieEncodeDesc, PieInstanceDesc, PieKvCopyDesc, PieKvMoveCellSlice,
+    PieMaskWordsDesc, PieMutBytes, PiePoolRangeSlice, PiePoolResizeDesc, PieProgramDesc,
+    PieStateCopyDesc, PieStateCopyRangeSlice, PieTerminalCellPtrSlice, PieU8Slice, PieU32MutSlice,
+    PieU32Slice, PieU64Slice,
 };
 
 use super::command::{
@@ -23,6 +24,12 @@ fn bytes_slice(bytes: &[u8]) -> PieBytes {
         len: bytes.len(),
     }
 }
+fn mut_bytes_slice(bytes: &mut [u8]) -> PieMutBytes {
+    PieMutBytes {
+        ptr: bytes.as_mut_ptr(),
+        len: bytes.len(),
+    }
+}
 fn u8_slice(slice: &[u8]) -> PieU8Slice {
     PieU8Slice {
         ptr: slice.as_ptr(),
@@ -32,6 +39,12 @@ fn u8_slice(slice: &[u8]) -> PieU8Slice {
 fn u32_slice(slice: &[u32]) -> PieU32Slice {
     PieU32Slice {
         ptr: slice.as_ptr(),
+        len: slice.len(),
+    }
+}
+fn u32_mut_slice(slice: &mut [u32]) -> PieU32MutSlice {
+    PieU32MutSlice {
+        ptr: slice.as_mut_ptr(),
         len: slice.len(),
     }
 }
@@ -67,12 +80,15 @@ impl MaskWordsStorage {
             let word_count = pie_grammar::bitmask::bitmask_size(mask.len());
             let start = words.len();
             words.resize(start + word_count, 0);
-            for (value, run_start, run_end) in mask.iter_runs() {
-                if value {
-                    for bit in run_start..run_end {
+            let mut run_start = 0usize;
+            for (index, &run_len) in mask.runs.iter().enumerate() {
+                let run_end = run_start.saturating_add(run_len as usize);
+                if index % 2 == 1 {
+                    for bit in run_start..run_end.min(mask.len()) {
                         pie_grammar::bitmask::set_bit(&mut words[start..], bit);
                     }
                 }
+                run_start = run_end;
             }
             word_indptr.push(words.len() as u32);
         }
@@ -236,6 +252,12 @@ impl<'a> LaunchDescBorrow<'a> {
             audio_feature_indptr: u32_slice(&plan.audio_feature_indptr),
             audio_anchor_rows: u32_slice(&plan.audio_anchor_rows),
             audio_indptr: u32_slice(&plan.audio_indptr),
+            embed_rows: bytes_slice(&plan.embed_rows),
+            embed_indptr: u32_slice(&plan.embed_indptr),
+            embed_shapes: u32_slice(&plan.embed_shapes),
+            embed_dtypes: u8_slice(&plan.embed_dtypes),
+            embed_anchor_rows: u32_slice(&plan.embed_anchor_rows),
+            embed_block_indptr: u32_slice(&plan.embed_block_indptr),
             kv_len: u32_slice(&plan.kv_len),
             kv_len_device: u64_slice(&plan.kv_len_device),
             kv_translation: u32_slice(&submission.kv_translation),
@@ -253,6 +275,32 @@ impl<'a> LaunchDescBorrow<'a> {
         }
     }
     pub fn as_raw(&self) -> &pie_driver_abi::PieLaunchDesc {
+        &self.raw
+    }
+}
+
+pub struct EncodeDescBorrow<'a> {
+    raw: PieEncodeDesc,
+    _plan: &'a mut pie_driver_abi::MediaEncodePlan,
+}
+
+impl<'a> EncodeDescBorrow<'a> {
+    pub fn new(plan: &'a mut pie_driver_abi::MediaEncodePlan) -> Self {
+        let raw = PieEncodeDesc {
+            abi_version: PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            image_grids: u32_slice(&plan.image_grids),
+            image_pixels: bytes_slice(&plan.image_pixels),
+            image_pixel_indptr: u32_slice(&plan.image_pixel_indptr),
+            image_patch_positions: u32_slice(&plan.image_patch_positions),
+            image_anchor_rows: u32_slice(&plan.image_anchor_rows),
+            output_rows: mut_bytes_slice(&mut plan.output_rows),
+            output_row_indptr: u32_mut_slice(&mut plan.output_row_indptr),
+        };
+        Self { raw, _plan: plan }
+    }
+
+    pub fn as_raw(&self) -> &PieEncodeDesc {
         &self.raw
     }
 }

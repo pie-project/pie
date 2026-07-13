@@ -34,6 +34,10 @@ pub struct Config {
     /// `controller` unset ⇒ single-node (gateway-free local inference).
     #[serde(default)]
     pub cluster: ClusterConfig,
+    #[serde(default)]
+    pub executor: ExecutorConfig,
+    #[serde(default)]
+    pub offload: OffloadConfig,
     /// The single `[model]` table. Pie serves exactly one model.
     pub model: ModelConfig,
 }
@@ -64,8 +68,86 @@ impl Config {
         self.server.validate()?;
         self.runtime.validate()?;
         self.cluster.validate()?;
+        self.executor.validate()?;
+        self.offload.validate()?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorConfig {
+    #[serde(default = "default_executor_max_clients")]
+    pub max_clients: usize,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self {
+            max_clients: default_executor_max_clients(),
+        }
+    }
+}
+
+impl ExecutorConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_clients > 0,
+            "executor.max_clients must be greater than zero"
+        );
+        Ok(())
+    }
+}
+
+fn default_executor_max_clients() -> usize {
+    4
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OffloadConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub prefill_min_suffix_tokens: usize,
+    #[serde(default = "default_offload_max_outstanding")]
+    pub max_outstanding_per_partner: u32,
+    #[serde(default)]
+    pub transfer: OffloadTransfer,
+}
+
+impl Default for OffloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prefill_min_suffix_tokens: 0,
+            max_outstanding_per_partner: default_offload_max_outstanding(),
+            transfer: OffloadTransfer::Auto,
+        }
+    }
+}
+
+impl OffloadConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_outstanding_per_partner > 0,
+            "offload.max_outstanding_per_partner must be greater than zero"
+        );
+        Ok(())
+    }
+}
+
+fn default_offload_max_outstanding() -> u32 {
+    4
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OffloadTransfer {
+    Inline,
+    Nixl,
+    #[default]
+    Auto,
 }
 
 // -----------------------------------------------------------------------------
@@ -95,6 +177,12 @@ impl ClusterConfig {
             ensure!(
                 self.role.is_some(),
                 "[cluster] role is required when controller is set"
+            );
+        }
+        if matches!(self.role, Some(Role::Prefill | Role::Encode)) {
+            ensure!(
+                self.controller.is_some(),
+                "[cluster] prefill and encode executors require a controller"
             );
         }
         Ok(())
@@ -751,6 +839,21 @@ device = ["cpu"]
         assert_eq!(cfg.model.driver.kind, DriverKind::Metal);
         assert_eq!(cfg.model.driver.device, vec!["cpu".to_string()]);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    #[test]
+    fn executor_roles_require_controller() {
+        let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.cluster.role = Some(Role::Prefill);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("require a controller")
+        );
+
+        cfg.cluster.controller = Some("127.0.0.1:7000".to_string());
+        cfg.validate().unwrap();
     }
 
     #[test]

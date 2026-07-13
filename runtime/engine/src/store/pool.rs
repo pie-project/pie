@@ -26,15 +26,24 @@ pub struct Pool<I> {
     free: Vec<I>,
     /// Ids waiting for their epoch to retire before becoming allocatable.
     pending: Vec<(u64, Vec<I>)>,
+    base: u32,
     capacity: u32,
 }
 
 impl<I: PoolId> Pool<I> {
     pub fn new(capacity: u32) -> Self {
+        Self::new_range(0, capacity)
+    }
+
+    pub fn new_range(base: u32, capacity: u32) -> Self {
+        let end = base
+            .checked_add(capacity)
+            .expect("pool id range overflows u32");
         Self {
             // Pop order: ascending ids first (cosmetic, deterministic tests).
-            free: (0..capacity).rev().map(I::from_index).collect(),
+            free: (base..end).rev().map(I::from_index).collect(),
             pending: Vec::new(),
+            base,
             capacity,
         }
     }
@@ -65,7 +74,9 @@ impl<I: PoolId> Pool<I> {
     /// driver operation. No completion epoch is required because no device
     /// user could have observed them.
     pub fn release_reserved(&mut self, ids: Vec<I>) {
-        debug_assert!(ids.iter().all(|id| id.index() < self.capacity));
+        debug_assert!(ids.iter().all(|id| {
+            id.index() >= self.base && id.index() < self.base.saturating_add(self.capacity)
+        }));
         debug_assert!(
             ids.iter()
                 .all(|id| !self.free.iter().any(|free| free.index() == id.index()))

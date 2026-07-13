@@ -125,6 +125,22 @@ extern "C" int32_t pie_cuda_launch(PieDriver* driver,
     }
 }
 
+extern "C" int32_t pie_cuda_encode(PieDriver* driver,
+                                    const PieEncodeDesc* encode,
+                                    PieCompletion completion) {
+    const int status = pie_native::abi::validate_encode_desc(encode);
+    if (status != PIE_STATUS_OK) return status;
+    const int completion_status =
+        pie_native::abi::validate_completion(completion, true);
+    if (completion_status != PIE_STATUS_OK) return completion_status;
+    if (driver == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    try {
+        return as_context(driver)->encode(*encode, completion);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
+}
+
 extern "C" int32_t pie_cuda_copy_kv(PieDriver* driver,
                                      const PieKvCopyDesc* copy,
                                      PieCompletion completion) {

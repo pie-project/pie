@@ -84,8 +84,14 @@ struct Inner {
     /// Connected remote peers, by worker.
     remotes: HashMap<u64, Remote>,
     /// In-flight transfer requests, by this engine's inner id.
-    reqs: HashMap<u64, nixl_capi_xfer_req_t>,
+    reqs: HashMap<u64, Request>,
     next_id: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Request {
+    handle: nixl_capi_xfer_req_t,
+    released: bool,
 }
 
 /// Cross-node NIXL engine. One NIXL agent + UCX backend per instance.
@@ -140,7 +146,8 @@ impl NixlEngine {
         &self,
         op: nixl_capi_xfer_op_t,
         local: &RegisteredHandle,
-        pages: &PageSet,
+        local_pages: &PageSet,
+        remote_pages: &PageSet,
         peer: WorkerId,
     ) -> Result<TransferId> {
         let mut g = self.inner.lock().unwrap();
@@ -156,8 +163,11 @@ impl NixlEngine {
         }
 
         unsafe {
-            let local_dl = build_xfer_dlist(local.handle(), pages)?;
-            let remote_dl = match build_xfer_dlist(&remote_handle, pages) {
+            if local_pages.len() != remote_pages.len() {
+                return Err(TransportError::LayoutMismatch);
+            }
+            let local_dl = build_xfer_dlist(local.handle(), local_pages)?;
+            let remote_dl = match build_xfer_dlist(&remote_handle, remote_pages) {
                 Ok(dl) => dl,
                 Err(e) => {
                     nixl_capi_destroy_xfer_dlist(local_dl);
@@ -181,51 +191,59 @@ impl NixlEngine {
                 return Err(err("create_xfer_req", st));
             }
 
-            let st = nixl_capi_post_xfer_req(g.agent, req, ptr::null_mut());
-            if st != OK && st != INPROG {
-                nixl_capi_destroy_xfer_req(req);
-                return Err(err("post_xfer_req", st));
-            }
+            let _post_status = nixl_capi_post_xfer_req(g.agent, req, ptr::null_mut());
+            // Even a hard post error can leave an agent-owned request. Keep it
+            // pollable so the normal terminal path releases it before destroy.
 
             let id = g.next_id;
             g.next_id += 1;
-            g.reqs.insert(id, req);
+            g.reqs.insert(
+                id,
+                Request {
+                    handle: req,
+                    released: false,
+                },
+            );
             Ok(TransferId(id))
         }
     }
 }
 
-/// Build a NIXL transfer descriptor list for `pages` of `handle`. Addresses
-/// only `regions.first()` — the single-contiguous-region assumption shared with
-/// the local engine; multi-region handles are out of current scope.
+/// Build a NIXL transfer descriptor list for every physical region slice of
+/// each logical KV page.
 unsafe fn build_xfer_dlist(handle: &KvHandle, pages: &PageSet) -> Result<nixl_capi_xfer_dlist_t> {
-    let region = handle
+    let first = handle
         .regions
         .first()
         .ok_or(TransportError::Unsupported("handle has no KV region"))?;
-    let page_bytes = handle.page_bytes();
     let mut dl: nixl_capi_xfer_dlist_t = ptr::null_mut();
-    let st = unsafe { nixl_capi_create_xfer_dlist(mem_type(region.domain), &mut dl) };
+    let st = unsafe { nixl_capi_create_xfer_dlist(mem_type(first.domain), &mut dl) };
     if st != OK {
         return Err(err("create_xfer_dlist", st));
     }
     for &page in &pages.pages {
-        let offset = page as u64 * page_bytes;
-        if offset + page_bytes > region.len {
-            unsafe { nixl_capi_destroy_xfer_dlist(dl) };
-            return Err(TransportError::PageOutOfBounds { page });
-        }
-        let st = unsafe {
-            nixl_capi_xfer_dlist_add_desc(
-                dl,
-                (region.base + offset) as usize,
-                page_bytes as usize,
-                dev_id(region.domain),
-            )
-        };
-        if st != OK {
-            unsafe { nixl_capi_destroy_xfer_dlist(dl) };
-            return Err(err("xfer_dlist_add_desc", st));
+        for region in &handle.regions {
+            if mem_type(region.domain) != mem_type(first.domain) || region.page_stride == 0 {
+                unsafe { nixl_capi_destroy_xfer_dlist(dl) };
+                return Err(TransportError::LayoutMismatch);
+            }
+            let offset = page as u64 * region.page_stride;
+            if offset + region.page_stride > region.len {
+                unsafe { nixl_capi_destroy_xfer_dlist(dl) };
+                return Err(TransportError::PageOutOfBounds { page });
+            }
+            let st = unsafe {
+                nixl_capi_xfer_dlist_add_desc(
+                    dl,
+                    (region.base + offset) as usize,
+                    region.page_stride as usize,
+                    dev_id(region.domain),
+                )
+            };
+            if st != OK {
+                unsafe { nixl_capi_destroy_xfer_dlist(dl) };
+                return Err(err("xfer_dlist_add_desc", st));
+            }
         }
     }
     Ok(dl)
@@ -272,30 +290,69 @@ impl Engine for NixlEngine {
         })
     }
 
-    fn send(
+    fn send_mapped(
         &self,
         handle: &RegisteredHandle,
-        pages: &PageSet,
+        src_pages: &PageSet,
+        dst_pages: &PageSet,
         dst: WorkerId,
     ) -> Result<TransferId> {
-        self.xfer(WRITE, handle, pages, dst)
+        self.xfer(WRITE, handle, src_pages, dst_pages, dst)
     }
 
-    fn recv(&self, slot: &RegisteredHandle, pages: &PageSet, src: WorkerId) -> Result<TransferId> {
-        self.xfer(READ, slot, pages, src)
+    fn recv_mapped(
+        &self,
+        slot: &RegisteredHandle,
+        dst_pages: &PageSet,
+        src_pages: &PageSet,
+        src: WorkerId,
+    ) -> Result<TransferId> {
+        self.xfer(READ, slot, dst_pages, src_pages, src)
     }
 
     fn poll(&self, id: TransferId) -> Result<Completion> {
-        let g = self.inner.lock().unwrap();
-        let req = *g
+        let mut g = self.inner.lock().unwrap();
+        let request = *g
             .reqs
             .get(&id.0)
             .ok_or(TransportError::UnknownTransfer { id: id.0 })?;
-        let st = unsafe { nixl_capi_get_xfer_status(g.agent, req) };
+        if request.released {
+            let status = unsafe { nixl_capi_destroy_xfer_req(request.handle) };
+            if status != OK {
+                return Err(err("destroy_xfer_req", status));
+            }
+            g.reqs.remove(&id.0);
+            return Ok(Completion::Done);
+        }
+        let st = unsafe { nixl_capi_get_xfer_status(g.agent, request.handle) };
         match st {
-            s if s == OK => Ok(Completion::Done),
+            s if s == OK => {
+                let status = unsafe { nixl_capi_release_xfer_req(g.agent, request.handle) };
+                if status != OK {
+                    return Err(err("release_xfer_req", status));
+                }
+                g.reqs.get_mut(&id.0).expect("request remains").released = true;
+                let status = unsafe { nixl_capi_destroy_xfer_req(request.handle) };
+                if status != OK {
+                    return Err(err("destroy_xfer_req", status));
+                }
+                g.reqs.remove(&id.0);
+                Ok(Completion::Done)
+            }
             s if s == INPROG => Ok(Completion::Pending),
-            other => Ok(Completion::Failed(format!("nixl xfer status {other}"))),
+            other => {
+                let status = unsafe { nixl_capi_release_xfer_req(g.agent, request.handle) };
+                if status != OK {
+                    return Err(err("release_xfer_req", status));
+                }
+                g.reqs.get_mut(&id.0).expect("request remains").released = true;
+                let status = unsafe { nixl_capi_destroy_xfer_req(request.handle) };
+                if status != OK {
+                    return Err(err("destroy_xfer_req", status));
+                }
+                g.reqs.remove(&id.0);
+                Ok(Completion::Failed(format!("nixl xfer status {other}")))
+            }
         }
     }
 
@@ -342,8 +399,11 @@ impl Drop for NixlEngine {
     fn drop(&mut self) {
         let g = self.inner.get_mut().unwrap();
         unsafe {
-            for (_, req) in g.reqs.drain() {
-                nixl_capi_destroy_xfer_req(req);
+            for (_, request) in g.reqs.drain() {
+                if !request.released {
+                    let _ = nixl_capi_release_xfer_req(g.agent, request.handle);
+                }
+                let _ = nixl_capi_destroy_xfer_req(request.handle);
             }
             if !g.backend.is_null() {
                 nixl_capi_destroy_backend(g.backend);
@@ -370,6 +430,8 @@ mod tests {
             page_size: 16,
             dtype: KvDtype::Bf16,
             kind: KvLayoutKind::KvSeparate,
+            storage_format: "test-bf16".to_string(),
+            region_page_bytes: Vec::new(),
         }
     }
 
@@ -378,6 +440,7 @@ mod tests {
             regions: vec![pie_driver_abi::KvRegion {
                 base: buf.as_ptr() as u64,
                 len: buf.len() as u64,
+                page_stride: layout().page_bytes(),
                 domain: MemoryDomain::HostPinned,
             }],
             layout: layout(),
@@ -449,6 +512,10 @@ mod tests {
                 Completion::Failed(m) => panic!("transfer failed: {m}"),
             }
         }
+        assert!(matches!(
+            a.poll(id),
+            Err(TransportError::UnknownTransfer { id: unknown }) if unknown == id.0
+        ));
 
         assert!(
             dst[..page_bytes * 2].iter().all(|&x| x == 0xAB),

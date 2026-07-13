@@ -8,6 +8,7 @@
 use smallvec::{SmallVec, smallvec};
 
 use crate::store::kv::project::PhysicalPageId;
+use pie_driver_abi::EncodedMask;
 use pie_grammar::brle::RunMask;
 
 /// Inline storage for the page-trim bitmap. Sized to cover up to 1024 pages
@@ -207,6 +208,12 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> crate::dr
         audio_feature_indptr: indptr(indptr_cap),
         audio_anchor_rows: Vec::new(),
         audio_indptr: indptr(indptr_cap),
+        embed_rows: Vec::new(),
+        embed_indptr: indptr(indptr_cap),
+        embed_shapes: Vec::new(),
+        embed_dtypes: Vec::new(),
+        embed_anchor_rows: Vec::new(),
+        embed_block_indptr: indptr(indptr_cap),
         ..Default::default()
     }
 }
@@ -241,16 +248,17 @@ fn emit_attention_masks(
 ) {
     match trim {
         None => {
-            batch.masks.extend_from_slice(masks);
+            batch.masks.extend(
+                masks
+                    .iter()
+                    .map(|mask| EncodedMask::new(mask.buffer.clone(), mask.total_size)),
+            );
         }
         Some(plan) => {
             for mask in masks {
                 let mut buf = Vec::new();
                 let new_total = mask.write_skipping(&plan.skip_ranges, &mut buf);
-                batch.masks.push(RunMask {
-                    buffer: buf,
-                    total_size: new_total as u64,
-                });
+                batch.masks.push(EncodedMask::new(buf, new_total as u64));
             }
         }
     }
@@ -310,6 +318,7 @@ pub fn append_request_with_options(
         && req.token_ids.len() <= 1;
 
     let synthesized_masks;
+    let decoded_masks;
     let masks = if !elide_decode_mask && req.masks.is_empty() && !req.position_ids.is_empty() {
         synthesized_masks = req
             .position_ids
@@ -318,7 +327,15 @@ pub fn append_request_with_options(
             .collect::<Vec<_>>();
         synthesized_masks.as_slice()
     } else {
-        req.masks.as_slice()
+        decoded_masks = req
+            .masks
+            .iter()
+            .map(|mask| RunMask {
+                buffer: mask.runs.clone(),
+                total_size: mask.total_size,
+            })
+            .collect::<Vec<_>>();
+        decoded_masks.as_slice()
     };
 
     let trim = if elide_decode_mask {
@@ -440,6 +457,20 @@ pub fn append_request_with_options(
     batch
         .audio_indptr
         .push(batch.audio_anchor_rows.len() as u32);
+
+    let embed_byte_base = batch.embed_rows.len() as u32;
+    batch.embed_rows.extend(&req.embed_rows);
+    for &offset in req.embed_indptr.iter().skip(1) {
+        batch.embed_indptr.push(embed_byte_base + offset);
+    }
+    batch.embed_shapes.extend(&req.embed_shapes);
+    batch.embed_dtypes.extend(&req.embed_dtypes);
+    for &row in &req.embed_anchor_rows {
+        batch.embed_anchor_rows.push(row_base + row);
+    }
+    batch
+        .embed_block_indptr
+        .push(batch.embed_dtypes.len() as u32);
 
     // Inference hint: prefill kernel when ANY request needs `custom_mask`.
     if req.token_ids.len() > 1 || req.has_user_mask {

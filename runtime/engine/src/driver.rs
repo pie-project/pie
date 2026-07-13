@@ -21,8 +21,8 @@ pub mod submission;
 pub use pie_waker as waker;
 
 pub use backend::{
-    DriverBackend, DriverSpec, DummyDriver, SchedulerLimits, get_spec, register_driver,
-    register_driver_backend, take_driver_backend,
+    DriverBackend, DriverSpec, DummyDriver, RemoteDisconnectHandle, RemoteDriver, SchedulerLimits,
+    get_spec, register_driver, register_driver_backend, take_driver_backend, unregister_driver,
 };
 pub use channel::{ChannelCloser, ChannelEndpoint, ChannelValue, RegisteredChannel};
 pub use command::{

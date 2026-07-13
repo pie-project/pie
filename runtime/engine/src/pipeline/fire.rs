@@ -511,6 +511,7 @@ pub async fn submit_pass<C: FireContext>(
             committed_tokens,
             fwd_rep,
             instance_id,
+            program,
             completion,
             canonical_evidence,
             dense_mask,
@@ -542,6 +543,7 @@ pub async fn submit_pass<C: FireContext>(
                 p.committed_tokens,
                 fwd.rep(),
                 p.bound_instance.instance_id,
+                Arc::clone(&p.instance.program),
                 p.bound_instance.reserve_completion(),
                 canonical_evidence,
                 p.dense_mask,
@@ -557,6 +559,7 @@ pub async fn submit_pass<C: FireContext>(
         // multi-program batch does not merge dense device masks — v1
         // scope).
         req.has_user_mask = dense_mask;
+        crate::pipeline::offload::try_encode(&mut req).await;
         // Prepare the guest-owned KV working set for this fire via
         // `pipeline::fire::kv` over the typed KvStore (reserve growth +
         // fresh / in-place / CoW classification + geometry projection).
@@ -654,7 +657,7 @@ pub async fn submit_pass<C: FireContext>(
         // indistinguishable from a continuation fire over `kts` committed
         // tokens. Any miss or ineligible shape falls through to the full
         // computation.
-        let (committed_tokens, new_tokens, hash_tokens) = {
+        let (mut committed_tokens, mut new_tokens, mut hash_tokens) = {
             let mut committed = committed_tokens;
             let mut toks_new = new_tokens;
             let mut toks_hash = hash_tokens;
@@ -705,6 +708,27 @@ pub async fn submit_pass<C: FireContext>(
             }
             (committed, toks_new, toks_hash)
         };
+
+        if committed_tokens == 0
+            && let Some(tokens) = hash_tokens.as_deref()
+            && let Some(adoption) = crate::pipeline::offload::try_prefill(
+                ws.model,
+                ws.driver as usize,
+                ws.id,
+                ws.page_size,
+                &mut req,
+                tokens,
+                &program,
+                instance_id,
+                ws.fire_lease().ok(),
+            )
+            .await
+        {
+            let adopted = adoption.token_count;
+            new_tokens.drain(..adopted);
+            hash_tokens = hash_tokens.map(|tokens| tokens[adopted..].to_vec());
+            committed_tokens += adopted as u32;
+        }
 
         debug_assert_eq!(
             u64::from(committed_tokens) + new_tokens.len() as u64,

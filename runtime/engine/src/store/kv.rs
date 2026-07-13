@@ -217,9 +217,18 @@ impl KvStore {
     }
 
     pub fn new_with_swap(capacity: u32, host_capacity: u32, opaque_nonce: Hash256) -> Self {
+        Self::new_with_swap_range(0, capacity, host_capacity, opaque_nonce)
+    }
+
+    pub fn new_with_swap_range(
+        base_page: u32,
+        capacity: u32,
+        host_capacity: u32,
+        opaque_nonce: Hash256,
+    ) -> Self {
         Self {
             table: KvPageTable::new(),
-            pool: Pool::new(capacity),
+            pool: Pool::new_range(base_page, capacity),
             host_pool: Pool::new(host_capacity),
             flat: HashMap::new(),
             pending: HashMap::new(),
@@ -1087,6 +1096,78 @@ impl KvStore {
         self.table.set_chain_state(ws, Some(*key))?;
         self.invalidate_flat(ws);
         Ok(Some(pages))
+    }
+
+    pub fn adopt_offloaded_prefix(
+        &mut self,
+        ws: WorkingSetId,
+        tokens: &[u32],
+        pages: Vec<PhysicalKvPageId>,
+        page_size: u32,
+    ) -> Result<u64, KvStoreError> {
+        if tokens.is_empty()
+            || page_size == 0
+            || !tokens.len().is_multiple_of(page_size as usize)
+            || pages.len() * page_size as usize != tokens.len()
+        {
+            self.pool.release_reserved(pages);
+            return Err(KvStoreError::BadWriteSet {
+                reason: "offloaded adoption requires a non-empty full-page token prefix",
+            });
+        }
+        let empty = match (self.mapped_len(ws), self.chain_state(ws)) {
+            (Ok(mapped), Ok(chain)) => {
+                mapped == 0
+                    && chain.is_none()
+                    && !self
+                        .pending
+                        .get(&ws)
+                        .is_some_and(|pending| !pending.is_empty())
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                self.pool.release_reserved(pages);
+                return Err(error);
+            }
+        };
+        if !empty {
+            self.pool.release_reserved(pages);
+            return Err(KvStoreError::BadWriteSet {
+                reason: "offloaded adoption requires an empty working set",
+            });
+        }
+
+        let page_count = pages.len() as u64;
+        if let Err(error) = self.reserve(ws, page_count) {
+            self.pool.release_reserved(pages);
+            return Err(error);
+        }
+        let indexes = (0..page_count).collect::<Vec<_>>();
+        let prepared = self.prepare_write_granted(ws, &indexes, pages)?;
+        let sequence = prepared.seq();
+        let mut previous = None;
+        let mut commits = Vec::with_capacity(page_count as usize);
+        for (page_index, page_tokens) in tokens.chunks_exact(page_size as usize).enumerate() {
+            let mut token_hashes = Vec::with_capacity(page_size as usize);
+            for (offset, &token) in page_tokens.iter().enumerate() {
+                let position = page_index * page_size as usize + offset;
+                let hash = hash::chain_token_slot_hash(
+                    &self.domain,
+                    previous.as_ref(),
+                    token,
+                    position as u32,
+                );
+                previous = Some(hash);
+                token_hashes.push(Some(hash));
+            }
+            commits.push(PageCommit {
+                page_hash: Some(hash::page_hash(&token_hashes)),
+                token_hashes,
+            });
+        }
+        let epoch = self.current_epoch();
+        self.commit(prepared, &commits, epoch)?;
+        self.retire_through(sequence);
+        Ok(page_count)
     }
 
     /// Contention-ladder rung 2 victim sizing: pages reachable only from

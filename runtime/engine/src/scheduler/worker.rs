@@ -718,8 +718,14 @@ impl BatchScheduler {
         let mut stopping = false;
         // The wait-for-all-active-pipelines fire rule (overview §7.2): one
         // instance per driver thread, mirroring `instances`/`channels` above.
-        let mut policy =
-            quorum::WaitAllPolicy::new(limits.max_forward_requests, Some(Arc::clone(&stats)));
+        let greedy = driver
+            .as_ref()
+            .is_some_and(|backend| backend.kind() == "remote");
+        let mut policy = quorum::WaitAllPolicy::with_greedy(
+            limits.max_forward_requests,
+            Some(Arc::clone(&stats)),
+            greedy,
+        );
 
         loop {
             let mut progress = false;

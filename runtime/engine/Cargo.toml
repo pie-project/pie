@@ -19,6 +19,7 @@ pie-ptir = { path = "../../interface/ptir" }
 pie-client = { path = "../../client/rust" }
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
+tarpc = { version = "0.35", features = ["serde1"] }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"

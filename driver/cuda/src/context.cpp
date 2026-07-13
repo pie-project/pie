@@ -19,6 +19,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -43,6 +44,7 @@
 #include "model/deepseek_v4/deepseek_v4_forward.hpp"
 #include "model/gemma/gemma2.hpp"
 #include "model/gemma4/gemma4.hpp"
+#include "model/gemma4/gemma4_vision_adapter.hpp"
 #include "model/glm5/glm5_forward.hpp"
 #include "model/kimi/kimi_forward.hpp"
 #include "model/llama_like/llama_like.hpp"
@@ -165,6 +167,12 @@ struct LaunchScratch {
         view.audio_features = pie_native::slice_from_u8(launch.audio_features.ptr, launch.audio_features.len);
         view.audio_feature_indptr = pie_native::slice_from_u32(launch.audio_feature_indptr.ptr, launch.audio_feature_indptr.len);
         view.audio_anchor_rows = pie_native::slice_from_u32(launch.audio_anchor_rows.ptr, launch.audio_anchor_rows.len);
+        view.embed_rows = pie_native::slice_from_u8(launch.embed_rows.ptr, launch.embed_rows.len);
+        view.embed_indptr = pie_native::slice_from_u32(launch.embed_indptr.ptr, launch.embed_indptr.len);
+        view.embed_shapes = pie_native::slice_from_u32(launch.embed_shapes.ptr, launch.embed_shapes.len);
+        view.embed_dtypes = pie_native::slice_from_u8(launch.embed_dtypes.ptr, launch.embed_dtypes.len);
+        view.embed_anchor_rows = pie_native::slice_from_u32(launch.embed_anchor_rows.ptr, launch.embed_anchor_rows.len);
+        view.embed_block_indptr = pie_native::slice_from_u32(launch.embed_block_indptr.ptr, launch.embed_block_indptr.len);
         return view;
     }
 };
@@ -242,6 +250,10 @@ class Context::Impl {
     Impl() = default;
     ~Impl() {
         drain_async_streams();
+        if (media_stream_ != nullptr) {
+            cudaStreamDestroy(media_stream_);
+            media_stream_ = nullptr;
+        }
         try {
             if (tp_comm_ != nullptr && tp_size_ > 1 && tp_rank_ == 0) {
                 pie_cuda_driver::tp_send_shutdown(*tp_comm_, tp_cpu_gate_key_);
@@ -276,6 +288,7 @@ class Context::Impl {
                          PieChannelEndpointBinding* binding);
     int bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding);
     int launch(const PieLaunchDesc& launch, PieCompletion completion);
+    int encode(const PieEncodeDesc& encode, PieCompletion completion);
     int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion);
     int copy_state(const PieStateCopyDesc& copy, PieCompletion completion);
     int resize_pool(const PiePoolResizeDesc& resize, PieCompletion completion);
@@ -362,6 +375,7 @@ class Context::Impl {
             cudaStream_t stream = swap_pool_->stream();
             if (stream != nullptr) cudaStreamSynchronize(stream);
         }
+        if (media_stream_ != nullptr) cudaStreamSynchronize(media_stream_);
     }
 
     bool is_tp_follower() const noexcept {
@@ -373,6 +387,8 @@ class Context::Impl {
     std::vector<OwnedValue> owners_;
     pie_cuda_driver::BatchEngine* executor_ = nullptr;
     pie_cuda_driver::pipeline::Registry* registry_ = nullptr;
+    pie_cuda_driver::model::IModel* model_ = nullptr;
+    pie_cuda_driver::model::VisRawWeights* encode_vision_ = nullptr;
     pie_cuda_driver::KvCache* kv_cache_ = nullptr;
     pie_cuda_driver::SwapPool* swap_pool_ = nullptr;
     pie_cuda_driver::NcclComm* tp_comm_ = nullptr;
@@ -383,6 +399,8 @@ class Context::Impl {
     int device_ordinal_ = 0;
     int tp_size_ = 1;
     int tp_rank_ = 0;
+    int media_hidden_size_ = 0;
+    cudaStream_t media_stream_ = nullptr;
     pie_cuda_driver::abi::MultimodalLimits multimodal_limits_;
     std::atomic<bool> tp_follower_stop_{false};
     std::thread tp_follower_thread_;
@@ -489,6 +507,7 @@ int Context::Impl::load_model(
     auto* engine_p = own_value(LoadedModel::load(
         cfg, tp_comm_, load_plan_bytes, load.compiler_version));
     auto& engine = *engine_p;
+    media_hidden_size_ = engine.hf_config().hidden_size;
 
     // THE arch table decides support: an unrecognized `model_type` is a
     // load error here, never a silent llama-like fallback (cpp-refact.md
@@ -511,6 +530,57 @@ int Context::Impl::load_model(
         }
     }
     const model::Family family = arch_entry->family;
+
+    if (load.component == PIE_MODEL_COMPONENT_ENCODE) {
+        if (tp_size_ > 1 || family != model::Family::Gemma4 ||
+            !engine.hf_config().gemma_vision.has_value()) {
+            return PIE_STATUS_UNSUPPORTED;
+        }
+        auto vision = model::bind_gemma4_vision(engine);
+        encode_vision_ = own_value(model::to_vis_raw(vision));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&media_stream_, cudaStreamNonBlocking));
+        multimodal_limits_.gemma4_pool_kernel = encode_vision_->pool_kernel;
+        multimodal_limits_.gemma4_position_table =
+            encode_vision_->pos_table_size;
+
+        const auto c = engine.capabilities();
+        nlohmann::json caps = {
+            {"abi_version", PIE_DRIVER_ABI_VERSION},
+            {"total_pages", 0},
+            {"kv_page_size", 0},
+            {"swap_pool_size", 0},
+            {"kv_copy_domain_mask", 0},
+            {"rs_cache_required", false},
+            {"rs_cache_slots", 0},
+            {"rs_cache_slot_bytes", 0},
+            {"has_mtp_logits", false},
+            {"has_mtp_drafts", false},
+            {"has_value_head", false},
+            {"max_forward_tokens",
+             static_cast<std::uint32_t>(std::max(1, c.max_model_len))},
+            {"max_forward_requests", 256},
+            {"max_page_refs", 0},
+            {"arch_name", c.arch_name},
+            {"vocab_size", c.vocab_size},
+            {"max_model_len", c.max_model_len},
+            {"activation_dtype", c.activation_dtype},
+            {"hidden_size",
+             static_cast<std::uint32_t>(encode_vision_->text_hidden)},
+            {"supports_media_encode", true},
+            {"snapshot_dir", c.snapshot_dir},
+            {"kv_handle", nullptr},
+        };
+        caps_json_ = caps.dump();
+        if (caps_out != nullptr) {
+            caps_out->json_bytes =
+                reinterpret_cast<const std::uint8_t*>(caps_json_.data());
+            caps_out->json_len = caps_json_.size();
+        }
+        return PIE_STATUS_OK;
+    }
+    if (load.component != PIE_MODEL_COMPONENT_FULL) {
+        return PIE_STATUS_UNSUPPORTED;
+    }
 
     // Bind the checkpoint's weights into a family-owned `ModelPlan`. The
     // plan stays alive (as a local `unique_ptr`) until `create_model`
@@ -1006,7 +1076,8 @@ int Context::Impl::load_model(
 
     auto* model_holder =
         own_value(arch_entry->create_model(std::move(plan), resources));
-    forward_fn.attach_model(model_holder->get());
+    model_ = model_holder->get();
+    forward_fn.attach_model(model_);
 
     // The pipeline registry (program/instance/channel ownership + the single
     // `Dispatch` instance) is constructed once, here, ahead of the batch
@@ -1107,6 +1178,52 @@ int Context::Impl::load_model(
               static_cast<std::uint64_t>(mem_plan.capacity.max_forward_requests),
               rs_cache_slots)
         : static_cast<std::uint64_t>(mem_plan.capacity.max_forward_requests);
+    nlohmann::json kv_regions = nlohmann::json::array();
+    nlohmann::json kv_region_page_bytes = nlohmann::json::array();
+    std::unordered_set<std::uintptr_t> exported_kv_buffers;
+    for (int layer = 0; layer < kv_cache.num_layers(); ++layer) {
+        for (const auto& buffer : kv_cache.page_buffers(layer)) {
+            const auto base = reinterpret_cast<std::uintptr_t>(buffer.data);
+            if (base == 0 || buffer.page_bytes == 0 ||
+                !exported_kv_buffers.insert(base).second) {
+                continue;
+            }
+            kv_regions.push_back({
+                {"base", static_cast<std::uint64_t>(base)},
+                {"len", static_cast<std::uint64_t>(buffer.page_bytes) *
+                            static_cast<std::uint64_t>(kv_cache.num_pages())},
+                {"page_stride", static_cast<std::uint64_t>(buffer.page_bytes)},
+                {"domain", {{"CudaDevice", device_ordinal_}}},
+            });
+            kv_region_page_bytes.push_back(
+                static_cast<std::uint64_t>(buffer.page_bytes));
+        }
+    }
+    nlohmann::json kv_handle = {
+        {"regions", std::move(kv_regions)},
+        {"layout",
+         {
+             {"num_layers", static_cast<std::uint32_t>(kv_cache.num_layers())},
+             {"num_kv_heads", static_cast<std::uint32_t>(kv_cache.num_kv_heads())},
+             {"head_dim", static_cast<std::uint32_t>(kv_cache.head_dim())},
+             {"page_size", static_cast<std::uint32_t>(kv_cache.page_size())},
+             {"dtype", kv_cache.format().is_native_bf16() ? "Bf16" : "I8"},
+             {"kind", "KvSeparate"},
+             {"storage_format",
+              kv_cache.format().name + ":" +
+                  std::to_string(static_cast<int>(kv_cache.format().scheme)) + ":" +
+                  std::to_string(static_cast<int>(kv_cache.format().scale_layout)) + ":" +
+                  std::to_string(static_cast<int>(kv_cache.format().storage_dtype)) + ":" +
+                  std::to_string(kv_cache.format().block_size) + ":" +
+                  (kv_cache.hnd_layout() ? "hnd" : "nhd")},
+             {"region_page_bytes", std::move(kv_region_page_bytes)},
+         }},
+    };
+    if (family == model::Family::Kimi || family == model::Family::Glm5) {
+        // These families decode from MlaCache (and GLM5 also DsaCache);
+        // kv_cache is only a 1x1 compatibility placeholder.
+        kv_handle = nullptr;
+    }
     nlohmann::json caps = {
         {"abi_version", PIE_DRIVER_ABI_VERSION},
         {"total_pages", c.total_pages},
@@ -1126,7 +1243,10 @@ int Context::Impl::load_model(
         {"vocab_size", c.vocab_size},
         {"max_model_len", c.max_model_len},
         {"activation_dtype", c.activation_dtype},
+        {"hidden_size", static_cast<std::uint32_t>(engine.hf_config().hidden_size)},
+        {"supports_media_encode", model_->capabilities().supports_media_encode},
         {"snapshot_dir", c.snapshot_dir},
+        {"kv_handle", std::move(kv_handle)},
     };
     caps_json_ = caps.dump();
     if (caps_out != nullptr) {
@@ -1174,6 +1294,11 @@ int Context::Impl::bind_instance(const PieInstanceDesc& instance, PieInstanceBin
 
 int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion) {
     if (executor_ == nullptr) return PIE_STATUS_CLOSED;
+    if (launch.embed_rows.len > 0 &&
+        (model_ == nullptr ||
+         !model_->capabilities().supports_media_encode)) {
+        return PIE_STATUS_UNSUPPORTED;
+    }
     if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
     std::vector<pie_cuda_driver::pipeline::InstanceRecord> launch_instances;
     const int resolve_status =
@@ -1250,6 +1375,54 @@ int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion)
                 runtime_.ctx, completion.wait_id, completion.target_epoch);
         }
         return PIE_STATUS_OK;
+    }
+}
+
+int Context::Impl::encode(const PieEncodeDesc& encode, PieCompletion completion) {
+    if (model_ == nullptr && encode_vision_ == nullptr) return PIE_STATUS_CLOSED;
+    if (tp_size_ > 1) return PIE_STATUS_UNSUPPORTED;
+    if (encode_vision_ == nullptr &&
+        !model_->capabilities().supports_media_encode) {
+        return PIE_STATUS_UNSUPPORTED;
+    }
+    const int resource_status = pie_cuda_driver::abi::validate_encode_resources(
+        encode, multimodal_limits_, media_hidden_size_);
+    if (resource_status != PIE_STATUS_OK) return resource_status;
+    collect_ready_async_resources();
+    try {
+        pie_cuda_driver::model::MediaEncodeInputs in;
+        in.image_pixels_h =
+            reinterpret_cast<const float*>(encode.image_pixels.ptr);
+        in.image_pixel_byte_indptr_h = encode.image_pixel_indptr.ptr;
+        in.image_patch_positions_h = encode.image_patch_positions.ptr;
+        in.image_anchor_rows_h = encode.image_anchor_rows.ptr;
+        in.num_images = static_cast<int>(encode.image_anchor_rows.len);
+        in.output_rows_h =
+            reinterpret_cast<std::uint16_t*>(encode.output_rows.ptr);
+        in.output_bytes = encode.output_rows.len;
+        in.output_row_indptr_h = encode.output_row_indptr.ptr;
+        cudaStream_t stream = media_stream_ != nullptr
+            ? media_stream_
+            : executor_->cublas.stream();
+        if (encode_vision_ != nullptr) {
+            pie_cuda_driver::model::Gemma4VisionInputs vision;
+            vision.weights = encode_vision_;
+            vision.pixels_h = in.image_pixels_h;
+            vision.pixel_byte_indptr_h = in.image_pixel_byte_indptr_h;
+            vision.patch_positions_h = in.image_patch_positions_h;
+            vision.anchor_rows_h = in.image_anchor_rows_h;
+            vision.num_images = in.num_images;
+            pie_cuda_driver::model::encode_gemma4_vision(
+                vision, in.output_rows_h, in.output_bytes,
+                in.output_row_indptr_h, stream);
+        } else if (!model_->encode_media(in, stream)) {
+            return PIE_STATUS_UNSUPPORTED;
+        }
+        enqueue_completion(stream, completion);
+        return PIE_STATUS_OK;
+    } catch (const std::exception& e) {
+        std::cerr << "[pie-driver-cuda] encode: " << e.what() << "\n";
+        return PIE_STATUS_DRIVER_ERROR;
     }
 }
 
@@ -1429,6 +1602,10 @@ int Context::bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* 
 
 int Context::launch(const PieLaunchDesc& launch, PieCompletion completion) {
     return impl_->launch(launch, completion);
+}
+
+int Context::encode(const PieEncodeDesc& encode, PieCompletion completion) {
+    return impl_->encode(encode, completion);
 }
 
 int Context::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {

@@ -12,11 +12,15 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Current direct local ABI version.
 ///
-/// v4: driver creation reports device facts only; model loading is a separate,
-/// blocking `*_load_model` call carrying mandatory LoadPlan bytes.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 4;
+/// v5: standalone media encoding and precomputed embedding injection.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 5;
+pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
+pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
+pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
 
 /// Success.
 pub const PIE_STATUS_OK: i32 = 0;
@@ -96,6 +100,13 @@ pub struct PieBytes {
     pub len: usize,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieMutBytes {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
 /// Borrowed immutable `u8` slice.
 ///
 /// `ptr` may be null only when `len == 0`.
@@ -113,6 +124,13 @@ pub struct PieU8Slice {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PieU32Slice {
     pub ptr: *const u32,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieU32MutSlice {
+    pub ptr: *mut u32,
     pub len: usize,
 }
 
@@ -143,7 +161,7 @@ pub const PIE_TERMINAL_OUTCOME_RETRY: PieTerminalOutcome = 3;
 /// The `outcome` word is published with release semantics by the driver and
 /// read with acquire semantics by the runtime.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PieTerminalCell {
     pub outcome: PieTerminalOutcome,
     /// Must be zero in ABI v1.
@@ -257,7 +275,7 @@ pub struct PieMaskWordsDesc {
 
 /// A single KV cell move expressed in physical page/token coordinates.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PieKvMoveCell {
     pub dst_page_id: u32,
     pub dst_token_offset: u32,
@@ -277,7 +295,7 @@ pub struct PieKvMoveCellSlice {
 
 /// One recurrent-state slot copy range.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PieStateCopyRange {
     pub src_slot_id: u32,
     pub dst_slot_id: u32,
@@ -298,7 +316,7 @@ pub struct PieStateCopyRangeSlice {
 
 /// One sparse pool page range to map or unmap.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PiePoolRange {
     pub page_index: u64,
     pub page_count: u64,
@@ -387,8 +405,8 @@ pub struct PieDriverCaps {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieModelLoadDesc {
     pub abi_version: u32,
-    /// Must be zero.
-    pub reserved0: u32,
+    /// One of `PIE_MODEL_COMPONENT_*`.
+    pub component: u32,
     /// Compiler source hash expected by this runtime.
     pub compiler_version: u64,
     /// Serialized, versioned LoadPlan. Empty plans are invalid.
@@ -401,7 +419,7 @@ impl Default for PieModelLoadDesc {
     fn default() -> Self {
         Self {
             abi_version: PIE_DRIVER_ABI_VERSION,
-            reserved0: 0,
+            component: PIE_MODEL_COMPONENT_FULL,
             compiler_version: 0,
             load_plan_bytes: PieBytes::default(),
             snapshot_dir: PieBytes::default(),
@@ -519,6 +537,12 @@ pub struct PieLaunchDesc {
     pub audio_feature_indptr: PieU32Slice,
     pub audio_anchor_rows: PieU32Slice,
     pub audio_indptr: PieU32Slice,
+    pub embed_rows: PieBytes,
+    pub embed_indptr: PieU32Slice,
+    pub embed_shapes: PieU32Slice,
+    pub embed_dtypes: PieU8Slice,
+    pub embed_anchor_rows: PieU32Slice,
+    pub embed_block_indptr: PieU32Slice,
     pub kv_len: PieU32Slice,
     pub kv_len_device: PieU64Slice,
     /// Per-instance WorkingSet page translation, flattened across the batch:
@@ -587,6 +611,12 @@ impl Default for PieLaunchDesc {
             audio_feature_indptr: PieU32Slice::default(),
             audio_anchor_rows: PieU32Slice::default(),
             audio_indptr: PieU32Slice::default(),
+            embed_rows: PieBytes::default(),
+            embed_indptr: PieU32Slice::default(),
+            embed_shapes: PieU32Slice::default(),
+            embed_dtypes: PieU8Slice::default(),
+            embed_anchor_rows: PieU32Slice::default(),
+            embed_block_indptr: PieU32Slice::default(),
             kv_len: PieU32Slice::default(),
             kv_len_device: PieU64Slice::default(),
             kv_translation: PieU32Slice::default(),
@@ -596,6 +626,36 @@ impl Default for PieLaunchDesc {
             channel_expected_head: PieU64Slice::default(),
             channel_expected_tail: PieU64Slice::default(),
             channel_ticket_indptr: PieU32Slice::default(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieEncodeDesc {
+    pub abi_version: u32,
+    pub reserved0: u32,
+    pub image_grids: PieU32Slice,
+    pub image_pixels: PieBytes,
+    pub image_pixel_indptr: PieU32Slice,
+    pub image_patch_positions: PieU32Slice,
+    pub image_anchor_rows: PieU32Slice,
+    pub output_rows: PieMutBytes,
+    pub output_row_indptr: PieU32MutSlice,
+}
+
+impl Default for PieEncodeDesc {
+    fn default() -> Self {
+        Self {
+            abi_version: PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            image_grids: PieU32Slice::default(),
+            image_pixels: PieBytes::default(),
+            image_pixel_indptr: PieU32Slice::default(),
+            image_patch_positions: PieU32Slice::default(),
+            image_anchor_rows: PieU32Slice::default(),
+            output_rows: PieMutBytes::default(),
+            output_row_indptr: PieU32MutSlice::default(),
         }
     }
 }
@@ -812,6 +872,10 @@ fn validate_bytes(bytes: PieBytes, name: &'static str) -> PieAbiValidationResult
     validate_slice_ptr(bytes.ptr, bytes.len, name)
 }
 
+fn validate_mut_bytes(bytes: PieMutBytes, name: &'static str) -> PieAbiValidationResult {
+    validate_slice_ptr(bytes.ptr.cast_const(), bytes.len, name)
+}
+
 fn validate_terminal_cell_ptr(
     ptr: *mut PieTerminalCell,
     name: &'static str,
@@ -831,6 +895,10 @@ fn validate_u8_slice(slice: PieU8Slice, name: &'static str) -> PieAbiValidationR
 
 fn validate_u32_slice(slice: PieU32Slice, name: &'static str) -> PieAbiValidationResult {
     validate_slice_ptr(slice.ptr, slice.len, name)
+}
+
+fn validate_u32_mut_slice(slice: PieU32MutSlice, name: &'static str) -> PieAbiValidationResult {
+    validate_slice_ptr(slice.ptr.cast_const(), slice.len, name)
 }
 
 fn validate_u64_slice(slice: PieU64Slice, name: &'static str) -> PieAbiValidationResult {
@@ -999,7 +1067,9 @@ pub fn validate_driver_create_desc(desc: &PieDriverCreateDesc) -> PieAbiValidati
 /// Validates a model-load descriptor.
 pub fn validate_model_load_desc(desc: &PieModelLoadDesc) -> PieAbiValidationResult {
     validate_pie_abi_version(desc.abi_version)?;
-    validate_reserved_zero("model load reserved0 must be zero", desc.reserved0)?;
+    if desc.component > PIE_MODEL_COMPONENT_ENCODE {
+        return Err(invalid_argument("model load component is invalid"));
+    }
     validate_bytes(
         desc.load_plan_bytes,
         "model load load_plan_bytes ptr/len mismatch",
@@ -1252,6 +1322,18 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
         desc.audio_anchor_rows,
         "launch audio_anchor_rows ptr/len mismatch",
     )?;
+    validate_bytes(desc.embed_rows, "launch embed_rows ptr/len mismatch")?;
+    validate_u32_slice(desc.embed_indptr, "launch embed_indptr ptr/len mismatch")?;
+    validate_u32_slice(desc.embed_shapes, "launch embed_shapes ptr/len mismatch")?;
+    validate_u8_slice(desc.embed_dtypes, "launch embed_dtypes ptr/len mismatch")?;
+    validate_u32_slice(
+        desc.embed_anchor_rows,
+        "launch embed_anchor_rows ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.embed_block_indptr,
+        "launch embed_block_indptr ptr/len mismatch",
+    )?;
     validate_u32_slice(desc.kv_len, "launch kv_len ptr/len mismatch")?;
     validate_u64_slice(desc.kv_len_device, "launch kv_len_device ptr/len mismatch")?;
     validate_u32_slice(
@@ -1368,6 +1450,20 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             true,
         )?;
         validate_csr(
+            desc.embed_block_indptr,
+            "launch embed_block_indptr malformed",
+            desc.embed_dtypes.len,
+            wire_row_count,
+            true,
+        )?;
+        validate_csr(
+            desc.embed_indptr,
+            "launch embed_indptr malformed",
+            desc.embed_rows.len,
+            desc.embed_dtypes.len,
+            true,
+        )?;
+        validate_csr(
             desc.kv_translation_indptr,
             "launch kv_translation_indptr malformed",
             desc.kv_translation.len,
@@ -1381,6 +1477,22 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             request_count,
             true,
         )?;
+    }
+    if desc.embed_shapes.len != desc.embed_dtypes.len.saturating_mul(2)
+        || desc.embed_anchor_rows.len != desc.embed_dtypes.len
+    {
+        return Err(invalid_argument(
+            "launch embedding shapes/dtypes/anchors must describe the same blocks",
+        ));
+    }
+    if desc.embed_dtypes.len != 0 {
+        let dtypes =
+            unsafe { std::slice::from_raw_parts(desc.embed_dtypes.ptr, desc.embed_dtypes.len) };
+        if dtypes.iter().any(|dtype| *dtype != 2) {
+            return Err(invalid_argument(
+                "launch precomputed embeddings currently require bf16 dtype tag 2",
+            ));
+        }
     }
     if desc.channel_expected_head.len != desc.channel_expected_tail.len {
         return Err(invalid_argument(
@@ -1550,6 +1662,67 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
     Ok(())
 }
 
+/// # Safety
+/// All descriptor pointers must remain readable/writable for the declared lengths.
+pub unsafe fn validate_encode_desc(desc: &PieEncodeDesc) -> PieAbiValidationResult {
+    validate_pie_abi_version(desc.abi_version)?;
+    validate_reserved_zero("encode reserved0 must be zero", desc.reserved0)?;
+    validate_u32_slice(desc.image_grids, "encode image_grids ptr/len mismatch")?;
+    validate_bytes(desc.image_pixels, "encode image_pixels ptr/len mismatch")?;
+    validate_u32_slice(
+        desc.image_pixel_indptr,
+        "encode image_pixel_indptr ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.image_patch_positions,
+        "encode image_patch_positions ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.image_anchor_rows,
+        "encode image_anchor_rows ptr/len mismatch",
+    )?;
+    validate_mut_bytes(desc.output_rows, "encode output_rows ptr/len mismatch")?;
+    validate_u32_mut_slice(
+        desc.output_row_indptr,
+        "encode output_row_indptr ptr/len mismatch",
+    )?;
+    let images = desc.image_anchor_rows.len;
+    if images == 0
+        || desc.image_grids.len != images.saturating_mul(3)
+        || desc.image_pixel_indptr.len != images + 1
+        || desc.output_row_indptr.len != images + 1
+        || desc.image_pixels.len == 0
+        || desc.image_pixels.len % std::mem::size_of::<f32>() != 0
+        || desc.image_patch_positions.len == 0
+        || desc.image_patch_positions.len % 2 != 0
+        || desc.output_rows.len == 0
+        || desc.output_rows.len % std::mem::size_of::<u16>() != 0
+    {
+        return Err(invalid_argument(
+            "encode media descriptor shapes are inconsistent",
+        ));
+    }
+    let pixel_indptr = unsafe {
+        as_u32_slice(
+            desc.image_pixel_indptr,
+            "encode image_pixel_indptr ptr/len mismatch",
+        )?
+    };
+    if pixel_indptr.first().copied() != Some(0)
+        || pixel_indptr.last().copied() != Some(desc.image_pixels.len as u32)
+        || !pixel_indptr.windows(2).all(|window| {
+            window[0] <= window[1]
+                && window[0] % std::mem::size_of::<f32>() as u32 == 0
+                && window[1] % std::mem::size_of::<f32>() as u32 == 0
+        })
+    {
+        return Err(invalid_argument(
+            "encode image_pixel_indptr must exactly partition aligned pixels",
+        ));
+    }
+    Ok(())
+}
+
 /// Validates a KV copy descriptor.
 pub fn validate_kv_copy_desc(desc: &PieKvCopyDesc) -> PieAbiValidationResult {
     validate_pie_abi_version(desc.abi_version)?;
@@ -1624,6 +1797,11 @@ unsafe extern "C" {
         launch: *const PieLaunchDesc,
         completion: PieCompletion,
     ) -> i32;
+    pub fn pie_cuda_encode(
+        driver: *mut PieDriver,
+        encode: *const PieEncodeDesc,
+        completion: PieCompletion,
+    ) -> i32;
     pub fn pie_cuda_copy_kv(
         driver: *mut PieDriver,
         copy: *const PieKvCopyDesc,
@@ -1672,6 +1850,11 @@ unsafe extern "C" {
     pub fn pie_metal_launch(
         driver: *mut PieDriver,
         launch: *const PieLaunchDesc,
+        completion: PieCompletion,
+    ) -> i32;
+    pub fn pie_metal_encode(
+        driver: *mut PieDriver,
+        encode: *const PieEncodeDesc,
         completion: PieCompletion,
     ) -> i32;
     pub fn pie_metal_copy_kv(
@@ -1770,6 +1953,7 @@ mod tests {
             PIE_DRIVER_ABI_VERSION
         );
         assert_eq!(PieLaunchDesc::default().abi_version, PIE_DRIVER_ABI_VERSION);
+        assert_eq!(PieEncodeDesc::default().abi_version, PIE_DRIVER_ABI_VERSION);
         assert_eq!(PieKvCopyDesc::default().abi_version, PIE_DRIVER_ABI_VERSION);
         assert_eq!(
             PieStateCopyDesc::default().abi_version,
@@ -1781,10 +1965,14 @@ mod tests {
         );
         assert_eq!(PieRuntimeCallbacks::default().reserved0, 0);
         assert_eq!(PieDriverCreateDesc::default().reserved0, 0);
-        assert_eq!(PieModelLoadDesc::default().reserved0, 0);
+        assert_eq!(
+            PieModelLoadDesc::default().component,
+            PIE_MODEL_COMPONENT_FULL
+        );
         assert_eq!(PieProgramDesc::default().reserved0, 0);
         assert_eq!(PieInstanceDesc::default().reserved0, 0);
         assert_eq!(PieLaunchDesc::default().reserved0, 0);
+        assert_eq!(PieEncodeDesc::default().reserved0, 0);
         assert_eq!(PieLaunchDesc::default().reserved_flags, [0; 6]);
         assert_eq!(PieKvCopyDesc::default().reserved0, 0);
         assert_eq!(PieStateCopyDesc::default().reserved0, 0);
@@ -1817,6 +2005,63 @@ mod tests {
     fn completion_layout_is_stable() {
         assert_eq!(std::mem::size_of::<PieCompletion>(), 24);
         assert_eq!(std::mem::align_of::<PieCompletion>(), 8);
+    }
+
+    #[test]
+    fn encode_layout_and_validation_are_stable() {
+        assert_eq!(std::mem::size_of::<PieEncodeDesc>(), 120);
+        assert_eq!(std::mem::align_of::<PieEncodeDesc>(), 8);
+
+        let grids = [1u32, 1, 1];
+        let pixels = [0u8; 4];
+        let pixel_indptr = [0u32, 4];
+        let patch_positions = [0u32, 0];
+        let anchors = [0u32];
+        let mut output = [0u8; 2];
+        let mut output_indptr = [0u32; 2];
+        let desc = PieEncodeDesc {
+            abi_version: PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            image_grids: PieU32Slice {
+                ptr: grids.as_ptr(),
+                len: grids.len(),
+            },
+            image_pixels: PieBytes {
+                ptr: pixels.as_ptr(),
+                len: pixels.len(),
+            },
+            image_pixel_indptr: PieU32Slice {
+                ptr: pixel_indptr.as_ptr(),
+                len: pixel_indptr.len(),
+            },
+            image_patch_positions: PieU32Slice {
+                ptr: patch_positions.as_ptr(),
+                len: patch_positions.len(),
+            },
+            image_anchor_rows: PieU32Slice {
+                ptr: anchors.as_ptr(),
+                len: anchors.len(),
+            },
+            output_rows: PieMutBytes {
+                ptr: output.as_mut_ptr(),
+                len: output.len(),
+            },
+            output_row_indptr: PieU32MutSlice {
+                ptr: output_indptr.as_mut_ptr(),
+                len: output_indptr.len(),
+            },
+        };
+        unsafe { validate_encode_desc(&desc) }.unwrap();
+
+        let bad_indptr = [0u32, 3];
+        let malformed = PieEncodeDesc {
+            image_pixel_indptr: PieU32Slice {
+                ptr: bad_indptr.as_ptr(),
+                len: 2,
+            },
+            ..desc
+        };
+        assert!(unsafe { validate_encode_desc(&malformed) }.is_err());
     }
 
     #[test]
@@ -2054,6 +2299,8 @@ mod tests {
         };
         desc.compiler_version = 1;
         validate_model_load_desc(&desc).unwrap();
+        desc.component = PIE_MODEL_COMPONENT_ENCODE + 1;
+        assert!(validate_model_load_desc(&desc).is_err());
     }
 
     #[test]
@@ -2417,6 +2664,7 @@ mod tests {
         let terminal_cell = header_block(&header, "PieTerminalCell");
         let terminal_cell_ptr_slice = header_block(&header, "PieTerminalCellPtrSlice");
         let launch = header_block(&header, "PieLaunchDesc");
+        let encode = header_block(&header, "PieEncodeDesc");
         let completion = header_block(&header, "PieCompletion");
         let kv_copy = header_block(&header, "PieKvCopyDesc");
         let state_copy = header_block(&header, "PieStateCopyDesc");
@@ -2441,9 +2689,14 @@ mod tests {
         assert!(load.contains("struct PieBytes load_plan_bytes;"));
         assert!(load.contains("struct PieBytes snapshot_dir;"));
         assert!(load.contains("uint64_t compiler_version;"));
+        assert!(load.contains("uint32_t component;"));
         assert!(program.contains("uint64_t program_hash;"));
         assert!(program.contains("uint32_t reserved0;"));
         assert!(instance.contains("struct PieU64Slice channel_ids;"));
+        assert!(launch.contains("struct PieBytes embed_rows;"));
+        assert!(launch.contains("struct PieU32Slice embed_indptr;"));
+        assert!(encode.contains("struct PieMutBytes output_rows;"));
+        assert!(encode.contains("struct PieU32MutSlice output_row_indptr;"));
         assert!(!program.contains("channel_ids"));
         assert!(binding.contains("uint64_t instance_id;"));
         assert!(!header.contains("typedef struct PieChannelBinding"));

@@ -168,7 +168,8 @@ inline int validate_model_load_desc(const PieModelLoadDesc* desc,
     if (desc == nullptr || caps == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     int status = validate_version(desc->abi_version);
     if (status != PIE_STATUS_OK) return status;
-    if (desc->reserved0 != 0 || desc->compiler_version == 0) {
+    if (desc->component > PIE_MODEL_COMPONENT_ENCODE ||
+        desc->compiler_version == 0) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     status = validate_bytes(desc->load_plan_bytes);
@@ -345,6 +346,11 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     PIE_VALIDATE_SLICE(audio_feature_indptr);
     PIE_VALIDATE_SLICE(audio_anchor_rows);
     PIE_VALIDATE_SLICE(audio_indptr);
+    PIE_VALIDATE_SLICE(embed_indptr);
+    PIE_VALIDATE_SLICE(embed_shapes);
+    PIE_VALIDATE_SLICE(embed_dtypes);
+    PIE_VALIDATE_SLICE(embed_anchor_rows);
+    PIE_VALIDATE_SLICE(embed_block_indptr);
     PIE_VALIDATE_SLICE(kv_len);
     PIE_VALIDATE_SLICE(kv_len_device);
     PIE_VALIDATE_SLICE(kv_translation);
@@ -359,6 +365,8 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     status = validate_bytes(desc->image_pixels);
     if (status != PIE_STATUS_OK) return status;
     status = validate_bytes(desc->audio_features);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_bytes(desc->embed_rows);
     if (status != PIE_STATUS_OK) return status;
     const std::size_t instance_count = desc->instance_ids.len;
     const std::size_t wire_row_count =
@@ -399,6 +407,12 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
              desc->audio_feature_indptr.len,
              desc->audio_anchor_rows.len,
              desc->audio_indptr.len,
+             desc->embed_rows.len,
+             desc->embed_indptr.len,
+             desc->embed_shapes.len,
+             desc->embed_dtypes.len,
+             desc->embed_anchor_rows.len,
+             desc->embed_block_indptr.len,
              desc->kv_len.len,
              desc->kv_len_device.len,
             desc->kv_translation.len,
@@ -421,6 +435,19 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
         desc->channel_expected_head.len != desc->channel_expected_tail.len) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
+    if (desc->embed_shapes.len != 2 * desc->embed_dtypes.len ||
+        desc->embed_anchor_rows.len != desc->embed_dtypes.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t i = 0; i < desc->embed_dtypes.len; ++i) {
+        if (desc->embed_dtypes.ptr[i] != 2) return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = validate_csr(
+        desc->embed_indptr, desc->embed_rows.len, desc->embed_dtypes.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_csr(
+        desc->embed_block_indptr, desc->embed_dtypes.len, wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
     status = validate_csr(
         desc->kv_translation_indptr,
         desc->kv_translation.len,
@@ -437,6 +464,7 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
             desc->channel_expected_head.len) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
+
     if (desc->ptir_program_row_indptr.len != 0) {
         status = validate_csr(
             desc->ptir_program_row_indptr,
@@ -603,6 +631,57 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
         desc->audio_features.len,
         audio_count);
     if (status != PIE_STATUS_OK) return status;
+    return PIE_STATUS_OK;
+}
+
+inline int validate_encode_desc(const PieEncodeDesc* desc) noexcept {
+    if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = validate_version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0) return PIE_STATUS_INVALID_ARGUMENT;
+    status = validate_slice(desc->image_grids.ptr, desc->image_grids.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_bytes(desc->image_pixels);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_slice(
+        desc->image_pixel_indptr.ptr, desc->image_pixel_indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_slice(
+        desc->image_patch_positions.ptr, desc->image_patch_positions.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_slice(
+        desc->image_anchor_rows.ptr, desc->image_anchor_rows.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_slice(desc->output_rows.ptr, desc->output_rows.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = validate_slice(
+        desc->output_row_indptr.ptr, desc->output_row_indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    const std::size_t images = desc->image_anchor_rows.len;
+    if (images == 0 ||
+        desc->image_grids.len != images * 3 ||
+        desc->image_pixel_indptr.len != images + 1 ||
+        desc->output_row_indptr.len != images + 1 ||
+        desc->image_pixels.len == 0 ||
+        desc->image_pixels.len % sizeof(float) != 0 ||
+        desc->image_patch_positions.len == 0 ||
+        desc->image_patch_positions.len % 2 != 0 ||
+        desc->output_rows.len == 0 ||
+        desc->output_rows.len % sizeof(std::uint16_t) != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (desc->image_pixel_indptr.ptr[0] != 0 ||
+        desc->image_pixel_indptr.ptr[images] != desc->image_pixels.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t image = 0; image < images; ++image) {
+        const std::uint32_t begin = desc->image_pixel_indptr.ptr[image];
+        const std::uint32_t end = desc->image_pixel_indptr.ptr[image + 1];
+        if (begin > end || begin % sizeof(float) != 0 ||
+            end % sizeof(float) != 0) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
     return PIE_STATUS_OK;
 }
 

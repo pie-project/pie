@@ -117,6 +117,13 @@ struct LaunchView {
     Slice<std::uint32_t> audio_feature_indptr;
     Slice<std::uint32_t> audio_anchor_rows;
 
+    Slice<std::uint8_t> embed_rows;
+    Slice<std::uint32_t> embed_indptr;
+    Slice<std::uint32_t> embed_shapes;
+    Slice<std::uint8_t> embed_dtypes;
+    Slice<std::uint32_t> embed_anchor_rows;
+    Slice<std::uint32_t> embed_block_indptr;
+
     constexpr std::size_t num_images() const noexcept { return image_grids.size() / 3; }
     constexpr std::size_t num_clips() const noexcept { return audio_anchor_rows.size(); }
     constexpr std::size_t size() const noexcept { return token_ids.size(); }

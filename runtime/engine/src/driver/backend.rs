@@ -12,16 +12,19 @@ mod cuda;
 mod dummy;
 #[cfg(feature = "driver-metal")]
 mod metal;
+mod remote;
 
 #[cfg(feature = "driver-cuda")]
 pub use cuda::CudaDriver;
 pub use dummy::DummyDriver;
 #[cfg(feature = "driver-metal")]
 pub use metal::MetalDriver;
+pub use remote::{RemoteDisconnectHandle, RemoteDriver};
 
 use crate::driver::channel::RegisteredChannel;
 use crate::driver::command::{
-    ChannelRegistrationPlan, KvCopyPlan, PoolResizePlan, ProgramRegistration, StateCopyPlan,
+    ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
+    StateCopyPlan,
 };
 use crate::driver::completion::SubmissionCompletion;
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
@@ -52,6 +55,7 @@ pub enum DriverBackend {
     Cuda(CudaDriver),
     #[cfg(feature = "driver-metal")]
     Metal(MetalDriver),
+    Remote(RemoteDriver),
 }
 
 impl DriverBackend {
@@ -62,6 +66,7 @@ impl DriverBackend {
             Self::Cuda(_) => "cuda",
             #[cfg(feature = "driver-metal")]
             Self::Metal(_) => "metal",
+            Self::Remote(_) => "remote",
         }
     }
 
@@ -119,6 +124,7 @@ impl DriverBackend {
                 };
                 driver.load_model(desc)
             }
+            Self::Remote(driver) => driver.load_model(descs),
         }
     }
 
@@ -129,6 +135,7 @@ impl DriverBackend {
             Self::Cuda(driver) => driver.register_program(desc),
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.register_program(desc),
+            Self::Remote(driver) => driver.register_program(desc),
         }
     }
 
@@ -142,6 +149,7 @@ impl DriverBackend {
             Self::Cuda(driver) => driver.register_channel(desc),
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.register_channel(desc),
+            Self::Remote(driver) => driver.register_channel(desc),
         }
     }
 
@@ -152,6 +160,7 @@ impl DriverBackend {
             Self::Cuda(driver) => driver.bind_instance(desc),
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.bind_instance(desc),
+            Self::Remote(driver) => driver.bind_instance(desc),
         }
     }
 
@@ -162,6 +171,18 @@ impl DriverBackend {
             Self::Cuda(driver) => driver.launch(desc),
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.launch(desc),
+            Self::Remote(driver) => driver.launch(desc),
+        }
+    }
+
+    pub fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
+        match self {
+            Self::Dummy(driver) => driver.encode(plan),
+            #[cfg(feature = "driver-cuda")]
+            Self::Cuda(driver) => driver.encode(plan),
+            #[cfg(feature = "driver-metal")]
+            Self::Metal(driver) => driver.encode(plan),
+            Self::Remote(driver) => driver.encode(plan),
         }
     }
 
@@ -172,6 +193,7 @@ impl DriverBackend {
             Self::Cuda(driver) => driver.copy_kv(desc),
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.copy_kv(desc),
+            Self::Remote(driver) => driver.copy_kv(desc),
         }
     }
 
@@ -182,6 +204,7 @@ impl DriverBackend {
             Self::Cuda(driver) => driver.copy_state(desc),
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.copy_state(desc),
+            Self::Remote(driver) => driver.copy_state(desc),
         }
     }
 
@@ -192,6 +215,7 @@ impl DriverBackend {
             Self::Cuda(driver) => driver.resize_pool(desc),
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.resize_pool(desc),
+            Self::Remote(driver) => driver.resize_pool(desc),
         }
     }
 
@@ -202,6 +226,7 @@ impl DriverBackend {
             Self::Cuda(driver) => driver.close_instance(id),
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.close_instance(id),
+            Self::Remote(driver) => driver.close_instance(id),
         }
     }
 
@@ -212,6 +237,24 @@ impl DriverBackend {
             Self::Cuda(driver) => driver.close_channel(id),
             #[cfg(feature = "driver-metal")]
             Self::Metal(driver) => driver.close_channel(id),
+            Self::Remote(driver) => driver.close_channel(id),
+        }
+    }
+
+    pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
+        match self {
+            Self::Dummy(driver) => driver.export_kv_handle(),
+            #[cfg(feature = "driver-cuda")]
+            Self::Cuda(driver) => driver.export_kv_handle(),
+            #[cfg(feature = "driver-metal")]
+            Self::Metal(_) => None,
+            Self::Remote(_) => None,
+        }
+    }
+
+    pub fn disconnect(&self, message: impl Into<String>) {
+        if let Self::Remote(driver) = self {
+            driver.disconnect(message);
         }
     }
 }

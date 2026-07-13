@@ -253,9 +253,15 @@ fn compile_load_plan_bytes(
     runtime_quant: &str,
     mxfp4_moe: &str,
     tp: Option<&TpLaunch>,
+    component: pie_driver_abi::ModelComponent,
 ) -> Result<Vec<u8>> {
-    use pie_load_planner::inproc::{compile_snapshot_to_plan_bytes, parse_model_config};
+    use pie_load_planner::abi::RuntimeAbi;
+    use pie_load_planner::inproc::{
+        compile_snapshot_to_plan_bytes, parse_checkpoint_metadata, parse_model_config,
+        serialize_load_plan,
+    };
     use pie_load_planner::load_plan::StorageTarget;
+    use pie_load_planner::planner::compile_load_plan;
     use pie_load_planner::types::{BackendKind, Mxfp4MoePolicy};
 
     if facts.abi_version != pie_driver_abi::PIE_DRIVER_ABI_VERSION {
@@ -320,8 +326,35 @@ fn compile_load_plan_bytes(
         native_mxfp4_moe: facts.native_mxfp4_moe,
     };
 
-    let bytes = compile_snapshot_to_plan_bytes(snapshot_dir, &model, target)
-        .map_err(|err| anyhow!("load planning failed: {err}"))?;
+    let bytes =
+        if component == pie_driver_abi::ModelComponent::Encode && backend == BackendKind::Cuda {
+            anyhow::ensure!(
+                tp_size == 1,
+                "encode-scoped CUDA loading does not support tensor parallelism"
+            );
+            anyhow::ensure!(
+                matches!(model.model_type.as_str(), "gemma4" | "gemma4_text"),
+                "encode-scoped CUDA loading currently supports Gemma-4, got {}",
+                model.model_type
+            );
+            let metadata = parse_checkpoint_metadata(snapshot_dir)
+                .map_err(|err| anyhow!("load-planner metadata parse failed: {err}"))?;
+            let abi = RuntimeAbi::default_for_target(&metadata, &model, &target)
+                .and_then(|abi| {
+                    abi.retain_outputs(|name| {
+                        name.starts_with("model.vision_tower.")
+                            || name.starts_with("model.embed_vision.")
+                    })
+                })
+                .map_err(|err| anyhow!("encode component ABI planning failed: {err}"))?;
+            let plan = compile_load_plan(&metadata, &model, &abi, target)
+                .map_err(|err| anyhow!("encode load planning failed: {err}"))?;
+            serialize_load_plan(&plan)
+                .map_err(|err| anyhow!("encode load-plan serialization failed: {err}"))?
+        } else {
+            compile_snapshot_to_plan_bytes(snapshot_dir, &model, target)
+                .map_err(|err| anyhow!("load planning failed: {err}"))?
+        };
     tracing::info!(
         "load-planner: compiled LoadPlan in-process ({} bytes); the driver \
          will execute it from the boot call (bulk weights never cross)",
@@ -336,6 +369,7 @@ fn model_load_desc(
     runtime_quant: &str,
     mxfp4_moe: &str,
     tp: Option<&TpLaunch>,
+    component: pie_driver_abi::ModelComponent,
 ) -> Result<pie_driver_abi::ModelLoadDesc> {
     Ok(pie_driver_abi::ModelLoadDesc {
         load_plan_bytes: compile_load_plan_bytes(
@@ -344,9 +378,11 @@ fn model_load_desc(
             runtime_quant,
             mxfp4_moe,
             tp,
+            component,
         )?,
         snapshot_dir: snapshot_dir.to_path_buf(),
         compiler_version: pie_load_planner::load_plan::compiler_version(),
+        component,
     })
 }
 
@@ -516,6 +552,7 @@ pub(crate) fn create_driver_backend_group(
     snapshot_dir: &Path,
     group_id: usize,
     tp_launches: &[TpLaunch],
+    component: pie_driver_abi::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
     validate_snapshot_dir(snapshot_dir)?;
     if rank_options.is_empty() {
@@ -570,6 +607,7 @@ pub(crate) fn create_driver_backend_group(
                 &opts.runtime_quant,
                 &opts.mxfp4_moe,
                 Some(tp),
+                component,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -582,6 +620,7 @@ pub(crate) fn create_driver_backend(
     snapshot_dir: &Path,
     group_id: usize,
     tp: Option<&TpLaunch>,
+    component: pie_driver_abi::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
     let _ = (group_id, tp);
     validate_snapshot_dir(snapshot_dir)?;
@@ -628,7 +667,14 @@ pub(crate) fn create_driver_backend(
             (backend, facts, "", "auto")
         }
     };
-    let desc = model_load_desc(snapshot_dir, &facts, runtime_quant, mxfp4_moe, tp)?;
+    let desc = model_load_desc(
+        snapshot_dir,
+        &facts,
+        runtime_quant,
+        mxfp4_moe,
+        tp,
+        component,
+    )?;
     let caps = backend.load_model(vec![desc])?;
 
     Ok(crate::translate::GroupDriver { caps, backend })
@@ -699,11 +745,137 @@ mod tests {
             &snapshot,
             0,
             None,
+            pie_driver_abi::ModelComponent::Full,
         )
         .unwrap();
         assert_eq!(group.caps.arch_name, "qwen3");
         assert_eq!(group.caps.vocab_size, 32);
         assert_eq!(group.caps.snapshot_dir, snapshot.display().to_string());
+    }
+
+    #[test]
+    #[ignore = "requires PIE_TEST_GEMMA4_SNAPSHOT"]
+    fn gemma4_encode_plan_contains_only_encoder_tensors() {
+        let snapshot = std::env::var_os("PIE_TEST_GEMMA4_SNAPSHOT")
+            .map(PathBuf::from)
+            .expect("set PIE_TEST_GEMMA4_SNAPSHOT");
+        let facts = pie_driver_abi::DeviceFacts {
+            abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
+            backend: "cuda".to_string(),
+            unified_memory: false,
+            fp8_native: true,
+            native_mxfp4_moe: false,
+            storage_alignment: 256,
+            storage_max_tile_bytes: 64 * 1024 * 1024,
+            storage_tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
+            page_size: 0,
+        };
+        let bytes = compile_load_plan_bytes(
+            &snapshot,
+            &facts,
+            "",
+            "auto",
+            None,
+            pie_driver_abi::ModelComponent::Encode,
+        )
+        .unwrap();
+        let plan = pie_load_planner::inproc::deserialize_load_plan(&bytes).unwrap();
+        let finalized = plan
+            .instrs
+            .iter()
+            .filter_map(|instruction| match instruction {
+                pie_load_planner::load_plan::StorageInstr::Finalize { name, .. } => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(finalized.len() > 10);
+        assert!(finalized.iter().all(|name| {
+            name.starts_with("model.vision_tower.") || name.starts_with("model.embed_vision.")
+        }));
+    }
+
+    #[cfg(feature = "driver-cuda")]
+    #[tokio::test]
+    #[ignore = "requires PIE_TEST_GEMMA4_SNAPSHOT and a CUDA GPU"]
+    async fn gemma4_encode_component_loads_and_encodes() {
+        let snapshot = std::env::var_os("PIE_TEST_GEMMA4_SNAPSHOT")
+            .map(PathBuf::from)
+            .expect("set PIE_TEST_GEMMA4_SNAPSHOT");
+        let options = DriverOptions::CudaNative(CudaNativeDriverOptions {
+            device: "cuda:0".to_string(),
+            gpu_mem_utilization: 0.5,
+            verbose: true,
+            ..Default::default()
+        });
+        let mut group = create_driver_backend(
+            &options,
+            &snapshot,
+            0,
+            None,
+            pie_driver_abi::ModelComponent::Encode,
+        )
+        .unwrap();
+        assert!(group.caps.supports_media_encode);
+        assert_eq!(group.caps.total_pages, 0);
+        assert!(group.backend.export_kv_handle().is_none());
+
+        let patch_count = 9usize;
+        let pixel_bytes = patch_count * 3 * 16 * 16 * std::mem::size_of::<f32>();
+        let hidden_size = group.caps.hidden_size;
+        let make_encode = || {
+            let mut patch_positions = Vec::with_capacity(patch_count * 2);
+            for y in 0..3 {
+                for x in 0..3 {
+                    patch_positions.extend([x, y]);
+                }
+            }
+            pie_driver_abi::MediaEncodePlan {
+                image_grids: vec![1, 3, 3],
+                image_pixels: vec![0; pixel_bytes],
+                image_pixel_indptr: vec![0, pixel_bytes as u32],
+                image_patch_positions: patch_positions,
+                image_anchor_rows: vec![0],
+                output_rows: vec![0; hidden_size as usize * 2],
+                output_row_indptr: vec![0; 2],
+            }
+        };
+        let mut encode = make_encode();
+        let completion = group.backend.encode(&mut encode).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(300), completion)
+            .await
+            .expect("encode completion timed out")
+            .unwrap();
+        assert_eq!(encode.output_row_indptr, vec![0, 1]);
+        assert!(encode.output_rows.iter().any(|byte| *byte != 0));
+        let tower_rows = encode.output_rows;
+        drop(group);
+
+        let full_options = DriverOptions::CudaNative(CudaNativeDriverOptions {
+            device: "cuda:0".to_string(),
+            gpu_mem_utilization: 1.0,
+            memory_profile: CudaMemoryProfile::Capacity,
+            total_pages: 1,
+            ..Default::default()
+        });
+        let mut full = create_driver_backend(
+            &full_options,
+            &snapshot,
+            1,
+            None,
+            pie_driver_abi::ModelComponent::Full,
+        )
+        .unwrap();
+        assert!(full.caps.supports_media_encode);
+        let mut inline = make_encode();
+        let completion = full.backend.encode(&mut inline).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(300), completion)
+            .await
+            .expect("full-model encode completion timed out")
+            .unwrap();
+        assert_eq!(inline.output_row_indptr, vec![0, 1]);
+        assert_eq!(inline.output_rows, tower_rows);
     }
 
     #[test]

@@ -35,6 +35,17 @@ namespace model {
 
 struct Workspace;
 
+struct MediaEncodeInputs {
+    const float* image_pixels_h = nullptr;
+    const std::uint32_t* image_pixel_byte_indptr_h = nullptr;
+    const std::uint32_t* image_patch_positions_h = nullptr;
+    const std::uint32_t* image_anchor_rows_h = nullptr;
+    int num_images = 0;
+    std::uint16_t* output_rows_h = nullptr;
+    std::size_t output_bytes = 0;
+    std::uint32_t* output_row_indptr_h = nullptr;
+};
+
 // Capability flags previously scattered as individual `forward_fn.supports_*`
 // booleans. Bundled here so a model declares them in one place at construction
 // time. The executor consults these to decide graph capture, fused-argmax,
@@ -46,6 +57,7 @@ struct ModelCapabilities {
     bool supports_small_prefill_graph = false;
     bool supports_fused_lmhead_argmax = false;
     bool supports_runtime_window       = false;
+    bool supports_media_encode         = false;
 };
 
 // Polymorphic per-model interface. Implementations hold refs to per-arch
@@ -103,6 +115,7 @@ public:
     virtual void set_logits_argmax_only(bool /*enabled*/) {}
     virtual void set_fused_argmax_output(std::int32_t* /*ptr*/) {}
     virtual bool fused_argmax_done() { return false; }
+    virtual bool encode_media(const MediaEncodeInputs&, cudaStream_t) { return false; }
 };
 
 }  // namespace model

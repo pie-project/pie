@@ -6,7 +6,8 @@ use crate::driver::abi::{
 };
 use crate::driver::channel::RegisteredChannel;
 use crate::driver::command::{
-    ChannelRegistrationPlan, KvCopyPlan, PoolResizePlan, ProgramRegistration, StateCopyPlan,
+    ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
+    StateCopyPlan,
 };
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
@@ -34,6 +35,10 @@ impl DummyDriver {
 
     pub fn device_facts(&self) -> &pie_driver_abi::DeviceFacts {
         self.inner.device_facts()
+    }
+
+    pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
+        self.inner.export_kv_handle()
     }
 
     pub fn load_model(
@@ -84,6 +89,12 @@ impl DummyDriver {
         let borrowed = LaunchDescBorrow::from_submission(desc);
         self.inner.launch(borrowed.as_raw(), raw)?;
         Ok(completion)
+    }
+
+    pub fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
+        Err(anyhow!(
+            "dummy media encode is implemented by the executor service"
+        ))
     }
 
     pub fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {

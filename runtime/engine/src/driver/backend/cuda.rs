@@ -1,12 +1,13 @@
 use anyhow::{Result, anyhow};
 
 use crate::driver::abi::{
-    ChannelDescBorrow, InstanceDescBorrow, KvCopyDescBorrow, LaunchDescBorrow,
+    ChannelDescBorrow, EncodeDescBorrow, InstanceDescBorrow, KvCopyDescBorrow, LaunchDescBorrow,
     PoolResizeDescBorrow, ProgramDescBorrow, StateCopyDescBorrow,
 };
 use crate::driver::channel::RegisteredChannel;
 use crate::driver::command::{
-    ChannelRegistrationPlan, KvCopyPlan, PoolResizePlan, ProgramRegistration, StateCopyPlan,
+    ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
+    StateCopyPlan,
 };
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
@@ -14,8 +15,8 @@ use crate::driver::submission::LaunchSubmission;
 use pie_driver_abi::{
     PieBytes, PieChannelEndpointBinding, PieDriver, PieDriverCaps, PieDriverCreateDesc,
     PieModelLoadDesc, pie_cuda_bind_instance, pie_cuda_close_channel, pie_cuda_close_instance,
-    pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_create, pie_cuda_destroy, pie_cuda_launch,
-    pie_cuda_load_model, pie_cuda_register_channel, pie_cuda_register_program,
+    pie_cuda_copy_kv, pie_cuda_copy_state, pie_cuda_create, pie_cuda_destroy, pie_cuda_encode,
+    pie_cuda_launch, pie_cuda_load_model, pie_cuda_register_channel, pie_cuda_register_program,
     pie_cuda_resize_pool,
 };
 
@@ -23,6 +24,7 @@ struct CudaDriverHandle {
     driver: *mut PieDriver,
     broker: CompletionBroker,
     device_facts: pie_driver_abi::DeviceFacts,
+    kv_handle: Option<pie_driver_abi::KvHandle>,
 }
 
 impl CudaDriverHandle {
@@ -53,6 +55,7 @@ impl CudaDriverHandle {
             driver,
             broker,
             device_facts,
+            kv_handle: None,
         })
     }
 
@@ -70,7 +73,7 @@ impl CudaDriverHandle {
             .ok_or_else(|| anyhow!("model snapshot path must be UTF-8"))?;
         let raw = PieModelLoadDesc {
             abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
-            reserved0: 0,
+            component: desc.component as u32,
             compiler_version: desc.compiler_version,
             load_plan_bytes: PieBytes {
                 ptr: desc.load_plan_bytes.as_ptr(),
@@ -88,6 +91,7 @@ impl CudaDriverHandle {
         )?;
         let capabilities: pie_driver_abi::DriverCapabilities =
             parse_json(caps, "model capabilities")?;
+        self.kv_handle = capabilities.kv_handle.clone();
         Ok(capabilities)
     }
 
@@ -148,6 +152,16 @@ impl CudaDriverHandle {
         Ok(completion)
     }
 
+    fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
+        let (raw, completion) = self.broker.pie_completion(1);
+        let borrowed = EncodeDescBorrow::new(plan);
+        sync_status(
+            unsafe { pie_cuda_encode(self.driver, borrowed.as_raw(), raw) },
+            "pie_cuda_encode",
+        )?;
+        Ok(completion)
+    }
+
     fn copy_kv(&mut self, plan: &KvCopyPlan) -> Result<SubmissionCompletion> {
         let target_epoch = 1;
         let (raw, completion) = self.broker.pie_completion(target_epoch);
@@ -193,6 +207,10 @@ impl CudaDriverHandle {
             unsafe { pie_cuda_close_channel(self.driver, channel_id) },
             "pie_cuda_close_channel",
         )
+    }
+
+    fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
+        self.kv_handle.clone()
     }
 }
 
@@ -354,6 +372,15 @@ impl CudaDriver {
         self.leader.launch(plan)
     }
 
+    pub fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
+        if !self.followers.is_empty() {
+            return Err(anyhow!(
+                "media encode does not support tensor-parallel groups"
+            ));
+        }
+        self.leader.encode(plan)
+    }
+
     pub fn copy_kv(&mut self, plan: &KvCopyPlan) -> Result<SubmissionCompletion> {
         self.leader.copy_kv(plan)
     }
@@ -372,6 +399,13 @@ impl CudaDriver {
 
     pub fn close_channel(&mut self, channel_id: u64) -> Result<()> {
         self.leader.close_channel(channel_id)
+    }
+
+    pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
+        self.followers
+            .is_empty()
+            .then(|| self.leader.export_kv_handle())
+            .flatten()
     }
 }
 

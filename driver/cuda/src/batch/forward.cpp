@@ -648,6 +648,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.audio_feature_byte_indptr_h  = in.audio_feature_byte_indptr_h;
     fwd_in.audio_anchor_rows_h          = in.audio_anchor_rows_h;
     fwd_in.num_clips                    = in.num_clips;
+    fwd_in.precomputed_embeddings       = in.precomputed_embeddings;
     fwd_in.stage_hooks                  = in.stage_hooks;
     forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
 }

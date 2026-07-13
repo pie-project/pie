@@ -1,4 +1,5 @@
 #include "model/gemma4/gemma4.hpp"
+#include "model/precomputed_embeddings.hpp"
 #include "model/stage_hooks.hpp"
 
 #include <algorithm>
@@ -1478,7 +1479,8 @@ void gemma4_forward_paged(
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
     const Gemma4VisionInputs* vision_in,
-    const Gemma4AudioInputs* audio_in)
+    const Gemma4AudioInputs* audio_in,
+    const PrecomputedEmbeddingInputs* precomputed_embeddings)
 {
     const int H        = cfg.hidden_size;
     const int L        = cfg.num_hidden_layers;
@@ -1552,6 +1554,12 @@ void gemma4_forward_paged(
     if (audio_in != nullptr && audio_in->num_clips > 0) {
         scatter_gemma4_audio(*audio_in, static_cast<__nv_bfloat16*>(ws.y.data()),
                              N, H, stream);
+    }
+    if (precomputed_embeddings != nullptr) {
+        scatter_precomputed_embeddings(
+            *precomputed_embeddings,
+            static_cast<std::uint16_t*>(ws.y.data()),
+            N, H, stream);
     }
 
     // ── 2. Per-layer inputs (PLE) ────────────────────────────────────────

@@ -18,6 +18,7 @@ pub struct ModelLoadDesc {
     pub load_plan_bytes: Vec<u8>,
     pub snapshot_dir: PathBuf,
     pub compiler_version: u64,
+    pub component: crate::ModelComponent,
 }
 
 /// Create-time device properties used by the runtime storage compiler.
@@ -82,9 +83,15 @@ pub struct DriverCapabilities {
     pub max_model_len: u32,
     /// Activation dtype on the driver side (`bf16` / `f16` / `f32`).
     pub activation_dtype: String,
+    #[serde(default)]
+    pub hidden_size: u32,
+    #[serde(default)]
+    pub supports_media_encode: bool,
     /// Optional snapshot directory the driver can use to persist state.
     #[serde(default)]
     pub snapshot_dir: String,
+    #[serde(default)]
+    pub kv_handle: Option<crate::transfer::KvHandle>,
 }
 
 #[cfg(test)]

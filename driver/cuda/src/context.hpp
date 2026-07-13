@@ -32,6 +32,7 @@ class Context {
     int register_channel(const PieChannelDesc& channel, PieChannelEndpointBinding* binding);
     int bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding);
     int launch(const PieLaunchDesc& launch, PieCompletion completion);
+    int encode(const PieEncodeDesc& encode, PieCompletion completion);
     int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion);
     int copy_state(const PieStateCopyDesc& copy, PieCompletion completion);
     int resize_pool(const PiePoolResizeDesc& resize, PieCompletion completion);

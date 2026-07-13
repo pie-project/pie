@@ -172,6 +172,7 @@ pub struct TelemetryConfig {
 
 pub struct BootstrapHandle {
     pub port: u16,
+    pub model_idx: usize,
     shutdown: Option<RuntimeShutdown>,
 }
 
@@ -373,6 +374,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,
+        model_idx: arena_model_idx,
         shutdown: Some(RuntimeShutdown {
             scheduler: scheduler_shutdown,
             driver_ids: drivers,

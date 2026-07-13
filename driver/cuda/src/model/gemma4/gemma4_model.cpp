@@ -31,6 +31,7 @@ Gemma4Model::Gemma4Model(
         audio_raw_ = to_audio_raw(*audio);
         has_audio_ = true;
     }
+    caps_.supports_media_encode = has_vision_;
     // CUDA graphs default ON for Gemma4 unless intrusive-profile env is set.
     const char* profile_env = std::getenv("PIE_GEMMA4_FORWARD_PROFILE");
     const bool profile_enabled =
@@ -100,7 +101,10 @@ void Gemma4Model::body(Workspace& ws,
         in.kv_last_page_lens_h,
         in.total_tokens, in.num_requests, in.is_pure_decode,
         in.custom_mask_d, in.custom_mask_indptr_d,
-        in.logit_row_indices_d, in.num_logit_rows, vision_in_ptr, audio_in_ptr);
+        in.logit_row_indices_d, in.num_logit_rows, vision_in_ptr, audio_in_ptr,
+        in.precomputed_embeddings.num_blocks > 0
+            ? &in.precomputed_embeddings
+            : nullptr);
 }
 
 std::uint32_t Gemma4Model::graph_layout() {
@@ -117,6 +121,21 @@ void Gemma4Model::set_fused_argmax_output(std::int32_t* ptr) {
 
 bool Gemma4Model::fused_argmax_done() {
     return pie_cuda_driver::model::gemma4_fused_argmax_done();
+}
+
+bool Gemma4Model::encode_media(const MediaEncodeInputs& in, cudaStream_t stream) {
+    if (!has_vision_ || in.num_images <= 0) return false;
+    Gemma4VisionInputs vision_in;
+    vision_in.weights = &vision_raw_;
+    vision_in.pixels_h = in.image_pixels_h;
+    vision_in.pixel_byte_indptr_h = in.image_pixel_byte_indptr_h;
+    vision_in.patch_positions_h = in.image_patch_positions_h;
+    vision_in.anchor_rows_h = in.image_anchor_rows_h;
+    vision_in.num_images = in.num_images;
+    encode_gemma4_vision(
+        vision_in, in.output_rows_h, in.output_bytes,
+        in.output_row_indptr_h, stream);
+    return true;
 }
 
 }  // namespace pie_cuda_driver::model

@@ -399,6 +399,14 @@ void handle_fire_batch(
     const auto aud_feat_byte_indptr = view.audio_feature_indptr.as<std::uint32_t>();
     const auto aud_anchor           = view.audio_anchor_rows.as<std::uint32_t>();
     const int aud_num_clips         = static_cast<int>(aud_anchor.size());
+    const PrecomputedEmbeddingInputs precomputed_embeddings{
+        .rows_h = view.embed_rows.data(),
+        .byte_indptr_h = view.embed_indptr.data(),
+        .shapes_h = view.embed_shapes.data(),
+        .dtypes_h = view.embed_dtypes.data(),
+        .anchor_rows_h = view.embed_anchor_rows.data(),
+        .num_blocks = static_cast<int>(view.embed_dtypes.size()),
+    };
 
     // Env-gated per-fire timing (PIE_FIRE_TIMING=1): logs tokens/requests/images
     // and wall duration of the whole fire. Scope guard fires on every return.
@@ -1287,6 +1295,7 @@ void handle_fire_batch(
                 .audio_feature_byte_indptr_h = aud_feat_byte_indptr.data(),
                 .audio_anchor_rows_h = aud_anchor.data(),
                 .num_clips = aud_num_clips,
+                .precomputed_embeddings = precomputed_embeddings,
                 .stage_hooks =
                     has_attention_stages ? &stage_hooks : nullptr,
             });

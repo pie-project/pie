@@ -152,6 +152,8 @@ mod tests {
             vocab_size: 151936,
             max_model_len: 4096,
             activation_dtype: "bfloat16".into(),
+            hidden_size: 4096,
+            supports_media_encode: false,
             snapshot_dir: "/tmp/snapshot".into(),
             rs_cache_required: false,
             rs_cache_slots: 0,
@@ -159,6 +161,7 @@ mod tests {
             has_mtp_logits: true,
             has_mtp_drafts: false,
             has_value_head: false,
+            kv_handle: None,
         }
     }
 

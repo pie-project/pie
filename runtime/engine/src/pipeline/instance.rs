@@ -249,6 +249,7 @@ impl ForwardPass {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
+        crate::pipeline::offload::close_home_instance(self.bound_instance.instance_id);
         if let Err(error) = crate::scheduler::close_instance(&self.bound_instance) {
             tracing::warn!(
                 instance_id = self.bound_instance.instance_id,

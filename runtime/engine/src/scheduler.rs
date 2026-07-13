@@ -29,6 +29,7 @@ pub(crate) mod stats;
 pub(crate) mod wire;
 pub mod worker;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
@@ -230,6 +231,48 @@ pub struct SchedulerShutdownHandle {
     schedulers: Vec<BatchScheduler>,
 }
 
+fn dynamic_schedulers() -> &'static Mutex<HashMap<DriverId, BatchScheduler>> {
+    static SCHEDULERS: OnceLock<Mutex<HashMap<DriverId, BatchScheduler>>> = OnceLock::new();
+    SCHEDULERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn build_driver_scheduler(
+    driver_id: DriverId,
+    page_size: u32,
+    request_timeout_secs: u64,
+) -> Result<BatchScheduler> {
+    let limits = crate::driver::get_spec(driver_id)?.scheduler_limits();
+    Ok(BatchScheduler::new(
+        driver_id,
+        driver_id,
+        page_size,
+        limits,
+        request_timeout_secs,
+    ))
+}
+
+pub fn spawn_driver(driver_id: DriverId, page_size: u32, request_timeout_secs: u64) -> Result<()> {
+    let mut schedulers = dynamic_schedulers().lock().unwrap();
+    if schedulers.contains_key(&driver_id) {
+        return Err(anyhow!(
+            "driver {driver_id} already has a dynamic scheduler"
+        ));
+    }
+    let scheduler = build_driver_scheduler(driver_id, page_size, request_timeout_secs)?;
+    schedulers.insert(driver_id, scheduler);
+    Ok(())
+}
+
+pub fn stop_driver(driver_id: DriverId) -> Result<()> {
+    let scheduler = dynamic_schedulers()
+        .lock()
+        .unwrap()
+        .remove(&driver_id)
+        .ok_or_else(|| anyhow!("driver {driver_id} has no dynamic scheduler"))?;
+    drop(scheduler);
+    Ok(())
+}
+
 impl SchedulerShutdownHandle {
     pub async fn shutdown(self) -> Result<()> {
         // `BatchScheduler::drop` joins the worker thread and clears the
@@ -248,28 +291,10 @@ pub async fn spawn(
     page_size: u32,
     request_timeout_secs: u64,
 ) -> Result<SchedulerShutdownHandle> {
-    let driver_ids: Vec<DriverId> = driver_indices.to_vec();
-    let mut driver_batch_limits = Vec::with_capacity(driver_indices.len());
-    for &driver_idx in driver_indices {
-        let info = crate::driver::get_spec(driver_idx)
-            .unwrap_or_else(|e| panic!("Failed to get driver info for index {driver_idx}: {e}"));
-        driver_batch_limits.push(info.scheduler_limits());
-    }
-
-    let schedulers: Vec<BatchScheduler> = driver_ids
+    let schedulers: Vec<BatchScheduler> = driver_indices
         .iter()
-        .enumerate()
-        .map(|(driver_idx, &driver_id)| {
-            let limits = driver_batch_limits[driver_idx];
-            BatchScheduler::new(
-                driver_id,
-                driver_idx,
-                page_size,
-                limits,
-                request_timeout_secs,
-            )
-        })
-        .collect();
+        .map(|&driver_id| build_driver_scheduler(driver_id, page_size, request_timeout_secs))
+        .collect::<Result<_>>()?;
 
     Ok(SchedulerShutdownHandle { schedulers })
 }

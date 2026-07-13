@@ -195,6 +195,10 @@ impl BoundInstance {
     pub(crate) fn wait_slots(&self) -> Arc<BoundWaitSlots> {
         Arc::clone(&self.wait_slots)
     }
+
+    pub fn close_wait_slots(&self) {
+        self.wait_slots.close();
+    }
 }
 
 #[cfg(test)]

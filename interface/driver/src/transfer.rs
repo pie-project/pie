@@ -53,10 +53,17 @@ pub struct KvLayout {
     pub page_size: u32,
     pub dtype: KvDtype,
     pub kind: KvLayoutKind,
+    #[serde(default)]
+    pub storage_format: String,
+    #[serde(default)]
+    pub region_page_bytes: Vec<u64>,
 }
 
 impl KvLayout {
     pub fn page_bytes(&self) -> u64 {
+        if !self.region_page_bytes.is_empty() {
+            return self.region_page_bytes.iter().copied().sum();
+        }
         self.num_layers as u64
             * self.kind.planes() as u64
             * self.num_kv_heads as u64
@@ -83,6 +90,7 @@ pub enum MemoryDomain {
 pub struct KvRegion {
     pub base: u64,
     pub len: u64,
+    pub page_stride: u64,
     pub domain: MemoryDomain,
 }
 
@@ -97,4 +105,26 @@ impl KvHandle {
     pub fn page_bytes(&self) -> u64 {
         self.layout.page_bytes()
     }
+
+    pub fn page_capacity(&self) -> Option<u64> {
+        let mut capacity = None;
+        for region in &self.regions {
+            if region.page_stride == 0 || region.len % region.page_stride != 0 {
+                return None;
+            }
+            let pages = region.len / region.page_stride;
+            if capacity
+                .replace(pages)
+                .is_some_and(|current| current != pages)
+            {
+                return None;
+            }
+        }
+        capacity
+    }
+}
+
+/// Driver-side producer seam for transport registration.
+pub trait KvExport {
+    fn export_kv_handle(&self) -> Option<KvHandle>;
 }

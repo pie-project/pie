@@ -42,6 +42,49 @@ fn sorted(mut v: Vec<PhysicalKvPageId>) -> Vec<u32> {
     v.into_iter().map(|p| p.0).collect()
 }
 
+#[test]
+fn offloaded_prefix_adoption_publishes_pages_hashes_and_cas() {
+    let mut store = KvStore::new(8, h(99));
+    let ws = store.create_working_set();
+    let tokens = (0..32).collect::<Vec<u32>>();
+    let reserved = store.reserve_device_pages(2).unwrap();
+    let reserved_ids = reserved.iter().map(|page| page.0).collect::<Vec<_>>();
+
+    assert_eq!(
+        store
+            .adopt_offloaded_prefix(ws, &tokens, reserved, 16)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store
+            .flat_table(ws)
+            .unwrap()
+            .1
+            .iter()
+            .map(|page| page.0)
+            .collect::<Vec<_>>(),
+        reserved_ids
+    );
+    assert_eq!(store.committed_token_len(ws, 16).unwrap(), 32);
+    let boundary = store.chain_state(ws).unwrap().unwrap();
+    assert!(store.lookup_cached_page(&boundary).is_some());
+}
+
+#[test]
+fn invalid_offloaded_prefix_releases_reserved_pages() {
+    let mut store = KvStore::new(4, h(100));
+    let ws = store.create_working_set();
+    let reserved = store.reserve_device_pages(1).unwrap();
+    assert_eq!(store.available_pages(), 3);
+    assert!(
+        store
+            .adopt_offloaded_prefix(ws, &[1, 2, 3], reserved, 16)
+            .is_err()
+    );
+    assert_eq!(store.available_pages(), 4);
+}
+
 /// A WorkingSet with two owned nodes: N1 = ids 0..5 shared-then-released via a
 /// throwaway fork, N2 = ids 5..10.
 fn two_node_ws(table: &mut KvPageTable) -> WorkingSetId {

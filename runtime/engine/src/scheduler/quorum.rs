@@ -119,6 +119,7 @@ struct PipelineWaveState {
 }
 
 pub(super) struct WaitAllPolicy {
+    greedy: bool,
     /// Structural cap — a full batch always fires immediately.
     max_forward_requests: usize,
     /// Batches enqueued but not yet retired; bounded by the configured depth.
@@ -145,7 +146,16 @@ pub(super) struct WaitAllPolicy {
 
 impl WaitAllPolicy {
     pub fn new(max_forward_requests: usize, stats: Option<Arc<SchedulerStats>>) -> Self {
+        Self::with_greedy(max_forward_requests, stats, false)
+    }
+
+    pub fn with_greedy(
+        max_forward_requests: usize,
+        stats: Option<Arc<SchedulerStats>>,
+        greedy: bool,
+    ) -> Self {
         Self {
+            greedy,
             max_forward_requests,
             in_flight: 0,
             active: BTreeMap::new(),
@@ -270,6 +280,13 @@ impl WaitAllPolicy {
         // between requests, nobody is holding anybody.
         if current_batch_size == 0 {
             return WaveDecision::Wait(Duration::from_micros(QUORUM_POLL_US));
+        }
+        if self.greedy {
+            self.record_clause(FireClause::Quorum);
+            self.record_wave(0);
+            return WaveDecision::Fire {
+                missing: Vec::new(),
+            };
         }
         let missing: Vec<ProcessId> = self
             .active

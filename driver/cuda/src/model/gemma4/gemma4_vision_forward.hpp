@@ -75,6 +75,12 @@ void scatter_gemma4_vision(const Gemma4VisionInputs& in,
                            int text_hidden,
                            cudaStream_t stream = 0);
 
+void encode_gemma4_vision(const Gemma4VisionInputs& in,
+                          std::uint16_t* output_rows_h,
+                          std::size_t output_bytes,
+                          std::uint32_t* output_row_indptr_h,
+                          cudaStream_t stream = 0);
+
 // Encode one image's patches → soft-token embeddings in the text hidden space.
 //   pixel    : bf16 [n_patch, 3*patch^2]   (raw patch pixels in [0,1])
 //   pos      : f32  [n_patch, 2]           (patch (x,y) coords; -1 = padding)

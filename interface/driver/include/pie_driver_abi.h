@@ -16,10 +16,15 @@
 /**
  * Current direct local ABI version.
  *
- * v4: driver creation reports device facts only; model loading is a separate,
- * blocking `*_load_model` call carrying mandatory LoadPlan bytes.
+ * v5: standalone media encoding and precomputed embedding injection.
  */
-#define PIE_DRIVER_ABI_VERSION 4
+#define PIE_DRIVER_ABI_VERSION 5
+
+#define PIE_MODEL_COMPONENT_FULL 0
+
+#define PIE_MODEL_COMPONENT_TEXT 1
+
+#define PIE_MODEL_COMPONENT_ENCODE 2
 
 /**
  * Success.
@@ -116,6 +121,14 @@
  */
 #define PIE_CHANNEL_EXTERN_EXPORT 2
 
+#define CHANNEL_TICKET_NONE UINT64_MAX
+
+#define RS_FLAG_RESET 1
+
+#define RS_FLAG_FOLD 2
+
+#define REMOTE_WIRE_VERSION 1
+
 /**
  * Opaque embedded-driver handle.
  */
@@ -186,9 +199,9 @@ typedef struct PieDriverCaps {
 typedef struct PieModelLoadDesc {
   uint32_t abi_version;
   /**
-   * Must be zero.
+   * One of `PIE_MODEL_COMPONENT_*`.
    */
-  uint32_t reserved0;
+  uint32_t component;
   /**
    * Compiler source hash expected by this runtime.
    */
@@ -414,7 +427,14 @@ typedef struct PieLaunchDesc {
   struct PieU32Slice kv_page_indptr;
   struct PieU32Slice kv_last_page_lens;
   struct PieU32Slice qo_indptr;
+  /**
+   * Folded recurrent-state slot per resolved `qo_indptr` row. Empty for
+   * pure-attention launches; never indexed by `instance_ids`.
+   */
   struct PieU32Slice rs_slot_ids;
+  /**
+   * Flags parallel to `rs_slot_ids`.
+   */
   struct PieU8Slice rs_slot_flags;
   struct PieU32Slice rs_fold_lens;
   struct PieU32Slice rs_buffer_slot_ids;
@@ -454,6 +474,12 @@ typedef struct PieLaunchDesc {
   struct PieU32Slice audio_feature_indptr;
   struct PieU32Slice audio_anchor_rows;
   struct PieU32Slice audio_indptr;
+  struct PieBytes embed_rows;
+  struct PieU32Slice embed_indptr;
+  struct PieU32Slice embed_shapes;
+  struct PieU8Slice embed_dtypes;
+  struct PieU32Slice embed_anchor_rows;
+  struct PieU32Slice embed_block_indptr;
   struct PieU32Slice kv_len;
   struct PieU64Slice kv_len_device;
   /**
@@ -506,6 +532,28 @@ typedef struct PieCompletion {
    */
   struct PieTerminalCell *terminal_cell;
 } PieCompletion;
+
+typedef struct PieMutBytes {
+  uint8_t *ptr;
+  size_t len;
+} PieMutBytes;
+
+typedef struct PieU32MutSlice {
+  uint32_t *ptr;
+  size_t len;
+} PieU32MutSlice;
+
+typedef struct PieEncodeDesc {
+  uint32_t abi_version;
+  uint32_t reserved0;
+  struct PieU32Slice image_grids;
+  struct PieBytes image_pixels;
+  struct PieU32Slice image_pixel_indptr;
+  struct PieU32Slice image_patch_positions;
+  struct PieU32Slice image_anchor_rows;
+  struct PieMutBytes output_rows;
+  struct PieU32MutSlice output_row_indptr;
+} PieEncodeDesc;
 
 /**
  * Memory domain tag for local KV residency copies.
@@ -691,6 +739,10 @@ extern int32_t pie_cuda_launch(PieDriver *driver,
                                const struct PieLaunchDesc *launch,
                                struct PieCompletion completion);
 
+extern int32_t pie_cuda_encode(PieDriver *driver,
+                               const struct PieEncodeDesc *encode,
+                               struct PieCompletion completion);
+
 extern int32_t pie_cuda_copy_kv(PieDriver *driver,
                                 const struct PieKvCopyDesc *copy,
                                 struct PieCompletion completion);
@@ -730,6 +782,10 @@ extern int32_t pie_metal_bind_instance(PieDriver *driver,
 
 extern int32_t pie_metal_launch(PieDriver *driver,
                                 const struct PieLaunchDesc *launch,
+                                struct PieCompletion completion);
+
+extern int32_t pie_metal_encode(PieDriver *driver,
+                                const struct PieEncodeDesc *encode,
                                 struct PieCompletion completion);
 
 extern int32_t pie_metal_copy_kv(PieDriver *driver,

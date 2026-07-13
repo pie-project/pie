@@ -27,6 +27,10 @@ use pie_ptir::registry::{KernelInfo, ModelProfile};
 use pie_ptir::types::{DType, ValueType};
 use pie_ptir::validate::BoundTrace;
 
+pub mod kv_export;
+
+use kv_export::DummyKvExport;
+
 /// One accepted `launch`'s forward geometry, copied out of the descriptor into
 /// owned vectors (safe to hold past the call) for test probes.
 #[derive(Debug, Clone, Default)]
@@ -232,6 +236,7 @@ pub struct DummyDriver {
     callback_workers: Vec<std::thread::JoinHandle<()>>,
     operation_log: Option<Arc<Mutex<Vec<String>>>>,
     launch_observer: Option<LaunchObserver>,
+    kv_export: DummyKvExport,
 }
 
 impl DummyDriver {
@@ -244,6 +249,7 @@ impl DummyDriver {
     }
 
     pub fn with_runtime(options: DummyDriverOptions, runtime: PieRuntimeCallbacks) -> Self {
+        let kv_export = DummyKvExport::new(options.total_pages, options.kv_page_size);
         let state = Arc::new(Mutex::new(DummyState::default()));
         let operation_log = options.operation_log.clone();
         let runtime = SendableRuntimeCallbacks {
@@ -289,7 +295,10 @@ impl DummyDriver {
                 vocab_size: options.vocab_size,
                 max_model_len: options.max_model_len,
                 activation_dtype: options.activation_dtype,
+                hidden_size: 1,
+                supports_media_encode: false,
                 snapshot_dir: options.snapshot_dir,
+                kv_handle: None,
             },
             load_storage: None,
             state,
@@ -304,7 +313,12 @@ impl DummyDriver {
             callback_workers: Vec::new(),
             operation_log,
             launch_observer: options.launch_observer,
+            kv_export,
         }
+    }
+
+    pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
+        pie_driver_abi::KvExport::export_kv_handle(&self.kv_export)
     }
 
     fn record_op(&self, name: &str) {
@@ -391,6 +405,8 @@ impl DummyDriver {
         )
         .map_err(|err| anyhow!("dummy LoadPlan execution failed: {err}"))?;
         self.capabilities.snapshot_dir = desc.snapshot_dir.display().to_string();
+        self.capabilities.supports_media_encode =
+            desc.component == pie_driver_abi::ModelComponent::Encode;
         self.load_storage = Some(storage);
         Ok(self.capabilities.clone())
     }
