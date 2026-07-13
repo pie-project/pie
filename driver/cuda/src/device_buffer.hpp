@@ -14,6 +14,7 @@
 // modeled; all allocations / copies use the default stream, matching the
 // pre-RAII code.
 
+#include <array>
 #include <cstddef>
 #include <cstring>
 #include <span>
@@ -50,12 +51,14 @@ public:
           count_(o.count_),
           h_pinned_(o.h_pinned_),
           h_pinned_copy_done_(o.h_pinned_copy_done_),
-          h_pinned_copy_pending_(o.h_pinned_copy_pending_) {
+          h_pinned_copy_pending_(o.h_pinned_copy_pending_),
+          next_pinned_slot_(o.next_pinned_slot_) {
         o.ptr_ = nullptr;
         o.count_ = 0;
-        o.h_pinned_ = nullptr;
-        o.h_pinned_copy_done_ = nullptr;
-        o.h_pinned_copy_pending_ = false;
+        o.h_pinned_.fill(nullptr);
+        o.h_pinned_copy_done_.fill(nullptr);
+        o.h_pinned_copy_pending_.fill(false);
+        o.next_pinned_slot_ = 0;
     }
 
     DeviceBuffer& operator=(DeviceBuffer&& o) noexcept {
@@ -66,11 +69,13 @@ public:
             h_pinned_ = o.h_pinned_;
             h_pinned_copy_done_ = o.h_pinned_copy_done_;
             h_pinned_copy_pending_ = o.h_pinned_copy_pending_;
+            next_pinned_slot_ = o.next_pinned_slot_;
             o.ptr_ = nullptr;
             o.count_ = 0;
-            o.h_pinned_ = nullptr;
-            o.h_pinned_copy_done_ = nullptr;
-            o.h_pinned_copy_pending_ = false;
+            o.h_pinned_.fill(nullptr);
+            o.h_pinned_copy_done_.fill(nullptr);
+            o.h_pinned_copy_pending_.fill(false);
+            o.next_pinned_slot_ = 0;
         }
         return *this;
     }
@@ -133,8 +138,8 @@ public:
     // CUDA's internal staging completes — adding ~1-2 ms per call. With
     // 13+ per-fire copies of this kind, that dominates the wall time at
     // small per-fire GPU work (~5× HtoD-vs-vllm gap shown in nsys
-    // profiles). The pinned scratch is allocated at the buffer's full
-    // capacity once on first use and reused thereafter.
+    // profiles). Two pinned slots let the configured depth-2 runahead enqueue
+    // the next fire without overwriting the previous fire's DMA source.
     void copy_from_host(std::span<const T> src) {
         if (src.size() > count_) {
             throw std::runtime_error(
@@ -143,14 +148,13 @@ public:
                 std::to_string(count_));
         }
         if (src.empty()) return;
-        ensure_pinned_staging();
-        await_pinned_staging();
-        std::memcpy(h_pinned_, src.data(), src.size() * sizeof(T));
-        CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_,
+        const std::size_t slot = acquire_pinned_staging();
+        std::memcpy(h_pinned_[slot], src.data(), src.size() * sizeof(T));
+        CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_[slot],
                                    src.size() * sizeof(T),
                                    cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaEventRecord(h_pinned_copy_done_, nullptr));
-        h_pinned_copy_pending_ = true;
+        CUDA_CHECK(cudaEventRecord(h_pinned_copy_done_[slot], nullptr));
+        h_pinned_copy_pending_[slot] = true;
     }
 
     // Same as `copy_from_host(span<const T>)` but takes a raw byte view —
@@ -164,13 +168,12 @@ public:
                 " > capacity " + std::to_string(count_));
         }
         if (bytes.empty()) return;
-        ensure_pinned_staging();
-        await_pinned_staging();
-        std::memcpy(h_pinned_, bytes.data(), bytes.size());
-        CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_, bytes.size(),
+        const std::size_t slot = acquire_pinned_staging();
+        std::memcpy(h_pinned_[slot], bytes.data(), bytes.size());
+        CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_[slot], bytes.size(),
                                    cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaEventRecord(h_pinned_copy_done_, nullptr));
-        h_pinned_copy_pending_ = true;
+        CUDA_CHECK(cudaEventRecord(h_pinned_copy_done_[slot], nullptr));
+        h_pinned_copy_pending_[slot] = true;
     }
 
     T*       data()       noexcept { return ptr_; }
@@ -187,14 +190,18 @@ public:
     }
 
 private:
+    static constexpr std::size_t kPinnedStagingSlots = 2;
+
     void reset() noexcept {
-        if (h_pinned_copy_pending_) {
-            cudaEventSynchronize(h_pinned_copy_done_);
-            h_pinned_copy_pending_ = false;
-        }
-        if (h_pinned_copy_done_) {
-            cudaEventDestroy(h_pinned_copy_done_);
-            h_pinned_copy_done_ = nullptr;
+        for (std::size_t slot = 0; slot < kPinnedStagingSlots; ++slot) {
+            if (h_pinned_copy_pending_[slot]) {
+                cudaEventSynchronize(h_pinned_copy_done_[slot]);
+                h_pinned_copy_pending_[slot] = false;
+            }
+            if (h_pinned_copy_done_[slot]) {
+                cudaEventDestroy(h_pinned_copy_done_[slot]);
+                h_pinned_copy_done_[slot] = nullptr;
+            }
         }
         if (ptr_) {
             // Best effort — driver shutdown may have already torn the
@@ -203,41 +210,50 @@ private:
             ptr_ = nullptr;
             count_ = 0;
         }
-        if (h_pinned_) {
-            cudaFreeHost(h_pinned_);
-            h_pinned_ = nullptr;
+        for (T*& pinned : h_pinned_) {
+            if (pinned != nullptr) {
+                cudaFreeHost(pinned);
+                pinned = nullptr;
+            }
         }
+        next_pinned_slot_ = 0;
     }
 
-    // Lazily allocate the pinned host staging buffer at the device
-    // buffer's full capacity. Pinned alloc isn't cheap (single ~µs
-    // syscall per buffer), but it's one-shot — amortised across all
-    // fires that ever touch this buffer.
-    void ensure_pinned_staging() {
-        if (h_pinned_ != nullptr) return;
-        if (count_ == 0) return;
-        CUDA_CHECK(cudaMallocHost(&h_pinned_, count_ * sizeof(T)));
+    void ensure_pinned_staging(std::size_t slot) {
+        if (h_pinned_[slot] != nullptr || count_ == 0) return;
+        CUDA_CHECK(cudaMallocHost(
+            &h_pinned_[slot], count_ * sizeof(T)));
         try {
             CUDA_CHECK(cudaEventCreateWithFlags(
-                &h_pinned_copy_done_, cudaEventDisableTiming));
+                &h_pinned_copy_done_[slot], cudaEventDisableTiming));
         } catch (...) {
-            cudaFreeHost(h_pinned_);
-            h_pinned_ = nullptr;
+            cudaFreeHost(h_pinned_[slot]);
+            h_pinned_[slot] = nullptr;
             throw;
         }
     }
 
-    void await_pinned_staging() {
-        if (!h_pinned_copy_pending_) return;
-        CUDA_CHECK(cudaEventSynchronize(h_pinned_copy_done_));
-        h_pinned_copy_pending_ = false;
+    std::size_t acquire_pinned_staging() {
+        const std::size_t slot = next_pinned_slot_;
+        next_pinned_slot_ =
+            (next_pinned_slot_ + 1) % kPinnedStagingSlots;
+        ensure_pinned_staging(slot);
+        if (h_pinned_copy_pending_[slot]) {
+            CUDA_CHECK(cudaEventSynchronize(
+                h_pinned_copy_done_[slot]));
+            h_pinned_copy_pending_[slot] = false;
+        }
+        return slot;
     }
 
     T* ptr_ = nullptr;
     std::size_t count_ = 0;
-    T* h_pinned_ = nullptr;
-    cudaEvent_t h_pinned_copy_done_ = nullptr;
-    bool h_pinned_copy_pending_ = false;
+    std::array<T*, kPinnedStagingSlots> h_pinned_{};
+    std::array<cudaEvent_t, kPinnedStagingSlots>
+        h_pinned_copy_done_{};
+    std::array<bool, kPinnedStagingSlots>
+        h_pinned_copy_pending_{};
+    std::size_t next_pinned_slot_ = 0;
 };
 
 template <class T>

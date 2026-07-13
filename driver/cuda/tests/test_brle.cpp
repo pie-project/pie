@@ -1,4 +1,4 @@
-// Unit tests for `pie_cuda_driver::brle::is_pure_causal` + `decode`.
+// Unit tests for packed-mask `is_pure_causal` + `decode`.
 //
 // Self-contained: builds against the same `brle.cpp` translation unit
 // the driver uses; no test framework — failures abort with a message
@@ -7,8 +7,8 @@
 // Test cases exercise the wire-format shapes the runtime ships:
 //   * pure-causal single request (most common)
 //   * pure-causal multi-request batch
-//   * BRLE non-causal (jacobi-style alternating)
-//   * empty mask, zero-length runs, kv_len truncation
+//   * non-causal packed rows (jacobi-style alternating)
+//   * empty masks and kv_len truncation
 
 #include <cstdint>
 #include <cstdio>
@@ -46,31 +46,27 @@ int g_failures = 0;
         }                                                           \
     } while (0)
 
-// Encode a "canonical causal" BRLE row for a query at absolute KV
-// position `p`. The runtime emits exactly two runs — leading false=0
-// then trailing true of length p+1 — and the driver's
-// `is_pure_causal` predicate matches that exact shape (anything else
-// is treated as a custom mask). Bits past the encoded run are
-// implicitly false, so we don't append a trailing false run.
-//
-// `kv_len` is unused here; included so callers can keep the
-// declaration symmetric with the multi-row helper.
-std::vector<std::uint32_t> causal_row(int p, int /*kv_len*/) {
-    return {0u, static_cast<std::uint32_t>(p + 1)};
+std::vector<std::uint32_t> causal_row(int p, int kv_len) {
+    std::vector<std::uint32_t> words(
+        static_cast<std::size_t>(kv_len + 31) / 32, 0);
+    for (int key = 0; key <= p; ++key) {
+        words[static_cast<std::size_t>(key) / 32] |=
+            1u << (key % 32);
+    }
+    return words;
 }
 
-// Concatenate per-row BRLE runs into a flat buffer + an indptr (length
-// = num_tokens + 1) of run offsets per row.
-struct FlatBrle {
-    std::vector<std::uint32_t> runs;
+// Concatenate packed rows into the ABI's flat word buffer + row indptr.
+struct FlatMask {
+    std::vector<std::uint32_t> words;
     std::vector<std::uint32_t> indptr;
 };
-FlatBrle flatten(const std::vector<std::vector<std::uint32_t>>& rows) {
-    FlatBrle out;
+FlatMask flatten(const std::vector<std::vector<std::uint32_t>>& rows) {
+    FlatMask out;
     out.indptr.push_back(0);
     for (const auto& r : rows) {
-        out.runs.insert(out.runs.end(), r.begin(), r.end());
-        out.indptr.push_back(static_cast<std::uint32_t>(out.runs.size()));
+        out.words.insert(out.words.end(), r.begin(), r.end());
+        out.indptr.push_back(static_cast<std::uint32_t>(out.words.size()));
     }
     return out;
 }
@@ -116,7 +112,7 @@ void test_pure_causal_single_request() {
     std::vector<std::uint32_t> kv_last_lpl    = {1u};       // last page = 1 token
 
     auto causal = brle::is_pure_causal(
-        std::span<const std::uint32_t>(flat.runs),
+        std::span<const std::uint32_t>(flat.words),
         std::span<const std::uint32_t>(flat.indptr),
         std::span<const std::uint32_t>(qo_indptr),
         std::span<const std::uint32_t>(kv_page_indptr),
@@ -125,7 +121,7 @@ void test_pure_causal_single_request() {
     CHECK(causal);
 
     auto decoded = brle::decode(
-        std::span<const std::uint32_t>(flat.runs),
+        std::span<const std::uint32_t>(flat.words),
         std::span<const std::uint32_t>(flat.indptr),
         std::span<const std::uint32_t>(qo_indptr),
         std::span<const std::uint32_t>(kv_page_indptr),
@@ -168,7 +164,7 @@ void test_pure_causal_multi_request() {
     std::vector<std::uint32_t> kv_last_lpl    = {2u, 4u};
 
     CHECK(brle::is_pure_causal(
-        std::span<const std::uint32_t>(flat.runs),
+        std::span<const std::uint32_t>(flat.words),
         std::span<const std::uint32_t>(flat.indptr),
         std::span<const std::uint32_t>(qo_indptr),
         std::span<const std::uint32_t>(kv_page_indptr),
@@ -176,13 +172,35 @@ void test_pure_causal_multi_request() {
         page_size));
 }
 
+void test_causal_prefix_with_reserved_pages() {
+    namespace brle = pie_cuda_driver::brle;
+    constexpr int page_size = 4;
+    auto flat = flatten({
+        causal_row(4, 12),
+        causal_row(5, 12),
+    });
+    std::vector<std::uint32_t> qo_indptr = {0u, 2u};
+    std::vector<std::uint32_t> kv_page_indptr = {0u, 3u};
+    std::vector<std::uint32_t> kv_last_lpl = {4u};
+    std::vector<std::uint32_t> lengths;
+
+    CHECK(brle::causal_prefix_lengths(
+        flat.words, flat.indptr, qo_indptr, kv_page_indptr,
+        kv_last_lpl, page_size, lengths));
+    CHECK_EQ(lengths.size(), 1);
+    CHECK_EQ(lengths[0], 6);
+    CHECK(!brle::is_pure_causal(
+        flat.words, flat.indptr, qo_indptr, kv_page_indptr,
+        kv_last_lpl, page_size));
+}
+
 void test_non_causal_alternating() {
     namespace brle = pie_cuda_driver::brle;
     constexpr int page_size = 8;
-    // Single request, qo=1, kv=4. Mask = [F T F T] ─ alternating, not
+    // Single request, qo=1, kv=4. Mask = [F T F T] — alternating, not
     // a causal triangle.
-    std::vector<std::uint32_t> runs = {1u, 1u, 1u, 1u};
-    std::vector<std::uint32_t> indptr = {0u, 4u};
+    std::vector<std::uint32_t> runs = {0b1010u};
+    std::vector<std::uint32_t> indptr = {0u, 1u};
     std::vector<std::uint32_t> qo_indptr      = {0u, 1u};
     std::vector<std::uint32_t> kv_page_indptr = {0u, 1u};
     std::vector<std::uint32_t> kv_last_lpl    = {4u};
@@ -205,10 +223,9 @@ void test_runs_truncated_at_kv_len() {
     namespace brle = pie_cuda_driver::brle;
     constexpr int page_size = 4;
     // Single request: qo=1, kv=3 (1 page = 4 - 1 unused slot).
-    // BRLE says false=0 true=10 false=0; the decoder should clip the
-    // true run to kv=3 instead of overflowing.
-    std::vector<std::uint32_t> runs = {0u, 10u, 0u};
-    std::vector<std::uint32_t> indptr = {0u, 3u};
+    // The packed row has ten set bits; the decoder clips to kv=3.
+    std::vector<std::uint32_t> runs = {0x3ffu};
+    std::vector<std::uint32_t> indptr = {0u, 1u};
     std::vector<std::uint32_t> qo_indptr      = {0u, 1u};
     std::vector<std::uint32_t> kv_page_indptr = {0u, 1u};
     std::vector<std::uint32_t> kv_last_lpl    = {3u};
@@ -228,6 +245,7 @@ int main() {
     test_empty_batch();
     test_pure_causal_single_request();
     test_pure_causal_multi_request();
+    test_causal_prefix_with_reserved_pages();
     test_non_causal_alternating();
     test_runs_truncated_at_kv_len();
 

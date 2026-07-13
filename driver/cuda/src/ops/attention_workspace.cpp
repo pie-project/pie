@@ -18,13 +18,24 @@ AttentionWorkspace AttentionWorkspace::allocate(
         DType::UINT8, {static_cast<std::int64_t>(float_workspace_bytes)});
     ws.int_buf_ = DeviceTensor::allocate(
         DType::UINT8, {static_cast<std::int64_t>(int_workspace_bytes)});
-    CUDA_CHECK(cudaMallocHost(&ws.page_locked_int_, int_workspace_bytes));
     try {
-        CUDA_CHECK(cudaEventCreateWithFlags(
-            &ws.plan_upload_done_, cudaEventDisableTiming));
+        for (auto& staging : ws.plan_staging_) {
+            CUDA_CHECK(cudaMallocHost(
+                &staging.host, int_workspace_bytes));
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &staging.upload_done, cudaEventDisableTiming));
+        }
     } catch (...) {
-        cudaFreeHost(ws.page_locked_int_);
-        ws.page_locked_int_ = nullptr;
+        for (auto& staging : ws.plan_staging_) {
+            if (staging.upload_done != nullptr) {
+                cudaEventDestroy(staging.upload_done);
+                staging.upload_done = nullptr;
+            }
+            if (staging.host != nullptr) {
+                cudaFreeHost(staging.host);
+                staging.host = nullptr;
+            }
+        }
         throw;
     }
     return ws;
@@ -33,62 +44,71 @@ AttentionWorkspace AttentionWorkspace::allocate(
 AttentionWorkspace::AttentionWorkspace(AttentionWorkspace&& other) noexcept
     : float_buf_(std::move(other.float_buf_)),
       int_buf_(std::move(other.int_buf_)),
-      page_locked_int_(other.page_locked_int_),
-      plan_upload_done_(other.plan_upload_done_),
-      plan_upload_pending_(other.plan_upload_pending_)
+      plan_staging_(other.plan_staging_),
+      active_plan_slot_(other.active_plan_slot_),
+      next_plan_slot_(other.next_plan_slot_)
 {
-    other.page_locked_int_ = nullptr;
-    other.plan_upload_done_ = nullptr;
-    other.plan_upload_pending_ = false;
+    other.plan_staging_ = {};
+    other.active_plan_slot_ = 0;
+    other.next_plan_slot_ = 0;
 }
 
 AttentionWorkspace& AttentionWorkspace::operator=(AttentionWorkspace&& other) noexcept {
     if (this != &other) {
-        if (plan_upload_pending_) {
-            cudaEventSynchronize(plan_upload_done_);
-        }
-        if (plan_upload_done_) {
-            cudaEventDestroy(plan_upload_done_);
-        }
-        if (page_locked_int_) {
-            cudaFreeHost(page_locked_int_);
+        for (auto& staging : plan_staging_) {
+            if (staging.upload_pending) {
+                cudaEventSynchronize(staging.upload_done);
+            }
+            if (staging.upload_done != nullptr) {
+                cudaEventDestroy(staging.upload_done);
+            }
+            if (staging.host != nullptr) {
+                cudaFreeHost(staging.host);
+            }
         }
         float_buf_ = std::move(other.float_buf_);
         int_buf_ = std::move(other.int_buf_);
-        page_locked_int_ = other.page_locked_int_;
-        plan_upload_done_ = other.plan_upload_done_;
-        plan_upload_pending_ = other.plan_upload_pending_;
-        other.page_locked_int_ = nullptr;
-        other.plan_upload_done_ = nullptr;
-        other.plan_upload_pending_ = false;
+        plan_staging_ = other.plan_staging_;
+        active_plan_slot_ = other.active_plan_slot_;
+        next_plan_slot_ = other.next_plan_slot_;
+        other.plan_staging_ = {};
+        other.active_plan_slot_ = 0;
+        other.next_plan_slot_ = 0;
     }
     return *this;
 }
 
 AttentionWorkspace::~AttentionWorkspace() {
-    if (plan_upload_pending_) {
-        cudaEventSynchronize(plan_upload_done_);
-        plan_upload_pending_ = false;
-    }
-    if (plan_upload_done_) {
-        cudaEventDestroy(plan_upload_done_);
-        plan_upload_done_ = nullptr;
-    }
-    if (page_locked_int_) {
-        cudaFreeHost(page_locked_int_);
-        page_locked_int_ = nullptr;
+    for (auto& staging : plan_staging_) {
+        if (staging.upload_pending) {
+            cudaEventSynchronize(staging.upload_done);
+            staging.upload_pending = false;
+        }
+        if (staging.upload_done != nullptr) {
+            cudaEventDestroy(staging.upload_done);
+            staging.upload_done = nullptr;
+        }
+        if (staging.host != nullptr) {
+            cudaFreeHost(staging.host);
+            staging.host = nullptr;
+        }
     }
 }
 
 void AttentionWorkspace::begin_plan_update() {
-    if (!plan_upload_pending_) return;
-    CUDA_CHECK(cudaEventSynchronize(plan_upload_done_));
-    plan_upload_pending_ = false;
+    active_plan_slot_ = next_plan_slot_;
+    next_plan_slot_ =
+        (next_plan_slot_ + 1) % kPlanStagingSlots;
+    auto& staging = plan_staging_[active_plan_slot_];
+    if (!staging.upload_pending) return;
+    CUDA_CHECK(cudaEventSynchronize(staging.upload_done));
+    staging.upload_pending = false;
 }
 
 void AttentionWorkspace::end_plan_update(cudaStream_t stream) {
-    CUDA_CHECK(cudaEventRecord(plan_upload_done_, stream));
-    plan_upload_pending_ = true;
+    auto& staging = plan_staging_[active_plan_slot_];
+    CUDA_CHECK(cudaEventRecord(staging.upload_done, stream));
+    staging.upload_pending = true;
 }
 
 bool flashinfer_decode_supports_gqa(int gqa) {

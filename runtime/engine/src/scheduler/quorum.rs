@@ -20,9 +20,10 @@ use super::worker::FireClause;
 use crate::scheduler::ProcessId;
 
 /// Default run-ahead depth: one batch computing plus one prefetched.
-/// Override via `PIE_SCHED_MAX_IN_FLIGHT`
-/// (see [`configured_max_in_flight`]).
+/// `PIE_SCHED_MAX_IN_FLIGHT` may reduce this to one; depth above two is
+/// intentionally capped to match the driver's double-buffered upload staging.
 const DEFAULT_MAX_IN_FLIGHT: usize = 2;
+const MAX_IN_FLIGHT: usize = 2;
 
 const COLD_HOLD_US: u64 = 2_000;
 
@@ -46,7 +47,7 @@ fn parse_max_in_flight(value: Option<&str>) -> usize {
     value
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_IN_FLIGHT)
-        .max(1)
+        .clamp(1, MAX_IN_FLIGHT)
 }
 
 pub(super) fn configured_max_in_flight() -> usize {
@@ -445,7 +446,7 @@ mod tests {
     fn max_in_flight_configuration_is_truthful_and_safely_capped() {
         assert_eq!(parse_max_in_flight(None), DEFAULT_MAX_IN_FLIGHT);
         assert_eq!(parse_max_in_flight(Some("0")), 1);
-        assert_eq!(parse_max_in_flight(Some("4")), 4);
+        assert_eq!(parse_max_in_flight(Some("4")), MAX_IN_FLIGHT);
         assert_eq!(parse_max_in_flight(Some("invalid")), DEFAULT_MAX_IN_FLIGHT);
         assert!(configured_max_in_flight() >= 1);
     }
