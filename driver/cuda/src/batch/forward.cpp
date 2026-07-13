@@ -561,7 +561,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
             in.forward_R,
             in.forward_N,
             graph_variant,
-            in.program_set_hash,
+            // PTIR phases execute outside the captured model body whenever
+            // stage_hooks is null, so their program identity cannot affect
+            // graph topology.
+            0,
             in.has_write_desc,
             in.structured_window_left,
         };

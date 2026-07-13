@@ -732,20 +732,27 @@ void handle_fire_batch(
                 "buffered RS fold is state-only and cannot sample logits");
         }
 
-        // Direct PTIR launches keep the forward geometry exact. Anatomical
-        // stages run through explicit model hooks; boundary-only programs remain
-        // eligible for a program-set-keyed graph variant.
+        // Anatomical stages run through explicit model hooks. Boundary-only
+        // PTIR stays outside the captured model body, whose decode geometry may
+        // be padded to a reusable graph bucket below.
         ForwardInputViews forward_inputs = make_forward_input_views(
             tok_view, pos_view, qo_view, kvpi_view, kvpp_view, kvlpl_view, R);
+        std::vector<std::uint32_t> graph_tokens;
+        std::vector<std::uint32_t> graph_positions;
+        std::vector<std::uint32_t> graph_qo_indptr;
+        std::vector<std::uint32_t> graph_kv_page_indices;
+        std::vector<std::uint32_t> graph_kv_page_indptr;
+        std::vector<std::uint32_t> graph_kv_last_page_lens;
         if (rs_is_fold) {
             forward_inputs.qo_indptr =
                 std::span<const std::uint32_t>(rs_plan.fold_qo_indptr);
             forward_inputs.total_tokens =
                 static_cast<int>(rs_plan.fold_tokens);
         }
-        const int forward_N = forward_inputs.total_tokens;
-        const int forward_R = forward_inputs.num_requests;
-        const std::uint32_t* h_qo_forward = forward_inputs.qo_indptr.data();
+        int forward_N = forward_inputs.total_tokens;
+        int forward_R = forward_inputs.num_requests;
+        const std::uint32_t* h_qo_forward =
+            forward_inputs.qo_indptr.data();
         const std::uint32_t* h_kvpi_forward =
             forward_inputs.kv_page_indices.data();
         const std::uint32_t* h_kvpp_forward =
@@ -804,10 +811,24 @@ void handle_fire_batch(
                 kvpp_view_wire.data(), kvpp_view_wire.size());
             const auto kvlpl_span = std::span<const std::uint32_t>(
                 kvlpl_view_orig.data(), kvlpl_view_orig.size());
-            if (!pie_cuda_driver::brle::is_pure_causal(
+            bool pure_causal =
+                pie_cuda_driver::brle::is_pure_causal(
                     fmask_view, mskptr_view,
                     qo_span, kvpp_span, kvlpl_span,
-                    kv_cache.page_size())) {
+                    kv_cache.page_size());
+            if (!pure_causal && !view.has_user_mask && is_pure_decode) {
+                std::vector<std::uint32_t> logical_kv_lens;
+                pure_causal =
+                    pie_cuda_driver::brle::causal_prefix_lengths(
+                        fmask_view,
+                        mskptr_view,
+                        qo_span,
+                        kvpp_span,
+                        kvlpl_span,
+                        kv_cache.page_size(),
+                        logical_kv_lens);
+            }
+            if (!pure_causal) {
                 if (dg_resolved) {
                     // A MULTI-program batch cannot honor wire BRLE masks
                     // (they index the wire request layout; the scheduler
@@ -1115,6 +1136,105 @@ void handle_fire_batch(
                     : 0)) {
             throw std::runtime_error(
                 "RS metadata cannot be represented by the TP payload");
+        }
+
+        const bool graph_padding_eligible =
+            engine.graph_cache != nullptr &&
+            forward_fn.graph_safe &&
+            is_pure_decode &&
+            !have_custom_mask &&
+            !rs_is_write &&
+            !rs_is_fold &&
+            !use_slots &&
+            !has_attention_stages &&
+            !has_write_desc &&
+            img_num_images == 0 &&
+            aud_num_clips == 0 &&
+            engine.tp_comm == nullptr &&
+            engine.graph_pad_page >= 0;
+        if (graph_padding_eligible) {
+            const int bucket = forward_graph_request_bucket(
+                forward_R, engine.max_forward_requests);
+            const int padding = bucket - forward_R;
+            const int page_size = kv_cache.page_size();
+            const std::size_t padded_tokens =
+                forward_inputs.tokens.size() +
+                static_cast<std::size_t>(std::max(padding, 0));
+            const std::size_t padded_requests =
+                static_cast<std::size_t>(std::max(bucket, 0));
+            const bool padding_fits =
+                padded_tokens <= pi.tokens.size() &&
+                padded_tokens <= pi.positions.size() &&
+                padded_tokens <= static_cast<std::size_t>(
+                    tensor_rows(ws.logits)) &&
+                padded_requests + 1 <= pi.qo_indptr.size() &&
+                padded_requests + 1 <= pi.kv_page_indptr.size() &&
+                padded_requests <= pi.kv_last_page_lens.size() &&
+                forward_inputs.kv_page_indices.size() +
+                        static_cast<std::size_t>(
+                            std::max(padding, 0)) <=
+                    pi.kv_page_indices.size();
+            if (padding > 0 && padding <= page_size && padding_fits) {
+                graph_tokens.assign(
+                    forward_inputs.tokens.begin(),
+                    forward_inputs.tokens.end());
+                graph_positions.assign(
+                    forward_inputs.positions.begin(),
+                    forward_inputs.positions.end());
+                graph_qo_indptr.assign(
+                    forward_inputs.qo_indptr.begin(),
+                    forward_inputs.qo_indptr.end());
+                graph_kv_page_indices.assign(
+                    forward_inputs.kv_page_indices.begin(),
+                    forward_inputs.kv_page_indices.end());
+                graph_kv_page_indptr.assign(
+                    forward_inputs.kv_page_indptr.begin(),
+                    forward_inputs.kv_page_indptr.end());
+                graph_kv_last_page_lens.assign(
+                    forward_inputs.kv_last_page_lens.begin(),
+                    forward_inputs.kv_last_page_lens.end());
+                for (int pad = 0; pad < padding; ++pad) {
+                    graph_tokens.push_back(0);
+                    graph_positions.push_back(
+                        static_cast<std::uint32_t>(pad));
+                    graph_qo_indptr.push_back(
+                        graph_qo_indptr.back() + 1);
+                    graph_kv_page_indices.push_back(
+                        static_cast<std::uint32_t>(
+                            engine.graph_pad_page));
+                    graph_kv_page_indptr.push_back(
+                        graph_kv_page_indptr.back() + 1);
+                    graph_kv_last_page_lens.push_back(
+                        static_cast<std::uint32_t>(pad + 1));
+                }
+                forward_inputs = make_forward_input_views(
+                    graph_tokens,
+                    graph_positions,
+                    graph_qo_indptr,
+                    graph_kv_page_indices,
+                    graph_kv_page_indptr,
+                    graph_kv_last_page_lens,
+                    bucket);
+                forward_N = forward_inputs.total_tokens;
+                forward_R = forward_inputs.num_requests;
+                h_qo_forward = forward_inputs.qo_indptr.data();
+                h_kvpi_forward =
+                    forward_inputs.kv_page_indices.data();
+                h_kvpp_forward =
+                    forward_inputs.kv_page_indptr.data();
+                h_kvlpl_forward =
+                    forward_inputs.kv_last_page_lens.data();
+                pi.tokens.copy_from_host(forward_inputs.tokens);
+                pi.positions.copy_from_host(forward_inputs.positions);
+                pi.qo_indptr.copy_from_host(
+                    forward_inputs.qo_indptr);
+                pi.kv_page_indices.copy_from_host(
+                    forward_inputs.kv_page_indices);
+                pi.kv_page_indptr.copy_from_host(
+                    forward_inputs.kv_page_indptr);
+                pi.kv_last_page_lens.copy_from_host(
+                    forward_inputs.kv_last_page_lens);
+            }
         }
 
         // TP fan-out. Rank 0 broadcasts the per-fire payload (header +

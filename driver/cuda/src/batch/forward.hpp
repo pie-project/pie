@@ -477,8 +477,8 @@ struct StepProfileTimer {
 };
 
 // Wire-shaped forward input spans for one fire, resolved in
-// `batch/compose.cpp` (either straight from the wire view or from the
-// composed device-geometry batch) and handed to `run_forward_dispatch`.
+// `batch/compose.cpp` (straight from the wire, composed device geometry, or a
+// graph-padded decode bucket) and handed to `run_forward_dispatch`.
 struct ForwardInputViews {
     std::span<const std::uint32_t> tokens;
     std::span<const std::uint32_t> positions;
@@ -490,10 +490,8 @@ struct ForwardInputViews {
     int num_requests = 0;
 };
 
-// Wraps the fire's already-resolved spans into `ForwardInputViews`. Direct
-// PTIR launches always dispatch at the exact wire/composed geometry — there
-// is no separate "graph-padded" request count at this callsite — so this is
-// a thin, allocation-free adapter rather than a padding/copy path.
+// Wraps already-resolved spans into `ForwardInputViews`. The adapter itself is
+// allocation-free; `batch/compose.cpp` owns any graph-padding storage.
 ForwardInputViews make_forward_input_views(
     std::span<const std::uint32_t> tokens,
     std::span<const std::uint32_t> positions,
@@ -507,10 +505,9 @@ ForwardInputViews make_forward_input_views(
 // and passed by-ref so the dispatcher can pick between graph replay
 // and a direct `forward_fn.body` call without a 20-arg signature.
 //
-// Direct PTIR launches keep the forward geometry exact. A launch with
-// anatomical stages takes the direct body path so its per-layer hooks execute
-// on every invocation; boundary-only programs may still use a compatible graph
-// variant keyed by their compiled program set.
+// A launch with anatomical stages takes the direct body path so its per-layer
+// hooks execute on every invocation. Boundary-only PTIR stays outside the model
+// graph and therefore does not alter its topology.
 struct ForwardDispatchInputs {
     int forward_R = 0;
     int forward_N = 0;
