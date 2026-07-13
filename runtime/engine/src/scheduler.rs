@@ -38,8 +38,9 @@ use anyhow::{Result, anyhow};
 // into the current mock-driver fire path vs. reserved/unit-test-only).
 #[allow(unused_imports)]
 pub(crate) use dispatch::{
-    bind_instance, close_instance, copy_d2d, copy_d2h, copy_h2d, copy_h2h, copy_kv_cells,
-    copy_rs_d2d, register_channel, register_program, resize_pool,
+    bind_instance, close_instance, copy_d2d, copy_d2h, copy_d2h_tracked, copy_h2d,
+    copy_h2d_tracked, copy_h2h, copy_kv_cells, copy_rs_d2d, register_channel, register_program,
+    resize_pool,
 };
 pub use stats::AggregateStats;
 pub use worker::BatchScheduler;
@@ -51,6 +52,51 @@ use crate::driver::DriverId;
 /// membership, wait-set keys). Kept as the leaf `uuid::Uuid` representation
 /// so the scheduler stays below the guest runtime in the layering.
 pub type ProcessId = uuid::Uuid;
+
+#[derive(Clone)]
+pub(crate) struct ControlCompletion {
+    inner: Arc<ControlCompletionState>,
+}
+
+struct ControlCompletionState {
+    result: Mutex<Option<std::result::Result<(), String>>>,
+    notify: tokio::sync::Notify,
+}
+
+impl ControlCompletion {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(ControlCompletionState {
+                result: Mutex::new(None),
+                notify: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) async fn wait(&self) -> Result<()> {
+        loop {
+            if let Some(result) = self.inner.result.lock().unwrap().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = self.inner.result.lock().unwrap().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            notified.await;
+        }
+    }
+
+    fn resolve(&self, result: &Result<()>) {
+        let result = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"));
+        *self.inner.result.lock().unwrap() = Some(result);
+        self.inner.notify.notify_waiters();
+    }
+}
 
 // =============================================================================
 // Scheduler handle registry (moved out of `driver/registry.rs`)
@@ -251,6 +297,36 @@ pub type LaunchPreparation = Box<
 
 pub type RetryClassifier = Box<dyn Fn() -> Option<String> + Send + Sync>;
 
+fn rs_state_copy_plan(
+    src_slots: Vec<u32>,
+    dst_slots: Vec<u32>,
+) -> Result<Option<crate::driver::StateCopyPlan>> {
+    if src_slots.len() != dst_slots.len() {
+        return Err(anyhow!(
+            "recurrent-state copy source/destination lengths differ: {} != {}",
+            src_slots.len(),
+            dst_slots.len()
+        ));
+    }
+    if src_slots.is_empty() {
+        return Ok(None);
+    }
+    let slot_ranges = src_slots
+        .into_iter()
+        .zip(dst_slots)
+        .map(
+            |(src_slot_id, dst_slot_id)| pie_driver_abi::PieStateCopyRange {
+                src_slot_id,
+                dst_slot_id,
+                src_token_offset: 0,
+                dst_token_offset: 0,
+                token_count: 0,
+            },
+        )
+        .collect();
+    Ok(Some(crate::driver::StateCopyPlan { slot_ranges }))
+}
+
 pub fn submit_async(
     request: crate::driver::LaunchPlan,
     driver_idx: usize,
@@ -290,6 +366,32 @@ pub fn submit_async_deferred(
         completion,
         pipeline_id,
         preparation_order_key,
+        None,
+        preparation,
+        retry_classifier,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn submit_async_deferred_with_rs_copy(
+    request: crate::driver::LaunchPlan,
+    driver_idx: usize,
+    instance_id: u64,
+    pipeline_id: Option<ProcessId>,
+    preparation_order_key: Option<u64>,
+    completion: crate::driver::WorkItemCompletion,
+    preparation: LaunchPreparation,
+    retry_classifier: Option<RetryClassifier>,
+    rs_copy_src: Vec<u32>,
+    rs_copy_dst: Vec<u32>,
+) -> Result<()> {
+    scheduler_handle(driver_idx)?.submit_deferred(
+        request,
+        instance_id,
+        completion,
+        pipeline_id,
+        preparation_order_key,
+        rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
         preparation,
         retry_classifier,
     )
@@ -357,6 +459,7 @@ pub fn submit_async_with_kv_copy(
         last_page_len,
         pipeline_id,
         prelaunch_copy,
+        None,
     )
 }
 
@@ -407,6 +510,40 @@ pub fn submit_prebuilt_async_with_kv_copy(
         physical_page_ids,
         last_page_len,
         prelaunch_copy,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn submit_prebuilt_async_with_kv_and_rs_copy(
+    request: crate::driver::LaunchPlan,
+    driver_idx: usize,
+    instance_id: u64,
+    physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
+    last_page_len: u32,
+    completion: crate::driver::WorkItemCompletion,
+    copy_src: Vec<u32>,
+    copy_dst: Vec<u32>,
+    rs_copy_src: Vec<u32>,
+    rs_copy_dst: Vec<u32>,
+) -> Result<()> {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
+        src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_device_ordinal: 0,
+        dst_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_device_ordinal: 0,
+        src_page_ids: copy_src,
+        dst_page_ids: copy_dst,
+        cells: Vec::new(),
+    });
+    scheduler_handle(driver_idx)?.submit_prebuilt_with_copy(
+        request,
+        instance_id,
+        completion,
+        physical_page_ids,
+        last_page_len,
+        prelaunch_copy,
+        rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
     )
 }
 

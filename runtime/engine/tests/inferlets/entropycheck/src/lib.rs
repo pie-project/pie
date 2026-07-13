@@ -40,7 +40,7 @@ async fn main(_input: String) -> Result<String> {
         // Shannon entropy H = -Σ p·log p of the softmax over the vocab.
         let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
         let p = softmax(logits);
-        let h = neg(reduce_sum(mul(&p, log(&p))));
+        let h = entropy(&p);
         entropy_out.put(&h);
     });
 
@@ -49,6 +49,7 @@ async fn main(_input: String) -> Result<String> {
     let entropy = entropy_out
         .take()
         .get::<f32>()
+        .await
         .map_err(|e| format!("entropy take: {e}"))?[0];
     pipeline.close();
 

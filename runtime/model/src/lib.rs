@@ -33,6 +33,7 @@ pub fn register(
     arch_name: &str,
     kv_page_size: u32,
     rs: RsCaps,
+    ptir: PtirCaps,
     tokenizer_path: PathBuf,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
@@ -52,6 +53,7 @@ pub fn register(
         instruct,
         kv_page_size,
         rs_caps: rs,
+        ptir_caps: ptir,
         tokenizer,
         vocab_size,
     });
@@ -82,6 +84,7 @@ pub struct Model {
     /// (`rs-state-size`/`rs-buffer-page-size`/`rs-fold-granularity`). All
     /// 0/0/1 for pure-attention models.
     rs_caps: RsCaps,
+    ptir_caps: PtirCaps,
     tokenizer: Arc<Tokenizer>,
     /// Logits/output vocab dimension (= hf_config.vocab_size from the model's
     /// config.json). May EXCEED tokenizer.vocab_size() due to padding — use
@@ -101,6 +104,14 @@ pub struct RsCaps {
     pub buffer_page_size: u32,
     /// Fold granularity in tokens (`rs-fold-granularity`; 1 = token-causal).
     pub fold_granularity: u32,
+}
+
+/// Model-gated values that a loaded backend can bind into PTIR programs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PtirCaps {
+    pub has_mtp_logits: bool,
+    pub has_mtp_drafts: bool,
+    pub has_value_head: bool,
 }
 
 impl std::fmt::Debug for Model {
@@ -181,5 +192,9 @@ impl Model {
     /// `rs-fold-granularity`). 0/0/1 for pure-attention models.
     pub fn rs_caps(&self) -> RsCaps {
         self.rs_caps
+    }
+
+    pub fn ptir_caps(&self) -> PtirCaps {
+        self.ptir_caps
     }
 }

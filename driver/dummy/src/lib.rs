@@ -63,6 +63,9 @@ pub struct DummyDriverOptions {
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,
     pub max_page_refs: u32,
+    pub has_mtp_logits: bool,
+    pub has_mtp_drafts: bool,
+    pub has_value_head: bool,
     pub callback_delay_ms: u64,
     pub reject_launches: bool,
     pub reject_launches_remaining: u32,
@@ -86,6 +89,9 @@ impl Default for DummyDriverOptions {
             max_forward_tokens: 4096,
             max_forward_requests: 256,
             max_page_refs: 65_536,
+            has_mtp_logits: true,
+            has_mtp_drafts: true,
+            has_value_head: true,
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,
@@ -273,6 +279,9 @@ impl DummyDriver {
                 rs_cache_required: false,
                 rs_cache_slots: 0,
                 rs_cache_slot_bytes: 0,
+                has_mtp_logits: options.has_mtp_logits,
+                has_mtp_drafts: options.has_mtp_drafts,
+                has_value_head: options.has_value_head,
                 max_forward_tokens: options.max_forward_tokens,
                 max_forward_requests: options.max_forward_requests,
                 max_page_refs: options.max_page_refs,
@@ -879,9 +888,9 @@ impl DummyDriver {
             page_size: self.capabilities.kv_page_size,
             num_layers: 2,
             activation: DType::F32,
-            has_mtp_logits: true,
-            has_mtp_drafts: true,
-            has_value_head: true,
+            has_mtp_logits: self.capabilities.has_mtp_logits,
+            has_mtp_drafts: self.capabilities.has_mtp_drafts,
+            has_value_head: self.capabilities.has_value_head,
             kernels: vec![KernelInfo {
                 name: "boom".to_string(),
                 sink_scope: None,
@@ -1585,8 +1594,8 @@ fn ensure_terminal_cell_pending(cell: *mut PieTerminalCell) -> Result<()> {
     Ok(())
 }
 
-fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<()> {
-    let _token_ids = copy_u32_slice(desc.token_ids, "launch.token_ids")?;
+fn validate_launch_shape(desc: &PieLaunchDesc, _instance_count: usize) -> Result<()> {
+    let token_ids = copy_u32_slice(desc.token_ids, "launch.token_ids")?;
     let kv_page_indices = copy_u32_slice(desc.kv_page_indices, "launch.kv_page_indices")?;
     let kv_page_indptr = copy_u32_slice(desc.kv_page_indptr, "launch.kv_page_indptr")?;
     let kv_last_page_lens = copy_u32_slice(desc.kv_last_page_lens, "launch.kv_last_page_lens")?;
@@ -1611,26 +1620,24 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
     let mask_request = copy_u32_slice(desc.masks.request_indptr, "launch.masks.request_indptr")?;
     let mask_word = copy_u32_slice(desc.masks.word_indptr, "launch.masks.word_indptr")?;
     let mask_words = copy_u32_slice(desc.masks.words, "launch.masks.words")?;
+    let row_count = qo_indptr.len().saturating_sub(1);
 
     if !kv_page_indptr.is_empty() || !kv_page_indices.is_empty() {
         validate_indptr(
             &kv_page_indptr,
             kv_page_indices.len(),
-            instance_count,
+            row_count,
             "launch.kv_page_indptr",
         )?;
     }
     if !kv_last_page_lens.is_empty() {
         ensure!(
-            kv_last_page_lens.len() == instance_count,
-            "launch.kv_last_page_lens must have one entry per instance"
+            kv_last_page_lens.len() == row_count,
+            "launch.kv_last_page_lens must have one entry per resolved row"
         );
     }
     if !qo_indptr.is_empty() {
-        ensure!(
-            qo_indptr.len() == instance_count + 1,
-            "launch.qo_indptr length mismatch"
-        );
+        validate_indptr(&qo_indptr, token_ids.len(), row_count, "launch.qo_indptr")?;
         ensure!(
             qo_indptr.windows(2).all(|w| w[0] <= w[1]),
             "launch.qo_indptr must be monotonic"
@@ -1640,29 +1647,39 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
         validate_indptr(
             &sampling_indptr,
             sampling_indices.len(),
-            instance_count,
+            row_count,
             "launch.sampling_indptr",
         )?;
     }
-    if !rs_slot_ids.is_empty() || !rs_slot_flags.is_empty() || !rs_fold_lens.is_empty() {
+    if !rs_slot_ids.is_empty() || !rs_slot_flags.is_empty() {
         ensure!(
-            rs_slot_ids.len() == instance_count
-                && rs_slot_flags.len() == instance_count
-                && rs_fold_lens.len() == instance_count,
-            "launch rs slot vectors must be parallel to instance_ids"
+            rs_slot_ids.len() == rs_slot_flags.len(),
+            "launch rs slot id/flag vectors must be parallel"
+        );
+        if !qo_indptr.is_empty() {
+            ensure!(
+                rs_slot_ids.len() == row_count,
+                "launch rs slot vectors must match resolved qo rows"
+            );
+        }
+    }
+    if !rs_fold_lens.is_empty() {
+        ensure!(
+            rs_fold_lens.len() == rs_slot_ids.len(),
+            "launch rs fold lengths must match rs slot vectors"
         );
     }
     if !rs_buffer_slot_indptr.is_empty() || !rs_buffer_slot_ids.is_empty() {
         validate_indptr(
             &rs_buffer_slot_indptr,
             rs_buffer_slot_ids.len(),
-            instance_count,
+            row_count,
             "launch.rs_buffer_slot_indptr",
         )?;
     }
     if !mask_request.is_empty() {
         ensure!(
-            mask_request.len() == instance_count + 1,
+            mask_request.len() == row_count + 1,
             "launch.masks.request_indptr length mismatch"
         );
         ensure!(
@@ -1677,7 +1694,7 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
     }
     if !image_indptr.is_empty() {
         ensure!(
-            image_indptr.len() == instance_count + 1,
+            image_indptr.len() == row_count + 1,
             "launch.image_indptr length mismatch"
         );
         ensure!(
@@ -1701,7 +1718,7 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
     }
     if !audio_indptr.is_empty() {
         ensure!(
-            audio_indptr.len() == instance_count + 1,
+            audio_indptr.len() == row_count + 1,
             "launch.audio_indptr length mismatch"
         );
         ensure!(
@@ -3339,6 +3356,54 @@ mod tests {
         assert!(
             callbacks.notifications().is_empty(),
             "sync validation must not notify"
+        );
+    }
+
+    #[test]
+    fn multi_row_rs_shape_uses_resolved_rows_not_instance_count() {
+        let tokens = [10u32, 11];
+        let qo_indptr = [0u32, 1, 2];
+        let rs_slot_ids = [7u32, 9];
+        let rs_slot_flags = [pie_driver_abi::PIE_RS_FLAG_RESET, 0];
+        let desc = PieLaunchDesc {
+            token_ids: PieU32Slice {
+                ptr: tokens.as_ptr(),
+                len: tokens.len(),
+            },
+            qo_indptr: PieU32Slice {
+                ptr: qo_indptr.as_ptr(),
+                len: qo_indptr.len(),
+            },
+            rs_slot_ids: PieU32Slice {
+                ptr: rs_slot_ids.as_ptr(),
+                len: rs_slot_ids.len(),
+            },
+            rs_slot_flags: pie_driver_abi::PieU8Slice {
+                ptr: rs_slot_flags.as_ptr(),
+                len: rs_slot_flags.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+        validate_launch_shape(&desc, 1).unwrap();
+
+        let one_slot = [7u32];
+        let one_flag = [0u8];
+        let wrong_rows = PieLaunchDesc {
+            rs_slot_ids: PieU32Slice {
+                ptr: one_slot.as_ptr(),
+                len: one_slot.len(),
+            },
+            rs_slot_flags: pie_driver_abi::PieU8Slice {
+                ptr: one_flag.as_ptr(),
+                len: one_flag.len(),
+            },
+            ..desc
+        };
+        assert!(
+            validate_launch_shape(&wrong_rows, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("resolved qo rows")
         );
     }
 

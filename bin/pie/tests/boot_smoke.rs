@@ -100,7 +100,7 @@ fn build_direct_channel_inferlet() -> Result<(PathBuf, PathBuf)> {
 }
 
 fn build_chat_completion_inferlet() -> Result<(PathBuf, PathBuf)> {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../inferlets");
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
     let crate_dir = workspace.join("chat-completion");
     let status = Command::new("cargo")
         .args([
@@ -127,7 +127,7 @@ fn build_chat_completion_inferlet() -> Result<(PathBuf, PathBuf)> {
 /// round-trips the real client path (REST → ingress → session → dispatch → worker → push_tokens →
 /// SSE). (3) Direct FFI: a client uploads and launches a real WASM inferlet, which executes a PTIR
 /// program through the dummy driver and returns the computed value. (4) Text completion: the
-/// production inferlet runs prefill and decode against synthetic logits and returns decoded text.
+/// curated inferlet fixture runs prefill and decode against synthetic logits and returns decoded text.
 /// Then shuts down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn standalone_runs_ping_direct_ffi_and_chat_completion_then_shuts_down() -> Result<()> {

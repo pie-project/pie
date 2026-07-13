@@ -2,17 +2,18 @@
 //! run-ahead engine (the WIT host glue lives one layer up, in the
 //! `inferlet::host` forward/pipeline modules).
 //!
-//! **Run-ahead** (overview §3): `pipeline.submit` NEVER blocks. It prepares the
+//! **Run-ahead** (overview §3): pure-attention `pipeline.submit` does not block.
+//! RS-bound submission first finalizes prior FIFO operations so folded-state
+//! preparation observes the preceding commit. It then prepares the
 //! fire (seeds, host puts, KV/RS projection), hands the request to the
 //! scheduler, and enqueues a [`PendingFire`] (the payload-free completion + the
 //! open KV/RS txns) on the pass — the classic `execute()`/`output()` split
-//! (`PendingForward`, Option A) applied to this engine. Step t+1 is prepared
-//! against t's OPTIMISTIC post-state (the `committed_tokens` cursor advances at
-//! submit), so a decode loop keeps the scheduler fed. `channel.take`/`read`
-//! are the await points: they finalize in-flight fires FIFO until the cell
-//! fills. A failed fire **poisons** the pass's host-reader channels (the only
-//! error path once submit is non-blocking) and fails the pass for further
-//! submits.
+//! (`PendingForward`, Option A) applied to this engine. Pure-attention KV step
+//! t+1 is prepared against t's OPTIMISTIC post-state (`committed_tokens`
+//! advances at submit); RS step t+1 waits for t's committed folded mapping.
+//! `channel.take`/`read` also finalize in-flight fires FIFO until the cell
+//! fills. A failed fire **poisons** the pass's host-reader channels and fails
+//! the pass for further submits.
 //!
 //! **Layering.** The orchestration functions below (`submit_pass`,
 //! `finalize_fire`, `drain_settled`, `wire_channels_to_pipeline`,
@@ -254,16 +255,111 @@ enum FireKv {
 pub struct PendingFire {
     completion: crate::driver::WorkItemCompletion,
     kv: FireKv,
-    rstxn: Option<rs::RsTxn>,
+    rstxns: Vec<rs::RsTxn>,
     ws_guard: KvFireLease,
     ws_rep: u32,
-    rs_rep: Option<u32>,
+    rs_reps: Vec<u32>,
     /// The owning pass, to fail it on a fire error (rep — the guest may have
     /// dropped the handle; failure marking is then moot).
     fwd_rep: u32,
     instance_id: u64,
     cells: BoundCells,
     failure: PipelineFailure,
+}
+
+type PreparedRs = (Vec<u32>, Vec<u8>, Vec<u32>, Vec<u32>, Vec<rs::RsTxn>);
+
+fn prepare_bound_rs<C: FireContext>(
+    ctx: &mut C,
+    stores: &crate::store::registry::Stores,
+    model: usize,
+    driver: usize,
+    rs_reps: &[u32],
+    qo_indptr: &[u32],
+    pipeline_scope: usize,
+) -> Anyhow<Result<PreparedRs, String>> {
+    let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
+    if let Err(error) = rs::validate_count(rs_reps.len(), qo_indptr, has_recurrent_state) {
+        return Ok(Err(format!("pipeline: recurrent-state binding: {error}")));
+    }
+
+    let mut working_sets = Vec::with_capacity(rs_reps.len());
+    for (row, &rep) in rs_reps.iter().enumerate() {
+        let resource: Resource<RsWorkingSet> = Resource::new_borrow(rep);
+        let rs = ctx.resources().get(&resource)?.clone();
+        if rs.model != model || rs.driver as usize != driver {
+            return Ok(Err(format!(
+                "pipeline: rs-working-set at request row {row} belongs to model/driver \
+                 ({}, {}), expected ({model}, {driver})",
+                rs.model, rs.driver
+            )));
+        }
+        if let Err(owner) = rs.claim_pipeline_scope(pipeline_scope) {
+            return Ok(Err(format!(
+                "pipeline: rs-working-set at request row {row} is already scoped to pipeline \
+                 {owner:#x}"
+            )));
+        }
+        working_sets.push(rs.id);
+    }
+
+    let prepared = {
+        let mut store = stores.rs.lock().unwrap();
+        rs::prepare_many(&mut store, &working_sets)
+    };
+    Ok(prepared
+        .map(|(ids, flags, (copy_src, copy_dst), txns)| (ids, flags, copy_src, copy_dst, txns))
+        .map_err(|error| format!("pipeline: rs prepare: {error}")))
+}
+
+fn abort_rs_transactions(stores: &crate::store::registry::Stores, txns: Vec<rs::RsTxn>) {
+    if txns.is_empty() {
+        return;
+    }
+    let mut store = stores.rs.lock().unwrap();
+    rs::abandon_many(&mut store, txns);
+}
+
+pub(crate) async fn drain_rs_predecessors<C: FireContext>(
+    ctx: &mut C,
+    fires: &PendingFires,
+) -> Anyhow<()> {
+    loop {
+        let completion = fires
+            .lock()
+            .unwrap()
+            .front()
+            .map(PendingOp::completion_signal);
+        let Some(mut completion) = completion else {
+            return Ok(());
+        };
+        if let Some(preemption) = ctx.preemption_signal() {
+            let notified = preemption.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            tokio::select! {
+                _ = &mut completion => {}
+                _ = &mut notified => {
+                    ctx.honor_preemption().await?;
+                    continue;
+                }
+            }
+        } else {
+            completion.await;
+        }
+
+        let op = {
+            let mut queue = fires.lock().unwrap();
+            queue
+                .front()
+                .is_some_and(PendingOp::is_settled)
+                .then(|| queue.pop_front())
+                .flatten()
+        };
+        if let Some(op) = op {
+            finalize_op(ctx, op).await?;
+        }
+    }
 }
 
 /// Poison every host-reader cell of a pass with the failed fire's error —
@@ -398,11 +494,20 @@ pub async fn submit_pass<C: FireContext>(
         if let Err(error) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
             return Ok(Err(error));
         }
+        if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
+            // RS mappings publish only at finalize. Correctness-first
+            // serialization prevents a later run-ahead fire from preparing
+            // against stale committed state (double RESET / repeated CoW).
+            drain_rs_predecessors(ctx, &pipe_fires).await?;
+            if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
+                return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
+            }
+        }
         let (
             geometry,
             cells,
             ws_rep,
-            rs_rep,
+            rs_reps,
             committed_tokens,
             fwd_rep,
             instance_id,
@@ -433,7 +538,7 @@ pub async fn submit_pass<C: FireContext>(
                 geometry,
                 p.cells.clone(),
                 p.kv_ws,
-                p.rs_ws,
+                p.rs_ws.clone(),
                 p.committed_tokens,
                 fwd.rep(),
                 p.bound_instance.instance_id,
@@ -474,45 +579,23 @@ pub async fn submit_pass<C: FireContext>(
             Err(error) => return Ok(Err(format!("pipeline: KV working set: {error}"))),
         };
 
-        // The recurrent-state slot for hybrid / linear-attention models
-        // (GDN, Mamba2): fresh RESET slab on the first fire, CoW-continue
-        // after. This remains before token/ticket reservation so every error
-        // path is reservation-free.
-        let rstxn = if let Some(rs_rep) = rs_rep {
-            let rs_res: Resource<RsWorkingSet> = Resource::new_borrow(rs_rep);
-            let rs = ctx.resources().get(&rs_res)?.clone();
-            let prepared = {
-                let mut rs_store = stores.rs.lock().unwrap();
-                rs::prepare(&mut rs_store, rs.id)
-            };
-            match prepared {
-                Ok((rs_slot_ids, rs_slot_flags, (rs_copy_src, rs_copy_dst), txn)) => {
-                    req.rs_slot_ids = rs_slot_ids;
-                    req.rs_slot_flags = rs_slot_flags;
-                    if !rs_copy_src.is_empty() {
-                        match crate::scheduler::copy_d2d(0, &rs_copy_src, &rs_copy_dst) {
-                            Ok(move_completion) => {
-                                pipe_fires.lock().unwrap().push_back(PendingOp::Move(
-                                    PendingMove {
-                                        completion: move_completion,
-                                        failure: pipeline_failure.clone(),
-                                    },
-                                ));
-                            }
-                            Err(e) => {
-                                tracing::warn!("pipeline rs CoW d2d copy failed: {e:#}");
-                            }
-                        }
-                    }
-                    Some(txn)
-                }
-                Err(e) => {
-                    return Ok(Err(format!("pipeline: rs prepare: {e}")));
-                }
-            }
-        } else {
-            None
+        // Recurrent-state rows are lowered independently, in resolved request
+        // order. Their CoW copies ride the scheduler's typed pre-launch state
+        // copy so a copy failure rejects this fire before model execution.
+        let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = match prepare_bound_rs(
+            ctx,
+            &stores,
+            ws.model,
+            ws.driver as usize,
+            &rs_reps,
+            &req.qo_indptr,
+            Arc::as_ptr(&pipe_fires) as usize,
+        )? {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(Err(error)),
         };
+        req.rs_slot_ids = rs_slot_ids;
+        req.rs_slot_flags = rs_slot_flags;
 
         // Mapping allocation is deferred, but extent order is not: publish the
         // submitted token extent now so another pass sharing this WS cannot
@@ -523,10 +606,7 @@ pub async fn submit_pass<C: FireContext>(
         } {
             Ok(floor) => floor,
             Err(error) => {
-                if let Some(rstxn) = rstxn {
-                    let mut rs_store = stores.rs.lock().unwrap();
-                    let _ = rs::finalize(&mut rs_store, rstxn, false);
-                }
+                abort_rs_transactions(&stores, rstxns);
                 return Ok(Err(format!("pipeline: KV visible token extent: {error}")));
             }
         };
@@ -537,30 +617,21 @@ pub async fn submit_pass<C: FireContext>(
         ) {
             Ok(reservation) => reservation,
             Err(error) => {
-                if let Some(rstxn) = rstxn {
-                    let mut rs_store = stores.rs.lock().unwrap();
-                    let _ = rs::finalize(&mut rs_store, rstxn, false);
-                }
+                abort_rs_transactions(&stores, rstxns);
                 return Ok(Err(format!("pipeline: KV working set: {error}")));
             }
         };
         let committed_tokens = match u32::try_from(extent_reservation.start_token()) {
             Ok(cursor) => cursor,
             Err(_) => {
-                if let Some(rstxn) = rstxn {
-                    let mut rs_store = stores.rs.lock().unwrap();
-                    let _ = rs::finalize(&mut rs_store, rstxn, false);
-                }
+                abort_rs_transactions(&stores, rstxns);
                 return Ok(Err("pipeline: KV token cursor exceeds u32".to_string()));
             }
         };
         let reserved_end = match committed_tokens.checked_add(new_tokens.len() as u32) {
             Some(end) => end,
             None => {
-                if let Some(rstxn) = rstxn {
-                    let mut rs_store = stores.rs.lock().unwrap();
-                    let _ = rs::finalize(&mut rs_store, rstxn, false);
-                }
+                abort_rs_transactions(&stores, rstxns);
                 return Ok(Err("pipeline: KV token cursor exceeds u32".to_string()));
             }
         };
@@ -851,7 +922,7 @@ pub async fn submit_pass<C: FireContext>(
                         .permanent_retry_cause(consume || publish)
                 })
         });
-        let submit_error = crate::scheduler::submit_async_deferred(
+        let submit_error = crate::scheduler::submit_async_deferred_with_rs_copy(
             req,
             0,
             instance_id,
@@ -860,15 +931,14 @@ pub async fn submit_pass<C: FireContext>(
             completion.clone(),
             preparation,
             Some(retry_classifier),
+            rs_copy_src,
+            rs_copy_dst,
         )
         .err()
         .map(|error| format!("{error:#}"));
         if let Some(error) = submit_error {
             let reason = format!("pipeline: submit failed: {error}");
-            if let Some(rstxn) = rstxn {
-                let mut rs_store = stores.rs.lock().unwrap();
-                let _ = rs::finalize(&mut rs_store, rstxn, false);
-            }
+            abort_rs_transactions(&stores, rstxns);
             ctx.resources().get_mut(&fwd)?.failed = Some(reason.clone());
             return Ok(Err(reason));
         }
@@ -890,10 +960,10 @@ pub async fn submit_pass<C: FireContext>(
             .push_back(PendingOp::Fire(PendingFire {
                 completion,
                 kv: FireKv::Deferred(kvtxn_slot),
-                rstxn,
+                rstxns,
                 ws_guard,
                 ws_rep,
-                rs_rep,
+                rs_reps,
                 fwd_rep,
                 instance_id,
                 cells,
@@ -1151,10 +1221,10 @@ pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
             let PendingFire {
                 completion,
                 kv,
-                rstxn,
+                rstxns,
                 ws_guard,
                 ws_rep: _,
-                rs_rep: _,
+                rs_reps: _,
                 fwd_rep: _,
                 instance_id: _,
                 cells,
@@ -1171,19 +1241,25 @@ pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
                 let mut kv_store = stores.kv.lock().unwrap();
                 let _ = kv::finalize(&mut kv_store, kvtxn, success);
             }
-            if let Some(rstxn) = rstxn {
+            let rs_failure = if rstxns.is_empty() {
+                None
+            } else {
                 let mut rs_store = stores.rs.lock().unwrap();
-                let _ = rs::finalize(&mut rs_store, rstxn, success);
-            }
+                rs::finalize_many(&mut rs_store, rstxns, success)
+                    .err()
+                    .map(|error| format!("pipeline: recurrent-state finalize failed: {error}"))
+            };
             if let Some(orchestrator) = crate::store::reclaim::contention() {
                 orchestrator.on_blocks_freed();
                 orchestrator.on_fire_retired();
             }
-            let reason = prior_failure.or_else(|| {
-                result
-                    .err()
-                    .map(|error| format!("pipeline: forward failed: {error:#}"))
-            });
+            let reason = prior_failure
+                .or_else(|| {
+                    result
+                        .err()
+                        .map(|error| format!("pipeline: forward failed: {error:#}"))
+                })
+                .or(rs_failure);
             if let Some(reason) = reason {
                 poison_readers(&cells, &reason);
                 let mut domain = failure.lock().unwrap();
@@ -1204,10 +1280,10 @@ async fn finalize_fire<C: FireContext>(ctx: &mut C, fire: PendingFire) -> Anyhow
     let PendingFire {
         completion,
         kv,
-        rstxn,
+        rstxns,
         ws_guard,
         ws_rep,
-        rs_rep,
+        rs_reps,
         fwd_rep,
         instance_id,
         cells,
@@ -1217,9 +1293,10 @@ async fn finalize_fire<C: FireContext>(ctx: &mut C, fire: PendingFire) -> Anyhow
     let result = completion.await;
     let success = result.is_ok() && prior_failure.is_none();
 
-    {
+    let rs_failure = {
         // Single-model, single-driver v1: fires are keyed to stores (0,0).
         let _ = ws_rep;
+        let _ = rs_reps;
         let stores = crate::store::registry::get(0, 0);
         match kv {
             FireKv::DeviceGeom { kvtxn } => {
@@ -1233,12 +1310,15 @@ async fn finalize_fire<C: FireContext>(ctx: &mut C, fire: PendingFire) -> Anyhow
                 }
             }
         }
-        if let Some(rstxn) = rstxn {
-            let _ = rs_rep;
+        if rstxns.is_empty() {
+            None
+        } else {
             let mut rs_store = stores.rs.lock().unwrap();
-            let _ = rs::finalize(&mut rs_store, rstxn, success);
+            rs::finalize_many(&mut rs_store, rstxns, success)
+                .err()
+                .map(|error| format!("pipeline: recurrent-state finalize failed: {error}"))
         }
-    } // store locks released before the contention drain re-locks pools
+    }; // store locks released before the contention drain re-locks pools
 
     // The fire's sequence retired: recycled slots (aborts, CoW'd tails,
     // collected suffixes) are allocatable now — wake parked allocators
@@ -1248,32 +1328,25 @@ async fn finalize_fire<C: FireContext>(ctx: &mut C, fire: PendingFire) -> Anyhow
         orch.on_fire_retired();
     }
 
-    if let Some(reason) = prior_failure {
-        poison_readers(&cells, &reason);
-        fail_pass(ctx, fwd_rep, &reason);
-        return Ok(());
-    }
-
     // Values are already visible through the release-published tail words
     // (plan §4.5) — resolving the fire only classifies success and settles
     // the transactions above.
-    let failure_reason = match result {
-        Ok(()) => {
-            reclaim_device_geometry_grants(ctx, fwd_rep, instance_id);
-            None
-        }
-        Err(e) => {
-            let reason = format!("pipeline: forward failed: {e:#}");
-            poison_readers(&cells, &reason);
-            fail_pass(ctx, fwd_rep, &reason);
-            Some(reason)
-        }
-    };
+    let failure_reason = prior_failure
+        .or_else(|| {
+            result
+                .err()
+                .map(|error| format!("pipeline: forward failed: {error:#}"))
+        })
+        .or(rs_failure);
     if let Some(reason) = failure_reason {
+        poison_readers(&cells, &reason);
+        fail_pass(ctx, fwd_rep, &reason);
         let mut domain = failure.lock().unwrap();
         if domain.is_none() {
             *domain = Some(reason);
         }
+    } else {
+        reclaim_device_geometry_grants(ctx, fwd_rep, instance_id);
     }
     drop(ws_guard);
     Ok(())
@@ -1323,8 +1396,17 @@ async fn fire_device_geometry<C: FireContext>(
     if let Err(e) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
         return Ok(Err(e));
     }
+    if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
+        drain_rs_predecessors(ctx, &pipe_fires).await?;
+        if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
+            return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
+        }
+    }
 
-    let ws_rep = ctx.resources().get(&fwd)?.kv_ws;
+    let (ws_rep, rs_reps) = {
+        let pass = ctx.resources().get(&fwd)?;
+        (pass.kv_ws, pass.rs_ws.clone())
+    };
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
     let page_size = ws.page_size;
@@ -1355,6 +1437,11 @@ async fn fire_device_geometry<C: FireContext>(
         copy_dst,
         dense_mask,
         accesses,
+        rs_slot_ids,
+        rs_slot_flags,
+        rs_copy_src,
+        rs_copy_dst,
+        rstxns,
     ) = {
         // Fail-fast.
         {
@@ -1520,6 +1607,36 @@ async fn fire_device_geometry<C: FireContext>(
                 }
             }
         };
+        // Device geometry resolves B request rows in-graph. Validate the bound
+        // RS list against that resolved arity before the launch and prepare one
+        // folded target per row. The wire `qo_indptr` itself remains
+        // driver-resolved; this host vector carries only its known row count.
+        let resolved_qo_indptr = vec![0; devgeo.b + 1];
+        let prepared_rs = prepare_bound_rs(
+            ctx,
+            &stores,
+            ws.model,
+            ws.driver as usize,
+            &rs_reps,
+            &resolved_qo_indptr,
+            Arc::as_ptr(&pipe_fires) as usize,
+        );
+        let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = match prepared_rs {
+            Ok(Ok(prepared)) => prepared,
+            outcome => {
+                {
+                    let mut kv_store = stores.kv.lock().unwrap();
+                    let _ = kv::finalize(&mut kv_store, kvtxn, false);
+                }
+                devgeo.lease.reclaim_after_fire(&vec![true; devgeo.b]);
+                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+                return match outcome {
+                    Ok(Err(error)) => Ok(Err(error)),
+                    Err(error) => Err(error),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+            }
+        };
         // Wire page refs (scheduler capacity accounting): this fire's
         // physical write targets.
         let wire_pages: Vec<u32> = pages.iter().map(|&(_, dst)| dst).collect();
@@ -1544,6 +1661,7 @@ async fn fire_device_geometry<C: FireContext>(
             error
         };
         if let Some(error) = fresh_error {
+            abort_rs_transactions(&stores, rstxns);
             let mut kv_store = stores.kv.lock().unwrap();
             let _ = kv::finalize(&mut kv_store, kvtxn, false);
             return Ok(Err(format!(
@@ -1568,12 +1686,19 @@ async fn fire_device_geometry<C: FireContext>(
             copy_dst,
             dense_mask,
             accesses,
+            rs_slot_ids,
+            rs_slot_flags,
+            rs_copy_src,
+            rs_copy_dst,
+            rstxns,
         )
     };
 
     let mut req = crate::driver::LaunchPlan::default();
     req.kv_translation = kv_translation;
     req.kv_translation_version = kv_translation_version;
+    req.rs_slot_ids = rs_slot_ids;
+    req.rs_slot_flags = rs_slot_flags;
     // A dense device mask (AttnMask channel) marks the fire mask-carrying;
     // the scheduler batches it SOLO (the composed multi-program batch
     // does not merge dense device masks — v1 scope).
@@ -1581,7 +1706,7 @@ async fn fire_device_geometry<C: FireContext>(
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
     let last_page_len = wire_pages.last().map(|_| page_size).unwrap_or(0);
-    let submit_error = crate::scheduler::submit_prebuilt_async_with_kv_copy(
+    let submit_error = crate::scheduler::submit_prebuilt_async_with_kv_and_rs_copy(
         req,
         0,
         instance_id,
@@ -1590,11 +1715,14 @@ async fn fire_device_geometry<C: FireContext>(
         completion.clone(),
         copy_src,
         copy_dst,
+        rs_copy_src,
+        rs_copy_dst,
     )
     .err()
     .map(|error| format!("{error:#}"));
     if let Some(error) = submit_error {
         let reason = format!("pipeline: device-geometry submit failed: {error}");
+        abort_rs_transactions(&stores, rstxns);
         {
             let mut kv_store = stores.kv.lock().unwrap();
             let _ = kv::finalize(&mut kv_store, kvtxn, false);
@@ -1611,10 +1739,10 @@ async fn fire_device_geometry<C: FireContext>(
         .push_back(PendingOp::Fire(PendingFire {
             completion,
             kv: FireKv::DeviceGeom { kvtxn },
-            rstxn: None,
+            rstxns,
             ws_guard,
             ws_rep,
-            rs_rep: None,
+            rs_reps,
             fwd_rep,
             instance_id,
             cells,

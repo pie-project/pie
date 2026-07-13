@@ -1,4 +1,5 @@
 #include "model/qwen3_5/qwen3_5_moe_forward.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -569,13 +570,18 @@ void linear_attn_body(
     Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la,
     RecurrentStateCache& state_cache,
-    int layer_idx, int N, int R, bool is_pure_decode,
+    int layer_idx, int linear_idx, int N, int R, bool is_pure_decode,
     const std::int32_t*  slot_ids_h,
     const std::int32_t*  slot_ids_d,
     const std::uint32_t* qo_indptr_h,
     const std::uint32_t* qo_indptr_d,
     ops::CublasHandle& cublas, cudaStream_t stream,
-    Qwen35MoeForwardProfile* profile)
+    Qwen35MoeForwardProfile* profile,
+    const std::int32_t* commit_len = nullptr,
+    const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
+    const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
+    bool rs_buffer_write = false,
+    bool rs_buffer_fold = false)
 {
     const int T        = std::max(1, fwd_cfg.tp_size);
     const int H        = cfg.hidden_size;
@@ -587,13 +593,15 @@ void linear_attn_body(
     const int V_dim    = V_h * V_d;
     const int conv_dim = 2 * K_dim + V_dim;
     const int conv_K   = cfg.linear_conv_kernel_dim;
+    const bool linear_decode = is_pure_decode && !rs_buffer_write;
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
     auto slot_for = [&](int r) -> int {
         return slot_ids_h ? slot_ids_h[r] : 0;
     };
     // Frozen verify: produce outputs but persist no recurrent/conv state (the
     // repair forward advances it through [input|accepted]). See qwen3_5_forward.
-    const bool write_state = !state_cache.verify_frozen();
+    const bool write_state =
+        !state_cache.verify_frozen() && !rs_buffer_write;
 
     const void* z_data = la.z.data();
     const void* a_data = la.a.data();
@@ -602,6 +610,54 @@ void linear_attn_body(
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_proj_ms : nullptr,
         stream, [&] {
+            if (rs_buffer_fold) {
+                const int page = state_cache.rs_buffer_page_tokens();
+                const std::size_t slab_a =
+                    static_cast<std::size_t>(page) * conv_dim;
+                const std::size_t slab_b =
+                    slab_a + static_cast<std::size_t>(page) * V_h;
+                for (int r = 0; r < R; ++r) {
+                    const int qo0 = static_cast<int>(qo_indptr_h[r]);
+                    const int nr =
+                        static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                    const std::uint32_t s0 =
+                        rs_buffer_slot_indptr_h[r];
+                    const std::uint32_t s1 =
+                        rs_buffer_slot_indptr_h[r + 1];
+                    for (std::uint32_t j = 0; s0 + j < s1; ++j) {
+                        const int tok0 = static_cast<int>(j) * page;
+                        const int count = std::min(page, nr - tok0);
+                        if (count <= 0) break;
+                        auto* slab = static_cast<std::uint16_t*>(
+                            state_cache.rs_buffer_slab(
+                                linear_idx,
+                                static_cast<int>(
+                                    rs_buffer_slot_ids_h[s0 + j])));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.mixed_qkv.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * conv_dim,
+                            slab,
+                            static_cast<std::size_t>(count) * conv_dim *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.a.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * V_h,
+                            slab + slab_a,
+                            static_cast<std::size_t>(count) * V_h *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.b.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * V_h,
+                            slab + slab_b,
+                            static_cast<std::size_t>(count) * V_h *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+                return;
+            }
             if (Lw.la_in_proj_qkvz != nullptr && Lw.la_in_proj_ba != nullptr) {
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     ws.norm_x.data(), Lw.la_in_proj_qkvz->data(),
@@ -627,6 +683,53 @@ void linear_attn_body(
                     ws.norm_x.data(), Lw.la_in_proj_b->data(),
                     la.b.data(), N, V_h, H);
             }
+            if (rs_buffer_write) {
+                const int page = state_cache.rs_buffer_page_tokens();
+                const std::size_t slab_a =
+                    static_cast<std::size_t>(page) * conv_dim;
+                const std::size_t slab_b =
+                    slab_a + static_cast<std::size_t>(page) * V_h;
+                for (int r = 0; r < R; ++r) {
+                    const int qo0 = static_cast<int>(qo_indptr_h[r]);
+                    const int nr =
+                        static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                    const std::uint32_t s0 =
+                        rs_buffer_slot_indptr_h[r];
+                    const std::uint32_t s1 =
+                        rs_buffer_slot_indptr_h[r + 1];
+                    for (std::uint32_t j = 0; s0 + j < s1; ++j) {
+                        const int tok0 = static_cast<int>(j) * page;
+                        const int count = std::min(page, nr - tok0);
+                        if (count <= 0) break;
+                        auto* slab = static_cast<std::uint16_t*>(
+                            state_cache.rs_buffer_slab(
+                                linear_idx,
+                                static_cast<int>(
+                                    rs_buffer_slot_ids_h[s0 + j])));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            slab,
+                            la.mixed_qkv.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * conv_dim,
+                            static_cast<std::size_t>(count) * conv_dim *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            slab + slab_a,
+                            la.a.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * V_h,
+                            static_cast<std::size_t>(count) * V_h *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            slab + slab_b,
+                            la.b.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * V_h,
+                            static_cast<std::size_t>(count) * V_h *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
+            }
         });
 
     profile_cuda_detail_stage(
@@ -634,7 +737,7 @@ void linear_attn_body(
         stream, [&] {
         auto* qkv_in_base   = static_cast<std::uint16_t*>(qkv_in_data);
         auto* qkv_post_base = la.mixed_qkv_post.data();
-        if (is_pure_decode) {
+        if (linear_decode) {
             if (slot_ids_d != nullptr) {
                 kernels::launch_causal_conv1d_update_batched_bf16(
                     qkv_in_base, Lw.la_conv1d_w->data(),
@@ -663,7 +766,7 @@ void linear_attn_body(
                     slot_ids_d, qo_indptr_d,
                     static_cast<long long>(state_cache.conv_kernel()) *
                         state_cache.conv_dim(),
-                    R, conv_dim, conv_K, stream, write_state);
+                    R, conv_dim, conv_K, stream, write_state, commit_len);
             } else {
                 for (int r = 0; r < R; ++r) {
                     const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -683,13 +786,14 @@ void linear_attn_body(
 
     auto* qkv_base = la.mixed_qkv_post.data();
     const bool use_warp_tiled_recurrent =
-        !is_pure_decode &&
+        !linear_decode &&
         slot_ids_d != nullptr &&
         qo_indptr_d != nullptr &&
         N <= qwen35_gdn_warp_tiled_max_tokens() &&
-        K_d <= 256;
+        K_d <= 256 &&
+        commit_len == nullptr;
     const bool use_decode_gqa_recurrent =
-        is_pure_decode &&
+        linear_decode &&
         slot_ids_d != nullptr &&
         V_h != K_h &&
         V_h % K_h == 0;
@@ -711,6 +815,12 @@ void linear_attn_body(
                 la.k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d, stream);
         }
     });
+    invoke_stage_hook(
+        StageHookPoint::OnAttnProj, la.q_pre.data(),
+        static_cast<std::uint32_t>(N),
+        static_cast<std::uint32_t>(K_h * K_d),
+        static_cast<std::uint32_t>(layer_idx), stream,
+        /*query_is_f32=*/true);
     const float* q_recur_full =
         (V_h == K_h) ? la.q_pre.data() : la.q_norm.data();
     const float* k_recur_full =
@@ -727,7 +837,7 @@ void linear_attn_body(
                 layer_idx, /*slot=*/0);
             const auto slot_stride = static_cast<long long>(
                 state_cache.recurrent_slot_stride_floats());
-            if (is_pure_decode) {
+            if (linear_decode) {
                 if (slot_ids_d != nullptr) {
                     if (use_decode_gqa_recurrent) {
                         if (state_bf16) {
@@ -863,7 +973,9 @@ void linear_attn_body(
                                 R, V_h, K_d, V_d,
                                 stream, write_state);
                         }
-                    } else if (N <= qwen35_gdn_cached_prefill_max_tokens()) {
+                    } else if (
+                        commit_len == nullptr &&
+                        N <= qwen35_gdn_cached_prefill_max_tokens()) {
                         if (state_bf16) {
                             kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
                                 q_recur_full,
@@ -906,7 +1018,8 @@ void linear_attn_body(
                                 slot_ids_d, qo_indptr_d,
                                 slot_stride,
                                 la.core_out.data(),
-                                R, V_h, V_h, K_d, V_d, stream);
+                                R, V_h, V_h, K_d, V_d, stream, write_state,
+                                commit_len);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched(
                                 q_recur_full,
@@ -918,7 +1031,8 @@ void linear_attn_body(
                                 slot_ids_d, qo_indptr_d,
                                 slot_stride,
                                 la.core_out.data(),
-                                R, V_h, V_h, K_d, V_d, stream);
+                                R, V_h, V_h, K_d, V_d, stream, write_state,
+                                commit_len);
                         }
                     }
                 } else {
@@ -956,6 +1070,13 @@ void linear_attn_body(
                 }
             }
         });
+    invoke_stage_hook(
+        StageHookPoint::OnAttn, la.q_pre.data(),
+        static_cast<std::uint32_t>(N),
+        static_cast<std::uint32_t>(K_h * K_d),
+        static_cast<std::uint32_t>(layer_idx), stream,
+        /*query_is_f32=*/true);
+    if (commit_len != nullptr) return;
 
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_post_ms : nullptr,
@@ -996,7 +1117,7 @@ void full_attn_body(
     KvCache& cache, AttentionWorkspace& attn_ws,
     const ops::DecodePlanCache* decode_plan,
     const ops::PrefillPlanCache* prefill_plan,
-    int kv_layer, int N, int R,
+    int model_layer, int kv_layer, int N, int R,
     const std::int32_t* positions,
     const std::uint32_t* qo_indptr,
     const std::uint32_t* kv_page_indices,
@@ -1004,6 +1125,9 @@ void full_attn_body(
     const std::uint32_t* kv_last_page_lens,
     const std::uint32_t* qo_indptr_h,
     const std::uint32_t* kv_page_indptr_h,
+    const std::uint32_t* w_page_d,
+    const std::uint32_t* w_off_d,
+    bool has_write_desc,
     ops::CublasHandle& cublas, cudaStream_t stream)
 {
     const int T  = std::max(1, fwd_cfg.tp_size);
@@ -1041,6 +1165,11 @@ void full_attn_body(
     ops::gemm_act_x_w(cublas.handle(),
         ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
         ws.v.data(), N, Hk, H);
+    invoke_stage_hook(
+        StageHookPoint::OnAttnProj, ws.q.data(),
+        static_cast<std::uint32_t>(N),
+        static_cast<std::uint32_t>(Hq),
+        static_cast<std::uint32_t>(model_layer), stream);
 
     rmsnorm_bf16_dispatch(cfg,
         ws.q.data(), Lw.fa_q_norm->data(), ws.q.data(),
@@ -1053,12 +1182,17 @@ void full_attn_body(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads_local, num_kv_heads_local,
         d, rotary_dim, cfg.rope_theta, stream);
-
     auto kv_view = cache.layer_view(kv_layer);
-    kernels::launch_write_kv_to_pages(
-        kv_view, ws.k.data(), ws.v.data(),
-        qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        N, R, stream);
+    if (has_write_desc) {
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view, ws.k.data(), ws.v.data(),
+            w_page_d, w_off_d, N, stream);
+    } else {
+        kernels::launch_write_kv_to_pages(
+            kv_view, ws.k.data(), ws.v.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            N, R, stream);
+    }
 
     // Decode and planned-prefill paths are graph-friendly: the host-side
     // FlashInfer planning was hoisted to the executor prepare hook.
@@ -1095,11 +1229,15 @@ void full_attn_body(
             qo_indptr_h, kv_page_indptr_h,
             N, R, num_q_heads_local, attn_ws, stream);
     }
-
     if (cfg.attn_output_gate) {
         kernels::launch_sigmoid_gate_inplace_bf16(
             ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     }
+    invoke_stage_hook(
+        StageHookPoint::OnAttn, ws.q.data(),
+        static_cast<std::uint32_t>(N),
+        static_cast<std::uint32_t>(Hq),
+        static_cast<std::uint32_t>(model_layer), stream);
 
     // o_proj: TP=1 fuses residual via beta=1; TP>1 row-parallel +
     // all-reduce + residual-add.
@@ -1629,17 +1767,38 @@ void qwen3_5_moe_forward_paged(
     bool is_pure_decode,
     const std::uint8_t* /*mask_d*/,
     const std::int32_t* /*mask_indptr_d*/,
+    const std::uint32_t* w_page_d,
+    const std::uint32_t* w_off_d,
+    bool has_write_desc,
     const std::int32_t* slot_ids_h,
     const std::uint8_t* is_fresh_h,
     const std::int32_t* slot_ids_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
-    const std::int32_t* commit_advance_gather)
+    const std::int32_t* commit_advance_gather,
+    const std::uint32_t* rs_buffer_slot_ids_h,
+    const std::uint32_t* rs_buffer_slot_indptr_h,
+    const std::int32_t* rs_fold_lens,
+    bool rs_buffer_write,
+    bool rs_buffer_fold)
 {
     // Recurrent-only commit-advance (see qwen3_5_forward.cpp): re-run only the
     // linear-attn block over the accepted tokens (gathered from the verify
     // stash), advancing rs_cache state — no embed/reset/attention/MLP/lm_head.
-    const bool commit_advance = commit_advance_gather != nullptr;
+    const bool commit_advance =
+        commit_advance_gather != nullptr || rs_buffer_fold;
+    if ((rs_buffer_write || rs_buffer_fold) &&
+        (rs_buffer_slot_ids_h == nullptr ||
+         rs_buffer_slot_indptr_h == nullptr ||
+         slot_ids_h == nullptr ||
+         slot_ids_d == nullptr)) {
+        throw std::runtime_error(
+            "buffered RS execution is missing its slot bindings");
+    }
+    if (rs_buffer_fold && rs_fold_lens == nullptr) {
+        throw std::runtime_error(
+            "buffered RS fold is missing per-request commit lengths");
+    }
     // Pure-Qwen3-MoE (Qwen3-30B-A3B, model_type == "qwen3_moe") has no
     // linear-attn layers; the per-slot rs_cache is unused. Qwen3.5 /
     // 3.6-MoE additionally fires the linear-attn body — those layers
@@ -1655,11 +1814,26 @@ void qwen3_5_moe_forward_paged(
     const int R  = num_requests;
     const float eps = cfg.rms_norm_eps;
     cudaStream_t stream = cublas.stream();
+    if (has_write_desc) {
+        const bool has_full_attention = std::any_of(
+            w.layers.begin(), w.layers.end(), [](const auto& layer) {
+                return layer.kind ==
+                    Qwen3_5MoeLayerWeights::Kind::FullAttn;
+            });
+        if (w_page_d == nullptr || w_off_d == nullptr ||
+            !cache.format().is_native_bf16() ||
+            !has_full_attention) {
+            throw std::runtime_error(
+                "Qwen3.5-MoE explicit KV writes are unsupported by this layout");
+        }
+    }
     Qwen35MoeForwardProfile profile;
     const int tp_rank = (fwd_cfg.tp_comm != nullptr) ? fwd_cfg.tp_comm->rank() : 0;
     profile.begin(N, R, is_pure_decode, tp_rank, stream);
 
-    if (has_linear_attn_layers && !commit_advance) {
+    if (has_linear_attn_layers &&
+        !(commit_advance && !rs_buffer_fold) &&
+        !rs_buffer_write) {
         if (slot_ids_h != nullptr && is_fresh_h != nullptr) {
             for (int r = 0; r < R; ++r) {
                 if (is_fresh_h[r]) {
@@ -1696,17 +1870,23 @@ void qwen3_5_moe_forward_paged(
 
         if (commit_advance) {
             if (!is_linear) continue;
-            const std::uint16_t* stash = static_cast<const std::uint16_t*>(
-                state_cache.verify_hidden_stash_layer(linear_idx));
-            kernels::launch_gather_bf16_rows(
-                stash, commit_advance_gather,
-                static_cast<std::uint16_t*>(ws.norm_x.data()),
-                N, H, stream);
+            if (!rs_buffer_fold) {
+                const std::uint16_t* stash =
+                    static_cast<const std::uint16_t*>(
+                        state_cache.verify_hidden_stash_layer(linear_idx));
+                kernels::launch_gather_bf16_rows(
+                    stash, commit_advance_gather,
+                    static_cast<std::uint16_t*>(ws.norm_x.data()),
+                    N, H, stream);
+            }
             linear_attn_body(
                 Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
-                static_cast<int>(L), N, R, is_pure_decode,
+                static_cast<int>(L), linear_idx, N, R, is_pure_decode,
                 slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
-                cublas, stream, &profile);
+                cublas, stream, &profile,
+                rs_buffer_fold ? rs_fold_lens : nullptr,
+                rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
+                /*rs_buffer_write=*/false, rs_buffer_fold);
             ++linear_idx;
             continue;
         }
@@ -1719,6 +1899,7 @@ void qwen3_5_moe_forward_paged(
 
         if (is_linear) {
             ++profile.linear_layers;
+            const int li = linear_idx;
             if (state_cache.verify_frozen() &&
                 state_cache.verify_hidden_stash_enabled()) {
                 void* stash =
@@ -1735,19 +1916,23 @@ void qwen3_5_moe_forward_paged(
             profile_cuda_stage(&profile, &profile.linear_attn_ms, stream, [&] {
                 linear_attn_body(
                     Lw, cfg, fwd_cfg, ws, la_ws, state_cache,
-                    static_cast<int>(L), N, R, is_pure_decode,
+                    static_cast<int>(L), li, N, R, is_pure_decode,
                     slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
-                    cublas, stream, &profile);
+                    cublas, stream, &profile, /*commit_len=*/nullptr,
+                    rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
+                    rs_buffer_write, /*rs_buffer_fold=*/false);
             });
         } else {
             ++profile.full_layers;
             profile_cuda_stage(&profile, &profile.full_attn_ms, stream, [&] {
                 full_attn_body(
                     Lw, cfg, fwd_cfg, ws, la_ws, cache, attn_ws,
-                    decode_plan, prefill_plan, Lw.kv_layer,
+                    decode_plan, prefill_plan, static_cast<int>(L),
+                    Lw.kv_layer,
                     N, num_requests,
                     positions, qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
+                    w_page_d, w_off_d, has_write_desc,
                     cublas, stream);
             });
         }

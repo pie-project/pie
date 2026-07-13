@@ -72,7 +72,10 @@ pub struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     pub fn new() -> Builder<'a> {
-        Builder { ports: Vec::new(), stages: Vec::new() }
+        Builder {
+            ports: Vec::new(),
+            stages: Vec::new(),
+        }
     }
 
     /// Bind a descriptor [`Port`] to a channel or a constant. Records the port's
@@ -249,14 +252,22 @@ impl<'a> Builder<'a> {
 
         let stages: Vec<StageProgram> = stage_results
             .into_iter()
-            .map(|r| StageProgram { stage: r.stage, ops: r.ops })
+            .map(|r| StageProgram {
+                stage: r.stage,
+                ops: r.ops,
+            })
             .collect();
 
         let mut ports = ports;
         ports.sort_by_key(|p| p.port as u8);
 
-        let container =
-            TraceContainer { externs: Vec::new(), names: Vec::new(), channels: channel_decls, ports, stages };
+        let container = TraceContainer {
+            externs: Vec::new(),
+            names: Vec::new(),
+            channels: channel_decls,
+            ports,
+            stages,
+        };
 
         // SDK span lints (friendly, spans). Echo's authoritative bind lives on
         // the host at `forward-pass.new` (D6); native parity tests bind explicitly.
@@ -268,7 +279,11 @@ impl<'a> Builder<'a> {
 
         let channel_order = channels.iter().map(|c| c.borrow().gid).collect();
         let channel_names = channels.iter().map(|c| c.borrow().name.clone()).collect();
-        Ok(Traced { container, channel_order, channel_names })
+        Ok(Traced {
+            container,
+            channel_order,
+            channel_names,
+        })
     }
 
     /// Assemble the raw container WITHOUT lint — for debugging emission.
@@ -290,11 +305,22 @@ impl<'a> Builder<'a> {
                 }
             })
             .collect();
-        let stages =
-            stage_results.into_iter().map(|r| StageProgram { stage: r.stage, ops: r.ops }).collect();
+        let stages = stage_results
+            .into_iter()
+            .map(|r| StageProgram {
+                stage: r.stage,
+                ops: r.ops,
+            })
+            .collect();
         let mut ports = ports;
         ports.sort_by_key(|p| p.port as u8);
-        TraceContainer { externs: Vec::new(), names: Vec::new(), channels: channel_decls, ports, stages }
+        TraceContainer {
+            externs: Vec::new(),
+            names: Vec::new(),
+            channels: channel_decls,
+            ports,
+            stages,
+        }
     }
 
     /// Intern descriptor-port channels + trace each present stage (inside a session).
@@ -302,22 +328,32 @@ impl<'a> Builder<'a> {
         let mut ports: Vec<PortBinding> = Vec::new();
         for (port, source) in &self.ports {
             let src = match source {
-                PortInput::Channel(ch) => {
-                    PortSource::Channel(context::intern_channel(ch.state()))
-                }
+                PortInput::Channel(ch) => PortSource::Channel(context::intern_channel(ch.state())),
                 PortInput::Const(t) => {
                     let cd = t
                         .as_const_data()
                         .expect("a const port source must be a Tensor::constant");
-                    PortSource::Const { dtype: cd.dtype, shape: cd.shape, data: cd.bytes }
+                    PortSource::Const {
+                        dtype: cd.dtype,
+                        shape: cd.shape,
+                        data: cd.bytes,
+                    }
                 }
             };
-            ports.push(PortBinding { port: *port, source: src });
+            ports.push(PortBinding {
+                port: *port,
+                source: src,
+            });
         }
 
         // Trace stages in canonical stage order (byte-stable container.stages).
         let mut results = Vec::new();
-        for stage in [Stage::Prologue, Stage::OnAttnProj, Stage::OnAttn, Stage::Epilogue] {
+        for stage in [
+            Stage::Prologue,
+            Stage::OnAttnProj,
+            Stage::OnAttn,
+            Stage::Epilogue,
+        ] {
             let Some((_, body)) = self.stages.iter().find(|(s, _)| *s == stage) else {
                 continue;
             };

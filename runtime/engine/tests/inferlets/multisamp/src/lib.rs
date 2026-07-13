@@ -126,6 +126,7 @@ async fn main(_input: String) -> Result<String> {
     let g0 = g0_ch
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("g0 take: {e}"))?[0];
     prefill.close();
 
@@ -189,6 +190,7 @@ async fn main(_input: String) -> Result<String> {
                 let t = out
                     .take()
                     .get::<i32>()
+                    .await
                     .map_err(|e| format!("{name} out.take @{step}: {e}"))?;
                 let Some(&t0) = t.first() else {
                     return Err(format!("{name} out.take @{step}: empty tensor"));

@@ -52,7 +52,7 @@
 //! Input: `"<max_tokens> [depth=<k>] [no-rollback-probe]"` (default 8 / 4).
 
 use inferlet::ptir::prelude::*;
-use inferlet::{chat, model as wit_model, Result};
+use inferlet::{Result, chat, model as wit_model};
 
 const SYSTEM: &str = "You are a helpful assistant.";
 const USER: &str = "Say hello.";
@@ -105,11 +105,12 @@ impl Stream {
 
     /// Harvest one fire's sampled token off the `out` channel (blocks by
     /// awaiting the in-flight fire; poison surfaces as `Err`).
-    fn take_token(&self) -> Result<u32> {
+    async fn take_token(&self) -> Result<u32> {
         let v = self
             .out
             .take()
             .get::<i32>()
+            .await
             .map_err(|e| format!("out take: {e}"))?;
         Ok(v.first().copied().unwrap_or(0) as u32)
     }
@@ -120,13 +121,15 @@ impl Stream {
 /// the armed decode stream. `budget` bounds the run-ahead window, so `out`
 /// gets `budget + 1` ring cells (every fire's token stays takeable even with
 /// the deep loop's k un-harvested fires in flight).
-fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
+async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     let n = prompt.len() as u32;
     let pool_pages = (n + budget as u32 + 2).div_ceil(PAGE_T);
     let pool = pool_pages * PAGE_T;
 
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let grant = ws.reserve(pool_pages).map_err(|e| format!("ws.reserve: {e}"))?;
+    let grant = ws
+        .reserve(pool_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
     let pool_ids: &'static Vec<u32> = bx(grant.ids().to_vec());
 
     // ── 1. PREFILL FIRE (N-wide): causal [N, POOL] mask, N-cell KV write,
@@ -142,7 +145,9 @@ fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
     let pages_p = bx(Channel::from(pool_ids.clone()).named("pages_p"));
     let page_indptr_p = bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p"));
-    let mask_pv: Vec<bool> = (0..n).flat_map(|i| (0..pool).map(move |j| j <= i)).collect();
+    let mask_pv: Vec<bool> = (0..n)
+        .flat_map(|i| (0..pool).map(move |j| j <= i))
+        .collect();
     let mask_p = bx(Channel::from_shaped([n, pool], mask_pv).named("mask_p"));
     let g0_ch = bx(Channel::new([1], dtype::i32).named("g0"));
 
@@ -163,7 +168,11 @@ fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     fwd_p
         .submit(&prefill)
         .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?;
+    let g0 = g0_ch
+        .take()
+        .get::<i32>()
+        .await
+        .map_err(|e| format!("g0 take: {e}"))?;
     let g0 = g0.first().copied().unwrap_or(0) as u32;
     prefill.close();
 
@@ -182,11 +191,9 @@ fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     let pages = bx(Channel::from(pool_ids.clone()).named("pages"));
     let page_indptr = bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr"));
     let pool_ids_ch = bx(Channel::new([pool_pages], dtype::u32).named("pool_ids"));
-    let out = bx(
-        Channel::new([1], dtype::i32)
-            .capacity(budget as u32 + 1)
-            .named("out"),
-    );
+    let out = bx(Channel::new([1], dtype::i32)
+        .capacity(budget as u32 + 1)
+        .named("out"));
     let lane1 = Tensor::constant(vec![0u32, 1u32]);
 
     let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
@@ -246,7 +253,7 @@ fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
 /// successor fire BEFORE harvesting the producer, even with a stop configured
 /// (declining only at the count-predictable max-tokens boundary, R9); on a
 /// stop, drains + drops the ≤1 over-shot output (the rollback).
-fn decode_pipelined_eos(s: &Stream, remaining: usize, stop: &[u32]) -> Result<Vec<u32>> {
+async fn decode_pipelined_eos(s: &Stream, remaining: usize, stop: &[u32]) -> Result<Vec<u32>> {
     let mut out = Vec::with_capacity(remaining);
     if remaining == 0 {
         return Ok(out);
@@ -260,13 +267,13 @@ fn decode_pipelined_eos(s: &Stream, remaining: usize, stop: &[u32]) -> Result<Ve
             s.submit()?;
             submitted += 1;
         }
-        let token = s.take_token()?;
+        let token = s.take_token().await?;
         harvested += 1;
         if stop.contains(&token) {
             // EOS: drain + drop the over-shot speculated output. The stop
             // token is NOT emitted.
             while harvested < submitted {
-                let _ = s.take_token()?;
+                let _ = s.take_token().await?;
                 harvested += 1;
             }
             break;
@@ -283,7 +290,7 @@ fn decode_pipelined_eos(s: &Stream, remaining: usize, stop: &[u32]) -> Result<Ve
 /// fires upfront (none harvested, speculating PAST a possible stop), then
 /// drains FIFO + refills one fire per non-stop token. On EOS, drains + drops
 /// the ≤depth−1 over-shot outputs.
-fn decode_pipelined_deep_eos(
+async fn decode_pipelined_deep_eos(
     s: &Stream,
     remaining: usize,
     stop: &[u32],
@@ -297,11 +304,11 @@ fn decode_pipelined_deep_eos(
         submitted += 1;
     }
     while harvested < submitted {
-        let token = s.take_token()?;
+        let token = s.take_token().await?;
         harvested += 1;
         if stop.contains(&token) {
             while harvested < submitted {
-                let _ = s.take_token()?;
+                let _ = s.take_token().await?;
                 harvested += 1;
             }
             break;
@@ -318,11 +325,11 @@ fn decode_pipelined_deep_eos(
 /// Synchronous reference: one fire at a time, the host harvesting each token
 /// before submitting the next fire (the per-token round-trip bubble the
 /// pipelined loops close). Stops on a `stop` token (dropping it).
-fn decode_sync(s: &Stream, remaining: usize, stop: &[u32]) -> Result<Vec<u32>> {
+async fn decode_sync(s: &Stream, remaining: usize, stop: &[u32]) -> Result<Vec<u32>> {
     let mut out = Vec::with_capacity(remaining);
     for _ in 0..remaining {
         s.submit()?;
-        let token = s.take_token()?;
+        let token = s.take_token().await?;
         if stop.contains(&token) {
             break;
         }
@@ -333,20 +340,22 @@ fn decode_sync(s: &Stream, remaining: usize, stop: &[u32]) -> Result<Vec<u32>> {
 
 /// One full greedy chat generation on a FRESH decode context (own KV pool),
 /// like the classic per-`Decoder` runs: prefill → g0 → decode loop per `mode`.
-fn generate(prompt: &[u32], max_tokens: usize, stop: &[u32], mode: Mode) -> Result<Vec<u32>> {
+async fn generate(prompt: &[u32], max_tokens: usize, stop: &[u32], mode: Mode) -> Result<Vec<u32>> {
     if max_tokens == 0 {
         return Ok(Vec::new());
     }
-    let (g0, stream) = start_stream(prompt, max_tokens)?;
+    let (g0, stream) = start_stream(prompt, max_tokens).await?;
     if stop.contains(&g0) {
         stream.pipeline.close();
         return Ok(Vec::new());
     }
     let mut tokens = vec![g0];
     let rest = match mode {
-        Mode::Sync => decode_sync(&stream, max_tokens - 1, stop)?,
-        Mode::Pipelined => decode_pipelined_eos(&stream, max_tokens - 1, stop)?,
-        Mode::Deep(depth) => decode_pipelined_deep_eos(&stream, max_tokens - 1, stop, depth)?,
+        Mode::Sync => decode_sync(&stream, max_tokens - 1, stop).await?,
+        Mode::Pipelined => decode_pipelined_eos(&stream, max_tokens - 1, stop).await?,
+        Mode::Deep(depth) => {
+            decode_pipelined_deep_eos(&stream, max_tokens - 1, stop, depth).await?
+        }
     };
     tokens.extend(rest);
     stream.pipeline.close();
@@ -381,8 +390,8 @@ async fn main(input: String) -> Result<String> {
     let stop = chat::stop_tokens();
 
     // ── Primary: explicit run-ahead + EOS-rollback vs the sequential reference ──
-    let tokens_p = generate(&prompt, max_tokens, &stop, Mode::Pipelined)?;
-    let tokens_s = generate(&prompt, max_tokens, &stop, Mode::Sync)?;
+    let tokens_p = generate(&prompt, max_tokens, &stop, Mode::Pipelined).await?;
+    let tokens_s = generate(&prompt, max_tokens, &stop, Mode::Sync).await?;
     let matched = tokens_p == tokens_s;
 
     // ── DEEP carrier: depth-k pre-submission == sequential. Device-gated
@@ -391,7 +400,7 @@ async fn main(input: String) -> Result<String> {
     // instance, so only the 4090 gate asserts DEEP_MATCH. ──
     let run_device_paths = !input.contains("no-rollback-probe");
     let (deep_matched, tokens_d) = if run_device_paths {
-        let d = generate(&prompt, max_tokens, &stop, Mode::Deep(depth))?;
+        let d = generate(&prompt, max_tokens, &stop, Mode::Deep(depth)).await?;
         (d == tokens_s, d)
     } else {
         (true, tokens_s.clone()) // skipped (device-gated)
@@ -404,8 +413,8 @@ async fn main(input: String) -> Result<String> {
     let rollback_ok = match (run_device_paths, tokens_s.get(1)) {
         (true, Some(&second)) => {
             let forced = [second];
-            let fp = generate(&prompt, max_tokens, &forced, Mode::Deep(depth))?;
-            let fs = generate(&prompt, max_tokens, &forced, Mode::Sync)?;
+            let fp = generate(&prompt, max_tokens, &forced, Mode::Deep(depth)).await?;
+            let fs = generate(&prompt, max_tokens, &forced, Mode::Sync).await?;
             fp == fs
         }
         // Probe skipped, or the stream was too short to force a mid-stream

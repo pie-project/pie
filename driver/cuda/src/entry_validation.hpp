@@ -36,9 +36,10 @@ inline int validate_launch_resources(const PieLaunchDesc& launch,
             return PIE_STATUS_INVALID_ARGUMENT;
         }
     }
+    const std::size_t wire_rows =
+        launch.qo_indptr.len == 0 ? 0 : launch.qo_indptr.len - 1;
     for (std::size_t request = 0;
-         request < launch.instance_ids.len &&
-         launch.kv_page_indptr.len != 0;
+         request < wire_rows && launch.kv_page_indptr.len != 0;
          ++request) {
         const bool has_pages =
             launch.kv_page_indptr.ptr[request] !=
@@ -54,19 +55,17 @@ inline int validate_launch_resources(const PieLaunchDesc& launch,
               last_len > static_cast<std::uint32_t>(page_size)))) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
-        if (launch.qo_indptr.len == launch.instance_ids.len + 1) {
-            const std::uint32_t query_rows =
-                launch.qo_indptr.ptr[request + 1] -
-                launch.qo_indptr.ptr[request];
-            if (query_rows != 0) {
-                if (!has_pages) return PIE_STATUS_INVALID_ARGUMENT;
-                const std::uint64_t kv_len =
-                    static_cast<std::uint64_t>(page_count - 1) *
-                        static_cast<std::uint32_t>(page_size) +
-                    last_len;
-                if (kv_len < query_rows) {
-                    return PIE_STATUS_INVALID_ARGUMENT;
-                }
+        const std::uint32_t query_rows =
+            launch.qo_indptr.ptr[request + 1] -
+            launch.qo_indptr.ptr[request];
+        if (query_rows != 0) {
+            if (!has_pages) return PIE_STATUS_INVALID_ARGUMENT;
+            const std::uint64_t kv_len =
+                static_cast<std::uint64_t>(page_count - 1) *
+                    static_cast<std::uint32_t>(page_size) +
+                last_len;
+            if (kv_len < query_rows) {
+                return PIE_STATUS_INVALID_ARGUMENT;
             }
         }
     }

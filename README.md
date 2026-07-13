@@ -61,7 +61,7 @@ pie run text-completion -- --prompt "The capital of France is"
 | `driver/transport/` | Worker↔worker P2P KV-tensor data plane |
 | `driver/` | Backend drivers (CUDA · Metal) + runtime↔driver IPC |
 | `interface/` | Boundary contract crates (`ids` · `driver` · `controller` · `worker` · `client` · `inferlet`) — the dependency floor |
-| `inferlets/` | Example inferlets |
+| `tests/inferlets/` | Curated inferlet E2E fixtures |
 | `sdk/` | Inferlet SDKs (Rust · Python · JavaScript) |
 | `client/` | Client libraries (Rust · Python · JavaScript) |
 | `website/` | [pie-project.org](https://pie-project.org) docs site |

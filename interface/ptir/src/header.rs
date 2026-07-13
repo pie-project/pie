@@ -32,6 +32,65 @@ pub fn generate_c_header() -> String {
         "// v1.1 extern channels (PTIR-CONTAINER.md section 6b): wire-version 2 iff externs\n#define PTIR_VERSION_EXTERN {}\nenum PtirExternDir : uint8_t {{ PTIR_EXTERN_IMPORT = 0, PTIR_EXTERN_EXPORT = 1 }};\n\n",
         crate::PTIR_VERSION_EXTERN
     ));
+    s.push_str(&format!(
+        "#define PTIR_COMPILER_VERSION {}\n#define PTIR_REGION_PLAN_VERSION {}\n#define PTIR_LANE_TABLE_ABI_VERSION {}\n\n",
+        crate::compiler::COMPILER_VERSION,
+        crate::compiler::REGION_PLAN_VERSION,
+        crate::compiler::LANE_TABLE_ABI_VERSION
+    ));
+    s.push_str(
+        "enum PtirSymbolicExtent : uint8_t {\n\
+  PTIR_EXTENT_KV_LEN = 0,\n\
+  PTIR_EXTENT_PAGE_COUNT = 1,\n\
+  PTIR_EXTENT_ROW_COUNT = 2,\n\
+  PTIR_EXTENT_TOKEN_COUNT = 3,\n\
+  PTIR_EXTENT_SAMPLED_ROWS = 4,\n\
+  PTIR_EXTENT_QUERY_LEN = 5,\n\
+  PTIR_EXTENT_KEY_LEN = 6,\n\
+};\n\n\
+enum PtirScheduleTemplate : uint8_t {\n\
+  PTIR_SCHEDULE_EFFECTS = 0,\n\
+  PTIR_SCHEDULE_ONE_CTA_PER_ROW = 1,\n\
+  PTIR_SCHEDULE_HIERARCHICAL_ROW = 2,\n\
+  PTIR_SCHEDULE_LIBRARY = 3,\n\
+};\n\n\
+enum PtirLibraryOp : uint8_t {\n\
+  PTIR_LIBRARY_NUCLEUS_SAMPLE = 0,\n\
+  PTIR_LIBRARY_TOP_K = 1,\n\
+  PTIR_LIBRARY_SORT = 2,\n\
+  PTIR_LIBRARY_SCAN = 3,\n\
+  PTIR_LIBRARY_MATMUL = 4,\n\
+  PTIR_LIBRARY_SECOND_PARTY = 5,\n\
+};\n\n\
+typedef struct PtirLaneTableHeader {\n\
+  uint32_t abi_version;\n\
+  uint32_t lane_count;\n\
+  uint32_t channel_slots_per_lane;\n\
+  uint32_t flags;\n\
+} PtirLaneTableHeader;\n\n\
+typedef struct PtirLaneRecord {\n\
+  uint64_t logits_base;\n\
+  uint32_t logits_row_offset;\n\
+  uint32_t logits_row_count;\n\
+  uint32_t kv_len;\n\
+  uint32_t page_count;\n\
+  uint32_t row_count;\n\
+  uint32_t token_count;\n\
+  uint32_t sampled_rows;\n\
+  uint32_t query_len;\n\
+  uint32_t key_len;\n\
+  uint32_t channel_slot_offset;\n\
+  uint64_t rng_state;\n\
+  uint64_t commit_slot;\n\
+  uint64_t active_row_mask;\n\
+} PtirLaneRecord;\n\n\
+typedef struct PtirLaneChannelSlot {\n\
+  uint64_t committed_cell;\n\
+  uint64_t pending_cell;\n\
+  uint64_t expected_head;\n\
+  uint64_t expected_tail;\n\
+} PtirLaneChannelSlot;\n\n",
+    );
 
     s.push_str("// ── op tags (X-macro: name, tag, value-operands, results; 0xFF = variadic) ──\n");
     s.push_str("#define PTIR_OP_LIST(X) \\\n");
@@ -147,7 +206,7 @@ pub fn generate_c_header() -> String {
     );
     s.push_str("// cummass_le(p): inclusive nucleus (keep while exclusive prefix mass < p). prob_ge: >=.\n");
     s.push_str("// rng_keyed(state=[key,ctr]): seed64 = splitmix64((key<<32)|ctr); u(j) = hash_uniform(seed64, j)\n");
-    s.push_str("//   with splitmix64/hash_uniform exactly as BYTECODE.md §5 / eval.rs; gumbel = -log(-log(u)).\n");
+    s.push_str("//   with splitmix64/hash_uniform exactly as interface/ptir/src/rng.rs; gumbel = -log(-log(u)).\n");
     s
 }
 

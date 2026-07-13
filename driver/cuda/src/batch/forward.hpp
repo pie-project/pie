@@ -40,6 +40,7 @@ namespace model {
 struct Qwen3Weights;
 struct Workspace;
 class IModel;
+struct StageHooks;
 }  // namespace model
 
 namespace ops {
@@ -82,6 +83,7 @@ struct ForwardFn {
     bool supports_tp_greedy_argmax = false;
     bool supports_compact_logits = false;
     bool supports_small_prefill_graph = false;
+    bool supports_runtime_window = false;
 
     // All metadata needed to execute one forward body call. Bundled as a
     // struct so adding a new field is a one-site addition rather than a
@@ -109,6 +111,8 @@ struct ForwardFn {
         // Optional: custom attention mask (BRLE-packed)
         const std::uint8_t*  custom_mask_d        = nullptr;
         const std::int32_t*  custom_mask_indptr_d = nullptr;
+        // -2: no runtime override; -1: full causal; >=0: sliding window.
+        int                  runtime_window_left = -2;
 
         // Optional: explicit KV-write descriptor (device-geometry WSlot/WOff,
         // B2). When `has_write_desc`, the per-layer KV append lands each lane's
@@ -125,6 +129,7 @@ struct ForwardFn {
         const std::int32_t*  slot_ids_h           = nullptr;
         const std::uint8_t*  is_fresh_h            = nullptr;
         const std::int32_t*  slot_ids_d           = nullptr;
+        const std::uint8_t*  rs_slot_flags_h      = nullptr;
 
         // Optional: logit row gather indices (for compact-logit modes)
         const std::int32_t*  logit_row_indices_d  = nullptr;
@@ -162,6 +167,8 @@ struct ForwardFn {
         //     recurrent_state[slot_ids[r]].
         const std::uint32_t* rs_buffer_slot_ids_h    = nullptr;  // flattened CSR
         const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;  // R+1, leading 0
+        const std::uint32_t* rs_fold_lens_h           = nullptr;  // R
+        const std::int32_t*  rs_fold_lens_d           = nullptr;  // R
         bool                 rs_buffer_write          = false;
         bool                 rs_buffer_fold           = false;
 
@@ -191,6 +198,10 @@ struct ForwardFn {
         const std::uint32_t* audio_feature_byte_indptr_h = nullptr; // n_clip+1 byte offsets
         const std::uint32_t* audio_anchor_rows_h      = nullptr;  // n_clip row offsets
         int                  num_clips                 = 0;
+
+        // Launch-scoped PTIR anatomical hooks. Null for ordinary forwards and
+        // TP followers; direct staged launches install this only on rank 0.
+        const model::StageHooks* stage_hooks = nullptr;
     };
 
     struct PrepareInputs {
@@ -204,6 +215,7 @@ struct ForwardFn {
         int total_tokens = 0;
         int num_requests = 0;
         bool is_pure_decode = false;
+        int runtime_window_left = -2;
     };
 
     // The arch implementation. context.cpp sets this once at construction;
@@ -383,11 +395,6 @@ struct BatchEngine {
     // persistent per-instance execution contexts keyed by the bound
     // instance id. Never null once the driver has finished composing.
     pipeline::Dispatch* dispatch = nullptr;
-    // Pipeline dispatch consumes a compact F32 matrix ordered by
-    // `sampling_indices`. Gather the selected BF16 rows here, then widen
-    // them before dispatch. See `batch/logits.hpp`.
-    DeviceBuffer<std::uint16_t> ptir_logits_bf16;
-    DeviceBuffer<float> ptir_logits_f32;
 };
 
 // Pre-capture the pure-decode CUDA graph lattice for graph-safe forwards.
@@ -416,7 +423,11 @@ cudaGraphExec_t capture_forward_graph_exec(
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
     bool single_gpu_greedy_argmax,
-    bool tp_greedy_argmax);
+    bool tp_greedy_argmax,
+    const std::uint32_t* w_page_d = nullptr,
+    const std::uint32_t* w_off_d = nullptr,
+    bool has_write_desc = false,
+    int runtime_window_left = -2);
 
 // Env-gated (`PIE_STEP_PROFILE`) forward-body wall-clock timer. Declared here
 // (not private to batch/forward.cpp) because `handle_fire_batch` in
@@ -496,19 +507,18 @@ ForwardInputViews make_forward_input_views(
 // and passed by-ref so the dispatcher can pick between graph replay
 // and a direct `forward_fn.body` call without a 20-arg signature.
 //
-// Direct PTIR launches keep the forward geometry exact (a stage program
-// runs after the model and cannot share the legacy graph variants that
-// fused sampling into the captured forward), so `run_forward_dispatch`
-// always takes the direct `forward_fn.body` path at its sole callsite in
-// `handle_fire_batch`. Graph capture/replay for decode-only shapes is
-// still used by `capture_forward_graph_lattice` (tp_size > 1 startup
-// precapture) and `tp_follower_serve` (TP follower replay).
+// Direct PTIR launches keep the forward geometry exact. A launch with
+// anatomical stages takes the direct body path so its per-layer hooks execute
+// on every invocation; boundary-only programs may still use a compatible graph
+// variant keyed by their compiled program set.
 struct ForwardDispatchInputs {
     int forward_R = 0;
     int forward_N = 0;
     int num_sampling = 0;
     bool is_pure_decode = false;
     bool have_custom_mask = false;
+    int structured_window_left = -2;
+    std::uint64_t program_set_hash = 0;
     // Explicit KV-write descriptor present (device-geometry WSlot/WOff, B2).
     // When set, the forward routes the per-layer KV append through the explicit
     // (physical page, offset) kernel from pi.w_page/pi.w_off.
@@ -526,7 +536,10 @@ struct ForwardDispatchInputs {
     // the separate fold-replay dispatch instead (not this path).
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr;
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;
+    const std::uint32_t* rs_fold_lens_h = nullptr;
+    const std::int32_t*  rs_fold_lens_d = nullptr;
     bool                 rs_buffer_write = false;
+    bool                 rs_buffer_fold = false;
     // Multimodal (gemma4 vision): image side-channel, set from the view.
     const float*         image_pixels_h = nullptr;
     const std::uint32_t* image_pixel_byte_indptr_h = nullptr;
@@ -543,6 +556,7 @@ struct ForwardDispatchInputs {
     const std::uint32_t* audio_feature_byte_indptr_h = nullptr;
     const std::uint32_t* audio_anchor_rows_h = nullptr;
     int                  num_clips = 0;
+    const model::StageHooks* stage_hooks = nullptr;
 };
 
 // Run the per-fire forward body directly against `forward_fn.body`. See

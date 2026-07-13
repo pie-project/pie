@@ -17,7 +17,7 @@
 //! pre-stages the §6.1 pass.
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 /// MTP draft width (K); the verify window is `[K+1, V]`.
 const K: u32 = 3;
@@ -35,7 +35,9 @@ async fn main(_input: String) -> Result<String> {
     let v = vocab;
     let kp1 = K + 1;
     model::configure(vocab, PAGE_T, NUM_LAYERS);
-    model::configure_gates(/* has_mtp_logits */ true, /* has_value_head */ false);
+    model::configure_gates(
+        /* has_mtp_logits */ true, /* has_value_head */ false,
+    );
 
     // gmask: host-fed per-position grammar mask [K+1, V] bool (host-writer).
     let gmask = bx(Channel::new([kp1, v], dtype::bool).named("gmask"));
@@ -76,7 +78,11 @@ async fn main(_input: String) -> Result<String> {
     let pipeline = Pipeline::new();
     gmask.put(vec![true; (kp1 * v) as usize]); // all-allow
     fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
-    let committed = out.take().get::<i32>().map_err(|e| format!("out.take: {e}"))?;
+    let committed = out
+        .take()
+        .get::<i32>()
+        .await
+        .map_err(|e| format!("out.take: {e}"))?;
 
     let result = format!(
         "MTP_GRAMMAR K={K} committed={} (SDK-authored §6.1 native-MTP+grammar, vocab={vocab})",

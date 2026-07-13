@@ -37,8 +37,10 @@ fn bx<T>(v: T) -> &'static T {
     Box::leak(Box::new(v))
 }
 
-fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
-    t.get::<i32>().map_err(|e| format!("tensor take: {e}"))
+async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
+    t.get::<i32>()
+        .await
+        .map_err(|e| format!("tensor take: {e}"))
 }
 
 /// Committed length of a sentinel `[k+1]` tail = the count before the first
@@ -50,7 +52,7 @@ fn committed_len(tail: &[i32]) -> usize {
 /// Bootstrap fire over `prompt + (k-1)` fillers: yields the seed (row-0 target
 /// argmax at the prompt's REAL last position) + the first REAL `[k]` drafts
 /// (native MTP argmax) for window 1.
-fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Vec<i32>)> {
+async fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Vec<i32>)> {
     let l = prompt.len() as u32;
     let mut window: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     window.extend(std::iter::repeat(0i32).take((k - 1) as usize));
@@ -79,11 +81,12 @@ fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Ve
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline)
         .map_err(|e| format!("bootstrap submit: {e}"))?;
-    let seed = get_i32(seed_out.take())?
+    let seed = get_i32(seed_out.take())
+        .await?
         .first()
         .copied()
         .ok_or_else(|| "bootstrap: empty seed".to_string())?;
-    let drafts = get_i32(drafts_out.take())?;
+    let drafts = get_i32(drafts_out.take()).await?;
     pipeline.close();
     Ok((seed, drafts))
 }
@@ -96,7 +99,7 @@ fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Ve
 /// (device-alias peeked off the SAME embedded tokens) against the target's
 /// per-row argmax, and draft the NEXT window natively off `mtp_logits`.
 /// Returns `(commit [k+1], next_drafts [k])`.
-fn verify_window(
+async fn verify_window(
     ws: &'static WorkingSet,
     k: u32,
     seed: i32,
@@ -145,8 +148,8 @@ fn verify_window(
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline)
         .map_err(|e| format!("verify submit: {e}"))?;
-    let commit = get_i32(commit_out.take())?;
-    let drafts = get_i32(drafts_out.take())?;
+    let commit = get_i32(commit_out.take()).await?;
+    let drafts = get_i32(drafts_out.take()).await?;
     pipeline.close();
     Ok((commit, drafts))
 }
@@ -166,7 +169,7 @@ async fn main(input: String) -> Result<String> {
         prompt.push(0);
     }
 
-    let (seed0, draft0) = bootstrap(ws, &prompt, k)?;
+    let (seed0, draft0) = bootstrap(ws, &prompt, k).await?;
     let mut seq_len: u32 = prompt.len() as u32 + k - 1;
 
     let mut committed: Vec<u32> = prompt.clone();
@@ -177,7 +180,7 @@ async fn main(input: String) -> Result<String> {
     let mut generated: u32 = 1;
 
     while generated < MAX_TOKENS {
-        let (commit, drafts) = verify_window(ws, k, seed, &draft, seq_len)?;
+        let (commit, drafts) = verify_window(ws, k, seed, &draft, seq_len).await?;
         seq_len += k + 1;
 
         let clen = committed_len(&commit);

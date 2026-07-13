@@ -16,6 +16,7 @@
 #include "batch/graph_variant.hpp"
 
 using pie_cuda_driver::gv_old_encode_for_proof;
+using pie_cuda_driver::graph_replay_has_no_host_resets;
 using pie_cuda_driver::make_graph_variant;
 
 namespace {
@@ -44,6 +45,21 @@ int main() {
     check(make_graph_variant(false, false, false, false, false, 128u) !=
               make_graph_variant(false, false, false, false, true, 0u),
           "NEW: graph_layout=128 is DISTINCT from rs_verify");
+
+    const std::uint8_t continuing[] = {0, 0};
+    const std::uint8_t resetting[] = {0, 1};
+    check(
+        graph_replay_has_no_host_resets(true, continuing, 2) &&
+            !graph_replay_has_no_host_resets(true, resetting, 2) &&
+            graph_replay_has_no_host_resets(false, nullptr, 2),
+        "Qwen graph replay is disabled whenever a host reset is requested");
+    const auto root_tp_key =
+        make_graph_variant(false, false, false, false, false, 7);
+    const auto follower_tp_key =
+        make_graph_variant(false, false, false, false, false, 7);
+    check(
+        root_tp_key == follower_tp_key,
+        "TP root/follower keys use identical actual capture flags");
 
     // ── 3. NEW encoding: exhaustive uniqueness over (5 flags) × (layout 0..255) ──
     {

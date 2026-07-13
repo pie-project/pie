@@ -43,7 +43,7 @@ interface forward {
     /// takes `put`; a host-reader channel yields `take`/`read`. Before binding,
     /// `put` stages freely (a seed or an early Writer cell); staged puts
     /// coalesce into the next submit. A poisoned channel surfaces an
-    /// `error` instead of hanging (the `?` in `out.take().await?`).
+    /// `error` instead of hanging (the `?` in `out.take().get::<T>().await?`).
     resource channel {
         constructor(shape: shape, dtype: dtype, capacity: u32);
 
@@ -59,11 +59,11 @@ interface forward {
         /// in-flight fire remains (nothing will ever fill it) or the channel
         /// is poisoned — a fire that feeds it failed, and the error carries
         /// that fire's failure (under run-ahead, poison IS the error channel).
-        take: func() -> result<data, error>;
+        take: async func() -> result<data, error>;
 
         /// Copy a committed value to the host, leaving the cell full. Same
         /// await/poison discipline as `take`.
-        read: func() -> result<data, error>;
+        read: async func() -> result<data, error>;
     }
 
     /// A traced forward pass ready to submit: the canonical PTIR container
@@ -79,11 +79,11 @@ interface forward {
         /// deduped compile/bind cache; a duplicate container is a cache hit)
         /// and bind the handles. Errors: a malformed trace (the validator's
         /// message), a channel-count/shape/dtype/capacity mismatch against the
-        /// container's declarations, not exactly one
-        /// kv-working-set, or more than one rs-working-set (the single-model
-        /// v1 contract). An rs-working-set is required for hybrid /
-        /// linear-attention models (GDN, Mamba2); pure-attention models pass
-        /// none.
+        /// container's declarations, not exactly one kv-working-set, or an
+        /// rs-working-set count that differs from the resolved request count.
+        /// Hybrid / linear-attention models (GDN, Mamba2) bind one
+        /// rs-working-set per resolved request row, in request order;
+        /// pure-attention models bind none.
         ///
         /// The pass records the underlying state of its bound channels (safe
         /// against the guest dropping a handle) and the working sets' reps
@@ -96,9 +96,19 @@ interface forward {
             rs-working-sets:  list<borrow<rs-working-set>>,
         ) -> result<forward-pass, error>;
 
-        /// Submit this pass on `on`, RUN-AHEAD: prepares + fires and returns
-        /// immediately — step t+1 may be submitted before t completes; the
-        /// channels' `take`/`read` are the await points. The first submit
+        /// Replace the recurrent-state bindings in-place, preserving this
+        /// pass's native instance, channel arena, seeds, KV cursor, and
+        /// device-geometry lease. The list is in resolved request order.
+        /// Fails while this pass's pipeline FIFO has any in-flight operation,
+        /// or when a resource/model/driver/count validation fails.
+        set-rs-working-sets: func(
+            rs-working-sets: list<borrow<rs-working-set>>,
+        ) -> result<_, error>;
+
+        /// Submit this pass on `on`, RUN-AHEAD. Pure-attention passes prepare
+        /// and enqueue immediately; an RS-bound pass first awaits/finalizes
+        /// prior FIFO operations so its folded state cannot be prepared from
+        /// a stale commit. The first submit
         /// ships the container bytes + sidecar and binds seeds (one staged
         /// `put` per `seeded` channel — missing seeds error here);
         /// steady-state submits carry the identity hash + instance only.

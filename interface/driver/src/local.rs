@@ -486,7 +486,10 @@ pub struct PieLaunchDesc {
     pub kv_page_indptr: PieU32Slice,
     pub kv_last_page_lens: PieU32Slice,
     pub qo_indptr: PieU32Slice,
+    /// Folded recurrent-state slot per resolved `qo_indptr` row. Empty for
+    /// pure-attention launches; never indexed by `instance_ids`.
     pub rs_slot_ids: PieU32Slice,
+    /// Flags parallel to `rs_slot_ids`.
     pub rs_slot_flags: PieU8Slice,
     pub rs_fold_lens: PieU32Slice,
     pub rs_buffer_slot_ids: PieU32Slice,
@@ -1281,6 +1284,7 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
     )?;
 
     let request_count = desc.instance_ids.len;
+    let wire_row_count = desc.qo_indptr.len.saturating_sub(1);
     if desc.kv_translation.len != 0 && desc.kv_translation_indptr.len == 0 {
         return Err(invalid_argument(
             "launch kv_translation_indptr is required when translation values are present",
@@ -1325,42 +1329,42 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             desc.qo_indptr,
             "launch qo_indptr malformed",
             desc.token_ids.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
             desc.kv_page_indptr,
             "launch kv_page_indptr malformed",
             desc.kv_page_indices.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
             desc.rs_buffer_slot_indptr,
             "launch rs_buffer_slot_indptr malformed",
             desc.rs_buffer_slot_ids.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
             desc.sampling_indptr,
             "launch sampling_indptr malformed",
             desc.sampling_indices.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
             desc.image_indptr,
             "launch image_indptr malformed",
             desc.image_anchor_positions.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
             desc.audio_indptr,
             "launch audio_indptr malformed",
             desc.audio_anchor_rows.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
@@ -1403,12 +1407,11 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
         true,
     )?;
     if desc.ptir_program_row_indptr.len != 0 {
-        let wire_rows = desc.qo_indptr.len.saturating_sub(1);
         unsafe {
             validate_csr(
                 desc.ptir_program_row_indptr,
                 "launch ptir_program_row_indptr malformed",
-                wire_rows,
+                wire_row_count,
                 request_count,
                 false,
             )?;
@@ -1417,38 +1420,50 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
 
     validate_row_count_u32(
         desc.kv_last_page_lens.len,
-        "launch kv_last_page_lens length must match batch size",
-        request_count,
+        "launch kv_last_page_lens length must match resolved row count",
+        wire_row_count,
         true,
     )?;
-    validate_row_count_u32(
-        desc.rs_slot_ids.len,
-        "launch rs_slot_ids length must match batch size",
-        request_count,
-        true,
-    )?;
-    validate_row_count_u32(
-        desc.rs_slot_flags.len,
-        "launch rs_slot_flags length must match batch size",
-        request_count,
-        true,
-    )?;
-    validate_row_count_u32(
-        desc.rs_fold_lens.len,
-        "launch rs_fold_lens length must match batch size",
-        request_count,
-        true,
-    )?;
+    if desc.rs_slot_ids.len != desc.rs_slot_flags.len {
+        return Err(invalid_argument(
+            "launch rs_slot_ids and rs_slot_flags lengths must match",
+        ));
+    }
+    if desc.rs_fold_lens.len != 0 && desc.rs_fold_lens.len != desc.rs_slot_ids.len {
+        return Err(invalid_argument(
+            "launch rs_fold_lens length must match rs_slot_ids",
+        ));
+    }
+    if desc.qo_indptr.len != 0
+        && desc.rs_slot_ids.len != 0
+        && desc.rs_slot_ids.len != wire_row_count
+    {
+        return Err(invalid_argument(
+            "launch rs slot vector length must match resolved qo rows",
+        ));
+    }
+    if desc.rs_slot_flags.len != 0 {
+        let flags =
+            unsafe { std::slice::from_raw_parts(desc.rs_slot_flags.ptr, desc.rs_slot_flags.len) };
+        if flags
+            .iter()
+            .any(|flag| flag & !(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD) != 0)
+        {
+            return Err(invalid_argument(
+                "launch rs_slot_flags contains unknown bits",
+            ));
+        }
+    }
     validate_row_count_u32(
         desc.context_ids.len,
-        "launch context_ids length must match batch size",
-        request_count,
+        "launch context_ids length must match resolved row count",
+        wire_row_count,
         true,
     )?;
     validate_row_count_u32(
         desc.kv_len.len,
-        "launch kv_len length must match batch size",
-        request_count,
+        "launch kv_len length must match resolved row count",
+        wire_row_count,
         true,
     )?;
     if desc.kv_len_device.len > 1 {
@@ -1513,7 +1528,7 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             desc.masks.request_indptr,
             "launch masks.request_indptr malformed",
             desc.masks.word_indptr.len.saturating_sub(1),
-            request_count,
+            wire_row_count,
             true,
         )?;
         let row_count = {
@@ -2061,7 +2076,7 @@ mod tests {
             .map(|cell| cell as *mut PieTerminalCell);
         let tokens = [1u32, 2, 3];
         let positions = [4u32, 5, 6];
-        let qo_indptr = [0u32, 2];
+        let qo_indptr = [0u32, 4];
         let launch = PieLaunchDesc {
             instance_ids: PieU64Slice {
                 ptr: instance_ids.as_ptr(),
@@ -2203,6 +2218,104 @@ mod tests {
         let err = unsafe { validate_launch_desc(&launch) }.unwrap_err();
         assert_eq!(err.status(), PIE_STATUS_INVALID_ARGUMENT);
         assert!(err.message().contains("single_token_mode"));
+    }
+
+    #[test]
+    fn launch_validator_accepts_resolved_request_rs_vectors() {
+        let instance_ids = [71u64];
+        let mut terminal = PieTerminalCell::default();
+        let terminal_cells = [&mut terminal as *mut PieTerminalCell];
+        let token_ids = [10u32, 11];
+        let position_ids = [0u32, 0];
+        let qo_indptr = [0u32, 1, 2];
+        let program_row_indptr = [0u32, 2];
+        let rs_slot_ids = [3u32, 4];
+        let rs_slot_flags = [PIE_RS_FLAG_RESET, 0];
+        let launch = PieLaunchDesc {
+            instance_ids: PieU64Slice {
+                ptr: instance_ids.as_ptr(),
+                len: instance_ids.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_cells.as_ptr(),
+                len: terminal_cells.len(),
+            },
+            token_ids: PieU32Slice {
+                ptr: token_ids.as_ptr(),
+                len: token_ids.len(),
+            },
+            position_ids: PieU32Slice {
+                ptr: position_ids.as_ptr(),
+                len: position_ids.len(),
+            },
+            qo_indptr: PieU32Slice {
+                ptr: qo_indptr.as_ptr(),
+                len: qo_indptr.len(),
+            },
+            ptir_program_row_indptr: PieU32Slice {
+                ptr: program_row_indptr.as_ptr(),
+                len: program_row_indptr.len(),
+            },
+            rs_slot_ids: PieU32Slice {
+                ptr: rs_slot_ids.as_ptr(),
+                len: rs_slot_ids.len(),
+            },
+            rs_slot_flags: PieU8Slice {
+                ptr: rs_slot_flags.as_ptr(),
+                len: rs_slot_flags.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+        unsafe { validate_launch_desc(&launch) }.unwrap();
+
+        let mismatched_flags = PieLaunchDesc {
+            rs_slot_flags: PieU8Slice {
+                ptr: rs_slot_flags.as_ptr(),
+                len: 1,
+            },
+            ..launch
+        };
+        assert!(
+            unsafe { validate_launch_desc(&mismatched_flags) }
+                .unwrap_err()
+                .message()
+                .contains("lengths must match")
+        );
+
+        let fold_lens = [0u32, 0, 0];
+        let mismatched_fold = PieLaunchDesc {
+            rs_fold_lens: PieU32Slice {
+                ptr: fold_lens.as_ptr(),
+                len: fold_lens.len(),
+            },
+            ..launch
+        };
+        assert!(
+            unsafe { validate_launch_desc(&mismatched_fold) }
+                .unwrap_err()
+                .message()
+                .contains("rs_fold_lens")
+        );
+
+        let one_slot = [3u32];
+        let one_flag = [0u8];
+        let wrong_resolved_count = PieLaunchDesc {
+            rs_slot_ids: PieU32Slice {
+                ptr: one_slot.as_ptr(),
+                len: one_slot.len(),
+            },
+            rs_slot_flags: PieU8Slice {
+                ptr: one_flag.as_ptr(),
+                len: one_flag.len(),
+            },
+            ..launch
+        };
+        assert!(
+            unsafe { validate_launch_desc(&wrong_resolved_count) }
+                .unwrap_err()
+                .message()
+                .contains("resolved qo rows")
+        );
     }
 
     #[test]

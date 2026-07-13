@@ -59,6 +59,15 @@ pub struct DriverCapabilities {
     /// Bytes per recurrent-state slot, for accounting/telemetry.
     #[serde(default)]
     pub rs_cache_slot_bytes: u64,
+    /// The loaded model exposes native MTP draft-logit rows to PTIR.
+    #[serde(default)]
+    pub has_mtp_logits: bool,
+    /// The loaded model exposes device-resident MTP draft token IDs to PTIR.
+    #[serde(default)]
+    pub has_mtp_drafts: bool,
+    /// The loaded model exposes a scalar value-head result to PTIR.
+    #[serde(default)]
+    pub has_value_head: bool,
     /// Maximum forward-pass tokens accepted in one driver fire.
     pub max_forward_tokens: u32,
     /// Maximum forward-pass requests accepted in one driver fire.
@@ -95,13 +104,18 @@ mod tests {
             "arch_name": "qwen3",
             "vocab_size": 151936,
             "max_model_len": 4096,
-            "activation_dtype": "bf16"
+            "activation_dtype": "bf16",
+            "has_mtp_logits": true,
+            "has_mtp_drafts": false,
+            "has_value_head": false
         }"#
     }
 
     #[test]
     fn capabilities_round_trip() {
         let caps: DriverCapabilities = serde_json::from_str(caps_json()).unwrap();
+        assert!(caps.has_mtp_logits);
+        assert!(!caps.has_mtp_drafts);
         let json = serde_json::to_string(&caps).unwrap();
         assert_eq!(
             serde_json::from_str::<DriverCapabilities>(&json).unwrap(),

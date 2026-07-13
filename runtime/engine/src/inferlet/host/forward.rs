@@ -16,7 +16,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use wasmtime::component::Resource;
+use wasmtime::component::{Accessor, HasSelf, Resource};
 use wasmtime_wasi::WasiView;
 
 use crate::inferlet::ProcessCtx;
@@ -33,6 +33,91 @@ use pie_ptir::container::HostRole;
 use super::pie;
 
 type Anyhow<T> = anyhow::Result<T>;
+
+#[derive(Clone, Copy)]
+enum ChannelReadMode {
+    Take,
+    Read,
+}
+
+enum ChannelPoll {
+    Ready(Result<Vec<u8>, String>),
+    Retry,
+    Pending {
+        cell: Arc<Mutex<ChannelCell>>,
+        fires: Option<crate::pipeline::fire::PendingFires>,
+        process_id: uuid::Uuid,
+        residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
+    },
+}
+
+async fn materialize_channel(
+    accessor: &Accessor<ProcessCtx, HasSelf<ProcessCtx>>,
+    this: Resource<Channel>,
+    mode: ChannelReadMode,
+) -> Anyhow<Result<Vec<u8>, String>> {
+    loop {
+        let state = accessor.with(|mut access| -> Anyhow<ChannelPoll> {
+            let ctx = access.get();
+            let (cell, fires) = {
+                let channel = ctx.ctx().table.get(&this)?;
+                (channel.cell.clone(), channel.fires.clone())
+            };
+            let value = {
+                let mut cell = cell.lock().unwrap();
+                match mode {
+                    ChannelReadMode::Take => cell.take(),
+                    ChannelReadMode::Read => cell.read(),
+                }
+            };
+            match value {
+                Ok(value) => return Ok(ChannelPoll::Ready(Ok(value))),
+                Err(ChannelError::Empty) => {}
+                Err(error) => return Ok(ChannelPoll::Ready(Err(error.to_string()))),
+            }
+
+            // `drain_settled` is async for the general case, but only pops
+            // already-settled operations here, so it cannot suspend while the
+            // Accessor temporarily lends us the store.
+            if futures::executor::block_on(crate::pipeline::fire::drain_settled(
+                ctx,
+                fires.as_ref(),
+            ))? {
+                return Ok(ChannelPoll::Retry);
+            }
+
+            Ok(ChannelPoll::Pending {
+                cell,
+                fires,
+                process_id: ctx.id(),
+                residency: ctx.residency_handle(),
+            })
+        })?;
+
+        match state {
+            ChannelPoll::Ready(value) => return Ok(value),
+            ChannelPoll::Retry => continue,
+            ChannelPoll::Pending {
+                cell,
+                fires,
+                process_id,
+                residency,
+            } => {
+                if let Err(error) =
+                    crate::inferlet::process::preemption::await_channel_progress_idle(
+                        process_id,
+                        residency,
+                        &cell,
+                        fires.as_ref(),
+                    )
+                    .await
+                {
+                    return Ok(Err(error));
+                }
+            }
+        }
+    }
+}
 
 impl pie::inferlet::forward::Host for ProcessCtx {}
 
@@ -84,75 +169,35 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
         }
     }
 
-    /// The direct-wake await point (plan §4.5): while the cell is empty,
-    /// non-blockingly drain already-settled pipeline ops (their KV/RS txns
-    /// finalize here, bounding pin float), then park on the channel's reader
-    /// wait slot — the driver's completion callback wakes it right after
-    /// publishing the mirror tail. The park races the oldest in-flight op so
-    /// a fire that resolves without producing on this channel still unblocks
-    /// the loop; with no endpoint and nothing in flight, nothing can ever
-    /// fill the cell and `Empty` is returned instead of parking.
-    async fn take(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
-        loop {
-            crate::inferlet::process::preemption::honor(self).await?;
-            let (cell, fires) = {
-                let ch = self.ctx().table.get(&this)?;
-                (ch.cell.clone(), ch.fires.clone())
-            };
-            match cell.lock().unwrap().take() {
-                Ok(v) => return Ok(Ok(v)),
-                Err(ChannelError::Empty) => {}
-                Err(e) => return Ok(Err(e.to_string())),
-            }
-            if crate::pipeline::fire::drain_settled(self, fires.as_ref()).await? {
-                continue;
-            }
-            if let Err(error) = crate::inferlet::process::preemption::await_channel_progress(
-                self,
-                &cell,
-                fires.as_ref(),
-            )
-            .await
-            {
-                return Ok(Err(error));
-            }
-        }
-    }
-
-    /// Non-consuming peek; same await discipline as `take`.
-    async fn read(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
-        loop {
-            crate::inferlet::process::preemption::honor(self).await?;
-            let (cell, fires) = {
-                let ch = self.ctx().table.get(&this)?;
-                (ch.cell.clone(), ch.fires.clone())
-            };
-            match cell.lock().unwrap().read() {
-                Ok(v) => return Ok(Ok(v)),
-                Err(ChannelError::Empty) => {}
-                Err(e) => return Ok(Err(e.to_string())),
-            }
-            if crate::pipeline::fire::drain_settled(self, fires.as_ref()).await? {
-                continue;
-            }
-            if let Err(error) = crate::inferlet::process::preemption::await_channel_progress(
-                self,
-                &cell,
-                fires.as_ref(),
-            )
-            .await
-            {
-                return Ok(Err(error));
-            }
-        }
-    }
-
     async fn drop(&mut self, this: Resource<Channel>) -> Anyhow<()> {
         // A pass that bound this channel holds its own Arc — dropping the
         // guest handle never dangles an in-flight fire. Native channel storage
         // is reference-counted by bound instances and releases on instance close.
         self.ctx().table.delete(this)?;
         Ok(())
+    }
+}
+
+impl pie::inferlet::forward::HostChannelWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
+    /// The direct-wake await point (plan §4.5): while the cell is empty,
+    /// non-blockingly drain already-settled pipeline ops (their KV/RS txns
+    /// finalize here, bounding pin float), then park on the channel's reader
+    /// wait slot — the driver's completion callback wakes it right after
+    /// publishing the mirror tail. Store access is scoped to synchronous polls;
+    /// the component task never holds an [`Accessor`] borrow across an await.
+    async fn take(
+        accessor: &Accessor<ProcessCtx, Self>,
+        this: Resource<Channel>,
+    ) -> Anyhow<Result<Vec<u8>, String>> {
+        materialize_channel(accessor, this, ChannelReadMode::Take).await
+    }
+
+    /// Non-consuming peek; same await discipline as `take`.
+    async fn read(
+        accessor: &Accessor<ProcessCtx, Self>,
+        this: Resource<Channel>,
+    ) -> Anyhow<Result<Vec<u8>, String>> {
+        materialize_channel(accessor, this, ChannelReadMode::Read).await
     }
 }
 
@@ -247,24 +292,19 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 cells.push(cell);
             }
 
-            // v1 single-model contract: exactly one guest-owned KV working set
+            // Single-model contract: exactly one guest-owned KV working set
             // (the classic forward-pass borrow convention — the guest keeps it
-            // alive for the pass's lifetime); at most one RS working set
-            // (hybrid / linear-attention models).
+            // alive for the pass's lifetime). RS working sets are retained in
+            // resolved request order and validated against that fire's
+            // `qo_indptr` immediately before launch.
             if kv_working_sets.len() != 1 {
                 return Ok(Err(format!(
                     "pipeline: expected exactly one kv-working-set, got {}",
                     kv_working_sets.len()
                 )));
             }
-            if rs_working_sets.len() > 1 {
-                return Ok(Err(format!(
-                    "pipeline: expected at most one rs-working-set, got {}",
-                    rs_working_sets.len()
-                )));
-            }
             let ws_rep = kv_working_sets[0].rep();
-            let rs_rep = rs_working_sets.first().map(|r| r.rep());
+            let rs_reps = rs_working_sets.iter().map(Resource::rep).collect();
 
             // Device-geometry pass (Track B): seed the physical-page lease with
             // `B` fire-0 pages (one live page per lane) drawn from the guest's
@@ -467,7 +507,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 channel_reps,
                 fires: None,
                 kv_ws: ws_rep,
-                rs_ws: rs_rep,
+                rs_ws: rs_reps,
                 committed_tokens: 0,
                 failed: None,
                 devgeo,
@@ -478,6 +518,84 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             })?;
             Ok(Ok(res))
         }
+    }
+
+    async fn set_rs_working_sets(
+        &mut self,
+        this: Resource<ForwardPass>,
+        rs_working_sets: Vec<Resource<RsWorkingSet>>,
+    ) -> Anyhow<Result<(), String>> {
+        let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
+        let (kv_rep, qo_indptr) = {
+            let pass = self.ctx().table.get(&this)?;
+            let pending = pass
+                .fires
+                .as_ref()
+                .map(|fifo| fifo.lock().unwrap().len())
+                .unwrap_or(0);
+            if pending != 0 {
+                return Ok(Err(format!(
+                    "pipeline: cannot replace rs-working-sets while {pending} operation(s) \
+                     remain in the pass FIFO"
+                )));
+            }
+            let qo_indptr = if let Some(devgeo) = pass.devgeo.as_ref() {
+                vec![0; devgeo.b + 1]
+            } else if has_recurrent_state {
+                match pass
+                    .instance
+                    .fire_geometry(crate::pipeline::program::model_profile().page_size)
+                {
+                    Ok(geometry) => geometry.qo_indptr,
+                    Err(error) => {
+                        return Ok(Err(format!(
+                            "pipeline: cannot resolve request rows for rs-working-set rebind: \
+                             {error:?}"
+                        )));
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            (pass.kv_ws, qo_indptr)
+        };
+
+        if let Err(error) = crate::pipeline::fire::rs::validate_count(
+            rs_working_sets.len(),
+            &qo_indptr,
+            has_recurrent_state,
+        ) {
+            return Ok(Err(format!("pipeline: recurrent-state binding: {error}")));
+        }
+
+        let kv_resource: Resource<KvWorkingSet> = Resource::new_borrow(kv_rep);
+        let kv = self.ctx().table.get(&kv_resource)?.clone();
+        let mut reps = Vec::with_capacity(rs_working_sets.len());
+        let mut ids = Vec::with_capacity(rs_working_sets.len());
+        for (row, resource) in rs_working_sets.iter().enumerate() {
+            let rs = self.ctx().table.get(resource)?;
+            if rs.model != kv.model || rs.driver != kv.driver {
+                return Ok(Err(format!(
+                    "pipeline: rs-working-set at request row {row} belongs to model/driver \
+                     ({}, {}), expected ({}, {})",
+                    rs.model, rs.driver, kv.model, kv.driver
+                )));
+            }
+            if ids.contains(&rs.id) {
+                return Ok(Err(format!(
+                    "pipeline: rs-working-set at request row {row} aliases an earlier row"
+                )));
+            }
+            ids.push(rs.id);
+            reps.push(resource.rep());
+        }
+
+        Ok(self
+            .ctx()
+            .table
+            .get_mut(&this)?
+            .replace_rs_working_sets(reps)
+            .map_err(|error| format!("pipeline: {error}")))
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
@@ -506,7 +624,8 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         Ok(())
     }
 
-    /// Run-ahead submit on `on`: prepare + fire + enqueue, NO await. See
+    /// Run-ahead submit on `on`: pure-attention prepares immediately; RS-bound
+    /// passes first finalize prior FIFO operations. See
     /// `crate::pipeline::fire`'s module docs; errors after this call surface
     /// via channel poison + `take`.
     async fn submit(

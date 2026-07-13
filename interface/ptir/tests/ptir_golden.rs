@@ -55,6 +55,23 @@ impl Report {
                     hex(&pie_ptir::sidecar::encode_bound(b))
                 )
                 .unwrap();
+                for stage in pie_ptir::compiler::compile_bound(b) {
+                    let metrics = stage.metrics();
+                    writeln!(
+                        self.0,
+                        "plan: stage={} signature=0x{:016x} source_ops={} normalized_ops={} singleton_regions={} fused_regions={} library_regions={} static_scratch_bytes={} direct_sink_bytes={}",
+                        stage.normalized.stage.name(),
+                        stage.signature.hash,
+                        metrics.source_ops,
+                        metrics.normalized_ops,
+                        metrics.singleton_regions,
+                        metrics.fused_regions,
+                        metrics.library_regions,
+                        metrics.static_scratch_bytes,
+                        metrics.direct_channel_sink_bytes,
+                    )
+                    .unwrap();
+                }
                 for e in &b.readiness {
                     writeln!(
                         self.0,
@@ -349,6 +366,210 @@ fn golden_counter_pingpong() {
     rep = rep.line(&take_line(&mut inst, &bound, 1));
     rep = rep.line(&take_line(&mut inst, &bound, 1)); // WouldBlock
     check("counter_pingpong", rep);
+}
+
+#[test]
+fn golden_nucleus_sample() {
+    const V: u32 = 8;
+    let c = TraceContainer {
+        channels: vec![
+            ChannelDecl {
+                shape: Shape::vector(2),
+                dtype: ChanDType::Concrete(DType::U32),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
+            },
+            ChannelDecl {
+                shape: Shape::SCALAR,
+                dtype: ChanDType::Concrete(DType::F32),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
+            },
+            ChannelDecl {
+                shape: Shape::vector(1),
+                dtype: ChanDType::Concrete(DType::I32),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            },
+        ],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Op::IntrinsicVal {
+                    intr: IntrinsicId::Logits,
+                    shape: Shape::matrix(1, V),
+                    dtype: DType::F32,
+                },
+                Op::ChanTake(0),
+                Op::ChanRead(1),
+                Op::ReduceMax(0),
+                Op::Broadcast {
+                    value: 3,
+                    shape: Shape::matrix(1, V),
+                },
+                Op::Sub(0, 4),
+                Op::Exp(5),
+                Op::ReduceSum(6),
+                Op::Broadcast {
+                    value: 7,
+                    shape: Shape::matrix(1, V),
+                },
+                Op::Div(6, 8),
+                Op::PivotThreshold {
+                    input: 9,
+                    predicate: pie_ptir::Predicate::CummassLe(2),
+                },
+                Op::Const(Literal::F32(f32::NEG_INFINITY)),
+                Op::Select {
+                    cond: 10,
+                    a: 0,
+                    b: 11,
+                },
+                Op::RngKeyed {
+                    state: 1,
+                    shape: Shape::matrix(1, V),
+                    kind: pie_ptir::RngKind::Gumbel,
+                },
+                Op::Add(12, 13),
+                Op::ReduceArgmax(14),
+                Op::ChanPut { chan: 2, value: 15 },
+            ],
+        }],
+        ..TraceContainer::default()
+    };
+    let mut profile = ModelProfile::dummy();
+    profile.vocab = V;
+    let bound = bind(c.clone(), profile).unwrap();
+    let mut report = Report::new("nucleus_sample", &c).verdict(&Ok(bound.clone()));
+    let inputs = PassInputs {
+        logits: Some(Value::F32(vec![
+            4.0,
+            4.0,
+            3.0,
+            2.0,
+            1.0,
+            0.0,
+            -1.0,
+            f32::NAN,
+        ])),
+        ..PassInputs::default()
+    };
+    for (case, top_p) in [
+        (0, 0.5f32),
+        (1, 1.0f32),
+        (2, 0.0f32),
+        (3, f32::NAN),
+        (4, f32::INFINITY),
+    ] {
+        let seeds = [(0, u32s(&[1234, case])), (1, Value::F32(vec![top_p]))];
+        report = report.line(&format!("case {case}: top_p={top_p}"));
+        report = seed_lines(report, &seeds);
+        let mut instance = Instance::new(&bound, &seeds).unwrap();
+        report = report.line(&step_line(case as usize, &mut instance, &bound, &inputs));
+        report = report.line(&take_line(&mut instance, &bound, 2));
+    }
+    check("nucleus_sample", report);
+}
+
+#[test]
+fn golden_structured_masks() {
+    let channel = |shape: Shape, dtype: DType, role, seeded| ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 1,
+        host_role: role,
+        seeded,
+    };
+    let c = TraceContainer {
+        channels: vec![
+            channel(Shape::vector(2), DType::U32, HostRole::None, true),
+            channel(Shape::matrix(2, 3), DType::U32, HostRole::None, true),
+            channel(Shape::vector(4), DType::U32, HostRole::None, true),
+            channel(Shape::matrix(2, 6), DType::Bool, HostRole::Reader, false),
+            channel(Shape::matrix(2, 6), DType::Bool, HostRole::Reader, false),
+            channel(Shape::matrix(2, 6), DType::Bool, HostRole::Reader, false),
+            channel(Shape::matrix(2, 4), DType::Bool, HostRole::Reader, false),
+        ],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Op::ChanTake(0),
+                Op::ChanTake(1),
+                Op::ChanTake(2),
+                Op::CausalMask {
+                    positions: 0,
+                    len: 6,
+                },
+                Op::ChanPut { chan: 3, value: 3 },
+                Op::SlidingWindowMask {
+                    positions: 0,
+                    len: 6,
+                    window: 3,
+                },
+                Op::ChanPut { chan: 4, value: 4 },
+                Op::SinkWindowMask {
+                    positions: 0,
+                    len: 6,
+                    sink: 1,
+                    window: 3,
+                },
+                Op::ChanPut { chan: 5, value: 5 },
+                Op::Reshape {
+                    value: 1,
+                    shape: Shape::vector(6),
+                },
+                Op::Iota { len: 24 },
+                Op::Const(Literal::U32(12)),
+                Op::Div(7, 8),
+                Op::Const(Literal::U32(3)),
+                Op::Rem(7, 10),
+                Op::Mul(9, 10),
+                Op::Add(12, 11),
+                Op::Gather { src: 6, idx: 13 },
+                Op::Div(7, 10),
+                Op::Const(Literal::U32(4)),
+                Op::Rem(15, 16),
+                Op::Gather { src: 2, idx: 17 },
+                Op::Reshape {
+                    value: 14,
+                    shape: Shape::new(&[2, 4, 3]).unwrap(),
+                },
+                Op::Reshape {
+                    value: 18,
+                    shape: Shape::new(&[2, 4, 3]).unwrap(),
+                },
+                Op::Eq(19, 20),
+                Op::Cast {
+                    value: 21,
+                    dtype: DType::U32,
+                },
+                Op::ReduceMax(22),
+                Op::Cast {
+                    value: 23,
+                    dtype: DType::Bool,
+                },
+                Op::ChanPut { chan: 6, value: 24 },
+            ],
+        }],
+        ..TraceContainer::default()
+    };
+    let bound = bind(c.clone(), ModelProfile::dummy()).unwrap();
+    let seeds = [
+        (0, Value::U32(vec![3, 5])),
+        (1, Value::U32(vec![0, 1, 2, 1, 2, 3])),
+        (2, Value::U32(vec![0, 1, 2, 3])),
+    ];
+    let mut report = Report::new("structured_masks", &c).verdict(&Ok(bound.clone()));
+    report = seed_lines(report, &seeds);
+    let mut instance = Instance::new(&bound, &seeds).unwrap();
+    report = report.line(&step_line(0, &mut instance, &bound, &PassInputs::default()));
+    for channel in 3..=6 {
+        report = report.line(&take_line(&mut instance, &bound, channel));
+    }
+    check("structured_masks", report);
 }
 
 // ── negative cases (verdict-only) ──────────────────────────────────────────
@@ -999,7 +1220,7 @@ fn quest_tap(budget_ch: u32) -> StageProgram {
         dtype: DType::F32,
     });
     let scores = b.p(Op::KernelCall {
-        name: 0, // "envelope_dot"
+        name: 1, // "envelope_dot"
         args: vec![q],
         shape: Shape::vector(PPAGES),
         dtype: DType::F32,
@@ -1014,7 +1235,7 @@ fn quest_tap(budget_ch: u32) -> StageProgram {
         predicate: pie_ptir::types::Predicate::RankLe(buds),
     });
     b.p(Op::SinkCall {
-        name: 1,
+        name: 0,
         args: vec![pm],
     }); // "attn_page_mask"
     StageProgram {
@@ -1109,7 +1330,7 @@ fn expand_trace() -> TraceContainer {
         seeded,
     };
     TraceContainer {
-        names: vec!["envelope_dot".into(), "attn_page_mask".into()],
+        names: vec!["attn_page_mask".into(), "envelope_dot".into()],
         channels: vec![
             ch(Shape::matrix(1, PV), DType::F32, HostRole::Writer, false), // 0 am
             ch(Shape::matrix(1, PV), DType::Bool, HostRole::Writer, false), // 1 gmask
@@ -1220,7 +1441,7 @@ fn rollout_trace() -> TraceContainer {
         seeded,
     };
     TraceContainer {
-        names: vec!["envelope_dot".into(), "attn_page_mask".into()],
+        names: vec!["attn_page_mask".into(), "envelope_dot".into()],
         channels: vec![
             ch(Shape::vector(PK), DType::I32, HostRole::None, true), // 0 prev_drafts
             ch(Shape::matrix(kp1, PV), DType::Bool, HostRole::Writer, false), // 1 gmask

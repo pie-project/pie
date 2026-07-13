@@ -18,6 +18,7 @@
 
 #include "distributed.hpp"
 #include "batch/persistent_inputs.hpp"
+#include "batch/rs_metadata.hpp"
 
 namespace pie_cuda_driver {
 
@@ -32,9 +33,23 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                          int kv_indices_count,
                          int mask_bytes, int mask_indptr_count,
                          bool has_slot_ids,
+                         bool has_write_desc,
                          bool tp_greedy_argmax,
                          int logit_rows,
+                         int structured_window_left,
+                         std::uint64_t program_set_hash,
+                         RsExecutionMode rs_mode,
+                         int rs_fold_lens_count,
+                         int rs_buffer_ids_count,
                          cudaStream_t stream);
+
+void tp_broadcast_mtp_step(
+    NcclComm& comm,
+    PersistentInputs& pi,
+    int rows,
+    int draft_step,
+    int max_global_tokens,
+    cudaStream_t stream);
 
 // Notify TP followers waiting on the CPU gate keyed by `key` that rank 0 has
 // begun broadcasting a new fire. No-op when `key` is empty (CPU gate off).

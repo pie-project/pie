@@ -541,9 +541,19 @@ CudaMemoryPlan plan_cuda_memory(
                                       (static_cast<std::int64_t>(N) *
                                        std::max(1024, R0 * 64) + 7) / 8)));
             const int output_rows = R0;
+            int mtp_drafts_per_program = 0;
+            if (qwen3_5_selected || qwen3_5_moe_selected) {
+                mtp_drafts_per_program = cfg.model.mtp_num_drafts;
+                if (const char* value =
+                        std::getenv("PIE_MTP_DRAFT_TOKENS")) {
+                    mtp_drafts_per_program =
+                        std::clamp(std::atoi(value), 0, 32);
+                }
+            }
             std::size_t arena = 0;
             arena += pie_cuda_driver::model::workspace_bytes(
-                hf, N, output_rows, max_intermediate, max_Hq, max_Hk);
+                hf, N, output_rows, max_intermediate, max_Hq, max_Hk,
+                R0 * mtp_drafts_per_program);
             if (qwen3_5_selected || qwen3_5_moe_selected) {
                 arena += pie_cuda_driver::model::qwen3_5_la_workspace_bytes(
                     hf, N, tp_size);

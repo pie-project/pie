@@ -28,6 +28,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "pie_native/ptir/rng_contract.generated.h"
 #include "pie_native/ptir/trace.hpp"
 
 namespace pie_cuda_driver::pipeline {
@@ -41,8 +42,6 @@ using namespace pie_native::ptir;
 enum class T1ArgKind : std::uint8_t {
     Logits,     // const float* [rows, V]  (intrinsic logits; f32 for tier-1 cut #1)
     RowSeed,    // const uint32_t* [rows]  (ambient RNG seed S per row)
-    HostVec,    // const float* [rows, V] or [V]  (a per-vocab host input, e.g. bias)
-    HostMaskU8, // const uint8_t* [rows, V] (unpacked bool mask for mask_apply)
     ChanVecF32, // const float* [V]  (a per-vocab channel-take value)
     ChanMaskU8, // const uint8_t* [V] (a bool channel-take mask, e.g. §3 grammar mask)
     RngState,   // const uint32_t* [2] (a channel-take rng state [key,ctr] for rng_keyed)
@@ -70,23 +69,19 @@ struct T1Kernel {
 namespace detail_t1 {
 
 // NVRTC-safe device prelude — RNG bit-parity with tier0_kernels.cuh.
-inline const char* t1_prelude() {
-    return R"PIECUDA(
+inline std::string t1_prelude() {
+    std::string source = R"PIECUDA(
 #define T1_BLOCK 256
 __device__ __forceinline__ float t1_neg_inf(){ return __int_as_float(0xff800000); }
-__device__ __forceinline__ unsigned long long t1_smix(unsigned long long x){
-  x^=x>>27; x*=0x3C79AC492BA7B653ULL; x^=x>>33; x*=0x1C69B3F74AC4AE35ULL; x^=x>>27; return x; }
-__device__ __forceinline__ unsigned long long t1_seed_eff(unsigned int s){ return (unsigned long long)s ^ 0xA5A5A5A5ULL; }
-__device__ __forceinline__ unsigned long long t1_stream_salt(unsigned int st){ return t1_smix((unsigned long long)st*0x9E3779B97F4A7C15ULL); }
-__device__ __forceinline__ unsigned long long t1_seed_eff_stream(unsigned int s, unsigned int st){ return t1_seed_eff(s) ^ t1_stream_salt(st); }
-__device__ __forceinline__ float t1_hash_uniform(unsigned long long se, int j){
-  unsigned long long x = se + 0x9E3779B97F4A7C15ULL*(unsigned long long)(j+1); x=t1_smix(x);
-  unsigned int b=(unsigned int)(x>>40); return ((float)b+0.5f)*(1.0f/16777216.0f); }
-__device__ __forceinline__ float t1_gumbel(unsigned long long se, int j){ float u=t1_hash_uniform(se,j); return -logf(-logf(u)); }
-__device__ __forceinline__ float t1_gumbel_keyed(unsigned int key, unsigned int ctr, int j){
-  unsigned long long s64 = t1_smix(((unsigned long long)key<<32) | (unsigned long long)ctr);
-  float u = t1_hash_uniform(s64, j); return -logf(-logf(u)); }
 )PIECUDA";
+    source += PTIR_RNG_CUDA_PREAMBLE;
+    source += R"PIECUDA(
+__device__ __forceinline__ float t1_gumbel(unsigned long long se, int j){ float u=ptir_rng_hash_uniform(se,(unsigned int)j); return -logf(-logf(u)); }
+__device__ __forceinline__ float t1_gumbel_keyed(unsigned int key, unsigned int ctr, int j){
+  unsigned long long s64 = ptir_rng_keyed_seed(key, ctr);
+  float u = ptir_rng_hash_uniform(s64, (unsigned int)j); return -logf(-logf(u)); }
+)PIECUDA";
+    return source;
 }
 
 }  // namespace detail_t1
@@ -155,7 +150,6 @@ inline T1Kernel emit_fused_epilogue(const Trace& trace, const Stage& stage) {
     if (vocab == 0) return fail("could not determine vocab length from logits intrinsic");
     k.vocab = vocab;
     bool needs_seed = false;
-    std::unordered_map<std::uint32_t, int> host_vec_arg;  // host_key → arg index
 
     // Walk ops in SSA order emitting per-vocab / scalar expressions.
     std::ostringstream body;   // per-vocab op locals, emitted inside the j-loop
@@ -197,24 +191,15 @@ inline T1Kernel emit_fused_epilogue(const Trace& trace, const Stage& stage) {
                 if (op.rng_kind == RngKind::Gumbel)
                     e = "t1_gumbel_keyed(" + st + "[0], " + st + "[1], j)";
                 else
-                    e = "t1_hash_uniform(t1_smix(((unsigned long long)" + st + "[0]<<32)|" + st + "[1]), j)";
+                    e = "ptir_rng_hash_uniform(ptir_rng_keyed_seed(" + st +
+                        "[0], " + st + "[1]), (unsigned int)j)";
                 any_pv = true;
                 break;
             }
-            case OpCode::MaskApplyBool: {
-                int ai = -1;
-                const Value* mv = trace.value(op.args[1]);
-                if (mv && mv->source == ValueSource::HostInput) {
-                    if (!host_vec_arg.count(mv->host_key)) { host_vec_arg[mv->host_key] = (int)k.args.size(); k.args.push_back({T1ArgKind::HostMaskU8, mv->host_key}); }
-                    ai = host_vec_arg[mv->host_key];
-                } else return fail("mask_apply mask must be a host input in tier-1 cut#1");
-                e = std::string("(hostmask") + std::to_string(ai) + "[row*V+j] ? " + a[0] + " : t1_neg_inf())";
-                any_pv = true;
-                break;
-            }
-            case OpCode::GumbelNoise: {
+            case OpCode::Rng: {
                 needs_seed = true;
-                e = "t1_gumbel(t1_seed_eff_stream(row_seed[row], " + std::to_string(op.imm) + "u), j)";
+                e = "t1_gumbel(ptir_rng_seed_eff_stream(row_seed[row], " +
+                    std::to_string(op.imm) + "u), j)";
                 any_pv = true;
                 break;
             }
@@ -249,8 +234,6 @@ inline T1Kernel emit_fused_epilogue(const Trace& trace, const Stage& stage) {
         switch (ar.kind) {
             case T1ArgKind::Logits:    src << "    const float* __restrict__ logits"; break;
             case T1ArgKind::RowSeed:   src << "    const unsigned int* __restrict__ row_seed"; break;
-            case T1ArgKind::HostVec:   src << "    const float* __restrict__ hostvec" << i; break;
-            case T1ArgKind::HostMaskU8:src << "    const unsigned char* __restrict__ hostmask" << i; break;
             case T1ArgKind::ChanVecF32:src << "    const float* __restrict__ chanvec" << i; break;
             case T1ArgKind::ChanMaskU8:src << "    const unsigned char* __restrict__ chanmask" << i; break;
             case T1ArgKind::RngState:  src << "    const unsigned int* __restrict__ rngstate" << i; break;

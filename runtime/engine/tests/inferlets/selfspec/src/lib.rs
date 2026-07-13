@@ -56,7 +56,7 @@ fn greedy_verify_a2_obs(d: &[u32], a: &[u32]) -> Vec<u32> {
 
 /// The independent greedy-argmax reference continuation `g[0..k)`: `k`
 /// sequential single-token argmax decode fires on a fresh working set.
-fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
+async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     let ws: &'static WorkingSet = bx(WorkingSet::new());
     let n = prompt.len() as u32;
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
@@ -79,6 +79,7 @@ fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     let g0 = g0_ch
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("g0 take: {e}"))?[0];
     prefill.close();
 
@@ -113,6 +114,7 @@ fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
             let t = out
                 .take()
                 .get::<i32>()
+                .await
                 .map_err(|e| format!("greedy out @{step}: {e}"))?[0];
             g.push(t as u32);
         }
@@ -124,7 +126,7 @@ fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
 /// Fire `input = prompt ++ drafts`; the verify device-aliases the k drafts by
 /// peeking (`.read()`, non-consuming) the SAME `toks` channel already embedded
 /// — NO separate draft submission. Returns the `[k]` accept set.
-fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>> {
+async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>> {
     let l = prompt.len() as u32;
     let mut inp: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     inp.extend(drafts.iter().map(|&t| t as i32));
@@ -167,6 +169,7 @@ fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>> {
     let v = verify_out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("verify take: {e}"))?;
     pipeline.close();
     Ok(v.iter().map(|&x| x as u32).collect())
@@ -186,19 +189,19 @@ async fn main(input: String) -> Result<String> {
     }
 
     // ── Greedy continuation g[0..k): the INDEPENDENT argmax witness. ──
-    let g = greedy_reference(&prompt, k)?;
+    let g = greedy_reference(&prompt, k).await?;
     if (g.len() as u32) < k {
         return Err(format!("greedy produced {} < k={} tokens", g.len(), k));
     }
     let g: Vec<u32> = g[..k as usize].to_vec();
 
     // ── ACCEPT-ALL: drafts = g → all rows match → V == g. ──
-    let accept_out = fire_verify(&prompt, k, &g)?;
+    let accept_out = fire_verify(&prompt, k, &g).await?;
 
     // ── REJECT-MID (load-bearing): perturb draft j (≠ g[j], nonzero). ──
     let mut rj_draft = g.clone();
     rj_draft[j] = ((g[j] + 1) % vocab).max(1);
-    let reject_out = fire_verify(&prompt, k, &rj_draft)?;
+    let reject_out = fire_verify(&prompt, k, &rj_draft).await?;
 
     // ── Verdicts ──
     let expect_accept = greedy_verify_a2_obs(&g, &g);

@@ -27,6 +27,28 @@ The intended end state is:
    pages needed to make progress, and it cannot thrash by restoring work that
    must immediately be evicted again.
 
+### Implementation status (2026-07-11)
+
+The single-model, single-GPU CUDA v1 described by Phases 0–8 is implemented.
+Sections 2 and 3 below remain as the historical pre-implementation gap record.
+
+- allocation and restore use one `submit_seq`-ordered, concrete-ID grant path;
+- process-owned residency inventory, host-slot ownership, and resident/swapped
+  trie backing are live;
+- process safe points freeze scheduler preparation, drain fires, execute
+  transactional D2H/H2D, and resume only after mapping publication;
+- long channel/session waits are park-interruptible;
+- requester self-suspend, run-ahead draining, event-driven blocked preparation,
+  cancellation-safe teardown, restore watchdogs, capability gating, diagnostics,
+  and real worker pressure reporting are wired;
+- RS ownership is inventoried but RS stays device-resident, as specified for v1.
+
+Validation includes the full engine unit suite, a non-ignored dummy-driver
+over-capacity integration test, Metal copy-capability host tests, and the CUDA
+4090 contention harness with 24 lanes over an 8-page pool. The CUDA run completed
+all lanes with identical output and observed 23 suspend/restore cycles. Phase 9
+platform expansion remains follow-up scope.
+
 ## 1. North-Star Semantics
 
 ### 1.1 Fairness clock

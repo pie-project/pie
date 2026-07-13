@@ -229,7 +229,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/batch/brle.cpp
   src/batch/compose.cpp
   src/batch/forward.cpp
-  src/batch/logits.cpp
   src/batch/persistent_inputs.cpp
   src/batch/tp.cpp
   src/batch/workspace.cpp
@@ -519,7 +518,6 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
   CUDA::cublas
   CUDA::cublasLt
   CUDA::cuda_driver
-  CUDA::nvrtc
   ${NCCL_LIBRARY}
 )
 
@@ -551,6 +549,7 @@ add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/golden-ptir/dfa_ingraph.txt
   tests/golden-ptir/greedy_argmax.txt
   tests/golden-ptir/mtp_verify_tail.txt
+  tests/golden-ptir/nucleus_sample.txt
   tests/golden-ptir/neg_body_type_error.txt
   tests/golden-ptir/neg_intrinsic_wrong_stage.txt
   tests/golden-ptir/neg_model_gated_missing.txt
@@ -558,7 +557,18 @@ add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/golden-ptir/neg_spsc_second_producer.txt
   tests/golden-ptir/neg_t10_nonreplayable.txt
   tests/golden-ptir/pivot_predicates_multistage.txt
-  tests/golden-ptir/section3_masked_gumbel.txt)
+  tests/golden-ptir/section3_masked_gumbel.txt
+  tests/golden-ptir/staged_dispatch.txt
+  tests/golden-ptir/structured_masks.txt)
+
+file(GLOB PIE_PTIR_CANONICAL_GOLDENS CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir/*.txt)
+pie_add_cuda_target(test_ptir_decoder_limits
+  SOURCES ../common/tests/ptir_decoder_limits_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  TEST_ARGS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
+    ${PIE_PTIR_CANONICAL_GOLDENS})
 
 # Mixed prefill/decode batch: a continuing T=1 request must reuse its conv window.
 pie_add_cuda_target(test_causal_conv1d
@@ -680,7 +690,27 @@ pie_add_cuda_target(test_flashinfer_decode_head_dim_guard
   SOURCES tests/test_flashinfer_decode_head_dim_guard.cpp
   LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_graph_variant SOURCES tests/graph_variant_test.cpp)
-pie_add_cuda_target(test_ptir_graph_key SOURCES tests/ptir_graph_key_test.cpp LIBS CUDA::cudart)
+pie_add_cuda_target(test_tp_gate
+  SOURCES tests/tp_gate_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
+  LIBS Threads::Threads)
+pie_add_cuda_target(test_program_identity
+  SOURCES tests/program_identity_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+pie_add_cuda_target(test_grouped_copy
+  SOURCES tests/grouped_copy_test.cpp)
+pie_add_cuda_target(test_nucleus_region
+  SOURCES tests/nucleus_region_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+pie_add_cuda_target(test_page_translation
+  SOURCES tests/page_translation_test.cpp)
+pie_add_cuda_target(test_ptir_graph_key
+  SOURCES tests/ptir_graph_key_test.cpp
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  LIBS CUDA::cudart)
 pie_add_cuda_target(test_frame_carrier_device
   SOURCES
     tests/test_frame_carrier_device.cpp
@@ -695,7 +725,7 @@ pie_add_cuda_target(test_pipeline_dispatch_bind
     src/pipeline/frame_carrier.cpp
     src/pipeline/frame_carrier_kernels.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
-  LIBS CUDA::cudart
+  LIBS CUDA::cudart CUDA::cuda_driver
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 # Same-instance run-ahead concurrency gate; build with -fsanitize=thread for the TSAN run.
 pie_add_cuda_target(test_pipeline_dispatch_race
@@ -705,7 +735,7 @@ pie_add_cuda_target(test_pipeline_dispatch_race
     src/pipeline/frame_carrier.cpp
     src/pipeline/frame_carrier_kernels.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
-  LIBS CUDA::cudart
+  LIBS CUDA::cudart CUDA::cuda_driver
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 pie_add_cuda_target(test_ptir_tier0
   SOURCES tests/ptir_tier0_test.cu
@@ -730,6 +760,49 @@ pie_add_cuda_target(test_ptir_tier1
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR}
   LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
+pie_add_cuda_target(test_ptir_grouped
+  SOURCES tests/ptir_grouped_test.cu
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  LIBS CUDA::cudart CUDA::cuda_driver Threads::Threads)
+pie_add_cuda_target(test_ptir_grouped_dispatch
+  SOURCES
+    tests/ptir_grouped_dispatch_test.cpp
+    src/pipeline/dispatch.cu
+    src/pipeline/frame_carrier.cpp
+    src/pipeline/frame_carrier_kernels.cu
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  LIBS CUDA::cudart CUDA::cuda_driver
+  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  pie_add_cuda_target(test_ptir_grouped_dispatch_asan
+    SOURCES
+      tests/ptir_grouped_dispatch_test.cpp
+      src/pipeline/dispatch.cu
+      src/pipeline/frame_carrier.cpp
+      src/pipeline/frame_carrier_kernels.cu
+    INCLUDE_DIRS
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+      ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+      ${PIE_DRIVER_ABI_INCLUDE_DIR}
+    LIBS CUDA::cudart CUDA::cuda_driver
+    TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+  target_compile_options(test_ptir_grouped_dispatch_asan PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fsanitize=address>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-omit-frame-pointer>)
+  target_link_options(test_ptir_grouped_dispatch_asan PRIVATE
+    -fsanitize=address)
+  set_tests_properties(ptir_grouped_dispatch_asan PROPERTIES
+    ENVIRONMENT
+      "ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:protect_shadow_gap=0")
+endif()
 pie_add_cuda_target(test_ptir_golden_exec
   SOURCES tests/ptir_golden_exec_test.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
@@ -738,6 +811,12 @@ pie_add_cuda_target(test_ptir_golden_exec
 pie_add_cuda_target(test_entry_validation
   SOURCES tests/entry_validation_test.cpp
   LIBS pie_driver_cuda_lib)
+pie_add_cuda_target(test_rs_descriptor_validation
+  SOURCES tests/rs_descriptor_validation_test.cpp
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR})
 # Structural proof for model/registry.{hpp,cpp}: every model_type resolves to its
 # intended family/binder; unrecognized archs are rejected. No GPU, no weights.
 pie_add_cuda_target(test_model_registry

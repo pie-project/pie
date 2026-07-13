@@ -68,11 +68,13 @@ pub use builder::{Builder, PortInput, Traced};
 pub use channel::{Channel, HostError, IntoPut, Put, Taken};
 pub use error::{Endpoint, Span, TraceError, TraceErrors};
 pub use value::{
-    add, and, broadcast, cast, cumprod, cumsum, div, eq, exp, gather, gather_row, ge, gt, gumbel,
-    iota, l2norm, le, log, log_softmax, lt, mask_apply, matmul, max_elem, min_elem, mul, ne, neg,
-    not, or, pivot_threshold, cummass_le, prob_ge, rank_le, reduce_argmax, reduce_max, reduce_min,
-    reduce_sum, rem, reshape, rng, scatter_add, scatter_set, select, softmax, sub, top_k, transpose,
-    AsTensor, IntoConst, IntoShape, PredicateArg, Tensor,
+    AsTensor, IntoConst, IntoShape, PredicateArg, Tensor, add, and, broadcast, cast, causal_mask,
+    cummass_le, cumprod, cumsum, div, entropy, entropy_from_logprobs, eq, exp, gather, gather_row,
+    ge, gt, gumbel, gumbel_max, iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax,
+    matmul, max_elem, min_elem, mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge,
+    rank_le, reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng, row_membership,
+    scalar_gather, scatter_add, scatter_set, select, sink_window_mask, sliding_window_mask,
+    softmax, sub, top_k, transpose,
 };
 
 /// The canonical PTIR contract (op-table, container, validator, interpreter) —
@@ -90,11 +92,13 @@ pub mod prelude {
     pub use crate::dtype;
     pub use crate::intrinsics;
     pub use crate::value::{
-        add, and, broadcast, cast, cumprod, cumsum, cummass_le, div, eq, exp, gather, gather_row,
-        ge, gt, gumbel, iota, l2norm, le, log, log_softmax, lt, mask_apply, matmul, max_elem,
-        min_elem, mul, ne, neg, not, or, pivot_threshold, prob_ge, rank_le, reduce_argmax,
-        reduce_max, reduce_min, reduce_sum, rem, reshape, rng, scatter_add, scatter_set, select,
-        softmax, sub, top_k, transpose, Tensor,
+        Tensor, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, entropy,
+        entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, iota,
+        l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem, min_elem,
+        mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, reduce_argmax,
+        reduce_max, reduce_min, reduce_sum, rem, reshape, rng, row_membership, scalar_gather,
+        scatter_add, scatter_set, select, sink_window_mask, sliding_window_mask, softmax, sub,
+        top_k, transpose,
     };
     pub use pie_ptir::registry::{Port, Stage};
 }

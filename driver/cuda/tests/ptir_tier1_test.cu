@@ -79,7 +79,9 @@ Trace build_epilogue(std::uint32_t V, bool gumbel, float inv_t, std::uint32_t st
         Value mv = mk(next, logv, ValueSource::OpResult); t.values.push_back(mv); ValueId mulid = next++;
         Op mul; mul.code = OpCode::Mul; mul.args = {0, cid}; mul.result_type = logv; mul.result_id = mulid; ep.ops.push_back(mul);
         Value gv = mk(next, logv, ValueSource::OpResult); t.values.push_back(gv); ValueId gid = next++;
-        Op gm; gm.code = OpCode::GumbelNoise; gm.result_type = logv; gm.result_id = gid; gm.imm = stream; ep.ops.push_back(gm);
+        Op gm; gm.code = OpCode::Rng; gm.rng_kind = RngKind::Gumbel;
+        gm.result_type = logv; gm.result_id = gid; gm.imm = stream;
+        ep.ops.push_back(gm);
         Value av = mk(next, logv, ValueSource::OpResult); t.values.push_back(av); ValueId aid = next++;
         Op add; add.code = OpCode::Add; add.args = {mulid, gid}; add.result_type = logv; add.result_id = aid; ep.ops.push_back(add);
         reduce_in = aid;

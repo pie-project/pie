@@ -13,9 +13,9 @@
 //!
 //! `draft` is read DEVICE-ALIAS off the SAME embedded window tokens (`toks.read()`,
 //! non-consuming peek — rows `1..=k`, the previous step's MTP proposals fed as
-//! this window's input), not a separately submitted channel; `toks` itself is a
-//! plain host-writer channel re-`put` each iteration from the host's running
-//! commit/draft bookkeeping (the ptir-bridge equivalent of the deleted
+//! this window's input), not a separately submitted draft channel; each fresh
+//! pass seeds its `toks` channel from the host's running commit/draft bookkeeping
+//! (the ptir-bridge equivalent of the deleted
 //! `sampling::program::mtp_native_verify` + `resolve_bindings` blob-submit
 //! surface — there is no lower-level "device-resident retain" primitive on the
 //! current `inferlet::ptir` surface, so drafts round-trip through host state
@@ -42,8 +42,10 @@ fn bx<T>(v: T) -> &'static T {
 }
 
 /// Decode a `[k]`/`[k+1]` i32 host vector.
-fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
-    t.get::<i32>().map_err(|e| format!("tensor take: {e}"))
+async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
+    t.get::<i32>()
+        .await
+        .map_err(|e| format!("tensor take: {e}"))
 }
 
 /// Committed length of a sentinel `[k+1]` tail = the count before the first
@@ -55,7 +57,12 @@ fn committed_len(tail: &[i32]) -> usize {
 /// Bootstrap fire over `prompt + (k-1)` fillers: yields the seed (row-0 target
 /// argmax at the prompt's REAL last position) + the first REAL `[k]` drafts
 /// (native MTP argmax) for window 1. No verify (nothing to verify yet).
-fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Vec<i32>)> {
+async fn bootstrap(
+    ws: &'static WorkingSet,
+    rs: &'static RsWorkingSet,
+    prompt: &[u32],
+    k: u32,
+) -> Result<(i32, Vec<i32>)> {
     let l = prompt.len() as u32;
     let mut window: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     window.extend(std::iter::repeat(0i32).take((k - 1) as usize));
@@ -73,6 +80,7 @@ fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Ve
     let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
     fwd.embed(toks, Tensor::constant(vec![0u32, n]));
     fwd.attn_working_set(ws, klen);
+    fwd.rs_working_set(rs);
     fwd.readout(&Tensor::constant(readout));
     fwd.epilogue(move || {
         let picked = reduce_argmax(intrinsics::logits()); // [k] target argmax
@@ -86,17 +94,18 @@ fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Ve
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline)
         .map_err(|e| format!("bootstrap submit: {e}"))?;
-    let seed = get_i32(seed_out.take())?
+    let seed = get_i32(seed_out.take())
+        .await?
         .first()
         .copied()
         .ok_or_else(|| "bootstrap: empty seed".to_string())?;
-    let drafts = get_i32(drafts_out.take())?;
+    let drafts = get_i32(drafts_out.take()).await?;
     pipeline.close();
     Ok((seed, drafts))
 }
 
-/// One `[k+1]`-wide verify window: embed `[seed, draft]` (a host-writer
-/// channel, freshly `put` each iteration) at the explicit ABSOLUTE positions
+/// One `[k+1]`-wide verify window: embed `[seed, draft]` (a freshly seeded
+/// channel each iteration) at the explicit ABSOLUTE positions
 /// `[seq_len .. seq_len+k+1)` (a fresh `pos` channel bound via
 /// `ForwardPass::positions` — every fresh `verify_window` fire is its own new
 /// `ForwardPass`, so a repeated implicit `0..k+1` default would misalign RoPE
@@ -104,8 +113,9 @@ fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Ve
 /// peeked off the SAME embedded tokens) against the target's per-row argmax,
 /// and draft the NEXT window natively off `mtp_logits`. Returns `(commit
 /// [k+1], next_drafts [k])`.
-fn verify_window(
+async fn verify_window(
     ws: &'static WorkingSet,
+    rs: &'static RsWorkingSet,
     k: u32,
     seed: i32,
     draft: &[i32],
@@ -115,9 +125,9 @@ fn verify_window(
     let mut window: Vec<i32> = vec![seed];
     window.extend_from_slice(draft);
 
-    let toks = bx(Channel::new([kp1], dtype::i32).named("v_toks"));
-    let pos = bx(Channel::new([kp1], dtype::u32).named("v_pos"));
-    let klen = bx(Channel::new([1], dtype::u32).named("v_klen"));
+    let toks = bx(Channel::from(window).named("v_toks"));
+    let pos = bx(Channel::from((seq_len..seq_len + kp1).collect::<Vec<u32>>()).named("v_pos"));
+    let klen = bx(Channel::from(vec![seq_len + kp1]).named("v_klen"));
     let commit_out = bx(Channel::new([kp1], dtype::i32).named("v_commit"));
     let drafts_out = bx(Channel::new([k], dtype::i32).named("v_drafts"));
 
@@ -126,6 +136,7 @@ fn verify_window(
     fwd.embed(toks, Tensor::constant(lanes));
     fwd.positions(pos);
     fwd.attn_working_set(ws, klen);
+    fwd.rs_working_set(rs);
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded window (NOT a resubmitted draft
         // channel) and gather rows 1..=k as the verify operand.
@@ -149,14 +160,11 @@ fn verify_window(
         drafts_out.put(&next_drafts);
     });
 
-    toks.put(window);
-    pos.put((seq_len..seq_len + kp1).collect::<Vec<u32>>());
-    klen.put(vec![seq_len + kp1]);
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline)
         .map_err(|e| format!("verify submit: {e}"))?;
-    let commit = get_i32(commit_out.take())?;
-    let drafts = get_i32(drafts_out.take())?;
+    let commit = get_i32(commit_out.take()).await?;
+    let drafts = get_i32(drafts_out.take()).await?;
     pipeline.close();
     Ok((commit, drafts))
 }
@@ -166,6 +174,7 @@ async fn main(input: String) -> Result<String> {
     let k: u32 = input.trim().parse().unwrap_or(4).max(2);
     let vocab = wit_model::output_vocab_size();
     let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let rs: &'static RsWorkingSet = bx(RsWorkingSet::new());
     model::configure(vocab, PAGE_T, NUM_LAYERS);
     model::configure_gates(
         /* has_mtp_logits */ true, /* has_value_head */ false,
@@ -177,7 +186,7 @@ async fn main(input: String) -> Result<String> {
     }
 
     // Bootstrap: real seed + real first drafts off the prompt's REAL last position.
-    let (seed0, draft0) = bootstrap(ws, &prompt, k)?;
+    let (seed0, draft0) = bootstrap(ws, rs, &prompt, k).await?;
     let mut seq_len: u32 = prompt.len() as u32 + k - 1;
 
     let mut committed: Vec<u32> = prompt.clone();
@@ -191,7 +200,7 @@ async fn main(input: String) -> Result<String> {
     // target → commit the [k+1] tail (accepted + bonus) → take the fresh
     // native-MTP drafts as the NEXT window's proposals → repeat.
     while generated < MAX_TOKENS {
-        let (commit, drafts) = verify_window(ws, k, seed, &draft, seq_len)?;
+        let (commit, drafts) = verify_window(ws, rs, k, seed, &draft, seq_len).await?;
         seq_len += k + 1;
 
         let clen = committed_len(&commit); // n_acc accepted + 1 bonus (≥ 1)

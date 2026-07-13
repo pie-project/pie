@@ -21,6 +21,7 @@
 #include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
 #include "model/qwen3_vl/qwen3_vl_vision_forward.hpp"  // scatter_qwen3vl_vision
+#include "model/stage_hooks.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
 
@@ -280,6 +281,7 @@ void llama_like_forward_paged(
     const std::uint32_t* w_page_d,
     const std::uint32_t* w_off_d,
     bool has_write_desc,
+    int runtime_window_left,
     const LlamaLikeVisionInputs* vision)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
@@ -422,9 +424,11 @@ void llama_like_forward_paged(
                                    !ws.qkv_fused.empty();
         const bool fused_decode_qkv_post =
             use_fused_qkv &&
+            active_stage_hooks == nullptr &&
             decode_fused_post_enabled() &&
             is_pure_decode &&
             !has_custom_mask &&
+            !has_write_desc &&
             native_bf16_kv_cache &&
             !head_dim_padded &&
             !fwd_cfg.use_qkv_bias &&
@@ -479,6 +483,13 @@ void llama_like_forward_paged(
             maybe_add_bias(ws.k.data(), layer.k_bias, N, Hk, stream);
             maybe_add_bias(ws.v.data(), layer.v_bias, N, Hk, stream);
         }
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj,
+            ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L),
+            stream);
 
         // q_norm / k_norm: two conventions ship in the wild.
         //   * Per-head (Qwen3, OLMo-2 small, Gemma-3): weight shape
@@ -569,7 +580,6 @@ void llama_like_forward_paged(
             attn_v = ws.v_padded.data();
             attn_out_buf = ws.attn_out_padded.data();
         }
-
         auto kv_view = cache.layer_view(L);
         if (fused_decode_qkv_post) {
             // Already written by launch_qkv_decode_qk_norm_rope_write_kv_bf16.
@@ -600,11 +610,12 @@ void llama_like_forward_paged(
         // `per_layer_window_left` is empty we fall back to the global
         // `sliding_window`; that single value is broadcast to every
         // layer (used by Mistral / Gemma-2 single-mode and Phi-3).
-        const int layer_window_left =
-            (!fwd_cfg.per_layer_window_left.empty() &&
+        const int layer_window_left = runtime_window_left >= -1
+            ? runtime_window_left
+            : (!fwd_cfg.per_layer_window_left.empty() &&
              L < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                ? fwd_cfg.per_layer_window_left[L]
-                : fwd_cfg.sliding_window;
+               ? fwd_cfg.per_layer_window_left[L]
+               : fwd_cfg.sliding_window;
 
         if (use_xqa_decode_path) {
             ops::launch_attention_xqa_decode_bf16_prepared(
@@ -652,6 +663,13 @@ void llama_like_forward_paged(
                 N, R, num_q_heads_local, attn_ws, stream, layer_window_left,
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         }
+        invoke_stage_hook(
+            StageHookPoint::OnAttn,
+            ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L),
+            stream);
 
         // Strip the trailing pad cols off the attention output before
         // it feeds the o_proj GEMM (which expects `[N, num_q*head_dim]`,

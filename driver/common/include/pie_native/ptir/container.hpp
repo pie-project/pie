@@ -72,6 +72,8 @@ struct COp {
     std::uint8_t  dtype = 0;        // intrinsic_val / cast / rng element dtype
     CShape        shape;            // broadcast/reshape/rng/intrinsic target shape
     std::uint32_t imm = 0;          // top_k k / iota len / rng stream
+    std::uint32_t imm2 = 0;
+    std::uint32_t imm3 = 0;
     std::uint8_t  kind = 0;         // rng kind (0 uniform, 1 gumbel)
     std::uint8_t  pred_tag = 0;     // pivot_threshold predicate tag
     std::uint32_t pred_payload = 0; // pivot_threshold predicate payload (value id / imm)
@@ -148,6 +150,13 @@ inline void decode_op(Cur& c, COp& op) {
         case PTIR_OP_MASK_APPLY_PACKED:
             op.args = {c.u32(), c.u32()};
             break;
+        case PTIR_OP_CAUSAL_MASK:
+            op.args = {c.u32()}; op.imm = c.u32(); break;
+        case PTIR_OP_SLIDING_WINDOW_MASK:
+            op.args = {c.u32()}; op.imm = c.u32(); op.imm2 = c.u32(); break;
+        case PTIR_OP_SINK_WINDOW_MASK:
+            op.args = {c.u32()}; op.imm = c.u32(); op.imm2 = c.u32();
+            op.imm3 = c.u32(); break;
         case PTIR_OP_SELECT: case PTIR_OP_SCATTER_ADD: case PTIR_OP_SCATTER_SET:
             op.args = {c.u32(), c.u32(), c.u32()};
             break;
@@ -194,10 +203,13 @@ inline bool decode(const std::uint8_t* data, std::size_t len, Container& out, De
     if (std::memcmp(data, PTIR_MAGIC, 4) != 0) return fail("bad magic");
     c.skip(4);
     std::uint16_t version = c.u16();
-    if (version != PTIR_VERSION && version != 2) return fail("bad version");
+    if (version != PTIR_VERSION && version != PTIR_VERSION_EXTERN) {
+        return fail("bad version");
+    }
     c.u16();  // flags
     std::uint32_t n_names = c.u32(), n_channels = c.u32(), n_ports = c.u32(), n_stages = c.u32();
-    const std::uint32_t n_externs = version == 2 ? c.u32() : 0;
+    const std::uint32_t n_externs =
+        version == PTIR_VERSION_EXTERN ? c.u32() : 0;
 
     for (std::uint32_t i = 0; i < n_names; ++i) {
         std::uint16_t l = c.u16();

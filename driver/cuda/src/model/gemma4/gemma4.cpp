@@ -1,4 +1,5 @@
 #include "model/gemma4/gemma4.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1712,6 +1713,7 @@ void gemma4_forward_paged(
                 ws.norm_x.data(), layer.qkv_proj_fused->data(),
                 ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
             const bool can_fuse_packed_qkv_post =
+                active_stage_hooks == nullptr &&
                 qk_norm_enabled && !partial && !dbg_dumps_enabled() &&
                 kv_view.is_native_bf16() &&
                 (use_row_decode_path || use_decode_path);
@@ -1762,6 +1764,11 @@ void gemma4_forward_paged(
                 }
             }
         }
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(l), stream);
 
         // Pre-norm dumps for parity.
         if (l == 0 && !layer.is_shared) {
@@ -1840,7 +1847,6 @@ void gemma4_forward_paged(
             dump_l0("q_post_norm", ws.q.data(),
                     static_cast<std::size_t>(N) * num_q_heads_local * d);
         }
-
         // KV write only on non-shared layers — shared layers attend
         // through the source slot's already-populated pages.
         if (!layer.is_shared && !qkv_post_fused) {
@@ -1936,6 +1942,11 @@ void gemma4_forward_paged(
                         /*sm_scale=*/1.0f);
                 }
             });
+        invoke_stage_hook(
+            StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(l), stream);
 
         dump_l0("attn_out", ws.attn_out.data(),
                 static_cast<std::size_t>(N) * Hq);

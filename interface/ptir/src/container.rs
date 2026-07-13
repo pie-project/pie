@@ -198,9 +198,7 @@ impl TraceContainer {
 pub fn encode(c: &TraceContainer) -> Vec<u8> {
     let mut w = Vec::new();
     w.extend_from_slice(&PTIR_MAGIC);
-    // Wire-version selection keeps every pre-v1.1 hash stable: no externs ⇒
-    // the exact version-1 byte stream; externs ⇒ version 2 (header gains
-    // `n_externs`, table appended after the stages).
+    // Preserve version-1 hashes when the extern extension is absent.
     let v2 = !c.externs.is_empty();
     put_u16(
         &mut w,
@@ -334,6 +332,30 @@ pub(crate) fn encode_op(w: &mut Vec<u8>, op: &Op) {
             put_u32(w, logits);
             put_u32(w, mask);
         }
+        Op::CausalMask { positions, len } => {
+            put_u32(w, positions);
+            put_u32(w, len);
+        }
+        Op::SlidingWindowMask {
+            positions,
+            len,
+            window,
+        } => {
+            put_u32(w, positions);
+            put_u32(w, len);
+            put_u32(w, window);
+        }
+        Op::SinkWindowMask {
+            positions,
+            len,
+            sink,
+            window,
+        } => {
+            put_u32(w, positions);
+            put_u32(w, len);
+            put_u32(w, sink);
+            put_u32(w, window);
+        }
         Op::ScatterAdd { base, idx, vals } | Op::ScatterSet { base, idx, vals } => {
             put_u32(w, base);
             put_u32(w, idx);
@@ -464,7 +486,11 @@ pub enum ContainerDecodeError {
     UnknownOpcode(u8),
     UnknownTag { what: &'static str, tag: u8 },
     RankTooLarge(u8),
+    ZeroDimension,
     BadUtf8,
+    TrailingBytes,
+    NonCanonical,
+    CountTooLarge(&'static str),
 }
 
 impl fmt::Display for ContainerDecodeError {
@@ -477,7 +503,11 @@ impl fmt::Display for ContainerDecodeError {
             UnknownOpcode(t) => write!(f, "unknown opcode 0x{t:02x}"),
             UnknownTag { what, tag } => write!(f, "unknown {what} tag 0x{tag:02x}"),
             RankTooLarge(r) => write!(f, "shape rank {r} exceeds MAX_RANK"),
+            ZeroDimension => f.write_str("shape dimensions must be nonzero"),
             BadUtf8 => f.write_str("name table entry is not valid UTF-8"),
+            TrailingBytes => f.write_str("trailing bytes after PTIR container"),
+            NonCanonical => f.write_str("noncanonical PTIR container encoding"),
+            CountTooLarge(table) => write!(f, "{table} count exceeds remaining container bytes"),
         }
     }
 }
@@ -519,6 +549,20 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(s)
     }
+    fn bounded_count(
+        &self,
+        count: u32,
+        minimum_record_bytes: usize,
+        table: &'static str,
+    ) -> Result<usize, ContainerDecodeError> {
+        let count = count as usize;
+        if minimum_record_bytes == 0
+            || count > self.buf.len().saturating_sub(self.pos) / minimum_record_bytes
+        {
+            return Err(ContainerDecodeError::CountTooLarge(table));
+        }
+        Ok(count)
+    }
 }
 
 /// Parse container bytes back into the model. Does not validate (bind does).
@@ -542,14 +586,14 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         0
     };
 
-    let mut names = Vec::with_capacity(n_names as usize);
+    let mut names = Vec::with_capacity(r.bounded_count(n_names, 2, "name table")?);
     for _ in 0..n_names {
         let len = r.u16()? as usize;
         let bytes = r.take(len)?;
         names.push(String::from_utf8(bytes.to_vec()).map_err(|_| ContainerDecodeError::BadUtf8)?);
     }
 
-    let mut channels = Vec::with_capacity(n_channels as usize);
+    let mut channels = Vec::with_capacity(r.bounded_count(n_channels, 8, "channel table")?);
     for _ in 0..n_channels {
         let dt = r.u8()?;
         let dtype = ChanDType::from_tag(dt).ok_or(ContainerDecodeError::UnknownTag {
@@ -573,7 +617,7 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         });
     }
 
-    let mut ports = Vec::with_capacity(n_ports as usize);
+    let mut ports = Vec::with_capacity(r.bounded_count(n_ports, 4, "port table")?);
     for _ in 0..n_ports {
         let pt = r.u8()?;
         let port = Port::from_u8(pt).ok_or(ContainerDecodeError::UnknownTag {
@@ -587,7 +631,10 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
                 let dt = r.u8()?;
                 let dtype = decode_dtype(dt)?;
                 let shape = decode_shape(&mut r)?;
-                let n = shape.numel() as usize * const_elem_size(dtype);
+                let n = usize::try_from(shape.numel())
+                    .ok()
+                    .and_then(|numel| numel.checked_mul(const_elem_size(dtype)))
+                    .ok_or(ContainerDecodeError::CountTooLarge("port constant payload"))?;
                 PortSource::Const {
                     dtype,
                     shape,
@@ -604,7 +651,7 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         ports.push(PortBinding { port, source });
     }
 
-    let mut stages = Vec::with_capacity(n_stages as usize);
+    let mut stages = Vec::with_capacity(r.bounded_count(n_stages, 5, "stage table")?);
     for _ in 0..n_stages {
         let st = r.u8()?;
         let stage = Stage::from_u8(st).ok_or(ContainerDecodeError::UnknownTag {
@@ -612,13 +659,13 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
             tag: st,
         })?;
         let n_ops = r.u32()?;
-        let mut ops = Vec::with_capacity(n_ops as usize);
+        let mut ops = Vec::with_capacity(r.bounded_count(n_ops, 1, "operation table")?);
         for _ in 0..n_ops {
             ops.push(decode_op(&mut r)?);
         }
         stages.push(StageProgram { stage, ops });
     }
-    let mut externs = Vec::with_capacity(n_externs as usize);
+    let mut externs = Vec::with_capacity(r.bounded_count(n_externs, 7, "extern table")?);
     for _ in 0..n_externs {
         let name = r.u16()?;
         let d = r.u8()?;
@@ -629,13 +676,20 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         let chan = r.u32()?;
         externs.push(ExternDecl { name, dir, chan });
     }
-    Ok(TraceContainer {
+    if r.pos != bytes.len() {
+        return Err(ContainerDecodeError::TrailingBytes);
+    }
+    let container = TraceContainer {
         names,
         channels,
         ports,
         stages,
         externs,
-    })
+    };
+    if container.encode() != bytes {
+        return Err(ContainerDecodeError::NonCanonical);
+    }
+    Ok(container)
 }
 
 fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
@@ -730,6 +784,21 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
         0x65 => Op::MaskApply {
             logits: r.u32()?,
             mask: r.u32()?,
+        },
+        0x66 => Op::CausalMask {
+            positions: r.u32()?,
+            len: r.u32()?,
+        },
+        0x67 => Op::SlidingWindowMask {
+            positions: r.u32()?,
+            len: r.u32()?,
+            window: r.u32()?,
+        },
+        0x68 => Op::SinkWindowMask {
+            positions: r.u32()?,
+            len: r.u32()?,
+            sink: r.u32()?,
+            window: r.u32()?,
         },
         0x70 => Op::Rng {
             stream: r.u32()?,
@@ -840,7 +909,7 @@ fn decode_shape(r: &mut Reader<'_>) -> Result<Shape, ContainerDecodeError> {
     for d in dims.iter_mut().take(rank as usize) {
         *d = r.u32()?;
     }
-    Ok(Shape::new(&dims[..rank as usize]).expect("rank checked"))
+    Shape::new(&dims[..rank as usize]).ok_or(ContainerDecodeError::ZeroDimension)
 }
 
 #[cfg(test)]
@@ -1009,6 +1078,21 @@ mod tests {
             },
             Op::Iota { len: 5 },
             Op::MaskApply { logits: 0, mask: 1 },
+            Op::CausalMask {
+                positions: 0,
+                len: 8,
+            },
+            Op::SlidingWindowMask {
+                positions: 0,
+                len: 8,
+                window: 4,
+            },
+            Op::SinkWindowMask {
+                positions: 0,
+                len: 8,
+                sink: 2,
+                window: 4,
+            },
             Op::Rng {
                 stream: 2,
                 shape: Shape::vector(4),
@@ -1073,12 +1157,79 @@ mod tests {
         b[0] = b'X';
         assert_eq!(decode(&b), Err(ContainerDecodeError::BadMagic));
         let mut b = encode(&sample());
+        b[4] = 3;
+        assert_eq!(decode(&b), Err(ContainerDecodeError::UnsupportedVersion(3)));
+        let mut b = encode(&sample());
         b[4] = 9;
         assert_eq!(decode(&b), Err(ContainerDecodeError::UnsupportedVersion(9)));
         let b = encode(&sample());
         assert_eq!(
             decode(&b[..b.len() - 2]),
             Err(ContainerDecodeError::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn retired_nucleus_opcode_is_unknown() {
+        let mut reader = Reader {
+            buf: &[0x59],
+            pos: 0,
+        };
+        assert_eq!(
+            decode_op(&mut reader),
+            Err(ContainerDecodeError::UnknownOpcode(0x59))
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_encodings() {
+        assert!(Shape::new(&[0]).is_none());
+        let minimal = TraceContainer {
+            channels: vec![ChannelDecl {
+                shape: Shape::SCALAR,
+                dtype: ChanDType::Concrete(DType::U32),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
+            }],
+            ..TraceContainer::default()
+        };
+
+        let mut flags = minimal.encode();
+        flags[6] = 1;
+        assert_eq!(decode(&flags), Err(ContainerDecodeError::NonCanonical));
+
+        let mut seeded = minimal.encode();
+        seeded[31] = 2;
+        assert_eq!(decode(&seeded), Err(ContainerDecodeError::NonCanonical));
+
+        let mut empty_v2 = minimal.encode();
+        empty_v2[4..6].copy_from_slice(&PTIR_VERSION_EXTERN.to_le_bytes());
+        empty_v2.splice(24..24, 0u32.to_le_bytes());
+        assert_eq!(decode(&empty_v2), Err(ContainerDecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn rejects_wire_counts_before_allocating_from_them() {
+        let mut names = TraceContainer::default().encode();
+        names[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            decode(&names),
+            Err(ContainerDecodeError::CountTooLarge("name table"))
+        );
+
+        let mut operations = TraceContainer {
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: Vec::new(),
+            }],
+            ..TraceContainer::default()
+        }
+        .encode();
+        operations[25..29].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            decode(&operations),
+            Err(ContainerDecodeError::CountTooLarge("operation table"))
         );
     }
 }

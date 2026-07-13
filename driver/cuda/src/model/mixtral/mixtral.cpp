@@ -1,4 +1,5 @@
 #include "model/mixtral/mixtral.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -242,12 +243,16 @@ void mixtral_forward_paged(
             ws.k.data(), layer.k_bias->data(), N, Hk, stream);
         if (layer.v_bias) kernels::launch_add_bias_bf16(
             ws.v.data(), layer.v_bias->data(), N, Hk, stream);
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L), stream);
 
         kernels::launch_rope_bf16(
             ws.q.data(), ws.k.data(), positions,
             N, num_q_heads_local, num_kv_heads_local, d,
             cfg.rope_theta, stream);
-
         auto kv_view = cache.layer_view(L);
         kernels::launch_write_kv_to_pages(
             kv_view, ws.k.data(), ws.v.data(),
@@ -290,7 +295,6 @@ void mixtral_forward_paged(
                 /*sm_scale=*/-1.f,
                 layer_lse);
         }
-
         // GPT-OSS: rescale o by `sigmoid(lse - sink_h)` to apply the
         // softmax-denominator extension that flashinfer's DefaultAttention
         // doesn't emit natively. Per-rank shard count under TP.
@@ -299,6 +303,11 @@ void mixtral_forward_paged(
                 ws.attn_out.data(), layer_lse, layer.attn_sinks->data(),
                 N, num_q_heads_local, d, stream);
         }
+        invoke_stage_hook(
+            StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L), stream);
 
         // o_proj is row-parallel under TP: write to scratch, all-reduce,
         // residual-add into y. o_bias (replicated; e.g. GPT-OSS) only goes

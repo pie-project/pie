@@ -146,6 +146,9 @@ pub struct DriverConfig {
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
+    pub has_mtp_logits: bool,
+    pub has_mtp_drafts: bool,
+    pub has_value_head: bool,
     pub limits: crate::driver::SchedulerLimits,
     pub driver_backend: crate::driver::DriverBackend,
 }
@@ -258,11 +261,20 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             fold_granularity: 1, // token-causal; 0-RS models never read it
         }
     };
+    let ptir_caps = model::PtirCaps {
+        has_mtp_logits: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_mtp_logits),
+        has_mtp_drafts: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_mtp_drafts),
+        has_value_head: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_value_head),
+    };
     model::register(
         name.clone(),
         &arch_name,
         kv_page_size as u32,
         rs_caps,
+        ptir_caps,
         tokenizer_path.clone(),
     )?;
 

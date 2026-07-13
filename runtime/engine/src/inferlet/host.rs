@@ -52,6 +52,10 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
     async fn honor_preemption(&mut self) -> anyhow::Result<()> {
         crate::inferlet::process::preemption::honor(self).await
     }
+
+    fn preemption_signal(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        crate::store::reclaim::contention()?.park_signal(self.id())
+    }
 }
 
 wasmtime::component::bindgen!({

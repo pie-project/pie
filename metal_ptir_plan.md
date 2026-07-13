@@ -13,6 +13,14 @@ Owner-facing: each phase is independently landable and gated. Sections 9
 and 10 list the acceptance gates and the open decisions that need a call
 before the affected phase starts.
 
+**Amendment (2026-07-12).** Phase 4 (§8, a handwritten MSL port of the
+tier-0 kernels) is superseded by the Metal track in
+[ptir_plan.md](ptir_plan.md) (Decision 7): Metal goes directly to generated
+execution, with singleton and fused partitions of the shared region plan,
+and the CPU interpreter is deleted once that track's M1 gates pass. Phases
+0-3 of this plan (shared headers, forward-wired epilogues, device geometry,
+batching/async) remain live prerequisites for that track's M2/M3.
+
 ## 1. Scope: what "PTIR support" means here
 
 PTIR programs fall into classes by what they need from the driver:

@@ -25,7 +25,9 @@ enum TensorInner {
 
 impl Tensor {
     pub(crate) fn node(id: ValueId, ty: ValueType) -> Tensor {
-        Tensor { inner: TensorInner::Node { id, ty } }
+        Tensor {
+            inner: TensorInner::Node { id, ty },
+        }
     }
 
     /// A trace-known constant value (overview §1). Accepts a scalar
@@ -34,7 +36,9 @@ impl Tensor {
     /// vector), or `Iota`/affine (a sequence) — the closed op set has no general
     /// vector-const op (overview §1: small consts fold to immediates).
     pub fn constant(v: impl IntoConst) -> Tensor {
-        Tensor { inner: TensorInner::Const(v.into_const()) }
+        Tensor {
+            inner: TensorInner::Const(v.into_const()),
+        }
     }
 
     pub fn ty(&self) -> ValueType {
@@ -112,12 +116,20 @@ impl AsTensor for &Tensor {
 }
 impl AsTensor for u32 {
     fn to_arg(&self) -> Arg {
-        Arg::Const(ConstData { shape: Shape::SCALAR, dtype: DType::U32, bytes: self.to_le_bytes().to_vec() })
+        Arg::Const(ConstData {
+            shape: Shape::SCALAR,
+            dtype: DType::U32,
+            bytes: self.to_le_bytes().to_vec(),
+        })
     }
 }
 impl AsTensor for f32 {
     fn to_arg(&self) -> Arg {
-        Arg::Const(ConstData { shape: Shape::SCALAR, dtype: DType::F32, bytes: self.to_le_bytes().to_vec() })
+        Arg::Const(ConstData {
+            shape: Shape::SCALAR,
+            dtype: DType::F32,
+            bytes: self.to_le_bytes().to_vec(),
+        })
     }
 }
 
@@ -163,7 +175,10 @@ fn elem_size(d: DType) -> usize {
 fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
     let ty = ValueType::new(c.shape, c.dtype);
     if c.shape.is_scalar() {
-        let id = emit(Op::Const(scalar_literal(c.dtype, &c.bytes)), &[ValueType::scalar(c.dtype)]);
+        let id = emit(
+            Op::Const(scalar_literal(c.dtype, &c.bytes)),
+            &[ValueType::scalar(c.dtype)],
+        );
         return (id, ty);
     }
     let n = c.shape.numel() as usize;
@@ -175,7 +190,13 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
             Op::Const(scalar_literal(c.dtype, &c.bytes[..elem_size(c.dtype)])),
             &[ValueType::scalar(c.dtype)],
         );
-        let id = emit(Op::Broadcast { value: s, shape: c.shape }, &[ty]);
+        let id = emit(
+            Op::Broadcast {
+                value: s,
+                shape: c.shape,
+            },
+            &[ty],
+        );
         return (id, ty);
     }
     // affine `a + b*i` over U32 ⇒ iota (+ optional mul/add).
@@ -186,11 +207,17 @@ fn materialize_const(c: ConstData) -> (ValueId, ValueType) {
             let io = emit(Op::Iota { len: n as u32 }, &[ty]);
             let mut cur = io;
             if b != 1.0 {
-                let bc = emit(Op::Const(Literal::U32(b as u32)), &[ValueType::scalar(DType::U32)]);
+                let bc = emit(
+                    Op::Const(Literal::U32(b as u32)),
+                    &[ValueType::scalar(DType::U32)],
+                );
                 cur = emit(Op::Mul(cur, bc), &[ty]);
             }
             if a != 0.0 {
-                let ac = emit(Op::Const(Literal::U32(a as u32)), &[ValueType::scalar(DType::U32)]);
+                let ac = emit(
+                    Op::Const(Literal::U32(a as u32)),
+                    &[ValueType::scalar(DType::U32)],
+                );
                 cur = emit(Op::Add(cur, ac), &[ty]);
             }
             return (cur, ty);
@@ -226,7 +253,11 @@ macro_rules! num_const {
     ($t:ty, $dt:expr) => {
         impl IntoConst for $t {
             fn into_const(self) -> ConstData {
-                ConstData { shape: Shape::SCALAR, dtype: $dt, bytes: scalar_bytes_of(self as f64, $dt) }
+                ConstData {
+                    shape: Shape::SCALAR,
+                    dtype: $dt,
+                    bytes: scalar_bytes_of(self as f64, $dt),
+                }
             }
         }
         impl<const N: usize> IntoConst for [$t; N] {
@@ -235,7 +266,11 @@ macro_rules! num_const {
                 for x in self {
                     bytes.extend_from_slice(&scalar_bytes_of(x as f64, $dt));
                 }
-                ConstData { shape: Shape::vector(N as u32), dtype: $dt, bytes }
+                ConstData {
+                    shape: Shape::vector(N as u32),
+                    dtype: $dt,
+                    bytes,
+                }
             }
         }
         impl IntoConst for Vec<$t> {
@@ -245,7 +280,11 @@ macro_rules! num_const {
                 for x in self {
                     bytes.extend_from_slice(&scalar_bytes_of(x as f64, $dt));
                 }
-                ConstData { shape: Shape::vector(n), dtype: $dt, bytes }
+                ConstData {
+                    shape: Shape::vector(n),
+                    dtype: $dt,
+                    bytes,
+                }
             }
         }
     };
@@ -256,18 +295,30 @@ num_const!(u32, DType::U32);
 
 impl IntoConst for bool {
     fn into_const(self) -> ConstData {
-        ConstData { shape: Shape::SCALAR, dtype: DType::Bool, bytes: alloc::vec![self as u8] }
+        ConstData {
+            shape: Shape::SCALAR,
+            dtype: DType::Bool,
+            bytes: alloc::vec![self as u8],
+        }
     }
 }
 impl<const N: usize> IntoConst for [bool; N] {
     fn into_const(self) -> ConstData {
-        ConstData { shape: Shape::vector(N as u32), dtype: DType::Bool, bytes: self.iter().map(|&b| b as u8).collect() }
+        ConstData {
+            shape: Shape::vector(N as u32),
+            dtype: DType::Bool,
+            bytes: self.iter().map(|&b| b as u8).collect(),
+        }
     }
 }
 impl IntoConst for Vec<bool> {
     fn into_const(self) -> ConstData {
         let n = self.len() as u32;
-        ConstData { shape: Shape::vector(n), dtype: DType::Bool, bytes: self.iter().map(|&b| b as u8).collect() }
+        ConstData {
+            shape: Shape::vector(n),
+            dtype: DType::Bool,
+            bytes: self.iter().map(|&b| b as u8).collect(),
+        }
     }
 }
 
@@ -304,7 +355,11 @@ fn reconcile(a: Arg, b: Arg) -> (Arg, Arg) {
             return None;
         }
         let v = elem_at(c.dtype, &c.bytes, 0);
-        Some(ConstData { shape: Shape::SCALAR, dtype: to, bytes: scalar_bytes_of(v, to) })
+        Some(ConstData {
+            shape: Shape::SCALAR,
+            dtype: to,
+            bytes: scalar_bytes_of(v, to),
+        })
     }
     match (&a, &b) {
         (Arg::Const(ca), Arg::Node { ty, .. }) => {
@@ -322,7 +377,11 @@ fn reconcile(a: Arg, b: Arg) -> (Arg, Arg) {
     (a, b)
 }
 
-fn emit_unary(x: &impl AsTensor, mk: impl FnOnce(ValueId) -> Op, out: impl FnOnce(ValueType) -> ValueType) -> Tensor {
+fn emit_unary(
+    x: &impl AsTensor,
+    mk: impl FnOnce(ValueId) -> Op,
+    out: impl FnOnce(ValueType) -> ValueType,
+) -> Tensor {
     let (id, ty) = x.to_arg().materialize();
     let rty = out(ty);
     Tensor::node(emit(mk(id), &[rty]), rty)
@@ -366,7 +425,14 @@ pub fn log(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Log, |t| t)
 }
 pub fn cast(x: impl AsTensor, to: DType) -> Tensor {
-    emit_unary(&x, move |id| Op::Cast { value: id, dtype: to }, move |t| ValueType::new(t.shape, to))
+    emit_unary(
+        &x,
+        move |id| Op::Cast {
+            value: id,
+            dtype: to,
+        },
+        move |t| ValueType::new(t.shape, to),
+    )
 }
 
 // -- map: binary --
@@ -429,23 +495,51 @@ pub fn select(cond: impl AsTensor, a: impl AsTensor, b: impl AsTensor) -> Tensor
     let (ia, tya) = aa.materialize();
     let (ib, _) = bb.materialize();
     let rty = ValueType::new(shape, tya.dtype);
-    Tensor::node(emit(Op::Select { cond: ca, a: ia, b: ib }, &[rty]), rty)
+    Tensor::node(
+        emit(
+            Op::Select {
+                cond: ca,
+                a: ia,
+                b: ib,
+            },
+            &[rty],
+        ),
+        rty,
+    )
 }
 
 // -- shape --
 pub fn reshape(x: impl AsTensor, shape: impl IntoShape) -> Tensor {
     let s = shape.into_shape();
-    emit_unary(&x, move |id| Op::Reshape { value: id, shape: s }, move |t| ValueType::new(s, t.dtype))
+    emit_unary(
+        &x,
+        move |id| Op::Reshape {
+            value: id,
+            shape: s,
+        },
+        move |t| ValueType::new(s, t.dtype),
+    )
 }
 pub fn broadcast(x: impl AsTensor, shape: impl IntoShape) -> Tensor {
     let s = shape.into_shape();
-    emit_unary(&x, move |id| Op::Broadcast { value: id, shape: s }, move |t| ValueType::new(s, t.dtype))
+    emit_unary(
+        &x,
+        move |id| Op::Broadcast {
+            value: id,
+            shape: s,
+        },
+        move |t| ValueType::new(s, t.dtype),
+    )
 }
 /// `transpose(x)` — rank-2 transpose `[m, n] → [n, m]`.
 pub fn transpose(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Transpose, |t| {
         let d = t.shape.dims();
-        let s = if d.len() == 2 { Shape::matrix(d[1], d[0]) } else { t.shape };
+        let s = if d.len() == 2 {
+            Shape::matrix(d[1], d[0])
+        } else {
+            t.shape
+        };
         ValueType::new(s, t.dtype)
     })
 }
@@ -478,28 +572,56 @@ pub fn scatter_set(base: impl AsTensor, idx: impl AsTensor, vals: impl AsTensor)
     let (ib, tyb) = base.to_arg().materialize();
     let (ii, _) = idx.to_arg().materialize();
     let (iv, _) = vals.to_arg().materialize();
-    Tensor::node(emit(Op::ScatterSet { base: ib, idx: ii, vals: iv }, &[tyb]), tyb)
+    Tensor::node(
+        emit(
+            Op::ScatterSet {
+                base: ib,
+                idx: ii,
+                vals: iv,
+            },
+            &[tyb],
+        ),
+        tyb,
+    )
 }
 pub fn scatter_add(base: impl AsTensor, idx: impl AsTensor, vals: impl AsTensor) -> Tensor {
     let (ib, tyb) = base.to_arg().materialize();
     let (ii, _) = idx.to_arg().materialize();
     let (iv, _) = vals.to_arg().materialize();
-    Tensor::node(emit(Op::ScatterAdd { base: ib, idx: ii, vals: iv }, &[tyb]), tyb)
+    Tensor::node(
+        emit(
+            Op::ScatterAdd {
+                base: ib,
+                idx: ii,
+                vals: iv,
+            },
+            &[tyb],
+        ),
+        tyb,
+    )
 }
 
 // -- reduce / scan --
 pub fn reduce_sum(x: impl AsTensor) -> Tensor {
-    emit_unary(&x, Op::ReduceSum, |t| ValueType::new(reduce_shape(t.shape), t.dtype))
+    emit_unary(&x, Op::ReduceSum, |t| {
+        ValueType::new(reduce_shape(t.shape), t.dtype)
+    })
 }
 pub fn reduce_max(x: impl AsTensor) -> Tensor {
-    emit_unary(&x, Op::ReduceMax, |t| ValueType::new(reduce_shape(t.shape), t.dtype))
+    emit_unary(&x, Op::ReduceMax, |t| {
+        ValueType::new(reduce_shape(t.shape), t.dtype)
+    })
 }
 pub fn reduce_min(x: impl AsTensor) -> Tensor {
-    emit_unary(&x, Op::ReduceMin, |t| ValueType::new(reduce_shape(t.shape), t.dtype))
+    emit_unary(&x, Op::ReduceMin, |t| {
+        ValueType::new(reduce_shape(t.shape), t.dtype)
+    })
 }
 /// Argmax over the last axis → `I32` token id(s).
 pub fn reduce_argmax(x: impl AsTensor) -> Tensor {
-    emit_unary(&x, Op::ReduceArgmax, |t| ValueType::new(reduce_shape(t.shape), DType::I32))
+    emit_unary(&x, Op::ReduceArgmax, |t| {
+        ValueType::new(reduce_shape(t.shape), DType::I32)
+    })
 }
 pub fn cumsum(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumSum, |t| t)
@@ -513,11 +635,20 @@ pub fn softmax(x: impl AsTensor) -> Tensor {
     let (xid, ty) = x.to_arg().materialize();
     let (s, red) = (ty.shape, reduce_shape(ty.shape));
     let m = push(Op::ReduceMax(xid), &[ValueType::new(red, DType::F32)]);
-    let mb = push(Op::Broadcast { value: m, shape: s }, &[ValueType::new(s, DType::F32)]);
+    let mb = push(
+        Op::Broadcast { value: m, shape: s },
+        &[ValueType::new(s, DType::F32)],
+    );
     let c = push(Op::Sub(xid, mb), &[ValueType::new(s, DType::F32)]);
     let e = push(Op::Exp(c), &[ValueType::new(s, DType::F32)]);
     let sum = push(Op::ReduceSum(e), &[ValueType::new(red, DType::F32)]);
-    let sb = push(Op::Broadcast { value: sum, shape: s }, &[ValueType::new(s, DType::F32)]);
+    let sb = push(
+        Op::Broadcast {
+            value: sum,
+            shape: s,
+        },
+        &[ValueType::new(s, DType::F32)],
+    );
     let out = push(Op::Div(e, sb), &[ValueType::new(s, DType::F32)]);
     Tensor::node(out, ValueType::new(s, DType::F32))
 }
@@ -525,12 +656,18 @@ pub fn log_softmax(x: impl AsTensor) -> Tensor {
     let (xid, ty) = x.to_arg().materialize();
     let (s, red) = (ty.shape, reduce_shape(ty.shape));
     let m = push(Op::ReduceMax(xid), &[ValueType::new(red, DType::F32)]);
-    let mb = push(Op::Broadcast { value: m, shape: s }, &[ValueType::new(s, DType::F32)]);
+    let mb = push(
+        Op::Broadcast { value: m, shape: s },
+        &[ValueType::new(s, DType::F32)],
+    );
     let c = push(Op::Sub(xid, mb), &[ValueType::new(s, DType::F32)]);
     let e = push(Op::Exp(c), &[ValueType::new(s, DType::F32)]);
     let sum = push(Op::ReduceSum(e), &[ValueType::new(red, DType::F32)]);
     let l = push(Op::Log(sum), &[ValueType::new(red, DType::F32)]);
-    let lb = push(Op::Broadcast { value: l, shape: s }, &[ValueType::new(s, DType::F32)]);
+    let lb = push(
+        Op::Broadcast { value: l, shape: s },
+        &[ValueType::new(s, DType::F32)],
+    );
     let out = push(Op::Sub(c, lb), &[ValueType::new(s, DType::F32)]);
     Tensor::node(out, ValueType::new(s, DType::F32))
 }
@@ -540,10 +677,19 @@ pub fn l2norm(x: impl AsTensor) -> Tensor {
     let sq = push(Op::Mul(xid, xid), &[ValueType::new(s, DType::F32)]);
     let sum = push(Op::ReduceSum(sq), &[ValueType::new(red, DType::F32)]);
     let lg = push(Op::Log(sum), &[ValueType::new(red, DType::F32)]);
-    let half = push(Op::Const(Literal::F32(0.5)), &[ValueType::scalar(DType::F32)]);
+    let half = push(
+        Op::Const(Literal::F32(0.5)),
+        &[ValueType::scalar(DType::F32)],
+    );
     let h = push(Op::Mul(lg, half), &[ValueType::new(red, DType::F32)]);
     let rt = push(Op::Exp(h), &[ValueType::new(red, DType::F32)]);
-    let rb = push(Op::Broadcast { value: rt, shape: s }, &[ValueType::new(s, DType::F32)]);
+    let rb = push(
+        Op::Broadcast {
+            value: rt,
+            shape: s,
+        },
+        &[ValueType::new(s, DType::F32)],
+    );
     let out = push(Op::Div(xid, rb), &[ValueType::new(s, DType::F32)]);
     Tensor::node(out, ValueType::new(s, DType::F32))
 }
@@ -589,7 +735,14 @@ pub fn pivot_threshold(input: impl AsTensor, predicate: PredicateArg) -> Tensor 
         PredKind::ProbGe(a) => Predicate::ProbGe(a.materialize().0),
     };
     let rty = ValueType::new(tyi.shape, DType::Bool);
-    Tensor::node(emit(Op::PivotThreshold { input: ii, predicate: pred }, &[rty]), rty)
+    let id = emit(
+        Op::PivotThreshold {
+            input: ii,
+            predicate: pred,
+        },
+        &[rty],
+    );
+    Tensor::node(id, rty)
 }
 
 // -- linear --
@@ -616,15 +769,283 @@ fn rng_noise(state: impl AsTensor, shape: impl IntoShape, kind: RngKind) -> Tens
     let s = shape.into_shape();
     let (istate, _) = state.to_arg().materialize();
     let rty = ValueType::new(s, DType::F32);
-    Tensor::node(emit(Op::RngKeyed { state: istate, shape: s, kind }, &[rty]), rty)
+    Tensor::node(
+        emit(
+            Op::RngKeyed {
+                state: istate,
+                shape: s,
+                kind,
+            },
+            &[rty],
+        ),
+        rty,
+    )
 }
 /// `mask_apply(logits, mask)` — bool-mask over logits (allowed → pass, else −∞),
 /// expanded to `select(mask, logits, -inf)` (echo's composed form).
 pub fn mask_apply(logits: impl AsTensor, mask: impl AsTensor) -> Tensor {
     let (il, tyl) = logits.to_arg().materialize();
     let (im, _) = mask.to_arg().materialize();
-    let ninf = push(Op::Const(Literal::F32(f32::NEG_INFINITY)), &[ValueType::scalar(DType::F32)]);
-    Tensor::node(emit(Op::Select { cond: im, a: il, b: ninf }, &[tyl]), tyl)
+    let ninf = push(
+        Op::Const(Literal::F32(f32::NEG_INFINITY)),
+        &[ValueType::scalar(DType::F32)],
+    );
+    Tensor::node(
+        emit(
+            Op::Select {
+                cond: im,
+                a: il,
+                b: ninf,
+            },
+            &[tyl],
+        ),
+        tyl,
+    )
+}
+
+fn append_mask_axis(shape: Shape, len: u32) -> Shape {
+    let mut dims = shape.dims().to_vec();
+    dims.push(len);
+    Shape::new(&dims).expect("structured mask rank")
+}
+
+pub fn causal_mask(positions: impl AsTensor, len: u32) -> Tensor {
+    let (positions, ty) = positions.to_arg().materialize();
+    let result = ValueType::new(append_mask_axis(ty.shape, len), DType::Bool);
+    Tensor::node(emit(Op::CausalMask { positions, len }, &[result]), result)
+}
+
+pub fn sliding_window_mask(positions: impl AsTensor, len: u32, window: u32) -> Tensor {
+    let (positions, ty) = positions.to_arg().materialize();
+    let result = ValueType::new(append_mask_axis(ty.shape, len), DType::Bool);
+    Tensor::node(
+        emit(
+            Op::SlidingWindowMask {
+                positions,
+                len,
+                window,
+            },
+            &[result],
+        ),
+        result,
+    )
+}
+
+pub fn sink_window_mask(positions: impl AsTensor, len: u32, sink: u32, window: u32) -> Tensor {
+    let (positions, ty) = positions.to_arg().materialize();
+    let result = ValueType::new(append_mask_axis(ty.shape, len), DType::Bool);
+    Tensor::node(
+        emit(
+            Op::SinkWindowMask {
+                positions,
+                len,
+                sink,
+                window,
+            },
+            &[result],
+        ),
+        result,
+    )
+}
+
+/// For every row and key, report whether the key occurs anywhere in the row.
+/// This is ordinary SSA composition; it introduces no wire opcode.
+pub fn row_membership(rows: impl AsTensor, keys: impl AsTensor) -> Tensor {
+    let rows = rows.to_arg();
+    let keys = keys.to_arg();
+    let row_type = rows.ty();
+    let key_type = keys.ty();
+    let [row_count, depth] = *row_type.shape.dims() else {
+        panic!("row_membership rows must have shape [R,D]");
+    };
+    let [key_count] = *key_type.shape.dims() else {
+        panic!("row_membership keys must have shape [K]");
+    };
+    assert_eq!(
+        row_type.dtype, key_type.dtype,
+        "row_membership rows and keys must have the same dtype"
+    );
+
+    let row_stride = key_count
+        .checked_mul(depth)
+        .expect("row_membership shape overflow");
+    let row_flat_len = row_count
+        .checked_mul(depth)
+        .expect("row_membership shape overflow");
+    let flat_len = row_count
+        .checked_mul(key_count)
+        .and_then(|value| value.checked_mul(depth))
+        .expect("row_membership shape overflow");
+    let (rows, _) = rows.materialize();
+    let (keys, _) = keys.materialize();
+    let rows = Tensor::node(rows, row_type);
+    let keys = Tensor::node(keys, key_type);
+    let linear = iota(flat_len);
+    let row_index = div(&linear, row_stride);
+    let depth_index = rem(&linear, depth);
+    let row_value_index = add(mul(row_index, depth), depth_index);
+    let row_values = gather(reshape(rows, [row_flat_len]), row_value_index);
+    let key_index = rem(div(&linear, depth), key_count);
+    let key_values = gather(keys, key_index);
+    let matches = eq(
+        reshape(row_values, [row_count, key_count, depth]),
+        reshape(key_values, [row_count, key_count, depth]),
+    );
+    cast(reduce_max(cast(matches, DType::U32)), DType::Bool)
+}
+
+/// Masked argmax expressed over ordinary PTIR primitives.
+pub fn masked_argmax(logits: impl AsTensor, mask: impl AsTensor) -> Tensor {
+    let (logits, logits_type) = logits.to_arg().materialize();
+    let (mask, _) = mask.to_arg().materialize();
+    let result_type = ValueType::new(reduce_shape(logits_type.shape), DType::I32);
+    let negative_infinity = push(
+        Op::Const(Literal::F32(f32::NEG_INFINITY)),
+        &[ValueType::scalar(DType::F32)],
+    );
+    let masked = push(
+        Op::Select {
+            cond: mask,
+            a: logits,
+            b: negative_infinity,
+        },
+        &[logits_type],
+    );
+    let result = push(Op::ReduceArgmax(masked), &[result_type]);
+    Tensor::node(result, result_type)
+}
+
+/// Semantic Gumbel-max sampler over the input's complete shape.
+pub fn gumbel_max(logits: impl AsTensor, state: impl AsTensor) -> Tensor {
+    let (logits, logits_type) = logits.to_arg().materialize();
+    let (state, _) = state.to_arg().materialize();
+    let result_type = ValueType::new(reduce_shape(logits_type.shape), DType::I32);
+    let noise = push(
+        Op::RngKeyed {
+            state,
+            shape: logits_type.shape,
+            kind: RngKind::Gumbel,
+        },
+        &[ValueType::new(logits_type.shape, DType::F32)],
+    );
+    let perturbed = push(Op::Add(logits, noise), &[logits_type]);
+    let result = push(Op::ReduceArgmax(perturbed), &[result_type]);
+    Tensor::node(result, result_type)
+}
+
+/// Shannon entropy `-sum(p * log(p))`.
+pub fn entropy(probabilities: impl AsTensor) -> Tensor {
+    let (probabilities, probability_type) = probabilities.to_arg().materialize();
+    let result_type = ValueType::new(reduce_shape(probability_type.shape), DType::F32);
+    let log_probabilities = push(Op::Log(probabilities), &[probability_type]);
+    let terms = push(
+        Op::Mul(probabilities, log_probabilities),
+        &[probability_type],
+    );
+    let sum = push(Op::ReduceSum(terms), &[result_type]);
+    let result = push(Op::Neg(sum), &[result_type]);
+    Tensor::node(result, result_type)
+}
+
+/// Entropy when both probabilities and log-probabilities already exist.
+pub fn entropy_from_logprobs(
+    probabilities: impl AsTensor,
+    log_probabilities: impl AsTensor,
+) -> Tensor {
+    let (probabilities, probability_type) = probabilities.to_arg().materialize();
+    let (log_probabilities, _) = log_probabilities.to_arg().materialize();
+    let result_type = ValueType::new(reduce_shape(probability_type.shape), DType::F32);
+    let terms = push(
+        Op::Mul(probabilities, log_probabilities),
+        &[probability_type],
+    );
+    let sum = push(Op::ReduceSum(terms), &[result_type]);
+    let result = push(Op::Neg(sum), &[result_type]);
+    Tensor::node(result, result_type)
+}
+
+/// Compiler-visible gather of the scalar selected by a token/index result.
+pub fn scalar_gather(src: impl AsTensor, index: impl AsTensor) -> Tensor {
+    let (src, src_type) = src.to_arg().materialize();
+    let (index, index_type) = index.to_arg().materialize();
+    let (op, result_shape) = if let [rows, _] = src_type.shape.dims() {
+        assert_eq!(
+            index_type.shape.dims(),
+            &[*rows],
+            "scalar_gather over a matrix requires one index per row"
+        );
+        (Op::GatherRow { src, idx: index }, Shape::vector(*rows))
+    } else {
+        let mut dimensions: Vec<u32> = index_type.shape.dims().to_vec();
+        dimensions.extend_from_slice(&src_type.shape.dims()[src_type.shape.rank().min(1)..]);
+        (
+            Op::Gather { src, idx: index },
+            Shape::new(&dimensions).expect("scalar gather result rank"),
+        )
+    };
+    let result_type = ValueType::new(result_shape, src_type.dtype);
+    let result = emit(op, &[result_type]);
+    Tensor::node(result, result_type)
+}
+
+/// Exact nucleus sampler expressed entirely as ordinary composable SSA.
+/// Temperature scaling remains an ordinary preceding operation.
+pub fn nucleus_sample(logits: impl AsTensor, top_p: impl AsTensor, state: impl AsTensor) -> Tensor {
+    let (logits, logits_type) = logits.to_arg().materialize();
+    let (top_p, _) = top_p.to_arg().materialize();
+    let (state, _) = state.to_arg().materialize();
+    let row_type = ValueType::new(reduce_shape(logits_type.shape), DType::F32);
+    let token_type = ValueType::new(reduce_shape(logits_type.shape), DType::I32);
+
+    let maximum = push(Op::ReduceMax(logits), &[row_type]);
+    let maximum = push(
+        Op::Broadcast {
+            value: maximum,
+            shape: logits_type.shape,
+        },
+        &[logits_type],
+    );
+    let centered = push(Op::Sub(logits, maximum), &[logits_type]);
+    let exponentials = push(Op::Exp(centered), &[logits_type]);
+    let sum = push(Op::ReduceSum(exponentials), &[row_type]);
+    let sum = push(
+        Op::Broadcast {
+            value: sum,
+            shape: logits_type.shape,
+        },
+        &[logits_type],
+    );
+    let probabilities = push(Op::Div(exponentials, sum), &[logits_type]);
+    let keep = push(
+        Op::PivotThreshold {
+            input: probabilities,
+            predicate: Predicate::CummassLe(top_p),
+        },
+        &[ValueType::new(logits_type.shape, DType::Bool)],
+    );
+    let negative_infinity = push(
+        Op::Const(Literal::F32(f32::NEG_INFINITY)),
+        &[ValueType::scalar(DType::F32)],
+    );
+    let masked = push(
+        Op::Select {
+            cond: keep,
+            a: logits,
+            b: negative_infinity,
+        },
+        &[logits_type],
+    );
+    let noise = push(
+        Op::RngKeyed {
+            state,
+            shape: logits_type.shape,
+            kind: RngKind::Gumbel,
+        },
+        &[logits_type],
+    );
+    let perturbed = push(Op::Add(masked, noise), &[logits_type]);
+    let result = push(Op::ReduceArgmax(perturbed), &[token_type]);
+    Tensor::node(result, token_type)
 }
 
 // -- intrinsic value leaf (used by `intrinsics`) --
@@ -639,5 +1060,11 @@ pub(crate) fn reshape_id_to(id: ValueId, from: ValueType, target: Shape) -> Valu
     if from.shape == target {
         return id;
     }
-    emit(Op::Reshape { value: id, shape: target }, &[ValueType::new(target, from.dtype)])
+    emit(
+        Op::Reshape {
+            value: id,
+            shape: target,
+        },
+        &[ValueType::new(target, from.dtype)],
+    )
 }

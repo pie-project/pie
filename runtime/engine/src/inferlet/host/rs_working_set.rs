@@ -5,6 +5,8 @@
 //! substantive operation delegates to the per-(model, driver) [`RsStore`]
 //! resolved through `store::registry`.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -111,10 +113,33 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     async fn fork(
         &mut self,
         this: Resource<RsWorkingSet>,
-        _on: Resource<Pipeline>,
+        on: Resource<Pipeline>,
     ) -> Result<Result<Resource<RsWorkingSet>, String>> {
         crate::inferlet::process::preemption::honor(self).await?;
+        // A channel value can become host-visible just before its fire's
+        // completion callback is drained. Fork must therefore retire every
+        // earlier operation on `on` before snapshotting the parent's committed
+        // folded mapping; this is the ordering guarantee carried by the
+        // pipeline argument.
+        let (fires, failure) = {
+            let pipeline = self.ctx().table.get(&on)?;
+            (pipeline.fires.clone(), pipeline.failure.clone())
+        };
         let ws = self.ctx().table.get(&this)?.clone();
+        let scope = Arc::as_ptr(&fires) as usize;
+        if let Err(owner) = ws.claim_pipeline_scope(scope) {
+            return Ok(Err(format!(
+                "rs working set fork: parent is scoped to pipeline {owner:#x}, \
+                 not supplied pipeline {scope:#x}"
+            )));
+        }
+        crate::pipeline::fire::drain_rs_predecessors(self, &fires).await?;
+        if let Some(reason) = failure.lock().unwrap().clone() {
+            return Ok(Err(format!(
+                "rs working set fork: pipeline failed: {reason}"
+            )));
+        }
+
         let stores = store_registry::get(ws.model, ws.driver as usize);
         let forked = stores.rs.lock().unwrap().fork(ws.id);
         match forked {

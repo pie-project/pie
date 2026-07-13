@@ -37,6 +37,10 @@ impl crate::pipeline::fire::FireContext for TeardownFireContext {
     async fn honor_preemption(&mut self) -> Result<()> {
         Ok(())
     }
+
+    fn preemption_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
 }
 
 pub(crate) fn defer_resource_teardown(
@@ -101,7 +105,7 @@ struct ResidencyTxnGuard {
     model: usize,
     driver: usize,
     txn: Option<ResidencyTxn>,
-    completion: Option<crate::driver::SubmissionCompletion>,
+    completion: Option<crate::scheduler::ControlCompletion>,
 }
 
 impl ResidencyTxnGuard {
@@ -123,7 +127,7 @@ impl ResidencyTxnGuard {
         }
     }
 
-    fn arm(&mut self, completion: crate::driver::SubmissionCompletion) {
+    fn arm(&mut self, completion: crate::scheduler::ControlCompletion) {
         self.completion = Some(completion);
     }
 
@@ -180,7 +184,7 @@ impl Drop for ResidencyTxnGuard {
             return;
         };
         runtime.spawn(async move {
-            let _ = completion.await;
+            let _ = completion.wait().await;
             let stores = crate::store::registry::get(model, driver);
             let mut kv = stores.kv.lock().unwrap();
             match txn {
@@ -501,7 +505,7 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
         _ => unreachable!(),
     };
     let copy_started = Instant::now();
-    let completion = match crate::scheduler::copy_d2h(0, &gpu_ids, &host_slots) {
+    let completion = match crate::scheduler::copy_d2h_tracked(0, &gpu_ids, &host_slots) {
         Ok(completion) => completion,
         Err(error) => {
             suspend.abort_now();
@@ -512,7 +516,7 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
         }
     };
     suspend.arm(completion.clone());
-    if let Err(error) = completion.await {
+    if let Err(error) = completion.wait().await {
         orchestrator.record_d2h_copy(copy_started.elapsed());
         suspend.disarm_completion();
         suspend.abort_now();
@@ -561,6 +565,7 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
             }
         };
         let mut restore = ResidencyTxnGuard::restore(0, 0, txn);
+        orchestrator.record_restore_prepared();
         let gpu_ids = match restore.txn.as_ref() {
             Some(ResidencyTxn::Restore(txn)) => txn.gpu_ids(),
             _ => unreachable!(),
@@ -570,7 +575,7 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
             _ => unreachable!(),
         };
         let copy_started = Instant::now();
-        let completion = match crate::scheduler::copy_h2d(0, &gpu_ids, &host_slots) {
+        let completion = match crate::scheduler::copy_h2d_tracked(0, &gpu_ids, &host_slots) {
             Ok(completion) => completion,
             Err(error) => {
                 restore.abort_now();
@@ -582,8 +587,9 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
                 continue;
             }
         };
+        orchestrator.record_h2d_submitted();
         restore.arm(completion.clone());
-        if let Err(error) = completion.await {
+        if let Err(error) = completion.wait().await {
             orchestrator.record_h2d_copy(copy_started.elapsed());
             restore.disarm_completion();
             restore.abort_now();
@@ -616,32 +622,39 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
     unreachable!("restore loop has at least one attempt")
 }
 
-pub(crate) async fn await_channel_progress(
-    ctx: &mut ProcessCtx,
+pub(crate) async fn await_channel_progress_idle(
+    process_id: uuid::Uuid,
+    residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
     cell: &Arc<Mutex<crate::pipeline::channel::ChannelCell>>,
     fires: Option<&PendingFires>,
 ) -> Result<(), String> {
     let Some(orchestrator) = crate::store::reclaim::contention() else {
         return crate::pipeline::fire::await_channel_progress(cell, fires).await;
     };
-    let Some(signal) = orchestrator.park_signal(ctx.id()) else {
+    let Some(signal) = orchestrator.park_signal(process_id) else {
         return crate::pipeline::fire::await_channel_progress(cell, fires).await;
     };
-    if orchestrator.should_park(ctx.id()) {
-        honor(ctx).await.map_err(|error| error.to_string())?;
+    if orchestrator.should_park(process_id) {
+        honor_idle(process_id, residency.clone())
+            .await
+            .map_err(|error| error.to_string())?;
         return Ok(());
     }
     let notified = signal.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    if orchestrator.should_park(ctx.id()) {
-        honor(ctx).await.map_err(|error| error.to_string())?;
+    if orchestrator.should_park(process_id) {
+        honor_idle(process_id, residency.clone())
+            .await
+            .map_err(|error| error.to_string())?;
         return Ok(());
     }
     tokio::select! {
         result = crate::pipeline::fire::await_channel_progress(cell, fires) => result,
         _ = &mut notified => {
-            honor(ctx).await.map_err(|error| error.to_string())?;
+            honor_idle(process_id, residency)
+                .await
+                .map_err(|error| error.to_string())?;
             Ok(())
         }
     }

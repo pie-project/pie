@@ -6,9 +6,9 @@
 //! container (parametric in the live model's `output_vocab_size`, so it binds
 //! against Qwen3-0.6B's vocab 151936), then `register-program →
 //! pipeline.instantiate(seed = BOS on tok) → pipeline.channel(out) →
-//! pipeline.submit → out.take()`. The pass embeds the seeded BOS, the model
+//! pipeline.submit → out.take().await`. The pass embeds the seeded BOS, the model
 //! forward fills `ws.logits`, and the PTIR epilogue argmaxes them into the
-//! host-reader `out` channel — so `out.take()` yields the model's greedy next
+//! host-reader `out` channel — so `out.take().await` yields the model's greedy next
 //! token. The harness asserts it equals a plain greedy decode of the same model.
 
 use inferlet::inference::{ForwardPass, InputBinding};
@@ -91,7 +91,7 @@ async fn main(_input: String) -> Result<String> {
     pipeline.submit().map_err(|e| format!("submit: {e}"))?;
 
     // Take the produced token (blocks until the fire commits the cell).
-    let token_bytes = out.take().map_err(|e| format!("out.take: {e}"))?;
+    let token_bytes = out.take().await.map_err(|e| format!("out.take: {e}"))?;
     if token_bytes.len() != 4 {
         return Err(format!("out.take: expected 4 bytes (i32), got {}", token_bytes.len()));
     }

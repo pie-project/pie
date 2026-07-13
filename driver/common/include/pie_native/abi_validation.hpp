@@ -113,6 +113,31 @@ inline int validate_csr(PieU32Slice indptr,
         : PIE_STATUS_INVALID_ARGUMENT;
 }
 
+// Validate a CSR whose outer dimension is resolved later by a device
+// descriptor. A direct launch can be descriptor-only or mixed with wire rows,
+// so the outer count is intentionally not checked here; CUDA composition checks
+// it against the exact resolved request count before execution.
+inline int validate_deferred_outer_csr(PieU32Slice indptr,
+                                       std::size_t values_len) noexcept {
+    int status = validate_slice(indptr.ptr, indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    if (indptr.len == 0) {
+        return values_len == 0 ? PIE_STATUS_OK : PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (values_len > std::numeric_limits<std::uint32_t>::max() ||
+        indptr.ptr[0] != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t i = 1; i < indptr.len; ++i) {
+        if (indptr.ptr[i - 1] > indptr.ptr[i]) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    return indptr.ptr[indptr.len - 1] == values_len
+        ? PIE_STATUS_OK
+        : PIE_STATUS_INVALID_ARGUMENT;
+}
+
 inline int validate_optional_rows(std::size_t len,
                                   std::size_t rows) noexcept {
     return (len == 0 || len == rows)
@@ -335,10 +360,11 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     if (status != PIE_STATUS_OK) return status;
     status = validate_bytes(desc->audio_features);
     if (status != PIE_STATUS_OK) return status;
-    status = validate_masks(desc->masks, desc->instance_ids.len);
+    const std::size_t instance_count = desc->instance_ids.len;
+    const std::size_t wire_row_count =
+        desc->qo_indptr.len == 0 ? 0 : desc->qo_indptr.len - 1;
+    status = validate_masks(desc->masks, wire_row_count);
     if (status != PIE_STATUS_OK) return status;
-
-    const std::size_t request_count = desc->instance_ids.len;
     const std::size_t max_int =
         static_cast<std::size_t>(std::numeric_limits<int>::max());
     for (std::size_t len : {
@@ -385,25 +411,25 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
          }) {
         if (len > max_int) return PIE_STATUS_INVALID_ARGUMENT;
     }
-    if (request_count > std::numeric_limits<std::uint32_t>::max() ||
-        desc->terminal_cells.len != request_count ||
+    if (instance_count > std::numeric_limits<std::uint32_t>::max() ||
+        desc->terminal_cells.len != instance_count ||
         desc->position_ids.len != desc->token_ids.len) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     if ((desc->logical_fire_ids.len != 0 &&
-         desc->logical_fire_ids.len != request_count) ||
+         desc->logical_fire_ids.len != instance_count) ||
         desc->channel_expected_head.len != desc->channel_expected_tail.len) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     status = validate_csr(
         desc->kv_translation_indptr,
         desc->kv_translation.len,
-        request_count);
+        instance_count);
     if (status != PIE_STATUS_OK) return status;
     status = validate_csr(
         desc->channel_ticket_indptr,
         desc->channel_expected_head.len,
-        request_count);
+        instance_count);
     if (status != PIE_STATUS_OK) return status;
     if (desc->channel_ticket_indptr.len != 0 &&
         desc->channel_ticket_indptr.ptr[
@@ -412,29 +438,35 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     if (desc->ptir_program_row_indptr.len != 0) {
-        const std::size_t wire_rows =
-            desc->qo_indptr.len == 0 ? 0 : desc->qo_indptr.len - 1;
         status = validate_csr(
             desc->ptir_program_row_indptr,
-            wire_rows,
-            request_count);
+            wire_row_count,
+            instance_count);
         if (status != PIE_STATUS_OK) return status;
     }
-    for (std::size_t i = 0; i < request_count; ++i) {
+    for (std::size_t i = 0; i < instance_count; ++i) {
         for (std::size_t j = 0; j < i; ++j) {
             if (desc->instance_ids.ptr[i] == desc->instance_ids.ptr[j]) {
                 return PIE_STATUS_INVALID_ARGUMENT;
             }
         }
     }
+    if (desc->rs_slot_ids.len != desc->rs_slot_flags.len ||
+        (desc->rs_fold_lens.len != 0 &&
+         desc->rs_fold_lens.len != desc->rs_slot_ids.len)) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    const bool has_rs_fold_lens = desc->rs_fold_lens.len != 0;
     for (std::size_t i = 0; i < desc->rs_slot_flags.len; ++i) {
-        if ((desc->rs_slot_flags.ptr[i] &
-             ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD)) != 0) {
+        const std::uint8_t flags = desc->rs_slot_flags.ptr[i];
+        if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD)) != 0) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
-    }
-    if (desc->rs_slot_ids.len != desc->rs_slot_flags.len) {
-        return PIE_STATUS_INVALID_ARGUMENT;
+        const bool folds = (flags & PIE_RS_FLAG_FOLD) != 0;
+        if (folds !=
+            (has_rs_fold_lens && desc->rs_fold_lens.ptr[i] != 0)) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
     }
     for (std::size_t i = 0; i < desc->rs_slot_ids.len; ++i) {
         if (desc->rs_slot_ids.ptr[i] >
@@ -450,38 +482,59 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
     }
 
     for (std::size_t len : {
-             desc->kv_last_page_lens.len,
-             desc->rs_slot_ids.len,
-             desc->rs_fold_lens.len,
-             desc->context_ids.len,
-             desc->kv_len.len,
+            desc->kv_last_page_lens.len,
+            desc->context_ids.len,
+            desc->kv_len.len,
          }) {
-        status = validate_optional_rows(len, request_count);
+        status = validate_optional_rows(len, wire_row_count);
         if (status != PIE_STATUS_OK) return status;
+    }
+    for (std::size_t i = 0; i < desc->rs_fold_lens.len; ++i) {
+        if (desc->rs_fold_lens.ptr[i] >
+            static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    // A direct PTIR launch may contain device-geometry programs whose
+    // descriptor-resolved row count differs from their wire placeholder span.
+    // Keep the vectors internally valid here, but defer their outer cardinality
+    // until CUDA composition has the exact resolved request count.
+    const bool defer_rs_outer =
+        instance_count != 0 &&
+        (wire_row_count == 0 ||
+         desc->ptir_program_row_indptr.len == instance_count + 1);
+    if (!defer_rs_outer && wire_row_count != 0 &&
+        desc->rs_slot_ids.len != 0 &&
+        desc->rs_slot_ids.len != wire_row_count) {
+        return PIE_STATUS_INVALID_ARGUMENT;
     }
     if (desc->kv_len_device.len > 1) return PIE_STATUS_INVALID_ARGUMENT;
 
     status = validate_csr(
-        desc->qo_indptr, desc->token_ids.len, request_count);
+        desc->qo_indptr, desc->token_ids.len, wire_row_count);
     if (status != PIE_STATUS_OK) return status;
     status = validate_csr(
-        desc->kv_page_indptr, desc->kv_page_indices.len, request_count);
+        desc->kv_page_indptr, desc->kv_page_indices.len, wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    status = defer_rs_outer
+        ? validate_deferred_outer_csr(
+              desc->rs_buffer_slot_indptr,
+              desc->rs_buffer_slot_ids.len)
+        : validate_csr(
+              desc->rs_buffer_slot_indptr,
+              desc->rs_buffer_slot_ids.len,
+              wire_row_count);
     if (status != PIE_STATUS_OK) return status;
     status = validate_csr(
-        desc->rs_buffer_slot_indptr,
-        desc->rs_buffer_slot_ids.len,
-        request_count);
-    if (status != PIE_STATUS_OK) return status;
-    status = validate_csr(
-        desc->sampling_indptr, desc->sampling_indices.len, request_count);
+        desc->sampling_indptr, desc->sampling_indices.len, wire_row_count);
     if (status != PIE_STATUS_OK) return status;
     if (desc->kv_page_indptr.len != 0 &&
-        desc->kv_last_page_lens.len != request_count) {
+        desc->kv_last_page_lens.len != wire_row_count) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     if (desc->token_ids.len != 0 &&
         (desc->kv_page_indptr.len == 0 ||
-         desc->kv_last_page_lens.len != request_count ||
+         desc->kv_last_page_lens.len != wire_row_count ||
          desc->sampling_indptr.len == 0)) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
@@ -489,7 +542,7 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
     if (desc->sampling_indices.len != 0) {
-        for (std::size_t request = 0; request < request_count; ++request) {
+        for (std::size_t request = 0; request < wire_row_count; ++request) {
             const std::uint32_t query_rows =
                 desc->qo_indptr.ptr[request + 1] -
                 desc->qo_indptr.ptr[request];
@@ -519,7 +572,7 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
         }
     }
     status = validate_csr(
-        desc->image_indptr, image_count, request_count);
+        desc->image_indptr, image_count, wire_row_count);
     if (status != PIE_STATUS_OK) return status;
     if (image_count != 0 && desc->image_pixel_indptr.len == 0) {
         return PIE_STATUS_INVALID_ARGUMENT;
@@ -540,7 +593,7 @@ inline int validate_launch_desc(const PieLaunchDesc* desc) noexcept {
         }
     }
     status = validate_csr(
-        desc->audio_indptr, audio_count, request_count);
+        desc->audio_indptr, audio_count, wire_row_count);
     if (status != PIE_STATUS_OK) return status;
     if (audio_count != 0 && desc->audio_feature_indptr.len == 0) {
         return PIE_STATUS_INVALID_ARGUMENT;

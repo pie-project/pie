@@ -10,7 +10,7 @@ Modes:
 
 Pie runs use an external `text-completion-bench` project so the runner can
 record actual prompt/output token counts without adding benchmark-only code to
-the curated `inferlets/` collection.
+the curated `tests/inferlets/` fixtures.
 
 Pass its path with `--inferlet-dir` or set `PIE_BENCH_INFERLET_DIR`.
 

@@ -7,17 +7,23 @@ use crate::driver::{LaunchSubmission, SchedulerLimits};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RequestCapacityUsage {
+    pub(crate) forward_requests: usize,
     pub(crate) forward_tokens: usize,
     pub(crate) page_refs: usize,
 }
 
 pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapacityUsage {
     let input_tokens = req.request.token_ids.len();
+    let forward_requests = req
+        .wire_row_count()
+        .max(req.request.rs_slot_ids.len())
+        .max(1);
     let forward_tokens = input_tokens;
     let page_refs = req.physical_page_ids.len();
     let _ = page_size;
 
     RequestCapacityUsage {
+        forward_requests,
         forward_tokens,
         page_refs,
     }
@@ -44,6 +50,12 @@ impl BatchAccumulator {
 
     pub(crate) fn single_request_limit_error(&self, req: &PendingRequest) -> Option<String> {
         let usage = request_capacity_usage(req, self.page_size);
+        if usage.forward_requests > self.limits.max_forward_requests {
+            return Some(format!(
+                "forward request has {} resolved rows, exceeding driver limit {}",
+                usage.forward_requests, self.limits.max_forward_requests
+            ));
+        }
         if usage.forward_tokens > self.limits.max_forward_tokens {
             return Some(format!(
                 "forward request has {} forward tokens, exceeding driver limit {}",
@@ -55,9 +67,6 @@ impl BatchAccumulator {
                 "forward request has {} page refs, exceeding driver limit {}",
                 usage.page_refs, self.limits.max_page_refs
             ));
-        }
-        if self.limits.max_forward_requests == 0 {
-            return Some("driver max forward requests is zero".to_string());
         }
         None
     }
@@ -72,9 +81,12 @@ pub(crate) fn build_batch_request(
     page_size: u32,
     stats: &SchedulerStats,
 ) -> LaunchSubmission {
-    if requests.len() == 1 && requests[0].prebuilt {
+    if requests.len() == 1 && (requests[0].prebuilt || requests[0].preserves_inner_rows()) {
         // Keep the logical-fire payload intact across attempts. RETRY builds a
-        // fresh native launch from this same immutable request.
+        // fresh native launch from this same immutable request. Ordinary
+        // multi-row programs take this path too: flattening them through
+        // `wire::append_request` would collapse their inner CSR to one row
+        // while incorrectly retaining B recurrent-state slots.
         let req = &mut requests[0];
         let mut plan = req.request.clone();
         let kv_translation = std::mem::take(&mut plan.kv_translation);
@@ -166,6 +178,7 @@ mod tests {
             prebuilt,
             retry_count: 0,
             prelaunch_copy: None,
+            prelaunch_state_copy: None,
             preparation: None,
             retry_classifier: None,
             preparation_retries: 0,
@@ -223,13 +236,48 @@ mod tests {
         two_lane.token_ids = vec![11, 22];
         two_lane.position_ids = vec![0, 0];
         two_lane.qo_indptr = vec![0, 1, 2];
+        two_lane.rs_slot_ids = vec![31, 32];
+        two_lane.rs_slot_flags = vec![0, crate::driver::RS_FLAG_RESET];
         let mut solo = [pending(two_lane, 1, true)];
         let sub = build_batch_request(&mut solo, 16, &SchedulerStats::default());
         assert_eq!(sub.program_row_indptr, vec![0, 2]);
+        assert_eq!(sub.plan.qo_indptr, vec![0, 1, 2]);
+        assert_eq!(sub.plan.rs_slot_ids, vec![31, 32]);
 
         let dg = LaunchPlan::default();
         let mut solo_dg = [pending(dg, 2, true)];
         let sub = build_batch_request(&mut solo_dg, 16, &SchedulerStats::default());
         assert_eq!(sub.program_row_indptr, vec![0, 0]);
+    }
+
+    #[test]
+    fn ordinary_multi_row_submission_remains_intact() {
+        let mut two_lane = wire_decode(11, 3);
+        two_lane.token_ids = vec![11, 22];
+        two_lane.position_ids = vec![0, 0];
+        two_lane.qo_indptr = vec![0, 1, 2];
+        two_lane.kv_page_indices = vec![3, 4];
+        two_lane.kv_page_indptr = vec![0, 1, 2];
+        two_lane.kv_last_page_lens = vec![1, 1];
+        two_lane.sampling_indices = vec![0, 1];
+        two_lane.sampling_indptr = vec![0, 1, 2];
+        two_lane.mask_indptr = vec![0, 0, 0];
+        two_lane.rs_slot_ids = vec![17, 23];
+        two_lane.rs_slot_flags = vec![crate::driver::RS_FLAG_RESET, 0];
+        let expected = two_lane.clone();
+
+        let mut ordinary = [pending(two_lane, 9, false)];
+        let sub = build_batch_request(&mut ordinary, 16, &SchedulerStats::default());
+
+        assert_eq!(sub.instance_ids, vec![9]);
+        assert_eq!(sub.program_row_indptr, vec![0, 2]);
+        assert_eq!(sub.plan.qo_indptr, expected.qo_indptr);
+        assert_eq!(sub.plan.kv_page_indptr, expected.kv_page_indptr);
+        assert_eq!(sub.plan.sampling_indptr, expected.sampling_indptr);
+        assert_eq!(sub.plan.rs_slot_ids, vec![17, 23]);
+        assert_eq!(
+            sub.plan.rs_slot_flags,
+            vec![crate::driver::RS_FLAG_RESET, 0]
+        );
     }
 }

@@ -41,11 +41,12 @@ pub use ptir_dsl::intrinsics;
 // `use inferlet::ptir::prelude::*;` (mirrors the old `ptir::prelude`).
 pub use ptir_dsl::{DType as Dtype, model};
 pub use ptir_dsl::{
-    add, and, broadcast, cast, cummass_le, cumprod, cumsum, div, dtype, eq, exp, gather,
-    gather_row, ge, gt, gumbel, iota, l2norm, le, log, log_softmax, lt, mask_apply, matmul,
-    max_elem, min_elem, mul, ne, neg, not, or, pivot_threshold, prob_ge, rank_le, reduce_argmax,
-    reduce_max, reduce_min, reduce_sum, rem, reshape, rng, scatter_add, scatter_set, select,
-    softmax, sub, top_k, transpose,
+    add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
+    entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, iota, l2norm,
+    le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem, min_elem, mul, ne, neg,
+    not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, reduce_argmax, reduce_max,
+    reduce_min, reduce_sum, rem, reshape, rng, row_membership, scalar_gather, scatter_add,
+    scatter_set, select, sink_window_mask, sliding_window_mask, softmax, sub, top_k, transpose,
 };
 
 // ---------------------------------------------------------------------------
@@ -93,16 +94,30 @@ fn dims_of(shape: Shape) -> Vec<u32> {
 /// A GPU-resident bounded queue (overview §1). Owns the `ptir-dsl` trace
 /// declaration and the WIT `channel` resource. In a stage closure `take`/`read`/
 /// `put` record IR ops; on the host `put` stages a value (seed / host-writer
-/// cell) and `Taken::get` moves a committed value out.
+/// cell) and `Taken::get().await`/`Taken::bytes().await` materialize a committed value.
 pub struct Channel {
     dsl: DslChannel,
     wit: Rc<wit::Channel>,
 }
 
+/// Default number of decode fires kept submitted ahead of host consumption.
+pub const DEFAULT_RUNAHEAD_DEPTH: usize = 2;
+
 impl Channel {
     /// `Channel::new([shape], dtype)` at capacity 1 (overview §1).
     pub fn new(shape: impl IntoShape, dtype: DType) -> Channel {
         Channel::build(shape.into_shape(), dtype, 1, false)
+    }
+
+    /// An initially empty channel whose producer is the host.
+    ///
+    /// Unlike [`Channel::new`], this declares the host-writer endpoint before
+    /// the first value is available, so a consuming pass may be submitted
+    /// run-ahead and receive the value later.
+    pub fn writer(shape: impl IntoShape, dtype: DType) -> Channel {
+        let channel = Channel::build(shape.into_shape(), dtype, 1, false);
+        channel.dsl.note_host_put();
+        channel
     }
 
     /// Widen the ring to `n` cells (deeper run-ahead).
@@ -188,13 +203,14 @@ impl Channel {
 
     /// `take()` — consume a cell. In a stage closure: records a `ChanTake` and
     /// yields an in-program value ([`AsTensor`]). On the host: [`Taken::get`]
-    /// moves the committed value out (blocks until a fire fills it; poison ⇒
+    /// awaits the committed value (awaits until a fire fills it; poison ⇒
     /// `Err`).
     pub fn take(&self) -> Taken {
         let dsl = self.dsl.take();
         Taken {
             dsl,
             wit: self.wit.clone(),
+            mode: TakenMode::Take,
             dtype: self.dsl.dtype(),
         }
     }
@@ -205,6 +221,7 @@ impl Channel {
         Taken {
             dsl,
             wit: self.wit.clone(),
+            mode: TakenMode::Read,
             dtype: self.dsl.dtype(),
         }
     }
@@ -230,11 +247,18 @@ impl Channel {
 
 /// The result of [`Channel::take`]/[`Channel::read`]. In a stage closure it is
 /// an in-program value (via [`AsTensor`]); on the host [`get`](Self::get) /
-/// [`bytes`](Self::bytes) move the committed value out.
+/// [`bytes`](Self::bytes) await the committed value.
 pub struct Taken {
     dsl: ptir_dsl::Taken,
     wit: Rc<wit::Channel>,
+    mode: TakenMode,
     dtype: DType,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TakenMode {
+    Take,
+    Read,
 }
 
 impl Taken {
@@ -243,15 +267,18 @@ impl Taken {
         self.dsl.tensor()
     }
 
-    /// Move the committed value out to the host as raw little-endian bytes.
-    /// Blocks by awaiting in-flight fires; a poisoned channel returns `Err`.
-    pub fn bytes(self) -> Result<Vec<u8>, String> {
-        self.wit.take()
+    /// Materialize the committed value to the host as raw little-endian bytes.
+    /// Awaits in-flight fires; a poisoned channel returns `Err`.
+    pub async fn bytes(self) -> Result<Vec<u8>, String> {
+        match self.mode {
+            TakenMode::Take => self.wit.take().await,
+            TakenMode::Read => self.wit.read().await,
+        }
     }
 
-    /// Move the committed value out to the host, decoded to `T`.
-    pub fn get<T: HostElem>(self) -> Result<Vec<T>, String> {
-        let raw = self.wit.take()?;
+    /// Materialize the committed value to the host, decoded to `T`.
+    pub async fn get<T: HostElem>(self) -> Result<Vec<T>, String> {
+        let raw = self.bytes().await?;
         let _ = self.dtype;
         Ok(T::decode(&raw))
     }
@@ -431,9 +458,8 @@ impl IntoPut for PageGrant {
 
 /// The runtime's recurrent-state slots for hybrid / linear-attention models
 /// (GDN, Mamba2). Wraps the WIT `rs-working-set`. Bind via
-/// [`ForwardPass::rs_working_set`] for models whose `model::rs_state_size()`
-/// is nonzero; pure-attention models bind none (the single rs-working-set v1
-/// contract — `forward-pass.new` errs on more than one).
+/// [`ForwardPass::set_rs_working_sets`] for models whose
+/// `model::rs_state_size()` is nonzero; pure-attention models bind none.
 pub struct RsWorkingSet {
     rs: Rc<crate::working_set::RsWorkingSet>,
 }
@@ -458,6 +484,14 @@ impl RsWorkingSet {
     /// Tokens per buffered RS page for this working set's model/driver.
     pub fn buffer_page_size(&self) -> u32 {
         self.rs.buffer_page_size()
+    }
+
+    /// Copy-on-write child sharing the current folded state and buffered
+    /// suffix, ordered on `on`.
+    pub fn fork(&self, on: &Pipeline) -> Result<RsWorkingSet, String> {
+        Ok(RsWorkingSet {
+            rs: Rc::new(self.rs.fork(&on.wit)?),
+        })
     }
 }
 
@@ -560,14 +594,37 @@ impl<'a> ForwardPass<'a> {
         self.invalidate();
     }
 
-    /// `rs_working_set(&rs)` — binds the recurrent-state slots for hybrid /
-    /// linear-attention models (GDN, Mamba2). No descriptor ports: presence in
-    /// `forward-pass.new`'s rs-working-sets list is itself the "this forward
-    /// writes recurrent state" signal (the single rs-working-set v1 contract).
-    /// Pure-attention models (`model::rs_state_size() == 0`) never call this.
+    /// Add one recurrent-state working set in resolved request order.
+    ///
+    /// This additive convenience is for initial construction. Use
+    /// [`set_rs_working_sets`](Self::set_rs_working_sets) after the pass has
+    /// been bound.
     pub fn rs_working_set(&self, rs: &RsWorkingSet) {
-        self.inner.borrow_mut().rs_working_sets.push(rs.rs.clone());
-        self.invalidate();
+        let mut inner = self.inner.borrow_mut();
+        assert!(
+            inner.bound.is_none(),
+            "rs_working_set is construction-only after binding; use set_rs_working_sets"
+        );
+        inner.rs_working_sets.push(rs.rs.clone());
+    }
+
+    /// Replace the recurrent-state bindings in resolved request order.
+    ///
+    /// Hybrid / linear-attention forwards bind one working set per request
+    /// row; pure-attention forwards pass an empty slice. Replacing the list
+    /// updates the already-bound host pass in-place; it never recreates the
+    /// native instance or resets seeds/KV/device geometry.
+    pub fn set_rs_working_sets(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
+        let replacement: Vec<Rc<crate::working_set::RsWorkingSet>> =
+            working_sets.iter().map(|rs| rs.rs.clone()).collect();
+        let mut inner = self.inner.borrow_mut();
+        if let Some(bound) = inner.bound.as_ref() {
+            let borrows: Vec<&crate::working_set::RsWorkingSet> =
+                replacement.iter().map(Rc::as_ref).collect();
+            bound.set_rs_working_sets(&borrows)?;
+        }
+        inner.rs_working_sets = replacement;
+        Ok(())
     }
 
     /// `attn_mask(&m)` — masks this pass's queries over the KV axis (peeked).
@@ -631,9 +688,10 @@ impl<'a> ForwardPass<'a> {
         self.invalidate();
     }
 
-    /// `submit(&pipeline)` — enqueue this pass run-ahead on `on`; never
-    /// blocks (the channels' `take`/`read` are the await points). The first
-    /// submit lowers + binds (`forward-pass.new`); bind errors surface here.
+    /// `submit(&pipeline)` — enqueue this pass run-ahead on `on`. RS-bound
+    /// passes serialize preparation behind prior FIFO operations; pure
+    /// attention remains non-blocking. The first submit lowers + binds
+    /// (`forward-pass.new`); bind errors surface here.
     pub fn submit(&self, on: &Pipeline) -> Result<(), String> {
         let bound = self.bound()?;
         bound.submit(&on.wit)
@@ -800,16 +858,20 @@ impl AttnWsArgs for (&Channel, Tensor, &Channel, &Channel, &Channel) {
 /// Glob-import surface for PTIR inferlet authors: the eDSL vocabulary plus the
 /// four author-facing wrapper types.
 pub mod prelude {
-    pub use super::{Channel, ForwardPass, PageGrant, Pipeline, RsWorkingSet, WorkingSet};
+    pub use super::{
+        Channel, DEFAULT_RUNAHEAD_DEPTH, ForwardPass, PageGrant, Pipeline, RsWorkingSet, WorkingSet,
+    };
     pub use ptir_dsl::dtype;
     pub use ptir_dsl::intrinsics;
     pub use ptir_dsl::model;
     pub use ptir_dsl::value::{
-        AsTensor, Tensor, add, and, broadcast, cast, cummass_le, cumprod, cumsum, div, eq, exp,
-        gather, gather_row, ge, gt, gumbel, iota, l2norm, le, log, log_softmax, lt, mask_apply,
-        matmul, max_elem, min_elem, mul, ne, neg, not, or, pivot_threshold, prob_ge, rank_le,
-        reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng, scatter_add,
-        scatter_set, select, softmax, sub, top_k, transpose,
+        AsTensor, Tensor, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div,
+        entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max,
+        iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem,
+        min_elem, mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le,
+        reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng, row_membership,
+        scalar_gather, scatter_add, scatter_set, select, sink_window_mask, sliding_window_mask,
+        softmax, sub, top_k, transpose,
     };
     pub use ptir_dsl::{DType, Port, Stage};
 }

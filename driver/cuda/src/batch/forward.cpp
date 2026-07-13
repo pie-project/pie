@@ -33,6 +33,7 @@
 #include "store/kv_cache.hpp"
 #include "store/recurrent_state_cache.hpp"
 #include "model/imodel.hpp"
+#include "model/stage_hooks.hpp"
 #include "model/llama_like/qwen3.hpp"
 #include "model/workspace.hpp"
 #include "ops/gemm.hpp"
@@ -48,6 +49,7 @@ void ForwardFn::attach_model(model::IModel* m) {
     supports_tp_greedy_argmax    = caps.supports_tp_greedy_argmax;
     supports_small_prefill_graph = caps.supports_small_prefill_graph;
     supports_fused_lmhead_argmax = caps.supports_fused_lmhead_argmax;
+    supports_runtime_window       = caps.supports_runtime_window;
 }
 
 void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
@@ -60,7 +62,10 @@ void ForwardFn::invoke_body(model::Workspace& ws,
                             AttentionWorkspace& aws,
                             ops::CublasHandle& cublas,
                             const ForwardInputs& in) {
-    if (model) model->body(ws, kv, aws, cublas, in);
+    if (model) {
+        model::ScopedStageHooks hooks(in.stage_hooks);
+        model->body(ws, kv, aws, cublas, in);
+    }
 }
 
 std::uint32_t ForwardFn::invoke_graph_layout() {
@@ -110,6 +115,84 @@ bool graph_single_gpu_argmax_enabled() {
     }();
     return enabled;
 }
+
+class CudaStreamOwner {
+      public:
+        CudaStreamOwner() {
+            CUDA_CHECK(cudaStreamCreateWithFlags(
+                &stream_, cudaStreamNonBlocking));
+        }
+        ~CudaStreamOwner() noexcept {
+            if (stream_ != nullptr) cudaStreamDestroy(stream_);
+        }
+        CudaStreamOwner(const CudaStreamOwner&) = delete;
+        CudaStreamOwner& operator=(const CudaStreamOwner&) = delete;
+        cudaStream_t get() const noexcept { return stream_; }
+
+      private:
+        cudaStream_t stream_ = nullptr;
+    };
+
+    class CudaGraphOwner {
+      public:
+        explicit CudaGraphOwner(cudaGraph_t graph = nullptr) : graph_(graph) {}
+        ~CudaGraphOwner() noexcept {
+            if (graph_ != nullptr) cudaGraphDestroy(graph_);
+        }
+        CudaGraphOwner(const CudaGraphOwner&) = delete;
+        CudaGraphOwner& operator=(const CudaGraphOwner&) = delete;
+        cudaGraph_t get() const noexcept { return graph_; }
+
+      private:
+        cudaGraph_t graph_ = nullptr;
+    };
+
+    class CudaGraphExecOwner {
+      public:
+        CudaGraphExecOwner() = default;
+        ~CudaGraphExecOwner() noexcept {
+            if (exec_ != nullptr) cudaGraphExecDestroy(exec_);
+        }
+        CudaGraphExecOwner(const CudaGraphExecOwner&) = delete;
+        CudaGraphExecOwner& operator=(const CudaGraphExecOwner&) = delete;
+        cudaGraphExec_t* out() noexcept { return &exec_; }
+        cudaGraphExec_t get() const noexcept { return exec_; }
+        cudaGraphExec_t release() noexcept {
+            const cudaGraphExec_t result = exec_;
+            exec_ = nullptr;
+            return result;
+        }
+
+      private:
+        cudaGraphExec_t exec_ = nullptr;
+    };
+
+    class CublasStreamScope {
+      public:
+        explicit CublasStreamScope(ops::CublasHandle& handle)
+            : handle_(handle), previous_(handle.stream()) {}
+        void bind(cudaStream_t stream) {
+            handle_.set_stream(stream);
+        }
+        ~CublasStreamScope() noexcept {
+            if (!active_) return;
+            try {
+                handle_.set_stream(previous_);
+            } catch (...) {
+            }
+        }
+        CublasStreamScope(const CublasStreamScope&) = delete;
+        CublasStreamScope& operator=(const CublasStreamScope&) = delete;
+        void restore() {
+            handle_.set_stream(previous_);
+            active_ = false;
+        }
+
+      private:
+        ops::CublasHandle& handle_;
+        cudaStream_t previous_ = nullptr;
+        bool active_ = true;
+};
 
 bool step_profile_enabled() {
     static const bool enabled = [] {
@@ -190,15 +273,20 @@ cudaGraphExec_t capture_forward_graph_exec(
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
     bool single_gpu_greedy_argmax,
-    bool tp_greedy_argmax)
+    bool tp_greedy_argmax,
+    const std::uint32_t* w_page_d,
+    const std::uint32_t* w_off_d,
+    bool has_write_desc,
+    int runtime_window_left)
 {
     auto& pi = engine.inputs;
 
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
-    cudaStream_t cstream = nullptr;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
-    engine.cublas.set_stream(cstream);
-    CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
+    CudaStreamOwner capture_stream;
+    const cudaStream_t cstream = capture_stream.get();
+    CublasStreamScope cublas_stream(engine.cublas);
+    cublas_stream.bind(cstream);
+    StreamCaptureGuard capture_guard(cstream);
     {
         pie_cuda_driver::ForwardFn::ForwardInputs fwd_in;
         fwd_in.token_ids = reinterpret_cast<const std::int32_t*>(pi.tokens.data());
@@ -220,6 +308,10 @@ cudaGraphExec_t capture_forward_graph_exec(
         fwd_in.logit_row_indices_d = logit_row_indices_d;
         fwd_in.num_logit_rows      = num_logit_rows;
         fwd_in.tp_greedy_argmax    = tp_greedy_argmax;
+        fwd_in.w_page_d = w_page_d;
+        fwd_in.w_off_d = w_off_d;
+        fwd_in.has_write_desc = has_write_desc;
+        fwd_in.runtime_window_left = runtime_window_left;
         engine.forward_fn.invoke_body(
             engine.ws, engine.kv_cache, engine.attn_ws, engine.cublas,
             fwd_in);
@@ -247,21 +339,19 @@ cudaGraphExec_t capture_forward_graph_exec(
                 cstream);
         }
     }
-    cudaGraph_t graph = nullptr;
-    CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
+    CudaGraphOwner graph(capture_guard.end());
     if (engine.tp_comm != nullptr &&
         engine.tp_comm->custom_all_reduce() != nullptr) {
         engine.tp_comm->custom_all_reduce()
             ->register_graph_buffers(*engine.tp_comm);
     }
-    engine.cublas.set_stream(nullptr);
+    cublas_stream.restore();
 
-    cudaGraphExec_t exec = nullptr;
-    CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
-    CUDA_CHECK(cudaGraphUpload(exec, nullptr));
-    cudaGraphDestroy(graph);
-    cudaStreamDestroy(cstream);
-    return exec;
+    CudaGraphExecOwner exec;
+    CUDA_CHECK(cudaGraphInstantiate(
+        exec.out(), graph.get(), nullptr, nullptr, 0));
+    CUDA_CHECK(cudaGraphUpload(exec.get(), nullptr));
+    return exec.release();
 }
 
 std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
@@ -442,13 +532,67 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     auto& pi = engine.inputs;
     auto& forward_fn = engine.forward_fn;
 
-    // Direct PTIR launches always take this path: the forward geometry is
-    // exact (a stage program runs after the model and cannot share the
-    // legacy graph variants that fused sampling into a captured forward),
-    // so rank-0 graph replay is unreachable here by construction. Graph
-    // capture/replay for decode-only shapes lives in
-    // `capture_forward_graph_lattice` (tp_size > 1 startup precapture) and
-    // `tp_follower_serve` (TP follower replay), not in this dispatcher.
+    const bool graph_eligible =
+        engine.graph_cache != nullptr &&
+        engine.forward_fn.graph_safe &&
+        in.is_pure_decode &&
+        !in.have_custom_mask &&
+        !in.rs_buffer_write &&
+        !in.rs_buffer_fold &&
+        graph_replay_has_no_host_resets(
+            in.use_slots,
+            in.is_fresh_h_data,
+            static_cast<std::size_t>(std::max(in.forward_R, 0))) &&
+        in.num_images == 0 &&
+        in.num_clips == 0 &&
+        in.stage_hooks == nullptr;
+    if (graph_eligible) {
+        const std::uint32_t graph_layout =
+            engine.forward_fn.invoke_graph_layout();
+        const std::uint32_t graph_variant =
+            make_graph_variant(
+                /*tp_greedy_argmax=*/false,
+                /*single_gpu_graph_argmax=*/false,
+                /*fwd_handles=*/false,
+                /*small_spec=*/false,
+                /*rs_verify=*/false,
+                graph_layout);
+        const ForwardGraphKey key{
+            in.forward_R,
+            in.forward_N,
+            graph_variant,
+            in.program_set_hash,
+            in.has_write_desc,
+            in.structured_window_left,
+        };
+        cudaGraphExec_t exec = engine.graph_cache->get(key);
+        if (exec == nullptr) {
+            exec = capture_forward_graph_exec(
+                engine,
+                in.h_qo_forward,
+                in.h_kvpi_forward,
+                in.h_kvpp_forward,
+                in.h_kvlpl_forward,
+                in.forward_N,
+                in.forward_R,
+                true,
+                in.use_slots ? in.slot_ids_h_data : nullptr,
+                in.use_slots ? in.is_fresh_h_data : nullptr,
+                in.use_slots ? pi.slot_ids.data() : nullptr,
+                nullptr,
+                0,
+                false,
+                false,
+                in.has_write_desc ? pi.w_page.data() : nullptr,
+                in.has_write_desc ? pi.w_off.data() : nullptr,
+                in.has_write_desc,
+                in.structured_window_left);
+            engine.graph_cache->put(key, exec);
+        }
+        CUDA_CHECK(cudaGraphLaunch(exec, cublas.stream()));
+        return;
+    }
+
     pie_cuda_driver::ForwardFn::ForwardInputs fwd_in;
     fwd_in.token_ids = reinterpret_cast<const std::int32_t*>(pi.tokens.data());
     fwd_in.positions = reinterpret_cast<const std::int32_t*>(pi.positions.data());
@@ -465,15 +609,22 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.is_pure_decode      = in.is_pure_decode;
     fwd_in.custom_mask_d        = in.have_custom_mask ? pi.custom_mask.data()        : nullptr;
     fwd_in.custom_mask_indptr_d = in.have_custom_mask ? pi.custom_mask_indptr.data() : nullptr;
+    fwd_in.runtime_window_left = in.structured_window_left;
     fwd_in.w_page_d             = in.has_write_desc ? pi.w_page.data() : nullptr;
     fwd_in.w_off_d              = in.has_write_desc ? pi.w_off.data()  : nullptr;
     fwd_in.has_write_desc       = in.has_write_desc;
     fwd_in.slot_ids_h          = in.use_slots ? in.slot_ids_h_data : nullptr;
     fwd_in.is_fresh_h          = in.use_slots ? in.is_fresh_h_data : nullptr;
     fwd_in.slot_ids_d          = in.use_slots ? pi.slot_ids.data() : nullptr;
+    fwd_in.rs_slot_flags_h     = in.use_slots
+        ? pi.rs_slot_flags_host.data()
+        : nullptr;
     fwd_in.rs_buffer_slot_ids_h    = in.rs_buffer_slot_ids_h;
     fwd_in.rs_buffer_slot_indptr_h = in.rs_buffer_slot_indptr_h;
+    fwd_in.rs_fold_lens_h           = in.rs_fold_lens_h;
+    fwd_in.rs_fold_lens_d           = in.rs_fold_lens_d;
     fwd_in.rs_buffer_write         = in.rs_buffer_write;
+    fwd_in.rs_buffer_fold          = in.rs_buffer_fold;
     // Compact/gathered logit rows are a legacy graph-variant fast path that
     // no direct-PTIR fire uses (the sampler reads straight out of ws.logits
     // via pi.sample_idx after this call — see batch/logits.hpp).
@@ -497,6 +648,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.audio_feature_byte_indptr_h  = in.audio_feature_byte_indptr_h;
     fwd_in.audio_anchor_rows_h          = in.audio_anchor_rows_h;
     fwd_in.num_clips                    = in.num_clips;
+    fwd_in.stage_hooks                  = in.stage_hooks;
     forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
 }
 

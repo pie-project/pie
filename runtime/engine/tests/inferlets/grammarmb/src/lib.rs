@@ -145,6 +145,7 @@ async fn main(input: String) -> Result<String> {
         let token = tok_out
             .take()
             .get::<i32>()
+            .await
             .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
 
         // Grammar conformance: the masked argmax MUST be in this request's alphabet.

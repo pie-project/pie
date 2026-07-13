@@ -1,4 +1,4 @@
-# PTIR Trace Container — wire format (`PTIR` v1)
+# PTIR Trace Container — wire format (`PTIR` v1/v2)
 
 The host↔driver encoding for a **traced pass** (thrust-3 P0.2): stage-tagged
 programs over the closed first-party op set, channel declarations,
@@ -50,19 +50,23 @@ Name[n_names]
 ChannelDecl[n_channels]
 PortBinding[n_ports]      (sorted by port tag, unique)
 StageProgram[n_stages]    (sorted by stage tag, unique — one program per stage)
+Extern[n_externs]         (v2)
 ```
 
-### 2.1 Header (24 bytes)
+### 2.1 Header
 
 | Offset | Field | Type | Notes |
 |---|---|---|---|
 | 0x00 | `magic` | 4×u8 | ASCII `"PTIR"` |
-| 0x04 | `version` | u16 | `1` |
+| 0x04 | `version` | u16 | `1` base, `2` externs |
 | 0x06 | `flags` | u16 | reserved, `0` |
 | 0x08 | `n_names` | u32 | name-table entries |
 | 0x0C | `n_channels` | u32 | |
 | 0x10 | `n_ports` | u32 | |
 | 0x14 | `n_stages` | u32 | |
+
+Version 1 ends at byte 24. Version 2 appends `n_externs:u32` at `0x18`.
+Version 3 is obsolete and rejected; there is no production compatibility path.
 
 ### 2.2 Name — `len:u16 | utf8[len]`
 
@@ -130,6 +134,9 @@ operands are `u32` value ids. `0x80` (v4 `input`) is reserved-unused in PTIR.
 | 0x62/0x63 | `scatter_add scatter_set` | `base:u32, idx:u32, vals:u32` | 1 |
 | 0x64 | `iota` | `len:u32` | 1 (U32 `[len]`) |
 | 0x65 | `mask_apply_packed` | `logits:u32, mask:u32` | 1 | (per-row: mask bit index = column `j mod n`) |
+| 0x66 | `causal_mask` | `positions:u32, len:u32` | 1 (Bool) |
+| 0x67 | `sliding_window_mask` | `positions:u32, len:u32, window:u32` | 1 (Bool) |
+| 0x68 | `sink_window_mask` | `positions:u32, len:u32, sink:u32, window:u32` | 1 (Bool) |
 | 0x70 | `rng` | `stream:u32, shape:Shape, kind:u8` | 1 |
 | 0x71 | `rng_keyed` | `state:u32, shape:Shape, kind:u8` | 1 |
 | 0x81 | `const` | `literal:5B` | 1 |
@@ -164,6 +171,10 @@ operands are `u32` value ids. `0x80` (v4 `input`) is reserved-unused in PTIR.
   logits[.., c] : -inf` with `bit_c = (mask[c>>5] >> (c&31)) & 1`, `c` the
   last-axis column (`flat_index mod n`), NEVER the flat element index.
   Per-row *distinct* masks are the composed bool form (`select`), not this op.
+- Causal/window/sink masks take U32 scalar-or-tensor query positions and append
+  a static key axis `len`. General row membership (including ancestry
+  membership) is expressed with reshape/iota/index arithmetic/gather/eq/cast/
+  reduce-max SSA; it has no dedicated opcode.
 - `chan_take`/`chan_read` yield the channel's declared `(shape, dtype)` with
   ACT materialized as F32; `chan_put` requires exactly that type.
 - `intrinsic_val`/`kernel_call` declare their (trace-known) result types;
@@ -178,27 +189,68 @@ operands are `u32` value ids. `0x80` (v4 `input`) is reserved-unused in PTIR.
 
 ## 5. Numeric + RNG contract (T8 — replay determinism; pinned)
 
-The tier-0 reference interpreter (`ptir::interp`, feature `eval`) is the
-normative golden model; every backend matches it **bit-for-bit on integer
-outputs and selections** (argmax/top-k indices, sort orders, mask bits) and to
-ULP-level on floats:
+The reference interpreter (`ptir::interp`, feature `eval`) defines semantic
+behavior. Within one backend, solo Tier 0, grouped Tier 0, singleton generated,
+and fused generated execution are bitwise-identical. Across CUDA, Metal, and
+the reference, integer, selection, tie, NaN, and RNG-hashing paths are bitwise;
+only backend transcendental implementations (`exp`, `log`) use a stated
+tolerance.
 
-- **argmax:** lower index wins ties; **NaN is never selected** (an all-NaN row
-  yields index 0).
+### 5.1 Canonical reduction schedule
+
+Reduction order depends only on the logical static row shape, never on launch
+configuration or grouped lane count:
+
+1. A logical tile contains 32 consecutive elements. Lane `l` owns element
+   `tile_base+l`; absent elements contribute the operation identity.
+2. A tile combines lanes with the fixed tree offsets `16,8,4,2,1`, always
+   evaluating the lower-index partial as the left operand.
+3. Rows longer than 32 produce tile partials in increasing tile order. Those
+   partials are reduced recursively by the same 32-wide tree until one value
+   remains.
+4. Sum starts at positive zero. Max/min and argmax carry `(have,value,index)` so
+   NaNs never win; equal argmax values retain the lower index. Max/min follow
+   IEEE maximumNumber/minimumNumber signed-zero behavior (`max(-0,+0)=+0`,
+   `min(-0,+0)=-0`).
+5. Scans use increasing logical index order. Sort/TopK use the total ordering
+   below and therefore do not depend on physical thread order.
+
+Generated code and both device singleton baselines implement this exact tree.
+The Rust reference uses the same tree for float accumulation, making identical
+non-transcendental reductions bitwise-comparable.
+
+### 5.2 Selection and RNG
+
+- **argmax:** lower index wins ties; integer inputs compare in their declared
+  signed/unsigned domain without float conversion; for F32, **NaN is never
+  selected** (an all-NaN row yields index 0).
 - **sort_desc / top_k:** descending; ties → lower original index first; NaN
   orders below −inf (i.e. last). `top_k` ≡ first k of `sort_desc` order.
 - **rank_le(k):** keep element iff `#{strictly greater} < k` — ties at the
   boundary may admit more than k elements. **cummass_le(p):** inclusive
   nucleus over the sort_desc order (keep while *exclusive* prefix mass < p).
   **prob_ge(t):** `x >= t`.
-- **`rng` (0x70, ambient seed):** unchanged from BYTECODE.md §5
-  (`seed_eff(S, stream)`, SplitMix64 mix, `sample_temp.cu` bit-parity).
+- **RNG contract ownership:** `src/rng.rs` is the normative constants/formula
+  contract. CUDA/C++ and MSL consume its checked-in generated projections;
+  backends retain their existing language-specific transcendental functions.
+- **`rng` (0x70, ambient seed):** `seed_eff(S, stream)`, SplitMix64 mix, and
+  `sample_temp.cu` bit-parity.
 - **`rng_keyed` (0x71, `state = [key, ctr]` U32):**
   `seed64 = splitmix64(((key as u64) << 32) | ctr)`; element `j` (row-major
   flat index over `shape`) draws `u = hash_uniform(seed64, j)` with the same
-  `splitmix64` / `hash_uniform` as BYTECODE.md §5; `uniform = u`,
+  canonical `splitmix64` / `hash_uniform`; `uniform = u`,
   `gumbel = -log(-log(u))`. Pure function of `(key, ctr, j)` — a replayed
   pipeline reproduces its tokens exactly.
+- The SDK nucleus helper is ordinary SSA: stabilized softmax,
+  `pivot_threshold(probabilities, cummass_le(top_p))`,
+  `select(keep, logits, -inf)`, keyed Gumbel noise, addition, and
+  `reduce_argmax`. Temperature is not part of the helper; scale logits with
+  ordinary SSA first.
+
+Direct bf16 logits consumption preserves the mathematical conversion
+`f32::from(bf16_bits)` per element. Moving the conversion from a gathered FP32
+buffer into generated-kernel registers is permitted only when differential
+tests prove identical converted bits before subsequent arithmetic.
 
 ## 6. Execution semantics the container does not encode
 
@@ -246,7 +298,7 @@ Extern[n_externs]  (sorted by chan, unique):  name:u16 | dir:u8 | chan:u32
 - Cross-instance POISON propagation is deliberately out of v1.1 (instance-
   local poison only) — revisit with the multi-model runtime.
 
-## 7. Bound-trace sidecar (`PTIB` v1) — the typed lowering
+## 7. Bound-trace sidecar (`PTIB` v2) — typed lowering and compiler plans
 
 Backends do NOT re-implement shape/dtype inference (T8 needs bit-identical
 shapes; `ptir::infer` is the single authority). At registration the host calls
@@ -254,7 +306,7 @@ shapes; `ptir::infer` is the single authority). At registration the host calls
 bytes)`; the sidecar is `ptir::sidecar::encode_bound(&BoundTrace)`:
 
 ```
-magic "PTIB" | version:u16 = 1 | flags:u16 = 0
+magic "PTIB" | version:u16 = 2 | flags:u16 = 0
 container_hash:u64            (REJECT if != FNV-1a64 of the container bytes)
 n_channels:u32
   class:u8                    (0 full_ring, 1 in_place, 2 in_place_undo)
@@ -264,7 +316,63 @@ n_readiness:u32
 n_stages:u32                  (container order)
   stage:u8 | n_values:u32
     dtype:u8 | shape           (per SSA value id, in order; ACT materialized)
+n_plans:u32
+  per stage: stage:u8 | plan_len:u32 | region_plan[plan_len]
 ```
+
+Version 1 sidecars remain readable and end after the type table. Version 2 is
+the production format. Each `PTRP` region plan contains the compiler version,
+canonical stage signature, symbolic value types, stage-local channel bindings,
+normalized operations with source mappings, and both singleton and fused
+partitions. Top-k, sort, scans, matmul, and second-party library cuts derive
+directly from opcodes. After normalization, the Rust compiler alone recognizes
+the exact nucleus SSA dataflow described in §5.2 and may emit one internal
+`PTIR_LIBRARY_NUCLEUS_SAMPLE` fused region. Drivers consume that decision and
+never pattern-match or recover it.
+
+The internal nucleus region contains all 13 dataflow nodes in topological
+order. Its role ABI is `inputs = [logits, top_p, rng_state]` and
+`outputs = [token]`, regardless of numeric value-id order. Any type, shape,
+connectivity, predicate, `-inf`, RNG-kind/state, or final-argmax mismatch stays
+generic. Singleton execution always remains the ordinary SSA fallback. Drivers
+reject malformed, mismatched, or unsupported plan versions at registration.
+
+Within `PTRP` normalized op records only, a zero dimension in a shape-bearing
+op is a symbolic placeholder (ordinary PTIR container dimensions remain
+concrete and nonzero). The corresponding value-type record names its
+`PtirSymbolicExtent`; lane-table ABI v2 supplies sampled/query/key and other
+runtime extent values. Generated code must resolve the symbolic type rather
+than treating the zero placeholder as an executable extent.
+
+### 7.1 Decoder resource limits and errors
+
+`PTIB` and `PTRP` are untrusted registration inputs. Rust and C++ readers
+preflight every wire count before allocation or iteration: conversion to
+`usize`/`size_t`, `count * minimum_record_bytes`, and the comparison with
+remaining input all use checked arithmetic. A declared payload length must fit
+the current record and the remaining buffer. An overrun is terminal; readers
+never continue a count-controlled loop with synthetic zero values.
+
+Schema-derived limits apply in addition to the byte budget:
+
+- `PTIB` has at most four typed stages and four plans, at most one readiness
+  entry per channel, rank at most `MAX_RANK = 4`, nonzero concrete dimensions
+  whose product fits `u64`, and plan payloads wholly contained in the sidecar.
+- `PTRP` has at most 65,536 local names (the `u16` index space). Its value count
+  must exactly equal the checked sum of normalized-op results (zero, one, or
+  two per op). Each partition has at most one region per op; node vectors are
+  bounded by the op table, input/output vectors by the value table, sink
+  vectors by their region's nodes, symbolic and op-shape ranks by four, and
+  variadic op arguments by their `u8` count.
+- The input byte length is the aggregate resource budget for all other tables.
+  Thus no count can request allocation or CPU work disproportionate to bytes
+  already supplied by the caller.
+
+Rust returns a decode error (`CountTooLarge`, truncation, invalid record/tag,
+or trailing bytes). C++ returns `false`, optionally supplies a stable diagnostic,
+and leaves the output empty; it performs an allocation-free validation pass
+before materializing a valid result. These checks do not change canonical
+`PTIB` v2, `PTRP` v4/compiler-v3, or readable legacy `PTIB` v1 bytes.
 
 Seed-independent and trace-known throughout ⇒ cache by `container_hash`
 alongside compiled kernels (the §7.3 registration discipline).

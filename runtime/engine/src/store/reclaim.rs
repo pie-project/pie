@@ -365,6 +365,8 @@ pub struct ContentionStats {
     pub suspend_rollbacks: std::sync::atomic::AtomicU64,
     pub restore_rollbacks: std::sync::atomic::AtomicU64,
     pub host_swap_exhaustions: std::sync::atomic::AtomicU64,
+    pub restore_prepared: std::sync::atomic::AtomicU64,
+    pub h2d_submitted: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -401,6 +403,8 @@ pub struct ContentionDiagnostics {
     pub suspend_rollbacks_total: u64,
     pub restore_rollbacks_total: u64,
     pub host_swap_exhaustions_total: u64,
+    pub restore_prepared_total: u64,
+    pub h2d_submitted_total: u64,
 }
 
 pub struct ContentionOrchestrator {
@@ -557,6 +561,8 @@ impl ContentionOrchestrator {
             suspend_rollbacks_total: self.stats.suspend_rollbacks.load(Relaxed),
             restore_rollbacks_total: self.stats.restore_rollbacks.load(Relaxed),
             host_swap_exhaustions_total: self.stats.host_swap_exhaustions.load(Relaxed),
+            restore_prepared_total: self.stats.restore_prepared.load(Relaxed),
+            h2d_submitted_total: self.stats.h2d_submitted.load(Relaxed),
         }
     }
 
@@ -589,6 +595,18 @@ impl ContentionOrchestrator {
     pub fn record_host_swap_exhaustion(&self) {
         self.stats
             .host_swap_exhaustions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_restore_prepared(&self) {
+        self.stats
+            .restore_prepared
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_h2d_submitted(&self) {
+        self.stats
+            .h2d_submitted
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 

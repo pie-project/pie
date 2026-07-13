@@ -45,6 +45,7 @@ struct ModelCapabilities {
     bool supports_compact_logits      = false;
     bool supports_small_prefill_graph = false;
     bool supports_fused_lmhead_argmax = false;
+    bool supports_runtime_window       = false;
 };
 
 // Polymorphic per-model interface. Implementations hold refs to per-arch

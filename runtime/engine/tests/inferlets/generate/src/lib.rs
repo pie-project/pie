@@ -82,7 +82,11 @@ async fn main(input: String) -> Result<String> {
     fwd_p
         .submit(&prefill)
         .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?[0];
+    let g0 = g0_ch
+        .take()
+        .get::<i32>()
+        .await
+        .map_err(|e| format!("g0 take: {e}"))?[0];
     prefill.close();
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
@@ -130,6 +134,7 @@ async fn main(input: String) -> Result<String> {
             let t = out
                 .take()
                 .get::<i32>()
+                .await
                 .map_err(|e| format!("out.take @{step}: {e}"))?;
             let Some(&t0) = t.first() else {
                 return Err(format!("out.take @{step}: empty tensor"));

@@ -27,7 +27,7 @@
 //! deferred host-writer-mask staging gap does not arise.
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 const B: u32 = 2; // beams
 const PAGE_T: u32 = 16; // tokens per pool page
@@ -66,12 +66,16 @@ async fn main(input: String) -> Result<String> {
     // and the copy_into move. Flat pool position `wpos` maps to physical page
     // `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let pool = ws.reserve(POOL_PAGES).map_err(|e| format!("ws.reserve pool: {e}"))?;
+    let pool = ws
+        .reserve(POOL_PAGES)
+        .map_err(|e| format!("ws.reserve pool: {e}"))?;
     let pool_ids: &'static Vec<u32> = bx(pool.ids().to_vec()); // [POOL_PAGES]
     let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect();
     let phys0 = pool_ids[0];
 
-    let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..POOL).map(|p| p == SRC_FLAT)).collect();
+    let init_mask: Vec<bool> = (0..B)
+        .flat_map(|_| (0..POOL).map(|p| p == SRC_FLAT))
+        .collect();
 
     // Loop-carried state (guest-seeded). klen stays at PAGE_T so the attention
     // scans ONLY the materialised page 0 (flat 0..15); the moved BOS cell lands at
@@ -157,7 +161,10 @@ async fn main(input: String) -> Result<String> {
         w_off.put(&w_off_v);
 
         let filled = add(&base, B);
-        klen.put(broadcast(reshape(&Tensor::constant(vec![PAGE_T]), [1]), [B]));
+        klen.put(broadcast(
+            reshape(&Tensor::constant(vec![PAGE_T]), [1]),
+            [B],
+        ));
 
         pos.put(add(pos.take(), 1u32));
         fill.put(&filled);
@@ -168,7 +175,9 @@ async fn main(input: String) -> Result<String> {
             [B * POOL_PAGES],
         );
         pages.put(&pages_ig);
-        page_indptr.put(&Tensor::constant((0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>()));
+        page_indptr.put(&Tensor::constant(
+            (0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>(),
+        ));
 
         out.put(&tok_i);
         out_par.put(&parent);
@@ -214,14 +223,17 @@ async fn main(input: String) -> Result<String> {
         let picked = out
             .take()
             .get::<i32>()
+            .await
             .map_err(|e| format!("out.take @{step}: {e}"))?;
         let _parents = out_par
             .take()
             .get::<u32>()
+            .await
             .map_err(|e| format!("out_par.take @{step}: {e}"))?;
         let _scr = out_scr
             .take()
             .get::<f32>()
+            .await
             .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);

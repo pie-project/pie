@@ -5,13 +5,16 @@
 // + the `__global__` tier-0 kernels live in `dispatch.cu`, so host `.cpp`
 // translation units that include `batch/forward.hpp` never pull device code (the
 // tier-0 headers only compile under nvcc). This is the driver half of the submission path: the
-// executor calls `run()` when a forward request carries `ptir_program_*`; the
-// dispatcher decodes (hash-cache), instantiates (persistent, by wire instance
-// id), fires, and harvests outputs. Owned once by `pipeline::Registry`
+// executor opens a launch before descriptor resolution, invokes the declared
+// model phases at their anatomical hooks, then atomically finishes after
+// lm_head. `run()` remains the boundary-stage convenience path used by focused
+// tests. Programs are decoded from compiler-owned PTRP plans and instances stay
+// persistent by wire id. Owned once by `pipeline::Registry`
 // (`registry.hpp`), which is the single construction site.
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -35,6 +38,40 @@ using namespace pie_native::ptir;
 class RetryableLaunchError : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
+};
+
+class StagedLaunch {
+  public:
+    ~StagedLaunch();
+    StagedLaunch(const StagedLaunch&) = delete;
+    StagedLaunch& operator=(const StagedLaunch&) = delete;
+
+    struct State;
+
+  private:
+    StagedLaunch();
+    std::unique_ptr<State> state_;
+    friend class Dispatch;
+};
+
+struct DispatchStats {
+    std::uint64_t grouped_tier0_groups = 0;
+    std::uint64_t grouped_lanes = 0;
+    std::uint64_t nucleus_library_groups = 0;
+    std::uint64_t selection_library_groups = 0;
+    std::uint64_t direct_bf16_groups = 0;
+    std::uint64_t direct_bf16_solo_materializations = 0;
+    std::uint64_t grouped_body_op_launches = 0;
+    std::uint64_t overlapped_groups = 0;
+    std::uint64_t ordered_alias_launches = 0;
+    std::uint64_t structured_mask_direct = 0;
+    std::uint64_t structured_mask_dense_fallback = 0;
+    std::uint64_t large_nucleus_scalable_groups = 0;
+    std::uint64_t shared_slot_exclusions = 0;
+    std::uint64_t rs_exclusions = 0;
+    std::uint64_t grouped_graph_cache_entries = 0;
+    std::uint64_t grouped_graph_captures = 0;
+    std::uint64_t grouped_graph_replays = 0;
 };
 
 class Dispatch {
@@ -63,13 +100,64 @@ class Dispatch {
 
     int validate_launch(const pie_native::LaunchView& view, std::string* err);
 
+    // Declared-phase execution. `begin` validates/pulls one logical fire and
+    // executes Prologue before descriptor resolution. Model hook points invoke
+    // `execute_attention_phase` for each layer. `finish` executes Epilogue and
+    // performs the sole atomic channel publication.
+    std::unique_ptr<StagedLaunch> begin(
+        const pie_native::LaunchView& view,
+        cudaStream_t stream);
+
+    void update_launch_geometry(
+        StagedLaunch& launch,
+        const pie_native::LaunchView& resolved_view,
+        std::span<const std::uint32_t> program_token_starts);
+
+    void execute_attention_phase(
+        StagedLaunch& launch,
+        std::uint8_t phase,
+        const void* query_data,
+        std::uint32_t query_rows,
+        std::uint32_t query_columns,
+        std::uint32_t layer,
+        cudaStream_t stream,
+        bool query_is_f32 = false);
+
+    bool finish(
+        StagedLaunch& launch,
+        const pie_native::LaunchView& view,
+        const void* logits, std::uint32_t vocab, cudaStream_t stream,
+        const PieRuntimeCallbacks* runtime,
+        PieCompletion completion,
+        const std::uint16_t* direct_bf16_logits = nullptr,
+        const std::uint32_t* direct_row_indices = nullptr,
+        std::span<const std::uint32_t> mtp_draft_row_starts = {},
+        std::span<const std::uint32_t> mtp_draft_row_counts = {},
+        std::uint32_t direct_bf16_row_capacity = 0);
+
+    void abort(StagedLaunch& launch, cudaStream_t stream) noexcept;
+
+    bool launch_has_attention_stages(
+        const pie_native::LaunchView& view) const;
+    void set_attention_hook_coverage(
+        bool supported,
+        std::uint32_t model_layers = 0);
+
     void close_instance(std::uint64_t instance_id);
     int close_channel(std::uint64_t channel_id, std::string* err);
 
     bool run(const pie_native::LaunchView& view,
              const void* logits, std::uint32_t vocab, cudaStream_t stream,
              const PieRuntimeCallbacks* runtime,
-             PieCompletion completion);
+             PieCompletion completion,
+             const std::uint16_t* direct_bf16_logits = nullptr,
+             const std::uint32_t* direct_row_indices = nullptr,
+             std::span<const std::uint32_t> mtp_draft_row_starts = {},
+             std::span<const std::uint32_t> mtp_draft_row_counts = {},
+             std::uint32_t direct_bf16_row_capacity = 0);
+
+    std::vector<std::uint32_t> mtp_draft_rows(
+        const pie_native::LaunchView& view) const;
 
     std::vector<std::pair<std::uint64_t, std::uint64_t>> settle_failed_launch(
         const pie_native::LaunchView& view,
@@ -92,7 +180,13 @@ class Dispatch {
                              std::uint32_t page_size,
                              std::uint32_t device_pages,
                              ResolvedPrograms& out,
-                             std::string* err);
+                             std::string* err,
+                             bool allow_structured_masks = false,
+                             StagedLaunch* launch = nullptr);
+
+    DispatchStats stats() const;
+    std::uint64_t compiled_program_set_hash(
+        const pie_native::LaunchView& view) const;
 
     struct Impl;
 

@@ -28,6 +28,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,6 +39,8 @@
 #include "pie_native/ptir/bound.hpp"
 #include "pipeline/channel_registry.hpp"
 #include "pie_native/ptir/container.hpp"
+#include "pie_native/ptir/plan.hpp"
+#include "pipeline/program_identity.hpp"
 #include "pipeline/tier0/tier0_runner.hpp"
 #include "pie_native/ptir/trace.hpp"
 
@@ -55,6 +59,147 @@ struct ChannelValue {
     std::vector<std::uint8_t> bytes;
 };
 
+inline bool validate_plan_structure(
+    const plan::StagePlan& stage,
+    std::string* error) {
+    auto fail = [&](const char* message) {
+        if (error != nullptr) *error = message;
+        return false;
+    };
+    std::uint32_t next = 0;
+    for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+        next += stage.ops[node].op.results;
+        for (const auto argument : stage.ops[node].op.args) {
+            if (argument >= stage.value_types.size()) {
+                return fail("region plan operand is out of range");
+            }
+        }
+        const auto& op = stage.ops[node].op;
+        if (op.tag == PTIR_OP_PIVOT_THRESHOLD &&
+            op.pred_payload >= stage.value_types.size()) {
+            return fail("region plan predicate is out of range");
+        }
+        if ((op.tag == PTIR_OP_CHAN_TAKE ||
+             op.tag == PTIR_OP_CHAN_READ ||
+             op.tag == PTIR_OP_CHAN_PUT) &&
+            (op.chan < 0 ||
+             static_cast<std::size_t>(op.chan) >=
+                 stage.channel_bindings.size())) {
+            return fail("region plan channel binding is out of range");
+        }
+    }
+    if (next != stage.value_types.size()) {
+        return fail("region plan value layout mismatch");
+    }
+    auto validate_partition = [&](const plan::Partition& partition) {
+        std::vector<std::uint8_t> covered(stage.ops.size(), 0);
+        for (const auto& region : partition.regions) {
+            if (region.nodes.empty()) return false;
+            for (const auto node : region.nodes) {
+                if (node >= stage.ops.size() || covered[node] != 0) {
+                   return false;
+                }
+                covered[node] = 1;
+            }
+            if (!region.library) {
+                if (region.schedule == PTIR_SCHEDULE_LIBRARY) return false;
+                continue;
+            }
+            if (region.schedule != PTIR_SCHEDULE_LIBRARY) {
+                return false;
+            }
+            if (region.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE) {
+                if (region.nodes.size() != 13 ||
+                    region.inputs.size() != 3 ||
+                    region.outputs.size() != 1 ||
+                    !region.sinks.empty()) {
+                    return false;
+                }
+                const auto logits = region.inputs[0];
+                const auto top_p = region.inputs[1];
+                const auto rng_state = region.inputs[2];
+                const auto token = region.outputs[0];
+                if (logits >= stage.value_types.size() ||
+                    top_p >= stage.value_types.size() ||
+                    rng_state >= stage.value_types.size() ||
+                    token >= stage.value_types.size() ||
+                    stage.value_types[logits].dtype != PTIR_DT_F32 ||
+                    stage.value_types[logits].dims.empty() ||
+                    stage.value_types[top_p].dtype != PTIR_DT_F32 ||
+                    stage.value_types[rng_state].dtype != PTIR_DT_U32 ||
+                    (stage.value_types[token].dtype != PTIR_DT_I32 &&
+                     stage.value_types[token].dtype != PTIR_DT_U32)) {
+                    return false;
+                }
+                continue;
+            }
+            if (region.nodes.size() != 1) return false;
+            const auto& op = stage.ops[region.nodes.front()].op;
+            const bool matches =
+                (region.library_op == PTIR_LIBRARY_TOP_K &&
+                 op.tag == PTIR_OP_TOP_K) ||
+                (region.library_op == PTIR_LIBRARY_SORT &&
+                 op.tag == PTIR_OP_SORT_DESC) ||
+                (region.library_op == PTIR_LIBRARY_SCAN &&
+                 (op.tag == PTIR_OP_CUMSUM ||
+                 op.tag == PTIR_OP_CUMPROD)) ||
+                (region.library_op == PTIR_LIBRARY_MATMUL &&
+                 op.tag == PTIR_OP_MATMUL) ||
+                (region.library_op == PTIR_LIBRARY_SECOND_PARTY &&
+                 op.tag == PTIR_OP_KERNEL_CALL);
+            if (!matches) return false;
+        }
+        return std::all_of(
+            covered.begin(), covered.end(),
+            [](std::uint8_t value) { return value != 0; });
+    };
+    if (!validate_partition(stage.singleton) ||
+        !validate_partition(stage.fused)) {
+        return fail("region plan partition/opcode mismatch");
+    }
+    return true;
+}
+
+inline bool validate_plan_bindings(
+    const plan::StagePlan& stage,
+    const container::CStage& source_stage,
+    std::string* error) {
+    auto fail = [&](const char* message) {
+        if (error != nullptr) *error = message;
+        return false;
+    };
+    for (const auto& normalized : stage.ops) {
+        const auto& op = normalized.op;
+        const bool channel_op =
+            op.tag == PTIR_OP_CHAN_TAKE ||
+            op.tag == PTIR_OP_CHAN_READ ||
+            op.tag == PTIR_OP_CHAN_PUT;
+        if (!channel_op) continue;
+        if (op.chan < 0 ||
+            static_cast<std::size_t>(op.chan) >=
+                stage.channel_bindings.size()) {
+            return fail("localized channel is out of range");
+        }
+        bool matched = false;
+        for (const auto source : normalized.source_ops) {
+            if (source >= source_stage.ops.size()) {
+                return fail("normalized source op is out of range");
+            }
+            const auto& source_op = source_stage.ops[source];
+            if (source_op.tag == op.tag && source_op.chan >= 0) {
+                matched = true;
+                if (stage.channel_bindings[
+                        static_cast<std::size_t>(op.chan)] !=
+                    static_cast<std::uint32_t>(source_op.chan)) {
+                    return fail("localized channel binding mismatch");
+                }
+            }
+        }
+        if (!matched) return fail("channel op has no matching source binding");
+    }
+    return true;
+}
+
 // C3 hash-keyed decoded-program cache. The `Trace` is folded once per identity
 // hash from the first fire's container + sidecar; steady-state fires reuse it.
 class PtirProgramCache {
@@ -68,7 +213,26 @@ class PtirProgramCache {
                                const std::uint8_t* sidecar_bytes, std::size_t sidecar_len,
                                std::string* err = nullptr) {
         auto it = programs_.find(hash);
-        if (it != programs_.end()) return &it->second;  // steady-state cache hit
+        if (it != programs_.end()) {
+            if (container_len != 0 || sidecar_len != 0) {
+                if (container_len == 0 || sidecar_len == 0 ||
+                    container_len != it->second.container_bytes.size() ||
+                    sidecar_len != it->second.sidecar_bytes.size() ||
+                    std::memcmp(
+                        container_bytes,
+                        it->second.container_bytes.data(),
+                        container_len) != 0 ||
+                    std::memcmp(
+                        sidecar_bytes,
+                        it->second.sidecar_bytes.data(),
+                        sidecar_len) != 0) {
+                    return fail(
+                        err,
+                        "ptir program hash collision or payload mismatch");
+                }
+            }
+            return &it->second.trace;
+        }
 
         if (container_len == 0 || sidecar_len == 0)
             return fail(err, "ptir program hash " + std::to_string(hash) +
@@ -98,19 +262,80 @@ class PtirProgramCache {
         bound::TranslateResult tr = bound::container_to_trace(c, b);
         if (!tr.ok) return fail(err, "ptir container->trace: " + tr.error);
 
-        auto ins = programs_.emplace(hash, std::move(tr.trace));
-        return &ins.first->second;
+        DecodedProgram decoded;
+        decoded.container_bytes.assign(
+            container_bytes, container_bytes + container_len);
+        decoded.sidecar_bytes.assign(
+            sidecar_bytes, sidecar_bytes + sidecar_len);
+        decoded.trace = std::move(tr.trace);
+        if (b.version != PTIB_VERSION ||
+            b.plans.size() != c.stages.size()) {
+            return fail(err, "ptir sidecar requires compiler v3 PTRP v4 plans");
+        }
+        decoded.plans.reserve(b.plans.size());
+        decoded.graph_stage_identities.reserve(b.plans.size());
+        for (std::size_t plan_index = 0;
+             plan_index < b.plans.size();
+             ++plan_index) {
+            const bound::StagePlan& encoded = b.plans[plan_index];
+            plan::StagePlan stage_plan;
+            std::string plan_error;
+            if (!plan::decode(
+                    encoded.bytes.data(), encoded.bytes.size(), stage_plan, &plan_error)) {
+                return fail(err, "ptir region plan: " + plan_error);
+            }
+            if (stage_plan.stage != encoded.stage ||
+                stage_plan.signature_hash == 0) {
+                return fail(err, "ptir region plan identity mismatch");
+            }
+            if (!validate_plan_structure(stage_plan, &plan_error)) {
+                return fail(err, "ptir region plan: " + plan_error);
+            }
+            if (!validate_plan_bindings(
+                    stage_plan,
+                    c.stages[plan_index],
+                    &plan_error)) {
+                return fail(
+                    err,
+                    "ptir region plan binding: " + plan_error);
+            }
+            decoded.graph_stage_identities.push_back(
+                compiled_stage_identity(stage_plan));
+            decoded.plans.push_back(std::move(stage_plan));
+        }
+        auto ins = programs_.emplace(hash, std::move(decoded));
+        return &ins.first->second.trace;
     }
 
     bool contains(std::uint64_t hash) const { return programs_.find(hash) != programs_.end(); }
     std::size_t size() const { return programs_.size(); }
+    const std::vector<plan::StagePlan>* plans(std::uint64_t hash) const {
+        auto it = programs_.find(hash);
+        return it == programs_.end() ? nullptr : &it->second.plans;
+    }
+    const std::vector<std::uint64_t>* graph_stage_identities(
+        std::uint64_t hash) const {
+        auto it = programs_.find(hash);
+        return it == programs_.end()
+            ? nullptr
+            : &it->second.graph_stage_identities;
+    }
 
   private:
+    struct DecodedProgram {
+        Trace trace;
+        std::vector<std::uint8_t> container_bytes;
+        std::vector<std::uint8_t> sidecar_bytes;
+        std::vector<plan::StagePlan> plans;
+        // Registration-time compact identities for the forward graph key.
+        // Steady-state fires fold these integers without touching plan bytes.
+        std::vector<std::uint64_t> graph_stage_identities;
+    };
     static const Trace* fail(std::string* e, const std::string& m) {
         if (e) *e = m;
         return nullptr;
     }
-    std::unordered_map<std::uint64_t, Trace> programs_;
+    std::unordered_map<std::uint64_t, DecodedProgram> programs_;
 };
 
 // Per-instance execution context: the shared cached `Trace` + a channel VIEW
@@ -276,7 +501,19 @@ class PtirInstance {
     std::uint32_t* commit_device_flag() const noexcept {
         return runner_.commit_device_flag();
     }
+    const std::vector<std::uint32_t>& commit_taken_slots() const noexcept {
+        return runner_.commit_taken_slots();
+    }
+    const std::vector<std::uint32_t>& commit_put_slots() const noexcept {
+        return runner_.commit_put_slots();
+    }
+    const Trace& trace() const noexcept { return *trace_; }
     void reset_commit(cudaStream_t stream) { runner_.reset_commit(stream); }
+    void finalize_commit(
+        cudaStream_t stream,
+        const std::uint32_t* commit_override = nullptr) {
+        runner_.finalize_commit(stream, commit_override);
+    }
     bool takes_channel(ChannelId dense) const { return fire_takes_channel(dense); }
     bool puts_channel(ChannelId dense) const {
         for (const Stage& stage : trace_->stages) {

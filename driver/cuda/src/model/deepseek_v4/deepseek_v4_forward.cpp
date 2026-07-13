@@ -1,4 +1,5 @@
 #include "model/deepseek_v4/deepseek_v4_forward.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -301,6 +302,11 @@ void dsv4_forward_paged(
         ops::gemm_act_x_w(cublas.handle(),
             ws.q_a.data(), make_weight_view(Lw.wq_b, Lw.wq_b_quant), ws.q.data(),
             N, num_heads * head_dim, q_lora);
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(num_heads * head_dim),
+            static_cast<std::uint32_t>(li), stream);
 
         // Per-head RMSNorm on Q (no gamma weight) — reference: q *= rsqrt(...)
         kernels::launch_per_head_rmsnorm_bf16(
@@ -320,7 +326,6 @@ void dsv4_forward_paged(
             ws.q.data(), ws.kv.data(),
             positions, N, num_heads, 1, head_dim, qk_rope,
             cfg.rope_theta, stream);
-
         {
             // SWA attention on ALL layers (every layer has a sliding window).
             auto lv = kv_cache.layer_view(li);
@@ -588,6 +593,11 @@ void dsv4_forward_paged(
                     static_cast<const float*>(Lw.attn_sink->data()),
                     N, num_heads, head_dim, stream);
             }
+            invoke_stage_hook(
+                StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(num_heads * head_dim),
+                static_cast<std::uint32_t>(li), stream);
 
             // Inverse RoPE on attention output (removes position info before projection)
             kernels::launch_rope_partial_last_bf16(

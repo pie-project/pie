@@ -27,8 +27,8 @@ async fn chat_completion_on_real_driver() -> Result<()> {
         pie.listen_addr
     );
 
-    // chat-completion is part of the standalone inferlet workspace.
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../inferlets");
+    // chat-completion is part of the curated inferlet test workspace.
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
     let dir = workspace.join("chat-completion");
     let ok = Command::new("cargo")
         .args([

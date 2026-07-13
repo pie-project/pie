@@ -138,6 +138,7 @@ struct LaunchScratch {
         view.qo_indptr = pie_native::slice_from_u32(launch.qo_indptr.ptr, launch.qo_indptr.len);
         view.rs_slot_ids = pie_native::slice_from_u32(launch.rs_slot_ids.ptr, launch.rs_slot_ids.len);
         view.rs_slot_flags = pie_native::slice_from_u8(launch.rs_slot_flags.ptr, launch.rs_slot_flags.len);
+        view.rs_fold_lens = pie_native::slice_from_u32(launch.rs_fold_lens.ptr, launch.rs_fold_lens.len);
         view.rs_buffer_slot_ids = pie_native::slice_from_u32(launch.rs_buffer_slot_ids.ptr, launch.rs_buffer_slot_ids.len);
         view.rs_buffer_slot_indptr = pie_native::slice_from_u32(launch.rs_buffer_slot_indptr.ptr, launch.rs_buffer_slot_indptr.len);
         view.flattened_masks = pie_native::slice_from_u32(launch.masks.words.ptr, launch.masks.words.len);
@@ -231,7 +232,7 @@ int configured_mtp_num_drafts(const pie_cuda_driver::Config& cfg) {
         return std::clamp(std::atoi(v), 0, 32);
     }();
     if (forced >= 0) return forced;
-    return cfg.model.mtp_num_drafts;
+    return std::clamp(cfg.model.mtp_num_drafts, 0, 32);
 }
 
 }  // namespace
@@ -532,6 +533,8 @@ int Context::Impl::load_model(
         multimodal_limits_.audio_mel_bins = plan_info.audio_mel_bins;
     }
     const int native_mtp_num_drafts = configured_mtp_num_drafts(cfg);
+    const bool has_mtp_logits =
+        plan_info.has_mtp && native_mtp_num_drafts > 0;
 
     const int local_tp_size = tp_size_;
     const int local_q_heads = engine.hf_config().num_attention_heads / local_tp_size;
@@ -597,6 +600,16 @@ int Context::Impl::load_model(
         family == model::Family::NemotronH, nemotron_h_mamba_layers,
         kv_format, runtime_quant_scratch_base, verbose);
     const int max_workspace_tokens = mem_plan.max_workspace_tokens;
+    if (native_mtp_num_drafts > 0 &&
+        mem_plan.max_requests >
+            std::numeric_limits<int>::max() / native_mtp_num_drafts) {
+        std::cerr << "[pie-driver-cuda] aggregate MTP draft capacity overflows\n";
+        return PIE_STATUS_UNSUPPORTED;
+    }
+    const int aggregate_mtp_draft_capacity =
+        plan_info.has_mtp
+            ? mem_plan.max_requests * native_mtp_num_drafts
+            : 0;
     const long kv_page_cap = [&]() -> long {
         if (const char* e = std::getenv("PIE_KV_PAGE_CAP")) {
             const long v = std::atol(e);
@@ -625,7 +638,8 @@ int Context::Impl::load_model(
     auto* ws_p = own_value(model::Workspace::allocate_full(
         engine.hf_config(), max_workspace_tokens,
         max_mlp_intermediate, max_Hq, max_Hk,
-        mem_plan.capacity.max_logit_rows));
+        mem_plan.capacity.max_logit_rows,
+        aggregate_mtp_draft_capacity));
     auto& ws = *ws_p;
 
     // KV-cache shape genuinely differs per family (MLA-backed families use
@@ -804,7 +818,8 @@ int Context::Impl::load_model(
         max_workspace_tokens,
         mem_plan.max_requests,
         mem_plan.max_page_refs,
-        mem_plan.capacity.max_custom_mask_bytes));
+        mem_plan.capacity.max_custom_mask_bytes,
+        aggregate_mtp_draft_capacity));
     auto& persistent_inputs = *persistent_inputs_p;
 
     model::LlamaLikeForwardCfg fwd_cfg{};
@@ -1001,6 +1016,16 @@ int Context::Impl::load_model(
     // (reverse-of-construction order): the engine's `dispatch` pointer is
     // never dangling.
     registry_ = own_emplace<pipeline::Registry>();
+    const bool complete_attention_hook_coverage =
+        tp_size_ == 1 &&
+        family != model::Family::Csm &&
+        !(family == model::Family::NemotronH &&
+          nemotron_h_attention_layer_count !=
+              engine.hf_config().num_hidden_layers);
+    registry_->dispatch().set_attention_hook_coverage(
+        complete_attention_hook_coverage,
+        static_cast<std::uint32_t>(
+            std::max(0, engine.hf_config().num_hidden_layers)));
 
     auto* executor_p = own_emplace<BatchEngine>(
         engine, ws, kv_cache, attn_ws, cublas,
@@ -1022,14 +1047,13 @@ int Context::Impl::load_model(
                    : &nemotron_h_state_cache));
     executor_p->dispatch = &registry_->dispatch();
     executor_ = executor_p;
+    const bool has_usable_mtp_logits =
+        has_mtp_logits && static_cast<bool>(executor_p->system_drafter);
 
     tp_startup_cpu_barrier(cfg);
-    // Rank-0 CUDA-graph replay is unreachable (direct PTIR launches always
-    // dispatch through `run_forward_dispatch`'s non-graph path — see
-    // batch/forward.hpp); only TP followers ever replay a captured graph
-    // (`tp_follower_serve`). Precapturing the full decode lattice on a
-    // single-GPU run therefore only costs startup time and VRAM for no
-    // benefit, so gate it on `tp_size_ > 1`.
+    // Single-GPU boundary-only PTIR launches can capture lazily on first use;
+    // anatomical-stage launches intentionally run the direct body. TP followers
+    // need the synchronized upfront lattice, so only TP pays startup capture.
     if (use_cuda_graphs && tp_size_ > 1) capture_forward_graph_lattice(*executor_);
     tp_startup_cpu_barrier(cfg);
 
@@ -1092,6 +1116,9 @@ int Context::Impl::load_model(
         {"rs_cache_required", rs_cache_required},
         {"rs_cache_slots", rs_cache_slots},
         {"rs_cache_slot_bytes", rs_cache_slot_bytes},
+        {"has_mtp_logits", has_usable_mtp_logits},
+        {"has_mtp_drafts", false},
+        {"has_value_head", false},
         {"max_forward_tokens", mem_plan.capacity.max_forward_tokens},
         {"max_forward_requests", max_forward_requests_caps},
         {"max_page_refs", mem_plan.capacity.max_page_refs},

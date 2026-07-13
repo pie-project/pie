@@ -44,7 +44,7 @@ async fn sliding_window_attention_on_real_driver() -> Result<()> {
         pie.listen_addr
     );
 
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../inferlets");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
     let dir = workspace.join("sliding-window-attention");
     let ok = Command::new("cargo")
         .args([

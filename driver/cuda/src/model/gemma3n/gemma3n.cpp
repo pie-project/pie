@@ -1,4 +1,5 @@
 #include "model/gemma3n/gemma3n.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <cmath>
 #include <stdexcept>
@@ -501,6 +502,11 @@ void gemma3n_forward_paged(
             ops::gemm_act_x_wt_bf16(cublas.handle(),
                 ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
         }
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L), stream);
         kernels::launch_rmsnorm_bf16(
             ws.q.data(), layer.q_norm->data(), ws.q.data(),
             N * num_q_heads_local, d, eps, stream);
@@ -563,6 +569,11 @@ void gemma3n_forward_paged(
                 N, R, num_q_heads_local, attn_ws, stream, layer_window,
                 /*logits_soft_cap=*/0.f, gemma3n_sm_scale);
         }
+        invoke_stage_hook(
+            StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L), stream);
 
         // o_proj → norm_x, post-attention norm → norm_y, residual. Under
         // TP this is row-parallel: all-reduce the partial before post-norm.

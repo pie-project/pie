@@ -1,4 +1,5 @@
 #include "model/kimi/kimi_forward.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -547,6 +548,11 @@ void kimi_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 kimi_ws.q_a.data(), *Lw.q_b_proj,
                 kimi_ws.q_b.data(), total_tokens, heads * (q_nope + q_rope), q_lora);
+            invoke_stage_hook(
+                StageHookPoint::OnAttnProj, kimi_ws.q_b.data(),
+                static_cast<std::uint32_t>(total_tokens),
+                static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
+                static_cast<std::uint32_t>(li), stream);
             kernels::launch_kimi_split_kv_a_norm_bf16(
                 kimi_ws.kv_a_mqa.data(), Lw.kv_a_norm->data(),
                 kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
@@ -607,6 +613,11 @@ void kimi_forward_paged(
                 kimi_ws.attn_latent.data(), Lw.kv_b_proj->data(),
                 kimi_ws.attn_v.data(),
                 total_tokens, heads, q_nope, v_dim, kv_lora, stream);
+            invoke_stage_hook(
+                StageHookPoint::OnAttn, kimi_ws.q_b.data(),
+                static_cast<std::uint32_t>(total_tokens),
+                static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
+                static_cast<std::uint32_t>(li), stream);
 
             if (T == 1) {
                 ops::gemm_act_x_w(cublas.handle(),

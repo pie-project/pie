@@ -1,9 +1,10 @@
 #pragma once
 
-// Metal's production PTIR engine intentionally executes channel-plane programs
-// on the CPU. CUDA's pipeline uses a GPU tier-0 runner; Metal keeps the same
-// module boundary while using this host interpreter until profiling justifies
-// a device execution plane. This is a C++ mirror of the canonical interpreter
+// Metal's temporary production PTIR engine executes channel-plane programs on
+// the CPU until Decision 7's generated singleton path passes its M1 gates.
+// M0 keeps this interpreter as the behavior oracle while moving its channel
+// authority into device-bindable Shared storage. This is a C++ mirror of the
+// canonical interpreter
 // (interface/ptir/src/interp.rs, the dummy driver's engine). Behavior is
 // pinned to that oracle: same readiness rule, same register-semantics commit
 // (take pops once, last put wins), same op semantics (argmax tie-break,
@@ -20,17 +21,17 @@
 //
 // Scope (direct_ffi_fix.md Phase 3 baseline; metal_ptir_plan.md Phase 1
 // extends it): programs whose values are Const / ChannelTake / ChannelRead /
-// OpResult / Intrinsic(Logits) / Intrinsic(MtpLogits) — the latter two need
-// a forward pass first (`ExecPlan::needs_logits` / `needs_mtp_logits`,
-// `PassInputs`, §5.3). Host inputs, per-layer taps, and other model
+// OpResult / Intrinsic(Logits). MtpLogits remains decodable only for oracle
+// tests and is rejected from production until bounded device storage exists.
+// Host inputs, per-layer taps, and other model
 // intrinsics (hidden/query/value-head) are not executable here — they need
 // backend feature work this increment does not add.
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -39,9 +40,12 @@
 #include <vector>
 
 #include "pie_native/ptir/bound.hpp"
+#include "pie_native/ptir/plan.hpp"
 #include "pie_native/ptir/container.hpp"
 #include "pie_native/ptir/op_table.hpp"
+#include "pie_native/ptir/rng_contract.generated.h"
 #include "pie_native/ptir/trace.hpp"
+#include "pipeline/shared_storage.hpp"
 
 namespace pie::metal::pipeline {
 
@@ -218,6 +222,11 @@ struct StagePlan {
     std::unordered_map<std::uint32_t, const cptir::Op*> op_by_result;
 };
 
+struct ConstPortValue {
+    std::uint8_t port = 0;
+    Value value;
+};
+
 // A registered program's decoded, executability-classified form.
 //
 // Classification, not a capability flag (metal_ptir_plan.md §3.2): a program
@@ -230,6 +239,8 @@ struct ExecPlan {
     Trace trace;
     cptir::bound::Bound bound;
     std::vector<StagePlan> stages;  // container order (mirrors trace.stages)
+    std::vector<cptir::plan::StagePlan> region_plans;
+    std::vector<ConstPortValue> const_ports;
     bool executable = false;
     std::string reject_reason;
     // Set together with `executable = true` when the program reads the base
@@ -266,12 +277,36 @@ struct ExecPlan {
     }
 
     // True if the launch path must run the forward before `step()`.
-    bool needs_forward() const { return needs_logits || needs_mtp_logits; }
+    bool needs_forward() const {
+        return needs_logits || needs_mtp_logits || !trace.ports.empty();
+    }
 };
 
+inline int bounded_mtp_row_base(
+    const ExecPlan& plan,
+    std::uint32_t vocab) {
+    if (!plan.needs_mtp_logits || vocab == 0) return -1;
+    std::uint64_t rows = 0;
+    for (const cptir::Value& value : plan.trace.values) {
+        if (value.source != cptir::ValueSource::Intrinsic ||
+            value.intrinsic != cptir::Intrinsic::Logits) {
+            continue;
+        }
+        const std::uint64_t numel =
+            value.type.shape.numel();
+        if (numel % vocab != 0) return -1;
+        rows = std::max(rows, numel / vocab);
+    }
+    return rows <=
+                   static_cast<std::uint64_t>(
+                       std::numeric_limits<int>::max())
+               ? static_cast<int>(rows)
+               : -1;
+}
+
 // Classify an already-translated Trace: split "rejected" (executable=false,
-// a precise reason) from "needs forward inputs" (needs_logits/
-// needs_mtp_logits, still executable). Pure function over the decoded Trace
+// a precise reason) from "needs forward inputs" (needs_logits). Pure function
+// over the decoded Trace
 // — no container/sidecar bytes involved — so callers (registration AND
 // tests) can classify a hand-built Trace directly.
 inline void classify_exec_plan(ExecPlan& out) {
@@ -286,17 +321,17 @@ inline void classify_exec_plan(ExecPlan& out) {
                     out.needs_logits = true;
                     break;
                 case cptir::Intrinsic::MtpLogits:
+                case cptir::Intrinsic::MtpDrafts:
+                    out.needs_logits = true;
                     out.needs_mtp_logits = true;
                     break;
                 default:
-                    // Hidden / Query / ValueHead (and any intrinsic tag the
-                    // shared bound.hpp does not map — it falls back to
-                    // Logits there, not here) — the Metal forward exposes no
-                    // per-layer taps or auxiliary heads in this increment.
+                    // The Metal forward exposes no per-layer taps, layer
+                    // ordinal, or auxiliary heads in this increment.
                     out.executable = false;
                     out.reject_reason =
-                        "program reads an unsupported model intrinsic (hidden/query/"
-                        "value-head; Metal forward not wired)";
+                        "program reads an unsupported model intrinsic "
+                        "(hidden/query/value-head/layer; Metal forward not wired)";
                     break;
             }
         } else if (v.source == cptir::ValueSource::HostInput) {
@@ -316,15 +351,196 @@ inline void classify_exec_plan(ExecPlan& out) {
     }
 }
 
+inline bool validate_region_plan_safety(
+    const cptir::plan::StagePlan& plan,
+    std::string& error) {
+    for (const auto& type : plan.value_types) {
+        std::uint64_t product = 1;
+        if (type.dims.size() > 4 || type.dtype > PTIR_DT_BOOL) {
+            error = "invalid normalized value type";
+            return false;
+        }
+        for (const auto& dimension : type.dims) {
+            if (dimension.symbolic) {
+                if (dimension.value < PTIR_EXTENT_KV_LEN ||
+                    dimension.value > PTIR_EXTENT_KEY_LEN) {
+                    error = "invalid symbolic extent role";
+                    return false;
+                }
+            } else if (
+                dimension.value == 0 ||
+                product >
+                    std::numeric_limits<std::uint32_t>::max() /
+                        dimension.value) {
+                error = "normalized value shape product exceeds u32";
+                return false;
+            } else {
+                product *= dimension.value;
+            }
+        }
+    }
+    std::uint32_t result_base = 0;
+    for (const auto& normalized : plan.ops) {
+        const auto& op = normalized.op;
+        if (!cptir::op_is_known(static_cast<OpCode>(op.tag))) {
+            error = "unknown normalized operation";
+            return false;
+        }
+        if (result_base >
+                std::numeric_limits<std::uint32_t>::max() -
+                    op.results ||
+            result_base + op.results > plan.value_types.size()) {
+            error = "normalized result range is invalid";
+            return false;
+        }
+        for (const std::uint32_t argument : op.args) {
+            if (argument >= result_base) {
+                error = "normalized SSA operand is not a prior value";
+                return false;
+            }
+        }
+        if (op.tag == PTIR_OP_PIVOT_THRESHOLD &&
+            (op.pred_tag > 2 || op.pred_payload >= result_base)) {
+            error = "pivot predicate payload is out of range";
+            return false;
+        }
+        if ((op.tag == PTIR_OP_CHAN_TAKE ||
+             op.tag == PTIR_OP_CHAN_READ ||
+             op.tag == PTIR_OP_CHAN_PUT) &&
+            (op.chan < 0 ||
+             static_cast<std::size_t>(op.chan) >=
+                 plan.channel_bindings.size())) {
+            error = "normalized channel slot is invalid";
+            return false;
+        }
+        result_base += op.results;
+    }
+    if (result_base != plan.value_types.size()) {
+        error = "normalized value layout does not match results";
+        return false;
+    }
+    return true;
+}
+
+inline bool decode_const_ports(
+    const std::uint8_t* data,
+    std::size_t len,
+    std::vector<ConstPortValue>& ports,
+    std::string& error) {
+    ports.clear();
+    cptir::container::detail::Cur cursor{data, len};
+    if (data == nullptr || len < 24 ||
+        std::memcmp(data, PTIR_MAGIC, 4) != 0) {
+        error = "invalid PTIR header while decoding const ports";
+        return false;
+    }
+    cursor.skip(4);
+    const std::uint16_t version = cursor.u16();
+    if (version != PTIR_VERSION && version != PTIR_VERSION_EXTERN) {
+        error = "unsupported PTIR version while decoding const ports";
+        return false;
+    }
+    cursor.u16();
+    const std::uint32_t name_count = cursor.u32();
+    const std::uint32_t channel_count = cursor.u32();
+    const std::uint32_t port_count = cursor.u32();
+    cursor.u32();
+    if (version == PTIR_VERSION_EXTERN) cursor.u32();
+    for (std::uint32_t name = 0; name < name_count; ++name) {
+        const std::uint16_t size = cursor.u16();
+        cursor.skip(size);
+    }
+    for (std::uint32_t channel = 0; channel < channel_count; ++channel) {
+        cursor.u8();
+        cursor.shape();
+        cursor.u32();
+        cursor.u8();
+        cursor.u8();
+    }
+    for (std::uint32_t index = 0; index < port_count; ++index) {
+        const std::uint8_t port = cursor.u8();
+        const std::uint8_t source = cursor.u8();
+        if (source == 0) {
+            cursor.u32();
+            continue;
+        }
+        if (source != 1) {
+            error = "invalid PTIR const-port source";
+            return false;
+        }
+        const std::uint8_t dtype = cursor.u8();
+        const cptir::container::CShape shape = cursor.shape();
+        std::size_t count = 1;
+        for (std::uint8_t dimension = 0; dimension < shape.rank;
+             ++dimension) {
+            if (shape.dims[dimension] == 0 ||
+                count > std::numeric_limits<std::size_t>::max() /
+                            shape.dims[dimension]) {
+                error = "invalid PTIR const-port shape";
+                return false;
+            }
+            count *= shape.dims[dimension];
+        }
+        const std::size_t element_bytes =
+            dtype == PTIR_DT_BOOL ? 1 : 4;
+        if (dtype > PTIR_DT_BOOL ||
+            count > std::numeric_limits<std::size_t>::max() /
+                        element_bytes ||
+            !cursor.need(count * element_bytes)) {
+            error = "invalid PTIR const-port payload";
+            return false;
+        }
+        const std::uint8_t* payload = data + cursor.i;
+        ConstPortValue decoded;
+        decoded.port = port;
+        if (dtype == PTIR_DT_F32) {
+            std::vector<float> values(count);
+            std::memcpy(values.data(), payload, count * sizeof(float));
+            decoded.value = Value::f32(std::move(values));
+        } else if (dtype == PTIR_DT_I32) {
+            std::vector<std::int32_t> values(count);
+            std::memcpy(
+                values.data(), payload, count * sizeof(std::int32_t));
+            decoded.value = Value::i32(std::move(values));
+        } else if (dtype == PTIR_DT_U32) {
+            std::vector<std::uint32_t> values(count);
+            std::memcpy(
+                values.data(), payload, count * sizeof(std::uint32_t));
+            decoded.value = Value::u32(std::move(values));
+        } else {
+            std::vector<std::uint8_t> values(payload, payload + count);
+            for (std::uint8_t& value : values) value = value != 0;
+            decoded.value = Value::boolean(std::move(values));
+        }
+        cursor.skip(count * element_bytes);
+        ports.push_back(std::move(decoded));
+    }
+    if (cursor.err) {
+        error = "PTIR const-port payload overruns container";
+        return false;
+    }
+    return true;
+}
+
 // Decode + classify. Registration never fails on executability — the launch
 // path rejects with `reject_reason` instead.
 inline bool build_exec_plan(const std::uint8_t* container_bytes, std::size_t container_len,
                             const std::uint8_t* sidecar_bytes, std::size_t sidecar_len,
                             ExecPlan& out, std::string* error) {
+    out = {};
     cptir::container::Container c;
     cptir::container::DecodeError derr;
     if (!cptir::container::decode(container_bytes, container_len, c, &derr)) {
         if (error != nullptr) *error = "container decode: " + derr.detail;
+        return false;
+    }
+    std::string const_error;
+    if (!decode_const_ports(
+            container_bytes,
+            container_len,
+            out.const_ports,
+            const_error)) {
+        if (error != nullptr) *error = const_error;
         return false;
     }
     if (sidecar_bytes == nullptr || sidecar_len == 0) {
@@ -337,13 +553,73 @@ inline bool build_exec_plan(const std::uint8_t* container_bytes, std::size_t con
         if (error != nullptr) *error = "sidecar decode: " + serr;
         return false;
     }
-    auto translated = cptir::bound::container_to_trace(c, out.bound);
+    cptir::container::Container translated_container = c;
+    for (auto& stage : translated_container.stages) {
+        std::vector<cptir::container::COp> lowered;
+        lowered.reserve(stage.ops.size());
+        for (auto op : stage.ops) {
+            if (op.tag == PTIR_OP_KERNEL_CALL) {
+                if (op.name_idx >= c.names.size() ||
+                    c.names[op.name_idx] != "metal.identity" ||
+                    op.args.size() != 1) {
+                    out.executable = false;
+                    out.reject_reason =
+                        "program requests an unsupported Metal semantic "
+                        "kernel boundary";
+                    return true;
+                }
+                op.tag = PTIR_OP_RESHAPE;
+                lowered.push_back(std::move(op));
+            } else if (op.tag == PTIR_OP_SINK_CALL) {
+                if (op.name_idx >= c.names.size() ||
+                    c.names[op.name_idx] != "metal.discard") {
+                    out.executable = false;
+                    out.reject_reason =
+                        "program requests an unsupported Metal semantic "
+                        "sink boundary";
+                    return true;
+                }
+            } else {
+                lowered.push_back(std::move(op));
+            }
+        }
+        stage.ops = std::move(lowered);
+    }
+    auto translated = cptir::bound::container_to_trace(
+        translated_container, out.bound);
     if (!translated.ok) {
         out.executable = false;
         out.reject_reason = translated.error;
         return true;
     }
     out.trace = std::move(translated.trace);
+    if (out.bound.version >= 2) {
+        if (out.bound.plans.size() != c.stages.size()) {
+            if (error != nullptr) *error = "compiler plan count does not match stages";
+            return false;
+        }
+        for (const cptir::bound::StagePlan& encoded : out.bound.plans) {
+            cptir::plan::StagePlan plan;
+            std::string plan_error;
+            if (!cptir::plan::decode(
+                    encoded.bytes.data(), encoded.bytes.size(), plan, &plan_error)) {
+                if (error != nullptr) *error = "compiler plan decode: " + plan_error;
+                return false;
+            }
+            if (plan.stage != encoded.stage || plan.signature_hash == 0) {
+                if (error != nullptr) *error = "compiler plan identity mismatch";
+                return false;
+            }
+            if (!validate_region_plan_safety(plan, plan_error)) {
+                if (error != nullptr) {
+                    *error =
+                        "compiler plan validation: " + plan_error;
+                }
+                return false;
+            }
+            out.region_plans.push_back(std::move(plan));
+        }
+    }
 
     std::uint32_t base = 0;
     for (std::size_t si = 0; si < out.trace.stages.size(); ++si) {
@@ -357,26 +633,183 @@ inline bool build_exec_plan(const std::uint8_t* container_bytes, std::size_t con
     }
 
     classify_exec_plan(out);
+    for (const auto& stage : c.stages) {
+        for (const auto& op : stage.ops) {
+            if ((op.tag == PTIR_OP_KERNEL_CALL ||
+                 op.tag == PTIR_OP_SINK_CALL) &&
+                (op.name_idx >= c.names.size() ||
+                 c.names[op.name_idx] !=
+                     (op.tag == PTIR_OP_KERNEL_CALL
+                          ? "metal.identity"
+                          : "metal.discard"))) {
+                out.executable = false;
+                out.needs_logits = false;
+                out.needs_mtp_logits = false;
+                out.reject_reason =
+                    "program requests an unsupported Metal semantic "
+                    "library boundary";
+            }
+        }
+    }
     return true;
 }
 
 // ─────────────────────────── instance state ────────────────────────────────
 
-// One channel's committed ring (interp.rs ChannelState). Extern channels
-// share one state across the exporting and importing instance.
+// One authoritative channel ring. The exact bytes and head/tail words exposed
+// through PieChannelEndpointBinding are the bytes the interpreter reads and
+// writes; Apple production allocations are MTLStorageModeShared and therefore
+// directly bindable by future generated kernels.
 struct ChannelState {
-    std::deque<Value> queue;
+    DType dtype = DType::F32;
+    std::size_t numel = 1;
     std::size_t capacity = 1;
-    Value last;
+    std::size_t cell_bytes = sizeof(float);
+    std::size_t cap1 = 2;
+    SharedStorage cells;
+    SharedStorage words;
+
+    ChannelState(
+        DType dtype_in,
+        std::size_t numel_in,
+        std::size_t capacity_in,
+        SharedStorage cells_in,
+        SharedStorage words_in)
+        : dtype(dtype_in == DType::Act ? DType::F32 : dtype_in),
+          numel(std::max<std::size_t>(numel_in, 1)),
+          capacity(std::max<std::size_t>(capacity_in, 1)),
+          cell_bytes(wire_cell_bytes(dtype, numel)),
+          cap1(capacity + 1),
+          cells(std::move(cells_in)),
+          words(std::move(words_in)) {}
+
+    bool valid() const {
+        return cells.valid() && words.valid() &&
+               cells.size >= cell_bytes * cap1 &&
+               words.size >= 4 * sizeof(std::uint64_t);
+    }
+
+    std::uint64_t load_word(std::size_t index) const {
+        auto* base = reinterpret_cast<std::uint64_t*>(words.contents);
+        return std::atomic_ref<std::uint64_t>(base[index])
+            .load(std::memory_order_acquire);
+    }
+
+    void store_word(std::size_t index, std::uint64_t value) {
+        auto* base = reinterpret_cast<std::uint64_t*>(words.contents);
+        std::atomic_ref<std::uint64_t>(base[index])
+            .store(value, std::memory_order_release);
+    }
+
+    std::uint64_t head() const { return load_word(0); }
+    std::uint64_t tail() const { return load_word(1); }
+    std::uint64_t poison() const { return load_word(2); }
+    std::uint64_t closed() const { return load_word(3); }
+
+    std::size_t size() const {
+        const std::uint64_t h = head();
+        const std::uint64_t t = tail();
+        return t >= h ? static_cast<std::size_t>(t - h) : 0;
+    }
+    bool empty() const { return size() == 0; }
+    bool full() const { return size() >= capacity; }
+
+    std::uint8_t* slot(std::uint64_t sequence) {
+        return cells.contents + (sequence % cap1) * cell_bytes;
+    }
+    const std::uint8_t* slot(std::uint64_t sequence) const {
+        return cells.contents + (sequence % cap1) * cell_bytes;
+    }
+
+    Value decode_sequence(std::uint64_t sequence) const {
+        Value value;
+        if (!decode_wire(slot(sequence), cell_bytes, dtype, numel, value)) {
+            return zeros(dtype, numel);
+        }
+        return value;
+    }
+
+    void encode_sequence(std::uint64_t sequence, const Value& value) {
+        encode_wire(value, slot(sequence));
+    }
+
+    Value front() const {
+        return decode_sequence(head());
+    }
+
+    Value current() const {
+        const std::uint64_t h = head();
+        if (tail() > h) return decode_sequence(h);
+        const std::uint64_t last_slot = (h + cap1 - 1) % cap1;
+        return decode_sequence(last_slot);
+    }
+
+    bool push(Value value) {
+        if (value.dtype != dtype || value.len() != numel || full()) return false;
+        const std::uint64_t t = tail();
+        encode_sequence(t, value);
+        store_word(1, t + 1);
+        return true;
+    }
+
+    bool pop(Value& value) {
+        if (empty()) return false;
+        const std::uint64_t h = head();
+        value = decode_sequence(h);
+        store_word(0, h + 1);
+        return true;
+    }
 };
+
+inline std::shared_ptr<ChannelState> make_host_channel_state(
+    DType dtype,
+    std::size_t numel,
+    std::size_t capacity) {
+    const DType concrete = dtype == DType::Act ? DType::F32 : dtype;
+    const std::size_t n = std::max<std::size_t>(numel, 1);
+    const std::size_t cap = std::max<std::size_t>(capacity, 1);
+    const std::size_t bytes = wire_cell_bytes(concrete, n);
+    auto state = std::make_shared<ChannelState>(
+        concrete,
+        n,
+        cap,
+        make_host_shared_storage(bytes * (cap + 1)),
+        make_host_shared_storage(4 * sizeof(std::uint64_t)));
+    return state->valid() ? state : nullptr;
+}
+
+inline std::shared_ptr<ChannelState> make_platform_channel_state(
+    DType dtype, std::size_t numel, std::size_t capacity) {
+    const DType concrete = dtype == DType::Act ? DType::F32 : dtype;
+    const std::size_t n = std::max<std::size_t>(numel, 1);
+    const std::size_t cap = std::max<std::size_t>(capacity, 1);
+    const std::size_t bytes = wire_cell_bytes(concrete, n);
+    auto state = std::make_shared<ChannelState>(
+        concrete,
+        n,
+        cap,
+        make_platform_shared_storage(bytes * (cap + 1)),
+        make_platform_shared_storage(4 * sizeof(std::uint64_t)));
+    return state->valid() ? state : nullptr;
+}
 
 struct InterpInstance {
     std::vector<std::shared_ptr<ChannelState>> channels;
     bool poisoned = false;
 };
 
-// Bind fresh channel state. `externs[dense]` (optional) supplies the shared
-// ring; `seeds[dense]` (optional) pre-fills one committed cell.
+inline InterpInstance make_instance(
+    const ExecPlan& plan,
+    const std::vector<std::shared_ptr<ChannelState>>& channels) {
+    InterpInstance inst;
+    if (channels.size() == plan.trace.channels.size()) {
+        inst.channels = channels;
+    }
+    return inst;
+}
+
+// Pure-host test helper. Production Registry bindings supply the endpoint's
+// platform-shared ChannelState through the overload above.
 inline InterpInstance make_instance(const ExecPlan& plan,
                                     const std::map<std::uint32_t, std::shared_ptr<ChannelState>>& externs,
                                     const std::map<std::uint32_t, Value>& seeds) {
@@ -386,15 +819,14 @@ inline InterpInstance make_instance(const ExecPlan& plan,
         auto shared = externs.find(static_cast<std::uint32_t>(ci));
         if (shared != externs.end()) {
             inst.channels.push_back(shared->second);
-            continue;
+        } else {
+            inst.channels.push_back(make_host_channel_state(
+                decl.type.dtype, decl.type.shape.numel(), decl.capacity));
         }
-        auto st = std::make_shared<ChannelState>();
-        st->capacity = decl.capacity;
-        const DType dt = decl.type.dtype == DType::Act ? DType::F32 : decl.type.dtype;
-        st->last = zeros(dt, decl.type.shape.numel());
         auto seed = seeds.find(static_cast<std::uint32_t>(ci));
-        if (seed != seeds.end()) st->queue.push_back(seed->second);
-        inst.channels.push_back(std::move(st));
+        if (seed != seeds.end() && inst.channels.back()->empty()) {
+            (void)inst.channels.back()->push(seed->second);
+        }
     }
     return inst;
 }
@@ -407,9 +839,7 @@ inline HostOp host_put(InterpInstance& inst, const ExecPlan& plan, std::uint32_t
     if (!decl.host_visible || decl.host_reader) return HostOp::WrongRole;
     if (!value_matches(v, decl.type)) return HostOp::TypeMismatch;
     ChannelState& st = *inst.channels[chan];
-    if (st.queue.size() >= st.capacity) return HostOp::WouldBlock;
-    st.queue.push_back(std::move(v));
-    return HostOp::Ok;
+    return st.push(std::move(v)) ? HostOp::Ok : HostOp::WouldBlock;
 }
 
 inline HostOp host_take(InterpInstance& inst, const ExecPlan& plan, std::uint32_t chan, Value& out) {
@@ -417,11 +847,7 @@ inline HostOp host_take(InterpInstance& inst, const ExecPlan& plan, std::uint32_
     const cptir::Channel& decl = plan.trace.channels[chan];
     if (!decl.host_reader) return HostOp::WrongRole;
     ChannelState& st = *inst.channels[chan];
-    if (st.queue.empty()) return HostOp::WouldBlock;
-    out = std::move(st.queue.front());
-    st.queue.pop_front();
-    st.last = out;
-    return HostOp::Ok;
+    return st.pop(out) ? HostOp::Ok : HostOp::WouldBlock;
 }
 
 // ───────────────────────────── op evaluation ────────────────────────────────
@@ -430,21 +856,137 @@ namespace detail {
 
 inline float neg_inf() { return -std::numeric_limits<float>::infinity(); }
 
-// argmax pinned contract: lower index wins ties; NaN never selected
-// (all-NaN row → 0).
-inline std::int32_t argmax_row(const float* row, std::size_t len) {
-    float best = 0.0f;
-    bool have = false;
-    std::size_t bi = 0;
-    for (std::size_t j = 0; j < len; ++j) {
-        const float x = row[j];
-        if (!std::isnan(x) && (!have || x > best)) {
-            best = x;
-            have = true;
-            bi = j;
-        }
+inline std::size_t canonical_rows(const cptir::Shape& shape) {
+    if (shape.dims.size() < 2) return 1;
+    std::size_t rows = 1;
+    for (std::size_t dimension = 0;
+         dimension + 1 < shape.dims.size();
+         ++dimension) {
+        rows *= shape.dims[dimension];
     }
-    return static_cast<std::int32_t>(bi);
+    return rows;
+}
+
+// Canonical logical width-32 tree shared with interface/ptir's reference.
+// Physical launch dimensions must never affect this order.
+template <class T, class Combine>
+inline T canonical_reduce(
+    const T* row,
+    std::size_t len,
+    T identity,
+    Combine combine) {
+    if (len == 0) return identity;
+    std::vector<T> level(row, row + len);
+    while (level.size() > 1) {
+        std::vector<T> next;
+        next.reserve((level.size() + 31) / 32);
+        for (std::size_t base = 0; base < level.size(); base += 32) {
+            T lanes[32];
+            std::fill(std::begin(lanes), std::end(lanes), identity);
+            const std::size_t count = std::min<std::size_t>(32, level.size() - base);
+            std::copy_n(level.data() + base, count, lanes);
+            for (const std::size_t offset : {16u, 8u, 4u, 2u, 1u}) {
+                for (std::size_t lane = 0; lane < offset; ++lane) {
+                    lanes[lane] = combine(lanes[lane], lanes[lane + offset]);
+                }
+            }
+            next.push_back(lanes[0]);
+        }
+        level = std::move(next);
+    }
+    return level[0];
+}
+
+struct ArgmaxCandidate {
+    float value = neg_inf();
+    std::uint32_t index = 0;
+    bool have = false;
+};
+
+struct IntArgmaxCandidate {
+    std::int64_t value = 0;
+    std::uint32_t index = 0;
+    bool have = false;
+};
+
+inline ArgmaxCandidate combine_argmax(
+    ArgmaxCandidate left,
+    ArgmaxCandidate right) {
+    if (!right.have) return left;
+    if (!left.have || right.value > left.value ||
+        (right.value == left.value && right.index < left.index)) {
+        return right;
+    }
+    return left;
+}
+
+inline IntArgmaxCandidate combine_int_argmax(
+    IntArgmaxCandidate left,
+    IntArgmaxCandidate right) {
+    if (!right.have) return left;
+    if (!left.have || right.value > left.value ||
+        (right.value == left.value && right.index < left.index)) {
+        return right;
+    }
+    return left;
+}
+
+inline float canonical_max(float left, float right) {
+    const bool left_nan = std::isnan(left);
+    const bool right_nan = std::isnan(right);
+    if (left_nan && right_nan) return neg_inf();
+    if (left_nan) return right;
+    if (right_nan) return left;
+    if (left == 0.0f && right == 0.0f) {
+        return std::signbit(left) && std::signbit(right) ? -0.0f : 0.0f;
+    }
+    return std::fmax(left, right);
+}
+
+inline float canonical_min(float left, float right) {
+    const bool left_nan = std::isnan(left);
+    const bool right_nan = std::isnan(right);
+    if (left_nan && right_nan) return std::numeric_limits<float>::infinity();
+    if (left_nan) return right;
+    if (right_nan) return left;
+    if (left == 0.0f && right == 0.0f) {
+        return std::signbit(left) || std::signbit(right) ? -0.0f : 0.0f;
+    }
+    return std::fmin(left, right);
+}
+
+// Argmax pinned contract: lower index wins ties; NaN never selected
+// (all-NaN row → 0), evaluated through the canonical tree.
+inline std::int32_t argmax_row(const float* row, std::size_t len) {
+    std::vector<ArgmaxCandidate> candidates;
+    candidates.reserve(len);
+    for (std::size_t j = 0; j < len; ++j) {
+        candidates.push_back(
+            {row[j], static_cast<std::uint32_t>(j), !std::isnan(row[j])});
+    }
+    const ArgmaxCandidate result = canonical_reduce(
+        candidates.data(),
+        candidates.size(),
+        ArgmaxCandidate{},
+        combine_argmax);
+    return static_cast<std::int32_t>(result.index);
+}
+
+inline std::int32_t argmax_row_i64(
+    const std::int64_t* row, std::size_t len) {
+    std::vector<IntArgmaxCandidate> candidates;
+    candidates.reserve(len);
+    for (std::size_t index = 0; index < len; ++index) {
+        candidates.push_back({
+            row[index], static_cast<std::uint32_t>(index), true});
+    }
+    return static_cast<std::int32_t>(
+        canonical_reduce(
+            candidates.data(),
+            candidates.size(),
+            IntArgmaxCandidate{},
+            combine_int_argmax)
+            .index);
 }
 
 // sort_desc pinned contract: descending; ties → lower original index; NaN
@@ -465,25 +1007,11 @@ inline std::vector<std::uint32_t> sort_desc_order(const float* row, std::size_t 
     return idx;
 }
 
-inline std::uint64_t splitmix64(std::uint64_t x) {
-    x ^= x >> 27;
-    x *= 0x3C79AC492BA7B653ULL;
-    x ^= x >> 33;
-    x *= 0x1C69B3F74AC4AE35ULL;
-    x ^= x >> 27;
-    return x;
-}
-
-inline float hash_uniform(std::uint64_t seed_eff, std::uint32_t j) {
-    const std::uint64_t x = seed_eff + 0x9E3779B97F4A7C15ULL * (static_cast<std::uint64_t>(j) + 1);
-    const std::uint32_t bits = static_cast<std::uint32_t>(splitmix64(x) >> 40);
-    return (static_cast<float>(bits) + 0.5f) * (1.0f / 16777216.0f);
-}
-
 inline std::vector<float> rng_lanes(std::uint64_t seed_eff, std::size_t n, bool gumbel) {
     std::vector<float> o(n);
     for (std::size_t j = 0; j < n; ++j) {
-        const float u = hash_uniform(seed_eff, static_cast<std::uint32_t>(j));
+        const float u =
+            ptir_rng_hash_uniform(seed_eff, static_cast<std::uint32_t>(j));
         o[j] = gumbel ? -std::log(-std::log(u)) : u;
     }
     return o;
@@ -626,7 +1154,7 @@ struct Overlay {
         auto p = pending.find(chan);
         if (p != pending.end()) return p->second;
         const ChannelState& st = *inst.channels[chan];
-        return st.queue.empty() ? st.last : st.queue.front();
+        return st.current();
     }
     Value take(const InterpInstance& inst, std::uint32_t chan) {
         taken[chan] = 1;
@@ -844,7 +1372,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
 
         case OpCode::ReduceSum: case OpCode::ReduceMax: case OpCode::ReduceMin: {
             const cptir::TensorType& t = ty(a0);
-            const std::size_t rows = t.shape.rows();
+            const std::size_t rows = canonical_rows(t.shape);
             const Value& data = v(a0);
             const std::size_t len = rows == 0 ? 0 : data.len() / rows;
             if (t.dtype == DType::F32 || t.dtype == DType::Act) {
@@ -852,18 +1380,20 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
                 std::vector<float> o(rows);
                 for (std::size_t r = 0; r < rows; ++r) {
                     const float* row = x.data() + r * len;
-                    float acc;
                     if (op.code == OpCode::ReduceSum) {
-                        acc = 0.0f;
-                        for (std::size_t j = 0; j < len; ++j) acc += row[j];
+                        o[r] = canonical_reduce(
+                            row, len, 0.0f,
+                            [](float left, float right) { return left + right; });
                     } else if (op.code == OpCode::ReduceMax) {
-                        acc = neg_inf();
-                        for (std::size_t j = 0; j < len; ++j) acc = std::fmax(acc, row[j]);
+                        o[r] = canonical_reduce(
+                            row, len, neg_inf(), canonical_max);
                     } else {
-                        acc = std::numeric_limits<float>::infinity();
-                        for (std::size_t j = 0; j < len; ++j) acc = std::fmin(acc, row[j]);
+                        o[r] = canonical_reduce(
+                            row,
+                            len,
+                            std::numeric_limits<float>::infinity(),
+                            canonical_min);
                     }
-                    o[r] = acc;
                 }
                 return out(Value::f32(std::move(o)));
             }
@@ -871,34 +1401,61 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             std::vector<std::int64_t> o(rows);
             for (std::size_t r = 0; r < rows; ++r) {
                 const std::int64_t* row = x.data() + r * len;
-                std::int64_t acc = 0;
                 if (op.code == OpCode::ReduceSum) {
-                    for (std::size_t j = 0; j < len; ++j) acc += row[j];
-                } else if (len == 0) {
-                    acc = 0;
+                    o[r] = canonical_reduce(
+                        row,
+                        len,
+                        std::int64_t{0},
+                        [](std::int64_t left, std::int64_t right) {
+                            const std::uint64_t bits =
+                                static_cast<std::uint64_t>(left) +
+                                static_cast<std::uint64_t>(right);
+                            std::int64_t value;
+                            std::memcpy(&value, &bits, sizeof(value));
+                            return value;
+                        });
                 } else if (op.code == OpCode::ReduceMax) {
-                    acc = row[0];
-                    for (std::size_t j = 1; j < len; ++j) acc = std::max(acc, row[j]);
+                    o[r] = canonical_reduce(
+                        row,
+                        len,
+                        std::numeric_limits<std::int64_t>::min(),
+                        [](std::int64_t left, std::int64_t right) {
+                            return std::max(left, right);
+                        });
                 } else {
-                    acc = row[0];
-                    for (std::size_t j = 1; j < len; ++j) acc = std::min(acc, row[j]);
+                    o[r] = canonical_reduce(
+                        row,
+                        len,
+                        std::numeric_limits<std::int64_t>::max(),
+                        [](std::int64_t left, std::int64_t right) {
+                            return std::min(left, right);
+                        });
                 }
-                o[r] = acc;
             }
             return out(from_i64(t.dtype, o));
         }
         case OpCode::ReduceArgmax: {
             const cptir::TensorType& t = ty(a0);
-            const std::size_t rows = t.shape.rows();
-            const auto x = lanes_f32(v(a0));
-            const std::size_t len = rows == 0 ? 0 : x.size() / rows;
+            const std::size_t rows = canonical_rows(t.shape);
+            const Value& data = v(a0);
+            const std::size_t len = rows == 0 ? 0 : data.len() / rows;
             std::vector<std::int32_t> o(rows);
-            for (std::size_t r = 0; r < rows; ++r) o[r] = argmax_row(x.data() + r * len, len);
+            if (t.dtype == DType::F32 || t.dtype == DType::Act) {
+                const auto x = lanes_f32(data);
+                for (std::size_t r = 0; r < rows; ++r) {
+                    o[r] = argmax_row(x.data() + r * len, len);
+                }
+            } else {
+                const auto x = lanes_i64(data);
+                for (std::size_t r = 0; r < rows; ++r) {
+                    o[r] = argmax_row_i64(x.data() + r * len, len);
+                }
+            }
             return out(Value::i32(std::move(o)));
         }
         case OpCode::CumSum: case OpCode::CumProd: {
             const cptir::TensorType& t = ty(a0);
-            const std::size_t rows = t.shape.rows();
+            const std::size_t rows = canonical_rows(t.shape);
             const auto x = lanes_f32(v(a0));
             const std::size_t len = rows == 0 ? 0 : x.size() / rows;
             const bool is_sum = op.code == OpCode::CumSum;
@@ -939,7 +1496,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
         }
         case OpCode::TopK: {
             const cptir::TensorType& t = ty(a0);
-            const std::size_t rows = t.shape.rows();
+            const std::size_t rows = canonical_rows(t.shape);
             const auto x = lanes_f32(v(a0));
             const std::size_t len = rows == 0 ? 0 : x.size() / rows;
             const std::size_t k = op.imm;
@@ -978,7 +1535,7 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
         }
         case OpCode::PivotThreshold: {
             const cptir::TensorType& t = ty(a0);
-            const std::size_t rows = t.shape.rows();
+            const std::size_t rows = canonical_rows(t.shape);
             const auto x = lanes_f32(v(a0));
             const std::size_t len = rows == 0 ? 0 : x.size() / rows;
             std::vector<std::uint8_t> keep(x.size(), 0);
@@ -1119,11 +1676,52 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             }
             return out(Value::f32(std::move(o)));
         }
+        case OpCode::CausalMask:
+        case OpCode::SlidingWindowMask:
+        case OpCode::SinkWindowMask: {
+            const Value& positions = v(a0);
+            if (positions.dtype != DType::U32) {
+                return fault("structured mask positions");
+            }
+            const std::uint32_t key_count = op.imm;
+            const std::uint32_t window =
+                op.code == OpCode::SlidingWindowMask
+                    ? op.imm2
+                    : op.imm3;
+            auto saturating_add = [](
+                                      std::uint32_t left,
+                                      std::uint32_t right) {
+                return left >
+                               std::numeric_limits<std::uint32_t>::max() -
+                                   right
+                           ? std::numeric_limits<std::uint32_t>::max()
+                           : left + right;
+            };
+            std::vector<std::uint8_t> mask;
+            mask.reserve(
+                positions.u.size() *
+                static_cast<std::size_t>(key_count));
+            for (const std::uint32_t position : positions.u) {
+                for (std::uint32_t key = 0; key < key_count; ++key) {
+                    bool allowed = key <= position;
+                    if (allowed &&
+                        op.code != OpCode::CausalMask) {
+                        const bool recent =
+                            saturating_add(key, window) > position;
+                        allowed =
+                            op.code == OpCode::SlidingWindowMask
+                                ? recent
+                                : (key < op.imm2 || recent);
+                    }
+                    mask.push_back(allowed ? 1 : 0);
+                }
+            }
+            return out(Value::boolean(std::move(mask)));
+        }
         case OpCode::Rng: {
             // Ambient-seed form: per-fire seed 0 in the reference interpreter.
-            const std::uint64_t salt = splitmix64(static_cast<std::uint64_t>(op.imm) *
-                                                  0x9E3779B97F4A7C15ULL);
-            const std::uint64_t seed_eff = 0xA5A5A5A5ULL ^ salt;
+            const std::uint64_t seed_eff =
+                ptir_rng_seed_eff_stream(0, op.imm);
             const std::size_t n = static_cast<std::size_t>(op.result_type.shape.numel());
             return out(Value::f32(rng_lanes(seed_eff, n, op.rng_kind == cptir::RngKind::Gumbel)));
         }
@@ -1131,10 +1729,19 @@ inline bool eval_op(const cptir::Op& op, const Trace& trace, std::vector<Value>&
             const auto st = lanes_i64(v(a0));
             const std::uint64_t key = static_cast<std::uint64_t>(st[0]) & 0xFFFFFFFFULL;
             const std::uint64_t ctr = st.size() > 1 ? static_cast<std::uint64_t>(st[1]) & 0xFFFFFFFFULL : 0;
-            const std::uint64_t seed64 = splitmix64((key << 32) | ctr);
+            const std::uint64_t seed64 = ptir_rng_keyed_seed(
+                static_cast<std::uint32_t>(key),
+                static_cast<std::uint32_t>(ctr));
             const std::size_t n = static_cast<std::size_t>(op.result_type.shape.numel());
             return out(Value::f32(rng_lanes(seed64, n, op.rng_kind == cptir::RngKind::Gumbel)));
         }
+        case OpCode::KernelCall:
+            if (op.args.size() != 1) {
+                return fault("Metal identity boundary arity");
+            }
+            return out(v(a0));
+        case OpCode::SinkCall:
+            return true;
 
         default:
             return fault(std::string("op not executable on the Metal host interpreter: ") +
@@ -1171,11 +1778,12 @@ inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePl
                 vals[id] = ov.resolve(inst, root.channel);
                 break;
             case cptir::ValueSource::Intrinsic: {
-                // Only Logits/MtpLogits reach here — classify_exec_plan()
+                // Only bounded logits/MTP roots reach here — classify_exec_plan()
                 // rejects every other intrinsic before a program is
                 // launchable, so any other tag means a plan/interp drift.
                 if (root.intrinsic != cptir::Intrinsic::Logits &&
-                    root.intrinsic != cptir::Intrinsic::MtpLogits) {
+                    root.intrinsic != cptir::Intrinsic::MtpLogits &&
+                    root.intrinsic != cptir::Intrinsic::MtpDrafts) {
                     error = "unresolved value root (unsupported intrinsic) reached execution";
                     return false;
                 }
@@ -1184,24 +1792,60 @@ inline bool exec_stage(InterpInstance& inst, const ExecPlan& plan, const StagePl
                     return false;
                 }
                 const std::uint64_t want = std::max<std::uint64_t>(root.type.shape.numel(), 1);
-                if (want % in.vocab != 0) {
+                const bool drafts =
+                    root.intrinsic == cptir::Intrinsic::MtpDrafts;
+                const std::uint64_t rows_needed =
+                    drafts ? want : (want / in.vocab);
+                if (!drafts && want % in.vocab != 0) {
                     error = "logits intrinsic shape mismatch (program vocab != model vocab)";
                     return false;
                 }
-                const std::uint64_t rows_needed = want / in.vocab;
                 std::uint32_t base_row = 0;
-                if (root.intrinsic == cptir::Intrinsic::MtpLogits && in.mtp_draft_row >= 0) {
+                if ((root.intrinsic == cptir::Intrinsic::MtpLogits ||
+                     drafts) &&
+                    in.mtp_draft_row >= 0) {
                     base_row = static_cast<std::uint32_t>(in.mtp_draft_row);
                 }
                 if (static_cast<std::uint64_t>(base_row) + rows_needed > in.rows) {
                     error = "logits intrinsic row range exceeds the forward's readout rows";
                     return false;
                 }
-                std::vector<float> lane(want);
-                std::memcpy(lane.data(),
-                           in.logits + static_cast<std::size_t>(base_row) * in.vocab,
-                           want * sizeof(float));
-                vals[id] = Value::f32(std::move(lane));
+                if (drafts) {
+                    std::vector<std::int32_t> tokens(want, 0);
+                    for (std::size_t row = 0; row < want; ++row) {
+                        const float* logits =
+                            in.logits +
+                            (static_cast<std::size_t>(base_row) + row) *
+                                in.vocab;
+                        bool have = false;
+                        float best = neg_inf();
+                        std::uint32_t best_index = 0;
+                        for (std::uint32_t column = 0;
+                             column < in.vocab;
+                             ++column) {
+                            const float value = logits[column];
+                            if (!std::isnan(value) &&
+                                (!have || value > best ||
+                                 (value == best &&
+                                  column < best_index))) {
+                                have = true;
+                                best = value;
+                                best_index = column;
+                            }
+                        }
+                        tokens[row] =
+                            static_cast<std::int32_t>(best_index);
+                    }
+                    vals[id] = Value::i32(std::move(tokens));
+                } else {
+                    std::vector<float> lane(want);
+                    std::memcpy(
+                        lane.data(),
+                        in.logits +
+                            static_cast<std::size_t>(base_row) * in.vocab,
+                        want * sizeof(float));
+                    vals[id] = Value::f32(std::move(lane));
+                }
                 break;
             }
             default:
@@ -1237,8 +1881,8 @@ inline StepResult step(InterpInstance& inst, const ExecPlan& plan, const PassInp
     for (const auto& e : plan.bound.readiness) {
         const ChannelState& st = *inst.channels[e.chan];
         const bool ok = e.dir == cptir::container::Direction::NeedsFull
-                            ? !st.queue.empty()
-                            : st.queue.size() < st.capacity;
+                            ? !st.empty()
+                            : !st.full();
         if (!ok) {
             result.ok = true;
             result.committed = false;
@@ -1276,22 +1920,56 @@ inline StepResult step(InterpInstance& inst, const ExecPlan& plan, const PassInp
         return result;
     }
 
+    // Validate every resulting ring state before writing a pending cell or
+    // publishing any head/tail word. This keeps a semantic fault pass-atomic.
+    std::vector<std::uint64_t> old_tails(inst.channels.size(), 0);
+    std::vector<std::uint64_t> new_heads(inst.channels.size(), 0);
+    std::vector<std::uint64_t> new_tails(inst.channels.size(), 0);
     for (std::size_t ci = 0; ci < inst.channels.size(); ++ci) {
         ChannelState& st = *inst.channels[ci];
-        if (ov.taken[ci] && !st.queue.empty()) {
-            st.last = std::move(st.queue.front());
-            st.queue.pop_front();
+        const std::uint64_t head = st.head();
+        const std::uint64_t tail = st.tail();
+        if (tail < head) {
+            inst.poisoned = true;
+            result.error = "channel " + std::to_string(ci) +
+                           ": tail precedes head at commit";
+            return result;
+        }
+        std::uint64_t next_head = head;
+        std::uint64_t next_tail = tail;
+        std::uint64_t used = tail - head;
+        if (ov.taken[ci] && used != 0) {
+            ++next_head;
+            --used;
         }
         if (ov.put[ci]) {
-            if (st.queue.size() >= st.capacity) {
-                // A non-leading put into a still-full ring — device fault.
+            if (used >= st.capacity) {
                 inst.poisoned = true;
-                result.error = "channel " + std::to_string(ci) + ": put overflows capacity " +
+                result.error = "channel " + std::to_string(ci) +
+                               ": put overflows capacity " +
                                std::to_string(st.capacity) + " at commit";
                 return result;
             }
-            st.queue.push_back(std::move(ov.pending.at(static_cast<std::uint32_t>(ci))));
+            ++next_tail;
         }
+        old_tails[ci] = tail;
+        new_heads[ci] = next_head;
+        new_tails[ci] = next_tail;
+    }
+
+    // Pending cells become visible only when the corresponding tail word is
+    // release-published below.
+    for (std::size_t ci = 0; ci < inst.channels.size(); ++ci) {
+        if (ov.put[ci]) {
+            inst.channels[ci]->encode_sequence(
+                old_tails[ci],
+                ov.pending.at(static_cast<std::uint32_t>(ci)));
+        }
+    }
+    for (std::size_t ci = 0; ci < inst.channels.size(); ++ci) {
+        ChannelState& st = *inst.channels[ci];
+        if (new_heads[ci] != st.head()) st.store_word(0, new_heads[ci]);
+        if (new_tails[ci] != st.tail()) st.store_word(1, new_tails[ci]);
     }
 
     result.ok = true;

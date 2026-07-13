@@ -31,7 +31,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -46,8 +45,9 @@ namespace pie_cuda_driver {
 // affect graph topology.
 //
 // PTIR: `program_set_hash` is the batching identity (contract C3)
-// of the stage programs captured in-graph — the order-independent fold of the
-// distinct program container hashes in the fire (see make_program_set_hash).
+// of the stage programs captured in-graph — an order-independent fold of
+// registration-time stage/region identities, runtime row buckets, and exact
+// multiplicity (`pipeline/program_identity.hpp`).
 // It is 0 for a pure-trunk / non-PTIR fire, so today's decode path is
 // bit-identical (the field defaults to 0 and the 3-field aggregate inits at the
 // executor capture sites keep compiling unchanged). When tier-1 glue kernels are
@@ -59,32 +59,18 @@ struct ForwardGraphKey {
     int num_tokens;
     std::uint32_t variant = 0;
     std::uint64_t program_set_hash = 0;   // C3 batching identity (0 = no PTIR)
+    bool has_write_desc = false;
+    int structured_window_left = -2;
 
     bool operator==(const ForwardGraphKey& o) const noexcept {
         return num_requests == o.num_requests &&
                num_tokens == o.num_tokens &&
                variant == o.variant &&
-               program_set_hash == o.program_set_hash;
+               program_set_hash == o.program_set_hash &&
+               has_write_desc == o.has_write_desc &&
+               structured_window_left == o.structured_window_left;
     }
 };
-
-// Fold a batch's distinct program container hashes into ONE order-independent
-// program-set identity (C3). Batching identity is a SET of stage-program traces
-// (T5) — co-batched instances of the same program share a hash, and the union
-// is what a captured graph's glue kernels encode — so the fold must be
-// commutative + duplicate-insensitive. We sort+unique then FNV-1a64 over the
-// canonical bytes (same FNV as program_hash / container_hash). Empty set → 0
-// (matches the non-PTIR default so the trunk path is unchanged).
-inline std::uint64_t make_program_set_hash(std::vector<std::uint64_t> hashes) {
-    if (hashes.empty()) return 0;
-    std::sort(hashes.begin(), hashes.end());
-    hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
-    std::uint64_t h = 0xcbf29ce484222325ULL;
-    for (std::uint64_t x : hashes) {
-        for (int b = 0; b < 8; ++b) { h ^= (x >> (b * 8)) & 0xff; h *= 0x100000001b3ULL; }
-    }
-    return h;
-}
 
 // vLLM-style decode graph lattice. Runtime batches are padded upward to
 // one of these request counts before graph capture/replay:
@@ -130,6 +116,10 @@ struct ForwardGraphKeyHash {
         // Mix the C3 program-set hash (0 for non-PTIR fires → unchanged).
         h ^= static_cast<std::size_t>(k.program_set_hash) +
              0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= static_cast<std::size_t>(k.has_write_desc) << 7;
+        h ^= static_cast<std::size_t>(
+                 static_cast<std::uint32_t>(k.structured_window_left)) +
+             0x517cc1b727220a95ULL + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -140,6 +130,12 @@ struct ForwardGraphKeyHash {
 // device-side resources, so keep this bounded.
 class ForwardGraphCache {
 public:
+    struct Metrics {
+        std::uint64_t hits = 0;
+        std::uint64_t misses = 0;
+        std::uint64_t captures = 0;
+        std::uint64_t evictions = 0;
+    };
     ForwardGraphCache() = default;
     ~ForwardGraphCache() noexcept {
         for (auto& [_, exec] : execs_) cudaGraphExecDestroy(exec);
@@ -150,7 +146,12 @@ public:
     // Returns a captured graph for `key`, or nullptr if none cached.
     cudaGraphExec_t get(const ForwardGraphKey& key) const noexcept {
         auto it = execs_.find(key);
-        return it == execs_.end() ? nullptr : it->second;
+        if (it == execs_.end()) {
+            ++metrics_.misses;
+            return nullptr;
+        }
+        ++metrics_.hits;
+        return it->second;
     }
 
     // Stores a captured graph. Caller transfers ownership.
@@ -158,6 +159,7 @@ public:
         if (auto it = execs_.find(key); it != execs_.end()) {
             cudaGraphExecDestroy(it->second);
             it->second = exec;
+            ++metrics_.captures;
             return;
         }
 
@@ -165,16 +167,20 @@ public:
             auto victim = execs_.begin();
             cudaGraphExecDestroy(victim->second);
             execs_.erase(victim);
+            ++metrics_.evictions;
         }
         execs_.emplace(key, exec);
+        ++metrics_.captures;
     }
 
     std::size_t size() const noexcept { return execs_.size(); }
+    Metrics metrics() const noexcept { return metrics_; }
 
 private:
     static constexpr std::size_t kMaxEntries = 128;
     std::unordered_map<ForwardGraphKey, cudaGraphExec_t,
                        ForwardGraphKeyHash> execs_;
+    mutable Metrics metrics_;
 };
 
 }  // namespace pie_cuda_driver

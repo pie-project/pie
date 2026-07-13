@@ -40,10 +40,17 @@ struct LaunchOp {
     std::uint64_t numel = 1;        // total elements of the result (elementwise)
 
     std::uint32_t k = 0;            // top_k / rank_le (standalone) immediate
+    std::uint32_t imm = 0;
+    std::uint32_t imm2 = 0;
+    std::uint32_t imm3 = 0;
     int           bcast_mode = 0;   // broadcast: 0 scalar, 1 per-row
     std::uint32_t rng_stream = 0;   // gumbel stream salt
     const void*   row_seeds = nullptr;  // gumbel per-row seed buffer
     std::uint32_t n_scatter = 0;    // scatter_set index count
+    std::uint32_t axis0 = 0;        // index-family source/base leading extent
+    std::uint32_t inner = 1;        // product of source/base trailing extents
+    DType         index_dtype = DType::U32;
+    bool          scalar_vals = false;
     int           a_scalar = 0;     // broadcast: operand 0 is a scalar (index 0)
     int           b_scalar = 0;     // broadcast: operand 1 is a scalar (index 0)
     const void*   bcast_meta = nullptr;  // general broadcast: [tdims(4), sstride(4)] device buf
@@ -86,20 +93,75 @@ inline void run_select(const LaunchOp& o) {
     k_select<T><<<gs(o.numel), kTier0Block, 0, o.stream>>>(
         (const std::uint8_t*)o.in[0], (const T*)o.in[1], (const T*)o.in[2], (T*)o.out, o.numel, o.a_scalar, o.b_scalar);
 }
-template <class T>
+template <class T, class Index>
 inline void run_gather(const LaunchOp& o) {
-    k_gather<T><<<gs(o.numel), kTier0Block, 0, o.stream>>>(
-        (const T*)o.in[0], (const std::uint32_t*)o.in[1], (T*)o.out, o.numel);
+    k_gather_axis0<T, Index><<<gs(o.numel), kTier0Block, 0, o.stream>>>(
+        static_cast<const T*>(o.in[0]),
+        static_cast<const Index*>(o.in[1]),
+        static_cast<T*>(o.out),
+        o.n_scatter,
+        o.axis0,
+        o.inner);
 }
 template <class T>
+inline bool run_gather_indexed(const LaunchOp& o) {
+    if (o.index_dtype == DType::I32) {
+        run_gather<T, std::int32_t>(o);
+        return true;
+    }
+    if (o.index_dtype == DType::U32) {
+        run_gather<T, std::uint32_t>(o);
+        return true;
+    }
+    return false;
+}
+template <class T>
+inline bool run_gather_row_indexed(const LaunchOp& o) {
+    if (o.index_dtype == DType::I32) {
+        k_gather_row<T, std::int32_t><<<
+            gs(o.numel), kTier0Block, 0, o.stream>>>(
+            static_cast<const T*>(o.in[0]),
+            static_cast<const std::int32_t*>(o.in[1]),
+            static_cast<T*>(o.out), o.rows, o.len);
+        return true;
+    }
+    if (o.index_dtype == DType::U32) {
+        k_gather_row<T, std::uint32_t><<<
+            gs(o.numel), kTier0Block, 0, o.stream>>>(
+            static_cast<const T*>(o.in[0]),
+            static_cast<const std::uint32_t*>(o.in[1]),
+            static_cast<T*>(o.out), o.rows, o.len);
+        return true;
+    }
+    return false;
+}
+template <class T, class Index, bool Add>
 inline void run_scatter(const LaunchOp& o) {
-    // base already copied into out by the runner; scatter idx/vals into it.
-    k_scatter_set_serial<T><<<1, 1, 0, o.stream>>>(
-        (T*)o.out, (const std::uint32_t*)o.in[1], (const T*)o.in[2], o.n_scatter);
+    k_scatter_axis0_serial<T, Index, Add><<<1, 1, 0, o.stream>>>(
+        static_cast<T*>(o.out),
+        static_cast<const Index*>(o.in[1]),
+        static_cast<const T*>(o.in[2]),
+        o.n_scatter,
+        o.axis0,
+        o.inner,
+        o.scalar_vals);
+}
+template <class T, bool Add>
+inline bool run_scatter_indexed(const LaunchOp& o) {
+    if (o.index_dtype == DType::I32) {
+        run_scatter<T, std::int32_t, Add>(o);
+        return true;
+    }
+    if (o.index_dtype == DType::U32) {
+        run_scatter<T, std::uint32_t, Add>(o);
+        return true;
+    }
+    return false;
 }
 template <class T>
 inline void run_reduce(const LaunchOp& o, RedKind k) {
-    k_reduce<T><<<o.rows, kTier0Block, 0, o.stream>>>((const T*)o.in[0], (T*)o.out, o.rows, o.len, k);
+    k_reduce<T><<<o.rows, kCanonicalReduceWidth, 0, o.stream>>>(
+        (const T*)o.in[0], (T*)o.out, o.rows, o.len, k);
 }
 template <class T>
 inline void run_scan(const LaunchOp& o, ScanKind k) {
@@ -163,6 +225,7 @@ inline bool launch_op(const LaunchOp& o) {
             switch (o.elem_dtype) {
                 case DType::F32: run_unary<float>(o, k); return true;
                 case DType::I32: if (k == UnKind::Neg || k == UnKind::Abs || k == UnKind::Sign) { run_unary<std::int32_t>(o, k); return true; } return false;
+                case DType::U32: if (k == UnKind::Neg || k == UnKind::Abs || k == UnKind::Sign) { run_unary<std::uint32_t>(o, k); return true; } return false;
                 default: return false;
             }
         }
@@ -178,10 +241,31 @@ inline bool launch_op(const LaunchOp& o) {
                 k_cast<std::uint32_t, float><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint32_t*)o.in[0], (float*)o.out, o.numel); return true; }
             if (o.elem_dtype == DType::Bool && o.out_dtype == DType::F32) {
                 k_cast<std::uint8_t, float><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint8_t*)o.in[0], (float*)o.out, o.numel); return true; }
+            if (o.elem_dtype == DType::Bool && o.out_dtype == DType::I32) {
+                k_cast<std::uint8_t, std::int32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint8_t*)o.in[0], (std::int32_t*)o.out, o.numel); return true; }
+            if (o.elem_dtype == DType::Bool && o.out_dtype == DType::U32) {
+                k_cast<std::uint8_t, std::uint32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint8_t*)o.in[0], (std::uint32_t*)o.out, o.numel); return true; }
+            if (o.out_dtype == DType::Bool) {
+                if (o.elem_dtype == DType::F32) {
+                    k_cast_bool<float><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const float*)o.in[0], (std::uint8_t*)o.out, o.numel); return true; }
+                if (o.elem_dtype == DType::I32) {
+                    k_cast_bool<std::int32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::int32_t*)o.in[0], (std::uint8_t*)o.out, o.numel); return true; }
+                if (o.elem_dtype == DType::U32) {
+                    k_cast_bool<std::uint32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint32_t*)o.in[0], (std::uint8_t*)o.out, o.numel); return true; }
+            }
             if (o.elem_dtype == DType::U32 && o.out_dtype == DType::I32) {
                 k_cast<std::uint32_t, std::int32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint32_t*)o.in[0], (std::int32_t*)o.out, o.numel); return true; }
             if (o.elem_dtype == DType::I32 && o.out_dtype == DType::U32) {
                 k_cast<std::int32_t, std::uint32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::int32_t*)o.in[0], (std::uint32_t*)o.out, o.numel); return true; }
+            if (o.elem_dtype == o.out_dtype) {
+                if (o.elem_dtype == DType::F32) {
+                    k_cast<float, float><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const float*)o.in[0], (float*)o.out, o.numel); return true; }
+                if (o.elem_dtype == DType::I32) {
+                    k_cast<std::int32_t, std::int32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::int32_t*)o.in[0], (std::int32_t*)o.out, o.numel); return true; }
+                if (o.elem_dtype == DType::U32) {
+                    k_cast<std::uint32_t, std::uint32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint32_t*)o.in[0], (std::uint32_t*)o.out, o.numel); return true; }
+                k_cast<std::uint8_t, std::uint8_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint8_t*)o.in[0], (std::uint8_t*)o.out, o.numel); return true;
+            }
             return false;
         }
         // ── compare / logic ──
@@ -236,33 +320,33 @@ inline bool launch_op(const LaunchOp& o) {
             return true;
         case OpCode::Gather:
             switch (o.elem_dtype) {
-                case DType::F32: run_gather<float>(o); return true;
-                case DType::I32: run_gather<std::int32_t>(o); return true;
-                case DType::U32: run_gather<std::uint32_t>(o); return true;
-                case DType::Bool: run_gather<std::uint8_t>(o); return true;
+                case DType::F32: return run_gather_indexed<float>(o);
+                case DType::I32: return run_gather_indexed<std::int32_t>(o);
+                case DType::U32: return run_gather_indexed<std::uint32_t>(o);
+                case DType::Bool: return run_gather_indexed<std::uint8_t>(o);
             }
             return false;
         case OpCode::GatherRow:
-            // rows = index count (m), len = per-row length.
             switch (o.elem_dtype) {
-                case DType::F32: k_gather_row<float><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const float*)o.in[0], (const std::uint32_t*)o.in[1], (float*)o.out, o.rows, o.len); return true;
-                case DType::U32: k_gather_row<std::uint32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint32_t*)o.in[0], (const std::uint32_t*)o.in[1], (std::uint32_t*)o.out, o.rows, o.len); return true;
-                case DType::I32: k_gather_row<std::int32_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::int32_t*)o.in[0], (const std::uint32_t*)o.in[1], (std::int32_t*)o.out, o.rows, o.len); return true;
-                case DType::Bool: k_gather_row<std::uint8_t><<<gs(o.numel), kTier0Block, 0, o.stream>>>((const std::uint8_t*)o.in[0], (const std::uint32_t*)o.in[1], (std::uint8_t*)o.out, o.rows, o.len); return true;
+                case DType::F32: return run_gather_row_indexed<float>(o);
+                case DType::U32: return run_gather_row_indexed<std::uint32_t>(o);
+                case DType::I32: return run_gather_row_indexed<std::int32_t>(o);
+                case DType::Bool: return run_gather_row_indexed<std::uint8_t>(o);
                 default: return false;
             }
         case OpCode::ScatterSet:
             switch (o.elem_dtype) {
-                case DType::F32: run_scatter<float>(o); return true;
-                case DType::I32: run_scatter<std::int32_t>(o); return true;
-                case DType::U32: run_scatter<std::uint32_t>(o); return true;
+                case DType::F32: return run_scatter_indexed<float, false>(o);
+                case DType::I32: return run_scatter_indexed<std::int32_t, false>(o);
+                case DType::U32: return run_scatter_indexed<std::uint32_t, false>(o);
+                case DType::Bool: return run_scatter_indexed<std::uint8_t, false>(o);
                 default: return false;
             }
         case OpCode::ScatterAdd:
             switch (o.elem_dtype) {
-                case DType::F32: k_scatter_add_serial<float><<<1, 1, 0, o.stream>>>((float*)o.out, (const std::uint32_t*)o.in[1], (const float*)o.in[2], o.n_scatter); return true;
-                case DType::I32: k_scatter_add_serial<std::int32_t><<<1, 1, 0, o.stream>>>((std::int32_t*)o.out, (const std::uint32_t*)o.in[1], (const std::int32_t*)o.in[2], o.n_scatter); return true;
-                case DType::U32: k_scatter_add_serial<std::uint32_t><<<1, 1, 0, o.stream>>>((std::uint32_t*)o.out, (const std::uint32_t*)o.in[1], (const std::uint32_t*)o.in[2], o.n_scatter); return true;
+                case DType::F32: return run_scatter_indexed<float, true>(o);
+                case DType::I32: return run_scatter_indexed<std::int32_t, true>(o);
+                case DType::U32: return run_scatter_indexed<std::uint32_t, true>(o);
                 default: return false;
             }
         // ── reduce / scan ──
@@ -277,8 +361,28 @@ inline bool launch_op(const LaunchOp& o) {
             }
         }
         case OpCode::ReduceArgmax:
-            k_reduce_argmax<<<o.rows, kTier0Block, 0, o.stream>>>((const float*)o.in[0], (std::uint32_t*)o.out, o.rows, o.len);
-            return true;
+            switch (o.elem_dtype) {
+                case DType::F32:
+                    k_reduce_argmax<float><<<
+                        o.rows, kTier0Block, 0, o.stream>>>(
+                        static_cast<const float*>(o.in[0]),
+                        static_cast<std::uint32_t*>(o.out), o.rows, o.len);
+                    return true;
+                case DType::I32:
+                    k_reduce_argmax<std::int32_t><<<
+                        o.rows, kTier0Block, 0, o.stream>>>(
+                        static_cast<const std::int32_t*>(o.in[0]),
+                        static_cast<std::uint32_t*>(o.out), o.rows, o.len);
+                    return true;
+                case DType::U32:
+                    k_reduce_argmax<std::uint32_t><<<
+                        o.rows, kTier0Block, 0, o.stream>>>(
+                        static_cast<const std::uint32_t*>(o.in[0]),
+                        static_cast<std::uint32_t*>(o.out), o.rows, o.len);
+                    return true;
+                default:
+                    return false;
+            }
         case OpCode::CumSum: case OpCode::CumProd: {
             ScanKind k = o.code == OpCode::CumSum ? ScanKind::Sum : ScanKind::Prod;
             switch (o.elem_dtype) {
@@ -288,27 +392,39 @@ inline bool launch_op(const LaunchOp& o) {
                 default: return false;
             }
         }
-        // ── normalize (composite / fusion-only) ──
-        case OpCode::Softmax: case OpCode::LogSoftmax: case OpCode::L2Norm: {
-            NormKind k = o.code == OpCode::Softmax ? NormKind::Softmax
-                       : o.code == OpCode::LogSoftmax ? NormKind::LogSoftmax : NormKind::L2Norm;
-            k_normalize<<<o.rows, kTier0Block, 0, o.stream>>>((const float*)o.in[0], (float*)o.out, o.rows, o.len, k);
-            return true;
-        }
         // ── sampling ──
-        case OpCode::MaskApplyBool:
-            k_mask_apply<<<gs(o.numel), kTier0Block, 0, o.stream>>>(
-                (const float*)o.in[0], (const std::uint8_t*)o.in[1], (float*)o.out, o.numel);
-            return true;
         case OpCode::MaskApplyPacked:
             // len = vocab; k carries mask words per row (ceil(len/32)).
             k_mask_apply_packed<<<gs(o.numel), kTier0Block, 0, o.stream>>>(
                 (const float*)o.in[0], (const std::uint32_t*)o.in[1], (float*)o.out, o.rows, o.len, o.k);
             return true;
-        case OpCode::GumbelNoise:
-            k_gumbel<<<gs((std::uint64_t)o.rows * o.len), kTier0Block, 0, o.stream>>>(
-                (const std::uint32_t*)o.row_seeds, o.rng_stream, (float*)o.out, o.rows, o.len);
+        case OpCode::CausalMask:
+        case OpCode::SlidingWindowMask:
+        case OpCode::SinkWindowMask: {
+            const Tier0StructuredMaskKind kind =
+                o.code == OpCode::CausalMask
+                    ? Tier0StructuredMaskKind::Causal
+                    : o.code == OpCode::SlidingWindowMask
+                        ? Tier0StructuredMaskKind::SlidingWindow
+                        : Tier0StructuredMaskKind::SinkWindow;
+            const std::uint32_t window =
+                o.code == OpCode::SinkWindowMask ? o.imm3 : o.imm2;
+            const std::uint32_t sink =
+                o.code == OpCode::SinkWindowMask ? o.imm2 : 0;
+            k_structured_position_mask<<<
+                gs(static_cast<std::uint64_t>(o.rows) * o.len),
+                kTier0Block,
+                0,
+                o.stream>>>(
+                static_cast<const std::uint32_t*>(o.in[0]),
+                static_cast<std::uint8_t*>(o.out),
+                o.rows,
+                o.len,
+                kind,
+                window,
+                sink);
             return true;
+        }
         case OpCode::Rng:   // ambient seed; rng_stream carries stream, bcast_mode = gumbel flag
             k_rng_ambient<<<gs((std::uint64_t)o.rows * o.len), kTier0Block, 0, o.stream>>>(
                 (const std::uint32_t*)o.row_seeds, o.rng_stream, (float*)o.out, o.rows, o.len, o.bcast_mode);
@@ -318,12 +434,6 @@ inline bool launch_op(const LaunchOp& o) {
                 (const std::uint32_t*)o.in[0], (float*)o.out, o.numel, o.bcast_mode);
             return true;
         // ── order ──
-        case OpCode::RankLe:
-            // Composite/fusion-only form (0xE5, never emitted by container
-            // decode today): `k` really is a host immediate here (op.imm),
-            // unlike pivot_threshold's dynamic predicate below.
-            k_rank_le<<<o.rows, kTier0Block, 0, o.stream>>>((const float*)o.in[0], (std::uint8_t*)o.out, o.rows, o.len, o.k);
-            return true;
         case OpCode::PivotThreshold:
             // Container pivot_threshold(input, predicate) → bool selection
             // mask. The predicate payload is a resolved trace value (scalar

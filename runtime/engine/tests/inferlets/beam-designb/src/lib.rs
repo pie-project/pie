@@ -27,7 +27,7 @@
 //! here; this inferlet exercises the steady-state append + mask-out path only.
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 const B: u32 = 2; // beams
 const PAGE_T: u32 = 16; // tokens per pool page
@@ -52,7 +52,9 @@ async fn main(_input: String) -> Result<String> {
     // port and the WSlot write descriptor. The flat pool position `wpos` maps to
     // physical page `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let pool = ws.reserve(POOL_PAGES).map_err(|e| format!("ws.reserve pool: {e}"))?;
+    let pool = ws
+        .reserve(POOL_PAGES)
+        .map_err(|e| format!("ws.reserve pool: {e}"))?;
     let pool_ids: &'static Vec<u32> = bx(pool.ids().to_vec()); // [POOL_PAGES] physical
     let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect(); // [B*POOL_PAGES]
     let phys0 = pool_ids[0]; // physical page holding the shared prefix (pos 0)
@@ -60,9 +62,7 @@ async fn main(_input: String) -> Result<String> {
     // Shared BOS prompt at pool position 0: both beams attend it (mask), and the
     // fire-0 write descriptor lands both BOS at (page pool_ids[0], off 0) — the
     // shared prefix cell. fill = 1 (position 0 filled).
-    let init_mask: Vec<bool> = (0..B)
-        .flat_map(|_| (0..POOL).map(|p| p == 0))
-        .collect();
+    let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..POOL).map(|p| p == 0)).collect();
 
     // Loop-carried state (guest-seeded). w_slot/pages carry PHYSICAL page ids.
     let mask = bx(Channel::from_shaped([B, POOL], init_mask).named("mask")); // [B, POOL] bool
@@ -158,7 +158,9 @@ async fn main(_input: String) -> Result<String> {
         pages.put(&pages_ig);
         // Re-emit the constant page_indptr each fire (channel-bound; peeked ports
         // still want a fresh value each pass). [0, POOL_PAGES, 2*POOL_PAGES].
-        page_indptr.put(&Tensor::constant((0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>()));
+        page_indptr.put(&Tensor::constant(
+            (0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>(),
+        ));
 
         out.put(&tok_i);
         out_par.put(&parent);
@@ -172,10 +174,23 @@ async fn main(_input: String) -> Result<String> {
     let mut hyp_tokens: Vec<u32> = Vec::new();
     for step in 0..MAX_STEPS {
         pool_ids_ch.put(pool_ids.clone());
-        fwd.submit(&pipeline).map_err(|e| format!("submit @{step}: {e}"))?;
-        let picked = out.take().get::<i32>().map_err(|e| format!("out.take @{step}: {e}"))?;
-        let _parents = out_par.take().get::<u32>().map_err(|e| format!("out_par.take @{step}: {e}"))?;
-        let _scr = out_scr.take().get::<f32>().map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+        fwd.submit(&pipeline)
+            .map_err(|e| format!("submit @{step}: {e}"))?;
+        let picked = out
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("out.take @{step}: {e}"))?;
+        let _parents = out_par
+            .take()
+            .get::<u32>()
+            .await
+            .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+        let _scr = out_scr
+            .take()
+            .get::<f32>()
+            .await
+            .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);
         }

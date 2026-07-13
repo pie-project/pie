@@ -154,10 +154,12 @@ async fn main(input: String) -> Result<String> {
     let g0 = tok_out_p
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("g0 take: {e}"))?[0];
     let s0 = s_out_p
         .take()
         .get::<f32>()
+        .await
         .map_err(|e| format!("s0 take: {e}"))?[0];
     prefill.close();
 
@@ -210,10 +212,12 @@ async fn main(input: String) -> Result<String> {
             let t = tok_out
                 .take()
                 .get::<i32>()
+                .await
                 .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0];
             let s = s_out
                 .take()
                 .get::<f32>()
+                .await
                 .map_err(|e| format!("s_out.take @{step}: {e}"))?[0];
             generated.push(t as u32);
             surprises.push(s);

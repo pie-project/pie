@@ -43,7 +43,7 @@ async fn attention_sink_on_real_driver() -> Result<()> {
         pie.listen_addr
     );
 
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../inferlets");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
     let dir = workspace.join("attention-sink");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "attention-sink"])

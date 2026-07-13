@@ -75,8 +75,7 @@ async fn grammar_mask_op_on_real_driver() -> Result<()> {
     // CONFORM (device==CPU-ref) ∧ FORCED-OUT (natural argmax disallowed +
     // forced out). Non-degenerate by construction: an all-allowed mask fails
     // FORCED-OUT, a wrong device mask fails CONFORM.
-    let report: serde_json::Value =
-        serde_json::from_str(&json).context("parse grammar report")?;
+    let report: serde_json::Value = serde_json::from_str(&json).context("parse grammar report")?;
     anyhow::ensure!(
         report.get("conform").and_then(|v| v.as_bool()) == Some(true)
             && report.get("forced_out").and_then(|v| v.as_bool()) == Some(true),

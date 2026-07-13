@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -36,8 +37,10 @@
 #include "batch/forward.hpp"
 #include "batch/worker.hpp"
 #include "decode_abi.hpp"
+#include "observability.hpp"
 #if defined(__APPLE__)
 #include "mtl4_context.hpp"
+#include "pipeline/m1_runtime.hpp"
 #endif
 
 namespace pie::metal {
@@ -155,17 +158,6 @@ Config load_config(const std::filesystem::path& path) {
             "int8_per_token_head, fp8_per_token_head, fp4_e2m1, nvfp4");
     }
     return config;
-}
-
-void store_word(std::vector<std::uint64_t>& words, std::size_t index, std::uint64_t value) {
-    std::atomic_ref<std::uint64_t>(words[index]).store(value, std::memory_order_release);
-}
-
-std::uint64_t load_word(const std::vector<std::uint64_t>& words, std::size_t index) {
-    // libc++ lacks the const atomic_ref specialization; the underlying word is
-    // never actually const (driver-owned storage).
-    return std::atomic_ref<std::uint64_t>(const_cast<std::uint64_t&>(words[index]))
-        .load(std::memory_order_acquire);
 }
 
 void publish_terminal(PieTerminalCell* cell, std::uint32_t outcome) {
@@ -357,6 +349,9 @@ class Context::Impl {
     ~Impl() {
         worker_.run([this] {
             if (executor_ != nullptr) executor_.reset();
+#if defined(__APPLE__)
+            if (m1_runtime_ != nullptr) m1_runtime_.reset();
+#endif
         });
     }
 
@@ -422,8 +417,78 @@ class Context::Impl {
     }
 
     int register_program(const PieProgramDesc& program, std::uint64_t* program_id) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        return registry_.register_program(program, program_id);
+        std::uint64_t id = 0;
+        pipeline::ExecPlan compile_plan;
+        std::vector<std::uint8_t> compile_canonical;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            const int status = registry_.register_program(program, &id);
+            if (status != PIE_STATUS_OK) return status;
+            ProgramRecord& record = *registry_.find_program(id);
+            if (record.m1_executable != nullptr) {
+                if (program_id != nullptr) *program_id = id;
+                return PIE_STATUS_OK;
+            }
+            if (!record.m1_error.empty()) {
+                std::cerr << "[pie-driver-metal] register_program: "
+                          << record.m1_error << "\n";
+                return PIE_STATUS_UNSUPPORTED;
+            }
+            if (!record.plan.executable) {
+                record.m1_error = record.plan.reject_reason;
+                std::cerr << "[pie-driver-metal] register_program: "
+                          << record.m1_error << "\n";
+                return PIE_STATUS_UNSUPPORTED;
+            }
+            compile_plan = record.plan;
+            compile_canonical = record.canonical_bytes;
+        }
+
+#if defined(__APPLE__)
+        std::shared_ptr<pipeline::M1ProgramExecutable> executable;
+        std::string compile_error;
+        pipeline::M1CompileFailureKind compile_failure =
+            pipeline::M1CompileFailureKind::Retryable;
+        worker_.run([&] {
+            if (m1_runtime_ == nullptr) {
+                m1_runtime_ = pipeline::M1Runtime::create(
+                    metal_kernels_dir(),
+                    pipeline::default_m1_cache_dir(),
+                    compile_error);
+            }
+            if (m1_runtime_ != nullptr) {
+                executable = m1_runtime_->compile_program(
+                    program.program_hash,
+                    compile_plan,
+                    compile_error,
+                    compile_canonical,
+                    &compile_failure);
+            }
+        });
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            ProgramRecord& record = *registry_.find_program(id);
+            if (executable == nullptr) {
+                const std::string message =
+                    compile_error.empty()
+                        ? "Metal M1 compilation failed"
+                        : compile_error;
+                if (compile_failure ==
+                    pipeline::M1CompileFailureKind::Deterministic) {
+                    record.m1_error = message;
+                }
+                std::cerr << "[pie-driver-metal] register_program: "
+                          << message << "\n";
+                return compile_failure ==
+                               pipeline::M1CompileFailureKind::Deterministic
+                           ? PIE_STATUS_UNSUPPORTED
+                           : PIE_STATUS_DRIVER_ERROR;
+            }
+            record.m1_executable = std::move(executable);
+        }
+#endif
+        if (program_id != nullptr) *program_id = id;
+        return PIE_STATUS_OK;
     }
 
     int register_channel(const PieChannelDesc& channel,
@@ -438,10 +503,8 @@ class Context::Impl {
     }
 
     // ABI v2 launch (Phase 3, review item 1 — ASYNC). SYNCHRONOUS PREFLIGHT
-    // under `state_mutex_`: validate instance/program ids + static rules, run
-    // the §4.3 writer-ring pull + availability check (a missing put still
-    // rejects synchronously with INVALID_ARGUMENT — no epoch, no poison), and
-    // RESERVE the consumed inputs. Then deep-copy the accepted batch into an
+    // under `state_mutex_`: validate instance/program ids, static rules, and
+    // ticket shape. Then deep-copy the accepted batch into an
     // owned `LaunchJobData` (each forward member's descriptor is a fully-owned
     // copy; no launch-array pointer is retained), POST it to the executor
     // worker, and RETURN — `pie_metal_launch` never waits for the GPU forward
@@ -469,6 +532,13 @@ class Context::Impl {
                           << ": " << program.plan.reject_reason << "\n";
                 return PIE_STATUS_UNSUPPORTED;
             }
+        }
+        if (launch.has_user_mask != 0) {
+            std::cerr
+                << "[pie-driver-metal] launch: user-provided wire masks "
+                   "require BRLE decoding, which Metal does not support; "
+                   "refusing to run unmasked\n";
+            return PIE_STATUS_UNSUPPORTED;
         }
         // Phase 2 (C3): at most one device-geometry program per launch batch
         // — the same structural constraint the runtime's scheduler already
@@ -562,11 +632,38 @@ class Context::Impl {
     // caught and translated to that member's terminal FAILED with the original
     // what() diagnostic — never swallowed, never left pending.
     void run_launch_job(std::shared_ptr<LaunchJobData> job) {
+        const M0TimingSnapshot timing_before =
+            m0_timing_counters().snapshot();
+#if defined(__APPLE__)
+        const pipeline::M3GroupStats m3_before =
+            m1_runtime_ != nullptr ? m1_runtime_->m3_stats()
+                                   : pipeline::M3GroupStats{};
+#endif
         const std::size_t M = job->members.size();
         std::vector<std::uint32_t> outcomes(M, PIE_TERMINAL_OUTCOME_SUCCESS);
         std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
+#if defined(__APPLE__)
+        struct PendingM3Group {
+            std::vector<std::size_t> members;
+            std::vector<pipeline::M3LaneCandidate> candidates;
+            std::vector<std::uint8_t> accepted;
+            std::vector<std::size_t> accepted_members;
+            std::shared_ptr<pipeline::M3GroupCommand> command;
+            bool finalized = false;
+            std::size_t leader = std::numeric_limits<std::size_t>::max();
+        };
+        std::vector<std::shared_ptr<pipeline::M1PreparedFire>> prepared(M);
+        std::vector<std::shared_ptr<pipeline::M2CommandPlan>> m2_commands(M);
+        std::vector<std::uint8_t> m2_active(M, 0);
+        std::vector<std::shared_ptr<PendingM3Group>> m3_for_member(M);
+        std::vector<pipeline::M1ExecuteOutcome> m3_outcomes(
+            M, pipeline::M1ExecuteOutcome::Failed);
+        std::vector<std::uint8_t> m3_active(M, 0);
+        std::vector<std::shared_ptr<PendingM3Group>> m3_groups;
+#endif
 
-        // ── Phase 0: execution-time ticket validation and lazy host pull. ──
+        // ── Phase 0: execution-time ticket validation directly against the
+        // authoritative Shared-storage channel rings. ──
         const pie_native::LaunchView view = job->launch.view();
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -581,14 +678,51 @@ class Context::Impl {
                 InstanceRecord& member = *instance;
                 const ProgramRecord& program =
                     *registry_.find_program(member.program_id);
+#if defined(__APPLE__)
+                lm.requires_m2 = m1_runtime_->requires_m2_placement(
+                    program.m1_executable);
+                lm.mtp_draft_row =
+                    interp::bounded_mtp_row_base(
+                        program.plan, facts_.vocab_size);
+                if (program.plan.needs_mtp_logits &&
+                    lm.mtp_draft_row < 0) {
+                    lm.build_err =
+                        "bounded MTP row base cannot be derived for this "
+                        "model/program";
+                    continue;
+                }
+#endif
                 std::string prepare_error;
+#if defined(__APPLE__)
+                const pipeline::M1PrepareOutcome prepared_outcome =
+                    m1_runtime_ != nullptr && program.m1_executable != nullptr
+                        ? m1_runtime_->prepare(
+                              program.m1_executable,
+                              member.interp.channels,
+                              lm.tickets,
+                              prepared[m],
+                              prepare_error)
+                        : pipeline::M1PrepareOutcome::Failed;
+                const TicketPreparation prepared_status =
+                    prepared_outcome == pipeline::M1PrepareOutcome::Ready
+                        ? TicketPreparation::Ready
+                        : (prepared_outcome == pipeline::M1PrepareOutcome::Retry
+                               ? TicketPreparation::Retry
+                               : TicketPreparation::Failed);
+#else
                 const TicketPreparation prepared =
-                    prepare_member_tickets(member, program, lm.tickets, prepare_error);
-                if (prepared == TicketPreparation::Retry) {
+                    prepare_member_tickets(lm.tickets, prepare_error);
+                const TicketPreparation prepared_status = prepared;
+#endif
+                if (prepared_status == TicketPreparation::Retry) {
                     outcomes[m] = PIE_TERMINAL_OUTCOME_RETRY;
                     continue;
                 }
-                if (prepared == TicketPreparation::Failed) {
+                if (prepared_status == TicketPreparation::Failed) {
+                    if (prepare_error.empty()) {
+                        prepare_error =
+                            "Metal M1 executable is unavailable";
+                    }
                     lm.build_err = std::move(prepare_error);
                     continue;
                 }
@@ -602,6 +736,11 @@ class Context::Impl {
                 } else if (built == ForwardBuildResult::Retry) {
                     outcomes[m] = PIE_TERMINAL_OUTCOME_RETRY;
                     lm.build_err.clear();
+#if defined(__APPLE__)
+                    if (m1_runtime_ != nullptr) {
+                        m1_runtime_->release(prepared[m]);
+                    }
+#endif
                 }
             }
         }
@@ -612,6 +751,67 @@ class Context::Impl {
         std::vector<std::string> fwd_err;
         std::string setup_err;
         bool executor_ready = true;
+#if defined(__APPLE__)
+        {
+            std::unordered_map<std::string, std::vector<std::size_t>>
+                channel_groups;
+            for (std::size_t m = 0; m < M; ++m) {
+                if (outcomes[m] != PIE_TERMINAL_OUTCOME_SUCCESS ||
+                    job->members[m].needs_forward ||
+                    prepared[m] == nullptr) {
+                    continue;
+                }
+                channel_groups["all"].push_back(m);
+            }
+            for (auto& [key, members] : channel_groups) {
+                static_cast<void>(key);
+                std::vector<pipeline::M3LaneCandidate> candidates;
+                for (const std::size_t member : members) {
+                    candidates.push_back({
+                        .fire = prepared[member],
+                        .inputs = {},
+                        .retry_ineligible = false,
+                    });
+                }
+                std::shared_ptr<pipeline::M3GroupCommand> command;
+                std::string group_error;
+                if (!m1_runtime_->prepare_m3_group(
+                        candidates,
+                        m1_runtime_->context(),
+                        command,
+                        group_error)) {
+                    if (cfg_.runtime.verbose && !group_error.empty()) {
+                        std::cerr
+                            << "[pie-driver-metal] channel M3 fallback: "
+                            << group_error << "\n";
+                    }
+                    continue;
+                }
+                const StepTiming timing =
+                    m1_runtime_->context().run_step(
+                    [&](StepEncoder& encoder) {
+                        m1_runtime_->encode_m3_pre(command, encoder);
+                        m1_runtime_->encode_m3_post(command, encoder);
+                    });
+                auto grouped = m1_runtime_->finish_m3_group(
+                    command, group_error);
+                if (!timing.succeeded()) {
+                    std::fill(
+                        grouped.begin(),
+                        grouped.end(),
+                        pipeline::M1ExecuteOutcome::Failed);
+                    group_error =
+                        "Metal M3 command timed out before its completion fence";
+                }
+                for (std::size_t lane = 0;
+                     lane < grouped.size() && lane < members.size();
+                     ++lane) {
+                    m3_active[members[lane]] = 1;
+                    m3_outcomes[members[lane]] = grouped[lane];
+                }
+            }
+        }
+#endif
         bool has_forward = false;
         for (std::size_t m = 0; m < M; ++m)
             if (outcomes[m] == PIE_TERMINAL_OUTCOME_SUCCESS &&
@@ -622,7 +822,309 @@ class Context::Impl {
             try {
                 executor_ready = ensure_executor(setup_err);  // inline on the worker
                 if (executor_ready) {
-                    executor_->forward_batch(job->fwd_descs, fwd_outs, fwd_ok, fwd_err);
+#if defined(__APPLE__)
+                    std::vector<executor::PtirCommandCallbacks> callbacks(
+                        job->fwd_descs.size());
+                    std::vector<std::uint32_t> token_bases(
+                        job->fwd_descs.size(), 0);
+                    std::uint32_t token_base = 0;
+                    for (std::size_t slot = 0;
+                         slot < job->fwd_descs.size();
+                         ++slot) {
+                        token_bases[slot] = token_base;
+                        token_base += static_cast<std::uint32_t>(
+                            job->fwd_descs[slot].token_ids.size());
+                    }
+                    const bool legacy_single =
+                        job->fwd_descs.size() == 1 &&
+                        !job->fwd_descs[0].requires_paged &&
+                        !job->fwd_descs[0].has_write_desc;
+                    RawMetalContext* command_context =
+                        executor_->command_context();
+                    std::vector<pipeline::M1DeviceInputs> member_inputs(M);
+                    std::vector<std::uint8_t> direct_eligible(M, 0);
+                    for (std::size_t m = 0; m < M; ++m) {
+                        LaunchMember& member = job->members[m];
+                        if (!member.needs_forward ||
+                            member.fwd_slot < 0 ||
+                            prepared[m] == nullptr) {
+                            continue;
+                        }
+                        const std::size_t slot =
+                            static_cast<std::size_t>(member.fwd_slot);
+                        const auto& desc = job->fwd_descs[slot];
+                        if (desc.readout_local_indices.empty() ||
+                            (legacy_single &&
+                             (desc.readout_local_indices.size() != 1 ||
+                              desc.readout_local_indices[0] + 1 !=
+                                  desc.token_ids.size()))) {
+                            continue;
+                        }
+                        pipeline::M1DeviceInputs inputs;
+                        inputs.logits_bf16 =
+                            executor_->logits_device_slot();
+                        inputs.logits_row_offset =
+                            legacy_single
+                                ? 0
+                                : token_bases[slot] +
+                                      desc.readout_local_indices[0];
+                        inputs.logits_row_count =
+                            static_cast<std::uint32_t>(
+                                desc.readout_local_indices.size());
+                        if (!legacy_single) {
+                            for (const std::uint32_t local :
+                                 desc.readout_local_indices) {
+                                inputs.logits_rows.push_back(
+                                    token_bases[slot] + local);
+                            }
+                        }
+                        inputs.vocab = executor_->vocab();
+                        inputs.mtp_draft_row = member.mtp_draft_row;
+                        inputs.extents =
+                            pipeline::m3_extents_from_forward_desc(desc);
+                        member_inputs[m] = inputs;
+                        direct_eligible[m] = 1;
+                    }
+
+                    std::unordered_map<std::string, std::vector<std::size_t>>
+                        candidate_groups;
+                    for (std::size_t m = 0; m < M; ++m) {
+                        if (direct_eligible[m] == 0) continue;
+                        candidate_groups["all"].push_back(m);
+                    }
+                    for (auto& [key, members] : candidate_groups) {
+                        static_cast<void>(key);
+                        auto group = std::make_shared<PendingM3Group>();
+                        group->members = members;
+                        group->accepted.assign(members.size(), 0);
+                        for (const std::size_t member : members) {
+                            const auto& desc = job->fwd_descs[
+                                static_cast<std::size_t>(
+                                    job->members[member].fwd_slot)];
+                            group->candidates.push_back({
+                                .fire = prepared[member],
+                                .inputs = member_inputs[member],
+                                .retry_ineligible =
+                                    desc.has_rs_slot ||
+                                    job->members[member].requires_m2,
+                            });
+                            m3_for_member[member] = group;
+                        }
+                        m3_groups.push_back(group);
+                        for (std::size_t lane = 0;
+                             lane < members.size();
+                             ++lane) {
+                            const std::size_t member = members[lane];
+                            const std::size_t slot =
+                                static_cast<std::size_t>(
+                                    job->members[member].fwd_slot);
+                            callbacks[slot].set_logits_row =
+                                [group, lane](std::uint32_t row) {
+                                    group->accepted[lane] = 1;
+                                    group->candidates[lane]
+                                        .inputs.logits_row_offset = row;
+                                    group->candidates[lane]
+                                        .inputs.logits_rows = {row};
+                                    group->candidates[lane]
+                                        .inputs.extents.sampled_rows = 1;
+                                };
+                            callbacks[slot].set_logits_rows =
+                                [group, lane](
+                                    const std::vector<std::uint32_t>& rows) {
+                                    if (rows.empty()) return;
+                                    group->accepted[lane] = 1;
+                                    group->candidates[lane]
+                                        .inputs.logits_row_offset =
+                                        rows.front();
+                                    group->candidates[lane]
+                                        .inputs.logits_row_count =
+                                        static_cast<std::uint32_t>(
+                                            rows.size());
+                                    group->candidates[lane]
+                                        .inputs.logits_rows = rows;
+                                    group->candidates[lane]
+                                        .inputs.extents.sampled_rows =
+                                        static_cast<std::uint32_t>(
+                                            rows.size());
+                                };
+                            callbacks[slot].finalize_group =
+                                [&, group] {
+                                    if (group->finalized) return;
+                                    group->finalized = true;
+                                    std::vector<pipeline::M3LaneCandidate>
+                                        accepted;
+                                    for (std::size_t index = 0;
+                                         index < group->members.size();
+                                         ++index) {
+                                        if (group->accepted[index] == 0)
+                                            continue;
+                                        accepted.push_back(
+                                            group->candidates[index]);
+                                        group->accepted_members.push_back(
+                                            group->members[index]);
+                                    }
+                                    if (accepted.empty() ||
+                                        command_context == nullptr) {
+                                        return;
+                                    }
+                                    std::string group_error;
+                                    if (!m1_runtime_->prepare_m3_group(
+                                            accepted,
+                                            *command_context,
+                                            group->command,
+                                            group_error)) {
+                                        if (cfg_.runtime.verbose &&
+                                            !group_error.empty()) {
+                                            std::cerr
+                                                << "[pie-driver-metal] M3 group fallback: "
+                                                << group_error << "\n";
+                                        }
+                                        for (std::size_t index = 0;
+                                             index <
+                                             group->accepted_members.size();
+                                             ++index) {
+                                            const std::size_t fallback_member =
+                                                group->accepted_members[index];
+                                            std::string fallback_error;
+                                            const auto& rows =
+                                                accepted[index].inputs.logits_rows;
+                                            const bool contiguous_rows =
+                                                rows.empty() ||
+                                                std::adjacent_find(
+                                                    rows.begin(),
+                                                    rows.end(),
+                                                    [](std::uint32_t left,
+                                                       std::uint32_t right) {
+                                                        return right !=
+                                                            left + 1;
+                                                    }) == rows.end();
+                                            if (contiguous_rows &&
+                                                m1_runtime_->prepare_m2_command(
+                                                    prepared[fallback_member],
+                                                    accepted[index].inputs,
+                                                    *command_context,
+                                                    m2_commands[fallback_member],
+                                                    fallback_error)) {
+                                                m2_active[fallback_member] = 1;
+                                                continue;
+                                            }
+                                            if (accepted[index]
+                                                    .retry_ineligible) {
+                                                if (!contiguous_rows) {
+                                                    fallback_error =
+                                                        "non-contiguous multi-row logits "
+                                                        "require M3 row attribution";
+                                                }
+                                                throw std::runtime_error(
+                                                    "definitively admitted Metal M3 lane "
+                                                    "lost safe placement before launch: " +
+                                                    group_error + "; M2 fallback: " +
+                                                    fallback_error);
+                                            }
+                                        }
+                                        return;
+                                    }
+                                    group->leader =
+                                        group->accepted_members.front();
+                                    for (const std::size_t accepted_member :
+                                         group->accepted_members) {
+                                        m3_active[accepted_member] = 1;
+                                    }
+                                };
+                            callbacks[slot].pre_forward =
+                                [this, group, member, &m2_active,
+                                 &m2_commands](StepEncoder& encoder) {
+                                    if (group->command &&
+                                        group->leader == member) {
+                                        m1_runtime_->encode_m3_pre(
+                                            group->command, encoder);
+                                    } else if (m2_active[member] != 0) {
+                                        m1_runtime_->encode_m2_pre(
+                                            m2_commands[member], encoder);
+                                    }
+                                };
+                            callbacks[slot].post_forward =
+                                [this, group, member, &m2_active,
+                                 &m2_commands](StepEncoder& encoder) {
+                                    if (group->command &&
+                                        group->leader == member) {
+                                        m1_runtime_->encode_m3_post(
+                                            group->command, encoder);
+                                    } else if (m2_active[member] != 0) {
+                                        m1_runtime_->encode_m2_post(
+                                            m2_commands[member], encoder);
+                                    }
+                                };
+                            // Keep GPU staging enabled so a failed grouping
+                            // attempt can safely use singleton fallback.
+                            callbacks[slot].consumes_logits_directly = false;
+                        }
+                    }
+
+                    for (std::size_t m = 0; m < M; ++m) {
+                        LaunchMember& member = job->members[m];
+                        if (direct_eligible[m] == 0 ||
+                            m3_for_member[m] != nullptr) {
+                            continue;
+                        }
+                        const std::size_t slot =
+                            static_cast<std::size_t>(member.fwd_slot);
+                        const auto& inputs = member_inputs[m];
+                        std::string m2_error;
+                        if (command_context == nullptr ||
+                            !m1_runtime_->prepare_m2_command(
+                                prepared[m],
+                                inputs,
+                                *command_context,
+                                m2_commands[m],
+                                m2_error)) {
+                            if (member.requires_m2) {
+                                executor_ready = false;
+                                setup_err =
+                                    "required Metal M2 placement failed: " +
+                                    m2_error;
+                                break;
+                            }
+                            if (cfg_.runtime.verbose && !m2_error.empty()) {
+                                std::cerr
+                                    << "[pie-driver-metal] M2 singleton fallback: "
+                                    << m2_error << "\n";
+                            }
+                            continue;
+                        }
+                        callbacks[slot].pre_forward =
+                            [this, command = m2_commands[m]](
+                                StepEncoder& encoder) {
+                                m1_runtime_->encode_m2_pre(
+                                    command, encoder);
+                            };
+                        callbacks[slot].post_forward =
+                            [this, command = m2_commands[m]](
+                                StepEncoder& encoder) {
+                                m1_runtime_->encode_m2_post(
+                                    command, encoder);
+                            };
+                        callbacks[slot].set_logits_row =
+                            [this, command = m2_commands[m]](
+                                std::uint32_t row) {
+                                m1_runtime_->set_m2_logits_row(
+                                    command, row);
+                            };
+                        callbacks[slot].consumes_logits_directly = true;
+                        m2_active[m] = 1;
+                    }
+                    if (executor_ready) {
+                        executor_->forward_batch(
+                            job->fwd_descs,
+                            fwd_outs,
+                            fwd_ok,
+                            fwd_err,
+                            &callbacks);
+                    }
+#else
+                    executor_->forward_batch(
+                        job->fwd_descs, fwd_outs, fwd_ok, fwd_err);
+#endif
                 }
             } catch (const std::exception& e) {
                 executor_ready = false;
@@ -632,8 +1134,28 @@ class Context::Impl {
                 setup_err = "forward raised: unknown exception";
             }
         }
+#if defined(__APPLE__)
+        for (const auto& group : m3_groups) {
+            if (group->command == nullptr) continue;
+            std::string group_error;
+            const auto group_outcomes =
+                m1_runtime_->finish_m3_group(
+                    group->command, group_error);
+            for (std::size_t lane = 0;
+                 lane < group_outcomes.size() &&
+                 lane < group->accepted_members.size();
+                 ++lane) {
+                m3_outcomes[group->accepted_members[lane]] =
+                    group_outcomes[lane];
+            }
+            if (!group_error.empty() && cfg_.runtime.verbose) {
+                std::cerr << "[pie-driver-metal] M3 finish: "
+                          << group_error << "\n";
+            }
+        }
+#endif
 
-        // ── Phase 2: interp step + channel settlement (under the state mutex) ──
+        // ── Phase 2: generated singleton execution + channel settlement. ──
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             for (std::size_t m = 0; m < M; ++m) {
@@ -646,19 +1168,29 @@ class Context::Impl {
                     std::cerr << "[pie-driver-metal] launch: instance " << lm.instance_id
                               << " was closed before its accepted fire settled\n";
                     outcomes[m] = PIE_TERMINAL_OUTCOME_FAILED;
+#if defined(__APPLE__)
+                    if (m1_runtime_ != nullptr) m1_runtime_->release(prepared[m]);
+#endif
                     continue;
                 }
                 InstanceRecord& member = *instance;
+#if !defined(__APPLE__)
                 const ProgramRecord& program =
                     *registry_.find_program(member.program_id);
+#endif
                 member.fire_seq += 1;
                 std::string failure;
+#if !defined(__APPLE__)
                 interp::PassInputs pass_in{};
-                bool ok = true;
+#endif
+                bool ok = lm.build_err.empty();
+                if (!ok) failure = lm.build_err;
+#if defined(__APPLE__)
+                pipeline::M1DeviceInputs generated_inputs;
+#endif
                 if (lm.needs_forward) {
-                    if (!lm.build_err.empty()) {
-                        ok = false;
-                        failure = lm.build_err;
+                    if (!ok) {
+                        // Preserve the preparation/geometry failure.
                     } else if (!executor_ready) {
                         ok = false;
                         failure = "Metal executor setup failed: " + setup_err;
@@ -670,15 +1202,52 @@ class Context::Impl {
                                               : "forward member was not scheduled";
                         } else {
                             const executor::LogitsOut& lo = fwd_outs[static_cast<std::size_t>(si)];
+#if defined(__APPLE__)
+                            const auto& desc =
+                                job->fwd_descs[static_cast<std::size_t>(si)];
+                            generated_inputs =
+                                pipeline::m1_singleton_fallback_inputs(
+                                    lo, desc, lm.mtp_draft_row);
+#else
                             pass_in.logits = lo.data.data();
                             pass_in.rows = lo.rows;
                             pass_in.vocab = lo.vocab;
                             pass_in.mtp_draft_row = -1;  // MtpLogits falls back to row 0
+#endif
                         }
                     }
                 }
                 try {
                     if (ok) {
+#if defined(__APPLE__)
+                        const pipeline::M1ExecuteOutcome generated =
+                            m3_active[m] != 0
+                                ? m3_outcomes[m]
+                            : m2_active[m] != 0
+                                ? m1_runtime_->finish_m2_command(
+                                      m2_commands[m], failure)
+                                : m1_runtime_->execute(
+                                      prepared[m],
+                                      generated_inputs,
+                                      failure);
+                        if (generated ==
+                            pipeline::M1ExecuteOutcome::Retry) {
+                            if (cfg_.runtime.verbose) {
+                                std::cerr << "[pie-driver-metal] M1 retry: "
+                                          << failure << "\n";
+                            }
+                            outcomes[m] = PIE_TERMINAL_OUTCOME_RETRY;
+                            m1_runtime_->release(prepared[m]);
+                            continue;
+                        }
+                        if (generated ==
+                            pipeline::M1ExecuteOutcome::Failed) {
+                            ok = false;
+                        } else {
+                            queue_channel_notifications(
+                                lm.tickets, notifications);
+                        }
+#else
                         const MemberRunOutcome run = run_member(
                             member, program, lm.tickets, pass_in, notifications, failure);
                         if (run == MemberRunOutcome::Retry) {
@@ -686,6 +1255,7 @@ class Context::Impl {
                             continue;
                         }
                         if (run == MemberRunOutcome::Failed) ok = false;
+#endif
                     }
                 } catch (const std::exception& e) {
                     ok = false;
@@ -700,6 +1270,14 @@ class Context::Impl {
                     poison_instance(member, notifications);
                     outcomes[m] = PIE_TERMINAL_OUTCOME_FAILED;
                 }
+#if defined(__APPLE__)
+                if (m2_commands[m] != nullptr) {
+                    std::string ignored;
+                    (void)m1_runtime_->finish_m2_command(
+                        m2_commands[m], ignored);
+                }
+                if (m1_runtime_ != nullptr) m1_runtime_->release(prepared[m]);
+#endif
             }
         }
 
@@ -711,6 +1289,53 @@ class Context::Impl {
         }
         for (const auto& [wait_id, epoch] : notifications) notify(wait_id, epoch);
         notify(job->completion.wait_id, job->completion.target_epoch);
+        if (cfg_.runtime.verbose) {
+            const M0TimingSnapshot timing =
+                m0_timing_counters().snapshot() - timing_before;
+            std::cerr
+                << "[pie-driver-metal] ptir_m0_timing"
+                << " cpu_epilogue_ns=" << timing.cpu_epilogue_ns
+                << " cpu_epilogue_samples=" << timing.cpu_epilogue_samples
+                << " bf16_conversion_ns=" << timing.bf16_conversion_ns
+                << " bf16_conversion_samples="
+                << timing.bf16_conversion_samples
+                << " forward_wait_ns=" << timing.forward_wait_ns
+                << " forward_wait_samples=" << timing.forward_wait_samples
+                << " forward_wait_timeouts="
+                << timing.forward_wait_timeouts
+                << "\n";
+#if defined(__APPLE__)
+            if (m1_runtime_ != nullptr) {
+                const pipeline::M3GroupStats m3_after =
+                    m1_runtime_->m3_stats();
+                std::cerr
+                    << "[pie-driver-metal] ptir_m3"
+                    << " grouped_readiness_launches="
+                    << m3_after.readiness_launches -
+                           m3_before.readiness_launches
+                    << " grouped_body_launches="
+                    << m3_after.body_launches - m3_before.body_launches
+                    << " grouped_library_launches="
+                    << m3_after.library_launches -
+                           m3_before.library_launches
+                    << " grouped_parallel_selection_launches="
+                    << m3_after.parallel_selection_launches -
+                           m3_before.parallel_selection_launches
+                    << " grouped_fallback_launches="
+                    << m3_after.singleton_fallback_launches -
+                           m3_before.singleton_fallback_launches
+                    << " grouped_commit_launches="
+                    << m3_after.commit_launches -
+                           m3_before.commit_launches
+                    << " grouped_lanes="
+                    << m3_after.lanes - m3_before.lanes
+                    << " post_forward_critical_ns="
+                    << m3_after.post_forward_critical_ns -
+                           m3_before.post_forward_critical_ns
+                    << "\n";
+            }
+#endif
+        }
     }
 
     // Phase 1b/3 paged-KV bridge: real, page-addressable KV pool copy — see
@@ -867,6 +1492,14 @@ class Context::Impl {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
         const auto target_pages = static_cast<std::uint32_t>(resize.target_pages);
+        const std::uint32_t allocated_pages =
+            effective_total_pages(cfg_, facts_.has_linear_attn);
+        if (target_pages > allocated_pages) {
+            std::cerr
+                << "[pie-driver-metal] resize_pool: growth beyond the fixed "
+                   "paged-IO allocation is unsupported\n";
+            return PIE_STATUS_UNSUPPORTED;
+        }
         // A shrink is only accepted if the caller's `unmap_ranges` fully
         // covers every page in [target_pages, current_pages) — this driver
         // has no independent way to know which physical pages the runtime
@@ -938,9 +1571,8 @@ class Context::Impl {
         runtime_.notify(runtime_.ctx, wait_id, epoch);
     }
 
+#if !defined(__APPLE__)
     TicketPreparation prepare_member_tickets(
-        InstanceRecord& member,
-        const ProgramRecord& program,
         const std::vector<executor::ChannelTicket>& tickets,
         std::string& failure) {
         for (const auto& ticket : tickets) {
@@ -949,15 +1581,15 @@ class Context::Impl {
                 failure = "ticket references a closed channel";
                 return TicketPreparation::Failed;
             }
-            const std::uint64_t poison = load_word(endpoint->words, 2);
-            const std::uint64_t closed = load_word(endpoint->words, 3);
+            const std::uint64_t poison = endpoint->shared_state->poison();
+            const std::uint64_t closed = endpoint->shared_state->closed();
             if (poison != 0 || closed != 0) {
                 failure = poison != 0 ? "ticket channel is poisoned"
                                       : "ticket channel is closed";
                 return TicketPreparation::Failed;
             }
-            const std::uint64_t head = load_word(endpoint->words, 0);
-            const std::uint64_t tail = load_word(endpoint->words, 1);
+            const std::uint64_t head = endpoint->shared_state->head();
+            const std::uint64_t tail = endpoint->shared_state->tail();
             if (tail < head) {
                 failure = "channel tail precedes head";
                 return TicketPreparation::Failed;
@@ -981,53 +1613,9 @@ class Context::Impl {
             }
         }
 
-        for (const auto& ticket : tickets) {
-            ChannelRecord& endpoint = *registry_.find_channel(ticket.channel_id);
-            if (endpoint.desc.host_role != PIE_CHANNEL_HOST_ROLE_WRITER ||
-                !ticket.requires_input) {
-                continue;
-            }
-            const int status =
-                pull_writer_ring(member, program, ticket.dense, endpoint);
-            if (status != PIE_STATUS_OK) {
-                failure = "writer ring pull failed for channel " +
-                          std::to_string(ticket.channel_id);
-                return TicketPreparation::Failed;
-            }
-        }
         return TicketPreparation::Ready;
     }
-
-    // Execution-time driver pull: move host-published writer-ring cells into
-    // the interpreter only after immutable ticket validation succeeds.
-    int pull_writer_ring(InstanceRecord& member, const ProgramRecord& program,
-                         std::size_t dense, ChannelRecord& endpoint) {
-        const std::size_t cell =
-            interp::wire_cell_bytes(endpoint.program_dtype(), endpoint.numel());
-        const std::uint64_t cap1 = static_cast<std::uint64_t>(endpoint.desc.capacity) + 1;
-        for (;;) {
-            const std::uint64_t tail = load_word(endpoint.words, 1);
-            if (endpoint.pulled >= tail) return PIE_STATUS_OK;
-            const std::size_t offset = static_cast<std::size_t>(endpoint.pulled % cap1) * cell;
-            interp::Value value;
-            if (!interp::decode_wire(endpoint.mirror.data() + offset, cell,
-                                     endpoint.program_dtype(), endpoint.numel(), value)) {
-                return PIE_STATUS_INVALID_ARGUMENT;
-            }
-            switch (interp::host_put(member.interp, program.plan,
-                                     static_cast<std::uint32_t>(dense), std::move(value))) {
-                case interp::HostOp::Ok:
-                    endpoint.pulled += 1;
-                    break;
-                case interp::HostOp::WouldBlock:
-                    return PIE_STATUS_OK;
-                default:
-                    std::cerr << "[pie-driver-metal] writer ring pull failed for channel "
-                              << endpoint.desc.channel_id << "\n";
-                    return PIE_STATUS_INVALID_ARGUMENT;
-            }
-        }
-    }
+#endif
 
     // C2 (forward-needing) members only: lazily creates the executor on the
     // first forward-needing launch (mirrors CUDA's lazy `ptir_dispatch`,
@@ -1103,7 +1691,7 @@ class Context::Impl {
         if (device_geometry) {
             const interp::GeometryResolveResult resolution =
                 interp::resolve_fire_geometry_typed(
-                    program.plan.trace,
+                    program.plan,
                     member.interp,
                     cfg_.batching.kv_page_size,
                     resolved,
@@ -1119,8 +1707,8 @@ class Context::Impl {
                     failure = "descriptor channel is closed";
                     return ForwardBuildResult::Failed;
                 }
-                const std::uint64_t poison = load_word(endpoint->words, 2);
-                const std::uint64_t closed = load_word(endpoint->words, 3);
+                const std::uint64_t poison = endpoint->shared_state->poison();
+                const std::uint64_t closed = endpoint->shared_state->closed();
                 if (poison != 0 || closed != 0) {
                     failure =
                         poison != 0
@@ -1157,6 +1745,7 @@ class Context::Impl {
                    m,
                    member_count,
                    facts_.has_linear_attn,
+                   cfg_.batching.kv_page_size,
                    device_geometry ? &resolved : nullptr,
                    desc,
                    failure)
@@ -1164,6 +1753,28 @@ class Context::Impl {
                    : ForwardBuildResult::Failed;
     }
 
+    void queue_channel_notifications(
+        const std::vector<executor::ChannelTicket>& tickets,
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>& notifications) {
+        for (const auto& ticket : tickets) {
+            ChannelRecord& endpoint =
+                *registry_.find_channel(ticket.channel_id);
+            if (ticket.expected_head != executor::kNoChannelTicket &&
+                endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_WRITER) {
+                notifications.emplace_back(
+                    endpoint.desc.writer_wait_id,
+                    ticket.expected_head + 1);
+            }
+            if (ticket.expected_tail != executor::kNoChannelTicket &&
+                endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_READER) {
+                notifications.emplace_back(
+                    endpoint.desc.reader_wait_id,
+                    ticket.expected_tail + 1);
+            }
+        }
+    }
+
+#if !defined(__APPLE__)
     MemberRunOutcome run_member(
         InstanceRecord& member,
         const ProgramRecord& program,
@@ -1171,6 +1782,14 @@ class Context::Impl {
         const interp::PassInputs& pass_in,
         std::vector<std::pair<std::uint64_t, std::uint64_t>>& notifications,
         std::string& failure) {
+        struct TimingRecorder {
+            M0TimingCounters::Clock::time_point begin =
+                M0TimingCounters::Clock::now();
+            ~TimingRecorder() {
+                m0_timing_counters().record_cpu_epilogue(
+                    M0TimingCounters::Clock::now() - begin);
+            }
+        } timing;
         const interp::StepResult report = interp::step(member.interp, program.plan, pass_in);
         if (!report.ok) {
             failure = report.error;
@@ -1180,46 +1799,19 @@ class Context::Impl {
             return MemberRunOutcome::Retry;
         }
 
-        for (const auto& ticket : tickets) {
-            ChannelRecord& endpoint = *registry_.find_channel(ticket.channel_id);
-            if (ticket.expected_tail == executor::kNoChannelTicket ||
-                endpoint.desc.host_role != PIE_CHANNEL_HOST_ROLE_READER) {
-                continue;
-            }
-            interp::Value value;
-            const interp::HostOp status = interp::host_take(
-                member.interp,
-                program.plan,
-                static_cast<std::uint32_t>(ticket.dense),
-                value);
-            if (status != interp::HostOp::Ok) {
-                failure = "host output unavailable for channel " +
-                          std::to_string(endpoint.desc.channel_id);
-                return MemberRunOutcome::Failed;
-            }
-            const std::size_t cell =
-                interp::wire_cell_bytes(endpoint.program_dtype(), endpoint.numel());
-            const std::uint64_t cap1 =
-                static_cast<std::uint64_t>(endpoint.desc.capacity) + 1;
-            interp::encode_wire(
-                value,
-                endpoint.mirror.data() +
-                    static_cast<std::size_t>(ticket.expected_tail % cap1) * cell);
-        }
-
+        // step() wrote pending values directly into the endpoint's authoritative
+        // Shared-storage ring and release-published its head/tail words. Only
+        // wake publication remains here.
         for (const auto& ticket : tickets) {
             ChannelRecord& endpoint = *registry_.find_channel(ticket.channel_id);
             if (ticket.expected_head != executor::kNoChannelTicket) {
                 const std::uint64_t actual = ticket.expected_head + 1;
-                store_word(endpoint.words, 0, actual);
                 if (endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_WRITER) {
                     notifications.emplace_back(endpoint.desc.writer_wait_id, actual);
                 }
             }
             if (ticket.expected_tail != executor::kNoChannelTicket) {
                 const std::uint64_t actual = ticket.expected_tail + 1;
-                store_word(endpoint.words, 1, actual);
-                store_word(endpoint.words, 2, 0);
                 if (endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_READER) {
                     notifications.emplace_back(endpoint.desc.reader_wait_id, actual);
                 }
@@ -1227,6 +1819,7 @@ class Context::Impl {
         }
         return MemberRunOutcome::Committed;
     }
+#endif
 
     // D4 failure settlement: poison every attached channel's word (epoch
     // `tail + 1`, first poison wins device-side by construction) and queue the
@@ -1236,9 +1829,9 @@ class Context::Impl {
         member.interp.poisoned = true;
         for (const std::uint64_t channel_id : member.channel_ids) {
             ChannelRecord& endpoint = *registry_.find_channel(channel_id);
-            const std::uint64_t tail = load_word(endpoint.words, 1);
+            const std::uint64_t tail = endpoint.shared_state->tail();
             const std::uint64_t poison_epoch = std::max<std::uint64_t>(tail + 1, 1);
-            store_word(endpoint.words, 2, poison_epoch);
+            endpoint.shared_state->store_word(2, poison_epoch);
             const std::uint64_t wait_id =
                 endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_READER
                     ? endpoint.desc.reader_wait_id
@@ -1271,6 +1864,9 @@ class Context::Impl {
     // command-queue thread-affinity + FIFO serialization. Declared BEFORE
     // `executor_` so the worker is still alive while `executor_` is destroyed.
     executor::ExecutorWorker worker_;
+#if defined(__APPLE__)
+    std::unique_ptr<pipeline::M1Runtime> m1_runtime_;
+#endif
     // Lazily created on the first forward-needing (C2) launch (§5.1); zero
     // Metal dependencies leak into this translation unit beyond the plain
     // executor::MetalExecutor interface. Only ever touched on `worker_`'s

@@ -19,7 +19,7 @@
 //! fork/freeze/compact driver geometry (thrust-1+3).
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 /// Beam width (lanes) — small, matching the validated reference.
 const B: u32 = 2;
@@ -75,7 +75,10 @@ async fn main(_input: String) -> Result<String> {
     fwd.attn_mask(kvm);
     fwd.epilogue(move || {
         // cand = running scores ⊕ log_softmax(logits); (s, i) = top_k over [B*V].
-        let cand = add(broadcast(reshape(scores.take(), [B, 1]), [B, v]), log_softmax(intrinsics::logits()));
+        let cand = add(
+            broadcast(reshape(scores.take(), [B, 1]), [B, v]),
+            log_softmax(intrinsics::logits()),
+        );
         let (s, i) = top_k(reshape(cand, [B * v]), B);
         let parent = div(&i, v); // which lane each survivor came from
         // Reorder = row gathers by parent.
@@ -93,7 +96,10 @@ async fn main(_input: String) -> Result<String> {
         let off = select(&cont, &tf, 0u32);
         let n2 = select(&cont, &n, add(&n, 1u32));
         let tcol = add(mul(&lanes, P), sub(&n2, 1u32)); // flat index of each lane's tail entry
-        pages.put(reshape(scatter_set(reshape(pg, [B * P]), &tcol, &slot), [B, P]));
+        pages.put(reshape(
+            scatter_set(reshape(pg, [B * P]), &tcol, &slot),
+            [B, P],
+        ));
         let off1 = add(&off, 1u32);
         let pl2 = reshape(scatter_set(reshape(pl, [B * P]), &tcol, &off1), [B, P]);
         lens.put(&pl2); // the source; klen/kvm are its two derivatives (put-only, tracer drains)
@@ -124,12 +130,27 @@ async fn main(_input: String) -> Result<String> {
     let mut hyp_tokens: Vec<u32> = Vec::new();
     for step in 0..MAX_STEPS {
         // Fresh headroom for this fire: B grant ids from the working set (D2).
-        let grant = ws.reserve(B).map_err(|e| format!("ws.reserve @{step}: {e}"))?;
+        let grant = ws
+            .reserve(B)
+            .map_err(|e| format!("ws.reserve @{step}: {e}"))?;
         fresh.put(grant);
-        fwd.submit(&pipeline).map_err(|e| format!("submit @{step}: {e}"))?;
-        let picked = out.take().get::<i32>().map_err(|e| format!("out.take @{step}: {e}"))?;
-        let _parents = out_par.take().get::<u32>().map_err(|e| format!("out_par.take @{step}: {e}"))?;
-        let _scr = out_scr.take().get::<f32>().map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+        fwd.submit(&pipeline)
+            .map_err(|e| format!("submit @{step}: {e}"))?;
+        let picked = out
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("out.take @{step}: {e}"))?;
+        let _parents = out_par
+            .take()
+            .get::<u32>()
+            .await
+            .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+        let _scr = out_scr
+            .take()
+            .get::<f32>()
+            .await
+            .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);
         }

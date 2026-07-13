@@ -36,7 +36,7 @@
 //! decode loop continues over the SAME pool pages.
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 const PAGE_T: u32 = 16; // tokens per pool page
 const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
@@ -58,7 +58,9 @@ async fn main(_input: String) -> Result<String> {
     let prompt: Vec<u32> = wit_model::encode("The capital of France is the city of");
     let n = prompt.len() as u32;
     if n < 2 {
-        return Err(format!("prompt must be multi-token to prove prefill (n={n})"));
+        return Err(format!(
+            "prompt must be multi-token to prove prefill (n={n})"
+        ));
     }
     if n + DECODE_STEPS as u32 >= POOL {
         return Err(format!("prompt ({n}) + decode exceeds pool ({POOL})"));
@@ -67,7 +69,9 @@ async fn main(_input: String) -> Result<String> {
 
     // Shared physical page pool (the KV store both pipelines bind).
     let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let pool = ws.reserve(POOL_PAGES).map_err(|e| format!("ws.reserve: {e}"))?;
+    let pool = ws
+        .reserve(POOL_PAGES)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
     let pool_ids: &'static Vec<u32> = bx(pool.ids().to_vec()); // [POOL_PAGES] physical
 
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
@@ -111,8 +115,14 @@ async fn main(_input: String) -> Result<String> {
     });
 
     let prefill = Pipeline::new();
-    fwd_p.submit(&prefill).map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?[0];
+    fwd_p
+        .submit(&prefill)
+        .map_err(|e| format!("prefill submit: {e}"))?;
+    let g0 = g0_ch
+        .take()
+        .get::<i32>()
+        .await
+        .map_err(|e| format!("g0 take: {e}"))?[0];
     prefill.close();
     println!("[prefill] N-wide fire committed; first generated token g0={g0}");
 
@@ -182,8 +192,13 @@ async fn main(_input: String) -> Result<String> {
     generated.push(g0 as u32);
     for step in 0..DECODE_STEPS {
         pool_ids_ch.put(pool_ids.clone());
-        fwd.submit(&decode).map_err(|e| format!("decode submit @{step}: {e}"))?;
-        let t = out.take().get::<i32>().map_err(|e| format!("out.take @{step}: {e}"))?;
+        fwd.submit(&decode)
+            .map_err(|e| format!("decode submit @{step}: {e}"))?;
+        let t = out
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("out.take @{step}: {e}"))?;
         if let Some(&t0) = t.first() {
             generated.push(t0 as u32);
         }
@@ -198,7 +213,9 @@ async fn main(_input: String) -> Result<String> {
     );
     println!("{result}");
     if distinct.len() < 2 {
-        return Err(format!("degenerate continuation (all same token): {generated:?}"));
+        return Err(format!(
+            "degenerate continuation (all same token): {generated:?}"
+        ));
     }
     Ok(result)
 }

@@ -5,6 +5,7 @@
 #include <pie_driver_abi.h>
 
 #include "entry_validation.hpp"
+#include "pie_native/abi_validation.hpp"
 #include "pie_native/ptir/fire_geometry.hpp"
 
 namespace {
@@ -156,6 +157,84 @@ int main() {
     if (!expect(pie_cuda_launch(driver, &launch, completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects count overflow")) return 1;
+    const std::uint32_t resolved_rs_slots[] = {2, 3};
+    const std::uint8_t resolved_rs_flags[] = {
+        PIE_RS_FLAG_RESET, 0};
+    const std::uint32_t resolved_fold_lens[] = {0, 0};
+    const std::uint32_t resolved_buffer_slots[] = {1, 2};
+    const std::uint32_t resolved_buffer_indptr[] = {0, 1, 2};
+    PieTerminalCell resolved_terminal{};
+    PieTerminalCell* resolved_terminals[] = {&resolved_terminal};
+    PieLaunchDesc device_geometry_rs{};
+    device_geometry_rs.abi_version = PIE_DRIVER_ABI_VERSION;
+    device_geometry_rs.instance_ids = {
+        .ptr = &instance_id,
+        .len = 1,
+    };
+    device_geometry_rs.terminal_cells = {
+        .ptr = resolved_terminals,
+        .len = 1,
+    };
+    device_geometry_rs.rs_slot_ids = {
+        .ptr = resolved_rs_slots,
+        .len = 2,
+    };
+    device_geometry_rs.rs_slot_flags = {
+        .ptr = resolved_rs_flags,
+        .len = 2,
+    };
+    device_geometry_rs.rs_fold_lens = {
+        .ptr = resolved_fold_lens,
+        .len = 2,
+    };
+    device_geometry_rs.rs_buffer_slot_ids = {
+        .ptr = resolved_buffer_slots,
+        .len = 2,
+    };
+    device_geometry_rs.rs_buffer_slot_indptr = {
+        .ptr = resolved_buffer_indptr,
+        .len = 3,
+    };
+    if (!expect(
+            pie_native::abi::validate_launch_desc(&device_geometry_rs) ==
+                    PIE_STATUS_OK &&
+                pie_cuda_driver::abi::validate_launch_resources(
+                    device_geometry_rs, 4, 16, 8, 8,
+                    pie_cuda_driver::abi::MultimodalLimits{}) ==
+                    PIE_STATUS_OK,
+            "solo instance accepts B=2 resolved folded RS rows")) {
+        return 1;
+    }
+    const std::uint32_t bad_buffer_indptr[] = {0, 2, 1};
+    device_geometry_rs.rs_buffer_slot_indptr = {
+        .ptr = bad_buffer_indptr,
+        .len = 3,
+    };
+    if (!expect(
+            pie_native::abi::validate_launch_desc(&device_geometry_rs) ==
+                PIE_STATUS_INVALID_ARGUMENT,
+            "deferred buffered RS CSR still rejects non-monotonic input")) {
+        return 1;
+    }
+    device_geometry_rs.rs_buffer_slot_indptr = {
+        .ptr = resolved_buffer_indptr,
+        .len = 3,
+    };
+    device_geometry_rs.rs_slot_flags.len = 1;
+    if (!expect(
+            pie_native::abi::validate_launch_desc(&device_geometry_rs) ==
+                PIE_STATUS_INVALID_ARGUMENT,
+            "resolved folded RS rejects mismatched ids/flags")) {
+        return 1;
+    }
+    device_geometry_rs.rs_slot_flags.len = 2;
+    device_geometry_rs.rs_fold_lens.len = 1;
+    if (!expect(
+            pie_native::abi::validate_launch_desc(&device_geometry_rs) ==
+                PIE_STATUS_INVALID_ARGUMENT,
+            "resolved folded RS rejects mismatched fold lengths")) {
+        return 1;
+    }
 
     PieKvCopyDesc kv{};
     kv.abi_version = PIE_DRIVER_ABI_VERSION + 1;
@@ -259,7 +338,6 @@ int main() {
                     resource_launch, 4, 16, 2, 0, no_multimodal) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "CUDA launch rejects out-of-range recurrent slot")) return 1;
-
     const std::uint32_t image_grid[] = {1, 1, 1};
     const std::uint32_t image_anchor_row[] = {0};
     const std::uint32_t image_pixel_indptr[] = {0, 3072};
@@ -298,6 +376,38 @@ int main() {
     if (!expect(pie_native::ptir::validate_fire_geometry(
                     geometry, 4, 16),
                 "resolved device geometry accepts valid descriptor")) return 1;
+    geometry.structured_mask = {
+        pie_native::ptir::StructuredMaskKind::Causal, 1, 0, 0};
+    if (!expect(pie_native::ptir::validate_fire_geometry(
+                   geometry, 4, 16),
+                "structured extent validates without a dense mask")) return 1;
+    geometry.structured_mask = {
+        pie_native::ptir::StructuredMaskKind::SlidingWindow, 1, 0, 0};
+    if (!expect(pie_native::ptir::validate_fire_geometry(
+                   geometry, 4, 16),
+                "zero-width sliding descriptor is valid")) return 1;
+    geometry.structured_mask = {
+        pie_native::ptir::StructuredMaskKind::SinkWindow, 1, 99, 0};
+    if (!expect(pie_native::ptir::validate_fire_geometry(
+                   geometry, 4, 16),
+                "sink extent may exceed key length")) return 1;
+    geometry.structured_mask.key_len = 0;
+    if (!expect(!pie_native::ptir::validate_fire_geometry(
+                   geometry, 4, 16),
+                "structured extent rejects independently of dense fallback")) {
+        return 1;
+    }
+    geometry.structured_mask = {};
+    pie_native::ptir::FireGeometry idle_geometry;
+    idle_geometry.qo_indptr = {0, 0};
+    idle_geometry.sampling_indptr = {0, 0};
+    idle_geometry.structured_mask = {
+        pie_native::ptir::StructuredMaskKind::Causal, 16, 0, 0};
+    if (!expect(pie_native::ptir::validate_fire_geometry(
+                    idle_geometry, 4, 16),
+                "idle structured geometry does not index absent KV arrays")) {
+        return 1;
+    }
     geometry.w_page[0] = 4;
     if (!expect(!pie_native::ptir::validate_fire_geometry(
                     geometry, 4, 16),

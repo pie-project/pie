@@ -7,10 +7,71 @@
 #define PTIR_MAGIC "PTIR"
 #define PTIR_VERSION 1
 #define PTIB_MAGIC "PTIB" // bound-trace typed sidecar (PTIR-CONTAINER.md section 7)
-#define PTIB_VERSION 1
+#define PTIB_VERSION 2
 // v1.1 extern channels (PTIR-CONTAINER.md section 6b): wire-version 2 iff externs
 #define PTIR_VERSION_EXTERN 2
 enum PtirExternDir : uint8_t { PTIR_EXTERN_IMPORT = 0, PTIR_EXTERN_EXPORT = 1 };
+
+#define PTIR_COMPILER_VERSION 3
+#define PTIR_REGION_PLAN_VERSION 4
+#define PTIR_LANE_TABLE_ABI_VERSION 2
+
+enum PtirSymbolicExtent : uint8_t {
+PTIR_EXTENT_KV_LEN = 0,
+PTIR_EXTENT_PAGE_COUNT = 1,
+PTIR_EXTENT_ROW_COUNT = 2,
+PTIR_EXTENT_TOKEN_COUNT = 3,
+PTIR_EXTENT_SAMPLED_ROWS = 4,
+PTIR_EXTENT_QUERY_LEN = 5,
+PTIR_EXTENT_KEY_LEN = 6,
+};
+
+enum PtirScheduleTemplate : uint8_t {
+PTIR_SCHEDULE_EFFECTS = 0,
+PTIR_SCHEDULE_ONE_CTA_PER_ROW = 1,
+PTIR_SCHEDULE_HIERARCHICAL_ROW = 2,
+PTIR_SCHEDULE_LIBRARY = 3,
+};
+
+enum PtirLibraryOp : uint8_t {
+PTIR_LIBRARY_NUCLEUS_SAMPLE = 0,
+PTIR_LIBRARY_TOP_K = 1,
+PTIR_LIBRARY_SORT = 2,
+PTIR_LIBRARY_SCAN = 3,
+PTIR_LIBRARY_MATMUL = 4,
+PTIR_LIBRARY_SECOND_PARTY = 5,
+};
+
+typedef struct PtirLaneTableHeader {
+uint32_t abi_version;
+uint32_t lane_count;
+uint32_t channel_slots_per_lane;
+uint32_t flags;
+} PtirLaneTableHeader;
+
+typedef struct PtirLaneRecord {
+uint64_t logits_base;
+uint32_t logits_row_offset;
+uint32_t logits_row_count;
+uint32_t kv_len;
+uint32_t page_count;
+uint32_t row_count;
+uint32_t token_count;
+uint32_t sampled_rows;
+uint32_t query_len;
+uint32_t key_len;
+uint32_t channel_slot_offset;
+uint64_t rng_state;
+uint64_t commit_slot;
+uint64_t active_row_mask;
+} PtirLaneRecord;
+
+typedef struct PtirLaneChannelSlot {
+uint64_t committed_cell;
+uint64_t pending_cell;
+uint64_t expected_head;
+uint64_t expected_tail;
+} PtirLaneChannelSlot;
 
 // ── op tags (X-macro: name, tag, value-operands, results; 0xFF = variadic) ──
 #define PTIR_OP_LIST(X) \
@@ -57,6 +118,9 @@ enum PtirExternDir : uint8_t { PTIR_EXTERN_IMPORT = 0, PTIR_EXTERN_EXPORT = 1 };
   X(scatter_set, 0x63, 3, 1) \
   X(iota, 0x64, 0, 1) \
   X(mask_apply_packed, 0x65, 2, 1) \
+  X(causal_mask, 0x66, 1, 1) \
+  X(sliding_window_mask, 0x67, 1, 1) \
+  X(sink_window_mask, 0x68, 1, 1) \
   X(rng, 0x70, 0, 1) \
   X(rng_keyed, 0x71, 1, 1) \
   X(const, 0x81, 0, 1) \
@@ -111,6 +175,9 @@ enum PtirOpTag : uint8_t {
   PTIR_OP_SCATTER_SET = 0x63,
   PTIR_OP_IOTA = 0x64,
   PTIR_OP_MASK_APPLY_PACKED = 0x65,
+  PTIR_OP_CAUSAL_MASK = 0x66,
+  PTIR_OP_SLIDING_WINDOW_MASK = 0x67,
+  PTIR_OP_SINK_WINDOW_MASK = 0x68,
   PTIR_OP_RNG = 0x70,
   PTIR_OP_RNG_KEYED = 0x71,
   PTIR_OP_CONST = 0x81,
@@ -182,4 +249,4 @@ enum PtirChannelClass : uint8_t { PTIR_CHAN_FULL_RING = 0, PTIR_CHAN_IN_PLACE = 
 // rank_le(k): #strictly-greater < k (ties may admit > k elements at the boundary).
 // cummass_le(p): inclusive nucleus (keep while exclusive prefix mass < p). prob_ge: >=.
 // rng_keyed(state=[key,ctr]): seed64 = splitmix64((key<<32)|ctr); u(j) = hash_uniform(seed64, j)
-//   with splitmix64/hash_uniform exactly as BYTECODE.md §5 / eval.rs; gumbel = -log(-log(u)).
+//   with splitmix64/hash_uniform exactly as interface/ptir/src/rng.rs; gumbel = -log(-log(u)).

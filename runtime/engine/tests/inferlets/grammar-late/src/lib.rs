@@ -159,10 +159,12 @@ async fn main(input: String) -> Result<String> {
         let token = tok_out
             .take()
             .get::<i32>()
+            .await
             .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
         let logits = raw
             .take()
             .get::<f32>()
+            .await
             .map_err(|e| format!("raw.take @{step}: {e}"))?;
 
         // Assert #1 CONFORM: device token == host apply_mask_argmax(raw, mask).

@@ -33,4 +33,7 @@ pub trait FireContext {
     /// Honor a requester self-suspend decision while this task still owns the
     /// process continuation.
     async fn honor_preemption(&mut self) -> anyhow::Result<()>;
+
+    /// Notification raised when this process is asked to quiesce.
+    fn preemption_signal(&self) -> Option<std::sync::Arc<tokio::sync::Notify>>;
 }

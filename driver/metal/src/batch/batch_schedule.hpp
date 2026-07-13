@@ -37,6 +37,9 @@ struct BatchStepInputs {
     std::vector<std::uint8_t> rs_slot_flags;
     std::vector<std::uint32_t> w_page;
     std::vector<std::uint32_t> w_off;
+    std::vector<std::uint8_t> attention_mask;
+    std::vector<std::uint8_t> attention_mask_enabled;
+    std::uint32_t attention_mask_stride = 0;
 };
 
 // Per-request spans, precomputed once per fire so the dispatch + read-walk avoid re-deriving.

@@ -40,4 +40,5 @@ rustup target add wasm32-wasip2
 cargo build --target wasm32-wasip2 --release
 ```
 
-Most examples live under `inferlets/`.
+Curated runnable fixtures live under `tests/inferlets/`; they are not bundled
+with Pie distributions.

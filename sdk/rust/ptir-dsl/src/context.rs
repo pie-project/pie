@@ -179,8 +179,18 @@ pub(crate) fn trace_stage(stage: Stage, rows: u32, body: impl FnOnce()) -> Stage
     });
     body();
     SESSION.with_borrow_mut(|s| {
-        let rec = s.as_mut().expect("session active").current.take().expect("stage recorder");
-        StageResult { stage: rec.stage, ops: rec.ops, sinks: rec.sinks, drains: rec.drains }
+        let rec = s
+            .as_mut()
+            .expect("session active")
+            .current
+            .take()
+            .expect("stage recorder");
+        StageResult {
+            stage: rec.stage,
+            ops: rec.ops,
+            sinks: rec.sinks,
+            drains: rec.drains,
+        }
     })
 }
 
@@ -198,7 +208,9 @@ pub(crate) struct StageResult {
 
 pub(crate) fn current_rows() -> u32 {
     SESSION.with_borrow(|s| {
-        s.as_ref().and_then(|s| s.current.as_ref().map(|r| r.rows)).unwrap_or(1)
+        s.as_ref()
+            .and_then(|s| s.current.as_ref().map(|r| r.rows))
+            .unwrap_or(1)
     })
 }
 
@@ -241,7 +253,11 @@ pub(crate) fn record_channel_read(ch: &ChannelRef, consume: bool, span: Span) ->
             }
         }
         let rec = sess.current.as_mut().expect("stage active");
-        let op = if consume { Op::ChanTake(dense) } else { Op::ChanRead(dense) };
+        let op = if consume {
+            Op::ChanTake(dense)
+        } else {
+            Op::ChanRead(dense)
+        };
         if consume {
             rec.consumed.insert(dense);
         }
@@ -288,11 +304,7 @@ pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
     })
 }
 
-pub(crate) fn record_sink(
-    name: String,
-    span: Span,
-    scope: pie_ptir::registry::SinkScope,
-) {
+pub(crate) fn record_sink(name: String, span: Span, scope: pie_ptir::registry::SinkScope) {
     SESSION.with_borrow_mut(|s| {
         s.as_mut()
             .and_then(|s| s.current.as_mut())

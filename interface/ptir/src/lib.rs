@@ -26,6 +26,8 @@
 //!   sink stage-precedence, model gating) producing a bound trace.
 //! * [`expand`] — the composed ops (`gumbel`, `mask_apply`, `softmax`,
 //!   `log_softmax`, `l2norm`) as expansions over the core.
+//! * [`rng`] — the canonical keyed-RNG formula and generated CUDA/C++ and MSL
+//!   projections.
 //! * [`interp`] (feature `eval`) — the **tier-0 reference interpreter**: the
 //!   golden model every backend diffs against.
 //! * [`header`] (feature `std`) — deterministic C header generator.
@@ -34,11 +36,13 @@
 
 extern crate alloc;
 
+pub mod compiler;
 pub mod container;
 pub mod expand;
 pub mod infer;
 pub mod op;
 pub mod registry;
+pub mod rng;
 pub mod sidecar;
 pub mod stage_key;
 pub mod types;

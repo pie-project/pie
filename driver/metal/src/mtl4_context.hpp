@@ -35,6 +35,11 @@ struct MetalStorageFacts {
 
 MetalStorageFacts query_metal_storage_facts();
 
+bool read_ptir_msl_source(
+    const std::string& path,
+    std::string& source,
+    std::string* error);
+
 // ── Opaque handles (borrowed; lifetime owned by RawMetalContext) ──────────────
 
 // A sub-range of the single resident heap. `contents()` is the CPU-visible pointer
@@ -71,7 +76,26 @@ enum class BarrierVisibility : uint8_t { ExecutionOnly = 0, Device = 1 };
 struct StepTiming {
     double encode_ms   = 0.0;  // begin_step -> end_step (CPU command-buffer build)
     double gpu_exec_ms = 0.0;  // commit -> event wait (GPU execution)
+    bool completed = false;    // event fence reached; command resources may be released
+    bool timed_out = false;    // the initial bounded wait expired before the fence
     double total_ms()  const { return encode_ms + gpu_exec_ms; }
+    bool succeeded() const { return completed; }
+};
+
+struct TransientBufferPoolStats {
+    std::uint64_t allocations = 0;
+    std::uint64_t reuse_hits = 0;
+    std::uint64_t recycles = 0;
+    std::uint64_t evictions = 0;
+    std::uint64_t allocation_failures = 0;
+    std::size_t resident_buffers = 0;
+    std::size_t resident_bytes = 0;
+    std::size_t cached_buffers = 0;
+    std::size_t cached_bytes = 0;
+    std::size_t in_use_buffers = 0;
+    std::size_t in_use_bytes = 0;
+    std::size_t peak_resident_bytes = 0;
+    std::size_t capacity_bytes = 0;
 };
 
 // ── StepEncoder — the per-dispatch surface beta's executor drives ─────────────
@@ -139,6 +163,19 @@ class RawMetalContext {
     // (zero) SlotHandle on allocation failure.
     SlotHandle create_standalone_buffer(size_t size);
 
+    // Size-classed, residency-stable storage for PTIR command scratch and
+    // metadata. Recycle only after the command's completion fence.
+    SlotHandle acquire_transient_buffer(size_t size);
+    void recycle_transient_buffer(const SlotHandle& h);
+    TransientBufferPoolStats transient_buffer_pool_stats() const;
+    void set_transient_buffer_pool_limit_for_test(size_t bytes);
+
+    // Add a Shared-storage buffer owned elsewhere (for example, an
+    // authoritative PTIR channel ring) to this context's residency set.
+    void use_external_buffer(const SlotHandle& h);
+    void release_external_buffer(const SlotHandle& h);
+    size_t external_buffer_count() const;
+
     // Phase 3 (review item 4) — release a standalone buffer previously handed
     // out by create_standalone_buffer: drop it from the residency set
     // (removeAllocation + commit) AND from the context's retained-alive array
@@ -149,11 +186,10 @@ class RawMetalContext {
     // (zero) handle or one this context never allocated.
     void release_standalone_buffer(const SlotHandle& h);
 
-    // Phase 3 (review item 4) — host-visible allocation probe over the
-    // STANDALONE (non-heap) buffers only: how many are currently alive and
-    // their summed byte size. Lets a lifecycle test assert that a grow→shrink
-    // cycle returns to a bounded baseline (no per-resize leak). The core
-    // placement heap is not counted (it is fixed-size, allocated once).
+    // Host-visible allocation probe over all STANDALONE (non-heap) buffers.
+    // This includes resident transient-pool buffers until context destruction;
+    // use transient_buffer_pool_stats() to distinguish cached from in-use
+    // command storage. The fixed placement heap is not counted.
     size_t standalone_buffer_count() const;
     size_t standalone_bytes() const;
 
@@ -176,6 +212,7 @@ class RawMetalContext {
     // table population, not shader reflection, and is safe before residency.
     bool arg_slot_is_bound(int ordinal, uint8_t bind_index) const;
     uint64_t arg_slot_address(int ordinal, uint8_t bind_index) const;
+    void release_argtable_ordinal(int ordinal);
     // delta's exact 1-arg-less form for singleton kernels (ordinal = -1).
     void arg_bind(Kernel k, uint8_t bind_index, SlotHandle slot, size_t offset = 0) {
         arg_bind(k, -1, bind_index, slot, offset);
@@ -186,6 +223,25 @@ class RawMetalContext {
                     std::string* error = nullptr);
     Pso compile_pso_from_file(const std::string& metal_path, const std::string& fn_name,
                               std::string* error = nullptr);
+    // PTIR semantics require strict NaN/tie behavior. This path always passes
+    // explicit safe-math options (MTLMathModeSafe, or fastMathEnabled=NO on
+    // older SDKs).
+    Pso compile_ptir_pso(const std::string& metal_source, const std::string& fn_name,
+                         std::string* error = nullptr);
+    Pso compile_ptir_pso_from_file(
+        const std::string& metal_path,
+        const std::string& fn_name,
+        std::string* error = nullptr);
+    Pso compile_ptir_pso_cached(
+        const std::string& metal_source,
+        const std::string& fn_name,
+        const std::string& archive_path,
+        bool* cache_hit = nullptr,
+        std::string* error = nullptr);
+    void release_pso(Pso pso);
+    size_t retained_pso_count() const;
+    bool last_ptir_compile_disabled_fast_math() const;
+    std::uint64_t device_cache_id() const;
 
     // ── GPU timestamp attribution (beta's per-dispatch / per-phase timing) ──
     // Allocate an opaque MTL4CounterHeap of `count` timestamp entries (owned by the
@@ -195,11 +251,13 @@ class RawMetalContext {
     // (nanoseconds on this device) into `out`. Returns nullptr on failure.
     void* create_timestamp_heap(uint32_t count);
     void  resolve_timestamps(void* heap, uint32_t count, uint64_t* out);
+    void  release_timestamp_heap(void* heap);
 
     // ── Encode one decode step. `encode_fn` issues the DAG via StepEncoder ──
     // Uses the double-buffered allocator (ab = 0/1) so the harness can overlap
     // encode(N+1) with GPU(N). Returns the encode/GPU split for THIS step.
     StepTiming run_step(const std::function<void(StepEncoder&)>& encode_fn, int ab = 0);
+    void force_next_wait_timeout_for_test();
 
     // ── Pipelined async commit (downclock-ceiling prototype) ──
     // Encode+commit a step WITHOUT waiting for completion (returns the signalled event value),

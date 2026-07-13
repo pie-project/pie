@@ -135,9 +135,20 @@ fn axis0_result(idx: Shape, src: Shape) -> Option<Shape> {
     if n > MAX_RANK {
         return None;
     }
+
     dims[..idx.rank()].copy_from_slice(idx.dims());
     dims[idx.rank()..n].copy_from_slice(&src.dims()[1..]);
     Shape::new(&dims[..n])
+}
+
+fn append_dim(shape: Shape, dim: u32) -> Option<Shape> {
+    let mut dims = [0u32; MAX_RANK];
+    if shape.rank() >= MAX_RANK || dim == 0 {
+        return None;
+    }
+    dims[..shape.rank()].copy_from_slice(shape.dims());
+    dims[shape.rank()] = dim;
+    Shape::new(&dims[..shape.rank() + 1])
 }
 
 enum Results {
@@ -420,7 +431,6 @@ fn infer(
             }
             push(&mut out, ValueType::new(t.shape, DType::Bool));
         }
-
         Op::Gather { src, idx } => {
             let (ts, ti) = (g(src)?, g(idx)?);
             if ts.shape.rank() == 0 {
@@ -486,7 +496,16 @@ fn infer(
             }
             push(&mut out, tl);
         }
-
+        Op::CausalMask { positions, len }
+        | Op::SlidingWindowMask { positions, len, .. }
+        | Op::SinkWindowMask { positions, len, .. } => {
+            let positions = g(positions)?;
+            if positions.dtype != DType::U32 {
+                return Err(dtype_err());
+            }
+            let shape = append_dim(positions.shape, len).ok_or_else(shape_err)?;
+            push(&mut out, ValueType::new(shape, DType::Bool));
+        }
         Op::Rng { shape, .. } => {
             if shape.rank() == 0 {
                 return Err(shape_err());

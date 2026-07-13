@@ -114,12 +114,44 @@ pub(crate) fn copy_d2h(
     })
 }
 
+pub(crate) fn copy_d2h_tracked(
+    driver_idx: DriverId,
+    gpu_phys_ids: &[u32],
+    cpu_pages: &[u32],
+) -> Result<super::ControlCompletion> {
+    scheduler_handle(driver_idx)?.copy_kv_tracked(KvCopyPlan {
+        src_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_device_ordinal: 0,
+        dst_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
+        dst_device_ordinal: 0,
+        src_page_ids: gpu_phys_ids.to_vec(),
+        dst_page_ids: cpu_pages.to_vec(),
+        cells: Vec::new(),
+    })
+}
+
 pub(crate) fn copy_h2d(
     driver_idx: DriverId,
     gpu_phys_ids: &[u32],
     cpu_pages: &[u32],
 ) -> Result<SubmissionCompletion> {
     scheduler_handle(driver_idx)?.copy_kv(KvCopyPlan {
+        src_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
+        src_device_ordinal: 0,
+        dst_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_device_ordinal: 0,
+        src_page_ids: cpu_pages.to_vec(),
+        dst_page_ids: gpu_phys_ids.to_vec(),
+        cells: Vec::new(),
+    })
+}
+
+pub(crate) fn copy_h2d_tracked(
+    driver_idx: DriverId,
+    gpu_phys_ids: &[u32],
+    cpu_pages: &[u32],
+) -> Result<super::ControlCompletion> {
+    scheduler_handle(driver_idx)?.copy_kv_tracked(KvCopyPlan {
         src_domain: PIE_MEMORY_DOMAIN_HOST_PINNED,
         src_device_ordinal: 0,
         dst_domain: PIE_MEMORY_DOMAIN_CUDA_DEVICE,

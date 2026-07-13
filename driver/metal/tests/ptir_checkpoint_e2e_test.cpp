@@ -29,6 +29,8 @@
 
 #include <pie_driver_abi.h>
 #include "../tools/rawmetal/native_access.hpp"
+#include "observability.hpp"
+#include "support/ptib_v2_plan.hpp"
 
 namespace {
 
@@ -70,12 +72,17 @@ void run_paged_numeric_gate(const std::string& ckpt_dir, const std::string& kern
         in.position_ids = {0, 1, 2, 3};
         in.qo_indptr = {0, 4};
         in.kv_page_indptr = {0, 1};
-        in.kv_page_indices = {3};  // deliberately not page zero
+        in.kv_page_indices = {2};  // deliberately not page zero
         in.kv_last_page_lens = {4};
         in.rs_slot_ids = {0};
         in.rs_slot_flags = {1};
-        in.w_page = {3, 3, 3, 3};
+        in.w_page = {2, 2, 2, 2};
         in.w_off = {0, 1, 2, 3};
+        in.attention_mask_stride = 4 * 32;
+        in.attention_mask_enabled = {1, 1, 1, 1};
+        in.attention_mask =
+            std::vector<std::uint8_t>(
+                4 * in.attention_mask_stride, 1);
         const BatchSchedule sched = build_batch_schedule(
             in.token_ids.data(), 4, in.qo_indptr.data(), in.kv_page_indptr.data(),
             in.kv_last_page_lens.data(), in.rs_slot_ids.data(), in.rs_slot_flags.data(),
@@ -84,33 +91,35 @@ void run_paged_numeric_gate(const std::string& ckpt_dir, const std::string& kern
                "explicit paged append + paged SDPA launch (" + paged_err + ")");
         const uint64_t bind_generation =
             NativeAccess::paged_bind_generation(paged);
-        expect(paged.resize_kv_pool(5, /*unmapped_tail_pages=*/false, &paged_err) &&
+        expect(paged.resize_kv_pool(3, /*unmapped_tail_pages=*/true, &paged_err) &&
+                   NativeAccess::run_batch_step(paged, sched, in, &paged_err) &&
+                   paged.resize_kv_pool(4, /*unmapped_tail_pages=*/false, &paged_err) &&
                    NativeAccess::paged_bind_generation(paged) ==
-                       bind_generation + 1 &&
+                       bind_generation + 2 &&
                    NativeAccess::run_batch_step(paged, sched, in, &paged_err),
-               "pool resize invalidates/rebinds paged tables before the next batch (" +
+               "pool shrink/regrowth within fixed pitch rebinds paged tables before the next batch (" +
                    paged_err + ")");
 
         const size_t row_bytes = size_t(pg.n_kv_heads) * pg.head_dim * 2;
-        bool wrote_page3 = true, left_page0_zero = true;
+        bool wrote_page2 = true, left_page0_zero = true;
         for (int l = 0; l < pg.n_layers; ++l) {
             if (!DecodeGeometry::is_full_attn(l)) continue;
             const auto& lp =
                 NativeAccess::kv_pool(paged).layers[size_t(l)];
             const auto* k = static_cast<const std::uint8_t*>(lp.k_pages.contents());
             const auto* v = static_cast<const std::uint8_t*>(lp.v_pages.contents());
-            bool k3 = false, v3 = false, k0 = false, v0 = false;
+            bool k2 = false, v2 = false, k0 = false, v0 = false;
             for (size_t b = 0; b < 4 * row_bytes; ++b) {
-                k3 |= k[3 * 32 * row_bytes + b] != 0;
-                v3 |= v[3 * 32 * row_bytes + b] != 0;
+                k2 |= k[2 * 32 * row_bytes + b] != 0;
+                v2 |= v[2 * 32 * row_bytes + b] != 0;
                 k0 |= k[b] != 0;
                 v0 |= v[b] != 0;
             }
-            wrote_page3 &= k3 && v3;
+            wrote_page2 &= k2 && v2;
             left_page0_zero &= !k0 && !v0;
         }
-        expect(wrote_page3 && left_page0_zero,
-               "paged append honors explicit w_page/w_off (writes page 3, not page 0)");
+        expect(wrote_page2 && left_page0_zero,
+               "paged append honors explicit w_page/w_off (writes page 2, not page 0)");
 
         MetalExecutor ring;
         std::string ring_err;
@@ -185,6 +194,7 @@ bool wait_terminal(const PieTerminalCell& cell) {
 }  // namespace
 
 int main() {
+    pie::metal::m0_timing_counters().reset_for_tests();
     const char* ckpt_env = std::getenv("PIE_METAL_CKPT");
     if (ckpt_env == nullptr || std::strlen(ckpt_env) == 0) {
         std::printf(
@@ -226,7 +236,9 @@ int main() {
     }
 
     const std::vector<std::uint8_t> container = greedy_argmax_container();
-    const std::vector<std::uint8_t> sidecar = greedy_argmax_sidecar();
+    const std::vector<std::uint8_t> sidecar =
+        pie::metal::tests::upgrade_ptib_v1(
+            container, greedy_argmax_sidecar());
     PieProgramDesc program{};
     program.abi_version = PIE_DRIVER_ABI_VERSION;
     program.program_hash = 0xff694395428759feULL;  // echo's greedy_argmax hash
@@ -330,6 +342,15 @@ int main() {
     const std::uint64_t reader_tail =
         *reinterpret_cast<const std::uint64_t*>(chan1_binding.word_base + 8);
     expect(reader_tail == 1, "chan1 reader tail advanced to 1");
+    {
+        const pie::metal::M0TimingSnapshot timing =
+            pie::metal::m0_timing_counters().snapshot();
+        expect(
+            timing.cpu_epilogue_samples == 0 &&
+                timing.bf16_conversion_samples == 0 &&
+                timing.forward_wait_samples > 0,
+            "M1 removes CPU epilogue/conversion while retaining forward-wait observability");
+    }
 
     // Independent cross-check: a fresh MetalExecutor, same checkpoint, the
     // exact same (token=1, position=0) input from a reset state.
@@ -353,6 +374,29 @@ int main() {
         expect(sampled_token == static_cast<std::int32_t>(want),
               "epilogue token == native argmax (epilogue=" +
                   std::to_string(sampled_token) + " decoder=" + std::to_string(want) + ")");
+
+        pie::metal::batch::NativeAccess::reset_state(cross_check);
+        pie::metal::batch::MemberForwardDesc first;
+        first.sequence_id = 0xc0ffee;
+        first.token_ids = {embed_token};
+        first.position_ids = {0};
+        first.readout_local_indices = {0};
+        pie::metal::batch::LogitsOut first_logits;
+        std::string first_error;
+        const bool first_ok =
+            cross_check.forward(first, first_logits, &first_error);
+        pie::metal::batch::MemberForwardDesc second = first;
+        second.position_ids = {1};
+        pie::metal::batch::LogitsOut second_logits;
+        std::string second_error;
+        const bool second_ok =
+            cross_check.forward(second, second_logits, &second_error);
+        expect(
+            first_ok && second_ok &&
+                first_logits.device_row_offset == 0 &&
+                second_logits.device_row_offset == 0,
+            "repeated single-member forward resets the PTIR logits cursor "
+            "on every call (" + first_error + "; " + second_error + ")");
     }
 
     // ── Phase 1b: real copy_state functional check, over the SAME live
@@ -436,7 +480,8 @@ int main() {
         expect(cell_terminal.outcome == PIE_TERMINAL_OUTCOME_SUCCESS,
               "copy_kv publishes the terminal cell as SUCCESS exactly once (cell copy)");
 
-        // resize_pool GROW: 128 -> 140 pages, always allowed, page ids stable.
+        // Growth beyond the fixed paged-IO pitch is rejected before buffers
+        // can be rebound inconsistently.
         PieTerminalCell grow_terminal{.outcome = PIE_TERMINAL_OUTCOME_PENDING, .reserved0 = 0};
         PiePoolResizeDesc grow{};
         grow.abi_version = PIE_DRIVER_ABI_VERSION;
@@ -444,13 +489,14 @@ int main() {
         grow.target_pages = 140;
         const int32_t grow_rc =
             pie_metal_resize_pool(driver, &grow, PieCompletion{.wait_id = 203, .target_epoch = 1, .terminal_cell = &grow_terminal});
-        expect(grow_rc == PIE_STATUS_OK,
-              "resize_pool GROW 128 -> 140 pages (rc=" + std::to_string(grow_rc) + ")");
-        expect(grow_terminal.outcome == PIE_TERMINAL_OUTCOME_SUCCESS,
-              "resize_pool publishes the terminal cell as SUCCESS exactly once (grow)");
+        expect(grow_rc == PIE_STATUS_UNSUPPORTED,
+              "resize_pool GROW beyond fixed 128-page IO rejects (rc=" +
+                  std::to_string(grow_rc) + ")");
+        expect(grow_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
+              "unsupported growth publishes no terminal or notification");
 
         // resize_pool SHRINK without an unmap attestation: rejected — the
-        // driver cannot independently know pages [100, 140) are free.
+        // driver cannot independently know pages [100, 128) are free.
         PieTerminalCell bad_shrink_terminal{.outcome = PIE_TERMINAL_OUTCOME_PENDING,
                                             .reserved0 = 0};
         PiePoolResizeDesc bad_shrink{};
@@ -466,10 +512,10 @@ int main() {
               "resize_pool never publishes the terminal cell on the unattested-shrink "
               "rejection path");
 
-        // resize_pool SHRINK WITH a full unmap attestation for [100, 140):
+        // resize_pool SHRINK WITH a full unmap attestation for [100, 128):
         // accepted.
         PieTerminalCell shrink_terminal{.outcome = PIE_TERMINAL_OUTCOME_PENDING, .reserved0 = 0};
-        const PiePoolRange unmap_range{/*page_index=*/100, /*page_count=*/40};
+        const PiePoolRange unmap_range{/*page_index=*/100, /*page_count=*/28};
         PiePoolResizeDesc shrink{};
         shrink.abi_version = PIE_DRIVER_ABI_VERSION;
         shrink.pool_id = 0;
@@ -478,11 +524,33 @@ int main() {
         const int32_t shrink_rc =
             pie_metal_resize_pool(driver, &shrink, PieCompletion{.wait_id = 205, .target_epoch = 1, .terminal_cell = &shrink_terminal});
         expect(shrink_rc == PIE_STATUS_OK,
-              "resize_pool SHRINK 140 -> 100 pages with a full unmap attestation (rc=" +
+              "resize_pool SHRINK 128 -> 100 pages with a full unmap attestation (rc=" +
                   std::to_string(shrink_rc) + ")");
         expect(shrink_terminal.outcome == PIE_TERMINAL_OUTCOME_SUCCESS,
               "resize_pool publishes the terminal cell as SUCCESS exactly once (attested "
               "shrink)");
+
+        PieTerminalCell regrow_terminal{
+            .outcome = PIE_TERMINAL_OUTCOME_PENDING,
+            .reserved0 = 0};
+        PiePoolResizeDesc regrow{};
+        regrow.abi_version = PIE_DRIVER_ABI_VERSION;
+        regrow.pool_id = 0;
+        regrow.target_pages = 120;
+        const int32_t regrow_rc = pie_metal_resize_pool(
+            driver,
+            &regrow,
+            PieCompletion{
+               .wait_id = 206,
+               .target_epoch = 1,
+               .terminal_cell = &regrow_terminal});
+        expect(
+            regrow_rc == PIE_STATUS_OK &&
+               regrow_terminal.outcome ==
+                   PIE_TERMINAL_OUTCOME_SUCCESS,
+            "resize_pool regrowth within fixed 128-page mask pitch succeeds "
+            "(rc=" +
+               std::to_string(regrow_rc) + ")");
     }
 
     // ── Phase 1b state-slot fix: DECISIVE hardware-level proof that

@@ -15,6 +15,24 @@
 
 namespace pie_native::ptir {
 
+enum class StructuredMaskKind : std::uint8_t {
+    None = 0,
+    Causal = 1,
+    SlidingWindow = 2,
+    SinkWindow = 3,
+};
+
+struct StructuredMaskDescriptor {
+    StructuredMaskKind kind = StructuredMaskKind::None;
+    std::uint32_t key_len = 0;
+    std::uint32_t sink = 0;
+    std::uint32_t window = 0;
+
+    explicit operator bool() const noexcept {
+        return kind != StructuredMaskKind::None;
+    }
+};
+
 // The forward geometry a device-geometry PTIR fire contributes, resolved from
 // its descriptor-port channels. Mirrors the runtime `ReqGeometry` fields plus
 // the explicit-write descriptor (`w_page`/`w_off`) and the dense attention mask.
@@ -30,6 +48,7 @@ struct FireGeometry {
     std::vector<std::uint32_t> w_page;            // w_slot (PHYSICAL page id per lane)
     std::vector<std::uint32_t> w_off;             // w_off (offset-in-page per lane)
     std::vector<std::uint8_t>  mask;              // attn_mask, dense [lanes, stride] bytes
+    StructuredMaskDescriptor structured_mask;
     bool has_kv_family = false;                   // pages/page_indptr present
     bool has_write_desc = false;                  // w_slot/w_off present
     bool has_mask = false;                        // attn_mask present
@@ -151,8 +170,8 @@ inline bool validate_fire_geometry(const FireGeometry& geometry,
         }
     }
 
-    if (geometry.has_mask && !geometry.mask.empty()) {
-        if (geometry.token_ids.empty() ||
+    if (geometry.has_mask) {
+        if (geometry.mask.empty() || geometry.token_ids.empty() ||
             geometry.mask.size() % geometry.token_ids.size() != 0) {
             return fail("ptir: invalid resolved attention mask shape");
         }
@@ -167,6 +186,42 @@ inline bool validate_fire_geometry(const FireGeometry& geometry,
                 geometry.kv_last_page_lens[request];
             if (stride < kv_len) {
                 return fail("ptir: resolved attention mask is shorter than KV");
+            }
+        }
+    }
+    if (geometry.structured_mask) {
+        const auto& mask = geometry.structured_mask;
+        if (mask.key_len == 0 ||
+            geometry.position_ids.size() != geometry.token_ids.size()) {
+            return fail("ptir: invalid structured attention mask shape");
+        }
+        // Idle fires legitimately carry an empty query span and no KV
+        // projection. The descriptor is still validated above, but there is
+        // no per-request KV extent to compare against.
+        if (geometry.token_ids.empty()) return true;
+        if (geometry.kv_page_indptr.size() != requests + 1 ||
+            geometry.kv_last_page_lens.size() != requests) {
+            return fail(
+                "ptir: structured attention mask is missing KV geometry");
+        }
+        if (geometry.has_mask) {
+            const std::size_t stride =
+                geometry.mask.size() / geometry.token_ids.size();
+            if (stride < mask.key_len) {
+                return fail(
+                    "ptir: dense structured fallback is shorter than its descriptor");
+            }
+        }
+        for (std::size_t request = 0; request < requests; ++request) {
+            const std::uint32_t page_count =
+                geometry.kv_page_indptr[request + 1] -
+                geometry.kv_page_indptr[request];
+            const std::uint64_t kv_len =
+                static_cast<std::uint64_t>(page_count - 1) * page_size +
+                geometry.kv_last_page_lens[request];
+            if (mask.key_len < kv_len) {
+                return fail(
+                    "ptir: structured attention mask is shorter than KV");
             }
         }
     }

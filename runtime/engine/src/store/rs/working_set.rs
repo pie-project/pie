@@ -15,8 +15,8 @@
 //! table's clone as the last reference, whose `Drop` then performs the
 //! release — the process-teardown fallback.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::{RsGeometry, RsWorkingSetId};
 use crate::driver::DriverId;
@@ -32,6 +32,7 @@ struct RsLifecycle {
     model: usize,
     driver: DriverId,
     id: RsWorkingSetId,
+    pipeline_scope: Mutex<Option<usize>>,
 }
 
 impl RsLifecycle {
@@ -86,6 +87,7 @@ impl RsWorkingSet {
                 model,
                 driver,
                 id,
+                pipeline_scope: Mutex::new(None),
             }),
         }
     }
@@ -96,6 +98,18 @@ impl RsWorkingSet {
     /// drop is a no-op.
     pub fn release(&self) {
         self.lifecycle.release();
+    }
+
+    pub fn claim_pipeline_scope(&self, scope: usize) -> Result<(), usize> {
+        let mut owner = self.lifecycle.pipeline_scope.lock().unwrap();
+        match *owner {
+            Some(existing) if existing != scope => Err(existing),
+            Some(_) => Ok(()),
+            None => {
+                *owner = Some(scope);
+                Ok(())
+            }
+        }
     }
 
     /// Whether [`Self::release`] (or the `Drop` fallback) has already run.
@@ -241,5 +255,17 @@ mod tests {
 
         drop(parent);
         assert_eq!(stores.rs.lock().unwrap().available_slots(), 2);
+    }
+
+    #[test]
+    fn working_set_is_scoped_to_one_pipeline_fifo() {
+        let model = fresh_model(1);
+        let stores = registry::get(model, 0);
+        let id = stores.rs.lock().unwrap().create_working_set(geom());
+        let ws = RsWorkingSet::new(model, 0, id, geom());
+
+        assert_eq!(ws.claim_pipeline_scope(0x11), Ok(()));
+        assert_eq!(ws.claim_pipeline_scope(0x11), Ok(()));
+        assert_eq!(ws.claim_pipeline_scope(0x22), Err(0x11));
     }
 }

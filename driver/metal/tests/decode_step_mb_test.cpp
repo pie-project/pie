@@ -58,6 +58,13 @@ int main() {
     g.max_slots = 4;
     g.total_pages = 8;
     g.kv_page_size = 32;
+    expect(
+        paged_attention_mask_pitch_bytes(g) == 256 &&
+            paged_pool_size_supported(g, 3) &&
+            paged_pool_size_supported(g, 8) &&
+            !paged_pool_size_supported(g, 9),
+        "masked prefill keeps the fixed allocated 8-page pitch and rejects "
+        "unsupported growth");
 
     const auto m1 = build_decode_dag(g, false, false, true);
     const auto mb1 = build_decode_dag_mb(g, 1);
@@ -182,9 +189,10 @@ int main() {
     const Dispatch* embed = find_kind(Kernel::EmbedGather);
     const Dispatch* rope = find_kind(Kernel::Rope);
     const Dispatch* append = find_kind(Kernel::KvAppendPaged);
+    const Dispatch* sdpa = find_kind(Kernel::SdpaPaged);
     const Dispatch* lm = find_kind(Kernel::QmvLmHead);
     const Dispatch* qmv = find_kind(Kernel::QmvQ);
-    bool row_offsets = embed && rope && append && lm && qmv;
+    bool row_offsets = embed && rope && append && sdpa && lm && qmv;
     if (row_offsets) {
         row_offsets &=
             ctx->arg_slot_address(embed->ordinal, uint8_t(bind::Embed::TokenId)) ==
@@ -195,6 +203,10 @@ int main() {
         row_offsets &=
             ctx->arg_slot_address(append->ordinal, uint8_t(bind::KvAppendPaged::WPage)) ==
             b.io[int(IoSlot::WPage)].gpu_address + 4;
+        row_offsets &=
+            ctx->arg_slot_address(sdpa->ordinal, uint8_t(bind::SdpaPaged::AttnMask)) ==
+            b.io[int(IoSlot::AttnMask)].gpu_address +
+                paged_attention_mask_pitch_bytes(g);
         row_offsets &=
             ctx->arg_slot_address(lm->ordinal, uint8_t(bind::Qmv::Out)) ==
             b.io[int(IoSlot::Logits)].gpu_address + logits_row;

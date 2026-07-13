@@ -26,7 +26,7 @@
 
 use inferlet::mask::{all_allowed, apply_mask_argmax, bit_allowed, pack_allowed};
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, serde_json, Result};
+use inferlet::{Result, model as wit_model, serde_json};
 
 /// Constraint alphabet: the only token ids the grammar ever allows. Small ids
 /// the model rarely naturally argmaxes, so the natural pick is forced out.
@@ -130,16 +130,17 @@ async fn main(input: String) -> Result<String> {
             .collect();
 
         gmask.put(mask_bool);
-        fwd
-            .submit(&pipeline)
+        fwd.submit(&pipeline)
             .map_err(|e| format!("submit @{step}: {e}"))?;
         let token = tok_out
             .take()
             .get::<i32>()
+            .await
             .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
         let logits = raw
             .take()
             .get::<f32>()
+            .await
             .map_err(|e| format!("raw.take @{step}: {e}"))?;
 
         // Assert #1 CONFORM: device token == host apply_mask_argmax(raw, mask).

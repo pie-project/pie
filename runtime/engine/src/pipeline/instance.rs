@@ -164,9 +164,10 @@ pub struct ForwardPass {
     /// keeps it alive for the pass's lifetime (the classic `forward-pass`
     /// borrow convention); the pass does NOT destroy it on drop.
     pub kv_ws: u32,
-    /// The guest-owned recurrent-state working set (hybrid / linear-attention
-    /// models — GDN, Mamba2). `None` for pure-attention models.
-    pub rs_ws: Option<u32>,
+    /// Guest-owned recurrent-state working sets (hybrid / linear-attention
+    /// models — GDN, Mamba2), in resolved forward-request order. Empty for
+    /// pure-attention models.
+    pub rs_ws: Vec<u32>,
     /// The bound ws's committed token length — the growing cursor threaded
     /// into [`crate::pipeline::fire::kv::prepare`]. Advances OPTIMISTICALLY at
     /// submit (run-ahead: fire t+1 prepares against t's post-state); a failed
@@ -210,6 +211,25 @@ pub struct ForwardPass {
 }
 
 impl ForwardPass {
+    /// Replace only the recurrent-state resource reps. The native instance and
+    /// every other pass field remain untouched. Rebinding is legal only at an
+    /// empty pipeline FIFO boundary so no in-flight fire can retain the old
+    /// request-row mapping.
+    pub fn replace_rs_working_sets(&mut self, reps: Vec<u32>) -> Result<(), String> {
+        let pending = self
+            .fires
+            .as_ref()
+            .map(|fifo| fifo.lock().unwrap().len())
+            .unwrap_or(0);
+        if pending != 0 {
+            return Err(format!(
+                "cannot replace rs-working-sets while {pending} operation(s) remain in the pass FIFO"
+            ));
+        }
+        self.rs_ws = reps;
+        Ok(())
+    }
+
     /// Idempotent synchronous native teardown: closes the bound driver
     /// instance, detaches this pass's `instance_id` from every bound
     /// `ChannelCell` it attached, and reclaims any outstanding
@@ -884,7 +904,7 @@ mod tests {
                 channel_reps: Vec::new(),
                 fires: None,
                 kv_ws: 0,
-                rs_ws: None,
+                rs_ws: Vec::new(),
                 committed_tokens: 0,
                 failed: None,
                 devgeo: None,
@@ -893,6 +913,50 @@ mod tests {
                 fired_once: false,
                 closed: false,
             }
+        }
+
+        #[test]
+        fn rs_rebind_is_in_place_and_preserves_pass_state() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, _) = setup(operation_log);
+            let mut pass = make_pass(bound, cells);
+            pass.committed_tokens = 37;
+            pass.fired_once = true;
+            pass.devgeo = Some(crate::pipeline::fire::lease::DevGeo {
+                lease: crate::pipeline::fire::lease::PageLease::new(2),
+                b: 2,
+                fresh_dense: 0,
+                w_cont_dense: 1,
+                has_mask: true,
+            });
+            let instance_id = pass.bound_instance.instance_id;
+
+            pass.replace_rs_working_sets(vec![101, 202]).unwrap();
+
+            assert_eq!(pass.rs_ws, vec![101, 202]);
+            assert_eq!(pass.bound_instance.instance_id, instance_id);
+            assert_eq!(pass.committed_tokens, 37);
+            assert!(pass.fired_once);
+            let devgeo = pass.devgeo.as_ref().expect("device geometry preserved");
+            assert_eq!(devgeo.b, 2);
+            assert!(devgeo.has_mask);
+        }
+
+        #[test]
+        fn rs_rebind_rejects_nonempty_fifo_without_mutation() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, _) = setup(operation_log);
+            let mut pass = make_pass(bound, cells);
+            pass.rs_ws = vec![7];
+            let fifo = Arc::new(Mutex::new(std::collections::VecDeque::from([
+                crate::pipeline::fire::test_pending_move_stub(),
+            ])));
+            pass.fires = Some(fifo.clone());
+
+            assert!(pass.replace_rs_working_sets(vec![8, 9]).is_err());
+            assert_eq!(pass.rs_ws, vec![7]);
+
+            fifo.lock().unwrap().clear();
         }
 
         #[test]

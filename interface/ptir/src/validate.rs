@@ -82,6 +82,7 @@ pub enum ValidateError {
     /// At most one program per stage; stages sorted by tag.
     DuplicateStage(Stage),
     StagesUnsorted,
+    NamesUnsortedOrDuplicate,
     /// Ports sorted by tag, unique.
     DuplicatePort(Port),
     PortsUnsorted,
@@ -169,6 +170,9 @@ impl fmt::Display for ValidateError {
             Body { stage, err } => write!(f, "stage {}: {err}", stage.name()),
             DuplicateStage(s) => write!(f, "duplicate program for stage {}", s.name()),
             StagesUnsorted => f.write_str("stage programs must be sorted by stage tag"),
+            NamesUnsortedOrDuplicate => {
+                f.write_str("name table must be strictly sorted and unique")
+            }
             DuplicatePort(p) => write!(f, "duplicate binding for port {}", p.name()),
             PortsUnsorted => f.write_str("port bindings must be sorted by port tag"),
             PortChannelOutOfRange { port, chan } => {
@@ -259,6 +263,9 @@ pub fn channel_value_type(decl: &ChannelDecl) -> ValueType {
 /// Validate a container against a profile; returns the typed, bound trace.
 pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTrace, ValidateError> {
     // ── container-level structure ────────────────────────────────────────
+    if container.names.windows(2).any(|names| names[0] >= names[1]) {
+        return Err(ValidateError::NamesUnsortedOrDuplicate);
+    }
     for w in container.stages.windows(2) {
         if w[0].stage == w[1].stage {
             return Err(ValidateError::DuplicateStage(w[0].stage));
@@ -1067,6 +1074,27 @@ mod tests {
                 intr: IntrinsicId::Logits,
                 stage: Stage::Prologue
             })
+        ));
+    }
+
+    #[test]
+    fn name_table_must_be_strictly_sorted_and_unique() {
+        let unsorted = TraceContainer {
+            names: vec!["z".into(), "a".into()],
+            ..TraceContainer::default()
+        };
+        assert!(matches!(
+            bind(unsorted, ModelProfile::dummy()),
+            Err(ValidateError::NamesUnsortedOrDuplicate)
+        ));
+
+        let duplicate = TraceContainer {
+            names: vec!["a".into(), "a".into()],
+            ..TraceContainer::default()
+        };
+        assert!(matches!(
+            bind(duplicate, ModelProfile::dummy()),
+            Err(ValidateError::NamesUnsortedOrDuplicate)
         ));
     }
 }

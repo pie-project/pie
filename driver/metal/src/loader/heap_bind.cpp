@@ -298,6 +298,15 @@ BoundDecode stage_decode_storage(
         b.io[static_cast<int>(IoSlot::SlotOfToken)]    = alloc_zeroed(ctx, n * 4u);
         b.io[static_cast<int>(IoSlot::WPage)]          = alloc_zeroed(ctx, n * 4u);
         b.io[static_cast<int>(IoSlot::WOff)]           = alloc_zeroed(ctx, n * 4u);
+        const size_t mask_stride =
+            size_t(std::max(1, g.total_pages)) *
+            size_t(std::max(1, g.kv_page_size));
+        b.io[static_cast<int>(IoSlot::AttnMask)] =
+            alloc_zeroed(ctx, n * mask_stride);
+        b.io[static_cast<int>(IoSlot::AttnMaskStride)] =
+            alloc_zeroed(ctx, sizeof(std::uint32_t));
+        b.io[static_cast<int>(IoSlot::AttnMaskEnabled)] =
+            alloc_zeroed(ctx, n);
     }
 
     // device-argmax substrate (inert unless with_argmax): ArgmaxParams const + EosFlag out.

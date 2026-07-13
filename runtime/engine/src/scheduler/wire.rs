@@ -293,6 +293,10 @@ pub fn append_request_with_options(
     page_size: u32,
     elide_decode_masks: bool,
 ) {
+    assert!(
+        req.qo_indptr.len().saturating_sub(1) <= 1 && req.rs_slot_ids.len() <= 1,
+        "multi-row launches must bypass row-collapsing wire append and remain intact"
+    );
     // Row offset of this request's tokens within the batch — image anchor rows
     // shift by this when merged (captured before extending `token_ids`).
     let row_base = batch.token_ids.len() as u32;

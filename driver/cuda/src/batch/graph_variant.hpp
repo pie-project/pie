@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace pie_cuda_driver {
@@ -44,6 +45,18 @@ constexpr std::uint32_t make_graph_variant(bool tp_greedy, bool single_gpu,
            (small_spec  ? kGvSmallSpec  : 0u) |
            (rs_verify   ? kGvRsVerify   : 0u) |
            (graph_layout << kGvLayoutShift);
+}
+
+inline bool graph_replay_has_no_host_resets(
+    bool uses_slots,
+    const std::uint8_t* is_fresh,
+    std::size_t requests) noexcept {
+    if (!uses_slots) return true;
+    if (is_fresh == nullptr) return false;
+    for (std::size_t request = 0; request < requests; ++request) {
+        if (is_fresh[request] != 0) return false;
+    }
+    return true;
 }
 
 // The OLD (pre-#24) encoding, kept only to compile-time-prove the latent

@@ -1,7 +1,7 @@
-//! Phase-6 canary: representative **production** inferlets RUN on the mock driver.
+//! Phase-6 canary: representative curated inferlet fixtures RUN on the mock driver.
 //!
 //! Complements `e2e.rs` (the small test inferlets in `tests/inferlets/`): this
-//! builds a few real inferlets from `../inferlets/` and spawns them through the
+//! builds a few realistic inferlets from the repository test fixtures and spawns them through the
 //! full stack — SDK `Context` facade → `kv-working-set` → forward descriptors →
 //! mock `EchoBehavior` driver — capturing the **process result** so we assert the
 //! inferlet actually *succeeded* (not merely "completed", which is also true on
@@ -52,9 +52,9 @@ fn harness() -> &'static Harness {
     })
 }
 
-/// Build a production inferlet (`../inferlets/<name>`) → wasm + manifest + id.
-fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../inferlets");
+/// Build a curated inferlet fixture → wasm + manifest + id.
+fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/inferlets");
     let dir = workspace.join(name);
     let status = Command::new("cargo")
         .args([
@@ -81,12 +81,12 @@ fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     (wasm, manifest, program_name)
 }
 
-/// Build + install + spawn a production inferlet on the mock driver and return its
+/// Build + install + spawn a curated inferlet fixture on the mock driver and return its
 /// **result** (`Ok(output)` on success, `Err(msg)` on a host/inferlet error).
 /// Panics only if it doesn't finish within `timeout`.
-fn run_prod_inferlet(name: &str, input: &str, timeout: Duration) -> Result<String, String> {
+fn run_curated_inferlet(name: &str, input: &str, timeout: Duration) -> Result<String, String> {
     let h = harness();
-    let (wasm, manifest, program_name) = load_prod_inferlet(name);
+    let (wasm, manifest, program_name) = load_curated_inferlet(name);
     h.rt.block_on(async {
         pie_engine::inferlet::program::add(wasm, manifest, true)
             .await

@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <type_traits>
 #include <unistd.h>
 
@@ -19,6 +21,7 @@
 #include "heap_bind.hpp"
 #include "heap_bind_metal.hpp"
 #include "heap_layout.hpp"
+#include "logits_convert.hpp"
 #include "mtl4_context.hpp"
 #include "safetensors_view.hpp"
 #include "scratch.hpp"
@@ -230,6 +233,223 @@ std::vector<std::uint32_t> global_readout_rows(
     return rows;
 }
 
+bool validate_request_local_positions(
+    const MemberForwardDesc& desc,
+    std::string* error) {
+    if (desc.qo_indptr.size() < 2 ||
+        desc.qo_indptr.front() != 0 ||
+        desc.qo_indptr.back() != desc.position_ids.size()) {
+        if (error != nullptr) {
+            *error = "paged query CSR does not cover positions";
+        }
+        return false;
+    }
+    for (std::size_t request = 0;
+         request + 1 < desc.qo_indptr.size();
+         ++request) {
+        const std::uint32_t begin = desc.qo_indptr[request];
+        const std::uint32_t end = desc.qo_indptr[request + 1];
+        if (end <= begin || end > desc.position_ids.size()) {
+            if (error != nullptr) {
+                *error = "paged request has an empty or invalid position span";
+            }
+            return false;
+        }
+        for (std::uint32_t token = begin + 1; token < end; ++token) {
+            if (desc.position_ids[token] !=
+                desc.position_ids[token - 1] + 1u) {
+                if (error != nullptr) {
+                    *error =
+                        "paged prefill positions must be contiguous within each request";
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+namespace {
+
+bool request_rs_binding(
+    const MemberForwardDesc& desc,
+    std::size_t request,
+    std::uint32_t& slot,
+    bool& reset,
+    bool& read,
+    bool& write) {
+    if (!desc.has_rs_slot) return false;
+    if (desc.request_rs_slot_ids.empty()) {
+        if (request != 0) return false;
+        slot = desc.rs_slot_id;
+        reset = desc.rs_reset;
+        read = !reset;
+        write = true;
+        return true;
+    }
+    if (request >= desc.request_rs_slot_ids.size() ||
+        request >= desc.request_rs_reset.size() ||
+        request >= desc.request_rs_read.size() ||
+        request >= desc.request_rs_write.size()) {
+        return false;
+    }
+    slot = desc.request_rs_slot_ids[request];
+    reset = desc.request_rs_reset[request] != 0;
+    read = desc.request_rs_read[request] != 0;
+    write = desc.request_rs_write[request] != 0;
+    return true;
+}
+
+}  // namespace
+
+bool validate_paged_request_state(
+    const std::unordered_map<std::uint32_t, LinearSequenceState>& states,
+    const MemberForwardDesc& desc,
+    std::size_t request,
+    std::string* error) {
+    auto fail = [&](const char* message) {
+        if (error != nullptr) *error = message;
+        return false;
+    };
+    std::uint32_t slot = 0;
+    bool reset = false, read = false, write = false;
+    if (!request_rs_binding(
+            desc, request, slot, reset, read, write)) {
+        return fail("missing per-request recurrent-state binding");
+    }
+    if ((reset && read) || (!reset && !read) || !write) {
+        return fail("invalid recurrent-state reset/read/write flags");
+    }
+    if (request + 1 >= desc.qo_indptr.size() ||
+        request + 1 >= desc.kv_page_indptr.size() ||
+        desc.qo_indptr[request + 1] <=
+            desc.qo_indptr[request] ||
+        desc.qo_indptr[request + 1] >
+            desc.position_ids.size() ||
+        desc.kv_page_indptr[request + 1] <
+            desc.kv_page_indptr[request] ||
+        desc.kv_page_indptr[request + 1] >
+            desc.kv_pages.size()) {
+        return fail("invalid recurrent-state request CSR");
+    }
+    if (reset) return true;
+    const auto found = states.find(slot);
+    if (found == states.end() ||
+        !found->second.has_resident ||
+        !found->second.paged_backed ||
+        found->second.resident_sequence_id != desc.sequence_id ||
+        found->second.resident_next_position !=
+            desc.position_ids[desc.qo_indptr[request]]) {
+        return fail(
+            "paged continuation has no matching resident recurrent state");
+    }
+    const std::size_t page_begin =
+        desc.kv_page_indptr[request];
+    const std::size_t page_end =
+        desc.kv_page_indptr[request + 1];
+    if (found->second.resident_pages.size() >
+            page_end - page_begin ||
+        !std::equal(
+            found->second.resident_pages.begin(),
+            found->second.resident_pages.end(),
+            desc.kv_pages.begin() + page_begin)) {
+        return fail(
+            "paged continuation does not preserve recurrent-state KV lineage");
+    }
+    return true;
+}
+
+void commit_paged_request_state(
+    std::unordered_map<std::uint32_t, LinearSequenceState>& states,
+    const MemberForwardDesc& desc,
+    std::size_t request) {
+    std::uint32_t slot = 0;
+    bool reset = false, read = false, write = false;
+    if (!request_rs_binding(
+            desc, request, slot, reset, read, write) ||
+        !write ||
+        request + 1 >= desc.qo_indptr.size() ||
+        request + 1 >= desc.kv_page_indptr.size()) {
+        return;
+    }
+    LinearSequenceState& state = states[slot];
+    state.has_resident = true;
+    state.resident_sequence_id = desc.sequence_id;
+    state.resident_slot = slot;
+    state.resident_next_position =
+        desc.position_ids[desc.qo_indptr[request + 1] - 1] + 1;
+    state.resident_pages.assign(
+        desc.kv_pages.begin() + desc.kv_page_indptr[request],
+        desc.kv_pages.begin() + desc.kv_page_indptr[request + 1]);
+    state.ring_backed = false;
+    state.paged_backed = true;
+}
+
+std::vector<PtirCommandCallbacks> compact_ptir_callbacks(
+    const std::vector<MemberForwardDesc>& descs,
+    const std::vector<std::size_t>& accepted_members,
+    const std::vector<std::uint32_t>& accepted_token_bases,
+    const std::vector<PtirCommandCallbacks>& callbacks) {
+    std::vector<PtirCommandCallbacks> compacted;
+    compacted.reserve(accepted_members.size());
+    for (std::size_t request = 0;
+         request < accepted_members.size();
+         ++request) {
+        const std::size_t member = accepted_members[request];
+        if (member >= descs.size() || member >= callbacks.size() ||
+            request >= accepted_token_bases.size()) {
+            continue;
+        }
+        PtirCommandCallbacks callback = callbacks[member];
+        std::vector<std::uint32_t> rows;
+        rows.reserve(
+            descs[member].readout_local_indices.size());
+        for (const std::uint32_t local :
+             descs[member].readout_local_indices) {
+            rows.push_back(
+                accepted_token_bases[request] + local);
+        }
+        if (callback.set_logits_rows) {
+            callback.set_logits_rows(rows);
+        }
+        if (callback.set_logits_row &&
+            rows.size() == 1) {
+            callback.set_logits_row(rows[0]);
+        }
+        compacted.push_back(std::move(callback));
+    }
+    for (auto& callback : compacted)
+        if (callback.finalize_group) callback.finalize_group();
+    return compacted;
+}
+
+std::vector<PtirCommandCallbacks> compact_ptir_member_callbacks(
+    const std::vector<std::size_t>& accepted_members,
+    const std::vector<std::vector<std::uint32_t>>& readout_rows,
+    const std::vector<PtirCommandCallbacks>& callbacks) {
+    std::vector<PtirCommandCallbacks> compacted;
+    compacted.reserve(accepted_members.size());
+    for (const std::size_t member : accepted_members) {
+        if (member >= callbacks.size() ||
+            member >= readout_rows.size()) {
+            continue;
+        }
+        PtirCommandCallbacks callback = callbacks[member];
+        const auto& rows = readout_rows[member];
+        if (callback.set_logits_rows) {
+            callback.set_logits_rows(rows);
+        }
+        if (callback.set_logits_row && rows.size() == 1) {
+            callback.set_logits_row(rows[0]);
+        }
+        compacted.push_back(std::move(callback));
+    }
+    for (auto& callback : compacted) {
+        if (callback.finalize_group) callback.finalize_group();
+    }
+    return compacted;
+}
+
 // Platform-agnostic: mutates only `slot_states_`, no decoder dependency.
 // Only the ring-backed entry (if any) matching `sequence_id` is released —
 // per-slot entries holding copy_state'd metadata for the SAME sequence_id
@@ -261,6 +481,11 @@ struct MetalExecutor::Impl {
     ScratchSchedule prefill_sched_{};
     bool mb_bound_ = false;
     std::uint64_t paged_bind_generation_ = 0;
+    SlotHandle ptir_logits_{};
+    SlotHandle ptir_logits_copy_params_{};
+    Pso ptir_logits_copy_pso_{};
+    std::uint32_t ptir_logits_capacity_rows_ = 0;
+    std::uint32_t ptir_logits_next_row_ = 0;
 
     struct GdnDisp {
         int ord;
@@ -317,17 +542,26 @@ struct MetalExecutor::Impl {
     StepTiming step(
         std::uint32_t token_id,
         std::uint32_t position,
-        std::uint32_t slot = 0);
+        std::uint32_t slot = 0,
+        const PtirCommandCallbacks* ptir = nullptr);
     bool run_batch_step(
         const BatchSchedule& schedule,
         const BatchStepInputs& inputs,
-        std::string* error);
+        std::string* error,
+        const std::vector<PtirCommandCallbacks>* ptir = nullptr);
     const std::uint16_t* logits_bf16() const;
     void copy_logits_f32(float* output) const;
     void copy_batch_logits_f32(
         std::uint32_t token_row,
         float* output) const;
     std::uint32_t argmax() const;
+    bool ensure_ptir_logits_rows(std::uint32_t rows, std::string* error);
+    std::uint32_t reserve_ptir_logits_rows(std::uint32_t rows);
+    bool stage_ptir_logits_row(
+        std::uint32_t source_row,
+        std::uint32_t destination_row,
+        std::string* error);
+    void attach_ptir_logits_view(LogitsOut& output) const;
 
   private:
     int& step_count_for(std::uint32_t slot) {
@@ -336,20 +570,23 @@ struct MetalExecutor::Impl {
     bool bind_paged_dag(std::string* error);
     bool run_prefill_step(
         const BatchSchedule& schedule,
-        std::string* error);
+        std::string* error,
+        const std::vector<PtirCommandCallbacks>* ptir);
 };
 
 namespace {
 
+struct PtirLogitsCopyParams {
+    std::uint32_t source_row = 0;
+    std::uint32_t destination_row = 0;
+    std::uint32_t vocab = 0;
+    std::uint32_t reserved = 0;
+};
+
+inline constexpr int kPtirLogitsCopyOrdinal = 90000;
+
 void write_u32(const SlotHandle& s, uint32_t v) {
     std::memcpy(s.contents(), &v, sizeof(v));
-}
-
-inline float bf16_to_f32(uint16_t h) {
-    uint32_t bits = uint32_t(h) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
 }
 
 void zero_slot(const SlotHandle& s) {
@@ -462,6 +699,19 @@ bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& 
     if (g_.paged_kv_enabled &&
         !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, /*with_d512=*/false, &load_err)) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
+        ctx_.reset();
+        return false;
+    }
+    ptir_logits_copy_pso_ = ctx_->compile_ptir_pso_from_file(
+        (std::filesystem::path(kernels_dir) / "ptir_logits_copy.metal").string(),
+        "ptir_copy_logits_bf16",
+        &load_err);
+    ptir_logits_copy_params_ =
+        ctx_->create_standalone_buffer(sizeof(PtirLogitsCopyParams));
+    if (!ptir_logits_copy_pso_.valid() ||
+        !ptir_logits_copy_params_.valid() ||
+        !ensure_ptir_logits_rows(1, &load_err)) {
+        if (err) *err = "PTIR logits staging setup failed: " + load_err;
         ctx_.reset();
         return false;
     }
@@ -591,12 +841,28 @@ size_t kv_pool_row_bytes(const DecodeGeometry& g) {
 }  // namespace
 
 bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size, std::string* err) {
+    auto release_pool = [&](KvPagePool& candidate) {
+        for (auto& layer : candidate.layers) {
+            if (layer.k_pages.valid()) ctx_->release_standalone_buffer(layer.k_pages);
+            if (layer.v_pages.valid()) ctx_->release_standalone_buffer(layer.v_pages);
+        }
+        candidate = {};
+    };
     if (!ready()) {
         if (err) *err = "MetalExecutor::Impl::setup_kv_pool: decoder not initialized";
         return false;
     }
     if (total_pages == 0 || page_size == 0) {
         if (err) *err = "MetalExecutor::Impl::setup_kv_pool: total_pages and page_size must be > 0";
+        return false;
+    }
+    if (!paged_pool_size_supported(g_, total_pages) ||
+        page_size != static_cast<std::uint32_t>(g_.kv_page_size)) {
+        if (err) {
+            *err =
+                "MetalExecutor::Impl::setup_kv_pool: pool geometry exceeds "
+                "the fixed paged-IO allocation";
+        }
         return false;
     }
     int n_full = 0;
@@ -624,22 +890,33 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
                        "(layer " + std::to_string(L) + ", " + std::to_string(layer_bytes) +
                        " bytes/buffer)";
             }
+            release_pool(pool);
             return false;
         }
     }
     pool.total_pages = total_pages;
     pool.page_size = page_size;
     pool.enabled = true;
-    // Phase 3 (review item 4): if a pool was already allocated (setup_kv_pool
-    // re-called with a different size), release the OLD standalone buffers
-    // before replacing it, so re-setup does not leak the previous allocation.
+    const std::uint64_t generation = paged_bind_generation_;
+    const bool was_bound = mb_bound_;
     KvPagePool old_pool = std::move(kv_pool_);
     kv_pool_ = std::move(pool);
-    for (auto& lp : old_pool.layers) {
-        if (lp.k_pages.valid()) ctx_->release_standalone_buffer(lp.k_pages);
-        if (lp.v_pages.valid()) ctx_->release_standalone_buffer(lp.v_pages);
+    if (!bind_paged_dag(err)) {
+        KvPagePool failed = std::move(kv_pool_);
+        kv_pool_ = std::move(old_pool);
+        mb_bound_ = was_bound;
+        if (kv_pool_.enabled) {
+            std::string restore_error;
+            if (!bind_paged_dag(&restore_error) && err != nullptr) {
+                *err += "; restore failed: " + restore_error;
+            }
+            paged_bind_generation_ = generation;
+        }
+        release_pool(failed);
+        return false;
     }
-    return bind_paged_dag(err);
+    release_pool(old_pool);
+    return true;
 }
 
 bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
@@ -780,6 +1057,14 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
         if (err) *err = "MetalExecutor::Impl::resize_kv_pool: resize to 0 pages is not supported";
         return false;
     }
+    if (!paged_pool_size_supported(g_, new_total_pages)) {
+        if (err) {
+            *err =
+                "MetalExecutor::Impl::resize_kv_pool: growth exceeds the "
+                "fixed paged-IO allocation";
+        }
+        return false;
+    }
     if (new_total_pages < kv_pool_.total_pages && !unmapped_tail_pages) {
         if (err) {
             *err = "MetalExecutor::Impl::resize_kv_pool: shrink would truncate pages [" +
@@ -789,6 +1074,13 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
         }
         return false;
     }
+    auto release_pool = [&](KvPagePool& candidate) {
+        for (auto& layer : candidate.layers) {
+            if (layer.k_pages.valid()) ctx_->release_standalone_buffer(layer.k_pages);
+            if (layer.v_pages.valid()) ctx_->release_standalone_buffer(layer.v_pages);
+        }
+        candidate = {};
+    };
     const size_t row_bytes = kv_pool_row_bytes(g_);
     const size_t new_layer_bytes =
         size_t(new_total_pages) * size_t(kv_pool_.page_size) * row_bytes;
@@ -802,6 +1094,9 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
         SlotHandle new_v = ctx_->create_standalone_buffer(new_layer_bytes);
         if (!new_k.valid() || !new_v.valid()) {
             if (err) *err = "MetalExecutor::Impl::resize_kv_pool: new buffer allocation failed";
+            if (new_k.valid()) ctx_->release_standalone_buffer(new_k);
+            if (new_v.valid()) ctx_->release_standalone_buffer(new_v);
+            release_pool(new_pool);
             return false;
         }
         if (copy_bytes > 0) {
@@ -809,6 +1104,9 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
             if (!copy_between_slots(new_k, old_lp.k_pages, 0, copy_bytes) ||
                 !copy_between_slots(new_v, old_lp.v_pages, 0, copy_bytes)) {
                 if (err) *err = "MetalExecutor::Impl::resize_kv_pool: page-preserving copy failed";
+                ctx_->release_standalone_buffer(new_k);
+                ctx_->release_standalone_buffer(new_v);
+                release_pool(new_pool);
                 return false;
             }
         }
@@ -818,22 +1116,31 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
     new_pool.total_pages = new_total_pages;
     new_pool.page_size = kv_pool_.page_size;
     new_pool.enabled = true;
-    // Phase 3 (review item 4): install the new pool, then RELEASE the old
-    // standalone buffers (drop from residency + retained-alive so ARC frees
-    // them). The synchronous copy_between_slots above has already read every
-    // preserved page out of the old buffers, so nothing still references them.
-    // Without this, repeated grow/shrink would leak the old K/V allocations
-    // unbounded (they'd stay retained + resident forever).
+    const std::uint64_t generation = paged_bind_generation_;
+    const bool was_bound = mb_bound_;
     KvPagePool old_pool = std::move(kv_pool_);
     kv_pool_ = std::move(new_pool);
-    for (auto& lp : old_pool.layers) {
-        if (lp.k_pages.valid()) ctx_->release_standalone_buffer(lp.k_pages);
-        if (lp.v_pages.valid()) ctx_->release_standalone_buffer(lp.v_pages);
+    if (!bind_paged_dag(err)) {
+        KvPagePool failed = std::move(kv_pool_);
+        kv_pool_ = std::move(old_pool);
+        mb_bound_ = was_bound;
+        std::string restore_error;
+        if (!bind_paged_dag(&restore_error) && err != nullptr) {
+            *err += "; restore failed: " + restore_error;
+        }
+        paged_bind_generation_ = generation;
+        release_pool(failed);
+        return false;
     }
-    return bind_paged_dag(err);
+    release_pool(old_pool);
+    return true;
 }
 
-StepTiming MetalExecutor::Impl::step(uint32_t token_id, uint32_t position, uint32_t slot) {
+StepTiming MetalExecutor::Impl::step(
+    uint32_t token_id,
+    uint32_t position,
+    uint32_t slot,
+    const PtirCommandCallbacks* ptir) {
     write_u32(b_.io[int(IoSlot::TokenId)],  token_id);
     write_u32(b_.io[int(IoSlot::Position)], position);
     write_u32(b_.io[int(IoSlot::SeqLen)],   position + 1u);
@@ -886,14 +1193,23 @@ StepTiming MetalExecutor::Impl::step(uint32_t token_id, uint32_t position, uint3
     }
 
     StepTiming t = ctx_->run_step(
-        [&](StepEncoder& se) { encode_decode_step(se, dag_, psos_, force_barriers_); },
+        [&](StepEncoder& se) {
+            if (ptir != nullptr && ptir->pre_forward) {
+                ptir->pre_forward(se);
+            }
+            encode_decode_step(se, dag_, psos_, force_barriers_);
+            if (ptir != nullptr && ptir->post_forward) {
+                ptir->post_forward(se);
+            }
+        },
         sc & 1);
     ++sc;
     return t;
 }
 
 bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const BatchStepInputs& in,
-                                     std::string* err) {
+                                     std::string* err,
+                                     const std::vector<PtirCommandCallbacks>* ptir) {
     auto fail = [&](const std::string& why) {
         if (err) *err = "MetalExecutor::Impl::run_batch_step: " + why;
         return false;
@@ -914,6 +1230,20 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         in.rs_slot_flags.size() != size_t(schedule.R) ||
         in.w_page.size() != size_t(schedule.N) || in.w_off.size() != size_t(schedule.N))
         return fail("inconsistent fixed IO vector sizes");
+    const bool has_attention_mask =
+        !in.attention_mask.empty() ||
+        !in.attention_mask_enabled.empty();
+    if (has_attention_mask &&
+        (in.attention_mask_stride == 0 ||
+         in.attention_mask_enabled.size() !=
+             size_t(schedule.N) ||
+         in.attention_mask.size() !=
+             size_t(schedule.N) *
+                 in.attention_mask_stride ||
+         in.attention_mask.size() >
+             b_.io[int(IoSlot::AttnMask)].size)) {
+        return fail("inconsistent dense attention mask sizes");
+    }
     if (in.kv_page_indices.size() > size_t(g_.max_requests) * size_t(g_.total_pages))
         return fail("flattened KV CSR exceeds configured reference capacity");
     std::string geometry_err;
@@ -959,12 +1289,31 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     copy_to(IoSlot::SlotOfToken, schedule.slot_of_token);
     copy_to(IoSlot::WPage, in.w_page);
     copy_to(IoSlot::WOff, in.w_off);
+    if (has_attention_mask) {
+        copy_to(IoSlot::AttnMask, in.attention_mask);
+        copy_to(
+            IoSlot::AttnMaskEnabled,
+            in.attention_mask_enabled);
+        write_u32(
+            b_.io[int(IoSlot::AttnMaskStride)],
+            in.attention_mask_stride);
+    } else {
+        std::memset(
+            b_.io[int(IoSlot::AttnMaskEnabled)].contents(),
+            0,
+            size_t(schedule.N));
+        write_u32(
+            b_.io[int(IoSlot::AttnMaskStride)],
+            static_cast<std::uint32_t>(
+                b_.io[int(IoSlot::AttnMask)].size /
+                std::max(schedule.N, 1)));
+    }
     std::vector<uint32_t> seq_len(size_t(schedule.N));
     for (int t = 0; t < schedule.N; ++t)
         seq_len[size_t(t)] = schedule.spans[schedule.req_of_token[size_t(t)]].seqlen;
     copy_to(IoSlot::SeqLen, seq_len);
 
-    if (!schedule.is_pure_decode) return run_prefill_step(schedule, err);
+    if (!schedule.is_pure_decode) return run_prefill_step(schedule, err, ptir);
 
     std::vector<uint32_t> active_slots;
     active_slots.reserve(size_t(schedule.R));
@@ -990,9 +1339,19 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
 
     const std::vector<Dispatch> fire_dag =
         build_decode_dag_mb(g_, schedule.N, kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
-    ctx_->run_step([&](StepEncoder& se) {
+    const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
+        if (ptir != nullptr) {
+            for (const auto& callbacks : *ptir)
+                if (callbacks.pre_forward) callbacks.pre_forward(se);
+        }
         encode_decode_step_mb(se, fire_dag, psos_, mb_psos_, force_barriers_);
+        if (ptir != nullptr) {
+            for (const auto& callbacks : *ptir)
+                if (callbacks.post_forward) callbacks.post_forward(se);
+        }
     });
+    if (!timing.succeeded())
+        return fail("Metal command timed out before its completion fence");
 
     for (uint32_t slot : active_slots) {
         const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
@@ -1007,7 +1366,10 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     return true;
 }
 
-bool MetalExecutor::Impl::run_prefill_step(const BatchSchedule& schedule, std::string* err) {
+bool MetalExecutor::Impl::run_prefill_step(
+    const BatchSchedule& schedule,
+    std::string* err,
+    const std::vector<PtirCommandCallbacks>* ptir) {
     auto fail = [&](const std::string& why) {
         if (err) *err = "MetalExecutor::Impl::run_prefill_step: " + why;
         return false;
@@ -1031,11 +1393,21 @@ bool MetalExecutor::Impl::run_prefill_step(const BatchSchedule& schedule, std::s
 
     // One command buffer, request-major token order.  Every complete layer DAG
     // ends in a barrier, so token t+1 observes token t's GDN and paged KV writes.
-    ctx_->run_step([&](StepEncoder& se) {
+    const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
+        if (ptir != nullptr) {
+            for (const auto& callbacks : *ptir)
+                if (callbacks.pre_forward) callbacks.pre_forward(se);
+        }
         for (int t = 0; t < schedule.N; ++t)
             encode_decode_step_mb(se, prefill_dags_[size_t(t)], psos_, mb_psos_,
                                   force_barriers_);
+        if (ptir != nullptr) {
+            for (const auto& callbacks : *ptir)
+                if (callbacks.post_forward) callbacks.post_forward(se);
+        }
     });
+    if (!timing.succeeded())
+        return fail("Metal command timed out before its completion fence");
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
     return true;
 }
@@ -1044,14 +1416,83 @@ const uint16_t* MetalExecutor::Impl::logits_bf16() const {
     return static_cast<const uint16_t*>(b_.io[int(IoSlot::Logits)].contents());
 }
 
+bool MetalExecutor::Impl::ensure_ptir_logits_rows(
+    std::uint32_t rows,
+    std::string* error) {
+    rows = std::max<std::uint32_t>(rows, 1);
+    if (ptir_logits_.valid() && rows <= ptir_logits_capacity_rows_) return true;
+    SlotHandle replacement = ctx_->create_standalone_buffer(
+        static_cast<std::size_t>(rows) * g_.vocab * sizeof(std::uint16_t));
+    if (!replacement.valid()) {
+        if (error != nullptr) *error = "shared bf16 staging allocation failed";
+        return false;
+    }
+    SlotHandle old = ptir_logits_;
+    ptir_logits_ = replacement;
+    ptir_logits_capacity_rows_ = rows;
+    ctx_->arg_bind_ordinal(
+        kPtirLogitsCopyOrdinal, 0, b_.io[int(IoSlot::Logits)]);
+    ctx_->arg_bind_ordinal(kPtirLogitsCopyOrdinal, 1, ptir_logits_);
+    ctx_->arg_bind_ordinal(
+        kPtirLogitsCopyOrdinal, 2, ptir_logits_copy_params_);
+    if (old.valid()) ctx_->release_standalone_buffer(old);
+    return true;
+}
+
+std::uint32_t MetalExecutor::Impl::reserve_ptir_logits_rows(
+    std::uint32_t rows) {
+    const std::uint32_t base = ptir_logits_next_row_;
+    ptir_logits_next_row_ += rows;
+    return base;
+}
+
+bool MetalExecutor::Impl::stage_ptir_logits_row(
+    std::uint32_t source_row,
+    std::uint32_t destination_row,
+    std::string* error) {
+    if (!ptir_logits_copy_pso_.valid() ||
+        destination_row >= ptir_logits_capacity_rows_) {
+        if (error != nullptr) *error = "PTIR logits staging is not ready";
+        return false;
+    }
+    *static_cast<PtirLogitsCopyParams*>(ptir_logits_copy_params_.contents()) = {
+        .source_row = source_row,
+        .destination_row = destination_row,
+        .vocab = static_cast<std::uint32_t>(g_.vocab),
+        .reserved = 0,
+    };
+    const StepTiming timing = ctx_->run_step([&](StepEncoder& encoder) {
+        encoder.set_pso(ptir_logits_copy_pso_);
+        encoder.set_argtable_ordinal(kPtirLogitsCopyOrdinal);
+        encoder.dispatch(
+            Grid{static_cast<std::uint32_t>(g_.vocab), 1, 1},
+            Threadgroup{256, 1, 1});
+    });
+    if (!timing.succeeded()) {
+        if (error != nullptr) {
+            *error =
+                "PTIR logits copy timed out before its completion fence";
+        }
+        return false;
+    }
+    return true;
+}
+
+void MetalExecutor::Impl::attach_ptir_logits_view(LogitsOut& output) const {
+    output.device_buffer = ptir_logits_.buffer;
+    output.device_contents = ptir_logits_.contents();
+    output.device_gpu_address = ptir_logits_.gpu_address;
+    output.device_bytes = ptir_logits_.size;
+}
+
 void MetalExecutor::Impl::copy_logits_f32(float* out) const {
     const uint16_t* lb = logits_bf16();
-    for (int i = 0; i < g_.vocab; ++i) out[i] = bf16_to_f32(lb[i]);
+    copy_bf16_to_f32(lb, out, static_cast<std::size_t>(g_.vocab));
 }
 
 void MetalExecutor::Impl::copy_batch_logits_f32(uint32_t token_row, float* out) const {
     const uint16_t* lb = logits_bf16() + size_t(token_row) * size_t(g_.vocab);
-    for (int i = 0; i < g_.vocab; ++i) out[i] = bf16_to_f32(lb[i]);
+    copy_bf16_to_f32(lb, out, static_cast<std::size_t>(g_.vocab));
 }
 
 uint32_t MetalExecutor::Impl::argmax() const {
@@ -1268,6 +1709,14 @@ bool MetalExecutor::ready() const { return impl_ != nullptr && impl_->ready(); }
 
 std::uint32_t MetalExecutor::vocab() const { return vocab_; }
 
+RawMetalContext* MetalExecutor::command_context() {
+    return ready() ? impl_->ctx_.get() : nullptr;
+}
+
+SlotHandle MetalExecutor::logits_device_slot() const {
+    return ready() ? impl_->b_.io[int(IoSlot::Logits)] : SlotHandle{};
+}
+
 std::uint32_t MetalExecutor::rs_slots() const {
     return ready() ? static_cast<std::uint32_t>(impl_->geometry().max_slots) : 0u;
 }
@@ -1344,6 +1793,17 @@ bool MetalExecutor::copy_state(std::uint32_t src_slot, std::uint32_t dst_slot, s
 }
 
 bool MetalExecutor::forward(const MemberForwardDesc& desc, LogitsOut& out, std::string* err) {
+    if (!ready()) {
+        if (err != nullptr) *err = "Metal executor not initialized";
+        return false;
+    }
+    impl_->ptir_logits_next_row_ = 0;
+    if (!impl_->ensure_ptir_logits_rows(
+            static_cast<std::uint32_t>(
+                desc.readout_local_indices.size()),
+            err)) {
+        return false;
+    }
     const std::uint32_t slot = desc.has_rs_slot ? desc.rs_slot_id : 0u;
     const auto state = slot_states_.find(slot);
     if (desc.requires_paged || desc.has_write_desc ||
@@ -1359,13 +1819,15 @@ bool MetalExecutor::forward(const MemberForwardDesc& desc, LogitsOut& out, std::
         if (err != nullptr) *err = errors.empty() ? "paged forward failed" : errors[0];
         return false;
     }
-    return run_member_forward(desc, out, /*batch_serialized=*/false, err);
+    return run_member_forward(
+        desc, out, /*batch_serialized=*/false, err, nullptr);
 }
 
 void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
                                   std::vector<LogitsOut>& outs,
                                   std::vector<std::uint8_t>& success,
-                                  std::vector<std::string>& errors) {
+                                  std::vector<std::string>& errors,
+                                  const std::vector<PtirCommandCallbacks>* ptir) {
     outs.assign(descs.size(), LogitsOut{});
     success.assign(descs.size(), 0);
     errors.assign(descs.size(), std::string{});
@@ -1373,19 +1835,48 @@ void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
         for (auto& e : errors) e = "Metal executor not initialized";
         return;
     }
+    if (ptir != nullptr && ptir->size() != descs.size()) {
+        for (auto& e : errors) e = "PTIR callback/member count mismatch";
+        return;
+    }
+    std::uint32_t total_readout_rows = 0;
+    for (const auto& desc : descs) {
+        total_readout_rows +=
+            static_cast<std::uint32_t>(desc.readout_local_indices.size());
+    }
+    std::string staging_error;
+    if (!impl_->ensure_ptir_logits_rows(total_readout_rows, &staging_error)) {
+        for (auto& e : errors) e = staging_error;
+        return;
+    }
+    impl_->ptir_logits_next_row_ = 0;
     if (descs.size() == 1 && !descs[0].requires_paged && !descs[0].has_write_desc) {
+        if (ptir != nullptr) {
+            if ((*ptir)[0].set_logits_row)
+                (*ptir)[0].set_logits_row(0);
+            if ((*ptir)[0].finalize_group)
+                (*ptir)[0].finalize_group();
+        }
         std::string member_err;
-        if (forward(descs[0], outs[0], &member_err)) success[0] = 1;
+        if (run_member_forward(
+                descs[0],
+                outs[0],
+                /*batch_serialized=*/false,
+                &member_err,
+                ptir != nullptr ? &(*ptir)[0] : nullptr)) {
+            success[0] = 1;
+        }
         else errors[0] = std::move(member_err);
         return;
     }
-    run_paged_batch_forward(descs, outs, success, errors);
+    run_paged_batch_forward(descs, outs, success, errors, ptir);
 }
 
 bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>& descs,
                                             std::vector<LogitsOut>& outs,
                                             std::vector<std::uint8_t>& success,
-                                            std::vector<std::string>& errors) {
+                                            std::vector<std::string>& errors,
+                                            const std::vector<PtirCommandCallbacks>* ptir) {
     outs.assign(descs.size(), LogitsOut{});
     success.assign(descs.size(), 0);
     errors.assign(descs.size(), std::string{});
@@ -1400,97 +1891,313 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
     }
 
     BatchStepInputs in;
-    std::vector<std::size_t> member_of_request;
-    std::vector<std::uint32_t> token_base_of_request;
+    const std::uint64_t mask_stride64 =
+        paged_attention_mask_pitch_bytes(
+            impl_->geometry());
+    if (mask_stride64 == 0 ||
+        mask_stride64 > std::numeric_limits<std::uint32_t>::max()) {
+        for (auto& e : errors) {
+            e = "paged attention mask stride exceeds u32";
+        }
+        return false;
+    }
+    in.attention_mask_stride =
+        static_cast<std::uint32_t>(mask_stride64);
+    struct AcceptedRequest {
+        std::size_t member = 0;
+        std::uint32_t local_request = 0;
+        bool write = false;
+    };
+    std::vector<AcceptedRequest> accepted_requests;
+    std::vector<std::vector<std::uint32_t>> member_readout_rows(
+        descs.size());
+    std::vector<std::size_t> accepted_members;
     std::unordered_map<std::uint32_t, std::size_t> slot_owner;
     auto reject = [&](std::size_t i, const std::string& reason) { errors[i] = reason; };
     for (std::size_t i = 0; i < descs.size(); ++i) {
         const MemberForwardDesc& d = descs[i];
-        const std::uint32_t slot = d.has_rs_slot ? d.rs_slot_id : 0u;
         if (d.token_ids.empty() || d.token_ids.size() != d.position_ids.size()) {
             reject(i, "paged forward token/position count mismatch or empty span");
             continue;
         }
-        if (slot >= rs_slots()) {
-            reject(i, "recurrent-state slot is out of range");
+        if (d.qo_indptr.size() < 2 ||
+            d.qo_indptr.front() != 0 ||
+            d.qo_indptr.back() != d.token_ids.size() ||
+            d.kv_page_indptr.size() != d.qo_indptr.size() ||
+            d.kv_page_indptr.front() != 0 ||
+            d.kv_page_indptr.back() != d.kv_pages.size() ||
+            d.kv_last_page_lens.size() + 1 !=
+                d.qo_indptr.size() ||
+            d.sampling_indptr.size() != d.qo_indptr.size() ||
+            d.sampling_indptr.front() != 0 ||
+            d.sampling_indptr.back() !=
+                d.readout_local_indices.size()) {
+            reject(i, "paged member CSR is malformed");
             continue;
         }
-        const bool fresh = d.has_rs_slot ? d.rs_reset : d.position_ids[0] == 0;
-        const auto prior = slot_states_.find(slot);
-        if (!fresh &&
-            (prior == slot_states_.end() || !prior->second.has_resident ||
-             !prior->second.paged_backed || prior->second.resident_sequence_id != d.sequence_id ||
-             prior->second.resident_next_position != d.position_ids[0])) {
-            reject(i, "paged continuation has no matching resident paged GDN state");
+        std::string position_error;
+        if (!validate_request_local_positions(
+                d, &position_error)) {
+            reject(i, position_error);
             continue;
         }
-        if (!slot_owner.emplace(slot, i).second) {
-            reject(i, "two paged requests target the same recurrent-state slot in one fire");
-            continue;
-        }
-        if (d.kv_pages.empty()) {
-            reject(i, "paged request has no KV page CSR");
-            continue;
-        }
-        bool positions_ok = true;
-        for (size_t t = 1; t < d.position_ids.size(); ++t) {
-            if (d.position_ids[t] != d.position_ids[t - 1] + 1u) {
-                positions_ok = false;
-                break;
-            }
-        }
-        if (!positions_ok) {
-            reject(i, "paged prefill positions must be contiguous within a request");
-            continue;
-        }
-        const uint32_t pos = d.position_ids.back();
-        const uint32_t last = d.kv_last_page_len != 0
-                                  ? d.kv_last_page_len
-                                  : (pos % pool.page_size) + 1u;
-        const uint64_t extent = uint64_t(d.kv_pages.size() - 1) * pool.page_size + last;
-        if (last == 0 || last > pool.page_size ||
-            std::any_of(d.position_ids.begin(), d.position_ids.end(),
-                        [&](uint32_t p) { return p >= extent; })) {
-            reject(i, "position is outside the request's paged KV extent");
-            continue;
-        }
-        bool pages_ok = true;
-        for (uint32_t p : d.kv_pages) {
-            if (p >= pool.total_pages) { pages_ok = false; break; }
-        }
-        if (!pages_ok) {
-            reject(i, "KV page id is outside the paged pool");
+        const std::size_t request_count =
+            d.qo_indptr.size() - 1;
+        const bool legacy_single_rs =
+            d.has_rs_slot && request_count == 1 &&
+            d.request_rs_slot_ids.empty();
+        if (d.has_rs_slot &&
+            !legacy_single_rs &&
+            (d.request_rs_slot_ids.size() != request_count ||
+             d.request_rs_reset.size() != request_count ||
+             d.request_rs_read.size() != request_count ||
+             d.request_rs_write.size() != request_count)) {
+            reject(
+                i,
+                "paged member recurrent-state bindings do not match its "
+                "request count");
             continue;
         }
         if (d.has_write_desc &&
-            (d.w_page.size() != d.token_ids.size() || d.w_off.size() != d.token_ids.size())) {
-            reject(i, "explicit w_page/w_off must have one entry per prompt token");
+            (d.w_page.size() != d.token_ids.size() ||
+             d.w_off.size() != d.token_ids.size())) {
+            reject(
+                i,
+                "explicit w_page/w_off must have one entry per prompt token");
             continue;
         }
-        for (uint32_t local : d.readout_local_indices) {
-            if (local >= d.token_ids.size()) {
-                reject(i, "readout index exceeds this prefill member's token span");
+        if (d.structured_mask && !d.has_attention_mask) {
+            reject(
+                i,
+                "structured attention mask has no dense Metal fallback");
+            continue;
+        }
+        if (d.has_attention_mask &&
+            (d.attention_mask_stride > in.attention_mask_stride ||
+             d.attention_mask.size() !=
+                 d.token_ids.size() *
+                     static_cast<std::size_t>(
+                         d.attention_mask_stride))) {
+            reject(i, "dense attention mask shape is malformed");
+            continue;
+        }
+        struct RequestSpan {
+            std::uint32_t q0 = 0;
+            std::uint32_t q1 = 0;
+            std::uint32_t k0 = 0;
+            std::uint32_t k1 = 0;
+            std::uint32_t s0 = 0;
+            std::uint32_t s1 = 0;
+            std::uint32_t last = 0;
+            std::uint32_t slot = 0;
+            bool reset = false;
+            bool read = false;
+            bool write = false;
+        };
+        std::vector<RequestSpan> spans;
+        spans.reserve(request_count);
+        for (std::size_t request = 0; request < request_count;
+             ++request) {
+            RequestSpan span{
+                .q0 = d.qo_indptr[request],
+                .q1 = d.qo_indptr[request + 1],
+                .k0 = d.kv_page_indptr[request],
+                .k1 = d.kv_page_indptr[request + 1],
+                .s0 = d.sampling_indptr[request],
+                .s1 = d.sampling_indptr[request + 1],
+                .last = d.kv_last_page_lens[request],
+                .slot =
+                    d.has_rs_slot
+                        ? (legacy_single_rs
+                               ? d.rs_slot_id
+                               : d.request_rs_slot_ids[request])
+                        : static_cast<std::uint32_t>(
+                              accepted_requests.size() +
+                              request),
+                .reset =
+                    d.has_rs_slot &&
+                    (legacy_single_rs
+                         ? d.rs_reset
+                         : d.request_rs_reset[request] != 0),
+                .read =
+                    d.has_rs_slot &&
+                    (legacy_single_rs
+                         ? !d.rs_reset
+                         : d.request_rs_read[request] != 0),
+                .write =
+                    d.has_rs_slot &&
+                    (legacy_single_rs
+                         ? true
+                         : d.request_rs_write[request] != 0),
+            };
+            if (span.q1 <= span.q0 ||
+                span.q1 > d.token_ids.size() ||
+                span.k1 <= span.k0 ||
+                span.k1 > d.kv_pages.size() ||
+                span.s1 < span.s0 ||
+                span.s1 >
+                    d.readout_local_indices.size()) {
+                reject(i, "paged request CSR span is invalid");
                 break;
             }
+            if (span.slot >= rs_slots()) {
+                reject(i, "recurrent-state slot is out of range");
+                break;
+            }
+            const std::uint64_t extent =
+                std::uint64_t(span.k1 - span.k0 - 1) *
+                    pool.page_size +
+                span.last;
+            if (span.last == 0 ||
+                span.last > pool.page_size ||
+                std::any_of(
+                    d.position_ids.begin() + span.q0,
+                    d.position_ids.begin() + span.q1,
+                    [&](std::uint32_t position) {
+                        return position >= extent;
+                    })) {
+                reject(
+                    i,
+                    "position is outside the request's paged KV extent");
+                break;
+            }
+            if (std::any_of(
+                    d.kv_pages.begin() + span.k0,
+                    d.kv_pages.begin() + span.k1,
+                    [&](std::uint32_t page) {
+                        return page >= pool.total_pages;
+                    })) {
+                reject(i, "KV page id is outside the paged pool");
+                break;
+            }
+            if (d.has_attention_mask &&
+                d.attention_mask_stride < extent) {
+                reject(
+                    i,
+                    "dense attention mask shape does not cover KV extent");
+                break;
+            }
+            const std::uint32_t query_count =
+                span.q1 - span.q0;
+            for (std::uint32_t sample = span.s0;
+                 sample < span.s1;
+                 ++sample) {
+                if (d.readout_local_indices[sample] >=
+                    query_count) {
+                    reject(
+                        i,
+                        "readout index exceeds its request token span");
+                    break;
+                }
+            }
+            if (!errors[i].empty()) break;
+            if (d.has_rs_slot) {
+                std::string state_error;
+                if (!validate_paged_request_state(
+                        slot_states_,
+                        d,
+                        request,
+                        &state_error)) {
+                    reject(i, state_error);
+                    break;
+                }
+                if (slot_owner.find(span.slot) !=
+                        slot_owner.end() ||
+                    std::any_of(
+                        spans.begin(),
+                        spans.end(),
+                        [&](const RequestSpan& prior) {
+                            return prior.slot == span.slot;
+                        })) {
+                    reject(
+                        i,
+                        "two paged requests target the same recurrent-state slot in one fire");
+                    break;
+                }
+            }
+            spans.push_back(span);
         }
         if (!errors[i].empty()) continue;
-
-        in.qo_indptr.push_back(static_cast<uint32_t>(in.token_ids.size()));
-        in.kv_page_indptr.push_back(static_cast<uint32_t>(in.kv_page_indices.size()));
-        token_base_of_request.push_back(static_cast<uint32_t>(in.token_ids.size()));
-        in.token_ids.insert(in.token_ids.end(), d.token_ids.begin(), d.token_ids.end());
-        in.position_ids.insert(in.position_ids.end(), d.position_ids.begin(), d.position_ids.end());
-        in.kv_page_indices.insert(in.kv_page_indices.end(), d.kv_pages.begin(), d.kv_pages.end());
-        in.kv_last_page_lens.push_back(last);
-        in.rs_slot_ids.push_back(slot);
-        in.rs_slot_flags.push_back(d.has_rs_slot && d.rs_reset ? 1u : 0u);
-        for (size_t t = 0; t < d.token_ids.size(); ++t) {
-            const uint32_t token_pos = d.position_ids[t];
-            const uint32_t csr_page = d.kv_pages[token_pos / pool.page_size];
-            in.w_page.push_back(d.has_write_desc ? d.w_page[t] : csr_page);
-            in.w_off.push_back(d.has_write_desc ? d.w_off[t] : token_pos % pool.page_size);
+        if (d.has_rs_slot) {
+            for (const auto& span : spans) {
+                slot_owner.emplace(span.slot, i);
+            }
         }
-        member_of_request.push_back(i);
+        accepted_members.push_back(i);
+        for (std::size_t request = 0; request < spans.size();
+             ++request) {
+            const RequestSpan& span = spans[request];
+            const std::uint32_t token_base =
+                static_cast<std::uint32_t>(
+                    in.token_ids.size());
+            in.qo_indptr.push_back(token_base);
+            in.kv_page_indptr.push_back(
+                static_cast<std::uint32_t>(
+                    in.kv_page_indices.size()));
+            in.token_ids.insert(
+                in.token_ids.end(),
+                d.token_ids.begin() + span.q0,
+                d.token_ids.begin() + span.q1);
+            in.position_ids.insert(
+                in.position_ids.end(),
+                d.position_ids.begin() + span.q0,
+                d.position_ids.begin() + span.q1);
+            in.kv_page_indices.insert(
+                in.kv_page_indices.end(),
+                d.kv_pages.begin() + span.k0,
+                d.kv_pages.begin() + span.k1);
+            in.kv_last_page_lens.push_back(span.last);
+            in.rs_slot_ids.push_back(span.slot);
+            in.rs_slot_flags.push_back(
+                span.reset ? 1u : 0u);
+            for (std::uint32_t token = span.q0;
+                 token < span.q1;
+                 ++token) {
+                const std::uint32_t token_pos =
+                    d.position_ids[token];
+                const std::uint32_t csr_page =
+                    d.kv_pages[
+                        span.k0 +
+                        token_pos / pool.page_size];
+                in.w_page.push_back(
+                    d.has_write_desc ? d.w_page[token]
+                                     : csr_page);
+                in.w_off.push_back(
+                    d.has_write_desc
+                        ? d.w_off[token]
+                        : token_pos % pool.page_size);
+                in.attention_mask_enabled.push_back(
+                    d.has_attention_mask ? 1 : 0);
+                const std::size_t mask_base =
+                    in.attention_mask.size();
+                in.attention_mask.resize(
+                    mask_base + in.attention_mask_stride,
+                    0);
+                if (d.has_attention_mask) {
+                    const auto* source =
+                        d.attention_mask.data() +
+                        token * d.attention_mask_stride;
+                    std::copy(
+                        source,
+                        source + d.attention_mask_stride,
+                        in.attention_mask.begin() +
+                            mask_base);
+                }
+            }
+            for (std::uint32_t sample = span.s0;
+                 sample < span.s1;
+                 ++sample) {
+                member_readout_rows[i].push_back(
+                    token_base +
+                    d.readout_local_indices[sample]);
+            }
+            accepted_requests.push_back({
+                .member = i,
+                .local_request =
+                    static_cast<std::uint32_t>(request),
+                .write = span.write,
+            });
+        }
     }
     if (in.token_ids.empty()) return false;
     in.qo_indptr.push_back(static_cast<uint32_t>(in.token_ids.size()));
@@ -1501,39 +2208,59 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         in.kv_page_indptr.data(), in.kv_last_page_lens.data(), in.rs_slot_ids.data(),
         in.rs_slot_flags.data(), int(in.qo_indptr.size()), int(pool.page_size));
     std::string batch_err;
-    if (!impl_->run_batch_step(schedule, in, &batch_err)) {
-        for (std::size_t i : member_of_request) errors[i] = batch_err;
+    std::vector<PtirCommandCallbacks> compacted_callbacks;
+    const std::vector<PtirCommandCallbacks>* dispatch_callbacks = ptir;
+    if (ptir != nullptr) {
+        compacted_callbacks = compact_ptir_member_callbacks(
+            accepted_members,
+            member_readout_rows,
+            *ptir);
+        dispatch_callbacks = &compacted_callbacks;
+    }
+    if (!impl_->run_batch_step(
+            schedule, in, &batch_err, dispatch_callbacks)) {
+        for (const std::size_t member : accepted_members) {
+            errors[member] = batch_err;
+        }
         return false;
     }
-    for (std::size_t r = 0; r < member_of_request.size(); ++r) {
-        const std::size_t i = member_of_request[r];
-        const MemberForwardDesc& d = descs[i];
+    for (const std::size_t i : accepted_members) {
         LogitsOut& out = outs[i];
         out.vocab = vocab_;
-        out.rows = static_cast<uint32_t>(d.readout_local_indices.size());
-        out.data.resize(size_t(out.rows) * out.vocab);
-        const std::vector<uint32_t> rows =
-            global_readout_rows(token_base_of_request[r], d.readout_local_indices);
-        for (uint32_t row = 0; row < out.rows; ++row)
-            impl_->copy_batch_logits_f32(
-                rows[row],
-                                                 out.data.data() + size_t(row) * out.vocab);
+        const auto& rows = member_readout_rows[i];
+        out.rows = static_cast<uint32_t>(rows.size());
+        out.device_row_offset =
+            impl_->reserve_ptir_logits_rows(out.rows);
+        impl_->attach_ptir_logits_view(out);
+        for (uint32_t row = 0; row < out.rows; ++row) {
+            if (ptir != nullptr &&
+                (*ptir)[i].consumes_logits_directly) {
+                continue;
+            }
+            std::string staging_error;
+            if (!impl_->stage_ptir_logits_row(
+                    rows[row],
+                    out.device_row_offset + row,
+                    &staging_error)) {
+                errors[i] = staging_error;
+                continue;
+            }
+        }
+        if (!errors[i].empty()) continue;
         success[i] = 1;
-        const uint32_t slot = d.has_rs_slot ? d.rs_slot_id : 0u;
-        LinearSequenceState& state = slot_states_[slot];
-        state.has_resident = true;
-        state.resident_sequence_id = d.sequence_id;
-        state.resident_slot = slot;
-        state.resident_next_position = d.position_ids.back() + 1;
-        state.resident_pages = d.kv_pages;
-        state.ring_backed = false;
-        state.paged_backed = true;
+    }
+    for (const AcceptedRequest& request : accepted_requests) {
+        if (!request.write || success[request.member] == 0) continue;
+        const MemberForwardDesc& d = descs[request.member];
+        commit_paged_request_state(
+            slot_states_, d, request.local_request);
     }
     return true;
 }
 
 bool MetalExecutor::run_member_forward(const MemberForwardDesc& desc, LogitsOut& out,
-                                       bool batch_serialized, std::string* err) {
+                                       bool batch_serialized, std::string* err,
+                                       const PtirCommandCallbacks* ptir) {
     if (!ready()) {
         if (err != nullptr) *err = "Metal executor not initialized";
         return false;
@@ -1583,14 +2310,41 @@ bool MetalExecutor::run_member_forward(const MemberForwardDesc& desc, LogitsOut&
 
     out.vocab = vocab_;
     out.rows = static_cast<std::uint32_t>(desc.readout_local_indices.size());
-    out.data.assign(static_cast<std::size_t>(out.rows) * out.vocab, 0.0f);
+    out.device_row_offset = impl_->reserve_ptir_logits_rows(out.rows);
+    impl_->attach_ptir_logits_view(out);
 
     for (std::size_t i = 0; i < desc.token_ids.size(); ++i) {
-        impl_->step(desc.token_ids[i], desc.position_ids[i], slot);
+        PtirCommandCallbacks token_callbacks;
+        const PtirCommandCallbacks* token_ptir = nullptr;
+        if (ptir != nullptr) {
+            if (i == 0) token_callbacks.pre_forward = ptir->pre_forward;
+            if (i + 1 == desc.token_ids.size())
+                token_callbacks.post_forward = ptir->post_forward;
+            token_callbacks.consumes_logits_directly =
+                ptir->consumes_logits_directly;
+            token_ptir = &token_callbacks;
+        }
+        const StepTiming timing = impl_->step(
+            desc.token_ids[i],
+            desc.position_ids[i],
+            slot,
+            token_ptir);
+        if (!timing.succeeded()) {
+            if (err != nullptr) {
+                *err =
+                    "Metal forward timed out before its completion fence";
+            }
+            return false;
+        }
         for (std::uint32_t r = 0; r < desc.readout_local_indices.size(); ++r) {
             if (desc.readout_local_indices[r] != static_cast<std::uint32_t>(i)) continue;
-            impl_->copy_logits_f32(out.data.data() +
-                                           static_cast<std::size_t>(r) * out.vocab);
+            if (ptir != nullptr && ptir->consumes_logits_directly) continue;
+            if (!impl_->stage_ptir_logits_row(
+                    0,
+                    out.device_row_offset + r,
+                    err)) {
+                return false;
+            }
         }
     }
 
@@ -1663,8 +2417,12 @@ bool MetalExecutor::forward(const MemberForwardDesc&, LogitsOut&, std::string* e
     return false;
 }
 
-bool MetalExecutor::run_member_forward(const MemberForwardDesc&, LogitsOut&, bool,
-                                       std::string* err) {
+bool MetalExecutor::run_member_forward(
+    const MemberForwardDesc&,
+    LogitsOut&,
+    bool,
+    std::string* err,
+    const PtirCommandCallbacks*) {
     if (err != nullptr) *err = "Metal executor requires an Apple build";
     return false;
 }
@@ -1672,11 +2430,15 @@ bool MetalExecutor::run_member_forward(const MemberForwardDesc&, LogitsOut&, boo
 void MetalExecutor::forward_batch(const std::vector<MemberForwardDesc>& descs,
                                   std::vector<LogitsOut>& outs,
                                   std::vector<std::uint8_t>& success,
-                                  std::vector<std::string>& errors) {
+                                  std::vector<std::string>& errors,
+                                  const std::vector<PtirCommandCallbacks>*) {
     outs.assign(descs.size(), LogitsOut{});
     success.assign(descs.size(), 0);
     errors.assign(descs.size(), std::string("Metal executor requires an Apple build"));
 }
+
+RawMetalContext* MetalExecutor::command_context() { return nullptr; }
+SlotHandle MetalExecutor::logits_device_slot() const { return {}; }
 
 #endif
 

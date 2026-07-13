@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "decode_psos.hpp"
@@ -19,6 +21,12 @@ struct MbBindOffsets {
     size_t token_row = 0;
     size_t logits_bytes = 0;
 };
+
+std::size_t paged_attention_mask_pitch_bytes(
+    const DecodeGeometry& geometry);
+bool paged_pool_size_supported(
+    const DecodeGeometry& geometry,
+    std::uint32_t pages);
 
 // The paged DAG has the same dataflow/order as build_decode_dag.  Only kernels
 // whose ABI changes for token rows/page tables/state slots use append-only kinds.

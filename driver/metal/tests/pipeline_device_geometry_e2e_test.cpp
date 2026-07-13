@@ -30,6 +30,9 @@
 #include <vector>
 
 #include <pie_driver_abi.h>
+
+#include "observability.hpp"
+#include "support/ptib_v2_plan.hpp"
 #include "pie_native/ptir/container.hpp"
 
 namespace {
@@ -133,19 +136,22 @@ std::vector<std::uint8_t> device_geometry_sidecar(const std::vector<std::uint8_t
     const std::uint64_t hash =
         pie_native::ptir::container::fnv1a64(container.data(), container.size());
     std::vector<std::uint8_t> out{'P', 'T', 'I', 'B'};
-    push_u16(out, PTIB_VERSION);
+    push_u16(out, 1);  // hand-built typed sidecar; no v2 compiler-plan section
     push_u16(out, 0);
     for (int b = 0; b < 8; ++b) out.push_back(static_cast<std::uint8_t>(hash >> (b * 8)));
     push_u32(out, 1);            // channel classes
     out.push_back(0);            // chan0 class = FullRing
-    push_u32(out, 0);            // readiness entries (none needed — no stages take/put chan0)
+    push_u32(out, 1);            // descriptor channel must be ready before forward
+    push_u32(out, 0);
+    out.push_back(PTIR_PHASE_DESCRIPTOR);
+    out.push_back(PTIR_NEEDS_FULL);
     push_u32(out, 1);            // stages
     out.push_back(PTIR_STAGE_EPILOGUE);
     push_u32(out, 1);            // 1 SSA value in this stage (the intrinsic)
     out.push_back(PTIR_DT_F32);
     out.push_back(1);
     push_u32(out, 1);
-    return out;
+    return pie::metal::tests::upgrade_ptib_v1(container, std::move(out));
 }
 
 // Program B: a plain channel-plane passthrough — chan0 (seeded Writer) ->
@@ -180,7 +186,7 @@ std::vector<std::uint8_t> passthrough_sidecar(const std::vector<std::uint8_t>& c
     const std::uint64_t hash =
         pie_native::ptir::container::fnv1a64(container.data(), container.size());
     std::vector<std::uint8_t> out{'P', 'T', 'I', 'B'};
-    push_u16(out, PTIB_VERSION);
+    push_u16(out, 1);  // hand-built typed sidecar; no v2 compiler-plan section
     push_u16(out, 0);
     for (int b = 0; b < 8; ++b) out.push_back(static_cast<std::uint8_t>(hash >> (b * 8)));
     push_u32(out, 2);  // channel classes
@@ -199,12 +205,13 @@ std::vector<std::uint8_t> passthrough_sidecar(const std::vector<std::uint8_t>& c
     out.push_back(PTIR_DT_U32);
     out.push_back(1);
     push_u32(out, 1);
-    return out;
+    return pie::metal::tests::upgrade_ptib_v1(container, std::move(out));
 }
 
 }  // namespace
 
 int main() {
+    pie::metal::m0_timing_counters().reset_for_tests();
     NotifyState notify_state;
 
     // A self-contained scratch config in the CURRENT working directory
@@ -408,6 +415,56 @@ int main() {
     expect(!notify_state.contains(0, a_poison),
           "no spurious wait_id==0 notification is queued for A's NONE-role channel");
 
+    bool retry_stress_ok = true;
+    for (std::uint64_t retry = 1; retry <= 16; ++retry) {
+        PieTerminalCell terminal{
+           .outcome = PIE_TERMINAL_OUTCOME_PENDING,
+           .reserved0 = 0,
+        };
+        PieTerminalCell* retry_terminals[] = {&terminal};
+        const std::uint64_t retry_instances[] = {
+           a_binding.instance_id};
+        const std::uint64_t retry_heads[] = {0};
+        const std::uint64_t retry_tails[] = {no_ticket};
+        const std::uint32_t retry_indptr[] = {0, 1};
+        PieLaunchDesc retry_launch{};
+        retry_launch.abi_version = PIE_DRIVER_ABI_VERSION;
+        retry_launch.instance_ids = {
+           .ptr = retry_instances, .len = 1};
+        retry_launch.terminal_cells = {
+           .ptr = retry_terminals, .len = 1};
+        retry_launch.channel_expected_head = {
+           .ptr = retry_heads, .len = 1};
+        retry_launch.channel_expected_tail = {
+           .ptr = retry_tails, .len = 1};
+        retry_launch.channel_ticket_indptr = {
+           .ptr = retry_indptr, .len = 2};
+        const PieCompletion retry_completion{
+           .wait_id = 98,
+           .target_epoch = retry,
+           .terminal_cell = nullptr,
+        };
+        retry_stress_ok =
+           retry_stress_ok &&
+           pie_metal_launch(
+               driver, &retry_launch, retry_completion) ==
+               PIE_STATUS_OK;
+        notify_state.wait(
+           retry_completion.wait_id,
+           retry_completion.target_epoch);
+        retry_stress_ok =
+           retry_stress_ok &&
+           terminal.outcome == PIE_TERMINAL_OUTCOME_RETRY;
+    }
+    const auto resources =
+        pie::metal::m1_prepared_resource_counters().snapshot();
+    expect(
+        retry_stress_ok && resources.fires == 0 &&
+           resources.external_handles == 0 &&
+           resources.standalone_buffers == 0,
+        "descriptor RETRY releases every prepared fire and residency "
+        "resource across repeated launches");
+
     // -- B: settles normally, unaffected by A's failure in the same batch --
     expect(b_terminal.outcome == PIE_TERMINAL_OUTCOME_SUCCESS,
           "B's terminal outcome == SUCCESS (got " + std::to_string(b_terminal.outcome) + ")");
@@ -424,6 +481,11 @@ int main() {
     // -- the batch-level completion still notifies exactly once --
     expect(notify_state.contains(completion.wait_id, completion.target_epoch),
           "batch completion notified exactly once despite A's per-member retry");
+    expect(
+        pie::metal::m0_timing_counters()
+               .snapshot()
+               .cpu_epilogue_samples == 0,
+        "production M1 executes no CPU epilogue");
 
     pie_metal_destroy(driver);
     std::remove(config_path.c_str());

@@ -41,7 +41,7 @@
 //! JSON/plain input: an optional token budget (defaults to 8), e.g. `"16"`.
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 const PROMPT: &str = "hello world";
 /// Fixed 2nd-turn continuation for the clear probes (Scenarios B/E).
@@ -85,19 +85,30 @@ impl Decoder {
     fn new(capacity_tokens: u32) -> Result<Decoder> {
         let pool_pages = capacity_tokens.div_ceil(PAGE_T).max(1);
         let ws: &'static WorkingSet = bx(WorkingSet::new());
-        let grant = ws.reserve(pool_pages).map_err(|e| format!("ws.reserve: {e}"))?;
+        let grant = ws
+            .reserve(pool_pages)
+            .map_err(|e| format!("ws.reserve: {e}"))?;
         let pool_ids: &'static Vec<u32> = bx(grant.ids().to_vec());
-        Ok(Decoder { ws, pool_ids, pool_pages, pool: pool_pages * PAGE_T, seq: 0 })
+        Ok(Decoder {
+            ws,
+            pool_ids,
+            pool_pages,
+            pool: pool_pages * PAGE_T,
+            seq: 0,
+        })
     }
 
     /// ONE N-wide prefill fire at the cursor: embeds `tokens` at positions
     /// `seq..seq+n`, writes their N KV cells, greedy-argmaxes the read-out row
     /// (row N-1). Advances the cursor by N and returns the generated token.
-    fn prefill(&mut self, tokens: &[u32], pipeline: &Pipeline) -> Result<u32> {
+    async fn prefill(&mut self, tokens: &[u32], pipeline: &Pipeline) -> Result<u32> {
         let n = tokens.len() as u32;
         let base = self.seq;
         if base + n >= self.pool {
-            return Err(format!("prefill overflows pool ({} + {n} >= {})", base, self.pool));
+            return Err(format!(
+                "prefill overflows pool ({} + {n} >= {})",
+                base, self.pool
+            ));
         }
 
         let toks_v: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
@@ -136,9 +147,14 @@ impl Decoder {
             g_ch.put(&tok);
         });
 
-        fwd.submit(&pipeline).map_err(|e| format!("prefill submit: {e}"))?;
+        fwd.submit(&pipeline)
+            .map_err(|e| format!("prefill submit: {e}"))?;
         self.seq += n;
-        let g0 = g_ch.take().get::<i32>().map_err(|e| format!("g0 take: {e}"))?[0];
+        let g0 = g_ch
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("g0 take: {e}"))?[0];
         Ok(g0 as u32)
     }
 
@@ -163,8 +179,9 @@ impl Decoder {
         let pages = bx(Channel::from(self.pool_ids.clone()).named("pages"));
         let page_indptr =
             bx(Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr"));
-        let pool_ids_ch =
-            bx(Channel::new([pool_pages], dtype::u32).capacity(RING).named("pool_ids"));
+        let pool_ids_ch = bx(Channel::new([pool_pages], dtype::u32)
+            .capacity(RING)
+            .named("pool_ids"));
         let out = bx(Channel::new([1], dtype::i32).capacity(RING).named("out"));
         let lane1 = Tensor::constant(vec![0u32, 1u32]);
 
@@ -209,7 +226,12 @@ impl Decoder {
             page_indptr.put(&pidx_v);
         });
 
-        DecodeLoop { fwd, out, pool_ids_ch, pipeline: Pipeline::new() }
+        DecodeLoop {
+            fwd,
+            out,
+            pool_ids_ch,
+            pipeline: Pipeline::new(),
+        }
     }
 }
 
@@ -226,14 +248,21 @@ impl DecodeLoop {
     /// the decoder cursor on SUBMIT, like the classic probe.
     fn submit(&self, d: &mut Decoder) -> Result<()> {
         d.pool_ids_ch_put(self.pool_ids_ch);
-        self.fwd.submit(&self.pipeline).map_err(|e| format!("decode submit: {e}"))?;
+        self.fwd
+            .submit(&self.pipeline)
+            .map_err(|e| format!("decode submit: {e}"))?;
         d.seq += 1;
         Ok(())
     }
 
     /// Drain the oldest in-flight fire's token (blocks until committed).
-    fn take(&self) -> Result<u32> {
-        let t = self.out.take().get::<i32>().map_err(|e| format!("out.take: {e}"))?;
+    async fn take(&self) -> Result<u32> {
+        let t = self
+            .out
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("out.take: {e}"))?;
         Ok(*t.first().unwrap_or(&0) as u32)
     }
 
@@ -274,11 +303,15 @@ async fn generate(
         return Ok(Vec::new());
     }
     let fallback = [0u32];
-    let prompt = if prompt.is_empty() { &fallback[..] } else { prompt };
+    let prompt = if prompt.is_empty() {
+        &fallback[..]
+    } else {
+        prompt
+    };
 
     // Fire #1: the N-wide prompt prefill (token #1 of the budget).
     let prefill_pipe = Pipeline::new();
-    let g0 = d.prefill(prompt, &prefill_pipe)?;
+    let g0 = d.prefill(prompt, &prefill_pipe).await?;
     prefill_pipe.close();
     let mut out = Vec::with_capacity(max_tokens);
     if stop.contains(&g0) {
@@ -289,7 +322,11 @@ async fn generate(
         return Ok(out);
     }
 
-    let depth = if !stop.is_empty() && !overshoot { 1 } else { depth.max(1) };
+    let depth = if !stop.is_empty() && !overshoot {
+        1
+    } else {
+        depth.max(1)
+    };
     let budget = max_tokens - 1; // decode fires (each yields one token)
 
     let dl = d.decode_pass(g0);
@@ -307,7 +344,7 @@ async fn generate(
     // FIFO drain; refill one fire per drained token to sustain `depth` in flight.
     let mut hit_stop = false;
     while inflight > 0 {
-        let token = dl.take()?;
+        let token = dl.take().await?;
         inflight -= 1;
         if stop.contains(&token) {
             hit_stop = true; // the stop fire committed; `inflight` are over-shot
@@ -328,7 +365,7 @@ async fn generate(
         // reuses/overwrites the over-shot cells.
         let overshot = inflight as u32;
         while inflight > 0 {
-            let _ = dl.take(); // finalize-drain; a discard never fails the decode
+            let _ = dl.take().await; // finalize-drain; a discard never fails the decode
             inflight -= 1;
         }
         d.seq = d.seq.saturating_sub(overshot);
@@ -344,7 +381,11 @@ async fn main(input: String) -> Result<String> {
     model::configure(vocab, PAGE_T, NUM_LAYERS);
 
     let prompt = wit_model::encode(PROMPT);
-    let prompt = if prompt.is_empty() { vec![0u32] } else { prompt };
+    let prompt = if prompt.is_empty() {
+        vec![0u32]
+    } else {
+        prompt
+    };
     let cont = wit_model::encode(CONT);
 
     // Deep-scenario budget bound (#17/#18): the deep scenarios test the chain
@@ -354,9 +395,8 @@ async fn main(input: String) -> Result<String> {
     let deep_budget = max_tokens.min(16);
 
     // One pool sizing covers every scenario context (gen-1 + gen-2 + margin).
-    let cap = (prompt.len() + cont.len()) as u32
-        + 2 * (max_tokens.max(deep_budget) as u32)
-        + PAGE_T;
+    let cap =
+        (prompt.len() + cont.len()) as u32 + 2 * (max_tokens.max(deep_budget) as u32) + PAGE_T;
 
     // ── Scenario A — run-ahead token-exactness: depth-2 == synchronous ──
     let mut d_p = Decoder::new(cap)?;
@@ -381,11 +421,9 @@ async fn main(input: String) -> Result<String> {
     // stop) then rolls back; the committed prefix must equal the sync stop run.
     let deep_stop_matched = if let Some(&mid_stop) = tokens_s.get(3) {
         let mut d_ss = Decoder::new(cap)?;
-        let tokens_ss =
-            generate(&mut d_ss, &prompt, deep_budget, &[mid_stop], 4, true).await?;
+        let tokens_ss = generate(&mut d_ss, &prompt, deep_budget, &[mid_stop], 4, true).await?;
         let mut d_sy = Decoder::new(cap)?;
-        let tokens_sy =
-            generate(&mut d_sy, &prompt, deep_budget, &[mid_stop], 1, false).await?;
+        let tokens_sy = generate(&mut d_sy, &prompt, deep_budget, &[mid_stop], 1, false).await?;
         !tokens_sy.is_empty() && tokens_ss == tokens_sy
     } else {
         // Too few tokens to place a mid-stream stop — nothing to over-shoot.
@@ -415,13 +453,11 @@ async fn main(input: String) -> Result<String> {
     // ctx_b: sync-stop gen-1 (no over-shoot), deep gen-2 — the clean reference.
     let deep_stop_clear_ok = if let Some(&mid_stop) = tokens_s.get(3) {
         let mut ctx_a = Decoder::new(cap)?;
-        let _g1a =
-            generate(&mut ctx_a, &prompt, deep_budget, &[mid_stop], 4, true).await?;
+        let _g1a = generate(&mut ctx_a, &prompt, deep_budget, &[mid_stop], 4, true).await?;
         let g2a = generate(&mut ctx_a, &cont, deep_budget, &[], 4, false).await?;
 
         let mut ctx_b = Decoder::new(cap)?;
-        let _g1b =
-            generate(&mut ctx_b, &prompt, deep_budget, &[mid_stop], 1, false).await?;
+        let _g1b = generate(&mut ctx_b, &prompt, deep_budget, &[mid_stop], 1, false).await?;
         let g2b = generate(&mut ctx_b, &cont, deep_budget, &[], 4, false).await?;
 
         !g2a.is_empty() && g2a.iter().any(|&t| t != 0) && g2a == g2b

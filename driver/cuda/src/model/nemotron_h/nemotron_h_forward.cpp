@@ -1,4 +1,5 @@
 #include "model/nemotron_h/nemotron_h_forward.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -379,6 +380,7 @@ void attention_layer(
     const std::uint32_t* kv_last_page_lens,
     const std::uint32_t* qo_indptr_h,
     const std::uint32_t* kv_page_indptr_h,
+    int model_layer,
     int N, int R, bool is_pure_decode,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
@@ -402,12 +404,16 @@ void attention_layer(
         ws.norm_x.data(), Lw.k_proj->data(), ws.k.data(), N, Hk, H);
     ops::gemm_act_x_wt_bf16(cublas.handle(),
         ws.norm_x.data(), Lw.v_proj->data(), ws.v.data(), N, Hk, H);
+    invoke_stage_hook(
+        StageHookPoint::OnAttnProj, ws.q.data(),
+        static_cast<std::uint32_t>(N),
+        static_cast<std::uint32_t>(Hq),
+        static_cast<std::uint32_t>(model_layer), stream);
 
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads_local, num_kv_heads_local,
         cfg.head_dim, cfg.rope_theta, stream);
-
     auto kv_view = cache.layer_view(Lw.kv_layer);
     kernels::launch_write_kv_to_pages(
         kv_view, ws.k.data(), ws.v.data(),
@@ -451,6 +457,11 @@ void attention_layer(
             qo_indptr_h, kv_page_indptr_h,
             N, R, num_q_heads_local, attn_ws, stream);
     }
+    invoke_stage_hook(
+        StageHookPoint::OnAttn, ws.q.data(),
+        static_cast<std::uint32_t>(N),
+        static_cast<std::uint32_t>(Hq),
+        static_cast<std::uint32_t>(model_layer), stream);
 
     if (T == 1) {
         ops::gemm_act_x_wt_bf16(cublas.handle(),
@@ -1440,6 +1451,7 @@ void nemotron_h_forward_paged(
                 attention_layer(Lw, cfg, fwd_cfg, plan_state, ws, cache, attn_ws,
                     cublas, positions, qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
+                    static_cast<int>(li),
                     N, R, is_pure_decode, custom_mask_d, custom_mask_indptr_d,
                     next_norm_w, eps, stream, &produced_next_norm);
             });

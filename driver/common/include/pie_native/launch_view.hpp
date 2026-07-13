@@ -59,6 +59,7 @@ struct LaunchView {
     Slice<std::uint32_t> qo_indptr;
     Slice<std::uint32_t> rs_slot_ids;
     Slice<std::uint8_t> rs_slot_flags;
+    Slice<std::uint32_t> rs_fold_lens;
     Slice<std::uint32_t> rs_buffer_slot_ids;
     Slice<std::uint32_t> rs_buffer_slot_indptr;
 
@@ -82,6 +83,20 @@ struct LaunchView {
     // program's span is its empty wire placeholder; the composed batch
     // substitutes its channel-resolved geometry for that span.
     Slice<std::uint32_t> ptir_program_row_indptr;
+    // Per-program sampled-logit placement in the composed workspace. Unlike a
+    // CSR, starts need not be monotonic in original program order because
+    // composition places wire programs before device-geometry programs.
+    Slice<std::uint32_t> ptir_sample_starts;
+    Slice<std::uint32_t> ptir_sample_counts;
+    // Per-program runtime symbolic extents. UINT32_MAX denotes an extent that
+    // cannot be represented by one scalar (for example, KV lengths across
+    // multiple request rows) and must not be consumed by a grouped lane.
+    Slice<std::uint32_t> ptir_row_counts;
+    Slice<std::uint32_t> ptir_token_counts;
+    Slice<std::uint32_t> ptir_kv_lens;
+    Slice<std::uint32_t> ptir_page_counts;
+    Slice<std::uint32_t> ptir_query_lens;
+    Slice<std::uint32_t> ptir_key_lens;
     Slice<std::uint64_t> logical_fire_ids;
     Slice<std::uint64_t> channel_expected_head;
     Slice<std::uint64_t> channel_expected_tail;

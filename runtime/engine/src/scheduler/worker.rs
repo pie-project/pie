@@ -17,7 +17,7 @@ use anyhow::{Result, anyhow};
 use super::batch::{self, BatchAccumulator};
 use super::quorum;
 use super::stats::{self, SchedulerStats};
-use super::{LaunchPreparation, LaunchPreparationError, RetryClassifier};
+use super::{ControlCompletion, LaunchPreparation, LaunchPreparationError, RetryClassifier};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FireClause {
@@ -108,6 +108,7 @@ pub(crate) struct PendingRequest {
     /// retained across attempts; only the native terminal cell is reset.
     pub(crate) retry_count: u32,
     pub(crate) prelaunch_copy: Option<crate::driver::KvCopyPlan>,
+    pub(crate) prelaunch_state_copy: Option<StateCopyPlan>,
     pub(crate) preparation: Option<LaunchPreparation>,
     pub(crate) retry_classifier: Option<RetryClassifier>,
     pub(crate) preparation_retries: u32,
@@ -124,6 +125,7 @@ impl PendingRequest {
         preparation_order_key: Option<u64>,
         prebuilt: bool,
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
+        prelaunch_state_copy: Option<StateCopyPlan>,
         preparation: Option<LaunchPreparation>,
         retry_classifier: Option<RetryClassifier>,
     ) -> Self {
@@ -139,6 +141,7 @@ impl PendingRequest {
             prebuilt,
             retry_count: 0,
             prelaunch_copy,
+            prelaunch_state_copy,
             preparation,
             retry_classifier,
             preparation_retries: 0,
@@ -150,6 +153,18 @@ impl PendingRequest {
             && self.request.rs_buffer_slot_ids.is_empty()
             && self.request.rs_fold_lens.is_empty()
     }
+
+    pub(crate) fn wire_row_count(&self) -> usize {
+        self.request.qo_indptr.len().saturating_sub(1)
+    }
+
+    pub(crate) fn preserves_inner_rows(&self) -> bool {
+        self.wire_row_count() > 1
+    }
+
+    fn requires_solo_submission(&self) -> bool {
+        self.prebuilt || self.preserves_inner_rows()
+    }
 }
 
 #[derive(Default)]
@@ -158,7 +173,7 @@ struct LaunchGrouping {
     count: usize,
     forward_tokens: usize,
     page_refs: usize,
-    has_prebuilt: bool,
+    has_solo_submission: bool,
     has_user_mask: bool,
 }
 
@@ -168,8 +183,8 @@ impl LaunchGrouping {
             return false;
         }
         if self.count != 0
-            && (request.prebuilt
-                || self.has_prebuilt
+            && (request.requires_solo_submission()
+                || self.has_solo_submission
                 || request.request.has_user_mask
                 || self.has_user_mask)
         {
@@ -179,7 +194,7 @@ impl LaunchGrouping {
             return true;
         }
         let usage = batch::request_capacity_usage(request, page_size);
-        self.count + 1 <= limits.max_forward_requests
+        self.count.saturating_add(usage.forward_requests) <= limits.max_forward_requests
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
             && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
     }
@@ -187,12 +202,12 @@ impl LaunchGrouping {
     fn push(&mut self, request: &PendingRequest, limits: SchedulerLimits, page_size: u32) -> bool {
         let usage = batch::request_capacity_usage(request, page_size);
         self.instances.insert(request.instance_id);
-        self.count += 1;
+        self.count = self.count.saturating_add(usage.forward_requests);
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
-        self.has_prebuilt |= request.prebuilt;
+        self.has_solo_submission |= request.requires_solo_submission();
         self.has_user_mask |= request.request.has_user_mask;
-        request.prebuilt
+        request.requires_solo_submission()
             || request.request.has_user_mask
             || self.count >= limits.max_forward_requests
             || self.forward_tokens >= limits.max_forward_tokens
@@ -219,6 +234,10 @@ enum SchedulerItem {
     CopyKv {
         plan: crate::driver::KvCopyPlan,
         response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
+    },
+    CopyKvTracked {
+        plan: crate::driver::KvCopyPlan,
+        completion: ControlCompletion,
     },
     // Only reached via `SchedulerHandle::copy_state`/`resize_pool`, which
     // the mock-driver fire path doesn't call yet (`scheduler::resize_pool`
@@ -297,11 +316,26 @@ fn arm_completion_nudge(completion: &SubmissionCompletion, waker: &std::task::Wa
     true
 }
 
+#[derive(Clone)]
+enum PreLaunchCopy {
+    Kv(crate::driver::KvCopyPlan),
+    State(StateCopyPlan),
+}
+
+impl PreLaunchCopy {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Kv(_) => "KV copy",
+            Self::State(_) => "recurrent-state copy",
+        }
+    }
+}
+
 enum QueuedItem {
     Launch(PendingRequest),
     Prepare(PendingRequest),
     PreLaunchCopy {
-        plan: crate::driver::KvCopyPlan,
+        plan: PreLaunchCopy,
         logical_completion: WorkItemCompletion,
         pipeline_id: Option<ProcessId>,
     },
@@ -320,6 +354,10 @@ enum QueuedItem {
     CopyKv {
         plan: crate::driver::KvCopyPlan,
         response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
+    },
+    CopyKvTracked {
+        plan: crate::driver::KvCopyPlan,
+        completion: ControlCompletion,
     },
     CopyState {
         plan: StateCopyPlan,
@@ -358,6 +396,8 @@ struct PendingControl {
     completion: SubmissionCompletion,
     logical_completion: Option<WorkItemCompletion>,
     pipeline_id: Option<ProcessId>,
+    tracked_completion: Option<ControlCompletion>,
+    operation: &'static str,
 }
 
 struct SchedulerControl {
@@ -407,6 +447,7 @@ impl SchedulerHandle {
         last_page_len: u32,
         pipeline_id: Option<ProcessId>,
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
+        prelaunch_state_copy: Option<StateCopyPlan>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
@@ -419,6 +460,7 @@ impl SchedulerHandle {
                 None,
                 false,
                 prelaunch_copy,
+                prelaunch_state_copy,
                 None,
                 None,
             ),
@@ -433,6 +475,7 @@ impl SchedulerHandle {
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
+        prelaunch_state_copy: Option<StateCopyPlan>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
@@ -445,6 +488,7 @@ impl SchedulerHandle {
                 None,
                 true,
                 prelaunch_copy,
+                prelaunch_state_copy,
                 None,
                 None,
             ),
@@ -458,6 +502,7 @@ impl SchedulerHandle {
         completion: WorkItemCompletion,
         pipeline_id: Option<ProcessId>,
         preparation_order_key: Option<u64>,
+        prelaunch_state_copy: Option<StateCopyPlan>,
         preparation: LaunchPreparation,
         retry_classifier: Option<RetryClassifier>,
     ) -> Result<()> {
@@ -472,6 +517,7 @@ impl SchedulerHandle {
                 preparation_order_key,
                 false,
                 None,
+                prelaunch_state_copy,
                 Some(preparation),
                 retry_classifier,
             ),
@@ -514,6 +560,18 @@ impl SchedulerHandle {
         let (tx, rx) = crossbeam::channel::bounded(1);
         self.send(SchedulerItem::CopyKv { plan, response: tx })?;
         rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+    }
+
+    pub(crate) fn copy_kv_tracked(
+        &self,
+        plan: crate::driver::KvCopyPlan,
+    ) -> Result<ControlCompletion> {
+        let completion = ControlCompletion::new();
+        self.send(SchedulerItem::CopyKvTracked {
+            plan,
+            completion: completion.clone(),
+        })?;
+        Ok(completion)
     }
 
     // Only called from `scheduler::dispatch::copy_rs_d2d`/`resize_pool`
@@ -887,6 +945,9 @@ impl BatchScheduler {
             SchedulerItem::CopyKv { plan, response } => {
                 pending.push_back(QueuedItem::CopyKv { plan, response });
             }
+            SchedulerItem::CopyKvTracked { plan, completion } => {
+                pending.push_back(QueuedItem::CopyKvTracked { plan, completion });
+            }
             SchedulerItem::CopyState { plan, response } => {
                 pending.push_back(QueuedItem::CopyState { plan, response });
             }
@@ -968,23 +1029,30 @@ impl BatchScheduler {
     }
 
     fn queue_attempt(pending: &mut VecDeque<QueuedItem>, request: PendingRequest, end: QueueEnd) {
-        let copy = request
-            .prelaunch_copy
-            .clone()
-            .map(|plan| QueuedItem::PreLaunchCopy {
-                plan,
+        let mut copies = Vec::with_capacity(2);
+        if let Some(plan) = request.prelaunch_copy.clone() {
+            copies.push(QueuedItem::PreLaunchCopy {
+                plan: PreLaunchCopy::Kv(plan),
                 logical_completion: request.completion.clone(),
                 pipeline_id: request.pipeline_id,
             });
+        }
+        if let Some(plan) = request.prelaunch_state_copy.clone() {
+            copies.push(QueuedItem::PreLaunchCopy {
+                plan: PreLaunchCopy::State(plan),
+                logical_completion: request.completion.clone(),
+                pipeline_id: request.pipeline_id,
+            });
+        }
         match end {
             QueueEnd::Front => {
                 pending.push_front(QueuedItem::Launch(request));
-                if let Some(copy) = copy {
+                for copy in copies.into_iter().rev() {
                     pending.push_front(copy);
                 }
             }
             QueueEnd::Back => {
-                if let Some(copy) = copy {
+                for copy in copies {
                     pending.push_back(copy);
                 }
                 pending.push_back(QueuedItem::Launch(request));
@@ -1263,6 +1331,11 @@ impl BatchScheduler {
                 plan: _,
                 logical_completion,
                 ..
+            } if logical_completion.is_settled() => {}
+            QueuedItem::PreLaunchCopy {
+                plan: _,
+                logical_completion,
+                ..
             } if logical_completion.cancel_requested() => {
                 logical_completion
                     .reject_unsubmitted("logical fire cancelled before pre-launch copy");
@@ -1271,22 +1344,34 @@ impl BatchScheduler {
                 plan,
                 logical_completion,
                 pipeline_id,
-            } => match driver.as_mut() {
-                Some(driver) => match driver.copy_kv(&plan) {
-                    Ok(completion) => {
-                        *in_flight_control = Some(PendingControl {
-                            completion,
-                            logical_completion: Some(logical_completion),
-                            pipeline_id,
-                        });
+            } => {
+                let operation = plan.label();
+                match driver.as_mut() {
+                    Some(driver) => {
+                        let submitted = match plan {
+                            PreLaunchCopy::Kv(plan) => driver.copy_kv(&plan),
+                            PreLaunchCopy::State(plan) => driver.copy_state(&plan),
+                        };
+                        match submitted {
+                            Ok(completion) => {
+                                *in_flight_control = Some(PendingControl {
+                                    completion,
+                                    logical_completion: Some(logical_completion),
+                                    pipeline_id,
+                                    tracked_completion: None,
+                                    operation,
+                                });
+                            }
+                            Err(error) => logical_completion.reject_unsubmitted(format!(
+                                "pre-launch {operation} rejected: {error:#}"
+                            )),
+                        }
                     }
-                    Err(error) => {
-                        logical_completion
-                            .reject_unsubmitted(format!("pre-launch KV copy rejected: {error:#}"));
+                    None => {
+                        logical_completion.reject_unsubmitted("driver has no backend installed")
                     }
-                },
-                None => logical_completion.reject_unsubmitted("driver has no backend installed"),
-            },
+                }
+            }
             QueuedItem::RegisterProgram { plan, response } => {
                 let _ = response.send(match driver.as_mut() {
                     Some(driver) => driver.register_program(&plan),
@@ -1342,6 +1427,8 @@ impl BatchScheduler {
                                 completion: completion.clone(),
                                 logical_completion: None,
                                 pipeline_id: None,
+                                tracked_completion: None,
+                                operation: "KV copy",
                             });
                             Ok(completion)
                         }
@@ -1350,6 +1437,21 @@ impl BatchScheduler {
                     None => Err(anyhow!("driver has no backend installed")),
                 });
             }
+            QueuedItem::CopyKvTracked { plan, completion } => match driver.as_mut() {
+                Some(driver) => match driver.copy_kv(&plan) {
+                    Ok(native_completion) => {
+                        *in_flight_control = Some(PendingControl {
+                            completion: native_completion,
+                            logical_completion: None,
+                            pipeline_id: None,
+                            tracked_completion: Some(completion),
+                            operation: "tracked KV copy",
+                        });
+                    }
+                    Err(error) => completion.resolve(&Err(error)),
+                },
+                None => completion.resolve(&Err(anyhow!("driver has no backend installed"))),
+            },
             QueuedItem::CopyState { plan, response } => {
                 let _ = response.send(match driver.as_mut() {
                     Some(driver) => match driver.copy_state(&plan) {
@@ -1358,6 +1460,8 @@ impl BatchScheduler {
                                 completion: completion.clone(),
                                 logical_completion: None,
                                 pipeline_id: None,
+                                tracked_completion: None,
+                                operation: "state copy",
                             });
                             Ok(completion)
                         }
@@ -1374,6 +1478,8 @@ impl BatchScheduler {
                                 completion: completion.clone(),
                                 logical_completion: None,
                                 pipeline_id: None,
+                                tracked_completion: None,
+                                operation: "pool resize",
                             });
                             Ok(completion)
                         }
@@ -1654,19 +1760,33 @@ impl BatchScheduler {
     }
 
     fn retire_ready_control(in_flight_control: &mut Option<PendingControl>) -> bool {
+        let operation = in_flight_control
+            .as_ref()
+            .map(|pending| pending.operation)
+            .unwrap_or("control operation");
         let Some(result) = in_flight_control
             .as_ref()
             .and_then(|pending| pending.completion.check())
         else {
             return false;
         };
-        if let Err(err) = result {
-            tracing::warn!(?err, "direct control completion closed before callback");
+        if let Some(tracked) = in_flight_control
+            .as_ref()
+            .and_then(|pending| pending.tracked_completion.as_ref())
+        {
+            tracked.resolve(&result);
+        }
+        if let Err(ref err) = result {
+            tracing::warn!(
+                ?err,
+                operation,
+                "direct control completion closed before callback"
+            );
             if let Some(logical) = in_flight_control
                 .as_ref()
                 .and_then(|pending| pending.logical_completion.as_ref())
             {
-                logical.reject_unsubmitted(format!("pre-launch KV copy failed: {err:#}"));
+                logical.reject_unsubmitted(format!("pre-launch {operation} failed: {err:#}"));
             }
         }
         *in_flight_control = None;
@@ -2128,6 +2248,55 @@ mod tests {
         close_bound.join().unwrap()?;
 
         timeout(Duration::from_secs(5), completion).await??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_instance_multi_row_rs_launch_reaches_dummy_intact() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) = setup_scheduler_with_limits(
+            DummyDriverOptions {
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            },
+            SchedulerLimits {
+                max_forward_requests: 2,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+            },
+        )
+        .await?;
+        let mut launch = dummy_launch();
+        launch.token_ids = vec![1, 2];
+        launch.position_ids = vec![0, 0];
+        launch.qo_indptr = vec![0, 1, 2];
+        launch.kv_page_indptr = vec![0, 0, 0];
+        launch.kv_last_page_lens = vec![0, 0];
+        launch.sampling_indices = vec![0, 1];
+        launch.sampling_indptr = vec![0, 1, 2];
+        launch.mask_indptr = vec![0, 0, 0];
+        launch.rs_slot_ids = vec![7, 9];
+        launch.rs_slot_flags = vec![crate::driver::RS_FLAG_RESET, 0];
+
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_async(
+            launch,
+            driver_id,
+            bound.instance_id,
+            Vec::new(),
+            0,
+            None,
+            completion.clone(),
+        )?;
+        timeout(Duration::from_secs(5), completion).await??;
+
+        assert!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == "launch-shape tokens=2 programs=1")
+        );
         Ok(())
     }
 
@@ -2645,6 +2814,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let mut pending = VecDeque::from([QueuedItem::Launch(request)]);
         let mut blocked = VecDeque::new();
@@ -2653,6 +2823,71 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(completion.cancel_requested());
         assert!(!completion.is_settled());
+    }
+
+    #[tokio::test]
+    async fn tracked_control_completion_wakes_multiple_waiters() {
+        let completion = ControlCompletion::new();
+        let first = completion.clone();
+        let second = completion.clone();
+        let first = tokio::spawn(async move { first.wait().await });
+        let second = tokio::spawn(async move { second.wait().await });
+        tokio::task::yield_now().await;
+        completion.resolve(&Ok(()));
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn aggregated_rs_copy_is_queued_before_its_launch() {
+        let completion = WorkItemCompletion::deferred_with_guard(None);
+        let state_copy = StateCopyPlan {
+            slot_ranges: vec![
+                pie_driver_abi::PieStateCopyRange {
+                    src_slot_id: 3,
+                    dst_slot_id: 5,
+                    src_token_offset: 0,
+                    dst_token_offset: 0,
+                    token_count: 0,
+                },
+                pie_driver_abi::PieStateCopyRange {
+                    src_slot_id: 3,
+                    dst_slot_id: 6,
+                    src_token_offset: 0,
+                    dst_token_offset: 0,
+                    token_count: 0,
+                },
+            ],
+        };
+        let request = PendingRequest::direct(
+            dummy_launch(),
+            1,
+            completion,
+            Vec::new(),
+            0,
+            None,
+            None,
+            false,
+            None,
+            Some(state_copy),
+            None,
+            None,
+        );
+        let mut pending = VecDeque::new();
+        BatchScheduler::queue_attempt(&mut pending, request, QueueEnd::Back);
+
+        let QueuedItem::PreLaunchCopy {
+            plan: PreLaunchCopy::State(plan),
+            ..
+        } = pending.pop_front().unwrap()
+        else {
+            panic!("aggregated state copy must precede the launch");
+        };
+        assert_eq!(plan.slot_ranges.len(), 2);
+        assert_eq!(plan.slot_ranges[0].src_slot_id, 3);
+        assert_eq!(plan.slot_ranges[1].dst_slot_id, 6);
+        assert!(matches!(pending.pop_front(), Some(QueuedItem::Launch(_))));
+        assert!(pending.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

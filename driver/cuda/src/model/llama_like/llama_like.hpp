@@ -193,6 +193,7 @@ void llama_like_forward_paged(
     const std::uint32_t* w_page_d = nullptr,
     const std::uint32_t* w_off_d = nullptr,
     bool has_write_desc = false,
+    int runtime_window_left = -2,
     // Qwen3-VL multimodal side-inputs (nullptr = plain text forward).
     const LlamaLikeVisionInputs* vision = nullptr);
 

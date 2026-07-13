@@ -39,7 +39,7 @@
 //! JSON input: `{"k": 4}` (draft-window size, default 4, min 2).
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, serde_json, Result};
+use inferlet::{Result, model as wit_model, serde_json};
 
 const PAGE_T: u32 = 16; // tokens per KV page (mock env page size)
 const NUM_LAYERS: u32 = 1;
@@ -69,11 +69,7 @@ fn expected_verdict(target: &[i32], draft: &[i32]) -> Vec<i32> {
 /// read-out rows `l-1 .. l-1+k`, epilogue = per-row `argmax` (probe) + the
 /// spec-verify DAG over the seeded `[k]` draft. Returns
 /// `(target [k], verdict [k])` off the two bound reader channels.
-fn verify_window(
-    prompt: &[u32],
-    k: u32,
-    draft: &[i32],
-) -> Result<(Vec<i32>, Vec<i32>)> {
+async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32>, Vec<i32>)> {
     let l = prompt.len() as u32;
     let n = l + k - 1;
     let input_toks: Vec<i32> = prompt
@@ -122,10 +118,12 @@ fn verify_window(
     let tgt = target_out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("target take: {e}"))?;
     let ver = verify_out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("verify take: {e}"))?;
     pipeline.close();
     Ok((tgt, ver))
@@ -133,8 +131,7 @@ fn verify_window(
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
-    let params: serde_json::Value =
-        serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+    let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let k: u32 = params.get("k").and_then(|v| v.as_u64()).unwrap_or(4).max(2) as u32;
     let vocab = wit_model::output_vocab_size();
     model::configure(vocab, PAGE_T, NUM_LAYERS);
@@ -148,7 +145,7 @@ async fn main(input: String) -> Result<String> {
     //    headline plus the value-exact DAG recompute against this window's own
     //    target. ──
     let draft_a: Vec<i32> = (1..=k as i32).collect();
-    let (target_a, verdict_a) = verify_window(&prompt, k, &draft_a)?;
+    let (target_a, verdict_a) = verify_window(&prompt, k, &draft_a).await?;
 
     // ── Window 2 (reject-mid-shaped): window 1's target with row j perturbed
     //    to a wrong, NONZERO token (≠ target_a[j]). On a stable-logits driver
@@ -159,7 +156,7 @@ async fn main(input: String) -> Result<String> {
     if let Some(x) = draft_b.get_mut(j) {
         *x = ((*x + 1).rem_euclid(vocab as i32)).max(1);
     }
-    let (target_b, verdict_b) = verify_window(&prompt, k, &draft_b)?;
+    let (target_b, verdict_b) = verify_window(&prompt, k, &draft_b).await?;
 
     // ── Verdicts ──
     let channel_emits_k = target_a.len() == k as usize

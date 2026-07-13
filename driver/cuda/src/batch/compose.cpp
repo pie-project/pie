@@ -7,6 +7,7 @@
 #include <cstring>
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -16,12 +17,13 @@
 
 #include "batch/brle.hpp"
 #include "batch/forward.hpp"
-#include "batch/logits.hpp"
 #include "batch/tp.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
+#include "kernels/argmax.hpp"
 #include "kernels/pack_dense_mask.hpp"
 #include "model/loaded_model.hpp"
+#include "model/stage_hooks.hpp"
 #include "store/kv_cache.hpp"
 #include "store/recurrent_state_cache.hpp"
 #include "model/workspace.hpp"
@@ -36,6 +38,299 @@ namespace {
 int tensor_rows(const DeviceTensor& t) {
     if (t.shape().empty()) return 0;
     return static_cast<int>(t.shape()[0]);
+}
+
+struct MtpDraftWork {
+    std::size_t program = 0;
+    std::uint32_t drafts = 0;
+    std::uint32_t request = 0;
+    std::uint32_t anchor_row = 0;
+    std::uint32_t seed_row = 0;
+    std::uint32_t source_position = 0;
+    std::uint32_t draft_start = 0;
+};
+
+struct MtpDraftPlan {
+    std::vector<MtpDraftWork> work;
+    std::vector<std::uint32_t> draft_starts;
+    std::size_t total_drafts = 0;
+    std::uint32_t vocab = 0;
+};
+
+MtpDraftPlan preflight_mtp_draft_logits(
+    BatchEngine& engine,
+    const pipeline::ComposedBatch& composed,
+    std::span<const std::int32_t> sampled_model_rows,
+    std::span<const std::uint32_t> draft_counts) {
+    MtpDraftPlan plan;
+    if (engine.ws.mtp_draft_row_base < 0 ||
+        engine.ws.mtp_draft_row_capacity < 0) {
+        throw std::runtime_error("MTP workspace layout is negative");
+    }
+    const std::uint32_t draft_base =
+        static_cast<std::uint32_t>(engine.ws.mtp_draft_row_base);
+    std::string layout_error;
+    if (!pipeline::plan_mtp_draft_rows(
+            draft_counts,
+            draft_base,
+            static_cast<std::uint32_t>(
+                std::max(0, engine.ws.mtp_draft_row_capacity)),
+            plan.draft_starts,
+            &layout_error,
+            model::Workspace::kMtpDraftRowsPerProgram)) {
+        throw std::runtime_error(layout_error);
+    }
+    for (std::size_t program = 0; program < draft_counts.size(); ++program) {
+        const std::uint32_t drafts = draft_counts[program];
+        if (drafts == 0) continue;
+        if (program >= composed.prog_request_starts.size() ||
+            program >= composed.prog_request_counts.size() ||
+            composed.prog_request_counts[program] != 1) {
+            throw std::runtime_error(
+                "MtpLogits requires one attributed forward request per program");
+        }
+        if (drafts > static_cast<std::uint32_t>(
+                std::max(0, engine.system_drafter.max_drafts))) {
+            throw std::runtime_error(
+                "MtpLogits draft-row requirement exceeds the production layout");
+        }
+        const std::uint32_t request =
+            composed.prog_request_starts[program];
+        if (request + 1 >= composed.qo_indptr.size() ||
+            composed.qo_indptr[request + 1] <=
+                composed.qo_indptr[request]) {
+            throw std::runtime_error(
+                "MtpLogits request has no anchor hidden row");
+        }
+        if (program >= composed.prog_sample_starts.size() ||
+            program >= composed.prog_sample_counts.size() ||
+            composed.prog_sample_counts[program] == 0) {
+            throw std::runtime_error(
+                "MtpLogits request has no target seed-logit row");
+        }
+        const std::uint32_t sample =
+            composed.prog_sample_starts[program] +
+            composed.prog_sample_counts[program] - 1;
+        if (sample >= sampled_model_rows.size() ||
+            sampled_model_rows[sample] < 0) {
+            throw std::runtime_error(
+                "MtpLogits target seed row is outside the model output");
+        }
+        const std::uint32_t anchor =
+            composed.qo_indptr[request + 1] - 1;
+        if (anchor >= composed.position_ids.size()) {
+            throw std::runtime_error(
+                "MtpLogits anchor position is outside the forward geometry");
+        }
+        if (sampled_model_rows[sample] >= tensor_rows(engine.ws.logits)) {
+            throw std::runtime_error(
+                "MtpLogits target seed row exceeds logits storage");
+        }
+        const std::uint64_t last_position =
+            static_cast<std::uint64_t>(composed.position_ids[anchor]) +
+            static_cast<std::uint64_t>(
+                std::max(0, engine.system_drafter.draft_position_offset)) +
+            drafts - 1;
+        if (last_position >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int32_t>::max()) ||
+            request >
+                static_cast<std::uint32_t>(
+                    std::numeric_limits<std::int32_t>::max()) ||
+            anchor >
+                static_cast<std::uint32_t>(
+                    std::numeric_limits<std::int32_t>::max())) {
+            throw std::runtime_error("MTP scalar staging exceeds i32");
+        }
+        plan.work.push_back({
+            program,
+            drafts,
+            request,
+            anchor,
+            static_cast<std::uint32_t>(sampled_model_rows[sample]),
+            composed.position_ids[anchor],
+            plan.draft_starts[program],
+        });
+    }
+    if (!plan.work.empty() && !engine.system_drafter.draft_step) {
+        throw std::runtime_error(
+            "MtpLogits is valid for this program but the model has no native draft head");
+    }
+    if (plan.work.empty()) return plan;
+    for (const MtpDraftWork& item : plan.work) {
+        if (item.drafts >
+            std::numeric_limits<std::size_t>::max() - plan.total_drafts) {
+            throw std::runtime_error("aggregate MTP scalar demand overflows");
+        }
+        plan.total_drafts += item.drafts;
+    }
+    const std::size_t scalar_capacity = std::min({
+        engine.inputs.mtp_positions_host.size(),
+        engine.inputs.mtp_hidden_rows_host.size(),
+        engine.inputs.mtp_request_ids_host.size(),
+    });
+    if (plan.total_drafts > scalar_capacity) {
+        throw std::runtime_error(
+            "aggregate MTP scalar demand exceeds persistent staging capacity");
+    }
+    const int model_vocab = engine.loaded_model.hf_config().vocab_size;
+    if (model_vocab <= 0) {
+        throw std::runtime_error("MTP model vocabulary is invalid");
+    }
+    plan.vocab = static_cast<std::uint32_t>(model_vocab);
+    if (!plan.work.empty() &&
+        (plan.vocab == 0 ||
+         engine.ws.mtp_row0_save.size() < plan.vocab ||
+         engine.inputs.tokens.size() < 1 ||
+         engine.inputs.positions.size() < 1 ||
+         engine.inputs.sample_idx.size() < 1 ||
+         engine.inputs.mtp_request_ids.size() < 1)) {
+        throw std::runtime_error(
+            "MTP persistent staging capacity is incomplete");
+    }
+    const std::uint32_t logits_rows = static_cast<std::uint32_t>(
+        std::max(0, tensor_rows(engine.ws.logits)));
+    for (const MtpDraftWork& item : plan.work) {
+        if (item.draft_start > logits_rows ||
+            item.drafts > logits_rows - item.draft_start) {
+            throw std::runtime_error(
+                "MTP draft rows exceed physical logits storage");
+        }
+    }
+    // Every draft step writes its one-row logits result to row zero and its
+    // hidden result to ws.y row zero. Preserve target row zero and process a
+    // request anchored at hidden row zero first, before another chain can
+    // overwrite that anchor.
+    std::stable_sort(
+        plan.work.begin(), plan.work.end(),
+        [](const MtpDraftWork& left, const MtpDraftWork& right) {
+            return (left.anchor_row == 0) > (right.anchor_row == 0);
+        });
+    return plan;
+}
+
+void enqueue_mtp_draft_logits(
+    BatchEngine& engine,
+    const MtpDraftPlan& plan) {
+    if (plan.work.empty()) return;
+    auto* logits = static_cast<std::uint16_t*>(engine.ws.logits.data());
+    const std::uint32_t vocab = plan.vocab;
+    cudaStream_t stream = engine.cublas.stream();
+    static thread_local cudaEvent_t scalar_copies_done = nullptr;
+    if (scalar_copies_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(
+            &scalar_copies_done, cudaEventDisableTiming));
+    } else {
+        CUDA_CHECK(cudaEventSynchronize(scalar_copies_done));
+    }
+    std::size_t scalar_index = 0;
+    CUDA_CHECK(cudaMemcpyAsync(
+        engine.ws.mtp_row0_save.data(),
+        logits,
+        static_cast<std::size_t>(vocab) * sizeof(std::uint16_t),
+        cudaMemcpyDeviceToDevice,
+        stream));
+    for (const MtpDraftWork& item : plan.work) {
+        kernels::launch_argmax_bf16(
+            logits + static_cast<std::size_t>(item.seed_row) * vocab,
+            reinterpret_cast<std::int32_t*>(engine.inputs.sampled.data()),
+            1,
+            vocab,
+            stream);
+        for (std::uint32_t draft = 0; draft < item.drafts; ++draft) {
+            const std::int32_t position = static_cast<std::int32_t>(
+                item.source_position +
+                std::max(0, engine.system_drafter.draft_position_offset) +
+                draft);
+            const std::int32_t hidden_row = draft == 0
+                ? static_cast<std::int32_t>(item.anchor_row)
+                : 0;
+            const std::int32_t request =
+                static_cast<std::int32_t>(item.request);
+            engine.inputs.mtp_positions_host[scalar_index] = position;
+            engine.inputs.mtp_hidden_rows_host[scalar_index] = hidden_row;
+            engine.inputs.mtp_request_ids_host[scalar_index] = request;
+            CUDA_CHECK(cudaMemcpyAsync(
+                engine.inputs.tokens.data(),
+                engine.inputs.sampled.data(),
+                sizeof(std::int32_t),
+                cudaMemcpyDeviceToDevice,
+                stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                engine.inputs.positions.data(),
+                engine.inputs.mtp_positions_host.data() + scalar_index,
+                sizeof(position),
+                cudaMemcpyHostToDevice,
+                stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                engine.inputs.sample_idx.data(),
+                engine.inputs.mtp_hidden_rows_host.data() + scalar_index,
+                sizeof(hidden_row),
+                cudaMemcpyHostToDevice,
+                stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                engine.inputs.mtp_request_ids.data(),
+                engine.inputs.mtp_request_ids_host.data() + scalar_index,
+                sizeof(request),
+                cudaMemcpyHostToDevice,
+                stream));
+            const bool prefix_global =
+                engine.system_drafter.draft_global_cache_uses_prefix_position;
+            const int max_global_tokens =
+                pipeline::mtp_global_history_tokens(
+                    position, draft, prefix_global);
+            if (engine.tp_comm != nullptr) {
+                tp_cpu_gate_notify(engine.tp_cpu_gate_key);
+                tp_broadcast_mtp_step(
+                    *engine.tp_comm,
+                    engine.inputs,
+                    1,
+                    static_cast<int>(draft),
+                    max_global_tokens,
+                    stream);
+            }
+            engine.system_drafter.draft_step(
+                engine.ws,
+                engine.kv_cache,
+                engine.cublas,
+                reinterpret_cast<const std::int32_t*>(
+                    engine.inputs.tokens.data()),
+                reinterpret_cast<const std::int32_t*>(
+                    engine.inputs.positions.data()),
+                engine.inputs.sample_idx.data(),
+                engine.inputs.mtp_request_ids.data(),
+                engine.inputs.kv_page_indices.data(),
+                engine.inputs.kv_page_indptr.data(),
+                engine.inputs.kv_last_page_lens.data(),
+                nullptr,
+                1,
+                static_cast<int>(draft),
+                max_global_tokens);
+            kernels::launch_argmax_bf16(
+                logits,
+                reinterpret_cast<std::int32_t*>(
+                    engine.inputs.sampled.data()),
+                1,
+                vocab,
+                stream);
+            CUDA_CHECK(cudaMemcpyAsync(
+                logits +
+                    static_cast<std::size_t>(item.draft_start + draft) *
+                        vocab,
+                logits,
+                static_cast<std::size_t>(vocab) * sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice,
+                stream));
+            ++scalar_index;
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(
+        logits,
+        engine.ws.mtp_row0_save.data(),
+        static_cast<std::size_t>(vocab) * sizeof(std::uint16_t),
+        cudaMemcpyDeviceToDevice,
+        stream));
+    CUDA_CHECK(cudaEventRecord(scalar_copies_done, stream));
 }
 
 }  // namespace
@@ -121,6 +416,7 @@ void handle_fire_batch(
         }
     } dbg_ft{t_entry, dbg_R, dbg_N, img_num_images, req_id, dbg_fire};
 
+    std::unique_ptr<pipeline::StagedLaunch> staged_launch;
     try {
         const auto tok_view_orig   = view.token_ids.as<std::uint32_t>();
         const auto pos_view_orig   = view.position_ids.as<std::uint32_t>();
@@ -131,6 +427,8 @@ void handle_fire_batch(
 
         const auto sidx_view_orig  = view.sampling_indices.as<std::uint32_t>();
         const auto sptr_view_orig  = view.sampling_indptr.as<std::uint32_t>();
+
+        staged_launch = engine.dispatch->begin(view, cublas.stream());
 
         // ── W1.1: pre-forward device-geometry descriptor resolution ──────
         // EVERY device-geometry PTIR program in the batch (WSlot/WOff write
@@ -147,8 +445,8 @@ void handle_fire_batch(
         pipeline::ComposedBatch composed;
         // Per-PROGRAM offsets of each program's sampled rows within the
         // gathered logits buffer (`n_prog + 1` entries) — what
-        // `Dispatch::run` slices each program's logits base from.
-        std::vector<std::uint32_t> prog_sample_offsets;
+        // `Dispatch::finish` slices each program's logits base from.
+        std::vector<std::uint32_t> prog_sample_csr;
         bool dg_resolved = false;
         bool composed_ready = false;
         if (!view.ptir_program_hashes.empty()) {
@@ -158,7 +456,9 @@ void handle_fire_batch(
                 static_cast<std::uint32_t>(kv_cache.page_size()),
                 static_cast<std::uint32_t>(kv_cache.num_pages()),
                 rpg,
-                &dg_err);
+                &dg_err,
+                engine.forward_fn.supports_runtime_window,
+                staged_launch.get());
             if (!dg_resolved && !dg_err.empty()) {
                 throw std::runtime_error(dg_err);
             }
@@ -170,9 +470,9 @@ void handle_fire_batch(
                     for (std::size_t p = 0; p < rpg.per_program.size(); ++p) {
                         if (rpg.is_device_geometry[p] &&
                             rpg.per_program[p].has_mask) {
-                            throw std::runtime_error(
+                            throw pipeline::RetryableLaunchError(
                                 "ptir: dense device mask in a multi-program "
-                                "batch (scheduler contract violated)");
+                                "batch requires solo retry");
                         }
                     }
                 }
@@ -185,7 +485,15 @@ void handle_fire_batch(
                 throw std::runtime_error(compose_err);
             }
             composed_ready = true;
-            prog_sample_offsets = composed.prog_sample_offsets;
+            prog_sample_csr.assign(
+                composed.prog_sample_counts.size() + 1, 0);
+            for (std::size_t program = 0;
+                 program < composed.prog_sample_counts.size();
+                 ++program) {
+                prog_sample_csr[program + 1] =
+                    prog_sample_csr[program] +
+                    composed.prog_sample_counts[program];
+            }
         }
         // Only the SOLO device-geometry fire may carry a dense device mask;
         // its resolved geometry equals the composed batch.
@@ -194,7 +502,25 @@ void handle_fire_batch(
              rpg.is_device_geometry[0])
                 ? &rpg.per_program[0]
                 : nullptr;
-
+        int structured_window_left = -2;
+        bool use_structured_mask = false;
+        bool pack_structured_mask = false;
+        std::vector<pie_native::ptir::StructuredMaskDescriptor>
+            effective_structured_masks = composed.structured_masks;
+        const auto mask_coverage = pipeline::structured_mask_coverage(
+            effective_structured_masks);
+        if (mask_coverage ==
+            pipeline::StructuredMaskCoverage::Mixed) {
+            throw pipeline::RetryableLaunchError(
+                "explicit PTIR masks cannot share one runtime override with "
+                "ordinary wire requests");
+        }
+        const auto effective_first = std::find_if(
+            effective_structured_masks.begin(),
+            effective_structured_masks.end(),
+            [](const auto& descriptor) {
+                return static_cast<bool>(descriptor);
+            });
         // Composed geometry takes precedence over the borrowed launch
         // slices. No request/speculation carrier is expanded in the driver.
         const int R = static_cast<int>(
@@ -208,6 +534,87 @@ void handle_fire_batch(
         const std::span<const std::uint32_t> kvlpl_view = composed_ready ? std::span<const std::uint32_t>(composed.kv_last_page_lens) : kvlpl_view_orig;
         const std::span<const std::uint32_t> sidx_view  = composed_ready ? std::span<const std::uint32_t>(composed.sampling_indices)  : sidx_view_orig;
         const std::span<const std::uint32_t> sptr_view  = composed_ready ? std::span<const std::uint32_t>(composed.sampling_indptr)   : sptr_view_orig;
+        if (effective_first != effective_structured_masks.end() &&
+            engine.forward_fn.supports_runtime_window) {
+            const auto window = pipeline::runtime_window_for_tail_aligned(
+                effective_structured_masks,
+                pos_view,
+                qo_view,
+                kvpp_view,
+                kvlpl_view,
+                static_cast<std::uint32_t>(kv_cache.page_size()));
+            if (window.has_value()) {
+                use_structured_mask = true;
+                structured_window_left = *window;
+            } else {
+                pack_structured_mask = true;
+            }
+        }
+        pie_native::LaunchView dispatch_view = view;
+        if (composed_ready) {
+            dispatch_view.rs_slot_ids = pie_native::slice_from_u32(
+                composed.rs_slot_ids.data(), composed.rs_slot_ids.size());
+            dispatch_view.rs_slot_flags = pie_native::slice_from_u8(
+                composed.rs_slot_flags.data(), composed.rs_slot_flags.size());
+            dispatch_view.rs_fold_lens = pie_native::slice_from_u32(
+                composed.rs_fold_lens.data(), composed.rs_fold_lens.size());
+            dispatch_view.rs_buffer_slot_ids = pie_native::slice_from_u32(
+                composed.rs_buffer_slot_ids.data(),
+                composed.rs_buffer_slot_ids.size());
+            dispatch_view.rs_buffer_slot_indptr = pie_native::slice_from_u32(
+                composed.rs_buffer_slot_indptr.data(),
+                composed.rs_buffer_slot_indptr.size());
+            dispatch_view.sampling_indices = pie_native::slice_from_u32(
+                sidx_view.data(), sidx_view.size());
+            dispatch_view.sampling_indptr = pie_native::slice_from_u32(
+                prog_sample_csr.data(), prog_sample_csr.size());
+            dispatch_view.ptir_sample_starts = pie_native::slice_from_u32(
+                composed.prog_sample_starts.data(),
+                composed.prog_sample_starts.size());
+            dispatch_view.ptir_sample_counts = pie_native::slice_from_u32(
+                composed.prog_sample_counts.data(),
+                composed.prog_sample_counts.size());
+            dispatch_view.ptir_row_counts = pie_native::slice_from_u32(
+                composed.prog_row_counts.data(),
+                composed.prog_row_counts.size());
+            dispatch_view.ptir_token_counts = pie_native::slice_from_u32(
+                composed.prog_token_counts.data(),
+                composed.prog_token_counts.size());
+            dispatch_view.ptir_kv_lens = pie_native::slice_from_u32(
+                composed.prog_kv_lens.data(),
+                composed.prog_kv_lens.size());
+            dispatch_view.ptir_page_counts = pie_native::slice_from_u32(
+                composed.prog_page_counts.data(),
+                composed.prog_page_counts.size());
+            dispatch_view.ptir_query_lens = pie_native::slice_from_u32(
+                composed.prog_query_lens.data(),
+                composed.prog_query_lens.size());
+            dispatch_view.ptir_key_lens = pie_native::slice_from_u32(
+                composed.prog_key_lens.data(),
+                composed.prog_key_lens.size());
+        }
+        std::vector<std::uint32_t> program_token_starts(
+            view.ptir_program_hashes.size(), 0);
+        if (composed_ready) {
+            for (std::size_t program = 0;
+                 program < program_token_starts.size();
+                 ++program) {
+                const std::uint32_t request =
+                    composed.prog_request_starts[program];
+                if (request >= composed.qo_indptr.size()) {
+                    throw std::runtime_error(
+                        "PTIR program token attribution is outside composed geometry");
+                }
+                program_token_starts[program] =
+                    composed.qo_indptr[request];
+            }
+        }
+        engine.dispatch->update_launch_geometry(
+            *staged_launch, dispatch_view, program_token_starts);
+        const std::uint64_t ptir_program_set_hash =
+            engine.dispatch->compiled_program_set_hash(dispatch_view);
+        const std::vector<std::uint32_t> mtp_draft_counts =
+            engine.dispatch->mtp_draft_rows(dispatch_view);
 
         const auto t_wire_parse_end = clock::now();
 
@@ -254,17 +661,6 @@ void handle_fire_batch(
             }
         }
 
-        if (N == 0 || R <= 0) {
-            engine.dispatch->run(
-                view, nullptr, 0, engine.cublas.stream(), &runtime, completion);
-            return;
-        }
-        if (N > max_workspace_tokens) {
-            std::cerr << "[pie-driver-cuda] batch tokens=" << N
-                      << " exceeds workspace=" << max_workspace_tokens << "\n";
-            throw std::runtime_error("forward batch exceeds workspace capacity");
-        }
-
         // Detect pure decode so the model can choose its decode kernel.
         const std::uint32_t* h_kvpp  = kvpp_view.data();
         const std::uint32_t* h_kvlpl = kvlpl_view.data();
@@ -274,32 +670,79 @@ void handle_fire_batch(
             if (h_qo[r + 1] - h_qo[r] != 1u) is_pure_decode = false;
         }
 
-        const auto rs_slot_view = view.rs_slot_ids.as<std::uint32_t>();
-        const auto rs_flag_view = view.rs_slot_flags.as<std::uint8_t>();
-        bool use_slots =
-            R > 0 && rs_slot_view.size() == static_cast<std::size_t>(R);
-        if (engine.rs_cache != nullptr && R > 0 && !use_slots) {
-            throw std::runtime_error(
-                "rs_cache forward missing runtime-assigned slot ids");
+        const std::span<const std::uint32_t> rs_slot_view = composed_ready
+            ? std::span<const std::uint32_t>(composed.rs_slot_ids)
+            : view.rs_slot_ids.as<std::uint32_t>();
+        const std::span<const std::uint8_t> rs_flag_view = composed_ready
+            ? std::span<const std::uint8_t>(composed.rs_slot_flags)
+            : view.rs_slot_flags.as<std::uint8_t>();
+        const std::span<const std::uint32_t> rs_fold_len_view =
+            composed_ready
+                ? std::span<const std::uint32_t>(composed.rs_fold_lens)
+                : view.rs_fold_lens.as<std::uint32_t>();
+        std::string rs_binding_error;
+        if (!pipeline::validate_folded_rs_bindings(
+                rs_slot_view,
+                rs_flag_view,
+                rs_fold_len_view,
+                static_cast<std::size_t>(std::max(R, 0)),
+                engine.rs_cache != nullptr,
+                &rs_binding_error)) {
+            throw std::runtime_error(rs_binding_error);
         }
+        const bool use_slots = !rs_slot_view.empty();
         // Ph7 RS working-set buffered-activation channel. Single-role per pass
         // (v1): a FOLD pass (FOLD-bit=2 set) gathers+replays from the buffered
         // pool into recurrent_state (separate fold-replay dispatch below); an
         // rs-output write pass (FOLD-bit clear + buffered slabs present)
         // scatters in-proj [mixed_qkv|a|b] to the pool during the main forward.
-        const auto rs_buf_id_view = view.rs_buffer_slot_ids.as<std::uint32_t>();
-        const auto rs_buf_indptr_view = view.rs_buffer_slot_indptr.as<std::uint32_t>();
-        const bool rs_is_fold = use_slots && std::any_of(
-            rs_flag_view.begin(), rs_flag_view.end(),
-            [](std::uint8_t v) { return (v & 2u) != 0; });
+        const std::span<const std::uint32_t> rs_buf_id_view = composed_ready
+            ? std::span<const std::uint32_t>(composed.rs_buffer_slot_ids)
+            : view.rs_buffer_slot_ids.as<std::uint32_t>();
+        const std::span<const std::uint32_t> rs_buf_indptr_view =
+            composed_ready
+                ? std::span<const std::uint32_t>(
+                      composed.rs_buffer_slot_indptr)
+                : view.rs_buffer_slot_indptr.as<std::uint32_t>();
+        pipeline::RsExecutionPlan rs_plan;
+        if (!pipeline::plan_rs_execution(
+                rs_slot_view,
+                rs_flag_view,
+                rs_fold_len_view,
+                rs_buf_id_view,
+                rs_buf_indptr_view,
+                qo_view,
+                engine.rs_cache != nullptr,
+                engine.rs_cache != nullptr &&
+                    engine.rs_cache->rs_buffer_pool_enabled(),
+                engine.rs_cache != nullptr
+                    ? static_cast<std::uint32_t>(
+                          engine.rs_cache->rs_buffer_page_tokens())
+                    : 0,
+                rs_plan,
+                &rs_binding_error)) {
+            throw std::runtime_error(rs_binding_error);
+        }
+        const bool rs_is_fold =
+            rs_plan.mode == RsExecutionMode::BufferFold;
         const bool rs_is_write =
-            use_slots && !rs_is_fold && rs_buf_id_view.size() > 0;
+            rs_plan.mode == RsExecutionMode::BufferWrite;
+        if (rs_is_fold && !sidx_view.empty()) {
+            throw std::runtime_error(
+                "buffered RS fold is state-only and cannot sample logits");
+        }
 
-        // Direct PTIR launches keep the forward geometry exact. The program runs
-        // after the model and therefore cannot use the legacy graph variants that
-        // fused sampling into the captured forward.
+        // Direct PTIR launches keep the forward geometry exact. Anatomical
+        // stages run through explicit model hooks; boundary-only programs remain
+        // eligible for a program-set-keyed graph variant.
         ForwardInputViews forward_inputs = make_forward_input_views(
             tok_view, pos_view, qo_view, kvpi_view, kvpp_view, kvlpl_view, R);
+        if (rs_is_fold) {
+            forward_inputs.qo_indptr =
+                std::span<const std::uint32_t>(rs_plan.fold_qo_indptr);
+            forward_inputs.total_tokens =
+                static_cast<int>(rs_plan.fold_tokens);
+        }
         const int forward_N = forward_inputs.total_tokens;
         const int forward_R = forward_inputs.num_requests;
         const std::uint32_t* h_qo_forward = forward_inputs.qo_indptr.data();
@@ -309,6 +752,22 @@ void handle_fire_batch(
             forward_inputs.kv_page_indptr.data();
         const std::uint32_t* h_kvlpl_forward =
             forward_inputs.kv_last_page_lens.data();
+        if (forward_N == 0 || forward_R <= 0) {
+            engine.dispatch->finish(
+                *staged_launch, dispatch_view, nullptr, 0,
+                engine.cublas.stream(), &runtime, completion);
+            return;
+        }
+        if (forward_N > max_workspace_tokens) {
+            std::cerr << "[pie-driver-cuda] batch tokens=" << forward_N
+                      << " exceeds workspace=" << max_workspace_tokens << "\n";
+            throw std::runtime_error("forward batch exceeds workspace capacity");
+        }
+        if (rs_is_fold) {
+            is_pure_decode = std::all_of(
+                rs_fold_len_view.begin(), rs_fold_len_view.end(),
+                [](std::uint32_t length) { return length == 1; });
+        }
 
         // Refill persistent device buffers with this fire's wire inputs.
         // Same device addresses every fire — required for graph-replay
@@ -380,6 +839,71 @@ void handle_fire_batch(
             }
         }
 
+        if (pack_structured_mask && !have_custom_mask) {
+            const int lanes = static_cast<int>(qo_view.size()) - 1;
+            std::vector<std::uint32_t> klen(
+                static_cast<std::size_t>(lanes), 0);
+            std::vector<std::int32_t> mindptr(
+                static_cast<std::size_t>(lanes) + 1, 0);
+            std::vector<kernels::StructuredMaskParams> masks(
+                static_cast<std::size_t>(lanes));
+            const std::uint32_t page =
+                static_cast<std::uint32_t>(kv_cache.page_size());
+            for (int lane = 0; lane < lanes; ++lane) {
+                const std::uint32_t pages =
+                    kvpp_view[lane + 1] - kvpp_view[lane];
+                klen[lane] = pages == 0
+                    ? 0
+                    : (pages - 1) * page + kvlpl_view[lane];
+                const std::uint32_t queries =
+                    qo_view[lane + 1] - qo_view[lane];
+                const std::uint64_t bits =
+                    static_cast<std::uint64_t>(queries) * klen[lane];
+                if (bits > static_cast<std::uint64_t>(
+                               std::numeric_limits<std::int32_t>::max()) *
+                        8 ||
+                    mindptr[lane] >
+                        std::numeric_limits<std::int32_t>::max() -
+                            static_cast<std::int64_t>((bits + 7) / 8)) {
+                    throw std::runtime_error(
+                        "structured attention mask exceeds packed ABI");
+                }
+                mindptr[lane + 1] = mindptr[lane] +
+                    static_cast<std::int32_t>((bits + 7) / 8);
+                const auto& descriptor =
+                    effective_structured_masks[lane];
+                masks[lane] = {
+                    static_cast<std::uint32_t>(descriptor.kind),
+                    descriptor.window,
+                    descriptor.sink,
+                };
+            }
+            const std::size_t packed_bytes =
+                static_cast<std::size_t>(mindptr.back());
+            if (packed_bytes > pi.custom_mask.size() ||
+                mindptr.size() > pi.custom_mask_indptr.size() ||
+                klen.size() > pi.structured_mask_klen.size() ||
+                masks.size() > pi.structured_masks.size()) {
+                throw std::runtime_error(
+                    "structured attention mask exceeds persistent capacity");
+            }
+            pi.structured_mask_klen.copy_from_host(klen);
+            pi.structured_masks.copy_from_host(masks);
+            pi.custom_mask_indptr.copy_from_host(mindptr);
+            kernels::launch_pack_structured_mask(
+                pi.positions.data(),
+                pi.structured_mask_klen.data(),
+                pi.qo_indptr.data(),
+                pi.custom_mask_indptr.data(),
+                pi.structured_masks.data(),
+                pi.custom_mask.data(),
+                lanes,
+                cublas.stream());
+            have_custom_mask = true;
+            mask_bytes = static_cast<int>(packed_bytes);
+            mask_indptr_count = lanes + 1;
+        }
+
         // ── W1.3: device-geometry AttnMask → FlashInfer packed custom mask ──
         // A device-geometry fire may carry a DENSE [lanes, stride] per-cell mask
         // on its AttnMask descriptor port (resolved into fg.mask). Pack it to
@@ -388,7 +912,8 @@ void handle_fire_batch(
         // exactly like a BRLE-decoded wire mask. DORMANT unless a device-geometry
         // program binds an AttnMask channel (fg.has_mask); the guest producer is
         // W2.1. Correctness is validated once a real device-geometry fire exists.
-        if (solo_fg != nullptr && solo_fg->has_mask && !solo_fg->mask.empty()) {
+        if (solo_fg != nullptr && solo_fg->has_mask &&
+            !solo_fg->mask.empty() && !use_structured_mask) {
             const pipeline::FireGeometry& fg = *solo_fg;
             const int lanes = static_cast<int>(qo_view.size()) - 1;
             // Total query rows = qo_indptr.back(). For a 1-query/lane decode this
@@ -477,12 +1002,19 @@ void handle_fire_batch(
         std::vector<std::uint8_t> is_fresh_h;
         if (use_slots) {
             const int slot_count = R;
+            if (rs_flag_view.size() > pi.rs_slot_flags.size() ||
+                rs_fold_len_view.size() > pi.rs_fold_lens.size() ||
+                rs_buf_id_view.size() > pi.rs_buffer_slot_ids.size() ||
+                rs_buf_indptr_view.size() >
+                    pi.rs_buffer_slot_indptr.size()) {
+                throw std::runtime_error(
+                    "RS metadata exceeds persistent input capacity");
+            }
             slot_ids_h.resize(slot_count);
             is_fresh_h.resize(slot_count);
             for (int r = 0; r < R; ++r) {
                 slot_ids_h[r] = static_cast<std::int32_t>(rs_slot_view[r]);
-                is_fresh_h[r] = (r < static_cast<int>(rs_flag_view.size()) &&
-                                 (rs_flag_view[r] & 1u))
+                is_fresh_h[r] = (rs_flag_view[r] & PIE_RS_FLAG_RESET)
                                     ? 1u
                                     : 0u;
             }
@@ -492,43 +1024,98 @@ void handle_fire_batch(
             }
             pi.slot_ids.copy_from_host(std::span<const std::int32_t>(slot_ids_h));
             pi.is_fresh.copy_from_host(std::span<const std::uint8_t>(is_fresh_h));
+            std::copy(
+                rs_flag_view.begin(), rs_flag_view.end(),
+                pi.rs_slot_flags_host.data());
+            pi.rs_slot_flags.copy_from_host(
+                std::span<const std::uint8_t>(
+                    pi.rs_slot_flags_host.data(), rs_flag_view.size()));
+            if (!rs_fold_len_view.empty()) {
+                std::copy(
+                    rs_fold_len_view.begin(), rs_fold_len_view.end(),
+                    pi.rs_fold_lens_host.data());
+                pi.rs_fold_lens.copy_from_host(
+                    std::span<const std::uint32_t>(
+                        pi.rs_fold_lens_host.data(),
+                        rs_fold_len_view.size()));
+            }
+            if (!rs_buf_indptr_view.empty()) {
+                std::copy(
+                    rs_buf_indptr_view.begin(), rs_buf_indptr_view.end(),
+                    pi.rs_buffer_slot_indptr_host.data());
+                pi.rs_buffer_slot_indptr.copy_from_host(
+                    std::span<const std::uint32_t>(
+                        pi.rs_buffer_slot_indptr_host.data(),
+                        rs_buf_indptr_view.size()));
+            }
+            if (!rs_buf_id_view.empty()) {
+                std::copy(
+                    rs_buf_id_view.begin(), rs_buf_id_view.end(),
+                    pi.rs_buffer_slot_ids_host.data());
+                pi.rs_buffer_slot_ids.copy_from_host(
+                    std::span<const std::uint32_t>(
+                        pi.rs_buffer_slot_ids_host.data(),
+                        rs_buf_id_view.size()));
+            }
         }
 
-        if (engine.rs_cache != nullptr) {
-            engine.rs_cache->set_verify_frozen(false);
-        }
-
-        if (sptr_view.size() != static_cast<std::size_t>(R + 1) ||
-            sptr_view.back() != sidx_view.size()) {
+        if (!rs_is_fold &&
+            (sptr_view.size() != static_cast<std::size_t>(R + 1) ||
+             sptr_view.back() != sidx_view.size())) {
             throw std::runtime_error("sampling CSR does not match launched instances");
         }
         std::vector<std::int32_t> sample_rows;
-        sample_rows.reserve(sidx_view.size());
-        const std::uint32_t* h_sptr = sptr_view.data();
-        const std::uint32_t* h_sidx = sidx_view.data();
-        for (int r = 0; r < R; ++r) {
-            const std::uint32_t qo_begin = h_qo[r];
-            const std::uint32_t qo_len = h_qo[r + 1] - qo_begin;
-            for (std::uint32_t k = h_sptr[r]; k < h_sptr[r + 1]; ++k) {
-                if (h_sidx[k] >= qo_len) {
-                    throw std::runtime_error("sampling row exceeds request query span");
-                }
-                sample_rows.push_back(
-                    static_cast<std::int32_t>(qo_begin + h_sidx[k]));
-            }
+        std::string sampling_error;
+        if (!rs_is_fold && !pipeline::global_sampling_rows(
+                qo_view,
+                sptr_view,
+                sidx_view,
+                sample_rows,
+                &sampling_error)) {
+            throw std::runtime_error(sampling_error);
         }
         if (sample_rows.size() > pi.sample_idx.size()) {
             throw std::runtime_error("sampling rows exceed persistent input capacity");
         }
-        if (N > tensor_rows(ws.logits)) {
+        if (!rs_is_fold && N > tensor_rows(ws.logits)) {
             throw std::runtime_error("forward batch exceeds logits workspace");
         }
         if (!sample_rows.empty()) {
             pi.sample_idx.copy_from_host(
                 std::span<const std::int32_t>(sample_rows));
         }
+        const MtpDraftPlan mtp_draft_plan =
+            preflight_mtp_draft_logits(
+                engine, composed, sample_rows, mtp_draft_counts);
+        if (rs_is_fold && !mtp_draft_plan.work.empty()) {
+            throw std::runtime_error(
+                "state-only buffered RS fold cannot produce MTP drafts");
+        }
+        if (engine.rs_cache != nullptr) {
+            engine.rs_cache->set_verify_frozen(false);
+        }
 
         const auto t_plan_end = clock::now();
+        const bool has_attention_stages =
+            engine.dispatch->launch_has_attention_stages(dispatch_view);
+        if (rs_is_fold && has_attention_stages) {
+            throw std::runtime_error(
+                "state-only buffered RS fold cannot execute anatomical PTIR "
+                "attention stages");
+        }
+        if (!tp_rs_metadata_shape_valid(
+                rs_plan.mode,
+                static_cast<std::size_t>(forward_R),
+                rs_slot_view.size(),
+                rs_flag_view.size(),
+                rs_fold_len_view.size(),
+                (rs_is_write || rs_is_fold) ? rs_buf_id_view.size() : 0,
+                (rs_is_write || rs_is_fold)
+                    ? rs_buf_indptr_view.size()
+                    : 0)) {
+            throw std::runtime_error(
+                "RS metadata cannot be represented by the TP payload");
+        }
 
         // TP fan-out. Rank 0 broadcasts the per-fire payload (header +
         // refilled persistent_inputs) to every follower so they can run
@@ -540,12 +1127,19 @@ void handle_fire_batch(
             tp_cpu_gate_notify(engine.tp_cpu_gate_key);
             tp_broadcast_inputs(*engine.tp_comm, pi,
                                 forward_N, forward_R, is_pure_decode,
-                                static_cast<int>(
+                                rs_is_fold ? 0 : static_cast<int>(
                                     forward_inputs.kv_page_indices.size()),
-                                mask_bytes, mask_indptr_count,
+                                rs_is_fold ? 0 : mask_bytes,
+                                rs_is_fold ? 0 : mask_indptr_count,
                                 /*has_slot_ids=*/use_slots,
+                                !rs_is_fold && has_write_desc,
                                 /*tp_greedy_argmax=*/false,
                                 /*logit_rows=*/0,
+                                structured_window_left,
+                                ptir_program_set_hash,
+                                rs_plan.mode,
+                                static_cast<int>(rs_fold_len_view.size()),
+                                static_cast<int>(rs_buf_id_view.size()),
                                 /*stream=*/nullptr);
         }
 
@@ -554,24 +1148,30 @@ void handle_fire_batch(
         // For graph-capable archs this updates pinned host / device
         // plan state for the captured body to read. Lives outside any
         // capture region so the host work re-runs every fire.
-        forward_fn.invoke_prepare(
-            attn_ws,
-            ForwardFn::PrepareInputs{
-                .qo_indptr_h = h_qo_forward,
-                .kv_page_indices_h = h_kvpi_forward,
-                .kv_page_indices_d =
-                    reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
-                .kv_page_indptr_h = h_kvpp_forward,
-                .kv_page_indptr_d =
-                    reinterpret_cast<const std::uint32_t*>(pi.kv_page_indptr.data()),
-                .kv_last_page_lens_h =
-                    h_kvlpl_forward,
-                .kv_last_page_lens_d =
-                    reinterpret_cast<const std::uint32_t*>(pi.kv_last_page_lens.data()),
-                .total_tokens = forward_N,
-                .num_requests = forward_R,
-                .is_pure_decode = is_pure_decode,
-            });
+        if (!rs_is_fold) {
+            forward_fn.invoke_prepare(
+                attn_ws,
+                ForwardFn::PrepareInputs{
+                    .qo_indptr_h = h_qo_forward,
+                    .kv_page_indices_h = h_kvpi_forward,
+                    .kv_page_indices_d =
+                        reinterpret_cast<const std::uint32_t*>(
+                            pi.kv_page_indices.data()),
+                    .kv_page_indptr_h = h_kvpp_forward,
+                    .kv_page_indptr_d =
+                        reinterpret_cast<const std::uint32_t*>(
+                            pi.kv_page_indptr.data()),
+                    .kv_last_page_lens_h =
+                        h_kvlpl_forward,
+                    .kv_last_page_lens_d =
+                        reinterpret_cast<const std::uint32_t*>(
+                            pi.kv_last_page_lens.data()),
+                    .total_tokens = forward_N,
+                    .num_requests = forward_R,
+                    .is_pure_decode = is_pure_decode,
+                    .runtime_window_left = structured_window_left,
+                });
+        }
 
         forward_fn.invoke_set_logits_argmax_only(false);
         forward_fn.invoke_set_fused_argmax_output(nullptr);
@@ -606,6 +1206,37 @@ void handle_fire_batch(
         };
         dump_rs("PRE ");
 
+        struct StageHookContext {
+            pipeline::Dispatch* dispatch = nullptr;
+            pipeline::StagedLaunch* launch = nullptr;
+        } stage_hook_context{
+            engine.dispatch,
+            staged_launch.get(),
+        };
+        const model::StageHooks stage_hooks{
+            .context = &stage_hook_context,
+            .execute = [](
+                void* opaque,
+                model::StageHookPoint point,
+                const void* query_data,
+                std::uint32_t query_rows,
+                std::uint32_t query_columns,
+                std::uint32_t layer,
+                cudaStream_t stream,
+                bool query_is_f32) {
+                auto& context =
+                    *static_cast<StageHookContext*>(opaque);
+                context.dispatch->execute_attention_phase(
+                    *context.launch,
+                    static_cast<std::uint8_t>(point),
+                    query_data,
+                    query_rows,
+                    query_columns,
+                    layer,
+                    stream,
+                    query_is_f32);
+            },
+        };
         run_forward_dispatch(
             engine, ForwardDispatchInputs{
                 .forward_R = forward_R,
@@ -613,6 +1244,8 @@ void handle_fire_batch(
                 .num_sampling = num_sampling,
                 .is_pure_decode = is_pure_decode,
                 .have_custom_mask = have_custom_mask,
+                .structured_window_left = structured_window_left,
+                .program_set_hash = ptir_program_set_hash,
                 .has_write_desc = has_write_desc,
                 .use_slots = use_slots,
                 .h_qo_forward = h_qo_forward,
@@ -621,9 +1254,23 @@ void handle_fire_batch(
                 .h_kvlpl_forward = h_kvlpl_forward,
                 .slot_ids_h_data = slot_ids_h.data(),
                 .is_fresh_h_data = is_fresh_h.data(),
-                .rs_buffer_slot_ids_h = rs_is_write ? rs_buf_id_view.data() : nullptr,
-                .rs_buffer_slot_indptr_h = rs_is_write ? rs_buf_indptr_view.data() : nullptr,
+                .rs_buffer_slot_ids_h =
+                    (rs_is_write || rs_is_fold)
+                        ? pi.rs_buffer_slot_ids_host.data()
+                        : nullptr,
+                .rs_buffer_slot_indptr_h =
+                    (rs_is_write || rs_is_fold)
+                        ? pi.rs_buffer_slot_indptr_host.data()
+                        : nullptr,
+                .rs_fold_lens_h = !rs_fold_len_view.empty()
+                    ? pi.rs_fold_lens_host.data()
+                    : nullptr,
+                .rs_fold_lens_d = !rs_fold_len_view.empty()
+                    ? reinterpret_cast<const std::int32_t*>(
+                          pi.rs_fold_lens.data())
+                    : nullptr,
                 .rs_buffer_write = rs_is_write,
+                .rs_buffer_fold = rs_is_fold,
                 .image_pixels_h = img_pixels_h,
                 .image_pixel_byte_indptr_h = img_pix_byte_indptr.data(),
                 .image_patch_positions_h = img_patch_pos.data(),
@@ -638,8 +1285,17 @@ void handle_fire_batch(
                 .audio_feature_byte_indptr_h = aud_feat_byte_indptr.data(),
                 .audio_anchor_rows_h = aud_anchor.data(),
                 .num_clips = aud_num_clips,
+                .stage_hooks =
+                    has_attention_stages ? &stage_hooks : nullptr,
             });
         dump_rs("POST");
+        if (rs_is_fold) {
+            verify_timer.finish(cublas.stream());
+            engine.dispatch->finish(
+                *staged_launch, dispatch_view, nullptr, 0,
+                engine.cublas.stream(), &runtime, completion);
+            return;
+        }
         if (ir_trace) {
             std::cerr << "[ir-trace] forward-returned req_id=" << req_id << "\n";
             std::cerr.flush();
@@ -658,24 +1314,28 @@ void handle_fire_batch(
         }
         const std::uint32_t vocab = static_cast<std::uint32_t>(
             engine.loaded_model.hf_config().vocab_size);
-        const void* ptir_logits =
-            gather_selected_logits_f32(engine, num_sampling, vocab);
-        // The post-forward dispatch slices each program's logits base from
+        enqueue_mtp_draft_logits(engine, mtp_draft_plan);
+        // The epilogue phase slices each program's logits base from
         // `sampling_indptr[p]` — hand it the PER-PROGRAM gathered-row offsets
         // (`n_prog + 1` entries), not the per-request sampling CSR (the two
         // coincided only while every batched program was exactly one wire
         // request).
-        pie_native::LaunchView dispatch_view = view;
-        dispatch_view.sampling_indices = pie_native::slice_from_u32(
-            sidx_view.data(), sidx_view.size());
-        dispatch_view.sampling_indptr = pie_native::slice_from_u32(
-            prog_sample_offsets.data(), prog_sample_offsets.size());
-        engine.dispatch->run(
-            dispatch_view, ptir_logits, vocab, engine.cublas.stream(),
-            &runtime, completion);
+        engine.dispatch->finish(
+            *staged_launch, dispatch_view, nullptr, vocab,
+            engine.cublas.stream(),
+            &runtime, completion,
+            static_cast<const std::uint16_t*>(engine.ws.logits.data()),
+            reinterpret_cast<const std::uint32_t*>(sample_rows.data()),
+            mtp_draft_plan.draft_starts,
+            mtp_draft_counts,
+            static_cast<std::uint32_t>(tensor_rows(engine.ws.logits)));
         return;
 
     } catch (const std::exception& e) {
+        if (staged_launch != nullptr) {
+            engine.dispatch->abort(
+                *staged_launch, engine.cublas.stream());
+        }
         std::cerr << "[pie-driver-cuda] fire_batch failed for req_id="
                   << req_id << ": " << e.what() << "\n";
         throw;

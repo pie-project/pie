@@ -18,49 +18,42 @@
 // generalized); this library is the correctness baseline every tier diffs
 // against the host golden interpreter.
 //
-// RNG PARITY: the gumbel/uniform helpers are transcribed byte-for-byte from
-// sampling_ir/primitives_src.hpp (SplitMix64, seed_eff ^ 0xA5A5A5A5, stream
-// salt) so tier-0 sampling matches the shipped sample_temp path. Do not
-// "improve" the constants.
+// RNG PARITY: the gumbel/uniform helpers consume the generated PTIR RNG
+// contract, preserving the shipped sample_temp bit mapping.
 
 #include <cstdint>
+#include <type_traits>
 
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
 #include "pie_native/ptir/op_table.hpp"
+#include "pie_native/ptir/rng_contract.generated.h"
 
 namespace pie_cuda_driver::pipeline {
 
 inline constexpr int kTier0Block = 256;   // fixed CTA width for row-local kernels
+inline constexpr int kCanonicalReduceWidth = 32;
+inline constexpr int kCanonicalReduceLevels = 8;
 
 // ───────────────────────────── device helpers ────────────────────────────
 
 __device__ __forceinline__ float t0_pos_inf() { return __int_as_float(0x7f800000); }
 __device__ __forceinline__ float t0_neg_inf() { return __int_as_float(0xff800000); }
 
-// RNG — bit-parity with sampling_ir/primitives_src.hpp (sample_temp.cu lineage).
-__device__ __forceinline__ unsigned long long t0_splitmix64(unsigned long long x) {
-    x ^= x >> 27; x *= 0x3C79AC492BA7B653ULL;
-    x ^= x >> 33; x *= 0x1C69B3F74AC4AE35ULL;
-    x ^= x >> 27;
-    return x;
-}
+// RNG — generated contract plus backend-specific transcendental spelling.
 __device__ __forceinline__ unsigned long long t0_seed_eff(unsigned int seed_u32) {
-    return (unsigned long long)seed_u32 ^ 0xA5A5A5A5ULL;
+    return ptir_rng_seed_eff(seed_u32);
 }
 __device__ __forceinline__ unsigned long long t0_stream_salt(unsigned int stream) {
-    return t0_splitmix64((unsigned long long)stream * 0x9E3779B97F4A7C15ULL);
+    return ptir_rng_stream_salt(stream);
 }
 __device__ __forceinline__ unsigned long long t0_seed_eff_stream(unsigned int seed_u32,
                                                                  unsigned int stream) {
-    return t0_seed_eff(seed_u32) ^ t0_stream_salt(stream);
+    return ptir_rng_seed_eff_stream(seed_u32, stream);
 }
 __device__ __forceinline__ float t0_hash_uniform(unsigned long long seed_eff, int j) {
-    unsigned long long x = seed_eff + 0x9E3779B97F4A7C15ULL * (unsigned long long)(j + 1);
-    x = t0_splitmix64(x);
-    unsigned int bits = (unsigned int)(x >> 40);
-    return ((float)bits + 0.5f) * (1.0f / 16777216.0f);
+    return ptir_rng_hash_uniform(seed_eff, static_cast<unsigned int>(j));
 }
 __device__ __forceinline__ float t0_gumbel_noise(unsigned long long seed_eff, int j) {
     float u = t0_hash_uniform(seed_eff, j);
@@ -111,19 +104,45 @@ __global__ void k_binary(const T* __restrict__ a, const T* __restrict__ b,
 enum class UnKind : std::uint8_t { Neg, Exp, Log, Recip, Abs, Sign };
 
 template <class T>
+__device__ __forceinline__ T t0_unary_value(T value, UnKind kind) {
+    if constexpr (std::is_same_v<T, float>) {
+        switch (kind) {
+            case UnKind::Neg: return -value;
+            case UnKind::Exp: return expf(value);
+            case UnKind::Log: return logf(value);
+            case UnKind::Recip: return 1.0f / value;
+            case UnKind::Abs: return fabsf(value);
+            case UnKind::Sign:
+                return static_cast<float>((value > 0.0f) - (value < 0.0f));
+        }
+    } else if constexpr (std::is_same_v<T, std::int32_t>) {
+        const auto bits = static_cast<std::uint32_t>(value);
+        const auto negated = static_cast<std::int32_t>(0u - bits);
+        switch (kind) {
+            case UnKind::Neg: return negated;
+            case UnKind::Abs: return value < 0 ? negated : value;
+            case UnKind::Sign:
+                return static_cast<std::int32_t>(
+                    (value > 0) - (value < 0));
+            default: return value;
+        }
+    } else {
+        switch (kind) {
+            case UnKind::Neg: return static_cast<T>(0u - value);
+            case UnKind::Abs: return value;
+            case UnKind::Sign: return static_cast<T>(value != 0);
+            default: return value;
+        }
+    }
+    return value;
+}
+
+template <class T>
 __global__ void k_unary(const T* __restrict__ a, T* __restrict__ out,
                         std::uint64_t n, UnKind kind) {
     for (std::uint64_t i = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
          i < n; i += (std::uint64_t)gridDim.x * blockDim.x) {
-        T v = a[i];
-        switch (kind) {
-            case UnKind::Neg:   out[i] = -v; break;
-            case UnKind::Exp:   out[i] = (T)expf((float)v); break;
-            case UnKind::Log:   out[i] = (T)logf((float)v); break;
-            case UnKind::Recip: out[i] = (T)(1.0f / (float)v); break;
-            case UnKind::Abs:   out[i] = (T)fabsf((float)v); break;
-            case UnKind::Sign:  out[i] = (T)(((float)v > 0.0f) - ((float)v < 0.0f)); break;
-        }
+        out[i] = t0_unary_value(a[i], kind);
     }
 }
 
@@ -188,6 +207,19 @@ __global__ void k_cast(const TIn* __restrict__ in, TOut* __restrict__ out, std::
     }
 }
 
+template <class TIn>
+__global__ void k_cast_bool(
+    const TIn* __restrict__ in,
+    std::uint8_t* __restrict__ out,
+    std::uint64_t n) {
+    for (std::uint64_t i =
+             blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
+         i < n;
+         i += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        out[i] = in[i] != static_cast<TIn>(0);
+    }
+}
+
 // ───────────────────────────────── index ─────────────────────────────────
 
 __global__ void k_iota(std::uint32_t* __restrict__ out, std::uint32_t n) {
@@ -197,119 +229,298 @@ __global__ void k_iota(std::uint32_t* __restrict__ out, std::uint32_t n) {
     }
 }
 
-// gather: out[i] = src[idx[i]]  (idx length = output length).
-template <class T>
-__global__ void k_gather(const T* __restrict__ src, const std::uint32_t* __restrict__ idx,
-                         T* __restrict__ out, std::uint64_t n_idx) {
-    for (std::uint64_t i = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
-         i < n_idx; i += (std::uint64_t)gridDim.x * blockDim.x) {
-        out[i] = src[idx[i]];
+template <class Index>
+__device__ __forceinline__ bool valid_axis0_index(
+    Index value, std::uint32_t extent, std::uint32_t* index) {
+    if constexpr (std::is_signed_v<Index>) {
+        if (value < 0) return false;
+    }
+    const std::uint64_t widened = static_cast<std::uint64_t>(value);
+    if (widened >= extent) return false;
+    *index = static_cast<std::uint32_t>(widened);
+    return true;
+}
+
+template <class T, class Index>
+__global__ void k_gather_axis0(
+    const T* __restrict__ src,
+    const Index* __restrict__ indices,
+    T* __restrict__ out,
+    std::uint32_t index_count,
+    std::uint32_t axis0,
+    std::uint32_t inner) {
+    const std::uint64_t numel =
+        static_cast<std::uint64_t>(index_count) * inner;
+    for (std::uint64_t flat =
+             blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
+         flat < numel;
+         flat += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        const std::uint32_t position =
+            static_cast<std::uint32_t>(flat / inner);
+        const std::uint32_t offset =
+            static_cast<std::uint32_t>(flat % inner);
+        std::uint32_t selected = 0;
+        out[flat] = valid_axis0_index(
+                        indices[position], axis0, &selected)
+            ? src[static_cast<std::uint64_t>(selected) * inner + offset]
+            : T{};
     }
 }
 
-// gather_row (axis-0 row gather): src [n, row_len], idx [m] → out [m, row_len],
-// out[i, :] = src[idx[i], :]. Grid-stride over m*row_len.
-template <class T>
-__global__ void k_gather_row(const T* __restrict__ src, const std::uint32_t* __restrict__ idx,
-                             T* __restrict__ out, std::uint32_t m, std::uint32_t row_len) {
-    std::uint64_t n = (std::uint64_t)m * row_len;
-    for (std::uint64_t t = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
-         t < n; t += (std::uint64_t)gridDim.x * blockDim.x) {
-        std::uint32_t i = (std::uint32_t)(t / row_len);
-        std::uint32_t j = (std::uint32_t)(t % row_len);
-        out[t] = src[(std::uint64_t)idx[i] * row_len + j];
+template <class T, class Index>
+__global__ void k_gather_row(
+    const T* __restrict__ src,
+    const Index* __restrict__ indices,
+    T* __restrict__ out,
+    std::uint32_t rows,
+    std::uint32_t columns) {
+    for (std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+         row < rows;
+         row += gridDim.x * blockDim.x) {
+        std::uint32_t column = 0;
+        out[row] = valid_axis0_index(
+                       indices[row], columns, &column)
+            ? src[static_cast<std::uint64_t>(row) * columns + column]
+            : T{};
     }
 }
 
-// scatter_set: out starts as a copy of base; out[idx[j]] = vals[j] for j in
-// index order, LAST WINS on duplicates (§6.2, load-bearing). Tier-0 correctness
-// path: a single ordered pass (scatter counts are small — K/B words per lane).
-// Tier 1 fuses this into a few flat writes per lane.
-template <class T>
-__global__ void k_scatter_set_serial(T* __restrict__ out, const std::uint32_t* __restrict__ idx,
-                                     const T* __restrict__ vals, std::uint32_t n_scatter) {
-    // grid=1, block=1 — deterministic index-order last-wins.
-    for (std::uint32_t j = 0; j < n_scatter; ++j) out[idx[j]] = vals[j];
-}
-
-// scatter_add: out starts as a copy of base; out[idx[j]] += vals[j] in index
-// order (accumulate). Serial single-pass (deterministic; scatter counts small).
-template <class T>
-__global__ void k_scatter_add_serial(T* __restrict__ out, const std::uint32_t* __restrict__ idx,
-                                     const T* __restrict__ vals, std::uint32_t n_scatter) {
-    for (std::uint32_t j = 0; j < n_scatter; ++j) out[idx[j]] = (T)(out[idx[j]] + vals[j]);
+template <class T, class Index, bool Add>
+__global__ void k_scatter_axis0_serial(
+    T* __restrict__ out,
+    const Index* __restrict__ indices,
+    const T* __restrict__ vals,
+    std::uint32_t index_count,
+    std::uint32_t axis0,
+    std::uint32_t inner,
+    bool scalar_vals) {
+    for (std::uint32_t update = 0; update < index_count; ++update) {
+        std::uint32_t selected = 0;
+        if (!valid_axis0_index(indices[update], axis0, &selected)) continue;
+        for (std::uint32_t offset = 0; offset < inner; ++offset) {
+            const T value = vals[
+                scalar_vals
+                    ? 0
+                    : static_cast<std::uint64_t>(update) * inner + offset];
+            T& destination =
+                out[static_cast<std::uint64_t>(selected) * inner + offset];
+            if constexpr (Add) {
+                if constexpr (std::is_same_v<T, std::int32_t>) {
+                    destination = static_cast<std::int32_t>(
+                        static_cast<std::uint32_t>(destination) +
+                        static_cast<std::uint32_t>(value));
+                } else {
+                    destination = static_cast<T>(destination + value);
+                }
+            } else {
+                destination = value;
+            }
+        }
+    }
 }
 
 // ───────────────────────── reduce / scan (row-local) ─────────────────────
 
 enum class RedKind : std::uint8_t { Sum, Max, Min };
 
-// One CTA per row; grid-stride load over the row, then a shared-memory tree
-// reduce. `len` may exceed the block width.
+template <class T> struct RedLimits;
+template <> struct RedLimits<float> {
+    __device__ static float lowest() { return t0_neg_inf(); }
+    __device__ static float highest() { return t0_pos_inf(); }
+};
+template <> struct RedLimits<std::int32_t> {
+    __device__ static std::int32_t lowest() { return -2147483647 - 1; }
+    __device__ static std::int32_t highest() { return 2147483647; }
+};
+template <> struct RedLimits<std::uint32_t> {
+    __device__ static std::uint32_t lowest() { return 0; }
+    __device__ static std::uint32_t highest() { return 0xffffffffu; }
+};
+
+template <class T>
+__device__ __forceinline__ T red_identity(RedKind kind) {
+    return kind == RedKind::Sum ? (T)0
+         : kind == RedKind::Max ? RedLimits<T>::lowest()
+                               : RedLimits<T>::highest();
+}
+
+template <class T>
+__device__ __forceinline__ T red_combine(T left, T right, RedKind kind) {
+    if (kind == RedKind::Sum) {
+        if constexpr (std::is_same_v<T, std::int32_t>) {
+            return static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(left) +
+                static_cast<std::uint32_t>(right));
+        }
+        return static_cast<T>(left + right);
+    }
+    if (kind == RedKind::Max) return right > left ? right : left;
+    return right < left ? right : left;
+}
+
+template <>
+__device__ __forceinline__ float red_combine<float>(
+    float left, float right, RedKind kind) {
+    if (kind == RedKind::Sum) return left + right;
+    const bool left_nan = isnan(left);
+    const bool right_nan = isnan(right);
+    if (left_nan) return right_nan ? red_identity<float>(kind) : right;
+    if (right_nan) return left;
+    if (left == 0.0f && right == 0.0f) {
+        const std::uint32_t left_sign = __float_as_uint(left) & 0x80000000u;
+        const std::uint32_t right_sign = __float_as_uint(right) & 0x80000000u;
+        return __uint_as_float(
+            kind == RedKind::Max ? left_sign & right_sign
+                                 : left_sign | right_sign);
+    }
+    if (kind == RedKind::Max) return fmaxf(left, right);
+    return fminf(left, right);
+}
+
+template <class T>
+__device__ __forceinline__ T reduce_canonical_slot(
+    T* slot, std::uint32_t lane, std::uint32_t count, RedKind kind) {
+    if (lane >= count) slot[lane] = red_identity<T>(kind);
+    __syncwarp();
+    for (std::uint32_t offset = 16; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            slot[lane] = red_combine(slot[lane], slot[lane + offset], kind);
+        }
+        __syncwarp();
+    }
+    return slot[0];
+}
+
+// One 32-lane logical tree per row. Tile partials are streamed through a
+// base-32 carry stack, reproducing the recursive 32-wide schedule without
+// launch-configuration-dependent accumulation or vocabulary-sized scratch.
 template <class T>
 __global__ void k_reduce(const T* __restrict__ in, T* __restrict__ out,
                          std::uint32_t rows, std::uint32_t len, RedKind kind) {
-    __shared__ T sh[kTier0Block];
+    __shared__ T levels[kCanonicalReduceLevels][kCanonicalReduceWidth];
+    __shared__ T tile[kCanonicalReduceWidth];
+    __shared__ std::uint32_t counts[kCanonicalReduceLevels];
+    const std::uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const std::uint32_t lane = threadIdx.x;
+    const T* r = in + (std::uint64_t)row * len;
+
+    if (lane < kCanonicalReduceLevels) counts[lane] = 0;
+    __syncwarp();
+    for (std::uint32_t base = 0; base < len; base += kCanonicalReduceWidth) {
+        const std::uint32_t index = base + lane;
+        tile[lane] = index < len ? r[index] : red_identity<T>(kind);
+        const std::uint32_t tile_count =
+            len - base < kCanonicalReduceWidth ? len - base : kCanonicalReduceWidth;
+        const T partial = reduce_canonical_slot(tile, lane, tile_count, kind);
+        if (lane == 0) {
+            levels[0][counts[0]++] = partial;
+        }
+        __syncwarp();
+        for (std::uint32_t level = 0; level + 1 < kCanonicalReduceLevels; ++level) {
+            if (counts[level] != kCanonicalReduceWidth) break;
+            const T carry = reduce_canonical_slot(
+                levels[level], lane, kCanonicalReduceWidth, kind);
+            if (lane == 0) {
+                counts[level] = 0;
+                levels[level + 1][counts[level + 1]++] = carry;
+            }
+            __syncwarp();
+        }
+    }
+
+    for (std::uint32_t level = 0; level + 1 < kCanonicalReduceLevels; ++level) {
+        const std::uint32_t count = counts[level];
+        if (count == 0) continue;
+        bool higher = false;
+        for (std::uint32_t next = level + 1; next < kCanonicalReduceLevels; ++next) {
+            higher = higher || counts[next] != 0;
+        }
+        if (count == 1 && !higher) {
+            if (lane == 0) out[row] = levels[level][0];
+            return;
+        }
+        const T carry = reduce_canonical_slot(levels[level], lane, count, kind);
+        if (lane == 0) {
+            counts[level] = 0;
+            levels[level + 1][counts[level + 1]++] = carry;
+        }
+        __syncwarp();
+    }
+    if (lane == 0) {
+        out[row] = counts[kCanonicalReduceLevels - 1] == 0
+            ? red_identity<T>(kind)
+            : levels[kCanonicalReduceLevels - 1][0];
+    }
+}
+
+// reduce_argmax row-local. Integer comparisons stay in their declared dtype;
+// float NaNs are never selected. Ties resolve to the LOWER index.
+template <class T>
+__global__ void k_reduce_argmax(const T* __restrict__ in,
+                                std::uint32_t* __restrict__ out,
+                                std::uint32_t rows, std::uint32_t len) {
+    __shared__ T sh_v[kTier0Block];
+    __shared__ std::uint32_t sh_i[kTier0Block];
+    __shared__ std::uint8_t sh_have[kTier0Block];
     const std::uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const T* r = in + (std::uint64_t)row * len;
 
-    T seed0 = r[threadIdx.x < len ? threadIdx.x : 0];
-    T acc = (kind == RedKind::Sum) ? (T)0 : seed0;
-    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
-        T v = r[i];
-        if (kind == RedKind::Sum) acc = (T)(acc + v);
-        else if (kind == RedKind::Max) acc = (v > acc ? v : acc);
-        else acc = (v < acc ? v : acc);
-    }
-    sh[threadIdx.x] = acc;
-    __syncthreads();
-    for (std::uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            T a = sh[threadIdx.x], b = sh[threadIdx.x + s];
-            if (kind == RedKind::Sum) sh[threadIdx.x] = (T)(a + b);
-            else if (kind == RedKind::Max) sh[threadIdx.x] = (b > a ? b : a);
-            else sh[threadIdx.x] = (b < a ? b : a);
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[row] = sh[0];
-}
-
-// reduce_argmax row-local (float rows). Ties resolve to the LOWER index.
-// Output is a u32 index per row.
-__global__ void k_reduce_argmax(const float* __restrict__ in, std::uint32_t* __restrict__ out,
-                                std::uint32_t rows, std::uint32_t len) {
-    __shared__ float sh_v[kTier0Block];
-    __shared__ std::uint32_t sh_i[kTier0Block];
-    const std::uint32_t row = blockIdx.x;
-    if (row >= rows) return;
-    const float* r = in + (std::uint64_t)row * len;
-
-    float best = t0_neg_inf();
+    T best{};
     std::uint32_t bi = 0;
+    bool have = false;
     for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
-        float v = r[i];
-        if (v > best) { best = v; bi = i; }
+        const T v = r[i];
+        bool selectable = true;
+        if constexpr (std::is_same_v<T, float>) {
+            selectable = !isnan(v);
+        }
+        if (selectable &&
+            (!have || v > best || (v == best && i < bi))) {
+            best = v;
+            bi = i;
+            have = true;
+        }
     }
     sh_v[threadIdx.x] = best;
     sh_i[threadIdx.x] = bi;
+    sh_have[threadIdx.x] = have;
     __syncthreads();
     for (std::uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
-            float ov = sh_v[threadIdx.x + s];
+            const T ov = sh_v[threadIdx.x + s];
             std::uint32_t oi = sh_i[threadIdx.x + s];
-            if (ov > sh_v[threadIdx.x] || (ov == sh_v[threadIdx.x] && oi < sh_i[threadIdx.x])) {
+            const bool other_have = sh_have[threadIdx.x + s] != 0;
+            const bool self_have = sh_have[threadIdx.x] != 0;
+            if (other_have &&
+                (!self_have || ov > sh_v[threadIdx.x] ||
+                 (ov == sh_v[threadIdx.x] && oi < sh_i[threadIdx.x]))) {
                 sh_v[threadIdx.x] = ov;
                 sh_i[threadIdx.x] = oi;
+                sh_have[threadIdx.x] = 1;
             }
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) out[row] = sh_i[0];
+    if (threadIdx.x == 0) out[row] = sh_have[0] ? sh_i[0] : 0;
 }
 
 enum class ScanKind : std::uint8_t { Sum, Prod };
+
+template <class T>
+__device__ __forceinline__ T scan_combine(
+    T left, T right, ScanKind kind) {
+    if constexpr (std::is_same_v<T, std::int32_t>) {
+        const auto a = static_cast<std::uint32_t>(left);
+        const auto b = static_cast<std::uint32_t>(right);
+        return static_cast<std::int32_t>(
+            kind == ScanKind::Sum ? a + b : a * b);
+    }
+    return kind == ScanKind::Sum
+        ? static_cast<T>(left + right)
+        : static_cast<T>(left * right);
+}
 
 // Inclusive scan per row (cumsum/cumprod). One CTA per row; tiled Hillis-Steele
 // with a running block carry so `len` may exceed the block width.
@@ -332,103 +543,21 @@ __global__ void k_scan(const T* __restrict__ in, T* __restrict__ out,
             T add = (threadIdx.x >= off) ? sh[threadIdx.x - off]
                                          : ((kind == ScanKind::Sum) ? (T)0 : (T)1);
             __syncthreads();
-            sh[threadIdx.x] = (kind == ScanKind::Sum) ? (T)(sh[threadIdx.x] + add)
-                                                      : (T)(sh[threadIdx.x] * add);
+            sh[threadIdx.x] =
+                scan_combine(sh[threadIdx.x], add, kind);
             __syncthreads();
         }
         if (i < len) {
-            ro[i] = (kind == ScanKind::Sum) ? (T)(sh[threadIdx.x] + carry)
-                                            : (T)(sh[threadIdx.x] * carry);
+            ro[i] = scan_combine(carry, sh[threadIdx.x], kind);
         }
         // carry := combine(carry, tile total) = value at last lane of this tile.
         T tile_total = sh[blockDim.x - 1];
         __syncthreads();
-        carry = (kind == ScanKind::Sum) ? (T)(carry + tile_total) : (T)(carry * tile_total);
-    }
-}
-
-// ────────────────────────── normalize (row-local) ────────────────────────
-
-enum class NormKind : std::uint8_t { Softmax, LogSoftmax, L2Norm };
-
-// One CTA per row: reduce (max/sumsq) → map. Numerically stable softmax.
-__global__ void k_normalize(const float* __restrict__ in, float* __restrict__ out,
-                            std::uint32_t rows, std::uint32_t len, NormKind kind) {
-    __shared__ float sh[kTier0Block];
-    const std::uint32_t row = blockIdx.x;
-    if (row >= rows) return;
-    const float* ri = in + (std::uint64_t)row * len;
-    float* ro = out + (std::uint64_t)row * len;
-
-    auto block_reduce = [&](float v, bool is_max) -> float {
-        sh[threadIdx.x] = v;
-        __syncthreads();
-        for (std::uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
-            if (threadIdx.x < s) {
-                float o = sh[threadIdx.x + s];
-                sh[threadIdx.x] = is_max ? fmaxf(sh[threadIdx.x], o) : (sh[threadIdx.x] + o);
-            }
-            __syncthreads();
-        }
-        float r = sh[0];
-        __syncthreads();
-        return r;
-    };
-
-    if (kind == NormKind::L2Norm) {
-        float local = 0.f;
-        for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) { float v = ri[i]; local += v * v; }
-        float ss = block_reduce(local, /*is_max=*/false);
-        float inv = rsqrtf(ss);
-        for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) ro[i] = ri[i] * inv;
-        return;
-    }
-
-    // softmax / log_softmax
-    float local_max = t0_neg_inf();
-    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) local_max = fmaxf(local_max, ri[i]);
-    float m = block_reduce(local_max, /*is_max=*/true);
-
-    float local_sum = 0.f;
-    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) local_sum += expf(ri[i] - m);
-    float sum = block_reduce(local_sum, /*is_max=*/false);
-
-    if (kind == NormKind::Softmax) {
-        float inv = 1.f / sum;
-        for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) ro[i] = expf(ri[i] - m) * inv;
-    } else {  // LogSoftmax
-        float lse = m + logf(sum);
-        for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) ro[i] = ri[i] - lse;
+        carry = scan_combine(carry, tile_total, kind);
     }
 }
 
 // ──────────────────────────────── sampling ───────────────────────────────
-
-// mask_apply(logits, mask): out[j] = mask[j] ? logits[j] : -inf. Unpacked bool
-// mask (materialized tier-0 form; the packed wire bitset is a D1 transport
-// detail the runtime unpacks). Grid-stride over numel.
-__global__ void k_mask_apply(const float* __restrict__ logits, const std::uint8_t* __restrict__ mask,
-                             float* __restrict__ out, std::uint64_t n) {
-    for (std::uint64_t i = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
-         i < n; i += (std::uint64_t)gridDim.x * blockDim.x) {
-        out[i] = mask[i] ? logits[i] : t0_neg_inf();
-    }
-}
-
-// gumbel(rng, [rows, len]): fresh Gumbel noise g[r,j] from the ambient per-row
-// seed S[r] and stream salt. Model B — no seed operand; the executor binds
-// row_seeds. Grid-stride over rows*len.
-__global__ void k_gumbel(const std::uint32_t* __restrict__ row_seed, std::uint32_t stream,
-                         float* __restrict__ out, std::uint32_t rows, std::uint32_t len) {
-    std::uint64_t n = (std::uint64_t)rows * len;
-    for (std::uint64_t t = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
-         t < n; t += (std::uint64_t)gridDim.x * blockDim.x) {
-        std::uint32_t row = (std::uint32_t)(t / len);
-        int col = (int)(t % len);
-        unsigned long long se = t0_seed_eff_stream(row_seed[row], stream);
-        out[t] = t0_gumbel_noise(se, col);
-    }
-}
 
 // rng (0x70, ambient seed): per-row draw from S[r] + stream salt. `gumbel`=1 →
 // Gumbel noise, else uniform in (0,1). Bit-parity with sample_temp.cu.
@@ -450,7 +579,7 @@ __global__ void k_rng_ambient(const std::uint32_t* __restrict__ row_seed, std::u
 // `gumbel`=1 → -log(-log(u)). Pure function of (key, ctr, j) — replay-exact.
 __global__ void k_rng_keyed(const std::uint32_t* __restrict__ state, float* __restrict__ out,
                             std::uint64_t numel, int gumbel) {
-    unsigned long long seed64 = t0_splitmix64(((unsigned long long)state[0] << 32) | (unsigned long long)state[1]);
+    unsigned long long seed64 = ptir_rng_keyed_seed(state[0], state[1]);
     for (std::uint64_t j = blockIdx.x * (std::uint64_t)blockDim.x + threadIdx.x;
          j < numel; j += (std::uint64_t)gridDim.x * blockDim.x) {
         float u = t0_hash_uniform(seed64, (int)j);
@@ -478,41 +607,52 @@ __global__ void k_mask_apply_packed(const float* __restrict__ logits, const std:
     }
 }
 
+enum class Tier0StructuredMaskKind : std::uint8_t {
+    Causal,
+    SlidingWindow,
+    SinkWindow,
+};
+
+__device__ __forceinline__ bool structured_position_allows(
+    std::uint32_t position,
+    std::uint32_t key,
+    Tier0StructuredMaskKind kind,
+    std::uint32_t window,
+    std::uint32_t sink) {
+    if (key > position) return false;
+    if (kind == Tier0StructuredMaskKind::Causal) return true;
+    const std::uint32_t key_plus_window =
+        window > UINT32_MAX - key ? UINT32_MAX : key + window;
+    const bool in_window = key_plus_window > position;
+    return kind == Tier0StructuredMaskKind::SlidingWindow
+        ? in_window
+        : key < sink || in_window;
+}
+
+__global__ void k_structured_position_mask(
+    const std::uint32_t* __restrict__ positions,
+    std::uint8_t* __restrict__ out,
+    std::uint32_t position_count,
+    std::uint32_t key_count,
+    Tier0StructuredMaskKind kind,
+    std::uint32_t window,
+    std::uint32_t sink) {
+    const std::uint64_t numel =
+        static_cast<std::uint64_t>(position_count) * key_count;
+    for (std::uint64_t flat =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         flat < numel;
+         flat += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        const std::uint32_t position_index =
+            static_cast<std::uint32_t>(flat / key_count);
+        const std::uint32_t key =
+            static_cast<std::uint32_t>(flat % key_count);
+        out[flat] = structured_position_allows(
+            positions[position_index], key, kind, window, sink);
+    }
+}
+
 // ────────────────────────────── order family ─────────────────────────────
-
-// rank_le(x, k): per-row bool, true iff x's rank (0 = largest) < k, i.e. fewer
-// than k elements are strictly greater. Ties may select > k entries — the exact
-// tie/NaN contract is pinned. One CTA per row.
-__global__ void k_rank_le(const float* __restrict__ in, std::uint8_t* __restrict__ out,
-                          std::uint32_t rows, std::uint32_t len, std::uint32_t k) {
-    const std::uint32_t row = blockIdx.x;
-    if (row >= rows) return;
-    const float* r = in + (std::uint64_t)row * len;
-    std::uint8_t* o = out + (std::uint64_t)row * len;
-    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
-        float v = r[i];
-        std::uint32_t greater = 0;
-        for (std::uint32_t j = 0; j < len; ++j) greater += (r[j] > v) ? 1u : 0u;
-        o[i] = (greater < k) ? 1u : 0u;
-    }
-}
-
-// pivot_threshold(score, rank_le(k)): keep entries whose rank < k, others → -inf
-// (the selection form used as an attn_page_mask / top-k truncation, §6.1). Same
-// rank rule as k_rank_le. One CTA per row.
-__global__ void k_pivot_threshold_rankle(const float* __restrict__ in, float* __restrict__ out,
-                                         std::uint32_t rows, std::uint32_t len, std::uint32_t k) {
-    const std::uint32_t row = blockIdx.x;
-    if (row >= rows) return;
-    const float* r = in + (std::uint64_t)row * len;
-    float* o = out + (std::uint64_t)row * len;
-    for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
-        float v = r[i];
-        std::uint32_t greater = 0;
-        for (std::uint32_t j = 0; j < len; ++j) greater += (r[j] > v) ? 1u : 0u;
-        o[i] = (greater < k) ? v : t0_neg_inf();
-    }
-}
 
 // ──────────────────── pivot_threshold predicates (dynamic) ───────────────
 // The three `pivot_threshold` predicates (interface/ptir interp.rs eval_op,
@@ -671,42 +811,70 @@ __global__ void k_pivot_cummassle(const float* __restrict__ in, std::uint8_t* __
 // `len`-byte "already-picked" mask in shared memory, which overflows the
 // per-block shared limit for large rows (e.g. a flattened [B*V] beam top_k over
 // the full vocab) and silently fails the launch. Instead we carry the last
-// picked (value, index) as a threshold: an element i is still available iff it
-// sorts strictly after the previous pick — `v < prev_v || (v == prev_v && i >
-// prev_i)`. O(k·len) with only the fixed-size reduction scratch.
+// picked total-order key as a threshold. Explicit validity admits +inf at index
+// zero on the first iteration; NaNs sort last; ties (including signed zero)
+// retain ascending source index. O(k·len) with fixed-size reduction scratch.
 __global__ void k_topk_rows(const float* __restrict__ in, float* __restrict__ out_val,
                             std::uint32_t* __restrict__ out_idx,
                             std::uint32_t rows, std::uint32_t len, std::uint32_t k) {
     __shared__ float sh_v[kTier0Block];
     __shared__ std::uint32_t sh_i[kTier0Block];
+    __shared__ std::uint8_t sh_nan[kTier0Block];
     __shared__ float prev_v;
     __shared__ std::uint32_t prev_i;
+    __shared__ std::uint8_t prev_nan;
+    __shared__ std::uint8_t prev_valid;
     const std::uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const float* r = in + (std::uint64_t)row * len;
 
-    // +inf threshold ⇒ the first pick sees every finite element as available.
-    if (threadIdx.x == 0) { prev_v = t0_pos_inf(); prev_i = 0; }
+    if (threadIdx.x == 0) {
+        prev_v = 0.0f;
+        prev_i = 0;
+        prev_nan = 0;
+        prev_valid = 0;
+    }
     __syncthreads();
 
     for (std::uint32_t pick = 0; pick < k; ++pick) {
-        const float pv = prev_v; const std::uint32_t pi = prev_i;
-        float best = t0_neg_inf();
+        const float pv = prev_v;
+        const std::uint32_t pi = prev_i;
+        const bool p_nan = prev_nan != 0;
+        const bool p_valid = prev_valid != 0;
+        float best = 0.0f;
         std::uint32_t bi = 0xFFFFFFFFu;
+        bool best_nan = false;
         for (std::uint32_t i = threadIdx.x; i < len; i += blockDim.x) {
             const float v = r[i];
-            // Available iff it sorts strictly after the previous pick.
-            const bool avail = (v < pv) || (v == pv && i > pi);
+            const bool v_nan = isnan(v);
+            const bool avail =
+                !p_valid || t0_desc_before(
+                    pv, pi, p_nan, v, i, v_nan);
             if (!avail) continue;
-            if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+            if (bi == 0xFFFFFFFFu ||
+                t0_desc_before(v, i, v_nan, best, bi, best_nan)) {
+                best = v;
+                bi = i;
+                best_nan = v_nan;
+            }
         }
-        sh_v[threadIdx.x] = best; sh_i[threadIdx.x] = bi;
+        sh_v[threadIdx.x] = best;
+        sh_i[threadIdx.x] = bi;
+        sh_nan[threadIdx.x] = best_nan;
         __syncthreads();
         for (std::uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
             if (threadIdx.x < s) {
-                float ov = sh_v[threadIdx.x + s]; std::uint32_t oi = sh_i[threadIdx.x + s];
-                if (ov > sh_v[threadIdx.x] || (ov == sh_v[threadIdx.x] && oi < sh_i[threadIdx.x])) {
-                    sh_v[threadIdx.x] = ov; sh_i[threadIdx.x] = oi;
+                const std::uint32_t oi = sh_i[threadIdx.x + s];
+                if (oi != 0xFFFFFFFFu &&
+                    (sh_i[threadIdx.x] == 0xFFFFFFFFu ||
+                     t0_desc_before(
+                         sh_v[threadIdx.x + s], oi,
+                         sh_nan[threadIdx.x + s] != 0,
+                         sh_v[threadIdx.x], sh_i[threadIdx.x],
+                         sh_nan[threadIdx.x] != 0))) {
+                    sh_v[threadIdx.x] = sh_v[threadIdx.x + s];
+                    sh_i[threadIdx.x] = oi;
+                    sh_nan[threadIdx.x] = sh_nan[threadIdx.x + s];
                 }
             }
             __syncthreads();
@@ -714,7 +882,10 @@ __global__ void k_topk_rows(const float* __restrict__ in, float* __restrict__ ou
         if (threadIdx.x == 0) {
             out_val[(std::uint64_t)row * k + pick] = sh_v[0];
             out_idx[(std::uint64_t)row * k + pick] = sh_i[0];
-            prev_v = sh_v[0]; prev_i = sh_i[0];
+            prev_v = sh_v[0];
+            prev_i = sh_i[0];
+            prev_nan = sh_nan[0];
+            prev_valid = 1;
         }
         __syncthreads();
     }

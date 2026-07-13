@@ -24,7 +24,7 @@
 //! Positions ports), token values host-known (seeded channel).
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 const N: u32 = 24; // prompt length: one full cached page (16) + 8-token suffix
 const PAGE_T: u32 = 16; // tokens per KV page (matches the engine store)
@@ -37,7 +37,7 @@ fn bx<T>(v: T) -> &'static T {
 /// One canonical N-token prefill over a FRESH working set; returns the greedy
 /// read-out of the last row. Everything (pass, pipeline, working set) drops
 /// before returning, so the runtime's drop-time retention runs.
-fn round(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
+async fn round(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
     let ws = WorkingSet::new();
     let toks = bx(Channel::from(tokens.to_vec()).named("toks")); // [N] i32, seeded
     let klen = bx(Channel::from(vec![N; 1]).named("klen")); // [1] total kv len
@@ -57,6 +57,7 @@ fn round(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
     let g = out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("{tag} out.take: {e}"))?[0];
     pipe.close();
     Ok(g)
@@ -66,7 +67,7 @@ fn round(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
 /// canonical pass commits the 16-token prefix, a second appends the 8-token
 /// suffix. Its read-out row is the same absolute position as `round`'s, so
 /// it isolates graft correctness from full-vs-chunked kernel numerics.
-fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
+async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
     let ws = WorkingSet::new();
     let k = PAGE_T as usize;
 
@@ -87,6 +88,7 @@ fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> 
     let _ = sink
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("{tag} sink.take: {e}"))?;
 
     let toks_b = bx(Channel::from(tokens[k..].to_vec()).named("toks_b"));
@@ -105,6 +107,7 @@ fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> 
     let g = out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("{tag} out.take: {e}"))?[0];
     pipe.close();
     Ok(g)
@@ -116,9 +119,9 @@ async fn main(input: String) -> Result<String> {
     model::configure(vocab, PAGE_T, NUM_LAYERS);
     let tokens: Vec<i32> = (0..N as i32).map(|i| (i % 31) + 1).collect();
 
-    let g0 = round(&tokens, "round0")?;
+    let g0 = round(&tokens, "round0").await?;
     println!("[prefix-cache] round 0 (cold) done: g0={g0}");
-    let g1 = round(&tokens, "round1")?;
+    let g1 = round(&tokens, "round1").await?;
     println!("[prefix-cache] round 1 (cached prefix) done: g1={g1}");
     let gc = if input.contains("chunked") {
         // Distinct tokens so the chunked rounds never hit the cache — unless
@@ -129,8 +132,8 @@ async fn main(input: String) -> Result<String> {
         } else {
             (0..N as i32).map(|i| ((i * 7) % 31) + 1).collect()
         };
-        let cold = round(&tokens_c, "round-c-cold")?;
-        let chunked = round_chunked(&tokens_c, "round-c-chunked")?;
+        let cold = round(&tokens_c, "round-c-cold").await?;
+        let chunked = round_chunked(&tokens_c, "round-c-chunked").await?;
         println!("[prefix-cache] chunked probe: cold={cold} chunked={chunked}");
         Some((cold, chunked))
     } else {
@@ -163,9 +166,9 @@ async fn main(input: String) -> Result<String> {
         }
     }
     let result = match gc {
-        Some((cold, chunked)) => format!(
-            "PREFIX_CACHE_E2E n={N} g0={g0} g1={g1} cold={cold} chunked={chunked}"
-        ),
+        Some((cold, chunked)) => {
+            format!("PREFIX_CACHE_E2E n={N} g0={g0} g1={g1} cold={cold} chunked={chunked}")
+        }
         None => format!("PREFIX_CACHE_E2E n={N} g0={g0} g1={g1}"),
     };
     println!("{result}");

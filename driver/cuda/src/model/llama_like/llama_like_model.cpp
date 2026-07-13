@@ -27,13 +27,22 @@ LlamaLikeModel::LlamaLikeModel(
     // newly-active pages stale, so we gate graph_safe on native BF16.
     caps_.graph_safe = kv_cache_.format().is_native_bf16();
     caps_.supports_compact_logits = true;
+    caps_.supports_runtime_window = true;
     caps_.supports_tp_greedy_argmax = supports_tp_greedy_argmax;
 }
 
 void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
                              const ForwardFn::PrepareInputs& in) {
+    LlamaLikeForwardCfg runtime_cfg = fwd_cfg_;
+    if (in.runtime_window_left >= -1) {
+        runtime_cfg.sliding_window = in.runtime_window_left;
+        runtime_cfg.per_layer_window_left.clear();
+        if (in.runtime_window_left >= 0) {
+            runtime_cfg.use_xqa_decode = false;
+        }
+    }
     prepare_llama_like_decode_plan(
-        plan_, attn_ws, kv_cache_, hf_config_, fwd_cfg_,
+        plan_, attn_ws, kv_cache_, hf_config_, runtime_cfg,
         in.qo_indptr_h,
         in.kv_page_indices_d,
         in.kv_page_indptr_h,
@@ -61,7 +70,8 @@ void LlamaLikeModel::body(Workspace& ws,
         in.logit_row_indices_d, in.num_logit_rows,
         in.tp_greedy_argmax,
         in.custom_mask_d, in.custom_mask_indptr_d,
-        in.w_page_d, in.w_off_d, in.has_write_desc);
+        in.w_page_d, in.w_off_d, in.has_write_desc,
+        in.runtime_window_left);
 }
 
 std::uint32_t LlamaLikeModel::graph_layout() {

@@ -164,6 +164,9 @@ void qwen3_5_forward_paged(
     bool is_pure_decode,
     const std::uint8_t* mask_d,
     const std::int32_t* mask_indptr_d,
+    const std::uint32_t* w_page_d = nullptr,
+    const std::uint32_t* w_off_d = nullptr,
+    bool has_write_desc = false,
     const std::int32_t* slot_ids_h = nullptr,
     const std::uint8_t* is_fresh_h = nullptr,
     const std::int32_t* slot_ids_d = nullptr,
@@ -174,6 +177,7 @@ void qwen3_5_forward_paged(
     // per-request CSR of buffered-slab pool ids + direction flags.
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
+    const std::int32_t* rs_fold_lens_d = nullptr,
     bool rs_buffer_write = false,
     bool rs_buffer_fold = false);
 

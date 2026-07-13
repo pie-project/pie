@@ -105,6 +105,8 @@ pub enum RsError {
     IndexOutOfRange { index: u32, size: u32 },
     #[error("rs working set: duplicate index {index}")]
     DuplicateIndex { index: u32 },
+    #[error("rs batch contains the same working set more than once")]
+    DuplicateWorkingSet,
     #[error("rs working set: permutation is not a bijection over 0..{size}")]
     BadPermutation { size: u32 },
     #[error(
@@ -452,20 +454,53 @@ impl RsStore {
     /// buffer repoints, advance the fold boundary, release displaced slots
     /// after the epoch retires.
     pub fn commit(&mut self, prepared: RsPreparedWrite, epoch: u64) -> Result<(), RsError> {
-        let ws = prepared.ws;
-        self.entry(ws)?; // released mid-flight is a caller bug; surface it
+        self.commit_batch(vec![prepared], epoch)
+    }
 
+    /// Atomically commit every recurrent-state row of one forward fire.
+    ///
+    /// All working sets are validated before any mapping is changed. If a
+    /// handle was released or the batch aliases one working set twice, every
+    /// prepared target is aborted and no row is adopted.
+    pub fn commit_batch(
+        &mut self,
+        prepared: Vec<RsPreparedWrite>,
+        epoch: u64,
+    ) -> Result<(), RsError> {
+        let validation = (|| {
+            let mut seen = Vec::with_capacity(prepared.len());
+            for write in &prepared {
+                self.entry(write.ws)?;
+                if seen.contains(&write.ws) {
+                    return Err(RsError::DuplicateWorkingSet);
+                }
+                seen.push(write.ws);
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            self.abort_batch(prepared, epoch);
+            return Err(error);
+        }
+        for write in prepared {
+            self.commit_prevalidated(write, epoch);
+        }
+        Ok(())
+    }
+
+    fn commit_prevalidated(&mut self, prepared: RsPreparedWrite, epoch: u64) {
+        let ws = prepared.ws;
         if let Some(state) = &prepared.state {
-            let old = self.entry(ws)?.folded;
+            let old = self.entry(ws).expect("batch prevalidated").folded;
             if old != Some(state.slot) {
                 self.refs.insert(state.slot, 1);
-                self.entry_mut(ws)?.folded = Some(state.slot);
+                self.entry_mut(ws).expect("batch prevalidated").folded = Some(state.slot);
                 if let Some(old) = old {
                     self.decref(old, epoch);
                 }
             }
             if let Some(tokens) = state.fold_tokens {
-                self.advance_fold(ws, tokens, epoch)?;
+                self.advance_fold(ws, tokens, epoch);
             }
         }
 
@@ -473,18 +508,19 @@ impl RsStore {
             match *target {
                 RsBufferTarget::Fresh { index, dst } => {
                     self.refs.insert(dst, 1);
-                    self.entry_mut(ws)?.buffer[index as usize] = Some(dst);
+                    self.entry_mut(ws).expect("batch prevalidated").buffer[index as usize] =
+                        Some(dst);
                 }
                 RsBufferTarget::Cow { index, src, dst } => {
                     self.refs.insert(dst, 1);
-                    self.entry_mut(ws)?.buffer[index as usize] = Some(dst);
+                    self.entry_mut(ws).expect("batch prevalidated").buffer[index as usize] =
+                        Some(dst);
                     self.decref(src, epoch);
                 }
                 RsBufferTarget::InPlace { .. } => {}
             }
         }
         self.in_flight = self.in_flight.saturating_sub(1);
-        Ok(())
     }
 
     /// Driver failure/poison/dummy-run: release pending slots; the committed
@@ -494,6 +530,12 @@ impl RsStore {
         self.in_flight = self.in_flight.saturating_sub(1);
     }
 
+    pub fn abort_batch(&mut self, prepared: Vec<RsPreparedWrite>, epoch: u64) {
+        for write in prepared {
+            self.abort(write, epoch);
+        }
+    }
+
     pub fn retire_through(&mut self, epoch: u64) {
         self.pool.retire_through(epoch);
     }
@@ -501,15 +543,14 @@ impl RsStore {
     /// Advance the folded boundary after a committed fold: drop the head
     /// buffer pages fully covered by the folded prefix; a partial tail page
     /// stays buffered (the inferlet owns token<->slot bookkeeping).
-    fn advance_fold(&mut self, ws: RsWorkingSetId, tokens: u32, epoch: u64) -> Result<(), RsError> {
-        let entry = self.entry_mut(ws)?;
+    fn advance_fold(&mut self, ws: RsWorkingSetId, tokens: u32, epoch: u64) {
+        let entry = self.entry_mut(ws).expect("batch prevalidated");
         let page = entry.geom.buffer_page_tokens.max(1);
         let drop = ((tokens / page) as usize).min(entry.buffer.len());
         let dropped: Vec<RsSlotId> = entry.buffer.drain(..drop).flatten().collect();
         for id in dropped {
             self.decref(id, epoch);
         }
-        Ok(())
     }
 
     // ------------------------------------------------------------------
