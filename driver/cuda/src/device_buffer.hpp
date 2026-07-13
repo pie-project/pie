@@ -46,10 +46,16 @@ public:
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
     DeviceBuffer(DeviceBuffer&& o) noexcept
-        : ptr_(o.ptr_), count_(o.count_), h_pinned_(o.h_pinned_) {
+        : ptr_(o.ptr_),
+          count_(o.count_),
+          h_pinned_(o.h_pinned_),
+          h_pinned_copy_done_(o.h_pinned_copy_done_),
+          h_pinned_copy_pending_(o.h_pinned_copy_pending_) {
         o.ptr_ = nullptr;
         o.count_ = 0;
         o.h_pinned_ = nullptr;
+        o.h_pinned_copy_done_ = nullptr;
+        o.h_pinned_copy_pending_ = false;
     }
 
     DeviceBuffer& operator=(DeviceBuffer&& o) noexcept {
@@ -58,9 +64,13 @@ public:
             ptr_ = o.ptr_;
             count_ = o.count_;
             h_pinned_ = o.h_pinned_;
+            h_pinned_copy_done_ = o.h_pinned_copy_done_;
+            h_pinned_copy_pending_ = o.h_pinned_copy_pending_;
             o.ptr_ = nullptr;
             o.count_ = 0;
             o.h_pinned_ = nullptr;
+            o.h_pinned_copy_done_ = nullptr;
+            o.h_pinned_copy_pending_ = false;
         }
         return *this;
     }
@@ -134,10 +144,13 @@ public:
         }
         if (src.empty()) return;
         ensure_pinned_staging();
+        await_pinned_staging();
         std::memcpy(h_pinned_, src.data(), src.size() * sizeof(T));
         CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_,
                                    src.size() * sizeof(T),
                                    cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventRecord(h_pinned_copy_done_, nullptr));
+        h_pinned_copy_pending_ = true;
     }
 
     // Same as `copy_from_host(span<const T>)` but takes a raw byte view —
@@ -152,9 +165,12 @@ public:
         }
         if (bytes.empty()) return;
         ensure_pinned_staging();
+        await_pinned_staging();
         std::memcpy(h_pinned_, bytes.data(), bytes.size());
         CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_, bytes.size(),
                                    cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventRecord(h_pinned_copy_done_, nullptr));
+        h_pinned_copy_pending_ = true;
     }
 
     T*       data()       noexcept { return ptr_; }
@@ -172,6 +188,14 @@ public:
 
 private:
     void reset() noexcept {
+        if (h_pinned_copy_pending_) {
+            cudaEventSynchronize(h_pinned_copy_done_);
+            h_pinned_copy_pending_ = false;
+        }
+        if (h_pinned_copy_done_) {
+            cudaEventDestroy(h_pinned_copy_done_);
+            h_pinned_copy_done_ = nullptr;
+        }
         if (ptr_) {
             // Best effort — driver shutdown may have already torn the
             // context down; we don't surface errors from a destructor.
@@ -193,11 +217,27 @@ private:
         if (h_pinned_ != nullptr) return;
         if (count_ == 0) return;
         CUDA_CHECK(cudaMallocHost(&h_pinned_, count_ * sizeof(T)));
+        try {
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &h_pinned_copy_done_, cudaEventDisableTiming));
+        } catch (...) {
+            cudaFreeHost(h_pinned_);
+            h_pinned_ = nullptr;
+            throw;
+        }
+    }
+
+    void await_pinned_staging() {
+        if (!h_pinned_copy_pending_) return;
+        CUDA_CHECK(cudaEventSynchronize(h_pinned_copy_done_));
+        h_pinned_copy_pending_ = false;
     }
 
     T* ptr_ = nullptr;
     std::size_t count_ = 0;
     T* h_pinned_ = nullptr;
+    cudaEvent_t h_pinned_copy_done_ = nullptr;
+    bool h_pinned_copy_pending_ = false;
 };
 
 template <class T>

@@ -1270,11 +1270,14 @@ impl BatchScheduler {
                         progress = true;
                         continue;
                     }
-                    let result = request
-                        .preparation
-                        .as_mut()
-                        .expect("prepare item carries a preparation")(
-                        &mut request.request
+                    let result = crate::probe_fire!(
+                        stats.fire.pre_dispatch.fire_prepare_us,
+                        request
+                            .preparation
+                            .as_mut()
+                            .expect("prepare item carries a preparation")(
+                            &mut request.request
+                        )
                     );
                     match result {
                         Ok(prepared) => {
@@ -1352,15 +1355,18 @@ impl BatchScheduler {
                         }
                     }
                     let before = in_flight_launches.len();
-                    let dispatched = Self::dispatch_launch_batch(
-                        driver,
-                        instances,
-                        pending,
-                        in_flight_launches,
-                        page_size,
-                        limits,
-                        stats,
-                        policy,
+                    let dispatched = crate::probe_fire!(
+                        stats.fire.execute.total_us,
+                        Self::dispatch_launch_batch(
+                            driver,
+                            instances,
+                            pending,
+                            in_flight_launches,
+                            page_size,
+                            limits,
+                            stats,
+                            policy,
+                        )
                     );
                     // Only a batch that actually reached `in_flight_launches`
                     // (the driver accepted the launch) increments the
@@ -1754,7 +1760,10 @@ impl BatchScheduler {
             candidate_epochs.push(instance.next_target_epoch);
         }
         match driver.as_mut() {
-            Some(driver) => match driver.launch(&submission) {
+            Some(driver) => match crate::probe_fire!(
+                stats.fire.execute.driver_fire_us,
+                driver.launch(&submission)
+            ) {
                 Ok(completion) => {
                     for (request, &epoch) in requests.iter().zip(candidate_epochs.iter()) {
                         request.completion.commit_target_epoch(epoch);

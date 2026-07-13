@@ -40,10 +40,15 @@ public:
     std::size_t float_bytes() const noexcept { return float_buf_.nbytes(); }
     std::size_t int_bytes()   const noexcept { return int_buf_.nbytes(); }
 
+    void begin_plan_update();
+    void end_plan_update(cudaStream_t stream);
+
 private:
     DeviceTensor float_buf_;       // device
     DeviceTensor int_buf_;         // device
     void* page_locked_int_ = nullptr;  // host pinned, same size as int_buf_
+    cudaEvent_t plan_upload_done_ = nullptr;
+    bool plan_upload_pending_ = false;
 };
 
 // FlashInfer decode is only a win for certain GQA ratios — for the rest

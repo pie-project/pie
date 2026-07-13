@@ -19,10 +19,10 @@ use super::stats::SchedulerStats;
 use super::worker::FireClause;
 use crate::scheduler::ProcessId;
 
-/// Default run-ahead depth: one batch computing plus up to three prefetched.
+/// Default run-ahead depth: one batch computing plus one prefetched.
 /// Override via `PIE_SCHED_MAX_IN_FLIGHT`
 /// (see [`configured_max_in_flight`]).
-const DEFAULT_MAX_IN_FLIGHT: usize = 4;
+const DEFAULT_MAX_IN_FLIGHT: usize = 2;
 
 const COLD_HOLD_US: u64 = 2_000;
 

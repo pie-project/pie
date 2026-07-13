@@ -1149,6 +1149,7 @@ void handle_fire_batch(
         // plan state for the captured body to read. Lives outside any
         // capture region so the host work re-runs every fire.
         if (!rs_is_fold) {
+            attn_ws.begin_plan_update();
             forward_fn.invoke_prepare(
                 attn_ws,
                 ForwardFn::PrepareInputs{
@@ -1171,6 +1172,7 @@ void handle_fire_batch(
                     .is_pure_decode = is_pure_decode,
                     .runtime_window_left = structured_window_left,
                 });
+            attn_ws.end_plan_update(cublas.stream());
         }
 
         forward_fn.invoke_set_logits_argmax_only(false);

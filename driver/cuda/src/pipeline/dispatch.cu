@@ -111,7 +111,6 @@ struct StagedLaunch::State {
     std::vector<std::uint64_t> touched_instances;
     std::uint32_t* device_layer = nullptr;
     cudaEvent_t source_ready = nullptr;
-    cudaEvent_t callback_ready = nullptr;
     cudaEvent_t phase_done[2] = {nullptr, nullptr};
     cudaEvent_t signature_ready = nullptr;
     cudaEvent_t signature_done[
@@ -141,10 +140,6 @@ StagedLaunch::~StagedLaunch() {
     if (state_->source_ready != nullptr) {
         cudaEventDestroy(state_->source_ready);
         state_->source_ready = nullptr;
-    }
-    if (state_->callback_ready != nullptr) {
-        cudaEventDestroy(state_->callback_ready);
-        state_->callback_ready = nullptr;
     }
     for (cudaEvent_t& event : state_->phase_done) {
         if (event != nullptr) {
@@ -1307,8 +1302,6 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
         stream));
     CUDA_CHECK(cudaEventCreateWithFlags(
         &state.source_ready, cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventCreateWithFlags(
-        &state.callback_ready, cudaEventDisableTiming));
     for (cudaEvent_t& event : state.phase_done) {
         CUDA_CHECK(cudaEventCreateWithFlags(
             &event, cudaEventDisableTiming));
@@ -1663,9 +1656,7 @@ bool Dispatch::finish(
         throw;
     }
 
-    sampling_ir::FrameCarrierEngine& carrier =
-        sampling_ir::FrameCarrierEngine::instance();
-    cudaStream_t callback_stream = carrier.copy_stream();
+    cudaStream_t callback_stream = stream;
     auto notify = std::make_unique<NotifyContext>();
     if (runtime != nullptr) notify->runtime = *runtime;
     notify->completion = completion;
@@ -1676,9 +1667,6 @@ bool Dispatch::finish(
         lane.bound->instance->finalize_commit(
             stream, lane.snapshot->device);
     }
-    CUDA_CHECK(cudaEventRecord(state.callback_ready, stream));
-    CUDA_CHECK(cudaStreamWaitEvent(
-        callback_stream, state.callback_ready, 0));
     for (auto& lane_ptr : state.lanes) {
         StagedLane& lane = *lane_ptr;
         BoundInstance& bound = *lane.bound;
@@ -2020,6 +2008,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
     };
     std::vector<PortCopy> port_copies;
     std::vector<std::uint32_t> ready(n_prog, 1);
+    bool copied_readiness = false;
     cudaStream_t descriptor_stream =
         staged == nullptr ? nullptr : staged->stream;
     for (std::size_t p = 0; p < n_prog; ++p) {
@@ -2066,6 +2055,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 sizeof(std::uint32_t),
                 cudaMemcpyDeviceToHost,
                 descriptor_stream));
+            copied_readiness = true;
         }
     }
     for (const PortCopy& copy : port_copies) {
@@ -2085,7 +2075,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 descriptor_stream));
         }
     }
-    if (staged != nullptr || !port_copies.empty()) {
+    if (copied_readiness || !port_copies.empty()) {
         CUDA_CHECK(cudaStreamSynchronize(descriptor_stream));
     }
 
