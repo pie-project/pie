@@ -1441,6 +1441,7 @@ async fn fire_device_geometry<C: FireContext>(
         rs_slot_flags,
         rs_copy_src,
         rs_copy_dst,
+        resolved_qo_indptr,
         rstxns,
     ) = {
         // Fail-fast.
@@ -1609,8 +1610,8 @@ async fn fire_device_geometry<C: FireContext>(
         };
         // Device geometry resolves B request rows in-graph. Validate the bound
         // RS list against that resolved arity before the launch and prepare one
-        // folded target per row. The wire `qo_indptr` itself remains
-        // driver-resolved; this host vector carries only its known row count.
+        // folded target per row. The zero-valued `qo_indptr` carries only the
+        // known row count; the driver still resolves its values in-graph.
         let resolved_qo_indptr = vec![0; devgeo.b + 1];
         let prepared_rs = prepare_bound_rs(
             ctx,
@@ -1690,11 +1691,13 @@ async fn fire_device_geometry<C: FireContext>(
             rs_slot_flags,
             rs_copy_src,
             rs_copy_dst,
+            resolved_qo_indptr,
             rstxns,
         )
     };
 
     let mut req = crate::driver::LaunchPlan::default();
+    req.qo_indptr = resolved_qo_indptr;
     req.kv_translation = kv_translation;
     req.kv_translation_version = kv_translation_version;
     req.rs_slot_ids = rs_slot_ids;
@@ -1706,10 +1709,11 @@ async fn fire_device_geometry<C: FireContext>(
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
     let last_page_len = wire_pages.last().map(|_| page_size).unwrap_or(0);
-    let submit_error = crate::scheduler::submit_prebuilt_async_with_kv_and_rs_copy(
+    let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy(
         req,
         0,
         instance_id,
+        pid,
         wire_pages,
         last_page_len,
         completion.clone(),

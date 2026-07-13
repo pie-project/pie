@@ -22,6 +22,7 @@ mod common;
 
 use std::path::Path;
 use std::process::Command;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use pie_client::client::Client;
@@ -96,15 +97,19 @@ async fn concurrent_runahead_matches_sequential() -> Result<()> {
     // Reference: run ALONE, sequentially (no concurrency) — the carrier's RETAIN
     // strictly precedes its INJECT with no co-batch merge.
     let mut reference = Vec::new();
+    let sequential_start = Instant::now();
     for k in 0..FLEET {
         let r = run_one(&addr).await.ok().flatten();
         eprintln!("[runahead-conc] seq[{k}] = {r:?}");
         reference.push(r);
     }
+    let sequential_elapsed = sequential_start.elapsed();
 
     // Concurrent: launch the whole fleet at once → forces co-batched fires whose
     // producer→consumer carrier links must survive the concurrent merge.
+    let concurrent_start = Instant::now();
     let concurrent = run_fleet_concurrent(&addr).await;
+    let concurrent_elapsed = concurrent_start.elapsed();
 
     let mut n_ok = 0usize;
     for k in 0..FLEET {
@@ -121,6 +126,16 @@ async fn concurrent_runahead_matches_sequential() -> Result<()> {
     }
     eprintln!(
         "[runahead-conc] {n_ok}/{FLEET} concurrent pipelined streams == their sequential reference"
+    );
+    let output_tokens = (FLEET * 8) as f64;
+    eprintln!(
+        "[runahead-conc] sequential={:.3}s ({:.1} output tok/s) \
+         concurrent={:.3}s ({:.1} output tok/s) speedup={:.2}x",
+        sequential_elapsed.as_secs_f64(),
+        output_tokens / sequential_elapsed.as_secs_f64(),
+        concurrent_elapsed.as_secs_f64(),
+        output_tokens / concurrent_elapsed.as_secs_f64(),
+        sequential_elapsed.as_secs_f64() / concurrent_elapsed.as_secs_f64(),
     );
 
     assert_eq!(

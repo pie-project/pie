@@ -114,12 +114,32 @@ impl Session {
                         serde_json::Value::from(inf.fire.avg_recv_block_wait_us),
                     );
                     stats.insert(
+                        format!("{}.fire.inter_fire_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.inter_fire_us_sum),
+                    );
+                    stats.insert(
+                        format!("{}.fire.post_dispatch_to_fire_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.post_dispatch_to_fire_us_sum),
+                    );
+                    stats.insert(
+                        format!("{}.fire.recv_block_wait_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.recv_block_wait_us_sum),
+                    );
+                    stats.insert(
                         format!("{}.fire.accumulate.accum_loop_us", model_name),
                         serde_json::Value::from(inf.fire.accumulate.avg_accum_loop_us),
                     );
                     stats.insert(
+                        format!("{}.fire.accumulate.accum_loop_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.accumulate.accum_loop_us_sum),
+                    );
+                    stats.insert(
                         format!("{}.fire.pre_dispatch.fire_prepare_us", model_name),
                         serde_json::Value::from(inf.fire.pre_dispatch.avg_fire_prepare_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.pre_dispatch.fire_prepare_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.pre_dispatch.fire_prepare_us_sum),
                     );
                     stats.insert(
                         format!("{}.fire.execute.total_us", model_name),
@@ -134,6 +154,18 @@ impl Session {
                         serde_json::Value::from(inf.fire.execute.avg_driver_fire_us),
                     );
                     stats.insert(
+                        format!("{}.fire.execute.total_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.execute.total_us_sum),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.batch_build_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.execute.batch_build_us_sum),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_fire_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_fire_us_sum),
+                    );
+                    stats.insert(
                         format!("{}.fire.post_dispatch.context_tick_us", model_name),
                         serde_json::Value::from(inf.fire.post_dispatch.avg_context_tick_us),
                     );
@@ -142,12 +174,28 @@ impl Session {
                         serde_json::Value::from(inf.fire.post_dispatch.avg_stats_update_us),
                     );
                     stats.insert(
+                        format!("{}.fire.post_dispatch.context_tick_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.post_dispatch.context_tick_us_sum),
+                    );
+                    stats.insert(
+                        format!("{}.fire.post_dispatch.stats_update_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.post_dispatch.stats_update_us_sum),
+                    );
+                    stats.insert(
                         format!("{}.fire.quorum.inter_batch_bubble_us", model_name),
                         serde_json::Value::from(inf.fire.quorum.avg_inter_batch_bubble_us),
                     );
                     stats.insert(
                         format!("{}.fire.quorum.quorum_latency_us", model_name),
                         serde_json::Value::from(inf.fire.quorum.avg_quorum_latency_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.inter_batch_bubble_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.quorum.inter_batch_bubble_us_sum),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.quorum_latency_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.quorum.quorum_latency_us_sum),
                     );
                     stats.insert(
                         format!("{}.fire.quorum.escape_fires", model_name),
@@ -166,8 +214,32 @@ impl Session {
                         serde_json::Value::from(inf.fire.quorum.cold_hold_fires),
                     );
                     stats.insert(
+                        format!("{}.fire.quorum.cold_hold_us_sum", model_name),
+                        serde_json::Value::from(inf.fire.quorum.cold_hold_us_sum),
+                    );
+                    stats.insert(
                         format!("{}.fire.quorum.readiness_miss", model_name),
                         serde_json::Value::from(inf.fire.quorum.readiness_miss),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.avg_active_pipelines_at_fire", model_name),
+                        serde_json::Value::from(inf.fire.quorum.avg_active_pipelines_at_fire),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.avg_missing_at_fire", model_name),
+                        serde_json::Value::from(inf.fire.quorum.avg_missing_at_fire),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.wave_active_sum", model_name),
+                        serde_json::Value::from(inf.fire.quorum.wave_active_sum),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.wave_missing_sum", model_name),
+                        serde_json::Value::from(inf.fire.quorum.wave_missing_sum),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.wave_fires", model_name),
+                        serde_json::Value::from(inf.fire.quorum.wave_fires),
                     );
                 }
 

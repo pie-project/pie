@@ -48,10 +48,13 @@ fn default_top_p() -> f32 {
 
 /// In-graph top-p + temperature sampler over the read-out row logits `[1,vocab]`.
 /// `r` is the taken `[2]` u32 rng state (`[key, ctr]`) driving the Gumbel noise.
-/// Returns the sampled token `[1]` i32. Temperature is clamped to a small epsilon
-/// so a `0` request degrades to near-greedy rather than dividing by zero.
+/// Returns the sampled token `[1]` i32. Zero temperature is exact greedy
+/// decoding; positive temperatures use nucleus sampling.
 fn sample_token(r: &Taken, temperature: f32, top_p: f32, vocab: u32) -> Tensor {
     let logits = intrinsics::logits(); // [1, vocab] f32 (read-out row)
+    if temperature == 0.0 {
+        return cast(&reduce_argmax(&logits), dtype::i32);
+    }
     let scaled = div(&logits, temperature.max(1e-4));
     let _ = vocab;
     nucleus_sample(&scaled, top_p, r)

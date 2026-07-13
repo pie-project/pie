@@ -518,6 +518,7 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
   CUDA::cublas
   CUDA::cublasLt
   CUDA::cuda_driver
+  CUDA::nvrtc
   ${NCCL_LIBRARY}
 )
 
@@ -710,7 +711,7 @@ pie_add_cuda_target(test_ptir_graph_key
   INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR}
-  LIBS CUDA::cudart)
+  LIBS CUDA::cudart tomlplusplus::tomlplusplus)
 pie_add_cuda_target(test_frame_carrier_device
   SOURCES
     tests/test_frame_carrier_device.cpp
@@ -725,7 +726,7 @@ pie_add_cuda_target(test_pipeline_dispatch_bind
     src/pipeline/frame_carrier.cpp
     src/pipeline/frame_carrier_kernels.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
-  LIBS CUDA::cudart CUDA::cuda_driver
+  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 # Same-instance run-ahead concurrency gate; build with -fsanitize=thread for the TSAN run.
 pie_add_cuda_target(test_pipeline_dispatch_race
@@ -735,7 +736,7 @@ pie_add_cuda_target(test_pipeline_dispatch_race
     src/pipeline/frame_carrier.cpp
     src/pipeline/frame_carrier_kernels.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
-  LIBS CUDA::cudart CUDA::cuda_driver
+  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 pie_add_cuda_target(test_ptir_tier0
   SOURCES tests/ptir_tier0_test.cu
@@ -760,6 +761,15 @@ pie_add_cuda_target(test_ptir_tier1
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR}
   LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
+pie_add_cuda_target(test_ptir_generated_singleton
+  SOURCES tests/ptir_generated_singleton_test.cu
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
+  TEST_ARGS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir)
 pie_add_cuda_target(test_ptir_grouped
   SOURCES tests/ptir_grouped_test.cu
   INCLUDE_DIRS
@@ -777,7 +787,7 @@ pie_add_cuda_target(test_ptir_grouped_dispatch
     ${CMAKE_CURRENT_SOURCE_DIR}/tests
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR}
-  LIBS CUDA::cudart CUDA::cuda_driver
+  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
   TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   pie_add_cuda_target(test_ptir_grouped_dispatch_asan
@@ -790,7 +800,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       ${CMAKE_CURRENT_SOURCE_DIR}/tests
       ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
       ${PIE_DRIVER_ABI_INCLUDE_DIR}
-    LIBS CUDA::cudart CUDA::cuda_driver
+    LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
     TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
   target_compile_options(test_ptir_grouped_dispatch_asan PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address>

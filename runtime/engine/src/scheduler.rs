@@ -547,6 +547,41 @@ pub fn submit_prebuilt_async_with_kv_and_rs_copy(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
+    request: crate::driver::LaunchPlan,
+    driver_idx: usize,
+    instance_id: u64,
+    pipeline_id: ProcessId,
+    physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
+    last_page_len: u32,
+    completion: crate::driver::WorkItemCompletion,
+    copy_src: Vec<u32>,
+    copy_dst: Vec<u32>,
+    rs_copy_src: Vec<u32>,
+    rs_copy_dst: Vec<u32>,
+) -> Result<()> {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
+        src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_device_ordinal: 0,
+        dst_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_device_ordinal: 0,
+        src_page_ids: copy_src,
+        dst_page_ids: copy_dst,
+        cells: Vec::new(),
+    });
+    scheduler_handle(driver_idx)?.submit_prebuilt_tracked_with_copy(
+        request,
+        instance_id,
+        completion,
+        physical_page_ids,
+        last_page_len,
+        pipeline_id,
+        prelaunch_copy,
+        rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
+    )
+}
+
 /// Returns aggregated scheduler stats across every registered driver
 /// (lock-free, non-blocking — the per-driver `SchedulerStats` are plain
 /// atomics, so this needs no actor round-trip).

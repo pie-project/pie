@@ -3614,14 +3614,6 @@ inline bool grouped_stage_supported(
                 return fail("channel value size does not match fixed cell");
             }
         }
-        if (std::any_of(
-                first->ops.begin(), first->ops.end(),
-                [](const plan::NormalizedOp& op) {
-                    return op.op.tag == PTIR_OP_RNG;
-                }) &&
-            lane.row_seeds == nullptr) {
-            return fail("ambient RNG lane has no row seed table");
-        }
     }
     std::unordered_map<std::uint32_t, bool> slots;
     for (const GroupedLaneBinding& lane : lanes) {
@@ -5267,7 +5259,7 @@ class GroupedTier0Executor {
         return result;
     }
 
-  private:
+  public:
     static void launch_op(
         const container::COp& op,
         const plan::StagePlan& stage,

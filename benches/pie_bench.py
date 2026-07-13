@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import os
@@ -35,7 +36,6 @@ if str(SERVER_SDK) not in sys.path:
 
 
 EMBEDDED_CLI_DRIVERS: set[str] = {
-    "cuda_native",
     "dummy",
     "vllm",
     "sglang",
@@ -79,6 +79,84 @@ def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return int(s.getsockname()[1])
+
+
+def embedded_engine_identity() -> dict[str, str]:
+    from pie import _engine
+
+    engine_path = Path(_engine.__file__).resolve()
+    source_suffixes = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".rs"}
+    source_roots = (
+        ROOT / "driver",
+        ROOT / "interface",
+        ROOT / "runtime",
+        ROOT / "sdk" / "python-server" / "src",
+    )
+    newest_source = max(
+        (
+            path
+            for root in source_roots
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix in source_suffixes
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+    if engine_path.stat().st_mtime_ns < newest_source.stat().st_mtime_ns:
+        raise RuntimeError(
+            f"embedded engine {engine_path} is older than {newest_source}; "
+            "rebuild with PIE_COMPILER_LAUNCHER=env CARGO_BUILD_JOBS=2 "
+            "CMAKE_BUILD_PARALLEL_LEVEL=2 uv --project sdk/python-server sync "
+            "--reinstall-package pie-server"
+        )
+    digest = hashlib.sha256()
+    with engine_path.open("rb") as engine:
+        for chunk in iter(lambda: engine.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "embedded engine": str(engine_path),
+        "embedded engine sha256": digest.hexdigest(),
+    }
+
+
+def is_cumulative_status_key(key: str) -> bool:
+    suffix = key.rsplit(".", 1)[-1]
+    return (
+        suffix.endswith("_sum")
+        or suffix
+        in {
+            "batch_size_hist",
+            "bypass_hits",
+            "chain_drops",
+            "chain_submits",
+            "cold_hold_fires",
+            "cumulative_batch_latency_us",
+            "escape_fires",
+            "readiness_miss",
+            "spec_attempted",
+            "spec_budget_skipped",
+            "spec_dropped_orphan",
+            "spec_hits",
+            "spec_misses",
+            "spec_need_pages",
+            "spec_rule_skipped",
+            "submit_ahead_fires",
+            "total_batches",
+            "total_requests_processed",
+            "total_tokens_processed",
+            "wave_fires",
+        }
+    )
+
+
+def measured_average(
+    status: dict[str, Any],
+    numerator_key: str,
+    denominator: int | float,
+    output_key: str,
+) -> None:
+    numerator = status.get(numerator_key)
+    if isinstance(numerator, (int, float)) and denominator > 0:
+        status[output_key] = numerator / denominator
 
 
 def build_config(args: argparse.Namespace):
@@ -193,15 +271,18 @@ def build_config(args: argparse.Namespace):
         max_concurrent_processes = None  # serializer drops field → unlimited
     else:
         max_concurrent_processes = args.concurrency
-    scheduler_kwargs = {
+    requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,
         "admission_oversubscription_factor": args.admission_oversubscription_factor,
     }
-    if (
-        args.speculation_depth is not None
-        and "speculation_depth" in inspect.signature(SchedulerConfig).parameters
-    ):
+    scheduler_parameters = inspect.signature(SchedulerConfig).parameters
+    scheduler_kwargs = {
+        key: value
+        for key, value in requested_scheduler_kwargs.items()
+        if key in scheduler_parameters
+    }
+    if args.speculation_depth is not None and "speculation_depth" in scheduler_parameters:
         scheduler_kwargs["speculation_depth"] = args.speculation_depth
 
     cfg = Config(
@@ -217,19 +298,17 @@ def build_config(args: argparse.Namespace):
             wasm_max_instances=max(4096, (args.num_requests + args.warmup) * 4),
             **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
-        models=[
-            ModelConfig(
-                name="default",
-                hf_repo=args.model,
-                scheduler=SchedulerConfig(**scheduler_kwargs),
-                driver=DriverConfig(
-                    type=args.driver,
-                    device=device,
-                    tensor_parallel_size=args.tp_size,
-                    options=driver_options,
-                ),
+        model=ModelConfig(
+            name="default",
+            hf_repo=args.model,
+            scheduler=SchedulerConfig(**scheduler_kwargs),
+            driver=DriverConfig(
+                type=args.driver,
+                device=device,
+                tensor_parallel_size=args.tp_size,
+                options=driver_options,
             )
-        ],
+        ),
     )
     config_blob = {
         "driver": args.driver,
@@ -249,8 +328,9 @@ async def python_pie_client(args: argparse.Namespace):
     from pie.server import Server
 
     cfg, engine_config = build_config(args)
+    engine_identity = embedded_engine_identity()
     async with Server(cfg) as server:
-        yield await server.connect(), engine_config
+        yield await server.connect(), {**engine_config, **engine_identity}
 
 
 @asynccontextmanager
@@ -272,9 +352,9 @@ async def cli_pie_client(args: argparse.Namespace):
 
     proc = await asyncio.create_subprocess_exec(
         str(pie_bin),
-        "serve",
         "--config",
         str(cfg_path),
+        "serve",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
@@ -640,12 +720,99 @@ async def run(args: argparse.Namespace):
                 model_status: dict[str, Any] = {}
                 for k, v in model_status_raw.items():
                     pre = pre_stats.get(k)
-                    if isinstance(v, (int, float)) and isinstance(pre, (int, float)):
+                    if (
+                        is_cumulative_status_key(k)
+                        and isinstance(v, (int, float))
+                        and isinstance(pre, (int, float))
+                    ):
                         model_status[k] = v - pre
-                    elif isinstance(v, list) and isinstance(pre, list) and len(v) == len(pre):
+                    elif (
+                        is_cumulative_status_key(k)
+                        and isinstance(v, list)
+                        and isinstance(pre, list)
+                        and len(v) == len(pre)
+                    ):
                         model_status[k] = [a - b for a, b in zip(v, pre)]
                     else:
                         model_status[k] = v
+                measured_batches = model_status.get("default.total_batches", 0)
+                if isinstance(measured_batches, (int, float)):
+                    measured_average(
+                        model_status,
+                        "default.cumulative_batch_latency_us",
+                        measured_batches,
+                        "default.avg_batch_latency_us",
+                    )
+                    for sum_key, average_key in (
+                        ("default.fire.accumulate.accum_loop_us_sum",
+                         "default.fire.accumulate.accum_loop_us"),
+                        ("default.fire.pre_dispatch.fire_prepare_us_sum",
+                         "default.fire.pre_dispatch.fire_prepare_us"),
+                        ("default.fire.execute.total_us_sum",
+                         "default.fire.execute.total_us"),
+                        ("default.fire.execute.batch_build_us_sum",
+                         "default.fire.execute.batch_build_us"),
+                        ("default.fire.execute.driver_fire_us_sum",
+                         "default.fire.execute.driver_fire_us"),
+                        ("default.fire.post_dispatch.context_tick_us_sum",
+                         "default.fire.post_dispatch.context_tick_us"),
+                        ("default.fire.post_dispatch.stats_update_us_sum",
+                         "default.fire.post_dispatch.stats_update_us"),
+                        ("default.fire.quorum.inter_batch_bubble_us_sum",
+                         "default.fire.quorum.inter_batch_bubble_us"),
+                        ("default.fire.quorum.quorum_latency_us_sum",
+                         "default.fire.quorum.quorum_latency_us"),
+                    ):
+                        measured_average(
+                            model_status,
+                            sum_key,
+                            measured_batches,
+                            average_key,
+                        )
+                    pre_batches = pre_stats.get("default.total_batches", 0)
+                    inter_fire_samples = (
+                        measured_batches
+                        if isinstance(pre_batches, (int, float)) and pre_batches > 0
+                        else max(measured_batches - 1, 0)
+                    )
+                    for sum_key, average_key in (
+                        ("default.fire.inter_fire_us_sum",
+                         "default.fire.inter_fire_us"),
+                        ("default.fire.post_dispatch_to_fire_us_sum",
+                         "default.fire.post_dispatch_to_fire_us"),
+                        ("default.fire.recv_block_wait_us_sum",
+                         "default.fire.recv_block_wait_us"),
+                    ):
+                        measured_average(
+                            model_status,
+                            sum_key,
+                            inter_fire_samples,
+                            average_key,
+                        )
+                cold_hold_fires = model_status.get(
+                    "default.fire.quorum.cold_hold_fires", 0
+                )
+                if isinstance(cold_hold_fires, (int, float)):
+                    measured_average(
+                        model_status,
+                        "default.fire.quorum.cold_hold_us_sum",
+                        cold_hold_fires,
+                        "default.fire.quorum.cold_hold_us",
+                    )
+                wave_fires = model_status.get("default.fire.quorum.wave_fires", 0)
+                if isinstance(wave_fires, (int, float)):
+                    measured_average(
+                        model_status,
+                        "default.fire.quorum.wave_active_sum",
+                        wave_fires,
+                        "default.fire.quorum.avg_active_pipelines_at_fire",
+                    )
+                    measured_average(
+                        model_status,
+                        "default.fire.quorum.wave_missing_sum",
+                        wave_fires,
+                        "default.fire.quorum.avg_missing_at_fire",
+                    )
                 for key, label in (
                     ("default.spec_attempted", "spec attempted"),
                     ("default.spec_hits", "spec hits"),
@@ -669,6 +836,15 @@ async def run(args: argparse.Namespace):
                     ("default.fire.execute.total_us", "fire.execute.total_us"),
                     ("default.fire.execute.batch_build_us", "fire.execute.batch_build_us"),
                     ("default.fire.execute.driver_fire_us", "fire.execute.driver_fire_us"),
+                    (
+                        "default.fire.quorum.avg_active_pipelines_at_fire",
+                        "wave avg active pipelines",
+                    ),
+                    (
+                        "default.fire.quorum.avg_missing_at_fire",
+                        "wave avg missing pipelines",
+                    ),
+                    ("default.fire.quorum.wave_fires", "wave fires"),
                     ("default.cumulative_batch_latency_us", "cumulative_batch_latency_us"),
                     ("default.fire.post_dispatch.context_tick_us", "fire.post_dispatch.context_tick_us"),
                     ("default.fire.post_dispatch.stats_update_us", "fire.post_dispatch.stats_update_us"),
@@ -684,6 +860,9 @@ async def run(args: argparse.Namespace):
                 ):
                     if key in model_status:
                         engine_config[label] = model_status[key]
+                for key, value in model_status.items():
+                    if "wave" in key or "active_pipelines" in key or "missing_at_fire" in key:
+                        engine_config[key] = value
         except Exception:  # noqa: BLE001
             # Stats are advisory — never break a bench on a failed query.
             pass

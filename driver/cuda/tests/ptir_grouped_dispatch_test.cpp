@@ -21,6 +21,7 @@
 
 using pie_cuda_driver::pipeline::Dispatch;
 using pie_cuda_driver::pipeline::DispatchStats;
+using pie_cuda_driver::pipeline::RetryableLaunchError;
 
 namespace {
 
@@ -108,8 +109,9 @@ std::uint64_t run_case(
     bool partial,
     bool recurrent_state,
     bool duplicate_instance = false,
-    bool direct_bf16 = false) {
-    constexpr std::uint32_t lane_count = 4;
+    bool direct_bf16 = false,
+    std::uint32_t lane_count = 4,
+    bool benchmark = false) {
     constexpr std::uint32_t vocab = 32;
     constexpr std::uint64_t no_ticket =
         std::numeric_limits<std::uint64_t>::max();
@@ -142,6 +144,14 @@ std::uint64_t run_case(
                 sidecar_bytes.data(), sidecar_bytes.size()},
             &error) == PIE_STATUS_OK,
         "register grouped program: " + error);
+    const DispatchStats registration_stats = dispatch.stats();
+    expect(
+        registration_stats.generated_compilations +
+                registration_stats.generated_disk_hits !=
+            0 &&
+            registration_stats.generated_stage_cache_entries != 0 &&
+            registration_stats.generated_program_cache_entries == 1,
+        "registration compiles every generated fused region before publishing");
 
     std::vector<std::uint64_t> hashes(lane_count, hash);
     std::vector<std::uint64_t> instances(lane_count);
@@ -239,7 +249,7 @@ std::uint64_t run_case(
                 &instance_binding,
                 &error) == PIE_STATUS_OK,
             "bind grouped instance: " + error);
-        if (!duplicate_instance && (!partial || lane != 1)) {
+        if (!partial || lane != 1) {
             publish_mask(endpoints[lane][2]);
         }
 
@@ -345,15 +355,54 @@ std::uint64_t run_case(
         "compiled graph key includes stage sequence and row buckets");
     cudaStream_t stream = nullptr;
     cudaStreamCreate(&stream);
-    expect(
-        dispatch.run(
+    cudaEvent_t benchmark_start = nullptr;
+    cudaEvent_t benchmark_stop = nullptr;
+    if (benchmark) {
+        cudaEventCreate(&benchmark_start);
+        cudaEventCreate(&benchmark_stop);
+        cudaEventRecord(benchmark_start, stream);
+    }
+    bool retryable_preflight = false;
+    bool ran = false;
+    try {
+        ran = dispatch.run(
             view, device_logits, vocab, stream, nullptr, PieCompletion{},
             device_logits_bf16,
-            direct_bf16 ? direct_rows.data() : nullptr),
-        "run grouped launch");
+            direct_bf16 ? direct_rows.data() : nullptr);
+    } catch (const RetryableLaunchError&) {
+        retryable_preflight = true;
+    }
+    if (partial && recurrent_state) {
+        expect(
+            retryable_preflight,
+            "RS launch rejects incomplete readiness before state mutation");
+        cudaStreamDestroy(stream);
+        cudaFree(device_logits);
+        cudaFree(device_logits_bf16);
+        return 0;
+    }
+    expect(!retryable_preflight && ran, "run grouped launch");
+    if (benchmark) {
+        cudaEventRecord(benchmark_stop, stream);
+    }
     cudaDeviceSynchronize();
+    if (benchmark) {
+        float elapsed_ms = 0.0f;
+        cudaEventElapsedTime(
+            &elapsed_ms, benchmark_start, benchmark_stop);
+        std::printf(
+            "generated grouped section3 B=%u: %.3f ms/fire\n",
+            lane_count,
+            elapsed_ms);
+        cudaEventDestroy(benchmark_stop);
+        cudaEventDestroy(benchmark_start);
+    }
 
     const DispatchStats stats = dispatch.stats();
+    expect(
+        stats.generated_compilations ==
+            registration_stats.generated_compilations,
+        "first fire performs no generated-region compilation");
     if (direct_bf16) {
         expect(
             stats.direct_bf16_groups == 1 &&
@@ -373,8 +422,9 @@ std::uint64_t run_case(
     } else {
         expect(
             stats.grouped_lanes == lane_count &&
-                stats.grouped_tier0_groups == 1,
-            "Dispatch grouped N=4");
+                stats.generated_fused_groups == 1 &&
+                stats.generated_fused_body_launches == 1,
+            "Dispatch executes one generated fused body for N=4");
     }
     for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
         const std::uint32_t outcome =
@@ -383,18 +433,27 @@ std::uint64_t run_case(
         const bool retry =
             (duplicate_instance && lane != 0) ||
             (partial && lane == 1);
+        const std::string case_label =
+            " lane=" + std::to_string(lane) +
+            " partial=" + std::to_string(partial) +
+            " rs=" + std::to_string(recurrent_state) +
+            " duplicate=" + std::to_string(duplicate_instance) +
+            " bf16=" + std::to_string(direct_bf16);
         expect(
             outcome ==
                 (retry
                     ? PIE_TERMINAL_OUTCOME_RETRY
                     : PIE_TERMINAL_OUTCOME_SUCCESS),
-            "per-lane terminal attribution");
+            "per-lane terminal attribution" + case_label +
+                " outcome=" + std::to_string(outcome));
         if (!retry) {
             const std::uint32_t token = *reinterpret_cast<const std::uint32_t*>(
                 endpoints[lane][1].mirror_base);
             expect(
                 token == expected_tokens[lane],
-                "grouped Gumbel-max token parity");
+                "grouped Gumbel-max token parity" + case_label +
+                    " expected=" + std::to_string(expected_tokens[lane]) +
+                    " actual=" + std::to_string(token));
         }
     }
     cudaStreamDestroy(stream);
@@ -405,7 +464,6 @@ std::uint64_t run_case(
 
 std::vector<std::int32_t> run_nucleus_case(
     const std::string& golden_directory,
-    bool disable_library,
     bool direct_bf16) {
     constexpr std::uint32_t lane_count = 6;
     constexpr std::uint32_t vocab = 8;
@@ -600,9 +658,6 @@ std::vector<std::int32_t> run_nucleus_case(
         "validate nucleus launch: " + error);
     cudaStream_t stream = nullptr;
     cudaStreamCreate(&stream);
-    if (disable_library) {
-        setenv("PIE_CUDA_DISABLE_PTIR_NUCLEUS_LIBRARY", "1", 1);
-    }
     expect(
         dispatch.run(
             view, device_logits, vocab, stream, nullptr, PieCompletion{},
@@ -610,26 +665,20 @@ std::vector<std::int32_t> run_nucleus_case(
             direct_bf16 ? direct_rows.data() : nullptr),
         "run nucleus launch");
     cudaDeviceSynchronize();
-    if (disable_library) {
-        unsetenv("PIE_CUDA_DISABLE_PTIR_NUCLEUS_LIBRARY");
-    }
     const DispatchStats stats = dispatch.stats();
     expect(
         stats.grouped_lanes == lane_count &&
-            stats.nucleus_library_groups ==
-                (disable_library ? 0u : 1u) &&
-            stats.grouped_graph_captures == 1,
-        disable_library
-            ? "nucleus golden executes grouped Tier 0 fallback"
-            : "generic nucleus region selects one library implementation");
-    const std::uint64_t expected_body_launches = disable_library
-        ? (direct_bf16 ? 14u : 15u)
-        : (direct_bf16 ? 2u : 3u);
+            stats.nucleus_library_groups == 1 &&
+            stats.generated_fused_groups == 1 &&
+            stats.generated_fused_body_launches == 3,
+        "generic nucleus region composes generated producers/consumers "
+        "with one stock library");
+    const std::uint64_t expected_body_launches = 3;
     expect(
         stats.grouped_body_op_launches == expected_body_launches,
-        disable_library
-            ? "generic fallback executes all 13 nucleus SSA nodes"
-            : "library skips exactly the 13 declared region nodes");
+        "nucleus launch topology is generated + library + generated: expected=" +
+            std::to_string(expected_body_launches) +
+            " actual=" + std::to_string(stats.grouped_body_op_launches));
     std::vector<std::int32_t> tokens;
     tokens.reserve(lane_count);
     for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
@@ -800,8 +849,9 @@ void run_structured_mask_golden(const std::string& golden_directory) {
     const auto stats = dispatch.stats();
     expect(
         stats.grouped_lanes == lane_count &&
-            stats.grouped_tier0_groups == 1,
-        "structured-mask golden uses generic grouped region execution");
+            stats.generated_fused_groups == 1 &&
+            stats.generated_fused_body_launches == 1,
+        "structured-mask golden uses one generated fused region");
     const std::vector<std::vector<std::uint8_t>> expected{
         {1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1},
         {0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1},
@@ -1370,8 +1420,10 @@ std::vector<std::uint8_t> run_beam_case(
     }
     expect(
         stats.grouped_lanes == lane_count &&
-            stats.selection_library_groups == 1,
-        "beam workload uses the ordinary TopK library path");
+            stats.selection_library_groups == 1 &&
+            stats.generated_fused_groups == 1 &&
+            stats.generated_fused_body_launches > 1,
+        "beam workload composes generated regions with the TopK library");
     std::vector<std::uint8_t> attribution;
     auto append = [&](const void* data, std::size_t bytes) {
         const auto* begin = static_cast<const std::uint8_t*>(data);
@@ -1620,6 +1672,229 @@ void run_mtp_direct_case(const std::string& golden_directory) {
     cudaFree(device_bf16);
 }
 
+void run_parallel_signature_case(const std::string& golden_directory) {
+    constexpr std::uint64_t no_ticket =
+        std::numeric_limits<std::uint64_t>::max();
+    struct Program {
+        std::uint64_t hash = 0;
+        std::uint64_t instance = 0;
+        pie_native::ptir::container::Container container;
+        std::vector<PieChannelEndpointBinding> endpoints;
+        std::vector<std::uint64_t> channel_ids;
+    };
+    Dispatch dispatch;
+    std::string error;
+    auto prepare = [&](const std::string& name,
+                       std::uint64_t channel_base,
+                       std::uint64_t instance,
+                       const std::vector<PieChannelValueDesc>& seeds) {
+        Program result;
+        const std::string path =
+            golden_directory + "/" + name + ".txt";
+        const auto canonical =
+            hex_bytes(golden_field(path, "container"));
+        const auto sidecar =
+            hex_bytes(golden_field(path, "sidecar"));
+        result.hash =
+            std::stoull(golden_field(path, "hash"), nullptr, 16);
+        pie_native::ptir::container::DecodeError decode_error;
+        expect(
+            pie_native::ptir::container::decode(
+                canonical.data(),
+                canonical.size(),
+                result.container,
+                &decode_error),
+            "parallel-signature container decode: " +
+                decode_error.detail);
+        expect(
+            dispatch.register_program(
+                result.hash,
+                {canonical.data(), canonical.size()},
+                {sidecar.data(), sidecar.size()},
+                &error) == PIE_STATUS_OK,
+            "parallel-signature program registration: " + error);
+        result.instance = instance;
+        result.endpoints.resize(result.container.channels.size());
+        result.channel_ids.resize(result.container.channels.size());
+        for (std::size_t channel = 0;
+             channel < result.container.channels.size();
+             ++channel) {
+            const auto& source = result.container.channels[channel];
+            result.channel_ids[channel] = channel_base + channel;
+            PieChannelDesc descriptor{};
+            descriptor.abi_version = PIE_DRIVER_ABI_VERSION;
+            descriptor.channel_id = result.channel_ids[channel];
+            descriptor.shape = {source.shape.dims, source.shape.rank};
+            descriptor.dtype = source.dtype;
+            descriptor.host_role = source.host_role;
+            descriptor.seeded = source.seeded;
+            descriptor.extern_dir = PIE_CHANNEL_EXTERN_NONE;
+            descriptor.capacity = source.capacity;
+            descriptor.reader_wait_id =
+                result.channel_ids[channel] * 2 + 1;
+            descriptor.writer_wait_id =
+                result.channel_ids[channel] * 2 + 2;
+            expect(
+                dispatch.register_channel(
+                    descriptor,
+                    &result.endpoints[channel],
+                    &error) == PIE_STATUS_OK,
+                "parallel-signature channel registration: " + error);
+        }
+        std::vector<PieChannelValueDesc> bound_seeds = seeds;
+        for (auto& seed : bound_seeds) {
+            seed.channel_id =
+                result.channel_ids[seed.channel_id];
+        }
+        PieInstanceBinding binding{};
+        expect(
+            dispatch.bind_instance(
+                instance,
+                result.hash,
+                instance + 100,
+                result.channel_ids,
+                bound_seeds,
+                &binding,
+                &error) == PIE_STATUS_OK,
+            "parallel-signature instance binding: " + error);
+        return result;
+    };
+
+    const std::int32_t greedy_seed = 1;
+    const PieChannelValueDesc greedy_seeds[] = {{
+        0,
+        {
+            reinterpret_cast<const std::uint8_t*>(&greedy_seed),
+            sizeof(greedy_seed),
+        },
+    }};
+    Program greedy = prepare(
+        "greedy_argmax",
+        120000,
+        9100,
+        {std::begin(greedy_seeds), std::end(greedy_seeds)});
+    const std::int32_t section_token = 1;
+    const std::uint32_t section_length = 1;
+    const std::uint32_t section_rng[2] = {1234, 0};
+    const PieChannelValueDesc section_seeds[] = {
+        {
+            0,
+            {
+                reinterpret_cast<const std::uint8_t*>(&section_token),
+                sizeof(section_token),
+            },
+        },
+        {
+            3,
+            {
+                reinterpret_cast<const std::uint8_t*>(&section_length),
+                sizeof(section_length),
+            },
+        },
+        {
+            4,
+            {
+                reinterpret_cast<const std::uint8_t*>(section_rng),
+                sizeof(section_rng),
+            },
+        },
+    };
+    Program section = prepare(
+        "section3_masked_gumbel",
+        121000,
+        9200,
+        {std::begin(section_seeds), std::end(section_seeds)});
+    publish_mask(section.endpoints[2]);
+
+    std::vector<std::uint64_t> hashes{greedy.hash, section.hash};
+    std::vector<std::uint64_t> instances{
+        greedy.instance, section.instance};
+    std::vector<PieTerminalCell> terminals(2);
+    std::vector<PieTerminalCell*> terminal_ptrs{
+        &terminals[0], &terminals[1]};
+    std::vector<std::uint32_t> sampling_indptr{0, 1, 2};
+    std::vector<std::uint64_t> expected_heads{
+        0, no_ticket,
+        0, no_ticket, 0, 0, 0,
+    };
+    std::vector<std::uint64_t> expected_tails{
+        1, 0,
+        1, 0, no_ticket, 1, 1,
+    };
+    std::vector<std::uint32_t> ticket_indptr{0, 2, 7};
+    std::vector<std::uint32_t> extents{1, 1};
+    pie_native::LaunchView view{};
+    view.terminal_cells =
+        pie_native::slice_from(terminal_ptrs.data(), terminal_ptrs.size());
+    view.ptir_program_hashes =
+        pie_native::slice_from_u64(hashes.data(), hashes.size());
+    view.ptir_program_instances =
+        pie_native::slice_from_u64(instances.data(), instances.size());
+    view.sampling_indptr =
+        pie_native::slice_from_u32(
+            sampling_indptr.data(), sampling_indptr.size());
+    view.channel_expected_head =
+        pie_native::slice_from_u64(
+            expected_heads.data(), expected_heads.size());
+    view.channel_expected_tail =
+        pie_native::slice_from_u64(
+            expected_tails.data(), expected_tails.size());
+    view.channel_ticket_indptr =
+        pie_native::slice_from_u32(
+            ticket_indptr.data(), ticket_indptr.size());
+    view.ptir_row_counts =
+        pie_native::slice_from_u32(extents.data(), extents.size());
+    view.ptir_token_counts =
+        pie_native::slice_from_u32(extents.data(), extents.size());
+    view.ptir_kv_lens =
+        pie_native::slice_from_u32(extents.data(), extents.size());
+    view.ptir_page_counts =
+        pie_native::slice_from_u32(extents.data(), extents.size());
+    view.ptir_query_lens =
+        pie_native::slice_from_u32(extents.data(), extents.size());
+    view.ptir_key_lens =
+        pie_native::slice_from_u32(extents.data(), extents.size());
+
+    std::vector<float> logits(2 * 32, -100.0f);
+    logits[2] = 100.0f;
+    logits[32 + 7] = 100.0f;
+    float* device_logits = nullptr;
+    cudaMalloc(&device_logits, logits.size() * sizeof(float));
+    cudaMemcpy(
+        device_logits,
+        logits.data(),
+        logits.size() * sizeof(float),
+        cudaMemcpyHostToDevice);
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+    expect(
+        dispatch.run(
+            view,
+            device_logits,
+            32,
+            stream,
+            nullptr,
+            PieCompletion{}),
+        "parallel-signature launch");
+    cudaDeviceSynchronize();
+    const auto stats = dispatch.stats();
+    expect(
+        stats.generated_fused_groups == 2 &&
+            stats.overlapped_groups == 2,
+        "independent signatures execute concurrently on dedicated streams");
+    const auto greedy_token =
+        *reinterpret_cast<const std::int32_t*>(
+            greedy.endpoints[1].mirror_base);
+    const auto section_token_out =
+        *reinterpret_cast<const std::int32_t*>(
+            section.endpoints[1].mirror_base);
+    expect(
+        greedy_token == 2 && section_token_out == 7,
+        "parallel signatures preserve per-program outputs");
+    cudaStreamDestroy(stream);
+    cudaFree(device_logits);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1627,26 +1902,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s <golden-directory>\n", argv[0]);
         return 2;
     }
-    const auto fp32_launches = run_case(argv[1], false, false);
+    const auto fp32_launches =
+        run_case(argv[1], false, false, false, false, 4, true);
     run_case(argv[1], true, false);
     run_case(argv[1], false, true);
     run_case(argv[1], true, true);
     run_case(argv[1], false, false, true);
     const auto direct_bf16_launches =
         run_case(argv[1], false, false, false, true);
+    run_case(argv[1], false, false, false, false, 1, true);
+    run_case(argv[1], false, false, false, false, 2, true);
+    run_case(argv[1], false, false, false, false, 4, true);
+    run_case(argv[1], false, false, false, false, 8, true);
     expect(
         direct_bf16_launches == fp32_launches,
         "direct BF16 grouped fallback fuses conversion into consumers");
-    const auto nucleus_library =
-        run_nucleus_case(argv[1], false, true);
-    const auto nucleus_tier0 =
-        run_nucleus_case(argv[1], true, false);
-    const auto nucleus_tier0_bf16 =
-        run_nucleus_case(argv[1], true, true);
+    const auto nucleus_fp32 =
+        run_nucleus_case(argv[1], false);
+    const auto nucleus_bf16 =
+        run_nucleus_case(argv[1], true);
     expect(
-        nucleus_library == nucleus_tier0 &&
-            nucleus_library == nucleus_tier0_bf16,
-        "nucleus library and both generic grouped fallbacks match bit-for-bit");
+        nucleus_fp32 == nucleus_bf16,
+        "nucleus generated/library execution matches FP32 and direct BF16");
     run_structured_mask_golden(argv[1]);
     run_declared_phase_case(argv[1], false);
     run_declared_phase_case(argv[1], true);
@@ -1663,6 +1940,7 @@ int main(int argc, char** argv) {
     expect(
         beam_fp32_launches == beam_bf16_launches,
         "generic beam launch scaling is independent of logits storage");
+    run_parallel_signature_case(argv[1]);
     std::printf("PTIR grouped Dispatch: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

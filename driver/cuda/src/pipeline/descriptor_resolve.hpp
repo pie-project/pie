@@ -42,13 +42,36 @@ using namespace pie_native::ptir::descriptor;
 
 namespace detail {
 
+struct CachedPortCell {
+    std::vector<std::uint8_t> bytes;
+    std::uint8_t ready = 0;
+};
+
+using PortCellCache =
+    std::unordered_map<std::uint32_t, CachedPortCell>;
+
 // Read a channel-bound port's committed cell as raw bytes (D2H). Fails (W1.6) if
 // the cell is not full — nothing will fill it on a solo device-geometry fire.
 inline bool read_port_cell(ChannelView& view, ChannelId dense,
                            std::vector<std::uint8_t>& out, std::string* err,
                            const std::unordered_set<std::uint32_t>*
-                               pending_slots = nullptr) {
+                               pending_slots = nullptr,
+                           const PortCellCache* cached_cells = nullptr) {
     const std::uint32_t slot = view.slot(dense);
+    if (cached_cells != nullptr) {
+        const auto cached = cached_cells->find(slot);
+        if (cached != cached_cells->end()) {
+            if (cached->second.ready == 0) {
+                if (err)
+                    *err = "ptir: descriptor channel " +
+                           std::to_string(dense) +
+                           " not ready (producing fire failed or not yet produced)";
+                return false;
+            }
+            out = cached->second.bytes;
+            return true;
+        }
+    }
     if (pending_slots != nullptr && pending_slots->contains(slot)) {
         out.resize(view.cell_bytes(dense));
         cudaMemcpy(
@@ -138,7 +161,9 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
                                   std::string* err,
                                   bool allow_structured_masks = false,
                                   const std::unordered_set<std::uint32_t>*
-                                      pending_slots = nullptr) {
+                                      pending_slots = nullptr,
+                                  const detail::PortCellCache*
+                                      cached_cells = nullptr) {
     // Index the channel-bound ports by tag.
     ChannelId ch[10];
     bool has[10] = {false};
@@ -152,7 +177,8 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     if (has[kPortEmbedTokens]) {
         std::vector<std::uint8_t> b;
         if (!detail::read_port_cell(
-                view, ch[kPortEmbedTokens], b, err, pending_slots)) return false;
+                view, ch[kPortEmbedTokens], b, err, pending_slots,
+                cached_cells)) return false;
         out.token_ids = detail::as_u32(b);
     }
     const std::uint32_t nnz = static_cast<std::uint32_t>(out.token_ids.size());
@@ -160,7 +186,8 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     if (has[kPortEmbedIndptr]) {
         std::vector<std::uint8_t> b;
         if (!detail::read_port_cell(
-                view, ch[kPortEmbedIndptr], b, err, pending_slots)) return false;
+                view, ch[kPortEmbedIndptr], b, err, pending_slots,
+                cached_cells)) return false;
         out.qo_indptr = detail::as_u32(b);
     } else {
         out.qo_indptr = {0, nnz};  // one lane over all tokens
@@ -170,7 +197,8 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     if (has[kPortPositions]) {
         std::vector<std::uint8_t> b;
         if (!detail::read_port_cell(
-                view, ch[kPortPositions], b, err, pending_slots)) return false;
+                view, ch[kPortPositions], b, err, pending_slots,
+                cached_cells)) return false;
         out.position_ids = detail::as_u32(b);
     } else {
         out.position_ids.resize(nnz);
@@ -181,13 +209,15 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     if (has[kPortPageIndptr]) {
         std::vector<std::uint8_t> b;
         if (!detail::read_port_cell(
-                view, ch[kPortPageIndptr], b, err, pending_slots)) return false;
+                view, ch[kPortPageIndptr], b, err, pending_slots,
+                cached_cells)) return false;
         out.kv_page_indptr = detail::as_u32(b);
     }
     if (has[kPortPages]) {
         std::vector<std::uint8_t> b;
         if (!detail::read_port_cell(
-                view, ch[kPortPages], b, err, pending_slots)) return false;
+                view, ch[kPortPages], b, err, pending_slots,
+                cached_cells)) return false;
         out.kv_page_indices = detail::as_u32(b);
         // CSR-prefix: trim the fixed-shape data port to page_indptr's last entry.
         if (!out.kv_page_indptr.empty()) {
@@ -200,7 +230,8 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     if (has[kPortKvLen]) {
         std::vector<std::uint8_t> b;
         if (!detail::read_port_cell(
-                view, ch[kPortKvLen], b, err, pending_slots)) return false;
+                view, ch[kPortKvLen], b, err, pending_slots,
+                cached_cells)) return false;
         for (std::uint32_t len : detail::as_u32(b))
             out.kv_last_page_lens.push_back(last_page_len(len, page_size));
     }
@@ -209,7 +240,8 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     if (has[kPortReadout]) {
         std::vector<std::uint8_t> b;
         if (!detail::read_port_cell(
-                view, ch[kPortReadout], b, err, pending_slots)) return false;
+                view, ch[kPortReadout], b, err, pending_slots,
+                cached_cells)) return false;
         out.sampling_indices = detail::as_u32(b);
         out.sampling_indptr = {0, static_cast<std::uint32_t>(out.sampling_indices.size())};
     } else {
@@ -227,14 +259,16 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     if (has[kPortWSlot]) {
         std::vector<std::uint8_t> b;
         if (!detail::read_port_cell(
-                view, ch[kPortWSlot], b, err, pending_slots)) return false;
+                view, ch[kPortWSlot], b, err, pending_slots,
+                cached_cells)) return false;
         out.w_page = detail::as_u32(b);
         out.has_write_desc = true;
     }
     if (has[kPortWOff]) {
         std::vector<std::uint8_t> b;
         if (!detail::read_port_cell(
-                view, ch[kPortWOff], b, err, pending_slots)) return false;
+                view, ch[kPortWOff], b, err, pending_slots,
+                cached_cells)) return false;
         out.w_off = detail::as_u32(b);
     }
 
@@ -256,7 +290,7 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
         if (!direct) {
             if (!detail::read_port_cell(
                     view, ch[kPortAttnMask], out.mask, err,
-                    pending_slots)) {
+                    pending_slots, cached_cells)) {
                 return false;
             }
             out.has_mask = true;

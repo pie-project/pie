@@ -4,6 +4,7 @@
 #include "batch/graph_variant.hpp"
 #include "batch/tp_gate.hpp"
 #include "pipeline/batch_compose.hpp"
+#include "store/recurrent_state_cache.hpp"
 
 #include <algorithm>
 #include <atomic>

@@ -163,7 +163,7 @@ impl PendingRequest {
     }
 
     fn requires_solo_submission(&self) -> bool {
-        self.prebuilt || self.preserves_inner_rows()
+        (self.prebuilt && self.pipeline_id.is_none()) || self.preserves_inner_rows()
     }
 }
 
@@ -485,6 +485,35 @@ impl SchedulerHandle {
                 physical_page_ids,
                 last_page_len,
                 None,
+                None,
+                true,
+                prelaunch_copy,
+                prelaunch_state_copy,
+                None,
+                None,
+            ),
+        })
+    }
+
+    pub fn submit_prebuilt_tracked_with_copy(
+        &self,
+        request: crate::driver::LaunchPlan,
+        instance_id: u64,
+        completion: WorkItemCompletion,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+        pipeline_id: ProcessId,
+        prelaunch_copy: Option<crate::driver::KvCopyPlan>,
+        prelaunch_state_copy: Option<StateCopyPlan>,
+    ) -> Result<()> {
+        self.send(SchedulerItem::Launch {
+            pending: PendingRequest::direct(
+                request,
+                instance_id,
+                completion,
+                physical_page_ids,
+                last_page_len,
+                Some(pipeline_id),
                 None,
                 true,
                 prelaunch_copy,
@@ -891,6 +920,7 @@ impl BatchScheduler {
                     Self::reject_pipeline_queued(
                         pending,
                         blocked_preparations,
+                        policy,
                         pid,
                         protected.as_ref(),
                     );
@@ -974,6 +1004,7 @@ impl BatchScheduler {
     fn reject_pipeline_queued(
         pending: &mut VecDeque<QueuedItem>,
         blocked_preparations: &mut VecDeque<PendingRequest>,
+        policy: &mut quorum::WaitAllPolicy,
         pid: ProcessId,
         protected: Option<&WorkItemCompletion>,
     ) {
@@ -998,9 +1029,15 @@ impl BatchScheduler {
             };
             if reject {
                 match item {
-                    QueuedItem::Prepare(request) | QueuedItem::Launch(request) => request
+                    QueuedItem::Prepare(request) => request
                         .completion
                         .reject_unsubmitted("pipeline terminated while queued"),
+                    QueuedItem::Launch(request) => {
+                        policy.on_request_dropped(request.pipeline_id);
+                        request
+                            .completion
+                            .reject_unsubmitted("pipeline terminated while queued");
+                    }
                     QueuedItem::PreLaunchCopy {
                         logical_completion, ..
                     } => logical_completion
@@ -1077,6 +1114,20 @@ impl BatchScheduler {
         })
     }
 
+    fn preparation_has_blocked_lane_head(
+        blocked: &VecDeque<PendingRequest>,
+        request: &PendingRequest,
+    ) -> bool {
+        let Some(key) = request.preparation_order_key else {
+            return false;
+        };
+        blocked.iter().any(|earlier| {
+            earlier.pipeline_id == request.pipeline_id
+                && earlier.preparation_order_key == Some(key)
+                && earlier.logical_fire_id < request.logical_fire_id
+        })
+    }
+
     /// Peeks how many requests at `pending`'s front would land in the NEXT
     /// launch batch — same grouping rules `dispatch_launch_batch` applies
     /// (same-instance dedup, mask-solo, structural capacity) — without
@@ -1092,6 +1143,7 @@ impl BatchScheduler {
         page_size: u32,
     ) -> usize {
         let mut grouping = LaunchGrouping::default();
+        let mut blocked_pipelines = HashSet::new();
         for item in pending.iter() {
             let QueuedItem::Launch(next) = item else {
                 break;
@@ -1099,7 +1151,19 @@ impl BatchScheduler {
             if !instances.contains_key(&next.instance_id) {
                 continue;
             }
+            if next
+                .pipeline_id
+                .is_some_and(|pid| blocked_pipelines.contains(&pid))
+            {
+                continue;
+            }
             if !grouping.accepts(next, limits, page_size) {
+                if grouping.instances.contains(&next.instance_id)
+                    && let Some(pid) = next.pipeline_id
+                {
+                    blocked_pipelines.insert(pid);
+                    continue;
+                }
                 break;
             }
             if grouping.push(next, limits, page_size) {
@@ -1164,6 +1228,23 @@ impl BatchScheduler {
                         request.completion.reject_unsubmitted(
                             "logical fire cancelled during dispatch preparation",
                         );
+                        progress = true;
+                        continue;
+                    }
+                    if pending.front().is_some_and(|item| {
+                        matches!(
+                            item,
+                            QueuedItem::Prepare(request)
+                                if Self::preparation_has_blocked_lane_head(
+                                    blocked_preparations,
+                                    request,
+                                )
+                        )
+                    }) {
+                        let Some(QueuedItem::Prepare(request)) = pending.pop_front() else {
+                            unreachable!();
+                        };
+                        blocked_preparations.push_back(request);
                         progress = true;
                         continue;
                     }
@@ -1279,6 +1360,7 @@ impl BatchScheduler {
                         page_size,
                         limits,
                         stats,
+                        policy,
                     );
                     // Only a batch that actually reached `in_flight_launches`
                     // (the driver accepted the launch) increments the
@@ -1287,14 +1369,50 @@ impl BatchScheduler {
                     // occupies a run-ahead slot, so nothing would ever
                     // decrement it back.
                     if in_flight_launches.len() > before {
-                        let participants = in_flight_launches
+                        let accepted = in_flight_launches
                             .back()
-                            .expect("accepted batch is present")
+                            .expect("accepted batch is present");
+                        let participants = accepted
                             .requests
                             .iter()
                             .map(|request| request.pipeline_id)
                             .collect::<Vec<_>>();
-                        policy.on_wave_dispatched(&participants);
+                        policy.on_wave_dispatched(&participants, Instant::now());
+                        if super::sched_trace_enabled() {
+                            let mut queued_launches = 0usize;
+                            let mut queued_preparations = 0usize;
+                            let mut queued_controls = 0usize;
+                            let mut queued_pipelines = HashSet::new();
+                            for item in pending.iter() {
+                                match item {
+                                    QueuedItem::Launch(request) => {
+                                        queued_launches += 1;
+                                        if let Some(pid) = request.pipeline_id {
+                                            queued_pipelines.insert(pid);
+                                        }
+                                    }
+                                    QueuedItem::Prepare(_) => {
+                                        queued_preparations += 1;
+                                    }
+                                    _ => queued_controls += 1,
+                                }
+                            }
+                            super::sched_trace_write(format_args!(
+                                concat!(
+                                    "wave candidate={} dispatched={} active={} ",
+                                    "pending={} launches={} preparations={} ",
+                                    "controls={} ready_pipelines={}"
+                                ),
+                                candidate_size,
+                                accepted.requests.len(),
+                                policy.active_pipelines(),
+                                pending.len(),
+                                queued_launches,
+                                queued_preparations,
+                                queued_controls,
+                                queued_pipelines.len(),
+                            ));
+                        }
                     }
                     progress |= dispatched;
                     if !dispatched {
@@ -1540,13 +1658,19 @@ impl BatchScheduler {
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
+        policy: &mut quorum::WaitAllPolicy,
     ) -> bool {
         let mut batch = BatchAccumulator::new(limits, page_size);
         let mut grouping = LaunchGrouping::default();
+        let mut deferred = VecDeque::new();
+        let mut blocked_pipelines = HashSet::new();
         let mut rejected_stale = false;
         while let Some(QueuedItem::Launch(next)) = pending.front() {
             if next.completion.is_settled() {
-                pending.pop_front();
+                let Some(QueuedItem::Launch(dropped)) = pending.pop_front() else {
+                    unreachable!();
+                };
+                policy.on_request_dropped(dropped.pipeline_id);
                 rejected_stale = true;
                 continue;
             }
@@ -1554,6 +1678,7 @@ impl BatchScheduler {
                 let Some(QueuedItem::Launch(cancelled)) = pending.pop_front() else {
                     unreachable!();
                 };
+                policy.on_request_dropped(cancelled.pipeline_id);
                 cancelled
                     .completion
                     .reject_unsubmitted("logical fire cancelled before native launch");
@@ -1567,6 +1692,7 @@ impl BatchScheduler {
                 let Some(QueuedItem::Launch(stale)) = pending.pop_front() else {
                     unreachable!();
                 };
+                policy.on_request_dropped(stale.pipeline_id);
                 stale.completion.reject_unsubmitted(format!(
                     "instance {} is unknown or stale",
                     stale.instance_id
@@ -1574,7 +1700,21 @@ impl BatchScheduler {
                 rejected_stale = true;
                 continue;
             }
+            if next
+                .pipeline_id
+                .is_some_and(|pid| blocked_pipelines.contains(&pid))
+            {
+                deferred.push_back(pending.pop_front().expect("blocked launch front"));
+                continue;
+            }
             if !grouping.accepts(next, limits, page_size) {
+                if grouping.instances.contains(&next.instance_id)
+                    && let Some(pid) = next.pipeline_id
+                {
+                    blocked_pipelines.insert(pid);
+                    deferred.push_back(pending.pop_front().expect("runahead launch front"));
+                    continue;
+                }
                 break;
             }
             let QueuedItem::Launch(next) = pending.pop_front().expect("launch front") else {
@@ -1585,6 +1725,9 @@ impl BatchScheduler {
             if stop {
                 break;
             }
+        }
+        while let Some(item) = deferred.pop_back() {
+            pending.push_front(item);
         }
         let mut requests = batch.take();
         if requests.is_empty() {
@@ -1602,6 +1745,7 @@ impl BatchScheduler {
         for request in &requests {
             let Some(instance) = instances.get(&request.instance_id) else {
                 for request in &mut requests {
+                    policy.on_request_dropped(request.pipeline_id);
                     let message = format!("instance {} is unknown or stale", request.instance_id);
                     request.completion.reject_unsubmitted(message.clone());
                 }
@@ -1632,12 +1776,14 @@ impl BatchScheduler {
                 Err(err) => {
                     let message = format!("direct launch rejected: {err:#}");
                     for request in &mut requests {
+                        policy.on_request_dropped(request.pipeline_id);
                         request.completion.reject_unsubmitted(message.clone());
                     }
                 }
             },
             None => {
                 for request in &mut requests {
+                    policy.on_request_dropped(request.pipeline_id);
                     request
                         .completion
                         .reject_unsubmitted("driver has no backend installed");
@@ -2818,8 +2964,15 @@ mod tests {
         );
         let mut pending = VecDeque::from([QueuedItem::Launch(request)]);
         let mut blocked = VecDeque::new();
+        let mut policy = quorum::WaitAllPolicy::new(1, None);
         completion.request_cancel();
-        BatchScheduler::reject_pipeline_queued(&mut pending, &mut blocked, pid, Some(&completion));
+        BatchScheduler::reject_pipeline_queued(
+            &mut pending,
+            &mut blocked,
+            &mut policy,
+            pid,
+            Some(&completion),
+        );
         assert_eq!(pending.len(), 1);
         assert!(completion.cancel_requested());
         assert!(!completion.is_settled());
@@ -2888,6 +3041,28 @@ mod tests {
         assert_eq!(plan.slot_ranges[1].dst_slot_id, 6);
         assert!(matches!(pending.pop_front(), Some(QueuedItem::Launch(_))));
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn tracked_multi_row_prebuilt_request_remains_solo() {
+        let mut launch = dummy_launch();
+        launch.qo_indptr = vec![0, 0, 0];
+        let request = PendingRequest::direct(
+            launch,
+            1,
+            WorkItemCompletion::deferred_with_guard(None),
+            Vec::new(),
+            0,
+            Some(ProcessId::new_v4()),
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(request.preserves_inner_rows());
+        assert!(request.requires_solo_submission());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3891,7 +4066,8 @@ mod tests {
         timeout(Duration::from_secs(5), first_b).await??;
 
         // Wave 2: only `a` resubmits (its decode loop's next token); `b`
-        // never comes back. The quorum holds `a` for `b` up to the ~10ms
+        // never comes back. The quorum holds `a` for `b` up to the default
+        // 500us
         // wave deadline, then fires solo — a straggler deadline-fire, not
         // an immediate dense fire.
         let started = Instant::now();
@@ -3907,8 +4083,8 @@ mod tests {
         )?;
         timeout(Duration::from_secs(5), second_a).await??;
         assert!(
-            started.elapsed() >= Duration::from_millis(8),
-            "a solo wave missing `b` should hold roughly the full ~10ms wave \
+            started.elapsed() >= Duration::from_micros(300),
+            "a solo wave missing `b` should hold the wave \
              deadline before firing, took {:?}",
             started.elapsed()
         );

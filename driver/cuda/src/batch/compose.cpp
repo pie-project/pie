@@ -180,7 +180,7 @@ MtpDraftPlan preflight_mtp_draft_logits(
     plan.vocab = static_cast<std::uint32_t>(model_vocab);
     if (!plan.work.empty() &&
         (plan.vocab == 0 ||
-         engine.ws.mtp_row0_save.size() < plan.vocab ||
+         engine.ws.mtp_row0_save.numel() < plan.vocab ||
          engine.inputs.tokens.size() < 1 ||
          engine.inputs.positions.size() < 1 ||
          engine.inputs.sample_idx.size() < 1 ||

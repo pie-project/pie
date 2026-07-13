@@ -170,8 +170,8 @@ pub enum PartitionKind {
 pub struct RegionPartition {
     pub kind: PartitionKind,
     pub regions: Vec<Region>,
-    /// CUDA executes the whole stage on grouped Tier 0 when true. Metal rejects
-    /// registration unless its singleton codegen supports every node.
+    /// Legacy wire bit retained for decoder compatibility. Revision 6 plans
+    /// never request whole-stage fallback.
     pub whole_stage_fallback: bool,
 }
 
@@ -1248,7 +1248,7 @@ fn singleton_partition(stage: &NormalizedStage) -> RegionPartition {
     RegionPartition {
         kind: PartitionKind::Singleton,
         regions,
-        whole_stage_fallback: stage.ops.iter().any(unsupported_for_codegen),
+        whole_stage_fallback: false,
     }
 }
 
@@ -1623,7 +1623,7 @@ fn fused_partition(stage: &NormalizedStage, library_matches: &[LibraryMatch]) ->
     RegionPartition {
         kind: PartitionKind::Fused,
         regions,
-        whole_stage_fallback: stage.ops.iter().any(unsupported_for_codegen),
+        whole_stage_fallback: false,
     }
 }
 
@@ -1658,13 +1658,9 @@ fn region_kind_for_node(stage: &NormalizedStage, node: usize) -> RegionKind {
         Op::SortDesc(_) => RegionKind::Library(LibraryOp::Sort),
         Op::CumSum(_) | Op::CumProd(_) => RegionKind::Library(LibraryOp::Scan),
         Op::MatMul(_, _) => RegionKind::Library(LibraryOp::MatMul),
-        Op::KernelCall { .. } => RegionKind::Library(LibraryOp::SecondParty),
+        Op::KernelCall { .. } | Op::SinkCall { .. } => RegionKind::Library(LibraryOp::SecondParty),
         _ => RegionKind::Generated,
     }
-}
-
-fn unsupported_for_codegen(op: &Op) -> bool {
-    matches!(op, Op::KernelCall { .. } | Op::SinkCall { .. })
 }
 
 fn compatible_schedule(first: &Op, next: &Op) -> bool {

@@ -26,6 +26,8 @@
 #include "cuda_check.hpp"
 #include "pipeline/program_runtime.hpp"
 #include "pipeline/grouped_runtime.cuh"
+#include "pipeline/generated/module_cache.hpp"
+#include "pipeline/generated/fused_runtime.cuh"
 
 #include "pipeline/descriptor_resolve.hpp"
 #include "pipeline/frame_carrier.hpp"
@@ -55,9 +57,10 @@ struct BoundInstance {
 };
 
 struct Dispatch::Impl {
+    static constexpr std::size_t kSignatureStreamCount = 4;
     PtirProgramCache cache;
+    generated::ModuleCache fused_modules;
     DeviceChannelRegistry channels;
-    GroupedTier0GraphCache grouped_graph_cache;
     std::unordered_map<std::uint64_t, BoundInstance> instances;
     std::atomic<bool> shutting_down{false};
     std::atomic<std::uint32_t> force_retry_launches_remaining{
@@ -66,6 +69,7 @@ struct Dispatch::Impl {
     DispatchStats stats;
     mutable std::mutex stats_mutex;
     cudaStream_t group_streams[2] = {nullptr, nullptr};
+    cudaStream_t signature_streams[kSignatureStreamCount] = {};
     bool attention_hook_coverage = false;
     std::uint32_t model_layers = 0;
 };
@@ -77,11 +81,12 @@ struct StagedLane {
     BoundInstance::CommitSnapshot* snapshot = nullptr;
     const std::vector<plan::StagePlan>* plans = nullptr;
     const std::vector<std::uint64_t>* plan_identities = nullptr;
+    std::shared_ptr<const generated::FusedProgramExecutable>
+        generated_program;
     std::array<std::vector<const plan::StagePlan*>, 4> phase_plans;
     std::vector<DeviceHostChannelTicket> tickets;
     DeviceHostChannelTicket* device_tickets = nullptr;
     std::uint32_t device_ticket_count = 0;
-    cudaEvent_t fire_ready = nullptr;
     std::unordered_set<std::uint32_t> prior_put_slots;
     std::unordered_set<std::uint32_t> prior_take_slots;
     std::uint32_t row_offset = 0;
@@ -106,7 +111,11 @@ struct StagedLaunch::State {
     std::vector<std::uint64_t> touched_instances;
     std::uint32_t* device_layer = nullptr;
     cudaEvent_t source_ready = nullptr;
+    cudaEvent_t callback_ready = nullptr;
     cudaEvent_t phase_done[2] = {nullptr, nullptr};
+    cudaEvent_t signature_ready = nullptr;
+    cudaEvent_t signature_done[
+        Dispatch::Impl::kSignatureStreamCount] = {};
     std::array<std::uint32_t, 4> phase_invocations{};
     bool active = true;
     bool failed = false;
@@ -124,10 +133,6 @@ StagedLaunch::~StagedLaunch() {
             cudaFree(lane->device_tickets);
             lane->device_tickets = nullptr;
         }
-        if (lane != nullptr && lane->fire_ready != nullptr) {
-            cudaEventDestroy(lane->fire_ready);
-            lane->fire_ready = nullptr;
-        }
     }
     if (state_->device_layer != nullptr) {
         cudaFree(state_->device_layer);
@@ -137,7 +142,21 @@ StagedLaunch::~StagedLaunch() {
         cudaEventDestroy(state_->source_ready);
         state_->source_ready = nullptr;
     }
+    if (state_->callback_ready != nullptr) {
+        cudaEventDestroy(state_->callback_ready);
+        state_->callback_ready = nullptr;
+    }
     for (cudaEvent_t& event : state_->phase_done) {
+        if (event != nullptr) {
+            cudaEventDestroy(event);
+            event = nullptr;
+        }
+    }
+    if (state_->signature_ready != nullptr) {
+        cudaEventDestroy(state_->signature_ready);
+        state_->signature_ready = nullptr;
+    }
+    for (cudaEvent_t& event : state_->signature_done) {
         if (event != nullptr) {
             cudaEventDestroy(event);
             event = nullptr;
@@ -481,6 +500,10 @@ Dispatch::Dispatch() : impl_(std::make_unique<Impl>()) {
         CUDA_CHECK(cudaStreamCreateWithFlags(
             &impl_->group_streams[index], cudaStreamNonBlocking));
     }
+    for (cudaStream_t& stream : impl_->signature_streams) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(
+            &stream, cudaStreamNonBlocking));
+    }
 }
 DispatchStats Dispatch::stats() const {
     DispatchStats result;
@@ -488,10 +511,15 @@ DispatchStats Dispatch::stats() const {
         std::lock_guard<std::mutex> lock(impl_->stats_mutex);
         result = impl_->stats;
     }
-    result.grouped_graph_cache_entries = impl_->grouped_graph_cache.size();
-    const auto fallback = impl_->grouped_graph_cache.metrics();
-    result.grouped_graph_captures = fallback.captures;
-    result.grouped_graph_replays = fallback.replays;
+    const auto generated = impl_->fused_modules.stats();
+    result.generated_compilations = generated.compilations;
+    result.generated_disk_hits = generated.disk_hits;
+    result.generated_disk_writes = generated.disk_writes;
+    result.generated_disk_errors = generated.disk_errors;
+    result.generated_negative_hits = generated.negative_hits;
+    result.generated_stage_cache_entries = generated.stage_entries;
+    result.generated_program_cache_entries = generated.program_entries;
+    result.generated_negative_cache_entries = generated.negative_entries;
     return result;
 }
 
@@ -553,6 +581,9 @@ Dispatch::~Dispatch() {
     for (cudaStream_t stream : impl_->group_streams) {
         if (stream != nullptr) CUDA_CHECK(cudaStreamSynchronize(stream));
     }
+    for (cudaStream_t stream : impl_->signature_streams) {
+        if (stream != nullptr) CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
     CUDA_CHECK(cudaStreamSynchronize(
         sampling_ir::FrameCarrierEngine::instance().copy_stream()));
     while (!impl_->instances.empty()) {
@@ -561,6 +592,12 @@ Dispatch::~Dispatch() {
     for (std::size_t index = 0; index < 2; ++index) {
         if (impl_->group_streams[index] != nullptr) {
             CUDA_CHECK(cudaStreamDestroy(impl_->group_streams[index]));
+        }
+    }
+    for (cudaStream_t& stream : impl_->signature_streams) {
+        if (stream != nullptr) {
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            stream = nullptr;
         }
     }
 }
@@ -706,6 +743,41 @@ int Dispatch::register_program(std::uint64_t program_hash,
                 }
                 return PIE_STATUS_UNSUPPORTED;
             }
+        }
+    }
+    generated::CompileFailureKind compile_failure =
+        generated::CompileFailureKind::None;
+    std::string compile_error;
+    const auto compiled_program = impl_->fused_modules.compile_program(
+            program_hash,
+            *plans,
+            compile_failure,
+            compile_error);
+    if (compiled_program == nullptr) {
+        if (err) *err = std::move(compile_error);
+        return compile_failure == generated::CompileFailureKind::Deterministic
+            ? PIE_STATUS_UNSUPPORTED
+            : PIE_STATUS_DRIVER_ERROR;
+    }
+    if (compiled_program->stages.size() != plans->size()) {
+        if (err) *err = "CUDA fused program stage count mismatch";
+        return PIE_STATUS_UNSUPPORTED;
+    }
+    for (std::size_t stage_index = 0;
+         stage_index < plans->size();
+         ++stage_index) {
+        std::string availability_error;
+        if (compiled_program->stages[stage_index] == nullptr ||
+            !generated::generated_stage_supported(
+                *compiled_program->stages[stage_index],
+                (*plans)[stage_index],
+                &availability_error)) {
+            if (err) {
+                *err =
+                    "CUDA fused registration lacks complete coverage: " +
+                    availability_error;
+            }
+            return PIE_STATUS_UNSUPPORTED;
         }
     }
     return PIE_STATUS_OK;
@@ -965,6 +1037,7 @@ void execute_declared_phase(
         struct Task {
             StagedLane* lane = nullptr;
             const plan::StagePlan* plan = nullptr;
+            const generated::FusedStageExecutable* executable = nullptr;
             GroupedLaneBinding binding;
             bool complete = false;
         };
@@ -975,6 +1048,13 @@ void execute_declared_phase(
             const plan::StagePlan& stage =
                 *lane.phase_plans[phase][occurrence];
             if (stage.ops.empty()) continue;
+            const std::size_t stage_index =
+                static_cast<std::size_t>(&stage - lane.plans->data());
+            if (lane.generated_program == nullptr ||
+                stage_index >= lane.generated_program->stages.size()) {
+                throw std::runtime_error(
+                    "PTIR staged launch has no compiled fused stage");
+            }
             if (stage_uses_intrinsic(stage, PTIR_INTR_QUERY)) {
                 if (query_base == nullptr || query_columns == 0 ||
                     lane.token_count == kUnavailableGroupedExtent ||
@@ -1006,10 +1086,18 @@ void execute_declared_phase(
             tasks.push_back(Task{
                 .lane = &lane,
                 .plan = &stage,
+                .executable =
+                    lane.generated_program->stages[stage_index].get(),
                 .binding = binding,
             });
         }
 
+        struct ExecutionGroup {
+            Task* first = nullptr;
+            std::vector<Task*> members;
+            std::vector<GroupedLaneBinding> bindings;
+        };
+        std::vector<ExecutionGroup> groups;
         for (std::size_t first_index = 0;
              first_index < tasks.size();
              ++first_index) {
@@ -1050,20 +1138,44 @@ void execute_declared_phase(
                 bindings = std::move(proposed);
                 members.push_back(&next);
             }
-            GroupedLaunchResult result = GroupedTier0Executor::run(
-                bindings,
-                stream,
-                &launch.owner->grouped_graph_cache,
-                GroupedExecutionOptions{
-                    .reset_commits = false,
-                    .pull_tickets = false,
-                    .finalize = false,
-                });
+            for (Task* member : members) member->complete = true;
+            groups.push_back(ExecutionGroup{
+                .first = &first,
+                .members = std::move(members),
+                .bindings = std::move(bindings),
+            });
+        }
+
+        const GroupedExecutionOptions execution_options{
+            .reset_commits = false,
+            .pull_tickets = false,
+            .finalize = false,
+        };
+        auto execute_group = [&](ExecutionGroup& group,
+                                 cudaStream_t target_stream) {
+            Task& first = *group.first;
+            std::string generated_reason;
+            if (first.executable == nullptr ||
+                !generated::generated_stage_supported(
+                    *first.executable,
+                    *first.plan,
+                    &generated_reason)) {
+                throw std::runtime_error(
+                    "registered PTIR stage has no generated execution: " +
+                    generated_reason);
+            }
+            GroupedLaunchResult result =
+                generated::run_generated_stage(
+                    group.bindings,
+                    *first.executable,
+                    target_stream,
+                    execution_options);
             if (result.device_tickets != nullptr) {
-                CUDA_CHECK(cudaFreeAsync(result.device_tickets, stream));
+                CUDA_CHECK(cudaFreeAsync(
+                    result.device_tickets, target_stream));
             }
             const bool direct_bf16 = std::any_of(
-                bindings.begin(), bindings.end(),
+                group.bindings.begin(), group.bindings.end(),
                 [](const GroupedLaneBinding& binding) {
                     return binding.logits_bf16_rows != nullptr ||
                         binding.mtp_logits_bf16_rows != nullptr;
@@ -1071,8 +1183,11 @@ void execute_declared_phase(
             {
                 std::lock_guard<std::mutex> lock(
                     launch.owner->stats_mutex);
-                ++launch.owner->stats.grouped_tier0_groups;
-                launch.owner->stats.grouped_lanes += members.size();
+                ++launch.owner->stats.generated_fused_groups;
+                launch.owner->stats.generated_fused_body_launches +=
+                    result.body_op_launches;
+                launch.owner->stats.grouped_lanes +=
+                    group.members.size();
                 launch.owner->stats.grouped_body_op_launches +=
                     result.body_op_launches;
                 if (direct_bf16) {
@@ -1088,11 +1203,82 @@ void execute_declared_phase(
                     ++launch.owner->stats.large_nucleus_scalable_groups;
                 }
             }
-            for (Task* member : members) {
+            for (Task* member : group.members) {
                 record_stage_channel_effects(
                     *member->lane, *member->plan);
-                member->complete = true;
             }
+        };
+
+        bool independent = groups.size() > 1;
+        std::unordered_set<std::uint32_t> prior_group_slots;
+        for (const auto& group : groups) {
+            std::unordered_set<std::uint32_t> group_slots;
+            for (const auto& binding : group.bindings) {
+                group_slots.insert(
+                    binding.instance->view().slots().begin(),
+                    binding.instance->view().slots().end());
+            }
+            for (const std::uint32_t slot : group_slots) {
+                if (prior_group_slots.contains(slot)) {
+                    independent = false;
+                }
+            }
+            prior_group_slots.insert(
+                group_slots.begin(), group_slots.end());
+        }
+        if (!independent) {
+            for (auto& group : groups) execute_group(group, stream);
+            continue;
+        }
+
+        ensure_event(&launch.signature_ready);
+        CUDA_CHECK(cudaEventRecord(launch.signature_ready, stream));
+        const std::size_t used_streams = std::min(
+            groups.size(),
+            Dispatch::Impl::kSignatureStreamCount);
+        for (std::size_t index = 0; index < used_streams; ++index) {
+            ensure_event(&launch.signature_done[index]);
+            CUDA_CHECK(cudaStreamWaitEvent(
+                launch.owner->signature_streams[index],
+                launch.signature_ready,
+                0));
+        }
+        struct SignatureStreamJoin {
+            StagedLaunch::State& launch;
+            cudaStream_t source;
+            std::size_t count;
+            ~SignatureStreamJoin() {
+                for (std::size_t index = 0; index < count; ++index) {
+                    const cudaError_t record_status = cudaEventRecord(
+                        launch.signature_done[index],
+                        launch.owner->signature_streams[index]);
+                    const cudaError_t wait_status =
+                        record_status == cudaSuccess
+                        ? cudaStreamWaitEvent(
+                              source,
+                              launch.signature_done[index],
+                              0)
+                        : record_status;
+                    if (wait_status != cudaSuccess) {
+                        std::fprintf(
+                            stderr,
+                            "[pie-driver-cuda] failed to rejoin PTIR "
+                            "signature stream: %s\n",
+                            cudaGetErrorString(wait_status));
+                    }
+                }
+            }
+        } signature_join{launch, stream, used_streams};
+        for (std::size_t index = 0; index < groups.size(); ++index) {
+            execute_group(
+                groups[index],
+                launch.owner->signature_streams[
+                    index % used_streams]);
+        }
+        {
+            std::lock_guard<std::mutex> lock(
+                launch.owner->stats_mutex);
+            launch.owner->stats.overlapped_groups += groups.size();
         }
     }
 }
@@ -1115,16 +1301,18 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
     state.owner = impl_.get();
     state.view = view;
     state.stream = stream;
-    CUDA_CHECK(cudaMalloc(
+    CUDA_CHECK(cudaMallocAsync(
         reinterpret_cast<void**>(&state.device_layer),
-        sizeof(std::uint32_t)));
+        sizeof(std::uint32_t),
+        stream));
     CUDA_CHECK(cudaEventCreateWithFlags(
         &state.source_ready, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(
+        &state.callback_ready, cudaEventDisableTiming));
     for (cudaEvent_t& event : state.phase_done) {
         CUDA_CHECK(cudaEventCreateWithFlags(
             &event, cudaEventDisableTiming));
     }
-
     const std::size_t count = view.ptir_program_hashes.size();
     std::unordered_map<std::uint64_t, std::size_t> fire_counts;
     state.lanes.reserve(count);
@@ -1137,16 +1325,22 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
         }
         BoundInstance& bound = found->second;
         auto lane = std::make_unique<StagedLane>();
+        const std::size_t instance_occurrence = fire_counts[instance_id]++;
         lane->program = program;
         lane->instance_id = instance_id;
         lane->bound = &bound;
         lane->snapshot =
-            &commit_snapshot(bound, fire_counts[instance_id]++);
+            &commit_snapshot(bound, instance_occurrence);
         lane->plans = impl_->cache.plans(bound.program_hash);
         lane->plan_identities =
             impl_->cache.graph_stage_identities(bound.program_hash);
+        lane->generated_program =
+            impl_->fused_modules.program(bound.program_hash);
         if (lane->plans == nullptr || lane->plan_identities == nullptr ||
-            lane->plan_identities->size() != lane->plans->size()) {
+            lane->plan_identities->size() != lane->plans->size() ||
+            lane->generated_program == nullptr ||
+            lane->generated_program->stages.size() !=
+                lane->plans->size()) {
             throw std::runtime_error("PTIR launch has no compiler region plans");
         }
         for (const plan::StagePlan& stage : *lane->plans) {
@@ -1156,12 +1350,11 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
             lane->phase_plans[stage.stage].push_back(&stage);
         }
         ensure_event(&bound.publish_done);
-        CUDA_CHECK(cudaEventCreateWithFlags(
-            &lane->fire_ready, cudaEventDisableTiming));
         CUDA_CHECK(cudaStreamWaitEvent(stream, bound.publish_done, 0));
-        const std::uint32_t one = 1;
+        const std::uint32_t initial_commit =
+            instance_occurrence == 0 ? 1u : 0u;
         CUDA_CHECK(cudaMemcpyAsync(
-            lane->snapshot->device, &one, sizeof(one),
+            lane->snapshot->device, &initial_commit, sizeof(initial_commit),
             cudaMemcpyHostToDevice, stream));
         lane->tickets =
             build_channel_tickets(view, program, bound, impl_->channels);
@@ -1480,13 +1673,17 @@ bool Dispatch::finish(
     notify->entries.reserve(program_count);
     for (auto& lane_ptr : state.lanes) {
         StagedLane& lane = *lane_ptr;
+        lane.bound->instance->finalize_commit(
+            stream, lane.snapshot->device);
+    }
+    CUDA_CHECK(cudaEventRecord(state.callback_ready, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(
+        callback_stream, state.callback_ready, 0));
+    for (auto& lane_ptr : state.lanes) {
+        StagedLane& lane = *lane_ptr;
         BoundInstance& bound = *lane.bound;
-        bound.instance->finalize_commit(stream, lane.snapshot->device);
-        CUDA_CHECK(cudaEventRecord(lane.fire_ready, stream));
 
         auto outputs = bound.instance->predict_outputs_device();
-        CUDA_CHECK(cudaStreamWaitEvent(
-            callback_stream, lane.fire_ready, 0));
         std::vector<std::uint32_t> output_slots;
         std::vector<NotifyContext::FinalizeEntry::EndpointUpdate> published;
         output_slots.reserve(outputs.size());
@@ -1770,7 +1967,6 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             if (err) *err = "ptir descriptor resolution has no active launch";
             return false;
         }
-        CUDA_CHECK(cudaStreamSynchronize(staged->stream));
     }
 
     for (std::size_t p = 0; p < n_prog; ++p) {
@@ -1794,32 +1990,115 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
 
     out.per_program.resize(n_prog);
     out.is_device_geometry.assign(n_prog, 0);
+    std::vector<detail::PortCellCache> cached_cells(n_prog);
+    std::vector<std::vector<std::vector<std::uint8_t>>> writer_staging(
+        n_prog);
+    bool pulled_writer_input = false;
+    for (std::size_t p = 0; p < n_prog; ++p) {
+        const std::uint64_t iid =
+            view.ptir_program_instances.data()[p];
+        auto it = s.instances.find(iid);
+        if (!is_device_geometry_trace(*it->second.trace)) continue;
+        std::string value_error;
+        if (!it->second.instance->writer_inputs_available(&value_error)) {
+            throw RetryableLaunchError(value_error);
+        }
+        pulled_writer_input =
+            it->second.instance->pull_writer_inputs(
+                nullptr, writer_staging[p]) ||
+            pulled_writer_input;
+    }
+    if (pulled_writer_input) {
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    }
+
+    struct PortCopy {
+        std::size_t program = 0;
+        std::uint32_t slot = 0;
+        const void* source = nullptr;
+        const std::uint8_t* ready_source = nullptr;
+    };
+    std::vector<PortCopy> port_copies;
+    std::vector<std::uint32_t> ready(n_prog, 1);
+    cudaStream_t descriptor_stream =
+        staged == nullptr ? nullptr : staged->stream;
+    for (std::size_t p = 0; p < n_prog; ++p) {
+        const std::uint64_t iid =
+            view.ptir_program_instances.data()[p];
+        auto it = s.instances.find(iid);
+        const Trace* trace = it->second.trace;
+        if (!is_device_geometry_trace(*trace)) continue;
+        const std::unordered_set<std::uint32_t>* pending_slots =
+            staged == nullptr
+                ? nullptr
+                : &staged->lanes[p]->prior_put_slots;
+        for (const PortBinding& binding : trace->ports) {
+            if (binding.is_const) continue;
+            ChannelView& channel_view = it->second.instance->view();
+            const std::uint32_t slot =
+                channel_view.slot(binding.channel);
+            auto [cell, inserted] =
+                cached_cells[p].try_emplace(slot);
+            if (!inserted) continue;
+            cell->second.bytes.resize(
+                channel_view.cell_bytes(binding.channel));
+            const bool pending =
+                pending_slots != nullptr &&
+                pending_slots->contains(slot);
+            cell->second.ready = pending ? 1 : 0;
+            port_copies.push_back(PortCopy{
+                .program = p,
+                .slot = slot,
+                .source = pending
+                    ? channel_view.pending_cell(binding.channel)
+                    : channel_view.committed_cell(binding.channel),
+                .ready_source = pending
+                    ? nullptr
+                    : channel_view.d_full() +
+                          static_cast<std::size_t>(slot) * kMaxRing +
+                          channel_view.registry()->host_head(slot),
+            });
+        }
+        if (staged != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                &ready[p],
+                staged->lanes[p]->snapshot->device,
+                sizeof(std::uint32_t),
+                cudaMemcpyDeviceToHost,
+                descriptor_stream));
+        }
+    }
+    for (const PortCopy& copy : port_copies) {
+        auto& destination = cached_cells[copy.program].at(copy.slot);
+        CUDA_CHECK(cudaMemcpyAsync(
+            destination.bytes.data(),
+            copy.source,
+            destination.bytes.size(),
+            cudaMemcpyDeviceToHost,
+            descriptor_stream));
+        if (copy.ready_source != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                &destination.ready,
+                copy.ready_source,
+                sizeof(destination.ready),
+                cudaMemcpyDeviceToHost,
+                descriptor_stream));
+        }
+    }
+    if (staged != nullptr || !port_copies.empty()) {
+        CUDA_CHECK(cudaStreamSynchronize(descriptor_stream));
+    }
+
     for (std::size_t p = 0; p < n_prog; ++p) {
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
         if (!is_device_geometry_trace(*trace)) continue;
 
-        std::string value_error;
-        if (!it->second.instance->writer_inputs_available(&value_error)) {
-            throw RetryableLaunchError(value_error);
-        }
-
-        // Geometry resolution reads device channel state synchronously, so
-        // pull the writer rings on the default stream and drain it first.
-        std::vector<std::vector<std::uint8_t>> staging;
-        it->second.instance->pull_writer_inputs(nullptr, staging);
-        CUDA_CHECK(cudaStreamSynchronize(nullptr));
         const std::unordered_set<std::uint32_t>* pending_slots = nullptr;
         if (staged != nullptr) {
             const StagedLane& lane = *staged->lanes[p];
-            std::uint32_t ready = 0;
-            CUDA_CHECK(cudaMemcpy(
-                &ready,
-                lane.snapshot->device,
-                sizeof(ready),
-                cudaMemcpyDeviceToHost));
-            if (ready == 0) {
+            if (ready[p] == 0) {
                 throw RetryableLaunchError(
                     "ptir prologue or channel readiness did not commit");
             }
@@ -1829,7 +2108,8 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         FireGeometry& fg = out.per_program[p];
         if (!resolve_fire_geometry(
                 *trace, it->second.instance->view(), page_size, fg, err,
-                allow_structured_masks, pending_slots)) {
+                allow_structured_masks, pending_slots,
+                &cached_cells[p])) {
             return false;
         }
         if (fg.structured_mask) {

@@ -11,6 +11,8 @@
 #include <type_traits>
 #include <unistd.h>
 
+#include "mtl4_context.hpp"
+
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
 #include "decode_consts.hpp"
@@ -22,7 +24,6 @@
 #include "heap_bind_metal.hpp"
 #include "heap_layout.hpp"
 #include "logits_convert.hpp"
-#include "mtl4_context.hpp"
 #include "safetensors_view.hpp"
 #include "scratch.hpp"
 #include "store/kv_pool.hpp"

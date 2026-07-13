@@ -378,11 +378,13 @@ class DeviceChannelRegistry {
     // which must outlive the async copies (it rides the fire's finalize
     // entry). A seeded ring holds its bind-time seed at device index 0, so
     // host entries land one index later.
-    void pull_writer_ring(std::uint32_t slot,
+    bool pull_writer_ring(std::uint32_t slot,
                           cudaStream_t stream,
                           std::vector<std::vector<std::uint8_t>>& staging) {
         const std::uint64_t tail = host_ring_tail(slot);
+        bool copied = false;
         while (pulled_tail_[slot] < tail) {
+            copied = true;
             const std::uint64_t sequence = pulled_tail_[slot]++;
             const std::size_t bytes = wire_bytes(slot);
             const auto* source =
@@ -409,6 +411,7 @@ class DeviceChannelRegistry {
                 d_full_ + static_cast<std::size_t>(slot) * kMaxRing + index,
                 1, 1, stream));
         }
+        return copied;
     }
 
     // Seed a slot's committed cell contents (host bytes → cell 0), pre-loop.
@@ -808,11 +811,11 @@ class ChannelView {
     void publish_host_seed(ChannelId c, const void* data, std::size_t bytes) {
         reg_->publish_host_seed(slot(c), data, bytes);
     }
-    void pull_writer_ring(
+    bool pull_writer_ring(
         ChannelId c,
         cudaStream_t stream,
         std::vector<std::vector<std::uint8_t>>& staging) {
-        reg_->pull_writer_ring(slot(c), stream, staging);
+        return reg_->pull_writer_ring(slot(c), stream, staging);
     }
     void host_feed(ChannelId c, const void* data, std::size_t bytes) {
         reg_->host_feed(slot(c), data, bytes);

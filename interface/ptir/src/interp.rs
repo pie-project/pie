@@ -860,6 +860,13 @@ fn canonical_max(left: f32, right: f32) -> f32 {
         (true, true) => f32::NEG_INFINITY,
         (true, false) => right,
         (false, true) => left,
+        (false, false) if left == 0.0 && right == 0.0 => {
+            if left.is_sign_negative() && right.is_sign_negative() {
+                -0.0
+            } else {
+                0.0
+            }
+        }
         (false, false) => left.max(right),
     }
 }
@@ -869,6 +876,45 @@ fn canonical_min(left: f32, right: f32) -> f32 {
         (true, true) => f32::INFINITY,
         (true, false) => right,
         (false, true) => left,
+        (false, false) if left == 0.0 && right == 0.0 => {
+            if left.is_sign_negative() || right.is_sign_negative() {
+                -0.0
+            } else {
+                0.0
+            }
+        }
+        (false, false) => left.min(right),
+    }
+}
+
+fn element_max(left: f32, right: f32) -> f32 {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => left,
+        (true, false) => right,
+        (false, true) => left,
+        (false, false) if left == 0.0 && right == 0.0 => {
+            if left.is_sign_negative() && right.is_sign_negative() {
+                -0.0
+            } else {
+                0.0
+            }
+        }
+        (false, false) => left.max(right),
+    }
+}
+
+fn element_min(left: f32, right: f32) -> f32 {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => left,
+        (true, false) => right,
+        (false, true) => left,
+        (false, false) if left == 0.0 && right == 0.0 => {
+            if left.is_sign_negative() || right.is_sign_negative() {
+                -0.0
+            } else {
+                0.0
+            }
+        }
         (false, false) => left.min(right),
     }
 }
@@ -991,12 +1037,20 @@ fn eval_op(
             |x, y| x / y,
             |x, y| if y == 0 { 0 } else { x.wrapping_div(y) },
         )),
-        Op::MaxElem(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, f32::max, |x, y| {
-            x.max(y)
-        })),
-        Op::MinElem(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, f32::min, |x, y| {
-            x.min(y)
-        })),
+        Op::MaxElem(a, b) => One(bin_arith(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            element_max,
+            |x, y| x.max(y),
+        )),
+        Op::MinElem(a, b) => One(bin_arith(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            element_min,
+            |x, y| x.min(y),
+        )),
         Op::Rem(a, b) => One(bin_arith(
             v(a),
             v(b),
@@ -2062,6 +2116,8 @@ mod tests {
             canonical_reduce(&[-0.0, 0.0], f32::INFINITY, canonical_min).to_bits(),
             (-0.0f32).to_bits()
         );
+        assert_eq!(element_max(-0.0, 0.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(element_min(0.0, -0.0).to_bits(), (-0.0f32).to_bits());
         assert_eq!(argmax_ordered(&[16_777_216u32, 16_777_217]), 1);
         assert_eq!(argmax_ordered(&[-2i32, -1]), 1);
     }

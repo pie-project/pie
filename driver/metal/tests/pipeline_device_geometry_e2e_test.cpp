@@ -481,11 +481,19 @@ int main() {
     // -- the batch-level completion still notifies exactly once --
     expect(notify_state.contains(completion.wait_id, completion.target_epoch),
           "batch completion notified exactly once despite A's per-member retry");
+#if defined(__APPLE__)
     expect(
         pie::metal::m0_timing_counters()
                .snapshot()
                .cpu_epilogue_samples == 0,
         "production M1 executes no CPU epilogue");
+#else
+    expect(
+        pie::metal::m0_timing_counters()
+               .snapshot()
+               .cpu_epilogue_samples != 0,
+        "Linux stub explicitly uses the CPU oracle");
+#endif
 
     pie_metal_destroy(driver);
     std::remove(config_path.c_str());

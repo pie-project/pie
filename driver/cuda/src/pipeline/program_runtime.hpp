@@ -68,16 +68,18 @@ inline bool validate_plan_structure(
     };
     std::uint32_t next = 0;
     for (std::size_t node = 0; node < stage.ops.size(); ++node) {
-        next += stage.ops[node].op.results;
-        for (const auto argument : stage.ops[node].op.args) {
-            if (argument >= stage.value_types.size()) {
-                return fail("region plan operand is out of range");
+        const auto& op = stage.ops[node].op;
+        const std::uint32_t result_base = next;
+        for (const auto argument : op.args) {
+            if (argument >= result_base) {
+                return fail(
+                    "region plan operand is not a prior SSA value");
             }
         }
-        const auto& op = stage.ops[node].op;
         if (op.tag == PTIR_OP_PIVOT_THRESHOLD &&
-            op.pred_payload >= stage.value_types.size()) {
-            return fail("region plan predicate is out of range");
+            op.pred_payload >= result_base) {
+            return fail(
+                "region plan predicate is not a prior SSA value");
         }
         if ((op.tag == PTIR_OP_CHAN_TAKE ||
              op.tag == PTIR_OP_CHAN_READ ||
@@ -87,20 +89,33 @@ inline bool validate_plan_structure(
                  stage.channel_bindings.size())) {
             return fail("region plan channel binding is out of range");
         }
+        if (next >
+            std::numeric_limits<std::uint32_t>::max() - op.results) {
+            return fail("region plan value layout overflows u32");
+        }
+        next += op.results;
     }
     if (next != stage.value_types.size()) {
         return fail("region plan value layout mismatch");
     }
     auto validate_partition = [&](const plan::Partition& partition) {
         std::vector<std::uint8_t> covered(stage.ops.size(), 0);
+        std::uint32_t previous_node = 0;
+        bool have_previous = false;
         for (const auto& region : partition.regions) {
             if (region.nodes.empty()) return false;
+            if (have_previous &&
+                region.nodes.front() <= previous_node) {
+                return false;
+            }
             for (const auto node : region.nodes) {
                 if (node >= stage.ops.size() || covered[node] != 0) {
                    return false;
                 }
                 covered[node] = 1;
             }
+            previous_node = region.nodes.back();
+            have_previous = true;
             if (!region.library) {
                 if (region.schedule == PTIR_SCHEDULE_LIBRARY) return false;
                 continue;
@@ -146,7 +161,8 @@ inline bool validate_plan_structure(
                 (region.library_op == PTIR_LIBRARY_MATMUL &&
                  op.tag == PTIR_OP_MATMUL) ||
                 (region.library_op == PTIR_LIBRARY_SECOND_PARTY &&
-                 op.tag == PTIR_OP_KERNEL_CALL);
+                 (op.tag == PTIR_OP_KERNEL_CALL ||
+                  op.tag == PTIR_OP_SINK_CALL));
             if (!matches) return false;
         }
         return std::all_of(
@@ -410,14 +426,18 @@ class PtirInstance {
 
     // §4.3 pull: move each host-writer channel's published ring entries into
     // the device cells, stream-ordered before the pass.
-    void pull_writer_inputs(
+    bool pull_writer_inputs(
         cudaStream_t stream,
         std::vector<std::vector<std::uint8_t>>& staging) {
+        bool copied = false;
         for (const Channel& ch : trace_->channels) {
             if (ch.host_visible && !ch.host_reader) {
-                view_.pull_writer_ring(ch.id, stream, staging);
+                copied =
+                    view_.pull_writer_ring(ch.id, stream, staging) ||
+                    copied;
             }
         }
+        return copied;
     }
 
     // One fire: run one tier-0 pass over the already-pulled channel state.

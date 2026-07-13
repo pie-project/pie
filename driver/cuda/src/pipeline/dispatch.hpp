@@ -1,8 +1,8 @@
 #pragma once
 
 // `pipeline::Dispatch`: driver-side PTIR stage-program dispatcher —
-// a CUDA-FREE façade over the tier-0 runtime (`program_runtime.hpp`). The impl
-// + the `__global__` tier-0 kernels live in `dispatch.cu`, so host `.cpp`
+// a CUDA-FREE façade over the generated runtime (`program_runtime.hpp`). The impl
+// + generated/library launch integration live in `dispatch.cu`, so host `.cpp`
 // translation units that include `batch/forward.hpp` never pull device code (the
 // tier-0 headers only compile under nvcc). This is the driver half of the submission path: the
 // executor opens a launch before descriptor resolution, invokes the declared
@@ -55,7 +55,8 @@ class StagedLaunch {
 };
 
 struct DispatchStats {
-    std::uint64_t grouped_tier0_groups = 0;
+    std::uint64_t generated_fused_groups = 0;
+    std::uint64_t generated_fused_body_launches = 0;
     std::uint64_t grouped_lanes = 0;
     std::uint64_t nucleus_library_groups = 0;
     std::uint64_t selection_library_groups = 0;
@@ -69,9 +70,14 @@ struct DispatchStats {
     std::uint64_t large_nucleus_scalable_groups = 0;
     std::uint64_t shared_slot_exclusions = 0;
     std::uint64_t rs_exclusions = 0;
-    std::uint64_t grouped_graph_cache_entries = 0;
-    std::uint64_t grouped_graph_captures = 0;
-    std::uint64_t grouped_graph_replays = 0;
+    std::uint64_t generated_compilations = 0;
+    std::uint64_t generated_disk_hits = 0;
+    std::uint64_t generated_disk_writes = 0;
+    std::uint64_t generated_disk_errors = 0;
+    std::uint64_t generated_negative_hits = 0;
+    std::uint64_t generated_stage_cache_entries = 0;
+    std::uint64_t generated_program_cache_entries = 0;
+    std::uint64_t generated_negative_cache_entries = 0;
 };
 
 class Dispatch {

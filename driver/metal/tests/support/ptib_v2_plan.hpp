@@ -201,6 +201,7 @@ inline bool library_for_op(
             library = PTIR_LIBRARY_MATMUL;
             return true;
         case PTIR_OP_KERNEL_CALL:
+        case PTIR_OP_SINK_CALL:
             library = PTIR_LIBRARY_SECOND_PARTY;
             return true;
         default:

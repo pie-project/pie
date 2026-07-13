@@ -179,7 +179,8 @@ bool library_region_valid(
         case PTIR_LIBRARY_MATMUL:
             return tag == PTIR_OP_MATMUL;
         case PTIR_LIBRARY_SECOND_PARTY:
-            return tag == PTIR_OP_KERNEL_CALL;
+            return tag == PTIR_OP_KERNEL_CALL ||
+                tag == PTIR_OP_SINK_CALL;
         default:
             return false;
     }

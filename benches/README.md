@@ -49,6 +49,10 @@ For Pie:
 uv --project sdk/python-server sync --reinstall-package pie-server
 ```
 
+`cuda_native` runs through that embedded extension. The benchmark reports its
+path and SHA-256 and refuses to run when the extension predates engine/driver
+sources, preventing stale native builds from being measured.
+
 For vLLM or SGLang, use separate virtual environments and install the engine
 there. The runners import the engine packages from the Python used to launch
 the script.

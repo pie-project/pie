@@ -2257,13 +2257,13 @@ void register_rule_case() {
     for (auto& instance : instances) {
         instance->view().sync_host_rings();
         std::uint32_t state_value = 0;
-        std::uint32_t output_value = 0;
         instance->view().read_committed(0, &state_value, sizeof(state_value));
-        instance->view().read_committed(1, &output_value, sizeof(output_value));
-        expect(state_value == 8, "last grouped put wins");
         expect(
-            output_value == 8,
-            "put-then-take/read observes pending grouped value");
+            state_value == 5,
+            "put-then-take preserves unread seeded state");
+        expect(
+            !instance->view().committed_full(1),
+            "put-then-take readiness miss publishes no output");
     }
 }
 
@@ -2679,8 +2679,8 @@ void ragged_rows_case() {
                 std::to_string(lane));
     }
     expect(
-        launch.body_op_launches == 4,
-        "ragged sampled rows launch once per op, not once per lane");
+        launch.body_op_launches == 3,
+        "ragged sampled rows launch once per executable op/effect, not once per lane");
     cudaFree(logits_device);
 }
 
@@ -3398,6 +3398,32 @@ void exclusion_cases() {
     const std::vector<std::uint8_t> mask(vocab, 1);
     const std::size_t instance = fixture.add_instance(vocab, 0, mask);
     auto tickets = fixture.tickets(instance, 0);
+    auto& view = fixture.instances[instance]->view();
+    detail::PortCellCache cached_cells;
+    auto& cached = cached_cells[view.slot(0)];
+    cached.bytes.resize(view.cell_bytes(0));
+    std::vector<std::uint8_t> cached_output;
+    std::string cached_error;
+    expect(
+        !detail::read_port_cell(
+            view,
+            0,
+            cached_output,
+            &cached_error,
+            nullptr,
+            &cached_cells) &&
+            cached_error.find("not ready") != std::string::npos,
+        "descriptor cache preserves empty-channel readiness");
+    cached.ready = 1;
+    expect(
+        detail::read_port_cell(
+            view,
+            0,
+            cached_output,
+            &cached_error,
+            nullptr,
+            &cached_cells),
+        "descriptor cache serves bytes only after readiness");
     std::vector<GroupedLaneBinding> aliased(2);
     for (GroupedLaneBinding& lane : aliased) {
         lane.instance = fixture.instances[instance].get();

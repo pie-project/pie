@@ -19,12 +19,25 @@ use super::stats::SchedulerStats;
 use super::worker::FireClause;
 use crate::scheduler::ProcessId;
 
-/// One-step run-ahead (R10): the DEFAULT run-ahead depth — at most one batch
-/// computing + one prefetched. Override via `PIE_SCHED_MAX_IN_FLIGHT`
+/// Default run-ahead depth: one batch computing plus up to three prefetched.
+/// Override via `PIE_SCHED_MAX_IN_FLIGHT`
 /// (see [`configured_max_in_flight`]).
-const DEFAULT_MAX_IN_FLIGHT: usize = 2;
+const DEFAULT_MAX_IN_FLIGHT: usize = 4;
 
-const COLD_HOLD_US: u64 = 500;
+const COLD_HOLD_US: u64 = 2_000;
+
+fn cold_hold() -> Duration {
+    static HOLD: OnceLock<Duration> = OnceLock::new();
+    *HOLD.get_or_init(|| {
+        Duration::from_micros(
+            std::env::var("PIE_SCHED_COLD_HOLD_US")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(COLD_HOLD_US)
+                .max(1),
+        )
+    })
+}
 
 /// Reads the requested run-ahead depth once. Dispatch-time preparation is the
 /// allocation-credit gate: physical pool allocation is atomic, and an
@@ -48,21 +61,37 @@ pub(super) fn configured_max_in_flight() -> usize {
 /// this only bounds the worst-case re-evaluation cadence (a hang backstop).
 pub(super) const QUORUM_POLL_US: u64 = 200;
 
-const WAITALL_DEADLINE_US_DEFAULT: u64 = 10_000;
+const WAITALL_DEADLINE_US_DEFAULT: u64 = 500;
 
 /// Consecutive deadline-misses before a pipeline is demoted from the wait-set
 /// and queued for termination.
-const WAITALL_MISS_LIMIT_DEFAULT: u32 = 100;
+const WAITALL_MISS_LIMIT_DEFAULT: u32 = 10_000;
 
-/// The per-wave straggler deadline (10ms).
+/// The per-wave straggler deadline (500 us by default).
 fn waitall_deadline() -> Duration {
-    Duration::from_micros(WAITALL_DEADLINE_US_DEFAULT)
+    static DEADLINE: OnceLock<Duration> = OnceLock::new();
+    *DEADLINE.get_or_init(|| {
+        Duration::from_micros(
+            std::env::var("PIE_SCHED_WAITALL_DEADLINE_US")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(WAITALL_DEADLINE_US_DEFAULT)
+                .max(1),
+        )
+    })
 }
 
-/// The consecutive-miss demotion limit. One hundred 10 ms misses leaves a
-/// full second for a healthy pipeline's host round-trip before termination.
+/// The consecutive-miss demotion limit. Ten thousand default-length misses
+/// leave five seconds for a healthy pipeline's host round-trip.
 fn waitall_miss_limit() -> u32 {
-    WAITALL_MISS_LIMIT_DEFAULT
+    static LIMIT: OnceLock<u32> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("PIE_SCHED_WAITALL_MISS_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(WAITALL_MISS_LIMIT_DEFAULT)
+            .max(1)
+    })
 }
 
 /// The wave-level fire decision. `Fire::missing` is the pipelines that missed
@@ -155,6 +184,30 @@ impl WaitAllPolicy {
         }
     }
 
+    /// A queued request that had already contributed a readiness credit will
+    /// never dispatch (cancellation, stale instance, or synchronous rejection).
+    pub fn on_request_dropped(&mut self, pid: Option<ProcessId>) {
+        match pid {
+            Some(pid) => {
+                if let Some(state) = self.active.get_mut(&pid) {
+                    debug_assert!(
+                        state.wave_ready > 0,
+                        "dropped pipeline request has no readiness credit"
+                    );
+                    state.wave_ready = state.wave_ready.saturating_sub(1);
+                } else {
+                    self.untracked_ready = self.untracked_ready.saturating_sub(1);
+                }
+            }
+            None => {
+                self.untracked_ready = self.untracked_ready.saturating_sub(1);
+            }
+        }
+        if self.untracked_ready == 0 && self.active.values().all(|state| state.wave_ready == 0) {
+            self.wave_started = None;
+        }
+    }
+
     /// A pipeline left the fleet (cancel / kill / exit / TASK-A terminate /
     /// TASK-B preempt). Its requests already in the wave ride along as
     /// untracked; it is no longer awaited. Rejoin is implicit on its next
@@ -162,6 +215,11 @@ impl WaitAllPolicy {
     pub fn on_pipeline_leave(&mut self, pid: ProcessId) {
         if let Some(state) = self.active.remove(&pid) {
             self.untracked_ready += state.wave_ready;
+        }
+        if self.active.is_empty() {
+            self.ever_fired = false;
+            self.cold_hold_deadline = None;
+            self.wave_started = None;
         }
     }
 
@@ -202,6 +260,7 @@ impl WaitAllPolicy {
         // penalty (the wave didn't run out of patience; it ran out of room).
         if current_batch_size >= self.max_forward_requests {
             self.record_clause(FireClause::Quorum);
+            self.record_wave(0);
             return WaveDecision::Fire {
                 missing: Vec::new(),
             };
@@ -212,11 +271,14 @@ impl WaitAllPolicy {
         if current_batch_size == 0 {
             return WaveDecision::Wait(Duration::from_micros(QUORUM_POLL_US));
         }
-
         let missing: Vec<ProcessId> = self
             .active
             .iter()
-            .filter(|(_, s)| s.wave_ready == 0 && !s.retry_participating && s.in_flight == 0)
+            .filter(|(_, s)| {
+                s.wave_ready == 0
+                    && !s.retry_participating
+                    && s.in_flight < configured_max_in_flight()
+            })
             .map(|(&pid, _)| pid)
             .collect();
 
@@ -225,6 +287,7 @@ impl WaitAllPolicy {
             if self.ever_fired {
                 // Dense wave — the steady-state fire.
                 self.record_clause(FireClause::Quorum);
+                self.record_wave(0);
                 return WaveDecision::Fire {
                     missing: Vec::new(),
                 };
@@ -235,7 +298,7 @@ impl WaitAllPolicy {
             // fleet's first requests to gather into one dense wave.
             match self.cold_hold_deadline {
                 None => {
-                    let window = Duration::from_micros(COLD_HOLD_US);
+                    let window = cold_hold();
                     self.cold_hold_deadline = Some(now + window);
                     return WaveDecision::Wait(window);
                 }
@@ -244,6 +307,7 @@ impl WaitAllPolicy {
                 }
                 _ => {
                     self.record_clause(FireClause::ColdHold);
+                    self.record_wave(0);
                     return WaveDecision::Fire {
                         missing: Vec::new(),
                     };
@@ -278,30 +342,45 @@ impl WaitAllPolicy {
             }
         }
         self.record_clause(FireClause::IdleEscape);
+        self.record_wave(missing.len());
         WaveDecision::Fire { missing }
     }
 
-    /// A wave was dispatched: bump the run-ahead depth `decide_wave_at`
-    /// gates on, and reset this wave's bookkeeping so the next arrivals
-    /// start a fresh gather. Participation resets the straggler count for
-    /// whoever rode this wave; absentees keep theirs (already bumped on the
-    /// deadline path that fired this wave, if it was a deadline fire) —
-    /// this is the live dispatch-side half of the removed `on_fired`,
-    /// without its EWMA/decay baggage.
-    pub fn on_wave_dispatched(&mut self, participants: &[Option<ProcessId>]) {
+    /// A wave was dispatched: consume exactly one readiness credit for each
+    /// submitted row and retain credits for requests already queued behind
+    /// this wave. Participation resets the straggler count for whoever rode
+    /// this wave; absentees keep theirs.
+    pub fn on_wave_dispatched(&mut self, participants: &[Option<ProcessId>], now: Instant) {
         self.in_flight += 1;
         self.ever_fired = true;
         self.cold_hold_deadline = None;
-        self.wave_started = None;
-        self.untracked_ready = 0;
-        for pid in participants.iter().flatten() {
-            self.active.entry(*pid).or_default().in_flight += 1;
+        for participant in participants {
+            match participant {
+                Some(pid) => {
+                    if let Some(state) = self.active.get_mut(pid) {
+                        debug_assert!(
+                            state.wave_ready > 0,
+                            "dispatched pipeline row has no readiness credit"
+                        );
+                        state.wave_ready = state.wave_ready.saturating_sub(1);
+                        state.in_flight += 1;
+                        state.consecutive_misses = 0;
+                    } else {
+                        self.untracked_ready = self.untracked_ready.saturating_sub(1);
+                    }
+                }
+                None => {
+                    self.untracked_ready = self.untracked_ready.saturating_sub(1);
+                }
+            }
         }
         for state in self.active.values_mut() {
-            if state.wave_ready > 0 {
-                state.consecutive_misses = 0;
-                state.wave_ready = 0;
-            }
+            state.retry_participating = false;
+        }
+        if self.untracked_ready == 0 && self.active.values().all(|state| state.wave_ready == 0) {
+            self.wave_started = None;
+        } else {
+            self.wave_started = Some(now);
         }
     }
 
@@ -334,6 +413,23 @@ impl WaitAllPolicy {
             }
         }
         let _ = (clause, &self.stats);
+    }
+
+    fn record_wave(&self, missing: usize) {
+        if let Some(stats) = &self.stats {
+            use std::sync::atomic::Ordering::Relaxed;
+            stats
+                .fire
+                .quorum
+                .wave_active_sum
+                .fetch_add(self.active.len() as u64, Relaxed);
+            stats
+                .fire
+                .quorum
+                .wave_missing_sum
+                .fetch_add(missing as u64, Relaxed);
+            stats.fire.quorum.wave_fires.fetch_add(1, Relaxed);
+        }
     }
 }
 
@@ -374,7 +470,14 @@ mod tests {
                 missing: Vec::new()
             }
         );
-        policy.on_wave_dispatched(&[]);
+        let participants = policy
+            .active
+            .iter()
+            .filter(|(_, state)| state.wave_ready > 0)
+            .map(|(&pid, _)| Some(pid))
+            .collect::<Vec<_>>();
+        policy.on_wave_dispatched(&participants, past_cold_hold);
+        policy.on_wave_retired(&participants);
         past_cold_hold
     }
 
@@ -440,8 +543,8 @@ mod tests {
 
         // Wave 2: only `a` resubmits.
         policy.on_pipeline_request(Some(a), past_cold_hold);
-        // Still inside the 10ms straggler deadline: holds for `b`.
-        match policy.decide_wave_at(1, past_cold_hold + Duration::from_millis(1)) {
+        // Still inside the straggler deadline: holds for `b`.
+        match policy.decide_wave_at(1, past_cold_hold + Duration::from_micros(250)) {
             WaveDecision::Wait(_) => {}
             other => panic!("expected a straggler wait, got {other:?}"),
         }
@@ -456,6 +559,74 @@ mod tests {
             policy.is_active(b),
             "one miss is well under the demote limit"
         );
+    }
+
+    #[test]
+    fn one_in_flight_request_does_not_exempt_a_pipeline_from_runahead_wave() {
+        let mut policy = WaitAllPolicy::new(4, None);
+        let (a, b) = (pid(), pid());
+        let t0 = Instant::now();
+        policy.on_pipeline_request(Some(a), t0);
+        policy.on_pipeline_request(Some(b), t0);
+        let past_cold_hold = t0 + Duration::from_micros(COLD_HOLD_US + 100);
+        let _ = policy.decide_wave_at(2, t0);
+        assert_eq!(
+            policy.decide_wave_at(2, past_cold_hold),
+            WaveDecision::Fire {
+                missing: Vec::new()
+            }
+        );
+        policy.on_wave_dispatched(&[Some(a), Some(b)], past_cold_hold);
+
+        policy.on_pipeline_request(Some(a), past_cold_hold);
+        assert!(
+            matches!(
+                policy.decide_wave_at(1, past_cold_hold + Duration::from_micros(250)),
+                WaveDecision::Wait(_)
+            ),
+            "b has only one in-flight request and must still fill depth two"
+        );
+    }
+
+    #[test]
+    fn dispatch_consumes_only_participating_readiness_credits() {
+        let mut policy = WaitAllPolicy::new(4, None);
+        let (a, b) = (pid(), pid());
+        let t0 = Instant::now();
+        policy.on_pipeline_request(Some(a), t0);
+        policy.on_pipeline_request(Some(a), t0);
+        policy.on_pipeline_request(Some(b), t0);
+
+        let _ = policy.decide_wave_at(2, t0);
+        let after = t0 + Duration::from_micros(COLD_HOLD_US + 100);
+        assert_eq!(
+            policy.decide_wave_at(2, after),
+            WaveDecision::Fire {
+                missing: Vec::new()
+            }
+        );
+        policy.on_wave_dispatched(&[Some(a), Some(b)], after);
+
+        assert_eq!(policy.active[&a].wave_ready, 1);
+        assert_eq!(policy.active[&b].wave_ready, 0);
+        match policy.decide_wave_at(1, after + Duration::from_micros(250)) {
+            WaveDecision::Wait(_) => {}
+            other => panic!("queued a credit must leave only b missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_a_queued_request_removes_only_its_credit() {
+        let mut policy = WaitAllPolicy::new(4, None);
+        let a = pid();
+        let t0 = Instant::now();
+        policy.on_pipeline_request(Some(a), t0);
+        policy.on_pipeline_request(Some(a), t0);
+
+        policy.on_request_dropped(Some(a));
+
+        assert_eq!(policy.active[&a].wave_ready, 1);
+        assert_eq!(policy.wave_started, Some(t0));
     }
 
     #[test]
@@ -478,6 +649,23 @@ mod tests {
             WaveDecision::Fire {
                 missing: Vec::new()
             }
+        );
+    }
+
+    #[test]
+    fn empty_wait_set_rearms_bootstrap_gather_for_the_next_fleet() {
+        let mut policy = WaitAllPolicy::new(4, None);
+        let first = pid();
+        let t0 = Instant::now();
+        policy.on_pipeline_request(Some(first), t0);
+        let fired = bootstrap_fire(&mut policy, 1, t0);
+        policy.on_pipeline_leave(first);
+
+        let next = pid();
+        policy.on_pipeline_request(Some(next), fired);
+        assert_eq!(
+            policy.decide_wave_at(1, fired),
+            WaveDecision::Wait(Duration::from_micros(COLD_HOLD_US))
         );
     }
 
@@ -517,11 +705,11 @@ mod tests {
                 policy.decide_wave_at(1, t),
                 WaveDecision::Fire { missing: vec![b] }
             );
-            policy.on_wave_dispatched(&[]);
+            policy.on_wave_dispatched(&[Some(a)], t);
             // Retire the wave before the next one gathers — otherwise the
             // run-ahead depth cap itself would hold (unrelated to this
             // test's miss-limit demotion).
-            policy.on_wave_retired(&[]);
+            policy.on_wave_retired(&[Some(a)]);
         }
         assert!(
             !policy.is_active(b),
