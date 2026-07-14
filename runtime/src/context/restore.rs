@@ -32,6 +32,17 @@ use crate::adapter::AdapterId;
 use crate::driver::{self, DriverId};
 use crate::inference;
 
+fn replay_masks_require_custom(masks: &[pie_bridge::Brle], positions: &[u32]) -> bool {
+    if masks.len() != positions.len() {
+        return true;
+    }
+
+    masks.iter().zip(positions).any(|(mask, &position)| {
+        materialize_lineage_mask(mask, position)
+            != pie_bridge::Brle::all_true((position + 1) as usize)
+    })
+}
+
 // =============================================================================
 // Restore methods on ContextManager
 // =============================================================================
@@ -406,9 +417,13 @@ impl ContextManager {
                 all_phys.len()
             );
             if pages_needed > 0 {
-                let tokens = group.iter().map(|info| info.token).collect();
-                let positions = group.iter().map(|info| info.position).collect();
-                let masks = group.iter().map(|info| info.mask.clone()).collect();
+                let tokens = group.iter().map(|info| info.token).collect::<Vec<_>>();
+                let positions = group.iter().map(|info| info.position).collect::<Vec<_>>();
+                let masks = group
+                    .iter()
+                    .map(|info| info.mask.clone())
+                    .collect::<Vec<_>>();
+                let has_user_mask = replay_masks_require_custom(&masks, &positions);
                 let last_page_len = compute_last_page_len(
                     total_after as u32,
                     pages_needed as u32,
@@ -419,7 +434,7 @@ impl ContextManager {
                     tokens,
                     positions,
                     masks,
-                    true,
+                    has_user_mask,
                     None,
                     Vec::new(),
                     Vec::new(),
@@ -591,22 +606,21 @@ impl ContextManager {
                     let last_page_len =
                         compute_last_page_len(total_kv, total_pages_for_fwd, page_size as u32);
 
-                    // Replay reproduces a previously-executed prefix whose
-                    // masks were already in the lineage. We can't
-                    // distinguish user-supplied from synthesized in the
-                    // lineage, so we conservatively force the prefill
-                    // kernel (which honors `custom_mask`) to preserve the
-                    // original semantics regardless.
+                    let replay_masks = suffix_masks[..aligned_len]
+                        .iter()
+                        .zip(&suffix_positions[..aligned_len])
+                        .map(|(mask, &position)| materialize_lineage_mask(mask, position))
+                        .collect::<Vec<_>>();
+                    let has_user_mask = replay_masks_require_custom(
+                        &replay_masks,
+                        &suffix_positions[..aligned_len],
+                    );
                     let fwd_req = crate::inference::request::new_per_request(
                         0,
                         suffix_tokens[..aligned_len].to_vec(),
                         suffix_positions[..aligned_len].to_vec(),
-                        suffix_masks[..aligned_len]
-                            .iter()
-                            .zip(&suffix_positions[..aligned_len])
-                            .map(|(mask, &position)| materialize_lineage_mask(mask, position))
-                            .collect(),
-                        true, // has_user_mask
+                        replay_masks,
+                        has_user_mask,
                         None,
                         Vec::new(),
                         Vec::new(),
@@ -642,6 +656,7 @@ impl ContextManager {
                     positions.push(info.position);
                     masks.push(materialize_lineage_mask(&info.mask, info.position));
                 }
+                let has_user_mask = replay_masks_require_custom(&masks, &positions);
 
                 // Try to merge into the last committed suffix request.
                 let adapter_i64 = adapter.map(|id| id as i64).unwrap_or(-1);
@@ -659,6 +674,7 @@ impl ContextManager {
                         last_req.token_ids.extend_from_slice(&tokens);
                         last_req.position_ids.extend_from_slice(&positions);
                         last_req.masks.extend_from_slice(&masks);
+                        last_req.has_user_mask |= has_user_mask;
                         *last_req.qo_indptr.last_mut().unwrap() = last_req.token_ids.len() as u32;
                         *last_req.mask_indptr.last_mut().unwrap() = last_req.masks.len() as u32;
                         last_phys.extend_from_slice(&working_pages[..num_replay_pages]);
@@ -687,15 +703,12 @@ impl ContextManager {
                     let last_page_len =
                         compute_last_page_len(total_kv, total_pages_for_fwd, page_size as u32);
 
-                    // See restore.rs head: replay forces prefill kernel
-                    // because the lineage doesn't tell us whether masks
-                    // were originally user-supplied or synthesized.
                     let fwd_req = crate::inference::request::new_per_request(
                         0,
                         tokens,
                         positions,
                         masks,
-                        true, // has_user_mask
+                        has_user_mask,
                         None,
                         Vec::new(),
                         Vec::new(),
@@ -846,5 +859,26 @@ impl ContextManager {
         for op in deferred_ops {
             (op.on_complete)(self, Err(error.clone()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replay_masks_require_custom;
+    use pie_bridge::Brle;
+
+    #[test]
+    fn causal_lineage_masks_do_not_force_custom_replay() {
+        let positions = [0, 31, 65_535];
+        let masks = [Brle::new(0), Brle::all_true(32), Brle::all_true(65_536)];
+
+        assert!(!replay_masks_require_custom(&masks, &positions));
+    }
+
+    #[test]
+    fn non_causal_or_misaligned_lineage_masks_stay_custom() {
+        let custom = [Brle::new(4)];
+        assert!(replay_masks_require_custom(&custom, &[3]));
+        assert!(replay_masks_require_custom(&custom, &[]));
     }
 }
