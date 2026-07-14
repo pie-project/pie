@@ -56,7 +56,12 @@ impl PendingRequest {
         }
 
         let usage = request_capacity_usage(&self, page_size);
-        let chunk_size = match chunk_size_for_limits(&usage, limits) {
+        let final_kv_tokens = total_kv_for_pages(
+            self.physical_page_ids.len() as u32,
+            self.last_page_len,
+            page_size,
+        ) as usize;
+        let chunk_size = match chunk_size_for_limits(&usage, limits, final_kv_tokens) {
             Ok(Some(chunk_size)) => chunk_size,
             Ok(None) => return Ok(self),
             Err(msg) => return Err((self, msg)),
@@ -662,6 +667,7 @@ fn response_nested_slot_count(
 fn chunk_size_for_limits(
     usage: &RequestCapacityUsage,
     limits: SchedulerLimits,
+    final_kv_tokens: usize,
 ) -> std::result::Result<Option<usize>, String> {
     let mut chunk_size = limits.max_forward_tokens;
     let mut needs_chunking = usage.forward_tokens > limits.max_forward_tokens;
@@ -681,6 +687,30 @@ fn chunk_size_for_limits(
             chunk_size = chunk_size.min(limits.max_prob_rows);
             needs_chunking = true;
         }
+    }
+
+    let custom_mask_bytes = if usage.has_spec_drafts {
+        usage.spec_custom_mask_bytes
+    } else {
+        usage.user_custom_mask_bytes
+    };
+    if custom_mask_bytes > limits.max_custom_mask_bytes {
+        // Use the final KV length so one conservative chunk size is safe for
+        // every continuation, including the last chunk with the largest page
+        // prefix. A single-token user-mask request uses the driver's existing
+        // single-token path and carries no packed custom-mask payload.
+        let mask_limited_tokens = if final_kv_tokens == 0 {
+            usage.forward_tokens
+        } else {
+            limits
+                .max_custom_mask_bytes
+                .saturating_mul(8)
+                .checked_div(final_kv_tokens)
+                .unwrap_or(0)
+                .max(1)
+        };
+        chunk_size = chunk_size.min(mask_limited_tokens);
+        needs_chunking = true;
     }
 
     if !needs_chunking {
@@ -1696,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn chunked_validation_rejects_later_chunk_mask_limit_before_first_submit() {
+    fn custom_mask_limit_starts_chunking_below_forward_token_limit() {
         let mut capped = limits(8, 4, 100);
         capped.max_custom_mask_bytes = 3;
         let tokens = 10;
@@ -1707,12 +1737,52 @@ mod tests {
         pending.request.has_user_mask = true;
         pending.request.single_token_mode = false;
 
-        let err = match pending.maybe_start_chunking(capped, page_size) {
-            Ok(_) => panic!("expected custom-mask rejection"),
-            Err((_, msg)) => msg,
+        let first = match pending.maybe_start_chunking(capped, page_size) {
+            Ok(chunked) => chunked,
+            Err((_, msg)) => panic!("{msg}"),
         };
 
-        assert!(err.contains("custom mask bytes"), "{err}");
+        assert_eq!(first.request.token_ids, vec![0, 1]);
+        assert!(matches!(first.completion, Completion::Chunk { .. }));
+        let usage = request_capacity_usage(&first, page_size);
+        assert!(usage.user_custom_mask_bytes <= capped.max_custom_mask_bytes);
+    }
+
+    #[test]
+    fn custom_mask_chunk_size_is_safe_for_largest_kv_prefix() {
+        let page_size = 4;
+        let kv_before = 14;
+        let tokens = 6;
+        let total_kv = kv_before + tokens as u32;
+        let mut capped = limits(8, 8, 100);
+        capped.max_custom_mask_bytes = 10;
+        let mut pending = positioned_pending_with_prefix(tokens, page_size, kv_before);
+        pending.request.masks = true_suffix_masks(tokens, total_kv);
+        pending.request.mask_indptr = vec![0, tokens as u32];
+        pending.request.has_user_mask = true;
+        pending.request.single_token_mode = false;
+
+        let mut current = match pending.maybe_start_chunking(capped, page_size) {
+            Ok(chunked) => chunked,
+            Err((_, msg)) => panic!("{msg}"),
+        };
+        let mut seen = Vec::new();
+        loop {
+            let usage = request_capacity_usage(&current, page_size);
+            assert!(usage.user_custom_mask_bytes <= capped.max_custom_mask_bytes);
+            seen.extend_from_slice(&current.request.token_ids);
+            let Completion::Chunk { continuation, .. } = current.completion else {
+                panic!("expected chunk continuation");
+            };
+            if seen.len() == tokens {
+                break;
+            }
+            current = match continuation.into_next_pending(page_size) {
+                Ok(next) => next,
+                Err((_, msg)) => panic!("{msg}"),
+            };
+        }
+        assert_eq!(seen, (0..tokens as u32).collect::<Vec<_>>());
     }
 
     #[test]
