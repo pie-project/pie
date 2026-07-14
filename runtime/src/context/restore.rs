@@ -455,6 +455,7 @@ impl ContextManager {
         let model_idx = self.model_idx;
         let driver_id = driver_idx;
         tokio::spawn(async move {
+            let mut replay_error = None;
             for (fwd_req, phys_ids, last_page_len) in requests {
                 let result = inference::submit(
                     model_idx,
@@ -466,11 +467,13 @@ impl ContextManager {
                 )
                 .await;
                 if let Err(e) = result {
+                    let error = format!("rs_cache replay forward pass failed: {e:#}");
                     tracing::error!(
                         ctx = ctx_id,
                         driver = driver_id,
-                        "rs_cache replay forward pass failed: {e:#}"
+                        "{error}"
                     );
+                    replay_error = Some(error);
                     break;
                 }
             }
@@ -481,6 +484,7 @@ impl ContextManager {
                     scratch_driver: driver_id,
                     scratch_pages: scratch_prefix_pages,
                     registration,
+                    error: replay_error,
                 },
             );
         });
@@ -717,6 +721,7 @@ impl ContextManager {
         let driver_id = driver_idx;
 
         tokio::spawn(async move {
+            let mut replay_error = None;
             for (fwd_req, phys_ids, last_page_len) in requests {
                 let result = inference::submit(
                     model_idx,
@@ -729,11 +734,13 @@ impl ContextManager {
                 .await;
 
                 if let Err(e) = result {
+                    let error = format!("replay forward pass failed: {e:#}");
                     tracing::error!(
                         ctx = ctx_id,
                         driver = driver_id,
-                        "replay forward pass failed: {e:#}"
+                        "{error}"
                     );
+                    replay_error = Some(error);
                     break; // Later chunks depend on this one's KV data
                 }
             }
@@ -746,6 +753,7 @@ impl ContextManager {
                     scratch_driver: driver_id,
                     scratch_pages: Vec::new(),
                     registration: None,
+                    error: replay_error,
                 },
             );
         });
@@ -773,10 +781,10 @@ impl ContextManager {
             }
             if num_pages == 0 {
                 let op = ops.remove(0);
-                (op.on_alloc)(self, Vec::new());
+                (op.on_complete)(self, Ok(Vec::new()));
             } else if let Some(pages) = self.gpu_stores[driver_idx].alloc(num_pages) {
                 let op = ops.remove(0);
-                (op.on_alloc)(self, pages);
+                (op.on_complete)(self, Ok(pages));
             } else {
                 // Stalled — put all remaining ops back on deferred_ops.
                 if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
@@ -816,5 +824,27 @@ impl ContextManager {
         }
 
         self.fire_deferred_ops(id);
+    }
+
+    /// Fail a context whose GPU replay could not reconstruct valid state.
+    ///
+    /// Replay is an all-or-nothing transition: a partial replay must never
+    /// reactivate the context. Remove it, release its resources, and deliver
+    /// the same terminal cause to every operation that was waiting for it.
+    pub(crate) fn replay_failed(&mut self, id: ContextId, error: String) {
+        let deferred_ops = match self.contexts.get_mut(&id) {
+            Some(ctx) if ctx.is_pinned() && ctx.pending_replay => {
+                std::mem::take(&mut ctx.deferred_ops)
+            }
+            _ => return,
+        };
+
+        tracing::error!(ctx = id, "context replay failed terminally: {error}");
+        if let Err(destroy_error) = self.destroy(id) {
+            tracing::error!(ctx = id, "failed to destroy replay context: {destroy_error:#}");
+        }
+        for op in deferred_ops {
+            (op.on_complete)(self, Err(error.clone()));
+        }
     }
 }
