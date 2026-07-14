@@ -73,8 +73,9 @@ impl ContextManager {
         // Create a temporary context ID for the fork operation.
         // We use the source context for contention — the fork inherits
         // the source's scheduling state.
-        self.when_allocated_allow_off_gpu(id, driver_idx, needed, move |mgr, gpu_pages| {
+        self.when_allocated_allow_off_gpu(id, driver_idx, needed, move |mgr, allocation| {
             let result = (|| -> Result<ContextId> {
+                let gpu_pages = allocation.map_err(anyhow::Error::msg)?;
                 let ctx = mgr
                     .contexts
                     .get(&id)
@@ -461,8 +462,10 @@ impl ContextManager {
             driver: driver_idx,
             num_pages: needed,
             needs_rs_slot: false,
-            on_alloc: Box::new(move |mgr, pages| {
-                let result = mgr.take_inner(username, name, owner, pages);
+            on_complete: Box::new(move |mgr, allocation| {
+                let result = allocation
+                    .map_err(anyhow::Error::msg)
+                    .and_then(|pages| mgr.take_inner(username, name, owner, pages));
                 let _ = response.send(result);
             }),
         };
