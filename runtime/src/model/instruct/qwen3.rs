@@ -274,7 +274,11 @@ impl QwenInstruct {
     }
 
     /// Build an EBNF grammar for constrained Qwen tool-call generation.
-    fn build_tool_call_grammar(format: ToolCallFormat, tools: &[String]) -> Option<String> {
+    fn build_tool_call_grammar(
+        format: ToolCallFormat,
+        tools: &[String],
+        has_thinking: bool,
+    ) -> Option<String> {
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
@@ -293,10 +297,9 @@ impl QwenInstruct {
         }
 
         let name_alt = names.join(" | ");
-        let grammar = match format {
+        let tool_grammar = match format {
             ToolCallFormat::Json => format!(
-                r#"root ::= tool-call ("\n" tool-call)*
-tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
+                r#"tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
 tool-json ::= "{{"  "\"name\": \"" tool-name "\", \"arguments\": " json-object "}}"
 tool-name ::= {name_alt}
 json-object ::= "{{" json-members? "}}"
@@ -312,8 +315,7 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
                 name_alt = name_alt
             ),
             ToolCallFormat::Qwen35Xml => format!(
-                r#"root ::= tool-call ("\n" tool-call)*
-tool-call ::= "<tool_call>\n<function=" tool-name ">\n" parameter* "</function>\n</tool_call>"
+                r#"tool-call ::= "<tool_call>\n<function=" tool-name ">\n" parameter* "</function>\n</tool_call>"
 tool-name ::= {name_alt}
 parameter ::= "<parameter=" parameter-name ">\n" parameter-value "\n</parameter>\n"
 parameter-name ::= [A-Za-z_][A-Za-z0-9_-]*
@@ -323,7 +325,18 @@ parameter-char ::= [^<]
                 name_alt = name_alt
             ),
         };
-        Some(grammar)
+        let root = if has_thinking {
+            // Reasoning syntax belongs to the model formatter. Inferlets only
+            // request the native tool matcher and remain family-agnostic.
+            r#"root ::= reasoning-block? tool-call ("\n" tool-call)*
+reasoning-block ::= "<think>" reasoning-content "</think>" "\n"*
+reasoning-content ::= reasoning-piece*
+reasoning-piece ::= [^<] | "<" [^/] | "</" [^t] | "</t" [^h] | "</th" [^i] | "</thi" [^n] | "</thin" [^k] | "</think" [^>]
+"#
+        } else {
+            "root ::= tool-call (\"\\n\" tool-call)*\n"
+        };
+        Some(format!("{root}{tool_grammar}"))
     }
 }
 
@@ -410,7 +423,11 @@ impl Instruct for QwenInstruct {
         if !self.config.has_tools || tools.is_empty() {
             return None;
         }
-        let source = Self::build_tool_call_grammar(self.config.tool_call_format, tools)?;
+        let source = Self::build_tool_call_grammar(
+            self.config.tool_call_format,
+            tools,
+            self.config.has_thinking,
+        )?;
         let grammar = Grammar::from_ebnf(&source, "root").ok()?;
         Some(ToolGrammar {
             source,
@@ -549,6 +566,7 @@ mod tests {
             "</tool_response>",
             "<tools>",
             "</tools>",
+            r#"{"name": "edit", "arguments": {}}"#,
         ]
         .into_iter()
         .map(String::from)
@@ -672,8 +690,9 @@ mod tests {
     #[test]
     fn qwen35_tool_grammar_uses_native_function_parameter_template() {
         let tool = r#"{"function":{"name":"edit"}}"#.to_string();
-        let grammar = QwenInstruct::build_tool_call_grammar(ToolCallFormat::Qwen35Xml, &[tool])
-            .expect("grammar");
+        let grammar =
+            QwenInstruct::build_tool_call_grammar(ToolCallFormat::Qwen35Xml, &[tool], true)
+                .expect("grammar");
         assert!(grammar.contains(r#"<function=""#));
         assert!(grammar.contains(r#"<parameter=""#));
         assert!(!grammar.contains(r#""\"name\": \""#));
@@ -693,6 +712,23 @@ mod tests {
         );
         let tool = r#"{"function":{"name":"edit"}}"#.to_string();
         assert!(inst.tool_call_grammar(&[tool]).is_some());
+    }
+
+    #[test]
+    fn tool_grammar_follows_reasoning_capability_and_still_decodes_calls() {
+        let tool = r#"{"function":{"name":"edit"}}"#.to_string();
+        let qwen3 = qwen3();
+        let qwen3_grammar = qwen3.tool_call_grammar(&[tool.clone()]).unwrap();
+        let qwen2_grammar = qwen2().tool_call_grammar(&[tool]).unwrap();
+        assert!(qwen3_grammar.source.contains("reasoning-block?"));
+        assert!(!qwen2_grammar.source.contains("reasoning-block"));
+
+        let mut decoder = qwen3.tool_decoder();
+        assert!(matches!(decoder.feed(&[9, 7, 10, 11, 4]), ToolEvent::Start));
+        assert!(matches!(
+            decoder.feed(&[17, 4, 12]),
+            ToolEvent::Call(name, arguments) if name == "edit" && arguments == "{}"
+        ));
     }
 
     #[test]
