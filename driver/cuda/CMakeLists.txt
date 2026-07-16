@@ -289,6 +289,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/llama_like_model.cpp
   src/attention_workspace.cpp
   src/brle.cpp
+  src/masked_distribution.cpp
   src/swap_pool.cpp
   src/distributed.cpp
   ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
@@ -498,6 +499,12 @@ target_link_libraries(test_causal_conv1d PRIVATE CUDA::cudart)
 add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
 target_include_directories(test_brle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+add_executable(test_masked_distribution
+  tests/test_masked_distribution.cpp
+  src/masked_distribution.cpp)
+target_include_directories(test_masked_distribution PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 add_executable(test_driver_common
   ../common/tests/test_common.cpp
   ../common/src/safetensors_manifest.cpp)
@@ -555,6 +562,7 @@ target_link_libraries(test_transcode_fused PRIVATE CUDA::cudart)
 
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
+add_test(NAME masked_distribution COMMAND test_masked_distribution)
 add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
 add_test(NAME driver_common COMMAND test_driver_common)
 add_test(NAME kv_cache_format COMMAND test_kv_cache_format)

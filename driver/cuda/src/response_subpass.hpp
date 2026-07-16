@@ -43,6 +43,10 @@ struct ResponseSubpassContext {
     std::span<const std::uint32_t> sampling_indptr; // length R+1
     std::span<const std::uint32_t> sampling_indices; // length num_sampling
     std::span<const std::uint32_t> request_num_samplers; // length R
+
+    // Optional per-request BRLE grammar masks. Empty means unconstrained.
+    std::span<const std::uint32_t> logit_masks;
+    std::span<const std::uint32_t> logit_mask_indptr; // length R+1 when present
 };
 
 // RawLogits (type=7): gather each Logits slot's row, convert bf16 → f32
@@ -66,8 +70,8 @@ void compute_logprob_slots(
     const pie_driver::PieForwardRequestView& view,
     std::vector<pie_driver::PerRequestOutput>& per_req);
 
-// Dist (type=0): temperature-scaled softmax kernel + host-side top-K
-// partial sort. Pushes (token_ids, probs) per slot.
+// Dist (type=0): temperature-scaled softmax kernel + host-side masked
+// top-K selection. Pushes (token_ids, probs) per slot.
 void compute_dist_slots(
     const ResponseSubpassContext& ctx,
     std::vector<pie_driver::PerRequestOutput>& per_req);

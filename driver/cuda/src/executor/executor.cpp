@@ -2861,6 +2861,7 @@ bool handle_fire_batch(
                     std::span<const float>(per_slot_temp),
                     std::span<const std::int32_t>(per_slot_top_k),
                     qo_view, sptr_view, sidx_view, rns_view,
+                    logit_masks_view, logit_mask_indptr_view,
                 };
                 gather_raw_logits(sub_ctx, per_req);
                 compute_entropy_slots(sub_ctx, per_req);

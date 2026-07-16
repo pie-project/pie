@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -14,6 +15,7 @@
 #include "kernels/entropy.hpp"
 #include "kernels/gather_rows.hpp"
 #include "kernels/logprobs.hpp"
+#include "masked_distribution.hpp"
 #include "model/qwen3_forward.hpp"
 #include "sampler_type.hpp"
 
@@ -26,6 +28,13 @@ constexpr std::uint32_t TYPE_RAWLOG   = static_cast<std::uint32_t>(SamplerType::
 constexpr std::uint32_t TYPE_LOGPROB  = static_cast<std::uint32_t>(SamplerType::Logprob);
 constexpr std::uint32_t TYPE_LOGPROBS = static_cast<std::uint32_t>(SamplerType::Logprobs);
 constexpr std::uint32_t TYPE_ENTROPY  = static_cast<std::uint32_t>(SamplerType::Entropy);
+
+float bf16_to_float(std::uint16_t value) {
+    const std::uint32_t bits = static_cast<std::uint32_t>(value) << 16;
+    float result;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
 
 }  // namespace
 
@@ -237,6 +246,11 @@ void compute_dist_slots(
         }
     }
     if (dist_rows.empty()) return;
+    if (!ctx.logit_masks.empty() &&
+        ctx.logit_mask_indptr.size() != static_cast<std::size_t>(ctx.R + 1)) {
+        throw std::runtime_error(
+            "distribution logit mask has malformed request indptr");
+    }
 
     const std::size_t nd = dist_rows.size();
     auto d_dist_rows  = DeviceBuffer<std::int32_t>::from_host(
@@ -249,31 +263,77 @@ void compute_dist_slots(
         ctx.ws.logits.data(), d_dist_rows.data(), d_dist_temps.data(),
         d_dist_probs.data(), static_cast<int>(nd), V, /*stream=*/nullptr);
 
+    bool has_constrained_distribution = false;
+    if (!ctx.logit_masks.empty()) {
+        for (const int request : dist_req_idx) {
+            const std::uint32_t mask_lo = ctx.logit_mask_indptr[request];
+            const std::uint32_t mask_hi = ctx.logit_mask_indptr[request + 1];
+            if (mask_lo > mask_hi || mask_hi > ctx.logit_masks.size()) {
+                throw std::runtime_error(
+                    "distribution logit mask has malformed request bounds");
+            }
+            has_constrained_distribution |= mask_hi > mask_lo;
+        }
+    }
+
+    std::vector<std::uint16_t> h_dist_logits;
+    if (has_constrained_distribution) {
+        auto d_dist_logits = DeviceBuffer<std::uint16_t>::alloc(
+            nd * static_cast<std::size_t>(V));
+        kernels::launch_gather_bf16_rows(
+            static_cast<const std::uint16_t*>(ctx.ws.logits.data()),
+            d_dist_rows.data(), d_dist_logits.data(),
+            static_cast<int>(nd), V, /*stream=*/nullptr);
+        h_dist_logits = d_dist_logits.to_host();
+    }
+
     const std::vector<float> h_dist_probs = d_dist_probs.to_host();
 
     std::vector<std::pair<float, std::uint32_t>> scratch(V);
     for (std::size_t i = 0; i < nd; ++i) {
         const auto* row = h_dist_probs.data() + i * V;
-        for (int j = 0; j < V; ++j) {
-            scratch[j] = {row[j], static_cast<std::uint32_t>(j)};
+        std::span<const std::uint32_t> mask_runs;
+        if (!ctx.logit_masks.empty()) {
+            const int request = dist_req_idx[i];
+            const std::uint32_t mask_lo = ctx.logit_mask_indptr[request];
+            const std::uint32_t mask_hi = ctx.logit_mask_indptr[request + 1];
+            mask_runs = ctx.logit_masks.subspan(mask_lo, mask_hi - mask_lo);
         }
-        const int K = dist_topk[i] < V ? dist_topk[i] : V;
-        // Partial sort: top-K by prob descending; tie-break by lower
-        // id (matches torch.topk's stable behavior).
+
+        const int K = std::min(dist_topk[i], V);
+        if (!mask_runs.empty()) {
+            std::vector<float> masked_logits(static_cast<std::size_t>(V));
+            const auto* bf16_logits = h_dist_logits.data() + i * V;
+            for (int token = 0; token < V; ++token) {
+                masked_logits[token] = bf16_to_float(bf16_logits[token]);
+            }
+            auto distribution = masked_top_k_distribution(
+                masked_logits, mask_runs, dist_temps[i],
+                static_cast<std::size_t>(K));
+            per_req[dist_req_idx[i]].dists.emplace_back(
+                std::move(distribution.token_ids),
+                std::move(distribution.probabilities));
+            continue;
+        }
+
+        // Preserve the established unconstrained response exactly.
+        for (int token = 0; token < V; ++token) {
+            scratch[token] = {row[token], static_cast<std::uint32_t>(token)};
+        }
         std::partial_sort(
             scratch.begin(), scratch.begin() + K, scratch.end(),
-            [](const auto& a, const auto& b) {
-                if (a.first != b.first) return a.first > b.first;
-                return a.second < b.second;
+            [](const auto& lhs, const auto& rhs) {
+                if (lhs.first != rhs.first) return lhs.first > rhs.first;
+                return lhs.second < rhs.second;
             });
         std::vector<std::uint32_t> ids(K);
-        std::vector<float> probs(K);
-        for (int kk = 0; kk < K; ++kk) {
-            ids[kk]   = scratch[kk].second;
-            probs[kk] = scratch[kk].first;
+        std::vector<float> probabilities(K);
+        for (int rank = 0; rank < K; ++rank) {
+            ids[rank] = scratch[rank].second;
+            probabilities[rank] = scratch[rank].first;
         }
         per_req[dist_req_idx[i]].dists.emplace_back(
-            std::move(ids), std::move(probs));
+            std::move(ids), std::move(probabilities));
     }
 }
 
