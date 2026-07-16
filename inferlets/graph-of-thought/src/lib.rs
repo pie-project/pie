@@ -35,7 +35,6 @@ Solve the following math problem step by step. Show your work and give the final
 End your response with: ANSWER: <number>\n\
 Question: {}";
 
-const AGGREGATE_PROMPT: &str = "";  // unused - see format_aggregate_prompt below
 
 
 /// Main logic for running the hierarchical aggregation workflow.
@@ -103,7 +102,7 @@ async fn run_hierarchical_aggregation(
             pending_aggregation = Some((aggregation_text, aggregation_ctx));
         } else {
             let (previous_aggregation_text, _) = pending_aggregation.take().unwrap();
-            let final_prompt = format!("{}{}", AGGREGATE_PROMPT, previous_aggregation_text);
+            let final_prompt = format!("The math problem is: {}\n\nHere is another solution:\n{}\n\nNow give the correct final answer. End with: ANSWER: <number>", question, previous_aggregation_text);
             aggregation_ctx.user(&final_prompt);
             aggregation_ctx.cue();
 
