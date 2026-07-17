@@ -204,6 +204,27 @@ void dsv4_forward_paged(
     const float hc_post_alpha = 2.0f;
     const int sinkhorn_iters = 20; // from config hc_sinkhorn_iters
 
+    // Per-layer RoPE parameters. Non-compressed layers use plain RoPE at
+    // the base theta. Compressed (C4/C128) layers use the long-context
+    // base (compress_rope_theta) with YaRN interpolation at 1/factor —
+    // reference `layer_rope_freq_base` / `layer_rope_freq_scale`.
+    const bool has_yarn = cfg.rope_factor > 1.f;
+    struct LayerRope {
+        float theta;
+        float freq_scale;
+        float ext_factor;
+    };
+    auto layer_rope = [&](int compress_ratio) -> LayerRope {
+        if (compress_ratio == 0) {
+            return {cfg.rope_theta, 1.f, 0.f};
+        }
+        const float base = cfg.dsv4_compress_rope_theta > 0.f
+            ? cfg.dsv4_compress_rope_theta
+            : cfg.rope_theta;
+        if (!has_yarn) return {base, 1.f, 0.f};
+        return {base, 1.f / cfg.rope_factor, 1.f};
+    };
+
     cudaStream_t stream = nullptr;  // default stream
 
     // TP all-reduce helper (safe: no-op when tp_comm is null)
@@ -315,11 +336,16 @@ void dsv4_forward_paged(
             ws.kv.data(), Lw.kv_norm->data(), ws.kv.data(),
             N, head_dim, eps, stream);
 
-        // Partial RoPE on last qk_rope dims of Q and KV
+        // Partial RoPE on last qk_rope dims of Q and KV (layer-dependent
+        // base + YaRN scaling on compressed layers)
+        const LayerRope lr = layer_rope(Lw.compress_ratio);
         kernels::launch_rope_partial_last_bf16(
             ws.q.data(), ws.kv.data(),
             positions, N, num_heads, 1, head_dim, qk_rope,
-            cfg.rope_theta, stream);
+            lr.theta, stream, /*inverse=*/false,
+            lr.freq_scale, lr.ext_factor,
+            cfg.rope_beta_fast, cfg.rope_beta_slow,
+            cfg.rope_original_max_position);
 
         {
             // SWA attention on ALL layers (every layer has a sliding window).
@@ -530,12 +556,9 @@ void dsv4_forward_paged(
                         static_cast<std::size_t>(total_comp) * sizeof(std::int32_t),
                         cudaMemcpyHostToDevice, stream));
 
-                    // Apply RoPE to compressed KV (single head, partial last dims)
-                    // Use compress_rope_theta if available, else base theta
-                    const float comp_theta =
-                        cfg.dsv4_compress_rope_theta > 0.f
-                            ? cfg.dsv4_compress_rope_theta
-                            : cfg.rope_theta;
+                    // Apply RoPE to compressed KV (single head, partial last
+                    // dims). Same layer params as the raw Q/KV rotation —
+                    // compressed layers use the long-context base + YaRN.
                     kernels::launch_rope_partial_last_bf16(
                         ws.comp_kv.data(),  // "q" — will be rotated
                         ws.comp_kv.data(),  // "k" — dummy (same buffer, 0 heads below)
@@ -545,8 +568,11 @@ void dsv4_forward_paged(
                         0,      // num_kv_heads: 0 means skip K rotation
                         head_dim,
                         qk_rope,
-                        comp_theta,
-                        stream);
+                        lr.theta,
+                        stream, /*inverse=*/false,
+                        lr.freq_scale, lr.ext_factor,
+                        cfg.rope_beta_fast, cfg.rope_beta_slow,
+                        cfg.rope_original_max_position);
 
                     // Step 5: Dense attention over compressed KV entries
                     // Build host-side qo_indptr as int for the compressed attention kernel
@@ -589,11 +615,16 @@ void dsv4_forward_paged(
                     N, num_heads, head_dim, stream);
             }
 
-            // Inverse RoPE on attention output (removes position info before projection)
+            // Inverse RoPE on attention output (removes position info before
+            // projection) — same layer-dependent params as the forward
+            // rotation.
             kernels::launch_rope_partial_last_bf16(
                 ws.attn_out.data(), ws.attn_out.data(),
                 positions, N, num_heads, 0, head_dim, qk_rope,
-                cfg.rope_theta, stream, /*inverse=*/true);
+                lr.theta, stream, /*inverse=*/true,
+                lr.freq_scale, lr.ext_factor,
+                cfg.rope_beta_fast, cfg.rope_beta_slow,
+                cfg.rope_original_max_position);
 
             // Grouped output projection: per-group GEMMs with strided I/O.
             //
