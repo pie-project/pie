@@ -77,10 +77,8 @@ async fn main(input: Input) -> Result<String> {
                 let model1 = Model::load(&model_name_1)?;
                 let mut propose_ctx = Context::new(&model1)?;
                 propose_ctx.system(sys_prompt);
-                propose_ctx.flush().await?;
                 let propose_prompt = format!("{}{}", PROPOSE_PROMPT_TEMPLATE, question_);
                 propose_ctx.user(&propose_prompt);
-                propose_ctx.flush().await?;
                 propose_ctx.cue();
 
                 let propose_text = propose_ctx
@@ -100,13 +98,9 @@ async fn main(input: Input) -> Result<String> {
                             let model2 = Model::load(&model_name_2)?;
                             let mut execute_ctx = Context::new(&model2)?;
                             execute_ctx.system(sys_prompt);
-                            execute_ctx.flush().await?;
                             execute_ctx.user(&propose_prompt_);
-                            execute_ctx.flush().await?;
                             execute_ctx.assistant(&propose_text_);
-                            execute_ctx.flush().await?;
                             execute_ctx.user(EXECUTE_PROMPT);
-                            execute_ctx.flush().await?;
                             execute_ctx.cue();
 
                             let execute_text = execute_ctx
@@ -127,17 +121,11 @@ async fn main(input: Input) -> Result<String> {
                                         let model3 = Model::load(&model_name_3)?;
                                         let mut reflect_ctx = Context::new(&model3)?;
                                         reflect_ctx.system(sys_prompt);
-                                        reflect_ctx.flush().await?;
                                         reflect_ctx.user(&propose_prompt_3);
-                                        reflect_ctx.flush().await?;
                                         reflect_ctx.assistant(&propose_text_3);
-                                        reflect_ctx.flush().await?;
                                         reflect_ctx.user(EXECUTE_PROMPT);
-                                        reflect_ctx.flush().await?;
                                         reflect_ctx.assistant(&execute_text_3);
-                                        reflect_ctx.flush().await?;
                                         reflect_ctx.user(REFLECT_PROMPT);
-                                        reflect_ctx.flush().await?;
                                         reflect_ctx.cue();
 
                                         let reflect_text = reflect_ctx
