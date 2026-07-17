@@ -905,10 +905,11 @@ void dsv4_forward_paged(
                     ws.expert_in.data(),
                     ops::WeightView::raw(ws.expert_up_w.data(), DType::BF16),
                     ws.expert_up.data(), Ne, local_moe_I, H);
-                kernels::launch_swiglu_bf16(
+                kernels::launch_swiglu_clamped_bf16(
                     ws.expert_gate.data(), ws.expert_up.data(),
                     ws.expert_gate.data(),
-                    static_cast<std::size_t>(Ne) * local_moe_I, stream);
+                    static_cast<std::size_t>(Ne) * local_moe_I,
+                    cfg.swiglu_limit, stream);
                 ops::gemm_act_x_w(cublas.handle(),
                     ws.expert_gate.data(),
                     ops::WeightView::raw(ws.expert_down_w.data(), DType::BF16),
@@ -930,10 +931,11 @@ void dsv4_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 ws.norm_y.data(), make_weight_view(Lw.shared_w3, Lw.shared_w3_quant), ws.shared_up.data(),
                 N, local_shared_I, H);
-            kernels::launch_swiglu_bf16(
+            kernels::launch_swiglu_clamped_bf16(
                 ws.shared_gate.data(), ws.shared_up.data(),
                 ws.shared_act.data(),
-                static_cast<std::size_t>(N) * local_shared_I, stream);
+                static_cast<std::size_t>(N) * local_shared_I,
+                cfg.swiglu_limit, stream);
             ops::gemm_act_x_w(cublas.handle(),
                 ws.shared_act.data(), make_weight_view(Lw.shared_w2, Lw.shared_w2_quant), ws.shared_out.data(),
                 N, H, local_shared_I);

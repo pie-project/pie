@@ -21,6 +21,28 @@ __global__ void swiglu_bf16_kernel(
     y[idx] = __float2bfloat16(silu * u);
 }
 
+// DeepSeek-V4 `swiglu_limit` variant: upper-clamp gate, symmetric-clamp up,
+// then standard silu(gate) * up. The clamps happen *before* the activation
+// (matches DwarfStar's `swiglu(..., clamp)` reference). Distinct from the
+// GPT-OSS GLU below, which uses alpha = 1.702 and a `+1` up-shift.
+__global__ void swiglu_clamped_bf16_kernel(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ y,
+    int n,
+    float limit)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float g = __bfloat162float(gate[idx]);
+    float u = __bfloat162float(up[idx]);
+    g = fminf(g, limit);
+    u = fminf(fmaxf(u, -limit), limit);
+    const float silu = g / (1.f + expf(-g));
+    y[idx] = __float2bfloat16(silu * u);
+}
+
 __global__ void gpt_oss_glu_bf16_kernel(
     const __nv_bfloat16* __restrict__ gate,
     const __nv_bfloat16* __restrict__ up,
@@ -56,6 +78,23 @@ void launch_swiglu_bf16(
         static_cast<const __nv_bfloat16*>(up),
         static_cast<__nv_bfloat16*>(y),
         num_elements);
+}
+
+void launch_swiglu_clamped_bf16(
+    const void* gate, const void* up, void* y,
+    int num_elements, float limit, cudaStream_t stream)
+{
+    if (limit <= 1e-6f) {
+        launch_swiglu_bf16(gate, up, y, num_elements, stream);
+        return;
+    }
+    constexpr int BLOCK = 256;
+    const int grid = (num_elements + BLOCK - 1) / BLOCK;
+    swiglu_clamped_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const __nv_bfloat16*>(up),
+        static_cast<__nv_bfloat16*>(y),
+        num_elements, limit);
 }
 
 void launch_gpt_oss_glu_bf16(
