@@ -362,7 +362,7 @@ void dsv4_forward_paged(
                 ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 N, num_requests, num_heads, 1, head_dim, lv.page_size, stream,
-                /*window_left=*/-1, /*sm_scale=*/-1.f,
+                /*window_left=*/cfg.sliding_window, /*sm_scale=*/-1.f,
                 /*logits_soft_cap=*/0.f,
                 /*lse_out=*/static_cast<float*>(ws.attn_lse.data()));
 
