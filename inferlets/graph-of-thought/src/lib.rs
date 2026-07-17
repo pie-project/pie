@@ -31,13 +31,10 @@ fn default_aggregation_tokens() -> usize { 256 }
 const SYSTEM_PROMPT: &str = "You are a helpful, respectful and honest assistant.";
 
 const PROPOSAL_PROMPT_TEMPLATE: &str = "\
-Could you suggest a method or approach to solve the following question? \
-Please provide a high-level plan without doing the actual calculation. \
-Keep it concise, around 80 words. Question: {}";
+Solve the following math problem step by step. Show your work and give the final numeric answer. \
+End your response with: ANSWER: <number>\n\
+Question: {}";
 
-const AGGREGATE_PROMPT: &str = "\
-Please compare the following solution with the one you just provided \
-and aggregate their ideas into a single, improved solution:\n";
 
 
 /// Main logic for running the hierarchical aggregation workflow.
@@ -80,7 +77,7 @@ async fn run_hierarchical_aggregation(
             pending_proposal = Some((proposal_text, proposal_ctx));
         } else {
             let (previous_proposal_text, _) = pending_proposal.take().unwrap();
-            let aggregation_prompt = format!("{}{}", AGGREGATE_PROMPT, previous_proposal_text);
+            let aggregation_prompt = format!("The math problem is: {}\n\nHere is another solution:\n{}\n\nNow give the correct final answer. End with: ANSWER: <number>",question, previous_proposal_text);
             proposal_ctx.user(&aggregation_prompt);
             proposal_ctx.cue();
 
@@ -105,7 +102,7 @@ async fn run_hierarchical_aggregation(
             pending_aggregation = Some((aggregation_text, aggregation_ctx));
         } else {
             let (previous_aggregation_text, _) = pending_aggregation.take().unwrap();
-            let final_prompt = format!("{}{}", AGGREGATE_PROMPT, previous_aggregation_text);
+            let final_prompt = format!("The math problem is: {}\n\nHere is another solution:\n{}\n\nNow give the correct final answer. End with: ANSWER: <number>", question, previous_aggregation_text);
             aggregation_ctx.user(&final_prompt);
             aggregation_ctx.cue();
 
