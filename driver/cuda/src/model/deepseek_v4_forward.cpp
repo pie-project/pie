@@ -821,13 +821,17 @@ void dsv4_forward_paged(
 
         // MoE routing
         if (Lw.is_hash_layer && Lw.tid2eid != nullptr) {
+            // Experts are chosen by token-id hash, but weighted by the
+            // router's sqrtsoftplus probs (normalized over the selection,
+            // then scaled).
             kernels::launch_hash_route_lookup(
                 token_ids,
                 static_cast<const std::int64_t*>(Lw.tid2eid->data()),
+                ws.router_logits.data(),
                 static_cast<std::int32_t*>(ws.topk_idx.data()),
                 static_cast<float*>(ws.topk_weights.data()),
-                N, cfg.vocab_size, K,
-                1.0f / static_cast<float>(K),
+                N, cfg.vocab_size, E, K,
+                cfg.routed_scaling_factor,
                 stream);
         } else {
             kernels::launch_topk_sqrtsoftplus_bf16(
