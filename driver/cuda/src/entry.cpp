@@ -168,6 +168,16 @@ int run_impl(int argc,
     if (!cli_nccl_unique_id_hex.empty())
         cfg.distributed.nccl_unique_id_hex = cli_nccl_unique_id_hex;
     const bool verbose = cfg.runtime.verbose;
+    // SSD expert streaming is single-GPU only for now (per-expert TP shards
+    // are strided file extents the streamer does not support). The config
+    // loader rejects the TOML combination; re-check here because --tp-size
+    // can override [distributed] after load_config.
+    if (cfg.model.stream_routed_experts && cfg.distributed.tp_size > 1) {
+        std::cerr << "[pie-driver-cuda] model.stream_routed_experts requires "
+                     "tp_size=1 (got tp_size="
+                  << cfg.distributed.tp_size << ")\n";
+        return 1;
+    }
     if (cfg.distributed.tp_size > 1 &&
         cfg.distributed.tp_rank > 0 &&
         cfg.distributed.nccl_unique_id_hex.empty()) {

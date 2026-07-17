@@ -501,6 +501,11 @@ impl DriverConfig {
                     })?;
                 opts.validate()?;
                 validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
+                ensure!(
+                    !opts.stream_routed_experts || self.tensor_parallel_size == 1,
+                    "model.driver.options.stream_routed_experts requires \
+                     tensor_parallel_size = 1"
+                );
             }
             DriverKind::Dummy => {
                 let _: DummyDriverOptions = toml::Value::Table(self.options.clone())
@@ -812,6 +817,15 @@ pub struct CudaNativeDriverOptions {
     /// latency-regime win (helps at low batch, costs at compute saturation), so
     /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
     pub enable_system_speculation: bool,
+    /// SSD expert streaming (DeepSeek-V4 only, tensor_parallel_size = 1):
+    /// keep routed MoE expert weights on disk and page them into a bounded
+    /// LRU GPU cache on demand at forward time instead of materializing
+    /// them in VRAM at startup.
+    pub stream_routed_experts: bool,
+    /// Expert stream cache budget in GiB. 0 (default) = auto: half of the
+    /// post-weights free VRAM, capped at the full routed expert set. Only
+    /// meaningful when `stream_routed_experts` is true.
+    pub expert_cache_gb: f64,
 
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
@@ -845,6 +859,8 @@ impl Default for CudaNativeDriverOptions {
             mtp_assistant_snapshot_dir: String::new(),
             mtp_num_drafts: 3,
             enable_system_speculation: false,
+            stream_routed_experts: false,
+            expert_cache_gb: 0.0,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
         }
@@ -880,6 +896,10 @@ impl CudaNativeDriverOptions {
         ensure!(
             self.mtp_num_drafts <= 32,
             "model.driver.options.mtp_num_drafts must be in 0..=32"
+        );
+        ensure!(
+            self.expert_cache_gb.is_finite() && self.expert_cache_gb >= 0.0,
+            "model.driver.options.expert_cache_gb must be finite and >= 0"
         );
         Ok(())
     }
@@ -985,6 +1005,65 @@ memory_profile = "latency"
             IpcProfile::Latency
         );
         assert!(cfg.models[0].driver.use_inproc_polling_channel());
+    }
+
+    #[test]
+    fn cuda_accepts_stream_routed_experts_single_rank() {
+        let text = r#"
+[[model]]
+name = "default"
+hf_repo = "org/DeepSeek-V4"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+stream_routed_experts = true
+expert_cache_gb = 24.0
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn cuda_rejects_stream_routed_experts_with_tensor_parallel() {
+        let text = r#"
+[[model]]
+name = "default"
+hf_repo = "org/DeepSeek-V4"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0", "cuda:1"]
+tensor_parallel_size = 2
+
+[model.driver.options]
+stream_routed_experts = true
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("stream_routed_experts"), "got: {err}");
+        assert!(err.contains("tensor_parallel_size"), "got: {err}");
+    }
+
+    #[test]
+    fn cuda_rejects_negative_expert_cache_gb() {
+        let text = r#"
+[[model]]
+name = "default"
+hf_repo = "org/DeepSeek-V4"
+
+[model.driver]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.driver.options]
+expert_cache_gb = -1.0
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("expert_cache_gb"), "got: {err}");
     }
 
     #[test]
