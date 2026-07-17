@@ -12,7 +12,7 @@
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Token ID (the value returned to the caller).
 pub type TokenId = u32;
@@ -93,19 +93,29 @@ impl BpeTable {
     /// converted to raw bytes via the inverse byte mapping.  This lets
     /// the encode path work directly on `&[u8]` without running
     /// `bytes_to_unicode()`.
+    ///
+    /// `skip_ids` are omitted here (HF `added_tokens` ids). Those are
+    /// literal content strings, not GPT-2 remapped BPE atoms, and must
+    /// be registered afterward with [`BpeTable::insert`] using raw UTF-8.
     pub fn from_vocab_and_merges(
         vocab: &HashMap<String, u32>,
         merge_pairs: &[(String, String)],
         continuing_subword_prefix: &str,
         raw_byte_keys: bool,
+        skip_ids: &HashSet<u32>,
     ) -> Self {
         let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
         let mut id_to_bytes = vec![Vec::new(); max_id + 1];
         let mut token_to_id = FxHashMap::with_capacity_and_hasher(vocab.len(), Default::default());
         let mut merges = FxHashMap::default();
 
-        // First pass: register all symbols.
+        // First pass: register BPE symbols only. Added/special token ids
+        // are skipped so their vocab spellings never go through GPT-2
+        // inversion (DeepSeek's `<｜…｜>` keys are literal Unicode).
         for (token, &id) in vocab {
+            if skip_ids.contains(&id) {
+                continue;
+            }
             let key = if raw_byte_keys {
                 gpt2_unicode_to_raw_bytes(token)
             } else {
@@ -194,24 +204,17 @@ impl BpeTable {
         self.token_to_id.len()
     }
 
-    /// Insert a token (for added/special tokens).
+    /// Insert an added/special token with its literal content bytes.
     ///
     /// Does NOT add merge entries — added tokens are matched by AhoCorasick
     /// before BPE encoding, so they never participate in the merge algorithm.
-    /// Skips `token_to_id` insertion if the ID already exists in the base vocab
-    /// (some models list tokens in both `vocab` and `added_tokens`).
+    /// The content string is the canonical spelling (raw UTF-8), matching HF.
     pub fn insert(&mut self, bytes: Vec<u8>, id: TokenId) {
         if id as usize >= self.id_to_bytes.len() {
             self.id_to_bytes.resize(id as usize + 1, Vec::new());
         }
-        // Only insert if this ID doesn't already have a mapping.
-        // This prevents duplicate entries when added_tokens overlap the base
-        // vocab (e.g. DeepSeek-V3.2 where GPT-2 byte remapping produces
-        // different key bytes for the same token).
-        if self.id_to_bytes[id as usize].is_empty() {
-            self.id_to_bytes[id as usize] = bytes.clone();
-            self.token_to_id.entry(bytes).or_insert(id);
-        }
+        self.id_to_bytes[id as usize] = bytes.clone();
+        self.token_to_id.insert(bytes, id);
     }
 
     /// Pair-merge rank lookup: can (left, right) merge?
@@ -307,8 +310,10 @@ pub fn bytes_to_unicode() -> &'static [char; 256] {
 
 /// Convert a GPT-2 unicode token string to raw bytes.
 ///
-/// Used at load time to re-key the vocabulary.  Each GPT-2 unicode char
-/// maps 1:1 to a byte value.
+/// Used at load time to re-key **BPE atom** vocab entries. Each GPT-2
+/// alphabet char maps 1:1 to a byte. Added/special tokens must not be
+/// passed here — the HF loader skips their ids and registers them with
+/// literal UTF-8 via [`BpeTable::insert`].
 fn gpt2_unicode_to_raw_bytes(token: &str) -> Vec<u8> {
     token
         .chars()
@@ -317,8 +322,8 @@ fn gpt2_unicode_to_raw_bytes(token: &str) -> Vec<u8> {
             if idx < 324 {
                 CHAR_TO_BYTE[idx].unwrap_or(c as u8)
             } else {
-                // Non-GPT2 char: keep raw encoding.  Should not happen
-                // for well-formed GPT-2 vocabs.
+                // Not a GPT-2 alphabet char. Should not happen for BPE
+                // atoms; added tokens are excluded before this runs.
                 c as u8
             }
         })
@@ -720,6 +725,7 @@ fn fallback_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn make_test_ranks() -> BpeTable {
         let mut map = HashMap::new();
@@ -773,7 +779,7 @@ mod tests {
             ("a".to_string(), "b".to_string()),
             ("ab".to_string(), "c".to_string()),
         ];
-        let bpe = BpeTable::from_vocab_and_merges(&vocab, &merges, "", false);
+        let bpe = BpeTable::from_vocab_and_merges(&vocab, &merges, "", false, &HashSet::new());
 
         let mut out = Vec::new();
         bpe_encode_bytes(b"abc", &bpe, false, None, &mut out);
@@ -797,6 +803,7 @@ mod tests {
             &[("h".to_string(), "i".to_string())],
             "",
             false,
+            &HashSet::new(),
         );
 
         let mut out = Vec::new();
@@ -821,11 +828,33 @@ mod tests {
             ("▁".to_string(), "H".to_string()),
             ("▁H".to_string(), "i".to_string()),
         ];
-        let bpe = BpeTable::from_vocab_and_merges(&vocab, &merges, "", false);
+        let bpe = BpeTable::from_vocab_and_merges(&vocab, &merges, "", false, &HashSet::new());
 
         let mut out = Vec::new();
         bpe_encode_chars("▁Hi", &bpe, false, None, &mut out);
         assert_eq!(out, vec![4]);
+    }
+
+    #[test]
+    fn test_added_token_ids_skip_gpt2_rekey() {
+        let mut vocab = HashMap::new();
+        // GPT-2 remapped space (Ġ → 0x20).
+        vocab.insert("Ġ".to_string(), 0u32);
+        // DeepSeek-style special listed in vocab with literal Unicode.
+        let eos = "<｜end▁of▁sentence｜>";
+        vocab.insert(eos.to_string(), 1u32);
+
+        let skip: HashSet<u32> = [1u32].into_iter().collect();
+        let mut bpe = BpeTable::from_vocab_and_merges(&vocab, &[], "", true, &skip);
+
+        // Skipped id is absent until insert registers literal UTF-8.
+        assert!(bpe.bytes_to_id(eos.as_bytes()).is_none());
+        assert!(bpe.id_to_bytes(1).is_none());
+        assert_eq!(bpe.bytes_to_id(&[0x20]), Some(0));
+
+        bpe.insert(eos.as_bytes().to_vec(), 1);
+        assert_eq!(bpe.bytes_to_id(eos.as_bytes()), Some(1));
+        assert_eq!(bpe.id_to_bytes(1), Some(eos.as_bytes()));
     }
 
     #[test]

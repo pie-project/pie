@@ -883,7 +883,7 @@ fn load_tiktoken_added_tokens(path: &std::path::Path) -> anyhow::Result<Vec<Adde
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn make_byte_tokenizer(
         vocab: &[(&str, u32)],
@@ -899,7 +899,13 @@ mod tests {
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        let mut bpe = bpe::BpeTable::from_vocab_and_merges(&vocab_map, &merge_pairs, "", false);
+        let mut bpe = bpe::BpeTable::from_vocab_and_merges(
+            &vocab_map,
+            &merge_pairs,
+            "",
+            false,
+            &HashSet::new(),
+        );
         for at in &added_tokens {
             bpe.insert(at.content.as_bytes().to_vec(), at.id);
         }
@@ -927,7 +933,13 @@ mod tests {
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        let bpe = bpe::BpeTable::from_vocab_and_merges(&vocab_map, &merge_pairs, "", false);
+        let bpe = bpe::BpeTable::from_vocab_and_merges(
+            &vocab_map,
+            &merge_pairs,
+            "",
+            false,
+            &HashSet::new(),
+        );
         Tokenizer::new(
             bpe,
             VocabType::CharLevel,
@@ -1137,7 +1149,10 @@ mod tests {
         let tok = Tokenizer::from_file(&model_path).unwrap();
         assert_eq!(tok.token_to_id("<|im_user|>"), Some(100));
         assert_eq!(tok.encode("<|im_user|>hi<|im_end|>"), vec![100, 0, 1, 101]);
-        assert_eq!(tok.decode(&[100, 0, 1, 101], false), "<|im_user|>hi<|im_end|>");
+        assert_eq!(
+            tok.decode(&[100, 0, 1, 101], false),
+            "<|im_user|>hi<|im_end|>"
+        );
         assert_eq!(tok.decode(&[100, 0, 1, 101], true), "hi");
     }
 }
