@@ -184,8 +184,16 @@ void launch_rope_partial_bf16_position_delta(
 
 // Partial rotary embedding on the LAST `rotary_dim` dimensions of each head.
 // Used by DeepSeek V4 where RoPE is applied to the trailing 64 dims of
-// head_dim=512. Pair convention: (offset+i, offset+i+rotary_dim/2)
-// where offset = head_dim - rotary_dim.
+// head_dim=512. Pair convention: ADJACENT dims (offset+2p, offset+2p+1)
+// — the GPT-J / interleaved layout that DeepSeek checkpoints are trained
+// with (reference `rope_tail_ext_inplace`), NOT the half/half NeoX split.
+//
+// Optional YaRN long-context interpolation (DSv4 compressed layers):
+// pass `freq_scale = 1/factor` and `ext_factor = 1` to blend each pair's
+// angle between interpolation and extrapolation with the beta_fast /
+// beta_slow correction ramp. The DSv4 reference cancels YaRN's magnitude
+// scale, so no attention factor is applied. Defaults (`freq_scale = 1`,
+// `ext_factor = 0`) give plain unscaled RoPE.
 void launch_rope_partial_last_bf16(
     void* q, void* k,
     const std::int32_t* positions,
@@ -196,6 +204,11 @@ void launch_rope_partial_last_bf16(
     int rotary_dim,
     float theta,
     cudaStream_t stream,
-    bool inverse = false);
+    bool inverse = false,
+    float freq_scale = 1.0f,
+    float ext_factor = 0.0f,
+    float beta_fast = 32.0f,
+    float beta_slow = 1.0f,
+    int original_max_position = 0);
 
 }  // namespace pie_cuda_driver::kernels

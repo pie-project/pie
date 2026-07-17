@@ -22,6 +22,20 @@ void launch_swiglu_bf16(
     int num_elements,
     cudaStream_t stream);
 
+// SwiGLU with DeepSeek-V4's `swiglu_limit` pre-activation clamps:
+//     gate' = min(gate, +limit)
+//     up'   = clamp(up, -limit, +limit)
+//     y     = silu(gate') * up'
+// Falls back to plain SwiGLU when `limit <= 0` (config field unset).
+// Unlike GPT-OSS's GLU this keeps alpha = 1 and has no `+1` up-shift.
+void launch_swiglu_clamped_bf16(
+    const void* gate,
+    const void* up,
+    void* y,
+    int num_elements,
+    float limit,
+    cudaStream_t stream);
+
 // GeLU-tanh-glu (Gemma).
 void launch_geglu_tanh_bf16(
     const void* gate,
