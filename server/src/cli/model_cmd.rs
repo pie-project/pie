@@ -95,6 +95,8 @@ const HF_TO_PIE_ARCH: &[(&str, &str)] = &[
     ("gptoss", "gptoss"),
     ("gpt_oss", "gptoss"),
     ("nemotron_h", "nemotron_h"),
+    ("deepseek_v3", "deepseek_v3"),
+    ("deepseek_v4", "deepseek_v4"),
 ];
 
 /// Read `<repo_dir>/snapshots/<latest>/config.json` and look up its
