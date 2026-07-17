@@ -434,6 +434,24 @@ impl<'ctx> Generator<'ctx> {
         Ok(text)
     }
 
+    /// Like `collect_text`, but also returns the number of tokens generated.
+    /// Useful for token-accounting comparisons across inferlet strategies.
+    pub async fn collect_text_with_tokens(mut self) -> Result<(String, usize)> {
+        use crate::chat;
+        let mut decoder = chat::Decoder::new(&self.ctx.model);
+        let mut text = String::new();
+        while let Some(step) = self.next()? {
+            let out = step.execute().await?;
+            match decoder.feed(&out.tokens)? {
+                chat::Event::Delta(s) => text.push_str(&s),
+                chat::Event::Done(s) => return Ok((s, self.tokens_generated)),
+                chat::Event::Idle | chat::Event::Interrupt(_) => {}
+            }
+        }
+        let n = self.tokens_generated;
+        Ok((text, n))
+    }
+
     /// Constrain to JSON conforming to `T`'s schema, run to completion,
     /// parse. Composes with any constraints already attached.
     pub async fn collect_json<T>(self) -> Result<T>
