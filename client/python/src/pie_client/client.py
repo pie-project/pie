@@ -102,7 +102,7 @@ class PieClient:
 
     async def connect(self):
         """Establish a WebSocket connection and start the background listener."""
-        self.ws = await websockets.connect(self.server_uri)
+        self.ws = await websockets.connect(self.server_uri, ping_interval=20, ping_timeout=120)
         self.listener_task = asyncio.create_task(self._listen_to_server())
 
     async def _listen_to_server(self):
