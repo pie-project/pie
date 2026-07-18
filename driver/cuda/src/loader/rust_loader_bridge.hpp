@@ -149,6 +149,11 @@ inline std::string rust_loader_compile_cache_key(
     h.update_scalar(input.version);
     h.update_loader_bytes(input.model.model_type);
     h.update_loader_bytes(input.model.quant_method);
+    h.update_scalar(input.model.quant_bits);
+    h.update_scalar(input.model.quant_group_size);
+    h.update_scalar(static_cast<std::uint8_t>(input.model.quant_desc_act));
+    h.update_scalar(static_cast<std::uint8_t>(input.model.quant_symmetric));
+    h.update_scalar(static_cast<std::uint8_t>(input.model.quant_zero_point));
     h.update_loader_bytes(input.model.runtime_quant);
     h.update_scalar(input.model.num_hidden_layers);
     h.update_scalar(input.model.num_experts);
@@ -443,11 +448,30 @@ inline std::vector<RustQuantAttachment> infer_rust_quant_attachments(
         if (tensor.encoding_kind != pie_weight_loader::PieLoaderEncodingKind::Quant) {
             continue;
         }
+        const std::string name = rust_loader_bytes_to_string(tensor.name);
+        if (tensor.quant_scheme == pie_weight_loader::PieLoaderQuantScheme::GptqInt4 ||
+            tensor.quant_scheme == pie_weight_loader::PieLoaderQuantScheme::AwqInt4) {
+            const std::string scale = name + "_scale_inv";
+            if (!present.contains(scale)) continue;
+            const bool is_awq = tensor.quant_scheme ==
+                pie_weight_loader::PieLoaderQuantScheme::AwqInt4;
+            const std::string zero = is_awq ? name + "_zero_point" : std::string{};
+            if (is_awq && !present.contains(zero)) continue;
+            attachments.push_back(RustQuantAttachment{
+                .tensor_name = name,
+                .scale_tensor_name = scale,
+                .zero_point_tensor_name = zero,
+                .granularity = QuantGranularity::PerGroup,
+                .group_size = static_cast<int>(tensor.quant_group_size),
+                .channel_axis = tensor.quant_channel_axis,
+                .preserve_scale_dtype = true,
+            });
+            continue;
+        }
         if (tensor.quant_scheme != pie_weight_loader::PieLoaderQuantScheme::Fp8E4M3 &&
             tensor.quant_scheme != pie_weight_loader::PieLoaderQuantScheme::Int8Symmetric) {
             continue;
         }
-        const std::string name = rust_loader_bytes_to_string(tensor.name);
         const std::string scale = name + "_scale_inv";
         if (!present.contains(scale)) continue;
         attachments.push_back(RustQuantAttachment{

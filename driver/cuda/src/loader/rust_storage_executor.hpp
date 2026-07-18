@@ -175,12 +175,13 @@ private:
         if (tensor.encoding_kind ==
             pie_weight_loader::PieLoaderEncodingKind::Quant) {
             const DType physical = quant_physical_dtype(tensor);
-            if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
+            if (physical == DType::FP8_E4M3 || physical == DType::INT8 ||
+                physical == DType::INT4_PACKED) {
                 buffers_.emplace(
                     buffer.id,
                     DeviceTensor::allocate(
                         physical,
-                        wl_cpp::i64_slice_to_vector(tensor.shape)));
+                        quant_physical_shape(tensor, physical)));
                 return;
             }
             buffers_.emplace(
@@ -252,9 +253,10 @@ private:
         if (tensor.encoding_kind ==
             pie_weight_loader::PieLoaderEncodingKind::Quant) {
             const DType physical = quant_physical_dtype(tensor);
-            if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
+            if (physical == DType::FP8_E4M3 || physical == DType::INT8 ||
+                physical == DType::INT4_PACKED) {
                 dtype = physical;
-                shape = wl_cpp::i64_slice_to_vector(tensor.shape);
+                shape = quant_physical_shape(tensor, physical);
             } else {
                 dtype = DType::UINT8;
                 shape = {static_cast<std::int64_t>(buffer.bytes)};
@@ -533,9 +535,10 @@ private:
         if (tensor.encoding_kind ==
             pie_weight_loader::PieLoaderEncodingKind::Quant) {
             const DType physical = quant_physical_dtype(tensor);
-            if (physical == DType::FP8_E4M3 || physical == DType::INT8) {
+            if (physical == DType::FP8_E4M3 || physical == DType::INT8 ||
+                physical == DType::INT4_PACKED) {
                 spec.dtype = physical;
-                spec.shape = wl_cpp::i64_slice_to_vector(tensor.shape);
+                spec.shape = quant_physical_shape(tensor, physical);
             } else {
                 spec.dtype = DType::UINT8;
                 spec.shape = {static_cast<std::int64_t>(buffer.mapped().nbytes())};
@@ -545,6 +548,9 @@ private:
             spec.shape = wl_cpp::i64_slice_to_vector(tensor.shape);
         }
         spec.layout = TensorLayoutKind::Dense;
+        if (spec.dtype == DType::INT4_PACKED) {
+            spec.layout = TensorLayoutKind::QuantPacked;
+        }
         spec.ownership = TensorOwnershipKind::Owned;
         spec.parallel = TensorParallelKind::Replicated;
         if (auto backing = view_backing_names_.find(instr.buffer_id);
@@ -625,6 +631,13 @@ private:
                     attachment.scale_tensor_name + "' for '" +
                     attachment.tensor_name + "' was not finalized");
             }
+            if (!attachment.zero_point_tensor_name.empty() &&
+                weights_.find(attachment.zero_point_tensor_name) == weights_.end()) {
+                throw std::runtime_error(
+                    "rust storage executor: quant zero-point tensor '" +
+                    attachment.zero_point_tensor_name + "' for '" +
+                    attachment.tensor_name + "' was not finalized");
+            }
             // MXFP4 (group_size 32) keeps its raw E8M0 byte scale: the
             // MXFP4 GEMM / dequant kernels and make_expert_weight_view all
             // require U8 E8M0 bytes (gemm.cpp asserts scale_dtype==UINT8).
@@ -632,7 +645,7 @@ private:
             // wants the E8M0 bytes expanded to F32 2^(b-127) factors.
             const bool is_mxfp4_scale = (attachment.group_size == 32);
             std::string scale_name = attachment.scale_tensor_name;
-            if (!is_mxfp4_scale) {
+            if (!is_mxfp4_scale && !attachment.preserve_scale_dtype) {
                 convert_block_scale_to_f32(attachment.scale_tensor_name);
                 const std::string f32_name =
                     attachment.scale_tensor_name + ".f32";
@@ -644,6 +657,10 @@ private:
             meta.kind = quant_meta_kind(attachment.granularity);
             meta.scale_name = scale_name;
             meta.scale = &weights_.get(scale_name);
+            meta.zero_point_name = attachment.zero_point_tensor_name;
+            if (!attachment.zero_point_tensor_name.empty()) {
+                meta.zero_point = &weights_.get(attachment.zero_point_tensor_name);
+            }
             meta.group_size = attachment.group_size;
             meta.channel_axis = attachment.channel_axis;
             weights_.set_quant_meta(attachment.tensor_name, std::move(meta));

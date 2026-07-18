@@ -564,6 +564,7 @@ impl DefaultAbiBuilder<'_> {
 
     fn build(&mut self) -> Result<(), CompileError> {
         let runtime_quant = self.runtime_quant_scheme()?;
+        self.add_offline_int4_weights()?;
         self.add_phi3_fused_splits()?;
         self.add_gpt_oss_mxfp4_groups()?;
         self.add_fused_moe_gate_up_tp_slices()?;
@@ -585,6 +586,223 @@ impl DefaultAbiBuilder<'_> {
             } else {
                 self.push_direct(raw, self.output_name(&raw.name), self.shard_axis(&raw.name));
             }
+        }
+        Ok(())
+    }
+
+    fn add_offline_int4_weights(&mut self) -> Result<(), CompileError> {
+        let scheme = match self.cfg.quant_method.as_str() {
+            "gptq" => QuantScheme::GptqInt4,
+            "awq" => QuantScheme::AwqInt4,
+            _ => return Ok(()),
+        };
+        if self.target.backend != BackendKind::Cuda {
+            return Err(CompileError::InvalidInput(format!(
+                "{} INT4 checkpoints require the CUDA Marlin backend",
+                self.cfg.quant_method
+            )));
+        }
+        if self.target.tp_size != 1 {
+            return Err(CompileError::InvalidInput(format!(
+                "{} INT4 checkpoint lowering currently requires tp_size=1",
+                self.cfg.quant_method
+            )));
+        }
+        if self.cfg.quant_bits != 4 || self.cfg.quant_group_size == 0 {
+            return Err(CompileError::InvalidInput(format!(
+                "{} checkpoint lowering requires bits=4 and a positive group_size",
+                self.cfg.quant_method
+            )));
+        }
+        if scheme == QuantScheme::GptqInt4
+            && (self.cfg.quant_desc_act
+                || !self.cfg.quant_symmetric
+                || self.cfg.quant_zero_point)
+        {
+            return Err(CompileError::InvalidInput(
+                "GPTQ Marlin lowering requires desc_act=false, sym=true, and zero_point=false"
+                    .to_string(),
+            ));
+        }
+
+        let qweights = self
+            .metadata
+            .tensors
+            .iter()
+            .filter(|raw| raw.name.ends_with(".qweight"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if qweights.is_empty() {
+            return Err(CompileError::InvalidInput(format!(
+                "{} quantization metadata is present but the checkpoint has no .qweight tensors",
+                self.cfg.quant_method
+            )));
+        }
+
+        for qweight in qweights {
+            self.add_offline_int4_weight(&qweight, scheme)?;
+        }
+        Ok(())
+    }
+
+    fn add_offline_int4_weight(
+        &mut self,
+        qweight: &RawTensor,
+        scheme: QuantScheme,
+    ) -> Result<(), CompileError> {
+        if qweight.encoding != Encoding::Raw(DType::I32) || qweight.shape.len() != 2 {
+            return Err(CompileError::InvalidInput(format!(
+                "{} qweight '{}' must be a 2-D I32 tensor",
+                self.cfg.quant_method, qweight.name
+            )));
+        }
+        let prefix = qweight.name.strip_suffix(".qweight").ok_or_else(|| {
+            CompileError::InvalidInput(format!("invalid qweight name '{}'", qweight.name))
+        })?;
+        let scales_name = format!("{prefix}.scales");
+        let scales = self
+            .metadata
+            .tensors
+            .iter()
+            .find(|raw| raw.name == scales_name)
+            .cloned()
+            .ok_or_else(|| {
+                CompileError::InvalidInput(format!(
+                    "{} qweight '{}' is missing matching scales tensor '{}'",
+                    self.cfg.quant_method, qweight.name, scales_name
+                ))
+            })?;
+        if !matches!(scales.encoding, Encoding::Raw(DType::F16 | DType::BF16 | DType::F32))
+            || scales.shape.len() != 2
+        {
+            return Err(CompileError::InvalidInput(format!(
+                "{} scales '{}' must be a 2-D F16/BF16/F32 tensor",
+                self.cfg.quant_method, scales.name
+            )));
+        }
+
+        let (k, n, weight_layout) = match scheme {
+            QuantScheme::GptqInt4 => (
+                qweight.shape[0].checked_mul(8).ok_or_else(|| {
+                    CompileError::InvalidInput("GPTQ K dimension overflow".to_string())
+                })?,
+                qweight.shape[1],
+                RepackLayout::MarlinGptqWeight,
+            ),
+            QuantScheme::AwqInt4 => (
+                qweight.shape[0],
+                qweight.shape[1].checked_mul(8).ok_or_else(|| {
+                    CompileError::InvalidInput("AWQ N dimension overflow".to_string())
+                })?,
+                RepackLayout::MarlinAwqWeight,
+            ),
+            _ => unreachable!(),
+        };
+        let group_size = i64::from(self.cfg.quant_group_size);
+        if k <= 0 || n <= 0 || k % 16 != 0 || n % 64 != 0 || k % group_size != 0 {
+            return Err(CompileError::InvalidInput(format!(
+                "{} qweight '{}' shape {:?} is not Marlin-compatible",
+                self.cfg.quant_method, qweight.name, qweight.shape
+            )));
+        }
+        let groups = k / group_size;
+        if scales.shape != vec![groups, n] {
+            return Err(CompileError::InvalidInput(format!(
+                "{} scales '{}' shape {:?} does not match expected [{groups}, {n}]",
+                self.cfg.quant_method, scales.name, scales.shape
+            )));
+        }
+
+        let canonical = format!("{prefix}.weight");
+        let scale_output = format!("{canonical}_scale_inv");
+        let zero_output = format!("{canonical}_zero_point");
+        let weight_encoding = Encoding::Quant(
+            QuantSpec {
+                scheme,
+                logical_dtype: DType::BF16,
+                bits_per_element: 4,
+                group_size: self.cfg.quant_group_size,
+                channel_axis: Some(Axis(0)),
+                scale_dtype: Some(DType::BF16),
+                zero_point_dtype: (scheme == QuantScheme::AwqInt4).then_some(DType::I32),
+                block_shape: vec![group_size],
+            }
+            .normalized(),
+        );
+        let base_spec = |batch: i64, rows: i64, layout: RepackLayout| {
+            Ok::<_, CompileError>(RepackSpec {
+                layout,
+                row_map: RowMap::Identity,
+                batch: u32_dim(batch, "offline INT4 source batch")?,
+                source_rows: u32_dim(rows, "offline INT4 source rows")?,
+                source_row_offset: 0,
+                target_rows: u32_dim(rows, "offline INT4 target rows")?,
+                valid_rows: u32_dim(rows, "offline INT4 valid rows")?,
+                source_stride_cols: 1,
+                source_col_offset: 0,
+                source_cols: 1,
+                target_cols: 1,
+                group_size: self.cfg.quant_group_size,
+            })
+        };
+        self.push_repack(
+            canonical.clone(),
+            qweight,
+            DType::BF16,
+            weight_encoding,
+            vec![n, k],
+            base_spec(qweight.shape[0], qweight.shape[1], weight_layout)?,
+        );
+        self.push_repack(
+            scale_output,
+            &scales,
+            DType::BF16,
+            Encoding::Raw(DType::BF16),
+            vec![groups, n],
+            base_spec(groups, n, RepackLayout::MarlinInt4Scale)?,
+        );
+        self.consumed.insert(qweight.id);
+        self.consumed.insert(scales.id);
+
+        let qzeros_name = format!("{prefix}.qzeros");
+        if scheme == QuantScheme::AwqInt4 {
+            let qzeros = self
+                .metadata
+                .tensors
+                .iter()
+                .find(|raw| raw.name == qzeros_name)
+                .cloned()
+                .ok_or_else(|| {
+                    CompileError::InvalidInput(format!(
+                        "AWQ qweight '{}' is missing matching qzeros tensor '{}'",
+                        qweight.name, qzeros_name
+                    ))
+                })?;
+            if qzeros.encoding != Encoding::Raw(DType::I32)
+                || qzeros.shape != vec![groups, n / 8]
+            {
+                return Err(CompileError::InvalidInput(format!(
+                    "AWQ qzeros '{}' shape/encoding does not match expected [{groups}, {}] I32",
+                    qzeros.name,
+                    n / 8
+                )));
+            }
+            self.push_repack(
+                zero_output,
+                &qzeros,
+                DType::I32,
+                Encoding::Raw(DType::I32),
+                qzeros.shape.clone(),
+                base_spec(groups, n / 8, RepackLayout::MarlinAwqZeroPoint)?,
+            );
+            self.consumed.insert(qzeros.id);
+        } else if let Some(qzeros) = self.metadata.tensors.iter().find(|raw| raw.name == qzeros_name)
+        {
+            self.consumed.insert(qzeros.id);
+        }
+        let g_idx_name = format!("{prefix}.g_idx");
+        if let Some(g_idx) = self.metadata.tensors.iter().find(|raw| raw.name == g_idx_name) {
+            self.consumed.insert(g_idx.id);
         }
         Ok(())
     }
@@ -1639,6 +1857,7 @@ impl DefaultAbiBuilder<'_> {
                     source_col_offset: 0,
                     source_cols: u32_dim(hidden, "GPT-OSS hidden size")?,
                     target_cols: u32_dim(hidden, "GPT-OSS hidden size")?,
+                    group_size: 0,
                 },
             );
             self.push_repack(
@@ -1659,6 +1878,7 @@ impl DefaultAbiBuilder<'_> {
                     source_col_offset: 0,
                     source_cols: u32_dim(groups, "GPT-OSS hidden groups")?,
                     target_cols: u32_dim(groups, "GPT-OSS hidden groups")?,
+                    group_size: 0,
                 },
             );
             self.push_repack(
@@ -1682,6 +1902,7 @@ impl DefaultAbiBuilder<'_> {
                     source_col_offset: 0,
                     source_cols: 1,
                     target_cols: 1,
+                    group_size: 0,
                 },
             );
         }
@@ -1746,6 +1967,7 @@ impl DefaultAbiBuilder<'_> {
                 source_col_offset: u32_dim(local_start, "GPT-OSS down source column offset")?,
                 source_cols: u32_dim(local_intermediate, "GPT-OSS intermediate size")?,
                 target_cols: u32_dim(intermediate_native, "GPT-OSS padded intermediate size")?,
+                group_size: 0,
             },
         );
         self.push_repack(
@@ -1769,6 +1991,7 @@ impl DefaultAbiBuilder<'_> {
                 )?,
                 source_cols: u32_dim(local_groups, "GPT-OSS down source groups")?,
                 target_cols: u32_dim(intermediate_native / 32, "GPT-OSS down target groups")?,
+                group_size: 0,
             },
         );
         self.push_direct(bias, format!("{base}.bias"), None);

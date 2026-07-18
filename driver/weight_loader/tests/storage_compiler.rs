@@ -137,6 +137,107 @@ fn direct_copy_lowers_to_identity_extent_write() {
 }
 
 #[test]
+fn gptq_int4_default_abi_lowers_checkpoint_triplet_to_marlin() {
+    let metadata = offline_int4_metadata(QuantScheme::GptqInt4);
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "qwen2".to_string(),
+        quant_method: "gptq".to_string(),
+        quant_bits: 4,
+        quant_group_size: 16,
+        quant_symmetric: true,
+        num_hidden_layers: 1,
+        ..Default::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        preferred_alignment: 256,
+        ..StorageTarget::default()
+    };
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
+    let weight = abi
+        .tensors
+        .iter()
+        .find(|tensor| tensor.output_name == "model.layers.0.self_attn.q_proj.weight")
+        .unwrap();
+    assert_eq!(weight.shape, vec![64, 32]);
+    assert!(matches!(
+        &weight.encoding,
+        Encoding::Quant(spec)
+            if spec.scheme == QuantScheme::GptqInt4 && spec.group_size == 16
+    ));
+    assert!(abi.tensors.iter().any(|tensor| {
+        tensor.output_name == "model.layers.0.self_attn.q_proj.weight_scale_inv"
+            && tensor.encoding == Encoding::Raw(DType::BF16)
+    }));
+    assert!(!abi.tensors.iter().any(|tensor| {
+        tensor.output_name.ends_with(".qweight")
+            || tensor.output_name.ends_with(".qzeros")
+            || tensor.output_name.ends_with(".g_idx")
+    }));
+
+    let program = compile_storage_program(&metadata, &cfg, &abi, target).unwrap();
+    let layouts = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Repack,
+                transform,
+                ..
+            } => Some(transform.repack.layout),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(layouts.contains(&RepackLayout::MarlinGptqWeight));
+    assert!(layouts.contains(&RepackLayout::MarlinInt4Scale));
+    assert_eq!(program.memory.persistent_bytes, 1280);
+}
+
+#[test]
+fn awq_int4_default_abi_lowers_checkpoint_triplet_to_marlin() {
+    let metadata = offline_int4_metadata(QuantScheme::AwqInt4);
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "qwen2".to_string(),
+        quant_method: "awq".to_string(),
+        quant_bits: 4,
+        quant_group_size: 16,
+        quant_symmetric: false,
+        quant_zero_point: true,
+        num_hidden_layers: 1,
+        ..Default::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        preferred_alignment: 256,
+        ..StorageTarget::default()
+    };
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
+    assert!(abi.tensors.iter().any(|tensor| {
+        tensor.output_name == "model.layers.0.self_attn.q_proj.weight_zero_point"
+            && tensor.encoding == Encoding::Raw(DType::I32)
+    }));
+    let program = compile_storage_program(&metadata, &cfg, &abi, target).unwrap();
+    let layouts = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::TileMap {
+                kind: TileMapKind::Repack,
+                transform,
+                ..
+            } => Some(transform.repack.layout),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(layouts.contains(&RepackLayout::MarlinAwqWeight));
+    assert!(layouts.contains(&RepackLayout::MarlinInt4Scale));
+    assert!(layouts.contains(&RepackLayout::MarlinAwqZeroPoint));
+    assert!(program.memory.transform_scratch_peak_bytes > 0);
+}
+
+#[test]
 fn packed_quant_row_select_uses_byte_exact_offsets() {
     let mut plan = LayoutPlan::new();
     let q_decl = decl(
@@ -311,6 +412,7 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
         num_hidden_layers: 1,
         num_experts: 2,
         num_experts_per_tok: 2,
+        ..Default::default()
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
@@ -372,6 +474,7 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
         num_hidden_layers: 1,
         num_experts: 2,
         num_experts_per_tok: 2,
+        ..Default::default()
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
@@ -505,6 +608,7 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         num_hidden_layers: 1,
         num_experts: 2,
         num_experts_per_tok: 2,
+        ..Default::default()
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
@@ -694,6 +798,47 @@ fn quant_metadata() -> CheckpointMetadata {
                 layout: Layout::dense(1),
             },
         ],
+    }
+}
+
+fn offline_int4_metadata(scheme: QuantScheme) -> CheckpointMetadata {
+    let prefix = "model.layers.0.self_attn.q_proj";
+    let (qweight_shape, qweight_bytes) = match scheme {
+        QuantScheme::GptqInt4 => (vec![4, 64], 4 * 64 * 4),
+        QuantScheme::AwqInt4 => (vec![32, 8], 32 * 8 * 4),
+        _ => panic!("offline_int4_metadata requires GPTQ or AWQ"),
+    };
+    let mut offset = 0_u64;
+    let mut tensor = |id: u32,
+                      suffix: &str,
+                      shape: Vec<i64>,
+                      dtype: DType,
+                      bytes: u64| {
+        let raw = RawTensor {
+            id: TensorId(id),
+            name: format!("{prefix}.{suffix}"),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(dtype),
+            layout: Layout::dense(1),
+        };
+        offset += bytes;
+        raw
+    };
+    let qweight = tensor(0, "qweight", qweight_shape, DType::I32, qweight_bytes);
+    let qzeros = tensor(1, "qzeros", vec![2, 8], DType::I32, 2 * 8 * 4);
+    let scales = tensor(2, "scales", vec![2, 64], DType::F16, 2 * 64 * 2);
+    let g_idx = tensor(3, "g_idx", vec![32], DType::I32, 32 * 4);
+    CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![qweight, qzeros, scales, g_idx],
     }
 }
 

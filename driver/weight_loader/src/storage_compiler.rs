@@ -1742,7 +1742,14 @@ fn validate_target_support(program: &StorageProgram) -> Result<(), CompileError>
                              | QuantScheme::Mxfp4E2M1E8M0)
                     ))
                     || (*kind == TileMapKind::Repack
-                        && (matches!(transform.repack.layout, RepackLayout::DenseRowGather)
+                        && (matches!(
+                            transform.repack.layout,
+                            RepackLayout::DenseRowGather
+                                | RepackLayout::MarlinGptqWeight
+                                | RepackLayout::MarlinAwqWeight
+                                | RepackLayout::MarlinInt4Scale
+                                | RepackLayout::MarlinAwqZeroPoint
+                        )
                             || (program.target.native_mxfp4_moe
                                 && matches!(
                                     transform.repack.layout,
@@ -2041,6 +2048,17 @@ fn narrow_repack_source(
                 )));
             }
         }
+        RepackLayout::MarlinGptqWeight
+        | RepackLayout::MarlinAwqWeight
+        | RepackLayout::MarlinInt4Scale
+        | RepackLayout::MarlinAwqZeroPoint => {
+            if source.shape.len() != 2 {
+                return Err(CompileError::InvalidInput(format!(
+                    "offline INT4 Repack source must be 2-D, got {:?}",
+                    source.shape
+                )));
+            }
+        }
         RepackLayout::None => {}
     }
 
@@ -2078,7 +2096,16 @@ fn repack_stage_bytes(spec: RepackSpec) -> Result<u64, CompileError> {
                 })?;
             Ok(elems.div_ceil(2))
         }
-        RepackLayout::MarlinMxfp4Scale | RepackLayout::DenseRowGather | RepackLayout::None => Ok(0),
+        RepackLayout::MarlinAwqWeight => u64::from(spec.batch)
+            .checked_mul(u64::from(spec.source_rows))
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| CompileError::InvalidInput("AWQ repack stage size overflow".to_string())),
+        RepackLayout::MarlinMxfp4Scale
+        | RepackLayout::DenseRowGather
+        | RepackLayout::MarlinGptqWeight
+        | RepackLayout::MarlinInt4Scale
+        | RepackLayout::MarlinAwqZeroPoint
+        | RepackLayout::None => Ok(0),
     }
 }
 

@@ -999,6 +999,23 @@ private:
                 target_rows, valid_rows, row_map, /*stream=*/0);
             CUDA_CHECK(cudaGetLastError());
             return;
+        case pie_weight_loader::PieLoaderRepackLayout::MarlinGptqWeight:
+            repack_marlin_gptq_weight(
+                src_base, dst_base, batch, source_rows);
+            return;
+        case pie_weight_loader::PieLoaderRepackLayout::MarlinAwqWeight:
+            repack_marlin_awq_weight(
+                src_base, dst_base, batch, source_rows);
+            return;
+        case pie_weight_loader::PieLoaderRepackLayout::MarlinInt4Scale:
+            repack_marlin_int4_scale(
+                instr, src_base, dst_base, batch, source_rows,
+                static_cast<int>(instr.transform_group_size));
+            return;
+        case pie_weight_loader::PieLoaderRepackLayout::MarlinAwqZeroPoint:
+            repack_marlin_awq_zero_point(
+                src_base, dst_base, batch, source_rows);
+            return;
         case pie_weight_loader::PieLoaderRepackLayout::None:
             break;
         }
@@ -1012,6 +1029,105 @@ private:
     }
 
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
+    void repack_marlin_gptq_weight(
+        const std::uint8_t* src_base,
+        std::uint8_t* dst_base,
+        int packed_k_rows,
+        int size_n)
+    {
+#if defined(PIE_CUDA_HAS_MARLIN)
+        const int size_k = packed_k_rows * 8;
+        if (size_k <= 0 || size_n <= 0 || size_k % 16 != 0 || size_n % 64 != 0) {
+            throw std::runtime_error(
+                "rust storage executor: GPTQ Marlin weight has incompatible dimensions");
+        }
+        marlin::launch_gptq_repack_w4_no_perm(
+            src_base, dst_base, size_k, size_n, /*stream=*/0);
+        CUDA_CHECK(cudaGetLastError());
+#else
+        (void)src_base; (void)dst_base; (void)packed_k_rows; (void)size_n;
+        throw std::runtime_error(
+            "rust storage executor: GPTQ Marlin weight requires Marlin");
+#endif
+    }
+
+    void repack_marlin_awq_weight(
+        const std::uint8_t* src_base,
+        std::uint8_t* dst_base,
+        int size_k,
+        int packed_n_cols)
+    {
+#if defined(PIE_CUDA_HAS_MARLIN)
+        const int size_n = packed_n_cols * 8;
+        if (size_k <= 0 || size_n <= 0 || size_k % 16 != 0 || size_n % 64 != 0) {
+            throw std::runtime_error(
+                "rust storage executor: AWQ Marlin weight has incompatible dimensions");
+        }
+        DeviceTensor gptq_qweight =
+            DeviceTensor::allocate(DType::INT32, {size_k / 8, size_n});
+        kernels::launch_awq_qweight_to_gptq_w4(
+            src_base, gptq_qweight.data(), size_k, size_n, /*stream=*/0);
+        marlin::launch_gptq_repack_w4_no_perm(
+            gptq_qweight.data(), dst_base, size_k, size_n, /*stream=*/0);
+        CUDA_CHECK(cudaGetLastError());
+#else
+        (void)src_base; (void)dst_base; (void)size_k; (void)packed_n_cols;
+        throw std::runtime_error(
+            "rust storage executor: AWQ Marlin weight requires Marlin");
+#endif
+    }
+
+    void repack_marlin_int4_scale(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        const std::uint8_t* src_base,
+        std::uint8_t* dst_base,
+        int groups,
+        int size_n,
+        int group_size)
+    {
+        if (!instr.has_source || group_size <= 0 || groups <= 0 || size_n <= 0) {
+            throw std::runtime_error(
+                "rust storage executor: Marlin INT4 scale requires a direct source and positive dimensions");
+        }
+        const int size_k = groups * group_size;
+        const TensorInfo& source_info =
+            loader_.info(source_tensor_names_.at(instr.source.tensor_id));
+        const std::size_t values = static_cast<std::size_t>(groups) * size_n;
+        if (source_info.dtype == DType::BF16) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                dst_base, src_base, values * sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice, /*stream=*/0));
+        } else if (source_info.dtype == DType::FP16) {
+            kernels::launch_cast_fp16_to_bf16(
+                src_base, dst_base, values, /*stream=*/0);
+        } else if (source_info.dtype == DType::FP32) {
+            kernels::launch_cast_fp32_to_bf16(
+                src_base, dst_base, values, /*stream=*/0);
+        } else {
+            throw std::runtime_error(
+                "rust storage executor: Marlin INT4 scale source must be BF16/FP16/FP32");
+        }
+        kernels::launch_marlin_permute_scales_bf16(
+            dst_base, groups, size_n, group_size, size_k, /*stream=*/0);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    void repack_marlin_awq_zero_point(
+        const std::uint8_t* src_base,
+        std::uint8_t* dst_base,
+        int groups,
+        int packed_n_cols)
+    {
+        const int size_n = packed_n_cols * 8;
+        if (groups <= 0 || size_n <= 0 || size_n % 64 != 0) {
+            throw std::runtime_error(
+                "rust storage executor: AWQ Marlin zero point has incompatible dimensions");
+        }
+        kernels::launch_awq_qzero_to_marlin_w4(
+            src_base, dst_base, groups, size_n, /*stream=*/0);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     void repack_marlin_mxfp4_weight(
         const std::uint8_t* src_base,
         std::uint8_t* dst_base,

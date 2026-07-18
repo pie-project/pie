@@ -9,6 +9,9 @@
 #include "loader/tensor_spec.hpp"
 #include "model/weight_store.hpp"
 
+#include <stdexcept>
+#include <vector>
+
 namespace pie_cuda_driver {
 
 inline QuantMeta::Kind quant_meta_kind(QuantGranularity granularity)
@@ -48,8 +51,25 @@ inline DType quant_physical_dtype(
     switch (tensor.quant_scheme) {
     case pie_weight_loader::PieLoaderQuantScheme::Fp8E4M3: return DType::FP8_E4M3;
     case pie_weight_loader::PieLoaderQuantScheme::Int8Symmetric: return DType::INT8;
+    case pie_weight_loader::PieLoaderQuantScheme::GptqInt4:
+    case pie_weight_loader::PieLoaderQuantScheme::AwqInt4:
+        return DType::INT4_PACKED;
     default: return DType::UINT8;
     }
+}
+
+inline std::vector<std::int64_t> quant_physical_shape(
+    const pie_weight_loader::PieLoaderTensorDeclView& tensor,
+    DType physical)
+{
+    auto logical = pie_weight_loader::cpp::i64_slice_to_vector(tensor.shape);
+    if (physical != DType::INT4_PACKED) return logical;
+    if (logical.size() != 2 || logical[0] <= 0 || logical[1] <= 0 ||
+        logical[1] % 16 != 0 || logical[0] % 64 != 0) {
+        throw std::runtime_error(
+            "rust storage executor: Marlin INT4 logical weight shape must be [N,K] with N%64=0 and K%16=0");
+    }
+    return {logical[1] / 16, logical[0] * 8};
 }
 
 }  // namespace pie_cuda_driver

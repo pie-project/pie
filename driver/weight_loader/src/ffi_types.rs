@@ -184,6 +184,10 @@ pub enum PieLoaderRepackLayout {
     MarlinMxfp4Weight = 1,
     MarlinMxfp4Scale = 2,
     DenseRowGather = 3,
+    MarlinGptqWeight = 4,
+    MarlinAwqWeight = 5,
+    MarlinInt4Scale = 6,
+    MarlinAwqZeroPoint = 7,
 }
 
 #[repr(C)]
@@ -392,6 +396,11 @@ pub struct PieLoaderRuntimeTensorContractSlice {
 pub struct PieLoaderModelConfigView {
     pub model_type: PieLoaderBytes,
     pub quant_method: PieLoaderBytes,
+    pub quant_bits: u32,
+    pub quant_group_size: u32,
+    pub quant_desc_act: bool,
+    pub quant_symmetric: bool,
+    pub quant_zero_point: bool,
     pub runtime_quant: PieLoaderBytes,
     pub num_hidden_layers: u32,
     pub num_experts: u32,
@@ -451,6 +460,8 @@ pub struct PieLoaderTensorDeclView {
     pub dtype: PieLoaderDType,
     pub encoding_kind: PieLoaderEncodingKind,
     pub quant_scheme: PieLoaderQuantScheme,
+    pub quant_group_size: u32,
+    pub quant_channel_axis: i32,
     pub shape: PieLoaderI64Slice,
     pub alignment: u32,
 }
@@ -524,6 +535,7 @@ pub struct PieLoaderStorageInstrView {
     pub transform_source_col_offset: u32,
     pub transform_source_cols: u32,
     pub transform_target_cols: u32,
+    pub transform_group_size: u32,
     pub transform_scratch_bytes: u64,
     pub name: PieLoaderBytes,
     pub slab_file_id: u32,

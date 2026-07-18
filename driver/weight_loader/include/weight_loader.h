@@ -14,7 +14,7 @@
 
 namespace pie_weight_loader {
 
-constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 3;
+constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 4;
 
 enum class PieLoaderBackendKind {
   Cuda = 0,
@@ -75,6 +75,10 @@ enum class PieLoaderRepackLayout {
   MarlinMxfp4Weight = 1,
   MarlinMxfp4Scale = 2,
   DenseRowGather = 3,
+  MarlinGptqWeight = 4,
+  MarlinAwqWeight = 5,
+  MarlinInt4Scale = 6,
+  MarlinAwqZeroPoint = 7,
 };
 
 enum class PieLoaderRowMap {
@@ -286,6 +290,11 @@ struct PieLoaderRuntimeTensorContractSlice {
 struct PieLoaderModelConfigView {
   PieLoaderBytes model_type;
   PieLoaderBytes quant_method;
+  uint32_t quant_bits;
+  uint32_t quant_group_size;
+  bool quant_desc_act;
+  bool quant_symmetric;
+  bool quant_zero_point;
   PieLoaderBytes runtime_quant;
   uint32_t num_hidden_layers;
   uint32_t num_experts;
@@ -323,6 +332,8 @@ struct PieLoaderTensorDeclView {
   PieLoaderDType dtype;
   PieLoaderEncodingKind encoding_kind;
   PieLoaderQuantScheme quant_scheme;
+  uint32_t quant_group_size;
+  int32_t quant_channel_axis;
   PieLoaderI64Slice shape;
   uint32_t alignment;
 };
@@ -384,6 +395,7 @@ struct PieLoaderStorageInstrView {
   uint32_t transform_source_col_offset;
   uint32_t transform_source_cols;
   uint32_t transform_target_cols;
+  uint32_t transform_group_size;
   uint64_t transform_scratch_bytes;
   PieLoaderBytes name;
   uint32_t slab_file_id;

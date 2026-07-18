@@ -88,6 +88,12 @@ public:
         model_ = pie_weight_loader::PieLoaderModelConfigView{
             .model_type = bytes(model_type_),
             .quant_method = bytes(quant_method_),
+            .quant_bits = static_cast<std::uint32_t>(std::max(hf.quant_bits, 0)),
+            .quant_group_size =
+                static_cast<std::uint32_t>(std::max(hf.quant_group_size, 0)),
+            .quant_desc_act = hf.quant_desc_act,
+            .quant_symmetric = hf.quant_sym,
+            .quant_zero_point = hf.quant_zero_point,
             .runtime_quant = bytes(runtime_quant_),
             .num_hidden_layers = static_cast<std::uint32_t>(
                 std::max(hf.num_hidden_layers, 0)),

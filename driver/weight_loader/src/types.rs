@@ -154,6 +154,10 @@ pub enum RepackLayout {
     MarlinMxfp4Weight,
     MarlinMxfp4Scale,
     DenseRowGather,
+    MarlinGptqWeight,
+    MarlinAwqWeight,
+    MarlinInt4Scale,
+    MarlinAwqZeroPoint,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -169,6 +173,7 @@ pub struct RepackSpec {
     pub source_col_offset: u32,
     pub source_cols: u32,
     pub target_cols: u32,
+    pub group_size: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

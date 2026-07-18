@@ -485,6 +485,53 @@ fn validate_repack_spec(
                 )));
             }
         }
+        RepackLayout::MarlinGptqWeight => {
+            if !matches!(source.encoding, Encoding::Raw(DType::I32))
+                || !matches!(
+                    &decl.encoding,
+                    Encoding::Quant(q) if q.scheme == QuantScheme::GptqInt4
+                )
+                || spec.group_size == 0
+            {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} GPTQ Marlin weight requires I32 source, GPTQ-Int4 output, and group_size"
+                )));
+            }
+        }
+        RepackLayout::MarlinAwqWeight => {
+            if !matches!(source.encoding, Encoding::Raw(DType::I32))
+                || !matches!(
+                    &decl.encoding,
+                    Encoding::Quant(q) if q.scheme == QuantScheme::AwqInt4
+                )
+                || spec.group_size == 0
+            {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} AWQ Marlin weight requires I32 source, AWQ-Int4 output, and group_size"
+                )));
+            }
+        }
+        RepackLayout::MarlinInt4Scale => {
+            if !matches!(
+                source.encoding,
+                Encoding::Raw(DType::F16 | DType::BF16 | DType::F32)
+            ) || !matches!(decl.encoding, Encoding::Raw(DType::BF16))
+                || spec.group_size == 0
+            {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} Marlin INT4 scale requires F16/BF16/F32 source, BF16 output, and group_size"
+                )));
+            }
+        }
+        RepackLayout::MarlinAwqZeroPoint => {
+            if !matches!(source.encoding, Encoding::Raw(DType::I32))
+                || !matches!(decl.encoding, Encoding::Raw(DType::I32))
+            {
+                return Err(CompileError::InvalidInput(format!(
+                    "Repack expr {index} AWQ Marlin zero point requires I32 source and output"
+                )));
+            }
+        }
         RepackLayout::None => unreachable!(),
     }
     Ok(())

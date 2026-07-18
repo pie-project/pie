@@ -30,7 +30,7 @@ fn empty_compile_returns_empty_program() {
     assert!(error.message.is_null());
 
     let view = unsafe { pie_loader_program_view(handle) };
-    assert_eq!(view.version, 3);
+    assert_eq!(view.version, 4);
     assert_eq!(view.tensors.len, 0);
     assert_eq!(view.buffers.len, 0);
     assert_eq!(view.instrs.len, 0);

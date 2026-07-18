@@ -37,12 +37,21 @@ impl FfiArena {
             let name = arena.push_string(&tensor.name);
             let shape = arena.push_i64_slice(&tensor.shape);
             let (encoding_kind, dtype, quant_scheme) = encoding_parts(&tensor.encoding);
+            let (quant_group_size, quant_channel_axis) = match &tensor.encoding {
+                crate::types::Encoding::Quant(spec) => (
+                    spec.normalized_group_size(),
+                    spec.channel_axis.map_or(-1, |axis| i32::from(axis.0)),
+                ),
+                crate::types::Encoding::Raw(_) => (0, -1),
+            };
             arena.tensor_views.push(PieLoaderTensorDeclView {
                 id: tensor.id.0,
                 name,
                 dtype,
                 encoding_kind,
                 quant_scheme,
+                quant_group_size,
+                quant_channel_axis,
                 shape,
                 alignment: tensor.alignment,
             });
@@ -217,6 +226,7 @@ impl FfiArena {
                 transform_source_col_offset: 0,
                 transform_source_cols: 0,
                 transform_target_cols: 0,
+                transform_group_size: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
                 slab_file_id: u32::MAX,
@@ -249,6 +259,7 @@ impl FfiArena {
                 transform_source_col_offset: 0,
                 transform_source_cols: 0,
                 transform_target_cols: 0,
+                transform_group_size: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
                 slab_file_id: u32::MAX,
@@ -289,6 +300,7 @@ impl FfiArena {
                 transform_source_col_offset: 0,
                 transform_source_cols: 0,
                 transform_target_cols: 0,
+                transform_group_size: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
                 slab_file_id: u32::MAX,
@@ -327,6 +339,7 @@ impl FfiArena {
                 transform_source_col_offset: 0,
                 transform_source_cols: 0,
                 transform_target_cols: 0,
+                transform_group_size: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
                 slab_file_id: file_id.0,
@@ -380,6 +393,7 @@ impl FfiArena {
                 transform_source_col_offset: transform.repack.source_col_offset,
                 transform_source_cols: transform.repack.source_cols,
                 transform_target_cols: transform.repack.target_cols,
+                transform_group_size: transform.repack.group_size,
                 transform_scratch_bytes: transform.scratch_bytes,
                 name: empty_name,
                 slab_file_id: u32::MAX,
@@ -418,6 +432,7 @@ impl FfiArena {
                 transform_source_col_offset: 0,
                 transform_source_cols: 0,
                 transform_target_cols: 0,
+                transform_group_size: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
                 slab_file_id: u32::MAX,
@@ -455,6 +470,7 @@ impl FfiArena {
                 transform_source_col_offset: 0,
                 transform_source_cols: 0,
                 transform_target_cols: 0,
+                transform_group_size: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
                 slab_file_id: u32::MAX,
@@ -487,6 +503,7 @@ impl FfiArena {
                 transform_source_col_offset: 0,
                 transform_source_cols: 0,
                 transform_target_cols: 0,
+                transform_group_size: 0,
                 transform_scratch_bytes: 0,
                 name: empty_name,
                 slab_file_id: u32::MAX,
@@ -519,6 +536,7 @@ impl FfiArena {
                 transform_source_col_offset: 0,
                 transform_source_cols: 0,
                 transform_target_cols: 0,
+                transform_group_size: 0,
                 transform_scratch_bytes: 0,
                 name: self.push_string(name),
                 slab_file_id: u32::MAX,
@@ -626,6 +644,10 @@ fn ffi_repack_layout(layout: RepackLayout) -> PieLoaderRepackLayout {
         RepackLayout::MarlinMxfp4Weight => PieLoaderRepackLayout::MarlinMxfp4Weight,
         RepackLayout::MarlinMxfp4Scale => PieLoaderRepackLayout::MarlinMxfp4Scale,
         RepackLayout::DenseRowGather => PieLoaderRepackLayout::DenseRowGather,
+        RepackLayout::MarlinGptqWeight => PieLoaderRepackLayout::MarlinGptqWeight,
+        RepackLayout::MarlinAwqWeight => PieLoaderRepackLayout::MarlinAwqWeight,
+        RepackLayout::MarlinInt4Scale => PieLoaderRepackLayout::MarlinInt4Scale,
+        RepackLayout::MarlinAwqZeroPoint => PieLoaderRepackLayout::MarlinAwqZeroPoint,
     }
 }
 
