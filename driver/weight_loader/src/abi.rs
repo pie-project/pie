@@ -1049,12 +1049,24 @@ impl DefaultAbiBuilder<'_> {
     }
 
     fn push_direct(&mut self, raw: &RawTensor, output_name: String, shard_axis: Option<Axis>) {
+        // Marlin's offline GPTQ/AWQ path is W4A16 with BF16 activations.
+        // Quantized checkpoints can still carry unquantized FP16 tensors
+        // (notably embeddings, norms, biases, and lm_head). Leaving those
+        // tensors as FP16 creates an unsupported BF16 x FP16 raw GEMM at
+        // runtime, so materialize them in the path's BF16 compute dtype.
+        let encoding = if matches!(self.cfg.quant_method.as_str(), "gptq" | "awq")
+            && raw.encoding == Encoding::Raw(DType::F16)
+        {
+            Encoding::Raw(DType::BF16)
+        } else {
+            raw.encoding.clone()
+        };
         self.tensors.push(RuntimeTensorContract {
             output_name,
             source: RuntimeTensorSource::DirectTensor(raw.id),
             metadata: Vec::new(),
-            dtype: self.dtype(raw),
-            encoding: raw.encoding.clone(),
+            dtype: dtype_for_encoding(&encoding),
+            encoding,
             shape: raw.shape.clone(),
             layout: Layout::dense(self.alignment()),
             sharding: Sharding::replicated(),

@@ -170,6 +170,11 @@ fn gptq_int4_default_abi_lowers_checkpoint_triplet_to_marlin() {
         tensor.output_name == "model.layers.0.self_attn.q_proj.weight_scale_inv"
             && tensor.encoding == Encoding::Raw(DType::BF16)
     }));
+    assert!(abi.tensors.iter().any(|tensor| {
+        tensor.output_name == "lm_head.weight"
+            && tensor.dtype == DType::BF16
+            && tensor.encoding == Encoding::Raw(DType::BF16)
+    }));
     assert!(!abi.tensors.iter().any(|tensor| {
         tensor.output_name.ends_with(".qweight")
             || tensor.output_name.ends_with(".qzeros")
@@ -191,7 +196,11 @@ fn gptq_int4_default_abi_lowers_checkpoint_triplet_to_marlin() {
         .collect::<Vec<_>>();
     assert!(layouts.contains(&RepackLayout::MarlinGptqWeight));
     assert!(layouts.contains(&RepackLayout::MarlinInt4Scale));
-    assert_eq!(program.memory.persistent_bytes, 1280);
+    assert!(program.instrs.iter().any(|instr| matches!(
+        instr,
+        StorageInstr::TileMap { kind: TileMapKind::Cast, .. }
+    )));
+    assert_eq!(program.memory.persistent_bytes, 5376);
 }
 
 #[test]
@@ -831,6 +840,17 @@ fn offline_int4_metadata(scheme: QuantScheme) -> CheckpointMetadata {
     let qzeros = tensor(1, "qzeros", vec![2, 8], DType::I32, 2 * 8 * 4);
     let scales = tensor(2, "scales", vec![2, 64], DType::F16, 2 * 64 * 2);
     let g_idx = tensor(3, "g_idx", vec![32], DType::I32, 32 * 4);
+    let lm_head = RawTensor {
+        id: TensorId(4),
+        name: "lm_head.weight".to_string(),
+        file_id: FileId(0),
+        file_offset: offset,
+        span_bytes: 64 * 32 * 2,
+        shape: vec![64, 32],
+        encoding: Encoding::Raw(DType::F16),
+        layout: Layout::dense(1),
+    };
+    offset += lm_head.span_bytes;
     CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
@@ -838,7 +858,7 @@ fn offline_int4_metadata(scheme: QuantScheme) -> CheckpointMetadata {
             size_bytes: offset,
             format: CheckpointFormat::Safetensors,
         }],
-        tensors: vec![qweight, qzeros, scales, g_idx],
+        tensors: vec![qweight, qzeros, scales, g_idx, lm_head],
     }
 }
 
