@@ -17,6 +17,22 @@ use crate::inference::structured::grammar::Grammar;
 use crate::inference::structured::grammar::normalize::normalize_grammar;
 use crate::model::tokenizer::Tokenizer;
 
+pub(crate) const MAX_STACK_RULES: usize = u16::MAX as usize;
+
+/// Validate that normalization will fit the matcher's packed rule identifier.
+///
+/// Grammar resources are created before a tokenizer-backed matcher. Keeping
+/// this check at resource construction makes an oversized user grammar a
+/// recoverable schema error instead of a panic on a Tokio runtime worker.
+pub(crate) fn validate_matcher_capacity(grammar: &Grammar) -> anyhow::Result<()> {
+    let normalized_rules = normalize_grammar(grammar).num_rules();
+    anyhow::ensure!(
+        normalized_rules <= MAX_STACK_RULES,
+        "grammar normalization produced {normalized_rules} rules, exceeding the matcher limit of {MAX_STACK_RULES}"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Compilation cache
 // ---------------------------------------------------------------------------
@@ -255,10 +271,10 @@ fn compute_state_actions(rule_dfas: &[Automaton<DfaTable>]) -> (Vec<StateAction>
     let mut has_self_ref_chains = false;
 
     assert!(
-        rule_dfas.len() <= u16::MAX as usize,
+        rule_dfas.len() <= MAX_STACK_RULES,
         "too many rules ({}) — StackState.rule_id is u16 (max {})",
         rule_dfas.len(),
-        u16::MAX,
+        MAX_STACK_RULES,
     );
     for dfa in rule_dfas {
         assert!(
@@ -525,4 +541,72 @@ fn precompute_token_masks(
     }
 
     masks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference::structured::grammar::builder::GrammarBuilder;
+    use crate::inference::structured::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
+
+    #[test]
+    fn capacity_preflight_rejects_rule_id_overflow_without_compiling_a_matcher() {
+        let mut builder = GrammarBuilder::new();
+        let empty = builder.add_empty_string();
+        for index in 0..=MAX_STACK_RULES {
+            let rule = builder.add_rule(&format!("rule_{index}"));
+            builder.set_rule_body(rule, empty);
+        }
+        let grammar = builder.build("rule_0").unwrap();
+
+        let error = validate_matcher_capacity(&grammar).unwrap_err().to_string();
+        assert!(error.contains("exceeding the matcher limit"));
+        assert!(error.contains(&MAX_STACK_RULES.to_string()));
+    }
+
+    #[test]
+    fn capacity_preflight_accepts_production_json_schema_compiler_output() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"const": "inspect"},
+                        "arguments": {
+                            "type": "object",
+                            "properties": {"resource": {"type": "string"}},
+                            "required": ["resource"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["name", "arguments"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": {"const": "update"},
+                        "arguments": {
+                            "type": "object",
+                            "properties": {
+                                "resource": {"type": "string"},
+                                "replacement": {"type": "string"}
+                            },
+                            "required": ["resource", "replacement"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["name", "arguments"],
+                    "additionalProperties": false
+                }
+            ]
+        });
+        let grammar = json_schema_to_grammar(
+            &serde_json::to_string(&schema).unwrap(),
+            &JsonSchemaOptions::default(),
+        )
+        .unwrap();
+
+        validate_matcher_capacity(&grammar).unwrap();
+    }
 }
