@@ -1,7 +1,7 @@
 //! Real component-boundary coverage for explicit context destruction.
 
 use futures::future::join_all;
-use inferlet::{Context, Result, model::Model, runtime};
+use inferlet::{Context, FutureStringExt, Result, messaging, model::Model, runtime};
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
@@ -16,8 +16,17 @@ async fn main(input: String) -> Result<String> {
     .await;
     root.destroy();
 
+    messaging::push("lifecycle-ready", &input);
+    let release = messaging::pull("lifecycle-release")
+        .wait_async()
+        .await
+        .ok_or("lifecycle release channel closed")?;
+    if release != input {
+        return Err(format!("unexpected lifecycle release: {release}"));
+    }
+
     if input == "error" {
-        return Err("injected error after context cleanup".into());
+        return Err("injected context lifecycle error".into());
     }
     Ok("contexts released".into())
 }

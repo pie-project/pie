@@ -114,7 +114,7 @@ fn explicit_destroy_releases_concurrent_forks_on_success_and_error() {
     s.rt.block_on(async {
         inferlets::add_and_install("context-lifecycle").await;
 
-        for (input, expect_error) in [("success", false), ("error", true)] {
+        for input in ["success", "error"] {
             let (result_tx, result_rx) = oneshot::channel();
             let pid = process::spawn(
                 "context-lifecycle-user".into(),
@@ -128,26 +128,39 @@ fn explicit_destroy_releases_concurrent_forks_on_success_and_error() {
             )
             .expect("spawn context lifecycle inferlet");
 
+            let ready = tokio::time::timeout(
+                PROCESS_TIMEOUT,
+                pie::messaging::pull("context-lifecycle-user:lifecycle-ready".into()),
+            )
+            .await
+            .expect("context lifecycle ready signal timed out")
+            .expect("context lifecycle ready signal failed");
+            assert_eq!(ready, input);
+            assert!(
+                process::list().contains(&pid),
+                "process exited before its live context ownership was inspected"
+            );
+            assert_eq!(
+                pie::context::debug_process_context_count(0, pid).await,
+                0,
+                "explicit destroy retained contexts while the process was alive"
+            );
+
+            pie::messaging::push(
+                "context-lifecycle-user:lifecycle-release".into(),
+                input.into(),
+            )
+            .expect("release context lifecycle inferlet");
+
             let result = tokio::time::timeout(PROCESS_TIMEOUT, result_rx)
                 .await
                 .expect("context lifecycle inferlet timed out")
                 .expect("context lifecycle result sender dropped");
-            assert_eq!(
-                result.is_err(),
-                expect_error,
-                "unexpected result for {input}"
-            );
-
-            tokio::time::timeout(PROCESS_TIMEOUT, async {
-                loop {
-                    if pie::context::debug_process_context_count(0, pid).await == 0 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("process teardown retained contexts");
+            match input {
+                "success" => assert_eq!(result, Ok("contexts released".into())),
+                "error" => assert_eq!(result, Err("injected context lifecycle error".into())),
+                _ => unreachable!(),
+            }
         }
     });
 }
