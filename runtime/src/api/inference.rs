@@ -5,7 +5,7 @@ use crate::api::context::Context;
 use crate::api::model::Model;
 use crate::api::pie;
 use crate::inference::ForwardOutput;
-use crate::inference::structured::compiled_grammar::CompiledGrammar;
+use crate::inference::structured::compiled_grammar::{CompiledGrammar, validate_matcher_capacity};
 use crate::inference::structured::grammar::Grammar as InternalGrammar;
 use crate::inference::structured::json_schema::{
     JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar,
@@ -1080,6 +1080,9 @@ impl pie::core::inference::HostGrammar for InstanceState {
     ) -> Result<Result<Resource<Grammar>, String>> {
         match json_schema_to_grammar(&schema, &JsonSchemaOptions::default()) {
             Ok(g) => {
+                if let Err(error) = validate_matcher_capacity(&g) {
+                    return Ok(Err(error.to_string()));
+                }
                 let grammar = Grammar {
                     source: schema,
                     inner: Arc::new(g),
@@ -1102,6 +1105,9 @@ impl pie::core::inference::HostGrammar for InstanceState {
     async fn from_regex(&mut self, pattern: String) -> Result<Result<Resource<Grammar>, String>> {
         match regex_to_grammar(&pattern) {
             Ok(g) => {
+                if let Err(error) = validate_matcher_capacity(&g) {
+                    return Ok(Err(error.to_string()));
+                }
                 let grammar = Grammar {
                     source: pattern,
                     inner: Arc::new(g),
@@ -1115,6 +1121,9 @@ impl pie::core::inference::HostGrammar for InstanceState {
     async fn from_ebnf(&mut self, ebnf: String) -> Result<Result<Resource<Grammar>, String>> {
         match InternalGrammar::from_ebnf(&ebnf, "root") {
             Ok(g) => {
+                if let Err(error) = validate_matcher_capacity(&g) {
+                    return Ok(Err(error.to_string()));
+                }
                 let grammar = Grammar {
                     source: ebnf,
                     inner: Arc::new(g),
