@@ -63,6 +63,22 @@ pie config set model.0.hf_repo Qwen/Qwen2.5-7B-Instruct  # update the first [[mo
 
 ## Run your first prompt
 
+:::note Registry vs local build
+`pie run text-completion` pulls the inferlet from the registry, which may lag behind
+the current engine. If you see a **404 Not Found** or
+**component imports instance not found** error, build it locally:
+
+```bash
+cd inferlets/text-completion
+cargo build --release --target wasm32-wasip2
+cd ../..
+pie run \
+  --path inferlets/text-completion/target/wasm32-wasip2/release/text_completion.wasm \
+  --manifest inferlets/text-completion/Pie.toml \
+  -- --prompt "The capital of France is"
+```
+:::
+
 ```bash
 pie run text-completion -- --prompt "The capital of France is"
 ```
