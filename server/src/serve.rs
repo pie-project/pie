@@ -330,7 +330,7 @@ pub async fn start_engine(user_cfg: config::Config) -> Result<EngineHandle> {
 
         // Resolve snapshot once per model — every group serves the same
         // weights against the same on-disk path.
-        let snapshot_dir = hf::resolve_or_download(&m.hf_repo)
+        let snapshot_dir = hf::resolve_or_download(&m.hf_repo, m.revision.as_deref())
             .await
             .with_context(|| format!("resolving hf_repo for model {:?}", m.name))?;
 

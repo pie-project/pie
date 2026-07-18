@@ -23,6 +23,9 @@ pub enum ModelCmd {
     /// Download a model snapshot by HuggingFace repo ID.
     Download {
         repo_id: String,
+        /// Hugging Face branch, tag, or immutable commit to download.
+        #[arg(long)]
+        revision: Option<String>,
         /// Download the complete HF snapshot, including alternate weight
         /// formats Pie does not use. By default, Pie downloads only runtime
         /// artifacts: config/tokenizer files and model*.safetensors.
@@ -41,7 +44,11 @@ pub enum ModelCmd {
 pub fn run(cmd: ModelCmd) -> Result<()> {
     match cmd {
         ModelCmd::List => list(),
-        ModelCmd::Download { repo_id, all } => download(repo_id, all),
+        ModelCmd::Download {
+            repo_id,
+            revision,
+            all,
+        } => download(repo_id, revision.as_deref(), all),
         ModelCmd::Remove { repo_id, yes } => remove(repo_id, yes),
     }
 }
@@ -191,7 +198,7 @@ fn list() -> Result<()> {
 // download
 // -----------------------------------------------------------------------------
 
-fn download(repo_id: String, all: bool) -> Result<()> {
+fn download(repo_id: String, revision: Option<&str>, all: bool) -> Result<()> {
     let (owner, name) = parse_repo_id(&repo_id)?;
 
     if all {
@@ -215,6 +222,7 @@ fn download(repo_id: String, all: bool) -> Result<()> {
         };
         let result = repo
             .snapshot_download()
+            .maybe_revision(revision.map(str::to_string))
             .maybe_allow_patterns(allow_patterns)
             .progress(progress.clone())
             .send()

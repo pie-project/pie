@@ -294,6 +294,8 @@ fn default_max_upload_mb() -> usize {
 pub struct ModelConfig {
     pub name: String,
     pub hf_repo: String,
+    #[serde(default)]
+    pub revision: Option<String>,
     pub driver: DriverConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
@@ -304,6 +306,12 @@ impl ModelConfig {
         ensure!(
             !self.name.is_empty(),
             "model.name must be a non-empty string"
+        );
+        ensure!(
+            self.revision
+                .as_ref()
+                .is_none_or(|revision| !revision.trim().is_empty()),
+            "model.revision must be non-empty when provided"
         );
         self.driver.validate()?;
         self.scheduler.validate()?;
@@ -917,6 +925,28 @@ device = ["cpu"]
         );
         assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 1_000);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    #[test]
+    fn parses_immutable_model_revision() {
+        let text = MINIMAL_PORTABLE.replace(
+            "hf_repo = \"Qwen/Qwen3-0.6B\"",
+            "hf_repo = \"Qwen/Qwen3-0.6B\"\nrevision = \"0123456789abcdef\"",
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.models[0].revision.as_deref(), Some("0123456789abcdef"));
+    }
+
+    #[test]
+    fn rejects_blank_model_revision() {
+        let text = MINIMAL_PORTABLE.replace(
+            "hf_repo = \"Qwen/Qwen3-0.6B\"",
+            "hf_repo = \"Qwen/Qwen3-0.6B\"\nrevision = \"  \"",
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("model.revision"), "got: {err}");
     }
 
     #[test]

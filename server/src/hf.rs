@@ -50,9 +50,12 @@ pub fn runtime_snapshot_allow_patterns() -> Vec<String> {
 /// HF repo ID and downloaded via the HF Hub.
 ///
 /// Network access is required only on cache miss for repo IDs.
-pub async fn resolve_or_download(repo_id_or_path: &str) -> Result<PathBuf> {
+pub async fn resolve_or_download(repo_id_or_path: &str, revision: Option<&str>) -> Result<PathBuf> {
     let p = Path::new(repo_id_or_path);
     if p.is_dir() {
+        if revision.is_some() {
+            bail!("hf_repo revision cannot be combined with a local snapshot directory");
+        }
         return Ok(p.to_path_buf());
     }
     // Single .gguf file is also a valid resolved target: the portable
@@ -61,6 +64,9 @@ pub async fn resolve_or_download(repo_id_or_path: &str) -> Result<PathBuf> {
     // path as pre-resolved so quantized weights can be wired through
     // `hf_repo` without a multi-file snapshot directory.
     if p.is_file() && p.extension().is_some_and(|e| e == "gguf") {
+        if revision.is_some() {
+            bail!("hf_repo revision cannot be combined with a local GGUF file");
+        }
         return Ok(p.to_path_buf());
     }
 
@@ -81,7 +87,7 @@ pub async fn resolve_or_download(repo_id_or_path: &str) -> Result<PathBuf> {
     }
 
     let (owner, name) = parse_repo_id(repo_id_or_path)?;
-    download_snapshot(&owner, &name).await
+    download_snapshot(&owner, &name, revision).await
 }
 
 /// Parse `owner/name` into its two components. Rejects nested paths
@@ -100,7 +106,7 @@ fn parse_repo_id(s: &str) -> Result<(String, String)> {
     Ok((owner.to_string(), name.to_string()))
 }
 
-async fn download_snapshot(owner: &str, name: &str) -> Result<PathBuf> {
+async fn download_snapshot(owner: &str, name: &str, revision: Option<&str>) -> Result<PathBuf> {
     let client = hf_hub::HFClient::new().map_err(|e| anyhow!("init HF client: {e}"))?;
     let repo = client.model(owner.to_string(), name.to_string());
     let allow_patterns = runtime_snapshot_allow_patterns();
@@ -110,6 +116,7 @@ async fn download_snapshot(owner: &str, name: &str) -> Result<PathBuf> {
     // returns the snapshot dir on cache hit and an error on miss.
     let cache_hit = repo
         .snapshot_download()
+        .maybe_revision(revision.map(str::to_string))
         .allow_patterns(allow_patterns.clone())
         .local_files_only(true)
         .send()
@@ -123,6 +130,7 @@ async fn download_snapshot(owner: &str, name: &str) -> Result<PathBuf> {
     }
 
     repo.snapshot_download()
+        .maybe_revision(revision.map(str::to_string))
         .allow_patterns(allow_patterns)
         .send()
         .await
@@ -174,10 +182,20 @@ mod tests {
     #[tokio::test]
     async fn local_directory_short_circuits() {
         let tmp = tempfile::tempdir().unwrap();
-        let resolved = resolve_or_download(tmp.path().to_str().unwrap())
+        let resolved = resolve_or_download(tmp.path().to_str().unwrap(), None)
             .await
             .unwrap();
         assert_eq!(resolved, tmp.path());
+    }
+
+    #[tokio::test]
+    async fn local_directory_rejects_hub_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = resolve_or_download(tmp.path().to_str().unwrap(), Some("deadbeef"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("revision"), "got: {err}");
     }
 
     #[tokio::test]
@@ -185,13 +203,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let gguf = tmp.path().join("model.gguf");
         std::fs::write(&gguf, b"dummy").unwrap();
-        let resolved = resolve_or_download(gguf.to_str().unwrap()).await.unwrap();
+        let resolved = resolve_or_download(gguf.to_str().unwrap(), None)
+            .await
+            .unwrap();
         assert_eq!(resolved, gguf);
     }
 
     #[tokio::test]
     async fn rejects_typo_path_clearly() {
-        let err = resolve_or_download("/nonexistent/path/that/should/not/exist")
+        let err = resolve_or_download("/nonexistent/path/that/should/not/exist", None)
             .await
             .unwrap_err()
             .to_string();

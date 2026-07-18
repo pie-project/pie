@@ -742,6 +742,7 @@ mod unix_impl {
             let model = ModelConfig {
                 name: "default".to_string(),
                 hf_repo: "Qwen/Qwen3-0.6B-Base".to_string(),
+                revision: None,
                 driver: DriverConfig {
                     kind: DriverKind::Vllm,
                     device: vec!["cuda:0".to_string(), "cuda:1".to_string()],
@@ -809,6 +810,7 @@ mod unix_impl {
             let model = ModelConfig {
                 name: "default".to_string(),
                 hf_repo: "Qwen/Qwen3-0.6B-Base".to_string(),
+                revision: None,
                 driver: DriverConfig {
                     kind: DriverKind::Vllm,
                     device: vec!["cuda:0".to_string()],
