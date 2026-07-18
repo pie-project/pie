@@ -169,7 +169,9 @@ impl pie::core::context::HostContext for InstanceState {
         // (chain gone → output silently discarded).
         crate::inference::invalidate_speculation_for_ctx(model_id, context_id);
         let _ = context::destroy(model_id, context_id).await;
-        self.ctx().table.delete(this)?;
+        // This is a borrowed resource method. Keep the WIT table entry alive
+        // until the guest-owned handle is dropped; deleting it here makes the
+        // later resource drop trap on an invalid handle.
         Ok(())
     }
 
