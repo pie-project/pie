@@ -12,6 +12,7 @@ use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
 use pie::process;
 use pie::program::ProgramName;
+use tokio::sync::oneshot;
 
 /// Timeout for a single process to complete.
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -105,6 +106,63 @@ fn context_inferlet_exercises_host_apis() {
         spawn_and_wait(s, "context", "{}".into()),
         "context inferlet should complete (exercises model, tokenizer, context host APIs)"
     );
+}
+
+#[test]
+fn explicit_destroy_releases_concurrent_forks_on_success_and_error() {
+    let s = state();
+    s.rt.block_on(async {
+        inferlets::add_and_install("context-lifecycle").await;
+
+        for input in ["success", "error"] {
+            let (result_tx, result_rx) = oneshot::channel();
+            let pid = process::spawn(
+                "context-lifecycle-user".into(),
+                program_name("context-lifecycle"),
+                input.into(),
+                None,
+                true,
+                Some(result_tx),
+                None,
+                None,
+            )
+            .expect("spawn context lifecycle inferlet");
+
+            let ready = tokio::time::timeout(
+                PROCESS_TIMEOUT,
+                pie::messaging::pull("context-lifecycle-user:lifecycle-ready".into()),
+            )
+            .await
+            .expect("context lifecycle ready signal timed out")
+            .expect("context lifecycle ready signal failed");
+            assert_eq!(ready, input);
+            assert!(
+                process::list().contains(&pid),
+                "process exited before its live context ownership was inspected"
+            );
+            assert_eq!(
+                pie::context::debug_process_context_count(0, pid).await,
+                0,
+                "explicit destroy retained contexts while the process was alive"
+            );
+
+            pie::messaging::push(
+                "context-lifecycle-user:lifecycle-release".into(),
+                input.into(),
+            )
+            .expect("release context lifecycle inferlet");
+
+            let result = tokio::time::timeout(PROCESS_TIMEOUT, result_rx)
+                .await
+                .expect("context lifecycle inferlet timed out")
+                .expect("context lifecycle result sender dropped");
+            match input {
+                "success" => assert_eq!(result, Ok("contexts released".into())),
+                "error" => assert_eq!(result, Err("injected context lifecycle error".into())),
+                _ => unreachable!(),
+            }
+        }
+    });
 }
 
 // The generate test inferlet currently hangs at `step.execute().await`
