@@ -536,6 +536,16 @@ pub async fn get_stats(model_idx: usize) -> Vec<(usize, usize)> {
     rx.await.unwrap_or_default()
 }
 
+#[doc(hidden)]
+pub async fn debug_process_context_count(model_idx: usize, pid: ProcessId) -> usize {
+    let (tx, rx) = oneshot::channel();
+    let _ = SERVICES.send(
+        model_idx,
+        Message::DebugProcessContextCount { pid, response: tx },
+    );
+    rx.await.unwrap_or_default()
+}
+
 pub async fn debug_context_state(model_idx: usize, id: ContextId) -> String {
     let (tx, rx) = oneshot::channel();
     let _ = SERVICES.send(model_idx, Message::DebugState { id, response: tx });
@@ -2382,6 +2392,10 @@ pub(crate) enum Message {
     GetStats {
         response: oneshot::Sender<Vec<(usize, usize)>>,
     },
+    DebugProcessContextCount {
+        pid: ProcessId,
+        response: oneshot::Sender<usize>,
+    },
 
     // Actor-routed write APIs
     TruncateWorkingPageTokens {
@@ -2590,6 +2604,13 @@ impl ServiceHandler for ContextManager {
             }
             Message::GetStats { response } => {
                 let _ = response.send(self.stats());
+            }
+            Message::DebugProcessContextCount { pid, response } => {
+                let count = self
+                    .processes
+                    .get(&pid)
+                    .map_or(0, |process| process.context_ids.len());
+                let _ = response.send(count);
             }
             Message::TruncateWorkingPageTokens {
                 id,

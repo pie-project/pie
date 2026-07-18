@@ -169,7 +169,11 @@ impl pie::core::context::HostContext for InstanceState {
         // (chain gone → output silently discarded).
         crate::inference::invalidate_speculation_for_ctx(model_id, context_id);
         let _ = context::destroy(model_id, context_id).await;
-        self.ctx().table.delete(this)?;
+        // `destroy` is a borrowed WIT resource method. Deleting `this` here
+        // attempts to remove a resource-table entry while the component call
+        // still holds its borrow, which traps at the component boundary. The
+        // guest method consumes its SDK wrapper, so its ordinary resource drop
+        // follows immediately and owns deletion of the table handle.
         Ok(())
     }
 

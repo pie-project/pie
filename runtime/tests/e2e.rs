@@ -12,6 +12,7 @@ use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
 use pie::process;
 use pie::program::ProgramName;
+use tokio::sync::oneshot;
 
 /// Timeout for a single process to complete.
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -105,6 +106,50 @@ fn context_inferlet_exercises_host_apis() {
         spawn_and_wait(s, "context", "{}".into()),
         "context inferlet should complete (exercises model, tokenizer, context host APIs)"
     );
+}
+
+#[test]
+fn explicit_destroy_releases_concurrent_forks_on_success_and_error() {
+    let s = state();
+    s.rt.block_on(async {
+        inferlets::add_and_install("context-lifecycle").await;
+
+        for (input, expect_error) in [("success", false), ("error", true)] {
+            let (result_tx, result_rx) = oneshot::channel();
+            let pid = process::spawn(
+                "context-lifecycle-user".into(),
+                program_name("context-lifecycle"),
+                input.into(),
+                None,
+                true,
+                Some(result_tx),
+                None,
+                None,
+            )
+            .expect("spawn context lifecycle inferlet");
+
+            let result = tokio::time::timeout(PROCESS_TIMEOUT, result_rx)
+                .await
+                .expect("context lifecycle inferlet timed out")
+                .expect("context lifecycle result sender dropped");
+            assert_eq!(
+                result.is_err(),
+                expect_error,
+                "unexpected result for {input}"
+            );
+
+            tokio::time::timeout(PROCESS_TIMEOUT, async {
+                loop {
+                    if pie::context::debug_process_context_count(0, pid).await == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("process teardown retained contexts");
+        }
+    });
 }
 
 // The generate test inferlet currently hangs at `step.execute().await`

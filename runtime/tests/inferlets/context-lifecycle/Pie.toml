@@ -1,0 +1,7 @@
+[package]
+name = "context-lifecycle"
+version = "0.1.0"
+description = "Exercises explicit context destruction across concurrent forks"
+
+[models]
+required = ["test-model"]
