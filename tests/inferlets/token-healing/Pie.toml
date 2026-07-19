@@ -1,0 +1,14 @@
+[package]
+name = "token-healing"
+version = "0.1.0"
+description = "Token healing — back the prompt off its trailing partial token and re-expand it under a prefix mask"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt whose final token is likely a split fragment"}
+heal = {type = "bool", optional = true, description = "Enable healing; false reproduces the unhealed baseline (default: true)"}
+backoff = {type = "int", optional = true, description = "Trailing tokens to roll back and re-expand, 1..4 (default: 1)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}

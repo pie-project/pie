@@ -1,0 +1,19 @@
+[package]
+name = "synthid-tournament-sampling"
+version = "0.1.0"
+description = "SynthID-Text tournament sampling — layered keyed g-functions reweight the distribution, mean-g detection"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+secret = {type = "int", optional = true, description = "Watermark secret; the detector needs this and nothing else"}
+context_width = {type = "int", optional = true, description = "Preceding tokens seeding each step, ngram_len-1, 1..8 (default: 4)"}
+depth = {type = "int", optional = true, description = "Tournament layers, 1..16 (default: 9)"}
+history_size = {type = "int", optional = true, description = "Ring buffer of recent context hashes, 1..1024 (default: 64)"}
+watermark = {type = "bool", optional = true, description = "False skips the tournament, producing unwatermarked text (default: true)"}
+temperature = {type = "float", optional = true, description = "Temperature applied before sampling (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for the sampler draw"}

@@ -1,0 +1,18 @@
+[package]
+name = "dry-repetition-penalty"
+version = "0.1.0"
+description = "DRY — penalize repeated sequences, not repeated tokens, with an exponential charge on repeat length"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+multiplier = {type = "float", optional = true, description = "Penalty scale; 0 disables DRY (default: 0.8)"}
+base = {type = "float", optional = true, description = "Exponential growth per token of repeat length (default: 1.75)"}
+allowed_length = {type = "int", optional = true, description = "Repeats shorter than this are free (default: 2)"}
+max_ngram = {type = "int", optional = true, description = "Longest repeat the scan can see, <=16 (default: 8)"}
+temperature = {type = "float", optional = true, description = "Temperature applied after the penalty (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}

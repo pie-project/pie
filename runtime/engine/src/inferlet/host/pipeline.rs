@@ -20,7 +20,7 @@ impl pie::inferlet::pipeline::HostPipeline for ProcessCtx {
     async fn new(&mut self) -> anyhow::Result<Resource<Pipeline>> {
         crate::inferlet::process::preemption::honor(self).await?;
         let pipeline = Pipeline::new();
-        self.register_pipeline(&pipeline.fires);
+        self.register_pipeline(&pipeline.scope, &pipeline.fires);
         Ok(self.ctx().table.push(pipeline)?)
     }
 

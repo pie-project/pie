@@ -3,7 +3,7 @@ name = "pie-tokenizer"
 version = "0.4.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "BPE tokenizer (encode/decode) for Pie, loaded from the HuggingFace tokenizer.json format. A leaf crate: no dependency on the rest of the runtime."
+description = "BPE tokenizer for Pie, loaded from Hugging Face tokenizer.json or native tiktoken rank files. A leaf crate with no runtime dependencies."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -24,5 +24,14 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 memchr = "2"
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false }
 tempfile = "3"
 tokenizers = "0.23"
+
+[[bench]]
+name = "hf_profiles"
+harness = false
+
+[[bench]]
+name = "tiktoken"
+harness = false

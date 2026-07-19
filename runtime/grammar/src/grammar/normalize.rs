@@ -25,11 +25,6 @@ pub fn normalize_grammar(grammar: &Grammar) -> Grammar {
     for (i, rule) in grammar.rules().iter().enumerate() {
         let body = normalize_expr(grammar, &mut builder, rule.body);
         builder.set_rule_body(RuleId(i as u32), body);
-
-        if let Some(ref la) = rule.lookahead {
-            let la_expr = normalize_expr(grammar, &mut builder, la.expr);
-            builder.set_rule_lookahead(RuleId(i as u32), la_expr, la.is_exact);
-        }
     }
 
     builder

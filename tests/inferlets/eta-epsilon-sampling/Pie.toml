@@ -1,0 +1,16 @@
+[package]
+name = "eta-epsilon-sampling"
+version = "0.1.0"
+description = "Epsilon and eta truncation sampling — entropy-adaptive probability floors"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+mode = {type = "string", optional = true, description = "Truncation mode: eta or epsilon (default: eta)"}
+epsilon = {type = "float", optional = true, description = "Probability floor (default: 0.0003)"}
+temperature = {type = "float", optional = true, description = "Temperature applied before truncation (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}

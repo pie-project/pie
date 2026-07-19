@@ -65,12 +65,24 @@ pub struct ProcessCtx {
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
     residency: Arc<Mutex<ProcessResidency>>,
-    /// Held while this process is in the prewarm cohort (instantiated and
-    /// binding, not yet touching pooled device resources). Dropped the
-    /// moment execution is admitted.
+    /// Held while this process is in the prewarm cohort (spawn through
+    /// instantiation and guest bring-up). Released before the process
+    /// parks on bind admission — a parked holder would clog the conveyor
+    /// — with the admit paths clearing it again as a safety net.
     prewarm_permit: Option<OwnedSemaphorePermit>,
-    /// The real concurrency permit, acquired lazily at the first pooled
-    /// resource acquisition or fire submit (strict admission).
+    /// The bind-ahead permit, acquired at the first operation that creates
+    /// per-instance driver state (channel registration / instance bind /
+    /// working-set declaration). Sized above execution admission so the
+    /// next cohort's driver bring-up overlaps the current cohort's
+    /// execution instead of the generation boundary. Transferred to
+    /// deferred teardown alongside the execution permit, bounding driver
+    /// registry overlap to the bind-ahead window.
+    bind_permit: Option<OwnedSemaphorePermit>,
+    bind_admitted: bool,
+    /// The real concurrency permit, acquired lazily at fire submit (strict
+    /// admission). Process drop transfers it to deferred teardown so the
+    /// next cohort cannot overlap stale scheduler membership or pooled
+    /// resources.
     execution_permit: Option<OwnedSemaphorePermit>,
     execution_admitted: bool,
     admission_wait_us: u64,
@@ -79,9 +91,40 @@ pub struct ProcessCtx {
 
 impl Drop for ProcessCtx {
     fn drop(&mut self) {
+        let timing = crate::scheduler::fire_timing_enabled();
+        let drop_entered_us = if timing {
+            crate::scheduler::fire_timing_now_us()
+        } else {
+            0
+        };
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
+        let scratch_removed_us = if timing {
+            crate::scheduler::fire_timing_now_us()
+        } else {
+            0
+        };
         let resources = std::mem::replace(&mut self.resource_table, ResourceTable::new());
-        super::preemption::defer_resource_teardown(self.id, resources, self.residency.clone());
+        let execution_permit = self.execution_permit.take();
+        let bind_permit = self.bind_permit.take();
+        self.execution_admitted = false;
+        self.bind_admitted = false;
+        super::preemption::defer_resource_teardown(
+            self.id,
+            resources,
+            self.residency.clone(),
+            execution_permit,
+            bind_permit,
+        );
+        if timing {
+            crate::scheduler::fire_timing_write(&serde_json::json!({
+                "schema": 1,
+                "source": "runtime",
+                "event": "process_drop",
+                "process_id": self.id,
+                "drop_entered_us": drop_entered_us,
+                "scratch_rm_us": scratch_removed_us - drop_entered_us,
+            }));
+        }
     }
 }
 
@@ -246,6 +289,8 @@ impl ProcessCtx {
             next_dynamic_rep: 1,
             residency: Arc::new(Mutex::new(ProcessResidency::default())),
             prewarm_permit: None,
+            bind_permit: None,
+            bind_admitted: false,
             execution_permit: None,
             execution_admitted: false,
             admission_wait_us: 0,
@@ -261,8 +306,28 @@ impl ProcessCtx {
         self.prewarm_permit = permit;
     }
 
+    /// Free the prewarm conveyor slot. Called before parking on bind
+    /// admission — a parked process holding its prewarm permit would clog
+    /// the conveyor and pin the next cohort's instantiation to the
+    /// generation boundary. Idempotent.
+    pub(crate) fn release_prewarm_permit(&mut self) {
+        self.prewarm_permit = None;
+    }
+
     pub(crate) fn execution_admitted(&self) -> bool {
         self.execution_admitted
+    }
+
+    pub(crate) fn bind_admitted(&self) -> bool {
+        self.bind_admitted
+    }
+
+    pub(crate) fn admit_bind(&mut self, permit: Option<OwnedSemaphorePermit>) {
+        self.bind_permit = permit;
+        self.bind_admitted = true;
+        // Safety net: normally released before the bind-admission park
+        // (`release_prewarm_permit`).
+        self.prewarm_permit = None;
     }
 
     pub(crate) fn admit_execution(&mut self, permit: Option<OwnedSemaphorePermit>, wait_us: u64) {
@@ -287,11 +352,6 @@ impl ProcessCtx {
         if enabled && crate::scheduler::ledger_timing_enabled() {
             self.ledger_fire_timing_claimed = true;
         }
-    }
-
-    pub(crate) fn release_execution_permit(&mut self) {
-        self.execution_permit = None;
-        self.execution_admitted = false;
     }
 
     pub fn get_username(&self) -> String {
@@ -363,12 +423,21 @@ impl ProcessCtx {
             .remove(&(model, driver, id));
     }
 
-    pub(crate) fn register_pipeline(&self, fires: &crate::pipeline::fire::PendingFires) {
+    pub(crate) fn register_pipeline(
+        &self,
+        scope: &crate::store::PipelineScope,
+        fires: &crate::pipeline::fire::PendingFires,
+    ) {
         let mut residency = self.residency.lock().unwrap();
         residency
             .pipelines
-            .retain(|pipeline| pipeline.strong_count() > 0);
-        residency.pipelines.push(Arc::downgrade(fires));
+            .retain(|pipeline| pipeline.fires.strong_count() > 0);
+        residency
+            .pipelines
+            .push(super::residency::ResidentPipeline {
+                scope: scope.clone(),
+                fires: Arc::downgrade(fires),
+            });
     }
 
     // ========================================================================

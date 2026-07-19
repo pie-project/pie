@@ -4,11 +4,15 @@
 //! inferlet components built from sources in `tests/inferlets/`.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
+use futures::future::join_all;
 mod common;
 use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
+use pie_engine::inferlet::process;
 use pie_engine::inferlet::program::{self, ProgramName};
+use tokio::sync::oneshot;
 
 /// Shared state: MockEnv + tokio runtime (must outlive the process).
 struct TestState {
@@ -45,7 +49,16 @@ fn test_program_name(name: &str) -> ProgramName {
 /// failed; the guard only orders access.
 fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+async fn spawn_echo(name: ProgramName, input: String) -> oneshot::Receiver<Result<String, String>> {
+    let (response, result) = oneshot::channel();
+    process::spawn("test-user".into(), name, input, None, false, Some(response))
+        .expect("spawn echo inferlet");
+    result
 }
 
 // =============================================================================
@@ -167,6 +180,73 @@ fn install_all_test_inferlets() {
             assert!(
                 program::is_installed(&program_name).await,
                 "{name} should be installed"
+            );
+        }
+    });
+}
+
+#[test]
+fn concurrent_instantiation_and_reinstall_use_current_component() {
+    let _serial = serial_guard();
+    let s = state();
+    let wasm = inferlets::read_inferlet_wasm("echo");
+    let manifest = inferlets::read_inferlet_manifest("echo");
+    let name = test_program_name("echo");
+
+    s.rt.block_on(async {
+        program::add(wasm.clone(), manifest.clone(), true)
+            .await
+            .unwrap();
+        program::install(&name).await.unwrap();
+
+        let receivers =
+            join_all((0..64).map(|index| spawn_echo(name.clone(), format!("fleet-{index}")))).await;
+        let results = tokio::time::timeout(Duration::from_secs(10), join_all(receivers))
+            .await
+            .expect("concurrent echo fleet timed out");
+        for (index, result) in results.into_iter().enumerate() {
+            assert_eq!(
+                result.expect("process result sender dropped").unwrap(),
+                format!("fleet-{index}")
+            );
+        }
+
+        program::add(wasm, manifest, true).await.unwrap();
+        program::install(&name).await.unwrap();
+        let result = spawn_echo(name.clone(), "after-reinstall".into()).await;
+        assert_eq!(
+            result
+                .await
+                .expect("reinstalled process result sender dropped")
+                .unwrap(),
+            "after-reinstall"
+        );
+    });
+}
+
+#[test]
+fn python_full_variant_instantiates_without_store_bound_modules() {
+    let _serial = serial_guard();
+    let s = state();
+    let wasm = inferlets::read_inferlet_wasm("echo");
+    let mut manifest = inferlets::read_inferlet_manifest("echo");
+    manifest.package.name = "echo-python-full".into();
+    manifest
+        .runtime
+        .insert("python-runtime".into(), "test-runtime".into());
+    let name = test_program_name("echo-python-full");
+
+    s.rt.block_on(async {
+        program::add(wasm, manifest, true).await.unwrap();
+        program::install(&name).await.unwrap();
+        for input in ["python-full-first", "python-full-second"] {
+            let result = spawn_echo(name.clone(), input.into()).await;
+            assert_eq!(
+                result
+                    .await
+                    .expect("process result sender dropped")
+                    .unwrap(),
+                input
             );
         }
     });

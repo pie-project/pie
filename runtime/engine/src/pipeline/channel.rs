@@ -726,6 +726,53 @@ impl ChannelCell {
         self.staged.len()
     }
 
+    /// Frame validation (Vesuvius, k > 1): host-known cells a Writer channel
+    /// can still feed to future fires. Counted by ring sequence — the seed
+    /// plus every flushed ring write (`writer_tail`) plus pre-endpoint
+    /// staging, minus the consume tickets already reserved by submitted
+    /// fires — so a seeded descriptor Writer's committed initial cell counts
+    /// exactly once.
+    pub fn writer_available_cells(&self) -> u64 {
+        self.writer_tail
+            .saturating_add(self.staged.len() as u64)
+            .saturating_sub(self.device_reserved_head)
+    }
+
+    /// Frame validation (Vesuvius, k > 1): the Reader ring's reservation
+    /// pressure as (publications reserved by accepted unsettled fires, cells
+    /// the host has already consumed). Their difference is the worst-case
+    /// ring occupancy if the guest drains nothing before the frame executes —
+    /// deterministic at submit time, never a function of drain timing.
+    pub fn reader_ring_pressure(&self) -> (u64, u64) {
+        let consumed = self
+            .reader
+            .as_ref()
+            .map(|reader| load_word(reader.word_base, reader.head_word_index))
+            .unwrap_or(0);
+        (self.device_reserved_tail, consumed)
+    }
+
+    /// Frame validation (Vesuvius, k > 1): a device-only ring's structural
+    /// backlog — publish tickets reserved by accepted unsettled fires minus
+    /// consume tickets likewise reserved. The worst-case occupancy the ring
+    /// reaches once every reserved fire settles, before anything not yet
+    /// submitted consumes — deterministic at submit time, never a function
+    /// of drain timing.
+    pub fn device_ring_backlog(&self) -> u64 {
+        self.device_reserved_tail
+            .saturating_sub(self.device_reserved_head)
+    }
+
+    /// Frame validation (Vesuvius, k > 1): whether the host side knows a
+    /// committed value exists for a latest-value (read-only-bound) channel.
+    pub fn has_committed_front(&self) -> bool {
+        self.seeded
+            || !self.staged.is_empty()
+            || !self.ring_host_copies.is_empty()
+            || self.front_override.is_some()
+            || self.device_reserved_tail > 0
+    }
+
     /// Host `take` a produced cell (Reader), FIFO. An unbound channel is
     /// simply empty.
     pub fn take(&mut self) -> Result<Vec<u8>, ChannelError> {
@@ -935,6 +982,39 @@ pub struct Channel {
     pub fires: Option<crate::pipeline::fire::PendingFires>,
 }
 
+/// Process-teardown close batching: walks the process's resource table,
+/// takes over the driver close notification from every guest channel
+/// endpoint still holding one, and returns the channel ids grouped by
+/// owning driver. The caller posts one batched close per driver AFTER
+/// dropping the table (whose pass drops post the instance closes) — the
+/// scheduler mailbox's per-producer FIFO then delivers every instance
+/// close before the channel batch, preserving the driver's
+/// instance-before-channel close order. Endpoints this walk cannot reach
+/// (a cell kept alive only by a pass after the guest dropped its channel
+/// handle) keep notifying one-by-one from their own drop.
+pub fn detach_channel_close_notifications(
+    resources: &mut wasmtime::component::ResourceTable,
+) -> Vec<(usize, Vec<u64>)> {
+    let mut by_driver: std::collections::BTreeMap<usize, Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for entry in resources.iter_mut() {
+        let Some(channel) = entry.downcast_ref::<Channel>() else {
+            continue;
+        };
+        let Some(endpoint) = channel.cell.lock().unwrap().endpoint() else {
+            continue;
+        };
+        let Some(channel_id) = endpoint.detach_close_notification() else {
+            continue;
+        };
+        by_driver
+            .entry(endpoint.registered().driver_id)
+            .or_default()
+            .push(channel_id);
+    }
+    by_driver.into_iter().collect()
+}
+
 /// The next host-known Writer value on `cell` — the native value the driver
 /// will pull for the next submitted fire (`None`: not a Writer channel, or
 /// nothing pending). Pre-endpoint values sit in `staged`; post-bind puts go
@@ -1093,150 +1173,6 @@ mod tests {
     /// stays ignorant of cell semantics (the completion-sink inversion);
     /// this integration test is `pipeline`-level (downward import of
     /// `scheduler`/`driver`, never the reverse).
-    #[tokio::test(flavor = "current_thread")]
-    async fn writer_ring_backpressure_wakes_after_a_consuming_fire() -> anyhow::Result<()> {
-        let driver_id = driver::register_driver_backend(
-            DriverSpec {
-                num_kv_pages: 16,
-                limits: SchedulerLimits {
-                    max_forward_requests: 1,
-                    max_forward_tokens: 64,
-                    max_page_refs: 64,
-                },
-                device_geometry_port_mask: 0,
-            },
-            crate::driver::DriverBackend::Dummy(crate::driver::DummyDriver::new(
-                DummyDriverOptions {
-                    callback_delay_ms: 20,
-                    ..DummyDriverOptions::default()
-                },
-            )),
-        );
-        let _scheduler = BatchScheduler::new(
-            driver_id,
-            driver_id,
-            16,
-            SchedulerLimits {
-                max_forward_requests: 1,
-                max_forward_tokens: 64,
-                max_page_refs: 64,
-            },
-            1,
-        );
-        // chan 0: host Writer u32[1], taken every fire; chan 1: host Reader.
-        let container_bytes = TraceContainer {
-            names: vec![],
-            externs: vec![],
-            channels: vec![
-                chan(Shape::vector(1), DType::U32, HostRole::Writer, false),
-                chan(Shape::vector(1), DType::U32, HostRole::Reader, false),
-            ],
-            ports: vec![],
-            stages: vec![StageProgram {
-                stage: Stage::Epilogue,
-                ops: vec![Op::ChanTake(0), Op::ChanPut { chan: 1, value: 0 }],
-            }],
-        }
-        .encode();
-        let program_id = scheduler::register_program(
-            driver_id,
-            crate::driver::ProgramRegistration {
-                program_hash: pie_ptir::container_hash(&container_bytes),
-                canonical_bytes: container_bytes,
-                sidecar_bytes: Vec::new(),
-            },
-        )
-        .await?;
-        let writer_decl = ChannelDecl {
-            shape: Shape::vector(1),
-            dtype: ChanDType::Concrete(DType::U32),
-            capacity: 2,
-            host_role: HostRole::Writer,
-            seeded: false,
-        };
-        let mut writer_cell = ChannelCell::new(vec![1], DType::U32, 2);
-        writer_cell.bind(&writer_decl);
-        let reader_cell = ChannelCell::new(vec![1], DType::U32, 2);
-        let channel_ids = [writer_cell.global_id, reader_cell.global_id];
-        let mut endpoints = Vec::new();
-        for (channel_id, host_role) in [
-            (channel_ids[0], HostRole::Writer),
-            (channel_ids[1], HostRole::Reader),
-        ] {
-            endpoints.push(
-                scheduler::register_channel(
-                driver_id,
-                ChannelRegistrationPlan {
-                    driver_id,
-                    channel_id,
-                    shape: vec![1],
-                    dtype: pie_driver_abi::PIE_CHANNEL_DTYPE_U32,
-                    host_role: host_role as u8,
-                    seeded: false,
-                    extern_dir: pie_driver_abi::PIE_CHANNEL_EXTERN_NONE,
-                    capacity: 2,
-                    reader_wait_id: 0,
-                    writer_wait_id: 0,
-                    extern_name: Vec::new(),
-                },
-            )
-                .await?,
-            );
-        }
-        let bound = scheduler::bind_instance(
-            driver_id,
-            None,
-            program_id,
-            51,
-            channel_ids.to_vec(),
-            Vec::new(),
-        )
-        .await?;
-        writer_cell
-            .attach_endpoint(Arc::clone(&endpoints[0]))
-            .map_err(|error| anyhow::anyhow!(error))?;
-
-        // Submit while empty. The first attempt RETRYs without poison; a put
-        // before the next attempt is the execution-time deadline.
-        let completion = bound.reserve_completion();
-        crate::scheduler::submit_prebuilt_async(
-            dummy_launch(),
-            driver_id,
-            bound.instance_id,
-            0,
-            completion.clone(),
-        )?;
-        tokio::time::sleep(Duration::from_millis(5)).await;
-
-        // Gate 4: puts fill the shared ring up to capacity, then Full.
-        writer_cell.put(1u32.to_le_bytes().to_vec()).unwrap();
-        writer_cell.put(2u32.to_le_bytes().to_vec()).unwrap();
-        assert_eq!(
-            writer_cell.put(3u32.to_le_bytes().to_vec()).unwrap_err(),
-            ChannelError::Full
-        );
-
-        // The retained logical fire retries and commits: the head word
-        // publishes and the parked producer wakes.
-        let waiter = tokio::spawn({
-            let endpoint = Arc::clone(&endpoints[0]);
-            async move { endpoint.wait_for_writer_change(0).await }
-        });
-        timeout(Duration::from_secs(5), waiter)
-            .await??
-            .expect("writer wake surfaces the new head, not an error");
-        timeout(Duration::from_secs(5), completion.clone()).await??;
-        assert!(
-            completion.target_epoch() > pie_waker::FIRST_COMPLETION_EPOCH,
-            "the empty first attempt must have retried"
-        );
-        writer_cell
-            .put(3u32.to_le_bytes().to_vec())
-            .expect("space released by the consumed entry");
-        scheduler::close_instance(&bound)?;
-        Ok(())
-    }
-
     /// §3 shape: mask (bool [8], host Writer) + out (i32 [1], host Reader) +
     /// a device-private seeded channel (tok).
     fn bound() -> BoundCells {

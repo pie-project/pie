@@ -213,9 +213,8 @@ pub struct FireStats {
 }
 
 /// Quorum-rule probe averages/counters (overview §7.2; thrust-2 §3 F1–F6).
-/// The wave counters (`wave_*`, `cold_hold_fires`, `straggler_fires`)
-/// populate in EVERY build — they are behavior counters, and a default
-/// build reporting zero while demoting would be a silently-wrong stat.
+/// The wave counters (`wave_*`, `cold_hold_fires`) populate in every build.
+/// Legacy straggler counters remain zero under strict wait-all.
 /// The latency probes (bubble/quorum-latency sums, escape/submit-ahead)
 /// still require `profile-fire`. Populated by the quorum core (thrust-2
 /// phase S5). Mirrors `crate::scheduler::probe::QuorumProbes`.
@@ -237,10 +236,9 @@ pub struct QuorumStats {
     pub cold_hold_us_sum: u64,
     /// Count of fires through the cold-hold path (F3).
     pub cold_hold_fires: u64,
-    /// Count of straggler-demotion fires (wave window expired, fired narrow).
+    /// Legacy field: strict wait-all never fires narrow.
     pub straggler_fires: u64,
-    /// Pipelines actually demoted at those fires (idle a full window since
-    /// their own last activity). Healthy workloads: ~0.
+    /// Legacy field: strict wait-all never demotes pipelines.
     pub straggler_demotions: u64,
     /// Dummy-run / readiness-miss count (M3 gate: rate < 1%).
     pub readiness_miss: u64,
@@ -248,8 +246,7 @@ pub struct QuorumStats {
     /// at each WaitAll fire. ≈ fleet width ⇒ persistent wait-set (waves should
     /// be dense); ≈1 ⇒ transient/singleton. 0 if no WaitAll fire.
     pub avg_active_pipelines_at_fire: u64,
-    /// Mean absentees per wave fire. Non-zero only through straggler
-    /// demotion (narrow fires after the wave window expires).
+    /// Mean absentees per wave fire; strict wait-all keeps this at zero.
     pub avg_missing_at_fire: u64,
     /// Cumulative numerator for `avg_active_pipelines_at_fire`.
     pub wave_active_sum: u64,

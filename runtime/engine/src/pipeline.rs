@@ -59,6 +59,9 @@ pub struct Pipeline {
     pub fires: PendingFires,
     pub(crate) failure: PipelineFailure,
     pub(crate) scope: crate::store::PipelineScope,
+    /// Per-lane frame sequence for Vesuvius frame submission (k > 1): each
+    /// `forward.submit` frame on this pipeline takes the next number.
+    pub(crate) frame_seq: std::sync::atomic::AtomicU64,
 }
 
 impl Pipeline {
@@ -74,7 +77,14 @@ impl Pipeline {
                     .upgrade()
                     .is_none_or(|fires| fires.lock().unwrap().is_empty())
             }),
+            frame_seq: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The next frame sequence number for this lane (frame mode).
+    pub(crate) fn next_frame_seq(&self) -> u64 {
+        self.frame_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 

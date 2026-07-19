@@ -228,17 +228,10 @@ Results:
 
 All candidate runs completed 256/256 with zero demotions.
 
-The final FlashInfer 0.6.15 + planner-boundary + E5 source measured
-47,117.60 tok/s median (47,117.60 / 46,772.25 / 47,197.19), with 133 batches,
-256/256 completions, and zero demotions in all three runs. Peak physical KV
-demand was 2,816 of 12,634 independently derived logical pages. Its serial
-oracle matched the pre-E5 ABI-v12 control 256/256 hashes.
-
-Serial oracle:
-
-- 256/256 requests completed
-- 256/256 output token hashes matched control
-- The run crossed repeated 10-second trim intervals
+The former FlashInfer 0.6.15 + planner-boundary + E5 headline of 47,117.60
+tok/s is invalid. Its 256/256 serial oracle compared two Pie builds that shared
+the same decode-channel corruption and therefore did not establish model
+accuracy. The corrected result and root cause are recorded in section 4.1.
 
 ### 3.4 CUDA footprint lifecycle
 
@@ -300,15 +293,228 @@ flat single-lane `Pages`. CUDA now verifies those channel shapes and preserves
 device-side decode composition for both all-decode and mixed host/envelope
 waves instead of attempting premature host descriptor readback.
 
-Post-merge gates on the migrated c0/256 guest:
+The original post-merge performance gates compared two equally corrupted
+decode paths and are not accuracy evidence. Long-output cross-validation found
+that every generation matched vLLM only through `<think>\n`, then became
+prompt-independent gibberish.
 
-- Exact current-source interleaved n=3: legacy committed-mapping path
-  47,022.36 tok/s, ABI v12 admission 47,096.72 tok/s, **+0.16%**.
-- Every headline arm completed 256/256, with 133 batches and zero failures.
-- Same-binary ABI v12 vs legacy-launch serial oracle: 256/256 token hashes
-  matched.
-- ABI, engine, dummy-driver, SDK, CUDA rollback, decode-envelope contract,
-  parity, canary, and entry-validation suites passed.
+The corruption was in grouped asynchronous channel initialization:
+
+- `seed_cell_async` copied a seed into device cell 0 and published host tail 1,
+  but unlike `seed_cell` it did not advance `pulled_tail` for a host-writer
+  channel.
+- The first fixed-decode `pull_writer_inputs` therefore treated sequence 0 as a
+  new host input and copied the zero-filled host mirror over the committed
+  seed.
+- For `Pages`, the verified bind-time value `[0,1,...]` became `[0,0,...]`.
+  Translation then mapped every logical page to one physical page. Prefill K/V
+  remained correct, but the first decode collapsed the page table and every
+  later token was wrong.
+
+The fix makes asynchronous writer seeding establish the same pulled-tail
+baseline as synchronous seeding. A CUDA regression now seeds a writer
+asynchronously, performs the first ring pull, and asserts that no copy occurs
+and the committed canary remains unchanged.
+
+Corrected gates:
+
+- The known Raft prompt matches vLLM exactly for the first 64/64 greedy tokens.
+- Four independent 1,024-token prompts (fiction, Raft, Python, incident report)
+  retain their requested entities and facts and produce coherent,
+  prompt-specific text. Pie/vLLM common prefixes are 38--67 tokens; forced
+  long-form continuation diverges numerically after that point.
+- Concurrent four-prompt outputs complete 1,024/1,024 each and match their
+  corresponding serial Pie token sequences exactly.
+- Correct c0/256 n=3 is 34,256.63 tok/s median
+  (34,256.63 / 34,489.34 / 34,184.02), 132 batches and 256/256 completions.
+  The former 47,117.60 tok/s was a 27.3% false uplift from repeatedly reading
+  one aliased physical KV page, not usable model throughput.
+- CUDA CTest passes 45/45, including the new seed-pull regression; engine unit
+  tests pass 359/359.
+
+#### Contention and shape cross-validation
+
+A follow-up Pie/vLLM sweep used 256 semantic prompts spanning 54--586 prompt
+tokens, request widths 1/2/3/7/15/16/17/31/32/33/63/64/65/127/128/129/256,
+contention caps 1/2/3/7/16/31/32, output boundaries
+1/2/15/16/17/31/32/33/63/64/65/127/128/129, a mixed 16/129-token workload,
+and four simultaneous long-form clients.
+
+- The final matched sweep covers 40 runs and 1,390 requests with zero failures.
+- A fixed-shape serial corpus matches vLLM for 196/256 complete 32-token
+  sequences; the median common prefix is all 32 tokens and the minimum is 4.
+  vLLM itself has the same minimum prefix of 4 when its active batch shape
+  changes, so cross-shape token-exactness is not a stable correctness oracle.
+- Every output-boundary case matches the pre-change Pie serial oracle:
+  112/112 sequences exact.
+- The four true-serial long outputs match the corrected pre-change build
+  4/4 x 1,024 tokens exactly. Four-way concurrent long output completes all
+  requests with coherent prompt-specific text; batch-shape numerical
+  divergence begins after 38--135 tokens.
+
+The performance sweep found that direct PTIR prefill still materialized
+`[N, vocab]` logits and gathered sampled rows only afterward. Reconnecting
+`sample_idx` to the models' existing compact-logit path makes non-graph
+prefill/mixed launches gather hidden rows before `lm_head`; the epilogue now
+addresses the compact `[0,S)` rows. Pure-decode graphs and MTP draft layouts
+remain unchanged, and TP followers receive the same compact row count.
+
+On the 64-request, 304-token-prefix cell, compact logits reduce measured CUDA
+kernel time from 206.6 ms to 163.8 ms. Pairing them with the measured
+Qwen3-0.6B Ada TP1 `N=8192, R=512` lattice reduces it to 152.75 ms, versus
+153.2 ms for vLLM. The wider lattice increases persistent input allocation
+from 73 MiB to 289 MiB; the planner rule is restricted to this small Qwen3
+shape on large Ada devices.
+
+| Requests | Pie tok/s | vLLM tok/s | Pie delta |
+|---:|---:|---:|---:|
+| 1 | 516.43 | 486.39 | +6.2% |
+| 8 | 3,630.62 | 3,267.81 | +11.1% |
+| 32 | 12,121.51 | 11,311.01 | +7.2% |
+| 128 | 28,124.16 | 27,381.72 | +2.7% |
+| 256 | 33,115.95 | 33,315.26 | -0.6% |
+| mixed 64 | 8,648.48 | 8,330.56 | +3.8% |
+| queued 31/32 | 5,136.80 | 5,131.90 | +0.1% |
+
+The long-prefix client headline remains about 3--4% below vLLM's offline API
+because Pie includes WebSocket process launch/bind while the vLLM measurement
+starts after prompt rendering and request construction. CUDA measured wall is
+185 ms for Pie and 183 ms for vLLM; no forward-kernel deficit remains.
+
+The accumulated shape sweep also reached the fused program cache's former
+128-entry limit. Program entries contain only a hash and shared references to
+the separately bounded 128-entry stage/module cache, so the lightweight
+program map now retains 4,096 variants. The stage and negative-cache limits
+remain 128. A regression stores 129 additional program variants without
+creating additional CUDA stage modules, and the repeated 1,518-request
+persistent-server sweep completes with zero failures.
+
+#### Extreme contention and length stress
+
+The stress matrix then raised total logical requests to 2,048 and 4,096. vLLM
+cannot boot with `max_num_seqs=2048` on the 24 GiB Ada device: sampler warmup
+OOMs after graph capture. Its 2,048-request comparisons therefore submit all
+requests while limiting active sequences to 512. Pie uses the same active cap
+for short workloads and a page-safe cap of 256 for the mixed 8/32/128/512-token
+workload.
+
+| Shape | Pie tok/s | vLLM tok/s | Result |
+|---|---:|---:|---:|
+| 2,048 x 32, active 512 | 19,077.69 | 30,813.23 | Pie -38.1% |
+| mixed 2,048, active 256 | 15,077.02 | 17,492.19 | Pie -13.8% |
+| 512 x 512, active 256 | 18,513.56 | 18,309.29 | Pie +1.1% |
+| 64 x 1,536 | 7,337.31 | 7,166.80 | Pie +2.4% |
+| 16 x 1,900 | 3,721.13 | 3,566.08 | Pie +4.3% |
+
+Pie also completes 4,096 x 8 with zero failures at 4,516.92 tok/s, and eight
+independent clients concurrently complete 256 x 32 each (2,048 total) with
+zero failures. The 2,048 x 32 accuracy comparison is 2,039/2,048 complete
+sequences exact against vLLM, with a full 32-token median common prefix.
+
+The first mixed-length runs exposed a real cohort-transition deadlock:
+
+- `pipeline.close()` enqueued scheduler leave without waiting for wait-set
+  removal, then process admission released the next cohort.
+- Error/trap teardown could drop a pipeline without an explicit close, and a
+  late bind/fire could recreate a terminated process's bind placeholder.
+- Bind controls queued behind held launches could not complete the very
+  placeholders that wait-all was awaiting.
+
+Capped execution now acknowledges pipeline/process leave before returning its
+permit, tracks and closes orphan scopes during deferred teardown, rejects late
+work from terminated processes, and inserts bind controls into the leading
+lifecycle-control FIFO ahead of held launches. The same mixed 2,048 workload
+then completes twice consecutively in 23.11/23.09 seconds with zero failures
+instead of stalling indefinitely.
+
+Mixed-length residency still needs an operator cap: active 512 eventually
+accumulates enough 512-token requests to demand more physical pages than the
+10,723-page driver ceiling, while cap 300 can still stall on allocator
+high-water; cap 256 is the measured safe point. Implementing automatic
+KV-weighted execution admission or request pooling would add material policy
+and state. The simpler current contract keeps this cap explicit.
+
+The remaining short-request deficit is likewise not a CUDA forward deficit:
+one Pie request owns one WASM instance and channel graph, while a vLLM request
+is lightweight engine metadata. Worker threads 16 -> 64 -> 128 improve the
+2,048 x 32 rate substantially, with 128 and 256 threads reaching the same
+plateau. The existing grouped-inferlet path is slower, so closing the remaining
+gap requires a new multiplexed/poolable inferlet lifecycle rather than another
+kernel or scheduler knob. Normal c0/256 remains unchanged at 34,273.04 tok/s
+median. CUDA CTest passes 45/45 and engine tests pass 360/360.
+
+An nsys + fire-timing capture of 2,048 x 32 closes the attribution:
+
+| Measured item | Pie | vLLM |
+|---|---:|---:|
+| Profiled wall | 3.523 s | 2.169 s |
+| GPU kernel sum | 0.741 s | 0.863 s |
+| GPU kernel span | 3.517 s | 1.917 s |
+| Idle inside kernel span | 2.775 s | 1.054 s |
+| GPU kernel instances | 28,475 | 6,053 |
+| `cudaMalloc` calls | 41,126 | 1 |
+| `cudaHostAlloc` calls | 32,175 | 12 |
+| `cudaMemcpyAsync` calls | 75,490 | 604 |
+| `cudaFree` calls | 26,523 | 0 |
+| `cudaLaunchKernel` calls | 27,657 | 3,318 |
+
+Pie therefore performs 14% less GPU kernel work than vLLM but takes 62% more
+wall time. Only 21% of its GPU activity span contains kernels, versus about 45%
+for vLLM. The direct cause is cold per-inferlet channel allocation and
+publication, not model compute.
+
+The scheduler capture records 184 waves versus roughly 134 from the workload
+geometry, and 76,308 processed fire rows versus 65,536 useful prefill/decode
+rows (+16.4%). Average active width is 454 with 29 missing pipelines. A
+prefill-only trace shows all 2,048 client launches in 88 ms, but WASM
+instantiate/admit spans 770 ms and driver bind completion spans 849 ms;
+register+bind control occupancy alone sums to 426 ms. The four 512-process
+cohorts leave 69/101/81 ms GPU gaps at handoff.
+
+The highest-value follow-up is a size-classed channel arena that pools both
+device cells and pinned host mirrors/words, or a reusable/multiplexed inferlet
+instance that avoids creating those objects per request. Either adds allocator
+and lifetime state. The next independent line is readiness-aware successor
+deferral: current fixed-decode retries inflate useful waves by about 37%.
+Repeated cold fleets also expose a third-run high-water stall, so reuse must
+include explicit page/channel retirement rather than hiding allocation behind
+an unbounded cache.
+
+The deeper allocation trace shows why the API count matters:
+
+- One prefill-only request registers exactly 10 channels but carries only
+  1,247 bytes of device-cell payload and 1,247 bytes of host-mirror payload.
+- The first 512-request cohort performs exactly 16 `cudaMalloc` and about 21
+  `cudaHostAlloc` calls per request. Ten device allocations are channel cells;
+  ten pinned allocations are mirrors and ten are 32-byte host-word blocks.
+  The remaining device allocations are the per-instance commit/static-stage
+  lists.
+- Across the 2,048-request run, only 1.36 MiB each of new device-cell and
+  pinned-mirror payload is requested. It is fragmented into 8,316 cell growths,
+  8,316 mirror growths, and 5,790 separate host-word allocations. There are
+  only 12 allocation size classes, from 8 to 296 bytes.
+
+CPU work overlaps but still determines cohort readiness: aggregate WASM
+instantiate work is 7.30 CPU-seconds and link work is 7.79 CPU-seconds. With
+128 workers, process instantiate/admit spans 770 ms and bind completion spans
+849 ms. Bind RPC latency is p50 70.9 ms / p95 104.7 ms because the single
+scheduler control lane serializes 2,048 register+bind controls; actual control
+occupancy sums to 426 ms.
+
+The measured 174-wave run spends 571 ms in CUDA submit host work. The largest
+sub-lines are settlement enqueue (321 ms), epilogue assembly/execution
+(164 ms), settle preparation (156 ms), H2D preparation (81 ms), and dispatch
+begin/ticket handling (64 ms). Pie emits 19 prefill waves and 165 decode graph
+waves; vLLM emits about 12 and 121 respectively.
+
+Forcing scheduler depth 1 confirms the readiness contribution: waves fall
+174 -> 136, average missing pipelines 88.5 -> 0, every wave is at least 128
+requests, and throughput rises 17.83k -> 18.83k (+5.6%). This is useful but
+does not address the dominant lifecycle cost. The target design is therefore
+one contiguous PTIR-instance device slab plus one pinned host slab (or
+fleet-level size-class equivalents), shared compiled stage metadata, and
+readiness-aware successor deferral. Pooling only model workspaces would miss
+the measured payer.
 
 This claim does **not** extend to Remote or CUDA TP. Remote post-scheduler
 coalescing would invalidate a worker-side lease, and TP needs all-rank atomic

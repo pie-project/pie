@@ -1,3 +1,4 @@
+#include <pie_native/step_launch.hpp>
 #include "batch/compose.hpp"
 
 #include <algorithm>
@@ -16,7 +17,7 @@ std::vector<T> copy_slice(const T* ptr, std::size_t len) {
 
 }  // namespace
 
-pie_native::LaunchView build_launch_view(const PieLaunchDesc& launch) {
+pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
     pie_native::LaunchView view{};
     view.token_ids =
         pie_native::slice_from_u32(launch.token_ids.ptr, launch.token_ids.len);
@@ -79,7 +80,7 @@ pie_native::LaunchView build_launch_view(const PieLaunchDesc& launch) {
     return view;
 }
 
-OwnedLaunchView OwnedLaunchView::capture(const PieLaunchDesc& launch) {
+OwnedLaunchView OwnedLaunchView::capture(const pie_native::StepLaunch& launch) {
     OwnedLaunchView owned;
     owned.token_ids = copy_slice(launch.token_ids.ptr, launch.token_ids.len);
     owned.position_ids = copy_slice(launch.position_ids.ptr, launch.position_ids.len);

@@ -437,6 +437,11 @@ CudaMemoryPlan plan_cuda_memory(
         prop.major >= 8 && prop.major < 12 &&
         prop.multiProcessorCount >= 100 &&
         hf.model_type == "qwen3" && hf.hidden_size == 4096;
+    const bool prefer_qwen3_small_ada_prefill_shape =
+        auto_profile && forced_prefill == 0 && tp_size == 1 &&
+        prop.major == 8 && prop.minor == 9 &&
+        prop.multiProcessorCount >= 100 &&
+        hf.model_type == "qwen3" && hf.hidden_size == 1024;
     // The same dense Qwen3-8B shape has a different TP2 knee on Ada/L40:
     // smaller page-16 KV and a ~5.5k token workspace reduce graph/arena
     // pressure enough to beat vLLM, while the generic 8k/6k candidates are
@@ -617,7 +622,8 @@ CudaMemoryPlan plan_cuda_memory(
             }
 #endif
             const std::size_t attn_float_bytes =
-                pie_cuda_driver::attention_float_workspace_bytes(hf, cfg, prop, R0);
+                pie_cuda_driver::attention_float_workspace_bytes(
+                    hf, cfg, prop);
             arena += attn_float_bytes;     // AttentionWorkspace float section
             arena += 8ull * 1024 * 1024;  // AttentionWorkspace int section
             const std::size_t persistent_bytes =
@@ -933,10 +939,15 @@ CudaMemoryPlan plan_cuda_memory(
         }
     }
     if (best_it == candidates.end()) {
-        if (prefer_qwen3_8b_prefill_shape) {
+        if (prefer_qwen3_8b_prefill_shape ||
+            prefer_qwen3_small_ada_prefill_shape) {
+            const int preferred_tokens =
+                prefer_qwen3_small_ada_prefill_shape
+                    ? 8192
+                    : prefill_cap;
             auto preferred_it = candidates.end();
             for (auto it = candidates.begin(); it != candidates.end(); ++it) {
-                if (it->plan.max_workspace_tokens != prefill_cap ||
+                if (it->plan.max_workspace_tokens != preferred_tokens ||
                     it->plan.max_requests < auto_decode_target ||
                     it->plan.kv_page_size != 16) {
                     continue;

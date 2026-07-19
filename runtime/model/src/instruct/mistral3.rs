@@ -13,8 +13,7 @@ use crate::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder};
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
-use pie_grammar::grammar::Grammar;
-use pie_tokenizer::Tokenizer;
+use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
 static TEMPLATE: &str = r#"
@@ -240,7 +239,7 @@ impl Instruct for MistralInstruct {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(MistralToolDecoder {
-            tokenizer: self.tokenizer.clone(),
+            decoder: self.tokenizer.decoder(false),
             accumulated: String::new(),
             state: ToolState::Outside,
             stop_ids: self.stop_ids.clone(),
@@ -286,11 +285,7 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
 "#,
             name_alt = name_alt
         );
-        let parsed = Grammar::from_ebnf(&grammar, "root").ok()?;
-        Some(ToolGrammar {
-            source: grammar,
-            grammar: Arc::new(parsed),
-        })
+        Some(ToolGrammar { source: grammar })
     }
 }
 
@@ -306,7 +301,7 @@ enum ToolState {
 }
 
 struct MistralToolDecoder {
-    tokenizer: Arc<Tokenizer>,
+    decoder: TokenizerDecoder,
     accumulated: String,
     state: ToolState,
     stop_ids: Vec<u32>,
@@ -315,7 +310,7 @@ struct MistralToolDecoder {
 
 impl ToolDecoder for MistralToolDecoder {
     fn feed(&mut self, tokens: &[u32]) -> ToolEvent {
-        let text = self.tokenizer.decode(tokens, false);
+        let text = self.decoder.feed(tokens);
         self.accumulated.push_str(&text);
 
         loop {
@@ -370,6 +365,7 @@ impl ToolDecoder for MistralToolDecoder {
     }
 
     fn reset(&mut self) {
+        self.decoder.reset();
         self.accumulated.clear();
         self.state = ToolState::Outside;
         self.current_name = None;

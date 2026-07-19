@@ -1,9 +1,29 @@
 //! Batch assembly: capacity accounting + the dense-batch accumulator.
 
+use std::collections::HashMap;
+
+use pie_driver_abi::PieTerminalCell;
+
 use super::stats::SchedulerStats;
 use super::wire;
 use super::worker::PendingRequest;
-use crate::driver::{LaunchSubmission, SchedulerLimits};
+use crate::driver::{FrameSubmission, LaunchPlan, SchedulerLimits, StepSubmission};
+
+/// One step's assembled wire request: the per-batch merge of its member
+/// fires, before roster resolution. Field names mirror the old per-wave
+/// submission so the merge logic and its tests carry over unchanged.
+pub(crate) struct StepBuild {
+    pub(crate) plan: LaunchPlan,
+    pub(crate) instance_ids: Vec<u64>,
+    pub(crate) terminal_cells: Vec<*mut PieTerminalCell>,
+    pub(crate) kv_translation: Vec<u32>,
+    pub(crate) kv_translation_indptr: Vec<u32>,
+    pub(crate) program_row_indptr: Vec<u32>,
+    pub(crate) logical_fire_ids: Vec<u64>,
+    pub(crate) channel_expected_head: Vec<u64>,
+    pub(crate) channel_expected_tail: Vec<u64>,
+    pub(crate) channel_ticket_indptr: Vec<u32>,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RequestCapacityUsage {
@@ -29,23 +49,16 @@ pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> Re
     }
 }
 
-pub(crate) struct BatchAccumulator {
-    requests: Vec<PendingRequest>,
+/// Admission-time shape gate: rejects a single fire whose resolved shape
+/// exceeds the driver's launch limits before it can enter the queue.
+pub(crate) struct AdmissionLimits {
     page_size: u32,
     limits: SchedulerLimits,
 }
 
-impl BatchAccumulator {
+impl AdmissionLimits {
     pub(crate) fn new(limits: SchedulerLimits, page_size: u32) -> Self {
-        Self {
-            requests: Vec::new(),
-            page_size,
-            limits,
-        }
-    }
-
-    pub(crate) fn push(&mut self, req: PendingRequest) {
-        self.requests.push(req);
+        Self { page_size, limits }
     }
 
     pub(crate) fn single_request_limit_error(&self, req: &PendingRequest) -> Option<String> {
@@ -90,16 +103,13 @@ impl BatchAccumulator {
         None
     }
 
-    pub(crate) fn take(&mut self) -> Vec<PendingRequest> {
-        std::mem::take(&mut self.requests)
-    }
 }
 
 pub(crate) fn build_batch_request(
     requests: &[PendingRequest],
     page_size: u32,
     stats: &SchedulerStats,
-) -> LaunchSubmission {
+) -> StepBuild {
     if requests.len() == 1 && (requests[0].prebuilt || requests[0].preserves_inner_rows()) {
         // Keep the logical-fire payload intact across attempts. RETRY builds a
         // fresh native launch from this same immutable request. Ordinary
@@ -120,7 +130,7 @@ pub(crate) fn build_batch_request(
         let channel_expected_tail = plan.channel_expected_tail.clone();
         let channel_ticket_len = channel_expected_head.len() as u32;
         let rows = plan.qo_indptr.len().saturating_sub(1) as u32;
-        return LaunchSubmission {
+        return StepBuild {
             kv_translation_indptr: vec![0, kv_translation.len() as u32],
             kv_translation,
             program_row_indptr: vec![0, rows],
@@ -193,7 +203,7 @@ pub(crate) fn build_batch_request(
                     + req.wire_row_count().max(1) as u32,
             );
         }
-        LaunchSubmission {
+        StepBuild {
             plan: batch_req,
             instance_ids,
             terminal_cells,
@@ -206,6 +216,160 @@ pub(crate) fn build_batch_request(
             channel_ticket_indptr,
         }
     })
+}
+
+/// Assemble one sealed frame's submission (ABI v14) from its waves' picked
+/// requests, in slot order. Returns the submission plus the flattened
+/// requests in POST order (step order, member order within a step) — the
+/// retirement set.
+///
+/// Step formation preserves the old per-wave batch semantics exactly: within
+/// a wave, requests group under [`LaunchGrouping`]'s compatibility rules
+/// (instance/pipeline dedup, geometry-class homogeneity, mask/solo
+/// exclusions, structural budgets); each group becomes one STEP with a
+/// single geometry-homogeneous sub-batch, so every step's wire payload is
+/// byte-identical to the wave batch it replaces.
+///
+/// Frame tables:
+/// - the roster is first-appearance order across steps;
+/// - each roster lane's translation segment comes from its LAST fire in the
+///   frame (the latest overlay — prepared write targets accumulate);
+/// - `required_kv_pages` is the frame-union high-water over every member
+///   (declared high-water and page-id-derived floors).
+pub(crate) fn build_frame_submission(
+    waves: Vec<Vec<PendingRequest>>,
+    limits: SchedulerLimits,
+    page_size: u32,
+    stats: &SchedulerStats,
+) -> (FrameSubmission, Vec<PendingRequest>) {
+    let mut step_groups: Vec<Vec<PendingRequest>> = Vec::new();
+    for wave in waves {
+        if wave.is_empty() {
+            continue;
+        }
+        let mut deferred = wave;
+        // Repeated passes: incompatible members defer to the wave's next
+        // step, exactly like the old deferred-class re-dispatch.
+        while !deferred.is_empty() {
+            let mut grouping = super::worker::LaunchGrouping::default();
+            let mut group: Vec<PendingRequest> = Vec::new();
+            let mut rest: Vec<PendingRequest> = Vec::new();
+            let mut closed = false;
+            for req in deferred {
+                if closed || !grouping.accepts(&req, limits, page_size) {
+                    rest.push(req);
+                    continue;
+                }
+                closed = grouping.push(&req, limits, page_size);
+                group.push(req);
+            }
+            debug_assert!(!group.is_empty(), "grouping always admits the head");
+            if group.is_empty() {
+                // Defensive: never loop forever on a malformed head.
+                group.push(rest.remove(0));
+            }
+            step_groups.push(group);
+            deferred = rest;
+        }
+    }
+
+    let mut roster: Vec<u64> = Vec::new();
+    let mut roster_index: HashMap<u64, u32> = HashMap::new();
+    let mut lane_translation: Vec<Vec<u32>> = Vec::new();
+    let mut required_kv_pages = 0u32;
+    let mut steps: Vec<StepSubmission> = Vec::new();
+    let mut flattened: Vec<PendingRequest> = Vec::new();
+
+    for group in step_groups {
+        // Ordered sub-batches: wire (Host-class) members first, the
+        // device-resolved envelope suffix last — the driver's offset
+        // fixed-decode compose requires the envelope lanes to be a
+        // contiguous program suffix. Stable sort keeps arrival order
+        // within each class.
+        let mut group = group;
+        group.sort_by_key(|req| req.request.device_resolved_geometry);
+        let wire_count = group
+            .iter()
+            .take_while(|req| !req.request.device_resolved_geometry)
+            .count();
+        let envelope_count = group.len() - wire_count;
+        // TEMP DIAG (remove before landing).
+        if super::sched_trace_enabled() && envelope_count > 0 && wire_count > 0 {
+            eprintln!("[sched] MIXED step wire={wire_count} envelope={envelope_count}");
+        }
+        let mut sub_batch_indptr: Vec<u32> = vec![0];
+        let mut sub_batch_class: Vec<u32> = Vec::new();
+        if wire_count > 0 {
+            sub_batch_indptr.push(wire_count as u32);
+            sub_batch_class.push(pie_driver_abi::PIE_GEOMETRY_CLASS_HOST);
+        }
+        if envelope_count > 0 {
+            sub_batch_indptr.push(group.len() as u32);
+            sub_batch_class.push(pie_driver_abi::PIE_GEOMETRY_CLASS_DECODE_ENVELOPE);
+        }
+        let build = build_batch_request(&group, page_size, stats);
+        let mut roster_rows: Vec<u32> = Vec::with_capacity(build.instance_ids.len());
+        for (member_index, (member, req)) in
+            build.instance_ids.iter().zip(&group).enumerate()
+        {
+            let row = *roster_index.entry(*member).or_insert_with(|| {
+                roster.push(*member);
+                lane_translation.push(Vec::new());
+                (roster.len() - 1) as u32
+            });
+            roster_rows.push(row);
+            let segment = &build.kv_translation[build.kv_translation_indptr[member_index]
+                as usize
+                ..build.kv_translation_indptr[member_index + 1] as usize];
+            if !segment.is_empty() {
+                lane_translation[row as usize] = segment.to_vec();
+            }
+            // Declared high-water + WIRE page maxima only (v13 semantics):
+            // translation ids are physical placements, not demand — folding
+            // them in demanded a full-arena commit and broke long-context
+            // shapes that oversubscribe KV through the reclaim layer.
+            required_kv_pages = required_kv_pages.max(req.request.required_kv_pages).max(
+                req.request
+                    .kv_page_indices
+                    .iter()
+                    .copied()
+                    .max()
+                    .map_or(0, |page| page.saturating_add(1)),
+            );
+        }
+        required_kv_pages = required_kv_pages.max(build.plan.required_kv_pages);
+        steps.push(StepSubmission {
+            plan: build.plan,
+            roster_rows,
+            sub_batch_indptr,
+            sub_batch_class,
+            terminal_cells: build.terminal_cells,
+            program_row_indptr: build.program_row_indptr,
+            logical_fire_ids: build.logical_fire_ids,
+            channel_expected_head: build.channel_expected_head,
+            channel_expected_tail: build.channel_expected_tail,
+            channel_ticket_indptr: build.channel_ticket_indptr,
+        });
+        flattened.extend(group);
+    }
+
+    let mut kv_translation: Vec<u32> = Vec::new();
+    let mut kv_translation_indptr: Vec<u32> = Vec::with_capacity(roster.len() + 1);
+    kv_translation_indptr.push(0);
+    for segment in &lane_translation {
+        kv_translation.extend(segment.iter().copied());
+        kv_translation_indptr.push(kv_translation.len() as u32);
+    }
+    (
+        FrameSubmission {
+            instance_ids: roster,
+            kv_translation,
+            kv_translation_indptr,
+            required_kv_pages,
+            steps,
+        },
+        flattened,
+    )
 }
 
 #[cfg(test)]
@@ -223,13 +387,9 @@ mod tests {
             process_id: None,
             pipeline_id: None,
             prebuilt,
-            retry_count: 0,
-            retry_after: None,
             prelaunch_copy: None,
             prelaunch_state_copy: None,
-            retry_classifier: None,
-            credit_published: false,
-            quorum_generation: 0,
+            frame: None,
             timing: None,
         }
     }
@@ -348,7 +508,7 @@ mod tests {
     /// would take down the scheduler thread (RV-20).
     #[test]
     fn multi_row_masks_without_a_row_csr_reject_at_admission() {
-        let accumulator = BatchAccumulator::new(
+        let accumulator = AdmissionLimits::new(
             SchedulerLimits {
                 max_forward_requests: 64,
                 max_forward_tokens: 64,

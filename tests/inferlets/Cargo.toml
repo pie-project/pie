@@ -1,20 +1,34 @@
 [workspace]
 resolver = "2"
 members = [
+    "asap-grammar-aligned-decoding",
     "attention-sink",
     "beam-search",
     "cacheback-speculative-decoding",
     "chat-completion",
     "consensus-decoding",
     "contrastive-decoding",
+    "entropy-adaptive-temperature",
+    "eta-epsilon-sampling",
     "greenlist-watermarking",
     "json-schema-constrained-decoding",
+    "locally-typical-sampling",
     "mirostat-v2-sampling",
     "mtp-speculative-decoding",
     "prefix-tree-kv-cache",
+    "repetition-penalty",
+    "dry-repetition-penalty",
+    "gumbel-watermark",
+    "synthid-tournament-sampling",
+    "classifier-free-guidance",
+    "context-aware-decoding",
     "sampling-primitives",
     "sliding-window-attention",
+    "tail-free-sampling",
     "text-completion-bench",
+    "token-healing",
+    "top-a-sampling",
+    "xtc-sampling",
 ]
 
 [profile.release]
