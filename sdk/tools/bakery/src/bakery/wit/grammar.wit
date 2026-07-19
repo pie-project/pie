@@ -24,8 +24,8 @@ interface grammar {
 
     /// Stateful matcher that walks the grammar automaton as tokens are
     /// accepted, producing a bitmask of valid next tokens at each step.
-    /// The host compiles the grammar on construction and may cache the
-    /// compiled result internally.
+    /// The host compiles and may cache the grammar when its resource is
+    /// constructed; matcher construction reuses that compiled result.
     resource matcher {
         /// Create a new matcher from a grammar.
         constructor(grammar: borrow<grammar>);
@@ -47,6 +47,26 @@ interface grammar {
 
         /// Reset the matcher to its initial state so it can be reused.
         reset: func();
+
+        /// Split off an independent matcher positioned exactly where this one
+        /// is. The two matchers do not share state afterwards. Search
+        /// algorithms that branch -- beam search, tree drafting, speculative
+        /// decoding -- need one grammar state per live branch; without this,
+        /// a branch has to be replayed token by token from a fresh matcher.
+        fork: func() -> matcher;
+
+        /// Undo the last `num-tokens` accepted tokens, returning the matcher
+        /// to the state it had before them. Values above
+        /// `rollback-capacity` undo as much history as is retained. This is
+        /// the reject path of speculative decoding: the drafter proposes k
+        /// tokens, the verifier accepts j < k, and the matcher must give back
+        /// the other k - j.
+        rollback: func(num-tokens: u32);
+
+        /// How many accepted tokens `rollback` can still undo. History is
+        /// bounded, so a caller that drafts deeply should check this rather
+        /// than assume an unlimited undo log.
+        rollback-capacity: func() -> u32;
     }
 
 }

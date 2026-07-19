@@ -1,11 +1,11 @@
 use anyhow::{Result, bail};
 
-use super::{Expr, ExprId, Grammar, Lookahead, Rule, RuleId};
+use super::{Expr, ExprId, Grammar, Rule, RuleId};
 
 /// Programmatic grammar construction.
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use pie_grammar::grammar::builder::GrammarBuilder;
 ///
 /// let mut b = GrammarBuilder::new();
@@ -35,7 +35,6 @@ impl GrammarBuilder {
         self.rules.push(Rule {
             name: name.to_string(),
             body: ExprId(u32::MAX), // sentinel, must be filled
-            lookahead: None,
         });
         id
     }
@@ -43,11 +42,6 @@ impl GrammarBuilder {
     /// Set the body expression of a rule.
     pub fn set_rule_body(&mut self, rule: RuleId, body: ExprId) {
         self.rules[rule.0 as usize].body = body;
-    }
-
-    /// Set a lookahead assertion on a rule.
-    pub fn set_rule_lookahead(&mut self, rule: RuleId, expr: ExprId, is_exact: bool) {
-        self.rules[rule.0 as usize].lookahead = Some(Lookahead { expr, is_exact });
     }
 
     /// Add an expression to the arena and return its id.

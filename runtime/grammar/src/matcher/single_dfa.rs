@@ -11,6 +11,7 @@ use crate::compiled_grammar::CompiledGrammar;
 use crate::fsm::StateId;
 use pie_tokenizer::Tokenizer;
 
+#[derive(Clone)]
 pub(super) struct SingleDfaEngine {
     pub(super) rule_idx: usize,
     pub(super) state: u16,
@@ -47,11 +48,6 @@ impl SingleDfaEngine {
     /// Whether the DFA is in an accepting state.
     pub(super) fn is_completed(&self, compiled: &CompiledGrammar) -> bool {
         compiled.rule_dfas[self.rule_idx].ends[self.state as usize]
-    }
-
-    /// Hash of current state for bitmask caching.
-    pub(super) fn state_hash(&self) -> u64 {
-        self.state as u64
     }
 
     /// Rollback num_tokens tokens by popping from history.
@@ -106,9 +102,11 @@ impl SingleDfaEngine {
         bitmask: &mut [u32],
         scratch_stack: &mut Vec<u16>,
         scratch_prefix: &mut Vec<u8>,
+        cache_key: &mut Vec<u64>,
     ) {
-        let hash = self.state_hash();
-        if compiled.get_cached_bitmask(hash, bitmask) {
+        cache_key.clear();
+        cache_key.extend([0, self.rule_idx as u64, self.state as u64]);
+        if compiled.get_cached_bitmask(cache_key, bitmask) {
             return;
         }
 
@@ -136,7 +134,7 @@ impl SingleDfaEngine {
             );
         }
 
-        compiled.cache_bitmask(hash, bitmask);
+        compiled.cache_bitmask(cache_key, bitmask);
     }
 
     /// Trie walk for uncertain tokens using raw byte_table lookups.
@@ -148,7 +146,7 @@ impl SingleDfaEngine {
         stack: &mut Vec<u16>,
         active_prefix: &mut Vec<u8>,
     ) {
-        let sorted = tokenizer_info.sorted_vocab();
+        let sorted = tokenizer_info.sorted_token_ids();
         let trie_end = tokenizer_info.trie_subtree_end();
         let bt = compiled.rule_dfas[self.rule_idx].fsm.byte_table();
 
@@ -158,10 +156,12 @@ impl SingleDfaEngine {
 
         let mut i = 0;
         while i < sorted.len() {
-            let (token_id, ref token_str) = sorted[i];
-            let bytes = token_str.as_bytes();
+            let token_id = sorted[i];
+            let bytes = tokenizer_info
+                .decoded_token_bytes(token_id)
+                .expect("sorted token IDs have decoded bytes");
 
-            if bytes.is_empty() || bitmask::get_bit(bitmask, token_id as usize) {
+            if bitmask::get_bit(bitmask, token_id as usize) {
                 i += 1;
                 continue;
             }

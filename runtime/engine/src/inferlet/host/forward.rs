@@ -255,7 +255,28 @@ async fn materialize_channel(
     }
 }
 
-impl pie::inferlet::forward::Host for ProcessCtx {}
+impl pie::inferlet::forward::Host for ProcessCtx {
+    /// Frame submission (`forward.submit(on, slots)`): exactly
+    /// `model.frame-size()` ordered slots; slot i executes in wave i; `none`
+    /// is a no-op. Delegates to [`crate::pipeline::fire::submit_frame`].
+    async fn submit(
+        &mut self,
+        on: Resource<crate::pipeline::Pipeline>,
+        slots: Vec<Option<Resource<ForwardPass>>>,
+    ) -> Anyhow<Result<(), String>> {
+        let slot_reps: Vec<Option<u32>> = slots
+            .iter()
+            .map(|slot| slot.as_ref().map(Resource::rep))
+            .collect();
+        for rep in slot_reps.iter().flatten() {
+            let fwd: Resource<ForwardPass> = Resource::new_borrow(*rep);
+            let _ = self.ctx().table.get(&fwd)?;
+        }
+        crate::inferlet::process::ensure_execution_admitted(self).await;
+        crate::inferlet::process::preemption::contention_gate(self).await?;
+        crate::pipeline::fire::submit_frame(self, on, slot_reps).await
+    }
+}
 
 impl pie::inferlet::forward::HostChannel for ProcessCtx {
     async fn new(
@@ -509,7 +530,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             // prewarm, but everything from here on creates per-instance
             // driver state (channel registration, instance bind) or claims
             // pooled KV (device-geometry seed pages) — execution first.
-            crate::inferlet::process::ensure_execution_admitted(self).await;
+            crate::inferlet::process::ensure_bind_admitted(self).await;
 
             // Validate every handle against its dense declaration BEFORE
             // stamping any of them, so a failed `program` attachment binds nothing.
@@ -686,6 +707,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                         fresh_dense,
                         w_cont_dense,
                         has_mask,
+                        pooled: false,
                     })
                 }
                 None => None,
@@ -729,6 +751,35 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                         .to_string(),
                 ));
             }
+            // A decode loop that carries a DENSE device `AttnMask` has no home
+            // in the envelope class (the compose paths hold no per-lane mask
+            // state) and none in the Host class (a device-sampled token is not
+            // host-derivable). It DOES have one in the pool-owned device
+            // geometry class: the descriptor resolver reads every port —
+            // including the mask — straight from the channel cells, and such
+            // fires are scheduled solo. Take that route rather than letting the
+            // fire die on the first value the host cannot know.
+            let devgeo = match devgeo {
+                Some(devgeo) => Some(devgeo),
+                None if decode_envelope.is_none()
+                    && devgeo_capable
+                    && !taint.host_derivable()
+                    && readable.start == 0
+                    && readable.end.is_none() =>
+                {
+                    crate::pipeline::fire::lease::detect_pooled_device_geometry(
+                        &prog.bound.container,
+                    )
+                    .map(|lanes| {
+                        tracing::info!(
+                            "masked device-carried decode ({lanes} lane(s)) executes as a \
+                             pool-owned device-geometry pass"
+                        );
+                        crate::pipeline::fire::lease::DevGeo::pooled(lanes, true)
+                    })
+                }
+                None => None,
+            };
             let geometry_class = if devgeo.is_some() {
                 pie_driver_abi::GeometryClass::DeviceGeometry
             } else if decode_envelope.is_some() {
@@ -1082,22 +1133,6 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         Ok(())
     }
 
-    /// Run-ahead submit on `on`: pure-attention prepares immediately; RS-bound
-    /// passes first finalize prior FIFO operations. See
-    /// `crate::pipeline::fire`'s module docs; errors after this call surface
-    /// via channel poison + `take`.
-    async fn submit(
-        &mut self,
-        this: Resource<ForwardPass>,
-        on: Resource<crate::pipeline::Pipeline>,
-    ) -> Anyhow<Result<(), String>> {
-        if !self.ctx().table.get(&this)?.is_bound() {
-            return Ok(Err("forward pass program is not attached".to_string()));
-        }
-        crate::inferlet::process::ensure_execution_admitted(self).await;
-        crate::inferlet::process::preemption::contention_gate(self).await?;
-        crate::pipeline::fire::submit_pass(self, on, this).await
-    }
 }
 
 #[cfg(test)]

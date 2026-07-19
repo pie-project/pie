@@ -1,0 +1,17 @@
+[package]
+name = "entropy-adaptive-temperature"
+version = "0.1.0"
+description = "Entropy-based dynamic temperature (EDT) — pick the temperature per step from the distribution's own entropy"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+t0 = {type = "float", optional = true, description = "Upper bound on temperature (default: 1.0)"}
+theta = {type = "float", optional = true, description = "Sensitivity of temperature to entropy (default: 0.1)"}
+n = {type = "float", optional = true, description = "Base of the entropy response, 0<n<1 (default: 0.8)"}
+min_temperature = {type = "float", optional = true, description = "Floor on the derived temperature (default: 0.05)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}

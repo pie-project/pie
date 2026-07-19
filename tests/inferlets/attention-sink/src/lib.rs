@@ -175,13 +175,20 @@ async fn main(input: Input) -> Result<String> {
         let logical_slot = div(&base, PAGE_T);
         let next = add(&base, 1u32);
 
+        // Device-resolved geometry is loop-carried: the host never drains
+        // these rings, so the graph has to take before it puts or the
+        // readiness check sees a full ring and refuses to commit the pass.
+        token_in.take();
         token_in.put(&token);
         token_out.put(&token);
+        position.take();
         position.put(&base);
         fill.put(&next);
         klen.take();
         klen.put(&next);
+        write_slot.take();
         write_slot.put(gather(&ids, &logical_slot));
+        write_offset.take();
         write_offset.put(rem(&base, PAGE_T));
         mask.take();
         mask.put(&next_mask);

@@ -1,0 +1,4 @@
+[package]
+name = "grammar-wit-bench"
+version = "0.1.0"
+description = "Measures grammar matcher calls through the Wasmtime component boundary"

@@ -29,7 +29,9 @@ inline float ptir_rng_hash_uniform(ulong seed_eff, uint index) {
   const ulong x = seed_eff +
       0x9E3779B97F4A7C15ul * (ulong(index) + 1ul);
   const uint bits = uint(ptir_rng_splitmix64(x) >> 40);
-  return (float(bits) + 0.5f) * (1.0f / 16777216.0f);
+  const float raw = (float(bits) + 0.5f) * (1.0f / 16777216.0f);
+  /* clamp off the one draw in 2^24 that rounds to exactly 1.0f */
+  return raw < 0.99999994f ? raw : 0.99999994f;
 }
 
 #endif

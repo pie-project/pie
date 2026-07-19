@@ -231,14 +231,21 @@ async fn main(input: Input) -> Result<String> {
         let pages_v = reshape(&pids, [pool_pages]);
         let pidx_v = mul(iota(2), pool_pages);
 
+        // Device-resolved geometry is loop-carried: the host never drains
+        // these rings, so the graph has to take before it puts or the
+        // readiness check sees a full ring and refuses to commit the pass.
+        tok_in.take();
         tok_in.put(&tok);
         out.put(&tok);
         mask.take();
         mask.put(&new_mask);
+        w_slot.take();
         w_slot.put(&w_slot_v);
+        w_off.take();
         w_off.put(&w_off_v);
         klen.take();
         klen.put(&klen_v);
+        pos.take();
         pos.put(&base);
         fill.put(&next_free);
         pages.take();

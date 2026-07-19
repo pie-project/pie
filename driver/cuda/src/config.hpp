@@ -7,7 +7,13 @@
 #include <string>
 #include <string_view>
 
+// toml++ cannot be parsed by nvcc (its `table::for_each` generic lambdas trip
+// the EDG frontend). Config parsing is host-only, so keep it out of device
+// translation units; `.cu` files that include this header still get the plain
+// config structs. Same convention as the model/loader adapter headers.
+#ifndef __CUDACC__
 #include <toml++/toml.hpp>
+#endif
 
 #include "store/kv_cache_format.hpp"
 
@@ -77,6 +83,7 @@ inline int parse_cuda_device_id(const std::string& device) {
     return id;
 }
 
+#ifndef __CUDACC__
 inline Config load_config(const std::filesystem::path& path) {
     if (!std::filesystem::exists(path)) {
         throw std::runtime_error("config not found: " + path.string());
@@ -194,5 +201,6 @@ inline Config load_config(const std::filesystem::path& path) {
     (void)kv_cache_format_from_string(c.batching.kv_cache_dtype, c.model.dtype);
     return c;
 }
+#endif  // __CUDACC__
 
 }  // namespace pie_cuda_driver

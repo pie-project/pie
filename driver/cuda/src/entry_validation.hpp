@@ -7,6 +7,7 @@
 #include <limits>
 
 #include <pie_driver_abi.h>
+#include <pie_native/step_launch.hpp>
 
 namespace pie_cuda_driver::abi {
 
@@ -132,7 +133,17 @@ inline int validate_encode_resources(
     return PIE_STATUS_OK;
 }
 
-inline int validate_launch_resources(const PieLaunchDesc& launch,
+template <typename LaunchT>
+inline std::size_t launch_member_count(const LaunchT& launch) {
+    if constexpr (requires { launch.roster_rows; }) {
+        return launch.roster_rows.len;
+    } else {
+        return launch.instance_ids.len;
+    }
+}
+
+template <typename LaunchT>
+inline int validate_launch_resources(const LaunchT& launch,
                                      int device_pages,
                                      int page_size,
                                      int rs_slots,
@@ -143,10 +154,12 @@ inline int validate_launch_resources(const PieLaunchDesc& launch,
     if (device_pages < 0 || page_size <= 0) {
         return PIE_STATUS_DRIVER_ERROR;
     }
-    const PieU32Slice physical_pages =
-        launch.kv_translation.len != 0
-            ? launch.kv_translation
-            : launch.kv_page_indices;
+    PieU32Slice physical_pages = launch.kv_page_indices;
+    if constexpr (requires { launch.kv_translation; }) {
+        if (launch.kv_translation.len != 0) {
+            physical_pages = launch.kv_translation;
+        }
+    }
     for (std::size_t i = 0; i < physical_pages.len; ++i) {
         if (physical_pages.ptr[i] >=
             static_cast<std::uint32_t>(device_pages)) {
@@ -166,11 +179,11 @@ inline int validate_launch_resources(const PieLaunchDesc& launch,
     // catch. The old exemption was a batch-level "this batch is PTIR"
     // shape sniff, which waved those rows through too (C2).
     const bool has_program_row_map =
-        launch.instance_ids.len != 0 &&
+        launch_member_count(launch) != 0 &&
         launch.ptir_program_row_indptr.len ==
-            launch.instance_ids.len + 1 &&
+            launch_member_count(launch) + 1 &&
         program_geometry_classes != nullptr &&
-        program_count == launch.instance_ids.len;
+        program_count == launch_member_count(launch);
     const auto row_defers_geometry =
         [&](std::size_t request) noexcept -> bool {
         if (!has_program_row_map) return false;

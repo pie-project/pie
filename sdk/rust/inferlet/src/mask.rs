@@ -26,9 +26,18 @@ pub fn all_allowed(vocab: usize) -> Vec<u32> {
 }
 
 /// Whether token `j` is allowed (bit `1`) in the packed mask.
+///
+/// Tokens past the mask's word coverage read as **disallowed**, mirroring
+/// [`pack_allowed`], which drops ids it cannot represent. This matters because
+/// a model's output vocabulary is routinely padded above its tokenizer's: Qwen3
+/// declares `vocab_size = 151936` against 151669 real tokens, so a constraint
+/// mask packed for the tokenizer covers 151680 and the top 256 logit slots fall
+/// off the end. Those slots decode to no token at all, so refusing them is both
+/// the safe answer and the correct one.
 #[inline]
 pub fn bit_allowed(mask: &[u32], j: usize) -> bool {
-    (mask[j >> 5] >> (j & 31)) & 1 == 1
+    let word = j >> 5;
+    word < mask.len() && (mask[word] >> (j & 31)) & 1 == 1
 }
 
 /// Pack an allowed-token id list into a `[ceil(vocab/32)]` u32 bitmask (bit `1`
@@ -107,6 +116,22 @@ mod tests {
         let mask2 = [0u32, 0b10u32];
         assert!(bit_allowed(&mask2, 33));
         assert!(!bit_allowed(&mask2, 32));
+    }
+
+    /// A model's padded output vocabulary can outrun the tokenizer's, so the
+    /// top logit slots have no bit in a constraint mask packed for the
+    /// tokenizer. They decode to no token and must read as disallowed rather
+    /// than panicking. Qwen3 is the live case: 151936 declared against a mask
+    /// covering 151680.
+    #[test]
+    fn bit_allowed_refuses_tokens_past_the_mask() {
+        let mask = pack_allowed(151_669, &[7, 151_668]);
+        assert_eq!(mask.len(), 4740);
+        assert!(bit_allowed(&mask, 7));
+        assert!(bit_allowed(&mask, 151_668));
+        for j in [151_680, 151_935, usize::MAX / 64] {
+            assert!(!bit_allowed(&mask, j), "token {j} should be disallowed");
+        }
     }
 
     #[test]

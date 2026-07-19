@@ -43,9 +43,18 @@ async fn main(_input: String) -> Result<String> {
     });
 
     let pipeline = Pipeline::new();
+    // The late-put run-ahead pattern (submit first, value later) is k = 1
+    // semantics; frame deployments require every per-fire input staged
+    // before submit (Vesuvius §5), so pre-stage there.
+    let late_put = frame_size() == 1;
+    if !late_put {
+        increment.put(vec![1u32]);
+    }
     pass.submit(&pipeline)
         .map_err(|error| format!("submit: {error}"))?;
-    increment.put(vec![1u32]);
+    if late_put {
+        increment.put(vec![1u32]);
+    }
     let value = out
         .take()
         .get::<u32>()

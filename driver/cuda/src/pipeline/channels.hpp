@@ -199,6 +199,10 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
         std::uint32_t ticket_offset = 0;
         std::uint32_t ticket_count = 0;
         std::uint32_t initial_commit = 0;
+        // Set from PIE_DEBUG_PULL_VALIDATE: prints the ticket that vetoed the
+        // fire. Ticket rejection is otherwise indistinguishable from any other
+        // reason a prologue fails to commit.
+        std::uint32_t diagnose = 0;
     };
 
     __device__ inline std::uint64_t load_system_acquire(std::uint64_t* word) {
@@ -227,7 +231,11 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
         const PullValidateHostChannelLane lane = lanes[lane_index];
         __shared__ std::uint32_t valid;
         if (threadIdx.x == 0) {
-            *lane.pass_commit = lane.initial_commit;
+            // Snapshot words: [0] pass_commit seed, [1] kill — reset both;
+            // the ringed snapshot may carry a stale kill from a previous
+            // occurrence of this ring slot.
+            lane.pass_commit[0] = lane.initial_commit;
+            lane.pass_commit[1] = 0;
         }
         __syncthreads();
 
@@ -255,7 +263,24 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
                                  same_fire_consume;
                 }
                 valid = ok ? 1u : 0u;
-                if (!ok) atomicAnd(lane.pass_commit, 0u);
+                if (!ok) {
+                    if (lane.diagnose != 0) {
+                        printf(
+                            "[pie-driver-cuda] pull-validate reject: "
+                            "slot=%u flags=0x%x head=%llu tail=%llu "
+                            "expected_head=%llu expected_tail=%llu cap1=%u\n",
+                            ticket.slot,
+                            static_cast<unsigned>(ticket.flags),
+                            static_cast<unsigned long long>(head),
+                            static_cast<unsigned long long>(tail),
+                            static_cast<unsigned long long>(
+                                ticket.expected_head),
+                            static_cast<unsigned long long>(
+                                ticket.expected_tail),
+                            ticket.cap1);
+                    }
+                    atomicAnd(lane.pass_commit, 0u);
+                }
             }
             __syncthreads();
 
@@ -318,6 +343,10 @@ inline constexpr std::uint32_t kTicketRequireInput = 1u << 4;
         const std::uint32_t committed = *lane.commit;
         if (threadIdx.x == 0) {
             if (lane.host_commit != nullptr) {
+                // Mapped snapshot: mirror both words ([0] commit, [1] kill)
+                // so the completion callback classifies the lane without a
+                // D2H copy.
+                store_system_release(lane.host_commit + 1, lane.commit[1]);
                 store_system_release(lane.host_commit, committed);
             }
             if (committed != 0) {

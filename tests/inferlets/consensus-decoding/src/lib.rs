@@ -141,14 +141,21 @@ async fn main(input: Input) -> Result<String> {
             let r = rng_p.take();
             // Shared nucleus keep-mask over the read-out row, then B independent
             // Gumbel draws → B distinct first tokens.
-            let logits = intrinsics::logits(); // [vocab] (single read-out row)
-            let scaled = div(&logits, TEMPERATURE.max(1e-4));
+            let logits = intrinsics::logits(); // [1, vocab] (single read-out row)
+            // Widen to [B, vocab] BEFORE the sampler: the keep-mask is
+            // row-wise, so a per-row nucleus over B identical rows is the same
+            // shared nucleus, and keeping `mask_apply -> add(noise) -> argmax`
+            // adjacent is what lets the compiler match `LibraryOp::NucleusSample`
+            // (compiler.rs:1305). A `broadcast` spliced between `mask_apply` and
+            // `reduce_argmax` breaks that match and falls back to a generated
+            // sort/cumsum region.
+            let wide = broadcast(reshape(&logits, [1, vocab]), [b, vocab]); // [B, vocab]
+            let scaled = div(&wide, TEMPERATURE.max(1e-4));
             let probs = softmax(&scaled);
             let keep = pivot_threshold(&probs, cummass_le(TOP_P));
-            let masked = mask_apply(&scaled, &keep); // [vocab]
-            let wide = broadcast(reshape(&masked, [1, vocab]), [b, vocab]); // [B, vocab]
+            let masked = mask_apply(&scaled, &keep); // [B, vocab]
             let g = gumbel(&r, [b, vocab]); // independent per-lane noise
-            let toks0 = reduce_argmax(add(&wide, &g)); // [B] i32
+            let toks0 = reduce_argmax(add(&masked, &g)); // [B] i32
             let r_next = add(&r, iota(2)); // advance ctr: [key, ctr+1]
             g0s_ch.put(&toks0);
             rng_p.put(&r_next);
@@ -262,10 +269,16 @@ async fn main(input: Input) -> Result<String> {
             );
             let pidx_n = mul(iota(b + 1), pool_pages);
 
+            // Device-resolved geometry is loop-carried: the host never drains
+            // these rings, so the graph has to take before it puts or the
+            // readiness check sees a full ring and refuses to commit the pass.
+            tok_in.take();
             tok_in.put(&toks);
             out.put(&toks);
             mask.put(&new_mask);
+            w_slot.take();
             w_slot.put(&w_slot_n);
+            w_off.take();
             w_off.put(&w_off_n);
             klen.take();
             klen.put(&klen_n);

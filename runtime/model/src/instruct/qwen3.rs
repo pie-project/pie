@@ -9,8 +9,7 @@ use crate::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, Thinki
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
-use pie_grammar::grammar::Grammar;
-use pie_tokenizer::Tokenizer;
+use pie_tokenizer::{Tokenizer, TokenizerDecoder};
 use std::sync::Arc;
 
 // =============================================================================
@@ -360,7 +359,7 @@ impl Instruct for QwenInstruct {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(QwenToolDecoder {
-            tokenizer: self.tokenizer.clone(),
+            decoder: self.tokenizer.decoder(false),
             accumulated: String::new(),
             inside: false,
             has_tools: self.config.has_tools,
@@ -372,11 +371,7 @@ impl Instruct for QwenInstruct {
             return None;
         }
         let source = Self::build_tool_call_grammar(tools)?;
-        let grammar = Grammar::from_ebnf(&source, "root").ok()?;
-        Some(ToolGrammar {
-            source,
-            grammar: Arc::new(grammar),
-        })
+        Some(ToolGrammar { source })
     }
 }
 
@@ -385,7 +380,7 @@ impl Instruct for QwenInstruct {
 // =============================================================================
 
 struct QwenToolDecoder {
-    tokenizer: Arc<Tokenizer>,
+    decoder: TokenizerDecoder,
     accumulated: String,
     inside: bool,
     has_tools: bool,
@@ -396,7 +391,7 @@ impl ToolDecoder for QwenToolDecoder {
         if !self.has_tools {
             return ToolEvent::Start;
         }
-        let text = self.tokenizer.decode(tokens, false);
+        let text = self.decoder.feed(tokens);
         self.accumulated.push_str(&text);
 
         if !self.inside {
@@ -423,6 +418,7 @@ impl ToolDecoder for QwenToolDecoder {
     }
 
     fn reset(&mut self) {
+        self.decoder.reset();
         self.accumulated.clear();
         self.inside = false;
     }

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1567,7 +1568,8 @@ inline GroupedLaunchResult run_generated_stage(
         group_view.d_full(),
         group_view.d_head(),
         group_view.d_tail(),
-        group_view.d_cap1());
+        group_view.d_cap1(),
+        std::getenv("PIE_DEBUG_PULL_VALIDATE") != nullptr ? 1u : 0u);
     CUDA_CHECK(cudaGetLastError());
 
     GroupedLaunchResult result;

@@ -30,7 +30,6 @@ bool has_non_full_attention_layers(const HfConfig& hf);
 // doesn't apply.
 std::size_t attention_float_workspace_bytes(const HfConfig& hf,
                                             const Config& cfg,
-                                            const cudaDeviceProp& prop,
-                                            int max_requests);
+                                            const cudaDeviceProp& prop);
 
 }  // namespace pie_cuda_driver

@@ -1,0 +1,16 @@
+[package]
+name = "classifier-free-guidance"
+version = "0.1.0"
+description = "Classifier-free guidance — extrapolate away from a negative prompt using two contexts in one frame"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Conditioning prompt"}
+negative_prompt = {type = "string", optional = true, description = "Prompt to extrapolate away from; empty means unconditional"}
+guidance = {type = "float", optional = true, description = "Guidance strength; 1.0 is plain conditional sampling (default: 1.5)"}
+temperature = {type = "float", optional = true, description = "Temperature applied after guidance (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}

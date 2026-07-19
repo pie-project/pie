@@ -1,0 +1,17 @@
+[package]
+name = "xtc-sampling"
+version = "0.1.0"
+description = "XTC (exclude top choices) — probabilistically remove the most likely candidates"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+threshold = {type = "float", optional = true, description = "Probability above which a token counts as a top choice (default: 0.1)"}
+min_p = {type = "float", optional = true, description = "Min-p floor applied before XTC; 0 disables (default: 0.02)"}
+probability = {type = "float", optional = true, description = "Chance of firing at each step, 0..1 (default: 0.5)"}
+temperature = {type = "float", optional = true, description = "Temperature applied before the rule (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for the gate and the Gumbel-max draw"}

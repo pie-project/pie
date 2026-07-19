@@ -14,10 +14,10 @@ use pie_driver_abi::{
     PIE_GEOMETRY_CLASS_HOST, PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_RETRY,
     PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieChannelDesc, PieChannelEndpointBinding,
     PieChannelValueDescSlice, PieCompletion, PieEncodeDesc, PieInstanceBinding, PieInstanceDesc,
-    PieKvCopyDesc, PieLaunchDesc, PieLaunchPrepareResult, PiePoolResizeDesc, PieProgramDesc,
+    PieFrameDesc, PieKvCopyDesc, PiePoolResizeDesc, PieProgramDesc, PieStepDesc,
     PieRuntimeCallbacks, PieStateCopyDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice,
     PieU64Slice, validate_channel_desc, validate_completion, validate_encode_desc,
-    validate_instance_desc, validate_kv_copy_desc, validate_launch_desc, validate_pool_resize_desc,
+    validate_frame_desc, validate_instance_desc, validate_kv_copy_desc, validate_pool_resize_desc,
     validate_program_desc, validate_state_copy_desc,
 };
 use pie_ptir::container::{self, ExternDir, HostRole};
@@ -243,12 +243,8 @@ pub struct DummyDriver {
     reject_launches_remaining: u32,
     fail_launches_after_accept: bool,
     retry_launches_remaining: u32,
-    elastic_admission: bool,
     prepare_exhaustions_remaining: u32,
     prepare_impossible_above_kv_pages: u32,
-    next_launch_lease_id: u64,
-    launch_leases: HashMap<u64, DummyLaunchLease>,
-    prepare_generation: u64,
     callback_delay_ms: u64,
     runtime: SendableRuntimeCallbacks,
     callback_workers: Vec<std::thread::JoinHandle<()>>,
@@ -257,12 +253,26 @@ pub struct DummyDriver {
     kv_export: DummyKvExport,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DummyLaunchLease {
-    instance_ids: Vec<u64>,
-    logical_fire_ids: Vec<u64>,
-    token_ids: Vec<u32>,
-    required_kv_pages: u32,
+/// Admission outcome of a frame post: the in-process mirror of ABI v14's
+/// folded admission statuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameAdmission {
+    Launched,
+    Exhausted,
+    Impossible,
+}
+
+/// Resolve a step's batch membership through the frame roster.
+fn resolve_step_members(roster: &[u64], step: &PieStepDesc) -> Result<Vec<u64>> {
+    copy_u32_slice(step.roster_rows, "step.roster_rows")?
+        .into_iter()
+        .map(|row| {
+            roster
+                .get(row as usize)
+                .copied()
+                .ok_or_else(|| anyhow!("step roster row {row} exceeds the frame roster"))
+        })
+        .collect()
 }
 
 impl DummyDriver {
@@ -338,12 +348,8 @@ impl DummyDriver {
             reject_launches_remaining: options.reject_launches_remaining,
             fail_launches_after_accept: options.fail_launches_after_accept,
             retry_launches_remaining: options.retry_launches_remaining,
-            elastic_admission: options.elastic_admission,
             prepare_exhaustions_remaining: options.prepare_exhaustions_remaining,
             prepare_impossible_above_kv_pages: options.prepare_impossible_above_kv_pages,
-            next_launch_lease_id: 1,
-            launch_leases: HashMap::new(),
-            prepare_generation: 1,
             callback_delay_ms: options.callback_delay_ms,
             runtime,
             callback_workers: Vec::new(),
@@ -355,10 +361,6 @@ impl DummyDriver {
 
     pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
         pie_driver_abi::KvExport::export_kv_handle(&self.kv_export)
-    }
-
-    pub fn supports_elastic_admission(&self) -> bool {
-        self.elastic_admission
     }
 
     fn record_op(&self, name: &str) {
@@ -742,118 +744,98 @@ impl DummyDriver {
         Ok(binding)
     }
 
-    fn launch_lease_signature(&self, desc: &PieLaunchDesc) -> Result<DummyLaunchLease> {
-        let required_kv_pages = copy_u32_slice(desc.kv_page_indices, "launch.kv_page_indices")?
-            .into_iter()
-            .chain(copy_u32_slice(
-                desc.kv_translation,
-                "launch.kv_translation",
-            )?)
-            .map(|page| page.saturating_add(1))
-            .fold(desc.required_kv_pages, u32::max);
-        Ok(DummyLaunchLease {
-            instance_ids: copy_u64_slice(desc.instance_ids, "launch.instance_ids")?,
-            logical_fire_ids: copy_u64_slice(desc.logical_fire_ids, "launch.logical_fire_ids")?,
-            token_ids: copy_u32_slice(desc.token_ids, "launch.token_ids")?,
-            required_kv_pages,
-        })
-    }
-
-    pub fn prepare_launch(&mut self, desc: &PieLaunchDesc) -> Result<PieLaunchPrepareResult> {
-        unsafe { validate_launch_desc(desc) }.map_err(|err| anyhow!(err))?;
+    /// Post one sealed frame (ABI v14). Admission is folded into the call:
+    /// the frame-union KV demand is evaluated first (the old prepare-surface
+    /// test knobs drive Exhausted/Impossible), then the steps execute in
+    /// order as one closed system and the single completion publishes at the
+    /// frame tail.
+    pub fn launch(
+        &mut self,
+        desc: &PieFrameDesc,
+        completion: PieCompletion,
+    ) -> Result<FrameAdmission> {
+        unsafe { validate_frame_desc(desc) }.map_err(|err| anyhow!(err))?;
         ensure_abi(desc.abi_version)?;
-        let signature = self.launch_lease_signature(desc)?;
+        self.record_op("launch");
+        let roster = copy_u64_slice(desc.instance_ids, "frame.instance_ids")?;
         ensure!(
-            !signature.instance_ids.is_empty(),
-            "launch preparation requires at least one bound instance"
+            !roster.is_empty(),
+            "launch requires at least one bound instance"
         );
-        {
-            let state = self.state.lock().unwrap();
-            ensure!(
-                signature
-                    .instance_ids
-                    .iter()
-                    .all(|instance_id| state.instances.contains_key(instance_id)),
-                "launch preparation contains an unknown instance"
-            );
+        let steps: Vec<PieStepDesc> =
+            unsafe { std::slice::from_raw_parts(desc.steps.ptr, desc.steps.len) }.to_vec();
+        ensure_completion(completion)?;
+
+        // Folded admission: frame-union KV page demand vs the (test-shaped)
+        // physical budget.
+        let mut required_kv_pages = desc.required_kv_pages;
+        for step in &steps {
+            required_kv_pages = copy_u32_slice(step.kv_page_indices, "step.kv_page_indices")?
+                .into_iter()
+                .map(|page| page.saturating_add(1))
+                .fold(required_kv_pages, u32::max);
         }
-        let budget_pages = u64::from(if self.prepare_impossible_above_kv_pages == 0 {
-            self.capabilities.total_pages
-        } else {
-            self.prepare_impossible_above_kv_pages
-        });
-        let required_pages = u64::from(signature.required_kv_pages);
         if self.prepare_impossible_above_kv_pages != 0
-            && signature.required_kv_pages > self.prepare_impossible_above_kv_pages
+            && required_kv_pages > self.prepare_impossible_above_kv_pages
         {
-            self.record_op("prepare_launch-impossible");
-            return Ok(PieLaunchPrepareResult {
-                outcome: pie_driver_abi::PIE_LAUNCH_PREPARE_IMPOSSIBLE,
-                budget_generation: self.prepare_generation,
-                required_pages,
-                budget_pages,
-                ..PieLaunchPrepareResult::default()
-            });
+            self.record_op("launch-impossible");
+            return Ok(FrameAdmission::Impossible);
         }
         if self.prepare_exhaustions_remaining != 0 {
             self.prepare_exhaustions_remaining -= 1;
-            self.prepare_generation = self.prepare_generation.saturating_add(1);
-            self.record_op("prepare_launch-exhausted");
-            return Ok(PieLaunchPrepareResult {
-                outcome: pie_driver_abi::PIE_LAUNCH_PREPARE_EXHAUSTED,
-                budget_generation: self.prepare_generation,
-                required_pages,
-                budget_pages,
-                ..PieLaunchPrepareResult::default()
-            });
+            self.record_op("launch-exhausted");
+            return Ok(FrameAdmission::Exhausted);
         }
-        let lease_id = self.next_launch_lease_id;
-        ensure!(lease_id != 0, "dummy launch lease id space exhausted");
-        self.next_launch_lease_id = self
-            .next_launch_lease_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("dummy launch lease id space exhausted"))?;
-        self.launch_leases.insert(lease_id, signature);
-        self.record_op("prepare_launch-ready");
-        Ok(PieLaunchPrepareResult {
-            outcome: pie_driver_abi::PIE_LAUNCH_PREPARE_READY,
-            lease_id,
-            budget_generation: self.prepare_generation,
-            required_pages,
-            budget_pages,
-            ..PieLaunchPrepareResult::default()
-        })
+        if self.reject_launches {
+            bail!("launch rejected by dummy test option");
+        }
+        if self.reject_launches_remaining != 0 {
+            self.reject_launches_remaining -= 1;
+            bail!("launch rejected by dummy test option");
+        }
+
+        // Whole-frame RETRY test knob: every fire of every step latches
+        // RETRY and the frame completes without executing (decision #5's
+        // backstop shape — there is no per-lane makeup).
+        if self.retry_launches_remaining != 0 {
+            self.retry_launches_remaining -= 1;
+            let callback = self.prepare_callback(completion)?;
+            for step in &steps {
+                let members = resolve_step_members(&roster, step)?;
+                let terminal_cells = copy_terminal_cell_ptrs(step.terminal_cells)?;
+                let state = self.state.lock().unwrap();
+                for (member_id, terminal_cell) in members.iter().zip(&terminal_cells) {
+                    if let Some(instance) = state.instances.get(member_id) {
+                        instance.inner.lock().unwrap().next_pacing_epoch += 1;
+                    }
+                    publish_terminal(*terminal_cell, PIE_TERMINAL_OUTCOME_RETRY);
+                }
+            }
+            self.publish_callback(callback, completion);
+            return Ok(FrameAdmission::Launched);
+        }
+
+        let callback = self.prepare_callback(completion)?;
+        let mut notifications: Vec<(u64, u64)> = Vec::new();
+        for step in &steps {
+            self.execute_step(desc, &roster, step, &mut notifications)?;
+        }
+        for &(wait_id, epoch) in &notifications {
+            notify_runtime(&self.runtime, wait_id, epoch);
+        }
+        self.publish_callback(callback, completion);
+        Ok(FrameAdmission::Launched)
     }
 
-    pub fn launch_prepared(
+    /// One forward step of an admitted frame: today's per-batch execution
+    /// body, with batch membership resolved through the frame roster.
+    fn execute_step(
         &mut self,
-        desc: &PieLaunchDesc,
-        lease_id: u64,
-        completion: PieCompletion,
+        frame: &PieFrameDesc,
+        roster: &[u64],
+        desc: &PieStepDesc,
+        notifications: &mut Vec<(u64, u64)>,
     ) -> Result<()> {
-        let expected = self
-            .launch_leases
-            .remove(&lease_id)
-            .ok_or_else(|| anyhow!("unknown or consumed launch lease {lease_id}"))?;
-        let actual = self.launch_lease_signature(desc)?;
-        ensure!(actual == expected, "prepared launch descriptor changed");
-        self.record_op("launch_prepared");
-        self.launch(desc, completion)
-    }
-
-    pub fn release_launch(&mut self, lease_id: u64) -> Result<()> {
-        ensure!(
-            self.launch_leases.remove(&lease_id).is_some(),
-            "unknown or consumed launch lease {lease_id}"
-        );
-        self.record_op("release_launch");
-        Ok(())
-    }
-
-    pub fn launch(&mut self, desc: &PieLaunchDesc, completion: PieCompletion) -> Result<()> {
-        unsafe { validate_launch_desc(desc) }.map_err(|err| anyhow!(err))?;
-        ensure_abi(desc.abi_version)?;
-        self.record_op("launch");
         // Shape trace for tests that assert on launch geometry (e.g. the
         // prefix-cache trim). `per` carries PER-PROGRAM token counts: the
         // wait-all quorum co-batches concurrently running pipelines into one
@@ -873,9 +855,9 @@ impl DummyDriver {
         };
         self.record_op(&format!(
             "launch-shape tokens={} programs={} per={:?}",
-            desc.token_ids.len, desc.instance_ids.len, per_program
+            desc.token_ids.len, desc.roster_rows.len, per_program
         ));
-        let instance_ids = copy_u64_slice(desc.instance_ids, "launch.instance_ids")?;
+        let instance_ids = resolve_step_members(roster, desc)?;
         let terminal_cells = copy_terminal_cell_ptrs(desc.terminal_cells)?;
         let ticket_heads =
             copy_u64_slice(desc.channel_expected_head, "launch.channel_expected_head")?;
@@ -887,18 +869,10 @@ impl DummyDriver {
             !instance_ids.is_empty(),
             "launch requires at least one bound instance"
         );
-        ensure_completion(completion)?;
         validate_launch_shape(desc, instance_ids.len())?;
-        if self.reject_launches {
-            bail!("launch rejected by dummy test option");
-        }
-        if self.reject_launches_remaining != 0 {
-            self.reject_launches_remaining -= 1;
-            bail!("launch rejected by dummy test option");
-        }
         ensure_unique_launch_members(&instance_ids, &terminal_cells)?;
 
-        // Test probe: surface the accepted launch's forward geometry, on the
+        // Test probe: surface the accepted step's forward geometry, on the
         // launch path (a sleeping observer keeps this fire outstanding).
         if let Some(observer) = &self.launch_observer {
             let observation = LaunchObservation {
@@ -910,10 +884,10 @@ impl DummyDriver {
                     desc.kv_last_page_lens,
                     "launch.kv_last_page_lens",
                 )?,
-                kv_translation: copy_u32_slice(desc.kv_translation, "launch.kv_translation")?,
+                kv_translation: copy_u32_slice(frame.kv_translation, "frame.kv_translation")?,
                 kv_translation_indptr: copy_u32_slice(
-                    desc.kv_translation_indptr,
-                    "launch.kv_translation_indptr",
+                    frame.kv_translation_indptr,
+                    "frame.kv_translation_indptr",
                 )?,
             };
             (observer.0)(&observation);
@@ -931,17 +905,6 @@ impl DummyDriver {
             })
             .collect::<Result<Vec<_>>>()?;
         drop(state);
-
-        if self.retry_launches_remaining != 0 {
-            self.retry_launches_remaining -= 1;
-            let callback = self.prepare_callback(completion)?;
-            for (instance, terminal_cell) in instances.iter().zip(&terminal_cells) {
-                instance.inner.lock().unwrap().next_pacing_epoch += 1;
-                publish_terminal(*terminal_cell, PIE_TERMINAL_OUTCOME_RETRY);
-            }
-            self.publish_callback(callback, completion);
-            return Ok(());
-        }
 
         let mut prepared = Vec::with_capacity(instances.len());
         for (slot, instance) in instances.iter().enumerate() {
@@ -965,7 +928,6 @@ impl DummyDriver {
             });
         }
 
-        let callback = self.prepare_callback(completion)?;
         for instance in &prepared {
             let mut inner = instance.instance.inner.lock().unwrap();
             debug_assert_eq!(inner.next_pacing_epoch, instance.pacing_epoch);
@@ -985,11 +947,8 @@ impl DummyDriver {
             publish_terminal(instance.terminal_cell, result.outcome);
         }
         for result in &results {
-            for &(wait_id, epoch) in &result.notifications {
-                notify_runtime(&self.runtime, wait_id, epoch);
-            }
+            notifications.extend(result.notifications.iter().copied());
         }
-        self.publish_callback(callback, completion);
         Ok(())
     }
 
@@ -1874,7 +1833,7 @@ fn ensure_terminal_cell_pending(cell: *mut PieTerminalCell) -> Result<()> {
     Ok(())
 }
 
-fn validate_launch_shape(desc: &PieLaunchDesc, _instance_count: usize) -> Result<()> {
+fn validate_launch_shape(desc: &PieStepDesc, _instance_count: usize) -> Result<()> {
     let token_ids = copy_u32_slice(desc.token_ids, "launch.token_ids")?;
     let kv_page_indices = copy_u32_slice(desc.kv_page_indices, "launch.kv_page_indices")?;
     let kv_page_indptr = copy_u32_slice(desc.kv_page_indptr, "launch.kv_page_indptr")?;
@@ -2246,6 +2205,41 @@ fn unpack_bool(wire: &[u8], numel: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wrap a single-step frame around a batch: the v14 shape of the old
+    /// per-wave launch tests (roster = the batch, identity roster rows).
+    fn launch_single_step(
+        driver: &mut DummyDriver,
+        instance_ids: &[u64],
+        terminal_ptrs: &[*mut PieTerminalCell],
+        completion: PieCompletion,
+    ) -> Result<FrameAdmission> {
+        let roster_rows: Vec<u32> = (0..instance_ids.len() as u32).collect();
+        let step = PieStepDesc {
+            roster_rows: PieU32Slice {
+                ptr: roster_rows.as_ptr(),
+                len: roster_rows.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_ptrs.as_ptr(),
+                len: terminal_ptrs.len(),
+            },
+            ..PieStepDesc::default()
+        };
+        let frame = PieFrameDesc {
+            instance_ids: PieU64Slice {
+                ptr: instance_ids.as_ptr(),
+                len: instance_ids.len(),
+            },
+            steps: pie_driver_abi::PieStepDescSlice {
+                ptr: &step,
+                len: 1,
+            },
+            ..PieFrameDesc::default()
+        };
+        driver.launch(&frame, completion)
+    }
+
     use pie_driver_abi::{
         PIE_CHANNEL_EXTERN_EXPORT, PIE_CHANNEL_HOST_ROLE_NONE, PIE_TERMINAL_OUTCOME_PENDING,
         PieChannelValueDesc,
@@ -3024,24 +3018,15 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        driver
-            .launch(
-                &PieLaunchDesc {
-                    instance_ids: PieU64Slice {
-                        ptr: instance_ids.as_ptr(),
-                        len: instance_ids.len(),
-                    },
-                    terminal_cells: PieTerminalCellPtrSlice {
-                        ptr: terminal_ptrs.as_ptr(),
-                        len: terminal_ptrs.len(),
-                    },
-                    ..PieLaunchDesc::default()
-                },
+        launch_single_step(
+                &mut driver,
+                &instance_ids,
+                &terminal_ptrs,
                 PieCompletion {
                     wait_id: 401,
                     target_epoch: 7,
                     terminal_cell: std::ptr::null_mut(),
-                },
+                }
             )
             .unwrap();
         callbacks.wait_for_notification((401, 7));
@@ -3109,67 +3094,6 @@ mod tests {
     }
 
     #[test]
-    fn prepared_launch_lease_is_consumed_or_released_exactly_once() {
-        let (mut driver, callbacks) = driver_with_callbacks(0);
-        let binding = bind_program(
-            &mut driver,
-            private_container(0).encode(),
-            &[],
-            &[],
-            &[],
-            311,
-        );
-        let instance_ids = [binding.instance_id];
-        let mut terminal_cells = [pending_terminal_cell()];
-        let terminal_ptrs = terminal_cells
-            .each_mut()
-            .map(|cell| cell as *mut PieTerminalCell);
-        let desc = PieLaunchDesc {
-            instance_ids: PieU64Slice {
-                ptr: instance_ids.as_ptr(),
-                len: instance_ids.len(),
-            },
-            terminal_cells: PieTerminalCellPtrSlice {
-                ptr: terminal_ptrs.as_ptr(),
-                len: terminal_ptrs.len(),
-            },
-            ..PieLaunchDesc::default()
-        };
-
-        let released = driver.prepare_launch(&desc).unwrap();
-        assert_eq!(released.outcome, pie_driver_abi::PIE_LAUNCH_PREPARE_READY);
-        driver.release_launch(released.lease_id).unwrap();
-        assert!(driver.release_launch(released.lease_id).is_err());
-
-        let consumed = driver.prepare_launch(&desc).unwrap();
-        driver
-            .launch_prepared(
-                &desc,
-                consumed.lease_id,
-                PieCompletion {
-                    wait_id: 411,
-                    target_epoch: 1,
-                    terminal_cell: std::ptr::null_mut(),
-                },
-            )
-            .unwrap();
-        callbacks.wait_for_notification((411, 1));
-        assert!(
-            driver
-                .launch_prepared(
-                    &desc,
-                    consumed.lease_id,
-                    PieCompletion {
-                        wait_id: 412,
-                        target_epoch: 1,
-                        terminal_cell: std::ptr::null_mut(),
-                    },
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
     fn lone_entropy_output_publishes_scalar() {
         let (mut driver, callbacks) = driver_with_callbacks(0);
         let channels = [20u64, 21u64];
@@ -3196,24 +3120,15 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        driver
-            .launch(
-                &PieLaunchDesc {
-                    instance_ids: PieU64Slice {
-                        ptr: instance_ids.as_ptr(),
-                        len: instance_ids.len(),
-                    },
-                    terminal_cells: PieTerminalCellPtrSlice {
-                        ptr: terminal_ptrs.as_ptr(),
-                        len: terminal_ptrs.len(),
-                    },
-                    ..PieLaunchDesc::default()
-                },
+        launch_single_step(
+                &mut driver,
+                &instance_ids,
+                &terminal_ptrs,
                 PieCompletion {
                     wait_id: 421,
                     target_epoch: 3,
                     terminal_cell: std::ptr::null_mut(),
-                },
+                }
             )
             .unwrap();
         callbacks.wait_for_notification((421, 3));
@@ -3283,24 +3198,15 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        driver
-            .launch(
-                &PieLaunchDesc {
-                    instance_ids: PieU64Slice {
-                        ptr: instance_ids.as_ptr(),
-                        len: instance_ids.len(),
-                    },
-                    terminal_cells: PieTerminalCellPtrSlice {
-                        ptr: terminal_ptrs.as_ptr(),
-                        len: terminal_ptrs.len(),
-                    },
-                    ..PieLaunchDesc::default()
-                },
+        launch_single_step(
+                &mut driver,
+                &instance_ids,
+                &terminal_ptrs,
                 PieCompletion {
                     wait_id: 431,
                     target_epoch: 5,
                     terminal_cell: std::ptr::null_mut(),
-                },
+                }
             )
             .unwrap();
         callbacks.wait_for_notification((431, 5));
@@ -3430,24 +3336,15 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        driver
-            .launch(
-                &PieLaunchDesc {
-                    instance_ids: PieU64Slice {
-                        ptr: instance_ids.as_ptr(),
-                        len: instance_ids.len(),
-                    },
-                    terminal_cells: PieTerminalCellPtrSlice {
-                        ptr: terminal_ptrs.as_ptr(),
-                        len: terminal_ptrs.len(),
-                    },
-                    ..PieLaunchDesc::default()
-                },
+        launch_single_step(
+                &mut driver,
+                &instance_ids,
+                &terminal_ptrs,
                 PieCompletion {
                     wait_id: 501,
                     target_epoch: 11,
                     terminal_cell: std::ptr::null_mut(),
-                },
+                }
             )
             .unwrap();
         callbacks.wait_for_notification((501, 11));
@@ -3523,24 +3420,15 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        driver
-            .launch(
-                &PieLaunchDesc {
-                    instance_ids: PieU64Slice {
-                        ptr: instance_ids.as_ptr(),
-                        len: instance_ids.len(),
-                    },
-                    terminal_cells: PieTerminalCellPtrSlice {
-                        ptr: terminal_ptrs.as_ptr(),
-                        len: terminal_ptrs.len(),
-                    },
-                    ..PieLaunchDesc::default()
-                },
+        launch_single_step(
+                &mut driver,
+                &instance_ids,
+                &terminal_ptrs,
                 PieCompletion {
                     wait_id: 511,
                     target_epoch: 13,
                     terminal_cell: std::ptr::null_mut(),
-                },
+                }
             )
             .unwrap();
         callbacks.wait_for_notification((511, 13));
@@ -3589,24 +3477,15 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        driver
-            .launch(
-                &PieLaunchDesc {
-                    instance_ids: PieU64Slice {
-                        ptr: instance_ids.as_ptr(),
-                        len: instance_ids.len(),
-                    },
-                    terminal_cells: PieTerminalCellPtrSlice {
-                        ptr: terminal_ptrs.as_ptr(),
-                        len: terminal_ptrs.len(),
-                    },
-                    ..PieLaunchDesc::default()
-                },
+        launch_single_step(
+                &mut driver,
+                &instance_ids,
+                &terminal_ptrs,
                 PieCompletion {
                     wait_id: 451,
                     target_epoch: 9,
                     terminal_cell: std::ptr::null_mut(),
-                },
+                }
             )
             .unwrap();
         callbacks.wait_for_notification((451, 9));
@@ -3658,22 +3537,34 @@ mod tests {
             .map(|cell| cell as *mut PieTerminalCell);
         // token_ids without matching position_ids is a malformed descriptor.
         let tokens = [1u32];
+        let roster_rows = [0u32];
+        let step = PieStepDesc {
+            roster_rows: PieU32Slice {
+                ptr: roster_rows.as_ptr(),
+                len: roster_rows.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_ptrs.as_ptr(),
+                len: terminal_ptrs.len(),
+            },
+            token_ids: PieU32Slice {
+                ptr: tokens.as_ptr(),
+                len: tokens.len(),
+            },
+            ..PieStepDesc::default()
+        };
         let err = driver
             .launch(
-                &PieLaunchDesc {
+                &PieFrameDesc {
                     instance_ids: PieU64Slice {
                         ptr: instance_ids.as_ptr(),
                         len: instance_ids.len(),
                     },
-                    terminal_cells: PieTerminalCellPtrSlice {
-                        ptr: terminal_ptrs.as_ptr(),
-                        len: terminal_ptrs.len(),
+                    steps: pie_driver_abi::PieStepDescSlice {
+                        ptr: &step,
+                        len: 1,
                     },
-                    token_ids: PieU32Slice {
-                        ptr: tokens.as_ptr(),
-                        len: tokens.len(),
-                    },
-                    ..PieLaunchDesc::default()
+                    ..PieFrameDesc::default()
                 },
                 PieCompletion {
                     wait_id: 461,
@@ -3695,7 +3586,7 @@ mod tests {
         let qo_indptr = [0u32, 1, 2];
         let rs_slot_ids = [7u32, 9];
         let rs_slot_flags = [pie_driver_abi::PIE_RS_FLAG_RESET, 0];
-        let desc = PieLaunchDesc {
+        let desc = PieStepDesc {
             token_ids: PieU32Slice {
                 ptr: tokens.as_ptr(),
                 len: tokens.len(),
@@ -3712,13 +3603,13 @@ mod tests {
                 ptr: rs_slot_flags.as_ptr(),
                 len: rs_slot_flags.len(),
             },
-            ..PieLaunchDesc::default()
+            ..PieStepDesc::default()
         };
         validate_launch_shape(&desc, 1).unwrap();
 
         let one_slot = [7u32];
         let one_flag = [0u8];
-        let wrong_rows = PieLaunchDesc {
+        let wrong_rows = PieStepDesc {
             rs_slot_ids: PieU32Slice {
                 ptr: one_slot.as_ptr(),
                 len: one_slot.len(),
@@ -3768,24 +3659,15 @@ mod tests {
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
 
-        let err = driver
-            .launch(
-                &PieLaunchDesc {
-                    instance_ids: PieU64Slice {
-                        ptr: instance_ids.as_ptr(),
-                        len: instance_ids.len(),
-                    },
-                    terminal_cells: PieTerminalCellPtrSlice {
-                        ptr: terminal_ptrs.as_ptr(),
-                        len: terminal_ptrs.len(),
-                    },
-                    ..PieLaunchDesc::default()
-                },
+        let err = launch_single_step(
+                &mut driver,
+                &instance_ids,
+                &terminal_ptrs,
                 PieCompletion {
                     wait_id: 462,
                     target_epoch: 1,
                     terminal_cell: std::ptr::null_mut(),
-                },
+                }
             )
             .unwrap_err();
 
@@ -3832,24 +3714,15 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        driver
-            .launch(
-                &PieLaunchDesc {
-                    instance_ids: PieU64Slice {
-                        ptr: instance_ids.as_ptr(),
-                        len: instance_ids.len(),
-                    },
-                    terminal_cells: PieTerminalCellPtrSlice {
-                        ptr: terminal_ptrs.as_ptr(),
-                        len: terminal_ptrs.len(),
-                    },
-                    ..PieLaunchDesc::default()
-                },
+        launch_single_step(
+                &mut driver,
+                &instance_ids,
+                &terminal_ptrs,
                 PieCompletion {
                     wait_id: 471,
                     target_epoch: 1,
                     terminal_cell: std::ptr::null_mut(),
-                },
+                }
             )
             .unwrap();
         let started = Instant::now();
@@ -3891,24 +3764,15 @@ mod tests {
         let terminal_ptrs = terminal_cells
             .each_mut()
             .map(|cell| cell as *mut PieTerminalCell);
-        driver
-            .launch(
-                &PieLaunchDesc {
-                    instance_ids: PieU64Slice {
-                        ptr: instance_ids.as_ptr(),
-                        len: instance_ids.len(),
-                    },
-                    terminal_cells: PieTerminalCellPtrSlice {
-                        ptr: terminal_ptrs.as_ptr(),
-                        len: terminal_ptrs.len(),
-                    },
-                    ..PieLaunchDesc::default()
-                },
+        launch_single_step(
+                &mut driver,
+                &instance_ids,
+                &terminal_ptrs,
                 PieCompletion {
                     wait_id: 481,
                     target_epoch: 1,
                     terminal_cell: std::ptr::null_mut(),
-                },
+                }
             )
             .unwrap();
         drop(driver);

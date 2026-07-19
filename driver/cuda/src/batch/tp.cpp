@@ -305,7 +305,7 @@ void tp_cpu_gate_notify(const std::string& key) {
 // TP follower service loop
 // ============================================================================
 //
-// Symmetric counterpart of `handle_fire_batch` for ranks > 0:
+// Symmetric counterpart of the frame step pipeline for ranks > 0:
 //
 //   * Inputs arrive via NCCL broadcast from rank 0.
 //   * No sampling — only rank 0 owns the direct PTIR publish path.
@@ -745,7 +745,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     logit_rows,
                     pi.w_page.data(),
                     pi.w_off.data(),
-                    /*has_write_desc=*/true,
+                    has_write_desc,
                     structured_window_left);
                 engine.graph_cache->put(key, exec);
             }

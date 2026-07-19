@@ -77,6 +77,23 @@ pub fn keyed_seed(key: u32, counter: u32) -> u64 {
     splitmix64(((key as u64) << RNG_FORMULA.keyed_word_bits) | counter as u64)
 }
 
+/// The largest `f32` strictly below `1.0`.
+///
+/// `(bits + 0.5) / 2^24` is mathematically in `(0, 1)`, but for the single top
+/// mantissa value `bits = 2^24 - 1` the quotient is `1 - 2^-25`, which sits
+/// exactly halfway between `0x1.fffffep-1` and `1.0` and so rounds to **`1.0`
+/// exactly** in `f32`. That one draw in `2^24` breaks every consumer that
+/// assumes a half-open range: `gumbel = -log(-log(u))` evaluates to `+inf` at
+/// `u = 1`, and `+inf` unconditionally wins `argmax(logits + gumbel)`, so the
+/// sampler returns a uniformly random token. At `vocab = 262144` that is
+/// `262144 / 2^24 ≈ 1.6 %` of decode steps.
+pub const UNIFORM_MAX: f32 = 1.0 - f32::EPSILON / 2.0;
+
+/// `UNIFORM_MAX` as a decimal literal for the generated backends. The nearest
+/// `f32` to this text is exactly `UNIFORM_MAX`, so host and device agree bit
+/// for bit.
+const UNIFORM_MAX_LITERAL: &str = "0.99999994";
+
 #[inline]
 pub fn hash_uniform(seed_eff: u64, index: u32) -> f32 {
     let x = seed_eff.wrapping_add(
@@ -86,7 +103,8 @@ pub fn hash_uniform(seed_eff: u64, index: u32) -> f32 {
     );
     let bits = (splitmix64(x) >> RNG_FORMULA.uniform_mantissa_shift) as u32;
     let denominator = (1u32 << RNG_FORMULA.uniform_mantissa_bits) as f32;
-    (bits as f32 + RNG_FORMULA.uniform_midpoint) * (1.0 / denominator)
+    let raw = (bits as f32 + RNG_FORMULA.uniform_midpoint) * (1.0 / denominator);
+    if raw < UNIFORM_MAX { raw } else { UNIFORM_MAX }
 }
 
 enum CudaProjection {
@@ -106,6 +124,7 @@ fn render_cuda_functions(projection: CudaProjection) -> String {
         ),
     };
     let denominator = 1u64 << RNG_FORMULA.uniform_mantissa_bits;
+    let uniform_max = UNIFORM_MAX_LITERAL;
     writeln!(out, "{inline} {u64_ty} ptir_rng_splitmix64({u64_ty} x) {{").unwrap();
     for round in RNG_FORMULA.splitmix64_rounds {
         writeln!(out, "  x ^= x >> {};", round.xor_shift).unwrap();
@@ -139,7 +158,7 @@ fn render_cuda_functions(projection: CudaProjection) -> String {
     .unwrap();
     writeln!(
         out,
-        "{inline} float ptir_rng_hash_uniform(\n    {u64_ty} seed_eff, {u32_ty} index) {{\n  const {u64_ty} x = seed_eff +\n      0x{:016X}{u64_suffix} * (({u64_ty})index + {}{u64_suffix});\n  const {u32_ty} bits =\n      ({u32_ty})(ptir_rng_splitmix64(x) >> {});\n  return ((float)bits + {:.1}f) * (1.0f / {denominator}.0f);\n}}\n",
+        "{inline} float ptir_rng_hash_uniform(\n    {u64_ty} seed_eff, {u32_ty} index) {{\n  const {u64_ty} x = seed_eff +\n      0x{:016X}{u64_suffix} * (({u64_ty})index + {}{u64_suffix});\n  const {u32_ty} bits =\n      ({u32_ty})(ptir_rng_splitmix64(x) >> {});\n  const float raw = ((float)bits + {:.1}f) * (1.0f / {denominator}.0f);\n  /* clamp off the one draw in 2^24 that rounds to exactly 1.0f, which would\n     make gumbel = -log(-log(u)) evaluate to +inf and hijack every argmax */\n  return raw < {uniform_max}f ? raw : {uniform_max}f;\n}}\n",
         RNG_FORMULA.lane_stride,
         RNG_FORMULA.lane_index_bias,
         RNG_FORMULA.uniform_mantissa_shift,
@@ -213,9 +232,10 @@ inline ulong ptir_rng_splitmix64(ulong x) {\n",
     )
     .unwrap();
     let denominator = 1u64 << RNG_FORMULA.uniform_mantissa_bits;
+    let uniform_max = UNIFORM_MAX_LITERAL;
     writeln!(
         out,
-        "inline float ptir_rng_hash_uniform(ulong seed_eff, uint index) {{\n  const ulong x = seed_eff +\n      0x{:016X}ul * (ulong(index) + {}ul);\n  const uint bits = uint(ptir_rng_splitmix64(x) >> {});\n  return (float(bits) + {:.1}f) * (1.0f / {denominator}.0f);\n}}\n",
+        "inline float ptir_rng_hash_uniform(ulong seed_eff, uint index) {{\n  const ulong x = seed_eff +\n      0x{:016X}ul * (ulong(index) + {}ul);\n  const uint bits = uint(ptir_rng_splitmix64(x) >> {});\n  const float raw = (float(bits) + {:.1}f) * (1.0f / {denominator}.0f);\n  /* clamp off the one draw in 2^24 that rounds to exactly 1.0f */\n  return raw < {uniform_max}f ? raw : {uniform_max}f;\n}}\n",
         RNG_FORMULA.lane_stride,
         RNG_FORMULA.lane_index_bias,
         RNG_FORMULA.uniform_mantissa_shift,

@@ -1,0 +1,16 @@
+[package]
+name = "tail-free-sampling"
+version = "0.1.0"
+description = "Tail-free sampling — cut the tail where the sorted-probability curve flattens"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+z = {type = "float", optional = true, description = "Fraction of total curvature to retain, 0<z<=1 (default: 0.95)"}
+temperature = {type = "float", optional = true, description = "Temperature applied before truncation (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+k_max = {type = "int", optional = true, description = "Candidate-set bound for the curvature scan (default: 128)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}

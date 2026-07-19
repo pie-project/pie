@@ -1,0 +1,399 @@
+//! Classifier-free guidance for language models (Sanchez et al., 2306.17806).
+//!
+//! Two forward passes run the bound model over two independent KV states: the
+//! conditional stream sees the full prompt, the unconditional stream sees only
+//! the negative prompt (empty by default). The paper's Eqn 4 is applied to
+//! **log-probabilities**, not raw logits — the two streams have different
+//! partition functions, so subtracting raw logits would inject a meaningless
+//! per-stream constant:
+//!
+//! ```text
+//! log P_cfg(w) ∝ log P(w | uncond) + γ · [log P(w | cond) − log P(w | uncond)]
+//! ```
+//!
+//! and renormalised. γ = 1 collapses to plain conditional decoding, which the
+//! reported `guidance_shift` statistic must confirm exactly.
+//!
+//! ## Source
+//!
+//! Sanchez et al., *Stay on topic with Classifier-Free Guidance* —
+//! <https://arxiv.org/abs/2306.17806> (Eq. 7).
+//!
+//! Faithfulness: **Exact (equivalent form)** — the paper writes the rule over
+//! log-probabilities and this works in logits, which differ by the per-stream
+//! `logsumexp` constant. That constant is uniform over the vocabulary, so it
+//! shifts every entry of the blended vector by the same amount and cancels in
+//! the softmax. See
+//! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
+
+use inferlet::ptir::prelude::*;
+use inferlet::{Result, chat, model as wit_model};
+use serde::Deserialize;
+
+const PAGE_T: u32 = 16;
+
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default)]
+    negative_prompt: String,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_guidance")]
+    guidance: f32,
+}
+
+fn default_prompt() -> String {
+    "Explain why the sky appears blue.".into()
+}
+
+fn default_max_tokens() -> usize {
+    32
+}
+
+fn default_guidance() -> f32 {
+    1.5
+}
+
+/// Eqn 4 of 2306.17806 in the log-domain, plus the two diagnostics that prove
+/// the γ = 1 identity: `shift` is 1 when guidance moved the argmax, and `kl` is
+/// KL(P_cfg ‖ P_cond), which is exactly 0 at γ = 1.
+fn guided_pick(uncond_logits: impl AsTensor, gamma: f32) -> (Tensor, Tensor, Tensor) {
+    let cond = log_softmax(intrinsics::logits());
+    let uncond = log_softmax(uncond_logits);
+    let guided = log_softmax(add(&uncond, mul(sub(&cond, &uncond), gamma)));
+
+    let token = reduce_argmax(&guided);
+    let cond_token = reduce_argmax(&cond);
+    let shift = cast(ne(&token, &cond_token), dtype::i32);
+    let kl = reduce_sum(mul(exp(&guided), sub(&guided, &cond)));
+    (
+        reshape(cast(&token, dtype::i32), [1]),
+        reshape(shift, [1]),
+        reshape(kl, [1]),
+    )
+}
+
+#[inferlet::main]
+async fn main(input: Input) -> Result<String> {
+    if !input.guidance.is_finite() || input.guidance < 0.0 {
+        return Err("guidance must be finite and non-negative".into());
+    }
+    if input.max_tokens == 0 {
+        return Ok(String::new());
+    }
+
+    let max_tokens =
+        u32::try_from(input.max_tokens).map_err(|_| "max_tokens exceeds the u32 range")?;
+    let vocab = wit_model::output_vocab_size();
+    let gamma = input.guidance;
+    let stop_tokens = chat::stop_tokens();
+
+    let mut cond_prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
+    cond_prompt.extend(chat::cue());
+    if cond_prompt.is_empty() {
+        cond_prompt.push(0);
+    }
+    // The unconditional stream drops the conditioning text. With no negative
+    // prompt it keeps only the chat scaffolding, which is the paper's
+    // "unconditional" ∅ context for an instruction-tuned model.
+    let mut uncond_prompt = chat::system_user("You are a helpful assistant.", &input.negative_prompt);
+    uncond_prompt.extend(chat::cue());
+    if uncond_prompt.is_empty() {
+        uncond_prompt.push(0);
+    }
+
+    let nc = u32::try_from(cond_prompt.len()).map_err(|_| "prompt is too long")?;
+    let nu = u32::try_from(uncond_prompt.len()).map_err(|_| "negative prompt is too long")?;
+    let cond_pages = (nc + max_tokens + 1).div_ceil(PAGE_T);
+    let uncond_pages = (nu + max_tokens + 1).div_ceil(PAGE_T);
+
+    // ---- unconditional stream -------------------------------------------
+    let uncond_ws = WorkingSet::new();
+    uncond_ws
+        .reserve(uncond_pages)
+        .map_err(|error| format!("reserve unconditional KV: {error}"))?;
+    let uncond_prompt_i32 = uncond_prompt
+        .iter()
+        .map(|&token| token as i32)
+        .collect::<Vec<_>>();
+
+    let u_prompt_ch = Channel::from(uncond_prompt_i32).named("uncond_prompt");
+    let u_pre_indptr = Channel::from(vec![0u32, nu]).named("uncond_prefill_embed_indptr");
+    let u_pre_pos = Channel::from((0..nu).collect::<Vec<_>>()).named("uncond_prefill_positions");
+    let u_pre_pages = Channel::from((0..uncond_pages).collect::<Vec<_>>());
+    let u_pre_page_indptr = Channel::from(vec![0u32, nu.div_ceil(PAGE_T)]);
+    let u_pre_slot = Channel::from((0..nu).map(|p| p / PAGE_T).collect::<Vec<_>>());
+    let u_pre_off = Channel::from((0..nu).map(|p| p % PAGE_T).collect::<Vec<_>>());
+    let u_pre_klen = Channel::from(vec![nu]);
+    let u_pre_out = Channel::new([vocab], dtype::f32).named("uncond_prefill_logits");
+
+    let uncond_prefill = ForwardPass::new();
+    uncond_prefill.embed(&u_prompt_ch, &u_pre_indptr)?;
+    uncond_prefill.attention(
+        &uncond_ws,
+        ..,
+        ..,
+        &u_pre_klen,
+        &u_pre_pages,
+        &u_pre_page_indptr,
+        &u_pre_slot,
+        &u_pre_off,
+        &u_pre_pos,
+        None,
+    )?;
+    uncond_prefill.epilogue(move || {
+        u_pre_out.put(intrinsics::logits());
+    });
+
+    // One pipeline for the whole inferlet: a KV WorkingSet claims the first
+    // pipeline it fires on and never migrates, so prefill and decode for both
+    // streams must share a single scope.
+    let pipeline = Pipeline::new();
+    uncond_prefill
+        .submit(&pipeline)
+        .map_err(|error| format!("uncond prefill: {error}"))?;
+    let first_uncond_logits = u_pre_out
+        .take()
+        .get::<f32>()
+        .await
+        .map_err(|error| format!("read uncond prefill logits: {error}"))?;
+
+    // ---- conditional stream ---------------------------------------------
+    let cond_ws = WorkingSet::new();
+    cond_ws
+        .reserve(cond_pages)
+        .map_err(|error| format!("reserve conditional KV: {error}"))?;
+    let cond_prompt_i32 = cond_prompt
+        .iter()
+        .map(|&token| token as i32)
+        .collect::<Vec<_>>();
+
+    let c_prompt_ch = Channel::from(cond_prompt_i32).named("cond_prompt");
+    let c_pre_indptr = Channel::from(vec![0u32, nc]).named("cond_prefill_embed_indptr");
+    let c_pre_pos = Channel::from((0..nc).collect::<Vec<_>>()).named("cond_prefill_positions");
+    let c_pre_pages = Channel::from((0..cond_pages).collect::<Vec<_>>());
+    let c_pre_page_indptr = Channel::from(vec![0u32, nc.div_ceil(PAGE_T)]);
+    let c_pre_slot = Channel::from((0..nc).map(|p| p / PAGE_T).collect::<Vec<_>>());
+    let c_pre_off = Channel::from((0..nc).map(|p| p % PAGE_T).collect::<Vec<_>>());
+    let c_pre_klen = Channel::from(vec![nc]);
+    let c_pre_uncond = Channel::new([vocab], dtype::f32).named("cond_prefill_uncond");
+    let first_out = Channel::new([1], dtype::i32).named("first_token");
+    let first_shift = Channel::new([1], dtype::i32).named("first_shift");
+    let first_kl = Channel::new([1], dtype::f32).named("first_kl");
+
+    let cond_prefill = ForwardPass::new();
+    cond_prefill.embed(&c_prompt_ch, &c_pre_indptr)?;
+    cond_prefill.attention(
+        &cond_ws,
+        ..,
+        ..,
+        &c_pre_klen,
+        &c_pre_pages,
+        &c_pre_page_indptr,
+        &c_pre_slot,
+        &c_pre_off,
+        &c_pre_pos,
+        None,
+    )?;
+    cond_prefill.epilogue(move || {
+        let (token, shift, kl) = guided_pick(c_pre_uncond.take(), gamma);
+        first_out.put(&token);
+        first_shift.put(&shift);
+        first_kl.put(&kl);
+    });
+
+    c_pre_uncond.put(first_uncond_logits);
+    cond_prefill
+        .submit(&pipeline)
+        .map_err(|error| format!("cond prefill: {error}"))?;
+    let first = read_i32(&first_out).await? as u32;
+    let mut shifts = read_i32(&first_shift).await? as u64;
+    let mut kl_total = read_f32(&first_kl).await? as f64;
+    let mut scored = 1u64;
+
+    let mut generated = Vec::with_capacity(input.max_tokens);
+    if !stop_tokens.contains(&first) {
+        generated.push(first);
+    }
+    if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
+        pipeline.close();
+        return report(&generated, gamma, shifts, scored, kl_total);
+    }
+
+    // ---- decode loop: uncond runs one step ahead, cond consumes it -------
+    let u_token = Channel::new([1], dtype::i32).named("uncond_token");
+    let u_embed_indptr = Channel::from(vec![0u32, 1]).named("uncond_embed_indptr");
+    let u_pos = Channel::from(vec![nu]).named("uncond_position");
+    let u_klen = Channel::from(vec![nu + 1]).named("uncond_kv_len");
+    let u_pages = Channel::from((0..uncond_pages).collect::<Vec<_>>()).named("uncond_pages");
+    let u_page_indptr =
+        Channel::from(vec![0u32, (nu + 1).div_ceil(PAGE_T)]).named("uncond_page_indptr");
+    let u_slot = Channel::from(vec![nu / PAGE_T]).named("uncond_write_slot");
+    let u_off = Channel::from(vec![nu % PAGE_T]).named("uncond_write_offset");
+    let u_logits_out = Channel::new([vocab], dtype::f32)
+        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .named("uncond_logits");
+
+    let uncond_decode = ForwardPass::new();
+    uncond_decode.embed(&u_token, &u_embed_indptr)?;
+    uncond_decode.attention(
+        &uncond_ws,
+        ..,
+        (nu / uncond_ws.page_size())..,
+        &u_klen,
+        &u_pages,
+        &u_page_indptr,
+        &u_slot,
+        &u_off,
+        &u_pos,
+        None,
+    )?;
+    uncond_decode.epilogue(move || {
+        let length = u_klen.take().tensor();
+        let next_length = add(&length, 1u32);
+        let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+
+        u_logits_out.put(intrinsics::logits());
+        u_klen.put(&next_length);
+        u_pos.put(&length);
+        u_slot.put(div(&length, PAGE_T));
+        u_off.put(rem(&length, PAGE_T));
+        u_page_indptr.take();
+        u_page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+    });
+
+    let c_token = Channel::from(vec![first as i32]).named("cond_token");
+    let c_embed_indptr = Channel::from(vec![0u32, 1]).named("cond_embed_indptr");
+    let c_pos = Channel::from(vec![nc]).named("cond_position");
+    let c_klen = Channel::from(vec![nc + 1]).named("cond_kv_len");
+    let c_pages = Channel::from((0..cond_pages).collect::<Vec<_>>()).named("cond_pages");
+    let c_page_indptr =
+        Channel::from(vec![0u32, (nc + 1).div_ceil(PAGE_T)]).named("cond_page_indptr");
+    let c_slot = Channel::from(vec![nc / PAGE_T]).named("cond_write_slot");
+    let c_off = Channel::from(vec![nc % PAGE_T]).named("cond_write_offset");
+    let c_uncond = Channel::writer([vocab], dtype::f32).named("cond_uncond_logits");
+    let c_token_out = Channel::new([1], dtype::i32)
+        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .named("cond_token_out");
+    let c_shift_out = Channel::new([1], dtype::i32)
+        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .named("cond_shift_out");
+    let c_kl_out = Channel::new([1], dtype::f32)
+        .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
+        .named("cond_kl_out");
+
+    let cond_decode = ForwardPass::new();
+    cond_decode.embed(&c_token, &c_embed_indptr)?;
+    cond_decode.attention(
+        &cond_ws,
+        ..,
+        (nc / cond_ws.page_size())..,
+        &c_klen,
+        &c_pages,
+        &c_page_indptr,
+        &c_slot,
+        &c_off,
+        &c_pos,
+        None,
+    )?;
+    cond_decode.epilogue(move || {
+        let length = c_klen.take().tensor();
+        let (token, shift, kl) = guided_pick(c_uncond.take(), gamma);
+        let next_length = add(&length, 1u32);
+        let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+
+        c_token.put(&token);
+        c_klen.put(&next_length);
+        c_pos.put(&length);
+        c_slot.put(div(&length, PAGE_T));
+        c_off.put(rem(&length, PAGE_T));
+        c_page_indptr.take();
+        c_page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        c_token_out.put(&token);
+        c_shift_out.put(&shift);
+        c_kl_out.put(&kl);
+    });
+
+    let budget = input.max_tokens.saturating_sub(generated.len());
+    // Strictly sequential: the unconditional stream must see the token that the
+    // guided distribution actually emitted, so its input is only known after the
+    // conditional fire lands. No run-ahead is possible without speculating.
+    let mut previous = first;
+    for _ in 0..budget {
+        u_token.put(vec![previous as i32]);
+        uncond_decode
+            .submit(&pipeline)
+            .map_err(|error| format!("uncond decode: {error}"))?;
+        let uncond_logits = u_logits_out
+            .take()
+            .get::<f32>()
+            .await
+            .map_err(|error| format!("read uncond logits: {error}"))?;
+
+        c_uncond.put(uncond_logits);
+        cond_decode
+            .submit(&pipeline)
+            .map_err(|error| format!("cond decode: {error}"))?;
+        let token = read_i32(&c_token_out).await? as u32;
+        shifts += read_i32(&c_shift_out).await? as u64;
+        kl_total += read_f32(&c_kl_out).await? as f64;
+        scored += 1;
+
+        if stop_tokens.contains(&token) {
+            break;
+        }
+        generated.push(token);
+        previous = token;
+    }
+    pipeline.close();
+
+    report(&generated, gamma, shifts, scored, kl_total)
+}
+
+fn report(
+    generated: &[u32],
+    gamma: f32,
+    shifts: u64,
+    scored: u64,
+    kl_total: f64,
+) -> Result<String> {
+    let text = wit_model::decode(generated)?;
+    let mean_kl = if scored == 0 {
+        0.0
+    } else {
+        kl_total / scored as f64
+    };
+    let identity = if (gamma - 1.0).abs() < 1e-6 && (shifts > 0 || mean_kl > 1e-3) {
+        " IDENTITY-VIOLATION"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{text}\n\n[cfg] guidance={gamma:.2} steps={scored} guidance_shift={:.3} mean_kl={mean_kl:.4}{identity}",
+        shifts as f64 / scored.max(1) as f64
+    ))
+}
+
+async fn read_i32(channel: &Channel) -> Result<i32> {
+    channel
+        .take()
+        .get::<i32>()
+        .await
+        .map_err(|error| format!("read i32 channel: {error}"))?
+        .first()
+        .copied()
+        .ok_or_else(|| "empty i32 channel".into())
+}
+
+async fn read_f32(channel: &Channel) -> Result<f32> {
+    channel
+        .take()
+        .get::<f32>()
+        .await
+        .map_err(|error| format!("read f32 channel: {error}"))?
+        .first()
+        .copied()
+        .ok_or_else(|| "empty f32 channel".into())
+}

@@ -38,6 +38,20 @@ interface model {
     // Tokens per KV page for the bound model/driver.
     kv-page-size: func() -> u32;
 
+    // Waves per frame (k) for this deployment — a static constant fixed at
+    // engine start, exactly like kv-page-size. `forward.submit` takes exactly
+    // this many ordered slots; slot i executes in wave i. Guests must be
+    // output-correct for any k: it decides submission granularity and
+    // resource sizing (host-reader channel capacity >= 2k - 1), never
+    // token-level behavior. Never renegotiated per frame and never adapted
+    // from runtime timing.
+    frame-size: func() -> u32;
+
+    // Max embed tokens in a single pass (C) — the prefill chunk budget.
+    // Guests split a prompt of L tokens into ceil(L / C) chunk passes;
+    // chunking is guest-side, against this static constant.
+    max-embed-length: func() -> u32;
+
     // ── Working-set / arena capabilities (global, over the bound model) ──
     // Memory-shaping parameters of the bound model's driver, so an inferlet
     // can size working sets and validate fold lengths before allocating.
@@ -49,8 +63,8 @@ interface model {
     // Tokens per buffered RS page. 0 if the model has no recurrent state.
     rs-buffer-page-size: func() -> u32;
 
-    // Fold granularity in tokens: `forward-pass.fold-buffered(n)` requires `n`
-    // to be a positive multiple of this value. 1 (or 0) means unconstrained;
+    // Fold granularity in tokens: an RS fold of `n` tokens requires `n` to
+    // be a positive multiple of this value. 1 (or 0) means unconstrained;
     // 0 also implies the model has no recurrent state. (Token-causal RS models
     // — Qwen3.5 GDN, Nemotron-H Mamba2 — report 1.)
     rs-fold-granularity: func() -> u32;

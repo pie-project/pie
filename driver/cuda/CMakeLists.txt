@@ -132,6 +132,38 @@ if(EXISTS "${_FI_PATCH_FILE}" AND NOT EXISTS "${_FI_PATCH_SENTINEL}")
   message(STATUS "Patched FlashInfer narrowing conversion in ${_FI_PATCH_FILE}")
 endif()
 
+# FlashInfer's `fastdiv.cuh` is a thin wrapper over `cuda::fast_mod_div`, which
+# CCCL only grew in 3.1. A CUDA toolkit that ships an older CCCL cannot compile
+# any FlashInfer attention kernel at all -- CUDA 13.0 ships CCCL 3.0, so the
+# driver fails to build against the current default toolkit.
+#
+# FlashInfer vendors the CCCL it was developed against, so prefer that over the
+# toolkit's when the toolkit's is too old. All three components are taken
+# together rather than just libcudacxx, so CUB and Thrust cannot end up a
+# different version from the `cuda::` headers they are built on.
+set(_PIE_FI_CCCL "${flashinfer_SOURCE_DIR}/3rdparty/cccl")
+set(_PIE_CCCL_HAS_FAST_MOD_DIV FALSE)
+foreach(_cccl_inc IN LISTS PIE_CCCL_INCLUDE_DIRS CUDAToolkit_INCLUDE_DIRS)
+  if(EXISTS "${_cccl_inc}/cuda/__cmath/fast_modulo_division.h")
+    set(_PIE_CCCL_HAS_FAST_MOD_DIV TRUE)
+  endif()
+endforeach()
+if(NOT _PIE_CCCL_HAS_FAST_MOD_DIV)
+  if(NOT EXISTS "${_PIE_FI_CCCL}/libcudacxx/include/cuda/__cmath/fast_modulo_division.h")
+    message(FATAL_ERROR
+      "The CUDA toolkit's CCCL predates cuda::fast_mod_div and FlashInfer's "
+      "vendored CCCL is missing from ${_PIE_FI_CCCL}; FlashInfer's fastdiv.cuh "
+      "cannot compile. Install a toolkit with CCCL 3.1 or newer.")
+  endif()
+  list(PREPEND PIE_CCCL_INCLUDE_DIRS
+    "${_PIE_FI_CCCL}/libcudacxx/include"
+    "${_PIE_FI_CCCL}/cub"
+    "${_PIE_FI_CCCL}/thrust")
+  message(STATUS
+    "CUDA toolkit CCCL lacks cuda::fast_mod_div; using FlashInfer's vendored "
+    "CCCL at ${_PIE_FI_CCCL}")
+endif()
+
 cpmaddpackage(URI "gh:marzer/tomlplusplus@3.4.0")
 cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
@@ -315,11 +347,11 @@ add_library(pie_driver_cuda_lib STATIC
   src/distributed.cpp
   # batch/ -- one submitted batch -> device work
   src/batch/brle.cpp
-  src/batch/compose.cpp
+  src/batch/frame.cpp
   src/batch/forward.cpp
   src/batch/persistent_inputs.cpp
   src/batch/tp.cpp
-  src/batch/workspace.cpp
+  src/batch/workspace.cu
   # pipeline/ -- guest programs (PTIR dispatch, tier0, frame carrier)
   src/pipeline/dispatch.cu
   src/pipeline/frame_carrier.cpp

@@ -376,6 +376,10 @@ enum SubmissionCompletionKind {
     ReadyOk,
     ReadyErr(String),
     Pending(Arc<PendingSubmissionCompletion>),
+    /// Settles when EVERY part settles; the first error wins. Used by the
+    /// remote edge adapter to fold a frame's per-step RPC completions into
+    /// the frame's single completion.
+    All(Arc<Vec<SubmissionCompletion>>),
 }
 
 #[derive(Clone)]
@@ -405,11 +409,24 @@ impl SubmissionCompletion {
         }
     }
 
+    /// A completion that settles when every part settles (first error wins).
+    pub fn all(parts: Vec<SubmissionCompletion>) -> Self {
+        match parts.len() {
+            0 => Self::ready(),
+            1 => parts.into_iter().next().expect("one part"),
+            _ => Self {
+                kind: SubmissionCompletionKind::All(Arc::new(parts)),
+            },
+        }
+    }
+
     pub fn wait_id(&self) -> u64 {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.slot,
-            SubmissionCompletionKind::ReadyOk | SubmissionCompletionKind::ReadyErr(_) => {
-                panic!("ready submission completions do not expose a wait id")
+            SubmissionCompletionKind::ReadyOk
+            | SubmissionCompletionKind::ReadyErr(_)
+            | SubmissionCompletionKind::All(_) => {
+                panic!("only pending submission completions expose a wait id")
             }
         }
     }
@@ -417,8 +434,10 @@ impl SubmissionCompletion {
     pub fn target_epoch(&self) -> u64 {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.target_epoch,
-            SubmissionCompletionKind::ReadyOk | SubmissionCompletionKind::ReadyErr(_) => {
-                panic!("ready submission completions do not expose a target epoch")
+            SubmissionCompletionKind::ReadyOk
+            | SubmissionCompletionKind::ReadyErr(_)
+            | SubmissionCompletionKind::All(_) => {
+                panic!("only pending submission completions expose a target epoch")
             }
         }
     }
@@ -426,13 +445,24 @@ impl SubmissionCompletion {
     pub(crate) fn terminal_cell_ptr(&self) -> Option<*mut PieTerminalCell> {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.terminal_cell_ptr(),
-            SubmissionCompletionKind::ReadyOk | SubmissionCompletionKind::ReadyErr(_) => None,
+            SubmissionCompletionKind::ReadyOk
+            | SubmissionCompletionKind::ReadyErr(_)
+            | SubmissionCompletionKind::All(_) => None,
         }
     }
 
     pub fn close(&self, message: impl Into<String>) {
-        if let SubmissionCompletionKind::Pending(pending) = &self.kind {
-            pending.state.close(pending.broker.table, message);
+        match &self.kind {
+            SubmissionCompletionKind::Pending(pending) => {
+                pending.state.close(pending.broker.table, message);
+            }
+            SubmissionCompletionKind::All(parts) => {
+                let message = message.into();
+                for part in parts.iter() {
+                    part.close(message.clone());
+                }
+            }
+            SubmissionCompletionKind::ReadyOk | SubmissionCompletionKind::ReadyErr(_) => {}
         }
     }
 
@@ -446,6 +476,17 @@ impl SubmissionCompletion {
         match &self.kind {
             SubmissionCompletionKind::ReadyOk => Some(Ok(())),
             SubmissionCompletionKind::ReadyErr(message) => Some(Err(anyhow!(message.clone()))),
+            SubmissionCompletionKind::All(parts) => {
+                let mut first_error = None;
+                for part in parts.iter() {
+                    match part.check() {
+                        None => return None,
+                        Some(Err(error)) if first_error.is_none() => first_error = Some(error),
+                        Some(_) => {}
+                    }
+                }
+                Some(first_error.map_or(Ok(()), Err))
+            }
             SubmissionCompletionKind::Pending(pending) => {
                 if pending.state.closed.load(Ordering::Acquire) {
                     return Some(pending.state.close_error());
@@ -504,6 +545,27 @@ impl std::future::Future for SubmissionCompletion {
             SubmissionCompletionKind::ReadyOk => Poll::Ready(Ok(())),
             SubmissionCompletionKind::ReadyErr(message) => {
                 Poll::Ready(Err(anyhow!(message.clone())))
+            }
+            SubmissionCompletionKind::All(parts) => {
+                // Poll every unsettled part (clones share the settled state;
+                // polling registers this task's waker on each pending slot).
+                let mut first_error = None;
+                let mut pending = false;
+                for part in parts.iter() {
+                    let mut part = part.clone();
+                    match std::pin::Pin::new(&mut part).poll(cx) {
+                        Poll::Pending => pending = true,
+                        Poll::Ready(Err(error)) if first_error.is_none() => {
+                            first_error = Some(error);
+                        }
+                        Poll::Ready(_) => {}
+                    }
+                }
+                if pending {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(first_error.map_or(Ok(()), Err))
+                }
             }
             SubmissionCompletionKind::Pending(pending) => {
                 let slot = pending.state.slot;

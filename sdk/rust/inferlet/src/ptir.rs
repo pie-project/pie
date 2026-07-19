@@ -42,12 +42,13 @@ pub use ptir_dsl::intrinsics;
 // `use inferlet::ptir::prelude::*;` (mirrors the old `ptir::prelude`).
 pub use ptir_dsl::DType as Dtype;
 pub use ptir_dsl::{
-    add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
+    abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
     entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, iota, l2norm,
     le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem, min_elem, mul, ne, neg,
-    not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, reduce_argmax, reduce_max,
+    not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, recip, reduce_argmax, reduce_max,
     reduce_min, reduce_sum, rem, reshape, rng, row_membership, scalar_gather, scatter_add,
-    scatter_set, select, sink_window_mask, sliding_window_mask, softmax, sub, top_k, transpose,
+    scatter_set, select, sign, sink_window_mask, sliding_window_mask, softmax, sort_desc, sub,
+    top_k, transpose,
 };
 
 // ---------------------------------------------------------------------------
@@ -875,11 +876,13 @@ impl ForwardPass {
         }
     }
 
-    /// Enqueue this pass run-ahead. First submit traces and attaches the
-    /// canonical program; attachment and bind errors surface here.
+    /// Enqueue this pass as a SINGLE-SLOT FRAME on `on` (slot 0; the other
+    /// k−1 slots are no-ops). At the default deployment (`frame_size() == 1`)
+    /// this is exactly the classic per-pass run-ahead submit. At k > 1 it
+    /// costs one whole frame per pass — k times fewer tokens per boundary —
+    /// so hot loops should fill all k slots via [`submit_frame`].
     pub fn submit(&self, on: &Pipeline) -> Result<(), String> {
-        self.attach_program()?;
-        self.wit.submit(&on.wit)
+        submit_frame(on, &[Some(self)])
     }
 
     fn attach_program(&self) -> Result<(), String> {
@@ -942,6 +945,54 @@ impl Default for ForwardPass {
     }
 }
 
+/// Waves per frame (k) for this deployment — the static constant
+/// `forward.submit` sizes its slot list to (cached; fixed at engine start,
+/// exactly like the KV page size). Guests must be output-correct for any k.
+pub fn frame_size() -> usize {
+    thread_local! {
+        static FRAME_SIZE: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
+    }
+    FRAME_SIZE.with(|k| *k.get_or_init(|| crate::model::frame_size().max(1) as usize))
+}
+
+/// Max embed tokens in a single pass (C) — the guest-side prefill chunk
+/// budget (cached). Split a prompt of L tokens into `ceil(L / C)` chunks.
+pub fn max_embed_length() -> usize {
+    thread_local! {
+        static MAX_EMBED: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
+    }
+    MAX_EMBED.with(|c| *c.get_or_init(|| crate::model::max_embed_length().max(1) as usize))
+}
+
+/// Submit ONE FRAME on `on`: up to `frame_size()` ordered slots, slot i
+/// executing in wave i; missing trailing slots are padded with no-ops. The
+/// same pass may repeat across slots (a plain decode frame is the same pass
+/// in every slot) and slots may be heterogeneous (prefill chunks first, then
+/// decode). First submit of a pass traces and attaches its program;
+/// attachment, bind, and frame-validation errors surface here.
+pub fn submit_frame(on: &Pipeline, slots: &[Option<&ForwardPass>]) -> Result<(), String> {
+    let k = frame_size();
+    if slots.len() > k {
+        return Err(format!(
+            "frame holds {} slot(s); model.frame-size() is {k}",
+            slots.len()
+        ));
+    }
+    for pass in slots.iter().flatten() {
+        pass.attach_program()?;
+    }
+    let wits: Vec<Option<Rc<wit::ForwardPass>>> = slots
+        .iter()
+        .map(|slot| slot.map(|pass| pass.wit.clone()))
+        .collect();
+    let mut borrows: Vec<Option<&wit::ForwardPass>> = wits
+        .iter()
+        .map(|slot| slot.as_deref())
+        .collect();
+    borrows.resize(k, None);
+    wit::submit(&on.wit, &borrows)
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
@@ -997,18 +1048,18 @@ impl Default for Pipeline {
 pub mod prelude {
     pub use super::{
         Channel, DEFAULT_RUNAHEAD_DEPTH, ForwardPass, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD,
-        WorkingSet, pad_tokens, unpad_tokens,
+        WorkingSet, frame_size, max_embed_length, pad_tokens, submit_frame, unpad_tokens,
     };
     pub use ptir_dsl::dtype;
     pub use ptir_dsl::intrinsics;
     pub use ptir_dsl::value::{
-        AsTensor, Tensor, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div,
-        entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max,
-        iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem,
-        min_elem, mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le,
-        reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng, row_membership,
-        scalar_gather, scatter_add, scatter_set, select, sink_window_mask, sliding_window_mask,
-        softmax, sub, top_k, transpose,
+        AsTensor, Tensor, abs, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum,
+        div, entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel,
+        gumbel_max, iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul,
+        max_elem, min_elem, mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge,
+        rank_le, recip, reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng,
+        row_membership, scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
+        sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
     };
     pub use ptir_dsl::{DType, Stage};
 }

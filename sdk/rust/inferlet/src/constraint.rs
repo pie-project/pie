@@ -20,7 +20,7 @@ use crate::pie::inferlet::grammar::Matcher;
 /// compose by word-wise bitwise-AND of their masks.
 pub trait Constrain: Send {
     /// Advance internal state with the tokens accepted last step.
-    fn advance(&mut self, accepted: &[u32]);
+    fn advance(&mut self, accepted: &[u32]) -> Result<()>;
 
     /// The packed allowed-token bitmask for the next position: a
     /// `[ceil(vocab/32)]` u32 array where bit `j` is 1 iff token `j` is
@@ -155,17 +155,44 @@ impl GrammarConstraint {
     pub fn is_terminated(&self) -> bool {
         self.matcher.is_terminated()
     }
+
+    /// Split off an independent constraint positioned exactly here.
+    ///
+    /// Branching search needs one grammar state per live branch. Beam search
+    /// forks a constraint per beam when it expands; speculative decoding forks
+    /// one for the draft run so the verified state is not disturbed. The two
+    /// constraints share the compiled grammar but no mutable state.
+    pub fn fork(&self) -> Self {
+        Self::new(self.matcher.fork())
+    }
+
+    /// Undo the last `num_tokens` accepted tokens.
+    ///
+    /// The reject path of speculative decoding: advance the constraint over
+    /// the whole draft, then give back the tokens the verifier refused.
+    /// Values above [`rollback_capacity`](Self::rollback_capacity) undo as
+    /// much history as is retained.
+    pub fn rollback(&mut self, num_tokens: u32) {
+        self.matcher.rollback(num_tokens);
+    }
+
+    /// How many accepted tokens [`rollback`](Self::rollback) can still undo.
+    pub fn rollback_capacity(&self) -> u32 {
+        self.matcher.rollback_capacity()
+    }
 }
 
 impl Constrain for GrammarConstraint {
-    fn advance(&mut self, accepted: &[u32]) {
-        if !accepted.is_empty() {
-            let _ = self.matcher.accept_tokens(accepted);
+    fn advance(&mut self, accepted: &[u32]) -> Result<()> {
+        if accepted.is_empty() {
+            return Ok(());
         }
+        self.matcher
+            .accept_tokens(accepted)
+            .map_err(|error| format!("grammar rejected accepted tokens: {error}"))
     }
 
     fn mask(&self) -> Vec<u32> {
         self.matcher.mask()
     }
 }
-

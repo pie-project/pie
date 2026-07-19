@@ -16,6 +16,7 @@
 
 #include <cuda_runtime.h>
 
+#include "runahead.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
@@ -53,10 +54,20 @@ private:
         bool upload_pending = false;
     };
 
-    static constexpr std::size_t kPlanStagingSlots = 2;
+    void ensure_plan_slot(PlanStaging& slot);
+
+    // Single-sourced from runahead.hpp: one slot is claimed per STEP
+    // (`begin_plan_update`), and a slot is reusable only after its recorded
+    // upload event retires, so a pool shallower than the in-flight STEP
+    // count blocks every submit in cudaEventSynchronize for ~a full GPU
+    // step. Slot 0 is pinned at allocate() (some ops read
+    // `page_locked_int()` without ever rotating); the rest pin lazily on
+    // first rotation so non-rotating workspaces don't hold 13 slots.
+    static constexpr std::size_t kPlanStagingSlots = kUploadStagingDepth;
 
     DeviceTensor float_buf_;       // device
     DeviceTensor int_buf_;         // device
+    std::size_t staging_bytes_ = 0;
     std::array<PlanStaging, kPlanStagingSlots> plan_staging_{};
     std::size_t active_plan_slot_ = 0;
     std::size_t next_plan_slot_ = 0;

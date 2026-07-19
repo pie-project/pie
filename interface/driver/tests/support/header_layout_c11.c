@@ -14,7 +14,7 @@
 typedef PieDriver *(*pie_create_fn)(const PieDriverCreateDesc *, PieDriverCaps *);
 typedef int32_t (*pie_register_program_fn)(PieDriver *, const PieProgramDesc *, uint64_t *);
 typedef int32_t (*pie_bind_instance_fn)(PieDriver *, const PieInstanceDesc *, PieInstanceBinding *);
-typedef int32_t (*pie_launch_fn)(PieDriver *, const PieLaunchDesc *, PieCompletion);
+typedef int32_t (*pie_launch_fn)(PieDriver *, const PieFrameDesc *, PieCompletion);
 typedef int32_t (*pie_copy_kv_fn)(PieDriver *, const PieKvCopyDesc *, PieCompletion);
 typedef int32_t (*pie_copy_state_fn)(PieDriver *, const PieStateCopyDesc *, PieCompletion);
 typedef int32_t (*pie_resize_pool_fn)(PieDriver *, const PiePoolResizeDesc *, PieCompletion);

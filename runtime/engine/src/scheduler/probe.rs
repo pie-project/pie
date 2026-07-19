@@ -43,7 +43,7 @@
 //! ├── escape_fires           count of F2 idle-escape fires (ready subset fired on device-idle+empty-queue)
 //! ├── cold_hold_us           time spent in the F3 cold-hold window (nothing in flight)
 //! ├── cold_hold_fires        count of fires that went through the F3 cold-hold path
-//! ├── straggler_fires        count of narrow fires after the wave window expired (straggler demotion)
+//! ├── straggler_fires        legacy field; always zero under strict wait-all
 //! └── readiness_miss         count of dummy-runs: a pass launched structurally-ready whose late edge missed (M3 gate: rate < 1%)
 //! ```
 
@@ -136,14 +136,9 @@ pub struct QuorumProbes {
     /// denominator for cold-hold occupancy (`cold_hold_us / cold_hold_fires`).
     pub cold_hold_fires: AtomicU64,
 
-    /// Count of straggler-demotion fires: the wave window expired and the
-    /// wave fired narrow, demoting the absentees. Divide by `total_batches`
-    /// for the demotion rate — near-zero on homogeneous decode fleets.
+    /// Legacy counter retained in telemetry; strict wait-all never fires narrow.
     pub straggler_fires: AtomicU64,
-    /// Pipelines actually DEMOTED (punished) at straggler fires — idle a
-    /// full wave window since their own last activity. `straggler_fires`
-    /// counts narrow WAVES; this counts punished pipelines. A healthy
-    /// workload should hold this at ~0 even when narrow waves occur.
+    /// Legacy counter retained in telemetry; strict wait-all never demotes.
     pub straggler_demotions: AtomicU64,
 
     /// Dummy-run / readiness-miss count: a pass launched as structurally
@@ -159,8 +154,7 @@ pub struct QuorumProbes {
     /// wave_fires` discriminates a PERSISTENT wait-set (converges to fleet
     /// width ⇒ waves should be dense) from a TRANSIENT one (stuck ≈1 ⇒
     /// singleton waves). `wave_missing_sum` counts absentees at fire time:
-    /// non-zero only through straggler demotion (narrow fires after the
-    /// wave window expires).
+    /// Strict wait-all records zero absentees at every fire.
     pub wave_active_sum: AtomicU64,
     pub wave_missing_sum: AtomicU64,
     pub wave_fires: AtomicU64,

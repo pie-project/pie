@@ -3,7 +3,7 @@
 //! - [`worker`]: `BatchScheduler` — the per-driver run loop (accumulate,
 //!   decide, dispatch, retire). The only public submodule (external crates
 //!   construct `worker::BatchScheduler` directly for host-driver test
-//!   harnesses); `batch`/`dispatch`/`probe`/`quorum`/`stats`/`wire` are
+//!   harnesses); `batch`/`dispatch`/`frame`/`probe`/`stats`/`wire` are
 //!   internal.
 //! - `batch`: capacity accounting + the dense-batch accumulator.
 //! - `dispatch`: the driver ABI's per-`driver_id` verbs (`register_program`,
@@ -11,7 +11,8 @@
 //!   module's root since they call [`scheduler_handle`], which is
 //!   scheduler-owned state.
 //! - `wire`: owned `LaunchPlan`s -> the batched wire request, page-trim.
-//! - `quorum`: the wait-all-active-pipelines fire rule.
+//! - `frame`: the wait-all-active-lanes frame fire rule (every k,
+//!   including the default single-slot k = 1).
 //! - `stats`: `SchedulerStats` (per-driver, lock-free) + [`AggregateStats`]
 //!   (cross-driver, this module's `get_stats`).
 //! - `probe`: per-fire lifecycle probes (`profile-fire` feature).
@@ -23,11 +24,13 @@
 
 pub(crate) mod batch;
 pub(crate) mod dispatch;
+pub(crate) mod frame;
 pub(crate) mod probe;
-pub(crate) mod quorum;
 pub(crate) mod stats;
 pub(crate) mod wire;
 pub mod worker;
+
+pub use frame::FrameStamp;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -39,9 +42,10 @@ use anyhow::{Result, anyhow};
 // into the current mock-driver fire path vs. reserved/unit-test-only).
 #[allow(unused_imports)]
 pub(crate) use dispatch::{
-    bind_instance, bind_instance_classified, close_instance, copy_d2d, copy_d2h, copy_d2h_tracked,
-    copy_h2d, copy_h2d_tracked, copy_h2h, copy_kv_cells, copy_rs_d2d, register_channel,
-    register_channels, register_channels_bind_classified, register_program, resize_pool,
+    bind_instance, bind_instance_classified, close_channels, close_instance, copy_d2d, copy_d2h,
+    copy_d2h_tracked, copy_h2d, copy_h2d_tracked, copy_h2h, copy_kv_cells, copy_rs_d2d,
+    register_channel, register_channels, register_channels_bind_classified, register_program,
+    resize_pool,
 };
 pub use stats::AggregateStats;
 pub use worker::BatchScheduler;
@@ -49,7 +53,7 @@ use worker::SchedulerHandle;
 
 use crate::driver::DriverId;
 
-/// Process identity the scheduler and quorum rule track (co-batch
+/// Process identity the scheduler and wait-all fire rule track (co-batch
 /// membership, wait-set keys). Kept as the leaf `uuid::Uuid` representation
 /// so the scheduler stays below the guest runtime in the layering.
 pub type ProcessId = uuid::Uuid;
@@ -147,11 +151,32 @@ pub async fn debug_dump(driver_id: usize) -> Result<String> {
 }
 
 // =============================================================================
+// Frame size (`PIE_FRAME_SIZE`) — the Vesuvius deployment constant k
+// =============================================================================
+
+/// Waves per frame (k): a static deployment constant, fixed at engine start
+/// exactly like the KV page size — never renegotiated per frame and never
+/// adapted from runtime timing. Guests query it via `model.frame-size()` and
+/// size their frames/channels to it. 1 (the default) keeps the per-wave
+/// wait-all scheduling path byte-identical to today; k > 1 enables sealed
+/// frame scheduling ([`worker`]'s frame policy).
+pub fn configured_frame_size() -> usize {
+    static CONFIGURED: OnceLock<usize> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_FRAME_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 64)
+    })
+}
+
+// =============================================================================
 // Fire trace (`PIE_SCHED_TRACE` / `PIE_SCHED_TRACE_FILE`)
 // =============================================================================
 
 /// Whether the scheduler fire trace is enabled. Read once (cached, like
-/// `quorum::max_in_flight`'s env lever) — MUST be set before the first fire
+/// `frame::configured_max_in_flight`'s env lever) — MUST be set before the first fire
 /// (before boot), since later env mutations are never re-observed. `worker`
 /// checks this before doing any per-fire trace bookkeeping (e.g. the
 /// distinct-program count), so tracing off costs nothing on the hot path.
@@ -312,6 +337,7 @@ fn build_driver_scheduler(
         page_size,
         limits,
         request_timeout_secs,
+        configured_frame_size(),
     ))
 }
 
@@ -362,8 +388,6 @@ pub async fn spawn(
 
     Ok(SchedulerShutdownHandle { schedulers })
 }
-
-pub type RetryClassifier = Box<dyn Fn() -> Option<String> + Send + Sync>;
 
 fn rs_state_copy_plan(
     src_slots: Vec<u32>,
@@ -601,7 +625,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     copy_dst: Vec<u32>,
     rs_copy_src: Vec<u32>,
     rs_copy_dst: Vec<u32>,
-    retry_classifier: Option<RetryClassifier>,
+    frame: Option<FrameStamp>,
     timing_enabled: bool,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
@@ -622,7 +646,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         pipeline_id,
         prelaunch_copy,
         rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
-        retry_classifier,
+        frame,
         timing_enabled,
     )
 }

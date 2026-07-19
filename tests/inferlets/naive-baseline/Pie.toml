@@ -1,0 +1,15 @@
+[package]
+name = "naive-baseline"
+version = "0.1.0"
+description = "Naive text completion — the performance control for the algorithm inferlets"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+temperature = {type = "float", optional = true, description = "Temperature applied before the Gumbel-max draw (default: 1.0)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}
+stats = {type = "bool", optional = true, description = "Drain the two instrumentation channels the algorithm inferlets carry (default: false)"}

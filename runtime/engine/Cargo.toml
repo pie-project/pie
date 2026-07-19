@@ -114,6 +114,10 @@ tempfile = "3"
 pie-ptir = { path = "../../interface/ptir", features = ["eval"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 
+[[bench]]
+name = "grammar_wit"
+harness = false
+
 #[profile.release]
 #lto = "fat"
 #codegen-units = 1

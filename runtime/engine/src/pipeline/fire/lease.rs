@@ -143,6 +143,101 @@ pub struct DevGeo {
     /// multi-program batch does not merge dense device masks with other
     /// programs' geometry (v1 scope).
     pub has_mask: bool,
+    /// POOL-OWNED device geometry: the program reserved its own page pool and
+    /// resolves every write target in-graph, so there is no `fresh`/`w_cont`
+    /// leasing handshake. `lease`, `fresh_dense` and `w_cont_dense` are inert;
+    /// the fire prepares explicit KV over the whole reserved span instead.
+    pub pooled: bool,
+}
+
+impl DevGeo {
+    /// A pool-owned device-geometry pass over `lanes` request rows.
+    pub fn pooled(lanes: usize, has_mask: bool) -> Self {
+        DevGeo {
+            lease: PageLease::new(0),
+            b: lanes,
+            fresh_dense: usize::MAX,
+            w_cont_dense: usize::MAX,
+            has_mask,
+            pooled: true,
+        }
+    }
+}
+
+/// Detect a POOL-OWNED device-geometry pass — the driver-side
+/// `is_loop_carried_explicit_geometry_trace` contract: every descriptor port is
+/// bound to a channel that the program itself re-publishes, so the driver can
+/// resolve the complete geometry from the channel cells with no page-lease
+/// handshake and no host replay.
+///
+/// This is the only executable home for a decode loop that carries a DENSE
+/// device `AttnMask` (sliding-window / attention-sink / beam ancestry): the
+/// DecodeEnvelope class composes batched lanes and has no per-lane mask state,
+/// and the Host class cannot derive a device-sampled token. The mask is
+/// required here so that mask-free decode loops keep the (batched, faster)
+/// envelope path.
+///
+/// Returns the lane count (`EmbedTokens` extent).
+pub fn detect_pooled_device_geometry(
+    container: &pie_ptir::container::TraceContainer,
+) -> Option<usize> {
+    use pie_ptir::container::{ChanDType, PortSource};
+    use pie_ptir::registry::Port;
+    use pie_ptir::types::DType;
+
+    let channel_of = |port: Port| {
+        container.ports.iter().find_map(|binding| match &binding.source {
+            PortSource::Channel(channel) if binding.port == port => Some(*channel as usize),
+            _ => None,
+        })
+    };
+    let republished = |channel: usize| {
+        container.stages.iter().any(|stage| {
+            stage.ops.iter().any(|op| {
+                matches!(op, pie_ptir::op::Op::ChanPut { chan, .. } if *chan as usize == channel)
+            })
+        })
+    };
+
+    // A dense bool `AttnMask` is what rules out every other class.
+    let mask = channel_of(Port::AttnMask)?;
+    if !matches!(
+        container.channels.get(mask)?.dtype,
+        ChanDType::Concrete(DType::Bool)
+    ) {
+        return None;
+    }
+    if !republished(mask) {
+        return None;
+    }
+
+    for port in [
+        Port::EmbedTokens,
+        Port::Positions,
+        Port::Pages,
+        Port::PageIndptr,
+        Port::KvLen,
+        Port::WSlot,
+        Port::WOff,
+    ] {
+        let channel = channel_of(port)?;
+        if !republished(channel) {
+            return None;
+        }
+    }
+
+    let tokens = container.channels.get(channel_of(Port::EmbedTokens)?)?;
+    let dims = tokens.shape.dims();
+    if dims.len() != 1 || dims[0] == 0 {
+        return None;
+    }
+    if !matches!(
+        tokens.dtype,
+        ChanDType::Concrete(DType::I32) | ChanDType::Concrete(DType::U32)
+    ) {
+        return None;
+    }
+    Some(dims[0] as usize)
 }
 
 /// Detect a device-geometry pass: its geometry ports (`WSlot`/`WOff` write
@@ -356,6 +451,109 @@ mod tests {
         assert!(
             detect_device_geometry(&c).is_none(),
             "P == 1 ⇒ not device-geometry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pooled_tests {
+    use super::detect_pooled_device_geometry;
+    use pie_ptir::container::{
+        ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+    };
+    use pie_ptir::op::Op;
+    use pie_ptir::registry::{Port, Stage};
+    use pie_ptir::types::{DType, Shape};
+
+    fn chan(shape: Shape, dtype: DType) -> ChannelDecl {
+        ChannelDecl {
+            shape,
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role: HostRole::None,
+            seeded: true,
+        }
+    }
+
+    /// A masked device-carried decode loop: every descriptor port is bound to a
+    /// channel the epilogue re-publishes (the driver's
+    /// `is_loop_carried_explicit_geometry_trace` contract).
+    fn masked_decode(lanes: u32, pool: u32) -> TraceContainer {
+        let decls = [
+            (Port::EmbedTokens, Shape::vector(lanes), DType::I32),
+            (Port::Positions, Shape::vector(lanes), DType::U32),
+            (Port::Pages, Shape::vector(lanes * 2), DType::U32),
+            (Port::PageIndptr, Shape::vector(lanes + 1), DType::U32),
+            (Port::KvLen, Shape::vector(lanes), DType::U32),
+            (Port::WSlot, Shape::vector(lanes), DType::U32),
+            (Port::WOff, Shape::vector(lanes), DType::U32),
+            (Port::AttnMask, Shape::matrix(lanes, pool), DType::Bool),
+        ];
+        let mut container = TraceContainer {
+            names: vec![],
+            externs: vec![],
+            channels: vec![],
+            ports: vec![],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![],
+            }],
+        };
+        for (port, shape, dtype) in decls {
+            let index = container.channels.len() as u32;
+            container.channels.push(chan(shape, dtype));
+            container.ports.push(PortBinding {
+                port,
+                source: PortSource::Channel(index),
+            });
+            container.stages[0].ops.push(Op::ChanPut {
+                chan: index,
+                value: 0,
+            });
+        }
+        container
+    }
+
+    #[test]
+    fn masked_loop_carried_decode_is_pooled_device_geometry() {
+        assert_eq!(detect_pooled_device_geometry(&masked_decode(1, 128)), Some(1));
+        assert_eq!(detect_pooled_device_geometry(&masked_decode(2, 128)), Some(2));
+    }
+
+    #[test]
+    fn a_mask_free_decode_keeps_the_envelope_path() {
+        let mut container = masked_decode(1, 128);
+        let mask = container
+            .ports
+            .iter()
+            .position(|binding| binding.port == Port::AttnMask)
+            .expect("mask port");
+        container.ports.remove(mask);
+        assert_eq!(
+            detect_pooled_device_geometry(&container),
+            None,
+            "without a dense device mask the decode envelope class still applies"
+        );
+    }
+
+    #[test]
+    fn a_host_driven_descriptor_is_not_pooled_device_geometry() {
+        let mut container = masked_decode(1, 128);
+        let pages = container
+            .ports
+            .iter()
+            .find_map(|binding| match (&binding.port, &binding.source) {
+                (Port::Pages, PortSource::Channel(channel)) => Some(*channel),
+                _ => None,
+            })
+            .expect("pages channel");
+        container.stages[0]
+            .ops
+            .retain(|op| !matches!(op, Op::ChanPut { chan, .. } if *chan == pages));
+        assert_eq!(
+            detect_pooled_device_geometry(&container),
+            None,
+            "a port the program does not re-publish is not device-resolvable"
         );
     }
 }

@@ -501,8 +501,10 @@ bool forward_graph_replay_eligible(
         mask_pointers_stable &&
         !rs_buffer_write &&
         !rs_buffer_fold &&
-        has_write_desc &&
         structured_window_left == -2 &&
+        // Pure-decode captures record the explicit w_page/w_off KV-write
+        // path, so a decode fire without write descriptors must stay eager.
+        has_write_desc &&
         graph_replay_has_no_host_resets(
             use_slots,
             is_fresh_h_data,
@@ -558,16 +560,19 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.h_kvlpl_forward,
                 in.forward_N,
                 in.forward_R,
-                true,
+                in.is_pure_decode,
                 in.have_custom_mask,
                 in.use_slots ? in.slot_ids_h_data : nullptr,
                 in.use_slots ? in.is_fresh_h_data : nullptr,
                 in.use_slots ? pi.slot_ids.data() : nullptr,
-                nullptr,
-                0,
+                // Pure decode captures full-N logits (N == R); a prefill
+                // capture records the compact row list instead — its count
+                // is pinned to R by the eligibility gate above.
+                in.compact_logits ? pi.sample_idx.data() : nullptr,
+                in.compact_logits ? in.num_sampling : 0,
                 pi.w_page.data(),
                 pi.w_off.data(),
-                /*has_write_desc=*/true,
+                in.has_write_desc,
                 in.structured_window_left);
             engine.graph_cache->put(key, exec);
         }
@@ -601,7 +606,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.slot_ids_d          = in.use_slots ? pi.slot_ids.data() : nullptr;
     fwd_in.is_fresh_d          = in.use_slots ? pi.is_fresh.data() : nullptr;
     fwd_in.rs_slot_flags_h     = in.use_slots
-        ? pi.rs_slot_flags_host.data()
+        ? in.rs_slot_flags_h
         : nullptr;
     fwd_in.rs_buffer_slot_ids_h    = in.rs_buffer_slot_ids_h;
     fwd_in.rs_buffer_slot_indptr_h = in.rs_buffer_slot_indptr_h;
