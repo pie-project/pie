@@ -79,7 +79,7 @@ pie run [OPTIONS] [INFERLET] [-- ARGS...]
 
 | Argument | Description |
 |----------|-------------|
-| `INFERLET` | Inferlet name from the registry (e.g., `text-completion@0.1.0`). |
+| `INFERLET` | Inferlet name from the registry (e.g., `chat-completion@0.1.0`). |
 
 | Option | Description |
 |--------|-------------|
@@ -96,7 +96,7 @@ If the inferlet name has no `@version`, the latest version is resolved from the 
 
 ```bash
 # Run from the registry
-pie run text-completion -- --prompt "Hello world"
+pie run chat-completion -- --prompt "Hello world"
 
 # Run a local build (needs the manifest too)
 pie run --path ./target/wasm32-wasip2/release/my_inferlet.wasm \
@@ -105,7 +105,7 @@ pie run --path ./target/wasm32-wasip2/release/my_inferlet.wasm \
         --prompt "Hi"
 
 # Pin a version
-pie run text-completion@0.1.0 -- --prompt "Hi" --max-tokens 64
+pie run chat-completion@0.1.0 -- --prompt "Hi" --max-tokens 64
 ```
 
 Argument parsing rules (`pie run … -- --key value …`):

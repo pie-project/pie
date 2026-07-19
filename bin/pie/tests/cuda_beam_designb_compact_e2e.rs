@@ -53,9 +53,15 @@ async fn beam_designb_compact_on_real_driver() -> Result<()> {
 
     // Build the compaction inferlet to wasm (member of the runtime test-inferlets
     // ws). The crate name normalizes to `beam_designb_compact.wasm`.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2", "-p", "beam-designb-compact"])
+        .args([
+            "build",
+            "--target",
+            "wasm32-wasip2",
+            "-p",
+            "beam-designb-compact",
+        ])
         .current_dir(&ws)
         .status()?
         .success();
@@ -68,7 +74,10 @@ async fn beam_designb_compact_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
     client
         .add_program(&wasm, &manifest, true)
         .await

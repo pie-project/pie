@@ -19,7 +19,7 @@ use crate::core::{
 };
 use crate::engines::local::{D2dCopier, LocalEngine};
 use crate::error::{Result, TransportError};
-use pie_driver_abi::kv::KvHandle;
+use pie_driver_abi::KvHandle;
 
 /// Where an outward [`TransferId`] was issued: which engine, and that engine's
 /// own (per-engine) transfer id.
@@ -126,6 +126,20 @@ impl Registry {
     ) -> Result<TransferId> {
         let kind = handle.engine();
         let inner = self.engine(kind)?.send(handle, pages, dst)?;
+        Ok(self.route(kind, inner))
+    }
+
+    pub fn send_mapped(
+        &self,
+        handle: &RegisteredHandle,
+        src_pages: &PageSet,
+        dst_pages: &PageSet,
+        dst: WorkerId,
+    ) -> Result<TransferId> {
+        let kind = handle.engine();
+        let inner = self
+            .engine(kind)?
+            .send_mapped(handle, src_pages, dst_pages, dst)?;
         Ok(self.route(kind, inner))
     }
 

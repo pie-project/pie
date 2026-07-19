@@ -10,8 +10,8 @@ use std::time::Duration;
 mod common;
 use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
-use pie_engine::process;
-use pie_engine::program::ProgramName;
+use pie_engine::inferlet::process;
+use pie_engine::inferlet::program::ProgramName;
 
 /// Timeout for a single process to complete.
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -134,86 +134,80 @@ fn context_inferlet_exercises_host_apis() {
     );
 }
 
-// The forward-pass / generate pipeline runs e2e on the mock driver: the
-// `generate` inferlet decodes via DIRECT WIT bindings (In Gim's directive) —
-// raw `inference::ForwardPass` (kv-working-set → input-tokens → sampler →
-// execute → output) + `working_set::KvWorkingSet`, no `Context`/`Generator`/
-// `collect_tokens` sugar — over the mock `EchoBehavior(42)` (every step returns
-// token 42, so 5 steps yield five 42s). We assert the exact returned string so
-// the test cannot silently pass on an early exit/error.
 #[test]
-fn generate_inferlet_exercises_forward_pass() {
+fn direct_ptir_inferlet_exercises_bound_channels() {
     let s = state();
-    let result = spawn_and_capture(s, "generate", "{}".into());
-    assert_eq!(
-        result.as_deref(),
-        Ok("generated 5 tokens: [42, 42, 42, 42, 42]"),
-        "generate inferlet should run the forward-pass loop end-to-end and \
-         return the mock's five echoed tokens (got {result:?})"
+    let result = spawn_and_capture(s, "direct-channel-e2e", "{}".into());
+    assert!(
+        result.as_deref() == Ok("value=42"),
+        "direct PTIR inferlet should publish and read bound channels (got {result:?})"
     );
 }
 
-/// The **linear-model fold-commit surface** runs e2e (echo — In Gim's
-/// linear-model WIT revisit). The `linearfold` inferlet drives a MODEL-AGNOSTIC
-/// spec-commit loop: the new `model::is_linear()` capability gates a
-/// `Forward::rs_working_set` + `Forward::fold(n_acc)` (the linear-model COMMIT —
-/// fold only the accepted prefix into the recurrent state). On the attention
-/// mock (`is_linear() == false`, all-0 RS caps, fold-granularity 1 per
-/// bootstrap.rs) the fold branch is skipped and the pass is an ordinary
-/// prefill. Asserts the new `model.is-linear()` + RS shaping caps surface
-/// correctly through the full stack (WIT → host binding → SDK), and that the
-/// model-agnostic loop executes cleanly. (The linear branch's fold lowering —
-/// `rs_fold_lens` + `RS_FLAG_FOLD`, api/inference.rs — rides the existing host
-/// path; its full linear-model e2e is the deferred Phase-6/7 RS harness.)
 #[test]
-fn linearfold_inferlet_exercises_is_linear_surface() {
+fn direct_ptir_mixed_outputs_execute_end_to_end() {
     let s = state();
-    let result = spawn_and_capture(s, "linearfold", "1".into());
-    assert_eq!(
-        result.as_deref(),
-        Ok(
-            "linearfold: is_linear=false rs_state_size=0 rs_fold_granularity=1 \
-rs_buffer_page_size=0 n_acc=1"
-        ),
-        "linearfold should surface the new model.is-linear() capability + RS caps \
-         e2e; the attention mock reports non-linear with all-0 RS caps (got {result:?})"
+    let result = spawn_and_capture(s, "direct-mixed-e2e", "{}".into())
+        .expect("mixed direct-channel inferlet should complete successfully");
+    for required in [
+        "MIXED_OK=true",
+        "ENTROPY_OK=true",
+        "VECTOR_OK=true",
+        "EMPTY_PREFIX_OK=true",
+        "MULTISAMPLER_OK=true",
+    ] {
+        assert!(
+            result.contains(required),
+            "mixed direct-channel e2e missing {required}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn explicit_prefix_index_submits_only_the_suffix() {
+    let s = state();
+    // Round 0 publishes one full page under an explicit key; round 1 loads
+    // that WorkingSet and submits only the 8-token suffix.
+    let result = spawn_and_capture(s, "prefix-cache-e2e", "{}".into());
+    assert!(
+        result
+            .as_deref()
+            .is_ok_and(|r| r.contains("PREFIX_CACHE_E2E n=24")),
+        "prefix-cache inferlet should complete (got {result:?})"
+    );
+    let shapes: Vec<String> = s
+        .env
+        .operations()
+        .into_iter()
+        .filter(|op| op.starts_with("launch-shape"))
+        .collect();
+    // Match this inferlet's PER-PROGRAM spans (`per=[..]`): the shared-engine
+    // suite runs concurrently and the wait-all quorum may co-batch another
+    // test's fire into the same launch, so batch totals are not stable.
+    let per_counts = |op: &str| -> Vec<u32> {
+        op.split_once("per=[")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| {
+                list.split(',')
+                    .filter_map(|count| count.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let cold = shapes.iter().position(|op| per_counts(op).contains(&24));
+    assert!(
+        cold.is_some(),
+        "round 0 should prefill all 24 tokens: {shapes:?}"
+    );
+    assert!(
+        shapes[cold.unwrap() + 1..]
+            .iter()
+            .any(|op| per_counts(op).contains(&8)),
+        "round 1 should load the indexed page and fire only the 8-token \
+         suffix: {shapes:?}"
     );
 }
 
-/// The **sampler-lowering keep-core primitive** runs e2e (echo). The
-/// `samplerprobe` inferlet gets a PARAMETRIC top-p sampler on the RAW WIT
-/// surface via `sampler::sampler_program` — the standard-sampler spec lowered to
-/// an attachable `tensor::Program` + its per-fire `InputBinding`s (logits row +
-/// the temperature/top-p submit param tensors), with `geometry::*` for the KV
-/// page split and a hand-written decode loop over `ForwardPass`. No hand-built
-/// Sampling-IR `Graph`, no `Context`/`Generator` facade. This is the sampler
-/// analog of the geometry/carrier keep-core exercises: it proves the full
-/// lowering + parametric binding-resolution path (incl. `tensor::from_data`
-/// submit tensors) runs end-to-end. On the mock `EchoBehavior(42)` every fire
-/// echoes token 42, so 3 steps yield `[42, 42, 42]`.
-#[test]
-fn samplerprobe_inferlet_exercises_sampler_lowering() {
-    let s = state();
-    let result = spawn_and_capture(s, "samplerprobe", "{}".into());
-    assert_eq!(
-        result.as_deref(),
-        Ok("sampled 3 tokens: [42, 42, 42]"),
-        "samplerprobe should lower a top-p sampler via the keep-core \
-         sampler::sampler_program primitive and decode three mock-echoed \
-         tokens (got {result:?})"
-    );
-}
-
-/// The **unified carrier × parametric-sampler keep-core path** runs e2e (echo).
-/// The `carrierprobe` inferlet drives a PARAMETRIC top-p sampler through the
-/// RUN-AHEAD carrier via `carrier::submit_pass` taking a `LoweredSampler` — the
-/// capability that did not exist until the unified signature (the old carrier
-/// hardwired `[Logits]`, dropping a parametric sampler's T/p/k submit tensors →
-/// `CustomJIT` + wrong sampling, `ptir-carrier-bind-seam-spec §9`). Now greedy
-/// (`Argmax`) and parametric share ONE carrier path, and the run-ahead pipeline
-/// (eager consumer submit + device carrier inject) composes with the full
-/// sampler binding list. On the mock `EchoBehavior(42)` a 3-step pipelined
-/// decode yields `[42, 42, 42]`.
 #[test]
 fn spawn_after_termination() {
     let s = state();
@@ -272,100 +266,9 @@ fn spawn_after_termination() {
         );
     });
 }
-#[test]
-fn isolatedtopp_pipelined_runs() {
-    let s = state();
-    let result = spawn_and_capture(s, "isolatedtopp-pipelined", "{}".into());
-    assert_eq!(
-        result.as_deref(),
-        Ok("{\"tokens\": [42, 42, 42, 42]}"),
-        "isolatedtopp-pipelined should run the run-ahead TopP decode (got {result:?})"
-    );
-}
-
-#[test]
-fn multisamp_pipelined_runs() {
-    let s = state();
-    let result = spawn_and_capture(s, "multisamp-pipelined", "{}".into());
-    // 4 kinds (topk/topp/minp/joint) × 4 tokens = 16 echoed 42s.
-    assert_eq!(
-        result.as_deref(),
-        Ok("{\"tokens\": [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42]}"),
-        "multisamp-pipelined should drive all 4 parametric kinds through the carrier (got {result:?})"
-    );
-}
-
-#[test]
-fn tempgen_pipelined_runs() {
-    let s = state();
-    let result = spawn_and_capture(s, "tempgen-pipelined", "{}".into());
-    assert_eq!(
-        result.as_deref(),
-        Ok("{\"tokens\": [42, 42, 42, 42, 42, 42, 42, 42]}"),
-        "tempgen-pipelined should run the run-ahead Multinomial decode (got {result:?})"
-    );
-}
-
 // =============================================================================
 // Stress & Concurrency
 // =============================================================================
-
-/// **Host-side concurrent-DECODE repro** (bravo, for alpha/charlie's arena bug).
-/// Spawns N concurrent decodes that each drive a real forward-pass loop (KV
-/// working set → arena txns). Uses the DIRECT-WIT-binding `generate` inferlet
-/// (In Gim's directive) so it exercises the raw WIT path the M3 inferlets use.
-/// On `EchoBehavior(42)` every pipeline MUST return the identical
-/// `[42, 42, 42, 42, 42]`; cross-request contamination / arena `unknown object`
-/// shows as a divergent or errored return. Fast host mirror of `cuda_bubble.rs`.
-#[test]
-fn concurrent_decode_fleet() {
-    let s = state();
-    const FLEET: usize = 8;
-    let results: Vec<Result<String, String>> = s.rt.block_on(async {
-        inferlets::add_and_install("generate").await;
-        // Launch the whole fleet BEFORE awaiting any → all decode concurrently,
-        // co-batching in the scheduler (the condition that triggers the bug).
-        let rxs: Vec<_> = (0..FLEET)
-            .map(|i| {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                process::spawn(
-                    "fleet-user".into(),
-                    program_name("generate"),
-                    format!(r#"{{"lane":{i}}}"#),
-                    None,
-                    false,
-                    Some(tx),
-                )
-                .unwrap_or_else(|e| panic!("spawn {i}: {e}"));
-                rx
-            })
-            .collect();
-        let mut out = Vec::with_capacity(FLEET);
-        for rx in rxs {
-            out.push(match tokio::time::timeout(PROCESS_TIMEOUT, rx).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(_)) => Err("result channel dropped".into()),
-                Err(_) => Err("timeout".into()),
-            });
-        }
-        out
-    });
-
-    const EXPECT: &str = "generated 5 tokens: [42, 42, 42, 42, 42]";
-    let mut ok = 0usize;
-    for (i, r) in results.iter().enumerate() {
-        match r {
-            Ok(s) if s == EXPECT => ok += 1,
-            other => eprintln!("[fleet] pipeline {i} diverged: {other:?}"),
-        }
-    }
-    eprintln!("[fleet] {ok}/{FLEET} pipelines produced the identical greedy stream");
-    assert_eq!(
-        ok, FLEET,
-        "concurrent decode must be deterministic across pipelines (arena/batching \
-         contamination if not) — {ok}/{FLEET} correct"
-    );
-}
 
 #[test]
 fn concurrent_spawns() {
@@ -491,4 +394,3 @@ fn mixed_success_and_error() {
         }
     });
 }
-

@@ -1,0 +1,22 @@
+interface tokenizer {
+
+    use types.{error};
+
+    // The tokenizer half of the former `model` interface: global functions over
+    // the single bound model's tokenizer (no resource handle).
+
+    // Converts input text into a list of token IDs
+    encode: func(text: string) -> list<u32>;
+
+    // Converts token IDs back into a decoded string
+    decode: func(tokens: list<u32>) -> result<string, error>;
+
+    // Returns the model's vocabulary as a list of byte sequences (tokens)
+    vocabs: func() -> tuple<list<u32>, list<list<u8>>>;
+
+    // Returns the split regular expression used by the tokenizer
+    split-regex: func() -> string;
+
+    // Returns the special tokens recognized by the model
+    special-tokens: func() -> tuple<list<u32>, list<list<u8>>>;
+}

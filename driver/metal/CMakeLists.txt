@@ -1,12 +1,15 @@
 cmake_minimum_required(VERSION 3.23)
 
-# driver/metal — MLX + native Metal backend for Pie (Apple Silicon, macOS).
-# Structure mirrors driver/cuda. OBJCXX is enabled so the compute layer can
-# add `.mm` (Objective-C++) translation units for Metal interop.
-project(PIE_DRIVER_METAL CXX OBJCXX)
-
-if(NOT APPLE)
-  message(FATAL_ERROR "driver/metal targets macOS / Apple Silicon only")
+if(APPLE)
+  # driver/metal — MLX + native Metal backend for Pie (Apple Silicon, macOS).
+  # Structure mirrors driver/cuda. OBJCXX is enabled so the compute layer can
+  # add `.mm` (Objective-C++) translation units for Metal interop.
+  project(PIE_DRIVER_METAL CXX OBJCXX)
+else()
+  # Linux/CI builds compile the direct-ABI stub surface (abi.cpp) so the
+  # driver still validates, unit-tests its bind layout, and stays in sync with
+  # the canonical ABI even when Metal frameworks are unavailable.
+  project(PIE_DRIVER_METAL CXX)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -24,21 +27,22 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(Threads REQUIRED)
+enable_testing()
 
-# Schema + in-proc IPC headers. The worker's build.rs passes these in via
-# -D...; standalone driver builds fall back to the in-tree paths.
-if(NOT PIE_SCHEMA_INCLUDE_DIR)
-  set(PIE_SCHEMA_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include")
-endif()
-if(NOT PIE_IPC_INCLUDE_DIR)
-  set(PIE_IPC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ipc/include")
+# Direct driver ABI header. The worker build forwards this when needed; local
+# standalone builds fall back to the committed in-tree generated header.
+if(NOT PIE_DRIVER_ABI_INCLUDE_DIR)
+  set(PIE_DRIVER_ABI_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include")
 endif()
 
-# Optional MLX dependency. OFF by default so the foundation skeleton
-# (entry + stub service) compiles/links fast; the compute layer flips it ON
+# Optional MLX dependency. OFF by default so the direct entry surface
+# compiles/links fast; the compute layer flips it ON
 # (see cmake/FetchMLX.cmake). The worker build.rs forwards
 # -DPIE_METAL_WITH_MLX from the PIE_METAL_WITH_MLX env var.
 option(PIE_METAL_WITH_MLX "Fetch and link MLX C++" OFF)
+if(NOT APPLE AND PIE_METAL_WITH_MLX)
+  message(FATAL_ERROR "PIE_METAL_WITH_MLX requires APPLE")
+endif()
 
 include(cmake/CPM.cmake)
 
@@ -55,83 +59,81 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 # -----------------------------------------------------------------------------
 # Sources
 #
-# Explicit (alpha-owned): entry, driver startup, the stub in-proc service.
-# GLOBbed (beta/charlie/delta-owned): every .cpp/.mm under the compute,
-# executor, kernels, model, and loader trees — so peers add translation
-# units WITHOUT editing this file. CONFIGURE_DEPENDS re-globs on rebuild.
+# Explicit direct-ABI entry sources.
 # -----------------------------------------------------------------------------
-# Explicit (alpha-owned): entry, driver startup, the stub in-proc service.
-# These compile WITHOUT MLX so the foundation seam stays fast to build and the
-# default worker (no driver feature) isn't forced to fetch/link MLX.
+# These compile WITHOUT MLX so the direct ABI stays available even when the
+# optional MLX backend is disabled.
 set(PIE_METAL_EXPLICIT_SOURCES
-  src/entry.cpp
-  src/driver_startup.cpp
-  src/service/inproc_service.cpp)
-
-# GLOBbed (beta/charlie/delta-owned): every .cpp/.mm under the compute,
-# executor, kernels, model, and loader trees — so peers add translation
-# units WITHOUT editing this file. CONFIGURE_DEPENDS re-globs on rebuild.
-#
-# These TUs all `#include` MLX (via ops/tensor.hpp), so they are ONLY compiled
-# when PIE_METAL_WITH_MLX is ON. With MLX OFF the library is just the stub
-# skeleton (entry + startup + stub service) — Health + dummy Forward — which
-# compiles/links without MLX present. The InProcService/entry executor wiring
-# is `#if defined(PIE_METAL_HAS_MLX)`-gated to match.
-set(PIE_METAL_GLOB_SOURCES)
-if(PIE_METAL_WITH_MLX)
-  file(GLOB_RECURSE PIE_METAL_GLOB_SOURCES CONFIGURE_DEPENDS
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/ops/*.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/ops/*.mm
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/executor/*.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/executor/*.mm
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.mm
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/*.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/*.mm
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/loader/*.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/loader/*.mm)
+  src/abi.cpp
+  src/context.cpp
+  src/pipeline/registry.cpp
+  src/batch/compose.cpp
+  src/batch/forward.cpp)
+if(NOT APPLE)
+  list(APPEND PIE_METAL_EXPLICIT_SOURCES src/pipeline/shared_storage.cpp)
 endif()
 
-# raw_metal (alpha/beta/charlie/delta-owned): the MLX-free raw Metal-4 compute
-# pipeline — the DEFAULT forward backend baked into the worker-embedded lib.
-# GLOB the compute TUs so peers add .cpp/.mm WITHOUT editing this file, then
-# EXCLUDE the standalone driver/bench/probe mains (each carries its own
-# `int main()` and must not link into the lib). Convention: any new standalone
-# executable TU must match the exclude regex below (`*_run.cpp`, `*_probe.cpp`,
-# `harness*.cpp`, `bench_*.cpp`).
-file(GLOB PIE_METAL_RAW_SOURCES CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal/*.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal/*.mm)
-list(FILTER PIE_METAL_RAW_SOURCES EXCLUDE REGEX
-  "/(.*_run|.*_probe|.*_smoke|harness.*|bench_.*)\\.cpp$")
+# Native Metal-4 compute pipeline and default backend.
+# Keep this list explicit: standalone tools and not-yet-live architecture
+# bring-up code must never enter the shipped archive by filename convention.
+set(PIE_METAL_LIVE_SOURCES)
+if(APPLE)
+  set(PIE_METAL_LIVE_SOURCES
+    src/mtl4_context.mm
+    src/pipeline/shared_storage.mm
+    src/pipeline/m1_codegen.cpp
+    src/pipeline/m1_runtime.cpp
+    src/batch/decode_timing.cpp
+    src/batch/scratch.cpp
+    src/model/qwen3_5/decode_consts.cpp
+    src/model/qwen3_5/decode_step.cpp
+    src/model/qwen3_5/decode_step_mb.cpp
+    src/kernels/decode_psos.cpp
+    src/loader/heap_bind.cpp
+    src/loader/safetensors_view.cpp)
+endif()
 
 add_library(pie_driver_metal_lib STATIC
   ${PIE_METAL_EXPLICIT_SOURCES}
-  ${PIE_METAL_GLOB_SOURCES}
-  ${PIE_METAL_RAW_SOURCES})
+  ${PIE_METAL_LIVE_SOURCES})
 
-# raw_metal's Objective-C++ TU (mtl4_context.mm) needs ARC.
-set_source_files_properties(
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal/mtl4_context.mm
-  PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+if(APPLE)
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/mtl4_context.mm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pipeline/shared_storage.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+endif()
 
 target_include_directories(pie_driver_metal_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/batch
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/qwen3_5
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/store
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/loader
+    # ../common/include also carries the shared pure-host PTIR decode headers
+    # (pie_native/ptir/{container,bound,trace,op_table,fire_geometry}.hpp —
+    # CUDA-free, namespace pie_native::ptir). The host interpreter
+    # (src/pipeline/interp.hpp) consumes them; Metal no longer reaches into
+    # driver/cuda/src for anything.
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_SCHEMA_INCLUDE_DIR}
-    ${PIE_IPC_INCLUDE_DIR})
+    ${PIE_DRIVER_ABI_INCLUDE_DIR})
 
 target_compile_options(pie_driver_metal_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
   $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall -Wextra -Wno-unused-parameter>)
 
-# Compiled-in fallback for the raw-Metal .metal kernel sources (runtime PSO
-# compilation). Overridable at run time via PIE_METAL_KERNELS_DIR. Installed
-# packaging of the kernels dir is a follow-up.
-target_compile_definitions(pie_driver_metal_lib PRIVATE
-  PIE_METAL_KERNELS_DIR_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/src/raw_metal/kernels")
+# Compiled-in fallback for the native .metal kernel sources (runtime PSO
+# compilation). Overridable at run time via PIE_METAL_KERNELS_DIR. PUBLIC so
+# every target linking pie_driver_metal_lib (e.g. ptir_checkpoint_e2e_test,
+# which drives an independent MetalExecutor::setup outside Context) sees
+# the same default when PIE_METAL_KERNELS_DIR is unset. Installed packaging
+# of the kernels dir is a follow-up.
+if(APPLE)
+  target_compile_definitions(pie_driver_metal_lib PUBLIC
+    PIE_METAL_KERNELS_DIR_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+endif()
 
 target_link_libraries(pie_driver_metal_lib PUBLIC
   CLI11::CLI11
@@ -143,15 +145,12 @@ target_link_libraries(pie_driver_metal_lib PUBLIC
 # the standalone exe and the worker binary that embeds the static lib
 # resolve them. (The worker build.rs also adds these via rustc-link-arg;
 # duplicate -framework flags are harmless.)
-target_link_libraries(pie_driver_metal_lib PUBLIC
-  "-framework Metal"
-  "-framework MetalKit"
-  "-framework Foundation"
-  "-framework Accelerate")
-
-if(PIE_METAL_WITH_MLX)
-  include(cmake/FetchMLX.cmake)
-  pie_metal_fetch_mlx(pie_driver_metal_lib)
+if(APPLE)
+  target_link_libraries(pie_driver_metal_lib PUBLIC
+    "-framework Metal"
+    "-framework MetalKit"
+    "-framework Foundation"
+    "-framework Accelerate")
 endif()
 
 # -----------------------------------------------------------------------------
@@ -165,14 +164,37 @@ endif()
 # -----------------------------------------------------------------------------
 option(PIE_METAL_BUILD_METALLIB "AOT-compile src/kernels/*.metal into default.metallib" OFF)
 
-file(GLOB_RECURSE PIE_METAL_SHADER_SOURCES CONFIGURE_DEPENDS
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.metal)
+set(PIE_METAL_SHADER_NAMES
+  argmax
+  attn_gate
+  bf16_gemv
+  dense_gemv
+  embed_gather
+  gated_rms
+  gdn_core
+  gdn_prep
+  geglu_tanh
+  gemv_demo
+  kv_append
+  kv_append_paged
+  layer_scalar
+  logit_softcap
+  ple_combine
+  quantized_qmv
+  residual_add
+  rms_norm
+  rope
+  sdpa_paged
+  sdpa_sliding
+  sdpa_vector
+  silu_mul
+  vnorm)
 
-if(PIE_METAL_BUILD_METALLIB AND PIE_METAL_SHADER_SOURCES)
+if(PIE_METAL_BUILD_METALLIB)
   find_program(XCRUN_EXECUTABLE xcrun REQUIRED)
   set(PIE_METAL_AIR_FILES "")
-  foreach(shader ${PIE_METAL_SHADER_SOURCES})
-    get_filename_component(shader_name ${shader} NAME_WE)
+  foreach(shader_name ${PIE_METAL_SHADER_NAMES})
+    set(shader ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/${shader_name}.metal)
     set(air_file ${CMAKE_BINARY_DIR}/metal/${shader_name}.air)
     add_custom_command(
       OUTPUT ${air_file}
@@ -202,38 +224,102 @@ target_link_libraries(pie_driver_metal PRIVATE pie_driver_metal_lib)
 # The `--features driver-metal` build in worker/build.rs consumes
 # `pie_driver_metal_lib` directly.
 
-# -----------------------------------------------------------------------------
-# RawMetalExecutor marshaling gate (alpha-owned, off by default). Drives the
-# golden qwen3.6 prompt through RawMetalExecutor::run_forward via the real
-# PieForwardRequestView/ResponseBuilder types and asserts argmax==264 — the
-# runtime-ABI-marshaling half of the e2e correctness gate (delta's
-# decoder_smoke gates the decoder body). Reuses pie_driver_metal_lib (which
-# carries RawMetalExecutor + the raw_metal TUs + schema includes). Requires a
-# GPU. Enable with -DPIE_METAL_BUILD_RAWSMOKE=ON.
-# -----------------------------------------------------------------------------
-option(PIE_METAL_BUILD_RAWSMOKE
-  "Build the RawMetalExecutor marshaling smoke (argmax-264 gate)" OFF)
-if(PIE_METAL_BUILD_RAWSMOKE)
-  add_executable(raw_metal_executor_smoke
-    src/raw_metal/raw_metal_executor_smoke.cpp)
-  target_link_libraries(raw_metal_executor_smoke PRIVATE pie_driver_metal_lib)
+option(PIE_METAL_BUILD_TOOLS "Build native Metal bring-up and diagnostic tools" OFF)
+if(PIE_METAL_BUILD_TOOLS AND APPLE)
+  add_subdirectory(tools/rawmetal)
 endif()
 
 # -----------------------------------------------------------------------------
 # Loader smoke test (delta-owned, off by default). Builds an end-to-end loader→
 # graph→KV→forward check; requires MLX. Enable with -DPIE_METAL_BUILD_TESTS=ON.
 # -----------------------------------------------------------------------------
-option(PIE_METAL_BUILD_TESTS "Build driver/metal loader smoke tests" OFF)
-if(PIE_METAL_BUILD_TESTS AND PIE_METAL_WITH_MLX)
+option(PIE_METAL_BUILD_TESTS "Build driver/metal MLX reference tests" OFF)
+option(PIE_METAL_BUILD_PARITY "Build driver/metal accuracy parity harness" OFF)
+if(PIE_METAL_WITH_MLX AND (PIE_METAL_BUILD_TESTS OR PIE_METAL_BUILD_PARITY))
   add_subdirectory(tests)
 endif()
 
-# -----------------------------------------------------------------------------
-# Accuracy parity harness (alpha-owned, off by default). Builds `parity_driver`
-# (driver logits dumper) for tools/parity/parity_check.py to diff against
-# mlx-lm. Requires MLX. Enable with -DPIE_METAL_BUILD_PARITY=ON.
-# -----------------------------------------------------------------------------
-option(PIE_METAL_BUILD_PARITY "Build driver/metal accuracy parity harness" OFF)
-if(PIE_METAL_BUILD_PARITY AND PIE_METAL_WITH_MLX)
-  add_subdirectory(tools/parity)
+option(PIE_METAL_BUILD_STUB_TESTS "Build Linux/non-MLX direct-surface tests" OFF)
+if(PIE_METAL_BUILD_STUB_TESTS AND NOT PIE_METAL_WITH_MLX)
+  add_executable(metal_direct_stub_test tests/direct_stub_test.cpp)
+  target_link_libraries(metal_direct_stub_test PRIVATE pie_driver_metal_lib)
+  add_test(NAME metal_direct_stub_test COMMAND metal_direct_stub_test)
+  set_tests_properties(metal_direct_stub_test PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+endif()
+
+function(add_metal_host_test target source)
+  add_executable(${target} ${source})
+  target_include_directories(${target} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+  add_test(NAME ${target} COMMAND ${target})
+endfunction()
+
+function(add_metal_linked_test target source)
+  add_executable(${target} ${source})
+  target_link_libraries(${target} PRIVATE pie_driver_metal_lib)
+  add_test(NAME ${target} COMMAND ${target})
+endfunction()
+
+file(GLOB PIE_PTIR_CANONICAL_GOLDENS CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir/*.txt)
+add_executable(
+  ptir_decoder_limits_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/tests/ptir_decoder_limits_test.cpp)
+target_include_directories(ptir_decoder_limits_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+target_compile_features(ptir_decoder_limits_test PRIVATE cxx_std_20)
+add_test(
+  NAME ptir_decoder_limits_test
+  COMMAND ptir_decoder_limits_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
+    ${PIE_PTIR_CANONICAL_GOLDENS})
+
+add_metal_host_test(pipeline_interp_test tests/pipeline_interp_test.cpp)
+add_metal_host_test(
+  pipeline_channel_storage_test
+  tests/pipeline_channel_storage_test.cpp)
+add_metal_host_test(
+  pipeline_descriptor_resolve_test
+  tests/pipeline_descriptor_resolve_test.cpp)
+add_metal_host_test(load_plan_decode_test tests/load_plan_decode_test.cpp)
+target_link_libraries(load_plan_decode_test PRIVATE nlohmann_json::nlohmann_json)
+
+add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
+target_include_directories(heap_layout_slot_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/loader)
+add_test(NAME heap_layout_slot_test COMMAND heap_layout_slot_test)
+
+add_executable(paged_batch_validation_test tests/paged_batch_validation_test.cpp)
+target_include_directories(paged_batch_validation_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(paged_batch_validation_test PRIVATE pie_driver_metal_lib)
+add_test(NAME paged_batch_validation_test COMMAND paged_batch_validation_test)
+
+add_metal_linked_test(
+  pipeline_device_geometry_e2e_test
+  tests/pipeline_device_geometry_e2e_test.cpp)
+add_metal_linked_test(pipeline_copy_ops_test tests/pipeline_copy_ops_test.cpp)
+add_metal_linked_test(caps_honesty_test tests/caps_honesty_test.cpp)
+add_metal_linked_test(executor_geometry_test tests/executor_geometry_test.cpp)
+add_metal_linked_test(batch_schedule_plan_test tests/batch_schedule_plan_test.cpp)
+
+add_executable(executor_worker_test tests/executor_worker_test.cpp)
+target_include_directories(executor_worker_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(executor_worker_test PRIVATE Threads::Threads)
+add_test(NAME executor_worker_test COMMAND executor_worker_test)
+
+if(APPLE)
+  add_metal_linked_test(m1_generated_test tests/m1_generated_test.cpp)
+  target_compile_definitions(m1_generated_test PRIVATE
+    PIE_PTIR_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir")
+  add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
+  add_metal_linked_test(ptir_checkpoint_e2e_test tests/ptir_checkpoint_e2e_test.cpp)
+  add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
+  add_metal_linked_test(decode_step_mb_test tests/decode_step_mb_test.cpp)
+  add_metal_linked_test(kv_pool_lifecycle_test tests/kv_pool_lifecycle_test.cpp)
 endif()

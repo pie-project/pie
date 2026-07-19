@@ -47,7 +47,7 @@ Submit an inferlet to the engine, stream its events, and exit when it returns.
 
 ```bash
 # By registry name
-pie-client submit text-completion@0.1.0 -- --prompt "hello"
+pie-client submit chat-completion@0.1.0 -- --prompt "hello"
 
 # By local build
 pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml -- --prompt "hello"

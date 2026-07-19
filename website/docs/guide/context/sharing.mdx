@@ -55,8 +55,8 @@ Pages 0, 1, 2 are committed and shared read-only. Page 3' is a fresh copy of the
 
 Use it for:
 
-- **Best-of-N.** Fork N times from a shared prefix and pick the best output. See the [`best-of-n`](https://github.com/pie-project/pie/tree/main/inferlets/best-of-n) inferlet.
-- **Tree of thought.** Explore continuations in parallel and prune low-scoring branches. See the [`tree-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/tree-of-thought) inferlet.
+- **Parallel candidates.** Fork from a shared prefix and rank the outputs. See [`consensus-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/consensus-decoding).
+- **Tree search.** Explore continuations in parallel and prune low-scoring branches.
 - **Tool-call retries.** Fork before the call so a failure rolls back cleanly without losing the conversation.
 - **Self-critique.** Fork to run a critic against the same prefix without disturbing the original.
 
@@ -213,4 +213,4 @@ Forking is free and is the right answer for branching workflows. Saving is for c
 
 - [Scheduling and budgets](./scheduling): the credit auction that prices forward passes.
 - [The forward pass](../forward/overview): drop down to single-pass primitives.
-- [Examples](../../guide/examples/overview): the [`tree-of-thought`](https://github.com/pie-project/pie/tree/main/inferlets/tree-of-thought) and [`best-of-n`](https://github.com/pie-project/pie/tree/main/inferlets/best-of-n) inferlets are full implementations of fork-and-share workflows.
+- [Examples](../../guide/examples/overview): [`consensus-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/consensus-decoding) and [`prefix-tree-kv-cache`](https://github.com/pie-project/pie/tree/main/inferlets/prefix-tree-kv-cache) demonstrate shared-prefix branching.

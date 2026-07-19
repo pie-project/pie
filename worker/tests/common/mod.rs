@@ -10,7 +10,7 @@
 //! Reused by the cuda validation tests (`cuda_forward` = dense forward; the
 //! Lane-C CAS-dedup + Lane-D fold-parity tests compose on these helpers). Every
 //! cuda test is `#[ignore]`d (real GPU + `--features driver-cuda`) and boots
-//! ONCE per process (auth/shmem singletons forbid a 2nd boot).
+//! ONCE per process (global engine state forbids a second boot).
 //!
 //! The model snapshot is overridable via `PIE_CUDA_TEST_SNAPSHOT` (a local HF
 //! snapshot dir — R3: the worker never downloads); the default is the Qwen3-0.6B
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use pie_engine::program::{Manifest, ProgramName};
+use pie_engine::inferlet::program::{Manifest, ProgramName};
 use pie_worker::WorkerHandle;
 
 /// Default local HF snapshot (Qwen3-0.6B dense) on the reference box. Override
@@ -89,9 +89,11 @@ pub fn cuda_toml() -> String {
 /// validation, the dense default otherwise. Caller holds the handle and
 /// `shutdown()`s it.
 pub async fn boot_cuda_model(snapshot_path: &str) -> WorkerHandle {
-    let cfg = pie_worker::Config::parse(&cuda_toml_for(snapshot_path))
-        .expect("parse cuda worker config");
-    pie_worker::run(cfg).await.expect("boot embedded cuda engine")
+    let cfg =
+        pie_worker::Config::parse(&cuda_toml_for(snapshot_path)).expect("parse cuda worker config");
+    pie_worker::run(cfg)
+        .await
+        .expect("boot embedded cuda engine")
 }
 
 /// Boot the embedded cuda engine with the default dense model (Qwen3-0.6B).
@@ -99,10 +101,10 @@ pub async fn boot_cuda() -> WorkerHandle {
     boot_cuda_model(&snapshot()).await
 }
 
-/// Build `../inferlets/<name>` → wasm + manifest + program id.
-pub fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
+/// Build a curated inferlet fixture → wasm + manifest + program id.
+pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../inferlets")
+        .join("../tests/inferlets")
         .join(name);
     let status = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "--release"])
@@ -114,23 +116,22 @@ pub fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let wasm_path = dir
         .join("target/wasm32-wasip2/release")
         .join(format!("{}.wasm", name.replace('-', "_")));
-    let wasm = std::fs::read(&wasm_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", wasm_path.display()));
+    let wasm =
+        std::fs::read(&wasm_path).unwrap_or_else(|e| panic!("read {}: {e}", wasm_path.display()));
     let manifest =
         Manifest::parse(&std::fs::read_to_string(dir.join("Pie.toml")).unwrap()).unwrap();
-    let program_name =
-        ProgramName::parse(&format!("{name}@{}", manifest.package.version)).unwrap();
+    let program_name = ProgramName::parse(&format!("{name}@{}", manifest.package.version)).unwrap();
     (wasm, manifest, program_name)
 }
 
 /// Build + add + install an inferlet once; returns its program id for repeated
 /// spawns (one install per process; spawn many).
 pub async fn install_inferlet(name: &str) -> ProgramName {
-    let (wasm, manifest, program_name) = load_prod_inferlet(name);
-    pie_engine::program::add(wasm, manifest, true)
+    let (wasm, manifest, program_name) = load_curated_inferlet(name);
+    pie_engine::inferlet::program::add(wasm, manifest, true)
         .await
         .expect("add program");
-    pie_engine::program::install(&program_name)
+    pie_engine::inferlet::program::install(&program_name)
         .await
         .expect("install program");
     program_name
@@ -152,7 +153,7 @@ pub async fn spawn_text(
 /// its result.
 pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<String, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    pie_engine::process::spawn(
+    pie_engine::inferlet::process::spawn(
         "cuda-test".into(),
         program.clone(),
         input_json.to_string(),
@@ -167,7 +168,7 @@ pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<Stri
         .expect("process result channel dropped")
 }
 
-/// Build + add + install + spawn an arbitrary production inferlet with a raw
+/// Build + add + install + spawn an arbitrary curated inferlet fixture with a raw
 /// JSON input (for canaries — fork / spec / snapshot — that take
 /// inferlet-specific inputs). One-shot: installs then spawns.
 pub async fn spawn_inferlet(name: &str, input_json: &str) -> Result<String, String> {

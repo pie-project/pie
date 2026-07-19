@@ -4,6 +4,8 @@ members = [
     "echo",
     "context",
     "error",
+    "direct-channel-e2e",
+    "direct-mixed-e2e",
     "generate",
     "generate-gdn",
     "generate-gdn-n1",
@@ -25,17 +27,13 @@ members = [
     "mtp-specdecode",
     "mtpverify",
     "mtp-native-verify",
-    "drafts-retain-e2e",
-    "ptir-greedy-e2e",
     "beam",
-    "beam-baseline",
     "beam-designb",
     "beam-designb-compact",
     "mtp-grammar",
     "ptir-prefill-e2e",
-    "linearfold",
-    "samplerprobe",
-    "carrierprobe",
+    "prefix-cache-e2e",
+    "selfspec",
 ]
 
 [workspace.dependencies]

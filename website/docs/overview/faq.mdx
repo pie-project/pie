@@ -14,7 +14,7 @@ No. Pie is a research prototype under active development. APIs change between re
 
 ## Do I have to write Rust?
 
-No. Inferlets can be written in Rust, Python, or TypeScript. Rust is the canonical SDK, and a few advanced primitives (the raw `forward()` API, custom speculators, custom adapters) are Rust-only today. The Python and TypeScript SDKs cover generation, KV cache control, structured output, MCP, and tool calling. See [Your first inferlet](../guide/first-inferlet) for the Rust path and the `python-example` and `js-example` inferlets for the other two.
+No. Inferlets can be written in Rust, Python, or TypeScript. Rust is the canonical SDK, and a few advanced primitives (the raw `forward()` API, custom speculators, custom adapters) are Rust-only today. The Python and TypeScript SDKs cover generation, KV cache control, structured output, MCP, and tool calling. See [Your first inferlet](../guide/first-inferlet) for the Rust path.
 
 ## What is the cost we pay for programmability?
 
@@ -28,7 +28,7 @@ In sum, this adds about 1ms per-token latency overhead compared to vLLM regardle
 
 ### How many inferlets can I run in parallel?
 
-You can spawn as many inferlets as you can fit in memory. Pie reliably handles thousands of concurrent inferlets without noticeable overhead. The forward pass calls from these inferlets are batched together efficiently, e.g., under high concurrent load using text-completion inferlets, Pie matches vLLM's peak throughput.
+You can spawn as many inferlets as you can fit in memory. Pie reliably handles thousands of concurrent inferlets without noticeable overhead. Forward-pass calls from concurrent chat-completion inferlets are batched together efficiently.
 
 
 ## Does Pie support multi-GPU and multi-node?

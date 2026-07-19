@@ -278,17 +278,9 @@ impl GatewayHandle {
 /// in-proc embedded adapter (single-node); juliet injects a stub yielding a
 /// seeded [`RoutingTable`](pie_controller_rpc::RoutingTable) for the smoke.
 pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gateway> {
-    // Control plane: register + heartbeat + subscribe to the routing table.
-    let info = GatewayInfo {
-        addr: config.listen.to_string(),
-    };
-    let gateway_id = control
-        .register_gateway(info.clone())
-        .await
-        .context("register gateway with controller")?;
-    tracing::info!(%gateway_id, "gateway registered with controller");
+    // Subscribe to the routing table first — independent of our own
+    // registration, and needed to assemble the state below.
     let routing_rx = control.routing_watch();
-    tokio::spawn(controller::heartbeat_loop(control, gateway_id, info));
 
     // Assemble the four plane handles. The worker registry's connected-set watch
     // feeds alpha's selector (`RoutingTable.healthy ∩ connected`); the
@@ -309,13 +301,30 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
     };
 
     // Data plane: bind the worker-facing listener FIRST (workers dial IN, M3) so
-    // its resolved address is known before serving — the single-node launcher
-    // points its in-proc worker here, and the smoke harness dials it.
+    // its resolved address is known — that is the endpoint we must advertise,
+    // since workers learn where to dial from the roster the controller pushes
+    // them (gateway.md).
     let worker_server = worker::serve(config.worker_listen, sessions, workers)
         .await
         .context("start worker-facing data-plane server")?;
     let worker_addr = worker_server.bound;
     tracing::info!(%worker_addr, "gateway worker-facing listener up (workers dial in)");
+
+    // Control plane: register advertising the WORKER-FACING dial-in address (not
+    // the client edge), then heartbeat + hold the routing subscription. NOTE: a
+    // `worker_listen` bound to `0.0.0.0` resolves to an unroutable advertise
+    // address for remote workers — deployments must bind a routable interface
+    // (or front the gateways with a stable Service DNS name) so the pushed
+    // roster is dialable.
+    let info = GatewayInfo {
+        addr: worker_addr.to_string(),
+    };
+    let gateway_id = control
+        .register_gateway(info.clone())
+        .await
+        .context("register gateway with controller")?;
+    tracing::info!(%gateway_id, %worker_addr, "gateway registered with controller");
+    tokio::spawn(controller::heartbeat_loop(control, gateway_id, info));
 
     // Client plane: ingress + blob route-providers merge onto the one listener.
     let app = Router::new()

@@ -9,7 +9,7 @@
 
 use crate::Result;
 use crate::inference::Grammar;
-use crate::pie::core::inference::Matcher;
+use crate::pie::inferlet::grammar::Matcher;
 
 /// Token sampling constraint.
 ///

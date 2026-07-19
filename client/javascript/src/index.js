@@ -317,22 +317,6 @@ export class PieClient {
     }
 
     // =========================================================================
-    // Authentication
-    // =========================================================================
-
-    /**
-     * Authenticate using an internal token.
-     * @param {string} token The internal authentication token.
-     */
-    async authByToken(token) {
-        const msg = { type: "auth_by_token", token };
-        const { ok, result } = await this._sendMsgAndWait(msg);
-        if (!ok) {
-            throw new Error(`Authentication failed: ${result}`);
-        }
-    }
-
-    // =========================================================================
     // Queries
     // =========================================================================
 

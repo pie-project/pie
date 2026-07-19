@@ -1,36 +1,38 @@
-//! pie-driver-abi — canonical runtime ↔ driver ABI vocabulary for pie.
+//! pie-driver-abi — the final local runtime ↔ driver contract.
 //!
-//! This crate owns the wire ring and the in-node driver surface: the rich
-//! `#[schema]` rkyv types in [`schema`], the flat-POD descriptors in [`pod`]
-//! (cast-readable by C++/Python), the run-length tensor codec in [`brle`], the
-//! [`capabilities`] JSON handshake, and the [`kv`] layout/handle vocabulary the
-//! data-plane transport moves. It imports nothing internal except its own derive
-//! macro, so transport, runtime, drivers, and the in-proc IPC mechanism can all
-//! share this ABI without dragging in any transport or IPC machinery.
+//! This crate exposes the local ABI plus process-independent driver schemas:
 //!
-//! The wire format IS Rust source: the structs in [`schema`] carry
-//! `#[schema(...)]` which derives `Archive` + `Serialize` + `Deserialize` and
-//! emits every `extern "C"` reader, parse entry, descriptor type, and builder
-//! mechanically from the type name. Downstream Rust consumers import these
-//! structs directly — no IDL, no codegen, no mirror types.
+//! - [`local`]: plain `#[repr(C)]` direct-FFI descriptors and symbol declarations.
+//! - [`capabilities`]: reduced cold-path JSON facts used at create time.
+//! - [`transfer`]: Rust-only KV transfer vocabulary shared with cross-node transport.
+//! - [`plan`]: owned verb plans shared by local and remote backends.
+//! - [`remote`]: versioned worker-to-executor protocol.
 //!
-//! C++ downstream drivers go through the auto-generated C ABI (`include/`); rkyv
-//! itself is Rust-only.
+//! The committed `include/pie_driver_abi.h` header is generated from [`local`]
+//! via `pie-driver-abi-cbindgen`.
 
-pub mod brle;
 pub mod capabilities;
-pub mod kv;
-pub mod pod;
-pub mod schema;
+pub mod geometry;
+pub mod local;
+pub mod plan;
+pub mod remote;
+pub mod transfer;
 
-// Schema types are the public API. Re-export at the crate root so
-// `pie_driver_abi::Frame` etc. work without an extra namespace hop.
-pub use brle::Brle;
-pub use capabilities::DriverCapabilities;
-pub use kv::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
-// Flat-POD wire types (see `pod`): plain `#[repr(C)]`/`#[repr(u8)]` + rkyv,
-// embedded by value in the rich types via `#[schema(pod)]`.
-pub use pod::*;
-pub use schema::*;
-
-include!(concat!(env!("OUT_DIR"), "/schema_hash.rs"));
+pub use capabilities::{
+    DeviceFacts, DriverCapabilities, KV_COPY_DEVICE_TO_DEVICE, KV_COPY_DEVICE_TO_HOST,
+    KV_COPY_HOST_TO_DEVICE, KV_COPY_HOST_TO_HOST, ModelLoadDesc,
+};
+pub use geometry::{
+    GeometryClass, PIE_DECODE_ENVELOPE_PORTS, PIE_DEVICE_GEOMETRY_PORTS,
+    PIE_DEVICE_PORT_ATTN_MASK, PIE_DEVICE_PORT_EMBED_TOKENS, PIE_DEVICE_PORT_KV_LEN,
+    PIE_DEVICE_PORT_PAGE_INDPTR, PIE_DEVICE_PORT_PAGES, PIE_DEVICE_PORT_POSITIONS,
+    PIE_DEVICE_PORT_W_OFF, PIE_DEVICE_PORT_W_SLOT,
+};
+pub use local::*;
+pub use plan::{
+    CHANNEL_TICKET_NONE, ChannelRegistrationPlan, EncodedMask, KvCopyPlan, LaunchPlan,
+    MediaEncodePlan, PoolResizePlan, ProgramRegistration, RS_FLAG_FOLD, RS_FLAG_RESET,
+    StateCopyPlan,
+};
+pub use remote::*;
+pub use transfer::{KvDtype, KvExport, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};

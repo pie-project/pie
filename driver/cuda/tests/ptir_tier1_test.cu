@@ -1,7 +1,7 @@
-// PTIR tier-1 fusion gate test (charlie, thrust-3 P5). Emits a fused epilogue
+// PTIR tier-1 fusion gate test. Emits a fused epilogue
 // kernel (tier1_codegen.hpp), NVRTC-compiles + launches it, and asserts its
 // output is IDENTICAL to the tier-0 stage-runner on the same trace + inputs —
-// the P5 exit criterion (tier-1 == tier-0). Covers greedy argmax and a
+// the tier-1 == tier-0 exit criterion. Covers greedy argmax and a
 // temperature+Gumbel-max sample epilogue (the Sampling-IR stress case), fused
 // into ONE kernel.
 //
@@ -18,10 +18,10 @@
 #include <cuda_runtime.h>
 #include <nvrtc.h>
 
-#include "ptir/tier0_runner.hpp"
-#include "ptir/tier1_codegen.hpp"
+#include "pipeline/tier0/tier0_runner.hpp"
+#include "support/tier1_codegen.hpp"
 
-using namespace pie_cuda_driver::ptir;
+using namespace pie_cuda_driver::pipeline;
 
 namespace {
 int g_pass = 0, g_fail = 0;
@@ -79,7 +79,9 @@ Trace build_epilogue(std::uint32_t V, bool gumbel, float inv_t, std::uint32_t st
         Value mv = mk(next, logv, ValueSource::OpResult); t.values.push_back(mv); ValueId mulid = next++;
         Op mul; mul.code = OpCode::Mul; mul.args = {0, cid}; mul.result_type = logv; mul.result_id = mulid; ep.ops.push_back(mul);
         Value gv = mk(next, logv, ValueSource::OpResult); t.values.push_back(gv); ValueId gid = next++;
-        Op gm; gm.code = OpCode::GumbelNoise; gm.result_type = logv; gm.result_id = gid; gm.imm = stream; ep.ops.push_back(gm);
+        Op gm; gm.code = OpCode::Rng; gm.rng_kind = RngKind::Gumbel;
+        gm.result_type = logv; gm.result_id = gid; gm.imm = stream;
+        ep.ops.push_back(gm);
         Value av = mk(next, logv, ValueSource::OpResult); t.values.push_back(av); ValueId aid = next++;
         Op add; add.code = OpCode::Add; add.args = {mulid, gid}; add.result_type = logv; add.result_id = aid; ep.ops.push_back(add);
         reduce_in = aid;
@@ -235,7 +237,7 @@ int main() {
     run_case("temp+gumbel V=1024 T=1.0 s1", 1024, true, 1.0f, 1, 987654);
     run_case("temp+gumbel V=32000 T=0.8 s2", 32000, true, 1.0f / 0.8f, 2, 555);
 
-    // §3 epilogue sampling-core fusion (masked Gumbel-max), the M1 tier-1 step.
+    // §3 epilogue sampling-core fusion (masked Gumbel-max), the tier-1 step.
     run_masked_gumbel("section3-core V=64", 64, 123456u, 0u);
     run_masked_gumbel("section3-core V=4096", 4096, 777u, 3u);
     run_masked_gumbel("section3-core V=32000", 32000, 2024u, 9u);

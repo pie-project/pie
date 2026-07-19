@@ -1,6 +1,6 @@
 #pragma once
 
-// PTIR M3.2 — Quest page-envelope kernels (overview §6.1). A program running
+// Quest page-envelope kernels (overview §6.1). A program running
 // Quest attention selects the top-`budget` KV pages per step by an importance
 // score derived from each page's per-dimension key min/max ENVELOPE:
 //
@@ -10,7 +10,7 @@
 //
 // i.e. the MAX possible q·k achievable by any key inside the page's envelope
 // (an upper bound on the page's attention logit — Quest criticality). Two
-// standalone kernels, NOT attention-kernel modifications (outside the W11 ban):
+// standalone kernels, not attention-kernel modifications:
 //
 //   1. `envelope_recompute` — maintenance: reduce each page's live keys to the
 //      per-(page, kv_head, dim) min/max envelope. (The KV-append incremental

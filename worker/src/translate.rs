@@ -5,9 +5,8 @@
 //! constructs through the pyo3 `pie._runtime.Config` builder. We do
 //! the same construction here in pure Rust, sourcing:
 //!   * scalars from the user TOML
-//!   * dirs (cache/log/auth) from `pie_engine::util` (`~/.pie/...`)
-//!   * caps from the per-model
-//!     [`ModelHandshake`] inputs collected at boot.
+//!   * dirs (cache/log/runtime) from `bootstrap::paths::pie_home()` (`~/.pie/...`)
+//!   * capability/backend bundles collected before bootstrap.
 
 use std::path::PathBuf;
 
@@ -16,56 +15,39 @@ use anyhow::Result;
 use crate::config;
 use crate::embedded_driver::DriverCapabilities;
 
-/// Per-DP-group handshake snapshot taken right after a driver thread
-/// emits caps.
-pub struct GroupHandshake {
-    /// Caps the driver returned over the `ready_cb` callback.
+/// Per-driver bundle created before bootstrap.
+pub struct GroupDriver {
     pub caps: DriverCapabilities,
+    pub backend: pie_engine::driver::DriverBackend,
 }
 
-/// Per-model bundle of group handshakes. One model with DP=N produces
-/// `N` entries here; one entry per `DriverConfig` in the resulting
-/// bootstrap config. Group ordering must match the runtime's flat
-/// driver-index assignment (`driver::register_driver` returns indices
-/// in call order).
-pub struct ModelHandshake {
-    pub groups: Vec<GroupHandshake>,
+/// Per-model bundle of concrete driver backends. One model with DP=N produces
+/// `N` entries here; one entry per bootstrap driver config.
+pub struct ModelDrivers {
+    pub groups: Vec<GroupDriver>,
 }
 
 pub fn build(
     user: &config::Config,
-    handshakes: &[ModelHandshake],
+    drivers: ModelDrivers,
 ) -> Result<pie_engine::bootstrap::Config> {
-    if handshakes.len() != 1 {
+    if drivers.groups.is_empty() {
         anyhow::bail!(
-            "internal: expected exactly one handshake bundle for the single \
-             model, got {}",
-            handshakes.len()
-        );
-    }
-    let handshake = &handshakes[0];
-    if handshake.groups.is_empty() {
-        anyhow::bail!(
-            "internal: model {:?} has zero group handshakes; \
+            "internal: model {:?} has zero native drivers; \
              expected at least one driver per model",
             user.model.name,
         );
     }
 
-    let pie_home = pie_engine::util::get_pie_home();
+    let pie_home = bootstrap::paths::pie_home();
     let cache_dir = pie_home.join("programs");
     let log_dir = Some(pie_home.join("logs"));
-    let auth_dir = pie_home.join("auth");
 
-    let model = build_model(&user.model, handshake);
+    let model = build_model(&user.model, drivers)?;
 
     Ok(pie_engine::bootstrap::Config {
         host: user.server.host.clone(),
         port: user.server.port,
-        auth: pie_engine::bootstrap::AuthConfig {
-            enabled: user.auth.enabled,
-            authorized_users_dir: auth_dir,
-        },
         cache_dir,
         verbose: user.server.verbose,
         log_dir,
@@ -86,6 +68,7 @@ pub fn build(
             allow_network: user.runtime.allow_network,
             network_allowed_hosts: user.runtime.network_allowed_hosts.clone(),
             max_upload_mb: user.runtime.max_upload_mb,
+            py_runtime_dir: pie_home.join("py-runtime"),
         },
         model,
         // The `bootstrap` lib (Seam 2) installs the global tracing subscriber;
@@ -96,11 +79,14 @@ pub fn build(
     })
 }
 
-fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie_engine::bootstrap::ModelConfig {
+fn build_model(
+    m: &config::ModelConfig,
+    drivers: ModelDrivers,
+) -> Result<pie_engine::bootstrap::ModelConfig> {
     // Arch + kv_page_size + tokenizer come from group 0; all groups
     // serve the same model so they agree. Per-group caps can differ in
     // memory-derived capacities — those flow through the per-driver entries.
-    let group0_caps = &hs.groups[0].caps;
+    let group0_caps = drivers.groups[0].caps.clone();
     let snapshot_dir = PathBuf::from(&group0_caps.snapshot_dir);
     let tokenizer_json = snapshot_dir.join("tokenizer.json");
     let tokenizer_path = if tokenizer_json.exists() {
@@ -109,45 +95,46 @@ fn build_model(m: &config::ModelConfig, hs: &ModelHandshake) -> pie_engine::boot
         snapshot_dir.join("tiktoken.model")
     };
 
-    let drivers = hs
+    let drivers = drivers
         .groups
-        .iter()
-        .map(|g| pie_engine::bootstrap::DriverConfig {
-            total_pages: g.caps.total_pages as usize,
-            cpu_pages: g.caps.swap_pool_size as usize,
-            rs_cache_required: g.caps.rs_cache_required,
-            rs_cache_slots: g.caps.rs_cache_slots as usize,
-            rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
-            rs_cache_spec_rollback: g.caps.rs_cache_spec_rollback,
-            limits: pie_engine::driver::SchedulerLimits {
-                max_forward_requests: g.caps.max_forward_requests as usize,
-                max_forward_tokens: g.caps.max_forward_tokens as usize,
-                max_page_refs: g.caps.max_page_refs as usize,
-                max_logit_rows: g.caps.max_logit_rows as usize,
-                max_prob_rows: g.caps.max_prob_rows as usize,
-                max_sampler_rows: g.caps.max_sampler_rows as usize,
-                max_custom_mask_bytes: g.caps.max_custom_mask_bytes as usize,
-                max_logprob_labels: g.caps.max_logprob_labels as usize,
-            },
+        .into_iter()
+        .map(|g| {
+            let backend_kind = g.backend.kind().to_string();
+            pie_engine::bootstrap::DriverConfig {
+                total_pages: g.caps.total_pages as usize,
+                cpu_pages: g.caps.swap_pool_size as usize,
+                kv_copy_domain_mask: g.caps.kv_copy_domain_mask,
+                backend_kind,
+                rs_cache_required: g.caps.rs_cache_required,
+                rs_cache_slots: g.caps.rs_cache_slots as usize,
+                rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
+                elastic_page_bytes: g.caps.elastic_page_bytes,
+                elastic_budget_pages: g.caps.elastic_budget_pages,
+                has_mtp_logits: g.caps.has_mtp_logits,
+                has_mtp_drafts: g.caps.has_mtp_drafts,
+                has_value_head: g.caps.has_value_head,
+                device_geometry_port_mask: g.caps.device_geometry_port_mask,
+                limits: pie_engine::driver::SchedulerLimits {
+                    max_forward_requests: g.caps.max_forward_requests as usize,
+                    max_forward_tokens: g.caps.max_forward_tokens as usize,
+                    max_page_refs: g.caps.max_page_refs as usize,
+                },
+                driver_backend: g.backend,
+            }
         })
         .collect();
 
-    pie_engine::bootstrap::ModelConfig {
+    Ok(pie_engine::bootstrap::ModelConfig {
         name: m.name.clone(),
-        arch_name: group0_caps.arch_name.clone(),
+        arch_name: group0_caps.arch_name,
         kv_page_size: group0_caps.kv_page_size as usize,
         tokenizer_path,
-        system_speculation_supported: hs
-            .groups
-            .iter()
-            .all(|g| g.caps.system_speculation_supported),
-        enable_system_speculation: hs.groups.iter().all(|g| g.caps.enable_system_speculation),
         drivers,
         scheduler: pie_engine::bootstrap::SchedulerConfig {
             request_timeout_secs: m.scheduler.request_timeout_secs,
             restore_pause_at_utilization: m.scheduler.restore_pause_at_utilization,
         },
-    }
+    })
 }
 
 #[cfg(test)]
@@ -156,35 +143,63 @@ mod tests {
 
     fn fixture_caps() -> DriverCapabilities {
         DriverCapabilities {
+            abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
             total_pages: 1024,
             kv_page_size: 32,
             swap_pool_size: 0,
+            kv_copy_domain_mask: pie_driver_abi::KV_COPY_DEVICE_TO_DEVICE,
             max_forward_tokens: 4096,
             max_forward_requests: 512,
             max_page_refs: 262144,
-            max_logit_rows: 4096,
-            max_prob_rows: 4096,
-            max_custom_mask_bytes: 8 * 1024 * 1024,
-            max_sampler_rows: 4096,
-            max_logprob_labels: 4096,
             arch_name: "qwen3".into(),
             vocab_size: 151936,
             max_model_len: 4096,
             activation_dtype: "bfloat16".into(),
+            hidden_size: 4096,
+            supports_media_encode: false,
             snapshot_dir: "/tmp/snapshot".into(),
-            storage_backend: String::new(),
-            max_tile_bytes: 0,
-            preferred_alignment: 0,
-            mxfp4_moe_policy: String::new(),
-            native_mxfp4_moe: false,
-            shmem_name: Some("/pie_shmem_g0".into()),
             rs_cache_required: false,
             rs_cache_slots: 0,
             rs_cache_slot_bytes: 0,
-            rs_cache_spec_rollback: false,
-            system_speculation_supported: false,
-            enable_system_speculation: false,
+            elastic_page_bytes: 0,
+            elastic_budget_pages: 0,
+            has_mtp_logits: true,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
+            kv_handle: None,
         }
+    }
+
+    fn fixture_group(caps: DriverCapabilities) -> GroupDriver {
+        let dummy = pie_driver_dummy_lib::DummyDriverOptions {
+            total_pages: caps.total_pages,
+            kv_page_size: caps.kv_page_size,
+            swap_pool_size: caps.swap_pool_size,
+            vocab_size: caps.vocab_size,
+            max_model_len: caps.max_model_len,
+            arch_name: caps.arch_name.clone(),
+            activation_dtype: caps.activation_dtype.clone(),
+            snapshot_dir: caps.snapshot_dir.clone(),
+            max_forward_tokens: caps.max_forward_tokens,
+            max_forward_requests: caps.max_forward_requests,
+            max_page_refs: caps.max_page_refs,
+            has_mtp_logits: caps.has_mtp_logits,
+            has_mtp_drafts: caps.has_mtp_drafts,
+            has_value_head: caps.has_value_head,
+            callback_delay_ms: 0,
+            reject_launches: false,
+            reject_launches_remaining: 0,
+            fail_launches_after_accept: false,
+            retry_launches_remaining: 0,
+            elastic_admission: false,
+            prepare_exhaustions_remaining: 0,
+            prepare_impossible_above_kv_pages: 0,
+            operation_log: None,
+            launch_observer: None,
+        };
+        let (backend, _) = pie_engine::driver::DriverBackend::dummy(dummy).unwrap();
+        GroupDriver { caps, backend }
     }
 
     #[test]
@@ -214,11 +229,13 @@ arch_name = "qwen3"
         let mut caps = fixture_caps();
         caps.snapshot_dir = snap.path().to_string_lossy().into_owned();
 
-        let handshakes = vec![ModelHandshake {
-            groups: vec![GroupHandshake { caps }],
-        }];
-
-        let cfg = build(&user, &handshakes).unwrap();
+        let cfg = build(
+            &user,
+            ModelDrivers {
+                groups: vec![fixture_group(caps)],
+            },
+        )
+        .unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 8080);
         let m = &cfg.model;
@@ -229,6 +246,11 @@ arch_name = "qwen3"
         assert_eq!(m.drivers.len(), 1);
         assert_eq!(m.drivers[0].total_pages, 1024);
         assert_eq!(m.drivers[0].limits.max_page_refs, 262144);
+        assert!(m.drivers[0].has_mtp_logits);
+        assert_eq!(
+            m.drivers[0].device_geometry_port_mask,
+            pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
+        );
     }
 
     #[test]
@@ -251,19 +273,15 @@ arch_name = "qwen3"
 
         // DP=2 → two groups, each with its own driver channel + caps.
         let mut g1 = fixture_caps();
-        g1.shmem_name = Some("/pie_shmem_g1".into());
         g1.total_pages = 2048;
 
-        let handshakes = vec![ModelHandshake {
-            groups: vec![
-                GroupHandshake {
-                    caps: fixture_caps(),
-                },
-                GroupHandshake { caps: g1 },
-            ],
-        }];
-
-        let cfg = build(&user, &handshakes).unwrap();
+        let cfg = build(
+            &user,
+            ModelDrivers {
+                groups: vec![fixture_group(fixture_caps()), fixture_group(g1)],
+            },
+        )
+        .unwrap();
         let m = &cfg.model;
         assert_eq!(m.drivers.len(), 2);
         assert_eq!(m.drivers[0].total_pages, 1024);
@@ -271,7 +289,7 @@ arch_name = "qwen3"
     }
 
     #[test]
-    fn handshake_count_must_match() {
+    fn requires_at_least_one_driver() {
         let user: config::Config = toml::from_str(
             r#"
 [model]
@@ -283,29 +301,10 @@ device = ["cpu"]
 "#,
         )
         .unwrap();
-        let err = build(&user, &[]).unwrap_err().to_string();
-        assert!(
-            err.contains("expected exactly one handshake bundle"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn empty_groups_rejected() {
-        let user: config::Config = toml::from_str(
-            r#"
-[model]
-name = "a"
-hf_repo = "x"
-[model.driver]
-type = "dummy"
-device = ["cpu"]
-"#,
-        )
-        .unwrap();
-        let err = build(&user, &[ModelHandshake { groups: vec![] }])
-            .unwrap_err()
+        let err = build(&user, ModelDrivers { groups: vec![] })
+            .err()
+            .unwrap()
             .to_string();
-        assert!(err.contains("zero group handshakes"), "got: {err}");
+        assert!(err.contains("zero native drivers"), "got: {err}");
     }
 }

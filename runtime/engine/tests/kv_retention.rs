@@ -34,8 +34,8 @@ use std::time::Duration;
 mod common;
 use common::{MockEnv, create_mock_env, inferlets, mock_device::Behavior};
 
-use pie_engine::process;
-use pie_engine::program::ProgramName;
+use pie_engine::inferlet::process;
+use pie_engine::inferlet::program::ProgramName;
 
 const FLEET: usize = 8;
 /// Enough physical pages that a correct engine hands each concurrent request its
@@ -51,22 +51,22 @@ const FIRE_LATENCY: Duration = Duration::from_millis(15);
 /// Per-fire log of per-request `kv_page_indices` runs (split by `kv_page_indptr`).
 type FireLog = Arc<Mutex<Vec<Vec<Vec<u32>>>>>;
 
-/// Wraps the echo token response, recording each fire's per-request page runs
-/// so the test can inspect the physical-page *assignment* the runtime arena
-/// produced (the surface charlie instrumented on the driver). A per-fire
-/// `thread::sleep` keeps the whole fleet outstanding so the decodes provably
-/// overlap.
+/// Records each observed launch's per-request page runs.
 struct PageProbe {
-    echo: u32,
     latency: Duration,
     log: FireLog,
 }
 
 impl Behavior for PageProbe {
-    fn handle_fire_batch(
-        &self,
-        req: &pie_driver_abi::ForwardRequest,
-    ) -> pie_driver_abi::ForwardResponse {
+    fn observe_launch(&self, req: &pie_engine::driver::LaunchPlan) {
+        if req.kv_page_indices.is_empty() && !req.kv_translation.is_empty() {
+            self.log
+                .lock()
+                .unwrap()
+                .push(vec![req.kv_translation.clone()]);
+            std::thread::sleep(self.latency);
+            return;
+        }
         let indptr = &req.kv_page_indptr;
         let pages = &req.kv_page_indices;
         let n = indptr.len().saturating_sub(1);
@@ -80,23 +80,6 @@ impl Behavior for PageProbe {
 
         // Stay outstanding so the fleet is provably concurrently live.
         std::thread::sleep(self.latency);
-
-        // Echo token response (one token per request), like `EchoBehavior`.
-        let tokens = vec![self.echo; n];
-        let tn = tokens.len() as u32;
-        pie_driver_abi::ForwardResponse {
-            num_requests: tn,
-            tokens_indptr: (0..=tn).collect(),
-            tokens,
-            dists_req_indptr: vec![0; (tn + 1) as usize],
-            dists_kv_indptr: vec![0],
-            logits_req_indptr: vec![0; (tn + 1) as usize],
-            logits_byte_indptr: vec![0],
-            logprobs_req_indptr: vec![0; (tn + 1) as usize],
-            logprobs_val_indptr: vec![0],
-            entropies_indptr: vec![0; (tn + 1) as usize],
-            ..Default::default()
-        }
     }
 }
 
@@ -123,7 +106,6 @@ fn state() -> &'static TestState {
             .map(Duration::from_millis)
             .unwrap_or(FIRE_LATENCY);
         let behavior = Arc::new(PageProbe {
-            echo: 42,
             latency,
             log: log.clone(),
         });
@@ -160,8 +142,15 @@ fn run_concurrent_fleet(s: &TestState) {
                 rx
             })
             .collect();
-        for rx in rxs {
-            let _ = tokio::time::timeout(PROCESS_TIMEOUT, rx).await;
+        for (lane, rx) in rxs.into_iter().enumerate() {
+            match tokio::time::timeout(PROCESS_TIMEOUT, rx).await {
+                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Err(error))) => {
+                    panic!("retention lane {lane} failed: {error}")
+                }
+                Ok(Err(_)) => panic!("retention lane {lane} result channel dropped"),
+                Err(_) => panic!("retention lane {lane} timed out"),
+            }
         }
     });
 }
@@ -205,7 +194,10 @@ fn concurrent_decode_retains_disjoint_kv_pages() {
         distinct_write.len(),
         all_pages.len(),
     );
-    eprintln!("[kv-retention] top write pages (page → #fires): {:?}", &top[..top.len().min(6)]);
+    eprintln!(
+        "[kv-retention] top write pages (page → #fires): {:?}",
+        &top[..top.len().min(6)]
+    );
 
     assert!(
         distinct_write.len() >= FLEET,

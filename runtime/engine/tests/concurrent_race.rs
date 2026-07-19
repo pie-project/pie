@@ -1,5 +1,5 @@
 //! **Host-side concurrent-decode RACE probe** (bravo, support for alpha's arena
-//! bug). The `cuda_bubble.rs` GPU repro shows concurrent multi-pipeline decode
+//! bug). The `cuda_concurrent` GPU repro shows concurrent multi-pipeline decode
 //! produces garbage + `arena: unknown object` on the real driver, but the plain
 //! synchronous mock (`e2e::concurrent_decode_fleet`) is CLEAN — the mock returns
 //! instantly, so concurrent forwards never actually overlap in flight and the
@@ -16,8 +16,8 @@ mod common;
 use common::mock_device::{DelayedBehavior, EchoBehavior};
 use common::{MockEnv, create_mock_env, inferlets};
 
-use pie_engine::process;
-use pie_engine::program::ProgramName;
+use pie_engine::inferlet::process;
+use pie_engine::inferlet::program::ProgramName;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
 /// Per-fire simulated device latency — long enough that the whole fleet is in

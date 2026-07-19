@@ -1,4 +1,4 @@
-// PTIR M3 — gather_tokens correctness + bandwidth test.
+// gather_tokens correctness + bandwidth test.
 //
 // Correctness: fill paged K/V so each bf16 element encodes its global index,
 // run a gather plan through the kernel, and verify every destination element

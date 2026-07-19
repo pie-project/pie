@@ -3,11 +3,11 @@
 //! Uses <|start_header_id|>role<|end_header_id|> delimiters.
 //! Tool responses use the `ipython` role.
 
-use pie_grammar::grammar::Grammar;
 use crate::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
+use pie_grammar::grammar::Grammar;
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;
 

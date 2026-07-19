@@ -24,14 +24,15 @@ crate-type = ["rlib"]
 # kept as a compatibility no-op for older build commands; the dummy
 # Rust driver is no longer gated.
 default = []
-driver-cuda = ["dep:pie-weight-loader", "pie-engine/driver-cuda"]
-driver-metal = ["dep:pie-weight-loader"]
+driver-cuda = ["pie-engine/driver-cuda"]
+driver-metal = ["pie-engine/driver-metal"]
 driver-dummy = []
+nixl = ["dep:pie-transport", "pie-transport/nixl"]
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
-# corresponding flag. See `pie/src/probe/` for the catalog of domains.
+# corresponding flag. See `runtime/engine/src/scheduler/probe.rs` for the
+# catalog of domains.
 profile-fire = ["pie-engine/profile-fire"]
-profile-driver-cuda = ["pie-engine/profile-driver-cuda"]
 profile-hot-path = ["pie-engine/profile-hot-path"]
 profile-all = ["pie-engine/profile-all"]
 
@@ -42,6 +43,7 @@ profile-all = ["pie-engine/profile-all"]
 # bundled into the `pie-driver-bridge` wheel via maturin), not in the
 # runtime crate itself.
 pie-engine = { path = "../runtime/engine" }
+pie-bootstrap = { path = "../bootstrap" }
 # Shared tarpc control-plane contract.
 pie-controller-rpc = { path = "../interface/controller" }
 # Gateway data-plane RPC contract (post-inversion M3): GatewayInbound +
@@ -52,25 +54,23 @@ pie-worker-rpc = { path = "../interface/worker" }
 # Direct dep so this crate's build script receives `DEP_PIE_DRIVER_ABI_INCLUDE`
 # (the C header dir) from pie-driver-abi's `links` build-script handoff.
 pie-driver-abi = { path = "../interface/driver" }
+pie-transport = { path = "../driver/transport", optional = true }
 # Shared id atoms (WorkerId / NodeId / ReqId / SessionId) and the client wire
 # vocabulary (ClientMessage / ServerMessage) the gateway data plane carries.
 pie-ids = { path = "../interface/ids" }
 pie-client-api = { path = "../interface/client" }
-# Direct dep for the parallel `DEP_PIE_IPC_INCLUDE` handoff (the in-proc
-# vtable header `pie_ipc.h` + `pie_ipc/inproc_server.hpp`).
-pie-ipc = { path = "../driver/ipc" }
 anyhow = "1.0"
 rmp-serde = "1.3"
 # Verify content-addressed blob fetches (design §9): blake3(body) == BlobRef.hash.
 blake3 = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.9"
-tokio = { version = "1.52", features = ["full"] }
+toml = "1.1"
+tokio = { version = "1.53", features = ["full"] }
 # `serde-transport-bincode` = control-plane codec (pie-controller-rpc client). The
 # data-plane codec is single-sourced in `pie-worker-rpc` (`dispatch_codec`,
 # MessagePack), so no `serde-transport-json` here.
-tarpc = { version = "0.35", features = [
+tarpc = { version = "0.37", features = [
 	"serde-transport",
 	"serde-transport-bincode",
 	"tcp",
@@ -78,24 +78,19 @@ tarpc = { version = "0.35", features = [
 ] }
 # The WebSocket the standalone client server terminates (client wire vocabulary
 # comes from `pie-client`, already a dependency below).
-tokio-tungstenite = "0.28.0"
-futures = "0.3.31"
+tokio-tungstenite = "0.30.0"
+futures = "0.3.33"
 mimalloc = "0.1"
 tracing = "0.1"
-# `shm_unlink` for the hard-kill cleanup path; see serve.rs's shutdown
-# branch. Drivers normally clean up on graceful exit, but a SIGKILL
-# leaves the POSIX shmem region behind — we call shm_unlink directly
-# so the next launch doesn't trip on a stale segment.
-libc = "0.2"
 # Async HTTP client for the data-plane blob fetch (gateway_link.rs): the
 # worker pulls `GET {origin}/blob/{hash}` for multimodal inputs during
 # inference (design §9). Provisioning downloads (weights, py-runtime) live in
 # `bin/pie`, so no `blocking` here — blob fetch is async.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 
 # Always-linked Rust dummy driver — random tokens, no model load.
 pie-driver-dummy = { path = "../driver/dummy" }
-pie-weight-loader = { path = "../driver/weight-loader", optional = true }
+pie-load-planner = { path = "../runtime/load-planner" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
 # the engine subprocess we boot. Same crate the dummy_roundtrip example
@@ -104,6 +99,7 @@ pie-client = { path = "../client/rust" }
 
 [dev-dependencies]
 tempfile = "3"
+pie-ptir = { path = "../interface/ptir" }
 
 [build-dependencies]
 cmake = "0.1"

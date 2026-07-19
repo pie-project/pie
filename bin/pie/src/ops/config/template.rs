@@ -108,8 +108,6 @@ type = "cuda_native"
 device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
-# ipc_profile omitted: cuda_native defaults to "latency".
-# Set "power" to minimize idle CPU.
 
 [model.driver.options]
 gpu_mem_utilization = 0.90
@@ -127,7 +125,6 @@ const DUMMY_DRIVER_BLOCK: &str = r#"
 type = "dummy"
 device = ["cpu"]
 activation_dtype = "bfloat16"
-ipc_profile = "balanced" # "latency", "balanced", or "power"
 
 [model.driver.options]
 vocab_size = 151936

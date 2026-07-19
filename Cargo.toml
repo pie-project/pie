@@ -1,8 +1,8 @@
 # Top-level Cargo workspace for the host-side Rust crates.
 #
 # Members are the crates that build for the host (Linux/macOS x86_64/aarch64).
-# Wasm-target crates (`inferlets/*`, `sdk/rust/*`) are intentionally excluded —
-# they have their own Cargo.lock files and target `wasm32-wasip3`, so mixing
+# Wasm-target crates (`tests/inferlets/*`, `sdk/rust/*`) are intentionally excluded —
+# they have their own Cargo.lock files and target `wasm32-wasip2`, so mixing
 # them into this workspace's resolver would pull wasm-only deps into the host
 # build graph.
 [workspace]
@@ -27,11 +27,11 @@ members = [
     "driver/transport",
     "client/rust",
     # Interface crates — boundary-named contracts (see designs/design-interface-restructure).
-    # ids: deduped id atoms (plain serde leaf). driver: rkyv ring + POD + capabilities + kv,
-    # with its 2 codegen tools. controller/worker/client: control-plane, data-plane, public-edge.
+    # ids: deduped id atoms (plain serde leaf). driver: direct local FFI ABI +
+    # cold capabilities + transfer vocabulary, with its cbindgen tool.
+    # controller/worker/client: control-plane, data-plane, public-edge.
     "interface/ids",
     "interface/driver",
-    "interface/driver/derive",
     "interface/driver/cbindgen",
     "interface/controller",
     "interface/worker",
@@ -40,9 +40,8 @@ members = [
     # (stage-tagged trace container + validation + versioned wire format).
     # `no_std` core; the wasm SDK depends on it with `default-features = false`.
     "interface/ptir",
-    "driver/ipc",
     "driver/dummy",
-    "driver/weight-loader",
+    "runtime/load-planner",
     "sdk/python-server",
     # Thin binary shells composing bootstrap + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).
@@ -52,8 +51,13 @@ members = [
     "bin/pie",
 ]
 exclude = [
-    "inferlets",
+    "tests/inferlets",
     "sdk/rust",
+    # Worktree checkouts under .claude/worktrees/ must never be captured by
+    # THIS manifest when cargo walks up from a worktree's excluded package
+    # (e.g. .claude/worktrees/<x>/tests/inferlets/<name> — the worktree's own root
+    # excludes it, so the walk continues up to here).
+    ".claude",
 ]
 
 # Distribution profile for `pie-worker`. Use

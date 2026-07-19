@@ -53,12 +53,14 @@ __global__ void write_mla_kernel(
     const std::uint32_t* __restrict__ kv_page_indices,
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
+    const std::uint8_t* __restrict__ row_valid,
     int R,
     int page_size,
     int kv_lora_rank,
     int qk_rope_head_dim)
 {
     const int t = blockIdx.x;
+    if (row_valid != nullptr && row_valid[t] == 0) return;
     int actual_page = 0;
     int offset_in_page = 0;
     resolve_dst(qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
@@ -97,7 +99,8 @@ void launch_write_mla_to_pages_bf16(
     int page_size,
     int kv_lora_rank,
     int qk_rope_head_dim,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const std::uint8_t* row_valid)
 {
     if (total_tokens <= 0) return;
     write_mla_kernel<<<total_tokens, 256, 0, stream>>>(
@@ -106,6 +109,7 @@ void launch_write_mla_to_pages_bf16(
         static_cast<__nv_bfloat16*>(ckv_pages),
         static_cast<__nv_bfloat16*>(kpe_pages),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+        row_valid,
         num_requests, page_size, kv_lora_rank, qk_rope_head_dim);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -120,13 +124,14 @@ void launch_write_mla_to_pages(
     const std::uint32_t* kv_last_page_lens,
     int total_tokens,
     int num_requests,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const std::uint8_t* row_valid)
 {
     launch_write_mla_to_pages_bf16(
         layer.ckv_pages, layer.kpe_pages, ckv_curr, kpe_curr,
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
         total_tokens, num_requests, layer.page_size, layer.kv_lora_rank,
-        layer.qk_rope_head_dim, stream);
+        layer.qk_rope_head_dim, stream, row_valid);
 }
 
 }  // namespace pie_cuda_driver::kernels

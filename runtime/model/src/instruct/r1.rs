@@ -3,11 +3,11 @@
 //! Uses fullwidth Unicode delimiters for roles and tool calls.
 //! Reference: DeepSeek R1 Jinja chat template with tool-calling support.
 
-use pie_grammar::grammar::Grammar;
 use crate::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
 };
+use pie_grammar::grammar::Grammar;
 use pie_tokenizer::Tokenizer;
 use std::sync::Arc;
 

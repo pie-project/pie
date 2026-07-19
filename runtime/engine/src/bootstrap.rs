@@ -2,26 +2,69 @@ use anyhow::{Context, Result, ensure};
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::arena;
 use crate::driver;
-use crate::inference;
-use crate::linker;
-use crate::messaging;
-use pie_model as model;
-use crate::process;
-use crate::program;
+use crate::inferlet::sandbox::{FsPolicy, NetworkPolicy};
+use crate::inferlet::{linker, process, program, python};
 use crate::server;
 use crate::telemetry;
+use pie_model as model;
 
-#[derive(Debug, Clone)]
+static RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct ActiveRuntimeGuard {
+    armed: bool,
+}
+
+impl ActiveRuntimeGuard {
+    fn acquire() -> Result<Self> {
+        ensure!(
+            !RUNTIME_ACTIVE.swap(true, Ordering::AcqRel),
+            "runtime bootstrap is single-use in this process; start a fresh process for another engine"
+        );
+        Ok(Self { armed: true })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ActiveRuntimeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            RUNTIME_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+}
+
+struct RuntimeShutdown {
+    scheduler: crate::scheduler::SchedulerShutdownHandle,
+    driver_ids: Vec<usize>,
+    elastic_trim_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RuntimeShutdown {
+    async fn shutdown(self) -> Result<()> {
+        if let Some(task) = self.elastic_trim_task {
+            task.abort();
+        }
+        let scheduler_result = self.scheduler.shutdown().await;
+        for driver_id in self.driver_ids {
+            let _ = driver::backend::unregister_driver(driver_id);
+        }
+        crate::store::registry::dump_kv_lock_trace()?;
+        scheduler_result
+    }
+}
+
 pub struct Config {
     pub host: String,
     pub port: u16,
-    pub auth: AuthConfig,
     pub cache_dir: PathBuf,
     pub verbose: bool,
     pub log_dir: Option<PathBuf>,
@@ -87,35 +130,35 @@ pub struct RuntimeConfig {
     /// Per-upload cap on cumulative bytes (program installs +
     /// `session.send_file` blobs), in MiB.
     pub max_upload_mb: usize,
+    /// Concrete py-runtime root passed in by the embedding worker.
+    pub py_runtime_dir: PathBuf,
 }
 
-#[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub name: String,
     pub arch_name: String,
     pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
-    /// True when every driver group wired a system drafter (the capability
-    /// signal). Manual/user drafts require this; auto-drafting additionally
-    /// requires `enable_system_speculation`.
-    pub system_speculation_supported: bool,
-    /// Operator opt-in for system speculation (deployment config, default
-    /// false). The runtime drives system drafts only when this is true AND the
-    /// model supports it; manual/user-supplied drafts are honored regardless.
-    pub enable_system_speculation: bool,
     pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }
 
-#[derive(Debug, Clone)]
 pub struct DriverConfig {
     pub total_pages: usize,
     pub cpu_pages: usize,
+    pub kv_copy_domain_mask: u32,
+    pub backend_kind: String,
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
-    pub rs_cache_spec_rollback: bool,
+    pub elastic_page_bytes: u64,
+    pub elastic_budget_pages: u64,
+    pub has_mtp_logits: bool,
+    pub has_mtp_drafts: bool,
+    pub has_value_head: bool,
+    pub device_geometry_port_mask: u32,
     pub limits: crate::driver::SchedulerLimits,
+    pub driver_backend: crate::driver::DriverBackend,
 }
 
 #[derive(Debug, Clone)]
@@ -135,16 +178,20 @@ pub struct TelemetryConfig {
     pub service_name: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct AuthConfig {
-    pub enabled: bool,
-    pub authorized_users_dir: PathBuf,
+pub struct BootstrapHandle {
+    pub port: u16,
+    pub model_idx: usize,
+    shutdown: Option<RuntimeShutdown>,
 }
 
-#[derive(Debug, Clone)]
-pub struct BootstrapHandle {
-    pub token: String,
-    pub port: u16,
+impl BootstrapHandle {
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown.shutdown().await
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
@@ -162,6 +209,7 @@ pub async fn bootstrap_with_listener(
 
 async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     verify_config(&config)?;
+    let mut active_guard = ActiveRuntimeGuard::acquire()?;
 
     if !config.skip_tracing {
         init_tracing(&config.log_dir, config.verbose, &config.telemetry)?;
@@ -173,7 +221,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // runtime state rather than loading their own copies.
     // The Python runtime shared modules must load before the linker and
     // program services spawn, so both read from shared runtime state.
-    crate::program::python::runtime::init(&wasm_engine, config.python_snapshot);
+    python::runtime::init(
+        &wasm_engine,
+        &config.runtime.py_runtime_dir,
+        config.python_snapshot,
+    );
 
     program::spawn(
         &wasm_engine,
@@ -184,11 +236,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // Compile per-instance security policies once. Network policy
     // parsing fails fast on bad config (typo'd CIDRs, `"*"` mixed with
     // rules, etc.) — better here than on the first inferlet launch.
-    let fs_policy = crate::policy::FsPolicy {
+    let fs_policy = FsPolicy {
         allow: config.runtime.allow_fs,
         base_dir: config.runtime.fs_scratch_dir.clone(),
     };
-    let network_policy = crate::policy::NetworkPolicy::parse(
+    let network_policy = NetworkPolicy::parse(
         config.runtime.allow_network,
         &config.runtime.network_allowed_hosts,
     )?;
@@ -197,61 +249,84 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
     server::init(max_upload_bytes);
     let bound_port = config.port;
-    messaging::spawn();
     process::init_admission(config.max_concurrent_processes);
 
-    let cfg = &config.model;
+    let ModelConfig {
+        name,
+        arch_name,
+        kv_page_size,
+        tokenizer_path,
+        drivers: driver_configs,
+        scheduler,
+    } = config.model;
     // RS working-set caps from the driver handshake (uniform across a model's
     // drivers → take [0]). bravo-authored bootstrap bundle.
     let rs_caps = {
-        let d0 = cfg.drivers.first();
+        let d0 = driver_configs.first();
         let is_rs = d0.map(|d| d.rs_cache_slots > 0).unwrap_or(false);
         model::RsCaps {
             state_size: d0.map(|d| d.rs_cache_slot_bytes).unwrap_or(0),
-            buffer_page_size: if is_rs { cfg.kv_page_size as u32 } else { 0 },
+            buffer_page_size: if is_rs { kv_page_size as u32 } else { 0 },
             fold_granularity: 1, // token-causal; 0-RS models never read it
         }
     };
+    let ptir_caps = model::PtirCaps {
+        has_mtp_logits: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_mtp_logits),
+        has_mtp_drafts: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_mtp_drafts),
+        has_value_head: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_value_head),
+    };
     model::register(
-        cfg.name.clone(),
-        &cfg.arch_name,
-        cfg.kv_page_size as u32,
+        name.clone(),
+        &arch_name,
+        kv_page_size as u32,
         rs_caps,
-        cfg.tokenizer_path.clone(),
-        cfg.system_speculation_supported,
-        cfg.enable_system_speculation,
+        ptir_caps,
+        tokenizer_path.clone(),
     )?;
 
-    let drivers: Vec<usize> = cfg
-        .drivers
+    let arena_kv_pages: Vec<usize> = driver_configs.iter().map(|d| d.total_pages).collect();
+    let arena_cpu_pages: Vec<usize> = driver_configs.iter().map(|d| d.cpu_pages).collect();
+    let arena_rs_slots: Vec<usize> = driver_configs.iter().map(|d| d.rs_cache_slots).collect();
+    let elastic_page_bytes: Vec<u64> = driver_configs
         .iter()
+        .map(|d| d.elastic_page_bytes)
+        .collect();
+    let rs_slot_bytes: Vec<u64> = driver_configs
+        .iter()
+        .map(|d| d.rs_cache_slot_bytes)
+        .collect();
+    let elastic_trim_enabled: Vec<bool> = driver_configs
+        .iter()
+        .map(|d| d.elastic_page_bytes != 0 && d.elastic_budget_pages != 0)
+        .collect();
+    let driver_count = driver_configs.len();
+    let drivers: Vec<usize> = driver_configs
+        .into_iter()
         .map(|d| {
-            driver::register_driver(driver::DriverSpec {
-                num_kv_pages: d.total_pages,
-                limits: d.limits,
-            })
+            driver::register_driver_backend(
+                driver::DriverSpec {
+                    num_kv_pages: d.total_pages,
+                    limits: d.limits,
+                    device_geometry_port_mask: d.device_geometry_port_mask,
+                },
+                d.driver_backend,
+            )
         })
         .collect();
 
-    // Register this model's per-driver unified arenas in the standalone
-    // registry. Capacities are read straight from `cfg.drivers[]`. The registry
-    // is independent of the (removed) context actor and is where KV/RS working
-    // sets + the forward `execute()` prepare lock `arena::registry::get(...)`.
-    let arena_kv_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.total_pages).collect();
-    let arena_cpu_pages: Vec<usize> = cfg.drivers.iter().map(|d| d.cpu_pages).collect();
-    let arena_rs_slots: Vec<usize> = cfg.drivers.iter().map(|d| d.rs_cache_slots).collect();
-    let arena_model_idx = arena::registry::register_model(
-        cfg.kv_page_size,
+    // Register this model's per-driver typed stores (KvStore/RsStore) in the
+    // standalone registry. Capacities are read straight from `cfg.drivers[]`.
+    // The registry is where the WIT working-set resources and the PTIR fire
+    // path lock `store::registry::get(...)`.
+    let _ = driver_count;
+    let arena_model_idx = crate::store::registry::register_model_with_swap(
+        kv_page_size as u32,
         &arena_kv_pages,
         &arena_cpu_pages,
         &arena_rs_slots,
-    );
-    // KvCas sibling registry: one content-addressed sharing index per driver,
-    // pushed in lock-step with the arena registry so `kv_cas::get` aligns.
-    let kv_cas_model_idx = crate::working_set::kv_cas::register_cas(cfg.drivers.len());
-    debug_assert_eq!(
-        kv_cas_model_idx, arena_model_idx,
-        "kv_cas registry desynced from arena/model index"
     );
 
     // Task-B contention orchestrator (`PIE_KV_CONTENTION=preempt`): KV pool
@@ -260,39 +335,155 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // default — the legacy error path is byte-for-byte unchanged. The
     // existing `scheduler.restore_pause_at_utilization` config gates the
     // restore anti-thrash pause (its long-reserved consumer).
-    if crate::inference::contention::contention_mode() == crate::inference::contention::ContentionMode::Preempt {
+    if crate::store::reclaim::contention_mode() == crate::store::reclaim::ContentionMode::Preempt {
         // Backend tiers: passive v1 (waiters ride natural frees — proven
         // e2e, M-AB ②③) by default; `PIE_KV_PREEMPT_ACTIVE=1` selects the
         // v2 self-suspend backend (active FCFS victim preempt).
-        let backend: Box<dyn crate::inference::contention::ReclaimBackend> =
-            if crate::inference::contention::preempt_active() {
-                Box::new(crate::inference::contention::SelfSuspendBackend::new(arena_model_idx, 0))
+        let backend: Box<dyn crate::store::reclaim::ReclaimBackend> =
+            if crate::store::reclaim::preempt_active() {
+                Box::new(crate::store::reclaim::SelfSuspendBackend::new(
+                    arena_model_idx,
+                    0,
+                ))
             } else {
-                Box::new(crate::inference::contention::ArenaPoolBackend::new(arena_model_idx, 0))
+                Box::new(crate::store::reclaim::KvPoolBackend::new(
+                    arena_model_idx,
+                    0,
+                ))
             };
-        crate::inference::contention::init_contention(crate::inference::contention::ContentionOrchestrator::new(
+        crate::store::reclaim::init_contention(crate::store::reclaim::ContentionOrchestrator::new(
             backend,
-            cfg.scheduler.restore_pause_at_utilization,
+            scheduler.restore_pause_at_utilization,
         ));
     }
 
     // (Context actor `context::spawn` removed — Phase 5. The unified arena
     // registry above is the per-model/driver physical home now.)
-    inference::spawn(
+    let scheduler_shutdown = crate::scheduler::spawn(
         &drivers,
-        cfg.kv_page_size as u32,
-        cfg.scheduler.request_timeout_secs,
+        kv_page_size as u32,
+        scheduler.request_timeout_secs,
     )
-    .await;
+    .await?;
+    let elastic_trim_task = elastic_trim_enabled
+        .iter()
+        .any(|enabled| *enabled)
+        .then(|| {
+            let driver_ids = drivers.clone();
+            let enabled_drivers = elastic_trim_enabled.clone();
+            let capacities = arena_kv_pages.clone();
+            let elastic_page_bytes = elastic_page_bytes.clone();
+            let rs_slot_bytes = rs_slot_bytes.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    for (ordinal, driver_id) in driver_ids.iter().copied().enumerate() {
+                        if !enabled_drivers.get(ordinal).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        let Some(stores) =
+                            crate::store::registry::try_get(arena_model_idx, ordinal)
+                        else {
+                            continue;
+                        };
+                        let target = crate::store::registry::with_kv_lock(
+                            &stores.kv,
+                            "elastic_trim_high_water",
+                            |kv| kv.committed_high_water_pages().max(1),
+                        );
+                        let capacity = capacities[ordinal] as u32;
+                        let unmap_ranges = vec![pie_driver_abi::PiePoolRange {
+                            page_index: u64::from(target),
+                            page_count: u64::from(capacity - target),
+                        }];
+                        if let Ok(completion) = crate::scheduler::resize_pool(
+                            driver_id,
+                            pie_driver_abi::PIE_ELASTIC_POOL_KV,
+                            u64::from(target),
+                            Vec::new(),
+                            unmap_ranges,
+                        )
+                        .await
+                        {
+                            if completion.await.is_ok() {
+                                let rs_high_water =
+                                    stores.rs.lock().unwrap().committed_high_water_slots();
+                                let page_bytes =
+                                    elastic_page_bytes.get(ordinal).copied().unwrap_or(0);
+                                let slot_bytes = rs_slot_bytes.get(ordinal).copied().unwrap_or(0);
+                                if page_bytes != 0 && slot_bytes != 0 {
+                                    let state_bytes =
+                                        u64::from(rs_high_water).saturating_mul(slot_bytes);
+                                    let state_pages =
+                                        state_bytes.saturating_add(page_bytes - 1) / page_bytes;
+                                    if let Ok(state) = crate::scheduler::resize_pool(
+                                        driver_id,
+                                        pie_driver_abi::PIE_ELASTIC_POOL_STATE,
+                                        state_pages,
+                                        Vec::new(),
+                                        Vec::new(),
+                                    )
+                                    .await
+                                    {
+                                        let _ = state.await;
+                                    }
+                                }
+                                if let Ok(workspace) = crate::scheduler::resize_pool(
+                                    driver_id,
+                                    pie_driver_abi::PIE_ELASTIC_POOL_WORKSPACE,
+                                    0,
+                                    Vec::new(),
+                                    Vec::new(),
+                                )
+                                .await
+                                {
+                                    let _ = workspace.await;
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        });
 
+    // M-A1/M-A2 wait-all quorum lifecycle wiring. Both scheduler-side hooks
+    // are plain-closure seams (see their doc comments) so `store`/`scheduler`
+    // never import the higher layers that `bootstrap` is free to wire here:
+    //  - `store::reclaim`'s suspend/restore ladder sits below `scheduler` in
+    //    the layering, so its leave notifications reach each driver's
+    //    `WaitAllPolicy` only via this installed subscription (the natural
+    //    terminate path calls `scheduler::worker::notify_pipeline_leave`
+    //    directly from `inferlet::process`, which needs no such hook).
+    crate::store::reclaim::set_pipeline_leave_hook(|pid, kind| {
+        let kind = match kind {
+            crate::store::reclaim::LeaveKind::Terminate => {
+                crate::scheduler::worker::LeaveKind::Terminate
+            }
+            crate::store::reclaim::LeaveKind::AllocationWait => {
+                crate::scheduler::worker::LeaveKind::Close
+            }
+            crate::store::reclaim::LeaveKind::Suspend => {
+                crate::scheduler::worker::LeaveKind::Suspend
+            }
+        };
+        crate::scheduler::worker::notify_pipeline_leave(pid, kind);
+    });
+    active_guard.disarm();
     Ok(BootstrapHandle {
-        token: crate::token::generate_internal_token(),
         port: bound_port,
+        model_idx: arena_model_idx,
+        shutdown: Some(RuntimeShutdown {
+            scheduler: scheduler_shutdown,
+            driver_ids: drivers,
+            elastic_trim_task,
+        }),
     })
 }
 
 /// Boot-time checks for the values pie's Python layer cannot validate
-/// itself: filesystem-side effects (cache/auth dirs) and worker-handshake
+/// itself: filesystem-side effects (cache dir) and worker-handshake
 /// outputs (tokenizer file, driver capability numbers). Field-level
 /// validation of user-supplied scalars (timeouts, etc.) happens in
 /// `pie.config.*.__post_init__` — by the time they reach Rust they're
@@ -327,6 +518,29 @@ fn verify_config(config: &Config) -> Result<()> {
         ensure!(
             dev.limits.max_page_refs > 0,
             "Model {:?} driver {i}: max_page_refs must be > 0",
+            model.name
+        );
+    }
+    if crate::store::reclaim::contention_mode() == crate::store::reclaim::ContentionMode::Preempt
+        && crate::store::reclaim::preempt_active()
+    {
+        ensure!(
+            model.drivers.len() == 1,
+            "Model {:?}: active KV preemption currently requires exactly one driver",
+            model.name
+        );
+        let driver = &model.drivers[0];
+        ensure!(
+            matches!(driver.backend_kind.as_str(), "cuda" | "dummy"),
+            "Model {:?}: active KV preemption requires CUDA (dummy is allowed for deterministic tests), got {}",
+            model.name,
+            driver.backend_kind
+        );
+        let required =
+            pie_driver_abi::KV_COPY_DEVICE_TO_HOST | pie_driver_abi::KV_COPY_HOST_TO_DEVICE;
+        ensure!(
+            driver.kv_copy_domain_mask & required == required,
+            "Model {:?}: active KV preemption requires device-to-host and host-to-device KV copies",
             model.name
         );
     }

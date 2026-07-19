@@ -1,7 +1,0 @@
-interface types {
-
-    type error = string;
-
-    type blob = list<u8>;
-
-}

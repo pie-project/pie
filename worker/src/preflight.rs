@@ -6,9 +6,9 @@ use anyhow::{Result, anyhow};
 
 #[cfg(feature = "driver-cuda")]
 use crate::config::CudaNativeDriverOptions;
-use crate::config::{self, DriverKind, DummyDriverOptions};
 #[cfg(feature = "driver-metal")]
 use crate::config::MetalDriverOptions;
+use crate::config::{self, DriverKind, DummyDriverOptions};
 use crate::driver_ffi::Flavor;
 use crate::embedded_driver::DriverOptions;
 
@@ -47,11 +47,9 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
 /// flavor was not compiled into this binary.
 pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlavor> {
     match kind {
-        DriverKind::CudaNative | DriverKind::Metal | DriverKind::Dummy => {
-            Flavor::from_kind(kind)
-                .map(ResolvedFlavor::Embedded)
-                .map_err(|msg| anyhow!("model {model_name:?}: {msg}"))
-        }
+        DriverKind::CudaNative | DriverKind::Metal | DriverKind::Dummy => Flavor::from_kind(kind)
+            .map(ResolvedFlavor::Embedded)
+            .map_err(|msg| anyhow!("model {model_name:?}: {msg}")),
     }
 }
 

@@ -1,0 +1,14 @@
+[package]
+name = "attention-sink"
+version = "0.1.0"
+description = "Attention sinks combined with a sliding attention window"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 512)"}
+sink_size = {type = "int", optional = true, description = "Number of initial sink tokens (default: 4)"}
+window_size = {type = "int", optional = true, description = "Recent-token attention window (default: 64)"}

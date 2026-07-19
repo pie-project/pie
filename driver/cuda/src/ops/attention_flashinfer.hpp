@@ -9,14 +9,14 @@
 
 #include <cuda_runtime.h>
 
-#include "attention_workspace.hpp"
-#include "kv_cache.hpp"
+#include "kernels/kv_cache_view.hpp"
+#include "ops/attention_workspace.hpp"
 
 namespace pie_cuda_driver::ops {
 
 // Opaque cache of flashinfer's `DecodePlanInfo` plus the few scheduling
 // fields the dispatch needs. Lifecycle: created once (e.g. in
-// Executor), reset each fire by `plan_attention_flashinfer_decode_bf16`,
+// BatchEngine), reset each fire by `plan_attention_flashinfer_decode_bf16`,
 // then reused by 28 per-layer dispatch calls within that fire. Hoisting
 // the plan out of the per-layer loop saves ~27 redundant DecodePlan
 // invocations per fire — the plan is identical across all layers in
@@ -97,7 +97,8 @@ void plan_attention_flashinfer_prefill_bf16(
     int window_left = -1,
     bool full_attention_variant = false,
     bool hnd_layout = false,
-    bool causal_mask = true);
+    bool causal_mask = true,
+    bool custom_mask = false);
 
 // Per-layer dispatch reusing the cached plan. `q`/`k_pages`/`v_pages`/`o`
 // vary per layer; everything else comes from the cache + workspace.
@@ -164,6 +165,42 @@ void dispatch_attention_flashinfer_prefill_bf16(
     const std::uint32_t* kv_page_indices_d,
     const std::uint32_t* kv_page_indptr_d,
     const std::uint32_t* kv_last_page_lens_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
+    float* lse_out = nullptr);
+
+// Custom-mask dispatch against a plan prepared outside the graph capture
+// region. Pointer arguments are device-persistent and may be captured/replayed.
+void dispatch_attention_flashinfer_prefill_custom_bf16(
+    const PrefillPlanCache& cache,
+    const void* q,
+    void* k_pages, void* v_pages,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint8_t* mask_d,
+    const std::int32_t* mask_indptr_d,
+    AttentionWorkspace& workspace,
+    cudaStream_t stream,
+    float logits_soft_cap = 0.f,
+    float sm_scale = -1.f,
+    float* lse_out = nullptr);
+
+void dispatch_attention_flashinfer_prefill_custom(
+    const PrefillPlanCache& cache,
+    const void* q,
+    KvCacheLayerView kv_layer,
+    void* o,
+    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* kv_page_indices_d,
+    const std::uint32_t* kv_page_indptr_d,
+    const std::uint32_t* kv_last_page_lens_d,
+    const std::uint8_t* mask_d,
+    const std::int32_t* mask_indptr_d,
     AttentionWorkspace& workspace,
     cudaStream_t stream,
     float logits_soft_cap = 0.f,

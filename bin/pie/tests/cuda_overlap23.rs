@@ -84,7 +84,7 @@ async fn found_abort_overlap_on_real_driver() -> Result<()> {
     );
 
     // Build the run-ahead carryover inferlet (the overlap driver).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "runahead"])
         .current_dir(&ws)
@@ -98,7 +98,10 @@ async fn found_abort_overlap_on_real_driver() -> Result<()> {
         Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
             .await
             .context("connect")?;
-    client.authenticate("test-user", &None).await.context("auth")?;
+    client
+        .authenticate("test-user", &None)
+        .await
+        .context("auth")?;
     client
         .add_program(&wasm, &manifest, true)
         .await

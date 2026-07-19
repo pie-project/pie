@@ -1,122 +1,75 @@
-//! Mock driver backend for integration tests.
+//! Mock-driver helpers for integration tests.
 //!
-//! Implements [`DriverChannel`] directly and pre-registers one channel
-//! per device through [`register_driver`] + [`install_channel`]. The
-//! unified driver surface means there's no RPC server, no mqueue, and
-//! no shmem ring in the test path — just a typed channel that dispatches
-//! `RequestPayload::Forward` to a [`Behavior`] and treats every cold
-//! method as a no-op status response.
+//! These helpers keep the existing harness source compiling on top of direct
+//! driver-backend registration.
 
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use async_trait::async_trait;
-
 use pie_engine::driver::{
-    DriverChannel, DriverRequest, DriverResponse, DriverSpec, install_channel, register_driver,
+    DriverBackend, DriverSpec, LaunchPlan, SchedulerLimits, register_driver_backend,
 };
+use pie_engine::scheduler::worker::BatchScheduler;
 
-// =============================================================================
-// Behavior Trait
-// =============================================================================
-
-/// How the mock device handles a forward batch. The behavior receives
-/// the batched [`pie_driver_abi::ForwardRequest`] (with indptrs delimiting
-/// each per-request slice) and returns a batched
-/// [`pie_driver_abi::ForwardResponse`] keyed by the same indptrs.
+/// Launch observer for harness probes, wired onto the dummy driver's launch
+/// path via [`launch_observer`]: it sees every accepted launch's forward
+/// geometry, and a sleeping implementation keeps that fire outstanding (the
+/// forced-overlap latency the concurrency suites rely on).
 pub trait Behavior: Send + Sync + 'static {
-    fn handle_fire_batch(&self, req: &pie_driver_abi::ForwardRequest) -> pie_driver_abi::ForwardResponse;
+    fn observe_launch(&self, _req: &LaunchPlan) {}
 }
 
-/// Helper: derive the request count from `qo_indptr`. The batched
-/// shape stores `num_requests + 1` entries (one indptr per request +
-/// the trailing total).
-fn num_requests(req: &pie_driver_abi::ForwardRequest) -> u32 {
+/// Adapt a [`Behavior`] to the dummy driver's [`LaunchObserver`]: rebuild the
+/// observed forward geometry as a [`LaunchPlan`] and forward it to
+/// `observe_launch` synchronously on the launch path.
+pub fn launch_observer(behavior: Arc<dyn Behavior>) -> pie_driver_dummy_lib::LaunchObserver {
+    pie_driver_dummy_lib::LaunchObserver(Arc::new(move |obs| {
+        let (kv_page_indices, kv_page_indptr) = if obs.kv_translation.is_empty() {
+            (obs.kv_page_indices.clone(), obs.kv_page_indptr.clone())
+        } else {
+            (
+                obs.kv_translation.clone(),
+                obs.kv_translation_indptr.clone(),
+            )
+        };
+        let plan = LaunchPlan {
+            token_ids: obs.token_ids.clone(),
+            qo_indptr: obs.qo_indptr.clone(),
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens: obs.kv_last_page_lens.clone(),
+            ..LaunchPlan::default()
+        };
+        behavior.observe_launch(&plan);
+    }))
+}
+
+/// Helper: derive the request count from `qo_indptr`.
+pub fn num_requests(req: &LaunchPlan) -> u32 {
     req.qo_indptr.len().saturating_sub(1) as u32
 }
 
-fn total_tokens(req: &pie_driver_abi::ForwardRequest) -> usize {
+pub fn total_tokens(req: &LaunchPlan) -> usize {
     req.token_ids.len()
 }
 
-/// Build a `ForwardResponse` that emits exactly one token per request
-/// — the common case for both `Echo` and `Counter` behaviors.
-fn build_token_response(tokens: Vec<u32>) -> pie_driver_abi::ForwardResponse {
-    let n = tokens.len() as u32;
-    let tokens_indptr: Vec<u32> = (0..=n).collect();
-    pie_driver_abi::ForwardResponse {
-        num_requests: n,
-        tokens_indptr,
-        tokens,
-        dists_req_indptr: vec![0; (n + 1) as usize],
-        dists_kv_indptr: vec![0],
-        dists_ids: Vec::new(),
-        dists_probs: Vec::new(),
-        logits_req_indptr: vec![0; (n + 1) as usize],
-        logits_byte_indptr: vec![0],
-        logits_bytes: Vec::new(),
-        logprobs_req_indptr: vec![0; (n + 1) as usize],
-        logprobs_val_indptr: vec![0],
-        logprobs_values: Vec::new(),
-        entropies_indptr: vec![0; (n + 1) as usize],
-        entropies: Vec::new(),
-        ..Default::default()
-    }
-}
-
-// =============================================================================
-// Built-in Behaviors
-// =============================================================================
-
-/// Always returns the same token for every request.
+/// Marker retained for harness configuration.
 pub struct EchoBehavior(pub u32);
 
-impl Behavior for EchoBehavior {
-    fn handle_fire_batch(&self, req: &pie_driver_abi::ForwardRequest) -> pie_driver_abi::ForwardResponse {
-        let n = num_requests(req) as usize;
-        build_token_response(vec![self.0; n])
-    }
-}
+impl Behavior for EchoBehavior {}
 
-// =============================================================================
-// (Removed) sampling-program eval-mock executor — the sampling-IR sampler
-// subsystem was retired; ptir succeeds it (outputs are channels, not declared
-// OutputKinds). The pure synthetic-logits helpers below survive for any
-// deterministic-logits mock use.
-// =============================================================================
-
-/// SplitMix64 + seed×column — the exact scheme validated against `sample_temp.cu`
-/// (so the SAME synthetic row can later be fed to a one-row CUDA fire for an
-/// eval-mock ≡ real-driver cross-check).
 fn mock_hash_uniform(seed_eff: u64, j: u32) -> f32 {
-    let mut x = seed_eff.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul((j as u64) + 1));
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x3C79_AC49_2BA7_B653);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0x1C69_B3F7_4AC4_AE35);
-    x ^= x >> 27;
-    ((x >> 40) as u32 as f32 + 0.5) * (1.0 / 16_777_216.0)
+    pie_ptir::rng::hash_uniform(seed_eff, j)
 }
 
 /// Deterministic pseudo-random logits row seeded by request id, in ~[-4, 4].
-/// Determinism (not model accuracy) is all `eval` needs for a plumbing gate.
 pub fn synthetic_logits(req_id: u64, vocab: usize) -> Vec<f32> {
-    let seed = req_id ^ 0xA5A5_A5A5u64;
+    let seed = req_id ^ pie_ptir::rng::seed_eff(0);
     (0..vocab as u32)
         .map(|j| (mock_hash_uniform(seed, j) * 2.0 - 1.0) * 4.0)
         .collect()
 }
-
-/// (removed with the sampling-IR eval mock: logits_shape / host_value /
-/// run_program_mock)
-
-
-/// (removed with the sampling-IR eval mock: run_program_mock_outputs)
-
-/// (removed with the sampling-IR eval mock: build_program_response /
-/// SamplingProgramBehavior)
 
 /// Returns sequential tokens starting from `start`.
 pub struct CounterBehavior {
@@ -132,29 +85,26 @@ impl CounterBehavior {
 }
 
 impl Behavior for CounterBehavior {
-    fn handle_fire_batch(&self, req: &pie_driver_abi::ForwardRequest) -> pie_driver_abi::ForwardResponse {
-        let n = num_requests(req) as usize;
-        let tokens: Vec<u32> = (0..n)
-            .map(|_| self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-            .collect();
-        build_token_response(tokens)
+    fn observe_launch(&self, req: &LaunchPlan) {
+        self.next
+            .fetch_add(num_requests(req), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// Wraps another behavior and adds simulated latency before responding.
+/// Observer wrapper that adds simulated latency.
 pub struct DelayedBehavior<B: Behavior> {
     pub inner: B,
     pub latency: Duration,
 }
 
 impl<B: Behavior> Behavior for DelayedBehavior<B> {
-    fn handle_fire_batch(&self, req: &pie_driver_abi::ForwardRequest) -> pie_driver_abi::ForwardResponse {
+    fn observe_launch(&self, req: &LaunchPlan) {
         std::thread::sleep(self.latency);
-        self.inner.handle_fire_batch(req)
+        self.inner.observe_launch(req);
     }
 }
 
-/// Wraps another behavior and fails after N successful calls.
+/// Observer wrapper that stops forwarding after N calls.
 pub struct FailAfterBehavior<B: Behavior> {
     pub inner: B,
     remaining: AtomicU32,
@@ -170,28 +120,16 @@ impl<B: Behavior> FailAfterBehavior<B> {
 }
 
 impl<B: Behavior> Behavior for FailAfterBehavior<B> {
-    fn handle_fire_batch(&self, req: &pie_driver_abi::ForwardRequest) -> pie_driver_abi::ForwardResponse {
+    fn observe_launch(&self, req: &LaunchPlan) {
         if self
             .remaining
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
-            == 0
+            != 0
         {
-            // Empty response to simulate failure: zero tokens, no
-            // dists/logits/etc.
-            pie_driver_abi::ForwardResponse {
-                num_requests: 0,
-                tokens_indptr: vec![0],
-                ..Default::default()
-            }
-        } else {
-            self.inner.handle_fire_batch(req)
+            self.inner.observe_launch(req);
         }
     }
 }
-
-// =============================================================================
-// CallRecorder
-// =============================================================================
 
 #[derive(Debug, Clone)]
 pub struct RecordedCall {
@@ -212,7 +150,7 @@ impl CallRecorder {
         Self::default()
     }
 
-    fn record(&self, call: RecordedCall) {
+    pub fn record(&self, call: RecordedCall) {
         self.calls.lock().unwrap().push(call);
     }
 
@@ -238,120 +176,95 @@ impl CallRecorder {
     }
 }
 
-// =============================================================================
-// MockChannel — DriverChannel impl per device.
-// =============================================================================
-
-struct MockChannel {
-    device_idx: usize,
+fn register_dummy_driver(
+    num_kv_pages: usize,
+    driver_idx: usize,
     behavior: Arc<dyn Behavior>,
-    recorder: Arc<CallRecorder>,
-    aborted: Mutex<bool>,
+    vocab_size: u32,
+    operation_log: Arc<Mutex<Vec<String>>>,
+) -> (usize, BatchScheduler) {
+    let (backend, _) = DriverBackend::dummy(pie_driver_dummy_lib::DummyDriverOptions {
+        total_pages: num_kv_pages as u32,
+        kv_page_size: 16,
+        swap_pool_size: 0,
+        // MUST match the engine model's `vocab_size()` (the tokenizer
+        // fixture's vocab): guests declare `logits` as
+        // `[rows, output-vocab-size]` and the dummy validates the decl
+        // against this capability at program bind.
+        vocab_size,
+        max_model_len: 8192,
+        arch_name: "test-dummy".into(),
+        activation_dtype: "f32".into(),
+        snapshot_dir: String::new(),
+        max_forward_tokens: 4096,
+        max_forward_requests: 32,
+        max_page_refs: num_kv_pages.max(1) as u32,
+        has_mtp_logits: true,
+        has_mtp_drafts: true,
+        has_value_head: true,
+        callback_delay_ms: 0,
+        reject_launches: false,
+        reject_launches_remaining: 0,
+        fail_launches_after_accept: false,
+        retry_launches_remaining: 0,
+        elastic_admission: false,
+        prepare_exhaustions_remaining: 0,
+        prepare_impossible_above_kv_pages: 0,
+        operation_log: Some(operation_log),
+        launch_observer: Some(launch_observer(behavior)),
+    })
+    .expect("create dummy driver backend");
+    let limits = SchedulerLimits {
+        max_forward_requests: 32,
+        max_forward_tokens: 4096,
+        max_page_refs: num_kv_pages.max(1),
+    };
+    let driver_id = register_driver_backend(
+        DriverSpec {
+            num_kv_pages,
+            limits,
+            device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
+                | pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
+        },
+        backend,
+    );
+    let scheduler = BatchScheduler::new(driver_id, driver_idx, 16, limits, 30);
+    (driver_id, scheduler)
 }
 
-fn status_response(status: i32) -> DriverResponse {
-    DriverResponse {
-        aborted: false,
-        payload: pie_driver_abi::ResponsePayload::Status(pie_driver_abi::StatusResponse { status }),
-    }
-}
-
-impl MockChannel {
-    fn submit_impl(&self, req: DriverRequest) -> Result<DriverResponse> {
-        if *self.aborted.lock().unwrap() {
-            anyhow::bail!("mock channel {}: aborted", self.device_idx);
-        }
-        match req.payload {
-            pie_driver_abi::RequestPayload::Forward(fwd) => {
-                self.recorder.record(RecordedCall {
-                    device_idx: self.device_idx,
-                    method: "fire_batch",
-                    num_requests: num_requests(&fwd) as usize,
-                    total_tokens: total_tokens(&fwd),
-                    timestamp: Instant::now(),
-                });
-                let resp = self.behavior.handle_fire_batch(&fwd);
-                Ok(DriverResponse {
-                    aborted: false,
-                    payload: pie_driver_abi::ResponsePayload::Forward(resp),
-                })
-            }
-            pie_driver_abi::RequestPayload::Copy(_)
-            | pie_driver_abi::RequestPayload::Adapter(_)
-            | pie_driver_abi::RequestPayload::Health => Ok(status_response(0)),
-        }
-    }
-}
-
-#[async_trait]
-impl DriverChannel for MockChannel {
-    async fn submit(&self, req: DriverRequest) -> Result<DriverResponse> {
-        self.submit_impl(req)
-    }
-
-    fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse> {
-        self.submit_impl(req)
-    }
-
-    fn notify(&self, _req: DriverRequest) -> Result<()> {
-        // Cold ops are no-ops in the mock — they always "succeed".
-        Ok(())
-    }
-
-    fn abort(&self) {
-        *self.aborted.lock().unwrap() = true;
-    }
-}
-
-// =============================================================================
-// MockBackend — owns the per-device channels.
-// =============================================================================
-
+/// Minimal backend wrapper that allocates direct native dummy drivers.
 pub struct MockBackend {
     driver_ids: Vec<usize>,
+    _schedulers: Vec<BatchScheduler>,
     recorder: Arc<CallRecorder>,
 }
 
 impl MockBackend {
-    /// Pre-register `num_devices` mock channels with the runtime. Each
-    /// channel gets a fresh [`pie_engine::driver::DriverId`] from the
-    /// runtime's allocator; callers thread those IDs through their
-    /// bootstrap config so the scheduler dispatches forward batches
-    /// into the mocks.
-    pub fn new(num_devices: usize, behavior: Arc<dyn Behavior>) -> Self {
+    pub fn new(
+        num_devices: usize,
+        behavior: Arc<dyn Behavior>,
+        vocab_size: u32,
+        operation_log: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
         let recorder = Arc::new(CallRecorder::new());
-        let mut driver_ids = Vec::with_capacity(num_devices);
-        for device_idx in 0..num_devices {
-            let channel = Arc::new(MockChannel {
-                device_idx,
-                behavior: Arc::clone(&behavior),
-                recorder: Arc::clone(&recorder),
-                aborted: Mutex::new(false),
-            });
-            let id = register_driver(DriverSpec {
-                num_kv_pages: 64,
-                limits: pie_engine::driver::SchedulerLimits {
-                    max_forward_requests: 32,
-                    max_forward_tokens: 4096,
-                    max_page_refs: 64,
-                    max_logit_rows: usize::MAX,
-                    max_prob_rows: usize::MAX,
-                    max_sampler_rows: usize::MAX,
-                    max_custom_mask_bytes: usize::MAX,
-                    max_logprob_labels: usize::MAX,
-                },
-            });
-            install_channel(id, channel);
-            driver_ids.push(id);
-        }
+        let (driver_ids, schedulers) = (0..num_devices)
+            .map(|driver_idx| {
+                register_dummy_driver(
+                    64,
+                    driver_idx,
+                    behavior.clone(),
+                    vocab_size,
+                    Arc::clone(&operation_log),
+                )
+            })
+            .unzip();
         Self {
             driver_ids,
+            _schedulers: schedulers,
             recorder,
         }
     }
 
-    /// Driver IDs allocated by [`Self::new`], one per device. Hand to
-    /// the bootstrap config builder.
     pub fn driver_ids(&self) -> &[usize] {
         &self.driver_ids
     }

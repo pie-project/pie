@@ -9,7 +9,7 @@
 #include <utility>
 
 #include "cuda_check.hpp"
-#include "custom_all_reduce.hpp"
+#include "kernels/custom_all_reduce.hpp"
 
 namespace pie_cuda_driver {
 
@@ -190,6 +190,12 @@ void NcclComm::barrier(cudaStream_t stream) {
     NCCL_CHECK_ASYNC(
         ncclAllReduce(d_one, d_one, 1, ncclInt32, ncclSum, comm_, stream),
         comm_);
+}
+
+void NcclComm::abort() noexcept {
+    if (comm_ != nullptr) {
+        ncclCommAbort(comm_);
+    }
 }
 
 }  // namespace pie_cuda_driver

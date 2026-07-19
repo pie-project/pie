@@ -14,9 +14,9 @@ Lifecycle:
     ephemeral port and returns the bound URL. The pyo3 layer blocks until
     drivers + WS listener are up, then returns a handle. We run that on a
     thread (`asyncio.to_thread`) so the asyncio loop isn't blocked.
-  * `connect()`: build a `pie_client.PieClient` against the bound URL +
-    auth-token-handshake using the engine's internal token. Each call
-    returns a fresh client; the user is responsible for closing them.
+  * `connect()`: build a `pie_client.PieClient` against the bound URL.
+    Each call returns a fresh client; the user is responsible for
+    closing them.
   * `__aexit__`: closes any connect()'d clients, then shuts the engine
     down (also off-thread). The pyo3 handle's `Drop` is the safety net
     if `__aexit__` doesn't run (interpreter exit, hard crash) — combined
@@ -96,12 +96,6 @@ class Server:
             return f"ws://{self._config.server.host or '127.0.0.1'}:{self._config.server.port}"
         return self._handle.url
 
-    @property
-    def token(self) -> str:
-        if self._handle is None:
-            raise RuntimeError("server is not started; use `async with Server(cfg) as server:`")
-        return self._handle.token
-
     async def __aenter__(self) -> "Server":
         from pie import _engine  # the pyo3 module
 
@@ -135,6 +129,5 @@ class Server:
         from pie_client import PieClient
         client = PieClient(self._handle.url)
         await client.connect()
-        await client.auth_by_token(self._handle.token)
         self._clients.append(client)
         return client

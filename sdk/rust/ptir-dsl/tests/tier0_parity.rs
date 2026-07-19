@@ -12,25 +12,38 @@
 use pie_ptir::container;
 use pie_ptir::interp::Value;
 use pie_ptir::interp::{HostError, Instance, NoKernels, PassInputs};
-use pie_ptir::validate::{bind, BoundTrace};
+use pie_ptir::registry::ModelProfile;
+use pie_ptir::validate::{BoundTrace, bind};
 
 use ptir_dsl::builder::Builder;
 use ptir_dsl::prelude::*;
 use ptir_dsl::{Channel, Traced};
 
 /// Bind a lowered [`Traced`] against the current model profile (native parity
-/// only — host-side this is `forward-pass.new`'s job).
-fn bound(traced: &Traced) -> BoundTrace {
-    bind(traced.container().clone(), ptir_dsl::model::profile()).expect("container binds")
+/// only — host-side this is `forward-pass.program`'s job).
+fn bound(traced: &Traced, vocab: u32, page_size: u32, num_layers: u32) -> BoundTrace {
+    let profile = ModelProfile {
+        vocab,
+        page_size,
+        num_layers,
+        ..ModelProfile::dummy()
+    };
+    bind(traced.container().clone(), profile).expect("container binds")
 }
 
 /// Dense channel index of a named channel.
 fn idx(names: &[String], name: &str) -> u32 {
-    names.iter().position(|n| n == name).unwrap_or_else(|| panic!("no channel `{name}`")) as u32
+    names
+        .iter()
+        .position(|n| n == name)
+        .unwrap_or_else(|| panic!("no channel `{name}`")) as u32
 }
 
 fn logits(v: Vec<f32>) -> PassInputs {
-    PassInputs { logits: Some(Value::F32(v)), ..Default::default() }
+    PassInputs {
+        logits: Some(Value::F32(v)),
+        ..Default::default()
+    }
 }
 
 fn leak<T>(v: T) -> &'static T {
@@ -43,38 +56,95 @@ fn leak<T>(v: T) -> &'static T {
 
 #[test]
 fn greedy_argmax_tier0_matches_golden() {
-    ptir_dsl::model::configure(8, 4, 2);
     let tok: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok"));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
+    let klen: &'static Channel = leak(Channel::from([1u32]).named("klen"));
+    let positions: &'static Channel = leak(Channel::from([0u32]).named("positions"));
+    let pages: &'static Channel = leak(Channel::from([0u32]).named("pages"));
+    let page_indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("page_indptr"));
+    let w_slot: &'static Channel = leak(Channel::from([0u32]).named("w_slot"));
+    let w_off: &'static Channel = leak(Channel::from([0u32]).named("w_off"));
     let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
     tok.put([1i32]); // seed BOS
 
-    let mut b = Builder::new();
+    let mut b = Builder::new(8, 4);
     b.bind_port(Port::EmbedTokens, tok);
-    b.bind_port(Port::EmbedIndptr, Tensor::constant([0u32, 1]));
+    b.bind_port(Port::EmbedIndptr, indptr);
+    b.bind_port(Port::KvLen, klen);
+    b.bind_port(Port::Positions, positions);
+    b.bind_port(Port::Pages, pages);
+    b.bind_port(Port::PageIndptr, page_indptr);
+    b.bind_port(Port::WSlot, w_slot);
+    b.bind_port(Port::WOff, w_off);
     b.stage(Stage::Epilogue, move || {
         let t = reduce_argmax(intrinsics::logits());
         tok.put(&t);
+        positions.put(Tensor::constant([0u32]));
+        w_slot.put(Tensor::constant([0u32]));
+        w_off.put(Tensor::constant([0u32]));
         out.put(t);
     });
     let _ = out.take(); // host-reader signal (marks `out` HostRole::Reader)
 
     let traced = b.build().expect("greedy builds");
-    let bound = bound(&traced);
+    let bound = bound(&traced, 8, 4, 2);
     let names = traced.channel_names();
-    let (tok_i, out_i) = (idx(names, "tok"), idx(names, "out"));
+    let (tok_i, indptr_i, klen_i, positions_i, pages_i, page_indptr_i, w_slot_i, w_off_i, out_i) = (
+        idx(names, "tok"),
+        idx(names, "indptr"),
+        idx(names, "klen"),
+        idx(names, "positions"),
+        idx(names, "pages"),
+        idx(names, "page_indptr"),
+        idx(names, "w_slot"),
+        idx(names, "w_off"),
+        idx(names, "out"),
+    );
 
     // encode -> decode round-trips stably.
     let bytes = traced.encode();
     assert_eq!(container::decode(&bytes).unwrap(), *traced.container());
 
-    let mut inst = Instance::new(&bound, &[(tok_i, Value::I32(vec![1]))]).unwrap();
+    let mut inst = Instance::new(
+        &bound,
+        &[
+            (tok_i, Value::I32(vec![1])),
+            (indptr_i, Value::U32(vec![0, 1])),
+            (klen_i, Value::U32(vec![1])),
+            (positions_i, Value::U32(vec![0])),
+            (pages_i, Value::U32(vec![0])),
+            (page_indptr_i, Value::U32(vec![0, 1])),
+            (w_slot_i, Value::U32(vec![0])),
+            (w_off_i, Value::U32(vec![0])),
+        ],
+    )
+    .unwrap();
 
-    let r = inst.step(&bound, &logits(vec![0., 1., 9., 2., 0., 0., 0., 3.]), &mut NoKernels).unwrap();
+    let r = inst
+        .step(
+            &bound,
+            &logits(vec![0., 1., 9., 2., 0., 0., 0., 3.]),
+            &mut NoKernels,
+        )
+        .unwrap();
     assert!(r.committed, "step 0 commits");
-    assert_eq!(inst.host_take(&bound, out_i).unwrap(), Value::I32(vec![2]), "golden token 2");
+    assert_eq!(
+        inst.host_take(&bound, out_i).unwrap(),
+        Value::I32(vec![2]),
+        "golden token 2"
+    );
 
-    inst.step(&bound, &logits(vec![7., 1., 0., 2., 0., 0., 0., 3.]), &mut NoKernels).unwrap();
-    assert_eq!(inst.host_take(&bound, out_i).unwrap(), Value::I32(vec![0]), "golden token 0");
+    inst.step(
+        &bound,
+        &logits(vec![7., 1., 0., 2., 0., 0., 0., 3.]),
+        &mut NoKernels,
+    )
+    .unwrap();
+    assert_eq!(
+        inst.host_take(&bound, out_i).unwrap(),
+        Value::I32(vec![0]),
+        "golden token 0"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -88,17 +158,28 @@ fn build_section3() -> Traced {
     // Channels live for 'static (test-only) so the pass owns nothing borrowed.
     let ctr1: &'static Tensor = leak(Tensor::constant([0u32, 1]));
     let tok: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok"));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
     let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
-    let mask: &'static Channel = leak(Channel::new([intrinsics::vocab()], dtype::bool).named("mask"));
+    let mask: &'static Channel = leak(Channel::new([V32], dtype::bool).named("mask"));
     let len: &'static Channel = leak(Channel::from([1u32]).named("len"));
+    let positions: &'static Channel = leak(Channel::from([0u32]).named("positions"));
+    let pages: &'static Channel = leak(Channel::from([0u32]).named("pages"));
+    let page_indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("page_indptr"));
+    let w_slot: &'static Channel = leak(Channel::from([0u32]).named("w_slot"));
+    let w_off: &'static Channel = leak(Channel::from([0u32]).named("w_off"));
     let rng: &'static Channel = leak(Channel::from([1234u32, 0]).named("rng"));
 
     tok.put([1i32]); // seed BOS
 
-    let mut b = Builder::new();
+    let mut b = Builder::new(V32, 16);
     b.bind_port(Port::EmbedTokens, tok);
-    b.bind_port(Port::EmbedIndptr, Tensor::constant([0u32, 1]));
+    b.bind_port(Port::EmbedIndptr, indptr);
     b.bind_port(Port::KvLen, len);
+    b.bind_port(Port::Positions, positions);
+    b.bind_port(Port::Pages, pages);
+    b.bind_port(Port::PageIndptr, page_indptr);
+    b.bind_port(Port::WSlot, w_slot);
+    b.bind_port(Port::WOff, w_off);
     b.stage(Stage::Epilogue, move || {
         let logits = intrinsics::logits();
         let r = rng.take();
@@ -107,6 +188,9 @@ fn build_section3() -> Traced {
         rng.put(add(&r, ctr1));
         tok.put(&t);
         len.put(add(len.take(), 1u32));
+        positions.put(Tensor::constant([0u32]));
+        w_slot.put(Tensor::constant([0u32]));
+        w_off.put(Tensor::constant([0u32]));
         out.put(t);
     });
     // Host-endpoint signals: mask is host-written each step, out is host-read
@@ -118,27 +202,53 @@ fn build_section3() -> Traced {
 
 #[test]
 fn section3_tier0_matches_golden() {
-    ptir_dsl::model::configure(V32, 16, 32);
     let traced = build_section3();
-    let bound = bound(&traced);
+    let bound = bound(&traced, V32, 16, 32);
     let names = traced.channel_names();
-    let (tok_i, out_i, mask_i, len_i, rng_i) = (
+    let (
+        tok_i,
+        indptr_i,
+        out_i,
+        mask_i,
+        len_i,
+        positions_i,
+        pages_i,
+        page_indptr_i,
+        w_slot_i,
+        w_off_i,
+        rng_i,
+    ) = (
         idx(names, "tok"),
+        idx(names, "indptr"),
         idx(names, "out"),
         idx(names, "mask"),
         idx(names, "len"),
+        idx(names, "positions"),
+        idx(names, "pages"),
+        idx(names, "page_indptr"),
+        idx(names, "w_slot"),
+        idx(names, "w_off"),
         idx(names, "rng"),
     );
 
     // encode -> decode round-trips stably.
-    assert_eq!(container::decode(&traced.encode()).unwrap(), *traced.container());
+    assert_eq!(
+        container::decode(&traced.encode()).unwrap(),
+        *traced.container()
+    );
 
     // Per-instance seeds (D2): tok=BOS, len=1, rng=[1234,0] (echo's golden seeds).
     let mut inst = Instance::new(
         &bound,
         &[
             (tok_i, Value::I32(vec![1])),
+            (indptr_i, Value::U32(vec![0, 1])),
             (len_i, Value::U32(vec![1])),
+            (positions_i, Value::U32(vec![0])),
+            (pages_i, Value::U32(vec![0])),
+            (page_indptr_i, Value::U32(vec![0, 1])),
+            (w_slot_i, Value::U32(vec![0])),
+            (w_off_i, Value::U32(vec![0])),
             (rng_i, Value::U32(vec![1234, 0])),
         ],
     )
@@ -158,19 +268,37 @@ fn section3_tier0_matches_golden() {
     };
 
     // step 0: mask=allow_all -> token 7.
-    inst.host_put(&bound, mask_i, Value::Bool(allow_all)).unwrap();
-    let r0 = inst.step(&bound, &logits(peaked.clone()), &mut NoKernels).unwrap();
+    inst.host_put(&bound, mask_i, Value::Bool(allow_all))
+        .unwrap();
+    let r0 = inst
+        .step(&bound, &logits(peaked.clone()), &mut NoKernels)
+        .unwrap();
     assert!(r0.committed, "step 0 commits");
-    assert_eq!(inst.host_take(&bound, out_i).unwrap(), Value::I32(vec![7]), "golden token 7");
+    assert_eq!(
+        inst.host_take(&bound, out_i).unwrap(),
+        Value::I32(vec![7]),
+        "golden token 7"
+    );
 
     // step 1: mask consumed + not re-fed -> readiness miss (dummy-run), out empty.
-    let r1 = inst.step(&bound, &logits(peaked.clone()), &mut NoKernels).unwrap();
+    let r1 = inst
+        .step(&bound, &logits(peaked.clone()), &mut NoKernels)
+        .unwrap();
     assert!(!r1.committed, "step 1 is a late-mask miss");
-    assert_eq!(inst.host_take(&bound, out_i), Err(HostError::WouldBlock), "no token on the miss");
+    assert_eq!(
+        inst.host_take(&bound, out_i),
+        Err(HostError::WouldBlock),
+        "no token on the miss"
+    );
 
     // step 2: mask=allow_only([3]) -> recover to token 3.
-    inst.host_put(&bound, mask_i, Value::Bool(allow_only_3)).unwrap();
+    inst.host_put(&bound, mask_i, Value::Bool(allow_only_3))
+        .unwrap();
     let r2 = inst.step(&bound, &logits(peaked), &mut NoKernels).unwrap();
     assert!(r2.committed, "step 2 recovers");
-    assert_eq!(inst.host_take(&bound, out_i).unwrap(), Value::I32(vec![3]), "golden token 3");
+    assert_eq!(
+        inst.host_take(&bound, out_i).unwrap(),
+        Value::I32(vec![3]),
+        "golden token 3"
+    );
 }

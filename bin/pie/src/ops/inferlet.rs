@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
 
-use pie_engine::program::{Manifest, ProgramName};
+use pie_engine::inferlet::program::{Manifest, ProgramName};
 
 use crate::paths;
 
@@ -19,8 +19,8 @@ pub enum InferletCmd {
 
 #[derive(Args, Debug)]
 pub struct InfoArgs {
-    /// Inferlet name, with optional version (e.g. `text-completion`
-    /// or `text-completion@0.2.14`).
+    /// Inferlet name, with optional version (e.g. `chat-completion`
+    /// or `chat-completion@0.1.0`).
     pub inferlet: String,
 
     /// Config TOML to use for the registry URL. Defaults to
@@ -184,12 +184,12 @@ fn print_manifest(program: &ProgramName, manifest: &Manifest) {
     }
 }
 
-fn parameter_type_name(param_type: &pie_engine::program::ParameterType) -> &'static str {
+fn parameter_type_name(param_type: &pie_engine::inferlet::program::ParameterType) -> &'static str {
     match param_type {
-        pie_engine::program::ParameterType::String => "string",
-        pie_engine::program::ParameterType::Int => "int",
-        pie_engine::program::ParameterType::Float => "float",
-        pie_engine::program::ParameterType::Bool => "bool",
+        pie_engine::inferlet::program::ParameterType::String => "string",
+        pie_engine::inferlet::program::ParameterType::Int => "int",
+        pie_engine::inferlet::program::ParameterType::Float => "float",
+        pie_engine::inferlet::program::ParameterType::Bool => "bool",
     }
 }
 

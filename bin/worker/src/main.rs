@@ -39,6 +39,10 @@ struct Cli {
     /// Override the controller endpoint from config (joins a distributed cluster).
     #[arg(long)]
     controller: Option<String>,
+
+    /// Override this node's cluster role: decode, prefill, or encode.
+    #[arg(long)]
+    role: Option<pie_worker::Role>,
 }
 
 #[tokio::main]
@@ -61,6 +65,10 @@ async fn main() -> anyhow::Result<ExitCode> {
     if let Some(controller) = cli.controller {
         cfg.cluster.controller = Some(controller);
     }
+    if let Some(role) = cli.role {
+        cfg.cluster.role = Some(role);
+    }
+    cfg.validate()?;
 
     let handle = pie_worker::run(cfg).await?;
     Ok(ctx

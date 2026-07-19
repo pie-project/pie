@@ -1,0 +1,10 @@
+[package]
+name = "sampling-primitives"
+version = "0.1.0"
+description = "Token, logits, entropy, probability, and log-probability sampling primitives"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]

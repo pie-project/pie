@@ -44,7 +44,7 @@ The `#[inferlet::main]` macro generates the WebAssembly entry point and a JSON b
 use inferlet::prelude::*;
 ```
 
-Pulls in the common types: `main`, `Context`, `Result`, `Schema`, `Model`, `runtime`, `messaging`, `Adapter`, `Forward`, `Output`, `SampleHandle`, `ProbeHandle`, `Sampler`, `Probe`, `Generator`, `GenStep`, `chat`, `reasoning`, `tools`, `Speculator`, plus the `ForwardPassExt`, `SubscriptionExt`, and `FutureStringExt` extension traits.
+Pulls in the common types: `main`, `Context`, `Result`, `Schema`, `Model`, `runtime`, `session`, `Adapter`, `Forward`, `Output`, `SampleHandle`, `ProbeHandle`, `Sampler`, `Probe`, `Generator`, `GenStep`, `chat`, `reasoning`, `tools`, and `Speculator`.
 
 ### Argument parsing
 
@@ -528,8 +528,7 @@ For the formula behind the default bid, see the SOSP paper.
 ## Session (user ↔ inferlet)
 
 ```rust
-use inferlet::pie::core::session;
-use inferlet::FutureStringExt;     // for `.wait_async()` on FutureString
+use inferlet::session;
 ```
 
 The session is the bidirectional channel between the inferlet and the client that launched it. Send and receive happen on the same channel; signals from `process.signal(...)` arrive through `receive`.
@@ -538,43 +537,16 @@ The session is the bidirectional channel between the inferlet and the client tha
 |---|---|
 | `session::send(msg: &str)` | Send a text message to the client. Arrives as a `Stdout` event. |
 | `session::send_file(data: &[u8])` | Send a binary blob. Arrives as a `File` event. |
-| `session::receive() -> FutureString` | Wait for the next text message. Pair with `FutureStringExt::wait_async()`. |
-| `session::receive_file() -> FutureBlob` | Wait for the next binary blob. |
+| `session::receive().await` | Wait for the next text message. |
+| `session::receive_file().await` | Wait for the next binary blob. |
 
-A `FutureString` resolves when the next inbound payload arrives:
-
-```rust
-use inferlet::pie::core::session;
-use inferlet::FutureStringExt;
-
-let next = session::receive();
-let msg: Option<String> = next.wait_async().await;
-```
-
-## Messaging (inferlet ↔ inferlet)
+Await `receive()` directly:
 
 ```rust
-use inferlet::messaging;
-use inferlet::{FutureStringExt, SubscriptionExt};
+use inferlet::session;
+
+let msg: Option<String> = session::receive().await;
 ```
-
-Pub/sub and queues across inferlets running in the same engine. The bus is engine-local; messages do not cross instances.
-
-| Function | Description |
-|---|---|
-| `messaging::broadcast(topic: &str, msg: &str)` | Publish to every subscriber of `topic`. Fire-and-forget. |
-| `messaging::subscribe(topic: &str) -> Subscription` | Open a subscription. Holds messages until consumed. |
-| `messaging::push(topic: &str, msg: &str)` | Push a message onto a queue. Each pull consumes one. |
-| `messaging::pull(topic: &str) -> FutureString` | Wait for the next queued message. |
-
-`Subscription` methods:
-
-| Method | Description |
-|---|---|
-| `sub.pollable() -> Pollable` | WASI pollable for ready-state detection. |
-| `sub.get() -> Option<String>` | Non-blocking poll for the next message. |
-| `sub.get_async().await` | Async poll that yields until a message arrives. From `SubscriptionExt`. |
-| `sub.unsubscribe()` | Drop the subscription. |
 
 ## MCP (Model Context Protocol)
 

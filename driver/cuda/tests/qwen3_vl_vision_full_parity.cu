@@ -21,7 +21,7 @@
 #include <vector>
 
 // Pull in the encoder under test (kernels + run_qwen3vl_vision + the .hpp).
-#include "model/qwen3_vl_vision_forward.cu"
+#include "model/qwen3_vl/qwen3_vl_vision_forward.cu"
 
 using pie_cuda_driver::model::QVisLinear;
 using pie_cuda_driver::model::QVisLayerNorm;
@@ -231,6 +231,11 @@ int main(int argc, char** argv) {
     BF* d_main; HCK(cudaMalloc(&d_main, (long)n_token * OUT * sizeof(BF)));
     std::vector<BF*> d_deep(NDEEP);
     for (int d = 0; d < NDEEP; d++) HCK(cudaMalloc(&d_deep[d], (long)n_token * OUT * sizeof(BF)));
+    cublasHandle_t blas = nullptr;
+    if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "cublasCreate failed\n");
+        return 2;
+    }
 
     auto fetch = [&](BF* d) {
         long n = (long)n_token * OUT; std::vector<BF> hb(n); std::vector<float> y(n);
@@ -247,8 +252,9 @@ int main(int argc, char** argv) {
         std::string lh = std::string("last_hidden") + (std::strcmp(src,"f32")==0?"_f32":"") + ".npy";
         std::printf("=== merger-only check (input = HF %s last_hidden) ===\n", src);
         BF* d_lh = upload_bf(as_f32(load_npy(DIR + "/" + lh)));
-        pie_cuda_driver::model::run_merger(W.merger, d_lh, n_patch, n_token,
-                                           HID, 4, OUT, 1e-6f, d_main, 0);
+        pie_cuda_driver::model::run_merger(
+            blas, W.merger, d_lh, n_patch, n_token,
+            HID, 4, OUT, 1e-6f, d_main, 0);
         HCK(cudaDeviceSynchronize());
         auto my = fetch(d_main);
         report("merged HF-bf16", my, "merged.npy");
@@ -257,10 +263,14 @@ int main(int argc, char** argv) {
     }
 
     std::printf("=== per-layer hidden checkpoints (bf16-vs-bf16) ===\n");
+    const int patch_counts[] = {n_patch};
     set_qwen3vl_vision_ckpt(qvis_ckpt_cb, nullptr);
-    run_qwen3vl_vision(W, d_pix, d_rope, d_pe, gt, gh, gw, d_main, d_deep.data(), NDEEP);
+    run_qwen3vl_vision(
+        blas, W, d_pix, d_rope, d_pe, 1, patch_counts,
+        d_main, d_deep.data(), NDEEP);
     set_qwen3vl_vision_ckpt(nullptr, nullptr);
     HCK(cudaDeviceSynchronize());
+    cublasDestroy(blas);
 
     std::printf("=== Qwen3-VL vision encoder parity (bf16-vs-bf16 is the real metric) ===\n");
     auto mainy = fetch(d_main);

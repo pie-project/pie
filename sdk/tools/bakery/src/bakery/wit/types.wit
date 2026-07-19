@@ -1,0 +1,23 @@
+interface types {
+
+    type error = string;
+
+    type blob = list<u8>;
+
+    // ── Shape-typed tensor primitives (absorbed from the former `tensor`
+    // interface; shared with the `forward` interface via
+    // `use types.{shape, dtype, data}`). These are pure type aliases — the
+    // device-resident tensor/program resources (the removed PSIR sampler front
+    // door) are gone; programmable sampling now lives entirely in `forward`.
+
+    /// Tensor dimensions. Rank is `shape.len()`: `[]` is scalar, `[n]` is a
+    /// vector, `[m, n]` is a matrix. All dimensions are static; dynamic/ragged
+    /// buffers are not represented.
+    type shape = list<u32>;
+
+    variant dtype { %f32, %i32, %u32, %bool }
+
+    /// Packed little-endian tensor payload. The runtime validates byte length
+    /// against the tensor shape/dtype.
+    type data = list<u8>;
+}

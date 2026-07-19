@@ -54,7 +54,7 @@ async fn main(input: Input) -> Result<String> {
 }
 ```
 
-`Image::from_bytes` decodes synchronously and exposes metadata before any forward pass: `token_count()` (soft tokens the image will occupy) and `grid()` (the `(t, h, w)` merged-token layout). See the [`image-qa`](https://github.com/pie-project/pie/tree/main/inferlets/image-qa) inferlet for the full example.
+`Image::from_bytes` decodes synchronously and exposes metadata before any forward pass: `token_count()` (soft tokens the image will occupy) and `grid()` (the `(t, h, w)` merged-token layout).
 
 ## Audio input
 
@@ -69,8 +69,6 @@ ctx.append_audio(&clip).await?;
 ctx.user("Transcribe this clip.").cue();
 ```
 
-See the [`audio-qa`](https://github.com/pie-project/pie/tree/main/inferlets/audio-qa) inferlet.
-
 ## Video input
 
 `Video::from_bytes` takes a `max_frames` budget; the host demuxes and uniformly samples up to that many frames, preprocesses each as an image, and `append_video` splices them in (each preceded by a generic `mm:ss` timestamp marker). `max_frames` is your KV-budget knob — each frame costs tens of soft tokens.
@@ -82,8 +80,6 @@ let bytes = inferlet::http::fetch(&input.video_url).await?;
 let video = Video::from_bytes(&model, &bytes, input.max_frames).map_err(|e| e.to_string())?;
 ctx.append_video(&video).await?;
 ```
-
-See the [`video-qa`](https://github.com/pie-project/pie/tree/main/inferlets/video-qa) inferlet.
 
 ## Audio output (text-to-speech)
 
@@ -103,8 +99,6 @@ let speech = model
 println!("{:.2}s @ {} Hz", speech.duration().as_secs_f32(), speech.sample_rate());
 let wav: Vec<u8> = speech.to_wav();               // ready to return or save
 ```
-
-See the [`tts`](https://github.com/pie-project/pie/tree/main/inferlets/tts) inferlet.
 
 ## Other SDKs
 

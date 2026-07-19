@@ -1,0 +1,11 @@
+[package]
+name = "prefix-tree-kv-cache"
+version = "0.1.0"
+description = "Prefix-tree KV-cache sharing across branched prompts"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+num_tokens = {type = "int", optional = true, description = "Maximum tokens generated for each leaf (default: 32)"}

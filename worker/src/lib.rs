@@ -7,7 +7,7 @@
 //!
 //! Modules are `pub` so external callers (the pyo3 wheel) can reach
 //! the surface they need — `serve::start_engine`, `config::Config`,
-//! `embedded_driver::EmbeddedDriver`, etc.
+//! and native-driver bootstrap helpers.
 
 pub mod config;
 pub mod driver_ffi;
@@ -15,8 +15,9 @@ pub mod embedded_driver;
 pub mod translate;
 pub mod weights;
 
-pub mod engine;
 mod client_server;
+pub mod engine;
+mod executor;
 mod lifecycle;
 mod link;
 mod preflight;
@@ -27,14 +28,7 @@ mod preflight;
 // underneath without reworking them.
 pub use config::Config;
 pub use engine::{WorkerHandle, run, run_with};
+pub use pie_controller_rpc::Role;
 // The control-plane seam `run_with` is generic over — re-exported so the
 // composition root (`bin/pie`) can impl it for its `EmbeddedControl` adapter.
 pub use link::control::ControlLink;
-
-#[cfg(any(feature = "driver-cuda", feature = "driver-metal"))]
-#[used]
-static PIE_WEIGHT_LOADER_LINK_ANCHOR: unsafe extern "C" fn(
-    *const pie_weight_loader::PieLoaderCompileInput,
-    *mut *mut pie_weight_loader::PieLoaderProgramHandle,
-    *mut pie_weight_loader::PieLoaderError,
-) -> pie_weight_loader::PieLoaderStatus = pie_weight_loader::pie_loader_compile;

@@ -85,8 +85,4 @@ export type { Speculator } from './spec.js';
 // ── Runtime / IO sub-modules ─────────────────────────────────────────
 export * as runtime from './runtime.js';
 export * as session from './session.js';
-export * as messaging from './messaging.js';
 export * as zo from './zo.js';
-
-// Convenience re-exports for the most commonly subscribed-to types.
-export { Subscription } from './messaging.js';

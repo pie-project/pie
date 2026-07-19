@@ -1,4 +1,4 @@
-// PTIR tier-0 stage-runner test (charlie, thrust-3 P4.2 milestone M-C).
+// PTIR tier-0 stage-runner test.
 //
 // Drives Tier0Runner over hand-built traces on the live GPU, verifying the
 // readiness → predicated-commit → epoch-ring-bump machinery (overview §7.1):
@@ -15,16 +15,17 @@
 //        -I../src tests/ptir_runner_test.cu -o ptir_runner_test && ./ptir_runner_test
 
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include <cuda_runtime.h>
 
-#include "ptir/host_eval.hpp"
-#include "ptir/tier0_runner.hpp"
+#include "support/host_eval.hpp"
+#include "pipeline/tier0/tier0_runner.hpp"
 
-using namespace pie_cuda_driver::ptir;
+using namespace pie_cuda_driver::pipeline;
 
 namespace {
 int g_pass = 0, g_fail = 0;
@@ -239,14 +240,153 @@ void test_log_softmax_expansion() {
     FireInputs in; in.logits = d_logits; in.vocab = V;
     PassResult r = runner.run_pass(in);
     std::vector<float> got(B * V); runner.arena().host_take(0, got.data(), got.size() * 4);
-    // host reference (fused log_softmax, same math)
-    std::vector<float> want = host_eval::normalize(NormKind::LogSoftmax, logits, B, V);
+    const auto maximum =
+        host_eval::reduce(RedKind::Max, logits, B, V);
+    std::vector<float> centered(logits.size());
+    std::vector<float> exponentials(logits.size());
+    for (std::uint32_t row = 0; row < B; ++row) {
+        for (std::uint32_t column = 0; column < V; ++column) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) * V + column;
+            centered[index] = logits[index] - maximum[row];
+            exponentials[index] = std::exp(centered[index]);
+        }
+    }
+    const auto sum =
+        host_eval::reduce(RedKind::Sum, exponentials, B, V);
+    std::vector<float> want(logits.size());
+    for (std::uint32_t row = 0; row < B; ++row) {
+        for (std::uint32_t column = 0; column < V; ++column) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) * V + column;
+            want[index] = centered[index] - std::log(sum[row]);
+        }
+    }
     bool ok = r.ok && r.committed;
     for (std::size_t i = 0; ok && i < got.size(); ++i)
         ok = std::fabs(got[i] - want[i]) <= 1e-4f + 1e-4f * std::fabs(want[i]);
     expect(ok, "log_softmax expansion matches fused (got[3]=" + std::to_string(got[3]) + " want=" + std::to_string(want[3]) + ")");
     if (!ok) std::printf("        got: [%g %g %g %g ...] want: [%g %g %g %g ...]\n", got[0],got[1],got[2],got[3], want[0],want[1],want[2],want[3]);
     cudaFree(d_logits);
+}
+
+void test_lazy_packed_bool_pull() {
+    std::printf("[lazy packed-bool host pull]\n");
+    std::uint8_t* mirror = nullptr;
+    std::uint64_t* words = nullptr;
+    cudaHostAlloc(&mirror, 2, cudaHostAllocDefault);
+    cudaHostAlloc(&words, 4 * sizeof(std::uint64_t), cudaHostAllocDefault);
+    std::memset(mirror, 0, 2);
+    std::memset(words, 0, 4 * sizeof(std::uint64_t));
+    mirror[0] = 0b10000101;
+    words[1] = 1;
+
+    std::uint8_t* cells = nullptr;
+    std::uint8_t* full = nullptr;
+    std::uint32_t* commit = nullptr;
+    cudaMalloc(&cells, 16);
+    cudaMalloc(&full, kMaxRing);
+    cudaMalloc(&commit, sizeof(std::uint32_t));
+    cudaMemset(cells, 0, 16);
+    cudaMemset(full, 0, kMaxRing);
+    const std::uint32_t one = 1;
+    cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
+
+    const DeviceHostChannelTicket ticket{
+        .slot = 0,
+        .flags = kTicketConsume | kTicketHostWriter |
+                 kTicketPackedBool | kTicketRequireInput,
+        .expected_head = 0,
+        .expected_tail = kNoChannelTicket,
+        .words = words,
+        .mirror = mirror,
+        .cells = cells,
+        .cap1 = 2,
+        .wire_bytes = 1,
+        .native_bytes = 8,
+    };
+    auto launch_validation =
+        [&](std::vector<DeviceHostChannelTicket> tickets) {
+            const std::vector<PullValidateHostChannelLane> lanes{{
+                .full = full,
+                .pass_commit = commit,
+                .ticket_offset = 0,
+                .ticket_count =
+                    static_cast<std::uint32_t>(tickets.size()),
+                .initial_commit = 1,
+            }};
+            return launch_pull_validate_host_channels_batch(
+                tickets, lanes, nullptr);
+        };
+    DeviceHostChannelTicket* uploaded =
+        launch_validation({ticket});
+    cudaDeviceSynchronize();
+    std::uint8_t native[8]{};
+    std::uint32_t committed = 0;
+    cudaMemcpy(native, cells, sizeof(native), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
+    expect(
+        committed == 1 &&
+            native[0] == 1 && native[1] == 0 && native[2] == 1 &&
+            native[7] == 1,
+        "published packed bool is acquired and unpacked on device");
+    cudaFree(uploaded);
+
+    words[1] = 0;
+    cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
+    uploaded = launch_validation({ticket});
+    cudaDeviceSynchronize();
+    cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
+    expect(committed == 0, "withheld writer value clears commit without blocking");
+
+    cudaFree(uploaded);
+    DeviceHostChannelTicket later_ticket = ticket;
+    later_ticket.expected_head = 1;
+    words[0] = 0;
+    words[1] = 2;
+    cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
+    uploaded = launch_validation({later_ticket});
+    cudaDeviceSynchronize();
+    cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
+    expect(
+        committed == 0,
+        "later fire ticket cannot steal a retried predecessor's entry");
+    cudaFree(uploaded);
+
+    const DeviceHostChannelTicket publish_ticket{
+        .slot = 0,
+        .flags = kTicketPublish,
+        .expected_head = kNoChannelTicket,
+        .expected_tail = 1,
+        .words = words,
+        .mirror = mirror,
+        .cells = cells,
+        .cap1 = 2,
+        .wire_bytes = 1,
+        .native_bytes = 8,
+    };
+    words[0] = 0;
+    words[1] = 1;
+    cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
+    uploaded = launch_validation({publish_ticket});
+    cudaDeviceSynchronize();
+    cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
+    expect(committed == 0, "full host-reader ring retries at device commit");
+    cudaFree(uploaded);
+
+    words[0] = 1;
+    cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
+    uploaded = launch_validation({publish_ticket});
+    cudaDeviceSynchronize();
+    cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
+    expect(committed == 1, "reader capacity released before execution commits");
+    cudaFree(uploaded);
+
+    cudaFree(commit);
+    cudaFree(full);
+    cudaFree(cells);
+    cudaFreeHost(words);
+    cudaFreeHost(mirror);
 }
 
 }  // namespace
@@ -262,6 +402,7 @@ int main() {
     test_backpressure();
     test_gather_row_routing();
     test_log_softmax_expansion();
+    test_lazy_packed_bool_pull();
 
     std::printf("\n==== runner: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

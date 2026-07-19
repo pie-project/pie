@@ -25,7 +25,7 @@ The shape of deployment changes along three axes.
 
 - **Single engine, single tenant.** One `pie serve` on a workstation. The default for prototyping.
 - **Single engine, multiple users.** One `pie serve` with auth on. Multiple developers connect.
-- **Multiple engines.** A pool of engines behind a load balancer. The registry is shared. Each engine runs the same set of inferlets independently. Cross-engine state (saved contexts, messaging) does not propagate.
+- **Multiple engines.** A pool of engines behind a load balancer. The registry is shared. Each engine runs the same set of inferlets independently. Cross-engine saved contexts do not propagate.
 
 The engine itself does not coordinate across instances today. For multi-engine deployments, treat each one as independent; route at the client level.
 

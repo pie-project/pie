@@ -1,23 +1,24 @@
 ---
-title: Samplers and probes
-description: Sampler outputs, scoring, watermarking
+title: Sampling and search
+description: Sampling primitives, ranking, watermarking, and search
 sidebar_position: 3
 ---
 
-# Samplers and probes
+# Sampling and search
 
-Inferlets that exercise the forward-pass output surface — every sampler kind, every probe kind, scoring candidate strings, watermarking generated text.
+Inferlets that transform or search model distributions during decoding.
 
 | Inferlet | What it shows |
 |---|---|
-| [`sampler-suite`](https://github.com/pie-project/pie/tree/main/inferlets/sampler-suite) | End-to-end correctness check for every sampler kind (token / distribution / raw-logits / logprob / logprobs / entropy) attached to the same forward-pass slot. |
-| [`raw-logits-demo`](https://github.com/pie-project/pie/tree/main/inferlets/raw-logits-demo) | Microbench for `Sampler::raw_logits()`. Measures per-call overhead vs. greedy. |
-| [`output-validation`](https://github.com/pie-project/pie/tree/main/inferlets/output-validation) | Score candidate strings by their normalized log-probability (yes/no, A/B/C/D). |
-| [`best-of-n`](https://github.com/pie-project/pie/tree/main/inferlets/best-of-n) | Best-of-N generation with diversity ranking. |
-| [`watermarking`](https://github.com/pie-project/pie/tree/main/inferlets/watermarking) | Text watermarking via green/red token partitioning. |
+| [`sampling-primitives`](https://github.com/pie-project/pie/tree/main/inferlets/sampling-primitives) | Token, logits, entropy, probabilities, and log-probabilities from one forward pass. |
+| [`consensus-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/consensus-decoding) | Parallel candidate generation with string-similarity consensus ranking. |
+| [`greenlist-watermarking`](https://github.com/pie-project/pie/tree/main/inferlets/greenlist-watermarking) | Greenlist token watermarking during generation. |
+| [`mirostat-v2-sampling`](https://github.com/pie-project/pie/tree/main/inferlets/mirostat-v2-sampling) | Adaptive-surprise sampling with Mirostat v2. |
+| [`contrastive-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/contrastive-decoding) | Same-model contrastive decoding with full-context expert and bounded-context amateur passes. |
+| [`beam-search`](https://github.com/pie-project/pie/tree/main/inferlets/beam-search) | On-device beam expansion over a shared prefix-tree KV cache. |
 
 ## Related guide
 
 - [Samplers and probabilities](../forward/samplers): every `Sampler` and `Probe` kind.
 - [The forward pass](../forward/overview): the primitive these inferlets drive directly.
-- [Forking and saving](../context/sharing): the fork mechanic `best-of-n` builds on.
+- [Forking and saving](../context/sharing): shared-prefix branching used by parallel candidates.

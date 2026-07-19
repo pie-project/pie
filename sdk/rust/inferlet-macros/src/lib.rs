@@ -3,37 +3,12 @@
 //! Provides the `#[inferlet::main]` attribute macro for defining inferlet entry points.
 
 use proc_macro::TokenStream;
-use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
     parse_macro_input, Attribute, Expr, ExprLit, FnArg, GenericArgument, Ident, ItemFn, Lit,
     LitStr, Meta, Pat, PathArguments, PatType, Type,
 };
-
-/// Reads the package name from Pie.toml.
-fn read_package_name() -> Result<String, String> {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .map_err(|_| "CARGO_MANIFEST_DIR not set".to_string())?;
-
-    let pie_toml_path = std::path::PathBuf::from(&manifest_dir).join("Pie.toml");
-    let pie_toml_content = std::fs::read_to_string(&pie_toml_path).map_err(|_| {
-        "Failed to read Pie.toml - make sure it exists next to Cargo.toml".to_string()
-    })?;
-
-    let pie_config: toml::Value = pie_toml_content
-        .parse()
-        .map_err(|e| format!("Failed to parse Pie.toml: {e}"))?;
-
-    pie_config["package"]["name"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "Missing [package].name in Pie.toml".to_string())
-}
-
-/// Converts a package name like "text-completion" to a valid Rust identifier "text_completion".
-fn to_rust_ident(name: &str) -> syn::Ident {
-    syn::Ident::new(&name.replace('-', "_"), Span::call_site())
-}
 
 /// Returns `true` if `ty` is exactly `String`.
 fn is_string(ty: &Type) -> bool {
@@ -85,27 +60,6 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
-    let package_name = match read_package_name() {
-        Ok(n) => n,
-        Err(e) => return syn::Error::new(Span::call_site(), e).to_compile_error().into(),
-    };
-    let package_ident = to_rust_ident(&package_name);
-
-    // Inline WIT for this inferlet's export interface
-    let export_wit = format!(
-        r#"
-package pie:{package_name};
-
-interface run {{
-    run: async func(input: string) -> result<string, string>;
-}}
-
-world inferlet {{
-    export run;
-}}
-"#
-    );
-
     // --- Detect input/output conventions ---
 
     let first_param_ty = input_fn.sig.inputs.first().and_then(|arg| {
@@ -146,20 +100,11 @@ world inferlet {{
     input_fn.sig.ident = inner_fn_name.clone();
 
     let expanded = quote! {
-        mod __pie_export {
-            ::inferlet::wit_bindgen::generate!({
-                inline: #export_wit,
-                world: "inferlet",
-                pub_export_macro: true,
-                runtime_path: "::inferlet::wit_bindgen::rt",
-            });
-        }
-
         #input_fn
 
         struct __PieMain;
 
-        impl __pie_export::exports::pie::#package_ident::run::Guest for __PieMain {
+        impl ::inferlet::exports::pie::inferlet::run::Guest for __PieMain {
             async fn run(input: String) -> std::result::Result<String, String> {
                 #input_prep
                 let result = #inner_fn_name(typed_input).await;
@@ -169,7 +114,7 @@ world inferlet {{
             }
         }
 
-        __pie_export::export!(__PieMain with_types_in __pie_export);
+        ::inferlet::export!(__PieMain with_types_in ::inferlet);
     };
 
     expanded.into()

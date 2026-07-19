@@ -168,9 +168,9 @@ logs
 *.log
 .plan
 *profiling_result.json
-# Hand-authored docs under /docs/ are tracked by default; generated or
-# temporary doc output goes in this clearly-named, ignored subdir.
-/docs/_generated/
+/profiling-artifacts/
+# Locally archived Markdown documents.
+/docs/
 # No MCP files
 .memory-bank
 # raw eval data

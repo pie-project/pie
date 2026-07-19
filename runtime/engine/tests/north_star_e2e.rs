@@ -29,8 +29,8 @@
 //!    channel-bit late input — the sampler parks on the channel word, the forward
 //!    overlaps. The C2 wait mechanism (device dirty-flag word → channel bit) is
 //!    already in place; this harness re-points the grammar slice at it.
-//! 2. **M2 3+1 (C1):** `fwd.attn_working_set(&ws, &cursor, P_MAX)` with the
-//!    descriptor's geometry contents from a device channel the host never reads.
+//! 2. **M2 3+1 (C1):** flat `fwd.attention(...)` with every geometry descriptor
+//!    supplied by device-carried channels the host never reads.
 //! 3. **M3 north star:** compose all three programs on one forward — the MTP
 //!    epilogue emits drafts, the grammar walk builds the K+1 mask rows, Quest
 //!    selects pages per layer — under the quorum scheduler. Add the accepted-
@@ -42,8 +42,8 @@ use std::time::Duration;
 mod common;
 use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
 
-use pie_engine::process;
-use pie_engine::program::ProgramName;
+use pie_engine::inferlet::process;
+use pie_engine::inferlet::program::ProgramName;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -71,12 +71,7 @@ fn state() -> &'static TestState {
         // via the CPU `eval` over deterministic synthetic logits — the §6.1
         // epilogue-program path proven without a GPU. `fallback: 0` for the plain
         // (no-program) passes a decode loop's prefill emits.
-        let env = create_mock_env(
-            "test-model",
-            1,
-            16,
-            Arc::new(EchoBehavior(0)),
-        );
+        let env = create_mock_env("test-model", 1, 16, Arc::new(EchoBehavior(0)));
         let config = env.config();
         rt.block_on(async {
             pie_engine::bootstrap::bootstrap(config).await.unwrap();
@@ -177,19 +172,20 @@ fn north_star_runahead_decode_slice() {
     let out = spawn_and_capture(s, "runahead", "8".into())
         .expect("runahead inferlet should run to completion");
     eprintln!("[north-star: runahead] {out}");
-    assert!(out.contains("MATCH=true"), "run-ahead == synchronous stream: {out}");
-    // depth-2 FIFO submit-ahead loop at the shipped WAR bound — verifiable now.
-    // DEEP4_MATCH (depth-4) is observed, not asserted: byte-identity holds at any
-    // cap (the carrier injects correctly), but to EXERCISE true 4-in-flight (the
-    // depth-k WAR test that empirically confirms the single `last_eager_d2h_done`
-    // scalar is depth-k-correct — no WAR ring needed, spec §3.3), run this with
-    // `PIE_SCHED_MAX_IN_FLIGHT=4` (else it queues at the default cap-2).
+    assert!(
+        out.contains("MATCH=true"),
+        "run-ahead == synchronous stream: {out}"
+    );
+    // Dispatch-time pool admission safely supports configured deeper depths.
     assert!(
         out.contains("DEEP_MATCH=true"),
         "deep-pre-submission carrier chain (depth-2 FIFO) == synchronous stream \
          (device-resident reduce-R cut): {out}"
     );
-    assert!(out.contains("CLEAR_OK=true"), "#26 dangling-carry clear: {out}");
+    assert!(
+        out.contains("CLEAR_OK=true"),
+        "#26 dangling-carry clear: {out}"
+    );
     assert!(
         out.contains("DEEP_STOP_MATCH=true"),
         "depth-k EOS-rollback (over-shoot + discard) == synchronous stop stream: {out}"
@@ -200,28 +196,26 @@ fn north_star_runahead_decode_slice() {
     );
 }
 
-/// **§6.1 MTP prerequisite — the spec-verify `[k]`-Token marshal runs on the
+/// **§6.1 MTP prerequisite — the spec-verify `[k]`-Token channel runs on the
 /// eval-mock.** Before composing MTP+grammar, prove the building block the
 /// composition rides: the `specverify` inferlet emits a `[k,vocab]` matrix
 /// intrinsic → per-row argmax → spec-verify DAG (`eq`/`cumprod`/`select`) → a
-/// `[k]`-Token, marshaled OFF the system `spec_tokens` channel into the
-/// per-(request,output) `program_tokens` CSR (#32/#33). `MARSHAL_EMITS_K` is the
-/// value-INDEPENDENT plumbing headline (all k rows emit) — it holds on the mock
+/// `[k]`-Token through its bound reader channel. `CHANNEL_EMITS_K` is the
+/// value-independent plumbing headline (all k rows emit) — it holds on the mock
 /// regardless of the eval-mock's single-row-logits limitation (which makes the
 /// matrix argmax VALUES degenerate, `MATRIX_ARGMAX_OK` real-driver-only). This
-/// gates the MTP composition below: the K-draft epilogue + match-verify marshal
+/// gates the MTP composition below: the K-draft epilogue + match-verify channel
 /// the same `[k]`-Token.
 #[test]
-fn north_star_specverify_marshal_runs_on_mock() {
+fn north_star_specverify_channel_runs_on_mock() {
     let _serial = serial_guard();
     let s = state();
     let out = spawn_and_capture(s, "specverify", r#"{"k":4}"#.into())
         .expect("specverify inferlet should run to completion on the eval-mock");
     eprintln!("[north-star: specverify] {out}");
     assert!(
-        out.contains("MARSHAL_EMITS_K=true"),
-        "the spec-verify [k]-Token marshal must emit all k off program_tokens \
-         (the #32 plumbing the MTP composition rides): {out}"
+        out.contains("CHANNEL_EMITS_K=true"),
+        "the spec-verify [k]-Token channel must publish all k values: {out}"
     );
 }
 
@@ -242,8 +236,8 @@ fn north_star_specverify_marshal_runs_on_mock() {
 ///     speculation, not a passthrough).
 ///
 /// §6.1's "MTP + grammar on one forward" leg, proven e2e on the eval-mock (its
-/// `[k, vocab]` matrix intrinsic + `[k]`-Token `program_tokens` marshal are real —
-/// see `north_star_specverify_marshal_runs_on_mock`). The remaining §6.1 MTP piece
+/// `[k, vocab]` matrix intrinsic + `[k]`-Token channel are real — see
+/// `north_star_specverify_channel_runs_on_mock`). The remaining §6.1 MTP piece
 /// is the multi-STEP accept-prefix decode LOOP (commit lanes `0..=n_acc`, re-draft
 /// via `mtp_logits`); its per-step verify program is exactly this fused
 /// composition, and its real-model speedup validates on the driver once the R>1
@@ -293,7 +287,7 @@ fn north_star_quest_attention_sink() {
 /// **§6.2 beam-search composition (extension point).** Beam search runs **B lanes
 /// in ONE forward** — a *single* batched instance ([B, ·] rows), NOT B concurrent
 /// pipelines — so it does **not** exercise the multi-pipeline concurrent-decode
-/// arena bug the fleet gate is blocked on (`cuda_bubble.rs`). That makes it the
+/// arena bug covered by the surviving `cuda_concurrent` fleet gate. That makes it the
 /// likely FIRST full PTIR composition to run end to end once the thrust-3 beam
 /// epilogue lands: reorder is an index gather over `pages [B, P]`, divergence is a
 /// **freeze** (not advancing the inherited `lens` entry), and each parent's
@@ -325,7 +319,7 @@ fn north_star_beam_search_composition() {
 /// tokens) with ALL processes in flight before awaiting any, so the scheduler
 /// co-batches them. The mock's `synthetic_logits` is seeded by BATCH-ROW index
 /// (not content), so pipelines legitimately diverge as co-batching varies — token
-/// IDENTITY across pipelines is a real-driver check (bravo's `cuda_bubble.rs`).
+/// IDENTITY across pipelines is a real-driver check (`cuda_concurrent`).
 /// What the mock CAN prove, and what this guards: concurrent co-batching runs
 /// every pipeline to completion with a well-formed budget and NO `arena: unknown
 /// object` crash / cross-request drop — the regression guard for the prefill-flush

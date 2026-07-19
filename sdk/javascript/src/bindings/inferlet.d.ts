@@ -4,7 +4,6 @@ export type * as PieCoreAudioOut from './interfaces/pie-core-audio-out.js'; // i
 export type * as PieCoreHttp from './interfaces/pie-core-http.js'; // import pie:core/http
 export type * as PieCoreInference from './interfaces/pie-core-inference.js'; // import pie:core/inference
 export type * as PieCoreMedia from './interfaces/pie-core-media.js'; // import pie:core/media
-export type * as PieCoreMessaging from './interfaces/pie-core-messaging.js'; // import pie:core/messaging
 export type * as PieCoreModel from './interfaces/pie-core-model.js'; // import pie:core/model
 export type * as PieCoreRuntime from './interfaces/pie-core-runtime.js'; // import pie:core/runtime
 export type * as PieCoreSession from './interfaces/pie-core-session.js'; // import pie:core/session

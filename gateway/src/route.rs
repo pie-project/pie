@@ -38,7 +38,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pie_controller_rpc::{Health, RoutableWorker, RoutingTable};
+use pie_controller_rpc::{Health, Role, RoutableWorker, RoutingTable};
 use pie_ids::WorkerId;
 use pie_worker_rpc::{Accepted, Request};
 use tokio::sync::watch;
@@ -307,6 +307,7 @@ fn select_candidates(
         .workers
         .iter()
         .filter(|w| w.health == Health::Healthy)
+        .filter(|w| w.role == Role::Decode)
         .filter(|w| connected.contains(&w.id))
         .filter(|w| want_model.is_none_or(|m| w.model == m))
         .collect();
@@ -492,6 +493,22 @@ mod tests {
         assert_eq!(
             select_candidates(&t, &conn, Some("m"), Some(7), &mut rng),
             vec![WorkerId(4)]
+        );
+    }
+
+    #[test]
+    fn filters_executor_roles() {
+        let mut prefill = worker(1, "m", Health::Healthy, 0, 0);
+        prefill.role = Role::Prefill;
+        let mut encode = worker(2, "m", Health::Healthy, 0, 0);
+        encode.role = Role::Encode;
+        let decode = worker(3, "m", Health::Healthy, 0, 0);
+        let t = table(vec![prefill, encode, decode]);
+        let conn = connset(&[1, 2, 3]);
+        let mut rng = scripted(vec![]);
+        assert_eq!(
+            select_candidates(&t, &conn, Some("m"), None, &mut rng),
+            vec![WorkerId(3)]
         );
     }
 

@@ -1,0 +1,20 @@
+interface reasoning {
+    use types.{error};
+
+    variant event {
+        /// Reasoning block started
+        start,
+        /// Reasoning text chunk
+        delta(string),
+        /// Reasoning complete (full reasoning text)
+        complete(string),
+    }
+
+    /// Create a decoder to detect reasoning blocks in generated tokens
+    create-decoder: func() -> decoder;
+
+    resource decoder {
+        feed: func(tokens: list<u32>) -> result<event, error>;
+        reset: func();
+    }
+}

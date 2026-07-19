@@ -15,7 +15,7 @@
 //! template knowledge lives in the Pie runtime, not in the SDK.
 
 use crate::Result;
-use crate::pie::instruct::chat::{Decoder as RawDecoder, Event as RawEvent};
+use crate::pie::inferlet::chat::{Decoder as RawDecoder, Event as RawEvent};
 
 // =============================================================================
 // Template fillers
@@ -23,43 +23,43 @@ use crate::pie::instruct::chat::{Decoder as RawDecoder, Event as RawEvent};
 
 /// Token sequence for a system-role message.
 pub fn system(message: &str) -> Vec<u32> {
-    crate::pie::instruct::chat::system(message)
+    crate::pie::inferlet::chat::system(message)
 }
 
 /// Token sequence for a user-role message.
 pub fn user(message: &str) -> Vec<u32> {
-    crate::pie::instruct::chat::user(message)
+    crate::pie::inferlet::chat::user(message)
 }
 
 /// Token sequence for the first user-role message in a fresh chat.
 pub fn first_user(message: &str) -> Vec<u32> {
-    crate::pie::instruct::chat::first_user(message)
+    crate::pie::inferlet::chat::first_user(message)
 }
 
 /// Token sequence for a system message followed by the first user message.
 pub fn system_user(system: &str, user: &str) -> Vec<u32> {
-    crate::pie::instruct::chat::system_user(system, user)
+    crate::pie::inferlet::chat::system_user(system, user)
 }
 
 /// Token sequence for an assistant-role message (history replay).
 pub fn assistant(message: &str) -> Vec<u32> {
-    crate::pie::instruct::chat::assistant(message)
+    crate::pie::inferlet::chat::assistant(message)
 }
 
 /// Token sequence for the generation cue (tells the model "your turn").
 pub fn cue() -> Vec<u32> {
-    crate::pie::instruct::chat::cue()
+    crate::pie::inferlet::chat::cue()
 }
 
 /// Token sequence that seals the current turn (inserts a stop token).
 pub fn seal() -> Vec<u32> {
-    crate::pie::instruct::chat::seal()
+    crate::pie::inferlet::chat::seal()
 }
 
 /// Stop-token IDs for the bound model's chat template — add to a decode
 /// loop's stop-token set for explicit termination control.
 pub fn stop_tokens() -> Vec<u32> {
-    crate::pie::instruct::chat::stop_tokens()
+    crate::pie::inferlet::chat::stop_tokens()
 }
 
 // =============================================================================
@@ -110,7 +110,7 @@ impl Decoder {
     /// Construct a decoder for the bound model's chat template.
     pub fn new() -> Self {
         Self {
-            inner: crate::pie::instruct::chat::create_decoder(),
+            inner: crate::pie::inferlet::chat::create_decoder(),
         }
     }
 

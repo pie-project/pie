@@ -26,7 +26,7 @@
 //! # Boundaries
 //!
 //!   * **↔driver (handle boundary):** the driver pins its KV buffers and exports
-//!     a [`pie_driver_abi::kv::KvHandle`]; transport consumes it without owning or
+//!     a [`pie_driver_abi::KvHandle`]; transport consumes it without owning or
 //!     interpreting the bytes. The per-backend registration shim lives on the
 //!     driver's export surface. Transport never imports the driver — they meet
 //!     only through the handle type on the schema floor.
@@ -36,7 +36,7 @@
 //!     completion signal ([`Completion`]); *when* to await is the scheduler's
 //!     job.
 //!   * **↔interface/driver:** the KV layout and handle type live in
-//!     [`pie_driver_abi::kv`], shared by driver / transport / runtime / controller.
+//!     [`pie_driver_abi`], shared by driver / transport / runtime / controller.
 
 pub mod core;
 pub mod engines;
@@ -47,10 +47,12 @@ pub use crate::core::{
     Completion, Engine, EngineKind, PageSet, PeerConn, RegisteredHandle, TransferId, WorkerId,
 };
 pub use engines::local::{D2dCopier, LocalEngine};
+#[cfg(feature = "nixl")]
+pub use engines::nixl::NixlEngine;
 pub use error::{Result, TransportError};
 pub use registry::Registry;
 
-pub use pie_driver_abi::kv::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
+pub use pie_driver_abi::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
 
 #[cfg(test)]
 mod tests {
@@ -65,6 +67,8 @@ mod tests {
             page_size: 16,
             dtype: KvDtype::Bf16,
             kind: KvLayoutKind::KvSeparate,
+            storage_format: "test-bf16".to_string(),
+            region_page_bytes: Vec::new(),
         }
     }
 
@@ -75,8 +79,31 @@ mod tests {
             regions: vec![KvRegion {
                 base,
                 len: n_pages * l.page_bytes(),
+                page_stride: l.page_bytes(),
                 domain: MemoryDomain::CudaDevice(0),
             }],
+            layout: l,
+        }
+    }
+
+    fn multi_handle(base: u64, n_pages: u64) -> KvHandle {
+        let mut l = layout();
+        l.region_page_bytes = vec![64, 32];
+        KvHandle {
+            regions: vec![
+                KvRegion {
+                    base,
+                    len: n_pages * 64,
+                    page_stride: 64,
+                    domain: MemoryDomain::CudaDevice(0),
+                },
+                KvRegion {
+                    base: base + 0x1000,
+                    len: n_pages * 32,
+                    page_stride: 32,
+                    domain: MemoryDomain::CudaDevice(0),
+                },
+            ],
             layout: l,
         }
     }
@@ -135,6 +162,34 @@ mod tests {
             .recv(&decode, &PageSet::new(vec![0]), WorkerId(1))
             .unwrap();
         assert_eq!(reg.poll(id).unwrap(), Completion::Done);
+    }
+
+    #[test]
+    fn local_mapped_send_copies_distinct_pages_across_all_regions() {
+        let copier = FakeCopier::default();
+        let calls = copier.calls.clone();
+        let reg = Registry::local_only(Box::new(copier));
+        let source = reg
+            .register(WorkerId(1), multi_handle(0x1000, 8), EngineKind::Local)
+            .unwrap();
+        reg.register(WorkerId(2), multi_handle(0x9000, 8), EngineKind::Local)
+            .unwrap();
+        let id = reg
+            .send_mapped(
+                &source,
+                &PageSet::new(vec![1]),
+                &PageSet::new(vec![3]),
+                WorkerId(2),
+            )
+            .unwrap();
+        assert_eq!(reg.poll(id).unwrap(), Completion::Done);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                (0x1000 + 64, 0x9000 + 3 * 64, 64),
+                (0x2000 + 32, 0xA000 + 3 * 32, 32),
+            ]
+        );
     }
 
     #[test]

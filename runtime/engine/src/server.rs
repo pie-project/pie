@@ -16,6 +16,7 @@
 
 mod data_transfer;
 mod handler;
+pub(crate) mod inbox;
 
 pub use data_transfer::InFlightUpload;
 
@@ -24,14 +25,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use dashmap::DashMap;
 use pie_client::message::{ClientMessage, ServerMessage as WireServerMessage};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
-use crate::process::{self, ProcessEvent, ProcessId};
-use crate::program::ProgramName;
+use crate::inferlet::process;
+use crate::inferlet::{ProcessEvent, ProcessId, ProgramName};
 use crate::service::{ServiceHandler, ServiceMap};
 
 /// Unique identifier for a connected client.
@@ -42,8 +43,9 @@ pub type ClientId = u32;
 // =============================================================================
 
 static STATE: OnceLock<Arc<ServerState>> = OnceLock::new();
-static SESSION_OUTBOX: LazyLock<DashMap<ClientId, Arc<TokioMutex<mpsc::Receiver<WireServerMessage>>>>> =
-    LazyLock::new(DashMap::new);
+static SESSION_OUTBOX: LazyLock<
+    DashMap<ClientId, Arc<TokioMutex<mpsc::Receiver<WireServerMessage>>>>,
+> = LazyLock::new(DashMap::new);
 
 fn install_state(max_upload_bytes: usize) -> Arc<ServerState> {
     if let Some(state) = STATE.get() {
@@ -69,8 +71,9 @@ fn get_state() -> Result<Arc<ServerState>> {
 ///
 /// Idempotent: the first call installs the upload cap; subsequent calls keep
 /// the original state.
-pub fn init(max_upload_bytes: usize) {
+pub(crate) fn init(max_upload_bytes: usize) {
     let _ = install_state(max_upload_bytes);
+    inbox::spawn();
 }
 
 /// Open a new in-process session for the worker edge-rpc service.
@@ -155,7 +158,11 @@ static CLIENT_SERVICES: LazyLock<ServiceMap<ClientId, SessionMessage>> =
     LazyLock::new(ServiceMap::new);
 
 /// Sends a typed process event to a client.
-pub fn send_event(client_id: ClientId, process_id: ProcessId, event: &ProcessEvent) -> Result<()> {
+pub(crate) fn send_event(
+    client_id: ClientId,
+    process_id: ProcessId,
+    event: &ProcessEvent,
+) -> Result<()> {
     CLIENT_SERVICES.send(
         &client_id,
         SessionMessage::Event {
@@ -167,12 +174,12 @@ pub fn send_event(client_id: ClientId, process_id: ProcessId, event: &ProcessEve
 }
 
 /// Sends a binary file to a client for a specific process.
-pub fn send_file(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Result<()> {
+pub(crate) fn send_file(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Result<()> {
     CLIENT_SERVICES.send(&client_id, SessionMessage::File { process_id, data })
 }
 
 /// Registers a file waiter for a process. Returns the file bytes when the client delivers them.
-pub async fn receive_file(client_id: ClientId, process_id: ProcessId) -> Result<Bytes> {
+pub(crate) async fn receive_file(client_id: ClientId, process_id: ProcessId) -> Result<Bytes> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     CLIENT_SERVICES.send(
         &client_id,
@@ -185,7 +192,8 @@ pub async fn receive_file(client_id: ClientId, process_id: ProcessId) -> Result<
 }
 
 /// Checks if a session exists for the given client.
-pub fn exists(client_id: ClientId) -> bool {
+#[allow(dead_code)] // part of the documented Client Session surface alongside send_event/send_file/receive_file; no current caller.
+pub(crate) fn exists(client_id: ClientId) -> bool {
     CLIENT_SERVICES.contains(&client_id)
 }
 
@@ -359,11 +367,6 @@ impl Session {
 
             ClientMessage::AuthProve { corr_id, .. } => {
                 self.send_response(corr_id, false, "Already authenticated".to_string())
-                    .await;
-            }
-
-            ClientMessage::AuthByToken { corr_id, token: _ } => {
-                self.send_response(corr_id, true, "Already authenticated".to_string())
                     .await;
             }
 

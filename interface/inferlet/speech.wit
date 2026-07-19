@@ -1,0 +1,66 @@
+// Native audio OUTPUT — the inverse of media.wit. See AUDIO_OUTPUT.md.
+//
+// The engine owns the CSM backbone (16-layer Llama, reuses the verified naive
+// forward) + the depth decoder (4-layer RVQ frame sampler, verified by
+// driver/cuda/tests/csm_depth_decoder_parity.cu) + the Mimi decoder (codes ->
+// waveform, verified by driver/cuda/tests/mimi_decoder_full_parity.cu).
+//
+// **Model-agnostic by construction, mirroring media.wit.** The inferlet supplies
+// neutral intent — the text to speak, a voice selector, an optional target
+// duration — and the host applies the bound model's own prompt framing (CSM:
+// "[speaker]text" with the Llama-3 BOS/EOS the CSM processor adds) and runs the
+// whole frame-stepped loop in one `generate_audio` cold-path request
+// (AdapterOp::GenerateAudio: backbone prefill -> per-frame depth loop -> Mimi
+// decode). No special-token id and no model constant (sample rate, frame rate)
+// ever crosses into the inferlet — the returned `speech` is self-describing.
+//
+// The codes never round-trip through WASM linear memory; only the final PCM
+// does, materialized on request via `pcm`. Streaming (`next-chunk`) and
+// conditioning on prior context turns are the documented follow-ups; the
+// resource shape is chosen to leave room for both without a breaking change.
+interface speech {
+    use types.{error};
+
+    // Which voice to speak in. A neutral selector; the host maps it onto the
+    // bound model's own conditioning (CSM bakes an integer speaker id into its
+    // "[id]text" frame). `named` is for models that pick voices by name — CSM
+    // has none and returns a clear error for it.
+    variant voice {
+        speaker(u32),
+        named(string),
+    }
+
+    // What to synthesize. Plain intent only: the host owns the model-specific
+    // prompt framing, so the inferlet never writes a "[speaker]text" string or a
+    // BOS/EOS token id of its own.
+    record speech-request {
+        // The text to speak.
+        text: string,
+        // The voice to speak it in.
+        voice: voice,
+        // Stop after roughly this much audio. A neutral unit (milliseconds); the
+        // host converts it to the model's internal frame count (CSM: 12.5 Hz Mimi
+        // frames, 80 ms each). `none` => the model's default cap. Generation also
+        // stops early on the model's end-of-audio signal regardless.
+        max-duration-ms: option<u32>,
+    }
+
+    // A generated audio clip. Self-describing: it carries its own sample rate and
+    // channel count, so the inferlet never hardcodes a model constant. Holds the
+    // decoded PCM host-side; `pcm` materializes it on request (so a future
+    // streaming form can hand back chunks without changing callers).
+    resource speech {
+        // Synthesize `req` on the bound model. Errors if the model has no
+        // audio-output front-end (i.e. is not a CSM checkpoint).
+        generate: static func(req: speech-request) -> result<speech, error>;
+
+        // Output sample rate in Hz (CSM: 24000).
+        sample-rate: func() -> u32;
+        // Channel count (CSM: 1, mono).
+        channels: func() -> u32;
+        // Duration of the generated clip in milliseconds.
+        duration-ms: func() -> u32;
+        // Decoded PCM samples in [-1, 1] (mono => one sample per frame).
+        pcm: func() -> list<f32>;
+    }
+}

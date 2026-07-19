@@ -158,6 +158,7 @@ __global__ void mamba_ssm_batched_warp_kernel(
     if (n_tokens <= 0) return;
 
     const int slot = slot_ids ? slot_ids[r] : 0;
+    if (slot < 0) return;
     const long long state_stride =
         static_cast<long long>(num_heads) * head_dim * state_size;
     __nv_bfloat16* state =
@@ -255,6 +256,7 @@ __global__ void mamba_ssm_batched_prefill_reg_kernel(
     if (n_tokens <= 0) return;
 
     const int slot = slot_ids ? slot_ids[r] : 0;
+    if (slot < 0) return;
     const long long state_stride =
         static_cast<long long>(num_heads) * head_dim * state_size;
     __nv_bfloat16* state =
@@ -370,6 +372,7 @@ __global__ void mamba_ssm_batched_kernel(
     float* acc = smem;  // [head_dim]
 
     const int slot = slot_ids ? slot_ids[r] : 0;
+    if (slot < 0) return;
     const long long state_stride =
         static_cast<long long>(num_heads) * head_dim * state_size;
     __nv_bfloat16* state =

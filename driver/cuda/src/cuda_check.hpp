@@ -1,7 +1,7 @@
 #pragma once
 
 // Tiny error-check macros for CUDA runtime calls. Turn cudaError_t into
-// std::runtime_error so we can surface failures cleanly through the shmem
+// std::runtime_error so the direct FFI entry point can surface failures
 // loop or shutdown path.
 
 #include <cuda_runtime.h>
@@ -20,6 +20,51 @@ inline void cuda_check_impl(cudaError_t err, const char* expr, const char* file,
         throw std::runtime_error(oss.str());
     }
 }
+
+class StreamCaptureGuard {
+  public:
+    explicit StreamCaptureGuard(
+        cudaStream_t stream,
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed)
+        : stream_(stream), active_(true) {
+        cuda_check_impl(
+            cudaStreamBeginCapture(stream_, mode),
+            "cudaStreamBeginCapture", __FILE__, __LINE__);
+    }
+
+    ~StreamCaptureGuard() noexcept {
+        if (!active_) return;
+        cudaGraph_t graph = nullptr;
+        const cudaError_t status = cudaStreamEndCapture(stream_, &graph);
+        if (status == cudaSuccess && graph != nullptr) {
+            cudaGraphDestroy(graph);
+        } else {
+            cudaGetLastError();
+        }
+    }
+
+    StreamCaptureGuard(const StreamCaptureGuard&) = delete;
+    StreamCaptureGuard& operator=(const StreamCaptureGuard&) = delete;
+
+    cudaGraph_t end() {
+        if (!active_) {
+            throw std::logic_error("CUDA stream capture already ended");
+        }
+        cudaGraph_t graph = nullptr;
+        const cudaError_t status = cudaStreamEndCapture(stream_, &graph);
+        active_ = false;
+        if (status != cudaSuccess && graph != nullptr) {
+            cudaGraphDestroy(graph);
+            graph = nullptr;
+        }
+        cuda_check_impl(status, "cudaStreamEndCapture", __FILE__, __LINE__);
+        return graph;
+    }
+
+  private:
+    cudaStream_t stream_ = nullptr;
+    bool active_ = false;
+};
 
 }  // namespace pie_cuda_driver
 

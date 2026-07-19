@@ -8,7 +8,9 @@ pub enum Readiness<T> {
     Ready(T),
     /// Not ready; `observed_epoch` is the ring index the check read (what
     /// the eventual commit must pass).
-    Pending { observed_epoch: u64 },
+    Pending {
+        observed_epoch: u64,
+    },
 }
 
 /// A future that parks on `slot` until `check` returns [`Readiness::Ready`].
@@ -36,10 +38,7 @@ where
 {
     type Output = T;
 
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<T> {
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<T> {
         let this = self.get_mut();
         // Fast path.
         let observed = match (this.check)() {
@@ -60,5 +59,11 @@ where
             }
             Readiness::Pending { .. } => std::task::Poll::Pending,
         }
+    }
+}
+
+impl<F> Drop for WaitFuture<'_, F> {
+    fn drop(&mut self) {
+        self.table.deregister(self.slot);
     }
 }

@@ -1,186 +1,243 @@
-//! Per-driver channel + spec registry.
-//!
-//! One [`DriverChannel`] per driver, keyed by [`DriverId`]. Embedded
-//! drivers install a channel before starting the driver thread;
-//! subprocess drivers fall through to lazy shmem attach on first
-//! request. The same channel carries every wire payload kind (Forward,
-//! Copy, Adapter, Health) — the driver-side handler dispatches on the
-//! [`pie_driver_abi::RequestPayload`] variant.
+//! Channel lifecycle: the registered native binding ([`RegisteredChannel`]),
+//! the owning-side handle applications hold ([`ChannelEndpoint`]) and its
+//! wait/poison/close semantics, plus the seed-value wire payload
+//! ([`ChannelValue`]) [`super::instance::InstanceBindingPlan`] carries.
 
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use anyhow::{Result, anyhow};
-use dashmap::DashMap;
+use pie_driver_abi::PieChannelEndpointBinding;
 
-use super::{DeferredResponse, DriverChannel, DriverId, DriverRequest, DriverSpec, ShmemChannel};
-use pie_driver_abi::{ForwardResponse, RequestPayload, ResponsePayload};
-
-fn shmem_name(driver_idx: usize) -> String {
-    format!("/pie_shmem_g{driver_idx}")
+/// One channel's initial (seed) value delivered at bind time — `channel` is
+/// the global channel identity, `bytes` its native-encoded wire payload. No
+/// IR semantics live here; this is purely the driver-facing seed-table
+/// entry `InstanceBindingPlan::seed_values` carries, next to the
+/// `LaunchPlan`/`InstanceBindingPlan` it feeds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelValue {
+    pub channel: u64,
+    pub bytes: Vec<u8>,
 }
 
-// Channel-level spin budgets are configured at startup via
-// `serve::start_subprocess_group` (which pre-installs the channel
-// with the user's `[model.driver].ipc_profile` / `spin_budget_us`). The lazy-attach
-// fallback below uses the bridge's default budget; in practice no
-// production path hits it because subprocess + embedded drivers
-// both pre-install.
-
-static CHANNELS: LazyLock<DashMap<DriverId, Arc<dyn DriverChannel>>> = LazyLock::new(DashMap::new);
-static SPECS: LazyLock<DashMap<DriverId, DriverSpec>> = LazyLock::new(DashMap::new);
-static NEXT_DRIVER_ID: AtomicUsize = AtomicUsize::new(0);
-
-/// Install a channel for the given driver. Used by the embedded path
-/// to register an in-process channel before the driver thread starts.
-pub fn install_channel(driver_idx: DriverId, channel: Arc<dyn DriverChannel>) {
-    CHANNELS.insert(driver_idx, channel);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredChannel {
+    pub driver_id: usize,
+    pub binding: PieChannelEndpointBinding,
+    pub reader_wait_id: u64,
+    pub writer_wait_id: u64,
 }
 
-/// Register the driver's static spec under a specific id.
-pub fn install_spec(driver_idx: DriverId, spec: DriverSpec) {
-    SPECS.insert(driver_idx, spec);
+/// Notifies whichever layer owns the channel's native binding that this
+/// endpoint has closed (physically closes/deregisters `channel_id` on the
+/// driver that owns it). A leaf callback type — it names no scheduler
+/// type — installed by whoever registers the channel and therefore already
+/// holds a handle to the owning driver's scheduler
+/// (`scheduler::dispatch::register_channel`); `None` in tests that only
+/// exercise wait/poison semantics and never call [`ChannelEndpoint::new`]
+/// with a closer installed.
+pub type ChannelCloser = Arc<dyn Fn(u64) -> anyhow::Result<()> + Send + Sync>;
+
+pub struct ChannelEndpoint {
+    registered: RegisteredChannel,
+    closed: AtomicBool,
+    closer: Option<ChannelCloser>,
 }
 
-/// Allocate the next sequential driver id and register its spec.
-/// Returns the id, which callers use to install a channel or address
-/// the driver in `fire_batch`/`copy_*`/`load_adapter`.
-pub fn register_driver(spec: DriverSpec) -> DriverId {
-    let id = NEXT_DRIVER_ID.fetch_add(1, Ordering::Relaxed);
-    SPECS.insert(id, spec);
-    id
-}
-
-/// Return the driver's static configuration.
-pub async fn get_spec(driver_idx: DriverId) -> Result<DriverSpec> {
-    SPECS
-        .get(&driver_idx)
-        .map(|s| s.clone())
-        .ok_or_else(|| anyhow!("no DriverSpec for driver {driver_idx}"))
-}
-
-pub(crate) fn get_channel(driver_idx: DriverId) -> Result<Arc<dyn DriverChannel>> {
-    if let Some(c) = CHANNELS.get(&driver_idx) {
-        return Ok(c.clone());
-    }
-    // Subprocess drivers may not have a pre-installed channel; lazy-attach
-    // to the shmem region named `/pie_shmem_g{idx}`. The spin budget
-    // here is a fallback default — in practice both subprocess and
-    // embedded drivers pre-install via `install_channel` with the
-    // user's `[model.driver].ipc_profile` / `spin_budget_us`, so this
-    // branch is rarely hit. 1000 µs matches `InProcChannel::new()`'s
-    // default.
-    let name = shmem_name(driver_idx);
-    let channel = ShmemChannel::open(&name, 1_000)?;
-    let arc: Arc<dyn DriverChannel> = Arc::new(channel);
-    CHANNELS.insert(driver_idx, arc.clone());
-    Ok(arc)
-}
-
-/// Run a closure with a channel handle. Convenience for sync notify-style
-/// calls in `ops::copy_*`.
-pub(crate) fn with_channel<F, R>(driver_idx: DriverId, f: F) -> Result<R>
-where
-    F: FnOnce(&Arc<dyn DriverChannel>) -> Result<R>,
-{
-    let ch = get_channel(driver_idx)?;
-    f(&ch)
-}
-
-/// Fire a batched forward pass. Wraps the request as a
-/// [`pie_driver_abi::RequestPayload::Forward`] and unwraps the matching
-/// [`pie_driver_abi::ResponsePayload::Forward`].
-pub async fn fire_batch(
-    driver_idx: DriverId,
-    req: pie_driver_abi::ForwardRequest,
-) -> Result<ForwardResponse> {
-    let ch = get_channel(driver_idx)?;
-    let resp = ch
-        .submit(DriverRequest {
-            driver_id: driver_idx,
-            payload: RequestPayload::Forward(req),
-        })
-        .await?;
-    match resp.payload {
-        ResponsePayload::Forward(r) => Ok(r),
-        ResponsePayload::Status(s) => Err(anyhow!(
-            "fire_batch: driver returned cold-path status {} (driver bug)",
-            s.status,
-        )),
+impl std::fmt::Debug for ChannelEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelEndpoint")
+            .field("registered", &self.registered)
+            .field("closed", &self.closed)
+            .field("closer", &self.closer.is_some())
+            .finish()
     }
 }
 
-/// Synchronous sibling of [`fire_batch`]. Used by the per-driver
-/// scheduler loop, which runs on a dedicated OS thread (not a tokio
-/// task) and so doesn't have an async context to `.await` in. Every
-/// production `DriverChannel` already has a sync inner; this just
-/// routes through the trait's `submit_sync`.
-pub fn fire_batch_sync(
-    driver_idx: DriverId,
-    req: pie_driver_abi::ForwardRequest,
-) -> Result<ForwardResponse> {
-    let ch = get_channel(driver_idx)?;
-    let resp = ch.submit_sync(DriverRequest {
-        driver_id: driver_idx,
-        payload: RequestPayload::Forward(req),
-    })?;
-    match resp.payload {
-        ResponsePayload::Forward(r) => Ok(r),
-        ResponsePayload::Status(s) => Err(anyhow!(
-            "fire_batch_sync: driver returned cold-path status {} (driver bug)",
-            s.status,
-        )),
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelWaitError {
+    Poisoned(u64),
+    Closed,
 }
 
-
-/// A submitted-but-not-yet-awaited forward batch. The request is already
-/// enqueued (its submission order fixed at [`fire_batch_deferred`] call time);
-/// [`FireHandle::wait`] blocks for the driver response. The run-ahead
-/// scheduler enqueues fires in fire-order on its own thread, then awaits each
-/// off-thread so the GPU wait overlaps building the next batch.
-pub struct FireHandle {
-    deferred: DeferredResponse,
-}
-
-impl FireHandle {
-    /// Block for the forward response. Call this off the scheduler thread so
-    /// the GPU wait overlaps building + enqueuing the next batch.
-    pub fn wait(self) -> Result<ForwardResponse> {
-        let resp = (self.deferred)()?;
-        match resp.payload {
-            ResponsePayload::Forward(r) => Ok(r),
-            ResponsePayload::Status(s) => Err(anyhow!(
-                "fire_batch_deferred: driver returned cold-path status {} (driver bug)",
-                s.status,
-            )),
+impl std::fmt::Display for ChannelWaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Poisoned(epoch) => write!(f, "channel is poisoned at epoch {epoch}"),
+            Self::Closed => write!(f, "channel is closed"),
         }
     }
 }
 
-/// Deferred-wait sibling of [`fire_batch_sync`]. Enqueues the batch now
-/// (fixing its submission order on the caller's thread) and returns a
-/// [`FireHandle`] whose `wait` blocks for the response off-thread. The
-/// run-ahead scheduler uses this to keep driver-inbox order == fire order
-/// (so a forward `t+1` never reaches the worker before its token-carryover
-/// source `t`) while overlapping the in-flight GPU with the next batch's build.
-pub fn fire_batch_deferred(
-    driver_idx: DriverId,
-    req: pie_driver_abi::ForwardRequest,
-) -> Result<FireHandle> {
-    let ch = get_channel(driver_idx)?;
-    let deferred = ch.submit_deferred(DriverRequest {
-        driver_id: driver_idx,
-        payload: RequestPayload::Forward(req),
-    })?;
-    Ok(FireHandle { deferred })
+impl std::error::Error for ChannelWaitError {}
+
+fn load_channel_word(word_base: u64, index: u32) -> u64 {
+    unsafe { (&*((word_base as *const AtomicU64).add(index as usize))).load(Ordering::Acquire) }
 }
 
-/// Abort every active driver channel. Called by the supervisor when it
-/// observes a driver exit.
-pub fn abort_all_driver_channels() {
-    for entry in CHANNELS.iter() {
-        entry.value().abort();
+impl ChannelEndpoint {
+    pub fn new(registered: RegisteredChannel) -> Self {
+        Self {
+            registered,
+            closed: AtomicBool::new(false),
+            closer: None,
+        }
+    }
+
+    /// Installs the close-notification callback (see [`ChannelCloser`]);
+    /// called by the scheduler dispatch facade, which already holds the
+    /// owning driver's scheduler handle.
+    pub fn with_closer(mut self, closer: ChannelCloser) -> Self {
+        self.closer = Some(closer);
+        self
+    }
+
+    pub fn registered(&self) -> &RegisteredChannel {
+        &self.registered
+    }
+
+    pub async fn wait_for_reader_change(&self, observed_tail: u64) -> Result<(), ChannelWaitError> {
+        self.wait_for_word_change(
+            self.registered.reader_wait_id,
+            self.registered.binding.tail_word_index,
+            observed_tail,
+        )
+        .await
+    }
+
+    pub async fn wait_for_writer_change(&self, observed_head: u64) -> Result<(), ChannelWaitError> {
+        self.wait_for_word_change(
+            self.registered.writer_wait_id,
+            self.registered.binding.head_word_index,
+            observed_head,
+        )
+        .await
+    }
+
+    async fn wait_for_word_change(
+        &self,
+        wait_id: u64,
+        word_index: u32,
+        observed: u64,
+    ) -> Result<(), ChannelWaitError> {
+        let binding = self.registered.binding;
+        pie_waker::WaitFuture::new(pie_waker::WakerTable::global(), wait_id, move || {
+            let poison = load_channel_word(binding.word_base, binding.poison_word_index);
+            if poison != 0 {
+                return pie_waker::Readiness::Ready(Err(ChannelWaitError::Poisoned(poison)));
+            }
+            if load_channel_word(binding.word_base, binding.closed_word_index) != 0 {
+                return pie_waker::Readiness::Ready(Err(ChannelWaitError::Closed));
+            }
+            let current = load_channel_word(binding.word_base, word_index);
+            if current > observed {
+                pie_waker::Readiness::Ready(Ok(()))
+            } else {
+                pie_waker::Readiness::Pending {
+                    observed_epoch: current,
+                }
+            }
+        })
+        .await
+    }
+
+    fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let table = pie_waker::WakerTable::global();
+        let wait_ids = [
+            self.registered.reader_wait_id,
+            self.registered.writer_wait_id,
+        ];
+        if let Some(closer) = self.closer.as_ref() {
+            if let Err(error) = closer(self.registered.binding.channel_id) {
+                tracing::warn!(
+                    channel_id = self.registered.binding.channel_id,
+                    ?error,
+                    "ordered channel close failed"
+                );
+            }
+        }
+        table.sweep(&wait_ids);
+        for wait_id in wait_ids {
+            table.deregister(wait_id);
+            table.free(wait_id);
+        }
+    }
+}
+
+impl Drop for ChannelEndpoint {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_endpoint() -> (ChannelEndpoint, Box<[u8]>, Box<[AtomicU64]>, u64, u64) {
+        let mirror = vec![0; 8].into_boxed_slice();
+        let words = (0..4)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let table = pie_waker::WakerTable::global();
+        let reader_wait_id = table.alloc();
+        let writer_wait_id = table.alloc();
+        let endpoint = ChannelEndpoint::new(RegisteredChannel {
+            driver_id: usize::MAX,
+            binding: PieChannelEndpointBinding {
+                channel_id: 1,
+                mirror_base: mirror.as_ptr() as u64,
+                word_base: words.as_ptr() as u64,
+                mirror_bytes: mirror.len() as u64,
+                word_bytes: (words.len() * std::mem::size_of::<AtomicU64>()) as u64,
+                cell_bytes: 4,
+                capacity: 1,
+                head_word_index: 0,
+                tail_word_index: 1,
+                poison_word_index: 2,
+                closed_word_index: 3,
+            },
+            reader_wait_id,
+            writer_wait_id,
+        });
+        (endpoint, mirror, words, reader_wait_id, writer_wait_id)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_waits_register_then_recheck_reader_and_writer_words() {
+        let (endpoint, _mirror, words, reader_wait_id, writer_wait_id) = test_endpoint();
+        let reader = endpoint.wait_for_reader_change(0);
+        let publish_reader = async {
+            tokio::task::yield_now().await;
+            words[1].store(1, Ordering::Release);
+            let _ = pie_waker::WakerTable::global().publish(reader_wait_id, 1);
+        };
+        let (result, ()) = tokio::join!(reader, publish_reader);
+        result.unwrap();
+
+        let writer = endpoint.wait_for_writer_change(0);
+        let publish_writer = async {
+            tokio::task::yield_now().await;
+            words[0].store(1, Ordering::Release);
+            let _ = pie_waker::WakerTable::global().publish(writer_wait_id, 1);
+        };
+        let (result, ()) = tokio::join!(writer, publish_writer);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_wait_surfaces_poison_after_wakeup() {
+        let (endpoint, _mirror, words, reader_wait_id, _writer_wait_id) = test_endpoint();
+        let reader = endpoint.wait_for_reader_change(0);
+        let poison = async {
+            tokio::task::yield_now().await;
+            words[2].store(7, Ordering::Release);
+            let _ = pie_waker::WakerTable::global().publish(reader_wait_id, 7);
+        };
+        let (result, ()) = tokio::join!(reader, poison);
+        assert_eq!(result, Err(ChannelWaitError::Poisoned(7)));
     }
 }

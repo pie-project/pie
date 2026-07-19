@@ -12,9 +12,9 @@ targets:
 * the opaque ``context`` resource is gone — replaced by ``kv-working-set`` /
   ``rs-working-set`` plus explicit ``kv-context`` / ``kv-output`` forward-pass
   descriptors (``inference``).
-* ``forward-pass.execute`` (and ``messaging.pull`` / ``session.receive*``) are
-  component-model-async — ``async def`` returning values directly, with no
-  pollable ``future-output``.
+* ``forward-pass.execute`` and ``session.receive*`` are component-model-async
+  — ``async def`` returning values directly, with no pollable
+  ``future-output``.
 * ``media`` (image / video / audio) is the multimodal splice surface.
 """
 
@@ -461,33 +461,6 @@ class FakeToolDecoder:
     def __exit__(self, *args): pass
 
 
-# --- Messaging ---
-class FakeStreamReader:
-    """Stand-in for a P3 `stream<string>` subscription handle: `async read`
-    returns up to `max_count` items, then `[]` (with `writer_dropped`) once
-    the writable end closes; `__exit__` drops the readable end."""
-
-    def __init__(self, messages=None):
-        self._messages = list(messages) if messages is not None else ["msg1", "msg2"]
-        self.writer_dropped = False
-        self.dropped = False
-
-    async def read(self, max_count):
-        if self._messages:
-            out = self._messages[:max_count]
-            del self._messages[:max_count]
-            return out
-        self.writer_dropped = True
-        return []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.dropped = True
-        return None
-
-
 # --- Adapter ---
 class FakeAdapter:
     @classmethod
@@ -625,16 +598,6 @@ def _build_mock_modules():
         return None
     runtime_mod.sleep = _sleep
 
-    # messaging — `pull` is async; `subscribe` yields a stream reader.
-    messaging_mod = types.ModuleType("wit_world.imports.messaging")
-    messaging_mod.push = lambda topic, msg: None
-
-    async def _pull(topic):
-        return "pulled"
-    messaging_mod.pull = _pull
-    messaging_mod.broadcast = lambda topic, msg: None
-    messaging_mod.subscribe = lambda topic: FakeStreamReader()
-
     # session — `receive` / `receive_file` are async.
     session_mod = types.ModuleType("wit_world.imports.session")
     session_mod.send = lambda msg: None
@@ -672,7 +635,6 @@ def _build_mock_modules():
         "wit_world.imports.reasoning": reasoning_mod,
         "wit_world.imports.tool_use": tool_mod,
         "wit_world.imports.runtime": runtime_mod,
-        "wit_world.imports.messaging": messaging_mod,
         "wit_world.imports.session": session_mod,
         "wit_world.imports.adapter": adapter_mod,
         "wit_world.imports.zo": zo_mod,
@@ -684,7 +646,7 @@ def _build_mock_modules():
     for attr in [
         "poll", "model", "working_set", "media",
         "inference", "chat", "reasoning", "tool_use", "runtime",
-        "messaging", "session", "adapter", "zo",
+        "session", "adapter", "zo",
     ]:
         setattr(wit_imports, attr, sys.modules[f"wit_world.imports.{attr}"])
 

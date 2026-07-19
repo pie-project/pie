@@ -64,12 +64,12 @@ pie config set model.0.hf_repo Qwen/Qwen2.5-7B-Instruct  # update the first [[mo
 ## Run your first prompt
 
 ```bash
-pie run text-completion -- --prompt "The capital of France is"
+pie run chat-completion -- --prompt "The capital of France is"
 ```
 
 ```
 ╭─ Pie Run ───────────────────────────────────────╮
-│ Inferlet     text-completion@0.1.0              │
+│ Inferlet     chat-completion@0.1.0              │
 │ Model        default (Qwen/Qwen3-0.6B)          │
 │ Driver       cuda_native                        │
 │ Device       cuda:0                             │
@@ -85,13 +85,13 @@ The capital of France is Paris, which is located in…
 | Part | Meaning |
 |------|---------|
 | `pie run` | Boot a one-shot engine, run an inferlet, exit. |
-| `text-completion` | The inferlet to run. Resolved to `text-completion@<latest>` via the registry. |
+| `chat-completion` | The inferlet to run. Resolved to `chat-completion@<latest>` via the registry. |
 | `-- --prompt "…"` | Becomes `{"prompt": "…"}` in the inferlet's input JSON. |
 
 Flags after `--` fold into the input dict. Type inference handles ints, floats, and booleans automatically:
 
 ```bash
-pie run text-completion \
+pie run chat-completion \
   -- \
   --prompt "Write a haiku about pie" \
   --max-tokens 64 \
@@ -101,7 +101,7 @@ pie run text-completion \
 ### Pin a version
 
 ```bash
-pie run text-completion@0.1.0 -- --prompt "hi"
+pie run chat-completion@0.1.0 -- --prompt "hi"
 ```
 
 Without `@`, Pie resolves to the latest version in the registry.

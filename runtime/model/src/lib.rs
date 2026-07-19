@@ -28,14 +28,29 @@ fn read_snapshot_vocab_size(tokenizer_path: &std::path::Path) -> Option<u32> {
     v.get("vocab_size")?.as_u64().map(|n| n as u32)
 }
 
+fn read_snapshot_num_layers(tokenizer_path: &std::path::Path) -> Option<u32> {
+    let cfg = tokenizer_path.parent()?.join("config.json");
+    let text = std::fs::read_to_string(cfg).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    ["num_hidden_layers", "num_layers", "n_layer"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            value
+                .get("text_config")
+                .and_then(|text| text.get("num_hidden_layers"))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .and_then(|layers| u32::try_from(layers).ok())
+}
+
 pub fn register(
     name: String,
     arch_name: &str,
     kv_page_size: u32,
     rs: RsCaps,
+    ptir: PtirCaps,
     tokenizer_path: PathBuf,
-    system_speculation_supported: bool,
-    enable_system_speculation: bool,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
     let instruct = instruct::create(arch_name, tokenizer.clone());
@@ -45,8 +60,15 @@ pub fn register(
     // mock/fixture setups without a config.json. This is the dim the sampler
     // operates on + the driver's recognizer table is keyed by — NOT the
     // tokenizer token count, which may be smaller (qwen3: 151669 vs 151936).
-    let vocab_size = read_snapshot_vocab_size(&tokenizer_path)
-        .unwrap_or_else(|| tokenizer.vocab_size() as u32);
+    let vocab_size =
+        read_snapshot_vocab_size(&tokenizer_path).unwrap_or_else(|| tokenizer.vocab_size() as u32);
+    let num_layers = read_snapshot_num_layers(&tokenizer_path).ok_or_else(|| {
+        anyhow!(
+            "model config beside {} does not declare num_hidden_layers, num_layers, n_layer, \
+             or text_config.num_hidden_layers",
+            tokenizer_path.display()
+        )
+    })?;
 
     let model = Arc::new(Model {
         name,
@@ -54,23 +76,21 @@ pub fn register(
         instruct,
         kv_page_size,
         rs_caps: rs,
+        ptir_caps: ptir,
         tokenizer,
         vocab_size,
-        system_speculation_supported,
-        enable_system_speculation,
+        num_layers,
     });
-    MODEL
-        .set(model)
-        .map_err(|_| anyhow!("a model is already registered; the engine serves exactly one model"))?;
+    MODEL.set(model).map_err(|_| {
+        anyhow!("a model is already registered; the engine serves exactly one model")
+    })?;
     Ok(())
 }
 
 /// Returns the single registered model. Panics if called before bootstrap
 /// registers the model.
 pub fn model() -> &'static Arc<Model> {
-    MODEL
-        .get()
-        .expect("model accessed before registration")
+    MODEL.get().expect("model accessed before registration")
 }
 
 // =============================================================================
@@ -88,13 +108,14 @@ pub struct Model {
     /// (`rs-state-size`/`rs-buffer-page-size`/`rs-fold-granularity`). All
     /// 0/0/1 for pure-attention models.
     rs_caps: RsCaps,
+    ptir_caps: PtirCaps,
     tokenizer: Arc<Tokenizer>,
     /// Logits/output vocab dimension (= hf_config.vocab_size from the model's
     /// config.json). May EXCEED tokenizer.vocab_size() due to padding — use
     /// THIS for sampler lowering / logits-shaped ops, NOT the tokenizer vocab.
     vocab_size: u32,
-    system_speculation_supported: bool,
-    enable_system_speculation: bool,
+    /// Transformer layer count from the model snapshot's config.json.
+    num_layers: u32,
 }
 
 /// RS (recurrent-state) working-set capabilities surfaced to inferlets via
@@ -109,6 +130,14 @@ pub struct RsCaps {
     pub buffer_page_size: u32,
     /// Fold granularity in tokens (`rs-fold-granularity`; 1 = token-causal).
     pub fold_granularity: u32,
+}
+
+/// Model-gated values that a loaded backend can bind into PTIR programs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PtirCaps {
+    pub has_mtp_logits: bool,
+    pub has_mtp_drafts: bool,
+    pub has_value_head: bool,
 }
 
 impl std::fmt::Debug for Model {
@@ -185,23 +214,17 @@ impl Model {
         self.kv_page_size
     }
 
+    pub fn num_layers(&self) -> u32 {
+        self.num_layers
+    }
+
     /// RS working-set capabilities (`rs-state-size`/`rs-buffer-page-size`/
     /// `rs-fold-granularity`). 0/0/1 for pure-attention models.
     pub fn rs_caps(&self) -> RsCaps {
         self.rs_caps
     }
 
-    /// Whether the driver wired a system drafter for this model (capability).
-    /// Required to verify manual drafts; auto-drafting additionally requires
-    /// [`Self::enable_system_speculation`].
-    pub fn system_speculation_supported(&self) -> bool {
-        self.system_speculation_supported
-    }
-
-    /// Operator opt-in for system speculation (deployment config, default
-    /// false). The runtime drives system drafts only when this is true; manual
-    /// (user-supplied) drafts are honored regardless of this flag.
-    pub fn enable_system_speculation(&self) -> bool {
-        self.enable_system_speculation
+    pub fn ptir_caps(&self) -> PtirCaps {
+        self.ptir_caps
     }
 }

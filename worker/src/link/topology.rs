@@ -30,21 +30,23 @@ pub enum TopologyMode {
         role: Role,
         controller: String,
         /// Gateway endpoint(s) to dial INTO — the worker is the client, the
-        /// gateway the listening server (M3 inversion). Deploy-config.
+        /// gateway the listening server (M3 inversion). **Optional**: this is a
+        /// static *pin/override* for fixed or local topologies. When empty, the
+        /// worker discovers its gateway roster dynamically from the controller
+        /// (`gateway.md`); when non-empty, these addresses are always kept dialed
+        /// in addition to any the controller pushes.
         gateways: Vec<String>,
     },
 }
 
 impl TopologyMode {
     /// Build a validated distributed topology. A worker needs a reachable
-    /// controller address and at least one gateway to dial into; the real dial
-    /// error surfaces later at connect time, this just rejects obvious garbage.
+    /// controller address; gateways are optional (empty ⇒ dynamic discovery from
+    /// the controller). Any addresses supplied are validated and become the
+    /// pinned dial-in set; the real dial error surfaces later at connect time.
     pub fn distributed(role: Role, controller: String, gateways: Vec<String>) -> Result<Self> {
         if !is_valid_addr(&controller) {
             bail!("controller {controller:?}: expected host:port, tcp://host:port, or unix:/path");
-        }
-        if gateways.is_empty() {
-            bail!("distributed mode requires at least one gateway to dial into");
         }
         for gw in &gateways {
             if !is_valid_addr(gw) {
@@ -149,10 +151,15 @@ mod tests {
     }
 
     #[test]
-    fn distributed_without_gateway_errors() {
-        assert!(
-            TopologyMode::distributed(Role::Decode, "127.0.0.1:7000".to_string(), vec![]).is_err()
-        );
+    fn distributed_without_gateway_is_dynamic() {
+        // Empty gateway list is valid now: the worker discovers its roster from
+        // the controller (gateway.md). No pinned dial-in set.
+        let mode =
+            TopologyMode::distributed(Role::Decode, "127.0.0.1:7000".to_string(), vec![]).unwrap();
+        match mode {
+            TopologyMode::Distributed { gateways, .. } => assert!(gateways.is_empty()),
+            other => panic!("expected Distributed, got {other:?}"),
+        }
     }
 
     #[test]
