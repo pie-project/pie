@@ -21,7 +21,7 @@ pie-driver-abi = { path = "../driver" }
 serde = { version = "1.0", features = ["derive"] }
 # The RPC mechanism. `serde1` enables the serde derives on the macro-generated
 # request/response types; transport/codec features stay with the binaries.
-tarpc = { version = "0.35", features = ["serde1"] }
+tarpc = { version = "0.37", features = ["serde1"] }
 
 [dev-dependencies]
 # Round-trips the serde control types in the unit tests.

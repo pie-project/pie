@@ -9,7 +9,7 @@
 
 #include <toml++/toml.hpp>
 
-#include "kv_cache_format.hpp"
+#include "store/kv_cache_format.hpp"
 
 namespace pie_cuda_driver {
 
@@ -17,33 +17,6 @@ struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
-    // Runtime-compiled StorageProgram handoff (weight-loader Variant A). When an
-    // embedded/in-process driver's runtime compiles the checkpoint's storage
-    // program itself, it writes the serialized `bincode` IR to this path and
-    // names it here; the driver deserializes it instead of running its own C++
-    // checkpoint parse + compile (the *locality switch* = path-present). Empty
-    // (standalone / remote / out-of-process) keeps the C++ compile. The bulk
-    // weight bytes never cross this boundary — only the program IR does.
-    std::string storage_program_path;
-    // Runtime quantization mode applied during load-plan materialization.
-    // Empty (default) = no quantization. Recognised values:
-    //   * "fp8"  — per-channel symmetric FP8_E4M3 for projection weights.
-    //   * "int8" — per-channel symmetric INT8 for projection weights.
-    //   * "fp4" / "mxfp4" — MXFP4 (E2M1 weight + E8M0 block scale) for the
-    //                      target model's expert weights. Used by GLM-5.1 to
-    //                      transcode the checkpoint's FP8 routed-expert
-    //                      weights to MXFP4 at materialize time, halving
-    //                      the per-rank expert footprint.
-    // Norms, biases, embeddings, and lm_head stay in their native dtype.
-    std::string runtime_quant;
-    // GPT-OSS MXFP4 MoE load/runtime policy. "auto" selects native packed
-    // MXFP4 expert GEMM on supported Blackwell-class GPUs/builds and uses the
-    // routed-dequant fallback on legacy GPUs. Recognised values:
-    //   * "routed_dequant" / "packed" — keep MXFP4 resident and dequantize
-    //     only routed experts into bounded BF16 runtime scratch.
-    //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
-    //   * "native" — require a true MXFP4 MoE GEMM backend.
-    std::string mxfp4_moe = "auto";
     int mtp_num_drafts = 3;
 };
 
@@ -66,7 +39,7 @@ struct BatchingConfig {
 // in the forward path runs collectives. Embedded TP launches set tp_size,
 // tp_rank, and nccl_unique_id_hex per process. `nccl_unique_id_hex`
 // also acts as the in-process rendezvous key for the startup barrier
-// and per-fire CPU gate (see `entry.cpp::tp_startup_cpu_barrier`).
+// and per-fire CPU gate (see `context.cpp::tp_startup_cpu_barrier`).
 struct DistributedConfig {
     int tp_size = 1;
     int tp_rank = 0;
@@ -114,12 +87,8 @@ inline Config load_config(const std::filesystem::path& path) {
 
     if (auto m = tbl["model"].as_table()) {
         c.model.snapshot_dir  = (*m)["snapshot_dir"].value_or(std::string{});
-        c.model.storage_program_path =
-            (*m)["storage_program_path"].value_or(std::string{});
         c.model.device        = (*m)["device"].value_or(c.model.device);
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
-        c.model.runtime_quant = (*m)["runtime_quant"].value_or(std::string{});
-        c.model.mxfp4_moe     = (*m)["mxfp4_moe"].value_or(c.model.mxfp4_moe);
         c.model.mtp_num_drafts = static_cast<int>(
             (*m)["mtp_num_drafts"].value_or<int64_t>(c.model.mtp_num_drafts));
     }

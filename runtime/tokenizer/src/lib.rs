@@ -1137,7 +1137,10 @@ mod tests {
         let tok = Tokenizer::from_file(&model_path).unwrap();
         assert_eq!(tok.token_to_id("<|im_user|>"), Some(100));
         assert_eq!(tok.encode("<|im_user|>hi<|im_end|>"), vec![100, 0, 1, 101]);
-        assert_eq!(tok.decode(&[100, 0, 1, 101], false), "<|im_user|>hi<|im_end|>");
+        assert_eq!(
+            tok.decode(&[100, 0, 1, 101], false),
+            "<|im_user|>hi<|im_end|>"
+        );
         assert_eq!(tok.decode(&[100, 0, 1, 101], true), "hi");
     }
 }

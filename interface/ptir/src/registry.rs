@@ -84,8 +84,13 @@ impl Phase {
         }
     }
     /// All phases in execution order.
-    pub const ORDER: [Phase; 5] =
-        [Phase::Prologue, Phase::Descriptor, Phase::OnAttnProj, Phase::OnAttn, Phase::Epilogue];
+    pub const ORDER: [Phase; 5] = [
+        Phase::Prologue,
+        Phase::Descriptor,
+        Phase::OnAttnProj,
+        Phase::OnAttn,
+        Phase::Epilogue,
+    ];
 }
 
 /// Descriptor ports (overview §5.1): the forward's ragged-tensor families.
@@ -142,7 +147,10 @@ impl Port {
     /// positions, `w_slot`/`w_off`) consumes — a token is spent by the pass
     /// that embeds it; geometry and masks are state, peeked.
     pub fn consumes(self) -> bool {
-        matches!(self, Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff)
+        matches!(
+            self,
+            Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff
+        )
     }
 }
 
@@ -169,9 +177,10 @@ pub const KNOWN_SINKS: &[(&str, SinkScope)] = &[
 /// Intrinsic value scope: which stages may materialize it (overview §5.3).
 pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
     match intr {
-        IntrinsicId::Logits | IntrinsicId::MtpLogits | IntrinsicId::Hidden | IntrinsicId::ValueHead => {
-            &[Stage::Epilogue]
-        }
+        IntrinsicId::Logits
+        | IntrinsicId::MtpLogits
+        | IntrinsicId::Hidden
+        | IntrinsicId::ValueHead => &[Stage::Epilogue],
         IntrinsicId::MtpDrafts => &[Stage::Epilogue],
         IntrinsicId::Query | IntrinsicId::Layer => &[Stage::OnAttnProj, Stage::OnAttn],
     }
@@ -180,7 +189,10 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
 /// True iff the intrinsic's availability is a **model property** checked at
 /// bind (overview §4).
 pub fn intrinsic_model_gated(intr: IntrinsicId) -> bool {
-    matches!(intr, IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts | IntrinsicId::ValueHead)
+    matches!(
+        intr,
+        IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts | IntrinsicId::ValueHead
+    )
 }
 
 /// A second-party kernel/sink the backend provides (bind-time availability,

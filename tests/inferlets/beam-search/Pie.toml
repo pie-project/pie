@@ -1,0 +1,11 @@
+[package]
+name = "beam-search"
+version = "0.1.0"
+description = "On-device beam search with shared KV storage and logical ancestry masks"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+max_tokens = {type = "int", optional = true, description = "Number of beam-search steps (default: 16, maximum: 63)"}

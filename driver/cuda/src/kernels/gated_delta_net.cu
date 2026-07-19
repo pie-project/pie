@@ -496,6 +496,7 @@ __global__ void chunk_gated_delta_prefill_batched_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -571,6 +572,7 @@ __global__ void chunk_gated_delta_prefill_batched_cached_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -655,6 +657,7 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -752,6 +755,7 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -856,6 +860,7 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -969,6 +974,7 @@ __global__ void recurrent_step_batched_kernel(
     const int r = blockIdx.x;
     const int h = blockIdx.y;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const long long bh = (long long)r * V_h + h;
     const float* q_h = q_norm + bh * K_d;
@@ -1035,6 +1041,7 @@ __global__ void recurrent_step_batched_gqa_kernel(
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
     const long long vh = (long long)r * V_h + h;
@@ -1130,6 +1137,7 @@ __global__ void recurrent_step_batched_fused_kernel(
     const int r = blockIdx.x;
     const int h = blockIdx.y;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const long long bh = (long long)r * V_h + h;
     const float* q_h = q_norm + bh * K_d;
@@ -1238,6 +1246,7 @@ __global__ void recurrent_step_batched_gqa_fused_kernel(
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
     const long long vh = (long long)r * V_h + h;
@@ -1349,6 +1358,7 @@ __global__ void recurrent_step_batched_fla_kernel(
     const int r  = blockIdx.y;
     const int h  = blockIdx.z;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const int v_idx = vt * BV + threadIdx.x;
     if (v_idx >= V_d) return;
@@ -1431,6 +1441,7 @@ __global__ void recurrent_step_batched_gqa_fla_kernel(
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const int v_idx = vt * BV + threadIdx.x;
     if (v_idx >= V_d) return;
@@ -1541,6 +1552,7 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
     const long long vh = (long long)r * V_h + h;
@@ -1668,6 +1680,7 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -1697,7 +1710,7 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
         bh_state[j] = __floats2bfloat162_rn(s0, s1);
     }
 
-    // COMMIT-LEN-GATED rounding (charlie, verified on the 4090): the SAME kernel
+    // COMMIT-LEN-GATED rounding (verified on the 4090): the SAME kernel
     // serves two ops with DIFFERENT bit-exactness references:
     //   * commit_len == nullptr (plain PREFILL, K=0 & K=2 initial): fold N fresh
     //     tokens into a reset state. The HF reference (T0 GDN_GOLDEN) matches the
@@ -1705,7 +1718,7 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
     //     warp-tiled-bug signature). So plain prefill KEEPS double-round.
     //   * commit_len != nullptr (COMMIT-ADVANCE replay [input|accepted]): must
     //     bit-match the K=0 decode-step kernel (single bf16 round/token) so the
-    //     spec-verify is lossless → SINGLE-round (fixes T1 K=0==K=2). bravo's fix.
+    //     spec-verify is lossless → SINGLE-round (fixes T1 K=0==K=2).
     // Verified: gating → T0 HF-exact (golden) AND T1 K=0==K=2 both green; ungated
     // single-round gave T1 green but T0 red (both glitch); double-round-only gave
     // T0 green but T1 red. (:1625 is shared prefill+commit-advance.)
@@ -1825,6 +1838,7 @@ __global__ void chunk_gated_delta_prefill_batched_gqa_fla_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;

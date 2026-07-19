@@ -1,173 +1,274 @@
-//! #31 greedy-v0 **self-spec verify** e2e — DEVICE-ALIAS draft source (delta).
+//! #31 greedy-v0 **self-spec verify** e2e — DEVICE-ALIAS draft source
+//! (`inferlet::ptir` bridge rewrite).
 //!
-//! The de-hardwiring thesis: the verify's `[k]` draft tokens come NOT from a host
-//! upload but DEVICE-RESIDENT off `pi.tokens + sample_row + 1` (echo's
-//! `SelfSpecDraftInput` resolver), source-selected by the manifest flag — the
-//! drafts ARE forward-N's verify INPUT (the tokens after the anchor). This inferlet
-//! drives `mtp_self_spec_greedy_observable` (foxtrot's A2 keystone) through that
-//! binding and asserts the COMPLETE accept set incl. the target correction `t_j`.
-//!
-//! ## What's new vs the #35-A `specverify` (host-injected `Submit` draft):
-//!  1. **Device-alias draft, not host-injected.** The draft is bound
-//!     `Readiness::SelfSpecDraftInput` → the resolver reads `pi.tokens+sample_row+1`
-//!     (alpha's ballast lets `resolve_bindings(.., &[])` synthesize the no-value
-//!     slot). So the drafts are the INPUT tokens after the anchor: we feed
-//!     `input = prompt ++ D`, and the verify device-aliases `D` from `pi.tokens`.
-//!     A wrong-buffer bind (`pi.sampled`, wrong offset) ⇒ the reject lands at the
-//!     wrong row ⇒ RED. This is the e2e proof of echo's bind.
-//!  2. **A2 correction.** `mtp_self_spec_greedy` emits `[d0..d_{j-1}, t_j, sentinel..]`
-//!     — the target's greedy token `t_j` spliced at the first-reject boundary (the
-//!     free correct token that kills the full-reject stall). The observable variant
-//!     uses a `0` sentinel (non-truncating) so the cross-row prefix + the correction
-//!     are OBSERVABLE (not masked by the `-1` marshal truncation).
+//! The de-hardwiring thesis: the verify's `[k]` draft tokens come NOT from a
+//! host upload but DEVICE-RESIDENT off the model's OWN embedded input tokens —
+//! the drafts ARE forward-N's verify INPUT (the tokens after the anchor). This
+//! inferlet embeds `input = prompt ++ D`, peeks the SAME `toks` channel back
+//! inside the epilogue (`toks.read()`, non-consuming — the device-alias read,
+//! the ptir-bridge equivalent of the deleted `Readiness::SelfSpecDraftInput`
+//! resolver reading `pi.tokens+sample_row+1`) to recover `D` as an in-program
+//! tensor, and verifies it against the target's per-row argmax — the A2 DAG
+//! (`argmax -> eq -> cumprod -> select`): the accepted draft prefix, the
+//! target's correction spliced at the first reject, then `0`-sentinels.
 //!
 //! ## Independent witness (no degenerate green):
-//! the reference `A` is the greedy continuation `g` computed via the **Argmax
-//! SAMPLER** — a DIFFERENT argmax code path than the verify's matrix intrinsic, so
-//! `V == greedy_verify_a2(D, g)` catches a verify matrix-argmax regression (the
-//! #35-A class) too, not just the eq/cumprod/select DAG. Using the verify's own
-//! argmax as the reference would be a shared-reference degenerate green.
+//! the reference `g` is the greedy continuation computed via a SEPARATE
+//! sequential argmax decode loop (its own working set) — a different code
+//! path than the verify's matrix `reduce_argmax`, so `V == greedy_verify_a2(D,
+//! g)` catches a verify-matrix argmax regression too, not just the
+//! eq/cumprod/select DAG.
 //!
 //! ## Arms (the inferlet asserts each):
-//!  * **ACCEPT-ALL:** `D = g` ⇒ every row matches ⇒ `V == g` (all k drafts, no
-//!    correction, no sentinel).
-//!  * **REJECT-MID (the load-bearing gate):** `D = g` with `D[j]` perturbed
-//!    (`j=k/2`, nonzero, `≠ g[j]`) ⇒ `V == [g0..g_{j-1}, g_j, 0..]` — the accepted
-//!    prefix `g[0..j]`, the correction `t_j == g[j]` spliced at `j`, then 0s. The
-//!    perturbation forces the verify to READ the device-aliased draft (a wrong bind
-//!    rejects elsewhere) AND exercises the A2 boundary correction.
-//!
-//! ## 0-sentinel collision invariant (extended `DRAFTS_NONZERO`):
-//! under A2 the boundary emits the REAL token `t_j`; a `t_j == 0` would collide with
-//! the past-boundary `0`-sentinels, re-masking the reject. So `{d0..d_{j-1}, t_j}`
-//! must ALL be `∈ [1, vocab)` — ensured by construction (a prompt whose greedy
-//! continuation incl. the boundary correction is nonzero); flagged if violated.
+//!  * **ACCEPT-ALL:** `D = g` ⇒ every row matches ⇒ `V == g`.
+//!  * **REJECT-MID (load-bearing):** `D = g` with `D[j]` perturbed (`j=k/2`,
+//!    nonzero, `≠ g[j]`) ⇒ `V == [g0..g_{j-1}, g_j, 0..]` — the accepted
+//!    prefix, the correction `t_j == g[j]` spliced at `j`, then 0s.
 
-use inferlet::program::resolve_bindings;
-use inferlet::sample::Sampler;
-use inferlet::sampling::program as edsl;
-use inferlet::serde_json;
-use inferlet::{Context, Result, model};
+use inferlet::ptir::prelude::*;
+use inferlet::{Result, model as wit_model, serde_json};
 
-/// Host reference for `mtp_self_spec_greedy_observable`'s A2 DAG
-/// (`argmax -> eq -> cumprod -> select(draft, select(boundary, target, 0))`): the
-/// accepted draft prefix, the target correction `a[j]` spliced at the first reject,
-/// then `0`-sentinels. `a` is the INDEPENDENT argmax reference (`g`).
+const PAGE_T: u32 = 16;
+const PROMPT: &str = "The quick brown fox jumps over";
+
+/// Host reference for the A2 DAG: the accepted draft prefix, the target
+/// correction `a[j]` spliced at the first reject, then `0`-sentinels.
 fn greedy_verify_a2_obs(d: &[u32], a: &[u32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(d.len());
     let mut keep = true;
     for i in 0..d.len() {
         if keep && d[i] == a[i] {
-            out.push(d[i]); // accepted draft (== target)
+            out.push(d[i]);
         } else if keep {
-            out.push(a[i]); // first-reject boundary → target correction t_i
+            out.push(a[i]);
             keep = false;
         } else {
-            out.push(0); // past the boundary → 0-sentinel
+            out.push(0);
         }
     }
     out
 }
 
-/// Fire `mtp_self_spec_greedy_observable` with `input = prompt ++ drafts`; the
-/// verify device-aliases the k drafts off `pi.tokens+sample_row+1` (NO host upload —
-/// `resolve_bindings(.., &[])`, alpha's ballast fills the slot + carries the flag).
-/// Returns the `[k]`-Token accept set through the bound reader channel.
-async fn fire_verify(
-    context: &Context,
-    prompt: &[u32],
-    vocab: u32,
-    k: u32,
-    drafts: &[u32],
-) -> Result<Vec<u32>> {
-    let l = prompt.len() as u32;
-    let mut sctx = context.fork()?;
-    let mut pass = sctx.forward();
-    let start = pass.start_position();
-    let mut inp = prompt.to_vec();
-    inp.extend_from_slice(drafts); // drafts = input tokens after the anchor
-    pass.input(&inp);
-    let (built, _keys) = edsl::mtp_self_spec_greedy_observable(vocab, k)
-        .map_err(|e| format!("mtp_self_spec build: {e:?}"))?;
-    let program = inferlet::emit::emit_program(&built.program).map_err(|e| format!("emit: {e}"))?;
-    // Matrix logit positions [start+l-1 .. start+l+k-2]: row r argmax conditioned on
-    // prompt ++ D[0..r). Empty submit_values: the SelfSpecDraftInput draft is driver
-    // source-selected (echo's resolver, pi.tokens+sample_row+1), the ballast fills it.
-    let positions: Vec<u32> = (0..k).map(|i| start + l - 1 + i).collect();
-    let bindings = resolve_bindings(&built.bindings, &built.host_inputs, &positions, &[])?;
-    let handles = pass.sampler(&program, bindings, built.outputs.len() as u32);
-    let out = pass.execute().await?;
-    let v: Vec<u32> = out
-        .tokens(handles[0])
+/// The independent greedy-argmax reference continuation `g[0..k)`: `k`
+/// sequential single-token argmax decode fires on a fresh working set.
+async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
+    let ws = WorkingSet::new();
+    let n = prompt.len() as u32;
+    let max_pages = (n + k + 1).div_ceil(PAGE_T);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("greedy ws.reserve: {e}"))?;
+    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+
+    let toks_p = Channel::from(prompt_i32).named("g_toks_p");
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("g_embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("g_positions_p");
+    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("g_pages_p");
+    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(PAGE_T)]).named("g_page_indptr_p");
+    let w_slot_p =
+        Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("g_w_slot_p");
+    let w_off_p = Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("g_w_off_p");
+    let g0_ch = Channel::new([1], dtype::i32).named("g0");
+
+    let fwd_p = ForwardPass::new();
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
+    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        None,
+    )?;
+    fwd_p.epilogue(move || {
+        let t = reduce_argmax(intrinsics::logits());
+        g0_ch.put(&t);
+    });
+    // ONE pipeline for the whole greedy stream (R4-4): prefill then decode
+    // are one sequential stream. The g0 handoff still rides the host.
+    let pipe = Pipeline::new();
+    fwd_p
+        .submit(&pipe)
+        .map_err(|e| format!("greedy prefill: {e}"))?;
+    let g0 = g0_ch
+        .take()
+        .get::<i32>()
         .await
-        .map_err(|e| format!("self-spec tokens: {e}"))?;
-    Ok(v)
+        .map_err(|e| format!("g0 take: {e}"))?[0];
+
+    let mut g: Vec<u32> = vec![g0 as u32];
+    if k > 1 {
+        let tok_in = Channel::from(vec![g0; 1]).named("g_tok_in");
+        let out = Channel::new([1], dtype::i32).named("g_out");
+        let lane1 = Channel::from(vec![0u32, 1u32]).named("g_embed_indptr");
+        let positions = Channel::from(vec![n]).named("g_positions");
+        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("g_pages");
+        let page_indptr =
+            Channel::from(vec![0u32, (n + 1).div_ceil(PAGE_T)]).named("g_page_indptr");
+        let w_slot = Channel::from(vec![n / PAGE_T]).named("g_w_slot");
+        let w_off = Channel::from(vec![n % PAGE_T]).named("g_w_off");
+
+        let fwd = ForwardPass::new();
+        fwd.embed(&tok_in, &lane1)?;
+        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        fwd.attention(
+            &ws,
+            ..,
+            (n / PAGE_T)..,
+            &kv_len,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &positions,
+            None,
+        )?;
+        fwd.epilogue(move || {
+            let length = kv_len.take().tensor();
+            let t = reduce_argmax(intrinsics::logits());
+            let next_length = add(&length, 1u32);
+            let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+            tok_in.put(&t);
+            kv_len.put(&next_length);
+            positions.put(&length);
+            w_slot.put(div(&length, PAGE_T));
+            w_off.put(rem(&length, PAGE_T));
+            page_indptr.take();
+            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            out.put(&t);
+        });
+        for step in 1..k {
+            fwd.submit(&pipe)
+                .map_err(|e| format!("greedy decode @{step}: {e}"))?;
+            let t = out
+                .take()
+                .get::<i32>()
+                .await
+                .map_err(|e| format!("greedy out @{step}: {e}"))?[0];
+            g.push(t as u32);
+        }
+    }
+    pipe.close();
+    Ok(g)
+}
+
+/// Fire `input = prompt ++ drafts`; the verify device-aliases the k drafts by
+/// peeking (`.read()`, non-consuming) the SAME `toks` channel already embedded
+/// — NO separate draft submission. Returns the `[k]` accept set.
+async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>> {
+    let l = prompt.len() as u32;
+    let mut inp: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    inp.extend(drafts.iter().map(|&t| t as i32));
+    let n = l + k;
+
+    let ws = WorkingSet::new();
+    let max_pages = n.div_ceil(PAGE_T);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("verify ws.reserve: {e}"))?;
+    let toks = Channel::from(inp).named("v_toks");
+    let embed_indptr = Channel::from(vec![0u32, n]).named("v_embed_indptr");
+    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("v_positions");
+    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("v_pages");
+    let page_indptr = Channel::from(vec![0u32, max_pages]).named("v_page_indptr");
+    let w_slot = Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("v_w_slot");
+    let w_off = Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("v_w_off");
+    let verify_out = Channel::new([k], dtype::i32).named("v_out");
+
+    // k read-out rows (the last k positions, prompt-tail .. prompt-tail+k-1)
+    // ⇒ intrinsics::logits() declares [k, vocab].
+    let readout: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
+    let readout = Channel::from(readout).named("v_readout");
+    // The k draft token indices WITHIN `toks` (the positions after the anchor).
+    let draft_positions: Vec<u32> = (l..l + k).collect();
+
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, &embed_indptr)?;
+    let kv_len = Channel::from(vec![n]).named("kv_len");
+    fwd.readout(&readout)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
+    fwd.epilogue(move || {
+        // Device-alias read: peek the embedded input tokens (NOT a separate
+        // submitted draft channel) and gather the k draft positions out of it.
+        let toks_val = toks.read().tensor(); // [n] i32
+        let draft = gather(&toks_val, Tensor::constant(draft_positions.clone())); // [k] i32
+        let target = reduce_argmax(intrinsics::logits()); // [k] i32
+        let hit = eq(&target, &draft); // [k] bool
+        let ones = broadcast(Tensor::constant(1.0f32), [k]);
+        let zeros = broadcast(Tensor::constant(0.0f32), [k]);
+        let n_acc = cast(reduce_sum(cumprod(select(&hit, &ones, &zeros))), DType::U32);
+        let keep = ge(broadcast(&n_acc, [k]), iota(k)); // [k] bool: i <= n_acc
+        let zeros_i32 = broadcast(Tensor::constant(0i32), [k]);
+        let verify = select(&keep, &target, &zeros_i32); // accepted prefix + correction + 0s
+        verify_out.put(&verify);
+    });
+
+    let pipeline = Pipeline::new();
+    fwd.submit(&pipeline)
+        .map_err(|e| format!("verify submit: {e}"))?;
+    let v = verify_out
+        .take()
+        .get::<i32>()
+        .await
+        .map_err(|e| format!("verify take: {e}"))?;
+    pipeline.close();
+    Ok(v.iter().map(|&x| x as u32).collect())
 }
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let k: u32 = params.get("k").and_then(|v| v.as_u64()).unwrap_or(4).max(2) as u32;
-    let vocab = model::output_vocab_size();
-    let j = (k / 2).max(1) as usize; // reject position
+    let vocab = wit_model::output_vocab_size();
+    let j = (k / 2).max(1) as usize;
 
-    let mut prompt = model::encode("The quick brown fox jumps over");
+    let mut prompt = wit_model::encode(PROMPT);
     if prompt.is_empty() {
         prompt.push(0);
     }
-    let context = Context::new()?;
 
-    // ── Greedy continuation g[0..k): k sequential Argmax decodes. This is the
-    //    INDEPENDENT argmax witness (Argmax sampler ≠ the verify's matrix intrinsic).
-    let g: Vec<u32> = {
-        let mut gctx = context.fork()?;
-        gctx.append(&prompt);
-        let mut decoder = gctx.generate(Sampler::Argmax).max_tokens(k as usize);
-        let mut acc = Vec::new();
-        while let Some(step) = decoder.next()? {
-            let o = step.execute().await?;
-            acc.extend(o.tokens.iter().copied());
-        }
-        acc
-    };
+    // ── Greedy continuation g[0..k): the INDEPENDENT argmax witness. ──
+    let g = greedy_reference(&prompt, k).await?;
     if (g.len() as u32) < k {
-        return Err(format!("greedy produced {} < k={} tokens", g.len(), k).into());
+        return Err(format!("greedy produced {} < k={} tokens", g.len(), k));
     }
     let g: Vec<u32> = g[..k as usize].to_vec();
 
-    // ── ACCEPT-ALL: drafts = g → all rows match → V == g (device-alias read of the
-    //    greedy continuation; no reject, no correction, no sentinel). ──
-    let accept_out = fire_verify(&context, &prompt, vocab, k, &g).await?;
+    // ── ACCEPT-ALL: drafts = g → all rows match → V == g. ──
+    let accept_out = fire_verify(&prompt, k, &g).await?;
 
-    // ── REJECT-MID (load-bearing): perturb draft j (≠ g[j], nonzero). The verify
-    //    must READ the device-aliased perturbed draft → reject at j → splice the
-    //    correction t_j = g[j] → V == [g0..g_{j-1}, g_j, 0..]. ──
+    // ── REJECT-MID (load-bearing): perturb draft j (≠ g[j], nonzero). ──
     let mut rj_draft = g.clone();
-    rj_draft[j] = ((g[j] + 1) % vocab).max(1); // ≠ g[j], ∈ [1,vocab)
-    let reject_out = fire_verify(&context, &prompt, vocab, k, &rj_draft).await?;
+    rj_draft[j] = ((g[j] + 1) % vocab).max(1);
+    let reject_out = fire_verify(&prompt, k, &rj_draft).await?;
 
     // ── Verdicts ──
-    let expect_accept = greedy_verify_a2_obs(&g, &g); // == g
-    let expect_reject = greedy_verify_a2_obs(&rj_draft, &g); // [g0..g_{j-1}, g_j, 0..]
+    let expect_accept = greedy_verify_a2_obs(&g, &g);
+    let expect_reject = greedy_verify_a2_obs(&rj_draft, &g);
 
     let accept_all_ok = accept_out == expect_accept;
     let reject_mid_ok = reject_out == expect_reject;
-    // The A2 boundary correction: the rejected row j emits the TARGET token g[j]
-    // (NOT the perturbed draft, NOT 0). This is the spliced correction that kills the
-    // full-reject stall and keeps v0 greedy-exact.
     let a2_correction_ok = reject_out.get(j).copied() == Some(g[j])
         && reject_out[j] != rj_draft[j]
         && reject_out[j] != 0;
-    // Device-alias bind proof: the perturbed draft forced a reject EXACTLY at j and
-    // the prefix < j read the (correct) device-aliased drafts == g. A wrong-buffer
-    // bind would reject at the wrong row / read garbage.
     let bind_device_alias_ok = reject_out.len() == k as usize
         && reject_out[..j] == g[..j]
         && reject_out.get(j).copied() != Some(rj_draft[j]);
     let crosscheck_ok = accept_all_ok && reject_mid_ok;
-    // Extended 0-sentinel invariant (A2): the accepted drafts AND the boundary
-    // correction t_j must be ∈ [1,vocab) — a 0 anywhere there collides with the
-    // past-boundary 0-sentinels and re-masks the reject.
     let drafts_nonzero = g.iter().all(|&t| t != 0) && rj_draft.iter().all(|&t| t != 0);
 
     let result = format!(

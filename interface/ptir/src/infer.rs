@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use super::op::Op;
-use crate::types::{DType, Predicate, Shape, ValueId, ValueType, MAX_RANK};
+use crate::types::{DType, MAX_RANK, Predicate, Shape, ValueId, ValueType};
 
 /// An inference failure at `op_index`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,13 +37,21 @@ impl fmt::Display for BodyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
             BodyErrorKind::ValueIdOutOfRange(v) => {
-                write!(f, "op {}: operand value id {v} is undefined here", self.op_index)
+                write!(
+                    f,
+                    "op {}: operand value id {v} is undefined here",
+                    self.op_index
+                )
             }
             BodyErrorKind::ShapeMismatch => {
                 write!(f, "op {}: incompatible operand shapes", self.op_index)
             }
             BodyErrorKind::ShapeMismatchBin(a, b) => {
-                write!(f, "op {}: incompatible operand shapes {a:?} vs {b:?}", self.op_index)
+                write!(
+                    f,
+                    "op {}: incompatible operand shapes {a:?} vs {b:?}",
+                    self.op_index
+                )
             }
             BodyErrorKind::DTypeMismatch => {
                 write!(f, "op {}: incompatible operand dtypes", self.op_index)
@@ -127,9 +135,20 @@ fn axis0_result(idx: Shape, src: Shape) -> Option<Shape> {
     if n > MAX_RANK {
         return None;
     }
+
     dims[..idx.rank()].copy_from_slice(idx.dims());
     dims[idx.rank()..n].copy_from_slice(&src.dims()[1..]);
     Shape::new(&dims[..n])
+}
+
+fn append_dim(shape: Shape, dim: u32) -> Option<Shape> {
+    let mut dims = [0u32; MAX_RANK];
+    if shape.rank() >= MAX_RANK || dim == 0 {
+        return None;
+    }
+    dims[..shape.rank()].copy_from_slice(shape.dims());
+    dims[shape.rank()] = dim;
+    Shape::new(&dims[..shape.rank() + 1])
 }
 
 enum Results {
@@ -162,7 +181,11 @@ fn infer(
             .ok_or(err(op_index, BodyErrorKind::ChannelOutOfRange(c)))
     };
     let name_ok = |n: u16| -> Result<(), BodyError> {
-        if n < ctx.n_names { Ok(()) } else { Err(err(op_index, BodyErrorKind::NameOutOfRange(n))) }
+        if n < ctx.n_names {
+            Ok(())
+        } else {
+            Err(err(op_index, BodyErrorKind::NameOutOfRange(n)))
+        }
     };
 
     let mut out = Results::None;
@@ -196,13 +219,23 @@ fn infer(
             push(&mut out, ValueType::new(t.shape, dtype));
         }
 
-        Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::MaxElem(a, b) | Op::MinElem(a, b)
+        Op::Add(a, b)
+        | Op::Sub(a, b)
+        | Op::Mul(a, b)
+        | Op::MaxElem(a, b)
+        | Op::MinElem(a, b)
         | Op::Rem(a, b) => {
             let (ta, tb) = (g(a)?, g(b)?);
             if !ta.dtype.is_numeric() || ta.dtype != tb.dtype {
                 return Err(dtype_err());
             }
-            push(&mut out, ValueType::new(broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?, ta.dtype));
+            push(
+                &mut out,
+                ValueType::new(
+                    broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
+                    ta.dtype,
+                ),
+            );
         }
         Op::Div(a, b) => {
             // Unlike PSIR v4 (F32-only), PTIR `div` is defined on every
@@ -212,10 +245,13 @@ fn infer(
             if !ta.dtype.is_numeric() || ta.dtype != tb.dtype {
                 return Err(dtype_err());
             }
-            push(&mut out, ValueType::new(
-                broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
-                ta.dtype,
-            ));
+            push(
+                &mut out,
+                ValueType::new(
+                    broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
+                    ta.dtype,
+                ),
+            );
         }
 
         Op::Gt(a, b) | Op::Ge(a, b) | Op::Eq(a, b) | Op::Ne(a, b) | Op::Lt(a, b) | Op::Le(a, b) => {
@@ -223,20 +259,26 @@ fn infer(
             if !ta.dtype.is_numeric() || ta.dtype != tb.dtype {
                 return Err(dtype_err());
             }
-            push(&mut out, ValueType::new(
-                broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
-                DType::Bool,
-            ));
+            push(
+                &mut out,
+                ValueType::new(
+                    broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
+                    DType::Bool,
+                ),
+            );
         }
         Op::And(a, b) | Op::Or(a, b) => {
             let (ta, tb) = (g(a)?, g(b)?);
             if ta.dtype != DType::Bool || tb.dtype != DType::Bool {
                 return Err(dtype_err());
             }
-            push(&mut out, ValueType::new(
-                broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
-                DType::Bool,
-            ));
+            push(
+                &mut out,
+                ValueType::new(
+                    broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
+                    DType::Bool,
+                ),
+            );
         }
         Op::Not(a) => {
             let t = g(a)?;
@@ -251,8 +293,12 @@ fn infer(
             if tc.dtype != DType::Bool || ta.dtype != tb.dtype {
                 return Err(dtype_err());
             }
-            let ab = broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?;
-            push(&mut out, ValueType::new(broadcast2(ab, tc.shape).ok_or_else(shape_err)?, ta.dtype));
+            let ab =
+                broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?;
+            push(
+                &mut out,
+                ValueType::new(broadcast2(ab, tc.shape).ok_or_else(shape_err)?, ta.dtype),
+            );
         }
 
         Op::ReduceSum(v) | Op::ReduceMax(v) | Op::ReduceMin(v) => {
@@ -260,14 +306,20 @@ fn infer(
             if !t.dtype.is_numeric() {
                 return Err(dtype_err());
             }
-            push(&mut out, ValueType::new(t.shape.drop_last().ok_or_else(shape_err)?, t.dtype));
+            push(
+                &mut out,
+                ValueType::new(t.shape.drop_last().ok_or_else(shape_err)?, t.dtype),
+            );
         }
         Op::ReduceArgmax(v) => {
             let t = g(v)?;
             if !t.dtype.is_numeric() {
                 return Err(dtype_err());
             }
-            push(&mut out, ValueType::new(t.shape.drop_last().ok_or_else(shape_err)?, DType::I32));
+            push(
+                &mut out,
+                ValueType::new(t.shape.drop_last().ok_or_else(shape_err)?, DType::I32),
+            );
         }
 
         Op::Broadcast { value, shape } => {
@@ -379,7 +431,6 @@ fn infer(
             }
             push(&mut out, ValueType::new(t.shape, DType::Bool));
         }
-
         Op::Gather { src, idx } => {
             let (ts, ti) = (g(src)?, g(idx)?);
             if ts.shape.rank() == 0 {
@@ -445,7 +496,16 @@ fn infer(
             }
             push(&mut out, tl);
         }
-
+        Op::CausalMask { positions, len }
+        | Op::SlidingWindowMask { positions, len, .. }
+        | Op::SinkWindowMask { positions, len, .. } => {
+            let positions = g(positions)?;
+            if positions.dtype != DType::U32 {
+                return Err(dtype_err());
+            }
+            let shape = append_dim(positions.shape, len).ok_or_else(shape_err)?;
+            push(&mut out, ValueType::new(shape, DType::Bool));
+        }
         Op::Rng { shape, .. } => {
             if shape.rank() == 0 {
                 return Err(shape_err());
@@ -476,7 +536,12 @@ fn infer(
         }
 
         Op::IntrinsicVal { shape, dtype, .. } => push(&mut out, ValueType::new(shape, dtype)),
-        Op::KernelCall { name, ref args, shape, dtype } => {
+        Op::KernelCall {
+            name,
+            ref args,
+            shape,
+            dtype,
+        } => {
             name_ok(name)?;
             for &a in args {
                 g(a)?;
@@ -500,13 +565,20 @@ mod tests {
     use alloc::vec;
 
     fn ctx_with(channels: &[ValueType]) -> BodyCtx<'_> {
-        BodyCtx { channel_types: channels, n_names: 1 }
+        BodyCtx {
+            channel_types: channels,
+            n_names: 1,
+        }
     }
 
     #[test]
     fn chan_take_types_from_decl() {
         let chans = [ValueType::vector(4, DType::I32)];
-        let ops = vec![Op::ChanTake(0), Op::Neg(0), Op::ChanPut { chan: 0, value: 1 }];
+        let ops = vec![
+            Op::ChanTake(0),
+            Op::Neg(0),
+            Op::ChanPut { chan: 0, value: 1 },
+        ];
         let t = body_types(&ops, &ctx_with(&chans)).unwrap();
         assert_eq!(t.len(), 2); // ChanPut defines no id
         assert_eq!(t[0], ValueType::vector(4, DType::I32));
@@ -515,7 +587,10 @@ mod tests {
     #[test]
     fn chan_put_type_mismatch_rejected() {
         let chans = [ValueType::vector(4, DType::I32)];
-        let ops = vec![Op::Const(Literal::F32(1.0)), Op::ChanPut { chan: 0, value: 0 }];
+        let ops = vec![
+            Op::Const(Literal::F32(1.0)),
+            Op::ChanPut { chan: 0, value: 0 },
+        ];
         assert_eq!(
             body_types(&ops, &ctx_with(&chans)).unwrap_err().kind,
             BodyErrorKind::DTypeMismatch
@@ -525,14 +600,21 @@ mod tests {
     #[test]
     fn row_gather_and_scatter_axis0() {
         // pages [3,5] gathered by parent [3] → [3,5]; then scatter one row back.
-        let chans = [ValueType::new(Shape::matrix(3, 5), DType::U32), ValueType::vector(3, DType::U32)];
+        let chans = [
+            ValueType::new(Shape::matrix(3, 5), DType::U32),
+            ValueType::vector(3, DType::U32),
+        ];
         let ops = vec![
-            Op::ChanTake(0),                                 // 0: [3,5] u32
-            Op::ChanRead(1),                                 // 1: [3] u32
-            Op::Gather { src: 0, idx: 1 },                   // 2: [3,5] u32
-            Op::Const(Literal::U32(0)),                      // 3: scalar
-            Op::Gather { src: 2, idx: 3 },                   // 4: [5] u32 (scalar idx → row)
-            Op::ScatterSet { base: 2, idx: 1, vals: 2 },     // wrong vals shape? [3]++[5]=[3,5] ok
+            Op::ChanTake(0),               // 0: [3,5] u32
+            Op::ChanRead(1),               // 1: [3] u32
+            Op::Gather { src: 0, idx: 1 }, // 2: [3,5] u32
+            Op::Const(Literal::U32(0)),    // 3: scalar
+            Op::Gather { src: 2, idx: 3 }, // 4: [5] u32 (scalar idx → row)
+            Op::ScatterSet {
+                base: 2,
+                idx: 1,
+                vals: 2,
+            }, // wrong vals shape? [3]++[5]=[3,5] ok
         ];
         let t = body_types(&ops, &ctx_with(&chans)).unwrap();
         assert_eq!(t[2], ValueType::new(Shape::matrix(3, 5), DType::U32));
@@ -544,10 +626,10 @@ mod tests {
     fn topk_matmul_transpose_shapes() {
         let chans = [ValueType::new(Shape::matrix(2, 8), DType::F32)];
         let ops = vec![
-            Op::ChanRead(0),                    // 0: [2,8]
-            Op::TopK { input: 0, k: 3 },        // 1: [2,3] f32, 2: [2,3] u32
-            Op::Transpose(0),                   // 3: [8,2]
-            Op::MatMul(0, 3),                   // 4: [2,2]
+            Op::ChanRead(0),             // 0: [2,8]
+            Op::TopK { input: 0, k: 3 }, // 1: [2,3] f32, 2: [2,3] u32
+            Op::Transpose(0),            // 3: [8,2]
+            Op::MatMul(0, 3),            // 4: [2,2]
         ];
         let t = body_types(&ops, &ctx_with(&chans)).unwrap();
         assert_eq!(t[1], ValueType::new(Shape::matrix(2, 3), DType::F32));
@@ -567,15 +649,26 @@ mod tests {
 
     #[test]
     fn rng_keyed_needs_u32_pair_state() {
-        let chans = [ValueType::vector(2, DType::U32), ValueType::vector(3, DType::U32)];
+        let chans = [
+            ValueType::vector(2, DType::U32),
+            ValueType::vector(3, DType::U32),
+        ];
         let ok = vec![
             Op::ChanTake(0),
-            Op::RngKeyed { state: 0, shape: Shape::vector(8), kind: crate::types::RngKind::Gumbel },
+            Op::RngKeyed {
+                state: 0,
+                shape: Shape::vector(8),
+                kind: crate::types::RngKind::Gumbel,
+            },
         ];
         assert!(body_types(&ok, &ctx_with(&chans)).is_ok());
         let bad = vec![
             Op::ChanTake(1), // [3] not [2]
-            Op::RngKeyed { state: 0, shape: Shape::vector(8), kind: crate::types::RngKind::Gumbel },
+            Op::RngKeyed {
+                state: 0,
+                shape: Shape::vector(8),
+                kind: crate::types::RngKind::Gumbel,
+            },
         ];
         assert_eq!(
             body_types(&bad, &ctx_with(&chans)).unwrap_err().kind,

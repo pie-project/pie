@@ -22,7 +22,7 @@ pie-controller-rpc = { path = "../interface/controller" }
 # Cross-node id atoms (`WorkerId`/`GatewayId`/`NodeId`).
 pie-ids = { path = "../interface/ids" }
 # tarpc serves the `Control` RPC: Bincode over tarpc-native TCP or Unix sockets.
-tarpc = { version = "0.35", features = [
+tarpc = { version = "0.37", features = [
     "serde-transport",
     "serde-transport-bincode",
     "tcp",
@@ -36,4 +36,4 @@ tracing = "0.1"
 anyhow = "1"
 # Config is TOML (project convention): pure `Config::parse(&str)` via serde.
 serde = { version = "1", features = ["derive"] }
-toml = "0.9"
+toml = "1.1"

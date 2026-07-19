@@ -10,13 +10,13 @@ keywords = ["wasi", "wasm", "pie", "inferlet"]
 categories = ["wasm"]
 
 [dependencies]
-wit-bindgen = { version = "0.58.0", features = ["async-spawn"] }
+wit-bindgen = { version = "0.59.0", features = ["async-spawn"] }
 trait-variant = "0.1.2"
 inferlet-macros = { version = "0.4.0", path = "../inferlet-macros" }
-futures = "0.3.31"
+futures = "0.3.33"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-schemars = "0.8"
+schemars = "1.2"
 pico-args = "0.5"
 # The PTIR authoring DSL (eDSL + neutral trace Builder). Host-`cargo test`able,
 # wasm-buildable, no wit-bindgen (the single `wit_bindgen::generate!` stays here

@@ -162,10 +162,14 @@ fn build_cuda() {
         "CMAKE_CUDA_ARCHITECTURES",
         "PIE_COMPILER_LAUNCHER",
         "PIE_CUDA_BUILD_MARLIN",
+        "PIE_CUDA_QWEN_ONLY",
         "PIE_MARLIN_ALL_SHAPES",
         "CPM_SOURCE_CACHE",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
+    }
+    if let Some(value) = std::env::var_os("PIE_CUDA_QWEN_ONLY") {
+        cfg.define("PIE_CUDA_QWEN_ONLY", value);
     }
 
     let build_dir = cfg.build().join("build");

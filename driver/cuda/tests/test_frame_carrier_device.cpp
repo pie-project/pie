@@ -1,4 +1,4 @@
-// X2 — standalone device de-risk for the CUDA frames/mirrors carrier (bravo).
+// Standalone device de-risk for the CUDA frames/mirrors carrier.
 // Verifies, in isolation on a live GPU (no executor / no forward), the real-device
 // bind-time frame primitives over the `pie_frame_*` isolation surface:
 //   * register → bind allocates a DEVICE frame + PINNED mirror + PINNED ring words,
@@ -8,7 +8,7 @@
 // Exercises the real extern "C" FFI surface the runtime consumes. Needs a GPU;
 // device validation is deferred to the later batch per the velocity-shift directive.
 
-#include "sampling_ir/frame_carrier.hpp"
+#include "pipeline/frame_carrier.hpp"
 
 #include <cstdint>
 #include <cstdio>

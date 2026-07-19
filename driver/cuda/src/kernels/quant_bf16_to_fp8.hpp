@@ -2,7 +2,7 @@
 
 // Runtime quantization helpers — convert bf16 weight tensors to FP8
 // (E4M3) or INT8 with per-tensor / per-channel symmetric scaling.
-// Used by the Rust storage-program runtime quantization path
+// Used by the Rust LoadPlan runtime quantization path
 // (`--runtime-quant {fp8|int8}`): the loader emits an Encode TileMap that
 // reads the source weight, computes absmax, and stores the quantized weight
 // plus scale tensor directly as runtime outputs.

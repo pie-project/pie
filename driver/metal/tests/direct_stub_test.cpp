@@ -1,21 +1,67 @@
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "entry.hpp"
-#include "ptir/container.hpp"  // fnv1a64 (the PTIB sidecar's container hash)
+#include <pie_driver_abi.h>
+#include "pie_native/ptir/container.hpp"  // fnv1a64 (the PTIB sidecar's container hash)
+#include "support/ptib_v2_plan.hpp"
 
 namespace {
 
+// Phase 3 (review item 1): launches are now ASYNC — the driver posts the
+// forward/settlement to its executor worker and `pie_metal_launch` returns
+// after acceptance. Terminals/words/notifies are published later, from the
+// worker thread. So this notify sink is thread-safe (the worker calls
+// `notify_cb` off the caller thread) and exposes `wait(wait_id, epoch)` so the
+// test blocks for a launch's BATCH notify — published last, after words +
+// terminals + per-channel notifies — before asserting settlement.
 struct NotifyState {
+    mutable std::mutex mu;
+    std::condition_variable cv;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> log;
 
-    std::size_t count() const { return log.size(); }
+    void record(std::uint64_t wait_id, std::uint64_t epoch) {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            log.emplace_back(wait_id, epoch);
+        }
+        cv.notify_all();
+    }
+    std::size_t count() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return log.size();
+    }
     bool contains(std::uint64_t wait_id, std::uint64_t epoch) const {
+        std::lock_guard<std::mutex> lock(mu);
+        return contains_locked(wait_id, epoch);
+    }
+    void clear() {
+        std::lock_guard<std::mutex> lock(mu);
+        log.clear();
+    }
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return log.empty();
+    }
+    std::pair<std::uint64_t, std::uint64_t> back() const {
+        std::lock_guard<std::mutex> lock(mu);
+        return log.back();
+    }
+    // Block until (wait_id, epoch) has been recorded — the async launch's batch
+    // notify, which the driver publishes last.
+    void wait(std::uint64_t wait_id, std::uint64_t epoch) {
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return contains_locked(wait_id, epoch); });
+    }
+
+  private:
+    bool contains_locked(std::uint64_t wait_id, std::uint64_t epoch) const {
         for (const auto& [w, e] : log)
             if (w == wait_id && e == epoch) return true;
         return false;
@@ -23,7 +69,7 @@ struct NotifyState {
 };
 
 void notify_cb(void* ctx, std::uint64_t wait_id, std::uint64_t epoch) {
-    static_cast<NotifyState*>(ctx)->log.emplace_back(wait_id, epoch);
+    static_cast<NotifyState*>(ctx)->record(wait_id, epoch);
 }
 
 bool expect(bool cond, const char* msg) {
@@ -107,9 +153,9 @@ std::vector<std::uint8_t> add_one_program(bool seeded_writer) {
 // epilogue's three SSA value types.
 std::vector<std::uint8_t> add_one_sidecar(const std::vector<std::uint8_t>& container) {
     const std::uint64_t hash =
-        pie_cuda_driver::ptir::container::fnv1a64(container.data(), container.size());
+        pie_native::ptir::container::fnv1a64(container.data(), container.size());
     std::vector<std::uint8_t> out{'P', 'T', 'I', 'B'};
-    push_u16(out, PTIB_VERSION);
+    push_u16(out, 1);  // hand-built typed sidecar; no v2 compiler-plan section
     push_u16(out, 0);
     for (int b = 0; b < 8; ++b) out.push_back(static_cast<std::uint8_t>(hash >> (b * 8)));
     push_u32(out, 2);  // channel classes
@@ -133,7 +179,7 @@ std::vector<std::uint8_t> add_one_sidecar(const std::vector<std::uint8_t>& conta
     out.push_back(PTIR_DT_U32);
     out.push_back(1);
     push_u32(out, 1);
-    return out;
+    return pie::metal::tests::upgrade_ptib_v1(container, std::move(out));
 }
 
 std::vector<std::uint8_t> extern_program(std::uint8_t direction) {
@@ -198,24 +244,39 @@ int main() {
     if (!expect(driver != nullptr, "driver create")) return 1;
 
     const auto program_bytes = mixed_role_program();
+    const auto program_sidecar =
+        pie::metal::tests::empty_program_ptib_v2(program_bytes);
     PieProgramDesc program{};
     program.abi_version = PIE_DRIVER_ABI_VERSION;
     program.program_hash = 0x1234;
     program.canonical_bytes.ptr = program_bytes.data();
     program.canonical_bytes.len = program_bytes.size();
+    program.sidecar_bytes = {
+        .ptr = program_sidecar.data(),
+        .len = program_sidecar.size(),
+    };
     std::uint64_t program_id = 0;
     const auto oversized_capacity_bytes = mixed_role_program(8);
+    const auto oversized_capacity_sidecar =
+        pie::metal::tests::empty_program_ptib_v2(
+            oversized_capacity_bytes);
     PieProgramDesc oversized_capacity_program = program;
-    oversized_capacity_program.program_hash += 1;
+    oversized_capacity_program.program_hash += 0x100;
     oversized_capacity_program.canonical_bytes = {
         .ptr = oversized_capacity_bytes.data(),
         .len = oversized_capacity_bytes.size(),
     };
+    oversized_capacity_program.sidecar_bytes = {
+        .ptr = oversized_capacity_sidecar.data(),
+        .len = oversized_capacity_sidecar.size(),
+    };
+    std::uint64_t oversized_capacity_program_id = 0;
     if (!expect(pie_metal_register_program(
                     driver,
                     &oversized_capacity_program,
-                    &program_id) == PIE_STATUS_INVALID_ARGUMENT,
-                "register rejects unsupported channel capacity")) return 1;
+                    &oversized_capacity_program_id) == PIE_STATUS_OK,
+                "register accepts contract-valid channel capacity without a "
+                "backend-private cap")) return 1;
     PieProgramDesc bad_program = program;
     bad_program.abi_version += 1;
     if (!expect(pie_metal_register_program(driver, &bad_program, &program_id) ==
@@ -224,6 +285,13 @@ int main() {
     if (!expect(pie_metal_register_program(driver, &program, nullptr) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "register rejects null output")) return 1;
+    PieProgramDesc sidecarless = program;
+    sidecarless.program_hash = 0x1233;
+    sidecarless.sidecar_bytes = {};
+    if (!expect(
+            pie_metal_register_program(driver, &sidecarless, &program_id) ==
+                PIE_STATUS_UNSUPPORTED,
+            "M1 rejects a sidecar-less program at registration")) return 1;
     bad_program = program;
     bad_program.sidecar_bytes = {.ptr = nullptr, .len = 1};
     if (!expect(pie_metal_register_program(driver, &bad_program, &program_id) ==
@@ -239,6 +307,19 @@ int main() {
                 "register rejects byte extent overflow")) return 1;
     if (!expect(pie_metal_register_program(driver, &program, &program_id) == PIE_STATUS_OK,
                 "register_program")) return 1;
+    std::vector<std::uint8_t> colliding_program_bytes = program_bytes;
+    colliding_program_bytes.back() ^= 1;
+    PieProgramDesc colliding_program = program;
+    colliding_program.canonical_bytes = {
+        .ptr = colliding_program_bytes.data(),
+        .len = colliding_program_bytes.size(),
+    };
+    std::uint64_t collision_id = 0;
+    if (!expect(
+            pie_metal_register_program(
+                driver, &colliding_program, &collision_id) ==
+                PIE_STATUS_INVALID_ARGUMENT,
+            "same hash with nonidentical canonical bytes rejects")) return 1;
     PieProgramDesc cached_program = program;
     cached_program.canonical_bytes = {};
     std::uint64_t cached_program_id = 0;
@@ -356,14 +437,13 @@ int main() {
     if (!expect(pie_metal_close_channel(driver, 33) == PIE_STATUS_INVALID_ARGUMENT,
                 "close_channel rejects live attachment")) return 1;
 
-    // Seeds are per-instance interp state (D2), never bind-time ring
-    // publications: the reader ring stays untouched until a fire produces.
+    // A host-reader seed is sequence zero on both the interpreter and the
+    // host-visible ring, matching the runtime/CUDA ticket origin.
     auto* mirror = reinterpret_cast<const std::uint8_t*>(endpoints[2].mirror_base);
     auto* words = reinterpret_cast<const std::uint64_t*>(endpoints[2].word_base);
-    const std::uint8_t zero_cell[4] = {0, 0, 0, 0};
-    if (!expect(std::memcmp(mirror, zero_cell, sizeof(zero_cell)) == 0,
-                "bind leaves the reader ring untouched")) return 1;
-    if (!expect(words[1] == 0, "bind publishes no reader tail")) return 1;
+    if (!expect(std::memcmp(mirror, seed_bytes, sizeof(seed_bytes)) == 0,
+                "bind publishes the reader seed")) return 1;
+    if (!expect(words[1] == 1, "bind publishes the reader seed tail")) return 1;
 
     PieInstanceDesc duplicate_instance = instance;
     duplicate_instance.requested_instance_id = binding.instance_id;
@@ -406,8 +486,8 @@ int main() {
         .len = 1,
     };
     if (!expect(pie_metal_launch(driver, &device_geometry_launch, launch_completion) ==
-                    PIE_STATUS_UNSUPPORTED,
-                "device-geometry empty mask encoding")) return 1;
+                    PIE_STATUS_INVALID_ARGUMENT,
+                "empty launch still requires channel tickets")) return 1;
 
     PieLaunchDesc bad_launch = launch;
     bad_launch.abi_version += 1;
@@ -419,8 +499,33 @@ int main() {
     if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects invalid bool")) return 1;
+    const std::uint32_t mask_request_indptr[] = {0, 1};
+    const std::uint32_t mask_word_indptr[] = {0, 1};
+    const std::uint32_t mask_words[] = {1};
+    const std::uint32_t mask_qo_indptr[] = {0, 0};
+    PieLaunchDesc user_mask_launch = launch;
+    user_mask_launch.has_user_mask = 1;
+    user_mask_launch.qo_indptr = {
+        .ptr = mask_qo_indptr, .len = 2};
+    user_mask_launch.masks.request_indptr = {
+        .ptr = mask_request_indptr, .len = 2};
+    user_mask_launch.masks.word_indptr = {
+        .ptr = mask_word_indptr, .len = 2};
+    user_mask_launch.masks.words = {
+        .ptr = mask_words, .len = 1};
+    launch_terminal = pending_terminal();
+    if (!expect(
+            pie_metal_launch(
+                driver, &user_mask_launch, launch_completion) ==
+                    PIE_STATUS_UNSUPPORTED &&
+                launch_terminal.outcome ==
+                    PIE_TERMINAL_OUTCOME_PENDING,
+            "user wire masks reject synchronously instead of running "
+            "unmasked")) {
+        return 1;
+    }
     bad_launch = launch;
-    bad_launch.reserved_flags[3] = 1;
+    bad_launch.reserved_flags[1] = 1;
     if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects reserved flags")) return 1;
@@ -577,18 +682,14 @@ int main() {
     if (!expect(pie_metal_launch(driver, &launch, rejected_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects operation terminal cell")) return 1;
-    // The mixed-role program ships no PTIB sidecar, so it is not executable
-    // on the host interpreter — launch rejects UNSUPPORTED without touching
-    // any ring state.
-    if (!expect(pie_metal_launch(driver, &launch, launch_completion) == PIE_STATUS_UNSUPPORTED,
-                "launch of a sidecar-less program is unsupported")) return 1;
-    if (!expect(notify.count() == 0, "unsupported launch does not notify")) return 1;
+    // Registration-time M1 rejection replaced the old fire-time unsupported
+    // path; the rejected operation above still touched no channel state.
     if (!expect(words[0] == 0, "reader head unchanged")) return 1;
-    if (!expect(words[1] == 0, "reader tail unchanged")) return 1;
+    if (!expect(words[1] == 1, "reader seed tail unchanged")) return 1;
     if (!expect(words[2] == 0, "poison stays clear")) return 1;
     if (!expect(words[3] == 0, "closed stays clear")) return 1;
     if (!expect(launch_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
-                "unsupported launch keeps member terminal pending")) return 1;
+                "unlaunched member terminal stays pending")) return 1;
     if (!expect(rejected_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
                 "rejected launch keeps operation terminal pending")) return 1;
 
@@ -699,27 +800,40 @@ int main() {
         exec_launch.abi_version = PIE_DRIVER_ABI_VERSION;
         exec_launch.instance_ids = {.ptr = exec_instance_ids, .len = 1};
         exec_launch.terminal_cells = {.ptr = exec_terminal_ptrs, .len = 1};
+        std::uint64_t exec_ticket_heads[] = {0, std::numeric_limits<std::uint64_t>::max()};
+        std::uint64_t exec_ticket_tails[] = {std::numeric_limits<std::uint64_t>::max(), 0};
+        const std::uint32_t exec_ticket_indptr[] = {0, 2};
+        exec_launch.channel_expected_head = {.ptr = exec_ticket_heads, .len = 2};
+        exec_launch.channel_expected_tail = {.ptr = exec_ticket_tails, .len = 2};
+        exec_launch.channel_ticket_indptr = {.ptr = exec_ticket_indptr, .len = 2};
         const PieCompletion exec_completion{
             .wait_id = 777,
             .target_epoch = 9,
             .terminal_cell = nullptr,
         };
 
-        // §4.3 availability: a fire taking from an empty host-writer ring
-        // rejects synchronously — no epoch, no poison, no notify.
-        if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) ==
-                        PIE_STATUS_INVALID_ARGUMENT,
-                    "launch without a host put rejects")) return 1;
-        if (!expect(notify.count() == 0, "availability rejection does not notify")) return 1;
-        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
-                    "availability rejection keeps terminal pending")) return 1;
+        // Missing input is accepted and classified at execution time as RETRY.
+        notify.clear();
+        if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) == PIE_STATUS_OK,
+                    "launch without a host put is accepted")) return 1;
+        notify.wait(777, 9);
+        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_RETRY,
+                    "missing host input publishes RETRY")) return 1;
+        if (!expect(writer_words[0] == 0 && reader_words[1] == 0 &&
+                        reader_words[2] == 0,
+                    "RETRY has no channel effects")) return 1;
 
         // Host put: wire bytes at `tail % cap1`, then the release tail store.
+        notify.clear();
+        exec_terminal = pending_terminal();
         const std::uint32_t put_value = 7;
         std::memcpy(writer_mirror, &put_value, sizeof(put_value));
         writer_words[1] = 1;
         if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) == PIE_STATUS_OK,
                     "put → launch succeeds")) return 1;
+        // Async (review item 1): launch returns after acceptance; the worker
+        // publishes words/terminal/notifies. Wait for the batch notify (last).
+        notify.wait(777, 9);
         std::uint32_t produced = 0;
         std::memcpy(&produced, reader_mirror, sizeof(produced));
         if (!expect(writer_words[0] == 1, "consumed writer head published")) return 1;
@@ -729,28 +843,113 @@ int main() {
                     "member terminal settles success")) return 1;
         if (!expect(notify.contains(502, 1), "writer wake carries the new head")) return 1;
         if (!expect(notify.contains(511, 1), "reader wake carries the new tail")) return 1;
-        if (!expect(!notify.log.empty() && notify.log.back() == std::make_pair(
+        if (!expect(!notify.empty() && notify.back() == std::make_pair(
                         std::uint64_t{777}, std::uint64_t{9}),
                     "batch notify lands last, exactly once")) return 1;
 
-        // Failure settlement (D4): a second fire with a fresh put but a full
-        // reader ring (no host take) poisons and fails the member terminal.
-        notify.log.clear();
+        // A second logical fire with a full reader ring RETRYs without poison.
+        notify.clear();
         exec_terminal = pending_terminal();
+        exec_ticket_heads[0] = 1;
+        exec_ticket_tails[1] = 1;
         const std::uint32_t second_value = 20;
         std::memcpy(writer_mirror + exec_endpoints[0].cell_bytes, &second_value,
                     sizeof(second_value));
         writer_words[1] = 2;
         if (!expect(pie_metal_launch(driver, &exec_launch, exec_completion) == PIE_STATUS_OK,
-                    "accepted fire settles even when publication fails")) return 1;
-        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_FAILED,
-                    "publication failure fails the member terminal")) return 1;
-        if (!expect(reader_words[2] != 0, "reader poison word published")) return 1;
-        if (!expect(notify.contains(511, reader_words[2]),
-                    "reader wake carries the poison epoch")) return 1;
-        if (!expect(!notify.log.empty() && notify.log.back() == std::make_pair(
+                    "backpressured fire is accepted")) return 1;
+        notify.wait(777, 9);
+        if (!expect(exec_terminal.outcome == PIE_TERMINAL_OUTCOME_RETRY,
+                    "output backpressure publishes RETRY")) return 1;
+        if (!expect(reader_words[2] == 0, "backpressure does not poison")) return 1;
+        if (!expect(writer_words[0] == 1 && reader_words[1] == 1,
+                    "backpressure leaves channel words unchanged")) return 1;
+        if (!expect(!notify.empty() && notify.back() == std::make_pair(
                         std::uint64_t{777}, std::uint64_t{9}),
-                    "failed fire still notifies the batch slot last")) return 1;
+                    "retrying fire still notifies the batch slot last")) return 1;
+
+        // ── Driver-level async acceptance (review items 1/5): a fresh add_one
+        //    instance on its own channels. `pie_metal_launch` returns after
+        //    acceptance; `close_instance` then QUEUES BEHIND the launch job on
+        //    the executor worker (FIFO), so by the time close returns the launch
+        //    has fully settled — its terminal is SUCCESS and its batch notify
+        //    was delivered exactly once, all published asynchronously from the
+        //    worker (never from the launch call). This is the driver-level
+        //    counterpart to executor_worker_test's mechanism-level proof. ──
+        {
+            const std::uint64_t async_channel_ids[] = {155, 166};
+            PieChannelDesc async_descs[2]{};
+            for (std::size_t i = 0; i < 2; ++i) {
+                async_descs[i].abi_version = PIE_DRIVER_ABI_VERSION;
+                async_descs[i].channel_id = async_channel_ids[i];
+                async_descs[i].shape = {.ptr = scalar_shape, .len = 1};
+                async_descs[i].dtype = PIE_CHANNEL_DTYPE_U32;
+                async_descs[i].capacity = 1;
+                async_descs[i].reader_wait_id = 1550 + i;
+                async_descs[i].writer_wait_id = 1560 + i;
+            }
+            async_descs[0].host_role = PIE_CHANNEL_HOST_ROLE_WRITER;
+            async_descs[1].host_role = PIE_CHANNEL_HOST_ROLE_READER;
+            PieChannelEndpointBinding async_endpoints[2]{};
+            for (std::size_t i = 0; i < 2; ++i) {
+                if (!expect(pie_metal_register_channel(driver, &async_descs[i],
+                                                       &async_endpoints[i]) == PIE_STATUS_OK,
+                            "register async add_one channel")) return 1;
+            }
+            PieInstanceDesc async_instance{};
+            async_instance.abi_version = PIE_DRIVER_ABI_VERSION;
+            async_instance.program_id = exec_program_id;
+            async_instance.channel_ids = {.ptr = async_channel_ids, .len = 2};
+            PieInstanceBinding async_binding{};
+            if (!expect(pie_metal_bind_instance(driver, &async_instance, &async_binding) ==
+                            PIE_STATUS_OK,
+                        "bind async add_one instance")) return 1;
+
+            auto* async_writer_mirror =
+                reinterpret_cast<std::uint8_t*>(async_endpoints[0].mirror_base);
+            auto* async_writer_words =
+                reinterpret_cast<std::uint64_t*>(async_endpoints[0].word_base);
+            const std::uint32_t async_put = 41;
+            std::memcpy(async_writer_mirror, &async_put, sizeof(async_put));
+            async_writer_words[1] = 1;
+
+            const std::uint64_t async_instance_ids[] = {async_binding.instance_id};
+            PieTerminalCell async_terminal = pending_terminal();
+            PieTerminalCell* const async_terminal_ptrs[] = {&async_terminal};
+            PieLaunchDesc async_launch{};
+            async_launch.abi_version = PIE_DRIVER_ABI_VERSION;
+            async_launch.instance_ids = {.ptr = async_instance_ids, .len = 1};
+            async_launch.terminal_cells = {.ptr = async_terminal_ptrs, .len = 1};
+            const std::uint64_t async_ticket_heads[] = {
+                0, std::numeric_limits<std::uint64_t>::max()};
+            const std::uint64_t async_ticket_tails[] = {
+                std::numeric_limits<std::uint64_t>::max(), 0};
+            const std::uint32_t async_ticket_indptr[] = {0, 2};
+            async_launch.channel_expected_head = {.ptr = async_ticket_heads, .len = 2};
+            async_launch.channel_expected_tail = {.ptr = async_ticket_tails, .len = 2};
+            async_launch.channel_ticket_indptr = {.ptr = async_ticket_indptr, .len = 2};
+            const PieCompletion async_completion{.wait_id = 1777, .target_epoch = 4,
+                                                 .terminal_cell = nullptr};
+            notify.clear();
+            if (!expect(pie_metal_launch(driver, &async_launch, async_completion) == PIE_STATUS_OK,
+                        "async launch returns OK after acceptance (no wait)")) return 1;
+            // Close WITHOUT waiting on the completion: close is a worker job
+            // enqueued strictly behind the launch job (FIFO), so it cannot
+            // return until the launch has settled.
+            if (!expect(pie_metal_close_instance(driver, async_binding.instance_id) ==
+                            PIE_STATUS_OK,
+                        "close queues behind the in-flight launch")) return 1;
+            if (!expect(async_terminal.outcome == PIE_TERMINAL_OUTCOME_SUCCESS,
+                        "launch settled asynchronously before close returned (terminal SUCCESS)"))
+                return 1;
+            if (!expect(notify.contains(1777, 4),
+                        "batch completion notified exactly once from the worker")) return 1;
+            for (const std::uint64_t id : async_channel_ids) {
+                if (!expect(pie_metal_close_channel(driver, id) == PIE_STATUS_OK,
+                            "close async add_one channel")) return 1;
+            }
+            notify.clear();
+        }
 
         if (!expect(pie_metal_close_instance(driver, exec_binding.instance_id) ==
                         PIE_STATUS_OK,
@@ -761,8 +960,7 @@ int main() {
         }
     }
 
-    // ── seed credit: a seeded Writer channel's first take spends the seed
-    //    without a host put and without a head-word publish (§4.3) ──
+    // ── seeded Writer: sequence zero is a normal immutable consume ticket. ──
     {
         const auto seeded_bytes = add_one_program(true);
         const auto seeded_sidecar = add_one_sidecar(seeded_bytes);
@@ -824,30 +1022,45 @@ int main() {
         seeded_launch.abi_version = PIE_DRIVER_ABI_VERSION;
         seeded_launch.instance_ids = {.ptr = seeded_instance_ids, .len = 1};
         seeded_launch.terminal_cells = {.ptr = seeded_terminal_ptrs, .len = 1};
+        std::uint64_t seeded_ticket_heads[] = {
+            0, std::numeric_limits<std::uint64_t>::max()};
+        std::uint64_t seeded_ticket_tails[] = {
+            std::numeric_limits<std::uint64_t>::max(), 0};
+        const std::uint32_t seeded_ticket_indptr[] = {0, 2};
+        seeded_launch.channel_expected_head = {.ptr = seeded_ticket_heads, .len = 2};
+        seeded_launch.channel_expected_tail = {.ptr = seeded_ticket_tails, .len = 2};
+        seeded_launch.channel_ticket_indptr = {.ptr = seeded_ticket_indptr, .len = 2};
         const PieCompletion seeded_completion{
             .wait_id = 888,
             .target_epoch = 3,
             .terminal_cell = nullptr,
         };
-        notify.log.clear();
+        notify.clear();
         if (!expect(pie_metal_launch(driver, &seeded_launch, seeded_completion) ==
                         PIE_STATUS_OK,
                     "seed credit satisfies the first fire without a put")) return 1;
+        notify.wait(888, 3);
         std::uint32_t seeded_out = 0;
         std::memcpy(&seeded_out, seeded_reader_mirror, sizeof(seeded_out));
         if (!expect(seeded_out == 42, "seed value flowed through the program")) return 1;
-        if (!expect(seeded_writer_words[0] == 0,
-                    "seed spend publishes no writer head")) return 1;
-        if (!expect(!notify.contains(602, 0) && !notify.contains(602, 1),
-                    "seed spend sends no writer wake")) return 1;
+        if (!expect(seeded_writer_words[0] == 1,
+                    "seed consume publishes the writer head")) return 1;
+        if (!expect(notify.contains(602, 1),
+                    "seed consume wakes the writer")) return 1;
         if (!expect(seeded_terminal.outcome == PIE_TERMINAL_OUTCOME_SUCCESS,
                     "seeded fire settles success")) return 1;
 
-        // The credit is spent: a second fire needs a real host put.
+        // The seed is spent: a second fire without a real host put RETRYs.
+        notify.clear();
         seeded_terminal = pending_terminal();
+        seeded_ticket_heads[0] = 1;
+        seeded_ticket_tails[1] = 1;
         if (!expect(pie_metal_launch(driver, &seeded_launch, seeded_completion) ==
-                        PIE_STATUS_INVALID_ARGUMENT,
-                    "spent seed credit no longer satisfies availability")) return 1;
+                        PIE_STATUS_OK,
+                    "spent seed launch is accepted")) return 1;
+        notify.wait(888, 3);
+        if (!expect(seeded_terminal.outcome == PIE_TERMINAL_OUTCOME_RETRY,
+                    "spent seed without a put RETRYs")) return 1;
 
         if (!expect(pie_metal_close_instance(driver, seeded_binding.instance_id) ==
                         PIE_STATUS_OK,
@@ -856,11 +1069,15 @@ int main() {
             if (!expect(pie_metal_close_channel(driver, id) == PIE_STATUS_OK,
                         "close seeded channel")) return 1;
         }
-        notify.log.clear();
+        notify.clear();
     }
 
     const auto export_bytes = extern_program(1);
     const auto import_bytes = extern_program(0);
+    const auto export_sidecar =
+        pie::metal::tests::empty_program_ptib_v2(export_bytes);
+    const auto import_sidecar =
+        pie::metal::tests::empty_program_ptib_v2(import_bytes);
     PieProgramDesc export_program{};
     export_program.abi_version = PIE_DRIVER_ABI_VERSION;
     export_program.program_hash = 0x2001;
@@ -868,11 +1085,19 @@ int main() {
         .ptr = export_bytes.data(),
         .len = export_bytes.size(),
     };
+    export_program.sidecar_bytes = {
+        .ptr = export_sidecar.data(),
+        .len = export_sidecar.size(),
+    };
     PieProgramDesc import_program = export_program;
     import_program.program_hash = 0x2002;
     import_program.canonical_bytes = {
         .ptr = import_bytes.data(),
         .len = import_bytes.size(),
+    };
+    import_program.sidecar_bytes = {
+        .ptr = import_sidecar.data(),
+        .len = import_sidecar.size(),
     };
     std::uint64_t export_program_id = 0;
     std::uint64_t import_program_id = 0;

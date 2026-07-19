@@ -29,8 +29,8 @@
 //!    channel-bit late input — the sampler parks on the channel word, the forward
 //!    overlaps. The C2 wait mechanism (device dirty-flag word → channel bit) is
 //!    already in place; this harness re-points the grammar slice at it.
-//! 2. **M2 3+1 (C1):** `fwd.attn_working_set(&ws, &cursor, P_MAX)` with the
-//!    descriptor's geometry contents from a device channel the host never reads.
+//! 2. **M2 3+1 (C1):** flat `fwd.attention(...)` with every geometry descriptor
+//!    supplied by device-carried channels the host never reads.
 //! 3. **M3 north star:** compose all three programs on one forward — the MTP
 //!    epilogue emits drafts, the grammar walk builds the K+1 mask rows, Quest
 //!    selects pages per layer — under the quorum scheduler. Add the accepted-
@@ -176,12 +176,7 @@ fn north_star_runahead_decode_slice() {
         out.contains("MATCH=true"),
         "run-ahead == synchronous stream: {out}"
     );
-    // depth-2 FIFO submit-ahead loop at the shipped WAR bound — verifiable now.
-    // DEEP4_MATCH (depth-4) is observed, not asserted: byte-identity holds at any
-    // cap (the carrier injects correctly), but to EXERCISE true 4-in-flight (the
-    // depth-k WAR test that empirically confirms the single `last_eager_d2h_done`
-    // scalar is depth-k-correct — no WAR ring needed, spec §3.3), run this with
-    // `PIE_SCHED_MAX_IN_FLIGHT=4` (else it queues at the default cap-2).
+    // Dispatch-time pool admission safely supports configured deeper depths.
     assert!(
         out.contains("DEEP_MATCH=true"),
         "deep-pre-submission carrier chain (depth-2 FIFO) == synchronous stream \

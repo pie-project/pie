@@ -84,7 +84,7 @@ let mask = vec![evict_count, window_size];   // mask out evicted, attend to wind
 fwd.attention_mask(&[mask]);
 ```
 
-See the [`windowed-attention`](https://github.com/pie-project/pie/tree/main/inferlets/windowed-attention) inferlet for the full implementation.
+See [`sliding-window-attention`](https://github.com/pie-project/pie/tree/main/inferlets/sliding-window-attention) for a full implementation.
 
 ### Attention sink
 
@@ -122,7 +122,7 @@ Two ground rules to make trim land:
 - **Mask whole pages, not individual tokens.** A row that masks positions `5..10` inside a 16-token page does not trim that page. Masking positions `0..16` does.
 - **Apply the same mask shape to every row.** Trim only fires when every row agrees that a page is dead.
 
-The high-level idioms (sliding window with whole-page eviction, attention sink, page-aligned sparse attention) all align with these rules. See the [`page-trim-bench`](https://github.com/pie-project/pie/tree/main/inferlets/page-trim-bench) inferlet for measurements.
+The high-level idioms (sliding window with whole-page eviction, attention sink, page-aligned sparse attention) all align with these rules.
 
 Pages receiving new K/V writes are never trimmed. The trim is per-request: two batched requests with different masks compute trim independently. Logical token positions and `position_ids` are preserved; only the physical pages on the wire shrink.
 

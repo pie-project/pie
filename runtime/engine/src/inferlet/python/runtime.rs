@@ -1,8 +1,8 @@
 //! Python runtime resources shared across the linker and program services.
 //!
-//! Tracks the CPython runtime directory and lazily loads the stdlib shared
-//! modules from $PIE_HOME/py-runtime/shared/*.wasm when a Python component
-//! is installed or instantiated. Non-Python components should not pay this
+//! Tracks the configured CPython runtime directory and lazily loads the stdlib
+//! shared modules from `<py-runtime>/shared/*.wasm` when a Python component is
+//! installed or instantiated. Non-Python components should not pay this
 //! compilation cost. Loaded modules are exposed as two variants:
 //!
 //! - **Full** modules — have their data segments and start functions intact.
@@ -21,14 +21,12 @@ use std::sync::OnceLock;
 
 use wasmtime::{Engine, Module};
 
-use crate::util;
-
 use super::snapshot;
 
 struct State {
     /// Wasmtime engine used to compile shared modules lazily.
     engine: Engine,
-    /// $PIE_HOME/py-runtime directory, if it exists on disk.
+    /// Configured py-runtime directory, if it exists on disk.
     py_runtime_dir: Option<PathBuf>,
     /// Lazily compiled shared modules. Startup should not pay CPython
     /// compilation cost for non-Python inferlets.
@@ -42,20 +40,20 @@ static STATE: OnceLock<State> = OnceLock::new();
 /// Initializes the shared Python runtime. Must be called once at startup,
 /// after the Wasmtime engine is created and before the linker/program services
 /// are spawned. Subsequent calls are no-ops.
-pub fn init(engine: &Engine, snapshot_enabled: bool) {
+pub fn init(engine: &Engine, py_runtime_dir: &Path, snapshot_enabled: bool) {
     if STATE.get().is_some() {
         return;
     }
 
-    let py_runtime_dir = {
-        let dir = util::get_py_runtime_dir();
-        if dir.is_dir() {
-            tracing::info!("Python runtime directory: {}", dir.display());
-            Some(dir)
-        } else {
-            tracing::info!("No Python runtime directory found at {}", dir.display());
-            None
-        }
+    let py_runtime_dir = if py_runtime_dir.is_dir() {
+        tracing::info!("Python runtime directory: {}", py_runtime_dir.display());
+        Some(py_runtime_dir.to_path_buf())
+    } else {
+        tracing::info!(
+            "No Python runtime directory found at {}",
+            py_runtime_dir.display()
+        );
+        None
     };
 
     let _ = STATE.set(State {

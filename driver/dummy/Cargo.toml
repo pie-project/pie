@@ -14,7 +14,8 @@ crate-type = ["rlib"]
 [dependencies]
 pie-driver-abi = { path = "../../interface/driver" }
 pie-ptir = { path = "../../interface/ptir", features = ["eval"] }
+pie-load-planner = { path = "../../runtime/load-planner" }
 anyhow = "1.0"
 
 [dev-dependencies]
-tokio = { version = "1.52", features = ["rt", "sync", "time"] }
+tokio = { version = "1.53", features = ["rt", "sync", "time"] }

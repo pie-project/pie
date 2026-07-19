@@ -1,5 +1,7 @@
 #pragma once
 
+// kernels/: fused device kernels used by ops/ and model/ forwards (leaf module).
+//
 // Per-row bias add: `out[n, d] += bias[d]` for n ∈ [0, num_rows),
 // d ∈ [0, dim). Used by Qwen-2 / OLMo-3 / GPT-OSS where Q/K/V (and
 // optionally MLP) projections carry a bias term — cuBLAS GEMM doesn't

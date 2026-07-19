@@ -89,7 +89,11 @@ fn assert_mirostat_path_executes(json: &str) -> Result<(), String> {
         return Err("s_flowed=false — Scalar S channel not marshaled; μ-update skipped".into());
     }
     if r.tokens.len() != r.count {
-        return Err(format!("token count mismatch: count={} tokens={}", r.count, r.tokens.len()));
+        return Err(format!(
+            "token count mismatch: count={} tokens={}",
+            r.count,
+            r.tokens.len()
+        ));
     }
     if r.count == 0 {
         return Err("mirostat produced zero tokens".into());
@@ -114,7 +118,11 @@ fn assert_grammar_conformant(json: &str, alphabet: &[u32]) -> Result<(), String>
         return Err("inferlet reported conformant=false".into());
     }
     if r.tokens.len() != r.count {
-        return Err(format!("token count mismatch: count={} tokens={}", r.count, r.tokens.len()));
+        return Err(format!(
+            "token count mismatch: count={} tokens={}",
+            r.count,
+            r.tokens.len()
+        ));
     }
     if r.count == 0 {
         return Err("grammar produced zero tokens".into());
@@ -122,10 +130,14 @@ fn assert_grammar_conformant(json: &str, alphabet: &[u32]) -> Result<(), String>
     let mut prev: Option<u32> = None;
     for (i, &t) in r.tokens.iter().enumerate() {
         if !alphabet.contains(&t) {
-            return Err(format!("token[{i}]={t} not in allowed alphabet {alphabet:?}"));
+            return Err(format!(
+                "token[{i}]={t} not in allowed alphabet {alphabet:?}"
+            ));
         }
         if Some(t) == prev {
-            return Err(format!("token[{i}]={t} repeats previous (no-repeat violated)"));
+            return Err(format!(
+                "token[{i}]={t} repeats previous (no-repeat violated)"
+            ));
         }
         prev = Some(t);
     }
@@ -170,7 +182,8 @@ async fn mirostat_path_executes_on_4090() -> Result<()> {
     // ~70% that collapse into the repetition attractor: s_flowed (Scalar channel) +
     // μ finite + loop completed. The τ-convergence-quality assertion is removed to
     // #19; it is NOT a path invariant on the corrected vocab.
-    assert_mirostat_path_executes(&json).map_err(|e| anyhow::anyhow!("mirostat: {e}\njson={json}"))?;
+    assert_mirostat_path_executes(&json)
+        .map_err(|e| anyhow::anyhow!("mirostat: {e}\njson={json}"))?;
     Ok(())
 }
 
@@ -188,13 +201,16 @@ async fn mirostat_path_executes_on_4090() -> Result<()> {
 async fn mirostat_tau_sweep_on_4090() -> Result<()> {
     let pie = common::boot_4090().await?;
 
-    eprintln!("[MIROSTAT-SWEEP] tau | final_mu | tail_surprise | mean_surprise | |tail-tau| | settled?");
+    eprintln!(
+        "[MIROSTAT-SWEEP] tau | final_mu | tail_surprise | mean_surprise | |tail-tau| | settled?"
+    );
     let mut rows: Vec<(f32, f32, f32, f32)> = Vec::new();
     for tau in [1.0_f32, 1.5, 2.0, 3.0] {
         let input = format!(r#"{{"tau":{tau},"max_tokens":64}}"#);
-        let json = common::run_inferlet(&pie.listen_addr, "mirostat", "mirostat@0.1.0", &input).await?;
-        let r: MirostatResult =
-            serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("sweep parse: {e}\njson={json}"))?;
+        let json =
+            common::run_inferlet(&pie.listen_addr, "mirostat", "mirostat@0.1.0", &input).await?;
+        let r: MirostatResult = serde_json::from_str(&json)
+            .map_err(|e| anyhow::anyhow!("sweep parse: {e}\njson={json}"))?;
         // "settled" ⇒ μ did not run away (stays within a few nats of τ, not ≫ τ).
         let settled = r.final_mu <= tau + 3.0;
         eprintln!(
@@ -206,7 +222,10 @@ async fn mirostat_tau_sweep_on_4090() -> Result<()> {
             (r.tail_mean_surprise - tau).abs(),
             if settled { "yes" } else { "RUNAWAY" },
         );
-        assert!(r.s_flowed, "sweep τ={tau}: S channel did not flow (μ-update path broken)");
+        assert!(
+            r.s_flowed,
+            "sweep τ={tau}: S channel did not flow (μ-update path broken)"
+        );
         rows.push((tau, r.final_mu, r.tail_mean_surprise, r.mean_surprise));
     }
     pie.shutdown().await;
@@ -227,13 +246,7 @@ async fn mirostat_tau_sweep_on_4090() -> Result<()> {
 async fn grammar_conforms_on_4090() -> Result<()> {
     let pie = common::boot_4090().await?;
 
-    let json = common::run_inferlet(
-        &pie.listen_addr,
-        "grammar",
-        "grammar@0.1.0",
-        "{}",
-    )
-    .await?;
+    let json = common::run_inferlet(&pie.listen_addr, "grammar", "grammar@0.1.0", "{}").await?;
 
     pie.shutdown().await;
 
@@ -254,13 +267,7 @@ async fn grammar_conforms_on_4090() -> Result<()> {
 async fn generate_greedy_on_4090() -> Result<()> {
     let pie = common::boot_4090().await?;
 
-    let json = common::run_inferlet(
-        &pie.listen_addr,
-        "generate",
-        "generate@0.1.0",
-        "\"\"",
-    )
-    .await?;
+    let json = common::run_inferlet(&pie.listen_addr, "generate", "generate@0.1.0", "\"\"").await?;
 
     pie.shutdown().await;
 

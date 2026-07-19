@@ -38,7 +38,7 @@ async fn lowlevel_chat_runahead_rollback_on_real_driver() -> Result<()> {
     eprintln!("[lowlevel-chat] booted, listen_addr={}", pie.listen_addr);
 
     // Build the low-level chat inferlet (raw-WIT explicit run-ahead + rollback).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "lowlevel-chat"])
         .current_dir(&ws)

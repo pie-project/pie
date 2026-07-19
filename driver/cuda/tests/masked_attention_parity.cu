@@ -23,8 +23,7 @@
 
 #include <cuda_runtime.h>
 
-#include "attention_workspace.hpp"
-#include "brle.hpp"
+#include "batch/brle.hpp"
 #include "ops/attention_flashinfer.hpp"
 
 #include "masked_attention_reference.hpp"
@@ -97,8 +96,11 @@ bool run_case(const Case& c, float tol) {
     for (int p = 0; p < pages; ++p) kv_page_indices_h[p] = static_cast<std::uint32_t>(p);
 
     // 1. Decode the BRLE through the real driver decoder; sanity-check vs intent.
+    const auto packed = pie_attn_ref::pack_brle_rows(
+        c.brle, c.mask_indptr, c.qo_len, c.kv_len);
     DecodedMasks dm = pie_cuda_driver::brle::decode(
-        c.brle, c.mask_indptr, qo_indptr_h, kv_page_indptr_h, kv_last_page_lens_h, PAGE);
+        packed.words, packed.indptr, qo_indptr_h, kv_page_indptr_h,
+        kv_last_page_lens_h, PAGE);
     auto decoded = unpack(dm, c.qo_len, c.kv_len);
     for (std::size_t i = 0; i < decoded.size(); ++i) {
         if ((decoded[i] != 0) != (c.want[i] != 0)) {
@@ -169,16 +171,34 @@ bool run_case(const Case& c, float tol) {
     RT(cudaMemcpy(d_mask, dm.packed.data(), dm.packed.size(), cudaMemcpyHostToDevice));
     RT(cudaMemcpy(d_mip, dm.mask_indptr.data(), dm.mask_indptr.size()*4, cudaMemcpyHostToDevice));
 
-    // 5. Workspace + the production masked kernel.
+    // 5. Plan outside capture, then capture/replay the production masked
+    // dispatch twice. This is the serving path: persistent mask pointers and a
+    // cached prefill plan, with no host planner work in the graph body.
     auto ws = AttentionWorkspace::allocate(128ull*1024*1024, 16ull*1024*1024);
-    pie_cuda_driver::ops::launch_attention_flashinfer_prefill_custom_bf16(
-        d_q, d_k, d_v, d_o,
-        d_qo, d_kpi, d_kpp, d_klpl,
-        d_mask, d_mip,
-        qo_indptr_h.data(), kv_page_indptr_h.data(),
-        tokens, /*num_requests=*/1, HQ, HKV, D, PAGE,
-        ws, /*stream=*/nullptr);
+    auto plan = pie_cuda_driver::ops::make_prefill_plan();
+    pie_cuda_driver::ops::plan_attention_flashinfer_prefill_bf16(
+        *plan, qo_indptr_h.data(), kv_page_indptr_h.data(),
+        kv_last_page_lens_h.data(), tokens, /*num_requests=*/1,
+        HQ, HKV, D, PAGE, ws, /*stream=*/nullptr,
+        /*enable_cuda_graph=*/true, /*window_left=*/-1,
+        /*full_attention_variant=*/false, /*hnd_layout=*/false,
+        /*causal_mask=*/false, /*custom_mask=*/true);
     RT(cudaDeviceSynchronize());
+
+    cudaStream_t graph_stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    RT(cudaStreamCreateWithFlags(&graph_stream, cudaStreamNonBlocking));
+    RT(cudaStreamBeginCapture(
+        graph_stream, cudaStreamCaptureModeThreadLocal));
+    pie_cuda_driver::ops::dispatch_attention_flashinfer_prefill_custom_bf16(
+        *plan, d_q, d_k, d_v, d_o, d_qo, d_kpi, d_kpp, d_klpl,
+        d_mask, d_mip, ws, graph_stream);
+    RT(cudaStreamEndCapture(graph_stream, &graph));
+    RT(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+    RT(cudaGraphLaunch(graph_exec, graph_stream));
+    RT(cudaGraphLaunch(graph_exec, graph_stream));
+    RT(cudaStreamSynchronize(graph_stream));
 
     // 6. Download, compare.
     std::vector<std::uint16_t> o_bf(static_cast<std::size_t>(tokens)*HQ*D);
@@ -187,6 +207,9 @@ bool run_case(const Case& c, float tol) {
     for (std::size_t i = 0; i < o_bf.size(); ++i) dev[i] = bf16_to_f32(o_bf[i]);
     const float diff = pie_attn_ref::max_abs_diff(dev, ref);
 
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(graph_stream);
     cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o); cudaFree(d_qo);
     cudaFree(d_kpi); cudaFree(d_kpp); cudaFree(d_klpl); cudaFree(d_mask); cudaFree(d_mip);
 
@@ -224,7 +247,10 @@ void beam_microbench() {
     // Full-KV BRLE per lane (attend all KVLEN): {0, KVLEN} per row.
     std::vector<std::uint32_t> brle(2 * B), mip(B + 1, 0);
     for (int r = 0; r < B; ++r) { brle[2*r] = 0; brle[2*r+1] = KVLEN; mip[r+1] = mip[r] + 2; }
-    DecodedMasks dm = pie_cuda_driver::brle::decode(brle, mip, qo_h, kvpp_h, klpl_h, PG);
+    const auto packed = pie_attn_ref::pack_brle_rows(
+        brle, mip, B, KVLEN);
+    DecodedMasks dm = pie_cuda_driver::brle::decode(
+        packed.words, packed.indptr, qo_h, kvpp_h, klpl_h, PG);
 
     std::mt19937_64 rng(7);
     std::uniform_real_distribution<float> u(-1.f, 1.f);

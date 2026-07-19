@@ -33,12 +33,16 @@ use pie_driver_abi::capabilities::DriverCapabilities;
 /// What stage of inference a worker serves. Declared once at registration and
 /// immutable thereafter (a worker re-registers to change role).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     /// Consumes prompt tokens and produces the initial KV state.
+    #[serde(alias = "Prefill")]
     Prefill,
     /// Consumes KV state and produces output tokens step by step.
+    #[serde(alias = "Decode")]
     Decode,
     /// Encodes non-text modalities (image / audio) into embeddings.
+    #[serde(alias = "Encode")]
     Encode,
 }
 
@@ -49,6 +53,21 @@ impl std::fmt::Display for Role {
             Role::Decode => "decode",
             Role::Encode => "encode",
         })
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "prefill" => Ok(Self::Prefill),
+            "decode" => Ok(Self::Decode),
+            "encode" => Ok(Self::Encode),
+            other => Err(format!(
+                "invalid worker role {other:?}; expected decode, prefill, or encode"
+            )),
+        }
     }
 }
 
@@ -217,6 +236,22 @@ pub trait Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_parses_cli_spelling() {
+        assert_eq!("decode".parse::<Role>().unwrap(), Role::Decode);
+        assert_eq!("PREFILL".parse::<Role>().unwrap(), Role::Prefill);
+        assert_eq!("encode".parse::<Role>().unwrap(), Role::Encode);
+        assert!("worker".parse::<Role>().is_err());
+        assert_eq!(
+            serde_json::from_str::<Role>("\"Decode\"").unwrap(),
+            Role::Decode
+        );
+        assert_eq!(
+            serde_json::from_str::<Role>("\"prefill\"").unwrap(),
+            Role::Prefill
+        );
+    }
 
     #[test]
     fn routing_table_serde_round_trip() {

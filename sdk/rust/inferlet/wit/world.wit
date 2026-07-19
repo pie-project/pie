@@ -13,7 +13,6 @@ world inferlet {
     import reasoning;
     import media;
     import speech;
-    import messaging;
     import session;
     import system;
 

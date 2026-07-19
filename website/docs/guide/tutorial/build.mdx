@@ -81,10 +81,10 @@ lto = true
 </TabItem>
 <TabItem value="python" label="Python">
 
-`bakery create` does not ship a Python template today. Copy [`inferlets/python-example`](https://github.com/pie-project/pie/tree/main/inferlets/python-example) as a starting point and rename:
+`bakery create` does not ship a Python template today, so create the project directory manually:
 
 ```bash
-cp -r inferlets/python-example research-agent
+mkdir research-agent
 cd research-agent
 ```
 
@@ -99,7 +99,7 @@ requires-python = ">=3.10"
 dependencies = ["requests"]
 ```
 
-The Python template's `Pie.toml` already declares the `[runtime]` block (including `python-runtime`).
+Create `Pie.toml` with the manifest shown below and add `python-runtime` to its `[runtime]` block.
 
 </TabItem>
 <TabItem value="js" label="JavaScript">
@@ -132,7 +132,7 @@ core = "^0.2.0"
 question = { type = "string", description = "The question to research" }
 ```
 
-The Python tab adds `python-runtime = "^0.4.0"` to `[runtime]`. Bakery does not scaffold Python projects yet; copy `inferlets/python-example` as a starting point and keep that runtime entry in `Pie.toml`.
+The Python tab adds `python-runtime = "^0.4.0"` to `[runtime]`. Bakery does not scaffold Python projects yet, so keep that runtime entry in the hand-authored `Pie.toml`.
 
 ## The program
 

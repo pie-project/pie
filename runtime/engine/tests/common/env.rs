@@ -6,9 +6,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use pie_engine::bootstrap::{
-    AuthConfig, Config, DriverConfig, ModelConfig, RuntimeConfig, SchedulerConfig, TelemetryConfig,
+    Config, DriverConfig, ModelConfig, RuntimeConfig, SchedulerConfig, TelemetryConfig,
 };
-use pie_engine::driver::{NativeDriver, SchedulerLimits};
+use pie_engine::driver::{DriverBackend, SchedulerLimits};
 
 use super::mock_device::{Behavior, MockBackend, launch_observer};
 
@@ -21,8 +21,8 @@ use super::mock_device::{Behavior, MockBackend, launch_observer};
 /// PTIR program at bind.
 fn fixture_vocab_size() -> u32 {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/fixtures");
-    let cfg = std::fs::read_to_string(fixtures.join("config.json"))
-        .expect("read fixture config.json");
+    let cfg =
+        std::fs::read_to_string(fixtures.join("config.json")).expect("read fixture config.json");
     let cfg: serde_json::Value = serde_json::from_str(&cfg).expect("parse fixture config.json");
     match cfg.get("vocab_size").and_then(|v| v.as_u64()) {
         Some(v) => v as u32,
@@ -35,15 +35,15 @@ fn fixture_vocab_size() -> u32 {
     }
 }
 
-fn native_dummy_driver(
+fn dummy_driver_backend(
     num_pages: usize,
     behavior: Arc<dyn Behavior>,
     operation_log: Arc<std::sync::Mutex<Vec<String>>>,
-) -> NativeDriver {
-    let (native, _) = NativeDriver::dummy(pie_driver_dummy_lib::DummyDriverOptions {
+) -> DriverBackend {
+    let (backend, _) = DriverBackend::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_pages as u32,
         kv_page_size: 16,
-        swap_pool_size: 0,
+        swap_pool_size: (num_pages * 4) as u32,
         vocab_size: fixture_vocab_size(),
         max_model_len: 8192,
         arch_name: "test-dummy".into(),
@@ -52,15 +52,22 @@ fn native_dummy_driver(
         max_forward_tokens: 4096,
         max_forward_requests: 32,
         max_page_refs: num_pages.max(1) as u32,
+        has_mtp_logits: true,
+        has_mtp_drafts: true,
+        has_value_head: true,
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
+        retry_launches_remaining: 0,
+        elastic_admission: false,
+        prepare_exhaustions_remaining: 0,
+        prepare_impossible_above_kv_pages: 0,
         operation_log: Some(operation_log),
         launch_observer: Some(launch_observer(behavior)),
     })
-    .expect("create dummy native driver");
-    native
+    .expect("create dummy driver backend");
+    backend
 }
 
 pub struct MockEnv {
@@ -70,9 +77,9 @@ pub struct MockEnv {
     num_pages: usize,
     behavior: Arc<dyn Behavior>,
     temp_cache: TempDir,
-    temp_auth: TempDir,
     /// Dummy-driver operation log (shared across every device driver): op
-    /// names plus `launch-shape tokens=N programs=P` entries for geometry
+    /// names plus `launch-shape tokens=N programs=P per=[..]` entries (batch
+    /// totals plus per-program token spans) for geometry
     /// assertions.
     operation_log: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -92,15 +99,26 @@ impl MockEnv {
             .map(|_| DriverConfig {
                 total_pages: self.num_pages,
                 cpu_pages: self.num_pages * 4,
+                kv_copy_domain_mask: pie_driver_abi::KV_COPY_DEVICE_TO_DEVICE
+                    | pie_driver_abi::KV_COPY_DEVICE_TO_HOST
+                    | pie_driver_abi::KV_COPY_HOST_TO_DEVICE
+                    | pie_driver_abi::KV_COPY_HOST_TO_HOST,
+                backend_kind: "dummy".to_string(),
                 rs_cache_required: false,
                 rs_cache_slots: 0,
                 rs_cache_slot_bytes: 0,
+                elastic_page_bytes: 0,
+                elastic_budget_pages: 0,
+                has_mtp_logits: true,
+                has_mtp_drafts: true,
+                has_value_head: true,
+                device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
                 limits: SchedulerLimits {
                     max_forward_requests: 32,
                     max_forward_tokens: 4096,
                     max_page_refs: self.num_pages,
                 },
-                native_driver: native_dummy_driver(
+                driver_backend: dummy_driver_backend(
                     self.num_pages,
                     self.behavior.clone(),
                     Arc::clone(&self.operation_log),
@@ -111,10 +129,6 @@ impl MockEnv {
         Config {
             host: "127.0.0.1".into(),
             port: 0,
-            auth: AuthConfig {
-                enabled: false,
-                authorized_users_dir: self.temp_auth.path().to_path_buf(),
-            },
             cache_dir: self.temp_cache.path().to_path_buf(),
             verbose: false,
             log_dir: None,
@@ -146,6 +160,7 @@ impl MockEnv {
                 allow_network: false,
                 network_allowed_hosts: vec![],
                 max_upload_mb: 256,
+                py_runtime_dir: self.temp_cache.path().join("py-runtime"),
             },
             skip_tracing: true,
             max_concurrent_processes: None,
@@ -173,7 +188,6 @@ pub fn create_mock_env(
         num_pages,
         behavior,
         temp_cache: TempDir::new().expect("Failed to create temp cache dir"),
-        temp_auth: TempDir::new().expect("Failed to create temp auth dir"),
         operation_log,
     }
 }

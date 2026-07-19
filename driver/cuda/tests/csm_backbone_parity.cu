@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include "model/csm_backbone_forward.cu"  // backbone forward + kernels under test
+#include "model/csm/csm_backbone_forward.cu"  // backbone forward + kernels under test
 
 using namespace pie_cuda_driver::model;
 using BF = __nv_bfloat16;

@@ -36,12 +36,10 @@ fn cuda_native_text_and_device_geometry_decode() {
 
         // (4) Exercise the PTIR device-geometry wire form: all model geometry is
         // loop-carried through channels while the borrowed launch slices stay empty.
-        let device_geometry = common::spawn_inferlet(
-            "windowed-attention",
-            r#"{"max_tokens":2,"window_size":2}"#,
-        )
-        .await
-        .expect("device-geometry inferlet errored on cuda");
+        let device_geometry =
+            common::spawn_inferlet("windowed-attention", r#"{"max_tokens":2,"window_size":2}"#)
+                .await
+                .expect("device-geometry inferlet errored on cuda");
         eprintln!("[cuda_forward] DEVICE_GEOMETRY = {device_geometry:?}");
         assert!(
             device_geometry.starts_with("WINDOWED_ATTENTION"),

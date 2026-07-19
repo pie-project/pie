@@ -9,7 +9,7 @@
 #include <utility>
 
 #include "cuda_check.hpp"
-#include "custom_all_reduce.hpp"
+#include "kernels/custom_all_reduce.hpp"
 
 namespace pie_cuda_driver {
 

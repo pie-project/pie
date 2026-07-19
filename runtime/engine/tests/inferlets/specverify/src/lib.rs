@@ -39,14 +39,9 @@
 //! JSON input: `{"k": 4}` (draft-window size, default 4, min 2).
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, serde_json, Result};
+use inferlet::{Result, model as wit_model, serde_json};
 
 const PAGE_T: u32 = 16; // tokens per KV page (mock env page size)
-const NUM_LAYERS: u32 = 1;
-
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
 
 /// Host recompute of the spec-verify DAG (the golden accept-prefix): accept
 /// `draft[r]` while every row `0..=r` matched `target`, `-1` from the first
@@ -69,11 +64,7 @@ fn expected_verdict(target: &[i32], draft: &[i32]) -> Vec<i32> {
 /// read-out rows `l-1 .. l-1+k`, epilogue = per-row `argmax` (probe) + the
 /// spec-verify DAG over the seeded `[k]` draft. Returns
 /// `(target [k], verdict [k])` off the two bound reader channels.
-fn verify_window(
-    prompt: &[u32],
-    k: u32,
-    draft: &[i32],
-) -> Result<(Vec<i32>, Vec<i32>)> {
+async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32>, Vec<i32>)> {
     let l = prompt.len() as u32;
     let n = l + k - 1;
     let input_toks: Vec<i32> = prompt
@@ -82,25 +73,46 @@ fn verify_window(
         .chain(std::iter::repeat(0).take((k - 1) as usize))
         .collect();
 
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
-    ws.reserve(n.div_ceil(PAGE_T))
+    let ws = WorkingSet::new();
+    let max_pages = n.div_ceil(PAGE_T);
+    ws.reserve(max_pages)
         .map_err(|e| format!("ws.reserve: {e}"))?;
 
     // Seeded inputs (single fire: the host geometry prefill reads seeds) +
     // terminal [k]-Token reader outputs.
-    let toks = bx(Channel::from(input_toks).named("toks"));
-    let klen = bx(Channel::from(vec![n]).named("klen"));
-    let draft_ch = bx(Channel::from(draft.to_vec()).named("draft"));
-    let target_out = bx(Channel::new([k], dtype::i32).named("target_out"));
-    let verify_out = bx(Channel::new([k], dtype::i32).named("verify_out"));
+    let toks = Channel::from(input_toks).named("toks");
+    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
+    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("positions");
+    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
+    let w_slot =
+        Channel::from((0..n).map(|position| position / PAGE_T).collect::<Vec<_>>()).named("w_slot");
+    let w_off =
+        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>()).named("w_off");
+    let kv_len = Channel::from(vec![n]).named("kv_len");
+    let draft_ch = Channel::from(draft.to_vec()).named("draft");
+    let target_out = Channel::new([k], dtype::i32).named("target_out");
+    let verify_out = Channel::new([k], dtype::i32).named("verify_out");
 
     // k read-out rows ⇒ intrinsics::logits() declares [k, vocab].
     let readout: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
+    let readout = Channel::from(readout).named("readout");
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(toks, Tensor::constant(vec![0u32, n]));
-    fwd.attn_working_set(ws, klen);
-    fwd.readout(&Tensor::constant(readout));
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, &embed_indptr)?;
+    fwd.readout(&readout)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
     fwd.epilogue(move || {
         // Takes + compute first, PUTS last (value-id discipline).
         let d = draft_ch.take().tensor(); // [k] i32 submit draft
@@ -122,10 +134,12 @@ fn verify_window(
     let tgt = target_out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("target take: {e}"))?;
     let ver = verify_out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("verify take: {e}"))?;
     pipeline.close();
     Ok((tgt, ver))
@@ -133,11 +147,9 @@ fn verify_window(
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
-    let params: serde_json::Value =
-        serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+    let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let k: u32 = params.get("k").and_then(|v| v.as_u64()).unwrap_or(4).max(2) as u32;
     let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
 
     let mut prompt = wit_model::encode("The quick brown fox jumps over");
     if prompt.is_empty() {
@@ -148,7 +160,7 @@ async fn main(input: String) -> Result<String> {
     //    headline plus the value-exact DAG recompute against this window's own
     //    target. ──
     let draft_a: Vec<i32> = (1..=k as i32).collect();
-    let (target_a, verdict_a) = verify_window(&prompt, k, &draft_a)?;
+    let (target_a, verdict_a) = verify_window(&prompt, k, &draft_a).await?;
 
     // ── Window 2 (reject-mid-shaped): window 1's target with row j perturbed
     //    to a wrong, NONZERO token (≠ target_a[j]). On a stable-logits driver
@@ -159,7 +171,7 @@ async fn main(input: String) -> Result<String> {
     if let Some(x) = draft_b.get_mut(j) {
         *x = ((*x + 1).rem_euclid(vocab as i32)).max(1);
     }
-    let (target_b, verdict_b) = verify_window(&prompt, k, &draft_b)?;
+    let (target_b, verdict_b) = verify_window(&prompt, k, &draft_b).await?;
 
     // ── Verdicts ──
     let channel_emits_k = target_a.len() == k as usize

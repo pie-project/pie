@@ -1,12 +1,12 @@
 ---
 title: Structured output
-description: Grammar, JSON Schema, and template-driven generation
+description: JSON Schema constrained decoding
 sidebar_position: 4
 ---
 
 # Structured output
 
-Inferlets that constrain the model's output to a grammar, a JSON Schema, or a templated form. The same idea in three languages.
+Constrain model output against a runtime-supplied JSON Schema.
 
 :::note[Running on the dummy driver?]
 The dummy driver honors constraint masks, so these inferlets emit *in-grammar* / schema-valid output — but the *content* inside the structure (string field values, numbers) is uniform random. The structural assertions hold; semantic ones don't.
@@ -14,11 +14,7 @@ The dummy driver honors constraint masks, so these inferlets emit *in-grammar* /
 
 | Inferlet | What it shows |
 |---|---|
-| [`constrained-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/constrained-decoding) | Grammar-constrained decoding with a Lark grammar. |
-| [`json-schema-validation`](https://github.com/pie-project/pie/tree/main/inferlets/json-schema-validation) | JSON generation constrained against a runtime-string JSON schema. |
-| [`template-generation`](https://github.com/pie-project/pie/tree/main/inferlets/template-generation) | Grammar-constrained JSON merged with a Jinja2 template. |
-| [`python-constrained-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/python-constrained-decoding) | Same idea in Python. |
-| [`js-constrained-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/js-constrained-decoding) | Same idea in JavaScript. |
+| [`json-schema-constrained-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/json-schema-constrained-decoding) | Compile a JSON Schema, feed grammar masks into PTIR, and decode valid JSON. |
 
 ## Related guide
 

@@ -8,15 +8,17 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use pie_driver_abi::{
-    DriverCapabilities, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL, PIE_CHANNEL_DTYPE_F32,
-    PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
-    PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieChannelDesc,
-    PieChannelEndpointBinding, PieChannelValueDescSlice, PieCompletion, PieInstanceBinding,
-    PieInstanceDesc, PieKvCopyDesc, PieLaunchDesc, PiePoolResizeDesc, PieProgramDesc,
+    DeviceFacts, DriverCapabilities, ModelLoadDesc, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL,
+    PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
+    PIE_GEOMETRY_CLASS_DECODE_ENVELOPE, PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY,
+    PIE_GEOMETRY_CLASS_HOST, PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_RETRY,
+    PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieChannelDesc, PieChannelEndpointBinding,
+    PieChannelValueDescSlice, PieCompletion, PieEncodeDesc, PieInstanceBinding, PieInstanceDesc,
+    PieKvCopyDesc, PieLaunchDesc, PieLaunchPrepareResult, PiePoolResizeDesc, PieProgramDesc,
     PieRuntimeCallbacks, PieStateCopyDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice,
-    PieU64Slice, validate_channel_desc, validate_completion, validate_instance_desc,
-    validate_kv_copy_desc, validate_launch_desc, validate_pool_resize_desc, validate_program_desc,
-    validate_state_copy_desc,
+    PieU64Slice, validate_channel_desc, validate_completion, validate_encode_desc,
+    validate_instance_desc, validate_kv_copy_desc, validate_launch_desc, validate_pool_resize_desc,
+    validate_program_desc, validate_state_copy_desc,
 };
 use pie_ptir::container::{self, ExternDir, HostRole};
 use pie_ptir::interp::{
@@ -27,6 +29,10 @@ use pie_ptir::registry::{KernelInfo, ModelProfile};
 use pie_ptir::types::{DType, ValueType};
 use pie_ptir::validate::BoundTrace;
 
+pub mod kv_export;
+
+use kv_export::DummyKvExport;
+
 /// One accepted `launch`'s forward geometry, copied out of the descriptor into
 /// owned vectors (safe to hold past the call) for test probes.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +42,8 @@ pub struct LaunchObservation {
     pub kv_page_indices: Vec<u32>,
     pub kv_page_indptr: Vec<u32>,
     pub kv_last_page_lens: Vec<u32>,
+    pub kv_translation: Vec<u32>,
+    pub kv_translation_indptr: Vec<u32>,
 }
 
 /// Synchronous observer invoked on the launch path for every accepted launch
@@ -63,10 +71,19 @@ pub struct DummyDriverOptions {
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,
     pub max_page_refs: u32,
+    pub has_mtp_logits: bool,
+    pub has_mtp_drafts: bool,
+    pub has_value_head: bool,
     pub callback_delay_ms: u64,
     pub reject_launches: bool,
     pub reject_launches_remaining: u32,
     pub fail_launches_after_accept: bool,
+    pub retry_launches_remaining: u32,
+    pub elastic_admission: bool,
+    /// Deterministically return elastic exhaustion for this many preparations.
+    pub prepare_exhaustions_remaining: u32,
+    /// Nonzero hard KV high-water ceiling used by deterministic prepare tests.
+    pub prepare_impossible_above_kv_pages: u32,
     pub operation_log: Option<Arc<Mutex<Vec<String>>>>,
     pub launch_observer: Option<LaunchObserver>,
 }
@@ -85,10 +102,17 @@ impl Default for DummyDriverOptions {
             max_forward_tokens: 4096,
             max_forward_requests: 256,
             max_page_refs: 65_536,
+            has_mtp_logits: true,
+            has_mtp_drafts: true,
+            has_value_head: true,
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,
             fail_launches_after_accept: false,
+            retry_launches_remaining: 0,
+            elastic_admission: false,
+            prepare_exhaustions_remaining: 0,
+            prepare_impossible_above_kv_pages: 0,
             operation_log: None,
             launch_observer: None,
         }
@@ -135,13 +159,10 @@ struct DummyEndpoint {
     words: Box<[AtomicU64]>,
     attachments: HashMap<u64, Option<ExternDir>>,
     shared: Option<ExternChannel>,
-    /// Host-writer ring cursors (plan §4.3). `pulled` counts host-published
-    /// ring entries already fed into the interp; `reserved_head` counts ring
-    /// consumes scheduled by accepted fires (the head word publishes to it on
-    /// success); `seed_credit` covers a seeded Writer's bind-time seed, which
-    /// the first consuming fire takes instead of a ring entry.
+    /// Host-writer ring cursor. `pulled` counts host-published ring entries
+    /// already staged into the interpreter; actual head/tail words remain
+    /// commit-predicated and ticket-authoritative.
     pulled: u64,
-    reserved_head: u64,
     seed_credit: bool,
 }
 
@@ -173,19 +194,18 @@ struct OwnedValueDesc {
     bytes: Vec<u8>,
 }
 
-/// One writer-channel consume scheduled for an accepted fire: the dense
-/// channel index and the head-word value to publish when the fire commits.
-#[derive(Clone, Debug)]
-struct ScheduledConsume {
-    dense_channel: usize,
-    target_head: u64,
+#[derive(Clone, Copy, Debug, Default)]
+struct ChannelTicket {
+    expected_head: Option<u64>,
+    expected_tail: Option<u64>,
+    require_input: bool,
 }
 
 #[derive(Debug)]
 struct LaunchInstanceWork {
     instance: Arc<BoundInstanceState>,
     pacing_epoch: u64,
-    writer_consumes: Vec<ScheduledConsume>,
+    tickets: Vec<ChannelTicket>,
     terminal_cell: *mut PieTerminalCell,
 }
 
@@ -213,18 +233,36 @@ enum PreparedCallback {
 }
 
 pub struct DummyDriver {
+    device_facts: DeviceFacts,
     capabilities: DriverCapabilities,
+    load_storage: Option<pie_load_planner::host_executor::HostStorage>,
     state: Arc<Mutex<DummyState>>,
     next_program_id: AtomicU64,
     next_instance_id: AtomicU64,
     reject_launches: bool,
     reject_launches_remaining: u32,
     fail_launches_after_accept: bool,
+    retry_launches_remaining: u32,
+    elastic_admission: bool,
+    prepare_exhaustions_remaining: u32,
+    prepare_impossible_above_kv_pages: u32,
+    next_launch_lease_id: u64,
+    launch_leases: HashMap<u64, DummyLaunchLease>,
+    prepare_generation: u64,
     callback_delay_ms: u64,
     runtime: SendableRuntimeCallbacks,
     callback_workers: Vec<std::thread::JoinHandle<()>>,
     operation_log: Option<Arc<Mutex<Vec<String>>>>,
     launch_observer: Option<LaunchObserver>,
+    kv_export: DummyKvExport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DummyLaunchLease {
+    instance_ids: Vec<u64>,
+    logical_fire_ids: Vec<u64>,
+    token_ids: Vec<u32>,
+    required_kv_pages: u32,
 }
 
 impl DummyDriver {
@@ -237,6 +275,7 @@ impl DummyDriver {
     }
 
     pub fn with_runtime(options: DummyDriverOptions, runtime: PieRuntimeCallbacks) -> Self {
+        let kv_export = DummyKvExport::new(options.total_pages, options.kv_page_size);
         let state = Arc::new(Mutex::new(DummyState::default()));
         let operation_log = options.operation_log.clone();
         let runtime = SendableRuntimeCallbacks {
@@ -245,14 +284,40 @@ impl DummyDriver {
             operation_log: operation_log.clone(),
         };
         Self {
+            device_facts: DeviceFacts {
+                abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
+                backend: "dummy".to_string(),
+                unified_memory: true,
+                fp8_native: false,
+                native_mxfp4_moe: false,
+                storage_alignment: std::mem::align_of::<usize>() as u32,
+                storage_max_tile_bytes: 64 * 1024 * 1024,
+                storage_tile_map_mask: pie_load_planner::load_plan::HOST_TILE_MAP_MASK,
+                page_size: 1,
+            },
             capabilities: DriverCapabilities {
                 abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
                 total_pages: options.total_pages,
                 kv_page_size: options.kv_page_size,
                 swap_pool_size: options.swap_pool_size,
+                kv_copy_domain_mask: if options.swap_pool_size > 0 {
+                    pie_driver_abi::KV_COPY_DEVICE_TO_DEVICE
+                        | pie_driver_abi::KV_COPY_DEVICE_TO_HOST
+                        | pie_driver_abi::KV_COPY_HOST_TO_DEVICE
+                        | pie_driver_abi::KV_COPY_HOST_TO_HOST
+                } else {
+                    pie_driver_abi::KV_COPY_DEVICE_TO_DEVICE
+                },
                 rs_cache_required: false,
                 rs_cache_slots: 0,
                 rs_cache_slot_bytes: 0,
+                elastic_page_bytes: 0,
+                elastic_budget_pages: 0,
+                has_mtp_logits: options.has_mtp_logits,
+                has_mtp_drafts: options.has_mtp_drafts,
+                has_value_head: options.has_value_head,
+                device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
+                    | pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
                 max_forward_tokens: options.max_forward_tokens,
                 max_forward_requests: options.max_forward_requests,
                 max_page_refs: options.max_page_refs,
@@ -260,25 +325,40 @@ impl DummyDriver {
                 vocab_size: options.vocab_size,
                 max_model_len: options.max_model_len,
                 activation_dtype: options.activation_dtype,
+                hidden_size: 1,
+                supports_media_encode: true,
                 snapshot_dir: options.snapshot_dir,
-                storage_backend: String::new(),
-                max_tile_bytes: 0,
-                preferred_alignment: 0,
-                mxfp4_moe_policy: String::new(),
-                native_mxfp4_moe: false,
+                kv_handle: None,
             },
+            load_storage: None,
             state,
             next_program_id: AtomicU64::new(1),
             next_instance_id: AtomicU64::new(1),
             reject_launches: options.reject_launches,
             reject_launches_remaining: options.reject_launches_remaining,
             fail_launches_after_accept: options.fail_launches_after_accept,
+            retry_launches_remaining: options.retry_launches_remaining,
+            elastic_admission: options.elastic_admission,
+            prepare_exhaustions_remaining: options.prepare_exhaustions_remaining,
+            prepare_impossible_above_kv_pages: options.prepare_impossible_above_kv_pages,
+            next_launch_lease_id: 1,
+            launch_leases: HashMap::new(),
+            prepare_generation: 1,
             callback_delay_ms: options.callback_delay_ms,
             runtime,
             callback_workers: Vec::new(),
             operation_log,
             launch_observer: options.launch_observer,
+            kv_export,
         }
+    }
+
+    pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
+        pie_driver_abi::KvExport::export_kv_handle(&self.kv_export)
+    }
+
+    pub fn supports_elastic_admission(&self) -> bool {
+        self.elastic_admission
     }
 
     fn record_op(&self, name: &str) {
@@ -348,6 +428,29 @@ impl DummyDriver {
         &self.capabilities
     }
 
+    pub fn device_facts(&self) -> &DeviceFacts {
+        &self.device_facts
+    }
+
+    pub fn load_model(&mut self, desc: &ModelLoadDesc) -> Result<DriverCapabilities> {
+        ensure!(self.load_storage.is_none(), "dummy model is already loaded");
+        ensure!(
+            desc.compiler_version == pie_load_planner::load_plan::compiler_version(),
+            "dummy compiler version mismatch"
+        );
+        self.record_op("load_model");
+        let storage = pie_load_planner::host_executor::execute_serialized_plan(
+            &desc.load_plan_bytes,
+            &desc.snapshot_dir,
+        )
+        .map_err(|err| anyhow!("dummy LoadPlan execution failed: {err}"))?;
+        self.capabilities.snapshot_dir = desc.snapshot_dir.display().to_string();
+        self.capabilities.supports_media_encode =
+            desc.component != pie_driver_abi::ModelComponent::Text;
+        self.load_storage = Some(storage);
+        Ok(self.capabilities.clone())
+    }
+
     pub fn register_program(&mut self, desc: &PieProgramDesc) -> Result<u64> {
         validate_program_desc(desc).map_err(|err| anyhow!(err))?;
         ensure_abi(desc.abi_version)?;
@@ -368,14 +471,13 @@ impl DummyDriver {
         }
         let container = container::decode(&canonical_bytes)
             .map_err(|err| anyhow!("program decode failed: {err}"))?;
-        let bound = pie_ptir::validate::bind(container, self.model_profile())
-            .map_err(|err| {
-                anyhow!(
-                    "program bind failed: {err} (profile: vocab={}, page_size={})",
-                    self.model_profile().vocab,
-                    self.model_profile().page_size
-                )
-            })?;
+        let bound = pie_ptir::validate::bind(container, self.model_profile()).map_err(|err| {
+            anyhow!(
+                "program bind failed: {err} (profile: vocab={}, page_size={})",
+                self.model_profile().vocab,
+                self.model_profile().page_size
+            )
+        })?;
         let program = Arc::new(DummyProgram {
             hash,
             intrinsics: collect_intrinsics(&bound),
@@ -422,13 +524,18 @@ impl DummyDriver {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             pulled: 0,
-            reserved_head: 0,
             seed_credit: desc.seeded != 0
                 && desc.host_role == pie_driver_abi::PIE_CHANNEL_HOST_ROLE_WRITER,
             attachments: HashMap::new(),
-            shared: if desc.extern_dir == PIE_CHANNEL_EXTERN_NONE {
-                None
-            } else {
+            // A ring exists for every channel that can legally be shared
+            // across instances: extern-declared channels AND chainable
+            // device-only private channels (R4-4 cross-pass chaining — no
+            // host role, unseeded). Single-attachment channels keep their
+            // instance-local interpreter ring.
+            shared: if desc.extern_dir != PIE_CHANNEL_EXTERN_NONE
+                || (desc.host_role == pie_driver_abi::PIE_CHANNEL_HOST_ROLE_NONE
+                    && desc.seeded == 0)
+            {
                 let dtype = channel_program_dtype(desc.dtype)?;
                 let shape = pie_ptir::types::Shape::new(&shape)
                     .ok_or_else(|| anyhow!("channel shape rank is unsupported"))?;
@@ -436,6 +543,8 @@ impl DummyDriver {
                     ValueType::new(shape, dtype),
                     desc.capacity,
                 ))
+            } else {
+                None
             },
         };
         let binding = endpoint_binding(&endpoint);
@@ -458,6 +567,16 @@ impl DummyDriver {
         ensure!(
             desc.pacing_wait_id != 0,
             "bind requires a nonzero pacing wait id"
+        );
+        ensure!(
+            matches!(
+                desc.geometry_class,
+                PIE_GEOMETRY_CLASS_HOST
+                    | PIE_GEOMETRY_CLASS_DECODE_ENVELOPE
+                    | PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY
+            ),
+            "dummy driver does not support geometry class {}",
+            desc.geometry_class
         );
         let channel_ids = copy_u64_slice(desc.channel_ids, "instance.channel_ids")?;
         ensure!(
@@ -493,6 +612,7 @@ impl DummyDriver {
             .collect::<Result<Vec<_>>>()?;
 
         let mut externs = Vec::new();
+        let mut shared_rings = Vec::new();
         for (dense, (decl, endpoint)) in program
             .bound
             .container
@@ -517,6 +637,12 @@ impl DummyDriver {
                         .clone()
                         .ok_or_else(|| anyhow!("extern channel has no shared ring"))?,
                 ));
+            } else if let Some(ring) = endpoint.shared.clone() {
+                // Chainable device-only private channel: every instance
+                // binding this endpoint operates on the one registered ring
+                // (R4-4 cross-pass chaining — the producer pass's put is
+                // visible to the consumer pass's take).
+                shared_rings.push((dense as u32, ring));
             }
         }
 
@@ -546,8 +672,9 @@ impl DummyDriver {
                 Ok((dense as u32, value))
             })
             .collect::<Result<Vec<_>>>()?;
-        let interp = InterpInstance::new_with_externs(&program.bound, &seeds, &externs)
-            .map_err(|err| anyhow!("instance bind failed: {err:?}"))?;
+        let interp =
+            InterpInstance::new_with_shared_rings(&program.bound, &seeds, &externs, &shared_rings)
+                .map_err(|err| anyhow!("instance bind failed: {err:?}"))?;
         let channels = program
             .bound
             .container
@@ -584,6 +711,14 @@ impl DummyDriver {
                 &bytes,
             )?;
         }
+        for (dense, _) in &seeds {
+            let role = program.bound.container.channels[*dense as usize].host_role;
+            let mut endpoint = endpoints[*dense as usize].lock().unwrap();
+            endpoint.words[1].store(1, Ordering::Release);
+            if role == HostRole::Writer {
+                endpoint.pulled = 1;
+            }
+        }
         for (dense, endpoint) in endpoints.iter().enumerate() {
             let extern_dir = program
                 .bound
@@ -600,10 +735,119 @@ impl DummyDriver {
         }
         let binding = PieInstanceBinding {
             instance_id,
+            geometry_class: desc.geometry_class,
             ..PieInstanceBinding::default()
         };
         state.instances.insert(instance_id, instance);
         Ok(binding)
+    }
+
+    fn launch_lease_signature(&self, desc: &PieLaunchDesc) -> Result<DummyLaunchLease> {
+        let required_kv_pages = copy_u32_slice(desc.kv_page_indices, "launch.kv_page_indices")?
+            .into_iter()
+            .chain(copy_u32_slice(
+                desc.kv_translation,
+                "launch.kv_translation",
+            )?)
+            .map(|page| page.saturating_add(1))
+            .fold(desc.required_kv_pages, u32::max);
+        Ok(DummyLaunchLease {
+            instance_ids: copy_u64_slice(desc.instance_ids, "launch.instance_ids")?,
+            logical_fire_ids: copy_u64_slice(desc.logical_fire_ids, "launch.logical_fire_ids")?,
+            token_ids: copy_u32_slice(desc.token_ids, "launch.token_ids")?,
+            required_kv_pages,
+        })
+    }
+
+    pub fn prepare_launch(&mut self, desc: &PieLaunchDesc) -> Result<PieLaunchPrepareResult> {
+        unsafe { validate_launch_desc(desc) }.map_err(|err| anyhow!(err))?;
+        ensure_abi(desc.abi_version)?;
+        let signature = self.launch_lease_signature(desc)?;
+        ensure!(
+            !signature.instance_ids.is_empty(),
+            "launch preparation requires at least one bound instance"
+        );
+        {
+            let state = self.state.lock().unwrap();
+            ensure!(
+                signature
+                    .instance_ids
+                    .iter()
+                    .all(|instance_id| state.instances.contains_key(instance_id)),
+                "launch preparation contains an unknown instance"
+            );
+        }
+        let budget_pages = u64::from(if self.prepare_impossible_above_kv_pages == 0 {
+            self.capabilities.total_pages
+        } else {
+            self.prepare_impossible_above_kv_pages
+        });
+        let required_pages = u64::from(signature.required_kv_pages);
+        if self.prepare_impossible_above_kv_pages != 0
+            && signature.required_kv_pages > self.prepare_impossible_above_kv_pages
+        {
+            self.record_op("prepare_launch-impossible");
+            return Ok(PieLaunchPrepareResult {
+                outcome: pie_driver_abi::PIE_LAUNCH_PREPARE_IMPOSSIBLE,
+                budget_generation: self.prepare_generation,
+                required_pages,
+                budget_pages,
+                ..PieLaunchPrepareResult::default()
+            });
+        }
+        if self.prepare_exhaustions_remaining != 0 {
+            self.prepare_exhaustions_remaining -= 1;
+            self.prepare_generation = self.prepare_generation.saturating_add(1);
+            self.record_op("prepare_launch-exhausted");
+            return Ok(PieLaunchPrepareResult {
+                outcome: pie_driver_abi::PIE_LAUNCH_PREPARE_EXHAUSTED,
+                budget_generation: self.prepare_generation,
+                required_pages,
+                budget_pages,
+                ..PieLaunchPrepareResult::default()
+            });
+        }
+        let lease_id = self.next_launch_lease_id;
+        ensure!(lease_id != 0, "dummy launch lease id space exhausted");
+        self.next_launch_lease_id = self
+            .next_launch_lease_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("dummy launch lease id space exhausted"))?;
+        self.launch_leases.insert(lease_id, signature);
+        self.record_op("prepare_launch-ready");
+        Ok(PieLaunchPrepareResult {
+            outcome: pie_driver_abi::PIE_LAUNCH_PREPARE_READY,
+            lease_id,
+            budget_generation: self.prepare_generation,
+            required_pages,
+            budget_pages,
+            ..PieLaunchPrepareResult::default()
+        })
+    }
+
+    pub fn launch_prepared(
+        &mut self,
+        desc: &PieLaunchDesc,
+        lease_id: u64,
+        completion: PieCompletion,
+    ) -> Result<()> {
+        let expected = self
+            .launch_leases
+            .remove(&lease_id)
+            .ok_or_else(|| anyhow!("unknown or consumed launch lease {lease_id}"))?;
+        let actual = self.launch_lease_signature(desc)?;
+        ensure!(actual == expected, "prepared launch descriptor changed");
+        self.record_op("launch_prepared");
+        self.launch(desc, completion)
+    }
+
+    pub fn release_launch(&mut self, lease_id: u64) -> Result<()> {
+        ensure!(
+            self.launch_leases.remove(&lease_id).is_some(),
+            "unknown or consumed launch lease {lease_id}"
+        );
+        self.record_op("release_launch");
+        Ok(())
     }
 
     pub fn launch(&mut self, desc: &PieLaunchDesc, completion: PieCompletion) -> Result<()> {
@@ -611,14 +855,34 @@ impl DummyDriver {
         ensure_abi(desc.abi_version)?;
         self.record_op("launch");
         // Shape trace for tests that assert on launch geometry (e.g. the
-        // prefix-cache trim). Extra entry — existing "launch" filters keep
+        // prefix-cache trim). `per` carries PER-PROGRAM token counts: the
+        // wait-all quorum co-batches concurrently running pipelines into one
+        // launch, so a shape oracle must match its own program's span, never
+        // the batch total. Extra entry — existing "launch" filters keep
         // matching.
+        let per_program: Vec<u32> = {
+            let rows = copy_u32_slice(desc.ptir_program_row_indptr, "launch.program_row_indptr")?;
+            let qo = copy_u32_slice(desc.qo_indptr, "launch.qo_indptr")?;
+            if rows.len() >= 2 && rows.iter().all(|&row| (row as usize) < qo.len()) {
+                rows.windows(2)
+                    .map(|span| qo[span[1] as usize] - qo[span[0] as usize])
+                    .collect()
+            } else {
+                vec![desc.token_ids.len as u32]
+            }
+        };
         self.record_op(&format!(
-            "launch-shape tokens={} programs={}",
-            desc.token_ids.len, desc.instance_ids.len
+            "launch-shape tokens={} programs={} per={:?}",
+            desc.token_ids.len, desc.instance_ids.len, per_program
         ));
         let instance_ids = copy_u64_slice(desc.instance_ids, "launch.instance_ids")?;
         let terminal_cells = copy_terminal_cell_ptrs(desc.terminal_cells)?;
+        let ticket_heads =
+            copy_u64_slice(desc.channel_expected_head, "launch.channel_expected_head")?;
+        let ticket_tails =
+            copy_u64_slice(desc.channel_expected_tail, "launch.channel_expected_tail")?;
+        let ticket_indptr =
+            copy_u32_slice(desc.channel_ticket_indptr, "launch.channel_ticket_indptr")?;
         ensure!(
             !instance_ids.is_empty(),
             "launch requires at least one bound instance"
@@ -646,6 +910,11 @@ impl DummyDriver {
                     desc.kv_last_page_lens,
                     "launch.kv_last_page_lens",
                 )?,
+                kv_translation: copy_u32_slice(desc.kv_translation, "launch.kv_translation")?,
+                kv_translation_indptr: copy_u32_slice(
+                    desc.kv_translation_indptr,
+                    "launch.kv_translation_indptr",
+                )?,
             };
             (observer.0)(&observation);
         }
@@ -663,78 +932,37 @@ impl DummyDriver {
             .collect::<Result<Vec<_>>>()?;
         drop(state);
 
-        // §4.3: pull host-published writer ring entries into the interp, then
-        // validate availability for every launched instance BEFORE accepting
-        // anything — a missing put is a guest ordering bug and rejects the
-        // launch synchronously (no epoch consumed, no poison published).
-        let mut prepared = Vec::with_capacity(instances.len());
-        let mut planned_extra: HashMap<usize, u64> = HashMap::new();
-        let mut planned_seed_spend: HashSet<usize> = HashSet::new();
-        for (slot, instance) in instances.iter().enumerate() {
-            let mut inner = instance.inner.lock().unwrap();
-            ensure!(!inner.closed, "instance {} is closed", instance.instance_id);
-            let program = Arc::clone(&instance.program);
-            let mut consumes = Vec::new();
-            for dense in 0..inner.channels.len() {
-                let channel = inner.channels[dense].clone();
-                if channel.host_role != HostRole::Writer {
-                    continue;
-                }
-                pull_writer_ring(&mut inner, &program, dense, &channel)?;
-                if !fire_takes_channel(&program.bound, dense as u32) {
-                    continue;
-                }
-                let endpoint_key = Arc::as_ptr(&channel.endpoint) as usize;
-                let endpoint = channel.endpoint.lock().unwrap();
-                let tail = endpoint.words[1].load(Ordering::Acquire);
-                let extra = planned_extra.entry(endpoint_key).or_insert(0);
-                let credit = u64::from(
-                    endpoint.seed_credit && !planned_seed_spend.contains(&endpoint_key),
-                );
-                if tail.saturating_sub(endpoint.reserved_head + *extra) + credit < 1 {
-                    bail!(
-                        "channel {} has no host input for this fire \
-                         (put must happen before submit)",
-                        channel.global_id
-                    );
-                }
-                if credit == 1 {
-                    planned_seed_spend.insert(endpoint_key);
-                    consumes.push(ScheduledConsume {
-                        dense_channel: dense,
-                        target_head: endpoint.reserved_head + *extra,
-                    });
-                } else {
-                    *extra += 1;
-                    consumes.push(ScheduledConsume {
-                        dense_channel: dense,
-                        target_head: endpoint.reserved_head + *extra,
-                    });
-                }
+        if self.retry_launches_remaining != 0 {
+            self.retry_launches_remaining -= 1;
+            let callback = self.prepare_callback(completion)?;
+            for (instance, terminal_cell) in instances.iter().zip(&terminal_cells) {
+                instance.inner.lock().unwrap().next_pacing_epoch += 1;
+                publish_terminal(*terminal_cell, PIE_TERMINAL_OUTCOME_RETRY);
             }
+            self.publish_callback(callback, completion);
+            return Ok(());
+        }
+
+        let mut prepared = Vec::with_capacity(instances.len());
+        for (slot, instance) in instances.iter().enumerate() {
+            let inner = instance.inner.lock().unwrap();
+            ensure!(!inner.closed, "instance {} is closed", instance.instance_id);
+            let tickets = launch_tickets(
+                &inner,
+                &instance.program,
+                slot,
+                &ticket_heads,
+                &ticket_tails,
+                &ticket_indptr,
+            )?;
             let pacing_epoch = inner.next_pacing_epoch;
             drop(inner);
             prepared.push(LaunchInstanceWork {
                 instance: Arc::clone(instance),
                 pacing_epoch,
-                writer_consumes: consumes,
+                tickets,
                 terminal_cell: terminal_cells[slot],
             });
-        }
-        // Every member validated — commit the scheduled reservations.
-        for work in &prepared {
-            let inner = work.instance.inner.lock().unwrap();
-            for consume in &work.writer_consumes {
-                let mut endpoint = inner.channels[consume.dense_channel]
-                    .endpoint
-                    .lock()
-                    .unwrap();
-                if endpoint.seed_credit && consume.target_head == endpoint.reserved_head {
-                    endpoint.seed_credit = false;
-                } else {
-                    endpoint.reserved_head = consume.target_head;
-                }
-            }
         }
 
         let callback = self.prepare_callback(completion)?;
@@ -778,6 +1006,69 @@ impl DummyDriver {
                 desc.src_page_ids.len == 0 && desc.dst_page_ids.len == 0,
                 "copy_kv cells and whole-page lists are mutually exclusive"
             );
+        }
+        self.complete_noop(completion)
+    }
+
+    pub fn encode(&mut self, desc: &PieEncodeDesc, completion: PieCompletion) -> Result<()> {
+        unsafe { validate_encode_desc(desc) }.map_err(|err| anyhow!(err))?;
+        ensure_abi(desc.abi_version)?;
+        self.record_op("encode");
+        ensure_completion_mode(completion, true)?;
+
+        let images = desc.image_anchor_rows.len;
+        let clips = desc.audio_anchor_rows.len;
+        let media = images + clips;
+        let row_bytes = self.capabilities.hidden_size as usize * std::mem::size_of::<u16>();
+        ensure!(
+            desc.output_rows.len >= media.saturating_mul(row_bytes),
+            "encode output buffer is too small"
+        );
+        let pixel_indptr = if images == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(desc.image_pixel_indptr.ptr, images + 1) }
+        };
+        let audio_indptr = if clips == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(desc.audio_feature_indptr.ptr, clips + 1) }
+        };
+        let output =
+            unsafe { std::slice::from_raw_parts_mut(desc.output_rows.ptr, desc.output_rows.len) };
+        let output_indptr =
+            unsafe { std::slice::from_raw_parts_mut(desc.output_row_indptr.ptr, media + 1) };
+        output_indptr[0] = 0;
+        for image in 0..images {
+            let begin = pixel_indptr[image] as usize;
+            let end = pixel_indptr[image + 1] as usize;
+            let mut hash = 0x9e37_u16;
+            for byte in
+                unsafe { std::slice::from_raw_parts(desc.image_pixels.ptr.add(begin), end - begin) }
+            {
+                hash = hash.rotate_left(5) ^ u16::from(*byte);
+            }
+            for value in output[image * row_bytes..(image + 1) * row_bytes].chunks_exact_mut(2) {
+                value.copy_from_slice(&hash.to_le_bytes());
+            }
+            output_indptr[image + 1] = (image + 1) as u32;
+        }
+        for clip in 0..clips {
+            let begin = audio_indptr[clip] as usize;
+            let end = audio_indptr[clip + 1] as usize;
+            let mut hash = 0x7f4a_u16;
+            for byte in unsafe {
+                std::slice::from_raw_parts(desc.audio_features.ptr.add(begin), end - begin)
+            } {
+                hash = hash.rotate_left(5) ^ u16::from(*byte);
+            }
+            let media_index = images + clip;
+            for value in
+                output[media_index * row_bytes..(media_index + 1) * row_bytes].chunks_exact_mut(2)
+            {
+                value.copy_from_slice(&hash.to_le_bytes());
+            }
+            output_indptr[media_index + 1] = (media_index + 1) as u32;
         }
         self.complete_noop(completion)
     }
@@ -870,9 +1161,9 @@ impl DummyDriver {
             page_size: self.capabilities.kv_page_size,
             num_layers: 2,
             activation: DType::F32,
-            has_mtp_logits: true,
-            has_mtp_drafts: true,
-            has_value_head: true,
+            has_mtp_logits: self.capabilities.has_mtp_logits,
+            has_mtp_drafts: self.capabilities.has_mtp_drafts,
+            has_value_head: self.capabilities.has_value_head,
             kernels: vec![KernelInfo {
                 name: "boom".to_string(),
                 sink_scope: None,
@@ -897,21 +1188,46 @@ impl Drop for DummyDriver {
     }
 }
 
+enum InstanceStepResult {
+    Committed(Vec<(u64, u64)>),
+    Retry,
+}
+
 fn process_launch_instance(instance: &LaunchInstanceWork) -> LaunchInstanceResult {
     let mut notify_waits = Vec::new();
     let outcome = {
         let mut inner = instance.instance.inner.lock().unwrap();
+        if !tickets_ready(&inner, &instance.tickets) {
+            return LaunchInstanceResult {
+                outcome: PIE_TERMINAL_OUTCOME_RETRY,
+                notifications: Vec::new(),
+            };
+        }
+        for dense in 0..inner.channels.len() {
+            let channel = inner.channels[dense].clone();
+            if channel.host_role == HostRole::Writer
+                && let Err(err) =
+                    pull_writer_ring(&mut inner, &instance.instance.program, dense, &channel)
+            {
+                poison_instance(&mut inner, &mut notify_waits, &err.to_string());
+                return LaunchInstanceResult {
+                    outcome: PIE_TERMINAL_OUTCOME_FAILED,
+                    notifications: notify_waits,
+                };
+            }
+        }
         let outcome = match run_instance_step(
             &mut inner,
             &instance.instance.program,
             instance.instance.instance_id,
             instance.pacing_epoch,
-            &instance.writer_consumes,
+            &instance.tickets,
         ) {
-            Ok(reader_epochs) => {
+            Ok(InstanceStepResult::Committed(reader_epochs)) => {
                 notify_waits.extend(reader_epochs);
                 PIE_TERMINAL_OUTCOME_SUCCESS
             }
+            Ok(InstanceStepResult::Retry) => PIE_TERMINAL_OUTCOME_RETRY,
             Err(err) => {
                 eprintln!(
                     "[pie-driver-dummy] instance {} launch failed: {err:#}",
@@ -971,6 +1287,102 @@ fn fire_takes_channel(bound: &BoundTrace, dense: u32) -> bool {
     stage_take || port_take
 }
 
+fn fire_puts_channel(bound: &BoundTrace, dense: u32) -> bool {
+    bound.container.stages.iter().any(|stage| {
+        stage
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::ChanPut { chan, .. } if *chan == dense))
+    })
+}
+
+fn fire_requires_channel_input(bound: &BoundTrace, dense: u32) -> bool {
+    if bound
+        .container
+        .ports
+        .iter()
+        .any(|binding| matches!(binding.source, container::PortSource::Channel(c) if c == dense))
+    {
+        return true;
+    }
+    for stage in &bound.container.stages {
+        for op in &stage.ops {
+            match *op {
+                Op::ChanPut { chan, .. } if chan == dense => return false,
+                Op::ChanTake(chan) | Op::ChanRead(chan) if chan == dense => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+fn launch_tickets(
+    inner: &BoundInstanceInner,
+    program: &DummyProgram,
+    program_index: usize,
+    heads: &[u64],
+    tails: &[u64],
+    indptr: &[u32],
+) -> Result<Vec<ChannelTicket>> {
+    if !heads.is_empty() || !tails.is_empty() {
+        ensure!(
+            indptr.len() > program_index + 1,
+            "channel tickets require a per-program CSR"
+        );
+        let lo = indptr[program_index] as usize;
+        let hi = indptr[program_index + 1] as usize;
+        ensure!(
+            hi - lo == inner.channels.len(),
+            "channel ticket segment length {} does not match instance channel count {}",
+            hi - lo,
+            inner.channels.len()
+        );
+        return Ok(heads[lo..hi]
+            .iter()
+            .zip(&tails[lo..hi])
+            .enumerate()
+            .map(|(dense, (&head, &tail))| ChannelTicket {
+                expected_head: (head != u64::MAX).then_some(head),
+                expected_tail: (tail != u64::MAX).then_some(tail),
+                require_input: fire_requires_channel_input(&program.bound, dense as u32),
+            })
+            .collect());
+    }
+
+    Ok(inner
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(dense, channel)| {
+            let endpoint = channel.endpoint.lock().unwrap();
+            let consume = fire_takes_channel(&program.bound, dense as u32);
+            let publish = fire_puts_channel(&program.bound, dense as u32);
+            ChannelTicket {
+                expected_head: consume.then(|| endpoint.words[0].load(Ordering::Acquire)),
+                expected_tail: publish.then(|| endpoint.words[1].load(Ordering::Acquire)),
+                require_input: fire_requires_channel_input(&program.bound, dense as u32),
+            }
+        })
+        .collect())
+}
+
+fn tickets_ready(inner: &BoundInstanceInner, tickets: &[ChannelTicket]) -> bool {
+    inner.channels.iter().zip(tickets).all(|(channel, ticket)| {
+        let endpoint = channel.endpoint.lock().unwrap();
+        let head = endpoint.words[0].load(Ordering::Acquire);
+        let tail = endpoint.words[1].load(Ordering::Acquire);
+        let consume_ready = ticket.expected_head.is_none_or(|expected| head == expected)
+            && (!ticket.require_input || tail > head);
+        let publish_ready = ticket.expected_tail.is_none_or(|expected| {
+            let same_fire_consume = u64::from(ticket.expected_head.is_some());
+            tail == expected
+                && tail.saturating_sub(head) < u64::from(endpoint.capacity) + same_fire_consume
+        });
+        consume_ready && publish_ready
+    })
+}
+
 /// §4.3 driver pull: move host-published writer-ring entries (mirror cells up
 /// to the release-published tail word) into the interp's channel queue,
 /// advancing the endpoint's `pulled` cursor. Interp backpressure leaves the
@@ -1016,8 +1428,8 @@ fn run_instance_step(
     program: &DummyProgram,
     instance_id: u64,
     pacing_epoch: u64,
-    writer_consumes: &[ScheduledConsume],
-) -> Result<Vec<(u64, u64)>> {
+    tickets: &[ChannelTicket],
+) -> Result<InstanceStepResult> {
     let mut notify_waits = Vec::new();
     let pass_inputs = build_pass_inputs(
         &program.intrinsics,
@@ -1031,25 +1443,26 @@ fn run_instance_step(
         .step(&program.bound, &pass_inputs, &mut NoKernels)
         .map_err(|err| anyhow!("interp step failed: {}", format_step_error(&err)))?;
     if !report.committed {
-        bail!(
-            "accepted launch missed its readiness invariant{}",
-            report
-                .missed
-                .map(|(channel, phase)| format!(" at channel {channel}, phase {phase:?}"))
-                .unwrap_or_default()
-        );
+        return Ok(InstanceStepResult::Retry);
     }
-    // §4.4: publish the consumed head word per writer channel (release), then
-    // notify its writer wait slot with the new head — space became available.
-    for consume in writer_consumes {
-        let endpoint = inner.channels[consume.dense_channel]
-            .endpoint
-            .lock()
-            .unwrap();
-        let previous = endpoint.words[0].load(Ordering::Acquire);
-        if consume.target_head > previous {
-            endpoint.words[0].store(consume.target_head, Ordering::Release);
-            notify_waits.push((endpoint.writer_wait_id, consume.target_head));
+
+    for (dense, ticket) in tickets.iter().enumerate() {
+        let channel = &inner.channels[dense];
+        let mut endpoint = channel.endpoint.lock().unwrap();
+        if fire_takes_channel(&program.bound, dense as u32) && endpoint.seed_credit {
+            endpoint.seed_credit = false;
+        }
+        if let Some(expected) = ticket.expected_head {
+            let next = expected + 1;
+            endpoint.words[0].store(next, Ordering::Release);
+            if channel.host_role == HostRole::Writer {
+                notify_waits.push((endpoint.writer_wait_id, next));
+            }
+        }
+        if let Some(expected) = ticket.expected_tail
+            && channel.host_role == HostRole::None
+        {
+            endpoint.words[1].store(expected + 1, Ordering::Release);
         }
     }
 
@@ -1075,7 +1488,7 @@ fn run_instance_step(
             }
         }
     }
-    Ok(notify_waits)
+    Ok(InstanceStepResult::Committed(notify_waits))
 }
 
 fn poison_instance(
@@ -1234,8 +1647,15 @@ fn ensure_endpoint_matches_program(
         .find(|binding| binding.chan == dense as u32);
     match extern_decl {
         None => {
+            // Same-guest cross-pass chaining (R4-4): a DEVICE-ONLY private
+            // channel (no host role, unseeded) may attach to multiple
+            // instances — the shared ring is ordered by the pipeline FIFO
+            // (prefill→decode `tok_in` handoff). Host-visible or seeded
+            // channels keep the one-attachment rule.
+            let device_only =
+                endpoint.host_role == pie_ptir::container::HostRole::None as u8 && !endpoint.seeded;
             ensure!(
-                endpoint.extern_name.is_none() && endpoint.attachments.is_empty(),
+                endpoint.extern_name.is_none() && (endpoint.attachments.is_empty() || device_only),
                 "private channel {} is already attached",
                 endpoint.channel_id
             );
@@ -1454,8 +1874,8 @@ fn ensure_terminal_cell_pending(cell: *mut PieTerminalCell) -> Result<()> {
     Ok(())
 }
 
-fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<()> {
-    let _token_ids = copy_u32_slice(desc.token_ids, "launch.token_ids")?;
+fn validate_launch_shape(desc: &PieLaunchDesc, _instance_count: usize) -> Result<()> {
+    let token_ids = copy_u32_slice(desc.token_ids, "launch.token_ids")?;
     let kv_page_indices = copy_u32_slice(desc.kv_page_indices, "launch.kv_page_indices")?;
     let kv_page_indptr = copy_u32_slice(desc.kv_page_indptr, "launch.kv_page_indptr")?;
     let kv_last_page_lens = copy_u32_slice(desc.kv_last_page_lens, "launch.kv_last_page_lens")?;
@@ -1480,26 +1900,24 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
     let mask_request = copy_u32_slice(desc.masks.request_indptr, "launch.masks.request_indptr")?;
     let mask_word = copy_u32_slice(desc.masks.word_indptr, "launch.masks.word_indptr")?;
     let mask_words = copy_u32_slice(desc.masks.words, "launch.masks.words")?;
+    let row_count = qo_indptr.len().saturating_sub(1);
 
     if !kv_page_indptr.is_empty() || !kv_page_indices.is_empty() {
         validate_indptr(
             &kv_page_indptr,
             kv_page_indices.len(),
-            instance_count,
+            row_count,
             "launch.kv_page_indptr",
         )?;
     }
     if !kv_last_page_lens.is_empty() {
         ensure!(
-            kv_last_page_lens.len() == instance_count,
-            "launch.kv_last_page_lens must have one entry per instance"
+            kv_last_page_lens.len() == row_count,
+            "launch.kv_last_page_lens must have one entry per resolved row"
         );
     }
     if !qo_indptr.is_empty() {
-        ensure!(
-            qo_indptr.len() == instance_count + 1,
-            "launch.qo_indptr length mismatch"
-        );
+        validate_indptr(&qo_indptr, token_ids.len(), row_count, "launch.qo_indptr")?;
         ensure!(
             qo_indptr.windows(2).all(|w| w[0] <= w[1]),
             "launch.qo_indptr must be monotonic"
@@ -1509,29 +1927,39 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
         validate_indptr(
             &sampling_indptr,
             sampling_indices.len(),
-            instance_count,
+            row_count,
             "launch.sampling_indptr",
         )?;
     }
-    if !rs_slot_ids.is_empty() || !rs_slot_flags.is_empty() || !rs_fold_lens.is_empty() {
+    if !rs_slot_ids.is_empty() || !rs_slot_flags.is_empty() {
         ensure!(
-            rs_slot_ids.len() == instance_count
-                && rs_slot_flags.len() == instance_count
-                && rs_fold_lens.len() == instance_count,
-            "launch rs slot vectors must be parallel to instance_ids"
+            rs_slot_ids.len() == rs_slot_flags.len(),
+            "launch rs slot id/flag vectors must be parallel"
+        );
+        if !qo_indptr.is_empty() {
+            ensure!(
+                rs_slot_ids.len() == row_count,
+                "launch rs slot vectors must match resolved qo rows"
+            );
+        }
+    }
+    if !rs_fold_lens.is_empty() {
+        ensure!(
+            rs_fold_lens.len() == rs_slot_ids.len(),
+            "launch rs fold lengths must match rs slot vectors"
         );
     }
     if !rs_buffer_slot_indptr.is_empty() || !rs_buffer_slot_ids.is_empty() {
         validate_indptr(
             &rs_buffer_slot_indptr,
             rs_buffer_slot_ids.len(),
-            instance_count,
+            row_count,
             "launch.rs_buffer_slot_indptr",
         )?;
     }
     if !mask_request.is_empty() {
         ensure!(
-            mask_request.len() == instance_count + 1,
+            mask_request.len() == row_count + 1,
             "launch.masks.request_indptr length mismatch"
         );
         ensure!(
@@ -1546,7 +1974,7 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
     }
     if !image_indptr.is_empty() {
         ensure!(
-            image_indptr.len() == instance_count + 1,
+            image_indptr.len() == row_count + 1,
             "launch.image_indptr length mismatch"
         );
         ensure!(
@@ -1570,7 +1998,7 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
     }
     if !audio_indptr.is_empty() {
         ensure!(
-            audio_indptr.len() == instance_count + 1,
+            audio_indptr.len() == row_count + 1,
             "launch.audio_indptr length mismatch"
         );
         ensure!(
@@ -2163,6 +2591,31 @@ mod tests {
         }
     }
 
+    fn scalar_attention_ports() -> Vec<PortBinding> {
+        let words = |values: &[u32]| values.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let constant = |port, values: &[u32]| PortBinding {
+            port,
+            source: PortSource::Const {
+                dtype: DType::U32,
+                shape: Shape::vector(values.len() as u32),
+                data: words(values),
+            },
+        };
+        vec![
+            PortBinding {
+                port: Port::EmbedTokens,
+                source: PortSource::Channel(0),
+            },
+            constant(Port::EmbedIndptr, &[0, 1]),
+            constant(Port::Positions, &[0]),
+            constant(Port::Pages, &[0]),
+            constant(Port::PageIndptr, &[0, 1]),
+            constant(Port::KvLen, &[1]),
+            constant(Port::WSlot, &[0]),
+            constant(Port::WOff, &[0]),
+        ]
+    }
+
     fn suite_container(vocab: u32) -> Vec<u8> {
         let mut ops = Vec::new();
         let logits2 = expand::next_id(&ops);
@@ -2223,20 +2676,7 @@ mod tests {
                 chan(Shape::vector(vocab), DType::F32, HostRole::Reader, false),
                 chan(Shape::vector(vocab), DType::F32, HostRole::Reader, false),
             ],
-            ports: vec![
-                PortBinding {
-                    port: Port::EmbedTokens,
-                    source: PortSource::Channel(0),
-                },
-                PortBinding {
-                    port: Port::EmbedIndptr,
-                    source: PortSource::Const {
-                        dtype: DType::U32,
-                        shape: Shape::vector(2),
-                        data: [0u32, 1].iter().flat_map(|w| w.to_le_bytes()).collect(),
-                    },
-                },
-            ],
+            ports: scalar_attention_ports(),
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
                 ops,
@@ -2283,20 +2723,7 @@ mod tests {
                 chan(Shape::vector(1), DType::I32, HostRole::None, true),
                 chan(Shape::vector(1), DType::F32, HostRole::Reader, false),
             ],
-            ports: vec![
-                PortBinding {
-                    port: Port::EmbedTokens,
-                    source: PortSource::Channel(0),
-                },
-                PortBinding {
-                    port: Port::EmbedIndptr,
-                    source: PortSource::Const {
-                        dtype: DType::U32,
-                        shape: Shape::vector(2),
-                        data: [0u32, 1].iter().flat_map(|w| w.to_le_bytes()).collect(),
-                    },
-                },
-            ],
+            ports: scalar_attention_ports(),
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
                 ops,
@@ -2334,20 +2761,7 @@ mod tests {
                 chan(Shape::vector(1), DType::I32, HostRole::None, true),
                 chan(Shape::vector(1), DType::F32, HostRole::Reader, false),
             ],
-            ports: vec![
-                PortBinding {
-                    port: Port::EmbedTokens,
-                    source: PortSource::Channel(0),
-                },
-                PortBinding {
-                    port: Port::EmbedIndptr,
-                    source: PortSource::Const {
-                        dtype: DType::U32,
-                        shape: Shape::vector(2),
-                        data: [0u32, 1].iter().flat_map(|w| w.to_le_bytes()).collect(),
-                    },
-                },
-            ],
+            ports: scalar_attention_ports(),
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
                 ops: vec![
@@ -2521,15 +2935,18 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_attachments_are_exclusive_atomic_and_close_ordered() {
+    fn endpoint_attachments_follow_sharing_atomicity_and_close_ordering() {
         let mut driver = DummyDriver::default();
 
         endpoint_contract(&mut driver, 1, PIE_CHANNEL_EXTERN_NONE, &[]);
         let private_program = register_test_program(&mut driver, private_container(1));
         let private = bind_existing_channels(&mut driver, private_program, 101, &[1]).unwrap();
-        assert!(bind_existing_channels(&mut driver, private_program, 102, &[1]).is_err());
+        let private_second =
+            bind_existing_channels(&mut driver, private_program, 102, &[1]).unwrap();
         assert!(driver.close_channel(1).is_err());
         driver.close_instance(private.instance_id).unwrap();
+        assert!(driver.close_channel(1).is_err());
+        driver.close_instance(private_second.instance_id).unwrap();
         driver.close_channel(1).unwrap();
 
         endpoint_contract(&mut driver, 2, PIE_CHANNEL_EXTERN_EXPORT, b"shared");
@@ -2549,7 +2966,7 @@ mod tests {
         endpoint_contract(&mut driver, 4, PIE_CHANNEL_EXTERN_NONE, &[]);
         let occupied = bind_existing_channels(&mut driver, private_program, 301, &[4]).unwrap();
         let two_channel_program = register_test_program(&mut driver, private_container(2));
-        assert!(bind_existing_channels(&mut driver, two_channel_program, 302, &[3, 4]).is_err());
+        assert!(bind_existing_channels(&mut driver, two_channel_program, 302, &[3, 999]).is_err());
         let free = bind_existing_channels(&mut driver, private_program, 303, &[3]).unwrap();
         driver.close_instance(free.instance_id).unwrap();
         driver.close_instance(occupied.instance_id).unwrap();
@@ -2689,6 +3106,67 @@ mod tests {
             .unwrap()
             .0 as i32;
         assert_eq!(best, favored);
+    }
+
+    #[test]
+    fn prepared_launch_lease_is_consumed_or_released_exactly_once() {
+        let (mut driver, callbacks) = driver_with_callbacks(0);
+        let binding = bind_program(
+            &mut driver,
+            private_container(0).encode(),
+            &[],
+            &[],
+            &[],
+            311,
+        );
+        let instance_ids = [binding.instance_id];
+        let mut terminal_cells = [pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
+        let desc = PieLaunchDesc {
+            instance_ids: PieU64Slice {
+                ptr: instance_ids.as_ptr(),
+                len: instance_ids.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_ptrs.as_ptr(),
+                len: terminal_ptrs.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+
+        let released = driver.prepare_launch(&desc).unwrap();
+        assert_eq!(released.outcome, pie_driver_abi::PIE_LAUNCH_PREPARE_READY);
+        driver.release_launch(released.lease_id).unwrap();
+        assert!(driver.release_launch(released.lease_id).is_err());
+
+        let consumed = driver.prepare_launch(&desc).unwrap();
+        driver
+            .launch_prepared(
+                &desc,
+                consumed.lease_id,
+                PieCompletion {
+                    wait_id: 411,
+                    target_epoch: 1,
+                    terminal_cell: std::ptr::null_mut(),
+                },
+            )
+            .unwrap();
+        callbacks.wait_for_notification((411, 1));
+        assert!(
+            driver
+                .launch_prepared(
+                    &desc,
+                    consumed.lease_id,
+                    PieCompletion {
+                        wait_id: 412,
+                        target_epoch: 1,
+                        terminal_cell: std::ptr::null_mut(),
+                    },
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -3208,6 +3686,54 @@ mod tests {
         assert!(
             callbacks.notifications().is_empty(),
             "sync validation must not notify"
+        );
+    }
+
+    #[test]
+    fn multi_row_rs_shape_uses_resolved_rows_not_instance_count() {
+        let tokens = [10u32, 11];
+        let qo_indptr = [0u32, 1, 2];
+        let rs_slot_ids = [7u32, 9];
+        let rs_slot_flags = [pie_driver_abi::PIE_RS_FLAG_RESET, 0];
+        let desc = PieLaunchDesc {
+            token_ids: PieU32Slice {
+                ptr: tokens.as_ptr(),
+                len: tokens.len(),
+            },
+            qo_indptr: PieU32Slice {
+                ptr: qo_indptr.as_ptr(),
+                len: qo_indptr.len(),
+            },
+            rs_slot_ids: PieU32Slice {
+                ptr: rs_slot_ids.as_ptr(),
+                len: rs_slot_ids.len(),
+            },
+            rs_slot_flags: pie_driver_abi::PieU8Slice {
+                ptr: rs_slot_flags.as_ptr(),
+                len: rs_slot_flags.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+        validate_launch_shape(&desc, 1).unwrap();
+
+        let one_slot = [7u32];
+        let one_flag = [0u8];
+        let wrong_rows = PieLaunchDesc {
+            rs_slot_ids: PieU32Slice {
+                ptr: one_slot.as_ptr(),
+                len: one_slot.len(),
+            },
+            rs_slot_flags: pie_driver_abi::PieU8Slice {
+                ptr: one_flag.as_ptr(),
+                len: one_flag.len(),
+            },
+            ..desc
+        };
+        assert!(
+            validate_launch_shape(&wrong_rows, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("resolved qo rows")
         );
     }
 

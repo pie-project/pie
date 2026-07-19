@@ -5,8 +5,8 @@
 //! constructs through the pyo3 `pie._runtime.Config` builder. We do
 //! the same construction here in pure Rust, sourcing:
 //!   * scalars from the user TOML
-//!   * dirs (cache/log/auth) from `pie_engine::util` (`~/.pie/...`)
-//!   * caps/native-driver bundles collected before bootstrap.
+//!   * dirs (cache/log/runtime) from `bootstrap::paths::pie_home()` (`~/.pie/...`)
+//!   * capability/backend bundles collected before bootstrap.
 
 use std::path::PathBuf;
 
@@ -18,10 +18,10 @@ use crate::embedded_driver::DriverCapabilities;
 /// Per-driver bundle created before bootstrap.
 pub struct GroupDriver {
     pub caps: DriverCapabilities,
-    pub native: pie_engine::driver::NativeDriver,
+    pub backend: pie_engine::driver::DriverBackend,
 }
 
-/// Per-model bundle of concrete native drivers. One model with DP=N produces
+/// Per-model bundle of concrete driver backends. One model with DP=N produces
 /// `N` entries here; one entry per bootstrap driver config.
 pub struct ModelDrivers {
     pub groups: Vec<GroupDriver>,
@@ -39,20 +39,15 @@ pub fn build(
         );
     }
 
-    let pie_home = pie_engine::util::get_pie_home();
+    let pie_home = bootstrap::paths::pie_home();
     let cache_dir = pie_home.join("programs");
     let log_dir = Some(pie_home.join("logs"));
-    let auth_dir = pie_home.join("auth");
 
     let model = build_model(&user.model, drivers)?;
 
     Ok(pie_engine::bootstrap::Config {
         host: user.server.host.clone(),
         port: user.server.port,
-        auth: pie_engine::bootstrap::AuthConfig {
-            enabled: user.auth.enabled,
-            authorized_users_dir: auth_dir,
-        },
         cache_dir,
         verbose: user.server.verbose,
         log_dir,
@@ -73,6 +68,7 @@ pub fn build(
             allow_network: user.runtime.allow_network,
             network_allowed_hosts: user.runtime.network_allowed_hosts.clone(),
             max_upload_mb: user.runtime.max_upload_mb,
+            py_runtime_dir: pie_home.join("py-runtime"),
         },
         model,
         // The `bootstrap` lib (Seam 2) installs the global tracing subscriber;
@@ -102,18 +98,29 @@ fn build_model(
     let drivers = drivers
         .groups
         .into_iter()
-        .map(|g| pie_engine::bootstrap::DriverConfig {
-            total_pages: g.caps.total_pages as usize,
-            cpu_pages: g.caps.swap_pool_size as usize,
-            rs_cache_required: g.caps.rs_cache_required,
-            rs_cache_slots: g.caps.rs_cache_slots as usize,
-            rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
-            limits: pie_engine::driver::SchedulerLimits {
-                max_forward_requests: g.caps.max_forward_requests as usize,
-                max_forward_tokens: g.caps.max_forward_tokens as usize,
-                max_page_refs: g.caps.max_page_refs as usize,
-            },
-            native_driver: g.native,
+        .map(|g| {
+            let backend_kind = g.backend.kind().to_string();
+            pie_engine::bootstrap::DriverConfig {
+                total_pages: g.caps.total_pages as usize,
+                cpu_pages: g.caps.swap_pool_size as usize,
+                kv_copy_domain_mask: g.caps.kv_copy_domain_mask,
+                backend_kind,
+                rs_cache_required: g.caps.rs_cache_required,
+                rs_cache_slots: g.caps.rs_cache_slots as usize,
+                rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
+                elastic_page_bytes: g.caps.elastic_page_bytes,
+                elastic_budget_pages: g.caps.elastic_budget_pages,
+                has_mtp_logits: g.caps.has_mtp_logits,
+                has_mtp_drafts: g.caps.has_mtp_drafts,
+                has_value_head: g.caps.has_value_head,
+                device_geometry_port_mask: g.caps.device_geometry_port_mask,
+                limits: pie_engine::driver::SchedulerLimits {
+                    max_forward_requests: g.caps.max_forward_requests as usize,
+                    max_forward_tokens: g.caps.max_forward_tokens as usize,
+                    max_page_refs: g.caps.max_page_refs as usize,
+                },
+                driver_backend: g.backend,
+            }
         })
         .collect();
 
@@ -140,6 +147,7 @@ mod tests {
             total_pages: 1024,
             kv_page_size: 32,
             swap_pool_size: 0,
+            kv_copy_domain_mask: pie_driver_abi::KV_COPY_DEVICE_TO_DEVICE,
             max_forward_tokens: 4096,
             max_forward_requests: 512,
             max_page_refs: 262144,
@@ -147,15 +155,19 @@ mod tests {
             vocab_size: 151936,
             max_model_len: 4096,
             activation_dtype: "bfloat16".into(),
+            hidden_size: 4096,
+            supports_media_encode: false,
             snapshot_dir: "/tmp/snapshot".into(),
-            storage_backend: String::new(),
-            max_tile_bytes: 0,
-            preferred_alignment: 0,
-            mxfp4_moe_policy: String::new(),
-            native_mxfp4_moe: false,
             rs_cache_required: false,
             rs_cache_slots: 0,
             rs_cache_slot_bytes: 0,
+            elastic_page_bytes: 0,
+            elastic_budget_pages: 0,
+            has_mtp_logits: true,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
+            kv_handle: None,
         }
     }
 
@@ -172,15 +184,22 @@ mod tests {
             max_forward_tokens: caps.max_forward_tokens,
             max_forward_requests: caps.max_forward_requests,
             max_page_refs: caps.max_page_refs,
+            has_mtp_logits: caps.has_mtp_logits,
+            has_mtp_drafts: caps.has_mtp_drafts,
+            has_value_head: caps.has_value_head,
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,
             fail_launches_after_accept: false,
+            retry_launches_remaining: 0,
+            elastic_admission: false,
+            prepare_exhaustions_remaining: 0,
+            prepare_impossible_above_kv_pages: 0,
             operation_log: None,
             launch_observer: None,
         };
-        let (native, _) = pie_engine::driver::NativeDriver::dummy(dummy).unwrap();
-        GroupDriver { caps, native }
+        let (backend, _) = pie_engine::driver::DriverBackend::dummy(dummy).unwrap();
+        GroupDriver { caps, backend }
     }
 
     #[test]
@@ -227,6 +246,11 @@ arch_name = "qwen3"
         assert_eq!(m.drivers.len(), 1);
         assert_eq!(m.drivers[0].total_pages, 1024);
         assert_eq!(m.drivers[0].limits.max_page_refs, 262144);
+        assert!(m.drivers[0].has_mtp_logits);
+        assert_eq!(
+            m.drivers[0].device_geometry_port_mask,
+            pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
+        );
     }
 
     #[test]

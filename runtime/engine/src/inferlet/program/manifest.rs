@@ -217,26 +217,6 @@ version = "1.0.0"
         let serialized = manifest.to_toml().unwrap();
         let reparsed = Manifest::parse(&serialized).unwrap();
 
-        // With PartialEq, we can assert full equality
         assert_eq!(manifest, reparsed);
-    }
-
-    #[test]
-    fn test_program_name() {
-        let manifest = Manifest::parse(CANONICAL_MANIFEST).unwrap();
-        let name = manifest.program_name();
-
-        assert_eq!(name.name, "text-completion");
-        assert_eq!(name.version, "0.1.0");
-    }
-
-    #[test]
-    fn test_dependency_names() {
-        let manifest = Manifest::parse(CANONICAL_MANIFEST).unwrap();
-        let deps = manifest.dependency_names();
-
-        assert_eq!(deps.len(), 2);
-        assert!(deps.iter().any(|d| d.name == "foo" && d.version == "0.1.0"));
-        assert!(deps.iter().any(|d| d.name == "bar" && d.version == "0.2.0"));
     }
 }

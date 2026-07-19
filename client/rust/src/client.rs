@@ -30,7 +30,7 @@ pub enum ProcessEvent {
     Stdout(String),
     /// Stderr output from the process.
     Stderr(String),
-    /// An inferlet text message (via messaging::send).
+    /// An inferlet text message (via session::send).
     Message(String),
     /// A binary file sent from the inferlet.
     File(Vec<u8>),
@@ -259,7 +259,6 @@ impl Client {
         let corr_id_ref = match &mut msg {
             ClientMessage::AuthIdentify { corr_id, .. }
             | ClientMessage::AuthProve { corr_id, .. }
-            | ClientMessage::AuthByToken { corr_id, .. }
             | ClientMessage::CheckProgram { corr_id, .. }
             | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
@@ -344,20 +343,6 @@ impl Client {
         }
     }
 
-    /// Authenticates the client with the server using an internal token.
-    pub async fn auth_by_token(&self, token: &str) -> Result<()> {
-        let msg = ClientMessage::AuthByToken {
-            corr_id: 0,
-            token: token.to_string(),
-        };
-        let (ok, result) = self.send_msg_and_wait(msg).await?;
-        if ok {
-            Ok(())
-        } else {
-            anyhow::bail!("Internal authentication failed: {}", result)
-        }
-    }
-
     pub async fn query<T: ToString>(&self, subject: T, record: String) -> Result<String> {
         let msg = ClientMessage::Query {
             corr_id: 0,
@@ -374,7 +359,7 @@ impl Client {
 
     /// Check if a program exists on the server.
     ///
-    /// The `inferlet` must be in `name@version` format (e.g., "text-completion@0.1.0").
+    /// The `inferlet` must be in `name@version` format (e.g., "chat-completion@0.1.0").
     pub async fn check_program(
         &self,
         inferlet: &str,

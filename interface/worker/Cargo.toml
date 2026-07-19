@@ -25,7 +25,7 @@ pie-controller-rpc = { path = "../controller" }
 # used by the typed link constructors). Transport/codec features (serde-transport
 # /tcp/unix) stay with the binaries (gateway/worker) so the contract crate
 # carries no transport.
-tarpc = { version = "0.35", features = ["serde1", "tokio1"] }
+tarpc = { version = "0.37", features = ["serde1", "tokio1"] }
 # Foundations for the shared two-way mux glue (`spawn_twoway` + the typed link
 # constructors) and the serde derives on the data types + `TwoWayMessage`.
 serde = { version = "1.0", features = ["derive"] }

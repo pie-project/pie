@@ -1,28 +1,34 @@
-//! Single-`[Token]` late-mask grammar inferlet for the #34 M-batch occupancy
-//! verify. Uses `edsl::grammar(vocab)` — `argmax(mask_apply(logits, mask))` with
-//! `outputs = [Token]` (single) and a `Readiness::Late` mask → **M-batch ELIGIBLE**
-//! (the `*_with_logits` variants emit `[Token, Logits]` = rich → ineligible; the
-//! `grammar`/`grammar-late` test inferlets use those for the host-reference
-//! conform, so neither M-batches).
+//! Single-`[Token]` mask grammar inferlet for the #34 M-batch occupancy verify
+//! — **`inferlet::ptir` bridge rewrite**. The classic M-batch-eligibility split
+//! (a single-`Token`-output program vs a rich `[Token, Logits]` program) was an
+//! executor batching-optimization detail of the old sampler-program surface;
+//! the ptir bridge has no such shape distinction — every host input (here, the
+//! grammar mask) rides a first-class host-writer [`Channel`], and only the
+//! OUTPUTS an inferlet chooses to `put` cross back to the host. This inferlet
+//! publishes only the constrained token (no raw-logits reader), mirroring the
+//! old single-`[Token]` shape's OBSERVABLE surface.
 //!
-//! Self-check: each constrained token MUST be in the alphabet (the mask's `−∞`
-//! fired). With DISJOINT alphabets across co-batched requests, a wrong-grouping /
-//! scatter bug (request i gets request j's gathered mask) yields a token in
-//! `alphabet_j ∉ alphabet_i` → caught here, AND by the harness's per-request
-//! ON==OFF token comparison. A dropped mask ⇒ the natural (large-id) argmax ∉ the
-//! small alphabet ⇒ also caught (the forced-out property).
+//! Self-check: each constrained token MUST be in the alphabet (the mask's
+//! `−∞` fired). With DISJOINT alphabets across co-batched requests, a
+//! wrong-grouping / scatter bug (request i gets request j's mask) yields a
+//! token in `alphabet_j ∉ alphabet_i` → caught here, AND by the harness's
+//! per-request ON==OFF token comparison.
+//!
+//! The author-bound loop-carried `KvLen` grows the absolute RoPE position and
+//! attended KV length by 1 every fire, so each fire embeds at the
+//! growing absolute position and attends the FULL committed KV — not a fixed
+//! 1-token window re-fired at position 0 forever.
 
-use inferlet::inference::ForwardPass;
 use inferlet::mask::pack_allowed;
-use inferlet::serde_json;
-use inferlet::working_set::KvWorkingSet;
-use inferlet::{geometry, model, sampler, Result};
+use inferlet::ptir::prelude::*;
+use inferlet::{Result, model as wit_model, serde_json};
 
 const ALPHABET: [u32; 4] = [10, 11, 12, 13];
 const MAX_TOKENS: usize = 6;
+const PAGE_T: u32 = 16;
 
 /// Tiny DFA: allow any alphabet token except the one just emitted (no repeats),
-/// so the per-step mask varies (a non-trivial Late mask each step).
+/// so the per-step mask varies (a non-trivial mask each step).
 struct NoRepeatMatcher {
     alphabet: Vec<u32>,
     last: Option<u32>,
@@ -30,7 +36,10 @@ struct NoRepeatMatcher {
 
 impl NoRepeatMatcher {
     fn new(alphabet: Vec<u32>) -> Self {
-        Self { alphabet, last: None }
+        Self {
+            alphabet,
+            last: None,
+        }
     }
     fn allowed(&self) -> Vec<u32> {
         self.alphabet
@@ -46,8 +55,7 @@ impl NoRepeatMatcher {
 
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
-    let params: serde_json::Value =
-        serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
+    let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let max_tokens = params
         .get("max_tokens")
         .and_then(|x| x.as_u64())
@@ -56,59 +64,98 @@ async fn main(input: String) -> Result<String> {
     let alphabet: Vec<u32> = params
         .get("alphabet")
         .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect()
+        })
         .filter(|a: &Vec<u32>| !a.is_empty())
         .unwrap_or_else(|| ALPHABET.to_vec());
 
-    let vocab = model::output_vocab_size();
-    let mut prompt = model::encode("hello world");
+    let vocab = wit_model::output_vocab_size();
+
+    let mut prompt = wit_model::encode("hello world");
     if prompt.is_empty() {
         prompt.push(0);
     }
+    let seed_tok = *prompt.last().unwrap() as i32;
 
-    // Keep-core `[Token]`-only grammar sampler with a **Late** mask (M-batch
-    // ELIGIBLE — single output, no rich logits): `argmax(mask_apply(logits, mask))`.
-    // Off the `Context`/`Forward`/`program` facade; single output read via
-    // `pass.output()`.
-    let g = sampler::grammar_program_late(vocab)?;
+    let ws = WorkingSet::new();
+    let max_pages = (max_tokens as u32 + 1).div_ceil(PAGE_T).max(1);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
 
-    let kv = KvWorkingSet::new();
-    let mut seq = 0u32;
-    let mut fresh = true;
+    // tok_in and KvLen are device loop-carried (seeded; each fire's epilogue
+    // advances the post-write readable extent by one). Each fire therefore
+    // embeds at the growing absolute position and attends the full committed
+    // KV. gmask: per-step
+    // host-writer allowed mask. tok_out: the SOLE host-reader output (no
+    // raw-logits reader — mirrors the old single-`[Token]` M-batch-eligible
+    // shape).
+    let tok_in = Channel::from(vec![seed_tok]).named("tok_in");
+    let kv_len = Channel::from(vec![1u32]).named("kv_len");
+    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
+    let positions = Channel::from(vec![0u32]).named("positions");
+    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, 1]).named("page_indptr");
+    let w_slot = Channel::from(vec![0u32]).named("w_slot");
+    let w_off = Channel::from(vec![0u32]).named("w_off");
+    let gmask = Channel::new([vocab], dtype::bool).named("gmask");
+    let tok_out = Channel::new([1], dtype::i32).named("tok_out");
+
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, &embed_indptr)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
+    fwd.epilogue(move || {
+        let length = kv_len.take().tensor();
+        // Takes + compute first, PUTS last (value-id discipline).
+        let m = gmask.take(); // [V] bool, host-fed per step
+        let lg = intrinsics::logits(); // [V] f32 (read-out row)
+        let tok = reshape(reduce_argmax(mask_apply(&lg, &m)), [1]); // [1] i32
+        let next_length = add(&length, 1u32);
+        let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+
+        tok_in.put(&tok);
+        kv_len.put(&next_length);
+        positions.put(&length);
+        w_slot.put(div(&length, PAGE_T));
+        w_off.put(rem(&length, PAGE_T));
+        page_indptr.take();
+        page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        tok_out.put(&tok);
+    });
 
     let mut matcher = NoRepeatMatcher::new(alphabet.clone());
     let mut tokens: Vec<u32> = Vec::with_capacity(max_tokens);
-    let mut pending: Vec<u32> = prompt;
     let mut conform_ok = true;
 
+    let pipeline = Pipeline::new();
     for step in 0..max_tokens {
         let allowed = matcher.allowed();
         let packed = pack_allowed(vocab as usize, &allowed);
+        let mask_bool: Vec<bool> = (0..vocab as usize)
+            .map(|j| inferlet::mask::bit_allowed(&packed, j))
+            .collect();
 
-        // Raw grammar fire (geometry + input + Late-masked sampler + execute),
-        // single `[Token]` output read via `pass.output()`.
-        let n = pending.len() as u32;
-        let pass = ForwardPass::new();
-        if fresh {
-            pass.fresh_generate();
-            fresh = false;
-        }
-        let geom = geometry::ensure_pages(&kv, geometry::kv_write_geometry(seq, n, kv.page_size()))?;
-        geometry::attach_kv_write(&pass, &kv, &geom);
-        let positions: Vec<u32> = (seq..seq + n).collect();
-        pass.input_tokens(&pending, &positions);
-        let decode_pos = seq + n - 1;
-        pass.sampler(&g.program, g.bindings(decode_pos, &packed)?);
-        pass.execute();
-        seq += n;
-
-        let out = pass.output().await.map_err(|e| format!("output @{step}: {e}"))?;
-        let tok_bytes = out.read().map_err(|e| format!("read token @{step}: {e:?}"))?;
-        let token = if tok_bytes.len() >= 4 {
-            i32::from_le_bytes([tok_bytes[0], tok_bytes[1], tok_bytes[2], tok_bytes[3]]) as u32
-        } else {
-            0
-        };
+        gmask.put(mask_bool);
+        fwd.submit(&pipeline)
+            .map_err(|e| format!("submit @{step}: {e}"))?;
+        let token = tok_out
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
 
         // Grammar conformance: the masked argmax MUST be in this request's alphabet.
         if !alphabet.contains(&token) {
@@ -118,8 +165,8 @@ async fn main(input: String) -> Result<String> {
 
         matcher.accept(token);
         tokens.push(token);
-        pending = vec![token];
     }
+    pipeline.close();
 
     let result = format!("GRAMMARMB_OK={conform_ok} tokens={tokens:?} alphabet={alphabet:?}");
     eprintln!("[GRAMMARMB] {result}");

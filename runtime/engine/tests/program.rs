@@ -39,12 +39,22 @@ fn test_program_name(name: &str) -> ProgramName {
     ProgramName::parse(&format!("{name}@0.1.0")).unwrap()
 }
 
+/// The tests share one engine state and mutate the SAME program names
+/// (add/install/uninstall on "echo"/"error", plus the install-all sweep), so
+/// they must not interleave. Poisoning is ignored: a panicked test already
+/// failed; the guard only orders access.
+fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
 
 #[test]
 fn add_and_register() {
+    let _serial = serial_guard();
     let s = state();
     let wasm = inferlets::read_inferlet_wasm("echo");
     let manifest = inferlets::read_inferlet_manifest("echo");
@@ -61,6 +71,7 @@ fn add_and_register() {
 
 #[test]
 fn install_and_query() {
+    let _serial = serial_guard();
     let s = state();
     let wasm = inferlets::read_inferlet_wasm("echo");
     let manifest = inferlets::read_inferlet_manifest("echo");
@@ -78,6 +89,7 @@ fn install_and_query() {
 
 #[test]
 fn fetch_manifest_after_add() {
+    let _serial = serial_guard();
     let s = state();
     let wasm = inferlets::read_inferlet_wasm("error");
     let manifest = inferlets::read_inferlet_manifest("error");
@@ -97,6 +109,7 @@ fn fetch_manifest_after_add() {
 
 #[test]
 fn uninstall_removes_program() {
+    let _serial = serial_guard();
     let s = state();
     let wasm = inferlets::read_inferlet_wasm("error");
     let manifest = inferlets::read_inferlet_manifest("error");
@@ -123,6 +136,7 @@ fn uninstall_removes_program() {
 
 #[test]
 fn install_context_inferlet() {
+    let _serial = serial_guard();
     let s = state();
     let wasm = inferlets::read_inferlet_wasm("context");
     let manifest = inferlets::read_inferlet_manifest("context");
@@ -137,6 +151,7 @@ fn install_context_inferlet() {
 
 #[test]
 fn install_all_test_inferlets() {
+    let _serial = serial_guard();
     let s = state();
 
     let inferlet_names = ["echo", "context", "error"];

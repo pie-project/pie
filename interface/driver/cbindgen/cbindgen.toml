@@ -12,6 +12,8 @@ parse_deps = false
 [export]
 exclude = [
   "DriverCapabilities",
+  # Rust-side enum; the C surface is the PIE_GEOMETRY_CLASS_* macros.
+  "GeometryClass",
   "KvDtype",
   "KvLayoutKind",
   "KvLayout",

@@ -43,6 +43,28 @@ jobs:
           cargo test -p pie --lib
           cargo test -p pie-client --lib
 
+  # pie-engine layering gate — major_refactor.md's L0..L3 dependency direction
+  # (driver -> store -> scheduler -> pipeline -> inferlet/server, strictly
+  # downward). Pure text check (no Rust build needed), so it's the cheapest
+  # possible guard against a layer re-importing something above it. Also
+  # confirms the legacy `ptir`/`api`/`inference` module paths never come back.
+  # Same job also carries the Metal and CUDA driver structural gates (source
+  # layout + include layering); neither needs a GPU or toolchain to run.
+  engine-layering-gate:
+    name: pie-engine layering gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enforce L0..L3 downward-only imports + legacy path absence
+        run: ./scripts/check-engine-layering.sh
+
+      - name: Enforce Metal driver source layout
+        run: ./scripts/check-metal-driver-layout.sh
+
+      - name: Enforce CUDA driver source layout
+        run: ./driver/cuda/check-structure.sh
+
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a
   # curated subset, so new crates (`pie-transport`) and the benches were
@@ -74,12 +96,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      # rust-toolchain.toml pins the wasip3 nightly; this installs the Tier-3
-      # wasm32-wasip3 build prereqs (wasm32-wasip2 libc donor + linker wrapper)
-      # so the runtime integration tests can build their wasip3 inferlets.
-      - name: Set up wasm32-wasip3 toolchain
-        run: ./scripts/setup-wasip3.sh
+        with:
+          targets: wasm32-wasip2
 
       - name: Cache cargo + cmake build
         uses: actions/cache@v5
@@ -116,8 +134,6 @@ jobs:
     name: schema header drift (cbindgen regen)
     runs-on: ubuntu-latest
     # Pinned to stable 1.91.1 for deterministic cbindgen parse.expand output.
-    # RUSTUP_TOOLCHAIN is forced here so the repo-wide nightly rust-toolchain.toml
-    # (wasip3 epic) does NOT override the dtolnay-installed 1.91.1 in this job.
     env:
       RUSTUP_TOOLCHAIN: "1.91.1"
     steps:
@@ -223,7 +239,7 @@ jobs:
       - name: Install build dependencies
         run: |
           brew update
-          brew install cmake ninja ccache libomp
+          brew install cmake ninja ccache libomp mlx
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -249,15 +265,25 @@ jobs:
           cmake -S driver/metal -B target/metal-validation -G Ninja \
             -DPIE_METAL_WITH_MLX=OFF \
             -DPIE_METAL_BUILD_STUB_TESTS=ON
-          cmake --build target/metal-validation --target metal_direct_stub_test
+          cmake --build target/metal-validation
           ctest --test-dir target/metal-validation \
-            --output-on-failure -R '^metal_direct_stub_test$'
+            --output-on-failure
+          ./scripts/check-metal-driver-layout.sh \
+            target/metal-validation/lib/libpie_driver_metal_lib.a
+
+      - name: MLX reference and parity validation
+        run: |
+          cmake -S driver/metal -B target/metal-mlx -G Ninja \
+            -DPIE_METAL_WITH_MLX=ON \
+            -DPIE_METAL_MLX_PROVIDER=system \
+            -DPIE_METAL_BUILD_TESTS=ON \
+            -DPIE_METAL_BUILD_PARITY=ON
+          cmake --build target/metal-mlx
+          ctest --test-dir target/metal-mlx --output-on-failure
 
   # Cuda build — runs only when an opt-in label or schedule fires
   # (no CUDA on the default GH-hosted runners). Add a self-hosted
-  # runner with a CUDA toolkit to enable this. Until then, M3's
-  # static-link spike + manual M4 verification are the canonical
-  # checkpoints.
+  # runner with a CUDA toolkit to enable this.
   pie-worker-cuda:
     name: pie-worker (driver-cuda)
     runs-on: [self-hosted, cuda]
@@ -279,9 +305,9 @@ jobs:
             -path '*/out/cuda/build' -print -quit)"
           test -n "$CUDA_BUILD_DIR"
           cmake --build "$CUDA_BUILD_DIR" \
-            --target test_entry_validation test_ptir_dispatch_bind
+            --target test_entry_validation test_pipeline_dispatch_bind
           ctest --test-dir "$CUDA_BUILD_DIR" --output-on-failure \
-            -R '^(entry_validation|ptir_dispatch_bind)$'
+            -R '^(entry_validation|pipeline_dispatch_bind)$'
 
       - name: Verify no CUDA shared deps
         run: |

@@ -7,6 +7,9 @@ description = "Python bindings for the pie engine — embed `pie serve` inside a
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
+[features]
+profile-fire = ["pie-worker/profile-fire"]
+
 [lib]
 name = "pie_engine"
 crate-type = ["cdylib"]
@@ -19,7 +22,7 @@ path = "src/lib.rs"
 # `pie.server.Server` can host the same local flavors as `pie serve`
 # (`driver-metal` is added on Apple-Silicon builds).
 pie-worker = { path = "../../worker", default-features = false, features = ["driver-cuda", "driver-dummy"] }
-pyo3 = { version = "0.23", features = ["extension-module"] }
-tokio = { version = "1.38", features = ["rt-multi-thread"] }
-toml = "0.9"
+pyo3 = { version = "0.29", features = ["extension-module"] }
+tokio = { version = "1.53", features = ["rt-multi-thread"] }
+toml = "1.1"
 anyhow = "1.0"

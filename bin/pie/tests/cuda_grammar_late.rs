@@ -56,7 +56,7 @@ async fn grammar_late_supply_on_real_driver() -> Result<()> {
     eprintln!("[grammar-late] booted, listen_addr={}", pie.listen_addr);
 
     // Build the Late-supply grammar masking verify inferlet.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "grammar-late"])
         .current_dir(&ws)
@@ -95,12 +95,10 @@ async fn grammar_late_supply_on_real_driver() -> Result<()> {
     let mut clients = Vec::with_capacity(N_CONCURRENT);
     let mut procs = Vec::with_capacity(N_CONCURRENT);
     for _ in 0..N_CONCURRENT {
-        let c = Client::connect_with_identity(
-            &format!("ws://{}/v1/ws", pie.listen_addr),
-            "test-user",
-        )
-        .await
-        .context("connect proc session")?;
+        let c =
+            Client::connect_with_identity(&format!("ws://{}/v1/ws", pie.listen_addr), "test-user")
+                .await
+                .context("connect proc session")?;
         c.authenticate("test-user", &None)
             .await
             .context("auth proc session")?;

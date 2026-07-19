@@ -57,34 +57,6 @@ void launch_marlin_permute_scales_bf16(
     int           size_k,
     cudaStream_t  stream);
 
-/// AWQ → marlin zero-point repack. AWQ stores per-group zero-points as
-/// packed int4 in `[groups, N/8]` int32 (each int32 holds 8 nibbles
-/// along the N axis with the AWQ-specific [0,2,4,6,1,3,5,7] interleave).
-/// Marlin's W4 kernel expects them in `[groups, N/8]` int32 too, but
-/// with the SAME 64-wide column permutation that scales undergo
-/// (`marlin_permute_scales`) AFTER the AWQ undo-interleave. This kernel
-/// does the full pipeline: undo AWQ interleave → marlin scale_perm →
-/// repack int4. Verified to match vLLM's `awq_to_marlin_zero_points`.
-void launch_awq_qzero_to_marlin_w4(
-    const void*   awq_qzeros_in,    // [groups, N/8] int32 (AWQ packing)
-    void*         qzeros_marlin_out,// [groups, N/8] int32 (marlin packing)
-    int           groups,
-    int           size_n,           // N (must be multiple of 64)
-    cudaStream_t  stream);
-
-/// AWQ qweight → GPTQ-format qweight conversion. AWQ stores `[K, N/8]`
-/// int32 packed along N with the AWQ-specific [0,2,4,6,1,3,5,7] bit
-/// interleave; GPTQ stores `[K/8, N]` int32 packed along K with linear
-/// bit order. After this conversion the standard `gptq_marlin_repack`
-/// can process the result. Mirrors vLLM's `_convert_awq_tensor_layout`
-/// qweight branch (awq_marlin.py:99-108).
-void launch_awq_qweight_to_gptq_w4(
-    const void*   awq_qweight_in,   // [K, N/8] int32 (AWQ packing)
-    void*         gptq_qweight_out, // [K/8, N] int32 (GPTQ packing)
-    int           size_k,
-    int           size_n,
-    cudaStream_t  stream);
-
 /// Direct AWQ dequant to bf16 — bypasses marlin entirely. Produces
 /// `bf16[N, K]` (HF Linear-compatible row-major) from the AWQ triplet
 /// (qweight, qzeros, scales). Used as a drop-in replacement for the

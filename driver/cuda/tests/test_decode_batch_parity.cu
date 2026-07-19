@@ -1,7 +1,7 @@
 // Bug#2 reproducer + permanent guard: batched (R>1) paged decode attention must
 // match the per-request R=1 reference bit-for-bit.
 //
-// The concurrent-decode corruption (charlie's 4090 repro: R=1 perfect, R>=2
+// The concurrent-decode corruption (reported on a 4090: R=1 perfect, R>=2
 // cross-scrambled/garbage logits despite correct geometry) is per-request KV
 // mis-attribution INSIDE the R>1 BatchDecode kernel/dispatch. This test isolates
 // the attention READ path from all model/scheduler/KV-write machinery: it
@@ -23,7 +23,6 @@
 
 #include <cuda_runtime.h>
 
-#include "attention_workspace.hpp"
 #include "ops/attention_flashinfer.hpp"
 
 using pie_cuda_driver::AttentionWorkspace;
@@ -57,7 +56,7 @@ float bf16_to_f32(std::uint16_t h) {
 }
 
 // Qwen3-0.6B decode shape: 16 q heads / 8 kv heads (GQA group 2), head_dim 128,
-// page_size 16 — the exact geometry of charlie's failing repro.
+// page_size 16 — the exact geometry of the failing repro.
 constexpr int HQ = 16, HKV = 8, D = 128, PAGE = 16;
 const std::size_t PAGE_STRIDE = static_cast<std::size_t>(PAGE) * HKV * D;  // NHD
 
@@ -171,12 +170,12 @@ int main() {
     const std::size_t row = static_cast<std::size_t>(HQ) * D;
     const float tol = 3e-3f;  // bf16 accumulation slack
 
-    // Mixed-length regimes — the FAILING regime charlie reports is co-batched
+    // Mixed-length regimes — the reported failing regime is co-batched
     // rows at MIXED KV-len (short kv_len=2 bit-exact, kv_len>=4 diverge 5-7%).
     // A uniform-length batch can hide a per-request length-attribution bug (a
     // mis-index still reads an equal length), so sweep mixed + edge lengths.
     const std::vector<std::vector<int>> regimes = {
-        {2, 4, 5},           // charlie's exact failing mix
+        {2, 4, 5},           // exact reported failing mix
         {2, 3, 4, 5},        // sweep across the kv_len=4 boundary
         {2, 5},              // minimal short+long pair
         {2, 2, 2, 2},        // uniform short (control)
@@ -218,7 +217,7 @@ int main() {
                     "in a mixed-length regime — reproduced in the attention "
                     "read/dispatch (isolated from KV-write + model loop).\n");
     } else {
-        std::printf("\nAll regimes (incl. charlie's mixed {2,4,5}), both variants: "
+        std::printf("\nAll regimes (incl. the reported mixed {2,4,5}), both variants: "
                     "batched == R=1 reference. R>1 decode attention is per-request "
                     "correct across mixed KV-lengths.\n");
     }

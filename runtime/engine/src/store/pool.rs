@@ -5,6 +5,16 @@
 //! owns no CoW logic, hash maintenance, mapping, residency, or refcounts
 //! (kv_refact.md, `store/pool.rs`). Freed ids are recycled only after the
 //! completion epoch of their last in-flight user retires.
+//!
+//! Complete typed-store API (kv_refact.md): some methods here are not yet
+//! called by the live single-model fire path (only a subset of the typed
+//! store surface is currently wired) but are exercised by this module's
+//! own unit test suite and reserved for upcoming increments (contention/
+//! reclaim expansion, RS buffer-write paths, etc.) — kept rather than
+//! deleted, allowed rather than silently masked.
+#![allow(dead_code)]
+
+use std::collections::HashSet;
 
 /// A typed physical id backed by a pool slot. Implemented by
 /// `PhysicalKvPageId` and RS-specific ids.
@@ -18,15 +28,24 @@ pub struct Pool<I> {
     free: Vec<I>,
     /// Ids waiting for their epoch to retire before becoming allocatable.
     pending: Vec<(u64, Vec<I>)>,
+    base: u32,
     capacity: u32,
 }
 
 impl<I: PoolId> Pool<I> {
     pub fn new(capacity: u32) -> Self {
+        Self::new_range(0, capacity)
+    }
+
+    pub fn new_range(base: u32, capacity: u32) -> Self {
+        let end = base
+            .checked_add(capacity)
+            .expect("pool id range overflows u32");
         Self {
             // Pop order: ascending ids first (cosmetic, deterministic tests).
-            free: (0..capacity).rev().map(I::from_index).collect(),
+            free: (base..end).rev().map(I::from_index).collect(),
             pending: Vec::new(),
+            base,
             capacity,
         }
     }
@@ -53,6 +72,20 @@ impl<I: PoolId> Pool<I> {
         }
     }
 
+    /// Return ids that were reserved but never published or submitted to a
+    /// driver operation. No completion epoch is required because no device
+    /// user could have observed them.
+    pub fn release_reserved(&mut self, ids: Vec<I>) {
+        debug_assert!(ids.iter().all(|id| {
+            id.index() >= self.base && id.index() < self.base.saturating_add(self.capacity)
+        }));
+        debug_assert!(
+            ids.iter()
+                .all(|id| !self.free.iter().any(|free| free.index() == id.index()))
+        );
+        self.free.extend(ids);
+    }
+
     /// Retire all epochs `<= epoch`, returning their ids to the free list.
     pub fn retire_through(&mut self, epoch: u64) {
         let mut i = 0;
@@ -76,5 +109,14 @@ impl<I: PoolId> Pool<I> {
 
     pub fn capacity(&self) -> u32 {
         self.capacity
+    }
+
+    pub fn highest_in_use_exclusive(&self) -> u32 {
+        let free: HashSet<u32> = self.free.iter().map(|id| id.index()).collect();
+        let end = self.base.saturating_add(self.capacity);
+        (self.base..end)
+            .rev()
+            .find(|index| !free.contains(index))
+            .map_or(0, |index| index - self.base + 1)
     }
 }

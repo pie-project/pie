@@ -1,5 +1,7 @@
 #pragma once
 
+// ops/: attention, GEMM, MoE, and SSM kernel wrappers shared by every model forward.
+//
 // Thin cuBLAS wrapper for bf16 matmul.
 //
 // The transformer linear layers are all of shape `out = act @ W^T`, where
@@ -14,7 +16,7 @@
 #include <cuda_runtime.h>
 #include <memory>
 
-#include "model/loaded_model.hpp"
+#include "ops/quant_meta.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::ops {
@@ -23,6 +25,7 @@ struct RuntimeQuantScratchSpec {
     std::size_t max_tokens = 0;
     std::size_t max_weight_rows = 0;  // GEMM N
     std::size_t max_weight_cols = 0;  // GEMM K
+    std::size_t max_dequant_weight_elems = 0;
     bool has_fp8 = false;
     bool has_int8 = false;
 
@@ -35,6 +38,32 @@ struct RuntimeQuantScratchSpec {
 };
 
 std::size_t runtime_quant_scratch_bytes(const RuntimeQuantScratchSpec& spec);
+
+class RuntimeQuantContext {
+public:
+    RuntimeQuantContext();
+    ~RuntimeQuantContext();
+    RuntimeQuantContext(const RuntimeQuantContext&) = delete;
+    RuntimeQuantContext& operator=(const RuntimeQuantContext&) = delete;
+
+    void reset() noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    friend class ScopedRuntimeQuantContext;
+};
+
+class ScopedRuntimeQuantContext {
+public:
+    explicit ScopedRuntimeQuantContext(RuntimeQuantContext& context) noexcept;
+    ~ScopedRuntimeQuantContext();
+    ScopedRuntimeQuantContext(const ScopedRuntimeQuantContext&) = delete;
+    ScopedRuntimeQuantContext& operator=(const ScopedRuntimeQuantContext&) = delete;
+
+private:
+    void* previous_ = nullptr;
+};
 
 // Preallocate the runtime-quant GEMM scratch described by `spec`. When
 // `seal_after_reserve` is true, any later attempt to grow those buffers throws
@@ -141,10 +170,9 @@ private:
 //   y:   [M, N]
 // Default beta = 0 (overwrite). Pass beta = 1 to fuse a residual add.
 //
-// Dispatcher entry point. Currently routes only `(BF16, BF16)` to the
-// existing cuBLAS path; M1 adds `(BF16, FP8_E4M3)` and M3 adds
-// `(BF16, INT4_PACKED)` via marlin. Throws on unsupported combos rather
-// than silently miscomputing.
+// Dispatcher entry point. Routes supported dense and quantized combinations
+// through cuBLAS/cuBLASLt or Marlin, and throws on unsupported combinations
+// rather than silently miscomputing.
 //
 // `act_dtype` / `y_dtype` default to BF16 so the common-case call site
 // just passes `(handle, act, w_tensor, y, M, N, K[, beta])` unchanged

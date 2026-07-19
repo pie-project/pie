@@ -582,7 +582,6 @@ fn corr_id_of(m: &ClientMessage) -> Option<u32> {
     match m {
         AuthIdentify { corr_id, .. }
         | AuthProve { corr_id, .. }
-        | AuthByToken { corr_id, .. }
         | CheckProgram { corr_id, .. }
         | Query { corr_id, .. }
         | AddProgram { corr_id, .. }

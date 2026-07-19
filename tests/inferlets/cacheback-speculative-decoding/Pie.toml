@@ -1,0 +1,14 @@
+[package]
+name = "cacheback-speculative-decoding"
+version = "0.1.0"
+description = "Speculative decoding with a prompt-lookup n-gram draft cache"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 256)"}
+draft_length = {type = "int", optional = true, description = "Draft tokens proposed per verification step (default: 4)"}
+max_ngram = {type = "int", optional = true, description = "Maximum suffix length used for cache lookup (default: 8)"}

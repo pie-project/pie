@@ -39,7 +39,7 @@ import {
     Grammar, GrammarConstraint,
     jsonSchema, anyJson, regex, ebnf, grammar,
     chat, reasoning, tools,
-    runtime, scheduling, session, messaging, mcp,
+    runtime, scheduling, session, mcp,
 } from '@pie-project/inferlet';
 ```
 
@@ -466,27 +466,6 @@ import { session } from '@pie-project/inferlet';
 | `await session.receiveFile()` | `Uint8Array` | Wait for the next inbound file. |
 
 Signals from `proc.signal(...)` arrive through `session.receive`.
-
-### Messaging
-
-```typescript
-import { messaging, Subscription } from '@pie-project/inferlet';
-```
-
-| Function | Description |
-|---|---|
-| `messaging.broadcast(topic, message)` | Publish to every subscriber. |
-| `messaging.subscribe(topic): Subscription` | Open a subscription. |
-| `messaging.push(topic, message)` | Push onto a queue. |
-| `await messaging.pull(topic): string` | Wait for the next queued message. |
-
-`Subscription` (implements `AsyncIterable<string>` and `Disposable`):
-
-| Method | Description |
-|---|---|
-| `await sub.next(): Promise<string \| undefined>` | Wait for the next broadcast. |
-| `sub.unsubscribe(): void` | Drop the subscription. |
-| `for await (const msg of sub)` | Async-iterable shorthand. |
 
 ### MCP
 

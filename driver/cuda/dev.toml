@@ -1,7 +1,7 @@
 # Sample driver/cuda config. Pass via `pie_driver_cuda --config dev.toml`.
 
 [model]
-hf_repo = "Qwen/Qwen3-0.6B"
+snapshot_dir = "/path/to/local/model"
 device = "cuda:0"
 dtype = "bfloat16"
 

@@ -8,9 +8,9 @@
 //! them to the canonical PTIR container, orders the WIT channel handles by the
 //! builder↔bridge contract
 //! ([`Traced::channel_order`](ptir_dsl::Traced::channel_order)), and calls
-//! `forward-pass.new` (which binds against the model — the guest does not bind,
-//! D6). Program identity, dedup, and validation happen host-side inside
-//! `forward-pass.new`/`forward-pass.submit`.
+//! the empty `forward-pass` builder and attaches the traced program (which
+//! binds against the model — the guest does not bind, D6). Program identity,
+//! dedup, and validation happen host-side at program attachment.
 //!
 //! A [`Channel`] owns BOTH sides: the `ptir-dsl` trace declaration (its `take`/
 //! `put`/`read` record ops inside a stage closure, and host `put`s record the
@@ -20,9 +20,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::{Bound, RangeBounds};
 use std::rc::Rc;
 
-use ptir_dsl::builder::{Builder, PortInput};
+use ptir_dsl::builder::Builder;
 use ptir_dsl::channel::PutValue;
 use ptir_dsl::value::{Arg, ConstData};
 use ptir_dsl::{
@@ -33,27 +34,28 @@ use ptir_dsl::{
 use crate::pie::inferlet::forward as wit;
 use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
-use crate::working_set::{KvWorkingSet, PageRange};
+use crate::working_set::{KvWorkingSet, PageRange, PageSpan};
 
 pub use ptir_dsl::intrinsics;
 
 // Re-export the eDSL vocabulary so an author writes stage closures with a single
 // `use inferlet::ptir::prelude::*;` (mirrors the old `ptir::prelude`).
+pub use ptir_dsl::DType as Dtype;
 pub use ptir_dsl::{
-    add, and, broadcast, cast, cumprod, cummass_le, cumsum, div, dtype, eq, exp, gather,
-    gather_row, ge, gt, gumbel, iota, l2norm, le, log, log_softmax, lt, mask_apply, matmul,
-    max_elem, min_elem, mul, ne, neg, not, or, pivot_threshold, prob_ge, rank_le, reduce_argmax,
-    reduce_max, reduce_min, reduce_sum, rem, reshape, rng, scatter_add, scatter_set, select,
-    softmax, sub, top_k, transpose,
+    add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
+    entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, iota, l2norm,
+    le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem, min_elem, mul, ne, neg,
+    not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le, reduce_argmax, reduce_max,
+    reduce_min, reduce_sum, rem, reshape, rng, row_membership, scalar_gather, scatter_add,
+    scatter_set, select, sink_window_mask, sliding_window_mask, softmax, sub, top_k, transpose,
 };
-pub use ptir_dsl::{model, DType as Dtype};
 
 // ---------------------------------------------------------------------------
 // gid -> WIT channel registry
 // ---------------------------------------------------------------------------
 //
 // A stage trace interns channels and yields dense channel ids keyed by the
-// dsl channel's gid; `forward-pass.new` wants the WIT handles in that dense
+// dsl channel's gid; `forward-pass.program` wants the WIT handles in that dense
 // order. Every channel the author can reference is created via `Channel::new`/
 // `from`/`seeded`, so registering (gid -> Rc<wit::Channel>) at construction
 // lets a `ForwardPass` resolve each `Traced.channel_order` entry. Inferlets are
@@ -90,13 +92,77 @@ fn dims_of(shape: Shape) -> Vec<u32> {
 // Channel
 // ---------------------------------------------------------------------------
 
+/// F8 eager descriptor claim: record the port's endpoint claim on the shared
+/// channel state AT PASS CONSTRUCTION (not at first-submit build), so a
+/// channel consumed by a later-constructed sibling pass is visible to every
+/// pass's host-role derivation. Cross-pass handoffs therefore need only
+/// construction order — build every pass sharing a channel before the first
+/// submit that touches it — and no annotation. `bound()` binds with
+/// `Builder::bind_port_recorded` so the claim is not double-counted.
+fn claim_port(port: Port, ch: &Channel) -> DslChannel {
+    let dsl = ch.dsl();
+    dsl.note_desc_claim(port.consumes());
+    dsl
+}
+
 /// A GPU-resident bounded queue (overview §1). Owns the `ptir-dsl` trace
 /// declaration and the WIT `channel` resource. In a stage closure `take`/`read`/
 /// `put` record IR ops; on the host `put` stages a value (seed / host-writer
-/// cell) and `Taken::get` moves a committed value out.
+/// cell) and `Taken::get().await`/`Taken::bytes().await` materialize a committed value.
+/// A registry-backed COPY TOKEN (F9): the channel's shared state (DSL trace
+/// state + WIT handle) lives in thread-local registries keyed by gid, and
+/// this token holds only the gid plus immutable metadata. Stage closures
+/// capture tokens by value, so closures are `'static`, [`ForwardPass`] has
+/// no lifetime parameter, and inferlets need no `Box::leak` to satisfy it.
+/// Handle lifetime is owned by the registries — which is what makes an
+/// explicit endpoint release at finish/close-settle possible later (the W2
+/// endpoint-release follow-up; flagged, not implemented).
+#[derive(Clone, Copy)]
 pub struct Channel {
-    dsl: DslChannel,
-    wit: Rc<wit::Channel>,
+    gid: u64,
+    shape: Shape,
+    dtype: DType,
+}
+
+/// Default number of decode fires kept submitted ahead of host consumption.
+/// Matches the engine scheduler's run-ahead depth (`MAX_IN_FLIGHT` in
+/// quorum.rs) so a single pipeline can keep every scheduler wave slot fed.
+pub const DEFAULT_RUNAHEAD_DEPTH: usize = 2;
+
+/// In-band validity sentinel: a token slot holding `-1` does not exist —
+/// it embeds nothing, appends no KV, and advances no position. Envelope
+/// shapes stay fixed while `-1` decides which slots are real (shape decides
+/// slots, `-1` decides existence, loop-carry decides position).
+pub const TOKEN_PAD: i32 = -1;
+
+/// Pad a token window to its fixed envelope with [`TOKEN_PAD`] sentinels.
+///
+/// Every fire of an envelope-shaped pass must supply exactly the envelope's
+/// slot count; the sentinel slots ride along as non-existent. Panics if the
+/// window is larger than the envelope — that is a programming error, not a
+/// runtime condition.
+pub fn pad_tokens(tokens: &[u32], envelope: usize) -> Vec<i32> {
+    assert!(
+        tokens.len() <= envelope,
+        "window of {} tokens exceeds its envelope of {envelope}",
+        tokens.len(),
+    );
+    tokens
+        .iter()
+        .map(|&token| token as i32)
+        .chain(std::iter::repeat(TOKEN_PAD))
+        .take(envelope)
+        .collect()
+}
+
+/// Recover the live tokens from an envelope read back from the device,
+/// dropping every [`TOKEN_PAD`] slot (interior or trailing).
+pub fn unpad_tokens(window: &[i32]) -> Vec<u32> {
+    window
+        .iter()
+        .filter(|&&token| token != TOKEN_PAD)
+        .map(|&token| token as u32)
+        .collect()
 }
 
 impl Channel {
@@ -105,19 +171,43 @@ impl Channel {
         Channel::build(shape.into_shape(), dtype, 1, false)
     }
 
+    /// An initially empty channel whose producer is the host.
+    ///
+    /// Unlike [`Channel::new`], this declares the host-writer endpoint before
+    /// the first value is available, so a consuming pass may be submitted
+    /// run-ahead and receive the value later.
+    pub fn writer(shape: impl IntoShape, dtype: DType) -> Channel {
+        let channel = Channel::build(shape.into_shape(), dtype, 1, false);
+        channel.dsl().note_host_put();
+        channel
+    }
+
+    /// The registry-resolved DSL trace state (panics on an unregistered
+    /// token — construction always registers, so that is a frontend bug).
+    fn dsl(&self) -> DslChannel {
+        DslChannel::by_gid(self.gid).expect("channel token resolves in the DSL registry")
+    }
+
+    /// The registry-resolved WIT handle.
+    fn wit(&self) -> Rc<wit::Channel> {
+        lookup_channel(self.gid).expect("channel token resolves in the WIT registry")
+    }
+
     /// Widen the ring to `n` cells (deeper run-ahead).
     pub fn capacity(self, n: u32) -> Channel {
-        let shape = self.dsl.shape();
-        let dtype = self.dsl.dtype();
-        let dsl = self.dsl.capacity(n);
-        let wit = Rc::new(wit::Channel::new(&dims_of(shape), to_wit_dtype(dtype), n));
-        register_channel(dsl.gid(), wit.clone());
-        Channel { dsl, wit }
+        let dsl = self.dsl().capacity(n);
+        let wit = Rc::new(wit::Channel::new(
+            &dims_of(self.shape),
+            to_wit_dtype(self.dtype),
+            n,
+        ));
+        register_channel(dsl.gid(), wit);
+        self
     }
 
     /// Name the channel (improves trace-error messages).
-    pub fn named(mut self, name: &str) -> Channel {
-        self.dsl = self.dsl.named(name);
+    pub fn named(self, name: &str) -> Channel {
+        let _ = self.dsl().named(name);
         self
     }
 
@@ -127,7 +217,7 @@ impl Channel {
     pub fn from(v: impl IntoConst) -> Channel {
         let data: ConstData = v.into_const();
         let ch = Channel::build(data.shape, data.dtype, 1, true);
-        ch.wit
+        ch.wit()
             .put(&data.bytes)
             .expect("stage seed on a fresh channel");
         ch
@@ -153,7 +243,7 @@ impl Channel {
             "from_shaped: element count mismatch"
         );
         let ch = Channel::build(shape, data.dtype, 1, true);
-        ch.wit
+        ch.wit()
             .put(&data.bytes)
             .expect("stage seed on a fresh channel");
         ch
@@ -165,32 +255,49 @@ impl Channel {
         } else {
             DslChannel::new(shape, dtype)
         };
-        let dsl = if capacity != 1 { dsl.capacity(capacity) } else { dsl };
-        let wit = Rc::new(wit::Channel::new(&dims_of(shape), to_wit_dtype(dtype), capacity));
-        register_channel(dsl.gid(), wit.clone());
-        Channel { dsl, wit }
+        let dsl = if capacity != 1 {
+            dsl.capacity(capacity)
+        } else {
+            dsl
+        };
+        let wit = Rc::new(wit::Channel::new(
+            &dims_of(shape),
+            to_wit_dtype(dtype),
+            capacity,
+        ));
+        let gid = dsl.gid();
+        register_channel(gid, wit);
+        Channel { gid, shape, dtype }
     }
 
     pub fn dtype(&self) -> DType {
-        self.dsl.dtype()
+        self.dtype
     }
     pub fn shape(&self) -> Shape {
-        self.dsl.shape()
+        self.shape
     }
 
     /// `take()` — consume a cell. In a stage closure: records a `ChanTake` and
     /// yields an in-program value ([`AsTensor`]). On the host: [`Taken::get`]
-    /// moves the committed value out (blocks until a fire fills it; poison ⇒
+    /// awaits the committed value (awaits until a fire fills it; poison ⇒
     /// `Err`).
     pub fn take(&self) -> Taken {
-        let dsl = self.dsl.take();
-        Taken { dsl, wit: self.wit.clone(), dtype: self.dsl.dtype() }
+        Taken {
+            dsl: self.dsl().take(),
+            wit: self.wit(),
+            mode: TakenMode::Take,
+            dtype: self.dtype,
+        }
     }
 
     /// `read()` — peek a cell (leaves it full). Same dual as [`take`](Self::take).
     pub fn read(&self) -> Taken {
-        let dsl = self.dsl.read();
-        Taken { dsl, wit: self.wit.clone(), dtype: self.dsl.dtype() }
+        Taken {
+            dsl: self.dsl().read(),
+            wit: self.wit(),
+            mode: TakenMode::Read,
+            dtype: self.dtype,
+        }
     }
 
     /// `put(v)` — in a stage closure `v` is an in-program [`Tensor`] (device
@@ -202,23 +309,39 @@ impl Channel {
     pub fn put(&self, v: impl IntoPut) {
         match v.into_put() {
             PutValue::Tensor(t) => {
-                self.dsl.put(t);
+                self.dsl().put(t);
             }
             PutValue::Data(data) => {
-                self.dsl.note_host_put();
-                let _ = self.wit.put(&data.bytes);
+                self.dsl().note_host_put();
+                let _ = self.wit().put(&data.bytes);
             }
         }
+    }
+
+    /// Atomically replace the committed front cell without changing queue
+    /// occupancy. A later value already queued by [`put`](Self::put) is left
+    /// untouched. This is a host operation; unlike a stage `put`, it records no
+    /// PTIR op.
+    pub fn set(&self, v: impl IntoConst) -> Result<(), String> {
+        let data: ConstData = v.into_const();
+        self.wit().set(&data.bytes)
     }
 }
 
 /// The result of [`Channel::take`]/[`Channel::read`]. In a stage closure it is
 /// an in-program value (via [`AsTensor`]); on the host [`get`](Self::get) /
-/// [`bytes`](Self::bytes) move the committed value out.
+/// [`bytes`](Self::bytes) await the committed value.
 pub struct Taken {
     dsl: ptir_dsl::Taken,
     wit: Rc<wit::Channel>,
+    mode: TakenMode,
     dtype: DType,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TakenMode {
+    Take,
+    Read,
 }
 
 impl Taken {
@@ -227,15 +350,18 @@ impl Taken {
         self.dsl.tensor()
     }
 
-    /// Move the committed value out to the host as raw little-endian bytes.
-    /// Blocks by awaiting in-flight fires; a poisoned channel returns `Err`.
-    pub fn bytes(self) -> Result<Vec<u8>, String> {
-        self.wit.take()
+    /// Materialize the committed value to the host as raw little-endian bytes.
+    /// Awaits in-flight fires; a poisoned channel returns `Err`.
+    pub async fn bytes(self) -> Result<Vec<u8>, String> {
+        match self.mode {
+            TakenMode::Take => self.wit.take().await,
+            TakenMode::Read => self.wit.read().await,
+        }
     }
 
-    /// Move the committed value out to the host, decoded to `T`.
-    pub fn get<T: HostElem>(self) -> Result<Vec<T>, String> {
-        let raw = self.wit.take()?;
+    /// Materialize the committed value to the host, decoded to `T`.
+    pub async fn get<T: HostElem>(self) -> Result<Vec<T>, String> {
+        let raw = self.bytes().await?;
         let _ = self.dtype;
         Ok(T::decode(&raw))
     }
@@ -258,17 +384,23 @@ pub trait HostElem: Copy {
 }
 impl HostElem for i32 {
     fn decode(raw: &[u8]) -> Vec<i32> {
-        raw.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        raw.chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 }
 impl HostElem for u32 {
     fn decode(raw: &[u8]) -> Vec<u32> {
-        raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        raw.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 }
 impl HostElem for f32 {
     fn decode(raw: &[u8]) -> Vec<f32> {
-        raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        raw.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 }
 
@@ -288,7 +420,9 @@ pub struct WorkingSet {
 
 impl WorkingSet {
     pub fn new() -> WorkingSet {
-        WorkingSet { kv: Rc::new(KvWorkingSet::new()) }
+        WorkingSet {
+            kv: Rc::new(KvWorkingSet::new()),
+        }
     }
 
     /// Tokens per KV page for this working set's model.
@@ -314,6 +448,23 @@ impl WorkingSet {
         })
     }
 
+    /// Insert or atomically replace an opaque, model-scoped index entry for
+    /// this fully mapped and settled working set.
+    pub fn update_index(&self, key: &[u8]) -> Result<(), String> {
+        self.kv.update_index(key)
+    }
+
+    /// Exact best-effort lookup of an opaque, model-scoped working-set index.
+    pub fn from_index(key: &[u8]) -> Result<Option<WorkingSet>, String> {
+        Ok(KvWorkingSet::from_index(key)?.map(|kv| WorkingSet { kv: Rc::new(kv) }))
+    }
+
+    /// Remove only an index root. Working sets returned by an earlier lookup
+    /// remain valid.
+    pub fn remove_index(key: &[u8]) -> Result<bool, String> {
+        KvWorkingSet::remove_index(key)
+    }
+
     /// Remove `ranges` (pre-discard indexes, applied atomically), ordered on
     /// `on`. Suffix indexes shift down — publish new PTIR geometry after. A
     /// shared-path interior range errs (growth-boundary invariant).
@@ -324,7 +475,9 @@ impl WorkingSet {
     /// O(1) copy-on-write child over the complete logical address space,
     /// ordered on `on` — the branching primitive (beam/MCTS/self-correct).
     pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
-        Ok(WorkingSet { kv: Rc::new(self.kv.fork(&on.wit)?) })
+        Ok(WorkingSet {
+            kv: Rc::new(self.kv.fork(&on.wit)?),
+        })
     }
 
     /// Structurally shared child over `[start, start+len)`, rebased to page
@@ -350,8 +503,13 @@ impl WorkingSet {
         src_page_ids: &[u32],
         src_tok_idx: &[u32],
     ) -> Result<(), String> {
-        self.kv
-            .copy_into(&on.wit, dst_page_ids, dst_tok_idx, src_page_ids, src_tok_idx)
+        self.kv.copy_into(
+            &on.wit,
+            dst_page_ids,
+            dst_tok_idx,
+            src_page_ids,
+            src_tok_idx,
+        )
     }
 }
 
@@ -381,7 +539,10 @@ impl PageGrant {
 
     /// The grant as a WIT `page-range` (e.g. to `discard` it later).
     pub fn range(&self) -> PageRange {
-        PageRange { start: self.start, len: self.ids.len() as u32 }
+        PageRange {
+            start: self.start,
+            len: self.ids.len() as u32,
+        }
     }
 }
 
@@ -392,197 +553,390 @@ impl IntoPut for PageGrant {
 }
 
 // ---------------------------------------------------------------------------
+// RsWorkingSet
+// ---------------------------------------------------------------------------
+
+/// The runtime's recurrent-state slots for hybrid / linear-attention models
+/// (GDN, Mamba2). Wraps the WIT `rs-working-set`. Bind via
+/// [`ForwardPass::rs_working_sets`] for models whose
+/// `model::rs_state_size()` is nonzero; pure-attention models bind none.
+pub struct RsWorkingSet {
+    rs: Rc<crate::working_set::RsWorkingSet>,
+}
+
+impl RsWorkingSet {
+    pub fn new() -> RsWorkingSet {
+        RsWorkingSet {
+            rs: Rc::new(crate::working_set::RsWorkingSet::new()),
+        }
+    }
+
+    /// Size in bytes of one folded recurrent-state object for this model.
+    pub fn state_size(&self) -> u64 {
+        self.rs.state_size()
+    }
+
+    /// Current number of buffered page slots.
+    pub fn buffer_size(&self) -> u32 {
+        self.rs.buffer_size()
+    }
+
+    /// Tokens per buffered RS page for this working set's model/driver.
+    pub fn buffer_page_size(&self) -> u32 {
+        self.rs.buffer_page_size()
+    }
+
+    /// Copy-on-write child sharing the current folded state and buffered
+    /// suffix, ordered on `on`.
+    pub fn fork(&self, on: &Pipeline) -> Result<RsWorkingSet, String> {
+        Ok(RsWorkingSet {
+            rs: Rc::new(self.rs.fork(&on.wit)?),
+        })
+    }
+}
+
+impl Default for RsWorkingSet {
+    fn default() -> Self {
+        RsWorkingSet::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ForwardPass
 // ---------------------------------------------------------------------------
 
-/// A descriptor-port binding staged on the [`ForwardPass`] until submit.
-enum PortSpec {
-    Channel(Port, DslChannel),
-    Const(Port, Tensor),
+type StageClosure = Box<dyn Fn()>;
+
+/// A forward-pass builder. Its WIT resource is constructed empty, descriptor
+/// resources are attached through typed methods, and the traced program is
+/// attached once on first submit.
+pub struct ForwardPass {
+    wit: Rc<wit::ForwardPass>,
+    inner: RefCell<ForwardInner>,
 }
 
-type StageClosure<'a> = Box<dyn Fn() + 'a>;
-
-/// The forward pass (overview §5). Attach descriptor ports + stage closures,
-/// submit through a [`Pipeline`]. On first submit the bridge drives the builder,
-/// lowers to the container, and calls `forward-pass.new`; the bound WIT resource
-/// is memoized. The lifetime lets stage closures borrow the channels they touch.
-pub struct ForwardPass<'a> {
-    inner: RefCell<ForwardInner<'a>>,
+struct ForwardInner {
+    ports: Vec<(Port, DslChannel)>,
+    stages: Vec<(Stage, StageClosure)>,
+    vocab: u32,
+    page_size: u32,
+    attention_ws: Option<Rc<KvWorkingSet>>,
+    rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
+    program_attached: bool,
 }
 
-struct ForwardInner<'a> {
-    ports: Vec<PortSpec>,
-    stages: Vec<(Stage, StageClosure<'a>)>,
-    working_sets: Vec<Rc<KvWorkingSet>>,
-    bound: Option<Rc<wit::ForwardPass>>,
+#[derive(Clone, Copy)]
+struct PageDeclaration {
+    start: u32,
+    end: Option<u32>,
 }
 
-impl<'a> ForwardPass<'a> {
-    pub fn new() -> ForwardPass<'a> {
+impl PageDeclaration {
+    fn from_range(range: impl RangeBounds<u32>) -> Result<Self, String> {
+        let start = match range.start_bound() {
+            Bound::Unbounded => 0,
+            Bound::Included(&start) => start,
+            Bound::Excluded(&start) => start
+                .checked_add(1)
+                .ok_or_else(|| "attention page-span start overflows u32".to_string())?,
+        };
+        let end = match range.end_bound() {
+            Bound::Unbounded => None,
+            Bound::Excluded(&end) => Some(end),
+            Bound::Included(&end) => Some(
+                end.checked_add(1)
+                    .ok_or_else(|| "attention page-span end overflows u32".to_string())?,
+            ),
+        };
+        if end.is_some_and(|end| start > end) {
+            return Err(format!(
+                "attention page-span start {start} exceeds end {}",
+                end.unwrap()
+            ));
+        }
+        Ok(Self { start, end })
+    }
+
+    fn wit(self) -> PageSpan {
+        PageSpan {
+            start: self.start,
+            end: self.end,
+        }
+    }
+}
+
+#[cfg(test)]
+mod page_declaration_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_open_ends() {
+        let all = PageDeclaration::from_range(..).unwrap();
+        assert_eq!((all.start, all.end), (0, None));
+
+        let tail = PageDeclaration::from_range(7..).unwrap();
+        assert_eq!((tail.start, tail.end), (7, None));
+    }
+
+    #[test]
+    fn normalizes_inclusive_and_exclusive_bounds() {
+        let closed = PageDeclaration::from_range(2..5).unwrap();
+        assert_eq!((closed.start, closed.end), (2, Some(5)));
+
+        let inclusive = PageDeclaration::from_range(2..=5).unwrap();
+        assert_eq!((inclusive.start, inclusive.end), (2, Some(6)));
+    }
+
+    #[test]
+    fn rejects_reversed_closed_spans() {
+        assert!(PageDeclaration::from_range(5..4).is_err());
+    }
+
+    #[test]
+    fn rejects_bound_overflow() {
+        assert!(
+            PageDeclaration::from_range((Bound::Excluded(u32::MAX), Bound::Unbounded)).is_err()
+        );
+        assert!(PageDeclaration::from_range(..=u32::MAX).is_err());
+    }
+}
+
+impl ForwardPass {
+    pub fn new() -> ForwardPass {
+        let vocab = crate::model::output_vocab_size();
+        let page_size = crate::model::kv_page_size();
         ForwardPass {
+            wit: Rc::new(wit::ForwardPass::new()),
             inner: RefCell::new(ForwardInner {
                 ports: Vec::new(),
                 stages: Vec::new(),
-                working_sets: Vec::new(),
-                bound: None,
+                vocab,
+                page_size,
+                attention_ws: None,
+                rs_working_sets: Vec::new(),
+                program_attached: false,
             }),
         }
     }
 
-    fn invalidate(&self) {
-        self.inner.borrow_mut().bound = None;
-    }
-
-    /// `embed(&toks, indptr)` — token ids per lane; consumes (take). `indptr`
-    /// is a trace-known constant for rectangular batches, or a channel.
-    pub fn embed(&self, toks: &Channel, indptr: impl Indptr) {
-        {
-            let mut inner = self.inner.borrow_mut();
-            inner.ports.push(PortSpec::Channel(Port::EmbedTokens, toks.dsl.clone()));
-            match indptr.resolve() {
-                IndptrSpec::Const(t) => inner.ports.push(PortSpec::Const(Port::EmbedIndptr, t)),
-                IndptrSpec::Channel(c) => {
-                    inner.ports.push(PortSpec::Channel(Port::EmbedIndptr, c))
-                }
-            }
+    fn ensure_ports_available(&self, ports: &[Port]) -> Result<(), String> {
+        let inner = self.inner.borrow();
+        if inner.program_attached {
+            return Err("forward pass program is already attached".to_string());
         }
-        self.invalidate();
-    }
-
-    /// `positions(&pos)` — explicit RoPE positions; consumes (take).
-    pub fn positions(&self, pos: &Channel) {
-        self.inner.borrow_mut().ports.push(PortSpec::Channel(Port::Positions, pos.dsl.clone()));
-        self.invalidate();
-    }
-
-    /// `attn_working_set(&ws, ..)` — binds attention's memory in one call.
-    pub fn attn_working_set(&self, ws: &WorkingSet, args: impl AttnWsArgs) {
-        let r = args.resolve();
+        if let Some(port) = ports
+            .iter()
+            .find(|port| inner.ports.iter().any(|(bound, _)| bound == *port))
         {
-            let mut inner = self.inner.borrow_mut();
-            inner.ports.push(PortSpec::Channel(Port::KvLen, r.kv_len));
-            if let Some(p) = r.pages {
-                inner.ports.push(PortSpec::Channel(Port::Pages, p));
-            }
-            if let Some(pi) = r.page_indptr {
-                inner.ports.push(PortSpec::Const(Port::PageIndptr, pi));
-            }
-            if let Some(w) = r.w_slot {
-                inner.ports.push(PortSpec::Channel(Port::WSlot, w));
-            }
-            if let Some(w) = r.w_off {
-                inner.ports.push(PortSpec::Channel(Port::WOff, w));
-            }
-            inner.working_sets.push(ws.kv.clone());
+            return Err(format!(
+                "forward pass port {} is already bound",
+                port.name()
+            ));
         }
-        self.invalidate();
+        Ok(())
     }
 
-    /// `attn_mask(&m)` — masks this pass's queries over the KV axis (peeked).
-    pub fn attn_mask(&self, m: &Channel) {
-        self.inner.borrow_mut().ports.push(PortSpec::Channel(Port::AttnMask, m.dsl.clone()));
-        self.invalidate();
+    /// Bind token ids and CSR row indptr. Both descriptor inputs are channels.
+    pub fn embed(&self, tokens: &Channel, indptr: &Channel) -> Result<(), String> {
+        self.ensure_ports_available(&[Port::EmbedTokens, Port::EmbedIndptr])?;
+        let token_wit = tokens.wit();
+        let indptr_wit = indptr.wit();
+        self.wit.embed(token_wit.as_ref(), indptr_wit.as_ref())?;
+        self.inner.borrow_mut().ports.extend([
+            (Port::EmbedTokens, claim_port(Port::EmbedTokens, tokens)),
+            (Port::EmbedIndptr, claim_port(Port::EmbedIndptr, indptr)),
+        ]);
+        Ok(())
     }
 
-    /// Bind a descriptor [`Port`] directly to a channel — the escape hatch for
-    /// device-geometry ports (e.g. `PageIndptr`/`Pages` fed by device-computed
-    /// wire-form channels) that the `attn_working_set` sugar (which takes a const
-    /// `page_indptr`) cannot express. Records the port's endpoint claim per its
-    /// consumption discipline, exactly like the other port setters.
-    pub fn port_channel(&self, port: Port, ch: &Channel) {
-        self.inner.borrow_mut().ports.push(PortSpec::Channel(port, ch.dsl.clone()));
-        self.invalidate();
+    /// Bind attention and all of its geometry channels. This is the only
+    /// attention binding surface; `mask: None` omits PTIR's existing AttnMask
+    /// port, while `Some` binds that channel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention<R, W>(
+        &self,
+        ws: &WorkingSet,
+        readable: R,
+        writable: W,
+        kv_len: &Channel,
+        pages: &Channel,
+        page_indptr: &Channel,
+        w_slot: &Channel,
+        w_off: &Channel,
+        positions: &Channel,
+        mask: Option<&Channel>,
+    ) -> Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        let mut ports = vec![
+            Port::KvLen,
+            Port::Pages,
+            Port::PageIndptr,
+            Port::WSlot,
+            Port::WOff,
+            Port::Positions,
+        ];
+        if mask.is_some() {
+            ports.push(Port::AttnMask);
+        }
+        self.ensure_ports_available(&ports)?;
+        let readable = PageDeclaration::from_range(readable)?;
+        let writable = PageDeclaration::from_range(writable)?;
+        let kv_len_wit = kv_len.wit();
+        let pages_wit = pages.wit();
+        let page_indptr_wit = page_indptr.wit();
+        let w_slot_wit = w_slot.wit();
+        let w_off_wit = w_off.wit();
+        let positions_wit = positions.wit();
+        let mask_wit = mask.map(Channel::wit);
+        self.wit.attention(
+            ws.kv.as_ref(),
+            readable.wit(),
+            writable.wit(),
+            kv_len_wit.as_ref(),
+            pages_wit.as_ref(),
+            page_indptr_wit.as_ref(),
+            w_slot_wit.as_ref(),
+            w_off_wit.as_ref(),
+            positions_wit.as_ref(),
+            mask_wit.as_deref(),
+        )?;
+
+        let mut inner = self.inner.borrow_mut();
+        inner.ports.extend([
+            (Port::KvLen, claim_port(Port::KvLen, kv_len)),
+            (Port::Pages, claim_port(Port::Pages, pages)),
+            (Port::PageIndptr, claim_port(Port::PageIndptr, page_indptr)),
+            (Port::WSlot, claim_port(Port::WSlot, w_slot)),
+            (Port::WOff, claim_port(Port::WOff, w_off)),
+            (Port::Positions, claim_port(Port::Positions, positions)),
+        ]);
+        if let Some(mask) = mask {
+            inner
+                .ports
+                .push((Port::AttnMask, claim_port(Port::AttnMask, mask)));
+        }
+        inner.attention_ws = Some(ws.kv.clone());
+        Ok(())
     }
 
-    /// `readout(&out_idx)` — which positions are read out. A constant `out_idx`
-    /// fixes the read-out row count.
-    pub fn readout(&self, out_idx: &Tensor) {
-        self.inner.borrow_mut().ports.push(PortSpec::Const(Port::Readout, out_idx.clone()));
-        self.invalidate();
+    /// Bind recurrent-state working sets in resolved request order.
+    pub fn rs_working_sets(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
+        let replacement: Vec<Rc<crate::working_set::RsWorkingSet>> =
+            working_sets.iter().map(|rs| rs.rs.clone()).collect();
+        let borrows: Vec<&crate::working_set::RsWorkingSet> =
+            replacement.iter().map(Rc::as_ref).collect();
+        self.wit.set_rs_working_sets(&borrows)?;
+        self.inner.borrow_mut().rs_working_sets = replacement;
+        Ok(())
+    }
+
+    /// Bind readout indexes through a channel, separately from embedding.
+    pub fn readout(&self, indices: &Channel) -> Result<(), String> {
+        self.ensure_ports_available(&[Port::Readout])?;
+        let indices_wit = indices.wit();
+        self.wit.readout(indices_wit.as_ref())?;
+        self.inner
+            .borrow_mut()
+            .ports
+            .push((Port::Readout, claim_port(Port::Readout, indices)));
+        Ok(())
     }
 
     /// Attach the `prologue` stage (overview §5.3).
-    pub fn prologue(&self, body: impl Fn() + 'a) {
+    pub fn prologue(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::Prologue, body);
     }
     /// Attach the `on_attn_proj` stage (per layer, before attention).
-    pub fn on_attn_proj(&self, body: impl Fn() + 'a) {
+    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::OnAttnProj, body);
     }
     /// Attach the `on_attn` stage (per layer, after attention).
-    pub fn on_attn(&self, body: impl Fn() + 'a) {
+    pub fn on_attn(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::OnAttn, body);
     }
     /// Attach the `epilogue` stage (sampling programs; after the forward).
-    pub fn epilogue(&self, body: impl Fn() + 'a) {
+    pub fn epilogue(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::Epilogue, body);
     }
 
-    fn set_stage(&self, stage: Stage, body: impl Fn() + 'a) {
-        {
-            let mut inner = self.inner.borrow_mut();
-            if let Some(slot) = inner.stages.iter_mut().find(|(s, _)| *s == stage) {
-                slot.1 = Box::new(body);
-            } else {
-                inner.stages.push((stage, Box::new(body)));
-            }
+    fn set_stage(&self, stage: Stage, body: impl Fn() + 'static) {
+        let mut inner = self.inner.borrow_mut();
+        assert!(
+            !inner.program_attached,
+            "stage attachment is construction-only"
+        );
+        if let Some(slot) = inner.stages.iter_mut().find(|(s, _)| *s == stage) {
+            slot.1 = Box::new(body);
+        } else {
+            inner.stages.push((stage, Box::new(body)));
         }
-        self.invalidate();
     }
 
-    /// `submit(&pipeline)` — enqueue this pass run-ahead on `on`; never
-    /// blocks (the channels' `take`/`read` are the await points). The first
-    /// submit lowers + binds (`forward-pass.new`); bind errors surface here.
+    /// Enqueue this pass run-ahead. First submit traces and attaches the
+    /// canonical program; attachment and bind errors surface here.
     pub fn submit(&self, on: &Pipeline) -> Result<(), String> {
-        let bound = self.bound()?;
-        bound.submit(&on.wit)
+        self.attach_program()?;
+        self.wit.submit(&on.wit)
     }
 
-    /// Lower + bind, memoized. Traces the stage closures once into the canonical
-    /// container, orders the WIT channel handles by the builder↔bridge contract,
-    /// and calls `forward-pass.new` (bind errors surface here as the validator's
-    /// message).
-    fn bound(&self) -> Result<Rc<wit::ForwardPass>, String> {
-        if let Some(fp) = &self.inner.borrow().bound {
-            return Ok(fp.clone());
+    fn attach_program(&self) -> Result<(), String> {
+        if self.inner.borrow().program_attached {
+            return Ok(());
         }
 
-        let fp = {
-            let inner = self.inner.borrow();
-            let mut builder = Builder::new();
-            for spec in &inner.ports {
-                match spec {
-                    PortSpec::Channel(port, ch) => {
-                        builder.bind_port(*port, PortInput::Channel(ch.clone()))
-                    }
-                    PortSpec::Const(port, t) => builder.bind_port(*port, PortInput::Const(t.clone())),
-                }
-            }
-            for (stage, body) in &inner.stages {
-                builder.stage(*stage, body);
-            }
-            let traced = builder.build().map_err(|e| e.to_string())?;
-            drop(builder);
+        let inner = self.inner.borrow();
+        let required = [
+            Port::EmbedTokens,
+            Port::EmbedIndptr,
+            Port::KvLen,
+            Port::Pages,
+            Port::PageIndptr,
+            Port::WSlot,
+            Port::WOff,
+            Port::Positions,
+        ];
+        let missing = required
+            .into_iter()
+            .filter(|port| !inner.ports.iter().any(|(bound, _)| bound == port))
+            .map(Port::name)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "forward pass is missing descriptor channels: {}",
+                missing.join(", ")
+            ));
+        }
+        if inner.attention_ws.is_none() {
+            return Err("attention must be bound before submit".to_string());
+        }
 
-            let handles: Vec<Rc<wit::Channel>> = traced
-                .channel_order()
-                .iter()
-                .map(|gid| lookup_channel(*gid).expect("channel registered before submit"))
-                .collect();
-            let borrows: Vec<&wit::Channel> = handles.iter().map(|rc| rc.as_ref()).collect();
-            let kv_borrows: Vec<&KvWorkingSet> =
-                inner.working_sets.iter().map(|rc| rc.as_ref()).collect();
-            let bytes = traced.encode();
-            Rc::new(wit::ForwardPass::new(&bytes, &borrows, &kv_borrows, &[])?)
-        };
-
-        self.inner.borrow_mut().bound = Some(fp.clone());
-        Ok(fp)
+        let mut builder = Builder::new(inner.vocab, inner.page_size);
+        for (port, channel) in &inner.ports {
+            builder.bind_port_recorded(*port, channel.clone());
+        }
+        for (stage, body) in &inner.stages {
+            builder.stage(*stage, body);
+        }
+        let traced = builder.build().map_err(|error| error.to_string())?;
+        drop(builder);
+        let handles: Vec<Rc<wit::Channel>> = traced
+            .channel_order()
+            .iter()
+            .map(|gid| lookup_channel(*gid).expect("channel registered before submit"))
+            .collect();
+        let borrows: Vec<&wit::Channel> = handles.iter().map(Rc::as_ref).collect();
+        let bytes = traced.encode();
+        self.wit.program(&bytes, &borrows)?;
+        drop(inner);
+        self.inner.borrow_mut().program_attached = true;
+        Ok(())
     }
 }
 
-impl<'a> Default for ForwardPass<'a> {
+impl Default for ForwardPass {
     fn default() -> Self {
         ForwardPass::new()
     }
@@ -597,16 +951,32 @@ impl<'a> Default for ForwardPass<'a> {
 /// Ordering across fires is carried by the channels' full/empty bits, not
 /// host code. Working-set mutators ([`WorkingSet::fork`]/`slice`/`discard`/
 /// `copy_into`) and [`ForwardPass::submit`] take `&Pipeline`.
+///
+/// # Canonical usage (one pipeline per sequential stream)
+///
+/// A `Pipeline` is an ordering domain, not a program: heterogeneous passes
+/// (an N-wide prefill, then a loop-carried decode) are ONE sequential
+/// stream and belong on ONE pipeline — never split phases of the same
+/// stream across pipelines. Call [`Pipeline::close`] right after the last
+/// submit; already-submitted run-ahead fires settle normally and remain
+/// take-able. Separate pipelines are for
+/// genuinely CONCURRENT streams only (draft vs target model in speculative
+/// decoding, parallel beam branches, independent requests) — close each
+/// stream when it will accept no more submissions.
 pub struct Pipeline {
     wit: wit_pipeline::Pipeline,
 }
 
 impl Pipeline {
     pub fn new() -> Pipeline {
-        Pipeline { wit: wit_pipeline::Pipeline::new() }
+        Pipeline {
+            wit: wit_pipeline::Pipeline::new(),
+        }
     }
 
-    /// `close()` — signal no further submissions (implied by drop).
+    /// End the stream and release its scheduler wait-set immediately.
+    /// Already-submitted fires drain to settlement in FIFO order and remain
+    /// take-able; later submissions fail. Dropping a pipeline is identical.
     pub fn close(&self) {
         self.wit.close();
     }
@@ -619,86 +989,26 @@ impl Default for Pipeline {
 }
 
 // ---------------------------------------------------------------------------
-// Port argument traits (mirrors the ptir-dsl author surface)
-// ---------------------------------------------------------------------------
-
-/// An `embed` indptr: a trace-known constant, or a channel.
-pub enum IndptrSpec {
-    Const(Tensor),
-    Channel(DslChannel),
-}
-
-/// Anything usable as an `embed` indptr.
-pub trait Indptr {
-    fn resolve(self) -> IndptrSpec;
-}
-impl Indptr for Tensor {
-    fn resolve(self) -> IndptrSpec {
-        IndptrSpec::Const(self)
-    }
-}
-impl Indptr for &Channel {
-    fn resolve(self) -> IndptrSpec {
-        IndptrSpec::Channel(self.dsl.clone())
-    }
-}
-
-/// The resolved trailing args of `attn_working_set`.
-pub struct AttnWsResolved {
-    kv_len: DslChannel,
-    pages: Option<DslChannel>,
-    page_indptr: Option<Tensor>,
-    w_slot: Option<DslChannel>,
-    w_off: Option<DslChannel>,
-}
-
-/// The `attn_working_set` trailing-argument arities (overview §5.1).
-pub trait AttnWsArgs {
-    fn resolve(self) -> AttnWsResolved;
-}
-/// Sugar arity: `attn_working_set(&ws, &len)`.
-impl AttnWsArgs for &Channel {
-    fn resolve(self) -> AttnWsResolved {
-        AttnWsResolved {
-            kv_len: self.dsl.clone(),
-            pages: None,
-            page_indptr: None,
-            w_slot: None,
-            w_off: None,
-        }
-    }
-}
-/// Full arity: `(&pages, page_indptr, &klen, &w_slot, &w_off)`.
-impl AttnWsArgs for (&Channel, Tensor, &Channel, &Channel, &Channel) {
-    fn resolve(self) -> AttnWsResolved {
-        let (pages, page_indptr, klen, w_slot, w_off) = self;
-        AttnWsResolved {
-            kv_len: klen.dsl.clone(),
-            pages: Some(pages.dsl.clone()),
-            page_indptr: Some(page_indptr),
-            w_slot: Some(w_slot.dsl.clone()),
-            w_off: Some(w_off.dsl.clone()),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // prelude
 // ---------------------------------------------------------------------------
 
 /// Glob-import surface for PTIR inferlet authors: the eDSL vocabulary plus the
 /// four author-facing wrapper types.
 pub mod prelude {
-    pub use super::{Channel, ForwardPass, PageGrant, Pipeline, WorkingSet};
+    pub use super::{
+        Channel, DEFAULT_RUNAHEAD_DEPTH, ForwardPass, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD,
+        WorkingSet, pad_tokens, unpad_tokens,
+    };
     pub use ptir_dsl::dtype;
     pub use ptir_dsl::intrinsics;
     pub use ptir_dsl::value::{
-        add, and, broadcast, cast, cumprod, cummass_le, cumsum, div, eq, exp, gather, gather_row,
-        ge, gt, gumbel, iota, l2norm, le, log, log_softmax, lt, mask_apply, matmul, max_elem,
-        min_elem, mul, ne, neg, not, or, pivot_threshold, prob_ge, rank_le, reduce_argmax,
-        reduce_max, reduce_min, reduce_sum, rem, reshape, rng, scatter_add, scatter_set, select,
-        softmax, sub, top_k, transpose, Tensor,
+        AsTensor, Tensor, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div,
+        entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max,
+        iota, l2norm, le, log, log_softmax, lt, mask_apply, masked_argmax, matmul, max_elem,
+        min_elem, mul, ne, neg, not, nucleus_sample, or, pivot_threshold, prob_ge, rank_le,
+        reduce_argmax, reduce_max, reduce_min, reduce_sum, rem, reshape, rng, row_membership,
+        scalar_gather, scatter_add, scatter_set, select, sink_window_mask, sliding_window_mask,
+        softmax, sub, top_k, transpose,
     };
-    pub use ptir_dsl::{DType, Port, Stage};
-    pub use ptir_dsl::model;
+    pub use ptir_dsl::{DType, Stage};
 }

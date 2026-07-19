@@ -17,16 +17,7 @@
 //! to export (e.g. metal/vulkan) decline by returning `None`. Real per-backend
 //! device-memory export + RDMA registration is deferred.
 
-use pie_driver_abi::{KvDtype, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
-
-/// Producer half of the KV-export seam. A backend returns `Some(handle)` to
-/// expose its KV cache to the transport layer, or `None` to decline (single-node
-/// / no remote-transfer support).
-pub trait KvExport {
-    /// Produce the [`KvHandle`] describing this backend's KV cache, or `None`
-    /// if it cannot participate in remote KV transfer.
-    fn export_kv_handle(&self) -> Option<KvHandle>;
-}
+use pie_driver_abi::{KvDtype, KvExport, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
 
 /// The dummy driver's host-DRAM KV-export stub.
 ///
@@ -44,12 +35,8 @@ pub struct DummyKvExport {
 }
 
 impl DummyKvExport {
-    /// Pages the synthetic buffer holds — a handful so a transfer has room to
-    /// move. Delta hands exact e2e numbers; this is the safe default.
-    const PAGES: u64 = 8;
-
-    /// Allocate the synthetic export buffer sized `layout.page_bytes() * PAGES`.
-    pub fn new() -> Self {
+    /// Allocate a synthetic export buffer matching the configured page count.
+    pub fn new(num_pages: u32, page_size: u32) -> Self {
         // Minimal but self-consistent layout. page_bytes() here is
         // 1 layer · 2 planes · 1 head · 64 head_dim · 16 tokens/page · 2 B
         // = 4096 bytes/page.
@@ -57,11 +44,14 @@ impl DummyKvExport {
             num_layers: 1,
             num_kv_heads: 1,
             head_dim: 64,
-            page_size: 16,
+            page_size,
             dtype: KvDtype::Bf16,
             kind: KvLayoutKind::KvSeparate,
+            storage_format: "dummy-bf16-v1".to_string(),
+            region_page_bytes: Vec::new(),
         };
-        let len = layout.page_bytes() * Self::PAGES;
+        let page_stride = layout.page_bytes();
+        let len = page_stride * num_pages as u64;
         Self {
             buf: vec![0u8; len as usize],
             layout,
@@ -84,7 +74,7 @@ impl DummyKvExport {
 
 impl Default for DummyKvExport {
     fn default() -> Self {
-        Self::new()
+        Self::new(8, 16)
     }
 }
 
@@ -97,6 +87,7 @@ impl KvExport for DummyKvExport {
             regions: vec![KvRegion {
                 base: self.buf.as_ptr() as u64,
                 len: self.buf.len() as u64,
+                page_stride: self.layout.page_bytes(),
                 domain: MemoryDomain::HostPinned,
             }],
             layout: self.layout.clone(),

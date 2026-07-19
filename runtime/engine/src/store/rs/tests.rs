@@ -82,20 +82,24 @@ fn buffer_writes_materialize_then_in_place_then_cow_after_fork() {
 
     // First write materializes all three pages.
     let prepared = s.prepare_write(ws, false, Some((0, 12))).unwrap();
-    assert!(prepared
-        .buffer_targets()
-        .iter()
-        .all(|t| matches!(t, RsBufferTarget::Fresh { .. })));
+    assert!(
+        prepared
+            .buffer_targets()
+            .iter()
+            .all(|t| matches!(t, RsBufferTarget::Fresh { .. }))
+    );
     let ids: Vec<_> = prepared.buffer_targets().iter().map(|t| t.dst()).collect();
     s.commit(prepared, 1).unwrap();
     assert_eq!(s.resolve_buffer(ws, 0, 12).unwrap(), ids);
 
     // Second write is in place.
     let prepared = s.prepare_write(ws, false, Some((0, 12))).unwrap();
-    assert!(prepared
-        .buffer_targets()
-        .iter()
-        .all(|t| matches!(t, RsBufferTarget::InPlace { .. })));
+    assert!(
+        prepared
+            .buffer_targets()
+            .iter()
+            .all(|t| matches!(t, RsBufferTarget::InPlace { .. }))
+    );
     s.commit(prepared, 2).unwrap();
 
     // After a fork the pages are shared: partial-range write CoWs its span.

@@ -1,10 +1,10 @@
-//! Native-driver bootstrap helpers for pie-worker.
+//! Driver-backend bootstrap helpers for pie-worker.
 //!
 //! This module exposes:
 //!   * [`DriverCapabilities`] — typed driver capability payloads.
 //!   * [`write_cuda_startup_toml`] / [`write_metal_startup_toml`] — emit the
 //!     per-launch TOML each native driver reads at creation.
-//!   * [`create_native_driver`] — build a runtime-owned [`NativeDriver`]
+//!   * [`create_driver_backend`] — build a runtime-owned [`DriverBackend`]
 //!     plus its caps before `pie_engine::bootstrap`.
 
 #[cfg(feature = "driver-cuda")]
@@ -142,7 +142,7 @@ fn write_toml_table(out_path: &Path, doc: toml::Table) -> Result<()> {
 /// but legal — different ports) don't clobber each other's TOML or
 /// aux sockets.
 pub fn launch_state_dir() -> PathBuf {
-    pie_engine::util::get_pie_home()
+    bootstrap::paths::pie_home()
         .join("standalone")
         .join(std::process::id().to_string())
 }
@@ -247,129 +247,150 @@ pub fn write_metal_startup_toml(
     write_toml_table(out_path, doc)
 }
 
-/// Compile the checkpoint's StorageProgram in-process (weight-loader Variant A)
-/// and write it beside the startup TOML, returning the file path to record in
-/// `[model].storage_program_path`. The embedded cuda driver deserializes that
-/// file instead of running its own C++ checkpoint parse + compile (the
-/// *locality switch* = path-present). The **bulk weight bytes never cross**:
-/// the serialized program records only where each tensor lives; the driver
-/// reads the payloads from its own copy of the checkpoint at execution.
-///
-/// Returns `None` (and logs) when the in-process compile can't produce a
-/// provably-correct program for this checkpoint — e.g. the config can't be
-/// parsed, or the request needs a device capability the runtime can't query
-/// before load (`runtime_quant="fp8"` → `fp8_native`; `mxfp4_moe="native"` →
-/// Blackwell). The embedded driver then transparently falls back to its own
-/// C++ compile, which runs after the device query. See plan.md
-/// "device-cap-derived gaps".
-#[cfg(feature = "driver-cuda")]
-fn compile_cuda_storage_program(
-    out_path: &Path,
+fn compile_load_plan_bytes(
     snapshot_dir: &Path,
-    opts: &CudaNativeDriverOptions,
+    facts: &pie_driver_abi::DeviceFacts,
+    runtime_quant: &str,
+    mxfp4_moe: &str,
     tp: Option<&TpLaunch>,
-) -> Option<PathBuf> {
-    use pie_weight_loader::inproc::{compile_snapshot_to_bytes, parse_model_config};
-    use pie_weight_loader::storage::StorageTarget;
-    use pie_weight_loader::types::{BackendKind, Mxfp4MoePolicy};
+    component: pie_driver_abi::ModelComponent,
+) -> Result<Vec<u8>> {
+    use pie_load_planner::abi::RuntimeAbi;
+    use pie_load_planner::inproc::{
+        compile_snapshot_to_plan_bytes, parse_checkpoint_metadata, parse_model_config,
+        serialize_load_plan,
+    };
+    use pie_load_planner::load_plan::StorageTarget;
+    use pie_load_planner::planner::compile_load_plan;
+    use pie_load_planner::types::{BackendKind, Mxfp4MoePolicy};
 
-    // Static CUDA storage-target constants (mirror driver/cuda/src/model/
-    // loaded_model.cpp `kStorageMaxTileBytes` / `kStoragePreferredAlignment`).
-    const CUDA_MAX_TILE_BYTES: u64 = 64 * 1024 * 1024;
-    const CUDA_PREFERRED_ALIGNMENT: u32 = 256;
-
-    // `runtime_quant="fp8"` is cleared by the driver on GPUs without native FP8
-    // (`fp8_native`), a capability the runtime can't query before load; defer to
-    // the C++ compile so we never emit a program the device would reject.
-    if opts.runtime_quant == "fp8" {
-        tracing::info!(
-            "weight-loader: runtime_quant='fp8' is device-conditional (fp8_native); \
-             deferring storage compile to the embedded cuda driver"
-        );
-        return None;
+    if facts.abi_version != pie_driver_abi::PIE_DRIVER_ABI_VERSION {
+        return Err(anyhow!(
+            "driver device facts ABI {} does not match runtime ABI {}",
+            facts.abi_version,
+            pie_driver_abi::PIE_DRIVER_ABI_VERSION
+        ));
     }
-
-    let model = match parse_model_config(snapshot_dir, opts.runtime_quant.clone()) {
-        Ok(model) => model,
-        Err(err) => {
-            tracing::warn!(
-                "weight-loader: in-process storage compile skipped ({err}); the \
-                 embedded cuda driver will compile the checkpoint itself"
-            );
-            return None;
+    let backend = match facts.backend.as_str() {
+        "cuda" => BackendKind::Cuda,
+        "metal" => BackendKind::Metal,
+        "dummy" => BackendKind::Unknown,
+        other => {
+            return Err(anyhow!(
+                "unsupported storage backend in device facts: {other}"
+            ));
         }
     };
-
-    // Resolve the MXFP4 MoE policy the way the C++ driver does
-    // (select_mxfp4_moe_lowering) for a non-Blackwell target. `native_mxfp4_moe`
-    // is GPU-derived (sm_100+) and can't be device-queried before load, so it
-    // defaults to false; it only affects the compiled program when the model
-    // requests `mxfp4_moe="native"` (handled below) — routed/eager are
-    // device-independent.
-    let native_mxfp4_moe = false;
-    let mxfp4_moe = match opts.mxfp4_moe.as_str() {
-        "" | "auto" | "routed_dequant" | "packed" => Mxfp4MoePolicy::RoutedDecode,
+    let effective_runtime_quant = if runtime_quant == "fp8" && !facts.fp8_native {
+        tracing::info!(
+            "load-planner: runtime_quant='fp8' disabled because device facts report \
+             fp8_native=false"
+        );
+        ""
+    } else {
+        runtime_quant
+    };
+    let model = parse_model_config(snapshot_dir, effective_runtime_quant)
+        .map_err(|err| anyhow!("load-planner model config parse failed: {err}"))?;
+    let mxfp4_moe = match mxfp4_moe {
+        "" | "auto" => {
+            if facts.native_mxfp4_moe {
+                Mxfp4MoePolicy::NativeGemm
+            } else {
+                Mxfp4MoePolicy::RoutedDecode
+            }
+        }
+        "routed_dequant" | "packed" => Mxfp4MoePolicy::RoutedDecode,
         "bf16" | "dequant" | "eager_bf16" => Mxfp4MoePolicy::EagerBf16,
         "native" => {
-            tracing::info!(
-                "weight-loader: mxfp4_moe='native' needs a Blackwell device query \
-                 unavailable pre-load; deferring storage compile to the C++ path"
-            );
-            return None;
+            if !facts.native_mxfp4_moe {
+                return Err(anyhow!(
+                    "mxfp4_moe='native' requested, but device facts report \
+                     native_mxfp4_moe=false"
+                ));
+            }
+            Mxfp4MoePolicy::NativeGemm
         }
-        other => {
-            tracing::warn!(
-                "weight-loader: unknown mxfp4_moe='{other}'; deferring storage \
-                 compile to the embedded cuda driver"
-            );
-            return None;
-        }
+        other => return Err(anyhow!("unknown mxfp4_moe policy '{other}'")),
     };
 
     let (tp_rank, tp_size) = tp.map(|t| (t.rank as u32, t.size as u32)).unwrap_or((0, 1));
     let target = StorageTarget {
-        backend: BackendKind::Cuda,
+        backend,
         tp_rank,
         tp_size,
-        max_tile_bytes: CUDA_MAX_TILE_BYTES,
-        preferred_alignment: CUDA_PREFERRED_ALIGNMENT,
+        max_tile_bytes: facts.storage_max_tile_bytes,
+        preferred_alignment: facts.storage_alignment.max(1),
+        tile_map_mask: facts.storage_tile_map_mask,
         mxfp4_moe,
-        native_mxfp4_moe,
+        native_mxfp4_moe: facts.native_mxfp4_moe,
     };
 
-    let bytes = match compile_snapshot_to_bytes(snapshot_dir, &model, target) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::warn!(
-                "weight-loader: in-process storage compile failed ({err}); the \
-                 embedded cuda driver will compile the checkpoint itself"
+    let bytes =
+        if component == pie_driver_abi::ModelComponent::Encode && backend == BackendKind::Cuda {
+            anyhow::ensure!(
+                tp_size == 1,
+                "encode-scoped CUDA loading does not support tensor parallelism"
             );
-            return None;
-        }
-    };
-
-    // Write beside the (already per-rank) startup TOML so concurrent TP ranks
-    // don't collide.
-    let bin_path = out_path.with_extension("storage_program.bin");
-    if let Err(err) = std::fs::write(&bin_path, &bytes) {
-        tracing::warn!(
-            "weight-loader: failed to write storage program {bin_path:?} ({err}); \
-             the embedded cuda driver will compile the checkpoint itself"
-        );
-        return None;
-    }
+            anyhow::ensure!(
+                matches!(model.model_type.as_str(), "gemma4" | "gemma4_text"),
+                "encode-scoped CUDA loading currently supports Gemma-4, got {}",
+                model.model_type
+            );
+            let metadata = parse_checkpoint_metadata(snapshot_dir)
+                .map_err(|err| anyhow!("load-planner metadata parse failed: {err}"))?;
+            let abi = RuntimeAbi::default_for_target(&metadata, &model, &target)
+                .and_then(|abi| {
+                    abi.retain_outputs(|name| {
+                        name.starts_with("model.vision_tower.")
+                            || name.starts_with("model.embed_vision.")
+                            || name.starts_with("model.audio_tower.")
+                            || name.starts_with("model.embed_audio.")
+                    })
+                })
+                .map_err(|err| anyhow!("encode component ABI planning failed: {err}"))?;
+            let plan = compile_load_plan(&metadata, &model, &abi, target)
+                .map_err(|err| anyhow!("encode load planning failed: {err}"))?;
+            serialize_load_plan(&plan)
+                .map_err(|err| anyhow!("encode load-plan serialization failed: {err}"))?
+        } else {
+            compile_snapshot_to_plan_bytes(snapshot_dir, &model, target)
+                .map_err(|err| anyhow!("load planning failed: {err}"))?
+        };
     tracing::info!(
-        "weight-loader: compiled StorageProgram in-process → {} ({} bytes); the \
-         embedded cuda driver will deserialize it (bulk weights never cross)",
-        bin_path.display(),
+        "load-planner: compiled LoadPlan in-process ({} bytes); the driver \
+         will execute it from the boot call (bulk weights never cross)",
         bytes.len()
     );
-    Some(bin_path)
+    Ok(bytes)
+}
+
+fn model_load_desc(
+    snapshot_dir: &Path,
+    facts: &pie_driver_abi::DeviceFacts,
+    runtime_quant: &str,
+    mxfp4_moe: &str,
+    tp: Option<&TpLaunch>,
+    component: pie_driver_abi::ModelComponent,
+) -> Result<pie_driver_abi::ModelLoadDesc> {
+    Ok(pie_driver_abi::ModelLoadDesc {
+        load_plan_bytes: compile_load_plan_bytes(
+            snapshot_dir,
+            facts,
+            runtime_quant,
+            mxfp4_moe,
+            tp,
+            component,
+        )?,
+        snapshot_dir: snapshot_dir.to_path_buf(),
+        compiler_version: pie_load_planner::load_plan::compiler_version(),
+        component,
+    })
 }
 
 /// Write the cuda driver's startup TOML. Schema mirrors
 /// `driver/cuda/src/config.hpp`: `[model]` with
-/// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional load policy knobs,
+/// `snapshot_dir`/`device`/`dtype` plus model-execution knobs,
 /// `[batching]` with KV-page geometry plus `swap_pool_size`, and `[runtime]`
 /// with the server verbosity flag.
 ///
@@ -388,31 +409,12 @@ pub(crate) fn write_cuda_startup_toml(
     insert_str(&mut model, "snapshot_dir", path_string(snapshot_dir));
     insert_str(&mut model, "device", &opts.device);
     insert_str(&mut model, "dtype", opts.weight_dtype.clone());
-    if !opts.runtime_quant.is_empty() {
-        insert_str(&mut model, "runtime_quant", opts.runtime_quant.clone());
-    }
-    if !opts.mxfp4_moe.is_empty() && opts.mxfp4_moe != "auto" {
-        insert_str(&mut model, "mxfp4_moe", opts.mxfp4_moe.clone());
-    }
-    if !opts.mtp_assistant_snapshot_dir.is_empty() {
-        insert_str(
-            &mut model,
-            "mtp_assistant_snapshot_dir",
-            opts.mtp_assistant_snapshot_dir.clone(),
-        );
-    }
     insert_int(&mut model, "mtp_num_drafts", opts.mtp_num_drafts);
     insert_bool(
         &mut model,
         "enable_system_speculation",
         opts.enable_system_speculation,
     );
-    // Weight-loader Variant A: compile the StorageProgram in-process and hand it
-    // to the embedded cuda driver as a file path (bulk weights never cross).
-    #[cfg(feature = "driver-cuda")]
-    if let Some(bin_path) = compile_cuda_storage_program(out_path, snapshot_dir, opts, tp) {
-        insert_str(&mut model, "storage_program_path", path_string(&bin_path));
-    }
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -514,32 +516,48 @@ fn dummy_native_options(
         max_forward_tokens,
         max_forward_requests,
         max_page_refs: total_pages,
+        has_mtp_logits: true,
+        has_mtp_drafts: true,
+        has_value_head: true,
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
+        retry_launches_remaining: 0,
+        elastic_admission: false,
+        prepare_exhaustions_remaining: 0,
+        prepare_impossible_above_kv_pages: 0,
         operation_log: None,
         launch_observer: None,
     })
 }
 
 fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
-    let is_gguf_file =
-        snapshot_dir.is_file() && snapshot_dir.extension().is_some_and(|e| e == "gguf");
-    if !snapshot_dir.is_dir() && !is_gguf_file {
+    let is_gguf_file = snapshot_dir.is_file()
+        && snapshot_dir
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
+    if is_gguf_file {
         return Err(anyhow!(
-            "snapshot_dir {snapshot_dir:?} does not exist, or is not a directory or .gguf file"
+            "GGUF model loading is deferred by the LoadPlan executors; \
+             use a Hugging Face safetensors snapshot directory"
+        ));
+    }
+    if !snapshot_dir.is_dir() {
+        return Err(anyhow!(
+            "snapshot_dir {snapshot_dir:?} does not exist or is not a directory"
         ));
     }
     Ok(())
 }
 
 #[cfg(feature = "driver-cuda")]
-pub(crate) fn create_native_driver_group(
+pub(crate) fn create_driver_backend_group(
     rank_options: &[DriverOptions],
     snapshot_dir: &Path,
     group_id: usize,
     tp_launches: &[TpLaunch],
+    component: pie_driver_abi::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
     validate_snapshot_dir(snapshot_dir)?;
     if rank_options.is_empty() {
@@ -560,33 +578,79 @@ pub(crate) fn create_native_driver_group(
                 "cuda group creation requires cuda-native rank options"
             ));
         };
+        if !opts.mtp_assistant_snapshot_dir.is_empty() {
+            return Err(anyhow!(
+                "mtp_assistant_snapshot_dir is not supported by the single-model \
+                 LoadPlan boot contract"
+            ));
+        }
         let state_dir = local_driver_state_dir(group_id, Some(tp))?;
         let toml_path = state_dir.join("driver.toml");
         write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, Some(tp))?;
         config_blobs.push(toml_path.to_string_lossy().into_owned().into_bytes());
     }
 
-    let (native, caps) = pie_engine::driver::NativeDriver::cuda_group_create(config_blobs)?;
-    Ok(crate::translate::GroupDriver { caps, native })
+    let (mut backend, facts) = pie_engine::driver::DriverBackend::cuda_group_create(config_blobs)?;
+    if facts.len() != rank_options.len() {
+        return Err(anyhow!(
+            "cuda group returned {} device-facts payloads for {} ranks",
+            facts.len(),
+            rank_options.len()
+        ));
+    }
+    let descs = rank_options
+        .iter()
+        .zip(tp_launches)
+        .zip(&facts)
+        .map(|((options, tp), facts)| {
+            let DriverOptions::CudaNative(opts) = options else {
+                unreachable!("validated cuda options above");
+            };
+            model_load_desc(
+                snapshot_dir,
+                facts,
+                &opts.runtime_quant,
+                &opts.mxfp4_moe,
+                Some(tp),
+                component,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let caps = backend.load_model(descs)?;
+    Ok(crate::translate::GroupDriver { caps, backend })
 }
 
-pub(crate) fn create_native_driver(
+pub(crate) fn create_driver_backend(
     options: &DriverOptions,
     snapshot_dir: &Path,
     group_id: usize,
     tp: Option<&TpLaunch>,
+    component: pie_driver_abi::ModelComponent,
 ) -> Result<crate::translate::GroupDriver> {
     let _ = (group_id, tp);
     validate_snapshot_dir(snapshot_dir)?;
 
-    let (native, caps) = match options {
+    let (mut backend, facts, runtime_quant, mxfp4_moe) = match options {
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => {
+            if !opts.mtp_assistant_snapshot_dir.is_empty() {
+                return Err(anyhow!(
+                    "mtp_assistant_snapshot_dir is not supported by the single-model \
+                     LoadPlan boot contract"
+                ));
+            }
             let state_dir = local_driver_state_dir(group_id, tp)?;
             let toml_path = state_dir.join("driver.toml");
             write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, tp)?;
             let config_path = toml_path.to_string_lossy();
-            pie_engine::driver::NativeDriver::cuda_create(config_path.as_bytes())?
+            let (backend, facts) =
+                pie_engine::driver::DriverBackend::cuda_create(config_path.as_bytes())?;
+            (
+                backend,
+                facts,
+                opts.runtime_quant.as_str(),
+                opts.mxfp4_moe.as_str(),
+            )
         }
         #[cfg(feature = "driver-metal")]
         DriverOptions::Metal(opts) => {
@@ -594,7 +658,9 @@ pub(crate) fn create_native_driver(
             let toml_path = state_dir.join("driver.toml");
             write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id)?;
             let config_path = toml_path.to_string_lossy();
-            pie_engine::driver::NativeDriver::metal_create(config_path.as_bytes())?
+            let (backend, facts) =
+                pie_engine::driver::DriverBackend::metal_create(config_path.as_bytes())?;
+            (backend, facts, "", "auto")
         }
         DriverOptions::Dummy {
             opts,
@@ -602,11 +668,21 @@ pub(crate) fn create_native_driver(
             activation_dtype,
         } => {
             let options = dummy_native_options(opts, snapshot_dir, *random_seed, activation_dtype)?;
-            pie_engine::driver::NativeDriver::dummy(options)?
+            let (backend, facts) = pie_engine::driver::DriverBackend::dummy(options)?;
+            (backend, facts, "", "auto")
         }
     };
+    let desc = model_load_desc(
+        snapshot_dir,
+        &facts,
+        runtime_quant,
+        mxfp4_moe,
+        tp,
+        component,
+    )?;
+    let caps = backend.load_model(vec![desc])?;
 
-    Ok(crate::translate::GroupDriver { caps, native })
+    Ok(crate::translate::GroupDriver { caps, backend })
 }
 
 #[cfg(test)]
@@ -615,8 +691,9 @@ mod tests {
 
     #[test]
     fn caps_json_round_trips() {
-        let json = r#"{
-            "abi_version": 1,
+        let json = format!(
+            r#"{{
+            "abi_version": {},
             "total_pages": 1024,
             "kv_page_size": 32,
             "swap_pool_size": 0,
@@ -628,14 +705,335 @@ mod tests {
             "max_model_len": 4096,
             "activation_dtype": "bfloat16",
             "snapshot_dir": "/tmp/snap"
-        }"#;
-        let caps = parse_caps_json(json).unwrap();
-        assert_eq!(caps.abi_version, 1);
+        }}"#,
+            pie_driver_abi::PIE_DRIVER_ABI_VERSION
+        );
+        let caps = parse_caps_json(&json).unwrap();
+        assert_eq!(caps.abi_version, pie_driver_abi::PIE_DRIVER_ABI_VERSION);
         assert_eq!(caps.total_pages, 1024);
         assert_eq!(caps.arch_name, "qwen3");
         assert_eq!(caps.snapshot_dir, "/tmp/snap");
         assert_eq!(caps.max_forward_tokens, 4096);
         assert_eq!(caps.max_page_refs, 262144);
+    }
+
+    #[test]
+    fn dummy_boot_uses_create_compile_load_sequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join("snapshot");
+        std::fs::create_dir(&snapshot).unwrap();
+        std::fs::write(
+            snapshot.join("config.json"),
+            r#"{
+                "model_type": "qwen3",
+                "architectures": ["Qwen3ForCausalLM"],
+                "num_hidden_layers": 1,
+                "vocab_size": 32,
+                "max_position_embeddings": 128
+            }"#,
+        )
+        .unwrap();
+        let header =
+            r#"{"model.embed_tokens.weight":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#;
+        let mut checkpoint = (header.len() as u64).to_le_bytes().to_vec();
+        checkpoint.extend_from_slice(header.as_bytes());
+        checkpoint.extend_from_slice(&[1, 2, 3, 4]);
+        std::fs::write(snapshot.join("model.safetensors"), checkpoint).unwrap();
+
+        let group = create_driver_backend(
+            &DriverOptions::Dummy {
+                opts: DummyDriverOptions {
+                    vocab_size: None,
+                    arch_name: None,
+                    ready_timeout_s: 5.0,
+                },
+                random_seed: 7,
+                activation_dtype: "f32".to_string(),
+            },
+            &snapshot,
+            0,
+            None,
+            pie_driver_abi::ModelComponent::Full,
+        )
+        .unwrap();
+        assert_eq!(group.caps.arch_name, "qwen3");
+        assert_eq!(group.caps.vocab_size, 32);
+        assert_eq!(group.caps.snapshot_dir, snapshot.display().to_string());
+    }
+
+    #[test]
+    #[ignore = "requires PIE_TEST_GEMMA4_SNAPSHOT"]
+    fn gemma4_encode_plan_contains_only_encoder_tensors() {
+        let snapshot = std::env::var_os("PIE_TEST_GEMMA4_SNAPSHOT")
+            .map(PathBuf::from)
+            .expect("set PIE_TEST_GEMMA4_SNAPSHOT");
+        let facts = pie_driver_abi::DeviceFacts {
+            abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
+            backend: "cuda".to_string(),
+            unified_memory: false,
+            fp8_native: true,
+            native_mxfp4_moe: false,
+            storage_alignment: 256,
+            storage_max_tile_bytes: 64 * 1024 * 1024,
+            storage_tile_map_mask: pie_load_planner::load_plan::CUDA_TILE_MAP_MASK,
+            page_size: 0,
+        };
+        let bytes = compile_load_plan_bytes(
+            &snapshot,
+            &facts,
+            "",
+            "auto",
+            None,
+            pie_driver_abi::ModelComponent::Encode,
+        )
+        .unwrap();
+        let plan = pie_load_planner::inproc::deserialize_load_plan(&bytes).unwrap();
+        let finalized = plan
+            .instrs
+            .iter()
+            .filter_map(|instruction| match instruction {
+                pie_load_planner::load_plan::StorageInstr::Finalize { name, .. } => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(finalized.len() > 10);
+        assert!(
+            finalized
+                .iter()
+                .any(|name| name.starts_with("model.vision_tower."))
+        );
+        assert!(
+            finalized
+                .iter()
+                .any(|name| name.starts_with("model.audio_tower."))
+        );
+        assert!(finalized.iter().all(|name| {
+            name.starts_with("model.vision_tower.")
+                || name.starts_with("model.embed_vision.")
+                || name.starts_with("model.audio_tower.")
+                || name.starts_with("model.embed_audio.")
+        }));
+    }
+
+    #[cfg(feature = "driver-cuda")]
+    #[tokio::test]
+    #[ignore = "requires PIE_TEST_GEMMA4_SNAPSHOT and a CUDA GPU"]
+    async fn gemma4_encode_component_loads_and_encodes() {
+        let snapshot = std::env::var_os("PIE_TEST_GEMMA4_SNAPSHOT")
+            .map(PathBuf::from)
+            .expect("set PIE_TEST_GEMMA4_SNAPSHOT");
+        let options = DriverOptions::CudaNative(CudaNativeDriverOptions {
+            device: "cuda:0".to_string(),
+            gpu_mem_utilization: 0.5,
+            verbose: true,
+            ..Default::default()
+        });
+        let mut group = create_driver_backend(
+            &options,
+            &snapshot,
+            0,
+            None,
+            pie_driver_abi::ModelComponent::Encode,
+        )
+        .unwrap();
+        assert!(group.caps.supports_media_encode);
+        assert_eq!(group.caps.total_pages, 0);
+        assert!(group.backend.export_kv_handle().is_none());
+
+        let patch_count = 9usize;
+        let pixel_bytes = patch_count * 3 * 16 * 16 * std::mem::size_of::<f32>();
+        let hidden_size = group.caps.hidden_size;
+        let make_encode = || {
+            let mut patch_positions = Vec::with_capacity(patch_count * 2);
+            for y in 0..3 {
+                for x in 0..3 {
+                    patch_positions.extend([x, y]);
+                }
+            }
+            pie_driver_abi::MediaEncodePlan {
+                image_grids: vec![1, 3, 3],
+                image_pixels: vec![0; pixel_bytes],
+                image_pixel_indptr: vec![0, pixel_bytes as u32],
+                image_patch_positions: patch_positions,
+                image_anchor_rows: vec![0],
+                audio_features: Vec::new(),
+                audio_feature_indptr: Vec::new(),
+                audio_anchor_rows: Vec::new(),
+                output_rows: vec![0; hidden_size as usize * 2],
+                output_row_indptr: vec![0; 2],
+            }
+        };
+        let audio_frames = 16usize;
+        let audio_rows = 4usize;
+        let make_audio = || pie_driver_abi::MediaEncodePlan {
+            image_grids: Vec::new(),
+            image_pixels: Vec::new(),
+            image_pixel_indptr: Vec::new(),
+            image_patch_positions: Vec::new(),
+            image_anchor_rows: Vec::new(),
+            audio_features: vec![0; audio_frames * 128 * std::mem::size_of::<f32>()],
+            audio_feature_indptr: vec![0, (audio_frames * 128 * std::mem::size_of::<f32>()) as u32],
+            audio_anchor_rows: vec![0],
+            output_rows: vec![0; audio_rows * hidden_size as usize * 2],
+            output_row_indptr: vec![0; 2],
+        };
+        let mut encode = make_encode();
+        let completion = group.backend.encode(&mut encode).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(300), completion)
+            .await
+            .expect("encode completion timed out")
+            .unwrap();
+        assert_eq!(encode.output_row_indptr, vec![0, 1]);
+        assert!(encode.output_rows.iter().any(|byte| *byte != 0));
+        let tower_rows = encode.output_rows;
+        let mut audio = make_audio();
+        let completion = group.backend.encode(&mut audio).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(300), completion)
+            .await
+            .expect("audio encode completion timed out")
+            .unwrap();
+        assert_eq!(audio.output_row_indptr, vec![0, audio_rows as u32]);
+        assert!(audio.output_rows.iter().any(|byte| *byte != 0));
+        let tower_audio_rows = audio.output_rows;
+
+        let model = pie_driver_abi::ModelIdentity {
+            hash: [9; 32],
+            component: pie_driver_abi::ModelComponent::Encode,
+        };
+        let layout = pie_driver_abi::KvLayout {
+            num_layers: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            page_size: 0,
+            dtype: pie_driver_abi::KvDtype::Bf16,
+            kind: pie_driver_abi::KvLayoutKind::KvSeparate,
+            storage_format: String::new(),
+            region_page_bytes: Vec::new(),
+        };
+        let server = crate::executor::ExecutorServer::bind(
+            "127.0.0.1:0",
+            crate::translate::ModelDrivers {
+                groups: vec![group],
+            },
+            model.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+        let client = crate::executor::connect(server.endpoint()).await.unwrap();
+        let hello = client
+            .execute(
+                tarpc::context::current(),
+                pie_driver_abi::ExecutorRequest::Hello(pie_driver_abi::HelloRequest {
+                    wire_version: pie_driver_abi::REMOTE_WIRE_VERSION,
+                    client_nonce: 1,
+                    model,
+                    kv_layout: layout,
+                    peer_conn: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let pie_driver_abi::ExecutorResponse::Hello(hello) = hello else {
+            panic!("executor Hello response");
+        };
+        assert_eq!(hello.grant.num_pages, 0);
+
+        let image = make_encode();
+        let response = client
+            .execute(
+                tarpc::context::current(),
+                pie_driver_abi::ExecutorRequest::Encode(pie_driver_abi::RemoteEncode {
+                    plan: pie_driver_abi::LaunchPlan {
+                        token_ids: vec![0],
+                        qo_indptr: vec![0, 1],
+                        image_grids: image.image_grids,
+                        image_pixels: image.image_pixels,
+                        image_pixel_indptr: image.image_pixel_indptr,
+                        image_patch_positions: image.image_patch_positions,
+                        image_anchor_rows: image.image_anchor_rows,
+                        ..Default::default()
+                    },
+                    blobs: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let pie_driver_abi::ExecutorResponse::Embeddings(image) = response else {
+            panic!("executor image response");
+        };
+        assert_eq!(image.rows, tower_rows);
+
+        let audio = make_audio();
+        let response = client
+            .execute(
+                tarpc::context::current(),
+                pie_driver_abi::ExecutorRequest::Encode(pie_driver_abi::RemoteEncode {
+                    plan: pie_driver_abi::LaunchPlan {
+                        token_ids: vec![0; audio_rows],
+                        qo_indptr: vec![0, audio_rows as u32],
+                        audio_features: audio.audio_features,
+                        audio_feature_indptr: audio.audio_feature_indptr,
+                        audio_anchor_rows: audio.audio_anchor_rows,
+                        ..Default::default()
+                    },
+                    blobs: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let pie_driver_abi::ExecutorResponse::Embeddings(audio) = response else {
+            panic!("executor audio response");
+        };
+        assert_eq!(audio.rows, tower_audio_rows);
+        server.shutdown().await;
+
+        let full_options = DriverOptions::CudaNative(CudaNativeDriverOptions {
+            device: "cuda:0".to_string(),
+            gpu_mem_utilization: 1.0,
+            memory_profile: CudaMemoryProfile::Capacity,
+            total_pages: 1,
+            ..Default::default()
+        });
+        let mut full = create_driver_backend(
+            &full_options,
+            &snapshot,
+            1,
+            None,
+            pie_driver_abi::ModelComponent::Full,
+        )
+        .unwrap();
+        assert!(full.caps.supports_media_encode);
+        let mut inline = make_encode();
+        let completion = full.backend.encode(&mut inline).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(300), completion)
+            .await
+            .expect("full-model encode completion timed out")
+            .unwrap();
+        assert_eq!(inline.output_row_indptr, vec![0, 1]);
+        assert_eq!(inline.output_rows, tower_rows);
+        let mut inline_audio = make_audio();
+        let completion = full.backend.encode(&mut inline_audio).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(300), completion)
+            .await
+            .expect("full-model audio encode completion timed out")
+            .unwrap();
+        assert_eq!(inline_audio.output_row_indptr, vec![0, audio_rows as u32]);
+        assert_eq!(inline_audio.output_rows, tower_audio_rows);
+    }
+
+    #[test]
+    fn gguf_boot_is_rejected_before_compilation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf = tmp.path().join("model.gguf");
+        std::fs::write(&gguf, b"GGUF").unwrap();
+        let error = validate_snapshot_dir(&gguf).unwrap_err().to_string();
+        assert!(error.contains("GGUF model loading is deferred"));
     }
 
     #[cfg(feature = "driver-cuda")]
@@ -715,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_startup_toml_emits_runtime_quant_when_set() {
+    fn cuda_startup_toml_keeps_runtime_quant_out_of_driver_config() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
         let snap = tmp.path().join("snap");
@@ -727,12 +1125,12 @@ mod tests {
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(val["model"]["runtime_quant"].as_str().unwrap(), "fp8");
+        assert!(val["model"].get("runtime_quant").is_none());
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:1");
     }
 
     #[test]
-    fn cuda_startup_toml_emits_mxfp4_policy_when_non_default() {
+    fn cuda_startup_toml_keeps_mxfp4_policy_out_of_driver_config() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
         let snap = tmp.path().join("snap");
@@ -744,7 +1142,7 @@ mod tests {
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(val["model"]["mxfp4_moe"].as_str().unwrap(), "bf16");
+        assert!(val["model"].get("mxfp4_moe").is_none());
     }
 
     #[test]

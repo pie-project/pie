@@ -6,21 +6,20 @@
 //! executor must reproduce the step lines exactly.
 //!
 //! Regenerate (bless) with:
-//! `PTIR_REGEN=1 cargo test -p pie-sampling-ir --features eval --test ptir_golden`
+//! `PTIR_REGEN=1 cargo test -p pie-ptir --features eval --test ptir_golden`
 #![cfg(feature = "eval")]
 
-use pie_ptir::interp::Value;
 use pie_ptir::container::{
-    encode, ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram,
-    TraceContainer,
+    ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer, encode,
 };
-use pie_ptir::registry::Port;
 use pie_ptir::container_hash;
+use pie_ptir::interp::Value;
 use pie_ptir::interp::{Instance, NoKernels, PassInputs};
 use pie_ptir::op::{IntrinsicId, Op};
+use pie_ptir::registry::Port;
 use pie_ptir::registry::{ModelProfile, Stage};
-use pie_ptir::validate::{bind, BoundTrace};
 use pie_ptir::types::{DType, Literal, Shape};
+use pie_ptir::validate::{BoundTrace, bind};
 use std::fmt::Write as _;
 
 #[path = "common/traces.rs"]
@@ -56,6 +55,23 @@ impl Report {
                     hex(&pie_ptir::sidecar::encode_bound(b))
                 )
                 .unwrap();
+                for stage in pie_ptir::compiler::compile_bound(b) {
+                    let metrics = stage.metrics();
+                    writeln!(
+                        self.0,
+                        "plan: stage={} signature=0x{:016x} source_ops={} normalized_ops={} singleton_regions={} fused_regions={} library_regions={} static_scratch_bytes={} direct_sink_bytes={}",
+                        stage.normalized.stage.name(),
+                        stage.signature.hash,
+                        metrics.source_ops,
+                        metrics.normalized_ops,
+                        metrics.singleton_regions,
+                        metrics.fused_regions,
+                        metrics.library_regions,
+                        metrics.static_scratch_bytes,
+                        metrics.direct_channel_sink_bytes,
+                    )
+                    .unwrap();
+                }
                 for e in &b.readiness {
                     writeln!(
                         self.0,
@@ -167,9 +183,15 @@ fn golden_greedy_argmax() {
         shape: Shape::matrix(1, 8),
         dtype: DType::F32,
     });
-    let flat = b.p(Op::Reshape { value: lg, shape: Shape::vector(8) });
+    let flat = b.p(Op::Reshape {
+        value: lg,
+        shape: Shape::vector(8),
+    });
     let t = b.p(Op::ReduceArgmax(flat));
-    let t1 = b.p(Op::Reshape { value: t, shape: Shape::vector(1) });
+    let t1 = b.p(Op::Reshape {
+        value: t,
+        shape: Shape::vector(1),
+    });
     b.p(Op::ChanPut { chan: 0, value: t1 });
     b.p(Op::ChanPut { chan: 1, value: t1 });
     let c = TraceContainer {
@@ -190,9 +212,31 @@ fn golden_greedy_argmax() {
                 seeded: false,
             },
         ],
-        ports: vec![PortBinding { port: Port::EmbedTokens, source: PortSource::Channel(0) }],
-        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
-    externs: Vec::new(),
+        ports: vec![
+            PortBinding {
+                port: Port::EmbedTokens,
+                source: PortSource::Channel(0),
+            },
+            const_port(Port::EmbedIndptr, DType::U32, Shape::vector(2), &[0, 1]),
+            const_port(Port::Positions, DType::U32, Shape::vector(1), &[0]),
+            const_port(Port::Pages, DType::U32, Shape::vector(1), &[0]),
+            const_port(Port::PageIndptr, DType::U32, Shape::vector(2), &[0, 1]),
+            PortBinding {
+                port: Port::KvLen,
+                source: PortSource::Const {
+                    dtype: DType::U32,
+                    shape: Shape::vector(1),
+                    data: 1u32.to_le_bytes().to_vec(),
+                },
+            },
+            const_port(Port::WSlot, DType::U32, Shape::vector(1), &[0]),
+            const_port(Port::WOff, DType::U32, Shape::vector(1), &[0]),
+        ],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: b.ops,
+        }],
+        externs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.vocab = 8;
@@ -201,10 +245,16 @@ fn golden_greedy_argmax() {
     let seeds = [(0u32, i32s(&[1]))];
     rep = seed_lines(rep, &seeds);
     let mut inst = Instance::new(&bound, &seeds).unwrap();
-    let inputs = PassInputs { logits: Some(f32s(&[0., 1., 9., 2., 0., 0., 0., 3.])), ..Default::default() };
+    let inputs = PassInputs {
+        logits: Some(f32s(&[0., 1., 9., 2., 0., 0., 0., 3.])),
+        ..Default::default()
+    };
     rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 1));
-    let inputs = PassInputs { logits: Some(f32s(&[7., 1., 0., 2., 0., 0., 0., 3.])), ..Default::default() };
+    let inputs = PassInputs {
+        logits: Some(f32s(&[7., 1., 0., 2., 0., 0., 0., 3.])),
+        ..Default::default()
+    };
     rep = rep.line(&step_line(1, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 1));
     check("greedy_argmax", rep);
@@ -215,10 +265,17 @@ fn golden_section3_masked_gumbel() {
     let c = section3_trace();
     let bound = bind(c.clone(), ModelProfile::dummy()).unwrap();
     let mut rep = Report::new("section3_masked_gumbel", &c).verdict(&Ok(bound.clone()));
-    let seeds = [(0u32, i32s(&[1])), (3u32, u32s(&[1])), (4u32, u32s(&[1234, 0]))];
+    let seeds = [
+        (0u32, i32s(&[1])),
+        (3u32, u32s(&[1])),
+        (4u32, u32s(&[1234, 0])),
+    ];
     rep = seed_lines(rep, &seeds);
     let mut inst = Instance::new(&bound, &seeds).unwrap();
-    let inputs = PassInputs { logits: Some(flat_logits(7, 100.0)), ..Default::default() };
+    let inputs = PassInputs {
+        logits: Some(flat_logits(7, 100.0)),
+        ..Default::default()
+    };
     rep = rep.line(&put_line(&mut inst, &bound, 2, allow_all()));
     rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 1));
@@ -265,7 +322,10 @@ fn golden_beam_epilogue() {
     let mut logits = vec![0.0f32; (BB * V) as usize];
     logits[3] = 8.0;
     logits[(V + 5) as usize] = 7.0;
-    let inputs = PassInputs { logits: Some(Value::F32(logits)), ..Default::default() };
+    let inputs = PassInputs {
+        logits: Some(Value::F32(logits)),
+        ..Default::default()
+    };
     // Step 0: no fresh grant → miss.
     rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
     rep = rep.line(&put_line(&mut inst, &bound, 12, u32s(&[7, 8])));
@@ -307,7 +367,7 @@ fn golden_counter_pingpong() {
                 Op::ChanPut { chan: 1, value: 2 },
             ],
         }],
-    externs: Vec::new(),
+        externs: Vec::new(),
     };
     let bound = bind(c.clone(), ModelProfile::dummy()).unwrap();
     let mut rep = Report::new("counter_pingpong", &c).verdict(&Ok(bound.clone()));
@@ -322,6 +382,210 @@ fn golden_counter_pingpong() {
     rep = rep.line(&take_line(&mut inst, &bound, 1));
     rep = rep.line(&take_line(&mut inst, &bound, 1)); // WouldBlock
     check("counter_pingpong", rep);
+}
+
+#[test]
+fn golden_nucleus_sample() {
+    const V: u32 = 8;
+    let c = TraceContainer {
+        channels: vec![
+            ChannelDecl {
+                shape: Shape::vector(2),
+                dtype: ChanDType::Concrete(DType::U32),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
+            },
+            ChannelDecl {
+                shape: Shape::SCALAR,
+                dtype: ChanDType::Concrete(DType::F32),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
+            },
+            ChannelDecl {
+                shape: Shape::vector(1),
+                dtype: ChanDType::Concrete(DType::I32),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            },
+        ],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Op::IntrinsicVal {
+                    intr: IntrinsicId::Logits,
+                    shape: Shape::matrix(1, V),
+                    dtype: DType::F32,
+                },
+                Op::ChanTake(0),
+                Op::ChanRead(1),
+                Op::ReduceMax(0),
+                Op::Broadcast {
+                    value: 3,
+                    shape: Shape::matrix(1, V),
+                },
+                Op::Sub(0, 4),
+                Op::Exp(5),
+                Op::ReduceSum(6),
+                Op::Broadcast {
+                    value: 7,
+                    shape: Shape::matrix(1, V),
+                },
+                Op::Div(6, 8),
+                Op::PivotThreshold {
+                    input: 9,
+                    predicate: pie_ptir::Predicate::CummassLe(2),
+                },
+                Op::Const(Literal::F32(f32::NEG_INFINITY)),
+                Op::Select {
+                    cond: 10,
+                    a: 0,
+                    b: 11,
+                },
+                Op::RngKeyed {
+                    state: 1,
+                    shape: Shape::matrix(1, V),
+                    kind: pie_ptir::RngKind::Gumbel,
+                },
+                Op::Add(12, 13),
+                Op::ReduceArgmax(14),
+                Op::ChanPut { chan: 2, value: 15 },
+            ],
+        }],
+        ..TraceContainer::default()
+    };
+    let mut profile = ModelProfile::dummy();
+    profile.vocab = V;
+    let bound = bind(c.clone(), profile).unwrap();
+    let mut report = Report::new("nucleus_sample", &c).verdict(&Ok(bound.clone()));
+    let inputs = PassInputs {
+        logits: Some(Value::F32(vec![
+            4.0,
+            4.0,
+            3.0,
+            2.0,
+            1.0,
+            0.0,
+            -1.0,
+            f32::NAN,
+        ])),
+        ..PassInputs::default()
+    };
+    for (case, top_p) in [
+        (0, 0.5f32),
+        (1, 1.0f32),
+        (2, 0.0f32),
+        (3, f32::NAN),
+        (4, f32::INFINITY),
+    ] {
+        let seeds = [(0, u32s(&[1234, case])), (1, Value::F32(vec![top_p]))];
+        report = report.line(&format!("case {case}: top_p={top_p}"));
+        report = seed_lines(report, &seeds);
+        let mut instance = Instance::new(&bound, &seeds).unwrap();
+        report = report.line(&step_line(case as usize, &mut instance, &bound, &inputs));
+        report = report.line(&take_line(&mut instance, &bound, 2));
+    }
+    check("nucleus_sample", report);
+}
+
+#[test]
+fn golden_structured_masks() {
+    let channel = |shape: Shape, dtype: DType, role, seeded| ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 1,
+        host_role: role,
+        seeded,
+    };
+    let c = TraceContainer {
+        channels: vec![
+            channel(Shape::vector(2), DType::U32, HostRole::None, true),
+            channel(Shape::matrix(2, 3), DType::U32, HostRole::None, true),
+            channel(Shape::vector(4), DType::U32, HostRole::None, true),
+            channel(Shape::matrix(2, 6), DType::Bool, HostRole::Reader, false),
+            channel(Shape::matrix(2, 6), DType::Bool, HostRole::Reader, false),
+            channel(Shape::matrix(2, 6), DType::Bool, HostRole::Reader, false),
+            channel(Shape::matrix(2, 4), DType::Bool, HostRole::Reader, false),
+        ],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Op::ChanTake(0),
+                Op::ChanTake(1),
+                Op::ChanTake(2),
+                Op::CausalMask {
+                    positions: 0,
+                    len: 6,
+                },
+                Op::ChanPut { chan: 3, value: 3 },
+                Op::SlidingWindowMask {
+                    positions: 0,
+                    len: 6,
+                    window: 3,
+                },
+                Op::ChanPut { chan: 4, value: 4 },
+                Op::SinkWindowMask {
+                    positions: 0,
+                    len: 6,
+                    sink: 1,
+                    window: 3,
+                },
+                Op::ChanPut { chan: 5, value: 5 },
+                Op::Reshape {
+                    value: 1,
+                    shape: Shape::vector(6),
+                },
+                Op::Iota { len: 24 },
+                Op::Const(Literal::U32(12)),
+                Op::Div(7, 8),
+                Op::Const(Literal::U32(3)),
+                Op::Rem(7, 10),
+                Op::Mul(9, 10),
+                Op::Add(12, 11),
+                Op::Gather { src: 6, idx: 13 },
+                Op::Div(7, 10),
+                Op::Const(Literal::U32(4)),
+                Op::Rem(15, 16),
+                Op::Gather { src: 2, idx: 17 },
+                Op::Reshape {
+                    value: 14,
+                    shape: Shape::new(&[2, 4, 3]).unwrap(),
+                },
+                Op::Reshape {
+                    value: 18,
+                    shape: Shape::new(&[2, 4, 3]).unwrap(),
+                },
+                Op::Eq(19, 20),
+                Op::Cast {
+                    value: 21,
+                    dtype: DType::U32,
+                },
+                Op::ReduceMax(22),
+                Op::Cast {
+                    value: 23,
+                    dtype: DType::Bool,
+                },
+                Op::ChanPut { chan: 6, value: 24 },
+            ],
+        }],
+        ..TraceContainer::default()
+    };
+    let bound = bind(c.clone(), ModelProfile::dummy()).unwrap();
+    let seeds = [
+        (0, Value::U32(vec![3, 5])),
+        (1, Value::U32(vec![0, 1, 2, 1, 2, 3])),
+        (2, Value::U32(vec![0, 1, 2, 3])),
+    ];
+    let mut report = Report::new("structured_masks", &c).verdict(&Ok(bound.clone()));
+    report = seed_lines(report, &seeds);
+    let mut instance = Instance::new(&bound, &seeds).unwrap();
+    report = report.line(&step_line(0, &mut instance, &bound, &PassInputs::default()));
+    for channel in 3..=6 {
+        report = report.line(&take_line(&mut instance, &bound, channel));
+    }
+    check("structured_masks", report);
 }
 
 // ── negative cases (verdict-only) ──────────────────────────────────────────
@@ -358,11 +622,14 @@ fn golden_neg_spsc_second_producer() {
             stage: Stage::Epilogue,
             ops: vec![
                 Op::Const(Literal::F32(0.0)),
-                Op::Broadcast { value: 0, shape: Shape::vector(4) },
+                Op::Broadcast {
+                    value: 0,
+                    shape: Shape::vector(4),
+                },
                 Op::ChanPut { chan: 0, value: 1 },
             ],
         }],
-    externs: Vec::new(),
+        externs: Vec::new(),
     };
     neg_report("neg_spsc_second_producer", c, ModelProfile::dummy());
 }
@@ -375,9 +642,15 @@ fn golden_neg_sink_at_epilogue() {
         ports: vec![],
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
-            ops: vec![Op::ChanRead(0), Op::SinkCall { name: 0, args: vec![0] }],
+            ops: vec![
+                Op::ChanRead(0),
+                Op::SinkCall {
+                    name: 0,
+                    args: vec![0],
+                },
+            ],
         }],
-    externs: Vec::new(),
+        externs: Vec::new(),
     };
     neg_report("neg_sink_at_epilogue", c, ModelProfile::dummy());
 }
@@ -391,14 +664,22 @@ fn golden_neg_t10_nonreplayable() {
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
             ops: vec![
-                Op::KernelCall { name: 0, args: vec![], shape: Shape::vector(1), dtype: DType::F32 },
+                Op::KernelCall {
+                    name: 0,
+                    args: vec![],
+                    shape: Shape::vector(1),
+                    dtype: DType::F32,
+                },
                 Op::ChanTake(0),
-                Op::Broadcast { value: 0, shape: Shape::vector(4) },
+                Op::Broadcast {
+                    value: 0,
+                    shape: Shape::vector(4),
+                },
                 Op::Add(1, 2),
                 Op::ChanPut { chan: 0, value: 3 },
             ],
         }],
-    externs: Vec::new(),
+        externs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.kernels.push(pie_ptir::registry::KernelInfo {
@@ -427,7 +708,7 @@ fn golden_neg_intrinsic_wrong_stage() {
                 Op::ChanPut { chan: 0, value: 1 },
             ],
         }],
-    externs: Vec::new(),
+        externs: Vec::new(),
     };
     neg_report("neg_intrinsic_wrong_stage", c, ModelProfile::dummy());
 }
@@ -450,7 +731,7 @@ fn golden_neg_model_gated_missing() {
                 Op::ChanPut { chan: 0, value: 1 },
             ],
         }],
-    externs: Vec::new(),
+        externs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.has_mtp_logits = false;
@@ -473,7 +754,7 @@ fn golden_neg_body_type_error() {
                 Op::ChanPut { chan: 0, value: 0 },
             ],
         }],
-    externs: Vec::new(),
+        externs: Vec::new(),
     };
     neg_report("neg_body_type_error", c, ModelProfile::dummy());
 }
@@ -490,8 +771,14 @@ fn golden_matrix_mask_apply_packed() {
         dtype: DType::F32,
     });
     let m = b.p(Op::Const(Literal::U32(0b0010_1000)));
-    let m1 = b.p(Op::Reshape { value: m, shape: Shape::vector(1) });
-    let masked = b.p(Op::MaskApply { logits: lg, mask: m1 });
+    let m1 = b.p(Op::Reshape {
+        value: m,
+        shape: Shape::vector(1),
+    });
+    let masked = b.p(Op::MaskApply {
+        logits: lg,
+        mask: m1,
+    });
     let t = b.p(Op::ReduceArgmax(masked)); // [2] i32, per row
     b.p(Op::ChanPut { chan: 0, value: t });
     let c = TraceContainer {
@@ -504,8 +791,11 @@ fn golden_matrix_mask_apply_packed() {
             seeded: false,
         }],
         ports: vec![],
-        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
-    externs: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: b.ops,
+        }],
+        externs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.vocab = 8;
@@ -518,7 +808,10 @@ fn golden_matrix_mask_apply_packed() {
         0., 0., 9., 1., 0., 2., 0., 0., // row 0 -> 5
         0., 0., 0., 4., 0., 3., 0., 9., // row 1 -> 3
     ];
-    let inputs = PassInputs { logits: Some(f32s(&logits)), ..Default::default() };
+    let inputs = PassInputs {
+        logits: Some(f32s(&logits)),
+        ..Default::default()
+    };
     rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 0));
     check("matrix_mask_apply_packed", rep);
@@ -542,8 +835,15 @@ fn golden_matrix_select_mask() {
     });
     let allow = b.p(Op::ChanTake(0)); // bool [k,v] per-position grammar mask
     let ninf = b.p(Op::Const(Literal::F32(f32::NEG_INFINITY)));
-    let nb = b.p(Op::Broadcast { value: ninf, shape: Shape::matrix(k, v) });
-    let masked = b.p(Op::Select { cond: allow, a: lg, b: nb });
+    let nb = b.p(Op::Broadcast {
+        value: ninf,
+        shape: Shape::matrix(k, v),
+    });
+    let masked = b.p(Op::Select {
+        cond: allow,
+        a: lg,
+        b: nb,
+    });
     let t = b.p(Op::ReduceArgmax(masked)); // [k] i32 per row
     b.p(Op::ChanPut { chan: 1, value: t });
     let c = TraceContainer {
@@ -565,8 +865,11 @@ fn golden_matrix_select_mask() {
             },
         ],
         ports: vec![],
-        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
-    externs: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: b.ops,
+        }],
+        externs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.vocab = v;
@@ -582,7 +885,10 @@ fn golden_matrix_select_mask() {
         logits[r * v as usize + a] = 1.0;
         allow_bits[r * v as usize + a] = true;
     }
-    let inputs = PassInputs { logits: Some(f32s(&logits)), ..Default::default() };
+    let inputs = PassInputs {
+        logits: Some(f32s(&logits)),
+        ..Default::default()
+    };
     rep = rep.line(&{
         let l = format!("host_put chan=0 = {:?}", Value::Bool(allow_bits.clone()));
         inst.host_put(&bound, 0, Value::Bool(allow_bits)).unwrap();
@@ -591,6 +897,118 @@ fn golden_matrix_select_mask() {
     rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
     rep = rep.line(&take_line(&mut inst, &bound, 1)); // expect I32([2,3,4,5])
     check("matrix_select_mask", rep);
+}
+
+#[test]
+fn golden_pivot_predicates_multistage() {
+    // Regression pin (charlie thrust-3 / driver bound.hpp): container.rs
+    // decodes `Predicate::{RankLe,CummassLe,ProbGe}`'s payload as a
+    // per-STAGE-LOCAL ValueId (same as any op arg) — a translator MUST remap
+    // it through that stage's global-id base before dereferencing it, exactly
+    // like `op.args`. This trace is deliberately MULTI-STAGE (a throwaway
+    // Prologue value ahead of the Epilogue hosting the real pivot_threshold
+    // ops) so the Epilogue's global base is NONZERO: a translator that
+    // forgot the remap — or one that (mis)treated the payload as an
+    // immediate `k`, CUDA tier-0's prior bug — would resolve the WRONG value
+    // (silently reading the Prologue's throwaway constant, or a garbage
+    // "k") instead of the real, host-fed, per-pass `p`/`thr` channels below.
+    // Also exercises CummassLe (top-p) and ProbGe (min-p-style) with dynamic
+    // (host-fed, not const-folded) thresholds, matching interp.rs exactly.
+    let v = 8u32;
+    let mut pro = B::new();
+    let _junk = pro.p(Op::Const(Literal::F32(999.0))); // Prologue: advances the Epilogue's global base by 1.
+
+    let mut b = B::new();
+    let lg = b.p(Op::IntrinsicVal {
+        intr: IntrinsicId::Logits,
+        shape: Shape::matrix(1, v),
+        dtype: DType::F32,
+    });
+    let probs = expand::softmax(&mut b.ops, lg, Shape::matrix(1, v));
+    let p = b.p(Op::ChanRead(0)); // dynamic top-p threshold (host-fed — NOT hardcoded)
+    let thr = b.p(Op::ChanRead(1)); // dynamic prob-ge threshold (host-fed — NOT hardcoded)
+    let mask_p = b.p(Op::PivotThreshold {
+        input: probs,
+        predicate: pie_ptir::types::Predicate::CummassLe(p),
+    });
+    let mask_t = b.p(Op::PivotThreshold {
+        input: probs,
+        predicate: pie_ptir::types::Predicate::ProbGe(thr),
+    });
+    b.p(Op::ChanPut {
+        chan: 2,
+        value: mask_p,
+    });
+    b.p(Op::ChanPut {
+        chan: 3,
+        value: mask_t,
+    });
+    let c = TraceContainer {
+        names: vec![],
+        channels: vec![
+            ChannelDecl {
+                shape: Shape::SCALAR,
+                dtype: ChanDType::Concrete(DType::F32),
+                capacity: 1,
+                host_role: HostRole::Writer,
+                seeded: false,
+            }, // 0 p (top-p threshold)
+            ChannelDecl {
+                shape: Shape::SCALAR,
+                dtype: ChanDType::Concrete(DType::F32),
+                capacity: 1,
+                host_role: HostRole::Writer,
+                seeded: false,
+            }, // 1 thr (prob-ge threshold)
+            ChannelDecl {
+                shape: Shape::matrix(1, v),
+                dtype: ChanDType::Concrete(DType::Bool),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            }, // 2 mask_p out
+            ChannelDecl {
+                shape: Shape::matrix(1, v),
+                dtype: ChanDType::Concrete(DType::Bool),
+                capacity: 1,
+                host_role: HostRole::Reader,
+                seeded: false,
+            }, // 3 mask_t out
+        ],
+        ports: vec![],
+        stages: vec![
+            StageProgram {
+                stage: Stage::Prologue,
+                ops: pro.ops,
+            },
+            StageProgram {
+                stage: Stage::Epilogue,
+                ops: b.ops,
+            },
+        ],
+        externs: Vec::new(),
+    };
+    let mut profile = ModelProfile::dummy();
+    profile.vocab = v;
+    let bound = bind(c.clone(), profile).unwrap();
+    let mut rep = Report::new("pivot_predicates_multistage", &c).verdict(&Ok(bound.clone()));
+    let mut inst = Instance::new(&bound, &[]).unwrap();
+    // logits = [0,1,9,2,0,0,0,3] (greedy_argmax's vector, reused for easy
+    // cross-checking): softmax is dominated by index 2 (logit 9), with a
+    // long shallow tail — enough separation to pin a non-trivial (not
+    // top-1-only) nucleus at p=0.999 and a non-trivial prob-ge set at
+    // thr=0.0003.
+    let logits = vec![0.0f32, 1.0, 9.0, 2.0, 0.0, 0.0, 0.0, 3.0];
+    let inputs = PassInputs {
+        logits: Some(f32s(&logits)),
+        ..Default::default()
+    };
+    rep = rep.line(&put_line(&mut inst, &bound, 0, Value::F32(vec![0.999])));
+    rep = rep.line(&put_line(&mut inst, &bound, 1, Value::F32(vec![0.0003])));
+    rep = rep.line(&step_line(0, &mut inst, &bound, &inputs));
+    rep = rep.line(&take_line(&mut inst, &bound, 2)); // CummassLe(0.999) mask
+    rep = rep.line(&take_line(&mut inst, &bound, 3)); // ProbGe(0.0003) mask
+    check("pivot_predicates_multistage", rep);
 }
 
 #[test]
@@ -619,30 +1037,69 @@ fn golden_mtp_verify_tail() {
     });
     let m = b.p(Op::ChanTake(1)); // allow [K+1, v] bool (host-fed)
     let ninf = b.p(Op::Const(Literal::F32(f32::NEG_INFINITY)));
-    let nb = b.p(Op::Broadcast { value: ninf, shape: Shape::matrix(kp1, v) });
-    let masked = b.p(Op::Select { cond: m, a: lg, b: nb });
+    let nb = b.p(Op::Broadcast {
+        value: ninf,
+        shape: Shape::matrix(kp1, v),
+    });
+    let masked = b.p(Op::Select {
+        cond: m,
+        a: lg,
+        b: nb,
+    });
     let picked = b.p(Op::ReduceArgmax(masked)); // [K+1] i32
     let d = b.p(Op::ChanTake(0)); // prev_drafts [K] i32
     let vl = b.p(Op::Iota { len: k }); // VERIFY_LANES = [0,1,2]
-    let head = b.p(Op::Gather { src: picked, idx: vl }); // picked[0..K]
+    let head = b.p(Op::Gather {
+        src: picked,
+        idx: vl,
+    }); // picked[0..K]
     let hit = b.p(Op::Eq(head, d)); // [K] bool
     let one = b.p(Op::Const(Literal::F32(1.0)));
     let zero = b.p(Op::Const(Literal::F32(0.0)));
-    let ones = b.p(Op::Broadcast { value: one, shape: Shape::vector(k) });
-    let zeros = b.p(Op::Broadcast { value: zero, shape: Shape::vector(k) });
-    let runf = b.p(Op::Select { cond: hit, a: ones, b: zeros }); // [K] {1,0}
+    let ones = b.p(Op::Broadcast {
+        value: one,
+        shape: Shape::vector(k),
+    });
+    let zeros = b.p(Op::Broadcast {
+        value: zero,
+        shape: Shape::vector(k),
+    });
+    let runf = b.p(Op::Select {
+        cond: hit,
+        a: ones,
+        b: zeros,
+    }); // [K] {1,0}
     let run = b.p(Op::CumProd(runf));
     let naccf = b.p(Op::ReduceSum(run)); // scalar f32 = leading-hit count
-    let nacc = b.p(Op::Cast { value: naccf, dtype: DType::U32 });
-    let naccb = b.p(Op::Broadcast { value: nacc, shape: Shape::vector(kp1) });
+    let nacc = b.p(Op::Cast {
+        value: naccf,
+        dtype: DType::U32,
+    });
+    let naccb = b.p(Op::Broadcast {
+        value: nacc,
+        shape: Shape::vector(kp1),
+    });
     let lanes = b.p(Op::Iota { len: kp1 });
     let keep = b.p(Op::Ge(naccb, lanes)); // keep[i] = i <= n_acc
     let neg1 = b.p(Op::Const(Literal::I32(-1)));
-    let commit = b.p(Op::Select { cond: keep, a: picked, b: neg1 }); // [K+1]
-    b.p(Op::ChanPut { chan: 2, value: commit });
+    let commit = b.p(Op::Select {
+        cond: keep,
+        a: picked,
+        b: neg1,
+    }); // [K+1]
+    b.p(Op::ChanPut {
+        chan: 2,
+        value: commit,
+    });
     let drf = b.p(Op::ReduceArgmax(mtp)); // [K] fresh drafts (greedy proposals)
-    b.p(Op::ChanPut { chan: 0, value: drf }); // prev_drafts ping-pong
-    b.p(Op::ChanPut { chan: 3, value: drf }); // publish for the host grammar walk
+    b.p(Op::ChanPut {
+        chan: 0,
+        value: drf,
+    }); // prev_drafts ping-pong
+    b.p(Op::ChanPut {
+        chan: 3,
+        value: drf,
+    }); // publish for the host grammar walk
     let c = TraceContainer {
         names: vec![],
         channels: vec![
@@ -676,8 +1133,11 @@ fn golden_mtp_verify_tail() {
             }, // 3 draft_out
         ],
         ports: vec![],
-        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
-    externs: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: b.ops,
+        }],
+        externs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.vocab = v; // has_mtp_logits = true in dummy()
@@ -776,19 +1236,28 @@ fn quest_tap(budget_ch: u32) -> StageProgram {
         dtype: DType::F32,
     });
     let scores = b.p(Op::KernelCall {
-        name: 0, // "envelope_dot"
+        name: 1, // "envelope_dot"
         args: vec![q],
         shape: Shape::vector(PPAGES),
         dtype: DType::F32,
     });
     let bud = b.p(Op::ChanRead(budget_ch)); // [1] u32 (peek — a knob)
-    let buds = b.p(Op::Reshape { value: bud, shape: Shape::SCALAR });
+    let buds = b.p(Op::Reshape {
+        value: bud,
+        shape: Shape::SCALAR,
+    });
     let pm = b.p(Op::PivotThreshold {
         input: scores,
         predicate: pie_ptir::types::Predicate::RankLe(buds),
     });
-    b.p(Op::SinkCall { name: 1, args: vec![pm] }); // "attn_page_mask"
-    StageProgram { stage: Stage::OnAttnProj, ops: b.ops }
+    b.p(Op::SinkCall {
+        name: 0,
+        args: vec![pm],
+    }); // "attn_page_mask"
+    StageProgram {
+        stage: Stage::OnAttnProj,
+        ops: b.ops,
+    }
 }
 
 /// Contrastive pick (design §2.3, ORDER PINNED BY THIS GOLDEN): grammar folds
@@ -805,14 +1274,28 @@ fn contrastive_score(b: &mut B, lse_in: u32, am_take: u32, gmask: u32, rows: u32
     let pen = b.p(Op::Mul(lsa, lam));
     let cd = b.p(Op::Sub(lse, pen));
     let ninf = b.p(Op::Const(Literal::F32(f32::NEG_INFINITY)));
-    let lse_g = b.p(Op::Select { cond: gmask, a: lse, b: ninf }); // grammar FIRST
+    let lse_g = b.p(Op::Select {
+        cond: gmask,
+        a: lse,
+        b: ninf,
+    }); // grammar FIRST
     let mx = b.p(Op::ReduceMax(lse_g)); // [rows] max over the LEGAL set
-    let mx1 = b.p(Op::Reshape { value: mx, shape: Shape::matrix(rows, 1) });
-    let mxb = b.p(Op::Broadcast { value: mx1, shape: sh });
+    let mx1 = b.p(Op::Reshape {
+        value: mx,
+        shape: Shape::matrix(rows, 1),
+    });
+    let mxb = b.p(Op::Broadcast {
+        value: mx1,
+        shape: sh,
+    });
     let la = b.p(Op::Const(Literal::F32(-1.0))); // log α
     let thr = b.p(Op::Add(mxb, la));
     let plaus = b.p(Op::Ge(lse_g, thr)); // -inf rows auto-excluded (grammar ∧ α)
-    b.p(Op::Select { cond: plaus, a: cd, b: ninf })
+    b.p(Op::Select {
+        cond: plaus,
+        a: cd,
+        b: ninf,
+    })
 }
 use pie_ptir::expand;
 
@@ -829,11 +1312,26 @@ fn expand_trace() -> TraceContainer {
     let am = b.p(Op::ChanTake(0));
     let gm = b.p(Op::ChanTake(1));
     let scored = contrastive_score(&mut b, lg, am, gm, 1);
-    let pr = b.p(Op::TopK { input: scored, k: PB }); // pr, pr+1=ids  [1,B]
-    let prv = b.p(Op::Reshape { value: pr, shape: Shape::vector(PB) });
-    let idv = b.p(Op::Reshape { value: pr + 1, shape: Shape::vector(PB) });
-    b.p(Op::ChanPut { chan: 3, value: prv });
-    b.p(Op::ChanPut { chan: 4, value: idv });
+    let pr = b.p(Op::TopK {
+        input: scored,
+        k: PB,
+    }); // pr, pr+1=ids  [1,B]
+    let prv = b.p(Op::Reshape {
+        value: pr,
+        shape: Shape::vector(PB),
+    });
+    let idv = b.p(Op::Reshape {
+        value: pr + 1,
+        shape: Shape::vector(PB),
+    });
+    b.p(Op::ChanPut {
+        chan: 3,
+        value: prv,
+    });
+    b.p(Op::ChanPut {
+        chan: 4,
+        value: idv,
+    });
     let vh = b.p(Op::IntrinsicVal {
         intr: IntrinsicId::ValueHead,
         shape: Shape::vector(1),
@@ -848,7 +1346,7 @@ fn expand_trace() -> TraceContainer {
         seeded,
     };
     TraceContainer {
-        names: vec!["envelope_dot".into(), "attn_page_mask".into()],
+        names: vec!["attn_page_mask".into(), "envelope_dot".into()],
         channels: vec![
             ch(Shape::matrix(1, PV), DType::F32, HostRole::Writer, false), // 0 am
             ch(Shape::matrix(1, PV), DType::Bool, HostRole::Writer, false), // 1 gmask
@@ -858,7 +1356,13 @@ fn expand_trace() -> TraceContainer {
             ch(Shape::vector(1), DType::F32, HostRole::Reader, false),     // 5 val
         ],
         ports: vec![],
-        stages: vec![quest_tap(2), StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+        stages: vec![
+            quest_tap(2),
+            StageProgram {
+                stage: Stage::Epilogue,
+                ops: b.ops,
+            },
+        ],
         externs: Vec::new(),
     }
 }
@@ -888,25 +1392,57 @@ fn rollout_trace() -> TraceContainer {
     // verify tail (== golden_mtp_verify_tail)
     let d = b.p(Op::ChanTake(0));
     let vl = b.p(Op::Iota { len: PK });
-    let head = b.p(Op::Gather { src: picked, idx: vl });
+    let head = b.p(Op::Gather {
+        src: picked,
+        idx: vl,
+    });
     let hit = b.p(Op::Eq(head, d));
     let one = b.p(Op::Const(Literal::F32(1.0)));
     let zero = b.p(Op::Const(Literal::F32(0.0)));
-    let ones = b.p(Op::Broadcast { value: one, shape: Shape::vector(PK) });
-    let zeros = b.p(Op::Broadcast { value: zero, shape: Shape::vector(PK) });
-    let runf = b.p(Op::Select { cond: hit, a: ones, b: zeros });
+    let ones = b.p(Op::Broadcast {
+        value: one,
+        shape: Shape::vector(PK),
+    });
+    let zeros = b.p(Op::Broadcast {
+        value: zero,
+        shape: Shape::vector(PK),
+    });
+    let runf = b.p(Op::Select {
+        cond: hit,
+        a: ones,
+        b: zeros,
+    });
     let run = b.p(Op::CumProd(runf));
     let naccf = b.p(Op::ReduceSum(run));
-    let nacc = b.p(Op::Cast { value: naccf, dtype: DType::U32 });
-    let naccb = b.p(Op::Broadcast { value: nacc, shape: Shape::vector(kp1) });
+    let nacc = b.p(Op::Cast {
+        value: naccf,
+        dtype: DType::U32,
+    });
+    let naccb = b.p(Op::Broadcast {
+        value: nacc,
+        shape: Shape::vector(kp1),
+    });
     let lanes = b.p(Op::Iota { len: kp1 });
     let keep = b.p(Op::Ge(naccb, lanes));
     let neg1 = b.p(Op::Const(Literal::I32(-1)));
-    let commit = b.p(Op::Select { cond: keep, a: picked, b: neg1 });
-    b.p(Op::ChanPut { chan: 3, value: commit });
+    let commit = b.p(Op::Select {
+        cond: keep,
+        a: picked,
+        b: neg1,
+    });
+    b.p(Op::ChanPut {
+        chan: 3,
+        value: commit,
+    });
     let drf = b.p(Op::ReduceArgmax(mtp));
-    b.p(Op::ChanPut { chan: 0, value: drf });
-    b.p(Op::ChanPut { chan: 4, value: drf });
+    b.p(Op::ChanPut {
+        chan: 0,
+        value: drf,
+    });
+    b.p(Op::ChanPut {
+        chan: 4,
+        value: drf,
+    });
     let vh = b.p(Op::IntrinsicVal {
         intr: IntrinsicId::ValueHead,
         shape: Shape::vector(kp1),
@@ -921,7 +1457,7 @@ fn rollout_trace() -> TraceContainer {
         seeded,
     };
     TraceContainer {
-        names: vec!["envelope_dot".into(), "attn_page_mask".into()],
+        names: vec!["attn_page_mask".into(), "envelope_dot".into()],
         channels: vec![
             ch(Shape::vector(PK), DType::I32, HostRole::None, true), // 0 prev_drafts
             ch(Shape::matrix(kp1, PV), DType::Bool, HostRole::Writer, false), // 1 gmask
@@ -929,10 +1465,16 @@ fn rollout_trace() -> TraceContainer {
             ch(Shape::vector(kp1), DType::I32, HostRole::Reader, false), // 3 out
             ch(Shape::vector(PK), DType::I32, HostRole::Reader, false), // 4 draft_out
             ch(Shape::vector(kp1), DType::F32, HostRole::Reader, false), // 5 val
-            ch(Shape::vector(1), DType::U32, HostRole::None, true),   // 6 budget
+            ch(Shape::vector(1), DType::U32, HostRole::None, true),  // 6 budget
         ],
         ports: vec![],
-        stages: vec![quest_tap(6), StageProgram { stage: Stage::Epilogue, ops: b.ops }],
+        stages: vec![
+            quest_tap(6),
+            StageProgram {
+                stage: Stage::Epilogue,
+                ops: b.ops,
+            },
+        ],
         externs: Vec::new(),
     }
 }
@@ -953,7 +1495,11 @@ fn golden_pentathlon_iter() {
     let rol_b = bind(rol_c.clone(), profile).expect("rollout binds");
 
     let mut rep = Report::new("pentathlon_expand", &exp_c).verdict(&Ok(exp_b.clone()));
-    rep.0.push_str(&Report::new("pentathlon_rollout", &rol_c).verdict(&Ok(rol_b.clone())).0);
+    rep.0.push_str(
+        &Report::new("pentathlon_rollout", &rol_c)
+            .verdict(&Ok(rol_b.clone()))
+            .0,
+    );
     let mut kh = QuestKernels { calls: 0 };
 
     // ── phase 1: EXPAND leaves A and B ──────────────────────────────────
@@ -1011,7 +1557,12 @@ fn golden_pentathlon_iter() {
         (
             "A5",
             [5i32, 2, 7],
-            [[(5usize, 9.0f32), (0, 0.0)], [(2, 9.0), (0, 0.0)], [(7, 9.0), (0, 0.0)], [(0, 9.0), (0, 0.0)]],
+            [
+                [(5usize, 9.0f32), (0, 0.0)],
+                [(2, 9.0), (0, 0.0)],
+                [(7, 9.0), (0, 0.0)],
+                [(0, 9.0), (0, 0.0)],
+            ],
             [(0usize, 0.0f32); 4],
             // row2 forbids 7, allows 4; other rows allow-all
             Some((2usize, 4usize)),
@@ -1023,7 +1574,12 @@ fn golden_pentathlon_iter() {
             [1i32, 1, 1],
             // row1: TWO plausible expert tokens (1 at 9.0, 3 at 8.5, inside
             // the α-window); the amateur loves 1 -> cd reranks 3 above 1.
-            [[(1usize, 9.0f32), (0, 0.0)], [(1, 9.0), (3, 8.5)], [(1, 9.0), (0, 0.0)], [(1, 9.0), (0, 0.0)]],
+            [
+                [(1usize, 9.0f32), (0, 0.0)],
+                [(1, 9.0), (3, 8.5)],
+                [(1, 9.0), (0, 0.0)],
+                [(1, 9.0), (0, 0.0)],
+            ],
             [(0, 0.0), (1, 18.0), (0, 0.0), (0, 0.0)],
             None,
             [(5usize, 8.0f32), (5, 8.0), (5, 8.0)],
@@ -1097,15 +1653,28 @@ fn golden_dfa_ingraph() {
     let allow = b.p(Op::ChanRead(0)); // [S, V] bool (read-only table)
     let next = b.p(Op::ChanRead(1)); // [S*V] u32 (flat next-state table)
     let st = b.p(Op::ChanTake(2)); // [1] u32
-    let row = b.p(Op::Gather { src: allow, idx: st }); // [1, V] bool — THE MASK
+    let row = b.p(Op::Gather {
+        src: allow,
+        idx: st,
+    }); // [1, V] bool — THE MASK
     let ninf = b.p(Op::Const(Literal::F32(f32::NEG_INFINITY)));
-    let masked = b.p(Op::Select { cond: row, a: lg, b: ninf });
+    let masked = b.p(Op::Select {
+        cond: row,
+        a: lg,
+        b: ninf,
+    });
     let picked = b.p(Op::ReduceArgmax(masked)); // [1] i32
-    b.p(Op::ChanPut { chan: 3, value: picked });
+    b.p(Op::ChanPut {
+        chan: 3,
+        value: picked,
+    });
     // state' = next[state*V + picked]  — the in-graph walk
     let vc = b.p(Op::Const(Literal::U32(v)));
     let base = b.p(Op::Mul(st, vc));
-    let pu = b.p(Op::Cast { value: picked, dtype: DType::U32 });
+    let pu = b.p(Op::Cast {
+        value: picked,
+        dtype: DType::U32,
+    });
     let idx = b.p(Op::Add(base, pu));
     let ns = b.p(Op::Gather { src: next, idx });
     b.p(Op::ChanPut { chan: 2, value: ns });
@@ -1125,8 +1694,11 @@ fn golden_dfa_ingraph() {
             ch(Shape::vector(1), DType::I32, HostRole::Reader, false),   // 3 out
         ],
         ports: vec![],
-        stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
-    externs: Vec::new(),
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: b.ops,
+        }],
+        externs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.vocab = v;
@@ -1158,7 +1730,10 @@ fn golden_dfa_ingraph() {
         let mut l = vec![0.0f32; v as usize];
         l[fav] = 9.0;
         l[second] = 1.0;
-        let inputs = PassInputs { logits: Some(f32s(&l)), ..Default::default() };
+        let inputs = PassInputs {
+            logits: Some(f32s(&l)),
+            ..Default::default()
+        };
         rep = rep.line(&step_line(n, &mut inst, &bound, &inputs));
         rep = rep.line(&take_line(&mut inst, &bound, 3)); // 2, 3, 0
     }
@@ -1198,8 +1773,15 @@ fn golden_extern_contrastive() {
                 seeded: false,
             }],
             ports: vec![],
-            stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
-            externs: vec![ExternDecl { name: 0, dir: ExternDir::Export, chan: 0 }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: b.ops,
+            }],
+            externs: vec![ExternDecl {
+                name: 0,
+                dir: ExternDir::Export,
+                chan: 0,
+            }],
         }
     };
 
@@ -1215,7 +1797,10 @@ fn golden_extern_contrastive() {
         let gm = b.p(Op::ChanTake(1)); // grammar mask (host)
         let scored = contrastive_score(&mut b, lg, am, gm, 1);
         let picked = b.p(Op::ReduceArgmax(scored)); // [1] i32
-        b.p(Op::ChanPut { chan: 2, value: picked });
+        b.p(Op::ChanPut {
+            chan: 2,
+            value: picked,
+        });
         TraceContainer {
             names: vec!["cd_amateur_logits".to_string()],
             channels: vec![
@@ -1242,8 +1827,15 @@ fn golden_extern_contrastive() {
                 }, // 2 out
             ],
             ports: vec![],
-            stages: vec![StageProgram { stage: Stage::Epilogue, ops: b.ops }],
-            externs: vec![ExternDecl { name: 0, dir: ExternDir::Import, chan: 0 }],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: b.ops,
+            }],
+            externs: vec![ExternDecl {
+                name: 0,
+                dir: ExternDir::Import,
+                chan: 0,
+            }],
         }
     };
 
@@ -1252,23 +1844,18 @@ fn golden_extern_contrastive() {
     let am_b = bind(am_trace.clone(), profile.clone()).expect("amateur binds");
     let ex_b = bind(ex_trace.clone(), profile).expect("expert binds");
     let mut rep = Report::new("extern_amateur", &am_trace).verdict(&Ok(am_b.clone()));
-    rep.0.push_str(&Report::new("extern_expert", &ex_trace).verdict(&Ok(ex_b.clone())).0);
+    rep.0.push_str(
+        &Report::new("extern_expert", &ex_trace)
+            .verdict(&Ok(ex_b.clone()))
+            .0,
+    );
 
     // The broker: ONE shared ring, handed to both instances (§1: SPSC
     // constrains endpoints, not clocks).
     let ring = ExternChannel::for_decl(&am_trace.channels[0]);
-    let mut am = pie_ptir::interp::Instance::new_with_externs(
-        &am_b,
-        &[],
-        &[(0, ring.clone())],
-    )
-    .unwrap();
-    let mut ex = pie_ptir::interp::Instance::new_with_externs(
-        &ex_b,
-        &[],
-        &[(0, ring)],
-    )
-    .unwrap();
+    let mut am =
+        pie_ptir::interp::Instance::new_with_externs(&am_b, &[], &[(0, ring.clone())]).unwrap();
+    let mut ex = pie_ptir::interp::Instance::new_with_externs(&ex_b, &[], &[(0, ring)]).unwrap();
 
     // Expert logits peak at 2 (9.0) and 5 (8.5), both in the α-window; the
     // AMATEUR (a genuinely different model) loves 2 -> contrastive demotes
@@ -1279,12 +1866,23 @@ fn golden_extern_contrastive() {
     exl[5] = 8.5;
     let mut aml = vec![0.0f32; v as usize];
     aml[2] = 9.0;
-    let ex_in = PassInputs { logits: Some(f32s(&exl)), ..Default::default() };
-    let am_in = PassInputs { logits: Some(f32s(&aml)), ..Default::default() };
+    let ex_in = PassInputs {
+        logits: Some(f32s(&exl)),
+        ..Default::default()
+    };
+    let am_in = PassInputs {
+        logits: Some(f32s(&aml)),
+        ..Default::default()
+    };
 
     // 1. Expert fires FIRST: the extern import is empty — the cross-pipeline
     //    readiness miss (the amateur's clock hasn't produced yet).
-    rep = rep.line(&put_line(&mut ex, &ex_b, 1, Value::Bool(vec![true; v as usize])));
+    rep = rep.line(&put_line(
+        &mut ex,
+        &ex_b,
+        1,
+        Value::Bool(vec![true; v as usize]),
+    ));
     rep = rep.line(&{
         let fed = format!("inputs expert-early: {ex_in:?}");
         step_line_k(0, &mut ex, &ex_b, &ex_in, &mut NoKernels, fed)
@@ -1316,7 +1914,7 @@ fn golden_extern_contrastive() {
 
 #[test]
 fn extern_v2_round_trip_and_v1_hashes_stable() {
-    use pie_ptir::container::{decode, encode, ExternDecl, ExternDir};
+    use pie_ptir::container::{ExternDecl, ExternDir, decode, encode};
     // A v1 container (no externs) encodes version 1 — byte layout untouched.
     let c1 = TraceContainer {
         names: vec![],
@@ -1340,7 +1938,11 @@ fn extern_v2_round_trip_and_v1_hashes_stable() {
         externs: vec![],
     };
     let b1 = encode(&c1);
-    assert_eq!(u16::from_le_bytes([b1[4], b1[5]]), 1, "no externs => wire v1");
+    assert_eq!(
+        u16::from_le_bytes([b1[4], b1[5]]),
+        1,
+        "no externs => wire v1"
+    );
     assert_eq!(decode(&b1).unwrap(), c1);
     // With an extern: version 2, round-trips, and the hash differs (a
     // different trace IS a different identity).
@@ -1353,7 +1955,11 @@ fn extern_v2_round_trip_and_v1_hashes_stable() {
         host_role: HostRole::None,
         seeded: false,
     });
-    c2.externs = vec![ExternDecl { name: 0, dir: ExternDir::Import, chan: 1 }];
+    c2.externs = vec![ExternDecl {
+        name: 0,
+        dir: ExternDir::Import,
+        chan: 1,
+    }];
     let b2 = encode(&c2);
     assert_eq!(u16::from_le_bytes([b2[4], b2[5]]), 2, "externs => wire v2");
     assert_eq!(decode(&b2).unwrap(), c2);
@@ -1384,14 +1990,24 @@ fn extern_direction_violations_rejected() {
             },
         ],
         ports: vec![],
-        stages: vec![StageProgram { stage: Stage::Epilogue, ops }],
-        externs: vec![ExternDecl { name: 0, dir, chan: 0 }],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }],
+        externs: vec![ExternDecl {
+            name: 0,
+            dir,
+            chan: 0,
+        }],
     };
     let put_on_import = mk(
         ExternDir::Import,
         vec![
             Op::Const(pie_ptir::types::Literal::F32(1.0)),
-            Op::Broadcast { value: 0, shape: Shape::vector(1) },
+            Op::Broadcast {
+                value: 0,
+                shape: Shape::vector(1),
+            },
             Op::ChanPut { chan: 0, value: 1 },
         ],
     );

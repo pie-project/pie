@@ -1,16 +1,16 @@
 //! Mock-driver helpers for integration tests.
 //!
 //! These helpers keep the existing harness source compiling on top of direct
-//! native-driver registration.
+//! driver-backend registration.
 
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pie_engine::driver::{
-    DriverSpec, LaunchPlan, NativeDriver, SchedulerLimits, register_native_driver,
+    DriverBackend, DriverSpec, LaunchPlan, SchedulerLimits, register_driver_backend,
 };
-use pie_engine::inference::scheduler::BatchScheduler;
+use pie_engine::scheduler::worker::BatchScheduler;
 
 /// Launch observer for harness probes, wired onto the dummy driver's launch
 /// path via [`launch_observer`]: it sees every accepted launch's forward
@@ -25,11 +25,19 @@ pub trait Behavior: Send + Sync + 'static {
 /// `observe_launch` synchronously on the launch path.
 pub fn launch_observer(behavior: Arc<dyn Behavior>) -> pie_driver_dummy_lib::LaunchObserver {
     pie_driver_dummy_lib::LaunchObserver(Arc::new(move |obs| {
+        let (kv_page_indices, kv_page_indptr) = if obs.kv_translation.is_empty() {
+            (obs.kv_page_indices.clone(), obs.kv_page_indptr.clone())
+        } else {
+            (
+                obs.kv_translation.clone(),
+                obs.kv_translation_indptr.clone(),
+            )
+        };
         let plan = LaunchPlan {
             token_ids: obs.token_ids.clone(),
             qo_indptr: obs.qo_indptr.clone(),
-            kv_page_indices: obs.kv_page_indices.clone(),
-            kv_page_indptr: obs.kv_page_indptr.clone(),
+            kv_page_indices,
+            kv_page_indptr,
             kv_last_page_lens: obs.kv_last_page_lens.clone(),
             ..LaunchPlan::default()
         };
@@ -51,21 +59,13 @@ pub struct EchoBehavior(pub u32);
 
 impl Behavior for EchoBehavior {}
 
-/// SplitMix64 + seed×column — preserved for tests that build deterministic
-/// synthetic logits.
 fn mock_hash_uniform(seed_eff: u64, j: u32) -> f32 {
-    let mut x = seed_eff.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul((j as u64) + 1));
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x3C79_AC49_2BA7_B653);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0x1C69_B3F7_4AC4_AE35);
-    x ^= x >> 27;
-    ((x >> 40) as u32 as f32 + 0.5) * (1.0 / 16_777_216.0)
+    pie_ptir::rng::hash_uniform(seed_eff, j)
 }
 
 /// Deterministic pseudo-random logits row seeded by request id, in ~[-4, 4].
 pub fn synthetic_logits(req_id: u64, vocab: usize) -> Vec<f32> {
-    let seed = req_id ^ 0xA5A5_A5A5u64;
+    let seed = req_id ^ pie_ptir::rng::seed_eff(0);
     (0..vocab as u32)
         .map(|j| (mock_hash_uniform(seed, j) * 2.0 - 1.0) * 4.0)
         .collect()
@@ -183,7 +183,7 @@ fn register_dummy_driver(
     vocab_size: u32,
     operation_log: Arc<Mutex<Vec<String>>>,
 ) -> (usize, BatchScheduler) {
-    let (native, _) = NativeDriver::dummy(pie_driver_dummy_lib::DummyDriverOptions {
+    let (backend, _) = DriverBackend::dummy(pie_driver_dummy_lib::DummyDriverOptions {
         total_pages: num_kv_pages as u32,
         kv_page_size: 16,
         swap_pool_size: 0,
@@ -199,25 +199,34 @@ fn register_dummy_driver(
         max_forward_tokens: 4096,
         max_forward_requests: 32,
         max_page_refs: num_kv_pages.max(1) as u32,
+        has_mtp_logits: true,
+        has_mtp_drafts: true,
+        has_value_head: true,
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,
         fail_launches_after_accept: false,
+        retry_launches_remaining: 0,
+        elastic_admission: false,
+        prepare_exhaustions_remaining: 0,
+        prepare_impossible_above_kv_pages: 0,
         operation_log: Some(operation_log),
         launch_observer: Some(launch_observer(behavior)),
     })
-    .expect("create dummy native driver");
+    .expect("create dummy driver backend");
     let limits = SchedulerLimits {
         max_forward_requests: 32,
         max_forward_tokens: 4096,
         max_page_refs: num_kv_pages.max(1),
     };
-    let driver_id = register_native_driver(
+    let driver_id = register_driver_backend(
         DriverSpec {
             num_kv_pages,
             limits,
+            device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
+                | pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
         },
-        native,
+        backend,
     );
     let scheduler = BatchScheduler::new(driver_id, driver_idx, 16, limits, 30);
     (driver_id, scheduler)

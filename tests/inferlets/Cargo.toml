@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "attention-sink",
+    "beam-search",
+    "cacheback-speculative-decoding",
+    "chat-completion",
+    "consensus-decoding",
+    "contrastive-decoding",
+    "greenlist-watermarking",
+    "json-schema-constrained-decoding",
+    "mirostat-v2-sampling",
+    "mtp-speculative-decoding",
+    "prefix-tree-kv-cache",
+    "sampling-primitives",
+    "sliding-window-attention",
+    "text-completion-bench",
+]
+
+[profile.release]
+lto = true

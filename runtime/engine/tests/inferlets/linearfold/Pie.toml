@@ -1,4 +1,0 @@
-[package]
-name = "linearfold"
-version = "0.1.0"
-description = "Test inferlet: exercises the linear-model fold-commit surface (model::is_linear() + RsWorkingSet + Forward::rs_working_set/fold) — the model-agnostic spec-commit loop"

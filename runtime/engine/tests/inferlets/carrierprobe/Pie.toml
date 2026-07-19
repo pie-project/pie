@@ -1,4 +1,0 @@
-[package]
-name = "carrierprobe"
-version = "0.1.0"
-description = "Test inferlet: drives a PARAMETRIC sampler (top-p) through the run-ahead carrier via carrier::submit_pass — the unified keep-core carrier x sampler_program path, no facade"

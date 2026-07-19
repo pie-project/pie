@@ -18,7 +18,7 @@ use core::fmt;
 
 use super::op::{ChannelIndex, IntrinsicId, Op};
 use super::registry::{Port, Stage};
-use crate::types::{DType, Literal, Predicate, RngKind, Shape, MAX_RANK};
+use crate::types::{DType, Literal, MAX_RANK, Predicate, RngKind, Shape};
 use crate::{PTIR_MAGIC, PTIR_VERSION, PTIR_VERSION_EXTERN};
 
 /// Channel element dtype: a concrete scalar type or the late-bound
@@ -107,7 +107,11 @@ pub enum PortSource {
     Channel(ChannelIndex),
     /// Raw little-endian payload: 4 bytes/element for F32/I32/U32, 1
     /// byte/element for Bool (the packed wire format is the runtime's, D1).
-    Const { dtype: DType, shape: Shape, data: Vec<u8> },
+    Const {
+        dtype: DType,
+        shape: Shape,
+        data: Vec<u8>,
+    },
 }
 
 /// One descriptor-port binding (overview §5.1).
@@ -194,11 +198,16 @@ impl TraceContainer {
 pub fn encode(c: &TraceContainer) -> Vec<u8> {
     let mut w = Vec::new();
     w.extend_from_slice(&PTIR_MAGIC);
-    // Wire-version selection keeps every pre-v1.1 hash stable: no externs ⇒
-    // the exact version-1 byte stream; externs ⇒ version 2 (header gains
-    // `n_externs`, table appended after the stages).
+    // Preserve version-1 hashes when the extern extension is absent.
     let v2 = !c.externs.is_empty();
-    put_u16(&mut w, if v2 { PTIR_VERSION_EXTERN } else { PTIR_VERSION });
+    put_u16(
+        &mut w,
+        if v2 {
+            PTIR_VERSION_EXTERN
+        } else {
+            PTIR_VERSION
+        },
+    );
     put_u16(&mut w, 0); // flags
     put_u32(&mut w, c.names.len() as u32);
     put_u32(&mut w, c.channels.len() as u32);
@@ -253,9 +262,20 @@ pub(crate) fn encode_op(w: &mut Vec<u8>, op: &Op) {
     match *op {
         Op::Const(lit) => encode_literal(w, lit),
 
-        Op::Exp(a) | Op::Log(a) | Op::Neg(a) | Op::Recip(a) | Op::Abs(a) | Op::Sign(a)
-        | Op::Not(a) | Op::ReduceSum(a) | Op::ReduceMax(a) | Op::ReduceMin(a)
-        | Op::ReduceArgmax(a) | Op::Transpose(a) | Op::CumSum(a) | Op::CumProd(a)
+        Op::Exp(a)
+        | Op::Log(a)
+        | Op::Neg(a)
+        | Op::Recip(a)
+        | Op::Abs(a)
+        | Op::Sign(a)
+        | Op::Not(a)
+        | Op::ReduceSum(a)
+        | Op::ReduceMax(a)
+        | Op::ReduceMin(a)
+        | Op::ReduceArgmax(a)
+        | Op::Transpose(a)
+        | Op::CumSum(a)
+        | Op::CumProd(a)
         | Op::SortDesc(a) => put_u32(w, a),
 
         Op::Cast { value, dtype } => {
@@ -263,9 +283,21 @@ pub(crate) fn encode_op(w: &mut Vec<u8>, op: &Op) {
             w.push(dtype as u8);
         }
 
-        Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::MaxElem(a, b)
-        | Op::MinElem(a, b) | Op::Rem(a, b) | Op::Gt(a, b) | Op::Ge(a, b) | Op::Eq(a, b)
-        | Op::Ne(a, b) | Op::Lt(a, b) | Op::Le(a, b) | Op::And(a, b) | Op::Or(a, b)
+        Op::Add(a, b)
+        | Op::Sub(a, b)
+        | Op::Mul(a, b)
+        | Op::Div(a, b)
+        | Op::MaxElem(a, b)
+        | Op::MinElem(a, b)
+        | Op::Rem(a, b)
+        | Op::Gt(a, b)
+        | Op::Ge(a, b)
+        | Op::Eq(a, b)
+        | Op::Ne(a, b)
+        | Op::Lt(a, b)
+        | Op::Le(a, b)
+        | Op::And(a, b)
+        | Op::Or(a, b)
         | Op::MatMul(a, b) => {
             put_u32(w, a);
             put_u32(w, b);
@@ -300,6 +332,30 @@ pub(crate) fn encode_op(w: &mut Vec<u8>, op: &Op) {
             put_u32(w, logits);
             put_u32(w, mask);
         }
+        Op::CausalMask { positions, len } => {
+            put_u32(w, positions);
+            put_u32(w, len);
+        }
+        Op::SlidingWindowMask {
+            positions,
+            len,
+            window,
+        } => {
+            put_u32(w, positions);
+            put_u32(w, len);
+            put_u32(w, window);
+        }
+        Op::SinkWindowMask {
+            positions,
+            len,
+            sink,
+            window,
+        } => {
+            put_u32(w, positions);
+            put_u32(w, len);
+            put_u32(w, sink);
+            put_u32(w, window);
+        }
         Op::ScatterAdd { base, idx, vals } | Op::ScatterSet { base, idx, vals } => {
             put_u32(w, base);
             put_u32(w, idx);
@@ -307,7 +363,11 @@ pub(crate) fn encode_op(w: &mut Vec<u8>, op: &Op) {
         }
         Op::Iota { len } => put_u32(w, len),
 
-        Op::Rng { stream, shape, kind } => {
+        Op::Rng {
+            stream,
+            shape,
+            kind,
+        } => {
             put_u32(w, stream);
             encode_shape(w, shape);
             w.push(kind as u8);
@@ -329,7 +389,12 @@ pub(crate) fn encode_op(w: &mut Vec<u8>, op: &Op) {
             w.push(dtype as u8);
             encode_shape(w, shape);
         }
-        Op::KernelCall { name, ref args, shape, dtype } => {
+        Op::KernelCall {
+            name,
+            ref args,
+            shape,
+            dtype,
+        } => {
             put_u16(w, name);
             w.push(dtype as u8);
             encode_shape(w, shape);
@@ -421,7 +486,11 @@ pub enum ContainerDecodeError {
     UnknownOpcode(u8),
     UnknownTag { what: &'static str, tag: u8 },
     RankTooLarge(u8),
+    ZeroDimension,
     BadUtf8,
+    TrailingBytes,
+    NonCanonical,
+    CountTooLarge(&'static str),
 }
 
 impl fmt::Display for ContainerDecodeError {
@@ -434,7 +503,11 @@ impl fmt::Display for ContainerDecodeError {
             UnknownOpcode(t) => write!(f, "unknown opcode 0x{t:02x}"),
             UnknownTag { what, tag } => write!(f, "unknown {what} tag 0x{tag:02x}"),
             RankTooLarge(r) => write!(f, "shape rank {r} exceeds MAX_RANK"),
+            ZeroDimension => f.write_str("shape dimensions must be nonzero"),
             BadUtf8 => f.write_str("name table entry is not valid UTF-8"),
+            TrailingBytes => f.write_str("trailing bytes after PTIR container"),
+            NonCanonical => f.write_str("noncanonical PTIR container encoding"),
+            CountTooLarge(table) => write!(f, "{table} count exceeds remaining container bytes"),
         }
     }
 }
@@ -449,7 +522,10 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn u8(&mut self) -> Result<u8, ContainerDecodeError> {
-        let b = *self.buf.get(self.pos).ok_or(ContainerDecodeError::UnexpectedEof)?;
+        let b = *self
+            .buf
+            .get(self.pos)
+            .ok_or(ContainerDecodeError::UnexpectedEof)?;
         self.pos += 1;
         Ok(b)
     }
@@ -462,10 +538,30 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8], ContainerDecodeError> {
-        let end = self.pos.checked_add(n).ok_or(ContainerDecodeError::UnexpectedEof)?;
-        let s = self.buf.get(self.pos..end).ok_or(ContainerDecodeError::UnexpectedEof)?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(ContainerDecodeError::UnexpectedEof)?;
+        let s = self
+            .buf
+            .get(self.pos..end)
+            .ok_or(ContainerDecodeError::UnexpectedEof)?;
         self.pos = end;
         Ok(s)
+    }
+    fn bounded_count(
+        &self,
+        count: u32,
+        minimum_record_bytes: usize,
+        table: &'static str,
+    ) -> Result<usize, ContainerDecodeError> {
+        let count = count as usize;
+        if minimum_record_bytes == 0
+            || count > self.buf.len().saturating_sub(self.pos) / minimum_record_bytes
+        {
+            return Err(ContainerDecodeError::CountTooLarge(table));
+        }
+        Ok(count)
     }
 }
 
@@ -484,34 +580,50 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
     let n_channels = r.u32()?;
     let n_ports = r.u32()?;
     let n_stages = r.u32()?;
-    let n_externs = if version == PTIR_VERSION_EXTERN { r.u32()? } else { 0 };
+    let n_externs = if version == PTIR_VERSION_EXTERN {
+        r.u32()?
+    } else {
+        0
+    };
 
-    let mut names = Vec::with_capacity(n_names as usize);
+    let mut names = Vec::with_capacity(r.bounded_count(n_names, 2, "name table")?);
     for _ in 0..n_names {
         let len = r.u16()? as usize;
         let bytes = r.take(len)?;
         names.push(String::from_utf8(bytes.to_vec()).map_err(|_| ContainerDecodeError::BadUtf8)?);
     }
 
-    let mut channels = Vec::with_capacity(n_channels as usize);
+    let mut channels = Vec::with_capacity(r.bounded_count(n_channels, 8, "channel table")?);
     for _ in 0..n_channels {
         let dt = r.u8()?;
-        let dtype = ChanDType::from_tag(dt)
-            .ok_or(ContainerDecodeError::UnknownTag { what: "channel dtype", tag: dt })?;
+        let dtype = ChanDType::from_tag(dt).ok_or(ContainerDecodeError::UnknownTag {
+            what: "channel dtype",
+            tag: dt,
+        })?;
         let shape = decode_shape(&mut r)?;
         let capacity = r.u32()?;
         let hr = r.u8()?;
-        let host_role = HostRole::from_u8(hr)
-            .ok_or(ContainerDecodeError::UnknownTag { what: "host role", tag: hr })?;
+        let host_role = HostRole::from_u8(hr).ok_or(ContainerDecodeError::UnknownTag {
+            what: "host role",
+            tag: hr,
+        })?;
         let seeded = r.u8()? != 0;
-        channels.push(ChannelDecl { shape, dtype, capacity, host_role, seeded });
+        channels.push(ChannelDecl {
+            shape,
+            dtype,
+            capacity,
+            host_role,
+            seeded,
+        });
     }
 
-    let mut ports = Vec::with_capacity(n_ports as usize);
+    let mut ports = Vec::with_capacity(r.bounded_count(n_ports, 4, "port table")?);
     for _ in 0..n_ports {
         let pt = r.u8()?;
-        let port =
-            Port::from_u8(pt).ok_or(ContainerDecodeError::UnknownTag { what: "port", tag: pt })?;
+        let port = Port::from_u8(pt).ok_or(ContainerDecodeError::UnknownTag {
+            what: "port",
+            tag: pt,
+        })?;
         let src = r.u8()?;
         let source = match src {
             0 => PortSource::Channel(r.u32()?),
@@ -519,36 +631,65 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
                 let dt = r.u8()?;
                 let dtype = decode_dtype(dt)?;
                 let shape = decode_shape(&mut r)?;
-                let n = shape.numel() as usize * const_elem_size(dtype);
-                PortSource::Const { dtype, shape, data: r.take(n)?.to_vec() }
+                let n = usize::try_from(shape.numel())
+                    .ok()
+                    .and_then(|numel| numel.checked_mul(const_elem_size(dtype)))
+                    .ok_or(ContainerDecodeError::CountTooLarge("port constant payload"))?;
+                PortSource::Const {
+                    dtype,
+                    shape,
+                    data: r.take(n)?.to_vec(),
+                }
             }
-            t => return Err(ContainerDecodeError::UnknownTag { what: "port source", tag: t }),
+            t => {
+                return Err(ContainerDecodeError::UnknownTag {
+                    what: "port source",
+                    tag: t,
+                });
+            }
         };
         ports.push(PortBinding { port, source });
     }
 
-    let mut stages = Vec::with_capacity(n_stages as usize);
+    let mut stages = Vec::with_capacity(r.bounded_count(n_stages, 5, "stage table")?);
     for _ in 0..n_stages {
         let st = r.u8()?;
-        let stage =
-            Stage::from_u8(st).ok_or(ContainerDecodeError::UnknownTag { what: "stage", tag: st })?;
+        let stage = Stage::from_u8(st).ok_or(ContainerDecodeError::UnknownTag {
+            what: "stage",
+            tag: st,
+        })?;
         let n_ops = r.u32()?;
-        let mut ops = Vec::with_capacity(n_ops as usize);
+        let mut ops = Vec::with_capacity(r.bounded_count(n_ops, 1, "operation table")?);
         for _ in 0..n_ops {
             ops.push(decode_op(&mut r)?);
         }
         stages.push(StageProgram { stage, ops });
     }
-    let mut externs = Vec::with_capacity(n_externs as usize);
+    let mut externs = Vec::with_capacity(r.bounded_count(n_externs, 7, "extern table")?);
     for _ in 0..n_externs {
         let name = r.u16()?;
         let d = r.u8()?;
-        let dir = ExternDir::from_u8(d)
-            .ok_or(ContainerDecodeError::UnknownTag { what: "extern dir", tag: d })?;
+        let dir = ExternDir::from_u8(d).ok_or(ContainerDecodeError::UnknownTag {
+            what: "extern dir",
+            tag: d,
+        })?;
         let chan = r.u32()?;
         externs.push(ExternDecl { name, dir, chan });
     }
-    Ok(TraceContainer { names, channels, ports, stages, externs })
+    if r.pos != bytes.len() {
+        return Err(ContainerDecodeError::TrailingBytes);
+    }
+    let container = TraceContainer {
+        names,
+        channels,
+        ports,
+        stages,
+        externs,
+    };
+    if container.encode() != bytes {
+        return Err(ContainerDecodeError::NonCanonical);
+    }
+    Ok(container)
 }
 
 fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
@@ -560,7 +701,10 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
         0x04 => Op::Recip(r.u32()?),
         0x05 => Op::Abs(r.u32()?),
         0x06 => Op::Sign(r.u32()?),
-        0x07 => Op::Cast { value: r.u32()?, dtype: decode_dtype(r.u8()?)? },
+        0x07 => Op::Cast {
+            value: r.u32()?,
+            dtype: decode_dtype(r.u8()?)?,
+        },
         0x10 => Op::Add(r.u32()?, r.u32()?),
         0x11 => Op::Sub(r.u32()?, r.u32()?),
         0x12 => Op::Mul(r.u32()?, r.u32()?),
@@ -577,18 +721,31 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
         0x1D => Op::Or(r.u32()?, r.u32()?),
         0x1E => Op::Not(r.u32()?),
         0x1F => Op::Rem(r.u32()?, r.u32()?),
-        0x20 => Op::Select { cond: r.u32()?, a: r.u32()?, b: r.u32()? },
+        0x20 => Op::Select {
+            cond: r.u32()?,
+            a: r.u32()?,
+            b: r.u32()?,
+        },
         0x30 => Op::ReduceSum(r.u32()?),
         0x31 => Op::ReduceMax(r.u32()?),
         0x32 => Op::ReduceMin(r.u32()?),
         0x33 => Op::ReduceArgmax(r.u32()?),
-        0x38 => Op::Broadcast { value: r.u32()?, shape: decode_shape(r)? },
-        0x39 => Op::Reshape { value: r.u32()?, shape: decode_shape(r)? },
+        0x38 => Op::Broadcast {
+            value: r.u32()?,
+            shape: decode_shape(r)?,
+        },
+        0x39 => Op::Reshape {
+            value: r.u32()?,
+            shape: decode_shape(r)?,
+        },
         0x3A => Op::Transpose(r.u32()?),
         0x40 => Op::CumSum(r.u32()?),
         0x41 => Op::CumProd(r.u32()?),
         0x50 => Op::SortDesc(r.u32()?),
-        0x51 => Op::TopK { input: r.u32()?, k: r.u32()? },
+        0x51 => Op::TopK {
+            input: r.u32()?,
+            k: r.u32()?,
+        },
         0x55 => Op::MatMul(r.u32()?, r.u32()?),
         0x58 => {
             let input = r.u32()?;
@@ -596,18 +753,63 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
                 0 => Predicate::RankLe(r.u32()?),
                 1 => Predicate::CummassLe(r.u32()?),
                 2 => Predicate::ProbGe(r.u32()?),
-                t => return Err(ContainerDecodeError::UnknownTag { what: "predicate", tag: t }),
+                t => {
+                    return Err(ContainerDecodeError::UnknownTag {
+                        what: "predicate",
+                        tag: t,
+                    });
+                }
             };
             Op::PivotThreshold { input, predicate }
         }
-        0x60 => Op::Gather { src: r.u32()?, idx: r.u32()? },
-        0x61 => Op::GatherRow { src: r.u32()?, idx: r.u32()? },
-        0x62 => Op::ScatterAdd { base: r.u32()?, idx: r.u32()?, vals: r.u32()? },
-        0x63 => Op::ScatterSet { base: r.u32()?, idx: r.u32()?, vals: r.u32()? },
+        0x60 => Op::Gather {
+            src: r.u32()?,
+            idx: r.u32()?,
+        },
+        0x61 => Op::GatherRow {
+            src: r.u32()?,
+            idx: r.u32()?,
+        },
+        0x62 => Op::ScatterAdd {
+            base: r.u32()?,
+            idx: r.u32()?,
+            vals: r.u32()?,
+        },
+        0x63 => Op::ScatterSet {
+            base: r.u32()?,
+            idx: r.u32()?,
+            vals: r.u32()?,
+        },
         0x64 => Op::Iota { len: r.u32()? },
-        0x65 => Op::MaskApply { logits: r.u32()?, mask: r.u32()? },
-        0x70 => Op::Rng { stream: r.u32()?, shape: decode_shape(r)?, kind: decode_rng_kind(r.u8()?)? },
-        0x71 => Op::RngKeyed { state: r.u32()?, shape: decode_shape(r)?, kind: decode_rng_kind(r.u8()?)? },
+        0x65 => Op::MaskApply {
+            logits: r.u32()?,
+            mask: r.u32()?,
+        },
+        0x66 => Op::CausalMask {
+            positions: r.u32()?,
+            len: r.u32()?,
+        },
+        0x67 => Op::SlidingWindowMask {
+            positions: r.u32()?,
+            len: r.u32()?,
+            window: r.u32()?,
+        },
+        0x68 => Op::SinkWindowMask {
+            positions: r.u32()?,
+            len: r.u32()?,
+            sink: r.u32()?,
+            window: r.u32()?,
+        },
+        0x70 => Op::Rng {
+            stream: r.u32()?,
+            shape: decode_shape(r)?,
+            kind: decode_rng_kind(r.u8()?)?,
+        },
+        0x71 => Op::RngKeyed {
+            state: r.u32()?,
+            shape: decode_shape(r)?,
+            kind: decode_rng_kind(r.u8()?)?,
+        },
         0x81 => {
             let dt = r.u8()?;
             let bits = r.u32()?;
@@ -616,12 +818,20 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
                 1 => Literal::I32(bits as i32),
                 2 => Literal::U32(bits),
                 3 => Literal::Bool(bits != 0),
-                t => return Err(ContainerDecodeError::UnknownTag { what: "literal dtype", tag: t }),
+                t => {
+                    return Err(ContainerDecodeError::UnknownTag {
+                        what: "literal dtype",
+                        tag: t,
+                    });
+                }
             })
         }
         0x90 => Op::ChanTake(r.u32()?),
         0x91 => Op::ChanRead(r.u32()?),
-        0x92 => Op::ChanPut { chan: r.u32()?, value: r.u32()? },
+        0x92 => Op::ChanPut {
+            chan: r.u32()?,
+            value: r.u32()?,
+        },
         0xA0 => {
             let iv = r.u16()?;
             let intr = IntrinsicId::from_u16(iv).ok_or(ContainerDecodeError::UnknownTag {
@@ -641,7 +851,12 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
             for _ in 0..n {
                 args.push(r.u32()?);
             }
-            Op::KernelCall { name, args, shape, dtype }
+            Op::KernelCall {
+                name,
+                args,
+                shape,
+                dtype,
+            }
         }
         0xA2 => {
             let name = r.u16()?;
@@ -661,7 +876,12 @@ fn decode_rng_kind(t: u8) -> Result<RngKind, ContainerDecodeError> {
     Ok(match t {
         0 => RngKind::Uniform,
         1 => RngKind::Gumbel,
-        t => return Err(ContainerDecodeError::UnknownTag { what: "rng kind", tag: t }),
+        t => {
+            return Err(ContainerDecodeError::UnknownTag {
+                what: "rng kind",
+                tag: t,
+            });
+        }
     })
 }
 
@@ -671,7 +891,12 @@ fn decode_dtype(t: u8) -> Result<DType, ContainerDecodeError> {
         1 => DType::I32,
         2 => DType::U32,
         3 => DType::Bool,
-        t => return Err(ContainerDecodeError::UnknownTag { what: "dtype", tag: t }),
+        t => {
+            return Err(ContainerDecodeError::UnknownTag {
+                what: "dtype",
+                tag: t,
+            });
+        }
     })
 }
 
@@ -684,7 +909,7 @@ fn decode_shape(r: &mut Reader<'_>) -> Result<Shape, ContainerDecodeError> {
     for d in dims.iter_mut().take(rank as usize) {
         *d = r.u32()?;
     }
-    Ok(Shape::new(&dims[..rank as usize]).expect("rank checked"))
+    Shape::new(&dims[..rank as usize]).ok_or(ContainerDecodeError::ZeroDimension)
 }
 
 #[cfg(test)]
@@ -716,7 +941,10 @@ mod tests {
                 },
             ],
             ports: vec![
-                PortBinding { port: Port::EmbedTokens, source: PortSource::Channel(0) },
+                PortBinding {
+                    port: Port::EmbedTokens,
+                    source: PortSource::Channel(0),
+                },
                 PortBinding {
                     port: Port::EmbedIndptr,
                     source: PortSource::Const {
@@ -783,36 +1011,116 @@ mod tests {
             Op::Const(Literal::I32(-1)),
             Op::Const(Literal::U32(7)),
             Op::Const(Literal::Bool(true)),
-            Op::Exp(0), Op::Log(0), Op::Neg(0), Op::Recip(0), Op::Abs(0), Op::Sign(0),
-            Op::Cast { value: 0, dtype: DType::U32 },
-            Op::Add(0, 1), Op::Sub(0, 1), Op::Mul(0, 1), Op::Div(0, 1),
-            Op::MaxElem(0, 1), Op::MinElem(0, 1), Op::Rem(0, 1),
-            Op::Gt(0, 1), Op::Ge(0, 1), Op::Eq(0, 1), Op::Ne(0, 1), Op::Lt(0, 1), Op::Le(0, 1),
-            Op::And(4, 5), Op::Or(4, 5), Op::Not(4),
-            Op::Select { cond: 4, a: 0, b: 1 },
-            Op::ReduceSum(0), Op::ReduceMax(0), Op::ReduceMin(0), Op::ReduceArgmax(0),
-            Op::Broadcast { value: 0, shape: Shape::matrix(2, 3) },
-            Op::Reshape { value: 0, shape: Shape::vector(6) },
+            Op::Exp(0),
+            Op::Log(0),
+            Op::Neg(0),
+            Op::Recip(0),
+            Op::Abs(0),
+            Op::Sign(0),
+            Op::Cast {
+                value: 0,
+                dtype: DType::U32,
+            },
+            Op::Add(0, 1),
+            Op::Sub(0, 1),
+            Op::Mul(0, 1),
+            Op::Div(0, 1),
+            Op::MaxElem(0, 1),
+            Op::MinElem(0, 1),
+            Op::Rem(0, 1),
+            Op::Gt(0, 1),
+            Op::Ge(0, 1),
+            Op::Eq(0, 1),
+            Op::Ne(0, 1),
+            Op::Lt(0, 1),
+            Op::Le(0, 1),
+            Op::And(4, 5),
+            Op::Or(4, 5),
+            Op::Not(4),
+            Op::Select {
+                cond: 4,
+                a: 0,
+                b: 1,
+            },
+            Op::ReduceSum(0),
+            Op::ReduceMax(0),
+            Op::ReduceMin(0),
+            Op::ReduceArgmax(0),
+            Op::Broadcast {
+                value: 0,
+                shape: Shape::matrix(2, 3),
+            },
+            Op::Reshape {
+                value: 0,
+                shape: Shape::vector(6),
+            },
             Op::Transpose(0),
-            Op::CumSum(0), Op::CumProd(0),
+            Op::CumSum(0),
+            Op::CumProd(0),
             Op::SortDesc(0),
             Op::TopK { input: 0, k: 3 },
             Op::MatMul(0, 1),
-            Op::PivotThreshold { input: 0, predicate: Predicate::CummassLe(2) },
+            Op::PivotThreshold {
+                input: 0,
+                predicate: Predicate::CummassLe(2),
+            },
             Op::Gather { src: 0, idx: 1 },
             Op::GatherRow { src: 0, idx: 1 },
-            Op::ScatterAdd { base: 0, idx: 1, vals: 2 },
-            Op::ScatterSet { base: 0, idx: 1, vals: 2 },
+            Op::ScatterAdd {
+                base: 0,
+                idx: 1,
+                vals: 2,
+            },
+            Op::ScatterSet {
+                base: 0,
+                idx: 1,
+                vals: 2,
+            },
             Op::Iota { len: 5 },
             Op::MaskApply { logits: 0, mask: 1 },
-            Op::Rng { stream: 2, shape: Shape::vector(4), kind: RngKind::Uniform },
-            Op::RngKeyed { state: 0, shape: Shape::vector(4), kind: RngKind::Gumbel },
+            Op::CausalMask {
+                positions: 0,
+                len: 8,
+            },
+            Op::SlidingWindowMask {
+                positions: 0,
+                len: 8,
+                window: 4,
+            },
+            Op::SinkWindowMask {
+                positions: 0,
+                len: 8,
+                sink: 2,
+                window: 4,
+            },
+            Op::Rng {
+                stream: 2,
+                shape: Shape::vector(4),
+                kind: RngKind::Uniform,
+            },
+            Op::RngKeyed {
+                state: 0,
+                shape: Shape::vector(4),
+                kind: RngKind::Gumbel,
+            },
             Op::ChanTake(0),
             Op::ChanRead(1),
             Op::ChanPut { chan: 0, value: 0 },
-            Op::IntrinsicVal { intr: IntrinsicId::Layer, shape: Shape::SCALAR, dtype: DType::U32 },
-            Op::KernelCall { name: 0, args: vec![0, 1, 2], shape: Shape::vector(9), dtype: DType::F32 },
-            Op::SinkCall { name: 0, args: vec![0] },
+            Op::IntrinsicVal {
+                intr: IntrinsicId::Layer,
+                shape: Shape::SCALAR,
+                dtype: DType::U32,
+            },
+            Op::KernelCall {
+                name: 0,
+                args: vec![0, 1, 2],
+                shape: Shape::vector(9),
+                dtype: DType::F32,
+            },
+            Op::SinkCall {
+                name: 0,
+                args: vec![0],
+            },
         ];
         let c = TraceContainer {
             names: vec!["k".to_string()],
@@ -833,8 +1141,11 @@ mod tests {
                 },
             ],
             ports: vec![],
-            stages: vec![StageProgram { stage: Stage::Prologue, ops }],
-        externs: alloc::vec::Vec::new(),
+            stages: vec![StageProgram {
+                stage: Stage::Prologue,
+                ops,
+            }],
+            externs: alloc::vec::Vec::new(),
         };
         let bytes = encode(&c);
         assert_eq!(decode(&bytes).expect("decode"), c);
@@ -846,9 +1157,79 @@ mod tests {
         b[0] = b'X';
         assert_eq!(decode(&b), Err(ContainerDecodeError::BadMagic));
         let mut b = encode(&sample());
+        b[4] = 3;
+        assert_eq!(decode(&b), Err(ContainerDecodeError::UnsupportedVersion(3)));
+        let mut b = encode(&sample());
         b[4] = 9;
         assert_eq!(decode(&b), Err(ContainerDecodeError::UnsupportedVersion(9)));
         let b = encode(&sample());
-        assert_eq!(decode(&b[..b.len() - 2]), Err(ContainerDecodeError::UnexpectedEof));
+        assert_eq!(
+            decode(&b[..b.len() - 2]),
+            Err(ContainerDecodeError::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn retired_nucleus_opcode_is_unknown() {
+        let mut reader = Reader {
+            buf: &[0x59],
+            pos: 0,
+        };
+        assert_eq!(
+            decode_op(&mut reader),
+            Err(ContainerDecodeError::UnknownOpcode(0x59))
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_encodings() {
+        assert!(Shape::new(&[0]).is_none());
+        let minimal = TraceContainer {
+            channels: vec![ChannelDecl {
+                shape: Shape::SCALAR,
+                dtype: ChanDType::Concrete(DType::U32),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
+            }],
+            ..TraceContainer::default()
+        };
+
+        let mut flags = minimal.encode();
+        flags[6] = 1;
+        assert_eq!(decode(&flags), Err(ContainerDecodeError::NonCanonical));
+
+        let mut seeded = minimal.encode();
+        seeded[31] = 2;
+        assert_eq!(decode(&seeded), Err(ContainerDecodeError::NonCanonical));
+
+        let mut empty_v2 = minimal.encode();
+        empty_v2[4..6].copy_from_slice(&PTIR_VERSION_EXTERN.to_le_bytes());
+        empty_v2.splice(24..24, 0u32.to_le_bytes());
+        assert_eq!(decode(&empty_v2), Err(ContainerDecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn rejects_wire_counts_before_allocating_from_them() {
+        let mut names = TraceContainer::default().encode();
+        names[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            decode(&names),
+            Err(ContainerDecodeError::CountTooLarge("name table"))
+        );
+
+        let mut operations = TraceContainer {
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: Vec::new(),
+            }],
+            ..TraceContainer::default()
+        }
+        .encode();
+        operations[25..29].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            decode(&operations),
+            Err(ContainerDecodeError::CountTooLarge("operation table"))
+        );
     }
 }

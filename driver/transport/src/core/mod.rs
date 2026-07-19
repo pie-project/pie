@@ -135,12 +135,36 @@ pub trait Engine {
 
     /// Start sending `pages` of `handle` to worker `dst`. Async — returns a
     /// token to poll.
-    fn send(&self, handle: &RegisteredHandle, pages: &PageSet, dst: WorkerId)
-    -> Result<TransferId>;
+    fn send_mapped(
+        &self,
+        handle: &RegisteredHandle,
+        src_pages: &PageSet,
+        dst_pages: &PageSet,
+        dst: WorkerId,
+    ) -> Result<TransferId>;
+
+    fn send(
+        &self,
+        handle: &RegisteredHandle,
+        pages: &PageSet,
+        dst: WorkerId,
+    ) -> Result<TransferId> {
+        self.send_mapped(handle, pages, pages, dst)
+    }
 
     /// Start receiving `pages` into the local `slot` from worker `src`. Async —
     /// returns a token to poll.
-    fn recv(&self, slot: &RegisteredHandle, pages: &PageSet, src: WorkerId) -> Result<TransferId>;
+    fn recv_mapped(
+        &self,
+        slot: &RegisteredHandle,
+        dst_pages: &PageSet,
+        src_pages: &PageSet,
+        src: WorkerId,
+    ) -> Result<TransferId>;
+
+    fn recv(&self, slot: &RegisteredHandle, pages: &PageSet, src: WorkerId) -> Result<TransferId> {
+        self.recv_mapped(slot, pages, pages, src)
+    }
 
     /// Poll an in-flight transfer's completion.
     fn poll(&self, id: TransferId) -> Result<Completion>;

@@ -102,7 +102,7 @@ struct LoadExecutionStats {
     std::size_t max_pending_copies_seen = 0;
     std::size_t h2d_batch_calls = 0;
     // Phase timing (ms). Always accumulated (cost is a few clock reads per
-    // instruction); surfaced only when PIE_WEIGHT_LOADER_PROFILE is set.
+    // instruction); surfaced only when PIE_LOAD_EXECUTOR_PROFILE is set.
     double phase_alloc_ms = 0;          // device buffer/arena allocation
     double phase_transfer_ms = 0;       // staged H2D copy + stream sync (flush)
     double phase_transform_ms = 0;      // slab-scatter / tile-map / finalize (GPU)

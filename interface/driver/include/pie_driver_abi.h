@@ -5,16 +5,62 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define KV_COPY_DEVICE_TO_DEVICE (1 << 0)
+
+#define KV_COPY_DEVICE_TO_HOST (1 << 1)
+
+#define KV_COPY_HOST_TO_DEVICE (1 << 2)
+
+#define KV_COPY_HOST_TO_HOST (1 << 3)
+
+#define PIE_DEVICE_PORT_EMBED_TOKENS (1 << 0)
+
+#define PIE_DEVICE_PORT_PAGES (1 << 1)
+
+#define PIE_DEVICE_PORT_POSITIONS (1 << 2)
+
+#define PIE_DEVICE_PORT_PAGE_INDPTR (1 << 3)
+
+#define PIE_DEVICE_PORT_W_SLOT (1 << 4)
+
+#define PIE_DEVICE_PORT_KV_LEN (1 << 5)
+
+#define PIE_DEVICE_PORT_W_OFF (1 << 6)
+
+/**
+ * The driver resolves a dense `AttnMask` descriptor channel (device-carried
+ * bool mask cells) pre-forward. Orthogonal to the geometry-class port sets:
+ * a masked device-resolved pass additionally requires this bit.
+ */
+#define PIE_DEVICE_PORT_ATTN_MASK (1 << 7)
+
+/**
+ * Full device-resolved port mask of the `DecodeEnvelope` geometry class.
+ * Driver-neutral: any backend that executes the class resolves exactly these
+ * ports on device.
+ */
+#define PIE_DECODE_ENVELOPE_PORTS ((PIE_DEVICE_PORT_EMBED_TOKENS | PIE_DEVICE_PORT_POSITIONS) | PIE_DEVICE_PORT_KV_LEN)
+
+/**
+ * Full device-resolved port mask of the `DeviceGeometry` geometry class:
+ * the program traces its complete explicit geometry in-graph and the driver
+ * resolves every descriptor port from device channel cells pre-forward.
+ */
+#define PIE_DEVICE_GEOMETRY_PORTS ((((((PIE_DEVICE_PORT_EMBED_TOKENS | PIE_DEVICE_PORT_PAGES) | PIE_DEVICE_PORT_POSITIONS) | PIE_DEVICE_PORT_PAGE_INDPTR) | PIE_DEVICE_PORT_W_SLOT) | PIE_DEVICE_PORT_KV_LEN) | PIE_DEVICE_PORT_W_OFF)
+
 /**
  * Current direct local ABI version.
  *
- * v2: channel values no longer ride launch descriptors — host puts are
- * direct writes into the registered channel endpoint's pinned ring, pulled
- * by the driver before the consuming pass; `PieChannelDesc` wait ids are
- * mandatory and every native driver must notify them per channel-word
- * publication.
+ * v12: finalized launches can be prepared into a driver-owned elastic-memory
+ * lease and then launched or released exactly once.
  */
-#define PIE_DRIVER_ABI_VERSION 2
+#define PIE_DRIVER_ABI_VERSION 12
+
+#define PIE_MODEL_COMPONENT_FULL 0
+
+#define PIE_MODEL_COMPONENT_TEXT 1
+
+#define PIE_MODEL_COMPONENT_ENCODE 2
 
 /**
  * Success.
@@ -45,6 +91,27 @@
  * The driver encountered an internal failure after accepting the call.
  */
 #define PIE_STATUS_DRIVER_ERROR -5
+
+/**
+ * The finalized launch was admitted and `lease_id` is valid.
+ */
+#define PIE_LAUNCH_PREPARE_READY 0
+
+/**
+ * The launch may fit later after physical budget is released.
+ */
+#define PIE_LAUNCH_PREPARE_EXHAUSTED 1
+
+/**
+ * The launch can never fit within the driver's physical budget ceiling.
+ */
+#define PIE_LAUNCH_PREPARE_IMPOSSIBLE 2
+
+#define PIE_GEOMETRY_CLASS_HOST 0
+
+#define PIE_GEOMETRY_CLASS_DECODE_ENVELOPE 1
+
+#define PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY 2
 
 /**
  * Reset the recurrent-state slot before executing the request.
@@ -111,6 +178,20 @@
  */
 #define PIE_CHANNEL_EXTERN_EXPORT 2
 
+#define PIE_ELASTIC_POOL_KV 0
+
+#define PIE_ELASTIC_POOL_STATE 1
+
+#define PIE_ELASTIC_POOL_WORKSPACE 2
+
+#define CHANNEL_TICKET_NONE UINT64_MAX
+
+#define RS_FLAG_RESET 1
+
+#define RS_FLAG_FOLD 2
+
+#define REMOTE_WIRE_VERSION 8
+
 /**
  * Opaque embedded-driver handle.
  */
@@ -141,7 +222,7 @@ typedef void (*PieRuntimeNotifyFn)(void *ctx, uint64_t wait_id, uint64_t epoch);
 typedef struct PieRuntimeCallbacks {
   uint32_t abi_version;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved0;
   /**
@@ -160,7 +241,7 @@ typedef struct PieRuntimeCallbacks {
 typedef struct PieDriverCreateDesc {
   uint32_t abi_version;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved0;
   struct PieBytes config_bytes;
@@ -168,7 +249,7 @@ typedef struct PieDriverCreateDesc {
 } PieDriverCreateDesc;
 
 /**
- * Cold JSON capability payload returned from `*_create`.
+ * Driver-owned JSON payload returned from a cold boot call.
  */
 typedef struct PieDriverCaps {
   const uint8_t *json_bytes;
@@ -176,12 +257,35 @@ typedef struct PieDriverCaps {
 } PieDriverCaps;
 
 /**
+ * Blocking model-load descriptor.
+ */
+typedef struct PieModelLoadDesc {
+  uint32_t abi_version;
+  /**
+   * One of `PIE_MODEL_COMPONENT_*`.
+   */
+  uint32_t component;
+  /**
+   * Compiler source hash expected by this runtime.
+   */
+  uint64_t compiler_version;
+  /**
+   * Serialized, versioned LoadPlan. Empty plans are invalid.
+   */
+  struct PieBytes load_plan_bytes;
+  /**
+   * UTF-8 path to the driver-local checkpoint payload root.
+   */
+  struct PieBytes snapshot_dir;
+} PieModelLoadDesc;
+
+/**
  * Static program registration descriptor.
  */
 typedef struct PieProgramDesc {
   uint32_t abi_version;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved0;
   /**
@@ -208,7 +312,7 @@ typedef struct PieU32Slice {
 typedef struct PieChannelDesc {
   uint32_t abi_version;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved0;
   uint64_t channel_id;
@@ -231,7 +335,7 @@ typedef struct PieChannelDesc {
   uint8_t extern_dir;
   uint32_t capacity;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved1;
   uint64_t reader_wait_id;
@@ -293,9 +397,18 @@ typedef struct PieChannelValueDescSlice {
 typedef struct PieInstanceDesc {
   uint32_t abi_version;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved0;
+  /**
+   * Runtime-derived geometry class; the driver verifies this against the
+   * registered trace and echoes it in `PieInstanceBinding`.
+   */
+  uint32_t geometry_class;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved1;
   uint64_t program_id;
   uint64_t requested_instance_id;
   uint64_t pacing_wait_id;
@@ -308,6 +421,11 @@ typedef struct PieInstanceDesc {
  */
 typedef struct PieInstanceBinding {
   uint64_t instance_id;
+  uint32_t geometry_class;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved0;
 } PieInstanceBinding;
 
 /**
@@ -324,7 +442,7 @@ typedef uint32_t PieTerminalOutcome;
 typedef struct PieTerminalCell {
   PieTerminalOutcome outcome;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved0;
 } PieTerminalCell;
@@ -369,7 +487,7 @@ typedef struct PieMaskWordsDesc {
 typedef struct PieLaunchDesc {
   uint32_t abi_version;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved0;
   /**
@@ -386,7 +504,14 @@ typedef struct PieLaunchDesc {
   struct PieU32Slice kv_page_indptr;
   struct PieU32Slice kv_last_page_lens;
   struct PieU32Slice qo_indptr;
+  /**
+   * Folded recurrent-state slot per resolved `qo_indptr` row. Empty for
+   * pure-attention launches; never indexed by `instance_ids`.
+   */
   struct PieU32Slice rs_slot_ids;
+  /**
+   * Flags parallel to `rs_slot_ids`.
+   */
   struct PieU8Slice rs_slot_flags;
   struct PieU32Slice rs_fold_lens;
   struct PieU32Slice rs_buffer_slot_ids;
@@ -410,9 +535,13 @@ typedef struct PieLaunchDesc {
    */
   uint8_t has_user_mask;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
-  uint8_t reserved_flags[6];
+  uint8_t reserved_flags[2];
+  /**
+   * Exclusive physical KV page high-water required before this launch.
+   */
+  uint32_t required_kv_pages;
   struct PieU32Slice image_indptr;
   struct PieU32Slice image_grids;
   struct PieU32Slice image_anchor_positions;
@@ -426,6 +555,12 @@ typedef struct PieLaunchDesc {
   struct PieU32Slice audio_feature_indptr;
   struct PieU32Slice audio_anchor_rows;
   struct PieU32Slice audio_indptr;
+  struct PieBytes embed_rows;
+  struct PieU32Slice embed_indptr;
+  struct PieU32Slice embed_shapes;
+  struct PieU8Slice embed_dtypes;
+  struct PieU32Slice embed_anchor_rows;
+  struct PieU32Slice embed_block_indptr;
   struct PieU32Slice kv_len;
   struct PieU64Slice kv_len_device;
   /**
@@ -454,6 +589,18 @@ typedef struct PieLaunchDesc {
    * geometry for that span when composing the forward batch.
    */
   struct PieU32Slice ptir_program_row_indptr;
+  struct PieU64Slice ptir_kv_write_lower_bounds;
+  struct PieU64Slice ptir_kv_write_upper_bounds;
+  /**
+   * Immutable logical-fire ids, one per instance.
+   */
+  struct PieU64Slice logical_fire_ids;
+  /**
+   * Dense-channel sequence tickets, CSR-partitioned per instance.
+   */
+  struct PieU64Slice channel_expected_head;
+  struct PieU64Slice channel_expected_tail;
+  struct PieU32Slice channel_ticket_indptr;
 } PieLaunchDesc;
 
 /**
@@ -468,6 +615,58 @@ typedef struct PieCompletion {
    */
   struct PieTerminalCell *terminal_cell;
 } PieCompletion;
+
+/**
+ * Result of synchronously preparing one finalized launch.
+ *
+ * `lease_id` is nonzero only for [`PIE_LAUNCH_PREPARE_READY`]. A ready lease
+ * is consumed by exactly one `*_launch_prepared` or `*_release_launch` call.
+ */
+typedef struct PieLaunchPrepareResult {
+  uint32_t outcome;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved0;
+  uint64_t lease_id;
+  /**
+   * Monotonic physical-budget generation observed by this attempt.
+   */
+  uint64_t budget_generation;
+  /**
+   * Independently rounded physical pages required by the finalized launch.
+   */
+  uint64_t required_pages;
+  /**
+   * Current physical budget in the same page units.
+   */
+  uint64_t budget_pages;
+} PieLaunchPrepareResult;
+
+typedef struct PieMutBytes {
+  uint8_t *ptr;
+  size_t len;
+} PieMutBytes;
+
+typedef struct PieU32MutSlice {
+  uint32_t *ptr;
+  size_t len;
+} PieU32MutSlice;
+
+typedef struct PieEncodeDesc {
+  uint32_t abi_version;
+  uint32_t reserved0;
+  struct PieU32Slice image_grids;
+  struct PieBytes image_pixels;
+  struct PieU32Slice image_pixel_indptr;
+  struct PieU32Slice image_patch_positions;
+  struct PieU32Slice image_anchor_rows;
+  struct PieBytes audio_features;
+  struct PieU32Slice audio_feature_indptr;
+  struct PieU32Slice audio_anchor_rows;
+  struct PieMutBytes output_rows;
+  struct PieU32MutSlice output_row_indptr;
+} PieEncodeDesc;
 
 /**
  * Memory domain tag for local KV residency copies.
@@ -507,7 +706,7 @@ typedef struct PieKvCopyDesc {
   PieMemoryDomain dst_domain;
   uint32_t dst_device_ordinal;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved0;
   struct PieU32Slice src_page_ids;
@@ -542,7 +741,7 @@ typedef struct PieStateCopyRangeSlice {
 typedef struct PieStateCopyDesc {
   uint32_t abi_version;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved0;
   struct PieStateCopyRangeSlice slot_ranges;
@@ -572,7 +771,7 @@ typedef struct PiePoolRangeSlice {
 typedef struct PiePoolResizeDesc {
   uint32_t abi_version;
   /**
-   * Must be zero in ABI v1.
+   * Reserved; must be zero.
    */
   uint32_t reserved0;
   uint64_t pool_id;
@@ -621,12 +820,21 @@ typedef struct PiePoolResizeDesc {
  */
 #define PIE_TERMINAL_OUTCOME_FAILED 2
 
+/**
+ * The accepted work item committed no effects and must be attempted again.
+ */
+#define PIE_TERMINAL_OUTCOME_RETRY 3
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
 
 extern PieDriver *pie_cuda_create(const struct PieDriverCreateDesc *desc,
                                   struct PieDriverCaps *caps);
+
+extern int32_t pie_cuda_load_model(PieDriver *driver,
+                                   const struct PieModelLoadDesc *load,
+                                   struct PieDriverCaps *caps);
 
 extern int32_t pie_cuda_register_program(PieDriver *driver,
                                          const struct PieProgramDesc *program,
@@ -642,6 +850,21 @@ extern int32_t pie_cuda_bind_instance(PieDriver *driver,
 
 extern int32_t pie_cuda_launch(PieDriver *driver,
                                const struct PieLaunchDesc *launch,
+                               struct PieCompletion completion);
+
+extern int32_t pie_cuda_prepare_launch(PieDriver *driver,
+                                       const struct PieLaunchDesc *launch,
+                                       struct PieLaunchPrepareResult *result);
+
+extern int32_t pie_cuda_launch_prepared(PieDriver *driver,
+                                        const struct PieLaunchDesc *launch,
+                                        uint64_t lease_id,
+                                        struct PieCompletion completion);
+
+extern int32_t pie_cuda_release_launch(PieDriver *driver, uint64_t lease_id);
+
+extern int32_t pie_cuda_encode(PieDriver *driver,
+                               const struct PieEncodeDesc *encode,
                                struct PieCompletion completion);
 
 extern int32_t pie_cuda_copy_kv(PieDriver *driver,
@@ -665,6 +888,10 @@ extern void pie_cuda_destroy(PieDriver *driver);
 extern PieDriver *pie_metal_create(const struct PieDriverCreateDesc *desc,
                                    struct PieDriverCaps *caps);
 
+extern int32_t pie_metal_load_model(PieDriver *driver,
+                                    const struct PieModelLoadDesc *load,
+                                    struct PieDriverCaps *caps);
+
 extern int32_t pie_metal_register_program(PieDriver *driver,
                                           const struct PieProgramDesc *program,
                                           uint64_t *program_id);
@@ -679,6 +906,21 @@ extern int32_t pie_metal_bind_instance(PieDriver *driver,
 
 extern int32_t pie_metal_launch(PieDriver *driver,
                                 const struct PieLaunchDesc *launch,
+                                struct PieCompletion completion);
+
+extern int32_t pie_metal_prepare_launch(PieDriver *driver,
+                                        const struct PieLaunchDesc *launch,
+                                        struct PieLaunchPrepareResult *result);
+
+extern int32_t pie_metal_launch_prepared(PieDriver *driver,
+                                         const struct PieLaunchDesc *launch,
+                                         uint64_t lease_id,
+                                         struct PieCompletion completion);
+
+extern int32_t pie_metal_release_launch(PieDriver *driver, uint64_t lease_id);
+
+extern int32_t pie_metal_encode(PieDriver *driver,
+                                const struct PieEncodeDesc *encode,
                                 struct PieCompletion completion);
 
 extern int32_t pie_metal_copy_kv(PieDriver *driver,

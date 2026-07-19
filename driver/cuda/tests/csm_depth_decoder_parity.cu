@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-#include "model/csm_depth_decoder_forward.cu"  // decoder under test + kernels
+#include "model/csm/csm_depth_decoder_forward.cu"  // decoder under test + kernels
 
 using namespace pie_cuda_driver::model;
 using BF = __nv_bfloat16;

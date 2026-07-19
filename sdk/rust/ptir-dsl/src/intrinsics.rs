@@ -20,10 +20,6 @@ pub fn vocab() -> u32 {
 pub fn page_size() -> u32 {
     model::page_size()
 }
-/// Number of transformer layers (trace-known).
-pub fn num_layers() -> u32 {
-    model::num_layers()
-}
 /// The late-bound backend activation dtype (`intrinsics::activation_type`, §4).
 #[allow(non_upper_case_globals)]
 pub const activation_type: DType = DType::F32;
