@@ -636,7 +636,7 @@ pub async fn submit_pass<C: FireContext>(
             instance_id,
             scheduler,
             completion,
-            dense_mask,
+            attn_mask,
             accesses,
             decode_envelope,
         ) = {
@@ -646,13 +646,24 @@ pub async fn submit_pass<C: FireContext>(
                     "pipeline: forward-pass failed by an earlier fire: {e}"
                 )));
             }
-            let geometry = if let Some(envelope) = &p.decode_envelope {
-                match envelope.template(&p.instance.program.bound.container) {
+            let (geometry, attn_mask) = if let Some(envelope) = &p.decode_envelope {
+                let geometry = match envelope.template(&p.instance.program.bound.container) {
                     Ok(template) => template,
                     Err(error) => {
                         return Ok(Err(format!("pipeline: fire geometry: {error:?}")));
                     }
-                }
+                };
+                let bound = &p.instance.program.bound;
+                let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
+                let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
+                let attn_mask =
+                    match geometry::evaluate_attn_mask(bound, &mut known, &geometry.qo_indptr) {
+                        Ok(mask) => mask,
+                        Err(error) => {
+                            return Ok(Err(format!("pipeline: fire attention mask: {error}")));
+                        }
+                    };
+                (geometry, attn_mask)
             } else {
                 let bound = &p.instance.program.bound;
                 let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
@@ -662,7 +673,7 @@ pub async fn submit_pass<C: FireContext>(
                     &mut known,
                     crate::pipeline::program::model_profile().page_size,
                 ) {
-                    Ok((geometry, _)) => {
+                    Ok((geometry, evaluated)) => {
                         // In-band -1 skips are the DEVICE-resolved contract
                         // (rank compaction happens in the compose kernels); a
                         // host-wire fire would embed the sentinel as a real
@@ -676,7 +687,17 @@ pub async fn submit_pass<C: FireContext>(
                                     .to_string(),
                             ));
                         }
-                        geometry
+                        let attn_mask = match geometry::lower_attn_mask_evaluated(
+                            &bound.container,
+                            &geometry.qo_indptr,
+                            &evaluated,
+                        ) {
+                            Ok(mask) => mask,
+                            Err(error) => {
+                                return Ok(Err(format!("pipeline: fire attention mask: {error}")));
+                            }
+                        };
+                        (geometry, attn_mask)
                     }
                     Err(error) => {
                         return Ok(Err(format!("pipeline: fire geometry: {error}")));
@@ -695,7 +716,7 @@ pub async fn submit_pass<C: FireContext>(
                 p.bound_instance.instance_id,
                 p.scheduler.clone(),
                 p.bound_instance.reserve_completion(),
-                p.dense_mask,
+                attn_mask,
                 accesses,
                 p.decode_envelope.clone(),
             )
@@ -705,11 +726,7 @@ pub async fn submit_pass<C: FireContext>(
         req.device_resolved_geometry = decode_envelope.is_some();
         req.single_token_mode = req.token_ids.len() + 1 == req.qo_indptr.len()
             && req.qo_indptr.windows(2).all(|lane| lane[1] - lane[0] == 1);
-        // A dense device mask (AttnMask channel) marks the fire
-        // mask-carrying: the scheduler batches it SOLO (the composed
-        // multi-program batch does not merge dense device masks — v1
-        // scope).
-        req.has_user_mask = dense_mask;
+        attn_mask.apply_to(&mut req);
         crate::pipeline::offload::try_encode(&mut req).await;
         // Resource preparation is independent of token position: realize the
         // declaration once, back only its missing frontier, then snapshot the
@@ -1446,7 +1463,6 @@ async fn fire_device_geometry<C: FireContext>(
         wire_pages,
         copy_src,
         copy_dst,
-        dense_mask,
         accesses,
         rs_slot_ids,
         rs_slot_flags,
@@ -1547,7 +1563,6 @@ async fn fire_device_geometry<C: FireContext>(
         // prepared write above backs physically). This also matches the
         // bind-time seed (`reserve(b)`), which was already logical.
         let fresh_dense = devgeo.fresh_dense;
-        let dense_mask = devgeo.has_mask;
         let fresh_error = {
             let p = ctx.resources().get_mut(&fwd)?;
             let bytes: Vec<u8> = grant_slots.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -1585,7 +1600,6 @@ async fn fire_device_geometry<C: FireContext>(
             wire_pages,
             copy_src,
             copy_dst,
-            dense_mask,
             accesses,
             rs_slot_ids,
             rs_slot_flags,
@@ -1596,16 +1610,39 @@ async fn fire_device_geometry<C: FireContext>(
         )
     };
 
+    // Device geometry and mask provenance are independent. A seed or
+    // host-staged mask still lowers through the wire BRLE path on this fire;
+    // after an epilogue device put advances the shadow, the same channel
+    // classifies as dense device-derived on the next fire.
+    let mask_qo_indptr: Vec<u32> = (0..resolved_qo_indptr.len() as u32).collect();
+    let attn_mask = {
+        let p = ctx.resources().get(&fwd)?;
+        let bound = &p.instance.program.bound;
+        let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
+        let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
+        geometry::evaluate_attn_mask(bound, &mut known, &mask_qo_indptr)
+    };
+    let attn_mask = match attn_mask {
+        Ok(mask) => mask,
+        Err(error) => {
+            abort_rs_transactions(&stores, rstxns);
+            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                let _ = kv::finalize(kv_store, kvtxn, false);
+            });
+            reclaim_pending_device_grant(ctx, &fwd);
+            let reason = format!("pipeline: device-geometry attention mask: {error}");
+            record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+            return Ok(Err(reason));
+        }
+    };
+
     let mut req = crate::driver::LaunchPlan::default();
     req.qo_indptr = resolved_qo_indptr;
     req.kv_translation = kv_translation;
     req.kv_translation_version = kv_translation_version;
     req.rs_slot_ids = rs_slot_ids;
     req.rs_slot_flags = rs_slot_flags;
-    // A dense device mask (AttnMask channel) marks the fire mask-carrying;
-    // the scheduler batches it SOLO (the composed multi-program batch
-    // does not merge dense device masks — v1 scope).
-    req.has_user_mask = dense_mask;
+    attn_mask.apply_to(&mut req);
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
     let last_page_len = wire_pages.last().map(|_| page_size).unwrap_or(0);
@@ -1637,6 +1674,12 @@ async fn fire_device_geometry<C: FireContext>(
     }
     ctx.commit_fire_timing(timing_enabled);
     ticket_reservation.commit();
+    {
+        let p = ctx.resources().get_mut(&fwd)?;
+        let (shadow, bound, shadow_cells) =
+            (&mut p.host_shadow, &p.instance.program.bound, &p.cells);
+        shadow.advance(bound, shadow_cells);
+    }
 
     pipe_fires
         .lock()

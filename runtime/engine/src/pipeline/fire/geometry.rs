@@ -23,6 +23,7 @@
 //! than deleted, allowed rather than silently masked.
 #![allow(dead_code)]
 
+use pie_grammar::brle::RunMask;
 use pie_ptir::container::{PortSource, TraceContainer};
 use pie_ptir::op::Op;
 use pie_ptir::registry::Port;
@@ -422,6 +423,132 @@ impl ReqGeometry {
         req.sampling_indices = self.sampling_indices.clone();
         req.sampling_indptr = self.sampling_indptr.clone();
     }
+}
+
+/// Per-fire lowering of the optional attention-mask descriptor.
+///
+/// A channel-backed mask is not intrinsically device-resident: a seed or
+/// host-staged value is available through the host shadow on this fire, while a
+/// value written from a device-only epilogue becomes unknown on a later fire.
+/// Keep that distinction per fire so host-known masks use the ordinary wire
+/// BRLE path and only genuinely device-derived values select dense device
+/// lowering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FireAttnMask {
+    Omitted,
+    Host {
+        masks: Vec<crate::driver::command::EncodedMask>,
+        mask_indptr: Vec<u32>,
+    },
+    Device,
+}
+
+impl FireAttnMask {
+    pub(crate) fn apply_to(self, request: &mut crate::driver::LaunchPlan) {
+        match self {
+            FireAttnMask::Omitted => {}
+            FireAttnMask::Host { masks, mask_indptr } => {
+                request.masks = masks;
+                request.mask_indptr = mask_indptr;
+                request.has_user_mask = true;
+                // A decode-shaped custom mask still needs the mask-aware
+                // prefill attention path.
+                request.single_token_mode = false;
+            }
+            FireAttnMask::Device => {
+                request.has_user_mask = true;
+            }
+        }
+    }
+}
+
+/// Lower an already-evaluated `AttnMask` port into one BRLE row per query.
+pub(crate) fn lower_attn_mask_evaluated(
+    container: &TraceContainer,
+    qo_indptr: &[u32],
+    evaluated: &[(Port, Result<pie_ptir::interp::Value, String>)],
+) -> Result<FireAttnMask, String> {
+    let Some(binding) = container
+        .ports
+        .iter()
+        .find(|binding| binding.port == Port::AttnMask)
+    else {
+        return Ok(FireAttnMask::Omitted);
+    };
+    let value = evaluated
+        .iter()
+        .find_map(|(port, value)| (*port == Port::AttnMask).then_some(value))
+        .ok_or_else(|| "attention-mask port was not evaluated".to_string())?;
+    let value = match value {
+        Ok(value) => value,
+        Err(_) if matches!(binding.source, PortSource::Channel(_)) => {
+            return Ok(FireAttnMask::Device);
+        }
+        Err(error) => {
+            return Err(format!(
+                "attention-mask constant could not be evaluated: {error}"
+            ));
+        }
+    };
+    let pie_ptir::interp::Value::Bool(dense) = value else {
+        return Err(format!(
+            "attention-mask evaluated as {:?}, expected bool",
+            value.dtype()
+        ));
+    };
+    if qo_indptr.len() < 2
+        || qo_indptr.first().copied() != Some(0)
+        || qo_indptr.windows(2).any(|pair| pair[1] < pair[0])
+    {
+        return Err("attention-mask query CSR is malformed".to_string());
+    }
+    let query_rows = qo_indptr.last().copied().unwrap_or_default() as usize;
+    if query_rows == 0 {
+        return Err("attention-mask requires at least one query row".to_string());
+    }
+    if dense.len() % query_rows != 0 {
+        return Err(format!(
+            "attention-mask has {} cells for {query_rows} query rows",
+            dense.len()
+        ));
+    }
+    let stride = dense.len() / query_rows;
+    if stride == 0 {
+        return Err("attention-mask key stride is empty".to_string());
+    }
+    let masks = dense
+        .chunks_exact(stride)
+        .map(|row| {
+            let mask = RunMask::from_slice(row);
+            crate::driver::command::EncodedMask::new(mask.buffer, mask.total_size)
+        })
+        .collect();
+    Ok(FireAttnMask::Host {
+        masks,
+        mask_indptr: qo_indptr.to_vec(),
+    })
+}
+
+/// Evaluate and lower the mask against this fire's host-shadow value oracle.
+pub(crate) fn evaluate_attn_mask(
+    bound: &pie_ptir::validate::BoundTrace,
+    known: &mut dyn FnMut(u32) -> Option<pie_ptir::interp::Value>,
+    qo_indptr: &[u32],
+) -> Result<FireAttnMask, String> {
+    if !bound
+        .container
+        .ports
+        .iter()
+        .any(|binding| binding.port == Port::AttnMask)
+    {
+        return Ok(FireAttnMask::Omitted);
+    }
+    let evaluated = pie_ptir::pareval::eval_descriptor_ports(bound, known)
+        .map_err(|blocker| format!("attention-mask evaluation failed: {blocker}"))?
+        .into_iter()
+        .map(|(port, value)| (port, value.map_err(|blocker| blocker.to_string())))
+        .collect::<Vec<_>>();
+    lower_attn_mask_evaluated(&bound.container, qo_indptr, &evaluated)
 }
 
 /// Per-channel values at fire time: `values[i]` is channel `i`'s current cell
@@ -1286,5 +1413,93 @@ mod tests {
     #[test]
     fn dense_defaults_reject_malformed_query_csr_before_allocating() {
         assert!(dense_defaults(&[0, u32::MAX], &[1], 1, 16).is_err());
+    }
+
+    fn mask_container() -> TraceContainer {
+        let mut container = section3_container();
+        let mask = container.channels.len() as u32;
+        container
+            .channels
+            .push(chan(Shape::matrix(2, 4), DType::Bool));
+        container.ports.push(PortBinding {
+            port: Port::AttnMask,
+            source: PortSource::Channel(mask),
+        });
+        container
+    }
+
+    fn expand_mask(mask: &crate::driver::command::EncodedMask) -> Vec<bool> {
+        let mut values = Vec::new();
+        for (run, &len) in mask.runs.iter().enumerate() {
+            values.extend(std::iter::repeat_n(run % 2 == 1, len as usize));
+        }
+        values
+    }
+
+    #[test]
+    fn omitted_attention_mask_stays_mask_free() {
+        let lowered = lower_attn_mask_evaluated(&section3_container(), &[0, 1], &[]).unwrap();
+        assert_eq!(lowered, FireAttnMask::Omitted);
+        let mut plan = crate::driver::LaunchPlan {
+            single_token_mode: true,
+            ..Default::default()
+        };
+        lowered.apply_to(&mut plan);
+        assert!(!plan.has_user_mask);
+        assert!(plan.masks.is_empty());
+        assert!(plan.mask_indptr.is_empty());
+        assert!(plan.single_token_mode);
+    }
+
+    #[test]
+    fn host_derived_attention_mask_lowers_to_wire_brle() {
+        let dense = vec![true, true, false, true, false, true, true, false];
+        let evaluated = vec![(
+            Port::AttnMask,
+            Ok(pie_ptir::interp::Value::Bool(dense.clone())),
+        )];
+        let lowered = lower_attn_mask_evaluated(&mask_container(), &[0, 1, 2], &evaluated).unwrap();
+        let FireAttnMask::Host { masks, mask_indptr } = &lowered else {
+            panic!("host-known mask must use wire lowering");
+        };
+        assert_eq!(mask_indptr, &[0, 1, 2]);
+        assert_eq!(masks.len(), 2);
+        assert_eq!(expand_mask(&masks[0]), dense[..4]);
+        assert_eq!(expand_mask(&masks[1]), dense[4..]);
+
+        let mut plan = crate::driver::LaunchPlan {
+            single_token_mode: true,
+            ..Default::default()
+        };
+        lowered.apply_to(&mut plan);
+        assert!(plan.has_user_mask);
+        assert_eq!(plan.mask_indptr, vec![0, 1, 2]);
+        assert!(
+            !plan.single_token_mode,
+            "decode-shaped custom masks require the prefill fallback"
+        );
+    }
+
+    #[test]
+    fn attention_mask_classification_is_per_fire() {
+        let container = mask_container();
+        let host = vec![(
+            Port::AttnMask,
+            Ok(pie_ptir::interp::Value::Bool(vec![true; 8])),
+        )];
+        assert!(matches!(
+            lower_attn_mask_evaluated(&container, &[0, 1, 2], &host).unwrap(),
+            FireAttnMask::Host { .. }
+        ));
+
+        let device = vec![(Port::AttnMask, Err("device epilogue put".to_string()))];
+        assert_eq!(
+            lower_attn_mask_evaluated(&container, &[0, 1, 2], &device).unwrap(),
+            FireAttnMask::Device
+        );
+        let mut plan = crate::driver::LaunchPlan::default();
+        FireAttnMask::Device.apply_to(&mut plan);
+        assert!(plan.has_user_mask);
+        assert!(plan.masks.is_empty(), "dense device path has no wire rows");
     }
 }

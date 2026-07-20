@@ -73,18 +73,12 @@ impl BatchAccumulator {
         // thread — RV-20).
         if req.request.kv_write_lower_bounds.len() > 1
             || req.request.kv_write_upper_bounds.len() > 1
-            || req.request.kv_write_lower_bounds.len()
-                != req.request.kv_write_upper_bounds.len()
+            || req.request.kv_write_lower_bounds.len() != req.request.kv_write_upper_bounds.len()
         {
-            return Some(
-                "per-fire KV containment bounds must be empty or scalar".to_string(),
-            );
+            return Some("per-fire KV containment bounds must be empty or scalar".to_string());
         }
         let rows = req.request.qo_indptr.len().saturating_sub(1);
-        if rows > 1
-            && !req.request.masks.is_empty()
-            && req.request.mask_indptr.len() != rows + 1
-        {
+        if rows > 1 && !req.request.masks.is_empty() && req.request.mask_indptr.len() != rows + 1 {
             return Some(format!(
                 "multi-row fire carries {} masks without a row CSR \
                  ({} mask boundaries for {} rows)",
@@ -416,6 +410,48 @@ mod tests {
         let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
         assert_eq!(sub.plan.kv_page_indices, vec![3, 4, 5]);
         assert!(sub.plan.masks.is_empty());
+    }
+
+    #[test]
+    fn host_custom_mask_cobatches_with_causal_fire() {
+        let mut custom = wire_decode(11, 3);
+        custom.has_user_mask = true;
+        custom.single_token_mode = false;
+        custom.masks = vec![crate::driver::command::EncodedMask::new(vec![1], 1)];
+        custom.mask_indptr = vec![0, 1];
+        let mut requests = [
+            pending(custom, 20, false),
+            pending(wire_decode(22, 4), 21, false),
+        ];
+
+        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        assert_eq!(sub.instance_ids, vec![20, 21]);
+        assert_eq!(sub.plan.mask_indptr, vec![0, 1, 2]);
+        assert_eq!(sub.plan.masks.len(), 2);
+        assert_eq!(sub.plan.masks[0].runs, vec![1], "explicit custom row");
+        assert_eq!(
+            sub.plan.masks[1].runs,
+            vec![0, 1],
+            "causal peer receives the synthesized compatible row"
+        );
+        assert!(sub.plan.has_user_mask);
+        assert!(!sub.plan.single_token_mode);
+    }
+
+    #[test]
+    fn host_mask_on_device_geometry_is_not_elided_as_dense() {
+        let mut request = wire_decode(11, 3);
+        request.device_resolved_geometry = true;
+        request.has_user_mask = true;
+        request.single_token_mode = false;
+        request.masks = vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+        request.mask_indptr = vec![0, 1];
+
+        let mut requests = [pending(request, 12, false)];
+        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        assert_eq!(sub.plan.masks.len(), 1);
+        assert_eq!(sub.plan.mask_indptr, vec![0, 1]);
+        assert!(sub.plan.has_user_mask);
     }
 
     #[test]

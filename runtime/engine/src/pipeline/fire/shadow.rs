@@ -160,3 +160,152 @@ impl HostShadow {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pie_ptir::container::{
+        ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+    };
+    use pie_ptir::op::{IntrinsicId, Op};
+    use pie_ptir::registry::{ModelProfile, Port, Stage};
+    use pie_ptir::types::{DType, Shape};
+
+    fn channel(shape: Shape, dtype: DType) -> ChannelDecl {
+        ChannelDecl {
+            shape,
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role: HostRole::None,
+            seeded: true,
+        }
+    }
+
+    #[test]
+    fn seeded_mask_becomes_device_derived_after_epilogue_put() {
+        let mut profile = ModelProfile::dummy();
+        profile.vocab = 4;
+        let container = TraceContainer {
+            names: vec![],
+            externs: vec![],
+            channels: vec![
+                channel(Shape::vector(1), DType::I32),
+                channel(Shape::vector(1), DType::U32),
+                channel(Shape::matrix(1, 4), DType::Bool),
+            ],
+            ports: vec![
+                PortBinding {
+                    port: Port::EmbedTokens,
+                    source: PortSource::Channel(0),
+                },
+                PortBinding {
+                    port: Port::EmbedIndptr,
+                    source: PortSource::Const {
+                        dtype: DType::U32,
+                        shape: Shape::vector(2),
+                        data: [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect(),
+                    },
+                },
+                PortBinding {
+                    port: Port::Positions,
+                    source: PortSource::Const {
+                        dtype: DType::U32,
+                        shape: Shape::vector(1),
+                        data: 0u32.to_le_bytes().to_vec(),
+                    },
+                },
+                PortBinding {
+                    port: Port::Pages,
+                    source: PortSource::Const {
+                        dtype: DType::U32,
+                        shape: Shape::vector(1),
+                        data: 0u32.to_le_bytes().to_vec(),
+                    },
+                },
+                PortBinding {
+                    port: Port::PageIndptr,
+                    source: PortSource::Const {
+                        dtype: DType::U32,
+                        shape: Shape::vector(2),
+                        data: [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect(),
+                    },
+                },
+                PortBinding {
+                    port: Port::KvLen,
+                    source: PortSource::Channel(1),
+                },
+                PortBinding {
+                    port: Port::WSlot,
+                    source: PortSource::Const {
+                        dtype: DType::U32,
+                        shape: Shape::vector(1),
+                        data: 0u32.to_le_bytes().to_vec(),
+                    },
+                },
+                PortBinding {
+                    port: Port::WOff,
+                    source: PortSource::Const {
+                        dtype: DType::U32,
+                        shape: Shape::vector(1),
+                        data: 0u32.to_le_bytes().to_vec(),
+                    },
+                },
+                PortBinding {
+                    port: Port::AttnMask,
+                    source: PortSource::Channel(2),
+                },
+            ],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::IntrinsicVal {
+                        intr: IntrinsicId::Logits,
+                        shape: Shape::matrix(1, 4),
+                        dtype: DType::F32,
+                    },
+                    Op::Eq(0, 0),
+                    Op::ChanTake(2),
+                    Op::ChanPut { chan: 2, value: 1 },
+                ],
+            }],
+        };
+        let bound = pie_ptir::validate::bind(container, profile).unwrap();
+        let seeds = vec![
+            ChannelSeed {
+                channel: 0,
+                data: 7i32.to_le_bytes().to_vec(),
+            },
+            ChannelSeed {
+                channel: 1,
+                data: 1u32.to_le_bytes().to_vec(),
+            },
+            ChannelSeed {
+                channel: 2,
+                data: vec![1, 0, 1, 0],
+            },
+        ];
+        let cells = BoundCells::new();
+        let mut shadow = HostShadow::new(&bound, &seeds);
+
+        let first = {
+            let mut known = |chan| shadow.fire_value(&bound, &cells, chan);
+            crate::pipeline::fire::geometry::evaluate_attn_mask(&bound, &mut known, &[0, 1])
+                .unwrap()
+        };
+        assert!(matches!(
+            first,
+            crate::pipeline::fire::geometry::FireAttnMask::Host { .. }
+        ));
+
+        shadow.advance(&bound, &cells);
+        let second = {
+            let mut known = |chan| shadow.fire_value(&bound, &cells, chan);
+            crate::pipeline::fire::geometry::evaluate_attn_mask(&bound, &mut known, &[0, 1])
+                .unwrap()
+        };
+        assert_eq!(
+            second,
+            crate::pipeline::fire::geometry::FireAttnMask::Device
+        );
+    }
+}

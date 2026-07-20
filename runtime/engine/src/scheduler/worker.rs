@@ -265,6 +265,10 @@ struct LaunchGrouping {
     has_device_geometry: bool,
 }
 
+fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
+    request.has_user_mask && request.masks.is_empty() && request.device_resolved_geometry
+}
+
 impl LaunchGrouping {
     fn accepts(&self, request: &PendingRequest, limits: SchedulerLimits, page_size: u32) -> bool {
         if self.instances.contains(&request.instance_id) {
@@ -284,11 +288,10 @@ impl LaunchGrouping {
         // the unmasked ones) and the driver predicates per row. They cannot
         // ride a composed device-geometry batch: wire masks index the wire
         // request layout, which composition replaces (driver fails loud).
-        // A DENSE-masked device-resolved fire is stricter still: the composed
-        // path does not merge dense device masks with any other program, so
-        // it batches solo.
-        let masked_device_geometry =
-            request.request.has_user_mask && request.request.device_resolved_geometry;
+        // A DENSE-masked device-resolved fire is stricter still: unlike a
+        // host-derived channel mask, it has no wire BRLE rows and the composed
+        // path cannot merge it with another program.
+        let masked_device_geometry = has_dense_device_mask(&request.request);
         if self.count != 0
             && (masked_device_geometry
                 || (self.has_user_mask && self.has_device_geometry)
@@ -319,7 +322,7 @@ impl LaunchGrouping {
         self.has_user_mask |= request.request.has_user_mask;
         self.has_device_geometry |= request.request.device_resolved_geometry;
         request.requires_solo_submission()
-            || (request.request.has_user_mask && request.request.device_resolved_geometry)
+            || has_dense_device_mask(&request.request)
             || self.count >= limits.max_forward_requests
             || self.forward_tokens >= limits.max_forward_tokens
             || self.page_refs >= limits.max_page_refs
@@ -6444,6 +6447,53 @@ mod tests {
         assert!(
             grouping.accepts(&second, limits, 16),
             "the scheduler must not impose a token cap below the driver limit"
+        );
+    }
+
+    #[test]
+    fn launch_grouping_only_solos_device_derived_masks() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let mut host_mask = dummy_launch_request(ProcessId::new_v4(), 1);
+        host_mask.request.has_user_mask = true;
+        host_mask.request.masks = vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+        host_mask.request.mask_indptr = vec![0, 1];
+        let causal = dummy_launch_request(ProcessId::new_v4(), 2);
+
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&host_mask, limits, 16));
+        assert!(
+            !grouping.push(&host_mask, limits, 16),
+            "a host-derived wire mask must not close the batch"
+        );
+        assert!(
+            grouping.accepts(&causal, limits, 16),
+            "host-derived custom and causal fires should co-batch"
+        );
+
+        let mut dense = dummy_launch_request(ProcessId::new_v4(), 3);
+        dense.request.has_user_mask = true;
+        dense.request.device_resolved_geometry = true;
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&dense, limits, 16));
+        assert!(
+            grouping.push(&dense, limits, 16),
+            "a device-derived dense mask remains a solo batch"
+        );
+
+        let mut host_on_device = dummy_launch_request(ProcessId::new_v4(), 4);
+        host_on_device.request.has_user_mask = true;
+        host_on_device.request.device_resolved_geometry = true;
+        host_on_device.request.masks =
+            vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+        host_on_device.request.mask_indptr = vec![0, 1];
+        let mut grouping = LaunchGrouping::default();
+        assert!(
+            !grouping.push(&host_on_device, limits, 16),
+            "wire rows distinguish a host-derived mask from dense device lowering"
         );
     }
 
