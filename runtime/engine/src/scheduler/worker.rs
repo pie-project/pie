@@ -292,8 +292,12 @@ impl LaunchGrouping {
         // host-derived channel mask, it has no wire BRLE rows and the composed
         // path cannot merge it with another program.
         let masked_device_geometry = has_dense_device_mask(&request.request);
+        let wire_mask_on_device_geometry = request.request.has_user_mask
+            && !request.request.masks.is_empty()
+            && request.request.device_resolved_geometry;
         if self.count != 0
             && (masked_device_geometry
+                || wire_mask_on_device_geometry
                 || (self.has_user_mask && self.has_device_geometry)
                 || (request.request.has_user_mask && self.has_device_geometry)
                 || (request.request.device_resolved_geometry && self.has_user_mask))
@@ -6494,6 +6498,12 @@ mod tests {
         assert!(
             !grouping.push(&host_on_device, limits, 16),
             "wire rows distinguish a host-derived mask from dense device lowering"
+        );
+        let mut ordinary_group = LaunchGrouping::default();
+        ordinary_group.push(&dummy_launch_request(ProcessId::new_v4(), 5), limits, 16);
+        assert!(
+            !ordinary_group.accepts(&host_on_device, limits, 16),
+            "resolved-geometry host masks remain incompatible with reordered wire rows"
         );
     }
 

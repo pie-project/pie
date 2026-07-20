@@ -50,7 +50,8 @@ void NemotronHModel::prepare(AttentionWorkspace& attn_ws,
         in.kv_last_page_lens_d,
         in.total_tokens,
         in.num_requests,
-        in.is_pure_decode);
+        in.is_pure_decode,
+        in.have_custom_mask);
 }
 
 void NemotronHModel::body(Workspace& ws,

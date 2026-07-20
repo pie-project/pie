@@ -22,9 +22,11 @@ namespace pie_cuda_driver {
 // layout above ALL flags and `static_assert`s the masks can't overlap.
 inline constexpr std::uint32_t kGvSmallSpec   = 1u << 0;
 inline constexpr std::uint32_t kGvRsVerify    = 1u << 1;
-inline constexpr int           kGvLayoutShift = 2;
+inline constexpr std::uint32_t kGvCustomMask  = 1u << 2;
+inline constexpr int           kGvLayoutShift = 3;
 
-inline constexpr std::uint32_t kGvFlagMask = kGvSmallSpec | kGvRsVerify;
+inline constexpr std::uint32_t kGvFlagMask =
+    kGvSmallSpec | kGvRsVerify | kGvCustomMask;
 
 // By construction: every flag is below the layout field, so no `graph_layout`
 // value can ever alias a flag bit.
@@ -33,9 +35,11 @@ static_assert(kGvFlagMask < (1u << kGvLayoutShift),
 
 constexpr std::uint32_t make_graph_variant(bool small_spec,
                                            bool rs_verify,
+                                           bool custom_mask,
                                            std::uint32_t graph_layout) {
     return (small_spec  ? kGvSmallSpec  : 0u) |
            (rs_verify   ? kGvRsVerify   : 0u) |
+           (custom_mask ? kGvCustomMask : 0u) |
            (graph_layout << kGvLayoutShift);
 }
 
@@ -67,8 +71,8 @@ static_assert(gv_old_encode_for_proof(64u, false, false) ==
               "#24 precondition: OLD encoding aliased graph_layout=64 with "
               "small_spec — the latent collision this fix closes");
 // And the fix keeps them distinct.
-static_assert(make_graph_variant(false, false, 64u) !=
-                  make_graph_variant(true, false, 0u),
+static_assert(make_graph_variant(false, false, false, 64u) !=
+                  make_graph_variant(true, false, false, 0u),
               "#24 fix: graph_layout=64 must hash distinctly from small_spec");
 
 }  // namespace pie_cuda_driver

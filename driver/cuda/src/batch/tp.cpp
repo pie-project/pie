@@ -125,6 +125,14 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                          int rs_buffer_ids_count,
                          cudaStream_t stream)
 {
+    if (mask_bytes < 0 || mask_indptr_count < 0 ||
+        (mask_indptr_count != 0 && mask_indptr_count != R + 1) ||
+        static_cast<std::size_t>(mask_bytes) > pi.custom_mask.size() ||
+        static_cast<std::size_t>(mask_indptr_count) >
+            pi.custom_mask_indptr.size()) {
+        throw std::runtime_error(
+            "TP root custom mask metadata exceeds persistent capacity");
+    }
     auto* d_hdr = tp_hdr_dev_buf();
     TpFireHeader hdr{
         TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
@@ -194,11 +202,13 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                                  static_cast<std::size_t>(kv_indices_count) * 4,
                                  ncclChar, 0, comm.comm(), stream));
     }
-    if (!state_only_fold && mask_bytes > 0) {
-        NCCL_CHECK(ncclBroadcast(pi.custom_mask.data(),
-                                 pi.custom_mask.data(),
-                                 static_cast<std::size_t>(mask_bytes), ncclChar, 0,
-                                 comm.comm(), stream));
+    if (!state_only_fold && mask_indptr_count > 0) {
+        if (mask_bytes > 0) {
+            NCCL_CHECK(ncclBroadcast(
+                pi.custom_mask.data(), pi.custom_mask.data(),
+                static_cast<std::size_t>(mask_bytes), ncclChar, 0,
+                comm.comm(), stream));
+        }
         NCCL_CHECK(ncclBroadcast(pi.custom_mask_indptr.data(),
                                  pi.custom_mask_indptr.data(),
                                  static_cast<std::size_t>(mask_indptr_count) * 4,
@@ -419,8 +429,18 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
 
         // 2. Receive payloads. Mirror order in `tp_broadcast_inputs`,
         //    grouped so NCCL submits the batch as a single op.
+        if (hdr.mask_bytes < 0 || hdr.mask_indptr_count < 0 ||
+            (hdr.mask_indptr_count != 0 &&
+             hdr.mask_indptr_count != R + 1) ||
+            static_cast<std::size_t>(hdr.mask_bytes) >
+                pi.custom_mask.size() ||
+            static_cast<std::size_t>(hdr.mask_indptr_count) >
+                pi.custom_mask_indptr.size()) {
+            throw std::runtime_error(
+                "TP follower custom mask exceeds persistent capacity");
+        }
         const bool have_custom_mask =
-            !state_only_fold && hdr.mask_bytes > 0;
+            !state_only_fold && hdr.mask_indptr_count > 0;
         NCCL_CHECK(ncclGroupStart());
         if (!state_only_fold) {
             NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
@@ -466,10 +486,12 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                                      ncclChar, 0, comm.comm(), stream));
         }
         if (!state_only_fold && have_custom_mask) {
-            NCCL_CHECK(ncclBroadcast(pi.custom_mask.data(),
-                                     pi.custom_mask.data(),
-                                     static_cast<std::size_t>(hdr.mask_bytes),
-                                     ncclChar, 0, comm.comm(), stream));
+            if (hdr.mask_bytes > 0) {
+                NCCL_CHECK(ncclBroadcast(
+                    pi.custom_mask.data(), pi.custom_mask.data(),
+                    static_cast<std::size_t>(hdr.mask_bytes),
+                    ncclChar, 0, comm.comm(), stream));
+            }
             NCCL_CHECK(ncclBroadcast(pi.custom_mask_indptr.data(),
                                      pi.custom_mask_indptr.data(),
                                      static_cast<std::size_t>(hdr.mask_indptr_count) * 4,
@@ -662,6 +684,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     .total_tokens = N,
                     .num_requests = R,
                     .is_pure_decode = is_pure_decode,
+                    .have_custom_mask = have_custom_mask,
                     .runtime_window_left = structured_window_left,
                 });
         }
@@ -671,22 +694,27 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         // first capture). The same `(R)` shape key keeps the per-rank
         // graph caches in lockstep; the captured graph on rank 1 has no
         // PTIR publication, just the forward kernels + NCCL.
-        const bool try_graphs =
-            engine.graph_cache != nullptr && is_pure_decode && !have_custom_mask
-            && engine.forward_fn.graph_safe &&
-            rs_mode != RsExecutionMode::BufferWrite &&
-            rs_mode != RsExecutionMode::BufferFold &&
-            has_write_desc &&
-            structured_window_left == -2 &&
-            graph_replay_has_no_host_resets(
-                have_slot_ids,
-                h_is_fresh.data(),
-                static_cast<std::size_t>(std::max(R, 0)));
+        const bool try_graphs = forward_graph_replay_eligible(
+            engine,
+            is_pure_decode,
+            have_custom_mask,
+            rs_mode == RsExecutionMode::BufferWrite,
+            rs_mode == RsExecutionMode::BufferFold,
+            has_write_desc,
+            structured_window_left,
+            have_slot_ids,
+            h_is_fresh.data(),
+            R,
+            /*num_images=*/0,
+            /*num_clips=*/0,
+            /*has_stage_hooks=*/false);
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
             make_graph_variant(/*small_spec=*/false,
-                               /*rs_verify=*/false, graph_layout);
+                               /*rs_verify=*/false,
+                               have_custom_mask,
+                               graph_layout);
         if (try_graphs) {
             const ForwardGraphKey key{R, N, graph_variant};
             cudaGraphExec_t exec = engine.graph_cache->get(key);
@@ -695,6 +723,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     engine, h_qo.data(), h_kvpi.data(), h_kvpp.data(),
                     h_kvlpl.data(),
                     N, R, is_pure_decode,
+                    have_custom_mask,
                     have_slot_ids ? h_slot_ids.data() : nullptr,
                     have_slot_ids ? h_is_fresh.data() : nullptr,
                     have_slot_ids ? pi.slot_ids.data() : nullptr,

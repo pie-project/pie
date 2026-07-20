@@ -23,6 +23,9 @@ __global__ void k_graph_pad_rows(
     std::uint32_t* __restrict__ tokens,
     std::uint32_t* __restrict__ positions,
     std::uint8_t* __restrict__ row_valid,
+    std::uint8_t* __restrict__ custom_mask,
+    std::int32_t* __restrict__ custom_mask_indptr,
+    int real_mask_bytes,
     int real_requests,
     int real_tokens,
     int padding,
@@ -39,6 +42,11 @@ __global__ void k_graph_pad_rows(
     tokens[real_tokens + j] = 0;
     positions[real_tokens + j] = 0;
     row_valid[real_tokens + j] = 0;
+    if (custom_mask != nullptr && custom_mask_indptr != nullptr) {
+        custom_mask[real_mask_bytes + j] = 1;
+        custom_mask_indptr[real_requests + 1 + j] =
+            real_mask_bytes + 1 + j;
+    }
 }
 
 }  // namespace
@@ -51,6 +59,9 @@ void launch_graph_pad_rows(
     std::uint32_t* tokens,
     std::uint32_t* positions,
     std::uint8_t* row_valid,
+    std::uint8_t* custom_mask,
+    std::int32_t* custom_mask_indptr,
+    int real_mask_bytes,
     int real_requests,
     int real_tokens,
     int padding,
@@ -65,6 +76,9 @@ void launch_graph_pad_rows(
         tokens,
         positions,
         row_valid,
+        custom_mask,
+        custom_mask_indptr,
+        real_mask_bytes,
         real_requests,
         real_tokens,
         padding,

@@ -1002,21 +1002,38 @@ void handle_fire_batch(
         // `has_custom_mask` gate). This is the previously-noted "route decode
         // through the prefill kernel for custom-mask inferlets" fix; a normal
         // decode batch carries no mask (`fmask_view` empty) so it is unaffected.
-        // Wire BRLE masks are indexed by the WIRE request layout, so the
-        // causality check and decode run against the WIRE spans (identical to
-        // the selected spans on a pure-wire batch). A composed batch never
-        // carries a custom wire mask (the runtime scheduler keeps custom-mask
-        // wire fires and device-geometry fires apart — fail loud otherwise);
-        // pure-causal wire masks are simply dropped, as before.
+        // Wire BRLE masks normally index the wire request layout. A solo
+        // device-geometry fire can also carry a host-derived channel mask; its
+        // row order is unchanged, but key lengths come from resolved geometry,
+        // so decode that mask against the selected spans.
         const auto fmask_view  = view.flattened_masks.as<std::uint32_t>();
         const auto mskptr_view = view.mask_indptr.as<std::uint32_t>();
         if (!fmask_view.empty()) {
+            const bool resolved_custom_wire =
+                dg_resolved && view.has_user_mask;
+            if (resolved_custom_wire &&
+                view.ptir_program_hashes.size() > 1) {
+                throw std::runtime_error(
+                    "ptir: host-derived masks on device geometry require a "
+                    "solo program");
+            }
             const auto qo_span = std::span<const std::uint32_t>(
-                qo_view_orig.data(), qo_view_orig.size());
+                resolved_custom_wire ? qo_view.data() : qo_view_orig.data(),
+                resolved_custom_wire ? qo_view.size() : qo_view_orig.size());
             const auto kvpp_span = std::span<const std::uint32_t>(
-                kvpp_view_wire.data(), kvpp_view_wire.size());
+                resolved_custom_wire
+                    ? kvpp_view.data()
+                    : kvpp_view_wire.data(),
+                resolved_custom_wire
+                    ? kvpp_view.size()
+                    : kvpp_view_wire.size());
             const auto kvlpl_span = std::span<const std::uint32_t>(
-                kvlpl_view_orig.data(), kvlpl_view_orig.size());
+                resolved_custom_wire
+                    ? kvlpl_view.data()
+                    : kvlpl_view_orig.data(),
+                resolved_custom_wire
+                    ? kvlpl_view.size()
+                    : kvlpl_view_orig.size());
             bool pure_causal =
                 pie_cuda_driver::brle::is_pure_causal(
                     fmask_view, mskptr_view,
@@ -1035,22 +1052,7 @@ void handle_fire_batch(
                         logical_kv_lens);
             }
             if (!pure_causal) {
-                if (dg_resolved) {
-                    // A MULTI-program batch cannot honor wire BRLE masks
-                    // (they index the wire request layout; the scheduler
-                    // batches mask-carrying fires solo — fail loud if not).
-                    // On a SOLO device-geometry fire the wire rows are
-                    // engine-SYNTHESIZED causal (a guest's mask is the DENSE
-                    // channel mask, packed below) and simply drop — the
-                    // resolved geometry runs the standard causal path.
-                    if (view.has_user_mask &&
-                        view.ptir_program_hashes.size() > 1) {
-                        throw std::runtime_error(
-                            "ptir: custom wire masks cannot co-batch with "
-                            "device-geometry programs (scheduler contract "
-                            "violated)");
-                    }
-                } else {
+                if (!dg_resolved || resolved_custom_wire) {
                     auto decoded = pie_cuda_driver::brle::decode(
                         fmask_view, mskptr_view,
                         qo_span, kvpp_span, kvlpl_span,
@@ -1178,24 +1180,30 @@ void handle_fire_batch(
                     static_cast<std::size_t>(mindptr[lanes]);
                 if (packed_bytes > 0 &&
                     packed_bytes <= pi.custom_mask.size() &&
-                    static_cast<std::size_t>(lanes) + 1 <= pi.custom_mask_indptr.size()) {
-                    auto kvm_dev = DeviceBuffer<std::uint8_t>::from_bytes(
+                    static_cast<std::size_t>(lanes) + 1 <=
+                        pi.custom_mask_indptr.size() &&
+                    fg.mask.size() <= pi.dense_mask.size() &&
+                    klen.size() <= pi.structured_mask_klen.size()) {
+                    pi.dense_mask.copy_from_host(
                         std::span<const std::uint8_t>(fg.mask));
-                    auto klen_dev = DeviceBuffer<std::uint32_t>::from_host(
+                    pi.structured_mask_klen.copy_from_host(
                         std::span<const std::uint32_t>(klen));
-                    auto qo_dev = DeviceBuffer<std::uint32_t>::from_host(
-                        std::span<const std::uint32_t>(qo_view.data(), qo_view.size()));
                     pi.custom_mask_indptr.copy_from_host(
                         std::span<const std::int32_t>(mindptr));
                     CUDA_CHECK(cudaMemsetAsync(pi.custom_mask.data(), 0,
                                                packed_bytes, cublas.stream()));
                     kernels::launch_pack_dense_mask(
-                        kvm_dev.data(), klen_dev.data(), qo_dev.data(),
+                        pi.dense_mask.data(),
+                        pi.structured_mask_klen.data(),
+                        pi.qo_indptr.data(),
                         pi.custom_mask_indptr.data(), pi.custom_mask.data(),
                         lanes, stride, cublas.stream());
                     have_custom_mask = true;
                     mask_bytes = static_cast<int>(packed_bytes);
                     mask_indptr_count = lanes + 1;
+                } else if (packed_bytes > 0) {
+                    throw std::runtime_error(
+                        "dense attention mask exceeds persistent capacity");
                 }
             }
         }
@@ -1279,7 +1287,12 @@ void handle_fire_batch(
                     static_cast<std::size_t>(bucket) + 1 <=
                         pi.kv_page_indptr.size() &&
                     static_cast<std::size_t>(bucket) <=
-                        pi.kv_last_page_lens.size();
+                        pi.kv_last_page_lens.size() &&
+                    (!have_custom_mask ||
+                     (static_cast<std::size_t>(mask_bytes + padding) <=
+                          pi.custom_mask.size() &&
+                      static_cast<std::size_t>(bucket) + 1 <=
+                          pi.custom_mask_indptr.size()));
                 if (fits) {
                     graph_pad_requests = padding;
                 }
@@ -1530,6 +1543,15 @@ void handle_fire_batch(
         std::vector<std::uint32_t> pad_kv_page_indptr;
         std::vector<std::uint32_t> pad_kv_last_page_lens;
         if (graph_pad_requests > 0) {
+            const int real_mask_bytes = mask_bytes;
+            if (have_custom_mask) {
+                if (mask_indptr_count != forward_R + 1) {
+                    throw std::runtime_error(
+                        "custom attention mask CSR does not match graph padding");
+                }
+                mask_bytes += graph_pad_requests;
+                mask_indptr_count += graph_pad_requests;
+            }
             pad_qo_indptr.assign(
                 h_qo_forward, h_qo_forward + forward_R + 1);
             pad_kv_page_indptr.assign(
@@ -1555,6 +1577,9 @@ void handle_fire_batch(
                 reinterpret_cast<std::uint32_t*>(pi.tokens.data()),
                 reinterpret_cast<std::uint32_t*>(pi.positions.data()),
                 reinterpret_cast<std::uint8_t*>(pi.row_valid.data()),
+                have_custom_mask ? pi.custom_mask.data() : nullptr,
+                have_custom_mask ? pi.custom_mask_indptr.data() : nullptr,
+                real_mask_bytes,
                 forward_R,
                 forward_N,
                 graph_pad_requests,
@@ -1579,7 +1604,7 @@ void handle_fire_batch(
             tp_broadcast_inputs(*engine.tp_comm, pi,
                                 forward_N, forward_R, is_pure_decode,
                                 rs_is_fold ? 0 : static_cast<int>(
-                                    forward_inputs.kv_page_indices.size()),
+                                    h_kvpp_forward[forward_R]),
                                 rs_is_fold ? 0 : mask_bytes,
                                 rs_is_fold ? 0 : mask_indptr_count,
                                 /*has_slot_ids=*/use_slots,
@@ -1619,6 +1644,7 @@ void handle_fire_batch(
                     .total_tokens = forward_N,
                     .num_requests = forward_R,
                     .is_pure_decode = is_pure_decode,
+                    .have_custom_mask = have_custom_mask,
                     .runtime_window_left = structured_window_left,
                 });
             attn_ws.end_plan_update(cublas.stream());

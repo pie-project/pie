@@ -226,6 +226,7 @@ cudaGraphExec_t capture_forward_graph_exec(
     int N,
     int R,
     bool is_pure_decode,
+    bool have_custom_mask,
     const std::int32_t* slot_ids_h,
     const std::uint8_t* is_fresh_h,
     const std::int32_t* slot_ids_d,
@@ -259,6 +260,12 @@ cudaGraphExec_t capture_forward_graph_exec(
         fwd_in.total_tokens        = N;
         fwd_in.num_requests        = R;
         fwd_in.is_pure_decode      = is_pure_decode;
+        fwd_in.custom_mask_d = have_custom_mask
+            ? pi.custom_mask.data()
+            : nullptr;
+        fwd_in.custom_mask_indptr_d = have_custom_mask
+            ? pi.custom_mask_indptr.data()
+            : nullptr;
         fwd_in.slot_ids_h          = slot_ids_h;
         fwd_in.is_fresh_h          = is_fresh_h;
         fwd_in.slot_ids_d          = slot_ids_d;
@@ -403,6 +410,7 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
             engine.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
             make_graph_variant(/*small_spec=*/false, /*rs_verify=*/false,
+                               /*custom_mask=*/false,
                                graph_layout);
         const ForwardGraphKey key{R, N, graph_variant};
         if (engine.graph_cache->get(key) != nullptr) continue;
@@ -411,6 +419,7 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
         cudaGraphExec_t exec = capture_forward_graph_exec(
             engine, qo.data(), kvpi.data(), kvpp.data(), kvlpl.data(),
             N, R, /*is_pure_decode=*/true,
+            /*have_custom_mask=*/false,
             /*slot_ids_h=*/nullptr, /*is_fresh_h=*/nullptr,
             engine.rs_cache != nullptr ? pi.slot_ids.data() : nullptr,
             /*logit_row_indices_d=*/nullptr,
@@ -477,10 +486,14 @@ bool forward_graph_replay_eligible(
     int num_images,
     int num_clips,
     bool has_stage_hooks) {
+    const bool mask_pointers_stable =
+        !have_custom_mask ||
+        (engine.inputs.custom_mask.data() != nullptr &&
+         engine.inputs.custom_mask_indptr.data() != nullptr);
     return engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
         is_pure_decode &&
-        !have_custom_mask &&
+        mask_pointers_stable &&
         !rs_buffer_write &&
         !rs_buffer_fold &&
         has_write_desc &&
@@ -523,6 +536,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
             make_graph_variant(
                 /*small_spec=*/false,
                 /*rs_verify=*/false,
+                in.have_custom_mask,
                 graph_layout);
         const ForwardGraphKey key{
             in.forward_R,
@@ -540,6 +554,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.forward_N,
                 in.forward_R,
                 true,
+                in.have_custom_mask,
                 in.use_slots ? in.slot_ids_h_data : nullptr,
                 in.use_slots ? in.is_fresh_h_data : nullptr,
                 in.use_slots ? pi.slot_ids.data() : nullptr,

@@ -153,7 +153,8 @@ void prepare_llama_like_decode_plan(
     const std::uint32_t* kv_last_page_lens_d,
     int total_tokens,
     int num_requests,
-    bool is_pure_decode);
+    bool is_pure_decode,
+    bool have_custom_mask);
 
 std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state);

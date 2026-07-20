@@ -215,6 +215,7 @@ struct ForwardFn {
         int total_tokens = 0;
         int num_requests = 0;
         bool is_pure_decode = false;
+        bool have_custom_mask = false;
         int runtime_window_left = -2;
     };
 
@@ -413,6 +414,7 @@ cudaGraphExec_t capture_forward_graph_exec(
     int N,
     int R,
     bool is_pure_decode,
+    bool have_custom_mask,
     const std::int32_t* slot_ids_h,
     const std::uint8_t* is_fresh_h,
     const std::int32_t* slot_ids_d,

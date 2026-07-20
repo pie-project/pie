@@ -171,16 +171,34 @@ bool run_case(const Case& c, float tol) {
     RT(cudaMemcpy(d_mask, dm.packed.data(), dm.packed.size(), cudaMemcpyHostToDevice));
     RT(cudaMemcpy(d_mip, dm.mask_indptr.data(), dm.mask_indptr.size()*4, cudaMemcpyHostToDevice));
 
-    // 5. Workspace + the production masked kernel.
+    // 5. Plan outside capture, then capture/replay the production masked
+    // dispatch twice. This is the serving path: persistent mask pointers and a
+    // cached prefill plan, with no host planner work in the graph body.
     auto ws = AttentionWorkspace::allocate(128ull*1024*1024, 16ull*1024*1024);
-    pie_cuda_driver::ops::launch_attention_flashinfer_prefill_custom_bf16(
-        d_q, d_k, d_v, d_o,
-        d_qo, d_kpi, d_kpp, d_klpl,
-        d_mask, d_mip,
-        qo_indptr_h.data(), kv_page_indptr_h.data(),
-        tokens, /*num_requests=*/1, HQ, HKV, D, PAGE,
-        ws, /*stream=*/nullptr);
+    auto plan = pie_cuda_driver::ops::make_prefill_plan();
+    pie_cuda_driver::ops::plan_attention_flashinfer_prefill_bf16(
+        *plan, qo_indptr_h.data(), kv_page_indptr_h.data(),
+        kv_last_page_lens_h.data(), tokens, /*num_requests=*/1,
+        HQ, HKV, D, PAGE, ws, /*stream=*/nullptr,
+        /*enable_cuda_graph=*/true, /*window_left=*/-1,
+        /*full_attention_variant=*/false, /*hnd_layout=*/false,
+        /*causal_mask=*/false, /*custom_mask=*/true);
     RT(cudaDeviceSynchronize());
+
+    cudaStream_t graph_stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    RT(cudaStreamCreateWithFlags(&graph_stream, cudaStreamNonBlocking));
+    RT(cudaStreamBeginCapture(
+        graph_stream, cudaStreamCaptureModeThreadLocal));
+    pie_cuda_driver::ops::dispatch_attention_flashinfer_prefill_custom_bf16(
+        *plan, d_q, d_k, d_v, d_o, d_qo, d_kpi, d_kpp, d_klpl,
+        d_mask, d_mip, ws, graph_stream);
+    RT(cudaStreamEndCapture(graph_stream, &graph));
+    RT(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+    RT(cudaGraphLaunch(graph_exec, graph_stream));
+    RT(cudaGraphLaunch(graph_exec, graph_stream));
+    RT(cudaStreamSynchronize(graph_stream));
 
     // 6. Download, compare.
     std::vector<std::uint16_t> o_bf(static_cast<std::size_t>(tokens)*HQ*D);
@@ -189,6 +207,9 @@ bool run_case(const Case& c, float tol) {
     for (std::size_t i = 0; i < o_bf.size(); ++i) dev[i] = bf16_to_f32(o_bf[i]);
     const float diff = pie_attn_ref::max_abs_diff(dev, ref);
 
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(graph_stream);
     cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_o); cudaFree(d_qo);
     cudaFree(d_kpi); cudaFree(d_kpp); cudaFree(d_klpl); cudaFree(d_mask); cudaFree(d_mip);
 
