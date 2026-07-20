@@ -43,7 +43,7 @@ rkyv = { version = "0.8", default-features = false, features = [
     "bytecheck",
 ] }
 libc = "0.2"
-pyo3 = { version = "0.23", features = ["extension-module", "multiple-pymethods"], optional = true }
+pyo3 = { version = "0.29", features = ["extension-module", "multiple-pymethods"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
