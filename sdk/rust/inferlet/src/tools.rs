@@ -17,9 +17,6 @@
 //!   to enforce well-formed output.
 //! - [`Decoder`] — streaming detector for tool calls inside generated
 //!   text. Feed each step's tokens; collect `Call(name, args)` events.
-//! - [`parse_call`] — best-effort one-shot parse out of a finished text
-//!   blob. Useful for `collect_text()` flows that want to extract one
-//!   call at the end.
 //!
 //! For agents that hand-roll their own format (e.g. `agent-react`'s
 //! `Action: ToolName[input]` parsing), none of these are required.
@@ -61,6 +58,20 @@ pub trait Tool {
 /// message. Models without a native tool-template return an empty vec.
 pub fn equip_prefix(model: &Model, tool_schemas: &[String]) -> Result<Vec<u32>> {
     tool_use::equip(model, tool_schemas)
+}
+
+/// Token sequence for a system turn that also registers `tool_schemas`.
+///
+/// Prefer this over `system` + [`equip_prefix`] whenever both are being
+/// emitted: templates that nest tool declarations inside the first system
+/// turn (Gemma 4) can only be produced this way, and templates that keep them
+/// separate produce byte-identical output either way.
+pub fn system_equip_prefix(
+    model: &Model,
+    system: &str,
+    tool_schemas: &[String],
+) -> Result<Vec<u32>> {
+    tool_use::system_equip(model, system, tool_schemas)
 }
 
 /// Token sequence that frames a tool result for the next turn. `name`
@@ -117,9 +128,26 @@ pub enum Event {
 
 impl Decoder {
     /// Construct a decoder for `model`'s tool-call template.
+    ///
+    /// This decoder does not know which tools were declared, so it can only
+    /// apply the template's lexical rules. Prefer [`Decoder::with_tools`]
+    /// whenever the toolset is known: it additionally refuses a call naming a
+    /// tool the model was never shown.
     pub fn new(model: &Model) -> Self {
         Self {
             inner: tool_use::create_decoder(model),
+        }
+    }
+
+    /// Construct a decoder that also enforces declared-tool membership.
+    ///
+    /// `tool_schemas` is the same set passed to
+    /// [`equip_prefix`]/[`system_equip_prefix`]. The decoder reports a call
+    /// only when its name is one of those tools, so an undeclared name is
+    /// refused even when generation was not constrained by a grammar.
+    pub fn with_tools(model: &Model, tool_schemas: &[String]) -> Self {
+        Self {
+            inner: tool_use::create_decoder_for_tools(model, tool_schemas),
         }
     }
 
@@ -136,24 +164,5 @@ impl Decoder {
     /// Reset to initial state.
     pub fn reset(&mut self) {
         self.inner.reset();
-    }
-}
-
-// =============================================================================
-// One-shot parse
-// =============================================================================
-
-/// Best-effort parse of a single tool call out of a finished text blob.
-/// Internally tokenizes, runs the decoder, and returns the first
-/// completed `Call`. Useful for `collect_text()` flows that want to
-/// extract one call at the end of generation. Returns `None` when no
-/// completed call is detected.
-pub fn parse_call(model: &Model, text: &str) -> Option<(String, String)> {
-    let tokenizer = model.tokenizer();
-    let tokens = tokenizer.encode(text);
-    let mut dec = Decoder::new(model);
-    match dec.feed(&tokens).ok()? {
-        Event::Call(name, args) => Some((name, args)),
-        Event::Start => None,
     }
 }
