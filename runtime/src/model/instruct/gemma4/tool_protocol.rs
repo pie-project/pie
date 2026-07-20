@@ -518,11 +518,25 @@ pub(super) fn declaration_block(tool: &ValidatedTool) -> String {
 ///
 /// Returning `None` rather than a lossy rendering is what lets the caller fail
 /// the turn instead of silently feeding the model a corrupted response.
-pub(super) fn response_block(name: &str, value: &str) -> String {
+/// Render a tool result into its `<|tool_response>` block, or refuse.
+///
+/// The tool result is the least-trusted string in the loop, so the whole
+/// response contract lives here, once. An empty name defaults to `unknown`, as
+/// the template does; any other name must be a supported tool identifier — the
+/// same charset the declaration holds — so a name carrying the DSL delimiter or
+/// whitespace cannot forge structure. The value is rendered through the DSL
+/// string rule ([`quote`]), which refuses the one delimiter the format has no
+/// escape for. Only a result that passes both is rendered; anything else is
+/// `None`, and the caller must decide how loudly to fail.
+pub(super) fn response_block(name: &str, value: &str) -> Option<String> {
     let name = if name.is_empty() { "unknown" } else { name };
-    format!(
-        "{TOOL_RESPONSE_OPEN}response:{name}{{value:{QUOTE}{value}{QUOTE}}}{TOOL_RESPONSE_CLOSE}"
-    )
+    if !is_supported_tool_name(name) {
+        return None;
+    }
+    Some(format!(
+        "{TOOL_RESPONSE_OPEN}response:{name}{{value:{}}}{TOOL_RESPONSE_CLOSE}",
+        quote(value)?
+    ))
 }
 
 /// EBNF constraining generation to exactly one well-formed Gemma 4 tool call.
@@ -1288,7 +1302,7 @@ mod tests {
 
     #[test]
     fn a_tool_response_is_not_mistaken_for_a_call() {
-        assert!(calls_from(&response_block("get_weather", "sunny")).is_empty());
+        assert!(calls_from(&response_block("get_weather", "sunny").unwrap()).is_empty());
     }
 
     #[test]

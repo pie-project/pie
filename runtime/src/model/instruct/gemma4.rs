@@ -208,17 +208,17 @@ impl Instruct for Gemma4Instruct {
     }
 
     fn answer(&self, name: &str, value: &str) -> Vec<u32> {
-        self.tokenizer.encode(&response_block(name, value))
+        // Infallible per the trait, but a result Gemma cannot represent has no
+        // correct rendering, so fail loudly rather than emit a corrupted turn.
+        // Delegates to `try_answer` (no duplicated validation, no recursion);
+        // callers that must handle refusal use `try_answer` directly, as the
+        // host does.
+        self.try_answer(name, value)
+            .expect("tool result is not representable in the Gemma 4 wire format; use try_answer")
     }
 
     fn try_answer(&self, name: &str, value: &str) -> Option<Vec<u32>> {
-        // A `<` in the value is unrepresentable: the DSL string delimiter has no
-        // escape, so rendering it naively would let the value close the literal
-        // early and forge structure. Refuse rather than emit a corrupted block.
-        if value.contains('<') {
-            return None;
-        }
-        Some(self.answer(name, value))
+        response_block(name, value).map(|block| self.tokenizer.encode(&block))
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
@@ -933,6 +933,49 @@ mod tests {
         let inst = gemma4_tools();
         let text = inst.tokenizer.decode(&inst.answer("", "sunny"), false);
         assert!(text.contains("response:unknown{"));
+    }
+
+    #[test]
+    fn try_answer_enforces_the_response_contract() {
+        let inst = gemma4_tools();
+
+        // A valid name renders, and the bytes are exactly the response block —
+        // the centralization must not change representable output.
+        let ok = inst
+            .try_answer("get_weather", "sunny")
+            .expect("representable");
+        assert_eq!(
+            inst.tokenizer.decode(&ok, false),
+            "<|tool_response>response:get_weather{value:<|\"|>sunny<|\"|>}<tool_response|>"
+        );
+
+        // An empty name defaults to `unknown` (itself a valid identifier).
+        let defaulted = inst.try_answer("", "sunny").expect("representable");
+        assert!(
+            inst.tokenizer
+                .decode(&defaulted, false)
+                .contains("response:unknown{")
+        );
+
+        // A name that is not a supported identifier is refused: a leading digit
+        // and embedded whitespace both fail the charset.
+        assert!(inst.try_answer("1bad", "x").is_none());
+        assert!(inst.try_answer("get weather", "x").is_none());
+
+        // A name carrying the DSL delimiter is refused (injection).
+        assert!(inst.try_answer("a<b", "x").is_none());
+
+        // A value carrying the DSL delimiter is refused (the format has no
+        // escape for it), by the same rule the declaration uses.
+        assert!(inst.try_answer("get_weather", "a<b").is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "not representable")]
+    fn answer_fails_loudly_on_an_unrepresentable_result() {
+        // The infallible `answer` must not silently emit a corrupted turn; an
+        // unrepresentable result is a loud panic, not a truncated block.
+        gemma4_tools().answer("get_weather", "a<b");
     }
 
     #[test]
