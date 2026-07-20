@@ -50,6 +50,7 @@ struct SlotHandle {
     uint64_t gpu_address  = 0;        // base GPU VA of the slot (for setAddress)
     size_t   offset       = 0;        // byte offset within the heap
     size_t   size         = 0;        // slot size in bytes
+    bool     elastic      = false;    // placement-sparse VA backed by heap chunks
 
     bool  valid()    const { return buffer != nullptr; }
     void* contents() const { return contents_ptr; }
@@ -141,7 +142,9 @@ class RawMetalContext {
     struct Impl;  // Obj-C++ guts (defined in mtl4_context.mm)
 
     // heap_bytes: total single-heap budget (delta sizes from DecodeGeometry + manifest).
-    static std::unique_ptr<RawMetalContext> create(size_t heap_bytes);
+    static std::unique_ptr<RawMetalContext> create(
+        size_t heap_bytes,
+        size_t elastic_budget_bytes = 0);
     ~RawMetalContext();
 
     RawMetalContext(const RawMetalContext&)            = delete;
@@ -152,16 +155,27 @@ class RawMetalContext {
     // offsets in call order. align defaults to 256 (Metal buffer-offset alignment).
     SlotHandle heap_alloc(size_t size, size_t align = 256);
 
-    // Phase 1b/3 paged-KV bridge: a STANDALONE Shared-storage MTLBuffer, OUTSIDE
-    // the single placement heap (I2's "one resident heap, fixed offsets" is about
-    // the CORE decode weights/state/scratch/IO, which never move after setup();
-    // the paged-KV pool is explicitly designed to be independently GROWABLE —
-    // `resize_pool` allocates a NEW standalone buffer and copies old pages into
-    // it, without touching the core heap's layout/offsets at all). Individually
-    // registered with the residency set (incremental `addAllocation:`+`commit`,
-    // safe to call after the initial `make_resident()`). Returns an invalid
-    // (zero) SlotHandle on allocation failure.
+    // CPU-visible standalone storage for channels, IO staging, and other pools
+    // intentionally excluded from elastic arenas.
     SlotHandle create_standalone_buffer(size_t size);
+    // Private placement-sparse VA backed by lazily-created Shared placement
+    // heaps. The VA and gpu_address never change as chunks grow or trim.
+    SlotHandle create_elastic_buffer(
+        size_t size,
+        size_t initial_commit_bytes = 0);
+    bool ensure_elastic_buffer(const SlotHandle& h, size_t bytes);
+    bool trim_elastic_buffer(const SlotHandle& h, size_t bytes);
+    void release_elastic_buffer(const SlotHandle& h);
+    bool zero_buffer_range(const SlotHandle& h, size_t offset, size_t bytes);
+    bool copy_buffer_range(
+        const SlotHandle& dst,
+        size_t dst_offset,
+        const SlotHandle& src,
+        size_t src_offset,
+        size_t bytes);
+    size_t elastic_page_bytes() const;
+    size_t elastic_budget_pages() const;
+    size_t elastic_committed_pages() const;
 
     // Size-classed, residency-stable storage for PTIR command scratch and
     // metadata. Recycle only after the command's completion fence.

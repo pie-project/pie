@@ -406,12 +406,18 @@ class Context::Impl {
             load.load_plan_bytes.ptr + load.load_plan_bytes.len);
         compiler_version_ = load.compiler_version;
         facts_ = read_model_facts(cfg_.model.hf_path);
-        caps_json_ = build_caps_json(cfg_, facts_);
         std::string error;
         if (!ensure_executor(error)) {
             std::cerr << "[pie-driver-metal] load_model: " << error << "\n";
             return PIE_STATUS_UNSUPPORTED;
         }
+        nlohmann::json capabilities =
+            nlohmann::json::parse(build_caps_json(cfg_, facts_));
+        capabilities["elastic_page_bytes"] =
+            executor_->elastic_page_bytes();
+        capabilities["elastic_budget_pages"] =
+            executor_->elastic_budget_pages();
+        caps_json_ = capabilities.dump();
         if (caps != nullptr) {
             caps->json_bytes =
                 reinterpret_cast<const std::uint8_t*>(caps_json_.data());
@@ -1471,9 +1477,8 @@ class Context::Impl {
     }
 
     int resize_pool_impl(const PiePoolResizeDesc& resize, PieCompletion completion) {
-        if (resize.pool_id != 0) {
-            std::cerr << "[pie-driver-metal] resize_pool: UNSUPPORTED — only pool_id 0 (the "
-                         "one paged KV pool this bridge creates) exists\n";
+        if (resize.pool_id > PIE_ELASTIC_POOL_WORKSPACE) {
+            std::cerr << "[pie-driver-metal] resize_pool: unknown elastic pool id\n";
             return PIE_STATUS_UNSUPPORTED;
         }
         if (!facts_.has_linear_attn) {
@@ -1485,6 +1490,20 @@ class Context::Impl {
         if (!ensure_executor(err)) {
             std::cerr << "[pie-driver-metal] resize_pool: " << err << "\n";
             return PIE_STATUS_UNSUPPORTED;
+        }
+        if (resize.pool_id != PIE_ELASTIC_POOL_KV) {
+            if (!executor_->resize_elastic_pool(
+                    resize.pool_id,
+                    resize.target_pages,
+                    &err)) {
+                std::cerr << "[pie-driver-metal] resize_pool: " << err << "\n";
+                return PIE_STATUS_DRIVER_ERROR;
+            }
+            publish_terminal(
+                completion.terminal_cell,
+                PIE_TERMINAL_OUTCOME_SUCCESS);
+            notify(completion.wait_id, completion.target_epoch);
+            return PIE_STATUS_OK;
         }
         const std::uint32_t current_pages = executor_->kv_pool_total_pages();
         if (current_pages == 0) {

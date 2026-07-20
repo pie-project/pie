@@ -60,6 +60,12 @@ pub struct DriverCapabilities {
     /// Bytes per recurrent-state slot, for accounting/telemetry.
     #[serde(default)]
     pub rs_cache_slot_bytes: u64,
+    /// Shared elastic-memory accounting page size in bytes (0 if unsupported).
+    #[serde(default)]
+    pub elastic_page_bytes: u64,
+    /// Total pages in the device-wide elastic physical budget.
+    #[serde(default)]
+    pub elastic_budget_pages: u64,
     /// The loaded model exposes native MTP draft-logit rows to PTIR.
     #[serde(default)]
     pub has_mtp_logits: bool,

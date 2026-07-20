@@ -713,8 +713,15 @@ typedef struct PiePoolRangeSlice {
   size_t len;
 } PiePoolRangeSlice;
 
+#define PIE_ELASTIC_POOL_KV 0
+#define PIE_ELASTIC_POOL_STATE 1
+#define PIE_ELASTIC_POOL_WORKSPACE 2
+
 /**
  * Direct pool-resize descriptor.
+ *
+ * target_pages is measured in KV pages for PIE_ELASTIC_POOL_KV and in the
+ * driver's advertised elastic_page_bytes for the state/workspace pools.
  */
 typedef struct PiePoolResizeDesc {
   uint32_t abi_version;

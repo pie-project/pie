@@ -104,6 +104,8 @@ impl MockEnv {
                 rs_cache_required: false,
                 rs_cache_slots: 0,
                 rs_cache_slot_bytes: 0,
+                elastic_page_bytes: 0,
+                elastic_budget_pages: 0,
                 has_mtp_logits: true,
                 has_mtp_drafts: true,
                 has_value_head: true,

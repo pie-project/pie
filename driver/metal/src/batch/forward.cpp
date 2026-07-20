@@ -533,6 +533,16 @@ struct MetalExecutor::Impl {
         std::uint32_t total_pages,
         bool unmapped_tail_pages,
         std::string* error);
+    bool resize_elastic_pool(
+        std::uint64_t pool_id,
+        std::uint64_t target_pages,
+        std::string* error);
+    bool ensure_elastic_storage(
+        std::uint32_t kv_pages,
+        std::uint32_t state_slots,
+        std::uint32_t token_rows,
+        std::uint32_t ring_tokens,
+        std::string* error);
     void reset_state();
     void reset_state(std::uint32_t slot);
     bool copy_state_slot(
@@ -590,39 +600,6 @@ void write_u32(const SlotHandle& s, uint32_t v) {
     std::memcpy(s.contents(), &v, sizeof(v));
 }
 
-void zero_slot(const SlotHandle& s) {
-    if (s.contents() && s.size) std::memset(s.contents(), 0, s.size);
-}
-
-// Zero one [off, off+len) byte window of a slot (a single slot's GDN-state slab region).
-void zero_slot_region(const SlotHandle& s, size_t off, size_t len) {
-    if (s.contents() && off + len <= s.size)
-        std::memset(static_cast<char*>(s.contents()) + off, 0, len);
-}
-
-// Copy one [off, off+len) byte window from `src`'s contents to the SAME window in a
-// DIFFERENT SlotHandle `dst` (used when growing the KV pool into a new, bigger standalone
-// buffer — old and new pages share the SAME byte offset, just a different backing buffer).
-bool copy_between_slots(const SlotHandle& dst, const SlotHandle& src, size_t off, size_t len) {
-    if (!dst.contents() || !src.contents()) return false;
-    if (off + len > dst.size || off + len > src.size) return false;
-    std::memcpy(static_cast<char*>(dst.contents()) + off,
-               static_cast<const char*>(src.contents()) + off, len);
-    return true;
-}
-
-// Copy one [src_off, src_off+len) byte window from `s` to [dst_off, dst_off+len) of the
-// SAME SlotHandle `s` (a single slot's GDN-state slab region — different slot OFFSETS
-// within one shared per-layer buffer). Returns false if either window is out of range (a
-// no-op, never a partial/garbage copy).
-bool copy_slot_region(const SlotHandle& s, size_t src_off, size_t dst_off, size_t len) {
-    if (!s.contents() || src_off + len > s.size || dst_off + len > s.size) return false;
-    if (src_off == dst_off || len == 0) return true;  // no-op
-    std::memcpy(static_cast<char*>(s.contents()) + dst_off,
-               static_cast<const char*>(s.contents()) + src_off, len);
-    return true;
-}
-
 }  // namespace
 
 bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& kernels_dir,
@@ -664,12 +641,18 @@ bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& 
     const size_t consts_budget = decode_consts_budget(dag_) +
                                  (mb_dag_.empty() ? 0 : decode_consts_budget(mb_dag_)) +
                                  prefill_consts_budget;
-    const size_t heap_bytes = plan_.total + consts_budget
-                            + size_t(std::max({sched_.colors_used, mb_sched_.colors_used,
-                                               prefill_sched_.colors_used})) *
-                                  plan_.scratch_slot_bytes + (32u << 20);
+    const size_t scratch_pool_bytes =
+        size_t(std::max({sched_.colors_used, mb_sched_.colors_used,
+                         prefill_sched_.colors_used})) *
+        plan_.scratch_slot_bytes;
+    const size_t heap_bytes =
+        plan_.weights_bytes + plan_.io_bytes + plan_.mb_io_bytes +
+        consts_budget + (32u << 20);
+    const size_t elastic_budget =
+        plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
+        plan_.kv_pool_bytes + scratch_pool_bytes;
 
-    ctx_ = RawMetalContext::create(heap_bytes);
+    ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
     if (!ctx_) {
         if (err) *err = "RawMetalContext::create failed";
         return false;
@@ -683,7 +666,7 @@ bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& 
     pool_.resize(std::max({sched_.colors_used, mb_sched_.colors_used,
                            prefill_sched_.colors_used}));
     for (size_t i = 0; i < pool_.size(); ++i)
-        pool_[i] = ctx_->heap_alloc(plan_.scratch_slot_bytes);
+        pool_[i] = ctx_->create_elastic_buffer(plan_.scratch_slot_bytes);
     bind_scratch(*ctx_, dag_, sched_, pool_.data(), int(pool_.size()));
 
     // ── Geometry const-params. ──
@@ -733,13 +716,21 @@ bool MetalExecutor::Impl::setup(const std::string& ckpt_dir, const std::string& 
 
 void MetalExecutor::Impl::reset_state() {
     for (auto& gs : b_.gdn) {
-        zero_slot(gs.conv_state);
-        zero_slot(gs.conv_state_out);
-        zero_slot(gs.recurrent_state);
+        ctx_->ensure_elastic_buffer(gs.conv_state, gs.conv_state.size);
+        ctx_->ensure_elastic_buffer(gs.conv_state_out, gs.conv_state_out.size);
+        ctx_->ensure_elastic_buffer(
+            gs.recurrent_state, gs.recurrent_state.size);
+        ctx_->zero_buffer_range(gs.conv_state, 0, gs.conv_state.size);
+        ctx_->zero_buffer_range(
+            gs.conv_state_out, 0, gs.conv_state_out.size);
+        ctx_->zero_buffer_range(
+            gs.recurrent_state, 0, gs.recurrent_state.size);
     }
     for (auto& ks : b_.kv) {
-        zero_slot(ks.k_pages);
-        zero_slot(ks.v_pages);
+        ctx_->ensure_elastic_buffer(ks.k_pages, ks.k_pages.size);
+        ctx_->ensure_elastic_buffer(ks.v_pages, ks.v_pages.size);
+        ctx_->zero_buffer_range(ks.k_pages, 0, ks.k_pages.size);
+        ctx_->zero_buffer_range(ks.v_pages, 0, ks.v_pages.size);
     }
     linear_state_slots_.reset_all();
 }
@@ -757,9 +748,18 @@ void MetalExecutor::Impl::reset_state(uint32_t slot) {
     const size_t conv_off  = size_t(slot) * conv_stride;
     const size_t recur_off = size_t(slot) * recur_stride;
     for (auto& gs : b_.gdn) {
-        zero_slot_region(gs.conv_state, conv_off, conv_stride);
-        zero_slot_region(gs.conv_state_out, conv_off, conv_stride);
-        zero_slot_region(gs.recurrent_state, recur_off, recur_stride);
+        ctx_->ensure_elastic_buffer(
+            gs.conv_state, conv_off + conv_stride);
+        ctx_->ensure_elastic_buffer(
+            gs.conv_state_out, conv_off + conv_stride);
+        ctx_->ensure_elastic_buffer(
+            gs.recurrent_state, recur_off + recur_stride);
+        ctx_->zero_buffer_range(
+            gs.conv_state, conv_off, conv_stride);
+        ctx_->zero_buffer_range(
+            gs.conv_state_out, conv_off, conv_stride);
+        ctx_->zero_buffer_range(
+            gs.recurrent_state, recur_off, recur_stride);
     }
     linear_state_slots_.reset(slot);
 }
@@ -795,9 +795,23 @@ bool MetalExecutor::Impl::copy_state_slot(uint32_t src_slot, uint32_t dst_slot, 
     int gdn_layers_copied = 0;
     for (auto& gs : b_.gdn) {
         if (!gs.conv_state.valid()) continue;  // a full-attn layer's unused slot
-        const bool ok = copy_slot_region(gs.conv_state, src_conv_off, dst_conv_off, conv_stride) &&
-                        copy_slot_region(gs.conv_state_out, src_conv_off, dst_conv_off, conv_stride) &&
-                        copy_slot_region(gs.recurrent_state, src_recur_off, dst_recur_off, recur_stride);
+        const size_t conv_extent =
+            std::max(src_conv_off, dst_conv_off) + conv_stride;
+        const size_t recur_extent =
+            std::max(src_recur_off, dst_recur_off) + recur_stride;
+        const bool ok =
+            ctx_->ensure_elastic_buffer(gs.conv_state, conv_extent) &&
+            ctx_->ensure_elastic_buffer(gs.conv_state_out, conv_extent) &&
+            ctx_->ensure_elastic_buffer(gs.recurrent_state, recur_extent) &&
+            ctx_->copy_buffer_range(
+                gs.conv_state, dst_conv_off,
+                gs.conv_state, src_conv_off, conv_stride) &&
+            ctx_->copy_buffer_range(
+                gs.conv_state_out, dst_conv_off,
+                gs.conv_state_out, src_conv_off, conv_stride) &&
+            ctx_->copy_buffer_range(
+                gs.recurrent_state, dst_recur_off,
+                gs.recurrent_state, src_recur_off, recur_stride);
         if (!ok) {
             if (err) *err = "MetalExecutor::Impl::copy_state_slot: internal bounds check failed";
             return false;
@@ -833,6 +847,82 @@ uint64_t MetalExecutor::Impl::rs_slot_bytes() const {
     return total;
 }
 
+bool MetalExecutor::Impl::ensure_elastic_storage(
+    std::uint32_t kv_pages,
+    std::uint32_t state_slots,
+    std::uint32_t token_rows,
+    std::uint32_t ring_tokens,
+    std::string* err) {
+    auto ensure = [&](const SlotHandle& slot, size_t bytes) {
+        if (!slot.valid() || !slot.elastic) return true;
+        if (ctx_->ensure_elastic_buffer(slot, std::min(bytes, slot.size))) {
+            return true;
+        }
+        if (err != nullptr) {
+            *err = "Metal elastic physical budget exhausted";
+        }
+        return false;
+    };
+
+    if (ring_tokens != 0) {
+        for (const auto& layer : b_.kv) {
+            if (!layer.k_pages.valid()) continue;
+            const size_t bytes =
+                layer.k_pages.size *
+                std::min<std::uint32_t>(ring_tokens, max_ctx_) /
+                size_t(max_ctx_);
+            if (!ensure(layer.k_pages, bytes) ||
+                !ensure(layer.v_pages, bytes)) {
+                return false;
+            }
+        }
+    }
+    if (kv_pool_.enabled && kv_pages != 0) {
+        const size_t page_bytes =
+            size_t(kv_pool_.page_size) *
+            size_t(g_.n_kv_heads) * size_t(g_.head_dim) * 2u;
+        const size_t bytes = size_t(kv_pages) * page_bytes;
+        for (const auto& layer : kv_pool_.layers) {
+            if (!layer.k_pages.valid()) continue;
+            if (!ensure(layer.k_pages, bytes) ||
+                !ensure(layer.v_pages, bytes)) {
+                return false;
+            }
+        }
+    }
+    if (state_slots != 0) {
+        const size_t conv_bytes =
+            size_t(state_slots) * g_.gdn_conv_stride_bytes();
+        const size_t recurrent_bytes =
+            size_t(state_slots) * g_.gdn_recurrent_stride_bytes();
+        for (const auto& layer : b_.gdn) {
+            if (!layer.conv_state.valid()) continue;
+            if (!ensure(layer.conv_state, conv_bytes) ||
+                !ensure(layer.conv_state_out, conv_bytes) ||
+                !ensure(layer.recurrent_state, recurrent_bytes)) {
+                return false;
+            }
+        }
+    }
+    const std::uint32_t rows = std::max<std::uint32_t>(1, token_rows);
+    const std::uint32_t capacity =
+        std::max<std::uint32_t>(1, g_.max_tokens);
+    for (const auto& slot : pool_) {
+        const size_t bytes =
+            (slot.size * std::min(rows, capacity) + capacity - 1) /
+            capacity;
+        if (!ensure(slot, bytes)) return false;
+    }
+    for (const auto& slot : b_.scratch) {
+        if (!slot.valid()) continue;
+        const size_t bytes =
+            (slot.size * std::min(rows, capacity) + capacity - 1) /
+            capacity;
+        if (!ensure(slot, bytes)) return false;
+    }
+    return true;
+}
+
 namespace {
 // One NHD paged-pool row's byte size: [n_kv_heads, head_dim], bf16 (matches the M=1
 // ring's activation dtype — kv_append.metal/kv_append_paged.metal both instantiate bf16).
@@ -844,8 +934,8 @@ size_t kv_pool_row_bytes(const DecodeGeometry& g) {
 bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size, std::string* err) {
     auto release_pool = [&](KvPagePool& candidate) {
         for (auto& layer : candidate.layers) {
-            if (layer.k_pages.valid()) ctx_->release_standalone_buffer(layer.k_pages);
-            if (layer.v_pages.valid()) ctx_->release_standalone_buffer(layer.v_pages);
+            if (layer.k_pages.valid()) ctx_->release_elastic_buffer(layer.k_pages);
+            if (layer.v_pages.valid()) ctx_->release_elastic_buffer(layer.v_pages);
         }
         candidate = {};
     };
@@ -883,11 +973,14 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
     pool.layers.resize(size_t(g_.n_layers));
     for (int L = 0; L < g_.n_layers; ++L) {
         if (!DecodeGeometry::is_full_attn(L)) continue;
-        pool.layers[size_t(L)].k_pages = ctx_->create_standalone_buffer(layer_bytes);
-        pool.layers[size_t(L)].v_pages = ctx_->create_standalone_buffer(layer_bytes);
+        const size_t initial = std::min(layer_bytes, size_t{2} << 20);
+        pool.layers[size_t(L)].k_pages =
+            ctx_->create_elastic_buffer(layer_bytes, initial);
+        pool.layers[size_t(L)].v_pages =
+            ctx_->create_elastic_buffer(layer_bytes, initial);
         if (!pool.layers[size_t(L)].k_pages.valid() || !pool.layers[size_t(L)].v_pages.valid()) {
             if (err) {
-                *err = "MetalExecutor::Impl::setup_kv_pool: standalone buffer allocation failed "
+                *err = "MetalExecutor::Impl::setup_kv_pool: sparse arena allocation failed "
                        "(layer " + std::to_string(L) + ", " + std::to_string(layer_bytes) +
                        " bytes/buffer)";
             }
@@ -896,6 +989,7 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
         }
     }
     pool.total_pages = total_pages;
+    pool.capacity_pages = total_pages;
     pool.page_size = page_size;
     pool.enabled = true;
     const std::uint64_t generation = paged_bind_generation_;
@@ -982,6 +1076,15 @@ bool MetalExecutor::Impl::copy_kv_pages(const std::vector<uint32_t>& src_pages,
             return false;
         }
     }
+    if (!src_pages.empty()) {
+        const std::uint32_t highest = std::max(
+            *std::max_element(src_pages.begin(), src_pages.end()),
+            *std::max_element(dst_pages.begin(), dst_pages.end()));
+        if (!ensure_elastic_storage(
+                highest + 1, 0, 0, 0, err)) {
+            return false;
+        }
+    }
     const size_t page_bytes = size_t(kv_pool_.page_size) * kv_pool_row_bytes(g_);
     // NOTE: copies within one call are applied in the given order; a chain like
     // {1->0, 2->1} reads page 1 for the second copy AFTER the first already
@@ -994,8 +1097,12 @@ bool MetalExecutor::Impl::copy_kv_pages(const std::vector<uint32_t>& src_pages,
         for (size_t i = 0; i < src_pages.size(); ++i) {
             const size_t src_off = size_t(src_pages[i]) * page_bytes;
             const size_t dst_off = size_t(dst_pages[i]) * page_bytes;
-            if (!copy_slot_region(lp.k_pages, src_off, dst_off, page_bytes) ||
-                !copy_slot_region(lp.v_pages, src_off, dst_off, page_bytes)) {
+            if (!ctx_->copy_buffer_range(
+                    lp.k_pages, dst_off,
+                    lp.k_pages, src_off, page_bytes) ||
+                !ctx_->copy_buffer_range(
+                    lp.v_pages, dst_off,
+                    lp.v_pages, src_off, page_bytes)) {
                 if (err) *err = "MetalExecutor::Impl::copy_kv_pages: internal bounds check failed";
                 return false;
             }
@@ -1020,6 +1127,18 @@ bool MetalExecutor::Impl::copy_kv_cells(const std::vector<KvMoveCell>& cells, st
             return false;
         }
     }
+    if (!cells.empty()) {
+        std::uint32_t highest = 0;
+        for (const auto& cell : cells) {
+            highest = std::max(
+                highest,
+                std::max(cell.src_page_id, cell.dst_page_id));
+        }
+        if (!ensure_elastic_storage(
+                highest + 1, 0, 0, 0, err)) {
+            return false;
+        }
+    }
     const size_t row_bytes = kv_pool_row_bytes(g_);
     const size_t page_bytes = size_t(kv_pool_.page_size) * row_bytes;
     for (int L = 0; L < g_.n_layers; ++L) {
@@ -1030,8 +1149,12 @@ bool MetalExecutor::Impl::copy_kv_cells(const std::vector<KvMoveCell>& cells, st
                                    size_t(c.src_token_offset) * row_bytes;
             const size_t dst_off = size_t(c.dst_page_id) * page_bytes +
                                    size_t(c.dst_token_offset) * row_bytes;
-            if (!copy_slot_region(lp.k_pages, src_off, dst_off, row_bytes) ||
-                !copy_slot_region(lp.v_pages, src_off, dst_off, row_bytes)) {
+            if (!ctx_->copy_buffer_range(
+                    lp.k_pages, dst_off,
+                    lp.k_pages, src_off, row_bytes) ||
+                !ctx_->copy_buffer_range(
+                    lp.v_pages, dst_off,
+                    lp.v_pages, src_off, row_bytes)) {
                 if (err) *err = "MetalExecutor::Impl::copy_kv_cells: internal bounds check failed";
                 return false;
             }
@@ -1058,7 +1181,8 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
         if (err) *err = "MetalExecutor::Impl::resize_kv_pool: resize to 0 pages is not supported";
         return false;
     }
-    if (!paged_pool_size_supported(g_, new_total_pages)) {
+    if (!paged_pool_size_supported(g_, new_total_pages) ||
+        new_total_pages > kv_pool_.capacity_pages) {
         if (err) {
             *err =
                 "MetalExecutor::Impl::resize_kv_pool: growth exceeds the "
@@ -1075,65 +1199,71 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
         }
         return false;
     }
-    auto release_pool = [&](KvPagePool& candidate) {
-        for (auto& layer : candidate.layers) {
-            if (layer.k_pages.valid()) ctx_->release_standalone_buffer(layer.k_pages);
-            if (layer.v_pages.valid()) ctx_->release_standalone_buffer(layer.v_pages);
-        }
-        candidate = {};
-    };
     const size_t row_bytes = kv_pool_row_bytes(g_);
-    const size_t new_layer_bytes =
+    const size_t committed_bytes =
         size_t(new_total_pages) * size_t(kv_pool_.page_size) * row_bytes;
-    const size_t copy_pages = std::min<uint32_t>(new_total_pages, kv_pool_.total_pages);
-    const size_t copy_bytes = size_t(copy_pages) * size_t(kv_pool_.page_size) * row_bytes;
-    KvPagePool new_pool;
-    new_pool.layers.resize(size_t(g_.n_layers));
     for (int L = 0; L < g_.n_layers; ++L) {
         if (!DecodeGeometry::is_full_attn(L)) continue;
-        SlotHandle new_k = ctx_->create_standalone_buffer(new_layer_bytes);
-        SlotHandle new_v = ctx_->create_standalone_buffer(new_layer_bytes);
-        if (!new_k.valid() || !new_v.valid()) {
-            if (err) *err = "MetalExecutor::Impl::resize_kv_pool: new buffer allocation failed";
-            if (new_k.valid()) ctx_->release_standalone_buffer(new_k);
-            if (new_v.valid()) ctx_->release_standalone_buffer(new_v);
-            release_pool(new_pool);
+        auto& layer = kv_pool_.layers[size_t(L)];
+        if (!ctx_->ensure_elastic_buffer(layer.k_pages, committed_bytes) ||
+            !ctx_->ensure_elastic_buffer(layer.v_pages, committed_bytes)) {
+            if (err) {
+                *err =
+                    "MetalExecutor::Impl::resize_kv_pool: shared elastic "
+                    "budget exhausted";
+            }
             return false;
         }
-        if (copy_bytes > 0) {
-            const auto& old_lp = kv_pool_.layers[size_t(L)];
-            if (!copy_between_slots(new_k, old_lp.k_pages, 0, copy_bytes) ||
-                !copy_between_slots(new_v, old_lp.v_pages, 0, copy_bytes)) {
-                if (err) *err = "MetalExecutor::Impl::resize_kv_pool: page-preserving copy failed";
-                ctx_->release_standalone_buffer(new_k);
-                ctx_->release_standalone_buffer(new_v);
-                release_pool(new_pool);
-                return false;
-            }
-        }
-        new_pool.layers[size_t(L)].k_pages = new_k;
-        new_pool.layers[size_t(L)].v_pages = new_v;
+        ctx_->trim_elastic_buffer(layer.k_pages, committed_bytes);
+        ctx_->trim_elastic_buffer(layer.v_pages, committed_bytes);
     }
-    new_pool.total_pages = new_total_pages;
-    new_pool.page_size = kv_pool_.page_size;
-    new_pool.enabled = true;
-    const std::uint64_t generation = paged_bind_generation_;
-    const bool was_bound = mb_bound_;
-    KvPagePool old_pool = std::move(kv_pool_);
-    kv_pool_ = std::move(new_pool);
-    if (!bind_paged_dag(err)) {
-        KvPagePool failed = std::move(kv_pool_);
-        kv_pool_ = std::move(old_pool);
-        mb_bound_ = was_bound;
-        std::string restore_error;
-        if (!bind_paged_dag(&restore_error) && err != nullptr) {
-            *err += "; restore failed: " + restore_error;
+    return true;
+}
+
+bool MetalExecutor::Impl::resize_elastic_pool(
+    std::uint64_t pool_id,
+    std::uint64_t target_pages,
+    std::string* err) {
+    std::vector<SlotHandle> slots;
+    if (pool_id == 1) {
+        for (const auto& layer : b_.gdn) {
+            if (!layer.conv_state.valid()) continue;
+            slots.push_back(layer.conv_state);
+            slots.push_back(layer.conv_state_out);
+            slots.push_back(layer.recurrent_state);
         }
-        paged_bind_generation_ = generation;
-        release_pool(failed);
+    } else if (pool_id == 2) {
+        slots.insert(slots.end(), pool_.begin(), pool_.end());
+        for (const auto& slot : b_.scratch) {
+            if (slot.valid()) slots.push_back(slot);
+        }
+    } else {
+        if (err != nullptr) *err = "unknown elastic pool id";
         return false;
     }
-    release_pool(old_pool);
+    size_t capacity = 0;
+    for (const auto& slot : slots) capacity += slot.size;
+    const std::uint64_t page_bytes = ctx_->elastic_page_bytes();
+    const std::uint64_t capacity_pages =
+        page_bytes == 0
+            ? 0
+            : (capacity + page_bytes - 1) / page_bytes;
+    const std::uint64_t requested =
+        std::min(target_pages, capacity_pages) * page_bytes;
+    const size_t target = static_cast<size_t>(
+        std::min<std::uint64_t>(requested, capacity));
+    for (const auto& slot : slots) {
+        const size_t bytes = capacity == 0
+            ? 0
+            : (slot.size * target + capacity - 1) / capacity;
+        if (!ctx_->ensure_elastic_buffer(slot, bytes) ||
+            !ctx_->trim_elastic_buffer(slot, bytes)) {
+            if (err != nullptr) {
+                *err = "elastic pool resize exceeded the shared budget";
+            }
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1142,6 +1272,15 @@ StepTiming MetalExecutor::Impl::step(
     uint32_t position,
     uint32_t slot,
     const PtirCommandCallbacks* ptir) {
+    std::string commit_error;
+    if (!ensure_elastic_storage(
+            0,
+            slot + 1,
+            1,
+            position + 1,
+            &commit_error)) {
+        throw std::runtime_error(commit_error);
+    }
     write_u32(b_.io[int(IoSlot::TokenId)],  token_id);
     write_u32(b_.io[int(IoSlot::Position)], position);
     write_u32(b_.io[int(IoSlot::SeqLen)],   position + 1u);
@@ -1223,6 +1362,34 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     if (!validate_paged_batch_capacity(schedule, uint32_t(g_.max_tokens),
                                        uint32_t(g_.max_requests), &capacity_err))
         return fail(capacity_err);
+    std::uint32_t highest_page = 0;
+    if (!in.kv_page_indices.empty()) {
+        highest_page = std::max(
+            highest_page,
+            *std::max_element(
+                in.kv_page_indices.begin(),
+                in.kv_page_indices.end()));
+    }
+    if (!in.w_page.empty()) {
+        highest_page = std::max(
+            highest_page,
+            *std::max_element(in.w_page.begin(), in.w_page.end()));
+    }
+    const std::uint32_t highest_slot =
+        in.rs_slot_ids.empty()
+            ? 0
+            : *std::max_element(
+                  in.rs_slot_ids.begin(),
+                  in.rs_slot_ids.end());
+    std::string commit_error;
+    if (!ensure_elastic_storage(
+            highest_page + 1,
+            highest_slot + 1,
+            static_cast<std::uint32_t>(schedule.N),
+            0,
+            &commit_error)) {
+        return fail(commit_error);
+    }
     if (in.token_ids.size() != size_t(schedule.N) || in.position_ids.size() != size_t(schedule.N) ||
         in.qo_indptr.size() != size_t(schedule.R + 1) ||
         in.kv_page_indptr.size() != size_t(schedule.R + 1) ||
@@ -1332,8 +1499,10 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         // copy C -> A (different handles, same offset).
         for (auto& gs : b_.gdn) {
             if (!gs.conv_state.valid() ||
-                !copy_between_slots(gs.conv_state, gs.conv_state_out, off,
-                                    g_.gdn_conv_stride_bytes()))
+                !ctx_->copy_buffer_range(
+                    gs.conv_state, off,
+                    gs.conv_state_out, off,
+                    g_.gdn_conv_stride_bytes()))
                 return fail("failed to normalize GDN ping-pong state");
         }
     }
@@ -1358,8 +1527,10 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
         for (auto& gs : b_.gdn) {
             if (!gs.conv_state.valid() ||
-                !copy_between_slots(gs.conv_state, gs.conv_state_out, off,
-                                    g_.gdn_conv_stride_bytes()))
+                !ctx_->copy_buffer_range(
+                    gs.conv_state, off,
+                    gs.conv_state_out, off,
+                    g_.gdn_conv_stride_bytes()))
                 return fail("failed to commit GDN ping-pong state");
         }
     }
@@ -1726,6 +1897,18 @@ std::uint64_t MetalExecutor::rs_slot_bytes() const {
     return ready() ? impl_->rs_slot_bytes() : 0u;
 }
 
+std::uint64_t MetalExecutor::elastic_page_bytes() const {
+    return ready() ? impl_->ctx_->elastic_page_bytes() : 0u;
+}
+
+std::uint64_t MetalExecutor::elastic_budget_pages() const {
+    return ready() ? impl_->ctx_->elastic_budget_pages() : 0u;
+}
+
+std::uint64_t MetalExecutor::elastic_committed_pages() const {
+    return ready() ? impl_->ctx_->elastic_committed_pages() : 0u;
+}
+
 std::uint32_t MetalExecutor::kv_pool_total_pages() const {
     return ready() && impl_->kv_pool().enabled ? impl_->kv_pool().total_pages : 0u;
 }
@@ -1763,6 +1946,14 @@ bool MetalExecutor::resize_kv_pool(std::uint32_t new_total_pages, bool unmapped_
         return false;
     }
     return impl_->resize_kv_pool(new_total_pages, unmapped_tail_pages, err);
+}
+
+bool MetalExecutor::resize_elastic_pool(
+    std::uint64_t pool_id,
+    std::uint64_t target_pages,
+    std::string* err) {
+    return ready() &&
+        impl_->resize_elastic_pool(pool_id, target_pages, err);
 }
 
 bool MetalExecutor::copy_state(std::uint32_t src_slot, std::uint32_t dst_slot, std::string* err) {
@@ -2388,6 +2579,9 @@ std::uint32_t MetalExecutor::vocab() const { return 0; }
 std::uint32_t MetalExecutor::rs_slots() const { return 0; }
 
 std::uint64_t MetalExecutor::rs_slot_bytes() const { return 0; }
+std::uint64_t MetalExecutor::elastic_page_bytes() const { return 0; }
+std::uint64_t MetalExecutor::elastic_budget_pages() const { return 0; }
+std::uint64_t MetalExecutor::elastic_committed_pages() const { return 0; }
 
 bool MetalExecutor::copy_state(std::uint32_t, std::uint32_t, std::string* err) {
     if (err != nullptr) *err = "Metal executor requires an Apple build";
@@ -2409,6 +2603,13 @@ bool MetalExecutor::copy_kv_cells(const std::vector<KvMoveCell>&, std::string* e
 }
 
 bool MetalExecutor::resize_kv_pool(std::uint32_t, bool, std::string* err) {
+    if (err != nullptr) *err = "Metal executor requires an Apple build";
+    return false;
+}
+bool MetalExecutor::resize_elastic_pool(
+    std::uint64_t,
+    std::uint64_t,
+    std::string* err) {
     if (err != nullptr) *err = "Metal executor requires an Apple build";
     return false;
 }

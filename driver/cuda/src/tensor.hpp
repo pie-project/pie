@@ -82,6 +82,15 @@ inline const char* dtype_name(DType d) {
 DType dtype_from_safetensors(const std::string& s);
 
 using DeviceTensorMemoryCallback = void (*)(void* context);
+using DeviceMemoryAllocateCallback = void* (*)(
+    void* context,
+    std::size_t bytes,
+    std::size_t alignment);
+
+struct DeviceMemoryAllocatorBinding {
+    DeviceMemoryAllocateCallback allocate = nullptr;
+    void* context = nullptr;
+};
 
 // Thread-local hook used by the loader to capture CUDA memory high-water
 // during materialization, including transient transform scratch allocated
@@ -89,6 +98,20 @@ using DeviceTensorMemoryCallback = void (*)(void* context);
 void set_device_tensor_memory_callback(
     DeviceTensorMemoryCallback callback,
     void* context) noexcept;
+
+DeviceMemoryAllocatorBinding set_device_memory_allocator(
+    DeviceMemoryAllocateCallback allocate,
+    void* context) noexcept;
+
+struct DeviceMemoryBlock {
+    void* ptr = nullptr;
+    bool arena_owned = false;
+};
+
+DeviceMemoryBlock allocate_device_memory(
+    std::size_t bytes,
+    std::size_t alignment = 256);
+void free_device_memory(DeviceMemoryBlock block) noexcept;
 
 class DeviceTensor {
 public:
@@ -113,11 +136,13 @@ public:
           shape_(std::move(other.shape_)),
           numel_(other.numel_),
           nbytes_(other.nbytes_),
-          owns_memory_(other.owns_memory_) {
+          owns_memory_(other.owns_memory_),
+          arena_owned_(other.arena_owned_) {
         other.ptr_ = nullptr;
         other.numel_ = 0;
         other.nbytes_ = 0;
         other.owns_memory_ = false;
+        other.arena_owned_ = false;
     }
 
     DeviceTensor& operator=(DeviceTensor&& other) noexcept {
@@ -129,10 +154,12 @@ public:
             numel_ = other.numel_;
             nbytes_ = other.nbytes_;
             owns_memory_ = other.owns_memory_;
+            arena_owned_ = other.arena_owned_;
             other.ptr_ = nullptr;
             other.numel_ = 0;
             other.nbytes_ = 0;
             other.owns_memory_ = false;
+            other.arena_owned_ = false;
         }
         return *this;
     }
@@ -161,6 +188,7 @@ private:
     // True for `allocate`d tensors (own + free on destruct), false for
     // non-owning views (`view(...)`). Move semantics propagate ownership.
     bool owns_memory_ = false;
+    bool arena_owned_ = false;
 };
 
 }  // namespace pie_cuda_driver

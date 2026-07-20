@@ -15,6 +15,7 @@ struct KvPagePool {
 
     std::vector<LayerPages> layers;
     std::uint32_t total_pages = 0;
+    std::uint32_t capacity_pages = 0;
     std::uint32_t page_size = 0;
     bool enabled = false;
 };

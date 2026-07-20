@@ -288,6 +288,8 @@ impl DummyDriver {
                 rs_cache_required: false,
                 rs_cache_slots: 0,
                 rs_cache_slot_bytes: 0,
+                elastic_page_bytes: 0,
+                elastic_budget_pages: 0,
                 has_mtp_logits: options.has_mtp_logits,
                 has_mtp_drafts: options.has_mtp_drafts,
                 has_value_head: options.has_value_head,

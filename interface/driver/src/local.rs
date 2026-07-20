@@ -92,6 +92,9 @@ pub const PIE_MEMORY_DOMAIN_ROCM_DEVICE: PieMemoryDomain = 2;
 pub const PIE_MEMORY_DOMAIN_METAL_SHARED: PieMemoryDomain = 3;
 /// Metal private device memory.
 pub const PIE_MEMORY_DOMAIN_METAL_PRIVATE: PieMemoryDomain = 4;
+pub const PIE_ELASTIC_POOL_KV: u64 = 0;
+pub const PIE_ELASTIC_POOL_STATE: u64 = 1;
+pub const PIE_ELASTIC_POOL_WORKSPACE: u64 = 2;
 
 /// Opaque embedded-driver handle.
 pub type PieDriver = c_void;

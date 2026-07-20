@@ -324,6 +324,7 @@ add_library(pie_driver_cuda_lib STATIC
   # store/ -- long-lived device memory pools
   src/store/kv_cache.cpp
   src/store/kv_cache_format.cpp
+  src/store/elastic.cpp
   src/store/memory_planner.cpp
   src/store/recurrent_state_cache.cpp
   src/store/swap_pool.cpp
@@ -633,22 +634,32 @@ pie_add_cuda_target(test_driver_common
   LIBS nlohmann_json::nlohmann_json)
 pie_add_cuda_target(test_kv_cache_format
   SOURCES tests/test_kv_cache_format.cpp src/store/kv_cache_format.cpp)
+pie_add_cuda_target(test_elastic
+  SOURCES tests/test_elastic.cpp src/tensor.cpp src/store/elastic.cpp
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  LIBS CUDA::cudart CUDA::cuda_driver)
 pie_add_cuda_target(test_kv_cache_quant
   SOURCES
     tests/test_kv_cache_quant.cu
     src/tensor.cpp
+    src/store/elastic.cpp
     src/store/kv_cache.cpp
     src/store/kv_cache_format.cpp
     src/kernels/kv_paged.cu
-  LIBS CUDA::cudart)
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  LIBS CUDA::cudart CUDA::cuda_driver)
 pie_add_cuda_target(test_swap_pool
   SOURCES
     tests/test_swap_pool.cpp
     src/tensor.cpp
+    src/store/elastic.cpp
     src/store/kv_cache.cpp
     src/store/kv_cache_format.cpp
     src/store/swap_pool.cpp
-  LIBS CUDA::cudart)
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  LIBS CUDA::cudart CUDA::cuda_driver)
 pie_add_cuda_target(test_mxfp4_marlin
   SOURCES tests/test_mxfp4_marlin.cu src/kernels/mxfp4_marlin.cu
   LIBS CUDA::cudart)

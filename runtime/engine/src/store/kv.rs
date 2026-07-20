@@ -1450,6 +1450,10 @@ impl KvStore {
         self.pool.available()
     }
 
+    pub fn committed_high_water_pages(&self) -> u32 {
+        self.pool.highest_in_use_exclusive()
+    }
+
     pub fn capacity_pages(&self) -> u32 {
         self.pool.capacity()
     }
