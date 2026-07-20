@@ -29,6 +29,6 @@ rsa = { version = "0.9", default-features = false, features = ["pem", "sha2"] }
 ssh-key = { version = "0.6", features = ["rsa", "ed25519", "ecdsa"] }
 pem = "3.0"
 p256 = { version = "0.13", features = ["pkcs8"] }
-p384 = { version = "0.13", features = ["pkcs8"] }
+p384 = { version = "0.14", features = ["pkcs8"] }
 base64 = "0.22"
 regex = "1"
