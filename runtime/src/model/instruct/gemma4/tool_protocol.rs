@@ -503,31 +503,14 @@ pub(super) fn declaration_block(tool: &ValidatedTool) -> String {
     format!("{TOOL_OPEN}{}{TOOL_CLOSE}", tool.declaration)
 }
 
-/// Render a tool result, or refuse it.
-///
-/// The template defaults a missing name to `unknown` rather than dropping the
-/// block, so the model always sees a well-formed response.
-///
-/// `value` is tool output — fetched pages, command results, whatever the tool
-/// returned — which makes it the most reachable string in the protocol for a
-/// party who does not control the prompt. It is interpolated into the same
-/// unescapable DSL as everything else, so it routes through [`quote`]: a result
-/// carrying `<` would close the literal early and let the remainder be read as
-/// structure, forging a call or a turn. `name` is held to the declaration
-/// charset for the same reason it is there.
-///
-/// Returning `None` rather than a lossy rendering is what lets the caller fail
-/// the turn instead of silently feeding the model a corrupted response.
 /// Render a tool result into its `<|tool_response>` block, or refuse.
 ///
-/// The tool result is the least-trusted string in the loop, so the whole
-/// response contract lives here, once. An empty name defaults to `unknown`, as
-/// the template does; any other name must be a supported tool identifier — the
-/// same charset the declaration holds — so a name carrying the DSL delimiter or
-/// whitespace cannot forge structure. The value is rendered through the DSL
-/// string rule ([`quote`]), which refuses the one delimiter the format has no
-/// escape for. Only a result that passes both is rendered; anything else is
-/// `None`, and the caller must decide how loudly to fail.
+/// The single point of the response contract. An empty name defaults to
+/// `unknown`; any other name must be a supported tool identifier, and the value
+/// routes through [`quote`]. Both reject the `<` delimiter the format cannot
+/// escape, so untrusted tool output cannot close a literal early and forge a
+/// call or a turn. `None` lets the caller fail the turn rather than feed the
+/// model a corrupted response.
 pub(super) fn response_block(name: &str, value: &str) -> Option<String> {
     let name = if name.is_empty() { "unknown" } else { name };
     if !is_supported_tool_name(name) {
