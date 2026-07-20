@@ -226,7 +226,7 @@ jobs:
         # node24 action that installs the full SDK (headers + import libs).
         # Replaces humbletim/install-vulkan-sdk (node20 + a transitive
         # actions/cache@v4) which warns under the Node-20 deprecation.
-        uses: jakoch/install-vulkan-sdk-action@v1.5.5
+        uses: jakoch/install-vulkan-sdk-action@v1.6.0
         with:
           cache: true
 
