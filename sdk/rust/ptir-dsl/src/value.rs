@@ -53,13 +53,6 @@ impl Tensor {
     pub fn shape(&self) -> Shape {
         self.ty().shape
     }
-
-    pub(crate) fn as_const_data(&self) -> Option<ConstData> {
-        match &self.inner {
-            TensorInner::Const(c) => Some(c.clone()),
-            TensorInner::Node { .. } => None,
-        }
-    }
 }
 
 /// A trace-known constant value: a typed scalar/vector immediate.

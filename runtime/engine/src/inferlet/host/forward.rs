@@ -2,14 +2,14 @@
 //! `HostForwardPass` impls over the pipeline-owned [`Channel`]/[`ForwardPass`]
 //! resource types (`crate::pipeline::channel`/`crate::pipeline::instance`).
 //!
-//! `forward-pass.new` binds + caches via [`crate::pipeline::program`] (the old
+//! `forward-pass.program` binds + caches via [`crate::pipeline::program`] (the old
 //! `register-program`, now an invisible compile/bind cache) and stamps the
 //! container's roles onto the guest-constructed channels. The run-ahead fire
 //! engine itself (`submit`'s body and FIFO finalization) lives in
 //! [`crate::pipeline::fire`]; this file's
 //! `HostForwardPass::submit` is a one-line delegation through the
 //! [`crate::pipeline::fire::FireContext`] trait (implemented for `ProcessCtx`
-//! below). `HostForwardPass::new` stays here (not `pipeline::fire`) because
+//! below). `HostForwardPass::program` stays here (not `pipeline::fire`) because
 //! it is fundamentally about validating and pushing the WIT resources
 //! (`Resource<Channel>` handles, the KV/RS working sets) into the component
 //! table — the WIT bind step, not the fire engine.
@@ -25,10 +25,12 @@ use crate::pipeline::channel::{BoundCells, ChannelCell, ChannelError};
 use crate::pipeline::fire::lease::DevGeo;
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
+use crate::pipeline::instance::{AttentionBinding, BoundForwardPass, EmbedBinding};
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::rs::working_set::RsWorkingSet;
 
-use pie_ptir::container::HostRole;
+use pie_ptir::container::{HostRole, PortSource, TraceContainer};
+use pie_ptir::registry::Port;
 
 use super::pie;
 
@@ -46,6 +48,56 @@ fn page_span(
         ));
     }
     Ok(crate::pipeline::instance::KvPageSpan { start, end })
+}
+
+fn validate_descriptor_bindings(
+    container: &TraceContainer,
+    channel_reps: &[u32],
+    expected: &[(Port, Option<u32>)],
+) -> Result<(), String> {
+    for &(port, expected_rep) in expected {
+        let binding = container.ports.iter().find(|binding| binding.port == port);
+        match (binding, expected_rep) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(format!(
+                    "pipeline: attached {} channel is absent from the traced program",
+                    port.name()
+                ));
+            }
+            (Some(_), None) => {
+                return Err(format!(
+                    "pipeline: traced program binds {} without a resource attachment",
+                    port.name()
+                ));
+            }
+            (Some(binding), Some(expected_rep)) => {
+                let PortSource::Channel(dense) = &binding.source else {
+                    return Err(format!(
+                        "pipeline: descriptor port {} must be channel-bound",
+                        port.name()
+                    ));
+                };
+                let actual_rep = channel_reps.get(*dense as usize).ok_or_else(|| {
+                    format!(
+                        "pipeline: descriptor port {} references missing channel {}",
+                        port.name(),
+                        dense
+                    )
+                })?;
+                if *actual_rep != expected_rep {
+                    return Err(format!(
+                        "pipeline: descriptor port {} uses channel resource {}, \
+                             attached resource is {}",
+                        port.name(),
+                        actual_rep,
+                        expected_rep
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -249,15 +301,144 @@ impl pie::inferlet::forward::HostChannelWithStore<ProcessCtx> for HasSelf<Proces
 }
 
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
-    async fn new(
+    async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
+        crate::inferlet::process::preemption::honor(self).await?;
+        Ok(self.ctx().table.push(ForwardPass::new())?)
+    }
+
+    async fn embed(
         &mut self,
-        container_bytes: Vec<u8>,
-        channels: Vec<Resource<Channel>>,
+        this: Resource<ForwardPass>,
+        tokens: Resource<Channel>,
+        indptr: Resource<Channel>,
+    ) -> Anyhow<Result<(), String>> {
+        let _ = self.ctx().table.get(&tokens)?;
+        let _ = self.ctx().table.get(&indptr)?;
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass.bindings.embed.is_some() {
+            return Ok(Err(
+                "forward pass embed binding is already attached".to_string()
+            ));
+        }
+        pass.bindings.embed = Some(EmbedBinding {
+            tokens: tokens.rep(),
+            indptr: indptr.rep(),
+        });
+        Ok(Ok(()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn attention(
+        &mut self,
+        this: Resource<ForwardPass>,
         kv_working_set: Resource<KvWorkingSet>,
         readable_pages: pie::inferlet::working_set::PageSpan,
         writable_pages: pie::inferlet::working_set::PageSpan,
-        rs_working_sets: Vec<Resource<RsWorkingSet>>,
-    ) -> Anyhow<Result<Resource<ForwardPass>, String>> {
+        kv_len: Resource<Channel>,
+        pages: Resource<Channel>,
+        page_indptr: Resource<Channel>,
+        w_slot: Resource<Channel>,
+        w_off: Resource<Channel>,
+        positions: Resource<Channel>,
+        mask: Option<Resource<Channel>>,
+    ) -> Anyhow<Result<(), String>> {
+        let readable = match page_span(readable_pages) {
+            Ok(span) => span,
+            Err(error) => return Ok(Err(error)),
+        };
+        let writable = match page_span(writable_pages) {
+            Ok(span) => span,
+            Err(error) => return Ok(Err(error)),
+        };
+        let _ = self.ctx().table.get(&kv_working_set)?;
+        for channel in [&kv_len, &pages, &page_indptr, &w_slot, &w_off, &positions] {
+            let _ = self.ctx().table.get(channel)?;
+        }
+        if let Some(mask) = mask.as_ref() {
+            let _ = self.ctx().table.get(mask)?;
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass.bindings.attention.is_some() {
+            return Ok(Err(
+                "forward pass attention binding is already attached".to_string()
+            ));
+        }
+        pass.bindings.attention = Some(AttentionBinding {
+            kv_ws: kv_working_set.rep(),
+            readable,
+            writable,
+            kv_len: kv_len.rep(),
+            pages: pages.rep(),
+            page_indptr: page_indptr.rep(),
+            w_slot: w_slot.rep(),
+            w_off: w_off.rep(),
+            positions: positions.rep(),
+            mask: mask.map(|resource| resource.rep()),
+        });
+        Ok(Ok(()))
+    }
+
+    async fn readout(
+        &mut self,
+        this: Resource<ForwardPass>,
+        indices: Resource<Channel>,
+    ) -> Anyhow<Result<(), String>> {
+        let _ = self.ctx().table.get(&indices)?;
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass.bindings.readout.is_some() {
+            return Ok(Err(
+                "forward pass readout binding is already attached".to_string()
+            ));
+        }
+        pass.bindings.readout = Some(indices.rep());
+        Ok(Ok(()))
+    }
+
+    async fn program(
+        &mut self,
+        this: Resource<ForwardPass>,
+        container_bytes: Vec<u8>,
+        channels: Vec<Resource<Channel>>,
+    ) -> Anyhow<Result<(), String>> {
+        let (embed, attention, readout, rs_working_sets) = {
+            let pass = self.ctx().table.get(&this)?;
+            if pass.is_bound() {
+                return Ok(Err("forward pass program is already attached".to_string()));
+            }
+            let Some(embed) = pass.bindings.embed else {
+                return Ok(Err(
+                    "forward pass embed binding must be attached before program".to_string(),
+                ));
+            };
+            let Some(attention) = pass.bindings.attention else {
+                return Ok(Err(
+                    "forward pass attention binding must be attached before program".to_string(),
+                ));
+            };
+            (
+                embed,
+                attention,
+                pass.bindings.readout,
+                pass.bindings
+                    .rs_ws
+                    .iter()
+                    .copied()
+                    .map(Resource::new_borrow)
+                    .collect::<Vec<Resource<RsWorkingSet>>>(),
+            )
+        };
+        let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
+        let readable_pages = attention.readable;
+        let writable_pages = attention.writable;
         let bind_timing = crate::scheduler::fire_timing_enabled()
             .then(|| (self.id(), crate::scheduler::fire_timing_now_us()));
         let mut bind_stages = [0u64; 5];
@@ -283,7 +464,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             crate::inferlet::process::ensure_execution_admitted(self).await;
 
             // Validate every handle against its dense declaration BEFORE
-            // stamping any of them, so a failed `new` binds nothing.
+            // stamping any of them, so a failed `program` attachment binds nothing.
             let decls = prog.bound.container.channels.clone();
             let extern_bindings = decls
                 .iter()
@@ -308,6 +489,24 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     channels.len(),
                     decls.len()
                 )));
+            }
+            let channel_reps = channels.iter().map(Resource::rep).collect::<Vec<_>>();
+            let expected = [
+                (Port::EmbedTokens, Some(embed.tokens)),
+                (Port::EmbedIndptr, Some(embed.indptr)),
+                (Port::KvLen, Some(attention.kv_len)),
+                (Port::Pages, Some(attention.pages)),
+                (Port::PageIndptr, Some(attention.page_indptr)),
+                (Port::WSlot, Some(attention.w_slot)),
+                (Port::WOff, Some(attention.w_off)),
+                (Port::Positions, Some(attention.positions)),
+                (Port::AttnMask, attention.mask),
+                (Port::Readout, readout),
+            ];
+            if let Err(error) =
+                validate_descriptor_bindings(&prog.bound.container, &channel_reps, &expected)
+            {
+                return Ok(Err(error));
             }
             let mut cells: BoundCells = Vec::with_capacity(channels.len());
             for (i, ch) in channels.iter().enumerate() {
@@ -349,17 +548,12 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                         )));
                     }
                 }
+
                 cells.push(cell);
             }
 
-            let readable = match page_span(readable_pages) {
-                Ok(span) => span,
-                Err(error) => return Ok(Err(error)),
-            };
-            let writable = match page_span(writable_pages) {
-                Ok(span) => span,
-                Err(error) => return Ok(Err(error)),
-            };
+            let readable = readable_pages;
+            let writable = writable_pages;
             let ws_rep = kv_working_set.rep();
             let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
             let bound_ws = self.ctx().table.get(&ws_res)?.clone();
@@ -664,7 +858,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 &instance.program.bound,
                 &instance.seeds,
             );
-            let res = self.ctx().table.push(ForwardPass {
+            let bound = BoundForwardPass {
                 instance,
                 bound_instance,
                 scheduler,
@@ -686,7 +880,10 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 dense_mask,
                 host_shadow,
                 closed: false,
-            })?;
+            };
+            if let Err(error) = self.ctx().table.get_mut(&this)?.attach_bound(bound) {
+                return Ok(Err(format!("pipeline: {error}")));
+            }
             if let Some((process_id, started_us)) = bind_timing {
                 let finished_us = crate::scheduler::fire_timing_now_us();
                 crate::scheduler::fire_timing_write(&serde_json::json!({
@@ -695,7 +892,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     "event": "forward_pass_bound",
                     "process_id": process_id,
                     "instance_id": instance_id,
-                    "pass_resource": res.rep(),
+                    "pass_resource": this.rep(),
                     "bind_started_us": started_us,
                     "bind_finished_us": finished_us,
                     "bind_us": finished_us.saturating_sub(started_us),
@@ -707,55 +904,8 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     "bind_finalize_us": finished_us.saturating_sub(bind_stages[4]),
                 }));
             }
-            Ok(Ok(res))
+            Ok(Ok(()))
         }
-    }
-
-    async fn set_attn_working_set(
-        &mut self,
-        this: Resource<ForwardPass>,
-        kv_working_set: Resource<KvWorkingSet>,
-        readable_pages: pie::inferlet::working_set::PageSpan,
-        writable_pages: pie::inferlet::working_set::PageSpan,
-    ) -> Anyhow<Result<(), String>> {
-        let readable = match page_span(readable_pages) {
-            Ok(span) => span,
-            Err(error) => return Ok(Err(error)),
-        };
-        let writable = match page_span(writable_pages) {
-            Ok(span) => span,
-            Err(error) => return Ok(Err(error)),
-        };
-        let new_ws = self.ctx().table.get(&kv_working_set)?.clone();
-        let old_rep = self.ctx().table.get(&this)?.kv_ws;
-        let old_resource: Resource<KvWorkingSet> = Resource::new_borrow(old_rep);
-        let old_ws = self.ctx().table.get(&old_resource)?;
-        if new_ws.model != old_ws.model || new_ws.driver != old_ws.driver {
-            return Ok(Err(format!(
-                "pipeline: replacement KV working set belongs to model/driver ({}, {}), \
-                 expected ({}, {})",
-                new_ws.model, new_ws.driver, old_ws.model, old_ws.driver
-            )));
-        }
-        let stores = crate::store::registry::get(new_ws.model, new_ws.driver as usize);
-        let page_len = match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-            kv.page_len(new_ws.id)
-        }) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(format!("pipeline: replacement KV state: {error}"))),
-        };
-        if let Err(error) = readable.resolve(page_len) {
-            return Ok(Err(error));
-        }
-        if let Err(error) = writable.resolve(page_len) {
-            return Ok(Err(error));
-        }
-        Ok(self
-            .ctx()
-            .table
-            .get_mut(&this)?
-            .replace_kv_declaration(kv_working_set.rep(), readable, writable)
-            .map_err(|error| format!("pipeline: {error}")))
     }
 
     async fn set_rs_working_sets(
@@ -763,6 +913,14 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         this: Resource<ForwardPass>,
         rs_working_sets: Vec<Resource<RsWorkingSet>>,
     ) -> Anyhow<Result<(), String>> {
+        if !self.ctx().table.get(&this)?.is_bound() {
+            for resource in &rs_working_sets {
+                let _ = self.ctx().table.get(resource)?;
+            }
+            self.ctx().table.get_mut(&this)?.bindings.rs_ws =
+                rs_working_sets.iter().map(Resource::rep).collect();
+            return Ok(Ok(()));
+        }
         let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
         let (kv_rep, qo_indptr) = {
             let pass = self.ctx().table.get(&this)?;
@@ -828,19 +986,30 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             reps.push(resource.rep());
         }
 
-        Ok(self
+        let replacement = reps.clone();
+        let result = self
             .ctx()
             .table
             .get_mut(&this)?
             .replace_rs_working_sets(reps)
-            .map_err(|error| format!("pipeline: {error}")))
+            .map_err(|error| format!("pipeline: {error}"));
+        if result.is_ok() {
+            self.ctx().table.get_mut(&this)?.bindings.rs_ws = replacement;
+        }
+        Ok(result)
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
         // A pass can be dropped before its pipeline. Drain the shared FIFO first
         // so every callback, mirror publication, and KV/RS transaction completes
         // before raw mirror pointers are detached or pages become reusable.
-        let fires = self.ctx().table.get(&this)?.fires.clone();
+        let fires = self
+            .ctx()
+            .table
+            .get(&this)?
+            .bound()
+            .ok()
+            .and_then(|pass| pass.fires.clone());
         if let Some(fires) = fires {
             let _finalize_guard = fires.finalize_guard().await;
             loop {
@@ -859,7 +1028,9 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         // otherwise repeat the work, but `close_native` no-ops the second
         // time.
         let mut pass = self.ctx().table.delete(this)?;
-        pass.close_native();
+        if let Ok(bound) = pass.bound_mut() {
+            bound.close_native();
+        }
         Ok(())
     }
 
@@ -872,8 +1043,72 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         this: Resource<ForwardPass>,
         on: Resource<crate::pipeline::Pipeline>,
     ) -> Anyhow<Result<(), String>> {
+        if !self.ctx().table.get(&this)?.is_bound() {
+            return Ok(Err("forward pass program is not attached".to_string()));
+        }
         crate::inferlet::process::ensure_execution_admitted(self).await;
         crate::inferlet::process::preemption::contention_gate(self).await?;
         crate::pipeline::fire::submit_pass(self, on, this).await
+    }
+}
+
+#[cfg(test)]
+mod descriptor_binding_tests {
+    use super::*;
+    use pie_ptir::container::PortBinding;
+    use pie_ptir::types::{DType, Shape};
+
+    fn container(ports: Vec<PortBinding>) -> TraceContainer {
+        TraceContainer {
+            names: Vec::new(),
+            externs: Vec::new(),
+            channels: Vec::new(),
+            ports,
+            stages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn optional_attention_mask_is_omitted_or_channel_bound() {
+        let no_mask = container(Vec::new());
+        validate_descriptor_bindings(&no_mask, &[], &[(Port::AttnMask, None)]).unwrap();
+
+        let mask = container(vec![PortBinding {
+            port: Port::AttnMask,
+            source: PortSource::Channel(0),
+        }]);
+        validate_descriptor_bindings(&mask, &[41], &[(Port::AttnMask, Some(41))]).unwrap();
+        assert!(
+            validate_descriptor_bindings(&mask, &[41], &[(Port::AttnMask, None)])
+                .unwrap_err()
+                .contains("without a resource attachment")
+        );
+    }
+
+    #[test]
+    fn descriptor_attachment_rejects_constants_and_wrong_resources() {
+        let constant = container(vec![PortBinding {
+            port: Port::EmbedIndptr,
+            source: PortSource::Const {
+                dtype: DType::U32,
+                shape: Shape::vector(2),
+                data: [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect(),
+            },
+        }]);
+        assert!(
+            validate_descriptor_bindings(&constant, &[], &[(Port::EmbedIndptr, Some(7))])
+                .unwrap_err()
+                .contains("must be channel-bound")
+        );
+
+        let channel = container(vec![PortBinding {
+            port: Port::EmbedIndptr,
+            source: PortSource::Channel(0),
+        }]);
+        assert!(
+            validate_descriptor_bindings(&channel, &[8], &[(Port::EmbedIndptr, Some(7))])
+                .unwrap_err()
+                .contains("attached resource is 7")
+        );
     }
 }

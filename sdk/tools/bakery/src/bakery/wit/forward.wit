@@ -2,7 +2,7 @@
 // surface is named `forward`; PTIR remains the name of the container byte
 // format it ships. Gated behind the runtime `ptir` cargo feature: the interface
 // is in the world unconditionally (additive, no-op for legacy guests); when the
-// feature is off, `forward-pass.new` / `forward-pass.submit` return a "ptir
+// feature is off, `forward-pass.program` / `forward-pass.submit` return a "ptir
 // disabled" error.
 //
 // Layering: the guest traces a pass -> canonical PTIR container bytes
@@ -14,13 +14,13 @@
 //   Channel::new([1], i32)       ->  channel constructor
 //   tok.put([BOS])               ->  channel.put        (seeds ride the channel)
 //   WorkingSet::new()/reserve(n) ->  kv-working-set     (working-set.wit)
-//   ForwardPass + epilogue       ->  forward-pass.new(bytes, channels, ws)
+//   ForwardPass + epilogue       ->  empty builder + typed attachments + program
 //   Pipeline::new(); fwd.submit(p) -> pipeline (pipeline.wit) + forward-pass.submit
 //
 // The old registry surface (register-program / program-id / instantiate /
 // channel-seed / pipeline.channel(index)) is deleted: identity dedup (the
 // FNV-1a container hash) and bind (against the backend ModelProfile — the guest
-// cannot bind) happen inside `forward-pass.new`, invisible to the guest.
+// cannot bind) happen inside `forward-pass.program`, invisible to the guest.
 // Malformed traces fail there with the validator's message. Seeds are
 // per-instance data (never identity): a `put` staged on a `seeded` channel
 // before the first submit is that channel's seed value.
@@ -33,12 +33,12 @@ interface forward {
 
     /// A GPU-resident bounded queue of cells with full/empty bits. Guest-
     /// constructed and first-class: the SAME handle is bound into a forward pass
-    /// (by dense declaration index, via `forward-pass.new`) and used for host
+    /// (by dense declaration index, via `forward-pass.program`) and used for host
     /// `put`/`set`/`take`/`read`. `Channel::from(v)` in the DSL is constructor +
     /// `put(v)`.
     ///
     /// The shape/dtype/capacity must match the container's declaration for the
-    /// index the handle is bound at — `forward-pass.new` validates this.
+    /// index the handle is bound at — `forward-pass.program` validates this.
     /// Direction comes from the container (`host-role`): a host-writer channel
     /// takes `put`; a host-reader channel yields `take`/`read`. Before binding,
     /// `put` stages freely (a seed or an early Writer cell); staged puts
@@ -73,69 +73,54 @@ interface forward {
         read: async func() -> result<data, error>;
     }
 
-    /// A traced forward pass ready to submit: the canonical PTIR container
-    /// bytes (traced stages + embed/attn port bindings) plus the first-class
-    /// handles the container references. The container names channels by dense
-    /// declaration index; `channels[i]` supplies the handle for dense channel
-    /// `i` (the DSL emits both from the same objects, so authors never see
-    /// indices). This subsumes register-program + instantiate + channel-seed:
-    /// identity dedup and bind happen here, and seeds ride each channel's own
-    /// `put`.
+    /// A forward-pass builder. Construction is empty; descriptor resources are
+    /// attached explicitly, then `program` supplies the traced container.
+    /// Native program validation/binding happens when `program` is attached.
     resource forward-pass {
-        /// Decode + bind `container-bytes` against the bound model (hash-
-        /// deduped compile/bind cache; a duplicate container is a cache hit)
-        /// and bind the handles. Errors: a malformed trace (the validator's
-        /// message), a channel-count/shape/dtype/capacity mismatch against the
-        /// container's declarations, or an rs-working-set count that differs
-        /// from the resolved request count.
-        /// `readable-pages` and `writable-pages` are per-fire containment
-        /// declarations, not inventories or eager materialization requests.
-        /// Hybrid / linear-attention models (GDN, Mamba2) bind one
-        /// rs-working-set per resolved request row, in request order;
-        /// pure-attention models bind none.
-        ///
-        /// The pass records the underlying state of its bound channels (safe
-        /// against the guest dropping a handle) and the working sets' reps
-        /// (the guest must keep them alive for the pass's lifetime, mirroring
-        /// the classic `forward-pass`'s borrows).
-        new: static func(
-            container-bytes: data,
-            channels:         list<borrow<channel>>,
-            kv-working-set:   borrow<kv-working-set>,
-            readable-pages:   page-span,
-            writable-pages:   page-span,
-            rs-working-sets:  list<borrow<rs-working-set>>,
-        ) -> result<forward-pass, error>;
+        constructor();
 
-        /// Atomically replace the attention working set and its readable and
-        /// writable page declarations in-place. The existing native pass,
-        /// channel arena, seeds, and traced program are preserved. Fails
-        /// without changing any binding if validation fails or this pass's
-        /// pipeline FIFO has an in-flight operation. Device-geometry passes do
-        /// not support re-call; device-resolved decode passes keep their WS and
-        /// full readable span. SDK-generated page envelopes cannot grow
-        /// beyond their bind-time lease width.
-        set-attn-working-set: func(
+        /// Bind embedding token ids and CSR row indptr. Both are channels.
+        embed: func(
+            tokens: borrow<channel>,
+            indptr: borrow<channel>,
+        ) -> result<_, error>;
+
+        /// The only attention binding surface. Every geometry input is an
+        /// individual channel. `none` omits the existing PTIR AttnMask port;
+        /// `some(mask)` binds that channel to it.
+        attention: func(
             kv-working-set: borrow<kv-working-set>,
             readable-pages: page-span,
             writable-pages: page-span,
+            kv-len: borrow<channel>,
+            pages: borrow<channel>,
+            page-indptr: borrow<channel>,
+            w-slot: borrow<channel>,
+            w-off: borrow<channel>,
+            positions: borrow<channel>,
+            mask: option<borrow<channel>>,
         ) -> result<_, error>;
 
-        /// Replace the recurrent-state bindings in-place, preserving this
-        /// pass's native instance, channel arena, seeds, attention binding,
-        /// and device geometry. The list is in resolved request order.
-        /// Fails while this pass's pipeline FIFO has any in-flight operation,
-        /// or when a resource/model/driver/count validation fails.
+        /// Bind an optional readout-index channel separately from embedding.
+        readout: func(indices: borrow<channel>) -> result<_, error>;
+
+        /// Bind recurrent-state working sets in resolved request order.
         set-rs-working-sets: func(
             rs-working-sets: list<borrow<rs-working-set>>,
+        ) -> result<_, error>;
+
+        /// Attach canonical PTIR bytes and channel handles in dense declaration
+        /// order. Validation uses the engine-owned ModelProfile.
+        program: func(
+            container-bytes: data,
+            channels: list<borrow<channel>>,
         ) -> result<_, error>;
 
         /// Submit this pass on `on`, RUN-AHEAD. Pure-attention passes prepare
         /// and enqueue immediately; an RS-bound pass first awaits/finalizes
         /// prior FIFO operations so its folded state cannot be prepared from
-        /// a stale commit. The first submit
-        /// ships the container bytes + sidecar and binds seeds (one staged
-        /// `put` per `seeded` channel — missing seeds error here);
+        /// a stale commit. The first submit binds seeds (one staged `put` per
+        /// `seeded` channel — missing seeds error here);
         /// steady-state submits carry the identity hash + instance only.
         /// Staged host-writer puts are coalesced into the fire.
         ///

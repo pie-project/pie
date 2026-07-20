@@ -48,7 +48,7 @@ impl DecodeEnvelope {
         let token_count = self.token_count;
         let qo_indptr = match const_port(container, Port::EmbedIndptr) {
             Some(bytes) => as_u32(Port::EmbedIndptr, bytes)?,
-            None => vec![0, token_count],
+            None => self.token_indptr.clone(),
         };
         let position_ids = match const_port(container, Port::Positions) {
             Some(bytes) => as_u32(Port::Positions, bytes)?,
@@ -170,8 +170,26 @@ pub fn classify_decode_envelope(
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect()
         }
+        Some(PortSource::Channel(channel)) => {
+            let declaration = container
+                .channels
+                .get(*channel as usize)
+                .ok_or_else(|| "decode envelope EmbedIndptr channel is out of range".to_string())?;
+            if declaration.shape.dims() != [token_count + 1]
+                || !matches!(
+                    declaration.dtype,
+                    pie_ptir::container::ChanDType::Concrete(DType::U32)
+                )
+            {
+                return Err(format!(
+                    "decode envelope EmbedIndptr channel must be a [{}] u32 vector",
+                    token_count + 1
+                ));
+            }
+            (0..=token_count).collect()
+        }
         Some(_) => {
-            return Err("decode envelope EmbedIndptr must be trace-constant".to_string());
+            return Err("decode envelope EmbedIndptr must be a u32 vector".to_string());
         }
     };
     if qo_indptr.len() < 2
@@ -202,6 +220,19 @@ pub fn classify_decode_envelope(
                 if *dtype == DType::U32
                     && shape.dims() == [lane_count + 1]
                     && data.len() == (lane_count as usize + 1) * 4 => {}
+            (Port::EmbedIndptr, PortSource::Channel(channel)) => {
+                let declaration = container.channels.get(*channel as usize).ok_or_else(|| {
+                    "decode envelope EmbedIndptr channel is out of range".to_string()
+                })?;
+                if declaration.shape.dims() != [lane_count + 1]
+                    || !matches!(
+                        declaration.dtype,
+                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                    )
+                {
+                    return Err("device EmbedIndptr must be a [lanes+1] u32 vector".to_string());
+                }
+            }
             (Port::Positions, PortSource::Const { dtype, shape, .. })
                 if *dtype == DType::U32 && shape.dims() == [token_count] => {}
             (Port::Readout, PortSource::Const { dtype, shape, data })
@@ -1005,6 +1036,32 @@ mod tests {
             envelope.template(&readout).unwrap().sampling_indices,
             vec![0]
         );
+    }
+
+    #[test]
+    fn decode_envelope_accepts_channel_embed_indptr() {
+        let mut container = section3_container();
+        container.stages[0].ops = vec![
+            Op::ChanTake(0),
+            Op::ChanPut { chan: 0, value: 0 },
+            Op::ChanTake(1),
+            Op::ChanPut { chan: 1, value: 1 },
+        ];
+        add_explicit_geometry(&mut container, 1, 1);
+        let indptr = container.channels.len() as u32;
+        container.channels.push(chan(Shape::vector(2), DType::U32));
+        container
+            .ports
+            .iter_mut()
+            .find(|binding| binding.port == Port::EmbedIndptr)
+            .unwrap()
+            .source = PortSource::Channel(indptr);
+
+        let envelope = classify_decode_envelope(&container)
+            .unwrap()
+            .expect("channel indptr decode");
+        assert_eq!(envelope.token_indptr, vec![0, 1]);
+        assert_eq!(envelope.template(&container).unwrap().qo_indptr, vec![0, 1]);
     }
 
     #[test]

@@ -35,6 +35,9 @@ interface model {
     // inferlet's lowering vocab == the driver's logits / recognizer-table vocab.
     output-vocab-size: func() -> u32;
 
+    // Tokens per KV page for the bound model/driver.
+    kv-page-size: func() -> u32;
+
     // ── Working-set / arena capabilities (global, over the bound model) ──
     // Memory-shaping parameters of the bound model's driver, so an inferlet
     // can size working sets and validate fold lengths before allocating.

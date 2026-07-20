@@ -127,7 +127,7 @@ impl Channel {
     /// The channel's global identity (declaration order). The
     /// builder↔bridge contract: [`Traced::channel_order`](crate::Traced::channel_order)
     /// lists these gids in dense declaration order, and the `inferlet` WIT bridge
-    /// orders its `forward-pass.new` handle list to match.
+    /// orders its `forward-pass.program` handle list to match.
     pub fn gid(&self) -> u64 {
         self.state.borrow().gid
     }

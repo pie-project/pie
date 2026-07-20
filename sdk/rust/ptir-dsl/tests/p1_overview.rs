@@ -14,14 +14,13 @@ use ptir_dsl::{Channel, TraceError, Traced};
 
 const VOCAB: u32 = 32_000;
 const PAGE: u32 = 16;
-const LAYERS: u32 = 32;
 
 // Golden C3 identity hashes (FNV-1a over the canonical container bytes). These
-// LOCK byte-identity of the lowering: a change here means the emitted container
-// bytes moved. Captured at the A1 pre-refactor `ForwardPass` baseline.
-const GOLDEN_S3: u64 = 13510327253018374923;
-const GOLDEN_BEAM: u64 = 2712280431104955710;
-const GOLDEN_MTP_GRAMMAR: u64 = 5700756782757024409;
+// LOCK byte-identity of the channel-only descriptor lowering: a change here
+// means the emitted container bytes moved.
+const GOLDEN_S3: u64 = 3890152592550917126;
+const GOLDEN_BEAM: u64 = 12714305880244465651;
+const GOLDEN_MTP_GRAMMAR: u64 = 6531911362903278470;
 
 fn leak<T>(v: T) -> &'static T {
     Box::leak(Box::new(v))
@@ -42,18 +41,18 @@ fn initial_mask() -> Vec<bool> {
 fn build_s3() -> Traced {
     let ctr1: &'static Tensor = leak(Tensor::constant([0u32, 1]));
     let tok: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok"));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]).named("indptr"));
     let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
-    let mask: &'static Channel =
-        leak(Channel::new([intrinsics::vocab()], dtype::bool).named("mask"));
+    let mask: &'static Channel = leak(Channel::new([VOCAB], dtype::bool).named("mask"));
     let len: &'static Channel = leak(Channel::from([1u32]).named("len"));
     let rng_ch: &'static Channel = leak(Channel::from([7u32, 0]).named("rng"));
 
     // seed token -> cell full
     tok.put([1i32]);
 
-    let mut b = Builder::new();
+    let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::EmbedTokens, tok);
-    b.bind_port(Port::EmbedIndptr, Tensor::constant([0u32, 1]));
+    b.bind_port(Port::EmbedIndptr, indptr);
     b.bind_port(Port::KvLen, len);
     b.stage(Stage::Epilogue, move || {
         let logits = intrinsics::logits();
@@ -73,13 +72,12 @@ fn build_s3() -> Traced {
 
 #[test]
 fn s3_traces_and_validates() {
-    ptir_dsl::model::configure(VOCAB, PAGE, LAYERS);
     let traced = build_s3();
 
     let c = traced.container();
     assert_eq!(c.stages.len(), 1, "one epilogue stage");
     assert_eq!(c.stages[0].stage, Stage::Epilogue);
-    assert_eq!(c.channels.len(), 5, "tok/out/mask/len/rng");
+    assert_eq!(c.channels.len(), 6, "tok/indptr/out/mask/len/rng");
     let puts = c.stages[0]
         .ops
         .iter()
@@ -90,27 +88,26 @@ fn s3_traces_and_validates() {
 
 #[test]
 fn s3_identity_hash_is_stable() {
-    ptir_dsl::model::configure(VOCAB, PAGE, LAYERS);
     let a = build_s3().identity_hash();
     let b = build_s3().identity_hash();
     assert_eq!(a, b, "the same program hashes identically (C3)");
     assert_eq!(
         a, GOLDEN_S3,
-        "byte-identical to the pre-A1 golden container"
+        "byte-identical to the channel-only descriptor golden"
     );
 }
 
 #[test]
 fn different_program_hashes_differently() {
-    ptir_dsl::model::configure(VOCAB, PAGE, LAYERS);
     let greedy = build_s3().identity_hash();
 
     let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]));
     let rng_ch: &'static Channel = leak(Channel::from([7u32, 0]));
     tok.put([1i32]);
-    let mut b = Builder::new();
+    let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::EmbedTokens, tok);
-    b.bind_port(Port::EmbedIndptr, Tensor::constant([0u32, 1]));
+    b.bind_port(Port::EmbedIndptr, indptr);
     b.stage(Stage::Epilogue, move || {
         let logits = intrinsics::logits();
         let r = rng_ch.take();
@@ -130,8 +127,8 @@ fn different_program_hashes_differently() {
 
 #[test]
 fn lint_double_endpoint_host_both_ends() {
-    ptir_dsl::model::configure(VOCAB, PAGE, LAYERS);
     let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]));
     // `dup` is claimed by the host as BOTH writer and reader (no pass endpoint
     // remains — SPSC violation). It is also consumed by the epilogue so it
     // enters the trace container.
@@ -140,9 +137,9 @@ fn lint_double_endpoint_host_both_ends() {
     dup.put([0i32]); // host writes
     let _ = dup.take(); // host also consumes
 
-    let mut b = Builder::new();
+    let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::EmbedTokens, tok);
-    b.bind_port(Port::EmbedIndptr, Tensor::constant([0u32, 1]));
+    b.bind_port(Port::EmbedIndptr, indptr);
     b.stage(Stage::Epilogue, move || {
         let v = dup.take(); // pass consumes it too (so `dup` is interned)
         tok.put(add(&v, reduce_argmax(intrinsics::logits())));
@@ -162,14 +159,14 @@ fn lint_double_endpoint_host_both_ends() {
 
 #[test]
 fn lint_readiness_conflict_consumed_never_produced() {
-    ptir_dsl::model::configure(VOCAB, PAGE, LAYERS);
     let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]));
     let orphan: &'static Channel = leak(Channel::new([1], dtype::i32).named("orphan"));
     tok.put([1i32]);
 
-    let mut b = Builder::new();
+    let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::EmbedTokens, tok);
-    b.bind_port(Port::EmbedIndptr, Tensor::constant([0u32, 1]));
+    b.bind_port(Port::EmbedIndptr, indptr);
     b.stage(Stage::Epilogue, move || {
         let v = orphan.take();
         let _ = intrinsics::logits();
@@ -192,14 +189,14 @@ fn lint_readiness_conflict_consumed_never_produced() {
 
 #[test]
 fn lint_sink_misplacement_in_epilogue() {
-    ptir_dsl::model::configure(VOCAB, PAGE, LAYERS);
     let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
+    let indptr: &'static Channel = leak(Channel::from([0u32, 1]));
     let budget: &'static Channel = leak(Channel::from([256u32]));
     tok.put([1i32]);
 
-    let mut b = Builder::new();
+    let mut b = Builder::new(VOCAB, PAGE);
     b.bind_port(Port::EmbedTokens, tok);
-    b.bind_port(Port::EmbedIndptr, Tensor::constant([0u32, 1]));
+    b.bind_port(Port::EmbedIndptr, indptr);
     b.stage(Stage::Epilogue, move || {
         let logits = intrinsics::logits();
         let mask = pivot_threshold(&logits, rank_le(budget.read()));
@@ -233,7 +230,6 @@ fn s6_2_beam_epilogue_binds() {
     const V: u32 = 8;
     const P: u32 = 3;
     const PAGE_T: u32 = 4;
-    ptir_dsl::model::configure(V, PAGE_T, 2);
 
     // channels 0..=15 as in overview §6.2 / echo's beam_trace.
     let pages: &'static Channel = leak(Channel::seeded([B, P], dtype::u32).named("pages"));
@@ -257,10 +253,10 @@ fn s6_2_beam_epilogue_binds() {
     // `fresh.put(ws.alloc(B))`), primed before submit.
     fresh.put(vec![0u32; B as usize]);
 
-    let lanes_b = Tensor::constant((0u32..=B).collect::<Vec<_>>()); // [0,1,2] indptr
-    let page_rows = Tensor::constant((0u32..=B).map(|i| i * P).collect::<Vec<_>>()); // [0,P,2P]
+    let lanes_b = leak(Channel::from((0u32..=B).collect::<Vec<_>>())); // [0,1,2]
+    let page_rows = leak(Channel::from((0u32..=B).map(|i| i * P).collect::<Vec<_>>())); // [0,P,2P]
 
-    let mut b = Builder::new();
+    let mut b = Builder::new(V, PAGE_T);
     b.bind_port(Port::EmbedTokens, toks);
     b.bind_port(Port::EmbedIndptr, lanes_b);
     b.bind_port(Port::Positions, pos);
@@ -322,7 +318,11 @@ fn s6_2_beam_epilogue_binds() {
     let traced = b.build().expect("§6.2 beam epilogue must bind");
     let c = traced.container();
     assert_eq!(c.stages[0].stage, Stage::Epilogue);
-    assert_eq!(c.channels.len(), 16, "16 beam channels");
+    assert_eq!(
+        c.channels.len(),
+        18,
+        "16 state channels + 2 descriptor channels"
+    );
     assert_eq!(
         traced.identity_hash(),
         GOLDEN_BEAM,
@@ -383,8 +383,6 @@ fn s6_2_beam_epilogue_binds() {
 fn s6_1_mtp_grammar_binds() {
     const V: u32 = 8;
     const K: u32 = 3;
-    ptir_dsl::model::configure(V, 4, 2);
-    ptir_dsl::model::configure_gates(true, false); // has_mtp_logits
     let kp1 = K + 1;
     let gmask: &'static Channel = leak(Channel::new([kp1, V], dtype::bool).named("gmask"));
     let toks: &'static Channel = leak(Channel::from(vec![1i32; kp1 as usize]).named("toks"));
@@ -392,9 +390,9 @@ fn s6_1_mtp_grammar_binds() {
     // gmask is host-fed each step (per-position grammar mask) — a host-side put
     // marks it host-writer + produces its value (mirrors the beam's `fresh.put`).
     gmask.put(vec![true; (kp1 * V) as usize]);
-    let lanes = Tensor::constant((0u32..=kp1).collect::<Vec<_>>());
+    let lanes = leak(Channel::from((0u32..=kp1).collect::<Vec<_>>()));
 
-    let mut b = Builder::new();
+    let mut b = Builder::new(V, 4);
     b.bind_port(Port::EmbedTokens, toks);
     b.bind_port(Port::EmbedIndptr, lanes);
     b.stage(Stage::Epilogue, move || {
@@ -419,6 +417,6 @@ fn s6_1_mtp_grammar_binds() {
     assert_eq!(
         traced.identity_hash(),
         GOLDEN_MTP_GRAMMAR,
-        "byte-identical to the pre-A1 golden"
+        "byte-identical to the channel-only descriptor golden"
     );
 }

@@ -897,6 +897,7 @@ pub async fn submit_pass<C: FireContext>(
 
         {
             let p = ctx.resources().get_mut(&fwd)?;
+            let p = p.bound_mut().map_err(anyhow::Error::msg)?;
             p.kv_declaration_realized = true;
             let (shadow, bound, shadow_cells) =
                 (&mut p.host_shadow, &p.instance.program.bound, &p.cells);
@@ -1699,6 +1700,9 @@ fn reclaim_device_geometry_grants<C: FireContext>(ctx: &mut C, fwd_rep: u32, ins
     let res: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
     let (ws_rep, reclaimed) = {
         let Ok(p) = ctx.resources().get_mut(&res) else {
+            return;
+        };
+        let Ok(p) = p.bound_mut() else {
             return;
         };
         let Some(devgeo) = p.devgeo.as_mut() else {

@@ -153,16 +153,107 @@ impl KvDeclaration {
     }
 }
 
+#[derive(Default)]
+pub struct ForwardBindings {
+    pub embed: Option<EmbedBinding>,
+    pub attention: Option<AttentionBinding>,
+    pub readout: Option<u32>,
+    pub rs_ws: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+pub struct EmbedBinding {
+    pub tokens: u32,
+    pub indptr: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct AttentionBinding {
+    pub kv_ws: u32,
+    pub readable: KvPageSpan,
+    pub writable: KvPageSpan,
+    pub kv_len: u32,
+    pub pages: u32,
+    pub page_indptr: u32,
+    pub w_slot: u32,
+    pub w_off: u32,
+    pub positions: u32,
+    pub mask: Option<u32>,
+}
+
+/// The WIT forward-pass builder. It starts empty and acquires a native bound
+/// pass only when canonical program bytes are attached.
+pub struct ForwardPass {
+    pub bindings: ForwardBindings,
+    bound: Option<Box<BoundForwardPass>>,
+}
+
+impl ForwardPass {
+    pub fn new() -> Self {
+        Self {
+            bindings: ForwardBindings::default(),
+            bound: None,
+        }
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.bound.is_some()
+    }
+
+    pub fn attach_bound(&mut self, bound: BoundForwardPass) -> Result<(), String> {
+        if self.bound.is_some() {
+            return Err("forward pass program is already attached".to_string());
+        }
+        self.bound = Some(Box::new(bound));
+        Ok(())
+    }
+
+    pub fn bound(&self) -> Result<&BoundForwardPass, String> {
+        self.bound
+            .as_deref()
+            .ok_or_else(|| "forward pass program is not attached".to_string())
+    }
+
+    pub fn bound_mut(&mut self) -> Result<&mut BoundForwardPass, String> {
+        self.bound
+            .as_deref_mut()
+            .ok_or_else(|| "forward pass program is not attached".to_string())
+    }
+}
+
+impl Default for ForwardPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for ForwardPass {
+    type Target = BoundForwardPass;
+
+    fn deref(&self) -> &Self::Target {
+        self.bound
+            .as_deref()
+            .expect("forward-pass runtime use requires an attached program")
+    }
+}
+
+impl std::ops::DerefMut for ForwardPass {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.bound
+            .as_deref_mut()
+            .expect("forward-pass runtime use requires an attached program")
+    }
+}
+
 /// A traced forward pass bound to its first-class handles — one instance of a
-/// (hash-deduped) registered program; the WIT `pie:inferlet/forward.forward-pass`
-/// resource. The driver's persistent channel arena is keyed by this pass's
+/// hash-deduped registered program. The driver's persistent channel arena is keyed by this pass's
 /// `instance_id`; a channel MAY bind to several passes (multi-pass channels,
 /// W3.2) — the driver's global channel registry (W0.1) resolves one shared
 /// device cell and the pipeline orders the fires (§3.4). Domain state (not
 /// WIT glue), so it lives here rather than in `inferlet::host::forward`,
 /// which only holds the `Host`/`HostForwardPass` impls that push/get/delete
 /// it from the WASM component resource table.
-pub struct ForwardPass {
+pub struct BoundForwardPass {
     pub instance: Instance,
     pub bound_instance: crate::driver::BoundInstance,
     /// Bind-time scheduler address. Stable for the instance lifetime, so
@@ -175,7 +266,7 @@ pub struct ForwardPass {
     /// bound cells). Rides every submission so the driver binds the trace's
     /// dense channel references to the global device channel registry.
     pub channel_ids: Vec<u64>,
-    /// The bound channel resource reps (captured at `forward-pass.new`), so
+    /// The bound channel resource reps (captured at `forward-pass.program`), so
     /// `submit` can point each channel's await queue at the feeding pipeline
     /// (W3.1: the pipeline owns the FIFO; a pass may bind to any pipeline).
     pub channel_reps: Vec<u32>,
@@ -228,7 +319,7 @@ pub struct ForwardPass {
     pub(crate) closed: bool,
 }
 
-impl ForwardPass {
+impl BoundForwardPass {
     /// Replace only the recurrent-state resource reps. The native instance and
     /// every other pass field remain untouched. Rebinding is legal only at an
     /// empty pipeline FIFO boundary so no in-flight fire can retain the old
@@ -351,7 +442,7 @@ impl ForwardPass {
     }
 }
 
-impl Drop for ForwardPass {
+impl Drop for BoundForwardPass {
     /// Fallback for when a `ResourceTable`/`ProcessCtx` teardown drops this
     /// value directly, bypassing `HostForwardPass::drop`'s async FIFO drain +
     /// explicit `close_native` call (thrust-3 process-teardown hardening).
@@ -446,7 +537,7 @@ impl std::error::Error for InstantiateError {}
 /// are seeded, each with the right byte length. Seeds are per-instance data (D2)
 /// — never part of the program identity.
 ///
-/// The live WIT `forward-pass.new` bind path (`inferlet::host::forward`) does
+/// The live WIT `forward-pass.program` bind path (`inferlet::host::forward`) does
 /// its own inline validation (dense channel decls, staged puts, extern
 /// bindings) alongside seed checking, so it does not call this pure
 /// entry point; kept + unit-tested as the minimal instantiate contract.
@@ -1002,7 +1093,7 @@ mod tests {
         ) -> ForwardPass {
             let program = registered();
             let host_shadow = crate::pipeline::fire::shadow::HostShadow::new(&program.bound, &[]);
-            ForwardPass {
+            let bound = BoundForwardPass {
                 instance: Instance {
                     program,
                     instance_id: bound_instance.instance_id,
@@ -1024,7 +1115,10 @@ mod tests {
                 decode_envelope: None,
                 dense_mask: false,
                 closed: false,
-            }
+            };
+            let mut pass = ForwardPass::new();
+            pass.attach_bound(bound).unwrap();
+            pass
         }
 
         #[tokio::test(flavor = "current_thread")]

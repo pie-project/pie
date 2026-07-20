@@ -13,7 +13,7 @@ fn row_membership_is_general_ssa_and_evaluates_per_row() {
     let rows = Channel::seeded([2, 3], dtype::u32);
     let keys = Channel::seeded([4], dtype::u32);
     let output = Channel::new([2, 4], dtype::bool);
-    let mut builder = Builder::new();
+    let mut builder = Builder::new(32_000, 16);
     builder.stage(Stage::Epilogue, || {
         output.put(row_membership(rows.take(), keys.take()));
     });
@@ -50,7 +50,7 @@ fn nucleus_trace(explicit: bool, escape_intermediate: bool) -> Traced {
     let rng = Channel::seeded([2], dtype::u32);
     let output = Channel::new([2], dtype::i32);
     let escaped = escape_intermediate.then(|| Channel::new([2, 4], dtype::f32));
-    let mut builder = Builder::new();
+    let mut builder = Builder::new(32_000, 16);
     builder.stage(Stage::Epilogue, || {
         let logits = logits.take().tensor();
         let top_p = top_p.take().tensor();
@@ -201,7 +201,7 @@ fn top_k_trace(beam_named: bool) -> Traced {
     } else {
         "top indices"
     });
-    let mut builder = Builder::new();
+    let mut builder = Builder::new(32_000, 16);
     builder.stage(Stage::Epilogue, || {
         let (top_values, top_indices) = top_k(input.take(), 2);
         values.put(top_values);

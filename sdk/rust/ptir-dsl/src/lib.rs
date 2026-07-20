@@ -12,26 +12,25 @@
 //! [`TraceContainer`](pie_ptir::container::TraceContainer). Tracing is its
 //! *implementation strategy*, not its identity — hence `ptir-dsl`.
 //!
-//! It does **not** bind (D6: the guest does not bind; `forward-pass.new` is the
+//! It does **not** bind (D6: the guest does not bind; `forward-pass.program` is the
 //! authoritative gate) and knows nothing of WIT. The author-facing lifetime
 //! objects (`ForwardPass`, `Pipeline`, `WorkingSet`, host `Channel` transport)
 //! live in `inferlet`, which wraps the WIT resources and drives this builder.
 //!
 //! ```
 //! use ptir_dsl::prelude::*;
-//! use ptir_dsl::builder::{Builder, PortInput};
+//! use ptir_dsl::builder::Builder;
 //! use ptir_dsl::Port;
 //!
-//! ptir_dsl::model::configure(/* vocab */ 32, /* page_size */ 4, /* num_layers */ 2);
-//!
 //! let tok = Channel::new([1], dtype::i32);
+//! let indptr = Channel::from([0u32, 1]);
 //! let out = Channel::new([1], dtype::i32);
 //! let rng = Channel::from([7u32, 0]);
 //! tok.put([1i32]); // seed BOS
 //!
-//! let mut b = Builder::new();
+//! let mut b = Builder::new(/* vocab */ 32, /* page_size */ 4);
 //! b.bind_port(Port::EmbedTokens, &tok);
-//! b.bind_port(Port::EmbedIndptr, PortInput::constant(Tensor::constant([0u32, 1])));
+//! b.bind_port(Port::EmbedIndptr, &indptr);
 //! b.stage(Stage::Epilogue, || {
 //!     let logits = intrinsics::logits();
 //!     let r = rng.take();
