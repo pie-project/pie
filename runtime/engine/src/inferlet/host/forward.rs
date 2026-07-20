@@ -205,6 +205,17 @@ impl pie::inferlet::forward::HostChannel for ProcessCtx {
         }
     }
 
+    async fn set(&mut self, this: Resource<Channel>, value: Vec<u8>) -> Anyhow<Result<(), String>> {
+        crate::inferlet::process::preemption::contention_gate(self).await?;
+        let cell = self.ctx().table.get(&this)?.cell.clone();
+        let result = cell
+            .lock()
+            .unwrap()
+            .set(value)
+            .map_err(|error| error.to_string());
+        Ok(result)
+    }
+
     async fn drop(&mut self, this: Resource<Channel>) -> Anyhow<()> {
         // A pass that bound this channel holds its own Arc — dropping the
         // guest handle never dangles an in-flight fire. Native channel storage

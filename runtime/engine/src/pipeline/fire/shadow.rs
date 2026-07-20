@@ -92,6 +92,15 @@ impl HostShadow {
             };
             return Value::from_le_bytes(dtype, &bytes);
         }
+        if let Some(cell) = cells.get(chan as usize)
+            && let Some(bytes) = cell.lock().unwrap().front_override()
+        {
+            let dtype = match bound.container.channels.get(chan as usize)?.dtype {
+                pie_ptir::container::ChanDType::Concrete(dtype) => dtype,
+                _ => return None,
+            };
+            return Value::from_le_bytes(dtype, &bytes);
+        }
         self.front(chan)
     }
 

@@ -34,7 +34,7 @@ interface forward {
     /// A GPU-resident bounded queue of cells with full/empty bits. Guest-
     /// constructed and first-class: the SAME handle is bound into a forward pass
     /// (by dense declaration index, via `forward-pass.new`) and used for host
-    /// `put`/`take`/`read`. `Channel::from(v)` in the DSL is constructor +
+    /// `put`/`set`/`take`/`read`. `Channel::from(v)` in the DSL is constructor +
     /// `put(v)`.
     ///
     /// The shape/dtype/capacity must match the container's declaration for the
@@ -52,6 +52,13 @@ interface forward {
         /// staged cell (empty -> fill; full -> back-pressure). `bool` payloads
         /// are dtype-native (1 byte per bool); the wire packs to bits.
         put:  func(value: data) -> result<_, error>;
+
+        /// Atomically replace the committed front cell without changing queue
+        /// occupancy. This is a fused take+put: it never exposes an empty slot,
+        /// never enqueues, and leaves any later put queued for the next fire
+        /// untouched. Errors when the channel is empty, poisoned/closed, or
+        /// its front is currently claimed by an in-flight fire.
+        set:  func(value: data) -> result<_, error>;
 
         /// Move a committed value out to the host (host-reader channels). Full
         /// -> value + empty the cell. Empty -> BLOCKS by awaiting the pass's

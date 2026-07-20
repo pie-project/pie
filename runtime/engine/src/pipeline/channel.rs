@@ -109,6 +109,10 @@ pub struct ChannelCell {
     /// host `take`/`read` errors with the reason. Under run-ahead the submit
     /// returns before the fire resolves, so poison IS the error channel.
     poisoned: Option<String>,
+    /// Host replacement for the current committed front. The per-pass host
+    /// shadow consults this after a staged Writer put, so `set` changes the
+    /// standing cell without displacing a value queued for the next fire.
+    front_override: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +157,8 @@ pub enum ChannelError {
     SeedAlreadyStaged,
     /// A bounded channel has no host capacity.
     Full,
+    /// The committed front is currently claimed by a submitted fire.
+    InFlight,
     /// The native endpoint was closed.
     Closed,
 }
@@ -170,6 +176,7 @@ impl std::fmt::Display for ChannelError {
             MissingSeed => write!(f, "seeded but no seed was put before the first fire"),
             SeedAlreadyStaged => write!(f, "a seed is already staged (a seed is exactly one put)"),
             Full => write!(f, "channel is full"),
+            InFlight => write!(f, "channel front is in use by an in-flight fire"),
             Closed => write!(f, "channel is closed"),
         }
     }
@@ -200,6 +207,7 @@ impl ChannelCell {
             device_reserved_tail: 0,
             reader: None,
             poisoned: None,
+            front_override: None,
         }
     }
 
@@ -526,6 +534,113 @@ impl ChannelCell {
         Ok(())
     }
 
+    /// Atomically replace the committed front cell. Queue cursors and
+    /// occupancy are unchanged, so a later queued put cannot move forward
+    /// between a take and put. A front already claimed by a fire is immutable
+    /// until that fire advances the device head.
+    pub fn set(&mut self, native: Vec<u8>) -> Result<(), ChannelError> {
+        self.set_ref(&native)
+    }
+
+    pub fn set_ref(&mut self, native: &[u8]) -> Result<(), ChannelError> {
+        let expected = self.native_len();
+        if native.len() != expected {
+            return Err(ChannelError::BadLength {
+                expected,
+                got: native.len(),
+            });
+        }
+        if let Some(reason) = &self.poisoned {
+            return Err(ChannelError::Poisoned(reason.clone()));
+        }
+
+        if let Some(endpoint) = self.endpoint.clone() {
+            let binding = endpoint.registered().binding;
+            let poison = load_word(binding.word_base, binding.poison_word_index as usize);
+            if poison != 0 {
+                return Err(ChannelError::Poisoned(format!(
+                    "driver published poison epoch {poison}"
+                )));
+            }
+            if load_word(binding.word_base, binding.closed_word_index as usize) != 0 {
+                return Err(ChannelError::Closed);
+            }
+
+            // Pull visible Reader cells into the host queue before replacing
+            // its front copy. Other roles read the same head/tail words
+            // directly below.
+            if self.role == Some(HostRole::Reader) {
+                self.refresh_reader_mirrors()?;
+            }
+            let head = load_word(binding.word_base, binding.head_word_index as usize);
+            let tail = load_word(binding.word_base, binding.tail_word_index as usize);
+            let committed_tail = if self.role == Some(HostRole::Writer) {
+                tail.saturating_sub(self.ring_host_copies.len() as u64)
+            } else {
+                tail
+            };
+            if committed_tail <= head {
+                return Err(ChannelError::Empty);
+            }
+            if self.device_reserved_head > head {
+                return Err(ChannelError::InFlight);
+            }
+
+            self.replace_ring_cell(binding, head, native)?;
+            if self.role == Some(HostRole::Reader) {
+                let front = self.produced.front_mut().ok_or(ChannelError::Empty)?;
+                *front = native.to_vec();
+            }
+            self.front_override = Some(native.to_vec());
+            return Ok(());
+        }
+
+        Err(ChannelError::Empty)
+    }
+
+    fn replace_ring_cell(
+        &self,
+        binding: PieChannelEndpointBinding,
+        sequence: u64,
+        native: &[u8],
+    ) -> Result<(), ChannelError> {
+        let cell_bytes = binding.cell_bytes as usize;
+        let wire_len = if self.dtype == DType::Bool {
+            native.len().div_ceil(8)
+        } else {
+            native.len()
+        };
+        if wire_len != cell_bytes {
+            return Err(ChannelError::BadLength {
+                expected: cell_bytes,
+                got: wire_len,
+            });
+        }
+        let cap1 = u64::from(binding.capacity).saturating_add(1);
+        let offset = (sequence % cap1) * cell_bytes as u64;
+        let cell = unsafe {
+            std::slice::from_raw_parts_mut((binding.mirror_base + offset) as *mut u8, cell_bytes)
+        };
+        if self.dtype == DType::Bool {
+            pack_bool_into(native, cell);
+        } else {
+            cell.copy_from_slice(native);
+        }
+        // Re-publish the unchanged tail so the replacement bytes happen-before
+        // the next consumer's acquire of queue state without changing occupancy.
+        let tail = load_word(binding.word_base, binding.tail_word_index as usize);
+        store_word(binding.word_base, binding.tail_word_index as usize, tail);
+        Ok(())
+    }
+
+    pub fn front_override(&self) -> Option<Vec<u8>> {
+        self.front_override.clone()
+    }
+
+    pub fn consume_front_override(&mut self) {
+        self.front_override = None;
+    }
+
     /// Write one cell into the driver-shared Writer ring (plan §4.2): check
     /// poison/closed/backpressure via the shared words, write the wire bytes
     /// at `tail % cap1`, then release-publish the incremented tail word. The
@@ -624,6 +739,7 @@ impl ChannelCell {
             }
         }
         let value = self.produced.pop_front().ok_or(ChannelError::Empty)?;
+        self.front_override = None;
         if let Some(reader) = &self.reader {
             let head = load_word(reader.word_base, reader.head_word_index);
             store_word(reader.word_base, reader.head_word_index, head + 1);
@@ -830,7 +946,10 @@ pub fn staged_put_bytes(cell: &Arc<Mutex<ChannelCell>>) -> Option<Vec<u8>> {
     if c.role != Some(HostRole::Writer) {
         return None;
     }
-    c.staged.front().cloned().or_else(|| c.ring_host_copies.front().cloned())
+    c.staged
+        .front()
+        .cloned()
+        .or_else(|| c.ring_host_copies.front().cloned())
 }
 
 /// A submitted fire consumed one Writer entry: drop the ring host copy
@@ -839,6 +958,7 @@ pub fn staged_put_bytes(cell: &Arc<Mutex<ChannelCell>>) -> Option<Vec<u8>> {
 /// ring writes, not yet consumable by any fire.)
 pub fn consume_writer_host_copy(cell: &Arc<Mutex<ChannelCell>>) {
     let mut c = cell.lock().unwrap();
+    c.consume_front_override();
     if c.role != Some(HostRole::Writer) {
         return;
     }
@@ -1202,6 +1322,42 @@ mod tests {
     }
 
     #[test]
+    fn set_empty_and_errors_without_changing_staging() {
+        let mut cell = ChannelCell::new(vec![1], DType::I32, 2);
+        assert_eq!(
+            cell.set(1i32.to_le_bytes().to_vec()).unwrap_err(),
+            ChannelError::Empty
+        );
+
+        cell.put(1i32.to_le_bytes().to_vec()).unwrap();
+        cell.put(2i32.to_le_bytes().to_vec()).unwrap();
+        assert_eq!(
+            cell.put(3i32.to_le_bytes().to_vec()).unwrap_err(),
+            ChannelError::Full
+        );
+        assert_eq!(
+            cell.set(7i32.to_le_bytes().to_vec()).unwrap_err(),
+            ChannelError::Empty,
+            "pre-bind puts are staged, not a committed front"
+        );
+        assert_eq!(cell.staged.len(), 2, "set never changes staged occupancy");
+        assert_eq!(cell.staged[0], 1i32.to_le_bytes());
+        assert_eq!(cell.staged[1], 2i32.to_le_bytes());
+        assert_eq!(
+            cell.set(vec![0]).unwrap_err(),
+            ChannelError::BadLength {
+                expected: 4,
+                got: 1
+            }
+        );
+        cell.poison("test failure");
+        assert_eq!(
+            cell.set(3i32.to_le_bytes().to_vec()).unwrap_err(),
+            ChannelError::Poisoned("test failure".into())
+        );
+    }
+
+    #[test]
     fn bind_validates_constructor_geometry() {
         let c = ChannelCell::new(vec![2, 3], DType::U32, 1);
         assert!(
@@ -1442,6 +1598,49 @@ mod tests {
     }
 
     #[test]
+    fn writer_set_replaces_only_committed_front_and_rejects_in_flight_use() {
+        let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, true);
+        declaration.capacity = 2;
+        let mut writer = ChannelCell::new(vec![8], DType::Bool, 2);
+        writer.bind(&declaration);
+        writer.seed_taken = true;
+        writer.writer_tail = 1;
+        let mirror = Box::leak(vec![1u8, 0, 0].into_boxed_slice());
+        let words = Box::leak(
+            vec![
+                AtomicU64::new(0),
+                AtomicU64::new(1),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ]
+            .into_boxed_slice(),
+        );
+        attach_writer(&mut writer, mirror, words, 1, 2);
+        let second = vec![0, 1, 0, 0, 0, 0, 0, 0];
+        writer.put(second).unwrap();
+
+        writer.set(vec![0, 0, 1, 0, 0, 0, 0, 0]).unwrap();
+        writer.set(vec![0, 0, 0, 1, 0, 0, 0, 0]).unwrap();
+        assert_eq!(words[0].load(Ordering::Acquire), 0);
+        assert_eq!(words[1].load(Ordering::Acquire), 2);
+        assert_eq!(mirror[0], 8, "repeat set replaces the same front slot");
+        assert_eq!(mirror[1], 2, "capacity>1 replacement leaves the next slot");
+        assert_eq!(
+            writer.put(vec![0; 8]).unwrap_err(),
+            ChannelError::Full,
+            "set does not release put backpressure"
+        );
+
+        assert_eq!(
+            writer.reserve_device_ticket(true, false),
+            (0, crate::driver::command::CHANNEL_TICKET_NONE)
+        );
+        assert_eq!(writer.set(vec![1; 8]).unwrap_err(), ChannelError::InFlight);
+        assert_eq!(mirror[0], 8, "an in-flight front is never overwritten");
+        assert_eq!(mirror[1], 2, "queued put remains intact");
+    }
+
+    #[test]
     fn cold_rebind_resynchronizes_device_tickets_from_the_live_ring() {
         let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, false);
         declaration.capacity = 2;
@@ -1492,9 +1691,14 @@ mod tests {
             writer.put(vec![0; 8]).unwrap_err(),
             ChannelError::Poisoned(_)
         ));
+        assert!(matches!(
+            writer.set(vec![0; 8]).unwrap_err(),
+            ChannelError::Poisoned(_)
+        ));
         words[2].store(0, Ordering::Release);
         words[3].store(1, Ordering::Release);
         assert_eq!(writer.put(vec![0; 8]).unwrap_err(), ChannelError::Closed);
+        assert_eq!(writer.set(vec![0; 8]).unwrap_err(), ChannelError::Closed);
     }
 
     #[test]

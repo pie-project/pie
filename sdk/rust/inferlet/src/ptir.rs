@@ -317,6 +317,15 @@ impl Channel {
             }
         }
     }
+
+    /// Atomically replace the committed front cell without changing queue
+    /// occupancy. A later value already queued by [`put`](Self::put) is left
+    /// untouched. This is a host operation; unlike a stage `put`, it records no
+    /// PTIR op.
+    pub fn set(&self, v: impl IntoConst) -> Result<(), String> {
+        let data: ConstData = v.into_const();
+        self.wit().set(&data.bytes)
+    }
 }
 
 /// The result of [`Channel::take`]/[`Channel::read`]. In a stage closure it is
