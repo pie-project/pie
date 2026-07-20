@@ -33,7 +33,7 @@ pub mod write;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, RwLock};
 
@@ -64,8 +64,6 @@ pub enum KvStoreError {
     HostSwapFull { requested: usize, available: usize },
     #[error("invalid KV index key: {reason}")]
     BadIndexKey { reason: &'static str },
-    #[error("KV indexing is disabled")]
-    IndexDisabled,
 }
 
 pub const MAX_INDEX_KEY_BYTES: usize = 256;
@@ -229,8 +227,6 @@ pub struct KvStore {
     /// Inferlet-owned opaque index. Values carry no token or layout meaning;
     /// each entry owns one cache-root lease for its snapshot terminal.
     indexes: HashMap<Vec<u8>, KvIndexEntry>,
-    index_order: VecDeque<Vec<u8>>,
-    max_indexes: usize,
     /// Monotonic submission sequence: bumped per prepared write. Freed slots
     /// are recycled tagged with the current value and retired once the fire
     /// carrying that sequence completes (FIFO stream order), or immediately
@@ -284,8 +280,6 @@ impl KvStore {
             #[cfg(test)]
             cas: HashMap::new(),
             indexes: HashMap::new(),
-            index_order: VecDeque::new(),
-            max_indexes: working_set::index_roots_max(),
             seq: 0,
             in_flight: 0,
         }
@@ -349,28 +343,14 @@ impl KvStore {
     /// reclaimable by replacing the previous entry.
     pub fn update_index(&mut self, key: Vec<u8>, ws: WorkingSetId) -> Result<usize, KvStoreError> {
         Self::validate_index_key(&key)?;
-        if self.max_indexes == 0 {
-            return Err(KvStoreError::IndexDisabled);
-        }
         let snapshot = self.table.index_snapshot(ws)?;
         if let Some(root) = snapshot.terminal {
             self.table.lease_cache_root(root);
         }
-        self.index_order.retain(|existing| existing != &key);
-        self.index_order.push_back(key.clone());
         let replaced = self.indexes.insert(key, KvIndexEntry { snapshot });
-        let mut freed = replaced.map_or(0, |entry| {
+        let freed = replaced.map_or(0, |entry| {
             self.release_index_entry(entry, self.current_epoch())
         });
-        while self.indexes.len() > self.max_indexes {
-            let oldest = self
-                .index_order
-                .pop_front()
-                .expect("index order covers every indexed key");
-            if let Some(entry) = self.indexes.remove(&oldest) {
-                freed += self.release_index_entry(entry, self.current_epoch());
-            }
-        }
         Ok(freed)
     }
 
@@ -393,8 +373,6 @@ impl KvStore {
         let Some(entry) = self.indexes.remove(key) else {
             return Ok((false, 0));
         };
-        self.index_order
-            .retain(|existing| existing.as_slice() != key);
         let epoch = self.current_epoch();
         let freed = self.release_index_entry(entry, epoch);
         Ok((true, freed))
@@ -1117,9 +1095,6 @@ impl KvStore {
                     .terminal
                     .is_none_or(|node| table.is_cache_root(node))
             });
-            let indexes = &self.indexes;
-            self.index_order
-                .retain(|key| indexes.contains_key(key.as_slice()));
         }
         let count = freed.len();
         self.recycle_backings(freed, epoch);

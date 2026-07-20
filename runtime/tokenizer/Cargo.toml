@@ -19,10 +19,10 @@ base64 = "0.22.1"
 unicode-normalization = "0.1"
 rustc-hash = "2.1"
 smallvec = "1"
-fancy-regex = "0.16.0"
+fancy-regex = "0.18.0"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 memchr = "2"
 
 [dev-dependencies]
 tempfile = "3"
-tokenizers = "0.21"
+tokenizers = "0.23"

@@ -59,7 +59,9 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
     let (handle, first_rx) = match state.sessions.create(ident, first, Affinity::Sticky).await {
         Ok(pair) => pair,
         Err(e) => {
-            let _ = tx.send(Message::Text(error_json(&e.to_string()))).await;
+            let _ = tx
+                .send(Message::Text(error_json(&e.to_string()).into()))
+                .await;
             let _ = tx.send(Message::Close(None)).await;
             return;
         }
@@ -80,7 +82,7 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                     // decode.
                     match encode(&msg) {
                         Some(bytes) => {
-                            if tx.send(Message::Binary(bytes)).await.is_err() {
+                            if tx.send(Message::Binary(bytes.into())).await.is_err() {
                                 break; // user hung up
                             }
                         }
@@ -90,13 +92,19 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                 // Clean end-of-turn: tell the client, then park awaiting the next.
                 Some(Tokens::Eos) => {
                     cur = None;
-                    if tx.send(Message::Text(turn_done_json())).await.is_err() {
+                    if tx
+                        .send(Message::Text(turn_done_json().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
                 // Channel closed without Eos ⇒ mid-stream abort: close the socket.
                 None => {
-                    let _ = tx.send(Message::Text(error_json("stream aborted"))).await;
+                    let _ = tx
+                        .send(Message::Text(error_json("stream aborted").into()))
+                        .await;
                     let _ = tx.send(Message::Close(None)).await;
                     break;
                 }
@@ -107,27 +115,31 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                     Ok(Incoming::Turn(req)) => match handle.turn(req).await {
                         Ok(new_rx) => cur = Some(new_rx),
                         Err(e) => {
-                            let _ = tx.send(Message::Text(error_json(&e.to_string()))).await;
+                            let _ = tx
+                                .send(Message::Text(error_json(&e.to_string()).into()))
+                                .await;
                             break;
                         }
                     },
                     Ok(Incoming::Cancel) => handle.cancel().await,
                     Err(e) => {
                         // Bad frame is non-fatal: report and keep the session.
-                        let _ = tx.send(Message::Text(error_json(&e))).await;
+                        let _ = tx.send(Message::Text(error_json(&e).into())).await;
                     }
                 },
                 Some(Ok(Message::Binary(b))) => match parse_incoming_bytes(&b) {
                     Ok(Incoming::Turn(req)) => match handle.turn(req).await {
                         Ok(new_rx) => cur = Some(new_rx),
                         Err(e) => {
-                            let _ = tx.send(Message::Text(error_json(&e.to_string()))).await;
+                            let _ = tx
+                                .send(Message::Text(error_json(&e.to_string()).into()))
+                                .await;
                             break;
                         }
                     },
                     Ok(Incoming::Cancel) => handle.cancel().await,
                     Err(e) => {
-                        let _ = tx.send(Message::Text(error_json(&e))).await;
+                        let _ = tx.send(Message::Text(error_json(&e).into())).await;
                     }
                 },
                 Some(Ok(Message::Close(_))) | None => break,

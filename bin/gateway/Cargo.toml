@@ -20,6 +20,6 @@ pie-bootstrap = { path = "../../bootstrap" }
 # The gateway role library: `Config::parse` + async `run` + `GatewayHandle::shutdown`.
 pie-gateway = { path = "../../gateway" }
 anyhow = "1"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 # This bin owns the runtime (Model A — bootstrap is runtime-agnostic).
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

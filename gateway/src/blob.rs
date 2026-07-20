@@ -142,7 +142,7 @@ impl BlobStore for GatewayOriginStore {
 /// second server.
 pub fn router(store: Arc<dyn BlobStore>) -> Router {
     Router::new()
-        .route("/blob/:hash", get(serve_blob))
+        .route("/blob/{hash}", get(serve_blob))
         .with_state(store)
 }
 

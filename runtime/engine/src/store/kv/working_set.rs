@@ -26,17 +26,6 @@ use std::sync::{Arc, Mutex};
 use super::page_table::WorkingSetId;
 use crate::driver::DriverId;
 
-/// Explicit index-entry cap (`PIE_KV_CACHE_ROOTS_MAX`, default 256).
-pub fn index_roots_max() -> usize {
-    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX.get_or_init(|| {
-        std::env::var("PIE_KV_CACHE_ROOTS_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(256)
-    })
-}
-
 /// Idempotent release fallback shared by every clone of one [`KvWorkingSet`].
 #[derive(Debug)]
 struct KvLifecycle {

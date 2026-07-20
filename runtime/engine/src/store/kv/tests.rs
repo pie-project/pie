@@ -818,19 +818,19 @@ fn store_index_replacement_keeps_existing_loaded_view() {
 }
 
 #[test]
-fn store_index_capacity_evicts_oldest_key() {
+fn store_index_count_does_not_evict_entries() {
     let mut store = KvStore::new(4, h(42));
-    store.max_indexes = 1;
-    let first = store.create_working_set();
-    commit_fresh(&mut store, first, 1, 1);
-    let second = store.create_working_set();
-    commit_fresh(&mut store, second, 1, 1);
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 1, 1);
 
-    store.update_index(b"first".to_vec(), first).unwrap();
-    store.update_index(b"second".to_vec(), second).unwrap();
+    for index in 0..257 {
+        store
+            .update_index(format!("index-{index}").into_bytes(), ws)
+            .unwrap();
+    }
 
-    assert!(store.from_index(b"first").unwrap().is_none());
-    assert!(store.from_index(b"second").unwrap().is_some());
+    assert!(store.from_index(b"index-0").unwrap().is_some());
+    assert!(store.from_index(b"index-256").unwrap().is_some());
 }
 
 #[test]

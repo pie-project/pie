@@ -21,8 +21,8 @@ pub use inferlet_macros::{main, tool};
 // WIT's own `async func` annotations drive async generation: only
 // run/execute/receive become `async fn` (component-model-async); sync funcs
 // (model::encode, chat::*, …) stay sync. wit-bindgen generates the wasi:io
-// bindings itself (0.58-suffixed cabi_realloc) so it doesn't collide with
-// std's 0.57.1 copy.
+// bindings itself with versioned cabi_realloc symbols so it doesn't collide
+// with std's copy.
 wit_bindgen::generate!({
     path: "wit",
     world: "inferlet",
@@ -64,7 +64,6 @@ pub mod ptir;
 /// REPLAY factors out to the inferlet's carrier prefill; the `Context::save/open`
 /// facade is the sugar that gets deleted. See `ptir-snapshot-keepcore-spec`.
 pub mod snapshot;
-
 
 /// Device tensor + tensor-program substrate (the WIT `tensor` interface).
 ///
@@ -182,8 +181,8 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 pub mod prelude {
     pub use crate::model;
     pub use crate::runtime;
-    pub use crate::{Result, Schema, Tool};
-    pub use crate::{main, tool};
     pub use crate::tensor;
+    pub use crate::{Result, Schema, Tool};
     pub use crate::{chat, reasoning, tools};
+    pub use crate::{main, tool};
 }

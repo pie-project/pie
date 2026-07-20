@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 pie-tokenizer = { path = "../tokenizer" }
 anyhow = "1.0"
-lru = "0.16.3"
+lru = "0.18.1"
 rustc-hash = "2.1"
 serde_json = { version = "1.0", features = ["preserve_order"] }
-fancy-regex = "0.16.0"
+fancy-regex = "0.18.0"

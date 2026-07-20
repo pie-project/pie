@@ -15,7 +15,6 @@ fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
         std::env::set_var("PIE_KV_CONTENTION", "preempt");
         std::env::set_var("PIE_KV_PREEMPT_ACTIVE", "1");
         std::env::set_var("PIE_KV_EXHAUSTION_MS", "5000");
-        std::env::set_var("PIE_KV_CACHE_ROOTS_MAX", "0");
     }
     inferlets::build_inferlets();
     let runtime = tokio::runtime::Runtime::new().unwrap();
