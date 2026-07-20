@@ -259,13 +259,6 @@ impl PendingOp {
         }
     }
 
-    fn request_cancel(&self) {
-        if let PendingOp::Fire(fire) = self {
-            fire.completion.request_cancel();
-            crate::scheduler::nudge(0);
-        }
-    }
-
     pub(crate) fn is_preemption_safe_unprepared(&self) -> bool {
         false
     }
@@ -606,14 +599,6 @@ pub async fn submit_pass<C: FireContext>(
             if pipeline.scope.is_closed() {
                 return Ok(Err("pipeline: pipeline is closed".to_string()));
             }
-            // F7: `finish` ended the ordered stream — a later submit is a
-            // guest contract error, surfaced here rather than as a
-            // scheduler mystery.
-            if pipeline.finished.load(std::sync::atomic::Ordering::Acquire) {
-                return Ok(Err(
-                    "pipeline: submit after finish (the stream ended)".to_string()
-                ));
-            }
             (
                 pipeline.fires.clone(),
                 pipeline.failure.clone(),
@@ -852,7 +837,7 @@ pub async fn submit_pass<C: FireContext>(
         ticket_reservation.apply_to(&mut req);
         let retry_cells = cells.clone();
         let retry_accesses = accesses.clone();
-        let finished_flag = ctx.resources().get(&this)?.finished.clone();
+        let closed_scope = pipeline_scope.clone();
         let retry_classifier: crate::scheduler::RetryClassifier = Box::new(move || {
             retry_cells
                 .iter()
@@ -860,21 +845,19 @@ pub async fn submit_pass<C: FireContext>(
                 .find_map(|(cell, &(consume, publish))| {
                     let cell = cell.lock().unwrap();
                     cell.permanent_retry_cause(consume || publish).or_else(|| {
-                        // F8: finish() is the decidability point — a put
+                        // Close is the decidability point: a put
                         // still blocked on a full ring with no attached
                         // consumer and no host role can never commit.
-                        (publish
-                            && finished_flag.load(std::sync::atomic::Ordering::Acquire)
-                            && cell.is_consumerless_device_ring())
-                        .then(|| {
-                            format!(
-                                "channel {} put can never commit: the pipeline \
-                                 finished with no consumer attached \
+                        (publish && closed_scope.is_closed() && cell.is_consumerless_device_ring())
+                            .then(|| {
+                                format!(
+                                    "channel {} put can never commit: the pipeline \
+                                 closed with no consumer attached \
                                  (device-only ring, single pass) — a definite \
                                  deadlock",
-                                cell.global_id
-                            )
-                        })
+                                    cell.global_id
+                                )
+                            })
                     })
                 })
         });
@@ -1070,40 +1053,28 @@ pub async fn copy_into_inner<C: FireContext>(
     Ok(Ok(()))
 }
 
-/// Shared close/drop body — close = cancel (operator ruling R4-1,
-/// 2026-07-17, reversing iteration 62's cb965fbb "close cancels nothing"):
-/// close and drop mean the same thing. End-of-stream is no longer close's
-/// job (the final-submit marker carries it, R4-2, and the scheduler leaves
-/// at the last fire's wave dispatch, R4-3) — close is the ABORT: every
-/// queued/preparing fire is cancelled and its scheduler books are deleted;
-/// already-dispatched fires are GPU-owned and run to settlement (their
-/// credits were consumed at dispatch, so the ledger is already clean).
-///
-/// ORDER MATTERS: cancel flags are set on every FIFO op BEFORE the leave is
-/// notified, so a preparation finishing asynchronously after the leave sees
-/// its cancel flag and rejects WITHOUT publishing a credit — no stale
-/// publication exists on the close path, which is what lets the W1
-/// leave-transfer stay deleted (F6). The pin-safety finalize drain stays:
-/// each fire's prepared KV/RS state must resolve — settled or rejected —
-/// before close returns (the
-/// concurrent_race probe catches finalization deferred past close).
-async fn pipeline_cancel_and_drain<C: FireContext>(
+/// Shared close/drop body. Close is the sole end-of-stream verb: it rejects
+/// later submissions, releases the scheduler wait-set immediately, then
+/// drains every already-submitted FIFO operation to settlement without
+/// cancelling it. Finalization leaves committed reader cells available to
+/// channel `take` after close returns. Drop is exactly the same lifecycle
+/// plus deletion of the WIT resource.
+async fn pipeline_close_and_drain<C: FireContext>(
     ctx: &mut C,
     this: &Resource<Pipeline>,
 ) -> Anyhow<()> {
-    let fires = ctx.resources().get(this).ok().map(|pipeline| {
-        pipeline.scope.close();
-        pipeline.fires.clone()
+    let state = ctx.resources().get(this).ok().map(|pipeline| {
+        let first_close = pipeline.scope.close();
+        (first_close, pipeline.fires.clone())
     });
-    if let Some(fires) = fires {
-        let _finalize_guard = fires.finalize_guard().await;
-        for fire in fires.lock().unwrap().iter() {
-            fire.request_cancel();
+    if let Some((first_close, fires)) = state {
+        if first_close {
+            crate::scheduler::worker::notify_pipeline_leave(
+                ctx.process_id(),
+                crate::scheduler::worker::LeaveKind::Close,
+            );
         }
-        crate::scheduler::worker::notify_pipeline_leave(
-            ctx.process_id(),
-            crate::scheduler::worker::LeaveKind::Close,
-        );
+        let _finalize_guard = fires.finalize_guard().await;
         loop {
             let fire = fires.lock().unwrap().pop_front();
             match fire {
@@ -1113,40 +1084,16 @@ async fn pipeline_cancel_and_drain<C: FireContext>(
                 None => break,
             }
         }
-    } else {
-        crate::scheduler::worker::notify_pipeline_leave(
-            ctx.process_id(),
-            crate::scheduler::worker::LeaveKind::Close,
-        );
     }
-    Ok(())
-}
-
-/// `pipeline.finish` (F7): graceful end of stream. A SEQUENCED verb — the
-/// finish event rides the same FIFO scheduler channel the pipeline's
-/// submissions rode, so it lands after every prior fire's admission (the
-/// same ordering close-at-last-submit relied on). The scheduler sets the
-/// stream books' `end_seen` at receipt; the leave condition (end_seen &&
-/// undispatched == 0, R4-3) is untouched, so the row leaves the wait-set
-/// the moment the last fire dispatches. Queued fires DRAIN normally —
-/// finish cancels nothing; `close` remains the cancel.
-pub async fn pipeline_finish<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
-    if let Ok(pipeline) = ctx.resources().get(&this) {
-        pipeline
-            .finished
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-    crate::scheduler::worker::notify_pipeline_finish(ctx.process_id());
     Ok(())
 }
 
 pub async fn pipeline_close<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
-    pipeline_cancel_and_drain(ctx, &this).await
+    pipeline_close_and_drain(ctx, &this).await
 }
 
 pub async fn pipeline_drop<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
-    // Close semantics plus resource deletion (drop implies close, R4-1).
-    pipeline_cancel_and_drain(ctx, &this).await?;
+    pipeline_close_and_drain(ctx, &this).await?;
     ctx.resources().delete(this)?;
     Ok(())
 }
@@ -1442,12 +1389,6 @@ async fn fire_device_geometry<C: FireContext>(
         let pipeline = ctx.resources().get(&this)?;
         if pipeline.scope.is_closed() {
             return Ok(Err("pipeline: pipeline is closed".to_string()));
-        }
-        // F7 — same contract as the ordinary submit.
-        if pipeline.finished.load(std::sync::atomic::Ordering::Acquire) {
-            return Ok(Err(
-                "pipeline: submit after finish (the stream ended)".to_string()
-            ));
         }
         (
             pipeline.fires.clone(),
@@ -1782,4 +1723,75 @@ fn reclaim_device_geometry_grants<C: FireContext>(ctx: &mut C, fwd_rep: u32, ins
     // pages until the working set discards or drops them (a discard here
     // would shift live indexes under the pass — see the pass-drop note).
     let _ = (ws_rep, reclaimed);
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use wasmtime::component::ResourceTable;
+
+    struct TestContext {
+        id: uuid::Uuid,
+        resources: ResourceTable,
+    }
+
+    impl FireContext for TestContext {
+        fn resources(&mut self) -> &mut ResourceTable {
+            &mut self.resources
+        }
+
+        fn process_id(&self) -> uuid::Uuid {
+            self.id
+        }
+
+        async fn honor_preemption(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn preemption_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+            None
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_and_drop_share_graceful_fifo_drain_semantics() -> anyhow::Result<()> {
+        let mut context = TestContext {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+        };
+        let pipeline = context.resources.push(Pipeline::new())?;
+        let rep = pipeline.rep();
+        let borrowed: Resource<Pipeline> = Resource::new_borrow(rep);
+        let fires = context.resources.get(&borrowed)?.fires.clone();
+        fires
+            .lock()
+            .unwrap()
+            .extend([test_pending_op_stub(), test_pending_op_stub()]);
+
+        pipeline_close(&mut context, Resource::new_borrow(rep)).await?;
+        assert!(context.resources.get(&borrowed)?.scope.is_closed());
+        assert!(fires.lock().unwrap().is_empty());
+        let missing_ws: Resource<KvWorkingSet> = Resource::new_borrow(u32::MAX);
+        assert_eq!(
+            copy_into_inner(
+                &mut context,
+                Resource::new_borrow(rep),
+                missing_ws,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await?,
+            Err("pipeline copy_into: pipeline is closed".to_string()),
+            "later submissions fail before touching their work resources"
+        );
+        // Repeated close is idempotent and does not manufacture work.
+        pipeline_close(&mut context, Resource::new_borrow(rep)).await?;
+        assert!(fires.lock().unwrap().is_empty());
+
+        pipeline_drop(&mut context, pipeline).await?;
+        assert!(context.resources.get(&borrowed).is_err());
+        Ok(())
+    }
 }

@@ -375,8 +375,8 @@ impl ChannelCell {
 
     /// F8 deadlock decidability: a DEVICE-ONLY ring (no host role, unseeded)
     /// with fewer than two pass attachments has no consumer for its puts —
-    /// after `pipeline.finish` a publish blocked on it can never commit
-    /// (the finish is what makes this decidable: before it, a consumer pass
+    /// after `pipeline.close` a publish blocked on it can never commit
+    /// (close is what makes this decidable: before it, a consumer pass
     /// could still attach).
     pub fn is_consumerless_device_ring(&self) -> bool {
         self.role == Some(HostRole::None) && !self.seeded && self.attachments.len() < 2

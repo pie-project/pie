@@ -30,14 +30,10 @@ pub(crate) enum FireClause {
 pub(crate) enum LeaveKind {
     Terminate,
     Suspend,
-    /// A pipeline closed or dropped — close = CANCEL (operator ruling R4-1,
-    /// 2026-07-17): every queued/preparing fire is rejected with its credits
-    /// and stream books settled BEFORE the row leaves; already-dispatched
-    /// fires run to settlement. Shares the Terminate cancel machinery
-    /// (Terminate additionally clears frozen state and marks departed). The
-    /// next submission of the process rejoins implicitly. End-of-stream is
-    /// NOT this event's job — the final-submit marker carries it
-    /// (`pipeline.finish` → stream books, F7/R4-3).
+    /// A pipeline closed or dropped. Its wait-set row is released immediately,
+    /// while every request already accepted by the scheduler continues
+    /// untracked to settlement. Later guest submissions are rejected by the
+    /// pipeline resource before they reach the scheduler.
     Close,
 }
 
@@ -46,10 +42,7 @@ pub(crate) enum LeaveKind {
 /// thread (a pipeline's requests may have landed on any of them) so each
 /// thread's local [`quorum::WaitAllPolicy`] drops `pid` from its wave
 /// wait-set. Fire-and-forget: a shutting-down/closed scheduler channel is
-/// silently skipped (nothing left there to notify). `_kind` is unused —
-/// the quorum drops a pipeline the same way whether it terminated or was
-/// merely suspended (see [`quorum::WaitAllPolicy::on_pipeline_leave`]'s
-/// doc); kept on the signature so call sites document which case fired.
+/// silently skipped (nothing left there to notify).
 pub(crate) fn notify_pipeline_leave(pid: ProcessId, _kind: LeaveKind) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
@@ -57,16 +50,6 @@ pub(crate) fn notify_pipeline_leave(pid: ProcessId, _kind: LeaveKind) {
     }
 }
 
-/// `pipeline.finish` (F7): graceful end of stream. Broadcast on the SAME
-/// FIFO channels the pipeline's Launch items rode, so each scheduler
-/// receives it after every prior fire's admission — the marker needs no
-/// per-fire stamp. Fire-and-forget like the leave.
-pub(crate) fn notify_pipeline_finish(pid: ProcessId) {
-    let handles = super::handle_registry().read().unwrap();
-    for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::PipelineFinish(pid));
-    }
-}
 /// No-op: quorum rejoin is implicit on the pipeline's next scheduler
 /// submission, so a join event has
 /// nothing to do here (`store::reclaim` owns the join hook for its own
@@ -437,11 +420,6 @@ enum SchedulerItem {
     /// driver submission completion publishes. Carries no work; it only unblocks the
     /// scheduler's wait so the retire pass runs immediately.
     Nudge,
-    /// A pipeline's stream ended gracefully ([`notify_pipeline_finish`],
-    /// F7): set the stream books' `end_seen`; the row auto-leaves at the
-    /// last fire's dispatch (R4-3), or immediately when nothing is
-    /// undispatched.
-    PipelineFinish(ProcessId),
     /// A pipeline left the fleet ([`notify_pipeline_leave`]'s broadcast).
     /// Handled immediately on dequeue (like [`SchedulerItem::Nudge`]): it
     /// only mutates the run-loop's local `WaitAllPolicy`, never touching
@@ -2249,33 +2227,11 @@ impl BatchScheduler {
             SchedulerItem::ResumePipeline(pid) => {
                 frozen_pipelines.remove(&pid);
             }
-            // Immediate: books only, never `pending`/`instances`. FIFO
-            // receipt order guarantees every prior fire of the pipeline was
-            // admitted first, so end_seen lands after the whole stream's
-            // books entries (F7).
-            SchedulerItem::PipelineFinish(pid) => {
-                if policy.on_stream_finished(pid) {
-                    policy.complete_stream(pid);
-                }
-            }
-            // Immediate, not queued — and ordered reject-BEFORE-leave:
-            // rejected fires settle their credits and stream books against
-            // the still-live row (exact accounting, no untracked transfer —
-            // F6), and only then does the row leave.
+            // Immediate, not queued. Termination rejects queued work; graceful
+            // pipeline close instead releases the wait-set and lets every
+            // already-admitted request drain untracked.
             SchedulerItem::PipelineLeave(pid, kind) => {
-                // Close = cancel (operator ruling R4-1, 2026-07-17,
-                // reversing iteration 62's "close cancels nothing"): every
-                // queued/preparing fire of the pipeline is rejected here and
-                // its books deleted; already-dispatched fires are GPU-owned
-                // and run to settlement (their credits were consumed at
-                // dispatch). Close and Terminate share the cancel machinery
-                // — an in-flight control's coupled queued launch is
-                // protected from direct rejection and unwinds through the
-                // cancelled-rejection path once the GPU-owned copy settles.
-                // Suspend (TASK-B preempt) still leaves with work queued and
-                // stranded credits — FLAGGED open ruling (hold-and-resume vs
-                // drain), not solved in the R4 bundle.
-                if kind != LeaveKind::Suspend {
+                if kind == LeaveKind::Terminate {
                     let protected = in_flight_control
                         .as_ref()
                         .filter(|control| control.pipeline_id == Some(pid))
@@ -2284,8 +2240,6 @@ impl BatchScheduler {
                         completion.request_cancel();
                     }
                     Self::reject_pipeline_queued(pending, policy, pid, protected.as_ref());
-                }
-                if kind == LeaveKind::Terminate {
                     frozen_pipelines.remove(&pid);
                 }
                 if kind != LeaveKind::Close {
@@ -2331,7 +2285,6 @@ impl BatchScheduler {
                     // `pending` behind an in-flight-depth or quorum hold.
                     if let Some(pid) = launch.pipeline_id {
                         departed_pipelines.remove(&pid);
-                        policy.on_fire_admitted(pid);
                     }
                     // No fire-admission early join: the readiness credit below
                     // creates the ordinary wait-set entry. Bind controls use
@@ -2449,7 +2402,6 @@ impl BatchScheduler {
                 match item {
                     QueuedItem::Launch(request) => {
                         Self::drop_request_credit(policy, &request);
-                        Self::resolve_stream_fire(policy, &request);
                         request
                             .completion
                             .reject_unsubmitted("pipeline left while queued");
@@ -2550,22 +2502,6 @@ impl BatchScheduler {
         if request.credit_published {
             let qpid = Self::quorum_pid(policy, request.pipeline_id, request.quorum_generation);
             policy.on_request_dropped(qpid);
-        }
-    }
-
-    /// R4-3 stream-book resolution for a request leaving the undispatched
-    /// set WITHOUT dispatching — every post-admission rejection/cancellation
-    /// site routes through here (wave consumption resolves at the dispatch
-    /// site instead). Unlike the credit, the book entry exists from
-    /// admission regardless of `credit_published`. Stamp-guarded: a stale
-    /// request's books died with its pipeline's leave. A rejected FINAL fire
-    /// completes its stream here — nothing further is coming, so the row
-    /// must not linger awaited.
-    fn resolve_stream_fire(policy: &mut quorum::WaitAllPolicy, request: &PendingRequest) {
-        if let Some(qpid) = Self::quorum_pid(policy, request.pipeline_id, request.quorum_generation)
-            && policy.on_fire_resolved(qpid)
-        {
-            policy.complete_stream(qpid);
         }
     }
 
@@ -3019,30 +2955,6 @@ impl BatchScheduler {
                         for request in accepted.requests.iter_mut() {
                             request.credit_published = false;
                         }
-                        // R4-3 leave-at-last-dispatch: settle every
-                        // participant's stream books, THEN complete finished
-                        // streams — two-phase so no generation bump lands
-                        // between two same-pid participants of this wave. A
-                        // pipeline whose final fire just dispatched leaves
-                        // the wait-set here, as a first-class member of the
-                        // wave it rode: the drain stays dense and no
-                        // post-dispatch hold survives (close-at-last-
-                        // submit's win, iteration 62, carried by the marker).
-                        let mut finished_streams: Vec<ProcessId> = Vec::new();
-                        for request in accepted.requests.iter() {
-                            if let Some(qpid) = Self::quorum_pid(
-                                policy,
-                                request.pipeline_id,
-                                request.quorum_generation,
-                            ) && policy.on_fire_resolved(qpid)
-                                && !finished_streams.contains(&qpid)
-                            {
-                                finished_streams.push(qpid);
-                            }
-                        }
-                        for pid in finished_streams {
-                            policy.complete_stream(pid);
-                        }
                         if super::sched_trace_enabled() {
                             let (candidate_present, candidate_at_depth, candidate_missing) =
                                 policy.candidate_state_counts(&candidate.pipelines);
@@ -3426,7 +3338,6 @@ impl BatchScheduler {
                     unreachable!();
                 };
                 Self::drop_request_credit(policy, &dropped);
-                Self::resolve_stream_fire(policy, &dropped);
                 rejected_stale = true;
                 continue;
             }
@@ -3435,7 +3346,6 @@ impl BatchScheduler {
                     unreachable!();
                 };
                 Self::drop_request_credit(policy, &cancelled);
-                Self::resolve_stream_fire(policy, &cancelled);
                 cancelled
                     .completion
                     .reject_unsubmitted("logical fire cancelled before native launch");
@@ -3454,7 +3364,6 @@ impl BatchScheduler {
                     unreachable!();
                 };
                 Self::drop_request_credit(policy, &stale);
-                Self::resolve_stream_fire(policy, &stale);
                 stale.completion.reject_unsubmitted(format!(
                     "instance {} is unknown or stale",
                     stale.instance_id
@@ -3534,7 +3443,6 @@ impl BatchScheduler {
             if instances.get(&request.instance_id).is_none() {
                 for request in &mut requests {
                     Self::drop_request_credit(policy, request);
-                    Self::resolve_stream_fire(policy, request);
                     let message = format!("instance {} is unknown or stale", request.instance_id);
                     request.completion.reject_unsubmitted(message.clone());
                 }
@@ -3719,32 +3627,10 @@ impl BatchScheduler {
                                             "logical fire remains uncommitted and will retry"
                                         );
                                     }
-                                    // A requeued RETRY re-enters the
-                                    // undispatched set (its dispatch was
-                                    // consumed at post). A STALE stamp on a
-                                    // NON-cancelled retry can only be the
-                                    // finished-stream corner — the last
-                                    // fire dispatched, the row auto-left
-                                    // (generation bumped), then the driver
-                                    // said RETRY — or a Suspend-stranded
-                                    // sibling (flagged rough state either
-                                    // way). RE-JOIN under the current
-                                    // generation and restore `end_seen`:
-                                    // the row re-arms and leaves again
-                                    // cleanly at this fire's dispatch;
-                                    // untracked stays 0 through the corner.
-                                    // (Close/Terminate stale fires never
-                                    // reach here: their cancel flags route
-                                    // to rejection above.)
-                                    if let Some(pid) = request.pipeline_id {
-                                        let stale =
-                                            policy.generation_of(pid) != request.quorum_generation;
-                                        request.quorum_generation = policy.generation_of(pid);
-                                        policy.on_fire_admitted(pid);
-                                        if stale {
-                                            policy.on_stream_end_restored(pid);
-                                        }
-                                    }
+                                    // Preserve the admission generation. A
+                                    // fire retrying after graceful close stays
+                                    // stale and therefore untracked; close must
+                                    // not re-create the wait-set row it released.
                                     if !Self::request_needs_prelaunch(&request) {
                                         let qpid = Self::quorum_pid(
                                             policy,
@@ -6432,6 +6318,67 @@ mod tests {
 
         crate::scheduler::close_instance(&bound_a)?;
         crate::scheduler::close_instance(&bound_b)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipeline_close_drains_the_already_submitted_run_ahead_tail() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                callback_delay_ms: 25,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let pid = ProcessId::new_v4();
+        let mut completions = Vec::new();
+        for _ in 0..3 {
+            let completion = bound.reserve_completion();
+            crate::scheduler::submit_async(
+                dummy_launch(),
+                driver_id,
+                bound.instance_id,
+                0,
+                Some(pid),
+                completion.clone(),
+            )?;
+            completions.push(completion);
+        }
+
+        // FIFO receipt puts this after all three launches. At least one launch
+        // remains queued behind the scheduler's run-ahead depth while close
+        // releases the wait-set; none may be cancelled.
+        notify_pipeline_leave(pid, LeaveKind::Close);
+        timeout(Duration::from_secs(5), completions.remove(0)).await??;
+        timeout(Duration::from_secs(5), completions.remove(0)).await??;
+
+        // The first two outputs remain committed after close. Consume them as
+        // a post-close `take` would, releasing capacity for the queued third
+        // fire; close did not poison or discard either value.
+        let binding = endpoints[1].registered().binding;
+        let words = binding.word_base as *const std::sync::atomic::AtomicU64;
+        let tail =
+            unsafe { (&*words.add(binding.tail_word_index as usize)).load(Ordering::Acquire) };
+        assert_eq!(tail, 2, "settled outputs remain visible after close");
+        unsafe {
+            (&*words.add(binding.head_word_index as usize)).store(2, Ordering::Release);
+        }
+        crate::scheduler::nudge(driver_id);
+        timeout(Duration::from_secs(5), completions.remove(0)).await??;
+
+        assert!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == "launch")
+                .count()
+                >= 3,
+            "close must preserve queued, preparing, and dispatched fires"
+        );
+
+        crate::scheduler::close_instance(&bound)?;
         Ok(())
     }
 

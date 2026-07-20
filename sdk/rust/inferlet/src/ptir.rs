@@ -1582,13 +1582,12 @@ impl Default for ForwardPass {
 /// A `Pipeline` is an ordering domain, not a program: heterogeneous passes
 /// (an N-wide prefill, then a loop-carried decode) are ONE sequential
 /// stream and belong on ONE pipeline — never split phases of the same
-/// stream across pipelines. Call [`Pipeline::finish`] right after the last
-/// submit; on an early stop (stop token), call [`Pipeline::close`], which
-/// CANCELS everything still unexecuted — takes of cancelled fires error,
-/// so a drain loop must tolerate that. Separate pipelines are for
+/// stream across pipelines. Call [`Pipeline::close`] right after the last
+/// submit; already-submitted run-ahead fires settle normally and remain
+/// take-able. Separate pipelines are for
 /// genuinely CONCURRENT streams only (draft vs target model in speculative
-/// decoding, parallel beam branches, independent requests) — each such
-/// stream still ends with its own `finish()`.
+/// decoding, parallel beam branches, independent requests) — close each
+/// stream when it will accept no more submissions.
 pub struct Pipeline {
     wit: wit_pipeline::Pipeline,
 }
@@ -1600,21 +1599,9 @@ impl Pipeline {
         }
     }
 
-    /// `finish()` — graceful END OF STREAM: no further submissions; queued
-    /// fires drain normally. Sequenced with the submissions (same FIFO),
-    /// so calling it right after the last submit is exact — the engine
-    /// stops awaiting the pipeline the moment its last fire dispatches,
-    /// and the drain tail never holds the wave barrier. Later submits
-    /// error; `close()` stays legal afterwards.
-    pub fn finish(&self) {
-        self.wit.finish();
-    }
-
-    /// `close()` — CANCEL the pipeline (implied by drop; close and drop
-    /// mean the same thing): queued/preparing fires are cancelled and
-    /// discarded, already-dispatched fires run to settlement. This is the
-    /// early-stop/abort path — the normal end of a stream is
-    /// [`Pipeline::finish`] after its last submission.
+    /// End the stream and release its scheduler wait-set immediately.
+    /// Already-submitted fires drain to settlement in FIFO order and remain
+    /// take-able; later submissions fail. Dropping a pipeline is identical.
     pub fn close(&self) {
         self.wit.close();
     }

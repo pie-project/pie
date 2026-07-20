@@ -64,10 +64,13 @@ impl PipelineScope {
         self.state.id
     }
 
-    pub(crate) fn close(&self) {
-        self.state
+    /// Mark the scope closed. Returns whether this call performed the
+    /// transition, allowing lifecycle notifications to remain idempotent.
+    pub(crate) fn close(&self) -> bool {
+        !self
+            .state
             .closed
-            .store(true, std::sync::atomic::Ordering::Release);
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 
     pub(crate) fn is_closed(&self) -> bool {

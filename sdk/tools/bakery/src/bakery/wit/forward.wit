@@ -143,7 +143,7 @@ interface forward {
         /// AFTER submit poisons the pass's host-reader channels (surfaced at
         /// `take`/`read` with the fire's error) and fails the pass — further
         /// submits of it error with the root cause. End-of-stream is a
-        /// PIPELINE event, not a fire attribute: call `pipeline.finish`
+        /// PIPELINE event, not a fire attribute: call `pipeline.close`
         /// after the last submit.
         submit: func(on: borrow<pipeline>) -> result<_, error>;
     }

@@ -172,24 +172,6 @@ pub(super) struct PipelineEpoch {
     generation: u64,
 }
 
-/// Per-process stream accounting for leave-at-last-dispatch (operator ruling
-/// R4-3, 2026-07-17). `undispatched` counts fires admitted to the scheduler
-/// (any queue state: preparing, blocked, credited) that have not yet been
-/// consumed by a wave dispatch or terminally rejected; `end_seen` records
-/// that a final-submit marker arrived (`PendingRequest::end_of_stream`).
-/// When `end_seen && undispatched == 0` the process leaves the wait-set
-/// automatically — drain fires ride dense waves as first-class members and
-/// the row disappears the moment its last fire dispatches, so the barrier
-/// never awaits a stream that has ended (close-at-last-submit's win) and
-/// nothing ever rides untracked on the way out (W1's leak class is
-/// unconstructible). NOT a wait-set row: admission must not make a brand-new
-/// pipeline awaited before its first credit (the no-early-join rule).
-#[derive(Debug, Default)]
-struct StreamBooks {
-    undispatched: usize,
-    end_seen: bool,
-}
-
 pub(super) struct WaitAllPolicy {
     /// Rolling estimate (EWMA, α=1/8) of the wave retire-to-retire cadence
     /// in µs. The straggler idleness threshold is `wave_window + cadence`:
@@ -212,11 +194,6 @@ pub(super) struct WaitAllPolicy {
     /// a wave holds unconditionally while any of them is absent.
     pending_binds: BTreeMap<ProcessId, usize>,
     generations: BTreeMap<ProcessId, u64>,
-    /// Stream lifecycle books per process (R4-3 leave-at-last-dispatch).
-    /// Keyed by the same pid as `active`/`generations`; entries exist only
-    /// while the process has admitted-but-undispatched fires or an unmet
-    /// final-submit marker, and are cleared by every leave.
-    streams: BTreeMap<ProcessId, StreamBooks>,
     /// Untracked (pipeline-less) requests in the current wave: counted so an
     /// untracked-only batch still fires, never awaited.
     untracked_ready: usize,
@@ -240,7 +217,6 @@ impl WaitAllPolicy {
             active: BTreeMap::new(),
             pending_binds: BTreeMap::new(),
             generations: BTreeMap::new(),
-            streams: BTreeMap::new(),
             untracked_ready: 0,
             wave_started: None,
             ever_fired: false,
@@ -269,17 +245,7 @@ impl WaitAllPolicy {
             let _ = write!(
                 out,
                 "\n  pipeline {pid}: wave_ready={} demoted={} in_flight={} generation={}",
-                state.wave_ready,
-                state.demoted,
-                state.in_flight,
-                state.generation,
-            );
-        }
-        for (pid, books) in &self.streams {
-            let _ = write!(
-                out,
-                "\n  stream {pid}: undispatched={} end_seen={}",
-                books.undispatched, books.end_seen,
+                state.wave_ready, state.demoted, state.in_flight, state.generation,
             );
         }
         out
@@ -382,98 +348,22 @@ impl WaitAllPolicy {
         }
     }
 
-    /// A pipeline left the fleet (close=cancel / kill / exit / TASK-A
-    /// terminate / TASK-B preempt / R4-3 auto-leave at last dispatch). The
-    /// row and its stream books are deleted and the identity generation
-    /// bumps; a stale-stamped straggler request routes untracked from here
-    /// on (`quorum_pid`). The W1 credit TRANSFER (wave_ready →
-    /// untracked_ready) is DELETED (F6, operator ruling 2026-07-17): under
-    /// close=cancel the worker rejects the pipeline's queued fires — and
-    /// returns their credits — BEFORE this leave, and the auto-leave fires
-    /// only at zero undispatched fires, so a row with a live credit cannot
-    /// reach here on either path. The remaining leave classes with work
-    /// still queued (TASK-B preempt/Suspend) previously relied on the
-    /// untracked ride; their stranded credits now vanish with the row and
-    /// the fires consume via the saturating untracked floor — flagged for
-    /// an operator ruling (hold-and-resume vs drain), not solved here.
-    /// Rejoin is implicit on the process's next request.
+    /// Release a pipeline from the wait-set. Readiness credits already
+    /// published by its queued fires transfer to the untracked bucket; fires
+    /// still preparing publish there after observing the bumped generation.
+    /// This is what lets graceful close stop being awaited immediately while
+    /// every accepted run-ahead fire continues to settlement.
     pub fn on_pipeline_leave(&mut self, pid: ProcessId) {
-        self.active.remove(&pid);
+        if let Some(state) = self.active.remove(&pid) {
+            self.untracked_ready += state.wave_ready;
+        }
         self.pending_binds.remove(&pid);
-        self.streams.remove(&pid);
         *self.generations.entry(pid).or_default() += 1;
         if self.active.is_empty() {
             self.ever_fired = false;
             self.cold_hold_deadline = None;
             self.wave_started = None;
         }
-    }
-
-    /// A tracked fire was admitted to the scheduler queue (or re-admitted by
-    /// a driver RETRY re-arm). CONTRACT: callers stamp-guard — the pid must
-    /// be the request's CURRENT `quorum_pid`. Books only; never creates a
-    /// wait-set row (no-early-join).
-    pub fn on_fire_admitted(&mut self, pid: ProcessId) {
-        self.streams.entry(pid).or_default().undispatched += 1;
-    }
-
-    /// `pipeline.finish` receipt (F7): the stream ended gracefully. FIFO
-    /// receipt order guarantees every prior fire was admitted first, so
-    /// this is exactly the old final-submit marker's information, carried
-    /// by the stream instead of a fire. Returns `true` when the stream is
-    /// already complete (nothing undispatched) — the caller then invokes
-    /// [`Self::complete_stream`]. A pid with no books here has no fires on
-    /// this scheduler: nothing to end, nothing to leave.
-    #[must_use]
-    pub fn on_stream_finished(&mut self, pid: ProcessId) -> bool {
-        let Some(books) = self.streams.get_mut(&pid) else {
-            return false;
-        };
-        books.end_seen = true;
-        books.undispatched == 0
-    }
-
-    /// R4-3 retry corner: a non-cancelled fire re-admitted with a STALE
-    /// stamp can only be a fire whose row already left — the finished
-    /// stream's last fire hit a driver RETRY after its dispatch completed
-    /// the stream (or a Suspend-stranded sibling, whose pipeline is in its
-    /// flagged rough state anyway). Restore `end_seen` so the re-armed row
-    /// leaves again cleanly at this fire's dispatch — untracked stays 0
-    /// through the whole corner.
-    pub fn on_stream_end_restored(&mut self, pid: ProcessId) {
-        self.streams.entry(pid).or_default().end_seen = true;
-    }
-
-    /// A tracked fire terminally left the undispatched set — consumed by a
-    /// wave dispatch or rejected after admission. Returns `true` when the
-    /// stream is complete (final-submit marker seen and nothing left to
-    /// dispatch): the caller must then invoke [`Self::complete_stream`].
-    /// Two-phase so a wave's participant loop finishes all its decrements
-    /// before any row/generation mutation. Stamp-guarded by the caller.
-    /// Missing books are a tolerated no-op: requests injected into the queue
-    /// without a receipt admission (worker unit tests drive dispatch
-    /// directly) resolve against nothing, and stamp-guarding already filters
-    /// every stale path.
-    #[must_use]
-    pub fn on_fire_resolved(&mut self, pid: ProcessId) -> bool {
-        let Some(books) = self.streams.get_mut(&pid) else {
-            return false;
-        };
-        books.undispatched = books.undispatched.saturating_sub(1);
-        books.end_seen && books.undispatched == 0
-    }
-
-    /// R4-3 auto-leave: the stream's last fire dispatched (or terminally
-    /// resolved) after its final-submit marker. All credits were consumed or
-    /// returned with the fires themselves, so the row must be credit-free.
-    pub fn complete_stream(&mut self, pid: ProcessId) {
-        debug_assert!(
-            self.active
-                .get(&pid)
-                .is_none_or(|state| state.wave_ready == 0),
-            "completed stream still holds readiness credits"
-        );
-        self.on_pipeline_leave(pid);
     }
 
     /// The wait-set size (probe/test accessor).
@@ -927,10 +817,7 @@ mod tests {
         // (and the production caller warns loudly).
         assert_eq!(resolve_wave_window(Some("0"), floor), (floor, true));
         assert_eq!(resolve_wave_window(Some("1"), floor), (floor, true));
-        assert_eq!(
-            resolve_wave_window(Some("1999"), floor),
-            (floor, true)
-        );
+        assert_eq!(resolve_wave_window(Some("1999"), floor), (floor, true));
         // At or above the floor the request passes through untouched.
         assert_eq!(resolve_wave_window(Some("2000"), floor), (floor, false));
         assert_eq!(
@@ -949,129 +836,61 @@ mod tests {
         );
     }
 
-    /// W1 regression, retargeted under close=cancel (R4-1/F6): a pipeline
-    /// that closes with fires straddling the leave (one credited+queued,
-    /// one still preparing) keeps the books balanced with NO untracked
-    /// transfer. The worker rejects the queued fire — returning its credit
-    /// and resolving its stream book — BEFORE the leave lands, and the
-    /// preparing fire was cancel-flagged before the leave notification, so
-    /// it rejects without ever publishing. Zero untracked at every step,
-    /// no ghost row, no assert trip; a successor pipeline of the same
-    /// process re-arms legitimately under the new generation.
+    /// Graceful close releases the wait-set immediately without dropping the
+    /// run-ahead tail: an already-credited queued fire transfers to untracked,
+    /// and a still-preparing fire publishes untracked after the generation
+    /// bump. Both credits drain with their fires.
     #[test]
-    fn close_cancels_straddling_fires_with_zero_untracked() {
+    fn close_releases_straddling_fires_to_untracked_drain() {
         let mut policy = WaitAllPolicy::new(64, None);
         let process = pid();
         let now = Instant::now();
         let admitted_generation = policy.generation_of(process);
-        // F_{n-1}: admitted and credited before the close; F_n admitted,
-        // still preparing (no credit yet).
-        policy.on_fire_admitted(process);
-        policy.on_fire_admitted(process);
+
+        // F_0 is credited+queued; F_1 is accepted but still preparing.
         policy.on_pipeline_request(Some(process), now);
-        // pipeline.close(): the worker rejects the queued fire first
-        // (credit returned, book resolved — no marker, so no completion),
-        // the preparing fire resolves its book without a credit, then the
-        // leave deletes the empty row and bumps the generation.
-        policy.on_request_dropped(Some(process));
-        assert!(!policy.on_fire_resolved(process));
-        assert!(!policy.on_fire_resolved(process));
         policy.on_pipeline_leave(process);
         assert_eq!(
             policy.untracked_ready_count(),
-            0,
-            "close must not transfer credits untracked (F6)"
+            1,
+            "the queued fire's published credit must transfer"
         );
-        assert_eq!(policy.active_pipelines(), 0, "no ghost row may re-form");
+        assert_eq!(policy.active_pipelines(), 0, "close releases the wait-set");
         assert_ne!(
             policy.generation_of(process),
             admitted_generation,
             "a leave must bump the identity generation"
         );
-        // A successor pipeline of the SAME process is tracked again.
-        policy.on_fire_admitted(process);
-        policy.on_pipeline_request(Some(process), now);
-        assert_eq!(policy.active_pipelines(), 1);
+
+        // F_1 finishes preparing after close and observes the stale stamp.
+        policy.on_pipeline_request(None, now);
+        assert_eq!(policy.untracked_ready_count(), 2);
+        let epochs = policy.on_wave_dispatched(&[None, None], now);
         assert_eq!(policy.untracked_ready_count(), 0);
+        assert_eq!(policy.active_pipelines(), 0);
+        policy.on_wave_retired(&epochs);
     }
 
-    /// R4-3/F7: a finished stream leaves the wait-set at its last fire's
-    /// wave dispatch — not before (an undispatched fire keeps the row
-    /// awaited, finish or not) and with nothing riding untracked on the
-    /// way out. `finish` arrives on the same FIFO after both admissions.
+    /// A fire that RETRYs after close remains untracked. Retrying must not
+    /// resurrect the released wait-set row.
     #[test]
-    fn finished_stream_leaves_at_last_dispatch() {
+    fn retry_after_close_remains_untracked() {
         let mut policy = WaitAllPolicy::new(64, None);
         let process = pid();
         let now = Instant::now();
-        let admitted_generation = policy.generation_of(process);
-        // Two fires admitted, then the pipeline finishes; both credited.
-        policy.on_fire_admitted(process);
-        policy.on_fire_admitted(process);
-        assert!(
-            !policy.on_stream_finished(process),
-            "two fires still undispatched: finish must not complete"
-        );
-        policy.on_pipeline_join(Some(process));
         policy.on_pipeline_request(Some(process), now);
-        policy.on_pipeline_request(Some(process), now);
-        // F_1 dispatches: end seen, but F_2 is undispatched — the row stays.
-        let epochs_1 = policy.on_wave_dispatched(&[Some(process)], now);
-        assert!(!policy.on_fire_resolved(process));
-        assert_eq!(policy.active_pipelines(), 1);
-        // F_2 dispatches: the stream is complete → auto-leave, zero
-        // untracked, fresh generation.
-        let epochs_2 = policy.on_wave_dispatched(&[Some(process)], now);
-        assert!(policy.on_fire_resolved(process));
-        policy.complete_stream(process);
+        policy.on_pipeline_leave(process);
+        let epochs = policy.on_wave_dispatched(&[None], now);
         assert_eq!(policy.active_pipelines(), 0);
         assert_eq!(policy.untracked_ready_count(), 0);
-        assert_ne!(policy.generation_of(process), admitted_generation);
-        // Retirement of the departed stream's waves is a clean no-op.
-        policy.on_wave_retired(&epochs_1);
-        policy.on_wave_retired(&epochs_2);
-        assert_eq!(policy.untracked_ready_count(), 0);
-    }
 
-    /// The retry-after-final-dispatch corner (operator follow-up to R4):
-    /// the final fire dispatches → the row auto-leaves (generation bumps)
-    /// → the driver says RETRY → the worker re-stamps to the current
-    /// generation, re-admits the book, and restores `end_seen`. The row
-    /// must re-arm, be awaited again, and leave again cleanly at the
-    /// re-dispatch — untracked stays 0 through the whole corner.
-    #[test]
-    fn retry_after_final_dispatch_rearms_and_leaves_again() {
-        let mut policy = WaitAllPolicy::new(64, None);
-        let process = pid();
-        let now = Instant::now();
-        // One-fire stream, finished, dispatched → auto-leave.
-        policy.on_fire_admitted(process);
-        assert!(!policy.on_stream_finished(process));
-        policy.on_pipeline_join(Some(process));
-        policy.on_pipeline_request(Some(process), now);
-        let epochs = policy.on_wave_dispatched(&[Some(process)], now);
-        assert!(policy.on_fire_resolved(process));
-        policy.complete_stream(process);
-        let left_generation = policy.generation_of(process);
+        policy.on_pipeline_request(None, now);
         assert_eq!(policy.active_pipelines(), 0);
-        // Driver RETRY: the worker's re-arm (stale stamp detected → re-join
-        // current generation, restore end_seen, republish the credit).
-        policy.on_fire_admitted(process);
-        policy.on_stream_end_restored(process);
-        policy.on_pipeline_join(Some(process));
-        policy.on_pipeline_request(Some(process), now);
-        assert_eq!(policy.active_pipelines(), 1, "the row must re-arm");
+        assert_eq!(policy.untracked_ready_count(), 1);
+        let epochs_retry = policy.on_wave_dispatched(&[None], now);
         assert_eq!(policy.untracked_ready_count(), 0);
-        // Re-dispatch: the stream completes AGAIN, cleanly.
-        let epochs_retry = policy.on_wave_dispatched(&[Some(process)], now);
-        assert!(policy.on_fire_resolved(process));
-        policy.complete_stream(process);
-        assert_eq!(policy.active_pipelines(), 0);
-        assert_eq!(policy.untracked_ready_count(), 0);
-        assert_ne!(policy.generation_of(process), left_generation);
         policy.on_wave_retired(&epochs);
         policy.on_wave_retired(&epochs_retry);
-        assert_eq!(policy.untracked_ready_count(), 0);
     }
 
     /// W1 consequence regression: once the books drain, the gather clock
@@ -1085,13 +904,12 @@ mod tests {
         let mut policy = WaitAllPolicy::new(64, None);
         let closer = pid();
         let start = Instant::now();
-        // A full close=cancel cycle, fully drained: the queued fire's
-        // credit returns at the reject, then the leave (R4-1 order).
-        policy.on_fire_admitted(closer);
+        // A graceful close transfers the queued fire's credit; its drain
+        // consumes that untracked credit before the next fleet arrives.
         policy.on_pipeline_request(Some(closer), start);
-        policy.on_request_dropped(Some(closer));
-        let _ = policy.on_fire_resolved(closer);
         policy.on_pipeline_leave(closer);
+        let closed_epochs = policy.on_wave_dispatched(&[None], start);
+        policy.on_wave_retired(&closed_epochs);
         assert_eq!(policy.untracked_ready_count(), 0);
         // Long after (>> wave window), a fresh fleet gathers: B is ready,
         // C has joined but is not launch-ready yet.
@@ -1225,17 +1043,30 @@ mod tests {
         let candidates: HashSet<ProcessId> = [a].into_iter().collect();
         let expiry1 = t0 + Duration::from_micros(wave_window().as_micros() as u64 + 100);
         assert_eq!(
-            policy.decide_candidate_wave_at(1, &candidates, &HashSet::new(), &HashSet::new(), false, expiry1),
+            policy.decide_candidate_wave_at(
+                1,
+                &candidates,
+                &HashSet::new(),
+                &HashSet::new(),
+                false,
+                expiry1
+            ),
             WaveDecision::Fire { missing: vec![b] }
         );
         // B kept its credit and was NOT demoted: it still holds the barrier.
         let epochs = policy.on_wave_dispatched(&[Some(a)], expiry1);
         policy.on_wave_retired(&epochs);
         policy.on_pipeline_request(Some(a), expiry1);
-        let expiry2 =
-            expiry1 + Duration::from_micros(wave_window().as_micros() as u64 + 100);
+        let expiry2 = expiry1 + Duration::from_micros(wave_window().as_micros() as u64 + 100);
         assert_eq!(
-            policy.decide_candidate_wave_at(1, &candidates, &HashSet::new(), &HashSet::new(), false, expiry2),
+            policy.decide_candidate_wave_at(
+                1,
+                &candidates,
+                &HashSet::new(),
+                &HashSet::new(),
+                false,
+                expiry2
+            ),
             WaveDecision::Fire { missing: vec![b] }
         );
         // Second expiry demoted B: it no longer blocks the wave decision.
@@ -1243,7 +1074,14 @@ mod tests {
         policy.on_wave_retired(&epochs);
         policy.on_pipeline_request(Some(a), expiry2);
         assert_eq!(
-            policy.decide_candidate_wave_at(1, &candidates, &HashSet::new(), &HashSet::new(), false, expiry2),
+            policy.decide_candidate_wave_at(
+                1,
+                &candidates,
+                &HashSet::new(),
+                &HashSet::new(),
+                false,
+                expiry2
+            ),
             WaveDecision::Fire {
                 missing: Vec::new()
             }
@@ -1493,11 +1331,25 @@ mod tests {
         policy.on_pipeline_request(Some(a), t);
         policy.on_pipeline_request(Some(b), t);
         assert!(matches!(
-            policy.decide_candidate_wave_at(1, &HashSet::from([a]), &HashSet::new(), &HashSet::new(), false, t),
+            policy.decide_candidate_wave_at(
+                1,
+                &HashSet::from([a]),
+                &HashSet::new(),
+                &HashSet::new(),
+                false,
+                t
+            ),
             WaveDecision::Wait(_)
         ));
         assert_eq!(
-            policy.decide_candidate_wave_at(2, &HashSet::from([a, b]), &HashSet::new(), &HashSet::new(), false, t),
+            policy.decide_candidate_wave_at(
+                2,
+                &HashSet::from([a, b]),
+                &HashSet::new(),
+                &HashSet::new(),
+                false,
+                t
+            ),
             WaveDecision::Fire {
                 missing: Vec::new()
             }
@@ -1673,14 +1525,7 @@ mod tests {
         let all_candidates = lanes.into_iter().collect();
         assert_eq!(policy.candidate_state_counts(&all_candidates), (4, 0, 0));
         assert_eq!(
-            policy.decide_candidate_wave_at(
-                4,
-                &all_candidates,
-                &empty,
-                &empty,
-                true,
-                t,
-            ),
+            policy.decide_candidate_wave_at(4, &all_candidates, &empty, &empty, true, t,),
             WaveDecision::Fire {
                 missing: Vec::new()
             }
