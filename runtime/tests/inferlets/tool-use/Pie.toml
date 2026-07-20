@@ -1,0 +1,4 @@
+[package]
+name = "tool-use"
+version = "0.1.0"
+description = "Test inferlet: exercises the tool-use host APIs (equip, system-equip, native grammar, decoder)"

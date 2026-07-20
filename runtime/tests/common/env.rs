@@ -55,14 +55,30 @@ pub fn create_mock_env(
     num_pages: usize,
     behavior: Arc<dyn Behavior>,
 ) -> MockEnv {
+    create_mock_env_for_arch(model_name, num_devices, num_pages, behavior, "", None)
+}
+
+/// Like [`create_mock_env`], but registers the model under a specific
+/// architecture and tokenizer fixture. Needed by tests that exercise a
+/// particular `Instruct` implementation end to end, since the arch string is
+/// what selects it.
+pub fn create_mock_env_for_arch(
+    model_name: &str,
+    num_devices: usize,
+    num_pages: usize,
+    behavior: Arc<dyn Behavior>,
+    arch_name: &str,
+    tokenizer_fixture: Option<&str>,
+) -> MockEnv {
     let backend = MockBackend::new(num_devices, behavior);
 
     let temp_cache = TempDir::new().expect("Failed to create temp cache dir");
     let temp_auth = TempDir::new().expect("Failed to create temp auth dir");
 
     // Path to bundled test tokenizer fixture
-    let tokenizer_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/fixtures/test_tokenizer.json");
+    let tokenizer_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/common/fixtures")
+        .join(tokenizer_fixture.unwrap_or("test_tokenizer.json"));
 
     // The pre-registered mock channels live at `backend.driver_ids()`.
     // `bootstrap::bootstrap` allocates its own DriverIds starting from
@@ -109,7 +125,7 @@ pub fn create_mock_env(
         },
         models: vec![ModelConfig {
             name: model_name.to_string(),
-            arch_name: String::new(),
+            arch_name: arch_name.to_string(),
             kv_page_size: 16,
             tokenizer_path,
             system_speculation_supported: false,
