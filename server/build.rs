@@ -137,7 +137,7 @@ fn build_portable() {
             // ON. Embedding ggml directly (as we do here) misses that override
             // and ends up issuing ~30 kernel launches per decode step, which
             // costs ~1 ms vs ~0.3 ms with capture. Enable explicitly.
-            .define("GGML_CUDA_GRAPHS", "ON")
+            .define("GGML_CUDA_GRAPHS", "OFF")
             .define("GGML_STATIC", "ON")
             // llama.cpp b8994 added a multi-GPU NCCL allreduce path inside
             // ggml-cuda (`GGML_CUDA_NCCL`, default ON when NCCL is present
