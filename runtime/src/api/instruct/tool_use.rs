@@ -30,10 +30,47 @@ impl pie::instruct::tool_use::Host for InstanceState {
         tools: Vec<String>,
     ) -> Result<Result<Vec<u32>, pie::core::types::Error>> {
         let model = self.ctx().table.get(&model)?;
-        let tokens = model.model.instruct().equip(&tools);
+        let instruct = model.model.instruct();
+        // Fail loudly rather than returning zero declarations: the caller is
+        // about to build a matcher from the same toolset, and an unconstrained
+        // prompt paired with a constrained decode is the one combination that
+        // makes the model call tools it was never shown.
+        if instruct.tool_declarations_require_system_turn() && !tools.is_empty() {
+            return Ok(Err(format!(
+                "model `{}` declares tools inside the system turn; use system-equip instead of equip",
+                model.model.name()
+            )));
+        }
+        let tokens = instruct.equip(&tools);
         Ok(Ok(tokens))
     }
 
+    async fn system_equip(
+        &mut self,
+        model: Resource<crate::api::model::Model>,
+        system: String,
+        tools: Vec<String>,
+    ) -> Result<Result<Vec<u32>, pie::core::types::Error>> {
+        let model = self.ctx().table.get(&model)?;
+        let Some(tokens) = model.model.instruct().system_equip(&system, &tools) else {
+            return Ok(Err(format!(
+                "model `{}` cannot declare this toolset; no tools were declared",
+                model.model.name()
+            )));
+        };
+        Ok(Ok(tokens))
+    }
+
+    /// Render a tool result into tokens, trapping when it cannot be represented.
+    ///
+    /// The WIT signature has no way to report an unrepresentable result, so an
+    /// architecture that refuses (Gemma 4, via [`try_answer`]) surfaces as a
+    /// trap in the calling component. That is abrupt but loud; returning an
+    /// empty or truncated token list would hand the model a turn that means
+    /// something other than what the tool returned, which is the failure this
+    /// whole path exists to prevent.
+    ///
+    /// [`try_answer`]: crate::model::instruct::Instruct::try_answer
     async fn answer(
         &mut self,
         model: Resource<crate::api::model::Model>,
@@ -41,7 +78,16 @@ impl pie::instruct::tool_use::Host for InstanceState {
         value: String,
     ) -> Result<Vec<u32>> {
         let model = self.ctx().table.get(&model)?;
-        Ok(model.model.instruct().answer(&name, &value))
+        model
+            .model
+            .instruct()
+            .try_answer(&name, &value)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "model `{}` cannot represent this tool result; it carries a delimiter the wire format has no escape for",
+                    model.model.name()
+                )
+            })
     }
 
     async fn create_decoder(
@@ -50,6 +96,17 @@ impl pie::instruct::tool_use::Host for InstanceState {
     ) -> Result<Resource<Decoder>> {
         let model = self.ctx().table.get(&model)?;
         let inner = model.model.instruct().tool_decoder();
+        let decoder = Decoder { inner };
+        Ok(self.ctx().table.push(decoder)?)
+    }
+
+    async fn create_decoder_for_tools(
+        &mut self,
+        model: Resource<crate::api::model::Model>,
+        tools: Vec<String>,
+    ) -> Result<Resource<Decoder>> {
+        let model = self.ctx().table.get(&model)?;
+        let inner = model.model.instruct().tool_decoder_for_tools(&tools);
         let decoder = Decoder { inner };
         Ok(self.ctx().table.push(decoder)?)
     }
