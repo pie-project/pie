@@ -102,6 +102,7 @@ void nemotron_h_forward_paged(
     const std::int32_t* slot_ids_h,
     const std::uint8_t* is_fresh_h,
     const std::int32_t* slot_ids_d,
+    const std::uint8_t* is_fresh_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows);
 

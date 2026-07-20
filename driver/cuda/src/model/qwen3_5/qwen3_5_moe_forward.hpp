@@ -98,12 +98,22 @@ void qwen3_5_moe_forward_paged(
     bool is_pure_decode,
     const std::uint8_t* mask_d,
     const std::int32_t* mask_indptr_d,
+    const std::uint32_t* w_page_d = nullptr,
+    const std::uint32_t* w_off_d = nullptr,
+    const std::uint8_t* row_valid_d = nullptr,
+    bool has_write_desc = false,
     const std::int32_t* slot_ids_h = nullptr,
     const std::uint8_t* is_fresh_h = nullptr,
     const std::int32_t* slot_ids_d = nullptr,
+    const std::uint8_t* is_fresh_d = nullptr,
     const std::int32_t* logit_row_indices_d = nullptr,
     int num_logit_rows = 0,
-    const std::int32_t* commit_advance_gather = nullptr);
+    const std::int32_t* commit_advance_gather = nullptr,
+    const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
+    const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
+    const std::int32_t* rs_fold_lens_d = nullptr,
+    bool rs_buffer_write = false,
+    bool rs_buffer_fold = false);
 
 void qwen3_5_moe_mtp_process_cache(
     const Qwen3_5MoeWeights& w,

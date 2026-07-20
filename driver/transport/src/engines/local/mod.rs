@@ -64,33 +64,42 @@ impl LocalEngine {
     /// Copy `pages` from `src` into `dst` at matching page offsets. Both handles
     /// are co-located (same node); the copy is a whole-page D2D move.
     ///
-    /// INVARIANT: this addresses only `regions.first()` on each side — it assumes
-    /// a single contiguous KV region per handle (the current producer shape; see
-    /// the driver export shim). A multi-region handle (e.g. per-layer or sharded
-    /// arenas) is out of current scope: only its first region would be moved.
-    /// Generalizing to multi-region addressing is deferred with the RDMA path.
-    fn copy_pages(&self, src: &KvHandle, dst: &KvHandle, pages: &PageSet) -> Result<()> {
+    fn copy_pages(
+        &self,
+        src: &KvHandle,
+        dst: &KvHandle,
+        src_pages: &PageSet,
+        dst_pages: &PageSet,
+    ) -> Result<()> {
         if !src.layout.compatible_with(&dst.layout) {
             return Err(TransportError::LayoutMismatch);
         }
-        let page_bytes = src.page_bytes();
-        let src_region = src.regions.first().ok_or(TransportError::Unsupported(
-            "source handle has no KV region",
-        ))?;
-        let dst_region = dst.regions.first().ok_or(TransportError::Unsupported(
-            "destination handle has no KV region",
-        ))?;
-
-        for &page in &pages.pages {
-            let offset = page as u64 * page_bytes;
-            if offset + page_bytes > src_region.len || offset + page_bytes > dst_region.len {
-                return Err(TransportError::PageOutOfBounds { page });
+        if src.regions.is_empty() || src.regions.len() != dst.regions.len() {
+            return Err(TransportError::LayoutMismatch);
+        }
+        if src_pages.len() != dst_pages.len() {
+            return Err(TransportError::LayoutMismatch);
+        }
+        for (&src_page, &dst_page) in src_pages.pages.iter().zip(&dst_pages.pages) {
+            for (src_region, dst_region) in src.regions.iter().zip(&dst.regions) {
+                if src_region.page_stride == 0 || src_region.page_stride != dst_region.page_stride {
+                    return Err(TransportError::LayoutMismatch);
+                }
+                let stride = src_region.page_stride;
+                let src_offset = src_page as u64 * stride;
+                let dst_offset = dst_page as u64 * stride;
+                if src_offset + stride > src_region.len {
+                    return Err(TransportError::PageOutOfBounds { page: src_page });
+                }
+                if dst_offset + stride > dst_region.len {
+                    return Err(TransportError::PageOutOfBounds { page: dst_page });
+                }
+                self.copier.copy(
+                    src_region.base + src_offset,
+                    dst_region.base + dst_offset,
+                    stride,
+                )?;
             }
-            self.copier.copy(
-                src_region.base + offset,
-                dst_region.base + offset,
-                page_bytes,
-            )?;
         }
         Ok(())
     }
@@ -110,10 +119,11 @@ impl Engine for LocalEngine {
         })
     }
 
-    fn send(
+    fn send_mapped(
         &self,
         handle: &RegisteredHandle,
-        pages: &PageSet,
+        src_pages: &PageSet,
+        dst_pages: &PageSet,
         dst: WorkerId,
     ) -> Result<TransferId> {
         let dst_handle = {
@@ -123,7 +133,7 @@ impl Engine for LocalEngine {
                 .cloned()
                 .ok_or(TransportError::UnknownPeer { worker: dst.0 })?
         };
-        self.copy_pages(&handle.handle, &dst_handle, pages)?;
+        self.copy_pages(&handle.handle, &dst_handle, src_pages, dst_pages)?;
         Ok(self.record(Completion::Done))
     }
 
@@ -136,11 +146,17 @@ impl Engine for LocalEngine {
     /// registered co-located peer and (b) acknowledges with `Completion::Done`.
     /// It performs no copy. The arguments are kept for interface uniformity with
     /// a future cross-node (`nixl`) engine, where `recv` posts the actual pull.
-    fn recv(&self, slot: &RegisteredHandle, pages: &PageSet, src: WorkerId) -> Result<TransferId> {
+    fn recv_mapped(
+        &self,
+        slot: &RegisteredHandle,
+        dst_pages: &PageSet,
+        src_pages: &PageSet,
+        src: WorkerId,
+    ) -> Result<TransferId> {
         if !self.peers.lock().unwrap().contains_key(&src.0) {
             return Err(TransportError::UnknownPeer { worker: src.0 });
         }
-        let _ = (slot, pages);
+        let _ = (slot, dst_pages, src_pages);
         Ok(self.record(Completion::Done))
     }
 

@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "pie_native/ptir/ptir_abi.h"
+
 namespace pie_native {
 
 inline constexpr std::uint8_t PTIR_HOST_NONE = 0;
@@ -103,10 +105,12 @@ inline bool decode_ptir_channels(
         !cursor.read_u32(port_count) || !cursor.read_u32(stage_count)) {
         return fail("truncated PTIR header");
     }
-    if (version != 1 && version != 2) return fail("unsupported PTIR version");
+    if (version != PTIR_VERSION && version != PTIR_VERSION_EXTERN) {
+        return fail("unsupported PTIR version");
+    }
     static_cast<void>(flags);
     std::uint32_t extern_count = 0;
-    if (version == 2 && !cursor.read_u32(extern_count)) {
+    if (version == PTIR_VERSION_EXTERN && !cursor.read_u32(extern_count)) {
         return fail("truncated PTIR extern count");
     }
 
@@ -144,11 +148,10 @@ inline bool decode_ptir_channels(
             return fail("truncated PTIR channel declaration");
         }
         const std::uint32_t cell_bytes = channel.cell_bytes();
-        if (channel.dtype > PIE_CHANNEL_DTYPE_ACT ||
-            channel.host_role > PTIR_HOST_READER ||
-            seeded > 1 ||
-            channel.capacity >= 8 ||
-            cell_bytes == 0 ||
+        if (        channel.dtype > PIE_CHANNEL_DTYPE_ACT ||
+        channel.host_role > PTIR_HOST_READER ||
+        seeded > 1 ||
+        cell_bytes == 0 ||
             static_cast<std::uint64_t>(cell_bytes) *
                     (static_cast<std::uint64_t>(channel.capacity) + 1) >
                 std::numeric_limits<std::size_t>::max()) {
@@ -215,10 +218,12 @@ inline bool decode_ptir_channels(
             case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
             case 0x16: case 0x17: case 0x18: case 0x19: case 0x1A: case 0x1B:
             case 0x1C: case 0x1D: case 0x1F: case 0x51: case 0x55: case 0x60:
-            case 0x61: case 0x65: case 0x92:
+            case 0x61: case 0x65: case 0x66: case 0x92:
                 return cursor.skip(8);
-            case 0x20: case 0x62: case 0x63:
+            case 0x20: case 0x62: case 0x63: case 0x67:
                 return cursor.skip(12);
+            case 0x68:
+                return cursor.skip(16);
             case 0x38: case 0x39:
                 return cursor.skip(4) && skip_shape();
             case 0x58:

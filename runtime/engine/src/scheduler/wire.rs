@@ -7,7 +7,7 @@
 
 use smallvec::{SmallVec, smallvec};
 
-use crate::store::kv::project::PhysicalPageId;
+use pie_driver_abi::EncodedMask;
 use pie_grammar::brle::RunMask;
 
 /// Inline storage for the page-trim bitmap. Sized to cover up to 1024 pages
@@ -207,21 +207,27 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> crate::dr
         audio_feature_indptr: indptr(indptr_cap),
         audio_anchor_rows: Vec::new(),
         audio_indptr: indptr(indptr_cap),
+        embed_rows: Vec::new(),
+        embed_indptr: indptr(indptr_cap),
+        embed_shapes: Vec::new(),
+        embed_dtypes: Vec::new(),
+        embed_anchor_rows: Vec::new(),
+        embed_block_indptr: indptr(indptr_cap),
         ..Default::default()
     }
 }
 
-/// Append the request's physical page IDs to `kv_page_indices`,
+/// Append the request's `kv_page_indices` to the batch's `kv_page_indices`,
 /// honoring the trim plan if present.
 fn emit_kv_pages(
     batch: &mut crate::driver::LaunchPlan,
-    physical_page_ids: &[PhysicalPageId],
+    pages: &[u32],
     trim: Option<&TrimPlan>,
 ) {
     match trim {
-        None => batch.kv_page_indices.extend(physical_page_ids),
+        None => batch.kv_page_indices.extend(pages),
         Some(plan) => {
-            for (idx, &pid) in physical_page_ids.iter().enumerate() {
+            for (idx, &pid) in pages.iter().enumerate() {
                 if !plan.is_page_dropped(idx as u32) {
                     batch.kv_page_indices.push(pid);
                 }
@@ -241,16 +247,17 @@ fn emit_attention_masks(
 ) {
     match trim {
         None => {
-            batch.masks.extend_from_slice(masks);
+            batch.masks.extend(
+                masks
+                    .iter()
+                    .map(|mask| EncodedMask::new(mask.buffer.clone(), mask.total_size)),
+            );
         }
         Some(plan) => {
             for mask in masks {
                 let mut buf = Vec::new();
                 let new_total = mask.write_skipping(&plan.skip_ranges, &mut buf);
-                batch.masks.push(RunMask {
-                    buffer: buf,
-                    total_size: new_total as u64,
-                });
+                batch.masks.push(EncodedMask::new(buf, new_total as u64));
             }
         }
     }
@@ -259,26 +266,19 @@ fn emit_attention_masks(
 
 /// Append a per-request [`crate::driver::LaunchPlan`] into the batched form.
 /// `req` is the single-element shape produced by [`new_per_request`]
-/// (indptrs `[0, N]`, empty kv pages). The scheduler resolved
-/// `physical_page_ids` and `last_page_len` out-of-band; this call
-/// folds them in along with the page-trim plan derived from
-/// `req.masks`. See the file-level docs for trim criteria.
+/// (indptrs `[0, N]`). The request carries its own explicit
+/// `kv_page_indices` (single-explicit-arity contract); the scheduler
+/// resolved `last_page_len` out-of-band. This call folds them in along
+/// with the page-trim plan derived from `req.masks`. See the file-level
+/// docs for trim criteria.
 #[allow(dead_code)] // batch.rs always calls `append_request_with_options` directly.
 pub fn append_request(
     batch: &mut crate::driver::LaunchPlan,
     req: &crate::driver::LaunchPlan,
-    physical_page_ids: &[PhysicalPageId],
     last_page_len: u32,
     page_size: u32,
 ) {
-    append_request_with_options(
-        batch,
-        req,
-        physical_page_ids,
-        last_page_len,
-        page_size,
-        false,
-    );
+    append_request_with_options(batch, req, last_page_len, page_size, false);
 }
 
 /// Append a per-request [`crate::driver::LaunchPlan`] with caller-selected
@@ -288,11 +288,14 @@ pub fn append_request(
 pub fn append_request_with_options(
     batch: &mut crate::driver::LaunchPlan,
     req: &crate::driver::LaunchPlan,
-    physical_page_ids: &[PhysicalPageId],
     last_page_len: u32,
     page_size: u32,
     elide_decode_masks: bool,
 ) {
+    if req.qo_indptr.len().saturating_sub(1) > 1 {
+        append_multi_row_request(batch, req, last_page_len, page_size);
+        return;
+    }
     // Row offset of this request's tokens within the batch — image anchor rows
     // shift by this when merged (captured before extending `token_ids`).
     let row_base = batch.token_ids.len() as u32;
@@ -300,12 +303,14 @@ pub fn append_request_with_options(
     batch.token_ids.extend(&req.token_ids);
     batch.position_ids.extend(&req.position_ids);
 
-    let elide_decode_mask = elide_decode_masks
-        && req.single_token_mode
-        && !req.has_user_mask
-        && req.token_ids.len() <= 1;
+    let elide_decode_mask = req.device_resolved_geometry
+        || (elide_decode_masks
+            && req.single_token_mode
+            && !req.has_user_mask
+            && req.token_ids.len() <= 1);
 
     let synthesized_masks;
+    let decoded_masks;
     let masks = if !elide_decode_mask && req.masks.is_empty() && !req.position_ids.is_empty() {
         synthesized_masks = req
             .position_ids
@@ -314,7 +319,15 @@ pub fn append_request_with_options(
             .collect::<Vec<_>>();
         synthesized_masks.as_slice()
     } else {
-        req.masks.as_slice()
+        decoded_masks = req
+            .masks
+            .iter()
+            .map(|mask| RunMask {
+                buffer: mask.runs.clone(),
+                total_size: mask.total_size,
+            })
+            .collect::<Vec<_>>();
+        decoded_masks.as_slice()
     };
 
     let trim = if elide_decode_mask {
@@ -322,7 +335,7 @@ pub fn append_request_with_options(
     } else {
         TrimPlan::compute(
             masks,
-            physical_page_ids.len() as u32,
+            req.kv_page_indices.len() as u32,
             last_page_len,
             page_size,
             req.token_ids.len() as u32,
@@ -330,7 +343,7 @@ pub fn append_request_with_options(
     };
 
     // KV cache layout.
-    emit_kv_pages(batch, physical_page_ids, trim.as_ref());
+    emit_kv_pages(batch, &req.kv_page_indices, trim.as_ref());
     // Length column (M2a / C1): per-request physical KV span, derived from the
     // EMITTED (post-trim) page count + this request's last-page length — so it
     // matches exactly what the driver reconstructs from the two arrays below.
@@ -375,6 +388,167 @@ pub fn append_request_with_options(
         batch.mask_indptr.push(batch.masks.len() as u32);
     } else {
         emit_attention_masks(batch, masks, trim.as_ref());
+    }
+
+    fn append_multi_row_request(
+        batch: &mut crate::driver::LaunchPlan,
+        req: &crate::driver::LaunchPlan,
+        fallback_last_page_len: u32,
+        page_size: u32,
+    ) {
+        let rows = req.qo_indptr.len() - 1;
+        assert_eq!(
+            req.qo_indptr[0], 0,
+            "multi-row query CSR must start at zero"
+        );
+        assert_eq!(
+            req.qo_indptr[rows] as usize,
+            req.token_ids.len(),
+            "multi-row query CSR must cover every token"
+        );
+        assert_eq!(
+            req.position_ids.len(),
+            req.token_ids.len(),
+            "multi-row positions must cover every token"
+        );
+        let deferred_geometry = req.device_resolved_geometry && req.kv_page_indptr.is_empty();
+        if !deferred_geometry {
+            assert_eq!(
+                req.kv_page_indptr.len(),
+                rows + 1,
+                "multi-row KV CSR must cover every row"
+            );
+        }
+        assert_eq!(
+            req.sampling_indptr.len(),
+            rows + 1,
+            "multi-row sampling CSR must cover every row"
+        );
+
+        let token_base = batch.token_ids.len() as u32;
+        batch.token_ids.extend(&req.token_ids);
+        batch.position_ids.extend(&req.position_ids);
+        for &boundary in req.qo_indptr.iter().skip(1) {
+            batch.qo_indptr.push(token_base + boundary);
+        }
+
+        if deferred_geometry {
+            for _ in 0..rows {
+                batch
+                    .kv_page_indptr
+                    .push(batch.kv_page_indices.len() as u32);
+                batch.kv_last_page_lens.push(0);
+                batch.kv_len.push(0);
+            }
+        } else {
+            assert_eq!(
+                req.kv_page_indptr.last().copied().unwrap_or(0) as usize,
+                req.kv_page_indices.len(),
+                "multi-row KV CSR must cover every page"
+            );
+            let page_base = batch.kv_page_indices.len() as u32;
+            batch.kv_page_indices.extend(&req.kv_page_indices);
+            for &boundary in req.kv_page_indptr.iter().skip(1) {
+                batch.kv_page_indptr.push(page_base + boundary);
+            }
+            for row in 0..rows {
+                let page_count = req.kv_page_indptr[row + 1] - req.kv_page_indptr[row];
+                let last = req
+                    .kv_last_page_lens
+                    .get(row)
+                    .copied()
+                    .unwrap_or(fallback_last_page_len);
+                batch.kv_last_page_lens.push(last);
+                batch.kv_len.push(if page_count == 0 {
+                    0
+                } else {
+                    (page_count - 1) * page_size + last
+                });
+            }
+        }
+
+        let sample_base = batch.sampling_indices.len() as u32;
+        for row in 0..rows {
+            let begin = req.sampling_indptr[row] as usize;
+            let end = req.sampling_indptr[row + 1] as usize;
+            let row_len = req.qo_indptr[row + 1] - req.qo_indptr[row];
+            for &index in &req.sampling_indices[begin..end] {
+                assert!(index < row_len, "multi-row sampling index exceeds its row");
+                batch.sampling_indices.push(index);
+            }
+            batch
+                .sampling_indptr
+                .push(sample_base + batch.sampling_indices.len() as u32 - sample_base);
+        }
+
+        if req.mask_indptr.len() == rows + 1 {
+            let mask_base = batch.masks.len() as u32;
+            batch.masks.extend(req.masks.iter().cloned());
+            for &boundary in req.mask_indptr.iter().skip(1) {
+                batch.mask_indptr.push(mask_base + boundary);
+            }
+        } else {
+            // Admission (`single_request_limit_error`) rejects multi-row
+            // masks without a row CSR; by batch build it is an invariant —
+            // a hard assert here would panic the scheduler thread on a
+            // malformed FIRE instead of rejecting that one fire (RV-20).
+            debug_assert!(req.masks.is_empty(), "multi-row masks require a row CSR");
+            for _ in 0..rows {
+                batch.mask_indptr.push(batch.masks.len() as u32);
+            }
+        }
+
+        assert!(
+            req.rs_slot_ids.is_empty() || req.rs_slot_ids.len() == rows,
+            "multi-row RS slots must align with rows"
+        );
+        assert!(
+            req.rs_slot_flags.is_empty() || req.rs_slot_flags.len() == rows,
+            "multi-row RS flags must align with rows"
+        );
+        batch.rs_slot_ids.extend(&req.rs_slot_ids);
+        batch.rs_slot_flags.extend(&req.rs_slot_flags);
+        batch.rs_fold_lens.extend(&req.rs_fold_lens);
+        if req.rs_buffer_slot_indptr.len() == rows + 1 {
+            let buffer_base = batch.rs_buffer_slot_ids.len() as u32;
+            batch.rs_buffer_slot_ids.extend(&req.rs_buffer_slot_ids);
+            for &boundary in req.rs_buffer_slot_indptr.iter().skip(1) {
+                batch.rs_buffer_slot_indptr.push(buffer_base + boundary);
+            }
+        } else {
+            assert!(
+                req.rs_buffer_slot_ids.is_empty(),
+                "multi-row RS buffers require a row CSR"
+            );
+            for _ in 0..rows {
+                batch
+                    .rs_buffer_slot_indptr
+                    .push(batch.rs_buffer_slot_ids.len() as u32);
+            }
+        }
+
+        batch.context_ids.extend(&req.context_ids);
+        assert!(
+            req.image_grids.is_empty() && req.audio_features.is_empty(),
+            "multi-row multimodal merge is not supported"
+        );
+        assert!(
+            req.embed_rows.is_empty(),
+            "multi-row embedding merge is not supported"
+        );
+        for _ in 0..rows {
+            batch
+                .image_indptr
+                .push((batch.image_grids.len() / 3) as u32);
+            batch
+                .audio_indptr
+                .push(batch.audio_anchor_rows.len() as u32);
+            batch
+                .embed_block_indptr
+                .push(batch.embed_dtypes.len() as u32);
+        }
+        batch.single_token_mode = false;
+        batch.has_user_mask |= req.has_user_mask;
     }
 
     // Sampling indices.
@@ -436,6 +610,20 @@ pub fn append_request_with_options(
     batch
         .audio_indptr
         .push(batch.audio_anchor_rows.len() as u32);
+
+    let embed_byte_base = batch.embed_rows.len() as u32;
+    batch.embed_rows.extend(&req.embed_rows);
+    for &offset in req.embed_indptr.iter().skip(1) {
+        batch.embed_indptr.push(embed_byte_base + offset);
+    }
+    batch.embed_shapes.extend(&req.embed_shapes);
+    batch.embed_dtypes.extend(&req.embed_dtypes);
+    for &row in &req.embed_anchor_rows {
+        batch.embed_anchor_rows.push(row_base + row);
+    }
+    batch
+        .embed_block_indptr
+        .push(batch.embed_dtypes.len() as u32);
 
     // Inference hint: prefill kernel when ANY request needs `custom_mask`.
     if req.token_ids.len() > 1 || req.has_user_mask {

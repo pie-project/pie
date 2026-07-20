@@ -130,6 +130,9 @@ fn build_designb() -> Traced {
         // physical KV span after this step's appends (all beams see the filled
         // prefix of the shared pool; the mask restricts attention).
         let filled = add(&base, B); // [1]
+        // Explicit drain (F8, no auto-drain synthesis): klen is a peek-port
+        // loop-carry — consume the old cell before the overwrite.
+        klen.take();
         klen.put(broadcast(reshape(&filled, [1]), [B]));
 
         pos.put(add(pos.take(), 1u32));

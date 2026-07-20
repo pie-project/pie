@@ -91,8 +91,18 @@ enum class ValueSource : std::uint8_t {
 };
 
 enum class Intrinsic : std::uint8_t {
-    Logits = 0, MtpLogits = 1, Hidden = 2, ValueHead = 3, Query = 4,
+    Logits = PTIR_INTR_LOGITS,
+    MtpLogits = PTIR_INTR_MTP_LOGITS,
+    Hidden = PTIR_INTR_HIDDEN,
+    Query = PTIR_INTR_QUERY,
+    ValueHead = PTIR_INTR_VALUE_HEAD,
+    Layer = PTIR_INTR_LAYER,
+    MtpDrafts = PTIR_INTR_MTP_DRAFTS,
 };
+static_assert(static_cast<std::uint8_t>(Intrinsic::Query) == PTIR_INTR_QUERY);
+static_assert(static_cast<std::uint8_t>(Intrinsic::ValueHead) == PTIR_INTR_VALUE_HEAD);
+static_assert(static_cast<std::uint8_t>(Intrinsic::Layer) == PTIR_INTR_LAYER);
+static_assert(static_cast<std::uint8_t>(Intrinsic::MtpDrafts) == PTIR_INTR_MTP_DRAFTS);
 
 enum class HostAvailability : std::uint8_t { SubmitBound = 0, LateBound = 1 };
 
@@ -138,6 +148,8 @@ struct Op {
     Predicate  predicate;           // PivotThreshold / RankLe
     RngKind    rng_kind = RngKind::Gumbel;   // Gumbel
     std::uint32_t imm = 0;          // TopK k, Transpose axis pair, Iota len, …
+    std::uint32_t imm2 = 0;
+    std::uint32_t imm3 = 0;
 
     ValueId       result_id = 0;    // first SSA id this op defines
     std::uint32_t result_count = 1; // top_k / sort_desc → 2 (value, index)
@@ -214,6 +226,8 @@ struct PortBinding {
     std::uint8_t port = 0;      // PtirPort tag
     ChannelId    channel = 0;
     bool         is_const = false;   // const-folded port (no channel consumption)
+    TensorType   const_type;
+    std::vector<std::uint8_t> const_data;
 };
 
 // True if a port CONSUMES (takes) its channel at the descriptor phase (advances

@@ -1,6 +1,6 @@
 #pragma once
 
-// PTIR bound-trace sidecar (`PTIB` v1) parser + container→Trace translation.
+// PTIR bound-trace sidecar (`PTIB` v2) parser + container→Trace translation.
 //
 // Per the Option-B ruling, the driver does NOT re-infer shapes/dtypes: echo's
 // `bind()` ships a `PTIB` typed sidecar (PTIR-CONTAINER.md §7) carrying, per
@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -31,11 +32,18 @@ struct StageTypes {
     std::vector<TensorType> value_types;   // per SSA id, in order
 };
 
+struct StagePlan {
+    std::uint8_t stage = 0;
+    std::vector<std::uint8_t> bytes;
+};
+
 struct Bound {
+    std::uint16_t version = 0;
     std::uint64_t container_hash = 0;
     std::vector<std::uint8_t> classes;               // per channel (0/1/2)
     std::vector<container::ReadinessEntry> readiness;
     std::vector<StageTypes> stages;                  // container order
+    std::vector<StagePlan> plans;                    // compiler-owned region plans
 };
 
 inline DType from_wire_dtype(std::uint8_t d) {
@@ -55,53 +63,308 @@ inline Shape from_cshape(const container::CShape& s) {
     return out;
 }
 
-// Parse a PTIB v1 sidecar. Returns false on a structural/version/magic error.
-inline bool parse_sidecar(const std::uint8_t* data, std::size_t len, Bound& out, std::string* err = nullptr) {
-    auto fail = [&](const char* m) { if (err) *err = m; return false; };
-    container::detail::Cur c{data, len};
-    if (len < 8) return fail("short sidecar");
-    if (std::memcmp(data, PTIB_MAGIC, 4) != 0) return fail("bad PTIB magic");
-    c.skip(4);
-    std::uint16_t ver = c.u16(); c.u16();
-    if (ver != PTIB_VERSION) return fail("bad PTIB version");
-    out.container_hash = 0;
-    for (int b = 0; b < 8; ++b) out.container_hash |= (std::uint64_t)c.u8() << (b * 8);
-    std::uint32_t n_ch = c.u32();
-    for (std::uint32_t i = 0; i < n_ch; ++i) out.classes.push_back(c.u8());
-    std::uint32_t n_rd = c.u32();
-    for (std::uint32_t i = 0; i < n_rd; ++i) {
-        container::ReadinessEntry e;
-        e.chan = c.u32(); e.phase = c.u8();
-        e.dir = c.u8() ? container::Direction::NeedsEmpty : container::Direction::NeedsFull;
-        out.readiness.push_back(e);
+namespace detail {
+
+struct Reader {
+    const std::uint8_t* data = nullptr;
+    std::size_t size = 0;
+    std::size_t offset = 0;
+
+    std::size_t remaining() const {
+        return offset <= size ? size - offset : 0;
     }
-    std::uint32_t n_st = c.u32();
-    for (std::uint32_t i = 0; i < n_st; ++i) {
-        StageTypes st;
-        st.stage = c.u8();
-        std::uint32_t nv = c.u32();
-        for (std::uint32_t v = 0; v < nv; ++v) {
-            TensorType t;
-            t.dtype = from_wire_dtype(c.u8());
-            t.shape = from_cshape(c.shape());
-            st.value_types.push_back(t);
+
+    bool bytes(std::size_t count, const std::uint8_t*& value) {
+        if (count > remaining()) return false;
+        value = data + offset;
+        offset += count;
+        return true;
+    }
+
+    bool u8(std::uint8_t& value) {
+        const std::uint8_t* bytes = nullptr;
+        if (!this->bytes(1, bytes)) return false;
+        value = bytes[0];
+        return true;
+    }
+
+    bool u16(std::uint16_t& value) {
+        const std::uint8_t* bytes = nullptr;
+        if (!this->bytes(2, bytes)) return false;
+        value = static_cast<std::uint16_t>(bytes[0]) |
+            (static_cast<std::uint16_t>(bytes[1]) << 8);
+        return true;
+    }
+
+    bool u32(std::uint32_t& value) {
+        const std::uint8_t* bytes = nullptr;
+        if (!this->bytes(4, bytes)) return false;
+        value = static_cast<std::uint32_t>(bytes[0]) |
+            (static_cast<std::uint32_t>(bytes[1]) << 8) |
+            (static_cast<std::uint32_t>(bytes[2]) << 16) |
+            (static_cast<std::uint32_t>(bytes[3]) << 24);
+        return true;
+    }
+
+    bool u64(std::uint64_t& value) {
+        const std::uint8_t* bytes = nullptr;
+        if (!this->bytes(8, bytes)) return false;
+        value = 0;
+        for (int byte = 0; byte < 8; ++byte) {
+            value |= static_cast<std::uint64_t>(bytes[byte]) << (byte * 8);
         }
-        out.stages.push_back(std::move(st));
+        return true;
     }
-    if (c.err) return fail("sidecar overrun");
+
+    bool bounded_count(
+        std::uint32_t raw_count,
+        std::size_t minimum_record_bytes,
+        std::size_t structural_maximum,
+        std::size_t& count) const {
+        if (static_cast<std::uintmax_t>(raw_count) >
+            static_cast<std::uintmax_t>(
+                std::numeric_limits<std::size_t>::max())) {
+            return false;
+        }
+        count = static_cast<std::size_t>(raw_count);
+        if (minimum_record_bytes == 0 || count > structural_maximum ||
+            count > std::numeric_limits<std::size_t>::max() /
+                minimum_record_bytes) {
+            return false;
+        }
+        const std::size_t minimum_bytes = count * minimum_record_bytes;
+        return minimum_bytes <= remaining();
+    }
+
+    bool length(std::uint32_t raw_length, std::size_t& length) const {
+        if (static_cast<std::uintmax_t>(raw_length) >
+            static_cast<std::uintmax_t>(
+                std::numeric_limits<std::size_t>::max())) {
+            return false;
+        }
+        length = static_cast<std::size_t>(raw_length);
+        return length <= remaining();
+    }
+};
+
+inline bool parse_sidecar_records(
+    const std::uint8_t* data,
+    std::size_t len,
+    Bound* output,
+    const char*& error) {
+    constexpr std::size_t kMaximumStages = 4;
+    auto fail = [&](const char* message) {
+        error = message;
+        return false;
+    };
+    if (data == nullptr || len < 4 || std::memcmp(data, PTIB_MAGIC, 4) != 0) {
+        return fail("bad PTIB magic");
+    }
+
+    Reader reader{data, len};
+    const std::uint8_t* magic = nullptr;
+    std::uint16_t version = 0;
+    std::uint16_t flags = 0;
+    std::uint64_t container_hash = 0;
+    if (!reader.bytes(4, magic) || !reader.u16(version) ||
+        !reader.u16(flags) || !reader.u64(container_hash)) {
+        return fail("short sidecar");
+    }
+    (void)flags;
+    if (version != 1 && version != PTIB_VERSION) {
+        return fail("bad PTIB version");
+    }
+    if (output != nullptr) {
+        output->version = version;
+        output->container_hash = container_hash;
+    }
+
+    std::uint32_t raw_channels = 0;
+    std::size_t channel_count = 0;
+    if (!reader.u32(raw_channels) ||
+        !reader.bounded_count(
+            raw_channels,
+            1,
+            std::numeric_limits<std::size_t>::max(),
+            channel_count)) {
+        return fail("sidecar channel count exceeds remaining bytes");
+    }
+    if (output != nullptr) output->classes.reserve(channel_count);
+    for (std::size_t index = 0; index < channel_count; ++index) {
+        std::uint8_t channel_class = 0;
+        if (!reader.u8(channel_class) || channel_class > PTIR_CHAN_IN_PLACE_UNDO) {
+            return fail("invalid sidecar channel class");
+        }
+        if (output != nullptr) output->classes.push_back(channel_class);
+    }
+
+    std::uint32_t raw_readiness = 0;
+    std::size_t readiness_count = 0;
+    if (!reader.u32(raw_readiness) ||
+        !reader.bounded_count(
+            raw_readiness, 6, channel_count, readiness_count)) {
+        return fail("sidecar readiness count exceeds structural limit");
+    }
+    if (output != nullptr) output->readiness.reserve(readiness_count);
+    for (std::size_t index = 0; index < readiness_count; ++index) {
+        std::uint32_t channel = 0;
+        std::uint8_t phase = 0;
+        std::uint8_t direction = 0;
+        if (!reader.u32(channel) || !reader.u8(phase) ||
+            !reader.u8(direction)) {
+            return fail("sidecar readiness overrun");
+        }
+        if ((phase > PTIR_STAGE_EPILOGUE &&
+             phase != PTIR_PHASE_DESCRIPTOR) ||
+            direction > PTIR_NEEDS_EMPTY) {
+            return fail("invalid sidecar readiness entry");
+        }
+        if (output != nullptr) {
+            output->readiness.push_back({
+                channel,
+                phase,
+                direction == PTIR_NEEDS_EMPTY
+                    ? container::Direction::NeedsEmpty
+                    : container::Direction::NeedsFull,
+            });
+        }
+    }
+
+    std::uint32_t raw_stages = 0;
+    std::size_t stage_count = 0;
+    if (!reader.u32(raw_stages) ||
+        !reader.bounded_count(
+            raw_stages, 5, kMaximumStages, stage_count)) {
+        return fail("sidecar stage count exceeds structural limit");
+    }
+    if (output != nullptr) output->stages.reserve(stage_count);
+    for (std::size_t stage_index = 0; stage_index < stage_count;
+         ++stage_index) {
+        std::uint8_t stage_tag = 0;
+        std::uint32_t raw_values = 0;
+        if (!reader.u8(stage_tag) || stage_tag > PTIR_STAGE_EPILOGUE ||
+            !reader.u32(raw_values)) {
+            return fail("invalid sidecar stage");
+        }
+        std::size_t value_count = 0;
+        if (!reader.bounded_count(
+                raw_values,
+                2,
+                std::numeric_limits<std::size_t>::max(),
+                value_count)) {
+            return fail("sidecar value count exceeds remaining bytes");
+        }
+        StageTypes stage;
+        stage.stage = stage_tag;
+        if (output != nullptr) stage.value_types.reserve(value_count);
+        for (std::size_t value_index = 0; value_index < value_count;
+             ++value_index) {
+            std::uint8_t dtype = 0;
+            std::uint8_t raw_rank = 0;
+            if (!reader.u8(dtype) || dtype > PTIR_DT_BOOL ||
+                !reader.u8(raw_rank) || raw_rank > 4) {
+                return fail("invalid sidecar value type");
+            }
+            std::size_t rank = 0;
+            if (!reader.bounded_count(raw_rank, 4, 4, rank)) {
+                return fail("sidecar shape dimensions overrun");
+            }
+            TensorType type;
+            type.dtype = from_wire_dtype(dtype);
+            if (output != nullptr) type.shape.dims.reserve(rank);
+            std::uint64_t elements = 1;
+            for (std::size_t dimension_index = 0;
+                 dimension_index < rank;
+                 ++dimension_index) {
+                std::uint32_t dimension = 0;
+                if (!reader.u32(dimension) || dimension == 0 ||
+                    elements > std::numeric_limits<std::uint64_t>::max() /
+                        dimension) {
+                    return fail("invalid sidecar shape");
+                }
+                elements *= dimension;
+                if (output != nullptr) {
+                    type.shape.dims.push_back(dimension);
+                }
+            }
+            if (output != nullptr) {
+                stage.value_types.push_back(std::move(type));
+            }
+        }
+        if (output != nullptr) output->stages.push_back(std::move(stage));
+    }
+
+    if (version == PTIB_VERSION) {
+        std::uint32_t raw_plans = 0;
+        std::size_t plan_count = 0;
+        if (!reader.u32(raw_plans) ||
+            !reader.bounded_count(
+                raw_plans, 5, kMaximumStages, plan_count)) {
+            return fail("sidecar plan count exceeds structural limit");
+        }
+        if (output != nullptr) output->plans.reserve(plan_count);
+        for (std::size_t plan_index = 0; plan_index < plan_count;
+             ++plan_index) {
+            std::uint8_t stage = 0;
+            std::uint32_t raw_length = 0;
+            std::size_t length = 0;
+            if (!reader.u8(stage) || stage > PTIR_STAGE_EPILOGUE ||
+                !reader.u32(raw_length) ||
+                !reader.length(raw_length, length)) {
+                return fail("sidecar plan overrun");
+            }
+            const std::uint8_t* plan_bytes = nullptr;
+            if (!reader.bytes(length, plan_bytes)) {
+                return fail("sidecar plan overrun");
+            }
+            if (output != nullptr) {
+                StagePlan plan;
+                plan.stage = stage;
+                plan.bytes.assign(plan_bytes, plan_bytes + length);
+                output->plans.push_back(std::move(plan));
+            }
+        }
+    }
+    if (reader.offset != len) return fail("trailing sidecar bytes");
+    return true;
+}
+
+}  // namespace detail
+
+// Parse a PTIB v1/v2 sidecar. v1 has no compiler plans. Malformed input is
+// fully preflighted without allocation before any output record is materialized.
+inline bool parse_sidecar(
+    const std::uint8_t* data,
+    std::size_t len,
+    Bound& out,
+    std::string* err = nullptr) {
+    out = {};
+    const char* message = "invalid sidecar";
+    if (!detail::parse_sidecar_records(data, len, nullptr, message)) {
+        if (err != nullptr) *err = message;
+        return false;
+    }
+    Bound decoded;
+    if (!detail::parse_sidecar_records(data, len, &decoded, message)) {
+        if (err != nullptr) *err = message;
+        return false;
+    }
+    out = std::move(decoded);
     return true;
 }
 
 // ── container + sidecar → executable Trace ──
 
-inline Intrinsic map_intrinsic(std::uint16_t intr) {
+inline bool map_intrinsic(std::uint16_t intr, Intrinsic& out) {
     switch (intr) {
-        case PTIR_INTR_LOGITS: return Intrinsic::Logits;
-        case PTIR_INTR_MTP_LOGITS: return Intrinsic::MtpLogits;
-        case PTIR_INTR_HIDDEN: return Intrinsic::Hidden;
-        case PTIR_INTR_QUERY: return Intrinsic::Query;
-        case PTIR_INTR_VALUE_HEAD: return Intrinsic::ValueHead;
-        default: return Intrinsic::Logits;
+        case PTIR_INTR_LOGITS: out = Intrinsic::Logits; return true;
+        case PTIR_INTR_MTP_LOGITS: out = Intrinsic::MtpLogits; return true;
+        case PTIR_INTR_HIDDEN: out = Intrinsic::Hidden; return true;
+        case PTIR_INTR_QUERY: out = Intrinsic::Query; return true;
+        case PTIR_INTR_VALUE_HEAD: out = Intrinsic::ValueHead; return true;
+        case PTIR_INTR_LAYER: out = Intrinsic::Layer; return true;
+        case PTIR_INTR_MTP_DRAFTS: out = Intrinsic::MtpDrafts; return true;
+        default: return false;
     }
 }
 
@@ -131,8 +394,20 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
         out.extern_name = ch.extern_name;
         t.channels.push_back(out);
     }
-    for (const container::CPort& p : c.ports)
-        t.ports.push_back({p.port, p.chan, p.is_const});
+    for (const container::CPort& p : c.ports) {
+        PortBinding binding;
+        binding.port = p.port;
+        binding.channel = p.chan;
+        binding.is_const = p.is_const;
+        if (p.is_const) {
+            binding.const_type.dtype =
+                from_wire_dtype(p.const_dtype);
+            binding.const_type.shape =
+                from_cshape(p.const_shape);
+            binding.const_data = p.const_data;
+        }
+        t.ports.push_back(std::move(binding));
+    }
 
     std::uint32_t global_base = 0;
     for (std::size_t si = 0; si < c.stages.size(); ++si) {
@@ -166,7 +441,9 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
                 }
                 case PTIR_OP_INTRINSIC_VAL: {
                     Value v; v.id = gid(local); v.type = ty(local); v.source = ValueSource::Intrinsic;
-                    v.intrinsic = map_intrinsic(op.intr);
+                    if (!map_intrinsic(op.intr, v.intrinsic)) {
+                        return fail("unknown intrinsic tag in stage body");
+                    }
                     t.values.push_back(v); local += 1; break;
                 }
                 case PTIR_OP_CHAN_PUT: {
@@ -185,6 +462,8 @@ inline TranslateResult container_to_trace(const container::Container& c, const B
                     for (std::uint32_t a : op.args) o.args.push_back(gid(a));
                     // op-specific immediates
                     o.imm = op.imm;
+                    o.imm2 = op.imm2;
+                    o.imm3 = op.imm3;
                     o.rng_kind = op.kind ? RngKind::Gumbel : RngKind::Uniform;
                     o.predicate.tag = (PredTag)op.pred_tag;
                     // Only PivotThreshold populates pred_tag/pred_payload

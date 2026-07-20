@@ -18,9 +18,10 @@
 // The port→field table is kept in explicit correspondence with CUDA's
 // resolver and `map_geometry`.
 //
-// Metal has no device buffers to read back — a channel's "current cell" is
-// already resident host memory (`ChannelState`), so this is a PEEK against
-// `InterpInstance` (the SAME committed-front-of-ring value `step()`'s own
+// Metal channel cells use CPU-visible, device-bindable Shared storage, so
+// descriptor resolution needs no readback. This is a PEEK against
+// `InterpInstance` (the SAME authoritative committed-front-of-ring value
+// `step()`'s own
 // descriptor-port loop will later `take()`/`read()`). Reading here is
 // non-destructive; the actual consume (ring-advance) for token-family ports
 // (embed_tokens/positions/w_slot/w_off) happens exactly once, inside
@@ -58,6 +59,64 @@ struct GeometryResolveResult {
 
 namespace detail {
 
+inline const cptir::Op* producer(
+    const Trace& trace, cptir::ValueId value) {
+    for (const cptir::Stage& stage : trace.stages) {
+        for (const cptir::Op& op : stage.ops) {
+            if (value >= op.result_id &&
+                value < op.result_id + op.result_count) {
+                return &op;
+            }
+        }
+    }
+    return nullptr;
+}
+
+inline cptir::StructuredMaskDescriptor structured_mask_descriptor(
+    const Trace& trace,
+    cptir::ChannelId mask_channel) {
+    const cptir::ChannelPut* selected = nullptr;
+    for (const cptir::Stage& stage : trace.stages) {
+        for (const cptir::ChannelPut& put : stage.puts) {
+            if (put.channel == mask_channel) selected = &put;
+        }
+    }
+    if (selected == nullptr) return {};
+    cptir::ValueId value = selected->value;
+    for (std::size_t depth = 0; depth <= trace.values.size(); ++depth) {
+        const cptir::Op* op = producer(trace, value);
+        if (op == nullptr) break;
+        if (op->code == OpCode::Reshape && !op->args.empty()) {
+            value = op->args[0];
+            continue;
+        }
+        cptir::StructuredMaskDescriptor descriptor;
+        switch (op->code) {
+            case OpCode::CausalMask:
+                descriptor.kind =
+                    cptir::StructuredMaskKind::Causal;
+                descriptor.key_len = op->imm;
+                return descriptor;
+            case OpCode::SlidingWindowMask:
+                descriptor.kind =
+                    cptir::StructuredMaskKind::SlidingWindow;
+                descriptor.key_len = op->imm;
+                descriptor.window = op->imm2;
+                return descriptor;
+            case OpCode::SinkWindowMask:
+                descriptor.kind =
+                    cptir::StructuredMaskKind::SinkWindow;
+                descriptor.key_len = op->imm;
+                descriptor.sink = op->imm2;
+                descriptor.window = op->imm3;
+                return descriptor;
+            default:
+                return {};
+        }
+    }
+    return {};
+}
+
 // Bit-reinterpret a Value's lanes as u32, mirroring CUDA's raw-byte
 // `as_u32` (a straight little-endian reinterpretation of the wire bytes,
 // not a value-preserving numeric cast). Token/position/page ids are always
@@ -90,14 +149,15 @@ inline GeometryResolveResult read_port_cell(
     std::vector<std::uint32_t>& out,
     std::string* err) {
     ChannelState& st = *inst.channels[channel];
-    if (st.queue.empty()) {
+    if (st.empty()) {
         if (err != nullptr) {
             *err = "ptir: descriptor channel " + std::to_string(channel) +
                    " not ready (not yet produced)";
         }
         return {GeometryResolveStatus::NotReady, channel};
     }
-    if (!value_as_u32(st.queue.front(), out)) {
+    const Value value = st.front();
+    if (!value_as_u32(value, out)) {
         if (err != nullptr) {
             *err = "ptir: descriptor channel " + std::to_string(channel) +
                    " has an unsupported dtype for geometry resolution";
@@ -116,14 +176,14 @@ inline GeometryResolveResult read_mask_cell(
     std::vector<std::uint8_t>& out,
     std::string* err) {
     ChannelState& st = *inst.channels[channel];
-    if (st.queue.empty()) {
+    if (st.empty()) {
         if (err != nullptr) {
             *err = "ptir: descriptor channel " + std::to_string(channel) +
                    " not ready (not yet produced)";
         }
         return {GeometryResolveStatus::NotReady, channel};
     }
-    const Value& v = st.queue.front();
+    const Value v = st.front();
     if (v.dtype != DType::Bool) {
         if (err != nullptr) {
             *err = "ptir: descriptor channel " + std::to_string(channel) +
@@ -143,6 +203,7 @@ inline GeometryResolveResult read_mask_cell(
 // The typed form distinguishes transient readiness from permanent failure.
 inline GeometryResolveResult resolve_fire_geometry_typed(
     const Trace& trace,
+    const std::vector<ConstPortValue>& const_ports,
     InterpInstance& inst,
     std::uint32_t page_size,
     cptir::FireGeometry& out,
@@ -150,23 +211,79 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     out = cptir::FireGeometry{};
     cptir::ChannelId ch[10] = {0};
     bool has[10] = {false};
+    bool channel_bound[10] = {false};
+    const Value* constant[10] = {nullptr};
     for (const cptir::PortBinding& pb : trace.ports) {
-        if (pb.is_const || pb.port > kPortAttnMask) continue;
-        ch[pb.port] = pb.channel;
+        if (pb.port > kPortAttnMask) continue;
         has[pb.port] = true;
+        if (pb.is_const) {
+            const auto found = std::find_if(
+                const_ports.begin(),
+                const_ports.end(),
+                [&](const ConstPortValue& value) {
+                    return value.port == pb.port;
+                });
+            if (found == const_ports.end()) {
+                if (err != nullptr) {
+                    *err = "ptir: const descriptor port payload is missing";
+                }
+                return {GeometryResolveStatus::Failed, 0};
+            }
+            constant[pb.port] = &found->value;
+        } else {
+            channel_bound[pb.port] = true;
+            ch[pb.port] = pb.channel;
+        }
     }
+    auto read_u32_port = [&](std::uint8_t port,
+                             std::vector<std::uint32_t>& values) {
+        if (channel_bound[port]) {
+            return detail::read_port_cell(
+                inst, ch[port], values, err);
+        }
+        if (constant[port] == nullptr ||
+            !detail::value_as_u32(*constant[port], values)) {
+            if (err != nullptr) {
+                *err =
+                    "ptir: const descriptor port has an unsupported dtype";
+            }
+            return GeometryResolveResult{
+                GeometryResolveStatus::Failed, 0};
+        }
+        return GeometryResolveResult{
+            GeometryResolveStatus::Ready, 0};
+    };
+    auto read_bool_port = [&](std::uint8_t port,
+                              std::vector<std::uint8_t>& values) {
+        if (channel_bound[port]) {
+            return detail::read_mask_cell(
+                inst, ch[port], values, err);
+        }
+        if (constant[port] == nullptr ||
+            constant[port]->dtype != DType::Bool) {
+            if (err != nullptr) {
+                *err =
+                    "ptir: const attention mask has an unsupported dtype";
+            }
+            return GeometryResolveResult{
+                GeometryResolveStatus::Failed, 0};
+        }
+        values = constant[port]->b;
+        return GeometryResolveResult{
+            GeometryResolveStatus::Ready, 0};
+    };
 
     // -- token family --
     if (has[kPortEmbedTokens]) {
         const auto result =
-            detail::read_port_cell(inst, ch[kPortEmbedTokens], out.token_ids, err);
+            read_u32_port(kPortEmbedTokens, out.token_ids);
         if (result.status != GeometryResolveStatus::Ready) return result;
     }
     const std::uint32_t nnz = static_cast<std::uint32_t>(out.token_ids.size());
 
     if (has[kPortEmbedIndptr]) {
         const auto result =
-            detail::read_port_cell(inst, ch[kPortEmbedIndptr], out.qo_indptr, err);
+            read_u32_port(kPortEmbedIndptr, out.qo_indptr);
         if (result.status != GeometryResolveStatus::Ready) return result;
     } else {
         out.qo_indptr = {0, nnz};  // one lane over all tokens
@@ -175,7 +292,7 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
 
     if (has[kPortPositions]) {
         const auto result =
-            detail::read_port_cell(inst, ch[kPortPositions], out.position_ids, err);
+            read_u32_port(kPortPositions, out.position_ids);
         if (result.status != GeometryResolveStatus::Ready) return result;
     } else {
         out.position_ids.resize(nnz);
@@ -185,12 +302,12 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     // -- KV family (CSR-prefix contract) --
     if (has[kPortPageIndptr]) {
         const auto result =
-            detail::read_port_cell(inst, ch[kPortPageIndptr], out.kv_page_indptr, err);
+            read_u32_port(kPortPageIndptr, out.kv_page_indptr);
         if (result.status != GeometryResolveStatus::Ready) return result;
     }
     if (has[kPortPages]) {
         const auto result =
-            detail::read_port_cell(inst, ch[kPortPages], out.kv_page_indices, err);
+            read_u32_port(kPortPages, out.kv_page_indices);
         if (result.status != GeometryResolveStatus::Ready) return result;
         // CSR-prefix: trim the fixed-shape data port to page_indptr's last entry.
         if (!out.kv_page_indptr.empty()) {
@@ -204,7 +321,7 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     if (has[kPortKvLen]) {
         std::vector<std::uint32_t> lens;
         const auto result =
-            detail::read_port_cell(inst, ch[kPortKvLen], lens, err);
+            read_u32_port(kPortKvLen, lens);
         if (result.status != GeometryResolveStatus::Ready) return result;
         for (std::uint32_t len : lens) {
             out.kv_last_page_lens.push_back(last_page_len(len, page_size));
@@ -214,14 +331,32 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     // -- read-out --
     if (has[kPortReadout]) {
         const auto result =
-            detail::read_port_cell(inst, ch[kPortReadout], out.sampling_indices, err);
+            read_u32_port(kPortReadout, out.sampling_indices);
         if (result.status != GeometryResolveStatus::Ready) return result;
-        out.sampling_indptr = {0, static_cast<std::uint32_t>(out.sampling_indices.size())};
+        out.sampling_indptr.push_back(0);
+        if (lanes <= 1) {
+            out.sampling_indptr.push_back(
+                static_cast<std::uint32_t>(
+                    out.sampling_indices.size()));
+        } else if (out.sampling_indices.size() == lanes) {
+            for (std::size_t lane = 0; lane < lanes; ++lane) {
+                out.sampling_indptr.push_back(
+                    static_cast<std::uint32_t>(lane + 1));
+            }
+        } else {
+            if (err != nullptr) {
+                *err =
+                    "ptir: multi-request readout needs one index per request";
+            }
+            return {GeometryResolveStatus::Failed, 0};
+        }
     } else {
         out.sampling_indptr.push_back(0);
         for (std::size_t lane = 0; lane < lanes; ++lane) {
-            if (out.qo_indptr[lane + 1] > out.qo_indptr[lane]) {
-                out.sampling_indices.push_back(out.qo_indptr[lane + 1] - 1);
+            const std::uint32_t span =
+                out.qo_indptr[lane + 1] - out.qo_indptr[lane];
+            if (span != 0) {
+                out.sampling_indices.push_back(span - 1);
             }
             out.sampling_indptr.push_back(static_cast<std::uint32_t>(out.sampling_indices.size()));
         }
@@ -230,24 +365,47 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     // -- explicit KV write descriptor (w_slot/w_off → write_kv_explicit) --
     if (has[kPortWSlot]) {
         const auto result =
-            detail::read_port_cell(inst, ch[kPortWSlot], out.w_page, err);
+            read_u32_port(kPortWSlot, out.w_page);
         if (result.status != GeometryResolveStatus::Ready) return result;
         out.has_write_desc = true;
     }
     if (has[kPortWOff]) {
         const auto result =
-            detail::read_port_cell(inst, ch[kPortWOff], out.w_off, err);
+            read_u32_port(kPortWOff, out.w_off);
         if (result.status != GeometryResolveStatus::Ready) return result;
     }
 
     // -- dense attention mask (→ pack_dense_mask) --
     if (has[kPortAttnMask]) {
+        if (channel_bound[kPortAttnMask]) {
+            out.structured_mask =
+                detail::structured_mask_descriptor(
+                    trace, ch[kPortAttnMask]);
+        }
         const auto result =
-            detail::read_mask_cell(inst, ch[kPortAttnMask], out.mask, err);
+            read_bool_port(kPortAttnMask, out.mask);
         if (result.status != GeometryResolveStatus::Ready) return result;
         out.has_mask = true;
+        if (out.structured_mask &&
+            out.structured_mask.key_len == 0 &&
+            !out.token_ids.empty() &&
+            out.mask.size() % out.token_ids.size() == 0) {
+            out.structured_mask.key_len =
+                static_cast<std::uint32_t>(
+                    out.mask.size() / out.token_ids.size());
+        }
     }
     return {GeometryResolveStatus::Ready, 0};
+}
+
+inline GeometryResolveResult resolve_fire_geometry_typed(
+    const Trace& trace,
+    InterpInstance& inst,
+    std::uint32_t page_size,
+    cptir::FireGeometry& out,
+    std::string* err) {
+    return resolve_fire_geometry_typed(
+        trace, {}, inst, page_size, out, err);
 }
 
 inline bool resolve_fire_geometry(
@@ -256,8 +414,24 @@ inline bool resolve_fire_geometry(
     std::uint32_t page_size,
     cptir::FireGeometry& out,
     std::string* err) {
-    return resolve_fire_geometry_typed(trace, inst, page_size, out, err).status ==
+    return resolve_fire_geometry_typed(
+               trace, {}, inst, page_size, out, err).status ==
            GeometryResolveStatus::Ready;
+}
+
+inline GeometryResolveResult resolve_fire_geometry_typed(
+    const ExecPlan& plan,
+    InterpInstance& inst,
+    std::uint32_t page_size,
+    cptir::FireGeometry& out,
+    std::string* err) {
+    return resolve_fire_geometry_typed(
+        plan.trace,
+        plan.const_ports,
+        inst,
+        page_size,
+        out,
+        err);
 }
 
 // WorkingSet page translation (kv_refact.md flattened-table model), the

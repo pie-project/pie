@@ -2,17 +2,21 @@
 
 #include "batch/forward.hpp"
 #include "batch/graph_variant.hpp"
+#include "batch/tp_gate.hpp"
+#include "pipeline/batch_compose.hpp"
+#include "store/recurrent_state_cache.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -25,19 +29,14 @@ namespace pie_cuda_driver {
 
 namespace {
 
-struct TpCpuGate {
-    std::mutex mu;
-    std::condition_variable cv;
-    std::atomic<std::uint64_t> seq{0};
-};
-
 std::mutex g_tp_cpu_gates_mu;
-std::unordered_map<std::string, std::shared_ptr<TpCpuGate>> g_tp_cpu_gates;
+std::unordered_map<std::string, std::shared_ptr<TpSequenceGate>>
+    g_tp_cpu_gates;
 
-std::shared_ptr<TpCpuGate> tp_cpu_gate_for(const std::string& key) {
+std::shared_ptr<TpSequenceGate> tp_cpu_gate_for(const std::string& key) {
     std::lock_guard<std::mutex> lk(g_tp_cpu_gates_mu);
     auto& gate = g_tp_cpu_gates[key];
-    if (!gate) gate = std::make_shared<TpCpuGate>();
+    if (!gate) gate = std::make_shared<TpSequenceGate>();
     return gate;
 }
 
@@ -57,21 +56,13 @@ void tp_cpu_gate_wait(const std::string& key,
     constexpr auto spin_budget = std::chrono::microseconds(2000);
     const auto start = std::chrono::steady_clock::now();
     while (!stop.load(std::memory_order_relaxed)) {
-        const std::uint64_t seq = gate->seq.load(std::memory_order_acquire);
-        if (seq != seen) {
-            seen = seq;
-            return;
-        }
+        const std::uint64_t seq = gate->published();
+        if (tp_cpu_gate_consume_one(seq, seen)) return;
         if (std::chrono::steady_clock::now() - start >= spin_budget) break;
         cpu_relax();
     }
 
-    std::unique_lock<std::mutex> lk(gate->mu);
-    gate->cv.wait(lk, [&] {
-        return stop.load(std::memory_order_relaxed) ||
-               gate->seq.load(std::memory_order_acquire) != seen;
-    });
-    seen = gate->seq.load(std::memory_order_acquire);
+    static_cast<void>(gate->wait_one(seen, stop));
 }
 
 // Broadcast header sent from rank 0 → followers before each fire's
@@ -81,8 +72,7 @@ void tp_cpu_gate_wait(const std::string& key,
 //   * TP_FIRE_MAGIC: a regular fire is incoming; payload broadcasts follow.
 //   * TP_STOP_MAGIC: shutdown sentinel; follower exits its serve loop.
 //
-// Sized at exactly 8 i32 so we can broadcast it as `8 * sizeof(int32_t)`
-// bytes without alignment surprises across compilers.
+// Trivially copyable so the exact header bytes can be broadcast to followers.
 struct TpFireHeader {
     std::int32_t magic;
     std::int32_t total_tokens;
@@ -95,18 +85,21 @@ struct TpFireHeader {
     // existing payload broadcasts. Inert (0) for archs that don't use
     // rs_cache — followers skip those broadcasts.
     std::int32_t has_slot_ids;
-    // 1 = llama-like TP greedy decode fast path. Followers use this to
-    // capture/replay the same forward variant as rank 0.
-    std::int32_t tp_greedy_argmax;
+    // 1 = w_page[N] and w_off[N] explicit write descriptors follow.
+    std::int32_t has_write_desc;
     // Number of compact logit rows in pi.sample_idx.
     std::int32_t logit_rows;
+    std::int32_t structured_window_left;
+    std::int32_t rs_mode;
+    std::int32_t rs_fold_lens_count;
+    std::int32_t rs_buffer_ids_count;
 };
-static_assert(sizeof(TpFireHeader) == 10 * sizeof(std::int32_t),
-              "TpFireHeader must pack into exactly 10 ints");
+static_assert(std::is_trivially_copyable_v<TpFireHeader>);
 constexpr std::int32_t TP_FIRE_MAGIC = 0x55504954;  // 'TPIU' tag
+constexpr std::int32_t TP_MTP_MAGIC  = 0x50544D54;  // 'TMTP' tag
 constexpr std::int32_t TP_STOP_MAGIC = 0x504F5453;  // 'STOP' tag
 
-// Lazily-allocated 32-byte device buffer holding the broadcast header.
+// Lazily allocated device buffer holding the broadcast header.
 // Both rank 0 and followers reuse it across fires; no need to plumb it
 // through BatchEngine.
 std::int32_t* tp_hdr_dev_buf() {
@@ -124,8 +117,12 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                          int kv_indices_count,
                          int mask_bytes, int mask_indptr_count,
                          bool has_slot_ids,
-                         bool tp_greedy_argmax,
+                         bool has_write_desc,
                          int logit_rows,
+                         int structured_window_left,
+                         RsExecutionMode rs_mode,
+                         int rs_fold_lens_count,
+                         int rs_buffer_ids_count,
                          cudaStream_t stream)
 {
     auto* d_hdr = tp_hdr_dev_buf();
@@ -133,8 +130,12 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
         TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
         kv_indices_count, mask_bytes, mask_indptr_count,
         has_slot_ids ? 1 : 0,
-        tp_greedy_argmax ? 1 : 0,
+        has_write_desc ? 1 : 0,
         logit_rows,
+        structured_window_left,
+        static_cast<std::int32_t>(rs_mode),
+        rs_fold_lens_count,
+        rs_buffer_ids_count,
     };
     // Header goes first (synchronous from the followers' POV — they need
     // to parse sizes before posting matching payload broadcasts).
@@ -147,32 +148,53 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
     // — tens of microseconds of host-side launch overhead saved per fire,
     // most visible at small batch sizes (decode where each broadcast is
     // sub-KB but the fixed per-op cost dominates).
+    const bool state_only_fold =
+        rs_mode == RsExecutionMode::BufferFold;
     NCCL_CHECK(ncclGroupStart());
-    NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
-                             static_cast<std::size_t>(N) * 4, ncclChar, 0,
-                             comm.comm(), stream));
-    NCCL_CHECK(ncclBroadcast(pi.positions.data(), pi.positions.data(),
-                             static_cast<std::size_t>(N) * 4, ncclChar, 0,
-                             comm.comm(), stream));
+    if (!state_only_fold) {
+        NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
+                                 static_cast<std::size_t>(N) * 4, ncclChar, 0,
+                                 comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(pi.positions.data(), pi.positions.data(),
+                                 static_cast<std::size_t>(N) * 4, ncclChar, 0,
+                                 comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(
+            pi.row_valid.data(), pi.row_valid.data(),
+            static_cast<std::size_t>(N), ncclChar, 0,
+            comm.comm(), stream));
+    }
+    if (!state_only_fold && has_write_desc && N > 0) {
+        NCCL_CHECK(ncclBroadcast(
+            pi.w_page.data(), pi.w_page.data(),
+            static_cast<std::size_t>(N) * 4, ncclChar, 0,
+            comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(
+            pi.w_off.data(), pi.w_off.data(),
+            static_cast<std::size_t>(N) * 4, ncclChar, 0,
+            comm.comm(), stream));
+    }
     NCCL_CHECK(ncclBroadcast(pi.qo_indptr.data(), pi.qo_indptr.data(),
                              static_cast<std::size_t>(R + 1) * 4, ncclChar, 0,
                              comm.comm(), stream));
-    NCCL_CHECK(ncclBroadcast(pi.kv_page_indptr.data(), pi.kv_page_indptr.data(),
-                             static_cast<std::size_t>(R + 1) * 4, ncclChar, 0,
-                             comm.comm(), stream));
-    if (R > 0) {
+    if (!state_only_fold) {
+        NCCL_CHECK(ncclBroadcast(
+            pi.kv_page_indptr.data(), pi.kv_page_indptr.data(),
+            static_cast<std::size_t>(R + 1) * 4, ncclChar, 0,
+            comm.comm(), stream));
+    }
+    if (!state_only_fold && R > 0) {
         NCCL_CHECK(ncclBroadcast(pi.kv_last_page_lens.data(),
                                  pi.kv_last_page_lens.data(),
                                  static_cast<std::size_t>(R) * 4, ncclChar, 0,
                                  comm.comm(), stream));
     }
-    if (kv_indices_count > 0) {
+    if (!state_only_fold && kv_indices_count > 0) {
         NCCL_CHECK(ncclBroadcast(pi.kv_page_indices.data(),
                                  pi.kv_page_indices.data(),
                                  static_cast<std::size_t>(kv_indices_count) * 4,
                                  ncclChar, 0, comm.comm(), stream));
     }
-    if (mask_bytes > 0) {
+    if (!state_only_fold && mask_bytes > 0) {
         NCCL_CHECK(ncclBroadcast(pi.custom_mask.data(),
                                  pi.custom_mask.data(),
                                  static_cast<std::size_t>(mask_bytes), ncclChar, 0,
@@ -189,8 +211,35 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
         NCCL_CHECK(ncclBroadcast(pi.is_fresh.data(), pi.is_fresh.data(),
                                  static_cast<std::size_t>(R), ncclChar, 0,
                                  comm.comm(), stream));
+        NCCL_CHECK(ncclBroadcast(
+            pi.rs_slot_flags.data(), pi.rs_slot_flags.data(),
+            static_cast<std::size_t>(R), ncclChar, 0, comm.comm(), stream));
     }
-    if (logit_rows > 0) {
+    if (rs_fold_lens_count > 0) {
+        NCCL_CHECK(ncclBroadcast(
+            pi.rs_fold_lens.data(), pi.rs_fold_lens.data(),
+            static_cast<std::size_t>(rs_fold_lens_count) *
+                sizeof(std::uint32_t),
+            ncclChar, 0, comm.comm(), stream));
+    }
+    if ((rs_mode == RsExecutionMode::BufferWrite ||
+         rs_mode == RsExecutionMode::BufferFold) &&
+        R >= 0) {
+        NCCL_CHECK(ncclBroadcast(
+            pi.rs_buffer_slot_indptr.data(),
+            pi.rs_buffer_slot_indptr.data(),
+            static_cast<std::size_t>(R + 1) * sizeof(std::uint32_t),
+            ncclChar, 0, comm.comm(), stream));
+        if (rs_buffer_ids_count > 0) {
+            NCCL_CHECK(ncclBroadcast(
+                pi.rs_buffer_slot_ids.data(),
+                pi.rs_buffer_slot_ids.data(),
+                static_cast<std::size_t>(rs_buffer_ids_count) *
+                    sizeof(std::uint32_t),
+                ncclChar, 0, comm.comm(), stream));
+        }
+    }
+    if (!state_only_fold && logit_rows > 0) {
         NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
                                  static_cast<std::size_t>(logit_rows) * 4,
                                  ncclChar, 0, comm.comm(), stream));
@@ -198,11 +247,46 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
     NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
 }
 
+void tp_broadcast_mtp_step(
+    NcclComm& comm,
+    PersistentInputs& pi,
+    int rows,
+    int draft_step,
+    int max_global_tokens,
+    cudaStream_t stream) {
+    auto* device_header = tp_hdr_dev_buf();
+    TpFireHeader header{
+        .magic = TP_MTP_MAGIC,
+        .total_tokens = rows,
+        .num_requests = draft_step,
+        .is_pure_decode = max_global_tokens,
+        .structured_window_left = -2,
+    };
+    CUDA_CHECK(cudaMemcpyAsync(
+        device_header, &header, sizeof(header),
+        cudaMemcpyHostToDevice, stream));
+    NCCL_CHECK_ASYNC(
+        ncclBroadcast(
+            device_header, device_header, sizeof(header), ncclChar, 0,
+            comm.comm(), stream),
+        comm.comm());
+    NCCL_CHECK(ncclGroupStart());
+    for (void* buffer : {
+             static_cast<void*>(pi.tokens.data()),
+             static_cast<void*>(pi.positions.data()),
+             static_cast<void*>(pi.sample_idx.data()),
+             static_cast<void*>(pi.mtp_request_ids.data())}) {
+        NCCL_CHECK(ncclBroadcast(
+            buffer, buffer, static_cast<std::size_t>(rows) * 4,
+            ncclChar, 0, comm.comm(), stream));
+    }
+    NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
+}
+
 void tp_cpu_gate_notify(const std::string& key) {
     if (key.empty()) return;
     auto gate = tp_cpu_gate_for(key);
-    gate->seq.fetch_add(1, std::memory_order_release);
-    gate->cv.notify_all();
+    gate->publish();
 }
 
 // ============================================================================
@@ -246,6 +330,40 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         if (hdr.magic == TP_STOP_MAGIC) break;
+        if (hdr.magic == TP_MTP_MAGIC) {
+            const int rows = hdr.total_tokens;
+            NCCL_CHECK(ncclGroupStart());
+            for (void* buffer : {
+                     static_cast<void*>(pi.tokens.data()),
+                     static_cast<void*>(pi.positions.data()),
+                     static_cast<void*>(pi.sample_idx.data()),
+                     static_cast<void*>(pi.mtp_request_ids.data())}) {
+                NCCL_CHECK(ncclBroadcast(
+                    buffer, buffer, static_cast<std::size_t>(rows) * 4,
+                    ncclChar, 0, comm.comm(), stream));
+            }
+            NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
+            if (!engine.system_drafter.draft_step) {
+                throw std::runtime_error(
+                    "TP follower received MTP work without a native draft head");
+            }
+            engine.system_drafter.draft_step(
+                engine.ws,
+                engine.kv_cache,
+                engine.cublas,
+                reinterpret_cast<const std::int32_t*>(pi.tokens.data()),
+                reinterpret_cast<const std::int32_t*>(pi.positions.data()),
+                pi.sample_idx.data(),
+                pi.mtp_request_ids.data(),
+                pi.kv_page_indices.data(),
+                pi.kv_page_indptr.data(),
+                pi.kv_last_page_lens.data(),
+                nullptr,
+                rows,
+                hdr.num_requests,
+                hdr.is_pure_decode);
+            continue;
+        }
         if (hdr.magic != TP_FIRE_MAGIC) {
             std::cerr << "[pie-driver-cuda] tp follower: unexpected header "
                       << "magic 0x" << std::hex << hdr.magic << std::dec
@@ -256,39 +374,98 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         const int N = hdr.total_tokens;
         const int R = hdr.num_requests;
         const bool is_pure_decode = (hdr.is_pure_decode != 0);
-        const bool tp_greedy_argmax = (hdr.tp_greedy_argmax != 0);
+        const bool has_write_desc = hdr.has_write_desc != 0;
         const int logit_rows = hdr.logit_rows;
+        const int structured_window_left =
+            hdr.structured_window_left;
+        if (!valid_rs_execution_mode(hdr.rs_mode) ||
+            hdr.rs_fold_lens_count < 0 ||
+            hdr.rs_buffer_ids_count < 0) {
+            throw std::runtime_error(
+                "TP follower received invalid RS metadata header");
+        }
+        const RsExecutionMode rs_mode =
+            static_cast<RsExecutionMode>(hdr.rs_mode);
+        const bool state_only_fold =
+            rs_mode == RsExecutionMode::BufferFold;
+        const int rs_fold_lens_count = hdr.rs_fold_lens_count;
+        const int rs_buffer_ids_count = hdr.rs_buffer_ids_count;
+        const std::size_t rs_rows =
+            static_cast<std::size_t>(std::max(R, 0));
+        const bool header_has_slots = hdr.has_slot_ids != 0;
+        const bool header_buffered =
+            rs_mode == RsExecutionMode::BufferWrite ||
+            rs_mode == RsExecutionMode::BufferFold;
+        if (!tp_rs_metadata_shape_valid(
+                rs_mode,
+                rs_rows,
+                header_has_slots ? rs_rows : 0,
+                header_has_slots ? rs_rows : 0,
+                static_cast<std::size_t>(rs_fold_lens_count),
+                static_cast<std::size_t>(rs_buffer_ids_count),
+                header_buffered ? rs_rows + 1 : 0)) {
+            throw std::runtime_error(
+                "TP follower received inconsistent RS metadata header");
+        }
+        if (static_cast<std::size_t>(std::max(R, 0)) >
+                pi.rs_fold_lens.size() ||
+            static_cast<std::size_t>(rs_fold_lens_count) >
+                pi.rs_fold_lens.size() ||
+            static_cast<std::size_t>(rs_buffer_ids_count) >
+                pi.rs_buffer_slot_ids.size()) {
+            throw std::runtime_error(
+                "TP follower RS metadata exceeds persistent capacity");
+        }
 
         // 2. Receive payloads. Mirror order in `tp_broadcast_inputs`,
         //    grouped so NCCL submits the batch as a single op.
-        const bool have_custom_mask = (hdr.mask_bytes > 0);
+        const bool have_custom_mask =
+            !state_only_fold && hdr.mask_bytes > 0;
         NCCL_CHECK(ncclGroupStart());
-        NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
-                                 static_cast<std::size_t>(N) * 4,
-                                 ncclChar, 0, comm.comm(), stream));
-        NCCL_CHECK(ncclBroadcast(pi.positions.data(), pi.positions.data(),
-                                 static_cast<std::size_t>(N) * 4,
-                                 ncclChar, 0, comm.comm(), stream));
+        if (!state_only_fold) {
+            NCCL_CHECK(ncclBroadcast(pi.tokens.data(), pi.tokens.data(),
+                                     static_cast<std::size_t>(N) * 4,
+                                     ncclChar, 0, comm.comm(), stream));
+            NCCL_CHECK(ncclBroadcast(pi.positions.data(), pi.positions.data(),
+                                     static_cast<std::size_t>(N) * 4,
+                                     ncclChar, 0, comm.comm(), stream));
+            NCCL_CHECK(ncclBroadcast(
+                pi.row_valid.data(), pi.row_valid.data(),
+                static_cast<std::size_t>(N), ncclChar, 0,
+                comm.comm(), stream));
+        }
+        if (!state_only_fold && has_write_desc && N > 0) {
+            NCCL_CHECK(ncclBroadcast(
+                pi.w_page.data(), pi.w_page.data(),
+                static_cast<std::size_t>(N) * 4, ncclChar, 0,
+                comm.comm(), stream));
+            NCCL_CHECK(ncclBroadcast(
+                pi.w_off.data(), pi.w_off.data(),
+                static_cast<std::size_t>(N) * 4, ncclChar, 0,
+                comm.comm(), stream));
+        }
         NCCL_CHECK(ncclBroadcast(pi.qo_indptr.data(), pi.qo_indptr.data(),
                                  static_cast<std::size_t>(R + 1) * 4,
                                  ncclChar, 0, comm.comm(), stream));
-        NCCL_CHECK(ncclBroadcast(pi.kv_page_indptr.data(),
-                                 pi.kv_page_indptr.data(),
-                                 static_cast<std::size_t>(R + 1) * 4,
-                                 ncclChar, 0, comm.comm(), stream));
-        if (R > 0) {
+        if (!state_only_fold) {
+            NCCL_CHECK(ncclBroadcast(
+                pi.kv_page_indptr.data(), pi.kv_page_indptr.data(),
+                static_cast<std::size_t>(R + 1) * 4,
+                ncclChar, 0, comm.comm(), stream));
+        }
+        if (!state_only_fold && R > 0) {
             NCCL_CHECK(ncclBroadcast(pi.kv_last_page_lens.data(),
                                      pi.kv_last_page_lens.data(),
                                      static_cast<std::size_t>(R) * 4,
                                      ncclChar, 0, comm.comm(), stream));
         }
-        if (hdr.kv_indices_count > 0) {
+        if (!state_only_fold && hdr.kv_indices_count > 0) {
             NCCL_CHECK(ncclBroadcast(pi.kv_page_indices.data(),
                                      pi.kv_page_indices.data(),
                                      static_cast<std::size_t>(hdr.kv_indices_count) * 4,
                                      ncclChar, 0, comm.comm(), stream));
         }
-        if (have_custom_mask) {
+        if (!state_only_fold && have_custom_mask) {
             NCCL_CHECK(ncclBroadcast(pi.custom_mask.data(),
                                      pi.custom_mask.data(),
                                      static_cast<std::size_t>(hdr.mask_bytes),
@@ -306,8 +483,36 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             NCCL_CHECK(ncclBroadcast(pi.is_fresh.data(), pi.is_fresh.data(),
                                      static_cast<std::size_t>(R),
                                      ncclChar, 0, comm.comm(), stream));
+            NCCL_CHECK(ncclBroadcast(
+                pi.rs_slot_flags.data(), pi.rs_slot_flags.data(),
+                static_cast<std::size_t>(R), ncclChar, 0,
+                comm.comm(), stream));
         }
-        if (logit_rows > 0) {
+        if (rs_fold_lens_count > 0) {
+            NCCL_CHECK(ncclBroadcast(
+                pi.rs_fold_lens.data(), pi.rs_fold_lens.data(),
+                static_cast<std::size_t>(rs_fold_lens_count) *
+                    sizeof(std::uint32_t),
+                ncclChar, 0, comm.comm(), stream));
+        }
+        if (rs_mode == RsExecutionMode::BufferWrite ||
+            rs_mode == RsExecutionMode::BufferFold) {
+            NCCL_CHECK(ncclBroadcast(
+                pi.rs_buffer_slot_indptr.data(),
+                pi.rs_buffer_slot_indptr.data(),
+                static_cast<std::size_t>(R + 1) *
+                    sizeof(std::uint32_t),
+                ncclChar, 0, comm.comm(), stream));
+            if (rs_buffer_ids_count > 0) {
+                NCCL_CHECK(ncclBroadcast(
+                    pi.rs_buffer_slot_ids.data(),
+                    pi.rs_buffer_slot_ids.data(),
+                    static_cast<std::size_t>(rs_buffer_ids_count) *
+                        sizeof(std::uint32_t),
+                    ncclChar, 0, comm.comm(), stream));
+            }
+        }
+        if (!state_only_fold && logit_rows > 0) {
             NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
                                      static_cast<std::size_t>(logit_rows) * 4,
                                      ncclChar, 0, comm.comm(), stream));
@@ -319,15 +524,22 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         h_qo.resize(R + 1);
         h_kvpp.resize(R + 1);
         std::vector<std::uint32_t> h_kvpi(
-            static_cast<std::size_t>(std::max(0, hdr.kv_indices_count)));
-        std::vector<std::uint32_t> h_kvlpl(R);
+            state_only_fold
+                ? 0
+                : static_cast<std::size_t>(
+                      std::max(0, hdr.kv_indices_count)));
+        std::vector<std::uint32_t> h_kvlpl(
+            state_only_fold ? 0 : static_cast<std::size_t>(R));
         CUDA_CHECK(cudaMemcpyAsync(h_qo.data(), pi.qo_indptr.data(),
                                    static_cast<std::size_t>(R + 1) * 4,
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(h_kvpp.data(), pi.kv_page_indptr.data(),
-                                   static_cast<std::size_t>(R + 1) * 4,
-                                   cudaMemcpyDeviceToHost, stream));
-        if (R > 0) {
+        if (!state_only_fold) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                h_kvpp.data(), pi.kv_page_indptr.data(),
+                static_cast<std::size_t>(R + 1) * 4,
+                cudaMemcpyDeviceToHost, stream));
+        }
+        if (!state_only_fold && R > 0) {
             CUDA_CHECK(cudaMemcpyAsync(h_kvlpl.data(), pi.kv_last_page_lens.data(),
                                        static_cast<std::size_t>(R) * 4,
                                        cudaMemcpyDeviceToHost, stream));
@@ -349,28 +561,110 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             CUDA_CHECK(cudaMemcpyAsync(h_is_fresh.data(), pi.is_fresh.data(),
                                        static_cast<std::size_t>(R),
                                        cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                pi.rs_slot_flags_host.data(), pi.rs_slot_flags.data(),
+                static_cast<std::size_t>(R), cudaMemcpyDeviceToHost, stream));
+        }
+        if (rs_fold_lens_count > 0) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                pi.rs_fold_lens_host.data(), pi.rs_fold_lens.data(),
+                static_cast<std::size_t>(rs_fold_lens_count) *
+                    sizeof(std::uint32_t),
+                cudaMemcpyDeviceToHost, stream));
+        }
+        if (rs_mode == RsExecutionMode::BufferWrite ||
+            rs_mode == RsExecutionMode::BufferFold) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                pi.rs_buffer_slot_indptr_host.data(),
+                pi.rs_buffer_slot_indptr.data(),
+                static_cast<std::size_t>(R + 1) *
+                    sizeof(std::uint32_t),
+                cudaMemcpyDeviceToHost, stream));
+            if (rs_buffer_ids_count > 0) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.rs_buffer_slot_ids_host.data(),
+                    pi.rs_buffer_slot_ids.data(),
+                    static_cast<std::size_t>(rs_buffer_ids_count) *
+                        sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, stream));
+            }
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int request = 0; request < R && have_slot_ids; ++request) {
+            const std::uint8_t flags =
+                pi.rs_slot_flags_host[static_cast<std::size_t>(request)];
+            const std::uint8_t expected_fresh =
+                (flags & PIE_RS_FLAG_RESET) != 0 ? 1u : 0u;
+            if (h_is_fresh[static_cast<std::size_t>(request)] !=
+                expected_fresh) {
+                throw std::runtime_error(
+                    "TP follower RS flags/reset metadata mismatch");
+            }
+        }
+
+        std::vector<std::uint32_t> h_rs_slots(
+            h_slot_ids.begin(), h_slot_ids.end());
+        const std::span<const std::uint32_t> rs_slots(h_rs_slots);
+        const std::span<const std::uint8_t> rs_flags(
+            have_slot_ids ? pi.rs_slot_flags_host.data() : nullptr,
+            have_slot_ids ? static_cast<std::size_t>(R) : 0);
+        const std::span<const std::uint32_t> rs_fold_lens(
+            rs_fold_lens_count > 0
+                ? pi.rs_fold_lens_host.data()
+                : nullptr,
+            static_cast<std::size_t>(rs_fold_lens_count));
+        const bool buffered =
+            rs_mode == RsExecutionMode::BufferWrite ||
+            rs_mode == RsExecutionMode::BufferFold;
+        const std::span<const std::uint32_t> rs_buffer_ids(
+            buffered ? pi.rs_buffer_slot_ids_host.data() : nullptr,
+            buffered ? static_cast<std::size_t>(rs_buffer_ids_count) : 0);
+        const std::span<const std::uint32_t> rs_buffer_indptr(
+            buffered ? pi.rs_buffer_slot_indptr_host.data() : nullptr,
+            buffered ? static_cast<std::size_t>(R + 1) : 0);
+        pipeline::RsExecutionPlan follower_rs_plan;
+        std::string rs_error;
+        if (!pipeline::plan_rs_execution(
+                rs_slots, rs_flags, rs_fold_lens,
+                rs_buffer_ids, rs_buffer_indptr, h_qo,
+                engine.rs_cache != nullptr,
+                engine.rs_cache != nullptr &&
+                    engine.rs_cache->rs_buffer_pool_enabled(),
+                engine.rs_cache != nullptr
+                    ? static_cast<std::uint32_t>(
+                          engine.rs_cache->rs_buffer_page_tokens())
+                    : 0,
+                follower_rs_plan, &rs_error) ||
+            follower_rs_plan.mode != rs_mode) {
+            throw std::runtime_error(
+                "TP follower RS metadata mismatch: " + rs_error);
+        }
 
         // 4. Run the same forward function as rank 0. Channel publication is
         // rank-0-only after the collectives complete.
-        engine.forward_fn.invoke_prepare(
-            engine.attn_ws,
-            ForwardFn::PrepareInputs{
-                .qo_indptr_h = h_qo.data(),
-                .kv_page_indices_h = h_kvpi.data(),
-                .kv_page_indices_d =
-                    reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data()),
-                .kv_page_indptr_h = h_kvpp.data(),
-                .kv_page_indptr_d =
-                    reinterpret_cast<const std::uint32_t*>(pi.kv_page_indptr.data()),
-                .kv_last_page_lens_h = h_kvlpl.data(),
-                .kv_last_page_lens_d =
-                    reinterpret_cast<const std::uint32_t*>(pi.kv_last_page_lens.data()),
-                .total_tokens = N,
-                .num_requests = R,
-                .is_pure_decode = is_pure_decode,
-            });
+        if (rs_mode != RsExecutionMode::BufferFold) {
+            engine.forward_fn.invoke_prepare(
+                engine.attn_ws,
+                ForwardFn::PrepareInputs{
+                    .qo_indptr_h = h_qo.data(),
+                    .kv_page_indices_h = h_kvpi.data(),
+                    .kv_page_indices_d =
+                        reinterpret_cast<const std::uint32_t*>(
+                            pi.kv_page_indices.data()),
+                    .kv_page_indptr_h = h_kvpp.data(),
+                    .kv_page_indptr_d =
+                        reinterpret_cast<const std::uint32_t*>(
+                            pi.kv_page_indptr.data()),
+                    .kv_last_page_lens_h = h_kvlpl.data(),
+                    .kv_last_page_lens_d =
+                        reinterpret_cast<const std::uint32_t*>(
+                            pi.kv_last_page_lens.data()),
+                    .total_tokens = N,
+                    .num_requests = R,
+                    .is_pure_decode = is_pure_decode,
+                    .runtime_window_left = structured_window_left,
+                });
+        }
         // Mirror rank 0's graph capture/replay decision so NCCL ops
         // inside the body record on both ranks simultaneously (otherwise
         // rank 0 would record while rank 1 executes, deadlocking the
@@ -379,12 +673,19 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         // PTIR publication, just the forward kernels + NCCL.
         const bool try_graphs =
             engine.graph_cache != nullptr && is_pure_decode && !have_custom_mask
-            && engine.forward_fn.graph_safe;
+            && engine.forward_fn.graph_safe &&
+            rs_mode != RsExecutionMode::BufferWrite &&
+            rs_mode != RsExecutionMode::BufferFold &&
+            has_write_desc &&
+            structured_window_left == -2 &&
+            graph_replay_has_no_host_resets(
+                have_slot_ids,
+                h_is_fresh.data(),
+                static_cast<std::size_t>(std::max(R, 0)));
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
-            make_graph_variant(tp_greedy_argmax, /*single_gpu=*/false,
-                               /*fwd_handles=*/false, /*small_spec=*/false,
+            make_graph_variant(/*small_spec=*/false,
                                /*rs_verify=*/false, graph_layout);
         if (try_graphs) {
             const ForwardGraphKey key{R, N, graph_variant};
@@ -399,8 +700,10 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     have_slot_ids ? pi.slot_ids.data() : nullptr,
                     logit_rows > 0 ? pi.sample_idx.data() : nullptr,
                     logit_rows,
-                    /*single_gpu_greedy_argmax=*/false,
-                    tp_greedy_argmax);
+                    pi.w_page.data(),
+                    pi.w_off.data(),
+                    /*has_write_desc=*/true,
+                    structured_window_left);
                 engine.graph_cache->put(key, exec);
             }
             CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
@@ -424,9 +727,33 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             fwd_in.slot_ids_h          = have_slot_ids ? h_slot_ids.data() : nullptr;
             fwd_in.is_fresh_h          = have_slot_ids ? h_is_fresh.data() : nullptr;
             fwd_in.slot_ids_d          = have_slot_ids ? pi.slot_ids.data() : nullptr;
+            fwd_in.is_fresh_d          = have_slot_ids ? pi.is_fresh.data() : nullptr;
+            fwd_in.rs_slot_flags_h     =
+                have_slot_ids ? pi.rs_slot_flags_host.data() : nullptr;
+            fwd_in.rs_buffer_slot_ids_h =
+                buffered ? pi.rs_buffer_slot_ids_host.data() : nullptr;
+            fwd_in.rs_buffer_slot_indptr_h =
+                buffered ? pi.rs_buffer_slot_indptr_host.data() : nullptr;
+            fwd_in.rs_fold_lens_h =
+                rs_fold_lens_count > 0
+                    ? pi.rs_fold_lens_host.data()
+                    : nullptr;
+            fwd_in.rs_fold_lens_d =
+                rs_fold_lens_count > 0
+                    ? reinterpret_cast<const std::int32_t*>(
+                          pi.rs_fold_lens.data())
+                    : nullptr;
+            fwd_in.rs_buffer_write =
+                rs_mode == RsExecutionMode::BufferWrite;
+            fwd_in.rs_buffer_fold =
+                rs_mode == RsExecutionMode::BufferFold;
             fwd_in.logit_row_indices_d = logit_rows > 0 ? pi.sample_idx.data() : nullptr;
             fwd_in.num_logit_rows      = logit_rows;
-            fwd_in.tp_greedy_argmax    = tp_greedy_argmax;
+            fwd_in.runtime_window_left = structured_window_left;
+            fwd_in.w_page_d = has_write_desc ? pi.w_page.data() : nullptr;
+            fwd_in.w_off_d = has_write_desc ? pi.w_off.data() : nullptr;
+            fwd_in.row_valid_d = pi.row_valid.data();
+            fwd_in.has_write_desc = has_write_desc;
             engine.forward_fn.invoke_body(
                 engine.ws, engine.kv_cache, engine.attn_ws, engine.cublas,
                 fwd_in);
@@ -438,7 +765,10 @@ void tp_send_shutdown(NcclComm& comm, const std::string& cpu_gate_key) {
     tp_cpu_gate_notify(cpu_gate_key);
     auto* d_hdr = tp_hdr_dev_buf();
     cudaStream_t stream = nullptr;
-    TpFireHeader hdr{TP_STOP_MAGIC, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    TpFireHeader hdr{
+        .magic = TP_STOP_MAGIC,
+        .structured_window_left = -2,
+    };
     CUDA_CHECK(cudaMemcpyAsync(d_hdr, &hdr, sizeof(hdr),
                                cudaMemcpyHostToDevice, stream));
     NCCL_CHECK_ASYNC(ncclBroadcast(d_hdr, d_hdr, sizeof(hdr), ncclChar, 0,

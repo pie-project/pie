@@ -21,8 +21,7 @@ public:
         MlaCache& mla_cache,
         int tp_size,
         NcclComm* tp_comm,
-        bool emit_logits,
-        bool supports_tp_greedy_argmax);
+        bool emit_logits);
 
     void prepare(AttentionWorkspace& attn_ws,
                  const ForwardFn::PrepareInputs& in) override;

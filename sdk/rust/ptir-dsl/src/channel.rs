@@ -14,7 +14,7 @@ use pie_ptir::types::{DType, Shape};
 
 use crate::context::{self, ChannelRef, ChannelState};
 use crate::error::Span;
-use crate::value::{reshape_id_to, AsTensor, ConstData, IntoConst, IntoShape, Tensor};
+use crate::value::{AsTensor, ConstData, IntoConst, IntoShape, Tensor, reshape_id_to};
 
 static NEXT_GID: AtomicU64 = AtomicU64::new(1);
 
@@ -68,6 +68,17 @@ impl Channel {
         ch
     }
 
+    /// Resolve a channel handle from its global id (the registry is
+    /// thread-local, like the trace session). A guest-facing Copy token
+    /// (F9) stores only the gid; every op resolves through here.
+    pub fn by_gid(gid: u64) -> Option<Channel> {
+        context::channel_state_by_gid(gid).map(|state| Channel { state })
+    }
+
+    pub fn is_seeded(&self) -> bool {
+        self.state.borrow().seeded
+    }
+
     fn build(shape: Shape, dtype: DType, capacity: u32, seed: Option<ConstData>) -> Channel {
         let gid = NEXT_GID.fetch_add(1, Ordering::Relaxed);
         let seeded = seed.is_some();
@@ -88,6 +99,7 @@ impl Channel {
             desc_takes: Vec::new(),
             desc_reads: Vec::new(),
         }));
+        context::register_channel_state(gid, state.clone());
         Channel { state }
     }
 
@@ -126,6 +138,25 @@ impl Channel {
     #[track_caller]
     pub fn note_host_put(&self) {
         self.state.borrow_mut().host_puts.push(Span::here());
+    }
+
+    /// Record a descriptor endpoint claim (take vs read per the port's
+    /// consumption discipline) WITHOUT binding a port. The `inferlet` bridge
+    /// claims EAGERLY at pass construction (F8): with claims on the shared
+    /// state before any pass's build, a channel consumed by a
+    /// later-constructed sibling pass never misinfers as a terminal output —
+    /// cross-pass handoffs need construction order, not an annotation. The
+    /// bridge's build then binds with [`Builder::bind_port_recorded`]
+    /// (crate::builder) so the claim is not double-counted.
+    #[track_caller]
+    pub fn note_desc_claim(&self, consumes: bool) {
+        let span = Span::here();
+        let mut st = self.state.borrow_mut();
+        if consumes {
+            st.desc_takes.push(span);
+        } else {
+            st.desc_reads.push(span);
+        }
     }
 
     /// `take()` — full ⇒ value + empty; empty ⇒ block. In-program: returns the
@@ -196,10 +227,14 @@ enum TakenInner {
 
 impl Taken {
     fn in_program(t: Tensor) -> Taken {
-        Taken { inner: TakenInner::InProgram(t) }
+        Taken {
+            inner: TakenInner::InProgram(t),
+        }
     }
     fn host(chan: ChannelRef, consume: bool) -> Taken {
-        Taken { inner: TakenInner::Host { chan, consume } }
+        Taken {
+            inner: TakenInner::Host { chan, consume },
+        }
     }
     /// The in-program `Tensor` (panics if this is a host take — a frontend bug).
     pub fn tensor(self) -> Tensor {

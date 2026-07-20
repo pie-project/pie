@@ -31,7 +31,8 @@ void launch_write_kv_to_pages_bf16(
     int num_kv_heads,
     int head_dim,
     bool hnd_layout,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const std::uint8_t* row_valid = nullptr);
 
 void launch_write_kv_to_pages(
     KvCacheLayerView layer,
@@ -43,7 +44,8 @@ void launch_write_kv_to_pages(
     const std::uint32_t* kv_last_page_lens,        // [R]
     int total_tokens,
     int num_requests,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const std::uint8_t* row_valid = nullptr);
 
 void launch_write_kv_to_pages_at_positions_bf16(
     KvCacheLayerView layer,
@@ -79,7 +81,8 @@ void launch_write_kv_explicit_bf16(
     const std::uint32_t* w_page,        // [LANES] physical page id per lane
     const std::uint32_t* w_off,         // [LANES] offset-in-page per lane
     int B,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const std::uint8_t* row_valid = nullptr);
 
 // Compaction primitive (Design-B lazy GC): move N token KV cells (single layer)
 // from explicit (src physical page, src offset) → (dst physical page, dst offset)

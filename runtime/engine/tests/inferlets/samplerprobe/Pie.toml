@@ -1,4 +1,0 @@
-[package]
-name = "samplerprobe"
-version = "0.1.0"
-description = "Test inferlet: exercises the keep-core sampler-lowering primitive (sampler::sampler_program) — a parametric top-p sampler on the raw WIT surface, no Graph/facade"

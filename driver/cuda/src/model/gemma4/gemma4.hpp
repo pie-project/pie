@@ -50,6 +50,10 @@
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
 
+namespace pie_cuda_driver {
+struct PrecomputedEmbeddingInputs;
+}
+
 namespace pie_cuda_driver::model {
 
 struct Gemma4LayerWeights {
@@ -369,10 +373,6 @@ struct Gemma4AudioWeights {
 // populated. Throws otherwise. Mirrors `bind_gemma4_vision`.
 Gemma4AudioWeights bind_gemma4_audio(const LoadedModel& engine);
 
-void set_gemma4_logits_argmax_only(bool enabled);
-void set_gemma4_fused_argmax_output(std::int32_t* ptr);
-bool gemma4_fused_argmax_done();
-
 void prepare_gemma4_decode_plans(
     const Gemma4Weights& w,
     const HfConfig& cfg,
@@ -422,7 +422,8 @@ void gemma4_forward_paged(
     const Gemma4VisionInputs* vision_in = nullptr,
     // Multimodal: encode + scatter audio soft tokens after the embed step.
     // nullptr / 0 clips for non-audio passes. See gemma4_audio_forward.hpp.
-    const Gemma4AudioInputs* audio_in = nullptr);
+    const Gemma4AudioInputs* audio_in = nullptr,
+    const ::pie_cuda_driver::PrecomputedEmbeddingInputs* precomputed_embeddings = nullptr);
 
 // Gemma4 MoE workspace byte budget. Returns 0 if the config has no MoE
 // block configured.

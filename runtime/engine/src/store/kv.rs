@@ -35,11 +35,12 @@ mod tests;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
+use std::sync::{Arc, RwLock};
 
 use hash::Hash256;
 use page_table::{
-    HostKvSlotId, KvPageBacking, KvPageTable, KvTableError, NodeId, PhysicalKvPageId,
-    PublishedPage, TriePageLocation, WorkingSetId,
+    HostKvSlotId, IndexedWorkingSet, KvPageBacking, KvPageTable, KvTableError, NodeId,
+    PhysicalKvPageId, PublishedPage, TriePageLocation, WorkingSetId,
 };
 use write::{KvPreparedWrite, PageCommit, PreparedTarget};
 
@@ -61,28 +62,68 @@ pub enum KvStoreError {
     GrantMismatch { required: usize, granted: usize },
     #[error("host KV swap pool exhausted: requested {requested}, available {available}")]
     HostSwapFull { requested: usize, available: usize },
-    #[error("working set has a prepared write in flight")]
-    Busy,
+    #[error("invalid KV index key: {reason}")]
+    BadIndexKey { reason: &'static str },
+    #[error("KV indexing is disabled")]
+    IndexDisabled,
 }
 
-#[derive(Default)]
+pub const MAX_INDEX_KEY_BYTES: usize = 256;
+
+#[derive(Debug, Clone)]
+struct KvTranslationSnapshot {
+    version: u64,
+    pages: Option<Arc<[u32]>>,
+}
+
+/// WorkingSet-owned logical-to-physical translation. Mapping events publish a
+/// new immutable snapshot; fire submission can clone it without taking the
+/// global KV-store lock.
+#[derive(Debug)]
+pub struct KvTranslation {
+    snapshot: RwLock<KvTranslationSnapshot>,
+}
+
+impl Default for KvTranslation {
+    fn default() -> Self {
+        Self {
+            snapshot: RwLock::new(KvTranslationSnapshot {
+                version: 0,
+                pages: Some(Arc::from([])),
+            }),
+        }
+    }
+}
+
+impl KvTranslation {
+    fn publish(&self, version: u64, pages: Option<Arc<[u32]>>) {
+        *self.snapshot.write().unwrap() = KvTranslationSnapshot { version, pages };
+    }
+
+    pub fn snapshot(&self) -> Result<(u64, Arc<[u32]>), &'static str> {
+        let snapshot = self.snapshot.read().unwrap();
+        snapshot
+            .pages
+            .as_ref()
+            .map(|pages| (snapshot.version, Arc::clone(pages)))
+            .ok_or("working set translation is not resident")
+    }
+}
+
 struct FlatEntry {
     version: u64,
     cache: Option<Vec<PhysicalKvPageId>>,
+    translation: Arc<KvTranslation>,
 }
 
-#[derive(Debug)]
-struct PendingOverlay {
-    seq: u64,
-    mappings: Vec<(u64, PhysicalKvPageId)>,
-    pages: Vec<(u64, PageCommit)>,
-    chain_state: Hash256,
-    token_len_after: Option<u64>,
-}
-
-#[derive(Debug)]
-struct DeferredRelease {
-    cache_roots_max: Option<usize>,
+impl Default for FlatEntry {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            cache: Some(Vec::new()),
+            translation: Arc::new(KvTranslation::default()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -178,25 +219,18 @@ pub struct KvStore {
     /// change any logical->physical value (owner compaction, collection) do
     /// not bump versions.
     flat: HashMap<WorkingSetId, FlatEntry>,
-    /// Prepared writes visible only to later prepares of the same WorkingSet.
-    /// The committed trie, CAS, reclaim accounting, and public flat table never
-    /// consult this FIFO.
-    pending: HashMap<WorkingSetId, VecDeque<PendingOverlay>>,
-    deferred_releases: HashMap<WorkingSetId, DeferredRelease>,
     opaque_nonce: Hash256,
     opaque_counter: u64,
     /// The pass-wide cache domain folded into every canonical token-slot
     /// hash (model/weights identity; today boot-scoped via the nonce).
     domain: Hash256,
-    /// Content-addressable index over canonical FULL pages: the page's last
-    /// token-slot hash (the chain value at its boundary) -> its trie
-    /// location. Entries are validated on lookup (owner compaction may move
-    /// locals; collection may free the node) and pruned lazily.
+    #[cfg(test)]
     cas: HashMap<Hash256, CasEntry>,
-    /// Bounded FIFO of auto-retained cache roots (prefix caching on release):
-    /// the oldest lease is evicted past the cap, and the contention ladder's
-    /// rung 1 drops any of them the moment memory is needed.
-    retained: VecDeque<NodeId>,
+    /// Inferlet-owned opaque index. Values carry no token or layout meaning;
+    /// each entry owns one cache-root lease for its snapshot terminal.
+    indexes: HashMap<Vec<u8>, KvIndexEntry>,
+    index_order: VecDeque<Vec<u8>>,
+    max_indexes: usize,
     /// Monotonic submission sequence: bumped per prepared write. Freed slots
     /// are recycled tagged with the current value and retired once the fire
     /// carrying that sequence completes (FIFO stream order), or immediately
@@ -205,8 +239,21 @@ pub struct KvStore {
     in_flight: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct CasEntry {
+    node: NodeId,
+    local: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KvIndexEntry {
+    snapshot: IndexedWorkingSet,
+}
+
+#[derive(Debug)]
+pub(crate) struct CasIntent {
+    key: Hash256,
     node: NodeId,
     local: u64,
 }
@@ -217,18 +264,28 @@ impl KvStore {
     }
 
     pub fn new_with_swap(capacity: u32, host_capacity: u32, opaque_nonce: Hash256) -> Self {
+        Self::new_with_swap_range(0, capacity, host_capacity, opaque_nonce)
+    }
+
+    pub fn new_with_swap_range(
+        base_page: u32,
+        capacity: u32,
+        host_capacity: u32,
+        opaque_nonce: Hash256,
+    ) -> Self {
         Self {
             table: KvPageTable::new(),
-            pool: Pool::new(capacity),
+            pool: Pool::new_range(base_page, capacity),
             host_pool: Pool::new(host_capacity),
             flat: HashMap::new(),
-            pending: HashMap::new(),
-            deferred_releases: HashMap::new(),
             opaque_nonce,
             opaque_counter: 0,
             domain: hash::cache_domain(&opaque_nonce),
+            #[cfg(test)]
             cas: HashMap::new(),
-            retained: VecDeque::new(),
+            indexes: HashMap::new(),
+            index_order: VecDeque::new(),
+            max_indexes: working_set::index_roots_max(),
             seq: 0,
             in_flight: 0,
         }
@@ -257,11 +314,97 @@ impl KvStore {
     // ------------------------------------------------------------------
 
     pub fn create_working_set(&mut self) -> WorkingSetId {
-        self.table.create_working_set()
+        let ws = self.table.create_working_set();
+        self.flat.insert(ws, FlatEntry::default());
+        ws
+    }
+
+    fn validate_index_key(key: &[u8]) -> Result<(), KvStoreError> {
+        if key.is_empty() {
+            return Err(KvStoreError::BadIndexKey {
+                reason: "key must not be empty",
+            });
+        }
+        if key.len() > MAX_INDEX_KEY_BYTES {
+            return Err(KvStoreError::BadIndexKey {
+                reason: "key exceeds 256 bytes",
+            });
+        }
+        Ok(())
+    }
+
+    fn release_index_entry(&mut self, entry: KvIndexEntry, epoch: u64) -> usize {
+        let freed = entry
+            .snapshot
+            .terminal
+            .map_or_else(Vec::new, |root| self.table.release_cache_root(root));
+        let count = freed.len();
+        self.recycle_backings(freed, epoch);
+        self.retire_idle();
+        count
+    }
+
+    /// Atomically insert or replace an opaque key with a fully mapped
+    /// WorkingSet snapshot. Returns the number of physical pages made
+    /// reclaimable by replacing the previous entry.
+    pub fn update_index(&mut self, key: Vec<u8>, ws: WorkingSetId) -> Result<usize, KvStoreError> {
+        Self::validate_index_key(&key)?;
+        if self.max_indexes == 0 {
+            return Err(KvStoreError::IndexDisabled);
+        }
+        let snapshot = self.table.index_snapshot(ws)?;
+        if let Some(root) = snapshot.terminal {
+            self.table.lease_cache_root(root);
+        }
+        self.index_order.retain(|existing| existing != &key);
+        self.index_order.push_back(key.clone());
+        let replaced = self.indexes.insert(key, KvIndexEntry { snapshot });
+        let mut freed = replaced.map_or(0, |entry| {
+            self.release_index_entry(entry, self.current_epoch())
+        });
+        while self.indexes.len() > self.max_indexes {
+            let oldest = self
+                .index_order
+                .pop_front()
+                .expect("index order covers every indexed key");
+            if let Some(entry) = self.indexes.remove(&oldest) {
+                freed += self.release_index_entry(entry, self.current_epoch());
+            }
+        }
+        Ok(freed)
+    }
+
+    /// Exact lookup of an opaque index key. The returned WorkingSet owns its
+    /// own terminal anchor and remains valid after index replacement/removal.
+    pub fn from_index(&mut self, key: &[u8]) -> Result<Option<WorkingSetId>, KvStoreError> {
+        Self::validate_index_key(key)?;
+        let Some(entry) = self.indexes.get(key).copied() else {
+            return Ok(None);
+        };
+        let ws = self.table.from_index_snapshot(entry.snapshot);
+        self.flat.insert(ws, FlatEntry::default());
+        self.refresh_flat(ws);
+        Ok(Some(ws))
+    }
+
+    /// Remove only the named index root. Returns `(removed, pages_freed)`.
+    pub fn remove_index(&mut self, key: &[u8]) -> Result<(bool, usize), KvStoreError> {
+        Self::validate_index_key(key)?;
+        let Some(entry) = self.indexes.remove(key) else {
+            return Ok((false, 0));
+        };
+        self.index_order
+            .retain(|existing| existing.as_slice() != key);
+        let epoch = self.current_epoch();
+        let freed = self.release_index_entry(entry, epoch);
+        Ok((true, freed))
     }
 
     pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvStoreError> {
-        Ok(self.table.fork(ws)?)
+        let child = self.table.fork(ws)?;
+        self.flat.insert(child, FlatEntry::default());
+        self.refresh_flat(child);
+        Ok(child)
     }
 
     pub fn slice(
@@ -278,11 +421,55 @@ impl KvStore {
         } else {
             self.refresh_chain_after_surgery(child, range.start == 0)?;
         }
+        self.flat.insert(child, FlatEntry::default());
+        self.refresh_flat(child);
         Ok(child)
     }
 
     pub fn reserve(&mut self, ws: WorkingSetId, pages: u64) -> Result<Range<u64>, KvStoreError> {
         Ok(self.table.reserve(ws, pages)?)
+    }
+
+    /// Physically back the missing logical prefix through `end`, without
+    /// changing `page_len`. Existing mappings are untouched; fresh pages carry
+    /// no content identity until an explicit index publication retains them.
+    pub fn ensure_backed(&mut self, ws: WorkingSetId, end: u64) -> Result<usize, KvStoreError> {
+        let page_len = self.table.page_len(ws)?;
+        if end > page_len {
+            return Err(KvStoreError::BadWriteSet {
+                reason: "backing frontier exceeds the logical reservation",
+            });
+        }
+        let mapped = self.table.mapped_len(ws)?;
+        if end <= mapped {
+            return Ok(0);
+        }
+        let count = usize::try_from(end - mapped).map_err(|_| KvStoreError::OutOfPages {
+            requested: usize::MAX,
+            available: self.pool.available(),
+        })?;
+        let allocated = self
+            .pool
+            .try_alloc_n(count)
+            .ok_or(KvStoreError::OutOfPages {
+                requested: count,
+                available: self.pool.available(),
+            })?;
+        let published = allocated
+            .iter()
+            .copied()
+            .map(|id| PublishedPage {
+                id,
+                token_hashes: Vec::new(),
+                page_hash: None,
+            })
+            .collect();
+        if let Err(error) = self.table.publish_appended(ws, published) {
+            self.pool.release_reserved(allocated);
+            return Err(error.into());
+        }
+        self.invalidate_flat(ws);
+        Ok(count)
     }
 
     /// Freed slots recycle after `epoch` retires (all in-flight users done).
@@ -313,10 +500,48 @@ impl KvStore {
             .all(|r| r.start >= new_mapped);
 
         let freed = self.table.discard(ws, ranges)?;
-        self.pool.recycle_after_epoch(freed, epoch);
+        self.recycle_backings(freed, epoch);
         self.invalidate_flat(ws);
         if removed > 0 {
             self.refresh_chain_after_surgery(ws, prefix_intact)?;
+        }
+        Ok(())
+    }
+
+    pub fn invalidate_copied_pages(
+        &mut self,
+        ws: WorkingSetId,
+        indexes: &[u32],
+    ) -> Result<(), KvStoreError> {
+        let mut indexes = indexes.to_vec();
+        indexes.sort_unstable();
+        indexes.dedup();
+        for index in indexes {
+            self.table
+                .commit_in_place(ws, u64::from(index), Vec::new(), None)?;
+        }
+        let opaque = self.next_opaque_hash();
+        self.table.set_chain_state(ws, Some(opaque))?;
+        Ok(())
+    }
+
+    pub fn privately_writable(&self, ws: WorkingSetId, index: u64) -> Result<bool, KvStoreError> {
+        Ok(self.table.privately_writable(ws, index)?)
+    }
+
+    /// Forget content-derived identity from `start` through the mapped suffix.
+    /// Explicit indexes retain structure directly and do not consume this
+    /// metadata; this only prevents the transitional implicit CAS from
+    /// reaching a page after it becomes writable.
+    pub fn opacify_suffix(&mut self, ws: WorkingSetId, start: u64) -> Result<(), KvStoreError> {
+        let mapped = self.table.mapped_len(ws)?;
+        let had_chain = self.table.chain_state(ws)?.is_some();
+        for index in start.min(mapped)..mapped {
+            self.table.commit_in_place(ws, index, Vec::new(), None)?;
+        }
+        if had_chain {
+            let opaque = self.next_opaque_hash();
+            self.table.set_chain_state(ws, Some(opaque))?;
         }
         Ok(())
     }
@@ -358,19 +583,6 @@ impl KvStore {
     }
 
     pub fn release_working_set(&mut self, ws: WorkingSetId, epoch: u64) {
-        if self
-            .pending
-            .get(&ws)
-            .is_some_and(|entries| !entries.is_empty())
-        {
-            self.deferred_releases.insert(
-                ws,
-                DeferredRelease {
-                    cache_roots_max: None,
-                },
-            );
-            return;
-        }
         self.release_working_set_now(ws, epoch);
     }
 
@@ -378,7 +590,6 @@ impl KvStore {
         let freed = self.table.release_working_set_backings(ws);
         self.recycle_backings(freed, epoch);
         self.flat.remove(&ws);
-        self.pending.remove(&ws);
     }
 
     fn recycle_backings(&mut self, backings: Vec<KvPageBacking>, epoch: u64) {
@@ -392,44 +603,6 @@ impl KvStore {
         }
         self.pool.recycle_after_epoch(resident, epoch);
         self.host_pool.release_reserved(swapped);
-    }
-
-    /// Release a WorkingSet, RETAINING its path as a prefix-cache root when
-    /// it carries canonical content (page 0 committed with a page hash). The
-    /// lease keeps the pages reachable for CAS matches; pressure reclaims
-    /// them via the contention ladder's rung 1, and the FIFO cap
-    /// (`max_roots`) bounds steady-state retention. Non-canonical paths
-    /// release exactly like [`Self::release_working_set`].
-    pub fn release_working_set_cached(&mut self, ws: WorkingSetId, epoch: u64, max_roots: usize) {
-        if self
-            .pending
-            .get(&ws)
-            .is_some_and(|entries| !entries.is_empty())
-        {
-            self.deferred_releases.insert(
-                ws,
-                DeferredRelease {
-                    cache_roots_max: Some(max_roots),
-                },
-            );
-            return;
-        }
-        let retain = match (self.table.terminal(ws), self.table.page_hash_at(ws, 0)) {
-            (Ok(Some(root)), Ok(Some(_))) if max_roots > 0 => Some(root),
-            _ => None,
-        };
-        if let Some(root) = retain {
-            self.table.lease_cache_root(root);
-            self.retained.push_back(root);
-            while self.retained.len() > max_roots {
-                if let Some(old) = self.retained.pop_front() {
-                    self.table.release_cache_root(old);
-                }
-            }
-        }
-        // The release's reachability sweep also collects any just-evicted
-        // roots' pages.
-        self.release_working_set_now(ws, epoch);
     }
 
     // ------------------------------------------------------------------
@@ -492,20 +665,12 @@ impl KvStore {
         self.finish_prepare_write(ws, classification, granted)
     }
 
-    pub fn required_pages(
-        &mut self,
-        ws: WorkingSetId,
-        write_indexes: &[u64],
-    ) -> Result<usize, KvStoreError> {
-        Ok(self.classify_write(ws, write_indexes)?.required_pages())
-    }
-
     fn classify_write(
         &mut self,
         ws: WorkingSetId,
         write_indexes: &[u64],
     ) -> Result<WriteClassification, KvStoreError> {
-        let visible = self.visible_flat_table(ws)?;
+        let visible = self.flat_table(ws)?.1.to_vec();
         let mapped = visible.len() as u64;
         let page_len = self.table.page_len(ws)?;
 
@@ -530,9 +695,7 @@ impl KvStore {
         let mut in_place: Vec<(u64, PhysicalKvPageId)> = Vec::new();
         let mut cow_start: Option<u64> = None;
         for &index in indexes.iter().filter(|&&i| i < mapped) {
-            if self.pending_target(ws, index).is_some() {
-                in_place.push((index, visible[index as usize]));
-            } else if self.table.privately_writable(ws, index)? {
+            if self.table.privately_writable(ws, index)? {
                 in_place.push((index, visible[index as usize]));
             } else {
                 cow_start = Some(cow_start.map_or(index, |c| c.min(index)));
@@ -592,19 +755,10 @@ impl KvStore {
             });
         }
 
-        // Pin the terminal snapshot after classification: the pin guards the
-        // captured path against concurrent mutation and collection until
-        // commit/abort, but must not make this fire's own pages look shared.
-        let pinned = self.table.terminal(ws)?;
-        if let Some(terminal) = pinned {
-            self.table.pin(terminal);
-        }
-
         self.seq += 1;
         self.in_flight += 1;
         Ok(KvPreparedWrite {
             ws,
-            pinned,
             targets,
             allocated,
             old_mapped: mapped,
@@ -613,32 +767,21 @@ impl KvStore {
         })
     }
 
-    /// Commit a prepared write after the driver reports success at `epoch`.
-    /// `commits` aligns with `prepared.targets()`. All-or-nothing for now;
-    /// partial driver commits abort instead.
-    pub fn commit(
+    /// Publish one guest-ordered prepared write into the single table state.
+    /// Physical content arrives later on the same pipeline stream; only CAS
+    /// visibility waits for GPU success.
+    pub fn publish_prepared(
         &mut self,
         prepared: KvPreparedWrite,
         commits: &[PageCommit],
-        epoch: u64,
-    ) -> Result<(), KvStoreError> {
+    ) -> Result<(u64, Vec<CasIntent>), KvStoreError> {
         if commits.len() != prepared.targets.len() {
-            self.abort(prepared, epoch);
+            self.cancel_prepared(prepared);
             return Err(KvStoreError::CommitMismatch);
         }
         let ws = prepared.ws;
-        let pending_chain = self
-            .pending
-            .get(&ws)
-            .and_then(|entries| entries.iter().find(|entry| entry.seq == prepared.seq))
-            .map(|entry| entry.chain_state);
-
-        // The fire is done; release the snapshot pin before publishing so a
-        // sole-user terminal can extend in place instead of growing a node
-        // chain per fire.
-        if let Some(terminal) = prepared.pinned {
-            self.table.unpin(terminal);
-        }
+        let seq = prepared.seq;
+        let mut freed = Vec::new();
 
         for (target, commit) in prepared.targets.iter().zip(commits) {
             if let PreparedTarget::InPlace { index, .. } = *target {
@@ -664,8 +807,15 @@ impl KvStore {
                 PreparedTarget::InPlace { .. } => {}
             }
         }
+        const fn changes_mapping(target: &PreparedTarget) -> bool {
+            matches!(
+                target,
+                PreparedTarget::Cow { .. } | PreparedTarget::Fresh { .. }
+            )
+        }
+        let mapping_changed = prepared.targets.iter().any(changes_mapping);
         match prepared.cow_start {
-            Some(cs) => self.table.replace_tail(ws, cs, pages)?,
+            Some(cs) => freed.extend(self.table.replace_tail(ws, cs, pages)?),
             None if !pages.is_empty() => self.table.publish_appended(ws, pages)?,
             None => {}
         }
@@ -680,54 +830,76 @@ impl KvStore {
             .max_by_key(|(t, _)| t.index())
         {
             let last = commit.token_hashes.iter().rev().find_map(|h| *h);
-            let state =
-                pending_chain.unwrap_or_else(|| last.unwrap_or_else(|| self.next_opaque_hash()));
+            let state = last.unwrap_or_else(|| self.next_opaque_hash());
             self.table.set_chain_state(ws, Some(state))?;
         }
 
-        self.invalidate_flat(ws);
-        let freed = self.table.collect_backings();
-        self.recycle_backings(freed, epoch);
-
-        // CAS index: canonical FULL pages (the fire path records their
-        // page_hash) become content-addressable at their boundary chain
-        // value. Located after collection so owner compaction has settled.
-        for (target, commit) in prepared.targets.iter().zip(commits) {
-            if commit.page_hash.is_none() {
-                continue;
-            }
-            let Some(key) = commit.token_hashes.iter().rev().find_map(|h| *h) else {
-                continue;
-            };
-            if let Ok((node, local)) = self.table.locate_page(ws, target.index()) {
-                self.cas.insert(key, CasEntry { node, local });
-            }
+        if mapping_changed {
+            self.invalidate_flat(ws);
         }
-        self.prune_cas_if_bloated();
-        self.retire_pending_overlay(ws, prepared.seq);
+        self.recycle_backings(freed, seq);
 
-        self.in_flight = self.in_flight.saturating_sub(1);
-        Ok(())
+        let intents = {
+            #[cfg(test)]
+            {
+                let mut intents = Vec::new();
+                for (target, commit) in prepared.targets.iter().zip(commits) {
+                    if commit.page_hash.is_none() {
+                        continue;
+                    }
+                    let Some(key) = commit.token_hashes.iter().rev().find_map(|h| *h) else {
+                        continue;
+                    };
+                    if let Ok((node, local)) = self.table.locate_page(ws, target.index()) {
+                        intents.push(CasIntent { key, node, local });
+                    }
+                }
+                intents
+            }
+            #[cfg(not(test))]
+            {
+                Vec::new()
+            }
+        };
+        Ok((seq, intents))
     }
 
-    /// Failure, poison, or readiness dummy-run: release pending slots and
-    /// metadata; the committed mapping and hashes remain authoritative.
-    pub fn abort(&mut self, prepared: KvPreparedWrite, epoch: u64) {
-        let ws = prepared.ws;
-        let seq = prepared.seq;
-        if let Some(terminal) = prepared.pinned {
-            self.table.unpin(terminal);
-        }
-        self.pool.recycle_after_epoch(prepared.allocated, epoch);
-        let freed = self.table.collect_backings();
-        self.recycle_backings(freed, epoch);
-        self.retire_pending_overlay(ws, seq);
+    pub fn cancel_prepared(&mut self, prepared: KvPreparedWrite) {
+        self.pool
+            .recycle_after_epoch(prepared.allocated, prepared.seq);
         self.in_flight = self.in_flight.saturating_sub(1);
+        self.retire_idle();
+    }
+
+    pub fn settle(&mut self, intents: Vec<CasIntent>, success: bool) {
+        #[cfg(test)]
+        if success {
+            for intent in intents {
+                if self
+                    .table
+                    .node_page_last_slot_hash(intent.node, intent.local)
+                    == Some(intent.key)
+                {
+                    self.cas.insert(
+                        intent.key,
+                        CasEntry {
+                            node: intent.node,
+                            local: intent.local,
+                        },
+                    );
+                }
+            }
+            self.prune_cas_if_bloated();
+        }
+        #[cfg(not(test))]
+        let _ = (intents, success);
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.retire_idle();
     }
 
     /// Retire completion epochs `<= epoch`, making recycled slots allocatable.
-    pub fn retire_through(&mut self, epoch: u64) {
-        self.pool.retire_through(epoch);
+    pub fn retire_through(&mut self, _epoch: u64) {
+        self.retire_idle();
     }
 
     // ------------------------------------------------------------------
@@ -744,7 +916,10 @@ impl KvStore {
         let cached = self.flat.get(&ws).is_some_and(|f| f.cache.is_some());
         if !cached {
             let flat = self.table.flatten(ws)?;
-            self.flat.entry(ws).or_default().cache = Some(flat);
+            let entry = self.flat.entry(ws).or_default();
+            let pages: Arc<[u32]> = flat.iter().map(|page| page.0).collect();
+            entry.translation.publish(entry.version, Some(pages));
+            entry.cache = Some(flat);
         }
         let entry = self.flat.get(&ws).expect("just populated");
         Ok((
@@ -753,184 +928,40 @@ impl KvStore {
         ))
     }
 
-    /// The pipeline-scoped speculative mapping: committed pages overlaid by
-    /// prepared writes in submit order. Callers must not publish this view to
-    /// the CAS or expose it through cross-pipeline store APIs.
-    pub fn visible_flat_table(
-        &mut self,
-        ws: WorkingSetId,
-    ) -> Result<Vec<PhysicalKvPageId>, KvStoreError> {
-        let mut table = {
-            let (_, committed) = self.flat_table(ws)?;
-            committed.to_vec()
-        };
-        if let Some(entries) = self.pending.get(&ws) {
-            for entry in entries {
-                for &(index, page) in &entry.mappings {
-                    if table.len() <= index as usize {
-                        table.resize(index as usize + 1, PhysicalKvPageId(0));
-                    }
-                    table[index as usize] = page;
-                }
-            }
-        }
-        Ok(table)
-    }
-
-    pub fn visible_mapped_len(&mut self, ws: WorkingSetId) -> Result<u64, KvStoreError> {
-        let (_, committed) = self.flat_table(ws)?;
-        let committed_len = committed.len() as u64;
-        let pending_len = self
-            .pending
-            .get(&ws)
-            .into_iter()
-            .flat_map(|entries| entries.iter())
-            .flat_map(|entry| entry.mappings.iter().map(|(index, _)| index + 1))
-            .max()
-            .unwrap_or(0);
-        Ok(committed_len.max(pending_len))
-    }
-
-    pub fn visible_chain_state(&self, ws: WorkingSetId) -> Result<Option<Hash256>, KvStoreError> {
-        if let Some(state) = self
-            .pending
-            .get(&ws)
-            .and_then(|entries| entries.back())
-            .map(|entry| entry.chain_state)
-        {
-            return Ok(Some(state));
-        }
-        self.chain_state(ws)
-    }
-
-    pub fn visible_page_hash_at(
-        &self,
-        ws: WorkingSetId,
-        index: u64,
-    ) -> Result<Option<Hash256>, KvStoreError> {
-        if let Some(commit) = self.pending_page(ws, index) {
-            return Ok(commit.page_hash);
-        }
-        self.page_hash_at(ws, index)
-    }
-
-    pub fn visible_page_token_hashes(
-        &self,
-        ws: WorkingSetId,
-        index: u64,
-    ) -> Result<Vec<Option<Hash256>>, KvStoreError> {
-        if let Some(commit) = self.pending_page(ws, index) {
-            return Ok(commit.token_hashes.clone());
-        }
-        self.page_token_hashes(ws, index)
-    }
-
-    pub fn visible_token_len(&self, ws: WorkingSetId, page_size: u32) -> Result<u64, KvStoreError> {
-        if let Some(token_len) = self
-            .pending
-            .get(&ws)
-            .and_then(|entries| entries.iter().rev().find_map(|entry| entry.token_len_after))
-        {
-            return Ok(token_len);
-        }
-        self.committed_token_len(ws, page_size)
-    }
-
-    pub fn track_pending_write(
-        &mut self,
-        prepared: &KvPreparedWrite,
-        commits: &[PageCommit],
-        token_len_after: Option<u64>,
-    ) {
-        debug_assert_eq!(prepared.targets.len(), commits.len());
-        let chain_state = commits
-            .iter()
-            .rev()
-            .find_map(|commit| commit.token_hashes.iter().rev().find_map(|hash| *hash))
-            .unwrap_or_else(|| self.next_opaque_hash());
-        let entry = PendingOverlay {
-            seq: prepared.seq,
-            mappings: prepared
-                .targets
-                .iter()
-                .map(|target| (target.index(), target.dst()))
-                .collect(),
-            pages: prepared
-                .targets
-                .iter()
-                .zip(commits)
-                .map(|(target, commit)| (target.index(), commit.clone()))
-                .collect(),
-            chain_state,
-            token_len_after,
-        };
-        let entries = self.pending.entry(prepared.ws).or_default();
-        debug_assert!(
-            entries.back().is_none_or(|prior| prior.seq < prepared.seq),
-            "pending KV overlays must be registered in submit order"
-        );
-        entries.push_back(entry);
-    }
-
-    fn pending_target(&self, ws: WorkingSetId, index: u64) -> Option<PhysicalKvPageId> {
-        self.latest_pending(ws, |entry| {
-            entry
-                .mappings
-                .iter()
-                .rev()
-                .find_map(|&(candidate, page)| (candidate == index).then_some(page))
-        })
-    }
-
-    fn pending_page(&self, ws: WorkingSetId, index: u64) -> Option<&PageCommit> {
-        self.latest_pending(ws, |entry| {
-            entry
-                .pages
-                .iter()
-                .rev()
-                .find_map(|(candidate, commit)| (*candidate == index).then_some(commit))
-        })
-    }
-
-    fn latest_pending<'a, T>(
-        &'a self,
-        ws: WorkingSetId,
-        mut find: impl FnMut(&'a PendingOverlay) -> Option<T>,
-    ) -> Option<T> {
-        self.pending
-            .get(&ws)
-            .and_then(|entries| entries.iter().rev().find_map(&mut find))
-    }
-
-    fn retire_pending_overlay(&mut self, ws: WorkingSetId, seq: u64) {
-        let Some(entries) = self.pending.get_mut(&ws) else {
-            return;
-        };
-        if entries.front().is_some_and(|entry| entry.seq == seq) {
-            entries.pop_front();
-        } else if let Some(position) = entries.iter().position(|entry| entry.seq == seq) {
-            debug_assert_eq!(
-                position, 0,
-                "KV overlays must finalize in pipeline FIFO order"
-            );
-            entries.remove(position);
-        }
-        if entries.is_empty() {
-            self.pending.remove(&ws);
-            if let Some(release) = self.deferred_releases.remove(&ws) {
-                let epoch = self.current_epoch();
-                match release.cache_roots_max {
-                    Some(max_roots) => self.release_working_set_cached(ws, epoch, max_roots),
-                    None => self.release_working_set_now(ws, epoch),
-                }
-            }
-        }
-    }
-
     fn invalidate_flat(&mut self, ws: WorkingSetId) {
+        {
+            let entry = self.flat.entry(ws).or_default();
+            entry.version += 1;
+            entry.cache = None;
+        }
+        self.refresh_flat(ws);
+    }
+
+    fn refresh_flat(&mut self, ws: WorkingSetId) {
+        let flattened = self.table.flatten(ws);
         let entry = self.flat.entry(ws).or_default();
-        entry.version += 1;
-        entry.cache = None;
+        match flattened {
+            Ok(flat) => {
+                let pages: Arc<[u32]> = flat.iter().map(|page| page.0).collect();
+                entry.translation.publish(entry.version, Some(pages));
+                entry.cache = Some(flat);
+            }
+            Err(_) => {
+                entry.translation.publish(entry.version, None);
+                entry.cache = None;
+            }
+        }
+    }
+
+    pub fn translation(&mut self, ws: WorkingSetId) -> Result<Arc<KvTranslation>, KvStoreError> {
+        let _ = self.flat_table(ws)?;
+        Ok(Arc::clone(
+            &self
+                .flat
+                .get(&ws)
+                .expect("flat table population creates translation")
+                .translation,
+        ))
     }
 
     // ------------------------------------------------------------------
@@ -973,9 +1004,7 @@ impl KvStore {
     /// The PUBLISHED committed token extent of `ws`: full pages below the
     /// last mapped page plus the written prefix of the last page (every
     /// committed slot carries a token-slot hash — chained or opaque — so the
-    /// last `Some` bounds the written prefix). Excludes pending
-    /// (prepared-but-unfinalized) fires: a pass's own run-ahead cursor covers
-    /// those.
+    /// last `Some` bounds the written prefix).
     pub fn committed_token_len(
         &self,
         ws: WorkingSetId,
@@ -997,6 +1026,7 @@ impl KvStore {
     /// its live trie location. Entries whose location no longer carries that
     /// content (owner compaction moved locals, collection freed the node)
     /// are pruned and miss.
+    #[cfg(test)]
     pub fn lookup_cached_page(&mut self, key: &Hash256) -> Option<(NodeId, u64)> {
         let entry = *self.cas.get(key)?;
         let location = TriePageLocation {
@@ -1009,14 +1039,39 @@ impl KvStore {
         );
         if self.table.node_page_last_slot_hash(entry.node, entry.local) != Some(*key) {
             self.cas.remove(key);
+            if crate::scheduler::fire_timing_enabled() {
+                crate::scheduler::fire_timing_write(&serde_json::json!({
+                    "schema": 1,
+                    "source": "runtime",
+                    "event": "cas_prune",
+                    "node": format!("{:?}", entry.node),
+                    "local": entry.local,
+                }));
+            }
+
             return None;
         }
-        (resident && !self.table.page_location_pinned(location))
-            .then_some((entry.node, entry.local))
+        let pinned = self.table.page_location_pinned(location);
+        if crate::scheduler::fire_timing_enabled() && (!resident || pinned) {
+            crate::scheduler::fire_timing_write(&serde_json::json!({
+                "schema": 1,
+                "source": "runtime",
+                "event": "cas_blocked",
+                "resident": resident,
+                "pinned": pinned,
+            }));
+        }
+        (resident && !pinned).then_some((entry.node, entry.local))
+    }
+
+    #[cfg(not(test))]
+    pub fn lookup_cached_page(&mut self, _key: &Hash256) -> Option<(NodeId, u64)> {
+        None
     }
 
     /// Lazy CAS hygiene: when dead entries outnumber any plausible live set,
     /// sweep by revalidation (lookups already prune what they touch).
+    #[cfg(test)]
     fn prune_cas_if_bloated(&mut self) {
         let cap = (self.pool.capacity() as usize).saturating_mul(4).max(1024);
         if self.cas.len() > cap {
@@ -1042,22 +1097,30 @@ impl KvStore {
     }
 
     pub fn release_cache_root(&mut self, node: NodeId, epoch: u64) {
-        self.table.release_cache_root(node);
-        let freed = self.table.collect_backings();
+        let freed = self.table.release_cache_root(node);
         self.recycle_backings(freed, epoch);
     }
 
     /// Contention-ladder rung 1: drop every cache-root lease no live
-    /// WorkingSet or in-flight fire reaches (pure cache — no work lost) and
-    /// collect. Returns the number of pages recycled (allocatable once
-    /// `epoch` retires).
+    /// WorkingSet or in-flight fire reaches, then sweep all unreachable
+    /// backings. The sweep also recovers old CoW owners whose final snapshot
+    /// pin retired on an in-place commit, where steady-state collection is
+    /// intentionally deferred. Returns the number of pages recycled
+    /// (allocatable once `epoch` retires).
     pub fn drop_unused_cache_leases(&mut self, epoch: u64) -> usize {
-        if self.table.drop_unused_cache_leases() == 0 {
-            return 0;
+        let (dropped, freed) = self.table.drop_unused_cache_leases();
+        if dropped != 0 {
+            let table = &self.table;
+            self.indexes.retain(|_, entry| {
+                entry
+                    .snapshot
+                    .terminal
+                    .is_none_or(|node| table.is_cache_root(node))
+            });
+            let indexes = &self.indexes;
+            self.index_order
+                .retain(|key| indexes.contains_key(key.as_slice()));
         }
-        let table = &self.table;
-        self.retained.retain(|n| table.is_cache_root(*n));
-        let freed = self.table.collect_backings();
         let count = freed.len();
         self.recycle_backings(freed, epoch);
         count
@@ -1089,6 +1152,70 @@ impl KvStore {
         Ok(Some(pages))
     }
 
+    pub fn adopt_offloaded_prefix(
+        &mut self,
+        ws: WorkingSetId,
+        tokens: &[u32],
+        pages: Vec<PhysicalKvPageId>,
+        page_size: u32,
+    ) -> Result<u64, KvStoreError> {
+        if tokens.is_empty()
+            || page_size == 0
+            || !tokens.len().is_multiple_of(page_size as usize)
+            || pages.len() * page_size as usize != tokens.len()
+        {
+            self.pool.release_reserved(pages);
+            return Err(KvStoreError::BadWriteSet {
+                reason: "offloaded adoption requires a non-empty full-page token prefix",
+            });
+        }
+        let empty = match (self.mapped_len(ws), self.chain_state(ws)) {
+            (Ok(mapped), Ok(chain)) => mapped == 0 && chain.is_none(),
+            (Err(error), _) | (_, Err(error)) => {
+                self.pool.release_reserved(pages);
+                return Err(error);
+            }
+        };
+        if !empty {
+            self.pool.release_reserved(pages);
+            return Err(KvStoreError::BadWriteSet {
+                reason: "offloaded adoption requires an empty working set",
+            });
+        }
+
+        let page_count = pages.len() as u64;
+        if let Err(error) = self.reserve(ws, page_count) {
+            self.pool.release_reserved(pages);
+            return Err(error);
+        }
+        let indexes = (0..page_count).collect::<Vec<_>>();
+        let prepared = self.prepare_write_granted(ws, &indexes, pages)?;
+        let mut previous = None;
+        let mut commits = Vec::with_capacity(page_count as usize);
+        for (page_index, page_tokens) in tokens.chunks_exact(page_size as usize).enumerate() {
+            let mut token_hashes = Vec::with_capacity(page_size as usize);
+            for (offset, &token) in page_tokens.iter().enumerate() {
+                let position = page_index * page_size as usize + offset;
+                let hash = hash::chain_token_slot_hash(
+                    &self.domain,
+                    previous.as_ref(),
+                    token,
+                    position as u32,
+                );
+                previous = Some(hash);
+                token_hashes.push(Some(hash));
+            }
+            commits.push(PageCommit {
+                page_hash: Some(hash::page_hash(&token_hashes)),
+                token_hashes,
+            });
+        }
+        let (sequence, intents) = self.publish_prepared(prepared, &commits)?;
+        self.settle(intents, true);
+        self.retire_through(sequence);
+        Ok(page_count)
+    }
+
     /// Contention-ladder rung 2 victim sizing: pages reachable only from
     /// `ws`'s terminal (its private trie suffix) — what releasing this
     /// WorkingSet would actually free.
@@ -1108,15 +1235,6 @@ impl KvStore {
         &mut self,
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<KvSuspendPrepare, KvStoreError> {
-        if working_sets.iter().any(|ws| {
-            self.pending
-                .get(ws)
-                .is_some_and(|entries| !entries.is_empty())
-        }) {
-            return Ok(KvSuspendPrepare::Deferred(
-                SuspendDisposition::GraceDeferred,
-            ));
-        }
         let (pages, pinned) = self.table.private_resident_pages(working_sets)?;
         if pinned {
             return Ok(KvSuspendPrepare::Deferred(
@@ -1142,7 +1260,7 @@ impl KvStore {
                 return Err(error.into());
             }
         };
-        let pages = pages
+        let pages: Vec<SuspendPage> = pages
             .into_iter()
             .zip(host_slots)
             .map(|((location, gpu_id), host_slot)| SuspendPage {
@@ -1151,6 +1269,8 @@ impl KvStore {
                 host_slot,
             })
             .collect();
+        self.table
+            .pin_swap_locations(pages.iter().map(|page| page.location));
         Ok(KvSuspendPrepare::Prepared(KvSuspendTxn {
             working_sets: working_sets.clone(),
             pages,
@@ -1170,21 +1290,12 @@ impl KvStore {
         &self,
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<usize, KvStoreError> {
-        let mut pages: HashSet<_> = self
+        let pages: HashSet<_> = self
             .table
             .post_drain_private_resident_pages(working_sets)?
             .into_iter()
             .map(|(_, page)| page)
             .collect();
-        for ws in working_sets {
-            if let Some(entries) = self.pending.get(ws) {
-                pages.extend(
-                    entries
-                        .iter()
-                        .flat_map(|entry| entry.mappings.iter().map(|(_, page)| *page)),
-                );
-            }
-        }
         Ok(pages.len())
     }
 
@@ -1201,16 +1312,23 @@ impl KvStore {
             })
             .collect();
         if let Err(error) = self.table.replace_backings(&replacements) {
-            self.table.unpin_terminals(&txn.pinned);
+            let mut freed = self.table.unpin_terminals(&txn.pinned);
+            freed.extend(
+                self.table
+                    .unpin_swap_locations(txn.pages.iter().map(|page| page.location)),
+            );
             self.host_pool
                 .release_reserved(txn.pages.iter().map(|page| page.host_slot).collect());
-            let freed = self.table.collect_backings();
             let epoch = self.current_epoch();
             self.recycle_backings(freed, epoch);
             self.retire_idle();
             return Err(error.into());
         }
-        self.table.unpin_terminals(&txn.pinned);
+        let mut freed = self.table.unpin_terminals(&txn.pinned);
+        freed.extend(
+            self.table
+                .unpin_swap_locations(txn.pages.iter().map(|page| page.location)),
+        );
         for ws in txn.working_sets {
             self.invalidate_flat(ws);
         }
@@ -1219,15 +1337,19 @@ impl KvStore {
             txn.pages.into_iter().map(|page| page.gpu_id).collect(),
             self.current_epoch(),
         );
+        self.recycle_backings(freed, self.current_epoch());
         self.retire_idle();
         Ok(count)
     }
 
     pub fn abort_suspend(&mut self, txn: KvSuspendTxn) {
-        self.table.unpin_terminals(&txn.pinned);
+        let mut freed = self.table.unpin_terminals(&txn.pinned);
+        freed.extend(
+            self.table
+                .unpin_swap_locations(txn.pages.iter().map(|page| page.location)),
+        );
         self.host_pool
             .release_reserved(txn.pages.into_iter().map(|page| page.host_slot).collect());
-        let freed = self.table.collect_backings();
         let epoch = self.current_epoch();
         self.recycle_backings(freed, epoch);
         self.retire_idle();
@@ -1245,14 +1367,6 @@ impl KvStore {
         working_sets: &HashSet<WorkingSetId>,
         gpu_pages: Vec<PhysicalKvPageId>,
     ) -> Result<KvRestoreTxn, KvStoreError> {
-        if working_sets.iter().any(|ws| {
-            self.pending
-                .get(ws)
-                .is_some_and(|entries| !entries.is_empty())
-        }) {
-            self.pool.release_reserved(gpu_pages);
-            return Err(KvStoreError::Busy);
-        }
         let swapped = match self.table.swapped_pages(working_sets) {
             Ok(swapped) => swapped,
             Err(error) => {
@@ -1273,7 +1387,7 @@ impl KvStore {
                 return Err(error.into());
             }
         };
-        let pages = swapped
+        let pages: Vec<RestorePage> = swapped
             .into_iter()
             .zip(gpu_pages)
             .map(|((location, host_slot), gpu_id)| RestorePage {
@@ -1282,6 +1396,8 @@ impl KvStore {
                 gpu_id,
             })
             .collect();
+        self.table
+            .pin_swap_locations(pages.iter().map(|page| page.location));
         Ok(KvRestoreTxn {
             working_sets: working_sets.clone(),
             pages,
@@ -1302,30 +1418,42 @@ impl KvStore {
             })
             .collect();
         if let Err(error) = self.table.replace_backings(&replacements) {
-            self.table.unpin_terminals(&txn.pinned);
+            let mut freed = self.table.unpin_terminals(&txn.pinned);
+            freed.extend(
+                self.table
+                    .unpin_swap_locations(txn.pages.iter().map(|page| page.location)),
+            );
             self.pool
                 .release_reserved(txn.pages.iter().map(|page| page.gpu_id).collect());
-            let freed = self.table.collect_backings();
             let epoch = self.current_epoch();
             self.recycle_backings(freed, epoch);
             self.retire_idle();
             return Err(error.into());
         }
-        self.table.unpin_terminals(&txn.pinned);
+        let mut freed = self.table.unpin_terminals(&txn.pinned);
+        freed.extend(
+            self.table
+                .unpin_swap_locations(txn.pages.iter().map(|page| page.location)),
+        );
         for ws in txn.working_sets {
             self.invalidate_flat(ws);
         }
         let count = txn.pages.len();
         self.host_pool
             .release_reserved(txn.pages.into_iter().map(|page| page.host_slot).collect());
+        self.recycle_backings(freed, self.current_epoch());
+        self.retire_idle();
         Ok(count)
     }
 
     pub fn abort_restore(&mut self, txn: KvRestoreTxn) {
-        self.table.unpin_terminals(&txn.pinned);
+        let mut freed = self.table.unpin_terminals(&txn.pinned);
+        freed.extend(
+            self.table
+                .unpin_swap_locations(txn.pages.iter().map(|page| page.location)),
+        );
         self.pool
             .release_reserved(txn.pages.into_iter().map(|page| page.gpu_id).collect());
-        let freed = self.table.collect_backings();
         let epoch = self.current_epoch();
         self.recycle_backings(freed, epoch);
         self.retire_idle();

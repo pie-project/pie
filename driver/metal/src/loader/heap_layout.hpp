@@ -142,9 +142,18 @@ inline HeapPlan plan_heap(const DecodeGeometry& g,
         const size_t slot_of_token    = align_slot(size_t(g.max_tokens) * 4);
         const size_t w_page           = align_slot(size_t(g.max_tokens) * 4);
         const size_t w_off            = align_slot(size_t(g.max_tokens) * 4);
+        const size_t mask_stride =
+            size_t(g.total_pages) * size_t(g.kv_page_size);
+        const size_t attn_mask =
+            align_slot(size_t(g.max_tokens) * mask_stride);
+        const size_t attn_mask_stride = align_slot(4);
+        const size_t attn_mask_enabled =
+            align_slot(size_t(g.max_tokens));
         p.mb_io_bytes = align_region(qo_indptr + kv_page_indptr + kv_page_indices +
                                     kv_last_page_len + rs_slot_ids + rs_slot_flags +
-                                    req_of_token + slot_of_token + w_page + w_off);
+                                    req_of_token + slot_of_token + w_page + w_off +
+                                    attn_mask + attn_mask_stride +
+                                    attn_mask_enabled);
     }
 
     // ── KvPagePool (Phase 1b/3; additive — zero bytes unless explicitly

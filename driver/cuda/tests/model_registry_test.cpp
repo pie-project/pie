@@ -60,6 +60,7 @@ int main() {
     //    "mistral" (bare) share one binder; mistral3/ministral3, phi3, and
     //    olmo2/olmo3 each get their own distinct binder within the family.
     expect_entry("qwen3", Family::LlamaLike, "llama_like");
+#ifndef PIE_CUDA_QWEN_ONLY
     expect_entry("qwen2", Family::LlamaLike, "llama_like");
     expect_entry("llama", Family::LlamaLike, "llama_like");
     expect_entry("llama3", Family::LlamaLike, "llama_like");
@@ -91,6 +92,7 @@ int main() {
     expect_entry("deepseek_v3", Family::Kimi, "kimi");
     expect_entry("kimi_k2", Family::Kimi, "kimi");
     expect_entry("glm_moe_dsa", Family::Glm5, "glm5");
+#endif
 
     // ── Qwen3.5 hybrid dense/MoE (aliases share one binder per variant).
     expect_entry("qwen3_5", Family::Qwen3_5, "qwen3_5");
@@ -99,17 +101,25 @@ int main() {
     expect_entry("qwen3_5_moe_text", Family::Qwen3_5Moe, "qwen3_5_moe");
     expect_entry("qwen3_moe", Family::Qwen3_5Moe, "qwen3_5_moe");
 
+#ifndef PIE_CUDA_QWEN_ONLY
     // ── Multimodal / audio-output families.
     expect_entry("qwen3_vl", Family::Qwen3VL, "qwen3_vl_text");
     expect_entry("qwen3_vl_text", Family::Qwen3VL, "qwen3_vl_text");
     expect_entry("csm", Family::Csm, "csm");
+#endif
 
     // ── Table shape: exactly the allowlisted set, one row per string, no
     //    duplicates.
     const auto& table = arch_table();
-    expect(table.size() == 33,
-           "arch table must have exactly 33 rows (one per supported "
-           "model_type string), got " + std::to_string(table.size()));
+    const std::size_t expected_rows =
+#ifdef PIE_CUDA_QWEN_ONLY
+        6;
+#else
+        33;
+#endif
+    expect(table.size() == expected_rows,
+           "arch table has the wrong number of supported model_type strings, got " +
+               std::to_string(table.size()));
     for (std::size_t i = 0; i < table.size(); ++i) {
         for (std::size_t j = i + 1; j < table.size(); ++j) {
             expect(table[i].model_type != table[j].model_type,

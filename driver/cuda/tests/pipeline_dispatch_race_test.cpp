@@ -177,7 +177,8 @@ int main() {
     g_stage = "bind_instance";
     PieInstanceBinding binding{};
     if (!expect(dispatch.bind_instance(
-                    /*instance_id=*/77, hash, /*pacing_wait_id=*/1234,
+                    /*instance_id=*/77, hash, PIE_GEOMETRY_CLASS_HOST,
+                    /*pacing_wait_id=*/1234,
                     channel_ids, {seed}, &binding, &err) == PIE_STATUS_OK,
                 err.c_str())) return 1;
 
@@ -281,6 +282,31 @@ int main() {
 
     std::uint64_t churn_channel_id = 50000;
     std::uint64_t churn_instance_id = 200;
+
+    // Ballast: fill the registry to just under its current slot capacity
+    // (observed through stats, so this never silently decays if the
+    // initial capacity moves) so the live churn inside the loop crosses it
+    // while fires are in flight, forcing grow() to reallocate the shared
+    // head/tail/full arrays under load (RV-27). These stay registered
+    // until after the final drain.
+    g_stage = "ballast_register";
+    const std::uint64_t initial_slot_capacity =
+        dispatch.stats().channel_slot_capacity;
+    if (!expect(initial_slot_capacity > 0, "registry reports capacity")) {
+        return 1;
+    }
+    std::vector<std::uint64_t> live_churn_ids;
+    while (live_churn_ids.size() + channel_ids.size() + 4 <
+           initial_slot_capacity) {
+        std::vector<PieChannelEndpointBinding> ballast_endpoints;
+        const auto ballast_ids = register_channels(
+            dispatch, container, churn_channel_id, ballast_endpoints, err);
+        if (!expect(!ballast_ids.empty(), err.c_str())) return 1;
+        churn_channel_id += ballast_ids.size();
+        live_churn_ids.insert(
+            live_churn_ids.end(), ballast_ids.begin(), ballast_ids.end());
+    }
+
     std::uint64_t next_sequence = 1;
     int fired = 0;
     for (int i = 0; i < kIterations; ++i) {
@@ -321,6 +347,39 @@ int main() {
                         "run accepted")) return 1;
         }
 
+        // Scheduler-thread churn concurrent with the genuinely in-flight
+        // fires above (no sync yet): registry growth under load. Churn
+        // channels stay LIVE across iterations, so the table crosses the
+        // initial 1024-slot capacity mid-loop and grow() reallocates the
+        // shared head/tail/full arrays while kernels advance them through
+        // pointers baked at launch (RV-27) — the committed-per-pair check
+        // below is what catches a lost update, and ASAN/TSAN builds catch
+        // the use-after-free.
+        g_stage = "churn_register";
+        std::vector<PieChannelEndpointBinding> churn_endpoints;
+        const auto churn_ids = register_channels(
+            dispatch, container, churn_channel_id, churn_endpoints, err);
+        if (!expect(!churn_ids.empty(), err.c_str())) return 1;
+        churn_channel_id += churn_ids.size();
+        for (const std::uint64_t id : churn_ids) {
+            live_churn_ids.push_back(id);
+        }
+
+        // … and bind/close of an unrelated instance, also under load.
+        g_stage = "churn_bind";
+        PieInstanceBinding churn_binding{};
+        const PieChannelValueDesc churn_seed{
+            .channel_id = churn_ids[0],
+            .bytes = {.ptr = seed_bytes, .len = sizeof(seed_bytes)},
+        };
+        if (!expect(dispatch.bind_instance(
+                        churn_instance_id++, hash, PIE_GEOMETRY_CLASS_HOST,
+                        /*pacing_wait_id=*/4321,
+                        churn_ids, {churn_seed}, &churn_binding,
+                        &err) == PIE_STATUS_OK,
+                    err.c_str())) return 1;
+        dispatch.close_instance(churn_binding.instance_id);
+
         cudaDeviceSynchronize();
         int committed = 0;
         for (int burst = 0; burst < kFiresPerIteration; ++burst) {
@@ -336,37 +395,14 @@ int main() {
         const std::uint32_t token[1] = {1};
         ring_put(endpoints[0], token, sizeof(token));
         next_sequence += static_cast<std::uint64_t>(committed);
-
-        // Scheduler-thread churn concurrent with the in-flight callbacks:
-        // registry growth (vector reallocation) …
-        g_stage = "churn_register";
-        std::vector<PieChannelEndpointBinding> churn_endpoints;
-        const auto churn_ids = register_channels(
-            dispatch, container, churn_channel_id, churn_endpoints, err);
-        if (!expect(!churn_ids.empty(), err.c_str())) return 1;
-        churn_channel_id += churn_ids.size();
-
-        // … and bind/close of an unrelated instance.
-        g_stage = "churn_bind";
-        PieInstanceBinding churn_binding{};
-        const PieChannelValueDesc churn_seed{
-            .channel_id = churn_ids[0],
-            .bytes = {.ptr = seed_bytes, .len = sizeof(seed_bytes)},
-        };
-        if (!expect(dispatch.bind_instance(
-                        churn_instance_id++, hash, /*pacing_wait_id=*/4321,
-                        churn_ids, {churn_seed}, &churn_binding,
-                        &err) == PIE_STATUS_OK,
-                    err.c_str())) return 1;
-        dispatch.close_instance(churn_binding.instance_id);
-        for (const std::uint64_t id : churn_ids) {
-            if (!expect(dispatch.close_channel(id, &err) == PIE_STATUS_OK,
-                        err.c_str())) return 1;
-        }
     }
 
     g_stage = "drain";
     cudaDeviceSynchronize();
+    // The coverage this stress claims: the churn actually forced at least
+    // one registry growth while fires were in flight.
+    if (!expect(dispatch.stats().channel_slot_capacity > initial_slot_capacity,
+                "registry grew under in-flight load")) return 1;
     if (!expect(g_notifies.load(std::memory_order_relaxed) >=
                     static_cast<std::uint64_t>(fired),
                 "every accepted fire notified")) return 1;
@@ -380,6 +416,11 @@ int main() {
     }
 
     dispatch.close_instance(binding.instance_id);
+    g_stage = "close_live_churn";
+    for (const std::uint64_t id : live_churn_ids) {
+        if (!expect(dispatch.close_channel(id, &err) == PIE_STATUS_OK,
+                    err.c_str())) return 1;
+    }
     for (const std::uint64_t id : channel_ids) {
         if (!expect(dispatch.close_channel(id, &err) == PIE_STATUS_OK,
                     err.c_str())) return 1;

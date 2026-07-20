@@ -90,8 +90,12 @@ enum class IoSlot : uint8_t {
     // the read CSR: a fork may write a new physical page while retaining a shared prefix.
     WPage          = 13, // u32[N] — physical destination page for every appended token
     WOff           = 14, // u32[N] — in-page destination offset for every appended token
+    AttnMask       = 15, // u8[N,mask_stride] dense allow mask
+    AttnMaskStride = 16, // u32[1] dense mask row stride
+    AttnMaskEnabled= 17, // u8[N] 1 iff row consumes AttnMask
 };
-inline constexpr int kIoSlotCount = static_cast<int>(IoSlot::WOff) + 1;
+inline constexpr int kIoSlotCount =
+    static_cast<int>(IoSlot::AttnMaskEnabled) + 1;
 
 // ── Per-kernel binding indices (arg order the encoder binds into MTL4ArgumentTable) ──
 // Grounded in MLX's host-side dispatch arg order, adjusted for I1 (scalars→buffers).
@@ -133,6 +137,7 @@ enum class SdpaPaged : uint8_t {
     KvPageIndices = 7,   // IoSlot::KvPageIndices
     KvPageIndptr = 8,    // IoSlot::KvPageIndptr
     PageSize = 9, NKvHeads = 10, Scale = 11,
+    AttnMask = 12, AttnMaskStride = 13, AttnMaskEnabled = 14,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed

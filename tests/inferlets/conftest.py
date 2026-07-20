@@ -31,8 +31,7 @@ from pie_client import Event
 # Paths
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-INFERLETS_DIR = ROOT / "inferlets"
+INFERLETS_DIR = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +120,7 @@ async def run_inferlet(
     if extra_args is None:
         extra_args = []
     wasm_name = name.replace("-", "_")
-    # Rust workspace artifacts live under inferlets/target. Keep the member
+    # Rust workspace artifacts live under this directory's target/. Keep the member
     # paths as fallbacks for inferlets built outside the curated workspace.
     # JS (bakery build) / Python (componentize-py): flat target/<name>.wasm
     inferlet_dir = INFERLETS_DIR / name

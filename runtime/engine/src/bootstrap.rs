@@ -53,6 +53,7 @@ impl RuntimeShutdown {
         for driver_id in self.driver_ids {
             let _ = driver::backend::unregister_driver(driver_id);
         }
+        crate::store::registry::dump_kv_lock_trace()?;
         scheduler_result
     }
 }
@@ -146,6 +147,10 @@ pub struct DriverConfig {
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
+    pub has_mtp_logits: bool,
+    pub has_mtp_drafts: bool,
+    pub has_value_head: bool,
+    pub device_geometry_port_mask: u32,
     pub limits: crate::driver::SchedulerLimits,
     pub driver_backend: crate::driver::DriverBackend,
 }
@@ -169,6 +174,7 @@ pub struct TelemetryConfig {
 
 pub struct BootstrapHandle {
     pub port: u16,
+    pub model_idx: usize,
     shutdown: Option<RuntimeShutdown>,
 }
 
@@ -258,11 +264,20 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             fold_granularity: 1, // token-causal; 0-RS models never read it
         }
     };
+    let ptir_caps = model::PtirCaps {
+        has_mtp_logits: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_mtp_logits),
+        has_mtp_drafts: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_mtp_drafts),
+        has_value_head: !driver_configs.is_empty()
+            && driver_configs.iter().all(|d| d.has_value_head),
+    };
     model::register(
         name.clone(),
         &arch_name,
         kv_page_size as u32,
         rs_caps,
+        ptir_caps,
         tokenizer_path.clone(),
     )?;
 
@@ -277,6 +292,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 driver::DriverSpec {
                     num_kv_pages: d.total_pages,
                     limits: d.limits,
+                    device_geometry_port_mask: d.device_geometry_port_mask,
                 },
                 d.driver_backend,
             )
@@ -340,27 +356,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     //    `WaitAllPolicy` only via this installed subscription (the natural
     //    terminate path calls `scheduler::worker::notify_pipeline_leave`
     //    directly from `inferlet::process`, which needs no such hook).
-    //  - the demoted-pipeline reaper needs the process facade (L4), which
-    //    `scheduler` (L2) may not import directly.
     crate::store::reclaim::set_pipeline_leave_hook(|pid| {
         crate::scheduler::worker::notify_pipeline_leave(
             pid,
             crate::scheduler::worker::LeaveKind::Suspend,
         );
     });
-    crate::scheduler::install_terminate_hook(|pid| {
-        crate::inferlet::process::terminate(
-            pid,
-            Err(
-                "scheduler: demoted after missing too many consecutive wait-all wave deadlines"
-                    .to_string(),
-            ),
-        );
-    });
-
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,
+        model_idx: arena_model_idx,
         shutdown: Some(RuntimeShutdown {
             scheduler: scheduler_shutdown,
             driver_ids: drivers,

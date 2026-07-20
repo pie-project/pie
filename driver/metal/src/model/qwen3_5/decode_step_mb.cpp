@@ -1,5 +1,6 @@
 #include "decode_step_mb.hpp"
 
+#include <limits>
 #include <stdexcept>
 
 #include "decode_dispatch.hpp"
@@ -125,6 +126,30 @@ inline void bind_slot(RawMetalContext& ctx, int ord, uint8_t idx, const SlotHand
 
 }  // namespace
 
+std::size_t paged_attention_mask_pitch_bytes(
+    const DecodeGeometry& geometry) {
+    if (geometry.total_pages <= 0 ||
+        geometry.kv_page_size <= 0 ||
+        static_cast<std::size_t>(geometry.total_pages) >
+            std::numeric_limits<std::size_t>::max() /
+                static_cast<std::size_t>(
+                    geometry.kv_page_size)) {
+        return 0;
+    }
+    return static_cast<std::size_t>(geometry.total_pages) *
+           static_cast<std::size_t>(geometry.kv_page_size);
+}
+
+bool paged_pool_size_supported(
+    const DecodeGeometry& geometry,
+    std::uint32_t pages) {
+    return pages != 0 &&
+           geometry.total_pages > 0 &&
+           pages <=
+               static_cast<std::uint32_t>(
+                   geometry.total_pages);
+}
+
 std::vector<Dispatch> build_decode_dag_mb(const DecodeGeometry& g, int n_tokens,
                                           int ordinal_base, bool fuse_residual, bool gdn_prep) {
     if (n_tokens <= 0) throw std::runtime_error("multi-batch DAG requires at least one token");
@@ -225,6 +250,21 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
                           io(IoSlot::KvPageIndices));
                 bind_slot(ctx, ord, uint8_t(bind::SdpaPaged::KvPageIndptr),
                           io(IoSlot::KvPageIndptr));
+                ctx.arg_bind_ordinal(
+                    ord,
+                    uint8_t(bind::SdpaPaged::AttnMask),
+                    io(IoSlot::AttnMask),
+                    offsets.token_row *
+                        paged_attention_mask_pitch_bytes(g));
+                bind_slot(
+                    ctx, ord,
+                    uint8_t(bind::SdpaPaged::AttnMaskStride),
+                    io(IoSlot::AttnMaskStride));
+                ctx.arg_bind_ordinal(
+                    ord,
+                    uint8_t(bind::SdpaPaged::AttnMaskEnabled),
+                    io(IoSlot::AttnMaskEnabled),
+                    offsets.token_row);
                 break;
             case Kernel::Rope:
             case Kernel::RopeK:

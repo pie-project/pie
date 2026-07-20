@@ -26,14 +26,8 @@ use std::sync::{Arc, Mutex};
 use super::page_table::WorkingSetId;
 use crate::driver::DriverId;
 
-/// Auto-retained prefix-cache root cap (`PIE_KV_CACHE_ROOTS_MAX`, default
-/// 256; `0` disables retention on release). The contention ladder's rung 1
-/// reclaims retained roots the moment memory is needed, so the cap bounds
-/// metadata, not pressure behavior. Read once (env lookup cached process-
-/// wide) and baked into each [`KvWorkingSet`]'s lifecycle at construction, so
-/// the release fallback — which may run long after construction, from
-/// process teardown — never needs to consult the environment itself.
-pub fn cache_roots_max() -> usize {
+/// Explicit index-entry cap (`PIE_KV_CACHE_ROOTS_MAX`, default 256).
+pub fn index_roots_max() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
         std::env::var("PIE_KV_CACHE_ROOTS_MAX")
@@ -43,12 +37,7 @@ pub fn cache_roots_max() -> usize {
     })
 }
 
-/// Idempotent release fallback shared by every clone of one [`KvWorkingSet`]
-/// value. Performs the exact `release_working_set_cached` /
-/// `current_epoch` / `retire_idle` + contention `on_blocks_freed` sequence
-/// the explicit WIT `drop` used to inline; now shared so a bypassed WIT drop
-/// (direct `ResourceTable`/`ProcessCtx` teardown) still runs it exactly
-/// once, via this type's own `Drop`.
+/// Idempotent release fallback shared by every clone of one [`KvWorkingSet`].
 #[derive(Debug)]
 struct KvLifecycle {
     released: AtomicBool,
@@ -57,15 +46,7 @@ struct KvLifecycle {
     model: usize,
     driver: DriverId,
     id: WorkingSetId,
-    cache_roots_max: usize,
-    pipeline_scope: Mutex<Option<u128>>,
-    submitted_cursor: Mutex<SubmittedCursor>,
-}
-
-#[derive(Debug, Default)]
-struct SubmittedCursor {
-    next_token: u64,
-    generation: u64,
+    pipeline_scope: Mutex<Option<crate::store::PipelineScope>>,
 }
 
 impl KvLifecycle {
@@ -82,14 +63,11 @@ impl KvLifecycle {
             return;
         }
         let stores = crate::store::registry::get(self.model, self.driver as usize);
-        {
-            // Retain canonical paths as prefix-cache roots (bounded FIFO;
-            // reclaimed by the contention ladder's rung 1 under pressure).
-            let mut kv = stores.kv.lock().unwrap();
+        crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             let epoch = kv.current_epoch();
-            kv.release_working_set_cached(self.id, epoch, self.cache_roots_max);
+            kv.release_working_set(self.id, epoch);
             kv.retire_idle();
-        } // store lock released before the contention drain re-locks pools.
+        }); // store lock released before the contention drain re-locks pools.
         // Freed pool space may unblock a preempted inferlet.
         if let Some(orchestrator) = crate::store::reclaim::contention() {
             orchestrator.on_blocks_freed();
@@ -130,43 +108,6 @@ impl Drop for KvFireLease {
     }
 }
 
-/// Submit-order token extent reserved on one working set.
-///
-/// Mapping allocation remains dispatch-time work, but every later submit must
-/// immediately see this extent. A reservation rolls back only while it is
-/// still the newest reservation; once a successor exists, failure poisons the
-/// owning pipeline and the cursor must not rewind underneath that successor.
-pub struct KvTokenExtentReservation {
-    lifecycle: Arc<KvLifecycle>,
-    start_token: u64,
-    end_token: u64,
-    previous_next_token: u64,
-    generation: u64,
-    committed: bool,
-}
-
-impl KvTokenExtentReservation {
-    pub fn start_token(&self) -> u64 {
-        self.start_token
-    }
-
-    pub fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for KvTokenExtentReservation {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        let mut cursor = self.lifecycle.submitted_cursor.lock().unwrap();
-        if cursor.generation == self.generation && cursor.next_token == self.end_token {
-            cursor.next_token = self.previous_next_token;
-        }
-    }
-}
-
 impl Drop for KvLifecycle {
     /// The process-teardown fallback: runs only when the LAST `Arc` clone of
     /// a [`KvWorkingSet`]'s lifecycle drops. No-ops if [`KvWorkingSet::release`]
@@ -188,22 +129,37 @@ pub struct KvWorkingSet {
     pub id: WorkingSetId,
     /// Tokens per KV page (cached from the store registry at construction).
     pub page_size: u32,
+    translation: Arc<crate::store::kv::KvTranslation>,
     lifecycle: Arc<KvLifecycle>,
 }
 
 impl KvWorkingSet {
     /// A fresh handle for a NEWLY minted working-set `id` (a `create`,
     /// `fork`, or `slice` result — never an ALREADY-live id, which would
-    /// wrongly share this fresh lifecycle with another handle's). Bakes in
-    /// `cache_roots_max` now (see [`cache_roots_max`]) so the release
-    /// fallback need not read the environment at drop time.
+    /// wrongly share this fresh lifecycle with another handle's).
     pub fn new(model: usize, driver: DriverId, id: WorkingSetId, page_size: u32) -> Self {
-        let cache_roots_max = cache_roots_max();
+        Self::new_with_scope(model, driver, id, page_size, None)
+    }
+
+    fn new_with_scope(
+        model: usize,
+        driver: DriverId,
+        id: WorkingSetId,
+        page_size: u32,
+        pipeline_scope: Option<crate::store::PipelineScope>,
+    ) -> Self {
+        let stores = crate::store::registry::get(model, driver as usize);
+        let translation =
+            crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                kv.translation(id)
+                    .expect("new working set has a translation state")
+            });
         KvWorkingSet {
             model,
             driver,
             id,
             page_size,
+            translation,
             lifecycle: Arc::new(KvLifecycle {
                 released: AtomicBool::new(false),
                 release_requested: AtomicBool::new(false),
@@ -211,20 +167,27 @@ impl KvWorkingSet {
                 model,
                 driver,
                 id,
-                cache_roots_max,
-                pipeline_scope: Mutex::new(None),
-                submitted_cursor: Mutex::new(SubmittedCursor::default()),
+                pipeline_scope: Mutex::new(pipeline_scope),
             }),
         }
     }
 
-    pub fn claim_pipeline_scope(&self, scope: u128) -> Result<(), u128> {
+    pub fn forked(&self, id: WorkingSetId) -> Self {
+        let scope = self.lifecycle.pipeline_scope.lock().unwrap().clone();
+        Self::new_with_scope(self.model, self.driver, id, self.page_size, scope)
+    }
+
+    pub fn claim_pipeline_scope(
+        &self,
+        scope: &crate::store::PipelineScope,
+    ) -> Result<(), crate::store::PipelineScopeId> {
         let mut owner = self.lifecycle.pipeline_scope.lock().unwrap();
-        match *owner {
-            Some(existing) if existing != scope => Err(existing),
-            Some(_) => Ok(()),
+        match owner.as_ref() {
+            Some(existing) if existing.id() == scope.id() => Ok(()),
+            Some(existing) => Err(existing.id()),
+            None if scope.is_closed() => Err(scope.id()),
             None => {
-                *owner = Some(scope);
+                *owner = Some(scope.clone());
                 Ok(())
             }
         }
@@ -234,38 +197,18 @@ impl KvWorkingSet {
         KvLifecycle::acquire_fire_lease(&self.lifecycle)
     }
 
-    pub fn reserve_token_extent(
-        &self,
-        pass_cursor: u64,
-        committed_floor: u64,
-        token_count: u64,
-    ) -> Result<KvTokenExtentReservation, &'static str> {
-        if token_count == 0 {
-            return Err("token extent must be non-empty");
-        }
-        if self.lifecycle.release_requested.load(Ordering::Acquire) {
-            return Err("working set release already requested");
-        }
-        let mut cursor = self.lifecycle.submitted_cursor.lock().unwrap();
-        let previous_next_token = cursor.next_token;
-        let start_token = pass_cursor.max(committed_floor).max(cursor.next_token);
-        let end_token = start_token
-            .checked_add(token_count)
-            .ok_or("working set token extent overflow")?;
-        cursor.generation = cursor.generation.wrapping_add(1);
-        cursor.next_token = end_token;
-        Ok(KvTokenExtentReservation {
-            lifecycle: Arc::clone(&self.lifecycle),
-            start_token,
-            end_token,
-            previous_next_token,
-            generation: cursor.generation,
-            committed: false,
-        })
+    /// Whether no submitted fire still holds this WorkingSet's mapping.
+    pub fn is_settled(&self) -> bool {
+        self.lifecycle.active_fire_leases.load(Ordering::Acquire) == 0
+            && !self.lifecycle.release_requested.load(Ordering::Acquire)
     }
 
-    /// Explicit release (the WIT `drop` path): runs
-    /// `release_working_set_cached` + contention drain NOW and marks it
+    pub fn translation(&self) -> Result<(u64, Arc<[u32]>), &'static str> {
+        self.translation.snapshot()
+    }
+
+    /// Explicit release (the WIT `drop` path): releases resource ownership,
+    /// drains contention, and marks it
     /// done, so this handle's (and any other outstanding clone's, e.g. the
     /// `ResourceTable`'s own) eventual `Arc` drop is a no-op.
     pub fn release(&self) {
@@ -303,7 +246,7 @@ mod tests {
     /// `store::kv::tests::commit_fresh`): the exact shape a solo forward
     /// lane uses to actually consume physical pool capacity (plain
     /// `reserve` alone is logical-only and never touches the pool).
-    fn commit_fresh_pages(model: usize, id: WorkingSetId, n: u64, epoch: u64) {
+    fn commit_fresh_pages(model: usize, id: WorkingSetId, n: u64, _epoch: u64) {
         let stores = registry::get(model, 0);
         let mut kv = stores.kv.lock().unwrap();
         let start = kv.page_len(id).unwrap();
@@ -316,7 +259,9 @@ mod tests {
                 page_hash: None,
             })
             .collect();
-        kv.commit(prepared, &commits, epoch).unwrap();
+        let (seq, intents) = kv.publish_prepared(prepared, &commits).unwrap();
+        kv.settle(intents, true);
+        kv.retire_through(seq);
     }
 
     #[test]
@@ -433,45 +378,22 @@ mod tests {
     }
 
     #[test]
-    fn submitted_token_extents_are_visible_across_clones_before_prepare() {
+    fn pipeline_scope_is_permanent_and_inherited_by_forks() {
         let model = fresh_model(4);
         let stores = registry::get(model, 0);
-        let id = stores.kv.lock().unwrap().create_working_set();
-        let ws = KvWorkingSet::new(model, 0, id, 16);
-        let other_pass = ws.clone();
+        let parent_id = stores.kv.lock().unwrap().create_working_set();
+        let child_id = stores.kv.lock().unwrap().fork(parent_id).unwrap();
+        let parent = KvWorkingSet::new(model, 0, parent_id, 16);
+        let first = crate::store::PipelineScope::new(|| true);
+        let second = crate::store::PipelineScope::new(|| true);
 
-        let first = ws.reserve_token_extent(0, 0, 4).unwrap();
-        assert_eq!(first.start_token(), 0);
-        first.commit();
+        parent.claim_pipeline_scope(&first).unwrap();
+        first.close();
+        assert_eq!(parent.claim_pipeline_scope(&second), Err(first.id()));
 
-        let second = other_pass.reserve_token_extent(0, 0, 1).unwrap();
-        assert_eq!(
-            second.start_token(),
-            4,
-            "a later pass sees the earlier submit before mapping preparation"
-        );
-        second.commit();
-    }
-
-    #[test]
-    fn newest_uncommitted_token_extent_rolls_back_without_rewinding_successors() {
-        let model = fresh_model(4);
-        let stores = registry::get(model, 0);
-        let id = stores.kv.lock().unwrap().create_working_set();
-        let ws = KvWorkingSet::new(model, 0, id, 16);
-
-        drop(ws.reserve_token_extent(0, 0, 4).unwrap());
-        let replacement = ws.reserve_token_extent(0, 0, 2).unwrap();
-        assert_eq!(replacement.start_token(), 0);
-        replacement.commit();
-
-        let earlier = ws.reserve_token_extent(0, 0, 3).unwrap();
-        let later = ws.reserve_token_extent(0, 0, 1).unwrap();
-        drop(earlier);
-        assert_eq!(later.start_token(), 5);
-        later.commit();
-
-        let next = ws.reserve_token_extent(0, 0, 1).unwrap();
-        assert_eq!(next.start_token(), 6);
+        let child = parent.forked(child_id);
+        assert_eq!(child.claim_pipeline_scope(&second), Err(first.id()));
+        child.release();
+        parent.release();
     }
 }

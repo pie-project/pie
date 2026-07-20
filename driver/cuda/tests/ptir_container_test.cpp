@@ -123,7 +123,8 @@ int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : "tests/golden-ptir";
     std::printf("PTIR container reader conformance vs golden vectors (%s)\n", dir.c_str());
     const char* names[] = {
-        "greedy_argmax", "counter_pingpong", "section3_masked_gumbel", "beam_epilogue",
+        "greedy_argmax", "counter_pingpong", "section3_masked_gumbel",
+        "beam_epilogue", "staged_dispatch",
         "neg_spsc_second_producer", "neg_sink_at_epilogue", "neg_t10_nonreplayable",
         "neg_intrinsic_wrong_stage", "neg_model_gated_missing", "neg_body_type_error",
     };

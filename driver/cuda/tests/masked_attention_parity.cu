@@ -96,8 +96,11 @@ bool run_case(const Case& c, float tol) {
     for (int p = 0; p < pages; ++p) kv_page_indices_h[p] = static_cast<std::uint32_t>(p);
 
     // 1. Decode the BRLE through the real driver decoder; sanity-check vs intent.
+    const auto packed = pie_attn_ref::pack_brle_rows(
+        c.brle, c.mask_indptr, c.qo_len, c.kv_len);
     DecodedMasks dm = pie_cuda_driver::brle::decode(
-        c.brle, c.mask_indptr, qo_indptr_h, kv_page_indptr_h, kv_last_page_lens_h, PAGE);
+        packed.words, packed.indptr, qo_indptr_h, kv_page_indptr_h,
+        kv_last_page_lens_h, PAGE);
     auto decoded = unpack(dm, c.qo_len, c.kv_len);
     for (std::size_t i = 0; i < decoded.size(); ++i) {
         if ((decoded[i] != 0) != (c.want[i] != 0)) {
@@ -223,7 +226,10 @@ void beam_microbench() {
     // Full-KV BRLE per lane (attend all KVLEN): {0, KVLEN} per row.
     std::vector<std::uint32_t> brle(2 * B), mip(B + 1, 0);
     for (int r = 0; r < B; ++r) { brle[2*r] = 0; brle[2*r+1] = KVLEN; mip[r+1] = mip[r] + 2; }
-    DecodedMasks dm = pie_cuda_driver::brle::decode(brle, mip, qo_h, kvpp_h, klpl_h, PG);
+    const auto packed = pie_attn_ref::pack_brle_rows(
+        brle, mip, B, KVLEN);
+    DecodedMasks dm = pie_cuda_driver::brle::decode(
+        packed.words, packed.indptr, qo_h, kvpp_h, klpl_h, PG);
 
     std::mt19937_64 rng(7);
     std::uniform_real_distribution<float> u(-1.f, 1.f);

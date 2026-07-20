@@ -16,6 +16,7 @@
 #include "model/loaded_model.hpp"
 #include "model/workspace.hpp"        // universal model::workspace_bytes
 
+#ifndef PIE_CUDA_QWEN_ONLY
 #include "model/csm/csm.hpp"
 #include "model/csm/csm_model.hpp"
 #include "model/deepseek_v4/deepseek_v4.hpp"
@@ -32,16 +33,21 @@
 #include "model/kimi/kimi.hpp"
 #include "model/kimi/kimi_forward.hpp"
 #include "model/kimi/kimi_model.hpp"
+#endif
 #include "model/llama_like/llama_like.hpp"
 #include "model/llama_like/llama_like_model.hpp"
+#ifndef PIE_CUDA_QWEN_ONLY
 #include "model/llama_like/mistral3.hpp"
+#endif
 #include "model/llama_like/qwen3.hpp"
+#ifndef PIE_CUDA_QWEN_ONLY
 #include "model/mixtral/gpt_oss.hpp"
 #include "model/mixtral/mixtral.hpp"
 #include "model/mixtral/mixtral_model.hpp"
 #include "model/nemotron_h/nemotron_h.hpp"
 #include "model/nemotron_h/nemotron_h_forward.hpp"
 #include "model/nemotron_h/nemotron_h_model.hpp"
+#endif
 #include "model/qwen3_5/qwen3_5.hpp"
 #include "model/qwen3_5/qwen3_5_config.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
@@ -49,8 +55,10 @@
 #include "model/qwen3_5/qwen3_5_moe.hpp"
 #include "model/qwen3_5/qwen3_5_moe_forward.hpp"
 #include "model/qwen3_5/qwen3_5_moe_model.hpp"
+#ifndef PIE_CUDA_QWEN_ONLY
 #include "model/qwen3_vl/qwen3_vl.hpp"
 #include "model/qwen3_vl/qwen3_vl_model.hpp"
+#endif
 
 namespace pie_cuda_driver::model {
 
@@ -93,7 +101,6 @@ public:
     explicit LlamaLikePlan(Qwen3Weights w) : weights(std::move(w)) {
         info.family = Family::LlamaLike;
         info.num_layers = weights.layers.size();
-        info.lm_head_tp_sharded = (weights.lm_head_tp_shard != nullptr);
     }
     const PlanInfo& plan_info() const override { return info; }
 
@@ -101,6 +108,7 @@ public:
     PlanInfo info;
 };
 
+#ifndef PIE_CUDA_QWEN_ONLY
 class GemmaPlan final : public ModelPlan {
 public:
     explicit GemmaPlan(Gemma2Weights w) : weights(std::move(w)) {
@@ -180,6 +188,7 @@ public:
     MixtralWeights weights;
     PlanInfo info;
 };
+#endif
 
 class Qwen3_5Plan final : public ModelPlan {
 public:
@@ -237,6 +246,7 @@ public:
     PlanInfo info;
 };
 
+#ifndef PIE_CUDA_QWEN_ONLY
 class NemotronHPlan final : public ModelPlan {
 public:
     explicit NemotronHPlan(NemotronHWeights w) : weights(std::move(w)) {
@@ -266,7 +276,6 @@ public:
     explicit KimiPlan(KimiWeights w) : weights(std::move(w)) {
         info.family = Family::Kimi;
         info.num_layers = weights.layers.size();
-        info.lm_head_tp_sharded = weights.lm_head_tp_sharded;
     }
     const PlanInfo& plan_info() const override { return info; }
 
@@ -304,7 +313,6 @@ public:
         : weights(std::move(w)), vision(std::move(v)) {
         info.family = Family::Qwen3VL;
         info.num_layers = weights.layers.size();
-        info.lm_head_tp_sharded = (weights.lm_head_tp_shard != nullptr);
         if (vision.has_value()) {
             info.has_vision = true;
             const auto& vc = vision->config;
@@ -341,6 +349,7 @@ public:
     CsmWeights weights;
     PlanInfo info;
 };
+#endif
 
 // ── Config validation hooks ──────────────────────────────────────────────
 // Most rows only need the generic dimension sanity check; the parser
@@ -360,6 +369,7 @@ std::optional<std::string> default_validate_config(const HfConfig& cfg) {
     return std::nullopt;
 }
 
+#ifndef PIE_CUDA_QWEN_ONLY
 std::optional<std::string> validate_csm_config(const HfConfig& cfg) {
     if (auto err = default_validate_config(cfg)) return err;
     if (!cfg.csm.has_value()) {
@@ -369,6 +379,7 @@ std::optional<std::string> validate_csm_config(const HfConfig& cfg) {
     }
     return std::nullopt;
 }
+#endif
 
 // ── Binders: one per distinct C++ bind function, wrapped into the owning
 //    plan for its family. Kind-sharing archs point their own row at one
@@ -377,6 +388,7 @@ std::optional<std::string> validate_csm_config(const HfConfig& cfg) {
 std::unique_ptr<ModelPlan> bind_row_llama_like(LoadedModel& engine, bool verbose) {
     return std::make_unique<LlamaLikePlan>(bind_llama_like(engine, verbose));
 }
+#ifndef PIE_CUDA_QWEN_ONLY
 std::unique_ptr<ModelPlan> bind_row_mistral3(LoadedModel& engine, bool) {
     return std::make_unique<LlamaLikePlan>(bind_mistral3(engine));
 }
@@ -439,12 +451,14 @@ std::unique_ptr<ModelPlan> bind_row_kimi(LoadedModel& engine, bool) {
 std::unique_ptr<ModelPlan> bind_row_glm5(LoadedModel& engine, bool) {
     return std::make_unique<Glm5Plan>(bind_glm5(engine));
 }
+#endif
 std::unique_ptr<ModelPlan> bind_row_qwen3_5(LoadedModel& engine, bool) {
     return std::make_unique<Qwen3_5Plan>(bind_qwen3_5(engine));
 }
 std::unique_ptr<ModelPlan> bind_row_qwen3_5_moe(LoadedModel& engine, bool) {
     return std::make_unique<Qwen3_5MoePlan>(bind_qwen3_5_moe(engine));
 }
+#ifndef PIE_CUDA_QWEN_ONLY
 std::unique_ptr<ModelPlan> bind_row_qwen3_vl(LoadedModel& engine, bool verbose) {
     Qwen3Weights text = bind_qwen3_vl_text(engine);
     std::optional<Qwen3VLVisionWeights> vision;
@@ -461,6 +475,7 @@ std::unique_ptr<ModelPlan> bind_row_qwen3_vl(LoadedModel& engine, bool verbose) 
 std::unique_ptr<ModelPlan> bind_row_csm(LoadedModel& engine, bool verbose) {
     return std::make_unique<CsmPlan>(bind_csm(engine, verbose));
 }
+#endif
 
 // ── Model factories: one per family. Each is the sole place that
 //    downcasts `ModelPlan*` to its concrete type — always safe because
@@ -482,13 +497,12 @@ Concrete& plan_cast(ModelPlan& base, const char* family_label) {
 std::unique_ptr<IModel> create_llama_like_model(
     std::unique_ptr<ModelPlan> plan_base, ModelResources& res) {
     auto& plan = plan_cast<LlamaLikePlan>(*plan_base, "llama_like");
-    const bool supports_tp_greedy_argmax =
-        res.tp_size > 1 && plan.info.lm_head_tp_sharded;
     return std::make_unique<LlamaLikeModel>(
         std::move(plan.weights), *res.hf_config, *res.kv_cache,
-        *res.llama_fwd_cfg, supports_tp_greedy_argmax);
+        *res.llama_fwd_cfg);
 }
 
+#ifndef PIE_CUDA_QWEN_ONLY
 std::unique_ptr<IModel> create_gemma_model(
     std::unique_ptr<ModelPlan> plan_base, ModelResources& res) {
     auto& plan = plan_cast<GemmaPlan>(*plan_base, "gemma");
@@ -544,12 +558,9 @@ std::unique_ptr<IModel> create_deepseek_v4_model(
 std::unique_ptr<IModel> create_kimi_model(
     std::unique_ptr<ModelPlan> plan_base, ModelResources& res) {
     auto& plan = plan_cast<KimiPlan>(*plan_base, "kimi");
-    const bool supports_tp_greedy_argmax =
-        res.tp_size > 1 && plan.info.lm_head_tp_sharded;
     return std::make_unique<KimiModel>(
         std::move(plan.weights), *res.hf_config, *res.kimi_ws, *res.mla_cache,
-        res.tp_size, res.tp_comm, /*emit_logits=*/true,
-        supports_tp_greedy_argmax);
+        res.tp_size, res.tp_comm, /*emit_logits=*/true);
 }
 
 std::unique_ptr<IModel> create_glm5_model(
@@ -559,6 +570,7 @@ std::unique_ptr<IModel> create_glm5_model(
         std::move(plan.weights), *res.hf_config, *res.glm5_ws, *res.mla_cache,
         *res.dsa_cache, res.tp_size, res.tp_comm, /*emit_logits=*/true);
 }
+#endif
 
 std::unique_ptr<IModel> create_qwen3_5_model(
     std::unique_ptr<ModelPlan> plan_base, ModelResources& res) {
@@ -615,6 +627,7 @@ std::unique_ptr<IModel> create_qwen3_5_moe_model(
     return model;
 }
 
+#ifndef PIE_CUDA_QWEN_ONLY
 std::unique_ptr<IModel> create_qwen3_vl_model(
     std::unique_ptr<ModelPlan> plan_base, ModelResources& res) {
     auto& plan = plan_cast<Qwen3VLPlan>(*plan_base, "qwen3_vl");
@@ -628,12 +641,17 @@ std::unique_ptr<IModel> create_csm_model(
     auto& plan = plan_cast<CsmPlan>(*plan_base, "csm");
     return std::make_unique<CsmModel>(std::move(plan.weights));
 }
+#endif
 
 // ── The table itself ─────────────────────────────────────────────────────
 
 std::vector<ArchEntry> build_arch_table() {
     std::vector<ArchEntry> t;
+#ifdef PIE_CUDA_QWEN_ONLY
+    t.reserve(6);
+#else
     t.reserve(33);
+#endif
 
     auto push = [&t](const char* model_type, Family family, const char* binder_key,
                      std::function<std::optional<std::string>(const HfConfig&)> validate,
@@ -652,6 +670,10 @@ std::vector<ArchEntry> build_arch_table() {
     // ── LlamaLike: dense/GQA decoder. Four distinct binders share the
     //    family (plain, Mistral-3, Phi-3, OLMo-3); "qwen3"/"qwen2"/"llama"/
     //    "llama3"/"mistral" (bare) all use the same `bind_llama_like`.
+#ifdef PIE_CUDA_QWEN_ONLY
+    push("qwen3", Family::LlamaLike, "llama_like", default_validate_config,
+         bind_row_llama_like, create_llama_like_model);
+#else
     for (const char* mt : {"qwen3", "qwen2", "llama", "llama3", "mistral"}) {
         push(mt, Family::LlamaLike, "llama_like", default_validate_config,
              bind_row_llama_like, create_llama_like_model);
@@ -666,7 +688,9 @@ std::vector<ArchEntry> build_arch_table() {
         push(mt, Family::LlamaLike, "olmo3", default_validate_config,
              bind_row_olmo3, create_llama_like_model);
     }
+#endif
 
+#ifndef PIE_CUDA_QWEN_ONLY
     // ── Mixtral: sparse top-k MoE. gpt_oss shares the family/model class
     //    through its own binder (MXFP4 experts + attention sinks).
     push("mixtral", Family::Mixtral, "mixtral", default_validate_config,
@@ -713,6 +737,7 @@ std::vector<ArchEntry> build_arch_table() {
     // ── GLM-5.1 (MLA + DSA indexer + routed/shared MoE).
     push("glm_moe_dsa", Family::Glm5, "glm5", default_validate_config,
          bind_row_glm5, create_glm5_model);
+#endif
 
     // ── Qwen3.5 hybrid dense (linear-attn + full-attn + optional MTP).
     for (const char* mt : {"qwen3_5", "qwen3_5_text"}) {
@@ -726,6 +751,7 @@ std::vector<ArchEntry> build_arch_table() {
              bind_row_qwen3_5_moe, create_qwen3_5_moe_model);
     }
 
+#ifndef PIE_CUDA_QWEN_ONLY
     // ── Qwen3-VL: Qwen3 text tower (binds into the same `Qwen3Weights`
     //    shape as LlamaLike) + optional ViT vision tower with DeepStack.
     for (const char* mt : {"qwen3_vl", "qwen3_vl_text"}) {
@@ -737,6 +763,7 @@ std::vector<ArchEntry> build_arch_table() {
     //    The only family whose config validation hook is non-trivial.
     push("csm", Family::Csm, "csm", validate_csm_config, bind_row_csm,
          create_csm_model);
+#endif
 
     return t;
 }

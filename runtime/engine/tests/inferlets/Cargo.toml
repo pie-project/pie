@@ -27,16 +27,12 @@ members = [
     "mtp-specdecode",
     "mtpverify",
     "mtp-native-verify",
-    "ptir-greedy-e2e",
     "beam",
     "beam-designb",
     "beam-designb-compact",
     "mtp-grammar",
     "ptir-prefill-e2e",
     "prefix-cache-e2e",
-    "linearfold",
-    "samplerprobe",
-    "carrierprobe",
     "selfspec",
 ]
 

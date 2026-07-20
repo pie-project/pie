@@ -58,6 +58,7 @@ int Registry::bind_instance(
     const int rc = dispatch_.bind_instance(
         instance_id,
         pit->second.program_hash,
+        instance.geometry_class,
         instance.pacing_wait_id,
         channel_ids,
         seeds,
@@ -66,7 +67,8 @@ int Registry::bind_instance(
     if (rc != PIE_STATUS_OK) return rc;
 
     instances_[instance_id] = InstanceRecord{
-        instance_id, instance.program_id, pit->second.program_hash};
+        instance_id, instance.program_id, pit->second.program_hash,
+        instance.geometry_class};
     return PIE_STATUS_OK;
 }
 

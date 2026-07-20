@@ -39,18 +39,20 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
         self.id()
     }
 
-    fn kv_working_sets(
-        &self,
-    ) -> std::collections::HashSet<crate::store::kv::page_table::WorkingSetId> {
-        self.residency_snapshot()
-            .kv_working_sets
-            .into_iter()
-            .filter_map(|(model, driver, ws)| (model == 0 && driver == 0).then_some(ws))
-            .collect()
+    fn fire_timing_requested(&self) -> bool {
+        ProcessCtx::fire_timing_requested(self)
+    }
+
+    fn commit_fire_timing(&mut self, enabled: bool) {
+        ProcessCtx::commit_fire_timing(self, enabled);
     }
 
     async fn honor_preemption(&mut self) -> anyhow::Result<()> {
         crate::inferlet::process::preemption::honor(self).await
+    }
+
+    fn preemption_signal(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        crate::store::reclaim::contention()?.park_signal(self.id())
     }
 }
 

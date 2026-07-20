@@ -173,7 +173,9 @@ ChainResult run_chain(const std::vector<Req>& reqs, int first, int R, int num_st
         RT(cudaMemcpy(d_packed, packed.data(), packed.size()*2, cudaMemcpyHostToDevice));
         k::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
             d_packed, d_qout, d_k, d_v, d_qw, d_kw, d_pos, /*rope_table=*/nullptr,
-            d_kpi, d_kpp, d_klpl, R, HQ, HKV, D, PAGE, /*hnd_layout=*/false,
+            d_kpi, d_kpp, d_klpl,
+            /*w_page=*/nullptr, /*w_off=*/nullptr, /*row_valid=*/nullptr,
+            R, HQ, HKV, D, PAGE, /*hnd_layout=*/false,
             /*theta=*/1.0e6f, /*eps=*/1.0e-6f, /*stream=*/nullptr);
         RT(cudaDeviceSynchronize());
     }

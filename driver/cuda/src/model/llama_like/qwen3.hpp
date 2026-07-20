@@ -111,10 +111,6 @@ struct Qwen3Weights {
     const DeviceTensor* embed       = nullptr;  // [vocab, hidden]
     const DeviceTensor* final_norm  = nullptr;  // [hidden]
     const DeviceTensor* lm_head     = nullptr;  // [vocab, hidden] (may alias embed)
-    // Optional non-owning TP row-slice of lm_head. The view object lives in
-    // this struct; its backing allocation stays owned by LoadedModel.
-    std::unique_ptr<DeviceTensor> lm_head_tp_shard;
-    int lm_head_tp_vocab_offset = 0;
     std::vector<Qwen3LayerWeights> layers;
 };
 

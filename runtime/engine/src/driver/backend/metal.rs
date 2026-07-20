@@ -6,7 +6,8 @@ use crate::driver::abi::{
 };
 use crate::driver::channel::RegisteredChannel;
 use crate::driver::command::{
-    ChannelRegistrationPlan, KvCopyPlan, PoolResizePlan, ProgramRegistration, StateCopyPlan,
+    ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
+    StateCopyPlan,
 };
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
@@ -77,13 +78,18 @@ impl MetalDriver {
         &mut self,
         desc: &pie_driver_abi::ModelLoadDesc,
     ) -> Result<pie_driver_abi::DriverCapabilities> {
+        if desc.component != pie_driver_abi::ModelComponent::Full {
+            return Err(anyhow!(
+                "metal component-scoped model loading is unsupported"
+            ));
+        }
         let snapshot = desc
             .snapshot_dir
             .to_str()
             .ok_or_else(|| anyhow!("model snapshot path must be UTF-8"))?;
         let raw = PieModelLoadDesc {
             abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
-            reserved0: 0,
+            component: desc.component as u32,
             compiler_version: desc.compiler_version,
             load_plan_bytes: PieBytes {
                 ptr: desc.load_plan_bytes.as_ptr(),
@@ -158,6 +164,10 @@ impl MetalDriver {
             "pie_metal_launch",
         )?;
         Ok(completion)
+    }
+
+    pub fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
+        Err(anyhow!("metal media encode is unsupported"))
     }
     pub fn copy_kv(&mut self, plan: &KvCopyPlan) -> Result<SubmissionCompletion> {
         let target_epoch = 1;

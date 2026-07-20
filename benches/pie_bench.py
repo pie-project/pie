@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import os
@@ -25,6 +26,8 @@ from common import (
     hf_chat_token_ids_and_counts,
     make_prompts,
     maybe_set_cpu_affinity,
+    request_max_tokens,
+    resolve_local_model,
     summarize,
     visible_cuda_devices,
 )
@@ -35,12 +38,18 @@ if str(SERVER_SDK) not in sys.path:
 
 
 EMBEDDED_CLI_DRIVERS: set[str] = {
-    "cuda_native",
     "dummy",
     "vllm",
     "sglang",
     "tensorrt_llm",
 }
+
+
+def hash_output_tokens(token_ids: list[int]) -> str:
+    digest = hashlib.sha256()
+    for token in token_ids:
+        digest.update(int(token).to_bytes(4, "little", signed=False))
+    return digest.hexdigest()
 KV_CACHE_DTYPES = [
     "auto",
     "bf16",
@@ -52,6 +61,21 @@ KV_CACHE_DTYPES = [
     "fp4_e2m1",
     "nvfp4",
 ]
+
+
+def reconstruct_token_arrivals(
+    first_arrival_s: float,
+    intertoken_us: list[int],
+    output_tokens: int,
+) -> list[float]:
+    arrivals = [first_arrival_s]
+    for gap_us in intertoken_us:
+        arrivals.append(arrivals[-1] + gap_us / 1_000_000.0)
+    if len(arrivals) != output_tokens:
+        raise ValueError(
+            f"token timing count is {len(arrivals)}, expected {output_tokens}"
+        )
+    return arrivals
 
 
 def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
@@ -79,6 +103,84 @@ def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return int(s.getsockname()[1])
+
+
+def embedded_engine_identity() -> dict[str, str]:
+    from pie import _engine
+
+    engine_path = Path(_engine.__file__).resolve()
+    source_suffixes = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".rs"}
+    source_roots = (
+        ROOT / "driver",
+        ROOT / "interface",
+        ROOT / "runtime",
+        ROOT / "sdk" / "python-server" / "src",
+    )
+    newest_source = max(
+        (
+            path
+            for root in source_roots
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix in source_suffixes
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+    if engine_path.stat().st_mtime_ns < newest_source.stat().st_mtime_ns:
+        raise RuntimeError(
+            f"embedded engine {engine_path} is older than {newest_source}; "
+            "rebuild with PIE_COMPILER_LAUNCHER=env CARGO_BUILD_JOBS=2 "
+            "CMAKE_BUILD_PARALLEL_LEVEL=2 uv --project sdk/python-server sync "
+            "--reinstall-package pie-server"
+        )
+    digest = hashlib.sha256()
+    with engine_path.open("rb") as engine:
+        for chunk in iter(lambda: engine.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "embedded engine": str(engine_path),
+        "embedded engine sha256": digest.hexdigest(),
+    }
+
+
+def is_cumulative_status_key(key: str) -> bool:
+    suffix = key.rsplit(".", 1)[-1]
+    return (
+        suffix.endswith("_sum")
+        or suffix
+        in {
+            "batch_size_hist",
+            "bypass_hits",
+            "chain_drops",
+            "chain_submits",
+            "cold_hold_fires",
+            "cumulative_batch_latency_us",
+            "escape_fires",
+            "readiness_miss",
+            "spec_attempted",
+            "spec_budget_skipped",
+            "spec_dropped_orphan",
+            "spec_hits",
+            "spec_misses",
+            "spec_need_pages",
+            "spec_rule_skipped",
+            "submit_ahead_fires",
+            "total_batches",
+            "total_requests_processed",
+            "total_tokens_processed",
+            "wave_fires",
+        }
+    )
+
+
+def measured_average(
+    status: dict[str, Any],
+    numerator_key: str,
+    denominator: int | float,
+    output_key: str,
+) -> None:
+    numerator = status.get(numerator_key)
+    if isinstance(numerator, (int, float)) and denominator > 0:
+        status[output_key] = numerator / denominator
 
 
 def build_config(args: argparse.Namespace):
@@ -193,17 +295,21 @@ def build_config(args: argparse.Namespace):
         max_concurrent_processes = None  # serializer drops field → unlimited
     else:
         max_concurrent_processes = args.concurrency
-    scheduler_kwargs = {
+    requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,
         "admission_oversubscription_factor": args.admission_oversubscription_factor,
     }
-    if (
-        args.speculation_depth is not None
-        and "speculation_depth" in inspect.signature(SchedulerConfig).parameters
-    ):
+    scheduler_parameters = inspect.signature(SchedulerConfig).parameters
+    scheduler_kwargs = {
+        key: value
+        for key, value in requested_scheduler_kwargs.items()
+        if key in scheduler_parameters
+    }
+    if args.speculation_depth is not None and "speculation_depth" in scheduler_parameters:
         scheduler_kwargs["speculation_depth"] = args.speculation_depth
 
+    resolved_model = resolve_local_model(args.model)
     cfg = Config(
         server=ServerConfig(
             host="127.0.0.1",
@@ -217,22 +323,21 @@ def build_config(args: argparse.Namespace):
             wasm_max_instances=max(4096, (args.num_requests + args.warmup) * 4),
             **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
-        models=[
-            ModelConfig(
-                name="default",
-                hf_repo=args.model,
-                scheduler=SchedulerConfig(**scheduler_kwargs),
-                driver=DriverConfig(
-                    type=args.driver,
-                    device=device,
-                    tensor_parallel_size=args.tp_size,
-                    options=driver_options,
-                ),
+        model=ModelConfig(
+            name="default",
+            hf_repo=resolved_model,
+            scheduler=SchedulerConfig(**scheduler_kwargs),
+            driver=DriverConfig(
+                type=args.driver,
+                device=device,
+                tensor_parallel_size=args.tp_size,
+                options=driver_options,
             )
-        ],
+        ),
     )
     config_blob = {
         "driver": args.driver,
+        "resolved model": resolved_model,
         **driver_options,
     }
     if args.speculation_depth is not None:
@@ -249,8 +354,29 @@ async def python_pie_client(args: argparse.Namespace):
     from pie.server import Server
 
     cfg, engine_config = build_config(args)
+    engine_identity = embedded_engine_identity()
+    if url := os.environ.get("PIE_BENCH_SERVER_URL"):
+        # Connect to an externally hosted server (see PIE_BENCH_SERVE_ONLY):
+        # same embedded engine, its own process. vLLM is always benched with
+        # its server in a separate process; this gives pie the same topology
+        # so client-interpreter interference can be isolated and measured.
+        from pie_client import PieClient
+
+        client = PieClient(url)
+        await client.connect()
+        try:
+            yield client, {**engine_config, **engine_identity}
+        finally:
+            await client.close()
+        return
     async with Server(cfg) as server:
-        yield await server.connect(), engine_config
+        if os.environ.get("PIE_BENCH_SERVE_ONLY") == "1":
+            # Host-only mode: boot the server with this invocation's exact
+            # config, announce the URL, and park until killed. A second
+            # invocation with PIE_BENCH_SERVER_URL runs the workload.
+            print(f"PIE_BENCH_SERVER_URL={server.url}", flush=True)
+            await asyncio.Event().wait()
+        yield await server.connect(), {**engine_config, **engine_identity}
 
 
 @asynccontextmanager
@@ -272,9 +398,9 @@ async def cli_pie_client(args: argparse.Namespace):
 
     proc = await asyncio.create_subprocess_exec(
         str(pie_bin),
-        "serve",
         "--config",
         str(cfg_path),
+        "serve",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
@@ -291,6 +417,7 @@ async def cli_pie_client(args: argparse.Namespace):
     def should_surface_server_line(txt: str) -> bool:
         return (
             txt.startswith("[fire ")
+            or txt.startswith("[pie-fire-timing] ")
             or txt.startswith("[sched-fire ")
             or txt.startswith("[outer-fire ")
             or txt.startswith("[sched-batch ")
@@ -418,6 +545,10 @@ async def run(args: argparse.Namespace):
         await client.install_program(wasm, manifest, force_overwrite=True)
 
         first_output_text: list[str | None] = [None]
+        output_token_ids_by_process: dict[str, list[int]] = {}
+        measured_epoch: float | None = None
+        measured_epoch_unix_s: float | None = None
+        measured_epoch_monotonic_ns: int | None = None
 
         def common_input(max_tokens: int | None = None) -> dict[str, Any]:
             return {
@@ -427,7 +558,9 @@ async def run(args: argparse.Namespace):
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
                 "wasm_delay_us": args.wasm_delay_us,
-                "return_text": args.dump_first_text,
+                "return_text": args.dump_first_text or args.dump_all_texts,
+                "report_timing": args.report_timing,
+                "report_arrivals": args.report_arrivals,
                 "wait_for_start": args.defer_start,
                 **(
                     {"system_speculation": args.system_speculation}
@@ -437,6 +570,8 @@ async def run(args: argparse.Namespace):
             }
 
         async def launch_one(i: int, *, max_tokens: int | None = None):
+            if max_tokens is None and getattr(args, "mixed_phase", False):
+                max_tokens = request_max_tokens(args, i)
             inp = {
                 **common_input(max_tokens),
                 "prompt": prompts[i],
@@ -444,30 +579,130 @@ async def run(args: argparse.Namespace):
             if prompt_token_ids is not None:
                 inp["prompt_tokens"] = prompt_token_ids[i]
             start = time.perf_counter()
+            send_monotonic_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+            client_send_s = (
+                (send_monotonic_ns - measured_epoch_monotonic_ns)
+                / 1_000_000_000.0
+                if measured_epoch_monotonic_ns is not None
+                and (args.report_timing or args.report_arrivals)
+                else None
+            )
             try:
                 proc = await client.launch_process(pkg, input=inp)
-                return i, start, proc
+                return i, start, proc, client_send_s
             except Exception as e:
                 return RequestResult(False, time.perf_counter() - start, 0, error=f"{type(e).__name__}: {e}")
 
         async def wait_one(launched) -> RequestResult:
             if isinstance(launched, RequestResult):
                 return launched
-            i, start, proc = launched
+            i, start, proc, client_send_s = launched
+            ttft_s: float | None = None
+            first_arrival_s: float | None = None
             try:
                 while True:
                     ev, msg = await asyncio.wait_for(
                         proc.recv(), timeout=args.request_timeout
                     )
+                    if ev == Event.Message and str(msg) == "t0":
+                        # Launch-inclusive first-token stamp (see inferlet's
+                        # report_timing contract).
+                        now = time.perf_counter()
+                        now_monotonic_ns = time.clock_gettime_ns(
+                            time.CLOCK_MONOTONIC
+                        )
+                        ttft_s = now - start
+                        first_arrival_s = (
+                            (
+                                now_monotonic_ns
+                                - measured_epoch_monotonic_ns
+                            )
+                            / 1_000_000_000.0
+                            if measured_epoch_monotonic_ns is not None
+                            and (args.report_timing or args.report_arrivals)
+                            else None
+                        )
+                        continue
                     if ev == Event.Return:
+                        returned = time.perf_counter()
+                        returned_monotonic_ns = time.clock_gettime_ns(
+                            time.CLOCK_MONOTONIC
+                        )
                         obj = json.loads(msg)
-                        if i == 0 and first_output_text[0] is None:
+                        if i == args.warmup and first_output_text[0] is None:
                             first_output_text[0] = obj.get("text", "")
+                        output_tokens = int(obj["num_output_tokens"])
+                        token_ids = [int(token) for token in obj.get("token_ids") or []]
+                        if len(token_ids) != output_tokens:
+                            raise ValueError(
+                                f"output token count {len(token_ids)}, expected {output_tokens}"
+                            )
+                        output_token_ids_by_process[str(proc.process_id)] = token_ids
+                        gaps = obj.get("intertoken_us") or []
+                        arrivals = None
+                        arrival_monotonic_ns = [
+                            int(value)
+                            for value in (obj.get("token_monotonic_ns") or [])
+                        ]
+                        if (
+                            measured_epoch_monotonic_ns is not None
+                            and arrival_monotonic_ns
+                            and arrival_monotonic_ns[-1]
+                            < measured_epoch_monotonic_ns
+                        ):
+                            # The guest clock may return measured-epoch-relative
+                            # marks; normalize the persisted field to absolute
+                            # CLOCK_MONOTONIC like the client stamps.
+                            arrival_monotonic_ns = [
+                                measured_epoch_monotonic_ns + value
+                                for value in arrival_monotonic_ns
+                            ]
+                        if measured_epoch_monotonic_ns is not None:
+                            if first_arrival_s is not None:
+                                arrivals = reconstruct_token_arrivals(
+                                    first_arrival_s, gaps, output_tokens
+                                )
+                            elif args.report_arrivals:
+                                if len(arrival_monotonic_ns) != output_tokens:
+                                    raise ValueError(
+                                        "shared-clock token timing count is "
+                                        f"{len(arrival_monotonic_ns)}, "
+                                        f"expected {output_tokens}"
+                                    )
+                                arrivals = [
+                                    (
+                                        int(value)
+                                        - measured_epoch_monotonic_ns
+                                    )
+                                    / 1_000_000_000.0
+                                    for value in arrival_monotonic_ns
+                                ]
                         return RequestResult(
                             True,
-                            time.perf_counter() - start,
-                            int(obj["num_output_tokens"]),
+                            returned - start,
+                            output_tokens,
                             int(obj["num_prompt_tokens"]),
+                            ttft_s=ttft_s,
+                            intertoken_us=gaps or None,
+                            client_send_s=client_send_s,
+                            token_arrival_s=arrivals,
+                            token_arrival_monotonic_ns=(
+                                arrival_monotonic_ns or None
+                            ),
+                            client_return_s=(
+                                (
+                                    returned_monotonic_ns
+                                    - measured_epoch_monotonic_ns
+                                )
+                                / 1_000_000_000.0
+                                if measured_epoch_monotonic_ns is not None
+                                else None
+                            ),
+                            process_id=str(proc.process_id),
+                            prologue_us=obj.get("prologue_us") or None,
+                            output_text=(
+                                obj.get("text", "") if args.dump_all_texts else None
+                            ),
                         )
                     if ev == Event.Error:
                         return RequestResult(False, time.perf_counter() - start, 0, error=str(msg))
@@ -565,7 +800,7 @@ async def run(args: argparse.Namespace):
                     if isinstance(item, RequestResult):
                         failed.append(item)
                         continue
-                    i, _start, proc = item
+                    i, _start, proc, _client_send_s = item
                     try:
                         while True:
                             ev, msg = await asyncio.wait_for(
@@ -588,7 +823,21 @@ async def run(args: argparse.Namespace):
                         )
                 start = time.perf_counter()
                 await asyncio.gather(*(proc.signal("start") for _i, proc in ready))
-                deferred = [(i, start, proc) for i, proc in ready]
+                deferred = [
+                    (
+                        i,
+                        start,
+                        proc,
+                        (
+                            time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+                            - measured_epoch_monotonic_ns
+                        )
+                        / 1_000_000_000.0
+                        if measured_epoch_monotonic_ns is not None
+                        else None,
+                    )
+                    for i, proc in ready
+                ]
                 return failed + await asyncio.gather(
                     *(wait_one(item) for item in deferred)
                 )
@@ -612,8 +861,36 @@ async def run(args: argparse.Namespace):
                 pre_stats = json.loads(body)
         except Exception:
             pass
-        cuda_profiler_start(args.cuda_profiler_capture)
-        start = time.perf_counter()
+        print("[pie-bench] measured-start", flush=True)
+        profiler_task = None
+        if (
+            args.cuda_profiler_capture
+            and args.cuda_profiler_duration_s > 0
+        ):
+            async def capture_profiler_window() -> None:
+                await asyncio.sleep(args.cuda_profiler_delay_s)
+                cuda_profiler_start(True)
+                try:
+                    await asyncio.sleep(args.cuda_profiler_duration_s)
+                finally:
+                    cuda_profiler_stop(True)
+
+            profiler_task = asyncio.create_task(capture_profiler_window())
+        else:
+            cuda_profiler_start(args.cuda_profiler_capture)
+        if (
+            args.report_timing
+            or args.report_arrivals
+            or args.report_wall_clock
+        ):
+            measured_epoch_unix_s = time.time()
+            measured_epoch_monotonic_ns = time.clock_gettime_ns(
+                time.CLOCK_MONOTONIC
+            )
+            measured_epoch = time.perf_counter()
+            start = measured_epoch
+        else:
+            start = time.perf_counter()
         try:
             if args.mode == "latency":
                 results = [await one(start_idx + i) for i in range(n)]
@@ -621,7 +898,20 @@ async def run(args: argparse.Namespace):
                 results = await many(range(start_idx, start_idx + n))
         finally:
             wall = time.perf_counter() - start
-            cuda_profiler_stop(args.cuda_profiler_capture)
+            if profiler_task is None:
+                cuda_profiler_stop(args.cuda_profiler_capture)
+            else:
+                if not profiler_task.done():
+                    profiler_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await profiler_task
+            print("[pie-bench] measured-end", flush=True)
+        for result in results:
+            if result.process_id is not None:
+                token_ids = output_token_ids_by_process[result.process_id]
+                result.output_token_sha256 = hash_output_tokens(token_ids)
+                if args.dump_all_token_ids:
+                    result.output_token_ids = token_ids
         if args.mode == "tput" and args.defer_start:
             measured = [r.latency_s for r in results if r.ok]
             if measured:
@@ -640,12 +930,99 @@ async def run(args: argparse.Namespace):
                 model_status: dict[str, Any] = {}
                 for k, v in model_status_raw.items():
                     pre = pre_stats.get(k)
-                    if isinstance(v, (int, float)) and isinstance(pre, (int, float)):
+                    if (
+                        is_cumulative_status_key(k)
+                        and isinstance(v, (int, float))
+                        and isinstance(pre, (int, float))
+                    ):
                         model_status[k] = v - pre
-                    elif isinstance(v, list) and isinstance(pre, list) and len(v) == len(pre):
+                    elif (
+                        is_cumulative_status_key(k)
+                        and isinstance(v, list)
+                        and isinstance(pre, list)
+                        and len(v) == len(pre)
+                    ):
                         model_status[k] = [a - b for a, b in zip(v, pre)]
                     else:
                         model_status[k] = v
+                measured_batches = model_status.get("default.total_batches", 0)
+                if isinstance(measured_batches, (int, float)):
+                    measured_average(
+                        model_status,
+                        "default.cumulative_batch_latency_us",
+                        measured_batches,
+                        "default.avg_batch_latency_us",
+                    )
+                    for sum_key, average_key in (
+                        ("default.fire.accumulate.accum_loop_us_sum",
+                         "default.fire.accumulate.accum_loop_us"),
+                        ("default.fire.pre_dispatch.fire_prepare_us_sum",
+                         "default.fire.pre_dispatch.fire_prepare_us"),
+                        ("default.fire.execute.total_us_sum",
+                         "default.fire.execute.total_us"),
+                        ("default.fire.execute.batch_build_us_sum",
+                         "default.fire.execute.batch_build_us"),
+                        ("default.fire.execute.driver_fire_us_sum",
+                         "default.fire.execute.driver_fire_us"),
+                        ("default.fire.post_dispatch.context_tick_us_sum",
+                         "default.fire.post_dispatch.context_tick_us"),
+                        ("default.fire.post_dispatch.stats_update_us_sum",
+                         "default.fire.post_dispatch.stats_update_us"),
+                        ("default.fire.quorum.inter_batch_bubble_us_sum",
+                         "default.fire.quorum.inter_batch_bubble_us"),
+                        ("default.fire.quorum.quorum_latency_us_sum",
+                         "default.fire.quorum.quorum_latency_us"),
+                    ):
+                        measured_average(
+                            model_status,
+                            sum_key,
+                            measured_batches,
+                            average_key,
+                        )
+                    pre_batches = pre_stats.get("default.total_batches", 0)
+                    inter_fire_samples = (
+                        measured_batches
+                        if isinstance(pre_batches, (int, float)) and pre_batches > 0
+                        else max(measured_batches - 1, 0)
+                    )
+                    for sum_key, average_key in (
+                        ("default.fire.inter_fire_us_sum",
+                         "default.fire.inter_fire_us"),
+                        ("default.fire.post_dispatch_to_fire_us_sum",
+                         "default.fire.post_dispatch_to_fire_us"),
+                        ("default.fire.recv_block_wait_us_sum",
+                         "default.fire.recv_block_wait_us"),
+                    ):
+                        measured_average(
+                            model_status,
+                            sum_key,
+                            inter_fire_samples,
+                            average_key,
+                        )
+                cold_hold_fires = model_status.get(
+                    "default.fire.quorum.cold_hold_fires", 0
+                )
+                if isinstance(cold_hold_fires, (int, float)):
+                    measured_average(
+                        model_status,
+                        "default.fire.quorum.cold_hold_us_sum",
+                        cold_hold_fires,
+                        "default.fire.quorum.cold_hold_us",
+                    )
+                wave_fires = model_status.get("default.fire.quorum.wave_fires", 0)
+                if isinstance(wave_fires, (int, float)):
+                    measured_average(
+                        model_status,
+                        "default.fire.quorum.wave_active_sum",
+                        wave_fires,
+                        "default.fire.quorum.avg_active_pipelines_at_fire",
+                    )
+                    measured_average(
+                        model_status,
+                        "default.fire.quorum.wave_missing_sum",
+                        wave_fires,
+                        "default.fire.quorum.avg_missing_at_fire",
+                    )
                 for key, label in (
                     ("default.spec_attempted", "spec attempted"),
                     ("default.spec_hits", "spec hits"),
@@ -669,6 +1046,15 @@ async def run(args: argparse.Namespace):
                     ("default.fire.execute.total_us", "fire.execute.total_us"),
                     ("default.fire.execute.batch_build_us", "fire.execute.batch_build_us"),
                     ("default.fire.execute.driver_fire_us", "fire.execute.driver_fire_us"),
+                    (
+                        "default.fire.quorum.avg_active_pipelines_at_fire",
+                        "wave avg active pipelines",
+                    ),
+                    (
+                        "default.fire.quorum.avg_missing_at_fire",
+                        "wave avg missing pipelines",
+                    ),
+                    ("default.fire.quorum.wave_fires", "wave fires"),
                     ("default.cumulative_batch_latency_us", "cumulative_batch_latency_us"),
                     ("default.fire.post_dispatch.context_tick_us", "fire.post_dispatch.context_tick_us"),
                     ("default.fire.post_dispatch.stats_update_us", "fire.post_dispatch.stats_update_us"),
@@ -684,6 +1070,15 @@ async def run(args: argparse.Namespace):
                 ):
                     if key in model_status:
                         engine_config[label] = model_status[key]
+                for key, value in model_status.items():
+                    if (
+                        "wave" in key
+                        or "active_pipelines" in key
+                        or "missing_at_fire" in key
+                        or "straggler" in key
+                        or "cold_hold" in key
+                    ):
+                        engine_config[key] = value
         except Exception:  # noqa: BLE001
             # Stats are advisory — never break a bench on a failed query.
             pass
@@ -710,6 +1105,20 @@ async def run(args: argparse.Namespace):
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
             "cuda profiler capture": args.cuda_profiler_capture,
+            **(
+                {
+                    "client timing epoch unix s": measured_epoch_unix_s,
+                    "client timing epoch monotonic ns": (
+                        measured_epoch_monotonic_ns
+                    ),
+                }
+                if (
+                    args.report_timing
+                    or args.report_arrivals
+                    or args.report_wall_clock
+                )
+                else {}
+            ),
             "cpu affinity": cpu_affinity,
             **engine_config,
         },
@@ -763,6 +1172,36 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="Print the first request's full output text + its sha256 prefix. "
                  "Use to A/B-compare spec vs no-spec runs at temperature=0.",
+        )
+        sp.add_argument(
+            "--dump-all-token-ids",
+            action="store_true",
+            help="Include every measured request's emitted token IDs in JSON output.",
+        )
+        sp.add_argument(
+            "--dump-all-texts",
+            action="store_true",
+            help="Include every measured request's decoded output in JSON output.",
+        )
+        sp.add_argument(
+            "--report-timing",
+            action="store_true",
+            help="Collect per-request TTFT (launch-inclusive, client-stamped on "
+                 "the inferlet's t0 message) and inter-token gap distributions; "
+                 "adds ttft/intertoken summaries to the output.",
+        )
+        sp.add_argument(
+            "--report-arrivals",
+            action="store_true",
+            help="Collect per-token guest-drain timestamps from the shared "
+            "host monotonic clock without sending a live first-token client "
+            "message. Intended for non-perturbing occupancy reconstruction.",
+        )
+        sp.add_argument(
+            "--report-wall-clock",
+            action="store_true",
+            help="Record only the measured wall's shared monotonic epoch; "
+            "adds no per-request or per-token client timing.",
         )
         sp.add_argument(
             "--pretokenized-prompts",

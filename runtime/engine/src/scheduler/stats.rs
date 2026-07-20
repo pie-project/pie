@@ -202,6 +202,9 @@ pub struct FireStats {
     pub avg_inter_fire_us: u64,
     pub avg_post_dispatch_to_fire_us: u64,
     pub avg_recv_block_wait_us: u64,
+    pub inter_fire_us_sum: u64,
+    pub post_dispatch_to_fire_us_sum: u64,
+    pub recv_block_wait_us_sum: u64,
     pub accumulate: AccumulateStats,
     pub pre_dispatch: PreDispatchStats,
     pub execute: ExecuteStats,
@@ -210,15 +213,20 @@ pub struct FireStats {
 }
 
 /// Quorum-rule probe averages/counters (overview §7.2; thrust-2 §3 F1–F6).
-/// Zero unless built with `profile-fire`. Populated by the quorum core
-/// (thrust-2 phase S5); scaffolding lands in S0. Mirrors
-/// `crate::scheduler::probe::QuorumProbes`.
+/// The wave counters (`wave_*`, `cold_hold_fires`, `straggler_fires`)
+/// populate in EVERY build — they are behavior counters, and a default
+/// build reporting zero while demoting would be a silently-wrong stat.
+/// The latency probes (bubble/quorum-latency sums, escape/submit-ahead)
+/// still require `profile-fire`. Populated by the quorum core (thrust-2
+/// phase S5). Mirrors `crate::scheduler::probe::QuorumProbes`.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct QuorumStats {
     /// Mean device idle between a batch retiring and the next launching (F1).
     pub avg_inter_batch_bubble_us: u64,
+    pub inter_batch_bubble_us_sum: u64,
     /// Mean last-ready → enqueue latency (F1 quorum completion).
     pub avg_quorum_latency_us: u64,
+    pub quorum_latency_us_sum: u64,
     /// Idle-escape (F2) fire count; divide by `total_batches` for escape rate.
     pub escape_fires: u64,
     /// Depth-2 submit-ahead (G3 bubble) fire count; divide by `total_batches`
@@ -226,17 +234,27 @@ pub struct QuorumStats {
     pub submit_ahead_fires: u64,
     /// Mean cold-hold window per cold-hold fire (F3 occupancy).
     pub avg_cold_hold_us: u64,
+    pub cold_hold_us_sum: u64,
     /// Count of fires through the cold-hold path (F3).
     pub cold_hold_fires: u64,
+    /// Count of straggler-demotion fires (wave window expired, fired narrow).
+    pub straggler_fires: u64,
+    /// Pipelines actually demoted at those fires (idle a full window since
+    /// their own last activity). Healthy workloads: ~0.
+    pub straggler_demotions: u64,
     /// Dummy-run / readiness-miss count (M3 gate: rate < 1%).
     pub readiness_miss: u64,
     /// Wait-for-all wave (M-AB): mean active_pipelines (wait-set size) sampled
     /// at each WaitAll fire. ≈ fleet width ⇒ persistent wait-set (waves should
     /// be dense); ≈1 ⇒ transient/singleton. 0 if no WaitAll fire.
     pub avg_active_pipelines_at_fire: u64,
-    /// Wait-for-all wave: mean stragglers fired without (deadline holds). >0 ⇒
-    /// waves hold to the deadline then fire partial; ≈0 ⇒ all-ready fires.
+    /// Mean absentees per wave fire. Non-zero only through straggler
+    /// demotion (narrow fires after the wave window expires).
     pub avg_missing_at_fire: u64,
+    /// Cumulative numerator for `avg_active_pipelines_at_fire`.
+    pub wave_active_sum: u64,
+    /// Cumulative numerator for `avg_missing_at_fire`.
+    pub wave_missing_sum: u64,
     /// Count of WaitAll wave fires (denominator for the two averages above).
     pub wave_fires: u64,
 }
@@ -244,11 +262,13 @@ pub struct QuorumStats {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct AccumulateStats {
     pub avg_accum_loop_us: u64,
+    pub accum_loop_us_sum: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct PreDispatchStats {
     pub avg_fire_prepare_us: u64,
+    pub fire_prepare_us_sum: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -256,12 +276,17 @@ pub struct ExecuteStats {
     pub avg_total_us: u64,
     pub avg_batch_build_us: u64,
     pub avg_driver_fire_us: u64,
+    pub total_us_sum: u64,
+    pub batch_build_us_sum: u64,
+    pub driver_fire_us_sum: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct PostDispatchStats {
     pub avg_context_tick_us: u64,
     pub avg_stats_update_us: u64,
+    pub context_tick_us_sum: u64,
+    pub stats_update_us_sum: u64,
 }
 
 /// Aggregate stats across every per-driver `SchedulerStats` (was
@@ -296,6 +321,8 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     let mut q_submit_ahead_fires = 0u64;
     let mut q_cold_hold = 0u64;
     let mut q_cold_hold_fires = 0u64;
+    let mut q_straggler_fires = 0u64;
+    let mut q_straggler_demotions = 0u64;
     let mut q_readiness_miss = 0u64;
     let mut q_wave_active_sum = 0u64;
     let mut q_wave_missing_sum = 0u64;
@@ -328,6 +355,8 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         q_submit_ahead_fires += f.quorum.submit_ahead_fires.load(Relaxed);
         q_cold_hold += f.quorum.cold_hold_us.load(Relaxed);
         q_cold_hold_fires += f.quorum.cold_hold_fires.load(Relaxed);
+        q_straggler_fires += f.quorum.straggler_fires.load(Relaxed);
+        q_straggler_demotions += f.quorum.straggler_demotions.load(Relaxed);
         q_readiness_miss += f.quorum.readiness_miss.load(Relaxed);
         q_wave_active_sum += f.quorum.wave_active_sum.load(Relaxed);
         q_wave_missing_sum += f.quorum.wave_missing_sum.load(Relaxed);
@@ -367,24 +396,36 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
             avg_inter_fire_us: avg_pair(fire_inter),
             avg_post_dispatch_to_fire_us: avg_pair(fire_post_dispatch_to_fire),
             avg_recv_block_wait_us: avg_pair(fire_recv_block_wait),
+            inter_fire_us_sum: fire_inter,
+            post_dispatch_to_fire_us_sum: fire_post_dispatch_to_fire,
+            recv_block_wait_us_sum: fire_recv_block_wait,
             accumulate: AccumulateStats {
                 avg_accum_loop_us: avg(fire_accumulate_accum_loop),
+                accum_loop_us_sum: fire_accumulate_accum_loop,
             },
             pre_dispatch: PreDispatchStats {
                 avg_fire_prepare_us: avg(fire_pre_dispatch_fire_prepare),
+                fire_prepare_us_sum: fire_pre_dispatch_fire_prepare,
             },
             execute: ExecuteStats {
                 avg_total_us: avg(fire_execute_total),
                 avg_batch_build_us: avg(fire_execute_batch_build),
                 avg_driver_fire_us: avg(fire_execute_driver_fire),
+                total_us_sum: fire_execute_total,
+                batch_build_us_sum: fire_execute_batch_build,
+                driver_fire_us_sum: fire_execute_driver_fire,
             },
             post_dispatch: PostDispatchStats {
                 avg_context_tick_us: avg(fire_post_dispatch_context_tick),
                 avg_stats_update_us: avg(fire_post_dispatch_stats_update),
+                context_tick_us_sum: fire_post_dispatch_context_tick,
+                stats_update_us_sum: fire_post_dispatch_stats_update,
             },
             quorum: QuorumStats {
                 avg_inter_batch_bubble_us: avg(q_inter_batch_bubble),
+                inter_batch_bubble_us_sum: q_inter_batch_bubble,
                 avg_quorum_latency_us: avg(q_quorum_latency),
+                quorum_latency_us_sum: q_quorum_latency,
                 escape_fires: q_escape_fires,
                 submit_ahead_fires: q_submit_ahead_fires,
                 avg_cold_hold_us: if q_cold_hold_fires > 0 {
@@ -392,7 +433,10 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
                 } else {
                     0
                 },
+                cold_hold_us_sum: q_cold_hold,
                 cold_hold_fires: q_cold_hold_fires,
+                straggler_fires: q_straggler_fires,
+                straggler_demotions: q_straggler_demotions,
                 readiness_miss: q_readiness_miss,
                 avg_active_pipelines_at_fire: if q_wave_fires > 0 {
                     q_wave_active_sum / q_wave_fires
@@ -404,6 +448,8 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
                 } else {
                     0
                 },
+                wave_active_sum: q_wave_active_sum,
+                wave_missing_sum: q_wave_missing_sum,
                 wave_fires: q_wave_fires,
             },
         },

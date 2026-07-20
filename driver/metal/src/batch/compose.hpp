@@ -27,6 +27,8 @@ struct LaunchMember {
     std::uint64_t instance_id = 0;
     std::vector<ChannelTicket> tickets;
     bool needs_forward = false;
+    bool requires_m2 = false;
+    int mtp_draft_row = -1;
     int fwd_slot = -1;
     std::string build_err;
     PieTerminalCell* terminal_cell = nullptr;
@@ -41,10 +43,18 @@ struct OwnedLaunchView {
     std::vector<std::uint32_t> qo_indptr;
     std::vector<std::uint32_t> rs_slot_ids;
     std::vector<std::uint8_t> rs_slot_flags;
+    // Preserved as activation-suffix metadata only; never a folded-state
+    // fallback for resolved request rows.
+    std::vector<std::uint32_t> rs_buffer_slot_ids;
+    std::vector<std::uint32_t> rs_buffer_slot_indptr;
     std::vector<std::uint32_t> sampling_indices;
     std::vector<std::uint32_t> sampling_indptr;
     std::vector<std::uint32_t> kv_translation;
     std::vector<std::uint32_t> kv_translation_indptr;
+    std::vector<std::uint32_t> mask_request_indptr;
+    std::vector<std::uint32_t> mask_word_indptr;
+    std::vector<std::uint32_t> mask_words;
+    bool has_user_mask = false;
 
     static OwnedLaunchView capture(const PieLaunchDesc& launch);
     pie_native::LaunchView view() const;
@@ -64,6 +74,7 @@ bool build_member_forward_desc(
     std::size_t member,
     std::size_t member_count,
     bool has_linear_attn,
+    std::uint32_t page_size,
     const pie_native::ptir::FireGeometry* resolved,
     MemberForwardDesc& desc,
     std::string& error);

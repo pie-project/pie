@@ -1,4 +1,5 @@
 #include "model/glm5/glm5_forward.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -271,6 +272,11 @@ void glm5_forward_paged(
             ws.q_a.data(),
             make_weight_view(Lw.q_b_proj, Lw.q_b_proj_quant),
             ws.q_b.data(), total_tokens, heads * (q_nope + q_rope), q_lora);
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj, ws.q_b.data(),
+            static_cast<std::uint32_t>(total_tokens),
+            static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
+            static_cast<std::uint32_t>(li), stream);
 
         // ── DSA lightning-indexer: build top-k mask for this layer ───────
         const std::uint8_t* idx_mask_ptr = nullptr;
@@ -357,6 +363,11 @@ void glm5_forward_paged(
             ws.attn_latent.data(), kv_b_bf16,
             ws.attn_v.data(),
             total_tokens, heads, q_nope, v_dim, kv_lora, stream);
+        invoke_stage_hook(
+            StageHookPoint::OnAttn, ws.q_b.data(),
+            static_cast<std::uint32_t>(total_tokens),
+            static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
+            static_cast<std::uint32_t>(li), stream);
 
         if (T == 1) {
             ops::gemm_act_x_w(cublas.handle(),

@@ -353,6 +353,12 @@ impl CompletionBroker {
         }
     }
 
+    pub(crate) fn notify(&self, wait_id: u64, epoch: u64) {
+        if !self.inner.closed.load(Ordering::Acquire) {
+            let _ = self.inner.table.publish(wait_id, epoch);
+        }
+    }
+
     #[cfg(test)]
     fn live_len(&self) -> usize {
         self.inner.live.lock().unwrap().entries.len()

@@ -69,6 +69,9 @@ set(PIE_METAL_EXPLICIT_SOURCES
   src/pipeline/registry.cpp
   src/batch/compose.cpp
   src/batch/forward.cpp)
+if(NOT APPLE)
+  list(APPEND PIE_METAL_EXPLICIT_SOURCES src/pipeline/shared_storage.cpp)
+endif()
 
 # Native Metal-4 compute pipeline and default backend.
 # Keep this list explicit: standalone tools and not-yet-live architecture
@@ -77,6 +80,9 @@ set(PIE_METAL_LIVE_SOURCES)
 if(APPLE)
   set(PIE_METAL_LIVE_SOURCES
     src/mtl4_context.mm
+    src/pipeline/shared_storage.mm
+    src/pipeline/m1_codegen.cpp
+    src/pipeline/m1_runtime.cpp
     src/batch/decode_timing.cpp
     src/batch/scratch.cpp
     src/model/qwen3_5/decode_consts.cpp
@@ -94,6 +100,7 @@ add_library(pie_driver_metal_lib STATIC
 if(APPLE)
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/mtl4_context.mm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pipeline/shared_storage.mm
     PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif()
 
@@ -255,7 +262,24 @@ function(add_metal_linked_test target source)
   add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
+file(GLOB PIE_PTIR_CANONICAL_GOLDENS CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir/*.txt)
+add_executable(
+  ptir_decoder_limits_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/tests/ptir_decoder_limits_test.cpp)
+target_include_directories(ptir_decoder_limits_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+target_compile_features(ptir_decoder_limits_test PRIVATE cxx_std_20)
+add_test(
+  NAME ptir_decoder_limits_test
+  COMMAND ptir_decoder_limits_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
+    ${PIE_PTIR_CANONICAL_GOLDENS})
+
 add_metal_host_test(pipeline_interp_test tests/pipeline_interp_test.cpp)
+add_metal_host_test(
+  pipeline_channel_storage_test
+  tests/pipeline_channel_storage_test.cpp)
 add_metal_host_test(
   pipeline_descriptor_resolve_test
   tests/pipeline_descriptor_resolve_test.cpp)
@@ -273,6 +297,7 @@ add_executable(paged_batch_validation_test tests/paged_batch_validation_test.cpp
 target_include_directories(paged_batch_validation_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(paged_batch_validation_test PRIVATE pie_driver_metal_lib)
 add_test(NAME paged_batch_validation_test COMMAND paged_batch_validation_test)
 
 add_metal_linked_test(
@@ -289,6 +314,10 @@ target_link_libraries(executor_worker_test PRIVATE Threads::Threads)
 add_test(NAME executor_worker_test COMMAND executor_worker_test)
 
 if(APPLE)
+  add_metal_linked_test(m1_generated_test tests/m1_generated_test.cpp)
+  target_compile_definitions(m1_generated_test PRIVATE
+    PIE_PTIR_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir")
+  add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(ptir_checkpoint_e2e_test tests/ptir_checkpoint_e2e_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
   add_metal_linked_test(decode_step_mb_test tests/decode_step_mb_test.cpp)

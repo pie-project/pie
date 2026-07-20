@@ -12,10 +12,12 @@
 //        -Isrc tests/ptir_golden_exec_test.cu -o ptir_golden_exec_test
 //   ./ptir_golden_exec_test tests/golden-ptir
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -24,6 +26,7 @@
 
 #include "pie_native/ptir/bound.hpp"
 #include "pipeline/program_runtime.hpp"
+#include "pipeline/grouped_runtime.cuh"
 #include "pipeline/tier0/tier0_runner.hpp"
 
 using namespace pie_cuda_driver::pipeline;
@@ -279,6 +282,37 @@ void run_via_runtime(const std::string& dir) {
     // Steady state: empty bytes MUST hit the cache + return the SAME Trace.
     const Trace* t2 = cache.get_or_decode(fhash, nullptr, 0, nullptr, 0, &err);
     expect(t2 == t, "runtime: steady-state cache hit (same Trace, empty bytes)");
+    const Trace* t3 = cache.get_or_decode(
+        fhash, cb.data(), cb.size(), sb.data(), sb.size(), &err);
+    expect(t3 == t, "runtime: repeated canonical payload matches cache");
+    auto colliding_container = cb;
+    colliding_container.back() ^= 0x1u;
+    expect(
+        cache.get_or_decode(
+            fhash,
+            colliding_container.data(),
+            colliding_container.size(),
+            sb.data(),
+            sb.size(),
+            &err) == nullptr &&
+            err.find("payload mismatch") != std::string::npos,
+        "runtime: same hash with different container bytes is rejected");
+    auto colliding_sidecar = sb;
+    colliding_sidecar.back() ^= 0x1u;
+    expect(
+        cache.get_or_decode(
+            fhash,
+            cb.data(),
+            cb.size(),
+            colliding_sidecar.data(),
+            colliding_sidecar.size(),
+            &err) == nullptr &&
+            err.find("payload mismatch") != std::string::npos,
+        "runtime: same hash with different sidecar bytes is rejected");
+    expect(
+        cache.get_or_decode(
+            fhash, cb.data(), cb.size(), nullptr, 0, &err) == nullptr,
+        "runtime: partial payload on a hash hit is rejected");
     // An uncached hash with empty bytes must FAIL loudly, never decode garbage.
     const Trace* miss = cache.get_or_decode(fhash ^ 0x1ull, nullptr, 0, nullptr, 0, &err);
     expect(miss == nullptr, "runtime: uncached hash + empty bytes → loud miss");
@@ -306,6 +340,176 @@ void run_via_runtime(const std::string& dir) {
     step({0, 1, 9, 2, 0, 0, 0, 3}, 2);   // golden step 0
     step({7, 1, 0, 2, 0, 0, 0, 3}, 0);   // golden step 1
     cudaFree(d_logits);
+}
+
+void run_nucleus_generic_fallback(const std::string& dir) {
+    std::printf("[program_runtime generic nucleus fallback]\n");
+    std::string container_hex;
+    std::string sidecar_hex;
+    std::uint64_t hash = 0;
+    if (!load_golden(
+            dir + "/nucleus_sample.txt",
+            container_hex,
+            sidecar_hex,
+            hash)) {
+        expect(false, "nucleus runtime: load");
+        return;
+    }
+    const auto container_bytes = hex_to_bytes(container_hex);
+    const auto sidecar_bytes = hex_to_bytes(sidecar_hex);
+    PtirProgramCache cache;
+    std::string error;
+    const Trace* trace = cache.get_or_decode(
+        hash,
+        container_bytes.data(),
+        container_bytes.size(),
+        sidecar_bytes.data(),
+        sidecar_bytes.size(),
+        &error);
+    expect(trace != nullptr, "nucleus runtime: decode (" + error + ")");
+    if (trace == nullptr) return;
+    const auto run = [&](const Trace& executable,
+                         const std::vector<float>& logits,
+                         float top_p,
+                         std::uint32_t counter,
+                         std::int32_t expected) {
+        const std::uint32_t state[2] = {1234, counter};
+        auto bytes = [](const void* data, std::size_t size) {
+            const auto* first = static_cast<const std::uint8_t*>(data);
+            return std::vector<std::uint8_t>(first, first + size);
+        };
+        DeviceChannelRegistry registry;
+        const auto ids = register_trace_endpoints(registry, executable);
+        std::vector<ChannelValue> seeds{
+            {ids[0], bytes(state, sizeof(state))},
+            {ids[1], bytes(&top_p, sizeof(top_p))},
+        };
+        std::string bind_error;
+        PtirInstance instance(
+            executable, &registry, ids, seeds, &bind_error);
+        float* device_logits = nullptr;
+        cudaMalloc(
+            &device_logits, logits.size() * sizeof(float));
+        cudaMemcpy(
+            device_logits,
+            logits.data(),
+            logits.size() * sizeof(float),
+            cudaMemcpyHostToDevice);
+        FireInputs inputs;
+        inputs.logits = device_logits;
+        inputs.vocab = static_cast<std::uint32_t>(logits.size());
+        const PassResult result = instance.fire(inputs);
+        const auto outputs = instance.harvest_outputs();
+        const bool shape =
+            outputs.size() == 1 &&
+            outputs[0].first == ids[2] &&
+            outputs[0].second.size() == sizeof(std::int32_t);
+        const std::int32_t token = shape
+            ? *reinterpret_cast<const std::int32_t*>(
+                  outputs[0].second.data())
+            : -1;
+        expect(
+            result.ok && result.committed && shape && token == expected,
+            "generic nucleus exact token " + std::to_string(expected) +
+                " (got " + std::to_string(token) + ")");
+        cudaFree(device_logits);
+    };
+    run(
+        *trace,
+        {4.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.0f, -1.0f, NAN},
+        0.5f,
+        0,
+        0);
+    run(
+        *trace,
+        {NAN, 1.0f, 1.0f, -INFINITY, -INFINITY, -INFINITY, -INFINITY,
+         -INFINITY},
+        1.0f,
+        1,
+        1);
+    run(
+        *trace,
+        {0.0f, 0.0f, -INFINITY, -INFINITY, -INFINITY, -INFINITY,
+         -INFINITY, -INFINITY},
+        0.5f,
+        2,
+        0);
+}
+
+void region_plan_library_abi_validation(const std::string& dir) {
+    std::string container_hex;
+    std::string sidecar_hex;
+    std::uint64_t hash = 0;
+    if (!load_golden(
+            dir + "/nucleus_sample.txt",
+            container_hex,
+            sidecar_hex,
+            hash)) {
+        expect(false, "region plan: load nucleus golden");
+        return;
+    }
+    const auto sidecar_bytes = hex_to_bytes(sidecar_hex);
+    pie_native::ptir::bound::Bound bound;
+    std::string error;
+    if (!pie_native::ptir::bound::parse_sidecar(
+            sidecar_bytes.data(),
+            sidecar_bytes.size(),
+            bound,
+            &error) ||
+        bound.plans.empty()) {
+        expect(false, "region plan: parse sidecar");
+        return;
+    }
+    const auto& encoded = bound.plans.front().bytes;
+    pie_native::ptir::plan::StagePlan decoded;
+    if (!pie_native::ptir::plan::decode(
+            encoded.data(), encoded.size(), decoded, &error)) {
+        expect(false, "region plan: decode plan");
+        return;
+    }
+    const auto region = std::find_if(
+        decoded.fused.regions.begin(), decoded.fused.regions.end(),
+        [&](const auto& candidate) {
+            return candidate.library &&
+                candidate.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE;
+        });
+    expect(
+        encoded.size() >= 8 &&
+            encoded[4] == PTIR_REGION_PLAN_VERSION &&
+            encoded[6] == PTIR_COMPILER_VERSION &&
+            region != decoded.fused.regions.end() &&
+            region->nodes ==
+                std::vector<std::uint32_t>(
+                    {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}) &&
+            region->inputs == std::vector<std::uint32_t>({0, 2, 1}) &&
+            region->outputs == std::vector<std::uint32_t>({15}) &&
+            region->sinks.empty(),
+        "PTRP v4/compiler v3 carries the role-ordered generic nucleus ABI");
+    if (region == decoded.fused.regions.end()) return;
+    auto malformed_inputs = decoded;
+    auto malformed_region = std::find_if(
+        malformed_inputs.fused.regions.begin(),
+        malformed_inputs.fused.regions.end(),
+        [](const auto& candidate) {
+            return candidate.library &&
+                candidate.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE;
+        });
+    malformed_region->inputs.pop_back();
+    expect(
+        !validate_plan_structure(malformed_inputs, &error),
+        "region validator rejects a missing role-ordered input");
+    auto malformed_nodes = decoded;
+    auto nodes_region = std::find_if(
+        malformed_nodes.fused.regions.begin(),
+        malformed_nodes.fused.regions.end(),
+        [](const auto& candidate) {
+            return candidate.library &&
+                candidate.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE;
+        });
+    nodes_region->nodes.pop_back();
+    expect(
+        !validate_plan_structure(malformed_nodes, &error),
+        "region validator rejects a non-13-node nucleus region");
 }
 
 // ── program_runtime STATEFUL: counter_pingpong through PtirInstance proves the
@@ -355,6 +559,17 @@ void run_mtp_verify_tail(const std::string& dir) {
     std::printf("[mtp_verify_tail]\n");
     Trace t; if (!build_trace(dir, "mtp_verify_tail", t)) return;
     const std::uint32_t V = 8, NROWS = 4;  // K=3 drafts + 1 bonus verify position
+    const auto mtp_value = std::find_if(
+        t.values.begin(), t.values.end(), [](const Value& value) {
+            return value.source == ValueSource::Intrinsic &&
+                value.intrinsic == Intrinsic::MtpLogits;
+        });
+    expect(
+        mtp_value != t.values.end() &&
+            mtp_value->type.shape.rank() == 2 &&
+            mtp_value->type.shape.dims[0] == 3 &&
+            mtp_value->type.shape.dims[1] == V,
+        "fresh MtpLogits golden keeps static [K,V] shape");
     Tier0Runner runner(t);
     // seed chan0 = draft tokens [3,5,6] (I32) to verify.
     std::int32_t drafts[3] = {3, 5, 6};
@@ -375,6 +590,18 @@ void run_mtp_verify_tail(const std::string& dir) {
     std::vector<std::uint8_t> mask = {
         1,1,1,1,1,1,1,1,  1,1,1,1,1,1,1,1,  0,0,1,0,0,0,0,0,  1,1,1,1,1,1,1,1,
     };
+    Tier0Runner missing_layout(t);
+    missing_layout.arena().seed_cell(0, drafts, sizeof(drafts));
+    missing_layout.arena().host_feed(1, mask.data(), mask.size());
+    FireInputs missing_inputs;
+    missing_inputs.logits = d_logits;
+    missing_inputs.vocab = V;
+    PassResult missing = missing_layout.run_pass(missing_inputs);
+    expect(
+        !missing.ok &&
+            missing.error.find("dedicated draft-row layout") !=
+                std::string::npos,
+        "MtpLogits rejects sampled-logit fallback without dedicated rows");
     runner.arena().host_feed(1, mask.data(), mask.size());
 
     PassResult r = runner.run_pass(in);
@@ -394,7 +621,89 @@ void run_mtp_verify_tail(const std::string& dir) {
     expect(mtp[0] == 1 && mtp[1] == 4 && mtp[2] == 0,
            "take chan3 mtp-argmax == [1,4,0] (got [" + std::to_string(mtp[0]) + "," +
                std::to_string(mtp[1]) + "," + std::to_string(mtp[2]) + "])");
+
+    std::vector<std::uint16_t> packed_bf16(packed.size());
+    for (std::size_t index = 0; index < packed.size(); ++index) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &packed[index], sizeof(bits));
+        packed_bf16[index] = static_cast<std::uint16_t>(bits >> 16);
+    }
+    std::uint16_t* d_bf16 = nullptr;
+    float* d_materialized = nullptr;
+    std::uint64_t* d_rows = nullptr;
+    cudaMalloc(&d_bf16, packed_bf16.size() * sizeof(std::uint16_t));
+    cudaMalloc(&d_materialized, packed.size() * sizeof(float));
+    cudaMalloc(&d_rows, 7 * sizeof(std::uint64_t));
+    cudaMemcpy(
+        d_bf16, packed_bf16.data(),
+        packed_bf16.size() * sizeof(std::uint16_t),
+        cudaMemcpyHostToDevice);
+    std::uint64_t row_pointers[7]{};
+    for (std::uint32_t row = 0; row < 7; ++row) {
+        row_pointers[row] = reinterpret_cast<std::uint64_t>(
+            d_bf16 + static_cast<std::size_t>(row) * V);
+    }
+    cudaMemcpy(
+        d_rows, row_pointers, sizeof(row_pointers), cudaMemcpyHostToDevice);
+    k_materialize_bf16_rows<<<1, kTier0Block>>>(
+        d_rows, d_materialized, 7, V);
+    Tier0Runner direct_bf16_runner(t);
+    direct_bf16_runner.arena().seed_cell(0, drafts, sizeof(drafts));
+    direct_bf16_runner.arena().host_feed(1, mask.data(), mask.size());
+    FireInputs direct_bf16_inputs;
+    direct_bf16_inputs.logits = d_materialized;
+    direct_bf16_inputs.vocab = V;
+    direct_bf16_inputs.mtp_draft_row = NROWS;
+    const PassResult direct_bf16_result =
+        direct_bf16_runner.run_pass(direct_bf16_inputs);
+    std::int32_t direct_mtp[3]{};
+    direct_bf16_runner.arena().host_take(
+        3, direct_mtp, sizeof(direct_mtp));
+    expect(
+        direct_bf16_result.ok && direct_bf16_result.committed &&
+            direct_mtp[0] == 1 && direct_mtp[1] == 4 &&
+            direct_mtp[2] == 0,
+        "production-style direct BF16 MtpLogits uses dedicated draft rows");
+    cudaFree(d_rows);
+    cudaFree(d_materialized);
+    cudaFree(d_bf16);
     cudaFree(d_logits);
+}
+
+void run_structured_masks(const std::string& dir) {
+    std::printf("[structured_masks]\n");
+    Trace trace;
+    if (!build_trace(dir, "structured_masks", trace)) return;
+    Tier0Runner runner(trace);
+    const std::uint32_t positions[2] = {3, 5};
+    const std::uint32_t ancestors[6] = {0, 1, 2, 1, 2, 3};
+    const std::uint32_t owners[4] = {0, 1, 2, 3};
+    runner.arena().seed_cell(0, positions, sizeof(positions));
+    runner.arena().seed_cell(1, ancestors, sizeof(ancestors));
+    runner.arena().seed_cell(2, owners, sizeof(owners));
+    const PassResult result = runner.run_pass(FireInputs{});
+    expect(
+        result.ok && result.committed,
+        "structured mask golden commits: " + result.error);
+    const std::vector<std::vector<std::uint8_t>> expected{
+        {1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1},
+        {0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1},
+        {1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1},
+        {1, 1, 1, 0, 0, 1, 1, 1},
+    };
+    for (std::uint32_t output = 0; output < expected.size(); ++output) {
+        std::vector<std::uint8_t> actual(expected[output].size());
+        runner.arena().host_take(
+            output + 3, actual.data(), actual.size());
+        std::string detail;
+        for (const auto value : actual) {
+            detail += value != 0 ? '1' : '0';
+        }
+        expect(
+            actual == expected[output],
+            "structured mask golden output " + std::to_string(output) +
+                " (got " + detail + ")");
+    }
 }
 
 // ── dfa_ingraph: capstone pentathlon technique — an IN-GRAPH grammar (DFA) walk.
@@ -491,13 +800,33 @@ int main(int argc, char** argv) {
     cudaDeviceProp p{}; cudaGetDeviceProperties(&p, 0);
     std::printf("PTIR cross-backend golden step-exec — device: %s (sm_%d%d), goldens: %s\n\n",
                 p.name, p.major, p.minor, dir.c_str());
+    pie_native::ptir::Intrinsic mapped_intrinsic{};
+    expect(
+        pie_native::ptir::bound::map_intrinsic(
+            PTIR_INTR_MTP_DRAFTS, mapped_intrinsic) &&
+            mapped_intrinsic == pie_native::ptir::Intrinsic::MtpDrafts,
+        "MtpDrafts never aliases ordinary Logits during trace translation");
+    expect(
+        pie_native::ptir::bound::map_intrinsic(
+            PTIR_INTR_LAYER, mapped_intrinsic) &&
+            mapped_intrinsic == pie_native::ptir::Intrinsic::Layer,
+        "Layer intrinsic maps through the bool/out-param contract");
+    mapped_intrinsic = pie_native::ptir::Intrinsic::Logits;
+    expect(
+        !pie_native::ptir::bound::map_intrinsic(
+            std::numeric_limits<std::uint16_t>::max(),
+            mapped_intrinsic),
+        "unknown intrinsic tags are rejected");
     run_counter(dir);
     run_greedy(dir);
     run_via_runtime(dir);
+    run_nucleus_generic_fallback(dir);
+    region_plan_library_abi_validation(dir);
     run_via_runtime_stateful(dir);
     run_section3(dir);
     run_beam(dir);
     run_mtp_verify_tail(dir);
+    run_structured_masks(dir);
     run_dfa_ingraph(dir);
     run_pivot_predicates(dir);
     std::printf("\n==== golden step-exec: %d passed, %d failed ====\n", g_pass, g_fail);

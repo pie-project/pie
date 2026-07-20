@@ -1,1 +1,0 @@
-"""Canonical Pie benchmark suite."""

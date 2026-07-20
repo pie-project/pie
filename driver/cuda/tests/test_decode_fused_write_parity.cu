@@ -82,7 +82,8 @@ struct Result {
 // position+1). Returns the produced q_out + the written K/V at each slot.
 Result run_fused(const std::vector<Req>& reqs, int first, int R,
                  const std::vector<std::uint16_t>& qw,
-                 const std::vector<std::uint16_t>& kw) {
+                 const std::vector<std::uint16_t>& kw,
+                 bool explicit_write = false) {
     std::vector<std::uint32_t> kv_page_indptr_h(R + 1);
     std::vector<std::uint32_t> kv_last_page_lens_h(R);
     std::vector<std::uint32_t> kv_page_indices_h(R);
@@ -103,6 +104,8 @@ Result run_fused(const std::vector<Req>& reqs, int first, int R,
     void *d_packed=nullptr,*d_qout=nullptr,*d_k=nullptr,*d_v=nullptr,*d_qw=nullptr,*d_kw=nullptr;
     std::int32_t* d_pos=nullptr;
     std::uint32_t *d_kpi=nullptr,*d_kpp=nullptr,*d_klpl=nullptr;
+    std::uint32_t *d_w_page=nullptr,*d_w_off=nullptr;
+    std::uint8_t* d_valid=nullptr;
     const std::size_t kv_bytes = static_cast<std::size_t>(R) * PAGE_STRIDE * 2;
     RT(cudaMalloc(&d_packed, packed.size()*2));
     RT(cudaMalloc(&d_qout, static_cast<std::size_t>(R)*Q_DIM*2));
@@ -123,10 +126,32 @@ Result run_fused(const std::vector<Req>& reqs, int first, int R,
     RT(cudaMemcpy(d_kpi, kv_page_indices_h.data(), R*4, cudaMemcpyHostToDevice));
     RT(cudaMemcpy(d_kpp, kv_page_indptr_h.data(), (R+1)*4, cudaMemcpyHostToDevice));
     RT(cudaMemcpy(d_klpl, kv_last_page_lens_h.data(), R*4, cudaMemcpyHostToDevice));
+    if (explicit_write) {
+        std::vector<std::uint32_t> w_page(R), w_off(R);
+        std::vector<std::uint8_t> valid(R, 1);
+        for (int i = 0; i < R; ++i) {
+            w_page[i] = static_cast<std::uint32_t>(i);
+            w_off[i] = static_cast<std::uint32_t>(
+                reqs[first + i].position);
+        }
+        RT(cudaMalloc(&d_w_page, R * sizeof(std::uint32_t)));
+        RT(cudaMalloc(&d_w_off, R * sizeof(std::uint32_t)));
+        RT(cudaMalloc(&d_valid, R));
+        RT(cudaMemcpy(
+            d_w_page, w_page.data(), R * sizeof(std::uint32_t),
+            cudaMemcpyHostToDevice));
+        RT(cudaMemcpy(
+            d_w_off, w_off.data(), R * sizeof(std::uint32_t),
+            cudaMemcpyHostToDevice));
+        RT(cudaMemcpy(
+            d_valid, valid.data(), R, cudaMemcpyHostToDevice));
+    }
 
     k::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
         d_packed, d_qout, d_k, d_v, d_qw, d_kw, d_pos, /*rope_table=*/nullptr,
-        d_kpi, d_kpp, d_klpl, R, HQ, HKV, D, PAGE, /*hnd_layout=*/false,
+        d_kpi, d_kpp, d_klpl,
+        d_w_page, d_w_off, d_valid,
+        R, HQ, HKV, D, PAGE, /*hnd_layout=*/false,
         /*theta=*/1.0e6f, /*eps=*/1.0e-6f, /*stream=*/nullptr);
     RT(cudaDeviceSynchronize());
 
@@ -156,6 +181,7 @@ Result run_fused(const std::vector<Req>& reqs, int first, int R,
     cudaFree(d_packed); cudaFree(d_qout); cudaFree(d_k); cudaFree(d_v);
     cudaFree(d_qw); cudaFree(d_kw); cudaFree(d_pos);
     cudaFree(d_kpi); cudaFree(d_kpp); cudaFree(d_klpl);
+    cudaFree(d_w_page); cudaFree(d_w_off); cudaFree(d_valid);
     return res;
 }
 
@@ -182,10 +208,26 @@ int main() {
     for (int r = 0; r < R; ++r) reqs.push_back(make_req(rng, positions[r]));
 
     const Result batched = run_fused(reqs, 0, R, qw, kw);
+    const Result explicit_batched =
+        run_fused(reqs, 0, R, qw, kw, true);
 
     const std::size_t qrow = Q_DIM, kvrow = KV_DIM;
     const float tol = 3e-3f;
     bool all_ok = true;
+    const bool explicit_ok =
+        maxdiff(
+            batched.q_out.data(), explicit_batched.q_out.data(),
+            batched.q_out.size()) <= tol &&
+        maxdiff(
+            batched.k_slot.data(), explicit_batched.k_slot.data(),
+            batched.k_slot.size()) <= tol &&
+        maxdiff(
+            batched.v_slot.data(), explicit_batched.v_slot.data(),
+            batched.v_slot.size()) <= tol;
+    all_ok = all_ok && explicit_ok;
+    std::printf(
+        "[%s] explicit WSlot/WOff matches page-derived fused write\n",
+        explicit_ok ? " ok " : "FAIL");
     for (int r = 0; r < R; ++r) {
         const Result alone = run_fused(reqs, r, 1, qw, kw);
         const float dq = maxdiff(batched.q_out.data() + static_cast<std::size_t>(r)*qrow,

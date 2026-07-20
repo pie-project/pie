@@ -221,13 +221,24 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
                 if let Some(orch) = pie_engine::store::reclaim::contention() {
                     let s = orch.stats();
                     use std::sync::atomic::Ordering::Relaxed;
+                    let diagnostics = orch.diagnostics();
                     eprintln!(
-                        "[contention-trace] t={}ms parked={} woken={} suspends={} restores={}",
+                        "[contention-trace] t={}ms parked={} woken={} suspends={} restores={} \
+                         restore_prepared={} h2d_submitted={} h2d_us={} \
+                         free={}/{} reserved={} waiters={:?} suspended={:?}",
                         t0.elapsed().as_millis(),
                         s.waiters_parked.load(Relaxed),
                         s.waiters_woken.load(Relaxed),
                         s.suspends.load(Relaxed),
                         s.restores.load(Relaxed),
+                        diagnostics.restore_prepared_total,
+                        diagnostics.h2d_submitted_total,
+                        diagnostics.h2d_copy_us_total,
+                        diagnostics.device_pages_free,
+                        diagnostics.device_pages_total,
+                        diagnostics.device_pages_reserved,
+                        diagnostics.waiters,
+                        diagnostics.suspended,
                     );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;

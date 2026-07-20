@@ -20,9 +20,10 @@ interface model {
     // per-token and reversibly discardable. TRUE iff the model has recurrent
     // state (equivalently `rs-state-size() > 0`). The runtime uses this to pick
     // the speculative-commit strategy — FOLD-COMMIT (fold only the accepted
-    // prefix via `forward-pass.rs-fold-buffered`; hold the uncertain tail in the
-    // RS buffer) for linear models vs KV-SLOT DISCARD for attention — so the
-    // inferlet's spec-decode loop can stay model-agnostic. Prefer this over
+    // prefix, holding the uncertain tail in the RS buffer; folding is
+    // runtime-managed in-forward) for linear models vs KV-SLOT DISCARD for
+    // attention — so the inferlet's spec-decode loop can stay model-agnostic.
+    // Prefer this over
     // reading `rs-state-size()` as a class flag: this pins the commit CONTRACT
     // (irreversible fold ⇒ fold-commit), not a byte-accounting accident.
     is-linear: func() -> bool;

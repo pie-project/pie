@@ -95,12 +95,9 @@ KimiWeights bind_kimi(const LoadedModel& engine) {
         throw std::runtime_error("kimi: embed row count does not match vocab or TP shard");
     }
     if (w.lm_head->shape()[0] == cfg.vocab_size) {
-        w.lm_head_tp_vocab_offset = 0;
         w.lm_head_tp_sharded = false;
     } else if (engine.distributed().tp_size > 1 &&
                w.lm_head->shape()[0] * engine.distributed().tp_size == cfg.vocab_size) {
-        w.lm_head_tp_vocab_offset =
-            static_cast<int>(w.lm_head->shape()[0] * engine.distributed().tp_rank);
         w.lm_head_tp_sharded = true;
     } else {
         throw std::runtime_error("kimi: lm_head row count does not match vocab or TP shard");

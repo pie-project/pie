@@ -10,13 +10,14 @@ use anyhow::{Result, anyhow, bail, ensure};
 use pie_driver_abi::{
     DeviceFacts, DriverCapabilities, ModelLoadDesc, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL,
     PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
-    PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_RETRY, PIE_TERMINAL_OUTCOME_SUCCESS,
-    PieBytes, PieChannelDesc, PieChannelEndpointBinding, PieChannelValueDescSlice, PieCompletion,
+    PIE_GEOMETRY_CLASS_DECODE_ENVELOPE, PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY, PIE_GEOMETRY_CLASS_HOST, PIE_TERMINAL_OUTCOME_FAILED,
+    PIE_TERMINAL_OUTCOME_RETRY, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieChannelDesc,
+    PieChannelEndpointBinding, PieChannelValueDescSlice, PieCompletion, PieEncodeDesc,
     PieInstanceBinding, PieInstanceDesc, PieKvCopyDesc, PieLaunchDesc, PiePoolResizeDesc,
     PieProgramDesc, PieRuntimeCallbacks, PieStateCopyDesc, PieTerminalCell,
     PieTerminalCellPtrSlice, PieU32Slice, PieU64Slice, validate_channel_desc, validate_completion,
-    validate_instance_desc, validate_kv_copy_desc, validate_launch_desc, validate_pool_resize_desc,
-    validate_program_desc, validate_state_copy_desc,
+    validate_encode_desc, validate_instance_desc, validate_kv_copy_desc, validate_launch_desc,
+    validate_pool_resize_desc, validate_program_desc, validate_state_copy_desc,
 };
 use pie_ptir::container::{self, ExternDir, HostRole};
 use pie_ptir::interp::{
@@ -27,6 +28,10 @@ use pie_ptir::registry::{KernelInfo, ModelProfile};
 use pie_ptir::types::{DType, ValueType};
 use pie_ptir::validate::BoundTrace;
 
+pub mod kv_export;
+
+use kv_export::DummyKvExport;
+
 /// One accepted `launch`'s forward geometry, copied out of the descriptor into
 /// owned vectors (safe to hold past the call) for test probes.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +41,8 @@ pub struct LaunchObservation {
     pub kv_page_indices: Vec<u32>,
     pub kv_page_indptr: Vec<u32>,
     pub kv_last_page_lens: Vec<u32>,
+    pub kv_translation: Vec<u32>,
+    pub kv_translation_indptr: Vec<u32>,
 }
 
 /// Synchronous observer invoked on the launch path for every accepted launch
@@ -63,6 +70,9 @@ pub struct DummyDriverOptions {
     pub max_forward_tokens: u32,
     pub max_forward_requests: u32,
     pub max_page_refs: u32,
+    pub has_mtp_logits: bool,
+    pub has_mtp_drafts: bool,
+    pub has_value_head: bool,
     pub callback_delay_ms: u64,
     pub reject_launches: bool,
     pub reject_launches_remaining: u32,
@@ -86,6 +96,9 @@ impl Default for DummyDriverOptions {
             max_forward_tokens: 4096,
             max_forward_requests: 256,
             max_page_refs: 65_536,
+            has_mtp_logits: true,
+            has_mtp_drafts: true,
+            has_value_head: true,
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,
@@ -226,6 +239,7 @@ pub struct DummyDriver {
     callback_workers: Vec<std::thread::JoinHandle<()>>,
     operation_log: Option<Arc<Mutex<Vec<String>>>>,
     launch_observer: Option<LaunchObserver>,
+    kv_export: DummyKvExport,
 }
 
 impl DummyDriver {
@@ -238,6 +252,7 @@ impl DummyDriver {
     }
 
     pub fn with_runtime(options: DummyDriverOptions, runtime: PieRuntimeCallbacks) -> Self {
+        let kv_export = DummyKvExport::new(options.total_pages, options.kv_page_size);
         let state = Arc::new(Mutex::new(DummyState::default()));
         let operation_log = options.operation_log.clone();
         let runtime = SendableRuntimeCallbacks {
@@ -273,6 +288,11 @@ impl DummyDriver {
                 rs_cache_required: false,
                 rs_cache_slots: 0,
                 rs_cache_slot_bytes: 0,
+                has_mtp_logits: options.has_mtp_logits,
+                has_mtp_drafts: options.has_mtp_drafts,
+                has_value_head: options.has_value_head,
+                device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
+                    | pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
                 max_forward_tokens: options.max_forward_tokens,
                 max_forward_requests: options.max_forward_requests,
                 max_page_refs: options.max_page_refs,
@@ -280,7 +300,10 @@ impl DummyDriver {
                 vocab_size: options.vocab_size,
                 max_model_len: options.max_model_len,
                 activation_dtype: options.activation_dtype,
+                hidden_size: 1,
+                supports_media_encode: true,
                 snapshot_dir: options.snapshot_dir,
+                kv_handle: None,
             },
             load_storage: None,
             state,
@@ -295,7 +318,12 @@ impl DummyDriver {
             callback_workers: Vec::new(),
             operation_log,
             launch_observer: options.launch_observer,
+            kv_export,
         }
+    }
+
+    pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
+        pie_driver_abi::KvExport::export_kv_handle(&self.kv_export)
     }
 
     fn record_op(&self, name: &str) {
@@ -382,6 +410,8 @@ impl DummyDriver {
         )
         .map_err(|err| anyhow!("dummy LoadPlan execution failed: {err}"))?;
         self.capabilities.snapshot_dir = desc.snapshot_dir.display().to_string();
+        self.capabilities.supports_media_encode =
+            desc.component != pie_driver_abi::ModelComponent::Text;
         self.load_storage = Some(storage);
         Ok(self.capabilities.clone())
     }
@@ -462,9 +492,15 @@ impl DummyDriver {
             seed_credit: desc.seeded != 0
                 && desc.host_role == pie_driver_abi::PIE_CHANNEL_HOST_ROLE_WRITER,
             attachments: HashMap::new(),
-            shared: if desc.extern_dir == PIE_CHANNEL_EXTERN_NONE {
-                None
-            } else {
+            // A ring exists for every channel that can legally be shared
+            // across instances: extern-declared channels AND chainable
+            // device-only private channels (R4-4 cross-pass chaining — no
+            // host role, unseeded). Single-attachment channels keep their
+            // instance-local interpreter ring.
+            shared: if desc.extern_dir != PIE_CHANNEL_EXTERN_NONE
+                || (desc.host_role == pie_driver_abi::PIE_CHANNEL_HOST_ROLE_NONE
+                    && desc.seeded == 0)
+            {
                 let dtype = channel_program_dtype(desc.dtype)?;
                 let shape = pie_ptir::types::Shape::new(&shape)
                     .ok_or_else(|| anyhow!("channel shape rank is unsupported"))?;
@@ -472,6 +508,8 @@ impl DummyDriver {
                     ValueType::new(shape, dtype),
                     desc.capacity,
                 ))
+            } else {
+                None
             },
         };
         let binding = endpoint_binding(&endpoint);
@@ -494,6 +532,16 @@ impl DummyDriver {
         ensure!(
             desc.pacing_wait_id != 0,
             "bind requires a nonzero pacing wait id"
+        );
+        ensure!(
+            matches!(
+                desc.geometry_class,
+                PIE_GEOMETRY_CLASS_HOST
+                    | PIE_GEOMETRY_CLASS_DECODE_ENVELOPE
+                    | PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY
+            ),
+            "dummy driver does not support geometry class {}",
+            desc.geometry_class
         );
         let channel_ids = copy_u64_slice(desc.channel_ids, "instance.channel_ids")?;
         ensure!(
@@ -529,6 +577,7 @@ impl DummyDriver {
             .collect::<Result<Vec<_>>>()?;
 
         let mut externs = Vec::new();
+        let mut shared_rings = Vec::new();
         for (dense, (decl, endpoint)) in program
             .bound
             .container
@@ -553,6 +602,12 @@ impl DummyDriver {
                         .clone()
                         .ok_or_else(|| anyhow!("extern channel has no shared ring"))?,
                 ));
+            } else if let Some(ring) = endpoint.shared.clone() {
+                // Chainable device-only private channel: every instance
+                // binding this endpoint operates on the one registered ring
+                // (R4-4 cross-pass chaining — the producer pass's put is
+                // visible to the consumer pass's take).
+                shared_rings.push((dense as u32, ring));
             }
         }
 
@@ -582,8 +637,9 @@ impl DummyDriver {
                 Ok((dense as u32, value))
             })
             .collect::<Result<Vec<_>>>()?;
-        let interp = InterpInstance::new_with_externs(&program.bound, &seeds, &externs)
-            .map_err(|err| anyhow!("instance bind failed: {err:?}"))?;
+        let interp =
+            InterpInstance::new_with_shared_rings(&program.bound, &seeds, &externs, &shared_rings)
+                .map_err(|err| anyhow!("instance bind failed: {err:?}"))?;
         let channels = program
             .bound
             .container
@@ -644,6 +700,7 @@ impl DummyDriver {
         }
         let binding = PieInstanceBinding {
             instance_id,
+            geometry_class: desc.geometry_class,
             ..PieInstanceBinding::default()
         };
         state.instances.insert(instance_id, instance);
@@ -655,11 +712,25 @@ impl DummyDriver {
         ensure_abi(desc.abi_version)?;
         self.record_op("launch");
         // Shape trace for tests that assert on launch geometry (e.g. the
-        // prefix-cache trim). Extra entry — existing "launch" filters keep
+        // prefix-cache trim). `per` carries PER-PROGRAM token counts: the
+        // wait-all quorum co-batches concurrently running pipelines into one
+        // launch, so a shape oracle must match its own program's span, never
+        // the batch total. Extra entry — existing "launch" filters keep
         // matching.
+        let per_program: Vec<u32> = {
+            let rows = copy_u32_slice(desc.ptir_program_row_indptr, "launch.program_row_indptr")?;
+            let qo = copy_u32_slice(desc.qo_indptr, "launch.qo_indptr")?;
+            if rows.len() >= 2 && rows.iter().all(|&row| (row as usize) < qo.len()) {
+                rows.windows(2)
+                    .map(|span| qo[span[1] as usize] - qo[span[0] as usize])
+                    .collect()
+            } else {
+                vec![desc.token_ids.len as u32]
+            }
+        };
         self.record_op(&format!(
-            "launch-shape tokens={} programs={}",
-            desc.token_ids.len, desc.instance_ids.len
+            "launch-shape tokens={} programs={} per={:?}",
+            desc.token_ids.len, desc.instance_ids.len, per_program
         ));
         let instance_ids = copy_u64_slice(desc.instance_ids, "launch.instance_ids")?;
         let terminal_cells = copy_terminal_cell_ptrs(desc.terminal_cells)?;
@@ -695,6 +766,11 @@ impl DummyDriver {
                 kv_last_page_lens: copy_u32_slice(
                     desc.kv_last_page_lens,
                     "launch.kv_last_page_lens",
+                )?,
+                kv_translation: copy_u32_slice(desc.kv_translation, "launch.kv_translation")?,
+                kv_translation_indptr: copy_u32_slice(
+                    desc.kv_translation_indptr,
+                    "launch.kv_translation_indptr",
                 )?,
             };
             (observer.0)(&observation);
@@ -791,6 +867,69 @@ impl DummyDriver {
         self.complete_noop(completion)
     }
 
+    pub fn encode(&mut self, desc: &PieEncodeDesc, completion: PieCompletion) -> Result<()> {
+        unsafe { validate_encode_desc(desc) }.map_err(|err| anyhow!(err))?;
+        ensure_abi(desc.abi_version)?;
+        self.record_op("encode");
+        ensure_completion_mode(completion, true)?;
+
+        let images = desc.image_anchor_rows.len;
+        let clips = desc.audio_anchor_rows.len;
+        let media = images + clips;
+        let row_bytes = self.capabilities.hidden_size as usize * std::mem::size_of::<u16>();
+        ensure!(
+            desc.output_rows.len >= media.saturating_mul(row_bytes),
+            "encode output buffer is too small"
+        );
+        let pixel_indptr = if images == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(desc.image_pixel_indptr.ptr, images + 1) }
+        };
+        let audio_indptr = if clips == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(desc.audio_feature_indptr.ptr, clips + 1) }
+        };
+        let output =
+            unsafe { std::slice::from_raw_parts_mut(desc.output_rows.ptr, desc.output_rows.len) };
+        let output_indptr =
+            unsafe { std::slice::from_raw_parts_mut(desc.output_row_indptr.ptr, media + 1) };
+        output_indptr[0] = 0;
+        for image in 0..images {
+            let begin = pixel_indptr[image] as usize;
+            let end = pixel_indptr[image + 1] as usize;
+            let mut hash = 0x9e37_u16;
+            for byte in
+                unsafe { std::slice::from_raw_parts(desc.image_pixels.ptr.add(begin), end - begin) }
+            {
+                hash = hash.rotate_left(5) ^ u16::from(*byte);
+            }
+            for value in output[image * row_bytes..(image + 1) * row_bytes].chunks_exact_mut(2) {
+                value.copy_from_slice(&hash.to_le_bytes());
+            }
+            output_indptr[image + 1] = (image + 1) as u32;
+        }
+        for clip in 0..clips {
+            let begin = audio_indptr[clip] as usize;
+            let end = audio_indptr[clip + 1] as usize;
+            let mut hash = 0x7f4a_u16;
+            for byte in unsafe {
+                std::slice::from_raw_parts(desc.audio_features.ptr.add(begin), end - begin)
+            } {
+                hash = hash.rotate_left(5) ^ u16::from(*byte);
+            }
+            let media_index = images + clip;
+            for value in
+                output[media_index * row_bytes..(media_index + 1) * row_bytes].chunks_exact_mut(2)
+            {
+                value.copy_from_slice(&hash.to_le_bytes());
+            }
+            output_indptr[media_index + 1] = (media_index + 1) as u32;
+        }
+        self.complete_noop(completion)
+    }
+
     pub fn copy_state(&mut self, desc: &PieStateCopyDesc, completion: PieCompletion) -> Result<()> {
         validate_state_copy_desc(desc).map_err(|err| anyhow!(err))?;
         ensure_abi(desc.abi_version)?;
@@ -879,9 +1018,9 @@ impl DummyDriver {
             page_size: self.capabilities.kv_page_size,
             num_layers: 2,
             activation: DType::F32,
-            has_mtp_logits: true,
-            has_mtp_drafts: true,
-            has_value_head: true,
+            has_mtp_logits: self.capabilities.has_mtp_logits,
+            has_mtp_drafts: self.capabilities.has_mtp_drafts,
+            has_value_head: self.capabilities.has_value_head,
             kernels: vec![KernelInfo {
                 name: "boom".to_string(),
                 sink_scope: None,
@@ -1365,8 +1504,17 @@ fn ensure_endpoint_matches_program(
         .find(|binding| binding.chan == dense as u32);
     match extern_decl {
         None => {
+            // Same-guest cross-pass chaining (R4-4): a DEVICE-ONLY private
+            // channel (no host role, unseeded) may attach to multiple
+            // instances — the shared ring is ordered by the pipeline FIFO
+            // (prefill→decode `tok_in` handoff). Host-visible or seeded
+            // channels keep the one-attachment rule.
+            let device_only = endpoint.host_role
+                == pie_ptir::container::HostRole::None as u8
+                && !endpoint.seeded;
             ensure!(
-                endpoint.extern_name.is_none() && endpoint.attachments.is_empty(),
+                endpoint.extern_name.is_none()
+                    && (endpoint.attachments.is_empty() || device_only),
                 "private channel {} is already attached",
                 endpoint.channel_id
             );
@@ -1585,8 +1733,8 @@ fn ensure_terminal_cell_pending(cell: *mut PieTerminalCell) -> Result<()> {
     Ok(())
 }
 
-fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<()> {
-    let _token_ids = copy_u32_slice(desc.token_ids, "launch.token_ids")?;
+fn validate_launch_shape(desc: &PieLaunchDesc, _instance_count: usize) -> Result<()> {
+    let token_ids = copy_u32_slice(desc.token_ids, "launch.token_ids")?;
     let kv_page_indices = copy_u32_slice(desc.kv_page_indices, "launch.kv_page_indices")?;
     let kv_page_indptr = copy_u32_slice(desc.kv_page_indptr, "launch.kv_page_indptr")?;
     let kv_last_page_lens = copy_u32_slice(desc.kv_last_page_lens, "launch.kv_last_page_lens")?;
@@ -1611,26 +1759,24 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
     let mask_request = copy_u32_slice(desc.masks.request_indptr, "launch.masks.request_indptr")?;
     let mask_word = copy_u32_slice(desc.masks.word_indptr, "launch.masks.word_indptr")?;
     let mask_words = copy_u32_slice(desc.masks.words, "launch.masks.words")?;
+    let row_count = qo_indptr.len().saturating_sub(1);
 
     if !kv_page_indptr.is_empty() || !kv_page_indices.is_empty() {
         validate_indptr(
             &kv_page_indptr,
             kv_page_indices.len(),
-            instance_count,
+            row_count,
             "launch.kv_page_indptr",
         )?;
     }
     if !kv_last_page_lens.is_empty() {
         ensure!(
-            kv_last_page_lens.len() == instance_count,
-            "launch.kv_last_page_lens must have one entry per instance"
+            kv_last_page_lens.len() == row_count,
+            "launch.kv_last_page_lens must have one entry per resolved row"
         );
     }
     if !qo_indptr.is_empty() {
-        ensure!(
-            qo_indptr.len() == instance_count + 1,
-            "launch.qo_indptr length mismatch"
-        );
+        validate_indptr(&qo_indptr, token_ids.len(), row_count, "launch.qo_indptr")?;
         ensure!(
             qo_indptr.windows(2).all(|w| w[0] <= w[1]),
             "launch.qo_indptr must be monotonic"
@@ -1640,29 +1786,39 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
         validate_indptr(
             &sampling_indptr,
             sampling_indices.len(),
-            instance_count,
+            row_count,
             "launch.sampling_indptr",
         )?;
     }
-    if !rs_slot_ids.is_empty() || !rs_slot_flags.is_empty() || !rs_fold_lens.is_empty() {
+    if !rs_slot_ids.is_empty() || !rs_slot_flags.is_empty() {
         ensure!(
-            rs_slot_ids.len() == instance_count
-                && rs_slot_flags.len() == instance_count
-                && rs_fold_lens.len() == instance_count,
-            "launch rs slot vectors must be parallel to instance_ids"
+            rs_slot_ids.len() == rs_slot_flags.len(),
+            "launch rs slot id/flag vectors must be parallel"
+        );
+        if !qo_indptr.is_empty() {
+            ensure!(
+                rs_slot_ids.len() == row_count,
+                "launch rs slot vectors must match resolved qo rows"
+            );
+        }
+    }
+    if !rs_fold_lens.is_empty() {
+        ensure!(
+            rs_fold_lens.len() == rs_slot_ids.len(),
+            "launch rs fold lengths must match rs slot vectors"
         );
     }
     if !rs_buffer_slot_indptr.is_empty() || !rs_buffer_slot_ids.is_empty() {
         validate_indptr(
             &rs_buffer_slot_indptr,
             rs_buffer_slot_ids.len(),
-            instance_count,
+            row_count,
             "launch.rs_buffer_slot_indptr",
         )?;
     }
     if !mask_request.is_empty() {
         ensure!(
-            mask_request.len() == instance_count + 1,
+            mask_request.len() == row_count + 1,
             "launch.masks.request_indptr length mismatch"
         );
         ensure!(
@@ -1677,7 +1833,7 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
     }
     if !image_indptr.is_empty() {
         ensure!(
-            image_indptr.len() == instance_count + 1,
+            image_indptr.len() == row_count + 1,
             "launch.image_indptr length mismatch"
         );
         ensure!(
@@ -1701,7 +1857,7 @@ fn validate_launch_shape(desc: &PieLaunchDesc, instance_count: usize) -> Result<
     }
     if !audio_indptr.is_empty() {
         ensure!(
-            audio_indptr.len() == instance_count + 1,
+            audio_indptr.len() == row_count + 1,
             "launch.audio_indptr length mismatch"
         );
         ensure!(
@@ -3339,6 +3495,54 @@ mod tests {
         assert!(
             callbacks.notifications().is_empty(),
             "sync validation must not notify"
+        );
+    }
+
+    #[test]
+    fn multi_row_rs_shape_uses_resolved_rows_not_instance_count() {
+        let tokens = [10u32, 11];
+        let qo_indptr = [0u32, 1, 2];
+        let rs_slot_ids = [7u32, 9];
+        let rs_slot_flags = [pie_driver_abi::PIE_RS_FLAG_RESET, 0];
+        let desc = PieLaunchDesc {
+            token_ids: PieU32Slice {
+                ptr: tokens.as_ptr(),
+                len: tokens.len(),
+            },
+            qo_indptr: PieU32Slice {
+                ptr: qo_indptr.as_ptr(),
+                len: qo_indptr.len(),
+            },
+            rs_slot_ids: PieU32Slice {
+                ptr: rs_slot_ids.as_ptr(),
+                len: rs_slot_ids.len(),
+            },
+            rs_slot_flags: pie_driver_abi::PieU8Slice {
+                ptr: rs_slot_flags.as_ptr(),
+                len: rs_slot_flags.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+        validate_launch_shape(&desc, 1).unwrap();
+
+        let one_slot = [7u32];
+        let one_flag = [0u8];
+        let wrong_rows = PieLaunchDesc {
+            rs_slot_ids: PieU32Slice {
+                ptr: one_slot.as_ptr(),
+                len: one_slot.len(),
+            },
+            rs_slot_flags: pie_driver_abi::PieU8Slice {
+                ptr: one_flag.as_ptr(),
+                len: one_flag.len(),
+            },
+            ..desc
+        };
+        assert!(
+            validate_launch_shape(&wrong_rows, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("resolved qo rows")
         );
     }
 

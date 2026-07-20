@@ -21,8 +21,7 @@ public:
         Qwen3Weights weights,
         const HfConfig& hf_config,
         KvCache& kv_cache,
-        const LlamaLikeForwardCfg& fwd_cfg,
-        bool supports_tp_greedy_argmax);
+        const LlamaLikeForwardCfg& fwd_cfg);
 
     void prepare(AttentionWorkspace& attn_ws,
                  const ForwardFn::PrepareInputs& in) override;

@@ -12,11 +12,18 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
+use crate::geometry::GeometryClass;
+
 /// Current direct local ABI version.
 ///
-/// v4: driver creation reports device facts only; model loading is a separate,
-/// blocking `*_load_model` call carrying mandatory LoadPlan bytes.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 4;
+/// v10: KV write lower bounds are exact declarations rather than clamped
+/// host-envelope hints.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 10;
+pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
+pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
+pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
 
 /// Success.
 pub const PIE_STATUS_OK: i32 = 0;
@@ -30,6 +37,17 @@ pub const PIE_STATUS_UNSUPPORTED: i32 = -3;
 pub const PIE_STATUS_CLOSED: i32 = -4;
 /// The driver encountered an internal failure after accepting the call.
 pub const PIE_STATUS_DRIVER_ERROR: i32 = -5;
+
+// Literal values so cbindgen emits plain macros; the assert pins them to the
+// Rust enum.
+pub const PIE_GEOMETRY_CLASS_HOST: u32 = 0;
+pub const PIE_GEOMETRY_CLASS_DECODE_ENVELOPE: u32 = 1;
+pub const PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY: u32 = 2;
+const _: () = {
+    assert!(PIE_GEOMETRY_CLASS_HOST == GeometryClass::Host as u32);
+    assert!(PIE_GEOMETRY_CLASS_DECODE_ENVELOPE == GeometryClass::DecodeEnvelope as u32);
+    assert!(PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY == GeometryClass::DeviceGeometry as u32);
+};
 
 /// Reset the recurrent-state slot before executing the request.
 pub const PIE_RS_FLAG_RESET: u8 = 1;
@@ -96,6 +114,13 @@ pub struct PieBytes {
     pub len: usize,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieMutBytes {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
 /// Borrowed immutable `u8` slice.
 ///
 /// `ptr` may be null only when `len == 0`.
@@ -113,6 +138,13 @@ pub struct PieU8Slice {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PieU32Slice {
     pub ptr: *const u32,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieU32MutSlice {
+    pub ptr: *mut u32,
     pub len: usize,
 }
 
@@ -143,10 +175,10 @@ pub const PIE_TERMINAL_OUTCOME_RETRY: PieTerminalOutcome = 3;
 /// The `outcome` word is published with release semantics by the driver and
 /// read with acquire semantics by the runtime.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PieTerminalCell {
     pub outcome: PieTerminalOutcome,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved0: u32,
 }
 
@@ -167,7 +199,7 @@ pub struct PieTerminalCellPtrSlice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieChannelDesc {
     pub abi_version: u32,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved0: u32,
     pub channel_id: u64,
     pub shape: PieU32Slice,
@@ -180,7 +212,7 @@ pub struct PieChannelDesc {
     /// One of `PIE_CHANNEL_EXTERN_*`.
     pub extern_dir: u8,
     pub capacity: u32,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved1: u32,
     pub reader_wait_id: u64,
     pub writer_wait_id: u64,
@@ -257,7 +289,7 @@ pub struct PieMaskWordsDesc {
 
 /// A single KV cell move expressed in physical page/token coordinates.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PieKvMoveCell {
     pub dst_page_id: u32,
     pub dst_token_offset: u32,
@@ -277,7 +309,7 @@ pub struct PieKvMoveCellSlice {
 
 /// One recurrent-state slot copy range.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PieStateCopyRange {
     pub src_slot_id: u32,
     pub dst_slot_id: u32,
@@ -298,7 +330,7 @@ pub struct PieStateCopyRangeSlice {
 
 /// One sparse pool page range to map or unmap.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PiePoolRange {
     pub page_index: u64,
     pub page_count: u64,
@@ -319,7 +351,7 @@ pub struct PiePoolRangeSlice {
 #[derive(Debug, Clone, Copy)]
 pub struct PieRuntimeCallbacks {
     pub abi_version: u32,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved0: u32,
     /// Opaque runtime-owned context pointer forwarded to [`PieRuntimeNotifyFn`].
     pub ctx: *mut c_void,
@@ -357,7 +389,7 @@ unsafe impl Sync for PieCompletion {}
 #[derive(Debug, Clone, Copy)]
 pub struct PieDriverCreateDesc {
     pub abi_version: u32,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved0: u32,
     pub config_bytes: PieBytes,
     pub runtime: PieRuntimeCallbacks,
@@ -387,8 +419,8 @@ pub struct PieDriverCaps {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieModelLoadDesc {
     pub abi_version: u32,
-    /// Must be zero.
-    pub reserved0: u32,
+    /// One of `PIE_MODEL_COMPONENT_*`.
+    pub component: u32,
     /// Compiler source hash expected by this runtime.
     pub compiler_version: u64,
     /// Serialized, versioned LoadPlan. Empty plans are invalid.
@@ -401,7 +433,7 @@ impl Default for PieModelLoadDesc {
     fn default() -> Self {
         Self {
             abi_version: PIE_DRIVER_ABI_VERSION,
-            reserved0: 0,
+            component: PIE_MODEL_COMPONENT_FULL,
             compiler_version: 0,
             load_plan_bytes: PieBytes::default(),
             snapshot_dir: PieBytes::default(),
@@ -414,7 +446,7 @@ impl Default for PieModelLoadDesc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieProgramDesc {
     pub abi_version: u32,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved0: u32,
     /// Stable C3 registration/cache key; canonical bytes are only needed on first registration.
     pub program_hash: u64,
@@ -439,8 +471,13 @@ impl Default for PieProgramDesc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieInstanceDesc {
     pub abi_version: u32,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved0: u32,
+    /// Runtime-derived geometry class; the driver verifies this against the
+    /// registered trace and echoes it in `PieInstanceBinding`.
+    pub geometry_class: u32,
+    /// Reserved; must be zero.
+    pub reserved1: u32,
     pub program_id: u64,
     pub requested_instance_id: u64,
     pub pacing_wait_id: u64,
@@ -453,6 +490,8 @@ impl Default for PieInstanceDesc {
         Self {
             abi_version: PIE_DRIVER_ABI_VERSION,
             reserved0: 0,
+            geometry_class: PIE_GEOMETRY_CLASS_HOST,
+            reserved1: 0,
             program_id: 0,
             requested_instance_id: 0,
             pacing_wait_id: 0,
@@ -467,6 +506,9 @@ impl Default for PieInstanceDesc {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PieInstanceBinding {
     pub instance_id: u64,
+    pub geometry_class: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
 }
 
 /// One batched launch descriptor.
@@ -474,7 +516,7 @@ pub struct PieInstanceBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieLaunchDesc {
     pub abi_version: u32,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved0: u32,
     /// Bound instance ids, one per fire/program in scheduler order.
     pub instance_ids: PieU64Slice,
@@ -486,7 +528,10 @@ pub struct PieLaunchDesc {
     pub kv_page_indptr: PieU32Slice,
     pub kv_last_page_lens: PieU32Slice,
     pub qo_indptr: PieU32Slice,
+    /// Folded recurrent-state slot per resolved `qo_indptr` row. Empty for
+    /// pure-attention launches; never indexed by `instance_ids`.
     pub rs_slot_ids: PieU32Slice,
+    /// Flags parallel to `rs_slot_ids`.
     pub rs_slot_flags: PieU8Slice,
     pub rs_fold_lens: PieU32Slice,
     pub rs_buffer_slot_ids: PieU32Slice,
@@ -501,7 +546,7 @@ pub struct PieLaunchDesc {
     pub single_token_mode: u8,
     /// Boolean `0`/`1`; any other value is invalid.
     pub has_user_mask: u8,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved_flags: [u8; 6],
     pub image_indptr: PieU32Slice,
     pub image_grids: PieU32Slice,
@@ -516,6 +561,12 @@ pub struct PieLaunchDesc {
     pub audio_feature_indptr: PieU32Slice,
     pub audio_anchor_rows: PieU32Slice,
     pub audio_indptr: PieU32Slice,
+    pub embed_rows: PieBytes,
+    pub embed_indptr: PieU32Slice,
+    pub embed_shapes: PieU32Slice,
+    pub embed_dtypes: PieU8Slice,
+    pub embed_anchor_rows: PieU32Slice,
+    pub embed_block_indptr: PieU32Slice,
     pub kv_len: PieU32Slice,
     pub kv_len_device: PieU64Slice,
     /// Per-instance WorkingSet page translation, flattened across the batch:
@@ -538,6 +589,8 @@ pub struct PieLaunchDesc {
     /// wire placeholder row; the driver substitutes its channel-resolved
     /// geometry for that span when composing the forward batch.
     pub ptir_program_row_indptr: PieU32Slice,
+    pub ptir_kv_write_lower_bounds: PieU64Slice,
+    pub ptir_kv_write_upper_bounds: PieU64Slice,
     /// Immutable logical-fire ids, one per instance.
     pub logical_fire_ids: PieU64Slice,
     /// Dense-channel sequence tickets, CSR-partitioned per instance.
@@ -584,15 +637,59 @@ impl Default for PieLaunchDesc {
             audio_feature_indptr: PieU32Slice::default(),
             audio_anchor_rows: PieU32Slice::default(),
             audio_indptr: PieU32Slice::default(),
+            embed_rows: PieBytes::default(),
+            embed_indptr: PieU32Slice::default(),
+            embed_shapes: PieU32Slice::default(),
+            embed_dtypes: PieU8Slice::default(),
+            embed_anchor_rows: PieU32Slice::default(),
+            embed_block_indptr: PieU32Slice::default(),
             kv_len: PieU32Slice::default(),
             kv_len_device: PieU64Slice::default(),
             kv_translation: PieU32Slice::default(),
             kv_translation_indptr: PieU32Slice::default(),
             ptir_program_row_indptr: PieU32Slice::default(),
+            ptir_kv_write_lower_bounds: PieU64Slice::default(),
+            ptir_kv_write_upper_bounds: PieU64Slice::default(),
             logical_fire_ids: PieU64Slice::default(),
             channel_expected_head: PieU64Slice::default(),
             channel_expected_tail: PieU64Slice::default(),
             channel_ticket_indptr: PieU32Slice::default(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieEncodeDesc {
+    pub abi_version: u32,
+    pub reserved0: u32,
+    pub image_grids: PieU32Slice,
+    pub image_pixels: PieBytes,
+    pub image_pixel_indptr: PieU32Slice,
+    pub image_patch_positions: PieU32Slice,
+    pub image_anchor_rows: PieU32Slice,
+    pub audio_features: PieBytes,
+    pub audio_feature_indptr: PieU32Slice,
+    pub audio_anchor_rows: PieU32Slice,
+    pub output_rows: PieMutBytes,
+    pub output_row_indptr: PieU32MutSlice,
+}
+
+impl Default for PieEncodeDesc {
+    fn default() -> Self {
+        Self {
+            abi_version: PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            image_grids: PieU32Slice::default(),
+            image_pixels: PieBytes::default(),
+            image_pixel_indptr: PieU32Slice::default(),
+            image_patch_positions: PieU32Slice::default(),
+            image_anchor_rows: PieU32Slice::default(),
+            audio_features: PieBytes::default(),
+            audio_feature_indptr: PieU32Slice::default(),
+            audio_anchor_rows: PieU32Slice::default(),
+            output_rows: PieMutBytes::default(),
+            output_row_indptr: PieU32MutSlice::default(),
         }
     }
 }
@@ -609,7 +706,7 @@ pub struct PieKvCopyDesc {
     pub src_device_ordinal: u32,
     pub dst_domain: PieMemoryDomain,
     pub dst_device_ordinal: u32,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved0: u32,
     pub src_page_ids: PieU32Slice,
     pub dst_page_ids: PieU32Slice,
@@ -637,7 +734,7 @@ impl Default for PieKvCopyDesc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PieStateCopyDesc {
     pub abi_version: u32,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved0: u32,
     pub slot_ranges: PieStateCopyRangeSlice,
 }
@@ -657,7 +754,7 @@ impl Default for PieStateCopyDesc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PiePoolResizeDesc {
     pub abi_version: u32,
-    /// Must be zero in ABI v1.
+    /// Reserved; must be zero.
     pub reserved0: u32,
     pub pool_id: u64,
     pub target_pages: u64,
@@ -809,6 +906,10 @@ fn validate_bytes(bytes: PieBytes, name: &'static str) -> PieAbiValidationResult
     validate_slice_ptr(bytes.ptr, bytes.len, name)
 }
 
+fn validate_mut_bytes(bytes: PieMutBytes, name: &'static str) -> PieAbiValidationResult {
+    validate_slice_ptr(bytes.ptr.cast_const(), bytes.len, name)
+}
+
 fn validate_terminal_cell_ptr(
     ptr: *mut PieTerminalCell,
     name: &'static str,
@@ -828,6 +929,10 @@ fn validate_u8_slice(slice: PieU8Slice, name: &'static str) -> PieAbiValidationR
 
 fn validate_u32_slice(slice: PieU32Slice, name: &'static str) -> PieAbiValidationResult {
     validate_slice_ptr(slice.ptr, slice.len, name)
+}
+
+fn validate_u32_mut_slice(slice: PieU32MutSlice, name: &'static str) -> PieAbiValidationResult {
+    validate_slice_ptr(slice.ptr.cast_const(), slice.len, name)
 }
 
 fn validate_u64_slice(slice: PieU64Slice, name: &'static str) -> PieAbiValidationResult {
@@ -996,7 +1101,9 @@ pub fn validate_driver_create_desc(desc: &PieDriverCreateDesc) -> PieAbiValidati
 /// Validates a model-load descriptor.
 pub fn validate_model_load_desc(desc: &PieModelLoadDesc) -> PieAbiValidationResult {
     validate_pie_abi_version(desc.abi_version)?;
-    validate_reserved_zero("model load reserved0 must be zero", desc.reserved0)?;
+    if desc.component > PIE_MODEL_COMPONENT_ENCODE {
+        return Err(invalid_argument("model load component is invalid"));
+    }
     validate_bytes(
         desc.load_plan_bytes,
         "model load load_plan_bytes ptr/len mismatch",
@@ -1038,6 +1145,10 @@ pub fn validate_program_desc(desc: &PieProgramDesc) -> PieAbiValidationResult {
 pub unsafe fn validate_instance_desc(desc: &PieInstanceDesc) -> PieAbiValidationResult {
     validate_pie_abi_version(desc.abi_version)?;
     validate_reserved_zero("instance reserved0 must be zero", desc.reserved0)?;
+    if GeometryClass::try_from(desc.geometry_class).is_err() {
+        return Err(invalid_argument("instance geometry_class is invalid"));
+    }
+    validate_reserved_zero("instance reserved1 must be zero", desc.reserved1)?;
     validate_u64_slice(desc.channel_ids, "instance channel_ids ptr/len mismatch")?;
     unsafe {
         validate_nested_channel_values(
@@ -1153,6 +1264,12 @@ pub fn validate_instance_binding(binding: &PieInstanceBinding) -> PieAbiValidati
     if binding.instance_id == 0 {
         return Err(invalid_argument("instance binding id must be nonzero"));
     }
+    if GeometryClass::try_from(binding.geometry_class).is_err() {
+        return Err(invalid_argument(
+            "instance binding geometry_class is invalid",
+        ));
+    }
+    validate_reserved_zero("instance binding reserved0 must be zero", binding.reserved0)?;
     Ok(())
 }
 
@@ -1249,6 +1366,18 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
         desc.audio_anchor_rows,
         "launch audio_anchor_rows ptr/len mismatch",
     )?;
+    validate_bytes(desc.embed_rows, "launch embed_rows ptr/len mismatch")?;
+    validate_u32_slice(desc.embed_indptr, "launch embed_indptr ptr/len mismatch")?;
+    validate_u32_slice(desc.embed_shapes, "launch embed_shapes ptr/len mismatch")?;
+    validate_u8_slice(desc.embed_dtypes, "launch embed_dtypes ptr/len mismatch")?;
+    validate_u32_slice(
+        desc.embed_anchor_rows,
+        "launch embed_anchor_rows ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.embed_block_indptr,
+        "launch embed_block_indptr ptr/len mismatch",
+    )?;
     validate_u32_slice(desc.kv_len, "launch kv_len ptr/len mismatch")?;
     validate_u64_slice(desc.kv_len_device, "launch kv_len_device ptr/len mismatch")?;
     validate_u32_slice(
@@ -1262,6 +1391,14 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
     validate_u32_slice(
         desc.ptir_program_row_indptr,
         "launch ptir_program_row_indptr ptr/len mismatch",
+    )?;
+    validate_u64_slice(
+        desc.ptir_kv_write_lower_bounds,
+        "launch ptir_kv_write_lower_bounds ptr/len mismatch",
+    )?;
+    validate_u64_slice(
+        desc.ptir_kv_write_upper_bounds,
+        "launch ptir_kv_write_upper_bounds ptr/len mismatch",
     )?;
     validate_u64_slice(
         desc.logical_fire_ids,
@@ -1281,6 +1418,7 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
     )?;
 
     let request_count = desc.instance_ids.len;
+    let wire_row_count = desc.qo_indptr.len.saturating_sub(1);
     if desc.kv_translation.len != 0 && desc.kv_translation_indptr.len == 0 {
         return Err(invalid_argument(
             "launch kv_translation_indptr is required when translation values are present",
@@ -1325,42 +1463,56 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             desc.qo_indptr,
             "launch qo_indptr malformed",
             desc.token_ids.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
             desc.kv_page_indptr,
             "launch kv_page_indptr malformed",
             desc.kv_page_indices.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
             desc.rs_buffer_slot_indptr,
             "launch rs_buffer_slot_indptr malformed",
             desc.rs_buffer_slot_ids.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
             desc.sampling_indptr,
             "launch sampling_indptr malformed",
             desc.sampling_indices.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
             desc.image_indptr,
             "launch image_indptr malformed",
             desc.image_anchor_positions.len,
-            request_count,
+            wire_row_count,
             true,
         )?;
         validate_csr(
             desc.audio_indptr,
             "launch audio_indptr malformed",
             desc.audio_anchor_rows.len,
-            request_count,
+            wire_row_count,
+            true,
+        )?;
+        validate_csr(
+            desc.embed_block_indptr,
+            "launch embed_block_indptr malformed",
+            desc.embed_dtypes.len,
+            wire_row_count,
+            true,
+        )?;
+        validate_csr(
+            desc.embed_indptr,
+            "launch embed_indptr malformed",
+            desc.embed_rows.len,
+            desc.embed_dtypes.len,
             true,
         )?;
         validate_csr(
@@ -1377,6 +1529,22 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             request_count,
             true,
         )?;
+    }
+    if desc.embed_shapes.len != desc.embed_dtypes.len.saturating_mul(2)
+        || desc.embed_anchor_rows.len != desc.embed_dtypes.len
+    {
+        return Err(invalid_argument(
+            "launch embedding shapes/dtypes/anchors must describe the same blocks",
+        ));
+    }
+    if desc.embed_dtypes.len != 0 {
+        let dtypes =
+            unsafe { std::slice::from_raw_parts(desc.embed_dtypes.ptr, desc.embed_dtypes.len) };
+        if dtypes.iter().any(|dtype| *dtype != 2) {
+            return Err(invalid_argument(
+                "launch precomputed embeddings currently require bf16 dtype tag 2",
+            ));
+        }
     }
     if desc.channel_expected_head.len != desc.channel_expected_tail.len {
         return Err(invalid_argument(
@@ -1403,52 +1571,88 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
         true,
     )?;
     if desc.ptir_program_row_indptr.len != 0 {
-        let wire_rows = desc.qo_indptr.len.saturating_sub(1);
         unsafe {
             validate_csr(
                 desc.ptir_program_row_indptr,
                 "launch ptir_program_row_indptr malformed",
-                wire_rows,
+                wire_row_count,
                 request_count,
                 false,
             )?;
+        }
+        if desc.ptir_kv_write_lower_bounds.len != desc.ptir_kv_write_upper_bounds.len
+            || (desc.ptir_kv_write_lower_bounds.len != 0
+                && desc.ptir_kv_write_lower_bounds.len != request_count)
+        {
+            return Err(invalid_argument(
+                "launch PTIR KV write bounds must have one pair per instance",
+            ));
+        }
+        if desc.ptir_kv_write_lower_bounds.len != 0 {
+            let lower = unsafe {
+                std::slice::from_raw_parts(
+                    desc.ptir_kv_write_lower_bounds.ptr,
+                    desc.ptir_kv_write_lower_bounds.len,
+                )
+            };
+            let upper = unsafe {
+                std::slice::from_raw_parts(
+                    desc.ptir_kv_write_upper_bounds.ptr,
+                    desc.ptir_kv_write_upper_bounds.len,
+                )
+            };
+            if lower.iter().zip(upper).any(|(lower, upper)| lower > upper) {
+                return Err(invalid_argument("launch PTIR KV write bounds are inverted"));
+            }
         }
     }
 
     validate_row_count_u32(
         desc.kv_last_page_lens.len,
-        "launch kv_last_page_lens length must match batch size",
-        request_count,
+        "launch kv_last_page_lens length must match resolved row count",
+        wire_row_count,
         true,
     )?;
-    validate_row_count_u32(
-        desc.rs_slot_ids.len,
-        "launch rs_slot_ids length must match batch size",
-        request_count,
-        true,
-    )?;
-    validate_row_count_u32(
-        desc.rs_slot_flags.len,
-        "launch rs_slot_flags length must match batch size",
-        request_count,
-        true,
-    )?;
-    validate_row_count_u32(
-        desc.rs_fold_lens.len,
-        "launch rs_fold_lens length must match batch size",
-        request_count,
-        true,
-    )?;
+    if desc.rs_slot_ids.len != desc.rs_slot_flags.len {
+        return Err(invalid_argument(
+            "launch rs_slot_ids and rs_slot_flags lengths must match",
+        ));
+    }
+    if desc.rs_fold_lens.len != 0 && desc.rs_fold_lens.len != desc.rs_slot_ids.len {
+        return Err(invalid_argument(
+            "launch rs_fold_lens length must match rs_slot_ids",
+        ));
+    }
+    if desc.qo_indptr.len != 0
+        && desc.rs_slot_ids.len != 0
+        && desc.rs_slot_ids.len != wire_row_count
+    {
+        return Err(invalid_argument(
+            "launch rs slot vector length must match resolved qo rows",
+        ));
+    }
+    if desc.rs_slot_flags.len != 0 {
+        let flags =
+            unsafe { std::slice::from_raw_parts(desc.rs_slot_flags.ptr, desc.rs_slot_flags.len) };
+        if flags
+            .iter()
+            .any(|flag| flag & !(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD) != 0)
+        {
+            return Err(invalid_argument(
+                "launch rs_slot_flags contains unknown bits",
+            ));
+        }
+    }
     validate_row_count_u32(
         desc.context_ids.len,
-        "launch context_ids length must match batch size",
-        request_count,
+        "launch context_ids length must match resolved row count",
+        wire_row_count,
         true,
     )?;
     validate_row_count_u32(
         desc.kv_len.len,
-        "launch kv_len length must match batch size",
-        request_count,
+        "launch kv_len length must match resolved row count",
+        wire_row_count,
         true,
     )?;
     if desc.kv_len_device.len > 1 {
@@ -1513,7 +1717,7 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
             desc.masks.request_indptr,
             "launch masks.request_indptr malformed",
             desc.masks.word_indptr.len.saturating_sub(1),
-            request_count,
+            wire_row_count,
             true,
         )?;
         let row_count = {
@@ -1532,6 +1736,127 @@ pub unsafe fn validate_launch_desc(desc: &PieLaunchDesc) -> PieAbiValidationResu
         )?;
     }
 
+    Ok(())
+}
+
+/// # Safety
+/// All descriptor pointers must remain readable/writable for the declared lengths.
+pub unsafe fn validate_encode_desc(desc: &PieEncodeDesc) -> PieAbiValidationResult {
+    validate_pie_abi_version(desc.abi_version)?;
+    validate_reserved_zero("encode reserved0 must be zero", desc.reserved0)?;
+    validate_u32_slice(desc.image_grids, "encode image_grids ptr/len mismatch")?;
+    validate_bytes(desc.image_pixels, "encode image_pixels ptr/len mismatch")?;
+    validate_u32_slice(
+        desc.image_pixel_indptr,
+        "encode image_pixel_indptr ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.image_patch_positions,
+        "encode image_patch_positions ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.image_anchor_rows,
+        "encode image_anchor_rows ptr/len mismatch",
+    )?;
+    validate_bytes(
+        desc.audio_features,
+        "encode audio_features ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.audio_feature_indptr,
+        "encode audio_feature_indptr ptr/len mismatch",
+    )?;
+    validate_u32_slice(
+        desc.audio_anchor_rows,
+        "encode audio_anchor_rows ptr/len mismatch",
+    )?;
+    validate_mut_bytes(desc.output_rows, "encode output_rows ptr/len mismatch")?;
+    validate_u32_mut_slice(
+        desc.output_row_indptr,
+        "encode output_row_indptr ptr/len mismatch",
+    )?;
+    let images = desc.image_anchor_rows.len;
+    let clips = desc.audio_anchor_rows.len;
+    if images + clips == 0
+        || desc.output_row_indptr.len != images + clips + 1
+        || desc.output_rows.len == 0
+        || desc.output_rows.len % std::mem::size_of::<u16>() != 0
+    {
+        return Err(invalid_argument(
+            "encode media descriptor shapes are inconsistent",
+        ));
+    }
+    if images == 0 {
+        if desc.image_grids.len != 0
+            || desc.image_pixels.len != 0
+            || desc.image_pixel_indptr.len != 0
+            || desc.image_patch_positions.len != 0
+        {
+            return Err(invalid_argument(
+                "encode image payload requires image anchors",
+            ));
+        }
+    } else {
+        if desc.image_grids.len != images.saturating_mul(3)
+            || desc.image_pixel_indptr.len != images + 1
+            || desc.image_pixels.len == 0
+            || desc.image_pixels.len % std::mem::size_of::<f32>() != 0
+            || desc.image_patch_positions.len == 0
+            || desc.image_patch_positions.len % 2 != 0
+        {
+            return Err(invalid_argument("encode image metadata is inconsistent"));
+        }
+        let pixel_indptr = unsafe {
+            as_u32_slice(
+                desc.image_pixel_indptr,
+                "encode image_pixel_indptr ptr/len mismatch",
+            )?
+        };
+        if pixel_indptr.first().copied() != Some(0)
+            || pixel_indptr.last().copied() != Some(desc.image_pixels.len as u32)
+            || !pixel_indptr.windows(2).all(|window| {
+                window[0] <= window[1]
+                    && window[0] % std::mem::size_of::<f32>() as u32 == 0
+                    && window[1] % std::mem::size_of::<f32>() as u32 == 0
+            })
+        {
+            return Err(invalid_argument(
+                "encode image_pixel_indptr must exactly partition aligned pixels",
+            ));
+        }
+    }
+    if clips == 0 {
+        if desc.audio_features.len != 0 || desc.audio_feature_indptr.len != 0 {
+            return Err(invalid_argument(
+                "encode audio payload requires audio anchors",
+            ));
+        }
+    } else {
+        if desc.audio_feature_indptr.len != clips + 1
+            || desc.audio_features.len == 0
+            || desc.audio_features.len % std::mem::size_of::<f32>() != 0
+        {
+            return Err(invalid_argument("encode audio metadata is inconsistent"));
+        }
+        let audio_indptr = unsafe {
+            as_u32_slice(
+                desc.audio_feature_indptr,
+                "encode audio_feature_indptr ptr/len mismatch",
+            )?
+        };
+        if audio_indptr.first().copied() != Some(0)
+            || audio_indptr.last().copied() != Some(desc.audio_features.len as u32)
+            || !audio_indptr.windows(2).all(|window| {
+                window[0] < window[1]
+                    && window[0] % std::mem::size_of::<f32>() as u32 == 0
+                    && window[1] % std::mem::size_of::<f32>() as u32 == 0
+            })
+        {
+            return Err(invalid_argument(
+                "encode audio_feature_indptr must exactly partition aligned features",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1609,6 +1934,11 @@ unsafe extern "C" {
         launch: *const PieLaunchDesc,
         completion: PieCompletion,
     ) -> i32;
+    pub fn pie_cuda_encode(
+        driver: *mut PieDriver,
+        encode: *const PieEncodeDesc,
+        completion: PieCompletion,
+    ) -> i32;
     pub fn pie_cuda_copy_kv(
         driver: *mut PieDriver,
         copy: *const PieKvCopyDesc,
@@ -1657,6 +1987,11 @@ unsafe extern "C" {
     pub fn pie_metal_launch(
         driver: *mut PieDriver,
         launch: *const PieLaunchDesc,
+        completion: PieCompletion,
+    ) -> i32;
+    pub fn pie_metal_encode(
+        driver: *mut PieDriver,
+        encode: *const PieEncodeDesc,
         completion: PieCompletion,
     ) -> i32;
     pub fn pie_metal_copy_kv(
@@ -1755,6 +2090,7 @@ mod tests {
             PIE_DRIVER_ABI_VERSION
         );
         assert_eq!(PieLaunchDesc::default().abi_version, PIE_DRIVER_ABI_VERSION);
+        assert_eq!(PieEncodeDesc::default().abi_version, PIE_DRIVER_ABI_VERSION);
         assert_eq!(PieKvCopyDesc::default().abi_version, PIE_DRIVER_ABI_VERSION);
         assert_eq!(
             PieStateCopyDesc::default().abi_version,
@@ -1766,10 +2102,19 @@ mod tests {
         );
         assert_eq!(PieRuntimeCallbacks::default().reserved0, 0);
         assert_eq!(PieDriverCreateDesc::default().reserved0, 0);
-        assert_eq!(PieModelLoadDesc::default().reserved0, 0);
+        assert_eq!(
+            PieModelLoadDesc::default().component,
+            PIE_MODEL_COMPONENT_FULL
+        );
         assert_eq!(PieProgramDesc::default().reserved0, 0);
         assert_eq!(PieInstanceDesc::default().reserved0, 0);
+        assert_eq!(
+            PieInstanceDesc::default().geometry_class,
+            PIE_GEOMETRY_CLASS_HOST
+        );
+        assert_eq!(PieInstanceDesc::default().reserved1, 0);
         assert_eq!(PieLaunchDesc::default().reserved0, 0);
+        assert_eq!(PieEncodeDesc::default().reserved0, 0);
         assert_eq!(PieLaunchDesc::default().reserved_flags, [0; 6]);
         assert_eq!(PieKvCopyDesc::default().reserved0, 0);
         assert_eq!(PieStateCopyDesc::default().reserved0, 0);
@@ -1788,7 +2133,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_binding_is_identity_only() {
+    fn instance_binding_defaults_to_host_geometry() {
         let instance = PieInstanceDesc::default();
         assert!(instance.channel_ids.ptr.is_null());
         assert_eq!(instance.channel_ids.len, 0);
@@ -1796,12 +2141,91 @@ mod tests {
         assert_eq!(instance.seed_values.len, 0);
 
         assert_eq!(PieInstanceBinding::default().instance_id, 0);
+        assert_eq!(
+            PieInstanceBinding::default().geometry_class,
+            PIE_GEOMETRY_CLASS_HOST
+        );
+        assert_eq!(PieInstanceBinding::default().reserved0, 0);
+    }
+
+    #[test]
+    fn instance_geometry_class_is_validated() {
+        let mut instance = PieInstanceDesc::default();
+        instance.geometry_class = u32::MAX;
+        assert!(unsafe { validate_instance_desc(&instance) }.is_err());
+
+        let binding = PieInstanceBinding {
+            instance_id: 1,
+            geometry_class: u32::MAX,
+            reserved0: 0,
+        };
+        assert!(validate_instance_binding(&binding).is_err());
     }
 
     #[test]
     fn completion_layout_is_stable() {
         assert_eq!(std::mem::size_of::<PieCompletion>(), 24);
         assert_eq!(std::mem::align_of::<PieCompletion>(), 8);
+    }
+
+    #[test]
+    fn encode_layout_and_validation_are_stable() {
+        assert_eq!(std::mem::size_of::<PieEncodeDesc>(), 168);
+        assert_eq!(std::mem::align_of::<PieEncodeDesc>(), 8);
+
+        let grids = [1u32, 1, 1];
+        let pixels = [0u8; 4];
+        let pixel_indptr = [0u32, 4];
+        let patch_positions = [0u32, 0];
+        let anchors = [0u32];
+        let mut output = [0u8; 2];
+        let mut output_indptr = [0u32; 2];
+        let desc = PieEncodeDesc {
+            abi_version: PIE_DRIVER_ABI_VERSION,
+            reserved0: 0,
+            image_grids: PieU32Slice {
+                ptr: grids.as_ptr(),
+                len: grids.len(),
+            },
+            image_pixels: PieBytes {
+                ptr: pixels.as_ptr(),
+                len: pixels.len(),
+            },
+            image_pixel_indptr: PieU32Slice {
+                ptr: pixel_indptr.as_ptr(),
+                len: pixel_indptr.len(),
+            },
+            image_patch_positions: PieU32Slice {
+                ptr: patch_positions.as_ptr(),
+                len: patch_positions.len(),
+            },
+            image_anchor_rows: PieU32Slice {
+                ptr: anchors.as_ptr(),
+                len: anchors.len(),
+            },
+            audio_features: PieBytes::default(),
+            audio_feature_indptr: PieU32Slice::default(),
+            audio_anchor_rows: PieU32Slice::default(),
+            output_rows: PieMutBytes {
+                ptr: output.as_mut_ptr(),
+                len: output.len(),
+            },
+            output_row_indptr: PieU32MutSlice {
+                ptr: output_indptr.as_mut_ptr(),
+                len: output_indptr.len(),
+            },
+        };
+        unsafe { validate_encode_desc(&desc) }.unwrap();
+
+        let bad_indptr = [0u32, 3];
+        let malformed = PieEncodeDesc {
+            image_pixel_indptr: PieU32Slice {
+                ptr: bad_indptr.as_ptr(),
+                len: 2,
+            },
+            ..desc
+        };
+        assert!(unsafe { validate_encode_desc(&malformed) }.is_err());
     }
 
     #[test]
@@ -2039,6 +2463,8 @@ mod tests {
         };
         desc.compiler_version = 1;
         validate_model_load_desc(&desc).unwrap();
+        desc.component = PIE_MODEL_COMPONENT_ENCODE + 1;
+        assert!(validate_model_load_desc(&desc).is_err());
     }
 
     #[test]
@@ -2061,7 +2487,7 @@ mod tests {
             .map(|cell| cell as *mut PieTerminalCell);
         let tokens = [1u32, 2, 3];
         let positions = [4u32, 5, 6];
-        let qo_indptr = [0u32, 2];
+        let qo_indptr = [0u32, 4];
         let launch = PieLaunchDesc {
             instance_ids: PieU64Slice {
                 ptr: instance_ids.as_ptr(),
@@ -2206,6 +2632,104 @@ mod tests {
     }
 
     #[test]
+    fn launch_validator_accepts_resolved_request_rs_vectors() {
+        let instance_ids = [71u64];
+        let mut terminal = PieTerminalCell::default();
+        let terminal_cells = [&mut terminal as *mut PieTerminalCell];
+        let token_ids = [10u32, 11];
+        let position_ids = [0u32, 0];
+        let qo_indptr = [0u32, 1, 2];
+        let program_row_indptr = [0u32, 2];
+        let rs_slot_ids = [3u32, 4];
+        let rs_slot_flags = [PIE_RS_FLAG_RESET, 0];
+        let launch = PieLaunchDesc {
+            instance_ids: PieU64Slice {
+                ptr: instance_ids.as_ptr(),
+                len: instance_ids.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_cells.as_ptr(),
+                len: terminal_cells.len(),
+            },
+            token_ids: PieU32Slice {
+                ptr: token_ids.as_ptr(),
+                len: token_ids.len(),
+            },
+            position_ids: PieU32Slice {
+                ptr: position_ids.as_ptr(),
+                len: position_ids.len(),
+            },
+            qo_indptr: PieU32Slice {
+                ptr: qo_indptr.as_ptr(),
+                len: qo_indptr.len(),
+            },
+            ptir_program_row_indptr: PieU32Slice {
+                ptr: program_row_indptr.as_ptr(),
+                len: program_row_indptr.len(),
+            },
+            rs_slot_ids: PieU32Slice {
+                ptr: rs_slot_ids.as_ptr(),
+                len: rs_slot_ids.len(),
+            },
+            rs_slot_flags: PieU8Slice {
+                ptr: rs_slot_flags.as_ptr(),
+                len: rs_slot_flags.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+        unsafe { validate_launch_desc(&launch) }.unwrap();
+
+        let mismatched_flags = PieLaunchDesc {
+            rs_slot_flags: PieU8Slice {
+                ptr: rs_slot_flags.as_ptr(),
+                len: 1,
+            },
+            ..launch
+        };
+        assert!(
+            unsafe { validate_launch_desc(&mismatched_flags) }
+                .unwrap_err()
+                .message()
+                .contains("lengths must match")
+        );
+
+        let fold_lens = [0u32, 0, 0];
+        let mismatched_fold = PieLaunchDesc {
+            rs_fold_lens: PieU32Slice {
+                ptr: fold_lens.as_ptr(),
+                len: fold_lens.len(),
+            },
+            ..launch
+        };
+        assert!(
+            unsafe { validate_launch_desc(&mismatched_fold) }
+                .unwrap_err()
+                .message()
+                .contains("rs_fold_lens")
+        );
+
+        let one_slot = [3u32];
+        let one_flag = [0u8];
+        let wrong_resolved_count = PieLaunchDesc {
+            rs_slot_ids: PieU32Slice {
+                ptr: one_slot.as_ptr(),
+                len: one_slot.len(),
+            },
+            rs_slot_flags: PieU8Slice {
+                ptr: one_flag.as_ptr(),
+                len: one_flag.len(),
+            },
+            ..launch
+        };
+        assert!(
+            unsafe { validate_launch_desc(&wrong_resolved_count) }
+                .unwrap_err()
+                .message()
+                .contains("resolved qo rows")
+        );
+    }
+
+    #[test]
     fn launch_validator_rejects_malformed_ticket_and_translation_csr() {
         let translation = [7u32];
         let launch = PieLaunchDesc {
@@ -2304,6 +2828,7 @@ mod tests {
         let terminal_cell = header_block(&header, "PieTerminalCell");
         let terminal_cell_ptr_slice = header_block(&header, "PieTerminalCellPtrSlice");
         let launch = header_block(&header, "PieLaunchDesc");
+        let encode = header_block(&header, "PieEncodeDesc");
         let completion = header_block(&header, "PieCompletion");
         let kv_copy = header_block(&header, "PieKvCopyDesc");
         let state_copy = header_block(&header, "PieStateCopyDesc");
@@ -2328,9 +2853,15 @@ mod tests {
         assert!(load.contains("struct PieBytes load_plan_bytes;"));
         assert!(load.contains("struct PieBytes snapshot_dir;"));
         assert!(load.contains("uint64_t compiler_version;"));
+        assert!(load.contains("uint32_t component;"));
         assert!(program.contains("uint64_t program_hash;"));
         assert!(program.contains("uint32_t reserved0;"));
         assert!(instance.contains("struct PieU64Slice channel_ids;"));
+        assert!(launch.contains("struct PieBytes embed_rows;"));
+        assert!(launch.contains("struct PieU32Slice embed_indptr;"));
+        assert!(encode.contains("struct PieMutBytes output_rows;"));
+        assert!(encode.contains("struct PieU32MutSlice output_row_indptr;"));
+        assert!(encode.contains("struct PieBytes audio_features;"));
         assert!(!program.contains("channel_ids"));
         assert!(binding.contains("uint64_t instance_id;"));
         assert!(!header.contains("typedef struct PieChannelBinding"));

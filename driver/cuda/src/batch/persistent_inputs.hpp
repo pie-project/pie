@@ -23,6 +23,7 @@
 #include <cstdint>
 
 #include "device_buffer.hpp"
+#include "kernels/pack_dense_mask.hpp"
 
 namespace pie_cuda_driver {
 
@@ -46,14 +47,20 @@ struct PersistentInputs {
     // case ceil(max_qo * max_kv / 8). `indptr` has R+1 byte offsets.
     DeviceBuffer<std::uint8_t>  custom_mask;
     DeviceBuffer<std::int32_t>  custom_mask_indptr;
+    DeviceBuffer<std::uint32_t> structured_mask_klen;
+    DeviceBuffer<kernels::StructuredMaskParams> structured_masks;
 
     // Explicit KV-write descriptor (device-geometry WSlot/WOff lowering, B2).
     // Per-lane physical page id + offset-in-page for the single new-token K/V
     // write, consumed by `launch_write_kv_explicit_bf16` when a device-geometry
-    // program binds the WSlot/WOff ports. Capacity = max_requests (one lane per
-    // request). Inert unless a fire resolves `has_write_desc`.
+    // program binds the WSlot/WOff ports. Capacity = max_workspace_tokens
+    // because prefill descriptors carry one target per token row.
     DeviceBuffer<std::uint32_t> w_page;
     DeviceBuffer<std::uint32_t> w_off;
+    // Device-composed fixed decode marks rows whose descriptor inputs were
+    // ready and valid. Invalid rows execute against isolated dummy geometry
+    // but must not mutate KV.
+    DeviceBuffer<std::uint8_t> row_valid;
 
     // Per-request linear-attention rs_cache slot ids (Qwen3.5 / 3.6).
     // Capacity = max_requests. Inert (zero-length writes) on archs that
@@ -62,7 +69,18 @@ struct PersistentInputs {
     // pattern as the rest of the per-fire payload.
     DeviceBuffer<std::int32_t>  slot_ids;
     DeviceBuffer<std::uint8_t>  is_fresh;
+    DeviceBuffer<std::uint8_t>  rs_slot_flags;
+    DeviceBuffer<std::uint32_t> rs_fold_lens;
+    DeviceBuffer<std::uint32_t> rs_buffer_slot_ids;
+    DeviceBuffer<std::uint32_t> rs_buffer_slot_indptr;
+    PinnedHostBuffer<std::uint8_t>  rs_slot_flags_host;
+    PinnedHostBuffer<std::uint32_t> rs_fold_lens_host;
+    PinnedHostBuffer<std::uint32_t> rs_buffer_slot_ids_host;
+    PinnedHostBuffer<std::uint32_t> rs_buffer_slot_indptr_host;
     DeviceBuffer<std::int32_t>  mtp_request_ids;
+    PinnedHostBuffer<std::int32_t> mtp_positions_host;
+    PinnedHostBuffer<std::int32_t> mtp_hidden_rows_host;
+    PinnedHostBuffer<std::int32_t> mtp_request_ids_host;
 
     // Absolute model rows requested by the launched PTIR instances.
     DeviceBuffer<std::int32_t>   sample_idx;
@@ -71,7 +89,8 @@ struct PersistentInputs {
         int max_workspace_tokens,
         int max_requests,
         int max_kv_pages,
-        std::size_t max_custom_mask_bytes);
+        std::size_t max_custom_mask_bytes,
+        int max_mtp_draft_rows);
 };
 
 // Memory-planner helper. Returns the byte budget for one PersistentInputs

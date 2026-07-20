@@ -14,11 +14,16 @@
 
 namespace pie::metal::pipeline {
 
+struct M1ProgramExecutable;
+
 struct ProgramRecord {
     std::uint64_t program_id = 0;
     std::uint64_t program_hash = 0;
+    std::vector<std::uint8_t> canonical_bytes;
     std::vector<pie_native::PtirChannelDecl> channels;
     ExecPlan plan;
+    std::shared_ptr<M1ProgramExecutable> m1_executable;
+    std::string m1_error;
 };
 
 struct InstanceRecord {
@@ -34,10 +39,7 @@ struct ChannelRecord {
     PieChannelDesc desc{};
     std::vector<std::uint32_t> shape;
     std::string extern_name;
-    std::vector<std::uint8_t> mirror;
-    std::vector<std::uint64_t> words;
     std::unordered_map<std::uint64_t, std::uint8_t> attachments;
-    std::uint64_t pulled = 0;
     std::shared_ptr<ChannelState> shared_state;
 
     std::size_t numel() const;

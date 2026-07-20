@@ -1,11 +1,8 @@
 //! `KvPreparedWrite`: the per-fire prepared KV operation (kv_refact.md,
 //! `store/kv/write.rs`).
 //!
-//! Holds freshly allocated physical ids, the CoW copy plan, and pending
-//! mapping/hash deltas, retained until async driver completion confirms the
-//! epoch. This is not a transaction manager: `KvStore` commits it on success
-//! and aborts/releases it on failure. `PendingFire` owns
-//! `Option<KvPreparedWrite>`.
+//! Holds freshly allocated physical ids and the CoW copy plan until prepare
+//! publishes them into the single table state.
 //!
 //! Complete typed-store API (kv_refact.md): some methods here are not yet
 //! called by the live single-model fire path (only a subset of the typed
@@ -16,7 +13,7 @@
 #![allow(dead_code)]
 
 use super::hash::Hash256;
-use super::page_table::{NodeId, PhysicalKvPageId, WorkingSetId};
+use super::page_table::{PhysicalKvPageId, WorkingSetId};
 
 /// One write target, classified by the CoW rules ("Every PTIR KV output is a
 /// write intent"):
@@ -59,12 +56,10 @@ impl PreparedTarget {
     }
 }
 
-/// A prepared, not-yet-committed KV write for one fire.
+/// A classified, allocated KV write ready for immediate table publication.
 #[derive(Debug)]
 pub struct KvPreparedWrite {
     pub(crate) ws: WorkingSetId,
-    /// Terminal snapshot pin taken at prepare; released at commit/abort.
-    pub(crate) pinned: Option<NodeId>,
     /// Ordered: in-place targets, then the CoW region ascending, then fresh
     /// appends ascending.
     pub(crate) targets: Vec<PreparedTarget>,

@@ -10,6 +10,7 @@ use common::{MockEnv, create_mock_env, mock_device::EchoBehavior};
 /// Shared state: MockEnv + tokio runtime (must outlive the process).
 struct TestState {
     env: MockEnv,
+    #[allow(dead_code)]
     rt: tokio::runtime::Runtime,
 }
 
@@ -40,14 +41,12 @@ fn model_registered() {
 
 #[test]
 fn all_devices_reachable() {
-    let s = state();
-    s.rt.block_on(async {
-        for i in 0..4 {
-            let spec = pie_engine::driver::get_spec(i).await.unwrap();
-            assert_eq!(spec.num_kv_pages, 64);
-            assert_eq!(spec.limits.max_forward_requests, 32);
-        }
-    });
+    let _ = state();
+    for i in 0..4 {
+        let spec = pie_engine::driver::get_spec(i).unwrap();
+        assert_eq!(spec.num_kv_pages, 64);
+        assert_eq!(spec.limits.max_forward_requests, 32);
+    }
 }
 
 #[test]

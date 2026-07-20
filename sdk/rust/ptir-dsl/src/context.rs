@@ -77,14 +77,6 @@ pub(crate) struct Recorder {
     pub types: Vec<ValueType>,
     pub next_id: u32,
     pub sinks: Vec<SinkCall>,
-    /// Dense ids consumed (taken) so far in this stage — drives the auto-drain
-    /// of pure-derivative device channels (put-without-take on a capacity-1
-    /// full cell; overview §6.2 elides the drain, the trace can't).
-    pub consumed: alloc::collections::BTreeSet<ChannelIndex>,
-    /// Positions (op indices) of the SYNTHESIZED drain `ChanTake`s this stage —
-    /// the only ops the builder may drop when a channel's derived role turns
-    /// out host-Reader (their result values are never exposed to the author).
-    pub drains: Vec<usize>,
 }
 
 impl Recorder {
@@ -96,8 +88,6 @@ impl Recorder {
             types: Vec::new(),
             next_id: 0,
             sinks: Vec::new(),
-            consumed: alloc::collections::BTreeSet::new(),
-            drains: Vec::new(),
         }
     }
 
@@ -147,6 +137,23 @@ impl Session {
 
 thread_local! {
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+    /// gid → channel state, for the whole guest (F9): the guest-facing
+    /// Channel is a Copy TOKEN holding only its gid; every op resolves
+    /// the shared state through this registry. Populated at construction,
+    /// owned here — handle lifetime belongs to the registry, not to leaked
+    /// references.
+    static CHANNELS_BY_GID: RefCell<alloc::collections::BTreeMap<u64, ChannelRef>> =
+        const { RefCell::new(alloc::collections::BTreeMap::new()) };
+}
+
+pub(crate) fn register_channel_state(gid: u64, state: ChannelRef) {
+    CHANNELS_BY_GID.with_borrow_mut(|map| {
+        map.insert(gid, state);
+    });
+}
+
+pub(crate) fn channel_state_by_gid(gid: u64) -> Option<ChannelRef> {
+    CHANNELS_BY_GID.with_borrow(|map| map.get(&gid).cloned())
 }
 
 /// Are we currently tracing a stage closure?
@@ -179,8 +186,17 @@ pub(crate) fn trace_stage(stage: Stage, rows: u32, body: impl FnOnce()) -> Stage
     });
     body();
     SESSION.with_borrow_mut(|s| {
-        let rec = s.as_mut().expect("session active").current.take().expect("stage recorder");
-        StageResult { stage: rec.stage, ops: rec.ops, sinks: rec.sinks, drains: rec.drains }
+        let rec = s
+            .as_mut()
+            .expect("session active")
+            .current
+            .take()
+            .expect("stage recorder");
+        StageResult {
+            stage: rec.stage,
+            ops: rec.ops,
+            sinks: rec.sinks,
+        }
     })
 }
 
@@ -188,8 +204,6 @@ pub(crate) struct StageResult {
     pub stage: Stage,
     pub ops: Vec<Op>,
     pub sinks: Vec<SinkCall>,
-    /// Synthesized auto-drain positions in `ops` (see [`Recorder::drains`]).
-    pub drains: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +212,9 @@ pub(crate) struct StageResult {
 
 pub(crate) fn current_rows() -> u32 {
     SESSION.with_borrow(|s| {
-        s.as_ref().and_then(|s| s.current.as_ref().map(|r| r.rows)).unwrap_or(1)
+        s.as_ref()
+            .and_then(|s| s.current.as_ref().map(|r| r.rows))
+            .unwrap_or(1)
     })
 }
 
@@ -241,45 +257,29 @@ pub(crate) fn record_channel_read(ch: &ChannelRef, consume: bool, span: Span) ->
             }
         }
         let rec = sess.current.as_mut().expect("stage active");
-        let op = if consume { Op::ChanTake(dense) } else { Op::ChanRead(dense) };
-        if consume {
-            rec.consumed.insert(dense);
-        }
+        let op = if consume {
+            Op::ChanTake(dense)
+        } else {
+            Op::ChanRead(dense)
+        };
         let id = rec.push(op, &[elem]);
         (id, elem)
     })
 }
 
 /// Record a channel `put` inside a stage (the value id must already match the
-/// channel's shape+dtype — the caller reshapes as needed). Auto-injects a drain
-/// `take` first when a **pure-derivative device channel** is put without being
-/// consumed this pass (else the capacity-1 full cell back-pressures forever;
-/// overview §6.2's klen/kvm — the doc elides the drain, the trace can't).
+/// channel's shape+dtype — the caller reshapes as needed). NO auto-drain (F8):
+/// producer programs are context-free — an unconsumed put sits in the ring
+/// (dropped at instance teardown) or back-pressures honestly at ring-full;
+/// loop-carried descriptor updates drain EXPLICITLY (`ch.take();` before the
+/// re-put). After `pipeline.finish`, a put still blocked with no attached
+/// consumer and no host role is a definite deadlock, surfaced by the fire's
+/// retry classifier.
 pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
     SESSION.with_borrow_mut(|s| {
         let sess = s.as_mut().expect("session active");
         let dense = sess.intern(ch);
         let stage = sess.current.as_ref().expect("stage active").stage;
-
-        // Auto-drain: device-private (no host role, not descriptor-consumed) and
-        // not yet taken this pass ⇒ the committed cell is full at entry, so the
-        // put needs a preceding drain.
-        let needs_drain = {
-            let st = ch.borrow();
-            let device_private = st.host_puts.is_empty()
-                && st.host_takes.is_empty()
-                && st.host_reads.is_empty()
-                && st.desc_takes.is_empty();
-            device_private && !sess.current.as_ref().unwrap().consumed.contains(&dense)
-        };
-        if needs_drain {
-            let elem = ch.borrow().elem_ty();
-            let rec = sess.current.as_mut().expect("stage active");
-            rec.consumed.insert(dense);
-            rec.drains.push(rec.ops.len());
-            rec.push(Op::ChanTake(dense), &[elem]);
-        }
-
         {
             ch.borrow_mut().prog_puts.push((stage, span));
         }
@@ -288,11 +288,7 @@ pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
     })
 }
 
-pub(crate) fn record_sink(
-    name: String,
-    span: Span,
-    scope: pie_ptir::registry::SinkScope,
-) {
+pub(crate) fn record_sink(name: String, span: Span, scope: pie_ptir::registry::SinkScope) {
     SESSION.with_borrow_mut(|s| {
         s.as_mut()
             .and_then(|s| s.current.as_mut())

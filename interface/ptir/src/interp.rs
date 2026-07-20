@@ -37,6 +37,7 @@ use super::container::{HostRole, PortSource};
 use super::op::{IntrinsicId, Op};
 use super::registry::{Phase, Port, Stage};
 use super::validate::{BoundTrace, Direction};
+use crate::rng;
 use crate::types::{DType, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
 
 /// A runtime value: a flat buffer (length 1 == scalar) tagged by dtype. The
@@ -67,6 +68,44 @@ impl Value {
             Value::I32(_) => DType::I32,
             Value::U32(_) => DType::U32,
             Value::Bool(_) => DType::Bool,
+        }
+    }
+
+    /// Decode from dtype-native little-endian bytes (bool = 1 byte per lane,
+    /// matching host channel cells; only the wire packs bool to bits).
+    /// `None` if the byte length is not a whole number of elements.
+    pub fn from_le_bytes(dtype: DType, bytes: &[u8]) -> Option<Value> {
+        match dtype {
+            DType::Bool => Some(Value::Bool(bytes.iter().map(|&b| b != 0).collect())),
+            DType::F32 | DType::I32 | DType::U32 if bytes.len() % 4 != 0 => None,
+            DType::F32 => Some(Value::F32(
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            )),
+            DType::I32 => Some(Value::I32(
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            )),
+            DType::U32 => Some(Value::U32(
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            )),
+        }
+    }
+
+    /// Encode to dtype-native little-endian bytes (bool = 1 byte per lane).
+    pub fn to_le_bytes(&self) -> Vec<u8> {
+        match self {
+            Value::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Value::I32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Value::U32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Value::Bool(v) => v.iter().map(|&b| b as u8).collect(),
         }
     }
 }
@@ -255,6 +294,31 @@ impl Instance {
         seeds: &[(u32, Value)],
         externs: &[(u32, ExternChannel)],
     ) -> Result<Instance, HostError> {
+        Instance::new_full(bound, seeds, externs, &[])
+    }
+
+    /// Like [`Self::new_with_externs`], plus driver-designated shared rings
+    /// for channels the container does NOT declare extern: same-guest
+    /// cross-pass chaining (R4-4) — two passes of one pipeline attach the
+    /// same DEVICE-ONLY channel, and the driver hands both instances one
+    /// ring so a producer pass's put is visible to the consumer pass. A
+    /// `seeded` channel cannot be shared this way (seed staging is
+    /// per-instance state).
+    pub fn new_with_shared_rings(
+        bound: &BoundTrace,
+        seeds: &[(u32, Value)],
+        externs: &[(u32, ExternChannel)],
+        shared: &[(u32, ExternChannel)],
+    ) -> Result<Instance, HostError> {
+        Instance::new_full(bound, seeds, externs, shared)
+    }
+
+    fn new_full(
+        bound: &BoundTrace,
+        seeds: &[(u32, Value)],
+        externs: &[(u32, ExternChannel)],
+        shared: &[(u32, ExternChannel)],
+    ) -> Result<Instance, HostError> {
         let mut channels = Vec::with_capacity(bound.container.channels.len());
         for (i, decl) in bound.container.channels.iter().enumerate() {
             let ty = bound.channel_types[i];
@@ -264,6 +328,13 @@ impl Instance {
                     .find(|(c, _)| *c == i as u32)
                     .ok_or(HostError::ExternUnpaired)?;
                 if ch.ty != ty || ch.capacity != decl.capacity as usize {
+                    return Err(HostError::TypeMismatch);
+                }
+                channels.push(Chan::Shared(ch.clone()));
+                continue;
+            }
+            if let Some((_, ch)) = shared.iter().find(|(c, _)| *c == i as u32) {
+                if ch.ty != ty || ch.capacity != decl.capacity as usize || decl.seeded {
                     return Err(HostError::TypeMismatch);
                 }
                 channels.push(Chan::Shared(ch.clone()));
@@ -565,7 +636,7 @@ impl Overlay {
     }
 }
 
-fn const_value(dtype: DType, shape: Shape, data: &[u8]) -> Value {
+pub(crate) fn const_value(dtype: DType, shape: Shape, data: &[u8]) -> Value {
     let n = shape.numel() as usize;
     match dtype {
         DType::Bool => Value::Bool(data.iter().take(n).map(|&b| b != 0).collect()),
@@ -659,13 +730,13 @@ fn exec_body(
     Ok(())
 }
 
-enum ChanEffect {
+pub(crate) enum ChanEffect {
     Take(u32),
     Read(u32),
     Put(u32, ValueId),
 }
 
-enum Evaled {
+pub(crate) enum Evaled {
     One(Value),
     Two(Value, Value),
     Chan(ChanEffect),
@@ -771,18 +842,151 @@ fn map_f32(v: &Value, f: impl Fn(f32) -> f32) -> Value {
     Value::F32(lanes_f32(v).into_iter().map(f).collect())
 }
 
-/// argmax with the pinned contract: lower index wins ties; NaN never
-/// selected (all-NaN row → 0).
-fn argmax_row(row: &[f32]) -> i32 {
-    let mut best = f32::NEG_INFINITY;
-    let mut bi: Option<usize> = None;
-    for (j, &x) in row.iter().enumerate() {
-        if !x.is_nan() && (bi.is_none() || x > best) {
-            best = x;
-            bi = Some(j);
+/// Canonical width-32 tree. Physical launch dimensions never affect this
+/// logical order.
+fn canonical_reduce<T: Copy>(row: &[T], identity: T, combine: impl Fn(T, T) -> T + Copy) -> T {
+    if row.is_empty() {
+        return identity;
+    }
+    let mut level = row.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(32));
+        for chunk in level.chunks(32) {
+            let mut lanes = [identity; 32];
+            lanes[..chunk.len()].copy_from_slice(chunk);
+            for offset in [16usize, 8, 4, 2, 1] {
+                for lane in 0..offset {
+                    lanes[lane] = combine(lanes[lane], lanes[lane + offset]);
+                }
+            }
+            next.push(lanes[0]);
+        }
+        level = next;
+    }
+    level[0]
+}
+
+#[derive(Clone, Copy)]
+struct ArgmaxCandidate {
+    value: f32,
+    index: u32,
+    have: bool,
+}
+
+fn combine_argmax(left: ArgmaxCandidate, right: ArgmaxCandidate) -> ArgmaxCandidate {
+    match (left.have, right.have) {
+        (false, false) => left,
+        (true, false) => left,
+        (false, true) => right,
+        (true, true) => {
+            if right.value > left.value || (right.value == left.value && right.index < left.index) {
+                right
+            } else {
+                left
+            }
         }
     }
-    bi.unwrap_or(0) as i32
+}
+
+/// Argmax with the pinned contract: lower index wins ties; NaN never selected
+/// (all-NaN row -> 0), evaluated through the canonical tree.
+fn argmax_row(row: &[f32]) -> i32 {
+    let candidates: Vec<_> = row
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| ArgmaxCandidate {
+            value,
+            index: index as u32,
+            have: !value.is_nan(),
+        })
+        .collect();
+    canonical_reduce(
+        &candidates,
+        ArgmaxCandidate {
+            value: f32::NEG_INFINITY,
+            index: 0,
+            have: false,
+        },
+        combine_argmax,
+    )
+    .index as i32
+}
+
+fn argmax_ordered<T: Ord>(row: &[T]) -> i32 {
+    let Some((mut best_index, mut best)) = row.first().map(|value| (0usize, value)) else {
+        return 0;
+    };
+    for (index, value) in row.iter().enumerate().skip(1) {
+        if value > best {
+            best = value;
+            best_index = index;
+        }
+    }
+    best_index as i32
+}
+
+fn canonical_max(left: f32, right: f32) -> f32 {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => f32::NEG_INFINITY,
+        (true, false) => right,
+        (false, true) => left,
+        (false, false) if left == 0.0 && right == 0.0 => {
+            if left.is_sign_negative() && right.is_sign_negative() {
+                -0.0
+            } else {
+                0.0
+            }
+        }
+        (false, false) => left.max(right),
+    }
+}
+
+fn canonical_min(left: f32, right: f32) -> f32 {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => f32::INFINITY,
+        (true, false) => right,
+        (false, true) => left,
+        (false, false) if left == 0.0 && right == 0.0 => {
+            if left.is_sign_negative() || right.is_sign_negative() {
+                -0.0
+            } else {
+                0.0
+            }
+        }
+        (false, false) => left.min(right),
+    }
+}
+
+fn element_max(left: f32, right: f32) -> f32 {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => left,
+        (true, false) => right,
+        (false, true) => left,
+        (false, false) if left == 0.0 && right == 0.0 => {
+            if left.is_sign_negative() && right.is_sign_negative() {
+                -0.0
+            } else {
+                0.0
+            }
+        }
+        (false, false) => left.max(right),
+    }
+}
+
+fn element_min(left: f32, right: f32) -> f32 {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => left,
+        (true, false) => right,
+        (false, true) => left,
+        (false, false) if left == 0.0 && right == 0.0 => {
+            if left.is_sign_negative() || right.is_sign_negative() {
+                -0.0
+            } else {
+                0.0
+            }
+        }
+        (false, false) => left.min(right),
+    }
 }
 
 /// sort_desc order with the pinned contract: descending; ties → lower
@@ -805,7 +1009,7 @@ fn rows_of(shape: Shape) -> usize {
     shape.rows() as usize
 }
 
-fn eval_op(
+pub(crate) fn eval_op(
     op: &Op,
     vals: &[Value],
     ty_of: &dyn Fn(ValueId) -> ValueType,
@@ -903,12 +1107,20 @@ fn eval_op(
             |x, y| x / y,
             |x, y| if y == 0 { 0 } else { x.wrapping_div(y) },
         )),
-        Op::MaxElem(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, f32::max, |x, y| {
-            x.max(y)
-        })),
-        Op::MinElem(a, b) => One(bin_arith(v(a), v(b), ty_of(a).dtype, f32::min, |x, y| {
-            x.min(y)
-        })),
+        Op::MaxElem(a, b) => One(bin_arith(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            element_max,
+            |x, y| x.max(y),
+        )),
+        Op::MinElem(a, b) => One(bin_arith(
+            v(a),
+            v(b),
+            ty_of(a).dtype,
+            element_min,
+            |x, y| x.min(y),
+        )),
         Op::Rem(a, b) => One(bin_arith(
             v(a),
             v(b),
@@ -1045,9 +1257,11 @@ fn eval_op(
             if t.dtype == DType::F32 {
                 let x = lanes_f32(data);
                 let f: fn(&[f32]) -> f32 = match op {
-                    Op::ReduceSum(_) => |r| r.iter().sum(),
-                    Op::ReduceMax(_) => |r| r.iter().copied().fold(f32::NEG_INFINITY, f32::max),
-                    _ => |r| r.iter().copied().fold(f32::INFINITY, f32::min),
+                    Op::ReduceSum(_) => |row| canonical_reduce(row, 0.0, |a, b| a + b),
+                    Op::ReduceMax(_) => {
+                        |row| canonical_reduce(row, f32::NEG_INFINITY, canonical_max)
+                    }
+                    _ => |row| canonical_reduce(row, f32::INFINITY, canonical_min),
                 };
                 One(Value::F32(
                     (0..rows).map(|r| f(&x[r * len..(r + 1) * len])).collect(),
@@ -1055,9 +1269,9 @@ fn eval_op(
             } else {
                 let x = lanes_i64(data);
                 let f: fn(&[i64]) -> i64 = match op {
-                    Op::ReduceSum(_) => |r| r.iter().sum(),
-                    Op::ReduceMax(_) => |r| r.iter().copied().max().unwrap_or(0),
-                    _ => |r| r.iter().copied().min().unwrap_or(0),
+                    Op::ReduceSum(_) => |row| canonical_reduce(row, 0, i64::wrapping_add),
+                    Op::ReduceMax(_) => |row| canonical_reduce(row, i64::MIN, i64::max),
+                    _ => |row| canonical_reduce(row, i64::MAX, i64::min),
                 };
                 One(from_i64(
                     t.dtype,
@@ -1068,13 +1282,28 @@ fn eval_op(
         Op::ReduceArgmax(a) => {
             let t = ty_of(a);
             let rows = rows_of(t.shape);
-            let x = lanes_f32(v(a));
-            let len = if rows == 0 { 0 } else { x.len() / rows };
-            One(Value::I32(
-                (0..rows)
-                    .map(|r| argmax_row(&x[r * len..(r + 1) * len]))
-                    .collect(),
-            ))
+            let result = match v(a) {
+                Value::F32(values) => {
+                    let len = if rows == 0 { 0 } else { values.len() / rows };
+                    (0..rows)
+                        .map(|row| argmax_row(&values[row * len..(row + 1) * len]))
+                        .collect()
+                }
+                Value::I32(values) => {
+                    let len = if rows == 0 { 0 } else { values.len() / rows };
+                    (0..rows)
+                        .map(|row| argmax_ordered(&values[row * len..(row + 1) * len]))
+                        .collect()
+                }
+                Value::U32(values) => {
+                    let len = if rows == 0 { 0 } else { values.len() / rows };
+                    (0..rows)
+                        .map(|row| argmax_ordered(&values[row * len..(row + 1) * len]))
+                        .collect()
+                }
+                Value::Bool(_) => return Err(fault("argmax on bool".into())),
+            };
+            One(Value::I32(result))
         }
 
         Op::Broadcast { value, shape } => {
@@ -1201,7 +1430,6 @@ fn eval_op(
             }
             One(Value::Bool(keep))
         }
-
         Op::Gather { src, idx } => {
             let ts = ty_of(src);
             let rest: usize = ts.shape.dims()[1..]
@@ -1326,7 +1554,56 @@ fn eval_op(
                     .collect(),
             ))
         }
-
+        Op::CausalMask { positions, len } => {
+            let Value::U32(positions) = v(positions) else {
+                return Err(fault("causal_mask positions".into()));
+            };
+            One(Value::Bool(
+                positions
+                    .iter()
+                    .flat_map(|&position| (0..len).map(move |key| key <= position))
+                    .collect(),
+            ))
+        }
+        Op::SlidingWindowMask {
+            positions,
+            len,
+            window,
+        } => {
+            let Value::U32(positions) = v(positions) else {
+                return Err(fault("sliding_window_mask positions".into()));
+            };
+            One(Value::Bool(
+                positions
+                    .iter()
+                    .flat_map(|&position| {
+                        (0..len).map(move |key| {
+                            key <= position && key.saturating_add(window) > position
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        Op::SinkWindowMask {
+            positions,
+            len,
+            sink,
+            window,
+        } => {
+            let Value::U32(positions) = v(positions) else {
+                return Err(fault("sink_window_mask positions".into()));
+            };
+            One(Value::Bool(
+                positions
+                    .iter()
+                    .flat_map(|&position| {
+                        (0..len).map(move |key| {
+                            key <= position && (key < sink || key.saturating_add(window) > position)
+                        })
+                    })
+                    .collect(),
+            ))
+        }
         Op::Rng {
             stream,
             shape,
@@ -1345,12 +1622,12 @@ fn eval_op(
         Op::RngKeyed { state, shape, kind } => {
             let st = lanes_i64(v(state));
             let (key, ctr) = (st[0] as u64 & 0xFFFF_FFFF, st[1] as u64 & 0xFFFF_FFFF);
-            let seed64 = splitmix64((key << 32) | ctr);
+            let seed64 = rng::keyed_seed(key as u32, ctr as u32);
             let n = shape.numel() as usize;
             One(Value::F32(
                 (0..n as u32)
                     .map(|j| {
-                        let u = hash_uniform(seed64, j);
+                        let u = rng::hash_uniform(seed64, j);
                         match kind {
                             RngKind::Uniform => u,
                             RngKind::Gumbel => -((-(u.ln())).ln()),
@@ -1463,30 +1740,11 @@ fn broadcast_value(value: &Value, src_shape: Shape, target: Shape) -> Value {
     gather_flat(value, &src_idx)
 }
 
-// ── RNG (pinned in PTIR-CONTAINER.md §5; splitmix64/hash_uniform shared with
-//    BYTECODE.md §5 / eval.rs) ────────────────────────────────────────────
-
-fn splitmix64(mut x: u64) -> u64 {
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x3C79_AC49_2BA7_B653);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0x1C69_B3F7_4AC4_AE35);
-    x ^= x >> 27;
-    x
-}
-
-fn hash_uniform(seed_eff: u64, j: u32) -> f32 {
-    let x = seed_eff.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul((j as u64) + 1));
-    let bits = (splitmix64(x) >> 40) as u32;
-    (bits as f32 + 0.5) * (1.0 / 16_777_216.0)
-}
-
 fn rng_ambient(seed: u32, stream: u32, kind: RngKind, len: usize) -> Vec<f32> {
-    let salt = splitmix64((stream as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let seed_eff = ((seed as u64) ^ 0xA5A5_A5A5u64) ^ salt;
+    let seed_eff = rng::seed_eff_stream(seed, stream);
     (0..len as u32)
         .map(|j| {
-            let u = hash_uniform(seed_eff, j);
+            let u = rng::hash_uniform(seed_eff, j);
             match kind {
                 RngKind::Uniform => u,
                 RngKind::Gumbel => -((-(u.ln())).ln()),
@@ -1691,6 +1949,132 @@ mod tests {
         assert_eq!(a.host_take(&b, 1).unwrap(), c.host_take(&b, 1).unwrap());
     }
 
+    fn nucleus_expansion(escape_intermediate: bool) -> TraceContainer {
+        let shape = Shape::matrix(2, 4);
+        let mut channels = vec![
+            chan(Shape::vector(2), DType::U32, HostRole::None, true),
+            chan(Shape::vector(2), DType::F32, HostRole::None, true),
+            chan(Shape::vector(2), DType::I32, HostRole::Reader, false),
+        ];
+        let mut ops = vec![
+            Op::IntrinsicVal {
+                intr: IntrinsicId::Logits,
+                shape,
+                dtype: DType::F32,
+            },
+            Op::ChanRead(0),
+            Op::ChanRead(1),
+            Op::ReduceMax(0),
+            Op::Broadcast { value: 3, shape },
+            Op::Sub(0, 4),
+            Op::Exp(5),
+            Op::ReduceSum(6),
+            Op::Broadcast { value: 7, shape },
+            Op::Div(6, 8),
+            Op::PivotThreshold {
+                input: 9,
+                predicate: Predicate::CummassLe(2),
+            },
+            Op::Const(Literal::F32(f32::NEG_INFINITY)),
+            Op::Select {
+                cond: 10,
+                a: 0,
+                b: 11,
+            },
+            Op::RngKeyed {
+                state: 1,
+                shape,
+                kind: RngKind::Gumbel,
+            },
+            Op::Add(12, 13),
+            Op::ReduceArgmax(14),
+            Op::ChanPut { chan: 2, value: 15 },
+        ];
+        if escape_intermediate {
+            channels.push(chan(shape, DType::F32, HostRole::Reader, false));
+            ops.push(Op::ChanPut { chan: 3, value: 6 });
+        }
+        TraceContainer {
+            channels,
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops,
+            }],
+            ..TraceContainer::default()
+        }
+    }
+
+    #[test]
+    fn recognized_nucleus_reference_matches_generic_ssa_fallback() {
+        use crate::compiler::{LibraryOp, RegionKind, compile_stage};
+
+        let mut profile = ModelProfile::dummy();
+        profile.vocab = 4;
+        let recognized = bind(nucleus_expansion(false), profile.clone()).unwrap();
+        let generic = bind(nucleus_expansion(true), profile).unwrap();
+        assert!(
+            compile_stage(&recognized, Stage::Epilogue)
+                .unwrap()
+                .fused
+                .regions
+                .iter()
+                .any(|region| region.kind == RegionKind::Library(LibraryOp::NucleusSample))
+        );
+        assert!(
+            !compile_stage(&generic, Stage::Epilogue)
+                .unwrap()
+                .fused
+                .regions
+                .iter()
+                .any(|region| region.kind == RegionKind::Library(LibraryOp::NucleusSample))
+        );
+
+        let logits = Value::F32(vec![
+            4.0,
+            4.0,
+            3.0,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            1.0,
+            1.0,
+            f32::NEG_INFINITY,
+        ]);
+        for (case, top_p) in [
+            vec![0.5, 1.0],
+            vec![0.0, f32::NAN],
+            vec![f32::INFINITY, -1.0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let execute = |bound: &BoundTrace| {
+                let mut instance = Instance::new(
+                    bound,
+                    &[
+                        (0, Value::U32(vec![17, case as u32])),
+                        (1, Value::F32(top_p.clone())),
+                    ],
+                )
+                .unwrap();
+                assert!(
+                    instance
+                        .step(
+                            bound,
+                            &PassInputs {
+                                logits: Some(logits.clone()),
+                                ..PassInputs::default()
+                            },
+                            &mut NoKernels,
+                        )
+                        .unwrap()
+                        .committed
+                );
+                instance.host_take(bound, 2).unwrap()
+            };
+            assert_eq!(execute(&recognized), execute(&generic), "case {case}");
+        }
+    }
+
     #[test]
     fn per_layer_tap_accumulates_via_register_rule() {
         // on_attn: stats.put(scatter_set(stats.take(), [layer], imp)) with
@@ -1780,5 +2164,31 @@ mod tests {
             sort_desc_order(&[1.0, f32::NAN, 2.0, 1.0]),
             vec![2, 0, 3, 1]
         );
+        let cancellation: [f32; 4] = [1.0e20, 1.0, -1.0e20, 1.0];
+        assert_eq!(
+            canonical_reduce(&cancellation, 0.0f32, |a, b| a + b).to_bits(),
+            2.0f32.to_bits(),
+            "width-32 tree order is part of the numeric contract"
+        );
+        assert_eq!(
+            canonical_reduce(
+                &[f32::NAN, -3.0, f32::NAN],
+                f32::NEG_INFINITY,
+                canonical_max
+            ),
+            -3.0
+        );
+        assert_eq!(
+            canonical_reduce(&[-0.0, 0.0], f32::NEG_INFINITY, canonical_max).to_bits(),
+            0.0f32.to_bits()
+        );
+        assert_eq!(
+            canonical_reduce(&[-0.0, 0.0], f32::INFINITY, canonical_min).to_bits(),
+            (-0.0f32).to_bits()
+        );
+        assert_eq!(element_max(-0.0, 0.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(element_min(0.0, -0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(argmax_ordered(&[16_777_216u32, 16_777_217]), 1);
+        assert_eq!(argmax_ordered(&[-2i32, -1]), 1);
     }
 }

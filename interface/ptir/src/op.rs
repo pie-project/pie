@@ -217,7 +217,24 @@ pub enum Op {
         logits: ValueId,
         mask: ValueId,
     },
-
+    /// Causal mask for query positions: output shape `positions.shape ++ [len]`.
+    CausalMask {
+        positions: ValueId,
+        len: u32,
+    },
+    /// Causal sliding window: `key <= position && key + window > position`.
+    SlidingWindowMask {
+        positions: ValueId,
+        len: u32,
+        window: u32,
+    },
+    /// Causal sink + recent window mask.
+    SinkWindowMask {
+        positions: ValueId,
+        len: u32,
+        sink: u32,
+        window: u32,
+    },
     // ── sampling ─────────────────────────────────────────────────────────
     /// Ambient-seed noise (`0x70`, v4-exact; per-fire seed folded by the
     /// runtime). Kept for epilogue-parity with shipped samplers.
@@ -317,6 +334,9 @@ impl Op {
             | Op::CumProd(a)
             | Op::SortDesc(a)
             | Op::TopK { input: a, .. }
+            | Op::CausalMask { positions: a, .. }
+            | Op::SlidingWindowMask { positions: a, .. }
+            | Op::SinkWindowMask { positions: a, .. }
             | Op::RngKeyed { state: a, .. }
             | Op::ChanPut { value: a, .. } => vec![a],
 
@@ -387,6 +407,9 @@ impl Op {
             | Op::CumProd(a)
             | Op::SortDesc(a)
             | Op::TopK { input: a, .. }
+            | Op::CausalMask { positions: a, .. }
+            | Op::SlidingWindowMask { positions: a, .. }
+            | Op::SinkWindowMask { positions: a, .. }
             | Op::RngKeyed { state: a, .. }
             | Op::ChanPut { value: a, .. } => *a = f(*a),
 
@@ -487,6 +510,9 @@ impl Op {
             Op::ScatterSet { .. } => 0x63,
             Op::Iota { .. } => 0x64,
             Op::MaskApply { .. } => 0x65,
+            Op::CausalMask { .. } => 0x66,
+            Op::SlidingWindowMask { .. } => 0x67,
+            Op::SinkWindowMask { .. } => 0x68,
             Op::Rng { .. } => 0x70,
             Op::RngKeyed { .. } => 0x71,
             Op::Const(_) => 0x81,
@@ -838,6 +864,27 @@ pub const OP_TABLE: &[OpSpec] = &[
         results: 1,
     },
     OpSpec {
+        tag: 0x66,
+        name: "causal_mask",
+        family: Family::Index,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x67,
+        name: "sliding_window_mask",
+        family: Family::Index,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
+        tag: 0x68,
+        name: "sink_window_mask",
+        family: Family::Index,
+        val_operands: 1,
+        results: 1,
+    },
+    OpSpec {
         tag: 0x70,
         name: "rng",
         family: Family::Sampling,
@@ -985,6 +1032,21 @@ mod tests {
             },
             Op::Iota { len: 8 },
             Op::MaskApply { logits: 0, mask: 1 },
+            Op::CausalMask {
+                positions: 0,
+                len: 8,
+            },
+            Op::SlidingWindowMask {
+                positions: 0,
+                len: 8,
+                window: 4,
+            },
+            Op::SinkWindowMask {
+                positions: 0,
+                len: 8,
+                sink: 2,
+                window: 4,
+            },
             Op::Rng {
                 stream: 0,
                 shape: Shape::vector(4),

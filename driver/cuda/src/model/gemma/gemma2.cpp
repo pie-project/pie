@@ -1,4 +1,5 @@
 #include "model/gemma/gemma2.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <cmath>
 #include <stdexcept>
@@ -160,6 +161,11 @@ void gemma2_forward_paged(
             ws.norm_x.data(), layer.k_proj->data(), ws.k.data(), N, Hk, H);
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L), stream);
 
         // Per-head q/k RMSNorm (Gemma-3+) — applied before the query
         // pre-scale and before RoPE, matching HF's
@@ -193,7 +199,6 @@ void gemma2_forward_paged(
             ws.q.data(), ws.k.data(), positions,
             N, num_q_heads_local, num_kv_heads_local, d,
             layer_rope_theta, stream);
-
         auto kv_view = cache.layer_view(L);
         kernels::launch_write_kv_to_pages(
             kv_view, ws.k.data(), ws.v.data(),
@@ -227,6 +232,11 @@ void gemma2_forward_paged(
                 N, R, num_q_heads_local, attn_ws, stream,
                 layer_window_left, fwd_cfg.attn_logit_softcap);
         }
+        invoke_stage_hook(
+            StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L), stream);
 
         // 1c. o_proj → norm_x scratch (NOT into y), apply post-attn norm,
         //     then residual-add into y. Under TP this is row-parallel; we

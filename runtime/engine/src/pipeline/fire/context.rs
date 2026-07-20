@@ -25,12 +25,19 @@ pub trait FireContext {
     /// type directly so this trait need not name either module).
     fn process_id(&self) -> uuid::Uuid;
 
-    /// Process-owned KV membership captured independently of WIT handles.
-    fn kv_working_sets(
-        &self,
-    ) -> std::collections::HashSet<crate::store::kv::page_table::WorkingSetId>;
+    /// Whether this fire should carry request-level timing. Process contexts
+    /// claim compact-ledger timing once locally; teardown contexts never do.
+    fn fire_timing_requested(&self) -> bool {
+        false
+    }
+
+    /// Commit a compact-ledger claim only after scheduler queue admission.
+    fn commit_fire_timing(&mut self, _enabled: bool) {}
 
     /// Honor a requester self-suspend decision while this task still owns the
     /// process continuation.
     async fn honor_preemption(&mut self) -> anyhow::Result<()>;
+
+    /// Notification raised when this process is asked to quiesce.
+    fn preemption_signal(&self) -> Option<std::sync::Arc<tokio::sync::Notify>>;
 }

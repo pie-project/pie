@@ -25,6 +25,8 @@
 #include <memory>
 #include <pie_driver_abi.h>
 
+#include "model/precomputed_embedding_inputs.hpp"
+
 namespace pie_cuda_driver {
 
 class LoadedModel;
@@ -40,6 +42,7 @@ namespace model {
 struct Qwen3Weights;
 struct Workspace;
 class IModel;
+struct StageHooks;
 }  // namespace model
 
 namespace ops {
@@ -79,9 +82,9 @@ struct ForwardFn {
     // satisfy that yet — left here as the explicit flip we'll set
     // alongside the graph-safe attention dispatch refactor.
     bool graph_safe = false;
-    bool supports_tp_greedy_argmax = false;
     bool supports_compact_logits = false;
     bool supports_small_prefill_graph = false;
+    bool supports_runtime_window = false;
 
     // All metadata needed to execute one forward body call. Bundled as a
     // struct so adding a new field is a one-site addition rather than a
@@ -109,6 +112,8 @@ struct ForwardFn {
         // Optional: custom attention mask (BRLE-packed)
         const std::uint8_t*  custom_mask_d        = nullptr;
         const std::int32_t*  custom_mask_indptr_d = nullptr;
+        // -2: no runtime override; -1: full causal; >=0: sliding window.
+        int                  runtime_window_left = -2;
 
         // Optional: explicit KV-write descriptor (device-geometry WSlot/WOff,
         // B2). When `has_write_desc`, the per-layer KV append lands each lane's
@@ -119,12 +124,15 @@ struct ForwardFn {
         // fork's cell must not be overwritten by the standard derivation).
         const std::uint32_t* w_page_d             = nullptr;
         const std::uint32_t* w_off_d              = nullptr;
+        const std::uint8_t*  row_valid_d           = nullptr;
         bool                 has_write_desc       = false;
 
         // Optional: per-request rs-cache slot info
         const std::int32_t*  slot_ids_h           = nullptr;
         const std::uint8_t*  is_fresh_h            = nullptr;
         const std::int32_t*  slot_ids_d           = nullptr;
+        const std::uint8_t*  is_fresh_d           = nullptr;
+        const std::uint8_t*  rs_slot_flags_h      = nullptr;
 
         // Optional: logit row gather indices (for compact-logit modes)
         const std::int32_t*  logit_row_indices_d  = nullptr;
@@ -135,10 +143,6 @@ struct ForwardFn {
         // than materialize dense logits over all N rows. Defaults true so
         // ordinary text fires (which always sample ≥ 1 row) are unaffected.
         bool emit_logits = true;
-
-        // Internal TP/graph hint; direct PTIR launches leave this disabled so
-        // the selected logits remain available to the stage program.
-        bool tp_greedy_argmax = false;
 
         // Recurrent-only commit-advance: when non-null, the forward runs ONLY
         // the linear-attn block of each linear layer (conv + recurrence,
@@ -162,6 +166,8 @@ struct ForwardFn {
         //     recurrent_state[slot_ids[r]].
         const std::uint32_t* rs_buffer_slot_ids_h    = nullptr;  // flattened CSR
         const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;  // R+1, leading 0
+        const std::uint32_t* rs_fold_lens_h           = nullptr;  // R
+        const std::int32_t*  rs_fold_lens_d           = nullptr;  // R
         bool                 rs_buffer_write          = false;
         bool                 rs_buffer_fold           = false;
 
@@ -191,6 +197,11 @@ struct ForwardFn {
         const std::uint32_t* audio_feature_byte_indptr_h = nullptr; // n_clip+1 byte offsets
         const std::uint32_t* audio_anchor_rows_h      = nullptr;  // n_clip row offsets
         int                  num_clips                 = 0;
+        PrecomputedEmbeddingInputs precomputed_embeddings;
+
+        // Launch-scoped PTIR anatomical hooks. Null for ordinary forwards and
+        // TP followers; direct staged launches install this only on rank 0.
+        const model::StageHooks* stage_hooks = nullptr;
     };
 
     struct PrepareInputs {
@@ -204,12 +215,12 @@ struct ForwardFn {
         int total_tokens = 0;
         int num_requests = 0;
         bool is_pure_decode = false;
+        int runtime_window_left = -2;
     };
 
     // The arch implementation. context.cpp sets this once at construction;
     // the batch engine dispatches every per-fire call through these methods.
     model::IModel* model = nullptr;
-    bool supports_fused_lmhead_argmax = false;
 
     // Wire `m` as the active arch and copy its capability bits onto the
     // ForwardFn caps that the batch engine consults each fire. Subsumes the
@@ -226,9 +237,6 @@ struct ForwardFn {
                      ops::CublasHandle& cublas,
                      const ForwardInputs& in);
     std::uint32_t invoke_graph_layout();
-    void invoke_set_logits_argmax_only(bool enabled);
-    void invoke_set_fused_argmax_output(std::int32_t* ptr);
-    bool invoke_fused_argmax_done();
 };
 
 struct NativeSystemCommitInputs {
@@ -383,11 +391,6 @@ struct BatchEngine {
     // persistent per-instance execution contexts keyed by the bound
     // instance id. Never null once the driver has finished composing.
     pipeline::Dispatch* dispatch = nullptr;
-    // Pipeline dispatch consumes a compact F32 matrix ordered by
-    // `sampling_indices`. Gather the selected BF16 rows here, then widen
-    // them before dispatch. See `batch/logits.hpp`.
-    DeviceBuffer<std::uint16_t> ptir_logits_bf16;
-    DeviceBuffer<float> ptir_logits_f32;
 };
 
 // Pre-capture the pure-decode CUDA graph lattice for graph-safe forwards.
@@ -415,8 +418,13 @@ cudaGraphExec_t capture_forward_graph_exec(
     const std::int32_t* slot_ids_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
-    bool single_gpu_greedy_argmax,
-    bool tp_greedy_argmax);
+    // Write descriptor: bound UNCONDITIONALLY in every capture (RV-8). The
+    // graph key is {R, N, variant}; a capture without the explicit-write
+    // kernel would silently collide with write-desc fires at replay.
+    const std::uint32_t* w_page_d,
+    const std::uint32_t* w_off_d,
+    bool has_write_desc,
+    int runtime_window_left);
 
 // Env-gated (`PIE_STEP_PROFILE`) forward-body wall-clock timer. Declared here
 // (not private to batch/forward.cpp) because `handle_fire_batch` in
@@ -466,8 +474,8 @@ struct StepProfileTimer {
 };
 
 // Wire-shaped forward input spans for one fire, resolved in
-// `batch/compose.cpp` (either straight from the wire view or from the
-// composed device-geometry batch) and handed to `run_forward_dispatch`.
+// `batch/compose.cpp` (straight from the wire, composed device geometry, or a
+// graph-padded decode bucket) and handed to `run_forward_dispatch`.
 struct ForwardInputViews {
     std::span<const std::uint32_t> tokens;
     std::span<const std::uint32_t> positions;
@@ -479,10 +487,8 @@ struct ForwardInputViews {
     int num_requests = 0;
 };
 
-// Wraps the fire's already-resolved spans into `ForwardInputViews`. Direct
-// PTIR launches always dispatch at the exact wire/composed geometry — there
-// is no separate "graph-padded" request count at this callsite — so this is
-// a thin, allocation-free adapter rather than a padding/copy path.
+// Wraps already-resolved spans into `ForwardInputViews`. The adapter itself is
+// allocation-free; `batch/compose.cpp` owns any graph-padding storage.
 ForwardInputViews make_forward_input_views(
     std::span<const std::uint32_t> tokens,
     std::span<const std::uint32_t> positions,
@@ -496,19 +502,16 @@ ForwardInputViews make_forward_input_views(
 // and passed by-ref so the dispatcher can pick between graph replay
 // and a direct `forward_fn.body` call without a 20-arg signature.
 //
-// Direct PTIR launches keep the forward geometry exact (a stage program
-// runs after the model and cannot share the legacy graph variants that
-// fused sampling into the captured forward), so `run_forward_dispatch`
-// always takes the direct `forward_fn.body` path at its sole callsite in
-// `handle_fire_batch`. Graph capture/replay for decode-only shapes is
-// still used by `capture_forward_graph_lattice` (tp_size > 1 startup
-// precapture) and `tp_follower_serve` (TP follower replay).
+// A launch with anatomical stages takes the direct body path so its per-layer
+// hooks execute on every invocation. Boundary-only PTIR stays outside the model
+// graph and therefore does not alter its topology.
 struct ForwardDispatchInputs {
     int forward_R = 0;
     int forward_N = 0;
     int num_sampling = 0;
     bool is_pure_decode = false;
     bool have_custom_mask = false;
+    int structured_window_left = -2;
     // Explicit KV-write descriptor present (device-geometry WSlot/WOff, B2).
     // When set, the forward routes the per-layer KV append through the explicit
     // (physical page, offset) kernel from pi.w_page/pi.w_off.
@@ -526,7 +529,10 @@ struct ForwardDispatchInputs {
     // the separate fold-replay dispatch instead (not this path).
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr;
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr;
+    const std::uint32_t* rs_fold_lens_h = nullptr;
+    const std::int32_t*  rs_fold_lens_d = nullptr;
     bool                 rs_buffer_write = false;
+    bool                 rs_buffer_fold = false;
     // Multimodal (gemma4 vision): image side-channel, set from the view.
     const float*         image_pixels_h = nullptr;
     const std::uint32_t* image_pixel_byte_indptr_h = nullptr;
@@ -543,7 +549,29 @@ struct ForwardDispatchInputs {
     const std::uint32_t* audio_feature_byte_indptr_h = nullptr;
     const std::uint32_t* audio_anchor_rows_h = nullptr;
     int                  num_clips = 0;
+    PrecomputedEmbeddingInputs precomputed_embeddings;
+    const model::StageHooks* stage_hooks = nullptr;
 };
+
+// Whether a dispatch with these properties replays/captures a forward CUDA
+// graph. ONE predicate shared by the dispatcher (which keys the graph cache)
+// and the composer (which pads eligible waves to the request lattice) — if
+// the two drift, padded waves stop matching cached graphs. `forward_R` and
+// `is_fresh_h_data` describe the REAL (pre-padding) rows.
+bool forward_graph_replay_eligible(
+    const BatchEngine& engine,
+    bool is_pure_decode,
+    bool have_custom_mask,
+    bool rs_buffer_write,
+    bool rs_buffer_fold,
+    bool has_write_desc,
+    int structured_window_left,
+    bool use_slots,
+    const std::uint8_t* is_fresh_h_data,
+    int forward_R,
+    int num_images,
+    int num_clips,
+    bool has_stage_hooks);
 
 // Run the per-fire forward body directly against `forward_fn.body`. See
 // `ForwardDispatchInputs` for why this is not a graph-replay dispatcher.

@@ -134,6 +134,7 @@ int main() {
     if (!expect(dispatch.bind_instance(
                     /*instance_id=*/76,
                     program_hash,
+                    PIE_GEOMETRY_CLASS_HOST,
                     /*pacing_wait_id=*/1234,
                     channel_ids,
                     {bad_seed},
@@ -145,17 +146,35 @@ int main() {
     if (!expect(dispatch.bind_instance(
                     /*instance_id=*/76,
                     program_hash,
+                    PIE_GEOMETRY_CLASS_HOST,
                     /*pacing_wait_id=*/1234,
                     duplicate_ids,
                     {},
                     &binding,
                     &err) == PIE_STATUS_INVALID_ARGUMENT,
                 "reject duplicate channel ids")) return 1;
+    if (!expect(dispatch.bind_instance(
+                    /*instance_id=*/76,
+                    program_hash,
+                    PIE_GEOMETRY_CLASS_DECODE_ENVELOPE,
+                    /*pacing_wait_id=*/1234,
+                    channel_ids,
+                    {},
+                    &binding,
+                    &err) == PIE_STATUS_INVALID_ARGUMENT,
+                "reject mismatched geometry classification")) return 1;
+    if (!expect(
+            err.find("cannot execute as a decode envelope") != std::string::npos,
+            "geometry mismatch diagnostic")) return 1;
     const int bind_rc = dispatch.bind_instance(
-        /*instance_id=*/77, program_hash, /*pacing_wait_id=*/1234,
+        /*instance_id=*/77, program_hash, PIE_GEOMETRY_CLASS_HOST,
+        /*pacing_wait_id=*/1234,
         channel_ids, {}, &binding, &err);
     if (!expect(bind_rc == PIE_STATUS_OK, err.c_str())) return 1;
     if (!expect(binding.instance_id == 77, "instance id")) return 1;
+    if (!expect(
+            binding.geometry_class == PIE_GEOMETRY_CLASS_HOST,
+            "geometry class ack")) return 1;
     for (std::size_t i = 0; i < endpoints.size(); ++i) {
         const auto& endpoint = endpoints[i];
         if (!expect(endpoint.channel_id == channel_ids[i], "stable channel id")) return 1;

@@ -18,6 +18,7 @@ pub struct ModelLoadDesc {
     pub load_plan_bytes: Vec<u8>,
     pub snapshot_dir: PathBuf,
     pub compiler_version: u64,
+    pub component: crate::ModelComponent,
 }
 
 /// Create-time device properties used by the runtime storage compiler.
@@ -59,6 +60,18 @@ pub struct DriverCapabilities {
     /// Bytes per recurrent-state slot, for accounting/telemetry.
     #[serde(default)]
     pub rs_cache_slot_bytes: u64,
+    /// The loaded model exposes native MTP draft-logit rows to PTIR.
+    #[serde(default)]
+    pub has_mtp_logits: bool,
+    /// The loaded model exposes device-resident MTP draft token IDs to PTIR.
+    #[serde(default)]
+    pub has_mtp_drafts: bool,
+    /// The loaded model exposes a scalar value-head result to PTIR.
+    #[serde(default)]
+    pub has_value_head: bool,
+    /// Descriptor-port tags the driver can resolve on-device for decode envelopes.
+    #[serde(default)]
+    pub device_geometry_port_mask: u32,
     /// Maximum forward-pass tokens accepted in one driver fire.
     pub max_forward_tokens: u32,
     /// Maximum forward-pass requests accepted in one driver fire.
@@ -73,9 +86,15 @@ pub struct DriverCapabilities {
     pub max_model_len: u32,
     /// Activation dtype on the driver side (`bf16` / `f16` / `f32`).
     pub activation_dtype: String,
+    #[serde(default)]
+    pub hidden_size: u32,
+    #[serde(default)]
+    pub supports_media_encode: bool,
     /// Optional snapshot directory the driver can use to persist state.
     #[serde(default)]
     pub snapshot_dir: String,
+    #[serde(default)]
+    pub kv_handle: Option<crate::transfer::KvHandle>,
 }
 
 #[cfg(test)]
@@ -95,13 +114,18 @@ mod tests {
             "arch_name": "qwen3",
             "vocab_size": 151936,
             "max_model_len": 4096,
-            "activation_dtype": "bf16"
+            "activation_dtype": "bf16",
+            "has_mtp_logits": true,
+            "has_mtp_drafts": false,
+            "has_value_head": false
         }"#
     }
 
     #[test]
     fn capabilities_round_trip() {
         let caps: DriverCapabilities = serde_json::from_str(caps_json()).unwrap();
+        assert!(caps.has_mtp_logits);
+        assert!(!caps.has_mtp_drafts);
         let json = serde_json::to_string(&caps).unwrap();
         assert_eq!(
             serde_json::from_str::<DriverCapabilities>(&json).unwrap(),

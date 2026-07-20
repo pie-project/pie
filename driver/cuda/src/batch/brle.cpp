@@ -1,6 +1,8 @@
 #include "batch/brle.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <limits>
 #include <stdexcept>
 
 namespace pie_cuda_driver::brle {
@@ -64,6 +66,39 @@ void require_valid_layout(
     }
 }
 
+bool packed_bit(
+    std::span<const std::uint32_t> words,
+    std::uint32_t begin,
+    std::uint32_t end,
+    std::uint32_t bit) {
+    const std::uint32_t word = bit / 32;
+    if (begin + word >= end) return false;
+    return ((words[begin + word] >> (bit % 32)) & 1u) != 0;
+}
+
+bool leading_true_prefix(
+    std::span<const std::uint32_t> words,
+    std::uint32_t begin,
+    std::uint32_t end,
+    std::uint32_t& prefix) {
+    prefix = 0;
+    bool saw_tail = false;
+    for (std::uint32_t index = begin; index < end; ++index) {
+        const std::uint32_t word = words[index];
+        if (saw_tail) {
+            if (word != 0) return false;
+            continue;
+        }
+        const std::uint32_t ones = std::countr_one(word);
+        prefix += ones;
+        if (ones != 32) {
+            if ((word >> ones) != 0) return false;
+            saw_tail = true;
+        }
+    }
+    return prefix != 0;
+}
+
 }  // namespace
 
 bool is_pure_causal(
@@ -74,6 +109,34 @@ bool is_pure_causal(
     std::span<const std::uint32_t> kv_last_page_lens_h,
     int page_size)
 {
+    std::vector<std::uint32_t> lengths;
+    if (!causal_prefix_lengths(
+            flattened_masks, mask_indptr, qo_indptr_h,
+            kv_page_indptr_h, kv_last_page_lens_h,
+            page_size, lengths)) {
+        return false;
+    }
+    const int R = static_cast<int>(qo_indptr_h.size()) - 1;
+    for (int r = 0; r < R; ++r) {
+        if (lengths[r] != static_cast<std::uint32_t>(kv_len_for(
+                r, page_size, kv_page_indptr_h,
+                kv_last_page_lens_h))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool causal_prefix_lengths(
+    std::span<const std::uint32_t> flattened_masks,
+    std::span<const std::uint32_t> mask_indptr,
+    std::span<const std::uint32_t> qo_indptr_h,
+    std::span<const std::uint32_t> kv_page_indptr_h,
+    std::span<const std::uint32_t> kv_last_page_lens_h,
+    int page_size,
+    std::vector<std::uint32_t>& lengths)
+{
+    lengths.clear();
     const int R = static_cast<int>(qo_indptr_h.size()) - 1;
     if (R <= 0) return true;
     if (!has_valid_layout(flattened_masks, mask_indptr, qo_indptr_h,
@@ -81,27 +144,33 @@ bool is_pure_causal(
         return false;
     }
 
+    lengths.reserve(R);
     for (int r = 0; r < R; ++r) {
-        const int kv_len = kv_len_for(r, page_size,
-                                      kv_page_indptr_h, kv_last_page_lens_h);
+        const int physical_kv_len = kv_len_for(
+            r, page_size, kv_page_indptr_h, kv_last_page_lens_h);
         const int qo_lo = static_cast<int>(qo_indptr_h[r]);
         const int qo_hi = static_cast<int>(qo_indptr_h[r + 1]);
         const int qo_len = qo_hi - qo_lo;
-        const int pre_kv = kv_len - qo_len;
+        if (qo_len <= 0) return false;
+        std::uint32_t previous_prefix = 0;
 
         for (int q = 0; q < qo_len; ++q) {
             const int token_idx = qo_lo + q;
-            const int p = pre_kv + q;  // absolute KV position for this token
-            const int rle_start = static_cast<int>(mask_indptr[token_idx]);
-            const int rle_end   = static_cast<int>(mask_indptr[token_idx + 1]);
-
-            // Causal pattern: BRLE = [0, p+1] (one zero-run of 0, one
-            // one-run of length p+1). Anything else means custom mask.
-            if (rle_end - rle_start != 2) return false;
-            if (flattened_masks[rle_start] != 0u) return false;
-            if (flattened_masks[rle_start + 1] != static_cast<std::uint32_t>(p + 1))
+            std::uint32_t prefix = 0;
+            if (!leading_true_prefix(
+                    flattened_masks,
+                    mask_indptr[token_idx],
+                    mask_indptr[token_idx + 1],
+                    prefix) ||
+                (q != 0 && prefix != previous_prefix + 1)) {
                 return false;
+            }
+            previous_prefix = prefix;
         }
+        if (previous_prefix > static_cast<std::uint32_t>(physical_kv_len)) {
+            return false;
+        }
+        lengths.push_back(previous_prefix);
     }
     return true;
 }
@@ -140,7 +209,7 @@ DecodedMasks decode(
     }
     out.packed.assign(static_cast<std::size_t>(out.mask_indptr.back()), 0);
 
-    // Second pass: decode BRLE → packed bits.
+    // Second pass: repack the row-aligned u32 words into byte-packed requests.
     for (int r = 0; r < R; ++r) {
         const int kv_len = kv_len_for(r, page_size,
                                       kv_page_indptr_h, kv_last_page_lens_h);
@@ -151,36 +220,20 @@ DecodedMasks decode(
 
         for (int q = 0; q < qo_len; ++q) {
             const int token_idx = qo_lo + q;
-            const int rle_start = static_cast<int>(mask_indptr[token_idx]);
-            const int rle_end   = static_cast<int>(mask_indptr[token_idx + 1]);
-
-            // BRLE always starts with a (possibly empty) false run, then
-            // alternates true / false / true / ...
-            int kv_pos = 0;
-            bool is_true_run = false;
-
-            for (int run_idx = rle_start; run_idx < rle_end; ++run_idx) {
-                int run_len = static_cast<int>(flattened_masks[run_idx]);
-                if (kv_pos >= kv_len) break;
-                int eff_len = std::min(run_len, kv_len - kv_pos);
-
-                if (is_true_run && eff_len > 0) {
-                    // Set `eff_len` consecutive bits starting at row q,
-                    // column kv_pos. Output offset = q * kv_len + kv_pos.
-                    const std::int64_t row_bit_off =
-                        static_cast<std::int64_t>(q) *
-                        static_cast<std::int64_t>(kv_len);
-                    for (int i = 0; i < eff_len; ++i) {
-                        const std::int64_t bit = row_bit_off + kv_pos + i;
-                        row_base[bit / 8] |=
-                            static_cast<std::uint8_t>(1u << (bit % 8));
-                    }
+            const std::uint32_t word_begin = mask_indptr[token_idx];
+            const std::uint32_t word_end = mask_indptr[token_idx + 1];
+            const std::int64_t row_bit_off =
+                static_cast<std::int64_t>(q) * kv_len;
+            for (int key = 0; key < kv_len; ++key) {
+                if (!packed_bit(
+                        flattened_masks, word_begin, word_end,
+                        static_cast<std::uint32_t>(key))) {
+                    continue;
                 }
-                kv_pos += eff_len;
-                is_true_run = !is_true_run;
+                const std::int64_t bit = row_bit_off + key;
+                row_base[bit / 8] |=
+                    static_cast<std::uint8_t>(1u << (bit % 8));
             }
-            // Bits past the BRLE-encoded `kv_pos` stay 0 (false), which is
-            // the correct interpretation of "implicitly masked".
         }
     }
 

@@ -1,4 +1,5 @@
 #include "model/kimi/kimi_forward.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -547,6 +548,11 @@ void kimi_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 kimi_ws.q_a.data(), *Lw.q_b_proj,
                 kimi_ws.q_b.data(), total_tokens, heads * (q_nope + q_rope), q_lora);
+            invoke_stage_hook(
+                StageHookPoint::OnAttnProj, kimi_ws.q_b.data(),
+                static_cast<std::uint32_t>(total_tokens),
+                static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
+                static_cast<std::uint32_t>(li), stream);
             kernels::launch_kimi_split_kv_a_norm_bf16(
                 kimi_ws.kv_a_mqa.data(), Lw.kv_a_norm->data(),
                 kimi_ws.kv_c.data(), kimi_ws.k_pe.data(),
@@ -607,6 +613,11 @@ void kimi_forward_paged(
                 kimi_ws.attn_latent.data(), Lw.kv_b_proj->data(),
                 kimi_ws.attn_v.data(),
                 total_tokens, heads, q_nope, v_dim, kv_lora, stream);
+            invoke_stage_hook(
+                StageHookPoint::OnAttn, kimi_ws.q_b.data(),
+                static_cast<std::uint32_t>(total_tokens),
+                static_cast<std::uint32_t>(heads * (q_nope + q_rope)),
+                static_cast<std::uint32_t>(li), stream);
 
             if (T == 1) {
                 ops::gemm_act_x_w(cublas.handle(),
@@ -834,16 +845,7 @@ void kimi_forward_paged(
             "post_moe", tp != nullptr ? tp->rank() : 0, stream);
     }
 
-    const bool use_tp_greedy =
-        fwd_cfg.tp_greedy_argmax && T > 1 && tp != nullptr &&
-        w.lm_head_tp_sharded &&
-        w.lm_head != nullptr &&
-        w.lm_head->shape().size() == 2 &&
-        w.lm_head->shape()[0] > 0 &&
-        fwd_cfg.greedy_pairs != nullptr &&
-        fwd_cfg.greedy_pairs_all != nullptr &&
-        T <= 8;
-    if (!fwd_cfg.emit_logits && !use_tp_greedy) {
+    if (!fwd_cfg.emit_logits) {
         profile.end(stream);
         maybe_print_profile(profile);
         return;
@@ -867,31 +869,9 @@ void kimi_forward_paged(
             final_in, w.final_norm->data(), kimi_ws.norm_y.data(),
             rows, H, eps, stream);
     });
-    if (use_tp_greedy) {
-        const int V_local = static_cast<int>(w.lm_head->shape()[0]);
-        profile_cuda_stage(&profile, &profile.lm_head_ms, stream, [&] {
-            ops::gemm_act_x_w(cublas.handle(),
-                kimi_ws.norm_y.data(), *w.lm_head, logits_out,
-                rows, V_local, H);
-            dump_top_logits(logits_out, rows, V_local,
-                tp != nullptr ? tp->rank() : 0,
-                w.lm_head_tp_vocab_offset, stream);
-            kernels::launch_argmax_bf16_tile_pair(
-                logits_out,
-                reinterpret_cast<std::uint64_t*>(fwd_cfg.greedy_pairs),
-                rows, V_local, w.lm_head_tp_vocab_offset, stream);
-            tp->all_gather_bytes(
-                fwd_cfg.greedy_pairs, fwd_cfg.greedy_pairs_all,
-                static_cast<std::size_t>(rows) * sizeof(std::uint64_t),
-                stream);
-        });
-        profile.end(stream);
-        maybe_print_profile(profile);
-        return;
-    }
     if (w.lm_head_tp_sharded) {
         throw std::runtime_error(
-            "kimi: sharded lm_head requires TP greedy argmax for logits");
+            "kimi: sharded lm_head cannot emit full-vocab logits");
     }
     profile_cuda_stage(&profile, &profile.lm_head_ms, stream, [&] {
         ops::gemm_act_x_w(cublas.handle(),

@@ -23,14 +23,6 @@ void launch_argmax_bf16_compact_scatter(
     int vocab,
     cudaStream_t stream);
 
-void launch_argmax_bf16_partitioned_pairs(
-    const void* logits,              // [num_rows, vocab] bf16
-    std::uint64_t* partial_pairs,    // [parts, num_rows]
-    int num_rows,
-    int vocab,
-    int parts,
-    cudaStream_t stream);
-
 // Direct greedy scorer for single-step draft paths. Computes
 // hidden_states @ lm_head_weight.T and returns the argmax without
 // materializing [num_rows, vocab] logits.
@@ -50,26 +42,6 @@ void launch_argmax_fp32(
     std::int32_t* token_ids,   // [num_rows]
     int num_rows,
     int vocab,
-    cudaStream_t stream);
-
-// Per-tile argmax for fused lm_head-argmax. Operates on a [num_rows,
-// tile_vocab] logits slice and produces one packed (value, token_id) pair
-// per row. `token_offset` is added to each local index so the packed pair
-// carries the global vocab token ID.
-void launch_argmax_bf16_tile_pair(
-    const void* logits,              // [num_rows, tile_vocab] bf16
-    std::uint64_t* out_pair,         // [num_rows]
-    int num_rows,
-    int tile_vocab,
-    int token_offset,
-    cudaStream_t stream);
-
-// Select the global token from rank/tile-major packed (value, token) pairs.
-void launch_select_global_argmax_pairs(
-    const std::uint64_t* pairs,
-    std::int32_t* token_ids,
-    int num_rows,
-    int num_parts,
     cudaStream_t stream);
 
 // Gemma4 MTP ordered-embedding argmax. The assistant first selects top

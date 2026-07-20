@@ -27,8 +27,10 @@ fn manifest_dir() -> PathBuf {
 #[test]
 fn rust_layout_matches_committed_header_contract() {
     assert_layout!(PieBytes, 16, 8, ptr => 0, len => 8);
+    assert_layout!(PieMutBytes, 16, 8, ptr => 0, len => 8);
     assert_layout!(PieU8Slice, 16, 8, ptr => 0, len => 8);
     assert_layout!(PieU32Slice, 16, 8, ptr => 0, len => 8);
+    assert_layout!(PieU32MutSlice, 16, 8, ptr => 0, len => 8);
     assert_layout!(PieU64Slice, 16, 8, ptr => 0, len => 8);
     assert_layout!(PieTerminalCell, 8, 4, outcome => 0, reserved0 => 4);
     assert_layout!(PieTerminalCellPtrSlice, 16, 8, ptr => 0, len => 8);
@@ -127,6 +129,16 @@ fn rust_layout_matches_committed_header_contract() {
     );
     assert_layout!(PieDriverCaps, 16, 8, json_bytes => 0, json_len => 8);
     assert_layout!(
+        PieModelLoadDesc,
+        48,
+        8,
+        abi_version => 0,
+        component => 4,
+        compiler_version => 8,
+        load_plan_bytes => 16,
+        snapshot_dir => 32
+    );
+    assert_layout!(
         PieProgramDesc,
         48,
         8,
@@ -138,20 +150,29 @@ fn rust_layout_matches_committed_header_contract() {
     );
     assert_layout!(
         PieInstanceDesc,
-        64,
+        72,
         8,
         abi_version => 0,
         reserved0 => 4,
-        program_id => 8,
-        requested_instance_id => 16,
-        pacing_wait_id => 24,
-        channel_ids => 32,
-        seed_values => 48
+        geometry_class => 8,
+        reserved1 => 12,
+        program_id => 16,
+        requested_instance_id => 24,
+        pacing_wait_id => 32,
+        channel_ids => 40,
+        seed_values => 56
     );
-    assert_layout!(PieInstanceBinding, 8, 8, instance_id => 0);
+    assert_layout!(
+        PieInstanceBinding,
+        16,
+        8,
+        instance_id => 0,
+        geometry_class => 8,
+        reserved0 => 12
+    );
     assert_layout!(
         PieLaunchDesc,
-        672,
+        800,
         8,
         abi_version => 0,
         reserved0 => 4,
@@ -188,15 +209,40 @@ fn rust_layout_matches_committed_header_contract() {
         audio_feature_indptr => 480,
         audio_anchor_rows => 496,
         audio_indptr => 512,
-        kv_len => 528,
-        kv_len_device => 544,
-        kv_translation => 560,
-        kv_translation_indptr => 576,
-        ptir_program_row_indptr => 592,
-        logical_fire_ids => 608,
-        channel_expected_head => 624,
-        channel_expected_tail => 640,
-        channel_ticket_indptr => 656
+        embed_rows => 528,
+        embed_indptr => 544,
+        embed_shapes => 560,
+        embed_dtypes => 576,
+        embed_anchor_rows => 592,
+        embed_block_indptr => 608,
+        kv_len => 624,
+        kv_len_device => 640,
+        kv_translation => 656,
+        kv_translation_indptr => 672,
+        ptir_program_row_indptr => 688,
+        ptir_kv_write_lower_bounds => 704,
+        ptir_kv_write_upper_bounds => 720,
+        logical_fire_ids => 736,
+        channel_expected_head => 752,
+        channel_expected_tail => 768,
+        channel_ticket_indptr => 784
+    );
+    assert_layout!(
+        PieEncodeDesc,
+        168,
+        8,
+        abi_version => 0,
+        reserved0 => 4,
+        image_grids => 8,
+        image_pixels => 24,
+        image_pixel_indptr => 40,
+        image_patch_positions => 56,
+        image_anchor_rows => 72,
+        audio_features => 88,
+        audio_feature_indptr => 104,
+        audio_anchor_rows => 120,
+        output_rows => 136,
+        output_row_indptr => 152
     );
     assert_layout!(
         PieKvCopyDesc,

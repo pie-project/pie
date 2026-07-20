@@ -36,7 +36,7 @@
 //! Plain input: an optional draft-window size `k` (default 4, min 2), e.g. `"6"`.
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 const PROMPT: &str = "The quick brown fox jumps over";
 /// The grammar-forced token: the allow-only-`T` per-position mask pins each
@@ -44,10 +44,6 @@ const PROMPT: &str = "The quick brown fox jumps over";
 const FORCE_TOKEN: u32 = 1;
 const PAGE_T: u32 = 16; // tokens per KV page (mock env page size)
 const NUM_LAYERS: u32 = 1;
-
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
 
 /// A `[k, vocab]` bool mask (flat, row-major) with EVERY token allowed at every
 /// position.
@@ -76,7 +72,7 @@ fn accepted_prefix(raw: &[i32]) -> Vec<i32> {
 /// `PROMPT + (k-1)` fillers, seeding the `[k, vocab]` bool allow-mask + the
 /// `[k]` draft, and read the sentinel-coded `[k]`-Token back (truncated at the
 /// first `-1` — the accepted prefix).
-fn verify_window(
+async fn verify_window(
     prompt: &[u32],
     k: u32,
     vocab: u32,
@@ -91,24 +87,27 @@ fn verify_window(
         .chain(std::iter::repeat(0).take((k - 1) as usize))
         .collect();
 
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
-    ws.reserve(n.div_ceil(PAGE_T))
+    let ws = WorkingSet::new();
+    let max_pages = n.div_ceil(PAGE_T);
+    ws.reserve(max_pages)
         .map_err(|e| format!("ws.reserve: {e}"))?;
 
     // Seeded inputs (single fire: the host geometry prefill reads seeds) + the
     // terminal [k]-Token reader output.
-    let toks = bx(Channel::from(input_toks).named("toks"));
-    let klen = bx(Channel::from(vec![n]).named("klen"));
-    let allow = bx(Channel::from_shaped([k, vocab], mask).named("allow"));
-    let draft_ch = bx(Channel::from(draft.to_vec()).named("draft"));
-    let out = bx(Channel::new([k], dtype::i32).named("out"));
+    let toks = Channel::from(input_toks).named("toks");
+    let kv_len = Channel::from(vec![n]).named("kv_len");
+    let allow = Channel::from_shaped([k, vocab], mask).named("allow");
+    let draft_ch = Channel::from(draft.to_vec()).named("draft");
+    let out = Channel::new([k], dtype::i32).named("out");
 
     // k read-out rows ⇒ intrinsics::logits() declares [k, vocab].
     let readout: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(toks, Tensor::constant(vec![0u32, n]));
-    fwd.attn_working_set(ws, klen);
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
+    fwd.port_channel(Port::KvLen, &kv_len);
+    fwd.attn_working_set(&ws, .., ..)?;
+    fwd.derive_dense_geometry();
     fwd.readout(&Tensor::constant(readout));
     fwd.epilogue(move || {
         // Takes + compute first, PUTS last (value-id discipline).
@@ -133,6 +132,7 @@ fn verify_window(
     let raw = out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("out take: {e}"))?;
     pipeline.close();
     Ok(accepted_prefix(&raw))
@@ -160,11 +160,12 @@ async fn main(input: String) -> Result<String> {
         vocab,
         allow_only(k, vocab, FORCE_TOKEN),
         &draft_t,
-    )?;
+    )
+    .await?;
 
     // Arm 2 — grammar PASSTHROUGH: all-allow ⇒ each row's masked argmax == the
     // model's natural argmax ⇒ the same draft yields a different accept-prefix.
-    let passthrough = verify_window(&prompt, k, vocab, allow_all(k, vocab), &draft_t)?;
+    let passthrough = verify_window(&prompt, k, vocab, allow_all(k, vocab), &draft_t).await?;
 
     let grammar_forces_accept = forced == draft_t;
     let composition_fires = forced != passthrough;
@@ -194,7 +195,7 @@ async fn main(input: String) -> Result<String> {
     let mut advances: Vec<usize> = Vec::new();
     for drafts in &schedule {
         let accepted =
-            verify_window(&prompt, k, vocab, allow_only(k, vocab, FORCE_TOKEN), drafts)?;
+            verify_window(&prompt, k, vocab, allow_only(k, vocab, FORCE_TOKEN), drafts).await?;
         advances.push(accepted.len());
         committed.extend_from_slice(&accepted);
     }
@@ -202,8 +203,8 @@ async fn main(input: String) -> Result<String> {
     // length, and the committed stream is the concatenation of accepted tokens
     // (all == FORCE_TOKEN, since the forced mask pins every accepted token to T).
     let loop_advances_ok = advances == expected_adv;
-    let loop_commit_ok = committed.len() == expected_adv.iter().sum::<usize>()
-        && committed.iter().all(|&x| x == t);
+    let loop_commit_ok =
+        committed.len() == expected_adv.iter().sum::<usize>() && committed.iter().all(|&x| x == t);
     let loop_ctrl_ok = loop_advances_ok && loop_commit_ok;
 
     let result = format!(

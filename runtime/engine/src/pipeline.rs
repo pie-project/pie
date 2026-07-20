@@ -27,12 +27,12 @@
 pub mod channel;
 pub mod fire;
 pub mod instance;
+pub mod offload;
 pub mod program;
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use fire::{PendingFires, PipelineFailure};
+use fire::{PendingFireQueue, PendingFires, PipelineFailure};
 
 /// A run-ahead submission pipeline (overview §3): the ORDERING domain (W3.1)
 /// — the WIT `pie:inferlet/pipeline.pipeline` resource. Owns the in-flight
@@ -58,14 +58,31 @@ use fire::{PendingFires, PipelineFailure};
 pub struct Pipeline {
     pub fires: PendingFires,
     pub(crate) failure: PipelineFailure,
+    pub(crate) scope: crate::store::PipelineScope,
+    /// `pipeline.finish` was called (graceful EOS, F7): the ordered stream
+    /// has ended, so any LATER submit on this pipeline is a guest contract
+    /// error (rejected in `fire::submit_pass`). `close` stays legal after
+    /// finish — it cancels whatever is still unexecuted (R4-1). Arc'd so
+    /// each fire's retry classifier can observe it: after finish, a put
+    /// blocked on a full ring with no attached consumer and no host role is
+    /// a DEFINITE deadlock, surfaced loud instead of retrying out (F8).
+    pub(crate) finished: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Pipeline {
     /// A fresh pipeline: an empty FIFO, no failure recorded yet.
     pub fn new() -> Self {
+        let fires = Arc::new(PendingFireQueue::new());
+        let weak_fires = Arc::downgrade(&fires);
         Self {
-            fires: Arc::new(Mutex::new(VecDeque::new())),
+            fires,
             failure: Arc::new(Mutex::new(None)),
+            scope: crate::store::PipelineScope::new(move || {
+                weak_fires
+                    .upgrade()
+                    .is_none_or(|fires| fires.lock().unwrap().is_empty())
+            }),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -73,5 +90,11 @@ impl Pipeline {
 impl Default for Pipeline {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        self.scope.close();
     }
 }

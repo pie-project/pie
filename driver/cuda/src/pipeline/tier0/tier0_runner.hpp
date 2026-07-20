@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -44,6 +45,9 @@ using namespace pie_native::ptir;
 // Per-fire inputs the runner binds into the trace (intrinsics + host tensors).
 struct FireInputs {
     const void* logits = nullptr;     // Intrinsic(Logits) base [rows, vocab], row-major
+    const void* mtp_logits = nullptr; // Intrinsic(MtpLogits) dedicated [K, vocab] base
+    const void* query = nullptr;
+    const void* layer = nullptr;
     std::uint32_t vocab = 0;
     const void* row_seeds = nullptr;  // gumbel per-row seed buffer (u32 [rows])
     std::unordered_map<std::uint32_t, const void*> host_inputs;  // host_key → device ptr
@@ -52,9 +56,9 @@ struct FireInputs {
     // DRAFT rows — an Intrinsic(MtpLogits) `[K, vocab]` matrix reads
     // `[mtp_draft_row .. mtp_draft_row + K)`. The draft logits live in DRAFT ROWS
     // of the same `ws.logits` base (not a separate buffer); only the row differs,
-    // exactly mirroring the sampling-IR resolver (runtime.cpp:135). `-1` = unset ⇒
-    // MtpLogits falls back to the base (row 0), same as Logits (safe no-op until
-    // the MTP head / draft layout writes the K rows and sets this).
+    // exactly mirroring the sampling-IR resolver (runtime.cpp:135). `-1` means
+    // the dedicated layout is unavailable and MtpLogits must fail rather than
+    // aliasing ordinary sampled-logit rows.
     int mtp_draft_row = -1;
 };
 
@@ -101,6 +105,18 @@ class Tier0Runner {
     }
     const std::vector<std::uint32_t>& commit_put_slots() const noexcept {
         return host_commit_put_slots_;
+    }
+    const std::uint32_t* commit_taken_device() const noexcept {
+        return d_commit_taken_;
+    }
+    std::uint32_t commit_taken_count() const noexcept {
+        return n_commit_taken_;
+    }
+    const std::uint32_t* commit_put_device() const noexcept {
+        return d_commit_put_;
+    }
+    std::uint32_t commit_put_count() const noexcept {
+        return n_commit_put_;
     }
     void apply_host_commit(bool committed) {
         ensure_channels();
@@ -192,6 +208,16 @@ class Tier0Runner {
         cudaMemcpyAsync(d_commit_, &one, sizeof(one), cudaMemcpyHostToDevice, stream);
     }
 
+    void finalize_commit(
+        cudaStream_t stream,
+        const std::uint32_t* commit_override = nullptr) {
+        k_commit_bump<<<1, 1, 0, stream>>>(
+            view_->d_full(), view_->d_head(), view_->d_tail(),
+            view_->d_cap1(), d_commit_taken_, n_commit_taken_,
+            d_commit_put_, n_commit_put_,
+            commit_override != nullptr ? commit_override : d_commit_);
+    }
+
     PassResult launch_pass_async(
         const FireInputs& in,
         std::vector<void*>& scratch,
@@ -203,9 +229,7 @@ class Tier0Runner {
         if (reset) reset_commit(s);
         launch_pass_body(in, scratch, res);
         if (res.ok) {
-            k_commit_bump<<<1, 1, 0, s>>>(view_->d_full(), view_->d_head(), view_->d_tail(),
-                                          view_->d_cap1(), d_commit_taken_, n_commit_taken_,
-                                          d_commit_put_, n_commit_put_, d_commit_);
+            finalize_commit(s);
         } else {
             std::uint32_t zero = 0;
             cudaMemcpyAsync(d_commit_, &zero, sizeof(zero), cudaMemcpyHostToDevice, s);
@@ -439,17 +463,40 @@ class Tier0Runner {
                     if (in.logits == nullptr) { err = "logits intrinsic unbound"; return false; }
                     // MtpLogits reads the K DRAFT rows at `mtp_draft_row` within the
                     // same `logits` base (a `[K, vocab]` matrix; the consuming op
-                    // strides K rows from here). Logits reads the base (row 0). `-1`
-                    // ⇒ MtpLogits falls back to the base (draft layout not yet set).
-                    if (v->intrinsic == Intrinsic::MtpLogits && in.mtp_draft_row >= 0) {
-                        const std::size_t elt = dtype_size(v->type.dtype);
-                        val_ptr_[id] = const_cast<std::uint8_t*>(
-                            static_cast<const std::uint8_t*>(in.logits)) +
-                            static_cast<std::size_t>(in.mtp_draft_row) *
-                                static_cast<std::size_t>(in.vocab) * elt;
+                    // strides K rows from here). Logits reads the base (row 0).
+                    if (v->intrinsic == Intrinsic::MtpLogits) {
+                        if (in.mtp_logits != nullptr) {
+                            val_ptr_[id] = const_cast<void*>(in.mtp_logits);
+                        } else if (in.mtp_draft_row < 0) {
+                            err =
+                                "MtpLogits dedicated draft-row layout unavailable";
+                            return false;
+                        } else {
+                            const std::size_t elt = dtype_size(v->type.dtype);
+                            val_ptr_[id] = const_cast<std::uint8_t*>(
+                                static_cast<const std::uint8_t*>(in.logits)) +
+                                static_cast<std::size_t>(in.mtp_draft_row) *
+                                    static_cast<std::size_t>(in.vocab) * elt;
+                        }
                     } else {
                         val_ptr_[id] = const_cast<void*>(in.logits);
                     }
+                    return true;
+                }
+                if (v->intrinsic == Intrinsic::Query) {
+                    if (in.query == nullptr) {
+                        err = "query intrinsic unbound";
+                        return false;
+                    }
+                    val_ptr_[id] = const_cast<void*>(in.query);
+                    return true;
+                }
+                if (v->intrinsic == Intrinsic::Layer) {
+                    if (in.layer == nullptr) {
+                        err = "layer intrinsic unbound";
+                        return false;
+                    }
+                    val_ptr_[id] = const_cast<void*>(in.layer);
                     return true;
                 }
                 err = "tier-0: intrinsic not yet bound"; return false;
@@ -473,6 +520,9 @@ class Tier0Runner {
                       LaunchOp& lo, std::string& err) {
         lo.code = op.code;
         lo.stream = in.stream;
+        lo.imm = op.imm;
+        lo.imm2 = op.imm2;
+        lo.imm3 = op.imm3;
         lo.row_seeds = in.row_seeds;
         lo.rng_stream = op.imm;   // Gumbel uses imm as the stream salt
         for (ValueId a : op.args) {
@@ -505,6 +555,16 @@ class Tier0Runner {
             std::uint64_t n = v->type.shape.numel();
             return n == 0 ? 1 : n;
         };
+        auto row_shape = [](const Shape& shape) {
+            const std::uint32_t len =
+                shape.dims.empty() ? 1 : shape.dims.back();
+            const std::uint64_t numel =
+                shape.numel() == 0 ? 1 : shape.numel();
+            return std::pair{
+                static_cast<std::uint32_t>(numel / std::max(len, 1u)),
+                len,
+            };
+        };
         if (op.args.size() >= 2) {
             lo.a_scalar = (operand_numel(0) == 1 && out_n > 1) ? 1 : 0;
             lo.b_scalar = (operand_numel(1) == 1 && out_n > 1) ? 1 : 0;
@@ -524,32 +584,64 @@ class Tier0Runner {
                 val_ptr_[op.result_id] = lo.in.empty() ? nullptr : const_cast<void*>(lo.in[0]);
                 val_type_[op.result_id] = rt;
                 return true;
-            case OpCode::ReduceSum: case OpCode::ReduceMax: case OpCode::ReduceArgmax:
+            case OpCode::ReduceSum: case OpCode::ReduceMax:
+            case OpCode::ReduceMin: case OpCode::ReduceArgmax:
             case OpCode::CumSum: case OpCode::CumProd:
-            case OpCode::Softmax: case OpCode::LogSoftmax: case OpCode::L2Norm:
-            case OpCode::RankLe: case OpCode::PivotThreshold:
-                lo.rows = prim_shape.rows(); lo.len = prim_shape.row_len();
+            case OpCode::PivotThreshold:
+                std::tie(lo.rows, lo.len) = row_shape(prim_shape);
                 lo.elem_dtype = prim;
                 break;
-            case OpCode::Gather: {                      // axis-0 generalized (§4)
-                // src rank-1 → element gather (out[i]=src[idx[i]]); src rank≥2 →
-                // ROW gather (out[i,:]=src[idx[i],:]). The container folds both
-                // under tag 0x60; route by the src operand's rank.
+            case OpCode::Gather: {
                 lo.elem_dtype = prim;
                 const Value* src = op.args.empty() ? nullptr : trace_->value(op.args[0]);
                 const Value* idx = op.args.size() < 2 ? nullptr : trace_->value(op.args[1]);
-                if (src && src->type.shape.rank() >= 2) {
-                    lo.code = OpCode::GatherRow;
-                    lo.rows = idx ? (std::uint32_t)(idx->type.shape.numel() == 0 ? 1 : idx->type.shape.numel()) : 1;
-                    lo.len = src->type.shape.row_len();   // product of src.dims[1..]
+                if (src && !src->type.shape.dims.empty()) {
+                    lo.axis0 = src->type.shape.dims[0];
+                    lo.inner = static_cast<std::uint32_t>(
+                        src->type.shape.numel() / std::max(lo.axis0, 1u));
                 }
+                lo.n_scatter = idx
+                    ? static_cast<std::uint32_t>(
+                          std::max<std::uint64_t>(
+                              idx->type.shape.numel(), 1))
+                    : 0;
+                lo.index_dtype = idx ? idx->type.dtype : DType::U32;
                 break;
             }
-            case OpCode::ScatterSet: {                  // copy base → out, then scatter
-                lo.n_scatter = 0;
-                if (op.args.size() >= 2) { const Value* iv = trace_->value(op.args[1]);
-                    if (iv) lo.n_scatter = (std::uint32_t)(iv->type.shape.numel() == 0 ? 1 : iv->type.shape.numel()); }
-                lo.elem_dtype = prim; break;
+            case OpCode::GatherRow: {
+                const Value* src = op.args.empty() ? nullptr : trace_->value(op.args[0]);
+                const Value* idx = op.args.size() < 2 ? nullptr : trace_->value(op.args[1]);
+                if (src && src->type.shape.dims.size() == 2) {
+                    lo.rows = src->type.shape.dims[0];
+                    lo.len = src->type.shape.dims[1];
+                    lo.axis0 = lo.rows;
+                    lo.inner = lo.len;
+                }
+                lo.index_dtype = idx ? idx->type.dtype : DType::U32;
+                lo.elem_dtype = prim;
+                break;
+            }
+            case OpCode::ScatterSet:
+            case OpCode::ScatterAdd: {
+                const Value* base = op.args.empty() ? nullptr : trace_->value(op.args[0]);
+                const Value* idx = op.args.size() < 2 ? nullptr : trace_->value(op.args[1]);
+                const Value* vals = op.args.size() < 3 ? nullptr : trace_->value(op.args[2]);
+                if (base && !base->type.shape.dims.empty()) {
+                    lo.axis0 = base->type.shape.dims[0];
+                    lo.inner = static_cast<std::uint32_t>(
+                        base->type.shape.numel() / std::max(lo.axis0, 1u));
+                }
+                lo.n_scatter = idx
+                    ? static_cast<std::uint32_t>(
+                          std::max<std::uint64_t>(
+                              idx->type.shape.numel(), 1))
+                    : 0;
+                lo.index_dtype = idx ? idx->type.dtype : DType::U32;
+                lo.scalar_vals =
+                    vals && std::max<std::uint64_t>(
+                                vals->type.shape.numel(), 1) == 1;
+                lo.elem_dtype = prim;
+                break;
             }
             case OpCode::Broadcast: {
                 lo.rows = rt.shape.rows(); lo.len = rt.shape.row_len();
@@ -586,30 +678,31 @@ class Tier0Runner {
                 // rows/len are the INPUT shape ([n] or [m,n]) — the axis top_k
                 // scans — NOT the [k] result. k = the immediate (top_k/sort_desc
                 // have no predicate — that field is exclusively pivot_threshold's).
-                lo.rows = prim_shape.rows(); lo.len = prim_shape.row_len();
+                std::tie(lo.rows, lo.len) = row_shape(prim_shape);
                 lo.k = op.imm;
                 if (op.code == OpCode::SortDesc) lo.k = lo.len;
                 break;
             case OpCode::Matmul:  // rows=M, len=K, k=N encoded in imm (N)
                 lo.k = op.imm; break;
             case OpCode::MaskApplyPacked:              // rows/len from result [rows,V]; k = mask words/row
-                lo.rows = rt.shape.rows(); lo.len = rt.shape.row_len();
+                std::tie(lo.rows, lo.len) = row_shape(rt.shape);
                 lo.k = (lo.len + 31) / 32; lo.elem_dtype = DType::F32; break;
+            case OpCode::CausalMask:
+            case OpCode::SlidingWindowMask:
+            case OpCode::SinkWindowMask:
+                lo.rows = static_cast<std::uint32_t>(operand_numel(0));
+                lo.len = op.imm;
+                lo.elem_dtype = DType::U32;
+                break;
             case OpCode::Rng:                          // ambient seed: stream=imm, kind→gumbel flag
                 lo.rows = rt.shape.rows(); lo.len = rt.shape.row_len();
                 lo.rng_stream = op.imm; lo.bcast_mode = (op.rng_kind == RngKind::Gumbel) ? 1 : 0;
                 lo.row_seeds = in.row_seeds; break;
             case OpCode::RngKeyed:                     // state=in[0]; kind→gumbel flag
                 lo.bcast_mode = (op.rng_kind == RngKind::Gumbel) ? 1 : 0; break;
-            case OpCode::GumbelNoise:
-                lo.rows = rt.shape.rows(); lo.len = rt.shape.row_len();
-                lo.rng_stream = op.imm; lo.row_seeds = in.row_seeds; break;
             default: break;
         }
-        if (op.code == OpCode::RankLe) {
-            // Composite/fusion-only form (0xE5): a true host immediate.
-            lo.k = op.imm;
-        } else if (op.code == OpCode::PivotThreshold) {
+        if (op.code == OpCode::PivotThreshold) {
             // The predicate payload is a resolved trace value (scalar or
             // per-row [rows]) — never an immediate (interface/ptir interp.rs
             // Op::PivotThreshold; all three PredTag variants carry a ValueId).
@@ -635,7 +728,9 @@ class Tier0Runner {
         val_ptr_[op.result_id] = d_out;
         val_type_[op.result_id] = rt;
 
-        if (op.code == OpCode::ScatterSet && !lo.in.empty()) {   // out starts as base copy
+        if ((op.code == OpCode::ScatterSet ||
+             op.code == OpCode::ScatterAdd) &&
+            !lo.in.empty()) {
             cudaMemcpyAsync(d_out, lo.in[0], out_bytes, cudaMemcpyDeviceToDevice, in.stream);
         }
         if (op.code == OpCode::TopK) {   // second result = indices

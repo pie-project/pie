@@ -20,7 +20,10 @@
 #include "kernels/rope.hpp"
 #include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
-#include "model/qwen3_vl/qwen3_vl_vision_forward.hpp"  // scatter_qwen3vl_vision
+#ifndef PIE_CUDA_QWEN_ONLY
+#include "model/qwen3_vl/qwen3_vl_vision_forward.hpp"
+#endif
+#include "model/stage_hooks.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/gemm.hpp"
 
@@ -274,12 +277,13 @@ void llama_like_forward_paged(
     bool is_pure_decode,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
-    bool tp_greedy_argmax,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
     const std::uint32_t* w_page_d,
     const std::uint32_t* w_off_d,
+    const std::uint8_t* row_valid_d,
     bool has_write_desc,
+    int runtime_window_left,
     const LlamaLikeVisionInputs* vision)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
@@ -329,6 +333,7 @@ void llama_like_forward_paged(
     // 1b. Qwen3-VL multimodal: encode each image and overwrite its soft-token
     // rows in the embed output; also stash the deepstack merger outputs (added
     // into the hidden state on image rows after early decoder layers below).
+#ifndef PIE_CUDA_QWEN_ONLY
     if (vision != nullptr && vision->vision_in != nullptr &&
         vision->vision_in->num_images > 0) {
         scatter_qwen3vl_vision(
@@ -338,6 +343,9 @@ void llama_like_forward_paged(
             static_cast<__nv_bfloat16*>(vision->deepstack_scratch),
             vision->num_deepstack, cublas.handle(), stream);
     }
+#else
+    (void)vision;
+#endif
 
     // Some GQA group sizes (Qwen2 small models — 6, 7) aren't in
     // flashinfer's decode dispatch table; for those we run the prefill
@@ -422,9 +430,11 @@ void llama_like_forward_paged(
                                    !ws.qkv_fused.empty();
         const bool fused_decode_qkv_post =
             use_fused_qkv &&
+            active_stage_hooks == nullptr &&
             decode_fused_post_enabled() &&
             is_pure_decode &&
             !has_custom_mask &&
+            (!has_write_desc || (w_page_d != nullptr && w_off_d != nullptr)) &&
             native_bf16_kv_cache &&
             !head_dim_padded &&
             !fwd_cfg.use_qkv_bias &&
@@ -453,6 +463,9 @@ void llama_like_forward_paged(
                     positions,
                     rope_table,
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
                     R, num_q_heads_local, num_kv_heads_local, d,
                     cache.page_size(), cache.hnd_layout(),
                     cfg.rope_theta, eps, stream);
@@ -479,6 +492,13 @@ void llama_like_forward_paged(
             maybe_add_bias(ws.k.data(), layer.k_bias, N, Hk, stream);
             maybe_add_bias(ws.v.data(), layer.v_bias, N, Hk, stream);
         }
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj,
+            ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L),
+            stream);
 
         // q_norm / k_norm: two conventions ship in the wild.
         //   * Per-head (Qwen3, OLMo-2 small, Gemma-3): weight shape
@@ -569,7 +589,6 @@ void llama_like_forward_paged(
             attn_v = ws.v_padded.data();
             attn_out_buf = ws.attn_out_padded.data();
         }
-
         auto kv_view = cache.layer_view(L);
         if (fused_decode_qkv_post) {
             // Already written by launch_qkv_decode_qk_norm_rope_write_kv_bf16.
@@ -587,24 +606,25 @@ void llama_like_forward_paged(
             kernels::launch_write_kv_explicit_bf16(
                 kv_view,
                 const_cast<void*>(attn_k), const_cast<void*>(attn_v),
-                w_page_d, w_off_d, N, stream);
+                w_page_d, w_off_d, N, stream, row_valid_d);
         } else {
             kernels::launch_write_kv_to_pages(
                 kv_view,
                 const_cast<void*>(attn_k), const_cast<void*>(attn_v),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, stream);
+                N, R, stream, row_valid_d);
         }
 
         // Per-layer sliding-window dispatch (OLMo-3, Mistral). When
         // `per_layer_window_left` is empty we fall back to the global
         // `sliding_window`; that single value is broadcast to every
         // layer (used by Mistral / Gemma-2 single-mode and Phi-3).
-        const int layer_window_left =
-            (!fwd_cfg.per_layer_window_left.empty() &&
+        const int layer_window_left = runtime_window_left >= -1
+            ? runtime_window_left
+            : (!fwd_cfg.per_layer_window_left.empty() &&
              L < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                ? fwd_cfg.per_layer_window_left[L]
-                : fwd_cfg.sliding_window;
+               ? fwd_cfg.per_layer_window_left[L]
+               : fwd_cfg.sliding_window;
 
         if (use_xqa_decode_path) {
             ops::launch_attention_xqa_decode_bf16_prepared(
@@ -652,6 +672,13 @@ void llama_like_forward_paged(
                 N, R, num_q_heads_local, attn_ws, stream, layer_window_left,
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         }
+        invoke_stage_hook(
+            StageHookPoint::OnAttn,
+            ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(L),
+            stream);
 
         // Strip the trailing pad cols off the attention output before
         // it feeds the o_proj GEMM (which expects `[N, num_q*head_dim]`,
@@ -808,57 +835,7 @@ void llama_like_forward_paged(
         }
     }
 
-    const bool use_tp_greedy =
-        tp_greedy_argmax && T > 1 && tp != nullptr &&
-        w.lm_head_tp_shard != nullptr &&
-        w.lm_head_tp_shard->shape().size() == 2 &&
-        w.lm_head_tp_shard->shape()[0] > 0 &&
-        T <= 8;
-    if (use_tp_greedy) {
-        const bool compact_logits =
-            logit_row_indices_d != nullptr && num_logit_rows > 0 &&
-            num_logit_rows < N;
-        const int V_local = static_cast<int>(w.lm_head_tp_shard->shape()[0]);
-        const void* final_act = final_norm_buf;
-        int lm_head_rows = N;
-        if (compact_logits) {
-            if (have_final_norm) {
-                kernels::launch_gather_bf16_rows(
-                    static_cast<const std::uint16_t*>(final_norm_buf),
-                    logit_row_indices_d,
-                    static_cast<std::uint16_t*>(ws.norm_x.data()),
-                    num_logit_rows, H, stream);
-                final_act = ws.norm_x.data();
-            } else {
-                kernels::launch_gather_bf16_rows(
-                    static_cast<const std::uint16_t*>(ws.y.data()),
-                    logit_row_indices_d,
-                    static_cast<std::uint16_t*>(ws.norm_x.data()),
-                    num_logit_rows, H, stream);
-                kernels::launch_rmsnorm_bf16(
-                    ws.norm_x.data(), w.final_norm->data(), ws.norm_y.data(),
-                    num_logit_rows, H, eps, stream);
-                final_act = ws.norm_y.data();
-            }
-            lm_head_rows = num_logit_rows;
-        } else if (!have_final_norm) {
-            kernels::launch_rmsnorm_bf16(
-                ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
-                N, H, eps, stream);
-            final_act = ws.norm_x.data();
-        }
-        ops::gemm_act_x_w(cublas.handle(),
-            final_act, *w.lm_head_tp_shard, ws.logits.data(),
-            lm_head_rows, V_local, H);
-        kernels::launch_argmax_bf16_tile_pair(
-            ws.logits.data(),
-            reinterpret_cast<std::uint64_t*>(ws.greedy_pairs.data()),
-            lm_head_rows, V_local, w.lm_head_tp_vocab_offset, stream);
-        tp->all_gather_bytes(
-            ws.greedy_pairs.data(), ws.greedy_pairs_all.data(),
-            static_cast<std::size_t>(lm_head_rows) * sizeof(std::uint64_t),
-            stream);
-    } else if (fwd_cfg.emit_logits) {
+    if (fwd_cfg.emit_logits) {
         const bool compact_logits =
             logit_row_indices_d != nullptr && num_logit_rows > 0 &&
             num_logit_rows < N;
@@ -889,13 +866,12 @@ void llama_like_forward_paged(
             // Full [N,V] emit (the PTIR `intrinsics::logits()` path). ALWAYS
             // recompute the final norm from `ws.y` here — do NOT fall through to
             // the `have_final_norm ? final_norm_buf` default. `final_norm_buf`
-            // (the TP fused-AR's `ws.norm_y`) is only guaranteed live on the
-            // fused greedy-argmax path that consumes it immediately; on the
-            // full-logits emit it can be stale/overwritten, so a PTIR stage-runner
-            // reading these logits saw garbage (§6.2: 19148 vs 14582). `ws.y` is
+            // (the TP fused-AR's `ws.norm_y`) can be stale/overwritten by the
+            // time the full-logits emit runs, so a PTIR stage-runner reading
+            // these logits saw garbage (§6.2: 19148 vs 14582). `ws.y` is
             // the full pre-norm hidden (the fused-AR updates it in place via
             // `residual_inout`), so `rmsnorm(ws.y)` reproduces the correct
-            // final-normed activation the fused path uses.
+            // final-normed activation.
             kernels::launch_rmsnorm_bf16(
                 ws.y.data(), w.final_norm->data(), ws.norm_y.data(),
                 N, H, eps, stream);

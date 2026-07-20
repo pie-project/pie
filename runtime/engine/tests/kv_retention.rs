@@ -59,6 +59,14 @@ struct PageProbe {
 
 impl Behavior for PageProbe {
     fn observe_launch(&self, req: &pie_engine::driver::LaunchPlan) {
+        if req.kv_page_indices.is_empty() && !req.kv_translation.is_empty() {
+            self.log
+                .lock()
+                .unwrap()
+                .push(vec![req.kv_translation.clone()]);
+            std::thread::sleep(self.latency);
+            return;
+        }
         let indptr = &req.kv_page_indptr;
         let pages = &req.kv_page_indices;
         let n = indptr.len().saturating_sub(1);
@@ -134,8 +142,15 @@ fn run_concurrent_fleet(s: &TestState) {
                 rx
             })
             .collect();
-        for rx in rxs {
-            let _ = tokio::time::timeout(PROCESS_TIMEOUT, rx).await;
+        for (lane, rx) in rxs.into_iter().enumerate() {
+            match tokio::time::timeout(PROCESS_TIMEOUT, rx).await {
+                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Err(error))) => {
+                    panic!("retention lane {lane} failed: {error}")
+                }
+                Ok(Err(_)) => panic!("retention lane {lane} result channel dropped"),
+                Err(_) => panic!("retention lane {lane} timed out"),
+            }
         }
     });
 }

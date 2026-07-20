@@ -261,9 +261,8 @@ mod tests {
         assert_eq!(b, WorkerId(1));
         wrx.changed().await.unwrap();
         assert_eq!(wrx.borrow().epoch, 2);
-        // a's neighbor list now includes b
-        assert_eq!(wrx.borrow().peers[&a].len(), 1);
-        assert_eq!(wrx.borrow().peers[&a][0].id, b);
+        // Same-role executors are deliberately omitted from the D4 pairing graph.
+        assert!(wrx.borrow().peers[&a].is_empty());
     }
 
     #[tokio::test]

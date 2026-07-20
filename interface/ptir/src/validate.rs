@@ -82,6 +82,7 @@ pub enum ValidateError {
     /// At most one program per stage; stages sorted by tag.
     DuplicateStage(Stage),
     StagesUnsorted,
+    NamesUnsortedOrDuplicate,
     /// Ports sorted by tag, unique.
     DuplicatePort(Port),
     PortsUnsorted,
@@ -91,6 +92,12 @@ pub enum ValidateError {
     },
     /// Const payload length must equal `numel × elem_size`.
     PortConstPayload {
+        port: Port,
+    },
+    /// Every attention trace must define the post-write readable extent.
+    EmbedTokensWithoutKvLen,
+    /// Every attention trace must bind its complete geometry explicitly.
+    EmbedTokensWithoutGeometry {
         port: Port,
     },
     /// Channel capacity must be ≥ 1 (trace-known constructor arg).
@@ -169,6 +176,9 @@ impl fmt::Display for ValidateError {
             Body { stage, err } => write!(f, "stage {}: {err}", stage.name()),
             DuplicateStage(s) => write!(f, "duplicate program for stage {}", s.name()),
             StagesUnsorted => f.write_str("stage programs must be sorted by stage tag"),
+            NamesUnsortedOrDuplicate => {
+                f.write_str("name table must be strictly sorted and unique")
+            }
             DuplicatePort(p) => write!(f, "duplicate binding for port {}", p.name()),
             PortsUnsorted => f.write_str("port bindings must be sorted by port tag"),
             PortChannelOutOfRange { port, chan } => {
@@ -176,6 +186,14 @@ impl fmt::Display for ValidateError {
             }
             PortConstPayload { port } => {
                 write!(f, "port {}: const payload length mismatch", port.name())
+            }
+            EmbedTokensWithoutKvLen => f.write_str("embed_tokens requires a kv_len port binding"),
+            EmbedTokensWithoutGeometry { port } => {
+                write!(
+                    f,
+                    "embed_tokens requires an explicit {} port binding",
+                    port.name()
+                )
             }
             ZeroCapacity { chan } => write!(f, "channel {chan}: capacity must be >= 1"),
             SecondProducer { chan, stage } => write!(
@@ -259,6 +277,9 @@ pub fn channel_value_type(decl: &ChannelDecl) -> ValueType {
 /// Validate a container against a profile; returns the typed, bound trace.
 pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTrace, ValidateError> {
     // ── container-level structure ────────────────────────────────────────
+    if container.names.windows(2).any(|names| names[0] >= names[1]) {
+        return Err(ValidateError::NamesUnsortedOrDuplicate);
+    }
     for w in container.stages.windows(2) {
         if w[0].stage == w[1].stage {
             return Err(ValidateError::DuplicateStage(w[0].stage));
@@ -295,6 +316,31 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
                 if data.len() != expect {
                     return Err(ValidateError::PortConstPayload { port: p.port });
                 }
+            }
+        }
+    }
+    let has_embed = container
+        .ports
+        .iter()
+        .any(|binding| binding.port == Port::EmbedTokens);
+    if has_embed
+        && !container
+            .ports
+            .iter()
+            .any(|binding| binding.port == Port::KvLen)
+    {
+        return Err(ValidateError::EmbedTokensWithoutKvLen);
+    }
+    if has_embed {
+        for port in [
+            Port::Positions,
+            Port::Pages,
+            Port::PageIndptr,
+            Port::WSlot,
+            Port::WOff,
+        ] {
+            if !container.ports.iter().any(|binding| binding.port == port) {
+                return Err(ValidateError::EmbedTokensWithoutGeometry { port });
             }
         }
     }
@@ -729,6 +775,20 @@ mod tests {
         }
     }
 
+    fn u32_port(port: Port, shape: Shape, values: &[u32]) -> PortBinding {
+        PortBinding {
+            port,
+            source: PortSource::Const {
+                dtype: DType::U32,
+                shape,
+                data: values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            },
+        }
+    }
+
     /// The overview §3 shape: tok (loop), out (host-read), mask (host-fed,
     /// bool), len (counter), rng (state) + greedy-gumbel epilogue.
     fn section3() -> TraceContainer {
@@ -810,10 +870,15 @@ mod tests {
                         data: [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect(),
                     },
                 },
+                u32_port(Port::Positions, Shape::vector(1), &[0]),
+                u32_port(Port::Pages, Shape::vector(1), &[0]),
+                u32_port(Port::PageIndptr, Shape::vector(2), &[0, 1]),
                 PortBinding {
                     port: Port::KvLen,
                     source: PortSource::Channel(3),
                 },
+                u32_port(Port::WSlot, Shape::vector(1), &[0]),
+                u32_port(Port::WOff, Shape::vector(1), &[0]),
             ],
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
@@ -830,6 +895,26 @@ mod tests {
         let bound = bind(c.clone(), ModelProfile::dummy()).expect("bind");
         assert_eq!(bound.hash, h1);
         assert_eq!(bind(c, ModelProfile::dummy()).unwrap().hash, h1);
+    }
+
+    #[test]
+    fn embed_tokens_requires_kv_len() {
+        let mut c = section3();
+        c.ports.retain(|binding| binding.port != Port::KvLen);
+        assert!(matches!(
+            bind(c, ModelProfile::dummy()),
+            Err(ValidateError::EmbedTokensWithoutKvLen)
+        ));
+    }
+
+    #[test]
+    fn embed_tokens_requires_complete_geometry() {
+        let mut c = section3();
+        c.ports.retain(|binding| binding.port != Port::Pages);
+        assert!(matches!(
+            bind(c, ModelProfile::dummy()),
+            Err(ValidateError::EmbedTokensWithoutGeometry { port: Port::Pages })
+        ));
     }
 
     #[test]
@@ -1067,6 +1152,27 @@ mod tests {
                 intr: IntrinsicId::Logits,
                 stage: Stage::Prologue
             })
+        ));
+    }
+
+    #[test]
+    fn name_table_must_be_strictly_sorted_and_unique() {
+        let unsorted = TraceContainer {
+            names: vec!["z".into(), "a".into()],
+            ..TraceContainer::default()
+        };
+        assert!(matches!(
+            bind(unsorted, ModelProfile::dummy()),
+            Err(ValidateError::NamesUnsortedOrDuplicate)
+        ));
+
+        let duplicate = TraceContainer {
+            names: vec!["a".into(), "a".into()],
+            ..TraceContainer::default()
+        };
+        assert!(matches!(
+            bind(duplicate, ModelProfile::dummy()),
+            Err(ValidateError::NamesUnsortedOrDuplicate)
         ));
     }
 }

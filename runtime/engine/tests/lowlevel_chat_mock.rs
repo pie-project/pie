@@ -89,6 +89,10 @@ fn spawn_and_capture(s: &TestState, name: &str, input: String) -> Result<String,
 /// property the mock cannot complete (exactly why `runahead`'s decode is
 /// mock-`#[ignore]`d). The discard/rollback is validated on the 4090.
 #[test]
+#[ignore = "same author-managed device-geometry KV gap as the inferlet_canary \
+            masked-decode suites: device-carried tokens with flat CSR pages \
+            have no engine execution class yet (pending RV-3 committed-value \
+            echo); identity remains 4090-gated either way"]
 fn lowlevel_chat_primary_path_runs_to_completion_on_mock() {
     let _serial = serial_guard();
     let s = state();

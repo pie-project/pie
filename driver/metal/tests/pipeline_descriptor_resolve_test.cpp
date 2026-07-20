@@ -42,11 +42,15 @@ Trace make_trace(int n_channels, std::vector<cptir::PortBinding> ports) {
 InterpInstance make_inst(int n_channels) {
     InterpInstance inst;
     for (int i = 0; i < n_channels; ++i) {
-        auto st = std::make_shared<ChannelState>();
-        st->capacity = 1;
-        inst.channels.push_back(std::move(st));
+        inst.channels.push_back(make_host_channel_state(DType::U32, 1, 1));
     }
     return inst;
+}
+
+void put(InterpInstance& inst, std::size_t channel, Value value) {
+    inst.channels[channel] =
+        make_host_channel_state(value.dtype, value.len(), 1);
+    (void)inst.channels[channel]->push(std::move(value));
 }
 
 }  // namespace
@@ -99,6 +103,25 @@ int main() {
         Trace t = make_trace(1, {{kPortPositions, 0, true}});
         expect(!is_device_geometry_trace(t), "const Positions port does not trigger device geometry");
     }
+    {
+        Trace t = make_trace(7, {{kPortEmbedTokens, 0, false},
+                                 {kPortPositions, 1, false},
+                                 {kPortPages, 2, false},
+                                 {kPortPageIndptr, 3, false},
+                                 {kPortKvLen, 4, false},
+                                 {kPortWSlot, 5, false},
+                                 {kPortWOff, 6, false}});
+        cptir::Stage stage;
+        for (cptir::ChannelId channel = 0; channel < 7; ++channel) {
+            stage.puts.push_back({channel, 0});
+        }
+        t.stages.push_back(std::move(stage));
+        expect(
+            !is_device_geometry_trace(t) &&
+                is_loop_carried_explicit_geometry_trace(t) &&
+                requires_descriptor_resolution(t),
+            "loop-carried explicit single-lane geometry resolves in the driver");
+    }
 
     std::printf("[resolve_fire_geometry]\n");
 
@@ -125,7 +148,7 @@ int main() {
     {
         Trace t = make_trace(1, {{kPortPositions, 0, false}});
         InterpInstance inst = make_inst(1);
-        inst.channels[0]->queue.push_back(Value::f32({1.0f}));
+        put(inst, 0, Value::f32({1.0f}));
         cptir::FireGeometry fg;
         std::string err;
         const GeometryResolveResult typed =
@@ -141,7 +164,7 @@ int main() {
     {
         Trace t = make_trace(1, {{kPortPositions, 0, false}});
         InterpInstance inst = make_inst(1);
-        inst.channels[0]->queue.push_back(Value::u32({5, 6, 7}));
+        put(inst, 0, Value::u32({5, 6, 7}));
         cptir::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
@@ -149,10 +172,10 @@ int main() {
         expect(fg.position_ids.size() == 3 && fg.position_ids[0] == 5 && fg.position_ids[1] == 6 &&
                   fg.position_ids[2] == 7,
               "resolved positions == [5,6,7]");
-        expect(inst.channels[0]->queue.size() == 1,
+        expect(inst.channels[0]->size() == 1,
               "resolve does not consume the channel (queue still has 1 entry)");
-        expect(inst.channels[0]->queue.front().u.size() == 3 &&
-                  inst.channels[0]->queue.front().u[0] == 5,
+        const Value unchanged = inst.channels[0]->front();
+        expect(unchanged.u.size() == 3 && unchanged.u[0] == 5,
               "channel front value unchanged after resolve (peek only)");
     }
 
@@ -161,8 +184,8 @@ int main() {
     {
         Trace t = make_trace(2, {{kPortPages, 0, false}, {kPortPageIndptr, 1, false}});
         InterpInstance inst = make_inst(2);
-        inst.channels[0]->queue.push_back(Value::u32({10, 11, 99, 99}));  // fixed shape[4]
-        inst.channels[1]->queue.push_back(Value::u32({0, 2}));           // prefix len 2
+        put(inst, 0, Value::u32({10, 11, 99, 99}));  // fixed shape[4]
+        put(inst, 1, Value::u32({0, 2}));            // prefix len 2
         cptir::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
@@ -173,11 +196,60 @@ int main() {
         expect(fg.has_kv_family, "has_kv_family set true");
     }
 
+    // Const request CSRs from the PTIR container remain available to the
+    // descriptor resolver and keep each generated request independent.
+    {
+        ExecPlan plan;
+        plan.trace = make_trace(
+            4,
+            {
+                {kPortEmbedTokens, 0, false},
+                {kPortEmbedIndptr, 0, true},
+                {kPortPositions, 1, false},
+                {kPortPages, 2, false},
+                {kPortPageIndptr, 0, true},
+                {kPortKvLen, 3, false},
+            });
+        plan.const_ports = {
+            {
+                .port = kPortEmbedIndptr,
+                .value = Value::u32({0, 1, 2}),
+            },
+            {
+                .port = kPortPageIndptr,
+                .value = Value::u32({0, 3, 6}),
+            },
+        };
+        InterpInstance inst = make_inst(4);
+        put(inst, 0, Value::i32({3, 5}));
+        put(inst, 1, Value::u32({7, 7}));
+        put(inst, 2, Value::u32({5, 6, 0, 5, 6, 0}));
+        put(inst, 3, Value::u32({7, 7}));
+        cptir::FireGeometry fg;
+        std::string err;
+        const auto result =
+            resolve_fire_geometry_typed(plan, inst, 4, fg, &err);
+        expect(
+            result.status == GeometryResolveStatus::Ready &&
+                fg.qo_indptr ==
+                    std::vector<std::uint32_t>({0, 1, 2}) &&
+                fg.kv_page_indptr ==
+                    std::vector<std::uint32_t>({0, 3, 6}) &&
+                fg.kv_last_page_lens ==
+                    std::vector<std::uint32_t>({3, 3}) &&
+                fg.sampling_indices ==
+                    std::vector<std::uint32_t>({0, 0}) &&
+                fg.sampling_indptr ==
+                    std::vector<std::uint32_t>({0, 1, 2}),
+            "const CSRs preserve two request-local geometry/readout rows (" +
+                err + ")");
+    }
+
     // KvLen -> last_page_len math: ((len-1) % page) + 1, and 0 for len==0.
     {
         Trace t = make_trace(1, {{kPortKvLen, 0, false}});
         InterpInstance inst = make_inst(1);
-        inst.channels[0]->queue.push_back(Value::u32({7, 8, 0, 1}));
+        put(inst, 0, Value::u32({7, 8, 0, 1}));
         cptir::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
@@ -193,15 +265,15 @@ int main() {
     {
         Trace t = make_trace(2, {{kPortEmbedTokens, 0, false}, {kPortEmbedIndptr, 1, false}});
         InterpInstance inst = make_inst(2);
-        inst.channels[0]->queue.push_back(Value::i32({100, 101, 102, 103, 104}));  // 5 tokens
-        inst.channels[1]->queue.push_back(Value::u32({0, 2, 5}));                 // 2 lanes
+        put(inst, 0, Value::i32({100, 101, 102, 103, 104}));  // 5 tokens
+        put(inst, 1, Value::u32({0, 2, 5}));                  // 2 lanes
         cptir::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
         expect(ok, "resolve succeeds for default-readout case (" + err + ")");
         expect(fg.sampling_indices.size() == 2 && fg.sampling_indices[0] == 1 &&
-                  fg.sampling_indices[1] == 4,
-              "default readout picks the last token of each lane [1,4]");
+                  fg.sampling_indices[1] == 2,
+              "default readout keeps request-local last-token indices [1,2]");
         expect(fg.sampling_indptr.size() == 3 && fg.sampling_indptr[0] == 0 &&
                   fg.sampling_indptr[1] == 1 && fg.sampling_indptr[2] == 2,
               "default sampling_indptr == [0,1,2]");
@@ -211,8 +283,8 @@ int main() {
     {
         Trace t = make_trace(2, {{kPortEmbedTokens, 0, false}, {kPortReadout, 1, false}});
         InterpInstance inst = make_inst(2);
-        inst.channels[0]->queue.push_back(Value::i32({1, 2, 3}));
-        inst.channels[1]->queue.push_back(Value::u32({0, 2}));
+        put(inst, 0, Value::i32({1, 2, 3}));
+        put(inst, 1, Value::u32({0, 2}));
         cptir::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
@@ -229,7 +301,7 @@ int main() {
     {
         Trace t = make_trace(1, {{kPortEmbedTokens, 0, false}});
         InterpInstance inst = make_inst(1);
-        inst.channels[0]->queue.push_back(Value::i32({7, 7, 7}));
+        put(inst, 0, Value::i32({7, 7, 7}));
         cptir::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
@@ -243,7 +315,7 @@ int main() {
     {
         Trace t = make_trace(1, {{kPortEmbedTokens, 0, false}});
         InterpInstance inst = make_inst(1);
-        inst.channels[0]->queue.push_back(Value::i32({9, 9, 9, 9}));
+        put(inst, 0, Value::i32({9, 9, 9, 9}));
         cptir::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
@@ -256,8 +328,8 @@ int main() {
     {
         Trace t = make_trace(2, {{kPortWSlot, 0, false}, {kPortWOff, 1, false}});
         InterpInstance inst = make_inst(2);
-        inst.channels[0]->queue.push_back(Value::u32({3, 4}));
-        inst.channels[1]->queue.push_back(Value::u32({1, 2}));
+        put(inst, 0, Value::u32({3, 4}));
+        put(inst, 1, Value::u32({1, 2}));
         cptir::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
@@ -270,8 +342,19 @@ int main() {
     // Dense attention mask port mapping (unpacked Bool bytes).
     {
         Trace t = make_trace(1, {{kPortAttnMask, 0, false}});
+        t.values.resize(1);
+        cptir::Stage stage;
+        cptir::Op mask_op;
+        mask_op.code = cptir::OpCode::SlidingWindowMask;
+        mask_op.result_id = 0;
+        mask_op.result_count = 1;
+        mask_op.imm = 4;
+        mask_op.imm2 = 2;
+        stage.ops.push_back(mask_op);
+        stage.puts.push_back({.channel = 0, .value = 0});
+        t.stages.push_back(std::move(stage));
         InterpInstance inst = make_inst(1);
-        inst.channels[0]->queue.push_back(Value::boolean({1, 0, 1, 1}));
+        put(inst, 0, Value::boolean({1, 0, 1, 1}));
         cptir::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
@@ -280,6 +363,38 @@ int main() {
         expect(fg.mask.size() == 4 && fg.mask[0] == 1 && fg.mask[1] == 0 && fg.mask[2] == 1 &&
                   fg.mask[3] == 1,
               "mask bytes == [1,0,1,1]");
+        expect(
+            fg.structured_mask.kind ==
+                   cptir::StructuredMaskKind::SlidingWindow &&
+                fg.structured_mask.key_len == 4 &&
+                fg.structured_mask.window == 2,
+            "semantic mask provenance accompanies its dense fallback");
+    }
+
+    // General mask SSA (including row_membership) has no special descriptor;
+    // attention consumes the ordinary dense Bool channel.
+    {
+        Trace t = make_trace(1, {{kPortAttnMask, 0, false}});
+        t.values.resize(1);
+        cptir::Stage stage;
+        cptir::Op general_mask;
+        general_mask.code = cptir::OpCode::Cast;
+        general_mask.result_id = 0;
+        general_mask.result_count = 1;
+        stage.ops.push_back(general_mask);
+        stage.puts.push_back({.channel = 0, .value = 0});
+        t.stages.push_back(std::move(stage));
+        InterpInstance inst = make_inst(1);
+        put(inst, 0, Value::boolean({1, 0, 0, 1, 1, 0}));
+        cptir::FireGeometry fg;
+        std::string err;
+        const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);
+        expect(
+            ok && fg.has_mask &&
+                fg.mask == std::vector<std::uint8_t>({1, 0, 0, 1, 1, 0}) &&
+                fg.structured_mask.kind ==
+                    cptir::StructuredMaskKind::None,
+            "row_membership-style general SSA uses dense Bool attention fallback");
     }
 
     // Not-ready mid-resolution: the first channel (embed_tokens) is ready,
@@ -288,7 +403,7 @@ int main() {
     {
         Trace t = make_trace(2, {{kPortEmbedTokens, 0, false}, {kPortPositions, 1, false}});
         InterpInstance inst = make_inst(2);
-        inst.channels[0]->queue.push_back(Value::i32({1, 2}));
+        put(inst, 0, Value::i32({1, 2}));
         cptir::FireGeometry fg;
         std::string err;
         const bool ok = resolve_fire_geometry(t, inst, 4, fg, &err);

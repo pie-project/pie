@@ -89,6 +89,11 @@ pub struct ChannelCell {
     /// Host-staged cells (seeds pre-first-fire; Writer stage cells otherwise),
     /// FIFO, dtype-native.
     staged: VecDeque<Vec<u8>>,
+    /// Host copies of Writer ring entries not yet claimed by a submitted
+    /// fire, FIFO, dtype-native. The host shadow reads the front as the next
+    /// fire's value and pops it when that fire submits — the engine's only
+    /// record of post-bind Writer puts (the ring itself is driver-shared).
+    ring_host_copies: VecDeque<Vec<u8>>,
     writer_tail: u64,
     /// Device-produced cells awaiting host `take`/`read`, FIFO, dtype-native.
     produced: VecDeque<Vec<u8>>,
@@ -188,6 +193,7 @@ impl ChannelCell {
             extern_name: None,
             attachments: Vec::new(),
             staged: VecDeque::new(),
+            ring_host_copies: VecDeque::new(),
             writer_tail: 0,
             produced: VecDeque::new(),
             device_reserved_head: 0,
@@ -244,7 +250,26 @@ impl ChannelCell {
         }
         if !self.attachments.is_empty() {
             let Some((name, dir)) = extern_binding else {
-                return Err("a private or host-visible channel may attach to only one pass".into());
+                // Same-guest cross-pass chaining (task #32 / R4-4 single-
+                // pipeline streams): a DEVICE-ONLY channel — no host role,
+                // never seeded — may attach to multiple passes. The cell is
+                // the ring-ticket source, so fires of both passes take
+                // sequential tickets in submission order, and the pipeline
+                // FIFO (same-pipeline constraint, §3.4) orders producer
+                // puts before consumer reads on the one device ring — the
+                // prefill→decode `tok_in` handoff. Host-visible or seeded
+                // channels keep the one-pass rule: their host endpoint,
+                // reader mirror, and seed staging are per-pass state.
+                if decl.host_role != HostRole::None
+                    || decl.seeded
+                    || self.role != Some(HostRole::None)
+                    || self.seeded
+                {
+                    return Err(
+                        "a host-visible or seeded channel may attach to only one pass".into(),
+                    );
+                }
+                return Ok(());
             };
             if decl.host_role != HostRole::None || decl.seeded {
                 return Err("shared extern channels cannot have a host role or seed".into());
@@ -338,6 +363,15 @@ impl ChannelCell {
             return Some(format!("channel {} is closed", self.global_id));
         }
         None
+    }
+
+    /// F8 deadlock decidability: a DEVICE-ONLY ring (no host role, unseeded)
+    /// with fewer than two pass attachments has no consumer for its puts —
+    /// after `pipeline.finish` a publish blocked on it can never commit
+    /// (the finish is what makes this decidable: before it, a consumer pass
+    /// could still attach).
+    pub fn is_consumerless_device_ring(&self) -> bool {
+        self.role == Some(HostRole::None) && !self.seeded && self.attachments.len() < 2
     }
 
     pub fn reserve_device_ticket(&mut self, consume: bool, publish: bool) -> (u64, u64) {
@@ -546,6 +580,7 @@ impl ChannelCell {
             binding.tail_word_index as usize,
             self.writer_tail,
         );
+        self.ring_host_copies.push_back(native.to_vec());
         Ok(())
     }
 
@@ -785,15 +820,29 @@ pub struct Channel {
 }
 
 /// The next host-known Writer value on `cell` — the native value the driver
-/// will pull for the next fire (`None`: not a Writer channel, nothing
-/// staged, or the value is no longer host-known). The canonical-KV fire
-/// gate reads the embed/kv-len values through this.
+/// will pull for the next submitted fire (`None`: not a Writer channel, or
+/// nothing pending). Pre-endpoint values sit in `staged`; post-bind puts go
+/// straight to the driver-shared ring with a host copy retained in
+/// `ring_host_copies` until a consuming fire submits. The host shadow (and
+/// through it the canonical-KV fire gate) reads Writer values through this.
 pub fn staged_put_bytes(cell: &Arc<Mutex<ChannelCell>>) -> Option<Vec<u8>> {
     let c = cell.lock().unwrap();
     if c.role != Some(HostRole::Writer) {
         return None;
     }
-    c.staged.front().cloned()
+    c.staged.front().cloned().or_else(|| c.ring_host_copies.front().cloned())
+}
+
+/// A submitted fire consumed one Writer entry: drop the ring host copy
+/// backing [`staged_put_bytes`]'s front so the next fire sees the next
+/// value. (`staged` is never popped here — pre-flush entries are pending
+/// ring writes, not yet consumable by any fire.)
+pub fn consume_writer_host_copy(cell: &Arc<Mutex<ChannelCell>>) {
+    let mut c = cell.lock().unwrap();
+    if c.role != Some(HostRole::Writer) {
+        return;
+    }
+    c.ring_host_copies.pop_front();
 }
 
 fn load_word(word_base: u64, index: usize) -> u64 {
@@ -934,6 +983,7 @@ mod tests {
                     max_forward_tokens: 64,
                     max_page_refs: 64,
                 },
+                device_geometry_port_mask: 0,
             },
             crate::driver::DriverBackend::Dummy(crate::driver::DummyDriver::new(
                 DummyDriverOptions {
@@ -975,7 +1025,8 @@ mod tests {
                 canonical_bytes: container_bytes,
                 sidecar_bytes: Vec::new(),
             },
-        )?;
+        )
+        .await?;
         let writer_decl = ChannelDecl {
             shape: Shape::vector(1),
             dtype: ChanDType::Concrete(DType::U32),
@@ -987,13 +1038,13 @@ mod tests {
         writer_cell.bind(&writer_decl);
         let reader_cell = ChannelCell::new(vec![1], DType::U32, 2);
         let channel_ids = [writer_cell.global_id, reader_cell.global_id];
-        let endpoints = [
+        let mut endpoints = Vec::new();
+        for (channel_id, host_role) in [
             (channel_ids[0], HostRole::Writer),
             (channel_ids[1], HostRole::Reader),
-        ]
-        .into_iter()
-        .map(|(channel_id, host_role)| {
-            scheduler::register_channel(
+        ] {
+            endpoints.push(
+                scheduler::register_channel(
                 driver_id,
                 ChannelRegistrationPlan {
                     driver_id,
@@ -1009,10 +1060,18 @@ mod tests {
                     extern_name: Vec::new(),
                 },
             )
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-        let bound =
-            scheduler::bind_instance(driver_id, program_id, 51, channel_ids.to_vec(), Vec::new())?;
+                .await?,
+            );
+        }
+        let bound = scheduler::bind_instance(
+            driver_id,
+            None,
+            program_id,
+            51,
+            channel_ids.to_vec(),
+            Vec::new(),
+        )
+        .await?;
         writer_cell
             .attach_endpoint(Arc::clone(&endpoints[0]))
             .map_err(|error| anyhow::anyhow!(error))?;
@@ -1024,7 +1083,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;

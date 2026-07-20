@@ -94,6 +94,13 @@ static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> = LazyLock::new(Servic
 
 /// Admission semaphore. `None` = unlimited concurrency (no gating).
 static ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+/// Prewarm admission: a bounded next cohort may instantiate its WASM and
+/// compile/register its (hash-deduped) program while the active cohort
+/// executes. Strict admission: everything that creates per-instance driver
+/// state or claims pooled KV/RS resources waits for the execution permit
+/// ([`ensure_execution_admitted`]).
+static PREWARM_ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+const MAX_PREWARM_PROCESSES: usize = 64;
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PROCESS_ADMISSION_WAIT_US: AtomicU64 = AtomicU64::new(0);
@@ -190,12 +197,55 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
 /// `None` = unlimited concurrency; `Some(n)` = at most `n` concurrent processes.
 /// `Some(0)` is treated as unlimited (a zero-permit semaphore would deadlock).
 pub fn init_admission(max_concurrent: Option<usize>) {
-    let sem = max_concurrent
-        .filter(|&n| n > 0)
-        .map(|n| Arc::new(Semaphore::new(n)));
+    let limit = max_concurrent.filter(|&n| n > 0);
+    let sem = limit.map(|n| Arc::new(Semaphore::new(n)));
+    // The prewarm bound is DECOUPLED from execution admission (W3): with
+    // unlimited execution (the hard-default shape) an unbounded prewarm
+    // would fan every queued process's instantiation out at once — a
+    // thundering herd of Store/linker/WASI setup competing with the
+    // scheduler threads. A bounded conveyor of MAX_PREWARM_PROCESSES keeps
+    // instantiation saturating the (now concurrent) linker without
+    // swamping the runtime; execution permits stay lazy and uncapped.
+    let prewarm = Some(Arc::new(Semaphore::new(
+        limit.map_or(MAX_PREWARM_PROCESSES, |n| n.min(MAX_PREWARM_PROCESSES)),
+    )));
     ADMISSION
         .set(sem)
         .expect("admission controller already initialized");
+    PREWARM_ADMISSION
+        .set(prewarm)
+        .expect("prewarm admission controller already initialized");
+}
+
+/// Strict-admission gate: acquire the execution permit lazily, at the first
+/// operation that creates per-instance driver state or claims pooled KV/RS
+/// resources. Idempotent per process. The prewarm permit (held since spawn)
+/// is released the moment execution is admitted.
+pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
+    if ctx.execution_admitted() {
+        return;
+    }
+    let started = Instant::now();
+    let permit = match ADMISSION.get().and_then(|value| value.as_ref()) {
+        Some(semaphore) => Some(
+            Arc::clone(semaphore)
+                .acquire_owned()
+                .await
+                .expect("admission semaphore closed"),
+        ),
+        None => None,
+    };
+    ctx.admit_execution(permit, duration_us(started.elapsed()));
+    if crate::scheduler::fire_timing_enabled() {
+        crate::scheduler::fire_timing_write(&serde_json::json!({
+            "schema": 1,
+            "source": "runtime",
+            "event": "process_admitted",
+            "process_id": ctx.id(),
+            "admitted_us": crate::scheduler::fire_timing_now_us(),
+            "admission_wait_us": ctx.admission_wait_us(),
+        }));
+    }
 }
 
 /// Spawn a new process and register it in the global registry.
@@ -208,6 +258,16 @@ pub fn spawn(
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
 ) -> Result<ProcessId> {
     let id = Uuid::new_v4();
+    if crate::scheduler::fire_timing_enabled() {
+        crate::scheduler::fire_timing_write(&serde_json::json!({
+            "schema": 1,
+            "source": "runtime",
+            "event": "process_spawned",
+            "process_id": id,
+            "spawned_us": crate::scheduler::fire_timing_now_us(),
+            "spawned_unix_us": crate::scheduler::fire_timing_unix_us(),
+        }));
+    }
     if let Some(orchestrator) = crate::store::reclaim::contention() {
         orchestrator.register(id);
     }
@@ -444,16 +504,40 @@ impl Process {
         capture_outputs: bool,
         result_tx: SharedResultTx,
     ) {
-        // Admission control: wait for a permit before instantiating.
-        // The permit is held for the entire WASM execution lifetime
-        // and auto-released on completion, error, or task abort.
-        let admission_start = Instant::now();
-        let _permit = match ADMISSION.get().and_then(|s| s.as_ref()) {
-            Some(sem) => Some(sem.acquire().await.expect("admission semaphore closed")),
+        // Prewarm admission: a bounded next cohort instantiates (and may
+        // compile/register its hash-deduped program) while the active cohort
+        // executes. The REAL concurrency permit is acquired lazily by
+        // `ensure_execution_admitted` at the first per-instance driver or
+        // pooled-resource operation, and held for the rest of the run.
+        let launch_timing = crate::scheduler::fire_timing_enabled().then(|| {
+            (
+                crate::scheduler::fire_timing_now_us(),
+                crate::scheduler::fire_timing_unix_us(),
+            )
+        });
+        let prewarm_permit = match PREWARM_ADMISSION.get().and_then(|s| s.as_ref()) {
+            Some(sem) => Some(
+                Arc::clone(sem)
+                    .acquire_owned()
+                    .await
+                    .expect("prewarm admission semaphore closed"),
+            ),
             None => None,
         };
-        let admission_wait_us = duration_us(admission_start.elapsed());
-
+        if let Some((launched_us, launched_unix_us)) = launch_timing {
+            let acquired_us = crate::scheduler::fire_timing_now_us();
+            crate::scheduler::fire_timing_write(&serde_json::json!({
+                "schema": 1,
+                "source": "runtime",
+                "event": "process_launch",
+                "process_id": process_id,
+                "launched_us": launched_us,
+                "launched_unix_us": launched_unix_us,
+                "prewarm_admitted_us": acquired_us,
+                "prewarm_wait_us": acquired_us.saturating_sub(launched_us),
+            }));
+        }
+        let mut admission_wait_us = 0u64;
         let mut instantiate_us = 0u64;
         let context_register_us = 0u64;
         let mut wasm_run_us = 0u64;
@@ -468,6 +552,7 @@ impl Process {
                 .await
                 .map_err(|e| e.to_string())?;
             instantiate_us = duration_us(instantiate_start.elapsed());
+            store.data_mut().install_prewarm_permit(prewarm_permit);
 
             // (KV admission via the context actor removed — Phase 5; physical
             // admission is now the unified arena's concern.)
@@ -493,8 +578,17 @@ impl Process {
                 .get_typed_func::<(&str,), (Result<String, String>,)>(&mut store, &run_func_export)
                 .map_err(|e| format!("Failed to get 'run' function: {e:?}"))?;
 
+            if crate::scheduler::fire_timing_enabled() {
+                crate::scheduler::fire_timing_write(&serde_json::json!({
+                    "schema": 1,
+                    "source": "runtime",
+                    "event": "guest_main_entered",
+                    "process_id": process_id,
+                    "entered_us": crate::scheduler::fire_timing_now_us(),
+                }));
+            }
             let wasm_run_start = Instant::now();
-            match run_func.call_async(&mut store, (&input,)).await {
+            let result = match run_func.call_async(&mut store, (&input,)).await {
                 Ok((Ok(output),)) => {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());
                     Ok(output)
@@ -507,7 +601,10 @@ impl Process {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());
                     Err(format!("Call error: {call_err}"))
                 }
-            }
+            };
+            admission_wait_us = store.data().admission_wait_us();
+            store.data_mut().release_execution_permit();
+            result
         }
         .await;
         record_process_timing(
@@ -552,10 +649,9 @@ impl Process {
 
         // M-A1 wait-for-all: drop this pid from the scheduler's wave wait-set as
         // an explicit step of the SINGLE exit funnel — so NATURAL completion (not
-        // only the external-terminate free fn) promptly stops holding the wave,
-        // well before the miss-limit backstop would demote it. Idempotent with the
-        // free fn's early `Leave{Terminate}`; no-op unless a waitall scheduler is
-        // registered.
+        // only the external-terminate free fn) promptly stops holding the wave.
+        // Idempotent with the free fn's early `Leave{Terminate}`; no-op unless a
+        // waitall scheduler is registered.
         crate::scheduler::worker::notify_pipeline_leave(
             self.process_id,
             crate::scheduler::worker::LeaveKind::Terminate,

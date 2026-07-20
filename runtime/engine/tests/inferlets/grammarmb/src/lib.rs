@@ -14,10 +14,10 @@
 //! token in `alphabet_j ∉ alphabet_i` → caught here, AND by the harness's
 //! per-request ON==OFF token comparison.
 //!
-//! Loop-carried `pos`/`klen`/`fill` (the `isolatedtopp`/`mirostat` split) grow
-//! the absolute RoPE position and the attended KV length by 1 every fire, so
-//! each fire embeds at the growing absolute position and attends the FULL
-//! committed KV — not a fixed 1-token window re-fired at position 0 forever.
+//! The author-bound loop-carried `KvLen` grows the absolute RoPE position and
+//! attended KV length by 1 every fire, so each fire embeds at the
+//! growing absolute position and attends the FULL committed KV — not a fixed
+//! 1-token window re-fired at position 0 forever.
 
 use inferlet::mask::pack_allowed;
 use inferlet::ptir::prelude::*;
@@ -54,10 +54,6 @@ impl NoRepeatMatcher {
     }
 }
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
@@ -86,45 +82,38 @@ async fn main(input: String) -> Result<String> {
     }
     let seed_tok = *prompt.last().unwrap() as i32;
 
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
-    ws.reserve(1).map_err(|e| format!("ws.reserve: {e}"))?;
+    let ws = WorkingSet::new();
+    let max_pages = (max_tokens as u32 + 1).div_ceil(PAGE_T).max(1);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
 
-    // tok_in: device loop-carried token (seeded; each fire's embed takes it,
-    // the epilogue re-puts the constrained pick). pos: loop-carried absolute
-    // RoPE position of THIS fire's token. klen/fill grow the attended KV
-    // length by 1 every fire (klen is the port-bound channel `attn_working_set`
-    // reads, fill is the internal carry the epilogue advances — the
-    // `isolatedtopp`/`mirostat` split), so each fire embeds at the growing
-    // absolute position and attends the FULL committed KV. gmask: per-step
+    // tok_in and KvLen are device loop-carried (seeded; each fire's epilogue
+    // advances the post-write readable extent by one). Each fire therefore
+    // embeds at the growing absolute position and attends the full committed
+    // KV. gmask: per-step
     // host-writer allowed mask. tok_out: the SOLE host-reader output (no
     // raw-logits reader — mirrors the old single-`[Token]` M-batch-eligible
     // shape).
-    let tok_in = bx(Channel::from(vec![seed_tok]).named("tok_in"));
-    let pos = bx(Channel::from(vec![0u32]).named("pos"));
-    let klen = bx(Channel::from(vec![1u32]).named("klen"));
-    let fill = bx(Channel::from(vec![1u32]).named("fill"));
-    let gmask = bx(Channel::new([vocab], dtype::bool).named("gmask"));
-    let tok_out = bx(Channel::new([1], dtype::i32).named("tok_out"));
+    let tok_in = Channel::from(vec![seed_tok]).named("tok_in");
+    let kv_len = Channel::from(vec![1u32]).named("kv_len");
+    let gmask = Channel::new([vocab], dtype::bool).named("gmask");
+    let tok_out = Channel::new([1], dtype::i32).named("tok_out");
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(tok_in, Tensor::constant(vec![0u32, 1]));
-    fwd.positions(pos);
-    fwd.attn_working_set(ws, klen);
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, Tensor::constant(vec![0u32, 1]));
+    fwd.port_channel(Port::KvLen, &kv_len);
+    fwd.attn_working_set(&ws, .., ..)?;
+    fwd.derive_dense_geometry();
     fwd.epilogue(move || {
+        let length = kv_len.take().tensor();
         // Takes + compute first, PUTS last (value-id discipline).
-        let base = fill.take().tensor(); // [1] u32 — this fire's absolute position
         let m = gmask.take(); // [V] bool, host-fed per step
         let lg = intrinsics::logits(); // [V] f32 (read-out row)
         let tok = reshape(reduce_argmax(mask_apply(&lg, &m)), [1]); // [1] i32
 
-        let klen_v = add(&base, 1u32); // cells 0..=base after this fire
-        let next_free = add(&base, 1u32); // position the NEXT fire writes
-
         tok_in.put(&tok);
+        kv_len.put(add(&length, 1u32));
         tok_out.put(&tok);
-        pos.put(&base);
-        klen.put(&klen_v);
-        fill.put(&next_free);
     });
 
     let mut matcher = NoRepeatMatcher::new(alphabet.clone());
@@ -145,6 +134,7 @@ async fn main(input: String) -> Result<String> {
         let token = tok_out
             .take()
             .get::<i32>()
+            .await
             .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
 
         // Grammar conformance: the masked argmax MUST be in this request's alphabet.

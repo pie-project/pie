@@ -30,6 +30,10 @@ struct InstanceRecord {
     std::uint64_t instance_id = 0;
     std::uint64_t program_id = 0;
     std::uint64_t program_hash = 0;
+    // The runtime's ACK'd classification (classify once): launch validation
+    // keys its deferred-geometry exemption on this, per instance — never on
+    // a batch-level shape sniff (RV-26/C2).
+    std::uint32_t geometry_class = PIE_GEOMETRY_CLASS_HOST;
 };
 
 class Registry {

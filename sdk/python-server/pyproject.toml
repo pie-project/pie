@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "pie-server"
 version = "0.4.0"
 description = "Embed the pie engine inside a Python script via `pie.server.Server`."
-readme = "README.md"
+readme = { text = "Python bindings for the Pie inference engine.", content-type = "text/plain" }
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "In Gim", email = "in.gim@icloud.com" }]

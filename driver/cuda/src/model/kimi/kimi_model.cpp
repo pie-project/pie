@@ -11,8 +11,7 @@ KimiModel::KimiModel(
     MlaCache& mla_cache,
     int tp_size,
     NcclComm* tp_comm,
-    bool emit_logits,
-    bool supports_tp_greedy_argmax)
+    bool emit_logits)
     : weights_(std::move(weights)),
       hf_config_(hf_config),
       ws_(ws),
@@ -22,7 +21,6 @@ KimiModel::KimiModel(
     fwd_cfg_.tp_comm = tp_comm;
     fwd_cfg_.emit_logits = emit_logits;
 
-    caps_.supports_tp_greedy_argmax = supports_tp_greedy_argmax;
     caps_.supports_compact_logits = true;
 }
 

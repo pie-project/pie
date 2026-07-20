@@ -28,14 +28,21 @@ fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
     });
 
     let name = ProgramName::parse("generate@0.1.0").unwrap();
+    // Each lane's budget makes its working set span the ENTIRE 4-page pool
+    // (prompt + 48 + 1 tokens at page size 16), and stretches its lifetime
+    // far past the fleet's spawn stagger. Engagement is then structural:
+    // any two co-alive lanes overcommit the pool mid-decode, so the ladder
+    // MUST suspend — a fast lane zipping through before its peers spawn
+    // (the old 5-token form) can no longer dodge contention.
+    const LANE_TOKENS: usize = 48;
     let results = runtime.block_on(async {
         let receivers: Vec<_> = (0..8)
-            .map(|lane| {
+            .map(|_| {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 process::spawn(
                     "contention-user".into(),
                     name.clone(),
-                    format!(r#"{{"lane":{lane}}}"#),
+                    LANE_TOKENS.to_string(),
                     None,
                     false,
                     Some(tx),
@@ -44,20 +51,42 @@ fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
                 rx
             })
             .collect();
+        let fleet_started = std::time::Instant::now();
         let mut results = Vec::new();
-        for receiver in receivers {
-            results.push(
-                tokio::time::timeout(Duration::from_secs(20), receiver)
-                    .await
-                    .expect("contention fleet must not hang")
-                    .expect("process result sender must remain live"),
+        for (lane, receiver) in receivers.into_iter().enumerate() {
+            let received = match tokio::time::timeout(Duration::from_secs(20), receiver).await {
+                Ok(received) => received,
+                Err(_) => {
+                    // Dump the orchestrator AND scheduler state with the
+                    // failure: which lane wedged, what it waits on, where the
+                    // pool stands, and what the wave barrier holds.
+                    let diagnostics = pie_engine::store::reclaim::contention()
+                        .unwrap()
+                        .diagnostics();
+                    let scheduler = pie_engine::scheduler::debug_dump(0)
+                        .await
+                        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+                    panic!(
+                        "contention fleet must not hang: lane {lane} timed out; \
+                         diagnostics: {diagnostics:#?}\nscheduler: {scheduler}"
+                    );
+                }
+            };
+            eprintln!(
+                "[contention] lane {lane} finished at {:?}",
+                fleet_started.elapsed()
             );
+            results.push(received.expect("process result sender must remain live"));
         }
         results
     });
 
+    let expected = format!(
+        "generated {LANE_TOKENS} tokens: {:?}",
+        vec![42u32; LANE_TOKENS]
+    );
     for result in results {
-        assert_eq!(result.unwrap(), "generated 5 tokens: [42, 42, 42, 42, 42]");
+        assert_eq!(result.unwrap(), expected);
     }
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -81,7 +110,10 @@ fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
     });
     let orchestrator = pie_engine::store::reclaim::contention().unwrap();
     let diagnostics = orchestrator.diagnostics();
-    assert!(diagnostics.suspends_total > 0);
+    assert!(
+        diagnostics.suspends_total > 0,
+        "active preemption never engaged; diagnostics: {diagnostics:#?}"
+    );
     assert!(diagnostics.restores_total > 0);
     assert!(diagnostics.d2h_pages_total > 0);
     assert_eq!(diagnostics.d2h_pages_total, diagnostics.h2d_pages_total);

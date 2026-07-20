@@ -12,14 +12,10 @@
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     model::configure(vocab, ws.page_size(), 1);
 
     let mut prompt = wit_model::encode("hello world");
@@ -27,20 +23,25 @@ async fn main(_input: String) -> Result<String> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
+    let max_pages = n.div_ceil(ws.page_size()).max(1);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
 
-    let toks = bx(Channel::from(prompt_i32).named("toks"));
-    let klen = bx(Channel::from(vec![n; 1]).named("klen"));
-    let entropy_out = bx(Channel::new([1], dtype::f32).named("entropy_out"));
+    let toks = Channel::from(prompt_i32).named("toks");
+    let kv_len = Channel::from(vec![n]).named("kv_len");
+    let entropy_out = Channel::new([1], dtype::f32).named("entropy_out");
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(toks, Tensor::constant(vec![0u32, n]));
-    fwd.attn_working_set(ws, klen);
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
+    fwd.port_channel(Port::KvLen, &kv_len);
+    fwd.attn_working_set(&ws, .., ..)?;
+    fwd.derive_dense_geometry();
     fwd.epilogue(move || {
         // Shannon entropy H = -Σ p·log p of the softmax over the vocab.
         let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
         let p = softmax(logits);
-        let h = neg(reduce_sum(mul(&p, log(&p))));
+        let h = entropy(&p);
         entropy_out.put(&h);
     });
 
@@ -49,6 +50,7 @@ async fn main(_input: String) -> Result<String> {
     let entropy = entropy_out
         .take()
         .get::<f32>()
+        .await
         .map_err(|e| format!("entropy take: {e}"))?[0];
     pipeline.close();
 

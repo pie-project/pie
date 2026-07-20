@@ -101,10 +101,10 @@ pub async fn boot_cuda() -> WorkerHandle {
     boot_cuda_model(&snapshot()).await
 }
 
-/// Build `../inferlets/<name>` → wasm + manifest + program id.
-pub fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
+/// Build a curated inferlet fixture → wasm + manifest + program id.
+pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../inferlets")
+        .join("../tests/inferlets")
         .join(name);
     let status = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "--release"])
@@ -127,7 +127,7 @@ pub fn load_prod_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
 /// Build + add + install an inferlet once; returns its program id for repeated
 /// spawns (one install per process; spawn many).
 pub async fn install_inferlet(name: &str) -> ProgramName {
-    let (wasm, manifest, program_name) = load_prod_inferlet(name);
+    let (wasm, manifest, program_name) = load_curated_inferlet(name);
     pie_engine::inferlet::program::add(wasm, manifest, true)
         .await
         .expect("add program");
@@ -168,7 +168,7 @@ pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<Stri
         .expect("process result channel dropped")
 }
 
-/// Build + add + install + spawn an arbitrary production inferlet with a raw
+/// Build + add + install + spawn an arbitrary curated inferlet fixture with a raw
 /// JSON input (for canaries — fork / spec / snapshot — that take
 /// inferlet-specific inputs). One-shot: installs then spawns.
 pub async fn spawn_inferlet(name: &str, input_json: &str) -> Result<String, String> {

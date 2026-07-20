@@ -1,12 +1,13 @@
 use anyhow::{Result, anyhow};
 
 use crate::driver::abi::{
-    ChannelDescBorrow, InstanceDescBorrow, KvCopyDescBorrow, LaunchDescBorrow,
+    ChannelDescBorrow, EncodeDescBorrow, InstanceDescBorrow, KvCopyDescBorrow, LaunchDescBorrow,
     PoolResizeDescBorrow, ProgramDescBorrow, StateCopyDescBorrow,
 };
 use crate::driver::channel::RegisteredChannel;
 use crate::driver::command::{
-    ChannelRegistrationPlan, KvCopyPlan, PoolResizePlan, ProgramRegistration, StateCopyPlan,
+    ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
+    StateCopyPlan,
 };
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
@@ -34,6 +35,10 @@ impl DummyDriver {
 
     pub fn device_facts(&self) -> &pie_driver_abi::DeviceFacts {
         self.inner.device_facts()
+    }
+
+    pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
+        self.inner.export_kv_handle()
     }
 
     pub fn load_model(
@@ -83,6 +88,13 @@ impl DummyDriver {
         let (raw, completion) = self.broker.launch_completion(1);
         let borrowed = LaunchDescBorrow::from_submission(desc);
         self.inner.launch(borrowed.as_raw(), raw)?;
+        Ok(completion)
+    }
+
+    pub fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
+        let (raw, completion) = self.broker.pie_completion(1);
+        let borrowed = EncodeDescBorrow::new(plan);
+        self.inner.encode(borrowed.as_raw(), raw)?;
         Ok(completion)
     }
 

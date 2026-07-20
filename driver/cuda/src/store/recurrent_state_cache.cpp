@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include "../cuda_check.hpp"
+#include "../kernels/slab_scatter.hpp"
 
 namespace pie_cuda_driver {
 
@@ -174,6 +175,55 @@ void RecurrentStateCache::reset_slot(int slot, cudaStream_t stream)
             0,
             static_cast<std::size_t>(hidden_size_) * sizeof(std::uint16_t),
             stream));
+    }
+}
+
+void RecurrentStateCache::reset_slots_if_fresh(
+    const std::int32_t* slot_ids,
+    const std::uint8_t* is_fresh,
+    int request_count,
+    cudaStream_t stream)
+{
+    if (slot_ids == nullptr || is_fresh == nullptr || request_count <= 0) {
+        return;
+    }
+    if (num_linear_layers_ > 0) {
+        const std::size_t conv_bytes = conv_slot_stride_bytes();
+        const std::size_t rec_bytes = recurrent_slot_stride_bytes();
+        launch_zero_slots_if_fresh(
+            reinterpret_cast<std::uint8_t*>(conv_states_.data()),
+            conv_bytes,
+            conv_bytes * static_cast<std::size_t>(max_slots_),
+            static_cast<std::size_t>(num_linear_layers_),
+            slot_ids,
+            is_fresh,
+            static_cast<std::size_t>(request_count),
+            stream);
+        auto* rec_base = recurrent_state_bf16_
+            ? reinterpret_cast<std::uint8_t*>(recurrent_states_bf16_.data())
+            : reinterpret_cast<std::uint8_t*>(recurrent_states_.data());
+        launch_zero_slots_if_fresh(
+            rec_base,
+            rec_bytes,
+            rec_bytes * static_cast<std::size_t>(max_slots_),
+            static_cast<std::size_t>(num_linear_layers_),
+            slot_ids,
+            is_fresh,
+            static_cast<std::size_t>(request_count),
+            stream);
+    }
+    if (mtp_pending_hidden_.data() != nullptr && hidden_size_ > 0) {
+        const std::size_t hidden_bytes =
+            static_cast<std::size_t>(hidden_size_) * sizeof(std::uint16_t);
+        launch_zero_slots_if_fresh(
+            reinterpret_cast<std::uint8_t*>(mtp_pending_hidden_.data()),
+            hidden_bytes,
+            hidden_bytes * static_cast<std::size_t>(max_slots_),
+            1,
+            slot_ids,
+            is_fresh,
+            static_cast<std::size_t>(request_count),
+            stream);
     }
 }
 

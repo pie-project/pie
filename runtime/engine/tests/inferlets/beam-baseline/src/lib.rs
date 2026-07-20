@@ -1,60 +1,38 @@
-//! Hand-rolled beam baseline — the M3-G2 ±10% reference.
+//! Hand-rolled beam baseline — the M3-G2 ±10% reference, on the
+//! `inferlet::ptir` bridge.
 //!
 //! This is the **same beam math the fused `beam` inferlet does on-device, but
-//! host-orchestrated per step**: every beam runs a plain raw-logits forward,
-//! the host reads the logits back, computes `score + log_softmax`, selects the
-//! per-beam top-B children, merges the `B*B` candidates and keeps the global
-//! top-B, then RE-FORKS each survivor from its parent working set and re-feeds
-//! its token. No on-device reorder / freeze / designated-child / compact —
-//! every selection + KV reorder is a host round-trip.
+//! host-orchestrated per step**: every beam runs a plain raw-logits forward
+//! (the epilogue publishes the FULL `[vocab]` logits row to a host-reader
+//! channel), the host reads the logits back, computes `score + log_softmax`,
+//! selects the per-beam top-B children, merges the `B*B` candidates and keeps
+//! the global top-B, then RE-FORKS each survivor from its parent working set
+//! (`WorkingSet::fork` — the CoW branching primitive) and re-feeds its token.
+//! No on-device reorder / freeze / designated-child / compact — every
+//! selection + KV reorder is a host round-trip.
 //!
-//! The M3 acceptance harness measures THIS inferlet's wall time into
-//! a standalone comparison point for the fused `beam` inferlet's wall
-//! time is within 10% of it. Because the fused form folds the whole
-//! reorder/select epilogue into ONE device pass (no per-step logits read-back,
-//! no host top-k, no re-fork), it should be strictly faster — this baseline is
-//! the honest hand-rolled upper bound the fused path must beat-or-match.
+//! The M3 acceptance harness measures THIS inferlet's wall time into a
+//! standalone comparison point: the fused `beam` inferlet's wall time must be
+//! within 10% of it. Because the fused form folds the whole reorder/select
+//! epilogue into ONE device pass (no per-step logits read-back, no host top-k,
+//! no re-fork), it should be strictly faster — this baseline is the honest
+//! hand-rolled upper bound the fused path must beat-or-match.
 //!
 //! FIDELITY: this is a token-domain beam over the model's real logits (real
-//! forwards, real KV fork), host-selected. It is the throughput/latency
-//! reference for G2, not the on-device beam-geometry correctness capstone
-//! (that is charlie's tier-0 replay of `s6_2_beam_epilogue_binds`).
+//! forwards, real CoW KV fork), host-selected. It is the throughput/latency
+//! reference for G2, not the on-device beam-geometry correctness capstone.
 //!
-//! Runs on the raw low-level WIT (keep-core): the `Context` facade's
-//! fork/append/forward is a plain `KvWorkingSet` + `geometry::*` write +
-//! raw `ForwardPass`, and the `edsl::logits` program's output tensor is read
-//! back directly with `output().read()`.
+//! It is also the workspace's only exercise of `WorkingSet::fork` on the
+//! bridge surface (the fused beam reorders inside one working set instead).
 
-use inferlet::geometry;
-use inferlet::inference::ForwardPass;
-use inferlet::mask::bf16_hi_to_f32;
-use inferlet::program::resolve_bindings;
-use inferlet::sampling::program as edsl;
+use inferlet::ptir::prelude::*;
 use inferlet::serde_json;
-use inferlet::working_set::KvWorkingSet;
-use inferlet::{model, Result};
+use inferlet::{Result, model as wit_model};
 
 /// Beam width.
 const BEAM_WIDTH: usize = 2;
 /// Default decode steps; override via `{"max_tokens":N}`.
 const MAX_TOKENS: usize = 12;
-
-/// Read a raw-logits output tensor as `f32` (bf16-hi or f32 storage), exactly
-/// as the driver materializes it — byte-identical to the on-device logits the
-/// fused beam consumes.
-fn logits_as_f32(bytes: &[u8], vocab: usize) -> Vec<f32> {
-    if bytes.len() == vocab * 2 {
-        bytes
-            .chunks_exact(2)
-            .map(|c| bf16_hi_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()
-    } else {
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    }
-}
 
 /// The top-`k` `(log_softmax, token)` children of one beam's raw logits.
 /// `log_softmax(x)[v] = x[v] - (m + ln Σ exp(x-m))` (max-shift stable).
@@ -78,15 +56,48 @@ fn top_k_children(logits: &[f32], k: usize) -> Vec<(f32, u32)> {
 }
 
 /// One live beam: its forked KV working set + sequence cursor, cumulative
-/// log-prob, and token trail. `fresh` fires the run-ahead generate-start signal
-/// on the beam's first forward (keep-core replacement for the facade's
-/// per-context `fresh_generate`).
+/// log-prob, and token trail.
 struct Beam {
-    kv: KvWorkingSet,
+    ws: WorkingSet,
     seq_len: u32,
-    fresh: bool,
     score: f32,
     tokens: Vec<u32>,
+}
+
+/// One raw-logits forward for `tokens` at `start` on `ws`: a fresh fire-once
+/// pass (fresh channels — a channel attaches to only one pass for its
+/// lifetime) whose epilogue publishes the read-out row's FULL `[vocab]` logits
+/// to the host. Returns the host-read logits.
+async fn forward_logits(
+    on: &Pipeline,
+    ws: &WorkingSet,
+    start: u32,
+    tokens: &[u32],
+    vocab: u32,
+    tag: &str,
+) -> Result<Vec<f32>> {
+    let n = tokens.len() as u32;
+    let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+    let toks = Channel::from(toks_i32).named("toks");
+    let logits_out = Channel::new([vocab], dtype::f32).named("logits_out");
+
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
+    let kv_len = Channel::from(vec![start + n]).named("kv_len");
+    fwd.port_channel(Port::KvLen, &kv_len);
+    fwd.attn_working_set(ws, .., (start / ws.page_size())..)?;
+    fwd.derive_dense_geometry();
+    fwd.epilogue(move || {
+        // No on-device select: ship the raw logits row to the host.
+        logits_out.put(&intrinsics::logits());
+    });
+
+    fwd.submit(on).map_err(|e| format!("submit {tag}: {e}"))?;
+    logits_out
+        .take()
+        .get::<f32>()
+        .await
+        .map_err(|e| format!("logits take {tag}: {e}"))
 }
 
 #[inferlet::main]
@@ -103,30 +114,36 @@ async fn main(input: String) -> Result<String> {
         .map(|x| x as usize)
         .unwrap_or(BEAM_WIDTH);
 
-    let vocab = model::output_vocab_size();
+    let vocab = wit_model::output_vocab_size();
 
-    // Raw-logits program: forward -> [vocab] logits (no on-device select).
-    let built = edsl::logits(vocab).map_err(|e| format!("logits build: {e:?}"))?;
-    let program =
-        inferlet::emit::emit_program(&built.program).map_err(|e| format!("logits emit: {e}"))?;
-
-    let mut prompt = model::encode("hello world");
+    let mut prompt = wit_model::encode("hello world");
     if prompt.is_empty() {
         prompt.push(0);
     }
+    let n = prompt.len() as u32;
+
+    // Root working set: reserve the whole logical envelope BEFORE any fork so
+    // every CoW child shares one address space sized for prompt + decode.
+    let root = WorkingSet::new();
+    model::configure(vocab, root.page_size(), 1);
+    let max_pages = (n + max_tokens as u32 + 1).div_ceil(root.page_size());
+    root.reserve(max_pages)
+        .map_err(|e| format!("root reserve: {e}"))?;
+
+    // One run-ahead ordering domain for the whole search: forks and fires
+    // linearize on it, so a survivor's fork is ordered after its parent's
+    // KV write and before the survivor's own re-feed forward.
+    let pipe = Pipeline::new();
 
     // Seed `beam_width` beams from the prompt; each first forward feeds the
     // whole prompt, each subsequent forward feeds that beam's one new token.
-    let root = KvWorkingSet::new();
-    let page = root.page_size();
     let mut beams: Vec<Beam> = Vec::with_capacity(beam_width);
     let mut pending: Vec<Vec<u32>> = Vec::with_capacity(beam_width);
     for _ in 0..beam_width {
-        let kv = root.fork().map_err(|e| format!("seed fork: {e}"))?;
+        let ws = root.fork(&pipe).map_err(|e| format!("seed fork: {e}"))?;
         beams.push(Beam {
-            kv,
+            ws,
             seq_len: 0,
-            fresh: true,
             score: 0.0,
             tokens: Vec::with_capacity(max_tokens),
         });
@@ -142,36 +159,10 @@ async fn main(input: String) -> Result<String> {
         for b in 0..active {
             let start = beams[b].seq_len;
             let inp = pending[b].clone();
-            let n = inp.len() as u32;
-            let decode_pos = start + n - 1;
+            let tag = format!("@{step}/{b}");
+            let logits = forward_logits(&pipe, &beams[b].ws, start, &inp, vocab, &tag).await?;
+            beams[b].seq_len += inp.len() as u32;
 
-            let pass = ForwardPass::new();
-            if beams[b].fresh {
-                pass.fresh_generate();
-                beams[b].fresh = false;
-            }
-            let geom = geometry::ensure_pages(
-                &beams[b].kv,
-                geometry::kv_write_geometry(start, n, page),
-            )
-            .map_err(|e| format!("pages @{step}/{b}: {e}"))?;
-            geometry::attach_kv_write(&pass, &beams[b].kv, &geom);
-            let positions: Vec<u32> = (start..start + n).collect();
-            pass.input_tokens(&inp, &positions);
-            let bindings = resolve_bindings(&built.bindings, &built.host_inputs, &[decode_pos], &[])
-                .map_err(|e| format!("bind @{step}/{b}: {e}"))?;
-            pass.sampler(&program, bindings);
-            pass.execute();
-            beams[b].seq_len += n;
-
-            let out = pass
-                .output()
-                .await
-                .map_err(|e| format!("logits output @{step}/{b}: {e}"))?;
-            let bytes = out
-                .read()
-                .map_err(|e| format!("read logits @{step}/{b}: {e:?}"))?;
-            let logits = logits_as_f32(&bytes, vocab as usize);
             let base_score = beams[b].score;
             for (lsm, tok) in top_k_children(&logits, beam_width) {
                 cand.push((base_score + lsm, b, tok));
@@ -186,16 +177,15 @@ async fn main(input: String) -> Result<String> {
         let mut next: Vec<Beam> = Vec::with_capacity(beam_width);
         let mut next_pending: Vec<Vec<u32>> = Vec::with_capacity(beam_width);
         for (score, parent, tok) in &cand {
-            let kv = beams[*parent]
-                .kv
-                .fork()
+            let ws = beams[*parent]
+                .ws
+                .fork(&pipe)
                 .map_err(|e| format!("survivor fork: {e}"))?;
             let mut tokens = beams[*parent].tokens.clone();
             tokens.push(*tok);
             next.push(Beam {
-                kv,
+                ws,
                 seq_len: beams[*parent].seq_len,
-                fresh: true,
                 score: *score,
                 tokens,
             });
@@ -204,6 +194,7 @@ async fn main(input: String) -> Result<String> {
         beams = next;
         pending = next_pending;
     }
+    pipe.close();
 
     let best = beams
         .iter()

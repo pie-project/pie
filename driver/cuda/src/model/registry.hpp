@@ -109,11 +109,6 @@ struct PlanInfo {
     std::vector<bool> layer_is_linear_attn;
     std::vector<bool> layer_is_mamba;
 
-    // True when the bound lm_head carries a non-null TP row-shard view
-    // (Qwen3Weights::lm_head_tp_shard / KimiWeights::lm_head_tp_sharded).
-    // Gates `supports_tp_greedy_argmax` for LlamaLike/Qwen3VL/Kimi.
-    bool lm_head_tp_sharded = false;
-
     // True when the bound weights carry an MTP head (Qwen3.5 [+MoE]).
     bool has_mtp = false;
 

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 
 #include <pie_driver_abi.h>
@@ -17,12 +18,128 @@ struct MultimodalLimits {
     int audio_mel_bins = 0;
 };
 
+inline int validate_encode_resources(
+    const PieEncodeDesc& encode,
+    const MultimodalLimits& multimodal,
+    int hidden_size) noexcept {
+    if (hidden_size <= 0 ||
+        (encode.image_anchor_rows.len != 0 &&
+         (multimodal.gemma4_pool_kernel <= 0 ||
+          multimodal.gemma4_position_table <= 0))) {
+        return PIE_STATUS_UNSUPPORTED;
+    }
+    const std::uint64_t patch_bytes =
+        3u * 16u * 16u * sizeof(float);
+    const std::uint64_t pool_area =
+        static_cast<std::uint64_t>(multimodal.gemma4_pool_kernel) *
+        static_cast<std::uint64_t>(multimodal.gemma4_pool_kernel);
+    std::uint64_t patch_count = 0;
+    std::uint64_t output_rows = 0;
+    for (std::size_t image = 0; image < encode.image_anchor_rows.len; ++image) {
+        const std::uint64_t begin = encode.image_pixel_indptr.ptr[image];
+        const std::uint64_t end = encode.image_pixel_indptr.ptr[image + 1];
+        if (end <= begin || (end - begin) % patch_bytes != 0) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        const std::uint64_t patches = (end - begin) / patch_bytes;
+        if (patches == 0 || patches % pool_area != 0 ||
+            patch_count > std::numeric_limits<std::uint64_t>::max() - patches ||
+            output_rows > std::numeric_limits<std::uint64_t>::max() -
+                patches / pool_area) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        std::uint32_t max_x = 0;
+        for (std::uint64_t patch = 0; patch < patches; ++patch) {
+            const std::uint64_t position = (patch_count + patch) * 2;
+            if (position + 1 >= encode.image_patch_positions.len ||
+                encode.image_patch_positions.ptr[position] >=
+                    static_cast<std::uint32_t>(
+                        multimodal.gemma4_position_table) ||
+                encode.image_patch_positions.ptr[position + 1] >=
+                    static_cast<std::uint32_t>(
+                        multimodal.gemma4_position_table)) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            max_x = std::max(
+                max_x, encode.image_patch_positions.ptr[position]);
+        }
+        const std::uint64_t groups_x =
+            (static_cast<std::uint64_t>(max_x) + 1) /
+            static_cast<std::uint64_t>(
+                multimodal.gemma4_pool_kernel);
+        const std::uint64_t image_output_rows = patches / pool_area;
+        if (groups_x == 0) return PIE_STATUS_INVALID_ARGUMENT;
+        for (std::uint64_t patch = 0; patch < patches; ++patch) {
+            const std::uint64_t position = (patch_count + patch) * 2;
+            const std::uint64_t x =
+                encode.image_patch_positions.ptr[position];
+            const std::uint64_t y =
+                encode.image_patch_positions.ptr[position + 1];
+            const std::uint64_t group =
+                x / multimodal.gemma4_pool_kernel +
+                groups_x * (y / multimodal.gemma4_pool_kernel);
+            if (group >= image_output_rows) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+        patch_count += patches;
+        output_rows += patches / pool_area;
+    }
+    if (patch_count > std::numeric_limits<std::size_t>::max() / 2 ||
+        encode.image_patch_positions.len !=
+            static_cast<std::size_t>(patch_count) * 2 ||
+        output_rows > std::numeric_limits<std::uint32_t>::max()) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (encode.audio_anchor_rows.len != 0) {
+        if (multimodal.audio_mel_bins <= 0) {
+            return PIE_STATUS_UNSUPPORTED;
+        }
+        const std::uint64_t frame_bytes =
+            static_cast<std::uint64_t>(multimodal.audio_mel_bins) *
+            sizeof(float);
+        const auto subsampled_len = [](std::uint64_t frames) {
+            const auto conv = [](std::uint64_t rows) {
+                return (rows + 2 - 3) / 2 + 1;
+            };
+            return conv(conv(frames));
+        };
+        for (std::size_t clip = 0; clip < encode.audio_anchor_rows.len;
+             ++clip) {
+            const std::uint64_t begin =
+                encode.audio_feature_indptr.ptr[clip];
+            const std::uint64_t end =
+                encode.audio_feature_indptr.ptr[clip + 1];
+            if (end <= begin || (end - begin) % frame_bytes != 0) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            const std::uint64_t frames = (end - begin) / frame_bytes;
+            const std::uint64_t rows = subsampled_len(frames);
+            if (frames == 0 || rows == 0 ||
+                output_rows >
+                    std::numeric_limits<std::uint64_t>::max() - rows) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            output_rows += rows;
+        }
+    }
+    const std::uint64_t required_bytes =
+        output_rows * static_cast<std::uint64_t>(hidden_size) *
+        sizeof(std::uint16_t);
+    if (required_bytes > encode.output_rows.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
+}
+
 inline int validate_launch_resources(const PieLaunchDesc& launch,
                                      int device_pages,
                                      int page_size,
                                      int rs_slots,
                                      int rs_buffer_slots,
-                                     const MultimodalLimits& multimodal) noexcept {
+                                     const MultimodalLimits& multimodal,
+                                     const std::uint32_t* program_geometry_classes,
+                                     std::size_t program_count) noexcept {
     if (device_pages < 0 || page_size <= 0) {
         return PIE_STATUS_DRIVER_ERROR;
     }
@@ -33,12 +150,44 @@ inline int validate_launch_resources(const PieLaunchDesc& launch,
     for (std::size_t i = 0; i < physical_pages.len; ++i) {
         if (physical_pages.ptr[i] >=
             static_cast<std::uint32_t>(device_pages)) {
+            std::fprintf(stderr,
+                         "[pie-driver-cuda] launch validation: physical page "
+                         "%u out of range (device has %d)\n",
+                         physical_pages.ptr[i], device_pages);
             return PIE_STATUS_INVALID_ARGUMENT;
         }
     }
+    const std::size_t wire_rows =
+        launch.qo_indptr.len == 0 ? 0 : launch.qo_indptr.len - 1;
+    // Row -> owning program -> the runtime's ACK'd geometry class. Only a
+    // row whose INSTANCE is device-resolved (non-Host) may defer its wire
+    // geometry to in-graph resolution; a Host-class row that lost its
+    // pages is exactly the engine bug the pages/last-len rule exists to
+    // catch. The old exemption was a batch-level "this batch is PTIR"
+    // shape sniff, which waved those rows through too (C2).
+    const bool has_program_row_map =
+        launch.instance_ids.len != 0 &&
+        launch.ptir_program_row_indptr.len ==
+            launch.instance_ids.len + 1 &&
+        program_geometry_classes != nullptr &&
+        program_count == launch.instance_ids.len;
+    const auto row_defers_geometry =
+        [&](std::size_t request) noexcept -> bool {
+        if (!has_program_row_map) return false;
+        for (std::size_t p = 0; p < program_count; ++p) {
+            const std::uint32_t begin =
+                launch.ptir_program_row_indptr.ptr[p];
+            const std::uint32_t end =
+                launch.ptir_program_row_indptr.ptr[p + 1];
+            if (request >= begin && request < end) {
+                return program_geometry_classes[p] !=
+                       PIE_GEOMETRY_CLASS_HOST;
+            }
+        }
+        return false;
+    };
     for (std::size_t request = 0;
-         request < launch.instance_ids.len &&
-         launch.kv_page_indptr.len != 0;
+         request < wire_rows && launch.kv_page_indptr.len != 0;
          ++request) {
         const bool has_pages =
             launch.kv_page_indptr.ptr[request] !=
@@ -48,25 +197,49 @@ inline int validate_launch_resources(const PieLaunchDesc& launch,
             launch.kv_page_indptr.ptr[request];
         const std::uint32_t last_len =
             launch.kv_last_page_lens.ptr[request];
+        // A device-resolved request ships no wire pages — the driver
+        // resolves its geometry in-graph, and the wire `last_page_len` is
+        // engine-side append bookkeeping, not wire geometry. Nothing to
+        // cross-check.
+        if (row_defers_geometry(request) && !has_pages) {
+            continue;
+        }
         if ((!has_pages && last_len != 0) ||
             (has_pages &&
              (last_len == 0 ||
               last_len > static_cast<std::uint32_t>(page_size)))) {
+            std::fprintf(stderr,
+                         "[pie-driver-cuda] launch validation: request %zu "
+                         "page/last-len mismatch (pages=%u last_len=%u "
+                         "page_size=%d)\n",
+                         request, page_count, last_len, page_size);
             return PIE_STATUS_INVALID_ARGUMENT;
         }
-        if (launch.qo_indptr.len == launch.instance_ids.len + 1) {
-            const std::uint32_t query_rows =
-                launch.qo_indptr.ptr[request + 1] -
-                launch.qo_indptr.ptr[request];
-            if (query_rows != 0) {
-                if (!has_pages) return PIE_STATUS_INVALID_ARGUMENT;
-                const std::uint64_t kv_len =
-                    static_cast<std::uint64_t>(page_count - 1) *
-                        static_cast<std::uint32_t>(page_size) +
-                    last_len;
-                if (kv_len < query_rows) {
-                    return PIE_STATUS_INVALID_ARGUMENT;
-                }
+        const std::uint32_t query_rows =
+            launch.qo_indptr.ptr[request + 1] -
+            launch.qo_indptr.ptr[request];
+        if (query_rows != 0) {
+            if (!has_pages) {
+                if (row_defers_geometry(request)) continue;
+                std::fprintf(stderr,
+                             "[pie-driver-cuda] launch validation: request "
+                             "%zu has %u query rows but no KV pages and no "
+                             "device-resolved geometry class\n",
+                             request, query_rows);
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            const std::uint64_t kv_len =
+                static_cast<std::uint64_t>(page_count - 1) *
+                    static_cast<std::uint32_t>(page_size) +
+                last_len;
+            if (kv_len < query_rows) {
+                std::fprintf(stderr,
+                             "[pie-driver-cuda] launch validation: request "
+                             "%zu kv_len %llu < query rows %u\n",
+                             request,
+                             static_cast<unsigned long long>(kv_len),
+                             query_rows);
+                return PIE_STATUS_INVALID_ARGUMENT;
             }
         }
     }

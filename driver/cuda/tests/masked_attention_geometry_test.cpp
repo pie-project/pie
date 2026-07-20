@@ -75,9 +75,11 @@ std::vector<std::uint8_t> decode_case(const Case& c) {
     const std::vector<std::uint32_t> qo_indptr{0, static_cast<std::uint32_t>(c.qo_len)};
     const std::vector<std::uint32_t> kv_page_indptr{0, static_cast<std::uint32_t>(pages)};
     const std::vector<std::uint32_t> kv_last_page_lens{static_cast<std::uint32_t>(last_len)};
+    const auto packed = pie_attn_ref::pack_brle_rows(
+        c.brle, c.mask_indptr, c.qo_len, c.kv_len);
     DecodedMasks dm = pie_cuda_driver::brle::decode(
-        c.brle, c.mask_indptr, qo_indptr, kv_page_indptr, kv_last_page_lens,
-        c.page_size);
+        packed.words, packed.indptr, qo_indptr, kv_page_indptr,
+        kv_last_page_lens, c.page_size);
     return unpack(dm, c.qo_len, c.kv_len);
 }
 

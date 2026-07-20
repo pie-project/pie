@@ -15,10 +15,11 @@ path = "src/lib.rs"
 [dependencies]
 pie-driver-abi = { path = "../../interface/driver" }
 pie-driver-dummy = { path = "../../driver/dummy" }
-pie-ptir = { path = "../../interface/ptir" }
+pie-ptir = { path = "../../interface/ptir", features = ["eval"] }
 pie-client = { path = "../../client/rust" }
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
+tarpc = { version = "0.35", features = ["serde1"] }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
@@ -61,6 +62,7 @@ wasmparser = "0.244.0"
 wasm-metadata = "0.244.0"
 chrono = "0.4"
 ringbuffer = "0.15"
+libc = "0.2"
 # default-features off so reqwest's `default-tls` (native-tls → openssl) is
 # never pulled in: it dynamically links libssl.so.1.1, which doesn't exist on
 # OpenSSL-3 distros (Ubuntu 22.04+) and breaks the manylinux_2_28 release

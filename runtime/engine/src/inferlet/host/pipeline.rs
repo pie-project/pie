@@ -24,6 +24,11 @@ impl pie::inferlet::pipeline::HostPipeline for ProcessCtx {
         Ok(self.ctx().table.push(pipeline)?)
     }
 
+    async fn finish(&mut self, this: Resource<Pipeline>) -> anyhow::Result<()> {
+        crate::inferlet::process::preemption::honor(self).await?;
+        crate::pipeline::fire::pipeline_finish(self, this).await
+    }
+
     async fn close(&mut self, this: Resource<Pipeline>) -> anyhow::Result<()> {
         crate::inferlet::process::preemption::honor(self).await?;
         crate::pipeline::fire::pipeline_close(self, this).await

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import time
 from typing import Any
@@ -15,6 +16,7 @@ from common import (
     hf_chat_prompts_and_counts,
     make_prompts,
     maybe_set_cpu_affinity,
+    request_max_tokens,
     summarize,
     visible_cuda_devices,
 )
@@ -170,7 +172,7 @@ def run(args: argparse.Namespace):
                     "max_num_batched_tokens": args.max_num_batched_tokens,
                     "tensor_parallel_size": args.tp_size,
                     "max_model_len": args.max_model_len,
-                    "enable_prefix_caching": False,
+                    "enable_prefix_caching": args.prefix_caching,
                     "disable_log_stats": False,
                     **llm_kwargs,
                 },
@@ -186,7 +188,7 @@ def run(args: argparse.Namespace):
         max_num_batched_tokens=args.max_num_batched_tokens,
         tensor_parallel_size=args.tp_size,
         max_model_len=args.max_model_len,
-        enable_prefix_caching=False,
+        enable_prefix_caching=args.prefix_caching,
         disable_log_stats=False,
         **llm_kwargs,
     )
@@ -246,7 +248,7 @@ def run(args: argparse.Namespace):
         results=results,
         wall_s=wall,
         config={
-            "enable_prefix_caching": False,
+            "enable_prefix_caching": args.prefix_caching,
             "max_num_seqs": max_num_seqs,
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "attention_backend": args.attention_backend,
@@ -265,12 +267,248 @@ def run(args: argparse.Namespace):
     return summary, results
 
 
+def run_streaming(args: argparse.Namespace):
+    """tput with per-token client stamps via the AsyncLLM streaming engine.
+
+    Vantage mirrors pie's --report-timing client: a closed loop of
+    `concurrency` in-flight requests, TTFT stamped on the first token
+    delivery after submit, inter-token gaps stamped per delivery event.
+    """
+    import asyncio
+
+    from vllm import SamplingParams
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
+    n = args.num_requests
+    prompts, prompt_counts = hf_chat_prompts_and_counts(
+        args.model, args.system, make_prompts(args, n + args.warmup)
+    )
+    if args.concurrency == 0:
+        max_num_seqs = max(1, args.num_requests)
+    else:
+        max_num_seqs = args.concurrency
+    engine_kwargs = {}
+    if args.enforce_eager:
+        engine_kwargs["enforce_eager"] = True
+    engine = AsyncLLM.from_engine_args(
+        AsyncEngineArgs(
+            model=args.model,
+            trust_remote_code=True,
+            gpu_memory_utilization=args.gpu_mem_util,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            tensor_parallel_size=args.tp_size,
+            max_model_len=args.max_model_len,
+            enable_prefix_caching=args.prefix_caching,
+            disable_log_stats=False,
+            **engine_kwargs,
+        )
+    )
+    sampling = SamplingParams(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        ignore_eos=args.ignore_eos,
+    )
+
+    def sampling_for(i: int) -> "SamplingParams":
+        if not getattr(args, "mixed_phase", False):
+            return sampling
+        return SamplingParams(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=request_max_tokens(args, i),
+            ignore_eos=args.ignore_eos,
+        )
+
+    async def stream_one(
+        request_id: str,
+        prompt,
+        prompt_count: int,
+        params=None,
+        measured_epoch_monotonic_ns: int | None = None,
+    ) -> RequestResult:
+        start = time.perf_counter()
+        send_monotonic_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        client_send_s = (
+            (send_monotonic_ns - measured_epoch_monotonic_ns)
+            / 1_000_000_000.0
+            if measured_epoch_monotonic_ns is not None
+            else None
+        )
+        ttft_s = None
+        last_tick = None
+        gaps_us: list[int] = []
+        token_arrival_s: list[float] = []
+        token_arrival_monotonic_ns: list[int] = []
+        n_tokens = 0
+        try:
+            async for out in engine.generate(
+                prompt, params or sampling, request_id
+            ):
+                now = time.perf_counter()
+                now_monotonic_ns = time.clock_gettime_ns(
+                    time.CLOCK_MONOTONIC
+                )
+                new_total = len(out.outputs[0].token_ids)
+                if new_total > n_tokens:
+                    if measured_epoch_monotonic_ns is not None:
+                        token_arrival_s.extend(
+                            [
+                                (
+                                    now_monotonic_ns
+                                    - measured_epoch_monotonic_ns
+                                )
+                                / 1_000_000_000.0
+                            ]
+                            * (new_total - n_tokens)
+                        )
+                        token_arrival_monotonic_ns.extend(
+                            [now_monotonic_ns] * (new_total - n_tokens)
+                        )
+                    if ttft_s is None:
+                        ttft_s = now - start
+                    else:
+                        gaps_us.append(int((now - last_tick) * 1e6))
+                    last_tick = now
+                    n_tokens = new_total
+            returned = time.perf_counter()
+            returned_monotonic_ns = time.clock_gettime_ns(
+                time.CLOCK_MONOTONIC
+            )
+            return RequestResult(
+                True,
+                returned - start,
+                n_tokens,
+                prompt_count,
+                ttft_s=ttft_s,
+                intertoken_us=gaps_us or None,
+                client_send_s=client_send_s,
+                token_arrival_s=token_arrival_s or None,
+                token_arrival_monotonic_ns=(
+                    token_arrival_monotonic_ns or None
+                ),
+                client_return_s=(
+                    (
+                        returned_monotonic_ns
+                        - measured_epoch_monotonic_ns
+                    )
+                    / 1_000_000_000.0
+                    if measured_epoch_monotonic_ns is not None
+                    else None
+                ),
+                process_id=request_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            return RequestResult(
+                False,
+                time.perf_counter() - start,
+                n_tokens,
+                prompt_count,
+                error=f"{type(e).__name__}: {e}",
+            )
+
+    async def drive() -> tuple[list[RequestResult], float, float, int]:
+        if args.warmup:
+            for j, p in enumerate(prompts[: args.warmup]):
+                await stream_one(f"warmup-{j}", p, prompt_counts[j])
+
+        # Submit ALL requests at t=0 — concurrency is enforced engine-side by
+        # max_num_seqs, exactly like pie's tput client (all launch_process at
+        # once, engine admission = concurrency). A client-side semaphore here
+        # would stop the TTFT clock during queueing that pie's clock counts,
+        # making the comparison asymmetric.
+        epoch_unix_s = time.time()
+        epoch_monotonic_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+        profiler_task = None
+        if (
+            args.cuda_profiler_capture
+            and args.cuda_profiler_duration_s > 0
+        ):
+            async def capture_profiler_window() -> None:
+                await asyncio.sleep(args.cuda_profiler_delay_s)
+                cuda_profiler_start(True)
+                try:
+                    await asyncio.sleep(args.cuda_profiler_duration_s)
+                finally:
+                    cuda_profiler_stop(True)
+
+            profiler_task = asyncio.create_task(capture_profiler_window())
+        else:
+            cuda_profiler_start(args.cuda_profiler_capture)
+        start = time.perf_counter()
+        try:
+            results = list(
+                await asyncio.gather(
+                    *(
+                        stream_one(
+                            f"req-{i}",
+                            prompts[args.warmup + i],
+                            prompt_counts[args.warmup + i],
+                            sampling_for(i),
+                            epoch_monotonic_ns,
+                        )
+                        for i in range(n)
+                    )
+                )
+            )
+        finally:
+            if profiler_task is None:
+                cuda_profiler_stop(args.cuda_profiler_capture)
+            else:
+                if not profiler_task.done():
+                    profiler_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await profiler_task
+        return (
+            results,
+            time.perf_counter() - start,
+            epoch_unix_s,
+            epoch_monotonic_ns,
+        )
+
+    try:
+        results, wall, epoch_unix_s, epoch_monotonic_ns = asyncio.run(drive())
+    finally:
+        engine.shutdown()
+
+    summary = summarize(
+        mode=args.mode,
+        engine="vllm",
+        model=args.model,
+        results=results,
+        wall_s=wall,
+        config={
+            "streaming_client": True,
+            "client timing epoch unix s": epoch_unix_s,
+            "client timing epoch monotonic ns": epoch_monotonic_ns,
+            "enable_prefix_caching": args.prefix_caching,
+            "max_num_seqs": max_num_seqs,
+            "max_num_batched_tokens": args.max_num_batched_tokens,
+            "enforce_eager": args.enforce_eager,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "ignore_eos": args.ignore_eos,
+            "unique_prompts": args.unique_prompts,
+            "cpu affinity": cpu_affinity,
+        },
+    )
+    return summary, results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="vLLM canonical latency/throughput benchmark")
     add_mode_subcommands(parser)
     for sp in parser._subparsers._group_actions[0].choices.values():
         sp.add_argument("--attention-backend", default=None)
         sp.add_argument("--enforce-eager", action="store_true")
+        sp.add_argument(
+            "--prefix-caching",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
         sp.add_argument("--max-num-batched-tokens", type=int, default=None)
         sp.add_argument(
             "--speculative-config",
@@ -306,8 +544,29 @@ def main() -> None:
             action="store_true",
             help="Print the vLLM LLM kwargs used by the benchmark before loading.",
         )
+        sp.add_argument(
+            "--report-timing",
+            action="store_true",
+            help="Collect per-request TTFT and inter-token gap distributions. "
+                 "Switches tput mode to the AsyncLLM streaming engine with a "
+                 "closed-loop client (mirrors pie's client vantage: stamps on "
+                 "token delivery, all requests submitted at t=0 when "
+                 "num_requests == concurrency).",
+        )
+        sp.add_argument(
+            "--report-arrivals",
+            action="store_true",
+            help="Collect absolute per-token client arrivals without enabling "
+            "additional latency reporting.",
+        )
     args = parser.parse_args()
-    summary, results = run(args)
+    if (
+        getattr(args, "report_timing", False)
+        or getattr(args, "report_arrivals", False)
+    ) and args.mode == "tput":
+        summary, results = run_streaming(args)
+    else:
+        summary, results = run(args)
     finish(summary, results, args.json_out)
 
 

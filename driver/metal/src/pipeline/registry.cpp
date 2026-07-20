@@ -1,10 +1,8 @@
 #include "pipeline/registry.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <iostream>
-#include <map>
 #include <unordered_set>
 #include <utility>
 
@@ -30,6 +28,17 @@ int Registry::register_program(
     std::uint64_t* program_id) {
     const auto found = program_ids_by_hash_.find(program.program_hash);
     if (found != program_ids_by_hash_.end()) {
+        const ProgramRecord& existing = programs_.at(found->second);
+        if (program.canonical_bytes.len != 0 &&
+            (program.canonical_bytes.len != existing.canonical_bytes.size() ||
+             std::memcmp(
+                 program.canonical_bytes.ptr,
+                 existing.canonical_bytes.data(),
+                 existing.canonical_bytes.size()) != 0)) {
+            std::cerr
+                << "[pie-driver-metal] register_program: program hash collision\n";
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
         if (program_id != nullptr) *program_id = found->second;
         return PIE_STATUS_OK;
     }
@@ -40,6 +49,9 @@ int Registry::register_program(
     ProgramRecord record;
     record.program_id = next_program_id_++;
     record.program_hash = program.program_hash;
+    record.canonical_bytes.assign(
+        program.canonical_bytes.ptr,
+        program.canonical_bytes.ptr + program.canonical_bytes.len);
     std::string decode_error;
     if (!pie_native::decode_ptir_channels(
             program.canonical_bytes.ptr,
@@ -90,9 +102,9 @@ int Registry::register_channel(
     }
     record.desc.extern_name.ptr =
         reinterpret_cast<const std::uint8_t*>(record.extern_name.data());
-    record.mirror.assign(
-        static_cast<std::size_t>(cell_bytes) * (channel.capacity + 1), 0);
-    record.words.assign(4, 0);
+    record.shared_state = make_platform_channel_state(
+        record.program_dtype(), record.numel(), channel.capacity);
+    if (record.shared_state == nullptr) return PIE_STATUS_DRIVER_ERROR;
     auto [it, inserted] =
         channels_.emplace(channel.channel_id, std::move(record));
     if (!inserted) return PIE_STATUS_INVALID_ARGUMENT;
@@ -101,12 +113,13 @@ int Registry::register_channel(
     stored.desc.shape.ptr = stored.shape.data();
     stored.desc.extern_name.ptr =
         reinterpret_cast<const std::uint8_t*>(stored.extern_name.data());
+    ChannelState& state = *stored.shared_state;
     *binding = PieChannelEndpointBinding{
         .channel_id = channel.channel_id,
-        .mirror_base = reinterpret_cast<std::uint64_t>(stored.mirror.data()),
-        .word_base = reinterpret_cast<std::uint64_t>(stored.words.data()),
-        .mirror_bytes = stored.mirror.size(),
-        .word_bytes = stored.words.size() * sizeof(std::uint64_t),
+        .mirror_base = reinterpret_cast<std::uint64_t>(state.cells.contents),
+        .word_base = reinterpret_cast<std::uint64_t>(state.words.contents),
+        .mirror_bytes = state.cells.size,
+        .word_bytes = state.words.size,
         .cell_bytes = cell_bytes,
         .capacity = channel.capacity,
         .head_word_index = 0,
@@ -120,6 +133,9 @@ int Registry::register_channel(
 int Registry::bind_instance(
     const PieInstanceDesc& instance,
     PieInstanceBinding* binding) {
+    if (instance.geometry_class != PIE_GEOMETRY_CLASS_HOST) {
+        return PIE_STATUS_UNSUPPORTED;
+    }
     const ProgramRecord* program_ptr = find_program(instance.program_id);
     if (program_ptr == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
     const std::uint64_t instance_id =
@@ -193,15 +209,8 @@ int Registry::bind_instance(
         instance.channel_ids.ptr,
         instance.channel_ids.ptr + instance.channel_ids.len);
 
-    std::map<std::uint32_t, Value> seeds;
     for (std::size_t i = 0; i < instance.seed_values.len; ++i) {
         const PieChannelValueDesc& seed = instance.seed_values.ptr[i];
-        const auto id = std::find(
-            record.channel_ids.begin(),
-            record.channel_ids.end(),
-            seed.channel_id);
-        const auto dense =
-            static_cast<std::uint32_t>(id - record.channel_ids.begin());
         ChannelRecord& endpoint = *find_channel(seed.channel_id);
         Value value;
         if (!decode_wire(
@@ -212,30 +221,19 @@ int Registry::bind_instance(
                 value)) {
             return PIE_STATUS_INVALID_ARGUMENT;
         }
-        if (endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_READER) {
-            encode_wire(value, endpoint.mirror.data());
-        }
-        seeds.emplace(dense, std::move(value));
-        std::atomic_ref<std::uint64_t>(endpoint.words[1]).store(
-            1, std::memory_order_release);
-        if (endpoint.desc.host_role == PIE_CHANNEL_HOST_ROLE_WRITER) {
-            endpoint.pulled = 1;
+        if (!endpoint.shared_state->empty() ||
+            !endpoint.shared_state->push(std::move(value))) {
+            return PIE_STATUS_INVALID_ARGUMENT;
         }
     }
 
-    std::map<std::uint32_t, std::shared_ptr<ChannelState>> externs;
+    std::vector<std::shared_ptr<ChannelState>> states;
+    states.reserve(record.channel_ids.size());
     for (std::size_t i = 0; i < record.channel_ids.size(); ++i) {
-        if (program.channels[i].extern_dir == PIE_CHANNEL_EXTERN_NONE) continue;
         ChannelRecord& endpoint = *find_channel(record.channel_ids[i]);
-        if (endpoint.shared_state == nullptr) {
-            endpoint.shared_state = std::make_shared<ChannelState>();
-            endpoint.shared_state->capacity = endpoint.desc.capacity;
-            endpoint.shared_state->last =
-                zeros(endpoint.program_dtype(), endpoint.numel());
-        }
-        externs.emplace(static_cast<std::uint32_t>(i), endpoint.shared_state);
+        states.push_back(endpoint.shared_state);
     }
-    record.interp = make_instance(program.plan, externs, seeds);
+    record.interp = make_instance(program.plan, states);
 
     for (std::size_t i = 0; i < record.channel_ids.size(); ++i) {
         find_channel(record.channel_ids[i])
@@ -244,6 +242,7 @@ int Registry::bind_instance(
     if (binding != nullptr) {
         std::memset(binding, 0, sizeof(*binding));
         binding->instance_id = instance_id;
+        binding->geometry_class = instance.geometry_class;
     }
     instances_[instance_id] = std::move(record);
     return PIE_STATUS_OK;
@@ -295,9 +294,7 @@ int Registry::close_channel(std::uint64_t channel_id) {
     const auto it = channels_.find(channel_id);
     if (it == channels_.end()) return PIE_STATUS_CLOSED;
     if (!it->second.attachments.empty()) return PIE_STATUS_INVALID_ARGUMENT;
-    std::atomic_ref<std::uint64_t>(it->second.words[3]).store(
-        1,
-        std::memory_order_release);
+    it->second.shared_state->store_word(3, 1);
     channels_.erase(it);
     return PIE_STATUS_OK;
 }

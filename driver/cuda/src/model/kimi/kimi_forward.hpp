@@ -17,9 +17,6 @@ struct KimiForwardCfg {
     int tp_size = 1;
     NcclComm* tp_comm = nullptr;
     bool emit_logits = true;
-    bool tp_greedy_argmax = false;
-    void* greedy_pairs = nullptr;
-    void* greedy_pairs_all = nullptr;
 };
 
 struct KimiWorkspace {

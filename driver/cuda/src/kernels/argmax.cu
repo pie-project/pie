@@ -198,105 +198,6 @@ __global__ void argmax_bf16_compact_scatter_vec2_kernel(
     if (tid == 0) out[original_row] = idxs[0];
 }
 
-__global__ void argmax_bf16_partitioned_pairs_kernel(
-    const __nv_bfloat16* __restrict__ logits,
-    std::uint64_t* __restrict__ partial_pairs,
-    int vocab,
-    int parts)
-{
-    const int row = blockIdx.x;
-    const int part = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int chunk = (vocab + parts - 1) / parts;
-    const int begin = part * chunk;
-    const int end = min(vocab, begin + chunk);
-    const __nv_bfloat16* row_ptr = logits + static_cast<long long>(row) * vocab;
-
-    float best_val = -INFINITY;
-    int best_idx = begin;
-    for (int i = begin + tid; i < end; i += BLOCK) {
-        const float v = __bfloat162float(row_ptr[i]);
-        update_argmax(v, i, best_val, best_idx);
-    }
-
-    __shared__ float vals[BLOCK];
-    __shared__ int idxs[BLOCK];
-    vals[tid] = best_val;
-    idxs[tid] = best_idx;
-    __syncthreads();
-
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) {
-            update_argmax(vals[tid + off], idxs[tid + off],
-                          vals[tid], idxs[tid]);
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        partial_pairs[static_cast<std::size_t>(part) * gridDim.x + row] =
-            pack_argmax_pair(vals[0], idxs[0]);
-    }
-}
-
-__global__ void argmax_bf16_partitioned_pairs_vec2_kernel(
-    const __nv_bfloat16* __restrict__ logits,
-    std::uint64_t* __restrict__ partial_pairs,
-    int vocab,
-    int parts)
-{
-    const int row = blockIdx.x;
-    const int part = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int chunk = (vocab + parts - 1) / parts;
-    const int begin = part * chunk;
-    const int end = min(vocab, begin + chunk);
-    const __nv_bfloat16* row_ptr = logits + static_cast<long long>(row) * vocab;
-    const auto* row2 = reinterpret_cast<const __nv_bfloat162*>(row_ptr);
-
-    float best_val = -INFINITY;
-    int best_idx = begin;
-
-    int even_begin = begin;
-    if ((even_begin & 1) != 0) {
-        if (tid == 0 && even_begin < end) {
-            update_argmax(__bfloat162float(row_ptr[even_begin]),
-                          even_begin, best_val, best_idx);
-        }
-        ++even_begin;
-    }
-    const int even_end = end & ~1;
-    for (int j = even_begin / 2 + tid; j < even_end / 2; j += BLOCK) {
-        const float2 pair = __bfloat1622float2(row2[j]);
-        const int i = j * 2;
-        update_argmax(pair.x, i, best_val, best_idx);
-        update_argmax(pair.y, i + 1, best_val, best_idx);
-    }
-    if (tid == 0 && even_end < end) {
-        update_argmax(__bfloat162float(row_ptr[even_end]),
-                      even_end, best_val, best_idx);
-    }
-
-    __shared__ float vals[BLOCK];
-    __shared__ int idxs[BLOCK];
-    vals[tid] = best_val;
-    idxs[tid] = best_idx;
-    __syncthreads();
-
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) {
-            update_argmax(vals[tid + off], idxs[tid + off],
-                          vals[tid], idxs[tid]);
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        partial_pairs[static_cast<std::size_t>(part) * gridDim.x + row] =
-            pack_argmax_pair(vals[0], idxs[0]);
-    }
-}
-
 __global__ void argmax_fp32_kernel(
     const float* __restrict__ logits,
     std::int32_t* __restrict__ out,
@@ -328,88 +229,6 @@ __global__ void argmax_fp32_kernel(
     }
 
     if (tid == 0) out[row] = idxs[0];
-}
-
-__global__ void argmax_bf16_tile_pair_kernel(
-    const __nv_bfloat16* __restrict__ logits,
-    std::uint64_t* __restrict__ out_pair,
-    int tile_vocab,
-    int token_offset)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const __nv_bfloat16* row_ptr = logits + static_cast<long long>(row) * tile_vocab;
-
-    float best_val = -INFINITY;
-    int best_idx = token_offset;
-
-    for (int i = tid; i < tile_vocab; i += BLOCK) {
-        const float v = __bfloat162float(row_ptr[i]);
-        update_argmax(v, token_offset + i, best_val, best_idx);
-    }
-
-    __shared__ float vals[BLOCK];
-    __shared__ int idxs[BLOCK];
-    vals[tid] = best_val;
-    idxs[tid] = best_idx;
-    __syncthreads();
-
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) {
-            update_argmax(vals[tid + off], idxs[tid + off],
-                          vals[tid], idxs[tid]);
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        out_pair[row] = pack_argmax_pair(vals[0], idxs[0]);
-    }
-}
-
-__global__ void argmax_bf16_tile_pair_vec2_kernel(
-    const __nv_bfloat16* __restrict__ logits,
-    std::uint64_t* __restrict__ out_pair,
-    int tile_vocab,
-    int token_offset)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const __nv_bfloat16* row_ptr = logits + static_cast<long long>(row) * tile_vocab;
-    const auto* row2 = reinterpret_cast<const __nv_bfloat162*>(row_ptr);
-
-    float best_val = -INFINITY;
-    int best_idx = token_offset;
-
-    const int even_end = tile_vocab & ~1;
-    for (int j = tid; j < even_end / 2; j += BLOCK) {
-        const float2 vals = __bfloat1622float2(row2[j]);
-        const int i = j * 2;
-        update_argmax(vals.x, token_offset + i, best_val, best_idx);
-        update_argmax(vals.y, token_offset + i + 1, best_val, best_idx);
-    }
-    if ((tile_vocab & 1) && tid == 0) {
-        update_argmax(__bfloat162float(row_ptr[tile_vocab - 1]),
-                      token_offset + tile_vocab - 1, best_val, best_idx);
-    }
-
-    __shared__ float vals[BLOCK];
-    __shared__ int idxs[BLOCK];
-    vals[tid] = best_val;
-    idxs[tid] = best_idx;
-    __syncthreads();
-
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) {
-            update_argmax(vals[tid + off], idxs[tid + off],
-                          vals[tid], idxs[tid]);
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        out_pair[row] = pack_argmax_pair(vals[0], idxs[0]);
-    }
 }
 
 __global__ void masked_embedding_argmax_bf16_kernel(
@@ -741,26 +560,6 @@ void launch_argmax_bf16_compact_scatter(
     }
 }
 
-void launch_argmax_bf16_partitioned_pairs(
-    const void* logits,
-    std::uint64_t* partial_pairs,
-    int num_rows,
-    int vocab,
-    int parts,
-    cudaStream_t stream)
-{
-    if (num_rows <= 0 || vocab <= 0 || parts <= 1) return;
-    dim3 grid(num_rows, parts);
-    dim3 block(BLOCK);
-    if (argmax_vec2_enabled()) {
-        argmax_bf16_partitioned_pairs_vec2_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(logits), partial_pairs, vocab, parts);
-    } else {
-        argmax_bf16_partitioned_pairs_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(logits), partial_pairs, vocab, parts);
-    }
-}
-
 void launch_lm_head_argmax_bf16(
     const void* hidden_states,
     const void* lm_head_weight,
@@ -1061,42 +860,6 @@ void launch_argmax_fp32(
     dim3 block(BLOCK);
     argmax_fp32_kernel<<<grid, block, 0, stream>>>(
         static_cast<const float*>(logits), token_ids, vocab);
-}
-
-void launch_argmax_bf16_tile_pair(
-    const void* logits,
-    std::uint64_t* out_pair,
-    int num_rows,
-    int tile_vocab,
-    int token_offset,
-    cudaStream_t stream)
-{
-    if (num_rows <= 0 || tile_vocab <= 0) return;
-    dim3 grid(num_rows);
-    dim3 block(BLOCK);
-    if (argmax_vec2_enabled()) {
-        argmax_bf16_tile_pair_vec2_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(logits), out_pair,
-            tile_vocab, token_offset);
-    } else {
-        argmax_bf16_tile_pair_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(logits), out_pair,
-            tile_vocab, token_offset);
-    }
-}
-
-void launch_select_global_argmax_pairs(
-    const std::uint64_t* pairs,
-    std::int32_t* token_ids,
-    int num_rows,
-    int num_parts,
-    cudaStream_t stream)
-{
-    if (num_rows <= 0 || num_parts <= 0) return;
-    dim3 block(128);
-    dim3 grid((num_rows + block.x - 1) / block.x);
-    select_lm_head_argmax_pairs_kernel<<<grid, block, 0, stream>>>(
-        pairs, token_ids, num_rows, num_parts);
 }
 
 void launch_masked_embedding_argmax_bf16(

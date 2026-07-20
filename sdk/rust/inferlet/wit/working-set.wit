@@ -11,6 +11,18 @@ interface working-set {
         len: u32,
     }
 
+    // A half-open declaration [start, end) of WorkingSet-relative page
+    // indexes. Unlike page-range, an absent end follows later lease growth at
+    // the storage contract. A pass using SDK-generated dense page geometry
+    // must be recreated if growth exceeds its bind-time page envelope. When
+    // end is present, start must not exceed it. This type is only for forward-
+    // pass readable/writable declarations; reserve/discard/slice continue to
+    // use finite page-range values.
+    record page-span {
+        start: u32,
+        end: option<u32>,
+    }
+
     // KV working set: a logical page address space over the runtime's KV
     // mapping trie (kv_refact.md). It is a migration and memory-accounting
     // domain and a handle to one terminal in a persistent prefix-sharing
@@ -43,6 +55,21 @@ interface working-set {
         // range. Purely logical: physical pages are allocated only when a
         // forward writes them.
         reserve: func(pages: u32) -> result<page-range, error>;
+
+        // Atomically insert or replace `key` with a structurally retained view
+        // of this working set. Keys are opaque bytes scoped to the active
+        // model/driver store. The working set must have no in-flight fire and
+        // every logical page must be physically mapped.
+        update-index: func(key: list<u8>) -> result<_, error>;
+
+        // Exact best-effort lookup. A missing or pressure-evicted key returns
+        // none. The returned working set structurally shares the indexed
+        // mapping and participates in the normal copy-on-write rules.
+        from-index: static func(key: list<u8>) -> result<option<kv-working-set>, error>;
+
+        // Remove only the named index root. Working sets already returned by
+        // from-index remain valid. Returns false when the key is absent.
+        remove-index: static func(key: list<u8>) -> result<bool, error>;
 
         // Remove `ranges` (pre-discard indexes, applied atomically) from the
         // mapping, ordered on `on`. Suffix indexes shift; no tombstone

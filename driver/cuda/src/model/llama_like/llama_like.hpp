@@ -184,7 +184,6 @@ void llama_like_forward_paged(
     bool is_pure_decode,
     const std::int32_t* logit_row_indices_d = nullptr,
     int num_logit_rows = 0,
-    bool tp_greedy_argmax = false,
     const std::uint8_t* custom_mask_d = nullptr,
     const std::int32_t* custom_mask_indptr_d = nullptr,
     // Explicit KV-write descriptor (device-geometry WSlot/WOff, B2). When
@@ -192,7 +191,9 @@ void llama_like_forward_paged(
     // (physical page, offset) kernel instead of the page-derived write.
     const std::uint32_t* w_page_d = nullptr,
     const std::uint32_t* w_off_d = nullptr,
+    const std::uint8_t* row_valid_d = nullptr,
     bool has_write_desc = false,
+    int runtime_window_left = -2,
     // Qwen3-VL multimodal side-inputs (nullptr = plain text forward).
     const LlamaLikeVisionInputs* vision = nullptr);
 

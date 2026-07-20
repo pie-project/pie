@@ -29,6 +29,7 @@ use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::watch;
 
 use super::gateway::GatewayLinkManager;
+use super::partner::PartnerLinkManager;
 
 /// Worker→controller heartbeat cadence. Matches the gateway's interval and sits
 /// well under the controller's liveness timeout (8s) → ~4× margin, so a few
@@ -45,6 +46,16 @@ const WATCH_DEADLINE: Duration = Duration::from_secs(300);
 /// Backoff before re-polling `watch_worker` after a transport error, so a wedged
 /// or restarting controller doesn't spin the loop.
 const WATCH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+fn restart_after_lost_registration(kind: &str) -> ! {
+    #[cfg(test)]
+    panic!("controller requested {kind} re-registration");
+    #[cfg(not(test))]
+    {
+        let _ = kind;
+        std::process::abort();
+    }
+}
 
 /// The control-plane operations the worker's loops need, abstracted over the
 /// transport (distributed tarpc client vs in-proc controller handle).
@@ -165,8 +176,9 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
 /// client or the in-proc adapter) and return their join handles, aborted on
 /// engine shutdown.
 ///
-/// - **heartbeat** every [`HEARTBEAT_INTERVAL`]; logs (but does not yet act on)
-///   an [`Ack::ReRegister`].
+/// - **heartbeat** every [`HEARTBEAT_INTERVAL`]; an [`Ack::ReRegister`] is fatal
+///   because the controller may mint a new worker id and all gateway/partner
+///   state is keyed by the old one. The process supervisor restarts cleanly.
 /// - **report** coarse load every [`REPORT_INTERVAL`].
 /// - **watch** the neighbor view: read-before-wait over the
 ///   [`ControlLink::neighbors_watch`] receiver (full snapshots, coalesced). Each
@@ -178,6 +190,7 @@ pub fn spawn_control_tasks<C: ControlLink>(
     ctrl: C,
     worker_id: WorkerId,
     mut gateways: GatewayLinkManager,
+    partners: Option<std::sync::Arc<tokio::sync::Mutex<PartnerLinkManager>>>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let heartbeat_ctrl = ctrl.clone();
     let heartbeat_task = tokio::spawn(async move {
@@ -187,10 +200,11 @@ pub fn spawn_control_tasks<C: ControlLink>(
             match heartbeat_ctrl.heartbeat(NodeId::Worker(worker_id)).await {
                 Ok(Ack::Ok) => {}
                 Ok(Ack::ReRegister) => {
-                    tracing::warn!(
+                    tracing::error!(
                         worker = %worker_id,
-                        "controller lost our registration; re-register needed"
+                        "controller lost our registration; restarting worker"
                     );
+                    restart_after_lost_registration("worker");
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -239,8 +253,83 @@ pub fn spawn_control_tasks<C: ControlLink>(
             );
             // Reconcile dial-in links against the freshly-pushed gateway roster.
             gateways.reconcile(&neighbors.gateways).await;
+            if let Some(partners) = partners.as_ref() {
+                partners.lock().await.reconcile(&neighbors.peers).await;
+            }
             if rx.changed().await.is_err() {
                 break; // controller gone → shutdown
+            }
+        }
+    });
+
+    vec![heartbeat_task, report_task, watch_task]
+}
+
+/// Spawn controller liveness loops for an executor. Executors deliberately do
+/// not dial gateways and do not query runtime/store globals: until the verb
+/// service is active their queue and leased scratch occupancy are both zero.
+pub fn spawn_executor_control_tasks<C: ControlLink>(
+    ctrl: C,
+    worker_id: WorkerId,
+    stats: std::sync::Arc<crate::executor::ExecutorStats>,
+    total_pages: u32,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let heartbeat_ctrl = ctrl.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            ticker.tick().await;
+            match heartbeat_ctrl.heartbeat(NodeId::Worker(worker_id)).await {
+                Ok(Ack::Ok) => {}
+                Ok(Ack::ReRegister) => {
+                    tracing::error!(
+                        worker = %worker_id,
+                        "controller lost executor registration; restarting executor"
+                    );
+                    restart_after_lost_registration("executor");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        worker = %worker_id,
+                        %error,
+                        "executor heartbeat transport failed"
+                    );
+                }
+            }
+        }
+    });
+
+    let report_ctrl = ctrl.clone();
+    let report_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(REPORT_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let status = WorkerStatus {
+                kv_pressure_bucket: stats.kv_pressure_bucket(total_pages),
+                inflight: stats.inflight(),
+            };
+            if let Err(error) = report_ctrl.report_worker(worker_id, status).await {
+                tracing::warn!(
+                    worker = %worker_id,
+                    %error,
+                    "executor report_worker transport failed"
+                );
+            }
+        }
+    });
+
+    let watch_task = tokio::spawn(async move {
+        let mut rx = ctrl.neighbors_watch(worker_id);
+        loop {
+            let neighbors = rx.borrow_and_update().clone();
+            tracing::debug!(
+                worker = %worker_id,
+                peers = neighbors.peers.len(),
+                epoch = neighbors.epoch,
+                "executor neighbor view updated"
+            );
+            if rx.changed().await.is_err() {
+                break;
             }
         }
     });

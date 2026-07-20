@@ -19,6 +19,41 @@ BENCH_SYSTEM = "You are a helpful benchmarking assistant."
 BENCH_PROMPT = "Write a short story about a robot."
 
 
+def resolve_local_model(model: str) -> str:
+    candidate = Path(model).expanduser()
+    if candidate.exists():
+        return str(candidate.resolve())
+    encoded = f"models--{model.replace('/', '--')}"
+    roots = []
+    if cache := os.environ.get("HF_HUB_CACHE"):
+        roots.append(Path(cache).expanduser())
+    if home := os.environ.get("HF_HOME"):
+        roots.append(Path(home).expanduser() / "hub")
+    roots.extend(
+        (
+            Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+            / "huggingface"
+            / "hub",
+            Path("~/.pie/programs").expanduser(),
+        )
+    )
+    for root in roots:
+        repository = root / encoded
+        revision = None
+        for ref_name in ("main", "master"):
+            ref = repository / "refs" / ref_name
+            if ref.is_file():
+                revision = ref.read_text().strip()
+                break
+        if revision:
+            snapshot = repository / "snapshots" / revision
+            if snapshot.is_dir():
+                return str(snapshot.resolve())
+    raise FileNotFoundError(
+        f"no local snapshot for {model!r}; download it before benchmarking"
+    )
+
+
 @dataclass
 class RequestResult:
     ok: bool
@@ -26,6 +61,28 @@ class RequestResult:
     output_tokens: int
     prompt_tokens: int | None = None
     error: str | None = None
+    # Populated only when the bench requests timing (--report-timing):
+    # ttft_s is launch-inclusive (client stamp on the engine's first-token
+    # signal); intertoken_us are gaps between successive token deliveries.
+    ttft_s: float | None = None
+    intertoken_us: list[int] | None = None
+    # Absolute client-vantage stamps relative to the measured-run epoch.
+    # Populated only for measured requests under --report-timing.
+    client_send_s: float | None = None
+    token_arrival_s: list[float] | None = None
+    token_arrival_monotonic_ns: list[int] | None = None
+    client_return_s: float | None = None
+    process_id: str | None = None
+    # pie only: guest prologue step durations in us, ordered
+    # [main_pre, tokenize, setup, reserve, build_submit].
+    prologue_us: list[int] | None = None
+    # SHA-256 over emitted u32 token ids in little-endian order. Pie's
+    # multi-process throughput path records this for every measured request.
+    output_token_sha256: str | None = None
+    # Diagnostic-only raw sequence, populated by --dump-all-token-ids.
+    output_token_ids: list[int] | None = None
+    # Diagnostic-only decoded sequence, populated by --dump-all-texts.
+    output_text: str | None = None
 
 
 @dataclass
@@ -46,6 +103,15 @@ class BenchSummary:
     latency_p95_ms: float | None
     latency_p99_ms: float | None
     config: dict[str, Any]
+    # Timing dimensions (present only when the bench collected them):
+    ttft_mean_ms: float | None = None
+    ttft_p50_ms: float | None = None
+    ttft_p95_ms: float | None = None
+    ttft_p99_ms: float | None = None
+    # Inter-token gaps pooled across all requests' accepted tokens.
+    intertoken_p50_ms: float | None = None
+    intertoken_p99_ms: float | None = None
+    intertoken_max_ms: float | None = None
 
 
 def percentile(xs: list[float], q: float) -> float | None:
@@ -74,6 +140,12 @@ def summarize(
     output_tokens = sum(r.output_tokens for r in ok)
     prompt_known = [r.prompt_tokens for r in ok if r.prompt_tokens is not None]
     prompt_tokens = sum(prompt_known) if len(prompt_known) == len(ok) else None
+    ttfts = [r.ttft_s for r in ok if getattr(r, "ttft_s", None) is not None]
+    gaps_ms = [
+        g / 1000.0
+        for r in ok
+        for g in (getattr(r, "intertoken_us", None) or [])
+    ]
     return BenchSummary(
         mode=mode,
         engine=engine,
@@ -91,6 +163,13 @@ def summarize(
         latency_p95_ms=(percentile(lats, 0.95) * 1000.0) if lats else None,
         latency_p99_ms=(percentile(lats, 0.99) * 1000.0) if lats else None,
         config=config,
+        ttft_mean_ms=(statistics.fmean(ttfts) * 1000.0) if ttfts else None,
+        ttft_p50_ms=(percentile(ttfts, 0.50) * 1000.0) if ttfts else None,
+        ttft_p95_ms=(percentile(ttfts, 0.95) * 1000.0) if ttfts else None,
+        ttft_p99_ms=(percentile(ttfts, 0.99) * 1000.0) if ttfts else None,
+        intertoken_p50_ms=percentile(gaps_ms, 0.50) if gaps_ms else None,
+        intertoken_p99_ms=percentile(gaps_ms, 0.99) if gaps_ms else None,
+        intertoken_max_ms=max(gaps_ms) if gaps_ms else None,
     )
 
 
@@ -110,6 +189,14 @@ def print_summary(s: BenchSummary) -> None:
     if s.latency_mean_ms is not None:
         print(f"lat mean/p50:      {s.latency_mean_ms:.1f} / {s.latency_p50_ms:.1f} ms")
         print(f"lat p95/p99:       {s.latency_p95_ms:.1f} / {s.latency_p99_ms:.1f} ms")
+    if s.ttft_mean_ms is not None:
+        print(f"ttft mean/p50:     {s.ttft_mean_ms:.1f} / {s.ttft_p50_ms:.1f} ms")
+        print(f"ttft p95/p99:      {s.ttft_p95_ms:.1f} / {s.ttft_p99_ms:.1f} ms")
+    if s.intertoken_p50_ms is not None:
+        print(
+            f"intertoken p50/p99/max: {s.intertoken_p50_ms:.2f} / "
+            f"{s.intertoken_p99_ms:.2f} / {s.intertoken_max_ms:.2f} ms"
+        )
     # Speculation counters live in the config blob, sourced from the
     # server's `model_status` query. Only printed when present so
     # baseline runs (no speculation capability) stay quiet.
@@ -220,6 +307,35 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--unique-prompts", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--shared-prefix-words",
+        type=int,
+        default=0,
+        help="Prefix-heavy shape: prepend a deterministic shared block of "
+             "roughly this many tokens to every prompt (unique tails kept). "
+             "Pair with prefix caching on engines that support it.",
+    )
+    p.add_argument(
+        "--mixed-phase",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Mixed-phase shape: even-indexed requests are prefill-heavy "
+             "(long prompt, --mixed-short-output tokens out), odd-indexed "
+             "are decode-heavy (short prompt, --max-tokens out). Run with "
+             "prefix caching OFF on both engines.",
+    )
+    p.add_argument(
+        "--mixed-long-prompt-words",
+        type=int,
+        default=400,
+        help="Word count of the long prompt body in --mixed-phase.",
+    )
+    p.add_argument(
+        "--mixed-short-output",
+        type=int,
+        default=16,
+        help="max_tokens for the prefill-heavy half in --mixed-phase.",
+    )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument(
         "--warmup-max-tokens",
@@ -235,6 +351,19 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         help="Call cudaProfilerStart/Stop around the measured section. Use with "
              "`nsys profile --capture-range=cudaProfilerApi` to exclude setup "
              "and warmup from the trace.",
+    )
+    p.add_argument(
+        "--cuda-profiler-delay-s",
+        type=float,
+        default=0.0,
+        help="Delay cudaProfilerStart after measured work begins.",
+    )
+    p.add_argument(
+        "--cuda-profiler-duration-s",
+        type=float,
+        default=0.0,
+        help="Stop a delayed profiler capture after this duration. Zero keeps "
+        "the legacy whole-measured-window capture.",
     )
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)
@@ -262,7 +391,47 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _filler_words(count: int) -> str:
+    base = (
+        "the quick brown fox jumps over the lazy dog and then walks "
+        "back home again to rest before the next long day begins"
+    ).split()
+    return " ".join(base[i % len(base)] for i in range(count))
+
+
+def request_max_tokens(args: argparse.Namespace, i: int) -> int:
+    """Per-request output budget: uniform unless --mixed-phase."""
+    if getattr(args, "mixed_phase", False) and i % 2 == 0:
+        return args.mixed_short_output
+    return args.max_tokens
+
+
 def make_prompts(args: argparse.Namespace, n: int) -> list[str]:
+    if getattr(args, "mixed_phase", False):
+        long_body = _filler_words(getattr(args, "mixed_long_prompt_words", 400))
+        return [
+            f"{long_body}. {args.prompt} (Request #{i})"
+            if i % 2 == 0
+            else f"{args.prompt} (Request #{i})"
+            for i in range(n)
+        ]
+    shared_words = getattr(args, "shared_prefix_words", 0) or 0
+    if shared_words > 0:
+        # Prefix-heavy shape: every prompt opens with the SAME long
+        # instruction block (deterministic filler; ~1 token per word)
+        # followed by a short unique tail. Exercises prefix caching on
+        # engines that support it.
+        base = (
+            "the quick brown fox jumps over the lazy dog and then walks "
+            "back home again to rest before the next long day begins"
+        ).split()
+        filler = " ".join(base[i % len(base)] for i in range(shared_words))
+        shared = (
+            "You will answer questions about the following policy. "
+            + filler
+            + ". Policy ends. "
+        )
+        return [f"{shared}{args.prompt} (Request #{i})" for i in range(n)]
     if args.unique_prompts:
         return [f"{args.prompt} (Request #{i})" for i in range(n)]
     return [args.prompt for _ in range(n)]

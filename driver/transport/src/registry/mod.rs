@@ -129,6 +129,20 @@ impl Registry {
         Ok(self.route(kind, inner))
     }
 
+    pub fn send_mapped(
+        &self,
+        handle: &RegisteredHandle,
+        src_pages: &PageSet,
+        dst_pages: &PageSet,
+        dst: WorkerId,
+    ) -> Result<TransferId> {
+        let kind = handle.engine();
+        let inner = self
+            .engine(kind)?
+            .send_mapped(handle, src_pages, dst_pages, dst)?;
+        Ok(self.route(kind, inner))
+    }
+
     /// Start receiving `pages` into the local `slot` from worker `src`.
     pub fn recv(
         &self,

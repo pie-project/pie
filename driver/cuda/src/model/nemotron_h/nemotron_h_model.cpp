@@ -68,7 +68,7 @@ void NemotronHModel::body(Workspace& ws,
         in.qo_indptr_h, in.kv_page_indptr_h,
         in.total_tokens, in.num_requests, in.is_pure_decode,
         in.custom_mask_d, in.custom_mask_indptr_d,
-        in.slot_ids_h, in.is_fresh_h, in.slot_ids_d,
+        in.slot_ids_h, in.is_fresh_h, in.slot_ids_d, in.is_fresh_d,
         in.logit_row_indices_d, in.num_logit_rows);
 }
 

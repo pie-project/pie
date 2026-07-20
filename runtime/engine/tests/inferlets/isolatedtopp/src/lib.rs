@@ -25,10 +25,6 @@ const TEMPERATURE: f32 = 0.8;
 const TOP_P: f32 = 0.9;
 const MAX_TOKENS: usize = 4;
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 /// TopP mask + Gumbel-max sample over `logits` (already temperature-scaled):
 /// keep = pivot_threshold(softmax(logits), cummass_le(p)); sample =
 /// argmax(select(keep, logits, -inf) + gumbel(r)). `r` is the taken `[2]` u32
@@ -45,23 +41,28 @@ fn topp_sample(logits: Tensor, vocab: u32, r: impl AsTensor) -> Tensor {
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     model::configure(vocab, ws.page_size(), 1);
 
     let prompt = wit_model::encode("hello world");
     let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
     let n = prompt.len() as u32;
+    let max_pages = (n + MAX_TOKENS as u32 + 1).div_ceil(ws.page_size());
+    ws.reserve(max_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
 
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = bx(Channel::from(prompt_i32).named("toks_p"));
-    let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
-    let rng_p = bx(Channel::from(vec![0x9e37_u32, 0]).named("rng_p"));
-    let g0_ch = bx(Channel::new([1], dtype::i32).named("g0"));
+    let toks_p = Channel::from(prompt_i32).named("toks_p");
+    let rng_p = Channel::from(vec![0x9e37_u32, 0]).named("rng_p");
+    let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
-    let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd_p.embed(toks_p, Tensor::constant(vec![0u32, n]));
-    fwd_p.attn_working_set(ws, klen_p);
+    let fwd_p = ForwardPass::new();
+    fwd_p.embed(&toks_p, Tensor::constant(vec![0u32, n]));
+    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    fwd_p.port_channel(Port::KvLen, &kv_len_p);
+    fwd_p.attn_working_set(&ws, .., ..)?;
+    fwd_p.derive_dense_geometry();
     fwd_p.epilogue(move || {
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
         let scaled = div(intrinsics::logits(), TEMPERATURE);
@@ -71,65 +72,68 @@ async fn main(_input: String) -> Result<String> {
         rng_p.put(&r_next);
     });
 
-    let prefill = Pipeline::new();
+    // ONE pipeline for the whole prefill→decode stream (R4-4): the decode
+    // fires below are submitted on this same pipeline (MAX_TOKENS > 1, so
+    // finish() (F7) lands after the last decode submit, not here).
+    let pipe = Pipeline::new();
     fwd_p
-        .submit(&prefill)
+        .submit(&pipe)
         .map_err(|e| format!("prefill submit: {e}"))?;
     let g0 = g0_ch
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("g0 take: {e}"))?[0];
-    prefill.close();
 
     let mut got: Vec<u32> = Vec::with_capacity(MAX_TOKENS);
     got.push(g0 as u32);
 
     // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
     if got.len() < MAX_TOKENS {
-        let tok_in = bx(Channel::from(vec![g0; 1]).named("tok_in"));
-        let pos = bx(Channel::from(vec![n; 1]).named("pos"));
-        let klen = bx(Channel::from(vec![n + 1; 1]).named("klen"));
-        let fill = bx(Channel::from(vec![n + 1; 1]).named("fill"));
-        let rng = bx(Channel::from(vec![0x51ed_u32, 0]).named("rng"));
-        let out = bx(Channel::new([1], dtype::i32).named("out"));
+        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
+        let rng = Channel::from(vec![0x51ed_u32, 0]).named("rng");
+        let out = Channel::new([1], dtype::i32).named("out");
         let lane1 = Tensor::constant(vec![0u32, 1u32]);
 
-        let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-        fwd.embed(tok_in, lane1);
-        fwd.positions(pos);
-        fwd.attn_working_set(ws, klen);
+        let fwd = ForwardPass::new();
+        fwd.embed(&tok_in, lane1);
+        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        fwd.port_channel(Port::KvLen, &kv_len);
+        fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
+        fwd.derive_dense_geometry();
         fwd.epilogue(move || {
-            let base = fill.take().tensor(); // [1] u32
+            let length = kv_len.take().tensor();
             let r = rng.take(); // [2] u32 rng state
             let scaled = div(intrinsics::logits(), TEMPERATURE);
             let t = topp_sample(scaled, vocab, &r);
 
-            let klen_v = add(&base, 1u32);
-            let next_free = add(&base, 1u32);
             let r_next = add(&r, iota(2));
 
             tok_in.put(&t);
+            kv_len.put(add(&length, 1u32));
             out.put(&t);
-            pos.put(&base);
-            klen.put(&klen_v);
-            fill.put(&next_free);
             rng.put(&r_next);
         });
 
-        let decode = Pipeline::new();
         for step in 1..MAX_TOKENS {
-            fwd.submit(&decode)
+            // Fixed budget: the last submit is knowable at submit time →
+            // finish() right after it (F7: end of stream; no close needed
+            // after the drain).
+            fwd.submit(&pipe)
                 .map_err(|e| format!("decode submit @{step}: {e}"))?;
+            if step + 1 == MAX_TOKENS {
+                pipe.finish();
+            }
             let t = out
                 .take()
                 .get::<i32>()
+                .await
                 .map_err(|e| format!("out.take @{step}: {e}"))?;
             let Some(&t0) = t.first() else {
                 return Err(format!("out.take @{step}: empty tensor"));
             };
             got.push(t0 as u32);
         }
-        decode.close();
     }
 
     eprintln!("[ISOLATED_TOPP] tokens: {got:?}");

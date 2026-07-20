@@ -215,6 +215,88 @@ else()
   message(STATUS "FlashInfer Mamba SM90 vertical/horizontal SSU kernels disabled (legacy + simple algorithm only)")
 endif()
 
+# Local PTIR development only needs the Qwen families. Opt-in (the dev build
+# script flips it ON): an unconfigured release must ship every model, not a
+# Qwen-only driver.
+option(PIE_CUDA_QWEN_ONLY
+  "Build only Qwen 3 and Qwen 3.5 CUDA model implementations" OFF)
+
+set(PIE_CUDA_MODEL_SOURCES
+  src/model/config.cpp
+  src/model/loaded_model.cpp
+  src/model/registry.cpp
+  src/model/weight_store.cpp
+  src/model/workspace.cpp
+  src/model/llama_like/llama_like.cpp
+  src/model/llama_like/llama_like_model.cpp
+  src/model/llama_like/qwen3.cpp
+  src/model/qwen3_5/qwen3_5.cpp
+  src/model/qwen3_5/qwen3_5_config.cpp
+  src/model/qwen3_5/qwen3_5_forward.cpp
+  src/model/qwen3_5/qwen3_5_model.cpp
+  src/model/qwen3_5/qwen3_5_moe.cpp
+  src/model/qwen3_5/qwen3_5_moe_forward.cpp
+  src/model/qwen3_5/qwen3_5_moe_model.cpp)
+
+if(PIE_CUDA_QWEN_ONLY)
+  message(STATUS "Building Qwen-only CUDA model registry")
+else()
+  list(APPEND PIE_CUDA_MODEL_SOURCES
+    src/model/csm/csm.cpp
+    src/model/csm/csm_backbone_forward.cu
+    src/model/csm/csm_depth_decoder_forward.cu
+    src/model/csm/csm_model.cpp
+    src/model/csm/mimi_decoder_adapter.cpp
+    src/model/csm/mimi_decoder_forward.cu
+    src/model/deepseek_v4/deepseek_v4.cpp
+    src/model/deepseek_v4/deepseek_v4_forward.cpp
+    src/model/deepseek_v4/deepseek_v4_model.cpp
+    src/model/gemma/gemma2.cpp
+    src/model/gemma/gemma2_model.cpp
+    src/model/gemma3n/gemma3n.cpp
+    src/model/gemma3n/gemma3n_model.cpp
+    src/model/gemma4/gemma4.cpp
+    src/model/gemma4/gemma4_audio_adapter.cpp
+    src/model/gemma4/gemma4_audio_forward.cu
+    src/model/gemma4/gemma4_model.cpp
+    src/model/gemma4/gemma4_vision_adapter.cpp
+    src/model/gemma4/gemma4_vision_forward.cu
+    src/model/glm5/glm5.cpp
+    src/model/glm5/glm5_forward.cpp
+    src/model/glm5/glm5_model.cpp
+    src/model/kimi/kimi.cpp
+    src/model/kimi/kimi_forward.cpp
+    src/model/kimi/kimi_model.cpp
+    src/model/llama_like/mistral3.cpp
+    src/model/mixtral/gpt_oss.cpp
+    src/model/mixtral/mixtral.cpp
+    src/model/mixtral/mixtral_model.cpp
+    src/model/nemotron_h/nemotron_h.cpp
+    src/model/nemotron_h/nemotron_h_forward.cpp
+    src/model/nemotron_h/nemotron_h_model.cpp
+    src/model/qwen3_vl/qwen3_vl.cpp
+    src/model/qwen3_vl/qwen3_vl_model.cpp
+    src/model/qwen3_vl/qwen3_vl_vision_adapter.cpp
+    src/model/qwen3_vl/qwen3_vl_vision_forward.cu
+    src/ops/attention_mla.cu
+    src/ops/flashinfer_mamba.cu
+    src/kernels/altup.cu
+    src/kernels/altup_aux.cu
+    src/kernels/attn_sink.cu
+    src/kernels/dsa_indexer.cu
+    src/kernels/dsv4_compress.cu
+    src/kernels/dsv4_hc.cu
+    src/kernels/dsv4_routing.cu
+    src/kernels/gaussian_topk.cu
+    src/kernels/kimi_mla.cu
+    src/kernels/mla_paged.cu
+    src/kernels/nemotron_h.cu
+    src/kernels/scalar_mul.cu
+    src/kernels/softcap.cu
+    src/store/dsa_cache.cpp
+    src/store/mla_cache.cpp)
+endif()
+
 # ---- pie_driver_cuda_lib ---------------------------------------------------
 # Native CUDA backend. `pie_driver_cuda_lib` is linked in-process by the Rust
 # worker; `pie_driver_cuda` below is a thin direct-create diagnostic shim.
@@ -229,7 +311,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/batch/brle.cpp
   src/batch/compose.cpp
   src/batch/forward.cpp
-  src/batch/logits.cpp
   src/batch/persistent_inputs.cpp
   src/batch/tp.cpp
   src/batch/workspace.cpp
@@ -238,64 +319,12 @@ add_library(pie_driver_cuda_lib STATIC
   src/pipeline/frame_carrier.cpp
   src/pipeline/frame_carrier_kernels.cu
   src/pipeline/registry.cpp
-  # model/ -- registry, workspace, weight store, HF config, one dir per family
-  src/model/config.cpp
-  src/model/loaded_model.cpp
-  src/model/registry.cpp
-  src/model/weight_store.cpp
-  src/model/workspace.cpp
-  src/model/csm/csm.cpp
-  src/model/csm/csm_backbone_forward.cu
-  src/model/csm/csm_depth_decoder_forward.cu
-  src/model/csm/csm_model.cpp
-  src/model/csm/mimi_decoder_adapter.cpp
-  src/model/csm/mimi_decoder_forward.cu
-  src/model/deepseek_v4/deepseek_v4.cpp
-  src/model/deepseek_v4/deepseek_v4_forward.cpp
-  src/model/deepseek_v4/deepseek_v4_model.cpp
-  src/model/gemma/gemma2.cpp
-  src/model/gemma/gemma2_model.cpp
-  src/model/gemma3n/gemma3n.cpp
-  src/model/gemma3n/gemma3n_model.cpp
-  src/model/gemma4/gemma4.cpp
-  src/model/gemma4/gemma4_audio_adapter.cpp
-  src/model/gemma4/gemma4_audio_forward.cu
-  src/model/gemma4/gemma4_model.cpp
-  src/model/gemma4/gemma4_vision_adapter.cpp
-  src/model/gemma4/gemma4_vision_forward.cu
-  src/model/glm5/glm5.cpp
-  src/model/glm5/glm5_forward.cpp
-  src/model/glm5/glm5_model.cpp
-  src/model/kimi/kimi.cpp
-  src/model/kimi/kimi_forward.cpp
-  src/model/kimi/kimi_model.cpp
-  src/model/llama_like/llama_like.cpp
-  src/model/llama_like/llama_like_model.cpp
-  src/model/llama_like/mistral3.cpp
-  src/model/llama_like/qwen3.cpp
-  src/model/mixtral/gpt_oss.cpp
-  src/model/mixtral/mixtral.cpp
-  src/model/mixtral/mixtral_model.cpp
-  src/model/nemotron_h/nemotron_h.cpp
-  src/model/nemotron_h/nemotron_h_forward.cpp
-  src/model/nemotron_h/nemotron_h_model.cpp
-  src/model/qwen3_5/qwen3_5.cpp
-  src/model/qwen3_5/qwen3_5_config.cpp
-  src/model/qwen3_5/qwen3_5_forward.cpp
-  src/model/qwen3_5/qwen3_5_model.cpp
-  src/model/qwen3_5/qwen3_5_moe.cpp
-  src/model/qwen3_5/qwen3_5_moe_forward.cpp
-  src/model/qwen3_5/qwen3_5_moe_model.cpp
-  src/model/qwen3_vl/qwen3_vl.cpp
-  src/model/qwen3_vl/qwen3_vl_model.cpp
-  src/model/qwen3_vl/qwen3_vl_vision_adapter.cpp
-  src/model/qwen3_vl/qwen3_vl_vision_forward.cu
+  # model/ -- registry, workspace, weight store, HF config, selected families
+  ${PIE_CUDA_MODEL_SOURCES}
   # store/ -- long-lived device memory pools
-  src/store/dsa_cache.cpp
   src/store/kv_cache.cpp
   src/store/kv_cache_format.cpp
   src/store/memory_planner.cpp
-  src/store/mla_cache.cpp
   src/store/recurrent_state_cache.cpp
   src/store/swap_pool.cpp
   # loader/ -- snapshot -> WeightStore
@@ -304,7 +333,6 @@ add_library(pie_driver_cuda_lib STATIC
   # ops/ -- attention / GEMM / MoE / SSM wrappers
   src/ops/attention_flashinfer.cu
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
-  src/ops/attention_mla.cu
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
   src/ops/attention_workspace.cpp
@@ -313,53 +341,44 @@ add_library(pie_driver_cuda_lib STATIC
   src/ops/attention_xqa_gqa2_p16.cu
   src/ops/attention_xqa_gqa4.cu
   src/ops/attention_xqa_gqa8.cu
-  src/ops/flashinfer_mamba.cu
   src/ops/gemm.cpp
   # kernels/ -- fused kernels
   src/kernels/add_bias.cu
-  src/kernels/altup.cu
-  src/kernels/altup_aux.cu
   src/kernels/argmax.cu
-  src/kernels/attn_sink.cu
+  src/kernels/graph_pad.cu
   src/kernels/causal_conv1d.cu
   ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   src/kernels/deinterleave.cu
   src/kernels/dequant_fp4.cu
   src/kernels/dequant_fp8.cu
   src/kernels/dequant_wna16.cu
-  src/kernels/dsa_indexer.cu
-  src/kernels/dsv4_compress.cu
-  src/kernels/dsv4_hc.cu
-  src/kernels/dsv4_routing.cu
   src/kernels/dtype_cast.cu
   src/kernels/embed.cu
   src/kernels/envelope.cu
   src/kernels/gated_delta_net.cu
   src/kernels/gather_rows.cu
   src/kernels/gather_tokens.cu
-  src/kernels/gaussian_topk.cu
   src/kernels/geometry.cu
   src/kernels/head_dim_pad.cu
-  src/kernels/kimi_mla.cu
   src/kernels/kv_paged.cu
-  src/kernels/mla_paged.cu
   src/kernels/moe_dispatch.cu
   src/kernels/mxfp4_marlin.cu
-  src/kernels/nemotron_h.cu
   src/kernels/pack_dense_mask.cu
   src/kernels/quant_bf16_to_fp8.cu
   src/kernels/quant_bf16_to_mxfp4.cu
   src/kernels/residual_add.cu
   src/kernels/rmsnorm.cu
   src/kernels/rope.cu
-  src/kernels/scalar_mul.cu
   src/kernels/slab_scatter.cu
-  src/kernels/softcap.cu
   src/kernels/split_packed.cu
   src/kernels/swiglu.cu
   src/kernels/topk_softmax.cu
   src/kernels/transcode.cu
 )
+
+if(PIE_CUDA_QWEN_ONLY)
+  target_compile_definitions(pie_driver_cuda_lib PUBLIC PIE_CUDA_QWEN_ONLY=1)
+endif()
 
 target_compile_options(pie_driver_cuda_lib PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:
@@ -539,7 +558,6 @@ add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/support/tier1_codegen.hpp
   tests/masked_attention_reference.hpp
   tests/parity_qwen3_5_multireq.py
-  tests/load_parity/README.md
   tests/load_parity/dtypes.py
   tests/load_parity/gen.py
   tests/load_parity/oracle.py
@@ -551,6 +569,7 @@ add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/golden-ptir/dfa_ingraph.txt
   tests/golden-ptir/greedy_argmax.txt
   tests/golden-ptir/mtp_verify_tail.txt
+  tests/golden-ptir/nucleus_sample.txt
   tests/golden-ptir/neg_body_type_error.txt
   tests/golden-ptir/neg_intrinsic_wrong_stage.txt
   tests/golden-ptir/neg_model_gated_missing.txt
@@ -558,7 +577,18 @@ add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/golden-ptir/neg_spsc_second_producer.txt
   tests/golden-ptir/neg_t10_nonreplayable.txt
   tests/golden-ptir/pivot_predicates_multistage.txt
-  tests/golden-ptir/section3_masked_gumbel.txt)
+  tests/golden-ptir/section3_masked_gumbel.txt
+  tests/golden-ptir/staged_dispatch.txt
+  tests/golden-ptir/structured_masks.txt)
+
+file(GLOB PIE_PTIR_CANONICAL_GOLDENS CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir/*.txt)
+pie_add_cuda_target(test_ptir_decoder_limits
+  SOURCES ../common/tests/ptir_decoder_limits_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  TEST_ARGS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/malformed_wire_corpus.txt
+    ${PIE_PTIR_CANONICAL_GOLDENS})
 
 # Mixed prefill/decode batch: a continuing T=1 request must reuse its conv window.
 pie_add_cuda_target(test_causal_conv1d
@@ -680,7 +710,27 @@ pie_add_cuda_target(test_flashinfer_decode_head_dim_guard
   SOURCES tests/test_flashinfer_decode_head_dim_guard.cpp
   LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_graph_variant SOURCES tests/graph_variant_test.cpp)
-pie_add_cuda_target(test_ptir_graph_key SOURCES tests/ptir_graph_key_test.cpp LIBS CUDA::cudart)
+pie_add_cuda_target(test_tp_gate
+  SOURCES tests/tp_gate_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
+  LIBS Threads::Threads)
+pie_add_cuda_target(test_program_identity
+  SOURCES tests/program_identity_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+pie_add_cuda_target(test_grouped_copy
+  SOURCES tests/grouped_copy_test.cpp)
+pie_add_cuda_target(test_nucleus_region
+  SOURCES tests/nucleus_region_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+pie_add_cuda_target(test_page_translation
+  SOURCES tests/page_translation_test.cpp)
+pie_add_cuda_target(test_ptir_graph_key
+  SOURCES tests/ptir_graph_key_test.cpp
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  LIBS CUDA::cudart tomlplusplus::tomlplusplus)
 pie_add_cuda_target(test_frame_carrier_device
   SOURCES
     tests/test_frame_carrier_device.cpp
@@ -695,7 +745,7 @@ pie_add_cuda_target(test_pipeline_dispatch_bind
     src/pipeline/frame_carrier.cpp
     src/pipeline/frame_carrier_kernels.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
-  LIBS CUDA::cudart
+  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 # Same-instance run-ahead concurrency gate; build with -fsanitize=thread for the TSAN run.
 pie_add_cuda_target(test_pipeline_dispatch_race
@@ -705,7 +755,7 @@ pie_add_cuda_target(test_pipeline_dispatch_race
     src/pipeline/frame_carrier.cpp
     src/pipeline/frame_carrier_kernels.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
-  LIBS CUDA::cudart
+  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 pie_add_cuda_target(test_ptir_tier0
   SOURCES tests/ptir_tier0_test.cu
@@ -730,6 +780,51 @@ pie_add_cuda_target(test_ptir_tier1
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR}
   LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc)
+pie_add_cuda_target(test_ptir_generated_singleton
+  SOURCES tests/ptir_generated_singleton_test.cu
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
+  TEST_ARGS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/ptir/tests/golden-ptir)
+pie_add_cuda_target(test_ptir_grouped_dispatch
+  SOURCES
+    tests/ptir_grouped_dispatch_test.cpp
+    src/pipeline/dispatch.cu
+    src/pipeline/frame_carrier.cpp
+    src/pipeline/frame_carrier_kernels.cu
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
+  TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  pie_add_cuda_target(test_ptir_grouped_dispatch_asan
+    SOURCES
+      tests/ptir_grouped_dispatch_test.cpp
+      src/pipeline/dispatch.cu
+      src/pipeline/frame_carrier.cpp
+      src/pipeline/frame_carrier_kernels.cu
+    INCLUDE_DIRS
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+      ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+      ${PIE_DRIVER_ABI_INCLUDE_DIR}
+    LIBS CUDA::cudart CUDA::cuda_driver CUDA::nvrtc
+    TEST_ARGS ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden-ptir)
+  target_compile_options(test_ptir_grouped_dispatch_asan PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fsanitize=address>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-omit-frame-pointer>)
+  target_link_options(test_ptir_grouped_dispatch_asan PRIVATE
+    -fsanitize=address)
+  set_tests_properties(ptir_grouped_dispatch_asan PROPERTIES
+    ENVIRONMENT
+      "ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:protect_shadow_gap=0")
+endif()
 pie_add_cuda_target(test_ptir_golden_exec
   SOURCES tests/ptir_golden_exec_test.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${PIE_DRIVER_ABI_INCLUDE_DIR}
@@ -738,6 +833,19 @@ pie_add_cuda_target(test_ptir_golden_exec
 pie_add_cuda_target(test_entry_validation
   SOURCES tests/entry_validation_test.cpp
   LIBS pie_driver_cuda_lib)
+pie_add_cuda_target(test_rs_descriptor_validation
+  SOURCES tests/rs_descriptor_validation_test.cpp
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR})
+pie_add_cuda_target(test_precomputed_embeddings
+  SOURCES tests/precomputed_embeddings_test.cpp
+  INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
+  LIBS CUDA::cudart)
 # Structural proof for model/registry.{hpp,cpp}: every model_type resolves to its
 # intended family/binder; unrecognized archs are rejected. No GPU, no weights.
 pie_add_cuda_target(test_model_registry

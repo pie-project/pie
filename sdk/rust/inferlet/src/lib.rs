@@ -127,6 +127,12 @@ pub async fn sleep(duration: std::time::Duration) {
     let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
     crate::wasi::clocks::monotonic_clock::wait_for(nanos).await;
 }
+
+/// Current `wasi:clocks/monotonic-clock` mark in nanoseconds.
+pub fn monotonic_now_ns() -> u64 {
+    crate::wasi::clocks::monotonic_clock::now()
+}
+
 pub mod session {
     pub use crate::pie::inferlet::session::*;
 }

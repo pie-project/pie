@@ -54,12 +54,7 @@ public:
         return bytes;
     }
 
-    // Fused argmax — module-level free functions in the gemma4 namespace
-    // today, exposed through the IModel interface so the executor's
-    // capability dispatch sees a uniform API.
-    void set_logits_argmax_only(bool enabled) override;
-    void set_fused_argmax_output(std::int32_t* ptr) override;
-    bool fused_argmax_done() override;
+    bool encode_media(const MediaEncodeInputs& in, cudaStream_t stream) override;
 
 private:
     Gemma4Weights weights_;

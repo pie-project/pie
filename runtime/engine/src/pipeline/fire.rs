@@ -2,17 +2,18 @@
 //! run-ahead engine (the WIT host glue lives one layer up, in the
 //! `inferlet::host` forward/pipeline modules).
 //!
-//! **Run-ahead** (overview §3): `pipeline.submit` NEVER blocks. It prepares the
+//! **Run-ahead** (overview §3): pure-attention `pipeline.submit` does not block.
+//! RS-bound submission first finalizes prior FIFO operations so folded-state
+//! preparation observes the preceding commit. It then prepares the
 //! fire (seeds, host puts, KV/RS projection), hands the request to the
 //! scheduler, and enqueues a [`PendingFire`] (the payload-free completion + the
 //! open KV/RS txns) on the pass — the classic `execute()`/`output()` split
-//! (`PendingForward`, Option A) applied to this engine. Step t+1 is prepared
-//! against t's OPTIMISTIC post-state (the `committed_tokens` cursor advances at
-//! submit), so a decode loop keeps the scheduler fed. `channel.take`/`read`
-//! are the await points: they finalize in-flight fires FIFO until the cell
-//! fills. A failed fire **poisons** the pass's host-reader channels (the only
-//! error path once submit is non-blocking) and fails the pass for further
-//! submits.
+//! (`PendingForward`, Option A) applied to this engine. Pure-attention fires
+//! read a standing WorkingSet translation; RS step t+1 waits for t's committed
+//! folded mapping.
+//! `channel.take`/`read` also finalize in-flight fires FIFO until the cell
+//! fills. A failed fire **poisons** the pass's host-reader channels and fails
+//! the pass for further submits.
 //!
 //! **Layering.** The orchestration functions below (`submit_pass`,
 //! `finalize_fire`, `drain_settled`, `wire_channels_to_pipeline`,
@@ -32,9 +33,9 @@ pub mod geometry;
 pub mod kv;
 pub mod lease;
 pub mod rs;
+pub mod shadow;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use wasmtime::component::Resource;
@@ -49,83 +50,183 @@ use crate::store::rs::working_set::RsWorkingSet;
 use lease::DevGeo;
 use pie_ptir::container::HostRole;
 
-/// A pass's in-flight fires, submit order. Plain mutex: never held across an
-/// await (the op is popped out, then awaited).
-pub type PendingFires = Arc<Mutex<VecDeque<PendingOp>>>;
+/// A pass's in-flight fires, submit order. The queue mutex is never held across
+/// an await; the async finalizer gate serializes pop-through-finalize instead.
+pub struct PendingFireQueue {
+    queue: Mutex<VecDeque<PendingOp>>,
+    finalizer: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl PendingFireQueue {
+    pub fn new() -> Self {
+        Self::from_queue(VecDeque::new())
+    }
+
+    pub(crate) fn from_queue(queue: VecDeque<PendingOp>) -> Self {
+        Self {
+            queue: Mutex::new(queue),
+            finalizer: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, VecDeque<PendingOp>>> {
+        self.queue.lock()
+    }
+
+    pub(crate) async fn finalize_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.finalizer).lock_owned().await
+    }
+}
+
+pub type PendingFires = Arc<PendingFireQueue>;
 pub type PipelineFailure = Arc<Mutex<Option<String>>>;
 
-#[derive(Clone)]
-struct AcquireCancellation {
-    cancelled: Arc<AtomicBool>,
-    notify: Arc<tokio::sync::Notify>,
-}
-
-impl AcquireCancellation {
-    async fn cancelled(&self) {
-        if self.cancelled.load(Ordering::Acquire) {
-            return;
-        }
-        let notified = self.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if self.cancelled.load(Ordering::Acquire) {
-            return;
-        }
-        notified.await;
-    }
-}
-
-struct AcquireOwner {
-    cancellation: AcquireCancellation,
-}
-
-impl AcquireOwner {
-    fn new() -> Self {
-        Self {
-            cancellation: AcquireCancellation {
-                cancelled: Arc::new(AtomicBool::new(false)),
-                notify: Arc::new(tokio::sync::Notify::new()),
-            },
-        }
-    }
-
-    fn cancellation(&self) -> AcquireCancellation {
-        self.cancellation.clone()
-    }
-}
-
-impl Drop for AcquireOwner {
-    fn drop(&mut self) {
-        self.cancellation.cancelled.store(true, Ordering::Release);
-        self.cancellation.notify.notify_waiters();
-    }
-}
-
-fn reclaimable_probe(
+struct CopyCompletionGuard {
+    completion: Option<crate::driver::SubmissionCompletion>,
+    lease: Option<KvFireLease>,
     model: usize,
     driver: usize,
-    process_id: uuid::Uuid,
-    working_sets: std::collections::HashSet<crate::store::kv::page_table::WorkingSetId>,
-) -> crate::store::reclaim::ReclaimableProbe {
-    Arc::new(move || {
+    ws: crate::store::kv::page_table::WorkingSetId,
+    indexes: Vec<u32>,
+}
+
+impl CopyCompletionGuard {
+    fn invalidate(
+        model: usize,
+        driver: usize,
+        ws: crate::store::kv::page_table::WorkingSetId,
+        indexes: &[u32],
+    ) {
         let stores = crate::store::registry::get(model, driver);
-        match stores
-            .kv
-            .lock()
-            .unwrap()
-            .post_drain_reclaimable_page_count(&working_sets)
+        if let Err(error) =
+            crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                kv.invalidate_copied_pages(ws, indexes)
+            })
         {
-            Ok(pages) => pages > 0,
-            Err(error) => {
-                tracing::warn!(
-                    pid = %process_id,
-                    %error,
-                    "failed to refresh KV reclaimability"
-                );
-                false
-            }
+            tracing::error!(%error, "failed to invalidate copied KV page metadata");
         }
+    }
+
+    async fn finish(mut self) -> anyhow::Result<()> {
+        let completion = self.completion.take().expect("copy completion present");
+        let result = completion.await;
+        Self::invalidate(self.model, self.driver, self.ws, &self.indexes);
+        drop(self.lease.take());
+        result
+    }
+}
+
+impl Drop for CopyCompletionGuard {
+    fn drop(&mut self) {
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        let lease = self.lease.take();
+        let model = self.model;
+        let driver = self.driver;
+        let ws = self.ws;
+        let indexes = std::mem::take(&mut self.indexes);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            Self::invalidate(model, driver, ws, &indexes);
+            if let Some(lease) = lease {
+                std::mem::forget(lease);
+            }
+            tracing::error!(
+                "KV copy dropped without a Tokio runtime; invalidated metadata and preserved its lease"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            let _ = completion.await;
+            Self::invalidate(model, driver, ws, &indexes);
+            drop(lease);
+        });
+    }
+}
+
+type PreparedExplicitKv = (Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, kv::KvTxn);
+
+fn reclaim_cache_roots(stores: &crate::store::registry::Stores) -> usize {
+    crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+        let epoch = kv_store.current_epoch();
+        let reclaimed = kv_store.drop_unused_cache_leases(epoch);
+        kv_store.retire_idle();
+        reclaimed
     })
+}
+
+fn realize_host_declaration(
+    stores: &crate::store::registry::Stores,
+    ws: &KvWorkingSet,
+    writable: std::ops::Range<u64>,
+) -> Result<((Vec<u32>, Vec<u32>), Option<kv::KvTxn>), String> {
+    let realize = || {
+        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+            kv::realize_declaration(store, ws.id, writable.clone())
+        })
+    };
+    match realize() {
+        Ok(realized) => Ok(realized),
+        Err(kv::KvError::OutOfPages { .. }) if reclaim_cache_roots(stores) != 0 => {
+            realize().map_err(|error| format!("pipeline: KV declaration realization: {error}"))
+        }
+        Err(error) => Err(format!("pipeline: KV declaration realization: {error}")),
+    }
+}
+
+fn ensure_host_backing(
+    stores: &crate::store::registry::Stores,
+    ws: &KvWorkingSet,
+    end: u64,
+) -> Result<(), String> {
+    let ensure = || {
+        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+            store.ensure_backed(ws.id, end)
+        })
+    };
+    match ensure() {
+        Ok(_) => Ok(()),
+        Err(crate::store::kv::KvStoreError::OutOfPages { .. })
+            if reclaim_cache_roots(stores) != 0 =>
+        {
+            ensure()
+                .map(|_| ())
+                .map_err(|error| format!("pipeline: KV backing frontier: {error}"))
+        }
+        Err(error) => Err(format!("pipeline: KV backing frontier: {error}")),
+    }
+}
+
+fn prepare_explicit_kv(
+    stores: &crate::store::registry::Stores,
+    ws: &KvWorkingSet,
+    write_indexes: &[u64],
+) -> Result<PreparedExplicitKv, String> {
+    let prepare = || {
+        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+            kv::prepare_explicit(kv_store, ws.id, write_indexes)
+        })
+    };
+    match prepare() {
+        Ok(prepared) => Ok(prepared),
+        Err(kv::KvError::OutOfPages { .. }) => {
+            let reclaimed =
+                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                    let epoch = kv_store.current_epoch();
+                    let reclaimed = kv_store.drop_unused_cache_leases(epoch);
+                    kv_store.retire_idle();
+                    reclaimed
+                });
+            if reclaimed == 0 {
+                return Err(
+                    "pipeline: in-lease device-geometry allocation failed; reservation accounting is inconsistent"
+                        .to_string(),
+                );
+            }
+            prepare().map_err(|error| format!("pipeline: device-geometry grant: {error}"))
+        }
+        Err(error) => Err(format!("pipeline: device-geometry grant: {error}")),
+    }
 }
 
 /// A pipeline FIFO entry: a forward FIRE or a KV cell MOVE (Design-B
@@ -133,7 +234,8 @@ fn reclaimable_probe(
 /// happens-before invariant; `take`/`read` drain them in submit order.
 pub enum PendingOp {
     Fire(PendingFire),
-    Move(PendingMove),
+    #[cfg(test)]
+    TestStub,
 }
 
 impl PendingOp {
@@ -141,7 +243,8 @@ impl PendingOp {
     fn is_settled(&self) -> bool {
         match self {
             PendingOp::Fire(fire) => fire.completion.is_settled(),
-            PendingOp::Move(mv) => mv.completion.is_settled(),
+            #[cfg(test)]
+            PendingOp::TestStub => true,
         }
     }
 
@@ -151,7 +254,8 @@ impl PendingOp {
     fn completion_signal(&self) -> OpSignal {
         match self {
             PendingOp::Fire(fire) => OpSignal::Fire(fire.completion.clone()),
-            PendingOp::Move(mv) => OpSignal::Move(mv.completion.clone()),
+            #[cfg(test)]
+            PendingOp::TestStub => OpSignal::TestReady,
         }
     }
 
@@ -163,23 +267,16 @@ impl PendingOp {
     }
 
     pub(crate) fn is_preemption_safe_unprepared(&self) -> bool {
-        matches!(
-            self,
-            PendingOp::Fire(PendingFire {
-                kv: FireKv::Deferred(slot),
-                ..
-            }) if slot.lock().unwrap().is_none()
-        )
+        false
     }
 
     pub(crate) fn is_preemption_detachable(&self) -> bool {
         matches!(
             self,
-            PendingOp::Move(_)
-                | PendingOp::Fire(PendingFire {
-                    kv: FireKv::Deferred(_),
-                    ..
-                })
+            PendingOp::Fire(PendingFire {
+                kv: FireKv::Host(_),
+                ..
+            })
         )
     }
 
@@ -190,10 +287,30 @@ impl PendingOp {
     }
 }
 
+enum FinalizeAction {
+    None,
+    Fail {
+        fwd_rep: u32,
+        cells: BoundCells,
+        failure: PipelineFailure,
+        reason: String,
+    },
+    ReclaimDeviceGeometry {
+        fwd_rep: u32,
+        instance_id: u64,
+    },
+}
+
+pub(crate) struct FinalizeOutcome {
+    action: FinalizeAction,
+    ws_guard: Option<KvFireLease>,
+}
+
 /// See [`PendingOp::completion_signal`].
 enum OpSignal {
     Fire(crate::driver::WorkItemCompletion),
-    Move(crate::driver::SubmissionCompletion),
+    #[cfg(test)]
+    TestReady,
 }
 
 impl std::future::Future for OpSignal {
@@ -205,30 +322,21 @@ impl std::future::Future for OpSignal {
     ) -> std::task::Poll<()> {
         match self.get_mut() {
             OpSignal::Fire(completion) => std::pin::Pin::new(completion).poll(cx).map(|_| ()),
-            OpSignal::Move(completion) => std::pin::Pin::new(completion).poll(cx).map(|_| ()),
+            #[cfg(test)]
+            OpSignal::TestReady => std::task::Poll::Ready(()),
         }
     }
-}
-
-/// One in-flight KV cell MOVE (`pipeline.copy-into`). It holds an ordered slot
-/// in the pipeline FIFO and finalizes by awaiting its payload-free completion.
-pub struct PendingMove {
-    completion: crate::driver::SubmissionCompletion,
-    failure: PipelineFailure,
 }
 
 /// Test-only inert FIFO entry: enough to make a pass's shared fires queue
 /// non-empty for `ForwardPass::can_close_native_on_drop`/`Drop` tests
 /// (`pipeline::instance`'s `native_cleanup` test module), without needing a
-/// live completion. `PendingMove`/`PendingFire`'s fields are private
+/// live completion. `PendingFire`'s fields are private
 /// to this module, so cross-module tests construct a stub through here
 /// rather than reaching in directly.
 #[cfg(test)]
-pub(crate) fn test_pending_move_stub() -> PendingOp {
-    PendingOp::Move(PendingMove {
-        completion: crate::driver::SubmissionCompletion::ready(),
-        failure: Arc::new(Mutex::new(None)),
-    })
+pub(crate) fn test_pending_op_stub() -> PendingOp {
+    PendingOp::TestStub
 }
 
 /// The open KV/arena transaction(s) one in-flight fire holds until it resolves.
@@ -239,7 +347,7 @@ pub(crate) fn test_pending_move_stub() -> PendingOp {
 /// plan's "pin float bounded by run-ahead depth × B, riding the per-fire arena
 /// txns").
 enum FireKv {
-    Deferred(Arc<Mutex<Option<kv::KvTxn>>>),
+    Host(Option<kv::KvTxn>),
     /// A device-geometry fire's prepared write over the lease-granted slots
     /// (B2's explicit-KV path): same commit/abort protocol, no host
     /// projection.
@@ -254,16 +362,123 @@ enum FireKv {
 pub struct PendingFire {
     completion: crate::driver::WorkItemCompletion,
     kv: FireKv,
-    rstxn: Option<rs::RsTxn>,
+    rstxns: Vec<rs::RsTxn>,
     ws_guard: KvFireLease,
+    model: usize,
+    driver: usize,
     ws_rep: u32,
-    rs_rep: Option<u32>,
+    rs_reps: Vec<u32>,
     /// The owning pass, to fail it on a fire error (rep — the guest may have
     /// dropped the handle; failure marking is then moot).
     fwd_rep: u32,
     instance_id: u64,
     cells: BoundCells,
     failure: PipelineFailure,
+}
+
+type PreparedRs = (Vec<u32>, Vec<u8>, Vec<u32>, Vec<u32>, Vec<rs::RsTxn>);
+
+fn prepare_bound_rs<C: FireContext>(
+    ctx: &mut C,
+    stores: &crate::store::registry::Stores,
+    model: usize,
+    driver: usize,
+    rs_reps: &[u32],
+    qo_indptr: &[u32],
+    pipeline_scope: &crate::store::PipelineScope,
+) -> Anyhow<Result<PreparedRs, String>> {
+    let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
+    if let Err(error) = rs::validate_count(rs_reps.len(), qo_indptr, has_recurrent_state) {
+        return Ok(Err(format!("pipeline: recurrent-state binding: {error}")));
+    }
+    if rs_reps.is_empty() {
+        return Ok(Ok((
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )));
+    }
+
+    let mut working_sets = Vec::with_capacity(rs_reps.len());
+    for (row, &rep) in rs_reps.iter().enumerate() {
+        let resource: Resource<RsWorkingSet> = Resource::new_borrow(rep);
+        let rs = ctx.resources().get(&resource)?.clone();
+        if rs.model != model || rs.driver as usize != driver {
+            return Ok(Err(format!(
+                "pipeline: rs-working-set at request row {row} belongs to model/driver \
+                 ({}, {}), expected ({model}, {driver})",
+                rs.model, rs.driver
+            )));
+        }
+        if let Err(owner) = rs.claim_pipeline_scope(pipeline_scope) {
+            return Ok(Err(format!(
+                "pipeline: rs-working-set at request row {row} is already scoped to pipeline \
+                 {owner:#x}"
+            )));
+        }
+        working_sets.push(rs.id);
+    }
+
+    let prepared = {
+        let mut store = stores.rs.lock().unwrap();
+        rs::prepare_many(&mut store, &working_sets)
+    };
+    Ok(prepared
+        .map(|(ids, flags, (copy_src, copy_dst), txns)| (ids, flags, copy_src, copy_dst, txns))
+        .map_err(|error| format!("pipeline: rs prepare: {error}")))
+}
+
+fn abort_rs_transactions(stores: &crate::store::registry::Stores, txns: Vec<rs::RsTxn>) {
+    if txns.is_empty() {
+        return;
+    }
+    let mut store = stores.rs.lock().unwrap();
+    rs::abandon_many(&mut store, txns);
+}
+
+pub(crate) async fn drain_rs_predecessors<C: FireContext>(
+    ctx: &mut C,
+    fires: &PendingFires,
+) -> Anyhow<()> {
+    loop {
+        let completion = fires
+            .lock()
+            .unwrap()
+            .front()
+            .map(PendingOp::completion_signal);
+        let Some(mut completion) = completion else {
+            return Ok(());
+        };
+        if let Some(preemption) = ctx.preemption_signal() {
+            let notified = preemption.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            tokio::select! {
+                _ = &mut completion => {}
+                _ = &mut notified => {
+                    ctx.honor_preemption().await?;
+                    continue;
+                }
+            }
+        } else {
+            completion.await;
+        }
+
+        let _finalize_guard = fires.finalize_guard().await;
+        let op = {
+            let mut queue = fires.lock().unwrap();
+            queue
+                .front()
+                .is_some_and(PendingOp::is_settled)
+                .then(|| queue.pop_front())
+                .flatten()
+        };
+        if let Some(op) = op {
+            finalize_op(ctx, op).await?;
+        }
+    }
 }
 
 /// Poison every host-reader cell of a pass with the failed fire's error —
@@ -386,8 +601,25 @@ pub async fn submit_pass<C: FireContext>(
         // pass's channels at this pipeline's queue so their `take`/`read`
         // await the right FIFO — enforcing the same-pipeline constraint
         // (§3.4): every pass binding a channel must submit on one pipeline.
-        let pipe_fires = ctx.resources().get(&this)?.fires.clone();
-        let pipeline_failure = ctx.resources().get(&this)?.failure.clone();
+        let (pipe_fires, pipeline_failure, pipeline_scope) = {
+            let pipeline = ctx.resources().get(&this)?;
+            if pipeline.scope.is_closed() {
+                return Ok(Err("pipeline: pipeline is closed".to_string()));
+            }
+            // F7: `finish` ended the ordered stream — a later submit is a
+            // guest contract error, surfaced here rather than as a
+            // scheduler mystery.
+            if pipeline.finished.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(Err(
+                    "pipeline: submit after finish (the stream ended)".to_string()
+                ));
+            }
+            (
+                pipeline.fires.clone(),
+                pipeline.failure.clone(),
+                pipeline.scope.clone(),
+            )
+        };
         // Non-blocking settlement drain (plan §6): resolved fires' KV/RS
         // txns finalize here so arena pins stay bounded by run-ahead depth
         // even when the guest never takes.
@@ -398,18 +630,30 @@ pub async fn submit_pass<C: FireContext>(
         if let Err(error) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
             return Ok(Err(error));
         }
+        if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
+            // RS mappings publish only at finalize. Correctness-first
+            // serialization prevents a later run-ahead fire from preparing
+            // against stale committed state (double RESET / repeated CoW).
+            drain_rs_predecessors(ctx, &pipe_fires).await?;
+            if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
+                return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
+            }
+        }
+        let timing_enabled = ctx.fire_timing_requested();
         let (
             geometry,
             cells,
             ws_rep,
-            rs_rep,
-            committed_tokens,
+            rs_reps,
+            kv_declaration,
+            kv_declaration_realized,
             fwd_rep,
             instance_id,
+            scheduler,
             completion,
-            canonical_evidence,
             dense_mask,
             accesses,
+            decode_envelope,
         ) = {
             let p = ctx.resources().get_mut(&fwd)?;
             if let Some(e) = &p.failed {
@@ -417,54 +661,102 @@ pub async fn submit_pass<C: FireContext>(
                     "pipeline: forward-pass failed by an earlier fire: {e}"
                 )));
             }
-            let geometry = p
-                .instance
-                .fire_geometry(crate::pipeline::program::model_profile().page_size)
-                .ok();
-            let canonical_evidence = kv::canonical_fire_evidence(
-                p.canonical_kv,
-                &p.instance.program.bound.container,
-                &p.cells,
-                &p.instance.seeds,
-                p.fired_once,
-            );
+            let geometry = if let Some(envelope) = &p.decode_envelope {
+                match envelope.template(&p.instance.program.bound.container) {
+                    Ok(template) => template,
+                    Err(error) => {
+                        return Ok(Err(format!("pipeline: fire geometry: {error:?}")));
+                    }
+                }
+            } else {
+                let bound = &p.instance.program.bound;
+                let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
+                let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
+                match geometry::map_geometry_evaluated(
+                    bound,
+                    &mut known,
+                    crate::pipeline::program::model_profile().page_size,
+                ) {
+                    Ok((geometry, _)) => {
+                        // In-band -1 skips are the DEVICE-resolved contract
+                        // (rank compaction happens in the compose kernels); a
+                        // host-wire fire would embed the sentinel as a real
+                        // token. Loud rejection, never silent execution
+                        // (RV-12).
+                        if geometry.token_ids.contains(&u32::MAX) {
+                            return Ok(Err(
+                                "pipeline: fire geometry: in-band -1 skip tokens require a \
+                                 device-resolved geometry class; this fire resolved on the \
+                                 host wire"
+                                    .to_string(),
+                            ));
+                        }
+                        geometry
+                    }
+                    Err(error) => {
+                        return Ok(Err(format!("pipeline: fire geometry: {error}")));
+                    }
+                }
+            };
             let accesses = p.instance.program.channel_accesses.clone();
             (
                 geometry,
                 p.cells.clone(),
                 p.kv_ws,
-                p.rs_ws,
-                p.committed_tokens,
+                p.rs_ws.clone(),
+                p.kv_declaration,
+                p.kv_declaration_realized,
                 fwd.rep(),
                 p.bound_instance.instance_id,
+                p.scheduler.clone(),
                 p.bound_instance.reserve_completion(),
-                canonical_evidence,
                 p.dense_mask,
                 accesses,
+                p.decode_envelope.clone(),
             )
         };
         let mut req = crate::driver::LaunchPlan::default();
-        if let Some(g) = &geometry {
-            g.apply_to(&mut req);
-        }
+        geometry.apply_to(&mut req);
+        req.device_resolved_geometry = decode_envelope.is_some();
+        req.single_token_mode = req.token_ids.len() + 1 == req.qo_indptr.len()
+            && req.qo_indptr.windows(2).all(|lane| lane[1] - lane[0] == 1);
         // A dense device mask (AttnMask channel) marks the fire
         // mask-carrying: the scheduler batches it SOLO (the composed
         // multi-program batch does not merge dense device masks — v1
         // scope).
         req.has_user_mask = dense_mask;
-        // Prepare the guest-owned KV working set for this fire via
-        // `pipeline::fire::kv` over the typed KvStore (reserve growth +
-        // fresh / in-place / CoW classification + geometry projection).
-        // The held `KvTxn` rides the PendingFire across the async fire;
-        // finalized (commit → mapping publishes / abort → pending slots
-        // release) when a take/read/drop drains it.
-        let new_tokens: Vec<u32> = req.token_ids.clone();
+        crate::pipeline::offload::try_encode(&mut req).await;
+        // Resource preparation is independent of token position: realize the
+        // declaration once, back only its missing frontier, then snapshot the
+        // WorkingSet translation.
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.driver as usize);
+        let (readable_pages, writable_pages) =
+            match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                let page_len = kv_store.page_len(ws.id)?;
+                Ok::<_, crate::store::kv::KvStoreError>((
+                    kv_declaration.readable.resolve(page_len).map_err(|_| {
+                        crate::store::kv::KvStoreError::BadWriteSet {
+                            reason: "invalid readable page declaration",
+                        }
+                    })?,
+                    kv_declaration.writable.resolve(page_len).map_err(|_| {
+                        crate::store::kv::KvStoreError::BadWriteSet {
+                            reason: "invalid writable page declaration",
+                        }
+                    })?,
+                ))
+            }) {
+                Ok(ranges) => ranges,
+                Err(error) => {
+                    return Ok(Err(format!(
+                        "pipeline: KV working-set declaration: {error}"
+                    )));
+                }
+            };
         let pid = ctx.process_id();
-        let process_working_sets = ctx.kv_working_sets();
-        if let Err(owner) = ws.claim_pipeline_scope(pid.as_u128()) {
+        if let Err(owner) = ws.claim_pipeline_scope(&pipeline_scope) {
             return Ok(Err(format!(
                 "pipeline: KV working set is already scoped to pipeline {owner:032x}"
             )));
@@ -474,414 +766,158 @@ pub async fn submit_pass<C: FireContext>(
             Err(error) => return Ok(Err(format!("pipeline: KV working set: {error}"))),
         };
 
-        // The recurrent-state slot for hybrid / linear-attention models
-        // (GDN, Mamba2): fresh RESET slab on the first fire, CoW-continue
-        // after. This remains before token/ticket reservation so every error
-        // path is reservation-free.
-        let rstxn = if let Some(rs_rep) = rs_rep {
-            let rs_res: Resource<RsWorkingSet> = Resource::new_borrow(rs_rep);
-            let rs = ctx.resources().get(&rs_res)?.clone();
-            let prepared = {
-                let mut rs_store = stores.rs.lock().unwrap();
-                rs::prepare(&mut rs_store, rs.id)
-            };
-            match prepared {
-                Ok((rs_slot_ids, rs_slot_flags, (rs_copy_src, rs_copy_dst), txn)) => {
-                    req.rs_slot_ids = rs_slot_ids;
-                    req.rs_slot_flags = rs_slot_flags;
-                    if !rs_copy_src.is_empty() {
-                        match crate::scheduler::copy_d2d(0, &rs_copy_src, &rs_copy_dst) {
-                            Ok(move_completion) => {
-                                pipe_fires.lock().unwrap().push_back(PendingOp::Move(
-                                    PendingMove {
-                                        completion: move_completion,
-                                        failure: pipeline_failure.clone(),
-                                    },
-                                ));
-                            }
-                            Err(e) => {
-                                tracing::warn!("pipeline rs CoW d2d copy failed: {e:#}");
-                            }
-                        }
-                    }
-                    Some(txn)
-                }
-                Err(e) => {
-                    return Ok(Err(format!("pipeline: rs prepare: {e}")));
-                }
-            }
-        } else {
-            None
+        // Recurrent-state rows are lowered independently, in resolved request
+        // order. Their CoW copies ride the scheduler's typed pre-launch state
+        // copy so a copy failure rejects this fire before model execution.
+        let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = match prepare_bound_rs(
+            ctx,
+            &stores,
+            ws.model,
+            ws.driver as usize,
+            &rs_reps,
+            &req.qo_indptr,
+            &pipeline_scope,
+        )? {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(Err(error)),
         };
+        req.rs_slot_ids = rs_slot_ids;
+        req.rs_slot_flags = rs_slot_flags;
 
-        // Mapping allocation is deferred, but extent order is not: publish the
-        // submitted token extent now so another pass sharing this WS cannot
-        // prepare over it before this fire reaches dispatch.
-        let committed_floor = match {
-            let kv = stores.kv.lock().unwrap();
-            kv.visible_token_len(ws.id, ws.page_size)
-        } {
-            Ok(floor) => floor,
-            Err(error) => {
-                if let Some(rstxn) = rstxn {
-                    let mut rs_store = stores.rs.lock().unwrap();
-                    let _ = rs::finalize(&mut rs_store, rstxn, false);
-                }
-                return Ok(Err(format!("pipeline: KV visible token extent: {error}")));
+        if writable_pages.is_empty() {
+            abort_rs_transactions(&stores, rstxns);
+            return Ok(Err(
+                "pipeline: writable KV page declaration is empty".to_string()
+            ));
+        }
+        if decode_envelope.is_none() {
+            if let Some(&page) = req
+                .kv_page_indices
+                .iter()
+                .find(|&&page| !readable_pages.contains(&u64::from(page)))
+            {
+                abort_rs_transactions(&stores, rstxns);
+                return Ok(Err(format!(
+                    "pipeline: KV read page {page} escapes the readable declaration"
+                )));
             }
-        };
-        let extent_reservation = match ws.reserve_token_extent(
-            u64::from(committed_tokens),
-            committed_floor,
-            new_tokens.len() as u64,
-        ) {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                if let Some(rstxn) = rstxn {
-                    let mut rs_store = stores.rs.lock().unwrap();
-                    let _ = rs::finalize(&mut rs_store, rstxn, false);
-                }
-                return Ok(Err(format!("pipeline: KV working set: {error}")));
-            }
-        };
-        let committed_tokens = match u32::try_from(extent_reservation.start_token()) {
-            Ok(cursor) => cursor,
-            Err(_) => {
-                if let Some(rstxn) = rstxn {
-                    let mut rs_store = stores.rs.lock().unwrap();
-                    let _ = rs::finalize(&mut rs_store, rstxn, false);
-                }
-                return Ok(Err("pipeline: KV token cursor exceeds u32".to_string()));
-            }
-        };
-        let reserved_end = match committed_tokens.checked_add(new_tokens.len() as u32) {
-            Some(end) => end,
-            None => {
-                if let Some(rstxn) = rstxn {
-                    let mut rs_store = stores.rs.lock().unwrap();
-                    let _ = rs::finalize(&mut rs_store, rstxn, false);
-                }
-                return Ok(Err("pipeline: KV token cursor exceeds u32".to_string()));
-            }
-        };
-        // Canonical gate, fire-time half: hash under the host-verified token
-        // values only when they cover this fire's full-context append.
-        let hash_tokens: Option<Vec<u32>> = canonical_evidence.and_then(|(toks, kv_len)| {
-            (toks.len() == new_tokens.len() && kv_len == Some(reserved_end)).then_some(toks)
-        });
-
-        // ── Prefix-cache graft (kv_refact.md, the matching consumer) ──
-        // First canonical fire of a FRESH working set: probe the CAS for
-        // the longest cached full-page prefix of this fire's embed, adopt
-        // it (structurally shared pages — writes CoW like any shared
-        // path), and TRIM the launch to the uncached suffix. A pure
-        // execution-strategy swap, invisible to the guest: the total
-        // attended context (KvLen) is unchanged, the kv projection covers
-        // the full context from the store, sampled rows keep their
-        // identity (shifted to the computed suffix), and the chain state
-        // continues from the boundary hash — so the launch is
-        // indistinguishable from a continuation fire over `kts` committed
-        // tokens. Any miss or ineligible shape falls through to the full
-        // computation.
-        let (committed_tokens, new_tokens, hash_tokens) = {
-            let mut committed = committed_tokens;
-            let mut toks_new = new_tokens;
-            let mut toks_hash = hash_tokens;
-            let n = toks_new.len();
-            // Eligible: nothing committed yet, host-verified tokens for
-            // the whole embed, and the exact single-lane canonical shape.
-            let eligible = committed == 0
-                && n > 1
-                && req.qo_indptr == [0, n as u32]
-                && req.position_ids.len() == n
-                && req.sampling_indices.iter().all(|&s| (s as usize) < n);
-            if eligible {
-                if let Some(toks) = toks_hash.as_deref() {
-                    // A sampled row must stay in the computed suffix: cap
-                    // the probe so no adopted page covers one.
-                    let min_sample = req
-                        .sampling_indices
-                        .iter()
-                        .copied()
-                        .min()
-                        .map(|s| s as usize)
-                        .unwrap_or(usize::MAX);
-                    let cap = n.min(min_sample.saturating_add(1));
-                    let adopted = {
-                        let mut kv = stores.kv.lock().unwrap();
-                        kv::match_prefix(&mut kv, ws.id, &toks[..cap], ws.page_size)
-                    };
-                    match adopted {
-                        Ok(Some(pages)) if pages > 0 => {
-                            let kts = pages as usize * ws.page_size as usize;
-                            debug_assert!(kts < n && kts <= min_sample);
-                            req.token_ids.drain(..kts);
-                            req.position_ids.drain(..kts);
-                            req.qo_indptr = vec![0, (n - kts) as u32];
-                            for s in &mut req.sampling_indices {
-                                *s -= kts as u32;
-                            }
-                            toks_new.drain(..kts);
-                            toks_hash = toks_hash.map(|t| t[kts..].to_vec());
-                            committed = kts as u32;
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::debug!("pipeline prefix-cache probe miss: {e}");
-                        }
-                    }
-                }
-            }
-            (committed, toks_new, toks_hash)
-        };
-
-        debug_assert_eq!(
-            u64::from(committed_tokens) + new_tokens.len() as u64,
-            u64::from(reserved_end)
-        );
-        let next_committed = reserved_end;
-        let kvtxn_slot = Arc::new(Mutex::new(None));
-
+        }
+        let page_size = u64::from(ws.page_size);
+        req.kv_write_lower_bounds = vec![writable_pages.start * page_size];
+        req.kv_write_upper_bounds = vec![writable_pages.end * page_size];
         let model = ws.model;
         let driver = ws.driver as usize;
-        let ws_id = ws.id;
-        let page_size = ws.page_size;
-        let deferred_slot = kvtxn_slot.clone();
-        let mut deferred_new_tokens = Some(new_tokens);
-        let mut deferred_hash_tokens = Some(hash_tokens);
-        let acquire_started = Arc::new(AtomicBool::new(false));
-        let acquire_result = Arc::new(Mutex::new(
-            None::<Result<crate::store::reclaim::Acquired, String>>,
-        ));
-        let self_suspend_wait = Arc::new(AtomicBool::new(false));
-        let acquire_owner = AcquireOwner::new();
-        let runtime = tokio::runtime::Handle::current();
-        let preparation: crate::scheduler::LaunchPreparation = Box::new(move |request| {
-            if let Some(orchestrator) = crate::store::reclaim::contention()
-                && !orchestrator.is_running(pid)
-            {
-                if orchestrator.is_registered(pid) {
-                    return Err(crate::scheduler::LaunchPreparationError::Blocked(
-                        "pipeline is quiesced for KV suspension".to_string(),
-                    ));
-                }
-                return Err(crate::scheduler::LaunchPreparationError::Failed(
-                    "pipeline terminated during KV preparation".to_string(),
-                ));
-            }
-            let new_tokens = deferred_new_tokens
-                .as_ref()
-                .expect("dispatch preparation payload remains live");
-            let hash_tokens = deferred_hash_tokens
-                .as_ref()
-                .expect("dispatch preparation hash payload remains live");
-            if self_suspend_wait.load(Ordering::Acquire) {
-                if crate::store::reclaim::contention()
-                    .is_some_and(|orchestrator| orchestrator.is_running(pid))
-                {
-                    self_suspend_wait.store(false, Ordering::Release);
-                } else {
-                    return Err(crate::scheduler::LaunchPreparationError::Blocked(
-                        "KV requester is self-suspended".to_string(),
-                    ));
+        let ((copy_src, copy_dst), kvtxn) = if kv_declaration_realized {
+            ((Vec::new(), Vec::new()), None)
+        } else {
+            match realize_host_declaration(&stores, &ws, writable_pages.clone()) {
+                Ok(realized) => realized,
+                Err(error) => {
+                    abort_rs_transactions(&stores, rstxns);
+                    return Ok(Err(error));
                 }
             }
-            let grant = match acquire_result.lock().unwrap().take() {
-                Some(Ok(crate::store::reclaim::Acquired::Granted(grant))) => {
-                    acquire_started.store(false, Ordering::Release);
-                    Some(grant.into_pages())
-                }
-                Some(Ok(crate::store::reclaim::Acquired::SelfSuspendFirst)) => {
-                    acquire_started.store(false, Ordering::Release);
-                    self_suspend_wait.store(true, Ordering::Release);
-                    return Err(crate::scheduler::LaunchPreparationError::Blocked(
-                        "KV requester must self-suspend".to_string(),
-                    ));
-                }
-                Some(Err(error)) => {
-                    acquire_started.store(false, Ordering::Release);
-                    return Err(crate::scheduler::LaunchPreparationError::Failed(format!(
-                        "pipeline: KV contention: {error}"
-                    )));
-                }
-                None => None,
-            };
-            let stores = crate::store::registry::get(model, driver);
-            if grant.is_none()
-                && let Some(orchestrator) = crate::store::reclaim::contention()
-                && orchestrator.allocation_requires_grant()
-            {
-                let requested = {
-                    let mut kv_store = stores.kv.lock().unwrap();
-                    kv::required_pages(
-                        &mut kv_store,
-                        ws_id,
-                        committed_tokens,
-                        new_tokens.len() as u32,
-                        page_size,
-                    )
-                    .map_err(|error| {
-                        crate::scheduler::LaunchPreparationError::Failed(format!(
-                            "pipeline: KV grant sizing: {error}"
-                        ))
-                    })?
-                };
-                if requested > 0 && !acquire_started.swap(true, Ordering::AcqRel) {
-                    let reclaimable =
-                        reclaimable_probe(model, driver, pid, process_working_sets.clone());
-                    let result = acquire_result.clone();
-                    let cancellation = acquire_owner.cancellation();
-                    runtime.spawn(async move {
-                        let acquire = orchestrator.acquire_or_self_suspend_live(
-                            pid,
-                            requested as u32,
-                            reclaimable,
-                        );
-                        tokio::pin!(acquire);
-                        tokio::select! {
-                            outcome = &mut acquire => {
-                                *result.lock().unwrap() =
-                                    Some(outcome.map_err(|error| error.to_string()));
-                                crate::scheduler::nudge(driver);
-                            }
-                            _ = cancellation.cancelled() => {}
-                        }
+        };
+        if let Err(error) = ensure_host_backing(&stores, &ws, writable_pages.end) {
+            abort_rs_transactions(&stores, rstxns);
+            if let Some(kvtxn) = kvtxn {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+                    let _ = kv::finalize(store, kvtxn, false);
+                });
+                record_submit_failure(ctx, &fwd, &pipeline_failure, &error);
+            }
+            return Ok(Err(error));
+        }
+        let (translation_version, translation) = match ws.translation() {
+            Ok(translation) => translation,
+            Err(error) => {
+                abort_rs_transactions(&stores, rstxns);
+                if let Some(kvtxn) = kvtxn {
+                    crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
+                        let _ = kv::finalize(store, kvtxn, false);
                     });
                 }
-                if requested > 0 {
-                    return Err(crate::scheduler::LaunchPreparationError::Blocked(
-                        "KV allocation waits for an older grant".to_string(),
-                    ));
-                }
+                let reason = format!("pipeline: KV translation: {error}");
+                record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+                return Ok(Err(reason));
             }
-            let prepared = {
-                let mut kv_store = stores.kv.lock().unwrap();
-                match grant {
-                    Some(granted) => kv::prepare_granted(
-                        &mut kv_store,
-                        ws_id,
-                        committed_tokens,
-                        new_tokens,
-                        page_size,
-                        hash_tokens.as_deref(),
-                        granted,
-                    ),
-                    None => kv::prepare(
-                        &mut kv_store,
-                        ws_id,
-                        committed_tokens,
-                        new_tokens,
-                        page_size,
-                        hash_tokens.as_deref(),
-                    ),
-                }
-            };
-            match prepared {
-                Ok((projection, (copy_src, copy_dst), translation, txn)) => {
-                    let translation_version = txn.mapping_version();
-                    request.kv_translation = translation;
-                    *deferred_slot.lock().unwrap() = Some(txn);
-                    deferred_new_tokens.take();
-                    deferred_hash_tokens.take();
-                    Ok(crate::scheduler::PreparedLaunch {
-                        page_refs: (0..projection.physical_page_ids.len() as u32).collect(),
-                        last_page_len: projection.last_page_len,
-                        kv_translation_version: translation_version,
-                        copy_src,
-                        copy_dst,
-                    })
-                }
-                Err(kv::KvError::OutOfPages { requested, .. }) => {
-                    let mut kv_store = stores.kv.lock().unwrap();
-                    let epoch = kv_store.current_epoch();
-                    let reclaimed = kv_store.drop_unused_cache_leases(epoch);
-                    kv_store.retire_idle();
-                    drop(kv_store);
-                    if reclaimed == 0
-                        && let Some(orchestrator) = crate::store::reclaim::contention()
-                    {
-                        if !acquire_started.swap(true, Ordering::AcqRel) {
-                            let reclaimable =
-                                reclaimable_probe(model, driver, pid, process_working_sets.clone());
-                            let result = acquire_result.clone();
-                            let cancellation = acquire_owner.cancellation();
-                            runtime.spawn(async move {
-                                let acquire = orchestrator.acquire_or_self_suspend_live(
-                                    pid,
-                                    requested as u32,
-                                    reclaimable,
-                                );
-                                tokio::pin!(acquire);
-                                tokio::select! {
-                                    outcome = &mut acquire => {
-                                        *result.lock().unwrap() =
-                                            Some(outcome.map_err(|error| error.to_string()));
-                                        crate::scheduler::nudge(driver);
-                                    }
-                                    _ = cancellation.cancelled() => {}
-                                }
-                            });
-                        }
-                        return Err(crate::scheduler::LaunchPreparationError::Blocked(
-                            "KV pages unavailable at dispatch".to_string(),
-                        ));
-                    }
-                    Err(crate::scheduler::LaunchPreparationError::Retry(
-                        "KV pages unavailable at dispatch".to_string(),
-                    ))
-                }
-                Err(error) => Err(crate::scheduler::LaunchPreparationError::Failed(format!(
-                    "pipeline: kv dispatch preparation: {error}"
-                ))),
-            }
-        });
+        };
+        req.kv_translation_version = translation_version;
+        req.kv_translation = translation.as_ref().to_vec();
+        let last_page_len = req.kv_last_page_lens.last().copied().unwrap_or(0);
 
-        // Fire through the scheduler → dispatch-time KV preparation → driver.
+        // Preparation is complete in guest order; the scheduler sees only
+        // launch-ready work.
         let ticket_reservation = TicketReservation::new(&cells, &accesses);
         ticket_reservation.apply_to(&mut req);
         let retry_cells = cells.clone();
         let retry_accesses = accesses.clone();
+        let finished_flag = ctx.resources().get(&this)?.finished.clone();
         let retry_classifier: crate::scheduler::RetryClassifier = Box::new(move || {
             retry_cells
                 .iter()
                 .zip(&retry_accesses)
                 .find_map(|(cell, &(consume, publish))| {
-                    cell.lock()
-                        .unwrap()
-                        .permanent_retry_cause(consume || publish)
+                    let cell = cell.lock().unwrap();
+                    cell.permanent_retry_cause(consume || publish).or_else(|| {
+                        // F8: finish() is the decidability point — a put
+                        // still blocked on a full ring with no attached
+                        // consumer and no host role can never commit.
+                        (publish
+                            && finished_flag.load(std::sync::atomic::Ordering::Acquire)
+                            && cell.is_consumerless_device_ring())
+                        .then(|| {
+                            format!(
+                                "channel {} put can never commit: the pipeline \
+                                 finished with no consumer attached \
+                                 (device-only ring, single pass) — a definite \
+                                 deadlock",
+                                cell.global_id
+                            )
+                        })
+                    })
                 })
         });
-        let submit_error = crate::scheduler::submit_async_deferred(
+        let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
+            &scheduler,
             req,
-            0,
             instance_id,
-            Some(pid),
-            Some(u64::from(ws_rep)),
+            pid,
+            last_page_len,
             completion.clone(),
-            preparation,
+            copy_src,
+            copy_dst,
+            rs_copy_src,
+            rs_copy_dst,
             Some(retry_classifier),
+            timing_enabled,
         )
         .err()
         .map(|error| format!("{error:#}"));
         if let Some(error) = submit_error {
             let reason = format!("pipeline: submit failed: {error}");
-            if let Some(rstxn) = rstxn {
-                let mut rs_store = stores.rs.lock().unwrap();
-                let _ = rs::finalize(&mut rs_store, rstxn, false);
+            abort_rs_transactions(&stores, rstxns);
+            if let Some(kvtxn) = kvtxn {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                    let _ = kv::finalize(kv_store, kvtxn, false);
+                });
             }
             ctx.resources().get_mut(&fwd)?.failed = Some(reason.clone());
+            let mut failure = pipeline_failure.lock().unwrap();
+            if failure.is_none() {
+                *failure = Some(reason.clone());
+            }
             return Ok(Err(reason));
         }
+        ctx.commit_fire_timing(timing_enabled);
         ticket_reservation.commit();
-        extent_reservation.commit();
 
-        // Optimistic cursor advance: the NEXT submit prepares against this
-        // fire's post-state (the run-ahead overlap). A failed fire fails
-        // the pass instead of rewinding.
         {
             let p = ctx.resources().get_mut(&fwd)?;
-            p.committed_tokens = next_committed;
-            p.fired_once = true; // seeds are consumed; the seed rule is off
+            p.kv_declaration_realized = true;
+            let (shadow, bound, shadow_cells) =
+                (&mut p.host_shadow, &p.instance.program.bound, &p.cells);
+            shadow.advance(bound, shadow_cells);
         }
 
         pipe_fires
@@ -889,11 +925,13 @@ pub async fn submit_pass<C: FireContext>(
             .unwrap()
             .push_back(PendingOp::Fire(PendingFire {
                 completion,
-                kv: FireKv::Deferred(kvtxn_slot),
-                rstxn,
+                kv: FireKv::Host(kvtxn),
+                rstxns,
                 ws_guard,
+                model,
+                driver,
                 ws_rep,
-                rs_rep,
+                rs_reps,
                 fwd_rep,
                 instance_id,
                 cells,
@@ -905,14 +943,8 @@ pub async fn submit_pass<C: FireContext>(
 
 /// Compaction (Design-B lazy KV GC): move `n` token KV cells within `ws`,
 /// all layers, from (`src_page_ids[i]`, `src_tok_idx[i]`) -> (`dst_page_ids[i]`,
-/// `dst_tok_idx[i]`). Enqueues a `PendingOp::Move` on the SAME pipeline FIFO /
-/// stream as forward fires (submitted solo/prebuilt), so ordering is automatic
-/// (happens-after prior fires' KV writes, happens-before later fires' reads) —
-/// no drain barrier (K6 dissolved). The guest's page ids are the PHYSICAL KV
-/// block ids it also binds to the `Pages`/`WSlot` ports (Design B works in
-/// physical page ids directly), so they pass straight through to the move — the
-/// wire / kernel operate on exactly the physical pages the fires read/write.
-/// The guest computed the post-move layout itself, so no result is taken.
+/// `dst_tok_idx[i]`). The copy is submitted in pipeline order and awaited here,
+/// so no separate pending-move lifetime or recycle epoch exists.
 pub async fn copy_into_inner<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
@@ -922,6 +954,9 @@ pub async fn copy_into_inner<C: FireContext>(
     src_page_ids: Vec<u32>,
     src_tok_idx: Vec<u32>,
 ) -> Anyhow<Result<(), String>> {
+    if ctx.resources().get(&this)?.scope.is_closed() {
+        return Ok(Err("pipeline copy_into: pipeline is closed".to_string()));
+    }
     let n = dst_page_ids.len();
     if dst_tok_idx.len() != n || src_page_ids.len() != n || src_tok_idx.len() != n {
         return Ok(Err(format!(
@@ -936,6 +971,19 @@ pub async fn copy_into_inner<C: FireContext>(
     if n == 0 {
         return Ok(Ok(()));
     }
+    let (pipeline_scope, pipe_fires, pipeline_failure) = {
+        let pipeline = ctx.resources().get(&this)?;
+        (
+            pipeline.scope.clone(),
+            pipeline.fires.clone(),
+            pipeline.failure.clone(),
+        )
+    };
+    drain_rs_predecessors(ctx, &pipe_fires).await?;
+    if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
+        return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
+    }
+    let ws_handle = ctx.resources().get(&ws)?.clone();
 
     // The WIT contract passes WorkingSet-RELATIVE page indexes (guests
     // never hold physical ids); translate through the flattened table so
@@ -944,40 +992,39 @@ pub async fn copy_into_inner<C: FireContext>(
     // in-flight fires that could remap these pages (a CoW rebase) are the
     // guest's ordering hazard, like any same-WS run-ahead write overlap.
     let (kv_move_dst_pages, kv_move_src_pages): (Vec<u32>, Vec<u32>) = {
-        let ws = ctx.resources().get(&ws)?.clone();
-        let stores = crate::store::registry::get(ws.model, ws.driver as usize);
-        let pid = ctx.process_id();
-        if let Err(owner) = ws.claim_pipeline_scope(pid.as_u128()) {
+        let stores = crate::store::registry::get(ws_handle.model, ws_handle.driver as usize);
+        if let Err(owner) = ws_handle.claim_pipeline_scope(&pipeline_scope) {
             return Ok(Err(format!(
                 "pipeline: KV working set is already scoped to pipeline {owner:032x}"
             )));
         }
-        let mut kv_store = stores.kv.lock().unwrap();
-        let (_, flat) = kv_store
-            .flat_table(ws.id)
-            .map_err(|e| anyhow::anyhow!("copy_into flat table: {e}"))?;
-        let translate = |ids: &[u32]| -> Result<Vec<u32>, String> {
-            ids.iter()
-                .map(|&i| {
-                    flat.get(i as usize).map(|p| p.0).ok_or_else(|| {
-                        format!("copy_into: page index {i} beyond the mapped extent")
-                    })
-                })
-                .collect()
-        };
-        match (translate(&dst_page_ids), translate(&src_page_ids)) {
-            (Ok(d), Ok(s)) => (d, s),
-            (Err(e), _) | (_, Err(e)) => return Ok(Err(e)),
+        let translated = crate::store::registry::with_kv_lock(
+            &stores.kv,
+            "host-other",
+            |kv_store| -> anyhow::Result<Result<(Vec<u32>, Vec<u32>), String>> {
+                let (_, flat) = kv_store
+                    .flat_table(ws_handle.id)
+                    .map_err(|e| anyhow::anyhow!("copy_into flat table: {e}"))?;
+                let translate = |ids: &[u32]| -> Result<Vec<u32>, String> {
+                    ids.iter()
+                        .map(|&i| {
+                            flat.get(i as usize).map(|p| p.0).ok_or_else(|| {
+                                format!("copy_into: page index {i} beyond the mapped extent")
+                            })
+                        })
+                        .collect()
+                };
+                match (translate(&dst_page_ids), translate(&src_page_ids)) {
+                    (Ok(dst), Ok(src)) => Ok(Ok((dst, src))),
+                    (Err(error), _) | (_, Err(error)) => Ok(Err(error)),
+                }
+            },
+        )?;
+        match translated {
+            Ok(pages) => pages,
+            Err(error) => return Ok(Err(error)),
         }
     };
-
-    // Point this pipeline's FIFO at the move so a later `take`/`read` on any
-    // channel fed by this pipeline drains it in submit order.
-    let pipe_fires = ctx.resources().get(&this)?.fires.clone();
-    let pipeline_failure = ctx.resources().get(&this)?.failure.clone();
-    if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
-        return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
-    }
 
     let cells = kv_move_dst_pages
         .into_iter()
@@ -994,29 +1041,69 @@ pub async fn copy_into_inner<C: FireContext>(
             },
         )
         .collect::<Vec<_>>();
-    let completion = match crate::scheduler::copy_kv_cells(0, cells) {
+    let lease = match ws_handle.fire_lease() {
+        Ok(lease) => lease,
+        Err(error) => return Ok(Err(format!("pipeline copy_into: {error}"))),
+    };
+    let completion = match crate::scheduler::copy_kv_cells(0, cells).await {
         Ok(completion) => completion,
         Err(e) => return Ok(Err(format!("pipeline copy_into: submit failed: {e:#}"))),
     };
-    pipe_fires
-        .lock()
-        .unwrap()
-        .push_back(PendingOp::Move(PendingMove {
-            completion,
-            failure: pipeline_failure,
-        }));
+    let result = CopyCompletionGuard {
+        completion: Some(completion),
+        lease: Some(lease),
+        model: ws_handle.model,
+        driver: ws_handle.driver as usize,
+        ws: ws_handle.id,
+        indexes: dst_page_ids,
+    }
+    .finish()
+    .await;
+    if let Err(error) = result {
+        let reason = format!("pipeline kv-move (copy_into) failed: {error:#}");
+        let mut failure = pipeline_failure.lock().unwrap();
+        if failure.is_none() {
+            *failure = Some(reason.clone());
+        }
+        return Ok(Err(reason));
+    }
     Ok(Ok(()))
 }
 
-pub async fn pipeline_close<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
-    // Signal no further submissions: drain the pipeline's in-flight FIFO so
-    // its fires' prepared KV/RS writes (snapshot pins) finalize before the
-    // pipeline goes away (the pin-safety drain follows the FIFO — W3.1).
-    let fires = ctx.resources().get(&this).ok().map(|p| p.fires.clone());
+/// Shared close/drop body — close = cancel (operator ruling R4-1,
+/// 2026-07-17, reversing iteration 62's cb965fbb "close cancels nothing"):
+/// close and drop mean the same thing. End-of-stream is no longer close's
+/// job (the final-submit marker carries it, R4-2, and the scheduler leaves
+/// at the last fire's wave dispatch, R4-3) — close is the ABORT: every
+/// queued/preparing fire is cancelled and its scheduler books are deleted;
+/// already-dispatched fires are GPU-owned and run to settlement (their
+/// credits were consumed at dispatch, so the ledger is already clean).
+///
+/// ORDER MATTERS: cancel flags are set on every FIFO op BEFORE the leave is
+/// notified, so a preparation finishing asynchronously after the leave sees
+/// its cancel flag and rejects WITHOUT publishing a credit — no stale
+/// publication exists on the close path, which is what lets the W1
+/// leave-transfer stay deleted (F6). The pin-safety finalize drain stays:
+/// each fire's prepared KV/RS state must resolve — settled or rejected —
+/// before close returns (the
+/// concurrent_race probe catches finalization deferred past close).
+async fn pipeline_cancel_and_drain<C: FireContext>(
+    ctx: &mut C,
+    this: &Resource<Pipeline>,
+) -> Anyhow<()> {
+    let fires = ctx.resources().get(this).ok().map(|pipeline| {
+        pipeline.scope.close();
+        pipeline.fires.clone()
+    });
     if let Some(fires) = fires {
+        let _finalize_guard = fires.finalize_guard().await;
         for fire in fires.lock().unwrap().iter() {
             fire.request_cancel();
         }
+        crate::scheduler::worker::notify_pipeline_leave(
+            ctx.process_id(),
+            crate::scheduler::worker::LeaveKind::Close,
+        );
         loop {
             let fire = fires.lock().unwrap().pop_front();
             match fire {
@@ -1026,30 +1113,40 @@ pub async fn pipeline_close<C: FireContext>(ctx: &mut C, this: Resource<Pipeline
                 None => break,
             }
         }
+    } else {
+        crate::scheduler::worker::notify_pipeline_leave(
+            ctx.process_id(),
+            crate::scheduler::worker::LeaveKind::Close,
+        );
     }
     Ok(())
 }
 
-pub async fn pipeline_drop<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
-    // Drain the pipeline's in-flight FIFO before releasing it: each fire
-    // holds a prepared KV/RS write (snapshot pins, pending slots) and the
-    // GPU may still be writing — await + finalize, never abandon
-    // mid-flight (W3.1: the pin-safety drain lives here, not on the pass).
-    let fires = ctx.resources().get(&this).ok().map(|p| p.fires.clone());
-    if let Some(fires) = fires {
-        for fire in fires.lock().unwrap().iter() {
-            fire.request_cancel();
-        }
-        loop {
-            let fire = fires.lock().unwrap().pop_front();
-            match fire {
-                Some(f) => {
-                    let _ = finalize_op(ctx, f).await;
-                }
-                None => break,
-            }
-        }
+/// `pipeline.finish` (F7): graceful end of stream. A SEQUENCED verb — the
+/// finish event rides the same FIFO scheduler channel the pipeline's
+/// submissions rode, so it lands after every prior fire's admission (the
+/// same ordering close-at-last-submit relied on). The scheduler sets the
+/// stream books' `end_seen` at receipt; the leave condition (end_seen &&
+/// undispatched == 0, R4-3) is untouched, so the row leaves the wait-set
+/// the moment the last fire dispatches. Queued fires DRAIN normally —
+/// finish cancels nothing; `close` remains the cancel.
+pub async fn pipeline_finish<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
+    if let Ok(pipeline) = ctx.resources().get(&this) {
+        pipeline
+            .finished
+            .store(true, std::sync::atomic::Ordering::Release);
     }
+    crate::scheduler::worker::notify_pipeline_finish(ctx.process_id());
+    Ok(())
+}
+
+pub async fn pipeline_close<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
+    pipeline_cancel_and_drain(ctx, &this).await
+}
+
+pub async fn pipeline_drop<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
+    // Close semantics plus resource deletion (drop implies close, R4-1).
+    pipeline_cancel_and_drain(ctx, &this).await?;
     ctx.resources().delete(this)?;
     Ok(())
 }
@@ -1093,17 +1190,10 @@ pub async fn drain_settled<C: FireContext>(
     let Some(fires) = fires else {
         return Ok(false);
     };
+    let _finalize_guard = fires.finalize_guard().await;
     let mut drained = false;
     loop {
-        let op = {
-            let mut queue = fires.lock().unwrap();
-            if queue.front().is_some_and(PendingOp::is_settled) {
-                queue.pop_front()
-            } else {
-                None
-            }
-        };
-        match op {
+        match pop_settled(Some(fires)) {
             Some(op) => {
                 finalize_op(ctx, op).await?;
                 drained = true;
@@ -1113,21 +1203,56 @@ pub async fn drain_settled<C: FireContext>(
     }
 }
 
-pub async fn finalize_op<C: FireContext>(ctx: &mut C, op: PendingOp) -> Anyhow<()> {
-    match op {
-        PendingOp::Fire(fire) => finalize_fire(ctx, fire).await,
-        PendingOp::Move(mv) => {
-            if let Err(e) = mv.completion.await {
-                let reason = format!("pipeline kv-move (copy_into) failed: {e:#}");
-                let mut failure = mv.failure.lock().unwrap();
-                if failure.is_none() {
-                    *failure = Some(reason.clone());
-                }
-                tracing::warn!("{reason}");
-            }
-            Ok(())
-        }
+pub(crate) fn pop_settled(fires: Option<&PendingFires>) -> Option<PendingOp> {
+    let fires = fires?;
+    let mut queue = fires.lock().unwrap();
+    if queue.front().is_some_and(PendingOp::is_settled) {
+        queue.pop_front()
+    } else {
+        None
     }
+}
+
+pub async fn finalize_op<C: FireContext>(ctx: &mut C, op: PendingOp) -> Anyhow<()> {
+    let finalized = finalize_op_await(op).await?;
+    complete_finalize(ctx, finalized);
+    Ok(())
+}
+
+pub(crate) async fn finalize_op_await(op: PendingOp) -> Anyhow<FinalizeOutcome> {
+    match op {
+        PendingOp::Fire(fire) => finalize_fire_await(fire).await,
+        #[cfg(test)]
+        PendingOp::TestStub => Ok(FinalizeOutcome {
+            action: FinalizeAction::None,
+            ws_guard: None,
+        }),
+    }
+}
+
+pub(crate) fn complete_finalize<C: FireContext>(ctx: &mut C, finalized: FinalizeOutcome) {
+    let FinalizeOutcome { action, ws_guard } = finalized;
+    match action {
+        FinalizeAction::None => {}
+        FinalizeAction::Fail {
+            fwd_rep,
+            cells,
+            failure,
+            reason,
+        } => {
+            poison_readers(&cells, &reason);
+            fail_pass(ctx, fwd_rep, &reason);
+            let mut domain = failure.lock().unwrap();
+            if domain.is_none() {
+                *domain = Some(reason);
+            }
+        }
+        FinalizeAction::ReclaimDeviceGeometry {
+            fwd_rep,
+            instance_id,
+        } => reclaim_device_geometry_grants(ctx, fwd_rep, instance_id),
+    }
+    drop(ws_guard);
 }
 
 /// Finalize an ordinary host-geometry op without a `ResourceTable` borrow.
@@ -1135,148 +1260,123 @@ pub async fn finalize_op<C: FireContext>(ctx: &mut C, op: PendingOp) -> Anyhow<(
 /// Device-geometry fires are excluded because their lease reclamation lives on
 /// the `ForwardPass` resource and still requires `FireContext`.
 pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
-    match op {
-        PendingOp::Move(mv) => {
-            if let Err(error) = mv.completion.await {
-                let reason = format!("pipeline kv-move (copy_into) failed: {error:#}");
-                let mut failure = mv.failure.lock().unwrap();
-                if failure.is_none() {
-                    *failure = Some(reason.clone());
-                }
-                tracing::warn!("{reason}");
+    debug_assert!(op.is_preemption_detachable());
+    let FinalizeOutcome { action, ws_guard } = finalize_op_await(op).await?;
+    match action {
+        FinalizeAction::None => {}
+        FinalizeAction::Fail {
+            cells,
+            failure,
+            reason,
+            ..
+        } => {
+            poison_readers(&cells, &reason);
+            let mut domain = failure.lock().unwrap();
+            if domain.is_none() {
+                *domain = Some(reason);
             }
-            Ok(())
         }
-        PendingOp::Fire(fire) => {
-            let PendingFire {
-                completion,
-                kv,
-                rstxn,
-                ws_guard,
-                ws_rep: _,
-                rs_rep: _,
-                fwd_rep: _,
-                instance_id: _,
-                cells,
-                failure,
-            } = fire;
-            let FireKv::Deferred(slot) = kv else {
-                unreachable!("device-geometry fires require FireContext finalization");
-            };
-            let prior_failure = failure.lock().unwrap().clone();
-            let result = completion.await;
-            let success = result.is_ok() && prior_failure.is_none();
-            let stores = crate::store::registry::get(0, 0);
-            if let Some(kvtxn) = slot.lock().unwrap().take() {
-                let mut kv_store = stores.kv.lock().unwrap();
-                let _ = kv::finalize(&mut kv_store, kvtxn, success);
-            }
-            if let Some(rstxn) = rstxn {
-                let mut rs_store = stores.rs.lock().unwrap();
-                let _ = rs::finalize(&mut rs_store, rstxn, success);
-            }
-            if let Some(orchestrator) = crate::store::reclaim::contention() {
-                orchestrator.on_blocks_freed();
-                orchestrator.on_fire_retired();
-            }
-            let reason = prior_failure.or_else(|| {
-                result
-                    .err()
-                    .map(|error| format!("pipeline: forward failed: {error:#}"))
-            });
-            if let Some(reason) = reason {
-                poison_readers(&cells, &reason);
-                let mut domain = failure.lock().unwrap();
-                if domain.is_none() {
-                    *domain = Some(reason);
-                }
-            }
-            drop(ws_guard);
-            Ok(())
+        FinalizeAction::ReclaimDeviceGeometry { .. } => {
+            unreachable!("device-geometry fires require FireContext finalization")
         }
     }
+    drop(ws_guard);
+    Ok(())
 }
 
 /// Resolve one in-flight fire: await the payload-free callback, finalize the
 /// KV/RS txns, and expose the release-published mirror tails. Values remain
 /// in driver-owned channel memory until `channel.take` or `channel.read`.
-async fn finalize_fire<C: FireContext>(ctx: &mut C, fire: PendingFire) -> Anyhow<()> {
+async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
     let PendingFire {
         completion,
         kv,
-        rstxn,
+        rstxns,
         ws_guard,
+        model,
+        driver,
         ws_rep,
-        rs_rep,
+        rs_reps,
         fwd_rep,
         instance_id,
         cells,
         failure,
     } = fire;
+    let device_geometry = matches!(&kv, FireKv::DeviceGeom { .. });
     let prior_failure = failure.lock().unwrap().clone();
     let result = completion.await;
     let success = result.is_ok() && prior_failure.is_none();
 
-    {
-        // Single-model, single-driver v1: fires are keyed to stores (0,0).
+    let (kv_failure, rs_failure) = {
         let _ = ws_rep;
-        let stores = crate::store::registry::get(0, 0);
-        match kv {
-            FireKv::DeviceGeom { kvtxn } => {
-                let mut kv_store = stores.kv.lock().unwrap();
-                let _ = kv::finalize(&mut kv_store, kvtxn, success);
-            }
-            FireKv::Deferred(slot) => {
-                if let Some(kvtxn) = slot.lock().unwrap().take() {
-                    let mut kv_store = stores.kv.lock().unwrap();
-                    let _ = kv::finalize(&mut kv_store, kvtxn, success);
-                }
-            }
-        }
-        if let Some(rstxn) = rstxn {
-            let _ = rs_rep;
+        let _ = rs_reps;
+        let stores = crate::store::registry::get(model, driver);
+        // RS transactions have no Drop rollback. Retire them before the only
+        // await below so process cancellation cannot leak their slots.
+        let rs_failure = if rstxns.is_empty() {
+            None
+        } else {
             let mut rs_store = stores.rs.lock().unwrap();
-            let _ = rs::finalize(&mut rs_store, rstxn, success);
-        }
-    } // store locks released before the contention drain re-locks pools
+            rs::finalize_many(&mut rs_store, rstxns, success)
+                .err()
+                .map(|error| format!("pipeline: recurrent-state finalize failed: {error}"))
+        };
+        let kv_failure = match kv {
+            FireKv::DeviceGeom { kvtxn } => {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                    kv::finalize(kv_store, kvtxn, success)
+                        .err()
+                        .map(|error| format!("pipeline: KV finalize failed: {error}"))
+                })
+            }
+            FireKv::Host(kvtxn) => kvtxn.and_then(|kvtxn| {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                    kv::finalize(kv_store, kvtxn, success)
+                        .err()
+                        .map(|error| format!("pipeline: KV finalize failed: {error}"))
+                })
+            }),
+        };
+        (kv_failure, rs_failure)
+    }; // store locks released before the contention drain re-locks pools
 
     // The fire's sequence retired: recycled slots (aborts, CoW'd tails,
     // collected suffixes) are allocatable now — wake parked allocators
     // and drain-gated lanes.
     if let Some(orch) = crate::store::reclaim::contention() {
         orch.on_blocks_freed();
-        orch.on_fire_retired();
-    }
-
-    if let Some(reason) = prior_failure {
-        poison_readers(&cells, &reason);
-        fail_pass(ctx, fwd_rep, &reason);
-        return Ok(());
     }
 
     // Values are already visible through the release-published tail words
     // (plan §4.5) — resolving the fire only classifies success and settles
     // the transactions above.
-    let failure_reason = match result {
-        Ok(()) => {
-            reclaim_device_geometry_grants(ctx, fwd_rep, instance_id);
-            None
+    let failure_reason = prior_failure
+        .or_else(|| {
+            result
+                .err()
+                .map(|error| format!("pipeline: forward failed: {error:#}"))
+        })
+        .or(kv_failure)
+        .or(rs_failure);
+    let action = if let Some(reason) = failure_reason {
+        FinalizeAction::Fail {
+            fwd_rep,
+            cells,
+            failure,
+            reason,
         }
-        Err(e) => {
-            let reason = format!("pipeline: forward failed: {e:#}");
-            poison_readers(&cells, &reason);
-            fail_pass(ctx, fwd_rep, &reason);
-            Some(reason)
+    } else if device_geometry {
+        FinalizeAction::ReclaimDeviceGeometry {
+            fwd_rep,
+            instance_id,
         }
+    } else {
+        FinalizeAction::None
     };
-    if let Some(reason) = failure_reason {
-        let mut domain = failure.lock().unwrap();
-        if domain.is_none() {
-            *domain = Some(reason);
-        }
-    }
-    drop(ws_guard);
-    Ok(())
+    Ok(FinalizeOutcome {
+        action,
+        ws_guard: Some(ws_guard),
+    })
 }
 
 /// Mark a pass failed (first failure wins). The guest may have dropped
@@ -1287,6 +1387,31 @@ fn fail_pass<C: FireContext>(ctx: &mut C, fwd_rep: u32, reason: &str) {
         if p.failed.is_none() {
             p.failed = Some(reason.to_string());
         }
+    }
+}
+
+fn record_submit_failure<C: FireContext>(
+    ctx: &mut C,
+    fwd: &Resource<ForwardPass>,
+    failure: &PipelineFailure,
+    reason: &str,
+) {
+    if let Ok(pass) = ctx.resources().get_mut(fwd)
+        && pass.failed.is_none()
+    {
+        pass.failed = Some(reason.to_string());
+    }
+    let mut pipeline = failure.lock().unwrap();
+    if pipeline.is_none() {
+        *pipeline = Some(reason.to_string());
+    }
+}
+
+fn reclaim_pending_device_grant<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) {
+    if let Ok(pass) = ctx.resources().get_mut(fwd)
+        && let Some(devgeo) = pass.devgeo.as_mut()
+    {
+        devgeo.lease.reclaim_after_fire(&vec![true; devgeo.b]);
     }
 }
 
@@ -1313,8 +1438,23 @@ async fn fire_device_geometry<C: FireContext>(
     // Wire each of this pass's channels at this pipeline's FIFO (§3.4: all
     // passes binding a channel must submit on ONE pipeline — the entire
     // ordering/FIFO correctness argument).
-    let pipe_fires = ctx.resources().get(&this)?.fires.clone();
-    let pipeline_failure = ctx.resources().get(&this)?.failure.clone();
+    let (pipe_fires, pipeline_failure, pipeline_scope) = {
+        let pipeline = ctx.resources().get(&this)?;
+        if pipeline.scope.is_closed() {
+            return Ok(Err("pipeline: pipeline is closed".to_string()));
+        }
+        // F7 — same contract as the ordinary submit.
+        if pipeline.finished.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(Err(
+                "pipeline: submit after finish (the stream ended)".to_string()
+            ));
+        }
+        (
+            pipeline.fires.clone(),
+            pipeline.failure.clone(),
+            pipeline.scope.clone(),
+        )
+    };
     // Non-blocking settlement drain (plan §6), as in the ordinary submit.
     drain_settled(ctx, Some(&pipe_fires)).await?;
     if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
@@ -1323,14 +1463,24 @@ async fn fire_device_geometry<C: FireContext>(
     if let Err(e) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
         return Ok(Err(e));
     }
+    if !ctx.resources().get(&fwd)?.rs_ws.is_empty() {
+        drain_rs_predecessors(ctx, &pipe_fires).await?;
+        if let Some(reason) = pipeline_failure.lock().unwrap().clone() {
+            return Ok(Err(format!("pipeline: pipeline failed: {reason}")));
+        }
+    }
+    let timing_enabled = ctx.fire_timing_requested();
 
-    let ws_rep = ctx.resources().get(&fwd)?.kv_ws;
+    let (ws_rep, rs_reps) = {
+        let pass = ctx.resources().get(&fwd)?;
+        (pass.kv_ws, pass.rs_ws.clone())
+    };
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
     let page_size = ws.page_size;
     let stores = crate::store::registry::get(ws.model, ws.driver as usize);
     let pid = ctx.process_id();
-    if let Err(owner) = ws.claim_pipeline_scope(pid.as_u128()) {
+    if let Err(owner) = ws.claim_pipeline_scope(&pipeline_scope) {
         return Ok(Err(format!(
             "pipeline: KV working set is already scoped to pipeline {owner:032x}"
         )));
@@ -1345,6 +1495,7 @@ async fn fire_device_geometry<C: FireContext>(
     let (
         completion,
         instance_id,
+        scheduler,
         cells,
         fwd_rep,
         kvtxn,
@@ -1355,6 +1506,12 @@ async fn fire_device_geometry<C: FireContext>(
         copy_dst,
         dense_mask,
         accesses,
+        rs_slot_ids,
+        rs_slot_flags,
+        rs_copy_src,
+        rs_copy_dst,
+        resolved_qo_indptr,
+        rstxns,
     ) = {
         // Fail-fast.
         {
@@ -1379,145 +1536,61 @@ async fn fire_device_geometry<C: FireContext>(
         // reserves. Purely logical — this can never exhaust the pool, so
         // it runs ONCE; only the physical prepare below retries under
         // contention.
-        let grant_slots = {
-            let mut kv_store = stores.kv.lock().unwrap();
-            devgeo.lease.grant(|| {
-                kv_store
-                    .reserve(ws.id, 1)
-                    .map(|r| r.start as u32)
-                    .unwrap_or(0)
-            })
-        };
-        let mut allocation_grant: Option<crate::store::reclaim::AllocationGrant> = None;
-        let (pages, (copy_src, copy_dst), kv_translation, kvtxn) = loop {
-            if allocation_grant.is_none()
-                && let Some(orchestrator) = crate::store::reclaim::contention()
-                && orchestrator.allocation_requires_grant()
-            {
-                let required = (|| -> Result<usize, kv::KvError> {
-                    let mut kv_store = stores.kv.lock().unwrap();
-                    let mapped = kv_store
-                        .visible_mapped_len(ws.id)
-                        .map_err(kv::KvError::from)?;
-                    let mut write_indexes: Vec<u64> =
-                        grant_slots.iter().map(|&slot| u64::from(slot)).collect();
-                    if let Some(max_fresh) =
-                        write_indexes.iter().copied().filter(|&i| i >= mapped).max()
-                    {
-                        write_indexes.extend(mapped..max_fresh);
-                    }
-                    write_indexes.sort_unstable();
-                    write_indexes.dedup();
+        let grant_slots =
+            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                devgeo.lease.grant(|| {
                     kv_store
-                        .required_pages(ws.id, &write_indexes)
-                        .map_err(kv::KvError::from)
-                })();
-                let required = match required {
-                    Ok(required) => required,
-                    Err(error) => {
-                        ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                        return Ok(Err(format!(
-                            "pipeline: device-geometry grant sizing: {error}"
-                        )));
-                    }
-                };
-                if required > 0 {
-                    let reclaimable =
-                        reclaimable_probe(ws.model, ws.driver as usize, pid, ctx.kv_working_sets());
-                    match orchestrator
-                        .acquire_or_self_suspend_live(pid, required as u32, reclaimable)
-                        .await
-                    {
-                        Ok(crate::store::reclaim::Acquired::Granted(grant)) => {
-                            allocation_grant = Some(grant);
-                        }
-                        Ok(crate::store::reclaim::Acquired::SelfSuspendFirst) => {
-                            if let Err(error) = ctx.honor_preemption().await {
-                                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                                return Err(error);
-                            }
-                        }
-                        Err(error) => {
-                            ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                            return Ok(Err(format!("pipeline: device-geometry grant: {error}")));
-                        }
-                    }
-                    continue;
-                }
-            }
-            let prepared = (|| {
-                let mut kv_store = stores.kv.lock().unwrap();
-                // One prepared write covers the grants plus any unwritten
-                // gap up to the mapped end (left by an aborted earlier
-                // fire), so fresh publication stays contiguous. The gap
-                // is recomputed per attempt: a parked retry may resume
-                // after another of this pass's fires committed.
-                let mapped = kv_store
-                    .visible_mapped_len(ws.id)
-                    .map_err(kv::KvError::from)?;
-                let mut write_indexes: Vec<u64> = grant_slots.iter().map(|&s| s as u64).collect();
-                if let Some(max_fresh) =
-                    write_indexes.iter().copied().filter(|&i| i >= mapped).max()
-                {
-                    write_indexes.extend(mapped..max_fresh);
-                }
-                write_indexes.sort_unstable();
-                write_indexes.dedup();
-                match allocation_grant.take() {
-                    Some(grant) => kv::prepare_explicit_granted(
-                        &mut kv_store,
-                        ws.id,
-                        &write_indexes,
-                        grant.into_pages(),
-                    ),
-                    None => kv::prepare_explicit(&mut kv_store, ws.id, &write_indexes),
-                }
-            })(); // kv lock dropped before any contention await below
-            match prepared {
-                Ok(v) => break v,
-                Err(e @ kv::KvError::OutOfPages { requested, .. }) => {
-                    // Same contention-ladder seam as the host-geometry
-                    // path (see submit_pass), including the Error-mode
-                    // inline rung 1.
-                    let Some(orch) = crate::store::reclaim::contention() else {
-                        let freed = {
-                            let mut kv_store = stores.kv.lock().unwrap();
-                            let epoch = kv_store.current_epoch();
-                            let freed = kv_store.drop_unused_cache_leases(epoch);
-                            kv_store.retire_idle();
-                            freed
-                        };
-                        if freed > 0 {
-                            continue;
-                        }
-                        ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                        return Ok(Err(format!("pipeline: device-geometry grant: {e}")));
-                    };
-                    let reclaimable =
-                        reclaimable_probe(ws.model, ws.driver as usize, pid, ctx.kv_working_sets());
-                    match orch
-                        .acquire_or_self_suspend_live(pid, requested as u32, reclaimable)
-                        .await
-                    {
-                        Ok(crate::store::reclaim::Acquired::Granted(grant)) => {
-                            allocation_grant = Some(grant)
-                        }
-                        Ok(crate::store::reclaim::Acquired::SelfSuspendFirst) => {
-                            if let Err(error) = ctx.honor_preemption().await {
-                                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                                return Err(error);
-                            }
-                        }
-                        Err(hard) => {
-                            ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                            return Ok(Err(format!("pipeline: device-geometry grant: {hard}")));
-                        }
-                    }
-                }
-                Err(e) => {
+                        .reserve(ws.id, 1)
+                        .map(|r| r.start as u32)
+                        .unwrap_or(0)
+                })
+            });
+        let mut write_indexes: Vec<u64> = grant_slots.iter().map(|&slot| u64::from(slot)).collect();
+        write_indexes.sort_unstable();
+        write_indexes.dedup();
+        let (pages, (copy_src, copy_dst), kv_translation, kvtxn) =
+            match prepare_explicit_kv(&stores, &ws, &write_indexes) {
+                Ok(prepared) => prepared,
+                Err(error) => {
                     ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
-                    return Ok(Err(format!("pipeline: device-geometry grant: {e}")));
+                    return Ok(Err(error));
                 }
+            };
+        // Device geometry resolves B request rows in-graph. Validate the bound
+        // RS list against that resolved arity before the launch and prepare one
+        // folded target per row. The zero-valued `qo_indptr` carries only the
+        // known row count; the driver still resolves its values in-graph.
+        let resolved_qo_indptr = vec![0; devgeo.b + 1];
+        let prepared_rs = prepare_bound_rs(
+            ctx,
+            &stores,
+            ws.model,
+            ws.driver as usize,
+            &rs_reps,
+            &resolved_qo_indptr,
+            &pipeline_scope,
+        );
+        let (rs_slot_ids, rs_slot_flags, rs_copy_src, rs_copy_dst, rstxns) = match prepared_rs {
+            Ok(Ok(prepared)) => prepared,
+            outcome => {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                    let _ = kv::finalize(kv_store, kvtxn, false);
+                });
+                devgeo.lease.reclaim_after_fire(&vec![true; devgeo.b]);
+                ctx.resources().get_mut(&fwd)?.devgeo = Some(devgeo);
+                return match outcome {
+                    Ok(Err(error)) => {
+                        record_submit_failure(ctx, &fwd, &pipeline_failure, &error);
+                        Ok(Err(error))
+                    }
+                    Err(error) => {
+                        let reason =
+                            format!("pipeline: device-geometry RS prepare failed: {error:#}");
+                        record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+                        Err(error)
+                    }
+                    Ok(Ok(_)) => unreachable!(),
+                };
             }
         };
         // Wire page refs (scheduler capacity accounting): this fire's
@@ -1544,11 +1617,14 @@ async fn fire_device_geometry<C: FireContext>(
             error
         };
         if let Some(error) = fresh_error {
-            let mut kv_store = stores.kv.lock().unwrap();
-            let _ = kv::finalize(&mut kv_store, kvtxn, false);
-            return Ok(Err(format!(
-                "pipeline: device-geometry fresh grant put: {error}"
-            )));
+            abort_rs_transactions(&stores, rstxns);
+            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+                let _ = kv::finalize(kv_store, kvtxn, false);
+            });
+            reclaim_pending_device_grant(ctx, &fwd);
+            let reason = format!("pipeline: device-geometry fresh grant put: {error}");
+            record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+            return Ok(Err(reason));
         }
 
         let p = ctx.resources().get_mut(&fwd)?;
@@ -1558,6 +1634,7 @@ async fn fire_device_geometry<C: FireContext>(
         (
             completion,
             p.bound_instance.instance_id,
+            p.scheduler.clone(),
             p.cells.clone(),
             fwd.rep(),
             kvtxn,
@@ -1568,12 +1645,21 @@ async fn fire_device_geometry<C: FireContext>(
             copy_dst,
             dense_mask,
             accesses,
+            rs_slot_ids,
+            rs_slot_flags,
+            rs_copy_src,
+            rs_copy_dst,
+            resolved_qo_indptr,
+            rstxns,
         )
     };
 
     let mut req = crate::driver::LaunchPlan::default();
+    req.qo_indptr = resolved_qo_indptr;
     req.kv_translation = kv_translation;
     req.kv_translation_version = kv_translation_version;
+    req.rs_slot_ids = rs_slot_ids;
+    req.rs_slot_flags = rs_slot_flags;
     // A dense device mask (AttnMask channel) marks the fire mask-carrying;
     // the scheduler batches it SOLO (the composed multi-program batch
     // does not merge dense device masks — v1 scope).
@@ -1581,29 +1667,34 @@ async fn fire_device_geometry<C: FireContext>(
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
     let last_page_len = wire_pages.last().map(|_| page_size).unwrap_or(0);
-    let submit_error = crate::scheduler::submit_prebuilt_async_with_kv_copy(
+    let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
+        &scheduler,
         req,
-        0,
         instance_id,
-        wire_pages,
+        pid,
         last_page_len,
         completion.clone(),
         copy_src,
         copy_dst,
+        rs_copy_src,
+        rs_copy_dst,
+        None,
+        timing_enabled,
     )
     .err()
     .map(|error| format!("{error:#}"));
     if let Some(error) = submit_error {
         let reason = format!("pipeline: device-geometry submit failed: {error}");
-        {
-            let mut kv_store = stores.kv.lock().unwrap();
-            let _ = kv::finalize(&mut kv_store, kvtxn, false);
-        }
-        ctx.resources().get_mut(&fwd)?.failed = Some(reason.clone());
+        abort_rs_transactions(&stores, rstxns);
+        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
+            let _ = kv::finalize(kv_store, kvtxn, false);
+        });
+        reclaim_pending_device_grant(ctx, &fwd);
+        record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
+    ctx.commit_fire_timing(timing_enabled);
     ticket_reservation.commit();
-    ctx.resources().get_mut(&fwd)?.fired_once = true;
 
     pipe_fires
         .lock()
@@ -1611,10 +1702,12 @@ async fn fire_device_geometry<C: FireContext>(
         .push_back(PendingOp::Fire(PendingFire {
             completion,
             kv: FireKv::DeviceGeom { kvtxn },
-            rstxn: None,
+            rstxns,
             ws_guard,
+            model: ws.model,
+            driver: ws.driver as usize,
             ws_rep,
-            rs_rep: None,
+            rs_reps,
             fwd_rep,
             instance_id,
             cells,

@@ -1,51 +1,39 @@
-//! **Prefix-cache e2e — CANONICAL prefill × 2.**
+//! **Explicit prefix-index e2e — cold publish then exact lookup.**
 //!
-//! Runs the SAME single-lane canonical prompt prefill twice, each over a fresh
-//! `WorkingSet` that is dropped after its fire:
-//!
-//!   1. Round 1 prefills N tokens; on the WorkingSet drop the runtime retains
-//!      the canonical path (cache-root lease) and indexes its full pages in
-//!      the CAS.
-//!   2. Round 2 builds the identical pass over a fresh WorkingSet. At fire
-//!      time the runtime recognizes the canonical evidence, probes the CAS,
-//!      GRAFTS the cached full-page prefix, and TRIMS the launch to the
-//!      uncached suffix — completely invisible from in here: this inferlet
-//!      does nothing but run the same pass twice.
-//!
-//! The engine test asserts the trim on the driver operation log
-//! (`launch-shape tokens=24` then `tokens=8` for N=24, page 16). On a real
-//! model `g0 == g1` additionally proves the grafted KV is byte-equivalent to
-//! recomputation (pass input "strict" to enforce; the dummy driver's
-//! synthetic logits are launch-seeded, so equality only holds on real
-//! hardware).
-//!
-//! CANONICAL means: token embed with a single trace-const lane, KvLen-only
-//! attention (`attn_working_set(&ws, klen)` — no Pages/WSlot/WOff/AttnMask/
-//! Positions ports), token values host-known (seeded channel).
+//! Round 0 prefills N tokens, slices its completed full-page prefix, and
+//! publishes that mapping under an opaque inferlet-owned key. Round 1 looks up
+//! the indexed WorkingSet, reserves one suffix page, and explicitly submits
+//! only the uncached suffix.
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 const N: u32 = 24; // prompt length: one full cached page (16) + 8-token suffix
 const PAGE_T: u32 = 16; // tokens per KV page (matches the engine store)
 const NUM_LAYERS: u32 = 2; // irrelevant to this test; required by the DSL config
+const PREFIX_KEY: &[u8] = b"prefix-cache-e2e/full-page-0";
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
+async fn round(tokens: &[i32], tag: &str, cached: bool) -> std::result::Result<i32, String> {
+    let ws = if cached {
+        WorkingSet::from_index(PREFIX_KEY)?
+            .ok_or_else(|| format!("{tag}: explicit prefix index miss"))?
+    } else {
+        WorkingSet::new()
+    };
+    let max_pages = N.div_ceil(PAGE_T);
+    let suffix_start = if cached { PAGE_T } else { 0 };
+    ws.reserve(max_pages - ws.page_len())
+        .map_err(|e| format!("{tag} ws.reserve: {e}"))?;
+    let input = &tokens[suffix_start as usize..];
+    let toks = Channel::from(input.to_vec()).named("toks");
+    let out = Channel::new([1], dtype::i32).named("out");
 
-/// One canonical N-token prefill over a FRESH working set; returns the greedy
-/// read-out of the last row. Everything (pass, pipeline, working set) drops
-/// before returning, so the runtime's drop-time retention runs.
-fn round(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
-    let ws = WorkingSet::new();
-    let toks = bx(Channel::from(tokens.to_vec()).named("toks")); // [N] i32, seeded
-    let klen = bx(Channel::from(vec![N; 1]).named("klen")); // [1] total kv len
-    let out = bx(Channel::new([1], dtype::i32).named("out"));
-
-    let fwd: ForwardPass<'static> = ForwardPass::new();
-    fwd.embed(toks, Tensor::constant(vec![0u32, N])); // single const lane [0, N]
-    fwd.attn_working_set(&ws, klen); // KvLen only — the canonical sugar arity
+    let fwd: ForwardPass = ForwardPass::new();
+    fwd.embed(&toks, Tensor::constant(vec![0u32, input.len() as u32]));
+    let kv_len = Channel::from(vec![N]).named("kv_len");
+    fwd.port_channel(Port::KvLen, &kv_len);
+    fwd.attn_working_set(&ws, .., (suffix_start / PAGE_T)..)?;
+    fwd.derive_dense_geometry();
     fwd.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits()); // read-out row N-1
         out.put(&tok);
@@ -57,7 +45,12 @@ fn round(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
     let g = out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("{tag} out.take: {e}"))?[0];
+    if !cached {
+        let prefix = ws.slice(&pipe, 0, 1)?;
+        prefix.update_index(PREFIX_KEY)?;
+    }
     pipe.close();
     Ok(g)
 }
@@ -66,16 +59,21 @@ fn round(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
 /// canonical pass commits the 16-token prefix, a second appends the 8-token
 /// suffix. Its read-out row is the same absolute position as `round`'s, so
 /// it isolates graft correctness from full-vs-chunked kernel numerics.
-fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
+async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> {
     let ws = WorkingSet::new();
+    let max_pages = N.div_ceil(PAGE_T);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("{tag} ws.reserve: {e}"))?;
     let k = PAGE_T as usize;
 
-    let toks_a = bx(Channel::from(tokens[..k].to_vec()).named("toks_a"));
-    let klen_a = bx(Channel::from(vec![PAGE_T; 1]).named("klen_a"));
-    let sink = bx(Channel::new([1], dtype::i32).named("sink"));
-    let fwd_a: ForwardPass<'static> = ForwardPass::new();
-    fwd_a.embed(toks_a, Tensor::constant(vec![0u32, PAGE_T]));
-    fwd_a.attn_working_set(&ws, klen_a);
+    let toks_a = Channel::from(tokens[..k].to_vec()).named("toks_a");
+    let sink = Channel::new([1], dtype::i32).named("sink");
+    let fwd_a: ForwardPass = ForwardPass::new();
+    fwd_a.embed(&toks_a, Tensor::constant(vec![0u32, PAGE_T]));
+    let kv_len_a = Channel::from(vec![PAGE_T]).named("kv_len_a");
+    fwd_a.port_channel(Port::KvLen, &kv_len_a);
+    fwd_a.attn_working_set(&ws, .., ..)?;
+    fwd_a.derive_dense_geometry();
     fwd_a.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits());
         sink.put(&tok);
@@ -87,14 +85,17 @@ fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> 
     let _ = sink
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("{tag} sink.take: {e}"))?;
 
-    let toks_b = bx(Channel::from(tokens[k..].to_vec()).named("toks_b"));
-    let klen_b = bx(Channel::from(vec![N; 1]).named("klen_b"));
-    let out = bx(Channel::new([1], dtype::i32).named("out_b"));
-    let fwd_b: ForwardPass<'static> = ForwardPass::new();
-    fwd_b.embed(toks_b, Tensor::constant(vec![0u32, N - PAGE_T]));
-    fwd_b.attn_working_set(&ws, klen_b);
+    let toks_b = Channel::from(tokens[k..].to_vec()).named("toks_b");
+    let out = Channel::new([1], dtype::i32).named("out_b");
+    let fwd_b: ForwardPass = ForwardPass::new();
+    fwd_b.embed(&toks_b, Tensor::constant(vec![0u32, N - PAGE_T]));
+    let kv_len_b = Channel::from(vec![N]).named("kv_len_b");
+    fwd_b.port_channel(Port::KvLen, &kv_len_b);
+    fwd_b.attn_working_set(&ws, .., (PAGE_T / ws.page_size())..)?;
+    fwd_b.derive_dense_geometry();
     fwd_b.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits());
         out.put(&tok);
@@ -105,6 +106,7 @@ fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, String> 
     let g = out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("{tag} out.take: {e}"))?[0];
     pipe.close();
     Ok(g)
@@ -116,9 +118,9 @@ async fn main(input: String) -> Result<String> {
     model::configure(vocab, PAGE_T, NUM_LAYERS);
     let tokens: Vec<i32> = (0..N as i32).map(|i| (i % 31) + 1).collect();
 
-    let g0 = round(&tokens, "round0")?;
+    let g0 = round(&tokens, "round0", false).await?;
     println!("[prefix-cache] round 0 (cold) done: g0={g0}");
-    let g1 = round(&tokens, "round1")?;
+    let g1 = round(&tokens, "round1", true).await?;
     println!("[prefix-cache] round 1 (cached prefix) done: g1={g1}");
     let gc = if input.contains("chunked") {
         // Distinct tokens so the chunked rounds never hit the cache — unless
@@ -129,8 +131,8 @@ async fn main(input: String) -> Result<String> {
         } else {
             (0..N as i32).map(|i| ((i * 7) % 31) + 1).collect()
         };
-        let cold = round(&tokens_c, "round-c-cold")?;
-        let chunked = round_chunked(&tokens_c, "round-c-chunked")?;
+        let cold = round(&tokens_c, "round-c-cold", false).await?;
+        let chunked = round_chunked(&tokens_c, "round-c-chunked").await?;
         println!("[prefix-cache] chunked probe: cold={cold} chunked={chunked}");
         Some((cold, chunked))
     } else {
@@ -163,9 +165,9 @@ async fn main(input: String) -> Result<String> {
         }
     }
     let result = match gc {
-        Some((cold, chunked)) => format!(
-            "PREFIX_CACHE_E2E n={N} g0={g0} g1={g1} cold={cold} chunked={chunked}"
-        ),
+        Some((cold, chunked)) => {
+            format!("PREFIX_CACHE_E2E n={N} g0={g0} g1={g1} cold={cold} chunked={chunked}")
+        }
         None => format!("PREFIX_CACHE_E2E n={N} g0={g0} g1={g1}"),
     };
     println!("{result}");

@@ -3,11 +3,20 @@
 //! Singleton service that owns the pre-configured wasmtime Engine.
 //! Creates per-instance linkers with WASI, WASI HTTP, Pie API host bindings,
 //! and dynamically linked library dependencies.
+//!
+//! Instantiations run CONCURRENTLY (W3): the actor is only the spawn
+//! point — each Instantiate message spawns an independent task over the
+//! shared Engine (Send+Sync). The strictly sequential service loop used
+//! to serialize ~2-3 ms of per-instance link work across a 256-process
+//! fleet entry (~0.5-0.75 s of ramp with the GPU near-idle). Instances
+//! are mutually independent: each builds its own Store/ProcessCtx, and
+//! the component/dependency lookups are shared-read. Only the
+//! InstancePre cache is shared state, behind a Mutex.
 
 pub(super) mod dynamic;
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Result, anyhow};
 use tokio::sync::oneshot;
@@ -43,6 +52,8 @@ pub async fn instantiate(
     program_name: &ProgramName,
     output: OutputMode,
 ) -> Result<(Store<ProcessCtx>, Instance)> {
+    let timing_started =
+        crate::scheduler::fire_timing_enabled().then(crate::scheduler::fire_timing_now_us);
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Instantiate {
         process_id,
@@ -51,15 +62,32 @@ pub async fn instantiate(
         output,
         response: tx,
     })?;
-    rx.await?
+    let result = rx.await?;
+    if let Some(started_us) = timing_started {
+        let finished_us = crate::scheduler::fire_timing_now_us();
+        crate::scheduler::fire_timing_write(&serde_json::json!({
+            "schema": 1,
+            "source": "runtime",
+            "event": "process_instantiated",
+            "process_id": process_id,
+            "program": program_name.to_string(),
+            "success": result.is_ok(),
+            "instantiate_started_us": started_us,
+            "instantiate_finished_us": finished_us,
+            "instantiate_us": finished_us.saturating_sub(started_us),
+        }));
+    }
+    result
 }
 
 // ---- State ------------------------------------------------------------------
 
+type InstancePreCache = Arc<Mutex<HashMap<(ProgramName, u64), InstancePre<ProcessCtx>>>>;
+
 struct Linker {
     engine: Engine,
     policy: InstancePolicy,
-    instance_pre_cache: HashMap<(ProgramName, u64), InstancePre<ProcessCtx>>,
+    instance_pre_cache: InstancePreCache,
 }
 
 impl Linker {
@@ -67,29 +95,41 @@ impl Linker {
         Linker {
             engine: engine.clone(),
             policy,
-            instance_pre_cache: HashMap::new(),
+            instance_pre_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     async fn instantiate(
-        &mut self,
+        engine: Engine,
+        policy: InstancePolicy,
+        instance_pre_cache: InstancePreCache,
         process_id: ProcessId,
         username: String,
         program_name: &ProgramName,
         output: OutputMode,
     ) -> Result<(Store<ProcessCtx>, Instance)> {
+        // Diagnostic sub-stamps (iteration 76 provenance): split the span
+        // into program-service round-trips vs ctx/store vs link+instantiate.
+        let timing = crate::scheduler::fire_timing_enabled();
+        let mut stamps = [0u64; 4];
+        let stamp_t0 = timing.then(crate::scheduler::fire_timing_now_us);
         // 1. Get the main component (with snapshot status + python-runtime decl)
         let main = program::get_wasm_component(program_name)
             .await
             .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
+        if timing {
+            stamps[0] = crate::scheduler::fire_timing_now_us();
+        }
 
         // 2. Resolve dependencies and reconcile the python-runtime requirement
         //    across the main program and its direct dependencies. Also tracks
         //    whether any Python component in the graph was snapshotted — that
         //    determines which shared-module variant we use for instantiation.
-        let (dependency_components, python_runtime, any_snapshotted) = self
-            .resolve_dependencies_and_runtime(program_name, &main)
-            .await?;
+        let (dependency_components, python_runtime, any_snapshotted) =
+            Self::resolve_dependencies_and_runtime(program_name, &main).await?;
+        if timing {
+            stamps[1] = crate::scheduler::fire_timing_now_us();
+        }
         let component = main.component;
         let cacheable_instance_pre = dependency_components.is_empty()
             && python_runtime.is_none()
@@ -120,14 +160,17 @@ impl Linker {
             process_id,
             username,
             output,
-            &self.policy,
+            &policy,
             py_runtime_dir_for_ctx,
         )
         .await?;
-        let mut store = Store::new(&self.engine, process_ctx);
+        let mut store = Store::new(&engine, process_ctx);
+        if timing {
+            stamps[2] = crate::scheduler::fire_timing_now_us();
+        }
 
         // 5. Create and configure linker
-        let mut linker = WasmLinker::<ProcessCtx>::new(&self.engine);
+        let mut linker = WasmLinker::<ProcessCtx>::new(&engine);
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
 
@@ -171,7 +214,7 @@ impl Linker {
         // wasi:http is unrestricted (pre-DNS hostname allowlisting would
         // require a DNS shim — not in v1). This is the p2 link, kept for
         // StarlingMonkey JS guests that still import wasi:http@0.2.
-        if self.policy.network.allow {
+        if policy.network.allow {
             wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
                 .expect("Failed to link WASI HTTP");
         }
@@ -190,7 +233,7 @@ impl Linker {
         // 6. Instantiate library dependencies (dynamic linking)
         if !dependency_components.is_empty() {
             dynamic::instantiate_libraries(
-                &self.engine,
+                &engine,
                 &mut linker,
                 &mut store,
                 dependency_components,
@@ -199,15 +242,27 @@ impl Linker {
         }
 
         // 7. Instantiate the main component
+        let mut pre_hit = false;
         let instance = if cacheable_instance_pre {
             let cache_key = (program_name.clone(), main.generation);
-            let pre = match self.instance_pre_cache.get(&cache_key) {
-                Some(pre) => pre.clone(),
+            let cached = instance_pre_cache.lock().unwrap().get(&cache_key).cloned();
+            let pre = match cached {
+                Some(pre) => {
+                    pre_hit = true;
+                    pre
+                }
                 None => {
+                    // Built OUTSIDE the lock (pre-linking is CPU work);
+                    // concurrent misses build twice and last-insert wins —
+                    // both values are equivalent, so no double-checked
+                    // ceremony is needed.
                     let pre = linker
                         .instantiate_pre(&component)
                         .map_err(|e| anyhow!("Instantiation pre-link error: {e}"))?;
-                    self.instance_pre_cache.insert(cache_key, pre.clone());
+                    instance_pre_cache
+                        .lock()
+                        .unwrap()
+                        .insert(cache_key, pre.clone());
                     pre
                 }
             };
@@ -220,6 +275,20 @@ impl Linker {
                 .await
                 .map_err(|e| anyhow!("Instantiation error: {e}"))?
         };
+        if let Some(t0) = stamp_t0 {
+            stamps[3] = crate::scheduler::fire_timing_now_us();
+            crate::scheduler::fire_timing_write(&serde_json::json!({
+                "schema": 1,
+                "source": "runtime",
+                "event": "instantiate_breakdown",
+                "process_id": process_id,
+                "pre_hit": pre_hit,
+                "get_component_us": stamps[0].saturating_sub(t0),
+                "resolve_deps_us": stamps[1].saturating_sub(stamps[0]),
+                "ctx_store_us": stamps[2].saturating_sub(stamps[1]),
+                "instantiate_us": stamps[3].saturating_sub(stamps[2]),
+            }));
+        }
 
         Ok((store, instance))
     }
@@ -231,7 +300,6 @@ impl Linker {
     /// shared modules at instantiate time. Returns an error if multiple
     /// python-runtime declarations conflict.
     async fn resolve_dependencies_and_runtime(
-        &self,
         program_name: &ProgramName,
         main: &InstalledComponent,
     ) -> Result<(Vec<Component>, Option<String>, bool)> {
@@ -316,10 +384,45 @@ impl ServiceHandler for Linker {
                 output,
                 response,
             } => {
-                let _ = response.send(
-                    self.instantiate(process_id, username, &program_name, output)
-                        .await,
-                );
+                // Spawn, do not await (W3): the actor loop must never
+                // serialize link work — a fleet entry queues hundreds of
+                // instantiations at once and each is 2-3 ms of CPU. The
+                // spawned tasks share the Engine and the InstancePre
+                // cache; everything else they build is their own.
+                let engine = self.engine.clone();
+                let policy = self.policy.clone();
+                let cache = Arc::clone(&self.instance_pre_cache);
+                tokio::task::spawn(async move {
+                    let link_started_us = crate::scheduler::fire_timing_enabled()
+                        .then(crate::scheduler::fire_timing_now_us);
+                    let result = Linker::instantiate(
+                        engine,
+                        policy,
+                        cache,
+                        process_id,
+                        username,
+                        &program_name,
+                        output,
+                    )
+                    .await;
+                    if let Some(started_us) = link_started_us {
+                        // Splits the public wrapper's `instantiate_us`
+                        // (queue + link) into its link-work part — the W3
+                        // gate reads this to prove the residual is work,
+                        // not actor queue wait.
+                        crate::scheduler::fire_timing_write(&serde_json::json!({
+                            "schema": 1,
+                            "source": "runtime",
+                            "event": "process_link_work",
+                            "process_id": process_id.to_string(),
+                            "success": result.is_ok(),
+                            "link_started_us": started_us,
+                            "link_us": crate::scheduler::fire_timing_now_us()
+                                .saturating_sub(started_us),
+                        }));
+                    }
+                    let _ = response.send(result);
+                });
             }
         }
     }

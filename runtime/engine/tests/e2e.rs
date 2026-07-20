@@ -164,13 +164,10 @@ fn direct_ptir_mixed_outputs_execute_end_to_end() {
 }
 
 #[test]
-fn prefix_cache_grafts_and_trims_second_prefill() {
+fn explicit_prefix_index_submits_only_the_suffix() {
     let s = state();
-    // Two identical CANONICAL 24-token prefills over fresh working sets in
-    // one process. Round 1's WorkingSet drop retains the canonical path;
-    // round 2's fire must graft the cached full page (16 tokens) and launch
-    // only the 8-token suffix — asserted on the dummy driver's launch-shape
-    // trace (24 and 8 are unique to this inferlet across the e2e suite).
+    // Round 0 publishes one full page under an explicit key; round 1 loads
+    // that WorkingSet and submits only the 8-token suffix.
     let result = spawn_and_capture(s, "prefix-cache-e2e", "{}".into());
     assert!(
         result
@@ -184,7 +181,20 @@ fn prefix_cache_grafts_and_trims_second_prefill() {
         .into_iter()
         .filter(|op| op.starts_with("launch-shape"))
         .collect();
-    let cold = shapes.iter().position(|op| op.contains("tokens=24"));
+    // Match this inferlet's PER-PROGRAM spans (`per=[..]`): the shared-engine
+    // suite runs concurrently and the wait-all quorum may co-batch another
+    // test's fire into the same launch, so batch totals are not stable.
+    let per_counts = |op: &str| -> Vec<u32> {
+        op.split_once("per=[")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| {
+                list.split(',')
+                    .filter_map(|count| count.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let cold = shapes.iter().position(|op| per_counts(op).contains(&24));
     assert!(
         cold.is_some(),
         "round 0 should prefill all 24 tokens: {shapes:?}"
@@ -192,8 +202,8 @@ fn prefix_cache_grafts_and_trims_second_prefill() {
     assert!(
         shapes[cold.unwrap() + 1..]
             .iter()
-            .any(|op| op.contains("tokens=8")),
-        "round 1 should graft the cached page and fire only the 8-token \
+            .any(|op| per_counts(op).contains(&8)),
+        "round 1 should load the indexed page and fire only the 8-token \
          suffix: {shapes:?}"
     );
 }

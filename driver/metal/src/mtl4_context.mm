@@ -14,6 +14,7 @@
 #import <Foundation/Foundation.h>
 
 #include "mtl4_context.hpp"
+#include "observability.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -23,10 +24,14 @@
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
+#include <limits>
+#include <map>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace pie::metal {
 
@@ -71,6 +76,7 @@ struct RawMetalContext::Impl {
     id<MTLHeap>              heap  = nil;
     id<MTLResidencySet>      rs    = nil;
     id<MTL4Compiler>         compiler = nil;
+    id<MTL4PipelineDataSetSerializer> pipeline_serializer = nil;
     id<MTLSharedEvent>       event = nil;
     uint64_t                 ev_val = 0;
 
@@ -79,16 +85,29 @@ struct RawMetalContext::Impl {
     bool   resident  = false;         // make_resident() idempotency guard
 
     NSMutableArray*           retained = nil;  // keeps PSOs / sub-buffers alive
+    std::unordered_set<void*> retained_psos;
     NSMutableDictionary*      argtables = nil;  // NSNumber(argkey) -> id<MTL4ArgumentTable>
     std::unordered_set<uint64_t> bound_arg_slots;
     std::unordered_map<uint64_t, uint64_t> bound_arg_addresses;
+    std::unordered_map<void*, size_t> external_allocations;
+    bool saw_ptir_compile = false;
+    bool last_ptir_fast_math_disabled = false;
+    std::atomic<bool> force_wait_timeout_once{false};
 
-    // Phase 3 (review item 4): standalone-buffer allocation accounting (the
-    // paged-KV pool buffers only, NOT heap sub-allocations). Kept exact by
-    // create_standalone_buffer / release_standalone_buffer so a lifecycle
-    // probe can prove grow/shrink does not leak.
+    // Standalone-buffer allocation accounting (all non-heap buffers,
+    // including buffers retained by the transient pool).
     size_t standalone_count = 0;
     size_t standalone_bytes = 0;
+
+    struct TransientAllocation {
+        size_t size_class = 0;
+        bool in_use = false;
+    };
+    std::map<size_t, std::vector<SlotHandle>> transient_free;
+    std::unordered_map<void*, TransientAllocation> transient_allocations;
+    TransientBufferPoolStats transient_stats{
+        .capacity_bytes = size_t{1} << 30,
+    };
 
     StepState step;  // active step (during run_step)
 
@@ -111,7 +130,7 @@ id<MTL4ArgumentTable> RawMetalContext::Impl::argtable_for(int ordinal, bool crea
     id<MTL4ArgumentTable> t = argtables[key];
     if (t == nil && create) {
         MTL4ArgumentTableDescriptor* ad = [MTL4ArgumentTableDescriptor new];
-        ad.maxBufferBindCount = 16;  // widest kernel (Sdpa=8) with margin
+        ad.maxBufferBindCount = 31;  // M1 readiness: status + lane + up to 29 channels
         NSError* e = nil;
         t = [dev newArgumentTableWithDescriptor:ad error:&e];
         if (t == nil) {
@@ -203,7 +222,14 @@ std::unique_ptr<RawMetalContext> RawMetalContext::create(size_t heap_bytes) {
     I.event    = [I.dev newSharedEvent];
 
     NSError* e = nil;
+    MTL4PipelineDataSetSerializerDescriptor* serializer_descriptor =
+        [MTL4PipelineDataSetSerializerDescriptor new];
+    serializer_descriptor.configuration =
+        MTL4PipelineDataSetSerializerConfigurationCaptureBinaries;
+    I.pipeline_serializer =
+        [I.dev newPipelineDataSetSerializerWithDescriptor:serializer_descriptor];
     MTL4CompilerDescriptor* cd = [MTL4CompilerDescriptor new];
+    cd.pipelineDataSetSerializer = I.pipeline_serializer;
     I.compiler = [I.dev newCompilerWithDescriptor:cd error:&e];
     if (I.compiler == nil) {
         fprintf(stderr, "[pie-metal] compiler create failed: %s\n",
@@ -289,6 +315,176 @@ SlotHandle RawMetalContext::create_standalone_buffer(size_t size) {
     return h;
 }
 
+SlotHandle RawMetalContext::acquire_transient_buffer(size_t size) {
+    auto& I = *impl_;
+    SlotHandle result;
+    if (size == 0) return result;
+
+    size_t size_class = 256;
+    while (size_class < size) {
+        if (size_class > std::numeric_limits<size_t>::max() / 2) {
+            ++I.transient_stats.allocation_failures;
+            return result;
+        }
+        size_class *= 2;
+    }
+    if (size_class > I.transient_stats.capacity_bytes) {
+        ++I.transient_stats.allocation_failures;
+        return result;
+    }
+
+    auto matching = I.transient_free.find(size_class);
+    if (matching != I.transient_free.end() &&
+        !matching->second.empty()) {
+        result = matching->second.back();
+        matching->second.pop_back();
+        I.transient_allocations[result.buffer].in_use = true;
+        ++I.transient_stats.reuse_hits;
+        --I.transient_stats.cached_buffers;
+        I.transient_stats.cached_bytes -= result.size;
+        ++I.transient_stats.in_use_buffers;
+        I.transient_stats.in_use_bytes += result.size;
+        return result;
+    }
+
+    auto release_cached = [&](SlotHandle handle) {
+        I.transient_allocations.erase(handle.buffer);
+        --I.transient_stats.resident_buffers;
+        I.transient_stats.resident_bytes -= handle.size;
+        --I.transient_stats.cached_buffers;
+        I.transient_stats.cached_bytes -= handle.size;
+        ++I.transient_stats.evictions;
+        release_standalone_buffer(handle);
+    };
+    while (I.transient_stats.resident_bytes + size_class >
+           I.transient_stats.capacity_bytes) {
+        auto bucket = I.transient_free.end();
+        while (bucket != I.transient_free.begin()) {
+            --bucket;
+            if (!bucket->second.empty()) break;
+        }
+        if (bucket == I.transient_free.end() || bucket->second.empty()) break;
+        SlotHandle evicted = bucket->second.back();
+        bucket->second.pop_back();
+        release_cached(evicted);
+    }
+
+    if (I.transient_stats.resident_bytes + size_class >
+        I.transient_stats.capacity_bytes) {
+        ++I.transient_stats.allocation_failures;
+        return result;
+    }
+    result = create_standalone_buffer(size_class);
+    if (!result.valid()) {
+        ++I.transient_stats.allocation_failures;
+        return result;
+    }
+    I.transient_allocations.emplace(
+        result.buffer,
+        Impl::TransientAllocation{
+            .size_class = size_class,
+            .in_use = true,
+        });
+    ++I.transient_stats.allocations;
+    ++I.transient_stats.resident_buffers;
+    I.transient_stats.resident_bytes += size_class;
+    I.transient_stats.peak_resident_bytes = std::max(
+        I.transient_stats.peak_resident_bytes,
+        I.transient_stats.resident_bytes);
+    ++I.transient_stats.in_use_buffers;
+    I.transient_stats.in_use_bytes += result.size;
+    return result;
+}
+
+void RawMetalContext::recycle_transient_buffer(const SlotHandle& h) {
+    auto& I = *impl_;
+    const auto allocation = I.transient_allocations.find(h.buffer);
+    if (allocation == I.transient_allocations.end() ||
+        !allocation->second.in_use) {
+        return;
+    }
+    allocation->second.in_use = false;
+    --I.transient_stats.in_use_buffers;
+    I.transient_stats.in_use_bytes -= allocation->second.size_class;
+    ++I.transient_stats.recycles;
+
+    auto& bucket = I.transient_free[allocation->second.size_class];
+    constexpr size_t kMaxCachedPerSizeClass = 8;
+    if (bucket.size() < kMaxCachedPerSizeClass &&
+        I.transient_stats.resident_bytes <=
+            I.transient_stats.capacity_bytes) {
+        bucket.push_back(h);
+        ++I.transient_stats.cached_buffers;
+        I.transient_stats.cached_bytes += allocation->second.size_class;
+        return;
+    }
+
+    const size_t bytes = allocation->second.size_class;
+    I.transient_allocations.erase(allocation);
+    --I.transient_stats.resident_buffers;
+    I.transient_stats.resident_bytes -= bytes;
+    ++I.transient_stats.evictions;
+    release_standalone_buffer(h);
+}
+
+TransientBufferPoolStats
+RawMetalContext::transient_buffer_pool_stats() const {
+    return impl_->transient_stats;
+}
+
+void RawMetalContext::set_transient_buffer_pool_limit_for_test(size_t bytes) {
+    auto& I = *impl_;
+    I.transient_stats.capacity_bytes = std::max<size_t>(bytes, 256);
+    while (I.transient_stats.resident_bytes >
+           I.transient_stats.capacity_bytes) {
+        auto bucket = I.transient_free.end();
+        while (bucket != I.transient_free.begin()) {
+            --bucket;
+            if (!bucket->second.empty()) break;
+        }
+        if (bucket == I.transient_free.end() || bucket->second.empty()) break;
+        SlotHandle evicted = bucket->second.back();
+        bucket->second.pop_back();
+        I.transient_allocations.erase(evicted.buffer);
+        --I.transient_stats.resident_buffers;
+        I.transient_stats.resident_bytes -= evicted.size;
+        --I.transient_stats.cached_buffers;
+        I.transient_stats.cached_bytes -= evicted.size;
+        ++I.transient_stats.evictions;
+        release_standalone_buffer(evicted);
+    }
+}
+
+void RawMetalContext::use_external_buffer(const SlotHandle& h) {
+    auto& I = *impl_;
+    if (h.buffer == nullptr) return;
+    auto [entry, inserted] =
+        I.external_allocations.emplace(h.buffer, 0);
+    ++entry->second;
+    if (!inserted) return;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)h.buffer;
+    [I.rs addAllocation:buffer];
+    [I.rs commit];
+    if (I.resident) [I.rs requestResidency];
+}
+
+void RawMetalContext::release_external_buffer(const SlotHandle& h) {
+    auto& I = *impl_;
+    if (h.buffer == nullptr) return;
+    const auto entry = I.external_allocations.find(h.buffer);
+    if (entry == I.external_allocations.end()) return;
+    if (--entry->second != 0) return;
+    I.external_allocations.erase(entry);
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)h.buffer;
+    [I.rs removeAllocation:buffer];
+    [I.rs commit];
+    if (I.resident) [I.rs requestResidency];
+}
+
+size_t RawMetalContext::external_buffer_count() const {
+    return impl_->external_allocations.size();
+}
+
 void RawMetalContext::release_standalone_buffer(const SlotHandle& h) {
     auto& I = *impl_;
     if (h.buffer == nullptr) return;
@@ -350,14 +546,35 @@ uint64_t RawMetalContext::arg_slot_address(int ordinal, uint8_t bind_index) cons
     return it == impl_->bound_arg_addresses.end() ? 0 : it->second;
 }
 
-Pso RawMetalContext::compile_pso(const std::string& src, const std::string& fn,
-                                 std::string* error) {
+void RawMetalContext::release_argtable_ordinal(int ordinal) {
     auto& I = *impl_;
+    [I.argtables removeObjectForKey:@(argkey(ordinal))];
+    for (auto iterator = I.bound_arg_slots.begin();
+         iterator != I.bound_arg_slots.end();) {
+        if (static_cast<std::uint32_t>(*iterator >> 8) ==
+            static_cast<std::uint32_t>(ordinal)) {
+            I.bound_arg_addresses.erase(*iterator);
+            iterator = I.bound_arg_slots.erase(iterator);
+        } else {
+            ++iterator;
+        }
+    }
+}
+
+namespace {
+
+Pso compile_pso_impl(
+    RawMetalContext::Impl& I,
+    const std::string& src,
+    const std::string& fn,
+    MTLCompileOptions* options,
+    MTL4CompilerTaskOptions* task_options,
+    std::string* error) {
     Pso out;
     NSError* e = nil;
     id<MTLLibrary> lib =
         [I.dev newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()]
-                            options:nil
+                            options:options
                               error:&e];
     if (lib == nil) {
         if (error) *error = e.localizedDescription.UTF8String;
@@ -370,7 +587,7 @@ Pso RawMetalContext::compile_pso(const std::string& src, const std::string& fn,
     pd.computeFunctionDescriptor = fd;
     id<MTLComputePipelineState> pso =
         [I.compiler newComputePipelineStateWithDescriptor:pd
-                                      compilerTaskOptions:nil
+                                      compilerTaskOptions:task_options
                                                     error:&e];
     if (pso == nil) {
         if (error) *error = e.localizedDescription.UTF8String;
@@ -378,20 +595,192 @@ Pso RawMetalContext::compile_pso(const std::string& src, const std::string& fn,
     }
     [I.retained addObject:pso];
     out.obj = (__bridge void*)pso;
+    I.retained_psos.insert(out.obj);
     return out;
+}
+
+bool read_metal_source(
+    const std::string& path,
+    std::string& source,
+    std::string* error) {
+    NSError* e = nil;
+    NSString* src = [NSString
+        stringWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]
+                        encoding:NSUTF8StringEncoding
+                           error:&e];
+    if (src == nil) {
+        if (error) {
+            *error =
+                std::string("read failed: ") + e.localizedDescription.UTF8String;
+        }
+        return false;
+    }
+    source = src.UTF8String;
+    return true;
+}
+
+void configure_ptir_math_options(
+    MTLCompileOptions* options,
+    bool& strict_math) {
+    if (@available(macOS 15.0, *)) {
+        options.mathMode = MTLMathModeSafe;
+        options.mathFloatingPointFunctions =
+            MTLMathFloatingPointFunctionsPrecise;
+        strict_math = options.mathMode == MTLMathModeSafe;
+        return;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    options.fastMathEnabled = NO;
+    strict_math = options.fastMathEnabled == NO;
+#pragma clang diagnostic pop
+}
+
+}  // namespace
+
+bool read_ptir_msl_source(
+    const std::string& path,
+    std::string& source,
+    std::string* error) {
+    if (!read_metal_source(path, source, error)) return false;
+    constexpr std::string_view include =
+        "#include \"ptir_rng.generated.metal\"";
+    const std::size_t first = source.find(include);
+    if (first == std::string::npos) return true;
+
+    const std::size_t separator = path.find_last_of("/\\");
+    const std::string preamble_path =
+        (separator == std::string::npos
+             ? std::string{}
+             : path.substr(0, separator + 1)) +
+        "ptir_rng.generated.metal";
+    std::string preamble;
+    if (!read_metal_source(preamble_path, preamble, error)) return false;
+    for (std::size_t position = first;
+         position != std::string::npos;
+         position = source.find(include, position + preamble.size())) {
+        source.replace(position, include.size(), preamble);
+    }
+    return true;
+}
+
+Pso RawMetalContext::compile_pso(const std::string& src, const std::string& fn,
+                                  std::string* error) {
+    return compile_pso_impl(*impl_, src, fn, nil, nil, error);
 }
 
 Pso RawMetalContext::compile_pso_from_file(const std::string& path, const std::string& fn,
                                            std::string* error) {
-    NSError* e = nil;
-    NSString* src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]
-                                              encoding:NSUTF8StringEncoding
-                                                 error:&e];
-    if (src == nil) {
-        if (error) *error = std::string("read failed: ") + e.localizedDescription.UTF8String;
+    std::string source;
+    return read_metal_source(path, source, error)
+               ? compile_pso(source, fn, error)
+               : Pso{};
+}
+
+Pso RawMetalContext::compile_ptir_pso(
+    const std::string& src,
+    const std::string& fn,
+    std::string* error) {
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    impl_->saw_ptir_compile = true;
+    configure_ptir_math_options(
+        options, impl_->last_ptir_fast_math_disabled);
+    return compile_pso_impl(*impl_, src, fn, options, nil, error);
+}
+
+Pso RawMetalContext::compile_ptir_pso_from_file(
+    const std::string& path,
+    const std::string& fn,
+    std::string* error) {
+    std::string source;
+    return read_ptir_msl_source(path, source, error)
+               ? compile_ptir_pso(source, fn, error)
+               : Pso{};
+}
+
+bool RawMetalContext::last_ptir_compile_disabled_fast_math() const {
+    return impl_->saw_ptir_compile && impl_->last_ptir_fast_math_disabled;
+}
+
+Pso RawMetalContext::compile_ptir_pso_cached(
+    const std::string& source,
+    const std::string& function,
+    const std::string& archive_path,
+    bool* cache_hit,
+    std::string* error) {
+    if (cache_hit != nullptr) *cache_hit = false;
+    MTL4CompilerTaskOptions* task = nil;
+    id<MTL4Archive> archive = nil;
+    if (!archive_path.empty()) {
+        NSURL* url = [NSURL fileURLWithPath:
+            [NSString stringWithUTF8String:archive_path.c_str()]];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
+            NSError* archive_error = nil;
+            archive = [impl_->dev newArchiveWithURL:url error:&archive_error];
+            if (archive != nil) {
+                task = [MTL4CompilerTaskOptions new];
+                task.lookupArchives = @[archive];
+                if (cache_hit != nullptr) *cache_hit = true;
+            }
+        }
+    }
+
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    impl_->saw_ptir_compile = true;
+    configure_ptir_math_options(
+        options, impl_->last_ptir_fast_math_disabled);
+    Pso result =
+        compile_pso_impl(*impl_, source, function, options, task, error);
+    if (!result.valid() || archive_path.empty() || archive != nil ||
+        impl_->pipeline_serializer == nil) {
+        return result;
+    }
+
+    NSURL* url = [NSURL fileURLWithPath:
+        [NSString stringWithUTF8String:archive_path.c_str()]];
+    NSError* serialize_error = nil;
+    if (![impl_->pipeline_serializer
+            serializeAsArchiveAndFlushToURL:url
+                                      error:&serialize_error]) {
+        if (error != nullptr) {
+            *error = std::string("pipeline archive: ") +
+                     serialize_error.localizedDescription.UTF8String;
+        }
+        release_pso(result);
         return Pso{};
     }
-    return compile_pso(src.UTF8String, fn, error);
+    return result;
+}
+
+void RawMetalContext::release_pso(Pso pso) {
+    if (!pso.valid() || impl_->retained_psos.erase(pso.obj) == 0) return;
+    id<MTLComputePipelineState> object =
+        (__bridge id<MTLComputePipelineState>)pso.obj;
+    [impl_->retained removeObject:object];
+}
+
+size_t RawMetalContext::retained_pso_count() const {
+    return impl_->retained_psos.size();
+}
+
+std::uint64_t RawMetalContext::device_cache_id() const {
+    const char* name = impl_->dev.name.UTF8String;
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    if (name != nullptr) {
+        for (const unsigned char* cursor =
+                 reinterpret_cast<const unsigned char*>(name);
+             *cursor != 0;
+             ++cursor) {
+            hash ^= *cursor;
+            hash *= 0x100000001b3ULL;
+        }
+    }
+    const std::uint64_t registry = impl_->dev.registryID;
+    for (int byte = 0; byte < 8; ++byte) {
+        hash ^= static_cast<std::uint8_t>(registry >> (byte * 8));
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
 }
 
 void* RawMetalContext::create_timestamp_heap(uint32_t count) {
@@ -422,9 +811,17 @@ void RawMetalContext::resolve_timestamps(void* heap, uint32_t count, uint64_t* o
         fprintf(stderr, "[pie-metal] timestamp resolve returned nil (count=%u)\n", count);
         return;
     }
+
     const auto* entries = static_cast<const MTL4TimestampHeapEntry*>(data.bytes);
     const uint32_t n = std::min<uint32_t>(count, uint32_t(data.length / sizeof(MTL4TimestampHeapEntry)));
     for (uint32_t i = 0; i < n; ++i) out[i] = entries[i].timestamp;
+}
+
+void RawMetalContext::release_timestamp_heap(void* heap) {
+    if (heap == nullptr) return;
+    id<MTL4CounterHeap> counter =
+        (__bridge id<MTL4CounterHeap>)heap;
+    [impl_->retained removeObject:counter];
 }
 
 StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& encode_fn,
@@ -451,13 +848,32 @@ StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& en
 
     [I.queue commit:&cb count:1];
     [I.queue signalEvent:I.event value:++I.ev_val];
-    [I.event waitUntilSignaledValue:I.ev_val timeoutMS:5000];
+    const auto wait_begin = M0TimingCounters::Clock::now();
+    BOOL signaled = I.force_wait_timeout_once.exchange(false)
+                        ? NO
+                        : [I.event waitUntilSignaledValue:I.ev_val
+                                               timeoutMS:5000];
+    tm.timed_out = signaled == NO;
+    if (tm.timed_out) {
+        m0_timing_counters().record_forward_wait_timeout();
+    }
+    while (signaled == NO) {
+        signaled = [I.event waitUntilSignaledValue:I.ev_val
+                                        timeoutMS:5000];
+    }
+    tm.completed = true;
+    m0_timing_counters().record_forward_wait(
+        M0TimingCounters::Clock::now() - wait_begin);
     double t2 = nowms();
 
     I.step.en = nil;
     tm.encode_ms   = t1 - t0;
     tm.gpu_exec_ms = t2 - t1;
     return tm;
+}
+
+void RawMetalContext::force_next_wait_timeout_for_test() {
+    impl_->force_wait_timeout_once.store(true);
 }
 
 uint64_t RawMetalContext::commit_step_async(const std::function<void(StepEncoder&)>& encode_fn,
@@ -496,7 +912,8 @@ uint64_t RawMetalContext::commit_step_async_dep(const std::function<void(StepEnc
 }
 
 void RawMetalContext::sync_event(uint64_t value) {
-    [impl_->event waitUntilSignaledValue:value timeoutMS:5000];
+    while (![impl_->event waitUntilSignaledValue:value timeoutMS:5000]) {
+    }
 }
 
 uint64_t RawMetalContext::last_event() const { return impl_->ev_val; }

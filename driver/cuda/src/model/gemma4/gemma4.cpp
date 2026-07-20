@@ -1,4 +1,6 @@
 #include "model/gemma4/gemma4.hpp"
+#include "model/precomputed_embeddings.hpp"
+#include "model/stage_hooks.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -37,19 +39,6 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-thread_local bool g_logits_argmax_only = false;
-thread_local std::int32_t* g_fused_argmax_output = nullptr;
-thread_local bool g_fused_argmax_done = false;
-
-bool fused_lmhead_argmax_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_FUSED_LMHEAD_ARGMAX");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
 bool gemma4_forward_profile_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_GEMMA4_FORWARD_PROFILE");
@@ -83,7 +72,6 @@ struct Gemma4ForwardProfile {
     bool decode_path = false;
     bool row_decode_path = false;
     bool compact_logits = false;
-    bool logits_argmax_only = false;
 
     float total_gpu_ms = 0.f;
     float embed_ms = 0.f;
@@ -177,7 +165,6 @@ void maybe_print_gemma4_forward_profile(
         << " decode_path=" << (p.decode_path ? 1 : 0)
         << " row_decode=" << (p.row_decode_path ? 1 : 0)
         << " compact_logits=" << (p.compact_logits ? 1 : 0)
-        << " logits_argmax_only=" << (p.logits_argmax_only ? 1 : 0)
         << " total_gpu_ms=" << p.total_gpu_ms
         << " embed_ms=" << p.embed_ms
         << " ple_inputs_ms=" << p.ple_inputs_ms
@@ -527,19 +514,6 @@ bool prepare_row_decode_kv_table(
 }
 
 }  // namespace
-
-void set_gemma4_logits_argmax_only(bool enabled) {
-    g_logits_argmax_only = enabled;
-}
-
-void set_gemma4_fused_argmax_output(std::int32_t* ptr) {
-    g_fused_argmax_output = ptr;
-    g_fused_argmax_done = false;
-}
-
-bool gemma4_fused_argmax_done() {
-    return g_fused_argmax_done;
-}
 
 namespace {
 
@@ -1477,7 +1451,8 @@ void gemma4_forward_paged(
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
     const Gemma4VisionInputs* vision_in,
-    const Gemma4AudioInputs* audio_in)
+    const Gemma4AudioInputs* audio_in,
+    const PrecomputedEmbeddingInputs* precomputed_embeddings)
 {
     const int H        = cfg.hidden_size;
     const int L        = cfg.num_hidden_layers;
@@ -1551,6 +1526,12 @@ void gemma4_forward_paged(
     if (audio_in != nullptr && audio_in->num_clips > 0) {
         scatter_gemma4_audio(*audio_in, static_cast<__nv_bfloat16*>(ws.y.data()),
                              N, H, stream);
+    }
+    if (precomputed_embeddings != nullptr) {
+        scatter_precomputed_embeddings(
+            *precomputed_embeddings,
+            static_cast<std::uint16_t*>(ws.y.data()),
+            N, H, stream);
     }
 
     // ── 2. Per-layer inputs (PLE) ────────────────────────────────────────
@@ -1712,6 +1693,7 @@ void gemma4_forward_paged(
                 ws.norm_x.data(), layer.qkv_proj_fused->data(),
                 ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
             const bool can_fuse_packed_qkv_post =
+                active_stage_hooks == nullptr &&
                 qk_norm_enabled && !partial && !dbg_dumps_enabled() &&
                 kv_view.is_native_bf16() &&
                 (use_row_decode_path || use_decode_path);
@@ -1762,6 +1744,11 @@ void gemma4_forward_paged(
                 }
             }
         }
+        invoke_stage_hook(
+            StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(l), stream);
 
         // Pre-norm dumps for parity.
         if (l == 0 && !layer.is_shared) {
@@ -1840,7 +1827,6 @@ void gemma4_forward_paged(
             dump_l0("q_post_norm", ws.q.data(),
                     static_cast<std::size_t>(N) * num_q_heads_local * d);
         }
-
         // KV write only on non-shared layers — shared layers attend
         // through the source slot's already-populated pages.
         if (!layer.is_shared && !qkv_post_fused) {
@@ -1936,6 +1922,11 @@ void gemma4_forward_paged(
                         /*sm_scale=*/1.0f);
                 }
             });
+        invoke_stage_hook(
+            StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            static_cast<std::uint32_t>(l), stream);
 
         dump_l0("attn_out", ws.attn_out.data(),
                 static_cast<std::size_t>(N) * Hq);
@@ -2229,62 +2220,19 @@ void gemma4_forward_paged(
         profile.compact_logits = compact_logits;
         profile.lm_head_rows = lm_head_rows;
     }
-    const bool use_fused_lmhead_argmax =
-        fused_lmhead_argmax_enabled() &&
-        g_logits_argmax_only && g_fused_argmax_output != nullptr &&
-        lm_head_rows > 0 && !dbg_dumps_enabled();
-    if (use_fused_lmhead_argmax) {
-        profile_gemma4_cuda_stage(profile, profile.lm_head_ms, stream, [&] {
-            constexpr int MAX_TILES = 8;
-            const int num_tiles = std::clamp(V / 32768, 1, MAX_TILES);
-            const int tile_size = (V + num_tiles - 1) / num_tiles;
-            const auto* lm_head_bf16 =
-                static_cast<const std::uint16_t*>(w.lm_head->data());
-            auto* pairs = reinterpret_cast<std::uint64_t*>(
-                ws.greedy_pairs_all.data());
-            for (int tile = 0; tile < num_tiles; ++tile) {
-                const int tile_start = tile * tile_size;
-                const int this_tile = std::min(tile_size, V - tile_start);
-                if (this_tile <= 0) break;
-                const void* tile_w =
-                    lm_head_bf16 +
-                    static_cast<long long>(tile_start) * H;
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    lm_head_input, tile_w, ws.logits.data(),
-                    lm_head_rows, this_tile, H);
-                kernels::launch_argmax_bf16_tile_pair(
-                    ws.logits.data(),
-                    pairs + static_cast<std::size_t>(tile) * lm_head_rows,
-                    lm_head_rows, this_tile, tile_start, stream);
-            }
-            kernels::launch_select_global_argmax_pairs(
-                pairs, g_fused_argmax_output,
-                lm_head_rows, num_tiles, stream);
+    profile_gemma4_cuda_stage(profile, profile.lm_head_ms, stream, [&] {
+        ops::gemm_act_x_wt_bf16(cublas.handle(),
+            lm_head_input, w.lm_head->data(), ws.logits.data(),
+            lm_head_rows, V, H);
+    });
+    if (fwd_cfg.final_logit_softcap > 0.f) {
+        profile_gemma4_cuda_stage(profile, profile.softcap_ms, stream, [&] {
+            kernels::launch_logit_softcap_bf16(
+                ws.logits.data(), fwd_cfg.final_logit_softcap,
+                static_cast<std::size_t>(lm_head_rows) * V, stream);
         });
-        g_fused_argmax_done = true;
-        if (profile.enabled) {
-            profile.logits_argmax_only = true;
-        }
-    } else {
-        profile_gemma4_cuda_stage(profile, profile.lm_head_ms, stream, [&] {
-            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                lm_head_input, w.lm_head->data(), ws.logits.data(),
-                lm_head_rows, V, H);
-        });
-        const bool skip_final_softcap =
-            g_logits_argmax_only && !dbg_dumps_enabled();
-        if (profile.enabled) {
-            profile.logits_argmax_only = g_logits_argmax_only;
-        }
-        if (fwd_cfg.final_logit_softcap > 0.f && !skip_final_softcap) {
-            profile_gemma4_cuda_stage(profile, profile.softcap_ms, stream, [&] {
-                kernels::launch_logit_softcap_bf16(
-                    ws.logits.data(), fwd_cfg.final_logit_softcap,
-                    static_cast<std::size_t>(lm_head_rows) * V, stream);
-            });
-        }
     }
-    if (lm_head_rows > 0 && !use_fused_lmhead_argmax) {
+    if (lm_head_rows > 0) {
         dbg_sync_dump_bf16("logits_last",
             static_cast<const std::uint16_t*>(ws.logits.data()) +
                 static_cast<std::size_t>(lm_head_rows - 1) * V,

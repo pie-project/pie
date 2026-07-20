@@ -9,36 +9,16 @@ use std::time::{Duration, Instant};
 use pie_engine::inferlet::process::ProcessId;
 use pie_engine::inferlet::program::ProgramName;
 
+const TARGET: &str = "wasm32-wasip2";
+
 /// Root directory of the test inferlets workspace.
 fn inferlets_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/inferlets")
 }
 
-fn target(name: &str) -> &'static str {
-    // Guests using the `inferlet::ptir` bridge build as wasip2: the bridge's
-    // channel registry pulls std `HashMap`, whose wasip3 std imports
-    // `wasi:random/insecure-seed@0.3.0-rc-2026-03-15` — version-mismatched with
-    // the engine wasmtime's `@0.3.0`, so the component fails to instantiate.
-    if matches!(
-        name,
-        "direct-channel-e2e"
-            | "direct-mixed-e2e"
-            | "generate"
-            | "grammar"
-            | "runahead"
-            | "lowlevel-chat"
-            | "specverify"
-            | "mtpverify"
-    ) {
-        "wasm32-wasip2"
-    } else {
-        "wasm32-wasip3"
-    }
-}
-
 fn build_inferlet(name: &str) {
     let status = Command::new("cargo")
-        .args(["build", "--target", target(name), "-p", name])
+        .args(["build", "--target", TARGET, "-p", name])
         .current_dir(inferlets_dir())
         .status()
         .unwrap_or_else(|error| panic!("failed to build test inferlet {name}: {error}"));
@@ -63,7 +43,7 @@ pub fn inferlet_wasm_path(name: &str) -> PathBuf {
     // Cargo replaces hyphens with underscores in output filenames
     let filename = format!("{}.wasm", name.replace('-', "_"));
     inferlets_dir()
-        .join(format!("target/{}/debug", target(name)))
+        .join(format!("target/{TARGET}/debug"))
         .join(filename)
 }
 

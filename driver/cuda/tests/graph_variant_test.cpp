@@ -16,6 +16,7 @@
 #include "batch/graph_variant.hpp"
 
 using pie_cuda_driver::gv_old_encode_for_proof;
+using pie_cuda_driver::graph_replay_has_no_host_resets;
 using pie_cuda_driver::make_graph_variant;
 
 namespace {
@@ -38,22 +39,36 @@ int main() {
           "OLD encoding ALIASES graph_layout=128 with rs_verify");
 
     // ── 2. The FIX keeps those distinct ──
-    check(make_graph_variant(false, false, false, false, false, 64u) !=
-              make_graph_variant(false, false, false, true, false, 0u),
+    check(make_graph_variant(false, false, 64u) !=
+              make_graph_variant(true, false, 0u),
           "NEW: graph_layout=64 is DISTINCT from small_spec");
-    check(make_graph_variant(false, false, false, false, false, 128u) !=
-              make_graph_variant(false, false, false, false, true, 0u),
+    check(make_graph_variant(false, false, 128u) !=
+              make_graph_variant(false, true, 0u),
           "NEW: graph_layout=128 is DISTINCT from rs_verify");
 
-    // ── 3. NEW encoding: exhaustive uniqueness over (5 flags) × (layout 0..255) ──
+    const std::uint8_t continuing[] = {0, 0};
+    const std::uint8_t resetting[] = {0, 1};
+    check(
+        graph_replay_has_no_host_resets(true, continuing, 2) &&
+            !graph_replay_has_no_host_resets(true, resetting, 2) &&
+            graph_replay_has_no_host_resets(false, nullptr, 2),
+        "Qwen graph replay is disabled whenever a host reset is requested");
+    const auto root_tp_key =
+        make_graph_variant(false, false, 7);
+    const auto follower_tp_key =
+        make_graph_variant(false, false, 7);
+    check(
+        root_tp_key == follower_tp_key,
+        "TP root/follower keys use identical actual capture flags");
+
+    // ── 3. NEW encoding: exhaustive uniqueness over (2 flags) × (layout 0..255) ──
     {
         std::set<std::uint32_t> seen;
         bool unique = true;
         for (std::uint32_t layout = 0; layout <= 255u; ++layout) {
-            for (int f = 0; f < 32; ++f) {
+            for (int f = 0; f < 4; ++f) {
                 const std::uint32_t v = make_graph_variant(
-                    (f & 1) != 0, (f & 2) != 0, (f & 4) != 0,
-                    (f & 8) != 0, (f & 16) != 0, layout);
+                    (f & 1) != 0, (f & 2) != 0, layout);
                 if (!seen.insert(v).second) unique = false;
             }
         }

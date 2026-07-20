@@ -16,11 +16,12 @@
 //   2. Rejection honesty (G1.5): `classify_exec_plan` over hand-built traces
 //      proves HostInput / per-layer taps / unsupported intrinsics
 //      (hidden/query/value-head) still hard-reject with a precise reason,
-//      while Intrinsic(Logits)/Intrinsic(MtpLogits) roots are `executable`
-//      with the matching `needs_logits`/`needs_mtp_logits` flag set.
+//      while MTP roots are retained for oracle replay but rejected from
+//      production classification until bounded device storage exists.
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <string>
@@ -54,6 +55,35 @@ bool build(const std::string& name, const std::string& chex, const std::string& 
         return false;
     }
     return true;
+}
+
+void run_rng_contract_vectors() {
+    struct Case {
+        std::uint32_t key;
+        std::uint32_t counter;
+        std::uint32_t index;
+        std::uint64_t hash;
+        std::uint32_t uniform_bits;
+    };
+    constexpr Case cases[] = {
+        {0x00000000u, 0x00000000u, 0u, 0x0000000000000000ull, 0x3f370fb2u},
+        {0x00000001u, 0x00000000u, 0u, 0x52375cd73dbed523ull, 0x3f602672u},
+        {0x000004d2u, 0x00000000u, 0u, 0x2db56ca5bfd5b704ull, 0x3ebcc971u},
+        {0x000004d2u, 0x00000000u, 1u, 0x2db56ca5bfd5b704ull, 0x3e682006u},
+        {0xffffffffu, 0xffffffffu, 31u, 0x78a9666a39c1a1b5ull, 0x3f490c40u},
+        {0x12345678u, 0x9abcdef0u, 7u, 0x3b8823c5eac7f534ull, 0x3d2110a8u},
+    };
+    for (const Case& test : cases) {
+        const std::uint64_t seed =
+            ptir_rng_keyed_seed(test.key, test.counter);
+        const float uniform =
+            ptir_rng_hash_uniform(seed, test.index);
+        std::uint32_t uniform_bits = 0;
+        std::memcpy(&uniform_bits, &uniform, sizeof(uniform_bits));
+        expect(
+            seed == test.hash && uniform_bits == test.uniform_bits,
+            "generated C++ RNG contract matches Rust byte vector");
+    }
 }
 
 // ── greedy_argmax: chan0 seeded embed token [1]; argmax(logits), V=8. ──
@@ -136,8 +166,11 @@ void run_mtp_verify_tail() {
     std::printf("[mtp_verify_tail]\n");
     ExecPlan plan;
     if (!build("mtp_verify_tail", "50544952010000000000000004000000000000000100000001010300000001000000000103020400000008000000010000000100010104000000010000000200010103000000010000000200031c000000a0000000020400000008000000a001000002030000000800000090010000008100000080ff38030000000204000000080000002002000000000000000400000033050000009000000000640300000060060000000800000018090000000700000081000000803f810000000000380b0000000103000000380c0000000103000000200a0000000d0000000e000000410f00000030100000000711000000023812000000010400000064040000001713000000140000008101ffffffff201500000006000000160000009202000000170000003301000000920000000018000000920300000018000000", "5054494201000000142e9ff7c60808b00400000000000000040000000100000003000000000003000200000003010300000003010100000003190000000002040000000800000000020300000008000000030204000000080000000000000204000000080000000002040000000800000001010400000001010300000002010300000001010300000003010300000000000000000103000000000103000000000103000000000103000000000002000201040000000201040000000301040000000100010104000000010103000000", plan)) return;
-    expect(plan.executable && plan.needs_logits && plan.needs_mtp_logits,
-          "classified executable, needs_logits + needs_mtp_logits");
+    expect(
+        plan.executable && plan.needs_logits &&
+            plan.needs_mtp_logits &&
+            bounded_mtp_row_base(plan, 8) == 4,
+        "bounded MTP logits are production-classified with Context row base 4");
 
     std::map<std::uint32_t, std::shared_ptr<ChannelState>> externs;
     std::map<std::uint32_t, Value> seeds{{0, Value::i32({3, 5, 6})}};
@@ -205,6 +238,15 @@ void run_classification_rejections() {
     std::printf("[classification: rejection honesty]\n");
     {
         ExecPlan plan;
+        plan.trace.ports.push_back(
+            {PTIR_PORT_POSITIONS, 0, false});
+        classify_exec_plan(plan);
+        expect(
+            plan.executable && plan.needs_forward(),
+            "descriptor-port-only programs still require a model forward");
+    }
+    {
+        ExecPlan plan;
         cptir::Value v;
         v.source = cptir::ValueSource::HostInput;
         plan.trace.values.push_back(v);
@@ -245,8 +287,7 @@ void run_classification_rejections() {
                   ") rejects with an intrinsic reason (" + plan.reject_reason + ")");
     }
     {
-        // Logits/MtpLogits: executable=true, classified as "needs forward",
-        // never a hard reject — the whole point of the C2 split (§5.3).
+        // MtpLogits shares the bounded sampled-row device view.
         ExecPlan plan;
         cptir::Value logits_v;
         logits_v.source = cptir::ValueSource::Intrinsic;
@@ -257,9 +298,10 @@ void run_classification_rejections() {
         mtp_v.intrinsic = cptir::Intrinsic::MtpLogits;
         plan.trace.values.push_back(mtp_v);
         classify_exec_plan(plan);
-        expect(plan.executable && plan.needs_logits && plan.needs_mtp_logits &&
-                  plan.reject_reason.empty(),
-              "Logits + MtpLogits roots classify as executable + needs_forward, no reject");
+        expect(
+            plan.executable && plan.needs_logits &&
+                plan.needs_mtp_logits,
+            "Logits + MtpLogits roots use bounded production rows");
     }
 }
 
@@ -295,6 +337,7 @@ void run_multistage_pivot_payload() {
 }  // namespace
 
 int main() {
+    run_rng_contract_vectors();
     run_greedy_argmax();
     run_section3_masked_gumbel();
     run_mtp_verify_tail();

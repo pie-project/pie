@@ -25,11 +25,19 @@ pub trait Behavior: Send + Sync + 'static {
 /// `observe_launch` synchronously on the launch path.
 pub fn launch_observer(behavior: Arc<dyn Behavior>) -> pie_driver_dummy_lib::LaunchObserver {
     pie_driver_dummy_lib::LaunchObserver(Arc::new(move |obs| {
+        let (kv_page_indices, kv_page_indptr) = if obs.kv_translation.is_empty() {
+            (obs.kv_page_indices.clone(), obs.kv_page_indptr.clone())
+        } else {
+            (
+                obs.kv_translation.clone(),
+                obs.kv_translation_indptr.clone(),
+            )
+        };
         let plan = LaunchPlan {
             token_ids: obs.token_ids.clone(),
             qo_indptr: obs.qo_indptr.clone(),
-            kv_page_indices: obs.kv_page_indices.clone(),
-            kv_page_indptr: obs.kv_page_indptr.clone(),
+            kv_page_indices,
+            kv_page_indptr,
             kv_last_page_lens: obs.kv_last_page_lens.clone(),
             ..LaunchPlan::default()
         };
@@ -51,21 +59,13 @@ pub struct EchoBehavior(pub u32);
 
 impl Behavior for EchoBehavior {}
 
-/// SplitMix64 + seed×column — preserved for tests that build deterministic
-/// synthetic logits.
 fn mock_hash_uniform(seed_eff: u64, j: u32) -> f32 {
-    let mut x = seed_eff.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul((j as u64) + 1));
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x3C79_AC49_2BA7_B653);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0x1C69_B3F7_4AC4_AE35);
-    x ^= x >> 27;
-    ((x >> 40) as u32 as f32 + 0.5) * (1.0 / 16_777_216.0)
+    pie_ptir::rng::hash_uniform(seed_eff, j)
 }
 
 /// Deterministic pseudo-random logits row seeded by request id, in ~[-4, 4].
 pub fn synthetic_logits(req_id: u64, vocab: usize) -> Vec<f32> {
-    let seed = req_id ^ 0xA5A5_A5A5u64;
+    let seed = req_id ^ pie_ptir::rng::seed_eff(0);
     (0..vocab as u32)
         .map(|j| (mock_hash_uniform(seed, j) * 2.0 - 1.0) * 4.0)
         .collect()
@@ -199,6 +199,9 @@ fn register_dummy_driver(
         max_forward_tokens: 4096,
         max_forward_requests: 32,
         max_page_refs: num_kv_pages.max(1) as u32,
+        has_mtp_logits: true,
+        has_mtp_drafts: true,
+        has_value_head: true,
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,
@@ -217,6 +220,8 @@ fn register_dummy_driver(
         DriverSpec {
             num_kv_pages,
             limits,
+            device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
+                | pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
         },
         backend,
     );

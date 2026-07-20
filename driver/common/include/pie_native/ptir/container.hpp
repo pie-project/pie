@@ -54,7 +54,9 @@ struct CPort {
     std::uint8_t  port = 0;         // PtirPort
     bool          is_const = false;
     std::uint32_t chan = 0;         // src == channel
-    // const payload (src == const) is skipped structurally (types via Option-B).
+    std::uint8_t  const_dtype = 0;
+    CShape        const_shape;
+    std::vector<std::uint8_t> const_data;
 };
 
 // A decoded op: its tag + the channel it touches (chan ops) + a compact operand
@@ -72,6 +74,8 @@ struct COp {
     std::uint8_t  dtype = 0;        // intrinsic_val / cast / rng element dtype
     CShape        shape;            // broadcast/reshape/rng/intrinsic target shape
     std::uint32_t imm = 0;          // top_k k / iota len / rng stream
+    std::uint32_t imm2 = 0;
+    std::uint32_t imm3 = 0;
     std::uint8_t  kind = 0;         // rng kind (0 uniform, 1 gumbel)
     std::uint8_t  pred_tag = 0;     // pivot_threshold predicate tag
     std::uint32_t pred_payload = 0; // pivot_threshold predicate payload (value id / imm)
@@ -121,6 +125,12 @@ struct Cur {
     std::uint8_t u8() { if (!need(1)) return 0; return p[i++]; }
     std::uint16_t u16() { if (!need(2)) return 0; std::uint16_t v; std::memcpy(&v, p + i, 2); i += 2; return v; }
     std::uint32_t u32() { if (!need(4)) return 0; std::uint32_t v; std::memcpy(&v, p + i, 4); i += 4; return v; }
+    std::vector<std::uint8_t> bytes(std::size_t k) {
+        if (!need(k)) return {};
+        std::vector<std::uint8_t> out(p + i, p + i + k);
+        i += k;
+        return out;
+    }
     void skip(std::size_t k) { if (need(k)) i += k; }
     CShape shape() { CShape s; s.rank = u8(); if (s.rank > 4) { err = true; return s; } for (int d = 0; d < s.rank; ++d) s.dims[d] = u32(); return s; }
 };
@@ -148,6 +158,13 @@ inline void decode_op(Cur& c, COp& op) {
         case PTIR_OP_MASK_APPLY_PACKED:
             op.args = {c.u32(), c.u32()};
             break;
+        case PTIR_OP_CAUSAL_MASK:
+            op.args = {c.u32()}; op.imm = c.u32(); break;
+        case PTIR_OP_SLIDING_WINDOW_MASK:
+            op.args = {c.u32()}; op.imm = c.u32(); op.imm2 = c.u32(); break;
+        case PTIR_OP_SINK_WINDOW_MASK:
+            op.args = {c.u32()}; op.imm = c.u32(); op.imm2 = c.u32();
+            op.imm3 = c.u32(); break;
         case PTIR_OP_SELECT: case PTIR_OP_SCATTER_ADD: case PTIR_OP_SCATTER_SET:
             op.args = {c.u32(), c.u32(), c.u32()};
             break;
@@ -194,10 +211,13 @@ inline bool decode(const std::uint8_t* data, std::size_t len, Container& out, De
     if (std::memcmp(data, PTIR_MAGIC, 4) != 0) return fail("bad magic");
     c.skip(4);
     std::uint16_t version = c.u16();
-    if (version != PTIR_VERSION && version != 2) return fail("bad version");
+    if (version != PTIR_VERSION && version != PTIR_VERSION_EXTERN) {
+        return fail("bad version");
+    }
     c.u16();  // flags
     std::uint32_t n_names = c.u32(), n_channels = c.u32(), n_ports = c.u32(), n_stages = c.u32();
-    const std::uint32_t n_externs = version == 2 ? c.u32() : 0;
+    const std::uint32_t n_externs =
+        version == PTIR_VERSION_EXTERN ? c.u32() : 0;
 
     for (std::uint32_t i = 0; i < n_names; ++i) {
         std::uint16_t l = c.u16();
@@ -222,12 +242,16 @@ inline bool decode(const std::uint8_t* data, std::size_t len, Container& out, De
         if (src == 0) { p.is_const = false; p.chan = c.u32(); }
         else {  // const: dtype, shape, data[numel*elem]
             p.is_const = true;
-            std::uint8_t dt = c.u8();
-            CShape s = c.shape();
-            std::uint64_t numel = s.rank == 0 ? 1 : 1;
-            for (int d = 0; d < s.rank; ++d) numel *= s.dims[d];
-            std::size_t elem = (dt == PTIR_DT_BOOL) ? 1 : 4;
-            c.skip(numel * elem);
+            p.const_dtype = c.u8();
+            p.const_shape = c.shape();
+            std::uint64_t numel =
+                p.const_shape.rank == 0 ? 1 : 1;
+            for (int d = 0; d < p.const_shape.rank; ++d) {
+                numel *= p.const_shape.dims[d];
+            }
+            const std::size_t elem =
+                p.const_dtype == PTIR_DT_BOOL ? 1 : 4;
+            p.const_data = c.bytes(numel * elem);
         }
         out.ports.push_back(p);
         if (c.err) return fail("port overrun");

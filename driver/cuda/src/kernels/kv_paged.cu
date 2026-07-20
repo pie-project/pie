@@ -34,12 +34,14 @@ __global__ void write_kv_kernel(
     const std::uint32_t* __restrict__ kv_page_indices,
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
+    const std::uint8_t* __restrict__ row_valid,
     int R,
     int page_size,
     int h_kv,
     int d)
 {
     const int t = blockIdx.x;
+    if (row_valid != nullptr && row_valid[t] == 0) return;
 
     const int r = find_request(qo_indptr, R, t);
     const int qo_lo = qo_indptr[r];
@@ -140,6 +142,7 @@ __global__ void write_kv_explicit_kernel(
     __nv_bfloat16* __restrict__ v_pages,
     const std::uint32_t* __restrict__ w_page,   // [LANES] PHYSICAL page id per lane
     const std::uint32_t* __restrict__ w_off,    // [LANES] offset-in-page per lane
+    const std::uint8_t* __restrict__ row_valid,
     int B,
     int page_size,
     int h_kv,
@@ -147,6 +150,7 @@ __global__ void write_kv_explicit_kernel(
 {
     const int b = blockIdx.x;
     if (b >= B) return;
+    if (row_valid != nullptr && row_valid[b] == 0) return;
     const int actual_page = static_cast<int>(w_page[b]);
     const int offset_in_page = static_cast<int>(w_off[b]);
     if (offset_in_page < 0 || offset_in_page >= page_size) return;
@@ -637,7 +641,8 @@ void launch_write_kv_to_pages_bf16(
     int num_kv_heads,
     int head_dim,
     bool hnd_layout,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const std::uint8_t* row_valid)
 {
     constexpr int BLOCK = 256;
     if (hnd_layout) {
@@ -647,7 +652,7 @@ void launch_write_kv_to_pages_bf16(
             static_cast<__nv_bfloat16*>(k_pages),
             static_cast<__nv_bfloat16*>(v_pages),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            num_requests, page_size, num_kv_heads, head_dim);
+            row_valid, num_requests, page_size, num_kv_heads, head_dim);
     } else {
         write_kv_kernel<false><<<total_tokens, BLOCK, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k_curr),
@@ -655,7 +660,7 @@ void launch_write_kv_to_pages_bf16(
             static_cast<__nv_bfloat16*>(k_pages),
             static_cast<__nv_bfloat16*>(v_pages),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            num_requests, page_size, num_kv_heads, head_dim);
+            row_valid, num_requests, page_size, num_kv_heads, head_dim);
     }
 }
 
@@ -669,7 +674,8 @@ void launch_write_kv_to_pages(
     const std::uint32_t* kv_last_page_lens,
     int total_tokens,
     int num_requests,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const std::uint8_t* row_valid)
 {
     const int page_size = layer.page_size;
     const int num_kv_heads = layer.num_kv_heads;
@@ -679,7 +685,7 @@ void launch_write_kv_to_pages(
             layer.k_pages, layer.v_pages, k_curr, v_curr,
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             total_tokens, num_requests, page_size, num_kv_heads, head_dim,
-            layer.hnd_layout, stream);
+            layer.hnd_layout, stream, row_valid);
         return;
     }
 
@@ -794,7 +800,8 @@ void launch_write_kv_explicit_bf16(
     const std::uint32_t* w_page,        // [LANES] PHYSICAL page id per lane
     const std::uint32_t* w_off,         // [LANES] offset-in-page per lane
     int B,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const std::uint8_t* row_valid)
 {
     if (!layer.is_native_bf16()) {
         throw std::runtime_error(
@@ -808,7 +815,7 @@ void launch_write_kv_explicit_bf16(
             static_cast<const __nv_bfloat16*>(v_curr),
             static_cast<__nv_bfloat16*>(layer.k_pages),
             static_cast<__nv_bfloat16*>(layer.v_pages),
-            w_page, w_off, B, layer.page_size, layer.num_kv_heads,
+            w_page, w_off, row_valid, B, layer.page_size, layer.num_kv_heads,
             layer.head_dim);
     } else {
         write_kv_explicit_kernel<false><<<B, BLOCK, 0, stream>>>(
@@ -816,7 +823,7 @@ void launch_write_kv_explicit_bf16(
             static_cast<const __nv_bfloat16*>(v_curr),
             static_cast<__nv_bfloat16*>(layer.k_pages),
             static_cast<__nv_bfloat16*>(layer.v_pages),
-            w_page, w_off, B, layer.page_size, layer.num_kv_heads,
+            w_page, w_off, row_valid, B, layer.page_size, layer.num_kv_heads,
             layer.head_dim);
     }
     CUDA_CHECK(cudaGetLastError());

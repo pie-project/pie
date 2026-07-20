@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "pipeline/channel_registry.hpp"
@@ -41,10 +42,43 @@ using namespace pie_native::ptir::descriptor;
 
 namespace detail {
 
+struct CachedPortCell {
+    std::vector<std::uint8_t> bytes;
+    std::uint8_t ready = 0;
+};
+
+using PortCellCache =
+    std::unordered_map<std::uint32_t, CachedPortCell>;
+
 // Read a channel-bound port's committed cell as raw bytes (D2H). Fails (W1.6) if
 // the cell is not full — nothing will fill it on a solo device-geometry fire.
 inline bool read_port_cell(ChannelView& view, ChannelId dense,
-                           std::vector<std::uint8_t>& out, std::string* err) {
+                           std::vector<std::uint8_t>& out, std::string* err,
+                           const std::unordered_set<std::uint32_t>*
+                               pending_slots = nullptr,
+                           const PortCellCache* cached_cells = nullptr) {
+    const std::uint32_t slot = view.slot(dense);
+    if (cached_cells != nullptr) {
+        const auto cached = cached_cells->find(slot);
+        if (cached != cached_cells->end()) {
+            if (cached->second.ready == 0) {
+                if (err)
+                    *err = "ptir: descriptor channel " +
+                           std::to_string(dense) +
+                           " not ready (producing fire failed or not yet produced)";
+                return false;
+            }
+            out = cached->second.bytes;
+            return true;
+        }
+    }
+    if (pending_slots != nullptr && pending_slots->contains(slot)) {
+        out.resize(view.cell_bytes(dense));
+        cudaMemcpy(
+            out.data(), view.pending_cell(dense), out.size(),
+            cudaMemcpyDeviceToHost);
+        return true;
+    }
     if (!view.committed_full(dense)) {
         if (err)
             *err = "ptir: descriptor channel " + std::to_string(dense) +
@@ -62,6 +96,60 @@ inline std::vector<std::uint32_t> as_u32(const std::vector<std::uint8_t>& bytes)
     return out;
 }
 
+inline const Op* producer(const Trace& trace, ValueId value) {
+    for (const Stage& stage : trace.stages) {
+        for (const Op& op : stage.ops) {
+            if (value >= op.result_id &&
+                value < op.result_id + op.result_count) {
+                return &op;
+            }
+        }
+    }
+    return nullptr;
+}
+
+inline StructuredMaskDescriptor structured_mask_descriptor(
+    const Trace& trace, ChannelId mask_channel) {
+    const ChannelPut* selected = nullptr;
+    for (const Stage& stage : trace.stages) {
+        for (const ChannelPut& put : stage.puts) {
+            if (put.channel == mask_channel) selected = &put;
+        }
+    }
+    if (selected == nullptr) return {};
+    ValueId value = selected->value;
+    for (std::size_t depth = 0; depth <= trace.values.size(); ++depth) {
+        const Op* op = producer(trace, value);
+        if (op == nullptr) break;
+        if (op->code == OpCode::Reshape && !op->args.empty()) {
+            value = op->args[0];
+            continue;
+        }
+        StructuredMaskDescriptor descriptor;
+        switch (op->code) {
+            case OpCode::CausalMask:
+                descriptor.kind = StructuredMaskKind::Causal;
+                descriptor.key_len = op->imm;
+                return descriptor;
+            case OpCode::SlidingWindowMask:
+                descriptor.kind = StructuredMaskKind::SlidingWindow;
+                descriptor.key_len = op->imm;
+                descriptor.window = op->imm2;
+                return descriptor;
+            case OpCode::SinkWindowMask:
+                descriptor.kind = StructuredMaskKind::SinkWindow;
+                descriptor.key_len = op->imm;
+                descriptor.sink = op->imm2;
+                descriptor.window = op->imm3;
+                return descriptor;
+            default:
+                break;
+        }
+        break;
+    }
+    return {};
+}
+
 }  // namespace detail
 
 // Resolve a device-geometry program's descriptor-port channels into `out`.
@@ -70,7 +158,12 @@ inline std::vector<std::uint32_t> as_u32(const std::vector<std::uint8_t>& bytes)
 // a not-ready channel (the fire must be failed).
 inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
                                   std::uint32_t page_size, FireGeometry& out,
-                                  std::string* err) {
+                                  std::string* err,
+                                  bool allow_structured_masks = false,
+                                  const std::unordered_set<std::uint32_t>*
+                                      pending_slots = nullptr,
+                                  const detail::PortCellCache*
+                                      cached_cells = nullptr) {
     // Index the channel-bound ports by tag.
     ChannelId ch[10];
     bool has[10] = {false};
@@ -79,29 +172,57 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
         ch[pb.port] = pb.channel;
         has[pb.port] = true;
     }
+    for (const PortBinding& pb : trace.ports) {
+        if (!pb.is_const) continue;
+        const auto values = detail::as_u32(pb.const_data);
+        switch (pb.port) {
+            case kPortEmbedTokens: out.token_ids = values; break;
+            case kPortEmbedIndptr: out.qo_indptr = values; break;
+            case kPortPositions: out.position_ids = values; break;
+            case kPortPages:
+                out.kv_page_indices = values;
+                out.has_kv_family = true;
+                break;
+            case kPortPageIndptr: out.kv_page_indptr = values; break;
+            case kPortKvLen:
+                for (std::uint32_t len : values) {
+                    out.kv_last_page_lens.push_back(
+                        last_page_len(len, page_size));
+                }
+                break;
+            case kPortReadout: out.sampling_indices = values; break;
+            default: break;
+        }
+    }
 
     // -- token family --
     if (has[kPortEmbedTokens]) {
         std::vector<std::uint8_t> b;
-        if (!detail::read_port_cell(view, ch[kPortEmbedTokens], b, err)) return false;
+        if (!detail::read_port_cell(
+                view, ch[kPortEmbedTokens], b, err, pending_slots,
+                cached_cells)) return false;
         out.token_ids = detail::as_u32(b);
     }
     const std::uint32_t nnz = static_cast<std::uint32_t>(out.token_ids.size());
 
     if (has[kPortEmbedIndptr]) {
         std::vector<std::uint8_t> b;
-        if (!detail::read_port_cell(view, ch[kPortEmbedIndptr], b, err)) return false;
+        if (!detail::read_port_cell(
+                view, ch[kPortEmbedIndptr], b, err, pending_slots,
+                cached_cells)) return false;
         out.qo_indptr = detail::as_u32(b);
-    } else {
+    } else if (out.qo_indptr.empty()) {
         out.qo_indptr = {0, nnz};  // one lane over all tokens
     }
     const std::size_t lanes = out.qo_indptr.size() > 0 ? out.qo_indptr.size() - 1 : 0;
 
     if (has[kPortPositions]) {
         std::vector<std::uint8_t> b;
-        if (!detail::read_port_cell(view, ch[kPortPositions], b, err)) return false;
+        if (!detail::read_port_cell(
+                view, ch[kPortPositions], b, err, pending_slots,
+                cached_cells)) return false;
         out.position_ids = detail::as_u32(b);
-    } else {
+    } else if (out.position_ids.empty()) {
         out.position_ids.resize(nnz);
         for (std::uint32_t i = 0; i < nnz; ++i) out.position_ids[i] = i;
     }
@@ -109,39 +230,84 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     // -- KV family (CSR-prefix contract) --
     if (has[kPortPageIndptr]) {
         std::vector<std::uint8_t> b;
-        if (!detail::read_port_cell(view, ch[kPortPageIndptr], b, err)) return false;
+        if (!detail::read_port_cell(
+                view, ch[kPortPageIndptr], b, err, pending_slots,
+                cached_cells)) return false;
         out.kv_page_indptr = detail::as_u32(b);
     }
     if (has[kPortPages]) {
         std::vector<std::uint8_t> b;
-        if (!detail::read_port_cell(view, ch[kPortPages], b, err)) return false;
+        if (!detail::read_port_cell(
+                view, ch[kPortPages], b, err, pending_slots,
+                cached_cells)) return false;
         out.kv_page_indices = detail::as_u32(b);
-        // CSR-prefix: trim the fixed-shape data port to page_indptr's last entry.
         if (!out.kv_page_indptr.empty()) {
-            const std::uint32_t nnz_pages = out.kv_page_indptr.back();
-            if (nnz_pages <= out.kv_page_indices.size())
-                out.kv_page_indices.resize(nnz_pages);
+            const auto& dims =
+                trace.channels[ch[kPortPages]].type.shape.dims;
+            if (dims.size() == 2 && dims[0] == lanes) {
+                std::vector<std::uint32_t> packed;
+                packed.reserve(out.kv_page_indptr.back());
+                for (std::size_t lane = 0; lane < lanes; ++lane) {
+                    const std::uint32_t count =
+                        out.kv_page_indptr[lane + 1] -
+                        out.kv_page_indptr[lane];
+                    if (count > dims[1]) return false;
+                    const std::size_t begin = lane * dims[1];
+                    packed.insert(
+                        packed.end(),
+                        out.kv_page_indices.begin() + begin,
+                        out.kv_page_indices.begin() + begin + count);
+                }
+                out.kv_page_indices = std::move(packed);
+            } else {
+                const std::uint32_t nnz_pages =
+                    out.kv_page_indptr.back();
+                if (nnz_pages <= out.kv_page_indices.size()) {
+                    out.kv_page_indices.resize(nnz_pages);
+                }
+            }
         }
         out.has_kv_family = true;
     }
     if (has[kPortKvLen]) {
         std::vector<std::uint8_t> b;
-        if (!detail::read_port_cell(view, ch[kPortKvLen], b, err)) return false;
+        if (!detail::read_port_cell(
+                view, ch[kPortKvLen], b, err, pending_slots,
+                cached_cells)) return false;
         for (std::uint32_t len : detail::as_u32(b))
             out.kv_last_page_lens.push_back(last_page_len(len, page_size));
     }
 
     // -- read-out --
+    std::vector<std::uint32_t> readout = out.sampling_indices;
     if (has[kPortReadout]) {
         std::vector<std::uint8_t> b;
-        if (!detail::read_port_cell(view, ch[kPortReadout], b, err)) return false;
-        out.sampling_indices = detail::as_u32(b);
-        out.sampling_indptr = {0, static_cast<std::uint32_t>(out.sampling_indices.size())};
-    } else {
-        out.sampling_indptr.push_back(0);
+        if (!detail::read_port_cell(
+                view, ch[kPortReadout], b, err, pending_slots,
+                cached_cells)) return false;
+        readout = detail::as_u32(b);
+    }
+    out.sampling_indices.clear();
+    out.sampling_indptr.clear();
+    out.sampling_indptr.push_back(0);
+    if (readout.empty()) {
         for (std::size_t lane = 0; lane < lanes; ++lane) {
             if (out.qo_indptr[lane + 1] > out.qo_indptr[lane]) {
-                out.sampling_indices.push_back(out.qo_indptr[lane + 1] - 1);
+                out.sampling_indices.push_back(
+                    out.qo_indptr[lane + 1] -
+                    out.qo_indptr[lane] - 1);
+            }
+            out.sampling_indptr.push_back(
+                static_cast<std::uint32_t>(out.sampling_indices.size()));
+        }
+    } else {
+        for (std::size_t lane = 0; lane < lanes; ++lane) {
+            const std::uint32_t begin = out.qo_indptr[lane];
+            const std::uint32_t end = out.qo_indptr[lane + 1];
+            for (std::uint32_t index : readout) {
+                if (index >= begin && index < end) {
+                    out.sampling_indices.push_back(index - begin);
+                }
             }
             out.sampling_indptr.push_back(
                 static_cast<std::uint32_t>(out.sampling_indices.size()));
@@ -151,20 +317,50 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     // -- explicit KV write descriptor (w_slot/w_off → write_kv_explicit) --
     if (has[kPortWSlot]) {
         std::vector<std::uint8_t> b;
-        if (!detail::read_port_cell(view, ch[kPortWSlot], b, err)) return false;
+        if (!detail::read_port_cell(
+                view, ch[kPortWSlot], b, err, pending_slots,
+                cached_cells)) return false;
         out.w_page = detail::as_u32(b);
         out.has_write_desc = true;
     }
     if (has[kPortWOff]) {
         std::vector<std::uint8_t> b;
-        if (!detail::read_port_cell(view, ch[kPortWOff], b, err)) return false;
+        if (!detail::read_port_cell(
+                view, ch[kPortWOff], b, err, pending_slots,
+                cached_cells)) return false;
         out.w_off = detail::as_u32(b);
     }
 
     // -- dense attention mask (→ pack_dense_mask) --
     if (has[kPortAttnMask]) {
-        if (!detail::read_port_cell(view, ch[kPortAttnMask], out.mask, err)) return false;
-        out.has_mask = true;
+        out.structured_mask =
+            detail::structured_mask_descriptor(trace, ch[kPortAttnMask]);
+        // Runtime-window APIs cannot encode an empty window. Keep window=0
+        // valid by consuming the program's exact dense Bool result instead.
+        const bool direct =
+            allow_structured_masks &&
+            (out.structured_mask.kind == StructuredMaskKind::Causal ||
+             (out.structured_mask.kind ==
+                  StructuredMaskKind::SlidingWindow &&
+              out.structured_mask.window > 0) ||
+             (out.structured_mask.kind ==
+                  StructuredMaskKind::SinkWindow &&
+              out.structured_mask.window > 0));
+        if (!direct) {
+            if (!detail::read_port_cell(
+                    view, ch[kPortAttnMask], out.mask, err,
+                    pending_slots, cached_cells)) {
+                return false;
+            }
+            out.has_mask = true;
+            if (out.structured_mask &&
+                out.structured_mask.key_len == 0 &&
+                !out.token_ids.empty() &&
+                out.mask.size() % out.token_ids.size() == 0) {
+                out.structured_mask.key_len = static_cast<std::uint32_t>(
+                    out.mask.size() / out.token_ids.size());
+            }
+        }
     }
     return true;
 }

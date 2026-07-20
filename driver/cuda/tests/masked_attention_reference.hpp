@@ -21,6 +21,7 @@
 //
 // Pure C++ (no CUDA headers) so the math is unit-testable host-only.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -28,6 +29,46 @@
 #include <vector>
 
 namespace pie_attn_ref {
+
+struct PackedMaskRows {
+    std::vector<std::uint32_t> words;
+    std::vector<std::uint32_t> indptr;
+};
+
+inline PackedMaskRows pack_brle_rows(
+    const std::vector<std::uint32_t>& runs,
+    const std::vector<std::uint32_t>& run_indptr,
+    int rows,
+    int bits_per_row) {
+    PackedMaskRows packed;
+    packed.indptr.push_back(0);
+    const std::size_t words_per_row =
+        static_cast<std::size_t>(bits_per_row + 31) / 32;
+    for (int row = 0; row < rows; ++row) {
+        const std::size_t base = packed.words.size();
+        packed.words.resize(base + words_per_row, 0);
+        std::uint32_t position = 0;
+        bool value = false;
+        for (std::uint32_t index = run_indptr[row];
+             index < run_indptr[row + 1];
+             ++index) {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                position + runs[index],
+                static_cast<std::uint32_t>(bits_per_row));
+            if (value) {
+                for (std::uint32_t bit = position; bit < end; ++bit) {
+                    packed.words[base + bit / 32] |=
+                        1u << (bit % 32);
+                }
+            }
+            position = end;
+            value = !value;
+        }
+        packed.indptr.push_back(
+            static_cast<std::uint32_t>(packed.words.size()));
+    }
+    return packed;
+}
 
 // Row-major dense tensors, described by explicit strides so the caller can feed
 // whatever head layout the test uses. All values are fp32 (the caller rounds

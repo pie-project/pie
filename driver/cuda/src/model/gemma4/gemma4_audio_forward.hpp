@@ -35,6 +35,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -139,6 +140,12 @@ void scatter_gemma4_audio(const Gemma4AudioInputs& in,
                           int n_rows,
                           int text_hidden,
                           cudaStream_t stream = 0);
+
+void encode_gemma4_audio(const Gemma4AudioInputs& in,
+                         std::uint16_t* output_rows_h,
+                         std::size_t output_bytes,
+                         std::uint32_t* output_row_indptr_h,
+                         cudaStream_t stream = 0);
 
 // Encode one clip's log-mel features → soft-token embeddings in the text hidden
 // space.

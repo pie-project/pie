@@ -1,137 +1,43 @@
-//! Per-stage batch keys (D5) — the normalization that captures "same stage
-//! program" across passes, post-bind and host-side.
-//!
-//! The pass-level identity is the C3 container hash ([`crate::container_hash`]).
-//! It is the wrong grain for stage co-batching: two passes may share an
-//! identical epilogue (or prologue, …) yet hash differently, and — because a
-//! stage's ops reference the pass-global dense channel table — raw byte-equality
-//! of one [`StageProgram`] section does NOT recognize "same epilogue" across
-//! passes (the same op graph lands on different global channel indices, and the
-//! decls it references sit at different positions).
-//!
-//! [`stage_key`] is that recognizer. For one stage it builds a canonical form
-//! from three parts and hashes it with the same FNV-1a as the container:
-//!
-//! 1. the stage's ops, with channel references renumbered into stage-local
-//!    first-use order (the first channel touched becomes local 0, the next new
-//!    one local 1, …), so pass-global numbering drops out;
-//! 2. each referenced channel's resolved signature (element type with `ACT`
-//!    materialized, capacity, host-role, seeded) in that same local order — so
-//!    two stages that renumber identically but read differently typed channels
-//!    stay distinct;
-//! 3. the stage body's resolved SSA value types (the sidecar's per-op types) —
-//!    so a difference the op tags alone miss (a model specialization) still
-//!    separates the keys.
-//!
-//! Contract: structurally identical stages (same ops up to channel renumbering,
-//! same referenced-channel signatures, same resolved types) share a key; any
-//! op, signature, or type difference yields a different key. Keys never cross
-//! the wasm boundary (D4-orthogonal): they are a runtime-derived scheduler grain
-//! over an already-bound trace.
+//! Compatibility accessors for compiler-owned canonical stage signatures.
 
-use alloc::vec::Vec;
-
-use crate::container::{encode_op, encode_shape, put_u32};
-use crate::op::Op;
+use crate::compiler::{StageSignature, compile_stage_at};
 use crate::registry::Stage;
-use crate::types::ValueType;
 use crate::validate::BoundTrace;
 
-/// Domain separator so a stage key can never collide with a container hash or a
-/// sidecar (distinct byte prefix into the shared FNV-1a).
-const PTSK_MAGIC: [u8; 4] = *b"PTSK";
-const PTSK_VERSION: u16 = 1;
-
-/// The D5 per-stage batch key for `stage`, or `None` if the bound trace has no
-/// program for that stage. See the module docs for the normalization.
-pub fn stage_key(bound: &BoundTrace, stage: Stage) -> Option<u64> {
-    let idx = bound
+/// Canonical compiler signature for `stage`.
+pub fn stage_signature(bound: &BoundTrace, stage: Stage) -> Option<StageSignature> {
+    let index = bound
         .container
         .stages
         .iter()
-        .position(|s| s.stage == stage)?;
-    Some(stage_key_at(bound, idx))
+        .position(|program| program.stage == stage)?;
+    Some(stage_signature_at(bound, index))
 }
 
-/// The D5 per-stage batch key for the stage at container position `stage_idx`.
-///
-/// Panics if `stage_idx` is out of range for the bound trace's stages.
-pub fn stage_key_at(bound: &BoundTrace, stage_idx: usize) -> u64 {
-    let sp = &bound.container.stages[stage_idx];
-    let value_types: &[ValueType] = &bound.stage_types[stage_idx];
-
-    // 1. Stage-local first-use renumbering of channel references. `order` is
-    // local -> global; `local_id` assigns on first use.
-    let mut order: Vec<u32> = Vec::new();
-
-    let mut w = Vec::new();
-    w.extend_from_slice(&PTSK_MAGIC);
-    w.extend_from_slice(&PTSK_VERSION.to_le_bytes());
-    w.push(sp.stage as u8);
-
-    // 2. Ops, with channel indices renumbered to stage-local first-use order.
-    put_u32(&mut w, sp.ops.len() as u32);
-    for op in &sp.ops {
-        match op {
-            Op::ChanTake(c) => encode_op(&mut w, &Op::ChanTake(local_id(&mut order, *c))),
-            Op::ChanRead(c) => encode_op(&mut w, &Op::ChanRead(local_id(&mut order, *c))),
-            Op::ChanPut { chan, value } => encode_op(
-                &mut w,
-                &Op::ChanPut {
-                    chan: local_id(&mut order, *chan),
-                    value: *value,
-                },
-            ),
-            other => encode_op(&mut w, other),
-        }
-    }
-
-    // 3. Referenced-channel signatures in local order: resolved element type
-    // (ACT materialized), capacity, host-role, seeded.
-    put_u32(&mut w, order.len() as u32);
-    for &g in &order {
-        let vt = bound.channel_types[g as usize];
-        let decl = &bound.container.channels[g as usize];
-        encode_value_type(&mut w, vt);
-        put_u32(&mut w, decl.capacity);
-        w.push(decl.host_role as u8);
-        w.push(decl.seeded as u8);
-    }
-
-    // 4. Resolved SSA value types (sidecar grain).
-    put_u32(&mut w, value_types.len() as u32);
-    for vt in value_types {
-        encode_value_type(&mut w, *vt);
-    }
-
-    crate::container_hash(&w)
+/// Canonical compiler signature for the stage at `stage_index`.
+pub fn stage_signature_at(bound: &BoundTrace, stage_index: usize) -> StageSignature {
+    compile_stage_at(bound, stage_index).signature
 }
 
-fn encode_value_type(w: &mut Vec<u8>, vt: ValueType) {
-    w.push(vt.dtype as u8);
-    encode_shape(w, vt.shape);
+/// Hash accessor retained for scheduler call sites that only need the compact
+/// grouping key. Collision-sensitive caches also compare canonical bytes.
+pub fn stage_key(bound: &BoundTrace, stage: Stage) -> Option<u64> {
+    stage_signature(bound, stage).map(|signature| signature.hash)
 }
 
-/// Local id for global channel `g` in stage-local first-use order (assigning on
-/// first sight; `order` maps local -> global).
-fn local_id(order: &mut Vec<u32>, g: u32) -> u32 {
-    match order.iter().position(|&x| x == g) {
-        Some(l) => l as u32,
-        None => {
-            order.push(g);
-            (order.len() - 1) as u32
-        }
-    }
+pub fn stage_key_at(bound: &BoundTrace, stage_index: usize) -> u64 {
+    stage_signature_at(bound, stage_index).hash
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+    use crate::op::Op;
     use crate::registry::ModelProfile;
     use crate::types::{DType, Literal, Shape};
     use crate::validate::bind;
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     fn ch(dtype: DType) -> ChannelDecl {
         ChannelDecl {

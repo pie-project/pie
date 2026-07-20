@@ -1,8 +1,8 @@
 # Top-level Cargo workspace for the host-side Rust crates.
 #
 # Members are the crates that build for the host (Linux/macOS x86_64/aarch64).
-# Wasm-target crates (`inferlets/*`, `sdk/rust/*`) are intentionally excluded —
-# they have their own Cargo.lock files and target `wasm32-wasip3`, so mixing
+# Wasm-target crates (`tests/inferlets/*`, `sdk/rust/*`) are intentionally excluded —
+# they have their own Cargo.lock files and target `wasm32-wasip2`, so mixing
 # them into this workspace's resolver would pull wasm-only deps into the host
 # build graph.
 [workspace]
@@ -51,11 +51,11 @@ members = [
     "bin/pie",
 ]
 exclude = [
-    "inferlets",
+    "tests/inferlets",
     "sdk/rust",
     # Worktree checkouts under .claude/worktrees/ must never be captured by
     # THIS manifest when cargo walks up from a worktree's excluded package
-    # (e.g. .claude/worktrees/<x>/inferlets/<name> — the worktree's own root
+    # (e.g. .claude/worktrees/<x>/tests/inferlets/<name> — the worktree's own root
     # excludes it, so the walk continues up to here).
     ".claude",
 ]

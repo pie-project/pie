@@ -46,6 +46,9 @@ template <typename T, int D, int V = D>
     const constant int& page_size           [[buffer(9)]],
     const constant int& n_kv_heads          [[buffer(10)]],
     const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],
+    const device uint& attention_mask_stride[[buffer(13)]],
+    const device uchar* attention_mask_enabled [[buffer(14)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
@@ -88,6 +91,11 @@ template <typename T, int D, int V = D>
 
   // Online-softmax over kv positions kp = simd_gid, +BN, ... up to and including q_pos.
   for (int kp = simd_gid; kp <= q_pos; kp += BN) {
+    if (attention_mask_enabled[row] != 0 &&
+        (uint(kp) >= attention_mask_stride ||
+         attention_mask[size_t(row) * attention_mask_stride + uint(kp)] == 0)) {
+      continue;
+    }
     // Page-table gather (== delta's kv_append phys_slot, byte-for-byte).
     const int page = int(kv_page_indices[page_base + kp / page_size]);
     const size_t slot = size_t(page) * page_size + (kp % page_size);
@@ -136,6 +144,7 @@ template <typename T, int D, int V = D>
       device itype*, const constant int&, const device int*,               \
       const device int*, const device uint*, const device uint*,           \
       const constant int&, const constant int&, const constant float&,     \
+      const device uchar*, const device uint&, const device uchar*,        \
       uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged(float32, float, 256, 256)

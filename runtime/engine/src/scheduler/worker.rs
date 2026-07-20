@@ -1,8 +1,8 @@
 //! Per-driver direct batch scheduler.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::driver::{
@@ -11,25 +11,34 @@ use crate::driver::{
     SubmissionCompletion, WorkItemAttemptOutcome, WorkItemCompletion,
 };
 use crate::scheduler::ProcessId;
-use crate::store::kv::project::PhysicalPageId;
 use anyhow::{Result, anyhow};
 
 use super::batch::{self, BatchAccumulator};
 use super::quorum;
 use super::stats::{self, SchedulerStats};
-use super::{LaunchPreparation, LaunchPreparationError, RetryClassifier};
+use super::{ControlCompletion, RetryClassifier};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FireClause {
     Quorum,
-    IdleEscape,
     ColdHold,
+    /// The wave window expired: fired narrow, demoting the absentees.
+    Straggler,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeaveKind {
     Terminate,
     Suspend,
+    /// A pipeline closed or dropped — close = CANCEL (operator ruling R4-1,
+    /// 2026-07-17): every queued/preparing fire is rejected with its credits
+    /// and stream books settled BEFORE the row leaves; already-dispatched
+    /// fires run to settlement. Shares the Terminate cancel machinery
+    /// (Terminate additionally clears frozen state and marks departed). The
+    /// next submission of the process rejoins implicitly. End-of-stream is
+    /// NOT this event's job — the final-submit marker carries it
+    /// (`pipeline.finish` → stream books, F7/R4-3).
+    Close,
 }
 
 /// A pipeline left the fleet (cancel / kill / exit / TASK-A terminate /
@@ -47,8 +56,19 @@ pub(crate) fn notify_pipeline_leave(pid: ProcessId, _kind: LeaveKind) {
         let _ = handle.send(SchedulerItem::PipelineLeave(pid, _kind));
     }
 }
-/// No-op: quorum rejoin is implicit on the pipeline's next
-/// [`quorum::WaitAllPolicy::on_pipeline_request`] call, so a join event has
+
+/// `pipeline.finish` (F7): graceful end of stream. Broadcast on the SAME
+/// FIFO channels the pipeline's Launch items rode, so each scheduler
+/// receives it after every prior fire's admission — the marker needs no
+/// per-fire stamp. Fire-and-forget like the leave.
+pub(crate) fn notify_pipeline_finish(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::PipelineFinish(pid));
+    }
+}
+/// No-op: quorum rejoin is implicit on the pipeline's next scheduler
+/// submission, so a join event has
 /// nothing to do here (`store::reclaim` owns the join hook for its own
 /// suspend/restore callers, which is equally inert for the same reason).
 #[allow(dead_code)] // no live caller — see doc.
@@ -92,25 +112,88 @@ pub(crate) struct PendingRequest {
     pub(crate) request: crate::driver::LaunchPlan,
     pub(crate) instance_id: u64,
     pub(crate) completion: WorkItemCompletion,
-    pub(crate) physical_page_ids: Vec<PhysicalPageId>,
     pub(crate) last_page_len: u32,
     /// The submitting pipeline's identity (`ProcessCtx::process_id()`), or
     /// `None` for an untracked/prebuilt fire (device-geometry, beam replay,
     /// this module's own unit tests) — the quorum wait-set key
     /// ([`quorum::WaitAllPolicy::on_pipeline_request`]).
     pub(crate) pipeline_id: Option<ProcessId>,
-    /// Submit-order lane for deferred preparation. Requests in the same
-    /// `(pipeline_id, key)` lane may not prepare out of logical-fire order,
-    /// while unrelated lanes may pass a retrying preparation.
-    pub(crate) preparation_order_key: Option<u64>,
     pub(crate) prebuilt: bool,
     /// Stable logical-fire retry state. The request payload and completion are
     /// retained across attempts; only the native terminal cell is reset.
     pub(crate) retry_count: u32,
+    /// Earliest instant the next attempt may dispatch. Peek and dispatch skip
+    /// a not-yet-due retry, so retry pacing is the backoff itself — never the
+    /// peers' cadence (a single-pipeline fleet must not spin hot — RV-20).
+    pub(crate) retry_after: Option<Instant>,
     pub(crate) prelaunch_copy: Option<crate::driver::KvCopyPlan>,
-    pub(crate) preparation: Option<LaunchPreparation>,
+    pub(crate) prelaunch_state_copy: Option<StateCopyPlan>,
     pub(crate) retry_classifier: Option<RetryClassifier>,
-    pub(crate) preparation_retries: u32,
+    /// Whether this request currently holds an unconsumed readiness credit
+    /// in the quorum wait-set. Published at admission (or, for a fire behind
+    /// a pre-launch copy, when the copy retires), consumed by the wave
+    /// dispatch, re-published on a RETRY re-arm. Drop paths give the credit
+    /// back through `on_request_dropped` ONLY when this is set — a fire
+    /// cancelled before its copy retires never had one (RV-20).
+    pub(crate) credit_published: bool,
+    /// The quorum identity generation of `pipeline_id` at worker receipt
+    /// (`WaitAllPolicy::generation_of`). Every quorum accounting call for
+    /// this request routes through [`Scheduler::quorum_pid`], which
+    /// compares this stamp against the CURRENT generation: a mismatch means
+    /// the pipeline left (Close/Terminate/Suspend bump the generation)
+    /// after this request was admitted, so its credit rides — and is
+    /// consumed — untracked. Without the stamp, a fire finishing async
+    /// preparation after a Close leave re-created the pid's wait-set row
+    /// (pid is the PROCESS id, shared with successor pipelines), and the
+    /// straddling wave's dispatch then consumed the successor's credit:
+    /// +1 permanent `untracked_ready` per close, wave_started resets
+    /// starved, instant narrow fires after any >window lull (W1, 2026-07-17).
+    pub(crate) quorum_generation: u64,
+    pub(super) timing: Option<FireTimingState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FireTimingState {
+    submitted_us: u64,
+    enqueued_us: Option<u64>,
+    ready_us: Option<u64>,
+}
+
+impl FireTimingState {
+    fn new() -> Self {
+        Self {
+            submitted_us: super::fire_timing_now_us(),
+            enqueued_us: None,
+            ready_us: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WaveTimingState {
+    wave_id: u64,
+    membership_hash: u64,
+    dispatch_started_us: u64,
+    batch_built_us: u64,
+    driver_started_us: u64,
+    launch_returned_us: u64,
+    decision_us: u64,
+    active_pipelines: usize,
+    missing_pipelines: usize,
+    candidate_count: usize,
+    deferred_pipelines: usize,
+    depth_capped_pipelines: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FireTimingSnapshot {
+    outcome_index: usize,
+    logical_fire_id: u64,
+    instance_id: u64,
+    process_id: Option<ProcessId>,
+    sampled_rows: usize,
+    retry_count: u32,
+    timing: FireTimingState,
 }
 
 impl PendingRequest {
@@ -118,30 +201,34 @@ impl PendingRequest {
         request: crate::driver::LaunchPlan,
         instance_id: u64,
         completion: WorkItemCompletion,
-        physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
         pipeline_id: Option<ProcessId>,
-        preparation_order_key: Option<u64>,
         prebuilt: bool,
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
-        preparation: Option<LaunchPreparation>,
+        prelaunch_state_copy: Option<StateCopyPlan>,
         retry_classifier: Option<RetryClassifier>,
+        timing_enabled: bool,
     ) -> Self {
+        let logical_fire_id = NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed);
         Self {
-            logical_fire_id: NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed),
+            logical_fire_id,
             request,
             instance_id,
             completion,
-            physical_page_ids,
             last_page_len,
             pipeline_id,
-            preparation_order_key,
             prebuilt,
             retry_count: 0,
+            retry_after: None,
             prelaunch_copy,
-            preparation,
+            prelaunch_state_copy,
             retry_classifier,
-            preparation_retries: 0,
+            credit_published: false,
+            // Stamped with the live generation at worker RECEIPT
+            // (SchedulerItem::Launch arm) — constructed requests outside the
+            // worker cannot see the policy; 0 matches a never-left pipeline.
+            quorum_generation: 0,
+            timing: timing_enabled.then(FireTimingState::new),
         }
     }
 
@@ -150,16 +237,49 @@ impl PendingRequest {
             && self.request.rs_buffer_slot_ids.is_empty()
             && self.request.rs_fold_lens.is_empty()
     }
+
+    pub(crate) fn wire_row_count(&self) -> usize {
+        self.request.qo_indptr.len().saturating_sub(1)
+    }
+
+    pub(crate) fn preserves_inner_rows(&self) -> bool {
+        self.wire_row_count() > 1
+    }
+
+    fn requires_solo_submission(&self) -> bool {
+        (self.prebuilt && self.pipeline_id.is_none())
+            || (self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0))
+    }
+}
+
+fn fire_membership_hash<'a>(logical_fire_ids: impl IntoIterator<Item = &'a u64>) -> u64 {
+    logical_fire_ids
+        .into_iter()
+        .fold(14_695_981_039_346_656_037u64, |hash, logical_fire_id| {
+            (hash ^ logical_fire_id).wrapping_mul(1_099_511_628_211)
+        })
 }
 
 #[derive(Default)]
 struct LaunchGrouping {
     instances: HashSet<u64>,
+    /// Tracked pipelines already contributing to this wave. ONE wave-member
+    /// per pipeline per wave: fires of one pipeline are ORDERED (B3), and
+    /// the driver's compose-time geometry/containment validation reads the
+    /// device state as of wave entry — a decode fire composed into the same
+    /// wave as the prefill it depends on (R4-4 device-carried handoff
+    /// submits it run-ahead) validates against KV the prefill has not
+    /// committed yet and FAIL-STOPs the lane. Same-instance dedup already
+    /// enforced this within an instance; the single-pipeline stream makes
+    /// the cross-instance case reachable. Also aligns the composer with the
+    /// quorum's one-credit-per-pipeline-per-wave model.
+    pipelines: HashSet<ProcessId>,
     count: usize,
     forward_tokens: usize,
     page_refs: usize,
-    has_prebuilt: bool,
+    has_solo_submission: bool,
     has_user_mask: bool,
+    has_device_geometry: bool,
 }
 
 impl LaunchGrouping {
@@ -167,11 +287,30 @@ impl LaunchGrouping {
         if self.instances.contains(&request.instance_id) {
             return false;
         }
+        if request
+            .pipeline_id
+            .is_some_and(|pid| self.pipelines.contains(&pid))
+        {
+            return false;
+        }
+        if self.count != 0 && (request.requires_solo_submission() || self.has_solo_submission) {
+            return false;
+        }
+        // Custom wire masks co-batch freely with other wire-geometry fires —
+        // the wire layer emits a mask row per request (synthesized causal for
+        // the unmasked ones) and the driver predicates per row. They cannot
+        // ride a composed device-geometry batch: wire masks index the wire
+        // request layout, which composition replaces (driver fails loud).
+        // A DENSE-masked device-resolved fire is stricter still: the composed
+        // path does not merge dense device masks with any other program, so
+        // it batches solo.
+        let masked_device_geometry =
+            request.request.has_user_mask && request.request.device_resolved_geometry;
         if self.count != 0
-            && (request.prebuilt
-                || self.has_prebuilt
-                || request.request.has_user_mask
-                || self.has_user_mask)
+            && (masked_device_geometry
+                || (self.has_user_mask && self.has_device_geometry)
+                || (request.request.has_user_mask && self.has_device_geometry)
+                || (request.request.device_resolved_geometry && self.has_user_mask))
         {
             return false;
         }
@@ -179,7 +318,7 @@ impl LaunchGrouping {
             return true;
         }
         let usage = batch::request_capacity_usage(request, page_size);
-        self.count + 1 <= limits.max_forward_requests
+        self.count.saturating_add(usage.forward_requests) <= limits.max_forward_requests
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
             && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
     }
@@ -187,17 +326,39 @@ impl LaunchGrouping {
     fn push(&mut self, request: &PendingRequest, limits: SchedulerLimits, page_size: u32) -> bool {
         let usage = batch::request_capacity_usage(request, page_size);
         self.instances.insert(request.instance_id);
-        self.count += 1;
+        if let Some(pid) = request.pipeline_id {
+            self.pipelines.insert(pid);
+        }
+        self.count = self.count.saturating_add(usage.forward_requests);
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
-        self.has_prebuilt |= request.prebuilt;
+        self.has_solo_submission |= request.requires_solo_submission();
         self.has_user_mask |= request.request.has_user_mask;
-        request.prebuilt
-            || request.request.has_user_mask
+        self.has_device_geometry |= request.request.device_resolved_geometry;
+        request.requires_solo_submission()
+            || (request.request.has_user_mask && request.request.device_resolved_geometry)
             || self.count >= limits.max_forward_requests
             || self.forward_tokens >= limits.max_forward_tokens
             || self.page_refs >= limits.max_page_refs
     }
+}
+
+struct LaunchBatchPreview {
+    count: usize,
+    pipelines: HashSet<ProcessId>,
+    /// Pipelines whose queued fires the COMPOSER deferred to the next wave
+    /// (driver capacity or same-instance dedup). They
+    /// are scheduled, not late — the quorum treats them as at-depth, never
+    /// missing (zero-straggler gate, V6 iteration 35).
+    deferred: HashSet<ProcessId>,
+    /// SUBMISSION = PRESENCE (operator model, V6 iteration 38): every
+    /// pipeline with ANY work in the engine — queued launch, preparation,
+    /// pre-launch copy. The gathering wave may still wait for them (that
+    /// wait keeps waves dense), but they can never be demoted or counted
+    /// as stragglers: an inferlet that submitted is on time by definition;
+    /// engine-side prepare latency must never be punished as straggling.
+    submitted: HashSet<ProcessId>,
+    structurally_full: bool,
 }
 
 enum SchedulerItem {
@@ -206,19 +367,45 @@ enum SchedulerItem {
     },
     RegisterProgram {
         plan: ProgramRegistration,
-        response: crossbeam::channel::Sender<Result<u64>>,
+        response: tokio::sync::oneshot::Sender<Result<u64>>,
     },
     RegisterChannel {
         plan: ChannelRegistrationPlan,
-        response: crossbeam::channel::Sender<Result<RegisteredChannel>>,
+        response: tokio::sync::oneshot::Sender<Result<RegisteredChannel>>,
+    },
+    RegisterChannels {
+        plans: Vec<ChannelRegistrationPlan>,
+        response: tokio::sync::oneshot::Sender<Result<Vec<RegisteredChannel>>>,
     },
     BindInstance {
+        pipeline_id: Option<ProcessId>,
         plan: InstanceBindingPlan,
-        response: crossbeam::channel::Sender<Result<BoundInstance>>,
+        response: tokio::sync::oneshot::Sender<Result<BoundInstance>>,
+    },
+    /// One dispatch registering an instance's channels AND binding it —
+    /// the two per-join controls always run back-to-back with only an
+    /// ordering dependency, and dispatching them separately doubled the
+    /// turnover control convoy (V6 iteration 25 attribution).
+    RegisterChannelsBind {
+        pipeline_id: Option<ProcessId>,
+        plans: Vec<ChannelRegistrationPlan>,
+        /// Some on the program cache's first sight (the driver requires the
+        /// instance's channels registered BEFORE the program — status -5
+        /// otherwise — so registration must ride between channels and bind
+        /// inside the one dispatch); None when the hash is already
+        /// registered, with `bind.program_id` carrying the cached id.
+        program: Option<ProgramRegistration>,
+        bind: InstanceBindingPlan,
+        response:
+            tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
     },
     CopyKv {
         plan: crate::driver::KvCopyPlan,
-        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
+        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
+    },
+    CopyKvTracked {
+        plan: crate::driver::KvCopyPlan,
+        completion: ControlCompletion,
     },
     // Only reached via `SchedulerHandle::copy_state`/`resize_pool`, which
     // the mock-driver fire path doesn't call yet (`scheduler::resize_pool`
@@ -227,36 +414,49 @@ enum SchedulerItem {
     #[allow(dead_code)]
     CopyState {
         plan: StateCopyPlan,
-        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
+        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     #[allow(dead_code)]
     ResizePool {
         plan: PoolResizePlan,
-        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
+        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CloseInstance {
         id: u64,
         pacing_wait_id: u64,
-        response: crossbeam::channel::Sender<Result<()>>,
     },
     CloseChannel {
         id: u64,
-        response: crossbeam::channel::Sender<Result<()>>,
     },
     FreezePipeline {
         pid: ProcessId,
-        response: crossbeam::channel::Sender<()>,
+        response: tokio::sync::oneshot::Sender<()>,
     },
     ResumePipeline(ProcessId),
     /// Event-driven retirement wake: sent by [`NudgeWaker`] when an in-flight
     /// driver submission completion publishes. Carries no work; it only unblocks the
     /// scheduler's wait so the retire pass runs immediately.
     Nudge,
+    /// A pipeline's stream ended gracefully ([`notify_pipeline_finish`],
+    /// F7): set the stream books' `end_seen`; the row auto-leaves at the
+    /// last fire's dispatch (R4-3), or immediately when nothing is
+    /// undispatched.
+    PipelineFinish(ProcessId),
     /// A pipeline left the fleet ([`notify_pipeline_leave`]'s broadcast).
     /// Handled immediately on dequeue (like [`SchedulerItem::Nudge`]): it
     /// only mutates the run-loop's local `WaitAllPolicy`, never touching
     /// `pending`, so it can't reorder control ops or launches.
     PipelineLeave(ProcessId, LeaveKind),
+    /// Snapshot the run loop's state as a human-readable dump (queue
+    /// composition, in-flight work, barrier membership). Answered inline on
+    /// dequeue — a held wave must be inspectable from outside the thread.
+    DebugDump {
+        response: tokio::sync::oneshot::Sender<String>,
+    },
+    /// A driver-lane reply (launch accepted/rejected, control commit).
+    /// Handled immediately on dequeue, like `Nudge` — it mutates only
+    /// in-flight bookkeeping, never queue order.
+    Lane(LaneReply),
     Stop,
 }
 
@@ -297,46 +497,926 @@ fn arm_completion_nudge(completion: &SubmissionCompletion, waker: &std::task::Wa
     true
 }
 
+#[derive(Clone)]
+enum PreLaunchCopy {
+    Kv(crate::driver::KvCopyPlan),
+    State(StateCopyPlan),
+}
+
+impl PreLaunchCopy {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Kv(_) => "KV copy",
+            Self::State(_) => "recurrent-state copy",
+        }
+    }
+}
+
+// =============================================================================
+// Driver lane (V6 iteration 48)
+// =============================================================================
+//
+// A dedicated thread owns the `DriverBackend` and executes EVERY driver call
+// in FIFO post order, so the driver keeps the exact single-threaded
+// serialization it has always had — no driver-side concurrency is introduced.
+// What changes is who blocks: launch submit (1.2–2.5 ms) and lifecycle
+// controls (0.16 ms p50 with 2–10 ms allocator tails) leave the scheduler
+// worker's critical path, which must otherwise fit inside the run-ahead
+// pipelining window (the measured 283–437 ms/run of
+// sched-lag-after-quorum — the fast/slow boot-mode spread — and the
+// 66–88 ms/run of control-occupancy wave gaps).
+//
+// Division of state:
+// - The lane owns the driver and the `channels` registry set (only control
+//   execution ever touched it).
+// - The worker keeps ALL policy and admission state: the quorum, `pending`,
+//   `instances` (read by launch admission and gather on every pass). Control
+//   arms that used to mutate `instances` inline are split: the driver half
+//   runs on the lane, and the map mutation + response happen back on the
+//   worker when the lane's reply arrives (`apply_lane_reply`) — keeping the
+//   invariant that a bind's response is sent only AFTER the instance is
+//   admissible, on the same thread that admits launches.
+// - Replies ride the scheduler's own channel (`SchedulerItem::Lane`), so a
+//   reply wakes the worker exactly like any other event.
+
+/// A [`LaunchSubmission`] in transit to the driver lane.
+///
+/// SAFETY: the submission is `!Send` only through its
+/// `Vec<*mut PieTerminalCell>` — raw pointers into the driver's pinned
+/// terminal-cell slots, which are process-stable allocations with no thread
+/// affinity (the driver itself reads them from its own threads today). The
+/// submission is built complete on the worker, moved to the lane, and
+/// consumed exactly once by `driver.launch` — the same single-consumer
+/// discipline as the worker-inline call this replaces, with the backing
+/// requests kept alive in `in_flight_launches` until the wave retires
+/// (retire happens strictly after the lane's reply).
+struct LaneLaunch(crate::driver::LaunchSubmission);
+unsafe impl Send for LaneLaunch {}
+
+/// Worker → lane requests, executed strictly in FIFO order.
+enum LaneRequest {
+    Launch {
+        token: u64,
+        submission: LaneLaunch,
+    },
+    /// A control `QueuedItem` (never `Launch`/`Prepare`): the lane runs the
+    /// driver half of the old `dispatch_ordered_item` arm.
+    Control {
+        token: u64,
+        item: QueuedItem,
+    },
+    /// Drain marker: the lane replies with the driver and its channel set so
+    /// the worker can run shutdown teardown with everything already quiesced.
+    Shutdown {
+        response: crossbeam::channel::Sender<(Option<DriverBackend>, HashSet<u64>)>,
+    },
+}
+
+/// Lane → worker replies (via `SchedulerItem::Lane`).
+enum LaneReply {
+    LaunchDone {
+        token: u64,
+        result: std::result::Result<SubmissionCompletion, String>,
+        driver_started_us: Option<u64>,
+        launch_returned_us: Option<u64>,
+    },
+    ControlDone {
+        token: u64,
+        commit: LaneCommit,
+    },
+}
+
+/// The worker-side half of a control that the lane finished executing.
+enum LaneCommit {
+    /// Nothing to commit — the lane already sent the response (pure driver
+    /// ops that touch no worker state: program/channel registers, channel
+    /// closes, failed binds after lane-side rollback).
+    None,
+    /// A successful bind: insert the instance, THEN respond (launch admission
+    /// reads `instances` on the worker thread, so respond-after-insert is the
+    /// ordering that makes the guest's first fire admissible).
+    BindInstance {
+        pipeline_id: Option<ProcessId>,
+        bound: BoundInstance,
+        respond: BindRespond,
+    },
+    /// A bind control completed without creating an instance.
+    BindFinished { pipeline_id: Option<ProcessId> },
+    /// A successful driver-side instance close: remove + close wait slots.
+    CloseInstance { id: u64 },
+    /// An async-completing control (copies / pool resizes): install the
+    /// driver's completion into the pending control slot, or clear the slot
+    /// on a synchronous driver rejection.
+    AsyncControl {
+        result: std::result::Result<SubmissionCompletion, String>,
+    },
+}
+
+/// Which response shape a successful bind commits to.
+enum BindRespond {
+    Bind(tokio::sync::oneshot::Sender<Result<BoundInstance>>),
+    ChannelsBind {
+        registered: Vec<RegisteredChannel>,
+        program_id: u64,
+        program_registered: bool,
+        response:
+            tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
+    },
+}
+
+struct DriverLane {
+    /// Launch fast path: served before any queued control. A queued launch
+    /// and a queued control are ALWAYS mutually independent — a close only
+    /// posts once its instance is quiesced (in-flight counts from post), and
+    /// a fire can only exist after its bind COMMITTED on the worker — so
+    /// preferring launches never reorders a dependent pair. Without the
+    /// split, control bursts (a prefix cohort turnover posts hundreds of
+    /// closes + binds faster than the lane drains them) head-of-line block
+    /// the wave train: measured +7 % prefix regression on the single-FIFO
+    /// variant, gaps doubling while sched-lag stayed low.
+    launch_tx: crossbeam::channel::Sender<LaneRequest>,
+    control_tx: crossbeam::channel::Sender<LaneRequest>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DriverLane {
+    fn spawn(
+        driver_idx: usize,
+        driver: Option<DriverBackend>,
+        reply_tx: crossbeam::channel::Sender<SchedulerItem>,
+        stats: Arc<SchedulerStats>,
+    ) -> Self {
+        let (launch_tx, launch_rx) = crossbeam::channel::unbounded::<LaneRequest>();
+        let (control_tx, control_rx) = crossbeam::channel::unbounded::<LaneRequest>();
+        let thread = std::thread::Builder::new()
+            .name(format!("pie-driver-{driver_idx}"))
+            .spawn(move || Self::run(driver, launch_rx, control_rx, reply_tx, stats))
+            .expect("spawn pie-driver lane thread");
+        Self {
+            launch_tx,
+            control_tx,
+            thread: Some(thread),
+        }
+    }
+
+    fn post(&self, request: LaneRequest) {
+        // The lane outlives every poster (shutdown joins it last); a send
+        // failure means the lane thread panicked, which the join reports.
+        let _ = match &request {
+            LaneRequest::Launch { .. } => self.launch_tx.send(request),
+            LaneRequest::Control { .. } | LaneRequest::Shutdown { .. } => {
+                self.control_tx.send(request)
+            }
+        };
+    }
+
+    /// Drain both queues and take the driver + channel set back for
+    /// teardown. The worker only calls this with `lane_inflight == 0`, so
+    /// both queues are empty and the Shutdown marker is the sole item.
+    fn shutdown(&mut self) -> (Option<DriverBackend>, HashSet<u64>) {
+        let (response_tx, response_rx) = crossbeam::channel::bounded(1);
+        let _ = self.control_tx.send(LaneRequest::Shutdown {
+            response: response_tx,
+        });
+        let state = response_rx
+            .recv()
+            .unwrap_or_else(|_| (None, HashSet::new()));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        state
+    }
+
+    /// Receive the next request, launches first. Blocks on both queues when
+    /// idle; between waves (a cadence of idle gaps) queued controls drain,
+    /// so control progress rides the wave rhythm instead of competing with
+    /// it.
+    fn next_request(
+        launch_rx: &crossbeam::channel::Receiver<LaneRequest>,
+        control_rx: &crossbeam::channel::Receiver<LaneRequest>,
+    ) -> std::result::Result<LaneRequest, ()> {
+        use crossbeam::channel::TryRecvError;
+        // Stay HOT for one wave window after going empty before parking.
+        // The lane hop sits on the enqueue-ahead path: a parked lane pays a
+        // thread wake (µs–ms under the box's wake-burst contention) on
+        // every submit, which measurably broke run-ahead pipelining
+        // (81 % → ~30 % of transitions enqueued ahead on the parked
+        // variant). At wave cadence the spin window always covers the next
+        // post, so the submit hop costs a cache-hot poll instead; the lane
+        // parks only after a full window of true idleness (between
+        // requests / at shutdown). The bound reuses the scheduler's own
+        // derived wave-window constant (PIE_SCHED_WAVE_WINDOW_US).
+        let mut spin_until = Instant::now() + quorum::wave_window();
+        loop {
+            match launch_rx.try_recv() {
+                Ok(request) => return Ok(request),
+                // Both senders live in the worker's `DriverLane` handle and
+                // drop together (the graceful path is the Shutdown marker):
+                // drain what remains on the other queue, then stop.
+                Err(TryRecvError::Disconnected) => {
+                    return control_rx.try_recv().map_err(|_| ());
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            match control_rx.try_recv() {
+                Ok(request) => return Ok(request),
+                Err(TryRecvError::Disconnected) => {
+                    return launch_rx.try_recv().map_err(|_| ());
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            if Instant::now() < spin_until {
+                std::hint::spin_loop();
+                continue;
+            }
+            let mut select = crossbeam::channel::Select::new();
+            select.recv(launch_rx);
+            select.recv(control_rx);
+            // Only wait; the loop re-runs the launch-first try_recv order
+            // (and the disconnect handling above) once something is ready,
+            // with a fresh spin window.
+            select.ready();
+            spin_until = Instant::now() + quorum::wave_window();
+        }
+    }
+
+    fn run(
+        mut driver: Option<DriverBackend>,
+        launch_rx: crossbeam::channel::Receiver<LaneRequest>,
+        control_rx: crossbeam::channel::Receiver<LaneRequest>,
+        reply_tx: crossbeam::channel::Sender<SchedulerItem>,
+        stats: Arc<SchedulerStats>,
+    ) {
+        let mut channels: HashSet<u64> = HashSet::new();
+        while let Ok(request) = Self::next_request(&launch_rx, &control_rx) {
+            match request {
+                LaneRequest::Launch { token, submission } => {
+                    let LaneLaunch(submission) = submission;
+                    let timing_enabled = super::fire_timing_enabled();
+                    let driver_started_us = timing_enabled.then(super::fire_timing_now_us);
+                    let result = match driver.as_mut() {
+                        Some(driver) => crate::probe_fire!(
+                            stats.fire.execute.driver_fire_us,
+                            driver.launch(&submission)
+                        )
+                        .map_err(|err| format!("{err:#}")),
+                        None => Err("driver has no backend installed".to_string()),
+                    };
+                    let launch_returned_us = timing_enabled.then(super::fire_timing_now_us);
+                    let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::LaunchDone {
+                        token,
+                        result,
+                        driver_started_us,
+                        launch_returned_us,
+                    }));
+                }
+                LaneRequest::Control { token, item } => {
+                    let control_timing = super::fire_timing_full().then(|| {
+                        (
+                            BatchScheduler::item_kind(&item),
+                            super::fire_timing_now_us(),
+                        )
+                    });
+                    let commit = Self::execute_control(&mut driver, &mut channels, item);
+                    if let Some((kind, started_us)) = control_timing {
+                        let finished_us = super::fire_timing_now_us();
+                        super::fire_timing_write(&serde_json::json!({
+                            "schema": 1,
+                            "source": "scheduler",
+                            "event": "control_dispatched",
+                            "kind": kind,
+                            "started_us": started_us,
+                            "occupancy_us": finished_us.saturating_sub(started_us),
+                        }));
+                    }
+                    let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::ControlDone {
+                        token,
+                        commit,
+                    }));
+                }
+                LaneRequest::Shutdown { response } => {
+                    let _ = response.send((driver.take(), std::mem::take(&mut channels)));
+                    return;
+                }
+            }
+        }
+        // Worker dropped its sender without a shutdown handshake (panic
+        // path): release the driver here.
+        drop(driver.take());
+    }
+
+    /// The driver half of the old `dispatch_ordered_item`: everything a
+    /// control does against the driver and the lane-owned `channels` set,
+    /// with worker-map effects returned as a [`LaneCommit`]. Failures respond
+    /// directly from here (after lane-side rollback) — only effects that
+    /// must be ordered with worker state travel back.
+    fn execute_control(
+        driver: &mut Option<DriverBackend>,
+        channels: &mut HashSet<u64>,
+        item: QueuedItem,
+    ) -> LaneCommit {
+        match item {
+            QueuedItem::Launch(_) => unreachable!(),
+            QueuedItem::PreLaunchCopy {
+                plan: _,
+                logical_completion,
+                ..
+            } if logical_completion.is_settled() => LaneCommit::AsyncControl {
+                result: Err("pre-launch copy already settled".to_string()),
+            },
+            QueuedItem::PreLaunchCopy {
+                plan: _,
+                logical_completion,
+                ..
+            } if logical_completion.cancel_requested() => {
+                logical_completion
+                    .reject_unsubmitted("logical fire cancelled before pre-launch copy");
+                LaneCommit::AsyncControl {
+                    result: Err("logical fire cancelled before pre-launch copy".to_string()),
+                }
+            }
+            QueuedItem::PreLaunchCopy {
+                plan,
+                logical_completion,
+                ..
+            } => {
+                let operation = plan.label();
+                match driver.as_mut() {
+                    Some(driver) => {
+                        let submitted = match plan {
+                            PreLaunchCopy::Kv(plan) => driver.copy_kv(&plan),
+                            PreLaunchCopy::State(plan) => driver.copy_state(&plan),
+                        };
+                        match submitted {
+                            Ok(completion) => LaneCommit::AsyncControl {
+                                result: Ok(completion),
+                            },
+                            Err(error) => {
+                                let message = format!("pre-launch {operation} rejected: {error:#}");
+                                logical_completion.reject_unsubmitted(message.clone());
+                                LaneCommit::AsyncControl {
+                                    result: Err(message),
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        logical_completion.reject_unsubmitted("driver has no backend installed");
+                        LaneCommit::AsyncControl {
+                            result: Err("driver has no backend installed".to_string()),
+                        }
+                    }
+                }
+            }
+            QueuedItem::RegisterProgram { plan, response } => {
+                if response.is_closed() {
+                    tracing::warn!(
+                        operation = "register_program",
+                        "scheduler RPC cancelled before resource creation"
+                    );
+                    return LaneCommit::None;
+                }
+                let result = match driver.as_mut() {
+                    Some(driver) => driver.register_program(&plan),
+                    None => Err(anyhow!("driver has no backend installed")),
+                };
+                match result {
+                    Ok(program_id) => {
+                        if response.send(Ok(program_id)).is_err() {
+                            tracing::warn!(
+                                operation = "register_program",
+                                program_hash = format_args!("0x{:016x}", plan.program_hash),
+                                "scheduler RPC cancelled after program registration; retaining driver-lifetime program"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                    }
+                }
+                LaneCommit::None
+            }
+            QueuedItem::RegisterChannel { plan, response } => {
+                if response.is_closed() {
+                    Self::release_channel_plan_wait_slots(std::slice::from_ref(&plan));
+                    tracing::warn!(
+                        operation = "register_channel",
+                        channel_id = plan.channel_id,
+                        "scheduler RPC cancelled before resource creation"
+                    );
+                    return LaneCommit::None;
+                }
+                let result = if channels.contains(&plan.channel_id) {
+                    Err(anyhow!("channel {} is already registered", plan.channel_id))
+                } else {
+                    match driver.as_mut() {
+                        Some(driver) => driver.register_channel(&plan).map(|channel| {
+                            channels.insert(plan.channel_id);
+                            channel
+                        }),
+                        None => Err(anyhow!("driver has no backend installed")),
+                    }
+                };
+                match result {
+                    Ok(channel) => {
+                        if let Err(Ok(channel)) = response.send(Ok(channel)) {
+                            if let Some(driver) = driver.as_mut() {
+                                Self::rollback_channel_set(
+                                    driver,
+                                    channels,
+                                    std::slice::from_ref(&channel),
+                                    "register_channel",
+                                    true,
+                                );
+                            }
+                            Self::release_registered_channel_wait_slots(std::slice::from_ref(
+                                &channel,
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        if response.send(Err(error)).is_err() {
+                            Self::release_channel_plan_wait_slots(std::slice::from_ref(&plan));
+                        }
+                    }
+                }
+                LaneCommit::None
+            }
+            QueuedItem::RegisterChannels { plans, response } => {
+                if response.is_closed() {
+                    Self::release_channel_plan_wait_slots(&plans);
+                    tracing::warn!(
+                        operation = "register_channels",
+                        "scheduler RPC cancelled before resource creation"
+                    );
+                    return LaneCommit::None;
+                }
+                let result = match driver.as_mut() {
+                    Some(driver) => Self::register_channel_set(driver, channels, &plans),
+                    None => Err(anyhow!("driver has no backend installed")),
+                };
+                match result {
+                    Ok(registered) => {
+                        if let Err(Ok(registered)) = response.send(Ok(registered)) {
+                            if let Some(driver) = driver.as_mut() {
+                                Self::rollback_channel_set(
+                                    driver,
+                                    channels,
+                                    &registered,
+                                    "register_channels",
+                                    true,
+                                );
+                            }
+                            Self::release_registered_channel_wait_slots(&registered);
+                        }
+                    }
+                    Err(error) => {
+                        if response.send(Err(error)).is_err() {
+                            Self::release_channel_plan_wait_slots(&plans);
+                        }
+                    }
+                }
+                LaneCommit::None
+            }
+            QueuedItem::BindInstance {
+                pipeline_id,
+                plan,
+                response,
+            } => {
+                if response.is_closed() {
+                    DriverLane::release_wait_slots([plan.pacing_wait_id]);
+                    tracing::warn!(
+                        operation = "bind_instance",
+                        requested_instance_id = plan.requested_instance_id,
+                        "scheduler RPC cancelled before resource creation"
+                    );
+                    return LaneCommit::BindFinished { pipeline_id };
+                }
+                match driver.as_mut() {
+                    Some(driver) => match driver.bind_instance(&plan) {
+                        Ok(bound) => LaneCommit::BindInstance {
+                            pipeline_id,
+                            bound,
+                            respond: BindRespond::Bind(response),
+                        },
+                        Err(error) => {
+                            if response.send(Err(error)).is_err() {
+                                DriverLane::release_wait_slots([plan.pacing_wait_id]);
+                            }
+                            LaneCommit::BindFinished { pipeline_id }
+                        }
+                    },
+                    None => {
+                        if response
+                            .send(Err(anyhow!("driver has no backend installed")))
+                            .is_err()
+                        {
+                            Self::release_wait_slots([plan.pacing_wait_id]);
+                        }
+                        LaneCommit::BindFinished { pipeline_id }
+                    }
+                }
+            }
+            QueuedItem::RegisterChannelsBind {
+                pipeline_id,
+                plans,
+                program,
+                mut bind,
+                response,
+            } => {
+                if response.is_closed() {
+                    DriverLane::release_channel_plan_wait_slots(&plans);
+                    DriverLane::release_wait_slots([bind.pacing_wait_id]);
+                    tracing::warn!(
+                        operation = "register_channels_bind",
+                        requested_instance_id = bind.requested_instance_id,
+                        "scheduler RPC cancelled before resource creation"
+                    );
+                    return LaneCommit::BindFinished { pipeline_id };
+                }
+                let Some(driver) = driver.as_mut() else {
+                    if response
+                        .send(Err(anyhow!("driver has no backend installed")))
+                        .is_err()
+                    {
+                        DriverLane::release_channel_plan_wait_slots(&plans);
+                        DriverLane::release_wait_slots([bind.pacing_wait_id]);
+                    }
+                    return LaneCommit::BindFinished { pipeline_id };
+                };
+                let registered = match Self::register_channel_set(driver, channels, &plans) {
+                    Ok(registered) => registered,
+                    Err(error) => {
+                        if response.send(Err(error)).is_err() {
+                            Self::release_channel_plan_wait_slots(&plans);
+                            Self::release_wait_slots([bind.pacing_wait_id]);
+                        }
+                        return LaneCommit::BindFinished { pipeline_id };
+                    }
+                };
+                if response.is_closed() {
+                    Self::rollback_channel_set(
+                        driver,
+                        channels,
+                        &registered,
+                        "register_channels_bind",
+                        true,
+                    );
+                    DriverLane::release_registered_channel_wait_slots(&registered);
+                    Self::release_wait_slots([bind.pacing_wait_id]);
+                    return LaneCommit::BindFinished { pipeline_id };
+                }
+                let program_registered = program.is_some();
+                if let Some(plan) = &program {
+                    match driver.register_program(plan) {
+                        Ok(program_id) => bind.program_id = program_id,
+                        Err(error) => {
+                            Self::rollback_channel_set(
+                                driver,
+                                channels,
+                                &registered,
+                                "register_channels_bind",
+                                false,
+                            );
+                            if response.send(Err(error)).is_err() {
+                                DriverLane::release_registered_channel_wait_slots(&registered);
+                                Self::release_wait_slots([bind.pacing_wait_id]);
+                            }
+                            return LaneCommit::BindFinished { pipeline_id };
+                        }
+                    }
+                }
+                if response.is_closed() {
+                    Self::rollback_channel_set(
+                        driver,
+                        channels,
+                        &registered,
+                        "register_channels_bind",
+                        true,
+                    );
+                    Self::release_registered_channel_wait_slots(&registered);
+                    Self::release_wait_slots([bind.pacing_wait_id]);
+                    if program_registered {
+                        tracing::warn!(
+                            operation = "register_channels_bind",
+                            program_id = bind.program_id,
+                            "scheduler RPC cancelled after program registration; retaining driver-lifetime program"
+                        );
+                    }
+                    return LaneCommit::BindFinished { pipeline_id };
+                }
+                match driver.bind_instance(&bind) {
+                    Ok(bound) => LaneCommit::BindInstance {
+                        pipeline_id,
+                        bound,
+                        respond: BindRespond::ChannelsBind {
+                            registered,
+                            program_id: bind.program_id,
+                            program_registered,
+                            response,
+                        },
+                    },
+                    Err(error) => {
+                        Self::rollback_channel_set(
+                            driver,
+                            channels,
+                            &registered,
+                            "register_channels_bind",
+                            false,
+                        );
+                        if response.send(Err(error)).is_err() {
+                            Self::release_registered_channel_wait_slots(&registered);
+                            Self::release_wait_slots([bind.pacing_wait_id]);
+                        }
+                        LaneCommit::BindFinished { pipeline_id }
+                    }
+                }
+            }
+            QueuedItem::CopyKv { plan, response } => match driver.as_mut() {
+                Some(driver) => match driver.copy_kv(&plan) {
+                    Ok(completion) => {
+                        let _ = response.send(Ok(completion.clone()));
+                        LaneCommit::AsyncControl {
+                            result: Ok(completion),
+                        }
+                    }
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        let _ = response.send(Err(err));
+                        LaneCommit::AsyncControl {
+                            result: Err(message),
+                        }
+                    }
+                },
+                None => {
+                    let _ = response.send(Err(anyhow!("driver has no backend installed")));
+                    LaneCommit::AsyncControl {
+                        result: Err("driver has no backend installed".to_string()),
+                    }
+                }
+            },
+            QueuedItem::CopyKvTracked { plan, completion } => match driver.as_mut() {
+                Some(driver) => match driver.copy_kv(&plan) {
+                    Ok(native_completion) => LaneCommit::AsyncControl {
+                        result: Ok(native_completion),
+                    },
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        completion.resolve(&Err(error));
+                        LaneCommit::AsyncControl {
+                            result: Err(message),
+                        }
+                    }
+                },
+                None => {
+                    completion.resolve(&Err(anyhow!("driver has no backend installed")));
+                    LaneCommit::AsyncControl {
+                        result: Err("driver has no backend installed".to_string()),
+                    }
+                }
+            },
+            QueuedItem::CopyState { plan, response } => match driver.as_mut() {
+                Some(driver) => match driver.copy_state(&plan) {
+                    Ok(completion) => {
+                        let _ = response.send(Ok(completion.clone()));
+                        LaneCommit::AsyncControl {
+                            result: Ok(completion),
+                        }
+                    }
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        let _ = response.send(Err(err));
+                        LaneCommit::AsyncControl {
+                            result: Err(message),
+                        }
+                    }
+                },
+                None => {
+                    let _ = response.send(Err(anyhow!("driver has no backend installed")));
+                    LaneCommit::AsyncControl {
+                        result: Err("driver has no backend installed".to_string()),
+                    }
+                }
+            },
+            QueuedItem::ResizePool { plan, response } => match driver.as_mut() {
+                Some(driver) => match driver.resize_pool(&plan) {
+                    Ok(completion) => {
+                        let _ = response.send(Ok(completion.clone()));
+                        LaneCommit::AsyncControl {
+                            result: Ok(completion),
+                        }
+                    }
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        let _ = response.send(Err(err));
+                        LaneCommit::AsyncControl {
+                            result: Err(message),
+                        }
+                    }
+                },
+                None => {
+                    let _ = response.send(Err(anyhow!("driver has no backend installed")));
+                    LaneCommit::AsyncControl {
+                        result: Err("driver has no backend installed".to_string()),
+                    }
+                }
+            },
+            QueuedItem::CloseInstance { id, .. } => match driver.as_mut() {
+                // The worker already gated existence/pacing/quiescence before
+                // posting; the map removal happens at commit.
+                Some(driver) => match driver.close_instance(id) {
+                    Ok(()) => LaneCommit::CloseInstance { id },
+                    Err(err) => {
+                        tracing::warn!(instance_id = id, ?err, "scheduler close_instance failed");
+                        LaneCommit::None
+                    }
+                },
+                None => {
+                    tracing::warn!(instance_id = id, "scheduler has no backend installed");
+                    LaneCommit::None
+                }
+            },
+            QueuedItem::CloseChannel { id } => {
+                let result = if !channels.contains(&id) {
+                    Err(anyhow!("channel {id} is unknown or stale"))
+                } else {
+                    match driver.as_mut() {
+                        Some(driver) => driver.close_channel(id).map(|()| {
+                            channels.remove(&id);
+                        }),
+                        None => Err(anyhow!("driver has no backend installed")),
+                    }
+                };
+                if let Err(err) = result {
+                    tracing::warn!(channel_id = id, ?err, "scheduler close_channel failed");
+                }
+                LaneCommit::None
+            }
+        }
+    }
+
+    /// Register a set of channels with all-or-nothing rollback (the shared
+    /// body of `RegisterChannels` and `RegisterChannelsBind`).
+    fn register_channel_set(
+        driver: &mut DriverBackend,
+        channels: &mut HashSet<u64>,
+        plans: &[ChannelRegistrationPlan],
+    ) -> Result<Vec<RegisteredChannel>> {
+        let mut registered = Vec::with_capacity(plans.len());
+        let mut registered_ids = Vec::with_capacity(plans.len());
+        for plan in plans {
+            if channels.contains(&plan.channel_id) {
+                for channel_id in registered_ids.iter().rev() {
+                    let _ = driver.close_channel(*channel_id);
+                    channels.remove(channel_id);
+                }
+                return Err(anyhow!("channel {} is already registered", plan.channel_id));
+            }
+            match driver.register_channel(plan) {
+                Ok(channel) => {
+                    channels.insert(plan.channel_id);
+                    registered_ids.push(plan.channel_id);
+                    registered.push(channel);
+                }
+                Err(cause) => {
+                    for channel_id in registered_ids.iter().rev() {
+                        let _ = driver.close_channel(*channel_id);
+                        channels.remove(channel_id);
+                    }
+                    return Err(cause);
+                }
+            }
+        }
+        Ok(registered)
+    }
+
+    fn rollback_channel_set(
+        driver: &mut DriverBackend,
+        channels: &mut HashSet<u64>,
+        registered: &[RegisteredChannel],
+        operation: &'static str,
+        cancellation: bool,
+    ) {
+        for channel in registered.iter().rev() {
+            let channel_id = channel.binding.channel_id;
+            match driver.close_channel(channel_id) {
+                Ok(()) => {
+                    channels.remove(&channel_id);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        operation,
+                        cancellation,
+                        channel_id,
+                        ?error,
+                        "scheduler cancellation rollback close_channel failed"
+                    );
+                }
+            }
+        }
+        tracing::warn!(
+            operation,
+            cancellation,
+            channel_count = registered.len(),
+            "scheduler registration rollback closed registered channels"
+        );
+    }
+
+    fn release_channel_plan_wait_slots(plans: &[ChannelRegistrationPlan]) {
+        Self::release_wait_slots(
+            plans
+                .iter()
+                .flat_map(|plan| [plan.reader_wait_id, plan.writer_wait_id]),
+        );
+    }
+
+    fn release_registered_channel_wait_slots(registered: &[RegisteredChannel]) {
+        Self::release_wait_slots(
+            registered
+                .iter()
+                .flat_map(|channel| [channel.reader_wait_id, channel.writer_wait_id]),
+        );
+    }
+
+    fn release_wait_slots(wait_ids: impl IntoIterator<Item = u64>) {
+        let wait_ids: Vec<u64> = wait_ids.into_iter().collect();
+        let table = pie_waker::WakerTable::global();
+        table.sweep(&wait_ids);
+        for wait_id in wait_ids {
+            table.deregister(wait_id);
+            table.free(wait_id);
+        }
+    }
+}
+
 enum QueuedItem {
     Launch(PendingRequest),
-    Prepare(PendingRequest),
     PreLaunchCopy {
-        plan: crate::driver::KvCopyPlan,
+        plan: PreLaunchCopy,
         logical_completion: WorkItemCompletion,
         pipeline_id: Option<ProcessId>,
+        credit_ready: bool,
+        /// The coupled launch's quorum identity stamp (W1): the credit this
+        /// copy publishes at retire belongs to that launch, so it must
+        /// route through the same generation check.
+        quorum_generation: u64,
     },
     RegisterProgram {
         plan: ProgramRegistration,
-        response: crossbeam::channel::Sender<Result<u64>>,
+        response: tokio::sync::oneshot::Sender<Result<u64>>,
     },
     RegisterChannel {
         plan: ChannelRegistrationPlan,
-        response: crossbeam::channel::Sender<Result<RegisteredChannel>>,
+        response: tokio::sync::oneshot::Sender<Result<RegisteredChannel>>,
+    },
+    RegisterChannels {
+        plans: Vec<ChannelRegistrationPlan>,
+        response: tokio::sync::oneshot::Sender<Result<Vec<RegisteredChannel>>>,
     },
     BindInstance {
+        pipeline_id: Option<ProcessId>,
         plan: InstanceBindingPlan,
-        response: crossbeam::channel::Sender<Result<BoundInstance>>,
+        response: tokio::sync::oneshot::Sender<Result<BoundInstance>>,
+    },
+    /// One dispatch registering an instance's channels AND binding it —
+    /// the two per-join controls always run back-to-back with only an
+    /// ordering dependency, and dispatching them separately doubled the
+    /// turnover control convoy (V6 iteration 25 attribution).
+    RegisterChannelsBind {
+        pipeline_id: Option<ProcessId>,
+        plans: Vec<ChannelRegistrationPlan>,
+        /// Some on the program cache's first sight (the driver requires the
+        /// instance's channels registered BEFORE the program — status -5
+        /// otherwise — so registration must ride between channels and bind
+        /// inside the one dispatch); None when the hash is already
+        /// registered, with `bind.program_id` carrying the cached id.
+        program: Option<ProgramRegistration>,
+        bind: InstanceBindingPlan,
+        response:
+            tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
     },
     CopyKv {
         plan: crate::driver::KvCopyPlan,
-        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
+        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
+    },
+    CopyKvTracked {
+        plan: crate::driver::KvCopyPlan,
+        completion: ControlCompletion,
     },
     CopyState {
         plan: StateCopyPlan,
-        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
+        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     ResizePool {
         plan: PoolResizePlan,
-        response: crossbeam::channel::Sender<Result<SubmissionCompletion>>,
+        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CloseInstance {
         id: u64,
         pacing_wait_id: u64,
-        response: crossbeam::channel::Sender<Result<()>>,
     },
     CloseChannel {
         id: u64,
-        response: crossbeam::channel::Sender<Result<()>>,
     },
 }
 
@@ -346,23 +1426,51 @@ enum QueueEnd {
     Back,
 }
 
+/// A posted launch's lane lifecycle: the batch enters `in_flight_launches`
+/// (and the run-ahead depth) at POST; the driver's verdict arrives as a
+/// `LaneReply::LaunchDone` and upgrades the state. Retirement only ever
+/// consumes `Accepted` (settled) or `Failed` heads — a `Posted` head is
+/// simply not ready yet.
+enum LaunchState {
+    Posted { token: u64 },
+    Accepted(SubmissionCompletion),
+    Failed(String),
+}
+
 struct PendingLaunchBatch {
-    completion: SubmissionCompletion,
+    state: LaunchState,
     requests: Vec<PendingRequest>,
+    pipeline_epochs: Vec<Option<quorum::PipelineEpoch>>,
     started: Instant,
     batch_size: u64,
     total_tokens: usize,
+    timing: Option<WaveTimingState>,
+}
+
+/// The control slot's lane lifecycle (async-completing controls only —
+/// copies and pool resizes; lifecycle controls never occupy the slot).
+enum ControlSlotState {
+    Posted { token: u64 },
+    Ready(SubmissionCompletion),
 }
 
 struct PendingControl {
-    completion: SubmissionCompletion,
+    state: ControlSlotState,
     logical_completion: Option<WorkItemCompletion>,
     pipeline_id: Option<ProcessId>,
+    tracked_completion: Option<ControlCompletion>,
+    operation: &'static str,
+    credit_ready: bool,
+    /// See `QueuedItem::PreLaunchCopy::quorum_generation` (W1).
+    quorum_generation: u64,
 }
 
 struct SchedulerControl {
     tx: crossbeam::channel::Sender<SchedulerItem>,
-    gate: Mutex<()>,
+    active_senders: AtomicUsize,
+    shutdown_wait: Condvar,
+    shutdown_gate: Mutex<()>,
+    program_ids: Mutex<HashMap<u64, (u64, Vec<u8>, Vec<u8>)>>,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
 }
@@ -374,22 +1482,52 @@ pub(crate) struct SchedulerHandle {
 
 impl SchedulerHandle {
     fn send(&self, item: SchedulerItem) -> Result<()> {
-        let _guard = self.inner.gate.lock().unwrap();
-        if !self.inner.accepting.load(Ordering::Acquire) {
+        if !self.inner.accepting.load(Ordering::SeqCst) {
             return Err(anyhow!("scheduler shutting down"));
         }
-        self.inner
+        self.inner.active_senders.fetch_add(1, Ordering::SeqCst);
+        if !self.inner.accepting.load(Ordering::SeqCst) {
+            self.finish_send();
+            return Err(anyhow!("scheduler shutting down"));
+        }
+        let result = self
+            .inner
             .tx
             .send(item)
-            .map_err(|_| anyhow!("scheduler channel closed"))
+            .map_err(|_| anyhow!("scheduler channel closed"));
+        self.finish_send();
+        result
+    }
+
+    fn finish_send(&self) {
+        if self.inner.active_senders.fetch_sub(1, Ordering::SeqCst) == 1
+            && !self.inner.accepting.load(Ordering::SeqCst)
+        {
+            let _guard = self.inner.shutdown_gate.lock().unwrap();
+            self.inner.shutdown_wait.notify_all();
+        }
     }
 
     fn begin_shutdown(&self) {
-        let _guard = self.inner.gate.lock().unwrap();
-        if !self.inner.accepting.swap(false, Ordering::AcqRel) {
+        if !self.inner.accepting.swap(false, Ordering::SeqCst) {
             return;
         }
+        let mut guard = self.inner.shutdown_gate.lock().unwrap();
+        while self.inner.active_senders.load(Ordering::SeqCst) != 0 {
+            guard = self.inner.shutdown_wait.wait(guard).unwrap();
+        }
         let _ = self.inner.tx.send(SchedulerItem::Stop);
+    }
+
+    async fn request<T>(
+        &self,
+        make: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> SchedulerItem,
+    ) -> Result<T> {
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        self.send(make(response))?;
+        receiver
+            .await
+            .map_err(|_| anyhow!("scheduler channel closed"))
     }
 
     /// This driver's lock-free stats snapshot (read by
@@ -403,24 +1541,24 @@ impl SchedulerHandle {
         request: crate::driver::LaunchPlan,
         instance_id: u64,
         completion: WorkItemCompletion,
-        physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
         pipeline_id: Option<ProcessId>,
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
+        prelaunch_state_copy: Option<StateCopyPlan>,
+        timing_enabled: bool,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
                 request,
                 instance_id,
                 completion,
-                physical_page_ids,
                 last_page_len,
                 pipeline_id,
-                None,
                 false,
                 prelaunch_copy,
+                prelaunch_state_copy,
                 None,
-                None,
+                timing_enabled,
             ),
         })
     }
@@ -430,50 +1568,51 @@ impl SchedulerHandle {
         request: crate::driver::LaunchPlan,
         instance_id: u64,
         completion: WorkItemCompletion,
-        physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
+        prelaunch_state_copy: Option<StateCopyPlan>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
                 request,
                 instance_id,
                 completion,
-                physical_page_ids,
                 last_page_len,
-                None,
                 None,
                 true,
                 prelaunch_copy,
+                prelaunch_state_copy,
                 None,
-                None,
+                super::fire_timing_full(),
             ),
         })
     }
 
-    pub fn submit_deferred(
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_prebuilt_tracked_with_copy(
         &self,
         request: crate::driver::LaunchPlan,
         instance_id: u64,
         completion: WorkItemCompletion,
-        pipeline_id: Option<ProcessId>,
-        preparation_order_key: Option<u64>,
-        preparation: LaunchPreparation,
+        last_page_len: u32,
+        pipeline_id: ProcessId,
+        prelaunch_copy: Option<crate::driver::KvCopyPlan>,
+        prelaunch_state_copy: Option<StateCopyPlan>,
         retry_classifier: Option<RetryClassifier>,
+        timing_enabled: bool,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
                 request,
                 instance_id,
                 completion,
-                Vec::new(),
-                0,
-                pipeline_id,
-                preparation_order_key,
-                false,
-                None,
-                Some(preparation),
+                last_page_len,
+                Some(pipeline_id),
+                true,
+                prelaunch_copy,
+                prelaunch_state_copy,
                 retry_classifier,
+                timing_enabled,
             ),
         })
     }
@@ -482,71 +1621,166 @@ impl SchedulerHandle {
         self.send(SchedulerItem::Nudge)
     }
 
-    pub(crate) fn freeze_pipeline(&self, pid: ProcessId) -> Result<()> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.send(SchedulerItem::FreezePipeline { pid, response: tx })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))
+    pub(crate) async fn freeze_pipeline(&self, pid: ProcessId) -> Result<()> {
+        self.request(|response| SchedulerItem::FreezePipeline { pid, response })
+            .await
     }
 
     pub(crate) fn resume_pipeline(&self, pid: ProcessId) -> Result<()> {
         self.send(SchedulerItem::ResumePipeline(pid))
     }
 
-    pub fn register_program(&self, plan: ProgramRegistration) -> Result<u64> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.send(SchedulerItem::RegisterProgram { plan, response: tx })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+    pub async fn register_program(&self, plan: ProgramRegistration) -> Result<u64> {
+        let program_hash = plan.program_hash;
+        {
+            let program_ids = self.inner.program_ids.lock().unwrap();
+            if let Some((program_id, canonical, sidecar)) = program_ids.get(&program_hash) {
+                if canonical != &plan.canonical_bytes || sidecar != &plan.sidecar_bytes {
+                    return Err(anyhow!("program hash collision for 0x{program_hash:016x}"));
+                }
+                return Ok(*program_id);
+            }
+        }
+        let canonical = plan.canonical_bytes.clone();
+        let sidecar = plan.sidecar_bytes.clone();
+        let program_id = self
+            .request(|response| SchedulerItem::RegisterProgram { plan, response })
+            .await??;
+        self.inner
+            .program_ids
+            .lock()
+            .unwrap()
+            .insert(program_hash, (program_id, canonical, sidecar));
+        Ok(program_id)
     }
 
-    pub fn register_channel(&self, plan: ChannelRegistrationPlan) -> Result<RegisteredChannel> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.send(SchedulerItem::RegisterChannel { plan, response: tx })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+    pub async fn register_channel(
+        &self,
+        plan: ChannelRegistrationPlan,
+    ) -> Result<RegisteredChannel> {
+        self.request(|response| SchedulerItem::RegisterChannel { plan, response })
+            .await?
     }
 
-    pub fn bind_instance(&self, plan: InstanceBindingPlan) -> Result<BoundInstance> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.send(SchedulerItem::BindInstance { plan, response: tx })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+    pub async fn register_channels(
+        &self,
+        plans: Vec<ChannelRegistrationPlan>,
+    ) -> Result<Vec<RegisteredChannel>> {
+        self.request(|response| SchedulerItem::RegisterChannels { plans, response })
+            .await?
     }
 
-    pub fn copy_kv(&self, plan: crate::driver::KvCopyPlan) -> Result<SubmissionCompletion> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.send(SchedulerItem::CopyKv { plan, response: tx })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+    pub async fn bind_instance(
+        &self,
+        pipeline_id: Option<ProcessId>,
+        plan: InstanceBindingPlan,
+    ) -> Result<BoundInstance> {
+        self.request(|response| SchedulerItem::BindInstance {
+            pipeline_id,
+            plan,
+            response,
+        })
+        .await?
+    }
+
+    pub async fn register_channels_bind(
+        &self,
+        pipeline_id: Option<ProcessId>,
+        plans: Vec<ChannelRegistrationPlan>,
+        program: ProgramRegistration,
+        mut bind: InstanceBindingPlan,
+    ) -> Result<(Vec<RegisteredChannel>, BoundInstance)> {
+        let program_hash = program.program_hash;
+        let cached = {
+            let program_ids = self.inner.program_ids.lock().unwrap();
+            match program_ids.get(&program_hash) {
+                Some((program_id, canonical, sidecar)) => {
+                    if canonical != &program.canonical_bytes || sidecar != &program.sidecar_bytes {
+                        return Err(anyhow!("program hash collision for 0x{program_hash:016x}"));
+                    }
+                    Some(*program_id)
+                }
+                None => None,
+            }
+        };
+        let (program_field, cache_fill) = match cached {
+            Some(program_id) => {
+                bind.program_id = program_id;
+                (None, None)
+            }
+            None => (
+                Some(program.clone()),
+                Some((program.canonical_bytes, program.sidecar_bytes)),
+            ),
+        };
+        let (registered, program_id, bound) = self
+            .request(|response| SchedulerItem::RegisterChannelsBind {
+                pipeline_id,
+                plans,
+                program: program_field,
+                bind,
+                response,
+            })
+            .await??;
+        if let Some((canonical, sidecar)) = cache_fill {
+            self.inner
+                .program_ids
+                .lock()
+                .unwrap()
+                .insert(program_hash, (program_id, canonical, sidecar));
+        }
+        Ok((registered, bound))
+    }
+
+    pub async fn copy_kv(&self, plan: crate::driver::KvCopyPlan) -> Result<SubmissionCompletion> {
+        self.request(|response| SchedulerItem::CopyKv { plan, response })
+            .await?
+    }
+
+    pub(crate) fn copy_kv_tracked(
+        &self,
+        plan: crate::driver::KvCopyPlan,
+    ) -> Result<ControlCompletion> {
+        let completion = ControlCompletion::new();
+        self.send(SchedulerItem::CopyKvTracked {
+            plan,
+            completion: completion.clone(),
+        })?;
+        Ok(completion)
+    }
+
+    /// Human-readable snapshot of the run loop's state (see
+    /// [`SchedulerItem::DebugDump`]).
+    pub(crate) async fn debug_dump(&self) -> Result<String> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.request(|response| SchedulerItem::DebugDump { response }),
+        )
+        .await
+        .map_err(|_| anyhow!("scheduler did not answer the debug dump"))?
     }
 
     // Only called from `scheduler::dispatch::copy_rs_d2d`/`resize_pool`
     // (not yet issued by the mock-driver fire path) and this module's own
     // unit tests — see `scheduler::dispatch`'s module doc.
     #[allow(dead_code)]
-    pub fn copy_state(&self, plan: StateCopyPlan) -> Result<SubmissionCompletion> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.send(SchedulerItem::CopyState { plan, response: tx })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+    pub async fn copy_state(&self, plan: StateCopyPlan) -> Result<SubmissionCompletion> {
+        self.request(|response| SchedulerItem::CopyState { plan, response })
+            .await?
     }
 
     #[allow(dead_code)]
-    pub fn resize_pool(&self, plan: PoolResizePlan) -> Result<SubmissionCompletion> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.send(SchedulerItem::ResizePool { plan, response: tx })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+    pub async fn resize_pool(&self, plan: PoolResizePlan) -> Result<SubmissionCompletion> {
+        self.request(|response| SchedulerItem::ResizePool { plan, response })
+            .await?
     }
 
     pub fn close_instance(&self, id: u64, pacing_wait_id: u64) -> Result<()> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.send(SchedulerItem::CloseInstance {
-            id,
-            pacing_wait_id,
-            response: tx,
-        })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+        self.send(SchedulerItem::CloseInstance { id, pacing_wait_id })
     }
 
     pub fn close_channel(&self, id: u64) -> Result<()> {
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.send(SchedulerItem::CloseChannel { id, response: tx })?;
-        rx.recv().map_err(|_| anyhow!("scheduler channel closed"))?
+        self.send(SchedulerItem::CloseChannel { id })
     }
 }
 
@@ -570,7 +1804,10 @@ impl BatchScheduler {
         let handle = SchedulerHandle {
             inner: Arc::new(SchedulerControl {
                 tx,
-                gate: Mutex::new(()),
+                active_senders: AtomicUsize::new(0),
+                shutdown_wait: Condvar::new(),
+                shutdown_gate: Mutex::new(()),
+                program_ids: Mutex::new(HashMap::new()),
                 accepting: AtomicBool::new(true),
                 stats: Arc::clone(&stats),
             }),
@@ -619,70 +1856,80 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: Arc<SchedulerStats>,
     ) {
-        let nudge_waker = std::task::Waker::from(Arc::new(NudgeWaker { tx: nudge_tx }));
-        let mut driver = crate::driver::take_driver_backend(driver_id).ok();
+        let lane_reply_tx = nudge_tx.clone();
+        let nudge_waker = std::task::Waker::from(Arc::new(NudgeWaker {
+            tx: nudge_tx.clone(),
+        }));
+        let driver = crate::driver::take_driver_backend(driver_id).ok();
+        let mut lane = DriverLane::spawn(driver_id, driver, lane_reply_tx, Arc::clone(&stats));
+        // Worker→lane requests not yet replied to (launch posts + control
+        // posts). Shutdown may only tear down once this drains — every lane
+        // request produces exactly one reply.
+        let mut lane_inflight: u64 = 0;
+        let mut lane_token: u64 = 0;
         let mut instances = HashMap::new();
-        let mut channels = HashSet::new();
         let mut pending = VecDeque::new();
-        let mut blocked_preparations = VecDeque::new();
         let mut frozen_pipelines = HashSet::new();
+        // Pipelines that LEFT the fleet (terminate / preempt) with work still
+        // in flight. A protected straggler resolving later must ride the wave
+        // untracked instead of re-arming the barrier on a ghost (RV-20); the
+        // pipeline's own next request is its implicit rejoin.
+        let mut departed_pipelines: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = None;
         let mut stopping = false;
         // The wait-for-all-active-pipelines fire rule (overview §7.2): one
         // instance per driver thread, mirroring `instances`/`channels` above.
+        // Every backend schedules the same way; density comes from the wave,
+        // throughput from run-ahead depth within it.
         let mut policy =
             quorum::WaitAllPolicy::new(limits.max_forward_requests, Some(Arc::clone(&stats)));
+        // Stall self-diagnosis: a scheduler that spins on the backstop with
+        // queued or in-flight work and zero progress is deadlocked from the
+        // caller's point of view, and every wait in this loop is silent. After
+        // 10s of that, print the full state dump so the wedge names itself
+        // (then re-print every 60s while it persists).
+        let mut stall_since: Option<std::time::Instant> = None;
+        let mut stall_dumps: u32 = 0;
 
         loop {
             let mut progress = false;
-            progress |= Self::retire_ready_launches(
-                &mut in_flight_launches,
-                &mut instances,
-                &mut pending,
-                &stats,
-                &mut policy,
-                stopping,
-            );
-            progress |= Self::retire_ready_control(&mut in_flight_control);
-            let (dispatched, wait_hint) = Self::dispatch_ready_items(
-                &mut driver,
-                &mut instances,
-                &mut channels,
-                &mut pending,
-                &mut blocked_preparations,
-                &frozen_pipelines,
-                &mut in_flight_launches,
-                &mut in_flight_control,
-                page_size,
-                limits,
-                &stats,
-                &mut policy,
-                stopping,
-            );
-            progress |= dispatched;
-            // M-A2: reap any pipeline the quorum just demoted for missing
-            // too many consecutive wave deadlines. Drained every pass (not
-            // only on a demoting fire) so a demotion is never left stranded.
-            for pid in policy.take_terminate_candidates() {
-                crate::scheduler::terminate_demoted_pipeline(pid);
-            }
-
-            if stopping
-                && pending.is_empty()
-                && blocked_preparations.is_empty()
-                && in_flight_launches.is_empty()
-                && in_flight_control.is_none()
-            {
-                break;
-            }
-
+            // Drain the scheduler channel FIRST: lane replies upgrade posted
+            // waves to Accepted and posted controls to Ready, and readiness
+            // credits land in `pending` — retiring and dispatching against a
+            // fresh view saves one full pass of latency per wave, which at
+            // decode cadence is the difference between an enqueued-ahead
+            // launch and a GPU gap (the retire path breaks on a Posted head).
             while let Ok(item) = rx.try_recv() {
                 progress = true;
+                if let SchedulerItem::DebugDump { response } = item {
+                    let _ = response.send(Self::render_debug_dump(
+                        &pending,
+                        &frozen_pipelines,
+                        &departed_pipelines,
+                        &in_flight_launches,
+                        &in_flight_control,
+                        &instances,
+                        &policy,
+                    ));
+                    continue;
+                }
+                if let SchedulerItem::Lane(reply) = item {
+                    Self::apply_lane_reply(
+                        reply,
+                        &mut lane_inflight,
+                        &mut in_flight_launches,
+                        &mut in_flight_control,
+                        &mut instances,
+                        &mut policy,
+                        &nudge_tx,
+                    );
+                    continue;
+                }
                 Self::enqueue_item(
                     &mut pending,
-                    &mut blocked_preparations,
                     &mut frozen_pipelines,
+                    &mut departed_pipelines,
                     &mut in_flight_control,
                     &instances,
                     limits,
@@ -692,13 +1939,47 @@ impl BatchScheduler {
                     item,
                 );
             }
+            progress |= Self::retire_ready_launches(
+                &mut in_flight_launches,
+                &mut instances,
+                &mut pending,
+                &stats,
+                &mut policy,
+                stopping,
+            );
+            progress |=
+                Self::retire_ready_control(&mut in_flight_control, &mut pending, &mut policy);
+            let (dispatched, wait_hint) = Self::dispatch_ready_items(
+                &lane,
+                &mut lane_inflight,
+                &mut lane_token,
+                &mut instances,
+                &mut pending,
+                &mut in_flight_launches,
+                &mut in_flight_control,
+                page_size,
+                limits,
+                &stats,
+                &mut policy,
+                stopping,
+            );
+            progress |= dispatched;
+            if stopping
+                && pending.is_empty()
+                && in_flight_launches.is_empty()
+                && in_flight_control.is_none()
+                && lane_inflight == 0
+            {
+                break;
+            }
 
             if progress {
+                stall_since = None;
+                stall_dumps = 0;
                 continue;
             }
 
             let item = if pending.is_empty()
-                && blocked_preparations.is_empty()
                 && in_flight_launches.is_empty()
                 && in_flight_control.is_none()
                 && !stopping
@@ -717,17 +1998,31 @@ impl BatchScheduler {
                 // backstop, never the steady-state wake path.
                 let mut armed = true;
                 if let Some(front) = in_flight_launches.front() {
-                    armed &= arm_completion_nudge(&front.completion, &nudge_waker);
+                    match &front.state {
+                        // A posted launch's reply arrives on the scheduler
+                        // channel itself — recv() IS the wake path.
+                        LaunchState::Posted { .. } => {}
+                        LaunchState::Accepted(completion) => {
+                            armed &= arm_completion_nudge(completion, &nudge_waker);
+                        }
+                        // A failed launch is retire-ready right now.
+                        LaunchState::Failed(_) => armed = false,
+                    }
                 }
                 if let Some(control) = in_flight_control.as_ref() {
-                    armed &= arm_completion_nudge(&control.completion, &nudge_waker);
+                    match &control.state {
+                        ControlSlotState::Posted { .. } => {}
+                        ControlSlotState::Ready(completion) => {
+                            armed &= arm_completion_nudge(completion, &nudge_waker);
+                        }
+                    }
                 }
                 if !armed {
                     // Something already settled; retire it on the next pass.
                     continue;
                 }
-                // A pending quorum hold (cold-hold gather / straggler
-                // deadline / depth-cap poll) re-arms the backstop at its own
+                // A pending quorum hold (cold gather / wait-all barrier /
+                // depth-cap poll) re-arms the backstop at its own
                 // cadence — never longer than the 250ms hang backstop, so a
                 // held wave still fires on time even with no new arrival or
                 // completion nudge in between.
@@ -742,18 +2037,39 @@ impl BatchScheduler {
                         // excluded: teardown may legitimately cross a tick.
                         // A quorum-hold timeout is NOT a lost wake (it is
                         // the wait's own cadence), so it never counts here.
-                        let missed = in_flight_launches
-                            .front()
-                            .is_some_and(|front| front.completion.is_settled())
-                            || in_flight_control
-                                .as_ref()
-                                .is_some_and(|control| control.completion.is_settled());
+                        let missed = in_flight_launches.front().is_some_and(|front| {
+                            matches!(&front.state, LaunchState::Accepted(c) if c.is_settled())
+                        }) || in_flight_control.as_ref().is_some_and(|control| {
+                            matches!(&control.state, ControlSlotState::Ready(c) if c.is_settled())
+                        });
                         if missed && !stopping && wait_hint.is_none() {
                             let total = BACKSTOP_RETIREMENTS.fetch_add(1, Ordering::Relaxed) + 1;
                             tracing::warn!(
                                 driver_id,
                                 total,
                                 "completion retired by the backstop poll, not the nudge"
+                            );
+                        }
+                        let stalled_for = stall_since
+                            .get_or_insert_with(std::time::Instant::now)
+                            .elapsed();
+                        if stalled_for
+                            >= Duration::from_secs(10)
+                                .saturating_add(Duration::from_secs(60) * stall_dumps)
+                        {
+                            stall_dumps += 1;
+                            eprintln!(
+                                "[pie-sched] driver {driver_id} stalled for {stalled_for:?} \
+                                 (no progress, work queued or in flight); state:\n{}",
+                                Self::render_debug_dump(
+                                    &pending,
+                                    &frozen_pipelines,
+                                    &departed_pipelines,
+                                    &in_flight_launches,
+                                    &in_flight_control,
+                                    &instances,
+                                    &policy,
+                                ),
                             );
                         }
                         None
@@ -766,10 +2082,34 @@ impl BatchScheduler {
             };
 
             if let Some(item) = item {
+                if let SchedulerItem::DebugDump { response } = item {
+                    let _ = response.send(Self::render_debug_dump(
+                        &pending,
+                        &frozen_pipelines,
+                        &departed_pipelines,
+                        &in_flight_launches,
+                        &in_flight_control,
+                        &instances,
+                        &policy,
+                    ));
+                    continue;
+                }
+                if let SchedulerItem::Lane(reply) = item {
+                    Self::apply_lane_reply(
+                        reply,
+                        &mut lane_inflight,
+                        &mut in_flight_launches,
+                        &mut in_flight_control,
+                        &mut instances,
+                        &mut policy,
+                        &nudge_tx,
+                    );
+                    continue;
+                }
                 Self::enqueue_item(
                     &mut pending,
-                    &mut blocked_preparations,
                     &mut frozen_pipelines,
+                    &mut departed_pipelines,
                     &mut in_flight_control,
                     &instances,
                     limits,
@@ -781,15 +2121,107 @@ impl BatchScheduler {
             }
         }
 
+        // The lane has no pending requests here (`lane_inflight == 0` gates
+        // the loop exit), so shutdown returns the quiesced driver and the
+        // channel registry for teardown.
+        let (mut driver, mut channels) = lane.shutdown();
         Self::shutdown_instances(&mut driver, &mut instances);
         Self::shutdown_channels(&mut driver, &mut channels);
         drop(driver.take());
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn render_debug_dump(
+        pending: &VecDeque<QueuedItem>,
+        frozen_pipelines: &HashSet<ProcessId>,
+        departed_pipelines: &HashSet<ProcessId>,
+        in_flight_launches: &VecDeque<PendingLaunchBatch>,
+        in_flight_control: &Option<PendingControl>,
+        instances: &HashMap<u64, TrackedInstance>,
+        policy: &quorum::WaitAllPolicy,
+    ) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let describe = |request: &PendingRequest| {
+            format!(
+                "fire {} instance {} pipeline {:?} retries {} tracked={} settled={} \
+                 cancelled={} retry_wait={}",
+                request.logical_fire_id,
+                request.instance_id,
+                request.pipeline_id,
+                request.retry_count,
+                instances.contains_key(&request.instance_id),
+                request.completion.is_settled(),
+                request.completion.cancel_requested(),
+                request.retry_after.is_some_and(|due| due > Instant::now()),
+            )
+        };
+        let _ = writeln!(out, "pending ({}):", pending.len());
+        for item in pending {
+            let line = match item {
+                QueuedItem::Launch(request) => format!("Launch: {}", describe(request)),
+                QueuedItem::PreLaunchCopy {
+                    plan, pipeline_id, ..
+                } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
+                QueuedItem::RegisterProgram { .. } => "RegisterProgram".to_string(),
+                QueuedItem::RegisterChannel { .. } => "RegisterChannel".to_string(),
+                QueuedItem::RegisterChannels { plans, .. } => {
+                    format!("RegisterChannels({})", plans.len())
+                }
+                QueuedItem::BindInstance { .. } => "BindInstance".to_string(),
+                QueuedItem::RegisterChannelsBind { .. } => "RegisterChannelsBind".to_string(),
+                QueuedItem::CopyKv { .. } => "CopyKv".to_string(),
+                QueuedItem::CopyKvTracked { .. } => "CopyKvTracked".to_string(),
+                QueuedItem::CopyState { .. } => "CopyState".to_string(),
+                QueuedItem::ResizePool { .. } => "ResizePool".to_string(),
+                QueuedItem::CloseInstance { id, .. } => format!("CloseInstance {id}"),
+                QueuedItem::CloseChannel { id, .. } => format!("CloseChannel {id}"),
+            };
+            let _ = writeln!(out, "  {line}");
+        }
+        let _ = writeln!(out, "in_flight_launches ({}):", in_flight_launches.len());
+        for batch in in_flight_launches {
+            let state = match &batch.state {
+                LaunchState::Posted { token } => format!("posted(token={token})"),
+                LaunchState::Accepted(c) => format!("settled={}", c.is_settled()),
+                LaunchState::Failed(msg) => format!("failed({msg})"),
+            };
+            let _ = writeln!(
+                out,
+                "  batch of {} ({state}, age={:?})",
+                batch.requests.len(),
+                batch.started.elapsed(),
+            );
+        }
+        match in_flight_control {
+            Some(control) => {
+                let state = match &control.state {
+                    ControlSlotState::Posted { token } => format!("posted(token={token})"),
+                    ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
+                };
+                let _ = writeln!(
+                    out,
+                    "in_flight_control: {} pipeline {:?} {state}",
+                    control.operation, control.pipeline_id,
+                );
+            }
+            None => {
+                let _ = writeln!(out, "in_flight_control: none");
+            }
+        }
+        let _ = writeln!(
+            out,
+            "frozen: {:?} departed: {:?}",
+            frozen_pipelines, departed_pipelines,
+        );
+        let _ = write!(out, "quorum: {}", policy.debug_summary());
+        out
+    }
+
     fn enqueue_item(
         pending: &mut VecDeque<QueuedItem>,
-        blocked_preparations: &mut VecDeque<PendingRequest>,
         frozen_pipelines: &mut HashSet<ProcessId>,
+        departed_pipelines: &mut HashSet<ProcessId>,
         in_flight_control: &mut Option<PendingControl>,
         instances: &HashMap<u64, TrackedInstance>,
         limits: SchedulerLimits,
@@ -801,28 +2233,49 @@ impl BatchScheduler {
         match item {
             SchedulerItem::Stop => {
                 *stopping = true;
-                pending.extend(blocked_preparations.drain(..).map(QueuedItem::Prepare));
+            }
+            // Answered inline at both dequeue sites in `run` — it never
+            // reaches this queue-mutating path.
+            SchedulerItem::DebugDump { .. } => {
+                unreachable!("DebugDump is intercepted before enqueue_item")
             }
             // A nudge only unblocks the wait; the retire pass at the top of
             // the loop does the work.
-            SchedulerItem::Nudge => {
-                pending.extend(blocked_preparations.drain(..).map(QueuedItem::Prepare));
-            }
+            SchedulerItem::Nudge => {}
             SchedulerItem::FreezePipeline { pid, response } => {
                 frozen_pipelines.insert(pid);
                 let _ = response.send(());
             }
             SchedulerItem::ResumePipeline(pid) => {
                 frozen_pipelines.remove(&pid);
-                pending.extend(blocked_preparations.drain(..).map(QueuedItem::Prepare));
             }
-            // Immediate, not queued: this only mutates the local quorum
-            // policy (never `pending`/`instances`), so it can't reorder
-            // control ops or launches.
+            // Immediate: books only, never `pending`/`instances`. FIFO
+            // receipt order guarantees every prior fire of the pipeline was
+            // admitted first, so end_seen lands after the whole stream's
+            // books entries (F7).
+            SchedulerItem::PipelineFinish(pid) => {
+                if policy.on_stream_finished(pid) {
+                    policy.complete_stream(pid);
+                }
+            }
+            // Immediate, not queued — and ordered reject-BEFORE-leave:
+            // rejected fires settle their credits and stream books against
+            // the still-live row (exact accounting, no untracked transfer —
+            // F6), and only then does the row leave.
             SchedulerItem::PipelineLeave(pid, kind) => {
-                policy.on_pipeline_leave(pid);
-                if kind == LeaveKind::Terminate {
-                    frozen_pipelines.remove(&pid);
+                // Close = cancel (operator ruling R4-1, 2026-07-17,
+                // reversing iteration 62's "close cancels nothing"): every
+                // queued/preparing fire of the pipeline is rejected here and
+                // its books deleted; already-dispatched fires are GPU-owned
+                // and run to settlement (their credits were consumed at
+                // dispatch). Close and Terminate share the cancel machinery
+                // — an in-flight control's coupled queued launch is
+                // protected from direct rejection and unwinds through the
+                // cancelled-rejection path once the GPU-owned copy settles.
+                // Suspend (TASK-B preempt) still leaves with work queued and
+                // stranded credits — FLAGGED open ruling (hold-and-resume vs
+                // drain), not solved in the R4 bundle.
+                if kind != LeaveKind::Suspend {
                     let protected = in_flight_control
                         .as_ref()
                         .filter(|control| control.pipeline_id == Some(pid))
@@ -830,15 +2283,30 @@ impl BatchScheduler {
                     if let Some(completion) = &protected {
                         completion.request_cancel();
                     }
-                    Self::reject_pipeline_queued(
-                        pending,
-                        blocked_preparations,
-                        pid,
-                        protected.as_ref(),
-                    );
+                    Self::reject_pipeline_queued(pending, policy, pid, protected.as_ref());
                 }
+                if kind == LeaveKind::Terminate {
+                    frozen_pipelines.remove(&pid);
+                }
+                if kind != LeaveKind::Close {
+                    departed_pipelines.insert(pid);
+                }
+                policy.on_pipeline_leave(pid);
             }
-            SchedulerItem::Launch { pending: launch } => {
+            SchedulerItem::Launch {
+                pending: mut launch,
+            } => {
+                if let Some(timing) = launch.timing.as_mut() {
+                    timing.enqueued_us = Some(super::fire_timing_now_us());
+                }
+                // Quorum identity stamp: the request belongs to its
+                // pipeline's CURRENT incarnation. Guest submissions strictly
+                // precede the pipeline's Close on the same FIFO, so a
+                // pre-close fire always stamps the pre-close generation and
+                // routes untracked after the leave (see `quorum_pid`).
+                if let Some(pid) = launch.pipeline_id {
+                    launch.quorum_generation = policy.generation_of(pid);
+                }
                 let validation = BatchAccumulator::new(limits, page_size);
                 let rejection = if launch.completion.cancel_requested() {
                     Some("logical fire cancelled before scheduler admission".to_string())
@@ -856,21 +2324,29 @@ impl BatchScheduler {
                 };
                 if let Some(message) = rejection {
                     launch.completion.reject_unsubmitted(message);
-                } else if launch.preparation.is_some()
-                    && launch
-                        .pipeline_id
-                        .is_some_and(|pid| frozen_pipelines.contains(&pid))
-                {
-                    blocked_preparations.push_back(launch);
-                } else if launch.preparation.is_some() {
-                    policy.on_retry_participation(launch.pipeline_id);
-                    pending.push_back(QueuedItem::Prepare(launch));
                 } else {
                     // The wave gather starts at acceptance, not dispatch:
                     // this request now counts toward `decide_wave_at`'s
                     // wait-set/untracked-ready even while it sits in
                     // `pending` behind an in-flight-depth or quorum hold.
-                    policy.on_pipeline_request(launch.pipeline_id, Instant::now());
+                    if let Some(pid) = launch.pipeline_id {
+                        departed_pipelines.remove(&pid);
+                        policy.on_fire_admitted(pid);
+                    }
+                    // No fire-admission early join: the readiness credit below
+                    // creates the ordinary wait-set entry. Bind controls use
+                    // separate assembly membership, which cannot age into
+                    // demotion while the control remains pending; preparation
+                    // alone still does not create a new member.
+                    if !Self::request_needs_prelaunch(&launch) {
+                        let qpid =
+                            Self::quorum_pid(policy, launch.pipeline_id, launch.quorum_generation);
+                        policy.on_pipeline_request(qpid, Instant::now());
+                        launch.credit_published = true;
+                        if let Some(timing) = launch.timing.as_mut() {
+                            timing.ready_us = Some(super::fire_timing_now_us());
+                        }
+                    }
                     Self::queue_attempt(pending, launch, QueueEnd::Back);
                 }
             }
@@ -881,11 +2357,42 @@ impl BatchScheduler {
             SchedulerItem::RegisterChannel { plan, response } => {
                 pending.push_back(QueuedItem::RegisterChannel { plan, response });
             }
-            SchedulerItem::BindInstance { plan, response } => {
-                pending.push_back(QueuedItem::BindInstance { plan, response });
+            SchedulerItem::RegisterChannels { plans, response } => {
+                pending.push_back(QueuedItem::RegisterChannels { plans, response });
+            }
+            SchedulerItem::BindInstance {
+                pipeline_id,
+                plan,
+                response,
+            } => {
+                policy.on_bind_enqueued(pipeline_id);
+                pending.push_back(QueuedItem::BindInstance {
+                    pipeline_id,
+                    plan,
+                    response,
+                });
+            }
+            SchedulerItem::RegisterChannelsBind {
+                pipeline_id,
+                plans,
+                program,
+                bind,
+                response,
+            } => {
+                policy.on_bind_enqueued(pipeline_id);
+                pending.push_back(QueuedItem::RegisterChannelsBind {
+                    pipeline_id,
+                    plans,
+                    program,
+                    bind,
+                    response,
+                });
             }
             SchedulerItem::CopyKv { plan, response } => {
                 pending.push_back(QueuedItem::CopyKv { plan, response });
+            }
+            SchedulerItem::CopyKvTracked { plan, completion } => {
+                pending.push_back(QueuedItem::CopyKvTracked { plan, completion });
             }
             SchedulerItem::CopyState { plan, response } => {
                 pending.push_back(QueuedItem::CopyState { plan, response });
@@ -893,33 +2400,36 @@ impl BatchScheduler {
             SchedulerItem::ResizePool { plan, response } => {
                 pending.push_back(QueuedItem::ResizePool { plan, response });
             }
-            SchedulerItem::CloseInstance {
-                id,
-                pacing_wait_id,
-                response,
-            } => {
-                pending.push_back(QueuedItem::CloseInstance {
-                    id,
-                    pacing_wait_id,
-                    response,
-                });
+            SchedulerItem::CloseInstance { id, pacing_wait_id } => {
+                pending.push_back(QueuedItem::CloseInstance { id, pacing_wait_id });
             }
-            SchedulerItem::CloseChannel { id, response } => {
-                pending.push_back(QueuedItem::CloseChannel { id, response });
+            SchedulerItem::CloseChannel { id } => {
+                pending.push_back(QueuedItem::CloseChannel { id });
             }
+            // Handled on dequeue in the run loop (like DebugDump) before
+            // enqueue_item is reached.
+            SchedulerItem::Lane(_) => unreachable!(),
         }
+    }
+
+    /// Exponential retry pacing, 20us doubling to a 1ms cap: enough to stop
+    /// a lone pipeline from hammering a transient device condition, far below
+    /// wave cadence, and small enough that the full retry budget
+    /// (`PIE_FIRE_RETRY_MAX`, default 1024) exhausts in about a second.
+    fn retry_backoff(retry_count: u32) -> Duration {
+        Duration::from_micros((20u64 << retry_count.min(6)).min(1_000))
     }
 
     fn reject_pipeline_queued(
         pending: &mut VecDeque<QueuedItem>,
-        blocked_preparations: &mut VecDeque<PendingRequest>,
+        policy: &mut quorum::WaitAllPolicy,
         pid: ProcessId,
         protected: Option<&WorkItemCompletion>,
     ) {
         let mut kept = VecDeque::with_capacity(pending.len());
         while let Some(item) = pending.pop_front() {
             let reject = match &item {
-                QueuedItem::Prepare(request) | QueuedItem::Launch(request) => {
+                QueuedItem::Launch(request) => {
                     request.pipeline_id == Some(pid)
                         && protected
                             .is_none_or(|completion| !request.completion.same_request(completion))
@@ -937,13 +2447,20 @@ impl BatchScheduler {
             };
             if reject {
                 match item {
-                    QueuedItem::Prepare(request) | QueuedItem::Launch(request) => request
-                        .completion
-                        .reject_unsubmitted("pipeline terminated while queued"),
+                    QueuedItem::Launch(request) => {
+                        Self::drop_request_credit(policy, &request);
+                        Self::resolve_stream_fire(policy, &request);
+                        request
+                            .completion
+                            .reject_unsubmitted("pipeline left while queued");
+                    }
+                    // A pre-launch copy is order-coupled to its consumer
+                    // launch (one fire, one book entry — the Launch arm
+                    // resolves it).
                     QueuedItem::PreLaunchCopy {
                         logical_completion, ..
                     } => logical_completion
-                        .reject_unsubmitted("pipeline terminated before pre-launch copy"),
+                        .reject_unsubmitted("pipeline left before pre-launch copy"),
                     _ => unreachable!("rejected item kind checked above"),
                 }
             } else {
@@ -951,40 +2468,41 @@ impl BatchScheduler {
             }
         }
         *pending = kept;
-
-        let mut kept = VecDeque::with_capacity(blocked_preparations.len());
-        while let Some(request) = blocked_preparations.pop_front() {
-            if request.pipeline_id == Some(pid)
-                && protected.is_none_or(|completion| !request.completion.same_request(completion))
-            {
-                request
-                    .completion
-                    .reject_unsubmitted("pipeline terminated while preparation was blocked");
-            } else {
-                kept.push_back(request);
-            }
-        }
-        *blocked_preparations = kept;
     }
 
     fn queue_attempt(pending: &mut VecDeque<QueuedItem>, request: PendingRequest, end: QueueEnd) {
-        let copy = request
-            .prelaunch_copy
-            .clone()
-            .map(|plan| QueuedItem::PreLaunchCopy {
-                plan,
+        let mut copies = Vec::with_capacity(2);
+        if let Some(plan) = request.prelaunch_copy.clone() {
+            copies.push(QueuedItem::PreLaunchCopy {
+                plan: PreLaunchCopy::Kv(plan),
                 logical_completion: request.completion.clone(),
                 pipeline_id: request.pipeline_id,
+                credit_ready: false,
+                quorum_generation: request.quorum_generation,
             });
+        }
+        if let Some(plan) = request.prelaunch_state_copy.clone() {
+            copies.push(QueuedItem::PreLaunchCopy {
+                plan: PreLaunchCopy::State(plan),
+                logical_completion: request.completion.clone(),
+                pipeline_id: request.pipeline_id,
+                credit_ready: false,
+                quorum_generation: request.quorum_generation,
+            });
+        }
+        if let Some(QueuedItem::PreLaunchCopy { credit_ready, .. }) = copies.last_mut() {
+            *credit_ready = true;
+        }
         match end {
             QueueEnd::Front => {
                 pending.push_front(QueuedItem::Launch(request));
-                if let Some(copy) = copy {
+                for copy in copies.into_iter().rev() {
                     pending.push_front(copy);
                 }
             }
+
             QueueEnd::Back => {
-                if let Some(copy) = copy {
+                for copy in copies {
                     pending.push_back(copy);
                 }
                 pending.push_back(QueuedItem::Launch(request));
@@ -992,21 +2510,217 @@ impl BatchScheduler {
         }
     }
 
-    fn preparation_has_earlier_lane_member(
+    fn request_needs_prelaunch(request: &PendingRequest) -> bool {
+        request.prelaunch_copy.is_some() || request.prelaunch_state_copy.is_some()
+    }
+
+    /// Whether any queued fire still targets `instance_id` (a queued
+    /// `PreLaunchCopy` is covered by its consumer launch queued behind it).
+    /// Together with `TrackedInstance::in_flight` this is the close gate:
+    /// an instance with neither queued nor in-flight work is quiesced.
+    fn instance_has_queued_work(pending: &VecDeque<QueuedItem>, instance_id: u64) -> bool {
+        pending.iter().any(|item| match item {
+            QueuedItem::Launch(request) => request.instance_id == instance_id,
+            _ => false,
+        })
+    }
+
+    /// The pid this request's quorum accounting must use NOW: its
+    /// `pipeline_id` while the pipeline's identity generation still matches
+    /// the request's admission stamp, `None` (untracked) once the pipeline
+    /// has left. Every publication, consumption, and drop site routes
+    /// through this — the leak class it closes is a post-leave publication
+    /// re-creating the pid's wait-set row and the straddling wave then
+    /// consuming a SUCCESSOR pipeline's credit (W1: pid is the process id,
+    /// shared across a process's consecutive pipelines).
+    fn quorum_pid(
+        policy: &quorum::WaitAllPolicy,
+        pipeline_id: Option<ProcessId>,
+        stamp: u64,
+    ) -> Option<ProcessId> {
+        pipeline_id.filter(|pid| policy.generation_of(*pid) == stamp)
+    }
+
+    /// Returns a dropped request's readiness credit to the barrier, if it
+    /// holds one. A fire that never published (still awaiting its pre-launch
+    /// copy) or whose credit a dispatched wave already consumed has nothing
+    /// to give back — decrementing anyway corrupts the wave accounting by
+    /// eating a sibling's credit (RV-20).
+    fn drop_request_credit(policy: &mut quorum::WaitAllPolicy, request: &PendingRequest) {
+        if request.credit_published {
+            let qpid = Self::quorum_pid(policy, request.pipeline_id, request.quorum_generation);
+            policy.on_request_dropped(qpid);
+        }
+    }
+
+    /// R4-3 stream-book resolution for a request leaving the undispatched
+    /// set WITHOUT dispatching — every post-admission rejection/cancellation
+    /// site routes through here (wave consumption resolves at the dispatch
+    /// site instead). Unlike the credit, the book entry exists from
+    /// admission regardless of `credit_published`. Stamp-guarded: a stale
+    /// request's books died with its pipeline's leave. A rejected FINAL fire
+    /// completes its stream here — nothing further is coming, so the row
+    /// must not linger awaited.
+    fn resolve_stream_fire(policy: &mut quorum::WaitAllPolicy, request: &PendingRequest) {
+        if let Some(qpid) = Self::quorum_pid(policy, request.pipeline_id, request.quorum_generation)
+            && policy.on_fire_resolved(qpid)
+        {
+            policy.complete_stream(qpid);
+        }
+    }
+
+    /// A standalone KV/state copy: suspend D2H, restore H2D, graft/CAS
+    /// copies. These touch pages no queued fire references (suspend takes
+    /// only unpinned drained pages; restore writes freshly reserved ones),
+    /// so a held wave must NEVER starve them — the preemption ladder is
+    /// what unsticks a held wave in the first place. `PreLaunchCopy` is
+    /// NOT in this class: it is order-coupled to its own launch (queued
+    /// directly in front of it) and must keep queue order.
+    const fn standalone_copy(item: &QueuedItem) -> bool {
+        matches!(
+            item,
+            QueuedItem::CopyKv { .. }
+                | QueuedItem::CopyKvTracked { .. }
+                | QueuedItem::CopyState { .. }
+        )
+    }
+
+    /// Controls that dispatch without draining in-flight launches. The
+    /// registrations are synchronous and create entities nothing in flight
+    /// can reference yet — with one caveat: a channel registration that
+    /// grows the driver's shared slot table would reallocate arrays whose
+    /// pointers in-flight kernels hold, so the CUDA registry quiesces the
+    /// device inside `grow()` (RV-27; capacity is driver knowledge, so the
+    /// drain lives there, not here). The copies (standalone and pre-launch)
+    /// address only committed or quiesced extents, which in-flight launches
+    /// never rewrite (append-only ledger) — a copy's coupled consumer launch
+    /// still holds behind `in_flight_control` until the copy settles.
+    /// A channel close only ever follows its instance closes (the guest
+    /// awaits each control's response) and the driver rejects a close with
+    /// live attachments, so no in-flight kernel can reference the closing
+    /// channel — it needs no drain. `CloseInstance` has its own per-instance
+    /// quiescence gate in `dispatch_ready_items`. Only pool resizes keep the
+    /// empty-pipe requirement: drain IS their ordering mechanism.
+    const fn pipe_concurrent_control(item: &QueuedItem) -> bool {
+        Self::standalone_copy(item)
+            || matches!(
+                item,
+                QueuedItem::PreLaunchCopy { .. }
+                    | QueuedItem::RegisterProgram { .. }
+                    | QueuedItem::RegisterChannel { .. }
+                    | QueuedItem::RegisterChannels { .. }
+                    | QueuedItem::BindInstance { .. }
+                    | QueuedItem::RegisterChannelsBind { .. }
+                    | QueuedItem::CloseChannel { .. }
+            )
+    }
+
+    /// Move held launches behind work that can make the current quorum
+    /// denser. The ENTIRE contiguous launch prefix rotates to the back in one
+    /// call: per-instance launch order is a dispatch invariant
+    /// (`launch_has_earlier_instance_member` defers an out-of-order head, and
+    /// a head whose earlier sibling sits beyond a non-launch item is
+    /// unreachable — a permanent stall), so a run-ahead sibling group must
+    /// never be split by a partial rotation.
+    ///
+    /// A `PreLaunchCopy` is valid rotate-target work under `allow_controls`:
+    /// it occupies the free control slot exactly like a lifecycle control.
+    /// Rotating front launches past it cannot break copy→consumer coupling —
+    /// a consumer launch is enqueued behind its copy and stays behind it (a
+    /// Lifecycle controls (registers, binds, closes) never order against a
+    /// launch already in the queue: a fire can only be submitted after its
+    /// own bind returned to the guest, so every queued launch's lifecycle
+    /// dependencies have already dispatched. Only `PreLaunchCopy` (channel
+    /// data feeding a later queued launch of the same pipeline) and pool
+    /// resizes (pipe drains) order against queued launches.
+    const fn lifecycle_control(item: &QueuedItem) -> bool {
+        matches!(
+            item,
+            QueuedItem::RegisterProgram { .. }
+                | QueuedItem::RegisterChannel { .. }
+                | QueuedItem::RegisterChannels { .. }
+                | QueuedItem::BindInstance { .. }
+                | QueuedItem::RegisterChannelsBind { .. }
+                | QueuedItem::CloseInstance { .. }
+                | QueuedItem::CloseChannel { .. }
+        )
+    }
+
+    /// launch that reached the queue front has no queued copy left).
+    fn rotate_launch_for_wave_work(
+        pending: &mut VecDeque<QueuedItem>,
+        allow_controls: bool,
+    ) -> bool {
+        if !matches!(pending.front(), Some(QueuedItem::Launch(_))) {
+            return false;
+        }
+        let Some(work) = pending
+            .iter()
+            .skip(1)
+            .find(|item| !matches!(item, QueuedItem::Launch(_)))
+        else {
+            return false;
+        };
+        if !(Self::standalone_copy(work)
+            || (allow_controls
+                && (Self::lifecycle_control(work)
+                    || matches!(work, QueuedItem::PreLaunchCopy { .. }))))
+        {
+            return false;
+        }
+        while matches!(pending.front(), Some(QueuedItem::Launch(_))) {
+            let launch = pending.pop_front().expect("launch front");
+            pending.push_back(launch);
+        }
+        true
+    }
+
+    fn launch_has_earlier_instance_member(
         pending: &VecDeque<QueuedItem>,
         request: &PendingRequest,
     ) -> bool {
-        let Some(key) = request.preparation_order_key else {
-            return false;
-        };
-        pending.iter().skip(1).any(|item| {
-            let QueuedItem::Prepare(earlier) = item else {
+        pending.iter().any(|item| {
+            let QueuedItem::Launch(earlier) = item else {
                 return false;
             };
-            earlier.pipeline_id == request.pipeline_id
-                && earlier.preparation_order_key == Some(key)
+            earlier.instance_id == request.instance_id
                 && earlier.logical_fire_id < request.logical_fire_id
         })
+    }
+
+    /// B3 FIFO invariant, CROSS-INSTANCE: the smallest queued/preparing
+    /// logical fire id per pipeline (logical fire ids are minted at submit,
+    /// so per-pipeline id order IS submission order). A candidate Launch
+    /// whose id is above its pipeline's floor has an earlier undispatched
+    /// sibling and must defer. Same-instance order is carried by
+    /// preparation lanes and `launch_has_earlier_instance_member`; the
+    /// cross-instance case is the R4-4 single-pipeline prefill→decode
+    /// handoff, where the prefill's requeue-at-back after async preparation
+    /// let the already-credited decode fires OVERTAKE it — the decode then
+    /// executed against KV the prefill had not committed and the driver's
+    /// compose kernel FAIL-STOPPED the lane. An ACTIVE preparation gates
+    /// its whole pipeline (floor 0): its fire is earlier than anything
+    /// queued by construction and is in neither queue. ONE O(queue) sweep
+    /// per composing pass, O(1) per candidate — a per-candidate rescan
+    /// measured −5% whole-run (peek runs at poll cadence). Computed at
+    /// pass start, the floor also covers items the pass later parks in its
+    /// deferred side-queue.
+    fn pipeline_order_floor(pending: &VecDeque<QueuedItem>) -> HashMap<ProcessId, u64> {
+        let mut floor: HashMap<ProcessId, u64> = HashMap::new();
+        let mut note = |pid: Option<ProcessId>, id: u64| {
+            if let Some(pid) = pid {
+                floor
+                    .entry(pid)
+                    .and_modify(|lowest| *lowest = (*lowest).min(id))
+                    .or_insert(id);
+            }
+        };
+        for item in pending {
+            if let QueuedItem::Launch(request) = item {
+                note(request.pipeline_id, request.logical_fire_id);
+            }
+        }
+        floor
     }
 
     /// Peeks how many requests at `pending`'s front would land in the NEXT
@@ -1017,37 +2731,147 @@ impl BatchScheduler {
     /// the exact geometry the dispatcher is about to build (a stale item —
     /// its instance closed after enqueue — is skipped here exactly like
     /// the real dispatch skips/rejects it, so it never inflates the count).
-    fn peek_launch_batch_size(
+    fn peek_launch_batch(
         pending: &VecDeque<QueuedItem>,
         instances: &HashMap<u64, TrackedInstance>,
         limits: SchedulerLimits,
         page_size: u32,
-    ) -> usize {
+    ) -> LaunchBatchPreview {
         let mut grouping = LaunchGrouping::default();
+        let mut blocked_pipelines = HashSet::new();
+        let mut pipelines = HashSet::new();
+        let mut deferred: HashSet<ProcessId> = HashSet::new();
+        let mut structurally_full = false;
+        let mut barrier_pipelines: HashSet<ProcessId> = HashSet::new();
+        let order_floor = Self::pipeline_order_floor(pending);
         for item in pending.iter() {
-            let QueuedItem::Launch(next) = item else {
-                break;
+            let next = match item {
+                QueuedItem::Launch(next) => next,
+                // Mirror dispatch_launch_batch exactly: skip lifecycle
+                // controls and pre-launch copies while barriering their
+                // pipeline; stop at everything else (pool resizes, state
+                // copies).
+                item if Self::lifecycle_control(item) => continue,
+                QueuedItem::PreLaunchCopy { pipeline_id, .. } => {
+                    if let Some(pid) = pipeline_id {
+                        barrier_pipelines.insert(*pid);
+                    }
+                    continue;
+                }
+                _ => break,
             };
+            if next
+                .pipeline_id
+                .is_some_and(|pid| barrier_pipelines.contains(&pid))
+            {
+                // NOT deferred: a fire behind its own preparation is
+                // imminent (~1 ms) — the barrier's short hold for it is the
+                // useful gathering (excluding these fired eager narrow
+                // waves and cost 20 % tput, measured V6 iteration 35).
+                continue;
+            }
             if !instances.contains_key(&next.instance_id) {
                 continue;
             }
+            // Mirror dispatch's drops exactly: a settled or cancelled request
+            // never reaches the batch, so counting it here would let the
+            // quorum decision see a bigger candidate wave than dispatch can
+            // build (transient barrier violation — RV-20).
+            if next.completion.is_settled() || next.completion.cancel_requested() {
+                continue;
+            }
+            if next.retry_after.is_some_and(|due| due > Instant::now()) {
+                continue;
+            }
+            if Self::launch_has_earlier_instance_member(pending, next) {
+                continue;
+            }
+            if next.pipeline_id.is_some_and(|pid| {
+                order_floor
+                    .get(&pid)
+                    .is_some_and(|&lowest| lowest < next.logical_fire_id)
+            }) {
+                // Composer-ordered behind its pipeline's earlier fire —
+                // scheduled for a later wave, never missing.
+                if let Some(pid) = next.pipeline_id {
+                    deferred.insert(pid);
+                }
+                continue;
+            }
+            if next
+                .pipeline_id
+                .is_some_and(|pid| blocked_pipelines.contains(&pid))
+            {
+                continue;
+            }
             if !grouping.accepts(next, limits, page_size) {
+                if (grouping.instances.contains(&next.instance_id)
+                    || next
+                        .pipeline_id
+                        .is_some_and(|pid| grouping.pipelines.contains(&pid)))
+                    && let Some(pid) = next.pipeline_id
+                {
+                    blocked_pipelines.insert(pid);
+                    deferred.insert(pid);
+                    continue;
+                }
+                if let Some(pid) = next.pipeline_id {
+                    deferred.insert(pid);
+                }
+                structurally_full = grouping.count != 0;
                 break;
             }
-            if grouping.push(next, limits, page_size) {
+            let stop = grouping.push(next, limits, page_size);
+            if let Some(pid) = next.pipeline_id {
+                pipelines.insert(pid);
+            }
+            if stop {
+                structurally_full = true;
                 break;
             }
         }
-        grouping.count
+        // Classify every remaining queued launch: the composing pass stops
+        // at the batch-full / drain break, but queued fires beyond it are
+        // SCHEDULED (composer/ordering-deferred), not missing — without
+        // this sweep, budget-queued prefills past the break counted missing
+        // and demoted en masse on the prefix shape (V6 iteration 35's open
+        // bug). Preparation-barriered lanes stay awaited: their fires are
+        // imminent and waiting ~1 ms for them keeps waves dense.
+        let mut submitted: HashSet<ProcessId> = HashSet::new();
+        for item in pending.iter() {
+            match item {
+                QueuedItem::Launch(next) => {
+                    if let Some(pid) = next.pipeline_id {
+                        submitted.insert(pid);
+                        if !pipelines.contains(&pid) && !barrier_pipelines.contains(&pid) {
+                            deferred.insert(pid);
+                        }
+                    }
+                }
+                QueuedItem::PreLaunchCopy { pipeline_id, .. } => {
+                    if let Some(pid) = pipeline_id {
+                        submitted.insert(*pid);
+                    }
+                }
+                _ => {}
+            }
+        }
+        submitted.extend(pipelines.iter().copied());
+        LaunchBatchPreview {
+            count: grouping.count,
+            pipelines,
+            deferred,
+            submitted,
+            structurally_full,
+        }
     }
 
     fn dispatch_ready_items(
-        driver: &mut Option<DriverBackend>,
+        driver_lane: &DriverLane,
+        lane_inflight: &mut u64,
+        lane_token: &mut u64,
         instances: &mut HashMap<u64, TrackedInstance>,
-        channels: &mut HashSet<u64>,
         pending: &mut VecDeque<QueuedItem>,
-        blocked_preparations: &mut VecDeque<PendingRequest>,
-        frozen_pipelines: &HashSet<ProcessId>,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut Option<PendingControl>,
         page_size: u32,
@@ -1058,389 +2882,551 @@ impl BatchScheduler {
     ) -> (bool, Option<Duration>) {
         let mut progress = false;
         let mut wait_hint = None;
+        // Busy-close rotations this pass: bounded so a queue of nothing but
+        // busy closes breaks out instead of spinning.
+        let mut close_rotations = 0usize;
         loop {
-            if in_flight_control.is_some() {
-                break;
-            }
             let Some(item) = pending.front() else {
                 break;
             };
             match item {
-                QueuedItem::Prepare(_) => {
-                    if pending.front().is_some_and(|item| {
-                        matches!(
-                            item,
-                            QueuedItem::Prepare(request)
-                                if request
-                                    .pipeline_id
-                                    .is_some_and(|pid| frozen_pipelines.contains(&pid))
-                        )
-                    }) {
-                        let Some(QueuedItem::Prepare(request)) = pending.pop_front() else {
-                            unreachable!();
-                        };
-                        blocked_preparations.push_back(request);
-                        progress = true;
-                        continue;
-                    }
-                    if pending.front().is_some_and(|item| {
-                        matches!(
-                            item,
-                            QueuedItem::Prepare(request)
-                                if request.completion.cancel_requested()
-                        )
-                    }) {
-                        let Some(QueuedItem::Prepare(request)) = pending.pop_front() else {
-                            unreachable!();
-                        };
-                        request.completion.reject_unsubmitted(
-                            "logical fire cancelled during dispatch preparation",
-                        );
-                        progress = true;
-                        continue;
-                    }
-                    let should_defer = match pending.front() {
-                        Some(QueuedItem::Prepare(request)) => {
-                            Self::preparation_has_earlier_lane_member(pending, request)
-                        }
-                        _ => false,
-                    };
-                    if should_defer {
-                        let request = pending.pop_front().expect("prepare front");
-                        pending.push_back(request);
-                        progress = true;
-                        continue;
-                    }
-                    let Some(QueuedItem::Prepare(mut request)) = pending.pop_front() else {
-                        unreachable!();
-                    };
-                    if stopping {
-                        request.completion.reject_unsubmitted(
-                            "scheduler shutdown interrupted dispatch preparation",
-                        );
-                        progress = true;
-                        continue;
-                    }
-                    let result = request
-                        .preparation
-                        .as_mut()
-                        .expect("prepare item carries a preparation")(
-                        &mut request.request
-                    );
-                    match result {
-                        Ok(prepared) => {
-                            request.physical_page_ids = prepared.page_refs;
-                            request.last_page_len = prepared.last_page_len;
-                            request.request.kv_translation_version =
-                                prepared.kv_translation_version;
-                            request.prelaunch_copy = (!prepared.copy_src.is_empty()).then_some(
-                                crate::driver::KvCopyPlan {
-                                    src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
-                                    src_device_ordinal: 0,
-                                    dst_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
-                                    dst_device_ordinal: 0,
-                                    src_page_ids: prepared.copy_src,
-                                    dst_page_ids: prepared.copy_dst,
-                                    cells: Vec::new(),
-                                },
-                            );
-                            request.preparation = None;
-                            let validation = BatchAccumulator::new(limits, page_size);
-                            if request.completion.cancel_requested() {
-                                request.completion.reject_unsubmitted(
-                                    "logical fire cancelled during dispatch preparation",
-                                );
-                            } else if let Some(message) =
-                                validation.single_request_limit_error(&request)
-                            {
-                                request.completion.reject_unsubmitted(message);
-                            } else {
-                                policy.on_pipeline_request(request.pipeline_id, Instant::now());
-                                Self::queue_attempt(pending, request, QueueEnd::Back);
-                            }
-                        }
-                        Err(LaunchPreparationError::Retry(reason)) => {
-                            request.preparation_retries += 1;
-                            if request.completion.cancel_requested() {
-                                request.completion.reject_unsubmitted(
-                                    "logical fire cancelled during dispatch preparation",
-                                );
-                            } else if request.preparation_retries > max_fire_retries() {
-                                request.completion.reject_unsubmitted(format!(
-                                    "dispatch preparation exceeded retry limit: {reason}"
-                                ));
-                            } else {
-                                policy.on_retry_participation(request.pipeline_id);
-                                pending.push_back(QueuedItem::Prepare(request));
-                                wait_hint =
-                                    Some(Duration::from_micros(super::quorum::QUORUM_POLL_US));
-                            }
-                            progress = true;
-                            break;
-                        }
-                        Err(LaunchPreparationError::Blocked(_reason)) => {
-                            blocked_preparations.push_back(request);
-                        }
-                        Err(LaunchPreparationError::Failed(reason)) => {
-                            request.completion.reject_unsubmitted(reason);
-                        }
-                    }
-                    progress = true;
-                }
                 QueuedItem::Launch(_) => {
-                    if in_flight_launches.len() >= quorum::configured_max_in_flight() {
+                    if in_flight_control.is_some() {
+                        // A settling copy/resize holds launches — the very
+                        // next launch may be the copy's coupled consumer —
+                        // but preparation work still advances behind it.
+                        if Self::rotate_launch_for_wave_work(pending, false) {
+                            progress = true;
+                            continue;
+                        }
                         break;
                     }
-                    let candidate_size =
-                        Self::peek_launch_batch_size(pending, instances, limits, page_size);
+                    if in_flight_launches.len() >= quorum::configured_max_in_flight() {
+                        // Depth-capped: launches cannot dispatch anyway, so
+                        // held wave work rotates back to reach ANY
+                        // dispatchable control — including lifecycle
+                        // controls with the pipe full. They are
+                        // pipe-concurrent and ~100 µs, and making a
+                        // transitioning pipeline's register→bind round
+                        // trips wait a full wave each was the cohort-swap
+                        // join-latency tail (V6 iteration 6).
+                        if Self::rotate_launch_for_wave_work(pending, true) {
+                            progress = true;
+                            continue;
+                        }
+                        break;
+                    }
+                    let candidate = Self::peek_launch_batch(pending, instances, limits, page_size);
+                    let mut decision_us = 0u64;
+                    let mut decision_active = policy.active_pipelines();
+                    let mut decision_missing = 0usize;
+                    let decision_candidate_count = candidate.count;
+                    let decision_deferred = candidate.deferred.len();
+                    let decision_depth_capped = policy.depth_capped_pipelines();
                     if !stopping {
-                        match policy.decide_wave_at(candidate_size, Instant::now()) {
+                        let decision_started_us =
+                            super::ledger_timing_enabled().then(super::fire_timing_now_us);
+                        match policy.decide_candidate_wave_at(
+                            candidate.count,
+                            &candidate.pipelines,
+                            &candidate.deferred,
+                            &candidate.submitted,
+                            candidate.structurally_full,
+                            Instant::now(),
+                        ) {
                             quorum::WaveDecision::Wait(hold) => {
                                 wait_hint = Some(hold);
+                                // A holding wave yields the thread to any
+                                // dispatchable control regardless of pipe
+                                // depth (see the depth-cap branch): the
+                                // hold is exactly when a transitioning
+                                // pipeline's bind/register round trips must
+                                // not wait a wave each.
+                                if Self::rotate_launch_for_wave_work(pending, true) {
+                                    progress = true;
+                                    continue;
+                                }
                                 break;
                             }
-                            quorum::WaveDecision::Fire { .. } => {}
+                            quorum::WaveDecision::Fire { missing } => {
+                                decision_active = policy.active_pipelines();
+                                decision_missing = missing.len();
+                                if let Some(started_us) = decision_started_us {
+                                    decision_us =
+                                        super::fire_timing_now_us().saturating_sub(started_us);
+                                }
+                            }
                         }
                     }
                     let before = in_flight_launches.len();
-                    let dispatched = Self::dispatch_launch_batch(
-                        driver,
-                        instances,
-                        pending,
-                        in_flight_launches,
-                        page_size,
-                        limits,
-                        stats,
+                    let dispatched = crate::probe_fire!(
+                        stats.fire.execute.total_us,
+                        Self::dispatch_launch_batch(
+                            driver_lane,
+                            lane_inflight,
+                            lane_token,
+                            instances,
+                            pending,
+                            in_flight_launches,
+                            page_size,
+                            limits,
+                            stats,
+                            policy,
+                            decision_us,
+                            decision_active,
+                            decision_missing,
+                            decision_candidate_count,
+                            decision_deferred,
+                            decision_depth_capped,
+                        )
                     );
                     // Only a batch that actually reached `in_flight_launches`
-                    // (the driver accepted the launch) increments the
-                    // policy's depth counter — a synchronous
-                    // stale-instance-reject or `driver.launch` failure never
-                    // occupies a run-ahead slot, so nothing would ever
-                    // decrement it back.
+                    // (posted to the driver lane) increments the policy's
+                    // depth counter — a synchronous stale-instance-reject
+                    // never occupies a run-ahead slot. A lane-side
+                    // `driver.launch` rejection unwinds through the retire
+                    // path (the batch retires as failed, releasing depth and
+                    // instance accounting the same way a completed wave
+                    // does).
                     if in_flight_launches.len() > before {
-                        let participants = in_flight_launches
+                        let accepted = in_flight_launches
                             .back()
-                            .expect("accepted batch is present")
+                            .expect("accepted batch is present");
+                        // Consumption mirrors publication: a request whose
+                        // pipeline left after admission published untracked,
+                        // so it must consume untracked too — the row lookup
+                        // by bare pid would eat a successor pipeline's
+                        // credit (W1).
+                        let participants = accepted
                             .requests
                             .iter()
-                            .map(|request| request.pipeline_id)
+                            .map(|request| {
+                                Self::quorum_pid(
+                                    policy,
+                                    request.pipeline_id,
+                                    request.quorum_generation,
+                                )
+                            })
                             .collect::<Vec<_>>();
-                        policy.on_wave_dispatched(&participants);
+                        let accepted_len = accepted.requests.len();
+                        let epochs = policy.on_wave_dispatched(&participants, Instant::now());
+                        let accepted = in_flight_launches
+                            .back_mut()
+                            .expect("accepted batch is present");
+                        accepted.pipeline_epochs = epochs;
+                        // The wave consumed each row's readiness credit; a
+                        // RETRY re-arm publishes (and re-marks) a fresh one.
+                        for request in accepted.requests.iter_mut() {
+                            request.credit_published = false;
+                        }
+                        // R4-3 leave-at-last-dispatch: settle every
+                        // participant's stream books, THEN complete finished
+                        // streams — two-phase so no generation bump lands
+                        // between two same-pid participants of this wave. A
+                        // pipeline whose final fire just dispatched leaves
+                        // the wait-set here, as a first-class member of the
+                        // wave it rode: the drain stays dense and no
+                        // post-dispatch hold survives (close-at-last-
+                        // submit's win, iteration 62, carried by the marker).
+                        let mut finished_streams: Vec<ProcessId> = Vec::new();
+                        for request in accepted.requests.iter() {
+                            if let Some(qpid) = Self::quorum_pid(
+                                policy,
+                                request.pipeline_id,
+                                request.quorum_generation,
+                            ) && policy.on_fire_resolved(qpid)
+                                && !finished_streams.contains(&qpid)
+                            {
+                                finished_streams.push(qpid);
+                            }
+                        }
+                        for pid in finished_streams {
+                            policy.complete_stream(pid);
+                        }
+                        if super::sched_trace_enabled() {
+                            let (candidate_present, candidate_at_depth, candidate_missing) =
+                                policy.candidate_state_counts(&candidate.pipelines);
+                            let mut queued_launches = 0usize;
+                            let mut queued_controls = 0usize;
+                            let mut queued_pipelines = HashSet::new();
+                            for item in pending.iter() {
+                                match item {
+                                    QueuedItem::Launch(request) => {
+                                        queued_launches += 1;
+                                        if let Some(pid) = request.pipeline_id {
+                                            queued_pipelines.insert(pid);
+                                        }
+                                    }
+                                    _ => queued_controls += 1,
+                                }
+                            }
+                            super::sched_trace_write(format_args!(
+                                concat!(
+                                    "wave candidate={} dispatched={} active={} ",
+                                    "pending={} launches={} ",
+                                    "controls={} ready_pipelines={} ",
+                                    "candidate_pipelines={} present={} at_depth={} missing={}"
+                                ),
+                                candidate.count,
+                                accepted_len,
+                                policy.active_pipelines(),
+                                pending.len(),
+                                queued_launches,
+                                queued_controls,
+                                queued_pipelines.len(),
+                                candidate.pipelines.len(),
+                                candidate_present,
+                                candidate_at_depth,
+                                candidate_missing,
+                            ));
+                        }
                     }
                     progress |= dispatched;
                     if !dispatched {
                         break;
                     }
                 }
-                _ if !in_flight_launches.is_empty() => break,
+                QueuedItem::CloseInstance { id, .. } => {
+                    // A close needs only ITS OWN instance quiesced — never a
+                    // global pipe drain. Inferlets submit passes upfront, so
+                    // an idle instance's close is always safe to overlap
+                    // with other instances' in-flight launches; the old
+                    // whole-pipe drain stalled every launch queued behind a
+                    // front close during cohort swaps, made freshly-bound
+                    // pipelines' credits ragged against the wave window,
+                    // and turned straggler demotion into a storm (V6
+                    // iteration 3: demotions track lost throughput 1:1, and
+                    // healthy inferlets should see none).
+                    if in_flight_control.is_some() {
+                        break;
+                    }
+                    let id = *id;
+                    let busy = instances
+                        .get(&id)
+                        .is_some_and(|tracked| tracked.in_flight != 0)
+                        || Self::instance_has_queued_work(pending, id);
+                    if !busy {
+                        let item = pending.pop_front().expect("close front");
+                        Self::post_control(
+                            driver_lane,
+                            lane_inflight,
+                            lane_token,
+                            instances,
+                            in_flight_control,
+                            policy,
+                            item,
+                        );
+                        progress = true;
+                        // One control post per pass: the outer loop drains
+                        // the scheduler channel between controls, so a
+                        // cohort-swap burst cannot let readiness credits
+                        // pile up unread while the wave window ages — the
+                        // post-burst decide then sees a dense fleet instead
+                        // of mass-demoting pipelines whose credits sat in
+                        // the mailbox (V6 iteration 5).
+                        break;
+                    }
+                    // Busy: rotate the close behind the queue so the fires
+                    // that will quiesce it (and everything unrelated) keep
+                    // flowing; its own retirement re-checks it. A close can
+                    // only move BACKWARD, so it never overtakes its own
+                    // instance's queued work.
+                    if close_rotations >= pending.len()
+                        || !pending
+                            .iter()
+                            .skip(1)
+                            .any(|item| !matches!(item, QueuedItem::CloseInstance { .. }))
+                    {
+                        break;
+                    }
+                    close_rotations += 1;
+                    let item = pending.pop_front().expect("close front");
+                    pending.push_back(item);
+                    progress = true;
+                }
+                // Single control slot: a settling copy/resize blocks the
+                // next control (the slot only ever holds async-completing
+                // controls now — lifecycle controls execute on the lane
+                // without occupying it, their driver order guaranteed by the
+                // lane FIFO).
+                _ if in_flight_control.is_some() => break,
+                _ if !in_flight_launches.is_empty() && !Self::pipe_concurrent_control(item) => {
+                    break;
+                }
                 _ => {
                     let item = pending.pop_front().expect("front item present");
-                    Self::dispatch_ordered_item(
-                        driver,
+                    Self::post_control(
+                        driver_lane,
+                        lane_inflight,
+                        lane_token,
                         instances,
-                        channels,
                         in_flight_control,
+                        policy,
                         item,
                     );
                     progress = true;
+                    // Keep readiness publication interleaved with control
+                    // posting; flooding the lane did not improve first-full.
+                    break;
                 }
             }
         }
         (progress, wait_hint)
     }
 
-    fn dispatch_ordered_item(
-        driver: &mut Option<DriverBackend>,
+    /// Static item-kind label for the control-occupancy fire-timing probe.
+    const fn item_kind(item: &QueuedItem) -> &'static str {
+        match item {
+            QueuedItem::Launch(_) => "launch",
+            QueuedItem::PreLaunchCopy { .. } => "pre_launch_copy",
+            QueuedItem::RegisterProgram { .. } => "register_program",
+            QueuedItem::RegisterChannel { .. } => "register_channel",
+            QueuedItem::RegisterChannels { .. } => "register_channels",
+            QueuedItem::BindInstance { .. } => "bind_instance",
+            QueuedItem::RegisterChannelsBind { .. } => "register_channels_bind",
+            QueuedItem::CopyKv { .. } => "copy_kv",
+            QueuedItem::CopyKvTracked { .. } => "copy_kv_tracked",
+            QueuedItem::CopyState { .. } => "copy_state",
+            QueuedItem::ResizePool { .. } => "resize_pool",
+            QueuedItem::CloseInstance { .. } => "close_instance",
+            QueuedItem::CloseChannel { .. } => "close_channel",
+        }
+    }
+
+    /// Post a control to the driver lane after the worker-side pre-checks
+    /// that read scheduler state. The driver half runs on the lane in FIFO
+    /// order; worker-map effects come back as a [`LaneCommit`]. Async
+    /// controls (copies / pool resizes) occupy the single control slot from
+    /// the moment they post.
+    fn post_control(
+        driver_lane: &DriverLane,
+        lane_inflight: &mut u64,
+        lane_token: &mut u64,
         instances: &mut HashMap<u64, TrackedInstance>,
-        channels: &mut HashSet<u64>,
         in_flight_control: &mut Option<PendingControl>,
+        policy: &mut quorum::WaitAllPolicy,
         item: QueuedItem,
     ) {
-        match item {
-            QueuedItem::Launch(_) | QueuedItem::Prepare(_) => unreachable!(),
+        match &item {
+            QueuedItem::Launch(_) => unreachable!(),
             QueuedItem::PreLaunchCopy {
-                plan: _,
-                logical_completion,
-                ..
+                logical_completion, ..
+            } if logical_completion.is_settled() => return,
+            QueuedItem::PreLaunchCopy {
+                logical_completion, ..
             } if logical_completion.cancel_requested() => {
                 logical_completion
                     .reject_unsubmitted("logical fire cancelled before pre-launch copy");
+                return;
             }
+            QueuedItem::CloseInstance {
+                id, pacing_wait_id, ..
+            } => {
+                let error = match instances.get(id) {
+                    Some(instance) if instance.pacing_wait_id == *pacing_wait_id => {
+                        (instance.in_flight != 0).then(|| format!("instance {id} is busy"))
+                    }
+                    _ => Some(format!("instance {id} is unknown or stale")),
+                };
+                if let Some(message) = error {
+                    tracing::warn!(
+                        instance_id = id,
+                        error = %message,
+                        "scheduler close_instance skipped"
+                    );
+                    return;
+                }
+            }
+            QueuedItem::BindInstance { plan, .. }
+                if plan.requested_instance_id != 0
+                    && instances.contains_key(&plan.requested_instance_id) =>
+            {
+                let QueuedItem::BindInstance {
+                    pipeline_id,
+                    plan,
+                    response,
+                } = item
+                else {
+                    unreachable!();
+                };
+                if response
+                    .send(Err(anyhow!(
+                        "instance {} is already bound",
+                        plan.requested_instance_id
+                    )))
+                    .is_err()
+                {
+                    DriverLane::release_wait_slots([plan.pacing_wait_id]);
+                }
+                policy.on_bind_completed(pipeline_id, Instant::now());
+                return;
+            }
+            QueuedItem::RegisterChannelsBind { bind, .. }
+                if bind.requested_instance_id != 0
+                    && instances.contains_key(&bind.requested_instance_id) =>
+            {
+                let QueuedItem::RegisterChannelsBind {
+                    pipeline_id,
+                    plans,
+                    bind,
+                    response,
+                    ..
+                } = item
+                else {
+                    unreachable!();
+                };
+                if response
+                    .send(Err(anyhow!(
+                        "instance {} is already bound",
+                        bind.requested_instance_id
+                    )))
+                    .is_err()
+                {
+                    DriverLane::release_channel_plan_wait_slots(&plans);
+                    DriverLane::release_wait_slots([bind.pacing_wait_id]);
+                }
+                policy.on_bind_completed(pipeline_id, Instant::now());
+                return;
+            }
+            _ => {}
+        }
+        *lane_token += 1;
+        let token = *lane_token;
+        // Async-completing controls hold the single control slot from POST:
+        // the copy's coupled consumer launch (and any later control) must
+        // not pass it, exactly as before the lane existed.
+        match &item {
             QueuedItem::PreLaunchCopy {
                 plan,
                 logical_completion,
                 pipeline_id,
-            } => match driver.as_mut() {
-                Some(driver) => match driver.copy_kv(&plan) {
-                    Ok(completion) => {
-                        *in_flight_control = Some(PendingControl {
-                            completion,
-                            logical_completion: Some(logical_completion),
-                            pipeline_id,
-                        });
-                    }
-                    Err(error) => {
-                        logical_completion
-                            .reject_unsubmitted(format!("pre-launch KV copy rejected: {error:#}"));
-                    }
-                },
-                None => logical_completion.reject_unsubmitted("driver has no backend installed"),
-            },
-            QueuedItem::RegisterProgram { plan, response } => {
-                let _ = response.send(match driver.as_mut() {
-                    Some(driver) => driver.register_program(&plan),
-                    None => Err(anyhow!("driver has no backend installed")),
-                });
-            }
-            QueuedItem::RegisterChannel { plan, response } => {
-                let result = if channels.contains(&plan.channel_id) {
-                    Err(anyhow!("channel {} is already registered", plan.channel_id))
-                } else {
-                    match driver.as_mut() {
-                        Some(driver) => driver.register_channel(&plan).map(|channel| {
-                            channels.insert(plan.channel_id);
-                            channel
-                        }),
-                        None => Err(anyhow!("driver has no backend installed")),
-                    }
-                };
-                let _ = response.send(result);
-            }
-            QueuedItem::BindInstance { plan, response } => {
-                let result = if plan.requested_instance_id != 0
-                    && instances.contains_key(&plan.requested_instance_id)
-                {
-                    Err(anyhow!(
-                        "instance {} is already bound",
-                        plan.requested_instance_id
-                    ))
-                } else {
-                    match driver.as_mut() {
-                        Some(driver) => driver.bind_instance(&plan).and_then(|bound| {
-                            if instances.contains_key(&bound.instance_id) {
-                                let _ = driver.close_instance(bound.instance_id);
-                                return Err(anyhow!(
-                                    "instance {} is already bound",
-                                    bound.instance_id
-                                ));
-                            }
-                            instances
-                                .insert(bound.instance_id, TrackedInstance::from_bound(&bound));
-                            Ok(bound)
-                        }),
-                        None => Err(anyhow!("driver has no backend installed")),
-                    }
-                };
-                let _ = response.send(result);
-            }
-            QueuedItem::CopyKv { plan, response } => {
-                let _ = response.send(match driver.as_mut() {
-                    Some(driver) => match driver.copy_kv(&plan) {
-                        Ok(completion) => {
-                            *in_flight_control = Some(PendingControl {
-                                completion: completion.clone(),
-                                logical_completion: None,
-                                pipeline_id: None,
-                            });
-                            Ok(completion)
-                        }
-                        Err(err) => Err(err),
-                    },
-                    None => Err(anyhow!("driver has no backend installed")),
-                });
-            }
-            QueuedItem::CopyState { plan, response } => {
-                let _ = response.send(match driver.as_mut() {
-                    Some(driver) => match driver.copy_state(&plan) {
-                        Ok(completion) => {
-                            *in_flight_control = Some(PendingControl {
-                                completion: completion.clone(),
-                                logical_completion: None,
-                                pipeline_id: None,
-                            });
-                            Ok(completion)
-                        }
-                        Err(err) => Err(err),
-                    },
-                    None => Err(anyhow!("driver has no backend installed")),
-                });
-            }
-            QueuedItem::ResizePool { plan, response } => {
-                let _ = response.send(match driver.as_mut() {
-                    Some(driver) => match driver.resize_pool(&plan) {
-                        Ok(completion) => {
-                            *in_flight_control = Some(PendingControl {
-                                completion: completion.clone(),
-                                logical_completion: None,
-                                pipeline_id: None,
-                            });
-                            Ok(completion)
-                        }
-                        Err(err) => Err(err),
-                    },
-                    None => Err(anyhow!("driver has no backend installed")),
-                });
-            }
-            QueuedItem::CloseInstance {
-                id,
-                pacing_wait_id,
-                response,
+                credit_ready,
+                quorum_generation,
             } => {
-                let result = match instances.get(&id) {
-                    Some(instance) if instance.pacing_wait_id == pacing_wait_id => {
-                        if instance.in_flight != 0 {
-                            Err(anyhow!("instance {id} is busy"))
-                        } else {
-                            match driver.as_mut() {
-                                Some(driver) => match driver.close_instance(id) {
-                                    Ok(()) => {
-                                        if let Some(instance) = instances.remove(&id) {
-                                            instance.close_wait_slots();
-                                        }
-                                        Ok(())
-                                    }
-                                    Err(err) => Err(err),
-                                },
-                                None => Err(anyhow!("driver has no backend installed")),
-                            }
-                        }
-                    }
-                    _ => Err(anyhow!("instance {id} is unknown or stale")),
-                };
-                let _ = response.send(result);
+                *in_flight_control = Some(PendingControl {
+                    state: ControlSlotState::Posted { token },
+                    logical_completion: Some(logical_completion.clone()),
+                    pipeline_id: *pipeline_id,
+                    tracked_completion: None,
+                    operation: plan.label(),
+                    credit_ready: *credit_ready,
+                    quorum_generation: *quorum_generation,
+                });
             }
-            QueuedItem::CloseChannel { id, response } => {
-                let result = if !channels.contains(&id) {
-                    Err(anyhow!("channel {id} is unknown or stale"))
-                } else {
-                    match driver.as_mut() {
-                        Some(driver) => driver.close_channel(id).map(|()| {
-                            channels.remove(&id);
-                        }),
-                        None => Err(anyhow!("driver has no backend installed")),
-                    }
-                };
-                let _ = response.send(result);
+            QueuedItem::CopyKv { .. } => {
+                *in_flight_control = Some(PendingControl {
+                    state: ControlSlotState::Posted { token },
+                    logical_completion: None,
+                    pipeline_id: None,
+                    tracked_completion: None,
+                    operation: "KV copy",
+                    credit_ready: false,
+                    quorum_generation: 0,
+                });
             }
+            QueuedItem::CopyKvTracked { completion, .. } => {
+                *in_flight_control = Some(PendingControl {
+                    state: ControlSlotState::Posted { token },
+                    logical_completion: None,
+                    pipeline_id: None,
+                    tracked_completion: Some(completion.clone()),
+                    operation: "tracked KV copy",
+                    credit_ready: false,
+                    quorum_generation: 0,
+                });
+            }
+            QueuedItem::CopyState { .. } => {
+                *in_flight_control = Some(PendingControl {
+                    state: ControlSlotState::Posted { token },
+                    logical_completion: None,
+                    pipeline_id: None,
+                    tracked_completion: None,
+                    operation: "state copy",
+                    credit_ready: false,
+                    quorum_generation: 0,
+                });
+            }
+            QueuedItem::ResizePool { .. } => {
+                *in_flight_control = Some(PendingControl {
+                    state: ControlSlotState::Posted { token },
+                    logical_completion: None,
+                    pipeline_id: None,
+                    tracked_completion: None,
+                    operation: "pool resize",
+                    credit_ready: false,
+                    quorum_generation: 0,
+                });
+            }
+            _ => {}
         }
+        *lane_inflight += 1;
+        driver_lane.post(LaneRequest::Control { token, item });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_launch_batch(
-        driver: &mut Option<DriverBackend>,
+        driver_lane: &DriverLane,
+        lane_inflight: &mut u64,
+        lane_token: &mut u64,
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut VecDeque<QueuedItem>,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
+        policy: &mut quorum::WaitAllPolicy,
+        decision_us: u64,
+        active_pipelines: usize,
+        missing_pipelines: usize,
+        candidate_count: usize,
+        deferred_pipelines: usize,
+        depth_capped_pipelines: usize,
     ) -> bool {
         let mut batch = BatchAccumulator::new(limits, page_size);
         let mut grouping = LaunchGrouping::default();
+        let mut deferred = VecDeque::new();
+        let mut blocked_pipelines = HashSet::new();
         let mut rejected_stale = false;
-        while let Some(QueuedItem::Launch(next)) = pending.front() {
+        let mut barrier_pipelines: HashSet<ProcessId> = HashSet::new();
+        let order_floor = Self::pipeline_order_floor(pending);
+        loop {
+            // Gather past items that do not order against queued launches:
+            // lifecycle controls never do (see `lifecycle_control`);
+            // pre-launch copies order only against LATER fires of their
+            // pipeline, so they are skipped with a barrier that defers
+            // exactly those.
+            // Deferred items return to the queue front in original order.
+            match pending.front() {
+                Some(QueuedItem::Launch(_)) => {}
+                Some(item) if Self::lifecycle_control(item) => {
+                    deferred.push_back(pending.pop_front().expect("control front"));
+                    continue;
+                }
+                Some(QueuedItem::PreLaunchCopy { pipeline_id, .. }) => {
+                    if let Some(pid) = pipeline_id {
+                        barrier_pipelines.insert(*pid);
+                    }
+                    deferred.push_back(pending.pop_front().expect("copy front"));
+                    continue;
+                }
+                _ => break,
+            }
+            let Some(QueuedItem::Launch(next)) = pending.front() else {
+                unreachable!();
+            };
+            if next
+                .pipeline_id
+                .is_some_and(|pid| barrier_pipelines.contains(&pid))
+            {
+                deferred.push_back(pending.pop_front().expect("barriered launch front"));
+                continue;
+            }
             if next.completion.is_settled() {
-                pending.pop_front();
+                let Some(QueuedItem::Launch(dropped)) = pending.pop_front() else {
+                    unreachable!();
+                };
+                Self::drop_request_credit(policy, &dropped);
+                Self::resolve_stream_fire(policy, &dropped);
                 rejected_stale = true;
                 continue;
             }
@@ -1448,10 +3434,16 @@ impl BatchScheduler {
                 let Some(QueuedItem::Launch(cancelled)) = pending.pop_front() else {
                     unreachable!();
                 };
+                Self::drop_request_credit(policy, &cancelled);
+                Self::resolve_stream_fire(policy, &cancelled);
                 cancelled
                     .completion
                     .reject_unsubmitted("logical fire cancelled before native launch");
                 rejected_stale = true;
+                continue;
+            }
+            if next.retry_after.is_some_and(|due| due > Instant::now()) {
+                deferred.push_back(pending.pop_front().expect("backoff launch front"));
                 continue;
             }
             if instances.get(&next.instance_id).is_none() {
@@ -1461,6 +3453,8 @@ impl BatchScheduler {
                 let Some(QueuedItem::Launch(stale)) = pending.pop_front() else {
                     unreachable!();
                 };
+                Self::drop_request_credit(policy, &stale);
+                Self::resolve_stream_fire(policy, &stale);
                 stale.completion.reject_unsubmitted(format!(
                     "instance {} is unknown or stale",
                     stale.instance_id
@@ -1468,7 +3462,36 @@ impl BatchScheduler {
                 rejected_stale = true;
                 continue;
             }
+            if Self::launch_has_earlier_instance_member(pending, next) {
+                deferred.push_back(pending.pop_front().expect("out-of-order launch front"));
+                continue;
+            }
+            if next.pipeline_id.is_some_and(|pid| {
+                order_floor
+                    .get(&pid)
+                    .is_some_and(|&lowest| lowest < next.logical_fire_id)
+            }) {
+                deferred.push_back(pending.pop_front().expect("pipeline-order launch front"));
+                continue;
+            }
+            if next
+                .pipeline_id
+                .is_some_and(|pid| blocked_pipelines.contains(&pid))
+            {
+                deferred.push_back(pending.pop_front().expect("blocked launch front"));
+                continue;
+            }
             if !grouping.accepts(next, limits, page_size) {
+                if (grouping.instances.contains(&next.instance_id)
+                    || next
+                        .pipeline_id
+                        .is_some_and(|pid| grouping.pipelines.contains(&pid)))
+                    && let Some(pid) = next.pipeline_id
+                {
+                    blocked_pipelines.insert(pid);
+                    deferred.push_back(pending.pop_front().expect("runahead launch front"));
+                    continue;
+                }
                 break;
             }
             let QueuedItem::Launch(next) = pending.pop_front().expect("launch front") else {
@@ -1480,9 +3503,23 @@ impl BatchScheduler {
                 break;
             }
         }
+        while let Some(item) = deferred.pop_back() {
+            pending.push_front(item);
+        }
         let mut requests = batch.take();
         if requests.is_empty() {
             return rejected_stale;
+        }
+        let timing_enabled = super::fire_timing_enabled();
+        let dispatch_started_us = timing_enabled.then(super::fire_timing_now_us);
+        if let Some(now) = dispatch_started_us {
+            for request in &mut requests {
+                if let Some(timing) = request.timing.as_mut()
+                    && timing.ready_us.is_none()
+                {
+                    timing.ready_us = Some(now);
+                }
+            }
         }
         let batch_size = requests.len() as u64;
         // Token stats must be read before build: a prebuilt single-request
@@ -1492,52 +3529,69 @@ impl BatchScheduler {
             .map(|req| req.request.token_ids.len())
             .sum::<usize>();
         let submission = batch::build_batch_request(&mut requests, page_size, stats);
-        let mut candidate_epochs = Vec::with_capacity(requests.len());
+        let batch_built_us = timing_enabled.then(super::fire_timing_now_us);
         for request in &requests {
-            let Some(instance) = instances.get(&request.instance_id) else {
+            if instances.get(&request.instance_id).is_none() {
                 for request in &mut requests {
+                    Self::drop_request_credit(policy, request);
+                    Self::resolve_stream_fire(policy, request);
                     let message = format!("instance {} is unknown or stale", request.instance_id);
                     request.completion.reject_unsubmitted(message.clone());
                 }
                 return true;
-            };
-            candidate_epochs.push(instance.next_target_epoch);
-        }
-        match driver.as_mut() {
-            Some(driver) => match driver.launch(&submission) {
-                Ok(completion) => {
-                    for (request, &epoch) in requests.iter().zip(candidate_epochs.iter()) {
-                        request.completion.commit_target_epoch(epoch);
-                    }
-                    for (request, &epoch) in requests.iter().zip(candidate_epochs.iter()) {
-                        if let Some(instance) = instances.get_mut(&request.instance_id) {
-                            instance.in_flight += 1;
-                            instance.next_target_epoch = epoch + 1;
-                        }
-                    }
-                    in_flight_launches.push_back(PendingLaunchBatch {
-                        completion,
-                        requests,
-                        started: Instant::now(),
-                        batch_size,
-                        total_tokens,
-                    });
-                }
-                Err(err) => {
-                    let message = format!("direct launch rejected: {err:#}");
-                    for request in &mut requests {
-                        request.completion.reject_unsubmitted(message.clone());
-                    }
-                }
-            },
-            None => {
-                for request in &mut requests {
-                    request
-                        .completion
-                        .reject_unsubmitted("driver has no backend installed");
-                }
             }
         }
+        // Post to the driver lane and enter the run-ahead pipe immediately:
+        // the batch occupies a depth slot and its instances' in-flight
+        // counts (close gating) from POST, and the driver's verdict arrives
+        // as a `LaneLaunchDone` reply. Target epochs commit at ACCEPT, not
+        // here: an instance's epoch ledger must match the driver's launch
+        // acceptance order exactly (the completion settles when the
+        // instance slot's published count reaches its target, so a gap from
+        // a rejected launch would hang every later fire on the instance) —
+        // and lane replies arrive in post order, which IS the driver's
+        // acceptance order.
+        let membership_hash = if timing_enabled {
+            fire_membership_hash(requests.iter().map(|request| &request.logical_fire_id))
+        } else {
+            0
+        };
+        let wave_timing = dispatch_started_us.map(|dispatch_started_us| WaveTimingState {
+            // Filled in when the lane's reply carries the completion.
+            wave_id: 0,
+            membership_hash,
+            dispatch_started_us,
+            batch_built_us: batch_built_us.unwrap_or(dispatch_started_us),
+            driver_started_us: dispatch_started_us,
+            launch_returned_us: dispatch_started_us,
+            decision_us,
+            active_pipelines,
+            missing_pipelines,
+            candidate_count,
+            deferred_pipelines,
+            depth_capped_pipelines,
+        });
+        for request in &requests {
+            if let Some(instance) = instances.get_mut(&request.instance_id) {
+                instance.in_flight += 1;
+            }
+        }
+        *lane_token += 1;
+        let token = *lane_token;
+        in_flight_launches.push_back(PendingLaunchBatch {
+            state: LaunchState::Posted { token },
+            requests,
+            pipeline_epochs: Vec::new(),
+            started: Instant::now(),
+            batch_size,
+            total_tokens,
+            timing: wave_timing,
+        });
+        *lane_inflight += 1;
+        driver_lane.post(LaneRequest::Launch {
+            token,
+            submission: LaneLaunch(submission),
+        });
         true
     }
 
@@ -1551,34 +3605,87 @@ impl BatchScheduler {
     ) -> bool {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
-            let Some(result) = front.completion.check() else {
-                break;
+            // A lane-rejected launch retires like a wave: it entered the
+            // pipe (depth, credits, instance accounting) at post, so the
+            // common unwind below applies; only its requests' settlement
+            // differs (rejected, never submitted).
+            let launch_failure = match &front.state {
+                LaunchState::Posted { .. } => break,
+                LaunchState::Failed(message) => Some(message.clone()),
+                LaunchState::Accepted(_) => None,
+            };
+            let result = match &front.state {
+                LaunchState::Accepted(completion) => {
+                    let Some(result) = completion.check() else {
+                        break;
+                    };
+                    Some(result)
+                }
+                _ => None,
             };
             let retired = in_flight_launches.pop_front().expect("front batch exists");
-            let participants = retired
-                .requests
-                .iter()
-                .map(|request| request.pipeline_id)
-                .collect::<Vec<_>>();
-            policy.on_wave_retired(&participants);
+            let native_complete_us = retired.timing.as_ref().map(|_| super::fire_timing_now_us());
+            let timing_snapshots = retired
+                .timing
+                .as_ref()
+                .map(|_| Self::fire_timing_snapshots(&retired.requests));
+            policy.on_wave_retired(&retired.pipeline_epochs);
             for request in &retired.requests {
                 if let Some(instance) = instances.get_mut(&request.instance_id) {
                     instance.in_flight = instance.in_flight.saturating_sub(1);
                 }
             }
+            if let Some(message) = launch_failure {
+                if let (Some(timing), Some(native_complete_us), Some(snapshots)) =
+                    (retired.timing, native_complete_us, timing_snapshots)
+                {
+                    let settled_us = super::fire_timing_now_us();
+                    Self::emit_fire_timing(
+                        &snapshots,
+                        timing,
+                        false,
+                        native_complete_us,
+                        settled_us,
+                        &vec!["launch_error"; snapshots.len()],
+                        retired.batch_size,
+                        retired.total_tokens,
+                        policy.untracked_ready_count(),
+                        &[],
+                    );
+                }
+                let message = format!("direct launch rejected: {message}");
+                for request in &retired.requests {
+                    request.completion.reject_unsubmitted(message.clone());
+                }
+                progress = true;
+                continue;
+            }
+            let result = result.expect("accepted batch carries a settled result");
             match result {
                 Ok(()) => {
                     for request in &retired.requests {
                         request.completion.mark_native_retired();
                     }
                     let mut retries = Vec::new();
+                    let mut outcomes = Vec::with_capacity(retired.requests.len());
+                    let mut token_instance_ids = Vec::new();
                     for mut request in retired.requests {
                         match request.completion.resolve_from_terminal() {
-                            Ok(
-                                WorkItemAttemptOutcome::Committed | WorkItemAttemptOutcome::Failed,
-                            ) => {}
+                            Ok(WorkItemAttemptOutcome::Committed) => {
+                                outcomes.push("committed");
+                                if !request.request.sampling_indices.is_empty() {
+                                    token_instance_ids.push(request.instance_id);
+                                }
+                            }
+                            Ok(WorkItemAttemptOutcome::Failed) => {
+                                outcomes.push("failed");
+                            }
                             Ok(WorkItemAttemptOutcome::Retry) => {
+                                outcomes.push("retry");
                                 request.retry_count += 1;
+                                if let Some(timing) = request.timing.as_mut() {
+                                    timing.ready_us = None;
+                                }
                                 if request.completion.cancel_requested() {
                                     request
                                         .completion
@@ -1612,11 +3719,53 @@ impl BatchScheduler {
                                             "logical fire remains uncommitted and will retry"
                                         );
                                     }
-                                    policy.on_pipeline_request(request.pipeline_id, Instant::now());
+                                    // A requeued RETRY re-enters the
+                                    // undispatched set (its dispatch was
+                                    // consumed at post). A STALE stamp on a
+                                    // NON-cancelled retry can only be the
+                                    // finished-stream corner — the last
+                                    // fire dispatched, the row auto-left
+                                    // (generation bumped), then the driver
+                                    // said RETRY — or a Suspend-stranded
+                                    // sibling (flagged rough state either
+                                    // way). RE-JOIN under the current
+                                    // generation and restore `end_seen`:
+                                    // the row re-arms and leaves again
+                                    // cleanly at this fire's dispatch;
+                                    // untracked stays 0 through the corner.
+                                    // (Close/Terminate stale fires never
+                                    // reach here: their cancel flags route
+                                    // to rejection above.)
+                                    if let Some(pid) = request.pipeline_id {
+                                        let stale =
+                                            policy.generation_of(pid) != request.quorum_generation;
+                                        request.quorum_generation = policy.generation_of(pid);
+                                        policy.on_fire_admitted(pid);
+                                        if stale {
+                                            policy.on_stream_end_restored(pid);
+                                        }
+                                    }
+                                    if !Self::request_needs_prelaunch(&request) {
+                                        let qpid = Self::quorum_pid(
+                                            policy,
+                                            request.pipeline_id,
+                                            request.quorum_generation,
+                                        );
+                                        policy.on_pipeline_join(qpid);
+                                        policy.on_pipeline_request(qpid, Instant::now());
+                                        request.credit_published = true;
+                                        if let Some(timing) = request.timing.as_mut() {
+                                            timing.ready_us = Some(super::fire_timing_now_us());
+                                        }
+                                    }
+                                    request.retry_after = Some(
+                                        Instant::now() + Self::retry_backoff(request.retry_count),
+                                    );
                                     retries.push(request);
                                 }
                             }
                             Err(err) => {
+                                outcomes.push("settlement_error");
                                 tracing::warn!(
                                     instance_id = request.instance_id,
                                     ?err,
@@ -1628,6 +3777,23 @@ impl BatchScheduler {
                     for request in retries.into_iter().rev() {
                         Self::queue_attempt(pending, request, QueueEnd::Front);
                     }
+                    if let (Some(timing), Some(native_complete_us), Some(snapshots)) =
+                        (retired.timing, native_complete_us, timing_snapshots)
+                    {
+                        let settled_us = super::fire_timing_now_us();
+                        Self::emit_fire_timing(
+                            &snapshots,
+                            timing,
+                            true,
+                            native_complete_us,
+                            settled_us,
+                            &outcomes,
+                            retired.batch_size,
+                            retired.total_tokens,
+                            policy.untracked_ready_count(),
+                            &token_instance_ids,
+                        );
+                    }
                     stats::record_fire_stats(
                         stats,
                         retired.started.elapsed(),
@@ -1637,6 +3803,23 @@ impl BatchScheduler {
                 }
 
                 Err(err) => {
+                    if let (Some(timing), Some(native_complete_us), Some(snapshots)) =
+                        (retired.timing, native_complete_us, timing_snapshots)
+                    {
+                        let settled_us = super::fire_timing_now_us();
+                        Self::emit_fire_timing(
+                            &snapshots,
+                            timing,
+                            true,
+                            native_complete_us,
+                            settled_us,
+                            &vec!["completion_error"; snapshots.len()],
+                            retired.batch_size,
+                            retired.total_tokens,
+                            policy.untracked_ready_count(),
+                            &[],
+                        );
+                    }
                     tracing::warn!(?err, "direct launch completion closed before callback");
                     for request in &retired.requests {
                         request.completion.reject(format!(
@@ -1653,24 +3836,413 @@ impl BatchScheduler {
         progress
     }
 
-    fn retire_ready_control(in_flight_control: &mut Option<PendingControl>) -> bool {
+    fn fire_timing_snapshots(requests: &[PendingRequest]) -> Vec<FireTimingSnapshot> {
+        requests
+            .iter()
+            .enumerate()
+            .filter_map(|(outcome_index, request)| {
+                request.timing.map(|timing| FireTimingSnapshot {
+                    outcome_index,
+                    logical_fire_id: request.logical_fire_id,
+                    instance_id: request.instance_id,
+                    process_id: request.pipeline_id,
+                    sampled_rows: request.request.sampling_indices.len(),
+                    retry_count: request.retry_count,
+                    timing,
+                })
+            })
+            .collect()
+    }
+
+    fn emit_fire_timing(
+        requests: &[FireTimingSnapshot],
+        timing: WaveTimingState,
+        cuda_submitted: bool,
+        native_complete_us: u64,
+        settled_us: u64,
+        outcomes: &[&str],
+        batch_size: u64,
+        total_tokens: usize,
+        untracked_ready: usize,
+        token_instance_ids: &[u64],
+    ) {
+        let committed = outcomes
+            .iter()
+            .filter(|&&outcome| outcome == "committed")
+            .count();
+        let retried = outcomes
+            .iter()
+            .filter(|&&outcome| outcome == "retry")
+            .count();
+        let failed = outcomes.len().saturating_sub(committed + retried);
+        let mut record = serde_json::json!({
+            "schema": 1,
+            "source": "scheduler",
+            "event": "scheduler_wave",
+            "wave_id": timing.wave_id,
+            "membership_hash": timing.membership_hash,
+            "cuda_submitted": cuda_submitted,
+            "fire_count": batch_size,
+            "batch_size": batch_size,
+            "tokens": total_tokens,
+            "committed": committed,
+            "retried": retried,
+            "failed": failed,
+            "dispatch_started_us": timing.dispatch_started_us,
+            "batch_built_us": timing.batch_built_us,
+            "driver_started_us": timing.driver_started_us,
+            "launch_returned_us": timing.launch_returned_us,
+            "native_complete_us": native_complete_us,
+            "settled_us": settled_us,
+            "batch_build_us": timing
+                .batch_built_us
+                .saturating_sub(timing.dispatch_started_us),
+            "driver_submit_us": timing
+                .launch_returned_us
+                .saturating_sub(timing.driver_started_us),
+            "native_inflight_us": native_complete_us
+                .saturating_sub(timing.launch_returned_us),
+            "retire_settle_us": settled_us.saturating_sub(native_complete_us),
+            "decision_us": timing.decision_us,
+            "active_pipelines": timing.active_pipelines,
+            "missing_pipelines": timing.missing_pipelines,
+            "candidate_count": timing.candidate_count,
+            "deferred_pipelines": timing.deferred_pipelines,
+            "depth_capped_pipelines": timing.depth_capped_pipelines,
+            // W1 leak gate: must be 0 whenever no untracked fires are in
+            // the gather (a monotonic climb here is the close-leave leak).
+            "untracked_ready": untracked_ready,
+        });
+        if super::ledger_timing_enabled() {
+            record["token_instance_ids"] = serde_json::json!(token_instance_ids);
+        }
+        super::fire_timing_write(&record);
+        for request in requests {
+            let outcome = outcomes
+                .get(request.outcome_index)
+                .copied()
+                .unwrap_or("unknown");
+            let fire = request.timing;
+            super::fire_timing_write(&serde_json::json!({
+                "schema": 1,
+                "source": "scheduler",
+                "event": "scheduler_fire",
+                "wave_id": timing.wave_id,
+                "logical_fire_id": request.logical_fire_id,
+                "instance_id": request.instance_id,
+                "process_id": request.process_id,
+                "sampled_rows": request.sampled_rows,
+                "attempt": request.retry_count,
+                "preparation_retries": 0,
+                "outcome": outcome,
+                "submitted_us": fire.submitted_us,
+                "enqueued_us": fire.enqueued_us,
+                "prepare_started_us": null,
+                "prepared_us": null,
+                "ready_us": fire.ready_us,
+                "native_complete_us": native_complete_us,
+                "settled_us": settled_us,
+                "submit_to_enqueue_us": fire
+                    .enqueued_us
+                    .map(|value| value.saturating_sub(fire.submitted_us)),
+                "prepare_us": 0,
+                "ready_to_dispatch_us": fire.ready_us
+                    .map(|ready| timing.dispatch_started_us.saturating_sub(ready)),
+            }));
+        }
+    }
+
+    fn retire_ready_control(
+        in_flight_control: &mut Option<PendingControl>,
+        pending: &mut VecDeque<QueuedItem>,
+        policy: &mut quorum::WaitAllPolicy,
+    ) -> bool {
+        let operation = in_flight_control
+            .as_ref()
+            .map(|pending| pending.operation)
+            .unwrap_or("control operation");
         let Some(result) = in_flight_control
             .as_ref()
-            .and_then(|pending| pending.completion.check())
+            .and_then(|pending| match &pending.state {
+                // Still waiting for the lane's reply to install the driver
+                // completion (or clear the slot on rejection).
+                ControlSlotState::Posted { .. } => None,
+                ControlSlotState::Ready(completion) => completion.check(),
+            })
         else {
             return false;
         };
-        if let Err(err) = result {
-            tracing::warn!(?err, "direct control completion closed before callback");
+        if let Some(tracked) = in_flight_control
+            .as_ref()
+            .and_then(|pending| pending.tracked_completion.as_ref())
+        {
+            tracked.resolve(&result);
+        }
+        if result.is_ok()
+            && in_flight_control
+                .as_ref()
+                .is_some_and(|pending| pending.credit_ready)
+        {
+            // A protected control retiring after its pipeline left must not
+            // re-arm the barrier on a ghost; the generation route publishes
+            // its coupled launch's credit untracked (W1; covers Close,
+            // which the departed-set guard never did).
+            let qpid = in_flight_control.as_ref().and_then(|pending| {
+                Self::quorum_pid(policy, pending.pipeline_id, pending.quorum_generation)
+            });
+            policy.on_pipeline_join(qpid);
+            policy.on_pipeline_request(qpid, Instant::now());
+            if let Some(completion) = in_flight_control
+                .as_ref()
+                .and_then(|control| control.logical_completion.as_ref())
+            {
+                // The credit published above belongs to this control's
+                // coupled consumer launch, still queued behind the control
+                // slot: mark it as the credit holder so a later drop of
+                // that launch gives the credit back (RV-20).
+                let ready_us = super::fire_timing_enabled().then(super::fire_timing_now_us);
+                for item in pending.iter_mut() {
+                    let QueuedItem::Launch(request) = item else {
+                        continue;
+                    };
+                    if request.completion.same_request(completion) {
+                        request.credit_published = true;
+                        if let (Some(timing), Some(ready_us)) = (request.timing.as_mut(), ready_us)
+                        {
+                            timing.ready_us = Some(ready_us);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if let Err(ref err) = result {
+            tracing::warn!(
+                ?err,
+                operation,
+                "direct control completion closed before callback"
+            );
             if let Some(logical) = in_flight_control
                 .as_ref()
                 .and_then(|pending| pending.logical_completion.as_ref())
             {
-                logical.reject_unsubmitted(format!("pre-launch KV copy failed: {err:#}"));
+                logical.reject_unsubmitted(format!("pre-launch {operation} failed: {err:#}"));
             }
         }
         *in_flight_control = None;
         true
+    }
+
+    /// Apply a driver-lane reply on the worker thread: fill in a posted
+    /// launch's verdict, commit a control's worker-map effects, or install an
+    /// async control's driver completion. Replies arrive in lane FIFO order.
+    fn apply_lane_reply(
+        reply: LaneReply,
+        lane_inflight: &mut u64,
+        in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
+        in_flight_control: &mut Option<PendingControl>,
+        instances: &mut HashMap<u64, TrackedInstance>,
+        policy: &mut quorum::WaitAllPolicy,
+        rollback_tx: &crossbeam::channel::Sender<SchedulerItem>,
+    ) {
+        *lane_inflight = lane_inflight.saturating_sub(1);
+        match reply {
+            LaneReply::LaunchDone {
+                token,
+                result,
+                driver_started_us,
+                launch_returned_us,
+            } => {
+                let Some(batch) = in_flight_launches.iter_mut().find(
+                    |batch| matches!(batch.state, LaunchState::Posted { token: t } if t == token),
+                ) else {
+                    // The batch can only leave the deque by retiring, and a
+                    // Posted batch never retires — a missing token is a bug.
+                    tracing::error!(token, "lane launch reply for an unknown batch");
+                    return;
+                };
+                match result {
+                    Ok(completion) => {
+                        // Commit target epochs AT ACCEPT: lane replies arrive
+                        // in post order — the driver's launch acceptance
+                        // order — so the per-instance ledger stays gapless
+                        // (a rejected launch commits nothing) and each
+                        // completion's target matches the ordinal the
+                        // instance slot will publish.
+                        for request in &batch.requests {
+                            if let Some(instance) = instances.get_mut(&request.instance_id) {
+                                let epoch = instance.next_target_epoch;
+                                request.completion.commit_target_epoch(epoch);
+                                instance.next_target_epoch = epoch + 1;
+                            }
+                        }
+                        if let Some(timing) = batch.timing.as_mut() {
+                            timing.wave_id = completion.wait_id();
+                            if let Some(at) = driver_started_us {
+                                timing.driver_started_us = at;
+                            }
+                            if let Some(at) = launch_returned_us {
+                                timing.launch_returned_us = at;
+                            }
+                        }
+                        batch.state = LaunchState::Accepted(completion);
+                    }
+                    Err(message) => {
+                        if let (Some(timing), Some(at)) =
+                            (batch.timing.as_mut(), launch_returned_us)
+                        {
+                            timing.launch_returned_us = at;
+                            if let Some(started) = driver_started_us {
+                                timing.driver_started_us = started;
+                            }
+                        }
+                        batch.state = LaunchState::Failed(message);
+                    }
+                }
+            }
+            LaneReply::ControlDone { token, commit } => match commit {
+                LaneCommit::None => {}
+                LaneCommit::BindFinished { pipeline_id } => {
+                    policy.on_bind_completed(pipeline_id, Instant::now());
+                }
+                LaneCommit::BindInstance {
+                    pipeline_id,
+                    bound,
+                    respond,
+                } => {
+                    policy.on_bind_completed(pipeline_id, Instant::now());
+                    if instances.contains_key(&bound.instance_id) {
+                        // Practically unreachable: driver-assigned ids are
+                        // unique and requested ids are pre-checked at post
+                        // (a guest awaits its bind response before it could
+                        // reuse an id). Refuse loudly; the legit instance in
+                        // the map stays untouched.
+                        tracing::error!(
+                            instance_id = bound.instance_id,
+                            "bind committed an already-bound instance id"
+                        );
+                        let error = anyhow!("instance {} is already bound", bound.instance_id);
+                        match respond {
+                            BindRespond::Bind(response) => {
+                                let _ = response.send(Err(error));
+                            }
+                            BindRespond::ChannelsBind { response, .. } => {
+                                let _ = response.send(Err(error));
+                            }
+                        }
+                        return;
+                    }
+                    let instance_id = bound.instance_id;
+                    instances.insert(instance_id, TrackedInstance::from_bound(&bound));
+                    // Respond AFTER the insert: launch admission reads
+                    // `instances` on this thread, so the guest's first fire
+                    // (sent only after this response) is always admissible.
+                    match respond {
+                        BindRespond::Bind(response) => {
+                            if let Err(Ok(bound)) = response.send(Ok(bound)) {
+                                tracing::warn!(
+                                    operation = "bind_instance",
+                                    instance_id = bound.instance_id,
+                                    "scheduler cancellation rollback enqueued bound instance"
+                                );
+                                if rollback_tx
+                                    .send(SchedulerItem::CloseInstance {
+                                        id: bound.instance_id,
+                                        pacing_wait_id: bound.pacing_wait_id,
+                                    })
+                                    .is_err()
+                                {
+                                    tracing::error!(
+                                        operation = "bind_instance",
+                                        instance_id = bound.instance_id,
+                                        "scheduler cancellation rollback enqueue failed"
+                                    );
+                                }
+                            }
+                        }
+                        BindRespond::ChannelsBind {
+                            registered,
+                            program_id,
+                            program_registered,
+                            response,
+                        } => {
+                            if let Err(Ok((registered, _, bound))) =
+                                response.send(Ok((registered, program_id, bound)))
+                            {
+                                tracing::warn!(
+                                    operation = "register_channels_bind",
+                                    instance_id = bound.instance_id,
+                                    channel_count = registered.len(),
+                                    "scheduler cancellation rollback enqueued bound instance and channels"
+                                );
+                                if program_registered {
+                                    tracing::warn!(
+                                        operation = "register_channels_bind",
+                                        program_id,
+                                        "scheduler RPC cancelled after program registration; retaining driver-lifetime program"
+                                    );
+                                }
+                                DriverLane::release_registered_channel_wait_slots(&registered);
+                                let instance_id = bound.instance_id;
+                                if rollback_tx
+                                    .send(SchedulerItem::CloseInstance {
+                                        id: instance_id,
+                                        pacing_wait_id: bound.pacing_wait_id,
+                                    })
+                                    .is_err()
+                                {
+                                    tracing::error!(
+                                        operation = "register_channels_bind",
+                                        instance_id,
+                                        "scheduler cancellation rollback close_instance enqueue failed"
+                                    );
+                                }
+                                for channel in registered {
+                                    let channel_id = channel.binding.channel_id;
+                                    if rollback_tx
+                                        .send(SchedulerItem::CloseChannel { id: channel_id })
+                                        .is_err()
+                                    {
+                                        tracing::error!(
+                                            operation = "register_channels_bind",
+                                            channel_id,
+                                            "scheduler cancellation rollback close_channel enqueue failed"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                LaneCommit::CloseInstance { id } => {
+                    if let Some(instance) = instances.remove(&id) {
+                        instance.close_wait_slots();
+                    }
+                }
+                LaneCommit::AsyncControl { result } => {
+                    let holds_token = in_flight_control.as_ref().is_some_and(
+                        |control| matches!(control.state, ControlSlotState::Posted { token: t } if t == token),
+                    );
+                    if !holds_token {
+                        tracing::error!(
+                            token,
+                            "lane async-control reply without a matching control slot"
+                        );
+                        return;
+                    }
+                    match result {
+                        Ok(completion) => {
+                            if let Some(control) = in_flight_control.as_mut() {
+                                control.state = ControlSlotState::Ready(completion);
+                            }
+                        }
+                        // The lane already rejected/resolved the control's
+                        // completions; the slot just frees.
+                        Err(_) => *in_flight_control = None,
+                    }
+                }
+            },
+        }
     }
 
     fn shutdown_instances(
@@ -1715,11 +4287,6 @@ struct TrackedInstance {
     wait_slots: Arc<crate::driver::instance::BoundWaitSlots>,
     in_flight: usize,
     next_target_epoch: u64,
-    /// This instance's compiled program identity — the fire trace
-    /// (`PIE_SCHED_TRACE`) derives `distinct_programs` from these per
-    /// dispatched batch (no per-identity hash/stats table: this is just the
-    /// bind-time `BoundInstance::program_id` already tracked here).
-    program_id: crate::driver::ProgramId,
 }
 
 impl TrackedInstance {
@@ -1729,7 +4296,6 @@ impl TrackedInstance {
             wait_slots: bound.wait_slots(),
             in_flight: 0,
             next_target_epoch: pie_waker::FIRST_COMPLETION_EPOCH,
-            program_id: bound.program_id,
         }
     }
 
@@ -1744,7 +4310,7 @@ mod tests {
     use crate::driver::{
         self, ChannelValue, DriverSpec, LaunchPlan, ProgramRegistration, SchedulerLimits,
     };
-    use pie_driver_abi::{PieKvMoveCell, PiePoolRange};
+    use pie_driver_abi::{PieInstanceBinding, PieKvMoveCell, PiePoolRange};
     use pie_driver_dummy_lib::DummyDriverOptions;
     use pie_ptir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
     use pie_ptir::op::Op;
@@ -1780,6 +4346,55 @@ mod tests {
             single_token_mode: true,
             ..LaunchPlan::default()
         }
+    }
+
+    fn dummy_prefill(tokens: usize) -> LaunchPlan {
+        let mut launch = dummy_launch();
+        launch.token_ids = vec![1; tokens];
+        launch.position_ids = (0..tokens as u32).collect();
+        launch.qo_indptr = vec![0, tokens as u32];
+        launch.sampling_indices = vec![tokens.saturating_sub(1) as u32];
+        launch.single_token_mode = false;
+        launch
+    }
+
+    /// Test lane over a driverless backend plus the reply stream the worker
+    /// loop would normally drain.
+    fn test_lane(
+        driver: Option<DriverBackend>,
+    ) -> (DriverLane, crossbeam::channel::Receiver<SchedulerItem>) {
+        let (reply_tx, reply_rx) = crossbeam::channel::unbounded();
+        let lane = DriverLane::spawn(
+            usize::MAX,
+            driver,
+            reply_tx,
+            Arc::new(SchedulerStats::default()),
+        );
+        (lane, reply_rx)
+    }
+
+    async fn wait_for_operation_count(
+        operation_log: &Arc<Mutex<Vec<String>>>,
+        operation: &str,
+        count: usize,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if operation_log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|entry| entry.as_str() == operation)
+                    .count()
+                    >= count
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler operation must complete");
     }
 
     fn chan(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
@@ -1820,34 +4435,36 @@ mod tests {
         }
     }
 
-    fn register_test_channels(
+    async fn register_test_channels(
         driver_id: usize,
         channel_ids: [u64; 2],
     ) -> anyhow::Result<Vec<Arc<crate::driver::ChannelEndpoint>>> {
-        [
+        let mut endpoints = Vec::new();
+        for (channel_id, host_role, seeded) in [
             (channel_ids[0], HostRole::None, true),
             (channel_ids[1], HostRole::Reader, false),
-        ]
-        .into_iter()
-        .map(|(channel_id, host_role, seeded)| {
-            crate::scheduler::register_channel(
-                driver_id,
-                ChannelRegistrationPlan {
+        ] {
+            endpoints.push(
+                crate::scheduler::register_channel(
                     driver_id,
-                    channel_id,
-                    shape: vec![1],
-                    dtype: pie_driver_abi::PIE_CHANNEL_DTYPE_U32,
-                    host_role: host_role as u8,
-                    seeded,
-                    extern_dir: pie_driver_abi::PIE_CHANNEL_EXTERN_NONE,
-                    capacity: 2,
-                    reader_wait_id: 0,
-                    writer_wait_id: 0,
-                    extern_name: Vec::new(),
-                },
-            )
-        })
-        .collect()
+                    ChannelRegistrationPlan {
+                        driver_id,
+                        channel_id,
+                        shape: vec![1],
+                        dtype: pie_driver_abi::PIE_CHANNEL_DTYPE_U32,
+                        host_role: host_role as u8,
+                        seeded,
+                        extern_dir: pie_driver_abi::PIE_CHANNEL_EXTERN_NONE,
+                        capacity: 2,
+                        reader_wait_id: 0,
+                        writer_wait_id: 0,
+                        extern_name: Vec::new(),
+                    },
+                )
+                .await?,
+            );
+        }
+        Ok(endpoints)
     }
 
     async fn setup_scheduler_with_options(
@@ -1871,11 +4488,11 @@ mod tests {
 
     /// Like [`setup_scheduler_with_options`], but with a caller-chosen
     /// `SchedulerLimits` — the quorum wait-all rule's structural cap
-    /// (`max_forward_requests`) short-circuits any cold-hold/deadline
+    /// (`max_forward_requests`) short-circuits any cold-hold/wait-all
     /// delay once a batch saturates it (see `quorum::tests::
     /// structural_cap_fires_immediately_even_cold`), so every other test in
     /// this module runs at cap 1 and never observes the quorum hold. Tests
-    /// that need to actually exercise the hold (coalescing/deadline/leave)
+    /// that need to actually exercise the hold (coalescing/leave)
     /// use this with a cap > 1 instead.
     async fn setup_scheduler_with_limits(
         options: DummyDriverOptions,
@@ -1890,14 +4507,16 @@ mod tests {
             DriverSpec {
                 num_kv_pages: 16,
                 limits,
+                device_geometry_port_mask: 0,
             },
             DriverBackend::Dummy(crate::driver::DummyDriver::new(options)),
         );
         let scheduler = BatchScheduler::new(driver_id, driver_id, 16, limits, 1);
-        let program_id = crate::scheduler::register_program(driver_id, dummy_program())?;
-        let endpoints = register_test_channels(driver_id, [7, 8])?;
+        let program_id = crate::scheduler::register_program(driver_id, dummy_program()).await?;
+        let endpoints = register_test_channels(driver_id, [7, 8]).await?;
         let bound = crate::scheduler::bind_instance(
             driver_id,
+            None,
             program_id,
             41,
             vec![7, 8],
@@ -1905,7 +4524,8 @@ mod tests {
                 channel: 7,
                 bytes: 1u32.to_le_bytes().to_vec(),
             }],
-        )?;
+        )
+        .await?;
         Ok((driver_id, scheduler, bound, endpoints))
     }
 
@@ -1915,24 +4535,19 @@ mod tests {
         let (driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler(operation_log.clone()).await?;
 
-        timeout(
-            Duration::from_secs(5),
-            crate::scheduler::copy_kv_cells(
-                driver_id,
-                vec![PieKvMoveCell {
-                    dst_page_id: 1,
-                    dst_token_offset: 0,
-                    src_page_id: 2,
-                    src_token_offset: 0,
-                }],
-            )?,
+        let copy_kv = crate::scheduler::copy_kv_cells(
+            driver_id,
+            vec![PieKvMoveCell {
+                dst_page_id: 1,
+                dst_token_offset: 0,
+                src_page_id: 2,
+                src_token_offset: 0,
+            }],
         )
-        .await??;
-        timeout(
-            Duration::from_secs(5),
-            crate::scheduler::copy_rs_d2d(driver_id, &[3], &[4])?,
-        )
-        .await??;
+        .await?;
+        timeout(Duration::from_secs(5), copy_kv).await??;
+        let copy_state = crate::scheduler::copy_rs_d2d(driver_id, &[3], &[4]).await?;
+        timeout(Duration::from_secs(5), copy_state).await??;
         crate::scheduler::close_instance(&bound)?;
 
         let log = operation_log.lock().unwrap().clone();
@@ -1966,13 +4581,13 @@ mod tests {
                 page_count: 4,
             }],
             Vec::new(),
-        )?;
+        )
+        .await?;
         let launch = bound.reserve_completion();
         crate::scheduler::submit_prebuilt_async(
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             launch.clone(),
         )?;
@@ -2004,11 +4619,110 @@ mod tests {
         let pacing_wait_id = bound.pacing_wait_id;
         crate::scheduler::close_instance(&bound)?;
 
-        assert!(matches!(
-            pie_waker::WakerTable::global().publish(pacing_wait_id, 1),
-            pie_waker::WakeOutcome::Stale
-        ));
+        timeout(Duration::from_secs(5), async {
+            while pie_waker::WakerTable::global()
+                .published(pacing_wait_id)
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         Ok(())
+    }
+
+    #[test]
+    fn cancelled_register_channel_releases_wait_slots_before_creation() {
+        let table = pie_waker::WakerTable::global();
+        let reader_wait_id = table.alloc();
+        let writer_wait_id = table.alloc();
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        drop(receiver);
+        let mut driver = None;
+        let mut channels = HashSet::new();
+
+        let commit = DriverLane::execute_control(
+            &mut driver,
+            &mut channels,
+            QueuedItem::RegisterChannel {
+                plan: ChannelRegistrationPlan {
+                    driver_id: 0,
+                    channel_id: 91,
+                    shape: vec![1],
+                    dtype: pie_driver_abi::PIE_CHANNEL_DTYPE_U32,
+                    host_role: HostRole::None as u8,
+                    seeded: false,
+                    extern_dir: pie_driver_abi::PIE_CHANNEL_EXTERN_NONE,
+                    capacity: 1,
+                    reader_wait_id,
+                    writer_wait_id,
+                    extern_name: Vec::new(),
+                },
+                response,
+            },
+        );
+
+        assert!(matches!(commit, LaneCommit::None));
+        assert!(table.published(reader_wait_id).is_none());
+        assert!(table.published(writer_wait_id).is_none());
+        assert!(channels.is_empty());
+    }
+
+    #[test]
+    fn cancelled_bind_response_enqueues_instance_rollback() {
+        let pacing_wait_id = pie_waker::WakerTable::global().alloc();
+        let bound = BoundInstance::new(
+            7,
+            11,
+            PieInstanceBinding {
+                instance_id: 41,
+                geometry_class: pie_driver_abi::GeometryClass::Host as u32,
+                reserved0: 0,
+            },
+            pacing_wait_id,
+        );
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        drop(receiver);
+        let (rollback_tx, rollback_rx) = crossbeam::channel::unbounded();
+        let mut lane_inflight = 1;
+        let mut launches = VecDeque::new();
+        let mut control = None;
+        let mut instances = HashMap::new();
+        let mut policy = quorum::WaitAllPolicy::new(1, None);
+
+        BatchScheduler::apply_lane_reply(
+            LaneReply::ControlDone {
+                token: 1,
+                commit: LaneCommit::BindInstance {
+                    pipeline_id: None,
+                    bound,
+                    respond: BindRespond::Bind(response),
+                },
+            },
+            &mut lane_inflight,
+            &mut launches,
+            &mut control,
+            &mut instances,
+            &mut policy,
+            &rollback_tx,
+        );
+
+        assert!(matches!(
+            rollback_rx.try_recv(),
+            Ok(SchedulerItem::CloseInstance {
+                id: 41,
+                pacing_wait_id: wait_id,
+            }) if wait_id == pacing_wait_id
+        ));
+        instances
+            .remove(&41)
+            .expect("cancelled bind remains tracked until ordered rollback")
+            .close_wait_slots();
+        assert!(
+            pie_waker::WakerTable::global()
+                .published(pacing_wait_id)
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2019,6 +4733,7 @@ mod tests {
 
         let error = crate::scheduler::bind_instance(
             driver_id,
+            None,
             bound.program_id,
             bound.instance_id,
             vec![17, 18],
@@ -2027,6 +4742,7 @@ mod tests {
                 bytes: 1u32.to_le_bytes().to_vec(),
             }],
         )
+        .await
         .expect_err("duplicate requested instance id must be rejected");
         assert!(error.to_string().contains("already bound"));
 
@@ -2035,7 +4751,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;
@@ -2098,7 +4813,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;
@@ -2132,6 +4846,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn one_instance_multi_row_rs_launch_reaches_dummy_intact() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) = setup_scheduler_with_limits(
+            DummyDriverOptions {
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            },
+            SchedulerLimits {
+                max_forward_requests: 2,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+            },
+        )
+        .await?;
+        let mut launch = dummy_launch();
+        launch.token_ids = vec![1, 2];
+        launch.position_ids = vec![0, 0];
+        launch.qo_indptr = vec![0, 1, 2];
+        launch.kv_page_indptr = vec![0, 0, 0];
+        launch.kv_last_page_lens = vec![0, 0];
+        launch.sampling_indices = vec![0, 1];
+        launch.sampling_indptr = vec![0, 1, 2];
+        launch.mask_indptr = vec![0, 0, 0];
+        launch.rs_slot_ids = vec![7, 9];
+        launch.rs_slot_flags = vec![crate::driver::RS_FLAG_RESET, 0];
+
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_async(
+            launch,
+            driver_id,
+            bound.instance_id,
+            0,
+            None,
+            completion.clone(),
+        )?;
+        timeout(Duration::from_secs(5), completion).await??;
+
+        assert!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.starts_with("launch-shape tokens=2 programs=1"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn synchronous_launch_rejection_has_no_callback_or_epoch_gap() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) =
@@ -2147,7 +4909,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             rejected.clone(),
         )?;
@@ -2166,7 +4927,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             accepted.clone(),
         )?;
@@ -2206,7 +4966,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
             vec![1],
@@ -2269,7 +5028,6 @@ mod tests {
             launch,
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;
@@ -2314,7 +5072,6 @@ mod tests {
             first_plan,
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             first.clone(),
         )?;
@@ -2323,7 +5080,6 @@ mod tests {
             second_plan,
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             second.clone(),
         )?;
@@ -2352,7 +5108,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;
@@ -2379,7 +5134,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;
@@ -2407,34 +5161,26 @@ mod tests {
     async fn permanent_retry_classifier_fails_without_burning_the_retry_budget()
     -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound, _endpoints) =
+        let (_driver_id, scheduler, bound, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
                 retry_launches_remaining: max_fire_retries(),
                 operation_log: Some(operation_log.clone()),
                 ..DummyDriverOptions::default()
             })
             .await?;
-        let preparation: crate::scheduler::LaunchPreparation = Box::new(|_| {
-            Ok(crate::scheduler::PreparedLaunch {
-                page_refs: Vec::new(),
-                last_page_len: 0,
-                kv_translation_version: 0,
-                copy_src: Vec::new(),
-                copy_dst: Vec::new(),
-            })
-        });
         let classifier: crate::scheduler::RetryClassifier =
             Box::new(|| Some("writer endpoint closed".to_string()));
         let completion = bound.reserve_completion();
-        crate::scheduler::submit_async_deferred(
+        scheduler.handle.submit_prebuilt_tracked_with_copy(
             dummy_launch(),
-            driver_id,
             bound.instance_id,
-            Some(ProcessId::new_v4()),
-            None,
             completion.clone(),
-            preparation,
+            0,
+            ProcessId::new_v4(),
+            None,
+            None,
             Some(classifier),
+            false,
         )?;
 
         let error = timeout(Duration::from_secs(5), completion)
@@ -2453,182 +5199,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn dispatch_preparation_retries_before_the_single_driver_attempt() -> anyhow::Result<()> {
-        let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound, _endpoints) =
-            setup_scheduler(operation_log.clone()).await?;
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let attempts_in_prepare = attempts.clone();
-        let preparation: crate::scheduler::LaunchPreparation = Box::new(move |request| {
-            let attempt = attempts_in_prepare.fetch_add(1, Ordering::AcqRel);
-            if attempt == 0 {
-                return Err(crate::scheduler::LaunchPreparationError::Retry(
-                    "predecessor translation not ready".to_string(),
-                ));
-            }
-            request.kv_translation = Vec::new();
-            Ok(crate::scheduler::PreparedLaunch {
-                page_refs: Vec::new(),
-                last_page_len: 0,
-                kv_translation_version: 0,
-                copy_src: Vec::new(),
-                copy_dst: Vec::new(),
-            })
-        });
-        let completion = bound.reserve_completion();
-        crate::scheduler::submit_async_deferred(
-            dummy_launch(),
-            driver_id,
-            bound.instance_id,
-            Some(ProcessId::new_v4()),
-            None,
-            completion.clone(),
-            preparation,
-            None,
-        )?;
-        timeout(Duration::from_secs(5), completion).await??;
-        assert_eq!(attempts.load(Ordering::Acquire), 2);
-        assert_eq!(
-            operation_log
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|entry| entry.as_str() == "launch")
-                .count(),
-            1
-        );
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn blocked_preparation_runs_only_after_an_event_nudge() -> anyhow::Result<()> {
-        let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound, _endpoints) =
-            setup_scheduler(operation_log.clone()).await?;
-        let ready = Arc::new(AtomicBool::new(false));
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let prepare_ready = ready.clone();
-        let prepare_attempts = attempts.clone();
-        let preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
-            prepare_attempts.fetch_add(1, Ordering::AcqRel);
-            if !prepare_ready.load(Ordering::Acquire) {
-                return Err(crate::scheduler::LaunchPreparationError::Blocked(
-                    "waiting for contention grant".to_string(),
-                ));
-            }
-            Ok(crate::scheduler::PreparedLaunch {
-                page_refs: Vec::new(),
-                last_page_len: 0,
-                kv_translation_version: 0,
-                copy_src: Vec::new(),
-                copy_dst: Vec::new(),
-            })
-        });
-        let completion = bound.reserve_completion();
-        crate::scheduler::submit_async_deferred(
-            dummy_launch(),
-            driver_id,
-            bound.instance_id,
-            Some(ProcessId::new_v4()),
-            None,
-            completion.clone(),
-            preparation,
-            None,
-        )?;
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        assert_eq!(attempts.load(Ordering::Acquire), 1);
-        assert!(!completion.is_settled());
-
-        ready.store(true, Ordering::Release);
-        crate::scheduler::nudge(driver_id);
-        timeout(Duration::from_secs(5), completion).await??;
-        assert_eq!(attempts.load(Ordering::Acquire), 2);
-        assert_eq!(
-            operation_log
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|entry| entry.as_str() == "launch")
-                .count(),
-            1
-        );
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pipeline_freeze_blocks_preparation_until_resume() -> anyhow::Result<()> {
-        let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
-        let pid = ProcessId::new_v4();
-        scheduler.handle.freeze_pipeline(pid)?;
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let prepare_attempts = attempts.clone();
-        let preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
-            prepare_attempts.fetch_add(1, Ordering::AcqRel);
-            Ok(crate::scheduler::PreparedLaunch {
-                page_refs: Vec::new(),
-                last_page_len: 0,
-                kv_translation_version: 0,
-                copy_src: Vec::new(),
-                copy_dst: Vec::new(),
-            })
-        });
-        let completion = bound.reserve_completion();
-        crate::scheduler::submit_async_deferred(
-            dummy_launch(),
-            driver_id,
-            bound.instance_id,
-            Some(pid),
-            None,
-            completion.clone(),
-            preparation,
-            None,
-        )?;
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        assert_eq!(attempts.load(Ordering::Acquire), 0);
-        assert!(!completion.is_settled());
-
-        scheduler.handle.resume_pipeline(pid)?;
-        timeout(Duration::from_secs(5), completion).await??;
-        assert_eq!(attempts.load(Ordering::Acquire), 1);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn termination_rejects_frozen_preparation() -> anyhow::Result<()> {
-        let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
-        let pid = ProcessId::new_v4();
-        scheduler.handle.freeze_pipeline(pid)?;
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let prepare_attempts = attempts.clone();
-        let preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
-            prepare_attempts.fetch_add(1, Ordering::AcqRel);
-            Err(crate::scheduler::LaunchPreparationError::Failed(
-                "must not run".to_string(),
-            ))
-        });
-        let completion = bound.reserve_completion();
-        crate::scheduler::submit_async_deferred(
-            dummy_launch(),
-            driver_id,
-            bound.instance_id,
-            Some(pid),
-            None,
-            completion.clone(),
-            preparation,
-            None,
-        )?;
-        notify_pipeline_leave(pid, LeaveKind::Terminate);
-        let error = timeout(Duration::from_secs(5), completion)
-            .await?
-            .expect_err("termination must reject blocked preparation");
-        assert!(error.to_string().contains("terminated"));
-        assert_eq!(attempts.load(Ordering::Acquire), 0);
-        Ok(())
-    }
-
     #[test]
     fn termination_preserves_launch_until_its_inflight_prelaunch_copy_retires() {
         let pid = ProcessId::new_v4();
@@ -2637,121 +5207,104 @@ mod tests {
             dummy_launch(),
             1,
             completion.clone(),
-            Vec::new(),
             0,
             Some(pid),
-            None,
             false,
             None,
             None,
             None,
+            false,
         );
         let mut pending = VecDeque::from([QueuedItem::Launch(request)]);
-        let mut blocked = VecDeque::new();
+        let mut policy = quorum::WaitAllPolicy::new(1, None);
         completion.request_cancel();
-        BatchScheduler::reject_pipeline_queued(&mut pending, &mut blocked, pid, Some(&completion));
+        BatchScheduler::reject_pipeline_queued(&mut pending, &mut policy, pid, Some(&completion));
         assert_eq!(pending.len(), 1);
         assert!(completion.cancel_requested());
         assert!(!completion.is_settled());
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn retrying_preparation_preserves_lane_order_without_global_blocking()
-    -> anyhow::Result<()> {
-        let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let (driver_id, _scheduler, bound, _endpoints) = setup_scheduler(operation_log).await?;
-        let pid = ProcessId::new_v4();
-        let allow_first = Arc::new(AtomicBool::new(false));
-        let order = Arc::new(Mutex::new(Vec::new()));
+    #[tokio::test]
+    async fn tracked_control_completion_wakes_multiple_waiters() {
+        let completion = ControlCompletion::new();
+        let first = completion.clone();
+        let second = completion.clone();
+        let first = tokio::spawn(async move { first.wait().await });
+        let second = tokio::spawn(async move { second.wait().await });
+        tokio::task::yield_now().await;
+        completion.resolve(&Ok(()));
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+    }
 
-        let first_allow = allow_first.clone();
-        let first_order = order.clone();
-        let first_preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
-            if !first_allow.load(Ordering::Acquire) {
-                return Err(crate::scheduler::LaunchPreparationError::Retry(
-                    "first lane member is waiting".to_string(),
-                ));
-            }
-            first_order.lock().unwrap().push("first");
-            Ok(crate::scheduler::PreparedLaunch {
-                page_refs: Vec::new(),
-                last_page_len: 0,
-                kv_translation_version: 0,
-                copy_src: Vec::new(),
-                copy_dst: Vec::new(),
-            })
-        });
-        let second_allow = allow_first.clone();
-        let second_order = order.clone();
-        let second_preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
-            assert!(
-                second_allow.load(Ordering::Acquire),
-                "a later same-lane preparation overtook its predecessor"
-            );
-            second_order.lock().unwrap().push("second");
-            Ok(crate::scheduler::PreparedLaunch {
-                page_refs: Vec::new(),
-                last_page_len: 0,
-                kv_translation_version: 0,
-                copy_src: Vec::new(),
-                copy_dst: Vec::new(),
-            })
-        });
-        let unblock_order = order.clone();
-        let unblock_preparation: crate::scheduler::LaunchPreparation = Box::new(move |_| {
-            unblock_order.lock().unwrap().push("unrelated");
-            allow_first.store(true, Ordering::Release);
-            Err(crate::scheduler::LaunchPreparationError::Failed(
-                "test-only unrelated preparation stop".to_string(),
-            ))
-        });
-
-        let first = bound.reserve_completion();
-        crate::scheduler::submit_async_deferred(
+    #[test]
+    fn aggregated_rs_copy_is_queued_before_its_launch() {
+        let completion = WorkItemCompletion::deferred_with_guard(None);
+        let state_copy = StateCopyPlan {
+            slot_ranges: vec![
+                pie_driver_abi::PieStateCopyRange {
+                    src_slot_id: 3,
+                    dst_slot_id: 5,
+                    src_token_offset: 0,
+                    dst_token_offset: 0,
+                    token_count: 0,
+                },
+                pie_driver_abi::PieStateCopyRange {
+                    src_slot_id: 3,
+                    dst_slot_id: 6,
+                    src_token_offset: 0,
+                    dst_token_offset: 0,
+                    token_count: 0,
+                },
+            ],
+        };
+        let request = PendingRequest::direct(
             dummy_launch(),
-            driver_id,
-            bound.instance_id,
-            Some(pid),
-            Some(7),
-            first.clone(),
-            first_preparation,
+            1,
+            completion,
+            0,
             None,
-        )?;
-        let second = bound.reserve_completion();
-        crate::scheduler::submit_async_deferred(
-            dummy_launch(),
-            driver_id,
-            bound.instance_id,
-            Some(pid),
-            Some(7),
-            second.clone(),
-            second_preparation,
+            false,
             None,
-        )?;
-        let unrelated = bound.reserve_completion();
-        crate::scheduler::submit_async_deferred(
-            dummy_launch(),
-            driver_id,
-            bound.instance_id,
-            Some(pid),
-            Some(8),
-            unrelated.clone(),
-            unblock_preparation,
+            Some(state_copy),
             None,
-        )?;
-
-        timeout(Duration::from_secs(5), async {
-            first.await?;
-            second.await?;
-            let _ = unrelated.await.expect_err("unrelated preparation stops");
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
-        assert_eq!(
-            order.lock().unwrap().as_slice(),
-            ["unrelated", "first", "second"]
+            false,
         );
-        Ok(())
+        let mut pending = VecDeque::new();
+        BatchScheduler::queue_attempt(&mut pending, request, QueueEnd::Back);
+
+        let QueuedItem::PreLaunchCopy {
+            plan: PreLaunchCopy::State(plan),
+            ..
+        } = pending.pop_front().unwrap()
+        else {
+            panic!("aggregated state copy must precede the launch");
+        };
+        assert_eq!(plan.slot_ranges.len(), 2);
+        assert_eq!(plan.slot_ranges[0].src_slot_id, 3);
+        assert_eq!(plan.slot_ranges[1].dst_slot_id, 6);
+        assert!(matches!(pending.pop_front(), Some(QueuedItem::Launch(_))));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn unresolved_multi_row_prebuilt_request_remains_solo() {
+        let mut launch = dummy_launch();
+        launch.qo_indptr = vec![0, 0, 0];
+        let request = PendingRequest::direct(
+            launch,
+            1,
+            WorkItemCompletion::deferred_with_guard(None),
+            0,
+            Some(ProcessId::new_v4()),
+            true,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(request.preserves_inner_rows());
+        assert!(request.requires_solo_submission());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2770,7 +5323,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;
@@ -2801,9 +5353,10 @@ mod tests {
                 ..DummyDriverOptions::default()
             })
             .await?;
-        let _secondary_endpoints = register_test_channels(driver_id, [17, 18])?;
+        let _secondary_endpoints = register_test_channels(driver_id, [17, 18]).await?;
         let bound_b = crate::scheduler::bind_instance(
             driver_id,
+            None,
             bound_a.program_id,
             42,
             vec![17, 18],
@@ -2811,14 +5364,14 @@ mod tests {
                 channel: 17,
                 bytes: 1u32.to_le_bytes().to_vec(),
             }],
-        )?;
+        )
+        .await?;
 
         let first = bound_a.reserve_completion();
         crate::scheduler::submit_prebuilt_async(
             dummy_launch(),
             driver_id,
             bound_a.instance_id,
-            Vec::new(),
             0,
             first.clone(),
         )?;
@@ -2828,7 +5381,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound_b.instance_id,
-            Vec::new(),
             0,
             second.clone(),
         )?;
@@ -2876,7 +5428,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             first.clone(),
         )?;
@@ -2889,7 +5440,6 @@ mod tests {
                 dummy_launch(),
                 driver_id,
                 instance_id,
-                Vec::new(),
                 0,
                 second_for_submit,
             )
@@ -2928,9 +5478,10 @@ mod tests {
                 ..DummyDriverOptions::default()
             })
             .await?;
-        let _secondary_endpoints = register_test_channels(driver_id, [17, 18])?;
+        let _secondary_endpoints = register_test_channels(driver_id, [17, 18]).await?;
         let bound_b = crate::scheduler::bind_instance(
             driver_id,
+            None,
             bound_a.program_id,
             42,
             vec![17, 18],
@@ -2938,19 +5489,19 @@ mod tests {
                 channel: 17,
                 bytes: 1u32.to_le_bytes().to_vec(),
             }],
-        )?;
+        )
+        .await?;
 
         let first = bound_a.reserve_completion();
         crate::scheduler::submit_prebuilt_async(
             dummy_launch(),
             driver_id,
             bound_a.instance_id,
-            Vec::new(),
             0,
             first.clone(),
         )?;
 
-        let resize_join = std::thread::spawn(move || {
+        let resize_join = tokio::spawn(async move {
             crate::scheduler::resize_pool(
                 driver_id,
                 7,
@@ -2961,6 +5512,7 @@ mod tests {
                 }],
                 Vec::new(),
             )
+            .await
         });
 
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2973,7 +5525,6 @@ mod tests {
                 dummy_launch(),
                 second_driver_id,
                 second_instance_id,
-                Vec::new(),
                 0,
                 second_for_submit,
             )
@@ -2996,7 +5547,7 @@ mod tests {
         );
 
         timeout(Duration::from_secs(5), first).await??;
-        let resize = resize_join.join().unwrap()?;
+        let resize = resize_join.await??;
         tokio::time::sleep(Duration::from_millis(10)).await;
         let during_control = operation_log.lock().unwrap().clone();
         assert_eq!(
@@ -3053,7 +5604,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn close_waits_for_accepted_launch_then_succeeds() -> anyhow::Result<()> {
+    async fn close_enqueues_before_accepted_launch_retires() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (_driver_id, _scheduler, bound, _endpoints) =
             setup_scheduler_with_options(DummyDriverOptions {
@@ -3068,23 +5619,27 @@ mod tests {
             dummy_launch(),
             bound.driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             launch.clone(),
         )?;
 
-        let close_bound = std::thread::spawn({
-            let bound = bound;
-            move || crate::scheduler::close_instance(&bound)
-        });
-
-        std::thread::sleep(Duration::from_millis(10));
+        let started = std::time::Instant::now();
+        crate::scheduler::close_instance(&bound)?;
         assert!(
-            !close_bound.is_finished(),
-            "close should block until accepted launch retires"
+            started.elapsed() < Duration::from_millis(10),
+            "fire-and-forget close must return after enqueue"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == "close_instance"),
+            "native close still waits for the accepted launch to retire"
         );
         timeout(Duration::from_secs(5), launch).await??;
-        close_bound.join().unwrap()?;
+        wait_for_operation_count(&operation_log, "close_instance", 1).await;
 
         let log = operation_log.lock().unwrap().clone();
         let launch_idx = log.iter().position(|entry| entry == "launch").unwrap();
@@ -3099,22 +5654,153 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn stale_instance_handles_are_rejected() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_instance_close_is_fire_and_forget() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let (_driver_id, _scheduler, bound, _endpoints) =
-                setup_scheduler(operation_log).await?;
-            crate::scheduler::close_instance(&bound)?;
-            let err = crate::scheduler::close_instance(&bound).unwrap_err();
-            assert!(err.to_string().contains("stale"));
-            Ok::<_, anyhow::Error>(())
-        })?;
+        let (_driver_id, scheduler, bound, endpoints) =
+            setup_scheduler(operation_log.clone()).await?;
+        crate::scheduler::close_instance(&bound)?;
+        crate::scheduler::close_instance(&bound)?;
+        drop(endpoints);
+        drop(scheduler);
+        assert_eq!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_str() == "close_instance")
+                .count(),
+            2,
+            "both fire-and-forget requests are attempted; stale-close diagnostics are scheduler-owned"
+        );
         Ok(())
+    }
+
+    /// A close needs only ITS OWN instance quiesced: instance B's close
+    /// completes while instance A's launch is still in flight. The old
+    /// behavior held every close hostage to a global pipe drain, which at
+    /// cohort swaps stalled all queued launches behind a front close and
+    /// turned the wave barrier's straggler demotion into a storm (V6
+    /// iteration 3).
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_of_idle_instance_overlaps_in_flight_launches() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound_a, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                callback_delay_ms: 200,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let program_id = crate::scheduler::register_program(driver_id, dummy_program()).await?;
+        let _secondary_endpoints = register_test_channels(driver_id, [17, 18]).await?;
+        let bound_b = crate::scheduler::bind_instance(
+            driver_id,
+            None,
+            program_id,
+            42,
+            vec![17, 18],
+            vec![ChannelValue {
+                channel: 17,
+                bytes: 1u32.to_le_bytes().to_vec(),
+            }],
+        )
+        .await?;
+
+        let launch = bound_a.reserve_completion();
+        crate::scheduler::submit_prebuilt_async(
+            dummy_launch(),
+            bound_a.driver_id,
+            bound_a.instance_id,
+            0,
+            launch.clone(),
+        )?;
+
+        // Give the worker a moment to dispatch A's launch into flight.
+        std::thread::sleep(Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        crate::scheduler::close_instance(&bound_b)?;
+        assert!(
+            started.elapsed() < Duration::from_millis(120),
+            "idle-instance close must not wait for the pipe to drain"
+        );
+        wait_for_operation_count(&operation_log, "close_instance", 1).await;
+
+        let log = operation_log.lock().unwrap().clone();
+        let launch_idx = log.iter().position(|entry| entry == "launch");
+        let close_idx = log.iter().position(|entry| entry == "close_instance");
+        assert!(
+            launch_idx.is_some() && close_idx.is_some() && launch_idx < close_idx,
+            "B's close must overlap A's in-flight launch: {log:?}"
+        );
+        timeout(Duration::from_secs(5), launch).await??;
+        Ok(())
+    }
+
+    /// Synchronous controls interleave with scheduler mailbox draining.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_synchronous_control_dispatches_per_pass() {
+        let (tx_a, mut rx_a) = tokio::sync::oneshot::channel();
+        let (tx_b, mut rx_b) = tokio::sync::oneshot::channel();
+        let mut pending = VecDeque::from([
+            QueuedItem::RegisterProgram {
+                plan: dummy_program(),
+                response: tx_a,
+            },
+            QueuedItem::RegisterProgram {
+                plan: dummy_program(),
+                response: tx_b,
+            },
+        ]);
+        let (lane, _lane_rx) = test_lane(None);
+        let mut lane_inflight = 0u64;
+        let mut lane_token = 0u64;
+        let mut instances = HashMap::new();
+        let mut in_flight_launches = VecDeque::new();
+        let mut in_flight_control = None;
+        let limits = SchedulerLimits {
+            max_forward_requests: 64,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let stats = Arc::new(SchedulerStats::default());
+        let mut policy = quorum::WaitAllPolicy::new(limits.max_forward_requests, None);
+
+        let (progress, _) = BatchScheduler::dispatch_ready_items(
+            &lane,
+            &mut lane_inflight,
+            &mut lane_token,
+            &mut instances,
+            &mut pending,
+            &mut in_flight_launches,
+            &mut in_flight_control,
+            16,
+            limits,
+            &stats,
+            &mut policy,
+            false,
+        );
+        assert!(progress);
+        assert!(
+            timeout(Duration::from_secs(5), &mut rx_a).await.is_ok(),
+            "the first control dispatches this pass"
+        );
+        assert!(
+            matches!(
+                rx_b.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the second control waits for the next pass"
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn instance_queued_work_gate_sees_launches() {
+        let pid = ProcessId::new_v4();
+        let pending = VecDeque::from([QueuedItem::Launch(dummy_launch_request(pid, 7))]);
+        assert!(BatchScheduler::instance_has_queued_work(&pending, 7));
+        assert!(!BatchScheduler::instance_has_queued_work(&pending, 8));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3127,10 +5813,11 @@ mod tests {
                 ..DummyDriverOptions::default()
             })
             .await?;
-        let program_id = crate::scheduler::register_program(driver_id, dummy_program())?;
-        let _secondary_endpoints = register_test_channels(driver_id, [17, 18])?;
+        let program_id = crate::scheduler::register_program(driver_id, dummy_program()).await?;
+        let _secondary_endpoints = register_test_channels(driver_id, [17, 18]).await?;
         let bound_b = crate::scheduler::bind_instance(
             driver_id,
+            None,
             program_id,
             42,
             vec![17, 18],
@@ -3138,15 +5825,16 @@ mod tests {
                 channel: 17,
                 bytes: 1u32.to_le_bytes().to_vec(),
             }],
-        )?;
+        )
+        .await?;
 
-        let resize = crate::scheduler::resize_pool(driver_id, 9, 16, Vec::new(), Vec::new())?;
+        let resize =
+            crate::scheduler::resize_pool(driver_id, 9, 16, Vec::new(), Vec::new()).await?;
         let a = bound_a.reserve_completion();
         crate::scheduler::submit_prebuilt_async(
             dummy_launch(),
             driver_id,
             bound_a.instance_id,
-            Vec::new(),
             0,
             a,
         )?;
@@ -3155,7 +5843,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound_b.instance_id,
-            Vec::new(),
             0,
             b,
         )?;
@@ -3215,7 +5902,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;
@@ -3253,7 +5939,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;
@@ -3295,7 +5980,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;
@@ -3328,6 +6012,7 @@ mod tests {
                     max_forward_tokens: 64,
                     max_page_refs: 64,
                 },
+                device_geometry_port_mask: 0,
             },
             DriverBackend::Dummy(crate::driver::DummyDriver::new(
                 DummyDriverOptions::default(),
@@ -3391,7 +6076,8 @@ mod tests {
                 canonical_bytes: exporter_bytes,
                 sidecar_bytes: Vec::new(),
             },
-        )?;
+        )
+        .await?;
         let importer_program = crate::scheduler::register_program(
             driver_id,
             ProgramRegistration {
@@ -3399,7 +6085,8 @@ mod tests {
                 canonical_bytes: importer_bytes,
                 sidecar_bytes: Vec::new(),
             },
-        )?;
+        )
+        .await?;
         let shared = crate::scheduler::register_channel(
             driver_id,
             ChannelRegistrationPlan {
@@ -3415,7 +6102,8 @@ mod tests {
                 writer_wait_id: 0,
                 extern_name: b"shared".to_vec(),
             },
-        )?;
+        )
+        .await?;
         let reader = crate::scheduler::register_channel(
             driver_id,
             ChannelRegistrationPlan {
@@ -3431,17 +6119,27 @@ mod tests {
                 writer_wait_id: 0,
                 extern_name: Vec::new(),
             },
-        )?;
+        )
+        .await?;
         let _ = shared;
-        let exporter =
-            crate::scheduler::bind_instance(driver_id, exporter_program, 61, vec![91], Vec::new())?;
+        let exporter = crate::scheduler::bind_instance(
+            driver_id,
+            None,
+            exporter_program,
+            61,
+            vec![91],
+            Vec::new(),
+        )
+        .await?;
         let importer = crate::scheduler::bind_instance(
             driver_id,
+            None,
             importer_program,
             62,
             vec![91, 92],
             Vec::new(),
-        )?;
+        )
+        .await?;
 
         // A parked take on the importer's reader — a task that never
         // submitted anything — observes the cross-instance flow end to end.
@@ -3455,7 +6153,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             exporter.instance_id,
-            Vec::new(),
             0,
             export_fire.clone(),
         )?;
@@ -3464,7 +6161,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             importer.instance_id,
-            Vec::new(),
             0,
             import_fire.clone(),
         )?;
@@ -3498,7 +6194,6 @@ mod tests {
                     dummy_launch(),
                     driver_id,
                     bound.instance_id,
-                    Vec::new(),
                     0,
                     completion,
                 )?;
@@ -3524,7 +6219,7 @@ mod tests {
 
     /// Binds a second instance on the same program/driver as `bound_a`, for
     /// tests that need two independent pipelines' fires in flight at once.
-    fn bind_second_instance(
+    async fn bind_second_instance(
         driver_id: usize,
         bound_a: &crate::driver::BoundInstance,
         channel_ids: [u64; 2],
@@ -3533,9 +6228,10 @@ mod tests {
         crate::driver::BoundInstance,
         Vec<Arc<crate::driver::ChannelEndpoint>>,
     )> {
-        let endpoints = register_test_channels(driver_id, channel_ids)?;
+        let endpoints = register_test_channels(driver_id, channel_ids).await?;
         let bound_b = crate::scheduler::bind_instance(
             driver_id,
+            None,
             bound_a.program_id,
             requested_instance_id,
             channel_ids.to_vec(),
@@ -3543,7 +6239,8 @@ mod tests {
                 channel: channel_ids[0],
                 bytes: 1u32.to_le_bytes().to_vec(),
             }],
-        )?;
+        )
+        .await?;
         Ok((bound_b, endpoints))
     }
 
@@ -3559,7 +6256,7 @@ mod tests {
         )
         .await?;
         let (bound_b, _secondary_endpoints) =
-            bind_second_instance(driver_id, &bound_a, [27, 28], 52)?;
+            bind_second_instance(driver_id, &bound_a, [27, 28], 52).await?;
 
         let pid_a = ProcessId::new_v4();
         let pid_b = ProcessId::new_v4();
@@ -3573,7 +6270,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound_a.instance_id,
-            Vec::new(),
             0,
             Some(pid_a),
             first.clone(),
@@ -3583,7 +6279,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound_b.instance_id,
-            Vec::new(),
             0,
             Some(pid_b),
             second.clone(),
@@ -3599,7 +6294,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|entry| entry == "launch-shape tokens=2 programs=2");
+                    .any(|entry| entry.starts_with("launch-shape tokens=2 programs=2"));
                 if hit {
                     return true;
                 }
@@ -3621,61 +6316,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_missing_members_wave_deadline_fires_and_counts_a_miss() -> anyhow::Result<()> {
-        let (driver_id, _scheduler, bound_a, _endpoints) =
-            setup_scheduler_with_limits(DummyDriverOptions::default(), coalescing_limits()).await?;
+    async fn token_capacity_partitions_wait_all_wave_without_deadlock() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let limits = SchedulerLimits {
+            max_forward_requests: 4,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let (driver_id, _scheduler, bound_a, _endpoints) = setup_scheduler_with_limits(
+            DummyDriverOptions {
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            },
+            limits,
+        )
+        .await?;
         let (bound_b, _secondary_endpoints) =
-            bind_second_instance(driver_id, &bound_a, [27, 28], 53)?;
-
+            bind_second_instance(driver_id, &bound_a, [29, 30], 53).await?;
         let pid_a = ProcessId::new_v4();
         let pid_b = ProcessId::new_v4();
 
-        // Wave 1: both pipelines are seen — establishes them in the
-        // wait-set (dense-fires quickly via the cold-hold gather).
-        let first_a = bound_a.reserve_completion();
-        crate::scheduler::submit_async(
-            dummy_launch(),
-            driver_id,
-            bound_a.instance_id,
-            Vec::new(),
-            0,
-            Some(pid_a),
-            first_a.clone(),
-        )?;
-        let first_b = bound_b.reserve_completion();
-        crate::scheduler::submit_async(
-            dummy_launch(),
-            driver_id,
-            bound_b.instance_id,
-            Vec::new(),
-            0,
-            Some(pid_b),
-            first_b.clone(),
-        )?;
-        timeout(Duration::from_secs(5), first_a).await??;
-        timeout(Duration::from_secs(5), first_b).await??;
+        for _ in 0..2 {
+            let first = bound_a.reserve_completion();
+            crate::scheduler::submit_async(
+                dummy_prefill(40),
+                driver_id,
+                bound_a.instance_id,
+                0,
+                Some(pid_a),
+                first.clone(),
+            )?;
+            let second = bound_b.reserve_completion();
+            crate::scheduler::submit_async(
+                dummy_prefill(40),
+                driver_id,
+                bound_b.instance_id,
+                0,
+                Some(pid_b),
+                second.clone(),
+            )?;
 
-        // Wave 2: only `a` resubmits (its decode loop's next token); `b`
-        // never comes back. The quorum holds `a` for `b` up to the ~10ms
-        // wave deadline, then fires solo — a straggler deadline-fire, not
-        // an immediate dense fire.
-        let started = Instant::now();
-        let second_a = bound_a.reserve_completion();
-        crate::scheduler::submit_async(
-            dummy_launch(),
-            driver_id,
-            bound_a.instance_id,
-            Vec::new(),
-            0,
-            Some(pid_a),
-            second_a.clone(),
-        )?;
-        timeout(Duration::from_secs(5), second_a).await??;
-        assert!(
-            started.elapsed() >= Duration::from_millis(8),
-            "a solo wave missing `b` should hold roughly the full ~10ms wave \
-             deadline before firing, took {:?}",
-            started.elapsed()
+            timeout(Duration::from_secs(5), first).await??;
+            timeout(Duration::from_secs(5), second).await??;
+        }
+
+        let launches = operation_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.starts_with("launch-shape tokens=40 programs=1"))
+            .count();
+        assert_eq!(
+            launches,
+            4,
+            "each logical wave should split into two capacity-limited launches: {:?}",
+            operation_log.lock().unwrap()
         );
 
         crate::scheduler::close_instance(&bound_a)?;
@@ -3688,7 +6383,7 @@ mod tests {
         let (driver_id, _scheduler, bound_a, _endpoints) =
             setup_scheduler_with_limits(DummyDriverOptions::default(), coalescing_limits()).await?;
         let (bound_b, _secondary_endpoints) =
-            bind_second_instance(driver_id, &bound_a, [27, 28], 54)?;
+            bind_second_instance(driver_id, &bound_a, [27, 28], 54).await?;
 
         let pid_a = ProcessId::new_v4();
         let pid_b = ProcessId::new_v4();
@@ -3699,7 +6394,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound_a.instance_id,
-            Vec::new(),
             0,
             Some(pid_a),
             first_a.clone(),
@@ -3709,7 +6403,6 @@ mod tests {
             dummy_launch(),
             driver_id,
             bound_b.instance_id,
-            Vec::new(),
             0,
             Some(pid_b),
             first_b.clone(),
@@ -3717,17 +6410,14 @@ mod tests {
         timeout(Duration::from_secs(5), first_a).await??;
         timeout(Duration::from_secs(5), first_b).await??;
 
-        // Wave 2: only `a` resubmits; `b` instead LEAVES the fleet (as the
-        // process facade's terminate path would call on exit) before the
-        // wave deadline — the quorum should drop it from the wait-set and
-        // fire `a`'s wave immediately, not after the ~10ms deadline.
+        // Wave 2: only `a` resubmits; `b` instead leaves the fleet. The
+        // quorum drops it from the wait-set and releases `a`.
         let started = Instant::now();
         let second_a = bound_a.reserve_completion();
         crate::scheduler::submit_async(
             dummy_launch(),
             driver_id,
             bound_a.instance_id,
-            Vec::new(),
             0,
             Some(pid_a),
             second_a.clone(),
@@ -3736,8 +6426,7 @@ mod tests {
         timeout(Duration::from_secs(5), second_a).await??;
         assert!(
             started.elapsed() < Duration::from_millis(8),
-            "leave should unblock the hold well before the ~10ms wave \
-             deadline, took {:?}",
+            "leave should unblock the wait-all hold promptly, took {:?}",
             started.elapsed()
         );
 
@@ -3754,14 +6443,13 @@ mod tests {
         // `submit_prebuilt_async` always carries `pipeline_id: None` — it
         // never joins the wait-set, so it must fire promptly even though
         // nothing else is active to gather with it (bootstrap cold-hold at
-        // most, never the ~10ms straggler deadline).
+        // most).
         let started = Instant::now();
         let completion = bound.reserve_completion();
         crate::scheduler::submit_prebuilt_async(
             dummy_launch(),
             driver_id,
             bound.instance_id,
-            Vec::new(),
             0,
             completion.clone(),
         )?;
@@ -3774,5 +6462,201 @@ mod tests {
 
         crate::scheduler::close_instance(&bound)?;
         Ok(())
+    }
+
+    fn dummy_launch_request(pipeline_id: ProcessId, instance_id: u64) -> PendingRequest {
+        PendingRequest::direct(
+            dummy_launch(),
+            instance_id,
+            WorkItemCompletion::deferred_with_guard(None),
+            0,
+            Some(pipeline_id),
+            false,
+            None,
+            None,
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn launch_grouping_uses_driver_token_capacity() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 4,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+        };
+        let mut first = dummy_launch_request(ProcessId::new_v4(), 1);
+        first.request = dummy_prefill(1536);
+        let mut second = dummy_launch_request(ProcessId::new_v4(), 2);
+        second.request = dummy_prefill(1536);
+
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&first, limits, 16));
+        grouping.push(&first, limits, 16);
+        assert!(
+            grouping.accepts(&second, limits, 16),
+            "the scheduler must not impose a token cap below the driver limit"
+        );
+    }
+
+    /// Rotating held launches behind wave work must move the WHOLE contiguous
+    /// launch prefix in one call. A partial rotation reorders a pipeline's
+    /// run-ahead siblings; dispatch then defers the out-of-order head
+    /// (`launch_has_earlier_instance_member`) and, with the earlier sibling
+    /// sitting beyond a non-launch item, can never reach it — a permanent
+    /// scheduler stall (the V5 benchmark deadlock, 2026-07-15).
+    #[test]
+    fn launch_rotation_preserves_per_instance_order() {
+        let pipeline_a = ProcessId::new_v4();
+        let pipeline_b = ProcessId::new_v4();
+        let mut pending = VecDeque::new();
+        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_a, 1)));
+        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_a, 1)));
+        pending.push_back(QueuedItem::Launch(dummy_launch_request(pipeline_b, 2)));
+        pending.push_back(QueuedItem::CloseInstance {
+            id: 9,
+            pacing_wait_id: 0,
+        });
+
+        assert!(BatchScheduler::rotate_launch_for_wave_work(
+            &mut pending,
+            true
+        ));
+
+        assert!(
+            matches!(pending.front(), Some(QueuedItem::CloseInstance { .. })),
+            "the rotate-target work must reach the queue front"
+        );
+        let launches: Vec<(u64, u64)> = pending
+            .iter()
+            .filter_map(|item| match item {
+                QueuedItem::Launch(request) => Some((request.instance_id, request.logical_fire_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            launches
+                .iter()
+                .map(|(instance, _)| *instance)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2],
+            "rotation must not interleave the launch prefix"
+        );
+        assert!(
+            launches[0].1 < launches[1].1,
+            "same-instance run-ahead fires must stay FIFO across rotation"
+        );
+    }
+
+    /// A `PreLaunchCopy` queued behind held launches is dispatchable control
+    /// work: rotation must treat it as a valid target when controls are
+    /// allowed (it occupies the free control slot exactly like a lifecycle
+    /// control), or a held front launch starves the copy — and the copy's
+    /// consumer launch — forever.
+    #[test]
+    fn launch_rotation_reaches_a_pre_launch_copy() {
+        let make_pending = || {
+            let mut pending = VecDeque::new();
+            pending.push_back(QueuedItem::Launch(dummy_launch_request(
+                ProcessId::new_v4(),
+                1,
+            )));
+            pending.push_back(QueuedItem::PreLaunchCopy {
+                plan: PreLaunchCopy::Kv(crate::driver::KvCopyPlan::default()),
+                logical_completion: WorkItemCompletion::deferred_with_guard(None),
+                pipeline_id: Some(ProcessId::new_v4()),
+                credit_ready: false,
+                quorum_generation: 0,
+            });
+            pending
+        };
+
+        let mut pending = make_pending();
+        assert!(
+            !BatchScheduler::rotate_launch_for_wave_work(&mut pending, false),
+            "a settling control slot (controls disallowed) must keep launch order"
+        );
+
+        let mut pending = make_pending();
+        assert!(BatchScheduler::rotate_launch_for_wave_work(
+            &mut pending,
+            true
+        ));
+        assert!(
+            matches!(pending.front(), Some(QueuedItem::PreLaunchCopy { .. })),
+            "the copy must reach the front so it can occupy the control slot"
+        );
+    }
+
+    /// A fire behind a pre-launch copy joins the barrier immediately but
+    /// holds no readiness credit until its copy retires. Cancelling it in
+    /// that window must drop it WITHOUT giving a credit back: the unguarded
+    /// drop used to panic debug builds ("dropped pipeline request has no
+    /// readiness credit") and eat a sibling's credit in release (RV-20).
+    #[test]
+    fn cancelled_creditless_fire_drops_without_wave_accounting() {
+        let pid = ProcessId::new_v4();
+        let completion = WorkItemCompletion::deferred_with_guard(None);
+        let request = PendingRequest::direct(
+            dummy_launch(),
+            7,
+            completion.clone(),
+            0,
+            Some(pid),
+            false,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            !request.credit_published,
+            "a fresh request holds no readiness credit"
+        );
+        completion.request_cancel();
+
+        let mut policy = quorum::WaitAllPolicy::new(64, None);
+        policy.on_pipeline_join(Some(pid));
+
+        let mut pending = VecDeque::from([QueuedItem::Launch(request)]);
+        let (lane, _lane_rx) = test_lane(None);
+        let mut lane_inflight = 0u64;
+        let mut lane_token = 0u64;
+        let mut instances = HashMap::new();
+        let mut in_flight_launches = VecDeque::new();
+        let limits = SchedulerLimits {
+            max_forward_requests: 64,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let stats = Arc::new(SchedulerStats::default());
+
+        assert!(BatchScheduler::dispatch_launch_batch(
+            &lane,
+            &mut lane_inflight,
+            &mut lane_token,
+            &mut instances,
+            &mut pending,
+            &mut in_flight_launches,
+            16,
+            limits,
+            &stats,
+            &mut policy,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+        ));
+
+        assert!(pending.is_empty());
+        assert!(completion.is_settled(), "the cancelled fire must reject");
+        assert_eq!(
+            policy.active_pipelines(),
+            1,
+            "the pipeline stays awaited; only a held credit may be returned"
+        );
     }
 }

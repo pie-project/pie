@@ -18,12 +18,10 @@
 //!      in the mask AND absent from the output (the `-inf` actually fired
 //!      through the channel-supplied mask).
 //!
-//! Loop-carried `pos`/`klen`/`fill` (the `isolatedtopp`/`mirostat` split: `klen`
-//! is the port-bound channel `attn_working_set` reads, `fill` is the internal
-//! carry the epilogue advances) grow the absolute RoPE position and the
-//! attended KV length by 1 every fire, so each fire embeds at the growing
-//! absolute position and attends the FULL committed KV — not a fixed 1-token
-//! window re-fired at position 0 forever.
+//! The author-bound loop-carried `KvLen` grows the absolute RoPE position and
+//! attended KV length by 1 every fire, so each fire embeds at the
+//! growing absolute position and attends the FULL committed KV — not a fixed
+//! 1-token window re-fired at position 0 forever.
 //!
 //! JSON input: `{"alphabet":[..],"max_tokens":N}` (defaults `[10,11,12,13]`, 8).
 
@@ -63,10 +61,6 @@ impl NoRepeatMatcher {
     }
 }
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
@@ -95,47 +89,39 @@ async fn main(input: String) -> Result<String> {
     }
     let seed_tok = *prompt.last().unwrap() as i32;
 
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
-    ws.reserve(1).map_err(|e| format!("ws.reserve: {e}"))?;
+    let ws = WorkingSet::new();
+    let max_pages = (max_tokens as u32 + 1).div_ceil(PAGE_T).max(1);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
 
-    // Channels: tok_in is the device loop-carried token (seeded; each fire's
-    // embed takes it, the epilogue re-puts the constrained pick); pos is the
-    // loop-carried absolute RoPE position of THIS fire's token; klen/fill grow
-    // the attended KV length by 1 every fire (klen is the port-bound channel
-    // read by attn_working_set; fill is the internal loop-carry advancing it
-    // — same split as `isolatedtopp`/`mirostat`) so each fire embeds at the
-    // growing absolute position and attends the FULL committed KV, not a
-    // fixed 1-token window. gmask is the per-step host-writer allowed mask
-    // (the production channel supply path); tok_out/raw are host-reader
+    // Channels: tok_in and KvLen are device loop-carried (seeded; each fire's
+    // epilogue advances the post-write readable extent by one), so each fire
+    // embeds at the growing absolute position and attends the full committed
+    // KV, not a fixed one-token window. gmask is the per-step host-writer allowed
+    // mask (the production channel supply path); tok_out/raw are host-reader
     // outputs (constrained token + RAW logits).
-    let tok_in = bx(Channel::from(vec![seed_tok]).named("tok_in"));
-    let pos = bx(Channel::from(vec![0u32]).named("pos"));
-    let klen = bx(Channel::from(vec![1u32]).named("klen"));
-    let fill = bx(Channel::from(vec![1u32]).named("fill"));
-    let gmask = bx(Channel::new([vocab], dtype::bool).named("gmask"));
-    let tok_out = bx(Channel::new([1], dtype::i32).named("tok_out"));
-    let raw = bx(Channel::new([vocab], dtype::f32).named("raw"));
+    let tok_in = Channel::from(vec![seed_tok]).named("tok_in");
+    let kv_len = Channel::from(vec![1u32]).named("kv_len");
+    let gmask = Channel::new([vocab], dtype::bool).named("gmask");
+    let tok_out = Channel::new([1], dtype::i32).named("tok_out");
+    let raw = Channel::new([vocab], dtype::f32).named("raw");
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(tok_in, Tensor::constant(vec![0u32, 1]));
-    fwd.positions(pos);
-    fwd.attn_working_set(ws, klen);
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, Tensor::constant(vec![0u32, 1]));
+    fwd.port_channel(Port::KvLen, &kv_len);
+    fwd.attn_working_set(&ws, .., ..)?;
+    fwd.derive_dense_geometry();
     fwd.epilogue(move || {
+        let length = kv_len.take().tensor();
         // Takes + compute first, PUTS last (value-id discipline).
-        let base = fill.take().tensor(); // [1] u32 — this fire's absolute position
         let m = gmask.take(); // [V] bool, host-fed per step
         let lg = intrinsics::logits(); // [V] f32 (read-out row)
         let tok = reshape(reduce_argmax(mask_apply(&lg, &m)), [1]); // [1] i32
 
-        let klen_v = add(&base, 1u32); // cells 0..=base after this fire
-        let next_free = add(&base, 1u32); // position the NEXT fire writes
-
         tok_in.put(&tok);
+        kv_len.put(add(&length, 1u32));
         tok_out.put(&tok);
         raw.put(&lg);
-        pos.put(&base);
-        klen.put(&klen_v);
-        fill.put(&next_free);
     });
 
     let mut matcher = NoRepeatMatcher::new(alphabet.clone());
@@ -159,10 +145,12 @@ async fn main(input: String) -> Result<String> {
         let token = tok_out
             .take()
             .get::<i32>()
+            .await
             .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
         let logits = raw
             .take()
             .get::<f32>()
+            .await
             .map_err(|e| format!("raw.take @{step}: {e}"))?;
 
         // Assert #1 CONFORM: device token == host apply_mask_argmax(raw, mask).

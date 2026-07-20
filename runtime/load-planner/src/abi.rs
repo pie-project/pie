@@ -127,6 +127,70 @@ impl RuntimeAbi {
         })
     }
 
+    pub fn retain_outputs(
+        mut self,
+        mut retain: impl FnMut(&str) -> bool,
+    ) -> Result<Self, CompileError> {
+        let mut selected = self
+            .tensors
+            .iter()
+            .map(|contract| retain(&contract.output_name))
+            .collect::<Vec<_>>();
+        loop {
+            let mut changed = false;
+            for index in 0..self.tensors.len() {
+                if !selected[index] {
+                    continue;
+                }
+                if let RuntimeTensorSource::SelectContract { contract, .. } =
+                    self.tensors[index].source
+                {
+                    if contract >= self.tensors.len() {
+                        return Err(CompileError::InvalidInput(format!(
+                            "runtime ABI contract {index} selects missing contract {contract}"
+                        )));
+                    }
+                    if !selected[contract] {
+                        selected[contract] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if !selected.iter().any(|selected| *selected) {
+            return Err(CompileError::InvalidInput(
+                "runtime ABI component filter selected no tensors".to_string(),
+            ));
+        }
+
+        let mut remap = vec![None; self.tensors.len()];
+        let mut tensors = Vec::new();
+        for (old_index, (contract, selected)) in self.tensors.into_iter().zip(selected).enumerate()
+        {
+            if selected {
+                remap[old_index] = Some(tensors.len());
+                tensors.push(contract);
+            }
+        }
+        for contract in &mut tensors {
+            if let RuntimeTensorSource::SelectContract {
+                contract: selected, ..
+            } = &mut contract.source
+            {
+                *selected = remap[*selected].ok_or_else(|| {
+                    CompileError::Internal(
+                        "runtime ABI component filter dropped a selected dependency".to_string(),
+                    )
+                })?;
+            }
+        }
+        self.tensors = tensors;
+        Ok(self)
+    }
+
     pub fn coalesce_direct_row_shards(
         &self,
         metadata: &CheckpointMetadata,
@@ -2232,4 +2296,60 @@ fn dsv4_shard_axis(name: &str) -> Option<Axis> {
 
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {
     suffixes.iter().any(|suffix| value.ends_with(suffix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contract(name: &str, source: RuntimeTensorSource) -> RuntimeTensorContract {
+        RuntimeTensorContract {
+            output_name: name.to_string(),
+            source,
+            metadata: Vec::new(),
+            dtype: DType::U8,
+            encoding: Encoding::Raw(DType::U8),
+            shape: vec![1],
+            layout: Layout::dense(1),
+            sharding: Sharding::replicated(),
+            alignment: 1,
+            shard_axis: None,
+        }
+    }
+
+    #[test]
+    fn component_filter_retains_and_reindexes_selected_dependencies() {
+        let abi = RuntimeAbi {
+            name: "test".to_string(),
+            version: 1,
+            tensors: vec![
+                contract(
+                    "text.weight",
+                    RuntimeTensorSource::DirectTensor(TensorId(0)),
+                ),
+                contract(
+                    "vision.base",
+                    RuntimeTensorSource::DirectTensor(TensorId(1)),
+                ),
+                contract(
+                    "vision.view",
+                    RuntimeTensorSource::SelectContract {
+                        contract: 1,
+                        axis: Axis(0),
+                        start: 0,
+                        length: 1,
+                    },
+                ),
+            ],
+        };
+
+        let filtered = abi.retain_outputs(|name| name == "vision.view").unwrap();
+        assert_eq!(filtered.tensors.len(), 2);
+        assert_eq!(filtered.tensors[0].output_name, "vision.base");
+        assert_eq!(filtered.tensors[1].output_name, "vision.view");
+        assert!(matches!(
+            filtered.tensors[1].source,
+            RuntimeTensorSource::SelectContract { contract: 0, .. }
+        ));
+    }
 }

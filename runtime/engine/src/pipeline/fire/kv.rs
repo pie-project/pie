@@ -26,8 +26,6 @@
 //! than deleted, allowed rather than silently masked.
 #![allow(dead_code)]
 
-use crate::pipeline::channel::BoundCells;
-use crate::pipeline::instance::ChannelSeed;
 use crate::store::kv::hash::{self, Hash256};
 use crate::store::kv::page_table::WorkingSetId;
 pub use crate::store::kv::project::PrepareError;
@@ -82,15 +80,8 @@ impl From<KvStoreError> for KvError {
 /// The prepared KV write for one in-flight PTIR fire — held across
 /// `submit_async` until [`finalize`].
 pub struct KvTxn {
-    prepared: KvPreparedWrite,
-    /// Per-target committed metadata computed at prepare (the token values
-    /// and pre-fire chain state exist only then); handed to `KvStore::commit`
-    /// at finalize.
-    commits: Vec<PageCommit>,
-    /// The working set's committed token length AFTER this fire commits
-    /// (`committed_tokens + new_tokens.len()`). The caller stores it on the
-    /// pass (the growing cursor) and passes it back next fire.
-    pub committed_tokens_after: u32,
+    seq: u64,
+    cas_intents: Vec<crate::store::kv::CasIntent>,
     mapping_version: u64,
 }
 
@@ -107,34 +98,14 @@ impl KvTxn {
 /// `Pages`/`WSlot` references; guests only ever hold relative indexes.
 fn build_translation(
     store: &mut KvStore,
-    prepared: &KvPreparedWrite,
     ws: WorkingSetId,
 ) -> Result<(u64, Vec<u32>), KvStoreError> {
-    let version = store.flat_table(ws)?.0;
-    let mut table: Vec<u32> = {
-        store
-            .visible_flat_table(ws)?
-            .into_iter()
-            .map(|p| p.0)
-            .collect()
-    };
-    let max_target = prepared
-        .targets()
-        .iter()
-        .map(|t| t.index() + 1)
-        .max()
-        .unwrap_or(0);
-    if (table.len() as u64) < max_target {
-        table.resize(max_target as usize, 0);
-    }
-    for t in prepared.targets() {
-        table[t.index() as usize] = t.dst().0;
-    }
-    Ok((version, table))
+    let (version, table) = store.flat_table(ws)?;
+    Ok((version, table.iter().map(|page| page.0).collect()))
 }
 
 /// Build the per-target [`PageCommit`]s for a fire appending `n_new` tokens
-/// at `committed_tokens`. `hash_tokens = Some(values)` on a canonical fire
+/// at `append_start`. `hash_tokens = Some(values)` on a canonical fire
 /// (bind-time shape + fire-time host-known gate both passed): the new slots
 /// chain `(token, position)` identities from the WorkingSet's chain state,
 /// and pages that come out FULL get a page hash (which marks them for the
@@ -147,14 +118,14 @@ fn build_commits(
     store: &mut KvStore,
     prepared: &KvPreparedWrite,
     ws: WorkingSetId,
-    committed_tokens: u32,
+    append_start: u32,
     n_new: u32,
     page_size: u32,
     hash_tokens: Option<&[u32]>,
 ) -> Result<Vec<PageCommit>, KvStoreError> {
     let canonical = hash_tokens.is_some();
     let domain = store.domain();
-    let mut prev = store.visible_chain_state(ws)?;
+    let mut prev = store.chain_state(ws)?;
     let mut slot_hashes: Vec<Hash256> = Vec::with_capacity(n_new as usize);
     for j in 0..n_new {
         let h = match hash_tokens {
@@ -162,7 +133,7 @@ fn build_commits(
                 &domain,
                 prev.as_ref(),
                 tokens[j as usize],
-                committed_tokens + j,
+                append_start + j,
             ),
             None => store.next_opaque_hash(),
         };
@@ -176,17 +147,17 @@ fn build_commits(
         let (mut hashes, existing_page_hash) = match target {
             PreparedTarget::Fresh { .. } => (Vec::new(), None),
             PreparedTarget::InPlace { index, .. } | PreparedTarget::Cow { index, .. } => (
-                store.visible_page_token_hashes(ws, *index)?,
-                store.visible_page_hash_at(ws, *index)?,
+                store.page_token_hashes(ws, *index)?,
+                store.page_hash_at(ws, *index)?,
             ),
         };
         hashes.resize(page_size as usize, None);
 
         // Written slots of this page: global token indexes
-        // [committed, committed + n_new) landing on page `page`.
+        // [append_start, append_start + n_new) landing on page `page`.
         let mut wrote = false;
         for (j, h) in slot_hashes.iter().enumerate() {
-            let tok = committed_tokens as u64 + j as u64;
+            let tok = append_start as u64 + j as u64;
             if tok / page_size as u64 == page {
                 hashes[(tok % page_size as u64) as usize] = Some(*h);
                 wrote = true;
@@ -206,6 +177,63 @@ fn build_commits(
         });
     }
     Ok(commits)
+}
+
+/// Realize the mapped overlap of one writable declaration exactly once.
+/// Shared pages rebase through the existing COW protocol; private pages only
+/// lose transitional implicit-cache identity. Fresh backing is handled
+/// separately by [`KvStore::ensure_backed`].
+pub fn realize_declaration(
+    store: &mut KvStore,
+    ws: WorkingSetId,
+    writable: std::ops::Range<u64>,
+) -> Result<((Vec<u32>, Vec<u32>), Option<KvTxn>), KvError> {
+    let mapped = store.mapped_len(ws)?;
+    let start = writable.start.min(mapped);
+    let end = writable.end.min(mapped);
+    if start >= end {
+        return Ok(((Vec::new(), Vec::new()), None));
+    }
+    let indexes: Vec<u64> = (start..end).collect();
+    let shared = indexes
+        .iter()
+        .copied()
+        .map(|index| store.privately_writable(ws, index))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|private| !private);
+    if !shared {
+        store.opacify_suffix(ws, start)?;
+        return Ok(((Vec::new(), Vec::new()), None));
+    }
+
+    let prepared = store.prepare_write(ws, &indexes)?;
+    let commits = prepared
+        .targets()
+        .iter()
+        .map(|target| {
+            let index = target.index();
+            Ok(PageCommit {
+                token_hashes: store.page_token_hashes(ws, index)?,
+                page_hash: store.page_hash_at(ws, index)?,
+            })
+        })
+        .collect::<Result<Vec<_>, KvStoreError>>()?;
+    let copies = prepared
+        .copy_plan()
+        .map(|(src, dst)| (src.0, dst.0))
+        .unzip();
+    let (seq, cas_intents) = store.publish_prepared(prepared, &commits)?;
+    store.opacify_suffix(ws, start)?;
+    let (mapping_version, _) = build_translation(store, ws)?;
+    Ok((
+        copies,
+        Some(KvTxn {
+            seq,
+            cas_intents,
+            mapping_version,
+        }),
+    ))
 }
 
 /// Empty-WS prefill prefix match (kv_refact.md "Trie Matching", increment
@@ -253,7 +281,7 @@ pub fn match_prefix(
 }
 
 /// Prepare the KV projection for a PTIR fire appending `new_tokens` to `ws`
-/// (currently holding `committed_tokens` committed tokens).
+/// at the explicit `append_start`.
 ///
 /// Returns `(proj, (copy_src, copy_dst), txn)`: pass
 /// `proj.physical_page_ids` / `proj.last_page_len` into `submit_async`, issue
@@ -267,73 +295,21 @@ pub fn match_prefix(
 pub fn prepare(
     store: &mut KvStore,
     ws: WorkingSetId,
-    committed_tokens: u32,
+    append_start: u32,
     new_tokens: &[u32],
     page_size: u32,
     hash_tokens: Option<&[u32]>,
 ) -> Result<(KvProjection, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
-    prepare_impl(
-        store,
-        ws,
-        committed_tokens,
-        new_tokens,
-        page_size,
-        hash_tokens,
-        None,
-    )
-}
-
-pub fn prepare_granted(
-    store: &mut KvStore,
-    ws: WorkingSetId,
-    committed_tokens: u32,
-    new_tokens: &[u32],
-    page_size: u32,
-    hash_tokens: Option<&[u32]>,
-    granted: Vec<crate::store::kv::page_table::PhysicalKvPageId>,
-) -> Result<(KvProjection, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
-    prepare_impl(
-        store,
-        ws,
-        committed_tokens,
-        new_tokens,
-        page_size,
-        hash_tokens,
-        Some(granted),
-    )
-}
-
-pub fn required_pages(
-    store: &mut KvStore,
-    ws: WorkingSetId,
-    committed_tokens: u32,
-    new_token_count: u32,
-    page_size: u32,
-) -> Result<usize, KvError> {
-    if new_token_count == 0 {
-        return Err(KvError::Fatal(
-            "required_pages: new_token_count must be non-empty".to_string(),
-        ));
-    }
-    let total = committed_tokens + new_token_count;
-    let needed_pages = total.div_ceil(page_size) as u64;
-    let page_len = store.page_len(ws)?;
-    if page_len < needed_pages {
-        store.reserve(ws, needed_pages - page_len)?;
-    }
-    let output_start = (committed_tokens / page_size) as u64;
-    let write_indexes: Vec<u64> = (output_start..needed_pages).collect();
-    Ok(store.required_pages(ws, &write_indexes)?)
+    prepare_impl(store, ws, append_start, new_tokens, page_size, hash_tokens)
 }
 
 fn prepare_impl(
     store: &mut KvStore,
     ws: WorkingSetId,
-    committed_tokens: u32,
+    append_start: u32,
     new_tokens: &[u32],
     page_size: u32,
     hash_tokens: Option<&[u32]>,
-    granted: Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>>,
 ) -> Result<(KvProjection, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
     debug_assert!(hash_tokens.is_none_or(|t| t.len() == new_tokens.len()));
     let n_new = new_tokens.len() as u32;
@@ -343,7 +319,7 @@ fn prepare_impl(
         ));
     }
 
-    let total = committed_tokens + n_new;
+    let total = append_start + n_new;
     let needed_pages = total.div_ceil(page_size) as u64;
 
     // Grow the logical address space so every write slot exists. Purely
@@ -355,10 +331,13 @@ fn prepare_impl(
 
     // Prior context: pages [0, valid_pages) for the committed tokens, from
     // the flattened table (write targets override their slots below).
-    let valid_pages = (committed_tokens.div_ceil(page_size)) as usize;
+    let valid_pages = (append_start.div_ceil(page_size)) as usize;
     let context_pages: Vec<u32> = {
         store
-            .visible_flat_table(ws)?
+            .flat_table(ws)?
+            .1
+            .iter()
+            .copied()
             .into_iter()
             .take(valid_pages)
             .map(|p| p.0)
@@ -366,7 +345,7 @@ fn prepare_impl(
     };
     if context_pages.len() < valid_pages {
         return Err(KvError::Fatal(format!(
-            "prepare: committed {committed_tokens} tokens but only {} mapped pages",
+            "prepare: committed {append_start} tokens but only {} mapped pages",
             context_pages.len()
         )));
     }
@@ -374,16 +353,13 @@ fn prepare_impl(
     // Classify + allocate the write slots [output_start, needed_pages).
     // `KvStoreError::OutOfPages` stays typed through here — the caller
     // routes it into the contention ladder and retries.
-    let output_start = (committed_tokens / page_size) as u64;
+    let output_start = (append_start / page_size) as u64;
     let write_indexes: Vec<u64> = (output_start..needed_pages).collect();
-    let prepared = match granted {
-        Some(granted) => store.prepare_write_granted(ws, &write_indexes, granted)?,
-        None => store.prepare_write(ws, &write_indexes)?,
-    };
+    let prepared = store.prepare_write(ws, &write_indexes)?;
 
     // Driver geometry: every prepared target is a written slot (the CoW
     // rebase never reaches below the first written committed page).
-    let offset = committed_tokens % page_size;
+    let offset = append_start % page_size;
     let writes: Vec<KvWrite> = prepared
         .targets()
         .iter()
@@ -404,37 +380,53 @@ fn prepare_impl(
     let (copy_src, copy_dst): (Vec<u32>, Vec<u32>) =
         prepared.copy_plan().map(|(s, d)| (s.0, d.0)).unzip();
 
-    let proj = project_kv(&context_pages, committed_tokens, &writes, page_size).map_err(|e| {
-        KvError::Fatal(format!(
-            "{e:?} (committed={committed_tokens}, new={n_new}, targets={:?})",
-            prepared
+    let proj = match project_kv(&context_pages, append_start, &writes, page_size) {
+        Ok(projection) => projection,
+        Err(error) => {
+            let targets = prepared
                 .targets()
                 .iter()
-                .map(|t| t.index())
-                .collect::<Vec<_>>()
-        ))
-    })?;
+                .map(|target| target.index())
+                .collect::<Vec<_>>();
+            store.cancel_prepared(prepared);
+            return Err(KvError::Fatal(format!(
+                "{error:?} (committed={append_start}, new={n_new}, targets={targets:?})"
+            )));
+        }
+    };
 
-    let commits = build_commits(
+    let commits = match build_commits(
         store,
         &prepared,
         ws,
-        committed_tokens,
+        append_start,
         n_new,
         page_size,
         hash_tokens,
-    )?;
-    let (translation_version, translation) = build_translation(store, &prepared, ws)?;
-    store.track_pending_write(&prepared, &commits, Some(total as u64));
+    ) {
+        Ok(commits) => commits,
+        Err(error) => {
+            store.cancel_prepared(prepared);
+            return Err(error.into());
+        }
+    };
+    let (seq, cas_intents) = store.publish_prepared(prepared, &commits)?;
+    let (translation_version, translation) = match build_translation(store, ws) {
+        Ok(translation) => translation,
+        Err(error) => {
+            store.settle(cas_intents, false);
+            store.retire_through(seq);
+            return Err(error.into());
+        }
+    };
 
     Ok((
         proj,
         (copy_src, copy_dst),
         translation,
         KvTxn {
-            prepared,
-            commits,
-            committed_tokens_after: total,
+            seq,
+            cas_intents,
             mapping_version: translation_version,
         },
     ))
@@ -444,41 +436,19 @@ fn prepare_impl(
 /// `write_indexes` with no host projection — the driver resolves the geometry
 /// itself and the inferlet owns the token bookkeeping. Returns the
 /// `(index, physical id)` pairs for the granted slots, the CoW copy plan, and
-/// the held txn (its `committed_tokens_after` is unused on this path).
+/// the held transaction.
 pub fn prepare_explicit(
     store: &mut KvStore,
     ws: WorkingSetId,
     write_indexes: &[u64],
 ) -> Result<(Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
-    prepare_explicit_impl(store, ws, write_indexes, None)
-}
-
-pub fn prepare_explicit_granted(
-    store: &mut KvStore,
-    ws: WorkingSetId,
-    write_indexes: &[u64],
-    granted: Vec<crate::store::kv::page_table::PhysicalKvPageId>,
-) -> Result<(Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
-    prepare_explicit_impl(store, ws, write_indexes, Some(granted))
-}
-
-fn prepare_explicit_impl(
-    store: &mut KvStore,
-    ws: WorkingSetId,
-    write_indexes: &[u64],
-    granted: Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>>,
-) -> Result<(Vec<(u64, u32)>, (Vec<u32>, Vec<u32>), Vec<u32>, KvTxn), KvError> {
-    let prepared = match granted {
-        Some(granted) => store.prepare_write_granted(ws, write_indexes, granted)?,
-        None => store.prepare_write(ws, write_indexes)?,
-    };
+    let prepared = store.prepare_write(ws, write_indexes)?;
     let pages: Vec<(u64, u32)> = prepared
         .targets()
         .iter()
         .map(|t| (t.index(), t.dst().0))
         .collect();
     let copies = prepared.copy_plan().map(|(s, d)| (s.0, d.0)).unzip();
-    let (translation_version, translation) = build_translation(store, &prepared, ws)?;
     // Device-geometry fires are non-canonical by construction, and the
     // device owns the token bookkeeping — commit with no hash metadata;
     // `KvStore::commit` poisons the chain state with an opaque draw.
@@ -490,27 +460,34 @@ fn prepare_explicit_impl(
             page_hash: None,
         })
         .collect();
-    store.track_pending_write(&prepared, &commits, None);
+    let (seq, cas_intents) = store.publish_prepared(prepared, &commits)?;
+    let (translation_version, translation) = match build_translation(store, ws) {
+        Ok(translation) => translation,
+        Err(error) => {
+            store.settle(cas_intents, false);
+            store.retire_through(seq);
+            return Err(error.into());
+        }
+    };
     Ok((
         pages,
         copies,
         translation,
         KvTxn {
-            prepared,
-            commits,
-            committed_tokens_after: 0,
+            seq,
+            cas_intents,
             mapping_version: translation_version,
         },
     ))
 }
 
-/// Abandon a fire's prepared KV write (e.g. the guest dropped the working set
-/// while the fire was in flight): the snapshot pin kept the captured path
-/// alive, so abort releases it and the pending slots safely.
+/// Settle a prepared fire as failed. Its mapping remains pipeline-local
+/// fail-stop state; CAS publication is discarded.
 pub fn abandon(store: &mut KvStore, txn: KvTxn) {
-    let seq = txn.prepared.seq();
-    let epoch = store.current_epoch();
-    store.abort(txn.prepared, epoch);
+    let KvTxn {
+        seq, cas_intents, ..
+    } = txn;
+    store.settle(cas_intents, false);
     store.retire_through(seq);
 }
 
@@ -521,17 +498,9 @@ pub fn abandon(store: &mut KvStore, txn: KvTxn) {
 /// at or before it.
 pub fn finalize(store: &mut KvStore, txn: KvTxn, success: bool) -> Result<(), String> {
     let KvTxn {
-        prepared, commits, ..
+        seq, cas_intents, ..
     } = txn;
-    let seq = prepared.seq();
-    let epoch = store.current_epoch();
-    if success {
-        store
-            .commit(prepared, &commits, epoch)
-            .map_err(|e| e.to_string())?;
-    } else {
-        store.abort(prepared, epoch);
-    }
+    store.settle(cas_intents, success);
     store.retire_through(seq);
     Ok(())
 }
@@ -565,13 +534,17 @@ pub fn check_generation(captured: u32, current: u32) -> Result<(), PrepareError>
 /// the vanilla model produces for one appended token run under full causal
 /// self-attention over the working set — so its KV rows may carry chained
 /// semantic hashes. Rejected by anything that can perturb K/V production:
-/// an attention mask or explicit positions (they change hidden states, hence
-/// KV at layers > 0), device geometry (inferlet-managed layout), per-layer
-/// stage programs (they can rewrite projections), extern channels, or
-/// multi-lane batching. Prologue/epilogue programs only shape sampling —
-/// grammar, watermarking, and sampler passes all stay canonical. A `KvLen`
-/// port must exist so the fire-time gate can verify the pass attends the
-/// FULL context (a shorter span changes upper-layer KV).
+/// an attention mask (it changes hidden states, hence KV at layers > 0),
+/// per-layer stage programs (they can rewrite projections), or extern
+/// channels. Prologue/epilogue programs only shape sampling — grammar,
+/// watermarking, and sampler passes all stay canonical. A `KvLen` port must
+/// exist so the fire-time gate can verify the pass attends the FULL context
+/// (a shorter span changes upper-layer KV).
+///
+/// KvLen-root dense defaults are canonical when any author-bound overrides
+/// agree with the same contiguous append. A channel-fed `EmbedIndptr`
+/// (dynamic lane structure) still rejects; const CSRs are value-checked at
+/// fire time.
 pub fn canonical_kv_shape(container: &pie_ptir::container::TraceContainer) -> bool {
     use pie_ptir::container::PortSource;
     use pie_ptir::registry::{Port, Stage};
@@ -582,22 +555,11 @@ pub fn canonical_kv_shape(container: &pie_ptir::container::TraceContainer) -> bo
     let mut has_kv_len = false;
     for binding in &container.ports {
         match binding.port {
-            Port::AttnMask
-            | Port::Positions
-            | Port::Pages
-            | Port::PageIndptr
-            | Port::WSlot
-            | Port::WOff => return false,
+            Port::AttnMask => return false,
             Port::KvLen => has_kv_len = true,
             Port::EmbedIndptr => {
-                // Single lane only: a trace-const two-entry CSR from 0.
-                match &binding.source {
-                    PortSource::Const { data, .. } => {
-                        if data.len() != 8 || data[0..4] != [0u8; 4] {
-                            return false;
-                        }
-                    }
-                    PortSource::Channel(_) => return false,
+                if matches!(binding.source, PortSource::Channel(_)) {
+                    return false;
                 }
             }
             _ => {}
@@ -610,74 +572,211 @@ pub fn canonical_kv_shape(container: &pie_ptir::container::TraceContainer) -> bo
             .any(|s| matches!(s.stage, Stage::OnAttnProj | Stage::OnAttn))
 }
 
-/// Reinterpret a little-endian byte payload as `u32`s.
-fn decode_le_u32s(bytes: &[u8]) -> Option<Vec<u32>> {
-    if bytes.len() % 4 != 0 {
-        return None;
-    }
-    Some(
-        bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-    )
+pub struct CanonicalFireEvidence {
+    tokens: Vec<u32>,
+    /// Per-lane attended context (one entry for a single-lane fire, one per
+    /// token for the per-token CSR form).
+    kv_len: Vec<u32>,
+    embed_indptr: Option<Vec<u32>>,
+    positions: Option<Vec<u32>>,
+    /// Wire-form lane page CSR (a rank-2 `[lanes, P]` envelope arrives
+    /// already compacted by the evaluated-geometry mapper).
+    pages: Option<Vec<u32>>,
+    page_indptr: Option<Vec<u32>>,
+    w_slot: Option<Vec<u32>>,
+    w_off: Option<Vec<u32>>,
 }
 
-/// The host-known u32 payload the channel bound at `port` consumes on THIS
-/// fire: a trace constant, the staged Writer put shipping with this fire, or
-/// (first fire only) the channel's seed. `None` = device-carried — the host
-/// cannot see the value, so the fire cannot hash canonically. Takes the
-/// pass's plain pipeline-owned state (`container`/`cells`/`seeds`/
-/// `fired_once`) rather than the WIT-resource `ForwardPass` itself, so this
-/// stays a `pipeline::fire` function (no upward `inferlet::host` import).
-pub fn host_known_port_u32s(
-    container: &pie_ptir::container::TraceContainer,
-    cells: &BoundCells,
-    seeds: &[ChannelSeed],
-    fired_once: bool,
-    port: pie_ptir::registry::Port,
-) -> Option<Vec<u32>> {
-    use pie_ptir::container::PortSource;
-
-    let binding = container.ports.iter().find(|b| b.port == port)?;
-    match &binding.source {
-        PortSource::Const { data, .. } => decode_le_u32s(data),
-        PortSource::Channel(c) => {
-            let dense = *c as usize;
-            if let Some(bytes) = crate::pipeline::channel::staged_put_bytes(cells.get(dense)?) {
-                return decode_le_u32s(&bytes);
-            }
-            if !fired_once && container.channels.get(dense).is_some_and(|d| d.seeded) {
-                let seed = seeds.iter().find(|s| s.channel as usize == dense)?;
-                return decode_le_u32s(&seed.data);
-            }
-            None
-        }
-    }
-}
-
-/// Fire-time half of the canonical-KV gate: the host-verified token values
-/// this fire embeds plus the kv-len the pass claims to attend. `None` unless
-/// the bind-time shape passed ([`canonical_kv_shape`], captured as
-/// `canonical_kv` at bind) and the embed value is host-known. The caller
-/// still verifies the token count against the fire geometry and
-/// `kv_len == committed + new` (full-context attention) before hashing.
+/// Fire-time half of the canonical-KV gate, over the fire's **evaluated
+/// descriptor ports** (`pie_ptir::pareval` folded through the host shadow):
+/// the host-verified token values this fire embeds, the kv-len it attends,
+/// and the append geometry the host derived. `None` unless the bind-time
+/// shape passed ([`canonical_kv_shape`], captured as `canonical_kv` at bind)
+/// and the embed/kv-len values are host-known — a device-decided value
+/// (loop-carried sampler output past the seed fire) yields no evidence, it
+/// never guesses. [`canonical_hash_tokens`] then verifies the values form
+/// this fire's contiguous full-context append.
 pub fn canonical_fire_evidence(
     canonical_kv: bool,
+    ports: &[(
+        pie_ptir::registry::Port,
+        Result<pie_ptir::interp::Value, String>,
+    )],
     container: &pie_ptir::container::TraceContainer,
-    cells: &BoundCells,
-    seeds: &[ChannelSeed],
-    fired_once: bool,
-) -> Option<(Vec<u32>, Option<u32>)> {
+) -> Option<CanonicalFireEvidence> {
     use pie_ptir::registry::Port;
 
     if !canonical_kv {
         return None;
     }
-    let tokens = host_known_port_u32s(container, cells, seeds, fired_once, Port::EmbedTokens)?;
-    let kv_len = host_known_port_u32s(container, cells, seeds, fired_once, Port::KvLen)
-        .and_then(|v| v.first().copied());
-    Some((tokens, kv_len))
+    let get = |port: Port| ports.iter().find(|(p, _)| *p == port);
+    let known = |port: Port| -> Option<Vec<u32>> {
+        match get(port) {
+            Some((_, Ok(value))) => Some(super::geometry::value_as_u32(value)),
+            _ => None,
+        }
+    };
+    // Unbound is fine (`Some(None)`); bound-but-unknown kills the evidence.
+    let optional = |port: Port| -> Option<Option<Vec<u32>>> {
+        match get(port) {
+            None => Some(None),
+            Some((_, Ok(value))) => Some(Some(super::geometry::value_as_u32(value))),
+            Some((_, Err(_))) => None,
+        }
+    };
+    let page_indptr = optional(pie_ptir::registry::Port::PageIndptr)?;
+    let pages = match optional(Port::Pages)? {
+        Some(raw) => Some(
+            super::geometry::compact_page_envelope(
+                container,
+                raw,
+                page_indptr.as_deref().unwrap_or(&[]),
+            )
+            .ok()?,
+        ),
+        None => None,
+    };
+    Some(CanonicalFireEvidence {
+        tokens: known(Port::EmbedTokens)?,
+        kv_len: known(Port::KvLen)?,
+        embed_indptr: optional(Port::EmbedIndptr)?,
+        positions: optional(Port::Positions)?,
+        pages,
+        page_indptr,
+        w_slot: optional(Port::WSlot)?,
+        w_off: optional(Port::WOff)?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalAppend {
+    pub start: u32,
+    pub tokens: Vec<u32>,
+}
+
+/// Verify the evidence forms a canonical contiguous append. `KvLen` is the
+/// root: it determines the appended span, and explicit positions/write
+/// geometry must agree when present.
+pub fn canonical_hash_tokens(
+    evidence: CanonicalFireEvidence,
+    request: &crate::driver::LaunchPlan,
+    device_resolved: bool,
+    page_size: u32,
+) -> Option<CanonicalAppend> {
+    let n = evidence.tokens.len();
+    if n == 0 || page_size == 0 || evidence.tokens.iter().any(|&t| t == u32::MAX) {
+        return None;
+    }
+
+    // Lane structure: one lane over all tokens, or one token per lane.
+    let per_token = match &evidence.embed_indptr {
+        None => false,
+        Some(v) if v.as_slice() == [0, n as u32] => false,
+        Some(v) if v.len() == n + 1 && v.iter().enumerate().all(|(i, &x)| x == i as u32) => true,
+        Some(_) => return None,
+    };
+    let lanes = if per_token { n } else { 1 };
+    if evidence.kv_len.len() != lanes {
+        return None;
+    }
+    let start = if per_token {
+        evidence.kv_len.first().copied()?.checked_sub(1)?
+    } else {
+        evidence.kv_len[0].checked_sub(n as u32)?
+    };
+    let end = start.checked_add(n as u32)?;
+
+    // Positions: the contiguous append span (absent = driver append order).
+    if let Some(positions) = &evidence.positions
+        && (positions.len() != n
+            || positions
+                .iter()
+                .enumerate()
+                .any(|(i, &p)| p != start + i as u32))
+    {
+        return None;
+    }
+
+    // Full-context attention per lane.
+    for lane in 0..lanes {
+        let expected = if per_token {
+            start + lane as u32 + 1
+        } else {
+            end
+        };
+        if evidence.kv_len[lane] != expected {
+            return None;
+        }
+    }
+
+    let mut default_pages = Vec::new();
+    let mut default_indptr = Vec::with_capacity(lanes + 1);
+    default_indptr.push(0);
+    for &len in &evidence.kv_len {
+        default_pages.extend(0..len.div_ceil(page_size));
+        default_indptr.push(u32::try_from(default_pages.len()).ok()?);
+    }
+    let pages = evidence.pages.as_deref().unwrap_or(&default_pages);
+    let page_indptr = evidence.page_indptr.as_deref().unwrap_or(&default_indptr);
+    if page_indptr.len() != lanes + 1 || page_indptr[0] != 0 {
+        return None;
+    }
+    for lane in 0..lanes {
+        let (start, end) = (page_indptr[lane] as usize, page_indptr[lane + 1] as usize);
+        if end < start || end > pages.len() {
+            return None;
+        }
+        let lane_pages = &pages[start..end];
+        let required = evidence.kv_len[lane].div_ceil(page_size) as usize;
+        if required == 0
+            || required > lane_pages.len()
+            || lane_pages[..required]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != required
+        {
+            return None;
+        }
+    }
+    for index in 0..n {
+        let lane = if per_token { index } else { 0 };
+        let (page_start, page_end) = (page_indptr[lane] as usize, page_indptr[lane + 1] as usize);
+        let lane_pages = &pages[page_start..page_end];
+        let position = start + index as u32;
+        let page = (position / page_size) as usize;
+        let expected_slot = *lane_pages.get(page)?;
+        if evidence
+            .w_slot
+            .as_ref()
+            .is_some_and(|slots| slots.get(index) != Some(&expected_slot))
+            || evidence
+                .w_off
+                .as_ref()
+                .is_some_and(|offsets| offsets.get(index) != Some(&(position % page_size)))
+        {
+            return None;
+        }
+    }
+
+    // Wire agreement — the driver must execute exactly what we hash. A
+    // device-resolved fire executes from the channel state the evaluator
+    // mirrored instead of the wire (the classifier parity corpus pins the
+    // two resolutions together).
+    if !device_resolved {
+        if evidence.tokens != request.token_ids {
+            return None;
+        }
+        if let Some(positions) = &evidence.positions
+            && *positions != request.position_ids
+        {
+            return None;
+        }
+    }
+    Some(CanonicalAppend {
+        start,
+        tokens: evidence.tokens,
+    })
 }
 
 #[cfg(test)]
@@ -702,13 +801,19 @@ mod tests {
         }
     }
 
-    /// A minimal canonical decode container: embed tokens + kv-len +
-    /// epilogue. Channels: 0 tok (device-loop), 1 klen.
+    /// A minimal canonical decode container: embed tokens + kv-len + the
+    /// explicit append geometry every SDK-lowered pass carries (RV-14) +
+    /// epilogue. Channels: 0 tok (device-loop), 1 klen, 2 pages,
+    /// 3 page-indptr, 4 w_slot, 5 w_off.
     fn plain_decode_container() -> pie_ptir::container::TraceContainer {
         pie_ptir::container::TraceContainer {
             names: vec![],
             channels: vec![
                 ch(Shape::vector(1), DType::I32, HostRole::None),
+                ch(Shape::vector(1), DType::U32, HostRole::None),
+                ch(Shape::vector(4), DType::U32, HostRole::None),
+                ch(Shape::vector(2), DType::U32, HostRole::None),
+                ch(Shape::vector(1), DType::U32, HostRole::None),
                 ch(Shape::vector(1), DType::U32, HostRole::None),
             ],
             ports: vec![
@@ -719,6 +824,22 @@ mod tests {
                 PortBinding {
                     port: Port::KvLen,
                     source: pie_ptir::container::PortSource::Channel(1),
+                },
+                PortBinding {
+                    port: Port::Pages,
+                    source: pie_ptir::container::PortSource::Channel(2),
+                },
+                PortBinding {
+                    port: Port::PageIndptr,
+                    source: pie_ptir::container::PortSource::Channel(3),
+                },
+                PortBinding {
+                    port: Port::WSlot,
+                    source: pie_ptir::container::PortSource::Channel(4),
+                },
+                PortBinding {
+                    port: Port::WOff,
+                    source: pie_ptir::container::PortSource::Channel(5),
                 },
             ],
             stages: vec![StageProgram {
@@ -732,6 +853,18 @@ mod tests {
     #[test]
     fn canonical_shape_accepts_the_plain_decode() {
         assert!(canonical_kv_shape(&plain_decode_container()));
+    }
+
+    #[test]
+    fn canonical_shape_accepts_kv_len_root_defaults() {
+        for port in [Port::Pages, Port::PageIndptr, Port::WSlot, Port::WOff] {
+            let mut c = plain_decode_container();
+            c.ports.retain(|p| p.port != port);
+            assert!(
+                canonical_kv_shape(&c),
+                "a container without {port:?} uses the KvLen-root dense default"
+            );
+        }
     }
 
     #[test]
@@ -813,6 +946,174 @@ mod tests {
         assert!(!canonical_kv_shape(&c));
     }
 
+    fn explicit_single_lane_evidence(tokens: &[u32], committed: u32) -> CanonicalFireEvidence {
+        let n = tokens.len() as u32;
+        CanonicalFireEvidence {
+            tokens: tokens.to_vec(),
+            kv_len: vec![committed + n],
+            embed_indptr: Some(vec![0, n]),
+            positions: Some((committed..committed + n).collect()),
+            pages: Some(vec![4, 9, 12]),
+            page_indptr: Some(vec![0, 3]),
+            w_slot: Some(
+                (committed..committed + n)
+                    .map(|position| [4, 9, 12][(position / 16) as usize])
+                    .collect(),
+            ),
+            w_off: Some(
+                (committed..committed + n)
+                    .map(|position| position % 16)
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn canonical_explicit_prefill_requires_contiguous_resolved_writes() {
+        let tokens = (1..=17).collect::<Vec<_>>();
+        let mut request = crate::driver::LaunchPlan {
+            token_ids: tokens.clone(),
+            position_ids: (0..17).collect(),
+            qo_indptr: vec![0, 17],
+            ..crate::driver::LaunchPlan::default()
+        };
+        let evidence = explicit_single_lane_evidence(&tokens, 0);
+        assert_eq!(
+            canonical_hash_tokens(evidence, &request, false, 16),
+            Some(CanonicalAppend {
+                start: 0,
+                tokens: tokens.clone(),
+            })
+        );
+
+        // Wire disagreement (host geometry differs from evidence): no hash.
+        request.position_ids[16] = 0;
+        let invalid = explicit_single_lane_evidence(&tokens, 0);
+        assert!(canonical_hash_tokens(invalid, &request, false, 16).is_none());
+    }
+
+    #[test]
+    fn canonical_continuation_prefill_hashes_against_committed_span() {
+        // 8 appended tokens over 16 already committed: evidence must check
+        // against [16, 24), not [0, 8) — the old gate's committed==0 bail is
+        // exactly the prefix-cache regression (RV-1).
+        let tokens = (100..108).collect::<Vec<_>>();
+        let request = crate::driver::LaunchPlan {
+            token_ids: tokens.clone(),
+            position_ids: (16..24).collect(),
+            qo_indptr: vec![0, 8],
+            ..crate::driver::LaunchPlan::default()
+        };
+        let evidence = explicit_single_lane_evidence(&tokens, 16);
+        assert_eq!(
+            canonical_hash_tokens(evidence, &request, false, 16),
+            Some(CanonicalAppend {
+                start: 16,
+                tokens: tokens.clone(),
+            })
+        );
+
+        // A stale evidence span (positions from 0) must not hash.
+        let stale = explicit_single_lane_evidence(&tokens, 0);
+        assert!(canonical_hash_tokens(stale, &request, false, 16).is_none());
+    }
+
+    #[test]
+    fn canonical_per_token_csr_hashes_like_single_lane() {
+        // The SDK lowering's one-token-per-lane CSR: lane i attends its own
+        // causal prefix [0, i+1). Union is the contiguous [0, n) append.
+        let n = 5u32;
+        let tokens: Vec<u32> = (1..=n).collect();
+        let pages: Vec<u32> = (0..n).flat_map(|_| [7u32]).collect(); // lane i -> page 7
+        let request = crate::driver::LaunchPlan {
+            token_ids: tokens.clone(),
+            position_ids: (0..n).collect(),
+            qo_indptr: (0..=n).collect(),
+            ..crate::driver::LaunchPlan::default()
+        };
+        let evidence = CanonicalFireEvidence {
+            tokens: tokens.clone(),
+            kv_len: (1..=n).collect(),
+            embed_indptr: Some((0..=n).collect()),
+            positions: Some((0..n).collect()),
+            pages: Some(pages),
+            page_indptr: Some((0..=n).collect()),
+            w_slot: Some(vec![7; n as usize]),
+            w_off: Some((0..n).collect()),
+        };
+        assert_eq!(
+            canonical_hash_tokens(evidence, &request, false, 16),
+            Some(CanonicalAppend {
+                start: 0,
+                tokens: tokens.clone(),
+            })
+        );
+
+        // A lane that under-attends its causal prefix must not hash.
+        let mut short = CanonicalFireEvidence {
+            tokens: tokens.clone(),
+            kv_len: (1..=n).collect(),
+            embed_indptr: Some((0..=n).collect()),
+            positions: Some((0..n).collect()),
+            pages: Some(vec![7; n as usize]),
+            page_indptr: Some((0..=n).collect()),
+            w_slot: Some(vec![7; n as usize]),
+            w_off: Some((0..n).collect()),
+        };
+        short.kv_len[3] = 3; // lane 3 attends 3 < 4
+        assert!(canonical_hash_tokens(short, &request, false, 16).is_none());
+    }
+
+    #[test]
+    fn canonical_per_token_csr_derives_continuation_start() {
+        let n = 5u32;
+        let tokens: Vec<u32> = (100..100 + n).collect();
+        let request = crate::driver::LaunchPlan {
+            token_ids: tokens.clone(),
+            position_ids: (16..16 + n).collect(),
+            qo_indptr: (0..=n).collect(),
+            ..crate::driver::LaunchPlan::default()
+        };
+        let evidence = CanonicalFireEvidence {
+            tokens: tokens.clone(),
+            kv_len: (17..17 + n).collect(),
+            embed_indptr: Some((0..=n).collect()),
+            positions: Some((16..16 + n).collect()),
+            pages: Some((0..n).flat_map(|_| [6u32, 7]).collect()),
+            page_indptr: Some((0..=n).map(|lane| lane * 2).collect()),
+            w_slot: Some(vec![7; n as usize]),
+            w_off: Some((0..n).collect()),
+        };
+
+        assert_eq!(
+            canonical_hash_tokens(evidence, &request, false, 16),
+            Some(CanonicalAppend { start: 16, tokens })
+        );
+    }
+
+    #[test]
+    fn in_band_skip_tokens_never_hash() {
+        // -1 (0xFFFFFFFF) anywhere means this is not a plain append.
+        let tokens = vec![1, u32::MAX, 3];
+        let request = crate::driver::LaunchPlan {
+            token_ids: tokens.clone(),
+            position_ids: (0..3).collect(),
+            qo_indptr: vec![0, 3],
+            ..crate::driver::LaunchPlan::default()
+        };
+        let evidence = CanonicalFireEvidence {
+            tokens,
+            kv_len: vec![3],
+            embed_indptr: Some(vec![0, 3]),
+            positions: Some((0..3).collect()),
+            pages: None,
+            page_indptr: None,
+            w_slot: None,
+            w_off: None,
+        };
+        assert!(canonical_hash_tokens(evidence, &request, false, 16).is_none());
+    }
+
     #[test]
     fn prefill_then_decode_grows_and_projects() {
         let mut store = KvStore::new(16, nonce());
@@ -832,7 +1133,6 @@ mod tests {
         assert_eq!(proj.physical_page_ids.len(), 2);
         assert_eq!(proj.last_page_len, 2);
         assert!(src.is_empty() && dst.is_empty());
-        assert_eq!(txn.committed_tokens_after, 6);
         finalize(&mut store, txn, true).unwrap();
         assert_eq!(store.mapped_len(ws).unwrap(), 2);
 
@@ -848,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_overlay_matches_synchronous_projection_translation_and_hashes() {
+    fn single_state_runahead_matches_synchronous_projection_translation_and_hashes() {
         let page = 4u32;
         let tokens: Vec<u32> = (1..=9).collect();
         let chunks = [5usize, 1, 3];
@@ -894,9 +1194,9 @@ mod tests {
             offset += size;
         }
 
-        assert_eq!(runahead.mapped_len(runahead_ws).unwrap(), 0);
+        assert_eq!(runahead.mapped_len(runahead_ws).unwrap(), 3);
         assert_eq!(
-            runahead.visible_token_len(runahead_ws, page).unwrap(),
+            runahead.committed_token_len(runahead_ws, page).unwrap(),
             tokens.len() as u64
         );
         assert_eq!(runahead_shapes, sync_shapes);
@@ -921,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_overlay_reuses_cow_destination_and_preserves_hash_chain() {
+    fn single_state_reuses_cow_destination_and_preserves_hash_chain() {
         let mut store = KvStore::new(32, nonce());
         let page = 4u32;
         let parent = store.create_working_set();
@@ -943,7 +1243,7 @@ mod tests {
             prepare(&mut store, runahead, 7, &[8], page, Some(&[8])).unwrap();
         assert!(
             second_copy_src.is_empty(),
-            "the second pending fire writes the first fire's private CoW destination"
+            "the second fire writes the first fire's published private CoW destination"
         );
         assert_eq!(first_translation[1], second_translation[1]);
         finalize(&mut store, first, true).unwrap();
@@ -960,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_predecessor_pages_recycle_after_downstream_pending_fire_retires() {
+    fn failed_runahead_keeps_fail_stop_mapping_until_release() {
         let mut store = KvStore::new(4, nonce());
         let ws = store.create_working_set();
         let (_, _, _, first) =
@@ -975,11 +1275,14 @@ mod tests {
             "the downstream translation can still reference the predecessor allocation"
         );
         finalize(&mut store, second, false).unwrap();
+        assert_eq!(store.available_pages(), 2);
+        store.release_working_set(ws, store.current_epoch());
+        store.retire_idle();
         assert_eq!(store.available_pages(), 4);
     }
 
     #[test]
-    fn working_set_release_waits_for_pending_overlay_retirement() {
+    fn working_set_release_recycles_after_inflight_epoch_retires() {
         let mut store = KvStore::new(4, nonce());
         let ws = store.create_working_set();
         let (_, _, _, pending) =
@@ -1022,13 +1325,30 @@ mod tests {
     }
 
     #[test]
-    fn failed_fire_leaves_committed_state_untouched() {
+    fn failed_fire_leaves_fail_stop_mapping_published() {
         let mut store = KvStore::new(4, nonce());
         let ws = store.create_working_set();
         let (_, _, _, txn) = prepare(&mut store, ws, 0, &[1, 2], 4, None).unwrap();
         finalize(&mut store, txn, false).unwrap();
-        assert_eq!(store.mapped_len(ws).unwrap(), 0);
-        assert_eq!(store.available_pages(), 4); // retired via FIFO seq
+        assert_eq!(store.mapped_len(ws).unwrap(), 1);
+        assert_eq!(store.available_pages(), 3);
+    }
+
+    #[test]
+    fn declaration_realization_cows_only_a_shared_mapped_tail() {
+        let mut store = KvStore::new(8, nonce());
+        let parent = store.create_working_set();
+        prefill(&mut store, parent, &(1..=8).collect::<Vec<_>>(), &[8], 4);
+        let parent_tail = store.lookup(parent, 1).unwrap();
+
+        let child = store.fork(parent).unwrap();
+        let ((copy_src, copy_dst), txn) = realize_declaration(&mut store, child, 1..2).unwrap();
+        assert_eq!(copy_src, vec![parent_tail.0]);
+        assert_eq!(copy_dst.len(), 1);
+        assert_ne!(store.lookup(child, 1).unwrap(), parent_tail);
+        assert_eq!(store.lookup(parent, 1).unwrap(), parent_tail);
+        assert!(store.page_token_hashes(child, 1).unwrap().is_empty());
+        finalize(&mut store, txn.unwrap(), true).unwrap();
     }
 
     /// Canonical prefill of `tokens` onto `ws`, chunked as `fires` splits.
@@ -1188,65 +1508,6 @@ mod tests {
             .unwrap()
             .expect("capped prefix hit");
         assert_eq!(matched, 1);
-    }
-
-    #[test]
-    fn released_paths_stay_matchable_until_pressure_reclaims_them() {
-        let mut store = KvStore::new(8, nonce());
-        let page = 4u32;
-        let tokens: Vec<u32> = (400..408).collect();
-
-        let a = store.create_working_set();
-        prefill(&mut store, a, &tokens, &[8], page);
-        let epoch = store.current_epoch();
-        store.release_working_set_cached(a, epoch, 8);
-        store.retire_idle();
-        // Retained: the pages did NOT free.
-        assert_eq!(store.available_pages(), 6);
-
-        // A newcomer still matches the retained prefix.
-        let b = store.create_working_set();
-        let matched = match_prefix(&mut store, b, &tokens, page).unwrap();
-        assert_eq!(matched, Some(1)); // 8 tokens -> capped at 1 full page
-        let epoch = store.current_epoch();
-        store.release_working_set(b, epoch);
-        store.retire_idle();
-
-        // Rung 1 reclaims the retained lease; nothing matches afterwards.
-        let epoch = store.current_epoch();
-        assert_eq!(store.drop_unused_cache_leases(epoch), 2);
-        store.retire_idle();
-        assert_eq!(store.available_pages(), 8);
-        let c = store.create_working_set();
-        assert_eq!(match_prefix(&mut store, c, &tokens, page).unwrap(), None);
-    }
-
-    #[test]
-    fn retention_cap_evicts_the_oldest_root() {
-        let mut store = KvStore::new(16, nonce());
-        let page = 4u32;
-        let t1: Vec<u32> = (500..504).collect();
-        let t2: Vec<u32> = (600..604).collect();
-
-        for t in [&t1, &t2] {
-            let ws = store.create_working_set();
-            prefill(&mut store, ws, t, &[4], page);
-            let epoch = store.current_epoch();
-            store.release_working_set_cached(ws, epoch, 1); // cap 1
-            store.retire_idle();
-        }
-        // t1's root was evicted by t2's retention; only t2 lingers.
-        assert_eq!(store.available_pages(), 15);
-        let probe = store.create_working_set();
-        assert_eq!(
-            match_prefix(&mut store, probe, &[t1.as_slice(), &[9]].concat(), page).unwrap(),
-            None
-        );
-        let probe2 = store.create_working_set();
-        assert_eq!(
-            match_prefix(&mut store, probe2, &[t2.as_slice(), &[9]].concat(), page).unwrap(),
-            Some(1)
-        );
     }
 
     #[test]

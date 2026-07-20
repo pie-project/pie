@@ -7,6 +7,9 @@ description = "Python bindings for the pie engine — embed `pie serve` inside a
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
+[features]
+profile-fire = ["pie-worker/profile-fire"]
+
 [lib]
 name = "pie_engine"
 crate-type = ["cdylib"]

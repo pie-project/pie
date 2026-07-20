@@ -32,10 +32,6 @@ const PAGE_T: u32 = 16;
 const NUM_LAYERS: u32 = 1;
 const PROMPT: &str = "The quick brown fox jumps over";
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 /// Host reference for the A2 DAG: the accepted draft prefix, the target
 /// correction `a[j]` spliced at the first reject, then `0`-sentinels.
 fn greedy_verify_a2_obs(d: &[u32], a: &[u32]) -> Vec<u32> {
@@ -56,67 +52,76 @@ fn greedy_verify_a2_obs(d: &[u32], a: &[u32]) -> Vec<u32> {
 
 /// The independent greedy-argmax reference continuation `g[0..k)`: `k`
 /// sequential single-token argmax decode fires on a fresh working set.
-fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
+    let ws = WorkingSet::new();
     let n = prompt.len() as u32;
+    let max_pages = (n + k + 1).div_ceil(PAGE_T);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("greedy ws.reserve: {e}"))?;
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
 
-    let toks_p = bx(Channel::from(prompt_i32).named("g_toks_p"));
-    let klen_p = bx(Channel::from(vec![n; 1]).named("g_klen_p"));
-    let g0_ch = bx(Channel::new([1], dtype::i32).named("g0"));
+    let toks_p = Channel::from(prompt_i32).named("g_toks_p");
+    let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
-    let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd_p.embed(toks_p, Tensor::constant(vec![0u32, n]));
-    fwd_p.attn_working_set(ws, klen_p);
+    let fwd_p = ForwardPass::new();
+    fwd_p.embed(&toks_p, Tensor::constant(vec![0u32, n]));
+    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    fwd_p.port_channel(Port::KvLen, &kv_len_p);
+    fwd_p.attn_working_set(&ws, .., ..)?;
+    fwd_p.derive_dense_geometry();
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
         g0_ch.put(&t);
     });
-    let prefill = Pipeline::new();
+    // ONE pipeline for the whole greedy stream (R4-4): prefill then decode
+    // are one sequential stream. The g0 handoff still rides the host.
+    let pipe = Pipeline::new();
     fwd_p
-        .submit(&prefill)
+        .submit(&pipe)
         .map_err(|e| format!("greedy prefill: {e}"))?;
+    if k == 1 {
+        pipe.finish();
+    }
     let g0 = g0_ch
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("g0 take: {e}"))?[0];
-    prefill.close();
 
     let mut g: Vec<u32> = vec![g0 as u32];
     if k > 1 {
-        let tok_in = bx(Channel::from(vec![g0; 1]).named("g_tok_in"));
-        let pos = bx(Channel::from(vec![n; 1]).named("g_pos"));
-        let klen = bx(Channel::from(vec![n + 1; 1]).named("g_klen"));
-        let fill = bx(Channel::from(vec![n + 1; 1]).named("g_fill"));
-        let out = bx(Channel::new([1], dtype::i32).named("g_out"));
+        let tok_in = Channel::from(vec![g0; 1]).named("g_tok_in");
+        let out = Channel::new([1], dtype::i32).named("g_out");
         let lane1 = Tensor::constant(vec![0u32, 1u32]);
 
-        let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-        fwd.embed(tok_in, lane1);
-        fwd.positions(pos);
-        fwd.attn_working_set(ws, klen);
+        let fwd = ForwardPass::new();
+        fwd.embed(&tok_in, lane1);
+        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        fwd.port_channel(Port::KvLen, &kv_len);
+        fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
+        fwd.derive_dense_geometry();
         fwd.epilogue(move || {
-            let base = fill.take().tensor();
+            let length = kv_len.take().tensor();
             let t = reduce_argmax(intrinsics::logits());
-            let klen_v = add(&base, 1u32);
-            let next_free = add(&base, 1u32);
             tok_in.put(&t);
+            kv_len.put(add(&length, 1u32));
             out.put(&t);
-            pos.put(&base);
-            klen.put(&klen_v);
-            fill.put(&next_free);
         });
-        let decode = Pipeline::new();
+        // Fixed budget: finish() (F7) lands right after the last decode
+        // submit.
         for step in 1..k {
-            fwd.submit(&decode)
+            fwd.submit(&pipe)
                 .map_err(|e| format!("greedy decode @{step}: {e}"))?;
+            if step + 1 == k {
+                pipe.finish();
+            }
             let t = out
                 .take()
                 .get::<i32>()
+                .await
                 .map_err(|e| format!("greedy out @{step}: {e}"))?[0];
             g.push(t as u32);
         }
-        decode.close();
     }
     Ok(g)
 }
@@ -124,16 +129,18 @@ fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
 /// Fire `input = prompt ++ drafts`; the verify device-aliases the k drafts by
 /// peeking (`.read()`, non-consuming) the SAME `toks` channel already embedded
 /// — NO separate draft submission. Returns the `[k]` accept set.
-fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>> {
+async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>> {
     let l = prompt.len() as u32;
     let mut inp: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     inp.extend(drafts.iter().map(|&t| t as i32));
     let n = l + k;
 
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let toks = bx(Channel::from(inp).named("v_toks"));
-    let klen = bx(Channel::from(vec![n]).named("v_klen"));
-    let verify_out = bx(Channel::new([k], dtype::i32).named("v_out"));
+    let ws = WorkingSet::new();
+    let max_pages = n.div_ceil(PAGE_T);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("verify ws.reserve: {e}"))?;
+    let toks = Channel::from(inp).named("v_toks");
+    let verify_out = Channel::new([k], dtype::i32).named("v_out");
 
     // k read-out rows (the last k positions, prompt-tail .. prompt-tail+k-1)
     // ⇒ intrinsics::logits() declares [k, vocab].
@@ -141,9 +148,12 @@ fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>> {
     // The k draft token indices WITHIN `toks` (the positions after the anchor).
     let draft_positions: Vec<u32> = (l..l + k).collect();
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(toks, Tensor::constant(vec![0u32, n]));
-    fwd.attn_working_set(ws, klen);
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
+    let kv_len = Channel::from(vec![n]).named("kv_len");
+    fwd.port_channel(Port::KvLen, &kv_len);
+    fwd.attn_working_set(&ws, .., ..)?;
+    fwd.derive_dense_geometry();
     fwd.readout(&Tensor::constant(readout));
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded input tokens (NOT a separate
@@ -167,6 +177,7 @@ fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>> {
     let v = verify_out
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("verify take: {e}"))?;
     pipeline.close();
     Ok(v.iter().map(|&x| x as u32).collect())
@@ -186,19 +197,19 @@ async fn main(input: String) -> Result<String> {
     }
 
     // ── Greedy continuation g[0..k): the INDEPENDENT argmax witness. ──
-    let g = greedy_reference(&prompt, k)?;
+    let g = greedy_reference(&prompt, k).await?;
     if (g.len() as u32) < k {
         return Err(format!("greedy produced {} < k={} tokens", g.len(), k));
     }
     let g: Vec<u32> = g[..k as usize].to_vec();
 
     // ── ACCEPT-ALL: drafts = g → all rows match → V == g. ──
-    let accept_out = fire_verify(&prompt, k, &g)?;
+    let accept_out = fire_verify(&prompt, k, &g).await?;
 
     // ── REJECT-MID (load-bearing): perturb draft j (≠ g[j], nonzero). ──
     let mut rj_draft = g.clone();
     rj_draft[j] = ((g[j] + 1) % vocab).max(1);
-    let reject_out = fire_verify(&prompt, k, &rj_draft)?;
+    let reject_out = fire_verify(&prompt, k, &rj_draft).await?;
 
     // ── Verdicts ──
     let expect_accept = greedy_verify_a2_obs(&g, &g);

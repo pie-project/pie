@@ -46,6 +46,7 @@
 //! ever made while holding it, and no await happens under it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -365,6 +366,8 @@ pub struct ContentionStats {
     pub suspend_rollbacks: std::sync::atomic::AtomicU64,
     pub restore_rollbacks: std::sync::atomic::AtomicU64,
     pub host_swap_exhaustions: std::sync::atomic::AtomicU64,
+    pub restore_prepared: std::sync::atomic::AtomicU64,
+    pub h2d_submitted: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -401,23 +404,23 @@ pub struct ContentionDiagnostics {
     pub suspend_rollbacks_total: u64,
     pub restore_rollbacks_total: u64,
     pub host_swap_exhaustions_total: u64,
+    pub restore_prepared_total: u64,
+    pub h2d_submitted_total: u64,
 }
 
 pub struct ContentionOrchestrator {
     inner: Mutex<Inner>,
+    /// Published queue cardinalities for the per-token fast paths. Writers
+    /// update these while holding `inner`; readers may observe one transition
+    /// late because every gate loops and re-checks after making progress.
+    allocation_waiters: AtomicUsize,
+    restore_waiters: AtomicUsize,
+    park_requests: AtomicUsize,
     backend: Box<dyn ReclaimBackend>,
     /// Pause restores while `used/total` exceeds this (anti-thrash; the
     /// existing `scheduler.restore_pause_at_utilization` config feeds it).
     restore_pause_at_utilization: f64,
     stats: ContentionStats,
-    /// Broadcast per fire retire (`notify_waiters` semantics — no stored
-    /// permit). Deep-running lanes gate on this to re-drain their own
-    /// already-retired fires under contention (the carrier ⋈ contention fix:
-    /// a lane's pins release only when ITS OWN task finalizes its fires, so
-    /// each retire re-opens the drain window). Racy-by-design: a missed
-    /// notification is covered by the next retire, and gate loops re-check
-    /// state before every wait (`Notified::enable`).
-    fire_retired: Arc<Notify>,
     /// #19 exhaustion deadline (ms): how long the FCFS-oldest keystone may stay
     /// CONTINUOUSLY unsatisfiable (no victim, `free < need`) before `acquire`
     /// fails LOUD with [`ContentionError::Exhausted`] instead of wedging. Read
@@ -465,10 +468,12 @@ impl ContentionOrchestrator {
     pub fn new(backend: Box<dyn ReclaimBackend>, restore_pause_at_utilization: f64) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
+            allocation_waiters: AtomicUsize::new(0),
+            restore_waiters: AtomicUsize::new(0),
+            park_requests: AtomicUsize::new(0),
             backend,
             restore_pause_at_utilization,
             stats: ContentionStats::default(),
-            fire_retired: Arc::new(Notify::new()),
             exhaustion_ms: exhaustion_ms_from_env(),
         }
     }
@@ -478,6 +483,26 @@ impl ContentionOrchestrator {
     pub fn with_exhaustion_ms(mut self, ms: u64) -> Self {
         self.exhaustion_ms = ms;
         self
+    }
+
+    fn remove_count(counter: &AtomicUsize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let previous = counter.fetch_sub(count, Ordering::AcqRel);
+        debug_assert!(previous >= count);
+    }
+
+    fn remove_allocation_waiters(&self, count: usize) {
+        Self::remove_count(&self.allocation_waiters, count);
+    }
+
+    fn remove_restore_waiters(&self, count: usize) {
+        Self::remove_count(&self.restore_waiters, count);
+    }
+
+    fn remove_park_request(&self) {
+        Self::remove_count(&self.park_requests, 1);
     }
 
     /// Engagement counters (see [`ContentionStats`] for v1-vs-v2 semantics).
@@ -557,6 +582,8 @@ impl ContentionOrchestrator {
             suspend_rollbacks_total: self.stats.suspend_rollbacks.load(Relaxed),
             restore_rollbacks_total: self.stats.restore_rollbacks.load(Relaxed),
             host_swap_exhaustions_total: self.stats.host_swap_exhaustions.load(Relaxed),
+            restore_prepared_total: self.stats.restore_prepared.load(Relaxed),
+            h2d_submitted_total: self.stats.h2d_submitted.load(Relaxed),
         }
     }
 
@@ -592,6 +619,18 @@ impl ContentionOrchestrator {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub fn record_restore_prepared(&self) {
+        self.stats
+            .restore_prepared
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn record_h2d_submitted(&self) {
+        self.stats
+            .h2d_submitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn kv_pressure_bucket(&self) -> u8 {
         let diagnostics = self.diagnostics();
         let device_used = diagnostics
@@ -622,9 +661,10 @@ impl ContentionOrchestrator {
 
     /// True while any allocation waiter is parked — the pool is contended and
     /// deep-running lanes should self-serialize (drain their own fires, stop
-    /// deepening) so their pins can release.
+    /// deepening) so their pins can release. The published count may lag one
+    /// queue transition; the contention gate re-checks after honor/drain.
     pub fn contended(&self) -> bool {
-        !self.inner.lock().unwrap().waiters.is_empty()
+        self.allocation_waiters.load(Ordering::Acquire) != 0
     }
 
     /// Is `pid` the FCFS-oldest registered process? The oldest is the
@@ -637,17 +677,6 @@ impl ContentionOrchestrator {
             return false;
         };
         inner.procs.values().all(|q| q.submit_seq >= p.submit_seq)
-    }
-
-    /// The per-fire retire signal (see the field doc). Callers use the
-    /// enable-then-check-then-await pattern to avoid lost wakeups.
-    pub fn fire_retired(&self) -> Arc<Notify> {
-        self.fire_retired.clone()
-    }
-
-    /// A fire retired — wake any lane gated on draining its own launches.
-    pub fn on_fire_retired(&self) {
-        self.fire_retired.notify_waiters();
     }
 
     /// Register a process at spawn — its registration order is the FCFS clock.
@@ -675,15 +704,25 @@ impl ContentionOrchestrator {
     pub fn unregister(&self, pid: ProcessId) {
         let (parked, waiters) = {
             let mut inner = self.inner.lock().unwrap();
-            inner.procs.remove(&pid);
+            let removed_park_request = inner
+                .procs
+                .remove(&pid)
+                .is_some_and(|process| process.state == ProcState::ParkRequested);
             let waiters: Vec<_> = inner
                 .waiters
                 .iter()
                 .filter(|waiter| waiter.pid == pid)
                 .map(|waiter| waiter.notify.clone())
                 .collect();
+            let allocation_waiters_before = inner.waiters.len();
             inner.waiters.retain(|w| w.pid != pid);
+            self.remove_allocation_waiters(allocation_waiters_before - inner.waiters.len());
+            let restore_waiters_before = inner.restore_queue.len();
             inner.restore_queue.retain(|&p| p != pid);
+            self.remove_restore_waiters(restore_waiters_before - inner.restore_queue.len());
+            if removed_park_request {
+                self.remove_park_request();
+            }
             inner.restore_grants.remove(&pid);
             inner.restore_errors.remove(&pid);
             (inner.parked.remove(&pid), waiters)
@@ -715,7 +754,11 @@ impl ContentionOrchestrator {
     /// FIFO waiters first, then restores suspended processes under the
     /// anti-thrash guard. Never called with arena/WS locks held.
     pub fn on_blocks_freed(&self) {
-        self.drain();
+        if self.allocation_waiters.load(Ordering::Acquire) != 0
+            || self.restore_waiters.load(Ordering::Acquire) != 0
+        {
+            self.drain();
+        }
     }
 
     // =========================================================================
@@ -734,14 +777,16 @@ impl ContentionOrchestrator {
     //      ids, restores H2D, publishes remapped metadata, then calls
     //      `report_restored`; only that final report makes it runnable.
     //
-    // The scheduler wait-set Leave (a parked pipeline must not be awaited) is
-    // emitted at `report_suspended` time once the lifecycle_rx wiring lands
-    // (M-AB); until then the wave deadline + miss-demote bounds the wait.
+    // The scheduler wait-set Leave is mandatory: a parked pipeline must not be
+    // awaited by the pure wait-all barrier.
     // =========================================================================
 
     /// Victim-side step 1: does `pid` have a pending park request?
     /// Checked at the host-call boundary before any allocation work.
     pub fn should_park(&self, pid: ProcessId) -> bool {
+        if self.park_requests.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         let inner = self.inner.lock().unwrap();
         matches!(
             inner.procs.get(&pid).map(|p| p.state),
@@ -769,6 +814,7 @@ impl ContentionOrchestrator {
             return false;
         }
         process.state = ProcState::Quiescing;
+        self.remove_park_request();
         drop(inner);
         notify_pipeline_leave(pid, LeaveKind::Suspend);
         true
@@ -789,7 +835,11 @@ impl ContentionOrchestrator {
                 return;
             };
             if matches!(p.state, ProcState::ParkRequested | ProcState::Quiescing) {
+                let was_requested = p.state == ProcState::ParkRequested;
                 p.state = ProcState::Running;
+                if was_requested {
+                    self.remove_park_request();
+                }
                 Some(p.park_requested.clone())
             } else {
                 None
@@ -819,11 +869,16 @@ impl ContentionOrchestrator {
             ) {
                 return;
             }
+            let was_requested = p.state == ProcState::ParkRequested;
             p.state = ProcState::Suspended;
             p.suspended_need = freed_now;
             p.suspended_at = Some(Instant::now());
             if !inner.restore_queue.contains(&pid) {
                 inner.restore_queue.push_back(pid);
+                self.restore_waiters.fetch_add(1, Ordering::Release);
+            }
+            if was_requested {
+                self.remove_park_request();
             }
             self.stats
                 .suspends
@@ -916,6 +971,7 @@ impl ContentionOrchestrator {
             process.state = ProcState::Suspended;
             if !inner.restore_queue.contains(&pid) {
                 inner.restore_queue.push_back(pid);
+                self.restore_waiters.fetch_add(1, Ordering::Release);
             }
         }
         self.drain();
@@ -1056,6 +1112,7 @@ impl ContentionOrchestrator {
                                 process.suspended_at = Some(Instant::now());
                                 if !inner.restore_queue.contains(&victim) {
                                     inner.restore_queue.push_back(victim);
+                                    self.restore_waiters.fetch_add(1, Ordering::Release);
                                 }
                             }
                         }
@@ -1067,10 +1124,14 @@ impl ContentionOrchestrator {
                     SuspendOutcome::Requested => {
                         let signal = {
                             let mut inner = self.inner.lock().unwrap();
-                            inner.procs.get_mut(&victim).map(|process| {
+                            let signal = inner.procs.get_mut(&victim).map(|process| {
                                 process.state = ProcState::ParkRequested;
                                 process.park_requested.clone()
-                            })
+                            });
+                            if signal.is_some() {
+                                self.park_requests.fetch_add(1, Ordering::Release);
+                            }
+                            signal
                         };
                         if let Some(signal) = signal {
                             signal.notify_waiters();
@@ -1115,10 +1176,14 @@ impl ContentionOrchestrator {
                 self.cancel_waiter(requester, request_id, false);
                 let signal = {
                     let mut inner = self.inner.lock().unwrap();
-                    inner.procs.get_mut(&requester).map(|process| {
+                    let signal = inner.procs.get_mut(&requester).map(|process| {
                         process.state = ProcState::ParkRequested;
                         process.park_requested.clone()
-                    })
+                    });
+                    if signal.is_some() {
+                        self.park_requests.fetch_add(1, Ordering::Release);
+                    }
+                    signal
                 };
                 if let Some(signal) = signal {
                     signal.notify_waiters();
@@ -1231,6 +1296,7 @@ impl ContentionOrchestrator {
             grant: None,
             parked_reported: false,
         });
+        self.allocation_waiters.fetch_add(1, Ordering::Release);
         Ok((request_id, notify))
     }
 
@@ -1278,6 +1344,7 @@ impl ContentionOrchestrator {
         }
         let grant = inner.waiters[position].grant.take()?;
         inner.waiters.remove(position);
+        self.remove_allocation_waiters(1);
         self.stats
             .waiters_woken
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1299,6 +1366,7 @@ impl ContentionOrchestrator {
                 false
             } else {
                 inner.waiters.remove(position);
+                self.remove_allocation_waiters(1);
                 true
             }
         };
@@ -1388,7 +1456,11 @@ impl ContentionOrchestrator {
                                     };
                                     if since.elapsed() >= Duration::from_millis(self.exhaustion_ms)
                                     {
+                                        let restore_waiters_before = inner.restore_queue.len();
                                         inner.restore_queue.retain(|queued| *queued != pid);
+                                        self.remove_restore_waiters(
+                                            restore_waiters_before - inner.restore_queue.len(),
+                                        );
                                         inner.restore_exhausted_since = None;
                                         inner.restore_errors.insert(
                                             pid,
@@ -1476,7 +1548,11 @@ impl ContentionOrchestrator {
                             drop(reservation);
                             continue;
                         }
+                        let restore_waiters_before = inner.restore_queue.len();
                         inner.restore_queue.retain(|queued| *queued != pid);
+                        self.remove_restore_waiters(
+                            restore_waiters_before - inner.restore_queue.len(),
+                        );
                         let request_id = inner.next_token;
                         inner.next_token += 1;
                         if let Some(process) = inner.procs.get_mut(&pid) {
@@ -1733,13 +1809,10 @@ impl ContentionOrchestrator {
                                     .waiters_parked
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 drop(inner);
-                                // A×B: a PLAIN-parked waiter must also LEAVE
-                                // the wave (first park only). Without this it
-                                // accrues wave misses while blocked here and
-                                // the miss-limit TERMINATES a live lane (the
-                                // BAR-2 "unresponsive pipeline" demote of a
-                                // preempt-cycling carrier lane). Join is
-                                // emitted on acquire exit.
+                                // A×B: a plain parked waiter must also leave
+                                // the wave (first park only), otherwise pure
+                                // wait-all blocks the fleet indefinitely.
+                                // Join is emitted on acquire exit.
                                 notify_pipeline_leave(requester, LeaveKind::Suspend);
                                 notify
                             }
@@ -1936,41 +2009,42 @@ impl KvPoolBackend {
 impl ReclaimBackend for KvPoolBackend {
     fn pool_stats(&self) -> (u32, u32) {
         let stores = crate::store::registry::get(self.model_idx, self.driver_idx);
-        let kv = stores.kv.lock().unwrap();
-        let free = kv.available_pages() as u32;
-        let total = kv.capacity_pages();
-        (free, total)
+        crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
+            (kv.available_pages() as u32, kv.capacity_pages())
+        })
     }
 
     fn host_pool_stats(&self) -> (u32, u32) {
         let stores = crate::store::registry::get(self.model_idx, self.driver_idx);
-        let kv = stores.kv.lock().unwrap();
-        (kv.host_swap_available() as u32, kv.host_swap_capacity())
+        crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
+            (kv.host_swap_available() as u32, kv.host_swap_capacity())
+        })
     }
 
     fn reclaim_idle(&self) -> u32 {
         let stores = crate::store::registry::get(self.model_idx, self.driver_idx);
-        let mut kv = stores.kv.lock().unwrap();
-        let epoch = kv.current_epoch();
-        let freed = kv.drop_unused_cache_leases(epoch);
-        if freed > 0 {
-            kv.retire_idle();
-        }
-        freed as u32
+        crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
+            let epoch = kv.current_epoch();
+            let freed = kv.drop_unused_cache_leases(epoch);
+            if freed > 0 {
+                kv.retire_idle();
+            }
+            freed as u32
+        })
     }
 
     fn reserve_pages(&self, count: u32) -> Option<DevicePageReservation> {
         let stores = crate::store::registry::get(self.model_idx, self.driver_idx);
-        let pages = stores
-            .kv
-            .lock()
-            .unwrap()
-            .reserve_device_pages(count as usize)?;
+        let pages = crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
+            kv.reserve_device_pages(count as usize)
+        })?;
         let model_idx = self.model_idx;
         let driver_idx = self.driver_idx;
         Some(DevicePageReservation::new(pages, move |pages| {
             let stores = crate::store::registry::get(model_idx, driver_idx);
-            stores.kv.lock().unwrap().release_device_reservation(pages);
+            crate::store::registry::with_kv_lock(&stores.kv, "reclaim", |kv| {
+                kv.release_device_reservation(pages);
+            });
         }))
     }
 
@@ -2089,14 +2163,6 @@ pub fn contention() -> Option<&'static ContentionOrchestrator> {
     CONTENTION.get()
 }
 
-/// Scheduler hook for payload-free fire retirement. No-op unless preempt mode
-/// is wired (one `OnceLock` load on the hot path).
-pub fn notify_fire_retired() {
-    if let Some(o) = CONTENTION.get() {
-        o.on_fire_retired();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2176,6 +2242,7 @@ mod tests {
             .get_mut(&pid)
             .unwrap()
             .state = ProcState::ParkRequested;
+        orch.park_requests.fetch_add(1, Ordering::Release);
         assert!(orch.begin_quiesce(pid));
         orch.report_suspended(pid, pages);
     }
@@ -2384,10 +2451,24 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(orch.contended());
         task.abort();
         let _ = task.await;
         tokio::task::yield_now().await;
         assert!(orch.inner.lock().unwrap().waiters.is_empty());
+        assert!(!orch.contended());
         assert_eq!(orch.stats.cancelled_waits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn idle_hot_path_does_not_lock_inner() {
+        let (orch, pid, _) = orch_with_free(10, 0, 10);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = orch.inner.lock().unwrap();
+            panic!("poison inner");
+        }));
+        assert!(!orch.contended());
+        assert!(!orch.should_park(pid));
+        orch.on_blocks_freed();
     }
 }

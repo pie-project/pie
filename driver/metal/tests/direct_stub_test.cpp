@@ -10,6 +10,7 @@
 
 #include <pie_driver_abi.h>
 #include "pie_native/ptir/container.hpp"  // fnv1a64 (the PTIB sidecar's container hash)
+#include "support/ptib_v2_plan.hpp"
 
 namespace {
 
@@ -154,7 +155,7 @@ std::vector<std::uint8_t> add_one_sidecar(const std::vector<std::uint8_t>& conta
     const std::uint64_t hash =
         pie_native::ptir::container::fnv1a64(container.data(), container.size());
     std::vector<std::uint8_t> out{'P', 'T', 'I', 'B'};
-    push_u16(out, PTIB_VERSION);
+    push_u16(out, 1);  // hand-built typed sidecar; no v2 compiler-plan section
     push_u16(out, 0);
     for (int b = 0; b < 8; ++b) out.push_back(static_cast<std::uint8_t>(hash >> (b * 8)));
     push_u32(out, 2);  // channel classes
@@ -178,7 +179,7 @@ std::vector<std::uint8_t> add_one_sidecar(const std::vector<std::uint8_t>& conta
     out.push_back(PTIR_DT_U32);
     out.push_back(1);
     push_u32(out, 1);
-    return out;
+    return pie::metal::tests::upgrade_ptib_v1(container, std::move(out));
 }
 
 std::vector<std::uint8_t> extern_program(std::uint8_t direction) {
@@ -243,24 +244,39 @@ int main() {
     if (!expect(driver != nullptr, "driver create")) return 1;
 
     const auto program_bytes = mixed_role_program();
+    const auto program_sidecar =
+        pie::metal::tests::empty_program_ptib_v2(program_bytes);
     PieProgramDesc program{};
     program.abi_version = PIE_DRIVER_ABI_VERSION;
     program.program_hash = 0x1234;
     program.canonical_bytes.ptr = program_bytes.data();
     program.canonical_bytes.len = program_bytes.size();
+    program.sidecar_bytes = {
+        .ptr = program_sidecar.data(),
+        .len = program_sidecar.size(),
+    };
     std::uint64_t program_id = 0;
     const auto oversized_capacity_bytes = mixed_role_program(8);
+    const auto oversized_capacity_sidecar =
+        pie::metal::tests::empty_program_ptib_v2(
+            oversized_capacity_bytes);
     PieProgramDesc oversized_capacity_program = program;
-    oversized_capacity_program.program_hash += 1;
+    oversized_capacity_program.program_hash += 0x100;
     oversized_capacity_program.canonical_bytes = {
         .ptr = oversized_capacity_bytes.data(),
         .len = oversized_capacity_bytes.size(),
     };
+    oversized_capacity_program.sidecar_bytes = {
+        .ptr = oversized_capacity_sidecar.data(),
+        .len = oversized_capacity_sidecar.size(),
+    };
+    std::uint64_t oversized_capacity_program_id = 0;
     if (!expect(pie_metal_register_program(
                     driver,
                     &oversized_capacity_program,
-                    &program_id) == PIE_STATUS_INVALID_ARGUMENT,
-                "register rejects unsupported channel capacity")) return 1;
+                    &oversized_capacity_program_id) == PIE_STATUS_OK,
+                "register accepts contract-valid channel capacity without a "
+                "backend-private cap")) return 1;
     PieProgramDesc bad_program = program;
     bad_program.abi_version += 1;
     if (!expect(pie_metal_register_program(driver, &bad_program, &program_id) ==
@@ -269,6 +285,13 @@ int main() {
     if (!expect(pie_metal_register_program(driver, &program, nullptr) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "register rejects null output")) return 1;
+    PieProgramDesc sidecarless = program;
+    sidecarless.program_hash = 0x1233;
+    sidecarless.sidecar_bytes = {};
+    if (!expect(
+            pie_metal_register_program(driver, &sidecarless, &program_id) ==
+                PIE_STATUS_UNSUPPORTED,
+            "M1 rejects a sidecar-less program at registration")) return 1;
     bad_program = program;
     bad_program.sidecar_bytes = {.ptr = nullptr, .len = 1};
     if (!expect(pie_metal_register_program(driver, &bad_program, &program_id) ==
@@ -284,6 +307,19 @@ int main() {
                 "register rejects byte extent overflow")) return 1;
     if (!expect(pie_metal_register_program(driver, &program, &program_id) == PIE_STATUS_OK,
                 "register_program")) return 1;
+    std::vector<std::uint8_t> colliding_program_bytes = program_bytes;
+    colliding_program_bytes.back() ^= 1;
+    PieProgramDesc colliding_program = program;
+    colliding_program.canonical_bytes = {
+        .ptr = colliding_program_bytes.data(),
+        .len = colliding_program_bytes.size(),
+    };
+    std::uint64_t collision_id = 0;
+    if (!expect(
+            pie_metal_register_program(
+                driver, &colliding_program, &collision_id) ==
+                PIE_STATUS_INVALID_ARGUMENT,
+            "same hash with nonidentical canonical bytes rejects")) return 1;
     PieProgramDesc cached_program = program;
     cached_program.canonical_bytes = {};
     std::uint64_t cached_program_id = 0;
@@ -450,8 +486,8 @@ int main() {
         .len = 1,
     };
     if (!expect(pie_metal_launch(driver, &device_geometry_launch, launch_completion) ==
-                    PIE_STATUS_UNSUPPORTED,
-                "device-geometry empty mask encoding")) return 1;
+                    PIE_STATUS_INVALID_ARGUMENT,
+                "empty launch still requires channel tickets")) return 1;
 
     PieLaunchDesc bad_launch = launch;
     bad_launch.abi_version += 1;
@@ -463,6 +499,31 @@ int main() {
     if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects invalid bool")) return 1;
+    const std::uint32_t mask_request_indptr[] = {0, 1};
+    const std::uint32_t mask_word_indptr[] = {0, 1};
+    const std::uint32_t mask_words[] = {1};
+    const std::uint32_t mask_qo_indptr[] = {0, 0};
+    PieLaunchDesc user_mask_launch = launch;
+    user_mask_launch.has_user_mask = 1;
+    user_mask_launch.qo_indptr = {
+        .ptr = mask_qo_indptr, .len = 2};
+    user_mask_launch.masks.request_indptr = {
+        .ptr = mask_request_indptr, .len = 2};
+    user_mask_launch.masks.word_indptr = {
+        .ptr = mask_word_indptr, .len = 2};
+    user_mask_launch.masks.words = {
+        .ptr = mask_words, .len = 1};
+    launch_terminal = pending_terminal();
+    if (!expect(
+            pie_metal_launch(
+                driver, &user_mask_launch, launch_completion) ==
+                    PIE_STATUS_UNSUPPORTED &&
+                launch_terminal.outcome ==
+                    PIE_TERMINAL_OUTCOME_PENDING,
+            "user wire masks reject synchronously instead of running "
+            "unmasked")) {
+        return 1;
+    }
     bad_launch = launch;
     bad_launch.reserved_flags[3] = 1;
     if (!expect(pie_metal_launch(driver, &bad_launch, launch_completion) ==
@@ -621,18 +682,14 @@ int main() {
     if (!expect(pie_metal_launch(driver, &launch, rejected_completion) ==
                     PIE_STATUS_INVALID_ARGUMENT,
                 "launch rejects operation terminal cell")) return 1;
-    // The mixed-role program ships no PTIB sidecar, so it is not executable
-    // on the host interpreter — launch rejects UNSUPPORTED without touching
-    // any ring state.
-    if (!expect(pie_metal_launch(driver, &launch, launch_completion) == PIE_STATUS_UNSUPPORTED,
-                "launch of a sidecar-less program is unsupported")) return 1;
-    if (!expect(notify.count() == 0, "unsupported launch does not notify")) return 1;
+    // Registration-time M1 rejection replaced the old fire-time unsupported
+    // path; the rejected operation above still touched no channel state.
     if (!expect(words[0] == 0, "reader head unchanged")) return 1;
     if (!expect(words[1] == 1, "reader seed tail unchanged")) return 1;
     if (!expect(words[2] == 0, "poison stays clear")) return 1;
     if (!expect(words[3] == 0, "closed stays clear")) return 1;
     if (!expect(launch_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
-                "unsupported launch keeps member terminal pending")) return 1;
+                "unlaunched member terminal stays pending")) return 1;
     if (!expect(rejected_terminal.outcome == PIE_TERMINAL_OUTCOME_PENDING,
                 "rejected launch keeps operation terminal pending")) return 1;
 
@@ -1017,6 +1074,10 @@ int main() {
 
     const auto export_bytes = extern_program(1);
     const auto import_bytes = extern_program(0);
+    const auto export_sidecar =
+        pie::metal::tests::empty_program_ptib_v2(export_bytes);
+    const auto import_sidecar =
+        pie::metal::tests::empty_program_ptib_v2(import_bytes);
     PieProgramDesc export_program{};
     export_program.abi_version = PIE_DRIVER_ABI_VERSION;
     export_program.program_hash = 0x2001;
@@ -1024,11 +1085,19 @@ int main() {
         .ptr = export_bytes.data(),
         .len = export_bytes.size(),
     };
+    export_program.sidecar_bytes = {
+        .ptr = export_sidecar.data(),
+        .len = export_sidecar.size(),
+    };
     PieProgramDesc import_program = export_program;
     import_program.program_hash = 0x2002;
     import_program.canonical_bytes = {
         .ptr = import_bytes.data(),
         .len = import_bytes.size(),
+    };
+    import_program.sidecar_bytes = {
+        .ptr = import_sidecar.data(),
+        .len = import_sidecar.size(),
     };
     std::uint64_t export_program_id = 0;
     std::uint64_t import_program_id = 0;

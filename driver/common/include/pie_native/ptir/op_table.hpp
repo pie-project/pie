@@ -11,8 +11,8 @@
 // `interface/sampling-ir/include/`, swap the include to that path (byte-identical,
 // so it is a no-op sync).
 //
-// This header adds the driver-side annotations echo's table does not carry:
-// per-op OpFamily / LaunchClass / ResultKind, which drive tier-0 launch-shape
+// This header adds the driver-side metadata echo's table does not carry:
+// per-op OpFamily / LaunchClass / ResultKind, which drive launch-shape
 // selection and tier-1 fusion cut points. Composite ops (softmax, gumbel, …) are
 // NOT container ops — the container carries their core-op expansion (echo's
 // `expand.rs`); we keep them as tier-1 fused-kernel forms at private tags 0xE0+.
@@ -42,7 +42,6 @@ inline constexpr bool dtype_is_float(DType d) { return d == DType::F32 || d == D
 inline constexpr bool dtype_is_int(DType d) { return d == DType::I32 || d == DType::U32; }
 
 // Op codes. Container ops take their byte from echo's ptir_abi.h constants;
-// composite (fusion-only, not-in-container) ops occupy the private 0xE0+ band.
 enum class OpCode : std::uint8_t {
     // map / element-wise
     Exp = PTIR_OP_EXP, Log = PTIR_OP_LOG, Neg = PTIR_OP_NEG, Recip = PTIR_OP_RECIP,
@@ -62,7 +61,8 @@ enum class OpCode : std::uint8_t {
     // shape
     Broadcast = PTIR_OP_BROADCAST, Reshape = PTIR_OP_RESHAPE, Transpose = PTIR_OP_TRANSPOSE,
     // order (sort_desc/top_k = 2 results value-first; pivot_threshold = bool mask)
-    SortDesc = PTIR_OP_SORT_DESC, TopK = PTIR_OP_TOP_K, PivotThreshold = PTIR_OP_PIVOT_THRESHOLD,
+    SortDesc = PTIR_OP_SORT_DESC, TopK = PTIR_OP_TOP_K,
+    PivotThreshold = PTIR_OP_PIVOT_THRESHOLD,
     // linear (library)
     Matmul = PTIR_OP_MATMUL,
     // index
@@ -71,17 +71,14 @@ enum class OpCode : std::uint8_t {
     Iota = PTIR_OP_IOTA,
     // sampling primitives
     MaskApplyPacked = PTIR_OP_MASK_APPLY_PACKED,
+    CausalMask = PTIR_OP_CAUSAL_MASK,
+    SlidingWindowMask = PTIR_OP_SLIDING_WINDOW_MASK,
+    SinkWindowMask = PTIR_OP_SINK_WINDOW_MASK,
     Rng = PTIR_OP_RNG, RngKeyed = PTIR_OP_RNG_KEYED,
     // structural (container roots/effects; translated by the reader, not launched)
     Const = PTIR_OP_CONST,
     ChanTake = PTIR_OP_CHAN_TAKE, ChanRead = PTIR_OP_CHAN_READ, ChanPut = PTIR_OP_CHAN_PUT,
     IntrinsicVal = PTIR_OP_INTRINSIC_VAL, KernelCall = PTIR_OP_KERNEL_CALL, SinkCall = PTIR_OP_SINK_CALL,
-
-    // ── composite / fusion-only (NOT container ops; core-op expansions, §7.3) ──
-    Softmax = 0xE0, LogSoftmax = 0xE1, L2Norm = 0xE2,
-    GumbelNoise = 0xE3,     // gumbel = -log(-log(rng_uniform))
-    MaskApplyBool = 0xE4,   // unpacked bool mask variant of mask_apply
-    RankLe = 0xE5,          // the rank predicate pivot_threshold cuts at, as a bool op
 };
 
 enum class OpFamily : std::uint8_t {
@@ -158,6 +155,9 @@ inline constexpr OpInfo op_info(OpCode c) {
         case OpCode::Iota:       return {c, F::Index, L::Elementwise, R::Index,   0, 1, "iota"};
 
         case OpCode::MaskApplyPacked: return {c, F::Sampling, L::Elementwise, R::SameAsInput, 2, 1, "mask_apply_packed"};
+        case OpCode::CausalMask: return {c, F::Index, L::Elementwise, R::Bool, 1, 1, "causal_mask"};
+        case OpCode::SlidingWindowMask: return {c, F::Index, L::Elementwise, R::Bool, 1, 1, "sliding_window_mask"};
+        case OpCode::SinkWindowMask: return {c, F::Index, L::Elementwise, R::Bool, 1, 1, "sink_window_mask"};
         case OpCode::Rng:      return {c, F::Sampling, L::Elementwise, R::SameAsInput, 0, 1, "rng"};
         case OpCode::RngKeyed: return {c, F::Sampling, L::Elementwise, R::SameAsInput, 1, 1, "rng_keyed"};
 
@@ -168,13 +168,6 @@ inline constexpr OpInfo op_info(OpCode c) {
         case OpCode::IntrinsicVal: return {c, F::Structural, L::Structural, R::Custom,      0, 1, "intrinsic_val"};
         case OpCode::KernelCall:   return {c, F::Structural, L::Structural, R::Custom,   0xFE, 1, "kernel_call"};
         case OpCode::SinkCall:     return {c, F::Structural, L::Structural, R::None,     0xFE, 0, "sink_call"};
-
-        case OpCode::Softmax:       return {c, F::Sampling, L::RowLocal,    R::SameAsInput, 1, 1, "softmax"};
-        case OpCode::LogSoftmax:    return {c, F::Sampling, L::RowLocal,    R::SameAsInput, 1, 1, "log_softmax"};
-        case OpCode::L2Norm:        return {c, F::Sampling, L::RowLocal,    R::SameAsInput, 1, 1, "l2norm"};
-        case OpCode::GumbelNoise:   return {c, F::Sampling, L::Elementwise, R::SameAsInput, 1, 1, "gumbel"};
-        case OpCode::MaskApplyBool: return {c, F::Sampling, L::Elementwise, R::SameAsInput, 2, 1, "mask_apply"};
-        case OpCode::RankLe:        return {c, F::Order,    L::RowLocal,    R::Bool,        1, 1, "rank_le"};
     }
     return {c, OpFamily::Map, LaunchClass::Alias, ResultKind::Custom, 0xFF, 1, "?"};
 }

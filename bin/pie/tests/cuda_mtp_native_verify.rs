@@ -116,3 +116,63 @@ async fn mtp_logits_value_verify() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the RTX 4090; PIE_MTP_DRAFT_TOKENS=0 checks an MTP model with \
+            drafting disabled, any positive value checks a model with no MTP head"]
+async fn mtp_logits_capability_false() -> Result<()> {
+    common::init_trace();
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ok = Command::new("cargo")
+        .args([
+            "build",
+            "--target",
+            "wasm32-wasip2",
+            "-p",
+            "mtp-native-verify",
+        ])
+        .current_dir(&ws)
+        .status()?
+        .success();
+    anyhow::ensure!(ok, "wasm build failed for mtp-native-verify");
+
+    let drafts_disabled = std::env::var("PIE_MTP_DRAFT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        == Some(0);
+    let pie = if drafts_disabled {
+        common::boot_4090_mtp().await?
+    } else {
+        common::boot_4090().await?
+    };
+    let endpoint = format!("ws://{}/v1/ws", pie.listen_addr);
+    let setup = Client::connect_with_identity(&endpoint, "test-user")
+        .await
+        .context("connect setup")?;
+    setup.authenticate("test-user", &None).await?;
+    setup
+        .add_program(
+            &ws.join("target/wasm32-wasip2/debug/mtp_native_verify.wasm"),
+            &ws.join("mtp-native-verify/Pie.toml"),
+            true,
+        )
+        .await?;
+    drop(setup);
+
+    let client = Client::connect_with_identity(&endpoint, "test-user").await?;
+    client.authenticate("test-user", &None).await?;
+    let mut process = client
+        .launch_process("mtp-native-verify@0.1.0".to_string(), "4".to_string(), true)
+        .await?;
+    let error = process
+        .wait_for_return()
+        .await
+        .expect_err("MtpLogits registration must be rejected");
+    let detail = format!("{error:#}");
+    pie.shutdown().await;
+    anyhow::ensure!(
+        detail.contains("model-gated intrinsic mtp_logits unavailable"),
+        "unexpected MtpLogits rejection: {detail}"
+    );
+    Ok(())
+}

@@ -9,13 +9,13 @@
 //!
 //! A `Channel` may attach to only ONE `ForwardPass` for its lifetime
 //! (`forward-pass.new` errs "may attach to only one pass" on a second bind),
-//! so each kind gets its OWN fresh `tok_in`/`pos`/`klen`/`fill`/`out`/`rng`
+//! so each kind gets its OWN fresh `tok_in`/`out`/`rng`
 //! channels and its own fresh `ForwardPass` — never shared with another
 //! kind's pass. The handoff between kinds rides the host (the same seam as
 //! the prefill→decode handoff): read the previous kind's last token + the
 //! running absolute position off the host, then seed the next kind's fresh
-//! channels from those values (`tok_in = [last_tok]`, `pos = [n+count-1]`,
-//! `klen = fill = [n+count]`) — exactly the values the ORIGINAL prefill→decode
+//! pass from those values (`tok_in = [last_tok]`, KvLen rooted at
+//! `n+count`) — exactly the values the original prefill→decode
 //! seed used with `count = 1`.
 //!
 //! Each kind's device mask + Gumbel-max sample is built directly from the
@@ -43,10 +43,6 @@ enum Kind {
     TopP { p: f32 },
     MinP { p: f32 },
     TopKTopP { k: u32, p: f32 },
-}
-
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
 }
 
 /// This kind's keep-mask over `scaled` (temperature-scaled logits), `[vocab]` bool.
@@ -84,7 +80,7 @@ fn sample(kind: Kind, scaled: Tensor, vocab: u32, r: impl AsTensor) -> Tensor {
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     model::configure(vocab, ws.page_size(), 1);
 
     let samplers: [(&str, Kind); 4] = [
@@ -99,18 +95,23 @@ async fn main(_input: String) -> Result<String> {
     let prompt = wit_model::encode("hello world");
     let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
     let n = prompt.len() as u32;
+    let max_pages = (n + (samplers.len() * STEPS_PER_KIND) as u32 + 1).div_ceil(ws.page_size());
+    ws.reserve(max_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
 
     // ── PREFILL FIRE (N-wide) — the first kind's first token. ──
     let (_, kind0) = samplers[0];
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = bx(Channel::from(prompt_i32).named("toks_p"));
-    let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
-    let rng_p = bx(Channel::from(vec![0x9e37_u32, 0]).named("rng_p"));
-    let g0_ch = bx(Channel::new([1], dtype::i32).named("g0"));
+    let toks_p = Channel::from(prompt_i32).named("toks_p");
+    let rng_p = Channel::from(vec![0x9e37_u32, 0]).named("rng_p");
+    let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
-    let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd_p.embed(toks_p, Tensor::constant(vec![0u32, n]));
-    fwd_p.attn_working_set(ws, klen_p);
+    let fwd_p = ForwardPass::new();
+    fwd_p.embed(&toks_p, Tensor::constant(vec![0u32, n]));
+    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    fwd_p.port_channel(Port::KvLen, &kv_len_p);
+    fwd_p.attn_working_set(&ws, .., ..)?;
+    fwd_p.derive_dense_geometry();
     fwd_p.epilogue(move || {
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
         let scaled = div(intrinsics::logits(), TEMPERATURE);
@@ -119,19 +120,21 @@ async fn main(_input: String) -> Result<String> {
         g0_ch.put(&t);
         rng_p.put(&r_next);
     });
-    let prefill = Pipeline::new();
+    // ONE pipeline for the whole stream (R4-4): the prefill and every kind's
+    // decode fires continue the SAME growing context, so they all submit here.
+    let pipeline = Pipeline::new();
     fwd_p
-        .submit(&prefill)
+        .submit(&pipeline)
         .map_err(|e| format!("prefill submit: {e}"))?;
     let g0 = g0_ch
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("g0 take: {e}"))?[0];
-    prefill.close();
 
     // `count` = total tokens generated so far (across every kind), INCLUDING
     // `last_tok`; the next fire embeds `last_tok` at absolute position
-    // `n+count-1` and writes `klen = n+count` — the same seed the original
+    // `n+count-1` — the same seed the original
     // prefill→decode handoff uses with `count == 1`.
     let mut last_tok = g0;
     let mut count: u32 = 1;
@@ -148,47 +151,48 @@ async fn main(_input: String) -> Result<String> {
         if steps > 0 {
             // Fresh channels + a fresh ForwardPass for EVERY kind: a Channel
             // may attach to only one pass for its lifetime, so the previous
-            // kind's `tok_in`/`pos`/`klen`/`fill`/`rng`/`out` can never be
+            // kind's `tok_in`/`rng`/`out` can never be
             // reused here. Seeded from the running host-tracked
             // `(last_tok, count)` — the handoff rides the host, exactly like
-            // the prefill→decode seam.
-            let tok_in = bx(Channel::from(vec![last_tok; 1]).named("tok_in"));
-            let pos = bx(Channel::from(vec![n + count - 1; 1]).named("pos"));
-            let klen = bx(Channel::from(vec![n + count; 1]).named("klen"));
-            let fill = bx(Channel::from(vec![n + count; 1]).named("fill"));
-            let rng = bx(Channel::from(vec![0x51ed_u32 ^ (i as u32), 0]).named("rng"));
-            let out = bx(Channel::new([1], dtype::i32).named("out"));
+            // the prefill→decode seam. KvLen starts after this kind's first
+            // write and advances by one per fire.
+            let tok_in = Channel::from(vec![last_tok; 1]).named("tok_in");
+            let rng = Channel::from(vec![0x51ed_u32 ^ (i as u32), 0]).named("rng");
+            let out = Channel::new([1], dtype::i32).named("out");
             let lane1 = Tensor::constant(vec![0u32, 1u32]);
 
-            let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-            fwd.embed(tok_in, lane1);
-            fwd.positions(pos);
-            fwd.attn_working_set(ws, klen);
+            let fwd = ForwardPass::new();
+            fwd.embed(&tok_in, lane1);
+            let kv_len = Channel::from(vec![n + count]).named("kv_len");
+            fwd.port_channel(Port::KvLen, &kv_len);
+            fwd.attn_working_set(&ws, .., ((n + count - 1) / ws.page_size())..)?;
+            fwd.derive_dense_geometry();
             fwd.epilogue(move || {
-                let base = fill.take().tensor(); // [1] u32
+                let length = kv_len.take().tensor();
                 let r = rng.take(); // [2] u32 rng state
                 let scaled = div(intrinsics::logits(), TEMPERATURE);
                 let t = sample(kind, scaled, vocab, &r);
 
-                let klen_v = add(&base, 1u32);
-                let next_free = add(&base, 1u32);
                 let r_next = add(&r, iota(2));
 
                 tok_in.put(&t);
+                kv_len.put(add(&length, 1u32));
                 out.put(&t);
-                pos.put(&base);
-                klen.put(&klen_v);
-                fill.put(&next_free);
                 rng.put(&r_next);
             });
 
-            let pipeline = Pipeline::new();
+            // Fixed budget: the last kind's last step is knowably the
+            // stream's last submit, so finish() (F7) lands right after it.
             for step in 0..steps {
                 fwd.submit(&pipeline)
                     .map_err(|e| format!("{name} submit @{step}: {e}"))?;
+                if i + 1 == samplers.len() && step + 1 == steps {
+                    pipeline.finish();
+                }
                 let t = out
                     .take()
                     .get::<i32>()
+                    .await
                     .map_err(|e| format!("{name} out.take @{step}: {e}"))?;
                 let Some(&t0) = t.first() else {
                     return Err(format!("{name} out.take @{step}: empty tensor"));
@@ -197,7 +201,6 @@ async fn main(_input: String) -> Result<String> {
                 last_tok = t0;
                 count += 1;
             }
-            pipeline.close();
         }
 
         eprintln!("[MULTISAMP] {name} tokens: {got:?}");

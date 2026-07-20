@@ -27,7 +27,7 @@
 //! here; this inferlet exercises the steady-state append + mask-out path only.
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 const B: u32 = 2; // beams
 const PAGE_T: u32 = 16; // tokens per pool page
@@ -36,10 +36,6 @@ const POOL: u32 = POOL_PAGES * PAGE_T; // flat pool token positions
 const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
 const BOS: i32 = 1;
 const MAX_STEPS: usize = 8;
-
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
@@ -51,35 +47,35 @@ async fn main(_input: String) -> Result<String> {
     // slots ONCE (bulk pool growth) and use their PHYSICAL ids for the Pages
     // port and the WSlot write descriptor. The flat pool position `wpos` maps to
     // physical page `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let pool = ws.reserve(POOL_PAGES).map_err(|e| format!("ws.reserve pool: {e}"))?;
-    let pool_ids: &'static Vec<u32> = bx(pool.ids().to_vec()); // [POOL_PAGES] physical
+    let ws = WorkingSet::new();
+    let pool = ws
+        .reserve(POOL_PAGES)
+        .map_err(|e| format!("ws.reserve pool: {e}"))?;
+    let pool_ids = pool.ids().to_vec(); // [POOL_PAGES] physical
     let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect(); // [B*POOL_PAGES]
     let phys0 = pool_ids[0]; // physical page holding the shared prefix (pos 0)
 
     // Shared BOS prompt at pool position 0: both beams attend it (mask), and the
     // fire-0 write descriptor lands both BOS at (page pool_ids[0], off 0) — the
     // shared prefix cell. fill = 1 (position 0 filled).
-    let init_mask: Vec<bool> = (0..B)
-        .flat_map(|_| (0..POOL).map(|p| p == 0))
-        .collect();
+    let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..POOL).map(|p| p == 0)).collect();
 
     // Loop-carried state (guest-seeded). w_slot/pages carry PHYSICAL page ids.
-    let mask = bx(Channel::from_shaped([B, POOL], init_mask).named("mask")); // [B, POOL] bool
-    let scores = bx(Channel::from(vec![0.0f32; B as usize]).named("scores"));
-    let toks = bx(Channel::from(vec![BOS; B as usize]).named("toks"));
-    let pos = bx(Channel::from(vec![0u32; B as usize]).named("pos"));
-    let fill = bx(Channel::from(vec![1u32; 1]).named("fill")); // next free flat position
-    let klen = bx(Channel::from(vec![1u32; B as usize]).named("klen"));
-    let w_slot = bx(Channel::from(vec![phys0; B as usize]).named("w_slot")); // physical page id
-    let w_off = bx(Channel::from(vec![0u32; B as usize]).named("w_off"));
-    let pages = bx(Channel::from(tiled.clone()).named("pages")); // [B*POOL_PAGES] physical, const
+    let mask = Channel::from_shaped([B, POOL], init_mask).named("mask"); // [B, POOL] bool
+    let scores = Channel::from(vec![0.0f32; B as usize]).named("scores");
+    let toks = Channel::from(vec![BOS; B as usize]).named("toks");
+    let pos = Channel::from(vec![0u32; B as usize]).named("pos");
+    let fill = Channel::from(vec![1u32; 1]).named("fill"); // next free flat position
+    let klen = Channel::from(vec![1u32; B as usize]).named("klen");
+    let w_slot = Channel::from(vec![phys0; B as usize]).named("w_slot"); // physical page id
+    let w_off = Channel::from(vec![0u32; B as usize]).named("w_off");
+    let pages = Channel::from(tiled.clone()).named("pages"); // [B*POOL_PAGES] physical, const
     // Physical pool ids [POOL_PAGES], host-fed each fire, gathered in-graph to
     // map a flat pool-page index → physical page id for the write descriptor.
-    let pool_ids_ch = bx(Channel::new([POOL_PAGES], dtype::u32).named("pool_ids"));
-    let out = bx(Channel::new([B], dtype::i32).named("out"));
-    let out_par = bx(Channel::new([B], dtype::u32).named("out_par"));
-    let out_scr = bx(Channel::new([B], dtype::f32).named("out_scr"));
+    let pool_ids_ch = Channel::new([POOL_PAGES], dtype::u32).named("pool_ids");
+    let out = Channel::new([B], dtype::i32).named("out");
+    let out_par = Channel::new([B], dtype::u32).named("out_par");
+    let out_scr = Channel::new([B], dtype::f32).named("out_scr");
 
     // Constant pool geometry: page_indptr = [0, POOL_PAGES, 2*POOL_PAGES] (each
     // beam references all pool pages). Bound via a CHANNEL (not the sugar's const
@@ -91,21 +87,23 @@ async fn main(_input: String) -> Result<String> {
     // the same constant) keeps every descriptor port channel-bound (the
     // device-geometry-fire wire-form).
     let pidx_const: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
-    let page_indptr = bx(Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr"));
+    let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
     let lanes_b = Tensor::constant((0u32..=B).collect::<Vec<_>>());
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(toks, lanes_b);
-    fwd.positions(pos);
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, lanes_b);
+    fwd.positions(&pos);
     // All descriptor ports channel-bound (device-geometry fire wire-form):
     // Pages ← pages, PageIndptr ← page_indptr, KvLen ← klen, WSlot/WOff ← the
     // explicit write descriptor. The pool is fixed so these carry constant values.
-    fwd.attn_working_set(ws, klen);
-    fwd.port_channel(Port::Pages, pages);
-    fwd.port_channel(Port::PageIndptr, page_indptr);
-    fwd.port_channel(Port::WSlot, w_slot);
-    fwd.port_channel(Port::WOff, w_off);
-    fwd.attn_mask(mask);
+    fwd.port_channel(Port::KvLen, &klen);
+    fwd.attn_working_set(&ws, .., ..)?;
+    fwd.derive_dense_geometry();
+    fwd.port_channel(Port::Pages, &pages);
+    fwd.port_channel(Port::PageIndptr, &page_indptr);
+    fwd.port_channel(Port::WSlot, &w_slot);
+    fwd.port_channel(Port::WOff, &w_off);
+    fwd.attn_mask(&mask);
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block.
         let cand = add(
@@ -142,6 +140,7 @@ async fn main(_input: String) -> Result<String> {
 
         // physical KV span after this step's appends (mask restricts attention).
         let filled = add(&base, B); // [1]
+        klen.take();
         klen.put(broadcast(reshape(&filled, [1]), [B]));
 
         pos.put(add(pos.take(), 1u32));
@@ -155,10 +154,14 @@ async fn main(_input: String) -> Result<String> {
             broadcast(reshape(&pids, [1, POOL_PAGES]), [B, POOL_PAGES]),
             [B * POOL_PAGES],
         );
+        pages.take();
         pages.put(&pages_ig);
         // Re-emit the constant page_indptr each fire (channel-bound; peeked ports
         // still want a fresh value each pass). [0, POOL_PAGES, 2*POOL_PAGES].
-        page_indptr.put(&Tensor::constant((0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>()));
+        page_indptr.take();
+        page_indptr.put(&Tensor::constant(
+            (0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>(),
+        ));
 
         out.put(&tok_i);
         out_par.put(&parent);
@@ -172,10 +175,23 @@ async fn main(_input: String) -> Result<String> {
     let mut hyp_tokens: Vec<u32> = Vec::new();
     for step in 0..MAX_STEPS {
         pool_ids_ch.put(pool_ids.clone());
-        fwd.submit(&pipeline).map_err(|e| format!("submit @{step}: {e}"))?;
-        let picked = out.take().get::<i32>().map_err(|e| format!("out.take @{step}: {e}"))?;
-        let _parents = out_par.take().get::<u32>().map_err(|e| format!("out_par.take @{step}: {e}"))?;
-        let _scr = out_scr.take().get::<f32>().map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+        fwd.submit(&pipeline)
+            .map_err(|e| format!("submit @{step}: {e}"))?;
+        let picked = out
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("out.take @{step}: {e}"))?;
+        let _parents = out_par
+            .take()
+            .get::<u32>()
+            .await
+            .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+        let _scr = out_scr
+            .take()
+            .get::<f32>()
+            .await
+            .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);
         }

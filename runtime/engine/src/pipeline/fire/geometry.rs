@@ -24,7 +24,323 @@
 #![allow(dead_code)]
 
 use pie_ptir::container::{PortSource, TraceContainer};
+use pie_ptir::op::Op;
 use pie_ptir::registry::Port;
+use pie_ptir::types::DType;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodeEnvelope {
+    pub token_count: u32,
+    pub lane_count: u32,
+    pub token_indptr: Vec<u32>,
+    pub loop_carried: bool,
+    /// `Positions` binds a channel (device-carried) rather than a const —
+    /// executing the class demands the positions device port.
+    pub device_positions: bool,
+    /// `AttnMask` binds a channel (dense device-carried bool mask) —
+    /// executing the class demands the mask descriptor port, and the fire
+    /// is marked mask-carrying so the scheduler keeps it solo.
+    pub has_mask: bool,
+}
+
+impl DecodeEnvelope {
+    pub fn template(&self, container: &TraceContainer) -> Result<ReqGeometry, GeometryError> {
+        let token_count = self.token_count;
+        let qo_indptr = match const_port(container, Port::EmbedIndptr) {
+            Some(bytes) => as_u32(Port::EmbedIndptr, bytes)?,
+            None => vec![0, token_count],
+        };
+        let position_ids = match const_port(container, Port::Positions) {
+            Some(bytes) => as_u32(Port::Positions, bytes)?,
+            None => vec![0; token_count as usize],
+        };
+        let readout = match const_port(container, Port::Readout) {
+            Some(bytes) => as_u32(Port::Readout, bytes)?,
+            None => qo_indptr
+                .windows(2)
+                .map(|lane| lane[1].saturating_sub(1))
+                .collect(),
+        };
+        let mut sampling_indices = Vec::with_capacity(readout.len());
+        let mut sampling_indptr = Vec::with_capacity(qo_indptr.len());
+        sampling_indptr.push(0);
+        for lane in qo_indptr.windows(2) {
+            for &index in &readout {
+                if index >= lane[0] && index < lane[1] {
+                    sampling_indices.push(index - lane[0]);
+                }
+            }
+            sampling_indptr.push(sampling_indices.len() as u32);
+        }
+        if sampling_indices.len() != readout.len() {
+            return Err(GeometryError::BadCsr {
+                port: Port::Readout,
+            });
+        }
+        Ok(ReqGeometry {
+            token_ids: vec![0; token_count as usize],
+            position_ids,
+            qo_indptr,
+            sampling_indptr,
+            sampling_indices,
+            ..ReqGeometry::default()
+        })
+    }
+}
+
+/// Pure shape classification of the decode-envelope family. Capability is
+/// the CALLER's decision: a shape match on a driver without the device
+/// geometry ports falls back to host-evaluated (serialized) execution
+/// rather than erroring — derivability decides class, the driver's port
+/// mask only decides where the class executes.
+pub fn classify_decode_envelope(
+    container: &TraceContainer,
+) -> Result<Option<DecodeEnvelope>, String> {
+    if !container.externs.is_empty() {
+        return Ok(None);
+    }
+    let channel_for = |port| {
+        container
+            .ports
+            .iter()
+            .find_map(|binding| (binding.port == port).then_some(&binding.source))
+    };
+    let channel_index = |port| match channel_for(port) {
+        Some(PortSource::Channel(channel)) => Some(*channel as usize),
+        _ => None,
+    };
+    let Some(token_channel) = channel_index(Port::EmbedTokens) else {
+        return Ok(None);
+    };
+    let Some(kv_len_channel) = channel_index(Port::KvLen) else {
+        return Ok(None);
+    };
+    let puts_channel = |channel: usize| {
+        container.stages.iter().any(|stage| {
+            stage
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::ChanPut { chan, .. } if *chan as usize == channel))
+        })
+    };
+    let loop_carried = puts_channel(token_channel);
+    let token = container
+        .channels
+        .get(token_channel)
+        .ok_or_else(|| "decode envelope token channel is out of range".to_string())?;
+    let kv_len = container
+        .channels
+        .get(kv_len_channel)
+        .ok_or_else(|| "decode envelope KV-length channel is out of range".to_string())?;
+    if (!token.seeded && !loop_carried) || !puts_channel(kv_len_channel) {
+        return Ok(None);
+    }
+    for port in [
+        Port::Positions,
+        Port::Pages,
+        Port::PageIndptr,
+        Port::WSlot,
+        Port::WOff,
+    ] {
+        if channel_for(port).is_none() {
+            return Ok(None);
+        }
+    }
+    let token_dims = token.shape.dims();
+    if token_dims.len() != 1
+        || token_dims[0] == 0
+        || !matches!(
+            token.dtype,
+            pie_ptir::container::ChanDType::Concrete(DType::I32)
+                | pie_ptir::container::ChanDType::Concrete(DType::U32)
+        )
+    {
+        return Err("decode envelope tokens must be a non-empty i32/u32 vector".to_string());
+    }
+    let token_count = token_dims[0];
+    let qo_indptr = match channel_for(Port::EmbedIndptr) {
+        None => vec![0, token_count],
+        Some(PortSource::Const { dtype, shape, data })
+            if *dtype == DType::U32 && shape.dims().len() == 1 =>
+        {
+            if data.len() % 4 != 0 {
+                return Err("decode envelope EmbedIndptr has a partial u32".to_string());
+            }
+            data.chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect()
+        }
+        Some(_) => {
+            return Err("decode envelope EmbedIndptr must be trace-constant".to_string());
+        }
+    };
+    if qo_indptr.len() < 2
+        || qo_indptr[0] != 0
+        || qo_indptr.last().copied() != Some(token_count)
+        || qo_indptr.windows(2).any(|pair| pair[1] != pair[0] + 1)
+    {
+        return Err("decode envelope EmbedIndptr must declare one token per lane".to_string());
+    }
+    let lane_count = (qo_indptr.len() - 1) as u32;
+    if kv_len.shape.dims() != [lane_count]
+        || !matches!(
+            kv_len.dtype,
+            pie_ptir::container::ChanDType::Concrete(DType::U32)
+        )
+    {
+        return Err(format!(
+            "decode envelope KV length must be a [{lane_count}] u32 vector"
+        ));
+    }
+
+    let mut device_positions = false;
+    let mut has_mask = false;
+    for binding in &container.ports {
+        match (&binding.port, &binding.source) {
+            (Port::EmbedTokens | Port::KvLen, PortSource::Channel(_)) => {}
+            (Port::EmbedIndptr, PortSource::Const { dtype, shape, data })
+                if *dtype == DType::U32
+                    && shape.dims() == [lane_count + 1]
+                    && data.len() == (lane_count as usize + 1) * 4 => {}
+            (Port::Positions, PortSource::Const { dtype, shape, .. })
+                if *dtype == DType::U32 && shape.dims() == [token_count] => {}
+            (Port::Readout, PortSource::Const { dtype, shape, data })
+                if *dtype == DType::U32
+                    && shape.dims().len() == 1
+                    && data.len() == shape.dims()[0] as usize * 4
+                    && data.chunks_exact(4).all(|bytes| {
+                        u32::from_le_bytes(bytes.try_into().unwrap()) < token_count
+                    }) => {}
+            (Port::PageIndptr, PortSource::Const { dtype, shape, data })
+                if *dtype == DType::U32
+                    && shape.dims() == [lane_count + 1]
+                    && data.len() == (lane_count as usize + 1) * 4 => {}
+            (Port::Positions, PortSource::Channel(channel)) => {
+                device_positions = true;
+                let declaration = container.channels.get(*channel as usize).ok_or_else(|| {
+                    "decode envelope position channel is out of range".to_string()
+                })?;
+                if declaration.shape.dims() != [token_count]
+                    || !matches!(
+                        declaration.dtype,
+                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                    )
+                {
+                    return Err(format!(
+                        "device-carried positions must be a [{token_count}] u32 vector"
+                    ));
+                }
+            }
+            (Port::Pages, PortSource::Channel(channel)) => {
+                let declaration = container
+                    .channels
+                    .get(*channel as usize)
+                    .ok_or_else(|| "decode envelope pages channel is out of range".to_string())?;
+                if declaration.shape.dims().len() != 2
+                    || declaration.shape.dims()[0] != lane_count
+                    || declaration.shape.dims()[1] == 0
+                    || !matches!(
+                        declaration.dtype,
+                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                    )
+                {
+                    return Err(
+                        "device pages must be a non-empty [lanes,pages] u32 matrix".to_string()
+                    );
+                }
+            }
+            (Port::PageIndptr, PortSource::Channel(channel)) => {
+                let declaration = container.channels.get(*channel as usize).ok_or_else(|| {
+                    "decode envelope page-indptr channel is out of range".to_string()
+                })?;
+                if declaration.shape.dims() != [lane_count + 1]
+                    || !matches!(
+                        declaration.dtype,
+                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                    )
+                {
+                    return Err("device PageIndptr must be a [lanes+1] u32 vector".to_string());
+                }
+            }
+            (Port::WSlot | Port::WOff, PortSource::Channel(channel)) => {
+                let declaration = container
+                    .channels
+                    .get(*channel as usize)
+                    .ok_or_else(|| "decode envelope write channel is out of range".to_string())?;
+                if declaration.shape.dims() != [token_count]
+                    || !matches!(
+                        declaration.dtype,
+                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                    )
+                {
+                    return Err("device WSlot/WOff must be a [tokens] u32 vector".to_string());
+                }
+            }
+            (Port::AttnMask, PortSource::Channel(channel)) => {
+                // A dense device-carried mask: the driver resolves the bool
+                // cells pre-forward (sink/sliding-window decode). The shape's
+                // key extent evolves with the KV, so only the element type is
+                // checked here; the driver derives key_len from the cell.
+                has_mask = true;
+                let declaration = container
+                    .channels
+                    .get(*channel as usize)
+                    .ok_or_else(|| "decode envelope mask channel is out of range".to_string())?;
+                if !matches!(
+                    declaration.dtype,
+                    pie_ptir::container::ChanDType::Concrete(DType::Bool)
+                ) {
+                    return Err("device attention mask must be a bool channel".to_string());
+                }
+            }
+            (Port::AttnMask, _) => {
+                // A host-known (const) mask is wire territory: the host
+                // evaluator synthesizes per-row wire masks for it.
+                return Ok(None);
+            }
+            _ => {
+                return Err(format!(
+                    "decode envelope cannot resolve {:?} from this source",
+                    binding.port
+                ));
+            }
+        }
+    }
+    Ok(Some(DecodeEnvelope {
+        token_count,
+        lane_count,
+        token_indptr: qo_indptr,
+        loop_carried,
+        device_positions,
+        has_mask,
+    }))
+}
+
+/// The device geometry ports executing `envelope` as the DecodeEnvelope
+/// class demands of a driver.
+pub fn envelope_required_ports(envelope: &DecodeEnvelope) -> u32 {
+    let mut required =
+        pie_driver_abi::PIE_DEVICE_PORT_EMBED_TOKENS | pie_driver_abi::PIE_DEVICE_PORT_KV_LEN;
+    if envelope.device_positions {
+        required |= pie_driver_abi::PIE_DEVICE_PORT_POSITIONS;
+    }
+    if envelope.has_mask {
+        required |= pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK;
+    }
+    required
+}
+
+fn const_port(container: &TraceContainer, port: Port) -> Option<&[u8]> {
+    container.ports.iter().find_map(|binding| {
+        if binding.port != port {
+            return None;
+        }
+        match &binding.source {
+            PortSource::Const { data, .. } => Some(data.as_slice()),
+            PortSource::Channel(_) => None,
+        }
+    })
+}
 
 /// The forward geometry a PTIR pass contributes to a `LaunchPlan`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -54,6 +370,8 @@ pub enum GeometryError {
     MissingChannelValue { port: Port, channel: u32 },
     /// A port's byte payload isn't a whole number of `u32`s.
     BadPayload { port: Port, bytes: usize },
+    /// A trace-constant CSR does not partition its declared rows.
+    BadCsr { port: Port },
     /// No `embed_tokens` port — every pass embeds tokens (§5.1).
     NoEmbed,
 }
@@ -78,6 +396,239 @@ impl ReqGeometry {
 /// Per-channel values at fire time: `values[i]` is channel `i`'s current cell
 /// bytes (little-endian, per its dtype), or `None` if unfilled.
 pub type ChannelValues<'a> = &'a [Option<Vec<u8>>];
+
+/// An evaluated-geometry failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvaluatedGeometryError {
+    /// A required port's value chain passes through device-only state.
+    NotDerivable { port: Port, blocker: String },
+    /// A derived value violates the wire contract (a real bug, loud).
+    BadValue { port: Port, reason: String },
+}
+
+impl std::fmt::Display for EvaluatedGeometryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EvaluatedGeometryError::NotDerivable { port, blocker } => {
+                write!(f, "{port:?} is not host-derivable: {blocker}")
+            }
+            EvaluatedGeometryError::BadValue { port, reason } => {
+                write!(f, "{port:?} evaluated to an invalid value: {reason}")
+            }
+        }
+    }
+}
+
+/// The declared dims of the channel or const a port binds.
+fn port_dims(container: &TraceContainer, port: Port) -> Option<Vec<u32>> {
+    let binding = container.ports.iter().find(|b| b.port == port)?;
+    match &binding.source {
+        PortSource::Const { shape, .. } => Some(shape.dims().to_vec()),
+        PortSource::Channel(chan) => Some(
+            container
+                .channels
+                .get(*chan as usize)?
+                .shape
+                .dims()
+                .to_vec(),
+        ),
+    }
+}
+
+/// Map a pass's descriptor ports to forward geometry by **evaluating** the
+/// geometry prologue over host-known channel values (`pie_ptir::pareval`) —
+/// the general form of [`map_geometry`], which reads only directly-present
+/// values and is its degenerate case. Returns the geometry plus every port's
+/// evaluated value (the canonical-KV gate verifies evidence against these).
+///
+/// A rank-2 `Pages` envelope (`[lanes, P]`, the SDK lowering) is compacted to
+/// the wire CSR by each lane's live page count from `PageIndptr`, mirroring
+/// the driver's descriptor resolution; rank-1 pages pass through flat.
+pub fn map_geometry_evaluated(
+    bound: &pie_ptir::validate::BoundTrace,
+    known: &mut dyn FnMut(u32) -> Option<pie_ptir::interp::Value>,
+    page_size: u32,
+) -> Result<
+    (
+        ReqGeometry,
+        Vec<(Port, Result<pie_ptir::interp::Value, String>)>,
+    ),
+    EvaluatedGeometryError,
+> {
+    use pie_ptir::interp::Value;
+
+    let container = &bound.container;
+    let ports = pie_ptir::pareval::eval_descriptor_ports(bound, known).map_err(|blocker| {
+        EvaluatedGeometryError::BadValue {
+            port: Port::EmbedTokens,
+            reason: blocker.to_string(),
+        }
+    })?;
+    let port_value = |port: Port| -> Option<Result<Value, String>> {
+        ports.iter().find_map(|(p, slot)| {
+            (*p == port).then(|| slot.clone().map_err(|blocker| blocker.to_string()))
+        })
+    };
+    let required_u32 = |port: Port| -> Result<Vec<u32>, EvaluatedGeometryError> {
+        match port_value(port) {
+            Some(Ok(value)) => Ok(value_as_u32(&value)),
+            Some(Err(blocker)) => Err(EvaluatedGeometryError::NotDerivable { port, blocker }),
+            None => Err(EvaluatedGeometryError::BadValue {
+                port,
+                reason: "port is not bound".to_string(),
+            }),
+        }
+    };
+    let optional_u32 = |port: Port| -> Result<Option<Vec<u32>>, EvaluatedGeometryError> {
+        match port_value(port) {
+            Some(Ok(value)) => Ok(Some(value_as_u32(&value))),
+            Some(Err(blocker)) => Err(EvaluatedGeometryError::NotDerivable { port, blocker }),
+            None => Ok(None),
+        }
+    };
+
+    let mut g = ReqGeometry::default();
+    g.token_ids = required_u32(Port::EmbedTokens)?;
+    let nnz = g.token_ids.len() as u32;
+
+    g.qo_indptr = optional_u32(Port::EmbedIndptr)?.unwrap_or_else(|| vec![0, nnz]);
+
+    let kv_len = required_u32(Port::KvLen)?;
+    let lanes = g.qo_indptr.len().saturating_sub(1);
+    let (default_positions, default_pages, default_page_indptr) =
+        dense_defaults(&g.qo_indptr, &kv_len, nnz, page_size).map_err(|reason| {
+            EvaluatedGeometryError::BadValue {
+                port: Port::KvLen,
+                reason,
+            }
+        })?;
+    g.position_ids = optional_u32(Port::Positions)?.unwrap_or(default_positions);
+
+    // Read-out rows distribute over lanes as LANE-RELATIVE indices (the
+    // multi-row wire contract; identical to the envelope template). Absent
+    // readout samples each lane's last row.
+    let readout = match optional_u32(Port::Readout)? {
+        Some(readout) => readout,
+        None => g
+            .qo_indptr
+            .windows(2)
+            .map(|lane| lane[1].saturating_sub(1))
+            .collect(),
+    };
+    let mut sampling_indices = Vec::with_capacity(readout.len());
+    let mut sampling_indptr = Vec::with_capacity(g.qo_indptr.len());
+    sampling_indptr.push(0);
+    for lane in g.qo_indptr.windows(2) {
+        for &index in &readout {
+            if index >= lane[0] && index < lane[1] {
+                sampling_indices.push(index - lane[0]);
+            }
+        }
+        sampling_indptr.push(sampling_indices.len() as u32);
+    }
+    if sampling_indices.len() != readout.len() {
+        return Err(EvaluatedGeometryError::BadValue {
+            port: Port::Readout,
+            reason: "read-out rows do not partition into the lane CSR".to_string(),
+        });
+    }
+    g.sampling_indices = sampling_indices;
+    g.sampling_indptr = sampling_indptr;
+
+    let pages = optional_u32(Port::Pages)?;
+    let page_indptr = optional_u32(Port::PageIndptr)?;
+    match (pages, page_indptr) {
+        (Some(pages), Some(indptr)) => {
+            g.kv_page_indices =
+                compact_page_envelope(container, pages, &indptr).map_err(|reason| {
+                    EvaluatedGeometryError::BadValue {
+                        port: Port::Pages,
+                        reason,
+                    }
+                })?;
+            g.kv_page_indptr = indptr;
+        }
+        (Some(pages), None) => {
+            g.kv_page_indices = compact_page_envelope(container, pages, &default_page_indptr)
+                .map_err(|reason| EvaluatedGeometryError::BadValue {
+                    port: Port::Pages,
+                    reason,
+                })?;
+            g.kv_page_indptr = default_page_indptr;
+        }
+        (None, Some(indptr)) => {
+            g.kv_page_indices = default_pages;
+            g.kv_page_indptr = indptr;
+        }
+        (None, None) => {
+            g.kv_page_indices = default_pages;
+            g.kv_page_indptr = default_page_indptr;
+        }
+    }
+    if kv_len.len() != lanes {
+        return Err(EvaluatedGeometryError::BadValue {
+            port: Port::KvLen,
+            reason: format!(
+                "expected one length for each of {lanes} lanes, got {}",
+                kv_len.len()
+            ),
+        });
+    }
+    g.kv_last_page_lens = kv_len
+        .iter()
+        .map(|&len| last_page_len(len, page_size))
+        .collect();
+
+    let evaluated = ports
+        .into_iter()
+        .map(|(port, slot)| (port, slot.map_err(|blocker| blocker.to_string())))
+        .collect();
+    Ok((g, evaluated))
+}
+
+/// Reinterpret an evaluated value's lanes as `u32` (i32 tokens bit-cast, the
+/// driver's `token_ids` convention; bool as 0/1).
+pub(crate) fn value_as_u32(value: &pie_ptir::interp::Value) -> Vec<u32> {
+    use pie_ptir::interp::Value;
+    match value {
+        Value::U32(v) => v.clone(),
+        Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
+        Value::F32(v) => v.iter().map(|&x| x as u32).collect(),
+        Value::Bool(v) => v.iter().map(|&b| b as u32).collect(),
+    }
+}
+
+/// Compact a `Pages` port value to the wire lane-page CSR: a rank-2
+/// `[lanes, P]` envelope (the SDK lowering) keeps each lane's live prefix per
+/// `page_indptr`'s counts, mirroring the driver's descriptor resolution;
+/// rank-1 pages are already flat and pass through.
+pub(crate) fn compact_page_envelope(
+    container: &TraceContainer,
+    pages: Vec<u32>,
+    page_indptr: &[u32],
+) -> Result<Vec<u32>, String> {
+    let dims = port_dims(container, Port::Pages).unwrap_or_default();
+    if dims.len() != 2 {
+        return Ok(pages);
+    }
+    let stride = dims[1] as usize;
+    let mut compact = Vec::new();
+    for (lane, window) in page_indptr.windows(2).enumerate() {
+        let count = window[1].saturating_sub(window[0]) as usize;
+        if count > stride {
+            return Err(format!(
+                "lane {lane} claims {count} live pages over a [{},{}] envelope",
+                dims[0], dims[1]
+            ));
+        }
+        let row = lane * stride;
+        if row + count > pages.len() {
+            return Err("page envelope is shorter than its lane CSR".to_string());
+        }
+        compact.extend_from_slice(&pages[row..row + count]);
+    }
+    Ok(compact)
+}
 
 /// Map a container's ports to the forward geometry (P2c-fire, pure).
 pub fn map_geometry(
@@ -128,9 +679,22 @@ fn map_geometry_impl(
     };
     let lanes = g.qo_indptr.len().saturating_sub(1);
 
+    let kv_len = match resolve_opt(container, values, Port::KvLen, relaxed)? {
+        Some(b) => Some(as_u32(Port::KvLen, &b)?),
+        None if relaxed => None,
+        None => return Err(GeometryError::BadCsr { port: Port::KvLen }),
+    };
+    let defaults = kv_len
+        .as_deref()
+        .map(|lengths| dense_defaults(&g.qo_indptr, lengths, nnz, page_size))
+        .transpose()
+        .map_err(|_| GeometryError::BadCsr { port: Port::KvLen })?;
     g.position_ids = match resolve_opt(container, values, Port::Positions, relaxed)? {
         Some(b) => as_u32(Port::Positions, &b)?,
-        None => (0..nnz).collect(), // append order (caller rebases by seq_len)
+        None => defaults
+            .as_ref()
+            .map(|(positions, _, _)| positions.clone())
+            .unwrap_or_default(),
     };
 
     // read-out: explicit positions, else the last token of each lane.
@@ -148,15 +712,36 @@ fn map_geometry_impl(
         }
     }
 
-    // -- KV family (port-provided; sugar arity leaves indices/indptr empty) --
-    if let Some(b) = resolve_opt(container, values, Port::Pages, relaxed)? {
-        g.kv_page_indices = as_u32(Port::Pages, &b)?;
+    let explicit_pages = resolve_opt(container, values, Port::Pages, relaxed)?
+        .map(|b| as_u32(Port::Pages, &b))
+        .transpose()?;
+    let explicit_indptr = resolve_opt(container, values, Port::PageIndptr, relaxed)?
+        .map(|b| as_u32(Port::PageIndptr, &b))
+        .transpose()?;
+    match (explicit_pages, explicit_indptr, defaults.as_ref()) {
+        (Some(pages), Some(indptr), _) => {
+            g.kv_page_indices = compact_page_envelope(container, pages, &indptr)
+                .map_err(|_| GeometryError::BadCsr { port: Port::Pages })?;
+            g.kv_page_indptr = indptr;
+        }
+        (Some(pages), None, Some((_, _, indptr))) => {
+            g.kv_page_indices = compact_page_envelope(container, pages, indptr)
+                .map_err(|_| GeometryError::BadCsr { port: Port::Pages })?;
+            g.kv_page_indptr = indptr.to_vec();
+        }
+        (None, Some(indptr), Some((_, pages, _))) => {
+            g.kv_page_indices = pages.clone();
+            g.kv_page_indptr = indptr;
+        }
+        (None, None, Some((_, pages, indptr))) => {
+            g.kv_page_indices = pages.clone();
+            g.kv_page_indptr = indptr.clone();
+        }
+        (Some(pages), None, None) => g.kv_page_indices = pages,
+        (None, Some(indptr), None) => g.kv_page_indptr = indptr,
+        (None, None, None) => {}
     }
-    if let Some(b) = resolve_opt(container, values, Port::PageIndptr, relaxed)? {
-        g.kv_page_indptr = as_u32(Port::PageIndptr, &b)?;
-    }
-    if let Some(b) = resolve_opt(container, values, Port::KvLen, relaxed)? {
-        let kv_len = as_u32(Port::KvLen, &b)?;
+    if let Some(kv_len) = kv_len {
         g.kv_last_page_lens = kv_len
             .iter()
             .map(|&len| last_page_len(len, page_size))
@@ -174,6 +759,50 @@ fn last_page_len(len: u32, page_size: u32) -> u32 {
     } else {
         ((len - 1) % page_size) + 1
     }
+}
+
+fn dense_defaults(
+    qo_indptr: &[u32],
+    kv_len: &[u32],
+    token_count: u32,
+    page_size: u32,
+) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>), String> {
+    if page_size == 0
+        || qo_indptr.len() != kv_len.len() + 1
+        || qo_indptr.first().copied() != Some(0)
+        || qo_indptr.last().copied() != Some(token_count)
+        || qo_indptr.windows(2).any(|lane| lane[1] < lane[0])
+        || qo_indptr
+            .windows(2)
+            .zip(kv_len)
+            .any(|(lane, &len)| lane[1] - lane[0] > len)
+    {
+        return Err("dense geometry has inconsistent lane metadata".to_string());
+    }
+    const MAX_DENSE_PAGE_REFS: u64 = 1_048_576;
+    let page_refs = kv_len.iter().try_fold(0u64, |total, &len| {
+        total.checked_add(u64::from(len.div_ceil(page_size)))
+    });
+    if page_refs.is_none_or(|page_refs| page_refs > MAX_DENSE_PAGE_REFS) {
+        return Err("dense geometry exceeds the page-reference safety bound".to_string());
+    }
+
+    let mut positions = Vec::with_capacity(token_count as usize);
+    let mut pages = Vec::with_capacity(page_refs.unwrap() as usize);
+    let mut page_indptr = Vec::with_capacity(qo_indptr.len());
+    page_indptr.push(0);
+    for (lane, &len) in qo_indptr.windows(2).zip(kv_len) {
+        let query_len = lane[1] - lane[0];
+        let start = len
+            .checked_sub(query_len)
+            .ok_or_else(|| "KV length is shorter than its query lane".to_string())?;
+        positions.extend(start..len);
+        pages.extend(0..len.div_ceil(page_size));
+        page_indptr.push(
+            u32::try_from(pages.len()).map_err(|_| "dense page CSR exceeds u32".to_string())?,
+        );
+    }
+    Ok((positions, pages, page_indptr))
 }
 
 /// Resolve a port's value: its const payload, or the current value of the
@@ -283,6 +912,41 @@ mod tests {
         }
     }
 
+    fn add_explicit_geometry(container: &mut TraceContainer, tokens: u32, lanes: u32) {
+        let position = container.channels.len() as u32;
+        container
+            .channels
+            .push(chan(Shape::vector(tokens), DType::U32));
+        let pages = container.channels.len() as u32;
+        container
+            .channels
+            .push(chan(Shape::matrix(lanes, 2), DType::U32));
+        let page_indptr = container.channels.len() as u32;
+        container
+            .channels
+            .push(chan(Shape::vector(lanes + 1), DType::U32));
+        let w_slot = container.channels.len() as u32;
+        container
+            .channels
+            .push(chan(Shape::vector(tokens), DType::U32));
+        let w_off = container.channels.len() as u32;
+        container
+            .channels
+            .push(chan(Shape::vector(tokens), DType::U32));
+        for (port, channel) in [
+            (Port::Positions, position),
+            (Port::Pages, pages),
+            (Port::PageIndptr, page_indptr),
+            (Port::WSlot, w_slot),
+            (Port::WOff, w_off),
+        ] {
+            container.ports.push(PortBinding {
+                port,
+                source: PortSource::Channel(channel),
+            });
+        }
+    }
+
     #[test]
     fn section3_single_seq_decode_geometry() {
         let c = section3_container();
@@ -295,7 +959,11 @@ mod tests {
 
         assert_eq!(g.token_ids, vec![42]);
         assert_eq!(g.qo_indptr, vec![0, 1], "one lane, one token");
-        assert_eq!(g.position_ids, vec![0], "append order, one token");
+        assert_eq!(
+            g.position_ids,
+            vec![4],
+            "len 5 places the write at position 4"
+        );
         assert_eq!(
             g.sampling_indices,
             vec![0],
@@ -307,10 +975,132 @@ mod tests {
             vec![5],
             "len 5 in a 16-page → last page holds 5"
         );
-        assert!(
-            g.kv_page_indices.is_empty(),
-            "sugar arity: page indices are ws-derived (staged)"
+        assert_eq!(g.kv_page_indices, vec![0]);
+        assert_eq!(g.kv_page_indptr, vec![0, 1]);
+    }
+
+    #[test]
+    fn decode_envelope_accepts_shape_equivalent_variants() {
+        let mut container = section3_container();
+        container.stages[0].ops = vec![
+            Op::ChanTake(0),
+            Op::ChanPut { chan: 0, value: 0 },
+            Op::ChanTake(1),
+            Op::ChanPut { chan: 1, value: 1 },
+        ];
+        add_explicit_geometry(&mut container, 1, 1);
+        let envelope = classify_decode_envelope(&container)
+            .unwrap()
+            .expect("plain loop-carried decode");
+        assert_eq!(envelope.token_count, 1);
+        assert!(envelope.loop_carried);
+        assert!(envelope.device_positions, "channel-fed positions");
+
+        let mut readout = container;
+        readout.ports.push(const_port(Port::Readout, &[0]));
+        let envelope = classify_decode_envelope(&readout)
+            .unwrap()
+            .expect("const readout decode");
+        assert_eq!(
+            envelope.template(&readout).unwrap().sampling_indices,
+            vec![0]
         );
+    }
+
+    #[test]
+    fn decode_envelope_accepts_a_device_carried_bool_mask() {
+        let mut container = section3_container();
+        container.stages[0].ops = vec![
+            Op::ChanTake(0),
+            Op::ChanPut { chan: 0, value: 0 },
+            Op::ChanTake(1),
+            Op::ChanPut { chan: 1, value: 1 },
+        ];
+        add_explicit_geometry(&mut container, 1, 1);
+        let mask = container.channels.len() as u32;
+        container
+            .channels
+            .push(chan(Shape::matrix(1, 8), DType::Bool));
+        container.ports.push(PortBinding {
+            port: Port::AttnMask,
+            source: PortSource::Channel(mask),
+        });
+
+        let envelope = classify_decode_envelope(&container)
+            .unwrap()
+            .expect("masked loop-carried decode classifies as an envelope");
+        assert!(envelope.has_mask);
+        assert_ne!(
+            envelope_required_ports(&envelope) & pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
+            0,
+            "a masked envelope demands the mask descriptor port"
+        );
+        // RV-26: the geometry ports alone must NOT satisfy a masked
+        // envelope. A driver that advertises geometry ports but cannot
+        // execute per-lane masks in its envelope compose (CUDA today)
+        // routes masked envelopes through the loud Host fallback — a
+        // driver that CLAIMS the mask port turns that fallback into a
+        // bind error, which is why claiming it demands real execution.
+        let required = envelope_required_ports(&envelope);
+        assert_ne!(
+            required & pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
+            required,
+            "geometry ports alone must not admit a masked envelope"
+        );
+
+        // A non-bool mask channel is a classification error, not a fallback.
+        let bad = container.channels.len() as u32 - 1;
+        container.channels[bad as usize].dtype = ChanDType::Concrete(DType::U32);
+        assert!(classify_decode_envelope(&container).is_err());
+    }
+
+    #[test]
+    fn decode_envelope_accepts_seeded_prefill_tokens() {
+        let mut container = section3_container();
+        container.channels[0].seeded = true;
+        container.stages[0].ops = vec![
+            Op::ChanTake(0),
+            Op::ChanTake(1),
+            Op::ChanPut { chan: 1, value: 1 },
+        ];
+        add_explicit_geometry(&mut container, 1, 1);
+
+        let envelope = classify_decode_envelope(&container)
+            .unwrap()
+            .expect("seeded prefill envelope");
+        assert!(!envelope.loop_carried);
+    }
+
+    #[test]
+    fn decode_envelope_derives_multitoken_and_multilane_shapes() {
+        let mut multi_token = section3_container();
+        multi_token.channels[0].shape = Shape::vector(4);
+        multi_token.ports[1] = const_port(Port::EmbedIndptr, &[0, 4]);
+        multi_token.stages[0].ops = vec![
+            Op::ChanPut { chan: 0, value: 0 },
+            Op::ChanPut { chan: 1, value: 1 },
+        ];
+        add_explicit_geometry(&mut multi_token, 4, 1);
+        assert!(classify_decode_envelope(&multi_token).is_err());
+
+        let mut multi_lane = section3_container();
+        multi_lane.channels[0].shape = Shape::vector(4);
+        multi_lane.channels[1].shape = Shape::vector(4);
+        multi_lane.ports[1] = const_port(Port::EmbedIndptr, &[0, 1, 2, 3, 4]);
+        multi_lane.stages[0].ops = vec![
+            Op::ChanPut { chan: 0, value: 0 },
+            Op::ChanPut { chan: 1, value: 1 },
+        ];
+        add_explicit_geometry(&mut multi_lane, 4, 4);
+        let envelope = classify_decode_envelope(&multi_lane).unwrap().unwrap();
+        assert_eq!((envelope.token_count, envelope.lane_count), (4, 4));
+        assert_eq!(
+            envelope.template(&multi_lane).unwrap().qo_indptr,
+            vec![0, 1, 2, 3, 4]
+        );
+        let template = envelope.template(&multi_lane).unwrap();
+        assert_eq!(template.sampling_indices, vec![0, 0, 0, 0]);
+        assert_eq!(template.sampling_indptr, vec![0, 1, 2, 3, 4]);
     }
 
     /// §6.2 rectangular batch: B=2 lanes, full KV arity from ports.
@@ -426,5 +1216,18 @@ mod tests {
         assert_eq!(last_page_len(16, 16), 16, "a full page ends exactly");
         assert_eq!(last_page_len(17, 16), 1);
         assert_eq!(last_page_len(32, 16), 16);
+    }
+
+    #[test]
+    fn dense_defaults_reject_unbounded_page_materialization() {
+        assert!(
+            dense_defaults(&[0, 1], &[u32::MAX], 1, 16).is_err(),
+            "guest KvLen must not force an unbounded host allocation"
+        );
+    }
+
+    #[test]
+    fn dense_defaults_reject_malformed_query_csr_before_allocating() {
+        assert!(dense_defaults(&[0, u32::MAX], &[1], 1, 16).is_err());
     }
 }

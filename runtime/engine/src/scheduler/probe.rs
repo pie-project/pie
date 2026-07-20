@@ -43,6 +43,7 @@
 //! ├── escape_fires           count of F2 idle-escape fires (ready subset fired on device-idle+empty-queue)
 //! ├── cold_hold_us           time spent in the F3 cold-hold window (nothing in flight)
 //! ├── cold_hold_fires        count of fires that went through the F3 cold-hold path
+//! ├── straggler_fires        count of narrow fires after the wave window expired (straggler demotion)
 //! └── readiness_miss         count of dummy-runs: a pass launched structurally-ready whose late edge missed (M3 gate: rate < 1%)
 //! ```
 
@@ -135,6 +136,16 @@ pub struct QuorumProbes {
     /// denominator for cold-hold occupancy (`cold_hold_us / cold_hold_fires`).
     pub cold_hold_fires: AtomicU64,
 
+    /// Count of straggler-demotion fires: the wave window expired and the
+    /// wave fired narrow, demoting the absentees. Divide by `total_batches`
+    /// for the demotion rate — near-zero on homogeneous decode fleets.
+    pub straggler_fires: AtomicU64,
+    /// Pipelines actually DEMOTED (punished) at straggler fires — idle a
+    /// full wave window since their own last activity. `straggler_fires`
+    /// counts narrow WAVES; this counts punished pipelines. A healthy
+    /// workload should hold this at ~0 even when narrow waves occur.
+    pub straggler_demotions: AtomicU64,
+
     /// Dummy-run / readiness-miss count: a pass launched as structurally
     /// ready (F5) whose genuinely-late host edge (grammar mask) had not
     /// landed when its consuming stage reached the device cut point, so the
@@ -143,14 +154,13 @@ pub struct QuorumProbes {
     pub readiness_miss: AtomicU64,
 
     /// Wait-for-all wave diagnostics (M-AB, delta). Sampled at each WaitAll
-    /// fire: `wave_active_sum` = Σ active_pipelines (the wait-set size),
-    /// `wave_missing_sum` = Σ stragglers fired without (deadline fires),
+    /// fire: `wave_active_sum` = Σ active_pipelines (the wait-set size) and
     /// `wave_fires` = the denominator. `avg_active = wave_active_sum /
     /// wave_fires` discriminates a PERSISTENT wait-set (converges to fleet
     /// width ⇒ waves should be dense) from a TRANSIENT one (stuck ≈1 ⇒
-    /// singleton waves). `avg_missing` high ⇒ the wave holds to the deadline
-    /// then fires partial; ≈0 ⇒ it fires all-ready (dense or firing-early).
-    /// Zero on legacy/quorum (never a WaitAll fire).
+    /// singleton waves). `wave_missing_sum` counts absentees at fire time:
+    /// non-zero only through straggler demotion (narrow fires after the
+    /// wave window expires).
     pub wave_active_sum: AtomicU64,
     pub wave_missing_sum: AtomicU64,
     pub wave_fires: AtomicU64,

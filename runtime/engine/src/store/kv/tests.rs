@@ -3,7 +3,10 @@
 use std::collections::HashSet;
 
 use super::hash::{self, Hash256};
-use super::page_table::{KvPageTable, KvTableError, PhysicalKvPageId, PublishedPage, WorkingSetId};
+use super::page_table::{
+    KvPageBacking, KvPageTable, KvTableError, PhysicalKvPageId, PublishedPage, TriePageLocation,
+    WorkingSetId,
+};
 use super::write::{PageCommit, PreparedTarget};
 use super::{KvStore, KvStoreError};
 use crate::store::pool::Pool;
@@ -42,6 +45,62 @@ fn sorted(mut v: Vec<PhysicalKvPageId>) -> Vec<u32> {
     v.into_iter().map(|p| p.0).collect()
 }
 
+fn sorted_backings(mut v: Vec<KvPageBacking>) -> Vec<u32> {
+    v.sort_by_key(|backing| match backing {
+        KvPageBacking::Resident(page) => page.0,
+        KvPageBacking::Swapped(slot) => slot.0,
+    });
+    v.into_iter()
+        .map(|backing| match backing {
+            KvPageBacking::Resident(page) => page.0,
+            KvPageBacking::Swapped(slot) => slot.0,
+        })
+        .collect()
+}
+
+#[test]
+fn offloaded_prefix_adoption_publishes_pages_hashes_and_cas() {
+    let mut store = KvStore::new(8, h(99));
+    let ws = store.create_working_set();
+    let tokens = (0..32).collect::<Vec<u32>>();
+    let reserved = store.reserve_device_pages(2).unwrap();
+    let reserved_ids = reserved.iter().map(|page| page.0).collect::<Vec<_>>();
+
+    assert_eq!(
+        store
+            .adopt_offloaded_prefix(ws, &tokens, reserved, 16)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store
+            .flat_table(ws)
+            .unwrap()
+            .1
+            .iter()
+            .map(|page| page.0)
+            .collect::<Vec<_>>(),
+        reserved_ids
+    );
+    assert_eq!(store.committed_token_len(ws, 16).unwrap(), 32);
+    let boundary = store.chain_state(ws).unwrap().unwrap();
+    assert!(store.lookup_cached_page(&boundary).is_some());
+}
+
+#[test]
+fn invalid_offloaded_prefix_releases_reserved_pages() {
+    let mut store = KvStore::new(4, h(100));
+    let ws = store.create_working_set();
+    let reserved = store.reserve_device_pages(1).unwrap();
+    assert_eq!(store.available_pages(), 3);
+    assert!(
+        store
+            .adopt_offloaded_prefix(ws, &[1, 2, 3], reserved, 16)
+            .is_err()
+    );
+    assert_eq!(store.available_pages(), 4);
+}
+
 /// A WorkingSet with two owned nodes: N1 = ids 0..5 shared-then-released via a
 /// throwaway fork, N2 = ids 5..10.
 fn two_node_ws(table: &mut KvPageTable) -> WorkingSetId {
@@ -68,6 +127,27 @@ fn publish_lookup_flatten_roundtrip() {
     }
     assert_eq!(t.page_len(ws).unwrap(), 5);
     assert_eq!(t.mapped_len(ws).unwrap(), 5);
+}
+
+#[test]
+fn single_state_runahead_reuses_the_published_mapping() {
+    let mut store = KvStore::new(2, h(42));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 1, 1);
+
+    let first = store.prepare_write(ws, &[0]).unwrap();
+    let (first_seq, first_intents) = store.publish_prepared(first, &[pc(19)]).unwrap();
+    let follower = store.prepare_write(ws, &[0]).unwrap();
+    assert!(matches!(
+        follower.targets(),
+        [PreparedTarget::InPlace { .. }]
+    ));
+    let (follow_seq, follow_intents) = store.publish_prepared(follower, &[pc(21)]).unwrap();
+    store.settle(first_intents, true);
+    store.retire_through(first_seq);
+    store.settle(follow_intents, true);
+    store.retire_through(follow_seq);
+    assert_eq!(store.available_pages(), 1);
 }
 
 #[test]
@@ -213,7 +293,7 @@ fn private_interior_discard_drains_across_node_boundaries() {
     let mut t = KvPageTable::new();
     let a = two_node_ws(&mut t);
     let freed = t.discard(a, &[3..7]).unwrap();
-    assert_eq!(sorted(freed), vec![3, 4, 5, 6]);
+    assert_eq!(sorted_backings(freed), vec![3, 4, 5, 6]);
     assert_eq!(ids(&t, a), vec![0, 1, 2, 7, 8, 9]);
     assert_eq!(t.mapped_len(a).unwrap(), 6);
     assert_eq!(t.page_len(a).unwrap(), 6);
@@ -323,9 +403,8 @@ fn cache_root_lease_keeps_an_otherwise_unused_path_alive() {
     let freed = t.release_working_set(a);
     assert!(freed.is_empty());
     assert_eq!(t.node_count(), 1);
-    t.release_cache_root(root);
-    let freed = t.collect();
-    assert_eq!(sorted(freed), vec![0, 1, 2, 3, 4]);
+    let freed = t.release_cache_root(root);
+    assert_eq!(sorted_backings(freed), vec![0, 1, 2, 3, 4]);
     assert_eq!(t.node_count(), 0);
 }
 
@@ -343,11 +422,11 @@ fn drop_unused_cache_leases_reclaims_lease_only_prefixes() {
     t.lease_cache_root(orphan_root);
     t.release_working_set(b); // now retained ONLY by the lease
 
-    assert_eq!(t.drop_unused_cache_leases(), 1);
-    let freed = t.collect();
-    assert_eq!(sorted(freed), vec![5, 6, 7]); // orphan lease reclaimed
+    let (dropped, freed) = t.drop_unused_cache_leases();
+    assert_eq!(dropped, 1);
+    assert_eq!(sorted_backings(freed), vec![5, 6, 7]); // orphan lease reclaimed
     assert_eq!(ids(&t, a), vec![0, 1, 2, 3, 4]); // in-use lease kept
-    assert_eq!(t.drop_unused_cache_leases(), 0); // idempotent
+    assert_eq!(t.drop_unused_cache_leases().0, 0); // idempotent
 }
 
 #[test]
@@ -384,8 +463,7 @@ fn pin_blocks_in_place_extension() {
     t.pin(terminal);
     publish(&mut t, a, 3..5); // must not mutate the pinned snapshot's node
     assert_eq!(t.node_count(), 2);
-    t.unpin(terminal);
-    assert!(t.collect().is_empty());
+    assert!(t.unpin(terminal).is_empty());
     assert_eq!(ids(&t, a), vec![0, 1, 2, 3, 4]);
 }
 
@@ -404,6 +482,106 @@ fn owner_compaction_frees_excluded_slots_once_the_selection_is_sole_consumer() {
     assert_eq!(sorted(freed), vec![0, 1]);
     assert_eq!(ids(&t, b), vec![2, 3, 4]); // mapping unchanged
     assert_eq!(t.lookup(b, 0).unwrap(), PhysicalKvPageId(2));
+}
+
+#[test]
+fn liveness_counts_anchor_multiplicity_without_scanning() {
+    let mut t = KvPageTable::new();
+    let a = t.create_working_set();
+    publish(&mut t, a, 0..3);
+    let root = t.terminal(a).unwrap().unwrap();
+    let b = t.fork(a).unwrap();
+    t.lease_cache_root(root);
+    t.lease_cache_root(root);
+    t.pin(root);
+    t.pin(root);
+    t.assert_liveness_consistent();
+
+    assert!(t.release_working_set(a).is_empty());
+    assert!(t.unpin(root).is_empty());
+    assert!(t.release_cache_root(root).is_empty());
+    t.assert_liveness_consistent();
+    assert!(t.release_working_set(b).is_empty());
+    assert!(t.unpin(root).is_empty());
+    let freed = t.release_cache_root(root);
+    assert_eq!(sorted_backings(freed), vec![0, 1, 2]);
+    assert_eq!(t.node_count(), 0);
+    t.assert_liveness_consistent();
+}
+
+#[test]
+fn selection_rewrite_recompacts_its_owner() {
+    let mut t = KvPageTable::new();
+    let a = t.create_working_set();
+    publish(&mut t, a, 0..5);
+    let b = t.fork(a).unwrap();
+    assert!(t.discard(b, &[0..2]).unwrap().is_empty());
+    assert_eq!(sorted(t.release_working_set(a)), vec![0, 1]);
+    let freed = t.discard(b, &[0..1]).unwrap();
+    assert_eq!(sorted_backings(freed), vec![2]);
+    assert_eq!(ids(&t, b), vec![3, 4]);
+    t.assert_liveness_consistent();
+}
+
+#[test]
+fn owner_compaction_retries_after_swap_location_unpins() {
+    let mut t = KvPageTable::new();
+    let a = t.create_working_set();
+    publish(&mut t, a, 0..5);
+    let owner = t.terminal(a).unwrap().unwrap();
+    let b = t.fork(a).unwrap();
+    assert!(t.discard(b, &[0..2]).unwrap().is_empty());
+    let location = TriePageLocation {
+        node: owner,
+        local: 0,
+    };
+    t.pin_swap_locations([location]);
+    assert!(t.release_working_set(a).is_empty());
+    let freed = t.unpin_swap_locations([location]);
+    assert_eq!(sorted_backings(freed), vec![0, 1]);
+    assert_eq!(ids(&t, b), vec![2, 3, 4]);
+    t.assert_liveness_consistent();
+}
+
+#[test]
+fn adoption_rejects_zero_visible_extent_with_hidden_backings() {
+    let mut t = KvPageTable::new();
+    let parent = two_node_ws(&mut t);
+    let target = t.fork(parent).unwrap();
+    assert!(t.discard(target, &[0..3]).unwrap().is_empty());
+    assert!(t.release_working_set(parent).is_empty());
+    assert_eq!(
+        sorted_backings(t.discard(target, &[0..7]).unwrap()),
+        vec![3, 4, 5, 6, 7, 8, 9]
+    );
+    assert_eq!(t.mapped_len(target).unwrap(), 0);
+
+    let source = t.create_working_set();
+    publish(&mut t, source, 10..11);
+    let node = t.terminal(source).unwrap().unwrap();
+    assert!(matches!(
+        t.adopt_path_prefix(target, node, 0),
+        Err(KvTableError::BadRange { .. })
+    ));
+    assert_eq!(sorted(t.release_working_set(target)), vec![0, 1, 2]);
+    t.assert_liveness_consistent();
+}
+
+#[test]
+fn failed_tail_replacement_preserves_mapping_and_backings() {
+    let mut t = KvPageTable::new();
+    let ws = t.create_working_set();
+    publish(&mut t, ws, 0..2);
+    assert_eq!(
+        t.replace_tail(ws, 1, pages(10..12)),
+        Err(KvTableError::PublishExceedsReservation {
+            count: 2,
+            mapped_len: 1,
+            page_len: 2,
+        })
+    );
+    assert_eq!(ids(&t, ws), vec![0, 1]);
+    t.assert_liveness_consistent();
 }
 
 // ----------------------------------------------------------------------
@@ -492,6 +670,16 @@ fn pc(seed: u32) -> PageCommit {
     }
 }
 
+fn publish_prepared(
+    store: &mut KvStore,
+    prepared: super::write::KvPreparedWrite,
+    commits: &[PageCommit],
+) {
+    let (seq, intents) = store.publish_prepared(prepared, commits).unwrap();
+    store.settle(intents, true);
+    store.retire_through(seq);
+}
+
 /// Prepare+commit `n` fresh pages onto `ws`, returning the committed ids.
 fn commit_fresh(
     store: &mut KvStore,
@@ -505,8 +693,190 @@ fn commit_fresh(
     let prepared = store.prepare_write(ws, &indexes).unwrap();
     let ids: Vec<PhysicalKvPageId> = prepared.targets().iter().map(|t| t.dst()).collect();
     let commits: Vec<PageCommit> = (0..n as u32).map(|i| pc(1000 + i)).collect();
-    store.commit(prepared, &commits, epoch).unwrap();
+    let _ = epoch;
+    publish_prepared(store, prepared, &commits);
     ids
+}
+
+#[test]
+fn store_explicit_index_roundtrip_remove_preserves_loaded_working_set() {
+    let mut store = KvStore::new(4, h(42));
+    let source = store.create_working_set();
+    let expected = commit_fresh(&mut store, source, 2, 1);
+
+    assert_eq!(store.update_index(b"prompt".to_vec(), source).unwrap(), 0);
+    store.release_working_set(source, store.current_epoch());
+    store.retire_idle();
+    assert_eq!(
+        store.available_pages(),
+        2,
+        "the explicit index root retains its pages"
+    );
+
+    let loaded = store.from_index(b"prompt").unwrap().unwrap();
+    assert_eq!(
+        (0..2)
+            .map(|index| store.lookup(loaded, index).unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    assert_eq!(store.remove_index(b"prompt").unwrap(), (true, 0));
+    assert!(store.from_index(b"prompt").unwrap().is_none());
+    assert_eq!(store.lookup(loaded, 1).unwrap(), expected[1]);
+    let private = store.prepare_write(loaded, &[1]).unwrap();
+    assert!(matches!(
+        private.targets(),
+        [PreparedTarget::InPlace { index: 1, dst }] if *dst == expected[1]
+    ));
+    store.cancel_prepared(private);
+
+    store.release_working_set(loaded, store.current_epoch());
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 4);
+}
+
+#[test]
+fn store_explicit_index_rejects_bad_keys_and_unmapped_tail() {
+    let mut store = KvStore::new(4, h(42));
+    let ws = store.create_working_set();
+    store.reserve(ws, 1).unwrap();
+
+    assert!(matches!(
+        store.update_index(Vec::new(), ws),
+        Err(KvStoreError::BadIndexKey { .. })
+    ));
+    assert!(matches!(
+        store.update_index(vec![0; super::MAX_INDEX_KEY_BYTES + 1], ws),
+        Err(KvStoreError::BadIndexKey { .. })
+    ));
+    assert!(matches!(
+        store.update_index(b"tail".to_vec(), ws),
+        Err(KvStoreError::Table(KvTableError::UnmappedTail {
+            mapped_len: 0,
+            page_len: 1
+        }))
+    ));
+}
+
+#[test]
+fn store_explicit_index_root_participates_in_cow() {
+    let mut store = KvStore::new(6, h(42));
+    let ws = store.create_working_set();
+    let ids = commit_fresh(&mut store, ws, 2, 1);
+    store.update_index(b"shared".to_vec(), ws).unwrap();
+
+    let shared = store.prepare_write(ws, &[1]).unwrap();
+    assert!(
+        shared
+            .targets()
+            .iter()
+            .any(|target| matches!(target, PreparedTarget::Cow { src, .. } if *src == ids[1]))
+    );
+    store.cancel_prepared(shared);
+
+    assert_eq!(store.remove_index(b"shared").unwrap().0, true);
+    let private = store.prepare_write(ws, &[1]).unwrap();
+    assert!(matches!(
+        private.targets(),
+        [PreparedTarget::InPlace { index: 1, dst }] if *dst == ids[1]
+    ));
+    store.cancel_prepared(private);
+}
+
+#[test]
+fn store_pressure_evicts_an_unowned_explicit_index() {
+    let mut store = KvStore::new(4, h(42));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 2, 1);
+    store.update_index(b"evict".to_vec(), ws).unwrap();
+    store.release_working_set(ws, store.current_epoch());
+    store.retire_idle();
+
+    assert_eq!(store.drop_unused_cache_leases(store.current_epoch()), 2);
+    store.retire_idle();
+    assert!(store.from_index(b"evict").unwrap().is_none());
+    assert_eq!(store.available_pages(), 4);
+}
+
+#[test]
+fn store_index_replacement_keeps_existing_loaded_view() {
+    let mut store = KvStore::new(4, h(42));
+    let first = store.create_working_set();
+    let first_id = commit_fresh(&mut store, first, 1, 1)[0];
+    store.update_index(b"session".to_vec(), first).unwrap();
+    let loaded_first = store.from_index(b"session").unwrap().unwrap();
+
+    let second = store.create_working_set();
+    let second_id = commit_fresh(&mut store, second, 1, 1)[0];
+    store.update_index(b"session".to_vec(), second).unwrap();
+    let loaded_second = store.from_index(b"session").unwrap().unwrap();
+
+    assert_eq!(store.lookup(loaded_first, 0).unwrap(), first_id);
+    assert_eq!(store.lookup(loaded_second, 0).unwrap(), second_id);
+    assert_ne!(first_id, second_id);
+}
+
+#[test]
+fn store_index_capacity_evicts_oldest_key() {
+    let mut store = KvStore::new(4, h(42));
+    store.max_indexes = 1;
+    let first = store.create_working_set();
+    commit_fresh(&mut store, first, 1, 1);
+    let second = store.create_working_set();
+    commit_fresh(&mut store, second, 1, 1);
+
+    store.update_index(b"first".to_vec(), first).unwrap();
+    store.update_index(b"second".to_vec(), second).unwrap();
+
+    assert!(store.from_index(b"first").unwrap().is_none());
+    assert!(store.from_index(b"second").unwrap().is_some());
+}
+
+#[test]
+fn standing_translation_publishes_immutable_mapping_snapshots() {
+    let mut store = KvStore::new(4, h(42));
+    let ws = store.create_working_set();
+    let translation = store.translation(ws).unwrap();
+    let (v0, empty) = translation.snapshot().unwrap();
+    assert_eq!(v0, 0);
+    assert!(empty.is_empty());
+
+    let ids = commit_fresh(&mut store, ws, 2, 1);
+    let (v1, mapped) = translation.snapshot().unwrap();
+    assert!(v1 > v0);
+    assert_eq!(
+        mapped.as_ref(),
+        ids.iter().map(|page| page.0).collect::<Vec<_>>()
+    );
+    assert!(empty.is_empty(), "the prior snapshot remains immutable");
+
+    store.discard(ws, &[1..2], store.current_epoch()).unwrap();
+    let (v2, shortened) = translation.snapshot().unwrap();
+    assert!(v2 > v1);
+    assert_eq!(shortened.as_ref(), &[ids[0].0]);
+    assert_eq!(mapped.len(), 2, "an in-flight reader keeps the old table");
+}
+
+#[test]
+fn ensure_backed_materializes_only_the_missing_logical_tail() {
+    let mut store = KvStore::new(3, h(42));
+    let ws = store.create_working_set();
+    store.reserve(ws, 3).unwrap();
+    let translation = store.translation(ws).unwrap();
+
+    assert_eq!(store.ensure_backed(ws, 2).unwrap(), 2);
+    assert_eq!(store.available_pages(), 1);
+    assert_eq!(translation.snapshot().unwrap().1.len(), 2);
+    assert_eq!(store.ensure_backed(ws, 2).unwrap(), 0);
+    assert_eq!(store.available_pages(), 1);
+
+    assert_eq!(store.ensure_backed(ws, 3).unwrap(), 1);
+    assert_eq!(translation.snapshot().unwrap().1.len(), 3);
+    assert!(matches!(
+        store.ensure_backed(ws, 4),
+        Err(KvStoreError::BadWriteSet { .. })
+    ));
 }
 
 #[test]
@@ -525,7 +895,7 @@ fn store_fresh_append_roundtrip() {
     assert_eq!(prepared.copy_plan().count(), 0);
     assert_eq!(store.available_pages(), 5);
     let ids: Vec<PhysicalKvPageId> = prepared.targets().iter().map(|t| t.dst()).collect();
-    store.commit(prepared, &[pc(0), pc(1), pc(2)], 1).unwrap();
+    publish_prepared(&mut store, prepared, &[pc(0), pc(1), pc(2)]);
     assert_eq!(store.mapped_len(ws).unwrap(), 3);
     for (i, id) in ids.iter().enumerate() {
         assert_eq!(store.lookup(ws, i as u64).unwrap(), *id);
@@ -549,7 +919,7 @@ fn store_in_place_write_on_private_page() {
         }]
     );
     assert_eq!(store.available_pages(), 5); // no allocation
-    store.commit(prepared, &[pc(77)], 2).unwrap();
+    publish_prepared(&mut store, prepared, &[pc(77)]);
 
     assert_eq!(store.lookup(ws, 2).unwrap(), id_before); // id stable
     assert_eq!(store.table().page_hash_at(ws, 2).unwrap(), Some(h(77)));
@@ -578,9 +948,7 @@ fn store_cow_on_shared_tail() {
     assert_eq!(copy_plan[0].0, a_ids[2]); // preserved cells come from a's tail
     let new_ids: Vec<PhysicalKvPageId> = prepared.targets().iter().map(|t| t.dst()).collect();
 
-    store
-        .commit(prepared, &[pc(10), pc(11), pc(12)], 2)
-        .unwrap();
+    publish_prepared(&mut store, prepared, &[pc(10), pc(11), pc(12)]);
     // b: shared prefix + private rebased tail.
     assert_eq!(store.lookup(b, 0).unwrap(), a_ids[0]);
     assert_eq!(store.lookup(b, 1).unwrap(), a_ids[1]);
@@ -609,7 +977,7 @@ fn store_shared_write_inside_the_tail_joins_the_rebase() {
             .iter()
             .all(|t| matches!(t, PreparedTarget::Cow { .. }))
     );
-    store.commit(prepared, &[pc(20), pc(21)], 2).unwrap();
+    publish_prepared(&mut store, prepared, &[pc(20), pc(21)]);
     assert_eq!(store.lookup(b, 0).unwrap(), a_ids[0]);
     assert_ne!(store.lookup(b, 1).unwrap(), a_ids[1]);
     assert_ne!(store.lookup(b, 2).unwrap(), a_ids[2]);
@@ -633,28 +1001,52 @@ fn store_prepare_oom_is_typed_and_leak_free() {
 }
 
 #[test]
-fn store_abort_recycles_after_epoch() {
+fn store_cancel_prepared_recycles_when_store_becomes_idle() {
     let mut store = KvStore::new(4, h(42));
     let ws = store.create_working_set();
     store.reserve(ws, 2).unwrap();
     let prepared = store.prepare_write(ws, &[0, 1]).unwrap();
     assert_eq!(store.available_pages(), 2);
-    store.abort(prepared, 7);
-    assert_eq!(store.available_pages(), 2); // held until the epoch retires
-    store.retire_through(7);
+    store.cancel_prepared(prepared);
     assert_eq!(store.available_pages(), 4);
     assert_eq!(store.mapped_len(ws).unwrap(), 0); // committed state unchanged
 }
 
 #[test]
-fn store_commit_mismatch_aborts() {
+fn later_settlement_does_not_retire_older_inflight_pages() {
+    let mut store = KvStore::new(4, h(42));
+    let first_ws = store.create_working_set();
+    let second_ws = store.create_working_set();
+    store.reserve(first_ws, 1).unwrap();
+    store.reserve(second_ws, 1).unwrap();
+    let first = store.prepare_write(first_ws, &[0]).unwrap();
+    let second = store.prepare_write(second_ws, &[0]).unwrap();
+    let (_first_seq, first_intents) = store.publish_prepared(first, &[pc(1)]).unwrap();
+    let (_second_seq, second_intents) = store.publish_prepared(second, &[pc(2)]).unwrap();
+    store
+        .discard(first_ws, &[0..1], store.current_epoch())
+        .unwrap();
+
+    store.settle(second_intents, true);
+    assert_eq!(
+        store.available_pages(),
+        2,
+        "a later fire cannot retire a page still protected by an older fire"
+    );
+    store.settle(first_intents, true);
+    assert_eq!(store.available_pages(), 3);
+}
+
+#[test]
+fn store_publish_mismatch_cancels_prepared_write() {
     let mut store = KvStore::new(4, h(42));
     let ws = store.create_working_set();
     store.reserve(ws, 2).unwrap();
     let prepared = store.prepare_write(ws, &[0, 1]).unwrap();
-    let err = store.commit(prepared, &[pc(0)], 3).unwrap_err();
+    let seq = prepared.seq();
+    let err = store.publish_prepared(prepared, &[pc(0)]).unwrap_err();
     assert_eq!(err, KvStoreError::CommitMismatch);
-    store.retire_through(3);
+    store.retire_through(seq);
     assert_eq!(store.available_pages(), 4);
     assert_eq!(store.mapped_len(ws).unwrap(), 0);
 }
@@ -772,7 +1164,7 @@ fn store_suspend_preserves_pages_shared_with_an_external_working_set() {
     let b = store.fork(a).unwrap();
     store.reserve(b, 1).unwrap();
     let prepared = store.prepare_write(b, &[3]).unwrap();
-    store.commit(prepared, &[pc(9)], 2).unwrap();
+    publish_prepared(&mut store, prepared, &[pc(9)]);
 
     let txn = match store.prepare_suspend(&HashSet::from([b])).unwrap() {
         super::KvSuspendPrepare::Prepared(txn) => txn,
@@ -865,23 +1257,42 @@ fn teardown_during_residency_transactions_reclaims_pinned_orphans() {
 }
 
 #[test]
+fn teardown_during_successful_restore_retires_reclaimed_pages() {
+    let mut store = KvStore::new_with_swap(4, 4, h(42));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 2, 1);
+    let working_sets = HashSet::from([ws]);
+    let suspend = match store.prepare_suspend(&working_sets).unwrap() {
+        super::KvSuspendPrepare::Prepared(txn) => txn,
+        other => panic!("expected suspend transaction, got {other:?}"),
+    };
+    store.commit_suspend(suspend).unwrap();
+    let granted = store.reserve_device_pages(2).unwrap();
+    let restore = store.prepare_restore(&working_sets, granted).unwrap();
+    let epoch = store.current_epoch();
+    store.release_working_set(ws, epoch);
+    store.commit_restore(restore).unwrap();
+    assert_eq!(store.available_pages(), 4);
+    assert_eq!(store.host_swap_available(), 4);
+}
+
+#[test]
 fn cas_adoption_rejects_a_path_pinned_by_suspend() {
     let mut store = KvStore::new_with_swap(4, 4, h(42));
     let source = store.create_working_set();
     store.reserve(source, 1).unwrap();
     let prepared = store.prepare_write(source, &[0]).unwrap();
     let key = h(77);
-    store
-        .commit(
-            prepared,
-            &[PageCommit {
-                token_hashes: vec![Some(key)],
-                page_hash: Some(h(88)),
-            }],
-            1,
-        )
-        .unwrap();
+    publish_prepared(
+        &mut store,
+        prepared,
+        &[PageCommit {
+            token_hashes: vec![Some(key)],
+            page_hash: Some(h(88)),
+        }],
+    );
     let target = store.create_working_set();
+    store.reserve(target, 2).unwrap();
     let suspend = match store.prepare_suspend(&HashSet::from([source])).unwrap() {
         super::KvSuspendPrepare::Prepared(txn) => txn,
         other => panic!("expected suspend transaction, got {other:?}"),
@@ -889,6 +1300,8 @@ fn cas_adoption_rejects_a_path_pinned_by_suspend() {
     assert_eq!(store.adopt_cached_prefix(target, &key, 1).unwrap(), None);
     store.abort_suspend(suspend);
     assert_eq!(store.adopt_cached_prefix(target, &key, 1).unwrap(), Some(1));
+    assert_eq!(store.mapped_len(target).unwrap(), 1);
+    assert_eq!(store.page_len(target).unwrap(), 2);
 }
 
 #[test]

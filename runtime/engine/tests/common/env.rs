@@ -52,6 +52,9 @@ fn dummy_driver_backend(
         max_forward_tokens: 4096,
         max_forward_requests: 32,
         max_page_refs: num_pages.max(1) as u32,
+        has_mtp_logits: true,
+        has_mtp_drafts: true,
+        has_value_head: true,
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,
@@ -72,7 +75,8 @@ pub struct MockEnv {
     behavior: Arc<dyn Behavior>,
     temp_cache: TempDir,
     /// Dummy-driver operation log (shared across every device driver): op
-    /// names plus `launch-shape tokens=N programs=P` entries for geometry
+    /// names plus `launch-shape tokens=N programs=P per=[..]` entries (batch
+    /// totals plus per-program token spans) for geometry
     /// assertions.
     operation_log: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -100,6 +104,10 @@ impl MockEnv {
                 rs_cache_required: false,
                 rs_cache_slots: 0,
                 rs_cache_slot_bytes: 0,
+                has_mtp_logits: true,
+                has_mtp_drafts: true,
+                has_value_head: true,
+                device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
                 limits: SchedulerLimits {
                     max_forward_requests: 32,
                     max_forward_tokens: 4096,

@@ -77,6 +77,14 @@ public:
     // replay/prefill.
     void reset_slot(int slot, cudaStream_t stream = 0);
 
+    // Device-predicated reset used by fixed envelopes. A negative slot id is
+    // an invalid row and leaves every recurrent-state surface unchanged.
+    void reset_slots_if_fresh(
+        const std::int32_t* slot_ids,
+        const std::uint8_t* is_fresh,
+        int request_count,
+        cudaStream_t stream = 0);
+
     // Copy one state slot to another across every linear-attention layer.
     // Used by runtime-managed fork/snapshot paths.
     void copy_slot_d2d(int src_slot, int dst_slot, cudaStream_t stream = 0);

@@ -240,8 +240,28 @@ void test_log_softmax_expansion() {
     FireInputs in; in.logits = d_logits; in.vocab = V;
     PassResult r = runner.run_pass(in);
     std::vector<float> got(B * V); runner.arena().host_take(0, got.data(), got.size() * 4);
-    // host reference (fused log_softmax, same math)
-    std::vector<float> want = host_eval::normalize(NormKind::LogSoftmax, logits, B, V);
+    const auto maximum =
+        host_eval::reduce(RedKind::Max, logits, B, V);
+    std::vector<float> centered(logits.size());
+    std::vector<float> exponentials(logits.size());
+    for (std::uint32_t row = 0; row < B; ++row) {
+        for (std::uint32_t column = 0; column < V; ++column) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) * V + column;
+            centered[index] = logits[index] - maximum[row];
+            exponentials[index] = std::exp(centered[index]);
+        }
+    }
+    const auto sum =
+        host_eval::reduce(RedKind::Sum, exponentials, B, V);
+    std::vector<float> want(logits.size());
+    for (std::uint32_t row = 0; row < B; ++row) {
+        for (std::uint32_t column = 0; column < V; ++column) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) * V + column;
+            want[index] = centered[index] - std::log(sum[row]);
+        }
+    }
     bool ok = r.ok && r.committed;
     for (std::size_t i = 0; ok && i < got.size(); ++i)
         ok = std::fabs(got[i] - want[i]) <= 1e-4f + 1e-4f * std::fabs(want[i]);
@@ -285,8 +305,21 @@ void test_lazy_packed_bool_pull() {
         .wire_bytes = 1,
         .native_bytes = 8,
     };
+    auto launch_validation =
+        [&](std::vector<DeviceHostChannelTicket> tickets) {
+            const std::vector<PullValidateHostChannelLane> lanes{{
+                .full = full,
+                .pass_commit = commit,
+                .ticket_offset = 0,
+                .ticket_count =
+                    static_cast<std::uint32_t>(tickets.size()),
+                .initial_commit = 1,
+            }};
+            return launch_pull_validate_host_channels_batch(
+                tickets, lanes, nullptr);
+        };
     DeviceHostChannelTicket* uploaded =
-        launch_pull_validate_host_channels({ticket}, full, commit, nullptr);
+        launch_validation({ticket});
     cudaDeviceSynchronize();
     std::uint8_t native[8]{};
     std::uint32_t committed = 0;
@@ -301,8 +334,7 @@ void test_lazy_packed_bool_pull() {
 
     words[1] = 0;
     cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
-    uploaded = launch_pull_validate_host_channels(
-        {ticket}, full, commit, nullptr);
+    uploaded = launch_validation({ticket});
     cudaDeviceSynchronize();
     cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
     expect(committed == 0, "withheld writer value clears commit without blocking");
@@ -313,8 +345,7 @@ void test_lazy_packed_bool_pull() {
     words[0] = 0;
     words[1] = 2;
     cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
-    uploaded = launch_pull_validate_host_channels(
-        {later_ticket}, full, commit, nullptr);
+    uploaded = launch_validation({later_ticket});
     cudaDeviceSynchronize();
     cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
     expect(
@@ -337,8 +368,7 @@ void test_lazy_packed_bool_pull() {
     words[0] = 0;
     words[1] = 1;
     cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
-    uploaded = launch_pull_validate_host_channels(
-        {publish_ticket}, full, commit, nullptr);
+    uploaded = launch_validation({publish_ticket});
     cudaDeviceSynchronize();
     cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
     expect(committed == 0, "full host-reader ring retries at device commit");
@@ -346,8 +376,7 @@ void test_lazy_packed_bool_pull() {
 
     words[0] = 1;
     cudaMemcpy(commit, &one, sizeof(one), cudaMemcpyHostToDevice);
-    uploaded = launch_pull_validate_host_channels(
-        {publish_ticket}, full, commit, nullptr);
+    uploaded = launch_validation({publish_ticket});
     cudaDeviceSynchronize();
     cudaMemcpy(&committed, commit, sizeof(committed), cudaMemcpyDeviceToHost);
     expect(committed == 1, "reader capacity released before execution commits");

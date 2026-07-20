@@ -15,32 +15,27 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
+#include <limits>
+#include <type_traits>
 #include <vector>
 
 #include "pie_native/ptir/op_table.hpp"
+#include "pie_native/ptir/rng_contract.generated.h"
 #include "pipeline/tier0/tier0_kernels.cuh"  // for the BinKind/UnKind/... enums (host-safe)
 
 namespace pie_cuda_driver::pipeline::host_eval {
 
-// ── RNG parity (mirrors t0_* in tier0_kernels.cuh, sample_temp.cu lineage) ──
-inline std::uint64_t h_splitmix64(std::uint64_t x) {
-    x ^= x >> 27; x *= 0x3C79AC492BA7B653ULL;
-    x ^= x >> 33; x *= 0x1C69B3F74AC4AE35ULL;
-    x ^= x >> 27;
-    return x;
-}
-inline std::uint64_t h_seed_eff(std::uint32_t s) { return (std::uint64_t)s ^ 0xA5A5A5A5ULL; }
+// ── RNG parity (generated PTIR contract) ──
+inline std::uint64_t h_seed_eff(std::uint32_t s) { return ptir_rng_seed_eff(s); }
 inline std::uint64_t h_stream_salt(std::uint32_t stream) {
-    return h_splitmix64((std::uint64_t)stream * 0x9E3779B97F4A7C15ULL);
+    return ptir_rng_stream_salt(stream);
 }
 inline std::uint64_t h_seed_eff_stream(std::uint32_t s, std::uint32_t stream) {
-    return h_seed_eff(s) ^ h_stream_salt(stream);
+    return ptir_rng_seed_eff_stream(s, stream);
 }
 inline float h_hash_uniform(std::uint64_t seed_eff, int j) {
-    std::uint64_t x = seed_eff + 0x9E3779B97F4A7C15ULL * (std::uint64_t)(j + 1);
-    x = h_splitmix64(x);
-    std::uint32_t bits = (std::uint32_t)(x >> 40);
-    return ((float)bits + 0.5f) * (1.0f / 16777216.0f);
+    return ptir_rng_hash_uniform(seed_eff, static_cast<std::uint32_t>(j));
 }
 inline float h_gumbel_noise(std::uint64_t seed_eff, int j) {
     float u = h_hash_uniform(seed_eff, j);
@@ -166,18 +161,58 @@ std::vector<T> scatter_add(const std::vector<T>& base, const std::vector<std::ui
 }
 
 // ───────────────────────── reduce / scan (row-local) ─────────────────────
+template <class T, class Combine>
+T canonical_reduce(const T* row, std::uint32_t len, T identity, Combine combine) {
+    if (len == 0) return identity;
+    std::vector<T> level(row, row + len);
+    while (level.size() > 1) {
+        std::vector<T> next;
+        next.reserve((level.size() + 31) / 32);
+        for (std::size_t base = 0; base < level.size(); base += 32) {
+            T lanes[32];
+            std::fill(std::begin(lanes), std::end(lanes), identity);
+            const std::size_t count = std::min<std::size_t>(32, level.size() - base);
+            std::copy_n(level.data() + base, count, lanes);
+            for (std::uint32_t offset : {16u, 8u, 4u, 2u, 1u})
+                for (std::uint32_t lane = 0; lane < offset; ++lane)
+                    lanes[lane] = combine(lanes[lane], lanes[lane + offset]);
+            next.push_back(lanes[0]);
+        }
+        level = std::move(next);
+    }
+    return level[0];
+}
+
+inline float canonical_max(float left, float right) {
+    if (std::isnan(left)) return std::isnan(right) ? neg_inf() : right;
+    if (std::isnan(right)) return left;
+    return std::fmax(left, right);
+}
+
+inline float canonical_min(float left, float right) {
+    if (std::isnan(left)) return std::isnan(right) ? INFINITY : right;
+    if (std::isnan(right)) return left;
+    return std::fmin(left, right);
+}
+
 template <class T>
 std::vector<T> reduce(RedKind k, const std::vector<T>& in, std::uint32_t rows, std::uint32_t len) {
     std::vector<T> o(rows);
     for (std::uint32_t r = 0; r < rows; ++r) {
         const T* row = in.data() + (std::size_t)r * len;
-        T acc = (k == RedKind::Sum) ? (T)0 : row[0];
-        for (std::uint32_t i = 0; i < len; ++i) {
-            if (k == RedKind::Sum) acc = (T)(acc + row[i]);
-            else if (k == RedKind::Max) acc = std::max(acc, row[i]);
-            else acc = std::min(acc, row[i]);
-        }
-        o[r] = acc;
+        const T identity = k == RedKind::Sum ? (T)0
+                         : k == RedKind::Max ? std::numeric_limits<T>::lowest()
+                                             : std::numeric_limits<T>::max();
+        o[r] = canonical_reduce(row, len, identity, [k](T left, T right) {
+            if (k == RedKind::Sum) return (T)(left + right);
+            if constexpr (std::is_same_v<T, float>) {
+                return k == RedKind::Max ? canonical_max(left, right)
+                                         : canonical_min(left, right);
+            } else {
+                return k == RedKind::Max ? std::max(left, right)
+                                         : std::min(left, right);
+            }
+        });
     }
     return o;
 }
@@ -188,7 +223,15 @@ inline std::vector<std::uint32_t> reduce_argmax(const std::vector<float>& in, st
         const float* row = in.data() + (std::size_t)r * len;
         float best = neg_inf();
         std::uint32_t bi = 0;
-        for (std::uint32_t i = 0; i < len; ++i) if (row[i] > best) { best = row[i]; bi = i; }
+        bool have = false;
+        for (std::uint32_t i = 0; i < len; ++i) {
+            if (!std::isnan(row[i]) &&
+                (!have || row[i] > best || (row[i] == best && i < bi))) {
+                best = row[i];
+                bi = i;
+                have = true;
+            }
+        }
         o[r] = bi;  // lower index on ties
     }
     return o;
@@ -208,51 +251,7 @@ std::vector<T> scan(ScanKind k, const std::vector<T>& in, std::uint32_t rows, st
     return o;
 }
 
-// ────────────────────────── normalize (row-local) ────────────────────────
-inline std::vector<float> normalize(NormKind k, const std::vector<float>& in, std::uint32_t rows,
-                                    std::uint32_t len) {
-    std::vector<float> o(in.size());
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        const float* ri = in.data() + (std::size_t)r * len;
-        float* ro = o.data() + (std::size_t)r * len;
-        if (k == NormKind::L2Norm) {
-            float ss = 0.f;
-            for (std::uint32_t i = 0; i < len; ++i) ss += ri[i] * ri[i];
-            float inv = 1.f / std::sqrt(ss);
-            for (std::uint32_t i = 0; i < len; ++i) ro[i] = ri[i] * inv;
-            continue;
-        }
-        float m = neg_inf();
-        for (std::uint32_t i = 0; i < len; ++i) m = std::max(m, ri[i]);
-        float sum = 0.f;
-        for (std::uint32_t i = 0; i < len; ++i) sum += std::exp(ri[i] - m);
-        if (k == NormKind::Softmax) {
-            float inv = 1.f / sum;
-            for (std::uint32_t i = 0; i < len; ++i) ro[i] = std::exp(ri[i] - m) * inv;
-        } else {
-            float lse = m + std::log(sum);
-            for (std::uint32_t i = 0; i < len; ++i) ro[i] = ri[i] - lse;
-        }
-    }
-    return o;
-}
-
 // ──────────────────────────────── sampling ───────────────────────────────
-inline std::vector<float> mask_apply(const std::vector<float>& logits,
-                                     const std::vector<std::uint8_t>& mask) {
-    std::vector<float> o(logits.size());
-    for (std::size_t i = 0; i < logits.size(); ++i) o[i] = mask[i] ? logits[i] : neg_inf();
-    return o;
-}
-inline std::vector<float> gumbel(const std::vector<std::uint32_t>& row_seed, std::uint32_t stream,
-                                 std::uint32_t rows, std::uint32_t len) {
-    std::vector<float> o((std::size_t)rows * len);
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        std::uint64_t se = h_seed_eff_stream(row_seed[r], stream);
-        for (std::uint32_t j = 0; j < len; ++j) o[(std::size_t)r * len + j] = h_gumbel_noise(se, (int)j);
-    }
-    return o;
-}
 // rng (0x70 ambient): per-row draw; gumbel=true → -log(-log(u)), else uniform.
 inline std::vector<float> rng_ambient(const std::vector<std::uint32_t>& row_seed, std::uint32_t stream,
                                       std::uint32_t rows, std::uint32_t len, bool gumbel) {
@@ -268,7 +267,7 @@ inline std::vector<float> rng_ambient(const std::vector<std::uint32_t>& row_seed
 }
 // rng_keyed (0x71): seed64 = splitmix64((key<<32)|ctr); element j → hash_uniform.
 inline std::vector<float> rng_keyed(std::uint32_t key, std::uint32_t ctr, std::uint64_t numel, bool gumbel) {
-    std::uint64_t seed64 = h_splitmix64(((std::uint64_t)key << 32) | (std::uint64_t)ctr);
+    std::uint64_t seed64 = ptir_rng_keyed_seed(key, ctr);
     std::vector<float> o(numel);
     for (std::uint64_t j = 0; j < numel; ++j) {
         float u = h_hash_uniform(seed64, (int)j);
@@ -313,40 +312,11 @@ inline void sort_desc(const std::vector<float>& in, std::uint32_t rows, std::uin
     }
 }
 
-// ────────────────────────────── order family ─────────────────────────────
-inline std::vector<std::uint8_t> rank_le(const std::vector<float>& in, std::uint32_t rows,
-                                         std::uint32_t len, std::uint32_t k) {
-    std::vector<std::uint8_t> o(in.size());
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        const float* row = in.data() + (std::size_t)r * len;
-        for (std::uint32_t i = 0; i < len; ++i) {
-            std::uint32_t greater = 0;
-            for (std::uint32_t j = 0; j < len; ++j) greater += (row[j] > row[i]) ? 1u : 0u;
-            o[(std::size_t)r * len + i] = (greater < k) ? 1u : 0u;
-        }
-    }
-    return o;
-}
-inline std::vector<float> pivot_threshold_rankle(const std::vector<float>& in, std::uint32_t rows,
-                                                 std::uint32_t len, std::uint32_t k) {
-    std::vector<float> o(in.size());
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        const float* row = in.data() + (std::size_t)r * len;
-        for (std::uint32_t i = 0; i < len; ++i) {
-            std::uint32_t greater = 0;
-            for (std::uint32_t j = 0; j < len; ++j) greater += (row[j] > row[i]) ? 1u : 0u;
-            o[(std::size_t)r * len + i] = (greater < k) ? row[i] : neg_inf();
-        }
-    }
-    return o;
-}
-
 // ── pivot_threshold's three DYNAMIC predicates (interface/ptir interp.rs
 // Op::PivotThreshold) — the payload is ALWAYS a scalar/per-row trace value,
 // never an immediate. `*_numel == 1` broadcasts index 0 to every row (mirrors
-// interp.rs `pick(len, r)`), else one value per row. Unlike `rank_le` above
-// (the standalone/composite form, no NaN handling pinned), these mirror
-// interp.rs's rank/NaN contract exactly: a NaN element is NEVER selected, and
+// interp.rs `pick(len, r)`), else one value per row. These mirror interp.rs's
+// rank/NaN contract exactly: a NaN element is NEVER selected, and
 // never counts toward another element's `greater` tally.
 template <class KT>
 inline std::vector<std::uint8_t> pivot_rankle(const std::vector<float>& in, std::uint32_t rows,

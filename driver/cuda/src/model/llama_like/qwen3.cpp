@@ -55,31 +55,6 @@ const DeviceTensor* bind_projection_or_fused_view(
     return view_slot.get();
 }
 
-void install_tp_lm_head_shard(const LoadedModel& engine, Qwen3Weights& w) {
-    const auto& dist = engine.distributed();
-    if (dist.tp_size <= 1 || w.lm_head == nullptr ||
-        w.lm_head->dtype() != DType::BF16 ||
-        w.lm_head->shape().size() != 2) {
-        return;
-    }
-
-    const auto& shape = w.lm_head->shape();
-    const std::int64_t vocab = shape[0];
-    const std::int64_t hidden = shape[1];
-    if (vocab <= 0 || hidden <= 0 || vocab % dist.tp_size != 0) {
-        return;
-    }
-
-    const std::int64_t rows = vocab / dist.tp_size;
-    const std::int64_t row_offset = rows * dist.tp_rank;
-    auto* base = static_cast<std::uint8_t*>(
-        const_cast<void*>(w.lm_head->data()));
-    auto* ptr = base + row_offset * hidden * dtype_bytes(DType::BF16);
-    w.lm_head_tp_shard = std::make_unique<DeviceTensor>(
-        DeviceTensor::view(ptr, DType::BF16, {rows, hidden}));
-    w.lm_head_tp_vocab_offset = static_cast<int>(row_offset);
-}
-
 }  // namespace
 
 Qwen3Weights bind_llama_like(const LoadedModel& engine, bool verbose) {
@@ -99,7 +74,6 @@ Qwen3Weights bind_llama_like(const LoadedModel& engine, bool verbose) {
     } else {
         throw std::runtime_error("llama-like: lm_head missing and tie_word_embeddings=false");
     }
-    install_tp_lm_head_shard(engine, w);
 
     w.layers.resize(static_cast<std::size_t>(cfg.num_hidden_layers));
     for (int i = 0; i < cfg.num_hidden_layers; ++i) {
@@ -238,7 +212,6 @@ Qwen3Weights bind_olmo3(const LoadedModel& engine) {
         throw std::runtime_error(
             "olmo3: lm_head missing and tie_word_embeddings=false");
     }
-    install_tp_lm_head_shard(engine, w);
 
     w.layers.resize(static_cast<std::size_t>(cfg.num_hidden_layers));
     for (int i = 0; i < cfg.num_hidden_layers; ++i) {

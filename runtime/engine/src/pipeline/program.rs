@@ -33,6 +33,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lru::LruCache;
+use pie_ptir::compiler::{CompiledStage, StageSignature};
 use pie_ptir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use pie_ptir::container_hash;
 use pie_ptir::op::Op;
@@ -65,6 +66,8 @@ pub struct RegisteredProgram {
     pub hash: u64,
     /// The validated, typed artifact (types, readiness, §7.1 classes).
     pub bound: BoundTrace,
+    /// Compiler-owned normalized stages, signatures, and region partitions.
+    pub compiled_stages: Vec<CompiledStage>,
     /// Dense-channel `(consume, publish)` mask, derived once from immutable IR.
     pub channel_accesses: Vec<(bool, bool)>,
     /// The PTIB typed sidecar (`encode_bound(&bound)`) — the wire form of
@@ -76,12 +79,22 @@ pub struct RegisteredProgram {
     pub pricing: Pricing,
 }
 
+impl RegisteredProgram {
+    pub fn stage_signature(&self, stage: pie_ptir::registry::Stage) -> Option<&StageSignature> {
+        self.compiled_stages
+            .iter()
+            .find(|compiled| compiled.normalized.stage == stage)
+            .map(|compiled| &compiled.signature)
+    }
+}
+
 /// A registration failure — surfaces the authoritative validator/decoder message
 /// (the P2 exit: "malformed traces fail at bind with the P0 validator's message").
 #[derive(Debug)]
 pub enum RegisterError {
     Decode(ContainerDecodeError),
     Bind(ValidateError),
+    HashCollision(u64),
 }
 
 impl fmt::Display for RegisterError {
@@ -89,6 +102,9 @@ impl fmt::Display for RegisterError {
         match self {
             RegisterError::Decode(e) => write!(f, "container decode failed: {e}"),
             RegisterError::Bind(e) => write!(f, "bind failed: {e}"),
+            RegisterError::HashCollision(hash) => {
+                write!(f, "program hash collision for 0x{hash:016x}")
+            }
         }
     }
 }
@@ -120,19 +136,30 @@ impl Registry {
     ) -> Result<Arc<RegisteredProgram>, RegisterError> {
         let hash = container_hash(&bytes);
         if let Some(hit) = self.inner.get(&hash) {
+            if hit.bytes != bytes {
+                return Err(RegisterError::HashCollision(hash));
+            }
             return Ok(hit.clone());
         }
         let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
         let pricing = price(&decoded);
         let channel_accesses = Self::channel_accesses(&decoded);
         let bound = bind(decoded, profile.clone()).map_err(RegisterError::Bind)?;
+        let compiled_stages = pie_ptir::compiler::compile_bound(&bound);
+        if std::env::var_os("PIE_PTIR_DUMP_PLAN").is_some() {
+            for stage in &compiled_stages {
+                eprintln!("{}", pie_ptir::compiler::debug_stage_plan(stage));
+                eprintln!("  metrics={:?}", stage.metrics());
+            }
+        }
         // The PTIB sidecar is the host→driver wire form of `BoundTrace`
         // (seed-independent, hash-keyed) — computed once, cached beside pricing.
-        let sidecar = pie_ptir::sidecar::encode_bound(&bound);
+        let sidecar = pie_ptir::sidecar::encode_bound_with_plans(&bound, &compiled_stages);
         let entry = Arc::new(RegisteredProgram {
             bytes,
             hash,
             bound,
+            compiled_stages,
             channel_accesses,
             sidecar,
             pricing,
@@ -244,14 +271,15 @@ pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
 /// conservative until the model surfaces them).
 pub fn model_profile() -> ModelProfile {
     let m = pie_model::model();
+    let ptir = m.ptir_caps();
     ModelProfile {
         vocab: m.vocab_size(),
         page_size: crate::store::registry::get(0, 0).kv_page_size,
         num_layers: 1,
         activation: pie_ptir::types::DType::F32,
-        has_mtp_logits: false,
-        has_mtp_drafts: false,
-        has_value_head: false,
+        has_mtp_logits: ptir.has_mtp_logits,
+        has_mtp_drafts: ptir.has_mtp_drafts,
+        has_value_head: ptir.has_value_head,
         kernels: Vec::new(),
     }
 }
@@ -275,6 +303,20 @@ mod tests {
             capacity: 1,
             host_role: role,
             seeded,
+        }
+    }
+
+    fn u32_port(port: Port, shape: Shape, values: &[u32]) -> PortBinding {
+        PortBinding {
+            port,
+            source: PortSource::Const {
+                dtype: DType::U32,
+                shape,
+                data: values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            },
         }
     }
 
@@ -318,6 +360,19 @@ mod tests {
                         data: [0u32, 1].iter().flat_map(|w| w.to_le_bytes()).collect(),
                     },
                 },
+                u32_port(Port::Positions, Shape::vector(1), &[0]),
+                u32_port(Port::Pages, Shape::vector(1), &[0]),
+                u32_port(Port::PageIndptr, Shape::vector(2), &[0, 1]),
+                PortBinding {
+                    port: Port::KvLen,
+                    source: PortSource::Const {
+                        dtype: DType::U32,
+                        shape: Shape::vector(1),
+                        data: 1u32.to_le_bytes().to_vec(),
+                    },
+                },
+                u32_port(Port::WSlot, Shape::vector(1), &[0]),
+                u32_port(Port::WOff, Shape::vector(1), &[0]),
             ],
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
@@ -372,6 +427,12 @@ mod tests {
         );
         assert_eq!(decoded.container_hash, container_hash(&bytes));
         assert!(!prog.sidecar.is_empty());
+        assert_eq!(decoded.stage_plans.len(), prog.compiled_stages.len());
+        let signature = prog
+            .stage_signature(Stage::Epilogue)
+            .expect("epilogue signature");
+        let plan = pie_ptir::compiler::decode_plan_header(&decoded.stage_plans[0].1).unwrap();
+        assert_eq!(plan.signature_hash, signature.hash);
     }
 
     #[test]
@@ -382,6 +443,29 @@ mod tests {
         assert_ne!(a.hash, b.hash);
         assert!(!Arc::ptr_eq(&a, &b));
         assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn hash_hit_requires_identical_canonical_bytes() {
+        let mut registry = reg(8);
+        let bytes = greedy(VOCAB).encode();
+        let program = registry.register(bytes.clone(), &prof(VOCAB)).unwrap();
+        registry.inner.put(
+            program.hash,
+            Arc::new(RegisteredProgram {
+                bytes: b"collision".to_vec(),
+                hash: program.hash,
+                bound: program.bound.clone(),
+                compiled_stages: program.compiled_stages.clone(),
+                channel_accesses: program.channel_accesses.clone(),
+                sidecar: program.sidecar.clone(),
+                pricing: program.pricing,
+            }),
+        );
+        assert!(matches!(
+            registry.register(bytes, &prof(VOCAB)),
+            Err(RegisterError::HashCollision(_))
+        ));
     }
 
     #[test]

@@ -10,9 +10,8 @@
 //! `prepare_write` allocates the folded slot, +`RS_FLAG_RESET` on the fresh
 //! fire, and the GDN forward writes it in-forward).
 //!
-//! Same greedy-argmax epilogue + KV/attn geometry sugar as `generate`
-//! (`attn_working_set(&ws, &klen)` — the host derives + projects the KV
-//! pages); the only addition is the RS working set binding, gated on
+//! Same greedy-argmax epilogue + KvLen-root dense geometry as `generate`; the
+//! only addition is the RS working set binding, gated on
 //! `rs.state_size() > 0` (pure-attention models skip it entirely and behave
 //! like `generate`). Input: an optional token budget (default 5), e.g. `"24"`.
 //!
@@ -20,7 +19,7 @@
 //! decode pass (both forward passes that exist). The decode pass is bound
 //! ONCE and resubmitted every fire (a `Channel` may attach to only ONE pass
 //! for its lifetime — `forward-pass.new` errs "may attach to only one pass"
-//! on a second bind attempt, so `tok_in`/`pos`/`klen`/`fill` are wired into a
+//! on a second bind attempt, so `tok_in` is wired into a
 //! single `ForwardPass` and that SAME pass is submitted `max_tokens-1` times,
 //! never rebuilt). `RsStore::prepare_write` (`runtime/engine/src/store/rs.rs`,
 //! `pipeline/fire.rs`) already keys reset-vs-continue-in-place off the
@@ -28,30 +27,26 @@
 //! `fork()`, which this inferlet never calls) — NOT off ForwardPass identity —
 //! so reusing one bound decode pass still resets exactly once (the prefill's
 //! first RS write) and continues in-place on every subsequent resubmit.
-//! `pos`/`klen`/`fill` device-loop-carry the growing absolute RoPE position +
-//! attended KV length across every fire (the `isolatedtopp`/`mirostat` split).
+//! The decode epilogue advances its author-bound `KvLen` by each fire's live
+//! token count.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const DEFAULT_MAX_TOKENS: usize = 5;
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let max_tokens: usize = input.trim().parse().unwrap_or(DEFAULT_MAX_TOKENS);
 
     let vocab = wit_model::output_vocab_size();
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     model::configure(vocab, ws.page_size(), 1);
 
     // Recurrent-state working set for the model's linear-attention layers.
     // `state_size() == 0` ⇒ the model has no recurrent state (pure attention)
     // → never bind it (this inferlet then behaves like `generate`).
-    let rs: &'static RsWorkingSet = bx(RsWorkingSet::new());
+    let rs = RsWorkingSet::new();
     let has_rs = rs.state_size() > 0;
     eprintln!(
         "[GENERATE_GDN] rs_state_size={} has_rs={has_rs}",
@@ -67,89 +62,98 @@ async fn main(input: String) -> Result<String> {
     let prompt = wit_model::encode("hello world");
     let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
     let n = prompt.len() as u32;
+    let max_pages = (n + max_tokens as u32 + 1).div_ceil(ws.page_size());
+    ws.reserve(max_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
 
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let toks_p = bx(Channel::from(prompt_i32).named("toks_p"));
+    let toks_p = Channel::from(prompt_i32).named("toks_p");
     let embed_indptr_p = Tensor::constant(vec![0u32, n]);
-    let klen_p = bx(Channel::from(vec![n; 1]).named("klen_p"));
-    let g0_ch = bx(Channel::new([1], dtype::i32).named("g0"));
+    let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
-    let fwd_p: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd_p.embed(toks_p, embed_indptr_p);
-    fwd_p.attn_working_set(ws, klen_p);
+    let fwd_p = ForwardPass::new();
+    fwd_p.embed(&toks_p, embed_indptr_p);
+    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    fwd_p.port_channel(Port::KvLen, &kv_len_p);
+    fwd_p.attn_working_set(&ws, .., ..)?;
+    fwd_p.derive_dense_geometry();
     if has_rs {
-        fwd_p.rs_working_set(rs);
+        fwd_p.rs_working_set(&rs);
     }
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits()); // [1] i32 greedy token
         g0_ch.put(&t);
     });
 
-    let prefill = Pipeline::new();
+    // ONE pipeline for the whole prefill→decode stream (R4-4): the decode
+    // fires below are submitted on this same pipeline. The stream is finished
+    // (F7) right after the prefill submit only in the degenerate case where
+    // zero decode fires follow.
+    let pipe = Pipeline::new();
     fwd_p
-        .submit(&prefill)
+        .submit(&pipe)
         .map_err(|e| format!("prefill submit: {e}"))?;
+    if max_tokens == 1 {
+        pipe.finish();
+    }
     let g0 = g0_ch
         .take()
         .get::<i32>()
+        .await
         .map_err(|e| format!("g0 take: {e}"))?[0];
-    prefill.close();
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     generated.push(g0 as u32);
 
     // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
     if generated.len() < max_tokens {
-        let tok_in = bx(Channel::from(vec![g0; 1]).named("tok_in"));
-        let pos = bx(Channel::from(vec![n; 1]).named("pos"));
-        let klen = bx(Channel::from(vec![n + 1; 1]).named("klen"));
-        let fill = bx(Channel::from(vec![n + 1; 1]).named("fill"));
-        let out = bx(Channel::new([1], dtype::i32).named("out"));
+        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
+        let out = Channel::new([1], dtype::i32).named("out");
         let lane1 = Tensor::constant(vec![0u32, 1u32]);
 
         // ONE bound ForwardPass, resubmitted every fire: each channel may
-        // attach to only one pass for its lifetime, so `tok_in`/`pos`/`klen`/
-        // `fill` are wired here ONCE, not rebuilt per step. `rs_working_set`
+        // attach to only one pass for its lifetime, so `tok_in` is wired here
+        // ONCE, not rebuilt per step. `rs_working_set`
         // is attached to this SAME pass, and the RS store's own reset-once/
         // continue-in-place tracking (keyed on the working set, not the pass)
         // is correct across all of this pass's resubmits.
-        let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-        fwd.embed(tok_in, lane1);
-        fwd.positions(pos);
-        fwd.attn_working_set(ws, klen);
+        let fwd = ForwardPass::new();
+        fwd.embed(&tok_in, lane1);
+        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        fwd.port_channel(Port::KvLen, &kv_len);
+        fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
+        fwd.derive_dense_geometry();
         if has_rs {
-            fwd.rs_working_set(rs);
+            fwd.rs_working_set(&rs);
         }
         fwd.epilogue(move || {
-            // Takes + compute first, PUTS last (value-id discipline).
-            let base = fill.take().tensor(); // [1] u32 — position the NEXT fire writes
+            let length = kv_len.take().tensor();
             let t = reduce_argmax(intrinsics::logits()); // [1] i32 greedy token
-
-            let klen_v = add(&base, 1u32);
-            let next_free = add(&base, 1u32);
-
             tok_in.put(&t);
+            kv_len.put(add(&length, 1u32));
             out.put(&t);
-            pos.put(&base);
-            klen.put(&klen_v);
-            fill.put(&next_free);
         });
 
-        let decode = Pipeline::new();
         for step in 1..max_tokens {
-            fwd.submit(&decode)
+            // Fixed budget: the last submit is knowable at submit time →
+            // finish() right after it (F7: end of stream; no close needed
+            // after the drain).
+            fwd.submit(&pipe)
                 .map_err(|e| format!("decode submit @{step}: {e}"))?;
+            if step + 1 == max_tokens {
+                pipe.finish();
+            }
             let t = out
                 .take()
                 .get::<i32>()
+                .await
                 .map_err(|e| format!("out.take @{step}: {e}"))?;
             let Some(&t0) = t.first() else {
                 return Err(format!("out.take @{step}: empty tensor"));
             };
             generated.push(t0 as u32);
         }
-        decode.close();
     }
 
     let result = format!("generated {} tokens: {:?}", generated.len(), generated);

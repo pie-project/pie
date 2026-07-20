@@ -33,12 +33,10 @@ const MAX_TOKENS: u32 = 16;
 const PAGE_T: u32 = 16;
 const NUM_LAYERS: u32 = 28;
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
-fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
-    t.get::<i32>().map_err(|e| format!("tensor take: {e}"))
+async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
+    t.get::<i32>()
+        .await
+        .map_err(|e| format!("tensor take: {e}"))
 }
 
 /// Committed length of a sentinel `[k+1]` tail = the count before the first
@@ -50,22 +48,30 @@ fn committed_len(tail: &[i32]) -> usize {
 /// Bootstrap fire over `prompt + (k-1)` fillers: yields the seed (row-0 target
 /// argmax at the prompt's REAL last position) + the first REAL `[k]` drafts
 /// (native MTP argmax) for window 1.
-fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Vec<i32>)> {
+async fn bootstrap(
+    ws: &WorkingSet,
+    pipeline: &Pipeline,
+    prompt: &[u32],
+    k: u32,
+    _max_pages: u32,
+) -> Result<(i32, Vec<i32>)> {
     let l = prompt.len() as u32;
     let mut window: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     window.extend(std::iter::repeat(0i32).take((k - 1) as usize));
     let n = l + k - 1;
 
-    let toks = bx(Channel::from(window).named("b_toks"));
-    let klen = bx(Channel::from(vec![n]).named("b_klen"));
-    let seed_out = bx(Channel::new([1], dtype::i32).named("b_seed"));
-    let drafts_out = bx(Channel::new([k], dtype::i32).named("b_drafts"));
+    let toks = Channel::from(window).named("b_toks");
+    let seed_out = Channel::new([1], dtype::i32).named("b_seed");
+    let drafts_out = Channel::new([k], dtype::i32).named("b_drafts");
 
     let readout: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(toks, Tensor::constant(vec![0u32, n]));
-    fwd.attn_working_set(ws, klen);
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
+    let kv_len = Channel::from(vec![n]).named("b_kv_len");
+    fwd.port_channel(Port::KvLen, &kv_len);
+    fwd.attn_working_set(ws, .., ..)?;
+    fwd.derive_dense_geometry();
     fwd.readout(&Tensor::constant(readout));
     fwd.epilogue(move || {
         let picked = reduce_argmax(intrinsics::logits());
@@ -76,48 +82,47 @@ fn bootstrap(ws: &'static WorkingSet, prompt: &[u32], k: u32) -> Result<(i32, Ve
         drafts_out.put(&drafts);
     });
 
-    let pipeline = Pipeline::new();
-    fwd.submit(&pipeline)
+    fwd.submit(pipeline)
         .map_err(|e| format!("bootstrap submit: {e}"))?;
-    let seed = get_i32(seed_out.take())?
+    let seed = get_i32(seed_out.take())
+        .await?
         .first()
         .copied()
         .ok_or_else(|| "bootstrap: empty seed".to_string())?;
-    let drafts = get_i32(drafts_out.take())?;
-    pipeline.close();
+    let drafts = get_i32(drafts_out.take()).await?;
     Ok((seed, drafts))
 }
 
-/// One `[k+1]`-wide verify window: embed `[seed, draft]` at the explicit
-/// ABSOLUTE positions `[seq_len .. seq_len+k+1)` (a fresh `pos` channel bound
-/// via `ForwardPass::positions` — every fresh `verify_window` fire is its own
-/// new `ForwardPass`, so a repeated implicit `0..k+1` default would misalign
-/// RoPE against `klen`'s growing attended length), verify `draft`
+/// One `[k+1]`-wide verify window: embed `[seed, draft]` at positions derived
+/// from the pre-envelope `seq_len` cursor, verify `draft`
 /// (device-alias peeked off the SAME embedded tokens) against the target's
 /// per-row argmax, and draft the NEXT window natively off `mtp_logits`.
 /// Returns `(commit [k+1], next_drafts [k])`.
-fn verify_window(
-    ws: &'static WorkingSet,
+async fn verify_window(
+    ws: &WorkingSet,
+    pipeline: &Pipeline,
     k: u32,
     seed: i32,
     draft: &[i32],
     seq_len: u32,
+    _max_pages: u32,
 ) -> Result<(Vec<i32>, Vec<i32>)> {
     let kp1 = k + 1;
     let mut window: Vec<i32> = vec![seed];
     window.extend_from_slice(draft);
 
-    let toks = bx(Channel::new([kp1], dtype::i32).named("v_toks"));
-    let pos = bx(Channel::new([kp1], dtype::u32).named("v_pos"));
-    let klen = bx(Channel::new([1], dtype::u32).named("v_klen"));
-    let commit_out = bx(Channel::new([kp1], dtype::i32).named("v_commit"));
-    let drafts_out = bx(Channel::new([k], dtype::i32).named("v_drafts"));
+    let toks = Channel::new([kp1], dtype::i32).named("v_toks");
+    let commit_out = Channel::new([kp1], dtype::i32).named("v_commit");
+    let drafts_out = Channel::new([k], dtype::i32).named("v_drafts");
 
     let lanes: Vec<u32> = (0..=kp1).collect();
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(toks, Tensor::constant(lanes));
-    fwd.positions(pos);
-    fwd.attn_working_set(ws, klen);
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, Tensor::constant(lanes));
+    let kv_len =
+        Channel::from((1..=kp1).map(|row| seq_len + row).collect::<Vec<_>>()).named("v_kv_len");
+    fwd.port_channel(Port::KvLen, &kv_len);
+    fwd.attn_working_set(ws, .., (seq_len / ws.page_size())..)?;
+    fwd.derive_dense_geometry();
     fwd.epilogue(move || {
         let win = toks.read().tensor(); // [k+1] i32 device-alias peek
         let draft_v = gather(&win, Tensor::constant((1..=k).collect::<Vec<u32>>()));
@@ -140,14 +145,10 @@ fn verify_window(
     });
 
     toks.put(window);
-    pos.put((seq_len..seq_len + kp1).collect::<Vec<u32>>());
-    klen.put(vec![seq_len + kp1]);
-    let pipeline = Pipeline::new();
-    fwd.submit(&pipeline)
+    fwd.submit(pipeline)
         .map_err(|e| format!("verify submit: {e}"))?;
-    let commit = get_i32(commit_out.take())?;
-    let drafts = get_i32(drafts_out.take())?;
-    pipeline.close();
+    let commit = get_i32(commit_out.take()).await?;
+    let drafts = get_i32(drafts_out.take()).await?;
     Ok((commit, drafts))
 }
 
@@ -155,7 +156,7 @@ fn verify_window(
 async fn main(input: String) -> Result<String> {
     let k: u32 = input.trim().parse().unwrap_or(4).max(2);
     let vocab = wit_model::output_vocab_size();
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
+    let ws = WorkingSet::new();
     model::configure(vocab, PAGE_T, NUM_LAYERS);
     model::configure_gates(
         /* has_mtp_logits */ true, /* has_value_head */ false,
@@ -165,8 +166,18 @@ async fn main(input: String) -> Result<String> {
     if prompt.is_empty() {
         prompt.push(0);
     }
+    let max_pages = (prompt.len() as u32 + MAX_TOKENS + k + 1).div_ceil(PAGE_T);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
 
-    let (seed0, draft0) = bootstrap(ws, &prompt, k)?;
+    // ONE pipeline for the whole stream (R4-4): the bootstrap and every
+    // verify window continue the same sequential decode, so all their fires
+    // submit here. The loop is acceptance-driven (the last submit is not
+    // knowable at submit time), so the stream ends with a close after the
+    // final drain instead of a final-submit marker.
+    let pipeline = Pipeline::new();
+
+    let (seed0, draft0) = bootstrap(&ws, &pipeline, &prompt, k, max_pages).await?;
     let mut seq_len: u32 = prompt.len() as u32 + k - 1;
 
     let mut committed: Vec<u32> = prompt.clone();
@@ -177,10 +188,10 @@ async fn main(input: String) -> Result<String> {
     let mut generated: u32 = 1;
 
     while generated < MAX_TOKENS {
-        let (commit, drafts) = verify_window(ws, k, seed, &draft, seq_len)?;
-        seq_len += k + 1;
-
+        let (commit, drafts) =
+            verify_window(&ws, &pipeline, k, seed, &draft, seq_len, max_pages).await?;
         let clen = committed_len(&commit);
+        seq_len += clen as u32;
         let n_acc = clen.saturating_sub(1);
         accepted_lengths.push(n_acc);
         let commit_toks: Vec<u32> = commit.iter().take(clen).map(|&t| t as u32).collect();
@@ -190,6 +201,8 @@ async fn main(input: String) -> Result<String> {
         draft = drafts;
         seed = *committed.last().unwrap_or(&0) as i32;
     }
+    // Every window's takes have drained: this close cancels nothing.
+    pipeline.close();
 
     let total_acc: usize = accepted_lengths.iter().sum();
     let steps = accepted_lengths.len();

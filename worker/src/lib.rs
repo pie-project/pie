@@ -17,6 +17,7 @@ pub mod weights;
 
 mod client_server;
 pub mod engine;
+mod executor;
 mod lifecycle;
 mod link;
 mod preflight;
@@ -27,6 +28,7 @@ mod preflight;
 // underneath without reworking them.
 pub use config::Config;
 pub use engine::{WorkerHandle, run, run_with};
+pub use pie_controller_rpc::Role;
 // The control-plane seam `run_with` is generic over — re-exported so the
 // composition root (`bin/pie`) can impl it for its `EmbeddedControl` adapter.
 pub use link::control::ControlLink;

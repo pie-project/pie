@@ -56,7 +56,13 @@ impl Shape {
 
     /// Build a shape from a dim slice. `None` if `dims.len() > MAX_RANK`.
     pub fn new(dims: &[u32]) -> Option<Shape> {
-        if dims.len() > MAX_RANK {
+        if dims.len() > MAX_RANK
+            || dims.contains(&0)
+            || dims
+                .iter()
+                .try_fold(1u64, |product, &dim| product.checked_mul(dim as u64))
+                .is_none()
+        {
             return None;
         }
         let mut d = [0u32; MAX_RANK];

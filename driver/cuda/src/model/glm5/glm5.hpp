@@ -104,7 +104,6 @@ struct Glm5Weights {
     const DeviceTensor* final_norm = nullptr;
     int embed_tp_vocab_offset = 0;
     bool embed_tp_sharded = false;
-    int lm_head_tp_vocab_offset = 0;
     bool lm_head_tp_sharded = false;
 
     std::vector<Glm5LayerWeights> layers;

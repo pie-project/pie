@@ -111,25 +111,45 @@ impl Instance {
             page_size,
         )
     }
+}
 
-    /// **Relaxed** geometry map for a device-geometry fire (plan W3.4): a
-    /// descriptor port bound to a device-produced channel with no host-known
-    /// value leaves its wire field empty (the driver resolves it pre-forward,
-    /// W1.1) instead of erroring, while const / host-known ports still prefill.
-    /// Never returns `MissingChannelValue`; used to route a device-geometry
-    /// pass through the ordinary solo/prebuilt submit.
-    pub fn fire_geometry_relaxed(
-        &self,
-        page_size: u32,
-    ) -> Result<
-        crate::pipeline::fire::geometry::ReqGeometry,
-        crate::pipeline::fire::geometry::GeometryError,
-    > {
-        crate::pipeline::fire::geometry::map_geometry_relaxed(
-            &self.program.bound.container,
-            &self.channel_values(),
-            page_size,
-        )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvPageSpan {
+    pub start: u64,
+    pub end: Option<u64>,
+}
+
+impl KvPageSpan {
+    pub const fn open(start: u64) -> Self {
+        Self { start, end: None }
+    }
+
+    pub fn resolve(self, page_len: u64) -> Result<std::ops::Range<u64>, String> {
+        let end = self.end.unwrap_or(page_len);
+        if self.start > end || end > page_len {
+            return Err(format!(
+                "KV page declaration {}..{} exceeds lease extent {page_len}",
+                self.start, end
+            ));
+        }
+        Ok(self.start..end)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvDeclaration {
+    pub ws_rep: u32,
+    pub readable: KvPageSpan,
+    pub writable: KvPageSpan,
+}
+
+impl KvDeclaration {
+    pub const fn all(ws_rep: u32) -> Self {
+        Self {
+            ws_rep,
+            readable: KvPageSpan::open(0),
+            writable: KvPageSpan::open(0),
+        }
     }
 }
 
@@ -145,6 +165,9 @@ impl Instance {
 pub struct ForwardPass {
     pub instance: Instance,
     pub bound_instance: crate::driver::BoundInstance,
+    /// Bind-time scheduler address. Stable for the instance lifetime, so
+    /// per-token submits never re-enter the global driver-handle registry.
+    pub scheduler: crate::scheduler::worker::SchedulerHandle,
     /// The bound channel cells, dense declaration order. Writer puts are
     /// coalesced into each fire; Reader cells hold direct mirror bindings.
     pub cells: crate::pipeline::channel::BoundCells,
@@ -164,14 +187,14 @@ pub struct ForwardPass {
     /// keeps it alive for the pass's lifetime (the classic `forward-pass`
     /// borrow convention); the pass does NOT destroy it on drop.
     pub kv_ws: u32,
-    /// The guest-owned recurrent-state working set (hybrid / linear-attention
-    /// models — GDN, Mamba2). `None` for pure-attention models.
-    pub rs_ws: Option<u32>,
-    /// The bound ws's committed token length — the growing cursor threaded
-    /// into [`crate::pipeline::fire::kv::prepare`]. Advances OPTIMISTICALLY at
-    /// submit (run-ahead: fire t+1 prepares against t's post-state); a failed
-    /// fire fails the whole pass (`failed`) rather than rewinding the cursor.
-    pub committed_tokens: u32,
+    pub kv_declaration: KvDeclaration,
+    /// Guest-owned recurrent-state working sets (hybrid / linear-attention
+    /// models — GDN, Mamba2), in resolved forward-request order. Empty for
+    /// pure-attention models.
+    pub rs_ws: Vec<u32>,
+    /// Whether the currently bound writable declaration has performed its
+    /// one-shot COW against the sharing shape visible at first submit.
+    pub kv_declaration_realized: bool,
     /// Set when a fire of this pass failed: further submits error with the
     /// root cause (the KV cursor and device channel state are unspecified
     /// after a failed fire — the guest builds a fresh pass).
@@ -185,21 +208,17 @@ pub struct ForwardPass {
     /// grants on the program's fresh channel. Replaces the deleted host-replay
     /// beam branch.
     pub devgeo: Option<crate::pipeline::fire::lease::DevGeo>,
-    /// Bind-time half of the canonical-KV gate
-    /// ([`crate::pipeline::fire::kv::canonical_kv_shape`]): this pass CAN
-    /// produce semantically hashable KV. Each fire additionally passes the
-    /// fire-time host-known gate
-    /// ([`crate::pipeline::fire::kv::canonical_fire_evidence`]).
-    pub canonical_kv: bool,
+    /// Shape-derived decode layout whose values are resolved by the driver.
+    pub decode_envelope: Option<crate::pipeline::fire::geometry::DecodeEnvelope>,
     /// The pass binds an `AttnMask` descriptor channel (dense device mask).
     /// Its fires are marked mask-carrying on the launch plan so the
     /// scheduler batches them SOLO (the composed multi-program batch does
     /// not merge dense device masks — v1 scope).
     pub dense_mask: bool,
-    /// Whether a fire of this pass has been submitted. The first fire
-    /// consumes channel seeds, so the fire-time gate's seed rule only
-    /// applies while this is false.
-    pub fired_once: bool,
+    /// Host mirror of the instance's committed channel state (seeds, then
+    /// per-fire stage folds): the value oracle for evaluated fire geometry.
+    /// Advances at submit.
+    pub host_shadow: crate::pipeline::fire::shadow::HostShadow,
     /// Idempotency guard for [`ForwardPass::close_native`]. Set the first
     /// time native cleanup runs — either the explicit WIT `drop` (after it
     /// drains the pass's pending FIFO) or, when a `ResourceTable`/
@@ -210,14 +229,69 @@ pub struct ForwardPass {
 }
 
 impl ForwardPass {
-    /// Idempotent synchronous native teardown: closes the bound driver
-    /// instance, detaches this pass's `instance_id` from every bound
-    /// `ChannelCell` it attached, and reclaims any outstanding
-    /// device-geometry page grants. Safe to call more than once — every step
-    /// is gated by `closed`, so a repeat call (explicit `drop` followed by
-    /// this type's `Drop`, or vice versa) is a pure no-op. Never panics and
-    /// never awaits: failures are logged, since teardown has no result
-    /// channel left to report to.
+    /// Replace only the recurrent-state resource reps. The native instance and
+    /// every other pass field remain untouched. Rebinding is legal only at an
+    /// empty pipeline FIFO boundary so no in-flight fire can retain the old
+    /// request-row mapping.
+    pub fn replace_rs_working_sets(&mut self, reps: Vec<u32>) -> Result<(), String> {
+        let pending = self
+            .fires
+            .as_ref()
+            .map(|fifo| fifo.lock().unwrap().len())
+            .unwrap_or(0);
+        if pending != 0 {
+            return Err(format!(
+                "cannot replace rs-working-sets while {pending} operation(s) remain in the pass FIFO"
+            ));
+        }
+        self.rs_ws = reps;
+        Ok(())
+    }
+
+    pub fn replace_kv_declaration(
+        &mut self,
+        ws_rep: u32,
+        readable: KvPageSpan,
+        writable: KvPageSpan,
+    ) -> Result<(), String> {
+        let pending = self
+            .fires
+            .as_ref()
+            .map(|fifo| fifo.lock().unwrap().len())
+            .unwrap_or(0);
+        if pending != 0 {
+            return Err(format!(
+                "cannot replace KV working-set declaration while {pending} operation(s) remain in the pass FIFO"
+            ));
+        }
+        if self.devgeo.is_some() {
+            return Err("a device-geometry pass cannot redeclare its KV working set".to_string());
+        }
+        if self.decode_envelope.is_some()
+            && (ws_rep != self.kv_ws || readable.start != 0 || readable.end.is_some())
+        {
+            return Err(
+                "a device-resolved pass cannot replace its KV working set or narrow readable pages"
+                    .to_string(),
+            );
+        }
+        self.kv_ws = ws_rep;
+        self.kv_declaration = KvDeclaration {
+            ws_rep,
+            readable,
+            writable,
+        };
+        self.kv_declaration_realized = false;
+        Ok(())
+    }
+
+    /// Idempotent ordered native teardown: enqueues the bound driver's close,
+    /// detaches this pass's `instance_id` from every bound `ChannelCell`, and
+    /// reclaims any outstanding device-geometry page grants. Safe to call more
+    /// than once — every step is gated by `closed`, so a repeat call (explicit
+    /// `drop` followed by this type's `Drop`, or vice versa) is a pure no-op.
+    /// Never panics and never awaits: scheduler-side failures are logged,
+    /// since teardown has no result channel left to report to.
     ///
     /// Callers MUST first confirm [`Self::can_close_native_on_drop`] (or
     /// have otherwise already drained the pass's fires FIFO, as
@@ -229,7 +303,11 @@ impl ForwardPass {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
-        if let Err(error) = crate::scheduler::close_instance(&self.bound_instance) {
+        crate::pipeline::offload::close_home_instance(self.bound_instance.instance_id);
+        if let Err(error) = self.scheduler.close_instance(
+            self.bound_instance.instance_id,
+            self.bound_instance.pacing_wait_id,
+        ) {
             tracing::warn!(
                 instance_id = self.bound_instance.instance_id,
                 %error,
@@ -453,6 +531,20 @@ mod tests {
         }
     }
 
+    fn u32_port(port: Port, shape: Shape, values: &[u32]) -> PortBinding {
+        PortBinding {
+            port,
+            source: PortSource::Const {
+                dtype: DType::U32,
+                shape,
+                data: values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            },
+        }
+    }
+
     /// tok (i32 [1], seeded, device) + out (i32 [1], host-reader).
     fn greedy() -> TraceContainer {
         let ops = vec![
@@ -492,6 +584,19 @@ mod tests {
                         data: [0u32, 1].iter().flat_map(|w| w.to_le_bytes()).collect(),
                     },
                 },
+                u32_port(Port::Positions, Shape::vector(1), &[0]),
+                u32_port(Port::Pages, Shape::vector(1), &[0]),
+                u32_port(Port::PageIndptr, Shape::vector(2), &[0, 1]),
+                PortBinding {
+                    port: Port::KvLen,
+                    source: PortSource::Const {
+                        dtype: DType::U32,
+                        shape: Shape::vector(1),
+                        data: 1u32.to_le_bytes().to_vec(),
+                    },
+                },
+                u32_port(Port::WSlot, Shape::vector(1), &[0]),
+                u32_port(Port::WOff, Shape::vector(1), &[0]),
             ],
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
@@ -767,7 +872,7 @@ mod tests {
         /// shape `HostForwardPass::new` binds, built directly so the test
         /// can drop the resulting `ForwardPass` WITHOUT calling
         /// `HostForwardPass::drop`.
-        fn setup(
+        async fn setup(
             operation_log: Arc<Mutex<Vec<String>>>,
         ) -> (
             BatchScheduler,
@@ -783,6 +888,7 @@ mod tests {
                         max_forward_tokens: 64,
                         max_page_refs: 64,
                     },
+                    device_geometry_port_mask: 0,
                 },
                 driver::DriverBackend::Dummy(driver::DummyDriver::new(DummyDriverOptions {
                     operation_log: Some(operation_log),
@@ -801,8 +907,9 @@ mod tests {
                 1,
             );
 
-            let program_id =
-                crate::scheduler::register_program(driver_id, dummy_program()).unwrap();
+            let program_id = crate::scheduler::register_program(driver_id, dummy_program())
+                .await
+                .unwrap();
 
             let decls = [
                 chan(Shape::vector(1), DType::U32, HostRole::None, true),
@@ -845,6 +952,7 @@ mod tests {
                         extern_name: Vec::new(),
                     },
                 )
+                .await
                 .unwrap();
                 cell.lock().unwrap().attach_endpoint(endpoint).unwrap();
             }
@@ -855,14 +963,34 @@ mod tests {
             }];
             let bound = crate::scheduler::bind_instance(
                 driver_id,
+                None,
                 program_id,
                 instance_id,
                 channel_ids,
                 seed_values,
             )
+            .await
             .unwrap();
 
             (scheduler, bound, cells, instance_id)
+        }
+
+        async fn wait_for_operation(operation_log: &Arc<Mutex<Vec<String>>>, operation: &str) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if operation_log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry == operation)
+                    {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("scheduler operation must complete");
         }
 
         /// Assemble a `ForwardPass` exactly like `HostForwardPass::new`
@@ -872,33 +1000,167 @@ mod tests {
             bound_instance: BoundInstance,
             cells: Vec<Arc<Mutex<ChannelCell>>>,
         ) -> ForwardPass {
+            let program = registered();
+            let host_shadow = crate::pipeline::fire::shadow::HostShadow::new(&program.bound, &[]);
             ForwardPass {
                 instance: Instance {
-                    program: registered(),
+                    program,
                     instance_id: bound_instance.instance_id,
                     seeds: Vec::new(),
                 },
+                host_shadow,
+                scheduler: crate::scheduler::scheduler_handle(bound_instance.driver_id).unwrap(),
                 bound_instance,
                 cells,
                 channel_ids: Vec::new(),
                 channel_reps: Vec::new(),
                 fires: None,
                 kv_ws: 0,
-                rs_ws: None,
-                committed_tokens: 0,
+                kv_declaration: KvDeclaration::all(0),
+                rs_ws: Vec::new(),
+                kv_declaration_realized: false,
                 failed: None,
                 devgeo: None,
-                canonical_kv: false,
+                decode_envelope: None,
                 dense_mask: false,
-                fired_once: false,
                 closed: false,
             }
         }
 
-        #[test]
-        fn drop_without_host_drop_closes_instance_and_detaches_channels() {
+        #[tokio::test(flavor = "current_thread")]
+        async fn rs_rebind_is_in_place_and_preserves_pass_state() {
             let operation_log = Arc::new(Mutex::new(Vec::new()));
-            let (_scheduler, bound, cells, instance_id) = setup(operation_log.clone());
+            let (_scheduler, bound, cells, _) = setup(operation_log).await;
+            let mut pass = make_pass(bound, cells);
+            pass.kv_declaration_realized = true;
+            pass.devgeo = Some(crate::pipeline::fire::lease::DevGeo {
+                lease: crate::pipeline::fire::lease::PageLease::new(2),
+                b: 2,
+                fresh_dense: 0,
+                w_cont_dense: 1,
+                has_mask: true,
+            });
+            let instance_id = pass.bound_instance.instance_id;
+
+            pass.replace_rs_working_sets(vec![101, 202]).unwrap();
+
+            assert_eq!(pass.rs_ws, vec![101, 202]);
+            assert_eq!(pass.bound_instance.instance_id, instance_id);
+            assert!(pass.kv_declaration_realized);
+            let devgeo = pass.devgeo.as_ref().expect("device geometry preserved");
+            assert_eq!(devgeo.b, 2);
+            assert!(devgeo.has_mask);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn rs_rebind_rejects_nonempty_fifo_without_mutation() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, _) = setup(operation_log).await;
+            let mut pass = make_pass(bound, cells);
+            pass.rs_ws = vec![7];
+            let fifo = Arc::new(crate::pipeline::fire::PendingFireQueue::from_queue(
+                std::collections::VecDeque::from([crate::pipeline::fire::test_pending_op_stub()]),
+            ));
+            pass.fires = Some(fifo.clone());
+
+            assert!(pass.replace_rs_working_sets(vec![8, 9]).is_err());
+            assert_eq!(pass.rs_ws, vec![7]);
+
+            fifo.lock().unwrap().clear();
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn kv_rebind_is_in_place_and_resets_declaration_realization() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, _) = setup(operation_log).await;
+            let mut pass = make_pass(bound, cells);
+            pass.kv_declaration_realized = true;
+            let instance_id = pass.bound_instance.instance_id;
+
+            pass.replace_kv_declaration(9, KvPageSpan::open(0), KvPageSpan::open(2))
+                .unwrap();
+
+            assert_eq!(pass.kv_ws, 9);
+            assert_eq!(pass.kv_declaration.ws_rep, 9);
+            assert_eq!(pass.kv_declaration.writable.start, 2);
+            assert!(!pass.kv_declaration_realized);
+            assert_eq!(pass.bound_instance.instance_id, instance_id);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn kv_rebind_rejects_nonempty_fifo_without_mutation() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, _) = setup(operation_log).await;
+            let mut pass = make_pass(bound, cells);
+            pass.kv_ws = 7;
+            let fifo = Arc::new(crate::pipeline::fire::PendingFireQueue::from_queue(
+                std::collections::VecDeque::from([crate::pipeline::fire::test_pending_op_stub()]),
+            ));
+            pass.fires = Some(fifo.clone());
+
+            assert!(
+                pass.replace_kv_declaration(8, KvPageSpan::open(0), KvPageSpan::open(1))
+                    .is_err()
+            );
+            assert_eq!(pass.kv_ws, 7);
+
+            fifo.lock().unwrap().clear();
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn device_geometry_rejects_kv_recall() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, _) = setup(operation_log).await;
+            let mut pass = make_pass(bound, cells);
+            pass.kv_ws = 7;
+            pass.devgeo = Some(crate::pipeline::fire::lease::DevGeo {
+                lease: crate::pipeline::fire::lease::PageLease::new(2),
+                b: 2,
+                fresh_dense: 0,
+                w_cont_dense: 1,
+                has_mask: false,
+            });
+
+            assert!(
+                pass.replace_kv_declaration(7, KvPageSpan::open(0), KvPageSpan::open(0))
+                    .is_err()
+            );
+            assert_eq!(pass.kv_ws, 7);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn device_resolved_recall_keeps_ws_and_full_readable_span() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, _) = setup(operation_log).await;
+            let mut pass = make_pass(bound, cells);
+            pass.kv_ws = 7;
+            pass.decode_envelope = Some(crate::pipeline::fire::geometry::DecodeEnvelope {
+                token_count: 1,
+                lane_count: 1,
+                token_indptr: vec![0, 1],
+                loop_carried: true,
+                device_positions: true,
+                has_mask: false,
+            });
+
+            assert!(
+                pass.replace_kv_declaration(8, KvPageSpan::open(0), KvPageSpan::open(0))
+                    .is_err()
+            );
+            assert!(
+                pass.replace_kv_declaration(7, KvPageSpan::open(1), KvPageSpan::open(0))
+                    .is_err()
+            );
+            pass.replace_kv_declaration(7, KvPageSpan::open(0), KvPageSpan::open(2))
+                .unwrap();
+            assert_eq!(pass.kv_declaration.writable.start, 2);
+            assert!(!pass.kv_declaration_realized);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn drop_without_host_drop_closes_instance_and_detaches_channels() {
+            let operation_log = Arc::new(Mutex::new(Vec::new()));
+            let (_scheduler, bound, cells, instance_id) = setup(operation_log.clone()).await;
             let pass = make_pass(bound, cells.clone());
 
             // Simulate a `ResourceTable`/`ProcessCtx` teardown dropping the
@@ -906,6 +1168,7 @@ mod tests {
             // drains the pending FIFO, then calls `close_native`) is never
             // invoked.
             drop(pass);
+            wait_for_operation(&operation_log, "close_instance").await;
 
             assert!(
                 operation_log
@@ -939,15 +1202,16 @@ mod tests {
             }
         }
 
-        #[test]
-        fn explicit_close_native_is_idempotent_with_the_drop_fallback() {
+        #[tokio::test(flavor = "current_thread")]
+        async fn explicit_close_native_is_idempotent_with_the_drop_fallback() {
             let operation_log = Arc::new(Mutex::new(Vec::new()));
-            let (_scheduler, bound, cells, _instance_id) = setup(operation_log.clone());
+            let (_scheduler, bound, cells, _instance_id) = setup(operation_log.clone()).await;
             let mut pass = make_pass(bound, cells.clone());
 
             // The explicit path (what `HostForwardPass::drop` does after
             // draining the FIFO).
             pass.close_native();
+            wait_for_operation(&operation_log, "close_instance").await;
             let closes_after_explicit = operation_log
                 .lock()
                 .unwrap()
@@ -973,10 +1237,10 @@ mod tests {
             );
         }
 
-        #[test]
-        fn can_close_native_on_drop_is_true_with_no_or_empty_fifo() {
+        #[tokio::test(flavor = "current_thread")]
+        async fn can_close_native_on_drop_is_true_with_no_or_empty_fifo() {
             let operation_log = Arc::new(Mutex::new(Vec::new()));
-            let (_scheduler, bound, cells, _instance_id) = setup(operation_log);
+            let (_scheduler, bound, cells, _instance_id) = setup(operation_log).await;
             let mut pass = make_pass(bound, cells);
 
             assert!(pass.fires.is_none());
@@ -985,22 +1249,24 @@ mod tests {
                 "no shared FIFO at all is trivially safe"
             );
 
-            pass.fires = Some(Arc::new(Mutex::new(std::collections::VecDeque::new())));
+            pass.fires = Some(Arc::new(crate::pipeline::fire::PendingFireQueue::new()));
             assert!(
                 pass.can_close_native_on_drop(),
                 "a FIFO that exists but is drained (empty) is just as safe as None"
             );
         }
 
-        #[test]
-        fn can_close_native_on_drop_is_false_with_a_pending_fifo_entry() {
+        #[tokio::test(flavor = "current_thread")]
+        async fn can_close_native_on_drop_is_false_with_a_pending_fifo_entry() {
             let operation_log = Arc::new(Mutex::new(Vec::new()));
-            let (_scheduler, bound, cells, _instance_id) = setup(operation_log);
+            let (_scheduler, bound, cells, _instance_id) = setup(operation_log).await;
             let mut pass = make_pass(bound, cells);
 
             let mut fifo = std::collections::VecDeque::new();
-            fifo.push_back(crate::pipeline::fire::test_pending_move_stub());
-            pass.fires = Some(Arc::new(Mutex::new(fifo)));
+            fifo.push_back(crate::pipeline::fire::test_pending_op_stub());
+            pass.fires = Some(Arc::new(
+                crate::pipeline::fire::PendingFireQueue::from_queue(fifo),
+            ));
 
             assert!(
                 !pass.can_close_native_on_drop(),
@@ -1017,15 +1283,17 @@ mod tests {
         /// premature page reuse. It must instead leave everything alone
         /// (log-and-skip), unlike the empty-FIFO fallback case which DOES
         /// run `close_native` (see `drop_without_host_drop_closes_instance_and_detaches_channels`).
-        #[test]
-        fn drop_with_pending_fifo_entry_skips_native_teardown() {
+        #[tokio::test(flavor = "current_thread")]
+        async fn drop_with_pending_fifo_entry_skips_native_teardown() {
             let operation_log = Arc::new(Mutex::new(Vec::new()));
-            let (_scheduler, bound, cells, instance_id) = setup(operation_log.clone());
+            let (_scheduler, bound, cells, instance_id) = setup(operation_log.clone()).await;
             let mut pass = make_pass(bound, cells.clone());
 
             let mut fifo = std::collections::VecDeque::new();
-            fifo.push_back(crate::pipeline::fire::test_pending_move_stub());
-            pass.fires = Some(Arc::new(Mutex::new(fifo)));
+            fifo.push_back(crate::pipeline::fire::test_pending_op_stub());
+            pass.fires = Some(Arc::new(
+                crate::pipeline::fire::PendingFireQueue::from_queue(fifo),
+            ));
 
             // Simulate a `ResourceTable`/`ProcessCtx` teardown dropping the
             // `ForwardPass` value directly while its FIFO is non-empty.

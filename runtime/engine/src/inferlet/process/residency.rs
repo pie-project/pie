@@ -1,13 +1,13 @@
 //! Process-owned membership inventory for KV/RS working sets and fire queues.
 
-use std::collections::{HashSet, VecDeque};
-use std::sync::{Mutex, Weak};
+use std::collections::HashSet;
+use std::sync::Weak;
 
-use crate::pipeline::fire::{PendingFires, PendingOp};
+use crate::pipeline::fire::{PendingFireQueue, PendingFires};
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::rs::RsWorkingSetId;
 
-type WeakPendingFires = Weak<Mutex<VecDeque<PendingOp>>>;
+type WeakPendingFires = Weak<PendingFireQueue>;
 
 #[derive(Default)]
 pub(crate) struct ProcessResidency {

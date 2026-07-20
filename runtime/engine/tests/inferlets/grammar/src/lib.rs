@@ -26,7 +26,7 @@
 
 use inferlet::mask::{all_allowed, apply_mask_argmax, bit_allowed, pack_allowed};
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, serde_json, Result};
+use inferlet::{Result, model as wit_model, serde_json};
 
 /// Constraint alphabet: the only token ids the grammar ever allows. Small ids
 /// the model rarely naturally argmaxes, so the natural pick is forced out.
@@ -58,10 +58,6 @@ impl NoRepeatMatcher {
     }
 }
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
@@ -85,23 +81,28 @@ async fn main(input: String) -> Result<String> {
     }
     let seed_tok = *prompt.last().unwrap() as i32;
 
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
-    ws.reserve(1).map_err(|e| format!("ws.reserve: {e}"))?;
+    let ws = WorkingSet::new();
+    let max_pages = (max_tokens as u32 + 1).div_ceil(PAGE_T).max(1);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
 
     // Channels: tok_in is the device loop-carried token (seeded; each fire's
     // embed takes it, the epilogue re-puts the constrained pick); gmask is the
     // per-step host-fed allowed mask; tok_out/raw are host-reader outputs
     // (constrained token + RAW unmasked logits for the CPU reference).
-    let tok_in = bx(Channel::from(vec![seed_tok]).named("tok_in"));
-    let klen = bx(Channel::from(vec![1u32]).named("klen"));
-    let gmask = bx(Channel::new([vocab], dtype::bool).named("gmask"));
-    let tok_out = bx(Channel::new([1], dtype::i32).named("tok_out"));
-    let raw = bx(Channel::new([vocab], dtype::f32).named("raw"));
+    let tok_in = Channel::from(vec![seed_tok]).named("tok_in");
+    let kv_len = Channel::from(vec![1u32]).named("kv_len");
+    let gmask = Channel::new([vocab], dtype::bool).named("gmask");
+    let tok_out = Channel::new([1], dtype::i32).named("tok_out");
+    let raw = Channel::new([vocab], dtype::f32).named("raw");
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(tok_in, Tensor::constant(vec![0u32, 1]));
-    fwd.attn_working_set(ws, klen);
+    let fwd = ForwardPass::new();
+    fwd.embed(&tok_in, Tensor::constant(vec![0u32, 1]));
+    fwd.port_channel(Port::KvLen, &kv_len);
+    fwd.attn_working_set(&ws, .., ..)?;
+    fwd.derive_dense_geometry();
     fwd.epilogue(move || {
+        let length = kv_len.take().tensor();
         // Takes + compute first, puts last (value-id discipline). `tok` is
         // pre-reshaped to the channel cell shape so the terminal-output puts
         // (tok_out/raw, host-read) emit NO value-defining ops — their auto-
@@ -110,6 +111,7 @@ async fn main(input: String) -> Result<String> {
         let lg = intrinsics::logits(); // [V] f32 (read-out row)
         let tok = reshape(reduce_argmax(mask_apply(&lg, &m)), [1]); // [1] i32
         tok_in.put(&tok);
+        kv_len.put(add(&length, 1u32));
         tok_out.put(&tok);
         raw.put(&lg);
     });
@@ -130,16 +132,17 @@ async fn main(input: String) -> Result<String> {
             .collect();
 
         gmask.put(mask_bool);
-        fwd
-            .submit(&pipeline)
+        fwd.submit(&pipeline)
             .map_err(|e| format!("submit @{step}: {e}"))?;
         let token = tok_out
             .take()
             .get::<i32>()
+            .await
             .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
         let logits = raw
             .take()
             .get::<f32>()
+            .await
             .map_err(|e| format!("raw.take @{step}: {e}"))?;
 
         // Assert #1 CONFORM: device token == host apply_mask_argmax(raw, mask).

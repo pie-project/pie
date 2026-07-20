@@ -108,6 +108,10 @@ fn build_model(
                 rs_cache_required: g.caps.rs_cache_required,
                 rs_cache_slots: g.caps.rs_cache_slots as usize,
                 rs_cache_slot_bytes: g.caps.rs_cache_slot_bytes,
+                has_mtp_logits: g.caps.has_mtp_logits,
+                has_mtp_drafts: g.caps.has_mtp_drafts,
+                has_value_head: g.caps.has_value_head,
+                device_geometry_port_mask: g.caps.device_geometry_port_mask,
                 limits: pie_engine::driver::SchedulerLimits {
                     max_forward_requests: g.caps.max_forward_requests as usize,
                     max_forward_tokens: g.caps.max_forward_tokens as usize,
@@ -149,10 +153,17 @@ mod tests {
             vocab_size: 151936,
             max_model_len: 4096,
             activation_dtype: "bfloat16".into(),
+            hidden_size: 4096,
+            supports_media_encode: false,
             snapshot_dir: "/tmp/snapshot".into(),
             rs_cache_required: false,
             rs_cache_slots: 0,
             rs_cache_slot_bytes: 0,
+            has_mtp_logits: true,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
+            kv_handle: None,
         }
     }
 
@@ -169,6 +180,9 @@ mod tests {
             max_forward_tokens: caps.max_forward_tokens,
             max_forward_requests: caps.max_forward_requests,
             max_page_refs: caps.max_page_refs,
+            has_mtp_logits: caps.has_mtp_logits,
+            has_mtp_drafts: caps.has_mtp_drafts,
+            has_value_head: caps.has_value_head,
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,
@@ -225,6 +239,11 @@ arch_name = "qwen3"
         assert_eq!(m.drivers.len(), 1);
         assert_eq!(m.drivers[0].total_pages, 1024);
         assert_eq!(m.drivers[0].limits.max_page_refs, 262144);
+        assert!(m.drivers[0].has_mtp_logits);
+        assert_eq!(
+            m.drivers[0].device_geometry_port_mask,
+            pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
+        );
     }
 
     #[test]

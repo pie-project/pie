@@ -27,7 +27,7 @@
 //! deferred host-writer-mask staging gap does not arise.
 
 use inferlet::ptir::prelude::*;
-use inferlet::{model as wit_model, Result};
+use inferlet::{Result, model as wit_model};
 
 const B: u32 = 2; // beams
 const PAGE_T: u32 = 16; // tokens per pool page
@@ -47,10 +47,6 @@ const SRC_FLAT: u32 = 0; // BOS lives at flat pool position 0
 const DST_FLAT: u32 = 1; // page 0, off 1 — materialised, dead, within causal range
 const INIT_FILL: u32 = 2; // decode starts at flat 2, leaving flat 1 permanently dead
 
-fn bx<T>(v: T) -> &'static T {
-    Box::leak(Box::new(v))
-}
-
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     // Two modes on the SAME code/geometry so the ONLY difference is the physical
@@ -65,49 +61,55 @@ async fn main(input: String) -> Result<String> {
     // Fixed physical page pool (bulk growth), used for BOTH the fire descriptors
     // and the copy_into move. Flat pool position `wpos` maps to physical page
     // `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
-    let ws: &'static WorkingSet = bx(WorkingSet::new());
-    let pool = ws.reserve(POOL_PAGES).map_err(|e| format!("ws.reserve pool: {e}"))?;
-    let pool_ids: &'static Vec<u32> = bx(pool.ids().to_vec()); // [POOL_PAGES]
+    let ws = WorkingSet::new();
+    let pool = ws
+        .reserve(POOL_PAGES)
+        .map_err(|e| format!("ws.reserve pool: {e}"))?;
+    let pool_ids = pool.ids().to_vec(); // [POOL_PAGES]
     let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect();
     let phys0 = pool_ids[0];
 
-    let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..POOL).map(|p| p == SRC_FLAT)).collect();
+    let init_mask: Vec<bool> = (0..B)
+        .flat_map(|_| (0..POOL).map(|p| p == SRC_FLAT))
+        .collect();
 
     // Loop-carried state (guest-seeded). klen stays at PAGE_T so the attention
     // scans ONLY the materialised page 0 (flat 0..15); the moved BOS cell lands at
     // flat 15 inside that same page, and the unmaterialised pool tail is never read.
-    let mask = bx(Channel::from_shaped([B, POOL], init_mask).named("mask"));
-    let scores = bx(Channel::from(vec![0.0f32; B as usize]).named("scores"));
-    let toks = bx(Channel::from(vec![BOS; B as usize]).named("toks"));
-    let pos = bx(Channel::from(vec![0u32; B as usize]).named("pos"));
-    let fill = bx(Channel::from(vec![INIT_FILL; 1]).named("fill"));
-    let klen = bx(Channel::from(vec![PAGE_T; B as usize]).named("klen"));
-    let w_slot = bx(Channel::from(vec![phys0; B as usize]).named("w_slot"));
-    let w_off = bx(Channel::from(vec![0u32; B as usize]).named("w_off"));
-    let pages = bx(Channel::from(tiled.clone()).named("pages"));
-    let pool_ids_ch = bx(Channel::new([POOL_PAGES], dtype::u32).named("pool_ids"));
+    let mask = Channel::from_shaped([B, POOL], init_mask).named("mask");
+    let scores = Channel::from(vec![0.0f32; B as usize]).named("scores");
+    let toks = Channel::from(vec![BOS; B as usize]).named("toks");
+    let pos = Channel::from(vec![0u32; B as usize]).named("pos");
+    let fill = Channel::from(vec![INIT_FILL; 1]).named("fill");
+    let klen = Channel::from(vec![PAGE_T; B as usize]).named("klen");
+    let w_slot = Channel::from(vec![phys0; B as usize]).named("w_slot");
+    let w_off = Channel::from(vec![0u32; B as usize]).named("w_off");
+    let pages = Channel::from(tiled.clone()).named("pages");
+    let pool_ids_ch = Channel::new([POOL_PAGES], dtype::u32).named("pool_ids");
     // In-graph mask-remap descriptor (host-fed scalars, NOT a host-fed mask):
     // remap_on gates an in-graph `select`; remap_src/remap_dst name the columns.
-    let remap_on = bx(Channel::new([1], dtype::bool).named("remap_on"));
-    let remap_src = bx(Channel::new([1], dtype::u32).named("remap_src"));
-    let remap_dst = bx(Channel::new([1], dtype::u32).named("remap_dst"));
-    let out = bx(Channel::new([B], dtype::i32).named("out"));
-    let out_par = bx(Channel::new([B], dtype::u32).named("out_par"));
-    let out_scr = bx(Channel::new([B], dtype::f32).named("out_scr"));
+    let remap_on = Channel::new([1], dtype::bool).named("remap_on");
+    let remap_src = Channel::new([1], dtype::u32).named("remap_src");
+    let remap_dst = Channel::new([1], dtype::u32).named("remap_dst");
+    let out = Channel::new([B], dtype::i32).named("out");
+    let out_par = Channel::new([B], dtype::u32).named("out_par");
+    let out_scr = Channel::new([B], dtype::f32).named("out_scr");
 
     let pidx_const: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
-    let page_indptr = bx(Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr"));
+    let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
     let lanes_b = Tensor::constant((0u32..=B).collect::<Vec<_>>());
 
-    let fwd: &'static ForwardPass<'static> = bx(ForwardPass::new());
-    fwd.embed(toks, lanes_b);
-    fwd.positions(pos);
-    fwd.attn_working_set(ws, klen);
-    fwd.port_channel(Port::Pages, pages);
-    fwd.port_channel(Port::PageIndptr, page_indptr);
-    fwd.port_channel(Port::WSlot, w_slot);
-    fwd.port_channel(Port::WOff, w_off);
-    fwd.attn_mask(mask);
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, lanes_b);
+    fwd.positions(&pos);
+    fwd.port_channel(Port::KvLen, &klen);
+    fwd.attn_working_set(&ws, .., ..)?;
+    fwd.derive_dense_geometry();
+    fwd.port_channel(Port::Pages, &pages);
+    fwd.port_channel(Port::PageIndptr, &page_indptr);
+    fwd.port_channel(Port::WSlot, &w_slot);
+    fwd.port_channel(Port::WOff, &w_off);
+    fwd.attn_mask(&mask);
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block (identical to beam-designb).
         let cand = add(
@@ -157,7 +159,11 @@ async fn main(input: String) -> Result<String> {
         w_off.put(&w_off_v);
 
         let filled = add(&base, B);
-        klen.put(broadcast(reshape(&Tensor::constant(vec![PAGE_T]), [1]), [B]));
+        klen.take();
+        klen.put(broadcast(
+            reshape(&Tensor::constant(vec![PAGE_T]), [1]),
+            [B],
+        ));
 
         pos.put(add(pos.take(), 1u32));
         fill.put(&filled);
@@ -167,8 +173,12 @@ async fn main(input: String) -> Result<String> {
             broadcast(reshape(&pids, [1, POOL_PAGES]), [B, POOL_PAGES]),
             [B * POOL_PAGES],
         );
+        pages.take();
         pages.put(&pages_ig);
-        page_indptr.put(&Tensor::constant((0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>()));
+        page_indptr.take();
+        page_indptr.put(&Tensor::constant(
+            (0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>(),
+        ));
 
         out.put(&tok_i);
         out_par.put(&parent);
@@ -214,14 +224,17 @@ async fn main(input: String) -> Result<String> {
         let picked = out
             .take()
             .get::<i32>()
+            .await
             .map_err(|e| format!("out.take @{step}: {e}"))?;
         let _parents = out_par
             .take()
             .get::<u32>()
+            .await
             .map_err(|e| format!("out_par.take @{step}: {e}"))?;
         let _scr = out_scr
             .take()
             .get::<f32>()
+            .await
             .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);

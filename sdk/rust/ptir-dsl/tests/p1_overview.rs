@@ -10,7 +10,7 @@
 use ptir_dsl::builder::Builder;
 use ptir_dsl::prelude::*;
 use ptir_dsl::ptir::op::Op;
-use ptir_dsl::{Channel, Traced, TraceError};
+use ptir_dsl::{Channel, TraceError, Traced};
 
 const VOCAB: u32 = 32_000;
 const PAGE: u32 = 16;
@@ -43,7 +43,8 @@ fn build_s3() -> Traced {
     let ctr1: &'static Tensor = leak(Tensor::constant([0u32, 1]));
     let tok: &'static Channel = leak(Channel::new([1], dtype::i32).named("tok"));
     let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
-    let mask: &'static Channel = leak(Channel::new([intrinsics::vocab()], dtype::bool).named("mask"));
+    let mask: &'static Channel =
+        leak(Channel::new([intrinsics::vocab()], dtype::bool).named("mask"));
     let len: &'static Channel = leak(Channel::from([1u32]).named("len"));
     let rng_ch: &'static Channel = leak(Channel::from([7u32, 0]).named("rng"));
 
@@ -93,7 +94,10 @@ fn s3_identity_hash_is_stable() {
     let a = build_s3().identity_hash();
     let b = build_s3().identity_hash();
     assert_eq!(a, b, "the same program hashes identically (C3)");
-    assert_eq!(a, GOLDEN_S3, "byte-identical to the pre-A1 golden container");
+    assert_eq!(
+        a, GOLDEN_S3,
+        "byte-identical to the pre-A1 golden container"
+    );
 }
 
 #[test]
@@ -172,7 +176,9 @@ fn lint_readiness_conflict_consumed_never_produced() {
         tok.put(add(&v, 1u32));
     });
 
-    let err = b.build().expect_err("consuming an unproduced channel must fail");
+    let err = b
+        .build()
+        .expect_err("consuming an unproduced channel must fail");
     let msg = err.to_string();
     assert!(
         err.0.iter().any(|e| matches!(
@@ -216,8 +222,9 @@ fn lint_sink_misplacement_in_epilogue() {
 // overview §6.2 — beam search (the second P1 exit gate): reorder = gathers,
 // divergence = freeze. Exercises the full op set (top_k, log_softmax, gather,
 // scatter_set, reshape, iota, broadcast, div/rem/mul/sub, lt/and/eq, cast).
-// Verbatim: the tracer auto-drains pure-derivative device channels (klen/kvm)
-// that are put-without-take (overview elides the drain; the tracer injects it).
+// F8: no auto-drain synthesis — the loop-carried peek-port channels
+// (klen/kvm) drain EXPLICITLY (`take()` directly before the re-put), which
+// reproduces the previously-synthesized ops verbatim (same golden hash).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -264,7 +271,10 @@ fn s6_2_beam_epilogue_binds() {
     b.bind_port(Port::WOff, w_off);
     b.bind_port(Port::AttnMask, kvm);
     b.stage(Stage::Epilogue, move || {
-        let cand = add(broadcast(reshape(scores.take(), [B, 1]), [B, V]), log_softmax(intrinsics::logits()));
+        let cand = add(
+            broadcast(reshape(scores.take(), [B, 1]), [B, V]),
+            log_softmax(intrinsics::logits()),
+        );
         let (s, i) = top_k(reshape(cand, [B * V]), B);
         let parent = div(&i, V);
         let pg = gather(pages.take(), &parent);
@@ -278,15 +288,22 @@ fn s6_2_beam_epilogue_binds() {
         let off = select(&cont, &tf, 0u32);
         let n2 = select(&cont, &n, add(&n, 1u32));
         let tcol = add(mul(&lanes, P), sub(&n2, 1u32));
-        pages.put(reshape(scatter_set(reshape(pg, [B * P]), &tcol, &slot), [B, P]));
+        pages.put(reshape(
+            scatter_set(reshape(pg, [B * P]), &tcol, &slot),
+            [B, P],
+        ));
         let off1 = add(&off, 1u32);
         let pl2 = reshape(scatter_set(reshape(pl, [B * P]), &tcol, &off1), [B, P]);
         lens.put(&pl2);
-        klen.put(add(mul(sub(&n2, 1u32), PAGE_T), &off1));
+        let klen_next = add(mul(sub(&n2, 1u32), PAGE_T), &off1);
+        klen.take();
+        klen.put(klen_next);
         let io = reshape(iota(PAGE_T), [1, 1, PAGE_T]);
         let iob = broadcast(io, [B, P, PAGE_T]);
         let lb = broadcast(reshape(&pl2, [B, P, 1]), [B, P, PAGE_T]);
-        kvm.put(reshape(lt(iob, lb), [B, P * PAGE_T]));
+        let kvm_next = reshape(lt(iob, lb), [B, P * PAGE_T]);
+        kvm.take();
+        kvm.put(kvm_next);
         pos.put(add(pos.take(), 1u32));
         np.put(&n2);
         tslot.put(&slot);
@@ -306,15 +323,27 @@ fn s6_2_beam_epilogue_binds() {
     let c = traced.container();
     assert_eq!(c.stages[0].stage, Stage::Epilogue);
     assert_eq!(c.channels.len(), 16, "16 beam channels");
-    assert_eq!(traced.identity_hash(), GOLDEN_BEAM, "byte-identical to the pre-A1 golden");
+    assert_eq!(
+        traced.identity_hash(),
+        GOLDEN_BEAM,
+        "canonical bytes remain stable"
+    );
 
     // Regression (G2 fire-0 seed round-trip): channel 0 (`pages`) is [B,P] (2D).
     // The [B,P] shape MUST survive encode→decode, else `validate_seeds` rejects
     // the [B,P] seed as a byte-length mismatch (numel collapse).
-    assert_eq!(c.channels[0].shape.numel(), (B * P) as u64, "pages [B,P] numel in built container");
-    let decoded = ptir_dsl::ptir::container::decode(&traced.encode())
-        .expect("decode beam container");
-    assert_eq!(decoded.channels[0].shape.dims(), &[B, P], "pages 2D dims survive encode->decode");
+    assert_eq!(
+        c.channels[0].shape.numel(),
+        (B * P) as u64,
+        "pages [B,P] numel in built container"
+    );
+    let decoded =
+        ptir_dsl::ptir::container::decode(&traced.encode()).expect("decode beam container");
+    assert_eq!(
+        decoded.channels[0].shape.dims(),
+        &[B, P],
+        "pages 2D dims survive encode->decode"
+    );
     assert_eq!(
         decoded.channels[0].shape.numel(),
         (B * P) as u64,
@@ -325,10 +354,26 @@ fn s6_2_beam_epilogue_binds() {
     // no program/descriptor consumer) → inferred host Reader so the guest's `take`
     // is accepted; fresh (host-put headroom) is a Writer.
     use ptir_dsl::ptir::container::HostRole;
-    assert_eq!(decoded.channels[13].host_role, HostRole::Reader, "out (13) is host-Reader");
-    assert_eq!(decoded.channels[14].host_role, HostRole::Reader, "out_par (14) is host-Reader");
-    assert_eq!(decoded.channels[15].host_role, HostRole::Reader, "out_scr (15) is host-Reader");
-    assert_eq!(decoded.channels[12].host_role, HostRole::Writer, "fresh (12) is host-Writer");
+    assert_eq!(
+        decoded.channels[13].host_role,
+        HostRole::Reader,
+        "out (13) is host-Reader"
+    );
+    assert_eq!(
+        decoded.channels[14].host_role,
+        HostRole::Reader,
+        "out_par (14) is host-Reader"
+    );
+    assert_eq!(
+        decoded.channels[15].host_role,
+        HostRole::Reader,
+        "out_scr (15) is host-Reader"
+    );
+    assert_eq!(
+        decoded.channels[12].host_role,
+        HostRole::Writer,
+        "fresh (12) is host-Writer"
+    );
 }
 
 // overview §6.1 — native-MTP + grammar spec-verify binds (the M3-G1 §6.1 pass:
@@ -371,5 +416,9 @@ fn s6_1_mtp_grammar_binds() {
         out.put(&commit);
     });
     let traced = b.build().expect("§6.1 mtp-grammar epilogue must bind");
-    assert_eq!(traced.identity_hash(), GOLDEN_MTP_GRAMMAR, "byte-identical to the pre-A1 golden");
+    assert_eq!(
+        traced.identity_hash(),
+        GOLDEN_MTP_GRAMMAR,
+        "byte-identical to the pre-A1 golden"
+    );
 }

@@ -51,6 +51,26 @@ typedef __nv_bfloat16 bf;
 __device__ __forceinline__ float F(bf x){return __bfloat162float(x);}
 __device__ __forceinline__ bf   Bf(float x){return __float2bfloat16(x);}
 
+class DeviceScratch {
+public:
+    ~DeviceScratch() {
+        for (void* pointer : allocations_) {
+            if (pointer != nullptr) cudaFree(pointer);
+        }
+    }
+
+    template <typename T>
+    T* alloc(long count) {
+        T* pointer = nullptr;
+        ACK(cudaMalloc(&pointer, count * sizeof(T)));
+        allocations_.push_back(pointer);
+        return pointer;
+    }
+
+private:
+    std::vector<void*> allocations_;
+};
+
 // ── Shared elementwise / GEMM / norm kernels (vision-style) ──────────────────
 __global__ void k_matmul(const bf* x,const bf* W,bf* y,int N,int K,int O){
     int n=blockIdx.y*blockDim.y+threadIdx.y,o=blockIdx.x*blockDim.x+threadIdx.x;if(n>=N||o>=O)return;
@@ -224,7 +244,8 @@ void run_gemma4_audio(const AudioRawWeights& w,
     const float k_scale=logf(1.f+(float)M_E)/logf(2.f);
     const int past=w.context_left-1; (void)w.context_right;  // future horizon == 0 (mask is plain causal sliding window)
 
-    auto MAL=[&](long n){bf* d;ACK(cudaMalloc(&d,n*sizeof(bf)));return d;};
+    DeviceScratch scratch;
+    auto MAL=[&](long n){return scratch.alloc<bf>(n);};
     auto clin=[&](const bf* x,bf* out,bf* xc,const AudioClipRaw& c,int N,int Kin,int Out){
         k_clamp<<<((long)N*Kin+255)/256,256,0,S>>>(x,xc,c.imin,c.imax,(long)N*Kin);
         k_matmul<<<G2(Out,N),B2,0,S>>>(xc,c.w,out,N,Kin,Out);
@@ -241,11 +262,10 @@ void run_gemma4_audio(const AudioRawWeights& w,
 
     bf* feat_bf=MAL((long)T0*F0);
     {   // upload f32 features (host) → device → bf16 [1, T0, F0]
-        float* f32d;ACK(cudaMalloc(&f32d,(long)T0*F0*4));
+        float* f32d=scratch.alloc<float>((long)T0*F0);
         ACK(cudaMemcpyAsync(f32d,features,(long)T0*F0*4,cudaMemcpyHostToDevice,S));
         k_f32_to_bf16<<<((long)T0*F0+255)/256,256,0,S>>>(f32d,feat_bf,(long)T0*F0);
         ACK(cudaStreamSynchronize(S));
-        cudaFree(f32d);
     }
     // layer0: conv [1,T0,F0]→[C0,T1,F1], LN-over-ch + ReLU.
     bf* c0=MAL((long)C0*T1*F1);
@@ -341,7 +361,6 @@ void run_gemma4_audio(const AudioRawWeights& w,
     CKPT("projected",out_proj,(long)N*TXT);
 
     ACK(cudaStreamSynchronize(S));
-    for(bf* b:{feat_bf,c0,c0cl,c1,c1cl,flat,h,hn,xc,ffmid,ffout,q,k,v,attn,glu,conv,tmp,start,enc,en,pe,relk})cudaFree(b);
 }
 
 void scatter_gemma4_audio(const Gemma4AudioInputs& ain, bf* hidden,
@@ -359,13 +378,59 @@ void scatter_gemma4_audio(const Gemma4AudioInputs& ain, bf* hidden,
         const std::uint32_t anchor=ain.anchor_rows_h[ci];
 
         // encode → projected [out_len, text_hidden] → overwrite the anchor rows.
-        bf* proj_d; ACK(cudaMalloc(&proj_d,(long)out_len*text_hidden*sizeof(bf)));
+        DeviceScratch scratch;
+        bf* proj_d=scratch.alloc<bf>((long)out_len*text_hidden);
         run_gemma4_audio(w, feat_h, n_frames, n_mel, out_len, proj_d, S);
         ACK(cudaMemcpyAsync(hidden + (long)anchor*text_hidden, proj_d,
                             (long)out_len*text_hidden*sizeof(bf),
                             cudaMemcpyDeviceToDevice, S));
         ACK(cudaStreamSynchronize(S));
-        cudaFree(proj_d);
+    }
+}
+
+void encode_gemma4_audio(const Gemma4AudioInputs& ain,
+                         std::uint16_t* output_rows_h,
+                         std::size_t output_bytes,
+                         std::uint32_t* output_row_indptr_h,
+                         cudaStream_t S) {
+    if (ain.weights == nullptr || ain.num_clips <= 0 ||
+        output_rows_h == nullptr || output_row_indptr_h == nullptr) {
+        throw std::runtime_error("gemma4_audio: invalid standalone encode inputs");
+    }
+    const AudioRawWeights& w = *ain.weights;
+    const int n_mel = ain.n_mel;
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(w.text_hidden) * sizeof(bf);
+    std::size_t output_rows = 0;
+    output_row_indptr_h[0] = 0;
+    for (int clip = 0; clip < ain.num_clips; ++clip) {
+        const long begin = ain.feature_byte_indptr_h[clip];
+        const long end = ain.feature_byte_indptr_h[clip + 1];
+        const int floats = static_cast<int>((end - begin) / sizeof(float));
+        const int frames = floats / n_mel;
+        if (frames <= 0 || floats % n_mel != 0) {
+            throw std::runtime_error("gemma4_audio: invalid feature shape");
+        }
+        const int rows = gemma4_audio_subsampled_len(frames);
+        if ((output_rows + static_cast<std::size_t>(rows)) * row_bytes >
+            output_bytes) {
+            throw std::runtime_error(
+                "gemma4_audio: encode output buffer too small");
+        }
+        DeviceScratch scratch;
+        bf* projected = scratch.alloc<bf>(
+            static_cast<long>(rows) * w.text_hidden);
+        run_gemma4_audio(
+            w, ain.features_h + begin / sizeof(float), frames, n_mel,
+            rows, projected, S);
+        ACK(cudaMemcpyAsync(
+            output_rows_h + output_rows * w.text_hidden, projected,
+            static_cast<long>(rows) * w.text_hidden * sizeof(bf),
+            cudaMemcpyDeviceToHost, S));
+        ACK(cudaStreamSynchronize(S));
+        output_rows += static_cast<std::size_t>(rows);
+        output_row_indptr_h[clip + 1] =
+            static_cast<std::uint32_t>(output_rows);
     }
 }
 

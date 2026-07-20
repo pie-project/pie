@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pie_driver_abi::PieInstanceBinding;
+use pie_driver_abi::{GeometryClass, PieInstanceBinding};
 
 use super::channel::ChannelValue;
 
@@ -22,6 +22,7 @@ pub struct InstanceBindingPlan {
     pub pacing_wait_id: u64,
     pub channel_ids: Vec<u64>,
     pub seed_values: Vec<ChannelValue>,
+    pub geometry_class: GeometryClass,
 }
 
 impl InstanceBindingPlan {
@@ -36,6 +37,12 @@ impl InstanceBindingPlan {
                 self.requested_instance_id
             );
         }
+        anyhow::ensure!(
+            binding.geometry_class == self.geometry_class as u32,
+            "native binding acknowledged geometry class {}, expected {:?}",
+            binding.geometry_class,
+            self.geometry_class
+        );
         Ok(())
     }
 }
@@ -163,6 +170,7 @@ pub struct BoundInstance {
     pub program_id: ProgramId,
     pub instance_id: InstanceId,
     pub pacing_wait_id: u64,
+    pub geometry_class: GeometryClass,
     wait_slots: Arc<BoundWaitSlots>,
 }
 
@@ -179,6 +187,8 @@ impl BoundInstance {
             program_id,
             instance_id: binding.instance_id,
             pacing_wait_id,
+            geometry_class: GeometryClass::try_from(binding.geometry_class)
+                .expect("validated geometry class"),
             wait_slots,
         }
     }
@@ -195,6 +205,10 @@ impl BoundInstance {
     pub(crate) fn wait_slots(&self) -> Arc<BoundWaitSlots> {
         Arc::clone(&self.wait_slots)
     }
+
+    pub fn close_wait_slots(&self) {
+        self.wait_slots.close();
+    }
 }
 
 #[cfg(test)]
@@ -209,16 +223,23 @@ mod tests {
             pacing_wait_id: 11,
             channel_ids: vec![101],
             seed_values: Vec::new(),
+            geometry_class: GeometryClass::Host,
         }
     }
 
     #[test]
     fn accepts_driver_or_requested_identity() {
         binding_plan(0)
-            .validate_binding(&PieInstanceBinding { instance_id: 9 })
+            .validate_binding(&PieInstanceBinding {
+                instance_id: 9,
+                ..PieInstanceBinding::default()
+            })
             .unwrap();
         binding_plan(7)
-            .validate_binding(&PieInstanceBinding { instance_id: 7 })
+            .validate_binding(&PieInstanceBinding {
+                instance_id: 7,
+                ..PieInstanceBinding::default()
+            })
             .unwrap();
     }
 
@@ -231,8 +252,25 @@ mod tests {
         );
         assert!(
             binding_plan(7)
-                .validate_binding(&PieInstanceBinding { instance_id: 8 })
+                .validate_binding(&PieInstanceBinding {
+                    instance_id: 8,
+                    ..PieInstanceBinding::default()
+                })
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_geometry_ack() {
+        let mut plan = binding_plan(0);
+        plan.geometry_class = GeometryClass::DecodeEnvelope;
+        assert!(
+            plan.validate_binding(&PieInstanceBinding {
+                instance_id: 9,
+                geometry_class: GeometryClass::Host as u32,
+                reserved0: 0,
+            })
+            .is_err()
         );
     }
 }

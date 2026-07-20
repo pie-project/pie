@@ -18,7 +18,6 @@ use crate::store::kv::{KvRestoreTxn, KvSuspendPrepare, KvSuspendTxn, SuspendDisp
 struct TeardownFireContext {
     process_id: uuid::Uuid,
     resources: wasmtime::component::ResourceTable,
-    working_sets: HashSet<WorkingSetId>,
 }
 
 impl crate::pipeline::fire::FireContext for TeardownFireContext {
@@ -30,12 +29,12 @@ impl crate::pipeline::fire::FireContext for TeardownFireContext {
         self.process_id
     }
 
-    fn kv_working_sets(&self) -> HashSet<WorkingSetId> {
-        self.working_sets.clone()
-    }
-
     async fn honor_preemption(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    fn preemption_signal(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
     }
 }
 
@@ -45,15 +44,9 @@ pub(crate) fn defer_resource_teardown(
     residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
 ) {
     let snapshot = residency.lock().unwrap().snapshot();
-    let working_sets = snapshot
-        .kv_working_sets
-        .into_iter()
-        .filter_map(|(model, driver, ws)| (model == 0 && driver == 0).then_some(ws))
-        .collect();
     let mut context = TeardownFireContext {
         process_id,
         resources,
-        working_sets,
     };
     if snapshot
         .pipelines
@@ -74,6 +67,7 @@ pub(crate) fn defer_resource_teardown(
     };
     runtime.spawn(async move {
         for fires in snapshot.pipelines {
+            let _finalize_guard = fires.finalize_guard().await;
             loop {
                 let op = fires.lock().unwrap().pop_front();
                 let Some(op) = op else {
@@ -101,7 +95,7 @@ struct ResidencyTxnGuard {
     model: usize,
     driver: usize,
     txn: Option<ResidencyTxn>,
-    completion: Option<crate::driver::SubmissionCompletion>,
+    completion: Option<crate::scheduler::ControlCompletion>,
 }
 
 impl ResidencyTxnGuard {
@@ -123,7 +117,7 @@ impl ResidencyTxnGuard {
         }
     }
 
-    fn arm(&mut self, completion: crate::driver::SubmissionCompletion) {
+    fn arm(&mut self, completion: crate::scheduler::ControlCompletion) {
         self.completion = Some(completion);
     }
 
@@ -150,11 +144,14 @@ impl ResidencyTxnGuard {
             return;
         };
         let stores = crate::store::registry::get(self.model, self.driver);
-        let mut kv = stores.kv.lock().unwrap();
-        match txn {
+        let tag = match &txn {
+            ResidencyTxn::Suspend(_) => "preemption-suspend",
+            ResidencyTxn::Restore(_) => "preemption-restore",
+        };
+        crate::store::registry::with_kv_lock(&stores.kv, tag, |kv| match txn {
             ResidencyTxn::Suspend(txn) => kv.abort_suspend(txn),
             ResidencyTxn::Restore(txn) => kv.abort_restore(txn),
-        }
+        });
     }
 }
 
@@ -180,14 +177,16 @@ impl Drop for ResidencyTxnGuard {
             return;
         };
         runtime.spawn(async move {
-            let _ = completion.await;
+            let _ = completion.wait().await;
             let stores = crate::store::registry::get(model, driver);
-            let mut kv = stores.kv.lock().unwrap();
-            match txn {
+            let tag = match &txn {
+                ResidencyTxn::Suspend(_) => "preemption-suspend",
+                ResidencyTxn::Restore(_) => "preemption-restore",
+            };
+            crate::store::registry::with_kv_lock(&stores.kv, tag, |kv| match txn {
                 ResidencyTxn::Suspend(txn) => kv.abort_suspend(txn),
                 ResidencyTxn::Restore(txn) => kv.abort_restore(txn),
-            }
-            drop(kv);
+            });
             if let Some(orchestrator) = crate::store::reclaim::contention() {
                 orchestrator.on_blocks_freed();
             }
@@ -198,6 +197,7 @@ impl Drop for ResidencyTxnGuard {
 async fn drain_preemption_safe_fires(ctx: &mut ProcessCtx) -> Result<()> {
     let pipelines = ctx.residency_snapshot().pipelines;
     for fires in pipelines {
+        let _finalize_guard = fires.finalize_guard().await;
         loop {
             let op = {
                 let mut queue = fires.lock().unwrap();
@@ -284,12 +284,13 @@ pub(crate) async fn honor_idle(
     if !orchestrator.begin_quiesce(pid) {
         return Ok(false);
     }
-    if let Err(error) = crate::scheduler::freeze_pipeline(pid) {
+    if let Err(error) = crate::scheduler::freeze_pipeline(pid).await {
         decline_park(pid);
         return Err(error).context("freeze scheduler preparation for idle suspension");
     }
     let snapshot = residency.lock().unwrap().snapshot();
     for fires in &snapshot.pipelines {
+        let _finalize_guard = fires.finalize_guard().await;
         loop {
             let op = {
                 let mut queue = fires.lock().unwrap();
@@ -438,7 +439,7 @@ pub(crate) async fn honor(ctx: &mut ProcessCtx) -> Result<()> {
     if !orchestrator.should_park(pid) || !orchestrator.begin_quiesce(pid) {
         return Ok(());
     }
-    if let Err(error) = crate::scheduler::freeze_pipeline(pid) {
+    if let Err(error) = crate::scheduler::freeze_pipeline(pid).await {
         decline_park(pid);
         return Err(error).context("freeze scheduler preparation for suspension");
     }
@@ -469,18 +470,21 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
     let orchestrator = crate::store::reclaim::contention()
         .context("KV contention orchestrator disappeared during suspend")?;
     let stores = crate::store::registry::get(0, 0);
-    let prepared = match stores.kv.lock().unwrap().prepare_suspend(&working_sets) {
-        Ok(prepared) => prepared,
-        Err(crate::store::kv::KvStoreError::HostSwapFull { .. }) => {
-            orchestrator.record_host_swap_exhaustion();
-            decline_park(pid);
-            return Ok(());
-        }
-        Err(error) => {
-            decline_park(pid);
-            return Err(error).context("prepare KV suspend");
-        }
-    };
+    let prepared =
+        match crate::store::registry::with_kv_lock(&stores.kv, "preemption-suspend", |kv| {
+            kv.prepare_suspend(&working_sets)
+        }) {
+            Ok(prepared) => prepared,
+            Err(crate::store::kv::KvStoreError::HostSwapFull { .. }) => {
+                orchestrator.record_host_swap_exhaustion();
+                decline_park(pid);
+                return Ok(());
+            }
+            Err(error) => {
+                decline_park(pid);
+                return Err(error).context("prepare KV suspend");
+            }
+        };
     let txn = match prepared {
         KvSuspendPrepare::Prepared(txn) => txn,
         KvSuspendPrepare::Deferred(
@@ -501,7 +505,7 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
         _ => unreachable!(),
     };
     let copy_started = Instant::now();
-    let completion = match crate::scheduler::copy_d2h(0, &gpu_ids, &host_slots) {
+    let completion = match crate::scheduler::copy_d2h_tracked(0, &gpu_ids, &host_slots) {
         Ok(completion) => completion,
         Err(error) => {
             suspend.abort_now();
@@ -512,7 +516,7 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
         }
     };
     suspend.arm(completion.clone());
-    if let Err(error) = completion.await {
+    if let Err(error) = completion.wait().await {
         orchestrator.record_d2h_copy(copy_started.elapsed());
         suspend.disarm_completion();
         suspend.abort_now();
@@ -524,7 +528,9 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
     orchestrator.record_d2h_copy(copy_started.elapsed());
     suspend.disarm_completion();
     let txn = suspend.take_suspend();
-    let freed = match stores.kv.lock().unwrap().commit_suspend(txn) {
+    let freed = match crate::store::registry::with_kv_lock(&stores.kv, "preemption-suspend", |kv| {
+        kv.commit_suspend(txn)
+    }) {
         Ok(freed) => freed,
         Err(error) => {
             orchestrator.record_suspend_rollback();
@@ -544,23 +550,22 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
             .park_until_restore_granted(pid)
             .await
             .context("wait for KV restore grant")?;
-        let txn = match stores
-            .kv
-            .lock()
-            .unwrap()
-            .prepare_restore(&working_sets, grant.into_pages())
-        {
-            Ok(txn) => txn,
-            Err(error) => {
-                orchestrator.record_restore_rollback();
-                orchestrator.report_restore_failed(pid);
-                if attempt == max_restore_attempts {
-                    return Err(error).context("prepare KV restore");
+        let txn =
+            match crate::store::registry::with_kv_lock(&stores.kv, "preemption-restore", |kv| {
+                kv.prepare_restore(&working_sets, grant.into_pages())
+            }) {
+                Ok(txn) => txn,
+                Err(error) => {
+                    orchestrator.record_restore_rollback();
+                    orchestrator.report_restore_failed(pid);
+                    if attempt == max_restore_attempts {
+                        return Err(error).context("prepare KV restore");
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
         let mut restore = ResidencyTxnGuard::restore(0, 0, txn);
+        orchestrator.record_restore_prepared();
         let gpu_ids = match restore.txn.as_ref() {
             Some(ResidencyTxn::Restore(txn)) => txn.gpu_ids(),
             _ => unreachable!(),
@@ -570,7 +575,7 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
             _ => unreachable!(),
         };
         let copy_started = Instant::now();
-        let completion = match crate::scheduler::copy_h2d(0, &gpu_ids, &host_slots) {
+        let completion = match crate::scheduler::copy_h2d_tracked(0, &gpu_ids, &host_slots) {
             Ok(completion) => completion,
             Err(error) => {
                 restore.abort_now();
@@ -582,8 +587,9 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
                 continue;
             }
         };
+        orchestrator.record_h2d_submitted();
         restore.arm(completion.clone());
-        if let Err(error) = completion.await {
+        if let Err(error) = completion.wait().await {
             orchestrator.record_h2d_copy(copy_started.elapsed());
             restore.disarm_completion();
             restore.abort_now();
@@ -597,17 +603,20 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
         orchestrator.record_h2d_copy(copy_started.elapsed());
         restore.disarm_completion();
         let txn = restore.take_restore();
-        let restored = match stores.kv.lock().unwrap().commit_restore(txn) {
-            Ok(restored) => restored,
-            Err(error) => {
-                orchestrator.record_restore_rollback();
-                orchestrator.report_restore_failed(pid);
-                if attempt == max_restore_attempts {
-                    return Err(error).context("commit KV restore");
+        let restored =
+            match crate::store::registry::with_kv_lock(&stores.kv, "preemption-restore", |kv| {
+                kv.commit_restore(txn)
+            }) {
+                Ok(restored) => restored,
+                Err(error) => {
+                    orchestrator.record_restore_rollback();
+                    orchestrator.report_restore_failed(pid);
+                    if attempt == max_restore_attempts {
+                        return Err(error).context("commit KV restore");
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
         orchestrator.report_restored(pid, restored as u32);
         crate::scheduler::resume_pipeline(pid);
         crate::scheduler::nudge(0);
@@ -616,32 +625,39 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
     unreachable!("restore loop has at least one attempt")
 }
 
-pub(crate) async fn await_channel_progress(
-    ctx: &mut ProcessCtx,
+pub(crate) async fn await_channel_progress_idle(
+    process_id: uuid::Uuid,
+    residency: Arc<Mutex<crate::inferlet::process::ProcessResidency>>,
     cell: &Arc<Mutex<crate::pipeline::channel::ChannelCell>>,
     fires: Option<&PendingFires>,
 ) -> Result<(), String> {
     let Some(orchestrator) = crate::store::reclaim::contention() else {
         return crate::pipeline::fire::await_channel_progress(cell, fires).await;
     };
-    let Some(signal) = orchestrator.park_signal(ctx.id()) else {
+    let Some(signal) = orchestrator.park_signal(process_id) else {
         return crate::pipeline::fire::await_channel_progress(cell, fires).await;
     };
-    if orchestrator.should_park(ctx.id()) {
-        honor(ctx).await.map_err(|error| error.to_string())?;
+    if orchestrator.should_park(process_id) {
+        honor_idle(process_id, residency.clone())
+            .await
+            .map_err(|error| error.to_string())?;
         return Ok(());
     }
     let notified = signal.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    if orchestrator.should_park(ctx.id()) {
-        honor(ctx).await.map_err(|error| error.to_string())?;
+    if orchestrator.should_park(process_id) {
+        honor_idle(process_id, residency.clone())
+            .await
+            .map_err(|error| error.to_string())?;
         return Ok(());
     }
     tokio::select! {
         result = crate::pipeline::fire::await_channel_progress(cell, fires) => result,
         _ = &mut notified => {
-            honor(ctx).await.map_err(|error| error.to_string())?;
+            honor_idle(process_id, residency)
+                .await
+                .map_err(|error| error.to_string())?;
             Ok(())
         }
     }

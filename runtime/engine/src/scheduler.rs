@@ -29,6 +29,7 @@ pub(crate) mod stats;
 pub(crate) mod wire;
 pub mod worker;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
@@ -38,8 +39,9 @@ use anyhow::{Result, anyhow};
 // into the current mock-driver fire path vs. reserved/unit-test-only).
 #[allow(unused_imports)]
 pub(crate) use dispatch::{
-    bind_instance, close_instance, copy_d2d, copy_d2h, copy_h2d, copy_h2h, copy_kv_cells,
-    copy_rs_d2d, register_channel, register_program, resize_pool,
+    bind_instance, bind_instance_classified, close_instance, copy_d2d, copy_d2h, copy_d2h_tracked,
+    copy_h2d, copy_h2d_tracked, copy_h2h, copy_kv_cells, copy_rs_d2d, register_channel,
+    register_channels, register_channels_bind_classified, register_program, resize_pool,
 };
 pub use stats::AggregateStats;
 pub use worker::BatchScheduler;
@@ -51,6 +53,51 @@ use crate::driver::DriverId;
 /// membership, wait-set keys). Kept as the leaf `uuid::Uuid` representation
 /// so the scheduler stays below the guest runtime in the layering.
 pub type ProcessId = uuid::Uuid;
+
+#[derive(Clone)]
+pub(crate) struct ControlCompletion {
+    inner: Arc<ControlCompletionState>,
+}
+
+struct ControlCompletionState {
+    result: Mutex<Option<std::result::Result<(), String>>>,
+    notify: tokio::sync::Notify,
+}
+
+impl ControlCompletion {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(ControlCompletionState {
+                result: Mutex::new(None),
+                notify: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) async fn wait(&self) -> Result<()> {
+        loop {
+            if let Some(result) = self.inner.result.lock().unwrap().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = self.inner.result.lock().unwrap().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            notified.await;
+        }
+    }
+
+    fn resolve(&self, result: &Result<()>) {
+        let result = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"));
+        *self.inner.result.lock().unwrap() = Some(result);
+        self.inner.notify.notify_waiters();
+    }
+}
 
 // =============================================================================
 // Scheduler handle registry (moved out of `driver/registry.rs`)
@@ -90,6 +137,13 @@ pub(crate) fn scheduler_handle(driver_id: usize) -> Result<SchedulerHandle> {
         .get(driver_id)
         .and_then(|slot| slot.clone())
         .ok_or_else(|| anyhow!("driver {driver_id} has no scheduler"))
+}
+
+/// Human-readable snapshot of driver `driver_id`'s run-loop state (queue
+/// composition, in-flight work, wave barrier membership). For diagnostics on
+/// a stalled fleet — a held wave must be inspectable from outside the thread.
+pub async fn debug_dump(driver_id: usize) -> Result<String> {
+    scheduler_handle(driver_id)?.debug_dump().await
 }
 
 // =============================================================================
@@ -147,31 +201,88 @@ pub(crate) fn sched_trace_write(args: std::fmt::Arguments) {
 }
 
 // =============================================================================
-// Demoted-pipeline reaper hook (M-A2)
+// Structured fire timing (`PIE_FIRE_TIMING`)
 // =============================================================================
 
-/// `WaitAllPolicy::take_terminate_candidates` reaps a pipeline through the
-/// process facade (`inferlet::process::terminate`), which is L4 — above
-/// `scheduler` (L2) in the layering, so this module may not import it
-/// directly. A plain closure seam instead: `bootstrap` installs it once, at
-/// startup, wired to the real facade; a unit-test scheduler with no
-/// installed hook just leaves demoted candidates undrained (no reaper, no
-/// panic).
-type TerminateHook = Box<dyn Fn(ProcessId) + Send + Sync>;
-static TERMINATE_HOOK: std::sync::OnceLock<TerminateHook> = std::sync::OnceLock::new();
-
-/// Installs the demoted-pipeline reaper (called once, from `bootstrap`,
-/// after [`spawn`]).
-pub(crate) fn install_terminate_hook(hook: impl Fn(ProcessId) + Send + Sync + 'static) {
-    let _ = TERMINATE_HOOK.set(Box::new(hook));
+/// Whether correlated per-wave timing is enabled. Unlike the cumulative
+/// `profile-fire` feature, this is a diagnostic stream intended for short,
+/// attribution-focused benchmark captures.
+pub(crate) fn fire_timing_full() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PIE_FIRE_TIMING").is_ok_and(|value| !value.is_empty() && value != "0")
+    })
 }
 
-/// Reaps a pipeline `WaitAllPolicy` demoted for missing too many consecutive
-/// wave deadlines. No-op until [`install_terminate_hook`] runs.
-pub(crate) fn terminate_demoted_pipeline(pid: ProcessId) {
-    if let Some(hook) = TERMINATE_HOOK.get() {
-        hook(pid);
+pub(crate) fn ledger_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PIE_LEDGER_TIMING").is_ok_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+pub(crate) fn fire_timing_enabled() -> bool {
+    fire_timing_full() || ledger_timing_enabled()
+}
+
+/// Compatibility claim for submission APIs that do not carry a process
+/// context. The production per-token path passes a process-local claim through
+/// the `_on` APIs and never touches this set.
+pub(crate) fn fire_timing_request_enabled(
+    pipeline_id: Option<crate::inferlet::process::ProcessId>,
+) -> bool {
+    if fire_timing_full() {
+        return true;
     }
+    if !ledger_timing_enabled() {
+        return false;
+    }
+    static CLAIMED: OnceLock<Mutex<std::collections::HashSet<uuid::Uuid>>> = OnceLock::new();
+    pipeline_id.is_some_and(|pipeline_id| {
+        CLAIMED
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert(pipeline_id)
+    })
+}
+
+/// Host `CLOCK_MONOTONIC` timestamp used by scheduler timing records and the
+/// opt-in guest/client ledger clock.
+/// Callers guard this with [`fire_timing_enabled`] so disabled builds do not
+/// execute an `Instant::now()` on the hot path.
+pub(crate) fn fire_timing_now_us() -> u64 {
+    ledger_monotonic_ns() / 1_000
+}
+
+pub(crate) fn ledger_monotonic_ns() -> u64 {
+    let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, value.as_mut_ptr()) };
+    assert_eq!(status, 0, "CLOCK_MONOTONIC is unavailable");
+    let value = unsafe { value.assume_init() };
+    (value.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(value.tv_nsec as u64)
+}
+
+pub(crate) fn fire_timing_unix_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// Emit one NDJSON-compatible timing record. CUDA emits the same prefix, so a
+/// benchmark log can be split and correlated without a second transport.
+pub(crate) fn fire_timing_write(record: &serde_json::Value) {
+    if !fire_timing_enabled() {
+        return;
+    }
+    use std::io::Write;
+    let line = format!("[pie-fire-timing] {record}\n");
+    let _ = std::io::stderr().lock().write(line.as_bytes());
 }
 
 // =============================================================================
@@ -182,6 +293,48 @@ pub(crate) fn terminate_demoted_pipeline(pid: ProcessId) {
 /// per-driver `BatchScheduler` it spawned.
 pub struct SchedulerShutdownHandle {
     schedulers: Vec<BatchScheduler>,
+}
+
+fn dynamic_schedulers() -> &'static Mutex<HashMap<DriverId, BatchScheduler>> {
+    static SCHEDULERS: OnceLock<Mutex<HashMap<DriverId, BatchScheduler>>> = OnceLock::new();
+    SCHEDULERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn build_driver_scheduler(
+    driver_id: DriverId,
+    page_size: u32,
+    request_timeout_secs: u64,
+) -> Result<BatchScheduler> {
+    let limits = crate::driver::get_spec(driver_id)?.scheduler_limits();
+    Ok(BatchScheduler::new(
+        driver_id,
+        driver_id,
+        page_size,
+        limits,
+        request_timeout_secs,
+    ))
+}
+
+pub fn spawn_driver(driver_id: DriverId, page_size: u32, request_timeout_secs: u64) -> Result<()> {
+    let mut schedulers = dynamic_schedulers().lock().unwrap();
+    if schedulers.contains_key(&driver_id) {
+        return Err(anyhow!(
+            "driver {driver_id} already has a dynamic scheduler"
+        ));
+    }
+    let scheduler = build_driver_scheduler(driver_id, page_size, request_timeout_secs)?;
+    schedulers.insert(driver_id, scheduler);
+    Ok(())
+}
+
+pub fn stop_driver(driver_id: DriverId) -> Result<()> {
+    let scheduler = dynamic_schedulers()
+        .lock()
+        .unwrap()
+        .remove(&driver_id)
+        .ok_or_else(|| anyhow!("driver {driver_id} has no dynamic scheduler"))?;
+    drop(scheduler);
+    Ok(())
 }
 
 impl SchedulerShutdownHandle {
@@ -202,60 +355,50 @@ pub async fn spawn(
     page_size: u32,
     request_timeout_secs: u64,
 ) -> Result<SchedulerShutdownHandle> {
-    let driver_ids: Vec<DriverId> = driver_indices.to_vec();
-    let mut driver_batch_limits = Vec::with_capacity(driver_indices.len());
-    for &driver_idx in driver_indices {
-        let info = crate::driver::get_spec(driver_idx)
-            .unwrap_or_else(|e| panic!("Failed to get driver info for index {driver_idx}: {e}"));
-        driver_batch_limits.push(info.scheduler_limits());
-    }
-
-    let schedulers: Vec<BatchScheduler> = driver_ids
+    let schedulers: Vec<BatchScheduler> = driver_indices
         .iter()
-        .enumerate()
-        .map(|(driver_idx, &driver_id)| {
-            let limits = driver_batch_limits[driver_idx];
-            BatchScheduler::new(
-                driver_id,
-                driver_idx,
-                page_size,
-                limits,
-                request_timeout_secs,
-            )
-        })
-        .collect();
+        .map(|&driver_id| build_driver_scheduler(driver_id, page_size, request_timeout_secs))
+        .collect::<Result<_>>()?;
 
     Ok(SchedulerShutdownHandle { schedulers })
 }
 
-pub struct PreparedLaunch {
-    pub page_refs: Vec<crate::store::kv::project::PhysicalPageId>,
-    pub last_page_len: u32,
-    pub kv_translation_version: u64,
-    pub copy_src: Vec<u32>,
-    pub copy_dst: Vec<u32>,
-}
-
-pub enum LaunchPreparationError {
-    Blocked(String),
-    Retry(String),
-    Failed(String),
-}
-
-pub type LaunchPreparation = Box<
-    dyn FnMut(
-            &mut crate::driver::LaunchPlan,
-        ) -> std::result::Result<PreparedLaunch, LaunchPreparationError>
-        + Send,
->;
-
 pub type RetryClassifier = Box<dyn Fn() -> Option<String> + Send + Sync>;
+
+fn rs_state_copy_plan(
+    src_slots: Vec<u32>,
+    dst_slots: Vec<u32>,
+) -> Result<Option<crate::driver::StateCopyPlan>> {
+    if src_slots.len() != dst_slots.len() {
+        return Err(anyhow!(
+            "recurrent-state copy source/destination lengths differ: {} != {}",
+            src_slots.len(),
+            dst_slots.len()
+        ));
+    }
+    if src_slots.is_empty() {
+        return Ok(None);
+    }
+    let slot_ranges = src_slots
+        .into_iter()
+        .zip(dst_slots)
+        .map(
+            |(src_slot_id, dst_slot_id)| pie_driver_abi::PieStateCopyRange {
+                src_slot_id,
+                dst_slot_id,
+                src_token_offset: 0,
+                dst_token_offset: 0,
+                token_count: 0,
+            },
+        )
+        .collect();
+    Ok(Some(crate::driver::StateCopyPlan { slot_ranges }))
+}
 
 pub fn submit_async(
     request: crate::driver::LaunchPlan,
     driver_idx: usize,
     instance_id: u64,
-    physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
     last_page_len: u32,
     pipeline_id: Option<ProcessId>,
     completion: crate::driver::WorkItemCompletion,
@@ -264,34 +407,11 @@ pub fn submit_async(
         request,
         driver_idx,
         instance_id,
-        physical_page_ids,
         last_page_len,
         pipeline_id,
         completion,
         Vec::new(),
         Vec::new(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn submit_async_deferred(
-    request: crate::driver::LaunchPlan,
-    driver_idx: usize,
-    instance_id: u64,
-    pipeline_id: Option<ProcessId>,
-    preparation_order_key: Option<u64>,
-    completion: crate::driver::WorkItemCompletion,
-    preparation: LaunchPreparation,
-    retry_classifier: Option<RetryClassifier>,
-) -> Result<()> {
-    scheduler_handle(driver_idx)?.submit_deferred(
-        request,
-        instance_id,
-        completion,
-        pipeline_id,
-        preparation_order_key,
-        preparation,
-        retry_classifier,
     )
 }
 
@@ -301,7 +421,7 @@ pub(crate) fn nudge(driver_idx: usize) {
     }
 }
 
-pub(crate) fn freeze_pipeline(pid: ProcessId) -> Result<()> {
+pub(crate) async fn freeze_pipeline(pid: ProcessId) -> Result<()> {
     let handles: Vec<_> = handle_registry()
         .read()
         .unwrap()
@@ -310,7 +430,7 @@ pub(crate) fn freeze_pipeline(pid: ProcessId) -> Result<()> {
         .cloned()
         .collect();
     for handle in handles {
-        handle.freeze_pipeline(pid)?;
+        handle.freeze_pipeline(pid).await?;
     }
     Ok(())
 }
@@ -333,7 +453,6 @@ pub fn submit_async_with_kv_copy(
     request: crate::driver::LaunchPlan,
     driver_idx: usize,
     instance_id: u64,
-    physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
     last_page_len: u32,
     pipeline_id: Option<ProcessId>,
     completion: crate::driver::WorkItemCompletion,
@@ -353,10 +472,11 @@ pub fn submit_async_with_kv_copy(
         request,
         instance_id,
         completion,
-        physical_page_ids,
         last_page_len,
         pipeline_id,
         prelaunch_copy,
+        None,
+        fire_timing_request_enabled(pipeline_id),
     )
 }
 
@@ -364,7 +484,6 @@ pub fn submit_prebuilt_async(
     request: crate::driver::LaunchPlan,
     driver_idx: usize,
     instance_id: u64,
-    physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
     last_page_len: u32,
     completion: crate::driver::WorkItemCompletion,
 ) -> Result<()> {
@@ -372,7 +491,6 @@ pub fn submit_prebuilt_async(
         request,
         driver_idx,
         instance_id,
-        physical_page_ids,
         last_page_len,
         completion,
         Vec::new(),
@@ -385,7 +503,6 @@ pub fn submit_prebuilt_async_with_kv_copy(
     request: crate::driver::LaunchPlan,
     driver_idx: usize,
     instance_id: u64,
-    physical_page_ids: Vec<crate::store::kv::project::PhysicalPageId>,
     last_page_len: u32,
     completion: crate::driver::WorkItemCompletion,
     copy_src: Vec<u32>,
@@ -404,9 +521,106 @@ pub fn submit_prebuilt_async_with_kv_copy(
         request,
         instance_id,
         completion,
-        physical_page_ids,
         last_page_len,
         prelaunch_copy,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn submit_prebuilt_async_with_kv_and_rs_copy(
+    request: crate::driver::LaunchPlan,
+    driver_idx: usize,
+    instance_id: u64,
+    last_page_len: u32,
+    completion: crate::driver::WorkItemCompletion,
+    copy_src: Vec<u32>,
+    copy_dst: Vec<u32>,
+    rs_copy_src: Vec<u32>,
+    rs_copy_dst: Vec<u32>,
+) -> Result<()> {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
+        src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_device_ordinal: 0,
+        dst_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_device_ordinal: 0,
+        src_page_ids: copy_src,
+        dst_page_ids: copy_dst,
+        cells: Vec::new(),
+    });
+    scheduler_handle(driver_idx)?.submit_prebuilt_with_copy(
+        request,
+        instance_id,
+        completion,
+        last_page_len,
+        prelaunch_copy,
+        rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
+    request: crate::driver::LaunchPlan,
+    driver_idx: usize,
+    instance_id: u64,
+    pipeline_id: ProcessId,
+    last_page_len: u32,
+    completion: crate::driver::WorkItemCompletion,
+    copy_src: Vec<u32>,
+    copy_dst: Vec<u32>,
+    rs_copy_src: Vec<u32>,
+    rs_copy_dst: Vec<u32>,
+) -> Result<()> {
+    submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
+        &scheduler_handle(driver_idx)?,
+        request,
+        instance_id,
+        pipeline_id,
+        last_page_len,
+        completion,
+        copy_src,
+        copy_dst,
+        rs_copy_src,
+        rs_copy_dst,
+        None,
+        fire_timing_request_enabled(Some(pipeline_id)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
+    handle: &worker::SchedulerHandle,
+    request: crate::driver::LaunchPlan,
+    instance_id: u64,
+    pipeline_id: ProcessId,
+    last_page_len: u32,
+    completion: crate::driver::WorkItemCompletion,
+    copy_src: Vec<u32>,
+    copy_dst: Vec<u32>,
+    rs_copy_src: Vec<u32>,
+    rs_copy_dst: Vec<u32>,
+    retry_classifier: Option<RetryClassifier>,
+    timing_enabled: bool,
+) -> Result<()> {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
+        src_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        src_device_ordinal: 0,
+        dst_domain: pie_driver_abi::PIE_MEMORY_DOMAIN_CUDA_DEVICE,
+        dst_device_ordinal: 0,
+        src_page_ids: copy_src,
+        dst_page_ids: copy_dst,
+        cells: Vec::new(),
+    });
+    handle.submit_prebuilt_tracked_with_copy(
+        request,
+        instance_id,
+        completion,
+        last_page_len,
+        pipeline_id,
+        prelaunch_copy,
+        rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
+        retry_classifier,
+        timing_enabled,
     )
 }
 

@@ -6,8 +6,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::sync::OwnedSemaphorePermit;
 use wasmtime::component::{ResourceAny, ResourceTable};
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
+use wasmtime_wasi::{
+    DirPerms, FilePerms, HostMonotonicClock, WasiCtx, WasiCtxView, WasiView,
+};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 use wasmtime_wasi_http::p3::{
@@ -62,6 +65,16 @@ pub struct ProcessCtx {
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
     residency: Arc<Mutex<ProcessResidency>>,
+    /// Held while this process is in the prewarm cohort (instantiated and
+    /// binding, not yet touching pooled device resources). Dropped the
+    /// moment execution is admitted.
+    prewarm_permit: Option<OwnedSemaphorePermit>,
+    /// The real concurrency permit, acquired lazily at the first pooled
+    /// resource acquisition or fire submit (strict admission).
+    execution_permit: Option<OwnedSemaphorePermit>,
+    execution_admitted: bool,
+    admission_wait_us: u64,
+    ledger_fire_timing_claimed: bool,
 }
 
 impl Drop for ProcessCtx {
@@ -127,6 +140,21 @@ impl ProcessCtx {
         py_runtime_dir: Option<&Path>,
     ) -> anyhow::Result<Self> {
         let mut builder = WasiCtx::builder();
+        if std::env::var("PIE_LEDGER_TIMING")
+            .is_ok_and(|value| !value.is_empty() && value != "0")
+        {
+            struct SharedMonotonicClock;
+            impl HostMonotonicClock for SharedMonotonicClock {
+                fn resolution(&self) -> u64 {
+                    1
+                }
+
+                fn now(&self) -> u64 {
+                    crate::scheduler::ledger_monotonic_ns()
+                }
+            }
+            builder.monotonic_clock(SharedMonotonicClock);
+        }
 
         // Network capability. `inherit_network` exposes the host network;
         // `socket_addr_check` filters per-connect/per-bind. Skipping
@@ -217,11 +245,53 @@ impl ProcessCtx {
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
             residency: Arc::new(Mutex::new(ProcessResidency::default())),
+            prewarm_permit: None,
+            execution_permit: None,
+            execution_admitted: false,
+            admission_wait_us: 0,
+            ledger_fire_timing_claimed: false,
         })
     }
 
     pub fn id(&self) -> ProcessId {
         self.id
+    }
+
+    pub(crate) fn install_prewarm_permit(&mut self, permit: Option<OwnedSemaphorePermit>) {
+        self.prewarm_permit = permit;
+    }
+
+    pub(crate) fn execution_admitted(&self) -> bool {
+        self.execution_admitted
+    }
+
+    pub(crate) fn admit_execution(&mut self, permit: Option<OwnedSemaphorePermit>, wait_us: u64) {
+        self.execution_permit = permit;
+        self.execution_admitted = true;
+        self.admission_wait_us = wait_us;
+        self.prewarm_permit = None;
+    }
+
+    pub(crate) fn admission_wait_us(&self) -> u64 {
+        self.admission_wait_us
+    }
+
+    pub(crate) fn fire_timing_requested(&self) -> bool {
+        if crate::scheduler::fire_timing_full() {
+            return true;
+        }
+        crate::scheduler::ledger_timing_enabled() && !self.ledger_fire_timing_claimed
+    }
+
+    pub(crate) fn commit_fire_timing(&mut self, enabled: bool) {
+        if enabled && crate::scheduler::ledger_timing_enabled() {
+            self.ledger_fire_timing_claimed = true;
+        }
+    }
+
+    pub(crate) fn release_execution_permit(&mut self) {
+        self.execution_permit = None;
+        self.execution_admitted = false;
     }
 
     pub fn get_username(&self) -> String {

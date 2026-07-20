@@ -14,18 +14,30 @@
 
 namespace pie_cuda_driver::model {
 
+constexpr int workspace_mtp_draft_row_base(int max_tokens) {
+    return max_tokens;
+}
+
+constexpr int workspace_logits_rows(
+    int max_tokens, int max_mtp_draft_rows) {
+    return max_tokens +
+        (max_mtp_draft_rows > 0 ? max_mtp_draft_rows : 0);
+}
+
 // Reusable scratch buffers, sized once for `max_tokens`. The forward pass
 // only writes prefixes of these, so reusing across calls is safe as long as
 // you don't exceed `max_tokens`.
 struct Workspace {
     // Stage-2 MTP: extra rows reserved at the TAIL of `logits` (beyond the
-    // `max_output_rows` target rows) to hold the K native MTP draft-logit rows
+    // `max_tokens` target rows) to hold the K native MTP draft-logit rows
     // an `Intrinsic::MtpLogits` [K,vocab] binding reads. `mtp_draft_row_base` is
     // the first reserved row; drafts live at [base, base+K) and never collide
-    // with the target rows [0, max_output_rows). Sized to the PIE_MTP_DRAFT_TOKENS
-    // clamp (0..32).
-    static constexpr int kMtpDraftRowReserve = 32;
+    // with the target rows [0, max_tokens). A program may request at most
+    // 32 drafts, while the aggregate batch reserve is one row per possible
+    // output row so several MTP programs can coexist.
+    static constexpr int kMtpDraftRowsPerProgram = 32;
     int mtp_draft_row_base = 0;
+    int mtp_draft_row_capacity = 0;
 
     DeviceTensor y;          // [max_tokens, hidden]
     DeviceTensor norm_x;     // [max_tokens, hidden]
@@ -42,16 +54,11 @@ struct Workspace {
     DeviceTensor gate_up_fused; // [max_tokens, 2*I] — fused gate+up output, empty
                                 // when unfused
     DeviceTensor mtp_concat;    // [max_tokens, 2*hidden] — Qwen3.6 MTP fc input
+    DeviceTensor mtp_row0_save; // [1, vocab] preserves target row 0 while MTP drafts run
     DeviceTensor gate;       // [max_tokens, intermediate]
     DeviceTensor up;         // [max_tokens, intermediate]
     DeviceTensor logits;     // [max_tokens, vocab]
     DeviceTensor probs;      // [max_tokens, vocab] FP32 — softmax scratch for sampling
-    DeviceTensor greedy_values;      // [max_tokens] FP32, TP greedy local maxima
-    DeviceTensor greedy_tokens;      // [max_tokens] INT32, TP greedy local token ids
-    DeviceTensor greedy_values_all;  // [8, max_tokens] FP32, rank/partition-major gather
-    DeviceTensor greedy_tokens_all;  // [8, max_tokens] INT32, rank-major gather
-    DeviceTensor greedy_pairs;       // [max_tokens] packed {FP32 value, INT32 token}
-    DeviceTensor greedy_pairs_all;   // [8, max_tokens] packed rank/partition-major gather
 
     // Padded variants for the attention kernel when `head_dim_kernel >
     // head_dim` (Phi-3 ships head_dim=96; flashinfer's TC kernel only
@@ -83,7 +90,8 @@ struct Workspace {
     static Workspace allocate_full(
         const HfConfig& cfg, int max_tokens,
         int max_intermediate, int max_Hq, int max_Hk,
-        int max_output_rows = -1);
+        int max_output_rows = -1,
+        int max_mtp_draft_rows = 0);
 };
 
 // Byte budget for the per-fire Workspace tensors, parameterized by
@@ -94,6 +102,7 @@ std::size_t workspace_bytes(const HfConfig& cfg,
                                   int output_rows,
                                   int max_intermediate,
                                   int max_Hq,
-                                  int max_Hk);
+                                  int max_Hk,
+                                  int max_mtp_draft_rows = 0);
 
 }  // namespace pie_cuda_driver::model

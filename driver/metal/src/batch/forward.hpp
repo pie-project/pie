@@ -26,10 +26,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "pie_native/ptir/fire_geometry.hpp"
 
 namespace pie::metal {
 
@@ -38,6 +41,9 @@ struct BatchStepInputs;
 struct DecodeGeometry;
 struct KvPagePool;
 struct StepTiming;
+class StepEncoder;
+class RawMetalContext;
+struct SlotHandle;
 
 }  // namespace pie::metal
 
@@ -65,10 +71,17 @@ struct MemberForwardDesc {
     std::vector<std::uint32_t> position_ids;  // absolute positions, parallel to token_ids
     std::vector<std::uint32_t> kv_pages;      // this member's full historical page list (flashinfer CSR convention)
     std::uint32_t kv_last_page_len = 0;       // final page fill count after this fire (0 => derive)
+    std::vector<std::uint32_t> qo_indptr;
+    std::vector<std::uint32_t> kv_page_indptr;
+    std::vector<std::uint32_t> kv_last_page_lens;
 
     bool has_rs_slot = false;   // false for a non-hybrid arch (no GDN / no rs_cache)
     std::uint32_t rs_slot_id = 0;
     bool rs_reset = false;      // RS_FLAG_RESET bit — fresh sequence, decoder resets
+    std::vector<std::uint32_t> request_rs_slot_ids;
+    std::vector<std::uint8_t> request_rs_reset;
+    std::vector<std::uint8_t> request_rs_read;
+    std::vector<std::uint8_t> request_rs_write;
 
     // Explicit KV write descriptor (device-geometry `WSlot`/`WOff` ports,
     // Phase 2/1b review fix B): per-token PHYSICAL page id + in-page offset
@@ -83,22 +96,61 @@ struct MemberForwardDesc {
     std::vector<std::uint32_t> w_page;  // physical page id per token, size == token_ids.size()
     std::vector<std::uint32_t> w_off;   // in-page offset per token, size == token_ids.size()
     bool requires_paged = false;        // C3/device geometry even without explicit writes
+    bool has_attention_mask = false;
+    std::uint32_t attention_mask_stride = 0;
+    std::vector<std::uint8_t> attention_mask;
+    pie_native::ptir::StructuredMaskDescriptor structured_mask;
 
     // Local indices into `token_ids` (NOT global) whose logits must be
     // materialized — the fire's `sampling_indices` slice, member-relative
     // (mirrors CUDA executor.cpp's `qo_begin + h_sidx[k]` convention, minus
     // the `qo_begin` offset since this desc is already member-scoped).
     std::vector<std::uint32_t> readout_local_indices;
+    std::vector<std::uint32_t> sampling_indptr;
+    std::uint32_t row_count = 1;
+    std::uint32_t sampled_rows = 0;
+    std::uint32_t token_count = 0;
+    std::uint32_t page_count = 0;
+    std::uint32_t query_len = 0;
+    std::uint32_t key_len = 0;
+    std::uint32_t kv_len = 0;
 };
 
 // f32 logits materialized for this fire's readout rows, in
-// `readout_local_indices` order — the exact buffer `PassInputs::logits`
-// binds into interp Intrinsic(Logits)/Intrinsic(MtpLogits) roots.
+// `readout_local_indices` order. Production consumes the bf16 device view;
+// this CPU form remains only for test support.
 struct LogitsOut {
-    std::vector<float> data;  // [rows, vocab] row-major
+    // Test-only CPU materialization. Production M1 leaves this empty and binds
+    // the bf16 Shared-storage view below directly.
+    std::vector<float> data;
     std::uint32_t rows = 0;
     std::uint32_t vocab = 0;
+    void* device_buffer = nullptr;
+    void* device_contents = nullptr;
+    std::uint64_t device_gpu_address = 0;
+    std::uint64_t device_bytes = 0;
+    std::uint32_t device_row_offset = 0;
 };
+
+struct PtirCommandCallbacks {
+    std::function<void(::pie::metal::StepEncoder&)> pre_forward;
+    std::function<void(::pie::metal::StepEncoder&)> post_forward;
+    std::function<void(std::uint32_t)> set_logits_row;
+    std::function<void(const std::vector<std::uint32_t>&)>
+        set_logits_rows;
+    std::function<void()> finalize_group;
+    bool consumes_logits_directly = false;
+};
+
+std::vector<PtirCommandCallbacks> compact_ptir_callbacks(
+    const std::vector<MemberForwardDesc>& descs,
+    const std::vector<std::size_t>& accepted_members,
+    const std::vector<std::uint32_t>& accepted_token_bases,
+    const std::vector<PtirCommandCallbacks>& callbacks);
+
+bool validate_request_local_positions(
+    const MemberForwardDesc& desc,
+    std::string* error);
 
 // Phase 1b (review fix B): the number of resident GDN conv+recurrent state
 // slots `MetalExecutor::setup` really allocates (heap_layout.hpp `plan_heap`
@@ -218,6 +270,16 @@ bool validate_linear_sequence_geometry(const LinearSequenceState& state,
 // closes" sequence of events) is unit-testable without a live executor.
 void close_linear_sequence(LinearSequenceState& state, std::uint64_t sequence_id);
 
+bool validate_paged_request_state(
+    const std::unordered_map<std::uint32_t, LinearSequenceState>& states,
+    const MemberForwardDesc& desc,
+    std::size_t request,
+    std::string* error);
+void commit_paged_request_state(
+    std::unordered_map<std::uint32_t, LinearSequenceState>& states,
+    const MemberForwardDesc& desc,
+    std::size_t request);
+
 // Phase 3 (metal_ptir_plan.md §7): the result of scheduling ONE launch batch
 // of forward-needing members over the single shared M=1 KV ring. A batch may
 // carry several members (mixed C1/C2, several C2). The ring holds exactly one
@@ -306,7 +368,11 @@ class MetalExecutor {
     void forward_batch(const std::vector<MemberForwardDesc>& descs,
                        std::vector<LogitsOut>& outs,
                        std::vector<std::uint8_t>& success,
-                       std::vector<std::string>& errors);
+                       std::vector<std::string>& errors,
+                       const std::vector<PtirCommandCallbacks>* ptir = nullptr);
+
+    ::pie::metal::RawMetalContext* command_context();
+    ::pie::metal::SlotHandle logits_device_slot() const;
 
     // Releases residency if `sequence_id` is the one currently ring-backed
     // (a no-op otherwise — closing a sequence that never ran, one that
@@ -412,11 +478,13 @@ class MetalExecutor {
     // per-member geometry check's. The single-member `forward` passes false, so
     // its sealed cross-launch semantics are unchanged.
     bool run_member_forward(const MemberForwardDesc& desc, LogitsOut& out,
-                            bool batch_serialized, std::string* err);
+                            bool batch_serialized, std::string* err,
+                            const PtirCommandCallbacks* ptir = nullptr);
     bool run_paged_batch_forward(const std::vector<MemberForwardDesc>& descs,
                                  std::vector<LogitsOut>& outs,
                                  std::vector<std::uint8_t>& success,
-                                 std::vector<std::string>& errors);
+                                 std::vector<std::string>& errors,
+                                 const std::vector<PtirCommandCallbacks>* ptir = nullptr);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
