@@ -228,17 +228,10 @@ Results:
 
 All candidate runs completed 256/256 with zero demotions.
 
-The final FlashInfer 0.6.15 + planner-boundary + E5 source measured
-47,117.60 tok/s median (47,117.60 / 46,772.25 / 47,197.19), with 133 batches,
-256/256 completions, and zero demotions in all three runs. Peak physical KV
-demand was 2,816 of 12,634 independently derived logical pages. Its serial
-oracle matched the pre-E5 ABI-v12 control 256/256 hashes.
-
-Serial oracle:
-
-- 256/256 requests completed
-- 256/256 output token hashes matched control
-- The run crossed repeated 10-second trim intervals
+The former FlashInfer 0.6.15 + planner-boundary + E5 headline of 47,117.60
+tok/s is invalid. Its 256/256 serial oracle compared two Pie builds that shared
+the same decode-channel corruption and therefore did not establish model
+accuracy. The corrected result and root cause are recorded in section 4.1.
 
 ### 3.4 CUDA footprint lifecycle
 
@@ -300,15 +293,44 @@ flat single-lane `Pages`. CUDA now verifies those channel shapes and preserves
 device-side decode composition for both all-decode and mixed host/envelope
 waves instead of attempting premature host descriptor readback.
 
-Post-merge gates on the migrated c0/256 guest:
+The original post-merge performance gates compared two equally corrupted
+decode paths and are not accuracy evidence. Long-output cross-validation found
+that every generation matched vLLM only through `<think>\n`, then became
+prompt-independent gibberish.
 
-- Exact current-source interleaved n=3: legacy committed-mapping path
-  47,022.36 tok/s, ABI v12 admission 47,096.72 tok/s, **+0.16%**.
-- Every headline arm completed 256/256, with 133 batches and zero failures.
-- Same-binary ABI v12 vs legacy-launch serial oracle: 256/256 token hashes
-  matched.
-- ABI, engine, dummy-driver, SDK, CUDA rollback, decode-envelope contract,
-  parity, canary, and entry-validation suites passed.
+The corruption was in grouped asynchronous channel initialization:
+
+- `seed_cell_async` copied a seed into device cell 0 and published host tail 1,
+  but unlike `seed_cell` it did not advance `pulled_tail` for a host-writer
+  channel.
+- The first fixed-decode `pull_writer_inputs` therefore treated sequence 0 as a
+  new host input and copied the zero-filled host mirror over the committed
+  seed.
+- For `Pages`, the verified bind-time value `[0,1,...]` became `[0,0,...]`.
+  Translation then mapped every logical page to one physical page. Prefill K/V
+  remained correct, but the first decode collapsed the page table and every
+  later token was wrong.
+
+The fix makes asynchronous writer seeding establish the same pulled-tail
+baseline as synchronous seeding. A CUDA regression now seeds a writer
+asynchronously, performs the first ring pull, and asserts that no copy occurs
+and the committed canary remains unchanged.
+
+Corrected gates:
+
+- The known Raft prompt matches vLLM exactly for the first 64/64 greedy tokens.
+- Four independent 1,024-token prompts (fiction, Raft, Python, incident report)
+  retain their requested entities and facts and produce coherent,
+  prompt-specific text. Pie/vLLM common prefixes are 38--67 tokens; forced
+  long-form continuation diverges numerically after that point.
+- Concurrent four-prompt outputs complete 1,024/1,024 each and match their
+  corresponding serial Pie token sequences exactly.
+- Correct c0/256 n=3 is 34,256.63 tok/s median
+  (34,256.63 / 34,489.34 / 34,184.02), 132 batches and 256/256 completions.
+  The former 47,117.60 tok/s was a 27.3% false uplift from repeatedly reading
+  one aliased physical KV page, not usable model throughput.
+- CUDA CTest passes 45/45, including the new seed-pull regression; engine unit
+  tests pass 359/359.
 
 This claim does **not** extend to Remote or CUDA TP. Remote post-scheduler
 coalescing would invalidate a worker-side lease, and TP needs all-rank atomic

@@ -627,6 +627,9 @@ class DeviceChannelRegistry {
             initialization_stream_));
         std::atomic_ref<std::uint64_t>(host_words_[slot][1]).store(
             1, std::memory_order_release);
+        if (host_role_[slot] == PIE_CHANNEL_HOST_ROLE_WRITER) {
+            pulled_tail_[slot] = 1;
+        }
         initialization_pending_ = true;
     }
 
