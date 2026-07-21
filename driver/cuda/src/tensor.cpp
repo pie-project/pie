@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <iostream>
+#include <limits>
 
 #include "cuda_check.hpp"
 
@@ -35,6 +36,27 @@ DeviceMemoryAllocatorBinding set_device_memory_allocator(
     const DeviceMemoryAllocatorBinding previous = g_memory_allocator;
     g_memory_allocator = {allocate, context};
     return previous;
+}
+
+ScopedDeviceAllocationCounter::ScopedDeviceAllocationCounter() noexcept
+    : previous_(set_device_memory_allocator(
+          &ScopedDeviceAllocationCounter::allocate, this)) {}
+
+ScopedDeviceAllocationCounter::~ScopedDeviceAllocationCounter() {
+    set_device_memory_allocator(previous_.allocate, previous_.context);
+}
+
+void* ScopedDeviceAllocationCounter::allocate(
+    void* context,
+    std::size_t bytes,
+    std::size_t /*alignment*/) {
+    auto& counter = *static_cast<ScopedDeviceAllocationCounter*>(context);
+    if (bytes > std::numeric_limits<std::size_t>::max() -
+                    counter.allocated_bytes_) {
+        throw std::overflow_error("device allocation counter overflow");
+    }
+    counter.allocated_bytes_ += bytes;
+    return reinterpret_cast<void*>(std::uintptr_t{256});
 }
 
 DeviceMemoryBlock allocate_device_memory(

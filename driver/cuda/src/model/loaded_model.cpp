@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
@@ -575,24 +576,59 @@ ops::RuntimeQuantScratchSpec runtime_quant_scratch_spec(const LoadedModel& engin
         auto it = store.find(name);
         if (it == store.end()) continue;
         const auto& tensor = it->second.tensor;
-        if (tensor.shape().size() != 2) continue;
-
-        if (tensor.dtype() == DType::FP8_E4M3) {
+        std::size_t rows = 0;
+        std::size_t cols = 0;
+        const bool is_mxfp4 =
+            item.second.group_size == 32 &&
+            (tensor.dtype() == DType::MXFP4_PACKED ||
+             tensor.dtype() == DType::UINT8);
+        if (is_mxfp4 && tensor.shape().size() == 1) {
+            spec.has_fp8 = true;
+            if (tensor.nbytes() >
+                std::numeric_limits<std::size_t>::max() / 2) {
+                throw std::runtime_error(
+                    "runtime quant MXFP4 dimensions overflow");
+            }
+            spec.max_dequant_weight_elems = std::max(
+                spec.max_dequant_weight_elems, tensor.nbytes() * 2);
+            spec.max_weight_rows =
+                std::max<std::size_t>(spec.max_weight_rows, 1);
+            spec.max_weight_cols =
+                std::max<std::size_t>(spec.max_weight_cols, 1);
+            continue;
+        } else if (is_mxfp4 && tensor.shape().size() == 2) {
+            rows = static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[0]));
+            cols = static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[1])) * 2;
+            spec.has_fp8 = true;
+        } else if (tensor.shape().size() != 2) {
+            continue;
+        } else if (tensor.dtype() == DType::FP8_E4M3) {
             spec.has_fp8 = true;
         } else if (tensor.dtype() == DType::INT8) {
             spec.has_int8 = true;
         } else {
             continue;
         }
+        if (rows == 0) {
+            rows = static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[0]));
+            cols = static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[1]));
+        }
+        if (cols > 0 &&
+            rows > std::numeric_limits<std::size_t>::max() / cols) {
+            throw std::runtime_error(
+                "runtime quant scratch dimensions overflow");
+        }
 
         spec.max_weight_rows = std::max<std::size_t>(
-            spec.max_weight_rows,
-            static_cast<std::size_t>(std::max<std::int64_t>(
-                0, tensor.shape()[0])));
+            spec.max_weight_rows, rows);
         spec.max_weight_cols = std::max<std::size_t>(
-            spec.max_weight_cols,
-            static_cast<std::size_t>(std::max<std::int64_t>(
-                0, tensor.shape()[1])));
+            spec.max_weight_cols, cols);
+        spec.max_dequant_weight_elems = std::max(
+            spec.max_dequant_weight_elems, rows * cols);
     }
 
     return spec;

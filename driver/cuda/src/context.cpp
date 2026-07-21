@@ -423,6 +423,7 @@ class Context::Impl {
     std::shared_ptr<pie_cuda_driver::CudaArenaAllocator> state_allocator_;
     std::shared_ptr<pie_cuda_driver::CudaArenaAllocator> workspace_allocator_;
     std::shared_ptr<pie_cuda_driver::CudaArenaAllocator> attention_allocator_;
+    pie_cuda_driver::ops::RuntimeQuantContext runtime_quant_context_;
     pie_cuda_driver::NcclComm* tp_comm_ = nullptr;
     std::string caps_json_;
     std::string device_facts_json_;
@@ -529,6 +530,7 @@ int Context::Impl::load_model(
     const PieModelLoadDesc& load,
     PieDriverCaps* caps_out) {
     using namespace pie_cuda_driver;
+    ops::ScopedRuntimeQuantContext quant_scope(runtime_quant_context_);
     if (cfg_ == nullptr || load_attempted_) return PIE_STATUS_CLOSED;
     load_attempted_ = true;
     Config& cfg = *cfg_;
@@ -711,13 +713,8 @@ int Context::Impl::load_model(
     const auto kv_format = kv_cache_format_from_string(
         cfg.batching.kv_cache_dtype, cfg.model.dtype);
     const bool use_cuda_graphs = true;
-    const bool graph_capable_forward =
-        use_cuda_graphs && family == model::Family::LlamaLike &&
-        kv_format.is_native_bf16();
     const auto runtime_quant_scratch_base =
-        graph_capable_forward
-            ? runtime_quant_scratch_spec(engine, /*max_tokens=*/0)
-            : ops::RuntimeQuantScratchSpec{};
+        runtime_quant_scratch_spec(engine, /*max_tokens=*/0);
 
     const CudaMemoryPlan mem_plan = plan_cuda_memory(
         cfg, engine.hf_config(), max_mlp_intermediate, max_Hq, max_Hk,
@@ -725,6 +722,9 @@ int Context::Impl::load_model(
         plan_info.kv_source_layer, family == model::Family::Qwen3_5,
         family == model::Family::Qwen3_5Moe, qwen3_5_linear_layers,
         family == model::Family::NemotronH, nemotron_h_mamba_layers,
+        family == model::Family::DeepSeekV4,
+        family == model::Family::Kimi,
+        family == model::Family::Glm5,
         kv_format, runtime_quant_scratch_base, verbose);
     std::size_t free_device_bytes = 0;
     std::size_t total_device_bytes = 0;
@@ -773,7 +773,9 @@ int Context::Impl::load_model(
          family == model::Family::Qwen3_5 ||
          family == model::Family::Qwen3_5Moe ||
          family == model::Family::Gemma4 ||
-         family == model::Family::NemotronH);
+         family == model::Family::NemotronH) ||
+        family == model::Family::Kimi ||
+        family == model::Family::Glm5;
     const int physical_kv_pages =
         mem_plan.kv_pages + (mem_plan.kv_pages > 0 && !page_zero_dummy_safe ? 1 : 0);
     const int graph_pad_page = mem_plan.kv_pages > 0
@@ -871,16 +873,20 @@ int Context::Impl::load_model(
     auto* mla_cache_p = own_value(MlaCache{});
     auto* dsa_cache_p = own_value(DsaCache{});
 #else
-    auto* mla_cache_p = own_value(
-        (family == model::Family::Kimi || family == model::Family::Glm5)
-            ? MlaCache::allocate(
-                  engine.hf_config().num_hidden_layers,
-                  physical_kv_pages,
-                  mem_plan.kv_page_size,
-                  engine.hf_config().kv_lora_rank,
-                  engine.hf_config().qk_rope_head_dim,
-                  DType::BF16)
-            : MlaCache{});
+    MlaCache* mla_cache_p = nullptr;
+    {
+        ScopedCudaArenaAllocator arena(*kv_allocator_);
+        mla_cache_p = own_value(
+            (family == model::Family::Kimi || family == model::Family::Glm5)
+                ? MlaCache::allocate(
+                      engine.hf_config().num_hidden_layers,
+                      physical_kv_pages,
+                      mem_plan.kv_page_size,
+                      engine.hf_config().kv_lora_rank,
+                      engine.hf_config().qk_rope_head_dim,
+                      DType::BF16)
+                : MlaCache{});
+    }
 
     auto* dsa_cache_p = own_value(
         family == model::Family::Glm5
@@ -1010,7 +1016,11 @@ int Context::Impl::load_model(
     auto runtime_quant_scratch = runtime_quant_scratch_base;
     runtime_quant_scratch.max_tokens = static_cast<std::size_t>(max_workspace_tokens);
     if (!runtime_quant_scratch.empty()) {
-        ops::reserve_runtime_quant_scratch(runtime_quant_scratch, true);
+        runtime_quant_context_.reset();
+        {
+            ScopedCudaArenaAllocator arena(*workspace_allocator_);
+            ops::reserve_runtime_quant_scratch(runtime_quant_scratch, true);
+        }
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
@@ -1289,6 +1299,7 @@ int Context::Impl::load_model(
             graph_cache_p,
             tp_comm_ptr,
             tp_cpu_gate_key_,
+            &runtime_quant_context_,
             !has_recurrent_state_cache
                 ? nullptr
                 : ((family == model::Family::Qwen3_5 ||
@@ -1524,6 +1535,8 @@ int Context::Impl::bind_instance(const PieInstanceDesc& instance, PieInstanceBin
 }
 
 int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion) {
+    pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
+        runtime_quant_context_);
     if (executor_ == nullptr) return PIE_STATUS_CLOSED;
     if (launch.embed_rows.len > 0 &&
         (model_ == nullptr ||
@@ -1685,6 +1698,8 @@ int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion)
 }
 
 int Context::Impl::encode(const PieEncodeDesc& encode, PieCompletion completion) {
+    pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
+        runtime_quant_context_);
 #ifdef PIE_CUDA_QWEN_ONLY
     (void)encode;
     (void)completion;

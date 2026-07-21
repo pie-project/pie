@@ -103,6 +103,24 @@ DeviceMemoryAllocatorBinding set_device_memory_allocator(
     DeviceMemoryAllocateCallback allocate,
     void* context) noexcept;
 
+class ScopedDeviceAllocationCounter {
+public:
+    ScopedDeviceAllocationCounter() noexcept;
+    ~ScopedDeviceAllocationCounter();
+    ScopedDeviceAllocationCounter(const ScopedDeviceAllocationCounter&) = delete;
+    ScopedDeviceAllocationCounter& operator=(
+        const ScopedDeviceAllocationCounter&) = delete;
+
+    std::size_t allocated_bytes() const noexcept { return allocated_bytes_; }
+
+private:
+    static void* allocate(
+        void* context, std::size_t bytes, std::size_t alignment);
+
+    DeviceMemoryAllocatorBinding previous_{};
+    std::size_t allocated_bytes_ = 0;
+};
+
 struct DeviceMemoryBlock {
     void* ptr = nullptr;
     bool arena_owned = false;

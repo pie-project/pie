@@ -25,6 +25,7 @@ struct RuntimeQuantScratchSpec {
     std::size_t max_tokens = 0;
     std::size_t max_weight_rows = 0;  // GEMM N
     std::size_t max_weight_cols = 0;  // GEMM K
+    std::size_t max_dequant_weight_elems = 0;
     bool has_fp8 = false;
     bool has_int8 = false;
 
@@ -37,6 +38,32 @@ struct RuntimeQuantScratchSpec {
 };
 
 std::size_t runtime_quant_scratch_bytes(const RuntimeQuantScratchSpec& spec);
+
+class RuntimeQuantContext {
+public:
+    RuntimeQuantContext();
+    ~RuntimeQuantContext();
+    RuntimeQuantContext(const RuntimeQuantContext&) = delete;
+    RuntimeQuantContext& operator=(const RuntimeQuantContext&) = delete;
+
+    void reset() noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    friend class ScopedRuntimeQuantContext;
+};
+
+class ScopedRuntimeQuantContext {
+public:
+    explicit ScopedRuntimeQuantContext(RuntimeQuantContext& context) noexcept;
+    ~ScopedRuntimeQuantContext();
+    ScopedRuntimeQuantContext(const ScopedRuntimeQuantContext&) = delete;
+    ScopedRuntimeQuantContext& operator=(const ScopedRuntimeQuantContext&) = delete;
+
+private:
+    void* previous_ = nullptr;
+};
 
 // Preallocate the runtime-quant GEMM scratch described by `spec`. When
 // `seal_after_reserve` is true, any later attempt to grow those buffers throws

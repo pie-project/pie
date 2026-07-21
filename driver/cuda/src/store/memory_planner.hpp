@@ -50,6 +50,7 @@ struct CudaMemoryPlan {
     int state_slots = 0;
     std::size_t attn_float_workspace_bytes = 0;
     std::size_t runtime_quant_scratch_bytes = 0;
+    std::size_t persistent_input_bytes = 0;
     std::size_t arena_bytes = 0;
     std::size_t kv_bytes = 0;
     std::size_t state_bytes = 0;
@@ -80,6 +81,9 @@ CudaMemoryPlan plan_cuda_memory(
     int qwen3_5_linear_layers,
     bool nemotron_h_selected,
     int nemotron_h_mamba_layers,
+    bool deepseek_v4_selected,
+    bool kimi_selected,
+    bool glm5_selected,
     const KvCacheFormat& kv_format,
     const ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
     bool verbose);

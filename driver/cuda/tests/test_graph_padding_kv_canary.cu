@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include "kernels/kv_paged.hpp"
+#include "kernels/mla_paged.hpp"
 #include "kernels/split_packed.hpp"
 
 namespace k = pie_cuda_driver::kernels;
@@ -226,6 +227,17 @@ int main() {
     };
     ok &= run_graph_canary("Gemma4Model/fallback", in, generic_write);
     ok &= run_graph_canary("NemotronHModel", in, generic_write);
+
+    const auto mla_write = [&] {
+        k::launch_write_mla_to_pages_bf16(
+            in.k_pages, in.v_pages, in.packed, in.packed,
+            in.qo_indptr, in.page_indices, in.page_indptr,
+            in.last_page_lens, kRows, kRows, kPageSize,
+            /*kv_lora_rank=*/8, /*qk_rope_head_dim=*/4,
+            in.stream, in.row_valid);
+    };
+    ok &= run_graph_canary("KimiModel", in, mla_write);
+    ok &= run_graph_canary("Glm5Model", in, mla_write);
 
     return ok ? 0 : 1;
 }

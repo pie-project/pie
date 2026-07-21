@@ -282,17 +282,24 @@ at load, so the sacrificial slot does not add a separate physical-commit floor
 today. Future proportional state commit must still retain a sacrificial slot
 unless every recurrent-state write is proven to skip invalid rows.
 
-### 4.4 CUDA conversion gaps
+### 4.4 CUDA residual conversion
 
-These planned allocations remain outside elastic arenas:
+The C1 residual conversion landed after the page-0 alias:
 
-- Runtime-quant GEMM scratch (`GrowScratch`, raw `cudaMalloc`)
-- MLA cache
-- DSA cache
+- Runtime-quant cuBLASLt workspace and growable FP8/INT8/MXFP4 scratch are
+  Context-owned and allocated from the workspace arena. Load, launch, encode,
+  and TP follower threads bind the owning context explicitly.
+- Kimi/GLM5 MLA cache storage is allocated from the KV arena and grows with the
+  translated physical page high-water. Invalid MLA rows are `row_valid`-gated,
+  so these families also use the page-0 dummy alias.
+- DeepSeek V4, Kimi, and GLM5 auxiliary workspace allocations are included
+  exactly in planner candidates.
+- `PersistentInputs` remains a direct allocation intentionally, but is now
+  reported as fixed `persistent_input_bytes` instead of elastic `arena_bytes`.
 
-`PersistentInputs` also remains directly allocated; it is mostly metadata and
-was not part of the primary >90% conversion target, but the planner currently
-counts it inside `arena_bytes`.
+`DsaCache` currently has no backing allocation; it is an empty GLM5 interface
+stub. There is therefore no DSA device pool to convert until the indexer cache
+itself is implemented.
 
 ### 4.5 Metal final release bug
 
@@ -368,7 +375,6 @@ It is **not** yet valid to claim:
 3. Add shared-budget lease/reservation to scheduler admission.
 4. Keep the landed page-0 graph-padding canaries and physical high-water ABI
    contract in CUDA CI.
-5. Convert runtime-quant scratch and MLA/DSA storage.
-6. Add Metal memory-pressure handling.
-7. Delete the old planner capacity lattice and obsolete fields.
-8. Run CUDA handle-size and first-touch latency A/B.
+5. Add Metal memory-pressure handling.
+6. Delete the old planner capacity lattice and obsolete fields.
+7. Run CUDA handle-size and first-touch latency A/B.

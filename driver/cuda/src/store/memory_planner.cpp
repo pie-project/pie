@@ -28,6 +28,9 @@
 #include "../model/config.hpp"
 #ifndef PIE_CUDA_QWEN_ONLY
 #include "../model/gemma4/gemma4.hpp"
+#include "../model/deepseek_v4/deepseek_v4_forward.hpp"
+#include "../model/glm5/glm5_forward.hpp"
+#include "../model/kimi/kimi_forward.hpp"
 #endif
 #include "../model/loaded_model.hpp"
 #ifndef PIE_CUDA_QWEN_ONLY
@@ -68,6 +71,8 @@ void min_into(CudaMemoryPlan& dst, const CudaMemoryPlan& src) {
         dst.attn_float_workspace_bytes, src.attn_float_workspace_bytes);
     dst.runtime_quant_scratch_bytes = std::max(
         dst.runtime_quant_scratch_bytes, src.runtime_quant_scratch_bytes);
+    dst.persistent_input_bytes = std::max(
+        dst.persistent_input_bytes, src.persistent_input_bytes);
     dst.arena_bytes = std::max(dst.arena_bytes, src.arena_bytes);
     dst.kv_bytes = std::min(dst.kv_bytes, src.kv_bytes);
     dst.state_bytes = std::min(dst.state_bytes, src.state_bytes);
@@ -340,6 +345,9 @@ CudaMemoryPlan plan_cuda_memory(
     int qwen3_5_linear_layers,
     bool nemotron_h_selected,
     int nemotron_h_mamba_layers,
+    bool deepseek_v4_selected,
+    bool kimi_selected,
+    bool glm5_selected,
     const pie_cuda_driver::KvCacheFormat& kv_format,
     const pie_cuda_driver::ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
     bool verbose)
@@ -388,7 +396,19 @@ CudaMemoryPlan plan_cuda_memory(
         pie_cuda_driver::kv_page_bytes_homogeneous(
             hf, tp_size, kv_format);
 #else
-        gemma4_selected
+        deepseek_v4_selected
+            ? static_cast<std::size_t>(hf.num_hidden_layers) *
+                  pie_cuda_driver::kv_cache_device_bytes_per_page(
+                      kv_format, 1, 1, hf.head_dim)
+            : (kimi_selected || glm5_selected)
+            ? static_cast<std::size_t>(hf.num_hidden_layers) *
+                  (static_cast<std::size_t>(hf.kv_lora_rank) +
+                   static_cast<std::size_t>(hf.qk_rope_head_dim)) *
+                  sizeof(std::uint16_t) +
+                  static_cast<std::size_t>(hf.num_hidden_layers) *
+                      pie_cuda_driver::kv_cache_device_bytes_per_page(
+                          kv_format, 1, 1, 1)
+            : gemma4_selected
             ? pie_cuda_driver::kv_page_bytes_per_layer(hf, gemma4_per_layer_head_dim,
                                       gemma4_kv_source_layer, tp_size,
                                       kv_format)
@@ -582,13 +602,26 @@ CudaMemoryPlan plan_cuda_memory(
                 arena += pie_cuda_driver::model::gemma4_moe_workspace_bytes(
                     hf, N);
             }
+            if (deepseek_v4_selected) {
+                arena += pie_cuda_driver::model::dsv4_workspace_bytes(
+                    hf, N, output_rows, tp_size);
+            }
+            if (kimi_selected) {
+                arena += pie_cuda_driver::model::kimi_workspace_bytes(
+                    hf, N, output_rows, tp_size);
+            }
+            if (glm5_selected) {
+                arena += pie_cuda_driver::model::glm5_workspace_bytes(
+                    hf, N, output_rows, hf.max_position_embeddings, tp_size);
+            }
 #endif
             const std::size_t attn_float_bytes =
                 pie_cuda_driver::attention_float_workspace_bytes(hf, cfg, prop, R0);
             arena += attn_float_bytes;     // AttentionWorkspace float section
             arena += 8ull * 1024 * 1024;  // AttentionWorkspace int section
-            arena += pie_cuda_driver::persistent_input_bytes(N, R0, max_page_refs,
-                                            max_custom_mask_bytes);
+            const std::size_t persistent_bytes =
+                pie_cuda_driver::persistent_input_bytes(
+                    N, R0, max_page_refs, max_custom_mask_bytes);
             auto quant_scratch_spec = runtime_quant_scratch_base;
             quant_scratch_spec.max_tokens = static_cast<std::size_t>(N);
             const std::size_t runtime_quant_scratch_bytes =
@@ -596,21 +629,23 @@ CudaMemoryPlan plan_cuda_memory(
                     quant_scratch_spec);
             arena += runtime_quant_scratch_bytes;
             arena = align_up(arena, 2ull * 1024 * 1024);
-            if (arena >= budget) continue;
+            if (arena + persistent_bytes >= budget) continue;
 
             int R = R0;
             int state_slots = 0;
             std::size_t state_bytes = 0;
             if (state_slot_bytes > 0) {
-                const std::size_t affordable = (budget - arena) / state_slot_bytes;
+                const std::size_t affordable =
+                    (budget - arena - persistent_bytes) / state_slot_bytes;
                 state_slots = static_cast<int>(
                     std::min<std::size_t>(static_cast<std::size_t>(R), affordable));
                 if (state_slots <= 0) continue;
                 R = std::min(R, state_slots);
                 state_bytes = static_cast<std::size_t>(state_slots) * state_slot_bytes;
             }
-            if (arena + state_bytes >= budget) continue;
-            const std::size_t remaining = budget - arena - state_bytes;
+            if (arena + persistent_bytes + state_bytes >= budget) continue;
+            const std::size_t remaining =
+                budget - arena - persistent_bytes - state_bytes;
             const int kv_pages = static_cast<int>(remaining / per_page_bytes);
             if (kv_pages <= 0) continue;
             const std::size_t kv_tokens =
@@ -651,6 +686,7 @@ CudaMemoryPlan plan_cuda_memory(
             p.state_slots = state_slots;
             p.attn_float_workspace_bytes = attn_float_bytes;
             p.runtime_quant_scratch_bytes = runtime_quant_scratch_bytes;
+            p.persistent_input_bytes = persistent_bytes;
             p.arena_bytes = arena;
             p.kv_bytes = static_cast<std::size_t>(kv_pages) * per_page_bytes;
             p.state_bytes = state_bytes;
@@ -949,6 +985,8 @@ CudaMemoryPlan plan_cuda_memory(
                   << " R=" << p.max_requests
                   << " page_refs=" << p.max_page_refs
                   << " arena=" << (p.arena_bytes / (1024 * 1024)) << " MiB"
+                  << " persistent_inputs="
+                  << (p.persistent_input_bytes / (1024 * 1024)) << " MiB"
                   << " rq_scratch="
                   << (p.runtime_quant_scratch_bytes / (1024 * 1024))
                   << " MiB"

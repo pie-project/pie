@@ -644,6 +644,9 @@ pie_add_cuda_target(test_elastic
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
   LIBS CUDA::cudart CUDA::cuda_driver)
+pie_add_cuda_target(test_elastic_converted_pools
+  SOURCES tests/test_elastic_converted_pools.cpp
+  LIBS pie_driver_cuda_lib CUDA::cudart CUDA::cuda_driver)
 pie_add_cuda_target(test_kv_cache_quant
   SOURCES
     tests/test_kv_cache_quant.cu

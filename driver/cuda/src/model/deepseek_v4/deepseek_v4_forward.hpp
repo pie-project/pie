@@ -90,6 +90,12 @@ struct DsV4Workspace {
         int tp_size);
 };
 
+std::size_t dsv4_workspace_bytes(
+    const HfConfig& cfg,
+    int max_tokens,
+    int max_logit_rows,
+    int tp_size);
+
 struct DsV4PlanState {
     // FlashInfer plan for SWA layers
     void* flashinfer_plan = nullptr;

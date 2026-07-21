@@ -31,6 +31,9 @@ namespace {
 
 constexpr std::size_t kDefaultLtWorkspaceBytes = 32ull * 1024ull * 1024ull;
 
+struct LtCtx;
+thread_local LtCtx* g_runtime_quant_context = nullptr;
+
 cublasComputeType_t bf16_compute_type() {
     static const cublasComputeType_t ct = [] {
         const char* v = std::getenv("PIE_CUBLAS_PRECISE");
@@ -61,10 +64,14 @@ std::size_t runtime_quant_dequant_bytes(
     const RuntimeQuantScratchSpec& spec)
 {
     if (spec.empty()) return 0;
+    const std::size_t weight_elems =
+        spec.max_dequant_weight_elems > 0
+            ? spec.max_dequant_weight_elems
+            : checked_mul(spec.max_weight_rows, spec.max_weight_cols,
+                          "dequant weight elems");
     const std::size_t weight_bf16_bytes =
         checked_mul(
-            checked_mul(spec.max_weight_rows, spec.max_weight_cols,
-                        "dequant weight elems"),
+            weight_elems,
             std::size_t{2},
             "dequant weight bytes");
     const std::size_t residual_bf16_bytes =
@@ -977,19 +984,24 @@ void* marlin_residual_scratch_(std::size_t bytes) {
 struct LtCtx {
     cublasLtHandle_t handle = nullptr;
     void*            workspace = nullptr;
+    DeviceMemoryBlock workspace_block{};
     std::size_t      workspace_bytes = 0;
     int              compute_capability_major = 0;  // 0 = unqueried
     bool             fp8_native_supported = false;
 
     static LtCtx& instance() {
-        thread_local LtCtx ctx;
-        return ctx;
+        if (g_runtime_quant_context != nullptr) {
+            return *g_runtime_quant_context;
+        }
+        static thread_local LtCtx fallback;
+        return fallback;
     }
 
     void ensure_init(std::size_t ws_bytes = kDefaultLtWorkspaceBytes) {
         if (!handle) LT_CHECK(cublasLtCreate(&handle));
         if (!workspace) {
-            CUDA_CHECK(cudaMalloc(&workspace, ws_bytes));
+            workspace_block = allocate_device_memory(ws_bytes, 256);
+            workspace = workspace_block.ptr;
             workspace_bytes = ws_bytes;
         }
         if (compute_capability_major == 0) {
@@ -1011,10 +1023,9 @@ struct LtCtx {
     }
 
     // Grow-on-demand device scratch. Caller passes byte size; returns
-    // a pointer valid until the next `ensure(bigger_size)` on the same
-    // buffer. Cleared at process exit (LtCtx is a static singleton).
+    // a pointer valid until the next `ensure(bigger_size)` on the same buffer.
     struct GrowScratch {
-        void*       p = nullptr;
+        DeviceMemoryBlock block{};
         std::size_t bytes = 0;
         bool        sealed = false;
         const char* name = "runtime quant scratch";
@@ -1029,19 +1040,26 @@ struct LtCtx {
                     std::to_string(bytes) +
                     " bytes. Increase the planner reserve or disable CUDA graphs.");
             }
-            if (p) CUDA_CHECK(cudaFree(p));
-            CUDA_CHECK(cudaMalloc(&p, want));
+            free_device_memory(block);
+            block = allocate_device_memory(want, 256);
             bytes = want;
         }
 
         void* ensure(std::size_t want) {
             reserve(want);
-            return p;
+            return block.ptr;
         }
 
         void seal(const char* label) noexcept {
             if (label != nullptr) name = label;
             sealed = true;
+        }
+
+        void reset() noexcept {
+            free_device_memory(block);
+            block = {};
+            bytes = 0;
+            sealed = false;
         }
     };
     GrowScratch dequant;        // sm<89 FP8 → bf16 weight scratch
@@ -1051,6 +1069,43 @@ struct LtCtx {
 };
 
 }  // namespace
+
+struct RuntimeQuantContext::Impl {
+    LtCtx ctx;
+};
+
+RuntimeQuantContext::RuntimeQuantContext()
+    : impl_(std::make_unique<Impl>()) {}
+
+RuntimeQuantContext::~RuntimeQuantContext() {
+    reset();
+    if (impl_->ctx.handle != nullptr) {
+        cublasLtDestroy(impl_->ctx.handle);
+        impl_->ctx.handle = nullptr;
+    }
+}
+
+void RuntimeQuantContext::reset() noexcept {
+    auto& ctx = impl_->ctx;
+    free_device_memory(ctx.workspace_block);
+    ctx.workspace_block = {};
+    ctx.workspace = nullptr;
+    ctx.workspace_bytes = 0;
+    ctx.dequant.reset();
+    ctx.int8_act.reset();
+    ctx.int8_act_scale.reset();
+    ctx.int32_acc.reset();
+}
+
+ScopedRuntimeQuantContext::ScopedRuntimeQuantContext(
+    RuntimeQuantContext& context) noexcept
+    : previous_(g_runtime_quant_context) {
+    g_runtime_quant_context = &context.impl_->ctx;
+}
+
+ScopedRuntimeQuantContext::~ScopedRuntimeQuantContext() {
+    g_runtime_quant_context = static_cast<LtCtx*>(previous_);
+}
 
 void reserve_runtime_quant_scratch(
     const RuntimeQuantScratchSpec& spec,

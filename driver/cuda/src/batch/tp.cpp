@@ -316,6 +316,12 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
     auto* d_hdr   = tp_hdr_dev_buf();
     cudaStream_t stream = nullptr;
     std::uint64_t cpu_gate_seq = 0;
+    if (engine.runtime_quant_context == nullptr) {
+        throw std::runtime_error(
+            "TP follower has no runtime-quant context");
+    }
+    ops::ScopedRuntimeQuantContext quant_scope(
+        *engine.runtime_quant_context);
 
     // Sized lazily; R is at most max_workspace_tokens (one request per token).
     std::vector<std::uint32_t> h_qo, h_kvpp;
