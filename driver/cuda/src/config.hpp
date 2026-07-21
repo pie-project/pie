@@ -36,6 +36,15 @@ struct ModelConfig {
     //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
     //   * "native" — require a true MXFP4 MoE GEMM backend.
     std::string mxfp4_moe = "auto";
+    // SSD expert streaming (DeepSeek-V4 only, tp_size=1). When true, routed
+    // MoE expert weights are not materialized on the GPU at load time;
+    // instead they are paged on demand from the safetensors shards into a
+    // bounded LRU expert cache at forward time.
+    bool stream_routed_experts = false;
+    // Expert stream cache budget in GiB. 0 (default) = auto: half of the
+    // free device memory after resident weights, capped at the full routed
+    // expert set. Only meaningful when stream_routed_experts is true.
+    double expert_cache_gb = 0.0;
     // Optional Gemma-4 native MTP assistant checkpoint. When set on a
     // Gemma-4 target, output_spec_flags requests draft from this assistant.
     std::string mtp_assistant_snapshot_dir;
@@ -113,6 +122,10 @@ inline Config load_config(const std::filesystem::path& path) {
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
         c.model.runtime_quant = (*m)["runtime_quant"].value_or(std::string{});
         c.model.mxfp4_moe     = (*m)["mxfp4_moe"].value_or(c.model.mxfp4_moe);
+        c.model.stream_routed_experts =
+            (*m)["stream_routed_experts"].value_or(c.model.stream_routed_experts);
+        c.model.expert_cache_gb =
+            (*m)["expert_cache_gb"].value_or(c.model.expert_cache_gb);
         c.model.mtp_assistant_snapshot_dir =
             (*m)["mtp_assistant_snapshot_dir"].value_or(std::string{});
         c.model.mtp_num_drafts = static_cast<int>(
@@ -186,6 +199,14 @@ inline Config load_config(const std::filesystem::path& path) {
     if (c.model.mtp_num_drafts < 0 || c.model.mtp_num_drafts > 32) {
         throw std::runtime_error(
             "config: [model].mtp_num_drafts must be in [0, 32]");
+    }
+    if (c.model.expert_cache_gb < 0.0) {
+        throw std::runtime_error(
+            "config: [model].expert_cache_gb must be >= 0");
+    }
+    if (c.model.stream_routed_experts && c.distributed.tp_size > 1) {
+        throw std::runtime_error(
+            "config: [model].stream_routed_experts requires tp_size=1");
     }
     if (!(c.batching.gpu_mem_utilization > 0.0 &&
           c.batching.gpu_mem_utilization <= 1.0)) {

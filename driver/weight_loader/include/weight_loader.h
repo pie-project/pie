@@ -14,7 +14,7 @@
 
 namespace pie_weight_loader {
 
-constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 3;
+constexpr static const uint32_t STORAGE_PROGRAM_VERSION = 4;
 
 enum class PieLoaderBackendKind {
   Cuda = 0,
@@ -306,6 +306,7 @@ struct PieLoaderBackendTargetView {
   uint32_t preferred_alignment;
   PieLoaderMxfp4MoePolicy mxfp4_moe;
   bool native_mxfp4_moe;
+  bool stream_routed_experts;
 };
 
 struct PieLoaderCompileInput {
@@ -421,6 +422,40 @@ struct PieLoaderOptimizerReportView {
   PieLoaderOptimizerPassStatsSlice passes;
 };
 
+struct PieLoaderStreamBindingView {
+  uint32_t file_id;
+  uint64_t file_offset;
+  uint64_t span_bytes;
+};
+
+struct PieLoaderStreamBindingSlice {
+  const PieLoaderStreamBindingView *ptr;
+  size_t len;
+};
+
+struct PieLoaderBytesSlice {
+  const PieLoaderBytes *ptr;
+  size_t len;
+};
+
+struct PieLoaderU64Slice {
+  const uint64_t *ptr;
+  size_t len;
+};
+
+/// Deferred expert-load plan exposed to the C++ stream cache.
+struct PieLoaderStreamPlanView {
+  PieLoaderU32Slice template_;
+  PieLoaderBytesSlice files;
+  uint32_t num_layers;
+  uint32_t num_experts;
+  uint32_t sections_per_expert;
+  PieLoaderStreamBindingSlice bindings;
+  uint64_t slot_bytes;
+  PieLoaderU64Slice section_offsets;
+  PieLoaderU64Slice section_bytes;
+};
+
 struct PieLoaderStorageProgramView {
   uint32_t version;
   PieLoaderTensorDeclSlice tensors;
@@ -429,6 +464,7 @@ struct PieLoaderStorageProgramView {
   PieLoaderU32Slice schedule;
   PieLoaderMemoryPlanView memory;
   PieLoaderOptimizerReportView optimizer;
+  PieLoaderStreamPlanView stream;
 };
 
 struct PieLoaderError {

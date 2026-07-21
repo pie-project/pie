@@ -416,6 +416,7 @@ pub struct PieLoaderBackendTargetView {
     pub preferred_alignment: u32,
     pub mxfp4_moe: PieLoaderMxfp4MoePolicy,
     pub native_mxfp4_moe: bool,
+    pub stream_routed_experts: bool,
 }
 
 impl Default for PieLoaderBackendTargetView {
@@ -428,6 +429,7 @@ impl Default for PieLoaderBackendTargetView {
             preferred_alignment: 0,
             mxfp4_moe: PieLoaderMxfp4MoePolicy::RoutedDecode,
             native_mxfp4_moe: false,
+            stream_routed_experts: false,
         }
     }
 }
@@ -573,6 +575,50 @@ pub struct PieLoaderOptimizerReportView {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieLoaderStreamBindingView {
+    pub file_id: u32,
+    pub file_offset: u64,
+    pub span_bytes: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieLoaderStreamBindingSlice {
+    pub ptr: *const PieLoaderStreamBindingView,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieLoaderBytesSlice {
+    pub ptr: *const PieLoaderBytes,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieLoaderU64Slice {
+    pub ptr: *const u64,
+    pub len: usize,
+}
+
+/// Deferred expert-load plan exposed to the C++ stream cache.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieLoaderStreamPlanView {
+    pub template: PieLoaderU32Slice,
+    pub files: PieLoaderBytesSlice,
+    pub num_layers: u32,
+    pub num_experts: u32,
+    pub sections_per_expert: u32,
+    pub bindings: PieLoaderStreamBindingSlice,
+    pub slot_bytes: u64,
+    pub section_offsets: PieLoaderU64Slice,
+    pub section_bytes: PieLoaderU64Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PieLoaderStorageProgramView {
     pub version: u32,
     pub tensors: PieLoaderTensorDeclSlice,
@@ -581,6 +627,7 @@ pub struct PieLoaderStorageProgramView {
     pub schedule: PieLoaderU32Slice,
     pub memory: PieLoaderMemoryPlanView,
     pub optimizer: PieLoaderOptimizerReportView,
+    pub stream: PieLoaderStreamPlanView,
 }
 
 #[repr(C)]

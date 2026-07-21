@@ -171,6 +171,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/sampling_dispatch.cpp
   src/spec_expansion.cpp
   src/tensor.cpp
+  src/expert_stream_cache.cpp
   src/model/weight_store.cpp
   src/mla_cache.cpp
   src/model/loaded_model.cpp
@@ -533,6 +534,20 @@ target_include_directories(test_swap_pool PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_swap_pool PRIVATE CUDA::cudart)
 
+add_executable(test_expert_stream_cache
+  tests/test_expert_stream_cache.cpp
+  src/expert_stream_cache.cpp)
+target_include_directories(test_expert_stream_cache PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_expert_stream_cache PRIVATE CUDA::cudart)
+
+add_executable(test_expert_stream_cache_gpu
+  tests/test_expert_stream_cache_gpu.cpp
+  src/expert_stream_cache.cpp)
+target_include_directories(test_expert_stream_cache_gpu PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_expert_stream_cache_gpu PRIVATE CUDA::cudart)
+
 add_executable(test_mxfp4_marlin
   tests/test_mxfp4_marlin.cu
   src/kernels/mxfp4_marlin.cu)
@@ -560,6 +575,8 @@ add_test(NAME driver_common COMMAND test_driver_common)
 add_test(NAME kv_cache_format COMMAND test_kv_cache_format)
 add_test(NAME kv_cache_quant COMMAND test_kv_cache_quant)
 add_test(NAME swap_pool COMMAND test_swap_pool)
+add_test(NAME expert_stream_cache COMMAND test_expert_stream_cache)
+add_test(NAME expert_stream_cache_gpu COMMAND test_expert_stream_cache_gpu)
 add_test(NAME mxfp4_marlin COMMAND test_mxfp4_marlin)
 add_test(NAME transcode_fused COMMAND test_transcode_fused)
 

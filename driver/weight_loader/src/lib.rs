@@ -21,6 +21,7 @@ pub mod semantic;
 pub mod source;
 pub mod storage;
 pub mod storage_compiler;
+pub mod stream;
 pub mod typecheck;
 pub mod types;
 

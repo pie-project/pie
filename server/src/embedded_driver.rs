@@ -496,6 +496,17 @@ pub(crate) fn write_cuda_startup_toml(
         "enable_system_speculation",
         opts.enable_system_speculation,
     );
+    // SSD expert streaming knobs — omitted at their defaults, matching the
+    // runtime_quant convention above.
+    if opts.stream_routed_experts {
+        insert_bool(&mut model, "stream_routed_experts", true);
+        if opts.expert_cache_gb > 0.0 {
+            model.insert(
+                "expert_cache_gb".into(),
+                toml::Value::Float(opts.expert_cache_gb),
+            );
+        }
+    }
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -1084,6 +1095,8 @@ mod tests {
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:0");
         assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
         assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
+        assert!(val["model"].get("stream_routed_experts").is_none()); // omitted when off
+        assert!(val["model"].get("expert_cache_gb").is_none());
         assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
         assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
         assert_eq!(
@@ -1127,6 +1140,41 @@ mod tests {
         let val: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(val["model"]["runtime_quant"].as_str().unwrap(), "fp8");
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:1");
+    }
+
+    #[test]
+    fn cuda_startup_toml_emits_expert_streaming_when_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.device = "cuda:0".to_string();
+        opts.stream_routed_experts = true;
+        opts.expert_cache_gb = 24.0;
+
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert!(val["model"]["stream_routed_experts"].as_bool().unwrap());
+        assert_eq!(val["model"]["expert_cache_gb"].as_float().unwrap(), 24.0);
+    }
+
+    #[test]
+    fn cuda_startup_toml_omits_expert_cache_gb_when_auto() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.device = "cuda:0".to_string();
+        opts.stream_routed_experts = true; // expert_cache_gb stays 0 = auto
+
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert!(val["model"]["stream_routed_experts"].as_bool().unwrap());
+        assert!(val["model"].get("expert_cache_gb").is_none());
     }
 
     #[test]

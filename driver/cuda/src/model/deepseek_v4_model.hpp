@@ -21,7 +21,8 @@ public:
         int tp_size,
         int tp_rank,
         NcclComm* tp_comm,
-        bool emit_logits);
+        bool emit_logits,
+        ExpertStreamCache* expert_cache = nullptr);
 
     void prepare(AttentionWorkspace& attn_ws,
                  const ForwardFn::PrepareInputs& in) override;

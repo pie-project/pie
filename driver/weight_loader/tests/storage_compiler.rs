@@ -1095,6 +1095,216 @@ fn mla_q_kv_a_fusion_produces_joined_tensor() {
     assert!(summary.finalize_count > 0);
 }
 
+// ── SSD expert streaming (DeepSeek-V4) ──────────────────────────────
+
+fn dsv4_streaming_metadata() -> CheckpointMetadata {
+    // Minimal DSv4-shaped checkpoint: one layer with a norm, a router, a
+    // shared expert, and two routed experts (w1/w2/w3 weight+scale each).
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>, dtype: DType| {
+        let bytes = shape.iter().fold(dtype.bytes(), |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(dtype),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "layers.0.ffn_norm.weight", vec![64], DType::BF16);
+    push(next(), "layers.0.ffn.gate.weight", vec![2, 64], DType::BF16);
+    push(next(), "layers.0.ffn.shared_experts.w1.weight", vec![32, 64], DType::BF16);
+    push(next(), "layers.0.ffn.shared_experts.w2.weight", vec![64, 32], DType::BF16);
+    push(next(), "layers.0.ffn.shared_experts.w3.weight", vec![32, 64], DType::BF16);
+    for e in 0..2 {
+        for w in ["w1", "w2", "w3"] {
+            push(
+                next(),
+                &format!("layers.0.ffn.experts.{e}.{w}.weight"),
+                vec![32, 32],
+                DType::U8,
+            );
+            push(
+                next(),
+                &format!("layers.0.ffn.experts.{e}.{w}.scale"),
+                vec![32, 1],
+                DType::U8,
+            );
+        }
+    }
+    // MTP routed experts share the `.ffn.experts.` naming but must stay
+    // resident — the stream cache only pages the main `layers.*` bank.
+    for w in ["w1", "w2", "w3"] {
+        push(
+            next(),
+            &format!("mtp.0.ffn.experts.0.{w}.weight"),
+            vec![32, 32],
+            DType::U8,
+        );
+        push(
+            next(),
+            &format!("mtp.0.ffn.experts.0.{w}.scale"),
+            vec![32, 1],
+            DType::U8,
+        );
+    }
+    let size_bytes = offset;
+    CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    }
+}
+
+fn dsv4_cfg() -> pie_weight_loader::config::ModelConfig {
+    pie_weight_loader::config::ModelConfig {
+        model_type: "deepseek_v4".to_string(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+        ..pie_weight_loader::config::ModelConfig::default()
+    }
+}
+
+#[test]
+fn dsv4_stream_routed_experts_excludes_expert_tensors_from_program() {
+    let meta = dsv4_streaming_metadata();
+    let cfg = dsv4_cfg();
+
+    let compile = |stream: bool| {
+        let target = StorageTarget {
+            backend: BackendKind::Cuda,
+            stream_routed_experts: stream,
+            ..StorageTarget::default()
+        };
+        let abi =
+            pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+        compile_storage_program(&meta, &cfg, &abi, target).unwrap()
+    };
+
+    let resident = compile(false);
+    let streamed = compile(true);
+
+    assert!(
+        resident.tensors.iter().any(|t| t.name.starts_with("layers.0.ffn.experts.")),
+        "baseline program must materialize main-stack routed experts"
+    );
+    assert!(
+        !streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.starts_with("layers.") && t.name.contains(".ffn.experts.")),
+        "streamed program must not declare main-stack routed-expert tensors; got: {:?}",
+        streamed.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    // Non-expert tensors (norm, router, shared experts) stay resident.
+    assert!(streamed.tensors.iter().any(|t| t.name == "layers.0.ffn.gate.weight"));
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name == "layers.0.ffn.shared_experts.w1.weight")
+    );
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.starts_with("mtp.0.ffn.experts.")),
+        "MTP experts must remain resident; got: {:?}",
+        streamed.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    assert!(
+        streamed.memory.persistent_bytes < resident.memory.persistent_bytes,
+        "streaming must shrink the persistent arena ({} vs {})",
+        streamed.memory.persistent_bytes,
+        resident.memory.persistent_bytes
+    );
+
+    // Deferred stream plan: template + bindings, not on the resident schedule.
+    assert!(!streamed.stream.is_empty(), "stream plan must be present");
+    assert_eq!(streamed.stream.num_layers, 1);
+    assert_eq!(streamed.stream.num_experts, 2);
+    assert_eq!(streamed.stream.sections_per_expert, 6);
+    assert_eq!(streamed.stream.template.len(), 6);
+    assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 6);
+    assert!(streamed.stream.slot_bytes > 0);
+    for id in &streamed.stream.template {
+        assert!(
+            !streamed.schedule.contains(id),
+            "stream template instr {id:?} must not be on the resident schedule"
+        );
+        assert!(
+            streamed.instrs.iter().any(|instr| instr_id(instr) == *id),
+            "stream template instr {id:?} must exist in instrs"
+        );
+    }
+    // Template instrs are ExtentWrites with slot-relative dests.
+    for id in &streamed.stream.template {
+        let instr = streamed
+            .instrs
+            .iter()
+            .find(|instr| instr_id(instr) == *id)
+            .unwrap();
+        match instr {
+            StorageInstr::ExtentWrite { dest, .. } => {
+                assert_eq!(dest.buffer.0, u32::MAX, "slot-base sentinel");
+            }
+            other => panic!("expected ExtentWrite in stream template, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn dsv4_stream_routed_experts_rejects_tensor_parallel() {
+    let meta = dsv4_streaming_metadata();
+    let cfg = dsv4_cfg();
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tp_rank: 0,
+        tp_size: 2,
+        stream_routed_experts: true,
+        ..StorageTarget::default()
+    };
+    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tp_size=1"), "unexpected error: {err}");
+}
+
+#[test]
+fn stream_routed_experts_rejects_unsupported_arch() {
+    let meta = dsv4_streaming_metadata();
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "llama".to_string(),
+        num_hidden_layers: 1,
+        ..pie_weight_loader::config::ModelConfig::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        stream_routed_experts: true,
+        ..StorageTarget::default()
+    };
+    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not supported"), "unexpected error: {err}");
+}
+
 fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }

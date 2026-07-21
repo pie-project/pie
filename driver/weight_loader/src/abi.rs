@@ -472,6 +472,10 @@ struct ArchProfile {
     /// llama-family rules; archs with a different expert/attention layout (e.g.
     /// DeepSeek-V4's native `.ffn.experts.w*`) register their own function.
     shard_axis_fn: fn(&str) -> Option<Axis>,
+    /// SSD expert streaming: arch-specific section layout + name parser for the
+    /// deferred [`crate::storage::StreamPlan`]. `None` = arch does not support
+    /// `stream_routed_experts`.
+    stream: Option<crate::stream::StreamArchDesc>,
 }
 
 const GENERIC_ARCH: ArchProfile = ArchProfile {
@@ -487,6 +491,7 @@ const GENERIC_ARCH: ArchProfile = ArchProfile {
     skip_dense_qkv_fusion: false,
     stack_per_expert_moe: false,
     shard_axis_fn: llama_like_shard_axis,
+    stream: None,
 };
 
 /// (matching model_type strings, profile). Matched case-insensitively. The
@@ -510,7 +515,11 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
     (
         // Native `.ffn.experts.w*` naming + per-expert intermediate sharding.
         &["deepseek_v4"],
-        ArchProfile { shard_axis_fn: dsv4_shard_axis, ..GENERIC_ARCH },
+        ArchProfile {
+            shard_axis_fn: dsv4_shard_axis,
+            stream: Some(DSV4_STREAM_ARCH),
+            ..GENERIC_ARCH
+        },
     ),
     (&["phi3"], ArchProfile { phi3_fused_splits: true, ..GENERIC_ARCH }),
     (
@@ -557,6 +566,11 @@ fn arch_profile(model_type: &str) -> ArchProfile {
     GENERIC_ARCH
 }
 
+/// Stream-plan recipe for `model_type`, if the arch supports SSD expert streaming.
+pub(crate) fn stream_arch_for(model_type: &str) -> Option<crate::stream::StreamArchDesc> {
+    arch_profile(model_type).stream
+}
+
 impl DefaultAbiBuilder<'_> {
     fn profile(&self) -> ArchProfile {
         arch_profile(&self.cfg.model_type)
@@ -564,6 +578,7 @@ impl DefaultAbiBuilder<'_> {
 
     fn build(&mut self) -> Result<(), CompileError> {
         let runtime_quant = self.runtime_quant_scheme()?;
+        self.skip_streamed_routed_experts()?;
         self.add_phi3_fused_splits()?;
         self.add_gpt_oss_mxfp4_groups()?;
         self.add_fused_moe_gate_up_tp_slices()?;
@@ -585,6 +600,46 @@ impl DefaultAbiBuilder<'_> {
             } else {
                 self.push_direct(raw, self.output_name(&raw.name), self.shard_axis(&raw.name));
             }
+        }
+        Ok(())
+    }
+
+    /// SSD expert streaming: consume every routed-expert checkpoint tensor
+    /// before any contract-emitting pass runs, so they never enter the
+    /// resident schedule / persistent arena. The compiler then attaches a
+    /// deferred [`crate::storage::StreamPlan`] (template + bindings) that the
+    /// driver executes into a cache slot on demand.
+    fn skip_streamed_routed_experts(&mut self) -> Result<(), CompileError> {
+        if !self.target.stream_routed_experts {
+            return Ok(());
+        }
+        let Some(arch) = self.profile().stream else {
+            return Err(CompileError::InvalidInput(format!(
+                "stream_routed_experts is not supported for model_type='{}' \
+                 (supported: deepseek_v4)",
+                self.cfg.model_type
+            )));
+        };
+        if self.target.tp_size > 1 {
+            return Err(CompileError::InvalidInput(
+                "stream_routed_experts requires tp_size=1 (per-expert TP shards \
+                 are strided file extents, which streaming does not support yet)"
+                    .to_string(),
+            ));
+        }
+        let mut skipped = 0usize;
+        for raw in &self.metadata.tensors {
+            if (arch.is_streamed)(&raw.name) {
+                self.consumed.insert(raw.id);
+                skipped += 1;
+            }
+        }
+        if skipped == 0 {
+            return Err(CompileError::InvalidInput(
+                "stream_routed_experts is set but the checkpoint contains no \
+                 routed-expert tensors"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -2063,6 +2118,79 @@ fn dsv4_shard_axis(name: &str) -> Option<Axis> {
     }
     // Everything else replicated (avoids TP communication in main path).
     None
+}
+
+/// Fixed DSv4 section order — must match `dsv4_expert_sections.hpp` in the
+/// CUDA driver (`w1/w2/w3` × weight/scale).
+pub const DSV4_EXPERT_SECTIONS: &[&str] = &[
+    "w1.weight",
+    "w1.scale",
+    "w2.weight",
+    "w2.scale",
+    "w3.weight",
+    "w3.scale",
+];
+
+/// DeepSeek-V4 main-stack routed experts:
+/// `layers.{L}.ffn.experts.{E}.{w1,w2,w3}.{weight,scale}`.
+///
+/// Shared experts (`.ffn.shared_experts.`), routers (`ffn.gate.*`), and MTP
+/// modules (`mtp.*.ffn.experts.*`) are **not** streamable — only the primary
+/// layer MoE bank is paged by the expert stream cache today.
+pub(crate) fn is_dsv4_routed_expert_tensor(name: &str) -> bool {
+    // Require the main-stack prefix so MTP / other modules stay resident.
+    let Some(rest) = name.strip_prefix("layers.") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once('.') else {
+        return false;
+    };
+    rest.starts_with("ffn.experts.")
+        && ends_with_any(
+            name,
+            &[
+                ".w1.weight",
+                ".w1.scale",
+                ".w2.weight",
+                ".w2.scale",
+                ".w3.weight",
+                ".w3.scale",
+            ],
+        )
+}
+
+/// Parse `layers.{L}.ffn.experts.{E}.{section}` → (layer, expert, section_idx).
+pub(crate) fn parse_dsv4_expert_section(name: &str) -> Option<(u32, u32, usize)> {
+    let rest = name.strip_prefix("layers.")?;
+    let (layer_str, rest) = rest.split_once('.')?;
+    let rest = rest.strip_prefix("ffn.experts.")?;
+    let (expert_str, section) = rest.split_once('.')?;
+    let layer: u32 = layer_str.parse().ok()?;
+    let expert: u32 = expert_str.parse().ok()?;
+    let section_idx = DSV4_EXPERT_SECTIONS.iter().position(|s| *s == section)?;
+    Some((layer, expert, section_idx))
+}
+
+const DSV4_STREAM_ARCH: crate::stream::StreamArchDesc = crate::stream::StreamArchDesc {
+    sections: DSV4_EXPERT_SECTIONS,
+    is_streamed: is_dsv4_routed_expert_tensor,
+    parse: parse_dsv4_expert_section,
+};
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn parse_dsv4_names() {
+        assert_eq!(
+            parse_dsv4_expert_section("layers.3.ffn.experts.12.w2.scale"),
+            Some((3, 12, 3))
+        );
+        assert!(parse_dsv4_expert_section("layers.0.ffn.shared_experts.w1.weight").is_none());
+        assert!(parse_dsv4_expert_section("layers.0.ffn.gate.weight").is_none());
+        assert!(parse_dsv4_expert_section("mtp.0.ffn.experts.0.w1.scale").is_none());
+    }
 }
 
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {
