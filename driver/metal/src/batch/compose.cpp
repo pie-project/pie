@@ -117,6 +117,7 @@ OwnedLaunchView OwnedLaunchView::capture(const PieLaunchDesc& launch) {
         launch.masks.word_indptr.len);
     owned.mask_words =
         copy_slice(launch.masks.words.ptr, launch.masks.words.len);
+    owned.required_kv_pages = launch.required_kv_pages;
     owned.has_user_mask = launch.has_user_mask != 0;
     return owned;
 }

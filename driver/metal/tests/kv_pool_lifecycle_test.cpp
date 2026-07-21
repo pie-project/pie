@@ -28,7 +28,7 @@ bool expect(bool ok, const std::string& what) {
 int main() {
     std::printf("[standalone-buffer allocation lifecycle]\n");
 
-    auto ctx = RawMetalContext::create(16u << 20);
+    auto ctx = RawMetalContext::create(16u << 20, 512u << 20);
     if (!expect(ctx != nullptr, "RawMetalContext::create succeeds")) {
         std::printf("\n==== kv_pool_lifecycle_test: %d passed, %d failed ====\n", g_pass, g_fail);
         return g_fail == 0 ? 0 : 1;
@@ -81,6 +81,30 @@ int main() {
                std::to_string(ctx->standalone_buffer_count()) + ")");
     ctx->release_standalone_buffer(live);
     expect(ctx->standalone_buffer_count() == 0, "final release returns to zero");
+
+    std::printf("\n[placement-sparse elastic lifecycle]\n");
+    SlotHandle elastic = ctx->create_elastic_buffer(64u << 20, 2u << 20);
+    const std::uint64_t elastic_address = elastic.gpu_address;
+    expect(elastic.valid() && elastic.elastic,
+           "elastic buffer reserves stable sparse VA");
+    expect(ctx->elastic_committed_pages() > 0,
+           "initial sparse prefix is physically committed");
+    expect(ctx->ensure_elastic_buffer(elastic, 32u << 20) &&
+               elastic.gpu_address == elastic_address,
+           "elastic grow preserves GPU address");
+    expect(ctx->trim_elastic_buffer(elastic, 0),
+           "elastic trim completes");
+    ctx->drain_elastic_mappings();
+    expect(ctx->elastic_committed_pages() == 0,
+           "elastic trim releases physical commitment");
+    expect(ctx->pending_elastic_release_count() == 0,
+           "elastic trim retires final heap without another mapping");
+    expect(ctx->ensure_elastic_buffer(elastic, 4u << 20) &&
+               elastic.gpu_address == elastic_address,
+           "elastic regrow preserves GPU address");
+    ctx->release_elastic_buffer(elastic);
+    expect(ctx->pending_elastic_release_count() == 0,
+           "elastic final release leaves no pending heap");
 
     std::printf("\n==== kv_pool_lifecycle_test: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

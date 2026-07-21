@@ -990,6 +990,12 @@ bool MetalExecutor::Impl::setup_kv_pool(uint32_t total_pages, uint32_t page_size
     }
     pool.total_pages = total_pages;
     pool.capacity_pages = total_pages;
+    const size_t page_bytes = size_t(page_size) * kv_pool_row_bytes(g_);
+    pool.committed_pages = static_cast<std::uint32_t>(
+        std::min<size_t>(
+            total_pages,
+            (std::min(layer_bytes, size_t{2} << 20) + page_bytes - 1) /
+                page_bytes));
     pool.page_size = page_size;
     pool.enabled = true;
     const std::uint64_t generation = paged_bind_generation_;
@@ -1176,7 +1182,7 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
         }
         return false;
     }
-    if (new_total_pages == kv_pool_.total_pages) return true;  // no-op success
+    if (new_total_pages == kv_pool_.committed_pages) return true;
     if (new_total_pages == 0) {
         if (err) *err = "MetalExecutor::Impl::resize_kv_pool: resize to 0 pages is not supported";
         return false;
@@ -1190,10 +1196,11 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
         }
         return false;
     }
-    if (new_total_pages < kv_pool_.total_pages && !unmapped_tail_pages) {
+    if (new_total_pages < kv_pool_.committed_pages && !unmapped_tail_pages) {
         if (err) {
             *err = "MetalExecutor::Impl::resize_kv_pool: shrink would truncate pages [" +
-                   std::to_string(new_total_pages) + ", " + std::to_string(kv_pool_.total_pages) +
+                   std::to_string(new_total_pages) + ", " +
+                   std::to_string(kv_pool_.committed_pages) +
                    ") that the caller has not attested are unmapped/free — refusing to "
                    "silently discard potentially-live pages";
         }
@@ -1217,6 +1224,7 @@ bool MetalExecutor::Impl::resize_kv_pool(uint32_t new_total_pages, bool unmapped
         ctx_->trim_elastic_buffer(layer.k_pages, committed_bytes);
         ctx_->trim_elastic_buffer(layer.v_pages, committed_bytes);
     }
+    kv_pool_.committed_pages = new_total_pages;
     return true;
 }
 
@@ -1913,8 +1921,29 @@ std::uint32_t MetalExecutor::kv_pool_total_pages() const {
     return ready() && impl_->kv_pool().enabled ? impl_->kv_pool().total_pages : 0u;
 }
 
+std::uint32_t MetalExecutor::kv_pool_committed_pages() const {
+    return ready() && impl_->kv_pool().enabled
+        ? impl_->kv_pool().committed_pages
+        : 0u;
+}
+
 std::uint32_t MetalExecutor::kv_pool_page_size() const {
     return ready() && impl_->kv_pool().enabled ? impl_->kv_pool().page_size : 0u;
+}
+
+bool MetalExecutor::ensure_kv_pages(
+    std::uint32_t pages,
+    std::string* error) {
+    if (!ready() || !impl_->kv_pool().enabled) {
+        if (error != nullptr) *error = "Metal KV pool is unavailable";
+        return false;
+    }
+    if (pages > impl_->kv_pool().total_pages) {
+        if (error != nullptr) *error = "Metal KV commit demand exceeds capacity";
+        return false;
+    }
+    if (pages <= impl_->kv_pool().committed_pages) return true;
+    return impl_->resize_kv_pool(pages, true, error);
 }
 
 bool MetalExecutor::copy_kv_pages(const std::vector<std::uint32_t>& src_pages,
@@ -2589,7 +2618,12 @@ bool MetalExecutor::copy_state(std::uint32_t, std::uint32_t, std::string* err) {
 }
 
 std::uint32_t MetalExecutor::kv_pool_total_pages() const { return 0; }
+std::uint32_t MetalExecutor::kv_pool_committed_pages() const { return 0; }
 std::uint32_t MetalExecutor::kv_pool_page_size() const { return 0; }
+bool MetalExecutor::ensure_kv_pages(std::uint32_t, std::string* error) {
+    if (error != nullptr) *error = "Metal executor requires an Apple build";
+    return false;
+}
 
 bool MetalExecutor::copy_kv_pages(const std::vector<std::uint32_t>&,
                                   const std::vector<std::uint32_t>&, std::string* err) {

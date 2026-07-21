@@ -418,7 +418,9 @@ class MetalExecutor {
     // control ops — narrow methods so context.cpp never needs to include
     // MetalExecutor/Metal types directly.
     std::uint32_t kv_pool_total_pages() const;
+    std::uint32_t kv_pool_committed_pages() const;
     std::uint32_t kv_pool_page_size() const;
+    bool ensure_kv_pages(std::uint32_t pages, std::string* error);
 
     // One per-token KV cell move (mirrors PieKvMoveCell exactly).
     struct KvMoveCell {

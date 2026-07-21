@@ -176,6 +176,8 @@ class RawMetalContext {
     size_t elastic_page_bytes() const;
     size_t elastic_budget_pages() const;
     size_t elastic_committed_pages() const;
+    void drain_elastic_mappings();
+    size_t pending_elastic_release_count() const;
 
     // Size-classed, residency-stable storage for PTIR command scratch and
     // metadata. Recycle only after the command's completion fence.

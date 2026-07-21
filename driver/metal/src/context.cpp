@@ -654,6 +654,15 @@ class Context::Impl {
         const std::size_t M = job->members.size();
         std::vector<std::uint32_t> outcomes(M, PIE_TERMINAL_OUTCOME_SUCCESS);
         std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
+        std::string kv_commit_error;
+        const bool kv_commit_failed =
+            job->launch.required_kv_pages != 0 &&
+            (executor_ == nullptr ||
+             !executor_->ensure_kv_pages(
+                 job->launch.required_kv_pages, &kv_commit_error));
+        if (kv_commit_failed && kv_commit_error.empty()) {
+            kv_commit_error = "Metal KV commit failed";
+        }
 #if defined(__APPLE__)
         struct PendingM3Group {
             std::vector<std::size_t> members;
@@ -682,6 +691,10 @@ class Context::Impl {
             job->fwd_descs.clear();
             for (std::size_t m = 0; m < M; ++m) {
                 LaunchMember& lm = job->members[m];
+                if (kv_commit_failed) {
+                    lm.build_err = kv_commit_error;
+                    continue;
+                }
                 InstanceRecord* instance = registry_.find_instance(lm.instance_id);
                 if (instance == nullptr) {
                     lm.build_err = "instance closed before execution";
@@ -1505,7 +1518,8 @@ class Context::Impl {
             notify(completion.wait_id, completion.target_epoch);
             return PIE_STATUS_OK;
         }
-        const std::uint32_t current_pages = executor_->kv_pool_total_pages();
+        const std::uint32_t current_pages =
+            executor_->kv_pool_committed_pages();
         if (current_pages == 0) {
             std::cerr << "[pie-driver-metal] resize_pool: UNSUPPORTED — no paged KV pool is "
                          "allocated (config total_pages/kv_page_size produced a zero-sized "

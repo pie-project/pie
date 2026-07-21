@@ -151,6 +151,7 @@ struct RawMetalContext::Impl {
 
     id<MTL4ArgumentTable> argtable_for(int ordinal, bool create);
     void collect_elastic_releases();
+    void drain_mapping_through(uint64_t value);
     uint64_t schedule_mapping(
         id<MTLBuffer> buffer,
         id<MTLHeap> heap,
@@ -180,6 +181,14 @@ void RawMetalContext::Impl::collect_elastic_releases() {
         ++out;
     }
     pending_elastic_releases.erase(out, pending_elastic_releases.end());
+}
+
+void RawMetalContext::Impl::drain_mapping_through(uint64_t value) {
+    if (value != 0 && event != nil) {
+        while (![event waitUntilSignaledValue:value timeoutMS:5000]) {
+        }
+    }
+    collect_elastic_releases();
 }
 
 uint64_t RawMetalContext::Impl::schedule_mapping(
@@ -283,7 +292,11 @@ void StepEncoder::mark_timestamp(void* heap, uint32_t idx, bool precise) {
 
 // ── RawMetalContext ───────────────────────────────────────────────────────────
 RawMetalContext::RawMetalContext() : impl_(std::make_unique<Impl>()) {}
-RawMetalContext::~RawMetalContext() = default;
+RawMetalContext::~RawMetalContext() {
+    if (impl_ != nullptr) {
+        impl_->drain_mapping_through(impl_->ev_val);
+    }
+}
 
 std::unique_ptr<RawMetalContext> RawMetalContext::create(
     size_t heap_bytes,
@@ -299,6 +312,11 @@ std::unique_ptr<RawMetalContext> RawMetalContext::create(
     I.alloc[0] = [I.dev newCommandAllocator];
     I.alloc[1] = [I.dev newCommandAllocator];
     I.event    = [I.dev newSharedEvent];
+    if (I.queue == nil || I.mapping_queue == nil ||
+        I.alloc[0] == nil || I.alloc[1] == nil || I.event == nil) {
+        fprintf(stderr, "[pie-metal] MTL4 queue/allocator/event creation failed\n");
+        return nullptr;
+    }
     I.elastic_budget_bytes = align_up(
         elastic_budget_bytes,
         pie::elastic::kLogicalPageBytes);
@@ -538,6 +556,8 @@ bool RawMetalContext::trim_elastic_buffer(
     const size_t target = align_up(
         std::min(bytes, allocation.virtual_bytes),
         Impl::kSparseTileBytes);
+    uint64_t last_done = 0;
+    size_t released_bytes = 0;
     while (allocation.committed_bytes > target &&
            !allocation.chunks.empty()) {
         auto& chunk = allocation.chunks.back();
@@ -551,22 +571,26 @@ bool RawMetalContext::trim_elastic_buffer(
                 Impl::kSparseTileBytes,
             shrink / Impl::kSparseTileBytes);
         operation.heapOffset = 0;
-        const uint64_t done = I.schedule_mapping(
+        last_done = I.schedule_mapping(
             (__bridge id<MTLBuffer>)allocation.buffer,
             nil,
             operation);
         chunk.mapped -= shrink;
         allocation.committed_bytes -= shrink;
-        I.elastic_committed_bytes -= shrink;
-        I.elastic_reserved_bytes -= shrink;
+        released_bytes += shrink;
         if (chunk.mapped == 0) {
             I.pending_elastic_releases.push_back({
-                .event_value = done,
+                .event_value = last_done,
                 .objects = {chunk.alias, chunk.heap},
             });
             allocation.chunks.pop_back();
         }
     }
+    I.drain_mapping_through(last_done);
+    I.elastic_committed_bytes -= std::min(
+        I.elastic_committed_bytes, released_bytes);
+    I.elastic_reserved_bytes -= std::min(
+        I.elastic_reserved_bytes, released_bytes);
     return true;
 }
 
@@ -682,6 +706,14 @@ size_t RawMetalContext::elastic_budget_pages() const {
 
 size_t RawMetalContext::elastic_committed_pages() const {
     return pie::elastic::pages_for_bytes(impl_->elastic_committed_bytes);
+}
+
+void RawMetalContext::drain_elastic_mappings() {
+    impl_->drain_mapping_through(impl_->ev_val);
+}
+
+size_t RawMetalContext::pending_elastic_release_count() const {
+    return impl_->pending_elastic_releases.size();
 }
 
 SlotHandle RawMetalContext::acquire_transient_buffer(size_t size) {
