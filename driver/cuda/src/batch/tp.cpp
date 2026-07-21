@@ -79,6 +79,7 @@ struct TpFireHeader {
     std::int32_t num_requests;
     std::int32_t is_pure_decode;
     std::int32_t kv_indices_count;
+    std::int32_t required_kv_pages;
     std::int32_t mask_bytes;
     std::int32_t mask_indptr_count;
     // 1 = slot_ids[R] (int32) and is_fresh[R] (uint8) follow the
@@ -115,6 +116,7 @@ std::int32_t* tp_hdr_dev_buf() {
 void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                          int N, int R, bool is_pure_decode,
                          int kv_indices_count,
+                         int required_kv_pages,
                          int mask_bytes, int mask_indptr_count,
                          bool has_slot_ids,
                          bool has_write_desc,
@@ -128,7 +130,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
     auto* d_hdr = tp_hdr_dev_buf();
     TpFireHeader hdr{
         TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
-        kv_indices_count, mask_bytes, mask_indptr_count,
+        kv_indices_count, required_kv_pages, mask_bytes, mask_indptr_count,
         has_slot_ids ? 1 : 0,
         has_write_desc ? 1 : 0,
         logit_rows,
@@ -373,6 +375,12 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
 
         const int N = hdr.total_tokens;
         const int R = hdr.num_requests;
+        if (hdr.required_kv_pages < 0 ||
+            hdr.required_kv_pages > engine.kv_cache.num_pages()) {
+            throw std::runtime_error(
+                "TP follower received invalid required KV page high-water");
+        }
+        engine.kv_cache.ensure_pages(hdr.required_kv_pages);
         const bool is_pure_decode = (hdr.is_pure_decode != 0);
         const bool has_write_desc = hdr.has_write_desc != 0;
         const int logit_rows = hdr.logit_rows;

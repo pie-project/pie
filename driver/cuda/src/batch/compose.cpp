@@ -1576,10 +1576,13 @@ void handle_fire_batch(
         // CUDA graph capture/replay stays lockstep across ranks.
         if (engine.tp_comm != nullptr) {
             tp_cpu_gate_notify(engine.tp_cpu_gate_key);
+            const int tp_kv_indices_count = rs_is_fold
+                ? 0
+                : static_cast<int>(h_kvpp_forward[forward_R]);
             tp_broadcast_inputs(*engine.tp_comm, pi,
                                 forward_N, forward_R, is_pure_decode,
-                                rs_is_fold ? 0 : static_cast<int>(
-                                    forward_inputs.kv_page_indices.size()),
+                                tp_kv_indices_count,
+                                engine.required_kv_pages,
                                 rs_is_fold ? 0 : mask_bytes,
                                 rs_is_fold ? 0 : mask_indptr_count,
                                 /*has_slot_ids=*/use_slots,

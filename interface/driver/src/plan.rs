@@ -56,6 +56,9 @@ pub struct LaunchPlan {
     pub single_token_mode: bool,
     pub device_resolved_geometry: bool,
     pub has_user_mask: bool,
+    /// Exclusive physical KV page high-water required before this launch.
+    #[serde(default)]
+    pub required_kv_pages: u32,
     pub image_indptr: Vec<u32>,
     pub image_grids: Vec<u32>,
     pub image_anchor_positions: Vec<u32>,

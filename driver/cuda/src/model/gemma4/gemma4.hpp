@@ -413,6 +413,7 @@ void gemma4_forward_paged(
     int total_tokens,
     int num_requests,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d = nullptr,
     const std::uint8_t* custom_mask_d = nullptr,
     const std::int32_t* custom_mask_indptr_d = nullptr,
     const std::int32_t* logit_row_indices_d = nullptr,

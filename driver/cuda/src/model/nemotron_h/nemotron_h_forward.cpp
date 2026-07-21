@@ -382,6 +382,7 @@ void attention_layer(
     const std::uint32_t* kv_page_indptr_h,
     int model_layer,
     int N, int R, bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
     const void* next_norm_w,
@@ -418,7 +419,7 @@ void attention_layer(
     kernels::launch_write_kv_to_pages(
         kv_view, ws.k.data(), ws.v.data(),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        N, R, stream);
+        N, R, stream, row_valid_d);
 
     const bool use_decode_path =
         is_pure_decode && !fwd_cfg.force_prefill_path;
@@ -1388,6 +1389,7 @@ void nemotron_h_forward_paged(
     int N,
     int R,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
     const std::int32_t* slot_ids_h,
@@ -1462,7 +1464,8 @@ void nemotron_h_forward_paged(
                     cublas, positions, qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
                     static_cast<int>(li),
-                    N, R, is_pure_decode, custom_mask_d, custom_mask_indptr_d,
+                    N, R, is_pure_decode, row_valid_d,
+                    custom_mask_d, custom_mask_indptr_d,
                     next_norm_w, eps, stream, &produced_next_norm);
             });
         } else {

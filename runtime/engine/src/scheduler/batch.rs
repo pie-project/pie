@@ -73,18 +73,12 @@ impl BatchAccumulator {
         // thread — RV-20).
         if req.request.kv_write_lower_bounds.len() > 1
             || req.request.kv_write_upper_bounds.len() > 1
-            || req.request.kv_write_lower_bounds.len()
-                != req.request.kv_write_upper_bounds.len()
+            || req.request.kv_write_lower_bounds.len() != req.request.kv_write_upper_bounds.len()
         {
-            return Some(
-                "per-fire KV containment bounds must be empty or scalar".to_string(),
-            );
+            return Some("per-fire KV containment bounds must be empty or scalar".to_string());
         }
         let rows = req.request.qo_indptr.len().saturating_sub(1);
-        if rows > 1
-            && !req.request.masks.is_empty()
-            && req.request.mask_indptr.len() != rows + 1
-        {
+        if rows > 1 && !req.request.masks.is_empty() && req.request.mask_indptr.len() != rows + 1 {
             return Some(format!(
                 "multi-row fire carries {} masks without a row CSR \
                  ({} mask boundaries for {} rows)",
@@ -115,6 +109,13 @@ pub(crate) fn build_batch_request(
         let req = &mut requests[0];
         let mut plan = req.request.clone();
         let kv_translation = std::mem::take(&mut plan.kv_translation);
+        plan.required_kv_pages = plan.required_kv_pages.max(
+            kv_translation
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, |page| page.saturating_add(1)),
+        );
         let channel_expected_head = plan.channel_expected_head.clone();
         let channel_expected_tail = plan.channel_expected_tail.clone();
         let channel_ticket_len = channel_expected_head.len() as u32;
@@ -273,6 +274,19 @@ mod tests {
         assert_eq!(sub.plan.sampling_indptr, vec![0, 1, 1, 2]);
         assert_eq!(sub.kv_translation, vec![7, 8]);
         assert_eq!(sub.kv_translation_indptr, vec![0, 0, 2, 2]);
+    }
+
+    #[test]
+    fn batch_preserves_largest_required_kv_high_water() {
+        let mut first = wire_decode(11, 3);
+        first.kv_translation = vec![3, 16];
+        let mut second = wire_decode(22, 4);
+        second.kv_translation = vec![8, 28];
+        let mut requests = [pending(first, 1, false), pending(second, 2, false)];
+
+        let sub = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+
+        assert_eq!(sub.plan.required_kv_pages, 29);
     }
 
     #[test]

@@ -25,6 +25,7 @@ LlamaLikeModel::LlamaLikeModel(
     // graph keys only bucket request count/layout — replay would leave
     // newly-active pages stale, so we gate graph_safe on native BF16.
     caps_.graph_safe = kv_cache_.format().is_native_bf16();
+    caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
     caps_.supports_runtime_window = true;
 }

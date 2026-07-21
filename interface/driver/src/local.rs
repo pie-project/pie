@@ -18,9 +18,9 @@ use crate::geometry::GeometryClass;
 
 /// Current direct local ABI version.
 ///
-/// v10: KV write lower bounds are exact declarations rather than clamped
-/// host-envelope hints.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 10;
+/// v11: launches carry the translated physical KV page high-water that must be
+/// committed before execution.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 11;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -550,7 +550,9 @@ pub struct PieLaunchDesc {
     /// Boolean `0`/`1`; any other value is invalid.
     pub has_user_mask: u8,
     /// Reserved; must be zero.
-    pub reserved_flags: [u8; 6],
+    pub reserved_flags: [u8; 2],
+    /// Exclusive physical KV page high-water required before this launch.
+    pub required_kv_pages: u32,
     pub image_indptr: PieU32Slice,
     pub image_grids: PieU32Slice,
     pub image_anchor_positions: PieU32Slice,
@@ -626,7 +628,8 @@ impl Default for PieLaunchDesc {
             context_ids: PieU64Slice::default(),
             single_token_mode: 0,
             has_user_mask: 0,
-            reserved_flags: [0; 6],
+            reserved_flags: [0; 2],
+            required_kv_pages: 0,
             image_indptr: PieU32Slice::default(),
             image_grids: PieU32Slice::default(),
             image_anchor_positions: PieU32Slice::default(),
@@ -2118,7 +2121,7 @@ mod tests {
         assert_eq!(PieInstanceDesc::default().reserved1, 0);
         assert_eq!(PieLaunchDesc::default().reserved0, 0);
         assert_eq!(PieEncodeDesc::default().reserved0, 0);
-        assert_eq!(PieLaunchDesc::default().reserved_flags, [0; 6]);
+        assert_eq!(PieLaunchDesc::default().reserved_flags, [0; 2]);
         assert_eq!(PieKvCopyDesc::default().reserved0, 0);
         assert_eq!(PieStateCopyDesc::default().reserved0, 0);
         assert_eq!(PiePoolResizeDesc::default().reserved0, 0);
@@ -2849,7 +2852,8 @@ mod tests {
         );
         assert!(completion.contains("struct PieTerminalCell *terminal_cell;"));
         assert!(launch.contains("uint32_t reserved0;"));
-        assert!(launch.contains("uint8_t reserved_flags[6];"));
+        assert!(launch.contains("uint8_t reserved_flags[2];"));
+        assert!(launch.contains("uint32_t required_kv_pages;"));
         assert!(runtime.contains("uint32_t reserved0;"));
         assert!(runtime.contains("PieRuntimeNotifyFn notify;"));
         assert!(create.contains("uint32_t reserved0;"));

@@ -625,6 +625,10 @@ pie_add_cuda_target(test_decode_fused_write_parity
   SOURCES tests/test_decode_fused_write_parity.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
+pie_add_cuda_target(test_graph_padding_kv_canary
+  SOURCES tests/test_graph_padding_kv_canary.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_decode_cobatch_chain
   SOURCES tests/test_decode_cobatch_chain.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests

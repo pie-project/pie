@@ -56,6 +56,7 @@ struct MediaEncodeInputs {
 // and small-prefill-graph eligibility.
 struct ModelCapabilities {
     bool graph_safe                   = false;
+    bool graph_padding_kv_write_safe  = false;
     bool supports_compact_logits      = false;
     bool supports_small_prefill_graph = false;
     bool supports_runtime_window       = false;

@@ -75,6 +75,7 @@ void launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
+    const std::uint8_t* row_valid,
     int num_rows,
     int num_q_heads,
     int num_kv_heads,

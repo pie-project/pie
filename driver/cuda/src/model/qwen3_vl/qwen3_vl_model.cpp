@@ -29,6 +29,7 @@ Qwen3VLModel::Qwen3VLModel(
     // Decode fires (no image) are plain Qwen3 and graph-replay safe on a
     // native bf16 KV cache; image fires are prefills (never graphed).
     caps_.graph_safe = kv_cache_.format().is_native_bf16();
+    caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
     caps_.supports_runtime_window = true;
 }

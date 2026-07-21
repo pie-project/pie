@@ -73,9 +73,9 @@ surfaces were moved behind VMM addresses:
 - DeepSeek V4, Kimi, GLM5, and Gemma 4 auxiliary workspaces
 - Recurrent-state cache, verification stash, and buffered-state pool
 
-CUDA graph capture sees immutable virtual addresses. The hidden graph-padding KV
-page is committed before replay so partially filled graph buckets cannot access
-an unmapped tail.
+CUDA graph capture sees immutable virtual addresses. Graph padding aliases KV
+page 0, and each launch carries the physical KV translation high-water that must
+be committed before replay.
 
 The physical accounting budget is derived from free VRAM after weights, with a
 reserved floor. A 32 MiB default VMM handle size is used, reduced to allocation
@@ -219,49 +219,62 @@ Physical commits share one accounting pool, but logical capacity cannot move
 freely between KV, state, and workspace. The planner lattice and per-pool
 capacity fields have not been deleted.
 
-### 4.3 CUDA KV is not proportional while graphs are active
+### 4.3 CUDA graph padding is demand-proportional
 
-The CUDA graph-padding page is located at the KV tail. Tail-only VMM commit must
-therefore commit through that page before graph replay.
+The gated page-0 alias landed on 2026-07-20.
 
-Consequences:
+Stage 1 made invalid-row KV write suppression a checked model capability:
 
-- Idle decommit works.
-- Active inference recommits the full planned KV tail.
-- CUDA does not yet achieve demand-proportional KV physical usage.
+- Gemma 4's packed fused writer and fallback generic writer now consume
+  `row_valid`.
+- Nemotron-H's generic writer now consumes `row_valid`.
+- Every graph-safe model must declare the checked KV-write capability or model
+  attachment fails.
+- Quantized KV writers remain excluded because graph safety is gated on native
+  BF16.
+- CUDA-graph canaries cover Llama-like, Qwen3-VL, Qwen3.5 dense/MoE, Gemma 4
+  fused/fallback, and Nemotron-H. Each replays an off-lattice invalid row
+  against a dedicated canary page and verifies that K/V remain untouched.
 
-Fixing this requires either:
+Stage 2 removed the dedicated tail page from the page-0-safe path:
 
-- A separately mapped graph-padding page/range, or
-- Non-tail sparse range mapping inside the CUDA arena.
+- Native graph-safe families use `graph_pad_page = 0`; models/formats whose
+  non-graph dummy-lane writers are not row-validity-safe retain a hidden
+  sacrificial tail page and keep its backing pinned.
+- Physical KV allocation no longer adds `kv_pages + 1` on the page-0-safe
+  path.
+- Upfront graph-lattice capture maps page 0 explicitly and uses page 0 for every
+  synthetic request instead of fully precommitting KV.
+- Launch commit demand no longer has a graph-pad tail floor.
 
-#### Page-0 alias audit (2026-07-20)
+The first c0/256 gate exposed an important vantage error: the ABI wire CSR for
+a device-resolved fire contains logical pages, not its translated physical
+page IDs. Using that CSR max committed three pages and faulted the first wide
+graph replay. The final implementation computes the exact physical high-water
+from each fire's existing `kv_translation`, takes the batch maximum, and
+carries it in `PieLaunchDesc::required_kv_pages`. The driver commits that prefix
+before descriptor resolution or model execution. ABI v11 and remote wire v8
+make the new field version-safe; remote launch merging recomputes the batch
+high-water, and TP broadcasts it so every follower commits the same prefix.
 
-The proposed simplification—remove the extra tail page and alias graph padding
-to physical page 0—was audited and **aborted before landing**.
+Final gates:
 
-The required write-skip invariant does not hold for every graph-safe path:
+- Graph canaries: all graph-safe model families pass.
+- Serial oracle: 256/256 output hashes match the pre-alias control.
+- Upfront lattice: 51 decode graphs capture with minimal KV commit.
+- c0/256 interleaved n=3: control 32,073.86 tok/s, page-0 alias
+  32,116.08 tok/s, **+0.13%**; all runs completed 256/256 with zero failures
+  and demotions.
+- Active c0/256 proportionality: peak required 2,816 / 10,407 planned pages;
+  peak committed KV 5.25 / 17.79 GiB (29.5%).
 
-- The ordinary native-BF16 `write_kv_kernel`, explicit
-  `write_kv_explicit_kernel`, and fused Llama-like QKV post kernels skip K/V
-  writes when `row_valid == 0`.
-- Quantized KV writers do not consume `row_valid`; they are currently excluded
-  from graph replay because model `graph_safe` is gated on native BF16.
-- Gemma 4 advertises graph safety for native BF16, but both its packed fused
-  QKV/KV writer and its fallback `launch_write_kv_to_pages` call omit
-  `row_valid`. An off-lattice graph-padded Gemma 4 wave can therefore write its
-  pad rows into the selected pad page. Aliasing that page to live page 0 would
-  corrupt real KV.
-
-The zero-request condition is also not literally true: upfront graph-lattice
-capture runs at model load with synthetic requests before any real request.
-Current code makes this memory-safe by precommitting KV before capture, but it
-is not evidence that page 0 is always live because of real decode work.
-
-An experimental non-tail range-mapping change was reverted after this audit.
-The tail padding page remains until every graph-safe KV writer is explicitly
-row-validity-gated (or Gemma 4 graph padding is excluded) and capture-time page
-requirements are represented separately.
+The weights-floor idle assertion is no longer a valid c0/256 oracle after the
+operator-ratified always-on KV index change: cached index roots intentionally
+retain physical pages until explicit removal or pressure eviction. A
+persistent-server cross-check measured 23,002 MiB after 27 seconds on the
+pre-alias control and 8,698 MiB on the alias. Reaching the weights floor while
+preserving those roots would require eviction or swap, so this change does not
+silently introduce either policy.
 
 `graph_pad_slot` was not aliased. RS graph padding is currently disabled by the
 host-reset eligibility predicate, while the state allocator is fully committed
@@ -353,7 +366,8 @@ It is **not** yet valid to claim:
 1. Fix Metal post-unmap heap retirement.
 2. Build and run the Metal implementation and land the probe assets.
 3. Add shared-budget lease/reservation to scheduler admission.
-4. Add non-tail CUDA mapping for the graph-padding page.
+4. Keep the landed page-0 graph-padding canaries and physical high-water ABI
+   contract in CUDA CI.
 5. Convert runtime-quant scratch and MLA/DSA storage.
 6. Add Metal memory-pressure handling.
 7. Delete the old planner capacity lattice and obsolete fields.

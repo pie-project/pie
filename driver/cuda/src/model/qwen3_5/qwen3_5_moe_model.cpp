@@ -33,6 +33,7 @@ Qwen35MoeModel::Qwen35MoeModel(
     fwd_cfg_.tp_comm = tp_comm;
 
     caps_.graph_safe                   = graph_safe;
+    caps_.graph_padding_kv_write_safe  = true;
     caps_.supports_compact_logits      = true;
     caps_.supports_small_prefill_graph = supports_small_prefill_graph;
 }

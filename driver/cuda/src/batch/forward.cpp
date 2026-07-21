@@ -43,7 +43,12 @@ void ForwardFn::attach_model(model::IModel* m) {
     model = m;
     if (m == nullptr) return;
     const auto caps = m->capabilities();
+    if (caps.graph_safe && !caps.graph_padding_kv_write_safe) {
+        throw std::runtime_error(
+            "graph-safe model must gate every KV write on row_valid");
+    }
     graph_safe                   = caps.graph_safe;
+    graph_padding_kv_write_safe  = caps.graph_padding_kv_write_safe;
     supports_compact_logits      = caps.supports_compact_logits;
     supports_small_prefill_graph = caps.supports_small_prefill_graph;
     supports_runtime_window       = caps.supports_runtime_window;
@@ -331,7 +336,7 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
     if (buckets.empty()) return 0;
 
     auto& pi = engine.inputs;
-    const int num_pages = std::max(1, engine.kv_cache.num_pages());
+    engine.kv_cache.ensure_pages(1);
     std::size_t captured = 0;
     const bool log_rank =
         engine.verbose &&
@@ -350,16 +355,14 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
         std::vector<std::uint32_t> qo(static_cast<std::size_t>(R) + 1);
         std::vector<std::uint32_t> kvpp(static_cast<std::size_t>(R) + 1);
         std::vector<std::uint32_t> kvlpl(static_cast<std::size_t>(R), 1u);
-        std::vector<std::uint32_t> kvpi(static_cast<std::size_t>(R));
+        std::vector<std::uint32_t> kvpi(static_cast<std::size_t>(R), 0u);
+        std::vector<std::uint32_t> write_page(static_cast<std::size_t>(N), 0u);
+        std::vector<std::uint32_t> write_offset(static_cast<std::size_t>(N), 0u);
         std::vector<std::int32_t> slot_ids;
 
         for (int r = 0; r <= R; ++r) {
             qo[static_cast<std::size_t>(r)] = static_cast<std::uint32_t>(r);
             kvpp[static_cast<std::size_t>(r)] = static_cast<std::uint32_t>(r);
-        }
-        for (int r = 0; r < R; ++r) {
-            kvpi[static_cast<std::size_t>(r)] =
-                static_cast<std::uint32_t>(r % num_pages);
         }
         if (engine.rs_cache != nullptr) {
             slot_ids.resize(static_cast<std::size_t>(R));
@@ -375,6 +378,8 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
         pi.kv_page_indices.copy_from_host(std::span<const std::uint32_t>(kvpi));
         pi.kv_page_indptr.copy_from_host(std::span<const std::uint32_t>(kvpp));
         pi.kv_last_page_lens.copy_from_host(std::span<const std::uint32_t>(kvlpl));
+        pi.w_page.copy_from_host(std::span<const std::uint32_t>(write_page));
+        pi.w_off.copy_from_host(std::span<const std::uint32_t>(write_offset));
         CUDA_CHECK(cudaMemsetAsync(
             pi.row_valid.data(), 1,
             static_cast<std::size_t>(N), nullptr));

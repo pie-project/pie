@@ -1446,6 +1446,7 @@ void gemma4_forward_paged(
     int N,
     int R,
     bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* /*custom_mask_indptr_d*/,
     const std::int32_t* logit_row_indices_d,
@@ -1712,7 +1713,7 @@ void gemma4_forward_paged(
                     kv_view.k_pages, kv_view.v_pages,
                     layer.q_norm->data(), layer.k_norm->data(),
                     positions, post_kv_page_indices, post_kv_page_indptr,
-                    post_kv_last_page_lens, N, num_q_heads_local,
+                    post_kv_last_page_lens, row_valid_d, N, num_q_heads_local,
                     num_kv_heads_local, d, cache.page_size(),
                     kv_view.hnd_layout, w.per_layer_rope_theta[l], eps,
                     stream);
@@ -1833,7 +1834,7 @@ void gemma4_forward_paged(
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, stream);
+                N, R, stream, row_valid_d);
         }
             });
 

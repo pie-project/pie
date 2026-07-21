@@ -355,6 +355,7 @@ __global__ void qkv_packed_qk_norm_rope_vnorm_write_kv_kernel(
     const std::uint32_t* __restrict__ kv_page_indices,
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
+    const std::uint8_t* __restrict__ row_valid,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -366,6 +367,7 @@ __global__ void qkv_packed_qk_norm_rope_vnorm_write_kv_kernel(
     const int row = blockIdx.x;
     const int head_idx = blockIdx.y;
     const bool is_q = head_idx < num_q_heads;
+    if (!is_q && row_valid != nullptr && row_valid[row] == 0) return;
     const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
     const int q_dim = num_q_heads * head_dim;
     const int kv_dim = num_kv_heads * head_dim;
@@ -644,6 +646,7 @@ void launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
+    const std::uint8_t* row_valid,
     int num_rows,
     int num_q_heads,
     int num_kv_heads,
@@ -666,6 +669,7 @@ void launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
             static_cast<const __nv_bfloat16*>(q_weight),
             static_cast<const __nv_bfloat16*>(k_weight),
             positions, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            row_valid,
             num_q_heads, num_kv_heads, head_dim, page_size, hnd_layout,
             theta, eps);
 }

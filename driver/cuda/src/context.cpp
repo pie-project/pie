@@ -263,6 +263,17 @@ class Context::Impl {
     Impl() = default;
     ~Impl() {
         drain_async_streams();
+        if (kv_proportional_peak_required_pages_ > 0) {
+            std::cerr
+                << "[pie-driver-cuda] KV proportionality summary: "
+                << "peak_required_pages="
+                << kv_proportional_peak_required_pages_
+                << " planned_pages=" << kv_proportional_planned_pages_
+                << " peak_committed_bytes="
+                << kv_proportional_peak_committed_bytes_
+                << " capacity_bytes=" << kv_proportional_capacity_bytes_
+                << "\n";
+        }
         if (media_stream_ != nullptr) {
             cudaStreamDestroy(media_stream_);
             media_stream_ = nullptr;
@@ -415,6 +426,10 @@ class Context::Impl {
     pie_cuda_driver::NcclComm* tp_comm_ = nullptr;
     std::string caps_json_;
     std::string device_facts_json_;
+    std::size_t kv_proportional_peak_required_pages_ = 0;
+    std::size_t kv_proportional_planned_pages_ = 0;
+    std::size_t kv_proportional_peak_committed_bytes_ = 0;
+    std::size_t kv_proportional_capacity_bytes_ = 0;
     bool load_attempted_ = false;
     std::string tp_cpu_gate_key_;
     int device_ordinal_ = 0;
@@ -751,9 +766,19 @@ int Context::Impl::load_model(
     const int runtime_kv_pages = (kv_page_cap > 0)
         ? std::min<int>(mem_plan.kv_pages, static_cast<int>(kv_page_cap))
         : mem_plan.kv_pages;
+    const bool page_zero_dummy_safe =
+        kv_format.is_native_bf16() &&
+        (family == model::Family::LlamaLike ||
+         family == model::Family::Qwen3VL ||
+         family == model::Family::Qwen3_5 ||
+         family == model::Family::Qwen3_5Moe ||
+         family == model::Family::Gemma4 ||
+         family == model::Family::NemotronH);
     const int physical_kv_pages =
-        mem_plan.kv_pages > 0 ? mem_plan.kv_pages + 1 : mem_plan.kv_pages;
-    const int graph_pad_page = mem_plan.kv_pages > 0 ? runtime_kv_pages : -1;
+        mem_plan.kv_pages + (mem_plan.kv_pages > 0 && !page_zero_dummy_safe ? 1 : 0);
+    const int graph_pad_page = mem_plan.kv_pages > 0
+        ? (page_zero_dummy_safe ? 0 : runtime_kv_pages)
+        : -1;
     const bool has_recurrent_state_cache =
         (family == model::Family::Qwen3_5 ||
          family == model::Family::Qwen3_5Moe) &&
@@ -1294,11 +1319,11 @@ int Context::Impl::load_model(
         workspace_allocator_->ensure_all();
         attention_allocator_->ensure_all();
         state_allocator_->ensure_all();
-        kv_cache.ensure_pages(kv_cache.num_pages());
         capture_forward_graph_lattice(*executor_);
-        kv_cache.trim_pages(1);
-        workspace_allocator_->trim_bytes(pie::elastic::kLogicalPageBytes);
-        attention_allocator_->trim_bytes(0);
+        if (!is_tp_follower()) {
+            workspace_allocator_->trim_bytes(pie::elastic::kLogicalPageBytes);
+            attention_allocator_->trim_bytes(0);
+        }
     }
     tp_startup_cpu_barrier(cfg);
 
@@ -1537,6 +1562,12 @@ int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion)
                   << resource_status << "\n";
         return resource_status;
     }
+    if (launch.required_kv_pages >
+        static_cast<std::uint32_t>(kv_cache_->num_pages())) {
+        std::cerr << "[pie-driver-cuda] launch rejected: required KV page "
+                     "high-water exceeds capacity\n";
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
     LaunchScratch scratch;
     pie_native::LaunchView view = scratch.build(launch, launch_instances);
     const bool has_ptir_launch = !view.ptir_program_hashes.empty();
@@ -1557,10 +1588,11 @@ int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion)
     try {
         workspace_allocator_->ensure_all();
         attention_allocator_->ensure_all();
-        int required_kv_pages =
-            executor_->graph_pad_page >= 0
-                ? executor_->graph_pad_page + 1
-                : 0;
+        int required_kv_pages = static_cast<int>(launch.required_kv_pages);
+        if (executor_->graph_pad_page > 0) {
+            required_kv_pages = std::max(
+                required_kv_pages, executor_->graph_pad_page + 1);
+        }
         if (launch.kv_page_indices.len > 0) {
             const auto* end =
                 launch.kv_page_indices.ptr + launch.kv_page_indices.len;
@@ -1571,6 +1603,27 @@ int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion)
                 static_cast<int>(highest) + 1);
         }
         kv_cache_->ensure_pages(required_kv_pages);
+        executor_->required_kv_pages = required_kv_pages;
+        const char* assert_proportional =
+            std::getenv("PIE_CUDA_ASSERT_KV_COMMIT_PROPORTIONAL");
+        if (assert_proportional != nullptr && assert_proportional[0] != '\0' &&
+            assert_proportional[0] != '0' && required_kv_pages > 0) {
+            const std::size_t committed = kv_allocator_->committed_bytes();
+            const std::size_t capacity = kv_allocator_->allocated_bytes();
+            kv_proportional_peak_required_pages_ = std::max(
+                kv_proportional_peak_required_pages_,
+                static_cast<std::size_t>(required_kv_pages));
+            kv_proportional_planned_pages_ =
+                static_cast<std::size_t>(kv_cache_->num_pages());
+            kv_proportional_peak_committed_bytes_ = std::max(
+                kv_proportional_peak_committed_bytes_, committed);
+            kv_proportional_capacity_bytes_ = capacity;
+            if (required_kv_pages * 2 < kv_cache_->num_pages() &&
+                committed * 2 >= capacity) {
+                throw std::runtime_error(
+                    "short-context KV commit is not demand-proportional");
+            }
+        }
         pie_cuda_driver::handle_fire_batch(
             0, view, *executor_, runtime_, completion);
         return PIE_STATUS_OK;

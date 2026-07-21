@@ -82,6 +82,7 @@ struct ForwardFn {
     // satisfy that yet — left here as the explicit flip we'll set
     // alongside the graph-safe attention dispatch refactor.
     bool graph_safe = false;
+    bool graph_padding_kv_write_safe = false;
     bool supports_compact_logits = false;
     bool supports_small_prefill_graph = false;
     bool supports_runtime_window = false;
@@ -346,14 +347,16 @@ struct BatchEngine {
     ops::CublasHandle& cublas;
     int max_workspace_tokens;
     int max_forward_requests;
-    // Private physical KV page used only for CUDA-graph padding rows.
-    // This page is not reported in DriverCapabilities.total_pages, so the
-    // runtime never assigns it to a context.
+    // Invalid-row dummy page. Row-validity-safe native graph paths alias page
+    // 0; other models/formats retain a hidden sacrificial tail page.
     int graph_pad_page = -1;
     // Private recurrent-state slot used only for CUDA-graph padding rows.
     // Like graph_pad_page, it is allocated in CUDA storage but hidden from
     // runtime capabilities.
     int graph_pad_slot = -1;
+    // Physical KV prefix required by the rank-0 launch. TP followers receive
+    // this in the fire header and commit the same prefix before execution.
+    int required_kv_pages = 0;
     // Pre-allocated input buffers — refreshed per fire via memcpy
     // rather than re-allocated. See `persistent_inputs.hpp`.
     PersistentInputs& inputs;

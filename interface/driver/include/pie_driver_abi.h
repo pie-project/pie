@@ -51,10 +51,10 @@
 /**
  * Current direct local ABI version.
  *
- * v10: KV write lower bounds are exact declarations rather than clamped
- * host-envelope hints.
+ * v11: launches carry the translated physical KV page high-water that must be
+ * committed before execution.
  */
-#define PIE_DRIVER_ABI_VERSION 10
+#define PIE_DRIVER_ABI_VERSION 11
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -169,7 +169,7 @@
 
 #define RS_FLAG_FOLD 2
 
-#define REMOTE_WIRE_VERSION 7
+#define REMOTE_WIRE_VERSION 8
 
 /**
  * Opaque embedded-driver handle.
@@ -516,7 +516,11 @@ typedef struct PieLaunchDesc {
   /**
    * Reserved; must be zero.
    */
-  uint8_t reserved_flags[6];
+  uint8_t reserved_flags[2];
+  /**
+   * Exclusive physical KV page high-water required before this launch.
+   */
+  uint32_t required_kv_pages;
   struct PieU32Slice image_indptr;
   struct PieU32Slice image_grids;
   struct PieU32Slice image_anchor_positions;
