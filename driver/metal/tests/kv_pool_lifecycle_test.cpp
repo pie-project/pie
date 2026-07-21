@@ -106,6 +106,21 @@ int main() {
     expect(ctx->pending_elastic_release_count() == 0,
            "elastic final release leaves no pending heap");
 
+    auto tight = RawMetalContext::create(4u << 20, 4u << 20);
+    SlotHandle tight_a = tight->create_elastic_buffer(4u << 20);
+    SlotHandle tight_b = tight->create_elastic_buffer(4u << 20);
+    expect(
+        !tight->ensure_elastic_buffers_atomically({
+            {tight_a, 4u << 20},
+            {tight_b, 4u << 20},
+        }),
+        "atomic elastic grow rejects an over-budget batch");
+    expect(
+        tight->elastic_committed_pages() == 0,
+        "failed atomic grow leaves every buffer uncommitted");
+    tight->release_elastic_buffer(tight_a);
+    tight->release_elastic_buffer(tight_b);
+
     std::printf("\n==== kv_pool_lifecycle_test: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

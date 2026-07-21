@@ -133,7 +133,11 @@ extern "C" int32_t pie_metal_prepare_launch(
     if (driver == nullptr || result == nullptr) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    return PIE_STATUS_UNSUPPORTED;
+    try {
+        return as_context(driver)->prepare_launch(*launch, result);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
 }
 
 extern "C" int32_t pie_metal_launch_prepared(
@@ -149,7 +153,12 @@ extern "C" int32_t pie_metal_launch_prepared(
     if (driver == nullptr || lease_id == 0) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    return PIE_STATUS_UNSUPPORTED;
+    try {
+        return as_context(driver)->launch_prepared(
+            *launch, lease_id, completion);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
 }
 
 extern "C" int32_t pie_metal_release_launch(
@@ -158,7 +167,11 @@ extern "C" int32_t pie_metal_release_launch(
     if (driver == nullptr || lease_id == 0) {
         return PIE_STATUS_INVALID_ARGUMENT;
     }
-    return PIE_STATUS_UNSUPPORTED;
+    try {
+        return as_context(driver)->release_launch(lease_id);
+    } catch (...) {
+        return PIE_STATUS_DRIVER_ERROR;
+    }
 }
 
 extern "C" int32_t pie_metal_copy_kv(

@@ -66,6 +66,7 @@ struct LaunchJobData {
     OwnedLaunchView launch;
     std::vector<MemberForwardDesc> fwd_descs;
     PieCompletion completion{};
+    std::uint64_t lease_id = 0;
 };
 
 pie_native::LaunchView build_launch_view(const PieLaunchDesc& launch);

@@ -394,6 +394,11 @@ class MetalExecutor {
     std::uint64_t elastic_page_bytes() const;
     std::uint64_t elastic_budget_pages() const;
     std::uint64_t elastic_committed_pages() const;
+    bool ensure_launch_storage(
+        std::uint32_t kv_pages,
+        std::uint32_t state_slots,
+        std::uint32_t token_rows,
+        std::string* error);
 
     // Copies one GDN layer's-worth (every GDN layer) resident conv+
     // recurrent state from `src_slot` to `dst_slot` (whole-slot; per-token

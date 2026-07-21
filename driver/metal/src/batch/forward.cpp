@@ -853,15 +853,10 @@ bool MetalExecutor::Impl::ensure_elastic_storage(
     std::uint32_t token_rows,
     std::uint32_t ring_tokens,
     std::string* err) {
-    auto ensure = [&](const SlotHandle& slot, size_t bytes) {
-        if (!slot.valid() || !slot.elastic) return true;
-        if (ctx_->ensure_elastic_buffer(slot, std::min(bytes, slot.size))) {
-            return true;
-        }
-        if (err != nullptr) {
-            *err = "Metal elastic physical budget exhausted";
-        }
-        return false;
+    std::vector<std::pair<SlotHandle, size_t>> targets;
+    auto add_target = [&](const SlotHandle& slot, size_t bytes) {
+        if (!slot.valid() || !slot.elastic) return;
+        targets.emplace_back(slot, std::min(bytes, slot.size));
     };
 
     if (ring_tokens != 0) {
@@ -871,10 +866,8 @@ bool MetalExecutor::Impl::ensure_elastic_storage(
                 layer.k_pages.size *
                 std::min<std::uint32_t>(ring_tokens, max_ctx_) /
                 size_t(max_ctx_);
-            if (!ensure(layer.k_pages, bytes) ||
-                !ensure(layer.v_pages, bytes)) {
-                return false;
-            }
+            add_target(layer.k_pages, bytes);
+            add_target(layer.v_pages, bytes);
         }
     }
     if (kv_pool_.enabled && kv_pages != 0) {
@@ -884,10 +877,8 @@ bool MetalExecutor::Impl::ensure_elastic_storage(
         const size_t bytes = size_t(kv_pages) * page_bytes;
         for (const auto& layer : kv_pool_.layers) {
             if (!layer.k_pages.valid()) continue;
-            if (!ensure(layer.k_pages, bytes) ||
-                !ensure(layer.v_pages, bytes)) {
-                return false;
-            }
+            add_target(layer.k_pages, bytes);
+            add_target(layer.v_pages, bytes);
         }
     }
     if (state_slots != 0) {
@@ -897,11 +888,9 @@ bool MetalExecutor::Impl::ensure_elastic_storage(
             size_t(state_slots) * g_.gdn_recurrent_stride_bytes();
         for (const auto& layer : b_.gdn) {
             if (!layer.conv_state.valid()) continue;
-            if (!ensure(layer.conv_state, conv_bytes) ||
-                !ensure(layer.conv_state_out, conv_bytes) ||
-                !ensure(layer.recurrent_state, recurrent_bytes)) {
-                return false;
-            }
+            add_target(layer.conv_state, conv_bytes);
+            add_target(layer.conv_state_out, conv_bytes);
+            add_target(layer.recurrent_state, recurrent_bytes);
         }
     }
     const std::uint32_t rows = std::max<std::uint32_t>(1, token_rows);
@@ -911,16 +900,20 @@ bool MetalExecutor::Impl::ensure_elastic_storage(
         const size_t bytes =
             (slot.size * std::min(rows, capacity) + capacity - 1) /
             capacity;
-        if (!ensure(slot, bytes)) return false;
+        add_target(slot, bytes);
     }
     for (const auto& slot : b_.scratch) {
         if (!slot.valid()) continue;
         const size_t bytes =
             (slot.size * std::min(rows, capacity) + capacity - 1) /
             capacity;
-        if (!ensure(slot, bytes)) return false;
+        add_target(slot, bytes);
     }
-    return true;
+    if (ctx_->ensure_elastic_buffers_atomically(targets)) return true;
+    if (err != nullptr) {
+        *err = "Metal elastic physical budget exhausted";
+    }
+    return false;
 }
 
 namespace {
@@ -1917,6 +1910,15 @@ std::uint64_t MetalExecutor::elastic_committed_pages() const {
     return ready() ? impl_->ctx_->elastic_committed_pages() : 0u;
 }
 
+bool MetalExecutor::ensure_launch_storage(
+    std::uint32_t kv_pages,
+    std::uint32_t state_slots,
+    std::uint32_t token_rows,
+    std::string* error) {
+    return ready() && impl_->ensure_elastic_storage(
+        kv_pages, state_slots, token_rows, 0, error);
+}
+
 std::uint32_t MetalExecutor::kv_pool_total_pages() const {
     return ready() && impl_->kv_pool().enabled ? impl_->kv_pool().total_pages : 0u;
 }
@@ -2621,6 +2623,14 @@ std::uint32_t MetalExecutor::kv_pool_total_pages() const { return 0; }
 std::uint32_t MetalExecutor::kv_pool_committed_pages() const { return 0; }
 std::uint32_t MetalExecutor::kv_pool_page_size() const { return 0; }
 bool MetalExecutor::ensure_kv_pages(std::uint32_t, std::string* error) {
+    if (error != nullptr) *error = "Metal executor requires an Apple build";
+    return false;
+}
+bool MetalExecutor::ensure_launch_storage(
+    std::uint32_t,
+    std::uint32_t,
+    std::uint32_t,
+    std::string* error) {
     if (error != nullptr) *error = "Metal executor requires an Apple build";
     return false;
 }

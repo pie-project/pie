@@ -202,7 +202,7 @@ impl DriverBackend {
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.supports_elastic_admission(),
             #[cfg(feature = "driver-metal")]
-            Self::Metal(_) => false,
+            Self::Metal(_) => true,
             Self::Remote(_) => false,
         }
     }
@@ -213,7 +213,7 @@ impl DriverBackend {
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.prepare_launch(desc),
             #[cfg(feature = "driver-metal")]
-            Self::Metal(_) => Ok(LaunchPrepareOutcome::Unsupported),
+            Self::Metal(driver) => driver.prepare_launch(desc),
             Self::Remote(_) => Ok(LaunchPrepareOutcome::Unsupported),
         }
     }
@@ -228,7 +228,7 @@ impl DriverBackend {
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.launch_prepared(desc, lease),
             #[cfg(feature = "driver-metal")]
-            Self::Metal(_) => Err(anyhow!("metal launch preparation is unsupported")),
+            Self::Metal(driver) => driver.launch_prepared(desc, lease),
             Self::Remote(_) => Err(anyhow!("remote launch preparation is unsupported")),
         }
     }
@@ -239,7 +239,7 @@ impl DriverBackend {
             #[cfg(feature = "driver-cuda")]
             Self::Cuda(driver) => driver.release_launch(lease),
             #[cfg(feature = "driver-metal")]
-            Self::Metal(_) => Err(anyhow!("metal launch preparation is unsupported")),
+            Self::Metal(driver) => driver.release_launch(lease),
             Self::Remote(_) => Err(anyhow!("remote launch preparation is unsupported")),
         }
     }
