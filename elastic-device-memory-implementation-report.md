@@ -332,6 +332,63 @@ Corrected gates:
 - CUDA CTest passes 45/45, including the new seed-pull regression; engine unit
   tests pass 359/359.
 
+#### Contention and shape cross-validation
+
+A follow-up Pie/vLLM sweep used 256 semantic prompts spanning 54--586 prompt
+tokens, request widths 1/2/3/7/15/16/17/31/32/33/63/64/65/127/128/129/256,
+contention caps 1/2/3/7/16/31/32, output boundaries
+1/2/15/16/17/31/32/33/63/64/65/127/128/129, a mixed 16/129-token workload,
+and four simultaneous long-form clients.
+
+- The final matched sweep covers 40 runs and 1,390 requests with zero failures.
+- A fixed-shape serial corpus matches vLLM for 196/256 complete 32-token
+  sequences; the median common prefix is all 32 tokens and the minimum is 4.
+  vLLM itself has the same minimum prefix of 4 when its active batch shape
+  changes, so cross-shape token-exactness is not a stable correctness oracle.
+- Every output-boundary case matches the pre-change Pie serial oracle:
+  112/112 sequences exact.
+- The four true-serial long outputs match the corrected pre-change build
+  4/4 x 1,024 tokens exactly. Four-way concurrent long output completes all
+  requests with coherent prompt-specific text; batch-shape numerical
+  divergence begins after 38--135 tokens.
+
+The performance sweep found that direct PTIR prefill still materialized
+`[N, vocab]` logits and gathered sampled rows only afterward. Reconnecting
+`sample_idx` to the models' existing compact-logit path makes non-graph
+prefill/mixed launches gather hidden rows before `lm_head`; the epilogue now
+addresses the compact `[0,S)` rows. Pure-decode graphs and MTP draft layouts
+remain unchanged, and TP followers receive the same compact row count.
+
+On the 64-request, 304-token-prefix cell, compact logits reduce measured CUDA
+kernel time from 206.6 ms to 163.8 ms. Pairing them with the measured
+Qwen3-0.6B Ada TP1 `N=8192, R=512` lattice reduces it to 152.75 ms, versus
+153.2 ms for vLLM. The wider lattice increases persistent input allocation
+from 73 MiB to 289 MiB; the planner rule is restricted to this small Qwen3
+shape on large Ada devices.
+
+| Requests | Pie tok/s | vLLM tok/s | Pie delta |
+|---:|---:|---:|---:|
+| 1 | 516.43 | 486.39 | +6.2% |
+| 8 | 3,630.62 | 3,267.81 | +11.1% |
+| 32 | 12,121.51 | 11,311.01 | +7.2% |
+| 128 | 28,124.16 | 27,381.72 | +2.7% |
+| 256 | 33,115.95 | 33,315.26 | -0.6% |
+| mixed 64 | 8,648.48 | 8,330.56 | +3.8% |
+| queued 31/32 | 5,136.80 | 5,131.90 | +0.1% |
+
+The long-prefix client headline remains about 3--4% below vLLM's offline API
+because Pie includes WebSocket process launch/bind while the vLLM measurement
+starts after prompt rendering and request construction. CUDA measured wall is
+185 ms for Pie and 183 ms for vLLM; no forward-kernel deficit remains.
+
+The accumulated shape sweep also reached the fused program cache's former
+128-entry limit. Program entries contain only a hash and shared references to
+the separately bounded 128-entry stage/module cache, so the lightweight
+program map now retains 4,096 variants. The stage and negative-cache limits
+remain 128. A regression stores 129 additional program variants without
+creating additional CUDA stage modules, and the repeated 1,518-request
+persistent-server sweep completes with zero failures.
+
 This claim does **not** extend to Remote or CUDA TP. Remote post-scheduler
 coalescing would invalidate a worker-side lease, and TP needs all-rank atomic
 prepare/abort. Both report prepare unsupported.

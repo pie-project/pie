@@ -519,6 +519,9 @@ struct ForwardDispatchInputs {
     int num_sampling = 0;
     bool is_pure_decode = false;
     bool have_custom_mask = false;
+    // Direct non-graph prefill/mixed launches may gather the requested hidden
+    // rows before lm_head instead of materializing [N, vocab] logits.
+    bool compact_logits = false;
     int structured_window_left = -2;
     // Explicit KV-write descriptor present (device-geometry WSlot/WOff, B2).
     // When set, the forward routes the per-layer KV append through the explicit

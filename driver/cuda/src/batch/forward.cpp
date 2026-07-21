@@ -609,11 +609,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.rs_fold_lens_d           = in.rs_fold_lens_d;
     fwd_in.rs_buffer_write         = in.rs_buffer_write;
     fwd_in.rs_buffer_fold          = in.rs_buffer_fold;
-    // Compact/gathered logit rows are a legacy graph-variant fast path that
-    // no direct-PTIR fire uses (the sampler reads straight out of ws.logits
-    // via pi.sample_idx after this call — see batch/logits.hpp).
-    fwd_in.logit_row_indices_d = nullptr;
-    fwd_in.num_logit_rows      = 0;
+    fwd_in.logit_row_indices_d =
+        in.compact_logits ? pi.sample_idx.data() : nullptr;
+    fwd_in.num_logit_rows =
+        in.compact_logits ? in.num_sampling : 0;
     fwd_in.emit_logits         = in.num_sampling > 0;
     // Multimodal: image data for the encode+scatter (no-op if none).
     fwd_in.image_pixels_h            = in.image_pixels_h;

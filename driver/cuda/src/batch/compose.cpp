@@ -9,6 +9,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <span>
 #include <stdexcept>
@@ -1400,6 +1401,11 @@ void handle_fire_batch(
         const MtpDraftPlan mtp_draft_plan =
             preflight_mtp_draft_logits(
                 engine, composed, sample_rows, mtp_draft_counts);
+        const bool compact_logits =
+            !is_pure_decode &&
+            mtp_draft_plan.work.empty() &&
+            num_sampling > 0 &&
+            num_sampling < forward_N;
         if (rs_is_fold && !mtp_draft_plan.work.empty()) {
             throw std::runtime_error(
                 "state-only buffered RS fold cannot produce MTP drafts");
@@ -1622,7 +1628,7 @@ void handle_fire_batch(
                                 rs_is_fold ? 0 : mask_indptr_count,
                                 /*has_slot_ids=*/use_slots,
                                 !rs_is_fold && has_write_desc,
-                                /*logit_rows=*/0,
+                                compact_logits ? num_sampling : 0,
                                 structured_window_left,
                                 rs_plan.mode,
                                 static_cast<int>(rs_fold_len_view.size()),
@@ -1735,6 +1741,7 @@ void handle_fire_batch(
                 .num_sampling = num_sampling,
                 .is_pure_decode = is_pure_decode,
                 .have_custom_mask = have_custom_mask,
+                .compact_logits = compact_logits,
                 .structured_window_left = structured_window_left,
                 .has_write_desc = has_write_desc,
                 .use_slots = use_slots,
@@ -1818,12 +1825,24 @@ void handle_fire_batch(
         const pipeline::DispatchStats stats_before = dbg_fire
             ? engine.dispatch->stats()
             : pipeline::DispatchStats{};
+        std::vector<std::uint32_t> compact_logit_rows;
+        const std::uint32_t* direct_logit_rows =
+            reinterpret_cast<const std::uint32_t*>(sample_rows.data());
+        if (compact_logits) {
+            compact_logit_rows.resize(
+                static_cast<std::size_t>(num_sampling));
+            std::iota(
+                compact_logit_rows.begin(),
+                compact_logit_rows.end(),
+                std::uint32_t{0});
+            direct_logit_rows = compact_logit_rows.data();
+        }
         engine.dispatch->finish(
             *staged_launch, dispatch_view, nullptr, vocab,
             engine.cublas.stream(),
             &runtime, completion,
             static_cast<const std::uint16_t*>(engine.ws.logits.data()),
-            reinterpret_cast<const std::uint32_t*>(sample_rows.data()),
+            direct_logit_rows,
             mtp_draft_plan.draft_starts,
             mtp_draft_counts,
             static_cast<std::uint32_t>(tensor_rows(engine.ws.logits)),
