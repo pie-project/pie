@@ -1,30 +1,32 @@
-use plex::types::{ColumnValues, DenseOutput, EvictionInput, PolicyError};
+use plex::serde_json::json;
+use plex::{Document, Policy};
 
 struct RetentionScore;
 
-impl plex::Policy for RetentionScore {
-    fn evict(input: EvictionInput) -> Result<DenseOutput, PolicyError> {
-        let Some(handle) = input.links.facts.first().copied().flatten() else {
-            return Err(PolicyError::FallbackRequired);
-        };
-        let Some(column) = input
-            .fields
-            .facts
-            .iter()
-            .find(|column| column.handle.value == handle.value)
-        else {
-            return Err(PolicyError::FallbackRequired);
-        };
-        let ColumnValues::Float64s(values) = &column.values else {
-            return Err(PolicyError::FallbackRequired);
-        };
-        let Some(scores) = values.iter().copied().collect::<Option<Vec<_>>>() else {
-            return Err(PolicyError::FallbackRequired);
-        };
-        Ok(DenseOutput {
-            scores,
-            mutations: Vec::new(),
-        })
+impl Policy for RetentionScore {
+    fn evict(input: &mut Document) -> Result<Document, String> {
+        let resident = input["resident"]
+            .as_array_mut()
+            .ok_or("resident must be an array")?;
+        let scores = resident
+            .iter_mut()
+            .map(|unit| {
+                let reload = unit["facts"]["reload_cost"].as_f64().unwrap_or(0.0);
+                let retention = unit["request"]["state"]["retention_bonus"]
+                    .as_f64()
+                    .unwrap_or(0.0);
+                if unit["request"].is_object() {
+                    unit["request"]["state"]["eviction_checks"] = json!(
+                        unit["request"]["state"]["eviction_checks"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            + 1
+                    );
+                }
+                reload + retention
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"scores": scores}))
     }
 }
 

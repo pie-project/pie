@@ -1,9 +1,9 @@
 [package]
 name = "pie-policy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Isolated Wasmtime host for PLEX operator policies"
+description = "Isolated JSON proof-of-concept host for PLEX policies"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -12,7 +12,6 @@ name = "pie_policy"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0"
 blake3 = "1.8"
 pie-plex = { path = "../../interface/plex" }
 serde = { version = "1.0", features = ["derive"] }

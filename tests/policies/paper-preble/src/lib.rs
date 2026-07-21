@@ -1,72 +1,40 @@
-//! Preble E2 exploit/explore routing stress case.
-//! Primary source: https://arxiv.org/abs/2407.00023
+//! JSON adaptation of Preble E2 routing.
+//! https://arxiv.org/abs/2407.00023
 
-use plex::types::{ColumnValues, DenseOutput, PlacementInput, PolicyError};
-use plex::{LinkSetExt, RecordBatchExt};
+use plex::serde_json::json;
+use plex::{Document, Policy};
 
 struct Preble;
 
-impl plex::Policy for Preble {
-    fn route(input: PlacementInput) -> Result<DenseOutput, PolicyError> {
-        let cached_handle = input.links.fact(0).ok_or(PolicyError::FallbackRequired)?;
-        let uncached_handle = input.links.fact(1).ok_or(PolicyError::FallbackRequired)?;
-        let load_handle = input.links.fact(2).ok_or(PolicyError::FallbackRequired)?;
-        let eviction_handle = input.links.fact(3).ok_or(PolicyError::FallbackRequired)?;
-        let ColumnValues::Unsigned64s(cached) = input
-            .fields
-            .fact(cached_handle)
-            .ok_or(PolicyError::FallbackRequired)?
-        else {
-            return Err(PolicyError::FallbackRequired);
-        };
-        let ColumnValues::Unsigned64s(uncached) = input
-            .fields
-            .fact(uncached_handle)
-            .ok_or(PolicyError::FallbackRequired)?
-        else {
-            return Err(PolicyError::FallbackRequired);
-        };
-        let ColumnValues::Unsigned64s(load) = input
-            .fields
-            .fact(load_handle)
-            .ok_or(PolicyError::FallbackRequired)?
-        else {
-            return Err(PolicyError::FallbackRequired);
-        };
-        let ColumnValues::Unsigned64s(eviction) = input
-            .fields
-            .fact(eviction_handle)
-            .ok_or(PolicyError::FallbackRequired)?
-        else {
-            return Err(PolicyError::FallbackRequired);
-        };
-        let remaining = uncached
+impl Policy for Preble {
+    fn route(input: &mut Document) -> Result<Document, String> {
+        let candidates = input["candidates"]
+            .as_array()
+            .ok_or("candidates must be an array")?;
+        let remaining = candidates
             .first()
-            .copied()
-            .flatten()
-            .ok_or(PolicyError::FallbackRequired)?;
-        let longest = cached
+            .and_then(|candidate| candidate["facts"]["uncached_tokens"].as_u64())
+            .unwrap_or(0);
+        let longest = candidates
             .iter()
-            .copied()
-            .flatten()
+            .filter_map(|candidate| candidate["facts"]["cached_tokens"].as_u64())
             .max()
-            .ok_or(PolicyError::FallbackRequired)?;
+            .unwrap_or(0);
         let exploit = longest > remaining;
-        let mut scores = Vec::with_capacity(cached.len());
-        for index in 0..cached.len() {
-            let cached = cached[index].ok_or(PolicyError::FallbackRequired)?;
-            let load = load[index].ok_or(PolicyError::FallbackRequired)?;
-            let eviction = eviction[index].ok_or(PolicyError::FallbackRequired)?;
-            scores.push(if exploit {
-                cached as f64
-            } else {
-                -(load.saturating_add(eviction).saturating_add(remaining) as f64)
-            });
-        }
-        Ok(DenseOutput {
-            scores,
-            mutations: Vec::new(),
-        })
+        let scores = candidates
+            .iter()
+            .map(|candidate| {
+                let cached = candidate["facts"]["cached_tokens"].as_u64().unwrap_or(0);
+                let load = candidate["facts"]["load_cost"].as_u64().unwrap_or(0);
+                let eviction = candidate["facts"]["eviction_cost"].as_u64().unwrap_or(0);
+                if exploit {
+                    cached as f64
+                } else {
+                    -(load.saturating_add(eviction).saturating_add(remaining) as f64)
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"scores": scores}))
     }
 }
 

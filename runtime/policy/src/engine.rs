@@ -1,58 +1,38 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::error::AttachmentError;
+use crate::AttachmentError;
 
 #[derive(Debug, Clone)]
 pub struct PolicyEngineConfig {
-    pub max_component_bytes: usize,
-    pub max_manifest_bytes: usize,
     pub max_package_bytes: usize,
+    pub max_manifest_bytes: usize,
+    pub max_component_bytes: usize,
     pub max_memory_bytes: usize,
     pub max_fuel: u64,
     pub max_deadline_ms: u64,
     pub max_input_bytes: u64,
     pub max_output_bytes: u64,
-    pub max_map_calls: u32,
-    pub max_map_bytes: u64,
-    pub max_maps: usize,
-    pub max_map_entries: u64,
-    pub max_map_storage_bytes: u64,
-    pub max_staged_mutations: u32,
-    pub max_feedback_records: u32,
-    pub max_telemetry_records: u32,
-    pub max_telemetry_bytes: u64,
-    pub telemetry_buffer_records: usize,
     pub max_concurrent_invocations: u32,
-    pub max_conflict_retries: u32,
+    pub max_feedback_deliveries: usize,
     pub epoch_tick: Option<Duration>,
 }
 
 impl Default for PolicyEngineConfig {
     fn default() -> Self {
         Self {
-            max_component_bytes: 4 * 1024 * 1024,
-            max_manifest_bytes: 256 * 1024,
             max_package_bytes: 5 * 1024 * 1024,
+            max_manifest_bytes: 64 * 1024,
+            max_component_bytes: 4 * 1024 * 1024,
             max_memory_bytes: 16 * 1024 * 1024,
             max_fuel: 10_000_000,
             max_deadline_ms: 100,
             max_input_bytes: 4 * 1024 * 1024,
             max_output_bytes: 4 * 1024 * 1024,
-            max_map_calls: 1024,
-            max_map_bytes: 4 * 1024 * 1024,
-            max_maps: 64,
-            max_map_entries: 1_000_000,
-            max_map_storage_bytes: 64 * 1024 * 1024,
-            max_staged_mutations: 1024,
-            max_feedback_records: 4096,
-            max_telemetry_records: 1024,
-            max_telemetry_bytes: 256 * 1024,
-            telemetry_buffer_records: 4096,
             max_concurrent_invocations: 128,
-            max_conflict_retries: 2,
+            max_feedback_deliveries: 4096,
             epoch_tick: Some(Duration::from_millis(1)),
         }
     }
@@ -77,7 +57,7 @@ struct EngineInner {
     config: PolicyEngineConfig,
     stop: Arc<AtomicBool>,
     ticker: Mutex<Option<JoinHandle<()>>>,
-    active_invocations: std::sync::atomic::AtomicU32,
+    active_invocations: AtomicU32,
 }
 
 impl Drop for EngineInner {
@@ -97,14 +77,14 @@ impl PolicyEngine {
                 "epoch_tick must be non-zero".into(),
             ));
         }
-        if config.telemetry_buffer_records == 0 {
-            return Err(AttachmentError::EngineConfig(
-                "telemetry_buffer_records must be non-zero".into(),
-            ));
-        }
         if config.max_concurrent_invocations == 0 {
             return Err(AttachmentError::EngineConfig(
                 "max_concurrent_invocations must be non-zero".into(),
+            ));
+        }
+        if config.max_feedback_deliveries == 0 {
+            return Err(AttachmentError::EngineConfig(
+                "max_feedback_deliveries must be non-zero".into(),
             ));
         }
 
@@ -116,13 +96,13 @@ impl PolicyEngine {
             .map_err(|error| AttachmentError::Compile(error.to_string()))?;
 
         let stop = Arc::new(AtomicBool::new(false));
-        let ticker_engine = engine.clone();
-        let ticker_stop = Arc::clone(&stop);
         let ticker = config
             .epoch_tick
             .map(|tick| {
+                let ticker_engine = engine.clone();
+                let ticker_stop = stop.clone();
                 std::thread::Builder::new()
-                    .name("plex-epoch".into())
+                    .name("plex-json-epoch".into())
                     .spawn(move || {
                         while !ticker_stop.load(Ordering::Acquire) {
                             std::thread::park_timeout(tick);
@@ -143,7 +123,7 @@ impl PolicyEngine {
                 config,
                 stop,
                 ticker: Mutex::new(ticker),
-                active_invocations: std::sync::atomic::AtomicU32::new(0),
+                active_invocations: AtomicU32::new(0),
             }),
         })
     }
@@ -192,24 +172,5 @@ impl Drop for InvocationPermit {
         self.engine
             .active_invocations
             .fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invocation_permits_bound_global_concurrency() {
-        let engine = PolicyEngine::new(PolicyEngineConfig {
-            max_concurrent_invocations: 1,
-            epoch_tick: None,
-            ..PolicyEngineConfig::default()
-        })
-        .unwrap();
-        let permit = engine.try_acquire().unwrap();
-        assert!(engine.try_acquire().is_none());
-        drop(permit);
-        assert!(engine.try_acquire().is_some());
     }
 }

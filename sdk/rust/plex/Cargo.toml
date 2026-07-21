@@ -1,9 +1,9 @@
 [package]
 name = "pie-plex-sdk"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Rust guest SDK for PLEX policies"
+description = "Rust JSON proof-of-concept SDK for PLEX policies"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -13,4 +13,5 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [dependencies]
+serde_json = "1.0"
 wit-bindgen = "0.58.0"

@@ -1,13 +1,11 @@
-use plex::types::{PolicyError, ScheduleInput, ScheduleOutput};
+use plex::serde_json::json;
+use plex::{Document, Policy};
 
 struct Malformed;
 
-impl plex::Policy for Malformed {
-    fn schedule(_input: ScheduleInput) -> Result<ScheduleOutput, PolicyError> {
-        Ok(ScheduleOutput {
-            decisions: Vec::new(),
-            mutations: Vec::new(),
-        })
+impl Policy for Malformed {
+    fn route(_input: &mut Document) -> Result<Document, String> {
+        Ok(json!({"scores": []}))
     }
 }
 

@@ -1,9 +1,5 @@
-package pie:plex@0.1.0;
+package pie:plex@0.2.0;
 
 world plex-policy {
-    import types;
-    import maps;
-    import telemetry;
-
     export policy;
 }

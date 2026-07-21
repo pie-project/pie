@@ -1,5 +1,0 @@
-interface telemetry {
-    use types.{telemetry-record, telemetry-error};
-
-    emit: func(entry: telemetry-record) -> result<_, telemetry-error>;
-}

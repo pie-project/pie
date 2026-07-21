@@ -1,52 +1,32 @@
-use plex::pie::plex::maps;
-use plex::types::{
-    FeedbackInput, FeedbackOutput, MapAddU64, MapKey, MapMutation, MapValue, PolicyError,
-    ScheduleInput, ScheduleOutput, ServiceDecision,
-};
+use plex::serde_json::json;
+use plex::{Document, Policy};
 
 struct FeedbackAccounting;
 
-impl plex::Policy for FeedbackAccounting {
-    fn schedule(input: ScheduleInput) -> Result<ScheduleOutput, PolicyError> {
-        let Some(handle) = input.links.maps.first().copied().flatten() else {
-            return Err(PolicyError::FallbackRequired);
-        };
-        let debt = match maps::get(handle, &MapKey::Bytes(vec![0])) {
-            Ok(Some(MapValue::Unsigned64(value))) => value,
-            Ok(None) => 0,
-            _ => return Err(PolicyError::FallbackRequired),
-        };
-        Ok(ScheduleOutput {
-            decisions: input
-                .runnable
-                .iter()
-                .enumerate()
-                .map(|(index, _)| ServiceDecision {
-                    score: -((debt + index as u64) as f64),
-                    token_budget: None,
-                })
-                .collect(),
-            mutations: vec![MapMutation::AddU64(MapAddU64 {
-                handle,
-                key: MapKey::Bytes(vec![0]),
-                delta: 10,
-                ttl_ms: None,
-            })],
-        })
-    }
-
-    fn feedback(input: FeedbackInput) -> Result<FeedbackOutput, PolicyError> {
-        let Some(handle) = input.links.maps.first().copied().flatten() else {
-            return Err(PolicyError::FallbackRequired);
-        };
-        Ok(FeedbackOutput {
-            mutations: vec![MapMutation::AddU64(MapAddU64 {
-                handle,
-                key: MapKey::Bytes(vec![0]),
-                delta: input.events.len() as u64,
-                ttl_ms: None,
-            })],
-        })
+impl Policy for FeedbackAccounting {
+    fn feedback(input: &mut Document) -> Result<Document, String> {
+        let records = input["records"]
+            .as_array_mut()
+            .ok_or("records must be an array")?;
+        for record in records {
+            match record["event"].as_str().unwrap_or("") {
+                "progress" => {
+                    let committed = record["facts"]["committed_tokens"].as_u64().unwrap_or(0);
+                    let previous = record["request"]["state"]["attained_service"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    record["request"]["state"]["attained_service"] = json!(previous + committed);
+                }
+                "tool-boundary" => {
+                    let previous = record["request"]["state"]["tool_calls"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    record["request"]["state"]["tool_calls"] = json!(previous + 1);
+                }
+                _ => {}
+            }
+        }
+        Ok(json!({}))
     }
 }
 

@@ -96,21 +96,22 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "pie-plex-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "serde_json",
  "wit-bindgen",
 ]
 
 [[package]]
-name = "plex-accept-all"
+name = "plex-attained-service"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",
 ]
 
 [[package]]
-name = "plex-attained-service"
-version = "0.1.0"
+name = "plex-bad-budget"
+version = "0.2.0"
 dependencies = [
  "pie-plex-sdk",
 ]
@@ -123,15 +124,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "plex-defer-all"
-version = "0.1.0"
-dependencies = [
- "pie-plex-sdk",
-]
-
-[[package]]
-name = "plex-external-weight"
-version = "0.1.0"
+name = "plex-fallback"
+version = "0.2.0"
 dependencies = [
  "pie-plex-sdk",
 ]
@@ -158,8 +152,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "plex-over-quota"
-version = "0.1.0"
+name = "plex-mutate-candidates"
+version = "0.2.0"
+dependencies = [
+ "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-mutate-fail"
+version = "0.2.0"
+dependencies = [
+ "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-mutate-identity"
+version = "0.2.0"
+dependencies = [
+ "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-nonfinite"
+version = "0.2.0"
 dependencies = [
  "pie-plex-sdk",
 ]
@@ -207,21 +222,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "plex-retry-fresh"
-version = "0.1.0"
+name = "plex-rewrite-admit"
+version = "0.2.0"
 dependencies = [
  "pie-plex-sdk",
 ]
 
 [[package]]
 name = "plex-spin"
-version = "0.1.0"
-dependencies = [
- "pie-plex-sdk",
-]
-
-[[package]]
-name = "plex-telemetry-burst"
 version = "0.1.0"
 dependencies = [
  "pie-plex-sdk",

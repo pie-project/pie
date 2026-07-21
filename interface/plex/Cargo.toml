@@ -1,9 +1,9 @@
 [package]
 name = "pie-plex"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Engine-neutral contract for the PLEX policy kernel"
+description = "JSON proof-of-concept contract for the PLEX policy kernel"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -13,7 +13,5 @@ path = "src/lib.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-thiserror = "2.0"
-
-[dev-dependencies]
 serde_json = "1.0"
+thiserror = "2.0"

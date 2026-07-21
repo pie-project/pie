@@ -226,6 +226,7 @@ jobs:
           cargo fmt --manifest-path tests/policies/Cargo.toml --all -- --check
           cargo test --locked -p pie-plex -p pie-policy --all-targets
           cargo clippy --locked -p pie-plex -p pie-policy --all-targets -- -D warnings
+          cargo test --manifest-path sdk/rust/plex/Cargo.toml --locked
           cargo check --manifest-path sdk/rust/plex/Cargo.toml \
             --target wasm32-unknown-unknown --locked
 
@@ -234,8 +235,6 @@ jobs:
           ./scripts/build-plex-policies.sh
           cargo run --locked -p pie-policy --example check_fixtures -- \
             tests/policies/target/components
-          PLEX_BENCH_ITERS=1 cargo run --locked -p pie-policy --example benchmark -- \
-            tests/policies/target/components/plex_attained_service.component.wasm
 
   # Dummy driver — pure Rust, builds on every OS we support. Cheapest
   # gate for "did the standalone wiring break end to end". Runs the

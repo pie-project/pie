@@ -1,24 +1,14 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 
-use pie_plex::{
-    AdmissionInput, AdmissionOutput, DenseScores, EvictionInput, FeedbackAcknowledgement,
-    FeedbackBatch, MapKey, Operation, PlacementInput, ScheduleInput, ServicePlan, TypedValue,
-};
+use pie_plex::{Document, Operation};
 use thiserror::Error;
 
-use crate::{
-    AttachedPolicy, AttachmentError, CapabilityCatalog, Clock, CommitResult, DedupLimits,
-    Invocation, MapStore, PackageLimits, PolicyEngine, PolicyPackage, PreparedDecision,
-    StateTransferError, SystemClock,
-};
+use crate::{AttachedPolicy, AttachmentError, Invocation, JsonResponse, PolicyEngine};
 
 #[derive(Clone)]
 pub struct AttachmentRegistry {
     engine: PolicyEngine,
-    catalog: Arc<CapabilityCatalog>,
-    clock: Arc<dyn Clock>,
-    dedup_limits: DedupLimits,
     inner: Arc<RegistryInner>,
 }
 
@@ -41,26 +31,9 @@ struct AttachmentSet {
 }
 
 impl AttachmentRegistry {
-    pub fn new(engine: PolicyEngine, catalog: CapabilityCatalog) -> Self {
-        Self::new_with_clock(
-            engine,
-            catalog,
-            Arc::new(SystemClock::new()),
-            DedupLimits::default(),
-        )
-    }
-
-    pub fn new_with_clock(
-        engine: PolicyEngine,
-        catalog: CapabilityCatalog,
-        clock: Arc<dyn Clock>,
-        dedup_limits: DedupLimits,
-    ) -> Self {
+    pub fn new(engine: PolicyEngine) -> Self {
         Self {
             engine,
-            catalog: Arc::new(catalog),
-            clock,
-            dedup_limits,
             inner: Arc::new(RegistryInner {
                 state: Mutex::new(RegistryState {
                     active: Arc::new(AttachmentSet::default()),
@@ -73,26 +46,8 @@ impl AttachmentRegistry {
     }
 
     pub fn prepare(&self, package: &[u8]) -> Result<AttachedPolicy, RegistryError> {
-        let config = self.engine.config();
-        let package = PolicyPackage::decode(
-            package,
-            PackageLimits {
-                max_package_bytes: config.max_package_bytes,
-                max_manifest_bytes: config.max_manifest_bytes,
-                max_component_bytes: config.max_component_bytes,
-            },
-        )
-        .map_err(|error| RegistryError::Prepare(AttachmentError::Package(error)))?;
-        let (manifest, component) = package.into_parts();
-        AttachedPolicy::compile_with_clock(
-            self.engine.clone(),
-            &component,
-            manifest,
-            &self.catalog,
-            self.clock.clone(),
-            self.dedup_limits,
-        )
-        .map_err(RegistryError::Prepare)
+        AttachedPolicy::compile_package(self.engine.clone(), package)
+            .map_err(RegistryError::Prepare)
     }
 
     pub fn attach(&self, package: &[u8]) -> Result<u64, RegistryError> {
@@ -120,11 +75,7 @@ impl AttachmentRegistry {
     }
 
     pub fn replace(&self, package: &[u8]) -> Result<u64, RegistryError> {
-        let prepared = self.prepare(package)?;
-        self.replace_prepared(prepared)
-    }
-
-    pub fn replace_prepared(&self, replacement: AttachedPolicy) -> Result<u64, RegistryError> {
+        let replacement = self.prepare(package)?;
         let package_name = replacement.manifest().package_name.clone();
         let mut state = self.inner.state.lock().unwrap();
         while state.updating {
@@ -134,7 +85,6 @@ impl AttachmentRegistry {
         while state.snapshots != 0 {
             state = self.inner.changed.wait(state).unwrap();
         }
-
         let result = (|| {
             let old = state
                 .active
@@ -143,9 +93,7 @@ impl AttachmentRegistry {
                 .cloned()
                 .ok_or_else(|| RegistryError::PackageNotAttached(package_name.clone()))?;
             ensure_operations_available(&state.active, &replacement, Some(&package_name))?;
-            replacement
-                .transfer_state_from(&old)
-                .map_err(RegistryError::StateTransfer)?;
+            replacement.transfer_dedup_from(&old);
 
             let generation = next_generation(state.active.generation)?;
             let mut next = (*state.active).clone();
@@ -154,12 +102,11 @@ impl AttachmentRegistry {
             for operation in &replacement.manifest().operations {
                 next.owners.insert(*operation, replacement.clone());
             }
-            next.packages.insert(package_name.clone(), replacement);
+            next.packages.insert(package_name, replacement);
             next.generation = generation;
             state.active = Arc::new(next);
             Ok(generation)
         })();
-
         state.updating = false;
         self.inner.changed.notify_all();
         result
@@ -185,7 +132,6 @@ impl AttachmentRegistry {
         }
         next.generation = generation;
         state.active = Arc::new(next);
-        self.inner.changed.notify_all();
         Ok(generation)
     }
 
@@ -201,7 +147,6 @@ impl AttachmentRegistry {
         next.packages.remove(package_name);
         next.generation = generation;
         state.active = Arc::new(next);
-        self.inner.changed.notify_all();
         Ok(generation)
     }
 
@@ -213,39 +158,14 @@ impl AttachmentRegistry {
             .ok_or(RegistryError::SnapshotCounterExhausted)?;
         Ok(AttachmentSnapshot {
             set: state.active.clone(),
-            lease: Arc::new(SnapshotLease {
+            _lease: Arc::new(SnapshotLease {
                 registry: self.inner.clone(),
             }),
         })
     }
 
-    pub fn map_store(&self, package_name: &str) -> Result<MapStore, RegistryError> {
-        let state = self.lock_stable();
-        state
-            .active
-            .packages
-            .get(package_name)
-            .map(|policy| policy.maps().clone())
-            .ok_or_else(|| RegistryError::PackageNotAttached(package_name.to_owned()))
-    }
-
-    pub fn publish_external(
-        &self,
-        package_name: &str,
-        handle: pie_plex::MapHandle,
-        entries: impl IntoIterator<Item = (MapKey, TypedValue)>,
-    ) -> Result<pie_plex::Revision, RegistryError> {
-        self.map_store(package_name)?
-            .publish_external(handle, entries)
-            .map_err(RegistryError::Map)
-    }
-
     pub(crate) fn uses_realtime_epochs(&self) -> bool {
         self.engine.uses_realtime_epochs()
-    }
-
-    pub(crate) fn uses_clock(&self, clock: &Arc<dyn Clock>) -> bool {
-        Arc::ptr_eq(&self.clock, clock)
     }
 
     fn lock_stable(&self) -> std::sync::MutexGuard<'_, RegistryState> {
@@ -296,7 +216,7 @@ impl Drop for SnapshotLease {
 #[derive(Clone)]
 pub struct AttachmentSnapshot {
     set: Arc<AttachmentSet>,
-    lease: Arc<SnapshotLease>,
+    _lease: Arc<SnapshotLease>,
 }
 
 impl AttachmentSnapshot {
@@ -311,84 +231,17 @@ impl AttachmentSnapshot {
             .map(|policy| policy.manifest().package_name.as_str())
     }
 
-    pub fn resolution(&self, operation: Operation) -> Option<&crate::AttachmentResolution> {
-        self.set
-            .owners
-            .get(&operation)
-            .map(AttachedPolicy::resolution)
-    }
-
-    pub fn admit(&self, input: AdmissionInput) -> Invocation<AttachedDecision<AdmissionOutput>> {
-        self.invoke(Operation::Admit, |policy| policy.admit(input))
-    }
-
-    pub fn route(&self, input: PlacementInput) -> Invocation<AttachedDecision<DenseScores>> {
-        self.invoke(Operation::Route, |policy| policy.route(input))
-    }
-
-    pub fn schedule(&self, input: ScheduleInput) -> Invocation<AttachedDecision<ServicePlan>> {
-        self.invoke(Operation::Schedule, |policy| policy.schedule(input))
-    }
-
-    pub fn evict(&self, input: EvictionInput) -> Invocation<AttachedDecision<DenseScores>> {
-        self.invoke(Operation::Evict, |policy| policy.evict(input))
-    }
-
-    pub fn feedback(&self, input: FeedbackBatch) -> Invocation<FeedbackAcknowledgement> {
-        let Some(policy) = self.set.owners.get(&Operation::Feedback) else {
-            return Invocation::Unavailable;
-        };
-        policy.feedback(input)
-    }
-
-    fn invoke<T>(
-        &self,
-        operation: Operation,
-        invoke: impl FnOnce(&AttachedPolicy) -> Invocation<PreparedDecision<T>>,
-    ) -> Invocation<AttachedDecision<T>> {
+    pub fn invoke(&self, operation: Operation, input: Document) -> Invocation<JsonResponse> {
         let Some(policy) = self.set.owners.get(&operation) else {
             return Invocation::Unavailable;
         };
-        match invoke(policy) {
-            Invocation::Success(prepared) => Invocation::Success(AttachedDecision {
-                prepared,
-                _lease: self.lease.clone(),
-            }),
-            Invocation::Unavailable => Invocation::Unavailable,
-            Invocation::FallbackRequired(failure) => Invocation::FallbackRequired(failure),
+        match operation {
+            Operation::Route => policy.route(input),
+            Operation::Admit => policy.admit(input),
+            Operation::Schedule => policy.schedule(input),
+            Operation::Evict => policy.evict(input),
+            Operation::Feedback => policy.feedback(input),
         }
-    }
-}
-
-pub struct AttachedDecision<T> {
-    prepared: PreparedDecision<T>,
-    _lease: Arc<SnapshotLease>,
-}
-
-impl<T: std::fmt::Debug> std::fmt::Debug for AttachedDecision<T> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AttachedDecision")
-            .field("prepared", &self.prepared)
-            .finish()
-    }
-}
-
-impl<T> AttachedDecision<T> {
-    pub fn decision(&self) -> &T {
-        self.prepared.decision()
-    }
-
-    pub fn attempts(&self) -> u32 {
-        self.prepared.attempts()
-    }
-
-    pub fn commit(self) -> (T, CommitResult) {
-        self.prepared.commit()
-    }
-
-    pub fn abort(self) -> T {
-        self.prepared.abort()
     }
 }
 
@@ -407,10 +260,6 @@ pub enum RegistryError {
         operation: Operation,
         package: String,
     },
-    #[error("failed to transfer replacement state")]
-    StateTransfer(#[source] StateTransferError),
-    #[error("attachment map operation failed")]
-    Map(#[source] crate::MapStoreError),
     #[error("attachment generation counter exhausted")]
     GenerationExhausted,
     #[error("attachment snapshot counter exhausted")]

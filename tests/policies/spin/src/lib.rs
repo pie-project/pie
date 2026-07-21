@@ -1,9 +1,9 @@
-use plex::types::{PolicyError, ScheduleInput, ScheduleOutput};
+use plex::{Document, Policy};
 
 struct Spin;
 
-impl plex::Policy for Spin {
-    fn schedule(_input: ScheduleInput) -> Result<ScheduleOutput, PolicyError> {
+impl Policy for Spin {
+    fn route(_input: &mut Document) -> Result<Document, String> {
         loop {
             core::hint::spin_loop();
         }

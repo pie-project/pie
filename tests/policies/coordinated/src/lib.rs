@@ -1,93 +1,130 @@
-use plex::pie::plex::maps;
-use plex::types::{
-    AdmissionDecision, AdmissionInput, AdmissionOutput, DenseOutput, EvictionInput, FeedbackInput,
-    FeedbackOutput, MapAddU64, MapKey, MapMutation, MapValue, PlacementInput, PolicyError,
-    ScheduleInput, ScheduleOutput, ServiceDecision,
-};
+use plex::serde_json::json;
+use plex::{Document, Policy};
 
 struct Coordinated;
 
-fn state(
-    input_maps: &[Option<plex::types::MapHandle>],
-) -> Result<(plex::types::MapHandle, u64), PolicyError> {
-    let Some(handle) = input_maps.first().copied().flatten() else {
-        return Err(PolicyError::FallbackRequired);
-    };
-    let value = match maps::get(handle, &MapKey::Bytes(vec![0])) {
-        Ok(Some(MapValue::Unsigned64(value))) => value,
-        Ok(None) => 0,
-        _ => return Err(PolicyError::FallbackRequired),
-    };
-    Ok((handle, value))
+impl Policy for Coordinated {
+    fn route(input: &mut Document) -> Result<Document, String> {
+        let route_count = input["request"]["state"]["route_count"]
+            .as_u64()
+            .unwrap_or(0)
+            + 1;
+        input["request"]["state"]["route_count"] = json!(route_count);
+        input["request"]["metadata"]["last_hook"] = json!("route");
+        append_prompt(&mut input["request"], "|route");
+
+        let candidates = input["candidates"]
+            .as_array()
+            .ok_or("candidates must be an array")?;
+        let scores = candidates
+            .iter()
+            .map(|candidate| {
+                candidate["facts"]["cached_tokens"].as_f64().unwrap_or(0.0)
+                    - candidate["facts"]["queue_depth"].as_f64().unwrap_or(0.0)
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"scores": scores}))
+    }
+
+    fn admit(input: &mut Document) -> Result<Document, String> {
+        if input["request"]["metadata"]["last_hook"] != "route" {
+            return Err("admit did not observe route mutation".into());
+        }
+        let count = input["request"]["state"]["admission_count"]
+            .as_u64()
+            .unwrap_or(0)
+            + 1;
+        input["request"]["state"]["admission_count"] = json!(count);
+        input["request"]["metadata"]["last_hook"] = json!("admit");
+        append_prompt(&mut input["request"], "|admit");
+
+        let queue = input["target"]["facts"]["queue_depth"]
+            .as_u64()
+            .unwrap_or(0);
+        let decision = if queue < 80 {
+            "accept"
+        } else if queue < 100 {
+            "defer"
+        } else {
+            "reject"
+        };
+        Ok(json!({"decision": decision}))
+    }
+
+    fn schedule(input: &mut Document) -> Result<Document, String> {
+        let runnable = input["runnable"]
+            .as_array_mut()
+            .ok_or("runnable must be an array")?;
+        let mut decisions = Vec::with_capacity(runnable.len());
+        for candidate in runnable {
+            if candidate["request"]["metadata"]["last_hook"] != "admit" {
+                return Err("schedule did not observe admit mutation".into());
+            }
+            candidate["request"]["metadata"]["last_hook"] = json!("schedule");
+            let calls = candidate["request"]["state"]["schedule_calls"]
+                .as_u64()
+                .unwrap_or(0)
+                + 1;
+            candidate["request"]["state"]["schedule_calls"] = json!(calls);
+            let attained = candidate["request"]["state"]["attained_service"]
+                .as_u64()
+                .unwrap_or(0);
+            decisions.push(json!({"score": -(attained as f64)}));
+        }
+        Ok(json!({"decisions": decisions}))
+    }
+
+    fn evict(input: &mut Document) -> Result<Document, String> {
+        let resident = input["resident"]
+            .as_array_mut()
+            .ok_or("resident must be an array")?;
+        let scores = resident
+            .iter_mut()
+            .map(|unit| {
+                if unit["request"].is_object() {
+                    let checks = unit["request"]["state"]["eviction_checks"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        + 1;
+                    unit["request"]["state"]["eviction_checks"] = json!(checks);
+                }
+                unit["facts"]["reload_cost"].as_f64().unwrap_or(0.0)
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"scores": scores}))
+    }
+
+    fn feedback(input: &mut Document) -> Result<Document, String> {
+        let records = input["records"]
+            .as_array_mut()
+            .ok_or("records must be an array")?;
+        for record in records {
+            match record["event"].as_str().unwrap_or("") {
+                "progress" => {
+                    let delta = record["facts"]["committed_tokens"].as_u64().unwrap_or(0);
+                    let attained = record["request"]["state"]["attained_service"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    record["request"]["state"]["attained_service"] = json!(attained + delta);
+                }
+                "tool-boundary" => {
+                    let calls = record["request"]["state"]["tool_calls"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        + 1;
+                    record["request"]["state"]["tool_calls"] = json!(calls);
+                    record["request"]["metadata"]["last_hook"] = json!("tool-boundary");
+                }
+                _ => {}
+            }
+        }
+        Ok(json!({}))
+    }
 }
 
-fn add(handle: plex::types::MapHandle, delta: u64) -> MapMutation {
-    MapMutation::AddU64(MapAddU64 {
-        handle,
-        key: MapKey::Bytes(vec![0]),
-        delta,
-        ttl_ms: None,
-    })
-}
-
-impl plex::Policy for Coordinated {
-    fn admit(input: AdmissionInput) -> Result<AdmissionOutput, PolicyError> {
-        let (handle, value) = state(&input.links.maps)?;
-        Ok(AdmissionOutput {
-            decision: if value < 100 {
-                AdmissionDecision::Accept
-            } else {
-                AdmissionDecision::Defer
-            },
-            mutations: vec![add(handle, 1)],
-        })
-    }
-
-    fn route(input: PlacementInput) -> Result<DenseOutput, PolicyError> {
-        let (handle, value) = state(&input.links.maps)?;
-        Ok(DenseOutput {
-            scores: (0..input.placement_count)
-                .map(|index| -((value + index as u64) as f64))
-                .collect(),
-            mutations: vec![add(handle, 2)],
-        })
-    }
-
-    fn schedule(input: ScheduleInput) -> Result<ScheduleOutput, PolicyError> {
-        let (handle, value) = state(&input.links.maps)?;
-        Ok(ScheduleOutput {
-            decisions: input
-                .runnable
-                .iter()
-                .enumerate()
-                .map(|(index, _)| ServiceDecision {
-                    score: -((value + index as u64) as f64),
-                    token_budget: None,
-                })
-                .collect(),
-            mutations: vec![add(handle, 3)],
-        })
-    }
-
-    fn evict(input: EvictionInput) -> Result<DenseOutput, PolicyError> {
-        let (handle, value) = state(&input.links.maps)?;
-        Ok(DenseOutput {
-            scores: input
-                .resident
-                .iter()
-                .enumerate()
-                .map(|(index, _)| (value + index as u64) as f64)
-                .collect(),
-            mutations: vec![add(handle, 4)],
-        })
-    }
-
-    fn feedback(input: FeedbackInput) -> Result<FeedbackOutput, PolicyError> {
-        let (handle, _) = state(&input.links.maps)?;
-        Ok(FeedbackOutput {
-            mutations: vec![add(handle, input.events.len() as u64)],
-        })
-    }
+fn append_prompt(request: &mut Document, suffix: &str) {
+    let prompt = request["body"]["prompt"].as_str().unwrap_or("").to_owned();
+    request["body"]["prompt"] = json!(format!("{prompt}{suffix}"));
 }
 
 plex::export_policy!(Coordinated);

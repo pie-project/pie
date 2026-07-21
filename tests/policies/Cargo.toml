@@ -1,24 +1,25 @@
 [workspace]
 resolver = "2"
 members = [
-    "accept-all",
     "attained-service",
+    "bad-budget",
     "coordinated",
-    "defer-all",
-    "external-weight",
+    "fallback",
     "feedback-accounting",
     "least-loaded",
     "malformed",
-    "over-quota",
+    "mutate-candidates",
+    "mutate-fail",
+    "mutate-identity",
+    "nonfinite",
     "paper-agentix",
     "paper-continuum",
     "paper-helium",
     "paper-kvflow",
     "paper-preble",
     "retention-score",
-    "retry-fresh",
+    "rewrite-admit",
     "spin",
-    "telemetry-burst",
     "trap",
 ]
 

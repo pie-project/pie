@@ -1,4 +1,3 @@
-use pie_plex::{DecisionValidationError, ManifestValidationError, OperationInputError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -7,34 +6,28 @@ pub enum AttachmentError {
     #[error("invalid policy engine configuration: {0}")]
     EngineConfig(String),
     #[error(transparent)]
-    Manifest(#[from] ManifestValidationError),
-    #[error("component contains {actual} bytes; host maximum is {maximum}")]
-    ComponentTooLarge { actual: usize, maximum: usize },
+    Manifest(#[from] pie_plex::ManifestValidationError),
     #[error("manifest limit {field} requests {requested}; host maximum is {maximum}")]
     HostLimit {
         field: &'static str,
         requested: u64,
         maximum: u64,
     },
-    #[error("failed to compile policy component")]
+    #[error("failed to compile policy component: {0}")]
     Compile(String),
-    #[error("failed to link policy component")]
+    #[error("failed to link policy component: {0}")]
     Link(String),
-    #[error("failed to instantiate policy component within declared limits")]
+    #[error("failed to instantiate policy component within declared limits: {0}")]
     Instantiate(String),
     #[error("policy engine has no free invocation slot")]
     EngineSaturated,
-    #[error("policy requirements do not match the host catalog")]
-    Resolve(#[source] crate::link::LinkError),
-    #[error("failed to initialize policy maps")]
-    Maps(#[source] crate::maps::MapStoreError),
     #[error("policy package is invalid")]
     Package(#[source] crate::package_format::PackageError),
-    #[error("policy component imports unsupported interface {0}")]
+    #[error("JSON PoC policy components must not import {0}")]
     UnsupportedImport(String),
     #[error("policy component exports unsupported interface {0}")]
     UnsupportedExport(String),
-    #[error("policy component does not export pie:plex/policy@0.1.0")]
+    #[error("policy component does not export pie:plex/policy@0.2.0")]
     MissingPolicyExport,
 }
 
@@ -47,9 +40,7 @@ pub enum InvocationFailureKind {
     Trap,
     FuelExhausted,
     DeadlineExceeded,
-    MapLimitExceeded,
     HostSaturated,
-    TransactionConflict,
     InvalidOutput,
 }
 
@@ -65,14 +56,6 @@ impl InvocationFailure {
             kind,
             message: message.into(),
         }
-    }
-
-    pub(crate) fn input(error: OperationInputError) -> Self {
-        Self::new(InvocationFailureKind::InvalidInput, error.to_string())
-    }
-
-    pub(crate) fn output(error: DecisionValidationError) -> Self {
-        Self::new(InvocationFailureKind::InvalidOutput, error.to_string())
     }
 }
 

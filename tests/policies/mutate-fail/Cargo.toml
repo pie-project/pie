@@ -1,0 +1,12 @@
+[package]
+name = "plex-mutate-fail"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+plex = { package = "pie-plex-sdk", path = "../../../sdk/rust/plex" }

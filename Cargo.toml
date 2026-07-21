@@ -36,8 +36,8 @@ members = [
     "interface/controller",
     "interface/worker",
     "interface/client",
-    # PLEX policy-kernel contract: engine-neutral operations, manifests, typed
-    # records, and the canonical component-model interface.
+    # PLEX policy-kernel contract: JSON operation conventions, manifests, and
+    # the canonical component-model interface.
     "interface/plex",
     # PTIR — the Pie Tensor IR: the cross-language seam for programmable dataflow
     # (stage-tagged trace container + validation + versioned wire format).
