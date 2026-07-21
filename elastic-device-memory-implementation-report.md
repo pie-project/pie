@@ -480,6 +480,42 @@ Repeated cold fleets also expose a third-run high-water stall, so reuse must
 include explicit page/channel retirement rather than hiding allocation behind
 an unbounded cache.
 
+The deeper allocation trace shows why the API count matters:
+
+- One prefill-only request registers exactly 10 channels but carries only
+  1,247 bytes of device-cell payload and 1,247 bytes of host-mirror payload.
+- The first 512-request cohort performs exactly 16 `cudaMalloc` and about 21
+  `cudaHostAlloc` calls per request. Ten device allocations are channel cells;
+  ten pinned allocations are mirrors and ten are 32-byte host-word blocks.
+  The remaining device allocations are the per-instance commit/static-stage
+  lists.
+- Across the 2,048-request run, only 1.36 MiB each of new device-cell and
+  pinned-mirror payload is requested. It is fragmented into 8,316 cell growths,
+  8,316 mirror growths, and 5,790 separate host-word allocations. There are
+  only 12 allocation size classes, from 8 to 296 bytes.
+
+CPU work overlaps but still determines cohort readiness: aggregate WASM
+instantiate work is 7.30 CPU-seconds and link work is 7.79 CPU-seconds. With
+128 workers, process instantiate/admit spans 770 ms and bind completion spans
+849 ms. Bind RPC latency is p50 70.9 ms / p95 104.7 ms because the single
+scheduler control lane serializes 2,048 register+bind controls; actual control
+occupancy sums to 426 ms.
+
+The measured 174-wave run spends 571 ms in CUDA submit host work. The largest
+sub-lines are settlement enqueue (321 ms), epilogue assembly/execution
+(164 ms), settle preparation (156 ms), H2D preparation (81 ms), and dispatch
+begin/ticket handling (64 ms). Pie emits 19 prefill waves and 165 decode graph
+waves; vLLM emits about 12 and 121 respectively.
+
+Forcing scheduler depth 1 confirms the readiness contribution: waves fall
+174 -> 136, average missing pipelines 88.5 -> 0, every wave is at least 128
+requests, and throughput rises 17.83k -> 18.83k (+5.6%). This is useful but
+does not address the dominant lifecycle cost. The target design is therefore
+one contiguous PTIR-instance device slab plus one pinned host slab (or
+fleet-level size-class equivalents), shared compiled stage metadata, and
+readiness-aware successor deferral. Pooling only model workspaces would miss
+the measured payer.
+
 This claim does **not** extend to Remote or CUDA TP. Remote post-scheduler
 coalescing would invalidate a worker-side lease, and TP needs all-rank atomic
 prepare/abort. Both report prepare unsupported.

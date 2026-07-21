@@ -187,6 +187,8 @@ class DeviceChannelRegistry {
             return false;
         }
         const std::size_t old_cell_capacity = cell_capacity_[slot];
+        const std::size_t old_mirror_capacity =
+            host_mirror_capacity_[slot];
         const bool fresh_words = host_words_[slot] == nullptr;
         auto reg_mark = reg_timing ? fire_timing::Clock::now()
                                    : fire_timing::Clock::time_point{};
@@ -246,7 +248,19 @@ class DeviceChannelRegistry {
                    << R"(,"slot":)" << slot
                    << R"(,"cell_grew":)"
                    << (cell_capacity_[slot] > old_cell_capacity ? "true" : "false")
+                   << R"(,"mirror_grew":)"
+                   << (host_mirror_capacity_[slot] > old_mirror_capacity
+                           ? "true"
+                           : "false")
                    << R"(,"fresh_words":)" << (fresh_words ? "true" : "false")
+                   << R"(,"required_cell_bytes":)" << required_cell_bytes
+                   << R"(,"mirror_bytes":)" << mirror_bytes
+                   << R"(,"wire_bytes":)" << wire_bytes
+                   << R"(,"native_bytes":)" << native_bytes
+                   << R"(,"ring_capacity":)" << ring_cap1
+                   << R"(,"dtype":)" << static_cast<unsigned>(desc.dtype)
+                   << R"(,"host_role":)"
+                   << static_cast<unsigned>(desc.host_role)
                    << R"(,"alloc_us":)" << alloc_us
                    << R"(,"init_us":)" << init_us
                    << R"(,"staging_us":)" << staging_us
