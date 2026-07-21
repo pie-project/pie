@@ -1,0 +1,6 @@
+# The JSON-schema converter's builtin grammar historically encoded a
+# control-character class with literal 0x00-0x1f bytes, so git/GitHub
+# misdetected the file as binary and hid its diff. The bytes are now
+# normalized to textual escapes; force a text diff so the file renders in
+# review even against the pre-normalization (binary) base blob.
+runtime/src/inference/structured/json_schema.rs diff
