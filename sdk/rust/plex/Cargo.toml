@@ -1,0 +1,16 @@
+[package]
+name = "pie-plex-sdk"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Rust guest SDK for PLEX policies"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "plex"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+wit-bindgen = "0.58.0"

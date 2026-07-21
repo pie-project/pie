@@ -1,0 +1,25 @@
+interface policy {
+    use types.{
+        admission-input,
+        admission-output,
+        placement-input,
+        dense-output,
+        schedule-input,
+        schedule-output,
+        eviction-input,
+        feedback-input,
+        feedback-output,
+        policy-error,
+    };
+
+    admit: func(input: admission-input)
+        -> result<admission-output, policy-error>;
+    route: func(input: placement-input)
+        -> result<dense-output, policy-error>;
+    schedule: func(input: schedule-input)
+        -> result<schedule-output, policy-error>;
+    evict: func(input: eviction-input)
+        -> result<dense-output, policy-error>;
+    feedback: func(input: feedback-input)
+        -> result<feedback-output, policy-error>;
+}

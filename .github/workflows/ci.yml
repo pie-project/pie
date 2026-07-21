@@ -167,29 +167,75 @@ jobs:
           fi
 
   # WIT drift — the canonical inferlet interface (interface/inferlet) is
-  # vendored into two SDK copies (sdk/rust/inferlet/wit,
-  # sdk/tools/bakery/src/bakery/wit). Manual three-way editing has regressed
-  # twice (commit 94043eb1). scripts/sync-wit.sh regenerates the copies from
-  # source; this job fails if a PR edited the interface without re-syncing.
+  # vendored into SDK/tool copies. Manual multi-way editing has regressed twice
+  # (commit 94043eb1). scripts/sync-wit.sh regenerates the copies from source;
+  # this job fails if a PR edited an interface without re-syncing.
   wit-drift:
     name: wit drift (sync-wit.sh)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install wit-deps
-        run: cargo install --locked wit-deps-cli
-
       - name: Regenerate vendored WIT copies
         run: ./scripts/sync-wit.sh
 
       - name: Fail if vendored WIT copies are stale
         run: |
-          if ! git diff --exit-code -- sdk/rust/inferlet/wit sdk/tools/bakery/src/bakery/wit; then
-            echo "::error::Vendored WIT copies are out of sync with interface/inferlet."
+          changes="$(git status --porcelain --untracked-files=all -- \
+            sdk/rust/inferlet/wit \
+            sdk/tools/bakery/src/bakery/wit \
+            sdk/rust/plex/wit)"
+          if [ -n "$changes" ]; then
+            printf '%s\n' "$changes"
+            echo "::error::Vendored WIT copies are out of sync with interface sources."
             echo "Regenerate with: ./scripts/sync-wit.sh   (then commit)"
             exit 1
           fi
+
+  plex-policy:
+    name: PLEX contract + policy fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + PLEX targets
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            tests/policies/target
+          key: ${{ runner.os }}-plex-${{ hashFiles('**/Cargo.lock', 'interface/plex/wit/*.wit') }}
+          restore-keys: |
+            ${{ runner.os }}-plex-
+
+      - name: Install wasm-tools
+        run: cargo install --locked wasm-tools --version 1.244.0
+
+      - name: Check contract, host, and SDK
+        run: |
+          ./scripts/check-plex-layering.sh
+          cargo fmt --package pie-plex --package pie-policy -- --check
+          cargo fmt --manifest-path sdk/rust/plex/Cargo.toml -- --check
+          cargo fmt --manifest-path tests/policies/Cargo.toml --all -- --check
+          cargo test --locked -p pie-plex -p pie-policy --all-targets
+          cargo clippy --locked -p pie-plex -p pie-policy --all-targets -- -D warnings
+          cargo check --manifest-path sdk/rust/plex/Cargo.toml \
+            --target wasm32-unknown-unknown --locked
+
+      - name: Build and invoke policy fixtures
+        run: |
+          ./scripts/build-plex-policies.sh
+          cargo run --locked -p pie-policy --example check_fixtures -- \
+            tests/policies/target/components
+          PLEX_BENCH_ITERS=1 cargo run --locked -p pie-policy --example benchmark -- \
+            tests/policies/target/components/plex_attained_service.component.wasm
 
   # Dummy driver — pure Rust, builds on every OS we support. Cheapest
   # gate for "did the standalone wiring break end to end". Runs the

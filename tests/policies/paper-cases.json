@@ -1,0 +1,76 @@
+[
+  {
+    "id": "agentix",
+    "title": "Agentix: An Efficient Serving Engine for LLM Agents as General Programs",
+    "source": "https://www.usenix.org/system/files/nsdi26-luo.pdf",
+    "date": "2026-05",
+    "component": "plex_paper_agentix",
+    "operations": ["schedule", "feedback"],
+    "implemented": [
+      "program-level least attained service",
+      "discretized service buckets",
+      "waiting-to-service anti-starvation",
+      "feedback-maintained program service"
+    ],
+    "deferred_mechanics": ["KV swap kernel", "multi-step engine execution"]
+  },
+  {
+    "id": "continuum",
+    "title": "Continuum: Efficient and Robust Multi-Turn LLM Agent Scheduling with KV Cache Time-to-Live",
+    "source": "https://arxiv.org/abs/2511.02230",
+    "date": "2025-11",
+    "component": "plex_paper_continuum",
+    "operations": ["schedule", "evict", "feedback"],
+    "implemented": [
+      "preempted-first priority",
+      "TTL-pinned priority",
+      "program-level FCFS",
+      "TTL-backed retention state"
+    ],
+    "deferred_mechanics": ["tool parser", "offline TTL estimator", "KV pin implementation"]
+  },
+  {
+    "id": "kvflow",
+    "title": "KVFlow: Efficient Prefix Caching for Accelerating LLM-Based Multi-Agent Workflows",
+    "source": "https://arxiv.org/abs/2507.07400",
+    "date": "2025-07",
+    "component": "plex_paper_kvflow",
+    "operations": ["schedule", "evict"],
+    "implemented": [
+      "steps-to-execution retention ranking",
+      "varying-suffix-first eviction",
+      "cache-loading-aware scheduling"
+    ],
+    "deferred_mechanics": ["proactive prefetch", "CPU-GPU transfer overlap"]
+  },
+  {
+    "id": "preble",
+    "title": "Preble: Efficient Distributed Prompt Scheduling for LLM Serving",
+    "source": "https://arxiv.org/abs/2407.00023",
+    "date": "2024-07",
+    "component": "plex_paper_preble",
+    "operations": ["route"],
+    "implemented": [
+      "E2 exploit when reusable prefix exceeds uncached prompt",
+      "longest-prefix exploitation",
+      "prompt-aware load and eviction-cost exploration"
+    ],
+    "deferred_mechanics": ["prefix replication", "autoscaling"]
+  },
+  {
+    "id": "helium",
+    "title": "Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective",
+    "source": "https://arxiv.org/abs/2603.16104",
+    "date": "2026-03",
+    "component": "plex_paper_helium",
+    "operations": ["schedule"],
+    "implemented": [
+      "ready-operator filtering",
+      "critical-path depth priority",
+      "cache-reuse benefit",
+      "earliest-start forced progress",
+      "profiled token-cost penalty"
+    ],
+    "deferred_mechanics": ["query-plan rewrite", "proactive cache warming"]
+  }
+]

@@ -1,0 +1,21 @@
+[package]
+name = "pie-policy"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Isolated Wasmtime host for PLEX operator policies"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie_policy"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+blake3 = "1.8"
+pie-plex = { path = "../../interface/plex" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+wasmtime = { version = "46.0.1", features = ["pooling-allocator"] }

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "accept-all",
+    "attained-service",
+    "coordinated",
+    "defer-all",
+    "external-weight",
+    "feedback-accounting",
+    "least-loaded",
+    "malformed",
+    "over-quota",
+    "paper-agentix",
+    "paper-continuum",
+    "paper-helium",
+    "paper-kvflow",
+    "paper-preble",
+    "retention-score",
+    "retry-fresh",
+    "spin",
+    "telemetry-burst",
+    "trap",
+]
+
+[profile.release]
+lto = true
+strip = "debuginfo"

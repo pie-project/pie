@@ -1,0 +1,6 @@
+interface maps {
+    use types.{map-handle, map-key, map-value, map-error};
+
+    get: func(handle: map-handle, key: map-key)
+        -> result<option<map-value>, map-error>;
+}

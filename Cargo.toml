@@ -36,12 +36,17 @@ members = [
     "interface/controller",
     "interface/worker",
     "interface/client",
+    # PLEX policy-kernel contract: engine-neutral operations, manifests, typed
+    # records, and the canonical component-model interface.
+    "interface/plex",
     # PTIR — the Pie Tensor IR: the cross-language seam for programmable dataflow
     # (stage-tagged trace container + validation + versioned wire format).
     # `no_std` core; the wasm SDK depends on it with `default-features = false`.
     "interface/ptir",
     "driver/dummy",
     "runtime/load-planner",
+    # Isolated operator-policy host for PLEX components.
+    "runtime/policy",
     "sdk/python-server",
     # Thin binary shells composing bootstrap + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).
@@ -52,6 +57,7 @@ members = [
 ]
 exclude = [
     "tests/inferlets",
+    "tests/policies",
     "sdk/rust",
     # Worktree checkouts under .claude/worktrees/ must never be captured by
     # THIS manifest when cargo walks up from a worktree's excluded package
