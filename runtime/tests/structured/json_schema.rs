@@ -1049,3 +1049,19 @@ fn test_object_required_exceeds_max_properties_error() {
         msg
     );
 }
+
+
+#[test]
+fn builtin_json_string_rejects_literal_control_chars() {
+    // Proves the normalized `char` class (textual \x00-\x1f, previously literal
+    // control bytes) keeps identical control-character behavior.
+    let g = builtin_json_grammar().unwrap();
+    // Escaped control chars are valid JSON and accepted.
+    assert!(is_grammar_accept_string_g(&g, r#""a\nb""#));
+    assert!(is_grammar_accept_string_g(&g, r#""a b""#));
+    // Literal (unescaped) control chars inside a string are rejected.
+    assert!(!is_grammar_accept_string_g(&g, "\"a\nb\"")); // literal newline (0x0a)
+    assert!(!is_grammar_accept_string_g(&g, "\"a\tb\"")); // literal tab (0x09)
+    assert!(!is_grammar_accept_string_g(&g, "\"a\u{0}b\"")); // literal NUL (0x00)
+    assert!(!is_grammar_accept_string_g(&g, "\"a\u{1f}b\"")); // literal 0x1f
+}
