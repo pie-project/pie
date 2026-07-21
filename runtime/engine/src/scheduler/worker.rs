@@ -96,10 +96,11 @@ pub(crate) struct PendingRequest {
     pub(crate) instance_id: u64,
     pub(crate) completion: WorkItemCompletion,
     pub(crate) last_page_len: u32,
-    /// The submitting pipeline's identity (`ProcessCtx::process_id()`), or
-    /// `None` for an untracked/prebuilt fire (device-geometry, beam replay,
-    /// this module's own unit tests) — the quorum wait-set key
-    /// ([`quorum::WaitAllPolicy::on_pipeline_request`]).
+    /// The owning process. Process-wide suspend/terminate acts on every
+    /// request with this identity.
+    pub(crate) process_id: Option<ProcessId>,
+    /// The submitting pipeline resource's stable scope identity, or `None`
+    /// for an untracked/prebuilt fire. This is the quorum wait-set key.
     pub(crate) pipeline_id: Option<ProcessId>,
     pub(crate) prebuilt: bool,
     /// Stable logical-fire retry state. The request payload and completion are
@@ -126,9 +127,9 @@ pub(crate) struct PendingRequest {
     /// the pipeline left (Close/Terminate/Suspend bump the generation)
     /// after this request was admitted, so its credit rides — and is
     /// consumed — untracked. Without the stamp, a fire finishing async
-    /// preparation after a Close leave re-created the pid's wait-set row
-    /// (pid is the PROCESS id, shared with successor pipelines), and the
-    /// straddling wave's dispatch then consumed the successor's credit:
+    /// preparation after a Close or allocation-wait leave re-created the
+    /// departed scope's wait-set row, and a straddling wave could consume a
+    /// later incarnation's credit:
     /// +1 permanent `untracked_ready` per close, wave_started resets
     /// starved, instant narrow fires after any >window lull (W1, 2026-07-17).
     pub(crate) quorum_generation: u64,
@@ -185,6 +186,7 @@ impl PendingRequest {
         instance_id: u64,
         completion: WorkItemCompletion,
         last_page_len: u32,
+        process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
         prebuilt: bool,
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
@@ -199,6 +201,7 @@ impl PendingRequest {
             instance_id,
             completion,
             last_page_len,
+            process_id,
             pipeline_id,
             prebuilt,
             retry_count: 0,
@@ -1339,6 +1342,7 @@ enum QueuedItem {
     PreLaunchCopy {
         plan: PreLaunchCopy,
         logical_completion: WorkItemCompletion,
+        process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
         credit_ready: bool,
         /// The coupled launch's quorum identity stamp (W1): the credit this
@@ -1442,6 +1446,7 @@ enum ControlSlotState {
 struct PendingControl {
     state: ControlSlotState,
     logical_completion: Option<WorkItemCompletion>,
+    process_id: Option<ProcessId>,
     pipeline_id: Option<ProcessId>,
     tracked_completion: Option<ControlCompletion>,
     operation: &'static str,
@@ -1539,6 +1544,7 @@ impl SchedulerHandle {
                 completion,
                 last_page_len,
                 pipeline_id,
+                pipeline_id,
                 false,
                 prelaunch_copy,
                 prelaunch_state_copy,
@@ -1564,6 +1570,7 @@ impl SchedulerHandle {
                 completion,
                 last_page_len,
                 None,
+                None,
                 true,
                 prelaunch_copy,
                 prelaunch_state_copy,
@@ -1580,6 +1587,7 @@ impl SchedulerHandle {
         instance_id: u64,
         completion: WorkItemCompletion,
         last_page_len: u32,
+        process_id: ProcessId,
         pipeline_id: ProcessId,
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
         prelaunch_state_copy: Option<StateCopyPlan>,
@@ -1592,6 +1600,7 @@ impl SchedulerHandle {
                 instance_id,
                 completion,
                 last_page_len,
+                Some(process_id),
                 Some(pipeline_id),
                 true,
                 prelaunch_copy,
@@ -2241,7 +2250,7 @@ impl BatchScheduler {
                 if kind == LeaveKind::Terminate {
                     let protected = in_flight_control
                         .as_ref()
-                        .filter(|control| control.pipeline_id == Some(pid))
+                        .filter(|control| control.process_id == Some(pid))
                         .and_then(|control| control.logical_completion.clone());
                     if let Some(completion) = &protected {
                         completion.request_cancel();
@@ -2251,8 +2260,10 @@ impl BatchScheduler {
                 }
                 if kind != LeaveKind::Close {
                     departed_pipelines.insert(pid);
+                    policy.on_process_leave(pid);
+                } else {
+                    policy.on_pipeline_leave(pid);
                 }
-                policy.on_pipeline_leave(pid);
             }
             SchedulerItem::Launch {
                 pending: mut launch,
@@ -2290,8 +2301,8 @@ impl BatchScheduler {
                     // this request now counts toward `decide_wave_at`'s
                     // wait-set/untracked-ready even while it sits in
                     // `pending` behind an in-flight-depth or quorum hold.
-                    if let Some(pid) = launch.pipeline_id {
-                        departed_pipelines.remove(&pid);
+                    if let Some(process_id) = launch.process_id {
+                        departed_pipelines.remove(&process_id);
                     }
                     // No fire-admission early join: the readiness credit below
                     // creates the ordinary wait-set entry. Bind controls use
@@ -2301,7 +2312,7 @@ impl BatchScheduler {
                     if !Self::request_needs_prelaunch(&launch) {
                         let qpid =
                             Self::quorum_pid(policy, launch.pipeline_id, launch.quorum_generation);
-                        policy.on_pipeline_request(qpid, Instant::now());
+                        policy.on_pipeline_request_owned(qpid, launch.process_id, Instant::now());
                         launch.credit_published = true;
                         if let Some(timing) = launch.timing.as_mut() {
                             timing.ready_us = Some(super::fire_timing_now_us());
@@ -2390,16 +2401,16 @@ impl BatchScheduler {
         while let Some(item) = pending.pop_front() {
             let reject = match &item {
                 QueuedItem::Launch(request) => {
-                    request.pipeline_id == Some(pid)
+                    request.process_id == Some(pid)
                         && protected
                             .is_none_or(|completion| !request.completion.same_request(completion))
                 }
                 QueuedItem::PreLaunchCopy {
-                    pipeline_id,
+                    process_id,
                     logical_completion,
                     ..
                 } => {
-                    *pipeline_id == Some(pid)
+                    *process_id == Some(pid)
                         && protected
                             .is_none_or(|completion| !logical_completion.same_request(completion))
                 }
@@ -2435,6 +2446,7 @@ impl BatchScheduler {
             copies.push(QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::Kv(plan),
                 logical_completion: request.completion.clone(),
+                process_id: request.process_id,
                 pipeline_id: request.pipeline_id,
                 credit_ready: false,
                 quorum_generation: request.quorum_generation,
@@ -2444,6 +2456,7 @@ impl BatchScheduler {
             copies.push(QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::State(plan),
                 logical_completion: request.completion.clone(),
+                process_id: request.process_id,
                 pipeline_id: request.pipeline_id,
                 credit_ready: false,
                 quorum_generation: request.quorum_generation,
@@ -2489,9 +2502,8 @@ impl BatchScheduler {
     /// the request's admission stamp, `None` (untracked) once the pipeline
     /// has left. Every publication, consumption, and drop site routes
     /// through this — the leak class it closes is a post-leave publication
-    /// re-creating the pid's wait-set row and the straddling wave then
-    /// consuming a SUCCESSOR pipeline's credit (W1: pid is the process id,
-    /// shared across a process's consecutive pipelines).
+    /// re-creating the scope's wait-set row and the straddling wave then
+    /// consuming a later incarnation's credit.
     fn quorum_pid(
         policy: &quorum::WaitAllPolicy,
         pipeline_id: Option<ProcessId>,
@@ -3218,6 +3230,7 @@ impl BatchScheduler {
             QueuedItem::PreLaunchCopy {
                 plan,
                 logical_completion,
+                process_id,
                 pipeline_id,
                 credit_ready,
                 quorum_generation,
@@ -3225,6 +3238,7 @@ impl BatchScheduler {
                 *in_flight_control = Some(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: Some(logical_completion.clone()),
+                    process_id: *process_id,
                     pipeline_id: *pipeline_id,
                     tracked_completion: None,
                     operation: plan.label(),
@@ -3236,6 +3250,7 @@ impl BatchScheduler {
                 *in_flight_control = Some(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
+                    process_id: None,
                     pipeline_id: None,
                     tracked_completion: None,
                     operation: "KV copy",
@@ -3247,6 +3262,7 @@ impl BatchScheduler {
                 *in_flight_control = Some(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
+                    process_id: None,
                     pipeline_id: None,
                     tracked_completion: Some(completion.clone()),
                     operation: "tracked KV copy",
@@ -3258,6 +3274,7 @@ impl BatchScheduler {
                 *in_flight_control = Some(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
+                    process_id: None,
                     pipeline_id: None,
                     tracked_completion: None,
                     operation: "state copy",
@@ -3269,6 +3286,7 @@ impl BatchScheduler {
                 *in_flight_control = Some(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
+                    process_id: None,
                     pipeline_id: None,
                     tracked_completion: None,
                     operation: "pool resize",
@@ -3644,8 +3662,12 @@ impl BatchScheduler {
                                             request.pipeline_id,
                                             request.quorum_generation,
                                         );
-                                        policy.on_pipeline_join(qpid);
-                                        policy.on_pipeline_request(qpid, Instant::now());
+                                        policy.on_pipeline_join_owned(qpid, request.process_id);
+                                        policy.on_pipeline_request_owned(
+                                            qpid,
+                                            request.process_id,
+                                            Instant::now(),
+                                        );
                                         request.credit_published = true;
                                         if let Some(timing) = request.timing.as_mut() {
                                             timing.ready_us = Some(super::fire_timing_now_us());
@@ -3738,7 +3760,7 @@ impl BatchScheduler {
                     outcome_index,
                     logical_fire_id: request.logical_fire_id,
                     instance_id: request.instance_id,
-                    process_id: request.pipeline_id,
+                    process_id: request.process_id,
                     sampled_rows: request.request.sampling_indices.len(),
                     retry_count: request.retry_count,
                     timing,
@@ -3883,8 +3905,11 @@ impl BatchScheduler {
             let qpid = in_flight_control.as_ref().and_then(|pending| {
                 Self::quorum_pid(policy, pending.pipeline_id, pending.quorum_generation)
             });
-            policy.on_pipeline_join(qpid);
-            policy.on_pipeline_request(qpid, Instant::now());
+            let owner = in_flight_control
+                .as_ref()
+                .and_then(|pending| pending.process_id);
+            policy.on_pipeline_join_owned(qpid, owner);
+            policy.on_pipeline_request_owned(qpid, owner, Instant::now());
             if let Some(completion) = in_flight_control
                 .as_ref()
                 .and_then(|control| control.logical_completion.as_ref())
@@ -5070,6 +5095,7 @@ mod tests {
             completion.clone(),
             0,
             ProcessId::new_v4(),
+            ProcessId::new_v4(),
             None,
             None,
             Some(classifier),
@@ -5101,6 +5127,7 @@ mod tests {
             1,
             completion.clone(),
             0,
+            Some(pid),
             Some(pid),
             false,
             None,
@@ -5157,6 +5184,7 @@ mod tests {
             completion,
             0,
             None,
+            None,
             false,
             None,
             Some(state_copy),
@@ -5184,12 +5212,14 @@ mod tests {
     fn unresolved_multi_row_prebuilt_request_remains_solo() {
         let mut launch = dummy_launch();
         launch.qo_indptr = vec![0, 0, 0];
+        let pid = ProcessId::new_v4();
         let request = PendingRequest::direct(
             launch,
             1,
             WorkItemCompletion::deferred_with_guard(None),
             0,
-            Some(ProcessId::new_v4()),
+            Some(pid),
+            Some(pid),
             true,
             None,
             None,
@@ -6329,6 +6359,71 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn scoped_leave_does_not_remove_a_sibling_pipeline_of_the_same_process()
+    -> anyhow::Result<()> {
+        let (driver_id, scheduler, bound_a, _endpoints) =
+            setup_scheduler_with_limits(DummyDriverOptions::default(), coalescing_limits()).await?;
+        let (bound_b, _secondary_endpoints) =
+            bind_second_instance(driver_id, &bound_a, [31, 32], 55).await?;
+        let process_id = ProcessId::new_v4();
+        let pipeline_a = ProcessId::new_v4();
+        let pipeline_b = ProcessId::new_v4();
+
+        for (bound, pipeline_id) in [(&bound_a, pipeline_a), (&bound_b, pipeline_b)] {
+            let completion = bound.reserve_completion();
+            scheduler.handle.submit_prebuilt_tracked_with_copy(
+                dummy_launch(),
+                bound.instance_id,
+                completion.clone(),
+                0,
+                process_id,
+                pipeline_id,
+                None,
+                None,
+                None,
+                false,
+            )?;
+            if pipeline_id == pipeline_b {
+                timeout(Duration::from_secs(5), completion).await??;
+            }
+        }
+
+        // Wait for the first wave's other completion before starting wave 2.
+        // Both scopes now belong to the same process but have independent
+        // quorum membership.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let sibling = bound_b.reserve_completion();
+        scheduler.handle.submit_prebuilt_tracked_with_copy(
+            dummy_launch(),
+            bound_b.instance_id,
+            sibling.clone(),
+            0,
+            process_id,
+            pipeline_b,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        notify_pipeline_leave(pipeline_a, LeaveKind::Close);
+        timeout(Duration::from_secs(5), sibling).await??;
+
+        let dump = scheduler.handle.debug_dump().await?;
+        assert!(
+            dump.contains(&pipeline_b.to_string()),
+            "sibling pipeline must remain in the quorum:\n{dump}"
+        );
+        assert!(
+            !dump.contains(&format!("pipeline {pipeline_a}")),
+            "only the departed scope should be removed:\n{dump}"
+        );
+
+        crate::scheduler::close_instance(&bound_a)?;
+        crate::scheduler::close_instance(&bound_b)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn pipeline_close_drains_the_already_submitted_run_ahead_tail() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, endpoints) =
@@ -6424,6 +6519,7 @@ mod tests {
             instance_id,
             WorkItemCompletion::deferred_with_guard(None),
             0,
+            Some(pipeline_id),
             Some(pipeline_id),
             false,
             None,
@@ -6572,6 +6668,7 @@ mod tests {
             pending.push_back(QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::Kv(crate::driver::KvCopyPlan::default()),
                 logical_completion: WorkItemCompletion::deferred_with_guard(None),
+                process_id: None,
                 pipeline_id: Some(ProcessId::new_v4()),
                 credit_ready: false,
                 quorum_generation: 0,
@@ -6610,6 +6707,7 @@ mod tests {
             7,
             completion.clone(),
             0,
+            Some(pid),
             Some(pid),
             false,
             None,

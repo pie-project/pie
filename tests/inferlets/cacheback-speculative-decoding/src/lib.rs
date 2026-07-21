@@ -77,15 +77,32 @@ async fn verify(committed: &[u32], draft: &[u32], page_size: u32) -> Result<Vec<
     ws.reserve(max_pages)
         .map_err(|e| format!("reserve verification KV: {e}"))?;
     let tokens = Channel::from(input.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let embed_indptr = Channel::from(vec![0u32, total]).named("embed_indptr");
+    let positions = Channel::from((0..total).collect::<Vec<_>>()).named("positions");
+    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
+    let w_slot =
+        Channel::from((0..total).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot");
+    let w_off = Channel::from((0..total).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off");
     let kv_len = Channel::from(vec![total]).named("kv_len");
     let target_out = Channel::new([rows], dtype::i32).named("target_tokens");
+    let readout = Channel::from(readout).named("readout");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&tokens, Tensor::constant(vec![0u32, total]));
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(&ws, .., ..)?;
-    fwd.derive_dense_geometry();
-    fwd.readout(&Tensor::constant(readout));
+    fwd.embed(&tokens, &embed_indptr)?;
+    fwd.readout(&readout)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
     fwd.epilogue(move || {
         target_out.put(reduce_argmax(intrinsics::logits()));
     });
@@ -111,10 +128,8 @@ async fn main(input: Input) -> Result<String> {
         return Ok(String::new());
     }
 
-    let vocab = wit_model::output_vocab_size();
     let probe_ws = WorkingSet::new();
     let page_size = probe_ws.page_size();
-    model::configure(vocab, page_size, 1);
 
     let mut committed = chat::system_user("Continue the requested text.", &input.prompt);
     committed.extend(chat::cue());

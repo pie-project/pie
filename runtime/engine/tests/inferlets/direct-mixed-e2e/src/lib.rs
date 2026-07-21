@@ -1,5 +1,5 @@
+use inferlet::Result;
 use inferlet::ptir::prelude::*;
-use inferlet::{Result, model as wit_model};
 
 /// One-page working set + a single seeded token.
 const MAX_PAGES: u32 = 1;
@@ -11,10 +11,35 @@ fn geometry() -> Result<(WorkingSet, Channel)> {
     Ok((ws, Channel::from(vec![1i32]).named("token")))
 }
 
+fn bind_geometry(
+    pass: &ForwardPass,
+    ws: &WorkingSet,
+    token: &Channel,
+    kv_len: &Channel,
+) -> Result<()> {
+    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
+    let positions = Channel::from(vec![0u32]).named("positions");
+    let pages = Channel::from(vec![0u32]).named("pages");
+    let page_indptr = Channel::from(vec![0u32, 1]).named("page_indptr");
+    let w_slot = Channel::from(vec![0u32]).named("w_slot");
+    let w_off = Channel::from(vec![0u32]).named("w_off");
+    pass.embed(token, &embed_indptr)?;
+    pass.attention(
+        ws,
+        ..,
+        ..,
+        kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )
+}
+
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
-    model::configure(wit_model::output_vocab_size(), 16, 1);
-
     let (ws, token) = geometry()?;
     let mixed_kv_len = Channel::from(vec![1u32]).named("mixed_kv_len");
     let mixed_token = Channel::new([1], dtype::u32).named("mixed_token");
@@ -35,10 +60,7 @@ async fn main(_input: String) -> Result<String> {
     let sampler_d_source = Channel::from(vec![14u32]).named("sampler_d_source");
 
     let mixed = ForwardPass::new();
-    mixed.embed(&token, Tensor::constant(vec![0u32, 1]));
-    mixed.port_channel(Port::KvLen, &mixed_kv_len);
-    mixed.attn_working_set(&ws, .., ..)?;
-    mixed.derive_dense_geometry();
+    bind_geometry(&mixed, &ws, &token, &mixed_kv_len)?;
     mixed.epilogue(move || {
         let mixed_token_value = mixed_token_source.take().tensor();
         let mixed_scalar_value = mixed_scalar_source.take().tensor();
@@ -121,10 +143,7 @@ async fn main(_input: String) -> Result<String> {
     let entropy = Channel::new([1], dtype::f32).named("entropy");
     let entropy_source = Channel::from(vec![0.5f32]).named("entropy_source");
     let entropy_pass = ForwardPass::new();
-    entropy_pass.embed(&entropy_token, Tensor::constant(vec![0u32, 1]));
-    entropy_pass.port_channel(Port::KvLen, &entropy_kv_len);
-    entropy_pass.attn_working_set(&entropy_ws, .., ..)?;
-    entropy_pass.derive_dense_geometry();
+    bind_geometry(&entropy_pass, &entropy_ws, &entropy_token, &entropy_kv_len)?;
     entropy_pass.epilogue(move || {
         let entropy_value = entropy_source.take().tensor();
         entropy_source.put(&entropy_value);

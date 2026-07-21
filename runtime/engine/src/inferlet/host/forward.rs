@@ -122,11 +122,41 @@ fn poll_channel(
     this: &Resource<Channel>,
     mode: ChannelReadMode,
     pop_settled: bool,
+    settle_ready_take: bool,
 ) -> Anyhow<ChannelPoll> {
     let (cell, fires) = {
         let channel = ctx.ctx().table.get(this)?;
         (channel.cell.clone(), channel.fires.clone())
     };
+    if settle_ready_take
+        && matches!(mode, ChannelReadMode::Take)
+        && fires
+            .as_ref()
+            .is_some_and(|fires| !fires.lock().unwrap().is_empty())
+    {
+        let ready = cell.lock().unwrap().read();
+        match ready {
+            Ok(_) if pop_settled => {
+                if let Some(op) = fires
+                    .as_ref()
+                    .and_then(|fires| fires.lock().unwrap().pop_front())
+                {
+                    return Ok(ChannelPoll::Finalize(op));
+                }
+            }
+            Ok(_) => {
+                return Ok(ChannelPoll::Pending {
+                    cell,
+                    fires,
+                    process_id: ctx.id(),
+                    residency: ctx.residency_handle(),
+                });
+            }
+            Err(ChannelError::Empty) => {}
+            Err(error) => return Ok(ChannelPoll::Ready(Err(error.to_string()))),
+        }
+    }
+
     let value = {
         let mut cell = cell.lock().unwrap();
         match mode {
@@ -159,21 +189,38 @@ async fn materialize_channel(
     this: Resource<Channel>,
     mode: ChannelReadMode,
 ) -> Anyhow<Result<Vec<u8>, String>> {
+    let mut settle_ready_take = true;
     loop {
-        let state = accessor.with(|mut access| poll_channel(access.get(), &this, mode, false))?;
+        let state = accessor.with(|mut access| {
+            poll_channel(
+                access.get(),
+                &this,
+                mode,
+                false,
+                settle_ready_take,
+            )
+        })?;
         let state = match state {
             ChannelPoll::Pending {
                 fires: Some(fires), ..
             } => {
                 let _finalize_guard = fires.finalize_guard().await;
-                let state =
-                    accessor.with(|mut access| poll_channel(access.get(), &this, mode, true))?;
+                let state = accessor.with(|mut access| {
+                    poll_channel(
+                        access.get(),
+                        &this,
+                        mode,
+                        true,
+                        settle_ready_take,
+                    )
+                })?;
                 match state {
                     ChannelPoll::Finalize(op) => {
                         let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
                         accessor.with(|mut access| {
                             crate::pipeline::fire::complete_finalize(access.get(), finalized);
                         });
+                        settle_ready_take = false;
                         continue;
                     }
                     state => state,
@@ -191,6 +238,7 @@ async fn materialize_channel(
                 process_id,
                 residency,
             } => {
+                settle_ready_take = true;
                 if let Err(error) =
                     crate::inferlet::process::preemption::await_channel_progress_idle(
                         process_id,

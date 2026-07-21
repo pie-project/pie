@@ -237,6 +237,20 @@ pub fn classify_decode_envelope(
                     && data.chunks_exact(4).all(|bytes| {
                         u32::from_le_bytes(bytes.try_into().unwrap()) < token_count
                     }) => {}
+            (Port::Readout, PortSource::Channel(channel)) => {
+                let declaration = container
+                    .channels
+                    .get(*channel as usize)
+                    .ok_or_else(|| "decode envelope Readout channel is out of range".to_string())?;
+                if declaration.shape.dims().len() != 1
+                    || !matches!(
+                        declaration.dtype,
+                        pie_ptir::container::ChanDType::Concrete(DType::U32)
+                    )
+                {
+                    return Err("device Readout must be a u32 vector".to_string());
+                }
+            }
             (Port::PageIndptr, PortSource::Const { dtype, shape, data })
                 if *dtype == DType::U32
                     && shape.dims() == [lane_count + 1]
@@ -262,16 +276,21 @@ pub fn classify_decode_envelope(
                     .channels
                     .get(*channel as usize)
                     .ok_or_else(|| "decode envelope pages channel is out of range".to_string())?;
-                if declaration.shape.dims().len() != 2
-                    || declaration.shape.dims()[0] != lane_count
-                    || declaration.shape.dims()[1] == 0
+                let dims = declaration.shape.dims();
+                let valid_shape = match dims {
+                    [flat] => *flat > 0,
+                    [lanes, stride] => *lanes == lane_count && *stride > 0,
+                    _ => false,
+                };
+                if !valid_shape
                     || !matches!(
                         declaration.dtype,
                         pie_ptir::container::ChanDType::Concrete(DType::U32)
                     )
                 {
                     return Err(
-                        "device pages must be a non-empty [lanes,pages] u32 matrix".to_string()
+                        "device pages must be a non-empty flat or [lanes,pages] u32 pool"
+                            .to_string(),
                     );
                 }
             }
@@ -732,7 +751,14 @@ pub(crate) fn compact_page_envelope(
 ) -> Result<Vec<u32>, String> {
     let dims = port_dims(container, Port::Pages).unwrap_or_default();
     if dims.len() != 2 {
-        return Ok(pages);
+        let live = page_indptr.last().copied().unwrap_or_default() as usize;
+        if live > pages.len() {
+            return Err(format!(
+                "page CSR claims {live} live pages from a {}-page pool",
+                pages.len()
+            ));
+        }
+        return Ok(pages[..live].to_vec());
     }
     let stride = dims[1] as usize;
     let mut compact = Vec::new();

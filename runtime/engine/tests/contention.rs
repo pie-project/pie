@@ -66,9 +66,11 @@ fn active_preemption_swaps_and_restores_an_over_capacity_fleet() {
                     let scheduler = pie_engine::scheduler::debug_dump(0)
                         .await
                         .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+                    let processes = process::list();
                     panic!(
                         "contention fleet must not hang: lane {lane} timed out; \
-                         diagnostics: {diagnostics:#?}\nscheduler: {scheduler}"
+                         diagnostics: {diagnostics:#?}\nprocesses: {processes:#?}\n\
+                         scheduler: {scheduler}"
                     );
                 }
             };

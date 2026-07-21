@@ -71,26 +71,43 @@ fn sample(kind: Kind, scaled: Tensor, vocab: u32, r: impl AsTensor) -> Tensor {
 /// decode chain for the remaining `STEPS_PER_KIND - 1` tokens.
 async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<u32>> {
     let ws = WorkingSet::new();
+    let page_size = ws.page_size();
 
     let prompt = wit_model::encode("hello world");
     let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
     let n = prompt.len() as u32;
-    let max_pages = (n + STEPS_PER_KIND as u32 + 1).div_ceil(ws.page_size());
+    let max_pages = (n + STEPS_PER_KIND as u32 + 1).div_ceil(page_size);
     ws.reserve(max_pages)
         .map_err(|e| format!("{name} ws.reserve: {e}"))?;
 
     // ── PREFILL FIRE (N-wide, awaited) — this kind's first token. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
+    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p =
+        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
+    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
     let rng_p = Channel::from(vec![0x9e37_u32 ^ (idx as u32), 0]).named("rng_p");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
     let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, Tensor::constant(vec![0u32, n]));
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    fwd_p.port_channel(Port::KvLen, &kv_len_p);
-    fwd_p.attn_working_set(&ws, .., ..)?;
-    fwd_p.derive_dense_geometry();
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        None,
+    )?;
     fwd_p.epilogue(move || {
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
         let scaled = div(intrinsics::logits(), TEMPERATURE);
@@ -123,14 +140,29 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
         let out = Channel::new([1], dtype::i32)
             .capacity(DEPTH as u32)
             .named("out");
-        let lane1 = Tensor::constant(vec![0u32, 1u32]);
+        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from(vec![n]).named("positions");
+        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+        let page_indptr =
+            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
+        let w_off = Channel::from(vec![n % page_size]).named("w_off");
 
         let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, lane1);
+        fwd.embed(&tok_in, &lane1)?;
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
-        fwd.port_channel(Port::KvLen, &kv_len);
-        fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-        fwd.derive_dense_geometry();
+        fwd.attention(
+            &ws,
+            ..,
+            (n / page_size)..,
+            &kv_len,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &positions,
+            None,
+        )?;
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
             let r = rng.take(); // [2] u32 rng state
@@ -138,9 +170,16 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
             let t = sample(kind, scaled, vocab, &r);
 
             let r_next = add(&r, iota(2));
+            let next_length = add(&length, 1u32);
+            let page_count = div(add(&next_length, page_size - 1), page_size);
 
             tok_in.put(&t);
-            kv_len.put(add(&length, 1u32));
+            kv_len.put(&next_length);
+            positions.put(&length);
+            w_slot.put(div(&length, page_size));
+            w_off.put(rem(&length, page_size));
+            page_indptr.take();
+            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
             out.put(&t);
             rng.put(&r_next);
         });
@@ -158,9 +197,6 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
             submitted += 1;
             inflight += 1;
         }
-        if submitted == budget {
-            pipe.finish();
-        }
         while inflight > 0 {
             let t = out
                 .take()
@@ -177,12 +213,10 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
                     .map_err(|e| format!("{name} decode submit @{submitted}: {e}"))?;
                 submitted += 1;
                 inflight += 1;
-                if submitted == budget {
-                    pipe.finish();
-                }
             }
         }
     }
+    pipe.close();
 
     eprintln!("[MULTISAMP_PIPELINED] {name} tokens: {got:?}");
     Ok(got)
@@ -191,7 +225,6 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, WorkingSet::new().page_size(), 1);
 
     let kinds: [(&str, Kind); 4] = [
         ("topk", Kind::TopK { k: 40 }),

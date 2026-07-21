@@ -119,10 +119,15 @@ pub fn section3_trace() -> TraceContainer {
                 source: PortSource::Channel(0),
             },
             const_port(Port::EmbedIndptr, DType::U32, Shape::vector(2), &[0, 1]),
+            const_port(Port::Positions, DType::U32, Shape::vector(1), &[0]),
+            const_port(Port::Pages, DType::U32, Shape::vector(1), &[0]),
+            const_port(Port::PageIndptr, DType::U32, Shape::vector(2), &[0, 1]),
             PortBinding {
                 port: Port::KvLen,
                 source: PortSource::Channel(3),
             },
+            const_port(Port::WSlot, DType::U32, Shape::vector(1), &[0]),
+            const_port(Port::WOff, DType::U32, Shape::vector(1), &[0]),
         ],
         stages: vec![StageProgram {
             stage: Stage::Epilogue,

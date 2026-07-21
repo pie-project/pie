@@ -134,6 +134,12 @@ pub(super) enum WaveDecision {
 /// Per-pipeline wave participation.
 #[derive(Debug, Default)]
 struct PipelineWaveState {
+    /// Process owning this pipeline scope. Process suspend/terminate removes
+    /// every scope with the same owner; close removes only the keyed scope.
+    owner: ProcessId,
+    /// Temporary process-keyed membership created by instance binding before
+    /// the guest submits on a concrete pipeline resource.
+    bind_placeholder: bool,
     /// Requests this pipeline has contributed to the CURRENT wave.
     /// `> 0` ⇒ ready (its N+1 is in).
     wave_ready: usize,
@@ -254,14 +260,25 @@ impl WaitAllPolicy {
     /// A request entered the current wave. `Some(pid)` joins the wait-set
     /// implicitly on first sight and marks the pipeline ready; `None` is
     /// untracked (prebuilt/beam/replay — rides the wave, never awaited).
+    #[cfg(test)]
     pub fn on_pipeline_request(&mut self, pid: Option<ProcessId>, now: Instant) {
+        self.on_pipeline_request_owned(pid, pid, now);
+    }
+
+    pub fn on_pipeline_request_owned(
+        &mut self,
+        pid: Option<ProcessId>,
+        owner: Option<ProcessId>,
+        now: Instant,
+    ) {
         if self.wave_started.is_none() {
             self.wave_started = Some(now);
         }
 
-        match pid {
-            Some(pid) => {
-                let state = self.active_state(pid);
+        match (pid, owner) {
+            (Some(pid), Some(owner)) => {
+                self.retire_bind_placeholder(owner, pid);
+                let state = self.active_state(pid, owner, false);
                 state.wave_ready += 1;
                 state.last_activity = Some(now);
                 // A fresh submission ends any grace episode: the pipeline
@@ -269,16 +286,22 @@ impl WaitAllPolicy {
                 // grace instead of inheriting a stale second-strike.
                 state.straggler_grace = false;
             }
-            None => self.untracked_ready += 1,
+            _ => self.untracked_ready += 1,
         }
     }
 
     /// A tracked pipeline has submitted work that is not launch-ready yet.
     /// It joins the barrier immediately and remains missing until preparation
     /// publishes a readiness credit.
+    #[cfg(test)]
     pub fn on_pipeline_join(&mut self, pid: Option<ProcessId>) {
-        if let Some(pid) = pid {
-            self.active_state(pid);
+        self.on_pipeline_join_owned(pid, pid);
+    }
+
+    pub fn on_pipeline_join_owned(&mut self, pid: Option<ProcessId>, owner: Option<ProcessId>) {
+        if let (Some(pid), Some(owner)) = (pid, owner) {
+            self.retire_bind_placeholder(owner, pid);
+            self.active_state(pid, owner, false);
         }
     }
 
@@ -286,14 +309,15 @@ impl WaitAllPolicy {
     /// before native bind completion or the process's first fire.
     pub fn on_bind_enqueued(&mut self, pid: Option<ProcessId>) {
         if let Some(pid) = pid {
-            self.active_state(pid);
+            self.active_state(pid, pid, true);
             *self.pending_binds.entry(pid).or_default() += 1;
         }
     }
 
-    /// A bind control completed, whether successfully or with an error. The
-    /// process remains an active missing member until its first fire arrives
-    /// or the existing leave/demotion machinery handles it.
+    /// A bind control completed, whether successfully or with an error. Bind
+    /// membership has no concrete pipeline scope yet, so its process-keyed
+    /// placeholder ends with the last bind; the first fire joins under the
+    /// actual pipeline resource identity.
     pub fn on_bind_completed(&mut self, pid: Option<ProcessId>, now: Instant) {
         let Some(pid) = pid else {
             return;
@@ -302,20 +326,55 @@ impl WaitAllPolicy {
             return;
         };
         *count = count.saturating_sub(1);
-        if *count == 0 {
+        let completed = *count == 0;
+        if completed {
             self.pending_binds.remove(&pid);
+            if self
+                .active
+                .get(&pid)
+                .is_some_and(|state| state.bind_placeholder)
+            {
+                self.on_pipeline_leave(pid);
+            }
         }
         if self.pending_binds.is_empty() && self.wave_started.is_some() {
             self.wave_started = Some(now);
         }
     }
 
-    fn active_state(&mut self, pid: ProcessId) -> &mut PipelineWaveState {
+    fn active_state(
+        &mut self,
+        pid: ProcessId,
+        owner: ProcessId,
+        bind_placeholder: bool,
+    ) -> &mut PipelineWaveState {
         let generation = *self.generations.entry(pid).or_default();
-        self.active.entry(pid).or_insert(PipelineWaveState {
-            generation,
-            ..PipelineWaveState::default()
-        })
+        self.active
+            .entry(pid)
+            .and_modify(|state| {
+                debug_assert_eq!(state.owner, owner);
+                state.bind_placeholder &= bind_placeholder;
+            })
+            .or_insert(PipelineWaveState {
+                owner,
+                bind_placeholder,
+                generation,
+                ..PipelineWaveState::default()
+            })
+    }
+
+    fn retire_bind_placeholder(&mut self, owner: ProcessId, pipeline_id: ProcessId) {
+        if owner == pipeline_id || self.pending_binds.contains_key(&owner) {
+            return;
+        }
+        if self
+            .active
+            .get(&owner)
+            .is_some_and(|state| state.bind_placeholder)
+        {
+            let placeholder = self.active.remove(&owner).unwrap();
+            self.untracked_ready += placeholder.wave_ready;
+        }
     }
 
     /// A queued request that had already contributed a readiness credit will
@@ -364,6 +423,21 @@ impl WaitAllPolicy {
             self.cold_hold_deadline = None;
             self.wave_started = None;
         }
+    }
+
+    /// Release every quorum scope owned by one process. Suspend/terminate are
+    /// process lifecycle events; unlike pipeline close/allocation-wait they
+    /// must remove sibling pipeline scopes together.
+    pub fn on_process_leave(&mut self, owner: ProcessId) {
+        let pipelines: Vec<_> = self
+            .active
+            .iter()
+            .filter_map(|(pid, state)| (state.owner == owner).then_some(*pid))
+            .collect();
+        for pipeline_id in pipelines {
+            self.on_pipeline_leave(pipeline_id);
+        }
+        self.pending_binds.remove(&owner);
     }
 
     /// The wait-set size (probe/test accessor).
@@ -1445,6 +1519,81 @@ mod tests {
                 missing: Vec::new()
             }
         );
+    }
+
+    #[test]
+    fn closing_one_pipeline_scope_keeps_its_process_sibling_active() {
+        let mut policy = WaitAllPolicy::new(4, None);
+        let owner = pid();
+        let (closed, sibling) = (pid(), pid());
+        let now = Instant::now();
+        policy.on_pipeline_request_owned(Some(closed), Some(owner), now);
+        policy.on_pipeline_request_owned(Some(sibling), Some(owner), now);
+
+        policy.on_pipeline_leave(closed);
+
+        assert!(!policy.is_active(closed));
+        assert!(policy.is_active(sibling));
+        assert_eq!(policy.active_pipelines(), 1);
+    }
+
+    #[test]
+    fn allocation_wait_leave_keeps_sibling_pipeline_in_the_quorum() {
+        let mut policy = WaitAllPolicy::new(4, None);
+        let owner = pid();
+        let (waiting, sibling) = (pid(), pid());
+        let now = Instant::now();
+        policy.on_pipeline_request_owned(Some(waiting), Some(owner), now);
+        policy.on_pipeline_request_owned(Some(sibling), Some(owner), now);
+        let fired = bootstrap_fire(&mut policy, 2, now);
+        policy.on_pipeline_request_owned(Some(sibling), Some(owner), fired);
+
+        // Allocation-wait uses the same scope-leave operation as close, but
+        // the process and its independently runnable sibling remain live.
+        policy.on_pipeline_leave(waiting);
+
+        assert_eq!(
+            policy.decide_wave_at(1, fired + Duration::from_micros(1)),
+            WaveDecision::Fire {
+                missing: Vec::new()
+            }
+        );
+        assert!(policy.is_active(sibling));
+    }
+
+    #[test]
+    fn process_suspend_removes_all_owned_pipeline_scopes() {
+        let mut policy = WaitAllPolicy::new(4, None);
+        let owner = pid();
+        let other_owner = pid();
+        let (first, second, unrelated) = (pid(), pid(), pid());
+        let now = Instant::now();
+        policy.on_pipeline_request_owned(Some(first), Some(owner), now);
+        policy.on_pipeline_request_owned(Some(second), Some(owner), now);
+        policy.on_pipeline_request_owned(Some(unrelated), Some(other_owner), now);
+
+        policy.on_process_leave(owner);
+
+        assert!(!policy.is_active(first));
+        assert!(!policy.is_active(second));
+        assert!(policy.is_active(unrelated));
+    }
+
+    #[test]
+    fn completed_bind_placeholder_does_not_outlive_assembly() {
+        let mut policy = WaitAllPolicy::new(4, None);
+        let owner = pid();
+        let pipeline = pid();
+        let now = Instant::now();
+        policy.on_bind_enqueued(Some(owner));
+        policy.on_bind_completed(Some(owner), now);
+        assert!(!policy.is_active(owner));
+
+        policy.on_pipeline_request_owned(Some(pipeline), Some(owner), now);
+
+        assert!(!policy.is_active(owner));
+        assert!(policy.is_active(pipeline));
+        assert_eq!(policy.active_pipelines(), 1);
     }
 
     #[test]

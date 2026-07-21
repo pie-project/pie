@@ -29,7 +29,6 @@ use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model, serde_json};
 
 const PAGE_T: u32 = 16;
-const NUM_LAYERS: u32 = 1;
 const PROMPT: &str = "The quick brown fox jumps over";
 
 /// Host reference for the A2 DAG: the accepted draft prefix, the target
@@ -61,14 +60,30 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
 
     let toks_p = Channel::from(prompt_i32).named("g_toks_p");
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("g_embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("g_positions_p");
+    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("g_pages_p");
+    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(PAGE_T)]).named("g_page_indptr_p");
+    let w_slot_p =
+        Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("g_w_slot_p");
+    let w_off_p = Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("g_w_off_p");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
     let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, Tensor::constant(vec![0u32, n]));
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    fwd_p.port_channel(Port::KvLen, &kv_len_p);
-    fwd_p.attn_working_set(&ws, .., ..)?;
-    fwd_p.derive_dense_geometry();
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        None,
+    )?;
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
         g0_ch.put(&t);
@@ -79,9 +94,6 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     fwd_p
         .submit(&pipe)
         .map_err(|e| format!("greedy prefill: {e}"))?;
-    if k == 1 {
-        pipe.finish();
-    }
     let g0 = g0_ch
         .take()
         .get::<i32>()
@@ -92,29 +104,46 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     if k > 1 {
         let tok_in = Channel::from(vec![g0; 1]).named("g_tok_in");
         let out = Channel::new([1], dtype::i32).named("g_out");
-        let lane1 = Tensor::constant(vec![0u32, 1u32]);
+        let lane1 = Channel::from(vec![0u32, 1u32]).named("g_embed_indptr");
+        let positions = Channel::from(vec![n]).named("g_positions");
+        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("g_pages");
+        let page_indptr =
+            Channel::from(vec![0u32, (n + 1).div_ceil(PAGE_T)]).named("g_page_indptr");
+        let w_slot = Channel::from(vec![n / PAGE_T]).named("g_w_slot");
+        let w_off = Channel::from(vec![n % PAGE_T]).named("g_w_off");
 
         let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, lane1);
+        fwd.embed(&tok_in, &lane1)?;
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
-        fwd.port_channel(Port::KvLen, &kv_len);
-        fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-        fwd.derive_dense_geometry();
+        fwd.attention(
+            &ws,
+            ..,
+            (n / PAGE_T)..,
+            &kv_len,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &positions,
+            None,
+        )?;
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
             let t = reduce_argmax(intrinsics::logits());
+            let next_length = add(&length, 1u32);
+            let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
             tok_in.put(&t);
-            kv_len.put(add(&length, 1u32));
+            kv_len.put(&next_length);
+            positions.put(&length);
+            w_slot.put(div(&length, PAGE_T));
+            w_off.put(rem(&length, PAGE_T));
+            page_indptr.take();
+            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
             out.put(&t);
         });
-        // Fixed budget: finish() (F7) lands right after the last decode
-        // submit.
         for step in 1..k {
             fwd.submit(&pipe)
                 .map_err(|e| format!("greedy decode @{step}: {e}"))?;
-            if step + 1 == k {
-                pipe.finish();
-            }
             let t = out
                 .take()
                 .get::<i32>()
@@ -123,6 +152,7 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
             g.push(t as u32);
         }
     }
+    pipe.close();
     Ok(g)
 }
 
@@ -140,21 +170,37 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
     ws.reserve(max_pages)
         .map_err(|e| format!("verify ws.reserve: {e}"))?;
     let toks = Channel::from(inp).named("v_toks");
+    let embed_indptr = Channel::from(vec![0u32, n]).named("v_embed_indptr");
+    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("v_positions");
+    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("v_pages");
+    let page_indptr = Channel::from(vec![0u32, max_pages]).named("v_page_indptr");
+    let w_slot = Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("v_w_slot");
+    let w_off = Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("v_w_off");
     let verify_out = Channel::new([k], dtype::i32).named("v_out");
 
     // k read-out rows (the last k positions, prompt-tail .. prompt-tail+k-1)
     // ⇒ intrinsics::logits() declares [k, vocab].
     let readout: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
+    let readout = Channel::from(readout).named("v_readout");
     // The k draft token indices WITHIN `toks` (the positions after the anchor).
     let draft_positions: Vec<u32> = (l..l + k).collect();
 
     let fwd = ForwardPass::new();
-    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
+    fwd.embed(&toks, &embed_indptr)?;
     let kv_len = Channel::from(vec![n]).named("kv_len");
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(&ws, .., ..)?;
-    fwd.derive_dense_geometry();
-    fwd.readout(&Tensor::constant(readout));
+    fwd.readout(&readout)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded input tokens (NOT a separate
         // submitted draft channel) and gather the k draft positions out of it.
@@ -188,7 +234,6 @@ async fn main(input: String) -> Result<String> {
     let params: serde_json::Value = serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
     let k: u32 = params.get("k").and_then(|v| v.as_u64()).unwrap_or(4).max(2) as u32;
     let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
     let j = (k / 2).max(1) as usize;
 
     let mut prompt = wit_model::encode(PROMPT);

@@ -284,10 +284,6 @@ pub(crate) async fn honor_idle(
     if !orchestrator.begin_quiesce(pid) {
         return Ok(false);
     }
-    if let Err(error) = crate::scheduler::freeze_pipeline(pid).await {
-        decline_park(pid);
-        return Err(error).context("freeze scheduler preparation for idle suspension");
-    }
     let snapshot = residency.lock().unwrap().snapshot();
     for fires in &snapshot.pipelines {
         let _finalize_guard = fires.finalize_guard().await;
@@ -313,6 +309,11 @@ pub(crate) async fn honor_idle(
                 return Err(error);
             }
         }
+    }
+    orchestrator.leave_for_suspend(pid);
+    if let Err(error) = crate::scheduler::freeze_pipeline(pid).await {
+        decline_park(pid);
+        return Err(error).context("freeze scheduler preparation for idle suspension");
     }
     let working_sets: HashSet<WorkingSetId> = snapshot
         .kv_working_sets
@@ -439,13 +440,14 @@ pub(crate) async fn honor(ctx: &mut ProcessCtx) -> Result<()> {
     if !orchestrator.should_park(pid) || !orchestrator.begin_quiesce(pid) {
         return Ok(());
     }
-    if let Err(error) = crate::scheduler::freeze_pipeline(pid).await {
-        decline_park(pid);
-        return Err(error).context("freeze scheduler preparation for suspension");
-    }
     if let Err(error) = drain_preemption_safe_fires(ctx).await {
         decline_park(pid);
         return Err(error);
+    }
+    orchestrator.leave_for_suspend(pid);
+    if let Err(error) = crate::scheduler::freeze_pipeline(pid).await {
+        decline_park(pid);
+        return Err(error).context("freeze scheduler preparation for suspension");
     }
     let snapshot = ctx.residency_snapshot();
     let rs_slots_remain_resident = snapshot.rs_working_sets.len();
@@ -475,10 +477,12 @@ async fn suspend_restore(pid: uuid::Uuid, working_sets: HashSet<WorkingSetId>) -
             kv.prepare_suspend(&working_sets)
         }) {
             Ok(prepared) => prepared,
-            Err(crate::store::kv::KvStoreError::HostSwapFull { .. }) => {
+            Err(error @ crate::store::kv::KvStoreError::HostSwapFull { .. }) => {
                 orchestrator.record_host_swap_exhaustion();
-                decline_park(pid);
-                return Ok(());
+                let reason =
+                    format!("KV preemption killed process after host swap exhaustion: {error}");
+                crate::inferlet::process::terminate(pid, Err(reason.clone()));
+                return Err(anyhow::anyhow!(reason));
             }
             Err(error) => {
                 decline_park(pid);

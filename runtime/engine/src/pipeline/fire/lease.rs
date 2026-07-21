@@ -146,8 +146,8 @@ pub struct DevGeo {
 }
 
 /// Detect a device-geometry pass: its geometry ports (`WSlot`/`WOff` write
-/// descriptors — beam-specific, a plain decode's `attn_working_set` binds only
-/// `KvLen`) bind DEVICE-produced channels, and the `Pages` port's channel is
+/// descriptors — beam-specific; an ordinary decode carries the same ports but
+/// keeps them host-derivable) bind DEVICE-produced channels, and `Pages` is
 /// `[B, P]` (`P > 1`). Returns `(B, fresh_dense, w_cont_dense)`: the single
 /// host-writer channel is `fresh`; the host-reader `[B]` bool channel is
 /// `w_cont` (the reclaim signal). `None` for an ordinary decode.

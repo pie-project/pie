@@ -35,7 +35,6 @@ use inferlet::{Result, model as wit_model};
 const PROMPT: &str = "The quick brown fox jumps over";
 const MAX_TOKENS: u32 = 16;
 const PAGE_T: u32 = 16;
-const NUM_LAYERS: u32 = 28;
 
 /// Decode a `[k]`/`[k+1]` i32 host vector.
 async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
@@ -50,6 +49,87 @@ fn committed_len(tail: &[i32]) -> usize {
     tail.iter().take_while(|&&t| t >= 0).count()
 }
 
+fn bind_single_sequence(
+    pass: &ForwardPass,
+    ws: &WorkingSet,
+    toks: &Channel,
+    kv_len: &Channel,
+    token_count: u32,
+    pool_pages: u32,
+    readout: &[u32],
+) -> Result<()> {
+    let embed_indptr = Channel::from(vec![0u32, token_count]).named("embed_indptr");
+    let positions = Channel::from((0..token_count).collect::<Vec<_>>()).named("positions");
+    let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, token_count.div_ceil(PAGE_T)]).named("page_indptr");
+    let w_slot =
+        Channel::from((0..token_count).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("w_slot");
+    let w_off =
+        Channel::from((0..token_count).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("w_off");
+    let readout = Channel::from(readout.to_vec()).named("readout");
+    pass.embed(toks, &embed_indptr)?;
+    pass.readout(&readout)?;
+    pass.attention(
+        ws,
+        ..,
+        ..,
+        kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )
+}
+
+fn bind_verify_rows(
+    pass: &ForwardPass,
+    ws: &WorkingSet,
+    toks: &Channel,
+    kv_len: &Channel,
+    seq_len: u32,
+    rows: u32,
+    pool_pages: u32,
+) -> Result<()> {
+    let embed_indptr = Channel::from((0u32..=rows).collect::<Vec<_>>()).named("embed_indptr");
+    let positions = Channel::from((seq_len..seq_len + rows).collect::<Vec<_>>()).named("positions");
+    let lengths: Vec<u32> = (1..=rows).map(|row| seq_len + row).collect();
+    let mut page_values = Vec::new();
+    let mut page_indptr_values = vec![0u32];
+    for length in &lengths {
+        page_values.extend(0..length.div_ceil(PAGE_T).min(pool_pages));
+        page_indptr_values.push(page_values.len() as u32);
+    }
+    let pages = Channel::from(page_values).named("pages");
+    let page_indptr = Channel::from(page_indptr_values).named("page_indptr");
+    let w_slot = Channel::from(
+        (seq_len..seq_len + rows)
+            .map(|p| p / PAGE_T)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_slot");
+    let w_off = Channel::from(
+        (seq_len..seq_len + rows)
+            .map(|p| p % PAGE_T)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_off");
+    pass.embed(toks, &embed_indptr)?;
+    pass.attention(
+        ws,
+        ..,
+        (seq_len / PAGE_T)..,
+        kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )
+}
+
 /// Bootstrap fire over `prompt + (k-1)` fillers: yields the seed (row-0 target
 /// argmax at the prompt's REAL last position) + the first REAL `[k]` drafts
 /// (native MTP argmax) for window 1. No verify (nothing to verify yet).
@@ -59,7 +139,7 @@ async fn bootstrap(
     pipeline: &Pipeline,
     prompt: &[u32],
     k: u32,
-    _max_pages: u32,
+    max_pages: u32,
 ) -> Result<(i32, Vec<i32>)> {
     let l = prompt.len() as u32;
     let mut window: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
@@ -75,13 +155,9 @@ async fn bootstrap(
     let readout: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
 
     let fwd = ForwardPass::new();
-    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
     let kv_len = Channel::from(vec![n]).named("b_kv_len");
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(ws, .., ..)?;
-    fwd.derive_dense_geometry();
-    fwd.rs_working_set(rs);
-    fwd.readout(&Tensor::constant(readout));
+    bind_single_sequence(&fwd, ws, &toks, &kv_len, n, max_pages, &readout)?;
+    fwd.rs_working_sets(std::slice::from_ref(rs))?;
     fwd.epilogue(move || {
         let picked = reduce_argmax(intrinsics::logits()); // [k] target argmax
         let seed = gather(&picked, Tensor::constant(vec![0u32])); // [1] row-0
@@ -116,7 +192,7 @@ async fn verify_window(
     seed: i32,
     draft: &[i32],
     seq_len: u32,
-    _max_pages: u32,
+    max_pages: u32,
 ) -> Result<(Vec<i32>, Vec<i32>)> {
     let kp1 = k + 1;
     let mut window: Vec<i32> = vec![seed];
@@ -126,15 +202,11 @@ async fn verify_window(
     let commit_out = Channel::new([kp1], dtype::i32).named("v_commit");
     let drafts_out = Channel::new([k], dtype::i32).named("v_drafts");
 
-    let lanes: Vec<u32> = (0..=kp1).collect(); // one token per window row
     let fwd = ForwardPass::new();
-    fwd.embed(&toks, Tensor::constant(lanes));
     let kv_len =
         Channel::from((1..=kp1).map(|row| seq_len + row).collect::<Vec<_>>()).named("v_kv_len");
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(ws, .., (seq_len / ws.page_size())..)?;
-    fwd.derive_dense_geometry();
-    fwd.rs_working_set(rs);
+    bind_verify_rows(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages)?;
+    fwd.rs_working_sets(std::slice::from_ref(rs))?;
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded window (NOT a resubmitted draft
         // channel) and gather rows 1..=k as the verify operand.
@@ -168,13 +240,8 @@ async fn verify_window(
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let k: u32 = input.trim().parse().unwrap_or(4).max(2);
-    let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
     let rs = RsWorkingSet::new();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
-    model::configure_gates(
-        /* has_mtp_logits */ true, /* has_value_head */ false,
-    );
 
     let mut prompt = wit_model::encode(PROMPT);
     if prompt.is_empty() {

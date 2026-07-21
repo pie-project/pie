@@ -213,6 +213,7 @@ mod tests {
             request,
             instance_id,
             completion: WorkItemCompletion::new(instance_id, 0),
+            process_id: None,
             pipeline_id: None,
             prebuilt,
             retry_count: 0,

@@ -24,18 +24,24 @@ fn argmax(values: &[f32]) -> usize {
 async fn main(_input: Input) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
-    model::configure(vocab, ws.page_size(), 1);
+    let page_size = ws.page_size();
 
     let mut prompt = wit_model::encode("The capital of France is");
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let max_pages = n.div_ceil(ws.page_size()).max(1);
+    let max_pages = n.div_ceil(page_size).max(1);
     ws.reserve(max_pages)
         .map_err(|e| format!("reserve KV: {e}"))?;
 
     let toks = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
+    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("positions");
+    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
+    let w_slot = Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot");
+    let w_off = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off");
     let kv_len = Channel::from(vec![n]).named("kv_len");
     let token_out = Channel::new([1], dtype::i32).named("token");
     let logits_out = Channel::new([vocab], dtype::f32).named("logits");
@@ -44,10 +50,19 @@ async fn main(_input: Input) -> Result<String> {
     let logprobs_out = Channel::new([vocab], dtype::f32).named("log_probabilities");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(&ws, .., ..)?;
-    fwd.derive_dense_geometry();
+    fwd.embed(&toks, &embed_indptr)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
     fwd.epilogue(move || {
         let logits = intrinsics::logits();
         let logprobs = log_softmax(&logits);

@@ -64,6 +64,10 @@ impl PipelineScope {
         self.state.id
     }
 
+    pub(crate) fn scheduler_id(&self) -> uuid::Uuid {
+        uuid::Uuid::from_u128(self.state.id.0)
+    }
+
     /// Mark the scope closed. Returns whether this call performed the
     /// transition, allowing lifecycle notifications to remain idempotent.
     pub(crate) fn close(&self) -> bool {

@@ -6,7 +6,7 @@
 //! executor must reproduce the step lines exactly.
 //!
 //! Regenerate (bless) with:
-//! `PTIR_REGEN=1 cargo test -p pie-sampling-ir --features eval --test ptir_golden`
+//! `PTIR_REGEN=1 cargo test -p pie-ptir --features eval --test ptir_golden`
 #![cfg(feature = "eval")]
 
 use pie_ptir::container::{
@@ -217,6 +217,10 @@ fn golden_greedy_argmax() {
                 port: Port::EmbedTokens,
                 source: PortSource::Channel(0),
             },
+            const_port(Port::EmbedIndptr, DType::U32, Shape::vector(2), &[0, 1]),
+            const_port(Port::Positions, DType::U32, Shape::vector(1), &[0]),
+            const_port(Port::Pages, DType::U32, Shape::vector(1), &[0]),
+            const_port(Port::PageIndptr, DType::U32, Shape::vector(2), &[0, 1]),
             PortBinding {
                 port: Port::KvLen,
                 source: PortSource::Const {
@@ -225,6 +229,8 @@ fn golden_greedy_argmax() {
                     data: 1u32.to_le_bytes().to_vec(),
                 },
             },
+            const_port(Port::WSlot, DType::U32, Shape::vector(1), &[0]),
+            const_port(Port::WOff, DType::U32, Shape::vector(1), &[0]),
         ],
         stages: vec![StageProgram {
             stage: Stage::Epilogue,

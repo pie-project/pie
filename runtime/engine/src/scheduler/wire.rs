@@ -219,11 +219,7 @@ pub fn new_batched_forward_request_with_capacity(n_requests: usize) -> crate::dr
 
 /// Append the request's `kv_page_indices` to the batch's `kv_page_indices`,
 /// honoring the trim plan if present.
-fn emit_kv_pages(
-    batch: &mut crate::driver::LaunchPlan,
-    pages: &[u32],
-    trim: Option<&TrimPlan>,
-) {
+fn emit_kv_pages(batch: &mut crate::driver::LaunchPlan, pages: &[u32], trim: Option<&TrimPlan>) {
     match trim {
         None => batch.kv_page_indices.extend(pages),
         Some(plan) => {

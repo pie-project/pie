@@ -472,6 +472,59 @@ impl KvStore {
         Ok(count)
     }
 
+    /// Number of additional physical pages needed to back the logical prefix
+    /// through `end`. Pure demand computation: no pool or mapping mutation.
+    pub fn backing_demand(&self, ws: WorkingSetId, end: u64) -> Result<usize, KvStoreError> {
+        let page_len = self.table.page_len(ws)?;
+        if end > page_len {
+            return Err(KvStoreError::BadWriteSet {
+                reason: "backing frontier exceeds the logical reservation",
+            });
+        }
+        let mapped = self.table.mapped_len(ws)?;
+        usize::try_from(end.saturating_sub(mapped)).map_err(|_| KvStoreError::OutOfPages {
+            requested: usize::MAX,
+            available: self.pool.available(),
+        })
+    }
+
+    /// Back the missing logical prefix from caller-owned reserved page IDs.
+    /// Consumes exactly the required prefix of `granted`; surplus remains
+    /// caller-owned.
+    pub fn ensure_backed_reserved(
+        &mut self,
+        ws: WorkingSetId,
+        end: u64,
+        granted: &mut Vec<PhysicalKvPageId>,
+    ) -> Result<usize, KvStoreError> {
+        let count = self.backing_demand(ws, end)?;
+        if granted.len() < count {
+            return Err(KvStoreError::GrantMismatch {
+                required: count,
+                granted: granted.len(),
+            });
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        let allocated: Vec<_> = granted.drain(..count).collect();
+        let published = allocated
+            .iter()
+            .copied()
+            .map(|id| PublishedPage {
+                id,
+                token_hashes: Vec::new(),
+                page_hash: None,
+            })
+            .collect();
+        if let Err(error) = self.table.publish_appended(ws, published) {
+            self.pool.release_reserved(allocated);
+            return Err(error.into());
+        }
+        self.invalidate_flat(ws);
+        Ok(count)
+    }
+
     /// Freed slots recycle after `epoch` retires (all in-flight users done).
     pub fn discard(
         &mut self,
@@ -635,6 +688,36 @@ impl KvStore {
         self.finish_prepare_write(ws, classification, allocated)
     }
 
+    /// Number of fresh/COW pages a write preparation requires. This performs
+    /// classification only and does not allocate, pin, or open a transaction.
+    pub fn write_demand(
+        &mut self,
+        ws: WorkingSetId,
+        write_indexes: &[u64],
+    ) -> Result<usize, KvStoreError> {
+        Ok(self.classify_write(ws, write_indexes)?.required_pages())
+    }
+
+    /// Prepare a write from caller-owned reserved pages, consuming exactly the
+    /// required prefix and leaving surplus caller-owned.
+    pub fn prepare_write_reserved(
+        &mut self,
+        ws: WorkingSetId,
+        write_indexes: &[u64],
+        granted: &mut Vec<PhysicalKvPageId>,
+    ) -> Result<KvPreparedWrite, KvStoreError> {
+        let classification = self.classify_write(ws, write_indexes)?;
+        let required = classification.required_pages();
+        if granted.len() < required {
+            return Err(KvStoreError::GrantMismatch {
+                required,
+                granted: granted.len(),
+            });
+        }
+        let allocated = granted.drain(..required).collect();
+        self.finish_prepare_write(ws, classification, allocated)
+    }
+
     /// Prepare using concrete ids reserved by the contention orchestrator.
     pub fn prepare_write_granted(
         &mut self,
@@ -642,27 +725,17 @@ impl KvStore {
         write_indexes: &[u64],
         mut granted: Vec<PhysicalKvPageId>,
     ) -> Result<KvPreparedWrite, KvStoreError> {
-        let classification = match self.classify_write(ws, write_indexes) {
-            Ok(classification) => classification,
+        let prepared = match self.prepare_write_reserved(ws, write_indexes, &mut granted) {
+            Ok(prepared) => prepared,
             Err(error) => {
                 self.pool.release_reserved(granted);
                 return Err(error);
             }
         };
-        let required = classification.required_pages();
-        if granted.len() < required {
-            let granted_len = granted.len();
+        if !granted.is_empty() {
             self.pool.release_reserved(granted);
-            return Err(KvStoreError::GrantMismatch {
-                required,
-                granted: granted_len,
-            });
         }
-        if granted.len() > required {
-            let extra = granted.split_off(required);
-            self.pool.release_reserved(extra);
-        }
-        self.finish_prepare_write(ws, classification, granted)
+        Ok(prepared)
     }
 
     fn classify_write(
