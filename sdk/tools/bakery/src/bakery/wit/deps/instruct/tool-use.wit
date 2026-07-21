@@ -13,11 +13,23 @@ interface tool-use {
     /// Register available tools (list of JSON schema strings)
     equip: func(model: borrow<model>, tools: list<string>) -> result<list<u32>, error>;
 
+    /// Register available tools inside a system turn. Architectures whose
+    /// template nests declarations in the first system block cannot express
+    /// that as `system` followed by `equip`, because `system` has already
+    /// closed its turn. Others compose the two exactly as before.
+    system-equip: func(model: borrow<model>, system: string, tools: list<string>) -> result<list<u32>, error>;
+
     /// Provide a tool result (after a tool-call reply)
     answer: func(model: borrow<model>, name: string, value: string) -> list<u32>;
 
     /// Create a decoder to detect tool calls in generated tokens
     create-decoder: func(model: borrow<model>) -> decoder;
+
+    /// Create a tool-call decoder that also enforces declared-tool membership:
+    /// it reports a call only when the name is one of `tools`, so a name the
+    /// model was never shown is refused independently of any grammar
+    /// constraint. Prefer this whenever the toolset is known.
+    create-decoder-for-tools: func(model: borrow<model>, tools: list<string>) -> decoder;
 
     /// Returns the grammar that constrains well-formed tool-call output for
     /// this model and toolset, or none if the model has no enforceable format.

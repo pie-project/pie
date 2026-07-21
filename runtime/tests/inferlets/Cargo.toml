@@ -6,6 +6,7 @@ members = [
     "error",
     "generate",
     "context-lifecycle",
+    "tool-use",
 ]
 
 [workspace.dependencies]

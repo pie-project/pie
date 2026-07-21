@@ -88,6 +88,9 @@ pub struct Context {
     /// Deferred system text, so model templates that fold system into the
     /// first user turn can render the pair correctly.
     pending_system: Option<String>,
+    /// Tool schema envelopes equipped on this context, so [`Context::tool_decoder`]
+    /// can build a decoder that only reports calls to tools the model was shown.
+    equipped: Vec<String>,
     /// Total tokens in committed + working pages (tracked locally).
     pub(crate) seq_len: u32,
     /// Number of committed pages (tracked locally).
@@ -138,6 +141,7 @@ impl Context {
             page_size,
             buffer: Vec::new(),
             pending_system: None,
+            equipped: Vec::new(),
             seq_len,
             committed_pages,
             working_pages,
@@ -159,6 +163,7 @@ impl Context {
             page_size: self.page_size,
             buffer: self.buffer.clone(),
             pending_system: self.pending_system.clone(),
+            equipped: self.equipped.clone(),
             seq_len: self.seq_len,
             committed_pages: self.committed_pages,
             working_pages: self.working_pages,
@@ -347,11 +352,18 @@ impl Context {
     /// dynamically-loaded tools.
     ///
     /// # Errors
-    /// Returns the underlying schema-parse or `equip_prefix` error if a
-    /// tool's `schema()` is not valid JSON, or if the model has no tool
-    /// template.
+    /// Errors if a tool's `schema()` is not valid JSON, if the model has no
+    /// tool template, or if the model cannot declare the toolset as given —
+    /// some architectures reject a schema they could not also constrain and
+    /// parse identically, and refuse the whole toolset rather than declare
+    /// part of it.
+    ///
+    /// Architectures that nest declarations inside the first system turn can
+    /// only be equipped while a system message is still pending, so call this
+    /// directly after [`Context::system`]. Interposing a `user` turn flushes
+    /// the system message and leaves nothing to nest into, which those models
+    /// reject. On any error the pending system message is left intact.
     pub fn equip(&mut self, tools: &[&dyn crate::tools::Tool]) -> Result<&mut Self> {
-        self.flush_pending_system();
         let envelopes: Vec<String> = tools
             .iter()
             .map(|t| {
@@ -365,9 +377,32 @@ impl Context {
                 .to_string())
             })
             .collect::<Result<_>>()?;
-        let prefix = crate::tools::equip_prefix(&self.model, &envelopes)?;
+        // Fuse with a pending system message, the same way `user` does. Some
+        // templates nest declarations inside the first system turn, which is
+        // unreachable once that turn has been flushed and closed.
+        // Borrow the pending system message rather than taking it, and clear it
+        // only once the host has accepted the turn. Taking first would drop it
+        // on the error path — the context would come back missing a system
+        // message the caller believes it set, having reported only that equip
+        // failed. Refusing a turn must not also destroy state.
+        let prefix = match self.pending_system.as_deref() {
+            Some(system) => crate::tools::system_equip_prefix(&self.model, system, &envelopes)?,
+            None => crate::tools::equip_prefix(&self.model, &envelopes)?,
+        };
+        self.pending_system = None;
         self.buffer.extend_from_slice(&prefix);
+        // Remember the declared toolset so `tool_decoder` can enforce membership
+        // over exactly what was equipped, accumulating across repeated calls.
+        self.equipped.extend(envelopes);
         Ok(self)
+    }
+
+    /// A tool-call decoder that only reports calls to tools equipped on this
+    /// context. This is the ordinary declared-tool path: `equip` your tools,
+    /// then decode with this. A decoder built before any `equip` reports
+    /// nothing, so an undeclared call can never be attributed.
+    pub fn tool_decoder(&self) -> crate::tools::Decoder {
+        crate::tools::Decoder::with_tools(&self.model, &self.equipped)
     }
 
     /// Drop the trailing `n` tokens from the working pages and re-sync the

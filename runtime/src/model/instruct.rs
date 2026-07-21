@@ -106,6 +106,56 @@ pub trait Instruct: Send + Sync {
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder>;
     fn tool_decoder(&self) -> Box<dyn ToolDecoder>;
 
+    /// Whether tool declarations can only be emitted inside a system turn.
+    ///
+    /// Architectures that return `true` cannot express [`equip`] standalone;
+    /// the host rejects that call rather than handing back zero declarations
+    /// while a tool grammar still compiles — which would constrain the model to
+    /// call tools it was never shown. Such callers use [`system_equip`].
+    ///
+    /// [`equip`]: Instruct::equip
+    /// [`system_equip`]: Instruct::system_equip
+    fn tool_declarations_require_system_turn(&self) -> bool {
+        false
+    }
+
+    /// Tokens for a system turn that also declares `tools`.
+    ///
+    /// The default composes the two independently — a system turn followed by a
+    /// separate `equip` block — which every ChatML-style template wants.
+    /// Architectures whose template nests declarations *inside* the first system
+    /// turn override this; they cannot be expressed as `system` + `equip`
+    /// because `system` has already closed its turn. `None` means the toolset
+    /// cannot be declared at all, so the host refuses rather than emitting a
+    /// tool-less turn the caller would believe carried its tools.
+    fn system_equip(&self, system: &str, tools: &[String]) -> Option<Vec<u32>> {
+        let mut tokens = self.system(system);
+        tokens.extend(self.equip(tools));
+        Some(tokens)
+    }
+
+    /// Fallible [`answer`]: `None` when the result cannot be represented in this
+    /// architecture's wire format — typically because it carries a delimiter the
+    /// format has no escape for. The default is always `Some`, matching the
+    /// infallible [`answer`]; architectures with an inexpressible-result case
+    /// (Gemma 4) override this so tool output is refused rather than truncated.
+    ///
+    /// [`answer`]: Instruct::answer
+    fn try_answer(&self, name: &str, value: &str) -> Option<Vec<u32>> {
+        Some(self.answer(name, value))
+    }
+
+    /// A tool decoder that also knows the declared toolset, so it can reject a
+    /// call naming a tool the model was never shown — the fail-closed contract
+    /// for callers that generate without a grammar constraint. The default
+    /// ignores `tools` and returns the plain [`tool_decoder`]; architectures
+    /// whose decoder reads a name out of the stream (Gemma 4) override it.
+    ///
+    /// [`tool_decoder`]: Instruct::tool_decoder
+    fn tool_decoder_for_tools(&self, _tools: &[String]) -> Box<dyn ToolDecoder> {
+        self.tool_decoder()
+    }
+
     /// Returns the parsed tool-call grammar that constrains generation to
     /// the architecture's tool-call format, given a list of tool schemas.
     /// Returns `None` if the architecture doesn't support constrained tool calling.
