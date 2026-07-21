@@ -290,6 +290,7 @@ struct PieLoaderModelConfigView {
   uint32_t num_hidden_layers;
   uint32_t num_experts;
   uint32_t num_experts_per_tok;
+  uint32_t first_k_dense_replace;
 };
 
 struct PieLoaderRuntimeAbiView {

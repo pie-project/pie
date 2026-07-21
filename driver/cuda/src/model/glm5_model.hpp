@@ -25,7 +25,8 @@ public:
         DsaCache& dsa_cache,
         int tp_size,
         NcclComm* tp_comm,
-        bool emit_logits);
+        bool emit_logits,
+        ExpertStreamCache* expert_cache = nullptr);
 
     void prepare(AttentionWorkspace& attn_ws,
                  const ForwardFn::PrepareInputs& in) override;

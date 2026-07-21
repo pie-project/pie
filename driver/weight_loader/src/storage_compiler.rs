@@ -41,7 +41,7 @@ pub fn compile_storage_program(
         let Some(arch) = crate::abi::stream_arch_for(&cfg.model_type) else {
             return Err(CompileError::InvalidInput(format!(
                 "stream_routed_experts is not supported for model_type='{}' \
-                 (supported: deepseek_v4)",
+                 (supported: deepseek_v4, glm_moe_dsa)",
                 cfg.model_type
             )));
         };
@@ -50,6 +50,7 @@ pub fn compile_storage_program(
             metadata,
             cfg.num_hidden_layers,
             cfg.num_experts,
+            cfg.first_k_dense_replace,
             arch,
         )?;
     }

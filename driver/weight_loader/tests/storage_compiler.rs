@@ -311,6 +311,7 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
         num_hidden_layers: 1,
         num_experts: 2,
         num_experts_per_tok: 2,
+        first_k_dense_replace: 0,
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
@@ -372,6 +373,7 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
         num_hidden_layers: 1,
         num_experts: 2,
         num_experts_per_tok: 2,
+        first_k_dense_replace: 0,
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
@@ -505,6 +507,7 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         num_hidden_layers: 1,
         num_experts: 2,
         num_experts_per_tok: 2,
+        first_k_dense_replace: 0,
     };
     let target = StorageTarget {
         backend: BackendKind::Cuda,
@@ -1303,6 +1306,222 @@ fn stream_routed_experts_rejects_unsupported_arch() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("not supported"), "unexpected error: {err}");
+}
+
+// ── SSD expert streaming (GLM-5 / glm_moe_dsa) ───────────────────────
+
+fn glm_streaming_metadata() -> CheckpointMetadata {
+    // 4 layers: 0..2 dense MLP, layer 3 MoE with 2 routed experts + shared.
+    // Routed experts are FP8 weight + weight_scale_inv (6 sections).
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>, dtype: DType| {
+        let bytes = shape.iter().fold(dtype.bytes(), |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(dtype),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    for li in 0..3 {
+        push(
+            next(),
+            &format!("model.layers.{li}.mlp.gate_proj.weight"),
+            vec![32, 64],
+            DType::F8E4M3,
+        );
+        push(
+            next(),
+            &format!("model.layers.{li}.mlp.up_proj.weight"),
+            vec![32, 64],
+            DType::F8E4M3,
+        );
+        push(
+            next(),
+            &format!("model.layers.{li}.mlp.down_proj.weight"),
+            vec![64, 32],
+            DType::F8E4M3,
+        );
+    }
+    push(next(), "model.layers.3.mlp.gate.weight", vec![2, 64], DType::BF16);
+    push(
+        next(),
+        "model.layers.3.mlp.shared_experts.gate_proj.weight",
+        vec![32, 64],
+        DType::F8E4M3,
+    );
+    push(
+        next(),
+        "model.layers.3.mlp.shared_experts.up_proj.weight",
+        vec![32, 64],
+        DType::F8E4M3,
+    );
+    push(
+        next(),
+        "model.layers.3.mlp.shared_experts.down_proj.weight",
+        vec![64, 32],
+        DType::F8E4M3,
+    );
+    for e in 0..2 {
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let (rows, cols) = if proj == "down_proj" {
+                (64i64, 32i64)
+            } else {
+                (32, 64)
+            };
+            push(
+                next(),
+                &format!("model.layers.3.mlp.experts.{e}.{proj}.weight"),
+                vec![rows, cols],
+                DType::F8E4M3,
+            );
+            // 128×128 block scales: ceil(rows/128) × ceil(cols/128)
+            let sr = (rows + 127) / 128;
+            let sc = (cols + 127) / 128;
+            push(
+                next(),
+                &format!("model.layers.3.mlp.experts.{e}.{proj}.weight_scale_inv"),
+                vec![sr, sc],
+                DType::F32,
+            );
+        }
+    }
+    // Nextn / MTP layer at index == num_hidden_layers (GLM
+    // num_nextn_predict_layers). Must stay resident.
+    for proj in ["gate_proj", "up_proj", "down_proj"] {
+        let (rows, cols) = if proj == "down_proj" {
+            (64i64, 32i64)
+        } else {
+            (32, 64)
+        };
+        push(
+            next(),
+            &format!("model.layers.4.mlp.experts.0.{proj}.weight"),
+            vec![rows, cols],
+            DType::F8E4M3,
+        );
+        let sr = (rows + 127) / 128;
+        let sc = (cols + 127) / 128;
+        push(
+            next(),
+            &format!("model.layers.4.mlp.experts.0.{proj}.weight_scale_inv"),
+            vec![sr, sc],
+            DType::F32,
+        );
+    }
+    let size_bytes = offset;
+    CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    }
+}
+
+fn glm_cfg() -> pie_weight_loader::config::ModelConfig {
+    pie_weight_loader::config::ModelConfig {
+        model_type: "glm_moe_dsa".to_string(),
+        num_hidden_layers: 4,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+        first_k_dense_replace: 3,
+        ..pie_weight_loader::config::ModelConfig::default()
+    }
+}
+
+#[test]
+fn glm_stream_routed_experts_excludes_experts_keeps_dense_and_shared() {
+    let meta = glm_streaming_metadata();
+    let cfg = glm_cfg();
+
+    let compile = |stream: bool| {
+        let target = StorageTarget {
+            backend: BackendKind::Cuda,
+            stream_routed_experts: stream,
+            ..StorageTarget::default()
+        };
+        let abi =
+            pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+        compile_storage_program(&meta, &cfg, &abi, target).unwrap()
+    };
+
+    let streamed = compile(true);
+    assert!(
+        !streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.starts_with("model.layers.3.mlp.experts.")),
+        "main-stack routed experts must be omitted from resident schedule; got: {:?}",
+        streamed.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name == "model.layers.0.mlp.gate_proj.weight"),
+        "dense MLP must stay resident"
+    );
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name == "model.layers.3.mlp.shared_experts.gate_proj.weight"),
+        "shared experts must stay resident"
+    );
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name == "model.layers.3.mlp.gate.weight"),
+        "router must stay resident"
+    );
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.starts_with("model.layers.4.mlp.experts.")),
+        "nextn/MTP experts must stay resident; got: {:?}",
+        streamed.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    assert!(!streamed.stream.is_empty());
+    assert_eq!(streamed.stream.num_layers, 1); // 4 - 3 dense
+    assert_eq!(streamed.stream.num_experts, 2);
+    assert_eq!(streamed.stream.sections_per_expert, 6);
+    assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 6);
+}
+
+#[test]
+fn glm_stream_routed_experts_rejects_mxfp4_runtime_quant() {
+    let meta = glm_streaming_metadata();
+    let mut cfg = glm_cfg();
+    cfg.runtime_quant = "fp4".to_string();
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        stream_routed_experts: true,
+        ..StorageTarget::default()
+    };
+    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("runtime_quant") || err.contains("mxfp4") || err.contains("fp4"),
+        "unexpected error: {err}"
+    );
 }
 
 fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {

@@ -12,12 +12,21 @@
 #include "ops/gemm.hpp"
 #include "tensor.hpp"
 
+namespace pie_cuda_driver {
+class ExpertStreamCache;
+}
+
 namespace pie_cuda_driver::model {
 
 struct Glm5ForwardCfg {
     int tp_size = 1;
     NcclComm* tp_comm = nullptr;
     bool emit_logits = true;
+    // SSD expert streaming: non-null when routed expert weights are paged
+    // on demand. MoE layers call ensure_resident with
+    // (li - first_k_dense_replace) and build FP8 WeightViews from slot
+    // section pointers.
+    ExpertStreamCache* expert_cache = nullptr;
 };
 
 // Scratch buffers for the GLM-5.1 forward pass. Mirrors KimiWorkspace

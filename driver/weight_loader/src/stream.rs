@@ -52,11 +52,17 @@ fn compact_stride(span_bytes: u64) -> StridedExtent {
 
 /// Attach a deferred expert-load plan to `program`. Appends template
 /// `ExtentWrite` instructions (not on `schedule`) and fills `program.stream`.
+///
+/// `first_k_dense_replace` skips early dense MLP layers (DeepSeek/GLM): the
+/// stream grid has `num_hidden_layers - first_k_dense_replace` MoE layers, and
+/// absolute checkpoint layer indices from `arch.parse` are remapped by
+/// subtracting that offset.
 pub fn attach_stream_plan(
     program: &mut StorageProgram,
     metadata: &CheckpointMetadata,
     num_hidden_layers: u32,
     num_experts: u32,
+    first_k_dense_replace: u32,
     arch: StreamArchDesc,
 ) -> Result<(), CompileError> {
     if num_hidden_layers == 0 || num_experts == 0 {
@@ -64,16 +70,22 @@ pub fn attach_stream_plan(
             "stream_routed_experts: invalid expert grid {num_hidden_layers}x{num_experts}"
         )));
     }
+    if first_k_dense_replace >= num_hidden_layers {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: first_k_dense_replace ({first_k_dense_replace}) \
+             must be < num_hidden_layers ({num_hidden_layers})"
+        )));
+    }
     if arch.sections.is_empty() {
         return Err(CompileError::InvalidInput(
             "stream_routed_experts: StreamArchDesc has zero sections".to_string(),
         ));
     }
-    let num_layers = num_hidden_layers;
+    let num_layers = num_hidden_layers - first_k_dense_replace;
     let num_experts_u = num_experts;
     let sections = arch.sections.len();
 
-    // Collect streamed tensors by (layer, expert, section).
+    // Collect streamed tensors by (stream_layer, expert, section).
     let mut grid: Vec<Option<&RawTensor>> =
         vec![None; (num_layers as usize) * (num_experts_u as usize) * sections];
     let mut found = 0usize;
@@ -81,16 +93,30 @@ pub fn attach_stream_plan(
         if !(arch.is_streamed)(&raw.name) {
             continue;
         }
-        let Some((layer, expert, section)) = (arch.parse)(&raw.name) else {
+        let Some((abs_layer, expert, section)) = (arch.parse)(&raw.name) else {
             return Err(CompileError::InvalidInput(format!(
                 "stream_routed_experts: cannot parse expert tensor name '{}'",
                 raw.name
             )));
         };
+        if abs_layer < first_k_dense_replace {
+            return Err(CompileError::InvalidInput(format!(
+                "stream_routed_experts: tensor '{}' is in a dense layer \
+                 (first_k_dense_replace={first_k_dense_replace})",
+                raw.name
+            )));
+        }
+        // Nextn / MTP layers are stored as model.layers.{num_hidden_layers+}
+        // (e.g. GLM-5.1 `num_nextn_predict_layers`). Keep them resident —
+        // they are outside the main MoE stream grid.
+        if abs_layer >= num_hidden_layers {
+            continue;
+        }
+        let layer = abs_layer - first_k_dense_replace;
         if layer >= num_layers || expert >= num_experts_u {
             return Err(CompileError::InvalidInput(format!(
                 "stream_routed_experts: tensor '{}' is outside the \
-                 {num_layers}x{num_experts_u} expert grid",
+                 {num_layers}x{num_experts_u} MoE expert grid",
                 raw.name
             )));
         }
@@ -116,7 +142,7 @@ pub fn attach_stream_plan(
     if found != expected {
         return Err(CompileError::InvalidInput(format!(
             "stream_routed_experts: expected {expected} routed-expert tensors \
-             (layers×experts×sections), found {found}"
+             (moe_layers×experts×sections), found {found}"
         )));
     }
 
@@ -299,7 +325,7 @@ mod tests {
             tensors,
         };
         let mut program = StorageProgram::empty(StorageTarget::default());
-        attach_stream_plan(&mut program, &metadata, 1, 2, FAKE_ARCH).unwrap();
+        attach_stream_plan(&mut program, &metadata, 1, 2, 0, FAKE_ARCH).unwrap();
 
         let stream = &program.stream;
         assert_eq!(stream.num_layers, 1);

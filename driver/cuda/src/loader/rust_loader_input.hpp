@@ -95,6 +95,8 @@ public:
                 std::max(hf.num_experts, 0)),
             .num_experts_per_tok = static_cast<std::uint32_t>(
                 std::max(hf.num_experts_per_tok, 0)),
+            .first_k_dense_replace = static_cast<std::uint32_t>(
+                std::max(hf.first_k_dense_replace, 0)),
         };
     }
 

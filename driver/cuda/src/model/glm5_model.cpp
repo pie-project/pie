@@ -10,7 +10,8 @@ Glm5Model::Glm5Model(
     DsaCache& dsa_cache,
     int tp_size,
     NcclComm* tp_comm,
-    bool emit_logits)
+    bool emit_logits,
+    ExpertStreamCache* expert_cache)
     : weights_(weights),
       hf_config_(hf_config),
       ws_(ws),
@@ -20,6 +21,7 @@ Glm5Model::Glm5Model(
     fwd_cfg_.tp_size = tp_size;
     fwd_cfg_.tp_comm = tp_comm;
     fwd_cfg_.emit_logits = emit_logits;
+    fwd_cfg_.expert_cache = expert_cache;
 
     caps_.supports_compact_logits = true;
 }

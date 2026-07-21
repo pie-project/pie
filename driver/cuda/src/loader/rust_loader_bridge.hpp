@@ -153,6 +153,7 @@ inline std::string rust_loader_compile_cache_key(
     h.update_scalar(input.model.num_hidden_layers);
     h.update_scalar(input.model.num_experts);
     h.update_scalar(input.model.num_experts_per_tok);
+    h.update_scalar(input.model.first_k_dense_replace);
     h.update_scalar(static_cast<std::uint32_t>(input.target.backend));
     h.update_scalar(input.target.tp_rank);
     h.update_scalar(input.target.tp_size);

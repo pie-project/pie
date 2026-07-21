@@ -230,9 +230,11 @@ Glm5Weights bind_glm5(const LoadedModel& engine) {
             const std::string ep =
                 mp + "experts." + std::to_string(e) + ".";
             auto& Ew = L.experts[static_cast<std::size_t>(e)];
-            Ew.gate_proj = &must(engine, ep + "gate_proj.weight");
-            Ew.up_proj   = &must(engine, ep + "up_proj.weight");
-            Ew.down_proj = &must(engine, ep + "down_proj.weight");
+            // maybe(): when stream_routed_experts is on, routed experts are
+            // absent from the WeightStore and paged via ExpertStreamCache.
+            Ew.gate_proj = maybe(engine, ep + "gate_proj.weight");
+            Ew.up_proj   = maybe(engine, ep + "up_proj.weight");
+            Ew.down_proj = maybe(engine, ep + "down_proj.weight");
             Ew.gate_quant = engine.quant_meta(ep + "gate_proj.weight");
             Ew.up_quant   = engine.quant_meta(ep + "up_proj.weight");
             Ew.down_quant = engine.quant_meta(ep + "down_proj.weight");
@@ -246,11 +248,11 @@ Glm5Weights bind_glm5(const LoadedModel& engine) {
                        t->dtype() == DType::UINT8 ||
                        t->shape().size() == 1;
             };
-            if (!is_packed(Ew.gate_proj))
+            if (Ew.gate_proj && !is_packed(Ew.gate_proj))
                 require_rank2(*Ew.gate_proj, ep + "gate_proj.weight");
-            if (!is_packed(Ew.up_proj))
+            if (Ew.up_proj && !is_packed(Ew.up_proj))
                 require_rank2(*Ew.up_proj, ep + "up_proj.weight");
-            if (!is_packed(Ew.down_proj))
+            if (Ew.down_proj && !is_packed(Ew.down_proj))
                 require_rank2(*Ew.down_proj, ep + "down_proj.weight");
         }
 

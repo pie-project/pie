@@ -396,6 +396,7 @@ pub struct PieLoaderModelConfigView {
     pub num_hidden_layers: u32,
     pub num_experts: u32,
     pub num_experts_per_tok: u32,
+    pub first_k_dense_replace: u32,
 }
 
 #[repr(C)]

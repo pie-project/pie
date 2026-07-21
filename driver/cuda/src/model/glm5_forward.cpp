@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
+#include "expert_stream_cache.hpp"
 #include "kernels/dsa_indexer.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
@@ -19,6 +21,7 @@
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/swiglu.hpp"
+#include "model/glm5_expert_sections.hpp"
 #include "model/qwen3.hpp"  // for make_weight_view
 
 namespace pie_cuda_driver::model {
@@ -451,13 +454,16 @@ void glm5_forward_paged(
 
         const auto routing =
             build_routing(topk_idx_h, topk_w_h, total_tokens, K, E);
-        for (int e = 0; e < E; ++e) {
-            const auto& tok_idx = routing.token_idx[static_cast<std::size_t>(e)];
-            const int Ne = static_cast<int>(tok_idx.size());
-            if (Ne == 0) continue;
-            const auto& wts = routing.weights[static_cast<std::size_t>(e)];
-            const auto& Ew = Lw.experts[static_cast<std::size_t>(e)];
 
+        // Dequant GEMM path for one expert given WeightViews (resident or
+        // streamed FP8 sections).
+        auto run_expert = [&](int /*e*/,
+                              const ops::WeightView& gate_w,
+                              const ops::WeightView& up_w,
+                              const ops::WeightView& down_w,
+                              const std::vector<std::int32_t>& tok_idx,
+                              const std::vector<float>& wts) {
+            const int Ne = static_cast<int>(tok_idx.size());
             CUDA_CHECK(cudaMemcpyAsync(
                 ws.route_idx.data(), tok_idx.data(),
                 static_cast<std::size_t>(Ne) * sizeof(std::int32_t),
@@ -472,25 +478,75 @@ void glm5_forward_paged(
                 static_cast<std::uint16_t*>(ws.expert_in.data()),
                 Ne, H, stream);
             ops::gemm_act_x_w(cublas.handle(),
-                ws.expert_in.data(),
-                make_expert_weight_view(Ew.gate_proj, Ew.gate_quant),
+                ws.expert_in.data(), gate_w,
                 ws.expert_gate.data(), Ne, routed_I, H);
             ops::gemm_act_x_w(cublas.handle(),
-                ws.expert_in.data(),
-                make_expert_weight_view(Ew.up_proj, Ew.up_quant),
+                ws.expert_in.data(), up_w,
                 ws.expert_up.data(), Ne, routed_I, H);
             kernels::launch_swiglu_bf16(
                 ws.expert_gate.data(), ws.expert_up.data(),
                 ws.expert_gate.data(), Ne * routed_I, stream);
             ops::gemm_act_x_w(cublas.handle(),
-                ws.expert_gate.data(),
-                make_expert_weight_view(Ew.down_proj, Ew.down_quant),
+                ws.expert_gate.data(), down_w,
                 ws.expert_out.data(), Ne, H, routed_I);
             kernels::launch_scatter_add_weighted_bf16(
                 ws.moe_out.data(), ws.expert_out.data(),
                 static_cast<const std::int32_t*>(ws.route_idx.data()),
                 static_cast<const float*>(ws.route_w.data()),
                 Ne, H, stream);
+        };
+
+        ExpertStreamCache* const expert_cache = fwd_cfg.expert_cache;
+        if (expert_cache != nullptr) {
+            std::vector<int> selected;
+            selected.reserve(static_cast<std::size_t>(E));
+            for (int e = 0; e < E; ++e) {
+                if (!routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                    selected.push_back(e);
+                }
+            }
+            // Stream plan indexes MoE layers only (absolute li remapped).
+            const int stream_li = li - cfg.first_k_dense_replace;
+            std::vector<ExpertSectionPointers> ptrs;
+            const std::size_t max_batch =
+                static_cast<std::size_t>(expert_cache->num_slots());
+            const auto& table = expert_cache->table();
+            for (std::size_t off = 0; off < selected.size();
+                 off += max_batch) {
+                const std::size_t chunk =
+                    std::min(max_batch, selected.size() - off);
+                expert_cache->ensure_resident(
+                    stream_li,
+                    std::span<const int>(selected.data() + off, chunk),
+                    stream, ptrs);
+                for (std::size_t j = 0; j < chunk; ++j) {
+                    const auto& p = ptrs[j];
+                    require_glm5_sections(p);
+                    const int e = selected[off + j];
+                    run_expert(
+                        e,
+                        glm5_gate_view(p, table),
+                        glm5_up_view(p, table),
+                        glm5_down_view(p, table),
+                        routing.token_idx[static_cast<std::size_t>(e)],
+                        routing.weights[static_cast<std::size_t>(e)]);
+                }
+            }
+        } else {
+            for (int e = 0; e < E; ++e) {
+                const auto& tok_idx =
+                    routing.token_idx[static_cast<std::size_t>(e)];
+                if (tok_idx.empty()) continue;
+                const auto& wts = routing.weights[static_cast<std::size_t>(e)];
+                const auto& Ew = Lw.experts[static_cast<std::size_t>(e)];
+                if (!Ew.gate_proj || !Ew.up_proj || !Ew.down_proj) continue;
+                run_expert(
+                    e,
+                    make_expert_weight_view(Ew.gate_proj, Ew.gate_quant),
+                    make_expert_weight_view(Ew.up_proj, Ew.up_quant),
+                    make_expert_weight_view(Ew.down_proj, Ew.down_quant),
+                    tok_idx, wts);
+            }
         }
 
         // ── Shared experts ──────────────────────────────────────────

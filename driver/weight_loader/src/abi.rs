@@ -536,6 +536,7 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
             shard_embed_tokens: true,
             mxfp4_runtime_quant: true,
             bf16_runtime_quant: true,
+            stream: Some(GLM_STREAM_ARCH),
             ..GENERIC_ARCH
         },
     ),
@@ -616,10 +617,23 @@ impl DefaultAbiBuilder<'_> {
         let Some(arch) = self.profile().stream else {
             return Err(CompileError::InvalidInput(format!(
                 "stream_routed_experts is not supported for model_type='{}' \
-                 (supported: deepseek_v4)",
+                 (supported: deepseek_v4, glm_moe_dsa)",
                 self.cfg.model_type
             )));
         };
+        // Streaming binds raw safetensors extents; MXFP4 runtime encode
+        // (TileMap) cannot run at page-in yet.
+        match self.cfg.runtime_quant.as_str() {
+            "fp4" | "mxfp4" => {
+                return Err(CompileError::InvalidInput(
+                    "stream_routed_experts cannot be combined with \
+                     runtime_quant=fp4/mxfp4 (streamed experts stay as \
+                     on-disk FP8 extents)"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
         if self.target.tp_size > 1 {
             return Err(CompileError::InvalidInput(
                 "stream_routed_experts requires tp_size=1 (per-expert TP shards \
@@ -628,10 +642,30 @@ impl DefaultAbiBuilder<'_> {
             ));
         }
         let mut skipped = 0usize;
+        let first_k = self.cfg.first_k_dense_replace;
+        let n_layers = self.cfg.num_hidden_layers;
         for raw in &self.metadata.tensors {
-            if (arch.is_streamed)(&raw.name) {
-                self.consumed.insert(raw.id);
-                skipped += 1;
+            if !(arch.is_streamed)(&raw.name) {
+                continue;
+            }
+            // Only page the main MoE bank. Absolute layer indices outside
+            // [first_k, num_hidden_layers) are dense (should not match) or
+            // nextn/MTP layers (e.g. GLM `model.layers.78` when
+            // num_hidden_layers=78) — keep those resident.
+            match (arch.parse)(&raw.name) {
+                Some((abs_layer, _, _))
+                    if abs_layer >= first_k && abs_layer < n_layers =>
+                {
+                    self.consumed.insert(raw.id);
+                    skipped += 1;
+                }
+                Some(_) => {}
+                None => {
+                    return Err(CompileError::InvalidInput(format!(
+                        "stream_routed_experts: cannot parse expert tensor name '{}'",
+                        raw.name
+                    )));
+                }
             }
         }
         if skipped == 0 {
@@ -2177,6 +2211,63 @@ const DSV4_STREAM_ARCH: crate::stream::StreamArchDesc = crate::stream::StreamArc
     parse: parse_dsv4_expert_section,
 };
 
+/// Fixed GLM-5 section order — must match `glm5_expert_sections.hpp`
+/// (gate/up/down × weight + weight_scale_inv).
+pub const GLM_EXPERT_SECTIONS: &[&str] = &[
+    "gate_proj.weight",
+    "gate_proj.weight_scale_inv",
+    "up_proj.weight",
+    "up_proj.weight_scale_inv",
+    "down_proj.weight",
+    "down_proj.weight_scale_inv",
+];
+
+/// GLM-5 routed experts:
+/// `model.layers.{L}.mlp.experts.{E}.{gate,up,down}_proj.{weight,weight_scale_inv}`.
+///
+/// Shared experts, routers, early dense MLP (`first_k_dense_replace`), and
+/// nextn/MTP layers (`L >= num_hidden_layers`) stay resident — only the main
+/// MoE bank is paged. The skip/attach path enforces the layer range; this
+/// matcher alone also matches nextn tensors by name.
+pub(crate) fn is_glm_routed_expert_tensor(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("model.layers.") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once('.') else {
+        return false;
+    };
+    rest.starts_with("mlp.experts.")
+        && ends_with_any(
+            name,
+            &[
+                ".gate_proj.weight",
+                ".gate_proj.weight_scale_inv",
+                ".up_proj.weight",
+                ".up_proj.weight_scale_inv",
+                ".down_proj.weight",
+                ".down_proj.weight_scale_inv",
+            ],
+        )
+}
+
+/// Parse `model.layers.{L}.mlp.experts.{E}.{section}` → (layer, expert, section_idx).
+pub(crate) fn parse_glm_expert_section(name: &str) -> Option<(u32, u32, usize)> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let (layer_str, rest) = rest.split_once('.')?;
+    let rest = rest.strip_prefix("mlp.experts.")?;
+    let (expert_str, section) = rest.split_once('.')?;
+    let layer: u32 = layer_str.parse().ok()?;
+    let expert: u32 = expert_str.parse().ok()?;
+    let section_idx = GLM_EXPERT_SECTIONS.iter().position(|s| *s == section)?;
+    Some((layer, expert, section_idx))
+}
+
+const GLM_STREAM_ARCH: crate::stream::StreamArchDesc = crate::stream::StreamArchDesc {
+    sections: GLM_EXPERT_SECTIONS,
+    is_streamed: is_glm_routed_expert_tensor,
+    parse: parse_glm_expert_section,
+};
+
 #[cfg(test)]
 mod stream_tests {
     use super::*;
@@ -2190,6 +2281,32 @@ mod stream_tests {
         assert!(parse_dsv4_expert_section("layers.0.ffn.shared_experts.w1.weight").is_none());
         assert!(parse_dsv4_expert_section("layers.0.ffn.gate.weight").is_none());
         assert!(parse_dsv4_expert_section("mtp.0.ffn.experts.0.w1.scale").is_none());
+    }
+
+    #[test]
+    fn parse_glm_names() {
+        assert_eq!(
+            parse_glm_expert_section(
+                "model.layers.3.mlp.experts.7.up_proj.weight_scale_inv"
+            ),
+            Some((3, 7, 3))
+        );
+        assert!(is_glm_routed_expert_tensor(
+            "model.layers.3.mlp.experts.0.gate_proj.weight"
+        ));
+        assert!(!is_glm_routed_expert_tensor(
+            "model.layers.3.mlp.shared_experts.gate_proj.weight"
+        ));
+        assert!(!is_glm_routed_expert_tensor(
+            "model.layers.0.mlp.gate_proj.weight"
+        ));
+        assert!(!is_glm_routed_expert_tensor(
+            "model.layers.3.mlp.gate.weight"
+        ));
+        assert!(parse_glm_expert_section(
+            "model.layers.3.mlp.shared_experts.gate_proj.weight"
+        )
+        .is_none());
     }
 }
 
