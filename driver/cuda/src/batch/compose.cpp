@@ -698,11 +698,13 @@ void handle_fire_batch(
             dbg_ft.resolve_end = clock::now();
             dbg_ft.compose_end = dbg_ft.resolve_end;
         }
-        // Only the SOLO device-geometry fire may carry a dense device mask;
-        // its resolved geometry equals the composed batch.
+        // A dense device mask is always solo. Its geometry may come from the
+        // descriptor resolver or remain on the ordinary wire path.
         const pipeline::FireGeometry* solo_fg =
             (dg_resolved && rpg.per_program.size() == 1 &&
-             rpg.is_device_geometry[0])
+             (rpg.is_device_geometry[0] ||
+              rpg.per_program[0].has_mask ||
+              static_cast<bool>(rpg.per_program[0].structured_mask)))
                 ? &rpg.per_program[0]
                 : nullptr;
         int structured_window_left = -2;
@@ -1162,12 +1164,20 @@ void handle_fire_batch(
                 std::vector<std::uint32_t> klen(static_cast<std::size_t>(lanes), 0);
                 std::vector<std::int32_t> mindptr(static_cast<std::size_t>(lanes) + 1, 0);
                 for (int l = 0; l < lanes; ++l) {
-                    const std::uint32_t np =
-                        (l + 1 < static_cast<int>(fg.kv_page_indptr.size()))
-                            ? fg.kv_page_indptr[l + 1] - fg.kv_page_indptr[l] : 0u;
-                    const std::uint32_t lpl =
-                        (l < static_cast<int>(fg.kv_last_page_lens.size()))
-                            ? fg.kv_last_page_lens[l] : 0u;
+                    const bool resolved_geometry =
+                        !fg.kv_page_indptr.empty();
+                    const std::uint32_t np = resolved_geometry
+                        ? ((l + 1 < static_cast<int>(fg.kv_page_indptr.size()))
+                               ? fg.kv_page_indptr[l + 1] -
+                                     fg.kv_page_indptr[l]
+                               : 0u)
+                        : kvpp_view[l + 1] - kvpp_view[l];
+                    const std::uint32_t lpl = resolved_geometry
+                        ? ((l < static_cast<int>(
+                                      fg.kv_last_page_lens.size()))
+                               ? fg.kv_last_page_lens[l]
+                               : 0u)
+                        : kvlpl_view[l];
                     klen[l] = np == 0 ? 0u : (np - 1) * page + lpl;
                     const std::uint32_t qo_len =
                         qo_view[l + 1] - qo_view[l];

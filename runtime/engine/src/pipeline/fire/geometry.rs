@@ -8,12 +8,6 @@
 //! `kv_last_page_lens`). Unit-testable in isolation against the locked
 //! bound program contract — no driver decode, no GPU.
 //!
-//! The one geometry piece that is NOT pure-from-ports is the **sugar** KV arity
-//! (`attn_working_set(&ws, &len)`, only `kv_len` bound): the page indices come
-//! from the instance's `WorkingSet` allocation, not a port — that derivation is
-//! staged for the fire wiring (needs the ws page map). This mapper fills every
-//! field the ports DO provide; absent-port fields stay empty for the caller.
-//!
 //! Complete pipeline domain API: some methods here (relaxed geometry
 //! variants, per-channel introspection, the pure `instantiate`/registry
 //! probe entry points, device-geometry lease internals) are not yet
@@ -379,13 +373,13 @@ fn const_port(container: &TraceContainer, port: Port) -> Option<&[u8]> {
 pub struct ReqGeometry {
     /// Input token ids (from `embed_tokens`).
     pub token_ids: Vec<u32>,
-    /// RoPE positions (from `positions`, else append-order `0..nnz`).
+    /// RoPE positions from the required `positions` channel.
     pub position_ids: Vec<u32>,
-    /// Per-lane token CSR (from `embed_indptr`, else one lane over all tokens).
+    /// Per-lane token CSR from the required `embed_indptr` channel.
     pub qo_indptr: Vec<u32>,
-    /// KV page slot ids (from `pages`; empty for the sugar arity — ws-derived).
+    /// KV page slot ids from the required `pages` channel.
     pub kv_page_indices: Vec<u32>,
-    /// Per-lane page CSR (from `page_indptr`; empty for the sugar arity).
+    /// Per-lane page CSR from the required `page_indptr` channel.
     pub kv_page_indptr: Vec<u32>,
     /// Valid tokens in each lane's last KV page (derived from `kv_len`).
     pub kv_last_page_lens: Vec<u32>,
@@ -647,20 +641,11 @@ pub fn map_geometry_evaluated(
 
     let mut g = ReqGeometry::default();
     g.token_ids = required_u32(Port::EmbedTokens)?;
-    let nnz = g.token_ids.len() as u32;
-
-    g.qo_indptr = optional_u32(Port::EmbedIndptr)?.unwrap_or_else(|| vec![0, nnz]);
+    g.qo_indptr = required_u32(Port::EmbedIndptr)?;
 
     let kv_len = required_u32(Port::KvLen)?;
     let lanes = g.qo_indptr.len().saturating_sub(1);
-    let (default_positions, default_pages, default_page_indptr) =
-        dense_defaults(&g.qo_indptr, &kv_len, nnz, page_size).map_err(|reason| {
-            EvaluatedGeometryError::BadValue {
-                port: Port::KvLen,
-                reason,
-            }
-        })?;
-    g.position_ids = optional_u32(Port::Positions)?.unwrap_or(default_positions);
+    g.position_ids = required_u32(Port::Positions)?;
 
     // Read-out rows distribute over lanes as LANE-RELATIVE indices (the
     // multi-row wire contract; identical to the envelope template). Absent
@@ -693,36 +678,16 @@ pub fn map_geometry_evaluated(
     g.sampling_indices = sampling_indices;
     g.sampling_indptr = sampling_indptr;
 
-    let pages = optional_u32(Port::Pages)?;
-    let page_indptr = optional_u32(Port::PageIndptr)?;
-    match (pages, page_indptr) {
-        (Some(pages), Some(indptr)) => {
-            g.kv_page_indices =
-                compact_page_envelope(container, pages, &indptr).map_err(|reason| {
-                    EvaluatedGeometryError::BadValue {
-                        port: Port::Pages,
-                        reason,
-                    }
-                })?;
-            g.kv_page_indptr = indptr;
-        }
-        (Some(pages), None) => {
-            g.kv_page_indices = compact_page_envelope(container, pages, &default_page_indptr)
-                .map_err(|reason| EvaluatedGeometryError::BadValue {
-                    port: Port::Pages,
-                    reason,
-                })?;
-            g.kv_page_indptr = default_page_indptr;
-        }
-        (None, Some(indptr)) => {
-            g.kv_page_indices = default_pages;
-            g.kv_page_indptr = indptr;
-        }
-        (None, None) => {
-            g.kv_page_indices = default_pages;
-            g.kv_page_indptr = default_page_indptr;
-        }
-    }
+    let pages = required_u32(Port::Pages)?;
+    let page_indptr = required_u32(Port::PageIndptr)?;
+    g.kv_page_indices =
+        compact_page_envelope(container, pages, &page_indptr).map_err(|reason| {
+            EvaluatedGeometryError::BadValue {
+                port: Port::Pages,
+                reason,
+            }
+        })?;
+    g.kv_page_indptr = page_indptr;
     if kv_len.len() != lanes {
         return Err(EvaluatedGeometryError::BadValue {
             port: Port::KvLen,
@@ -829,11 +794,14 @@ fn map_geometry_impl(
         None => return Err(GeometryError::NoEmbed),
     };
     g.token_ids = as_u32(Port::EmbedTokens, &tokens)?;
-    let nnz = g.token_ids.len() as u32;
-
     g.qo_indptr = match resolve_opt(container, values, Port::EmbedIndptr, relaxed)? {
         Some(b) => as_u32(Port::EmbedIndptr, &b)?,
-        None => vec![0, nnz], // one lane over all tokens
+        None if relaxed => Vec::new(),
+        None => {
+            return Err(GeometryError::BadCsr {
+                port: Port::EmbedIndptr,
+            });
+        }
     };
     let lanes = g.qo_indptr.len().saturating_sub(1);
 
@@ -842,17 +810,14 @@ fn map_geometry_impl(
         None if relaxed => None,
         None => return Err(GeometryError::BadCsr { port: Port::KvLen }),
     };
-    let defaults = kv_len
-        .as_deref()
-        .map(|lengths| dense_defaults(&g.qo_indptr, lengths, nnz, page_size))
-        .transpose()
-        .map_err(|_| GeometryError::BadCsr { port: Port::KvLen })?;
     g.position_ids = match resolve_opt(container, values, Port::Positions, relaxed)? {
         Some(b) => as_u32(Port::Positions, &b)?,
-        None => defaults
-            .as_ref()
-            .map(|(positions, _, _)| positions.clone())
-            .unwrap_or_default(),
+        None if relaxed => Vec::new(),
+        None => {
+            return Err(GeometryError::BadCsr {
+                port: Port::Positions,
+            });
+        }
     };
 
     // read-out: explicit positions, else the last token of each lane.
@@ -876,28 +841,26 @@ fn map_geometry_impl(
     let explicit_indptr = resolve_opt(container, values, Port::PageIndptr, relaxed)?
         .map(|b| as_u32(Port::PageIndptr, &b))
         .transpose()?;
-    match (explicit_pages, explicit_indptr, defaults.as_ref()) {
-        (Some(pages), Some(indptr), _) => {
+    match (explicit_pages, explicit_indptr) {
+        (Some(pages), Some(indptr)) => {
             g.kv_page_indices = compact_page_envelope(container, pages, &indptr)
                 .map_err(|_| GeometryError::BadCsr { port: Port::Pages })?;
             g.kv_page_indptr = indptr;
         }
-        (Some(pages), None, Some((_, _, indptr))) => {
-            g.kv_page_indices = compact_page_envelope(container, pages, indptr)
-                .map_err(|_| GeometryError::BadCsr { port: Port::Pages })?;
-            g.kv_page_indptr = indptr.to_vec();
+        (Some(_), None) if !relaxed => {
+            return Err(GeometryError::BadCsr {
+                port: Port::PageIndptr,
+            });
         }
-        (None, Some(indptr), Some((_, pages, _))) => {
-            g.kv_page_indices = pages.clone();
-            g.kv_page_indptr = indptr;
+        (None, Some(_)) if !relaxed => {
+            return Err(GeometryError::BadCsr { port: Port::Pages });
         }
-        (None, None, Some((_, pages, indptr))) => {
-            g.kv_page_indices = pages.clone();
-            g.kv_page_indptr = indptr.clone();
+        (Some(pages), None) => g.kv_page_indices = pages,
+        (None, Some(indptr)) => g.kv_page_indptr = indptr,
+        (None, None) if !relaxed => {
+            return Err(GeometryError::BadCsr { port: Port::Pages });
         }
-        (Some(pages), None, None) => g.kv_page_indices = pages,
-        (None, Some(indptr), None) => g.kv_page_indptr = indptr,
-        (None, None, None) => {}
+        (None, None) => {}
     }
     if let Some(kv_len) = kv_len {
         g.kv_last_page_lens = kv_len
@@ -917,50 +880,6 @@ fn last_page_len(len: u32, page_size: u32) -> u32 {
     } else {
         ((len - 1) % page_size) + 1
     }
-}
-
-fn dense_defaults(
-    qo_indptr: &[u32],
-    kv_len: &[u32],
-    token_count: u32,
-    page_size: u32,
-) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>), String> {
-    if page_size == 0
-        || qo_indptr.len() != kv_len.len() + 1
-        || qo_indptr.first().copied() != Some(0)
-        || qo_indptr.last().copied() != Some(token_count)
-        || qo_indptr.windows(2).any(|lane| lane[1] < lane[0])
-        || qo_indptr
-            .windows(2)
-            .zip(kv_len)
-            .any(|(lane, &len)| lane[1] - lane[0] > len)
-    {
-        return Err("dense geometry has inconsistent lane metadata".to_string());
-    }
-    const MAX_DENSE_PAGE_REFS: u64 = 1_048_576;
-    let page_refs = kv_len.iter().try_fold(0u64, |total, &len| {
-        total.checked_add(u64::from(len.div_ceil(page_size)))
-    });
-    if page_refs.is_none_or(|page_refs| page_refs > MAX_DENSE_PAGE_REFS) {
-        return Err("dense geometry exceeds the page-reference safety bound".to_string());
-    }
-
-    let mut positions = Vec::with_capacity(token_count as usize);
-    let mut pages = Vec::with_capacity(page_refs.unwrap() as usize);
-    let mut page_indptr = Vec::with_capacity(qo_indptr.len());
-    page_indptr.push(0);
-    for (lane, &len) in qo_indptr.windows(2).zip(kv_len) {
-        let query_len = lane[1] - lane[0];
-        let start = len
-            .checked_sub(query_len)
-            .ok_or_else(|| "KV length is shorter than its query lane".to_string())?;
-        positions.extend(start..len);
-        pages.extend(0..len.div_ceil(page_size));
-        page_indptr.push(
-            u32::try_from(pages.len()).map_err(|_| "dense page CSR exceeds u32".to_string())?,
-        );
-    }
-    Ok((positions, pages, page_indptr))
 }
 
 /// Resolve a port's value: its const payload, or the current value of the
@@ -1043,7 +962,7 @@ mod tests {
         }
     }
 
-    /// §3 sugar: embed tok (chan 0) + embed_indptr const [0,1] + kv_len (chan 1).
+    /// Minimal base fixture; tests add the required explicit geometry channels.
     fn section3_container() -> TraceContainer {
         TraceContainer {
             names: vec![],
@@ -1107,11 +1026,17 @@ mod tests {
 
     #[test]
     fn section3_single_seq_decode_geometry() {
-        let c = section3_container();
+        let mut c = section3_container();
+        add_explicit_geometry(&mut c, 1, 1);
         // tok = [42] (i32), len = [5] (u32); page_size 16.
         let values: Vec<Option<Vec<u8>>> = vec![
             Some(42i32.to_le_bytes().to_vec()),
             Some(5u32.to_le_bytes().to_vec()),
+            Some(4u32.to_le_bytes().to_vec()),
+            Some([0u32, 0].into_iter().flat_map(u32::to_le_bytes).collect()),
+            Some([0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect()),
+            Some(0u32.to_le_bytes().to_vec()),
+            Some(4u32.to_le_bytes().to_vec()),
         ];
         let g = map_geometry(&c, &values, 16).unwrap();
 
@@ -1400,19 +1325,6 @@ mod tests {
         assert_eq!(last_page_len(16, 16), 16, "a full page ends exactly");
         assert_eq!(last_page_len(17, 16), 1);
         assert_eq!(last_page_len(32, 16), 16);
-    }
-
-    #[test]
-    fn dense_defaults_reject_unbounded_page_materialization() {
-        assert!(
-            dense_defaults(&[0, 1], &[u32::MAX], 1, 16).is_err(),
-            "guest KvLen must not force an unbounded host allocation"
-        );
-    }
-
-    #[test]
-    fn dense_defaults_reject_malformed_query_csr_before_allocating() {
-        assert!(dense_defaults(&[0, u32::MAX], &[1], 1, 16).is_err());
     }
 
     fn mask_container() -> TraceContainer {

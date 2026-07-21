@@ -1072,12 +1072,12 @@ pub async fn copy_into_inner<C: FireContext>(
 }
 
 /// Shared close/drop body. Close is the sole end-of-stream verb: it rejects
-/// later submissions, releases the scheduler wait-set immediately, then
-/// drains every already-submitted FIFO operation to settlement without
-/// cancelling it. Finalization leaves committed reader cells available to
-/// channel `take` after close returns. Drop is exactly the same lifecycle
-/// plus deletion of the WIT resource.
-async fn pipeline_close_and_drain<C: FireContext>(
+/// later submissions and releases the scheduler wait-set immediately. Already
+/// settled FIFO entries are finalized opportunistically, but close never waits
+/// for an unsettled fire: a full reader ring may require a post-close `take`
+/// before the next submitted fire can settle. Channel reads and process
+/// teardown retain the FIFO and finish that drain without cancelling work.
+async fn pipeline_close_inner<C: FireContext>(
     ctx: &mut C,
     this: &Resource<Pipeline>,
 ) -> Anyhow<()> {
@@ -1092,26 +1092,17 @@ async fn pipeline_close_and_drain<C: FireContext>(
                 crate::scheduler::worker::LeaveKind::Close,
             );
         }
-        let _finalize_guard = fires.finalize_guard().await;
-        loop {
-            let fire = fires.lock().unwrap().pop_front();
-            match fire {
-                Some(f) => {
-                    let _ = finalize_op(ctx, f).await;
-                }
-                None => break,
-            }
-        }
+        drain_settled(ctx, Some(&fires)).await?;
     }
     Ok(())
 }
 
 pub async fn pipeline_close<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
-    pipeline_close_and_drain(ctx, &this).await
+    pipeline_close_inner(ctx, &this).await
 }
 
 pub async fn pipeline_drop<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
-    pipeline_close_and_drain(ctx, &this).await?;
+    pipeline_close_inner(ctx, &this).await?;
     ctx.resources().delete(this)?;
     Ok(())
 }
@@ -1676,9 +1667,14 @@ async fn fire_device_geometry<C: FireContext>(
     ticket_reservation.commit();
     {
         let p = ctx.resources().get_mut(&fwd)?;
-        let (shadow, bound, shadow_cells) =
-            (&mut p.host_shadow, &p.instance.program.bound, &p.cells);
-        shadow.advance(bound, shadow_cells);
+        let p = p.bound_mut().map_err(anyhow::Error::msg)?;
+        let crate::pipeline::instance::BoundForwardPass {
+            host_shadow,
+            instance,
+            cells,
+            ..
+        } = p;
+        host_shadow.advance(&instance.program.bound, cells);
     }
 
     pipe_fires

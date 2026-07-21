@@ -266,7 +266,7 @@ struct LaunchGrouping {
 }
 
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
-    request.has_user_mask && request.masks.is_empty() && request.device_resolved_geometry
+    request.has_user_mask && request.masks.is_empty()
 }
 
 impl LaunchGrouping {

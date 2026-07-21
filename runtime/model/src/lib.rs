@@ -62,7 +62,13 @@ pub fn register(
     // tokenizer token count, which may be smaller (qwen3: 151669 vs 151936).
     let vocab_size =
         read_snapshot_vocab_size(&tokenizer_path).unwrap_or_else(|| tokenizer.vocab_size() as u32);
-    let num_layers = read_snapshot_num_layers(&tokenizer_path).unwrap_or(1);
+    let num_layers = read_snapshot_num_layers(&tokenizer_path).ok_or_else(|| {
+        anyhow!(
+            "model config beside {} does not declare num_hidden_layers, num_layers, n_layer, \
+             or text_config.num_hidden_layers",
+            tokenizer_path.display()
+        )
+    })?;
 
     let model = Arc::new(Model {
         name,

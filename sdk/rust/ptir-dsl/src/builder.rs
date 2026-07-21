@@ -193,7 +193,12 @@ impl<'a> Builder<'a> {
                     && !has_host_put
                     && !st.seeded
                     && st.seed.is_none();
-                let host_role = if has_host_put && !has_prog_put {
+                // A seeded descriptor-only channel is replaceable through the
+                // host `set` operation after bind. It therefore needs the same
+                // device-visible Writer endpoint as an explicit host `put`,
+                // even when its initial value came from the seed table.
+                let seeded_descriptor_writer = st.seeded && has_desc_use && !has_prog_put;
+                let host_role = if (has_host_put || seeded_descriptor_writer) && !has_prog_put {
                     HostRole::Writer
                 } else if host_consumes && (!st.prog_takes.is_empty() || has_prog_put) {
                     // A host-consumed, pass-produced/loop-carried channel.

@@ -18,9 +18,9 @@ const PAGE: u32 = 16;
 // Golden C3 identity hashes (FNV-1a over the canonical container bytes). These
 // LOCK byte-identity of the channel-only descriptor lowering: a change here
 // means the emitted container bytes moved.
-const GOLDEN_S3: u64 = 3890152592550917126;
-const GOLDEN_BEAM: u64 = 12714305880244465651;
-const GOLDEN_MTP_GRAMMAR: u64 = 6531911362903278470;
+const GOLDEN_S3: u64 = 7015106236045798467;
+const GOLDEN_BEAM: u64 = 16590305409635560083;
+const GOLDEN_MTP_GRAMMAR: u64 = 12706234719755930498;
 
 fn leak<T>(v: T) -> &'static T {
     Box::leak(Box::new(v))
@@ -78,6 +78,11 @@ fn s3_traces_and_validates() {
     assert_eq!(c.stages.len(), 1, "one epilogue stage");
     assert_eq!(c.stages[0].stage, Stage::Epilogue);
     assert_eq!(c.channels.len(), 6, "tok/indptr/out/mask/len/rng");
+    assert_eq!(
+        c.channels[1].host_role,
+        ptir_dsl::ptir::container::HostRole::Writer,
+        "a seeded descriptor-only channel supports device-visible host set"
+    );
     let puts = c.stages[0]
         .ops
         .iter()

@@ -794,9 +794,8 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
                                         sidx.data() + s0, sidx.data() + s1);
             out.sampling_indptr.push_back(
                 static_cast<std::uint32_t>(out.sampling_indices.size()));
-            // No PTIR mask exists for an ordinary wire row. Keep the override
-            // unset so the model's native sliding-window policy remains active.
-            out.structured_masks.push_back({});
+            out.structured_masks.push_back(
+                resolved.per_program[p].structured_mask);
             if (any_write_desc &&
                 !detail::synthesize_wire_write_desc(
                     out, out.qo_indptr.size() - 2, page_size,
