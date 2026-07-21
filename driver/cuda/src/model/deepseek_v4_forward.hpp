@@ -9,6 +9,10 @@
 #include "ops/gemm.hpp"
 #include "tensor.hpp"
 
+namespace pie_cuda_driver {
+class ExpertStreamCache;
+}
+
 namespace pie_cuda_driver::model {
 
 struct DsV4ForwardCfg {
@@ -19,6 +23,11 @@ struct DsV4ForwardCfg {
     bool tp_greedy_argmax = false;
     void* greedy_pairs = nullptr;
     void* greedy_pairs_all = nullptr;
+    // SSD expert streaming: non-null when routed expert weights are paged
+    // on demand instead of being resident in the WeightStore. The MoE
+    // block calls ensure_resident after routing and consumes the returned
+    // slot pointers in place of `experts[e].w1->data()` etc.
+    ExpertStreamCache* expert_cache = nullptr;
 };
 
 struct DsV4Workspace {

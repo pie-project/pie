@@ -5,10 +5,13 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <cublas_v2.h>
 
 #include "model/qwen3.hpp"  // for make_weight_view
+#include "expert_stream_cache.hpp"
+#include "model/dsv4_expert_sections.hpp"
 #include "kernels/dequant_fp4.hpp"
 #include "kernels/dequant_fp8.hpp"
 #include "kernels/embed.hpp"
@@ -878,10 +881,15 @@ void dsv4_forward_paged(
                 stream);
         }
 
-        // Routed expert dispatch (MXFP4 weights, dequant to bf16)
+        // Routed expert dispatch (MXFP4 weights, dequant to bf16). Weights
+        // come either from the resident WeightStore or, when SSD expert
+        // streaming is on, from the bounded ExpertStreamCache slab.
         cudaMemsetAsync(ws.moe_out.data(), 0,
                         static_cast<std::size_t>(N) * H * 2, stream);
-        if (!Lw.experts.empty() && Lw.experts[0].w1 != nullptr) {
+        ExpertStreamCache* const expert_cache = fwd_cfg.expert_cache;
+        const bool experts_resident =
+            !Lw.experts.empty() && Lw.experts[0].w1 != nullptr;
+        if (experts_resident || expert_cache != nullptr) {
             std::vector<std::int32_t> topk_idx_h(
                 static_cast<std::size_t>(N) * K);
             std::vector<float> topk_w_h(static_cast<std::size_t>(N) * K);
@@ -896,25 +904,28 @@ void dsv4_forward_paged(
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
             const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
-            for (int e = 0; e < E; ++e) {
+
+            // Dequant + GEMM + scatter for one routed expert whose packed
+            // MXFP4 sections live at the given device pointers.
+            auto run_expert = [&](int e,
+                                  const std::uint8_t* w1,
+                                  const std::uint8_t* w1_scale,
+                                  const std::uint8_t* w2,
+                                  const std::uint8_t* w2_scale,
+                                  const std::uint8_t* w3,
+                                  const std::uint8_t* w3_scale) {
                 const auto& tok_idx = routing.token_idx[static_cast<std::size_t>(e)];
                 const int Ne = static_cast<int>(tok_idx.size());
-                if (Ne == 0) continue;
-                const auto& ew = Lw.experts[static_cast<std::size_t>(e)];
-                if (!ew.w1 || !ew.w1_scale) continue;
                 const auto& wts = routing.weights[static_cast<std::size_t>(e)];
 
                 kernels::launch_dequant_mxfp4_to_bf16(
-                    static_cast<const std::uint8_t*>(ew.w1->data()),
-                    static_cast<const std::uint8_t*>(ew.w1_scale->data()),
+                    w1, w1_scale,
                     ws.expert_gate_w.data(), local_moe_I, H, stream);
                 kernels::launch_dequant_mxfp4_to_bf16(
-                    static_cast<const std::uint8_t*>(ew.w3->data()),
-                    static_cast<const std::uint8_t*>(ew.w3_scale->data()),
+                    w3, w3_scale,
                     ws.expert_up_w.data(), local_moe_I, H, stream);
                 kernels::launch_dequant_mxfp4_to_bf16(
-                    static_cast<const std::uint8_t*>(ew.w2->data()),
-                    static_cast<const std::uint8_t*>(ew.w2_scale->data()),
+                    w2, w2_scale,
                     ws.expert_down_w.data(), H, local_moe_I, stream);
 
                 CUDA_CHECK(cudaMemcpyAsync(
@@ -955,6 +966,56 @@ void dsv4_forward_paged(
                     static_cast<const std::int32_t*>(ws.route_idx.data()),
                     static_cast<const float*>(ws.route_w.data()),
                     Ne, H, stream);
+            };
+
+            if (expert_cache != nullptr) {
+                // Selected experts for this layer, paged in in chunks of at
+                // most the cache's slot count. Pointers stay valid for the
+                // chunk: ensure_resident pins the whole batch, and the next
+                // call drains the compute stream before any eviction upload.
+                std::vector<int> selected;
+                selected.reserve(static_cast<std::size_t>(E));
+                for (int e = 0; e < E; ++e) {
+                    if (!routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                        selected.push_back(e);
+                    }
+                }
+                std::vector<ExpertSectionPointers> ptrs;
+                const std::size_t max_batch =
+                    static_cast<std::size_t>(expert_cache->num_slots());
+                for (std::size_t off = 0; off < selected.size();
+                     off += max_batch) {
+                    const std::size_t chunk =
+                        std::min(max_batch, selected.size() - off);
+                    expert_cache->ensure_resident(
+                        li,
+                        std::span<const int>(selected.data() + off, chunk),
+                        stream, ptrs);
+                    for (std::size_t j = 0; j < chunk; ++j) {
+                        const auto& p = ptrs[j];
+                        require_dsv4_sections(p);
+                        run_expert(selected[off + j],
+                                   dsv4_w1(p), dsv4_w1_scale(p),
+                                   dsv4_w2(p), dsv4_w2_scale(p),
+                                   dsv4_w3(p), dsv4_w3_scale(p));
+                    }
+                }
+            } else {
+                for (int e = 0; e < E; ++e) {
+                    if (routing.token_idx[static_cast<std::size_t>(e)].empty()) {
+                        continue;
+                    }
+                    const auto& ew = Lw.experts[static_cast<std::size_t>(e)];
+                    if (!ew.w1 || !ew.w1_scale) continue;
+                    run_expert(
+                        e,
+                        static_cast<const std::uint8_t*>(ew.w1->data()),
+                        static_cast<const std::uint8_t*>(ew.w1_scale->data()),
+                        static_cast<const std::uint8_t*>(ew.w2->data()),
+                        static_cast<const std::uint8_t*>(ew.w2_scale->data()),
+                        static_cast<const std::uint8_t*>(ew.w3->data()),
+                        static_cast<const std::uint8_t*>(ew.w3_scale->data()));
+                }
             }
         }
 
