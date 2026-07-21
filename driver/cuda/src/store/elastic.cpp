@@ -164,15 +164,8 @@ CUmemGenericAllocationHandle CudaPhysicalPool::acquire_handle(
 }
 
 void CudaPhysicalPool::release_handle(
-    CUmemGenericAllocationHandle handle,
-    std::size_t bytes,
-    bool cache) noexcept {
-    static_cast<void>(bytes);
-    static_cast<void>(cache);
+    CUmemGenericAllocationHandle handle) noexcept {
     if (handle == 0) return;
-    // An unmapped generic handle still owns physical memory. Releasing it
-    // keeps held/committed accounting exact; an uncharged handle cache could
-    // otherwise exceed the shared budget after repeated trim/grow cycles.
     cuMemRelease(handle);
 }
 
@@ -261,18 +254,39 @@ std::size_t CudaArena::target_pages(std::size_t bytes) const {
         target_committed_bytes(bytes), pool_->page_bytes());
 }
 
+std::size_t CudaArena::physical_growth_pages(std::size_t bytes) const {
+    const std::size_t target = target_committed_bytes(bytes);
+    if (target <= committed_bytes()) return 0;
+    const std::size_t needed_handles =
+        (target - committed_bytes()) / map_unit_bytes_;
+    const std::size_t new_handles =
+        needed_handles > cached_handles_.size()
+            ? needed_handles - cached_handles_.size()
+            : 0;
+    return pie::elastic::pages_for_bytes(
+        new_handles * map_unit_bytes_,
+        pool_->page_bytes());
+}
+
 void CudaArena::grow_reserved(std::size_t bytes) {
     const std::size_t target = target_committed_bytes(bytes);
     if (target <= committed_bytes()) return;
     const std::size_t old_count = handles_.size();
+    const std::size_t old_cached_count = cached_handles_.size();
     try {
         while (committed_bytes() < target) {
             CUmemAllocationProp prop{};
             prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = pool_->device_ordinal();
-            CUmemGenericAllocationHandle handle =
-                pool_->acquire_handle(map_unit_bytes_);
+            const bool reused = !cached_handles_.empty();
+            CUmemGenericAllocationHandle handle = 0;
+            if (reused) {
+                handle = cached_handles_.back();
+                cached_handles_.pop_back();
+            } else {
+                handle = pool_->acquire_handle(map_unit_bytes_);
+            }
             const CUdeviceptr address =
                 base_ + handles_.size() * map_unit_bytes_;
             bool mapped = false;
@@ -295,33 +309,45 @@ void CudaArena::grow_reserved(std::size_t bytes) {
                 if (mapped) {
                     cuMemUnmap(address, map_unit_bytes_);
                 }
-                pool_->release_handle(handle, map_unit_bytes_, true);
+                if (reused) {
+                    cached_handles_.push_back(handle);
+                } else {
+                    pool_->release_handle(handle);
+                }
                 throw;
             }
             handles_.push_back(handle);
         }
     } catch (...) {
-        rollback_reserved(old_count * map_unit_bytes_);
+        rollback_reserved(
+            old_count * map_unit_bytes_,
+            old_cached_count);
         throw;
     }
 }
 
-void CudaArena::rollback_reserved(std::size_t bytes) noexcept {
+void CudaArena::rollback_reserved(
+    std::size_t bytes,
+    std::size_t cached_handle_count) noexcept {
     const std::size_t target = align_up(bytes, map_unit_bytes_);
     while (committed_bytes() > target && !handles_.empty()) {
         const std::size_t index = handles_.size() - 1;
         cuMemUnmap(base_ + index * map_unit_bytes_, map_unit_bytes_);
-        pool_->release_handle(handles_.back(), map_unit_bytes_, false);
+        if (cached_handles_.size() < cached_handle_count) {
+            cached_handles_.push_back(handles_.back());
+        } else {
+            pool_->release_handle(handles_.back());
+        }
         handles_.pop_back();
     }
 }
 
 void CudaArena::ensure_committed(std::size_t bytes) {
     const std::size_t before = committed_bytes();
+    const std::size_t cached_before = cached_handles_.size();
     const std::size_t target = target_committed_bytes(bytes);
     if (target <= before) return;
-    const std::size_t logical_pages =
-        pie::elastic::pages_for_bytes(target - before, pool_->page_bytes());
+    const std::size_t logical_pages = physical_growth_pages(bytes);
     if (!pool_->try_reserve(logical_pages)) {
         throw std::runtime_error(
             label_ + ": shared physical pool budget exhausted");
@@ -330,7 +356,7 @@ void CudaArena::ensure_committed(std::size_t bytes) {
         grow_reserved(bytes);
         pool_->mark_committed(logical_pages);
     } catch (...) {
-        rollback_reserved(before);
+        rollback_reserved(before, cached_before);
         pool_->unreserve(logical_pages);
         throw;
     }
@@ -338,17 +364,29 @@ void CudaArena::ensure_committed(std::size_t bytes) {
 
 void CudaArena::release_tail(std::size_t target_bytes) noexcept {
     const std::size_t target = align_up(target_bytes, map_unit_bytes_);
-    const std::size_t before = committed_bytes();
+    const std::size_t target_handles = target / map_unit_bytes_;
+    const std::size_t cache_goal = target_handles >= 2 ? 1 : 0;
+    std::size_t released_bytes = 0;
     while (committed_bytes() > target && !handles_.empty()) {
         const std::size_t index = handles_.size() - 1;
         cuMemUnmap(base_ + index * map_unit_bytes_, map_unit_bytes_);
-        pool_->release_handle(
-            handles_.back(), map_unit_bytes_, false);
+        if (cached_handles_.size() < cache_goal) {
+            cached_handles_.push_back(handles_.back());
+        } else {
+            pool_->release_handle(handles_.back());
+            released_bytes += map_unit_bytes_;
+        }
         handles_.pop_back();
     }
-    const std::size_t released = before - committed_bytes();
+    while (cached_handles_.size() > cache_goal) {
+        pool_->release_handle(cached_handles_.back());
+        cached_handles_.pop_back();
+        released_bytes += map_unit_bytes_;
+    }
     const std::size_t pages =
-        pie::elastic::pages_for_bytes(released, pool_->page_bytes());
+        pie::elastic::pages_for_bytes(
+            released_bytes,
+            pool_->page_bytes());
     pool_->mark_uncommitted(pages);
 }
 
@@ -459,7 +497,9 @@ CudaCommitResult commit_cuda_arena_targets_atomically(
     struct Growth {
         CudaArena* arena = nullptr;
         std::size_t before = 0;
+        std::size_t cached_before = 0;
         std::size_t target = 0;
+        bool grow = false;
         std::size_t delta_pages = 0;
     };
     std::vector<Growth> growth;
@@ -483,11 +523,9 @@ CudaCommitResult commit_cuda_arena_targets_atomically(
             const std::size_t arena_target_pages =
                 pie::elastic::pages_for_bytes(
                     committed_target, pool->page_bytes());
+            const bool arena_grow = committed_target > before;
             const std::size_t arena_delta_pages =
-                committed_target > before
-                    ? pie::elastic::pages_for_bytes(
-                          committed_target - before, pool->page_bytes())
-                    : 0;
+                arena->physical_growth_pages(arena_target);
             if (required_pages >
                     std::numeric_limits<std::size_t>::max() -
                         arena_target_pages ||
@@ -499,7 +537,14 @@ CudaCommitResult commit_cuda_arena_targets_atomically(
             required_pages += arena_target_pages;
             delta_pages += arena_delta_pages;
             growth.push_back(
-                {arena.get(), before, arena_target, arena_delta_pages});
+                {
+                    arena.get(),
+                    before,
+                    arena->cached_handle_count(),
+                    arena_target,
+                    arena_grow,
+                    arena_delta_pages,
+                });
         }
     }
 
@@ -521,14 +566,16 @@ CudaCommitResult commit_cuda_arena_targets_atomically(
     }
     try {
         for (auto& item : growth) {
-            if (item.delta_pages != 0) {
+            if (item.grow) {
                 item.arena->grow_reserved(item.target);
             }
         }
         pool->mark_committed(delta_pages);
     } catch (...) {
         for (auto it = growth.rbegin(); it != growth.rend(); ++it) {
-            it->arena->rollback_reserved(it->before);
+            it->arena->rollback_reserved(
+                it->before,
+                it->cached_before);
         }
         pool->unreserve(delta_pages);
         throw;

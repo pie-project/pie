@@ -753,7 +753,11 @@ impl DriverLane {
         let _ = match &request {
             LaneRequest::Launch { .. }
             | LaneRequest::Prepare { .. }
-            | LaneRequest::Release { .. } => self.launch_tx.send(request),
+            | LaneRequest::Release { .. }
+            | LaneRequest::Control {
+                item: QueuedItem::ResizePool { .. },
+                ..
+            } => self.launch_tx.send(request),
             LaneRequest::Control { .. } | LaneRequest::Shutdown { .. } => {
                 self.control_tx.send(request)
             }

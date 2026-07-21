@@ -46,10 +46,7 @@ class CudaPhysicalPool final : public pie::elastic::PhysicalPool {
         std::size_t safety_floor_bytes,
         bool reset_hard_ceiling);
     CUmemGenericAllocationHandle acquire_handle(std::size_t bytes);
-    void release_handle(
-        CUmemGenericAllocationHandle handle,
-        std::size_t bytes,
-        bool cache) noexcept;
+    void release_handle(CUmemGenericAllocationHandle handle) noexcept;
     bool should_fail_mapping_for_test();
     void fail_mapping_after_for_test(std::size_t successful_mappings);
 
@@ -85,8 +82,14 @@ class CudaArena final : public pie::elastic::Arena {
     std::size_t max_bytes() const noexcept { return max_bytes_; }
     std::size_t target_committed_bytes(std::size_t bytes) const;
     std::size_t target_pages(std::size_t bytes) const;
+    std::size_t physical_growth_pages(std::size_t bytes) const;
     void grow_reserved(std::size_t bytes);
-    void rollback_reserved(std::size_t bytes) noexcept;
+    void rollback_reserved(
+        std::size_t bytes,
+        std::size_t cached_handle_count) noexcept;
+    std::size_t cached_handle_count() const noexcept {
+        return cached_handles_.size();
+    }
 
   private:
     static std::size_t align_up(std::size_t value, std::size_t alignment);
@@ -99,6 +102,7 @@ class CudaArena final : public pie::elastic::Arena {
     std::size_t virtual_bytes_ = 0;
     std::size_t map_unit_bytes_ = 0;
     std::vector<CUmemGenericAllocationHandle> handles_;
+    std::vector<CUmemGenericAllocationHandle> cached_handles_;
 };
 
 enum class CudaCommitOutcome {

@@ -60,22 +60,23 @@ int clamp_pow2_nearest(int value, int lo, int hi) {
 
 
 void min_into(CudaMemoryPlan& dst, const CudaMemoryPlan& src) {
-    dst.kv_page_size = std::min(dst.kv_page_size, src.kv_page_size);
+    if (src.kv_page_size < dst.kv_page_size) {
+        dst.kv_page_size = src.kv_page_size;
+        dst.kv_page_bytes = src.kv_page_bytes;
+    } else if (src.kv_page_size == dst.kv_page_size) {
+        dst.kv_page_bytes = std::max(
+            dst.kv_page_bytes, src.kv_page_bytes);
+    }
     dst.max_workspace_tokens = std::min(dst.max_workspace_tokens,
                                         src.max_workspace_tokens);
     dst.max_requests = std::min(dst.max_requests, src.max_requests);
     dst.max_page_refs = std::min(dst.max_page_refs, src.max_page_refs);
-    dst.kv_pages = std::min(dst.kv_pages, src.kv_pages);
-    dst.state_slots = std::min(dst.state_slots, src.state_slots);
     dst.attn_float_workspace_bytes = std::max(
         dst.attn_float_workspace_bytes, src.attn_float_workspace_bytes);
     dst.runtime_quant_scratch_bytes = std::max(
         dst.runtime_quant_scratch_bytes, src.runtime_quant_scratch_bytes);
     dst.persistent_input_bytes = std::max(
         dst.persistent_input_bytes, src.persistent_input_bytes);
-    dst.arena_bytes = std::max(dst.arena_bytes, src.arena_bytes);
-    dst.kv_bytes = std::min(dst.kv_bytes, src.kv_bytes);
-    dst.state_bytes = std::min(dst.state_bytes, src.state_bytes);
     dst.capacity.max_forward_tokens = std::min(
         dst.capacity.max_forward_tokens, src.capacity.max_forward_tokens);
     dst.capacity.max_forward_requests = std::min(
@@ -632,21 +633,20 @@ CudaMemoryPlan plan_cuda_memory(
             if (arena + persistent_bytes >= budget) continue;
 
             int R = R0;
-            int state_slots = 0;
-            std::size_t state_bytes = 0;
-            if (state_slot_bytes > 0) {
-                const std::size_t affordable =
-                    (budget - arena - persistent_bytes) / state_slot_bytes;
-                state_slots = static_cast<int>(
-                    std::min<std::size_t>(static_cast<std::size_t>(R), affordable));
-                if (state_slots <= 0) continue;
-                R = std::min(R, state_slots);
-                state_bytes = static_cast<std::size_t>(state_slots) * state_slot_bytes;
+            const int state_slots = state_slot_bytes > 0 ? R : 0;
+            const std::size_t state_bytes =
+                static_cast<std::size_t>(state_slots) * state_slot_bytes;
+            const std::size_t minimum_wave_kv_bytes =
+                static_cast<std::size_t>(R) * per_page_bytes;
+            if (arena + persistent_bytes >= budget ||
+                state_bytes > budget - arena - persistent_bytes ||
+                minimum_wave_kv_bytes >
+                    budget - arena - persistent_bytes - state_bytes) {
+                continue;
             }
-            if (arena + persistent_bytes + state_bytes >= budget) continue;
-            const std::size_t remaining =
-                budget - arena - persistent_bytes - state_bytes;
-            const int kv_pages = static_cast<int>(remaining / per_page_bytes);
+            const int kv_pages = static_cast<int>(std::min<std::size_t>(
+                static_cast<std::size_t>(std::numeric_limits<int>::max()),
+                budget / per_page_bytes));
             if (kv_pages <= 0) continue;
             const std::size_t kv_tokens =
                 static_cast<std::size_t>(kv_pages) * kv_page_size;
@@ -682,14 +682,10 @@ CudaMemoryPlan plan_cuda_memory(
             p.max_workspace_tokens = N;
             p.max_requests = R;
             p.max_page_refs = std::max(262144, R * 512);
-            p.kv_pages = kv_pages;
-            p.state_slots = state_slots;
+            p.kv_page_bytes = per_page_bytes;
             p.attn_float_workspace_bytes = attn_float_bytes;
             p.runtime_quant_scratch_bytes = runtime_quant_scratch_bytes;
             p.persistent_input_bytes = persistent_bytes;
-            p.arena_bytes = arena;
-            p.kv_bytes = static_cast<std::size_t>(kv_pages) * per_page_bytes;
-            p.state_bytes = state_bytes;
             p.capacity = PlannedForwardLimits{
                 N,
                 R,
@@ -729,7 +725,9 @@ CudaMemoryPlan plan_cuda_memory(
             const double kv_headroom_penalty =
                 kv_headroom < min_headroom ? (min_headroom - kv_headroom) : 0.0;
             const double pressure =
-                static_cast<double>(arena + state_bytes) /
+                static_cast<double>(
+                    arena + persistent_bytes + state_bytes +
+                    minimum_wave_kv_bytes) /
                 static_cast<double>(budget);
             double page_score = 0.0;
             if (score_as_auto) {
@@ -984,17 +982,18 @@ CudaMemoryPlan plan_cuda_memory(
                   << " N=" << p.max_workspace_tokens
                   << " R=" << p.max_requests
                   << " page_refs=" << p.max_page_refs
-                  << " arena=" << (p.arena_bytes / (1024 * 1024)) << " MiB"
                   << " persistent_inputs="
                   << (p.persistent_input_bytes / (1024 * 1024)) << " MiB"
                   << " rq_scratch="
                   << (p.runtime_quant_scratch_bytes / (1024 * 1024))
                   << " MiB"
-                  << " kv_pages=" << p.kv_pages
+                  << " logical_kv_pages="
+                  << (budget / p.kv_page_bytes)
                   << " kv_tokens="
-                  << (static_cast<std::size_t>(p.kv_pages) *
-                      p.kv_page_size)
-                  << " state_slots=" << p.state_slots
+                  << ((budget / p.kv_page_bytes) *
+                      static_cast<std::size_t>(p.kv_page_size))
+                  << " logical_state_slots="
+                  << (state_slot_bytes == 0 ? 0 : p.max_requests)
                   << "\n";
     }
     return best_plan;

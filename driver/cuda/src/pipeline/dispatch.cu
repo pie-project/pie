@@ -2788,7 +2788,16 @@ void Dispatch::close_instance(std::uint64_t instance_id) {
 
 int Dispatch::close_channel(std::uint64_t channel_id, std::string* err) {
     if (err) err->clear();
-    return impl_->channels.close_endpoint(channel_id, err)
+    drain_reaped_instances(*impl_);
+    const bool has_active_attachment = std::any_of(
+        impl_->instances.begin(),
+        impl_->instances.end(),
+        [channel_id](const auto& entry) {
+            const auto& ids = entry.second.channel_ids;
+            return std::find(ids.begin(), ids.end(), channel_id) != ids.end();
+        });
+    return impl_->channels.close_endpoint(
+               channel_id, err, !has_active_attachment)
         ? PIE_STATUS_OK
         : (impl_->channels.contains(channel_id)
                ? PIE_STATUS_INVALID_ARGUMENT

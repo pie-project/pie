@@ -2,11 +2,11 @@
 
 Date: 2026-07-21
 
-Baseline commits: `faa0e9d4`, `ef314886`, `555b2d35`; C2/E4 changes are
-currently uncommitted.
+Implementation commits through `b4db0531`; this report includes the final
+planner, pressure, trim-order, and E5 validation delta.
 
-Status: **local CUDA TP1 admission implemented; overall E0-E5 plan remains
-partial**
+Status: **local CUDA TP1 and Metal elastic admission implemented and
+validated; Remote and CUDA TP admission remain capability-gated**
 
 ## 1. Executive summary
 
@@ -23,17 +23,21 @@ The implementation now establishes:
   statistics, tickets, or ordinary retry budget.
 - Metal KV, state, and scratch allocations use placement-sparse private buffers
   backed by shared placement-heap chunks.
+- Metal uses the same ABI-v12 prepare/lease contract, with atomic multi-buffer
+  growth, rollback, trim exclusion while leases exist, and owner-thread
+  retirement.
 - The runtime periodically derives safe KV and RS high-waters and requests
   KV/state/workspace trim.
 
 The CUDA implementation was built and extensively tested on the local RTX 4090.
 It is performance-neutral and returns committed memory after idle. The Metal
-implementation was intentionally not built or tested.
+implementation and embedded worker were built on the Mac Studio; the complete
+Metal CTest suite, sparse lifecycle, pressure gates, and raw probes passed on
+the live AGX device.
 
-This is **not yet the complete architecture described in the plan**. Remote,
-Metal, and CUDA TP admission are deliberately capability-gated rather than
-claimed correct. The CUDA planner still freezes logical pool capacities, and the
-Metal idle-release path retains its pre-existing final-release issue.
+Remote and CUDA TP admission remain deliberately capability-gated rather than
+claimed correct. Remote needs a lease contract that survives post-scheduler
+coalescing, and TP needs all-rank atomic prepare/abort.
 
 ## 2. Implemented
 
@@ -97,10 +101,12 @@ be committed before replay.
 
 The physical accounting budget is recalibrated after fixed allocation/graph
 capture and before every preparation, using one safety floor and never dropping
-below charged pages. `charged = committed + held <= budget`; cached generic
-handles were removed so unmapped memory cannot escape accounting. Budget and
-release changes advance a generation. A 32 MiB default VMM handle size is used,
-reduced to allocation granularity for smaller arenas.
+below charged pages. `charged = committed + held <= budget`; every retained
+arena-local hysteresis handle remains in `committed`, so unmapped memory cannot
+escape accounting. Partial trims may retain one handle only when at least two
+handles remain mapped; deep/idle trim releases the cache. Budget and release
+changes advance a generation. `PIE_CUDA_VMM_HANDLE_MB` selects 2--64 MiB, with
+32 MiB as the validated default.
 
 ### 2.3 Metal
 
@@ -125,6 +131,11 @@ Converted:
 Paged-KV resize no longer allocates replacement buffers, copies live pages, or
 rebinds argument tables.
 
+Metal launch preparation computes exact KV/state/token-row demand, atomically
+commits every required sparse buffer, and returns a one-shot ABI-v12 lease.
+Failure restores all buffers to their prior commitments. Trim is rejected while
+any prepared or in-flight lease exists.
+
 ### 2.4 Runtime trim policy
 
 Every 10 seconds the runtime:
@@ -136,19 +147,29 @@ Every 10 seconds the runtime:
 5. Trims transient workspace backing to zero.
 
 Logical KV capacity and device virtual addresses remain unchanged. A later fire
-recommits backing before dispatch.
+recommits backing before dispatch. Resize commands share the launch/prepare FIFO
+rather than the ordinary control queue; this prevents a later prepare from
+overtaking a pending trim and republishing a stale admission watermark.
+
+On macOS, a `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` source updates an atomic
+admission level. Warning pressure lowers the growth budget to 50%; critical
+pressure lowers it to `PIE_METAL_PRESSURE_FLOOR_BYTES` (zero by default).
+Existing commitments are grandfathered, but no new physical growth can exceed
+the pressured budget.
 
 ## 3. CUDA validation
 
 ### 3.1 Build and unit coverage
 
 - Full `pie-worker --features driver-cuda` build passed.
-- CUDA VMM grow/trim/remap plus injected second-arena rollback passed.
+- Complete CUDA CTest suite: 45/45 passed.
+- CUDA VMM grow/trim/remap, arena-local cache reuse, and injected rollback
+  after cached-handle reuse passed.
 - KV quantized-cache test passed.
 - Swap-pool test passed.
-- Runtime engine library: 334/334 passed (including deterministic
+- Runtime engine library: 359/359 passed (including deterministic
   exhausted/impossible admission and unchanged-proposal tests).
-- Driver ABI: 28/28 passed.
+- Driver ABI: 28 unit checks plus 2 C/C++ layout checks passed.
 - Dummy one-shot lease consume/release regression passed.
 - Worker library: 60 passed, 1 ignored.
 
@@ -164,6 +185,14 @@ Passed:
 - Real CUDA boot
 - Real plain generation
 - Real 256-request concurrent generation
+
+The complete CTest gate also exposed two inherited PTIR lifecycle defects:
+asynchronous instance retirement made immediate channel close fail permanently,
+and standalone tier-0 tests did not settle grouped channel initialization.
+Deferred channel retirement now uses one per-channel pending-close bit without
+blocking the driver lane, and standalone runners use the production settlement
+boundary. The c0 close warnings disappeared and the affected race/bind/runner
+tests pass.
 
 Two hardware fixtures fail before entering the driver:
 
@@ -199,6 +228,12 @@ Results:
 
 All candidate runs completed 256/256 with zero demotions.
 
+The final FlashInfer 0.6.15 + planner-boundary + E5 source measured
+47,117.60 tok/s median (47,117.60 / 46,772.25 / 47,197.19), with 133 batches,
+256/256 completions, and zero demotions in all three runs. Peak physical KV
+demand was 2,816 of 12,634 independently derived logical pages. Its serial
+oracle matched the pre-E5 ABI-v12 control 256/256 hashes.
+
 Serial oracle:
 
 - 256/256 requests completed
@@ -216,11 +251,35 @@ Persistent-server c0/256:
 | After idle trim | 3,982 MiB |
 | Returned | **19,068 MiB** |
 
-## 4. Not implemented or incomplete
+That table is the original no-live-root lifecycle gate. With the current
+text-completion lifecycle, the final persistent cross-check was 3,960 MiB at
+boot and 8,728 MiB both immediately after c0/256 and after 22 seconds. The
+remaining pages are still live according to the runtime high-water; the trim
+path correctly does not invent eviction. The independently measured deep-trim
+first-wave gate below uses no retained wide c0 working set.
+
+### 3.5 E5 handle and first-touch gates
+
+Same-binary c0/256, interleaved n=3:
+
+| VMM handle | Median output tok/s |
+|---|---:|
+| 2 MiB | 44,766.00 |
+| 32 MiB | 46,813.44 |
+| 64 MiB | 46,853.66 |
+
+All nine runs completed 256/256 with 133 batches. 64 MiB was only +0.09%
+versus 32 MiB, while 2 MiB was -4.37%; 32 MiB remains the default.
+
+On one persistent server, a one-request first wave measured 41.36 ms TTFT
+before deep trim and 41.19 ms after the 10-second trim boundary. No
+background warmup was added because no first-touch regression was observed.
+
+## 4. Remaining scope and resolved audit items
 
 ### 4.1 Admission scope and gates
 
-The E4 invariant is implemented for local CUDA TP1:
+The E4 invariant is implemented for local CUDA TP1 and Metal:
 
 - Preparation performs full launch/resource/PTIR validation.
 - KV, state, workspace, and attention targets are rounded per CUDA arena.
@@ -233,8 +292,8 @@ The E4 invariant is implemented for local CUDA TP1:
   until stream retirement.
 - The scheduler caches the highest driver-prepared KV/state demand. Waves below
   that watermark use the already-committed mappings without a second
-  driver-lane round trip; any pool-resize command invalidates the watermark
-  before it is queued.
+  driver-lane round trip; pool resize invalidates the watermark and is ordered
+  in the same FIFO as prepare/launch.
 
 The inferlet/attention lifecycle merge channelized `EmbedIndptr`, `Readout`, and
 flat single-lane `Pages`. CUDA now verifies those channel shapes and preserves
@@ -251,29 +310,25 @@ Post-merge gates on the migrated c0/256 guest:
 - ABI, engine, dummy-driver, SDK, CUDA rollback, decode-envelope contract,
   parity, canary, and entry-validation suites passed.
 
-This claim does **not** extend to Remote, Metal, or TP. Remote post-scheduler
-coalescing would invalidate a worker-side lease, Metal has no C2 implementation,
-and TP needs all-rank atomic prepare/abort. All three use the existing unprepared
-path and report prepare unsupported.
+This claim does **not** extend to Remote or CUDA TP. Remote post-scheduler
+coalescing would invalidate a worker-side lease, and TP needs all-rank atomic
+prepare/abort. Both report prepare unsupported.
 
-### 4.2 Logical pool boundaries remain
+### 4.2 Planner physical pool boundaries removed
 
-The CUDA memory planner still computes and freezes:
+The CUDA planner lattice now selects only:
 
-- `kv_pages`
-- `state_slots`
-- workspace shape limits
-- `arena_bytes`
+- KV page size
+- Forward token/request/page-reference shape limits
+- Object-to-byte coefficients such as `kv_page_bytes`
 
-Physical commits share one accounting pool, but logical capacity cannot move
-freely between KV, state, and workspace. The planner lattice and per-pool
-capacity fields have not been deleted.
-
-This boundary was intentionally not changed speculatively. Correct deletion
-needs the active planner lifecycle work to define bounded logical KV/RS ceilings
-while preserving c0 capacity, the hidden non-page-zero graph padding allocation,
-and recurrent-state initialization. The C2 patch therefore keeps virtual/index
-shape ceilings and explicit `total_pages` behavior unchanged.
+`CudaMemoryPlan::kv_pages`, `state_slots`, `arena_bytes`, `kv_bytes`, and
+`state_bytes` are deleted. Context derives the KV logical/VA ceiling from the
+shared elastic budget divided by `kv_page_bytes`; an explicit `total_pages`
+configuration remains a hard operator clamp. State logical capacity equals the
+selected request shape when recurrent state exists. Workspace virtual capacity
+comes from the selected forward shape. ABI-v12 admission is the only physical
+concurrency partition.
 
 ### 4.3 CUDA graph padding is demand-proportional
 
@@ -358,59 +413,50 @@ The C1 residual conversion landed after the page-0 alias:
 stub. There is therefore no DSA device pool to convert until the indexer cache
 itself is implemented.
 
-### 4.5 Metal final release bug
+### 4.5 Metal final release resolved
 
 Metal unmap operations enqueue heap/alias objects in
-`pending_elastic_releases`. Those objects are collected only when another
-mapping operation begins.
+`pending_elastic_releases`. Trim now drains the mapping event on the owner
+thread, removes completed heaps from the residency set, commits the residency
+change, and drops both heap and alias retention before returning. Final context
+destruction also drains the last event. Live grow/trim/regrow/final-release
+coverage observes zero pending releases.
 
-If the system becomes completely idle immediately after trim:
+### 4.6 Metal memory pressure integrated
 
-- The unmap can complete.
-- No later mapping call collects the pending objects.
-- The placement heap may remain retained/resident.
-- Immediate return to the OS is not guaranteed.
-
-This must be fixed before claiming the macOS idle-footprint goal. Collection
-needs an event completion callback, timer, or other post-unmap retirement path
-that runs without requiring another mapping operation.
-
-### 4.6 Metal memory pressure
-
-No `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` hook exists. Critical/warning pressure
-does not currently:
-
-- Bypass trim hysteresis
-- Force immediate safe-tail trim
-- Reduce admission
+A dispatch memory-pressure source reduces admission as described in section
+2.4. The driver does not invent a safe-tail high-water under pressure; physical
+release remains runtime-owned and occurs at the next ordered trim boundary.
+Forcing immediate trim would require a new driver-to-runtime callback or
+duplicated liveness state, so the simpler correctness-preserving policy is
+growth denial plus the existing 10-second trim.
 
 ### 4.7 E0 probes and Metal validation
 
-The planned probe sources were not landed:
+The planned sources are landed under `driver/metal/tools/rawmetal/`:
 
 - `sparse_probe.mm`
 - `sparse_probe2.mm`
 - `sparse_probe3.mm`
-- CUDA VMM latency/granularity microbench
 
-Metal was not built or tested, per operator request. The Objective-C++ code uses
-the measured Metal 4 API shape, but compilation and behavior remain unverified.
+They cover stable sparse VA grow/trim/final release, atomic over-budget
+rollback, and alias copy integrity across trim/regrow. All three compile and
+run on the Mac Studio. The full Metal CTest suite passes 20/20; extended sparse
+lifecycle and pressure coverage passes 23/23; `pie-worker --features
+driver-metal` builds with Rust 1.97.1.
 
-### 4.8 Remaining cleanup and knobs
+### 4.8 Completed cleanup and knobs
 
-Not completed:
-
-- E5 deletion of obsolete planner fields and paths
-- Configurable CUDA handle size and 2-64 MiB A/B
-- First-touch background warmup after deep trim
-- Full logical planner-boundary deletion
-- On-device/jetsam integration
+- Obsolete planner capacity/byte fields are deleted.
+- CUDA handle size is configurable and the 2/32/64 MiB gate is recorded.
+- Arena-local handle hysteresis is budget-accounted and deep-trim-safe.
+- Deep-trim first-touch was measured; background warmup was unnecessary.
 
 ## 5. Claims that are currently valid
 
 It is valid to claim:
 
-- CUDA and Metal elastic backing implementations exist.
+- CUDA and Metal elastic backing and local ABI-v12 admission are implemented.
 - CUDA VMM virtual addresses remain stable across remap.
 - CUDA is performance-neutral on c0/256.
 - CUDA idle trim returns committed VRAM.
@@ -418,25 +464,22 @@ It is valid to claim:
   prepared launch, and its one-shot lease prevents unsafe trim.
 - Exhausted wait-all proposals are deferred without consuming wave state.
 - Metal paged-KV no longer uses realloc-copy growth.
+- Metal sparse retirement, rollback, pressure admission, and live build/test
+  gates pass on macOS.
+- CUDA planner physical pool partitions and obsolete capacity fields are
+  removed.
 
 It is **not** yet valid to claim:
 
-- The complete E0-E5 plan is implemented.
-- Prepare/lease correctness for Remote, Metal, or CUDA TP.
-- Logical KV/RS/workspace boundaries are removed.
-- Metal idle trim reliably returns memory to the OS.
-- Metal behavior or performance has passed validation.
+- Prepare/lease correctness for Remote or CUDA TP.
+- Immediate memory-pressure trim before the next runtime trim boundary.
+- End-to-end Metal model throughput parity; the validated Metal scope is build,
+  driver tests, sparse lifecycle, and ABI admission.
 
-## 6. Recommended completion order
+## 6. Remaining distributed work
 
-1. Fix Metal post-unmap heap retirement.
-2. Build and run the Metal implementation and land the probe assets.
-3. Define and implement bounded logical KV/RS ceilings, then delete the old
-   planner partition coupling.
-4. Keep the landed page-0 graph-padding canaries and physical high-water ABI
-   contract in CUDA CI.
-5. Add Metal memory-pressure handling.
-6. Add all-rank prepare/abort before enabling CUDA TP admission.
-7. Design worker-side preparation that survives remote coalescing before
+1. Keep the landed page-0 graph-padding canaries, physical high-water ABI, and
+   elastic lifecycle assertions in CI.
+2. Add all-rank prepare/abort before enabling CUDA TP admission.
+3. Design worker-side preparation that survives remote coalescing before
    enabling Remote.
-8. Run CUDA handle-size and first-touch latency A/B.

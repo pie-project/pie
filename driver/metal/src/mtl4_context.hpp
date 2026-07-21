@@ -180,6 +180,7 @@ class RawMetalContext {
     size_t elastic_page_bytes() const;
     size_t elastic_budget_pages() const;
     size_t elastic_committed_pages() const;
+    void set_memory_pressure_level_for_test(std::uint32_t level);
     void drain_elastic_mappings();
     size_t pending_elastic_release_count() const;
 

@@ -121,6 +121,35 @@ int main() {
     tight->release_elastic_buffer(tight_a);
     tight->release_elastic_buffer(tight_b);
 
+    auto pressure = RawMetalContext::create(4u << 20, 8u << 20);
+    SlotHandle pressure_a = pressure->create_elastic_buffer(4u << 20);
+    SlotHandle pressure_b = pressure->create_elastic_buffer(4u << 20);
+    pressure->set_memory_pressure_level_for_test(1);
+    expect(
+        pressure->elastic_budget_pages() == 2 &&
+            !pressure->ensure_elastic_buffers_atomically({
+                {pressure_a, 4u << 20},
+                {pressure_b, 4u << 20},
+            }),
+        "warning pressure halves admission budget");
+    expect(
+        pressure->elastic_committed_pages() == 0,
+        "pressure rejection leaves every buffer uncommitted");
+    pressure->set_memory_pressure_level_for_test(0);
+    expect(
+        pressure->ensure_elastic_buffer(pressure_a, 4u << 20),
+        "normal pressure restores the configured budget");
+    const auto committed_before_critical =
+        pressure->elastic_committed_pages();
+    pressure->set_memory_pressure_level_for_test(2);
+    expect(
+        !pressure->ensure_elastic_buffer(pressure_b, 4u << 20) &&
+            pressure->elastic_committed_pages() ==
+                committed_before_critical,
+        "critical pressure blocks growth without disturbing committed storage");
+    pressure->release_elastic_buffer(pressure_a);
+    pressure->release_elastic_buffer(pressure_b);
+
     std::printf("\n==== kv_pool_lifecycle_test: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

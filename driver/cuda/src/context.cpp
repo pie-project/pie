@@ -108,6 +108,21 @@ void publish_terminal(PieTerminalCell* cell, std::uint32_t outcome) {
         outcome, std::memory_order_release);
 }
 
+std::size_t cuda_vmm_handle_bytes() {
+    constexpr std::size_t kMib = 1024ull * 1024ull;
+    constexpr std::size_t kDefaultMib = 32;
+    const char* value = std::getenv("PIE_CUDA_VMM_HANDLE_MB");
+    if (value == nullptr || *value == '\0') return kDefaultMib * kMib;
+    char* end = nullptr;
+    const unsigned long long mib = std::strtoull(value, &end, 10);
+    if (end == value || end == nullptr || *end != '\0' ||
+        mib < 2 || mib > 64) {
+        throw std::runtime_error(
+            "PIE_CUDA_VMM_HANDLE_MB must be an integer from 2 through 64");
+    }
+    return static_cast<std::size_t>(mib) * kMib;
+}
+
 void CUDART_CB finish_async_completion(void* userdata) {
     std::unique_ptr<AsyncCompletionContext> ctx(
         static_cast<AsyncCompletionContext*>(userdata));
@@ -786,7 +801,8 @@ int Context::Impl::load_model(
             : 0;
     elastic_pool_ = std::make_shared<CudaPhysicalPool>(
         device_ordinal_,
-        elastic_budget);
+        elastic_budget,
+        cuda_vmm_handle_bytes());
     kv_allocator_ = std::make_shared<CudaArenaAllocator>(
         elastic_pool_, "kv", false);
     state_allocator_ = std::make_shared<CudaArenaAllocator>(
@@ -813,9 +829,17 @@ int Context::Impl::load_model(
         }
         return static_cast<long>(cfg.batching.total_pages);
     }();
+    if (mem_plan.kv_page_bytes == 0) {
+        std::cerr << "[pie-driver-cuda] zero KV page byte coefficient\n";
+        return PIE_STATUS_UNSUPPORTED;
+    }
+    const int logical_kv_pages = static_cast<int>(
+        std::min<std::size_t>(
+            elastic_budget / mem_plan.kv_page_bytes,
+            static_cast<std::size_t>(std::numeric_limits<int>::max())));
     const int runtime_kv_pages = (kv_page_cap > 0)
-        ? std::min<int>(mem_plan.kv_pages, static_cast<int>(kv_page_cap))
-        : mem_plan.kv_pages;
+        ? std::min<int>(logical_kv_pages, static_cast<int>(kv_page_cap))
+        : logical_kv_pages;
     const bool page_zero_dummy_safe =
         kv_format.is_native_bf16() &&
         (family == model::Family::LlamaLike ||
@@ -827,8 +851,9 @@ int Context::Impl::load_model(
         family == model::Family::Kimi ||
         family == model::Family::Glm5;
     const int physical_kv_pages =
-        mem_plan.kv_pages + (mem_plan.kv_pages > 0 && !page_zero_dummy_safe ? 1 : 0);
-    const int graph_pad_page = mem_plan.kv_pages > 0
+        runtime_kv_pages +
+        (runtime_kv_pages > 0 && !page_zero_dummy_safe ? 1 : 0);
+    const int graph_pad_page = runtime_kv_pages > 0
         ? (page_zero_dummy_safe ? 0 : runtime_kv_pages)
         : -1;
     const bool has_recurrent_state_cache =
@@ -840,7 +865,8 @@ int Context::Impl::load_model(
             nemotron_h_mamba_layers > 0)
 #endif
         ;
-    const int runtime_state_slots = mem_plan.state_slots;
+    const int runtime_state_slots =
+        has_recurrent_state_cache ? mem_plan.max_requests : 0;
     const int graph_pad_slot =
         has_recurrent_state_cache && runtime_state_slots > 0 && graph_pad_page >= 0
             ? runtime_state_slots
@@ -992,7 +1018,7 @@ int Context::Impl::load_model(
                 cfg_q.linear_value_head_dim,
                 (cfg_q.num_attention_heads / local_tp_size) * cfg_q.head_dim);
         }
-        qwen3_5_runtime_rs_slots = std::max<int>(1, mem_plan.state_slots);
+        qwen3_5_runtime_rs_slots = std::max(1, runtime_state_slots);
         {
             ScopedCudaArenaAllocator arena(*state_allocator_);
             qwen3_5_state_cache = RecurrentStateCache::allocate(

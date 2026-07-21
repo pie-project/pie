@@ -258,6 +258,7 @@ class DeviceChannelRegistry {
         slot_of_.emplace(desc.channel_id, slot);
         id_of_[slot] = desc.channel_id;
         refcounts_[slot] = 0;
+        pending_close_[slot] = false;
         dtype_[slot] = desc.dtype;
         host_role_[slot] = desc.host_role;
         reader_wait_ids_[slot] = desc.reader_wait_id;
@@ -296,12 +297,21 @@ class DeviceChannelRegistry {
         return true;
     }
 
-    bool close_endpoint(std::uint64_t id, std::string* err) {
+    bool close_endpoint(
+        std::uint64_t id,
+        std::string* err,
+        bool defer_if_attached = false) {
         settle_initialization();
         auto it = slot_of_.find(id);
         if (it == slot_of_.end()) return false;
         const std::uint32_t slot = it->second;
         if (refcounts_[slot] != 0) {
+            if (defer_if_attached) {
+                std::atomic_ref<std::uint64_t>(host_words_[slot][3]).store(
+                    1, std::memory_order_release);
+                pending_close_[slot] = true;
+                return true;
+            }
             if (err) *err = "ptir: channel still has instance attachments";
             return false;
         }
@@ -317,6 +327,10 @@ class DeviceChannelRegistry {
         auto it = slot_of_.find(id);
         if (it != slot_of_.end()) {
             const std::uint32_t slot = it->second;
+            if (pending_close_[slot]) {
+                if (err) *err = "ptir: channel is closing";
+                return kBadSlot;
+            }
             if (!decl_matches(slot, decl)) {
                 if (err)
                     *err = "ptir: channel " + std::to_string(id) +
@@ -387,6 +401,10 @@ class DeviceChannelRegistry {
         if (extern_dir >= 0) {
             attachment_direction_masks_[slot] &= static_cast<std::uint8_t>(
                 ~(1u << static_cast<std::uint8_t>(extern_dir)));
+        }
+        if (refcounts_[slot] == 0 && pending_close_[slot]) {
+            retire_slot(slot);
+            slot_of_.erase(it);
         }
     }
 
@@ -955,6 +973,7 @@ class DeviceChannelRegistry {
         extern_names_[slot].clear();
         attachment_direction_masks_[slot] = 0;
         refcounts_[slot] = 0;
+        pending_close_[slot] = false;
         reader_wait_ids_[slot] = 0;
         writer_wait_ids_[slot] = 0;
         id_of_[slot] = 0;
@@ -1083,6 +1102,7 @@ class DeviceChannelRegistry {
         extern_names_.resize(new_cap);
         attachment_direction_masks_.resize(new_cap, 0);
         refcounts_.resize(new_cap, 0);
+        pending_close_.resize(new_cap, false);
         host_head_.resize(new_cap, 0);
         host_tail_.resize(new_cap, 0);
         host_cap1_.resize(new_cap, 1);
@@ -1126,6 +1146,7 @@ class DeviceChannelRegistry {
     std::vector<std::string> extern_names_;
     std::vector<std::uint8_t> attachment_direction_masks_;
     std::vector<bool> seeded_;
+    std::vector<bool> pending_close_;
     std::vector<std::uint32_t> refcounts_;
     std::vector<std::uint32_t> host_head_, host_tail_, host_cap1_;
     std::vector<std::uint32_t> free_slots_;

@@ -610,6 +610,7 @@ pie_add_cuda_target(test_pack_dense_mask
     src/batch/persistent_inputs.cpp
     src/kernels/graph_pad.cu
     src/kernels/pack_dense_mask.cu
+    src/tensor.cpp
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_envelope_dot
   SOURCES tests/test_envelope_dot.cu src/kernels/envelope.cu

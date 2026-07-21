@@ -130,9 +130,49 @@ int main() {
                 rollback_pool->budget_pages()) {
             return 10;
         }
+
+        auto cache_pool =
+            std::make_shared<pie_cuda_driver::CudaPhysicalPool>(
+                0,
+                256ull << 20);
+        pie_cuda_driver::CudaArena cache_arena(
+            cache_pool,
+            128ull << 20,
+            "cache-hysteresis");
+        cache_arena.ensure_committed(96ull << 20);
+        const auto peak_pages = cache_pool->committed_pages();
+        cache_arena.trim_committed(64ull << 20);
+        if (cache_pool->committed_pages() != peak_pages) {
+            return 11;
+        }
+        cache_pool->fail_mapping_after_for_test(1);
+        bool cache_regrow_failed = false;
+        try {
+            cache_arena.ensure_committed(128ull << 20);
+        } catch (const std::exception&) {
+            cache_regrow_failed = true;
+        }
+        if (!cache_regrow_failed ||
+            cache_arena.committed_bytes() != (64ull << 20) ||
+            cache_pool->committed_pages() != peak_pages ||
+            cache_pool->held_pages() != 0) {
+            return 12;
+        }
+        cache_arena.ensure_committed(96ull << 20);
+        if (cache_pool->committed_pages() != peak_pages) {
+            return 13;
+        }
+        cache_arena.trim_committed(1);
+        if (cache_pool->committed_pages() >= peak_pages) {
+            return 14;
+        }
+        cache_arena.trim_committed(0);
+        if (cache_pool->committed_pages() != 0) {
+            return 15;
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << "\n";
-        return 11;
+        return 16;
     }
 }

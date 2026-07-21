@@ -12,6 +12,7 @@
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#import <dispatch/dispatch.h>
 
 #include "mtl4_context.hpp"
 #include "observability.hpp"
@@ -123,8 +124,12 @@ struct RawMetalContext::Impl {
     std::unordered_map<void*, ElasticAllocation> elastic_allocations;
     std::vector<PendingElasticRelease> pending_elastic_releases;
     size_t elastic_budget_bytes = 0;
+    size_t elastic_pressure_floor_bytes = 0;
     size_t elastic_reserved_bytes = 0;
     size_t elastic_committed_bytes = 0;
+    std::shared_ptr<std::atomic<std::uint32_t>> memory_pressure_level =
+        std::make_shared<std::atomic<std::uint32_t>>(0);
+    dispatch_source_t memory_pressure_source = nullptr;
 
     struct TransientAllocation {
         size_t size_class = 0;
@@ -156,7 +161,19 @@ struct RawMetalContext::Impl {
         id<MTLBuffer> buffer,
         id<MTLHeap> heap,
         const MTL4UpdateSparseBufferMappingOperation& operation);
+    size_t effective_elastic_budget_bytes() const;
 };
+
+size_t RawMetalContext::Impl::effective_elastic_budget_bytes() const {
+    const std::uint32_t level =
+        memory_pressure_level->load(std::memory_order_acquire);
+    if (level == 0) return elastic_budget_bytes;
+    const size_t pressure_limit =
+        level >= 2
+            ? elastic_pressure_floor_bytes
+            : std::max(elastic_pressure_floor_bytes, elastic_budget_bytes / 2);
+    return std::min(elastic_budget_bytes, pressure_limit);
+}
 
 void RawMetalContext::Impl::collect_elastic_releases() {
     const uint64_t signaled = event.signaledValue;
@@ -294,6 +311,12 @@ void StepEncoder::mark_timestamp(void* heap, uint32_t idx, bool precise) {
 RawMetalContext::RawMetalContext() : impl_(std::make_unique<Impl>()) {}
 RawMetalContext::~RawMetalContext() {
     if (impl_ != nullptr) {
+        if (impl_->memory_pressure_source != nullptr) {
+            dispatch_source_cancel(impl_->memory_pressure_source);
+            dispatch_source_set_event_handler(
+                impl_->memory_pressure_source, nullptr);
+            impl_->memory_pressure_source = nullptr;
+        }
         impl_->drain_mapping_through(impl_->ev_val);
     }
 }
@@ -320,6 +343,42 @@ std::unique_ptr<RawMetalContext> RawMetalContext::create(
     I.elastic_budget_bytes = align_up(
         elastic_budget_bytes,
         pie::elastic::kLogicalPageBytes);
+    if (const char* floor = std::getenv("PIE_METAL_PRESSURE_FLOOR_BYTES")) {
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(floor, &end, 10);
+        if (end != floor && end != nullptr && *end == '\0') {
+            const size_t requested = static_cast<size_t>(
+                std::min<unsigned long long>(
+                    parsed,
+                    I.elastic_budget_bytes));
+            I.elastic_pressure_floor_bytes = std::min(
+                I.elastic_budget_bytes,
+                align_up(
+                    requested,
+                    pie::elastic::kLogicalPageBytes));
+        }
+    }
+    I.memory_pressure_source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,
+        0,
+        DISPATCH_MEMORYPRESSURE_NORMAL |
+            DISPATCH_MEMORYPRESSURE_WARN |
+            DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    if (I.memory_pressure_source != nullptr) {
+        dispatch_source_t source = I.memory_pressure_source;
+        auto pressure_level = I.memory_pressure_level;
+        dispatch_source_set_event_handler(I.memory_pressure_source, ^{
+            const unsigned long pressure =
+                dispatch_source_get_data(source);
+            const std::uint32_t level =
+                (pressure & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0
+                    ? 2u
+                    : ((pressure & DISPATCH_MEMORYPRESSURE_WARN) != 0 ? 1u : 0u);
+            pressure_level->store(level, std::memory_order_release);
+        });
+        dispatch_resume(I.memory_pressure_source);
+    }
 
     NSError* e = nil;
     MTL4PipelineDataSetSerializerDescriptor* serializer_descriptor =
@@ -474,8 +533,8 @@ bool RawMetalContext::ensure_elastic_buffer(
         Impl::kSparseTileBytes);
     if (target <= allocation.committed_bytes) return true;
     const size_t delta = target - allocation.committed_bytes;
-    if (delta > I.elastic_budget_bytes -
-                    std::min(I.elastic_budget_bytes, I.elastic_reserved_bytes)) {
+    const size_t budget = I.effective_elastic_budget_bytes();
+    if (delta > budget - std::min(budget, I.elastic_reserved_bytes)) {
         return false;
     }
     I.elastic_reserved_bytes += delta;
@@ -547,10 +606,22 @@ bool RawMetalContext::ensure_elastic_buffer(
 bool RawMetalContext::ensure_elastic_buffers_atomically(
     const std::vector<std::pair<SlotHandle, size_t>>& targets) {
     auto& I = *impl_;
-    std::vector<std::pair<SlotHandle, size_t>> prior;
-    prior.reserve(targets.size());
-    size_t total_delta = 0;
+    std::vector<std::pair<SlotHandle, size_t>> normalized;
+    std::unordered_map<void*, std::size_t> by_buffer;
     for (const auto& [slot, bytes] : targets) {
+        const auto [found, inserted] =
+            by_buffer.emplace(slot.buffer, normalized.size());
+        if (inserted) {
+            normalized.emplace_back(slot, bytes);
+        } else {
+            normalized[found->second].second =
+                std::max(normalized[found->second].second, bytes);
+        }
+    }
+    std::vector<std::pair<SlotHandle, size_t>> prior;
+    prior.reserve(normalized.size());
+    size_t total_delta = 0;
+    for (const auto& [slot, bytes] : normalized) {
         if (!slot.elastic || slot.buffer == nullptr || bytes > slot.size) {
             return false;
         }
@@ -568,13 +639,12 @@ bool RawMetalContext::ensure_elastic_buffers_atomically(
             total_delta += delta;
         }
     }
-    if (total_delta > I.elastic_budget_bytes -
-                          std::min(
-                              I.elastic_budget_bytes,
-                              I.elastic_reserved_bytes)) {
+    const size_t budget = I.effective_elastic_budget_bytes();
+    if (total_delta > budget -
+                          std::min(budget, I.elastic_reserved_bytes)) {
         return false;
     }
-    for (const auto& [slot, bytes] : targets) {
+    for (const auto& [slot, bytes] : normalized) {
         if (ensure_elastic_buffer(slot, bytes)) continue;
         for (auto it = prior.rbegin(); it != prior.rend(); ++it) {
             trim_elastic_buffer(it->first, it->second);
@@ -740,11 +810,19 @@ size_t RawMetalContext::elastic_page_bytes() const {
 }
 
 size_t RawMetalContext::elastic_budget_pages() const {
-    return pie::elastic::pages_for_bytes(impl_->elastic_budget_bytes);
+    return pie::elastic::pages_for_bytes(
+        impl_->effective_elastic_budget_bytes());
 }
 
 size_t RawMetalContext::elastic_committed_pages() const {
     return pie::elastic::pages_for_bytes(impl_->elastic_committed_bytes);
+}
+
+void RawMetalContext::set_memory_pressure_level_for_test(
+    std::uint32_t level) {
+    impl_->memory_pressure_level->store(
+        std::min<std::uint32_t>(level, 2u),
+        std::memory_order_release);
 }
 
 void RawMetalContext::drain_elastic_mappings() {
