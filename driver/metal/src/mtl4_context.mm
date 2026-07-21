@@ -429,8 +429,11 @@ SlotHandle RawMetalContext::create_elastic_buffer(
             newBufferWithLength:virtual_bytes
                        options:MTLResourceStorageModePrivate
        placementSparsePageSize:MTLSparsePageSize16];
-        if (buffer == nil ||
-            buffer.sparseBufferTier == MTLBufferSparseTierNone) {
+        const bool reports_no_sparse_tier =
+            buffer != nil &&
+            [buffer respondsToSelector:@selector(sparseBufferTier)] &&
+            buffer.sparseBufferTier == MTLBufferSparseTierNone;
+        if (buffer == nil || reports_no_sparse_tier) {
             fprintf(
                 stderr,
                 "[pie-metal] placement sparse buffer creation failed (%zu bytes)\n",
