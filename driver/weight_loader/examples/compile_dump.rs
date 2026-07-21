@@ -34,6 +34,7 @@ fn main() {
         preferred_alignment: 256,
         mxfp4_moe: Mxfp4MoePolicy::RoutedDecode,
         native_mxfp4_moe: false,
+        stream_routed_experts: false,
     };
 
     let start = Instant::now();

@@ -43,6 +43,7 @@
 #include "cuda_memory_planner.hpp"
 #include "custom_all_reduce.hpp"
 #include "cuda_check.hpp"
+#include "expert_stream_cache.hpp"
 #include "driver_startup.hpp"
 #include "hf_snapshot.hpp"
 #include "parity_harness.hpp"
@@ -467,6 +468,34 @@ int run_impl(int argc,
     const int nemotron_h_attention_layer_count = is_nemotron_h_arch
         ? pie_cuda_driver::model::nemotron_h_attention_layers(engine.hf_config())
         : 0;
+    // SSD expert streaming: carve the bounded expert slab out of free VRAM
+    // now, *before* the memory planner runs, so KV/workspace sizing adapts
+    // to the remaining budget automatically. Only DSv4 is wired up; the
+    // Rust weight-loader compiler already rejected other archs at load.
+    std::unique_ptr<pie_cuda_driver::ExpertStreamCache> expert_stream_cache;
+    if (cfg.model.stream_routed_experts) {
+        if (!is_dsv4_arch) {
+            std::cerr << "[pie-driver-cuda] model.stream_routed_experts is only "
+                         "supported for deepseek_v4 (got '"
+                      << engine.hf_config().model_type << "')\n";
+            return 2;
+        }
+        std::size_t free_bytes = 0;
+        std::size_t total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        // 0 = auto: half of post-weights free VRAM. The cache clamps the
+        // slot count to the full expert set, so an over-large budget only
+        // ever allocates what the model can use.
+        const std::uint64_t budget_bytes =
+            cfg.model.expert_cache_gb > 0.0
+                ? static_cast<std::uint64_t>(
+                      cfg.model.expert_cache_gb * 1073741824.0)
+                : static_cast<std::uint64_t>(free_bytes) / 2;
+        expert_stream_cache =
+            std::make_unique<pie_cuda_driver::ExpertStreamCache>(
+                engine.streamed_expert_table(), budget_bytes, verbose);
+    }
+
     const auto kv_format = pie_cuda_driver::kv_cache_format_from_string(
         cfg.batching.kv_cache_dtype, cfg.model.dtype);
     const bool graph_capable_forward =
@@ -1238,7 +1267,8 @@ int run_impl(int argc,
         dsv4_model = std::make_unique<pie_cuda_driver::model::DsV4Model>(
             weights_dsv4, engine.hf_config(), dsv4_ws,
             cfg.distributed.tp_size, cfg.distributed.tp_rank, tp_comm_ptr,
-            cfg.distributed.tp_rank == 0);
+            cfg.distributed.tp_rank == 0,
+            expert_stream_cache.get());
         forward_fn.attach_model(dsv4_model.get());
     } else if (is_kimi_arch) {
         const bool kimi_tp_greedy =
@@ -1431,6 +1461,9 @@ int run_impl(int argc,
 
     if (server_p) {
         pie_cuda_driver::unregister_server(server_p.get());
+    }
+    if (expert_stream_cache && verbose) {
+        expert_stream_cache->log_stats("lifetime");
     }
     if (verbose) {
         std::cerr << "[pie-driver-cuda] shutting down (handled " << handled

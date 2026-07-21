@@ -104,7 +104,8 @@ public:
         std::uint64_t max_tile_bytes,
         std::uint32_t preferred_alignment,
         Mxfp4MoeLowering mxfp4_moe = Mxfp4MoeLowering::RoutedDequant,
-        bool native_mxfp4_moe = false)
+        bool native_mxfp4_moe = false,
+        bool stream_routed_experts = false)
     {
         auto mxfp4_policy = pie_weight_loader::PieLoaderMxfp4MoePolicy::RoutedDecode;
         switch (mxfp4_moe) {
@@ -126,6 +127,7 @@ public:
             .preferred_alignment = preferred_alignment,
             .mxfp4_moe = mxfp4_policy,
             .native_mxfp4_moe = native_mxfp4_moe,
+            .stream_routed_experts = stream_routed_experts,
         };
     }
 

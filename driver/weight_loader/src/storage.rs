@@ -6,7 +6,7 @@ use crate::types::{
     TensorDecl, TensorId,
 };
 
-pub const STORAGE_PROGRAM_VERSION: u32 = 3;
+pub const STORAGE_PROGRAM_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
@@ -26,6 +26,7 @@ pub struct StorageTarget {
     pub preferred_alignment: u32,
     pub mxfp4_moe: Mxfp4MoePolicy,
     pub native_mxfp4_moe: bool,
+    pub stream_routed_experts: bool,
 }
 
 impl Default for StorageTarget {
@@ -38,6 +39,7 @@ impl Default for StorageTarget {
             preferred_alignment: 1,
             mxfp4_moe: Mxfp4MoePolicy::RoutedDecode,
             native_mxfp4_moe: false,
+            stream_routed_experts: false,
         }
     }
 }
@@ -175,6 +177,56 @@ pub enum StorageInstr {
     },
 }
 
+/// One deferred source extent for a streamed expert section.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamBinding {
+    pub file_id: FileId,
+    pub file_offset: u64,
+    pub span_bytes: u64,
+}
+
+/// Deferred expert-load plan: one reusable instruction template plus
+/// per-(layer, expert) source bindings. Empty when streaming is off.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamPlan {
+    /// Instr IDs into [`StorageProgram::instrs`] that are **not** on
+    /// [`StorageProgram::schedule`]. Each is typically an `ExtentWrite`
+    /// whose `dest.offset` is relative to a cache-slot base
+    /// (`dest.buffer == BufferId(u32::MAX)`).
+    pub template: Vec<InstrId>,
+    /// Checkpoint shard paths indexed by `FileId`.
+    pub files: Vec<String>,
+    pub num_layers: u32,
+    pub num_experts: u32,
+    pub sections_per_expert: u32,
+    /// Flat `[num_layers * num_experts * sections_per_expert]` bindings in
+    /// template section order.
+    pub bindings: Vec<StreamBinding>,
+    /// Aligned bytes per expert slot (sum of section sizes with padding).
+    pub slot_bytes: u64,
+    /// Per-section slot-relative offsets (`len == sections_per_expert`).
+    pub section_offsets: Vec<u64>,
+    /// Per-section payload sizes (`len == sections_per_expert`).
+    pub section_bytes: Vec<u64>,
+}
+
+impl StreamPlan {
+    pub fn is_empty(&self) -> bool {
+        self.template.is_empty()
+    }
+
+    pub fn binding(&self, layer: u32, expert: u32, section: u32) -> Option<&StreamBinding> {
+        if layer >= self.num_layers
+            || expert >= self.num_experts
+            || section >= self.sections_per_expert
+        {
+            return None;
+        }
+        let idx = ((layer * self.num_experts + expert) * self.sections_per_expert + section) as usize;
+        self.bindings.get(idx)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageProgram {
     pub version: u32,
@@ -185,6 +237,7 @@ pub struct StorageProgram {
     pub instrs: Vec<StorageInstr>,
     pub schedule: Vec<InstrId>,
     pub memory: MemoryPlan,
+    pub stream: StreamPlan,
 }
 
 impl StorageProgram {
@@ -198,6 +251,7 @@ impl StorageProgram {
             instrs: Vec::new(),
             schedule: Vec::new(),
             memory: MemoryPlan::default(),
+            stream: StreamPlan::default(),
         }
     }
 

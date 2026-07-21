@@ -9,7 +9,8 @@ DsV4Model::DsV4Model(
     int tp_size,
     int tp_rank,
     NcclComm* tp_comm,
-    bool emit_logits)
+    bool emit_logits,
+    ExpertStreamCache* expert_cache)
     : weights_(weights),
       hf_config_(hf_config),
       ws_(ws)
@@ -18,6 +19,7 @@ DsV4Model::DsV4Model(
     fwd_cfg_.tp_rank = tp_rank;
     fwd_cfg_.tp_comm = tp_comm;
     fwd_cfg_.emit_logits = emit_logits;
+    fwd_cfg_.expert_cache = expert_cache;
 
     // DSV4 emits dense or compact logits via the standard path; it does
     // not opt into CUDA-graph capture or fused-argmax.

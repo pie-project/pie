@@ -35,8 +35,24 @@ pub fn compile_storage_program(
     };
     let plan = plan_from_semantics(metadata, &graph, &abi, &target)?;
     let optimized = optimize_with_report(plan)?;
-    let mut program = lower_layout_plan(metadata, &optimized.plan, target)?;
+    let mut program = lower_layout_plan(metadata, &optimized.plan, target.clone())?;
     program.optimizer = optimized.report;
+    if target.stream_routed_experts {
+        let Some(arch) = crate::abi::stream_arch_for(&cfg.model_type) else {
+            return Err(CompileError::InvalidInput(format!(
+                "stream_routed_experts is not supported for model_type='{}' \
+                 (supported: deepseek_v4)",
+                cfg.model_type
+            )));
+        };
+        crate::stream::attach_stream_plan(
+            &mut program,
+            metadata,
+            cfg.num_hidden_layers,
+            cfg.num_experts,
+            arch,
+        )?;
+    }
     Ok(program)
 }
 

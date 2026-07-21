@@ -1,13 +1,14 @@
 use crate::ffi_types::{
     PieLoaderBufferDeclSlice, PieLoaderBufferDeclView, PieLoaderBufferIdSlice, PieLoaderBytes,
-    PieLoaderDType, PieLoaderDestExtentView, PieLoaderDimSpecSlice, PieLoaderDimSpecView,
-    PieLoaderEncodingKind, PieLoaderI64Slice, PieLoaderMemoryPlanView,
+    PieLoaderBytesSlice, PieLoaderDType, PieLoaderDestExtentView, PieLoaderDimSpecSlice,
+    PieLoaderDimSpecView, PieLoaderEncodingKind, PieLoaderI64Slice, PieLoaderMemoryPlanView,
     PieLoaderOptimizerPassStatsSlice, PieLoaderOptimizerPassStatsView,
     PieLoaderOptimizerReportView, PieLoaderQuantScheme, PieLoaderRepackLayout, PieLoaderRowMap,
     PieLoaderSlabPlacementSlice, PieLoaderSlabPlacementView, PieLoaderSourceExtentView,
     PieLoaderStorageInstrKind, PieLoaderStorageInstrSlice, PieLoaderStorageInstrView,
-    PieLoaderStorageProgramView, PieLoaderStridedExtentView,
-    PieLoaderTensorDeclSlice, PieLoaderTensorDeclView, PieLoaderTileMapKind, PieLoaderU32Slice,
+    PieLoaderStorageProgramView, PieLoaderStreamBindingSlice, PieLoaderStreamBindingView,
+    PieLoaderStreamPlanView, PieLoaderStridedExtentView, PieLoaderTensorDeclSlice,
+    PieLoaderTensorDeclView, PieLoaderTileMapKind, PieLoaderU32Slice, PieLoaderU64Slice,
 };
 use crate::storage::{
     DestExtent, SourceExtent, StorageInstr, StorageProgram, StridedExtent, TileMapKind,
@@ -26,6 +27,11 @@ pub struct FfiArena {
     instr_views: Vec<PieLoaderStorageInstrView>,
     optimizer_pass_views: Vec<PieLoaderOptimizerPassStatsView>,
     schedule: Vec<u32>,
+    stream_template: Vec<u32>,
+    stream_file_bytes: Vec<PieLoaderBytes>,
+    stream_bindings: Vec<PieLoaderStreamBindingView>,
+    stream_section_offsets: Vec<u64>,
+    stream_section_bytes: Vec<u64>,
 }
 
 impl FfiArena {
@@ -85,6 +91,31 @@ impl FfiArena {
                     rewrites: pass.rewrites as u64,
                 });
         }
+
+        let stream = &program.stream;
+        arena
+            .stream_template
+            .extend(stream.template.iter().map(|id| id.0));
+        arena.stream_file_bytes.reserve(stream.files.len());
+        for path in &stream.files {
+            let bytes = arena.push_string(path);
+            arena.stream_file_bytes.push(bytes);
+        }
+        arena.stream_bindings.reserve(stream.bindings.len());
+        for b in &stream.bindings {
+            arena.stream_bindings.push(PieLoaderStreamBindingView {
+                file_id: b.file_id.0,
+                file_offset: b.file_offset,
+                span_bytes: b.span_bytes,
+            });
+        }
+        arena
+            .stream_section_offsets
+            .extend_from_slice(&stream.section_offsets);
+        arena
+            .stream_section_bytes
+            .extend_from_slice(&stream.section_bytes);
+
         arena
     }
 
@@ -118,6 +149,32 @@ impl FfiArena {
                 passes: PieLoaderOptimizerPassStatsSlice {
                     ptr: self.optimizer_pass_views.as_ptr(),
                     len: self.optimizer_pass_views.len(),
+                },
+            },
+            stream: PieLoaderStreamPlanView {
+                template: PieLoaderU32Slice {
+                    ptr: self.stream_template.as_ptr(),
+                    len: self.stream_template.len(),
+                },
+                files: PieLoaderBytesSlice {
+                    ptr: self.stream_file_bytes.as_ptr(),
+                    len: self.stream_file_bytes.len(),
+                },
+                num_layers: program.stream.num_layers,
+                num_experts: program.stream.num_experts,
+                sections_per_expert: program.stream.sections_per_expert,
+                bindings: PieLoaderStreamBindingSlice {
+                    ptr: self.stream_bindings.as_ptr(),
+                    len: self.stream_bindings.len(),
+                },
+                slot_bytes: program.stream.slot_bytes,
+                section_offsets: PieLoaderU64Slice {
+                    ptr: self.stream_section_offsets.as_ptr(),
+                    len: self.stream_section_offsets.len(),
+                },
+                section_bytes: PieLoaderU64Slice {
+                    ptr: self.stream_section_bytes.as_ptr(),
+                    len: self.stream_section_bytes.len(),
                 },
             },
         }

@@ -160,6 +160,8 @@ inline std::string rust_loader_compile_cache_key(
     h.update_scalar(input.target.preferred_alignment);
     h.update_scalar(static_cast<std::uint32_t>(input.target.mxfp4_moe));
     h.update_scalar(static_cast<std::uint8_t>(input.target.native_mxfp4_moe));
+    h.update_scalar(
+        static_cast<std::uint8_t>(input.target.stream_routed_experts));
     h.update_loader_bytes(input.runtime_abi.name);
     h.update_scalar(input.runtime_abi.version);
 
@@ -628,7 +630,8 @@ inline RustLoaderCompileResult compile_rust_loader_plan_from_metadata(
         max_tile_bytes,
         preferred_alignment,
         backend_target.mxfp4_moe,
-        backend_target.mxfp4_native_gemm);
+        backend_target.mxfp4_native_gemm,
+        backend_target.stream_routed_experts);
     input.set_runtime_abi_name("pie-cuda", /*version=*/1);
 
     RustLoaderSourceIndex source_index =
@@ -668,6 +671,8 @@ inline std::string describe_rust_storage_program(
         << ", buffers=" << view.buffers.len
         << ", instrs=" << view.instrs.len
         << ", schedule=" << view.schedule.len
+        << ", stream_template=" << view.stream.template_.len
+        << ", stream_bindings=" << view.stream.bindings.len
         << ", optimizer_passes=" << view.optimizer.passes.len
         << ", optimizer_rewrites=" << optimizer_rewrites
         << ", persistent_bytes=" << view.memory.persistent_bytes

@@ -11,6 +11,7 @@
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
+#include "expert_stream_cache.hpp"
 #include "ops/gemm.hpp"
 #include "loader/rust_loader_bridge.hpp"
 #include "loader/rust_storage_executor.hpp"
@@ -209,6 +210,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     backend_target.mxfp4_moe =
         select_mxfp4_moe_lowering(boot_cfg.model, backend_target);
     e.mxfp4_moe_lowering_ = backend_target.mxfp4_moe;
+    backend_target.stream_routed_experts = boot_cfg.model.stream_routed_experts;
 
     log_stage("open safetensors begin");
     auto loader = SafetensorsCheckpointSource::open(snapshot);
@@ -355,6 +357,27 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             std::to_string(rust_plan.runtime_tensor_count) +
             " runtime tensors. Add schema/RuntimeABI coverage before enabling "
             "this model.");
+    }
+
+    // SSD expert streaming: the compiled program excluded routed experts
+    // from the resident schedule and attached a deferred stream plan
+    // (template ExtentWrites + per-expert source bindings). Materialize
+    // that plan into the runtime extent table while the program view is live.
+    if (boot_cfg.model.stream_routed_experts) {
+        log_stage("build streamed expert table begin");
+        e.streamed_experts_ = streamed_expert_table_from_program(rust_view);
+        log_stage("build streamed expert table done");
+        if (verbose) {
+            std::cerr << "[pie-driver-cuda] expert streaming: "
+                      << e.streamed_experts_.num_layers << "x"
+                      << e.streamed_experts_.num_experts << " experts, "
+                      << (e.streamed_experts_.payload_bytes_per_expert() /
+                          (1024 * 1024))
+                      << " MiB/expert, "
+                      << (e.streamed_experts_.total_payload_bytes() /
+                          (1024ull * 1024ull * 1024ull))
+                      << " GiB total kept on SSD (deferred loader template)\n";
+        }
     }
 
     // Materialized-weight artifact cache (WEIGHT_LOADER_TODO.md A3.1). The
