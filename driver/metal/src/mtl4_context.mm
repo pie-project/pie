@@ -429,11 +429,7 @@ SlotHandle RawMetalContext::create_elastic_buffer(
             newBufferWithLength:virtual_bytes
                        options:MTLResourceStorageModePrivate
        placementSparsePageSize:MTLSparsePageSize16];
-        const bool reports_no_sparse_tier =
-            buffer != nil &&
-            [buffer respondsToSelector:@selector(sparseBufferTier)] &&
-            buffer.sparseBufferTier == MTLBufferSparseTierNone;
-        if (buffer == nil || reports_no_sparse_tier) {
+        if (buffer == nil) {
             fprintf(
                 stderr,
                 "[pie-metal] placement sparse buffer creation failed (%zu bytes)\n",
@@ -544,6 +540,46 @@ bool RawMetalContext::ensure_elastic_buffer(
         chunk.mapped += grow;
         allocation.committed_bytes += grow;
         I.elastic_committed_bytes += grow;
+    }
+    return true;
+}
+
+bool RawMetalContext::ensure_elastic_buffers_atomically(
+    const std::vector<std::pair<SlotHandle, size_t>>& targets) {
+    auto& I = *impl_;
+    std::vector<std::pair<SlotHandle, size_t>> prior;
+    prior.reserve(targets.size());
+    size_t total_delta = 0;
+    for (const auto& [slot, bytes] : targets) {
+        if (!slot.elastic || slot.buffer == nullptr || bytes > slot.size) {
+            return false;
+        }
+        const auto found = I.elastic_allocations.find(slot.buffer);
+        if (found == I.elastic_allocations.end()) return false;
+        const size_t target = align_up(
+            std::min(bytes, found->second.virtual_bytes),
+            Impl::kSparseTileBytes);
+        prior.emplace_back(slot, found->second.committed_bytes);
+        if (target > found->second.committed_bytes) {
+            const size_t delta = target - found->second.committed_bytes;
+            if (delta > std::numeric_limits<size_t>::max() - total_delta) {
+                return false;
+            }
+            total_delta += delta;
+        }
+    }
+    if (total_delta > I.elastic_budget_bytes -
+                          std::min(
+                              I.elastic_budget_bytes,
+                              I.elastic_reserved_bytes)) {
+        return false;
+    }
+    for (const auto& [slot, bytes] : targets) {
+        if (ensure_elastic_buffer(slot, bytes)) continue;
+        for (auto it = prior.rbegin(); it != prior.rend(); ++it) {
+            trim_elastic_buffer(it->first, it->second);
+        }
+        return false;
     }
     return true;
 }

@@ -23,6 +23,8 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "decode_abi.hpp"  // delta owns this (pure C++); Region / IoSlot / bind / Kernel
 
@@ -164,6 +166,8 @@ class RawMetalContext {
         size_t size,
         size_t initial_commit_bytes = 0);
     bool ensure_elastic_buffer(const SlotHandle& h, size_t bytes);
+    bool ensure_elastic_buffers_atomically(
+        const std::vector<std::pair<SlotHandle, size_t>>& targets);
     bool trim_elastic_buffer(const SlotHandle& h, size_t bytes);
     void release_elastic_buffer(const SlotHandle& h);
     bool zero_buffer_range(const SlotHandle& h, size_t offset, size_t bytes);
