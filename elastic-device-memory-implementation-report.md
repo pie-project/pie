@@ -235,6 +235,40 @@ Fixing this requires either:
 - A separately mapped graph-padding page/range, or
 - Non-tail sparse range mapping inside the CUDA arena.
 
+#### Page-0 alias audit (2026-07-20)
+
+The proposed simplification—remove the extra tail page and alias graph padding
+to physical page 0—was audited and **aborted before landing**.
+
+The required write-skip invariant does not hold for every graph-safe path:
+
+- The ordinary native-BF16 `write_kv_kernel`, explicit
+  `write_kv_explicit_kernel`, and fused Llama-like QKV post kernels skip K/V
+  writes when `row_valid == 0`.
+- Quantized KV writers do not consume `row_valid`; they are currently excluded
+  from graph replay because model `graph_safe` is gated on native BF16.
+- Gemma 4 advertises graph safety for native BF16, but both its packed fused
+  QKV/KV writer and its fallback `launch_write_kv_to_pages` call omit
+  `row_valid`. An off-lattice graph-padded Gemma 4 wave can therefore write its
+  pad rows into the selected pad page. Aliasing that page to live page 0 would
+  corrupt real KV.
+
+The zero-request condition is also not literally true: upfront graph-lattice
+capture runs at model load with synthetic requests before any real request.
+Current code makes this memory-safe by precommitting KV before capture, but it
+is not evidence that page 0 is always live because of real decode work.
+
+An experimental non-tail range-mapping change was reverted after this audit.
+The tail padding page remains until every graph-safe KV writer is explicitly
+row-validity-gated (or Gemma 4 graph padding is excluded) and capture-time page
+requirements are represented separately.
+
+`graph_pad_slot` was not aliased. RS graph padding is currently disabled by the
+host-reset eligibility predicate, while the state allocator is fully committed
+at load, so the sacrificial slot does not add a separate physical-commit floor
+today. Future proportional state commit must still retain a sacrificial slot
+unless every recurrent-state write is proven to skip invalid rows.
+
 ### 4.4 CUDA conversion gaps
 
 These planned allocations remain outside elastic arenas:
