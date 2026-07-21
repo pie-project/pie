@@ -104,11 +104,11 @@ endif()
 cpmaddpackage(
   NAME flashinfer
   GITHUB_REPOSITORY flashinfer-ai/flashinfer
-  GIT_TAG v0.6.9
+  GIT_TAG v0.6.15
   GIT_SHALLOW TRUE
   DOWNLOAD_ONLY YES)
 
-# v0.6.9 has a narrowing-conversion warning nvcc escalates to an error
+# v0.6.15 has a narrowing-conversion warning nvcc escalates to an error
 # (`state_stride_batch`, signed long, brace-initialized into a uint64_t
 # field). Patch once after fetch; a sentinel file avoids re-patching every
 # fresh build-hash dir.
@@ -117,6 +117,12 @@ set(_FI_PATCH_FILE
   "${flashinfer_SOURCE_DIR}/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh")
 if(EXISTS "${_FI_PATCH_FILE}" AND NOT EXISTS "${_FI_PATCH_SENTINEL}")
   file(READ "${_FI_PATCH_FILE}" _fi_src)
+  string(FIND "${_fi_src}"
+    "DSTATE * DIM, params.state_stride_batch}" _fi_patch_offset)
+  if(_fi_patch_offset EQUAL -1)
+    message(FATAL_ERROR
+      "FlashInfer narrowing patch no longer applies to ${_FI_PATCH_FILE}")
+  endif()
   string(REPLACE
     "DSTATE * DIM, params.state_stride_batch}"
     "DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)}"
