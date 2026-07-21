@@ -47,8 +47,36 @@ pub(crate) enum LeaveKind {
 pub(crate) fn notify_pipeline_leave(pid: ProcessId, _kind: LeaveKind) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::PipelineLeave(pid, _kind));
+        let _ = handle.send(SchedulerItem::PipelineLeave(pid, _kind, None));
     }
+}
+
+async fn notify_pipeline_leave_and_wait(pid: ProcessId, kind: LeaveKind) {
+    let responses = {
+        let handles = super::handle_registry().read().unwrap();
+        handles
+            .iter()
+            .flatten()
+            .filter_map(|handle| {
+                let (response, received) = tokio::sync::oneshot::channel();
+                handle
+                    .send(SchedulerItem::PipelineLeave(pid, kind, Some(response)))
+                    .ok()
+                    .map(|_| received)
+            })
+            .collect::<Vec<_>>()
+    };
+    for response in responses {
+        let _ = response.await;
+    }
+}
+
+pub(crate) async fn notify_pipeline_close(pid: ProcessId) {
+    notify_pipeline_leave_and_wait(pid, LeaveKind::Close).await;
+}
+
+pub(crate) async fn notify_process_terminate(pid: ProcessId) {
+    notify_pipeline_leave_and_wait(pid, LeaveKind::Terminate).await;
 }
 
 /// No-op: quorum rejoin is implicit on the pipeline's next scheduler
@@ -457,7 +485,11 @@ enum SchedulerItem {
     /// Handled immediately on dequeue (like [`SchedulerItem::Nudge`]): it
     /// only mutates the run-loop's local `WaitAllPolicy`, never touching
     /// `pending`, so it can't reorder control ops or launches.
-    PipelineLeave(ProcessId, LeaveKind),
+    PipelineLeave(
+        ProcessId,
+        LeaveKind,
+        Option<tokio::sync::oneshot::Sender<()>>,
+    ),
     /// Snapshot the run loop's state as a human-readable dump (queue
     /// composition, in-flight work, barrier membership). Answered inline on
     /// dequeue — a held wave must be inspectable from outside the thread.
@@ -2045,6 +2077,7 @@ impl BatchScheduler {
         // untracked instead of re-arming the barrier on a ghost (RV-20); the
         // pipeline's own next request is its implicit rejoin.
         let mut departed_pipelines: HashSet<ProcessId> = HashSet::new();
+        let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = None;
         let mut admission_retry_at = None;
@@ -2101,6 +2134,7 @@ impl BatchScheduler {
                     &mut pending,
                     &mut frozen_pipelines,
                     &mut departed_pipelines,
+                    &mut terminated_processes,
                     &mut in_flight_control,
                     &instances,
                     limits,
@@ -2282,6 +2316,7 @@ impl BatchScheduler {
                     &mut pending,
                     &mut frozen_pipelines,
                     &mut departed_pipelines,
+                    &mut terminated_processes,
                     &mut in_flight_control,
                     &instances,
                     limits,
@@ -2394,6 +2429,7 @@ impl BatchScheduler {
         pending: &mut VecDeque<QueuedItem>,
         frozen_pipelines: &mut HashSet<ProcessId>,
         departed_pipelines: &mut HashSet<ProcessId>,
+        terminated_processes: &mut HashSet<ProcessId>,
         in_flight_control: &mut Option<PendingControl>,
         instances: &HashMap<u64, TrackedInstance>,
         limits: SchedulerLimits,
@@ -2424,8 +2460,9 @@ impl BatchScheduler {
             // Immediate, not queued. Termination rejects queued work; graceful
             // pipeline close instead releases the wait-set and lets every
             // already-admitted request drain untracked.
-            SchedulerItem::PipelineLeave(pid, kind) => {
+            SchedulerItem::PipelineLeave(pid, kind, response) => {
                 if kind == LeaveKind::Terminate {
+                    terminated_processes.insert(pid);
                     let protected = in_flight_control
                         .as_ref()
                         .filter(|control| control.process_id == Some(pid))
@@ -2441,6 +2478,9 @@ impl BatchScheduler {
                     policy.on_process_leave(pid);
                 } else {
                     policy.on_pipeline_leave(pid);
+                }
+                if let Some(response) = response {
+                    let _ = response.send(());
                 }
             }
             SchedulerItem::Launch {
@@ -2460,6 +2500,11 @@ impl BatchScheduler {
                 let validation = BatchAccumulator::new(limits, page_size);
                 let rejection = if launch.completion.cancel_requested() {
                     Some("logical fire cancelled before scheduler admission".to_string())
+                } else if launch
+                    .process_id
+                    .is_some_and(|pid| terminated_processes.contains(&pid))
+                {
+                    Some("process terminated before scheduler admission".to_string())
                 } else if !instances.contains_key(&launch.instance_id) {
                     Some(format!(
                         "instance {} is unknown or stale",
@@ -2514,12 +2559,22 @@ impl BatchScheduler {
                 plan,
                 response,
             } => {
+                if pipeline_id.is_some_and(|pid| terminated_processes.contains(&pid)) {
+                    DriverLane::release_wait_slots([plan.pacing_wait_id]);
+                    let _ = response.send(Err(anyhow!(
+                        "process departed before instance bind admission"
+                    )));
+                    return;
+                }
                 policy.on_bind_enqueued(pipeline_id);
-                pending.push_back(QueuedItem::BindInstance {
-                    pipeline_id,
-                    plan,
-                    response,
-                });
+                Self::queue_bind_control(
+                    pending,
+                    QueuedItem::BindInstance {
+                        pipeline_id,
+                        plan,
+                        response,
+                    },
+                );
             }
             SchedulerItem::RegisterChannelsBind {
                 pipeline_id,
@@ -2528,14 +2583,25 @@ impl BatchScheduler {
                 bind,
                 response,
             } => {
+                if pipeline_id.is_some_and(|pid| terminated_processes.contains(&pid)) {
+                    DriverLane::release_channel_plan_wait_slots(&plans);
+                    DriverLane::release_wait_slots([bind.pacing_wait_id]);
+                    let _ = response.send(Err(anyhow!(
+                        "process departed before channel bind admission"
+                    )));
+                    return;
+                }
                 policy.on_bind_enqueued(pipeline_id);
-                pending.push_back(QueuedItem::RegisterChannelsBind {
-                    pipeline_id,
-                    plans,
-                    program,
-                    bind,
-                    response,
-                });
+                Self::queue_bind_control(
+                    pending,
+                    QueuedItem::RegisterChannelsBind {
+                        pipeline_id,
+                        plans,
+                        program,
+                        bind,
+                        response,
+                    },
+                );
             }
             SchedulerItem::CopyKv { plan, response } => {
                 pending.push_back(QueuedItem::CopyKv { plan, response });
@@ -2777,6 +2843,14 @@ impl BatchScheduler {
                 | QueuedItem::CloseInstance { .. }
                 | QueuedItem::CloseChannel { .. }
         )
+    }
+
+    fn queue_bind_control(pending: &mut VecDeque<QueuedItem>, item: QueuedItem) {
+        let index = pending
+            .iter()
+            .position(|queued| !Self::lifecycle_control(queued))
+            .unwrap_or(pending.len());
+        pending.insert(index, item);
     }
 
     /// launch that reached the queue front has no queued copy left).
@@ -7000,7 +7074,7 @@ mod tests {
             None,
             false,
         )?;
-        notify_pipeline_leave(pipeline_a, LeaveKind::Close);
+        notify_pipeline_close(pipeline_a).await;
         timeout(Duration::from_secs(5), sibling).await??;
 
         let dump = scheduler.handle.debug_dump().await?;
@@ -7046,7 +7120,7 @@ mod tests {
         // FIFO receipt puts this after all three launches. At least one launch
         // remains queued behind the scheduler's run-ahead depth while close
         // releases the wait-set; none may be cancelled.
-        notify_pipeline_leave(pid, LeaveKind::Close);
+        notify_pipeline_close(pid).await;
         timeout(Duration::from_secs(5), completions.remove(0)).await??;
         timeout(Duration::from_secs(5), completions.remove(0)).await??;
 

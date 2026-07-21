@@ -217,6 +217,10 @@ pub fn init_admission(max_concurrent: Option<usize>) {
         .expect("prewarm admission controller already initialized");
 }
 
+pub(crate) fn execution_admission_is_capped() -> bool {
+    ADMISSION.get().is_some_and(Option::is_some)
+}
+
 /// Strict-admission gate: acquire the execution permit lazily, at the first
 /// operation that creates per-instance driver state or claims pooled KV/RS
 /// resources. Idempotent per process. The prewarm permit (held since spawn)
@@ -603,7 +607,6 @@ impl Process {
                 }
             };
             admission_wait_us = store.data().admission_wait_us();
-            store.data_mut().release_execution_permit();
             result
         }
         .await;

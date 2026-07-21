@@ -389,6 +389,60 @@ remain 128. A regression stores 129 additional program variants without
 creating additional CUDA stage modules, and the repeated 1,518-request
 persistent-server sweep completes with zero failures.
 
+#### Extreme contention and length stress
+
+The stress matrix then raised total logical requests to 2,048 and 4,096. vLLM
+cannot boot with `max_num_seqs=2048` on the 24 GiB Ada device: sampler warmup
+OOMs after graph capture. Its 2,048-request comparisons therefore submit all
+requests while limiting active sequences to 512. Pie uses the same active cap
+for short workloads and a page-safe cap of 256 for the mixed 8/32/128/512-token
+workload.
+
+| Shape | Pie tok/s | vLLM tok/s | Result |
+|---|---:|---:|---:|
+| 2,048 x 32, active 512 | 19,077.69 | 30,813.23 | Pie -38.1% |
+| mixed 2,048, active 256 | 15,077.02 | 17,492.19 | Pie -13.8% |
+| 512 x 512, active 256 | 18,513.56 | 18,309.29 | Pie +1.1% |
+| 64 x 1,536 | 7,337.31 | 7,166.80 | Pie +2.4% |
+| 16 x 1,900 | 3,721.13 | 3,566.08 | Pie +4.3% |
+
+Pie also completes 4,096 x 8 with zero failures at 4,516.92 tok/s, and eight
+independent clients concurrently complete 256 x 32 each (2,048 total) with
+zero failures. The 2,048 x 32 accuracy comparison is 2,039/2,048 complete
+sequences exact against vLLM, with a full 32-token median common prefix.
+
+The first mixed-length runs exposed a real cohort-transition deadlock:
+
+- `pipeline.close()` enqueued scheduler leave without waiting for wait-set
+  removal, then process admission released the next cohort.
+- Error/trap teardown could drop a pipeline without an explicit close, and a
+  late bind/fire could recreate a terminated process's bind placeholder.
+- Bind controls queued behind held launches could not complete the very
+  placeholders that wait-all was awaiting.
+
+Capped execution now acknowledges pipeline/process leave before returning its
+permit, tracks and closes orphan scopes during deferred teardown, rejects late
+work from terminated processes, and inserts bind controls into the leading
+lifecycle-control FIFO ahead of held launches. The same mixed 2,048 workload
+then completes twice consecutively in 23.11/23.09 seconds with zero failures
+instead of stalling indefinitely.
+
+Mixed-length residency still needs an operator cap: active 512 eventually
+accumulates enough 512-token requests to demand more physical pages than the
+10,723-page driver ceiling, while cap 300 can still stall on allocator
+high-water; cap 256 is the measured safe point. Implementing automatic
+KV-weighted execution admission or request pooling would add material policy
+and state. The simpler current contract keeps this cap explicit.
+
+The remaining short-request deficit is likewise not a CUDA forward deficit:
+one Pie request owns one WASM instance and channel graph, while a vLLM request
+is lightweight engine metadata. Worker threads 16 -> 64 -> 128 improve the
+2,048 x 32 rate substantially, with 128 and 256 threads reaching the same
+plateau. The existing grouped-inferlet path is slower, so closing the remaining
+gap requires a new multiplexed/poolable inferlet lifecycle rather than another
+kernel or scheduler knob. Normal c0/256 remains unchanged at 34,273.04 tok/s
+median. CUDA CTest passes 45/45 and engine tests pass 360/360.
+
 This claim does **not** extend to Remote or CUDA TP. Remote post-scheduler
 coalescing would invalidate a worker-side lease, and TP needs all-rank atomic
 prepare/abort. Both report prepare unsupported.
