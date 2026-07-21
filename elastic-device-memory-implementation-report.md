@@ -231,6 +231,25 @@ The E4 invariant is implemented for local CUDA TP1:
   path.
 - The lease is consumed by one launch or one release; in-flight floors remain
   until stream retirement.
+- The scheduler caches the highest driver-prepared KV/state demand. Waves below
+  that watermark use the already-committed mappings without a second
+  driver-lane round trip; any pool-resize command invalidates the watermark
+  before it is queued.
+
+The inferlet/attention lifecycle merge channelized `EmbedIndptr`, `Readout`, and
+flat single-lane `Pages`. CUDA now verifies those channel shapes and preserves
+device-side decode composition for both all-decode and mixed host/envelope
+waves instead of attempting premature host descriptor readback.
+
+Post-merge gates on the migrated c0/256 guest:
+
+- Exact current-source interleaved n=3: legacy committed-mapping path
+  47,022.36 tok/s, ABI v12 admission 47,096.72 tok/s, **+0.16%**.
+- Every headline arm completed 256/256, with 133 batches and zero failures.
+- Same-binary ABI v12 vs legacy-launch serial oracle: 256/256 token hashes
+  matched.
+- ABI, engine, dummy-driver, SDK, CUDA rollback, decode-envelope contract,
+  parity, canary, and entry-validation suites passed.
 
 This claim does **not** extend to Remote, Metal, or TP. Remote post-scheduler
 coalescing would invalidate a worker-side lease, Metal has no C2 implementation,

@@ -232,6 +232,7 @@ impl PendingRequest {
             instance_id: self.instance_id,
             completion: self.completion.clone(),
             last_page_len: self.last_page_len,
+            process_id: self.process_id,
             pipeline_id: self.pipeline_id,
             prebuilt: self.prebuilt,
             retry_count: self.retry_count,
@@ -654,6 +655,61 @@ struct DriverLane {
     control_tx: crossbeam::channel::Sender<LaneRequest>,
     thread: Option<std::thread::JoinHandle<()>>,
     admission_supported: bool,
+    admission_watermark: Mutex<AdmissionWatermark>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AdmissionWatermark {
+    valid: bool,
+    kv_pages: u32,
+    state_slots: u32,
+}
+
+impl AdmissionWatermark {
+    fn demand(submission: &crate::driver::LaunchSubmission) -> Self {
+        let physical_kv_pages = submission
+            .kv_translation
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |page| page.saturating_add(1));
+        let wire_kv_pages = submission
+            .plan
+            .kv_page_indices
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |page| page.saturating_add(1));
+        let state_slots = submission
+            .plan
+            .rs_slot_ids
+            .iter()
+            .chain(&submission.plan.rs_buffer_slot_ids)
+            .copied()
+            .max()
+            .map_or(0, |slot| slot.saturating_add(1));
+        Self {
+            valid: true,
+            kv_pages: submission
+                .plan
+                .required_kv_pages
+                .max(physical_kv_pages)
+                .max(wire_kv_pages),
+            state_slots,
+        }
+    }
+
+    fn covers(self, demand: Self) -> bool {
+        self.valid
+            && self.kv_pages >= demand.kv_pages
+            && self.state_slots >= demand.state_slots
+    }
+
+    fn include(&mut self, demand: Self) {
+        self.valid = true;
+        self.kv_pages = self.kv_pages.max(demand.kv_pages);
+        self.state_slots = self.state_slots.max(demand.state_slots);
+    }
 }
 
 impl DriverLane {
@@ -677,10 +733,21 @@ impl DriverLane {
             control_tx,
             thread: Some(thread),
             admission_supported,
+            admission_watermark: Mutex::new(AdmissionWatermark::default()),
         }
     }
 
     fn post(&self, request: LaneRequest) {
+        if matches!(
+            &request,
+            LaneRequest::Control {
+                item: QueuedItem::ResizePool { .. },
+                ..
+            }
+        ) {
+            *self.admission_watermark.lock().unwrap() =
+                AdmissionWatermark::default();
+        }
         // The lane outlives every poster (shutdown joins it last); a send
         // failure means the lane thread panicked, which the join reports.
         let _ = match &request {
@@ -697,14 +764,27 @@ impl DriverLane {
         &self,
         submission: crate::driver::LaunchSubmission,
     ) -> std::result::Result<LaunchPrepareOutcome, String> {
+        let demand = AdmissionWatermark::demand(&submission);
+        if self
+            .admission_watermark
+            .lock()
+            .unwrap()
+            .covers(demand)
+        {
+            return Ok(LaunchPrepareOutcome::Unsupported);
+        }
         let (response, receiver) = crossbeam::channel::bounded(1);
         self.post(LaneRequest::Prepare {
             submission: LaneLaunch(submission),
             response,
         });
-        receiver
+        let result = receiver
             .recv()
-            .unwrap_or_else(|_| Err("driver lane closed during launch preparation".to_string()))
+            .unwrap_or_else(|_| Err("driver lane closed during launch preparation".to_string()));
+        if matches!(result, Ok(LaunchPrepareOutcome::Prepared(_))) {
+            self.admission_watermark.lock().unwrap().include(demand);
+        }
+        result
     }
 
     fn release(&self, lease: LaunchLease) -> std::result::Result<(), String> {
@@ -2984,7 +3064,6 @@ impl BatchScheduler {
             match item {
                 QueuedItem::Launch(request) if ids.contains(&request.logical_fire_id) => {
                     Self::drop_request_credit(policy, &request);
-                    Self::resolve_stream_fire(policy, &request);
                     request.completion.reject_unsubmitted(message.to_string());
                     rejected += 1;
                 }
@@ -4636,6 +4715,40 @@ mod tests {
             single_token_mode: true,
             ..LaunchPlan::default()
         }
+    }
+
+    #[test]
+    fn admission_watermark_covers_only_committed_demand() {
+        let submission = crate::driver::LaunchSubmission {
+            plan: LaunchPlan {
+                required_kv_pages: 4,
+                kv_page_indices: vec![7],
+                rs_slot_ids: vec![2],
+                ..LaunchPlan::default()
+            },
+            instance_ids: Vec::new(),
+            terminal_cells: Vec::new(),
+            kv_translation: vec![1, 9],
+            kv_translation_indptr: Vec::new(),
+            program_row_indptr: Vec::new(),
+            logical_fire_ids: Vec::new(),
+            channel_expected_head: Vec::new(),
+            channel_expected_tail: Vec::new(),
+            channel_ticket_indptr: Vec::new(),
+        };
+        let demand = AdmissionWatermark::demand(&submission);
+        assert_eq!(demand.kv_pages, 10);
+        assert_eq!(demand.state_slots, 3);
+
+        let mut watermark = AdmissionWatermark::default();
+        assert!(!watermark.covers(demand));
+        watermark.include(demand);
+        assert!(watermark.covers(demand));
+        assert!(!watermark.covers(AdmissionWatermark {
+            valid: true,
+            kv_pages: 11,
+            state_slots: 3,
+        }));
     }
 
     fn dummy_prefill(tokens: usize) -> LaunchPlan {

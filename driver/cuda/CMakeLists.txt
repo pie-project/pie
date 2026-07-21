@@ -732,6 +732,9 @@ pie_add_cuda_target(test_flashinfer_decode_head_dim_guard
   SOURCES tests/test_flashinfer_decode_head_dim_guard.cpp
   LIBS pie_driver_cuda_lib)
 pie_add_cuda_target(test_graph_variant SOURCES tests/graph_variant_test.cpp)
+pie_add_cuda_target(test_decode_envelope_contract
+  SOURCES tests/decode_envelope_contract_test.cpp
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 pie_add_cuda_target(test_tp_gate
   SOURCES tests/tp_gate_test.cpp
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src

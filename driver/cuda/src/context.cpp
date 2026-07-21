@@ -191,91 +191,6 @@ struct LaunchScratch {
     }
 };
 
-void hash_launch_bytes(
-    std::uint64_t& hash,
-    const void* data,
-    std::size_t bytes) {
-    const auto* ptr = static_cast<const std::uint8_t*>(data);
-    hash ^= static_cast<std::uint64_t>(bytes);
-    hash *= 1099511628211ull;
-    for (std::size_t i = 0; i < bytes; ++i) {
-        hash ^= ptr[i];
-        hash *= 1099511628211ull;
-    }
-}
-
-template <typename T>
-void hash_launch_slice(
-    std::uint64_t& hash,
-    const T* ptr,
-    std::size_t len) {
-    hash_launch_bytes(hash, ptr, len * sizeof(T));
-}
-
-std::uint64_t launch_fingerprint(const PieLaunchDesc& launch) {
-    std::uint64_t hash = 14695981039346656037ull;
-#define PIE_HASH_SLICE(field) \
-    hash_launch_slice(hash, launch.field.ptr, launch.field.len)
-    PIE_HASH_SLICE(instance_ids);
-    PIE_HASH_SLICE(terminal_cells);
-    PIE_HASH_SLICE(token_ids);
-    PIE_HASH_SLICE(position_ids);
-    PIE_HASH_SLICE(kv_page_indices);
-    PIE_HASH_SLICE(kv_page_indptr);
-    PIE_HASH_SLICE(kv_last_page_lens);
-    PIE_HASH_SLICE(qo_indptr);
-    PIE_HASH_SLICE(rs_slot_ids);
-    PIE_HASH_SLICE(rs_slot_flags);
-    PIE_HASH_SLICE(rs_fold_lens);
-    PIE_HASH_SLICE(rs_buffer_slot_ids);
-    PIE_HASH_SLICE(rs_buffer_slot_indptr);
-    hash_launch_slice(
-        hash, launch.masks.request_indptr.ptr,
-        launch.masks.request_indptr.len);
-    hash_launch_slice(
-        hash, launch.masks.word_indptr.ptr,
-        launch.masks.word_indptr.len);
-    hash_launch_slice(hash, launch.masks.words.ptr, launch.masks.words.len);
-    PIE_HASH_SLICE(sampling_indices);
-    PIE_HASH_SLICE(sampling_indptr);
-    PIE_HASH_SLICE(context_ids);
-    hash_launch_bytes(hash, &launch.single_token_mode, sizeof(launch.single_token_mode));
-    hash_launch_bytes(hash, &launch.has_user_mask, sizeof(launch.has_user_mask));
-    hash_launch_bytes(hash, &launch.required_kv_pages, sizeof(launch.required_kv_pages));
-    PIE_HASH_SLICE(image_indptr);
-    PIE_HASH_SLICE(image_grids);
-    PIE_HASH_SLICE(image_anchor_positions);
-    hash_launch_slice(hash, launch.image_pixels.ptr, launch.image_pixels.len);
-    PIE_HASH_SLICE(image_pixel_indptr);
-    PIE_HASH_SLICE(image_mrope_positions);
-    PIE_HASH_SLICE(image_mrope_indptr);
-    PIE_HASH_SLICE(image_patch_positions);
-    PIE_HASH_SLICE(image_anchor_rows);
-    hash_launch_slice(hash, launch.audio_features.ptr, launch.audio_features.len);
-    PIE_HASH_SLICE(audio_feature_indptr);
-    PIE_HASH_SLICE(audio_anchor_rows);
-    PIE_HASH_SLICE(audio_indptr);
-    hash_launch_slice(hash, launch.embed_rows.ptr, launch.embed_rows.len);
-    PIE_HASH_SLICE(embed_indptr);
-    PIE_HASH_SLICE(embed_shapes);
-    PIE_HASH_SLICE(embed_dtypes);
-    PIE_HASH_SLICE(embed_anchor_rows);
-    PIE_HASH_SLICE(embed_block_indptr);
-    PIE_HASH_SLICE(kv_len);
-    PIE_HASH_SLICE(kv_len_device);
-    PIE_HASH_SLICE(kv_translation);
-    PIE_HASH_SLICE(kv_translation_indptr);
-    PIE_HASH_SLICE(ptir_program_row_indptr);
-    PIE_HASH_SLICE(ptir_kv_write_lower_bounds);
-    PIE_HASH_SLICE(ptir_kv_write_upper_bounds);
-    PIE_HASH_SLICE(logical_fire_ids);
-    PIE_HASH_SLICE(channel_expected_head);
-    PIE_HASH_SLICE(channel_expected_tail);
-    PIE_HASH_SLICE(channel_ticket_indptr);
-#undef PIE_HASH_SLICE
-    return hash;
-}
-
 struct TpStartupBarrier {
     std::mutex mu;
     std::condition_variable cv;
@@ -501,7 +416,6 @@ class Context::Impl {
     }
 
     struct LaunchLease {
-        std::uint64_t fingerprint = 0;
         std::array<std::size_t, 4> target_bytes{};
     };
 
@@ -1820,10 +1734,25 @@ int Context::Impl::prepare_launch(
     const int status = validate_finalized_launch(
         launch, &instances, &scratch, &view);
     if (status != PIE_STATUS_OK) return status;
-    recalibrate_elastic_budget(/*reset_hard_ceiling=*/false);
     std::array<std::size_t, 4> target_bytes{};
+    const auto targets = launch_targets(launch, &target_bytes);
+    const std::array<std::size_t, 4> committed_bytes = {
+        kv_allocator_->committed_bytes(),
+        state_allocator_->committed_bytes(),
+        workspace_allocator_->committed_bytes(),
+        attention_allocator_->committed_bytes(),
+    };
+    const bool needs_growth = std::equal(
+        target_bytes.begin(), target_bytes.end(),
+        committed_bytes.begin(),
+        [](std::size_t target, std::size_t committed) {
+            return target <= committed;
+        }) == false;
+    if (needs_growth) {
+        recalibrate_elastic_budget(/*reset_hard_ceiling=*/false);
+    }
     const auto commit = pie_cuda_driver::commit_cuda_arena_targets_atomically(
-        elastic_pool_, launch_targets(launch, &target_bytes));
+        elastic_pool_, targets);
     result->budget_generation = commit.generation;
     result->required_pages = commit.required_pages;
     result->budget_pages = commit.budget_pages;
@@ -1841,7 +1770,6 @@ int Context::Impl::prepare_launch(
     launch_leases_.emplace(
         lease_id,
         LaunchLease{
-            launch_fingerprint(launch),
             target_bytes,
         });
     result->outcome = PIE_LAUNCH_PREPARE_READY;
@@ -1918,10 +1846,6 @@ int Context::Impl::launch_impl(
         lease = found->second;
         launch_leases_.erase(found);
     }
-    if (lease.has_value() &&
-        lease->fingerprint != launch_fingerprint(launch)) {
-        return PIE_STATUS_INVALID_ARGUMENT;
-    }
     pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
         runtime_quant_context_);
     std::vector<pie_cuda_driver::pipeline::InstanceRecord> launch_instances;
@@ -1930,6 +1854,16 @@ int Context::Impl::launch_impl(
     const int validation_status = validate_finalized_launch(
         launch, &launch_instances, &scratch, &view);
     if (validation_status != PIE_STATUS_OK) return validation_status;
+    if (lease.has_value()) {
+        std::array<std::size_t, 4> launch_target_bytes{};
+        static_cast<void>(launch_targets(
+            launch, &launch_target_bytes));
+        for (std::size_t i = 0; i < launch_target_bytes.size(); ++i) {
+            if (launch_target_bytes[i] > lease->target_bytes[i]) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
     bool lease_in_flight = false;
     try {
         const int launch_required_kv_pages = required_kv_pages(launch);

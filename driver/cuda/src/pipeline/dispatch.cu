@@ -453,7 +453,7 @@ __global__ void compose_fixed_decode(
     if (valid) {
         const auto* commit =
             fixed_decode_pointer<std::uint32_t>(
-                descriptor->pass_commit);
+            descriptor->pass_commit);
         valid = commit != nullptr && *commit != 0;
         for (std::size_t port = 0;
              port < kFixedDecodePortCount;
@@ -4442,8 +4442,7 @@ bool Dispatch::enqueue_decode_envelopes(
         const PortBinding* embed_indptr = nullptr;
         for (const PortBinding& binding :
              found->second.trace->ports) {
-            if (binding.port == kPortEmbedIndptr &&
-                       binding.is_const) {
+            if (binding.port == kPortEmbedIndptr) {
                 embed_indptr = &binding;
             } else if (!binding.is_const) {
                 if (binding.port == kPortEmbedTokens) {
@@ -4467,7 +4466,7 @@ bool Dispatch::enqueue_decode_envelopes(
         std::vector<std::uint32_t> qo_indptr;
         if (embed_indptr == nullptr) {
             qo_indptr = {0, token_shape[0]};
-        } else {
+        } else if (embed_indptr->is_const) {
             if (embed_indptr->const_data.size() % sizeof(std::uint32_t) != 0) {
                 return fail(
                     "decode envelope: const EmbedIndptr is not u32-aligned");
@@ -4478,6 +4477,11 @@ bool Dispatch::enqueue_decode_envelopes(
                 qo_indptr.data(),
                 embed_indptr->const_data.data(),
                 embed_indptr->const_data.size());
+        } else {
+            qo_indptr.resize(static_cast<std::size_t>(token_shape[0]) + 1);
+            for (std::size_t row = 0; row < qo_indptr.size(); ++row) {
+                qo_indptr[row] = static_cast<std::uint32_t>(row);
+            }
         }
         if (qo_indptr.size() < 2 ||
             qo_indptr.front() != 0 ||
@@ -4731,12 +4735,9 @@ bool Dispatch::enqueue_fixed_decode(
             }
             program_ports.by_tag[binding.port] = &binding;
         }
-        if (program_ports.by_tag[kPortEmbedIndptr] != nullptr ||
-            program_ports.by_tag[kPortReadout] != nullptr ||
-            program_ports.by_tag[kPortAttnMask] != nullptr) {
+        if (program_ports.by_tag[kPortAttnMask] != nullptr) {
             if (err != nullptr) {
-                *err = "ptir fixed decode cannot compose embed-indptr, "
-                       "readout, or attention-mask ports";
+                *err = "ptir fixed decode cannot compose attention-mask ports";
             }
             return false;
         }
@@ -4772,7 +4773,13 @@ bool Dispatch::enqueue_fixed_decode(
             channel_dtype(kPortPageIndptr) != DType::U32 ||
             channel_dtype(kPortKvLen) != DType::U32 ||
             channel_dtype(kPortWSlot) != DType::U32 ||
-            channel_dtype(kPortWOff) != DType::U32) {
+            channel_dtype(kPortWOff) != DType::U32 ||
+            (program_ports.by_tag[kPortEmbedIndptr] != nullptr &&
+             (channel_numel(kPortEmbedIndptr) != 2 ||
+              channel_dtype(kPortEmbedIndptr) != DType::U32)) ||
+            (program_ports.by_tag[kPortReadout] != nullptr &&
+             (channel_numel(kPortReadout) != 1 ||
+              channel_dtype(kPortReadout) != DType::U32))) {
             if (err != nullptr) {
                 *err = "ptir fixed decode channel shapes or dtypes do not "
                        "match the envelope";
@@ -5080,9 +5087,9 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         }
         ResolvedPrograms candidate;
         candidate.per_program.resize(n_prog);
-        candidate.is_device_geometry.assign(n_prog, 1);
-        candidate.device_count = n_prog;
-        candidate.device_composed = true;
+        candidate.is_device_geometry.assign(n_prog, 0);
+        candidate.device_count = 0;
+        bool all_decode_envelopes = true;
         auto constant_is = [](const PortBinding* binding,
                               std::span<const std::uint32_t> expected) {
             if (binding == nullptr) return true;
@@ -5100,6 +5107,10 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         for (std::size_t p = 0; p < n_prog; ++p) {
             BoundInstance& instance = s.instances.at(
                 view.ptir_program_instances.data()[p]);
+            if (instance.geometry_class == PIE_GEOMETRY_CLASS_HOST) {
+                all_decode_envelopes = false;
+                continue;
+            }
             if (instance.geometry_class !=
                     PIE_GEOMETRY_CLASS_DECODE_ENVELOPE ||
                 instance.trace == nullptr) {
@@ -5116,14 +5127,14 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 if (slot != nullptr) return false;
                 slot = &binding;
             }
-            if (dynamic[kPortEmbedIndptr] != nullptr ||
-                dynamic[kPortReadout] != nullptr ||
-                dynamic[kPortAttnMask] != nullptr ||
+            if (dynamic[kPortAttnMask] != nullptr ||
                 constants[kPortAttnMask] != nullptr ||
-                !constant_is(
-                    constants[kPortEmbedIndptr], default_indptr) ||
-                !constant_is(
-                    constants[kPortReadout], default_readout)) {
+                (dynamic[kPortEmbedIndptr] == nullptr &&
+                 !constant_is(
+                     constants[kPortEmbedIndptr], default_indptr)) ||
+                (dynamic[kPortReadout] == nullptr &&
+                 !constant_is(
+                     constants[kPortReadout], default_readout))) {
                 return false;
             }
             constexpr std::array<std::uint8_t, 7> required{
@@ -5155,10 +5166,22 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             const Channel* kv_len = channel(kPortKvLen);
             const Channel* w_slot = channel(kPortWSlot);
             const Channel* w_off = channel(kPortWOff);
+            const Channel* embed_indptr =
+                dynamic[kPortEmbedIndptr] != nullptr
+                    ? channel(kPortEmbedIndptr)
+                    : nullptr;
+            const Channel* readout =
+                dynamic[kPortReadout] != nullptr
+                    ? channel(kPortReadout)
+                    : nullptr;
             if (tokens == nullptr || positions == nullptr ||
                 pages == nullptr || page_indptr == nullptr ||
                 kv_len == nullptr || w_slot == nullptr ||
-                w_off == nullptr) {
+                w_off == nullptr ||
+                (dynamic[kPortEmbedIndptr] != nullptr &&
+                 embed_indptr == nullptr) ||
+                (dynamic[kPortReadout] != nullptr &&
+                 readout == nullptr)) {
                 return false;
             }
             const auto& page_dims = pages->type.shape.dims;
@@ -5178,7 +5201,14 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 page_indptr->type.dtype != DType::U32 ||
                 kv_len->type.dtype != DType::U32 ||
                 w_slot->type.dtype != DType::U32 ||
-                w_off->type.dtype != DType::U32) {
+                w_off->type.dtype != DType::U32 ||
+                (embed_indptr != nullptr &&
+                 (embed_indptr->type.dtype != DType::U32 ||
+                  embed_indptr->type.shape.dims !=
+                      std::vector<std::uint32_t>{2})) ||
+                (readout != nullptr &&
+                 (readout->type.dtype != DType::U32 ||
+                  readout->type.shape.numel() != 1))) {
                 return false;
             }
             const std::uint32_t translation_begin =
@@ -5204,7 +5234,11 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             geometry.w_off = {0};
             geometry.has_kv_family = true;
             geometry.has_write_desc = true;
+            candidate.is_device_geometry[p] = 1;
+            ++candidate.device_count;
         }
+        if (candidate.device_count == 0) return false;
+        candidate.device_composed = all_decode_envelopes;
         out = std::move(candidate);
         return true;
     };
