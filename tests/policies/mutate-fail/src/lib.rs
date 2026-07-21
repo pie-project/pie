@@ -5,7 +5,9 @@ struct MutateFail;
 
 impl Policy for MutateFail {
     fn route(input: &mut Document) -> Result<Document, String> {
-        input["request"]["state"]["should_not_commit"] = json!(true);
+        let request_id = input["request_id"].as_str().unwrap_or("").to_owned();
+        input["requests"][request_id.as_str()]["scratch"]["should_not_commit"] = json!(true);
+        input["global"]["scratch"]["should_not_commit"] = json!(true);
         Err("fallback-required".into())
     }
 }

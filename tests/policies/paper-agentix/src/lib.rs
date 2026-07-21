@@ -14,7 +14,8 @@ impl Policy for Agentix {
         let decisions = runnable
             .iter()
             .map(|candidate| {
-                let service = candidate["request"]["state"]["attained_service"]
+                let request_id = candidate["request_id"].as_str().unwrap_or("");
+                let service = input["requests"][request_id]["facts"]["attained_service"]
                     .as_u64()
                     .unwrap_or(0);
                 let waiting = candidate["facts"]["waiting_ms"].as_u64().unwrap_or(0);
@@ -33,15 +34,21 @@ impl Policy for Agentix {
     }
 
     fn feedback(input: &mut Document) -> Result<Document, String> {
-        for record in input["records"]
-            .as_array_mut()
+        let records = input["records"]
+            .as_array()
             .ok_or("records must be an array")?
-        {
-            let service = record["facts"]["service_us"].as_u64().unwrap_or(0);
-            let previous = record["request"]["state"]["attained_service"]
-                .as_u64()
-                .unwrap_or(0);
-            record["request"]["state"]["attained_service"] = json!(previous + service);
+            .iter()
+            .map(|record| {
+                (
+                    record["request_id"].as_str().unwrap_or("").to_owned(),
+                    record["facts"]["service_us"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (request_id, service) in records {
+            let request = &mut input["requests"][request_id.as_str()];
+            let previous = request["scratch"]["observed_service"].as_u64().unwrap_or(0);
+            request["scratch"]["observed_service"] = json!(previous + service);
         }
         Ok(json!({}))
     }

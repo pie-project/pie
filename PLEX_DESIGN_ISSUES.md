@@ -1,106 +1,134 @@
-# PLEX JSON PoC Design Record
+# PLEX JSON State-Map Design Record
 
 ## Current Decision
 
-PLEX now uses a breaking, intentionally untyped `pie:plex@0.2.0` research ABI.
-One JSON string crosses the Wasm boundary in each direction. The prior v0.1
-handle/schema/column/map design has been removed rather than retained behind
-compatibility adapters.
+PLEX uses the breaking, intentionally untyped `pie:plex@0.3.0` research ABI.
+One JSON string crosses the Wasm boundary in each direction. The removed v0.1
+handle/schema/column/map system and the v0.2 embedded request document are not
+retained behind compatibility adapters.
 
-## Lifecycle Boundary
+## State Model
 
-The five operations remain:
+Every invocation receives:
 
-- `route`
-- `admit`
-- `schedule`
-- `evict`
-- `feedback`
+- one process-local global map;
+- one map per referenced logical request;
+- transient operation context.
 
-`admit` is target-local generation admission and follows `route` for every
-generation:
+Both persistent scopes contain exactly:
 
 ```text
-route -> admit -> schedule
+facts
+fields
+scratch
 ```
 
-Initial generations, continuations, and placement-changing stage transitions
-all follow this sequence.
+`facts` is host-written and policy-read-only. `fields` is policy-writable and
+engine-interpreted. `scratch` is policy-writable and engine-opaque.
 
-## Trust and Mutation
+The global map is shared by every active operation owner in a
+`LifecycleHost`. Request maps survive hooks and continuations and are removed
+at terminal completion.
 
-Operator-installed policy code is trusted with full request contents.
+## Identity and Observations
 
-- `identity` is host-owned and immutable.
-- `body`, `metadata`, and `state` are mutable dictionaries.
-- request mutation becomes visible to subsequent hooks only after the complete
-  policy response validates.
-- failure discards the invocation's mutation.
-
-User metadata is arbitrary input, not a typed or trusted fact vocabulary.
-
-## State
-
-Policy state retained across hooks in this milestone is request-local:
+Request identity moved to host facts:
 
 ```text
-request.state
+requests[id].facts.logical_request_id
+requests[id].facts.generation_id
 ```
 
-The in-process canonical request store preserves state and shallow-merges
-metadata across continuations. Mutable package-global maps, typed map schemas,
-revision transactions, and cross-process state are removed.
+The map key must match `logical_request_id`.
 
-Feedback retains bounded process-local delivery deduplication so duplicate
-events do not apply request mutation twice.
+Actual placement is recorded only after enactment through
+`record_enacted_placement`. Route scores and admission acceptance do not
+speculatively change `previous_target`.
 
-## ABI
+Host-observed service belongs in facts. Policy predictions, debt models, and
+derived accounting belong in scratch.
 
-All five component exports accept `string` and return `result<string, string>`.
-Components import no PLEX interfaces and no WASI interfaces.
+## Mutation Rule
 
-The simplified manifest contains only package identity, owned operations, and
-memory/fuel/deadline/input/output limits.
+A response may change only:
 
-## Retained Host Guarantees
+```text
+global.fields
+global.scratch
+requests[id].fields
+requests[id].scratch
+```
 
-The PoC still enforces:
+Facts, request-map membership, candidate/event facts, capacity, identities,
+causes, delivery IDs, capabilities, and all other transient context are
+read-only.
 
-- package integrity and size limits;
-- zero component imports;
-- fresh Wasm instances;
-- memory, fuel, deadline, input, and output bounds;
-- finite aligned scores;
-- token-budget capability and bounds;
-- request identity immutability;
-- candidate count/order/identity immutability;
-- native fallback on any invalid result or failure;
-- atomic package publication and replacement.
+Attempted read-only mutation causes fallback. The host does not silently
+restore it.
+
+## Atomicity and Concurrency
+
+One `LifecycleHost` mutex serializes:
+
+```text
+hydrate -> invoke -> validate -> commit
+```
+
+Global and request mutations commit atomically only after complete response
+validation. `route -> admit` holds the same gate across the sequence while
+making each successful mutation visible to the next hook.
+
+This is the simplest intentional PoC tradeoff. Revisions, CAS loops,
+distributed transactions, and scalable concurrent state updates are deferred.
+
+## Feedback
+
+Feedback deduplication is part of the state store. Mutation and delivery-ID
+commit happen atomically. Duplicates skip Wasm and return the cached result.
+The ledger survives package replacement but not process restart.
+
+## Continuations
+
+Continuation creation:
+
+- preserves request fields and scratch;
+- replaces `fields.body`;
+- shallow-merges `fields.metadata`;
+- increments host-owned generation;
+- preserves durable facts such as `previous_target`;
+- clears the explicit generation-local key `current_target`.
+
+## Retained Runtime Guarantees
+
+The PoC retains package integrity, zero imports, fresh Wasm instances,
+memory/fuel/deadline/input/output bounds, aligned finite scores, budget bounds,
+native fallback, deterministic replay, and atomic package publication.
 
 ## Intentional Tradeoffs
 
-Returning the complete mutated input is inefficient but makes mutation
-semantics obvious. There is no patch language or typed accessor layer.
-
-Missing keys and unexpected JSON types are ordinary policy cases. A policy may
-default them or return `fallback-required`.
-
-The host does not automatically reroute when admit or schedule changes a
-prompt. Trusted policy code owns consistency between mutation and decision.
+- Full mutated JSON is returned instead of a patch.
+- Policies share one global namespace and coordinate key ownership by
+  convention.
+- JSON shape validation is minimal and untyped.
+- State and deduplication are process-local.
+- Stateful invocations are serialized.
+- The host does not automatically reroute after policy request mutation.
 
 ## Deferred
 
 - typed schemas and efficient encodings;
-- capability and field linking;
-- provenance-enforced metadata/facts;
-- mutable cross-request global state;
-- distributed request state;
+- generated request models;
+- field/map/event/capability handles;
+- provenance-enforced facts;
+- per-package global isolation;
+- distributed/persistent state;
 - crash-durable deduplication;
+- scalable state transactions;
 - automatic mutation dependency tracking;
 - candidate-local indexes;
 - shared-unit multi-owner mutation;
 - prefetch/rebalance;
 - production Pie adapters.
 
-`plex_paper.md` remains unchanged; reconciling paper claims with the JSON PoC
-is a separate task.
+`plex_paper.md` remains unchanged. Paper reconciliation and measurements are
+separate work.

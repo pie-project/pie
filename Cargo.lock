@@ -3690,7 +3690,7 @@ dependencies = [
 
 [[package]]
 name = "pie-plex"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3699,7 +3699,7 @@ dependencies = [
 
 [[package]]
 name = "pie-policy"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "pie-plex",

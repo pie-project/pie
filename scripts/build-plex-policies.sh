@@ -27,9 +27,13 @@ for artifact in \
     plex_feedback_accounting \
     plex_least_loaded \
     plex_malformed \
+    plex_mutate_candidate_facts \
     plex_mutate_candidates \
     plex_mutate_fail \
+    plex_mutate_feedback_facts \
+    plex_mutate_global_facts \
     plex_mutate_identity \
+    plex_mutate_request_set \
     plex_nonfinite \
     plex_paper_agentix \
     plex_paper_continuum \
@@ -46,8 +50,8 @@ do
         "$target/wasm32-unknown-unknown/release/$artifact.wasm" \
         -o "$component"
     wit="$(wasm-tools component wit "$component")"
-    if ! grep -q '^  export pie:plex/policy@0.2.0;$' <<<"$wit"; then
-        echo "$artifact does not export pie:plex/policy@0.2.0" >&2
+    if ! grep -q '^  export pie:plex/policy@0.3.0;$' <<<"$wit"; then
+        echo "$artifact does not export pie:plex/policy@0.3.0" >&2
         exit 1
     fi
     if grep -q '^  import ' <<<"$wit"; then

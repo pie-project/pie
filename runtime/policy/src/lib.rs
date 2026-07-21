@@ -12,7 +12,7 @@ mod package_format;
 mod protocol;
 mod registry;
 mod replay;
-mod request_store;
+mod state_store;
 
 pub use engine::{PolicyEngine, PolicyEngineConfig};
 pub use error::{AttachmentError, Invocation, InvocationFailure, InvocationFailureKind};
@@ -25,4 +25,4 @@ pub use replay::{
     ReplayCommand, ReplayDivergence, ReplayError, ReplayOutcome, ReplayReport, ReplayRunner,
     ReplaySetupError, ReplayTrace,
 };
-pub use request_store::{CanonicalRequestStore, RequestStoreError};
+pub use state_store::{PolicyStateStore, StateStoreError};

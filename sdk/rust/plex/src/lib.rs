@@ -1,4 +1,4 @@
-//! JSON guest SDK for the breaking PLEX v0.2 proof of concept.
+//! JSON guest SDK for the breaking PLEX v0.3 proof of concept.
 
 #![forbid(unsafe_code)]
 
@@ -96,13 +96,16 @@ mod tests {
 
     #[test]
     fn wrapper_returns_mutated_input_and_result() {
-        let response = invoke(r#"{"request":{"state":{}}}"#.into(), |input| {
-            input["request"]["state"]["calls"] = serde_json::json!(1);
-            Ok(serde_json::json!({"decision": "accept"}))
-        })
+        let response = invoke(
+            r#"{"global":{"facts":{},"fields":{},"scratch":{}},"requests":{}}"#.into(),
+            |input| {
+                input["global"]["scratch"]["calls"] = serde_json::json!(1);
+                Ok(serde_json::json!({"decision": "accept"}))
+            },
+        )
         .unwrap();
         let response: Document = serde_json::from_str(&response).unwrap();
-        assert_eq!(response["input"]["request"]["state"]["calls"], 1);
+        assert_eq!(response["input"]["global"]["scratch"]["calls"], 1);
         assert_eq!(response["result"]["decision"], "accept");
     }
 

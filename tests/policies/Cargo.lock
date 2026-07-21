@@ -96,7 +96,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "pie-plex-sdk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "wit-bindgen",
@@ -152,6 +152,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-mutate-candidate-facts"
+version = "0.3.0"
+dependencies = [
+ "pie-plex-sdk",
+]
+
+[[package]]
 name = "plex-mutate-candidates"
 version = "0.2.0"
 dependencies = [
@@ -166,8 +173,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "plex-mutate-feedback-facts"
+version = "0.3.0"
+dependencies = [
+ "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-mutate-global-facts"
+version = "0.3.0"
+dependencies = [
+ "pie-plex-sdk",
+]
+
+[[package]]
 name = "plex-mutate-identity"
 version = "0.2.0"
+dependencies = [
+ "pie-plex-sdk",
+]
+
+[[package]]
+name = "plex-mutate-request-set"
+version = "0.3.0"
 dependencies = [
  "pie-plex-sdk",
 ]

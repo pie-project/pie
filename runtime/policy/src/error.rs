@@ -27,7 +27,7 @@ pub enum AttachmentError {
     UnsupportedImport(String),
     #[error("policy component exports unsupported interface {0}")]
     UnsupportedExport(String),
-    #[error("policy component does not export pie:plex/policy@0.2.0")]
+    #[error("policy component does not export pie:plex/policy@0.3.0")]
     MissingPolicyExport,
 }
 

@@ -1,240 +1,212 @@
-# PLEX JSON Policy PoC
+# PLEX JSON State-Map PoC
 
 ## Status
 
-PLEX is currently implemented as an intentionally untyped JSON proof of
-concept. Its purpose is to validate:
+PLEX is an intentionally untyped policy research subsystem with a breaking
+`pie:plex@0.3.0` ABI. It validates:
 
-- the five-operation policy boundary;
+- five serving-policy operations;
 - `route -> admit -> schedule` for every generation;
-- trusted policy mutation of complete request documents;
-- request-local state across hooks and tool continuations;
-- deterministic score and token-budget mechanics;
-- failure rollback and native fallback;
-- portable, bounded Wasm execution.
+- one process-local global map;
+- one process-local map per logical request;
+- explicit host/policy ownership within those maps;
+- atomic JSON mutation and native fallback;
+- feedback idempotency;
+- deterministic score and token-budget mechanics; and
+- bounded, replaceable Wasm policy execution.
 
-The breaking ABI is `pie:plex@0.2.0`. It is a research ABI, not the final
-efficient or typed representation.
+PLEX remains isolated from live Pie gateway, worker, scheduler, KV-reclaim,
+and inferlet mechanics. Adapters for those systems are future work.
 
-PLEX remains independent from live Pie mechanics. It does not yet modify
-gateway routing, worker RPC, the engine scheduler, KV reclaim, or inferlet
-lifecycle code.
+## Design Boundary
 
-## Lifecycle
-
-Every generation follows:
+The five operations are:
 
 ```text
-route -> admit -> schedule
+route
+admit
+schedule
+evict
+feedback
 ```
 
-This applies to:
+All five use one mutable JSON object. The ABI has no WIT records, schemas,
+handles, typed maps, host calls, or imported capabilities.
 
-- the initial generation;
-- a tool continuation;
-- any later generation under the same logical request;
-- a stage transition that performs a new placement/admission decision.
+The persistent state model has two scopes:
 
-A tool boundary is:
+1. one global map shared by all active operation owners in a `LifecycleHost`;
+2. one request map for each logical request.
 
-```text
-feedback(tool-boundary)
--> external tool execution
--> create continuation generation
--> route(continuation)
--> admit(continuation)
--> schedule
-```
-
-`route` ranks host-provided feasible targets. The host invokes `admit` on the
-highest-ranked target:
-
-- `accept`: enqueue the generation;
-- `reject`: try the next ranked target;
-- `defer`: retry the same target up to a small host-defined bound.
-
-The PoC does not implement a distributed placement retry protocol.
+Operation-specific candidates, facts, capacity, records, and causes are
+transient host-owned context.
 
 ## Trust Model
 
-Operator-installed policy code is trusted to inspect and rewrite request
-content. Wasm is used for:
+Operator-installed policy code is trusted to inspect request contents and to
+write policy-owned namespaces. Wasm provides:
 
 - a portable ABI;
 - memory isolation;
 - bounded execution;
-- trap containment;
+- trap containment; and
 - package replacement.
 
-Wasm is not an authorization boundary between a policy and a request.
+Wasm is not an authorization boundary between a policy and request data.
+Namespace ownership is nevertheless validated to catch policy bugs and protect
+host observations.
 
-Every hook may read and modify:
+## Persistent Map Shape
 
-- prompts and messages;
-- token IDs;
-- sampling parameters;
-- model or adapter selection;
-- tool definitions;
-- output constraints;
-- user metadata;
-- request-local policy state;
-- any additional request dictionary keys.
-
-Only `request.identity` is immutable.
-
-## Repository Layout
-
-```text
-interface/plex/          Minimal JSON contract and host fill validation
-interface/plex/wit/      Canonical pie:plex@0.2.0 WIT
-runtime/policy/          Package, Wasmtime host, registry, request store, replay
-sdk/rust/plex/           serde_json::Value guest SDK
-tests/policies/          JSON reference, failure, and research policies
-```
-
-`pie-policy` depends on `pie-plex`, never on Pie gateway, worker, or engine
-mechanics. `scripts/check-plex-layering.sh` enforces the boundary.
-
-## Wasm ABI
-
-The complete WIT surface is:
-
-```wit
-package pie:plex@0.2.0;
-
-interface policy {
-    route: func(input-json: string) -> result<string, string>;
-    admit: func(input-json: string) -> result<string, string>;
-    schedule: func(input-json: string) -> result<string, string>;
-    evict: func(input-json: string) -> result<string, string>;
-    feedback: func(input-json: string) -> result<string, string>;
-}
-
-world plex-policy {
-    export policy;
-}
-```
-
-There are no PLEX imports and no WASI imports.
-
-All five exports are statically present. The manifest declares which
-operations the package owns. An unimplemented operation returns
-`fallback-required`.
-
-## Manifest
-
-The manifest contains only:
-
-- exact contract version;
-- package name;
-- package version;
-- owned operations;
-- memory limit;
-- fuel limit;
-- deadline;
-- maximum input bytes;
-- maximum output bytes.
-
-Unknown manifest fields are rejected. There are no field, map, event,
-metadata, capability, or invocation-mode schemas.
-
-Set-dependent invocation is the only mode.
-
-## Request Document
-
-The canonical request shape is:
+Both persistent scopes contain exactly three object-valued namespaces:
 
 ```json
 {
-  "identity": {
-    "logical_request_id": "opaque-host-id",
-    "generation_id": 0
+  "facts": {},
+  "fields": {},
+  "scratch": {}
+}
+```
+
+Values below those namespaces are arbitrary JSON.
+
+### Ownership
+
+| Namespace | Writer | Meaning |
+|---|---|---|
+| `facts` | Host only | Configuration, identity, and enacted observations |
+| `fields` | Policy | Values an adapter or engine may interpret |
+| `scratch` | Policy | State persisted by the host but opaque to the engine |
+
+Policies may change `fields` and `scratch`. Any attempted mutation of `facts`
+invalidates the whole response and triggers fallback.
+
+## Global Map
+
+There is one global map per `LifecycleHost`:
+
+```json
+{
+  "facts": {
+    "config": {},
+    "model": "example-model",
+    "replica_count": 4
   },
-  "body": {},
-  "metadata": {},
-  "state": {}
+  "fields": {
+    "scheduler": {}
+  },
+  "scratch": {
+    "acme.routing": {},
+    "acme.scheduler": {}
+  }
 }
 ```
 
 Semantics:
 
-- `identity` is host-owned and immutable;
-- `body` is an arbitrary mutable object;
-- `metadata` is arbitrary mutable user/application input;
-- `state` is arbitrary mutable policy-owned request state;
-- extra request keys are preserved;
-- valid hook mutations become visible to later hooks.
+- all active PLEX packages in the host share the same map;
+- state survives invocations, request completion, and package replacement;
+- `facts` may change through explicit host methods;
+- `fields` may carry engine-interpreted policy output;
+- `scratch` is arbitrary cross-request policy state;
+- `reset_global` clears `fields` and `scratch` but preserves facts;
+- process restart clears the entire in-memory store.
 
-The in-process `CanonicalRequestStore` owns one current request document per
-logical request.
+There is no per-package isolation. Independently authored policies must
+namespace shared keys by convention.
 
-### Continuations
+## Request Maps
 
-Creating a continuation:
-
-1. increments `generation_id`;
-2. installs the newly supplied body;
-3. preserves prior `state`;
-4. preserves prior metadata;
-5. shallow-merges new metadata over prior metadata;
-6. lets the new value win on duplicate keys.
-
-Terminal feedback may be followed by removal of the canonical request.
-
-Distributed request-state propagation is not implemented.
-
-## Policy Response
-
-The SDK wrapper returns:
+Each logical request has:
 
 ```json
 {
-  "input": {},
-  "result": {}
+  "facts": {
+    "logical_request_id": "L",
+    "generation_id": 1,
+    "previous_target": "node-a",
+    "attained_service": 128
+  },
+  "fields": {
+    "body": {
+      "prompt": "hello"
+    },
+    "metadata": {
+      "workflow_id": "wf-1"
+    }
+  },
+  "scratch": {
+    "route_count": 2,
+    "predicted_tokens": 64
+  }
 }
 ```
 
-`input` is the complete mutated operation input. `result` is the
-operation-specific decision.
+`facts.logical_request_id` must match the key in the invocation's `requests`
+object. `facts.generation_id` is host-owned.
 
-Returning the entire input is intentionally inefficient. The PoC has no patch
-language, diff representation, column encoding, or typed accessor layer.
+`fields.body` is the mutable engine request. `fields.metadata` contains
+arbitrary user/application metadata and is also policy-mutable. `scratch`
+holds request-local policy state.
 
-The host commits request mutation only after:
+The host creates and removes request maps. A policy cannot create, delete, or
+rename them.
 
-1. Wasm returns successfully;
-2. output JSON parses;
-3. the wrapper shape validates;
-4. immutable host fields validate;
-5. the operation result validates.
+## Uniform Invocation Envelope
 
-Any failure discards the returned mutation.
-
-## Operation Conventions
-
-These are host-validated JSON conventions, not WIT schemas. Additional keys
-are allowed and preserved unless they belong to host-owned candidate/context
-data.
-
-### `route`
-
-Input:
+Every actual Wasm invocation receives:
 
 ```json
 {
-  "cause": "generation-arrival",
-  "request": {},
+  "global": {
+    "facts": {},
+    "fields": {},
+    "scratch": {}
+  },
+  "requests": {
+    "L": {
+      "facts": {},
+      "fields": {},
+      "scratch": {}
+    }
+  },
+  "... operation-specific context ...": {}
+}
+```
+
+`requests` contains each referenced request exactly once. Transient objects
+refer to a request with `request_id`.
+
+Callers of `LifecycleHost` provide only transient context and request IDs.
+`PolicyStateStore` hydrates canonical global/request maps before invoking Wasm.
+Caller-supplied `global` or `requests` state is rejected.
+
+Extra canonical request maps that are not referenced are not exposed.
+Duplicate references share one object rather than receiving duplicated copies.
+
+## Operation Contracts
+
+These contracts are JSON conventions validated by the host, not typed WIT
+schemas.
+
+### `route`
+
+```json
+{
+  "cause": "continuation",
+  "request_id": "L",
   "candidates": [
     {
       "id": "node-a",
       "facts": {
         "queue_depth": 10,
-        "cached_tokens": 800
+        "cached_tokens": 2048,
+        "has_request_kv": true
       }
     }
   ],
   "context": {
-    "config": {}
+    "capabilities": {}
   }
 }
 ```
@@ -247,21 +219,18 @@ Result:
 
 Rules:
 
-- exactly one finite score per candidate;
-- higher score is preferred;
+- return exactly one finite score per candidate;
+- higher scores rank first;
 - ties retain input order;
-- candidate count, order, and ID are immutable;
-- candidate/context mutations have no effect;
-- `request` is fully mutable.
+- candidate count, order, identity, and facts are read-only;
+- the referenced request and global map may mutate in writable namespaces.
 
 ### `admit`
-
-Input:
 
 ```json
 {
   "cause": "continuation",
-  "request": {},
+  "request_id": "L",
   "target": {
     "id": "node-a",
     "facts": {
@@ -270,7 +239,7 @@ Input:
     }
   },
   "context": {
-    "config": {}
+    "capabilities": {}
   }
 }
 ```
@@ -281,20 +250,18 @@ Result:
 {"decision": "accept"}
 ```
 
-`decision` must be `accept`, `defer`, or `reject`. Target identity and context
-are host-owned. The complete request remains mutable for every decision,
-including defer and reject.
+`decision` is `accept`, `defer`, or `reject`. The target and all transient
+context are read-only. Writable global/request mutations commit even for a
+valid defer or reject decision.
 
 ### `schedule`
-
-Input:
 
 ```json
 {
   "cause": "service-step",
   "runnable": [
     {
-      "request": {},
+      "request_id": "L",
       "facts": {
         "waiting_ms": 12
       },
@@ -307,7 +274,6 @@ Input:
     "max_token_budget": 8
   },
   "context": {
-    "config": {},
     "capabilities": {
       "token_budget": true
     }
@@ -330,23 +296,18 @@ Result:
 
 Rules:
 
-- one decision per runnable entry;
-- finite scores only;
-- higher score first;
-- stable ties;
-- missing/null budget requests the candidate/host maximum;
-- zero requests no service;
-- explicit budgets require capability;
-- explicit budgets may not exceed candidate or host bounds;
-- `runnable[i].request` is mutable;
-- runnable order, identity, facts, limits, capacity, and context are host-owned.
+- return one decision per runnable entry;
+- scores are finite, descending, and stably ordered;
+- missing or null budget requests the candidate/host maximum;
+- zero budget requests no service;
+- explicit budgets require `token_budget` capability;
+- budgets may not exceed candidate or host bounds;
+- stable greedy fill enforces selected-count and total-token capacity.
 
-The host uses a stable descending greedy fill under `max_selected` and
-`max_total_tokens`.
+The same request ID may occur more than once. It remains one shared request map
+while operation decisions stay aligned with runnable entries.
 
 ### `evict`
-
-Input:
 
 ```json
 {
@@ -354,16 +315,22 @@ Input:
   "bytes_needed": 4096,
   "resident": [
     {
-      "id": "host-unit",
+      "id": "unit-1",
+      "request_id": "L",
       "size_bytes": 4096,
-      "request": {},
       "facts": {
         "reload_cost": 200.0
       }
+    },
+    {
+      "id": "shared-unit",
+      "request_id": null,
+      "size_bytes": 4096,
+      "facts": {}
     }
   ],
   "context": {
-    "config": {}
+    "capabilities": {}
   }
 }
 ```
@@ -371,40 +338,37 @@ Input:
 Result:
 
 ```json
-{"scores": [200.0]}
+{"scores": [200.0, 100.0]}
 ```
 
-Scores are retention scores:
-
-- one finite score per resident unit;
-- lower scores are reclaimed first;
-- ties retain input order;
-- reclaim continues until `bytes_needed` is met;
-- the adapter supplies only legally reclaimable units;
-- non-null attributed requests are mutable;
-- a null request remains unattributed.
-
-Shared-unit multi-owner request mutation is out of scope.
+Scores are retention scores. Lower scores are reclaimed first with stable ties
+until `bytes_needed` is met. `request_id: null` represents unattributed or
+shared host state. Shared-unit multi-owner mutation is not implemented.
 
 ### `feedback`
 
-Input:
-
 ```json
 {
-  "delivery_id": "opaque-delivery-id",
+  "delivery_id": "delivery-1",
   "records": [
     {
       "event": "progress",
-      "request": {},
+      "request_id": "L",
       "facts": {
         "committed_tokens": 8,
         "service_us": 1250
       }
+    },
+    {
+      "event": "tool-boundary",
+      "request_id": "L",
+      "facts": {
+        "tool_name": "search"
+      }
     }
   ],
   "context": {
-    "config": {}
+    "capabilities": {}
   }
 }
 ```
@@ -415,43 +379,139 @@ Result:
 {}
 ```
 
-Rules:
+Event names are open strings. Records describe enacted outcomes. Multiple
+records referencing `L` mutate the same `requests["L"]` object, so both updates
+survive without last-write-wins loss.
 
-- events are open strings;
-- unknown events may be ignored;
-- records contain enacted outcomes;
-- every record request is mutable;
-- delivery ID, event order, facts, and context are host-owned.
+## Per-Generation Lifecycle
+
+Every initial generation, tool continuation, later generation, and
+placement-changing stage transition follows:
+
+```text
+route -> admit -> schedule
+```
+
+Routing produces a stable descending target order. Admission then runs against
+the preferred target:
+
+- `accept`: enqueue;
+- `reject`: try the next ranked target;
+- `defer`: retry the same target up to the configured bound.
+
+A tool boundary is:
+
+```text
+feedback(tool-boundary)
+-> external tool execution
+-> create continuation
+-> route
+-> admit
+-> schedule
+```
+
+The PoC does not implement a distributed retry protocol.
+
+## Continuations
+
+Creating a continuation:
+
+1. preserves request `scratch`;
+2. preserves request `fields` except for body/metadata handling;
+3. replaces `fields.body`;
+4. shallow-merges new metadata into `fields.metadata`;
+5. preserves durable host facts;
+6. increments `facts.generation_id`;
+7. clears generation-local facts.
+
+The new metadata value wins on duplicate keys.
+
+The implemented generation-local fact list currently contains only:
+
+```text
+current_target
+```
+
+`previous_target` is durable and survives continuations.
+
+## Enacted Placement
+
+Routing and admission decisions are proposals, not observations. Neither a
+route score nor `admit: accept` changes `previous_target`.
+
+After an adapter confirms placement, it calls:
+
+```text
+record_enacted_placement(logical_request_id, target_id)
+```
+
+This sets host-owned `facts.previous_target`. Continuation routing may combine
+that history with current candidate cache facts. The reference route retains
+locality only when the historical target still reports useful request KV.
+
+## Host Fact API
+
+`PolicyStateStore` and serialized `LifecycleHost` wrappers provide:
+
+```text
+replace_global_facts(facts)
+merge_global_facts(facts)
+merge_request_facts(logical_request_id, facts)
+record_enacted_placement(logical_request_id, target_id)
+```
+
+Request identity facts cannot be changed through generic fact merge. Host fact
+updates describe reality and are never rolled back by a later policy failure.
+
+## State Transaction
+
+`LifecycleHost` has one stateful-invocation mutex shared by all clones. The
+critical section is:
+
+```text
+hydrate canonical global/request state
+-> invoke Wasm
+-> validate the full response
+-> atomically commit global/request fields and scratch
+```
+
+This deliberately serializes stateful policy invocations. It avoids revisions,
+compare-and-swap loops, and distributed transactions in the PoC.
+
+`route -> admit` holds the same gate across the sequence while committing each
+valid hook before the next hook runs.
+
+`PolicyStateStore` publishes mutations by cloning its complete in-memory state,
+updating writable namespaces, and replacing the canonical state under one
+mutex. Global and all referenced request changes therefore commit together.
+
+Scalable concurrent state transactions are deferred.
 
 ## Mutation Validation
 
-For every request returned by a policy:
+A valid policy response must preserve:
 
-- the top-level request remains an object;
-- `identity`, `body`, `metadata`, and `state` remain objects as required;
-- `logical_request_id` remains unchanged;
-- `generation_id` remains unchanged.
+- the exact top-level input key set;
+- the global scope and request-map scope shapes;
+- `global.facts`;
+- every request's `facts`;
+- the exact request-map key set;
+- operation cause;
+- candidates, targets, resident units, and runnable entries;
+- candidate/event facts;
+- capacity and budgets;
+- feedback delivery ID and record order;
+- capabilities and all other transient context.
 
-For route, schedule, and evict:
+The host does not silently restore attempted read-only mutations. Any mismatch
+rejects the complete response and requests native fallback.
 
-- candidate count and order remain unchanged;
-- candidate identity remains unchanged;
-- host facts and capacity are restored from the original input.
-
-For feedback:
-
-- delivery ID remains unchanged;
-- record count and event order remain unchanged;
-- enacted facts are restored from the original input.
-
-Policy-added top-level and request-local keys are otherwise preserved.
-
-There is no automatic reroute when admit or schedule rewrites a prompt. The
-trusted policy is responsible for coordinating mutation and decision.
+Only `global.fields`, `global.scratch`, and each referenced request's `fields`
+and `scratch` may change.
 
 ## Failure and Rollback
 
-The host returns:
+Invocation outcomes are:
 
 ```text
 Success
@@ -459,94 +519,79 @@ Unavailable
 FallbackRequired
 ```
 
-Fallback classes include:
+Fallback classes include invalid input, instantiation failure, explicit policy
+fallback, trap, fuel exhaustion, deadline, host saturation, and invalid output.
 
-- invalid input;
-- instantiation failure;
-- explicit policy fallback;
-- trap;
-- fuel exhaustion;
-- deadline;
-- host saturation;
-- invalid output.
+For any failure:
 
-For malformed JSON, malformed decision shape, invalid score, invalid budget,
-identity mutation, candidate mutation, policy error, trap, fuel exhaustion, or
-deadline:
+- no global policy mutation commits;
+- no request policy mutation commits;
+- feedback delivery is not marked committed;
+- the caller uses native/default behavior.
 
-- no returned request mutation is applied;
-- canonical request state remains unchanged;
-- the caller invokes native/default behavior.
-
-The PoC does not implement map transactions or a general rollback protocol.
-Atomicity comes from validating a full cloned JSON response before replacing
-the in-process canonical request.
+There is no patch log or general rollback protocol. Atomicity comes from
+keeping canonical state untouched until the complete cloned JSON response has
+validated.
 
 ## Feedback Deduplication
 
-Feedback deduplication is process-local and keyed by delivery ID within an
-attached package lineage.
+Deduplication belongs to `PolicyStateStore`, not a package instance.
 
-- duplicate committed delivery: do not execute the policy;
-- duplicate mutation: do not apply it again;
-- in-flight duplicate: fallback;
-- full bounded ledger: fallback;
-- failed first delivery: reservation is removed;
-- replacement transfers committed delivery IDs.
+For a new delivery:
 
-Deduplication is not crash durable.
+1. hydrate canonical state;
+2. invoke and validate feedback;
+3. atomically commit fields/scratch and the delivery ID;
+4. cache the operation result.
 
-## Package and Attachment
+For a duplicate:
 
-The package envelope retains:
+- Wasm is not invoked;
+- no mutation is applied;
+- the cached result is returned.
 
-- magic and package-format version;
-- JSON manifest length;
-- component length;
-- BLAKE3 integrity digest;
-- manifest bytes;
-- component bytes.
+The ledger is bounded, process-local, and survives package replacement because
+it is part of the host state store. A failed state commit does not reserve or
+commit the delivery ID. Deduplication is not crash durable.
 
-The host validates size limits and integrity before compiling.
+## Wasm ABI
 
-Attachment preparation:
+The complete WIT is:
 
-1. decodes the package;
-2. validates the v0.2 manifest;
-3. compiles the component;
-4. verifies zero imports;
-5. verifies only `pie:plex/policy@0.2.0` is exported;
-6. prelinks the component;
-7. instantiates once inside declared limits;
-8. publishes only after preparation succeeds.
+```wit
+package pie:plex@0.3.0;
 
-The immutable attachment registry retains one owner per operation. Replacement
-prepares first, waits for old invocation snapshots to drain, transfers feedback
-dedup state, and atomically publishes a new generation.
+interface policy {
+    route: func(input-json: string) -> result<string, string>;
+    admit: func(input-json: string) -> result<string, string>;
+    schedule: func(input-json: string) -> result<string, string>;
+    evict: func(input-json: string) -> result<string, string>;
+    feedback: func(input-json: string) -> result<string, string>;
+}
 
-There is no attachment-time request schema or capability linking.
+world plex-policy {
+    export policy;
+}
+```
 
-## Runtime Bounds
+Components import nothing and export only `pie:plex/policy@0.3.0`.
 
-The PoC retains:
+The manifest contains only:
 
-- one policy-specific Wasmtime engine;
-- no WASI imports;
-- disabled Wasm threads/shared memory;
-- one fresh store and component instance per invocation;
-- one linear-memory limit;
-- fuel;
-- epoch deadline;
-- input/output byte limits;
-- bounded concurrent invocations;
-- bounded feedback ledger.
+- contract version;
+- package name and version;
+- owned operations;
+- memory limit;
+- fuel limit;
+- deadline;
+- input byte limit;
+- output byte limit.
 
-The policy manifest may request less authority than the host maximum, never
-more.
+Unknown fields and older contracts are rejected.
 
-## Rust Guest SDK
+## Guest SDK
 
-The author-facing API is:
+The Rust SDK remains:
 
 ```rust
 pub type Document = serde_json::Value;
@@ -560,142 +605,118 @@ pub trait Policy {
 }
 ```
 
-Every method defaults to `fallback-required`.
+Every hook defaults to `fallback-required`.
 
-`export_policy!`:
+`export_policy!` parses object JSON, invokes the mutable hook, and returns:
 
-1. parses the input string;
-2. requires a top-level object;
-3. calls the mutable policy hook;
-4. wraps mutated input and result;
-5. serializes JSON;
-6. returns clear parse/policy/serialization errors.
+```json
+{
+  "input": {},
+  "result": {}
+}
+```
 
-Policy code uses ordinary dictionary access. There are no handles, generated
-request structs, typed maps, record batches, or typed accessors.
+Returning the full input is intentionally inefficient. It keeps mutation
+obvious and avoids patches, diffs, generated accessors, and typed models.
 
-## Canonical Request Store
+## Package and Runtime
 
-`CanonicalRequestStore` provides:
+The package envelope has:
 
-- logical-request creation;
-- canonical lookup;
-- atomic application of validated operation mutations;
-- continuation creation;
-- terminal removal.
+- magic and format version;
+- bounded manifest/component lengths;
+- BLAKE3 integrity digest;
+- manifest bytes;
+- component bytes.
 
-Applying an operation collects all associated request documents, validates
-their identities against current canonical state, updates a cloned store, then
-publishes all updates together.
+Attachment validates the manifest and host limits, compiles the component,
+rejects every import and unexpected export, prelinks it, probes bounded
+instantiation, and only then publishes.
 
-This store is deliberately in-process. Gateway/worker distribution is future
-integration work.
+The immutable attachment registry retains one owner per operation. Replacement
+prepares first, waits for old snapshots to drain, and atomically publishes a
+new generation. Persistent state does not move between package objects because
+it already belongs to `LifecycleHost`.
+
+Each call receives a fresh Wasmtime store and component instance. Runtime
+protection includes:
+
+- no WASI or PLEX imports;
+- disabled Wasm threads/shared memory;
+- memory limit;
+- fuel;
+- epoch deadline;
+- input/output limits;
+- bounded Wasmtime invocation slots;
+- bounded feedback ledger.
 
 ## Replay
 
-The replay runner supports:
+The deterministic replay runner supports:
 
-- package attach/replace/detach;
-- request creation;
-- continuation creation;
-- generic operation invocation;
+- attach, replace, and detach;
+- create and continue request;
+- read global/request maps;
+- replace/merge global facts;
+- merge request facts;
+- record enacted placement;
+- invoke any operation from transient context;
 - combined route/admit placement;
-- terminal feedback and request removal;
-- canonical request reads.
+- terminal feedback and removal.
 
-Replay uses a deterministic engine without real-time epoch ticks. Reports
-include operation responses, host selections, placement outcomes, fallback
-classes, and attachment generations. Running an identical trace twice must
-produce an identical report.
+Replay uses no realtime epoch ticker. Identical traces on fresh stores must
+produce identical reports.
 
-## Reference Policies
+## Policy Fixtures
 
-The JSON corpus includes:
+Reference policies include:
 
-- least-loaded route;
+- continuation-aware least-loaded/locality route;
 - rewrite-and-admit;
-- least-attained-service schedule;
+- host-observed least-attained-service schedule;
 - retention-score eviction;
 - feedback accounting;
-- one coordinated five-operation policy.
+- coordinated five-operation policy.
 
-Failure fixtures include:
+Failure fixtures cover:
 
 - unimplemented fallback;
-- malformed result length;
-- raw NaN and infinity output;
+- malformed result;
+- NaN/infinity;
 - invalid token budget;
-- identity mutation;
-- candidate mutation;
+- global/request fact mutation;
+- candidate identity/fact mutation;
+- feedback fact mutation;
+- request-map insertion;
 - mutate-then-fallback;
 - trap after mutation;
-- infinite loop/fuel exhaustion.
+- infinite loop.
 
-Research stress policies remain as ordinary JSON policies:
+Research stress policies remain for Agentix, Continuum, KVFlow, Preble, and
+Helium. Their physical engine mechanisms remain out of scope.
 
-- Agentix;
-- Continuum;
-- KVFlow;
-- Preble;
-- Helium.
+## Process Lifetime and Deferred Work
 
-Their physical engine mechanisms remain out of scope.
+Global maps, request maps, and feedback deduplication are in-memory and
+process-local. This milestone does not provide:
 
-## Required Lifecycle Coverage
-
-The fixture harness verifies:
-
-1. create logical request `L`, generation 0;
-2. route mutation becomes visible to admit;
-3. admit runs and mutates the prompt/state;
-4. schedule sees both prior mutations;
-5. eviction mutates an attributed request;
-6. progress feedback updates attained service;
-7. duplicate feedback does not double-count;
-8. tool-boundary feedback updates state;
-9. continuation generation 1 preserves state and merged metadata;
-10. route/admit/schedule run again;
-11. admission count proves admit ran for both generations;
-12. terminal feedback removes the request.
-
-It also verifies stable score order, defer/reject bounds, invalid mutation
-rollback, token budgets, non-finite output, fallback, and deterministic replay.
-
-## Validation and CI
-
-The repository uses existing Cargo, `wasm-tools`, and shell tooling:
-
-- host contract/runtime tests;
-- guest SDK check for `wasm32-unknown-unknown`;
-- all policy component builds;
-- fixture/replay harness;
-- generated component WIT audit;
-- zero component imports;
-- PLEX layering check;
-- workspace formatting/clippy/checks.
-
-Canonical WIT remains in `interface/plex/wit` and is synchronized to the SDK
-with `scripts/sync-wit.sh`.
-
-## Explicit Non-goals
-
-The JSON PoC does not implement:
-
-- typed schemas;
-- generated request models;
-- field, map, event, or capability handles;
+- typed schemas or generated models;
+- field/map/event/capability handles;
+- host map imports;
 - columnar encoding;
 - patches or diffs;
-- mutable package-global maps;
-- distributed request state;
-- distributed transactions;
+- distributed global/request state;
+- persistent disk state;
 - crash-durable deduplication;
-- automatic reroute after downstream mutation;
-- candidate-local scheduler indexes;
+- scalable concurrent transactions;
+- per-package global isolation;
+- automatic fact derivation from arbitrary event JSON;
+- automatic rerouting after downstream mutation;
+- candidate-local indexes;
 - shared-unit multi-owner mutation;
-- `prefetch`;
-- `rebalance`;
-- live adapters for every serving engine.
+- `prefetch` or `rebalance`;
+- live serving-engine adapters.
 
-Efficient encoding, schema validation, and distributed integration are future
-work after the five-operation and mutation semantics are validated.
+Efficient encodings, schema validation, and distributed integration remain
+future work. `plex_paper.md` is unchanged; reconciling paper claims is a
+separate task.

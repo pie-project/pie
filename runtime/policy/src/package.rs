@@ -1,5 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use pie_plex::{Document, Manifest, Operation};
 use wasmtime::Store;
@@ -22,13 +21,6 @@ struct AttachedPolicyInner {
     engine: PolicyEngine,
     manifest: Manifest,
     pre: PlexPolicyPre<InvocationContext>,
-    dedup: Mutex<DedupLedger>,
-}
-
-#[derive(Default)]
-struct DedupLedger {
-    committed: BTreeMap<String, Document>,
-    in_flight: BTreeSet<String>,
 }
 
 impl AttachedPolicy {
@@ -72,7 +64,6 @@ impl AttachedPolicy {
                 engine,
                 manifest,
                 pre,
-                dedup: Mutex::new(DedupLedger::default()),
             }),
         })
     }
@@ -106,64 +97,9 @@ impl AttachedPolicy {
     }
 
     pub fn feedback(&self, input: Document) -> Invocation<JsonResponse> {
-        if !self
-            .inner
-            .manifest
-            .operations
-            .contains(&Operation::Feedback)
-        {
-            return Invocation::Unavailable;
-        }
-        if let Err(error) = validate_input(Operation::Feedback, &input) {
-            return Invocation::FallbackRequired(InvocationFailure::new(
-                InvocationFailureKind::InvalidInput,
-                error.to_string(),
-            ));
-        }
-        let delivery_id = input["delivery_id"]
-            .as_str()
-            .expect("feedback input was validated")
-            .to_owned();
-        {
-            let mut dedup = self.inner.dedup.lock().unwrap();
-            if let Some(result) = dedup.committed.get(&delivery_id) {
-                return Invocation::Success(JsonResponse::unchanged_feedback(
-                    input,
-                    result.clone(),
-                ));
-            }
-            if dedup.in_flight.contains(&delivery_id) {
-                return Invocation::FallbackRequired(InvocationFailure::new(
-                    InvocationFailureKind::HostSaturated,
-                    "feedback delivery is already in flight",
-                ));
-            }
-            if dedup.committed.len() + dedup.in_flight.len()
-                >= self.inner.engine.config().max_feedback_deliveries
-            {
-                return Invocation::FallbackRequired(InvocationFailure::new(
-                    InvocationFailureKind::HostSaturated,
-                    "feedback deduplication ledger is full",
-                ));
-            }
-            dedup.in_flight.insert(delivery_id.clone());
-        }
-
-        let invocation = self.invoke_owned(Operation::Feedback, input, |policy, store, input| {
+        self.invoke(Operation::Feedback, input, |policy, store, input| {
             policy.call_feedback(store, input)
-        });
-        let mut dedup = self.inner.dedup.lock().unwrap();
-        dedup.in_flight.remove(&delivery_id);
-        if let Invocation::Success(response) = &invocation {
-            dedup.committed.insert(delivery_id, response.result.clone());
-        }
-        invocation
-    }
-
-    pub(crate) fn transfer_dedup_from(&self, source: &AttachedPolicy) {
-        let source = source.inner.dedup.lock().unwrap();
-        let mut target = self.inner.dedup.lock().unwrap();
-        target.committed = source.committed.clone();
+        })
     }
 
     fn invoke<Call>(
@@ -338,7 +274,7 @@ fn verify_component_surface(
     engine: &wasmtime::Engine,
     component: &Component,
 ) -> Result<(), AttachmentError> {
-    const POLICY: &str = "pie:plex/policy@0.2.0";
+    const POLICY: &str = "pie:plex/policy@0.3.0";
     let component_type = component.component_type();
     if let Some((name, _)) = component_type.imports(engine).next() {
         return Err(AttachmentError::UnsupportedImport(name.to_owned()));

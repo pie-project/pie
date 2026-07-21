@@ -2,12 +2,11 @@ use std::collections::BTreeMap;
 
 use pie_plex::{Document, Operation};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    AttachmentRegistry, CanonicalRequestStore, Invocation, InvocationFailureKind, JsonResponse,
-    LifecycleHost, PlacementOutcome,
+    AttachmentRegistry, Invocation, InvocationFailureKind, JsonResponse, LifecycleHost,
+    PlacementOutcome, PolicyStateStore,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,6 +48,21 @@ pub enum ReplayCommand {
         input: Document,
         terminal_logical_ids: Vec<String>,
     },
+    ReadGlobal,
+    ReplaceGlobalFacts {
+        facts: Document,
+    },
+    MergeGlobalFacts {
+        facts: Document,
+    },
+    MergeRequestFacts {
+        logical_request_id: String,
+        facts: Document,
+    },
+    RecordEnactedPlacement {
+        logical_request_id: String,
+        target_id: String,
+    },
     ReadRequest {
         logical_request_id: String,
     },
@@ -68,7 +82,10 @@ pub enum ReplayOutcome {
     AttachmentDetached {
         generation: u64,
     },
-    RequestStored {
+    GlobalState {
+        global: Document,
+    },
+    RequestState {
         request: Document,
     },
     Invocation {
@@ -102,14 +119,14 @@ pub struct ReplayRunner {
 impl ReplayRunner {
     pub fn new(
         registry: AttachmentRegistry,
-        requests: CanonicalRequestStore,
+        state: PolicyStateStore,
         packages: BTreeMap<String, Vec<u8>>,
         max_defer_retries: u32,
     ) -> Result<Self, ReplaySetupError> {
         if registry.uses_realtime_epochs() {
             return Err(ReplaySetupError::RealtimeEpochs);
         }
-        let lifecycle = LifecycleHost::new(registry.clone(), requests, max_defer_retries);
+        let lifecycle = LifecycleHost::new(registry.clone(), state, max_defer_retries);
         Ok(Self {
             registry,
             lifecycle,
@@ -185,9 +202,8 @@ impl ReplayRunner {
                 metadata,
             } => self
                 .lifecycle
-                .requests()
-                .create(logical_request_id, body.clone(), metadata.clone())
-                .map(|request| ReplayOutcome::RequestStored { request })
+                .create_request(logical_request_id, body.clone(), metadata.clone())
+                .map(|request| ReplayOutcome::RequestState { request })
                 .map_err(|error| error.to_string()),
             ReplayCommand::ContinueRequest {
                 logical_request_id,
@@ -195,14 +211,11 @@ impl ReplayRunner {
                 metadata,
             } => self
                 .lifecycle
-                .requests()
-                .continuation(logical_request_id, body.clone(), metadata.clone())
-                .map(|request| ReplayOutcome::RequestStored { request })
+                .continue_request(logical_request_id, body.clone(), metadata.clone())
+                .map(|request| ReplayOutcome::RequestState { request })
                 .map_err(|error| error.to_string()),
-            ReplayCommand::Invoke { operation, input } => {
-                let mut input = input.clone();
-                hydrate_requests(*operation, &mut input, self.lifecycle.requests())?;
-                Ok(match self.lifecycle.invoke_and_apply(*operation, input) {
+            ReplayCommand::Invoke { operation, input } => Ok(
+                match self.lifecycle.invoke_and_apply(*operation, input.clone()) {
                     Invocation::Success(response) => ReplayOutcome::Invocation {
                         operation: *operation,
                         selection: selection(*operation, &response)
@@ -216,8 +229,8 @@ impl ReplayRunner {
                         operation: *operation,
                         kind: failure.kind,
                     },
-                })
-            }
+                },
+            ),
             ReplayCommand::RouteAdmit {
                 logical_request_id,
                 cause,
@@ -243,36 +256,74 @@ impl ReplayRunner {
             ReplayCommand::FeedbackRemove {
                 input,
                 terminal_logical_ids,
-            } => {
-                let mut input = input.clone();
-                hydrate_requests(Operation::Feedback, &mut input, self.lifecycle.requests())?;
-                Ok(
-                    match self
-                        .lifecycle
-                        .feedback_and_remove(input, terminal_logical_ids)
-                    {
-                        Invocation::Success(response) => ReplayOutcome::Invocation {
-                            operation: Operation::Feedback,
-                            response,
-                            selection: None,
-                        },
-                        Invocation::Unavailable => ReplayOutcome::Unavailable {
-                            operation: Operation::Feedback,
-                        },
-                        Invocation::FallbackRequired(failure) => ReplayOutcome::FallbackRequired {
-                            operation: Operation::Feedback,
-                            kind: failure.kind,
-                        },
+            } => Ok(
+                match self
+                    .lifecycle
+                    .feedback_and_remove(input.clone(), terminal_logical_ids)
+                {
+                    Invocation::Success(response) => ReplayOutcome::Invocation {
+                        operation: Operation::Feedback,
+                        response,
+                        selection: None,
                     },
-                )
+                    Invocation::Unavailable => ReplayOutcome::Unavailable {
+                        operation: Operation::Feedback,
+                    },
+                    Invocation::FallbackRequired(failure) => ReplayOutcome::FallbackRequired {
+                        operation: Operation::Feedback,
+                        kind: failure.kind,
+                    },
+                },
+            ),
+            ReplayCommand::ReadGlobal => Ok(ReplayOutcome::GlobalState {
+                global: self.lifecycle.state().read_global(),
+            }),
+            ReplayCommand::ReplaceGlobalFacts { facts } => {
+                self.lifecycle
+                    .replace_global_facts(facts.clone())
+                    .map_err(|error| error.to_string())?;
+                Ok(ReplayOutcome::GlobalState {
+                    global: self.lifecycle.state().read_global(),
+                })
             }
-            ReplayCommand::ReadRequest { logical_request_id } => self
-                .lifecycle
-                .requests()
-                .get(logical_request_id)
-                .map(|request| ReplayOutcome::RequestStored { request })
-                .map_err(|error| error.to_string()),
+            ReplayCommand::MergeGlobalFacts { facts } => {
+                self.lifecycle
+                    .merge_global_facts(facts.clone())
+                    .map_err(|error| error.to_string())?;
+                Ok(ReplayOutcome::GlobalState {
+                    global: self.lifecycle.state().read_global(),
+                })
+            }
+            ReplayCommand::MergeRequestFacts {
+                logical_request_id,
+                facts,
+            } => {
+                self.lifecycle
+                    .merge_request_facts(logical_request_id, facts.clone())
+                    .map_err(|error| error.to_string())?;
+                self.request_outcome(logical_request_id)
+            }
+            ReplayCommand::RecordEnactedPlacement {
+                logical_request_id,
+                target_id,
+            } => {
+                self.lifecycle
+                    .record_enacted_placement(logical_request_id, target_id)
+                    .map_err(|error| error.to_string())?;
+                self.request_outcome(logical_request_id)
+            }
+            ReplayCommand::ReadRequest { logical_request_id } => {
+                self.request_outcome(logical_request_id)
+            }
         }
+    }
+
+    fn request_outcome(&self, logical_request_id: &str) -> Result<ReplayOutcome, String> {
+        self.lifecycle
+            .state()
+            .read_request(logical_request_id)
+            .map(|request| ReplayOutcome::RequestState { request })
+            .map_err(|error| error.to_string())
     }
 
     fn package(&self, name: &str) -> Result<&[u8], String> {
@@ -281,61 +332,6 @@ impl ReplayRunner {
             .map(Vec::as_slice)
             .ok_or_else(|| format!("replay package {name:?} is not registered"))
     }
-}
-
-fn hydrate_requests(
-    operation: Operation,
-    input: &mut Value,
-    store: &CanonicalRequestStore,
-) -> Result<(), String> {
-    match operation {
-        Operation::Route | Operation::Admit => {
-            hydrate(input.get_mut("request"), store)?;
-        }
-        Operation::Schedule => {
-            for candidate in input
-                .get_mut("runnable")
-                .and_then(Value::as_array_mut)
-                .ok_or("missing runnable array")?
-            {
-                hydrate(candidate.get_mut("request"), store)?;
-            }
-        }
-        Operation::Evict => {
-            for unit in input
-                .get_mut("resident")
-                .and_then(Value::as_array_mut)
-                .ok_or("missing resident array")?
-            {
-                if unit
-                    .get("request")
-                    .is_some_and(|request| !request.is_null())
-                {
-                    hydrate(unit.get_mut("request"), store)?;
-                }
-            }
-        }
-        Operation::Feedback => {
-            for record in input
-                .get_mut("records")
-                .and_then(Value::as_array_mut)
-                .ok_or("missing records array")?
-            {
-                hydrate(record.get_mut("request"), store)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn hydrate(request: Option<&mut Value>, store: &CanonicalRequestStore) -> Result<(), String> {
-    let request = request.ok_or("missing request")?;
-    let logical_id = request
-        .pointer("/identity/logical_request_id")
-        .and_then(Value::as_str)
-        .ok_or("request placeholder has no logical_request_id")?;
-    *request = store.get(logical_id).map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 fn selection(operation: Operation, response: &JsonResponse) -> Result<Option<Document>, String> {

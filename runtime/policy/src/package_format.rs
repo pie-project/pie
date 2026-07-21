@@ -2,7 +2,7 @@ use pie_plex::Manifest;
 use thiserror::Error;
 
 const MAGIC: &[u8; 8] = b"PLEXPKG\0";
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
 const HEADER_BYTES: usize = 56;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,9 +185,9 @@ mod tests {
 
     fn manifest() -> Manifest {
         Manifest {
-            contract: ContractVersion::V0_2,
+            contract: ContractVersion::V0_3,
             package_name: "json-package".into(),
-            package_version: "0.2.0".into(),
+            package_version: "0.3.0".into(),
             operations: BTreeSet::from([Operation::Route]),
             limits: PolicyLimits {
                 memory_bytes: 1,

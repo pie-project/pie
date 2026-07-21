@@ -86,14 +86,12 @@ impl AttachmentRegistry {
             state = self.inner.changed.wait(state).unwrap();
         }
         let result = (|| {
-            let old = state
+            state
                 .active
                 .packages
                 .get(&package_name)
-                .cloned()
                 .ok_or_else(|| RegistryError::PackageNotAttached(package_name.clone()))?;
             ensure_operations_available(&state.active, &replacement, Some(&package_name))?;
-            replacement.transfer_dedup_from(&old);
 
             let generation = next_generation(state.active.generation)?;
             let mut next = (*state.active).clone();
@@ -166,6 +164,10 @@ impl AttachmentRegistry {
 
     pub(crate) fn uses_realtime_epochs(&self) -> bool {
         self.engine.uses_realtime_epochs()
+    }
+
+    pub(crate) fn max_feedback_deliveries(&self) -> usize {
+        self.engine.config().max_feedback_deliveries
     }
 
     fn lock_stable(&self) -> std::sync::MutexGuard<'_, RegistryState> {

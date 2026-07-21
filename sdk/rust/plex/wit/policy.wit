@@ -1,4 +1,4 @@
-package pie:plex@0.2.0;
+package pie:plex@0.3.0;
 
 interface policy {
     route: func(input-json: string) -> result<string, string>;

@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,31 +35,69 @@ pub struct SelectedEviction {
     pub size_bytes: u64,
 }
 
-pub fn validate_request(request: &Value) -> Result<(), DecisionValidationError> {
-    let object = request
+const SCOPE_NAMESPACES: [&str; 3] = ["facts", "fields", "scratch"];
+
+pub fn validate_global_scope(global: &Value) -> Result<(), DecisionValidationError> {
+    validate_scope(global, "global").map(|_| ())
+}
+
+pub fn validate_request_scope(
+    logical_request_id: &str,
+    request: &Value,
+) -> Result<(), DecisionValidationError> {
+    let object = validate_scope(request, "request")?;
+    let facts = object["facts"]
         .as_object()
-        .ok_or(DecisionValidationError::RequestNotObject)?;
-    let identity = object
-        .get("identity")
-        .and_then(Value::as_object)
-        .ok_or(DecisionValidationError::InvalidIdentity)?;
-    if identity
-        .get("logical_request_id")
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
-        || identity
-            .get("generation_id")
-            .and_then(Value::as_u64)
-            .is_none()
+        .expect("validated request facts");
+    if facts.get("logical_request_id").and_then(Value::as_str) != Some(logical_request_id)
+        || logical_request_id.is_empty()
+        || facts.get("generation_id").and_then(Value::as_u64).is_none()
     {
-        return Err(DecisionValidationError::InvalidIdentity);
-    }
-    for field in ["body", "metadata", "state"] {
-        if !object.get(field).is_some_and(Value::is_object) {
-            return Err(DecisionValidationError::RequestFieldNotObject(field));
-        }
+        return Err(DecisionValidationError::InvalidRequestIdentity);
     }
     Ok(())
+}
+
+pub fn validate_state_envelope(input: &Value) -> Result<(), DecisionValidationError> {
+    let input = input
+        .as_object()
+        .ok_or(DecisionValidationError::EnvelopeNotObject)?;
+    validate_global_scope(
+        input
+            .get("global")
+            .ok_or(DecisionValidationError::MissingField("global"))?,
+    )?;
+    let requests = input
+        .get("requests")
+        .and_then(Value::as_object)
+        .ok_or(DecisionValidationError::RequestsNotObject)?;
+    for (logical_request_id, request) in requests {
+        validate_request_scope(logical_request_id, request)?;
+    }
+    Ok(())
+}
+
+fn validate_scope<'a>(
+    scope: &'a Value,
+    name: &'static str,
+) -> Result<&'a serde_json::Map<String, Value>, DecisionValidationError> {
+    let object = scope
+        .as_object()
+        .ok_or(DecisionValidationError::ScopeNotObject(name))?;
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = SCOPE_NAMESPACES.into_iter().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(DecisionValidationError::InvalidScopeNamespaces(name));
+    }
+    for namespace in SCOPE_NAMESPACES {
+        if !object.get(namespace).is_some_and(Value::is_object) {
+            return Err(DecisionValidationError::NamespaceNotObject {
+                scope: name,
+                namespace,
+            });
+        }
+    }
+    Ok(object)
 }
 
 pub fn validate_admit(result: &Value) -> Result<AdmissionDecision, DecisionValidationError> {
@@ -273,12 +312,23 @@ fn stable_order(scores: &[f64], descending: bool) -> Vec<usize> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DecisionValidationError {
-    #[error("request must be a JSON object")]
-    RequestNotObject,
-    #[error("request.identity must contain immutable logical_request_id and generation_id")]
-    InvalidIdentity,
-    #[error("request.{0} must be a JSON object")]
-    RequestFieldNotObject(&'static str),
+    #[error("operation envelope must be a JSON object")]
+    EnvelopeNotObject,
+    #[error("{0} scope must be a JSON object")]
+    ScopeNotObject(&'static str),
+    #[error("{0} scope must contain exactly facts, fields, and scratch")]
+    InvalidScopeNamespaces(&'static str),
+    #[error("{scope}.{namespace} must be a JSON object")]
+    NamespaceNotObject {
+        scope: &'static str,
+        namespace: &'static str,
+    },
+    #[error("requests must be a JSON object")]
+    RequestsNotObject,
+    #[error(
+        "request-map key must equal non-empty facts.logical_request_id and generation_id must be unsigned"
+    )]
+    InvalidRequestIdentity,
     #[error("missing or invalid JSON field {0}")]
     MissingField(&'static str),
     #[error("JSON field {0} must be a finite number")]
@@ -310,15 +360,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_request_shape() {
-        validate_request(&json!({
-            "identity": {"logical_request_id": "L", "generation_id": 0},
-            "body": {},
-            "metadata": {},
-            "state": {}
+    fn validates_global_and_request_scopes() {
+        let global = json!({"facts": {}, "fields": {}, "scratch": {}});
+        let request = json!({
+            "facts": {"logical_request_id": "L", "generation_id": 0},
+            "fields": {"body": {}, "metadata": {}},
+            "scratch": {}
+        });
+        validate_global_scope(&global).unwrap();
+        validate_request_scope("L", &request).unwrap();
+        validate_state_envelope(&json!({
+            "global": global,
+            "requests": {"L": request}
         }))
         .unwrap();
-        assert!(validate_request(&json!({"identity": {}})).is_err());
+        assert!(validate_request_scope("M", &request).is_err());
+        assert!(
+            validate_global_scope(&json!({"facts": {}, "fields": {}, "scratch": {}, "extra": {}}))
+                .is_err()
+        );
     }
 
     #[test]

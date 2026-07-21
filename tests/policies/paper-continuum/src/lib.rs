@@ -15,7 +15,8 @@ impl Policy for Continuum {
             .iter()
             .map(|candidate| {
                 let preempted = candidate["facts"]["preempted"].as_bool().unwrap_or(false);
-                let pinned = candidate["request"]["state"]["ttl_active"]
+                let request_id = candidate["request_id"].as_str().unwrap_or("");
+                let pinned = input["requests"][request_id]["scratch"]["ttl_active"]
                     .as_bool()
                     .unwrap_or(false);
                 let arrival = candidate["facts"]["program_arrival"]
@@ -39,8 +40,11 @@ impl Policy for Continuum {
             .iter()
             .map(|unit| {
                 let reload = unit["facts"]["reload_cost"].as_f64().unwrap_or(0.0);
-                let pinned = unit["request"]["state"]["ttl_active"]
-                    .as_bool()
+                let pinned = unit["request_id"]
+                    .as_str()
+                    .and_then(|request_id| {
+                        input["requests"][request_id]["scratch"]["ttl_active"].as_bool()
+                    })
                     .unwrap_or(false);
                 reload + if pinned { 1.0e12 } else { 0.0 }
             })
@@ -49,15 +53,24 @@ impl Policy for Continuum {
     }
 
     fn feedback(input: &mut Document) -> Result<Document, String> {
-        for record in input["records"]
-            .as_array_mut()
+        let records = input["records"]
+            .as_array()
             .ok_or("records must be an array")?
-        {
-            if record["event"] == "tool-boundary" {
-                record["request"]["state"]["ttl_active"] =
-                    json!(record["facts"]["ttl_ms"].as_u64().unwrap_or(0) != 0);
-            } else if record["event"] == "ttl-expired" {
-                record["request"]["state"]["ttl_active"] = json!(false);
+            .iter()
+            .map(|record| {
+                (
+                    record["event"].as_str().unwrap_or("").to_owned(),
+                    record["request_id"].as_str().unwrap_or("").to_owned(),
+                    record["facts"]["ttl_ms"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (event, request_id, ttl_ms) in records {
+            if event == "tool-boundary" {
+                input["requests"][request_id.as_str()]["scratch"]["ttl_active"] =
+                    json!(ttl_ms != 0);
+            } else if event == "ttl-expired" {
+                input["requests"][request_id.as_str()]["scratch"]["ttl_active"] = json!(false);
             }
         }
         Ok(json!({}))
