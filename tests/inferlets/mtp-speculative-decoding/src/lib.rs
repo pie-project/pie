@@ -27,7 +27,6 @@ use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
-const NUM_LAYERS: u32 = 28;
 
 #[derive(Deserialize)]
 struct Input {
@@ -60,10 +59,6 @@ async fn main(input: Input) -> Result<String> {
         return Err("k must be between 1 and 32".into());
     }
 
-    let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
-    model::configure_gates(true, false);
-
     let k = input.k;
     let w = k + 1;
 
@@ -89,14 +84,32 @@ async fn main(input: Input) -> Result<String> {
 
     // ── Prefill: host-known prompt, one fire ────────────────────────────
     let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let prefill_indptr = Channel::from(vec![0u32, n]).named("prefill_indptr");
+    let prefill_positions = Channel::from((0..n).collect::<Vec<_>>()).named("prefill_positions");
+    let prefill_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("prefill_pages");
+    let prefill_page_indptr =
+        Channel::from(vec![0u32, n.div_ceil(PAGE_T)]).named("prefill_page_indptr");
+    let prefill_w_slot =
+        Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("prefill_w_slot");
+    let prefill_w_off =
+        Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("prefill_w_off");
     let seed_out = Channel::new([1], dtype::i32).named("seed");
     let drafts_out = Channel::new([k], dtype::i32).named("drafts");
     let prefill = ForwardPass::new();
-    prefill.embed(&prompt_tokens, Tensor::constant(vec![0u32, n]));
+    prefill.embed(&prompt_tokens, &prefill_indptr)?;
     let prefill_kv_len = Channel::from(vec![n]).named("prefill_kv_len");
-    prefill.port_channel(Port::KvLen, &prefill_kv_len);
-    prefill.attn_working_set(&ws, .., ..)?;
-    prefill.derive_dense_geometry();
+    prefill.attention(
+        &ws,
+        ..,
+        ..,
+        &prefill_kv_len,
+        &prefill_pages,
+        &prefill_page_indptr,
+        &prefill_w_slot,
+        &prefill_w_off,
+        &prefill_positions,
+        None,
+    )?;
     prefill.epilogue(move || {
         seed_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
         drafts_out.put(reduce_argmax(intrinsics::mtp_logits(k)));
@@ -125,17 +138,39 @@ async fn main(input: Input) -> Result<String> {
     let window = Channel::from(pad_tokens(&window0, w as usize)).named("window");
     let len = Channel::from(vec![n]).named("len");
     let kv_len = Channel::from((1..=w).map(|row| n + row).collect::<Vec<_>>()).named("kv_len");
+    let embed_indptr = Channel::from((0..=w).collect::<Vec<_>>()).named("embed_indptr");
+    let positions = Channel::from((n..n + w).collect::<Vec<_>>()).named("positions");
+    let tiled_pages: Vec<u32> = (0..w).flat_map(|_| 0..max_pages).collect();
+    let pages = Channel::from_shaped([w, max_pages], tiled_pages).named("pages");
+    let mut initial_page_indptr = vec![0u32];
+    for length in (1..=w).map(|row| n + row) {
+        initial_page_indptr
+            .push(initial_page_indptr.last().copied().unwrap() + length.div_ceil(PAGE_T));
+    }
+    let page_indptr = Channel::from(initial_page_indptr).named("page_indptr");
+    let w_slot = Channel::from((n..n + w).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("w_slot");
+    let w_off = Channel::from((n..n + w).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("w_off");
+    let readout = Channel::from((0..w).collect::<Vec<_>>()).named("readout");
     let stopped = Channel::from_shaped([1u32], vec![false]).named("stopped");
     let committed_out = Channel::new([w], dtype::i32)
         .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
         .named("committed");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&window, Tensor::constant((0..=w).collect::<Vec<_>>()));
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-    fwd.derive_dense_geometry();
-    fwd.readout(&Tensor::constant((0..w).collect::<Vec<u32>>()));
+    fwd.embed(&window, &embed_indptr)?;
+    fwd.readout(&readout)?;
+    fwd.attention(
+        &ws,
+        ..,
+        (n / PAGE_T)..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
     let stage_stop_tokens = stop_tokens.clone();
     fwd.epilogue(move || {
         let win = window.take().tensor();
@@ -198,8 +233,21 @@ async fn main(input: Input) -> Result<String> {
         let next_rank = cast(sub(cumsum(&next_live_f32), &next_live_f32), DType::U32);
         let next_positions = add(broadcast(&next_base, [w]), &next_rank);
 
+        let next_kv_len = add(&next_positions, &next_live_u32);
+        let page_counts = div(add(&next_kv_len, PAGE_T - 1), PAGE_T);
+        let page_tail = cast(cumsum(cast(&page_counts, DType::F32)), DType::U32);
+        let next_page_indptr = scatter_set(
+            broadcast(Tensor::constant(0u32), [w + 1]),
+            add(iota(w), 1u32),
+            &page_tail,
+        );
         len.put(&next_base);
-        kv_len.put(add(&next_positions, &next_live_u32));
+        kv_len.put(&next_kv_len);
+        positions.put(&next_positions);
+        w_slot.put(div(&next_positions, PAGE_T));
+        w_off.put(rem(&next_positions, PAGE_T));
+        page_indptr.take();
+        page_indptr.put(&next_page_indptr);
         window.put(&next_window);
     });
 

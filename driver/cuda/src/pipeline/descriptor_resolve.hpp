@@ -365,4 +365,44 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
     return true;
 }
 
+inline bool resolve_attention_mask(
+    const Trace& trace, ChannelView& view, FireGeometry& out,
+    std::string* err, bool allow_structured_masks,
+    const std::unordered_set<std::uint32_t>* pending_slots = nullptr,
+    const detail::PortCellCache* cached_cells = nullptr) {
+    const PortBinding* binding = nullptr;
+    for (const PortBinding& candidate : trace.ports) {
+        if (candidate.port != kPortAttnMask) continue;
+        if (candidate.is_const) {
+            if (err) *err = "ptir: device-derived attention mask must bind a channel";
+            return false;
+        }
+        binding = &candidate;
+        break;
+    }
+    if (binding == nullptr) {
+        if (err) *err = "ptir: device-derived attention mask port is missing";
+        return false;
+    }
+
+    out.structured_mask =
+        detail::structured_mask_descriptor(trace, binding->channel);
+    const bool direct =
+        allow_structured_masks &&
+        (out.structured_mask.kind == StructuredMaskKind::Causal ||
+         (out.structured_mask.kind == StructuredMaskKind::SlidingWindow &&
+          out.structured_mask.window > 0) ||
+         (out.structured_mask.kind == StructuredMaskKind::SinkWindow &&
+          out.structured_mask.window > 0));
+    if (direct) return true;
+
+    if (!detail::read_port_cell(
+            view, binding->channel, out.mask, err, pending_slots,
+            cached_cells)) {
+        return false;
+    }
+    out.has_mask = true;
+    return true;
+}
+
 }  // namespace pie_cuda_driver::pipeline

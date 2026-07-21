@@ -599,7 +599,11 @@ pie_add_cuda_target(test_gather_tokens
   SOURCES tests/test_gather_tokens.cu src/kernels/gather_tokens.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_pack_dense_mask
-  SOURCES tests/pack_dense_mask_test.cu src/kernels/pack_dense_mask.cu
+  SOURCES
+    tests/pack_dense_mask_test.cu
+    src/batch/persistent_inputs.cpp
+    src/kernels/graph_pad.cu
+    src/kernels/pack_dense_mask.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_envelope_dot
   SOURCES tests/test_envelope_dot.cu src/kernels/envelope.cu

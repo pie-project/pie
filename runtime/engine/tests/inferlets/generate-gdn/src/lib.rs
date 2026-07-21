@@ -39,9 +39,8 @@ const DEFAULT_MAX_TOKENS: usize = 5;
 async fn main(input: String) -> Result<String> {
     let max_tokens: usize = input.trim().parse().unwrap_or(DEFAULT_MAX_TOKENS);
 
-    let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
-    model::configure(vocab, ws.page_size(), 1);
+    let page_size = ws.page_size();
 
     // Recurrent-state working set for the model's linear-attention layers.
     // `state_size() == 0` ⇒ the model has no recurrent state (pure attention)
@@ -62,24 +61,48 @@ async fn main(input: String) -> Result<String> {
     let prompt = wit_model::encode("hello world");
     let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
     let n = prompt.len() as u32;
-    let max_pages = (n + max_tokens as u32 + 1).div_ceil(ws.page_size());
+    let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size);
     ws.reserve(max_pages)
         .map_err(|e| format!("ws.reserve: {e}"))?;
 
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Tensor::constant(vec![0u32, n]);
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
+    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p = Channel::from(
+        (0..n)
+            .map(|position| position / page_size)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_slot_p");
+    let w_off_p = Channel::from(
+        (0..n)
+            .map(|position| position % page_size)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_off_p");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
     let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, embed_indptr_p);
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    fwd_p.port_channel(Port::KvLen, &kv_len_p);
-    fwd_p.attn_working_set(&ws, .., ..)?;
-    fwd_p.derive_dense_geometry();
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        None,
+    )?;
     if has_rs {
-        fwd_p.rs_working_set(&rs);
+        fwd_p.rs_working_sets(std::slice::from_ref(&rs))?;
     }
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits()); // [1] i32 greedy token
@@ -94,9 +117,6 @@ async fn main(input: String) -> Result<String> {
     fwd_p
         .submit(&pipe)
         .map_err(|e| format!("prefill submit: {e}"))?;
-    if max_tokens == 1 {
-        pipe.finish();
-    }
     let g0 = g0_ch
         .take()
         .get::<i32>()
@@ -110,7 +130,13 @@ async fn main(input: String) -> Result<String> {
     if generated.len() < max_tokens {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let out = Channel::new([1], dtype::i32).named("out");
-        let lane1 = Tensor::constant(vec![0u32, 1u32]);
+        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from(vec![n]).named("positions");
+        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+        let page_indptr =
+            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
+        let w_off = Channel::from(vec![n % page_size]).named("w_off");
 
         // ONE bound ForwardPass, resubmitted every fire: each channel may
         // attach to only one pass for its lifetime, so `tok_in` is wired here
@@ -119,31 +145,41 @@ async fn main(input: String) -> Result<String> {
         // continue-in-place tracking (keyed on the working set, not the pass)
         // is correct across all of this pass's resubmits.
         let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, lane1);
+        fwd.embed(&tok_in, &lane1)?;
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
-        fwd.port_channel(Port::KvLen, &kv_len);
-        fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-        fwd.derive_dense_geometry();
+        fwd.attention(
+            &ws,
+            ..,
+            (n / page_size)..,
+            &kv_len,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &positions,
+            None,
+        )?;
         if has_rs {
-            fwd.rs_working_set(&rs);
+            fwd.rs_working_sets(std::slice::from_ref(&rs))?;
         }
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
             let t = reduce_argmax(intrinsics::logits()); // [1] i32 greedy token
+            let next_length = add(&length, 1u32);
+            let page_count = div(add(&next_length, page_size - 1), page_size);
             tok_in.put(&t);
-            kv_len.put(add(&length, 1u32));
+            kv_len.put(&next_length);
+            positions.put(&length);
+            w_slot.put(div(&length, page_size));
+            w_off.put(rem(&length, page_size));
+            page_indptr.take();
+            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
             out.put(&t);
         });
 
         for step in 1..max_tokens {
-            // Fixed budget: the last submit is knowable at submit time →
-            // finish() right after it (F7: end of stream; no close needed
-            // after the drain).
             fwd.submit(&pipe)
                 .map_err(|e| format!("decode submit @{step}: {e}"))?;
-            if step + 1 == max_tokens {
-                pipe.finish();
-            }
             let t = out
                 .take()
                 .get::<i32>()
@@ -155,6 +191,7 @@ async fn main(input: String) -> Result<String> {
             generated.push(t0 as u32);
         }
     }
+    pipe.close();
 
     let result = format!("generated {} tokens: {:?}", generated.len(), generated);
     eprintln!("[GENERATE_GDN] {result}");

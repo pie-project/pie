@@ -39,6 +39,10 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(model::model().vocab_size())
     }
 
+    async fn kv_page_size(&mut self) -> Result<u32> {
+        Ok(model::model().kv_page_size())
+    }
+
     // ── Working-set / arena capabilities (global over the bound model) ──────
     //
     // Real values come from the driver handshake `DriverCapabilities`

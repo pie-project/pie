@@ -309,7 +309,8 @@ pub fn append_request_with_options(
     batch.token_ids.extend(&req.token_ids);
     batch.position_ids.extend(&req.position_ids);
 
-    let elide_decode_mask = req.device_resolved_geometry
+    let elide_decode_mask = ((req.device_resolved_geometry || req.has_user_mask)
+        && req.masks.is_empty())
         || (elide_decode_masks
             && req.single_token_mode
             && !req.has_user_mask

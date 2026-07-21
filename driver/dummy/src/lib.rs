@@ -2452,6 +2452,31 @@ mod tests {
         }
     }
 
+    fn scalar_attention_ports() -> Vec<PortBinding> {
+        let words = |values: &[u32]| values.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let constant = |port, values: &[u32]| PortBinding {
+            port,
+            source: PortSource::Const {
+                dtype: DType::U32,
+                shape: Shape::vector(values.len() as u32),
+                data: words(values),
+            },
+        };
+        vec![
+            PortBinding {
+                port: Port::EmbedTokens,
+                source: PortSource::Channel(0),
+            },
+            constant(Port::EmbedIndptr, &[0, 1]),
+            constant(Port::Positions, &[0]),
+            constant(Port::Pages, &[0]),
+            constant(Port::PageIndptr, &[0, 1]),
+            constant(Port::KvLen, &[1]),
+            constant(Port::WSlot, &[0]),
+            constant(Port::WOff, &[0]),
+        ]
+    }
+
     fn suite_container(vocab: u32) -> Vec<u8> {
         let mut ops = Vec::new();
         let logits2 = expand::next_id(&ops);
@@ -2512,20 +2537,7 @@ mod tests {
                 chan(Shape::vector(vocab), DType::F32, HostRole::Reader, false),
                 chan(Shape::vector(vocab), DType::F32, HostRole::Reader, false),
             ],
-            ports: vec![
-                PortBinding {
-                    port: Port::EmbedTokens,
-                    source: PortSource::Channel(0),
-                },
-                PortBinding {
-                    port: Port::EmbedIndptr,
-                    source: PortSource::Const {
-                        dtype: DType::U32,
-                        shape: Shape::vector(2),
-                        data: [0u32, 1].iter().flat_map(|w| w.to_le_bytes()).collect(),
-                    },
-                },
-            ],
+            ports: scalar_attention_ports(),
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
                 ops,
@@ -2572,20 +2584,7 @@ mod tests {
                 chan(Shape::vector(1), DType::I32, HostRole::None, true),
                 chan(Shape::vector(1), DType::F32, HostRole::Reader, false),
             ],
-            ports: vec![
-                PortBinding {
-                    port: Port::EmbedTokens,
-                    source: PortSource::Channel(0),
-                },
-                PortBinding {
-                    port: Port::EmbedIndptr,
-                    source: PortSource::Const {
-                        dtype: DType::U32,
-                        shape: Shape::vector(2),
-                        data: [0u32, 1].iter().flat_map(|w| w.to_le_bytes()).collect(),
-                    },
-                },
-            ],
+            ports: scalar_attention_ports(),
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
                 ops,
@@ -2623,20 +2622,7 @@ mod tests {
                 chan(Shape::vector(1), DType::I32, HostRole::None, true),
                 chan(Shape::vector(1), DType::F32, HostRole::Reader, false),
             ],
-            ports: vec![
-                PortBinding {
-                    port: Port::EmbedTokens,
-                    source: PortSource::Channel(0),
-                },
-                PortBinding {
-                    port: Port::EmbedIndptr,
-                    source: PortSource::Const {
-                        dtype: DType::U32,
-                        shape: Shape::vector(2),
-                        data: [0u32, 1].iter().flat_map(|w| w.to_le_bytes()).collect(),
-                    },
-                },
-            ],
+            ports: scalar_attention_ports(),
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
                 ops: vec![
@@ -2810,15 +2796,18 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_attachments_are_exclusive_atomic_and_close_ordered() {
+    fn endpoint_attachments_follow_sharing_atomicity_and_close_ordering() {
         let mut driver = DummyDriver::default();
 
         endpoint_contract(&mut driver, 1, PIE_CHANNEL_EXTERN_NONE, &[]);
         let private_program = register_test_program(&mut driver, private_container(1));
         let private = bind_existing_channels(&mut driver, private_program, 101, &[1]).unwrap();
-        assert!(bind_existing_channels(&mut driver, private_program, 102, &[1]).is_err());
+        let private_second =
+            bind_existing_channels(&mut driver, private_program, 102, &[1]).unwrap();
         assert!(driver.close_channel(1).is_err());
         driver.close_instance(private.instance_id).unwrap();
+        assert!(driver.close_channel(1).is_err());
+        driver.close_instance(private_second.instance_id).unwrap();
         driver.close_channel(1).unwrap();
 
         endpoint_contract(&mut driver, 2, PIE_CHANNEL_EXTERN_EXPORT, b"shared");
@@ -2838,7 +2827,7 @@ mod tests {
         endpoint_contract(&mut driver, 4, PIE_CHANNEL_EXTERN_NONE, &[]);
         let occupied = bind_existing_channels(&mut driver, private_program, 301, &[4]).unwrap();
         let two_channel_program = register_test_program(&mut driver, private_container(2));
-        assert!(bind_existing_channels(&mut driver, two_channel_program, 302, &[3, 4]).is_err());
+        assert!(bind_existing_channels(&mut driver, two_channel_program, 302, &[3, 999]).is_err());
         let free = bind_existing_channels(&mut driver, private_program, 303, &[3]).unwrap();
         driver.close_instance(free.instance_id).unwrap();
         driver.close_instance(occupied.instance_id).unwrap();

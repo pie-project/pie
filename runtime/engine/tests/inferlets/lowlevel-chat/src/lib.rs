@@ -52,13 +52,12 @@
 //! Input: `"<max_tokens> [depth=<k>] [no-rollback-probe]"` (default 8 / 4).
 
 use inferlet::ptir::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
+use inferlet::{Result, chat};
 
 const SYSTEM: &str = "You are a helpful assistant.";
 const USER: &str = "Say hello.";
 
 const PAGE_T: u32 = 16; // tokens per KV pool page (mock and Qwen3 page size)
-const NUM_LAYERS: u32 = 28; // Qwen3-0.6B (inert for epilogue-only passes)
 
 /// How the decode fires are driven. All three run the SAME device-carried
 /// pass; they differ only in submission discipline (the point of this
@@ -132,7 +131,8 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     //       read-out row N−1, greedy argmax → g0. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Tensor::constant(vec![0u32, n]);
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
 
     let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
     let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
@@ -148,15 +148,19 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
     let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, embed_indptr_p);
-    fwd_p.port_channel(Port::KvLen, &klen_p);
-    fwd_p.attn_working_set(&ws, .., ..)?;
-    fwd_p.derive_dense_geometry();
-    fwd_p.port_channel(Port::Pages, &pages_p);
-    fwd_p.port_channel(Port::PageIndptr, &page_indptr_p);
-    fwd_p.port_channel(Port::WSlot, &w_slot_p);
-    fwd_p.port_channel(Port::WOff, &w_off_p);
-    fwd_p.attn_mask(&mask_p);
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &klen_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        Some(&mask_p),
+    )?;
     fwd_p.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits()); // greedy over row N−1
         g0_ch.put(&tok);
@@ -194,19 +198,22 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     let out = Channel::new([1], dtype::i32)
         .capacity(budget as u32 + 1)
         .named("out");
-    let lane1 = Tensor::constant(vec![0u32, 1u32]);
+    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&tok_in, lane1);
-    fwd.positions(&pos);
-    fwd.port_channel(Port::KvLen, &klen);
-    fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-    fwd.derive_dense_geometry();
-    fwd.port_channel(Port::Pages, &pages);
-    fwd.port_channel(Port::PageIndptr, &page_indptr);
-    fwd.port_channel(Port::WSlot, &w_slot);
-    fwd.port_channel(Port::WOff, &w_off);
-    fwd.attn_mask(&mask);
+    fwd.embed(&tok_in, &lane1)?;
+    fwd.attention(
+        &ws,
+        ..,
+        (n / ws.page_size())..,
+        &klen,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &pos,
+        Some(&mask),
+    )?;
     fwd.epilogue(move || {
         // Takes + compute first, puts last (value-id discipline).
         let base = fill.take().tensor(); // [1] u32: position this fire writes
@@ -382,9 +389,6 @@ async fn main(input: String) -> Result<String> {
         .split_whitespace()
         .find_map(|t| t.strip_prefix("depth=").and_then(|v| v.parse().ok()))
         .unwrap_or(4);
-
-    let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
 
     // Chat prompt via the thin `pie:inferlet/chat` bindings (the template
     // knowledge lives in the host runtime). `stop` is the chat-EOS set.

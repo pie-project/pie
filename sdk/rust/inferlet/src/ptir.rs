@@ -8,9 +8,9 @@
 //! them to the canonical PTIR container, orders the WIT channel handles by the
 //! builder↔bridge contract
 //! ([`Traced::channel_order`](ptir_dsl::Traced::channel_order)), and calls
-//! `forward-pass.new` (which binds against the model — the guest does not bind,
-//! D6). Program identity, dedup, and validation happen host-side inside
-//! `forward-pass.new`/`forward-pass.submit`.
+//! the empty `forward-pass` builder and attaches the traced program (which
+//! binds against the model — the guest does not bind, D6). Program identity,
+//! dedup, and validation happen host-side at program attachment.
 //!
 //! A [`Channel`] owns BOTH sides: the `ptir-dsl` trace declaration (its `take`/
 //! `put`/`read` record ops inside a stage closure, and host `put`s record the
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::ops::{Bound, RangeBounds};
 use std::rc::Rc;
 
-use ptir_dsl::builder::{Builder, PortInput};
+use ptir_dsl::builder::Builder;
 use ptir_dsl::channel::PutValue;
 use ptir_dsl::value::{Arg, ConstData};
 use ptir_dsl::{
@@ -40,7 +40,7 @@ pub use ptir_dsl::intrinsics;
 
 // Re-export the eDSL vocabulary so an author writes stage closures with a single
 // `use inferlet::ptir::prelude::*;` (mirrors the old `ptir::prelude`).
-pub use ptir_dsl::{DType as Dtype, model};
+pub use ptir_dsl::DType as Dtype;
 pub use ptir_dsl::{
     add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div, dtype, entropy,
     entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max, iota, l2norm,
@@ -55,7 +55,7 @@ pub use ptir_dsl::{
 // ---------------------------------------------------------------------------
 //
 // A stage trace interns channels and yields dense channel ids keyed by the
-// dsl channel's gid; `forward-pass.new` wants the WIT handles in that dense
+// dsl channel's gid; `forward-pass.program` wants the WIT handles in that dense
 // order. Every channel the author can reference is created via `Channel::new`/
 // `from`/`seeded`, so registering (gid -> Rc<wit::Channel>) at construction
 // lets a `ForwardPass` resolve each `Traced.channel_order` entry. Inferlets are
@@ -317,6 +317,15 @@ impl Channel {
             }
         }
     }
+
+    /// Atomically replace the committed front cell without changing queue
+    /// occupancy. A later value already queued by [`put`](Self::put) is left
+    /// untouched. This is a host operation; unlike a stage `put`, it records no
+    /// PTIR op.
+    pub fn set(&self, v: impl IntoConst) -> Result<(), String> {
+        let data: ConstData = v.into_const();
+        self.wit().set(&data.bytes)
+    }
 }
 
 /// The result of [`Channel::take`]/[`Channel::read`]. In a stage closure it is
@@ -549,7 +558,7 @@ impl IntoPut for PageGrant {
 
 /// The runtime's recurrent-state slots for hybrid / linear-attention models
 /// (GDN, Mamba2). Wraps the WIT `rs-working-set`. Bind via
-/// [`ForwardPass::set_rs_working_sets`] for models whose
+/// [`ForwardPass::rs_working_sets`] for models whose
 /// `model::rs_state_size()` is nonzero; pure-attention models bind none.
 pub struct RsWorkingSet {
     rs: Rc<crate::working_set::RsWorkingSet>,
@@ -596,194 +605,24 @@ impl Default for RsWorkingSet {
 // ForwardPass
 // ---------------------------------------------------------------------------
 
-/// A descriptor-port binding staged on the [`ForwardPass`] until submit.
-enum PortSpec {
-    Channel(Port, DslChannel),
-    Const(Port, Tensor),
-}
-
 type StageClosure = Box<dyn Fn()>;
 
-/// The forward pass (overview §5). Attach descriptor ports + stage closures,
-/// submit through a [`Pipeline`]. On first submit the bridge drives the builder,
-/// lowers to the container, and calls `forward-pass.new`; the bound WIT resource
-/// is memoized. The lifetime lets stage closures borrow the channels they touch.
+/// A forward-pass builder. Its WIT resource is constructed empty, descriptor
+/// resources are attached through typed methods, and the traced program is
+/// attached once on first submit.
 pub struct ForwardPass {
+    wit: Rc<wit::ForwardPass>,
     inner: RefCell<ForwardInner>,
 }
 
 struct ForwardInner {
-    ports: Vec<PortSpec>,
+    ports: Vec<(Port, DslChannel)>,
     stages: Vec<(Stage, StageClosure)>,
-    attn: Option<AttnWorkingSet>,
-    derive_dense_geometry: bool,
-    dense_page_capacity: Option<u32>,
-    auto_geometry: Option<AutoGeometry>,
-    geometry_materialized: bool,
-    rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
-    bound: Option<Rc<wit::ForwardPass>>,
-}
-
-struct AttnWorkingSet {
-    ws: Rc<KvWorkingSet>,
-    readable: PageDeclaration,
-    writable: PageDeclaration,
-}
-
-#[derive(Clone)]
-enum GeometryInput {
-    Channel(DslChannel),
-    Const(Tensor),
-}
-
-impl GeometryInput {
-    fn shape(&self) -> Shape {
-        match self {
-            GeometryInput::Channel(channel) => channel.shape(),
-            GeometryInput::Const(value) => value.shape(),
-        }
-    }
-
-    fn tensor(&self) -> Tensor {
-        match self {
-            GeometryInput::Channel(channel) => channel.read().tensor(),
-            GeometryInput::Const(value) => value.clone(),
-        }
-    }
-}
-
-struct AutoGeometry {
-    tokens: DslChannel,
-    indptr: GeometryInput,
-    kv_len: GeometryInput,
-    positions: Option<DslChannel>,
-    pages: Option<DslChannel>,
-    page_indptr: Option<DslChannel>,
-    w_slot: Option<DslChannel>,
-    w_off: Option<DslChannel>,
-    token_count: u32,
-    lane_count: u32,
-    page_count: u32,
+    vocab: u32,
     page_size: u32,
-    token_dtype: DType,
-}
-
-impl AutoGeometry {
-    fn trace(&self) {
-        for output in [
-            self.positions.as_ref(),
-            self.pages.as_ref(),
-            self.page_indptr.as_ref(),
-            self.w_slot.as_ref(),
-            self.w_off.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            output.take();
-        }
-
-        let needs_token_geometry =
-            self.positions.is_some() || self.w_slot.is_some() || self.w_off.is_some();
-        let needs_kv_len = needs_token_geometry || self.page_indptr.is_some();
-        let kv_len = needs_kv_len.then(|| self.kv_len.tensor());
-
-        let positions = needs_token_geometry.then(|| {
-            let tokens = self.tokens.read().tensor();
-            let indptr = self.indptr.tensor();
-            let kv_len = kv_len.as_ref().expect("KvLen read for token geometry");
-            let sentinel = match self.token_dtype {
-                DType::I32 => Tensor::constant(-1i32),
-                DType::U32 => Tensor::constant(u32::MAX),
-                _ => unreachable!("embed tokens are integer"),
-            };
-            let valid = ne(&tokens, &sentinel);
-
-            let rows = broadcast(
-                reshape(iota(self.token_count), [self.token_count, 1]),
-                [self.token_count, self.lane_count],
-            );
-            let lane_indices = iota(self.lane_count);
-            let starts = broadcast(
-                reshape(gather(&indptr, &lane_indices), [1, self.lane_count]),
-                [self.token_count, self.lane_count],
-            );
-            let ends = broadcast(
-                reshape(
-                    gather(&indptr, add(&lane_indices, 1u32)),
-                    [1, self.lane_count],
-                ),
-                [self.token_count, self.lane_count],
-            );
-            let membership = and(ge(&rows, &starts), lt(&rows, &ends));
-            let live = and(
-                &membership,
-                broadcast(
-                    reshape(&valid, [self.token_count, 1]),
-                    [self.token_count, self.lane_count],
-                ),
-            );
-
-            // Scan each CSR lane independently. F32 is exact for every
-            // practical token envelope (all live counts remain below 2^24).
-            let live_by_lane = transpose(cast(&live, DType::F32));
-            let exclusive_by_lane = sub(cumsum(&live_by_lane), &live_by_lane);
-            let rank = cast(
-                reduce_sum(mul(
-                    transpose(exclusive_by_lane),
-                    cast(&membership, DType::F32),
-                )),
-                DType::U32,
-            );
-            let live_rows = cast(reduce_sum(&live_by_lane), DType::U32);
-            let base_by_lane = sub(kv_len, &live_rows);
-            let base = reduce_sum(mul(
-                broadcast(
-                    reshape(base_by_lane, [1, self.lane_count]),
-                    [self.token_count, self.lane_count],
-                ),
-                cast(membership, DType::U32),
-            ));
-            add(base, rank)
-        });
-
-        if let Some(output) = &self.positions {
-            output.put(positions.as_ref().expect("generated Positions"));
-        }
-        if let Some(output) = &self.pages {
-            output.put(broadcast(
-                reshape(iota(self.page_count), [1, self.page_count]),
-                [self.lane_count, self.page_count],
-            ));
-        }
-        if let Some(output) = &self.page_indptr {
-            let page_counts = div(
-                add(
-                    kv_len.as_ref().expect("KvLen read for PageIndptr"),
-                    self.page_size - 1,
-                ),
-                self.page_size,
-            );
-            let cumulative = cast(cumsum(cast(page_counts, DType::F32)), DType::U32);
-            output.put(scatter_set(
-                Tensor::constant(vec![0u32; self.lane_count as usize + 1]),
-                add(iota(self.lane_count), 1u32),
-                cumulative,
-            ));
-        }
-        if let Some(output) = &self.w_slot {
-            output.put(div(
-                positions.as_ref().expect("generated WSlot"),
-                self.page_size,
-            ));
-        }
-        if let Some(output) = &self.w_off {
-            output.put(rem(
-                positions.as_ref().expect("generated WOff"),
-                self.page_size,
-            ));
-        }
-    }
+    attention_ws: Option<Rc<KvWorkingSet>>,
+    rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
+    program_attached: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -862,562 +701,148 @@ mod page_declaration_tests {
     }
 }
 
-impl ForwardInner {
-    fn input(&self, port: Port) -> Option<GeometryInput> {
-        self.ports.iter().find_map(|spec| match spec {
-            PortSpec::Channel(bound, channel) if *bound == port => {
-                Some(GeometryInput::Channel(channel.clone()))
-            }
-            PortSpec::Const(bound, value) if *bound == port => {
-                Some(GeometryInput::Const(value.clone()))
-            }
-            _ => None,
-        })
-    }
-
-    fn has_port(&self, port: Port) -> bool {
-        self.ports.iter().any(|spec| match spec {
-            PortSpec::Channel(bound, _) | PortSpec::Const(bound, _) => *bound == port,
-        })
-    }
-
-    fn materialize_geometry(&mut self) {
-        if self.geometry_materialized {
-            return;
-        }
-
-        let missing_positions = !self.has_port(Port::Positions);
-        let missing_pages = !self.has_port(Port::Pages);
-        let missing_page_indptr = !self.has_port(Port::PageIndptr);
-        let missing_w_slot = !self.has_port(Port::WSlot);
-        let missing_w_off = !self.has_port(Port::WOff);
-        if ![
-            missing_positions,
-            missing_pages,
-            missing_page_indptr,
-            missing_w_slot,
-            missing_w_off,
-        ]
-        .into_iter()
-        .any(|missing| missing)
-        {
-            self.geometry_materialized = true;
-            return;
-        }
-
-        let Some(tokens) = self.ports.iter().find_map(|spec| match spec {
-            PortSpec::Channel(Port::EmbedTokens, channel) => Some(channel.clone()),
-            _ => None,
-        }) else {
-            return;
-        };
-        let Some(indptr) = self.input(Port::EmbedIndptr) else {
-            return;
-        };
-        let Some(kv_len) = self.input(Port::KvLen) else {
-            // The PTIR validator reports the missing author-bound KvLen.
-            return;
-        };
-        let Some(attn) = self.attn.as_ref() else {
-            return;
-        };
-
-        let token_count =
-            u32::try_from(tokens.shape().numel()).expect("embed token envelope fits in u32");
-        let indptr_shape = indptr.shape();
-        assert_eq!(indptr_shape.dims().len(), 1, "EmbedIndptr must be a vector");
-        let lane_count = u32::try_from(indptr_shape.numel().saturating_sub(1))
-            .expect("EmbedIndptr lane count fits in u32");
-        assert!(token_count > 0, "embed token envelope must be non-empty");
-        assert!(
-            lane_count > 0,
-            "EmbedIndptr must describe at least one lane"
-        );
-        assert_eq!(
-            kv_len.shape().dims(),
-            [lane_count],
-            "KvLen must have one post-write extent per EmbedIndptr lane"
-        );
-
-        let page_size = attn.ws.page_size();
-        let page_count = if missing_pages {
-            let page_count = self
-                .dense_page_capacity
-                .unwrap_or_else(|| attn.ws.page_len());
-            assert!(
-                page_count > 0,
-                "dense geometry must declare at least one page of capacity"
-            );
-            assert!(
-                page_count >= attn.ws.page_len(),
-                "dense geometry page capacity is smaller than the current working-set extent"
-            );
-            page_count
-        } else {
-            0
-        };
-        let token_dtype = tokens.dtype();
-
-        let positions = missing_positions
-            .then(|| Channel::from(vec![0u32; token_count as usize]).named("__geometry_positions"));
-        let pages = missing_pages.then(|| {
-            Channel::from_shaped(
-                [lane_count, page_count],
-                vec![0u32; lane_count as usize * page_count as usize],
-            )
-            .named("__geometry_pages")
-        });
-        let page_indptr = missing_page_indptr.then(|| {
-            Channel::from(vec![0u32; lane_count as usize + 1]).named("__geometry_page_indptr")
-        });
-        let w_slot = missing_w_slot
-            .then(|| Channel::from(vec![0u32; token_count as usize]).named("__geometry_w_slot"));
-        let w_off = missing_w_off
-            .then(|| Channel::from(vec![0u32; token_count as usize]).named("__geometry_w_off"));
-
-        if let Some(channel) = &positions {
-            self.ports.push(PortSpec::Channel(
-                Port::Positions,
-                claim_port(Port::Positions, channel),
-            ));
-        }
-        if let Some(channel) = &pages {
-            self.ports.push(PortSpec::Channel(
-                Port::Pages,
-                claim_port(Port::Pages, channel),
-            ));
-        }
-        if let Some(channel) = &page_indptr {
-            self.ports.push(PortSpec::Channel(
-                Port::PageIndptr,
-                claim_port(Port::PageIndptr, channel),
-            ));
-        }
-        if let Some(channel) = &w_slot {
-            self.ports.push(PortSpec::Channel(
-                Port::WSlot,
-                claim_port(Port::WSlot, channel),
-            ));
-        }
-        if let Some(channel) = &w_off {
-            self.ports.push(PortSpec::Channel(
-                Port::WOff,
-                claim_port(Port::WOff, channel),
-            ));
-        }
-
-        self.auto_geometry = Some(AutoGeometry {
-            tokens,
-            indptr,
-            kv_len,
-            positions: positions.map(|channel| channel.dsl()),
-            pages: pages.map(|channel| channel.dsl()),
-            page_indptr: page_indptr.map(|channel| channel.dsl()),
-            w_slot: w_slot.map(|channel| channel.dsl()),
-            w_off: w_off.map(|channel| channel.dsl()),
-            token_count,
-            lane_count,
-            page_count,
-            page_size,
-            token_dtype,
-        });
-        self.geometry_materialized = true;
-    }
-}
-
-#[cfg(test)]
-mod auto_geometry_tests {
-    use super::*;
-    use ptir_dsl::ptir::container::{PortSource, TraceContainer};
-    use ptir_dsl::ptir::op::Op;
-    use ptir_dsl::ptir::registry::ModelProfile;
-    use ptir_dsl::ptir::validate::bind;
-
-    struct GeometryTrace {
-        container: TraceContainer,
-        tokens: u32,
-        indptr: Option<u32>,
-        kv_len: u32,
-        positions: u32,
-        pages: u32,
-        page_indptr: u32,
-        w_slot: u32,
-        w_off: u32,
-    }
-
-    fn channel_index(traced: &ptir_dsl::Traced, channel: &DslChannel) -> u32 {
-        traced
-            .channel_order()
-            .iter()
-            .position(|gid| *gid == channel.gid())
-            .expect("test channel is traced") as u32
-    }
-
-    fn trace_geometry(
-        token_count: u32,
-        lane_count: u32,
-        channel_indptr: bool,
-        page_count: u32,
-        page_size: u32,
-        generated: [bool; 5],
-    ) -> GeometryTrace {
-        let tokens = DslChannel::seeded([token_count], DType::I32);
-        let indptr_channel = DslChannel::seeded([lane_count + 1], DType::U32);
-        let kv_len = DslChannel::seeded([lane_count], DType::U32);
-        let positions = DslChannel::seeded([token_count], DType::U32);
-        let pages = DslChannel::seeded([lane_count, page_count], DType::U32);
-        let page_indptr = DslChannel::seeded([lane_count + 1], DType::U32);
-        let w_slot = DslChannel::seeded([token_count], DType::U32);
-        let w_off = DslChannel::seeded([token_count], DType::U32);
-
-        let indptr = if channel_indptr {
-            GeometryInput::Channel(indptr_channel.clone())
-        } else {
-            assert_eq!(lane_count, 1);
-            GeometryInput::Const(Tensor::constant(vec![0u32, token_count]))
-        };
-        let geometry = AutoGeometry {
-            tokens: tokens.clone(),
-            indptr: indptr.clone(),
-            kv_len: GeometryInput::Channel(kv_len.clone()),
-            positions: generated[0].then(|| positions.clone()),
-            pages: generated[1].then(|| pages.clone()),
-            page_indptr: generated[2].then(|| page_indptr.clone()),
-            w_slot: generated[3].then(|| w_slot.clone()),
-            w_off: generated[4].then(|| w_off.clone()),
-            token_count,
-            lane_count,
-            page_count,
-            page_size,
-            token_dtype: DType::I32,
-        };
-
-        let mut builder = Builder::new();
-        builder.bind_port(Port::EmbedTokens, PortInput::Channel(tokens.clone()));
-        match indptr {
-            GeometryInput::Channel(channel) => {
-                builder.bind_port(Port::EmbedIndptr, PortInput::Channel(channel))
-            }
-            GeometryInput::Const(value) => {
-                builder.bind_port(Port::EmbedIndptr, PortInput::Const(value))
-            }
-        }
-        builder.bind_port(Port::KvLen, PortInput::Channel(kv_len.clone()));
-        builder.bind_port(Port::Positions, PortInput::Channel(positions.clone()));
-        builder.bind_port(Port::Pages, PortInput::Channel(pages.clone()));
-        builder.bind_port(Port::PageIndptr, PortInput::Channel(page_indptr.clone()));
-        builder.bind_port(Port::WSlot, PortInput::Channel(w_slot.clone()));
-        builder.bind_port(Port::WOff, PortInput::Channel(w_off.clone()));
-        builder.stage(Stage::Prologue, || geometry.trace());
-        let traced = builder.build().expect("geometry trace builds");
-        let container = traced.container().clone();
-        bind(container.clone(), ModelProfile::dummy()).expect("generated geometry validates");
-        GeometryTrace {
-            container,
-            tokens: channel_index(&traced, &tokens),
-            indptr: channel_indptr.then(|| channel_index(&traced, &indptr_channel)),
-            kv_len: channel_index(&traced, &kv_len),
-            positions: channel_index(&traced, &positions),
-            pages: channel_index(&traced, &pages),
-            page_indptr: channel_index(&traced, &page_indptr),
-            w_slot: channel_index(&traced, &w_slot),
-            w_off: channel_index(&traced, &w_off),
-        }
-    }
-
-    fn assert_read_only(container: &TraceContainer, channel: u32) {
-        let ops = &container.stages[0].ops;
-        assert!(
-            ops.iter()
-                .any(|op| matches!(op, Op::ChanRead(bound) if *bound == channel))
-        );
-        assert!(!ops.iter().any(|op| {
-            matches!(op, Op::ChanTake(bound) if *bound == channel)
-                || matches!(op, Op::ChanPut { chan, .. } if *chan == channel)
-        }));
-    }
-
-    #[test]
-    fn const_one_lane_prefill_preserves_csr_and_channel_shapes() {
-        let trace = trace_geometry(4, 1, false, 3, 4, [true; 5]);
-
-        assert_eq!(
-            trace.container.channels[trace.positions as usize].shape,
-            Shape::vector(4)
-        );
-        assert_eq!(
-            trace.container.channels[trace.pages as usize].shape,
-            Shape::matrix(1, 3)
-        );
-        assert_eq!(
-            trace.container.channels[trace.page_indptr as usize].shape,
-            Shape::vector(2)
-        );
-        assert_eq!(
-            trace.container.channels[trace.w_slot as usize].shape,
-            Shape::vector(4)
-        );
-        assert_eq!(
-            trace.container.channels[trace.w_off as usize].shape,
-            Shape::vector(4)
-        );
-        let embed_indptr = trace
-            .container
-            .ports
-            .iter()
-            .find(|binding| binding.port == Port::EmbedIndptr)
-            .expect("EmbedIndptr remains bound");
-        let PortSource::Const { data, .. } = &embed_indptr.source else {
-            panic!("one-lane EmbedIndptr remains the caller's constant");
-        };
-        let values: Vec<u32> = data
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("u32 word")))
-            .collect();
-        assert_eq!(values, [0, 4]);
-        assert_read_only(&trace.container, trace.kv_len);
-    }
-
-    #[test]
-    fn channel_csr_is_read_only_and_segments_live_ranks() {
-        let trace = trace_geometry(5, 2, true, 4, 4, [true; 5]);
-
-        assert_eq!(
-            trace.container.channels[trace.pages as usize].shape,
-            Shape::matrix(2, 4)
-        );
-        assert_read_only(&trace.container, trace.kv_len);
-        assert_read_only(
-            &trace.container,
-            trace.indptr.expect("channel EmbedIndptr is retained"),
-        );
-        let ops = &trace.container.stages[0].ops;
-        assert!(ops.iter().any(|op| matches!(op, Op::Transpose(_))));
-        assert!(ops.iter().filter(|op| matches!(op, Op::CumSum(_))).count() >= 2);
-    }
-
-    #[test]
-    fn partial_override_generates_only_the_missing_port() {
-        let trace = trace_geometry(3, 1, false, 2, 4, [false, false, true, false, false]);
-        let ops = &trace.container.stages[0].ops;
-
-        assert!(
-            ops.iter()
-                .any(|op| matches!(op, Op::ChanTake(bound) if *bound == trace.page_indptr))
-        );
-        for untouched in [trace.positions, trace.pages, trace.w_slot, trace.w_off] {
-            assert!(!ops.iter().any(|op| {
-                matches!(op, Op::ChanTake(bound) if *bound == untouched)
-                    || matches!(op, Op::ChanPut { chan, .. } if *chan == untouched)
-            }));
-        }
-        assert_read_only(&trace.container, trace.kv_len);
-        assert!(
-            !ops.iter()
-                .any(|op| matches!(op, Op::ChanRead(bound) if *bound == trace.tokens))
-        );
-    }
-}
-
 impl ForwardPass {
     pub fn new() -> ForwardPass {
+        let vocab = crate::model::output_vocab_size();
+        let page_size = crate::model::kv_page_size();
         ForwardPass {
+            wit: Rc::new(wit::ForwardPass::new()),
             inner: RefCell::new(ForwardInner {
                 ports: Vec::new(),
                 stages: Vec::new(),
-                attn: None,
-                derive_dense_geometry: false,
-                dense_page_capacity: None,
-                auto_geometry: None,
-                geometry_materialized: false,
+                vocab,
+                page_size,
+                attention_ws: None,
                 rs_working_sets: Vec::new(),
-                bound: None,
+                program_attached: false,
             }),
         }
     }
 
-    fn invalidate(&self) {
-        self.inner.borrow_mut().bound = None;
-    }
-
-    /// `embed(&toks, indptr)` — token ids per lane; consumes (take). `indptr`
-    /// is a trace-known constant for rectangular batches, or a channel.
-    pub fn embed(&self, toks: &Channel, indptr: impl Indptr) {
-        {
-            let mut inner = self.inner.borrow_mut();
-            inner.ports.push(PortSpec::Channel(
-                Port::EmbedTokens,
-                claim_port(Port::EmbedTokens, toks),
-            ));
-            match indptr.resolve() {
-                IndptrSpec::Const(t) => inner.ports.push(PortSpec::Const(Port::EmbedIndptr, t)),
-                IndptrSpec::Channel(c) => inner.ports.push(PortSpec::Channel(Port::EmbedIndptr, c)),
-            }
+    fn ensure_ports_available(&self, ports: &[Port]) -> Result<(), String> {
+        let inner = self.inner.borrow();
+        if inner.program_attached {
+            return Err("forward pass program is already attached".to_string());
         }
-        self.invalidate();
+        if let Some(port) = ports
+            .iter()
+            .find(|port| inner.ports.iter().any(|(bound, _)| bound == *port))
+        {
+            return Err(format!(
+                "forward pass port {} is already bound",
+                port.name()
+            ));
+        }
+        Ok(())
     }
 
-    /// `positions(&pos)` — explicit RoPE positions; consumes (take).
-    pub fn positions(&self, pos: &Channel) {
-        self.inner.borrow_mut().ports.push(PortSpec::Channel(
-            Port::Positions,
-            claim_port(Port::Positions, pos),
-        ));
-        self.invalidate();
+    /// Bind token ids and CSR row indptr. Both descriptor inputs are channels.
+    pub fn embed(&self, tokens: &Channel, indptr: &Channel) -> Result<(), String> {
+        self.ensure_ports_available(&[Port::EmbedTokens, Port::EmbedIndptr])?;
+        let token_wit = tokens.wit();
+        let indptr_wit = indptr.wit();
+        self.wit.embed(token_wit.as_ref(), indptr_wit.as_ref())?;
+        self.inner.borrow_mut().ports.extend([
+            (Port::EmbedTokens, claim_port(Port::EmbedTokens, tokens)),
+            (Port::EmbedIndptr, claim_port(Port::EmbedIndptr, indptr)),
+        ]);
+        Ok(())
     }
 
-    /// Declare this pass's attention working set and readable/writable page
-    /// spans. Open-ended ranges (for example `..` or `start..`) follow later
-    /// working-set growth. These are per-fire access declarations, not page
-    /// inventories: the runtime checks each fire's resolved dense read/write
-    /// pages against them.
-    ///
-    /// Every pass with [`Port::EmbedTokens`] must author-bind [`Port::KvLen`],
-    /// whose values are each lane's post-write readable token extent. Geometry
-    /// is never inferred from this declaration: bind every geometry port
-    /// explicitly, or opt into the SDK's named dense lowering with
-    /// [`derive_dense_geometry`](Self::derive_dense_geometry).
-    ///
-    /// Before first submit the declaration is passed to `forward-pass.new`.
-    /// Re-calling this method after bind atomically updates the native pass in
-    /// place; it never recreates the pass or resets its channels.
-    pub fn attn_working_set<R, W>(
+    /// Bind attention and all of its geometry channels. This is the only
+    /// attention binding surface; `mask: None` omits PTIR's existing AttnMask
+    /// port, while `Some` binds that channel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention<R, W>(
         &self,
         ws: &WorkingSet,
         readable: R,
         writable: W,
+        kv_len: &Channel,
+        pages: &Channel,
+        page_indptr: &Channel,
+        w_slot: &Channel,
+        w_off: &Channel,
+        positions: &Channel,
+        mask: Option<&Channel>,
     ) -> Result<(), String>
     where
         R: RangeBounds<u32>,
         W: RangeBounds<u32>,
     {
+        let mut ports = vec![
+            Port::KvLen,
+            Port::Pages,
+            Port::PageIndptr,
+            Port::WSlot,
+            Port::WOff,
+            Port::Positions,
+        ];
+        if mask.is_some() {
+            ports.push(Port::AttnMask);
+        }
+        self.ensure_ports_available(&ports)?;
         let readable = PageDeclaration::from_range(readable)?;
         let writable = PageDeclaration::from_range(writable)?;
-        let (bound, generated_page_limit) = {
-            let inner = self.inner.borrow();
-            (
-                inner.bound.clone(),
-                inner
-                    .auto_geometry
-                    .as_ref()
-                    .and_then(|geometry| geometry.pages.as_ref().map(|_| geometry.page_count)),
-            )
-        };
-        if let Some(bound) = bound {
-            if generated_page_limit.is_some_and(|limit| ws.page_len() > limit) {
-                return Err(
-                    "attention lease growth exceeds this pass's generated page envelope; \
-                     construct a new pass"
-                        .to_string(),
-                );
-            }
-            bound.set_attn_working_set(ws.kv.as_ref(), readable.wit(), writable.wit())?;
+        let kv_len_wit = kv_len.wit();
+        let pages_wit = pages.wit();
+        let page_indptr_wit = page_indptr.wit();
+        let w_slot_wit = w_slot.wit();
+        let w_off_wit = w_off.wit();
+        let positions_wit = positions.wit();
+        let mask_wit = mask.map(Channel::wit);
+        self.wit.attention(
+            ws.kv.as_ref(),
+            readable.wit(),
+            writable.wit(),
+            kv_len_wit.as_ref(),
+            pages_wit.as_ref(),
+            page_indptr_wit.as_ref(),
+            w_slot_wit.as_ref(),
+            w_off_wit.as_ref(),
+            positions_wit.as_ref(),
+            mask_wit.as_deref(),
+        )?;
+
+        let mut inner = self.inner.borrow_mut();
+        inner.ports.extend([
+            (Port::KvLen, claim_port(Port::KvLen, kv_len)),
+            (Port::Pages, claim_port(Port::Pages, pages)),
+            (Port::PageIndptr, claim_port(Port::PageIndptr, page_indptr)),
+            (Port::WSlot, claim_port(Port::WSlot, w_slot)),
+            (Port::WOff, claim_port(Port::WOff, w_off)),
+            (Port::Positions, claim_port(Port::Positions, positions)),
+        ]);
+        if let Some(mask) = mask {
+            inner
+                .ports
+                .push((Port::AttnMask, claim_port(Port::AttnMask, mask)));
         }
-        self.inner.borrow_mut().attn = Some(AttnWorkingSet {
-            ws: ws.kv.clone(),
-            readable,
-            writable,
-        });
+        inner.attention_ws = Some(ws.kv.clone());
         Ok(())
     }
 
-    /// Explicitly select the SDK's ordinary dense layout lowering.
-    ///
-    /// On first bind, any missing `Positions`/`Pages`/`PageIndptr`/`WSlot`/
-    /// `WOff` ports are traced from author-bound `EmbedTokens`, `EmbedIndptr`,
-    /// and `KvLen`. Explicitly bound ports remain authoritative. Without this
-    /// opt-in, every geometry port must be bound by the inferlet.
-    pub fn derive_dense_geometry(&self) {
-        let mut inner = self.inner.borrow_mut();
-        assert!(
-            inner.bound.is_none(),
-            "derive_dense_geometry is construction-only"
-        );
-        inner.derive_dense_geometry = true;
-    }
-
-    /// Select dense lowering with an explicit static page-channel capacity,
-    /// decoupled from the WorkingSet's current logical reserve frontier.
-    pub fn derive_dense_geometry_with_page_capacity(&self, page_capacity: u32) {
-        assert!(page_capacity > 0, "dense page capacity must be nonzero");
-        let mut inner = self.inner.borrow_mut();
-        assert!(
-            inner.bound.is_none(),
-            "derive_dense_geometry_with_page_capacity is construction-only"
-        );
-        inner.derive_dense_geometry = true;
-        inner.dense_page_capacity = Some(page_capacity);
-    }
-
-    /// Add one recurrent-state working set in resolved request order.
-    ///
-    /// This additive convenience is for initial construction. Use
-    /// [`set_rs_working_sets`](Self::set_rs_working_sets) after the pass has
-    /// been bound.
-    pub fn rs_working_set(&self, rs: &RsWorkingSet) {
-        let mut inner = self.inner.borrow_mut();
-        assert!(
-            inner.bound.is_none(),
-            "rs_working_set is construction-only after binding; use set_rs_working_sets"
-        );
-        inner.rs_working_sets.push(rs.rs.clone());
-    }
-
-    /// Replace the recurrent-state bindings in resolved request order.
-    ///
-    /// Hybrid / linear-attention forwards bind one working set per request
-    /// row; pure-attention forwards pass an empty slice. Replacing the list
-    /// updates the already-bound host pass in-place; it never recreates the
-    /// native instance or resets seeds/KV/device geometry.
-    pub fn set_rs_working_sets(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
+    /// Bind recurrent-state working sets in resolved request order.
+    pub fn rs_working_sets(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
         let replacement: Vec<Rc<crate::working_set::RsWorkingSet>> =
             working_sets.iter().map(|rs| rs.rs.clone()).collect();
-        let mut inner = self.inner.borrow_mut();
-        if let Some(bound) = inner.bound.as_ref() {
-            let borrows: Vec<&crate::working_set::RsWorkingSet> =
-                replacement.iter().map(Rc::as_ref).collect();
-            bound.set_rs_working_sets(&borrows)?;
-        }
-        inner.rs_working_sets = replacement;
+        let borrows: Vec<&crate::working_set::RsWorkingSet> =
+            replacement.iter().map(Rc::as_ref).collect();
+        self.wit.set_rs_working_sets(&borrows)?;
+        self.inner.borrow_mut().rs_working_sets = replacement;
         Ok(())
     }
 
-    /// `attn_mask(&m)` — masks this pass's queries over the KV axis (peeked).
-    pub fn attn_mask(&self, m: &Channel) {
-        self.inner.borrow_mut().ports.push(PortSpec::Channel(
-            Port::AttnMask,
-            claim_port(Port::AttnMask, m),
-        ));
-        self.invalidate();
-    }
-
-    /// Bind a descriptor [`Port`] directly to a channel — the escape hatch for
-    /// device-geometry ports (e.g. `PageIndptr`/`Pages` fed by device-computed
-    /// wire-form channels). Records the port's endpoint claim per its
-    /// consumption discipline, exactly like the other port setters.
-    pub fn port_channel(&self, port: Port, ch: &Channel) {
+    /// Bind readout indexes through a channel, separately from embedding.
+    pub fn readout(&self, indices: &Channel) -> Result<(), String> {
+        self.ensure_ports_available(&[Port::Readout])?;
+        let indices_wit = indices.wit();
+        self.wit.readout(indices_wit.as_ref())?;
         self.inner
             .borrow_mut()
             .ports
-            .push(PortSpec::Channel(port, claim_port(port, ch)));
-        self.invalidate();
-    }
-
-    /// Bind a descriptor [`Port`] to a trace-known constant — the const
-    /// companion of [`port_channel`](Self::port_channel) for explicit
-    /// geometry (e.g. a fixed `PageIndptr` alongside channel-fed `Pages`).
-    pub fn port_const(&self, port: Port, value: &Tensor) {
-        self.inner
-            .borrow_mut()
-            .ports
-            .push(PortSpec::Const(port, value.clone()));
-        self.invalidate();
-    }
-
-    /// `readout(&out_idx)` — which positions are read out. A constant `out_idx`
-    /// fixes the read-out row count.
-    pub fn readout(&self, out_idx: &Tensor) {
-        self.port_const(Port::Readout, out_idx);
+            .push((Port::Readout, claim_port(Port::Readout, indices)));
+        Ok(())
     }
 
     /// Attach the `prologue` stage (overview §5.3).
@@ -1438,117 +863,76 @@ impl ForwardPass {
     }
 
     fn set_stage(&self, stage: Stage, body: impl Fn() + 'static) {
-        {
-            let mut inner = self.inner.borrow_mut();
-            if let Some(slot) = inner.stages.iter_mut().find(|(s, _)| *s == stage) {
-                slot.1 = Box::new(body);
-            } else {
-                inner.stages.push((stage, Box::new(body)));
-            }
+        let mut inner = self.inner.borrow_mut();
+        assert!(
+            !inner.program_attached,
+            "stage attachment is construction-only"
+        );
+        if let Some(slot) = inner.stages.iter_mut().find(|(s, _)| *s == stage) {
+            slot.1 = Box::new(body);
+        } else {
+            inner.stages.push((stage, Box::new(body)));
         }
-        self.invalidate();
     }
 
-    /// `submit(&pipeline)` — enqueue this pass run-ahead on `on`. RS-bound
-    /// passes serialize preparation behind prior FIFO operations; pure
-    /// attention remains non-blocking. The first submit lowers + binds
-    /// (`forward-pass.new`); bind errors surface here.
+    /// Enqueue this pass run-ahead. First submit traces and attaches the
+    /// canonical program; attachment and bind errors surface here.
     pub fn submit(&self, on: &Pipeline) -> Result<(), String> {
-        let bound = self.bound()?;
-        bound.submit(&on.wit)
+        self.attach_program()?;
+        self.wit.submit(&on.wit)
     }
 
-    /// Lower + bind, memoized. Traces the stage closures once into the canonical
-    /// container, orders the WIT channel handles by the builder↔bridge contract,
-    /// and calls `forward-pass.new` (bind errors surface here as the validator's
-    /// message).
-    fn bound(&self) -> Result<Rc<wit::ForwardPass>, String> {
-        if let Some(fp) = &self.inner.borrow().bound {
-            return Ok(fp.clone());
+    fn attach_program(&self) -> Result<(), String> {
+        if self.inner.borrow().program_attached {
+            return Ok(());
         }
-        {
-            let mut inner = self.inner.borrow_mut();
-            if inner.derive_dense_geometry {
-                inner.materialize_geometry();
-            }
-            let missing = [
-                Port::Positions,
-                Port::Pages,
-                Port::PageIndptr,
-                Port::WSlot,
-                Port::WOff,
-            ]
+
+        let inner = self.inner.borrow();
+        let required = [
+            Port::EmbedTokens,
+            Port::EmbedIndptr,
+            Port::KvLen,
+            Port::Pages,
+            Port::PageIndptr,
+            Port::WSlot,
+            Port::WOff,
+            Port::Positions,
+        ];
+        let missing = required
             .into_iter()
-            .filter(|&port| !inner.has_port(port))
-            .map(|port| port.name())
+            .filter(|port| !inner.ports.iter().any(|(bound, _)| bound == port))
+            .map(Port::name)
             .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                return Err(format!(
-                    "forward pass is missing explicit geometry ports: {}; \
-                     bind them or call derive_dense_geometry()",
-                    missing.join(", ")
-                ));
-            }
+        if !missing.is_empty() {
+            return Err(format!(
+                "forward pass is missing descriptor channels: {}",
+                missing.join(", ")
+            ));
+        }
+        if inner.attention_ws.is_none() {
+            return Err("attention must be bound before submit".to_string());
         }
 
-        let fp = {
-            let inner = self.inner.borrow();
-            let mut builder = Builder::new();
-            for spec in &inner.ports {
-                match spec {
-                    PortSpec::Channel(port, ch) => {
-                        builder.bind_port_recorded(*port, PortInput::Channel(ch.clone()))
-                    }
-                    PortSpec::Const(port, t) => {
-                        builder.bind_port(*port, PortInput::Const(t.clone()))
-                    }
-                }
-            }
-            for (stage, body) in &inner.stages {
-                if *stage == Stage::Prologue && inner.auto_geometry.is_some() {
-                    continue;
-                }
-                builder.stage(*stage, body);
-            }
-            if let Some(geometry) = inner.auto_geometry.as_ref() {
-                builder.stage(Stage::Prologue, || {
-                    if let Some((_, body)) = inner
-                        .stages
-                        .iter()
-                        .find(|(stage, _)| *stage == Stage::Prologue)
-                    {
-                        body();
-                    }
-                    geometry.trace();
-                });
-            }
-            let traced = builder.build().map_err(|e| e.to_string())?;
-            drop(builder);
-
-            let handles: Vec<Rc<wit::Channel>> = traced
-                .channel_order()
-                .iter()
-                .map(|gid| lookup_channel(*gid).expect("channel registered before submit"))
-                .collect();
-            let borrows: Vec<&wit::Channel> = handles.iter().map(|rc| rc.as_ref()).collect();
-            let attn = inner.attn.as_ref().ok_or_else(|| {
-                "attention working set must be declared before submit".to_string()
-            })?;
-            let rs_borrows: Vec<&crate::working_set::RsWorkingSet> =
-                inner.rs_working_sets.iter().map(|rc| rc.as_ref()).collect();
-            let bytes = traced.encode();
-            Rc::new(wit::ForwardPass::new(
-                &bytes,
-                &borrows,
-                attn.ws.as_ref(),
-                attn.readable.wit(),
-                attn.writable.wit(),
-                &rs_borrows,
-            )?)
-        };
-
-        self.inner.borrow_mut().bound = Some(fp.clone());
-        Ok(fp)
+        let mut builder = Builder::new(inner.vocab, inner.page_size);
+        for (port, channel) in &inner.ports {
+            builder.bind_port_recorded(*port, channel.clone());
+        }
+        for (stage, body) in &inner.stages {
+            builder.stage(*stage, body);
+        }
+        let traced = builder.build().map_err(|error| error.to_string())?;
+        drop(builder);
+        let handles: Vec<Rc<wit::Channel>> = traced
+            .channel_order()
+            .iter()
+            .map(|gid| lookup_channel(*gid).expect("channel registered before submit"))
+            .collect();
+        let borrows: Vec<&wit::Channel> = handles.iter().map(Rc::as_ref).collect();
+        let bytes = traced.encode();
+        self.wit.program(&bytes, &borrows)?;
+        drop(inner);
+        self.inner.borrow_mut().program_attached = true;
+        Ok(())
     }
 }
 
@@ -1573,13 +957,12 @@ impl Default for ForwardPass {
 /// A `Pipeline` is an ordering domain, not a program: heterogeneous passes
 /// (an N-wide prefill, then a loop-carried decode) are ONE sequential
 /// stream and belong on ONE pipeline — never split phases of the same
-/// stream across pipelines. Call [`Pipeline::finish`] right after the last
-/// submit; on an early stop (stop token), call [`Pipeline::close`], which
-/// CANCELS everything still unexecuted — takes of cancelled fires error,
-/// so a drain loop must tolerate that. Separate pipelines are for
+/// stream across pipelines. Call [`Pipeline::close`] right after the last
+/// submit; already-submitted run-ahead fires settle normally and remain
+/// take-able. Separate pipelines are for
 /// genuinely CONCURRENT streams only (draft vs target model in speculative
-/// decoding, parallel beam branches, independent requests) — each such
-/// stream still ends with its own `finish()`.
+/// decoding, parallel beam branches, independent requests) — close each
+/// stream when it will accept no more submissions.
 pub struct Pipeline {
     wit: wit_pipeline::Pipeline,
 }
@@ -1591,21 +974,9 @@ impl Pipeline {
         }
     }
 
-    /// `finish()` — graceful END OF STREAM: no further submissions; queued
-    /// fires drain normally. Sequenced with the submissions (same FIFO),
-    /// so calling it right after the last submit is exact — the engine
-    /// stops awaiting the pipeline the moment its last fire dispatches,
-    /// and the drain tail never holds the wave barrier. Later submits
-    /// error; `close()` stays legal afterwards.
-    pub fn finish(&self) {
-        self.wit.finish();
-    }
-
-    /// `close()` — CANCEL the pipeline (implied by drop; close and drop
-    /// mean the same thing): queued/preparing fires are cancelled and
-    /// discarded, already-dispatched fires run to settlement. This is the
-    /// early-stop/abort path — the normal end of a stream is
-    /// [`Pipeline::finish`] after its last submission.
+    /// End the stream and release its scheduler wait-set immediately.
+    /// Already-submitted fires drain to settlement in FIFO order and remain
+    /// take-able; later submissions fail. Dropping a pipeline is identical.
     pub fn close(&self) {
         self.wit.close();
     }
@@ -1614,31 +985,6 @@ impl Pipeline {
 impl Default for Pipeline {
     fn default() -> Self {
         Pipeline::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Port argument traits (mirrors the ptir-dsl author surface)
-// ---------------------------------------------------------------------------
-
-/// An `embed` indptr: a trace-known constant, or a channel.
-pub enum IndptrSpec {
-    Const(Tensor),
-    Channel(DslChannel),
-}
-
-/// Anything usable as an `embed` indptr.
-pub trait Indptr {
-    fn resolve(self) -> IndptrSpec;
-}
-impl Indptr for Tensor {
-    fn resolve(self) -> IndptrSpec {
-        IndptrSpec::Const(self)
-    }
-}
-impl Indptr for &Channel {
-    fn resolve(self) -> IndptrSpec {
-        IndptrSpec::Channel(self.dsl())
     }
 }
 
@@ -1655,7 +1001,6 @@ pub mod prelude {
     };
     pub use ptir_dsl::dtype;
     pub use ptir_dsl::intrinsics;
-    pub use ptir_dsl::model;
     pub use ptir_dsl::value::{
         AsTensor, Tensor, add, and, broadcast, cast, causal_mask, cummass_le, cumprod, cumsum, div,
         entropy, entropy_from_logprobs, eq, exp, gather, gather_row, ge, gt, gumbel, gumbel_max,
@@ -1665,5 +1010,5 @@ pub mod prelude {
         scalar_gather, scatter_add, scatter_set, select, sink_window_mask, sliding_window_mask,
         softmax, sub, top_k, transpose,
     };
-    pub use ptir_dsl::{DType, Port, Stage};
+    pub use ptir_dsl::{DType, Stage};
 }

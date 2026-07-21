@@ -43,7 +43,6 @@ const PROMPT: &str = "The quick brown fox jumps over";
 /// row's masked argmax here.
 const FORCE_TOKEN: u32 = 1;
 const PAGE_T: u32 = 16; // tokens per KV page (mock env page size)
-const NUM_LAYERS: u32 = 1;
 
 /// A `[k, vocab]` bool mask (flat, row-major) with EVERY token allowed at every
 /// position.
@@ -95,6 +94,14 @@ async fn verify_window(
     // Seeded inputs (single fire: the host geometry prefill reads seeds) + the
     // terminal [k]-Token reader output.
     let toks = Channel::from(input_toks).named("toks");
+    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
+    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("positions");
+    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
+    let w_slot =
+        Channel::from((0..n).map(|position| position / PAGE_T).collect::<Vec<_>>()).named("w_slot");
+    let w_off =
+        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>()).named("w_off");
     let kv_len = Channel::from(vec![n]).named("kv_len");
     let allow = Channel::from_shaped([k, vocab], mask).named("allow");
     let draft_ch = Channel::from(draft.to_vec()).named("draft");
@@ -102,13 +109,23 @@ async fn verify_window(
 
     // k read-out rows ⇒ intrinsics::logits() declares [k, vocab].
     let readout: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
+    let readout = Channel::from(readout).named("readout");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(&ws, .., ..)?;
-    fwd.derive_dense_geometry();
-    fwd.readout(&Tensor::constant(readout));
+    fwd.embed(&toks, &embed_indptr)?;
+    fwd.readout(&readout)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
     fwd.epilogue(move || {
         // Takes + compute first, PUTS last (value-id discipline).
         let a = allow.take().tensor(); // [k, vocab] bool per-position mask
@@ -142,7 +159,6 @@ async fn verify_window(
 async fn main(input: String) -> Result<String> {
     let k: u32 = input.trim().parse().unwrap_or(4).max(2);
     let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
 
     let mut prompt = wit_model::encode(PROMPT);
     if prompt.is_empty() {

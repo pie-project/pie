@@ -26,7 +26,6 @@ use inferlet::{Result, model as wit_model, serde_json};
 const ALPHABET: [u32; 4] = [10, 11, 12, 13];
 const MAX_TOKENS: usize = 6;
 const PAGE_T: u32 = 16;
-const NUM_LAYERS: u32 = 1;
 
 /// Tiny DFA: allow any alphabet token except the one just emitted (no repeats),
 /// so the per-step mask varies (a non-trivial mask each step).
@@ -74,7 +73,6 @@ async fn main(input: String) -> Result<String> {
         .unwrap_or_else(|| ALPHABET.to_vec());
 
     let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
 
     let mut prompt = wit_model::encode("hello world");
     if prompt.is_empty() {
@@ -96,23 +94,45 @@ async fn main(input: String) -> Result<String> {
     // shape).
     let tok_in = Channel::from(vec![seed_tok]).named("tok_in");
     let kv_len = Channel::from(vec![1u32]).named("kv_len");
+    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
+    let positions = Channel::from(vec![0u32]).named("positions");
+    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, 1]).named("page_indptr");
+    let w_slot = Channel::from(vec![0u32]).named("w_slot");
+    let w_off = Channel::from(vec![0u32]).named("w_off");
     let gmask = Channel::new([vocab], dtype::bool).named("gmask");
     let tok_out = Channel::new([1], dtype::i32).named("tok_out");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&tok_in, Tensor::constant(vec![0u32, 1]));
-    fwd.port_channel(Port::KvLen, &kv_len);
-    fwd.attn_working_set(&ws, .., ..)?;
-    fwd.derive_dense_geometry();
+    fwd.embed(&tok_in, &embed_indptr)?;
+    fwd.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )?;
     fwd.epilogue(move || {
         let length = kv_len.take().tensor();
         // Takes + compute first, PUTS last (value-id discipline).
         let m = gmask.take(); // [V] bool, host-fed per step
         let lg = intrinsics::logits(); // [V] f32 (read-out row)
         let tok = reshape(reduce_argmax(mask_apply(&lg, &m)), [1]); // [1] i32
+        let next_length = add(&length, 1u32);
+        let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
 
         tok_in.put(&tok);
-        kv_len.put(add(&length, 1u32));
+        kv_len.put(&next_length);
+        positions.put(&length);
+        w_slot.put(div(&length, PAGE_T));
+        w_off.put(rem(&length, PAGE_T));
+        page_indptr.take();
+        page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
         tok_out.put(&tok);
     });
 

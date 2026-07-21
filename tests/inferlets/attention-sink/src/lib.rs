@@ -9,7 +9,6 @@ use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
-const NUM_LAYERS: u32 = 28;
 
 #[derive(Deserialize)]
 struct Input {
@@ -51,8 +50,6 @@ async fn main(input: Input) -> Result<String> {
         return Ok(String::new());
     }
 
-    let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
     let sink = input.sink_size;
     let window = input.window_size.max(1);
 
@@ -73,6 +70,8 @@ async fn main(input: Input) -> Result<String> {
     let pool_ids = slots.ids().to_vec();
 
     let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
+    let prefill_embed_indptr = Channel::from(vec![0u32, n]).named("prefill_embed_indptr");
+    let prefill_positions = Channel::from((0..n).collect::<Vec<_>>()).named("prefill_positions");
     let prefill_slots = Channel::from(
         (0..n)
             .map(|position| pool_ids[(position / PAGE_T) as usize])
@@ -92,15 +91,19 @@ async fn main(input: Input) -> Result<String> {
     let first_out = Channel::new([1], dtype::i32).named("first_token");
 
     let prefill = ForwardPass::new();
-    prefill.embed(&prompt_tokens, Tensor::constant(vec![0u32, n]));
-    prefill.port_channel(Port::KvLen, &prefill_klen);
-    prefill.attn_working_set(&ws, .., ..)?;
-    prefill.derive_dense_geometry();
-    prefill.port_channel(Port::Pages, &prefill_pages);
-    prefill.port_channel(Port::PageIndptr, &prefill_indptr);
-    prefill.port_channel(Port::WSlot, &prefill_slots);
-    prefill.port_channel(Port::WOff, &prefill_offsets);
-    prefill.attn_mask(&causal);
+    prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
+    prefill.attention(
+        &ws,
+        ..,
+        ..,
+        &prefill_klen,
+        &prefill_pages,
+        &prefill_indptr,
+        &prefill_slots,
+        &prefill_offsets,
+        &prefill_positions,
+        Some(&causal),
+    )?;
     prefill.epilogue(move || {
         first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
@@ -114,9 +117,6 @@ async fn main(input: Input) -> Result<String> {
         .map_err(|e| format!("attention-sink prefill: {e}"))?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
-    if input.max_tokens == 1 {
-        pipeline.finish();
-    }
     let first = first_out
         .take()
         .get::<i32>()
@@ -128,8 +128,7 @@ async fn main(input: Input) -> Result<String> {
         generated.push(first);
     }
     if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
-        // The only fire has settled (its take succeeded), so dropping the
-        // pipeline here (drop == close) cancels nothing.
+        pipeline.close();
         return wit_model::decode(&generated);
     }
 
@@ -151,16 +150,20 @@ async fn main(input: Input) -> Result<String> {
         .named("token_out");
 
     let decode = ForwardPass::new();
-    decode.embed(&token_in, Tensor::constant(vec![0u32, 1]));
-    decode.positions(&position);
-    decode.port_channel(Port::KvLen, &klen);
-    decode.attn_working_set(&ws, .., ..)?;
-    decode.derive_dense_geometry();
-    decode.port_channel(Port::Pages, &pages);
-    decode.port_channel(Port::PageIndptr, &page_indptr);
-    decode.port_channel(Port::WSlot, &write_slot);
-    decode.port_channel(Port::WOff, &write_offset);
-    decode.attn_mask(&mask);
+    let decode_indptr = Channel::from(vec![0u32, 1]).named("decode_indptr");
+    decode.embed(&token_in, &decode_indptr)?;
+    decode.attention(
+        &ws,
+        ..,
+        ..,
+        &klen,
+        &pages,
+        &page_indptr,
+        &write_slot,
+        &write_offset,
+        &position,
+        Some(&mask),
+    )?;
     decode.epilogue(move || {
         let base = fill.take().tensor();
         let ids = pool_ids_input.take().tensor();
@@ -199,11 +202,6 @@ async fn main(input: Input) -> Result<String> {
         submitted += 1;
         in_flight += 1;
     }
-    // Budget spent inside the burst: the last submit ends the stream —
-    // finish() right after it (F7).
-    if submitted == budget {
-        pipeline.finish();
-    }
     while in_flight > 0 {
         let token = token_out
             .take()
@@ -221,9 +219,6 @@ async fn main(input: Input) -> Result<String> {
                 .map_err(|e| format!("attention-sink decode: {e}"))?;
             submitted += 1;
             in_flight += 1;
-            if submitted == budget {
-                pipeline.finish();
-            }
         }
     }
     while in_flight > 0 {
@@ -234,8 +229,8 @@ async fn main(input: Input) -> Result<String> {
             .map_err(|e| format!("drain run-ahead token: {e}"))?;
         in_flight -= 1;
     }
-    // Every submitted fire was drained above, so this cancels nothing; it
-    // ends stop-path streams that never reached finish() (F7).
+    // Every submitted fire was drained above, so close only releases the
+    // scheduler wait-set.
     pipeline.close();
     wit_model::decode(&generated)
 }

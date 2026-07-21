@@ -47,6 +47,11 @@ struct PersistentInputs {
     // case ceil(max_qo * max_kv / 8). `indptr` has R+1 byte offsets.
     DeviceBuffer<std::uint8_t>  custom_mask;
     DeviceBuffer<std::int32_t>  custom_mask_indptr;
+    // Stable staging for a device-derived dense bool mask before
+    // `launch_pack_dense_mask` writes `custom_mask`. One byte per source bit;
+    // sized from the packed-mask budget at startup so graph-era fires never
+    // allocate a transient source pointer.
+    DeviceBuffer<std::uint8_t>  dense_mask;
     DeviceBuffer<std::uint32_t> structured_mask_klen;
     DeviceBuffer<kernels::StructuredMaskParams> structured_masks;
 

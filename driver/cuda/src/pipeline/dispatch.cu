@@ -5212,6 +5212,9 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
 
     out.per_program.resize(n_prog);
     out.is_device_geometry.assign(n_prog, 0);
+    const bool resolve_device_mask =
+        view.has_user_mask && view.flattened_masks.empty();
+    bool resolved_mask = false;
     std::vector<detail::PortCellCache> cached_cells(n_prog);
     // Pull host-writer rings on the descriptor stream: the readback pack
     // below is ordered behind these copies and its `read` synchronizes the
@@ -5282,13 +5285,20 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST) continue;
+        const bool mask_only =
+            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
+            resolve_device_mask;
+        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
+            !mask_only) {
+            continue;
+        }
         const std::unordered_set<std::uint32_t>* pending_slots =
             staged == nullptr
                 ? nullptr
                 : &staged->lanes[p]->prior_put_slots;
         for (const PortBinding& binding : trace->ports) {
             if (binding.is_const) continue;
+            if (mask_only && binding.port != kPortAttnMask) continue;
             ChannelView& channel_view = it->second.instance->view();
             const std::uint32_t slot =
                 channel_view.slot(binding.channel);
@@ -5368,8 +5378,10 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
     }
     if (staged != nullptr) {
         for (std::size_t p = 0; p < n_prog; ++p) {
-            if (s.instances.at(view.ptir_program_instances.data()[p])
-                    .geometry_class == PIE_GEOMETRY_CLASS_HOST) {
+            const auto& instance =
+                s.instances.at(view.ptir_program_instances.data()[p]);
+            if (instance.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
+                !resolve_device_mask) {
                 continue;
             }
             pack_copies.push_back(DescriptorPackCopy{
@@ -5421,7 +5433,13 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST) continue;
+        const bool mask_only =
+            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
+            resolve_device_mask;
+        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
+            !mask_only) {
+            continue;
+        }
 
         const std::unordered_set<std::uint32_t>* pending_slots = nullptr;
         if (staged != nullptr) {
@@ -5434,6 +5452,16 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         }
 
         FireGeometry& fg = out.per_program[p];
+        if (mask_only) {
+            if (!resolve_attention_mask(
+                    *trace, it->second.instance->view(), fg, err,
+                    allow_structured_masks, pending_slots,
+                    &cached_cells[p])) {
+                return false;
+            }
+            resolved_mask = true;
+            continue;
+        }
         if (!resolve_fire_geometry(
                 *trace, it->second.instance->view(), page_size, fg, err,
                 allow_structured_masks, pending_slots,
@@ -5495,7 +5523,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         out.is_device_geometry[p] = 1;
         ++out.device_count;
     }
-    return out.device_count > 0;
+    return out.device_count > 0 || resolved_mask;
 }
 
 }  // namespace pie_cuda_driver::pipeline

@@ -424,11 +424,19 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     //    `WaitAllPolicy` only via this installed subscription (the natural
     //    terminate path calls `scheduler::worker::notify_pipeline_leave`
     //    directly from `inferlet::process`, which needs no such hook).
-    crate::store::reclaim::set_pipeline_leave_hook(|pid| {
-        crate::scheduler::worker::notify_pipeline_leave(
-            pid,
-            crate::scheduler::worker::LeaveKind::Suspend,
-        );
+    crate::store::reclaim::set_pipeline_leave_hook(|pid, kind| {
+        let kind = match kind {
+            crate::store::reclaim::LeaveKind::Terminate => {
+                crate::scheduler::worker::LeaveKind::Terminate
+            }
+            crate::store::reclaim::LeaveKind::AllocationWait => {
+                crate::scheduler::worker::LeaveKind::Close
+            }
+            crate::store::reclaim::LeaveKind::Suspend => {
+                crate::scheduler::worker::LeaveKind::Suspend
+            }
+        };
+        crate::scheduler::worker::notify_pipeline_leave(pid, kind);
     });
     active_guard.disarm();
     Ok(BootstrapHandle {
@@ -495,11 +503,6 @@ fn verify_config(config: &Config) -> Result<()> {
             "Model {:?}: active KV preemption requires CUDA (dummy is allowed for deterministic tests), got {}",
             model.name,
             driver.backend_kind
-        );
-        ensure!(
-            driver.cpu_pages > 0,
-            "Model {:?}: active KV preemption requires a non-empty host-pinned swap pool",
-            model.name
         );
         let required =
             pie_driver_abi::KV_COPY_DEVICE_TO_HOST | pie_driver_abi::KV_COPY_HOST_TO_DEVICE;

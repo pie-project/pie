@@ -38,16 +38,13 @@
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, model as wit_model};
 
-const PAGE_T: u32 = 16; // tokens per pool page
-const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
 const POOL_PAGES: u32 = 24; // shared physical pool (prompt + decode headroom)
-const POOL: u32 = POOL_PAGES * PAGE_T; // flat pool token positions (384)
 const DECODE_STEPS: usize = 24;
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
-    let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
+    let page_t = wit_model::kv_page_size();
+    let pool_len = POOL_PAGES * page_t;
 
     // A REAL multi-token prompt — the whole point is N > 1 prefill. Raw factual
     // completion so a WORKING prefill has an unambiguous continuation ("Paris").
@@ -58,8 +55,8 @@ async fn main(_input: String) -> Result<String> {
             "prompt must be multi-token to prove prefill (n={n})"
         ));
     }
-    if n + DECODE_STEPS as u32 >= POOL {
-        return Err(format!("prompt ({n}) + decode exceeds pool ({POOL})"));
+    if n + DECODE_STEPS as u32 >= pool_len {
+        return Err(format!("prompt ({n}) + decode exceeds pool ({pool_len})"));
     }
     println!("--- PTIR PREFILL e2e: prefilling n={n} prompt tokens in ONE fire ---");
 
@@ -77,12 +74,14 @@ async fn main(_input: String) -> Result<String> {
     // N query rows). positions default to [0..N]; read-out defaults to row N-1.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p"); // [N] i32
-    let embed_indptr_p = Tensor::constant(vec![0u32, n]); // [2] qo_indptr
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let readout_p = Channel::from(vec![n - 1]).named("readout_p");
 
     // Explicit-write descriptor for the N prefill cells: cell c → physical page
     // pool_ids[c / PAGE_T] at offset c % PAGE_T.
-    let w_slot_v: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
-    let w_off_v: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
+    let w_slot_v: Vec<u32> = (0..n).map(|c| pool_ids[(c / page_t) as usize]).collect();
+    let w_off_v: Vec<u32> = (0..n).map(|c| c % page_t).collect();
     let w_slot_p = Channel::from(w_slot_v).named("w_slot_p"); // [N]
     let w_off_p = Channel::from(w_off_v).named("w_off_p"); // [N]
     let klen_p = Channel::from(vec![n; 1]).named("klen_p"); // [1] one seq, N kv len
@@ -91,21 +90,26 @@ async fn main(_input: String) -> Result<String> {
 
     // Causal prefill mask [N, POOL]: query row i attends KV cols j with j <= i.
     let mask_pv: Vec<bool> = (0..n)
-        .flat_map(|i| (0..POOL).map(move |j| j <= i))
+        .flat_map(|i| (0..pool_len).map(move |j| j <= i))
         .collect();
-    let mask_p = Channel::from_shaped([n, POOL], mask_pv).named("mask_p");
+    let mask_p = Channel::from_shaped([n, pool_len], mask_pv).named("mask_p");
     let g0_ch = Channel::new([1], dtype::i32).named("g0"); // host-read first gen token
 
     let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, embed_indptr_p);
-    fwd_p.port_channel(Port::KvLen, &klen_p);
-    fwd_p.attn_working_set(&ws, .., ..)?;
-    fwd_p.derive_dense_geometry();
-    fwd_p.port_channel(Port::Pages, &pages_p);
-    fwd_p.port_channel(Port::PageIndptr, &page_indptr_p);
-    fwd_p.port_channel(Port::WSlot, &w_slot_p);
-    fwd_p.port_channel(Port::WOff, &w_off_p);
-    fwd_p.attn_mask(&mask_p);
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
+    fwd_p.readout(&readout_p)?;
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &klen_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        Some(&mask_p),
+    )?;
     fwd_p.epilogue(move || {
         // Read-out row (N-1) logits [1, V] → greedy next token.
         let tok = reduce_argmax(intrinsics::logits()); // [1] i32
@@ -130,33 +134,36 @@ async fn main(_input: String) -> Result<String> {
     // Seeded with g0 at position N, continuing over the SAME pool pages (so the
     // attention reads the prefill's KV cells 0..N). Full causal mask (attend all
     // filled positions). Device loop-carried exactly like windowed-attention.
-    let phys_n = pool_ids[(n / PAGE_T) as usize];
+    let phys_n = pool_ids[(n / page_t) as usize];
     let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
     let pos = Channel::from(vec![n; 1]).named("pos");
     let fill = Channel::from(vec![n + 1; 1]).named("fill"); // next free after this fire writes cell N
     let klen = Channel::from(vec![n + 1; 1]).named("klen"); // cells 0..=N present
     let w_slot = Channel::from(vec![phys_n; 1]).named("w_slot");
-    let w_off = Channel::from(vec![n % PAGE_T; 1]).named("w_off");
+    let w_off = Channel::from(vec![n % page_t; 1]).named("w_off");
     // Seed mask: the first decode query at position N attends 0..=N.
-    let seed_mask: Vec<bool> = (0..POOL).map(|j| j <= n).collect();
-    let mask = Channel::from_shaped([1, POOL], seed_mask).named("mask");
+    let seed_mask: Vec<bool> = (0..pool_len).map(|j| j <= n).collect();
+    let mask = Channel::from_shaped([1, pool_len], seed_mask).named("mask");
     let pages = Channel::from(pool_ids.clone()).named("pages");
     let page_indptr = Channel::from_shaped([2], vec![0u32, POOL_PAGES]).named("page_indptr");
     let pool_ids_ch = Channel::new([POOL_PAGES], dtype::u32).named("pool_ids");
     let out = Channel::new([1], dtype::i32).named("out");
-    let lane1 = Tensor::constant(vec![0u32, 1u32]); // embed indptr [0,1]
+    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&tok_in, lane1);
-    fwd.positions(&pos);
-    fwd.port_channel(Port::KvLen, &klen);
-    fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-    fwd.derive_dense_geometry();
-    fwd.port_channel(Port::Pages, &pages);
-    fwd.port_channel(Port::PageIndptr, &page_indptr);
-    fwd.port_channel(Port::WSlot, &w_slot);
-    fwd.port_channel(Port::WOff, &w_off);
-    fwd.attn_mask(&mask);
+    fwd.embed(&tok_in, &lane1)?;
+    fwd.attention(
+        &ws,
+        ..,
+        (n / page_t)..,
+        &klen,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &pos,
+        Some(&mask),
+    )?;
     fwd.epilogue(move || {
         // Takes + compute first, PUTS last (value-id discipline).
         let base = fill.take().tensor(); // [1] u32 — position this next fire writes
@@ -165,13 +172,13 @@ async fn main(_input: String) -> Result<String> {
         let tok = reduce_argmax(intrinsics::logits()); // [1] i32
 
         // Full causal mask for the query at `base`: attend all j <= base.
-        let col = iota(POOL);
-        let base_b = broadcast(reshape(&base, [1]), [POOL]);
-        let new_mask = reshape(le(&col, &base_b), [1, POOL]);
+        let col = iota(pool_len);
+        let base_b = broadcast(reshape(&base, [1]), [pool_len]);
+        let new_mask = reshape(le(&col, &base_b), [1, pool_len]);
 
-        let logical_slot = div(&base, PAGE_T);
+        let logical_slot = div(&base, page_t);
         let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = rem(&base, PAGE_T);
+        let w_off_v = rem(&base, page_t);
         let klen_v = add(&base, 1u32);
         let next_free = add(&base, 1u32);
         let pages_v = reshape(&pids, [POOL_PAGES]);
@@ -197,13 +204,8 @@ async fn main(_input: String) -> Result<String> {
     generated.push(g0 as u32);
     for step in 0..DECODE_STEPS {
         pool_ids_ch.put(pool_ids.clone());
-        // Fixed budget: the last submit is knowable at submit time → finish()
-        // right after it (F7: end of stream; no close needed after the drain).
         fwd.submit(&pipe)
             .map_err(|e| format!("decode submit @{step}: {e}"))?;
-        if step + 1 == DECODE_STEPS {
-            pipe.finish();
-        }
         let t = out
             .take()
             .get::<i32>()
@@ -213,6 +215,7 @@ async fn main(_input: String) -> Result<String> {
             generated.push(t0 as u32);
         }
     }
+    pipe.close();
 
     let distinct: std::collections::BTreeSet<u32> = generated.iter().copied().collect();
     let text = wit_model::decode(&generated).unwrap_or_default();

@@ -880,6 +880,43 @@ fn ensure_backed_materializes_only_the_missing_logical_tail() {
 }
 
 #[test]
+fn demand_and_reserved_backing_consume_exactly_once() {
+    let mut store = KvStore::new(3, h(42));
+    let ws = store.create_working_set();
+    store.reserve(ws, 3).unwrap();
+    assert_eq!(store.backing_demand(ws, 2).unwrap(), 2);
+
+    let mut granted = store.reserve_device_pages(3).unwrap();
+    assert_eq!(
+        store.ensure_backed_reserved(ws, 2, &mut granted).unwrap(),
+        2
+    );
+    assert_eq!(granted.len(), 1);
+    assert_eq!(store.mapped_len(ws).unwrap(), 2);
+    store.release_device_reservation(granted);
+    assert_eq!(store.available_pages(), 1);
+}
+
+#[test]
+fn write_demand_and_reserved_prepare_leave_surplus_owned() {
+    let mut store = KvStore::new(3, h(42));
+    let ws = store.create_working_set();
+    store.reserve(ws, 2).unwrap();
+    assert_eq!(store.write_demand(ws, &[0, 1]).unwrap(), 2);
+
+    let mut granted = store.reserve_device_pages(3).unwrap();
+    let prepared = store
+        .prepare_write_reserved(ws, &[0, 1], &mut granted)
+        .unwrap();
+    assert_eq!(prepared.targets().len(), 2);
+    assert_eq!(granted.len(), 1);
+    store.cancel_prepared(prepared);
+    store.release_device_reservation(granted);
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 3);
+}
+
+#[test]
 fn store_fresh_append_roundtrip() {
     let mut store = KvStore::new(8, h(42));
     let ws = store.create_working_set();

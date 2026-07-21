@@ -9,20 +9,17 @@
 //! temperature-scaled TopP Gumbel-max), so the host never round-trips per
 //! token.
 //!
-//! Behavioral note vs the classic sequential loop: with stop tokens active
-//! (`ignore_eos = false`) up to depth-1 fires past the stop are already
-//! submitted when the host observes it; `close()` CANCELS them (R4-1), so
-//! they stop executing instead of draining. Token COUNTS are unchanged. The
-//! benchmark presets run `ignore_eos = true`, where the loop is exact.
+//! With stop tokens active (`ignore_eos = false`), up to depth-1 fires past
+//! the stop are already submitted when the host observes it. They drain and
+//! their outputs are ignored; token counts remain unchanged.
 //!
 //! Lifecycle (R4-4 single-pipeline): prefill and decode are ONE sequential
 //! stream on ONE pipeline. The prefill epilogue hands its sampled token to
 //! the decode pass on-device (`tok_in`, a device-only channel attached to
 //! both passes) and mirrors it to the host on `g0`, so decode fires are
 //! submitted immediately after the prefill submit — the g0 host round-trip
-//! runs in parallel, off the critical path. `pipe.finish()` right after the
-//! last submit is what ends the stream (F7, sequenced with the submits);
-//! `close()` is only the early-stop cancel.
+//! runs in parallel, off the critical path. `close()` ends the stream after
+//! the submitted tail is drained.
 
 use inferlet::ptir::prelude::*;
 use inferlet::{Result, chat, model as wit_model, session};
@@ -216,13 +213,11 @@ async fn run_one(
     let top_p = input.top_p;
 
     let ws = WorkingSet::new();
+    let page_size = ws.page_size();
     let n = prompt_vec.len() as u32;
-    let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(ws.page_size());
+    let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size);
     let reserve_to_tokens = |tokens: u32| -> std::result::Result<(), String> {
-        let target = tokens
-            .div_ceil(ws.page_size())
-            .saturating_add(1)
-            .min(max_pages);
+        let target = tokens.div_ceil(page_size).saturating_add(1).min(max_pages);
         let current = ws.page_len();
         if current < target {
             ws.reserve(target - current)?;
@@ -240,6 +235,13 @@ async fn run_one(
     // runs in parallel off the critical path.
     let prompt_i32: Vec<i32> = prompt_vec.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
+    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
+    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p =
+        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
+    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
     let depth = DEFAULT_RUNAHEAD_DEPTH;
     // Decode fires: the prefill sample already spends one of the
     // `max_tokens` sampler activations.
@@ -259,11 +261,20 @@ async fn run_one(
         .named("out");
 
     let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, Tensor::constant(vec![0u32, n]));
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    fwd_p.port_channel(Port::KvLen, &kv_len_p);
-    fwd_p.attn_working_set(&ws, .., ..)?;
-    fwd_p.derive_dense_geometry_with_page_capacity(max_pages);
+    fwd_p.attention(
+        &ws,
+        ..,
+        ..,
+        &kv_len_p,
+        &pages_p,
+        &page_indptr_p,
+        &w_slot_p,
+        &w_off_p,
+        &positions_p,
+        None,
+    )?;
     fwd_p.epilogue(move || {
         let t = reshape(
             sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
@@ -280,19 +291,42 @@ async fn run_one(
     // the prefill's token value, which flows through `tok_in`.
     let fwd_d: Option<ForwardPass> = if budget > 0 {
         let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, Tensor::constant(vec![0u32, 1u32]));
+        let embed_indptr = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from(vec![n]).named("positions");
+        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+        let page_indptr =
+            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
+        let w_off = Channel::from(vec![n % page_size]).named("w_off");
+        fwd.embed(&tok_in, &embed_indptr)?;
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
-        fwd.port_channel(Port::KvLen, &kv_len);
-        fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-        fwd.derive_dense_geometry_with_page_capacity(max_pages);
+        fwd.attention(
+            &ws,
+            ..,
+            (n / page_size)..,
+            &kv_len,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &positions,
+            None,
+        )?;
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
             let t = reshape(
                 sample(intrinsics::logits(), vocab, temperature, top_p, sampled_rng),
                 [1],
             );
+            let next_length = add(&length, 1u32);
+            let page_count = div(add(&next_length, page_size - 1), page_size);
             tok_in.put(&t);
-            kv_len.put(add(&length, 1u32));
+            kv_len.put(&next_length);
+            positions.put(&length);
+            w_slot.put(div(&length, page_size));
+            w_off.put(rem(&length, page_size));
+            page_indptr.take();
+            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
             out.put(&t);
         });
         Some(fwd)
@@ -304,11 +338,6 @@ async fn run_one(
     fwd_p
         .submit(&pipe)
         .map_err(|e| format!("prefill submit: {e}"))?;
-    if budget == 0 {
-        // The prompt spends the whole budget: the prefill was the stream's
-        // only submission (F7: finish is sequenced right behind it).
-        pipe.finish();
-    }
 
     let mut submitted = 0usize;
     if let Some(fwd) = &fwd_d {
@@ -318,13 +347,6 @@ async fn run_one(
             fwd.submit(&pipe)
                 .map_err(|e| format!("decode submit: {e}"))?;
             submitted += 1;
-        }
-        // Budget spent inside the burst: finish() right after the last
-        // submit (F7) — the engine stops awaiting this pipeline at that
-        // fire's dispatch, so the drain tail never holds the wave barrier
-        // (iteration 62's win, carried by finish instead of close).
-        if submitted == budget {
-            pipe.finish();
         }
     }
     step(&mut prologue_us, input.report_timing); // [4] build_submit (both passes)
@@ -353,33 +375,21 @@ async fn run_one(
     let mut emitted = 0usize; // sampler emissions counted (stop excluded)
 
     let mut stopped = stop_tokens.contains(&(g0 as u32));
-    let mut closed = false;
     if !stopped {
         emitted += 1;
         generated.push(g0 as u32);
         if let Some(now_ns) = first_token_monotonic_ns {
             token_monotonic_ns.push(now_ns);
         }
-    } else if submitted > 0 {
-        // Early stop at the prefill token: the run-ahead burst is already
-        // submitted — cancel it (R4-1; the wasted fires stop executing).
-        pipe.close();
-        closed = true;
     }
 
     let mut taken = 0usize;
     while taken < submitted {
-        let t = match out.take().get::<i32>().await {
-            Ok(t) => t,
-            Err(e) => {
-                if closed {
-                    // R4-1: close cancelled the run-ahead tail; cancelled
-                    // takes error instead of delivering.
-                    break;
-                }
-                return Err(format!("out.take: {e}").into());
-            }
-        };
+        let t = out
+            .take()
+            .get::<i32>()
+            .await
+            .map_err(|e| format!("out.take: {e}"))?;
         taken += 1;
         let Some(&t0) = t.first() else {
             return Err("out.take: empty tensor".into());
@@ -389,10 +399,6 @@ async fn run_one(
         }
         if stop_tokens.contains(&(t0 as u32)) {
             stopped = true;
-            if !closed {
-                pipe.close();
-                closed = true;
-            }
             continue;
         }
         emitted += 1;
@@ -419,11 +425,9 @@ async fn run_one(
             fwd.submit(&pipe)
                 .map_err(|e| format!("decode submit: {e}"))?;
             submitted += 1;
-            if submitted == budget {
-                pipe.finish();
-            }
         }
     }
+    pipe.close();
 
     Ok(RunResult {
         num_prompt_tokens,
@@ -439,9 +443,6 @@ async fn run_one(
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     let main_start = std::time::Instant::now();
-    let vocab = wit_model::output_vocab_size();
-    // Real-driver metadata (Qwen3 page size / depth; inert on the mock).
-    model::configure(vocab, 16, 28);
 
     let stop_tokens: Vec<u32> = if input.ignore_eos {
         Vec::new()

@@ -39,12 +39,15 @@ int main() {
           "OLD encoding ALIASES graph_layout=128 with rs_verify");
 
     // ── 2. The FIX keeps those distinct ──
-    check(make_graph_variant(false, false, 64u) !=
-              make_graph_variant(true, false, 0u),
+    check(make_graph_variant(false, false, false, 64u) !=
+              make_graph_variant(true, false, false, 0u),
           "NEW: graph_layout=64 is DISTINCT from small_spec");
-    check(make_graph_variant(false, false, 128u) !=
-              make_graph_variant(false, true, 0u),
+    check(make_graph_variant(false, false, false, 128u) !=
+              make_graph_variant(false, true, false, 0u),
           "NEW: graph_layout=128 is DISTINCT from rs_verify");
+    check(make_graph_variant(false, false, false, 7u) !=
+              make_graph_variant(false, false, true, 7u),
+          "NEW: masked and mask-free captures have DISTINCT variants");
 
     const std::uint8_t continuing[] = {0, 0};
     const std::uint8_t resetting[] = {0, 1};
@@ -54,25 +57,25 @@ int main() {
             graph_replay_has_no_host_resets(false, nullptr, 2),
         "Qwen graph replay is disabled whenever a host reset is requested");
     const auto root_tp_key =
-        make_graph_variant(false, false, 7);
+        make_graph_variant(false, false, true, 7);
     const auto follower_tp_key =
-        make_graph_variant(false, false, 7);
+        make_graph_variant(false, false, true, 7);
     check(
         root_tp_key == follower_tp_key,
         "TP root/follower keys use identical actual capture flags");
 
-    // ── 3. NEW encoding: exhaustive uniqueness over (2 flags) × (layout 0..255) ──
+    // ── 3. NEW encoding: exhaustive uniqueness over (3 flags) × (layout 0..255) ──
     {
         std::set<std::uint32_t> seen;
         bool unique = true;
         for (std::uint32_t layout = 0; layout <= 255u; ++layout) {
-            for (int f = 0; f < 4; ++f) {
+            for (int f = 0; f < 8; ++f) {
                 const std::uint32_t v = make_graph_variant(
-                    (f & 1) != 0, (f & 2) != 0, layout);
+                    (f & 1) != 0, (f & 2) != 0, (f & 4) != 0, layout);
                 if (!seen.insert(v).second) unique = false;
             }
         }
-        check(unique, "NEW: all (flags × layout 0..255) graph_variants are UNIQUE");
+        check(unique, "NEW: all (3 flags × layout 0..255) graph_variants are UNIQUE");
     }
 
     // ── 4. OLD encoding MUST collide over the same range (non-degenerate proof:

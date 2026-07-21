@@ -14,7 +14,7 @@ use serde::Deserialize;
 use std::time::Instant;
 
 const PAGE_T: u32 = 16; // tokens per pool page
-const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
+// Qwen3-0.6B
 const TEMPERATURE: f32 = 0.6;
 const TOP_P: f32 = 0.95;
 
@@ -68,7 +68,6 @@ async fn main(input: Input) -> Result<String> {
 
     let start = Instant::now();
     let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
     let stop = chat::stop_tokens();
 
     // Shared prefix: system + question via the deferred-system `system_user`
@@ -104,7 +103,8 @@ async fn main(input: Input) -> Result<String> {
         // Gumbel noise over the shared nucleus keep-mask).
         let prefix_i32: Vec<i32> = prefix.iter().map(|&t| t as i32).collect();
         let toks_p = Channel::from(prefix_i32).named("toks_p"); // [N] i32 (seeded)
-        let embed_indptr_p = Tensor::constant(vec![0u32, n]); // qo_indptr [0,N]
+        let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+        let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
 
         // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
         let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
@@ -124,15 +124,19 @@ async fn main(input: Input) -> Result<String> {
         let g0s_ch = Channel::new([b], dtype::i32).named("g0s");
 
         let fwd_p = ForwardPass::new();
-        fwd_p.embed(&toks_p, embed_indptr_p);
-        fwd_p.port_channel(Port::KvLen, &klen_p);
-        fwd_p.attn_working_set(&ws, .., ..)?;
-        fwd_p.derive_dense_geometry();
-        fwd_p.port_channel(Port::Pages, &pages_p);
-        fwd_p.port_channel(Port::PageIndptr, &page_indptr_p);
-        fwd_p.port_channel(Port::WSlot, &w_slot_p);
-        fwd_p.port_channel(Port::WOff, &w_off_p);
-        fwd_p.attn_mask(&mask_p);
+        fwd_p.embed(&toks_p, &embed_indptr_p)?;
+        fwd_p.attention(
+            &ws,
+            ..,
+            ..,
+            &klen_p,
+            &pages_p,
+            &page_indptr_p,
+            &w_slot_p,
+            &w_off_p,
+            &positions_p,
+            Some(&mask_p),
+        )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
             // Shared nucleus keep-mask over the read-out row, then B independent
@@ -158,9 +162,6 @@ async fn main(input: Input) -> Result<String> {
         fwd_p
             .submit(&pipe)
             .map_err(|e| format!("prefill submit: {e}"))?;
-        if max_tokens == 1 {
-            pipe.finish();
-        }
         let g0s: Vec<i32> = g0s_ch
             .take()
             .get::<i32>()
@@ -206,19 +207,22 @@ async fn main(input: Input) -> Result<String> {
             .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
             .named("out");
         let rng = Channel::from(vec![0x9e37_u32, 0]).named("rng");
-        let lanes = Tensor::constant((0..=b).collect::<Vec<u32>>()); // qo_indptr [0..=B]
+        let lanes = Channel::from((0..=b).collect::<Vec<u32>>()).named("embed_indptr");
 
         let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, lanes);
-        fwd.positions(&pos);
-        fwd.port_channel(Port::KvLen, &klen);
-        fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-        fwd.derive_dense_geometry();
-        fwd.port_channel(Port::Pages, &pages);
-        fwd.port_channel(Port::PageIndptr, &page_indptr);
-        fwd.port_channel(Port::WSlot, &w_slot);
-        fwd.port_channel(Port::WOff, &w_off);
-        fwd.attn_mask(&mask);
+        fwd.embed(&tok_in, &lanes)?;
+        fwd.attention(
+            &ws,
+            ..,
+            (n / ws.page_size())..,
+            &klen,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &pos,
+            Some(&mask),
+        )?;
         fwd.epilogue(move || {
             // TAKES + compute first, PUTS last (value-id discipline).
             let base = fill.take().tensor(); // [1] u32 — next fire's first append cell
@@ -287,13 +291,6 @@ async fn main(input: Input) -> Result<String> {
             submitted += 1;
             in_flight += 1;
         }
-        // Budget spent inside the burst: finish() right after the last
-        // submit (F7). `budget > 0` guards max_tokens == 1 (the prefill
-        // already finished the stream) and the all-lanes-done-at-prefill
-        // case, which keeps close-after-drain instead.
-        if budget > 0 && submitted == budget {
-            pipe.finish();
-        }
         while in_flight > 0 && done.iter().any(|d| !d) {
             let step: Vec<i32> = out
                 .take()
@@ -317,9 +314,6 @@ async fn main(input: Input) -> Result<String> {
                     .map_err(|e| format!("decode submit: {e}"))?;
                 submitted += 1;
                 in_flight += 1;
-                if submitted == budget {
-                    pipe.finish();
-                }
             }
         }
         while in_flight > 0 {
@@ -329,9 +323,7 @@ async fn main(input: Input) -> Result<String> {
                 .map_err(|e| format!("drain run-ahead candidates: {e}"))?;
             in_flight -= 1;
         }
-        // Fully drained above, so this cancels nothing (R4-1); it ends the
-        // stream on the early all-lanes-done path where finish() was never
-        // called.
+        // Fully drained above, so close only releases the scheduler wait-set.
         pipe.close();
     }
 

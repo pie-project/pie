@@ -13,7 +13,7 @@ use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16; // tokens per pool page
-const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
+// Qwen3-0.6B
 
 #[derive(Deserialize)]
 struct Input {
@@ -70,7 +70,6 @@ async fn main(input: Input) -> Result<String> {
     }
 
     let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
 
     let temperature = input.temperature;
     let top_p = input.top_p;
@@ -106,7 +105,8 @@ async fn main(input: Input) -> Result<String> {
     let g0 = {
         let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
         let toks_p = Channel::from(prompt_i32).named("toks_p"); // [N] i32 (seeded)
-        let embed_indptr_p = Tensor::constant(vec![0u32, n]); // qo_indptr [0,N]
+        let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+        let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
 
         // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
         let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
@@ -126,15 +126,19 @@ async fn main(input: Input) -> Result<String> {
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
         let fwd_p = ForwardPass::new();
-        fwd_p.embed(&toks_p, embed_indptr_p);
-        fwd_p.port_channel(Port::KvLen, &klen_p);
-        fwd_p.attn_working_set(&ws, .., ..)?;
-        fwd_p.derive_dense_geometry();
-        fwd_p.port_channel(Port::Pages, &pages_p);
-        fwd_p.port_channel(Port::PageIndptr, &page_indptr_p);
-        fwd_p.port_channel(Port::WSlot, &w_slot_p);
-        fwd_p.port_channel(Port::WOff, &w_off_p);
-        fwd_p.attn_mask(&mask_p);
+        fwd_p.embed(&toks_p, &embed_indptr_p)?;
+        fwd_p.attention(
+            &ws,
+            ..,
+            ..,
+            &klen_p,
+            &pages_p,
+            &page_indptr_p,
+            &w_slot_p,
+            &w_off_p,
+            &positions_p,
+            Some(&mask_p),
+        )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
             let tok = sample_token(&r, temperature, top_p, vocab);
@@ -148,9 +152,6 @@ async fn main(input: Input) -> Result<String> {
             .map_err(|e| format!("prefill submit: {e}"))?;
         // max_tokens == 1: the prefill spends the whole budget, so it was
         // the stream's last submit — finish() right after it (F7).
-        if max_tokens == 1 {
-            pipe.finish();
-        }
         g0_ch
             .take()
             .get::<i32>()
@@ -192,19 +193,22 @@ async fn main(input: Input) -> Result<String> {
         .capacity(DEFAULT_RUNAHEAD_DEPTH as u32)
         .named("out");
     let rng = Channel::from(vec![0x9e37_u32, 0]).named("rng");
-    let lane1 = Tensor::constant(vec![0u32, 1u32]);
+    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
 
     let fwd = ForwardPass::new();
-    fwd.embed(&tok_in, lane1);
-    fwd.positions(&pos);
-    fwd.port_channel(Port::KvLen, &klen);
-    fwd.attn_working_set(&ws, .., (n / ws.page_size())..)?;
-    fwd.derive_dense_geometry();
-    fwd.port_channel(Port::Pages, &pages);
-    fwd.port_channel(Port::PageIndptr, &page_indptr);
-    fwd.port_channel(Port::WSlot, &w_slot);
-    fwd.port_channel(Port::WOff, &w_off);
-    fwd.attn_mask(&mask);
+    fwd.embed(&tok_in, &lane1)?;
+    fwd.attention(
+        &ws,
+        ..,
+        (n / ws.page_size())..,
+        &klen,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &pos,
+        Some(&mask),
+    )?;
     fwd.epilogue(move || {
         // TAKES + compute first, PUTS last (value-id discipline).
         let base = fill.take().tensor(); // [1] u32 — position this fire writes
@@ -258,13 +262,6 @@ async fn main(input: Input) -> Result<String> {
         submitted += 1;
         in_flight += 1;
     }
-    // Budget spent inside the burst: finish() right after the last submit
-    // (F7). `budget > 0` guards the max_tokens == 1 case (the prefill
-    // already finished the stream) and the done-at-g0 case, which ends via
-    // close() below.
-    if budget > 0 && submitted == budget {
-        pipe.finish();
-    }
     while !done && in_flight > 0 {
         let t = out
             .take()
@@ -292,9 +289,6 @@ async fn main(input: Input) -> Result<String> {
                 .map_err(|e| format!("decode submit: {e}"))?;
             submitted += 1;
             in_flight += 1;
-            if submitted == budget {
-                pipe.finish();
-            }
         }
     }
     while in_flight > 0 {
@@ -304,8 +298,8 @@ async fn main(input: Input) -> Result<String> {
             .map_err(|e| format!("drain run-ahead output: {e}"))?;
         in_flight -= 1;
     }
-    // Every submitted fire was drained above, so this cancels nothing; it
-    // ends stop-path streams that never reached finish() (F7).
+    // Every submitted fire was drained above, so close only releases the
+    // scheduler wait-set and rejects future submissions.
     pipe.close();
 
     Ok(text)

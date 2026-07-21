@@ -27,7 +27,7 @@
 
 use pie_ptir::interp::{Instance, NoKernels, PassInputs, Value};
 use pie_ptir::registry::{ModelProfile, Port};
-use pie_ptir::validate::{bind, BoundTrace};
+use pie_ptir::validate::{BoundTrace, bind};
 
 use ptir_dsl::builder::Builder;
 use ptir_dsl::prelude::*;
@@ -61,8 +61,6 @@ fn leak<T>(v: T) -> &'static T {
 ///  12 out_wslot[B] u32 (host-reader) — the write-descriptor page id
 ///  13 out_woff[B] u32 (host-reader) — the write-descriptor in-page offset
 fn build_designb() -> Traced {
-    ptir_dsl::model::configure(V, PAGE_T, 2);
-
     let mask = leak(Channel::seeded([B, POOL], dtype::bool).named("mask"));
     let scores = leak(Channel::from(vec![0.0f32; B as usize]).named("scores"));
     let toks = leak(Channel::from(vec![1i32; B as usize]).named("toks"));
@@ -83,11 +81,11 @@ fn build_designb() -> Traced {
     // compactions — no per-fire Pages computation.
     let pool_pages: Vec<u32> = (0..B).flat_map(|_| 0..POOL_PAGES).collect(); // [B*POOL_PAGES]
     let page_indptr: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect(); // [B+1]
-    let pages_c = Tensor::constant(pool_pages);
-    let page_indptr_c = Tensor::constant(page_indptr);
-    let lanes_b = Tensor::constant((0u32..=B).collect::<Vec<_>>());
+    let pages_c = leak(Channel::from(pool_pages).named("pages"));
+    let page_indptr_c = leak(Channel::from(page_indptr).named("page_indptr"));
+    let lanes_b = leak(Channel::from((0u32..=B).collect::<Vec<_>>()).named("indptr"));
 
-    let mut b = Builder::new();
+    let mut b = Builder::new(V, PAGE_T);
     b.bind_port(Port::EmbedTokens, toks);
     b.bind_port(Port::EmbedIndptr, lanes_b);
     b.bind_port(Port::Positions, pos);
@@ -151,7 +149,12 @@ fn build_designb() -> Traced {
 }
 
 fn beam_profile() -> ModelProfile {
-    ModelProfile { vocab: V, page_size: PAGE_T, num_layers: 2, ..ModelProfile::dummy() }
+    ModelProfile {
+        vocab: V,
+        page_size: PAGE_T,
+        num_layers: 2,
+        ..ModelProfile::dummy()
+    }
 }
 
 fn u32s(v: &[u32]) -> Value {
@@ -176,7 +179,10 @@ fn logits_forcing_parent(parent_beam: u32, t0: u32, t1: u32) -> PassInputs {
     let row = (parent_beam * V) as usize;
     l[row + t0 as usize] = 20.0;
     l[row + t1 as usize] = 19.0;
-    PassInputs { logits: Some(Value::F32(l)), ..Default::default() }
+    PassInputs {
+        logits: Some(Value::F32(l)),
+        ..Default::default()
+    }
 }
 
 /// Force `parent = [0, 1]` (each beam continues itself): one dominant token per
@@ -185,7 +191,10 @@ fn logits_diagonal(t0: u32, t1: u32) -> PassInputs {
     let mut l = vec![0.0f32; (B * V) as usize];
     l[t0 as usize] = 20.0; // beam 0 peak
     l[(V + t1) as usize] = 20.0; // beam 1 peak
-    PassInputs { logits: Some(Value::F32(l)), ..Default::default() }
+    PassInputs {
+        logits: Some(Value::F32(l)),
+        ..Default::default()
+    }
 }
 
 /// Harvested host-reader outputs of one committed Design B step (drains all of
@@ -205,7 +214,13 @@ fn harvest(inst: &mut Instance, bound: &BoundTrace) -> Harvest {
     let mask = inst.host_take(bound, 11).unwrap();
     let wslot = inst.host_take(bound, 12).unwrap();
     let woff = inst.host_take(bound, 13).unwrap();
-    Harvest { tok, par, mask, wslot, woff }
+    Harvest {
+        tok,
+        par,
+        mask,
+        wslot,
+        woff,
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -230,13 +245,20 @@ fn golden_designb_fork_from_shared_prefix() {
         (5, u32s(&[2, 2])),                // klen
         (6, u32s(&[0, 0])),                // w_slot
         (7, u32s(&[0, 0])),                // w_off
+        (14, u32s(&[0, 1, 2, 0, 1, 2])),   // pages
+        (15, u32s(&[0, 3, 6])),            // page_indptr
+        (16, u32s(&[0, 1, 2])),            // embed indptr
     ];
     let mut inst = Instance::new(&bound, &seeds).unwrap();
 
     // Force both survivors from beam 0, tokens 2 and 3.
     let inputs = logits_forcing_parent(0, 2, 3);
     let r0 = inst.step(&bound, &inputs, &mut NoKernels).unwrap();
-    assert!(r0.committed, "no host-writer late edge in Design B ⇒ first fire commits: {:?}", r0.missed);
+    assert!(
+        r0.committed,
+        "no host-writer late edge in Design B ⇒ first fire commits: {:?}",
+        r0.missed
+    );
 
     let h = harvest(&mut inst, &bound);
     assert_eq!(h.par, u32s(&[0, 0]), "out_par: both fork from beam 0");
@@ -248,7 +270,11 @@ fn golden_designb_fork_from_shared_prefix() {
         "mask: beam0={{0,1,2}}, beam1={{0,1,3}} (shared {{0,1}} + own append)"
     );
     // Explicit write descriptor: positions 2,3 land in pool page 0 at offs 2,3.
-    assert_eq!(h.wslot, u32s(&[0, 0]), "w_slot: positions 2,3 in pool page 0");
+    assert_eq!(
+        h.wslot,
+        u32s(&[0, 0]),
+        "w_slot: positions 2,3 in pool page 0"
+    );
     assert_eq!(h.woff, u32s(&[2, 3]), "w_off: offsets 2,3 within page 0");
 }
 
@@ -271,11 +297,16 @@ fn golden_designb_multistep_pageturn() {
         (5, u32s(&[2, 2])),
         (6, u32s(&[0, 0])),
         (7, u32s(&[0, 0])),
+        (14, u32s(&[0, 1, 2, 0, 1, 2])),
+        (15, u32s(&[0, 3, 6])),
+        (16, u32s(&[0, 1, 2])),
     ];
     let mut inst = Instance::new(&bound, &seeds).unwrap();
 
     // step 0: fork both from beam 0.
-    let r0 = inst.step(&bound, &logits_forcing_parent(0, 2, 3), &mut NoKernels).unwrap();
+    let r0 = inst
+        .step(&bound, &logits_forcing_parent(0, 2, 3), &mut NoKernels)
+        .unwrap();
     assert!(r0.committed, "{:?}", r0.missed);
     let h0 = harvest(&mut inst, &bound);
     assert_eq!(h0.par, u32s(&[0, 0]));
@@ -284,7 +315,9 @@ fn golden_designb_multistep_pageturn() {
     assert_eq!(h0.woff, u32s(&[2, 3]));
 
     // step 1: each survivor continues itself (parent=[0,1]); appends 4,5.
-    let r1 = inst.step(&bound, &logits_diagonal(4, 5), &mut NoKernels).unwrap();
+    let r1 = inst
+        .step(&bound, &logits_diagonal(4, 5), &mut NoKernels)
+        .unwrap();
     assert!(r1.committed, "{:?}", r1.missed);
     let h1 = harvest(&mut inst, &bound);
     assert_eq!(h1.par, u32s(&[0, 1]), "each beam continues itself");
@@ -293,6 +326,10 @@ fn golden_designb_multistep_pageturn() {
         mask_of(&[&[0, 1, 2, 4], &[0, 1, 3, 5]]),
         "masks accumulate independent ancestry: beam0={{0,1,2,4}}, beam1={{0,1,3,5}}"
     );
-    assert_eq!(h1.wslot, u32s(&[1, 1]), "page turn: positions 4,5 are in pool page 1");
+    assert_eq!(
+        h1.wslot,
+        u32s(&[1, 1]),
+        "page turn: positions 4,5 are in pool page 1"
+    );
     assert_eq!(h1.woff, u32s(&[0, 1]), "page-1 offsets 0,1");
 }

@@ -47,7 +47,6 @@ const PROMPT: &str = "hello world";
 /// Fixed 2nd-turn continuation for the clear probes (Scenarios B/E).
 const CONT: &str = " Tell me more.";
 const PAGE_T: u32 = 16; // tokens per pool page
-const NUM_LAYERS: u32 = 28; // Qwen3-0.6B
 
 /// The known-good greedy decode of `PROMPT` on qwen3-0.6b — the verified #6/#21
 /// milestone stream (argmax == greedy at temperature 0).
@@ -109,6 +108,7 @@ impl Decoder {
 
         let toks_v: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let toks = Channel::from(toks_v).named("toks_p"); // [N] i32 (seeded)
+        let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr_p");
         let pos_v: Vec<u32> = (base..base + n).collect();
         let pos = Channel::from(pos_v).named("pos_p");
         // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
@@ -129,16 +129,19 @@ impl Decoder {
         let g_ch = Channel::new([1], dtype::i32).named("g0");
 
         let fwd = ForwardPass::new();
-        fwd.embed(&toks, Tensor::constant(vec![0u32, n]));
-        fwd.positions(&pos);
-        fwd.port_channel(Port::KvLen, &klen);
-        fwd.attn_working_set(&self.ws, .., (base / self.ws.page_size())..)?;
-        fwd.derive_dense_geometry();
-        fwd.port_channel(Port::Pages, &pages);
-        fwd.port_channel(Port::PageIndptr, &page_indptr);
-        fwd.port_channel(Port::WSlot, &w_slot);
-        fwd.port_channel(Port::WOff, &w_off);
-        fwd.attn_mask(&mask);
+        fwd.embed(&toks, &embed_indptr)?;
+        fwd.attention(
+            &self.ws,
+            ..,
+            (base / self.ws.page_size())..,
+            &klen,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &pos,
+            Some(&mask),
+        )?;
         fwd.epilogue(move || {
             let tok = reshape(reduce_argmax(intrinsics::logits()), [1]); // [1] i32
             g_ch.put(&tok);
@@ -179,19 +182,22 @@ impl Decoder {
             .capacity(RING)
             .named("pool_ids");
         let out = Channel::new([1], dtype::i32).capacity(RING).named("out");
-        let lane1 = Tensor::constant(vec![0u32, 1u32]);
+        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
 
         let fwd = ForwardPass::new();
-        fwd.embed(&tok_in, lane1);
-        fwd.positions(&pos);
-        fwd.port_channel(Port::KvLen, &klen);
-        fwd.attn_working_set(&self.ws, .., (n / self.ws.page_size())..)?;
-        fwd.derive_dense_geometry();
-        fwd.port_channel(Port::Pages, &pages);
-        fwd.port_channel(Port::PageIndptr, &page_indptr);
-        fwd.port_channel(Port::WSlot, &w_slot);
-        fwd.port_channel(Port::WOff, &w_off);
-        fwd.attn_mask(&mask);
+        fwd.embed(&tok_in, &lane1)?;
+        fwd.attention(
+            &self.ws,
+            ..,
+            (n / self.ws.page_size())..,
+            &klen,
+            &pages,
+            &page_indptr,
+            &w_slot,
+            &w_off,
+            &pos,
+            Some(&mask),
+        )?;
         fwd.epilogue(move || {
             // Takes + compute first, puts last (value-id discipline).
             let base = fill.take().tensor(); // [1] u32 — position this next fire writes
@@ -380,9 +386,6 @@ async fn generate(
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let max_tokens: usize = input.trim().parse().unwrap_or(8);
-    let vocab = wit_model::output_vocab_size();
-    model::configure(vocab, PAGE_T, NUM_LAYERS);
-
     let prompt = wit_model::encode(PROMPT);
     let prompt = if prompt.is_empty() {
         vec![0u32]

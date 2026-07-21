@@ -1,4 +1,5 @@
 {
   "_comment": "Mock model snapshot config beside test_tokenizer.json. `vocab_size` is the logits/output dim (hf_config.vocab_size) and MUST match the dummy driver's DriverCapabilities.vocab_size (32, set in tests/common/{env,mock_device}.rs). pie_model reads it via read_snapshot_vocab_size(); without it the host falls back to the tokenizer vocab (22), and PTIR programs that type `intrinsics::logits()` can never satisfy both the engine-side and driver-side bind validators.",
-  "vocab_size": 32
+  "vocab_size": 32,
+  "num_hidden_layers": 2
 }
