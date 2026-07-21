@@ -443,6 +443,43 @@ gap requires a new multiplexed/poolable inferlet lifecycle rather than another
 kernel or scheduler knob. Normal c0/256 remains unchanged at 34,273.04 tok/s
 median. CUDA CTest passes 45/45 and engine tests pass 360/360.
 
+An nsys + fire-timing capture of 2,048 x 32 closes the attribution:
+
+| Measured item | Pie | vLLM |
+|---|---:|---:|
+| Profiled wall | 3.523 s | 2.169 s |
+| GPU kernel sum | 0.741 s | 0.863 s |
+| GPU kernel span | 3.517 s | 1.917 s |
+| Idle inside kernel span | 2.775 s | 1.054 s |
+| GPU kernel instances | 28,475 | 6,053 |
+| `cudaMalloc` calls | 41,126 | 1 |
+| `cudaHostAlloc` calls | 32,175 | 12 |
+| `cudaMemcpyAsync` calls | 75,490 | 604 |
+| `cudaFree` calls | 26,523 | 0 |
+| `cudaLaunchKernel` calls | 27,657 | 3,318 |
+
+Pie therefore performs 14% less GPU kernel work than vLLM but takes 62% more
+wall time. Only 21% of its GPU activity span contains kernels, versus about 45%
+for vLLM. The direct cause is cold per-inferlet channel allocation and
+publication, not model compute.
+
+The scheduler capture records 184 waves versus roughly 134 from the workload
+geometry, and 76,308 processed fire rows versus 67,584 useful prefill/decode
+rows (+12.9%). Average active width is 454 with 29 missing pipelines. A
+prefill-only trace shows all 2,048 client launches in 88 ms, but WASM
+instantiate/admit spans 770 ms and driver bind completion spans 849 ms;
+register+bind control occupancy alone sums to 426 ms. The four 512-process
+cohorts leave 69/101/81 ms GPU gaps at handoff.
+
+The highest-value follow-up is a size-classed channel arena that pools both
+device cells and pinned host mirrors/words, or a reusable/multiplexed inferlet
+instance that avoids creating those objects per request. Either adds allocator
+and lifetime state. The next independent line is readiness-aware successor
+deferral: current fixed-decode retries inflate useful waves by about 37%.
+Repeated cold fleets also expose a third-run high-water stall, so reuse must
+include explicit page/channel retirement rather than hiding allocation behind
+an unbounded cache.
+
 This claim does **not** extend to Remote or CUDA TP. Remote post-scheduler
 coalescing would invalidate a worker-side lease, and TP needs all-rank atomic
 prepare/abort. Both report prepare unsupported.
