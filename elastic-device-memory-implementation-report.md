@@ -1,31 +1,39 @@
 # Elastic Device Memory Implementation Report
 
-Date: 2026-07-20
+Date: 2026-07-21
 
-Implementation commit: `faa0e9d4` (`Implement elastic device memory`)
+Baseline commits: `faa0e9d4`, `ef314886`, `555b2d35`; C2/E4 changes are
+currently uncommitted.
 
-Status: **partial implementation; not complete against the E0-E5 plan**
+Status: **local CUDA TP1 admission implemented; overall E0-E5 plan remains
+partial**
 
 ## 1. Executive summary
 
-The landed implementation establishes elastic backing primitives in both
-drivers:
+The implementation now establishes:
 
 - CUDA allocations can use stable VMM addresses backed by a shared physical
   accounting pool.
+- Local, single-rank CUDA launches use ABI-v12 prepare/lease admission. Prepare
+  validates the finalized descriptor, atomically commits independently rounded
+  KV/state/workspace/attention deltas, and returns either a one-shot lease,
+  transient exhaustion, or explicit impossible demand.
+- Wait-all treats the driver verdict as the commit point. Exhausted proposals
+  remain queued and do not consume credits, depth, demotion state, wave
+  statistics, tickets, or ordinary retry budget.
 - Metal KV, state, and scratch allocations use placement-sparse private buffers
   backed by shared placement-heap chunks.
-- The runtime periodically derives a safe KV tail high-water from the
-  epoch-aware store and requests KV/workspace trim.
+- The runtime periodically derives safe KV and RS high-waters and requests
+  KV/state/workspace trim.
 
 The CUDA implementation was built and extensively tested on the local RTX 4090.
 It is performance-neutral and returns committed memory after idle. The Metal
 implementation was intentionally not built or tested.
 
-This is **not yet the complete architecture described in the plan**. In
-particular, scheduler admission does not lease shared physical pages, the CUDA
-memory planner still freezes logical pool capacities, and the Metal idle-release
-path has an unresolved final-release issue.
+This is **not yet the complete architecture described in the plan**. Remote,
+Metal, and CUDA TP admission are deliberately capability-gated rather than
+claimed correct. The CUDA planner still freezes logical pool capacities, and the
+Metal idle-release path retains its pre-existing final-release issue.
 
 ## 2. Implemented
 
@@ -38,6 +46,16 @@ Added `driver/common/include/pie_driver/elastic.hpp` with:
 - `Arena::ensure_committed`
 - `Arena::trim_committed`
 - A common 2 MiB logical accounting page
+
+Local ABI v12 adds:
+
+- `*_prepare_launch`
+- `*_launch_prepared`
+- `*_release_launch`
+- `PieLaunchPrepareResult` with ready/exhausted/impossible outcomes and the
+  observed budget generation
+
+The remote wire remains v8 because leases are intentionally not serialized.
 
 Driver capabilities now report:
 
@@ -77,9 +95,12 @@ CUDA graph capture sees immutable virtual addresses. Graph padding aliases KV
 page 0, and each launch carries the physical KV translation high-water that must
 be committed before replay.
 
-The physical accounting budget is derived from free VRAM after weights, with a
-reserved floor. A 32 MiB default VMM handle size is used, reduced to allocation
-granularity for smaller arenas.
+The physical accounting budget is recalibrated after fixed allocation/graph
+capture and before every preparation, using one safety floor and never dropping
+below charged pages. `charged = committed + held <= budget`; cached generic
+handles were removed so unmapped memory cannot escape accounting. Budget and
+release changes advance a generation. A 32 MiB default VMM handle size is used,
+reduced to allocation granularity for smaller arenas.
 
 ### 2.3 Metal
 
@@ -111,7 +132,8 @@ Every 10 seconds the runtime:
 1. Reads the KV pool's epoch-aware physical high-water.
 2. Attests the free tail through `unmap_ranges`.
 3. Issues a KV trim to that high-water.
-4. Trims transient workspace backing to zero.
+4. Converts the exact RS slot high-water to elastic pages and trims state.
+5. Trims transient workspace backing to zero.
 
 Logical KV capacity and device virtual addresses remain unchanged. A later fire
 recommits backing before dispatch.
@@ -121,11 +143,13 @@ recommits backing before dispatch.
 ### 3.1 Build and unit coverage
 
 - Full `pie-worker --features driver-cuda` build passed.
-- New CUDA VMM grow/trim/remap smoke passed.
+- CUDA VMM grow/trim/remap plus injected second-arena rollback passed.
 - KV quantized-cache test passed.
 - Swap-pool test passed.
-- Runtime engine: 330/330 passed.
+- Runtime engine library: 334/334 passed (including deterministic
+  exhausted/impossible admission and unchanged-proposal tests).
 - Driver ABI: 28/28 passed.
+- Dummy one-shot lease consume/release regression passed.
 - Worker library: 60 passed, 1 ignored.
 
 ### 3.2 Kernel and driver parity
@@ -194,17 +218,24 @@ Persistent-server c0/256:
 
 ## 4. Not implemented or incomplete
 
-### 4.1 Admission lease invariant
+### 4.1 Admission scope and gates
 
-The most important missing item is the E4 lease ABI.
+The E4 invariant is implemented for local CUDA TP1:
 
-The scheduler does **not** convert wave KV/RS/workspace demand into elastic
-pages and reserve them all-or-nothing at admission. `try_reserve` currently
-lives inside driver-side commit. Therefore:
+- Preparation performs full launch/resource/PTIR validation.
+- KV, state, workspace, and attention targets are rounded per CUDA arena.
+- One pool hold covers the complete multi-arena transaction.
+- A mapping or access failure unmaps every new mapping and restores pool
+  counters.
+- A successful prepare leaves no elastic allocation on the prepared launch
+  path.
+- The lease is consumed by one launch or one release; in-flight floors remain
+  until stream retirement.
 
-- Late commit is still theoretically failable.
-- The plan's "admission is the only failable point" invariant is not proven.
-- Wait-all cannot yet reason directly about shared physical-page demand.
+This claim does **not** extend to Remote, Metal, or TP. Remote post-scheduler
+coalescing would invalidate a worker-side lease, Metal has no C2 implementation,
+and TP needs all-rank atomic prepare/abort. All three use the existing unprepared
+path and report prepare unsupported.
 
 ### 4.2 Logical pool boundaries remain
 
@@ -218,6 +249,12 @@ The CUDA memory planner still computes and freezes:
 Physical commits share one accounting pool, but logical capacity cannot move
 freely between KV, state, and workspace. The planner lattice and per-pool
 capacity fields have not been deleted.
+
+This boundary was intentionally not changed speculatively. Correct deletion
+needs the active planner lifecycle work to define bounded logical KV/RS ceilings
+while preserving c0 capacity, the hidden non-page-zero graph padding allocation,
+and recurrent-state initialization. The C2 patch therefore keeps virtual/index
+shape ceilings and explicit `total_pages` behavior unchanged.
 
 ### 4.3 CUDA graph padding is demand-proportional
 
@@ -253,8 +290,9 @@ page IDs. Using that CSR max committed three pages and faulted the first wide
 graph replay. The final implementation computes the exact physical high-water
 from each fire's existing `kv_translation`, takes the batch maximum, and
 carries it in `PieLaunchDesc::required_kv_pages`. The driver commits that prefix
-before descriptor resolution or model execution. ABI v11 and remote wire v8
-make the new field version-safe; remote launch merging recomputes the batch
+before descriptor resolution or model execution. The field entered in ABI v11
+(the current local ABI is v12) and remote wire v8; remote launch merging
+recomputes the batch
 high-water, and TP broadcasts it so every follower commits the same prefix.
 
 Final gates:
@@ -346,8 +384,7 @@ Not completed:
 - E5 deletion of obsolete planner fields and paths
 - Configurable CUDA handle size and 2-64 MiB A/B
 - First-touch background warmup after deep trim
-- State high-water trim policy
-- CUDA handle-cache hysteresis policy
+- Full logical planner-boundary deletion
 - On-device/jetsam integration
 
 ## 5. Claims that are currently valid
@@ -358,12 +395,15 @@ It is valid to claim:
 - CUDA VMM virtual addresses remain stable across remap.
 - CUDA is performance-neutral on c0/256.
 - CUDA idle trim returns committed VRAM.
+- Local CUDA TP1 prepare is the only elastic-allocation failure point before a
+  prepared launch, and its one-shot lease prevents unsafe trim.
+- Exhausted wait-all proposals are deferred without consuming wave state.
 - Metal paged-KV no longer uses realloc-copy growth.
 
 It is **not** yet valid to claim:
 
 - The complete E0-E5 plan is implemented.
-- Reserve-then-commit cannot fail after admission.
+- Prepare/lease correctness for Remote, Metal, or CUDA TP.
 - Logical KV/RS/workspace boundaries are removed.
 - Metal idle trim reliably returns memory to the OS.
 - Metal behavior or performance has passed validation.
@@ -372,9 +412,12 @@ It is **not** yet valid to claim:
 
 1. Fix Metal post-unmap heap retirement.
 2. Build and run the Metal implementation and land the probe assets.
-3. Add shared-budget lease/reservation to scheduler admission.
+3. Define and implement bounded logical KV/RS ceilings, then delete the old
+   planner partition coupling.
 4. Keep the landed page-0 graph-padding canaries and physical high-water ABI
    contract in CUDA CI.
 5. Add Metal memory-pressure handling.
-6. Delete the old planner capacity lattice and obsolete fields.
-7. Run CUDA handle-size and first-touch latency A/B.
+6. Add all-rank prepare/abort before enabling CUDA TP admission.
+7. Design worker-side preparation that survives remote coalescing before
+   enabling Remote.
+8. Run CUDA handle-size and first-touch latency A/B.

@@ -96,7 +96,7 @@ impl BatchAccumulator {
 }
 
 pub(crate) fn build_batch_request(
-    requests: &mut [PendingRequest],
+    requests: &[PendingRequest],
     page_size: u32,
     stats: &SchedulerStats,
 ) -> LaunchSubmission {
@@ -106,7 +106,7 @@ pub(crate) fn build_batch_request(
         // multi-row programs take this path too: flattening them through
         // `wire::append_request` would collapse their inner CSR to one row
         // while incorrectly retaining B recurrent-state slots.
-        let req = &mut requests[0];
+        let req = &requests[0];
         let mut plan = req.request.clone();
         let kv_translation = std::mem::take(&mut plan.kv_translation);
         plan.required_kv_pages = plan.required_kv_pages.max(

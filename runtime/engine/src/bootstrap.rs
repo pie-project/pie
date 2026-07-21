@@ -290,6 +290,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_kv_pages: Vec<usize> = driver_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = driver_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_rs_slots: Vec<usize> = driver_configs.iter().map(|d| d.rs_cache_slots).collect();
+    let elastic_page_bytes: Vec<u64> = driver_configs
+        .iter()
+        .map(|d| d.elastic_page_bytes)
+        .collect();
+    let rs_slot_bytes: Vec<u64> = driver_configs
+        .iter()
+        .map(|d| d.rs_cache_slot_bytes)
+        .collect();
     let elastic_trim_enabled: Vec<bool> = driver_configs
         .iter()
         .map(|d| d.elastic_page_bytes != 0 && d.elastic_budget_pages != 0)
@@ -364,6 +372,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             let driver_ids = drivers.clone();
             let enabled_drivers = elastic_trim_enabled.clone();
             let capacities = arena_kv_pages.clone();
+            let elastic_page_bytes = elastic_page_bytes.clone();
+            let rs_slot_bytes = rs_slot_bytes.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
                 interval.tick().await;
@@ -398,6 +408,28 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                         .await
                         {
                             if completion.await.is_ok() {
+                                let rs_high_water =
+                                    stores.rs.lock().unwrap().committed_high_water_slots();
+                                let page_bytes =
+                                    elastic_page_bytes.get(ordinal).copied().unwrap_or(0);
+                                let slot_bytes = rs_slot_bytes.get(ordinal).copied().unwrap_or(0);
+                                if page_bytes != 0 && slot_bytes != 0 {
+                                    let state_bytes =
+                                        u64::from(rs_high_water).saturating_mul(slot_bytes);
+                                    let state_pages =
+                                        state_bytes.saturating_add(page_bytes - 1) / page_bytes;
+                                    if let Ok(state) = crate::scheduler::resize_pool(
+                                        driver_id,
+                                        pie_driver_abi::PIE_ELASTIC_POOL_STATE,
+                                        state_pages,
+                                        Vec::new(),
+                                        Vec::new(),
+                                    )
+                                    .await
+                                    {
+                                        let _ = state.await;
+                                    }
+                                }
                                 if let Ok(workspace) = crate::scheduler::resize_pool(
                                     driver_id,
                                     pie_driver_abi::PIE_ELASTIC_POOL_WORKSPACE,

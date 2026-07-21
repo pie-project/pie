@@ -51,10 +51,10 @@
 /**
  * Current direct local ABI version.
  *
- * v11: launches carry the translated physical KV page high-water that must be
- * committed before execution.
+ * v12: finalized launches can be prepared into a driver-owned elastic-memory
+ * lease and then launched or released exactly once.
  */
-#define PIE_DRIVER_ABI_VERSION 11
+#define PIE_DRIVER_ABI_VERSION 12
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -91,6 +91,21 @@
  * The driver encountered an internal failure after accepting the call.
  */
 #define PIE_STATUS_DRIVER_ERROR -5
+
+/**
+ * The finalized launch was admitted and `lease_id` is valid.
+ */
+#define PIE_LAUNCH_PREPARE_READY 0
+
+/**
+ * The launch may fit later after physical budget is released.
+ */
+#define PIE_LAUNCH_PREPARE_EXHAUSTED 1
+
+/**
+ * The launch can never fit within the driver's physical budget ceiling.
+ */
+#define PIE_LAUNCH_PREPARE_IMPOSSIBLE 2
 
 #define PIE_GEOMETRY_CLASS_HOST 0
 
@@ -162,6 +177,12 @@
  * Bound program produces an externally consumed channel.
  */
 #define PIE_CHANNEL_EXTERN_EXPORT 2
+
+#define PIE_ELASTIC_POOL_KV 0
+
+#define PIE_ELASTIC_POOL_STATE 1
+
+#define PIE_ELASTIC_POOL_WORKSPACE 2
 
 #define CHANNEL_TICKET_NONE UINT64_MAX
 
@@ -595,6 +616,33 @@ typedef struct PieCompletion {
   struct PieTerminalCell *terminal_cell;
 } PieCompletion;
 
+/**
+ * Result of synchronously preparing one finalized launch.
+ *
+ * `lease_id` is nonzero only for [`PIE_LAUNCH_PREPARE_READY`]. A ready lease
+ * is consumed by exactly one `*_launch_prepared` or `*_release_launch` call.
+ */
+typedef struct PieLaunchPrepareResult {
+  uint32_t outcome;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved0;
+  uint64_t lease_id;
+  /**
+   * Monotonic physical-budget generation observed by this attempt.
+   */
+  uint64_t budget_generation;
+  /**
+   * Independently rounded physical pages required by the finalized launch.
+   */
+  uint64_t required_pages;
+  /**
+   * Current physical budget in the same page units.
+   */
+  uint64_t budget_pages;
+} PieLaunchPrepareResult;
+
 typedef struct PieMutBytes {
   uint8_t *ptr;
   size_t len;
@@ -717,15 +765,8 @@ typedef struct PiePoolRangeSlice {
   size_t len;
 } PiePoolRangeSlice;
 
-#define PIE_ELASTIC_POOL_KV 0
-#define PIE_ELASTIC_POOL_STATE 1
-#define PIE_ELASTIC_POOL_WORKSPACE 2
-
 /**
  * Direct pool-resize descriptor.
- *
- * target_pages is measured in KV pages for PIE_ELASTIC_POOL_KV and in the
- * driver's advertised elastic_page_bytes for the state/workspace pools.
  */
 typedef struct PiePoolResizeDesc {
   uint32_t abi_version;
@@ -811,6 +852,17 @@ extern int32_t pie_cuda_launch(PieDriver *driver,
                                const struct PieLaunchDesc *launch,
                                struct PieCompletion completion);
 
+extern int32_t pie_cuda_prepare_launch(PieDriver *driver,
+                                       const struct PieLaunchDesc *launch,
+                                       struct PieLaunchPrepareResult *result);
+
+extern int32_t pie_cuda_launch_prepared(PieDriver *driver,
+                                        const struct PieLaunchDesc *launch,
+                                        uint64_t lease_id,
+                                        struct PieCompletion completion);
+
+extern int32_t pie_cuda_release_launch(PieDriver *driver, uint64_t lease_id);
+
 extern int32_t pie_cuda_encode(PieDriver *driver,
                                const struct PieEncodeDesc *encode,
                                struct PieCompletion completion);
@@ -855,6 +907,17 @@ extern int32_t pie_metal_bind_instance(PieDriver *driver,
 extern int32_t pie_metal_launch(PieDriver *driver,
                                 const struct PieLaunchDesc *launch,
                                 struct PieCompletion completion);
+
+extern int32_t pie_metal_prepare_launch(PieDriver *driver,
+                                        const struct PieLaunchDesc *launch,
+                                        struct PieLaunchPrepareResult *result);
+
+extern int32_t pie_metal_launch_prepared(PieDriver *driver,
+                                         const struct PieLaunchDesc *launch,
+                                         uint64_t lease_id,
+                                         struct PieCompletion completion);
+
+extern int32_t pie_metal_release_launch(PieDriver *driver, uint64_t lease_id);
 
 extern int32_t pie_metal_encode(PieDriver *driver,
                                 const struct PieEncodeDesc *encode,

@@ -5,7 +5,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
+#include <array>
+#include <limits>
 #include <vector>
 
 #include <cuda.h>
@@ -28,6 +29,10 @@ class CudaPhysicalPool final : public pie::elastic::PhysicalPool {
     std::size_t page_bytes() const noexcept override;
     std::size_t budget_pages() const noexcept override;
     std::size_t committed_pages() const noexcept override;
+    std::size_t held_pages() const noexcept;
+    std::size_t charged_pages() const noexcept;
+    std::size_t hard_budget_pages() const noexcept;
+    std::uint64_t generation() const noexcept;
 
     int device_ordinal() const noexcept { return device_ordinal_; }
     std::size_t allocation_granularity() const noexcept {
@@ -36,23 +41,29 @@ class CudaPhysicalPool final : public pie::elastic::PhysicalPool {
     std::size_t handle_bytes() const noexcept { return handle_bytes_; }
     void mark_committed(std::size_t pages);
     void mark_uncommitted(std::size_t pages) noexcept;
+    void recalibrate_budget(
+        std::size_t available_bytes,
+        std::size_t safety_floor_bytes,
+        bool reset_hard_ceiling);
     CUmemGenericAllocationHandle acquire_handle(std::size_t bytes);
     void release_handle(
         CUmemGenericAllocationHandle handle,
         std::size_t bytes,
         bool cache) noexcept;
+    bool should_fail_mapping_for_test();
+    void fail_mapping_after_for_test(std::size_t successful_mappings);
 
   private:
     int device_ordinal_ = 0;
     std::size_t allocation_granularity_ = 0;
     std::size_t handle_bytes_ = 0;
     std::size_t budget_pages_ = 0;
+    std::size_t hard_budget_pages_ = 0;
     mutable std::mutex mutex_;
-    std::size_t reserved_pages_ = 0;
+    std::size_t held_pages_ = 0;
     std::size_t committed_pages_ = 0;
-    std::unordered_map<
-        std::size_t,
-        std::vector<CUmemGenericAllocationHandle>> free_handles_;
+    std::uint64_t generation_ = 1;
+    std::size_t fail_mapping_after_ = std::numeric_limits<std::size_t>::max();
 };
 
 class CudaArena final : public pie::elastic::Arena {
@@ -72,6 +83,10 @@ class CudaArena final : public pie::elastic::Arena {
     void trim_committed(std::size_t bytes) override;
 
     std::size_t max_bytes() const noexcept { return max_bytes_; }
+    std::size_t target_committed_bytes(std::size_t bytes) const;
+    std::size_t target_pages(std::size_t bytes) const;
+    void grow_reserved(std::size_t bytes);
+    void rollback_reserved(std::size_t bytes) noexcept;
 
   private:
     static std::size_t align_up(std::size_t value, std::size_t alignment);
@@ -85,6 +100,21 @@ class CudaArena final : public pie::elastic::Arena {
     std::size_t map_unit_bytes_ = 0;
     std::vector<CUmemGenericAllocationHandle> handles_;
 };
+
+enum class CudaCommitOutcome {
+    Committed,
+    Exhausted,
+    Impossible,
+};
+
+struct CudaCommitResult {
+    CudaCommitOutcome outcome = CudaCommitOutcome::Committed;
+    std::size_t required_pages = 0;
+    std::size_t budget_pages = 0;
+    std::uint64_t generation = 0;
+};
+
+struct CudaAllocatorTarget;
 
 class CudaArenaAllocator {
   public:
@@ -101,6 +131,9 @@ class CudaArenaAllocator {
     void trim_bytes(std::size_t bytes);
     std::size_t committed_bytes() const noexcept;
     std::size_t allocated_bytes() const noexcept;
+    std::size_t target_bytes(
+        std::size_t used,
+        std::size_t capacity) const noexcept;
 
   private:
     static void* allocate_callback(
@@ -116,7 +149,21 @@ class CudaArenaAllocator {
     mutable std::mutex mutex_;
     std::vector<std::unique_ptr<CudaArena>> arenas_;
     std::size_t allocated_bytes_ = 0;
+
+    friend CudaCommitResult commit_cuda_arena_targets_atomically(
+        const std::shared_ptr<CudaPhysicalPool>&,
+        const std::vector<CudaAllocatorTarget>&);
 };
+
+struct CudaAllocatorTarget {
+    CudaArenaAllocator* allocator = nullptr;
+    std::size_t used = 0;
+    std::size_t capacity = 1;
+};
+
+CudaCommitResult commit_cuda_arena_targets_atomically(
+    const std::shared_ptr<CudaPhysicalPool>& pool,
+    const std::vector<CudaAllocatorTarget>& targets);
 
 class ScopedCudaArenaAllocator {
   public:

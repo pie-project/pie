@@ -192,6 +192,9 @@ mod tests {
             reject_launches_remaining: 0,
             fail_launches_after_accept: false,
             retry_launches_remaining: 0,
+            elastic_admission: false,
+            prepare_exhaustions_remaining: 0,
+            prepare_impossible_above_kv_pages: 0,
             operation_log: None,
             launch_observer: None,
         };

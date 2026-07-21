@@ -125,14 +125,14 @@ pub(super) const QUORUM_POLL_US: u64 = 200;
 
 /// The wave-level fire decision. Dense quorum fires carry an empty `missing`
 /// set; a straggler demotion fires narrow and names the absentees.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum WaveDecision {
     Fire { missing: Vec<ProcessId> },
     Wait(Duration),
 }
 
 /// Per-pipeline wave participation.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PipelineWaveState {
     /// Process owning this pipeline scope. Process suspend/terminate removes
     /// every scope with the same owner; close removes only the keyed scope.
@@ -178,6 +178,7 @@ pub(super) struct PipelineEpoch {
     generation: u64,
 }
 
+#[derive(Clone)]
 pub(super) struct WaitAllPolicy {
     /// Rolling estimate (EWMA, α=1/8) of the wave retire-to-retire cadence
     /// in µs. The straggler idleness threshold is `wave_window + cadence`:
@@ -530,6 +531,32 @@ impl WaitAllPolicy {
         )
     }
 
+    /// Side-effect-free candidate decision used before driver admission.
+    ///
+    /// A denied physical preparation must not advance grace/demotion state or
+    /// wave counters, so the scheduler evaluates against a private copy and
+    /// invokes the mutating decision only after preparation succeeds.
+    pub fn preview_candidate_wave_at(
+        &self,
+        current_batch_size: usize,
+        candidate_pipelines: &HashSet<ProcessId>,
+        deferred_pipelines: &HashSet<ProcessId>,
+        submitted_pipelines: &HashSet<ProcessId>,
+        structurally_full: bool,
+        now: Instant,
+    ) -> WaveDecision {
+        let mut preview = self.clone();
+        preview.stats = None;
+        preview.decide_wave_inner(
+            current_batch_size,
+            Some(candidate_pipelines),
+            deferred_pipelines,
+            submitted_pipelines,
+            structurally_full,
+            now,
+        )
+    }
+
     fn decide_wave_inner(
         &mut self,
         current_batch_size: usize,
@@ -691,7 +718,7 @@ impl WaitAllPolicy {
                 }
             }
         }
-        if crate::scheduler::fire_timing_full() {
+        if self.stats.is_some() && crate::scheduler::fire_timing_full() {
             // Named absentees with their per-pid OUTCOME: "demoted" means
             // punished (excluded until next participation); false means
             // graced (credited backlog) or recently-active (idle-window
@@ -718,7 +745,7 @@ impl WaitAllPolicy {
                 "batch_size": current_batch_size,
                 "missing": detail,
             }));
-        } else if crate::scheduler::ledger_timing_enabled() {
+        } else if self.stats.is_some() && crate::scheduler::ledger_timing_enabled() {
             crate::scheduler::fire_timing_write(&serde_json::json!({
                 "schema": 1,
                 "source": "scheduler",
@@ -1097,6 +1124,48 @@ mod tests {
         let epochs = policy.on_wave_dispatched(&participants, past_cold_hold);
         policy.on_wave_retired(&epochs);
         past_cold_hold
+    }
+
+    #[test]
+    fn denied_admission_preview_changes_no_quorum_state_or_stats() {
+        let stats = Arc::new(SchedulerStats::default());
+        let mut policy = WaitAllPolicy::new(64, Some(Arc::clone(&stats)));
+        let (ready, absent) = (pid(), pid());
+        let start = Instant::now();
+        policy.on_pipeline_request(Some(ready), start);
+        policy.on_pipeline_request(Some(absent), start);
+        let fired = bootstrap_fire(&mut policy, 2, start);
+        policy.on_pipeline_request(Some(ready), fired);
+        let candidates = HashSet::from([ready]);
+        let before = policy.debug_summary();
+        let waves_before = stats
+            .fire
+            .quorum
+            .wave_fires
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let decision = policy.preview_candidate_wave_at(
+            1,
+            &candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+            fired + wave_window() + Duration::from_micros(1),
+        );
+        assert_eq!(
+            decision,
+            WaveDecision::Fire {
+                missing: vec![absent]
+            }
+        );
+        assert_eq!(policy.debug_summary(), before);
+        assert_eq!(
+            stats
+                .fire
+                .quorum
+                .wave_fires
+                .load(std::sync::atomic::Ordering::Relaxed,),
+            waves_before,
+        );
     }
 
     #[test]

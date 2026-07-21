@@ -1,6 +1,7 @@
 #include "context.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -190,6 +191,91 @@ struct LaunchScratch {
     }
 };
 
+void hash_launch_bytes(
+    std::uint64_t& hash,
+    const void* data,
+    std::size_t bytes) {
+    const auto* ptr = static_cast<const std::uint8_t*>(data);
+    hash ^= static_cast<std::uint64_t>(bytes);
+    hash *= 1099511628211ull;
+    for (std::size_t i = 0; i < bytes; ++i) {
+        hash ^= ptr[i];
+        hash *= 1099511628211ull;
+    }
+}
+
+template <typename T>
+void hash_launch_slice(
+    std::uint64_t& hash,
+    const T* ptr,
+    std::size_t len) {
+    hash_launch_bytes(hash, ptr, len * sizeof(T));
+}
+
+std::uint64_t launch_fingerprint(const PieLaunchDesc& launch) {
+    std::uint64_t hash = 14695981039346656037ull;
+#define PIE_HASH_SLICE(field) \
+    hash_launch_slice(hash, launch.field.ptr, launch.field.len)
+    PIE_HASH_SLICE(instance_ids);
+    PIE_HASH_SLICE(terminal_cells);
+    PIE_HASH_SLICE(token_ids);
+    PIE_HASH_SLICE(position_ids);
+    PIE_HASH_SLICE(kv_page_indices);
+    PIE_HASH_SLICE(kv_page_indptr);
+    PIE_HASH_SLICE(kv_last_page_lens);
+    PIE_HASH_SLICE(qo_indptr);
+    PIE_HASH_SLICE(rs_slot_ids);
+    PIE_HASH_SLICE(rs_slot_flags);
+    PIE_HASH_SLICE(rs_fold_lens);
+    PIE_HASH_SLICE(rs_buffer_slot_ids);
+    PIE_HASH_SLICE(rs_buffer_slot_indptr);
+    hash_launch_slice(
+        hash, launch.masks.request_indptr.ptr,
+        launch.masks.request_indptr.len);
+    hash_launch_slice(
+        hash, launch.masks.word_indptr.ptr,
+        launch.masks.word_indptr.len);
+    hash_launch_slice(hash, launch.masks.words.ptr, launch.masks.words.len);
+    PIE_HASH_SLICE(sampling_indices);
+    PIE_HASH_SLICE(sampling_indptr);
+    PIE_HASH_SLICE(context_ids);
+    hash_launch_bytes(hash, &launch.single_token_mode, sizeof(launch.single_token_mode));
+    hash_launch_bytes(hash, &launch.has_user_mask, sizeof(launch.has_user_mask));
+    hash_launch_bytes(hash, &launch.required_kv_pages, sizeof(launch.required_kv_pages));
+    PIE_HASH_SLICE(image_indptr);
+    PIE_HASH_SLICE(image_grids);
+    PIE_HASH_SLICE(image_anchor_positions);
+    hash_launch_slice(hash, launch.image_pixels.ptr, launch.image_pixels.len);
+    PIE_HASH_SLICE(image_pixel_indptr);
+    PIE_HASH_SLICE(image_mrope_positions);
+    PIE_HASH_SLICE(image_mrope_indptr);
+    PIE_HASH_SLICE(image_patch_positions);
+    PIE_HASH_SLICE(image_anchor_rows);
+    hash_launch_slice(hash, launch.audio_features.ptr, launch.audio_features.len);
+    PIE_HASH_SLICE(audio_feature_indptr);
+    PIE_HASH_SLICE(audio_anchor_rows);
+    PIE_HASH_SLICE(audio_indptr);
+    hash_launch_slice(hash, launch.embed_rows.ptr, launch.embed_rows.len);
+    PIE_HASH_SLICE(embed_indptr);
+    PIE_HASH_SLICE(embed_shapes);
+    PIE_HASH_SLICE(embed_dtypes);
+    PIE_HASH_SLICE(embed_anchor_rows);
+    PIE_HASH_SLICE(embed_block_indptr);
+    PIE_HASH_SLICE(kv_len);
+    PIE_HASH_SLICE(kv_len_device);
+    PIE_HASH_SLICE(kv_translation);
+    PIE_HASH_SLICE(kv_translation_indptr);
+    PIE_HASH_SLICE(ptir_program_row_indptr);
+    PIE_HASH_SLICE(ptir_kv_write_lower_bounds);
+    PIE_HASH_SLICE(ptir_kv_write_upper_bounds);
+    PIE_HASH_SLICE(logical_fire_ids);
+    PIE_HASH_SLICE(channel_expected_head);
+    PIE_HASH_SLICE(channel_expected_tail);
+    PIE_HASH_SLICE(channel_ticket_indptr);
+#undef PIE_HASH_SLICE
+    return hash;
+}
+
 struct TpStartupBarrier {
     std::mutex mu;
     std::condition_variable cv;
@@ -312,6 +398,14 @@ class Context::Impl {
                          PieChannelEndpointBinding* binding);
     int bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* binding);
     int launch(const PieLaunchDesc& launch, PieCompletion completion);
+    int prepare_launch(
+        const PieLaunchDesc& launch,
+        PieLaunchPrepareResult* result);
+    int launch_prepared(
+        const PieLaunchDesc& launch,
+        std::uint64_t lease_id,
+        PieCompletion completion);
+    int release_launch(std::uint64_t lease_id);
     int encode(const PieEncodeDesc& encode, PieCompletion completion);
     int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion);
     int copy_state(const PieStateCopyDesc& copy, PieCompletion completion);
@@ -406,6 +500,42 @@ class Context::Impl {
         return tp_size_ > 1 && tp_rank_ > 0;
     }
 
+    struct LaunchLease {
+        std::uint64_t fingerprint = 0;
+        std::array<std::size_t, 4> target_bytes{};
+    };
+
+    struct LeaseRetireContext {
+        Impl* impl = nullptr;
+        std::uint64_t lease_id = 0;
+    };
+
+    static void CUDART_CB retire_launch_lease(void* userdata) {
+        std::unique_ptr<LeaseRetireContext> ctx(
+            static_cast<LeaseRetireContext*>(userdata));
+        if (ctx == nullptr || ctx->impl == nullptr) return;
+        std::lock_guard lock(ctx->impl->lease_mutex_);
+        ctx->impl->in_flight_leases_.erase(ctx->lease_id);
+    }
+
+    int launch_impl(
+        const PieLaunchDesc& launch,
+        PieCompletion completion,
+        std::optional<std::uint64_t> lease_id);
+    int validate_finalized_launch(
+        const PieLaunchDesc& launch,
+        std::vector<pie_cuda_driver::pipeline::InstanceRecord>* instances,
+        LaunchScratch* scratch,
+        pie_native::LaunchView* view) const;
+    int required_kv_pages(const PieLaunchDesc& launch) const;
+    std::size_t required_state_slots(const PieLaunchDesc& launch) const;
+    std::vector<pie_cuda_driver::CudaAllocatorTarget> launch_targets(
+        const PieLaunchDesc& launch,
+        std::array<std::size_t, 4>* target_bytes) const;
+    std::array<std::size_t, 4> active_lease_floors() const;
+    void recalibrate_elastic_budget(bool reset_hard_ceiling);
+    void schedule_lease_retirement(std::uint64_t lease_id) noexcept;
+
     PieRuntimeCallbacks runtime_{};
     pie_cuda_driver::Config* cfg_ = nullptr;
     std::vector<OwnedValue> owners_;
@@ -423,6 +553,11 @@ class Context::Impl {
     std::shared_ptr<pie_cuda_driver::CudaArenaAllocator> state_allocator_;
     std::shared_ptr<pie_cuda_driver::CudaArenaAllocator> workspace_allocator_;
     std::shared_ptr<pie_cuda_driver::CudaArenaAllocator> attention_allocator_;
+    std::size_t elastic_safety_floor_bytes_ = 0;
+    mutable std::mutex lease_mutex_;
+    std::unordered_map<std::uint64_t, LaunchLease> launch_leases_;
+    std::unordered_map<std::uint64_t, LaunchLease> in_flight_leases_;
+    std::uint64_t next_launch_lease_id_ = 1;
     pie_cuda_driver::ops::RuntimeQuantContext runtime_quant_context_;
     pie_cuda_driver::NcclComm* tp_comm_ = nullptr;
     std::string caps_json_;
@@ -729,11 +864,12 @@ int Context::Impl::load_model(
     std::size_t free_device_bytes = 0;
     std::size_t total_device_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_device_bytes, &total_device_bytes));
-    static_cast<void>(total_device_bytes);
-    const std::size_t reserve_floor =
-        std::min<std::size_t>(128ull << 20, free_device_bytes / 10);
+    elastic_safety_floor_bytes_ =
+        std::min<std::size_t>(128ull << 20, total_device_bytes / 10);
     const std::size_t elastic_budget =
-        free_device_bytes - reserve_floor;
+        free_device_bytes > elastic_safety_floor_bytes_
+            ? free_device_bytes - elastic_safety_floor_bytes_
+            : 0;
     elastic_pool_ = std::make_shared<CudaPhysicalPool>(
         device_ordinal_,
         elastic_budget);
@@ -1334,9 +1470,13 @@ int Context::Impl::load_model(
         if (!is_tp_follower()) {
             workspace_allocator_->trim_bytes(pie::elastic::kLogicalPageBytes);
             attention_allocator_->trim_bytes(0);
+            if (tp_size_ == 1) {
+                state_allocator_->trim_bytes(0);
+            }
         }
     }
     tp_startup_cpu_barrier(cfg);
+    recalibrate_elastic_budget(/*reset_hard_ceiling=*/true);
 
     if (is_tp_follower()) {
         tp_follower_stop_.store(false);
@@ -1499,6 +1639,224 @@ int Context::Impl::load_model(
     return PIE_STATUS_OK;
 }
 
+void Context::Impl::recalibrate_elastic_budget(bool reset_hard_ceiling) {
+    if (elastic_pool_ == nullptr) return;
+    std::size_t free_device_bytes = 0;
+    std::size_t total_device_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_device_bytes, &total_device_bytes));
+    static_cast<void>(total_device_bytes);
+    elastic_pool_->recalibrate_budget(
+        free_device_bytes,
+        elastic_safety_floor_bytes_,
+        reset_hard_ceiling);
+}
+
+int Context::Impl::required_kv_pages(const PieLaunchDesc& launch) const {
+    int pages = static_cast<int>(launch.required_kv_pages);
+    if (executor_->graph_pad_page >= 0 && kv_cache_->num_pages() > 0) {
+        pages = std::max(pages, executor_->graph_pad_page + 1);
+    }
+    if (launch.kv_page_indices.len > 0) {
+        const auto* end =
+            launch.kv_page_indices.ptr + launch.kv_page_indices.len;
+        const std::uint32_t highest =
+            *std::max_element(launch.kv_page_indices.ptr, end);
+        pages = std::max(pages, static_cast<int>(highest) + 1);
+    }
+    return pages;
+}
+
+std::size_t Context::Impl::required_state_slots(
+    const PieLaunchDesc& launch) const {
+    if (executor_->rs_cache == nullptr) return 0;
+    std::size_t slots = 0;
+    auto include = [&slots](PieU32Slice ids) {
+        if (ids.len == 0) return;
+        const auto* end = ids.ptr + ids.len;
+        slots = std::max<std::size_t>(
+            slots,
+            static_cast<std::size_t>(*std::max_element(ids.ptr, end)) + 1);
+    };
+    include(launch.rs_slot_ids);
+    include(launch.rs_buffer_slot_ids);
+    if (executor_->graph_pad_slot >= 0) {
+        slots = std::max<std::size_t>(
+            slots,
+            static_cast<std::size_t>(executor_->graph_pad_slot) + 1);
+    }
+    return slots;
+}
+
+std::vector<pie_cuda_driver::CudaAllocatorTarget>
+Context::Impl::launch_targets(
+    const PieLaunchDesc& launch,
+    std::array<std::size_t, 4>* target_bytes) const {
+    const std::size_t kv_capacity =
+        static_cast<std::size_t>(std::max(1, kv_cache_->num_pages()));
+    const std::size_t kv_required =
+        static_cast<std::size_t>(std::max(0, required_kv_pages(launch)));
+    const std::size_t state_capacity =
+        executor_->rs_cache == nullptr
+            ? 1
+            : static_cast<std::size_t>(
+                  std::max(1, executor_->rs_cache->max_slots()));
+    const std::size_t state_required = required_state_slots(launch);
+    std::vector<pie_cuda_driver::CudaAllocatorTarget> targets = {
+        {kv_allocator_.get(), kv_required, kv_capacity},
+        {state_allocator_.get(), state_required, state_capacity},
+        {workspace_allocator_.get(), 1, 1},
+        {attention_allocator_.get(), 1, 1},
+    };
+    if (target_bytes != nullptr) {
+        *target_bytes = {
+            kv_allocator_->target_bytes(kv_required, kv_capacity),
+            state_allocator_->target_bytes(state_required, state_capacity),
+            workspace_allocator_->allocated_bytes(),
+            attention_allocator_->allocated_bytes(),
+        };
+    }
+    return targets;
+}
+
+int Context::Impl::validate_finalized_launch(
+    const PieLaunchDesc& launch,
+    std::vector<pie_cuda_driver::pipeline::InstanceRecord>* instances,
+    LaunchScratch* scratch,
+    pie_native::LaunchView* view) const {
+    if (executor_ == nullptr) return PIE_STATUS_CLOSED;
+    if (launch.embed_rows.len > 0 &&
+        (model_ == nullptr ||
+         !model_->capabilities().supports_media_encode)) {
+        return PIE_STATUS_UNSUPPORTED;
+    }
+    if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
+    const int resolve_status =
+        registry_->resolve_instances(launch.instance_ids, instances);
+    if (resolve_status != PIE_STATUS_OK) return resolve_status;
+    std::vector<std::uint32_t> program_geometry_classes;
+    program_geometry_classes.reserve(instances->size());
+    for (const auto& record : *instances) {
+        program_geometry_classes.push_back(record.geometry_class);
+    }
+    const int resource_status = pie_cuda_driver::abi::validate_launch_resources(
+        launch,
+        kv_cache_->num_pages(),
+        kv_cache_->page_size(),
+        executor_->rs_cache != nullptr ? executor_->rs_cache->max_slots() : 0,
+        executor_->rs_cache != nullptr
+            ? executor_->rs_cache->rs_buffer_num_slots()
+            : 0,
+        multimodal_limits_,
+        program_geometry_classes.data(),
+        program_geometry_classes.size());
+    if (resource_status != PIE_STATUS_OK) return resource_status;
+    if (launch.required_kv_pages >
+        static_cast<std::uint32_t>(kv_cache_->num_pages())) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    *view = scratch->build(launch, *instances);
+    if (view->ptir_program_hashes.empty()) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    std::string ptir_error;
+    const int ptir_status = registry_->validate_launch(*view, &ptir_error);
+    if (ptir_status != PIE_STATUS_OK && !ptir_error.empty()) {
+        std::cerr << "[pie-driver-cuda] launch rejected: "
+                  << ptir_error << "\n";
+    }
+    return ptir_status;
+}
+
+std::array<std::size_t, 4> Context::Impl::active_lease_floors() const {
+    std::array<std::size_t, 4> floors{};
+    std::lock_guard lock(lease_mutex_);
+    auto include = [&floors](const auto& leases) {
+        for (const auto& [id, lease] : leases) {
+            static_cast<void>(id);
+            for (std::size_t i = 0; i < floors.size(); ++i) {
+                floors[i] = std::max(floors[i], lease.target_bytes[i]);
+            }
+        }
+    };
+    include(launch_leases_);
+    include(in_flight_leases_);
+    return floors;
+}
+
+void Context::Impl::schedule_lease_retirement(
+    std::uint64_t lease_id) noexcept {
+    auto context = std::make_unique<LeaseRetireContext>();
+    context->impl = this;
+    context->lease_id = lease_id;
+    const cudaError_t status = cudaLaunchHostFunc(
+        executor_->cublas.stream(),
+        retire_launch_lease,
+        context.get());
+    if (status == cudaSuccess) {
+        context.release();
+    } else {
+        std::cerr
+            << "[pie-driver-cuda] retaining launch lease floor after callback "
+               "registration failure: "
+            << cudaGetErrorString(status) << "\n";
+    }
+}
+
+int Context::Impl::prepare_launch(
+    const PieLaunchDesc& launch,
+    PieLaunchPrepareResult* result) {
+    if (result == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    *result = PieLaunchPrepareResult{};
+    if (tp_size_ > 1) return PIE_STATUS_UNSUPPORTED;
+    if (const char* disabled =
+            std::getenv("PIE_CUDA_DISABLE_UPFRONT_GRAPHS");
+        disabled != nullptr && disabled[0] != '\0' &&
+        disabled[0] != '0') {
+        return PIE_STATUS_UNSUPPORTED;
+    }
+    std::vector<pie_cuda_driver::pipeline::InstanceRecord> instances;
+    LaunchScratch scratch;
+    pie_native::LaunchView view{};
+    const int status = validate_finalized_launch(
+        launch, &instances, &scratch, &view);
+    if (status != PIE_STATUS_OK) return status;
+    recalibrate_elastic_budget(/*reset_hard_ceiling=*/false);
+    std::array<std::size_t, 4> target_bytes{};
+    const auto commit = pie_cuda_driver::commit_cuda_arena_targets_atomically(
+        elastic_pool_, launch_targets(launch, &target_bytes));
+    result->budget_generation = commit.generation;
+    result->required_pages = commit.required_pages;
+    result->budget_pages = commit.budget_pages;
+    if (commit.outcome == pie_cuda_driver::CudaCommitOutcome::Exhausted) {
+        result->outcome = PIE_LAUNCH_PREPARE_EXHAUSTED;
+        return PIE_STATUS_OK;
+    }
+    if (commit.outcome == pie_cuda_driver::CudaCommitOutcome::Impossible) {
+        result->outcome = PIE_LAUNCH_PREPARE_IMPOSSIBLE;
+        return PIE_STATUS_OK;
+    }
+    std::lock_guard lock(lease_mutex_);
+    std::uint64_t lease_id = next_launch_lease_id_++;
+    if (lease_id == 0) lease_id = next_launch_lease_id_++;
+    launch_leases_.emplace(
+        lease_id,
+        LaunchLease{
+            launch_fingerprint(launch),
+            target_bytes,
+        });
+    result->outcome = PIE_LAUNCH_PREPARE_READY;
+    result->lease_id = lease_id;
+    return PIE_STATUS_OK;
+}
+
+int Context::Impl::release_launch(std::uint64_t lease_id) {
+    if (lease_id == 0) return PIE_STATUS_INVALID_ARGUMENT;
+    std::lock_guard lock(lease_mutex_);
+    return launch_leases_.erase(lease_id) == 1
+        ? PIE_STATUS_OK
+        : PIE_STATUS_INVALID_ARGUMENT;
+}
+
 int Context::Impl::register_program(const PieProgramDesc& program, std::uint64_t* program_id) {
     if (registry_ == nullptr) return PIE_STATUS_CLOSED;
     if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
@@ -1535,103 +1893,90 @@ int Context::Impl::bind_instance(const PieInstanceDesc& instance, PieInstanceBin
 }
 
 int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion) {
+    return launch_impl(launch, completion, std::nullopt);
+}
+
+int Context::Impl::launch_prepared(
+    const PieLaunchDesc& launch,
+    std::uint64_t lease_id,
+    PieCompletion completion) {
+    if (lease_id == 0) return PIE_STATUS_INVALID_ARGUMENT;
+    return launch_impl(launch, completion, lease_id);
+}
+
+int Context::Impl::launch_impl(
+    const PieLaunchDesc& launch,
+    PieCompletion completion,
+    std::optional<std::uint64_t> lease_id) {
+    std::optional<LaunchLease> lease;
+    if (lease_id.has_value()) {
+        std::lock_guard lock(lease_mutex_);
+        const auto found = launch_leases_.find(*lease_id);
+        if (found == launch_leases_.end()) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        lease = found->second;
+        launch_leases_.erase(found);
+    }
+    if (lease.has_value() &&
+        lease->fingerprint != launch_fingerprint(launch)) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
     pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
         runtime_quant_context_);
-    if (executor_ == nullptr) return PIE_STATUS_CLOSED;
-    if (launch.embed_rows.len > 0 &&
-        (model_ == nullptr ||
-         !model_->capabilities().supports_media_encode)) {
-        return PIE_STATUS_UNSUPPORTED;
-    }
-    if (is_tp_follower()) return PIE_STATUS_UNSUPPORTED;
     std::vector<pie_cuda_driver::pipeline::InstanceRecord> launch_instances;
-    const int resolve_status =
-        registry_->resolve_instances(launch.instance_ids, &launch_instances);
-    if (resolve_status != PIE_STATUS_OK) {
-        std::cerr << "[pie-driver-cuda] launch rejected: instance resolve "
-                     "failed with status "
-                  << resolve_status << "\n";
-        return resolve_status;
-    }
-    std::vector<std::uint32_t> program_geometry_classes;
-    program_geometry_classes.reserve(launch_instances.size());
-    for (const auto& record : launch_instances) {
-        program_geometry_classes.push_back(record.geometry_class);
-    }
-    const int resource_status = pie_cuda_driver::abi::validate_launch_resources(
-        launch,
-        kv_cache_->num_pages(),
-        kv_cache_->page_size(),
-        executor_->rs_cache != nullptr ? executor_->rs_cache->max_slots() : 0,
-        executor_->rs_cache != nullptr
-            ? executor_->rs_cache->rs_buffer_num_slots()
-            : 0,
-        multimodal_limits_,
-        program_geometry_classes.data(),
-        program_geometry_classes.size());
-    if (resource_status != PIE_STATUS_OK) {
-        std::cerr << "[pie-driver-cuda] launch rejected: resource validation "
-                     "failed with status "
-                  << resource_status << "\n";
-        return resource_status;
-    }
-    if (launch.required_kv_pages >
-        static_cast<std::uint32_t>(kv_cache_->num_pages())) {
-        std::cerr << "[pie-driver-cuda] launch rejected: required KV page "
-                     "high-water exceeds capacity\n";
-        return PIE_STATUS_INVALID_ARGUMENT;
-    }
     LaunchScratch scratch;
-    pie_native::LaunchView view = scratch.build(launch, launch_instances);
-    const bool has_ptir_launch = !view.ptir_program_hashes.empty();
-    if (!has_ptir_launch) {
-        std::cerr << "[pie-driver-cuda] launch rejected: no PTIR program on "
-                     "the batch\n";
-        return PIE_STATUS_INVALID_ARGUMENT;
-    }
-    std::string ptir_error;
-    const int ptir_status = registry_->validate_launch(view, &ptir_error);
-    if (ptir_status != PIE_STATUS_OK) {
-        std::cerr << "[pie-driver-cuda] launch rejected: "
-                  << (ptir_error.empty() ? "(validator gave no reason)"
-                                         : ptir_error)
-                  << "\n";
-        return ptir_status;
-    }
+    pie_native::LaunchView view{};
+    const int validation_status = validate_finalized_launch(
+        launch, &launch_instances, &scratch, &view);
+    if (validation_status != PIE_STATUS_OK) return validation_status;
+    bool lease_in_flight = false;
     try {
-        workspace_allocator_->ensure_all();
-        attention_allocator_->ensure_all();
-        int required_kv_pages = static_cast<int>(launch.required_kv_pages);
-        if (executor_->graph_pad_page > 0) {
-            required_kv_pages = std::max(
-                required_kv_pages, executor_->graph_pad_page + 1);
+        const int launch_required_kv_pages = required_kv_pages(launch);
+        if (lease.has_value()) {
+            const std::array<std::size_t, 4> committed = {
+                kv_allocator_->committed_bytes(),
+                state_allocator_->committed_bytes(),
+                workspace_allocator_->committed_bytes(),
+                attention_allocator_->committed_bytes(),
+            };
+            for (std::size_t i = 0; i < committed.size(); ++i) {
+                if (committed[i] < lease->target_bytes[i]) {
+                    throw std::runtime_error(
+                        "prepared launch mappings were trimmed below lease floor");
+                }
+            }
+            {
+                std::lock_guard lock(lease_mutex_);
+                in_flight_leases_.emplace(*lease_id, *lease);
+            }
+            lease_in_flight = true;
+        } else {
+            const auto commit =
+                pie_cuda_driver::commit_cuda_arena_targets_atomically(
+                    elastic_pool_, launch_targets(launch, nullptr));
+            if (commit.outcome !=
+                pie_cuda_driver::CudaCommitOutcome::Committed) {
+                throw std::runtime_error(
+                    "shared physical pool budget exhausted before launch");
+            }
         }
-        if (launch.kv_page_indices.len > 0) {
-            const auto* end =
-                launch.kv_page_indices.ptr + launch.kv_page_indices.len;
-            const std::uint32_t highest =
-                *std::max_element(launch.kv_page_indices.ptr, end);
-            required_kv_pages = std::max(
-                required_kv_pages,
-                static_cast<int>(highest) + 1);
-        }
-        kv_cache_->ensure_pages(required_kv_pages);
-        executor_->required_kv_pages = required_kv_pages;
+        executor_->required_kv_pages = launch_required_kv_pages;
         const char* assert_proportional =
             std::getenv("PIE_CUDA_ASSERT_KV_COMMIT_PROPORTIONAL");
         if (assert_proportional != nullptr && assert_proportional[0] != '\0' &&
-            assert_proportional[0] != '0' && required_kv_pages > 0) {
+            assert_proportional[0] != '0' && launch_required_kv_pages > 0) {
             const std::size_t committed = kv_allocator_->committed_bytes();
             const std::size_t capacity = kv_allocator_->allocated_bytes();
             kv_proportional_peak_required_pages_ = std::max(
                 kv_proportional_peak_required_pages_,
-                static_cast<std::size_t>(required_kv_pages));
+                static_cast<std::size_t>(launch_required_kv_pages));
             kv_proportional_planned_pages_ =
                 static_cast<std::size_t>(kv_cache_->num_pages());
             kv_proportional_peak_committed_bytes_ = std::max(
                 kv_proportional_peak_committed_bytes_, committed);
             kv_proportional_capacity_bytes_ = capacity;
-            if (required_kv_pages * 2 < kv_cache_->num_pages() &&
+            if (launch_required_kv_pages * 2 < kv_cache_->num_pages() &&
                 committed * 2 >= capacity) {
                 throw std::runtime_error(
                     "short-context KV commit is not demand-proportional");
@@ -1639,8 +1984,15 @@ int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion)
         }
         pie_cuda_driver::handle_fire_batch(
             0, view, *executor_, runtime_, completion);
+        if (lease_in_flight) {
+            schedule_lease_retirement(*lease_id);
+        }
         return PIE_STATUS_OK;
     } catch (const pie_cuda_driver::pipeline::RetryableLaunchError& e) {
+        if (lease_in_flight) {
+            std::lock_guard lock(lease_mutex_);
+            in_flight_leases_.erase(*lease_id);
+        }
         std::cerr << "[pie-driver-cuda] launch retry: " << e.what() << "\n";
         if (pie_cuda_driver::fire_timing::enabled()) {
             const auto logical_fire_ids =
@@ -1676,6 +2028,9 @@ int Context::Impl::launch(const PieLaunchDesc& launch, PieCompletion completion)
             std::cerr
                 << "[pie-driver-cuda] launch failure settlement: "
                 << settle_error.what() << "\n";
+        }
+        if (lease_in_flight) {
+            schedule_lease_retirement(*lease_id);
         }
         for (std::size_t i = 0; i < launch.terminal_cells.len; ++i) {
             publish_terminal(
@@ -1962,16 +2317,19 @@ int Context::Impl::resize_pool(const PiePoolResizeDesc& resize, PieCompletion co
             }
             CUDA_CHECK(stream_status);
         }
+        const auto lease_floors = active_lease_floors();
         if (resize.pool_id == PIE_ELASTIC_POOL_KV) {
             if (resize.target_pages >
                 static_cast<std::uint64_t>(kv_cache_->num_pages())) {
                 return PIE_STATUS_INVALID_ARGUMENT;
             }
-            const int pages = static_cast<int>(resize.target_pages);
+            const int pages = lease_floors[0] == 0
+                ? std::max<int>(1, static_cast<int>(resize.target_pages))
+                : kv_cache_->num_pages();
             kv_cache_->ensure_pages(pages);
             kv_cache_->trim_pages(pages);
         } else {
-            const std::size_t bytes = static_cast<std::size_t>(
+            std::size_t bytes = static_cast<std::size_t>(
                 std::min<std::uint64_t>(
                     resize.target_pages,
                     std::numeric_limits<std::size_t>::max() /
@@ -1981,11 +2339,39 @@ int Context::Impl::resize_pool(const PiePoolResizeDesc& resize, PieCompletion co
                 resize.pool_id == PIE_ELASTIC_POOL_STATE
                     ? state_allocator_
                     : workspace_allocator_;
-            allocator->ensure_bytes(bytes);
+            const std::size_t floor_index =
+                resize.pool_id == PIE_ELASTIC_POOL_STATE ? 1 : 2;
+            if (lease_floors[floor_index] != 0) {
+                bytes = allocator->allocated_bytes();
+            }
+            std::vector<pie_cuda_driver::CudaAllocatorTarget> targets = {
+                {allocator.get(), bytes, allocator->allocated_bytes()},
+            };
+            if (resize.pool_id == PIE_ELASTIC_POOL_WORKSPACE) {
+                const std::size_t attention_bytes =
+                    lease_floors[3] == 0
+                        ? std::min(bytes, attention_allocator_->allocated_bytes())
+                        : attention_allocator_->allocated_bytes();
+                targets.push_back({
+                    attention_allocator_.get(),
+                    attention_bytes,
+                    attention_allocator_->allocated_bytes(),
+                });
+            }
+            const auto commit =
+                pie_cuda_driver::commit_cuda_arena_targets_atomically(
+                    elastic_pool_, targets);
+            if (commit.outcome !=
+                pie_cuda_driver::CudaCommitOutcome::Committed) {
+                return PIE_STATUS_DRIVER_ERROR;
+            }
             allocator->trim_bytes(bytes);
             if (resize.pool_id == PIE_ELASTIC_POOL_WORKSPACE) {
-                attention_allocator_->ensure_bytes(bytes);
-                attention_allocator_->trim_bytes(bytes);
+                const std::size_t attention_bytes =
+                    lease_floors[3] == 0
+                        ? std::min(bytes, attention_allocator_->allocated_bytes())
+                        : attention_allocator_->allocated_bytes();
+                attention_allocator_->trim_bytes(attention_bytes);
             }
         }
         enqueue_completion(executor_->cublas.stream(), completion);
@@ -2045,6 +2431,23 @@ int Context::bind_instance(const PieInstanceDesc& instance, PieInstanceBinding* 
 
 int Context::launch(const PieLaunchDesc& launch, PieCompletion completion) {
     return impl_->launch(launch, completion);
+}
+
+int Context::prepare_launch(
+    const PieLaunchDesc& launch,
+    PieLaunchPrepareResult* result) {
+    return impl_->prepare_launch(launch, result);
+}
+
+int Context::launch_prepared(
+    const PieLaunchDesc& launch,
+    std::uint64_t lease_id,
+    PieCompletion completion) {
+    return impl_->launch_prepared(launch, lease_id, completion);
+}
+
+int Context::release_launch(std::uint64_t lease_id) {
+    return impl_->release_launch(lease_id);
 }
 
 int Context::encode(const PieEncodeDesc& encode, PieCompletion completion) {

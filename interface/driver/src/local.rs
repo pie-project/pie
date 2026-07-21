@@ -18,9 +18,9 @@ use crate::geometry::GeometryClass;
 
 /// Current direct local ABI version.
 ///
-/// v11: launches carry the translated physical KV page high-water that must be
-/// committed before execution.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 11;
+/// v12: finalized launches can be prepared into a driver-owned elastic-memory
+/// lease and then launched or released exactly once.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 12;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -37,6 +37,13 @@ pub const PIE_STATUS_UNSUPPORTED: i32 = -3;
 pub const PIE_STATUS_CLOSED: i32 = -4;
 /// The driver encountered an internal failure after accepting the call.
 pub const PIE_STATUS_DRIVER_ERROR: i32 = -5;
+
+/// The finalized launch was admitted and `lease_id` is valid.
+pub const PIE_LAUNCH_PREPARE_READY: u32 = 0;
+/// The launch may fit later after physical budget is released.
+pub const PIE_LAUNCH_PREPARE_EXHAUSTED: u32 = 1;
+/// The launch can never fit within the driver's physical budget ceiling.
+pub const PIE_LAUNCH_PREPARE_IMPOSSIBLE: u32 = 2;
 
 // Literal values so cbindgen emits plain macros; the assert pins them to the
 // Rust enum.
@@ -662,6 +669,25 @@ impl Default for PieLaunchDesc {
             channel_ticket_indptr: PieU32Slice::default(),
         }
     }
+}
+
+/// Result of synchronously preparing one finalized launch.
+///
+/// `lease_id` is nonzero only for [`PIE_LAUNCH_PREPARE_READY`]. A ready lease
+/// is consumed by exactly one `*_launch_prepared` or `*_release_launch` call.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PieLaunchPrepareResult {
+    pub outcome: u32,
+    /// Reserved; must be zero.
+    pub reserved0: u32,
+    pub lease_id: u64,
+    /// Monotonic physical-budget generation observed by this attempt.
+    pub budget_generation: u64,
+    /// Independently rounded physical pages required by the finalized launch.
+    pub required_pages: u64,
+    /// Current physical budget in the same page units.
+    pub budget_pages: u64,
 }
 
 #[repr(C)]
@@ -1905,6 +1931,23 @@ pub fn validate_pool_resize_desc(desc: &PiePoolResizeDesc) -> PieAbiValidationRe
     )
 }
 
+/// Validates a driver-owned launch-prepare result.
+pub fn validate_launch_prepare_result(result: &PieLaunchPrepareResult) -> PieAbiValidationResult {
+    validate_reserved_zero(
+        "launch prepare result reserved0 must be zero",
+        result.reserved0,
+    )?;
+    if result.outcome > PIE_LAUNCH_PREPARE_IMPOSSIBLE {
+        return Err(invalid_argument("launch prepare result outcome is invalid"));
+    }
+    if (result.outcome == PIE_LAUNCH_PREPARE_READY) != (result.lease_id != 0) {
+        return Err(invalid_argument(
+            "launch prepare result lease_id does not match outcome",
+        ));
+    }
+    Ok(())
+}
+
 /// Validates non-null out-parameters used by the native driver entrypoints.
 pub fn validate_create_out_params(caps: *mut PieDriverCaps) -> PieAbiValidationResult {
     validate_mut_ptr(caps, "driver create caps output pointer must be non-null")
@@ -1940,6 +1983,18 @@ unsafe extern "C" {
         launch: *const PieLaunchDesc,
         completion: PieCompletion,
     ) -> i32;
+    pub fn pie_cuda_prepare_launch(
+        driver: *mut PieDriver,
+        launch: *const PieLaunchDesc,
+        result: *mut PieLaunchPrepareResult,
+    ) -> i32;
+    pub fn pie_cuda_launch_prepared(
+        driver: *mut PieDriver,
+        launch: *const PieLaunchDesc,
+        lease_id: u64,
+        completion: PieCompletion,
+    ) -> i32;
+    pub fn pie_cuda_release_launch(driver: *mut PieDriver, lease_id: u64) -> i32;
     pub fn pie_cuda_encode(
         driver: *mut PieDriver,
         encode: *const PieEncodeDesc,
@@ -1995,6 +2050,18 @@ unsafe extern "C" {
         launch: *const PieLaunchDesc,
         completion: PieCompletion,
     ) -> i32;
+    pub fn pie_metal_prepare_launch(
+        driver: *mut PieDriver,
+        launch: *const PieLaunchDesc,
+        result: *mut PieLaunchPrepareResult,
+    ) -> i32;
+    pub fn pie_metal_launch_prepared(
+        driver: *mut PieDriver,
+        launch: *const PieLaunchDesc,
+        lease_id: u64,
+        completion: PieCompletion,
+    ) -> i32;
+    pub fn pie_metal_release_launch(driver: *mut PieDriver, lease_id: u64) -> i32;
     pub fn pie_metal_encode(
         driver: *mut PieDriver,
         encode: *const PieEncodeDesc,

@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use crate::driver::{
     BoundInstance, ChannelRegistrationPlan, DriverBackend, DriverId, InstanceBindingPlan,
-    PoolResizePlan, ProgramRegistration, RegisteredChannel, SchedulerLimits, StateCopyPlan,
-    SubmissionCompletion, WorkItemAttemptOutcome, WorkItemCompletion,
+    LaunchLease, LaunchPrepareOutcome, PoolResizePlan, ProgramRegistration, RegisteredChannel,
+    SchedulerLimits, StateCopyPlan, SubmissionCompletion, WorkItemAttemptOutcome,
+    WorkItemCompletion,
 };
 use crate::scheduler::ProcessId;
 use anyhow::{Result, anyhow};
@@ -224,6 +225,26 @@ impl PendingRequest {
             && self.request.rs_fold_lens.is_empty()
     }
 
+    fn clone_for_batch(&self) -> Self {
+        Self {
+            logical_fire_id: self.logical_fire_id,
+            request: self.request.clone(),
+            instance_id: self.instance_id,
+            completion: self.completion.clone(),
+            last_page_len: self.last_page_len,
+            pipeline_id: self.pipeline_id,
+            prebuilt: self.prebuilt,
+            retry_count: self.retry_count,
+            retry_after: self.retry_after,
+            prelaunch_copy: self.prelaunch_copy.clone(),
+            prelaunch_state_copy: self.prelaunch_state_copy.clone(),
+            retry_classifier: None,
+            credit_published: self.credit_published,
+            quorum_generation: self.quorum_generation,
+            timing: self.timing,
+        }
+    }
+
     pub(crate) fn wire_row_count(&self) -> usize {
         self.request.qo_indptr.len().saturating_sub(1)
     }
@@ -338,6 +359,7 @@ impl LaunchGrouping {
 
 struct LaunchBatchPreview {
     count: usize,
+    logical_fire_ids: Vec<u64>,
     pipelines: HashSet<ProcessId>,
     /// Pipelines whose queued fires the COMPOSER deferred to the next wave
     /// (driver capacity or same-instance dedup). They
@@ -546,13 +568,19 @@ enum LaneRequest {
     Launch {
         token: u64,
         submission: LaneLaunch,
+        lease: Option<LaunchLease>,
+    },
+    Prepare {
+        submission: LaneLaunch,
+        response: crossbeam::channel::Sender<std::result::Result<LaunchPrepareOutcome, String>>,
+    },
+    Release {
+        lease: LaunchLease,
+        response: crossbeam::channel::Sender<std::result::Result<(), String>>,
     },
     /// A control `QueuedItem` (never `Launch`/`Prepare`): the lane runs the
     /// driver half of the old `dispatch_ordered_item` arm.
-    Control {
-        token: u64,
-        item: QueuedItem,
-    },
+    Control { token: u64, item: QueuedItem },
     /// Drain marker: the lane replies with the driver and its channel set so
     /// the worker can run shutdown teardown with everything already quiesced.
     Shutdown {
@@ -625,6 +653,7 @@ struct DriverLane {
     launch_tx: crossbeam::channel::Sender<LaneRequest>,
     control_tx: crossbeam::channel::Sender<LaneRequest>,
     thread: Option<std::thread::JoinHandle<()>>,
+    admission_supported: bool,
 }
 
 impl DriverLane {
@@ -634,6 +663,9 @@ impl DriverLane {
         reply_tx: crossbeam::channel::Sender<SchedulerItem>,
         stats: Arc<SchedulerStats>,
     ) -> Self {
+        let admission_supported = driver
+            .as_ref()
+            .is_some_and(DriverBackend::supports_elastic_admission);
         let (launch_tx, launch_rx) = crossbeam::channel::unbounded::<LaneRequest>();
         let (control_tx, control_rx) = crossbeam::channel::unbounded::<LaneRequest>();
         let thread = std::thread::Builder::new()
@@ -644,6 +676,7 @@ impl DriverLane {
             launch_tx,
             control_tx,
             thread: Some(thread),
+            admission_supported,
         }
     }
 
@@ -651,11 +684,35 @@ impl DriverLane {
         // The lane outlives every poster (shutdown joins it last); a send
         // failure means the lane thread panicked, which the join reports.
         let _ = match &request {
-            LaneRequest::Launch { .. } => self.launch_tx.send(request),
+            LaneRequest::Launch { .. }
+            | LaneRequest::Prepare { .. }
+            | LaneRequest::Release { .. } => self.launch_tx.send(request),
             LaneRequest::Control { .. } | LaneRequest::Shutdown { .. } => {
                 self.control_tx.send(request)
             }
         };
+    }
+
+    fn prepare(
+        &self,
+        submission: crate::driver::LaunchSubmission,
+    ) -> std::result::Result<LaunchPrepareOutcome, String> {
+        let (response, receiver) = crossbeam::channel::bounded(1);
+        self.post(LaneRequest::Prepare {
+            submission: LaneLaunch(submission),
+            response,
+        });
+        receiver
+            .recv()
+            .unwrap_or_else(|_| Err("driver lane closed during launch preparation".to_string()))
+    }
+
+    fn release(&self, lease: LaunchLease) -> std::result::Result<(), String> {
+        let (response, receiver) = crossbeam::channel::bounded(1);
+        self.post(LaneRequest::Release { lease, response });
+        receiver
+            .recv()
+            .unwrap_or_else(|_| Err("driver lane closed during lease release".to_string()))
     }
 
     /// Drain both queues and take the driver + channel set back for
@@ -738,14 +795,23 @@ impl DriverLane {
         let mut channels: HashSet<u64> = HashSet::new();
         while let Ok(request) = Self::next_request(&launch_rx, &control_rx) {
             match request {
-                LaneRequest::Launch { token, submission } => {
+                LaneRequest::Launch {
+                    token,
+                    submission,
+                    lease,
+                } => {
                     let LaneLaunch(submission) = submission;
                     let timing_enabled = super::fire_timing_enabled();
                     let driver_started_us = timing_enabled.then(super::fire_timing_now_us);
                     let result = match driver.as_mut() {
                         Some(driver) => crate::probe_fire!(
                             stats.fire.execute.driver_fire_us,
-                            driver.launch(&submission)
+                            match lease {
+                                Some(lease) => {
+                                    driver.launch_prepared(&submission, lease)
+                                }
+                                None => driver.launch(&submission),
+                            }
                         )
                         .map_err(|err| format!("{err:#}")),
                         None => Err("driver has no backend installed".to_string()),
@@ -757,6 +823,32 @@ impl DriverLane {
                         driver_started_us,
                         launch_returned_us,
                     }));
+                }
+                LaneRequest::Prepare {
+                    submission,
+                    response,
+                } => {
+                    let LaneLaunch(submission) = submission;
+                    let result = driver
+                        .as_mut()
+                        .ok_or_else(|| "driver has no backend installed".to_string())
+                        .and_then(|driver| {
+                            driver
+                                .prepare_launch(&submission)
+                                .map_err(|error| format!("{error:#}"))
+                        });
+                    let _ = response.send(result);
+                }
+                LaneRequest::Release { lease, response } => {
+                    let result = driver
+                        .as_mut()
+                        .ok_or_else(|| "driver has no backend installed".to_string())
+                        .and_then(|driver| {
+                            driver
+                                .release_launch(lease)
+                                .map_err(|error| format!("{error:#}"))
+                        });
+                    let _ = response.send(result);
                 }
                 LaneRequest::Control { token, item } => {
                     let control_timing = super::fire_timing_full().then(|| {
@@ -1871,6 +1963,7 @@ impl BatchScheduler {
         let mut departed_pipelines: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = None;
+        let mut admission_retry_at = None;
         let mut stopping = false;
         // The wait-for-all-active-pipelines fire rule (overview §7.2): one
         // instance per driver thread, mirroring `instances`/`channels` above.
@@ -1951,6 +2044,7 @@ impl BatchScheduler {
                 &mut pending,
                 &mut in_flight_launches,
                 &mut in_flight_control,
+                &mut admission_retry_at,
                 page_size,
                 limits,
                 &stats,
@@ -2630,6 +2724,29 @@ impl BatchScheduler {
         true
     }
 
+    fn rotate_launch_for_admission_work(pending: &mut VecDeque<QueuedItem>) -> bool {
+        if Self::rotate_launch_for_wave_work(pending, true) {
+            return true;
+        }
+        if !matches!(pending.front(), Some(QueuedItem::Launch(_))) {
+            return false;
+        }
+        if !matches!(
+            pending
+                .iter()
+                .skip(1)
+                .find(|item| { !matches!(item, QueuedItem::Launch(_)) }),
+            Some(QueuedItem::ResizePool { .. })
+        ) {
+            return false;
+        }
+        while matches!(pending.front(), Some(QueuedItem::Launch(_))) {
+            let launch = pending.pop_front().expect("launch front");
+            pending.push_back(launch);
+        }
+        true
+    }
+
     fn launch_has_earlier_instance_member(
         pending: &VecDeque<QueuedItem>,
         request: &PendingRequest,
@@ -2697,6 +2814,7 @@ impl BatchScheduler {
         let mut pipelines = HashSet::new();
         let mut deferred: HashSet<ProcessId> = HashSet::new();
         let mut structurally_full = false;
+        let mut logical_fire_ids = Vec::new();
         let mut barrier_pipelines: HashSet<ProcessId> = HashSet::new();
         let order_floor = Self::pipeline_order_floor(pending);
         for item in pending.iter() {
@@ -2777,6 +2895,7 @@ impl BatchScheduler {
                 break;
             }
             let stop = grouping.push(next, limits, page_size);
+            logical_fire_ids.push(next.logical_fire_id);
             if let Some(pid) = next.pipeline_id {
                 pipelines.insert(pid);
             }
@@ -2814,11 +2933,66 @@ impl BatchScheduler {
         submitted.extend(pipelines.iter().copied());
         LaunchBatchPreview {
             count: grouping.count,
+            logical_fire_ids,
             pipelines,
             deferred,
             submitted,
             structurally_full,
         }
+    }
+
+    fn candidate_submission(
+        pending: &VecDeque<QueuedItem>,
+        logical_fire_ids: &[u64],
+        page_size: u32,
+    ) -> Option<crate::driver::LaunchSubmission> {
+        let mut requests = Vec::with_capacity(logical_fire_ids.len());
+        let mut next = 0usize;
+        for item in pending {
+            let QueuedItem::Launch(request) = item else {
+                continue;
+            };
+            if logical_fire_ids.get(next) == Some(&request.logical_fire_id) {
+                requests.push(request.clone_for_batch());
+                next += 1;
+                if next == logical_fire_ids.len() {
+                    break;
+                }
+            }
+        }
+        if requests.is_empty() || next != logical_fire_ids.len() {
+            return None;
+        }
+        let proposal_stats = SchedulerStats::default();
+        Some(batch::build_batch_request(
+            &requests,
+            page_size,
+            &proposal_stats,
+        ))
+    }
+
+    fn reject_launch_candidates(
+        pending: &mut VecDeque<QueuedItem>,
+        logical_fire_ids: &[u64],
+        policy: &mut quorum::WaitAllPolicy,
+        message: &str,
+    ) -> usize {
+        let ids: HashSet<u64> = logical_fire_ids.iter().copied().collect();
+        let mut kept = VecDeque::with_capacity(pending.len());
+        let mut rejected = 0usize;
+        while let Some(item) = pending.pop_front() {
+            match item {
+                QueuedItem::Launch(request) if ids.contains(&request.logical_fire_id) => {
+                    Self::drop_request_credit(policy, &request);
+                    Self::resolve_stream_fire(policy, &request);
+                    request.completion.reject_unsubmitted(message.to_string());
+                    rejected += 1;
+                }
+                item => kept.push_back(item),
+            }
+        }
+        *pending = kept;
+        rejected
     }
 
     fn dispatch_ready_items(
@@ -2829,6 +3003,7 @@ impl BatchScheduler {
         pending: &mut VecDeque<QueuedItem>,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut Option<PendingControl>,
+        admission_retry_at: &mut Option<Instant>,
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
@@ -2836,7 +3011,7 @@ impl BatchScheduler {
         stopping: bool,
     ) -> (bool, Option<Duration>) {
         let mut progress = false;
-        let mut wait_hint = None;
+        let mut wait_hint: Option<Duration> = None;
         // Busy-close rotations this pass: bounded so a queue of nothing but
         // busy closes breaks out instead of spinning.
         let mut close_rotations = 0usize;
@@ -2873,23 +3048,69 @@ impl BatchScheduler {
                     }
                     let candidate = Self::peek_launch_batch(pending, instances, limits, page_size);
                     let mut decision_us = 0u64;
-                    let mut decision_active = policy.active_pipelines();
                     let mut decision_missing = 0usize;
                     let decision_candidate_count = candidate.count;
                     let decision_deferred = candidate.deferred.len();
                     let decision_depth_capped = policy.depth_capped_pipelines();
+                    let decision_now = Instant::now();
+                    let mut prepared_lease = None;
+                    if driver_lane.admission_supported
+                        && admission_retry_at.is_some_and(|due| due > decision_now)
+                    {
+                        let hold = admission_retry_at
+                            .expect("admission retry deadline is present")
+                            .saturating_duration_since(decision_now);
+                        wait_hint = Some(wait_hint.map_or(hold, |old| old.min(hold)));
+                        if Self::rotate_launch_for_admission_work(pending) {
+                            progress = true;
+                            continue;
+                        }
+                        break;
+                    }
                     if !stopping {
                         let decision_started_us =
                             super::ledger_timing_enabled().then(super::fire_timing_now_us);
-                        match policy.decide_candidate_wave_at(
-                            candidate.count,
-                            &candidate.pipelines,
-                            &candidate.deferred,
-                            &candidate.submitted,
-                            candidate.structurally_full,
-                            Instant::now(),
-                        ) {
+                        let decision = if driver_lane.admission_supported {
+                            policy.preview_candidate_wave_at(
+                                candidate.count,
+                                &candidate.pipelines,
+                                &candidate.deferred,
+                                &candidate.submitted,
+                                candidate.structurally_full,
+                                decision_now,
+                            )
+                        } else {
+                            policy.decide_candidate_wave_at(
+                                candidate.count,
+                                &candidate.pipelines,
+                                &candidate.deferred,
+                                &candidate.submitted,
+                                candidate.structurally_full,
+                                decision_now,
+                            )
+                        };
+                        if let Some(started_us) = decision_started_us {
+                            decision_us = super::fire_timing_now_us().saturating_sub(started_us);
+                        }
+                        match decision {
                             quorum::WaveDecision::Wait(hold) => {
+                                let hold = if driver_lane.admission_supported {
+                                    match policy.decide_candidate_wave_at(
+                                        candidate.count,
+                                        &candidate.pipelines,
+                                        &candidate.deferred,
+                                        &candidate.submitted,
+                                        candidate.structurally_full,
+                                        decision_now,
+                                    ) {
+                                        quorum::WaveDecision::Wait(committed) => committed,
+                                        quorum::WaveDecision::Fire { .. } => {
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    hold
+                                };
                                 wait_hint = Some(hold);
                                 // A holding wave yields the thread to any
                                 // dispatchable control regardless of pipe
@@ -2904,15 +3125,124 @@ impl BatchScheduler {
                                 break;
                             }
                             quorum::WaveDecision::Fire { missing } => {
-                                decision_active = policy.active_pipelines();
                                 decision_missing = missing.len();
-                                if let Some(started_us) = decision_started_us {
-                                    decision_us =
-                                        super::fire_timing_now_us().saturating_sub(started_us);
-                                }
                             }
                         }
                     }
+                    if driver_lane.admission_supported && !candidate.logical_fire_ids.is_empty() {
+                        let Some(submission) = Self::candidate_submission(
+                            pending,
+                            &candidate.logical_fire_ids,
+                            page_size,
+                        ) else {
+                            progress |= Self::reject_launch_candidates(
+                                pending,
+                                &candidate.logical_fire_ids,
+                                policy,
+                                "launch admission proposal became inconsistent",
+                            ) != 0;
+                            continue;
+                        };
+                        match driver_lane.prepare(submission) {
+                            Ok(LaunchPrepareOutcome::Prepared(lease)) => {
+                                prepared_lease = Some(lease);
+                                *admission_retry_at = None;
+                                if !stopping {
+                                    match policy.decide_candidate_wave_at(
+                                        candidate.count,
+                                        &candidate.pipelines,
+                                        &candidate.deferred,
+                                        &candidate.submitted,
+                                        candidate.structurally_full,
+                                        decision_now,
+                                    ) {
+                                        quorum::WaveDecision::Fire { missing } => {
+                                            decision_missing = missing.len();
+                                        }
+                                        quorum::WaveDecision::Wait(hold) => {
+                                            let _ = driver_lane.release(lease);
+                                            wait_hint = Some(hold);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(LaunchPrepareOutcome::Exhausted {
+                                budget_generation,
+                                required_pages,
+                                budget_pages,
+                            }) => {
+                                if stopping {
+                                    progress |= Self::reject_launch_candidates(
+                                        pending,
+                                        &candidate.logical_fire_ids,
+                                        policy,
+                                        "scheduler shutdown interrupted launch admission",
+                                    ) != 0;
+                                    continue;
+                                }
+                                let _ = (budget_generation, required_pages, budget_pages);
+                                const RETRY: Duration = Duration::from_millis(1);
+                                *admission_retry_at = Some(Instant::now() + RETRY);
+                                wait_hint = Some(RETRY);
+                                if Self::rotate_launch_for_admission_work(pending) {
+                                    progress = true;
+                                    continue;
+                                }
+                                break;
+                            }
+                            Ok(LaunchPrepareOutcome::Impossible {
+                                required_pages,
+                                budget_pages,
+                            }) => {
+                                *admission_retry_at = None;
+                                let message = format!(
+                                    "launch requires {required_pages} physical pages, \
+                                     exceeding driver ceiling {budget_pages}"
+                                );
+                                progress |= Self::reject_launch_candidates(
+                                    pending,
+                                    &candidate.logical_fire_ids,
+                                    policy,
+                                    &message,
+                                ) != 0;
+                                continue;
+                            }
+                            Ok(LaunchPrepareOutcome::Unsupported) => {
+                                if !stopping {
+                                    match policy.decide_candidate_wave_at(
+                                        candidate.count,
+                                        &candidate.pipelines,
+                                        &candidate.deferred,
+                                        &candidate.submitted,
+                                        candidate.structurally_full,
+                                        decision_now,
+                                    ) {
+                                        quorum::WaveDecision::Fire { missing } => {
+                                            decision_missing = missing.len();
+                                        }
+                                        quorum::WaveDecision::Wait(hold) => {
+                                            wait_hint = Some(hold);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                *admission_retry_at = None;
+                                progress |= Self::reject_launch_candidates(
+                                    pending,
+                                    &candidate.logical_fire_ids,
+                                    policy,
+                                    &format!("launch preparation failed: {error}"),
+                                ) != 0;
+                                continue;
+                            }
+                        }
+                    }
+                    let decision_active = policy.active_pipelines();
+                    let prepared_fire_ids =
+                        prepared_lease.map(|_| candidate.logical_fire_ids.clone());
                     let before = in_flight_launches.len();
                     let dispatched = crate::probe_fire!(
                         stats.fire.execute.total_us,
@@ -2933,6 +3263,8 @@ impl BatchScheduler {
                             decision_candidate_count,
                             decision_deferred,
                             decision_depth_capped,
+                            prepared_lease,
+                            prepared_fire_ids,
                         )
                     );
                     // Only a batch that actually reached `in_flight_launches`
@@ -3318,6 +3650,8 @@ impl BatchScheduler {
         candidate_count: usize,
         deferred_pipelines: usize,
         depth_capped_pipelines: usize,
+        prepared_lease: Option<LaunchLease>,
+        prepared_fire_ids: Option<Vec<u64>>,
     ) -> bool {
         let mut batch = BatchAccumulator::new(limits, page_size);
         let mut grouping = LaunchGrouping::default();
@@ -3325,6 +3659,7 @@ impl BatchScheduler {
         let mut blocked_pipelines = HashSet::new();
         let mut rejected_stale = false;
         let mut barrier_pipelines: HashSet<ProcessId> = HashSet::new();
+        let mut selected_count = 0usize;
         let order_floor = Self::pipeline_order_floor(pending);
         loop {
             // Gather past items that do not order against queued launches:
@@ -3351,6 +3686,15 @@ impl BatchScheduler {
             let Some(QueuedItem::Launch(next)) = pending.front() else {
                 unreachable!();
             };
+            if prepared_fire_ids
+                .as_ref()
+                .is_some_and(|expected| selected_count >= expected.len())
+            {
+                break;
+            }
+            let prepared_member = prepared_fire_ids
+                .as_ref()
+                .is_some_and(|expected| expected.contains(&next.logical_fire_id));
             if next
                 .pipeline_id
                 .is_some_and(|pid| barrier_pipelines.contains(&pid))
@@ -3358,7 +3702,7 @@ impl BatchScheduler {
                 deferred.push_back(pending.pop_front().expect("barriered launch front"));
                 continue;
             }
-            if next.completion.is_settled() {
+            if !prepared_member && next.completion.is_settled() {
                 let Some(QueuedItem::Launch(dropped)) = pending.pop_front() else {
                     unreachable!();
                 };
@@ -3366,7 +3710,7 @@ impl BatchScheduler {
                 rejected_stale = true;
                 continue;
             }
-            if next.completion.cancel_requested() {
+            if !prepared_member && next.completion.cancel_requested() {
                 let Some(QueuedItem::Launch(cancelled)) = pending.pop_front() else {
                     unreachable!();
                 };
@@ -3428,11 +3772,17 @@ impl BatchScheduler {
                 }
                 break;
             }
+            if let Some(expected) = prepared_fire_ids.as_ref()
+                && expected.get(selected_count) != Some(&next.logical_fire_id)
+            {
+                break;
+            }
             let QueuedItem::Launch(next) = pending.pop_front().expect("launch front") else {
                 unreachable!();
             };
             let stop = grouping.push(&next, limits, page_size);
             batch.push(next);
+            selected_count += 1;
             if stop {
                 break;
             }
@@ -3442,7 +3792,25 @@ impl BatchScheduler {
         }
         let mut requests = batch.take();
         if requests.is_empty() {
+            if let Some(lease) = prepared_lease {
+                let _ = driver_lane.release(lease);
+            }
             return rejected_stale;
+        }
+        if let Some(expected) = prepared_fire_ids.as_ref() {
+            let actual = requests
+                .iter()
+                .map(|request| request.logical_fire_id)
+                .collect::<Vec<_>>();
+            if &actual != expected {
+                for request in requests.into_iter().rev() {
+                    pending.push_front(QueuedItem::Launch(request));
+                }
+                if let Some(lease) = prepared_lease {
+                    let _ = driver_lane.release(lease);
+                }
+                return true;
+            }
         }
         let timing_enabled = super::fire_timing_enabled();
         let dispatch_started_us = timing_enabled.then(super::fire_timing_now_us);
@@ -3470,6 +3838,9 @@ impl BatchScheduler {
                     Self::drop_request_credit(policy, request);
                     let message = format!("instance {} is unknown or stale", request.instance_id);
                     request.completion.reject_unsubmitted(message.clone());
+                }
+                if let Some(lease) = prepared_lease {
+                    let _ = driver_lane.release(lease);
                 }
                 return true;
             }
@@ -3524,6 +3895,7 @@ impl BatchScheduler {
         driver_lane.post(LaneRequest::Launch {
             token,
             submission: LaneLaunch(submission),
+            lease: prepared_lease,
         });
         true
     }
@@ -4927,6 +5299,110 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn exhausted_admission_preserves_wave_books_and_wakes_later() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                elastic_admission: true,
+                prepare_exhaustions_remaining: 1,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let stats = Arc::clone(scheduler.stats());
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_prebuilt_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            0,
+            completion.clone(),
+        )?;
+        timeout(Duration::from_secs(5), completion.clone()).await??;
+
+        let log = operation_log.lock().unwrap().clone();
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.as_str() == "prepare_launch-exhausted")
+                .count(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.as_str() == "prepare_launch-ready")
+                .count(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.as_str() == "launch_prepared")
+                .count(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(stats.total_batches.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats.fire.quorum.wave_fires.load(Ordering::Relaxed),
+            1,
+            "the denied proposal must not count as a wave"
+        );
+        assert_eq!(
+            completion.target_epoch(),
+            pie_waker::FIRST_COMPLETION_EPOCH,
+            "physical exhaustion is not an ordinary driver RETRY"
+        );
+        crate::scheduler::close_instance(&bound)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn impossible_admission_fails_without_parking() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                elastic_admission: true,
+                prepare_impossible_above_kv_pages: 1,
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+        let stats = Arc::clone(scheduler.stats());
+        let mut launch = dummy_launch();
+        launch.required_kv_pages = 2;
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_prebuilt_async(
+            launch,
+            driver_id,
+            bound.instance_id,
+            0,
+            completion.clone(),
+        )?;
+        let error = timeout(Duration::from_secs(1), completion)
+            .await?
+            .expect_err("impossible demand must fail explicitly");
+        assert!(error.to_string().contains("exceeding driver ceiling"));
+        let log = operation_log.lock().unwrap().clone();
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.as_str() == "prepare_launch-impossible")
+                .count(),
+            1,
+            "{log:?}"
+        );
+        assert!(!log.iter().any(|entry| entry == "launch_prepared"));
+        assert_eq!(stats.total_batches.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stats.fire.quorum.wave_fires.load(Ordering::Relaxed),
+            0,
+            "an impossible proposal never commits wave statistics"
+        );
+        crate::scheduler::close_instance(&bound)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn rs_carrying_fire_is_retry_ineligible() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound, _endpoints) =
@@ -5681,6 +6157,7 @@ mod tests {
         let mut instances = HashMap::new();
         let mut in_flight_launches = VecDeque::new();
         let mut in_flight_control = None;
+        let mut admission_retry_at = None;
         let limits = SchedulerLimits {
             max_forward_requests: 64,
             max_forward_tokens: 64,
@@ -5697,6 +6174,7 @@ mod tests {
             &mut pending,
             &mut in_flight_launches,
             &mut in_flight_control,
+            &mut admission_retry_at,
             16,
             limits,
             &stats,
@@ -6754,6 +7232,8 @@ mod tests {
             1,
             0,
             0,
+            None,
+            None,
         ));
 
         assert!(pending.is_empty());

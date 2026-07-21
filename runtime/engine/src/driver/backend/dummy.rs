@@ -12,6 +12,7 @@ use crate::driver::command::{
 use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
 use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
 use crate::driver::submission::LaunchSubmission;
+use crate::driver::{LaunchLease, LaunchPrepareOutcome};
 
 pub struct DummyDriver {
     inner: pie_driver_dummy_lib::DummyDriver,
@@ -39,6 +40,10 @@ impl DummyDriver {
 
     pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
         self.inner.export_kv_handle()
+    }
+
+    pub fn supports_elastic_admission(&self) -> bool {
+        self.inner.supports_elastic_admission()
     }
 
     pub fn load_model(
@@ -89,6 +94,45 @@ impl DummyDriver {
         let borrowed = LaunchDescBorrow::from_submission(desc);
         self.inner.launch(borrowed.as_raw(), raw)?;
         Ok(completion)
+    }
+
+    pub fn prepare_launch(&mut self, desc: &LaunchSubmission) -> Result<LaunchPrepareOutcome> {
+        let borrowed = LaunchDescBorrow::from_submission(desc);
+        let result = self.inner.prepare_launch(borrowed.as_raw())?;
+        pie_driver_abi::validate_launch_prepare_result(&result).map_err(|error| anyhow!(error))?;
+        match result.outcome {
+            pie_driver_abi::PIE_LAUNCH_PREPARE_READY => {
+                Ok(LaunchPrepareOutcome::Prepared(LaunchLease {
+                    id: result.lease_id,
+                }))
+            }
+            pie_driver_abi::PIE_LAUNCH_PREPARE_EXHAUSTED => Ok(LaunchPrepareOutcome::Exhausted {
+                budget_generation: result.budget_generation,
+                required_pages: result.required_pages,
+                budget_pages: result.budget_pages,
+            }),
+            pie_driver_abi::PIE_LAUNCH_PREPARE_IMPOSSIBLE => Ok(LaunchPrepareOutcome::Impossible {
+                required_pages: result.required_pages,
+                budget_pages: result.budget_pages,
+            }),
+            _ => unreachable!("prepare result validator checked outcome"),
+        }
+    }
+
+    pub fn launch_prepared(
+        &mut self,
+        desc: &LaunchSubmission,
+        lease: LaunchLease,
+    ) -> Result<SubmissionCompletion> {
+        let (raw, completion) = self.broker.launch_completion(1);
+        let borrowed = LaunchDescBorrow::from_submission(desc);
+        self.inner
+            .launch_prepared(borrowed.as_raw(), lease.id, raw)?;
+        Ok(completion)
+    }
+
+    pub fn release_launch(&mut self, lease: LaunchLease) -> Result<()> {
+        self.inner.release_launch(lease.id)
     }
 
     pub fn encode(&mut self, plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {

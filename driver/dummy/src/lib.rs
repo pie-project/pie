@@ -10,14 +10,15 @@ use anyhow::{Result, anyhow, bail, ensure};
 use pie_driver_abi::{
     DeviceFacts, DriverCapabilities, ModelLoadDesc, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL,
     PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
-    PIE_GEOMETRY_CLASS_DECODE_ENVELOPE, PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY, PIE_GEOMETRY_CLASS_HOST, PIE_TERMINAL_OUTCOME_FAILED,
-    PIE_TERMINAL_OUTCOME_RETRY, PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieChannelDesc,
-    PieChannelEndpointBinding, PieChannelValueDescSlice, PieCompletion, PieEncodeDesc,
-    PieInstanceBinding, PieInstanceDesc, PieKvCopyDesc, PieLaunchDesc, PiePoolResizeDesc,
-    PieProgramDesc, PieRuntimeCallbacks, PieStateCopyDesc, PieTerminalCell,
-    PieTerminalCellPtrSlice, PieU32Slice, PieU64Slice, validate_channel_desc, validate_completion,
-    validate_encode_desc, validate_instance_desc, validate_kv_copy_desc, validate_launch_desc,
-    validate_pool_resize_desc, validate_program_desc, validate_state_copy_desc,
+    PIE_GEOMETRY_CLASS_DECODE_ENVELOPE, PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY,
+    PIE_GEOMETRY_CLASS_HOST, PIE_TERMINAL_OUTCOME_FAILED, PIE_TERMINAL_OUTCOME_RETRY,
+    PIE_TERMINAL_OUTCOME_SUCCESS, PieBytes, PieChannelDesc, PieChannelEndpointBinding,
+    PieChannelValueDescSlice, PieCompletion, PieEncodeDesc, PieInstanceBinding, PieInstanceDesc,
+    PieKvCopyDesc, PieLaunchDesc, PieLaunchPrepareResult, PiePoolResizeDesc, PieProgramDesc,
+    PieRuntimeCallbacks, PieStateCopyDesc, PieTerminalCell, PieTerminalCellPtrSlice, PieU32Slice,
+    PieU64Slice, validate_channel_desc, validate_completion, validate_encode_desc,
+    validate_instance_desc, validate_kv_copy_desc, validate_launch_desc, validate_pool_resize_desc,
+    validate_program_desc, validate_state_copy_desc,
 };
 use pie_ptir::container::{self, ExternDir, HostRole};
 use pie_ptir::interp::{
@@ -78,6 +79,11 @@ pub struct DummyDriverOptions {
     pub reject_launches_remaining: u32,
     pub fail_launches_after_accept: bool,
     pub retry_launches_remaining: u32,
+    pub elastic_admission: bool,
+    /// Deterministically return elastic exhaustion for this many preparations.
+    pub prepare_exhaustions_remaining: u32,
+    /// Nonzero hard KV high-water ceiling used by deterministic prepare tests.
+    pub prepare_impossible_above_kv_pages: u32,
     pub operation_log: Option<Arc<Mutex<Vec<String>>>>,
     pub launch_observer: Option<LaunchObserver>,
 }
@@ -104,6 +110,9 @@ impl Default for DummyDriverOptions {
             reject_launches_remaining: 0,
             fail_launches_after_accept: false,
             retry_launches_remaining: 0,
+            elastic_admission: false,
+            prepare_exhaustions_remaining: 0,
+            prepare_impossible_above_kv_pages: 0,
             operation_log: None,
             launch_observer: None,
         }
@@ -234,12 +243,26 @@ pub struct DummyDriver {
     reject_launches_remaining: u32,
     fail_launches_after_accept: bool,
     retry_launches_remaining: u32,
+    elastic_admission: bool,
+    prepare_exhaustions_remaining: u32,
+    prepare_impossible_above_kv_pages: u32,
+    next_launch_lease_id: u64,
+    launch_leases: HashMap<u64, DummyLaunchLease>,
+    prepare_generation: u64,
     callback_delay_ms: u64,
     runtime: SendableRuntimeCallbacks,
     callback_workers: Vec<std::thread::JoinHandle<()>>,
     operation_log: Option<Arc<Mutex<Vec<String>>>>,
     launch_observer: Option<LaunchObserver>,
     kv_export: DummyKvExport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DummyLaunchLease {
+    instance_ids: Vec<u64>,
+    logical_fire_ids: Vec<u64>,
+    token_ids: Vec<u32>,
+    required_kv_pages: u32,
 }
 
 impl DummyDriver {
@@ -315,6 +338,12 @@ impl DummyDriver {
             reject_launches_remaining: options.reject_launches_remaining,
             fail_launches_after_accept: options.fail_launches_after_accept,
             retry_launches_remaining: options.retry_launches_remaining,
+            elastic_admission: options.elastic_admission,
+            prepare_exhaustions_remaining: options.prepare_exhaustions_remaining,
+            prepare_impossible_above_kv_pages: options.prepare_impossible_above_kv_pages,
+            next_launch_lease_id: 1,
+            launch_leases: HashMap::new(),
+            prepare_generation: 1,
             callback_delay_ms: options.callback_delay_ms,
             runtime,
             callback_workers: Vec::new(),
@@ -326,6 +355,10 @@ impl DummyDriver {
 
     pub fn export_kv_handle(&self) -> Option<pie_driver_abi::KvHandle> {
         pie_driver_abi::KvExport::export_kv_handle(&self.kv_export)
+    }
+
+    pub fn supports_elastic_admission(&self) -> bool {
+        self.elastic_admission
     }
 
     fn record_op(&self, name: &str) {
@@ -707,6 +740,114 @@ impl DummyDriver {
         };
         state.instances.insert(instance_id, instance);
         Ok(binding)
+    }
+
+    fn launch_lease_signature(&self, desc: &PieLaunchDesc) -> Result<DummyLaunchLease> {
+        let required_kv_pages = copy_u32_slice(desc.kv_page_indices, "launch.kv_page_indices")?
+            .into_iter()
+            .chain(copy_u32_slice(
+                desc.kv_translation,
+                "launch.kv_translation",
+            )?)
+            .map(|page| page.saturating_add(1))
+            .fold(desc.required_kv_pages, u32::max);
+        Ok(DummyLaunchLease {
+            instance_ids: copy_u64_slice(desc.instance_ids, "launch.instance_ids")?,
+            logical_fire_ids: copy_u64_slice(desc.logical_fire_ids, "launch.logical_fire_ids")?,
+            token_ids: copy_u32_slice(desc.token_ids, "launch.token_ids")?,
+            required_kv_pages,
+        })
+    }
+
+    pub fn prepare_launch(&mut self, desc: &PieLaunchDesc) -> Result<PieLaunchPrepareResult> {
+        unsafe { validate_launch_desc(desc) }.map_err(|err| anyhow!(err))?;
+        ensure_abi(desc.abi_version)?;
+        let signature = self.launch_lease_signature(desc)?;
+        ensure!(
+            !signature.instance_ids.is_empty(),
+            "launch preparation requires at least one bound instance"
+        );
+        {
+            let state = self.state.lock().unwrap();
+            ensure!(
+                signature
+                    .instance_ids
+                    .iter()
+                    .all(|instance_id| state.instances.contains_key(instance_id)),
+                "launch preparation contains an unknown instance"
+            );
+        }
+        let budget_pages = u64::from(if self.prepare_impossible_above_kv_pages == 0 {
+            self.capabilities.total_pages
+        } else {
+            self.prepare_impossible_above_kv_pages
+        });
+        let required_pages = u64::from(signature.required_kv_pages);
+        if self.prepare_impossible_above_kv_pages != 0
+            && signature.required_kv_pages > self.prepare_impossible_above_kv_pages
+        {
+            self.record_op("prepare_launch-impossible");
+            return Ok(PieLaunchPrepareResult {
+                outcome: pie_driver_abi::PIE_LAUNCH_PREPARE_IMPOSSIBLE,
+                budget_generation: self.prepare_generation,
+                required_pages,
+                budget_pages,
+                ..PieLaunchPrepareResult::default()
+            });
+        }
+        if self.prepare_exhaustions_remaining != 0 {
+            self.prepare_exhaustions_remaining -= 1;
+            self.prepare_generation = self.prepare_generation.saturating_add(1);
+            self.record_op("prepare_launch-exhausted");
+            return Ok(PieLaunchPrepareResult {
+                outcome: pie_driver_abi::PIE_LAUNCH_PREPARE_EXHAUSTED,
+                budget_generation: self.prepare_generation,
+                required_pages,
+                budget_pages,
+                ..PieLaunchPrepareResult::default()
+            });
+        }
+        let lease_id = self.next_launch_lease_id;
+        ensure!(lease_id != 0, "dummy launch lease id space exhausted");
+        self.next_launch_lease_id = self
+            .next_launch_lease_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("dummy launch lease id space exhausted"))?;
+        self.launch_leases.insert(lease_id, signature);
+        self.record_op("prepare_launch-ready");
+        Ok(PieLaunchPrepareResult {
+            outcome: pie_driver_abi::PIE_LAUNCH_PREPARE_READY,
+            lease_id,
+            budget_generation: self.prepare_generation,
+            required_pages,
+            budget_pages,
+            ..PieLaunchPrepareResult::default()
+        })
+    }
+
+    pub fn launch_prepared(
+        &mut self,
+        desc: &PieLaunchDesc,
+        lease_id: u64,
+        completion: PieCompletion,
+    ) -> Result<()> {
+        let expected = self
+            .launch_leases
+            .remove(&lease_id)
+            .ok_or_else(|| anyhow!("unknown or consumed launch lease {lease_id}"))?;
+        let actual = self.launch_lease_signature(desc)?;
+        ensure!(actual == expected, "prepared launch descriptor changed");
+        self.record_op("launch_prepared");
+        self.launch(desc, completion)
+    }
+
+    pub fn release_launch(&mut self, lease_id: u64) -> Result<()> {
+        ensure!(
+            self.launch_leases.remove(&lease_id).is_some(),
+            "unknown or consumed launch lease {lease_id}"
+        );
+        self.record_op("release_launch");
+        Ok(())
     }
 
     pub fn launch(&mut self, desc: &PieLaunchDesc, completion: PieCompletion) -> Result<()> {
@@ -1511,12 +1652,10 @@ fn ensure_endpoint_matches_program(
             // instances — the shared ring is ordered by the pipeline FIFO
             // (prefill→decode `tok_in` handoff). Host-visible or seeded
             // channels keep the one-attachment rule.
-            let device_only = endpoint.host_role
-                == pie_ptir::container::HostRole::None as u8
-                && !endpoint.seeded;
+            let device_only =
+                endpoint.host_role == pie_ptir::container::HostRole::None as u8 && !endpoint.seeded;
             ensure!(
-                endpoint.extern_name.is_none()
-                    && (endpoint.attachments.is_empty() || device_only),
+                endpoint.extern_name.is_none() && (endpoint.attachments.is_empty() || device_only),
                 "private channel {} is already attached",
                 endpoint.channel_id
             );
@@ -2967,6 +3106,67 @@ mod tests {
             .unwrap()
             .0 as i32;
         assert_eq!(best, favored);
+    }
+
+    #[test]
+    fn prepared_launch_lease_is_consumed_or_released_exactly_once() {
+        let (mut driver, callbacks) = driver_with_callbacks(0);
+        let binding = bind_program(
+            &mut driver,
+            private_container(0).encode(),
+            &[],
+            &[],
+            &[],
+            311,
+        );
+        let instance_ids = [binding.instance_id];
+        let mut terminal_cells = [pending_terminal_cell()];
+        let terminal_ptrs = terminal_cells
+            .each_mut()
+            .map(|cell| cell as *mut PieTerminalCell);
+        let desc = PieLaunchDesc {
+            instance_ids: PieU64Slice {
+                ptr: instance_ids.as_ptr(),
+                len: instance_ids.len(),
+            },
+            terminal_cells: PieTerminalCellPtrSlice {
+                ptr: terminal_ptrs.as_ptr(),
+                len: terminal_ptrs.len(),
+            },
+            ..PieLaunchDesc::default()
+        };
+
+        let released = driver.prepare_launch(&desc).unwrap();
+        assert_eq!(released.outcome, pie_driver_abi::PIE_LAUNCH_PREPARE_READY);
+        driver.release_launch(released.lease_id).unwrap();
+        assert!(driver.release_launch(released.lease_id).is_err());
+
+        let consumed = driver.prepare_launch(&desc).unwrap();
+        driver
+            .launch_prepared(
+                &desc,
+                consumed.lease_id,
+                PieCompletion {
+                    wait_id: 411,
+                    target_epoch: 1,
+                    terminal_cell: std::ptr::null_mut(),
+                },
+            )
+            .unwrap();
+        callbacks.wait_for_notification((411, 1));
+        assert!(
+            driver
+                .launch_prepared(
+                    &desc,
+                    consumed.lease_id,
+                    PieCompletion {
+                        wait_id: 412,
+                        target_epoch: 1,
+                        terminal_cell: std::ptr::null_mut(),
+                    },
+                )
+                .is_err()
+        );
     }
 
     #[test]
