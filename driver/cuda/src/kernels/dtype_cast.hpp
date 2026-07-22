@@ -61,10 +61,12 @@ void launch_marlin_permute_scales_bf16(
 /// packed int4 in `[groups, N/8]` int32 (each int32 holds 8 nibbles
 /// along the N axis with the AWQ-specific [0,2,4,6,1,3,5,7] interleave).
 /// Marlin's W4 kernel expects them in `[groups, N/8]` int32 too, but
-/// with the SAME 64-wide column permutation that scales undergo
-/// (`marlin_permute_scales`) AFTER the AWQ undo-interleave. This kernel
-/// does the full pipeline: undo AWQ interleave → marlin scale_perm →
-/// repack int4. Verified to match vLLM's `awq_to_marlin_zero_points`.
+/// zero-points need BOTH the 64-wide column permutation that scales undergo
+/// (`marlin_permute_scales`) AND an additional 8-wide column interleave
+/// `[0,2,4,6,1,3,5,7]` (`marlin_zero_points`), applied AFTER the AWQ
+/// undo-interleave. This kernel does the full pipeline: undo AWQ interleave →
+/// 64-wide scale_perm → 8-wide interleave → repack int4. Verified to match
+/// vLLM's `awq_to_marlin_zero_points`.
 void launch_awq_qzero_to_marlin_w4(
     const void*   awq_qzeros_in,    // [groups, N/8] int32 (AWQ packing)
     void*         qzeros_marlin_out,// [groups, N/8] int32 (marlin packing)
