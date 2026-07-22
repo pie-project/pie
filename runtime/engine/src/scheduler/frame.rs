@@ -21,9 +21,14 @@
 //!   demand, never timing). A lane deferred by capacity is served in the
 //!   same structurally partitioned round without re-awaiting the lanes
 //!   already served ([`FramePolicy::round_served`], the quorum's round rule);
-//! - dispatches the sealed frame's waves in slot order, each wave gated on
-//!   its own posted fires' retirement (the per-wave driver path cannot
-//!   overlap data-dependent waves);
+//! - dispatches the sealed frame's waves in slot order, at most
+//!   [`configured_chain_depth`] of them posted-unretired at once. Depth 1
+//!   (the default) serializes dependent waves on retirement; deeper chains
+//!   trust the driver's device-side readiness gate (`pass_commit` channel
+//!   tickets) to order device-composed successors on-stream, exactly as the
+//!   per-wave quorum's run-ahead already does — a successor whose
+//!   predecessor did not commit comes back RETRY and replays through the
+//!   wave-ordered makeup set;
 //! - releases a gracefully closed lane from the wait-set immediately while
 //!   its accepted frames drain to settlement.
 //!
@@ -59,6 +64,24 @@ const COLD_HOLD_US: u64 = 2_000;
 /// per-wave quorum: it never removes a member and never fires a narrow
 /// epoch — an unresponsive lane leaves only through close/terminate.
 const STRICT_WATCHDOG_US: u64 = 1_000_000;
+
+fn parse_chain_depth(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|depth| depth.clamp(1, 3))
+        .unwrap_or(1)
+}
+
+/// Intra-frame wave chaining depth (`PIE_FRAME_CHAIN`, default 1, clamp
+/// 1..=3): how many consecutive waves of one sealed frame may be
+/// posted-unretired at once. A static deployment constant like `k` itself —
+/// never adapted at runtime. The cap matches the scheduler/driver run-ahead
+/// depth (`quorum::MAX_IN_FLIGHT`, `runahead.hpp`) whose pinned staging
+/// pools bound how many launches may overlap.
+pub(super) fn configured_chain_depth() -> usize {
+    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| parse_chain_depth(std::env::var("PIE_FRAME_CHAIN").ok().as_deref()))
+}
 
 struct ArrivedFire {
     slot: u32,
@@ -105,12 +128,16 @@ struct SealedFrame {
     /// Fire ids of the OPEN wave not yet posted or dropped.
     open_remaining: HashSet<u64>,
     /// Fires that came back RETRY after posting: they re-dispatch before any
-    /// further wave of any frame opens (per-lane slot order is enforced by
-    /// channel tickets; the makeup gate keeps the pipe from racing ahead of
-    /// a known-uncommitted step).
+    /// further wave of this frame opens, oldest wave first, and a wave's
+    /// makeups only once every earlier wave has drained (per-lane slot order
+    /// is enforced by channel tickets; the makeup gate keeps the pipe from
+    /// racing ahead of a known-uncommitted step).
     makeup: HashSet<u64>,
     /// Posted fires not yet retired.
     outstanding: usize,
+    /// Posted-unretired fires per wave index — the chaining depth gate and
+    /// the makeup ordering guard both read this.
+    wave_outstanding: Vec<usize>,
 }
 
 impl SealedFrame {
@@ -119,6 +146,14 @@ impl SealedFrame {
             && self.open_remaining.is_empty()
             && self.outstanding == 0
             && self.makeup.is_empty()
+    }
+
+    /// Waves with at least one posted-unretired fire.
+    fn inflight_waves(&self) -> usize {
+        self.wave_outstanding[..self.next_wave]
+            .iter()
+            .filter(|count| **count > 0)
+            .count()
     }
 }
 
@@ -138,6 +173,8 @@ pub(super) struct FramePolicy {
     k: usize,
     max_wave_tokens: usize,
     max_wave_rows: usize,
+    /// See [`configured_chain_depth`].
+    chain_depth: usize,
     /// THE wait-set plus each lane's queued frames. BTreeMap for
     /// deterministic admission order.
     lanes: BTreeMap<ProcessId, LaneState>,
@@ -162,6 +199,7 @@ impl FramePolicy {
             k,
             max_wave_tokens,
             max_wave_rows,
+            chain_depth: configured_chain_depth(),
             lanes: BTreeMap::new(),
             sealed: VecDeque::new(),
             pending_binds: BTreeMap::new(),
@@ -336,11 +374,12 @@ impl FramePolicy {
     pub fn on_fires_posted(&mut self, fire_ids: &[u64]) {
         for fire_id in fire_ids {
             for frame in &mut self.sealed {
-                if frame.fire_waves.contains_key(fire_id) {
+                if let Some(&wave) = frame.fire_waves.get(fire_id) {
                     let in_open = frame.open_remaining.remove(fire_id);
                     let in_makeup = frame.makeup.remove(fire_id);
                     if in_open || in_makeup {
                         frame.outstanding += 1;
+                        frame.wave_outstanding[wave] += 1;
                     }
                     break;
                 }
@@ -352,8 +391,10 @@ impl FramePolicy {
     /// it (RETRY outcome within budget) — it becomes a makeup fire.
     pub fn on_fire_retired(&mut self, fire_id: u64, will_retry: bool) {
         for frame in &mut self.sealed {
-            if frame.fire_waves.contains_key(&fire_id) {
+            if let Some(&wave) = frame.fire_waves.get(&fire_id) {
                 frame.outstanding = frame.outstanding.saturating_sub(1);
+                let count = &mut frame.wave_outstanding[wave];
+                *count = count.saturating_sub(1);
                 if will_retry {
                     frame.makeup.insert(fire_id);
                 }
@@ -467,6 +508,7 @@ impl FramePolicy {
         self.ever_sealed = true;
         self.round_served.extend(members.iter().copied());
         self.close_round_if_complete();
+        let wave_count = waves.len();
         self.sealed.push_back(SealedFrame {
             lanes: members,
             waves,
@@ -475,6 +517,7 @@ impl FramePolicy {
             open_remaining: HashSet::new(),
             makeup: HashSet::new(),
             outstanding: 0,
+            wave_outstanding: vec![0; wave_count],
         });
         // Open the first non-empty wave immediately.
         let newest = self.sealed.len() - 1;
@@ -520,17 +563,42 @@ impl FramePolicy {
         self.pop_complete();
 
         // Consecutive waves OF ONE FRAME are data-dependent (device-advanced
-        // channels): the per-wave driver path validates predecessor
-        // publication at launch staging, so a frame's next wave opens only
-        // once its own posted fires have retired. Coexisting sealed frames
-        // (a capacity-partitioned round) have DISJOINT lane sets, so their
-        // waves are independent and pipeline freely at the launch depth.
+        // channels). Up to `chain_depth` of them may be posted-unretired at
+        // once: the driver's device-side readiness gate (`pass_commit`
+        // channel tickets) orders a device-composed successor behind its
+        // predecessor on-stream, and a successor whose predecessor did not
+        // commit comes back RETRY into the wave-ordered makeup set. At the
+        // default depth 1 a wave opens only once its predecessor retired.
+        // Coexisting sealed frames (a capacity-partitioned round) have
+        // DISJOINT lane sets, so their waves are independent and pipeline
+        // freely at the launch depth.
         loop {
             let mut advanced = false;
             for index in 0..self.sealed.len() {
                 let frame = &self.sealed[index];
                 if !frame.makeup.is_empty() {
-                    let mut makeups: Vec<u64> = frame.makeup.iter().copied().collect();
+                    // Replay the oldest wave's makeups first, and only once
+                    // every earlier wave has drained: the rings must be at
+                    // the state the makeup's channel tickets expect.
+                    let min_wave = frame
+                        .makeup
+                        .iter()
+                        .filter_map(|fire_id| frame.fire_waves.get(fire_id))
+                        .copied()
+                        .min()
+                        .unwrap_or(0);
+                    let earlier_draining = frame.wave_outstanding[..min_wave]
+                        .iter()
+                        .any(|count| *count > 0);
+                    if earlier_draining {
+                        continue;
+                    }
+                    let mut makeups: Vec<u64> = frame
+                        .makeup
+                        .iter()
+                        .filter(|fire_id| frame.fire_waves.get(*fire_id) == Some(&min_wave))
+                        .copied()
+                        .collect();
                     makeups.sort_unstable();
                     return FramePlan::Dispatch(makeups);
                 }
@@ -543,7 +611,9 @@ impl FramePolicy {
                         .collect();
                     return FramePlan::Dispatch(ordered);
                 }
-                if frame.next_wave < frame.waves.len() && frame.outstanding == 0 {
+                if frame.next_wave < frame.waves.len()
+                    && frame.inflight_waves() < self.chain_depth
+                {
                     self.advance_open_wave(index, Some(still_queued));
                     self.pop_complete();
                     advanced = true;
@@ -775,6 +845,83 @@ mod tests {
             panic!("expected wave 1 after makeup commits");
         };
         assert_eq!(wave1, vec![11]);
+    }
+
+    #[test]
+    fn chained_waves_overlap_to_the_configured_depth() {
+        let mut policy = FramePolicy::new(3, 64, 4096);
+        policy.chain_depth = 2;
+        let lane = pid();
+        for slot in 0..3 {
+            policy.on_fire_enqueued(stamp(lane, 0, slot, 3), Some(lane), 30 + slot as u64, 1, 1);
+        }
+        let queued: HashSet<u64> = [30, 31, 32].into_iter().collect();
+        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("expected wave 0");
+        };
+        assert_eq!(wave0, vec![30]);
+        policy.on_fires_posted(&wave0);
+        // Depth 2: wave 1 opens while wave 0 is still in flight.
+        let FramePlan::Dispatch(wave1) = policy.plan_dispatch(&queued, Instant::now()) else {
+            panic!("chaining must open wave 1 behind the posted wave 0");
+        };
+        assert_eq!(wave1, vec![31]);
+        policy.on_fires_posted(&wave1);
+        assert_eq!(
+            policy.plan_dispatch(&queued, Instant::now()),
+            FramePlan::Park,
+            "two waves in flight saturate the chain depth"
+        );
+        policy.on_fire_retired(30, false);
+        let FramePlan::Dispatch(wave2) = policy.plan_dispatch(&queued, Instant::now()) else {
+            panic!("retiring wave 0 must open wave 2");
+        };
+        assert_eq!(wave2, vec![32]);
+    }
+
+    #[test]
+    fn chained_retry_replays_wave_ordered_makeups() {
+        let mut policy = FramePolicy::new(2, 64, 4096);
+        policy.chain_depth = 2;
+        let lane = pid();
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 40, 1, 1);
+        policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), 41, 1, 1);
+        let queued: HashSet<u64> = [40, 41].into_iter().collect();
+        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("expected wave 0");
+        };
+        policy.on_fires_posted(&wave0);
+        let FramePlan::Dispatch(wave1) = policy.plan_dispatch(&queued, Instant::now()) else {
+            panic!("expected chained wave 1");
+        };
+        policy.on_fires_posted(&wave1);
+        // The predecessor fails to commit and requeues; its chained
+        // successor is still in flight and will bounce on the stale rings.
+        policy.on_fire_retired(40, true);
+        assert_eq!(
+            policy.plan_dispatch(&queued, Instant::now()),
+            FramePlan::Dispatch(vec![40]),
+            "the oldest wave's makeup replays first"
+        );
+        policy.on_fires_posted(&[40]);
+        policy.on_fire_retired(41, true);
+        assert_eq!(
+            policy.plan_dispatch(&queued, Instant::now()),
+            FramePlan::Park,
+            "a later wave's makeup holds while the earlier wave is in flight"
+        );
+        policy.on_fire_retired(40, false);
+        assert_eq!(
+            policy.plan_dispatch(&queued, Instant::now()),
+            FramePlan::Dispatch(vec![41]),
+            "the successor's makeup replays once the predecessor drained"
+        );
+        policy.on_fires_posted(&[41]);
+        policy.on_fire_retired(41, false);
+        assert_eq!(
+            policy.plan_dispatch(&queued, Instant::now()),
+            FramePlan::Park
+        );
     }
 
     #[test]
