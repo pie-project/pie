@@ -3511,11 +3511,6 @@ impl BatchScheduler {
                             item,
                         );
                         progress = true;
-                        // One control post per pass: the outer loop drains
-                        // the scheduler channel between controls, so a
-                        // cohort-swap burst cannot let readiness credits pile
-                        // up unread; the post-burst decision sees a dense fleet.
-                        break;
                     }
                     // Busy: rotate the close behind the queue so the fires
                     // that will quiesce it (and everything unrelated) keep
@@ -3556,9 +3551,6 @@ impl BatchScheduler {
                         item,
                     );
                     progress = true;
-                    // Keep readiness publication interleaved with control
-                    // posting; flooding the lane did not improve first-full.
-                    break;
                 }
             }
         }
@@ -6296,9 +6288,10 @@ mod tests {
         Ok(())
     }
 
-    /// Synchronous controls interleave with scheduler mailbox draining.
+    /// Strict wait-all lets a synchronous lifecycle burst fill the lane in one
+    /// pass; no wave window can age while the worker drains its mailbox.
     #[tokio::test(flavor = "current_thread")]
-    async fn one_synchronous_control_dispatches_per_pass() {
+    async fn synchronous_control_burst_dispatches_in_one_pass() {
         let (tx_a, mut rx_a) = tokio::sync::oneshot::channel();
         let (tx_b, mut rx_b) = tokio::sync::oneshot::channel();
         let mut pending = VecDeque::from([
@@ -6347,13 +6340,10 @@ mod tests {
             "the first control dispatches this pass"
         );
         assert!(
-            matches!(
-                rx_b.try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-            ),
-            "the second control waits for the next pass"
+            timeout(Duration::from_secs(5), &mut rx_b).await.is_ok(),
+            "the second control dispatches in the same pass"
         );
-        assert_eq!(pending.len(), 1);
+        assert!(pending.is_empty());
     }
 
     #[test]
