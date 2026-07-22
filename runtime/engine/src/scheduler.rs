@@ -23,11 +23,14 @@
 
 pub(crate) mod batch;
 pub(crate) mod dispatch;
+pub(crate) mod frame;
 pub(crate) mod probe;
 pub(crate) mod quorum;
 pub(crate) mod stats;
 pub(crate) mod wire;
 pub mod worker;
+
+pub use frame::FrameStamp;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -144,6 +147,27 @@ pub(crate) fn scheduler_handle(driver_id: usize) -> Result<SchedulerHandle> {
 /// a stalled fleet — a held wave must be inspectable from outside the thread.
 pub async fn debug_dump(driver_id: usize) -> Result<String> {
     scheduler_handle(driver_id)?.debug_dump().await
+}
+
+// =============================================================================
+// Frame size (`PIE_FRAME_SIZE`) — the Vesuvius deployment constant k
+// =============================================================================
+
+/// Waves per frame (k): a static deployment constant, fixed at engine start
+/// exactly like the KV page size — never renegotiated per frame and never
+/// adapted from runtime timing. Guests query it via `model.frame-size()` and
+/// size their frames/channels to it. 1 (the default) keeps the per-wave
+/// wait-all scheduling path byte-identical to today; k > 1 enables sealed
+/// frame scheduling ([`worker`]'s frame policy).
+pub fn configured_frame_size() -> usize {
+    static CONFIGURED: OnceLock<usize> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_FRAME_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 64)
+    })
 }
 
 // =============================================================================
@@ -312,6 +336,7 @@ fn build_driver_scheduler(
         page_size,
         limits,
         request_timeout_secs,
+        configured_frame_size(),
     ))
 }
 
@@ -584,6 +609,7 @@ pub fn submit_prebuilt_tracked_async_with_kv_and_rs_copy(
         rs_copy_src,
         rs_copy_dst,
         None,
+        None,
         fire_timing_request_enabled(Some(pipeline_id)),
     )
 }
@@ -602,6 +628,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     rs_copy_src: Vec<u32>,
     rs_copy_dst: Vec<u32>,
     retry_classifier: Option<RetryClassifier>,
+    frame: Option<FrameStamp>,
     timing_enabled: bool,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::driver::KvCopyPlan {
@@ -623,6 +650,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         prelaunch_copy,
         rs_state_copy_plan(rs_copy_src, rs_copy_dst)?,
         retry_classifier,
+        frame,
         timing_enabled,
     )
 }

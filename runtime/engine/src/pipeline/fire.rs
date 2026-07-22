@@ -679,11 +679,21 @@ pub(crate) async fn await_channel_progress(
 
 type Anyhow<T> = anyhow::Result<T>;
 
-/// The body behind `forward-pass.submit(on)`.
+/// One pass submission without a frame stamp (k = 1, or internal callers).
 pub async fn submit_pass<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
     fwd: Resource<ForwardPass>,
+) -> Anyhow<Result<(), String>> {
+    submit_pass_stamped(ctx, this, fwd, None).await
+}
+
+/// The body behind one non-no-op slot of `forward.submit(on, slots)`.
+pub async fn submit_pass_stamped<C: FireContext>(
+    ctx: &mut C,
+    this: Resource<Pipeline>,
+    fwd: Resource<ForwardPass>,
+    frame: Option<crate::scheduler::FrameStamp>,
 ) -> Anyhow<Result<(), String>> {
     {
         // Device-geometry pass (Track B): the [B,P] geometry is
@@ -693,7 +703,7 @@ pub async fn submit_pass<C: FireContext>(
         // RUNS AHEAD like any pass (the FIFO carries it; NOT synchronous like
         // the deleted host-replay beam branch).
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
-            return fire_device_geometry(ctx, this, fwd).await;
+            return fire_device_geometry(ctx, this, fwd, frame).await;
         }
         // W3.1: the PIPELINE owns the in-flight FIFO. Point each of this
         // pass's channels at this pipeline's queue so their `take`/`read`
@@ -1026,6 +1036,7 @@ pub async fn submit_pass<C: FireContext>(
             rs_copy_src,
             rs_copy_dst,
             Some(retry_classifier),
+            frame,
             timing_enabled,
         )
         .err()
@@ -1076,6 +1087,184 @@ pub async fn submit_pass<C: FireContext>(
             }));
         Ok(Ok(()))
     }
+}
+
+/// The body behind the interface-level `forward.submit(on, slots)` —
+/// Vesuvius frame submission. Exactly `model.frame-size()` ordered slots;
+/// slot i executes in wave i; `none` is a no-op. At k = 1 a single-slot frame
+/// IS today's per-pass submit (identical semantics, per-wave wait-all path
+/// untouched). At k > 1 the frame validates structurally (Section 5 of the
+/// design: staged / device-advanced / latest-value host-writer classes,
+/// static reader-capacity overflow prevention), then prepares and enqueues
+/// each slot in order under one frame stamp.
+pub async fn submit_frame<C: FireContext>(
+    ctx: &mut C,
+    this: Resource<Pipeline>,
+    slot_reps: Vec<Option<u32>>,
+) -> Anyhow<Result<(), String>> {
+    let k = crate::scheduler::configured_frame_size();
+    if slot_reps.len() != k {
+        return Ok(Err(format!(
+            "pipeline: frame holds {} slot(s); model.frame-size() is {k} — \
+             supply exactly k ordered slots (none = no-op)",
+            slot_reps.len()
+        )));
+    }
+    let fired: Vec<(u32, u32)> = slot_reps
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, rep)| rep.map(|rep| (slot as u32, rep)))
+        .collect();
+    if fired.is_empty() {
+        return Ok(Err(
+            "pipeline: a frame needs at least one non-no-op slot".to_string(),
+        ));
+    }
+    for &(slot, rep) in &fired {
+        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+        if !ctx.resources().get(&fwd)?.is_bound() {
+            return Ok(Err(format!(
+                "pipeline: frame slot {slot}: forward pass program is not attached"
+            )));
+        }
+    }
+    if k == 1 {
+        let (_, rep) = fired[0];
+        return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None).await;
+    }
+    if let Err(error) = validate_frame(ctx, k, &fired)? {
+        return Ok(Err(error));
+    }
+    let (lane, seq) = {
+        let pipeline = ctx.resources().get(&this)?;
+        if pipeline.scope.is_closed() {
+            return Ok(Err("pipeline: pipeline is closed".to_string()));
+        }
+        (pipeline.scope.scheduler_id(), pipeline.next_frame_seq())
+    };
+    let fires = fired.len() as u32;
+    for (index, &(slot, rep)) in fired.iter().enumerate() {
+        let stamp = crate::scheduler::FrameStamp {
+            lane,
+            seq,
+            slot,
+            fires,
+        };
+        let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
+        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+        if let Err(error) = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await? {
+            // Mid-frame failure: the fires already submitted stand and
+            // execute as a truncated frame; tell the scheduler how many
+            // exist so the frame can still seal.
+            if index > 0 {
+                let first: Resource<ForwardPass> = Resource::new_borrow(fired[0].1);
+                if let Ok(pass) = ctx.resources().get(&first)
+                    && let Ok(bound) = pass.bound()
+                {
+                    let _ = bound.scheduler.frame_truncate(lane, seq, index as u32);
+                }
+            }
+            return Ok(Err(format!("pipeline: frame slot {slot}: {error}")));
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// Section 5 structural frame validation (k > 1 only): fusability is a
+/// deterministic program property — decided from program structure and
+/// staged occupancy at submit, never timing.
+fn validate_frame<C: FireContext>(
+    ctx: &mut C,
+    k: usize,
+    fired: &[(u32, u32)],
+) -> Anyhow<Result<(), String>> {
+    struct ChannelUse {
+        cell: Arc<Mutex<crate::pipeline::channel::ChannelCell>>,
+        consumes: usize,
+        publishes: usize,
+    }
+    let mut uses: std::collections::HashMap<usize, ChannelUse> = std::collections::HashMap::new();
+    for &(_, rep) in fired {
+        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+        let pass = ctx.resources().get(&fwd)?;
+        let bound = match pass.bound() {
+            Ok(bound) => bound,
+            Err(error) => return Ok(Err(format!("pipeline: {error}"))),
+        };
+        let accesses = &bound.instance.program.channel_accesses;
+        for (cell, &(consume, publish)) in bound.cells.iter().zip(accesses) {
+            let key = Arc::as_ptr(cell) as usize;
+            let entry = uses.entry(key).or_insert_with(|| ChannelUse {
+                cell: cell.clone(),
+                consumes: 0,
+                publishes: 0,
+            });
+            entry.consumes += usize::from(consume);
+            entry.publishes += usize::from(publish);
+        }
+    }
+    for entry in uses.values() {
+        let cell = entry.cell.lock().unwrap();
+        match cell.role {
+            Some(HostRole::Writer) => {
+                if entry.publishes == 0 && entry.consumes > 0 {
+                    // *staged* class: each consuming fire drains one host
+                    // cell; every one must exist at submit (frames execute
+                    // uninterrupted — no mid-frame host put can arrive).
+                    let available = cell.unclaimed_writer_cells();
+                    if available < entry.consumes {
+                        return Ok(Err(format!(
+                            "pipeline: channel {}: frame consumes {} host-writer \
+                             cell(s) but only {available} are staged — stage every \
+                             per-fire input before submitting the frame",
+                            cell.global_id, entry.consumes
+                        )));
+                    }
+                } else if entry.publishes == 0 && entry.consumes == 0 {
+                    // *latest-value* class: a control word the program only
+                    // reads. One committed cell suffices; host `set` may
+                    // replace it at any time.
+                    if !cell.has_committed_front() {
+                        return Ok(Err(format!(
+                            "pipeline: channel {}: latest-value control word has \
+                             no committed cell at frame submit",
+                            cell.global_id
+                        )));
+                    }
+                }
+                // publishes > 0: *device-advanced* — the program carries an
+                // advance rule for it.
+            }
+            Some(HostRole::Reader) => {
+                if entry.publishes > 0 {
+                    // Overflow is prevented statically at submit, never by
+                    // back-pressure: worst-case ring occupancy (reserved by
+                    // accepted unsettled fires, minus host-consumed, plus
+                    // this frame's writes) must fit the capacity.
+                    let (reserved_tail, consumed) = cell.reader_ring_pressure();
+                    let needed = reserved_tail
+                        .saturating_sub(consumed)
+                        .saturating_add(entry.publishes as u64);
+                    if needed > u64::from(cell.capacity) {
+                        return Ok(Err(format!(
+                            "pipeline: channel {}: frame would need {needed} reader \
+                             cell(s) (capacity {}) — size take-side channels to at \
+                             least 2k-1 = {} for frame-size k = {k}",
+                            cell.global_id,
+                            cell.capacity,
+                            2 * k - 1,
+                        )));
+                    }
+                }
+            }
+            _ => {
+                // Device-only / seeded descriptor channels: device-advanced
+                // or seeded by construction; remaining per-lane error classes
+                // surface at prepare, before the frame is accepted.
+            }
+        }
+    }
+    Ok(Ok(()))
 }
 
 /// Compaction (Design-B lazy KV GC): move `n` token KV cells within `ws`,
@@ -1534,6 +1723,7 @@ async fn fire_device_geometry<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
     fwd: Resource<ForwardPass>,
+    frame: Option<crate::scheduler::FrameStamp>,
 ) -> Anyhow<Result<(), String>> {
     // Wire each of this pass's channels at this pipeline's FIFO (§3.4: all
     // passes binding a channel must submit on ONE pipeline — the entire
@@ -1819,6 +2009,7 @@ async fn fire_device_geometry<C: FireContext>(
         rs_copy_src,
         rs_copy_dst,
         None,
+        frame,
         timing_enabled,
     )
     .err()

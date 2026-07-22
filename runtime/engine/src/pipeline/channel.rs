@@ -726,6 +726,37 @@ impl ChannelCell {
         self.staged.len()
     }
 
+    /// Frame validation (Vesuvius, k > 1): host-known cells a Writer channel
+    /// can still feed to future fires — pre-endpoint staging plus unclaimed
+    /// ring copies.
+    pub fn unclaimed_writer_cells(&self) -> usize {
+        self.staged.len() + self.ring_host_copies.len()
+    }
+
+    /// Frame validation (Vesuvius, k > 1): the Reader ring's reservation
+    /// pressure as (publications reserved by accepted unsettled fires, cells
+    /// the host has already consumed). Their difference is the worst-case
+    /// ring occupancy if the guest drains nothing before the frame executes —
+    /// deterministic at submit time, never a function of drain timing.
+    pub fn reader_ring_pressure(&self) -> (u64, u64) {
+        let consumed = self
+            .reader
+            .as_ref()
+            .map(|reader| load_word(reader.word_base, reader.head_word_index))
+            .unwrap_or(0);
+        (self.device_reserved_tail, consumed)
+    }
+
+    /// Frame validation (Vesuvius, k > 1): whether the host side knows a
+    /// committed value exists for a latest-value (read-only-bound) channel.
+    pub fn has_committed_front(&self) -> bool {
+        self.seeded
+            || !self.staged.is_empty()
+            || !self.ring_host_copies.is_empty()
+            || self.front_override.is_some()
+            || self.device_reserved_tail > 0
+    }
+
     /// Host `take` a produced cell (Reader), FIFO. An unbound channel is
     /// simply empty.
     pub fn take(&mut self) -> Result<Vec<u8>, ChannelError> {
@@ -1121,6 +1152,7 @@ mod tests {
                 max_forward_tokens: 64,
                 max_page_refs: 64,
             },
+            1,
             1,
         );
         // chan 0: host Writer u32[1], taken every fire; chan 1: host Reader.

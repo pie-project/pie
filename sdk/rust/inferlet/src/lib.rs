@@ -96,8 +96,9 @@ pub use tools::Tool;
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        architecture, arena_block_size, default_system_speculation, is_linear, name,
-        kv_page_size, output_vocab_size, rs_buffer_page_size, rs_fold_granularity, rs_state_size,
+        architecture, arena_block_size, default_system_speculation, frame_size, is_linear,
+        kv_page_size, max_embed_length, name, output_vocab_size, rs_buffer_page_size,
+        rs_fold_granularity, rs_state_size,
     };
     // Tokenizer functions split into the `tokenizer` interface (§2.2); re-exported
     // here so `model::encode`/`model::decode`/… keep working for inferlet source.

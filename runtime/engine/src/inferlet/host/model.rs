@@ -43,6 +43,19 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(model::model().kv_page_size())
     }
 
+    /// Waves per frame (k) — the static deployment constant `forward.submit`
+    /// sizes its slot list to. Fixed at engine start, like `kv-page-size`.
+    async fn frame_size(&mut self) -> Result<u32> {
+        Ok(crate::scheduler::configured_frame_size() as u32)
+    }
+
+    /// Max embed tokens in a single pass (C) — the guest-side prefill chunk
+    /// budget, sourced from the bound driver's structural per-launch token
+    /// capacity.
+    async fn max_embed_length(&mut self) -> Result<u32> {
+        Ok(crate::driver::get_spec(0)?.limits.max_forward_tokens as u32)
+    }
+
     // ── Working-set / arena capabilities (global over the bound model) ──────
     //
     // Real values come from the driver handshake `DriverCapabilities`

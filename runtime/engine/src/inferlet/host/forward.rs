@@ -255,7 +255,28 @@ async fn materialize_channel(
     }
 }
 
-impl pie::inferlet::forward::Host for ProcessCtx {}
+impl pie::inferlet::forward::Host for ProcessCtx {
+    /// Frame submission (`forward.submit(on, slots)`): exactly
+    /// `model.frame-size()` ordered slots; slot i executes in wave i; `none`
+    /// is a no-op. Delegates to [`crate::pipeline::fire::submit_frame`].
+    async fn submit(
+        &mut self,
+        on: Resource<crate::pipeline::Pipeline>,
+        slots: Vec<Option<Resource<ForwardPass>>>,
+    ) -> Anyhow<Result<(), String>> {
+        let slot_reps: Vec<Option<u32>> = slots
+            .iter()
+            .map(|slot| slot.as_ref().map(Resource::rep))
+            .collect();
+        for rep in slot_reps.iter().flatten() {
+            let fwd: Resource<ForwardPass> = Resource::new_borrow(*rep);
+            let _ = self.ctx().table.get(&fwd)?;
+        }
+        crate::inferlet::process::ensure_execution_admitted(self).await;
+        crate::inferlet::process::preemption::contention_gate(self).await?;
+        crate::pipeline::fire::submit_frame(self, on, slot_reps).await
+    }
+}
 
 impl pie::inferlet::forward::HostChannel for ProcessCtx {
     async fn new(
@@ -1082,22 +1103,6 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         Ok(())
     }
 
-    /// Run-ahead submit on `on`: pure-attention prepares immediately; RS-bound
-    /// passes first finalize prior FIFO operations. See
-    /// `crate::pipeline::fire`'s module docs; errors after this call surface
-    /// via channel poison + `take`.
-    async fn submit(
-        &mut self,
-        this: Resource<ForwardPass>,
-        on: Resource<crate::pipeline::Pipeline>,
-    ) -> Anyhow<Result<(), String>> {
-        if !self.ctx().table.get(&this)?.is_bound() {
-            return Ok(Err("forward pass program is not attached".to_string()));
-        }
-        crate::inferlet::process::ensure_execution_admitted(self).await;
-        crate::inferlet::process::preemption::contention_gate(self).await?;
-        crate::pipeline::fire::submit_pass(self, on, this).await
-    }
 }
 
 #[cfg(test)]

@@ -230,6 +230,7 @@ mod tests {
             retry_classifier: None,
             credit_published: false,
             quorum_generation: 0,
+            frame: None,
             timing: None,
         }
     }

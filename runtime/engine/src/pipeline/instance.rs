@@ -996,6 +996,7 @@ mod tests {
                     max_page_refs: 64,
                 },
                 1,
+                1,
             );
 
             let program_id = crate::scheduler::register_program(driver_id, dummy_program())

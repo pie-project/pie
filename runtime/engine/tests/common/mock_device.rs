@@ -228,7 +228,7 @@ fn register_dummy_driver(
         },
         backend,
     );
-    let scheduler = BatchScheduler::new(driver_id, driver_idx, 16, limits, 30);
+    let scheduler = BatchScheduler::new(driver_id, driver_idx, 16, limits, 30, 1);
     (driver_id, scheduler)
 }
 
