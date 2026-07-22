@@ -83,6 +83,23 @@ pub(super) fn configured_chain_depth() -> usize {
     *DEPTH.get_or_init(|| parse_chain_depth(std::env::var("PIE_FRAME_CHAIN").ok().as_deref()))
 }
 
+/// Boundary gather hold (`PIE_FRAME_GATHER_US`, default 0 = off): when
+/// members DEPARTED during the round that just drained, hold the next seal
+/// this long so the replacement herd's binds and first frames land in the
+/// same dense epoch instead of one epoch late. The bootstrap cold hold
+/// generalized to every membership-shrink boundary — a fixed deployment
+/// constant (the page-size pattern), never adapted from runtime timing.
+pub(super) fn configured_gather_hold_us() -> u64 {
+    static HOLD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| {
+        std::env::var("PIE_FRAME_GATHER_US")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .map(|us| us.min(1_000_000))
+            .unwrap_or(0)
+    })
+}
+
 struct ArrivedFire {
     slot: u32,
     /// `None` when the fire was rejected at scheduler admission — it counts
@@ -190,6 +207,11 @@ pub(super) struct FramePolicy {
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
+    /// An awaited lane left since the last seal: the next boundary holds
+    /// [`configured_gather_hold_us`] so the replacement herd joins densely.
+    departed_since_seal: bool,
+    gather_hold_us: u64,
+    gather_hold_deadline: Option<Instant>,
     ever_sealed: bool,
 }
 
@@ -206,6 +228,9 @@ impl FramePolicy {
             round_served: HashSet::new(),
             strict_watchdog_deadline: None,
             cold_hold_deadline: None,
+            departed_since_seal: false,
+            gather_hold_us: configured_gather_hold_us(),
+            gather_hold_deadline: None,
             ever_sealed: false,
         }
     }
@@ -306,6 +331,9 @@ impl FramePolicy {
     /// the wait-set immediately but keeps queued frames — the
     /// already-accepted fires drain to settlement.
     pub fn on_lane_leave(&mut self, lane: ProcessId, purge_queued: bool) {
+        if self.lanes.get(&lane).is_some_and(|state| state.awaited) {
+            self.departed_since_seal = true;
+        }
         if purge_queued {
             self.lanes.remove(&lane);
         } else if let Some(state) = self.lanes.get_mut(&lane) {
@@ -322,6 +350,13 @@ impl FramePolicy {
 
     /// Every scope owned by `owner` left (process terminate/suspend).
     pub fn on_process_leave(&mut self, owner: ProcessId) {
+        if self
+            .lanes
+            .values()
+            .any(|lane| lane.owner == Some(owner) && lane.awaited)
+        {
+            self.departed_since_seal = true;
+        }
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
         self.pending_binds.remove(&owner);
         self.round_served
@@ -339,6 +374,8 @@ impl FramePolicy {
         self.ever_sealed = false;
         self.cold_hold_deadline = None;
         self.strict_watchdog_deadline = None;
+        self.departed_since_seal = false;
+        self.gather_hold_deadline = None;
         self.round_served.clear();
     }
 
@@ -427,6 +464,7 @@ impl FramePolicy {
     fn seal(&mut self, now: Instant) -> Option<FramePlan> {
         if !self.have_seal_candidate() {
             self.cold_hold_deadline = None;
+            self.gather_hold_deadline = None;
             return None;
         }
         if !self.ever_sealed {
@@ -447,6 +485,22 @@ impl FramePolicy {
             }
         }
         self.cold_hold_deadline = None;
+        if self.ever_sealed && self.departed_since_seal && self.gather_hold_us > 0 {
+            // Members died in the drained round: hold the seal briefly so
+            // the replacement herd's binds land in this epoch, not the next.
+            match self.gather_hold_deadline {
+                None => {
+                    let hold = Duration::from_micros(self.gather_hold_us);
+                    self.gather_hold_deadline = Some(now + hold);
+                    return Some(FramePlan::Hold(hold));
+                }
+                Some(deadline) if now < deadline => {
+                    return Some(FramePlan::Hold(deadline - now));
+                }
+                Some(_) => {}
+            }
+        }
+        self.gather_hold_deadline = None;
 
         let mut waves: Vec<Vec<u64>> = vec![Vec::new(); self.k];
         let mut fire_waves = HashMap::new();
@@ -506,6 +560,7 @@ impl FramePolicy {
             return None;
         }
         self.ever_sealed = true;
+        self.departed_since_seal = false;
         self.round_served.extend(members.iter().copied());
         self.close_round_if_complete();
         let wave_count = waves.len();
@@ -669,6 +724,19 @@ impl FramePolicy {
                 return FramePlan::Hold(deadline.saturating_duration_since(now));
             }
             self.strict_watchdog_deadline = None;
+            // The wait-all rule at FLEET scope: a NEW round seals only once
+            // the executing round has fully drained, so every awaited lane —
+            // including the ones busy in the tail of the last epoch — enters
+            // the same dense epoch. Without this, a straggler cohort that
+            // misses one seal (bootstrap, a late bind) pipelines phase-offset
+            // forever behind the busy-lane exclusion and the fleet runs as
+            // permanent narrow sub-epochs (measured: c256 split 230/26,
+            // median wave width 29). Mid-round capacity partitions are
+            // lane-disjoint by construction and still seal while earlier
+            // partitions execute.
+            if self.round_served.is_empty() && !self.sealed.is_empty() {
+                return FramePlan::Park;
+            }
             match self.seal(now) {
                 Some(FramePlan::Dispatch(_)) => continue,
                 Some(plan) => return plan,
@@ -845,6 +913,95 @@ mod tests {
             panic!("expected wave 1 after makeup commits");
         };
         assert_eq!(wave1, vec![11]);
+    }
+
+    /// A membership-shrink boundary holds the seal for the gather window so
+    /// the replacement herd joins densely; a boundary with no departures
+    /// seals immediately.
+    #[test]
+    fn departure_boundary_holds_for_the_gather_window() {
+        let mut policy = FramePolicy::new(2, 64, 4096);
+        policy.gather_hold_us = 5_000;
+        let (a, b) = (pid(), pid());
+        for (lane, base) in [(a, 70u64), (b, 80u64)] {
+            policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), base, 1, 1);
+            policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), base + 1, 1, 1);
+        }
+        let queued: HashSet<u64> = [70, 71, 80, 81].into_iter().collect();
+        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("expected epoch 1 wave 0");
+        };
+        policy.on_fires_posted(&wave0);
+        for fire_id in wave0 {
+            policy.on_fire_retired(fire_id, false);
+        }
+        let FramePlan::Dispatch(wave1) = policy.plan_dispatch(&queued, Instant::now()) else {
+            panic!("expected epoch 1 wave 1");
+        };
+        policy.on_fires_posted(&wave1);
+        for fire_id in wave1 {
+            policy.on_fire_retired(fire_id, false);
+        }
+        // Lane b leaves gracefully; lane a queues its next frame.
+        policy.on_lane_leave(b, false);
+        policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 72, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 73, 1, 1);
+        let queued: HashSet<u64> = [72, 73].into_iter().collect();
+        let t0 = Instant::now();
+        match policy.plan_dispatch(&queued, t0) {
+            FramePlan::Hold(hold) => {
+                assert_eq!(hold, Duration::from_micros(5_000), "gather hold, not watchdog");
+            }
+            plan => panic!("departure boundary must hold the seal, got {plan:?}"),
+        }
+        let FramePlan::Dispatch(next) =
+            policy.plan_dispatch(&queued, t0 + Duration::from_micros(5_001))
+        else {
+            panic!("the gather window elapsed: the epoch must seal");
+        };
+        assert_eq!(next, vec![72]);
+    }
+
+    /// Fleet-scope wait-all: a straggler lane that missed the current
+    /// epoch's seal joins the NEXT epoch densely instead of pipelining as a
+    /// permanent phase-offset cohort behind the busy-lane exclusion.
+    #[test]
+    fn straggler_lanes_remerge_at_the_next_boundary() {
+        let mut policy = FramePolicy::new(2, 64, 4096);
+        let (a, b) = (pid(), pid());
+        policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 50, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 51, 1, 1);
+        let queued: HashSet<u64> = [50, 51].into_iter().collect();
+        let FramePlan::Dispatch(wave0) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("expected lane a's wave 0");
+        };
+        assert_eq!(wave0, vec![50]);
+        policy.on_fires_posted(&wave0);
+        // Mid-epoch: a straggler submits its first frame and lane a queues
+        // its next. Neither may seal while lane a's epoch executes.
+        policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 60, 1, 1);
+        policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 61, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 52, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 53, 1, 1);
+        let queued: HashSet<u64> = [50, 51, 52, 53, 60, 61].into_iter().collect();
+        assert_eq!(
+            policy.plan_dispatch(&queued, Instant::now()),
+            FramePlan::Park,
+            "a new round must not seal while the executing round drains"
+        );
+        policy.on_fire_retired(50, false);
+        let FramePlan::Dispatch(wave1) = policy.plan_dispatch(&queued, Instant::now()) else {
+            panic!("expected lane a's wave 1");
+        };
+        assert_eq!(wave1, vec![51]);
+        policy.on_fires_posted(&wave1);
+        policy.on_fire_retired(51, false);
+        // Boundary: the drained fleet seals ONE dense epoch with both lanes.
+        let FramePlan::Dispatch(merged) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("expected the merged dense epoch");
+        };
+        assert_eq!(merged.len(), 2, "wave 0 must hold BOTH lanes: {merged:?}");
+        assert!(merged.contains(&52) && merged.contains(&60));
     }
 
     #[test]

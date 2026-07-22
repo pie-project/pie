@@ -83,8 +83,36 @@ Phase 1. Mechanics (`scheduler/frame.rs`):
   (fallback class) simply RETRYs and replays — correctness by the same
   makeup machinery, throughput unchanged for those waves.
 
-Results: see `vesuvius-phase2-report.md` (probe pending at time of
-writing).
+Probe (CUDA, RTX 4090, k=16): chaining alone lifted 2048×32 16.6k →
+18.4k (depth 3) and 16×1900 to +3% over k=1, with exact 4/4 greedy token
+parity and zero retry storms (chained retries were *fewer* than the k=1
+baseline's normal retry load). But instrumentation showed the dominant
+residual was elsewhere — see M1b/M1c.
+
+## M1b — fleet-scope strict rounds (cohort re-merge)
+
+Instrumented widths exposed a second, bigger leak: **phase-offset
+cohorts**. Busy-lane exclusion sealed a straggler cohort (bootstrap or a
+late herd) into its own epochs, and the wait-all gate then waited for busy
+lanes' *submissions* but sealed *without* them — so cohorts never
+re-merged (c0/256 ran as a permanent 230/26 split, median wave width 29 vs
+k=1's 256). That deviates from the operator's principle (wait for ALL
+pipelines). Fix: a NEW round seals only after the executing round fully
+drains; mid-round capacity partitions (lane-disjoint by construction)
+still pipeline. Measured: c0/256 22.2k → 26.4–26.7k (−2% vs k=1),
+512×512 19.27k (k=1 parity), 64×1536 7.32k (parity), 16×1900 3.69k (+3%).
+
+## M1c — boundary gather hold
+
+On the churn shape (2048×32) strict rounds alone at chain=1 gave 20.9k
+(+26% over Phase 1), but chaining *lowered* it: faster epochs shrink the
+wall-clock window in which the replacement herd (spawned on the dying
+generation's completions) can bind before the boundary seal, so epochs
+get narrower — slow epochs were accidentally buying width. Fix:
+`PIE_FRAME_GATHER_US` — when members departed during the drained round,
+hold the next seal a fixed window so the herd's binds land in the same
+epoch (the bootstrap cold hold generalized to membership-shrink
+boundaries; a static deployment constant, no runtime adaptation).
 
 ## Scoped next milestones
 
