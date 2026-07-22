@@ -1352,6 +1352,140 @@ fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {
 }
 
 #[test]
+fn mixtral_stream_routed_experts_excludes_expert_tensors_from_program() {
+    // Minimal Mixtral-shaped checkpoint: 1 layer × 2 experts × w1/w2/w3 BF16.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>, dtype: DType| {
+        let bytes = shape.iter().fold(dtype.bytes(), |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(dtype),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64], DType::BF16);
+    push(next(), "model.layers.0.input_layernorm.weight", vec![64], DType::BF16);
+    push(
+        next(),
+        "model.layers.0.block_sparse_moe.gate.weight",
+        vec![2, 64],
+        DType::BF16,
+    );
+    for e in 0..2 {
+        for w in ["w1", "w2", "w3"] {
+            push(
+                next(),
+                &format!("model.layers.0.block_sparse_moe.experts.{e}.{w}.weight"),
+                vec![32, 32],
+                DType::BF16,
+            );
+        }
+    }
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "mixtral.safetensors".into(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
+    };
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "mixtral".to_string(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+        ..pie_weight_loader::config::ModelConfig::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        stream_routed_experts: true,
+        ..StorageTarget::default()
+    };
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+
+    assert!(
+        !streamed.tensors.iter().any(|t| t.name.contains("block_sparse_moe.experts.")),
+        "streamed program must not declare Mixtral expert tensors; got: {:?}",
+        streamed.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.contains("block_sparse_moe.gate.weight")),
+        "router must remain resident; got: {:?}",
+        streamed.tensors.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    assert!(!streamed.stream.is_empty());
+    assert_eq!(streamed.stream.num_layers, 1);
+    assert_eq!(streamed.stream.num_experts, 2);
+    assert_eq!(streamed.stream.sections_per_expert, 3);
+    assert_eq!(streamed.stream.template.len(), 3);
+    assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 3);
+    for id in &streamed.stream.template {
+        assert!(!streamed.schedule.contains(id));
+        assert!(streamed.instrs.iter().any(|instr| instr_id(instr) == *id));
+    }
+}
+
+#[test]
+fn mixtral_stream_routed_experts_rejects_tensor_parallel() {
+    let meta = CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "mixtral.safetensors".into(),
+            size_bytes: 64,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(0),
+            name: "model.layers.0.block_sparse_moe.experts.0.w1.weight".into(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 64,
+            shape: vec![32, 1],
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        }],
+    };
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "mixtral".to_string(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+        ..pie_weight_loader::config::ModelConfig::default()
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tp_rank: 0,
+        tp_size: 2,
+        stream_routed_experts: true,
+        ..StorageTarget::default()
+    };
+    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tp_size=1"), "unexpected error: {err}");
+}
+
+#[test]
 fn gpt_oss_stream_routed_experts_fused_plan() {
     // Minimal fused-bank fixture: 1 layer × 2 experts (not the real 32).
     let mut offset = 0u64;

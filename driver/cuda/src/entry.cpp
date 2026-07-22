@@ -471,13 +471,13 @@ int run_impl(int argc,
         : 0;
     // SSD expert streaming: carve the bounded expert slab out of free VRAM
     // now, *before* the memory planner runs, so KV/workspace sizing adapts
-    // to the remaining budget automatically. DSv4 and GPT-OSS are wired;
-    // the Rust weight-loader compiler already rejected other archs at load.
+    // to the remaining budget automatically. DSv4, GPT-OSS, and Mixtral are
+    // wired; the Rust weight-loader compiler already rejected other archs.
     std::unique_ptr<pie_cuda_driver::ExpertStreamCache> expert_stream_cache;
     if (cfg.model.stream_routed_experts) {
-        if (!is_dsv4_arch && !is_gpt_oss_arch) {
+        if (!is_dsv4_arch && !is_gpt_oss_arch && !is_mixtral_arch) {
             std::cerr << "[pie-driver-cuda] model.stream_routed_experts is only "
-                         "supported for deepseek_v4 and gpt_oss (got '"
+                         "supported for deepseek_v4, gpt_oss, and mixtral (got '"
                       << engine.hf_config().model_type << "')\n";
             return 2;
         }

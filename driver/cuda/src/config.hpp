@@ -36,10 +36,10 @@ struct ModelConfig {
     //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
     //   * "native" — require a true MXFP4 MoE GEMM backend.
     std::string mxfp4_moe = "auto";
-    // SSD expert streaming (DeepSeek-V4 only, tp_size=1). When true, routed
-    // MoE expert weights are not materialized on the GPU at load time;
-    // instead they are paged on demand from the safetensors shards into a
-    // bounded LRU expert cache at forward time.
+    // SSD expert streaming (DeepSeek-V4 / GPT-OSS / Mixtral, tp_size=1). When
+    // true, routed MoE expert weights are not materialized on the GPU at load
+    // time; instead they are paged on demand from the safetensors shards into
+    // a bounded LRU expert cache at forward time.
     bool stream_routed_experts = false;
     // Expert stream cache budget in GiB. 0 (default) = auto: half of the
     // free device memory after resident weights, capped at the full routed

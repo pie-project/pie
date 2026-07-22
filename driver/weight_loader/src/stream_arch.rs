@@ -188,6 +188,58 @@ pub(crate) const GPT_OSS_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     collect_bindings: gpt_oss_collect_bindings,
 };
 
+/// Fixed Mixtral section order — must match `mixtral_expert_sections.hpp`.
+/// HF layout: w1=gate, w2=down, w3=up (BF16, no scales).
+pub const MIXTRAL_EXPERT_SECTIONS: &[&str] = &["w1.weight", "w2.weight", "w3.weight"];
+
+/// Mixtral routed experts:
+/// `model.layers.{L}.block_sparse_moe.experts.{E}.w{1,2,3}.weight`.
+///
+/// The router (`…block_sparse_moe.gate.weight`) stays resident.
+pub(crate) fn is_mixtral_routed_expert_tensor(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("model.layers.") else {
+        return false;
+    };
+    let Some((_, rest)) = rest.split_once('.') else {
+        return false;
+    };
+    rest.starts_with("block_sparse_moe.experts.")
+        && ends_with_any(name, &[".w1.weight", ".w2.weight", ".w3.weight"])
+}
+
+/// Parse `model.layers.{L}.block_sparse_moe.experts.{E}.{section}`.
+pub(crate) fn parse_mixtral_expert_section(name: &str) -> Option<(u32, u32, usize)> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let (layer_str, rest) = rest.split_once('.')?;
+    let rest = rest.strip_prefix("block_sparse_moe.experts.")?;
+    let (expert_str, section) = rest.split_once('.')?;
+    let layer: u32 = layer_str.parse().ok()?;
+    let expert: u32 = expert_str.parse().ok()?;
+    let section_idx = MIXTRAL_EXPERT_SECTIONS.iter().position(|s| *s == section)?;
+    Some((layer, expert, section_idx))
+}
+
+fn mixtral_collect_bindings(
+    metadata: &CheckpointMetadata,
+    num_layers: u32,
+    num_experts: u32,
+) -> Result<Vec<StreamBinding>, CompileError> {
+    collect_bindings_from_named_tensors(
+        metadata,
+        num_layers,
+        num_experts,
+        MIXTRAL_EXPERT_SECTIONS.len(),
+        is_mixtral_routed_expert_tensor,
+        parse_mixtral_expert_section,
+    )
+}
+
+pub(crate) const MIXTRAL_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
+    sections: MIXTRAL_EXPERT_SECTIONS,
+    is_streamed: is_mixtral_routed_expert_tensor,
+    collect_bindings: mixtral_collect_bindings,
+};
+
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {
     suffixes.iter().any(|suffix| value.ends_with(suffix))
 }
@@ -221,5 +273,25 @@ mod tests {
         assert!(!is_gpt_oss_streamed_expert_tensor(
             "model.layers.0.mlp.experts.down_proj_bias"
         ));
+    }
+
+    #[test]
+    fn parse_mixtral_names() {
+        assert_eq!(
+            parse_mixtral_expert_section(
+                "model.layers.3.block_sparse_moe.experts.7.w2.weight"
+            ),
+            Some((3, 7, 1))
+        );
+        assert!(is_mixtral_routed_expert_tensor(
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight"
+        ));
+        assert!(!is_mixtral_routed_expert_tensor(
+            "model.layers.0.block_sparse_moe.gate.weight"
+        ));
+        assert!(parse_mixtral_expert_section(
+            "model.layers.0.block_sparse_moe.gate.weight"
+        )
+        .is_none());
     }
 }

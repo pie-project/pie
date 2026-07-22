@@ -538,6 +538,16 @@ const ARCH_PROFILES: &[(&[&str], ArchProfile)] = &[
         },
     ),
     (
+        // Plain Mixtral: per-expert BF16 w1/w2/w3 under block_sparse_moe.
+        // bind_mixtral reads separate q/k/v, so opt out of dense QKV fusion.
+        &["mixtral"],
+        ArchProfile {
+            skip_dense_qkv_fusion: true,
+            stream: Some(crate::stream_arch::MIXTRAL_STREAM_ARCH),
+            ..GENERIC_ARCH
+        },
+    ),
+    (
         &["glm_moe_dsa"],
         ArchProfile {
             shard_embed_tokens: true,
@@ -623,7 +633,7 @@ impl DefaultAbiBuilder<'_> {
         let Some(arch) = self.profile().stream else {
             return Err(CompileError::InvalidInput(format!(
                 "stream_routed_experts is not supported for model_type='{}' \
-                 (supported: deepseek_v4, gpt_oss)",
+                 (supported: deepseek_v4, gpt_oss, mixtral)",
                 self.cfg.model_type
             )));
         };

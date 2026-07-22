@@ -41,7 +41,7 @@ pub fn compile_storage_program(
         let Some(arch) = crate::abi::stream_arch_for(&cfg.model_type) else {
             return Err(CompileError::InvalidInput(format!(
                 "stream_routed_experts is not supported for model_type='{}' \
-                 (supported: deepseek_v4, gpt_oss)",
+                 (supported: deepseek_v4, gpt_oss, mixtral)",
                 cfg.model_type
             )));
         };

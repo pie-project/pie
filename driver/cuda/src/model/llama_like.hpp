@@ -105,9 +105,9 @@ struct LlamaLikeForwardCfg {
     int mrope_section_h = 0;
     int mrope_section_w = 0;
 
-    // SSD expert streaming (GPT-OSS RoutedDequant): non-null when routed
-    // expert packs are paged on demand. Mixtral BF16 / native MXFP4 leave
-    // this null and use resident WeightStore tensors.
+    // SSD expert streaming: non-null when routed experts are paged on demand
+    // (GPT-OSS MXFP4 RoutedDequant and Mixtral BF16). Resident Mixtral /
+    // native MXFP4 leave this null and use WeightStore tensors.
     ExpertStreamCache* expert_cache = nullptr;
 };
 
