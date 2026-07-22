@@ -1,0 +1,5 @@
+# The JSON-schema converter's builtin grammar encodes a control-character
+# class with literal 0x00-0x1f bytes, so git and GitHub currently misdetect
+# this file as binary and render no diff for changes to it. Mark the path as
+# text for diffing so that changes to this file review as a proper text diff.
+runtime/src/inference/structured/json_schema.rs diff
