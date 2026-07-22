@@ -2169,6 +2169,7 @@ impl BatchScheduler {
                         &mut in_flight_control,
                         &mut instances,
                         &mut policy,
+                        &mut frame_policy,
                         &nudge_tx,
                     );
                     continue;
@@ -2356,6 +2357,7 @@ impl BatchScheduler {
                         &mut in_flight_control,
                         &mut instances,
                         &mut policy,
+                        &mut frame_policy,
                         &nudge_tx,
                     );
                     continue;
@@ -2666,6 +2668,9 @@ impl BatchScheduler {
                     return;
                 }
                 policy.on_bind_enqueued(pipeline_id);
+                if let Some(frame_policy) = frame_policy.as_mut() {
+                    frame_policy.on_bind_enqueued(pipeline_id);
+                }
                 Self::queue_bind_control(
                     pending,
                     QueuedItem::BindInstance {
@@ -2691,6 +2696,9 @@ impl BatchScheduler {
                     return;
                 }
                 policy.on_bind_enqueued(pipeline_id);
+                if let Some(frame_policy) = frame_policy.as_mut() {
+                    frame_policy.on_bind_enqueued(pipeline_id);
+                }
                 Self::queue_bind_control(
                     pending,
                     QueuedItem::RegisterChannelsBind {
@@ -3649,6 +3657,7 @@ impl BatchScheduler {
                             instances,
                             in_flight_control,
                             policy,
+                            frame_policy,
                             item,
                         );
                         progress = true;
@@ -3689,6 +3698,7 @@ impl BatchScheduler {
                         instances,
                         in_flight_control,
                         policy,
+                        frame_policy,
                         item,
                     );
                     progress = true;
@@ -3729,6 +3739,7 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         in_flight_control: &mut Option<PendingControl>,
         policy: &mut quorum::WaitAllPolicy,
+        frame_policy: &mut Option<FramePolicy>,
         item: QueuedItem,
     ) {
         match &item {
@@ -3783,6 +3794,9 @@ impl BatchScheduler {
                     DriverLane::release_wait_slots([plan.pacing_wait_id]);
                 }
                 policy.on_bind_completed(pipeline_id, Instant::now());
+                if let Some(frame_policy) = frame_policy.as_mut() {
+                    frame_policy.on_bind_completed(pipeline_id);
+                }
                 return;
             }
             QueuedItem::RegisterChannelsBind { bind, .. }
@@ -3810,6 +3824,9 @@ impl BatchScheduler {
                     DriverLane::release_wait_slots([bind.pacing_wait_id]);
                 }
                 policy.on_bind_completed(pipeline_id, Instant::now());
+                if let Some(frame_policy) = frame_policy.as_mut() {
+                    frame_policy.on_bind_completed(pipeline_id);
+                }
                 return;
             }
             _ => {}
@@ -3917,7 +3934,7 @@ impl BatchScheduler {
     ) -> (bool, Option<Duration>) {
         let mut progress = false;
         let mut wait_hint: Option<Duration> = None;
-        let mut merge_hint = |hint: &mut Option<Duration>, hold: Duration| {
+        let merge_hint = |hint: &mut Option<Duration>, hold: Duration| {
             *hint = Some(hint.map_or(hold, |old| old.min(hold)));
         };
         loop {
@@ -4948,6 +4965,7 @@ impl BatchScheduler {
         in_flight_control: &mut Option<PendingControl>,
         instances: &mut HashMap<u64, TrackedInstance>,
         policy: &mut quorum::WaitAllPolicy,
+        frame_policy: &mut Option<FramePolicy>,
         rollback_tx: &crossbeam::channel::Sender<SchedulerItem>,
     ) {
         *lane_inflight = lane_inflight.saturating_sub(1);
@@ -5009,6 +5027,9 @@ impl BatchScheduler {
                 LaneCommit::None => {}
                 LaneCommit::BindFinished { pipeline_id } => {
                     policy.on_bind_completed(pipeline_id, Instant::now());
+                    if let Some(frame_policy) = frame_policy.as_mut() {
+                        frame_policy.on_bind_completed(pipeline_id);
+                    }
                 }
                 LaneCommit::BindInstance {
                     pipeline_id,
@@ -5016,6 +5037,9 @@ impl BatchScheduler {
                     respond,
                 } => {
                     policy.on_bind_completed(pipeline_id, Instant::now());
+                    if let Some(frame_policy) = frame_policy.as_mut() {
+                        frame_policy.on_bind_completed(pipeline_id);
+                    }
                     if instances.contains_key(&bound.instance_id) {
                         // Practically unreachable: driver-assigned ids are
                         // unique and requested ids are pre-checked at post
@@ -5643,6 +5667,7 @@ mod tests {
             &mut control,
             &mut instances,
             &mut policy,
+            &mut None,
             &rollback_tx,
         );
 
