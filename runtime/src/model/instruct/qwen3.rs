@@ -6,6 +6,7 @@
 //! Reference: Qwen3 Jinja chat template with tool-calling support.
 
 use crate::inference::structured::grammar::Grammar;
+use crate::inference::structured::json_schema::{JsonSchemaOptions, json_schema_to_ebnf_with_root};
 use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, ThinkingDecoder};
 use crate::model::instruct::{
     ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
@@ -279,18 +280,44 @@ impl QwenInstruct {
         tools: &[String],
         has_thinking: bool,
     ) -> Option<String> {
+        // Parse each tool into a name literal plus a per-tool payload schema.
+        // The payload schema fixes the tool name and constrains `arguments` to
+        // the tool's own parameter schema, so the generated grammar admits only
+        // strict-JSON, schema-valid arguments (no unescaped control characters,
+        // no undeclared keys) instead of an unconstrained object.
         let mut names: Vec<String> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut variants: Vec<serde_json::Value> = Vec::new();
         for tool in tools {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
-                let name = parsed
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .or_else(|| parsed.get("name"))
-                    .and_then(|n| n.as_str());
-                if let Some(n) = name {
-                    names.push(format!("\"{}\"", n));
-                }
+            // Fail closed: a malformed declaration, a missing name, or a
+            // duplicate name would produce a grammar that silently drops or
+            // ambiguates a tool, so refuse to build a native grammar at all.
+            let parsed = serde_json::from_str::<serde_json::Value>(tool).ok()?;
+            let func = parsed.get("function").unwrap_or(&parsed);
+            let name = func.get("name").and_then(|n| n.as_str())?;
+            if name.is_empty() {
+                return None;
             }
+            if seen.iter().any(|existing| existing == name) {
+                return None;
+            }
+            seen.push(name.to_string());
+            // Emit the name as a JSON string literal so quotes, backslashes, and
+            // control characters are escaped into a form Pie's EBNF parser accepts
+            // (unlike raw `format!("\"{name}\"")`, which a `"`/`\` in the name would
+            // corrupt, and unlike `{name:?}`, whose `\u{..}` escapes the parser
+            // rejects). The schema `const` below keeps the original, unescaped name.
+            names.push(serde_json::to_string(name).ok()?);
+            let params = func
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+            variants.push(serde_json::json!({
+                "type": "object",
+                "properties": { "name": { "const": name }, "arguments": params },
+                "required": ["name", "arguments"],
+                "additionalProperties": false,
+            }));
         }
         if names.is_empty() {
             return None;
@@ -298,22 +325,23 @@ impl QwenInstruct {
 
         let name_alt = names.join(" | ");
         let tool_grammar = match format {
-            ToolCallFormat::Json => format!(
-                r#"tool-call ::= "<tool_call>\n" tool-json "\n</tool_call>"
-tool-json ::= "{{"  "\"name\": \"" tool-name "\", \"arguments\": " json-object "}}"
-tool-name ::= {name_alt}
-json-object ::= "{{" json-members? "}}"
-json-members ::= json-pair ("," json-pair)*
-json-pair ::= json-string ":" json-value
-json-value ::= json-string | json-number | json-object | json-array | "true" | "false" | "null"
-json-string ::= "\"" json-chars "\""
-json-chars ::= json-char*
-json-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
-json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
-json-array ::= "[" (json-value ("," json-value)*)? "]"
-"#,
-                name_alt = name_alt
-            ),
+            ToolCallFormat::Json => {
+                // Lower the tool-call payload with the shared JSON-Schema→EBNF
+                // converter (strict objects, RFC 8259 strings). Embed it under a
+                // custom `tool-json` root so it composes with the tool-call and
+                // reasoning wrappers below.
+                let payload_schema = serde_json::json!({ "anyOf": variants });
+                let options = JsonSchemaOptions {
+                    any_whitespace: true,
+                    strict_mode: true,
+                    ..JsonSchemaOptions::default()
+                };
+                let payload_ebnf =
+                    json_schema_to_ebnf_with_root(&payload_schema, &options, "tool-json").ok()?;
+                format!(
+                    "tool-call ::= \"<tool_call>\\n\" tool-json \"\\n</tool_call>\"\n{payload_ebnf}"
+                )
+            }
             ToolCallFormat::Qwen35Xml => format!(
                 r#"tool-call ::= "<tool_call>\n<function=" tool-name ">\n" parameter* "</function>\n</tool_call>"
 tool-name ::= {name_alt}
@@ -544,6 +572,7 @@ impl ToolDecoder for QwenToolDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::structured::matcher::GrammarMatcher;
     use crate::model::tokenizer::Tokenizer;
     use std::sync::Arc;
 
@@ -728,6 +757,246 @@ mod tests {
         assert!(matches!(
             decoder.feed(&[17, 4, 12]),
             ToolEvent::Call(name, arguments) if name == "edit" && arguments == "{}"
+        ));
+    }
+
+    #[test]
+    fn json_tool_grammar_lowers_argument_schema_and_excludes_control_chars() {
+        let tool = r#"{"function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}"#.to_string();
+        let source = QwenInstruct::build_tool_call_grammar(ToolCallFormat::Json, &[tool], false)
+            .expect("grammar source");
+        // The old unconstrained productions are gone.
+        assert!(!source.contains("json-char ::= [^\"\\\\]"), "loose json-char still present:\n{source}");
+        assert!(!source.contains("json-object ::= "), "unconstrained json-object still present:\n{source}");
+        // The converter's RFC 8259 string char class (excludes control chars 0x00-0x1f) is present.
+        assert!(
+            source.to_lowercase().contains("x1f"),
+            "expected control-char exclusion, got:\n{source}"
+        );
+        // Arguments are constrained to the declared property key and the tool name.
+        assert!(source.contains("command"), "declared arg key not lowered:\n{source}");
+        assert!(source.contains("bash"), "tool name not present:\n{source}");
+        // Composes into a valid grammar.
+        assert!(
+            Grammar::from_ebnf(&source, "root").is_ok(),
+            "grammar failed to compile:\n{source}"
+        );
+    }
+
+    #[test]
+    fn json_tool_grammar_rejects_corrupt_arguments_and_accepts_valid() {
+        let tool = r#"{"function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}"#.to_string();
+        let source =
+            QwenInstruct::build_tool_call_grammar(ToolCallFormat::Json, &[tool], false).unwrap();
+        let grammar = Arc::new(Grammar::from_ebnf(&source, "root").expect("compile"));
+        let tok = make_tok();
+        let stop: Vec<u32> = Vec::new();
+
+        // A well-formed, schema-valid tool call is accepted.
+        let mut ok = GrammarMatcher::new(grammar.clone(), tok.clone(), stop.clone(), 64);
+        let valid = "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>";
+        assert!(ok.accept_string(valid), "valid tool call should be accepted");
+
+        // The corruption observed in run 0f5e3b1e (undeclared key + a literal
+        // unescaped newline inside a JSON string) must be rejected.
+        let mut bad = GrammarMatcher::new(grammar, tok, stop, 64);
+        let corrupt = "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\">\n'\":null}}\n</tool_call>";
+        assert!(!bad.accept_string(corrupt), "corrupt arguments must be rejected");
+    }
+
+    fn json_tool_grammar(tools: &[&str], has_thinking: bool) -> Arc<Grammar> {
+        let owned: Vec<String> = tools.iter().map(|t| t.to_string()).collect();
+        let source =
+            QwenInstruct::build_tool_call_grammar(ToolCallFormat::Json, &owned, has_thinking)
+                .expect("grammar source");
+        Arc::new(Grammar::from_ebnf(&source, "root").expect("grammar compiles"))
+    }
+
+    fn grammar_accepts(grammar: &Arc<Grammar>, s: &str) -> bool {
+        let mut m = GrammarMatcher::new(grammar.clone(), make_tok(), Vec::new(), 64);
+        // Require a complete match: the string must advance and the matcher
+        // must be at a valid terminal state (not merely a valid prefix).
+        m.accept_string(s) && m.can_terminate()
+    }
+
+    fn json_call(name: &str, args: &str) -> String {
+        format!("<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>")
+    }
+
+    #[test]
+    fn json_tool_grammar_enforces_required_wrong_type_and_undeclared_keys() {
+        let bash = r#"{"function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}"#;
+        let g = json_tool_grammar(&[bash], false);
+
+        assert!(grammar_accepts(&g, &json_call("bash", r#"{"command": "ls"}"#)));
+        // Missing required key.
+        assert!(!grammar_accepts(&g, &json_call("bash", "{}")));
+        // Wrong value type (number where a string is required).
+        assert!(!grammar_accepts(&g, &json_call("bash", r#"{"command": 7}"#)));
+        // Only an undeclared key.
+        assert!(!grammar_accepts(&g, &json_call("bash", r#"{"foo": "x"}"#)));
+        // Declared key plus an extra undeclared key.
+        assert!(!grammar_accepts(
+            &g,
+            &json_call("bash", r#"{"command": "ls", "foo": "x"}"#)
+        ));
+    }
+
+    #[test]
+    fn json_tool_grammar_rejects_literal_control_char_in_a_declared_string() {
+        let bash = r#"{"function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}"#;
+        let g = json_tool_grammar(&[bash], false);
+
+        // A LITERAL (unescaped) newline inside the declared string value is
+        // rejected on its own — the only difference from the accepted case is
+        // the escaping, isolating the control-character exclusion.
+        let literal_newline = "{\"command\": \"a\nb\"}";
+        assert!(!grammar_accepts(&g, &json_call("bash", literal_newline)));
+        // The properly escaped form of the same value is accepted.
+        let escaped_newline = r#"{"command": "a\nb"}"#;
+        assert!(grammar_accepts(&g, &json_call("bash", escaped_newline)));
+        // A literal tab (also 0x00-0x1f) is likewise rejected.
+        let literal_tab = "{\"command\": \"a\tb\"}";
+        assert!(!grammar_accepts(&g, &json_call("bash", literal_tab)));
+        // A literal NUL (0x00) is rejected.
+        let literal_nul = "{\"command\": \"a\u{0}b\"}";
+        assert!(!grammar_accepts(&g, &json_call("bash", literal_nul)));
+    }
+
+    #[test]
+    fn json_tool_grammar_handles_missing_parameters() {
+        // A tool declaration without a `parameters` field must still build a
+        // working grammar (defaulting to an object) rather than failing.
+        let no_params = r#"{"function":{"name":"finish"}}"#;
+        let g = json_tool_grammar(&[no_params], false);
+        assert!(grammar_accepts(&g, &json_call("finish", "{}")));
+        // Non-object arguments are still rejected.
+        assert!(!grammar_accepts(&g, &json_call("finish", r#""oops""#)));
+    }
+
+    #[test]
+    fn json_tool_grammar_fails_closed_on_unsupported_parameter_schema() {
+        // The converter does not support allOf with multiple schemas, so an
+        // unsupported parameter schema fails closed instead of emitting an
+        // unconstrained tool.
+        let bad = r#"{"function":{"name":"bash","parameters":{"allOf":[{"type":"object"},{"type":"string"}]}}}"#;
+        assert!(
+            QwenInstruct::build_tool_call_grammar(
+                ToolCallFormat::Json,
+                &[bad.to_string()],
+                false
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn json_tool_grammar_constrains_arguments_with_reasoning_enabled() {
+        let bash = r#"{"function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}"#;
+        let g = json_tool_grammar(&[bash], true);
+
+        // A bare tool call is accepted under the reasoning-enabled root.
+        assert!(grammar_accepts(&g, &json_call("bash", r#"{"command": "ls"}"#)));
+        // A reasoning block preceding the tool call is accepted.
+        let with_reasoning =
+            format!("<think>plan</think>\n{}", json_call("bash", r#"{"command": "ls"}"#));
+        assert!(grammar_accepts(&g, &with_reasoning));
+        // Argument constraints still hold with reasoning enabled: missing
+        // required key, undeclared key, and a literal control char are rejected.
+        assert!(!grammar_accepts(&g, &json_call("bash", "{}")));
+        assert!(!grammar_accepts(&g, &json_call("bash", r#"{"foo": "x"}"#)));
+        assert!(!grammar_accepts(&g, &json_call("bash", "{\"command\": \"a\nb\"}")));
+    }
+
+    #[test]
+    fn json_tool_grammar_binds_each_tool_to_its_own_schema() {
+        let bash = r#"{"function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}}}"#;
+        let finish = r#"{"function":{"name":"finish","parameters":{"type":"object","properties":{"status":{"type":"string"}},"required":["status"],"additionalProperties":false}}}"#;
+        let g = json_tool_grammar(&[bash, finish], false);
+
+        // Each tool accepts its own schema.
+        assert!(grammar_accepts(&g, &json_call("bash", r#"{"command": "ls"}"#)));
+        assert!(grammar_accepts(&g, &json_call("finish", r#"{"status": "done"}"#)));
+        // Cross-schema binding is rejected (name is bound to its own arguments).
+        assert!(!grammar_accepts(&g, &json_call("bash", r#"{"status": "done"}"#)));
+        assert!(!grammar_accepts(&g, &json_call("finish", r#"{"command": "ls"}"#)));
+        // An undeclared tool name is rejected.
+        assert!(!grammar_accepts(&g, &json_call("rm", r#"{"command": "ls"}"#)));
+    }
+
+    #[test]
+    fn json_tool_grammar_fails_closed_on_malformed_or_duplicate_tools() {
+        // Malformed JSON declaration.
+        assert!(
+            QwenInstruct::build_tool_call_grammar(
+                ToolCallFormat::Json,
+                &["{not json".to_string()],
+                false
+            )
+            .is_none()
+        );
+        // Missing name.
+        assert!(
+            QwenInstruct::build_tool_call_grammar(
+                ToolCallFormat::Json,
+                &[r#"{"function":{}}"#.to_string()],
+                false
+            )
+            .is_none()
+        );
+        // Empty tool name.
+        assert!(
+            QwenInstruct::build_tool_call_grammar(
+                ToolCallFormat::Json,
+                &[r#"{"function":{"name":""}}"#.to_string()],
+                false
+            )
+            .is_none()
+        );
+        // Duplicate names.
+        let dup = r#"{"function":{"name":"bash","parameters":{"type":"object"}}}"#.to_string();
+        assert!(
+            QwenInstruct::build_tool_call_grammar(
+                ToolCallFormat::Json,
+                &[dup.clone(), dup],
+                false
+            )
+            .is_none()
+        );
+        // A well-formed declaration alongside a malformed one also fails closed
+        // (the good tool is not silently kept).
+        let good = r#"{"function":{"name":"bash","parameters":{"type":"object"}}}"#.to_string();
+        assert!(
+            QwenInstruct::build_tool_call_grammar(
+                ToolCallFormat::Json,
+                &[good, "nope".to_string()],
+                false
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn qwen35_xml_escapes_tool_name_into_the_grammar_literal() {
+        // A name carrying both a double-quote and a backslash must be escaped
+        // into the Qwen3.5 XML `tool-name` EBNF literal rather than corrupting or
+        // widening it. JSON parsing unescapes the declaration to the name a"b\c.
+        let tool = r#"{"function":{"name":"a\"b\\c"}}"#.to_string();
+        let source =
+            QwenInstruct::build_tool_call_grammar(ToolCallFormat::Qwen35Xml, &[tool], false)
+                .expect("grammar source");
+        let grammar =
+            Arc::new(Grammar::from_ebnf(&source, "root").expect("grammar compiles despite quote/backslash in name"));
+
+        // Accepts a call naming the exact declared tool (quote + backslash intact).
+        assert!(grammar_accepts(
+            &grammar,
+            "<tool_call>\n<function=a\"b\\c>\n</function>\n</tool_call>"
+        ));
+        // Rejects any other name — the literal is bound to a"b\c, not widened.
+        assert!(!grammar_accepts(
+            &grammar,
+            "<tool_call>\n<function=other>\n</function>\n</tool_call>"
         ));
     }
 
