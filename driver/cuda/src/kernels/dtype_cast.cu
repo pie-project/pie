@@ -141,7 +141,8 @@ namespace {
 //      8-element stride. Equivalent to "AWQ stored values with
 //      interleave [0,2,4,6,1,3,5,7]; argsort gives the inverse".
 //   3. marlin_zero_points: reshape [N, groups] flat → [-1, 64] and
-//      apply scale_perm (`perm[i*8+j] = i + 8*j`); reshape to
+//      apply scale_perm (`perm[i*8+j] = i + 8*j`), THEN reshape [-1, 8]
+//      and apply the 8-wide interleave [0,2,4,6,1,3,5,7]; reshape to
 //      [groups, N] and pack 8 nibbles per int32.
 //
 // The whole pipeline is pure index arithmetic — we read the source
@@ -172,11 +173,16 @@ __global__ void awq_qzero_to_marlin_w4_kernel(
     // = bit position in the AWQ-packed int32 holding slot j of the
     // unpacked array.
     constexpr int reverse_order[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    // marlin_zero_points applies an 8-wide column interleave
+    // (`zp.reshape(-1, 8)[:, [0,2,4,6,1,3,5,7]]`) AFTER the 64-wide
+    // scale_perm and before packing. Output nibble slot j therefore carries
+    // the logical column n8_out*8 + interleave[j], not the linear j.
+    constexpr int interleave[8] = {0, 2, 4, 6, 1, 3, 5, 7};
 
     std::uint32_t v = 0;
     #pragma unroll
     for (int j = 0; j < 8; ++j) {
-        const int n_out = n8_out * 8 + j;
+        const int n_out = n8_out * 8 + interleave[j];
         const int p = g_out * size_n + n_out;
         const int p_in_64 = p % 64;
         const int p_in_64_perm = (p_in_64 % 8) * 8 + (p_in_64 / 8);
