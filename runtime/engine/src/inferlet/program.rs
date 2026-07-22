@@ -97,7 +97,7 @@ pub async fn install(name: &ProgramName) -> Result<()> {
     rx.await?
 }
 
-/// Uninstall a program: remove from installed programs (does NOT remove from cache).
+/// Uninstall a program and invalidate its linker cache entry.
 pub async fn uninstall(name: &ProgramName) -> bool {
     let (tx, rx) = oneshot::channel();
     SERVICE
@@ -258,6 +258,7 @@ impl ProgramService {
         if self.installed.remove(name).is_none() {
             return false;
         }
+        super::linker::invalidate(name);
         self.explicit_installs.remove(name);
 
         // Cascade: find and remove orphaned dependencies
@@ -268,6 +269,7 @@ impl ProgramService {
             }
             for orphan in orphans {
                 self.installed.remove(&orphan);
+                super::linker::invalidate(&orphan);
             }
         }
 
@@ -547,7 +549,7 @@ enum Message {
         response: oneshot::Sender<Result<()>>,
     },
 
-    /// Uninstall a program: remove from installed programs (does NOT remove from cache)
+    /// Uninstall a program and invalidate its linker cache entry.
     Uninstall {
         name: ProgramName,
         response: oneshot::Sender<bool>,
